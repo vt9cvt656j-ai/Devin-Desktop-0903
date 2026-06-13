@@ -1294,6 +1294,7 @@ async function gitRunOp(op, okMsg) {
 }
 
 async function gitCommit() {
+  if (!rootPath) return;
   const input = $("gitCommitMsg");
   const msg = input.value.trim();
   if (!msg) {
@@ -1313,6 +1314,7 @@ async function gitCommit() {
 }
 
 async function gitPush() {
+  if (!rootPath) return;
   showToast("Pushing…");
   try {
     const res = await backend.gitPush(rootPath);

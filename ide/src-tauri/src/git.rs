@@ -42,6 +42,10 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
         .arg("-C")
         .arg(root)
         .args(args)
+        // Never block waiting for an interactive credential prompt — fail fast
+        // instead. This keeps network commands like `git push` from hanging
+        // indefinitely on an auth prompt when no credential helper is set.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("failed to run git: {e}"))
 }
@@ -194,6 +198,16 @@ fn run_git_checked(root: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Whether the repo has at least one commit (i.e. `HEAD` resolves).
+///
+/// `git restore --staged` / `git reset` need a HEAD to diff the index against;
+/// a freshly `git init`-ed repo has none, so we fall back to `git rm --cached`.
+fn has_head(root: &str) -> bool {
+    run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Stage a single path (`git add -- <rel>`). Works for new, modified, and
 /// deleted files alike.
 #[tauri::command]
@@ -201,11 +215,17 @@ pub fn git_stage(root: String, rel: String) -> Result<(), String> {
     run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
 }
 
-/// Unstage a single path (`git restore --staged -- <rel>`), leaving the
-/// worktree changes intact.
+/// Unstage a single path, leaving the worktree changes intact.
+///
+/// Uses `git restore --staged` normally, but `git rm --cached` when the repo
+/// has no commits yet (there is no HEAD to restore from).
 #[tauri::command]
 pub fn git_unstage(root: String, rel: String) -> Result<(), String> {
-    run_git_checked(&root, &["restore", "--staged", "--", &rel]).map(|_| ())
+    if has_head(&root) {
+        run_git_checked(&root, &["restore", "--staged", "--", &rel]).map(|_| ())
+    } else {
+        run_git_checked(&root, &["rm", "--cached", "--quiet", "--", &rel]).map(|_| ())
+    }
 }
 
 /// Stage every change in the worktree (`git add -A`).
@@ -214,10 +234,17 @@ pub fn git_stage_all(root: String) -> Result<(), String> {
     run_git_checked(&root, &["add", "-A"]).map(|_| ())
 }
 
-/// Unstage everything currently in the index (`git reset`).
+/// Unstage everything currently in the index.
+///
+/// Uses `git reset` normally, falling back to `git rm -r --cached .` for a repo
+/// with no commits (no HEAD to reset to).
 #[tauri::command]
 pub fn git_unstage_all(root: String) -> Result<(), String> {
-    run_git_checked(&root, &["reset", "--quiet"]).map(|_| ())
+    if has_head(&root) {
+        run_git_checked(&root, &["reset", "--quiet"]).map(|_| ())
+    } else {
+        run_git_checked(&root, &["rm", "-r", "--cached", "--quiet", "."]).map(|_| ())
+    }
 }
 
 /// Commit the staged changes with `message`. Returns the short hash + subject.
