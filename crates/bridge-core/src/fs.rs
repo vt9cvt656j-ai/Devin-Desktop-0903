@@ -87,7 +87,10 @@ impl ScopedFs {
         let check = if full.exists() {
             full.clone()
         } else {
-            full.parent()
+            // Walk up to the closest *existing* ancestor so a symlink anywhere
+            // along the path (not just the immediate parent) is still checked.
+            full.ancestors()
+                .find(|p| p.exists())
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.root.clone())
         };
@@ -240,7 +243,11 @@ impl ScopedFs {
             if line.to_lowercase().contains(needle) {
                 let preview = line.trim();
                 let preview = if preview.len() > 200 {
-                    &preview[..200]
+                    let mut end = 200;
+                    while !preview.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &preview[..end]
                 } else {
                     preview
                 };
@@ -333,5 +340,33 @@ mod tests {
         assert!(sfs.read_file("hello.txt").is_err());
         sfs.delete("sub").unwrap();
         assert!(sfs.list_dir("sub").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_writes_through_symlink_to_outside() {
+        let (_d, sfs) = setup();
+        let outside = tempfile::tempdir().unwrap();
+        // A symlink inside the root that points outside it.
+        std::os::unix::fs::symlink(outside.path(), _d.path().join("link")).unwrap();
+
+        // Even when neither the target nor its immediate parent exist yet, the
+        // closest existing ancestor (the symlink) must be detected.
+        let err = sfs
+            .write_file("link/newdir/secret.txt", b"escape")
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::PathEscapesRoot(_)));
+        assert!(!outside.path().join("newdir").exists());
+    }
+
+    #[test]
+    fn content_preview_handles_multibyte_utf8() {
+        let (_d, sfs) = setup();
+        // A long line of CJK characters: a naive `&s[..200]` byte slice would
+        // panic in the middle of a multi-byte char.
+        let long_line: String = "中文内容".repeat(100);
+        sfs.write_file("cjk.txt", long_line.as_bytes()).unwrap();
+        let hits = sfs.search("", "中文", true, 10).unwrap();
+        assert!(hits.iter().any(|h| h.path == "cjk.txt"));
     }
 }

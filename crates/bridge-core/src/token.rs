@@ -1,40 +1,31 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz";
 
-/// Generate a random, URL-safe access token.
+/// Generate a cryptographically random, URL-safe access token.
 ///
-/// This is not a cryptographic library: it derives entropy from the system
-/// clock and address-space layout, which is sufficient for a local,
-/// user-controlled bridge token that the user can rotate at any time.
+/// Entropy comes from the operating system CSPRNG (`getrandom`). Characters are
+/// drawn from [`ALPHABET`] using rejection sampling so the distribution is
+/// uniform and unbiased. The token is the sole authentication barrier when the
+/// bridge is exposed through a tunnel, so it must be unpredictable.
 pub fn generate_token(len: usize) -> String {
-    let mut seed = seed();
+    let n = ALPHABET.len() as u16; // 54
+                                   // Largest multiple of `n` that fits in a byte; values >= this are rejected
+                                   // to avoid modulo bias.
+    let limit = (256 / n) * n;
+
     let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        // xorshift64
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let idx = (seed % ALPHABET.len() as u64) as usize;
-        out.push(ALPHABET[idx] as char);
+    let mut buf = [0u8; 64];
+    while out.len() < len {
+        getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+        for &b in buf.iter() {
+            if (b as u16) < limit {
+                out.push(ALPHABET[(b as u16 % n) as usize] as char);
+                if out.len() == len {
+                    break;
+                }
+            }
+        }
     }
     out
-}
-
-fn seed() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let stack_marker = 0u8;
-    let addr = &stack_marker as *const u8 as u64;
-    let mixed = nanos ^ addr.rotate_left(32) ^ 0x9E3779B97F4A7C15;
-    // ensure non-zero seed for xorshift
-    if mixed == 0 {
-        0x9E3779B97F4A7C15
-    } else {
-        mixed
-    }
 }
 
 #[cfg(test)]
@@ -44,6 +35,8 @@ mod tests {
     #[test]
     fn token_has_requested_length() {
         assert_eq!(generate_token(32).len(), 32);
+        assert_eq!(generate_token(1).len(), 1);
+        assert_eq!(generate_token(100).len(), 100);
     }
 
     #[test]
