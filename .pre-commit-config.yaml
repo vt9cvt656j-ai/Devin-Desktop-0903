@@ -1,0 +1,31 @@
+# Run `pre-commit install` once to enable these hooks.
+# Run `pre-commit run --all-files` to check the whole repo.
+exclude: '(^|/)(Cargo\.lock|package-lock\.json)$|\.(png|jpg|jpeg|gif|ico|icns|svg)$'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: rustfmt-core
+        name: rustfmt (Devin Desktop)
+        entry: cargo fmt --manifest-path Cargo.toml --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: rustfmt-ide
+        name: rustfmt (Devin IDE)
+        entry: cargo fmt --manifest-path ide/Cargo.toml --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
