@@ -551,10 +551,6 @@ kbd {
 }
 .msg.assistant .msg__body {
   color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  padding: 10px 12px;
-  border-radius: 4px 14px 14px 14px;
 }
 .msg__body code {
   font-family: var(--mono);
@@ -615,16 +611,12 @@ kbd {
   border-left: 3px solid var(--line-strong);
   color: var(--text-dim);
 }
-/* ---- Devin agent activity step ---- */
+/* ---- Devin thinking / progress step (plain, no card) ---- */
 .devin-activity {
   display: flex;
   align-items: baseline;
   gap: 7px;
-  margin: 2px 0 6px;
-  padding: 5px 11px;
-  border-left: 2px solid var(--accent-2);
-  background: var(--panel-2);
-  border-radius: 0 8px 8px 0;
+  margin: 3px 0;
   font-size: 12px;
   color: var(--text-dim);
 }
@@ -654,16 +646,12 @@ kbd {
   padding: 0 16px;
 }
 
-/* ---- Devin session status row ---- */
+/* ---- Devin session status line (plain, no card) ---- */
 .devin-status {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 4px 0 8px;
-  padding: 7px 11px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--panel-2);
+  margin: 6px 0;
   font-size: 12px;
   color: var(--text-dim);
 }
@@ -682,16 +670,6 @@ kbd {
 }
 .devin-status__text {
   flex: 1;
-}
-.devin-status__link {
-  flex: none;
-  color: var(--accent);
-  font-weight: 600;
-  text-decoration: none;
-  cursor: pointer;
-}
-.devin-status__link:hover {
-  text-decoration: underline;
 }
 @keyframes devin-pulse {
   0% {

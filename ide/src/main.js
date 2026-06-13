@@ -546,6 +546,17 @@ function renderBody(body, role, text) {
   body.innerHTML = DOMPurify.sanitize(marked.parse(text || ""));
 }
 
+// Keep the live Devin status line pinned to the bottom: new messages slot in
+// just above it instead of after it.
+function placeInChat(node) {
+  if (devinStatusEl && devinStatusEl.parentNode === chatEl) {
+    chatEl.insertBefore(node, devinStatusEl);
+  } else {
+    chatEl.appendChild(node);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 function addMessage(role, text, who) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -555,14 +566,13 @@ function addMessage(role, text, who) {
   wrap.querySelector(".msg__who span").textContent = name;
   const body = wrap.querySelector(".msg__body");
   renderBody(body, role, text);
-  chatEl.appendChild(wrap);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  placeInChat(wrap);
   return body;
 }
 
 // A Devin session emits several kinds of messages. The chat reply
-// (`devin_message`) gets a full assistant bubble; everything else the agent
-// emits is shown as a compact activity step so you can watch it work.
+// (`devin_message`) is Devin's answer; everything else the agent emits is its
+// thinking/progress, shown as a plain step so you can follow along.
 function addDevinMessage(m) {
   if (m.type === "devin_message") {
     addMessage("assistant", m.message, "Devin");
@@ -575,8 +585,9 @@ function devinKindLabel(kind = "") {
   return (
     kind
       .replace(/_/g, " ")
-      .replace(/\bdevin\b/gi, "Devin")
-      .trim() || "activity"
+      .replace(/\bdevin\b/gi, "")
+      .replace(/\bupdate\b/gi, "")
+      .trim() || "thinking"
   );
 }
 
@@ -586,8 +597,7 @@ function addDevinActivity(kind, text) {
   wrap.innerHTML = `<svg class="ic devin-activity__ic"><use href="#i-sparkle" /></svg><span class="devin-activity__kind"></span><span class="devin-activity__text"></span>`;
   wrap.querySelector(".devin-activity__kind").textContent = devinKindLabel(kind);
   wrap.querySelector(".devin-activity__text").textContent = text;
-  chatEl.appendChild(wrap);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  placeInChat(wrap);
 }
 
 function showChatHint() {
@@ -653,8 +663,12 @@ async function sendPrompt(text) {
 let devinSessionId = null;
 let devinSessionUrl = null;
 let devinBusy = false;
+let devinStatusEl = null;
+let devinPollTimer = null;
 const devinSeen = new Set();
-const TERMINAL = new Set(["finished", "blocked", "expired"]);
+// Only states the session can't come back from on its own stop the poller.
+// `blocked` (Devin waiting on you) keeps polling so the session stays live.
+const DONE = new Set(["finished", "expired", "suspended"]);
 
 /** Open file + selection as context, appended to the very first prompt only. */
 function projectContext() {
@@ -689,8 +703,10 @@ function devinStatusText(s) {
 }
 
 function resetDevinSession(announce) {
+  stopDevinPoller();
   devinSessionId = null;
   devinSessionUrl = null;
+  devinStatusEl = null;
   devinSeen.clear();
   if (announce && isDevinMode()) {
     chatEl.innerHTML = "";
@@ -698,25 +714,75 @@ function resetDevinSession(announce) {
   }
 }
 
-/** A status row with a live link to the running Devin session. */
-function addDevinStatus() {
-  const row = document.createElement("div");
-  row.className = "devin-status";
-  row.innerHTML = `<span class="devin-status__dot"></span><span class="devin-status__text"></span><a class="devin-status__link" target="_blank" hidden>View session ↗</a>`;
-  const link = row.querySelector(".devin-status__link");
-  link.addEventListener("click", (e) => {
-    e.preventDefault();
-    if (devinSessionUrl) backend.openUrl(devinSessionUrl);
-  });
-  chatEl.appendChild(row);
+// A single status line pinned to the bottom of the chat that reflects the
+// live Devin session state. Everything happens in-window — there is no link
+// out to the hosted session.
+function devinStatusRow() {
+  if (!devinStatusEl || devinStatusEl.parentNode !== chatEl) {
+    const row = document.createElement("div");
+    row.className = "devin-status";
+    row.innerHTML = `<span class="devin-status__dot"></span><span class="devin-status__text"></span>`;
+    devinStatusEl = row;
+  }
+  chatEl.appendChild(devinStatusEl);
   chatEl.scrollTop = chatEl.scrollHeight;
+  const textEl = devinStatusEl.querySelector(".devin-status__text");
+  const row = devinStatusEl;
   return {
     set(text, opts = {}) {
-      row.querySelector(".devin-status__text").textContent = text;
+      textEl.textContent = text;
       row.classList.toggle("is-done", !!opts.done);
-      if (devinSessionUrl) link.hidden = false;
     },
   };
+}
+
+function renderDevinMessages(msgs) {
+  msgs.forEach((m, i) => {
+    // event_id is the stable key; fall back to type:timestamp:index so
+    // messages still dedup correctly if the API omits both fields.
+    const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
+    if (devinSeen.has(id)) return;
+    devinSeen.add(id);
+    if (!m.message) return;
+    // The user's own prompts come back as `user_message` /
+    // `initial_user_message`; we already render those locally. Show every
+    // other message the agent emits — chat replies and the thinking/progress
+    // steps in between — so you can watch Devin work right here.
+    if (!(m.type || "").endsWith("user_message")) addDevinMessage(m);
+  });
+}
+
+// One long-lived poller per session. It keeps pulling new messages every few
+// seconds and never stops while the session is live — even when Devin is
+// `blocked` waiting on you — so the thinking process keeps streaming in and
+// the session never looks halted. It only ends once the session truly closes.
+function startDevinPoller() {
+  if (devinPollTimer) return;
+  const status = devinStatusRow();
+  const tick = async () => {
+    let session;
+    try {
+      session = await backend.devinGetSession(devinConfig(), devinSessionId);
+    } catch (e) {
+      status.set("⚠️ " + String(e), { done: true });
+      stopDevinPoller();
+      return;
+    }
+    renderDevinMessages(session.messages || []);
+    const state = session.status_enum || session.status;
+    const done = DONE.has(state);
+    status.set(devinStatusText(state), { done });
+    if (done) stopDevinPoller();
+  };
+  tick();
+  devinPollTimer = setInterval(tick, 3000);
+}
+
+function stopDevinPoller() {
+  if (devinPollTimer) {
+    clearInterval(devinPollTimer);
+    devinPollTimer = null;
+  }
 }
 
 async function sendDevinPrompt(text) {
@@ -730,74 +796,26 @@ async function sendDevinPrompt(text) {
   devinBusy = true;
   chatEl.querySelector(".hint")?.remove();
   addMessage("user", text);
-  const status = addDevinStatus();
+  const status = devinStatusRow();
 
-  const continuing = !!devinSessionId;
   try {
-    if (!continuing) {
+    if (!devinSessionId) {
       status.set("Starting a Devin session…");
       const ctx = projectContext();
       const prompt = ctx ? `${text}\n\n---\nContext from my editor:\n${ctx}` : text;
       const ref = await backend.devinCreateSession(cfg, prompt, text.slice(0, 60));
       devinSessionId = ref.session_id;
       devinSessionUrl = ref.url;
-      status.set("Devin is working…");
     } else {
       status.set("Sending to Devin…");
       await backend.devinSendMessage(cfg, devinSessionId, text);
-      status.set("Devin is working…");
     }
-    await pollDevin(cfg, status, continuing);
+    status.set("Devin is working…");
+    startDevinPoller();
   } catch (e) {
     status.set("⚠️ " + String(e), { done: true });
   } finally {
     devinBusy = false;
-  }
-}
-
-// `awaitNew` is set when continuing a session: it may still report the
-// previous turn's terminal `blocked` state for a poll or two before Devin
-// picks up the new message, so we keep polling until a fresh agent message
-// actually arrives instead of stopping on that stale state.
-async function pollDevin(cfg, status, awaitNew = false) {
-  const started = Date.now();
-  const TIMEOUT_MS = 10 * 60 * 1000;
-  let sawNew = false;
-  while (true) {
-    let session;
-    try {
-      session = await backend.devinGetSession(cfg, devinSessionId);
-    } catch (e) {
-      status.set("⚠️ " + String(e), { done: true });
-      return;
-    }
-    const msgs = session.messages || [];
-    msgs.forEach((m, i) => {
-      // event_id is the stable key; fall back to type:timestamp:index so
-      // messages still dedup correctly if the API omits both fields.
-      const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
-      if (devinSeen.has(id)) return;
-      devinSeen.add(id);
-      if (!m.message) return;
-      // The user's own prompts come back as `user_message` /
-      // `initial_user_message`; we already render those locally. Show every
-      // other message the agent emits (chat replies, progress notes, etc.).
-      if (!(m.type || "").endsWith("user_message")) {
-        addDevinMessage(m);
-        sawNew = true;
-      }
-    });
-    const state = session.status_enum || session.status;
-    if (TERMINAL.has(state) && (!awaitNew || sawNew)) {
-      status.set(devinStatusText(state), { done: true });
-      return;
-    }
-    if (Date.now() - started > TIMEOUT_MS) {
-      status.set("Still working — open the session to follow along.", { done: true });
-      return;
-    }
-    status.set(devinStatusText(state));
-    await new Promise((r) => setTimeout(r, 3000));
   }
 }
 
