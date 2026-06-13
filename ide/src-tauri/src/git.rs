@@ -173,3 +173,86 @@ pub fn git_file_head(root: String, rel: String) -> Result<String, String> {
         Ok(String::new())
     }
 }
+
+/// Run a git command and map a non-zero exit into a readable `Err`.
+fn run_git_checked(root: &str, args: &[&str]) -> Result<String, String> {
+    let out = run_git(root, args)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let msg = if err.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            err
+        };
+        Err(if msg.is_empty() {
+            format!("git {} failed", args.first().copied().unwrap_or("command"))
+        } else {
+            msg
+        })
+    }
+}
+
+/// Stage a single path (`git add -- <rel>`). Works for new, modified, and
+/// deleted files alike.
+#[tauri::command]
+pub fn git_stage(root: String, rel: String) -> Result<(), String> {
+    run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
+}
+
+/// Unstage a single path (`git restore --staged -- <rel>`), leaving the
+/// worktree changes intact.
+#[tauri::command]
+pub fn git_unstage(root: String, rel: String) -> Result<(), String> {
+    run_git_checked(&root, &["restore", "--staged", "--", &rel]).map(|_| ())
+}
+
+/// Stage every change in the worktree (`git add -A`).
+#[tauri::command]
+pub fn git_stage_all(root: String) -> Result<(), String> {
+    run_git_checked(&root, &["add", "-A"]).map(|_| ())
+}
+
+/// Unstage everything currently in the index (`git reset`).
+#[tauri::command]
+pub fn git_unstage_all(root: String) -> Result<(), String> {
+    run_git_checked(&root, &["reset", "--quiet"]).map(|_| ())
+}
+
+/// Commit the staged changes with `message`. Returns the short hash + subject.
+#[tauri::command]
+pub fn git_commit(root: String, message: String) -> Result<String, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Err("Commit message is empty.".into());
+    }
+    run_git_checked(&root, &["commit", "-m", msg])?;
+    // Report the new commit so the UI can show feedback.
+    run_git_checked(&root, &["log", "-1", "--pretty=%h %s"])
+}
+
+/// Push the current branch to its upstream (`git push`).
+///
+/// Returns combined stdout/stderr because git writes its progress to stderr
+/// even on success.
+#[tauri::command]
+pub fn git_push(root: String) -> Result<String, String> {
+    let out = run_git(&root, &["push"])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}").trim().to_string();
+    if out.status.success() {
+        Ok(if combined.is_empty() {
+            "Pushed.".into()
+        } else {
+            combined
+        })
+    } else {
+        Err(if combined.is_empty() {
+            "git push failed".into()
+        } else {
+            combined
+        })
+    }
+}
