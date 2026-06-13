@@ -1635,6 +1635,7 @@ window.addEventListener("keydown", (e) => {
 let term = null;
 let termFit = null;
 let termId = null;
+let termOpening = false;
 const termPanel = $("terminalPanel");
 const termBody = $("terminalBody");
 const editorwrapEl = document.querySelector(".editorwrap");
@@ -1696,7 +1697,8 @@ async function openTerminal() {
     }
   });
 
-  if (termId == null) {
+  if (termId == null && !termOpening) {
+    termOpening = true;
     try {
       termId = await backend.termOpen(
         { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
@@ -1710,6 +1712,8 @@ async function openTerminal() {
       );
     } catch (err) {
       term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
+    } finally {
+      termOpening = false;
     }
   }
   term.focus();
@@ -1730,6 +1734,10 @@ function toggleTerminal() {
 
 $("terminalClose")?.addEventListener("click", closeTerminal);
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
+// Clean up the backend shell process when the window goes away.
+window.addEventListener("beforeunload", () => {
+  if (termId != null) backend.termClose(termId);
+});
 
 buildMenubar();
 
