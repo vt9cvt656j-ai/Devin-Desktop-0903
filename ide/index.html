@@ -67,10 +67,23 @@
         </header>
         <div class="chat" id="chat"></div>
         <form class="composer" id="composer">
-          <textarea id="prompt" rows="1" placeholder="Ask about the open file… (⌘↩ to send)"></textarea>
-          <button class="btn btn--primary send" id="sendBtn" type="submit" title="Send">
-            <svg class="ic"><use href="#i-send" /></svg>
-          </button>
+          <div class="composer__box">
+            <textarea id="prompt" rows="1" placeholder="Ask about the open file…"></textarea>
+            <div class="composer__bar">
+              <div class="model-picker" id="modelPicker">
+                <button class="model-picker__btn" id="modelPickerBtn" type="button" title="Switch model" aria-haspopup="listbox" aria-expanded="false">
+                  <svg class="ic"><use href="#i-cpu" /></svg>
+                  <span class="model-picker__label" id="modelPickerLabel">Select model</span>
+                  <svg class="ic model-picker__caret"><use href="#i-caret" /></svg>
+                </button>
+                <div class="menu" id="modelMenu" role="listbox" hidden></div>
+              </div>
+              <span class="composer__hint">⌘↩</span>
+              <button class="send" id="sendBtn" type="submit" title="Send (⌘↩)">
+                <svg class="ic"><use href="#i-arrow-up" /></svg>
+              </button>
+            </div>
+          </div>
         </form>
       </aside>
     </main>
@@ -132,6 +145,20 @@
       </symbol>
       <symbol id="i-send" viewBox="0 0 24 24">
         <path fill="currentColor" d="M4.6 3.4 20.5 11.1a1 1 0 0 1 0 1.8L4.6 20.6a1 1 0 0 1-1.42-1.16L5 12.9h6.5a.9.9 0 0 0 0-1.8H5L3.18 4.56A1 1 0 0 1 4.6 3.4" />
+      </symbol>
+      <symbol id="i-arrow-up" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V6m0 0-6 6m6-6 6 6" />
+      </symbol>
+      <symbol id="i-cpu" viewBox="0 0 24 24">
+        <rect x="7" y="7" width="10" height="10" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <rect x="10" y="10" width="4" height="4" rx="1" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10 4v2m4-2v2m-4 12v2m4-2v2M4 10h2m-2 4h2m12-4h2m-2 4h2" />
+      </symbol>
+      <symbol id="i-caret" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7" />
       </symbol>
       <symbol id="i-sparkle" viewBox="0 0 24 24">
         <path fill="currentColor" d="M12 2.2c.34 2.86 1.94 4.46 4.8 4.8-2.86.34-4.46 1.94-4.8 4.8-.34-2.86-1.94-4.46-4.8-4.8 2.86-.34 4.46-1.94 4.8-4.8" />

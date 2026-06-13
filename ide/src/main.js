@@ -326,7 +326,113 @@ function saveConfig(c) {
 function refreshModelBadge() {
   const c = loadConfig();
   modelBadge.textContent = c.model && c.apiKey ? c.model : "not configured";
+  syncModelPicker();
 }
+
+// ---- model picker (bottom-bar dropdown) ----
+const MODEL_GROUPS = [
+  {
+    label: "OpenAI",
+    models: [
+      { id: "gpt-4o", meta: "Most capable" },
+      { id: "gpt-4o-mini", meta: "Fast · cheap" },
+      { id: "gpt-4.1", meta: "" },
+      { id: "o3-mini", meta: "Reasoning" },
+    ],
+  },
+  {
+    label: "Anthropic",
+    models: [
+      { id: "claude-3-7-sonnet", meta: "" },
+      { id: "claude-3-5-sonnet", meta: "" },
+      { id: "claude-3-5-haiku", meta: "Fast" },
+    ],
+  },
+  {
+    label: "Local",
+    models: [
+      { id: "llama3.1", meta: "Ollama" },
+      { id: "qwen2.5-coder", meta: "Ollama" },
+    ],
+  },
+];
+
+const modelPicker = $("modelPicker");
+const modelPickerBtn = $("modelPickerBtn");
+const modelPickerLabel = $("modelPickerLabel");
+const modelMenu = $("modelMenu");
+
+function syncModelPicker() {
+  const c = loadConfig();
+  modelPickerLabel.textContent = c.model || "Select model";
+}
+
+function buildModelMenu() {
+  const current = loadConfig().model;
+  modelMenu.innerHTML = "";
+  for (const group of MODEL_GROUPS) {
+    const g = document.createElement("div");
+    g.className = "menu__group";
+    g.textContent = group.label;
+    modelMenu.appendChild(g);
+    for (const m of group.models) {
+      const item = document.createElement("div");
+      item.className = "menu__item" + (m.id === current ? " is-active" : "");
+      item.setAttribute("role", "option");
+      const meta = m.meta ? `<span class="meta">${m.meta}</span>` : "";
+      const mark =
+        m.id === current
+          ? `<svg class="check"><use href="#i-check" /></svg>`
+          : meta;
+      item.innerHTML = `<svg class="ic"><use href="#i-cpu" /></svg><span class="name"></span>${mark}`;
+      item.querySelector(".name").textContent = m.id;
+      item.addEventListener("click", () => {
+        selectModel(m.id);
+        closeModelMenu();
+      });
+      modelMenu.appendChild(item);
+    }
+  }
+  const sep = document.createElement("div");
+  sep.className = "menu__sep";
+  modelMenu.appendChild(sep);
+  const cfg = document.createElement("div");
+  cfg.className = "menu__item";
+  cfg.innerHTML = `<svg class="ic"><use href="#i-gear" /></svg><span>Configure provider…</span>`;
+  cfg.addEventListener("click", () => {
+    closeModelMenu();
+    openSettings();
+  });
+  modelMenu.appendChild(cfg);
+}
+
+function selectModel(model) {
+  const c = loadConfig();
+  saveConfig({ ...c, model });
+  refreshModelBadge();
+}
+
+function openModelMenu() {
+  buildModelMenu();
+  modelMenu.hidden = false;
+  modelPicker.classList.add("is-open");
+  modelPickerBtn.setAttribute("aria-expanded", "true");
+}
+function closeModelMenu() {
+  modelMenu.hidden = true;
+  modelPicker.classList.remove("is-open");
+  modelPickerBtn.setAttribute("aria-expanded", "false");
+}
+modelPickerBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  modelMenu.hidden ? openModelMenu() : closeModelMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!modelMenu.hidden && !modelPicker.contains(e.target)) closeModelMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !modelMenu.hidden) closeModelMenu();
+});
 
 const history = [];
 let streaming = false;

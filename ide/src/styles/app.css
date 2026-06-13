@@ -569,44 +569,198 @@ kbd {
   padding: 0 16px;
 }
 
-/* ---- composer ---- */
+/* ---- composer (Cursor/Devin-style input card) ---- */
 .composer {
-  display: flex;
-  gap: 8px;
-  align-items: flex-end;
-  padding: 10px;
+  padding: 12px;
   border-top: 1px solid var(--line);
   background: var(--panel-solid);
 }
-.composer textarea {
-  flex: 1;
-  resize: none;
-  max-height: 160px;
-  font-family: var(--font);
-  font-size: 13.5px;
-  line-height: 1.45;
-  color: var(--text);
+.composer__box {
+  display: flex;
+  flex-direction: column;
   background: var(--editor-bg);
   border: 1px solid var(--line-strong);
-  border-radius: 11px;
-  padding: 9px 12px;
+  border-radius: 14px;
+  padding: 4px 4px 4px 0;
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.13s ease, box-shadow 0.13s ease;
+}
+.composer__box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--sel);
+}
+.composer textarea {
+  resize: none;
+  max-height: 168px;
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  padding: 10px 12px 4px;
   outline: none;
   user-select: text;
-  transition: border-color 0.13s ease, box-shadow 0.13s ease;
 }
 .composer textarea::placeholder {
   color: var(--text-dim);
 }
-.composer textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--sel);
+.composer__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 8px;
+}
+.composer__hint {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  opacity: 0.65;
 }
 .send {
-  width: 36px;
-  height: 36px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   flex: none;
-  border-radius: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  background: linear-gradient(180deg, #2b95ff, var(--accent));
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(10, 132, 255, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: filter 0.13s ease, transform 0.08s ease, opacity 0.13s ease;
+}
+.send .ic {
+  width: 17px;
+  height: 17px;
+}
+.send:hover {
+  filter: brightness(1.06);
+}
+.send:active {
+  transform: scale(0.94);
+}
+
+/* ---- model picker + dropdown ---- */
+.model-picker {
+  position: relative;
+}
+.model-picker__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  max-width: 180px;
+  padding: 0 7px;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.model-picker__btn:hover,
+.model-picker.is-open .model-picker__btn {
+  background: var(--hover);
+  border-color: var(--line);
+  color: var(--text);
+}
+.model-picker__btn .ic {
+  width: 14px;
+  height: 14px;
+}
+.model-picker__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker__caret {
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
+  transition: transform 0.14s ease;
+}
+.model-picker.is-open .model-picker__caret {
+  transform: rotate(180deg);
+}
+.menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 232px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  z-index: 60;
+  animation: menu-in 0.14s ease both;
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+}
+.menu__group {
+  padding: 5px 9px 3px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.menu__item:hover {
+  background: var(--hover);
+}
+.menu__item .ic {
+  width: 15px;
+  height: 15px;
+  color: var(--text-dim);
+  flex: none;
+}
+.menu__item .meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.menu__item.is-active {
+  color: var(--accent);
+}
+.menu__item.is-active .ic,
+.menu__item.is-active .check {
+  color: var(--accent);
+}
+.menu__item .check {
+  margin-left: auto;
+  width: 15px;
+  height: 15px;
+  color: var(--accent);
+}
+.menu__sep {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--line);
 }
 
 /* ---- buttons ---- */
