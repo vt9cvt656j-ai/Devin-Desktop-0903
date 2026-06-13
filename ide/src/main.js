@@ -78,6 +78,9 @@ async function tauriBackend() {
     gitUnstageAll: (root) => core.invoke("git_unstage_all", { root }),
     gitCommit: (root, message) => core.invoke("git_commit", { root, message }),
     gitPush: (root) => core.invoke("git_push", { root }),
+    gitBranches: (root) => core.invoke("git_branches", { root }),
+    gitCheckout: (root, branch, create) => core.invoke("git_checkout", { root, branch, create }),
+    gitPull: (root) => core.invoke("git_pull", { root }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -144,6 +147,9 @@ function mockBackend() {
     { rel: "src/utils/format.js", code: "M ", label: "Modified", staged: true, deleted: false },
     { rel: "components/Card.js", code: "??", label: "Untracked", staged: false, deleted: false },
   ];
+  // Simulated branches for the browser preview's branch picker.
+  let GIT_BRANCH = "main";
+  const GIT_BRANCHES = ["main", "feature/login", "release/1.0"];
 
   const parentOf = (p) => p.slice(0, p.lastIndexOf("/"));
   const baseOf = (p) => p.slice(p.lastIndexOf("/") + 1);
@@ -320,7 +326,7 @@ function mockBackend() {
         staged: c.staged,
         deleted: c.deleted,
       }));
-      return { is_repo: true, branch: "main", files };
+      return { is_repo: true, branch: GIT_BRANCH, files };
     },
     gitFileHead: async (root, rel) => {
       const prefix = root.endsWith("/") ? root : root + "/";
@@ -370,6 +376,19 @@ function mockBackend() {
       return `${hash} ${msg}`;
     },
     gitPush: async (_root) => "Everything up-to-date (preview mock).",
+    gitBranches: async (_root) => ({ current: GIT_BRANCH, branches: [...GIT_BRANCHES] }),
+    gitCheckout: async (_root, branch, create) => {
+      const name = (branch || "").trim();
+      if (!name) throw new Error("Branch name is empty.");
+      if (create) {
+        if (GIT_BRANCHES.includes(name)) throw new Error(`Branch '${name}' already exists.`);
+        GIT_BRANCHES.push(name);
+      } else if (!GIT_BRANCHES.includes(name)) {
+        throw new Error(`Branch '${name}' not found.`);
+      }
+      GIT_BRANCH = name;
+    },
+    gitPull: async (_root) => "Already up to date. (preview mock)",
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -556,6 +575,7 @@ function activate(path) {
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
   $("windowTitle").textContent = f.name + " — Michael IDE";
+  refreshGutter();
 }
 
 function closeFile(path) {
@@ -572,6 +592,7 @@ function closeFile(path) {
       monacoEditor.setModel(monaco.editor.createModel("", "plaintext"));
       saveBtn.disabled = true;
       $("windowTitle").textContent = "Michael IDE";
+      refreshGutter();
     }
   }
   renderTabs();
@@ -1383,6 +1404,8 @@ function cssEscape(s) {
 const gitListEl = $("gitList");
 const gitBranchNameEl = $("gitBranchName");
 let gitActiveRel = null;
+// Whether the open folder is a git repo — gates the editor diff gutter.
+let gitIsRepo = false;
 
 /** Single-letter badge + colour class for a porcelain status code. */
 function gitBadge(file) {
@@ -1403,19 +1426,25 @@ async function refreshGitStatus() {
   try {
     status = await backend.gitStatus(rootPath);
   } catch (e) {
+    gitIsRepo = false;
     gitBranchNameEl.textContent = "—";
     gitListEl.innerHTML = `<div class="git-empty"></div>`;
     gitListEl.firstChild.textContent = String(e);
+    refreshGutter();
     return;
   }
   if (!status.is_repo) {
+    gitIsRepo = false;
     gitBranchNameEl.textContent = "—";
     gitListEl.innerHTML = `<div class="git-empty">This folder is not a Git repository.</div>`;
+    refreshGutter();
     return;
   }
+  gitIsRepo = true;
   gitBranchNameEl.textContent = status.branch;
   gitBranchNameEl.parentElement.title = "On branch " + status.branch;
   renderGitFiles(status.files);
+  refreshGutter();
 }
 
 function renderGitFiles(files) {
@@ -1552,6 +1581,260 @@ async function gitPush() {
     showToast(String(e && e.message ? e.message : e));
   }
 }
+
+async function gitPull() {
+  if (!rootPath) return;
+  showToast("Pulling…");
+  try {
+    const res = await backend.gitPull(rootPath);
+    showToast(res.split("\n").pop() || "Pulled.");
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
+  await afterWorktreeChange();
+}
+
+// ---- branch picker ----
+const gitBranchMenuEl = $("gitBranchMenu");
+const gitBranchBtnEl = $("gitBranchBtn");
+
+function closeBranchMenu() {
+  gitBranchMenuEl.hidden = true;
+  gitBranchMenuEl.innerHTML = "";
+  gitBranchBtnEl.setAttribute("aria-expanded", "false");
+}
+
+async function toggleBranchMenu() {
+  if (!gitBranchMenuEl.hidden) {
+    closeBranchMenu();
+    return;
+  }
+  if (!rootPath || !gitIsRepo) {
+    showToast("Open a Git repository first.");
+    return;
+  }
+  let info;
+  try {
+    info = await backend.gitBranches(rootPath);
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+    return;
+  }
+  renderBranchMenu(info);
+  gitBranchMenuEl.hidden = false;
+  gitBranchBtnEl.setAttribute("aria-expanded", "true");
+}
+
+function renderBranchMenu(info) {
+  gitBranchMenuEl.innerHTML = "";
+  const list = document.createElement("div");
+  list.className = "git-branch-menu__list";
+  for (const name of info.branches) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "git-branch-item" + (name === info.current ? " is-current" : "");
+    const check = document.createElement("span");
+    check.className = "git-branch-item__check";
+    check.textContent = name === info.current ? "✓" : "";
+    const label = document.createElement("span");
+    label.className = "git-branch-item__name";
+    label.textContent = name;
+    item.append(check, label);
+    if (name === info.current) {
+      item.disabled = true;
+    } else {
+      item.addEventListener("click", () => switchBranch(name));
+    }
+    list.appendChild(item);
+  }
+  gitBranchMenuEl.appendChild(list);
+
+  const create = document.createElement("button");
+  create.type = "button";
+  create.className = "git-branch-create";
+  create.innerHTML = `<svg class="ic"><use href="#i-plus" /></svg><span>Create new branch…</span>`;
+  create.addEventListener("click", () => createBranch());
+  gitBranchMenuEl.appendChild(create);
+}
+
+async function switchBranch(name) {
+  closeBranchMenu();
+  showToast("Switching to " + name + "…");
+  try {
+    await backend.gitCheckout(rootPath, name, false);
+    showToast("Switched to branch '" + name + "'");
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+    return;
+  }
+  await afterWorktreeChange();
+}
+
+async function createBranch() {
+  closeBranchMenu();
+  const name = (window.prompt("New branch name:") || "").trim();
+  if (!name) return;
+  try {
+    await backend.gitCheckout(rootPath, name, true);
+    showToast("Created and switched to '" + name + "'");
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+    return;
+  }
+  await afterWorktreeChange();
+}
+
+// After an op that may rewrite the working tree (checkout/pull), reload
+// non-dirty open files from disk and refresh git state + diff gutter.
+async function afterWorktreeChange() {
+  closeDiffView();
+  for (const [path, f] of openFiles) {
+    if (f.dirty) continue;
+    try {
+      const content = await backend.readTextFile(path);
+      if (content !== f.model.getValue()) {
+        const pos = path === activePath ? monacoEditor.getPosition() : null;
+        f.model.setValue(content);
+        if (pos) monacoEditor.setPosition(pos);
+      }
+    } catch {
+      /* file may not exist on the new branch */
+    }
+  }
+  if (rootPath) await reloadDir(rootPath);
+  await refreshGitStatus();
+}
+
+// ---- editor diff gutter (dirty diff vs HEAD) ----
+const gutterDecorations = monacoEditor.createDecorationsCollection([]);
+let gutterBaselinePath = null;
+let gutterBaselineText = null;
+let gutterTimer = null;
+
+function relForPath(path) {
+  if (!rootPath || !path) return null;
+  const prefix = rootPath.endsWith("/") ? rootPath : rootPath + "/";
+  return path.startsWith(prefix) ? path.slice(prefix.length) : null;
+}
+
+// Reload the HEAD baseline for the active file, then redraw the gutter.
+async function refreshGutter() {
+  const path = activePath;
+  const rel = relForPath(path);
+  if (!gitIsRepo || !rel) {
+    gutterBaselinePath = null;
+    gutterBaselineText = null;
+    updateGutter();
+    return;
+  }
+  let head = "";
+  try {
+    head = await backend.gitFileHead(rootPath, rel);
+  } catch {
+    head = "";
+  }
+  gutterBaselinePath = path;
+  // Empty HEAD = untracked/new file — skip gutter to avoid all-green noise.
+  gutterBaselineText = head === "" ? null : head;
+  updateGutter();
+}
+
+// Recompute decorations from the cached baseline + current editor content.
+function updateGutter() {
+  if (gutterBaselinePath !== activePath || gutterBaselineText == null) {
+    gutterDecorations.set([]);
+    return;
+  }
+  const model = monacoEditor.getModel();
+  if (!model) {
+    gutterDecorations.set([]);
+    return;
+  }
+  const orig = gutterBaselineText.split("\n");
+  const mod = model.getValue().split("\n");
+  // Guard against pathological sizes (O(n*m) LCS).
+  if (orig.length > 4000 || mod.length > 4000) {
+    gutterDecorations.set([]);
+    return;
+  }
+  const lineCount = model.getLineCount();
+  const decos = [];
+  for (const h of lineDiffHunks(orig, mod)) {
+    if (h.aCount === 0 && h.bCount > 0) {
+      for (let k = 0; k < h.bCount; k++) decos.push(gutterDeco(h.bStart + 1 + k, "gutter-add"));
+    } else if (h.bCount === 0 && h.aCount > 0) {
+      decos.push(gutterDeco(Math.min(Math.max(h.bStart, 1), lineCount), "gutter-del"));
+    } else {
+      for (let k = 0; k < h.bCount; k++) decos.push(gutterDeco(h.bStart + 1 + k, "gutter-mod"));
+    }
+  }
+  gutterDecorations.set(decos);
+}
+
+function gutterDeco(line, cls) {
+  return {
+    range: new monaco.Range(line, 1, line, 1),
+    options: { isWholeLine: true, linesDecorationsClassName: "git-gutter " + cls },
+  };
+}
+
+// Longest-common-subsequence line diff → change hunks (0-based indices).
+function lineDiffHunks(a, b) {
+  const n = a.length;
+  const m = b.length;
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const hunks = [];
+  let cur = null;
+  const flush = () => {
+    if (cur) {
+      hunks.push(cur);
+      cur = null;
+    }
+  };
+  let i = 0;
+  let j = 0;
+  const open = () => {
+    if (!cur) cur = { aStart: i, aCount: 0, bStart: j, bCount: 0 };
+  };
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      flush();
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      open();
+      cur.aCount++;
+      i++;
+    } else {
+      open();
+      cur.bCount++;
+      j++;
+    }
+  }
+  while (i < n) {
+    open();
+    cur.aCount++;
+    i++;
+  }
+  while (j < m) {
+    open();
+    cur.bCount++;
+    j++;
+  }
+  flush();
+  return hunks;
+}
+
+monacoEditor.onDidChangeModelContent(() => {
+  if (gutterTimer) clearTimeout(gutterTimer);
+  gutterTimer = setTimeout(updateGutter, 250);
+});
 
 // ---- diff view ----
 let diffEditor = null;
@@ -2135,7 +2418,17 @@ $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabSearch").addEventListener("click", () => showSide("search"));
 $("tabGit").addEventListener("click", () => showSide("git"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
+$("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
+$("gitBranchBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleBranchMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!gitBranchMenuEl.hidden && !gitBranchMenuEl.contains(e.target) && !gitBranchBtnEl.contains(e.target)) {
+    closeBranchMenu();
+  }
+});
 $("gitCommitBtn").addEventListener("click", () => gitCommit());
 $("gitCommitMsg").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {

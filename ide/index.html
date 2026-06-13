@@ -86,12 +86,15 @@
         <!-- Source Control (Git) view -->
         <div class="side-view" id="viewGit" hidden>
           <div class="git-bar">
-            <span class="git-branch" id="gitBranch" title="Current branch">
+            <button class="git-branch" id="gitBranchBtn" type="button" title="Current branch — click to switch" aria-haspopup="true" aria-expanded="false">
               <svg class="ic"><use href="#i-git" /></svg>
               <span id="gitBranchName">—</span>
-            </span>
+              <svg class="ic git-branch__caret"><use href="#i-chevron" /></svg>
+            </button>
+            <button class="iconbtn" id="gitPullBtn" type="button" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
             <button class="iconbtn" id="gitPushBtn" type="button" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
             <button class="iconbtn" id="gitRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+            <div class="git-branch-menu" id="gitBranchMenu" hidden></div>
           </div>
           <div class="git-commit">
             <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" placeholder="Message (commit staged changes)"></textarea>
@@ -278,6 +281,9 @@
       </symbol>
       <symbol id="i-arrow-up" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V6m0 0-6 6m6-6 6 6" />
+      </symbol>
+      <symbol id="i-arrow-down" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 5v13m0 0 6-6m-6 6-6-6" />
       </symbol>
       <symbol id="i-cpu" viewBox="0 0 24 24">
         <rect x="7" y="7" width="10" height="10" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />

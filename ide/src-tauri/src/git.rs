@@ -283,3 +283,77 @@ pub fn git_push(root: String) -> Result<String, String> {
         })
     }
 }
+
+/// Local branches plus the name of the current branch, for the branch picker.
+#[derive(Serialize)]
+pub struct GitBranches {
+    /// Current branch (empty on a detached HEAD or a repo with no commits).
+    current: String,
+    /// Local branch names, in `git branch` order.
+    branches: Vec<String>,
+}
+
+/// List local branches and report which one is checked out.
+#[tauri::command]
+pub fn git_branches(root: String) -> Result<GitBranches, String> {
+    let head = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let mut current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if current == "HEAD" {
+        // Detached HEAD has no branch name.
+        current = String::new();
+    }
+    let out = run_git(&root, &["branch", "--format=%(refname:short)"])?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "git branch failed".into()
+        } else {
+            err
+        });
+    }
+    let branches = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(GitBranches { current, branches })
+}
+
+/// Switch to `branch`, optionally creating it first (`git checkout [-b]`).
+#[tauri::command]
+pub fn git_checkout(root: String, branch: String, create: bool) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Branch name is empty.".into());
+    }
+    if create {
+        run_git_checked(&root, &["checkout", "-b", branch]).map(|_| ())
+    } else {
+        run_git_checked(&root, &["checkout", branch]).map(|_| ())
+    }
+}
+
+/// Pull the current branch from its upstream (`git pull`).
+///
+/// Returns combined stdout/stderr because git reports progress on stderr even
+/// on success.
+#[tauri::command]
+pub fn git_pull(root: String) -> Result<String, String> {
+    let out = run_git(&root, &["pull"])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}").trim().to_string();
+    if out.status.success() {
+        Ok(if combined.is_empty() {
+            "Already up to date.".into()
+        } else {
+            combined
+        })
+    } else {
+        Err(if combined.is_empty() {
+            "git pull failed".into()
+        } else {
+            combined
+        })
+    }
+}
