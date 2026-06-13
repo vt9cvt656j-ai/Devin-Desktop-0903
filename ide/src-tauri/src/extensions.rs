@@ -17,6 +17,11 @@ use tauri::{AppHandle, Manager};
 /// Largest text asset the frontend may read back from an extension (2 MiB).
 const MAX_ASSET: u64 = 2 * 1024 * 1024;
 
+/// Per-file cap applied when unpacking an extension archive (16 MiB).
+const MAX_UNPACKED_FILE: u64 = 16 * 1024 * 1024;
+/// Total cap on the unpacked size of an extension archive (64 MiB).
+const MAX_UNPACKED_TOTAL: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandContribution {
     pub id: String,
@@ -296,16 +301,45 @@ pub fn ext_install_from_path(
     let prefix = find_manifest_prefix(&mut archive)?;
     let manifest = read_zip_manifest(&mut archive, &prefix)?;
     validate_id(&manifest.id)?;
-
     let ext_dir = dir.join(&manifest.id);
+
+    // Validate every entry up front, BEFORE touching the existing install:
+    // reject unsafe paths (zip-slip) and enforce an extraction budget
+    // (zip-bomb). Doing this first guarantees a malformed archive can never
+    // delete an already-installed extension partway through extraction.
+    let mut declared_total: u64 = 0;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        // `enclosed_name` returns None for unsafe paths (zip-slip protection).
+        let Some(name) = entry.enclosed_name() else {
+            return Err("archive contains an unsafe path".into());
+        };
+        let name = name.to_string_lossy().replace('\\', "/");
+        let rel = name.strip_prefix(&prefix).unwrap_or(&name);
+        if rel.is_empty() {
+            continue;
+        }
+        // Ensure the destination stays inside the extension directory.
+        safe_join(&ext_dir, rel)?;
+        if !entry.is_dir() {
+            if entry.size() > MAX_UNPACKED_FILE {
+                return Err("extension file is too large".into());
+            }
+            declared_total = declared_total.saturating_add(entry.size());
+            if declared_total > MAX_UNPACKED_TOTAL {
+                return Err("extension archive is too large".into());
+            }
+        }
+    }
+
     if ext_dir.exists() {
         fs::remove_dir_all(&ext_dir).map_err(|e| e.to_string())?;
     }
     fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
 
+    let mut written_total: u64 = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        // `enclosed_name` returns None for unsafe paths (zip-slip protection).
         let Some(name) = entry.enclosed_name() else {
             return Err("archive contains an unsafe path".into());
         };
@@ -322,7 +356,17 @@ pub fn ext_install_from_path(
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let mut out = fs::File::create(&target).map_err(|e| e.to_string())?;
-            io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+            // Defense-in-depth: cap the bytes actually written in case a zip
+            // header understated the real entry size.
+            let mut limited = entry.by_ref().take(MAX_UNPACKED_FILE + 1);
+            let n = io::copy(&mut limited, &mut out).map_err(|e| e.to_string())?;
+            if n > MAX_UNPACKED_FILE {
+                return Err("extension file is too large".into());
+            }
+            written_total = written_total.saturating_add(n);
+            if written_total > MAX_UNPACKED_TOTAL {
+                return Err("extension archive is too large".into());
+            }
         }
     }
 
