@@ -24,6 +24,32 @@ self.MonacoEnvironment = {
   },
 };
 
+// Configure Monaco's bundled TypeScript language service so JS/TS files get
+// real completions, hover, signature help, go-to-definition and live
+// diagnostics — not just syntax highlighting. This needs no external language
+// server, so it works in both the native app and the browser preview.
+(function configureLanguageService() {
+  const ts = monaco.languages.typescript;
+  const compilerOptions = {
+    target: ts.ScriptTarget.ESNext,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeJs,
+    allowJs: true,
+    checkJs: false,
+    allowNonTsExtensions: true,
+    esModuleInterop: true,
+    jsx: ts.JsxEmit.ReactJSX,
+    skipLibCheck: true,
+    noEmit: true,
+    baseUrl: ".",
+  };
+  for (const d of [ts.typescriptDefaults, ts.javascriptDefaults]) {
+    d.setCompilerOptions(compilerOptions);
+    d.setEagerModelSync(true);
+    d.setDiagnosticsOptions({ noSemanticValidation: false, noSyntaxValidation: false });
+  }
+})();
+
 // ---- backend abstraction (Tauri when available, mock in a plain browser) ----
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 // Reserve room for the macOS traffic-light buttons only when running natively.
@@ -96,6 +122,8 @@ function mockBackend() {
       'export function greet(name) {\n  const who = name?.trim() || "world";\n  return `Hello, ${who}!`;\n}\n',
     [ROOT + "/src/utils/dom.js"]:
       'export function mount(el, text) {\n  el.textContent = text;\n}\n',
+    [ROOT + "/src/utils/math.ts"]:
+      "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nexport function clamp(value: number, min: number, max: number): number {\n  return Math.min(Math.max(value, min), max);\n}\n\nexport const TAU = Math.PI * 2;\n",
     [ROOT + "/components/Button.js"]:
       'export function Button(label) {\n  const el = document.createElement("button");\n  el.textContent = label;\n  return el;\n}\n',
     [ROOT + "/components/Card.js"]:
@@ -431,9 +459,50 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   if (term) term.options.theme = termTheme();
 });
 
+// Route "go to definition" (and similar) to a resource other than the current
+// model through our own tab system, then move the cursor to the target.
+monaco.editor.registerEditorOpener({
+  openCodeEditor(_source, resource, selectionOrPosition) {
+    const path = resource.fsPath || resource.path;
+    if (!path) return false;
+    const name = path.split("/").pop();
+    Promise.resolve(openFile(path, name)).then((opened) => {
+      if (!opened || !selectionOrPosition) return;
+      const pos =
+        "startLineNumber" in selectionOrPosition
+          ? { lineNumber: selectionOrPosition.startLineNumber, column: selectionOrPosition.startColumn }
+          : selectionOrPosition;
+      monacoEditor.revealPositionInCenter(pos);
+      monacoEditor.setPosition(pos);
+      monacoEditor.focus();
+    });
+    return true;
+  },
+});
+
 /** path -> { model, name, dirty, viewState } */
 const openFiles = new Map();
 let activePath = null;
+
+// Paths whose Monaco model is kept alive as part of the language-service
+// "project" (so cross-file go-to-definition / completion resolves even when the
+// target file isn't open in a tab). These models are not disposed on close.
+const projectModels = new Set();
+
+// Create (or reuse) a model addressed by its real path so the TypeScript
+// language service treats files as one project and can resolve imports across
+// them. Reuses any model preloaded by the project walk.
+function getOrCreateModel(path, name, content) {
+  const uri = monaco.Uri.file(path);
+  let model = monaco.editor.getModel(uri);
+  if (model) {
+    if (content != null && model.getValue() !== content) model.setValue(content);
+    return model;
+  }
+  model = monaco.editor.createModel(content ?? "", extLang(name), uri);
+  model.onDidChangeContent(() => markDirty(path, true));
+  return model;
+}
 
 function extLang(name) {
   const ext = name.split(".").pop().toLowerCase();
@@ -456,20 +525,20 @@ function syncWelcome() {
 async function openFile(path, name) {
   if (openFiles.has(path)) {
     activate(path);
-    return;
+    return true;
   }
   let content;
   try {
     content = await backend.readTextFile(path);
   } catch (e) {
     showToast(String(e));
-    return;
+    return false;
   }
-  const model = monaco.editor.createModel(content, extLang(name));
-  model.onDidChangeContent(() => markDirty(path, true));
+  const model = getOrCreateModel(path, name, content);
   openFiles.set(path, { model, name, dirty: false, viewState: null });
   renderTabs();
   activate(path);
+  return true;
 }
 
 function activate(path) {
@@ -492,7 +561,8 @@ function activate(path) {
 function closeFile(path) {
   const f = openFiles.get(path);
   if (!f) return;
-  f.model.dispose();
+  // Keep project models alive so language features still resolve this file.
+  if (!projectModels.has(path)) f.model.dispose();
   openFiles.delete(path);
   if (activePath === path) {
     activePath = null;
@@ -693,7 +763,166 @@ async function openFolder(path) {
   setExplorerToolsEnabled(true);
   await renderChildren(path, rootContainer);
   renderTreeActive();
+  preloadProjectModels(path);
 }
+
+// Eagerly load the workspace's JS/TS/JSON files into the TypeScript language
+// service so imports resolve and go-to-definition works across files the user
+// hasn't opened yet. Skips heavy/irrelevant directories and caps the count so
+// large repos stay responsive; runs in the background (not awaited).
+const PRELOAD_CODE_EXT = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "json"]);
+const PRELOAD_SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", "out", "target",
+  ".next", "coverage", ".cache", ".vscode", "vendor",
+]);
+const PRELOAD_MAX_FILES = 1500;
+const PRELOAD_MAX_BYTES = 512 * 1024;
+let preloadToken = 0;
+
+async function preloadProjectModels(root) {
+  const token = ++preloadToken;
+  // Drop project models from a previously opened folder.
+  for (const p of projectModels) {
+    if (openFiles.has(p)) continue;
+    const m = monaco.editor.getModel(monaco.Uri.file(p));
+    if (m) m.dispose();
+  }
+  projectModels.clear();
+
+  let count = 0;
+  const stack = [root];
+  while (stack.length && count < PRELOAD_MAX_FILES) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await backend.readDir(dir);
+    } catch {
+      continue;
+    }
+    if (token !== preloadToken) return; // folder changed mid-walk
+    for (const entry of entries) {
+      if (entry.is_dir) {
+        if (!PRELOAD_SKIP_DIRS.has(entry.name)) stack.push(entry.path);
+        continue;
+      }
+      const ext = entry.name.includes(".") ? entry.name.split(".").pop().toLowerCase() : "";
+      if (!PRELOAD_CODE_EXT.has(ext) || count >= PRELOAD_MAX_FILES) continue;
+      let content;
+      try {
+        content = await backend.readTextFile(entry.path);
+      } catch {
+        continue;
+      }
+      if (token !== preloadToken) return;
+      if (content.length > PRELOAD_MAX_BYTES) continue;
+      // Never clobber a file the user has open (and may be editing): its model
+      // is already alive in the language service.
+      if (openFiles.has(entry.path)) {
+        projectModels.add(entry.path);
+        count++;
+        continue;
+      }
+      getOrCreateModel(entry.path, entry.name, content);
+      projectModels.add(entry.path);
+      count++;
+    }
+  }
+}
+
+// ---- diagnostics / problems panel ----
+const SEV = monaco.MarkerSeverity;
+const problemsPanel = $("problemsPanel");
+const problemsBody = $("problemsBody");
+
+function pathBase(p) {
+  return p.slice(p.lastIndexOf("/") + 1);
+}
+function pathForDisplay(p) {
+  if (rootPath && p.startsWith(rootPath + "/")) return p.slice(rootPath.length + 1);
+  return pathBase(p);
+}
+
+function gotoMarker(path, marker) {
+  Promise.resolve(openFile(path, pathBase(path))).then((opened) => {
+    if (!opened) return;
+    monacoEditor.revealLineInCenter(marker.startLineNumber);
+    monacoEditor.setPosition({ lineNumber: marker.startLineNumber, column: marker.startColumn });
+    monacoEditor.focus();
+  });
+}
+
+function renderProblems(markers) {
+  if (!problemsBody) return;
+  problemsBody.innerHTML = "";
+  if (!markers.length) {
+    const empty = document.createElement("div");
+    empty.className = "problems__empty";
+    empty.textContent = "No problems have been detected.";
+    problemsBody.appendChild(empty);
+    return;
+  }
+  const byFile = new Map();
+  for (const m of markers) {
+    const key = m.resource.toString();
+    if (!byFile.has(key)) byFile.set(key, { path: m.resource.fsPath || m.resource.path, items: [] });
+    byFile.get(key).items.push(m);
+  }
+  for (const { path, items } of byFile.values()) {
+    const head = document.createElement("div");
+    head.className = "problems__file";
+    head.innerHTML = `${iconImg(fileIconUrl(pathBase(path)))}<span class="problems__file-name"></span><span class="problems__file-count"></span>`;
+    head.querySelector(".problems__file-name").textContent = pathForDisplay(path);
+    head.querySelector(".problems__file-count").textContent = String(items.length);
+    problemsBody.appendChild(head);
+    for (const m of items) {
+      const isErr = m.severity === SEV.Error;
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "problems__item problems__item--" + (isErr ? "error" : "warn");
+      item.innerHTML = `<svg class="ic"><use href="#i-${isErr ? "error" : "warn"}" /></svg><span class="problems__msg"></span><span class="problems__loc"></span>`;
+      item.querySelector(".problems__msg").textContent = m.message;
+      item.querySelector(".problems__loc").textContent = `Ln ${m.startLineNumber}, Col ${m.startColumn}`;
+      item.addEventListener("click", () => gotoMarker(path, m));
+      problemsBody.appendChild(item);
+    }
+  }
+}
+
+function updateProblems() {
+  const markers = monaco.editor
+    .getModelMarkers({})
+    // Only real files — skip in-memory models such as the diff viewer's panes.
+    .filter(
+      (m) =>
+        m.resource.scheme === "file" &&
+        (m.severity === SEV.Error || m.severity === SEV.Warning),
+    );
+  let err = 0;
+  let warn = 0;
+  for (const m of markers) {
+    if (m.severity === SEV.Error) err++;
+    else warn++;
+  }
+  const errEl = $("problemsErrCount");
+  const warnEl = $("problemsWarnCount");
+  if (errEl) errEl.textContent = String(err);
+  if (warnEl) warnEl.textContent = String(warn);
+  $("problemsBtn")?.classList.toggle("has-errors", err > 0);
+  if (problemsPanel && !problemsPanel.hidden) renderProblems(markers);
+}
+
+function toggleProblems() {
+  if (!problemsPanel) return;
+  problemsPanel.hidden = !problemsPanel.hidden;
+  if (!problemsPanel.hidden) updateProblems();
+}
+
+monaco.editor.onDidChangeMarkers(() => updateProblems());
+$("problemsBtn")?.addEventListener("click", toggleProblems);
+$("problemsClose")?.addEventListener("click", () => {
+  if (problemsPanel) problemsPanel.hidden = true;
+});
+updateProblems();
 
 async function renderChildren(path, container) {
   let entries;
@@ -1791,6 +2020,7 @@ const MENUS = [
       { label: "Toggle Explorer", icon: "i-sidebar-left", action: () => togglePane("explorer") },
       { label: "Toggle Assistant", icon: "i-sidebar-right", action: () => togglePane("assistant") },
       { label: "Toggle Terminal", icon: "i-terminal", hint: "⌃`", action: () => toggleTerminal() },
+      { label: "Problems", icon: "i-error", hint: "⇧⌘M", action: () => toggleProblems() },
       { sep: true },
       { label: "Command Palette…", icon: "i-command", hint: "⌘⇧P", action: () => editorAction("editor.action.quickCommand") },
     ],
@@ -1975,6 +2205,9 @@ window.addEventListener("keydown", (e) => {
   } else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "g") {
     e.preventDefault();
     showSide("git");
+  } else if (mod && e.shiftKey && e.key.toLowerCase() === "m") {
+    e.preventDefault();
+    toggleProblems();
   }
 });
 
