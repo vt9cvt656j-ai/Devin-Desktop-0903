@@ -84,7 +84,6 @@ const editorEl = $("editor");
 const welcomeEl = $("welcome");
 const chatEl = $("chat");
 const rootNameEl = $("rootName");
-const modelBadge = $("modelBadge");
 const saveBtn = $("saveBtn");
 const toastEl = $("toast");
 
@@ -324,8 +323,6 @@ function saveConfig(c) {
   localStorage.setItem(CFG_KEY, JSON.stringify(c));
 }
 function refreshModelBadge() {
-  const c = loadConfig();
-  modelBadge.textContent = c.model && c.apiKey ? c.model : "not configured";
   syncModelPicker();
 }
 

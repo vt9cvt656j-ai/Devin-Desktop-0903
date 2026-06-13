@@ -208,24 +208,40 @@ body {
   height: 13px;
   color: var(--accent-2);
 }
+.panel__head--assistant {
+  height: 44px;
+}
+.assistant__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.assistant__avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 1px 4px rgba(124, 92, 255, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.assistant__avatar .ic {
+  width: 15px;
+  height: 15px;
+}
+.assistant__name {
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
 .panel__hint {
   font-size: 11px;
   color: var(--text-dim);
   max-width: 130px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.badge {
-  display: inline-flex;
-  align-items: center;
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--accent);
-  background: var(--sel);
-  padding: 2px 9px;
-  border-radius: 999px;
-  max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
