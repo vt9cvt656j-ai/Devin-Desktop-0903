@@ -34,7 +34,7 @@
         </header>
         <div class="tree" id="tree">
           <div class="empty">
-            <svg class="empty__art"><use href="#i-folder-open" /></svg>
+            <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
             <p>Open a folder to get started.</p>
             <button class="btn btn--primary" id="emptyOpenBtn">Open folder…</button>
           </div>
@@ -46,16 +46,23 @@
         <div class="tabs" id="tabs"></div>
         <div class="editor" id="editor"></div>
         <div class="welcome" id="welcome">
-          <svg class="welcome__logo"><use href="#i-logo" /></svg>
+          <svg class="welcome__hero" viewBox="0 0 240 160"><use href="#art-hero" /></svg>
           <h1>Devin IDE</h1>
-          <p>A macOS-style editor with an AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+          <p>A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+          <div class="welcome__tips">
+            <span class="kbd-tip"><kbd>⌘</kbd><kbd>S</kbd> Save</span>
+            <span class="kbd-tip"><kbd>⌘</kbd><kbd>↩</kbd> Ask assistant</span>
+          </div>
         </div>
       </section>
 
       <!-- Right: AI assistant -->
       <aside class="panel assistant" id="assistant">
         <header class="panel__head">
-          <span class="panel__title">Assistant</span>
+          <span class="panel__title">
+            <svg class="ic ic--sparkle"><use href="#i-sparkle" /></svg>
+            Assistant
+          </span>
           <span class="badge" id="modelBadge">not configured</span>
         </header>
         <div class="chat" id="chat"></div>
@@ -71,6 +78,7 @@
     <!-- Settings dialog -->
     <dialog class="sheet" id="settings">
       <form method="dialog" class="sheet__body" id="settingsForm">
+        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
         <h2>AI provider</h2>
         <p class="sheet__sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
         <label>Base URL
@@ -97,16 +105,19 @@
           <stop offset="0" stop-color="#0a84ff" />
           <stop offset="1" stop-color="#7c5cff" />
         </linearGradient>
+        <linearGradient id="g-accent" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
       </defs>
+
+      <!-- UI glyphs (inherit currentColor) -->
       <symbol id="i-folder" viewBox="0 0 24 24">
         <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
       </symbol>
       <symbol id="i-folder-open" viewBox="0 0 24 24">
         <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5V10H7.7a2 2 0 0 0-1.9 1.37L3 19.5z" opacity=".5" />
         <path fill="currentColor" d="M6.2 11.5A1.5 1.5 0 0 1 7.62 10.5H22l-2.2 6.6A2 2 0 0 1 17.9 18.5H3.4z" />
-      </symbol>
-      <symbol id="i-file" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" />
       </symbol>
       <symbol id="i-chevron" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9 6 6 6-6 6" />
@@ -120,12 +131,84 @@
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.4 13.5a7.5 7.5 0 0 0 0-3l1.8-1.4-1.8-3.1-2.1.8a7.5 7.5 0 0 0-2.6-1.5L14.2 2H9.8l-.3 2.3a7.5 7.5 0 0 0-2.6 1.5l-2.1-.8-1.8 3.1L4.6 10.5a7.5 7.5 0 0 0 0 3l-1.8 1.4 1.8 3.1 2.1-.8a7.5 7.5 0 0 0 2.6 1.5l.3 2.3h4.4l.3-2.3a7.5 7.5 0 0 0 2.6-1.5l2.1.8 1.8-3.1z" />
       </symbol>
       <symbol id="i-send" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M3.4 3.3 21 12 3.4 20.7 6 12zM6 12H3.4z" />
-        <path fill="currentColor" d="M5.6 4.7 19 12 5.6 19.3 7.7 12.9H13a.9.9 0 0 0 0-1.8H7.7z" />
+        <path fill="currentColor" d="M4.6 3.4 20.5 11.1a1 1 0 0 1 0 1.8L4.6 20.6a1 1 0 0 1-1.42-1.16L5 12.9h6.5a.9.9 0 0 0 0-1.8H5L3.18 4.56A1 1 0 0 1 4.6 3.4" />
+      </symbol>
+      <symbol id="i-sparkle" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 2.2c.34 2.86 1.94 4.46 4.8 4.8-2.86.34-4.46 1.94-4.8 4.8-.34-2.86-1.94-4.46-4.8-4.8 2.86-.34 4.46-1.94 4.8-4.8" />
+        <path fill="currentColor" d="M18.5 13c.2 1.66 1.14 2.6 2.8 2.8-1.66.2-2.6 1.14-2.8 2.8-.2-1.66-1.14-2.6-2.8-2.8 1.66-.2 2.6-1.14 2.8-2.8" opacity=".7" />
+      </symbol>
+      <symbol id="i-close" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
       </symbol>
       <symbol id="i-logo" viewBox="0 0 64 64">
         <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#g-logo)" />
         <path fill="#fff" d="M22 22h9c7 0 11 4 11 10s-4 10-11 10h-9zm6 5v10h3c3.4 0 5-1.8 5-5s-1.6-5-5-5z" />
+      </symbol>
+
+      <!-- File-type glyphs (tinted via .ic--<type> color) -->
+      <symbol id="i-file" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" />
+      </symbol>
+      <symbol id="i-file-code" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="m10 12-2 2 2 2m4-4 2 2-2 2" />
+      </symbol>
+      <symbol id="i-file-style" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8.5 13h3m1.5 0h2M8.5 16.5h2m1.5 0h3" />
+      </symbol>
+      <symbol id="i-file-data" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11 11.5c-1.3 0-1.3 1.2-1.3 2.5S9.7 16.5 8.4 16.5m4.6-5c1.3 0 1.3 1.2 1.3 2.5s0 2.5 1.3 2.5" />
+      </symbol>
+      <symbol id="i-file-doc" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 12.5h8M8 15.5h5" />
+      </symbol>
+      <symbol id="i-file-image" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <circle cx="10" cy="13" r="1.2" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="m8 18 2.5-2.6 1.6 1.4 2-2.2L17 18z" />
+      </symbol>
+
+      <!-- Illustrations -->
+      <symbol id="art-hero" viewBox="0 0 240 160">
+        <rect x="22" y="22" width="196" height="116" rx="14" fill="currentColor" opacity=".04" />
+        <rect x="22.5" y="22.5" width="195" height="115" rx="13.5" fill="none" stroke="currentColor" stroke-opacity=".14" />
+        <path d="M22 36a14 14 0 0 1 14-14h168a14 14 0 0 1 14 14v6H22z" fill="currentColor" opacity=".05" />
+        <circle cx="38" cy="32" r="3.2" fill="#ff5f57" />
+        <circle cx="50" cy="32" r="3.2" fill="#febc2e" />
+        <circle cx="62" cy="32" r="3.2" fill="#28c840" />
+        <line x1="86" y1="42" x2="86" y2="138" stroke="currentColor" stroke-opacity=".12" />
+        <g fill="currentColor" opacity=".18">
+          <rect x="34" y="58" width="40" height="6" rx="3" />
+          <rect x="34" y="72" width="32" height="6" rx="3" />
+          <rect x="34" y="86" width="40" height="6" rx="3" />
+          <rect x="34" y="100" width="28" height="6" rx="3" />
+        </g>
+        <g>
+          <rect x="100" y="56" width="20" height="7" rx="3.5" fill="url(#g-accent)" />
+          <rect x="124" y="56" width="46" height="7" rx="3.5" fill="currentColor" opacity=".22" />
+          <rect x="110" y="71" width="34" height="7" rx="3.5" fill="currentColor" opacity=".22" />
+          <rect x="148" y="71" width="40" height="7" rx="3.5" fill="url(#g-accent)" opacity=".55" />
+          <rect x="110" y="86" width="58" height="7" rx="3.5" fill="currentColor" opacity=".22" />
+          <rect x="100" y="101" width="26" height="7" rx="3.5" fill="url(#g-accent)" opacity=".7" />
+          <rect x="130" y="101" width="30" height="7" rx="3.5" fill="currentColor" opacity=".22" />
+        </g>
+        <g transform="translate(150 96)">
+          <rect x="0" y="0" width="74" height="46" rx="13" fill="url(#g-accent)" />
+          <path d="M14 46l8-9h-8z" fill="url(#g-accent)" />
+          <path fill="#fff" d="M24 14.5c.3 2.5 1.7 3.9 4.2 4.2-2.5.3-3.9 1.7-4.2 4.2-.3-2.5-1.7-3.9-4.2-4.2 2.5-.3 3.9-1.7 4.2-4.2" />
+          <rect x="34" y="16" width="30" height="4.6" rx="2.3" fill="#fff" opacity=".95" />
+          <rect x="34" y="25" width="22" height="4.6" rx="2.3" fill="#fff" opacity=".7" />
+        </g>
+      </symbol>
+      <symbol id="art-folder" viewBox="0 0 120 96">
+        <path fill="currentColor" opacity=".12" d="M18 26a8 8 0 0 1 8-8h18a8 8 0 0 1 5.6 2.3l4.4 4.4H94a8 8 0 0 1 8 8V42H18z" />
+        <path fill="currentColor" opacity=".22" d="M22 40a7 7 0 0 1 6.8-5.4H100a7 7 0 0 1 6.8 8.6l-7 28A8 8 0 0 1 92 78H22a8 8 0 0 1-8-8V36a7 7 0 0 1 8 4z" />
+        <g transform="translate(78 12)">
+          <path fill="url(#g-accent)" d="M11 0c.4 3.2 2.4 5.2 5.6 5.6-3.2.4-5.2 2.4-5.6 5.6-.4-3.2-2.4-5.2-5.6-5.6C8.6 5.2 10.6 3.2 11 0" />
+        </g>
       </symbol>
     </svg>
     <script type="module" src="/src/main.js"></script>

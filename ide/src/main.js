@@ -206,10 +206,12 @@ function renderTabs() {
   for (const [path, f] of openFiles) {
     const tab = document.createElement("div");
     tab.className = "tab" + (path === activePath ? " is-active" : "") + (f.dirty ? " dirty" : "");
-    tab.innerHTML = `<span class="dot"></span><span class="label"></span><span class="x">×</span>`;
+    const fi = fileIcon(f.name);
+    tab.innerHTML =
+      `${iconSvg(fi.id, fi.cls)}<span class="label"></span>` +
+      `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
     tab.querySelector(".label").textContent = f.name;
-    tab.querySelector(".label").addEventListener("click", () => activate(path));
-    tab.querySelector(".dot").addEventListener("click", () => activate(path));
+    tab.addEventListener("click", () => activate(path));
     tab.querySelector(".x").addEventListener("click", (e) => {
       e.stopPropagation();
       closeFile(path);
@@ -221,8 +223,31 @@ function renderTabs() {
 // ---- file tree ----
 let rootPath = null;
 
-function iconSvg(id) {
-  return `<svg class="ic"><use href="#${id}" /></svg>`;
+function iconSvg(id, cls = "") {
+  return `<svg class="ic ${cls}"><use href="#${id}" /></svg>`;
+}
+
+/** Map a filename to an SVG glyph id + a color class. */
+function fileIcon(name) {
+  const ext = name.split(".").pop().toLowerCase();
+  const code = {
+    js: "js", jsx: "js", mjs: "js", cjs: "js", ts: "ts", tsx: "ts",
+    rs: "rust", py: "py", go: "go", java: "java", c: "c", h: "c", cpp: "cpp",
+    hpp: "cpp", cc: "cpp", rb: "ruby", php: "php", swift: "swift", kt: "kotlin",
+    sh: "shell", bash: "shell",
+  };
+  const markup = { html: "html", htm: "html", xml: "html", svg: "img", vue: "html" };
+  const style = { css: "style", scss: "style", less: "style", sass: "style" };
+  const data = { json: "data", yml: "data", yaml: "data", toml: "data", ini: "data", sql: "data", lock: "data" };
+  const doc = { md: "doc", markdown: "doc", txt: "doc", rst: "doc" };
+  const image = { png: "img", jpg: "img", jpeg: "img", gif: "img", webp: "img", ico: "img", svg: "img", avif: "img" };
+  if (ext in code) return { id: "i-file-code", cls: "ic--" + code[ext] };
+  if (ext in style) return { id: "i-file-style", cls: "ic--style" };
+  if (ext in data) return { id: "i-file-data", cls: "ic--data" };
+  if (ext in image) return { id: "i-file-image", cls: "ic--img" };
+  if (ext in markup) return { id: "i-file-code", cls: "ic--html" };
+  if (ext in doc) return { id: "i-file-doc", cls: "ic--doc" };
+  return { id: "i-file", cls: "ic--doc" };
 }
 
 async function openFolder(path) {
@@ -248,9 +273,10 @@ async function renderChildren(path, container) {
     row.className = "row";
     row.dataset.path = entry.path;
     if (entry.is_dir) {
-      row.innerHTML = `<svg class="chev"><use href="#i-chevron" /></svg>${iconSvg("i-folder")}<span class="name"></span>`;
+      row.innerHTML = `<svg class="chev"><use href="#i-chevron" /></svg>${iconSvg("i-folder", "ic--folder")}<span class="name"></span>`;
     } else {
-      row.innerHTML = `<span style="width:14px;flex:none"></span>${iconSvg("i-file")}<span class="name"></span>`;
+      const fi = fileIcon(entry.name);
+      row.innerHTML = `<span class="chev-spacer"></span>${iconSvg(fi.id, fi.cls)}<span class="name"></span>`;
     }
     row.querySelector(".name").textContent = entry.name;
     container.appendChild(row);
@@ -308,8 +334,9 @@ let streaming = false;
 function addMessage(role, text) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
-  wrap.innerHTML = `<span class="msg__who"></span><div class="msg__body"></div>`;
-  wrap.querySelector(".msg__who").textContent = role === "user" ? "You" : "Assistant";
+  const whoIcon = role === "assistant" ? `<svg class="ic"><use href="#i-sparkle" /></svg>` : "";
+  wrap.innerHTML = `<span class="msg__who">${whoIcon}<span></span></span><div class="msg__body"></div>`;
+  wrap.querySelector(".msg__who span").textContent = role === "user" ? "You" : "Assistant";
   const body = wrap.querySelector(".msg__body");
   body.textContent = text;
   chatEl.appendChild(wrap);
