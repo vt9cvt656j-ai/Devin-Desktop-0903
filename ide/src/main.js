@@ -1,4 +1,4 @@
-// Devin IDE — editor + AI assistant orchestration.
+// Michael IDE — editor + AI assistant orchestration.
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
@@ -19,6 +19,8 @@ self.MonacoEnvironment = {
 
 // ---- backend abstraction (Tauri when available, mock in a plain browser) ----
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+// Reserve room for the macOS traffic-light buttons only when running natively.
+if (inTauri) document.body.classList.add("is-tauri");
 const backend = inTauri ? await tauriBackend() : mockBackend();
 
 async function tauriBackend() {
@@ -82,7 +84,7 @@ function mockBackend() {
         `  return \`Hello, \${who}!\`;`,
         `}`,
         ``,
-        `console.log(greet("Devin")); // "Hello, Devin!"`,
+        `console.log(greet("Michael")); // "Hello, Michael!"`,
         `\`\`\``,
         ``,
         `> Tip: select code in the editor and it's sent as context automatically.`,
@@ -189,7 +191,7 @@ function activate(path) {
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
-  $("windowTitle").textContent = f.name + " — Devin IDE";
+  $("windowTitle").textContent = f.name + " — Michael IDE";
 }
 
 function closeFile(path) {
@@ -204,7 +206,7 @@ function closeFile(path) {
     else {
       monacoEditor.setModel(monaco.editor.createModel("", "plaintext"));
       saveBtn.disabled = true;
-      $("windowTitle").textContent = "Devin IDE";
+      $("windowTitle").textContent = "Michael IDE";
     }
   }
   renderTabs();
@@ -569,7 +571,7 @@ function showChatHint() {
   const hint = document.createElement("div");
   hint.className = "chat-empty";
   hint.innerHTML =
-    `<div class="chat-empty__icon"><svg class="ic"><use href="#i-sparkle" /></svg></div>` +
+    `<div class="chat-empty__icon"><svg class="ic"><use href="#i-monogram" /></svg></div>` +
     `<h3>Ask about your code</h3>` +
     `<p>The open file — and any text you select — is sent as context automatically.</p>` +
     `<div class="chat-empty__chips"></div>`;
@@ -603,7 +605,7 @@ async function sendPrompt(text) {
 
   // Build the request: system prompt, optional file context, history, prompt.
   const messages = [
-    { role: "system", content: "You are Devin IDE's coding assistant. Be concise and precise. Use fenced code blocks for code." },
+    { role: "system", content: "You are Michael IDE's coding assistant. Be concise and precise. Use fenced code blocks for code." },
   ];
   if (activePath) {
     const f = openFiles.get(activePath);
@@ -692,6 +694,146 @@ function showToast(msg) {
   toastTimer = setTimeout(() => toastEl.classList.remove("is-visible"), 1900);
 }
 
+// ---- titlebar menu bar (Cursor/Devin-style) ----
+function editorAction(id) {
+  monacoEditor.focus();
+  monacoEditor.getAction(id)?.run();
+}
+function editorTrigger(cmd) {
+  monacoEditor.focus();
+  monacoEditor.trigger("menubar", cmd, null);
+}
+function togglePane(which) {
+  document.querySelector(".layout")?.classList.toggle("hide-" + which);
+}
+function openExternal(url) {
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+const MENUS = [
+  {
+    label: "File",
+    items: [
+      { label: "Open Folder…", icon: "i-folder", hint: "⌘O", action: () => chooseFolder() },
+      { label: "Save", icon: "i-save", hint: "⌘S", action: () => saveActive() },
+      { sep: true },
+      { label: "Close File", icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
+    ],
+  },
+  {
+    label: "Edit",
+    items: [
+      { label: "Undo", icon: "i-undo", hint: "⌘Z", action: () => editorTrigger("undo") },
+      { label: "Redo", icon: "i-redo", hint: "⇧⌘Z", action: () => editorTrigger("redo") },
+      { sep: true },
+      { label: "Find…", icon: "i-search", hint: "⌘F", action: () => editorAction("actions.find") },
+      { label: "Replace…", icon: "i-replace", hint: "⌥⌘F", action: () => editorAction("editor.action.startFindReplaceAction") },
+    ],
+  },
+  {
+    label: "View",
+    items: [
+      { label: "Toggle Explorer", icon: "i-sidebar-left", action: () => togglePane("explorer") },
+      { label: "Toggle Assistant", icon: "i-sidebar-right", action: () => togglePane("assistant") },
+      { sep: true },
+      { label: "Command Palette…", icon: "i-command", hint: "⌘⇧P", action: () => editorAction("editor.action.quickCommand") },
+    ],
+  },
+  {
+    label: "Help",
+    items: [
+      { label: "Documentation", icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
+      { label: "AI Settings…", icon: "i-gear", action: () => openSettings() },
+      { sep: true },
+      { label: "About Michael IDE", icon: "i-info", action: () => showToast("Michael IDE — a macOS-style editor with a built-in AI assistant") },
+    ],
+  },
+];
+
+function buildMenubar() {
+  const bar = $("menubar");
+  if (!bar) return;
+  const buttons = [];
+  const panels = [];
+  let openIdx = -1;
+
+  const closeMenu = () => {
+    if (openIdx < 0) return;
+    panels[openIdx].hidden = true;
+    buttons[openIdx].classList.remove("is-open");
+    buttons[openIdx].setAttribute("aria-expanded", "false");
+    openIdx = -1;
+  };
+  const openMenu = (i) => {
+    if (openIdx === i) return;
+    closeMenu();
+    panels[i].hidden = false;
+    buttons[i].classList.add("is-open");
+    buttons[i].setAttribute("aria-expanded", "true");
+    openIdx = i;
+  };
+
+  MENUS.forEach((menu, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "tb-menu";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tb-menu__btn";
+    btn.textContent = menu.label;
+    btn.setAttribute("aria-haspopup", "true");
+    btn.setAttribute("aria-expanded", "false");
+    const panel = document.createElement("div");
+    panel.className = "menu menu--tb";
+    panel.setAttribute("role", "menu");
+    panel.hidden = true;
+    for (const entry of menu.items) {
+      if (entry.sep) {
+        const sep = document.createElement("div");
+        sep.className = "menu__sep";
+        panel.appendChild(sep);
+        continue;
+      }
+      const mi = document.createElement("div");
+      mi.className = "menu__item";
+      mi.setAttribute("role", "menuitem");
+      mi.innerHTML =
+        (entry.icon ? `<svg class="ic" aria-hidden="true"><use href="#${entry.icon}" /></svg>` : "") +
+        `<span class="name"></span>` +
+        (entry.hint ? `<span class="meta"></span>` : "");
+      mi.querySelector(".name").textContent = entry.label;
+      if (entry.hint) mi.querySelector(".meta").textContent = entry.hint;
+      mi.addEventListener("click", () => {
+        closeMenu();
+        try {
+          entry.action();
+        } catch (e) {
+          showToast(String(e));
+        }
+      });
+      panel.appendChild(mi);
+    }
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (openIdx === i) closeMenu();
+      else openMenu(i);
+    });
+    btn.addEventListener("mouseenter", () => {
+      if (openIdx >= 0) openMenu(i);
+    });
+    wrap.append(btn, panel);
+    bar.appendChild(wrap);
+    buttons.push(btn);
+    panels.push(panel);
+  });
+
+  document.addEventListener("click", (e) => {
+    if (openIdx >= 0 && !bar.contains(e.target)) closeMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeMenu();
+  });
+}
+
 // ---- wiring ----
 async function chooseFolder() {
   const picked = await backend.pickFolder();
@@ -729,6 +871,7 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+buildMenubar();
 refreshModelBadge();
 showChatHint();
 syncWelcome();
