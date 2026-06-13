@@ -1688,6 +1688,7 @@ async function createBranch() {
 // non-dirty open files from disk and refresh git state + diff gutter.
 async function afterWorktreeChange() {
   closeDiffView();
+  const gone = [];
   for (const [path, f] of openFiles) {
     if (f.dirty) continue;
     try {
@@ -1695,12 +1696,17 @@ async function afterWorktreeChange() {
       if (content !== f.model.getValue()) {
         const pos = path === activePath ? monacoEditor.getPosition() : null;
         f.model.setValue(content);
+        // setValue fires onDidChangeContent → markDirty(true); reset it since
+        // the file now matches disk again.
+        markDirty(path, false);
         if (pos) monacoEditor.setPosition(pos);
       }
     } catch {
-      /* file may not exist on the new branch */
+      // File doesn't exist on the new branch — close its (clean) tab.
+      gone.push(path);
     }
   }
+  for (const path of gone) closeFile(path);
   if (rootPath) await reloadDir(rootPath);
   await refreshGitStatus();
 }
@@ -1733,6 +1739,7 @@ async function refreshGutter() {
   } catch {
     head = "";
   }
+  if (path !== activePath) return; // user switched files during the fetch
   gutterBaselinePath = path;
   // Empty HEAD = untracked/new file — skip gutter to avoid all-green noise.
   gutterBaselineText = head === "" ? null : head;
