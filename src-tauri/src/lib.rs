@@ -124,6 +124,12 @@ async fn start_bridge(
     };
     let status = BridgeStatus::from(&running);
     let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+    if guard.is_some() {
+        // Another concurrent start_bridge won the race; tear down the server we
+        // just spawned so we don't leave an orphan, and report the conflict.
+        let _ = running.shutdown.send(());
+        return Err("bridge is already running; stop it first".into());
+    }
     *guard = Some(running);
     Ok(status)
 }

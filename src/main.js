@@ -24,7 +24,7 @@ function mockBackend() {
   const token = () =>
     Array.from({ length: 40 }, () =>
       "ABCDEFGHJKMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz"[
-        Math.floor(Math.random() * 54)
+        Math.floor(Math.random() * 55)
       ]
     ).join("");
   return {

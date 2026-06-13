@@ -7,7 +7,7 @@ const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxy
 /// uniform and unbiased. The token is the sole authentication barrier when the
 /// bridge is exposed through a tunnel, so it must be unpredictable.
 pub fn generate_token(len: usize) -> String {
-    let n = ALPHABET.len() as u16; // 54
+    let n = ALPHABET.len() as u16; // 55
                                    // Largest multiple of `n` that fits in a byte; values >= this are rejected
                                    // to avoid modulo bias.
     let limit = (256 / n) * n;
