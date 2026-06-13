@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Devin Desktop</title>
+    <link rel="stylesheet" href="/src/styles/app.css" />
+  </head>
+  <body>
+    <!-- The top strip is draggable and leaves room for the macOS traffic lights. -->
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="titlebar__brand" data-tauri-drag-region>
+        <img class="titlebar__logo" src="/src/assets/logo.svg" alt="" />
+        <span class="titlebar__title" data-tauri-drag-region>Devin Desktop</span>
+      </div>
+      <span id="versionBadge" class="titlebar__version">v0.1.0</span>
+    </header>
+
+    <main class="app">
+      <!-- Hero / status -->
+      <section class="card hero">
+        <div class="hero__illustration" id="heroArt"></div>
+        <div class="hero__body">
+          <div class="status" id="statusPill">
+            <span class="status__dot"></span>
+            <span class="status__label" id="statusLabel">Stopped</span>
+          </div>
+          <h1 class="hero__headline" id="heroHeadline">Share a folder with Devin</h1>
+          <p class="hero__sub" id="heroSub">
+            Run a secure, token-protected bridge on your Mac so Devin can read and
+            write files inside a single folder you choose.
+          </p>
+        </div>
+      </section>
+
+      <!-- Folder + options -->
+      <section class="card">
+        <div class="field">
+          <label class="field__label">Shared folder</label>
+          <div class="field__row">
+            <div class="path-box" id="folderPath" title="">Choose a folder to share…</div>
+            <button class="btn btn--ghost" id="pickFolderBtn">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#folder"/></svg>
+              Choose…
+            </button>
+          </div>
+        </div>
+
+        <div class="field field--inline">
+          <div class="field__text">
+            <label class="field__label">Allow writes</label>
+            <p class="field__hint">When off, the bridge is strictly read-only.</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="allowWrite" checked />
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+          </label>
+        </div>
+
+        <button class="btn btn--primary btn--block" id="toggleBtn" disabled>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#power"/></svg>
+          <span id="toggleLabel">Start bridge</span>
+        </button>
+      </section>
+
+      <!-- Connection details (only meaningful while running) -->
+      <section class="card connection" id="connectionCard" hidden>
+        <h2 class="card__title">Connection</h2>
+
+        <div class="kv">
+          <span class="kv__key">Local URL</span>
+          <div class="kv__val">
+            <code id="urlValue">—</code>
+            <button class="iconbtn" data-copy="urlValue" title="Copy URL">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#copy"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="kv">
+          <span class="kv__key">Access token</span>
+          <div class="kv__val">
+            <code id="tokenValue" class="masked">—</code>
+            <button class="iconbtn" id="revealToken" title="Reveal token">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#eye"/></svg>
+            </button>
+            <button class="iconbtn" data-copy="tokenValue" title="Copy token">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#copy"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <p class="connection__hint">
+          <svg class="icon icon--inline" viewBox="0 0 24 24" aria-hidden="true"><use href="/src/assets/icons.svg#lock"/></svg>
+          Every request must send <code>Authorization: Bearer &lt;token&gt;</code>.
+          The bridge listens on loopback only — expose it to Devin with a tunnel.
+        </p>
+      </section>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
