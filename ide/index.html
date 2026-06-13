@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Devin IDE</title>
+    <link rel="stylesheet" href="/src/styles/app.css" />
+  </head>
+  <body>
+    <div class="titlebar" data-tauri-drag-region>
+      <div class="titlebar__lead"></div>
+      <div class="titlebar__title" id="windowTitle">Devin IDE</div>
+      <div class="titlebar__actions">
+        <button class="tbtn" id="openFolderBtn" title="Open folder">
+          <svg class="ic"><use href="#i-folder" /></svg>
+          <span>Open</span>
+        </button>
+        <button class="tbtn" id="saveBtn" title="Save (⌘S)" disabled>
+          <svg class="ic"><use href="#i-save" /></svg>
+          <span>Save</span>
+        </button>
+        <button class="tbtn tbtn--icon" id="settingsBtn" title="AI settings">
+          <svg class="ic"><use href="#i-gear" /></svg>
+        </button>
+      </div>
+    </div>
+
+    <main class="layout">
+      <!-- Left: file explorer -->
+      <aside class="panel explorer" id="explorer">
+        <header class="panel__head">
+          <span class="panel__title">Explorer</span>
+          <span class="panel__hint" id="rootName">No folder</span>
+        </header>
+        <div class="tree" id="tree">
+          <div class="empty">
+            <svg class="empty__art"><use href="#i-folder-open" /></svg>
+            <p>Open a folder to get started.</p>
+            <button class="btn btn--primary" id="emptyOpenBtn">Open folder…</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: tabs + editor -->
+      <section class="editorwrap">
+        <div class="tabs" id="tabs"></div>
+        <div class="editor" id="editor"></div>
+        <div class="welcome" id="welcome">
+          <svg class="welcome__logo"><use href="#i-logo" /></svg>
+          <h1>Devin IDE</h1>
+          <p>A macOS-style editor with an AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+        </div>
+      </section>
+
+      <!-- Right: AI assistant -->
+      <aside class="panel assistant" id="assistant">
+        <header class="panel__head">
+          <span class="panel__title">Assistant</span>
+          <span class="badge" id="modelBadge">not configured</span>
+        </header>
+        <div class="chat" id="chat"></div>
+        <form class="composer" id="composer">
+          <textarea id="prompt" rows="1" placeholder="Ask about the open file… (⌘↩ to send)"></textarea>
+          <button class="btn btn--primary send" id="sendBtn" type="submit" title="Send">
+            <svg class="ic"><use href="#i-send" /></svg>
+          </button>
+        </form>
+      </aside>
+    </main>
+
+    <!-- Settings dialog -->
+    <dialog class="sheet" id="settings">
+      <form method="dialog" class="sheet__body" id="settingsForm">
+        <h2>AI provider</h2>
+        <p class="sheet__sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
+        <label>Base URL
+          <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" />
+        </label>
+        <label>API key
+          <input id="cfgApiKey" type="password" placeholder="sk-…" />
+        </label>
+        <label>Model
+          <input id="cfgModel" type="text" placeholder="gpt-4o-mini" />
+        </label>
+        <div class="sheet__actions">
+          <button class="btn" value="cancel" formnovalidate>Cancel</button>
+          <button class="btn btn--primary" id="saveCfgBtn" value="save">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast"></div>
+
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <defs>
+        <linearGradient id="g-logo" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
+      </defs>
+      <symbol id="i-folder" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+      </symbol>
+      <symbol id="i-folder-open" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5V10H7.7a2 2 0 0 0-1.9 1.37L3 19.5z" opacity=".5" />
+        <path fill="currentColor" d="M6.2 11.5A1.5 1.5 0 0 1 7.62 10.5H22l-2.2 6.6A2 2 0 0 1 17.9 18.5H3.4z" />
+      </symbol>
+      <symbol id="i-file" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" />
+      </symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9 6 6 6-6 6" />
+      </symbol>
+      <symbol id="i-save" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M5 4h11l3 3v13H5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" d="M8 4v5h7V4M9 13h6v7H9z" />
+      </symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.4 13.5a7.5 7.5 0 0 0 0-3l1.8-1.4-1.8-3.1-2.1.8a7.5 7.5 0 0 0-2.6-1.5L14.2 2H9.8l-.3 2.3a7.5 7.5 0 0 0-2.6 1.5l-2.1-.8-1.8 3.1L4.6 10.5a7.5 7.5 0 0 0 0 3l-1.8 1.4 1.8 3.1 2.1-.8a7.5 7.5 0 0 0 2.6 1.5l.3 2.3h4.4l.3-2.3a7.5 7.5 0 0 0 2.6-1.5l2.1.8 1.8-3.1z" />
+      </symbol>
+      <symbol id="i-send" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3.4 3.3 21 12 3.4 20.7 6 12zM6 12H3.4z" />
+        <path fill="currentColor" d="M5.6 4.7 19 12 5.6 19.3 7.7 12.9H13a.9.9 0 0 0 0-1.8H7.7z" />
+      </symbol>
+      <symbol id="i-logo" viewBox="0 0 64 64">
+        <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#g-logo)" />
+        <path fill="#fff" d="M22 22h9c7 0 11 4 11 10s-4 10-11 10h-9zm6 5v10h3c3.4 0 5-1.8 5-5s-1.6-5-5-5z" />
+      </symbol>
+    </svg>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
