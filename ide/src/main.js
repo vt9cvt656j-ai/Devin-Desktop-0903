@@ -5,6 +5,10 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { ExtensionHost } from "./ext/host.js";
+import { createExtensionManager } from "./ext/manager.js";
+import { createCommandPalette } from "./ext/palette.js";
+import { createExtensionsPanel } from "./ext/panel.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -586,6 +590,117 @@ window.addEventListener("keydown", (e) => {
     saveActive();
   }
 });
+
+// ---- extensions ----
+const statusbarRight = $("statusbarRight");
+const statusItems = new Map();
+
+function setStatusBarItem(key, opts, onClick) {
+  let el = statusItems.get(key);
+  if (!el || el.tagName.toLowerCase() !== (onClick ? "button" : "span")) {
+    if (el) el.remove();
+    el = document.createElement(onClick ? "button" : "span");
+    el.className = "statusbar__item" + (onClick ? " statusbar__item--btn" : "");
+    statusItems.set(key, el);
+    statusbarRight.appendChild(el);
+  }
+  el.textContent = opts.text ?? "";
+  if (opts.tooltip) el.title = opts.tooltip;
+  else el.removeAttribute("title");
+  el.onclick = onClick || null;
+}
+
+function removeStatusBarItem(key) {
+  const el = statusItems.get(key);
+  if (el) {
+    el.remove();
+    statusItems.delete(key);
+  }
+}
+
+function insertAtCursor(text) {
+  const sel = monacoEditor.getSelection();
+  if (!sel) return;
+  monacoEditor.executeEdits("extension", [
+    { range: sel, text, forceMoveMarkers: true },
+  ]);
+  monacoEditor.focus();
+}
+
+const extHost = new ExtensionHost({
+  getEditorText: () => monacoEditor.getModel()?.getValue() ?? "",
+  getSelectionText: () => {
+    const sel = monacoEditor.getSelection();
+    const model = monacoEditor.getModel();
+    return sel && model && !sel.isEmpty() ? model.getValueInRange(sel) : "";
+  },
+  insertText: insertAtCursor,
+  showInformationMessage: (text) => showToast(text),
+  setStatusBarItem,
+  removeStatusBarItem,
+  readFile: (path) => backend.readTextFile(path),
+  writeFile: (path, content) => backend.writeTextFile(path, content),
+});
+
+const extManager = await createExtensionManager();
+const extPanel = createExtensionsPanel({
+  manager: extManager,
+  host: extHost,
+  showToast,
+});
+
+const palette = createCommandPalette({
+  getCommands: () => [
+    { id: "file.save", title: "Save File", category: "File", run: () => saveActive() },
+    {
+      id: "file.openFolder",
+      title: "Open Folder\u2026",
+      category: "File",
+      run: () => chooseFolder(),
+    },
+    {
+      id: "view.extensions",
+      title: "Show Extensions",
+      category: "View",
+      run: () => extPanel.open(),
+    },
+    {
+      id: "ai.settings",
+      title: "AI Provider Settings",
+      category: "Preferences",
+      run: () => openSettings(),
+    },
+    ...extHost.listCommands().map((c) => ({
+      ...c,
+      run: () => extHost.invokeCommand(c.id),
+    })),
+  ],
+});
+
+$("extensionsBtn").addEventListener("click", () => extPanel.open());
+$("paletteBtn").addEventListener("click", () => palette.open());
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "p") {
+      e.preventDefault();
+      e.stopPropagation();
+      palette.open();
+    }
+  },
+  true,
+);
+
+(async () => {
+  try {
+    const installed = await extManager.listInstalled();
+    for (const item of installed) {
+      if (item.enabled) await extHost.activate(item, extManager);
+    }
+  } catch (err) {
+    console.error("[extensions] init failed:", err);
+  }
+})();
 
 refreshModelBadge();
 showChatHint();
