@@ -677,6 +677,8 @@ function devinConfig() {
 
 function devinStatusText(s) {
   const map = {
+    claimed: "Devin is working…",
+    running: "Devin is working…",
     working: "Devin is working…",
     blocked: "Devin is waiting for your reply.",
     finished: "Devin finished.",
@@ -730,8 +732,9 @@ async function sendDevinPrompt(text) {
   addMessage("user", text);
   const status = addDevinStatus();
 
+  const continuing = !!devinSessionId;
   try {
-    if (!devinSessionId) {
+    if (!continuing) {
       status.set("Starting a Devin session…");
       const ctx = projectContext();
       const prompt = ctx ? `${text}\n\n---\nContext from my editor:\n${ctx}` : text;
@@ -744,7 +747,7 @@ async function sendDevinPrompt(text) {
       await backend.devinSendMessage(cfg, devinSessionId, text);
       status.set("Devin is working…");
     }
-    await pollDevin(cfg, status);
+    await pollDevin(cfg, status, continuing);
   } catch (e) {
     status.set("⚠️ " + String(e), { done: true });
   } finally {
@@ -752,9 +755,14 @@ async function sendDevinPrompt(text) {
   }
 }
 
-async function pollDevin(cfg, status) {
+// `awaitNew` is set when continuing a session: it may still report the
+// previous turn's terminal `blocked` state for a poll or two before Devin
+// picks up the new message, so we keep polling until a fresh agent message
+// actually arrives instead of stopping on that stale state.
+async function pollDevin(cfg, status, awaitNew = false) {
   const started = Date.now();
   const TIMEOUT_MS = 10 * 60 * 1000;
+  let sawNew = false;
   while (true) {
     let session;
     try {
@@ -774,10 +782,13 @@ async function pollDevin(cfg, status) {
       // The user's own prompts come back as `user_message` /
       // `initial_user_message`; we already render those locally. Show every
       // other message the agent emits (chat replies, progress notes, etc.).
-      if (!(m.type || "").endsWith("user_message")) addDevinMessage(m);
+      if (!(m.type || "").endsWith("user_message")) {
+        addDevinMessage(m);
+        sawNew = true;
+      }
     });
     const state = session.status_enum || session.status;
-    if (TERMINAL.has(state)) {
+    if (TERMINAL.has(state) && (!awaitNew || sawNew)) {
       status.set(devinStatusText(state), { done: true });
       return;
     }
