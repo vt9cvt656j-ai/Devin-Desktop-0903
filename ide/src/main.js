@@ -96,7 +96,7 @@ function mockBackend() {
       mockDevin.polls += 1;
       const done = mockDevin.polls >= 2;
       const messages = [
-        { type: "user_message", message: mockDevin.prompt, event_id: "u1" },
+        { type: "initial_user_message", message: mockDevin.prompt, event_id: "u1" },
         {
           type: "devin_progress_update",
           event_id: "p1",
@@ -771,9 +771,10 @@ async function pollDevin(cfg, status) {
       if (devinSeen.has(id)) return;
       devinSeen.add(id);
       if (!m.message) return;
-      // We already render the user's own prompt locally; show every other
-      // message the agent emits (chat replies, progress notes, etc.).
-      if (m.type !== "user_message") addDevinMessage(m);
+      // The user's own prompts come back as `user_message` /
+      // `initial_user_message`; we already render those locally. Show every
+      // other message the agent emits (chat replies, progress notes, etc.).
+      if (!(m.type || "").endsWith("user_message")) addDevinMessage(m);
     });
     const state = session.status_enum || session.status;
     if (TERMINAL.has(state)) {

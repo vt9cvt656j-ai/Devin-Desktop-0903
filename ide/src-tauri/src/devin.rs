@@ -52,7 +52,7 @@ pub struct DevinMessage {
     pub timestamp: String,
 }
 
-/// Subset of `GET /v1/sessions/{id}` we surface to the UI.
+/// Subset of `GET /v1/session/{id}` we surface to the UI.
 #[derive(Deserialize, Serialize, Clone)]
 pub struct DevinSession {
     pub session_id: String,
@@ -111,7 +111,7 @@ pub async fn devin_send_message(
     session_id: String,
     message: String,
 ) -> Result<(), String> {
-    let url = format!("{}/v1/sessions/{}/messages", config.base(), session_id);
+    let url = format!("{}/v1/session/{}/message", config.base(), session_id);
     let resp = client()?
         .post(&url)
         .bearer_auth(&config.api_key)
@@ -128,7 +128,7 @@ pub async fn devin_get_session(
     config: DevinConfig,
     session_id: String,
 ) -> Result<DevinSession, String> {
-    let url = format!("{}/v1/sessions/{}", config.base(), session_id);
+    let url = format!("{}/v1/session/{}", config.base(), session_id);
     let resp = client()?
         .get(&url)
         .bearer_auth(&config.api_key)
