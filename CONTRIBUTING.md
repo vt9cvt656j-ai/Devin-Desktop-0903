@@ -6,10 +6,10 @@ Thanks for your interest in improving Devin Desktop! This repository contains
 | Path | App | What it is |
 | --- | --- | --- |
 | repo root (`crates/`, `src-tauri/`, `src/`) | **Devin Desktop** | A token-protected local bridge that exposes one folder to cloud agents. |
-| [`ide/`](ide) | **Devin IDE** | A macOS-style Monaco editor with an AI assistant sidebar. |
+| [`ide/`](ide) | **Michael IDE** | A macOS-style Monaco editor with an AI assistant sidebar. |
 
 The two are **separate Cargo workspaces**, so Rust commands run from the relevant
-directory (repo root for Devin Desktop, `ide/` for Devin IDE).
+directory (repo root for Devin Desktop, `ide/` for Michael IDE).
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ npm run tauri dev            # run the app (Rust + Vite)
 npm run build                # build the frontend only
 ```
 
-Devin IDE (`ide/`):
+Michael IDE (`ide/`):
 
 ```bash
 cd ide
@@ -54,7 +54,7 @@ cargo clippy -p bridge-core --all-targets -- -D warnings
 cargo test -p bridge-core
 npm run build
 
-# Devin IDE
+# Michael IDE
 cd ide
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings

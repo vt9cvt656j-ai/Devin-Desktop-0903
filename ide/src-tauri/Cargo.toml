@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Devin IDE: a macOS-style code editor with an AI assistant sidebar."
+description = "Michael IDE: a macOS-style code editor with an AI assistant sidebar."
 default-run = "devin-ide"
 
 [lib]

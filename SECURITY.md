@@ -12,7 +12,7 @@ Please report security issues **privately** rather than opening a public issue.
 - We aim to acknowledge reports within a few days and will coordinate a fix and
   disclosure timeline with you.
 
-When reporting, include the affected app (Devin Desktop bridge or Devin IDE), a
+When reporting, include the affected app (Devin Desktop bridge or Michael IDE), a
 description of the issue, and steps to reproduce if possible.
 
 ## Supported versions
@@ -40,7 +40,7 @@ default**:
 If you find a way to bypass any of these guarantees, that is a security issue —
 please report it as described above.
 
-## Notes for the Devin IDE
+## Notes for Michael IDE
 
 The IDE stores the AI provider **API key in `localStorage`** and sends chat
 requests from the Rust backend to the configured OpenAI-compatible endpoint.

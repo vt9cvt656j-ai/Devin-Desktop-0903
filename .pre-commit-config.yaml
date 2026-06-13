@@ -24,7 +24,7 @@ repos:
         types: [rust]
         pass_filenames: false
       - id: rustfmt-ide
-        name: rustfmt (Devin IDE)
+        name: rustfmt (Michael IDE)
         entry: cargo fmt --manifest-path ide/Cargo.toml --all --
         language: system
         types: [rust]
