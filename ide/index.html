@@ -45,6 +45,9 @@
             <button class="seg__btn" id="tabSearch" type="button" role="tab" title="Search (⇧⌘F)">
               <svg class="ic"><use href="#i-search" /></svg><span>Search</span>
             </button>
+            <button class="seg__btn" id="tabGit" type="button" role="tab" title="Source Control (⌃⇧G)">
+              <svg class="ic"><use href="#i-git" /></svg><span>Source</span>
+            </button>
           </div>
         </header>
 
@@ -79,12 +82,37 @@
           </div>
           <div class="search-results" id="searchResults"></div>
         </div>
+
+        <!-- Source Control (Git) view -->
+        <div class="side-view" id="viewGit" hidden>
+          <div class="git-bar">
+            <span class="git-branch" id="gitBranch" title="Current branch">
+              <svg class="ic"><use href="#i-git" /></svg>
+              <span id="gitBranchName">—</span>
+            </span>
+            <button class="iconbtn" id="gitRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+          </div>
+          <div class="git-list" id="gitList"></div>
+        </div>
       </aside>
 
       <!-- Center: tabs + editor -->
       <section class="editorwrap">
         <div class="tabs" id="tabs"></div>
         <div class="editor" id="editor"></div>
+        <div class="diff-view" id="diffView" hidden>
+          <div class="diff-view__head">
+            <span class="diff-view__title">
+              <svg class="ic"><use href="#i-git" /></svg>
+              <span id="diffTitle">Diff</span>
+              <span class="diff-view__sub">HEAD ↔ Working Tree</span>
+            </span>
+            <button class="diff-view__close" id="diffClose" type="button" title="Close diff" aria-label="Close diff">
+              <svg class="ic"><use href="#i-close" /></svg>
+            </button>
+          </div>
+          <div class="diff-view__body" id="diffBody"></div>
+        </div>
         <div class="welcome" id="welcome">
           <svg class="welcome__hero" viewBox="0 0 240 160"><use href="#art-hero" /></svg>
           <h1>Michael IDE</h1>
@@ -340,6 +368,12 @@
       </symbol>
       <symbol id="i-trash" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 7h14M10 7V5h4v2M6.5 7l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9L17.5 7M10 11v6M14 11v6" />
+      </symbol>
+      <symbol id="i-git" viewBox="0 0 24 24">
+        <circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="6" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="18" cy="8.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M6 8.4v7.2M18 11v.5a4 4 0 0 1-4 4H8.4" />
       </symbol>
 
       <!-- File-type glyphs (tinted via .ic--<type> color) -->
