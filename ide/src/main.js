@@ -1,5 +1,7 @@
 // Devin IDE — editor + AI assistant orchestration.
 import * as monaco from "monaco-editor";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
@@ -93,13 +95,32 @@ function mockBackend() {
     devinGetSession: async (_config, sessionId) => {
       mockDevin.polls += 1;
       const done = mockDevin.polls >= 2;
-      const messages = [{ type: "user_message", message: mockDevin.prompt, event_id: "u1" }];
+      const messages = [
+        { type: "user_message", message: mockDevin.prompt, event_id: "u1" },
+        {
+          type: "devin_progress_update",
+          event_id: "p1",
+          message: "Cloning the repository and reading the open file you sent as context.",
+        },
+      ];
       if (done) {
         messages.push({
           type: "devin_message",
           event_id: "d1",
-          message:
-            "(preview mock) This is where Devin's reply would stream in. Add your Devin API key in settings and run the desktop app to talk to a real session.",
+          message: [
+            "**(preview mock)** This is where Devin's reply renders as Markdown:",
+            "",
+            "- bullet lists",
+            "- **bold** and `inline code`",
+            "",
+            "```js",
+            "export function hello(name) {",
+            "  return `Hi, ${name}!`;",
+            "}",
+            "```",
+            "",
+            "Add your Devin API key in settings and run the desktop app to talk to a real session.",
+          ].join("\n"),
         });
       }
       return {
@@ -513,6 +534,18 @@ document.addEventListener("keydown", (e) => {
 const history = [];
 let streaming = false;
 
+marked.setOptions({ gfm: true, breaks: true });
+
+/** Render assistant/agent text as sanitized markdown; user text stays literal. */
+function renderBody(body, role, text) {
+  if (role === "user") {
+    body.textContent = text;
+    return;
+  }
+  body.classList.add("md");
+  body.innerHTML = DOMPurify.sanitize(marked.parse(text || ""));
+}
+
 function addMessage(role, text, who) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -521,10 +554,40 @@ function addMessage(role, text, who) {
   const name = who || (role === "user" ? "You" : isDevinMode() ? "Devin" : "Assistant");
   wrap.querySelector(".msg__who span").textContent = name;
   const body = wrap.querySelector(".msg__body");
-  body.textContent = text;
+  renderBody(body, role, text);
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
   return body;
+}
+
+// A Devin session emits several kinds of messages. The chat reply
+// (`devin_message`) gets a full assistant bubble; everything else the agent
+// emits is shown as a compact activity step so you can watch it work.
+function addDevinMessage(m) {
+  if (m.type === "devin_message") {
+    addMessage("assistant", m.message, "Devin");
+  } else {
+    addDevinActivity(m.type, m.message);
+  }
+}
+
+function devinKindLabel(kind = "") {
+  return (
+    kind
+      .replace(/_/g, " ")
+      .replace(/\bdevin\b/gi, "Devin")
+      .trim() || "activity"
+  );
+}
+
+function addDevinActivity(kind, text) {
+  const wrap = document.createElement("div");
+  wrap.className = "devin-activity";
+  wrap.innerHTML = `<svg class="ic devin-activity__ic"><use href="#i-sparkle" /></svg><span class="devin-activity__kind"></span><span class="devin-activity__text"></span>`;
+  wrap.querySelector(".devin-activity__kind").textContent = devinKindLabel(kind);
+  wrap.querySelector(".devin-activity__text").textContent = text;
+  chatEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 function showChatHint() {
@@ -572,7 +635,7 @@ async function sendPrompt(text) {
     await backend.aiChat(config, messages, (ev) => {
       if (ev.kind === "token") {
         acc += ev.delta;
-        body.textContent = acc;
+        renderBody(body, "assistant", acc);
         chatEl.scrollTop = chatEl.scrollHeight;
       } else if (ev.kind === "error") {
         body.textContent = "⚠️ " + ev.message;
@@ -707,7 +770,10 @@ async function pollDevin(cfg, status) {
       const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
       if (devinSeen.has(id)) return;
       devinSeen.add(id);
-      if (m.type === "devin_message" && m.message) addMessage("assistant", m.message, "Devin");
+      if (!m.message) return;
+      // We already render the user's own prompt locally; show every other
+      // message the agent emits (chat replies, progress notes, etc.).
+      if (m.type !== "user_message") addDevinMessage(m);
     });
     const state = session.status_enum || session.status;
     if (TERMINAL.has(state)) {

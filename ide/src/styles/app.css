@@ -576,6 +576,75 @@ kbd {
   overflow-x: auto;
   margin: 6px 0;
 }
+.msg__body pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+/* ---- rendered markdown (assistant / Devin replies) ---- */
+.msg__body.md > :first-child {
+  margin-top: 0;
+}
+.msg__body.md > :last-child {
+  margin-bottom: 0;
+}
+.msg__body.md p {
+  margin: 6px 0;
+}
+.msg__body.md ul,
+.msg__body.md ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.msg__body.md li {
+  margin: 2px 0;
+}
+.msg__body.md h1,
+.msg__body.md h2,
+.msg__body.md h3 {
+  margin: 10px 0 6px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.msg__body.md a {
+  color: var(--accent);
+}
+.msg__body.md blockquote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--line-strong);
+  color: var(--text-dim);
+}
+/* ---- Devin agent activity step ---- */
+.devin-activity {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 2px 0 6px;
+  padding: 5px 11px;
+  border-left: 2px solid var(--accent-2);
+  background: var(--panel-2);
+  border-radius: 0 8px 8px 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.devin-activity__ic {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  color: var(--accent-2);
+  align-self: center;
+}
+.devin-activity__kind {
+  flex: none;
+  font-weight: 700;
+  text-transform: capitalize;
+  color: var(--text);
+}
+.devin-activity__text {
+  flex: 1;
+  min-width: 0;
+}
 .chat .hint {
   margin: auto;
   text-align: center;
