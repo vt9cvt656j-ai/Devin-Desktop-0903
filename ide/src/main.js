@@ -34,6 +34,16 @@ async function tauriBackend() {
       channel.onmessage = onEvent;
       return core.invoke("ai_chat", { config, messages, onEvent: channel });
     },
+    devinCreateSession: (config, prompt, title) =>
+      core.invoke("devin_create_session", { config, prompt, title }),
+    devinSendMessage: (config, sessionId, message) =>
+      core.invoke("devin_send_message", { config, sessionId, message }),
+    devinGetSession: (config, sessionId) =>
+      core.invoke("devin_get_session", { config, sessionId }),
+    openUrl: async (url) => {
+      const opener = await import("@tauri-apps/plugin-opener");
+      return opener.openUrl(url);
+    },
   };
 }
 
@@ -73,8 +83,37 @@ function mockBackend() {
       }
       onEvent({ kind: "done" });
     },
+    devinCreateSession: async (_config, prompt) => {
+      mockDevin = { id: "devin-mock", polls: 0, prompt };
+      return { session_id: "devin-mock", url: "https://app.devin.ai/sessions/mock" };
+    },
+    devinSendMessage: async (_config, _sessionId, message) => {
+      mockDevin = { id: "devin-mock", polls: 0, prompt: message };
+    },
+    devinGetSession: async (_config, sessionId) => {
+      mockDevin.polls += 1;
+      const done = mockDevin.polls >= 2;
+      const messages = [{ type: "user_message", message: mockDevin.prompt, event_id: "u1" }];
+      if (done) {
+        messages.push({
+          type: "devin_message",
+          event_id: "d1",
+          message:
+            "(preview mock) This is where Devin's reply would stream in. Add your Devin API key in settings and run the desktop app to talk to a real session.",
+        });
+      }
+      return {
+        session_id: sessionId,
+        status: done ? "finished" : "working",
+        status_enum: done ? "finished" : "working",
+        messages,
+      };
+    },
+    openUrl: async (url) => window.open(url, "_blank"),
   };
 }
+
+let mockDevin = { id: null, polls: 0, prompt: "" };
 
 // ---- element refs ----
 const $ = (id) => document.getElementById(id);
@@ -251,6 +290,7 @@ function fileIcon(name) {
 
 async function openFolder(path) {
   rootPath = path;
+  resetDevinSession(false);
   rootNameEl.textContent = path.split("/").filter(Boolean).pop() || path;
   rootNameEl.title = path;
   treeEl.innerHTML = "";
@@ -324,10 +364,15 @@ function saveConfig(c) {
 }
 function refreshModelBadge() {
   syncModelPicker();
+  updateAssistantMode();
 }
 
 // ---- model picker (bottom-bar dropdown) ----
 const MODEL_GROUPS = [
+  {
+    label: "Devin",
+    models: [{ id: "devin", meta: "Agent · full session" }],
+  },
   {
     label: "OpenAI",
     models: [
@@ -363,6 +408,7 @@ const modelMenu = $("modelMenu");
 /** Map a model id to its provider brand logo + brand colour. */
 function brandOf(id = "") {
   const s = id.toLowerCase();
+  if (s === "devin") return { sym: "i-sparkle", cls: "brand--devin" };
   if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
   if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
   if (s.includes("llama")) return { sym: "i-brand-meta", cls: "brand--meta" };
@@ -370,12 +416,30 @@ function brandOf(id = "") {
   return { sym: "i-cpu", cls: "" };
 }
 
+function isDevinMode() {
+  return loadConfig().model === "devin";
+}
+
+function modelLabel(id) {
+  return id === "devin" ? "Devin" : id || "Select model";
+}
+
 function syncModelPicker() {
   const c = loadConfig();
-  modelPickerLabel.textContent = c.model || "Select model";
+  modelPickerLabel.textContent = modelLabel(c.model);
   const b = brandOf(c.model);
   modelPickerBtnIcon.setAttribute("href", "#" + b.sym);
   modelPickerBtn.querySelector(".ic").setAttribute("class", "ic " + b.cls);
+}
+
+/** Reflect the active backend in the assistant header + composer hints. */
+function updateAssistantMode() {
+  const devin = isDevinMode();
+  $("assistantName").textContent = devin ? "Devin" : "Assistant";
+  $("newSessionBtn").hidden = !devin;
+  promptEl.placeholder = devin
+    ? "Ask Devin to work on your project…"
+    : "Ask about the open file…";
 }
 
 function buildModelMenu() {
@@ -449,12 +513,13 @@ document.addEventListener("keydown", (e) => {
 const history = [];
 let streaming = false;
 
-function addMessage(role, text) {
+function addMessage(role, text, who) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   const whoIcon = role === "assistant" ? `<svg class="ic"><use href="#i-sparkle" /></svg>` : "";
   wrap.innerHTML = `<span class="msg__who">${whoIcon}<span></span></span><div class="msg__body"></div>`;
-  wrap.querySelector(".msg__who span").textContent = role === "user" ? "You" : "Assistant";
+  const name = who || (role === "user" ? "You" : isDevinMode() ? "Devin" : "Assistant");
+  wrap.querySelector(".msg__who span").textContent = name;
   const body = wrap.querySelector(".msg__body");
   body.textContent = text;
   chatEl.appendChild(wrap);
@@ -472,6 +537,7 @@ function showChatHint() {
 }
 
 async function sendPrompt(text) {
+  if (isDevinMode()) return sendDevinPrompt(text);
   const config = loadConfig();
   if (!config.baseUrl || !config.apiKey || !config.model) {
     openSettings();
@@ -520,24 +586,167 @@ async function sendPrompt(text) {
   }
 }
 
+// ---- Devin session backend ----
+let devinSessionId = null;
+let devinSessionUrl = null;
+let devinBusy = false;
+const devinSeen = new Set();
+const TERMINAL = new Set(["finished", "blocked", "expired"]);
+
+/** Open file + selection as context, appended to the very first prompt only. */
+function projectContext() {
+  const parts = [];
+  if (rootPath) parts.push(`Project folder: ${rootPath}`);
+  if (activePath) {
+    const f = openFiles.get(activePath);
+    const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
+    const selected = sel && !sel.isEmpty() ? f.model.getValueInRange(sel) : "";
+    parts.push(`Open file: ${activePath}\n\n\`\`\`\n${f.model.getValue().slice(0, 12000)}\n\`\`\``);
+    if (selected) parts.push(`Selected text:\n\`\`\`\n${selected.slice(0, 4000)}\n\`\`\``);
+  }
+  return parts.join("\n\n");
+}
+
+function devinConfig() {
+  const c = loadConfig();
+  return { apiKey: (c.devinApiKey || "").trim(), baseUrl: (c.devinBaseUrl || "").trim() };
+}
+
+function devinStatusText(s) {
+  const map = {
+    working: "Devin is working…",
+    blocked: "Devin is waiting for your reply.",
+    finished: "Devin finished.",
+    expired: "Session expired.",
+    suspended: "Session suspended.",
+  };
+  return map[s] || `Devin: ${s}`;
+}
+
+function resetDevinSession(announce) {
+  devinSessionId = null;
+  devinSessionUrl = null;
+  devinSeen.clear();
+  if (announce && isDevinMode()) {
+    chatEl.innerHTML = "";
+    showChatHint();
+  }
+}
+
+/** A status row with a live link to the running Devin session. */
+function addDevinStatus() {
+  const row = document.createElement("div");
+  row.className = "devin-status";
+  row.innerHTML = `<span class="devin-status__dot"></span><span class="devin-status__text"></span><a class="devin-status__link" target="_blank" hidden>View session ↗</a>`;
+  const link = row.querySelector(".devin-status__link");
+  link.addEventListener("click", (e) => {
+    e.preventDefault();
+    if (devinSessionUrl) backend.openUrl(devinSessionUrl);
+  });
+  chatEl.appendChild(row);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return {
+    set(text, opts = {}) {
+      row.querySelector(".devin-status__text").textContent = text;
+      row.classList.toggle("is-done", !!opts.done);
+      if (devinSessionUrl) link.hidden = false;
+    },
+  };
+}
+
+async function sendDevinPrompt(text) {
+  const cfg = devinConfig();
+  if (!cfg.apiKey) {
+    openSettings();
+    showToast("Add your Devin API key first");
+    return;
+  }
+  if (devinBusy) return;
+  chatEl.querySelector(".hint")?.remove();
+  addMessage("user", text);
+  const status = addDevinStatus();
+
+  try {
+    if (!devinSessionId) {
+      status.set("Starting a Devin session…");
+      const ctx = projectContext();
+      const prompt = ctx ? `${text}\n\n---\nContext from my editor:\n${ctx}` : text;
+      const ref = await backend.devinCreateSession(cfg, prompt, text.slice(0, 60));
+      devinSessionId = ref.session_id;
+      devinSessionUrl = ref.url;
+      status.set("Devin is working…");
+    } else {
+      status.set("Sending to Devin…");
+      await backend.devinSendMessage(cfg, devinSessionId, text);
+      status.set("Devin is working…");
+    }
+    devinBusy = true;
+    await pollDevin(cfg, status);
+  } catch (e) {
+    status.set("⚠️ " + String(e), { done: true });
+  } finally {
+    devinBusy = false;
+  }
+}
+
+async function pollDevin(cfg, status) {
+  const started = Date.now();
+  const TIMEOUT_MS = 10 * 60 * 1000;
+  while (true) {
+    let session;
+    try {
+      session = await backend.devinGetSession(cfg, devinSessionId);
+    } catch (e) {
+      status.set("⚠️ " + String(e), { done: true });
+      return;
+    }
+    for (const m of session.messages || []) {
+      const id = m.event_id || `${m.type}:${m.timestamp}`;
+      if (devinSeen.has(id)) continue;
+      devinSeen.add(id);
+      if (m.type === "devin_message" && m.message) addMessage("assistant", m.message, "Devin");
+    }
+    const state = session.status_enum || session.status;
+    if (TERMINAL.has(state)) {
+      status.set(devinStatusText(state), { done: true });
+      return;
+    }
+    if (Date.now() - started > TIMEOUT_MS) {
+      status.set("Still working — open the session to follow along.", { done: true });
+      return;
+    }
+    status.set(devinStatusText(state));
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
 // ---- settings dialog ----
 const settingsEl = $("settings");
 function openSettings() {
   const c = loadConfig();
+  $("cfgDevinKey").value = c.devinApiKey || "";
+  $("cfgDevinBaseUrl").value = c.devinBaseUrl || "";
   $("cfgBaseUrl").value = c.baseUrl || "https://api.openai.com/v1";
   $("cfgApiKey").value = c.apiKey || "";
-  $("cfgModel").value = c.model || "gpt-4o-mini";
+  $("cfgModel").value = c.model && c.model !== "devin" ? c.model : "gpt-4o-mini";
   settingsEl.showModal();
 }
 $("settingsForm").addEventListener("submit", (e) => {
   if (e.submitter && e.submitter.value === "save") {
+    const c = loadConfig();
+    const cfgModel = $("cfgModel").value.trim();
     saveConfig({
+      ...c,
+      devinApiKey: $("cfgDevinKey").value.trim(),
+      devinBaseUrl: $("cfgDevinBaseUrl").value.trim(),
       baseUrl: $("cfgBaseUrl").value.trim(),
       apiKey: $("cfgApiKey").value.trim(),
-      model: $("cfgModel").value.trim(),
+      // The active backend is chosen in the composer's model menu; keep the
+      // Devin selection intact and otherwise fall back to the OpenAI model.
+      model: c.model === "devin" ? "devin" : cfgModel || c.model,
     });
     refreshModelBadge();
-    showToast("AI settings saved");
+    showToast("Assistant settings saved");
   }
 });
 
@@ -559,6 +768,10 @@ $("openFolderBtn").addEventListener("click", chooseFolder);
 $("emptyOpenBtn").addEventListener("click", chooseFolder);
 $("settingsBtn").addEventListener("click", openSettings);
 $("saveBtn").addEventListener("click", saveActive);
+$("newSessionBtn").addEventListener("click", () => {
+  resetDevinSession(true);
+  showToast("Started a new Devin session");
+});
 
 const promptEl = $("prompt");
 promptEl.addEventListener("input", () => {

@@ -1,4 +1,5 @@
 mod ai;
+mod devin;
 mod files;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -18,6 +19,9 @@ pub fn run() {
             files::write_text_file,
             files::home_dir,
             ai::ai_chat,
+            devin::devin_create_session,
+            devin::devin_send_message,
+            devin::devin_get_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Devin IDE");

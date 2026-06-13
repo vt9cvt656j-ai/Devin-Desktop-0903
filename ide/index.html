@@ -63,8 +63,11 @@
             <span class="assistant__avatar">
               <svg class="ic"><use href="#i-sparkle" /></svg>
             </span>
-            <span class="assistant__name">Assistant</span>
+            <span class="assistant__name" id="assistantName">Assistant</span>
           </span>
+          <button class="tbtn tbtn--icon" id="newSessionBtn" title="New Devin session" hidden>
+            <svg class="ic"><use href="#i-sparkle" /></svg>
+          </button>
         </header>
         <div class="chat" id="chat"></div>
         <form class="composer" id="composer">
@@ -93,17 +96,34 @@
     <dialog class="sheet" id="settings">
       <form method="dialog" class="sheet__body" id="settingsForm">
         <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
-        <h2>AI provider</h2>
-        <p class="sheet__sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
-        <label>Base URL
-          <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" />
-        </label>
-        <label>API key
-          <input id="cfgApiKey" type="password" placeholder="sk-…" />
-        </label>
-        <label>Model
-          <input id="cfgModel" type="text" placeholder="gpt-4o-mini" />
-        </label>
+        <h2>Assistant</h2>
+        <p class="sheet__sub">Stored locally on this machine. Pick a backend from the model menu in the composer.</p>
+
+        <div class="sheet__section">
+          <h3 class="sheet__legend">Devin</h3>
+          <p class="sheet__note">Runs a real Devin session. Get a key at app.devin.ai → Settings → API Keys.</p>
+          <label>Devin API key
+            <input id="cfgDevinKey" type="password" placeholder="apk_…" />
+          </label>
+          <label>API base URL <span class="sheet__opt">(optional)</span>
+            <input id="cfgDevinBaseUrl" type="text" placeholder="https://api.devin.ai" />
+          </label>
+        </div>
+
+        <div class="sheet__section">
+          <h3 class="sheet__legend">OpenAI-compatible model</h3>
+          <p class="sheet__note">Any endpoint that speaks the OpenAI chat API (OpenAI, Azure, Ollama…).</p>
+          <label>Base URL
+            <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" />
+          </label>
+          <label>API key
+            <input id="cfgApiKey" type="password" placeholder="sk-…" />
+          </label>
+          <label>Model
+            <input id="cfgModel" type="text" placeholder="gpt-4o-mini" />
+          </label>
+        </div>
+
         <div class="sheet__actions">
           <button class="btn" value="cancel" formnovalidate>Cancel</button>
           <button class="btn btn--primary" id="saveCfgBtn" value="save">Save</button>

@@ -585,6 +585,57 @@ kbd {
   padding: 0 16px;
 }
 
+/* ---- Devin session status row ---- */
+.devin-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-2);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.devin-status__dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent-2);
+  box-shadow: 0 0 0 0 rgba(124, 92, 255, 0.5);
+  animation: devin-pulse 1.3s ease-out infinite;
+}
+.devin-status.is-done .devin-status__dot {
+  background: var(--text-dim);
+  animation: none;
+}
+.devin-status__text {
+  flex: 1;
+}
+.devin-status__link {
+  flex: none;
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+.devin-status__link:hover {
+  text-decoration: underline;
+}
+@keyframes devin-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(124, 92, 255, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(124, 92, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(124, 92, 255, 0);
+  }
+}
+
 /* ---- composer (Cursor/Devin-style input card) ---- */
 .composer {
   padding: 12px;
@@ -780,6 +831,9 @@ kbd {
 .ic.brand--qwen {
   color: #615ced;
 }
+.ic.brand--devin {
+  color: var(--accent-2);
+}
 .menu__item .check {
   margin-left: auto;
   width: 15px;
@@ -892,6 +946,31 @@ kbd {
   font-size: 12.5px;
   line-height: 1.45;
   color: var(--text-dim);
+}
+.sheet__section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.sheet__legend {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.sheet__note {
+  margin: -4px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.sheet__opt {
+  font-weight: 500;
+  opacity: 0.7;
 }
 .sheet label {
   display: flex;
