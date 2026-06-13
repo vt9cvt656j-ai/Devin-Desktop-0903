@@ -22,6 +22,9 @@
           <svg class="ic"><use href="#i-save" /></svg>
           <span>Save</span>
         </button>
+        <button class="tbtn tbtn--icon" id="terminalBtn" title="Toggle terminal (⌃`)">
+          <svg class="ic"><use href="#i-terminal" /></svg>
+        </button>
         <button class="tbtn tbtn--icon" id="extensionsBtn" title="Extensions">
           <svg class="ic"><use href="#i-ext" /></svg>
         </button>
@@ -90,6 +93,18 @@
             <span class="kbd-tip"><kbd>⌘</kbd><kbd>S</kbd> Save</span>
             <span class="kbd-tip"><kbd>⌘</kbd><kbd>↩</kbd> Ask assistant</span>
           </div>
+        </div>
+        <div class="terminal-panel" id="terminalPanel" hidden>
+          <div class="terminal-panel__head">
+            <span class="terminal-panel__title">
+              <svg class="ic" aria-hidden="true"><use href="#i-terminal" /></svg>
+              <span>Terminal</span>
+            </span>
+            <button class="terminal-panel__close" id="terminalClose" type="button" title="Close panel (⌃`)" aria-label="Close terminal">
+              <svg class="ic"><use href="#i-close" /></svg>
+            </button>
+          </div>
+          <div class="terminal-panel__body" id="terminalBody"></div>
         </div>
       </section>
 
@@ -278,6 +293,10 @@
       </symbol>
       <symbol id="i-replace" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3M20 16H8l3-3m-3 3 3 3" />
+      </symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="m7.5 9.5 3 2.5-3 2.5M12.5 15h4" />
       </symbol>
       <symbol id="i-sidebar-left" viewBox="0 0 24 24">
         <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
