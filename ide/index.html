@@ -129,6 +129,18 @@
             <span class="kbd-tip"><kbd>⌘</kbd><kbd>↩</kbd> Ask assistant</span>
           </div>
         </div>
+        <div class="problems-panel" id="problemsPanel" hidden>
+          <div class="problems-panel__head">
+            <span class="problems-panel__title">
+              <svg class="ic" aria-hidden="true"><use href="#i-error" /></svg>
+              <span>Problems</span>
+            </span>
+            <button class="problems-panel__close" id="problemsClose" type="button" title="Close panel" aria-label="Close problems">
+              <svg class="ic"><use href="#i-close" /></svg>
+            </button>
+          </div>
+          <div class="problems-panel__body" id="problemsBody"></div>
+        </div>
         <div class="terminal-panel" id="terminalPanel" hidden>
           <div class="terminal-panel__head">
             <span class="terminal-panel__title">
@@ -182,6 +194,10 @@
         <button class="statusbar__item statusbar__item--btn" id="paletteBtn" title="Command Palette (⇧⌘P)">
           <svg class="ic"><use href="#i-command" /></svg>
           <span>Commands</span>
+        </button>
+        <button class="statusbar__item statusbar__item--btn" id="problemsBtn" title="Problems" aria-label="Problems">
+          <span class="statusbar__diag"><svg class="ic"><use href="#i-error" /></svg><span id="problemsErrCount">0</span></span>
+          <span class="statusbar__diag"><svg class="ic"><use href="#i-warn" /></svg><span id="problemsWarnCount">0</span></span>
         </button>
       </div>
       <div class="statusbar__right" id="statusbarRight"></div>
@@ -357,6 +373,15 @@
         <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 11.2v4.6" />
         <circle cx="12" cy="8" r="1.05" fill="currentColor" />
+      </symbol>
+      <symbol id="i-error" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M9 9l6 6M15 9l-6 6" />
+      </symbol>
+      <symbol id="i-warn" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 3.5 21 19H3z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 9.5v4.2" />
+        <circle cx="12" cy="16.4" r="1.05" fill="currentColor" />
       </symbol>
 
       <!-- explorer action glyphs -->
