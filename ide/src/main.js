@@ -46,6 +46,12 @@ async function tauriBackend() {
       core.invoke("search_in_project", { root, query, caseSensitive }),
     gitStatus: (root) => core.invoke("git_status", { root }),
     gitFileHead: (root, rel) => core.invoke("git_file_head", { root, rel }),
+    gitStage: (root, rel) => core.invoke("git_stage", { root, rel }),
+    gitUnstage: (root, rel) => core.invoke("git_unstage", { root, rel }),
+    gitStageAll: (root) => core.invoke("git_stage_all", { root }),
+    gitUnstageAll: (root) => core.invoke("git_unstage_all", { root }),
+    gitCommit: (root, message) => core.invoke("git_commit", { root, message }),
+    gitPush: (root) => core.invoke("git_push", { root }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -292,6 +298,50 @@ function mockBackend() {
       const prefix = root.endsWith("/") ? root : root + "/";
       return GIT_HEAD[prefix + rel] ?? "";
     },
+    gitStage: async (_root, rel) => {
+      const c = GIT_CHANGES.find((x) => x.rel === rel);
+      if (!c || c.staged) return;
+      c.staged = true;
+      c.code = c.code === "??" ? "A " : c.code.trim().charAt(0) + " ";
+    },
+    gitUnstage: async (_root, rel) => {
+      const c = GIT_CHANGES.find((x) => x.rel === rel);
+      if (!c || !c.staged) return;
+      c.staged = false;
+      c.code = c.label === "Untracked" ? "??" : " " + c.code.trim().charAt(0);
+    },
+    gitStageAll: async (_root) => {
+      for (const c of GIT_CHANGES) {
+        if (c.staged) continue;
+        c.staged = true;
+        c.code = c.code === "??" ? "A " : c.code.trim().charAt(0) + " ";
+      }
+    },
+    gitUnstageAll: async (_root) => {
+      for (const c of GIT_CHANGES) {
+        if (!c.staged) continue;
+        c.staged = false;
+        c.code = c.label === "Untracked" ? "??" : " " + c.code.trim().charAt(0);
+      }
+    },
+    gitCommit: async (root, message) => {
+      const msg = (message || "").trim();
+      if (!msg) throw new Error("Commit message is empty.");
+      const staged = GIT_CHANGES.filter((c) => c.staged);
+      if (!staged.length) throw new Error("No staged changes to commit.");
+      const prefix = root.endsWith("/") ? root : root + "/";
+      for (const c of staged) {
+        // Fold the working-tree content into the simulated HEAD.
+        GIT_HEAD[prefix + c.rel] = FILES[prefix + c.rel] ?? "";
+      }
+      // Drop committed entries from the change set.
+      for (let i = GIT_CHANGES.length - 1; i >= 0; i--) {
+        if (GIT_CHANGES[i].staged) GIT_CHANGES.splice(i, 1);
+      }
+      const hash = Math.random().toString(16).slice(2, 9);
+      return `${hash} ${msg}`;
+    },
+    gitPush: async (_root) => "Everything up-to-date (preview mock).",
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -1150,16 +1200,33 @@ function renderGitFiles(files) {
   }
   const staged = files.filter((f) => f.staged);
   const unstaged = files.filter((f) => !f.staged);
-  const addSection = (title, group) => {
+  const addSection = (title, group, action) => {
     if (!group.length) return;
     const head = document.createElement("div");
     head.className = "git-section-title";
-    head.textContent = `${title} (${group.length})`;
+    const label = document.createElement("span");
+    label.textContent = `${title} (${group.length})`;
+    head.appendChild(label);
+    const btn = document.createElement("button");
+    btn.className = "git-section-act";
+    btn.type = "button";
+    btn.title = action.title;
+    btn.innerHTML = `<svg class="ic"><use href="#${action.icon}" /></svg>`;
+    btn.addEventListener("click", action.run);
+    head.appendChild(btn);
     gitListEl.appendChild(head);
     for (const f of group) gitListEl.appendChild(gitRow(f));
   };
-  addSection("Staged Changes", staged);
-  addSection("Changes", unstaged);
+  addSection("Staged Changes", staged, {
+    title: "Unstage all",
+    icon: "i-minus",
+    run: () => gitRunOp(() => backend.gitUnstageAll(rootPath), "Unstaged all changes"),
+  });
+  addSection("Changes", unstaged, {
+    title: "Stage all",
+    icon: "i-plus",
+    run: () => gitRunOp(() => backend.gitStageAll(rootPath), "Staged all changes"),
+  });
 }
 
 function gitRow(file) {
@@ -1186,14 +1253,75 @@ function gitRow(file) {
   }
   row.title = file.label + " — " + file.rel;
 
+  const act = document.createElement("button");
+  act.className = "git-row__act";
+  act.type = "button";
+  if (file.staged) {
+    act.title = "Unstage";
+    act.innerHTML = `<svg class="ic"><use href="#i-minus" /></svg>`;
+    act.addEventListener("click", (e) => {
+      e.stopPropagation();
+      gitRunOp(() => backend.gitUnstage(rootPath, file.rel), "Unstaged " + file.name);
+    });
+  } else {
+    act.title = "Stage";
+    act.innerHTML = `<svg class="ic"><use href="#i-plus" /></svg>`;
+    act.addEventListener("click", (e) => {
+      e.stopPropagation();
+      gitRunOp(() => backend.gitStage(rootPath, file.rel), "Staged " + file.name);
+    });
+  }
+
   const badge = document.createElement("span");
   const b = gitBadge(file);
   badge.className = "git-row__badge " + b.cls;
   badge.textContent = b.ch;
 
-  row.append(icon, name, badge);
+  row.append(icon, name, act, badge);
   row.addEventListener("click", () => openDiff(file));
   return row;
+}
+
+/** Run a git mutation, then refresh the panel; surface errors via toast. */
+async function gitRunOp(op, okMsg) {
+  try {
+    await op();
+    if (okMsg) showToast(okMsg);
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
+  await refreshGitStatus();
+}
+
+async function gitCommit() {
+  if (!rootPath) return;
+  const input = $("gitCommitMsg");
+  const msg = input.value.trim();
+  if (!msg) {
+    showToast("Enter a commit message first.");
+    input.focus();
+    return;
+  }
+  try {
+    const res = await backend.gitCommit(rootPath, msg);
+    input.value = "";
+    closeDiffView();
+    showToast("Committed " + res);
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
+  await refreshGitStatus();
+}
+
+async function gitPush() {
+  if (!rootPath) return;
+  showToast("Pushing…");
+  try {
+    const res = await backend.gitPush(rootPath);
+    showToast(res.split("\n").pop() || "Pushed.");
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
 }
 
 // ---- diff view ----
@@ -1777,6 +1905,14 @@ $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabSearch").addEventListener("click", () => showSide("search"));
 $("tabGit").addEventListener("click", () => showSide("git"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
+$("gitPushBtn").addEventListener("click", () => gitPush());
+$("gitCommitBtn").addEventListener("click", () => gitCommit());
+$("gitCommitMsg").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    e.preventDefault();
+    gitCommit();
+  }
+});
 $("diffClose").addEventListener("click", () => closeDiffView());
 $("newFileBtn").addEventListener("click", () => rootPath && newEntry(rootPath, false));
 $("newFolderBtn").addEventListener("click", () => rootPath && newEntry(rootPath, true));

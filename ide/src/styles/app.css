@@ -1870,6 +1870,53 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.git-commit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 10px 8px;
+}
+.git-commit__msg {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  min-height: 28px;
+  max-height: 120px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--input-bg, var(--editor-bg));
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.git-commit__msg:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.git-commit__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+.git-commit__btn:hover {
+  filter: brightness(1.08);
+}
+.git-commit__btn .ic {
+  width: 14px;
+  height: 14px;
+}
 .git-list {
   flex: 1;
   min-height: 0;
@@ -1877,12 +1924,40 @@ kbd {
   padding: 2px 6px 8px;
 }
 .git-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 6px 8px 4px;
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-dim);
+}
+.git-section-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.git-section-title:hover .git-section-act {
+  opacity: 1;
+}
+.git-section-act:hover {
+  background: var(--sel);
+  color: var(--text);
+}
+.git-section-act .ic {
+  width: 14px;
+  height: 14px;
 }
 .git-row {
   display: flex;
@@ -1914,6 +1989,32 @@ kbd {
 .git-row__dir {
   color: var(--text-dim);
   opacity: 0.75;
+}
+.git-row__act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.git-row:hover .git-row__act {
+  opacity: 1;
+}
+.git-row__act:hover {
+  background: var(--sel-strong, var(--sel));
+  color: var(--text);
+}
+.git-row__act .ic {
+  width: 15px;
+  height: 15px;
 }
 .git-row__badge {
   flex: none;

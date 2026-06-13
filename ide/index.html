@@ -90,7 +90,14 @@
               <svg class="ic"><use href="#i-git" /></svg>
               <span id="gitBranchName">—</span>
             </span>
+            <button class="iconbtn" id="gitPushBtn" type="button" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
             <button class="iconbtn" id="gitRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+          </div>
+          <div class="git-commit">
+            <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" placeholder="Message (commit staged changes)"></textarea>
+            <button class="git-commit__btn" id="gitCommitBtn" type="button" title="Commit staged changes">
+              <svg class="ic"><use href="#i-check" /></svg><span>Commit</span>
+            </button>
           </div>
           <div class="git-list" id="gitList"></div>
         </div>
@@ -285,6 +292,12 @@
       </symbol>
       <symbol id="i-close" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
+      </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 5v14M5 12h14" />
+      </symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M5 12h14" />
       </symbol>
       <symbol id="i-code" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m9 8-5 4 5 4m6-8 5 4-5 4" />
