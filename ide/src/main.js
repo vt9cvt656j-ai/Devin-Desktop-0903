@@ -44,6 +44,8 @@ async function tauriBackend() {
     deletePath: (path) => core.invoke("delete_path", { path }),
     searchInProject: (root, query, caseSensitive) =>
       core.invoke("search_in_project", { root, query, caseSensitive }),
+    gitStatus: (root) => core.invoke("git_status", { root }),
+    gitFileHead: (root, rel) => core.invoke("git_file_head", { root, rel }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -93,6 +95,21 @@ function mockBackend() {
     [ROOT + "/components/Card.js"]:
       'export function Card(title) {\n  const el = document.createElement("div");\n  el.className = "card";\n  el.textContent = title;\n  return el;\n}\n',
   };
+
+  // Simulated git state: a curated set of changes vs. an imaginary HEAD so the
+  // browser preview can show the Source Control panel and diffs. The native app
+  // talks to the real `git` instead.
+  const GIT_HEAD = {
+    [ROOT + "/README.md"]:
+      "# my-app\n\nA sample project shown in the browser preview.\n",
+    [ROOT + "/src/utils/format.js"]:
+      "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
+  };
+  const GIT_CHANGES = [
+    { rel: "README.md", code: " M", label: "Modified", staged: false, deleted: false },
+    { rel: "src/utils/format.js", code: "M ", label: "Modified", staged: true, deleted: false },
+    { rel: "components/Card.js", code: "??", label: "Untracked", staged: false, deleted: false },
+  ];
 
   const parentOf = (p) => p.slice(0, p.lastIndexOf("/"));
   const baseOf = (p) => p.slice(p.lastIndexOf("/") + 1);
@@ -258,6 +275,23 @@ function mockBackend() {
       }
       return results;
     },
+    gitStatus: async (root) => {
+      const prefix = root.endsWith("/") ? root : root + "/";
+      const files = GIT_CHANGES.map((c) => ({
+        path: prefix + c.rel,
+        name: baseOf(c.rel),
+        rel: c.rel,
+        code: c.code,
+        label: c.label,
+        staged: c.staged,
+        deleted: c.deleted,
+      }));
+      return { is_repo: true, branch: "main", files };
+    },
+    gitFileHead: async (root, rel) => {
+      const prefix = root.endsWith("/") ? root : root + "/";
+      return GIT_HEAD[prefix + rel] ?? "";
+    },
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -389,6 +423,7 @@ async function openFile(path, name) {
 }
 
 function activate(path) {
+  closeDiffView();
   if (activePath && openFiles.has(activePath)) {
     openFiles.get(activePath).viewState = monacoEditor.saveViewState();
   }
@@ -1038,17 +1073,20 @@ async function openFileAt(path, name, line, column, endColumn) {
 }
 
 function showSide(which) {
-  const isSearch = which === "search";
-  $("viewExplorer").hidden = isSearch;
-  $("viewSearch").hidden = !isSearch;
-  $("tabExplorer").classList.toggle("is-active", !isSearch);
-  $("tabSearch").classList.toggle("is-active", isSearch);
+  $("viewExplorer").hidden = which !== "explorer";
+  $("viewSearch").hidden = which !== "search";
+  $("viewGit").hidden = which !== "git";
+  $("tabExplorer").classList.toggle("is-active", which === "explorer");
+  $("tabSearch").classList.toggle("is-active", which === "search");
+  $("tabGit").classList.toggle("is-active", which === "git");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
-  if (isSearch) {
+  if (which === "search") {
     const si = $("searchInput");
     si.focus();
     si.select();
+  } else if (which === "git") {
+    refreshGitStatus();
   }
 }
 
@@ -1060,6 +1098,172 @@ function renderTreeActive() {
 }
 function cssEscape(s) {
   return s.replace(/"/g, '\\"');
+}
+
+// ---- source control (git) ----
+const gitListEl = $("gitList");
+const gitBranchNameEl = $("gitBranchName");
+let gitActiveRel = null;
+
+/** Single-letter badge + colour class for a porcelain status code. */
+function gitBadge(file) {
+  if (file.code === "??") return { ch: "U", cls: "git-badge--Q" };
+  const c = (file.label || "").charAt(0).toUpperCase();
+  const known = { M: "M", A: "A", D: "D", R: "R", C: "R", U: "U" };
+  const ch = known[c] || "M";
+  return { ch, cls: "git-badge--" + ch };
+}
+
+async function refreshGitStatus() {
+  if (!rootPath) {
+    gitBranchNameEl.textContent = "—";
+    gitListEl.innerHTML = `<div class="git-empty">Open a folder to see source control.</div>`;
+    return;
+  }
+  let status;
+  try {
+    status = await backend.gitStatus(rootPath);
+  } catch (e) {
+    gitBranchNameEl.textContent = "—";
+    gitListEl.innerHTML = `<div class="git-empty"></div>`;
+    gitListEl.firstChild.textContent = String(e);
+    return;
+  }
+  if (!status.is_repo) {
+    gitBranchNameEl.textContent = "—";
+    gitListEl.innerHTML = `<div class="git-empty">This folder is not a Git repository.</div>`;
+    return;
+  }
+  gitBranchNameEl.textContent = status.branch;
+  gitBranchNameEl.parentElement.title = "On branch " + status.branch;
+  renderGitFiles(status.files);
+}
+
+function renderGitFiles(files) {
+  gitListEl.innerHTML = "";
+  if (!files.length) {
+    const empty = document.createElement("div");
+    empty.className = "git-empty";
+    empty.textContent = "No changes — working tree clean.";
+    gitListEl.appendChild(empty);
+    return;
+  }
+  const staged = files.filter((f) => f.staged);
+  const unstaged = files.filter((f) => !f.staged);
+  const addSection = (title, group) => {
+    if (!group.length) return;
+    const head = document.createElement("div");
+    head.className = "git-section-title";
+    head.textContent = `${title} (${group.length})`;
+    gitListEl.appendChild(head);
+    for (const f of group) gitListEl.appendChild(gitRow(f));
+  };
+  addSection("Staged Changes", staged);
+  addSection("Changes", unstaged);
+}
+
+function gitRow(file) {
+  const row = document.createElement("div");
+  row.className = "git-row";
+  row.dataset.rel = file.rel;
+  if (file.rel === gitActiveRel) row.classList.add("is-active");
+
+  const icon = document.createElement("span");
+  icon.className = "git-row__icon";
+  icon.innerHTML = iconImg(fileIconUrl(file.name));
+
+  const name = document.createElement("span");
+  name.className = "git-row__name";
+  const slash = file.rel.lastIndexOf("/");
+  if (slash >= 0) {
+    name.textContent = file.name;
+    const dir = document.createElement("span");
+    dir.className = "git-row__dir";
+    dir.textContent = " · " + file.rel.slice(0, slash);
+    name.appendChild(dir);
+  } else {
+    name.textContent = file.name;
+  }
+  row.title = file.label + " — " + file.rel;
+
+  const badge = document.createElement("span");
+  const b = gitBadge(file);
+  badge.className = "git-row__badge " + b.cls;
+  badge.textContent = b.ch;
+
+  row.append(icon, name, badge);
+  row.addEventListener("click", () => openDiff(file));
+  return row;
+}
+
+// ---- diff view ----
+let diffEditor = null;
+const diffViewEl = $("diffView");
+
+function ensureDiffEditor() {
+  if (diffEditor) return diffEditor;
+  diffEditor = monaco.editor.createDiffEditor($("diffBody"), {
+    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
+    automaticLayout: true,
+    readOnly: true,
+    renderSideBySide: true,
+    fontSize: 13,
+    fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+    minimap: { enabled: false },
+    scrollBeyondLastLine: false,
+  });
+  return diffEditor;
+}
+
+async function openDiff(file) {
+  if (!rootPath) return;
+  let headText = "";
+  let workText = "";
+  try {
+    headText = await backend.gitFileHead(rootPath, file.rel);
+  } catch {
+    headText = "";
+  }
+  if (!file.deleted) {
+    try {
+      workText = await backend.readTextFile(file.path);
+    } catch {
+      workText = "";
+    }
+  }
+
+  const ed = ensureDiffEditor();
+  const lang = extLang(file.name);
+  const original = monaco.editor.createModel(headText, lang);
+  const modified = monaco.editor.createModel(workText, lang);
+  const prev = ed.getModel();
+  ed.setModel({ original, modified });
+  if (prev) {
+    prev.original?.dispose();
+    prev.modified?.dispose();
+  }
+
+  $("diffTitle").textContent = file.rel;
+  gitActiveRel = file.rel;
+  gitListEl.querySelectorAll(".git-row.is-active").forEach((r) => r.classList.remove("is-active"));
+  const activeRow = gitListEl.querySelector(`.git-row[data-rel="${cssEscape(file.rel)}"]`);
+  if (activeRow) activeRow.classList.add("is-active");
+
+  diffViewEl.hidden = false;
+  ed.layout();
+}
+
+function closeDiffView() {
+  if (diffViewEl.hidden) return;
+  diffViewEl.hidden = true;
+  gitActiveRel = null;
+  gitListEl.querySelectorAll(".git-row.is-active").forEach((r) => r.classList.remove("is-active"));
+  const m = diffEditor?.getModel();
+  if (m) {
+    m.original?.dispose();
+    m.modified?.dispose();
+    diffEditor.setModel(null);
+  }
 }
 
 // ---- AI assistant ----
@@ -1454,6 +1658,7 @@ const MENUS = [
     items: [
       { label: "Explorer", icon: "i-files", hint: "⇧⌘E", action: () => showSide("explorer") },
       { label: "Search", icon: "i-search", hint: "⇧⌘F", action: () => showSide("search") },
+      { label: "Source Control", icon: "i-git", hint: "⌃⇧G", action: () => showSide("git") },
       { sep: true },
       { label: "Toggle Explorer", icon: "i-sidebar-left", action: () => togglePane("explorer") },
       { label: "Toggle Assistant", icon: "i-sidebar-right", action: () => togglePane("assistant") },
@@ -1570,6 +1775,9 @@ $("saveBtn").addEventListener("click", saveActive);
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabSearch").addEventListener("click", () => showSide("search"));
+$("tabGit").addEventListener("click", () => showSide("git"));
+$("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
+$("diffClose").addEventListener("click", () => closeDiffView());
 $("newFileBtn").addEventListener("click", () => rootPath && newEntry(rootPath, false));
 $("newFolderBtn").addEventListener("click", () => rootPath && newEntry(rootPath, true));
 $("refreshTreeBtn").addEventListener("click", () => rootPath && reloadDir(rootPath));
@@ -1628,6 +1836,9 @@ window.addEventListener("keydown", (e) => {
   } else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
     e.preventDefault();
     showSide("search");
+  } else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "g") {
+    e.preventDefault();
+    showSide("git");
   }
 });
 

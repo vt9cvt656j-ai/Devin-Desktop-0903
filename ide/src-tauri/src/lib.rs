@@ -1,6 +1,7 @@
 mod ai;
 mod extensions;
 mod files;
+mod git;
 mod terminal;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -25,6 +26,8 @@ pub fn run() {
             files::rename_path,
             files::delete_path,
             files::search_in_project,
+            git::git_status,
+            git::git_file_head,
             ai::ai_chat,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
