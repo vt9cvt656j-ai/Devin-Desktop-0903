@@ -97,6 +97,7 @@ function mockBackend() {
         ``,
         `Read more in the [docs](https://github.com/fendoushaonian/Devin-Desktop).`,
       ].join("\n");
+      await new Promise((r) => setTimeout(r, 750)); // let the "thinking" card show
       for (const tok of reply.match(/\S+\s*|\s+/g) ?? []) {
         await new Promise((r) => setTimeout(r, 18));
         onEvent({ kind: "token", delta: tok });
@@ -494,18 +495,35 @@ async function highlightCode(code, lang) {
 function addMessage(role, text) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
-  const whoIcon = role === "assistant" ? `<svg class="ic"><use href="#i-sparkle" /></svg>` : "";
-  wrap.innerHTML = `<span class="msg__who">${whoIcon}<span></span></span><div class="msg__body"></div>`;
-  wrap.querySelector(".msg__who span").textContent = role === "user" ? "You" : "Assistant";
-  const body = wrap.querySelector(".msg__body");
+  let body;
   if (role === "assistant") {
+    const avatar = document.createElement("div");
+    avatar.className = "msg__avatar";
+    avatar.innerHTML = `<svg class="ic"><use href="#i-sparkle" /></svg>`;
+    const main = document.createElement("div");
+    main.className = "msg__main";
+    main.innerHTML = `<span class="msg__who"><span>Devin</span></span><div class="msg__body"></div>`;
+    wrap.append(avatar, main);
+    body = main.querySelector(".msg__body");
     if (text) renderMarkdownInto(body, text, { highlighter: highlightCode });
   } else {
+    wrap.innerHTML = `<span class="msg__who"><span>You</span></span><div class="msg__body"></div>`;
+    body = wrap.querySelector(".msg__body");
     body.textContent = text;
   }
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
   return body;
+}
+
+// Devin-style "thinking" card shown while the first token is pending.
+function thinkingCard() {
+  const t = document.createElement("div");
+  t.className = "thinking";
+  t.innerHTML =
+    `<span class="thinking__orb"><svg class="ic"><use href="#i-sparkle" /></svg></span>` +
+    `<span class="thinking__text">Thinking</span>`;
+  return t;
 }
 
 function showChatHint() {
@@ -562,14 +580,12 @@ async function sendPrompt(text) {
   history.push({ role: "user", content: text });
 
   const body = addMessage("assistant", "");
-  body.classList.add("is-thinking");
-  body.innerHTML = "<i></i><i></i><i></i>";
+  body.appendChild(thinkingCard());
   let acc = "";
   let err = null;
   let raf = 0;
   const flushStream = () => {
     raf = 0;
-    body.classList.remove("is-thinking");
     renderMarkdownInto(body, acc, { streaming: true });
     chatEl.scrollTop = chatEl.scrollHeight;
   };
@@ -587,14 +603,16 @@ async function sendPrompt(text) {
       }
     });
   } catch (e) {
-    if (!acc) err = String(e);
+    if (!err) err = String(e);
   } finally {
     if (raf) cancelAnimationFrame(raf);
     streaming = false;
-    body.classList.remove("is-thinking");
+    body.querySelector(".thinking")?.remove();
     if (acc) {
       renderMarkdownInto(body, acc, { highlighter: highlightCode });
-      history.push({ role: "assistant", content: acc });
+      // Don't push a truncated/errored reply into history — it would feed
+      // incomplete context into later requests.
+      if (!err) history.push({ role: "assistant", content: acc });
     }
     if (err) {
       const note = document.createElement("div");

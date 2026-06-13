@@ -17,6 +17,7 @@
   --hover: rgba(0, 0, 0, 0.05);
   --active: rgba(0, 0, 0, 0.085);
   --sel: rgba(10, 132, 255, 0.14);
+  --shimmer: rgba(10, 132, 255, 0.1);
   --titlebar-h: 44px;
   --radius: 10px;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
@@ -56,6 +57,7 @@
     --hover: rgba(255, 255, 255, 0.06);
     --active: rgba(255, 255, 255, 0.1);
     --sel: rgba(10, 132, 255, 0.26);
+    --shimmer: rgba(255, 255, 255, 0.08);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 16px 40px rgba(0, 0, 0, 0.5);
   }
@@ -517,6 +519,36 @@ kbd {
     transform: translateY(6px);
   }
 }
+/* assistant turn: avatar on the left, name + content stacked on the right */
+.msg.assistant {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+}
+.msg__avatar {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 3px 8px rgba(124, 92, 255, 0.32);
+}
+.msg__avatar .ic {
+  width: 15px;
+  height: 15px;
+}
+.msg__main {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
 .msg__who {
   display: inline-flex;
   align-items: center;
@@ -527,10 +559,12 @@ kbd {
   text-transform: uppercase;
   color: var(--text-dim);
 }
-.msg__who .ic {
-  width: 13px;
-  height: 13px;
-  color: var(--accent-2);
+.msg.assistant .msg__who {
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
 }
 .msg__body {
   font-size: 13.5px;
@@ -554,6 +588,7 @@ kbd {
 .msg.assistant .msg__body {
   color: var(--text);
   white-space: normal;
+  line-height: 1.62;
 }
 .msg.assistant .msg__body > *:first-child {
   margin-top: 0;
@@ -612,8 +647,10 @@ kbd {
 }
 .msg__body blockquote {
   margin: 10px 0;
-  padding: 2px 0 2px 12px;
-  border-left: 3px solid var(--line-strong);
+  padding: 7px 13px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 9px 9px 0;
+  background: var(--hover);
   color: var(--text-dim);
 }
 .msg__body blockquote p {
@@ -775,34 +812,98 @@ kbd {
     opacity: 0;
   }
 }
-.msg__body.is-thinking {
-  display: flex;
-  gap: 5px;
-  padding: 4px 2px;
+/* ---- thinking card (shown before the first token) ---- */
+.thinking {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 14px 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-2);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
 }
-.msg__body.is-thinking i {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--text-dim);
-  animation: think 1.2s infinite ease-in-out;
+/* a soft light sweep glides across the card */
+.thinking::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 25%,
+    var(--shimmer) 50%,
+    transparent 75%
+  );
+  transform: translateX(-100%);
+  animation: thinking-sweep 1.7s ease-in-out infinite;
 }
-.msg__body.is-thinking i:nth-child(2) {
-  animation-delay: 0.15s;
+.thinking__orb {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
 }
-.msg__body.is-thinking i:nth-child(3) {
-  animation-delay: 0.3s;
+.thinking__orb .ic {
+  width: 13px;
+  height: 13px;
+  animation: orb-spin 2.6s linear infinite;
 }
-@keyframes think {
-  0%,
+/* flowing highlight across the label text */
+.thinking__text {
+  font-size: 12.5px;
+  font-weight: 600;
+  background: linear-gradient(
+    90deg,
+    var(--text-dim) 0%,
+    var(--text-dim) 35%,
+    var(--text) 50%,
+    var(--text-dim) 65%,
+    var(--text-dim) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: text-shimmer 1.7s linear infinite;
+}
+@keyframes thinking-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
   60%,
   100% {
-    opacity: 0.25;
-    transform: translateY(0);
+    transform: translateX(100%);
   }
-  30% {
-    opacity: 1;
-    transform: translateY(-3px);
+}
+@keyframes orb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes text-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking::after,
+  .thinking__orb .ic,
+  .thinking__text,
+  .md-caret {
+    animation: none;
+  }
+  .thinking__text {
+    color: var(--text-dim);
   }
 }
 
