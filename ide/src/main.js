@@ -5,6 +5,9 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 import { renderMarkdownInto } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
@@ -47,6 +50,19 @@ async function tauriBackend() {
       channel.onmessage = onEvent;
       return core.invoke("ai_chat", { config, messages, onEvent: channel });
     },
+    termOpen: (opts, onEvent) => {
+      const channel = new core.Channel();
+      channel.onmessage = onEvent;
+      return core.invoke("term_open", {
+        cwd: opts.cwd ?? null,
+        cols: opts.cols,
+        rows: opts.rows,
+        onEvent: channel,
+      });
+    },
+    termWrite: (id, data) => core.invoke("term_write", { id, data }),
+    termResize: (id, cols, rows) => core.invoke("term_resize", { id, cols, rows }),
+    termClose: (id) => core.invoke("term_close", { id }),
   };
 }
 
@@ -81,6 +97,73 @@ function mockBackend() {
   const parentOf = (p) => p.slice(0, p.lastIndexOf("/"));
   const baseOf = (p) => p.slice(p.lastIndexOf("/") + 1);
   const exists = (p) => DIRS.has(p) || p in FILES;
+
+  // ---- simulated terminal (browser preview only) ----
+  const mockTerms = new Map();
+  let mockTermSeq = 1;
+  const mockPrompt = (cwd) => {
+    const short = cwd.replace("/Users/andrew", "~");
+    return `\x1b[1;32mmichael\x1b[0m:\x1b[1;34m${short}\x1b[0m$ `;
+  };
+  function runMockCommand(t, cmd, send) {
+    if (!cmd) return;
+    const [name, ...args] = cmd.split(/\s+/);
+    switch (name) {
+      case "help":
+        send("Simulated shell. Try: \x1b[1mhelp ls pwd echo date whoami clear\x1b[0m\r\n");
+        break;
+      case "pwd":
+        send(t.cwd + "\r\n");
+        break;
+      case "whoami":
+        send("andrew\r\n");
+        break;
+      case "date":
+        send(new Date().toString() + "\r\n");
+        break;
+      case "echo":
+        send(args.join(" ") + "\r\n");
+        break;
+      case "clear":
+        send("\x1b[2J\x1b[3J\x1b[H");
+        break;
+      case "ls": {
+        const names = [];
+        for (const d of DIRS) if (d !== t.cwd && parentOf(d) === t.cwd) names.push(`\x1b[1;34m${baseOf(d)}\x1b[0m`);
+        for (const f of Object.keys(FILES)) if (parentOf(f) === t.cwd) names.push(baseOf(f));
+        if (names.length) send(names.join("  ") + "\r\n");
+        break;
+      }
+      default:
+        send(`michael: command not found: ${name}\r\n`);
+    }
+  }
+  function mockTermInput(id, data) {
+    const t = mockTerms.get(id);
+    if (!t) return;
+    const send = (s) => t.onEvent({ kind: "data", data: s });
+    if (data.charCodeAt(0) === 27) return; // ignore arrow / nav escape sequences
+    for (const ch of data) {
+      if (ch === "\r" || ch === "\n") {
+        send("\r\n");
+        runMockCommand(t, t.line.trim(), send);
+        t.line = "";
+        send(mockPrompt(t.cwd));
+      } else if (ch === "\x7f" || ch === "\b") {
+        if (t.line.length) {
+          t.line = t.line.slice(0, -1);
+          send("\b \b");
+        }
+      } else if (ch === "\x03") {
+        send("^C\r\n");
+        t.line = "";
+        send(mockPrompt(t.cwd));
+      } else if (ch >= " ") {
+        t.line += ch;
+        send(ch);
+      }
+    }
+  }
   const ensureDir = (p) => {
     let cur = p;
     while (cur && !DIRS.has(cur)) {
@@ -215,6 +298,23 @@ function mockBackend() {
       }
       onEvent({ kind: "done" });
     },
+    termOpen: async (opts, onEvent) => {
+      const id = mockTermSeq++;
+      const cwd = opts?.cwd || ROOT;
+      mockTerms.set(id, { onEvent, line: "", cwd });
+      const send = (s) => onEvent({ kind: "data", data: s });
+      setTimeout(() => {
+        send("Michael IDE terminal \x1b[2m(preview mock)\x1b[0m\r\n");
+        send("\x1b[2mSimulated shell — the native app runs your real shell via a PTY. Type 'help'.\x1b[0m\r\n\r\n");
+        send(mockPrompt(cwd));
+      }, 20);
+      return id;
+    },
+    termWrite: async (id, data) => mockTermInput(id, data),
+    termResize: async () => {},
+    termClose: async (id) => {
+      mockTerms.delete(id);
+    },
   };
 }
 
@@ -244,6 +344,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   monaco.editor.setTheme(e.matches ? "vs-dark" : "vs");
+  if (term) term.options.theme = termTheme();
 });
 
 /** path -> { model, name, dirty, viewState } */
@@ -1356,6 +1457,7 @@ const MENUS = [
       { sep: true },
       { label: "Toggle Explorer", icon: "i-sidebar-left", action: () => togglePane("explorer") },
       { label: "Toggle Assistant", icon: "i-sidebar-right", action: () => togglePane("assistant") },
+      { label: "Toggle Terminal", icon: "i-terminal", hint: "⌃`", action: () => toggleTerminal() },
       { sep: true },
       { label: "Command Palette…", icon: "i-command", hint: "⌘⇧P", action: () => editorAction("editor.action.quickCommand") },
     ],
@@ -1514,7 +1616,10 @@ promptEl.addEventListener("keydown", (e) => {
 
 window.addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey;
-  if (mod && !e.shiftKey && e.key.toLowerCase() === "s") {
+  if (e.ctrlKey && e.key === "`") {
+    e.preventDefault();
+    toggleTerminal();
+  } else if (mod && !e.shiftKey && e.key.toLowerCase() === "s") {
     e.preventDefault();
     saveActive();
   } else if (mod && e.shiftKey && e.key.toLowerCase() === "e") {
@@ -1524,6 +1629,114 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     showSide("search");
   }
+});
+
+// ---- integrated terminal ----
+let term = null;
+let termFit = null;
+let termId = null;
+let termOpening = false;
+const termPanel = $("terminalPanel");
+const termBody = $("terminalBody");
+const editorwrapEl = document.querySelector(".editorwrap");
+
+function termTheme() {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  return dark
+    ? { background: "#1e1e1e", foreground: "#d4d4d4", cursor: "#d4d4d4", selectionBackground: "#264f78" }
+    : { background: "#ffffff", foreground: "#1f2328", cursor: "#1f2328", selectionBackground: "#b3d4fc" };
+}
+
+const termIsOpen = () => termPanel && !termPanel.hidden;
+
+const termResizeObserver = new ResizeObserver(() => {
+  if (termIsOpen() && termFit) {
+    try {
+      termFit.fit();
+    } catch {
+      /* container not measurable yet */
+    }
+  }
+});
+
+async function openTerminal() {
+  if (!termPanel) return;
+  if (termIsOpen()) {
+    term?.focus();
+    return;
+  }
+  termPanel.hidden = false;
+  editorwrapEl?.classList.add("has-terminal");
+  monacoEditor.layout();
+
+  if (!term) {
+    term = new Terminal({
+      fontSize: 12,
+      fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+      theme: termTheme(),
+      cursorBlink: true,
+      scrollback: 5000,
+    });
+    termFit = new FitAddon();
+    term.loadAddon(termFit);
+    term.open(termBody);
+    term.onData((d) => {
+      if (termId != null) backend.termWrite(termId, d);
+    });
+    term.onResize(({ cols, rows }) => {
+      if (termId != null) backend.termResize(termId, cols, rows);
+    });
+    termResizeObserver.observe(termBody);
+  }
+
+  requestAnimationFrame(() => {
+    try {
+      termFit.fit();
+    } catch {
+      /* ignore */
+    }
+  });
+
+  if (termId == null && !termOpening) {
+    termOpening = true;
+    try {
+      termId = await backend.termOpen(
+        { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
+        (ev) => {
+          if (ev.kind === "data") term.write(ev.data);
+          else if (ev.kind === "exit") {
+            term.write("\r\n\x1b[2m[process exited — press ⌃` to reopen]\x1b[0m\r\n");
+            termId = null;
+          }
+        },
+      );
+    } catch (err) {
+      term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
+    } finally {
+      termOpening = false;
+    }
+  }
+  term.focus();
+}
+
+function closeTerminal() {
+  if (!termIsOpen()) return;
+  termPanel.hidden = true;
+  editorwrapEl?.classList.remove("has-terminal");
+  monacoEditor.layout();
+  monacoEditor.focus();
+}
+
+function toggleTerminal() {
+  if (termIsOpen()) closeTerminal();
+  else openTerminal();
+}
+
+$("terminalClose")?.addEventListener("click", closeTerminal);
+$("terminalBtn")?.addEventListener("click", toggleTerminal);
+// Clean up the backend shell process when the window goes away.
+window.addEventListener("beforeunload", () => {
+  if (termId != null) backend.termClose(termId);
 });
 
 buildMenubar();
@@ -1600,6 +1813,12 @@ const palette = createCommandPalette({
       title: "Show Extensions",
       category: "View",
       run: () => extPanel.open(),
+    },
+    {
+      id: "view.terminal",
+      title: "Toggle Terminal",
+      category: "View",
+      run: () => toggleTerminal(),
     },
     {
       id: "ai.settings",

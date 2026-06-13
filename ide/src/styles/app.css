@@ -399,6 +399,8 @@ body.is-tauri .titlebar {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: var(--editor-bg);
 }
 .tabs {
@@ -481,6 +483,58 @@ body.is-tauri .titlebar {
   flex: 1;
   min-height: 0;
 }
+
+/* ---- integrated terminal ---- */
+.terminal-panel[hidden] { display: none; }
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 248px;
+  min-height: 120px;
+  border-top: 1px solid var(--line);
+  background: var(--editor-bg);
+  z-index: 3;
+}
+.terminal-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+.terminal-panel__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.terminal-panel__title .ic { width: 15px; height: 15px; }
+.terminal-panel__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px; height: 24px;
+  border: 0; border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.terminal-panel__close:hover { background: var(--hover); color: var(--text); }
+.terminal-panel__close .ic { width: 15px; height: 15px; }
+.terminal-panel__body {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 4px 6px 8px;
+  overflow: hidden;
+}
+.terminal-panel__body .xterm,
+.terminal-panel__body .terminal { height: 100%; }
+.editorwrap.has-terminal .welcome { bottom: 248px; }
 
 /* ---- welcome ---- */
 .welcome[hidden] {
