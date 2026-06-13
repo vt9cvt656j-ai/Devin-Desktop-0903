@@ -106,6 +106,21 @@ npx tauri icon src-tauri/icons/source-icon.png
 3. Give Devin the **public tunnel URL** and the **token**. Devin talks to the
    HTTP API above to read/write inside your shared folder.
 
+If your machine has **no public inbound IP** — behind NAT, a corporate
+firewall, or a network that blocks foreign inbound traffic (common in mainland
+China) — you can't let the cloud connect *in*; use a reverse **outbound** tunnel
+instead. See [docs/cloudflare-tunnel.md](docs/cloudflare-tunnel.md) for a
+copy-paste Cloudflare Tunnel setup (quick test + stable named tunnel on your own
+domain + systemd), and the helper script
+[`scripts/cloudflare-tunnel.sh`](scripts/cloudflare-tunnel.sh):
+
+```bash
+# throwaway test URL
+scripts/cloudflare-tunnel.sh quick 53412
+# stable URL on your own domain (recommended)
+scripts/cloudflare-tunnel.sh named devin.example.com 53412
+```
+
 ## Roadmap
 
 - Native **MCP server** adapter (stdio + HTTP) so MCP-aware clients get file

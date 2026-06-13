@@ -3,13 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Devin IDE</title>
+    <title>Michael IDE</title>
     <link rel="stylesheet" href="/src/styles/app.css" />
   </head>
   <body>
     <div class="titlebar" data-tauri-drag-region>
-      <div class="titlebar__lead"></div>
-      <div class="titlebar__title" id="windowTitle">Devin IDE</div>
+      <div class="titlebar__lead">
+        <svg class="brandmark" viewBox="0 0 64 64" aria-hidden="true"><use href="#i-logo" /></svg>
+      </div>
+      <nav class="titlebar__menu" id="menubar" aria-label="Main menu"></nav>
+      <div class="titlebar__title" id="windowTitle">Michael IDE</div>
       <div class="titlebar__actions">
         <button class="tbtn" id="openFolderBtn" title="Open folder">
           <svg class="ic"><use href="#i-folder" /></svg>
@@ -19,6 +22,9 @@
           <svg class="ic"><use href="#i-save" /></svg>
           <span>Save</span>
         </button>
+        <button class="tbtn tbtn--icon" id="extensionsBtn" title="Extensions">
+          <svg class="ic"><use href="#i-ext" /></svg>
+        </button>
         <button class="tbtn tbtn--icon" id="settingsBtn" title="AI settings">
           <svg class="ic"><use href="#i-gear" /></svg>
         </button>
@@ -26,18 +32,49 @@
     </div>
 
     <main class="layout">
-      <!-- Left: file explorer -->
+      <!-- Left: file explorer + search -->
       <aside class="panel explorer" id="explorer">
         <header class="panel__head">
-          <span class="panel__title">Explorer</span>
-          <span class="panel__hint" id="rootName">No folder</span>
-        </header>
-        <div class="tree" id="tree">
-          <div class="empty">
-            <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
-            <p>Open a folder to get started.</p>
-            <button class="btn btn--primary" id="emptyOpenBtn">Open folder…</button>
+          <div class="seg" id="sideTabs" role="tablist">
+            <button class="seg__btn is-active" id="tabExplorer" type="button" role="tab" title="Explorer (⇧⌘E)">
+              <svg class="ic"><use href="#i-files" /></svg><span>Explorer</span>
+            </button>
+            <button class="seg__btn" id="tabSearch" type="button" role="tab" title="Search (⇧⌘F)">
+              <svg class="ic"><use href="#i-search" /></svg><span>Search</span>
+            </button>
           </div>
+        </header>
+
+        <!-- Explorer view -->
+        <div class="side-view" id="viewExplorer">
+          <div class="explorer__bar">
+            <span class="explorer__root" id="rootName" title="">No folder</span>
+            <span class="explorer__tools">
+              <button class="iconbtn" id="newFileBtn" type="button" title="New File" disabled><svg class="ic"><use href="#i-new-file" /></svg></button>
+              <button class="iconbtn" id="newFolderBtn" type="button" title="New Folder" disabled><svg class="ic"><use href="#i-new-folder" /></svg></button>
+              <button class="iconbtn" id="refreshTreeBtn" type="button" title="Refresh" disabled><svg class="ic"><use href="#i-refresh" /></svg></button>
+            </span>
+          </div>
+          <div class="tree" id="tree">
+            <div class="empty">
+              <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
+              <p>Open a folder to get started.</p>
+              <button class="btn btn--primary" id="emptyOpenBtn">Open folder…</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Search view -->
+        <div class="side-view" id="viewSearch" hidden>
+          <div class="search-box">
+            <div class="search-input">
+              <svg class="ic"><use href="#i-search" /></svg>
+              <input id="searchInput" type="text" placeholder="Search in folder…" spellcheck="false" autocomplete="off" />
+              <button class="iconbtn search-case" id="searchCaseBtn" type="button" title="Match Case" aria-pressed="false">Aa</button>
+            </div>
+            <div class="search-meta" id="searchMeta"></div>
+          </div>
+          <div class="search-results" id="searchResults"></div>
         </div>
       </aside>
 
@@ -47,7 +84,7 @@
         <div class="editor" id="editor"></div>
         <div class="welcome" id="welcome">
           <svg class="welcome__hero" viewBox="0 0 240 160"><use href="#art-hero" /></svg>
-          <h1>Devin IDE</h1>
+          <h1>Michael IDE</h1>
           <p>A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
           <div class="welcome__tips">
             <span class="kbd-tip"><kbd>⌘</kbd><kbd>S</kbd> Save</span>
@@ -89,6 +126,17 @@
       </aside>
     </main>
 
+    <!-- Status bar -->
+    <footer class="statusbar" id="statusbar">
+      <div class="statusbar__left">
+        <button class="statusbar__item statusbar__item--btn" id="paletteBtn" title="Command Palette (⇧⌘P)">
+          <svg class="ic"><use href="#i-command" /></svg>
+          <span>Commands</span>
+        </button>
+      </div>
+      <div class="statusbar__right" id="statusbarRight"></div>
+    </footer>
+
     <!-- Settings dialog -->
     <dialog class="sheet" id="settings">
       <form method="dialog" class="sheet__body" id="settingsForm">
@@ -107,6 +155,21 @@
         <div class="sheet__actions">
           <button class="btn" value="cancel" formnovalidate>Cancel</button>
           <button class="btn btn--primary" id="saveCfgBtn" value="save">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- File-operation dialog (prompt / confirm) -->
+    <dialog class="sheet sheet--io" id="ioDialog">
+      <form method="dialog" class="sheet__body" id="ioForm">
+        <h2 id="ioTitle">Rename</h2>
+        <p class="sheet__sub" id="ioMessage" hidden></p>
+        <label id="ioInputWrap">
+          <input id="ioInput" type="text" spellcheck="false" autocomplete="off" />
+        </label>
+        <div class="sheet__actions">
+          <button class="btn" type="button" id="ioCancel">Cancel</button>
+          <button class="btn btn--primary" id="ioOk" value="ok">OK</button>
         </div>
       </form>
     </dialog>
@@ -180,9 +243,84 @@
       <symbol id="i-close" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
       </symbol>
+      <symbol id="i-code" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m9 8-5 4 5 4m6-8 5 4-5 4" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="9" y="9" width="11" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M15 5.5A2.5 2.5 0 0 0 12.5 4H6.5A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 5.5 15" />
+      </symbol>
+      <symbol id="i-ext" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z" />
+      </symbol>
+      <symbol id="i-command" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
+      </symbol>
       <symbol id="i-logo" viewBox="0 0 64 64">
-        <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#g-logo)" />
-        <path fill="#fff" d="M22 22h9c7 0 11 4 11 10s-4 10-11 10h-9zm6 5v10h3c3.4 0 5-1.8 5-5s-1.6-5-5-5z" />
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g-logo)" />
+        <rect x="4.5" y="4.5" width="55" height="55" rx="15.5" fill="none" stroke="#fff" stroke-opacity=".24" />
+        <path fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" d="M17 45V21l15 15 15-15v24" />
+      </symbol>
+      <symbol id="i-monogram" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M5 18V7l7 7 7-7v11" />
+      </symbol>
+
+      <!-- menu glyphs -->
+      <symbol id="i-undo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H8" />
+      </symbol>
+      <symbol id="i-redo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="m15 14 5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H16" />
+      </symbol>
+      <symbol id="i-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="m20 20-3.7-3.7" />
+      </symbol>
+      <symbol id="i-replace" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3M20 16H8l3-3m-3 3 3 3" />
+      </symbol>
+      <symbol id="i-sidebar-left" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M9 5v14" />
+      </symbol>
+      <symbol id="i-sidebar-right" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+      </symbol>
+      <symbol id="i-command" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" />
+      </symbol>
+      <symbol id="i-book" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
+      </symbol>
+      <symbol id="i-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 11.2v4.6" />
+        <circle cx="12" cy="8" r="1.05" fill="currentColor" />
+      </symbol>
+
+      <!-- explorer action glyphs -->
+      <symbol id="i-files" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M9 3h6l4 4v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14 3v5h5M7 7H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h8" opacity=".5" />
+      </symbol>
+      <symbol id="i-new-file" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M13 3v6h6M12 12v6M9 15h6" />
+      </symbol>
+      <symbol id="i-new-folder" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.1c.6 0 1.2.25 1.6.7l1 1.3H18A2 2 0 0 1 20 9v8.5A2.5 2.5 0 0 1 17.5 20h-12A2.5 2.5 0 0 1 3 17.5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M11.5 14h4M13.5 12v4" />
+      </symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M20 6.5v5h-5M4 17.5v-5h5" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19 11.5a7 7 0 0 0-12.3-3.4L4 11.5m0 1a7 7 0 0 0 12.3 3.4L20 12.5" />
+      </symbol>
+      <symbol id="i-rename" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5l3 3M4 20l1-4L16 5a1.8 1.8 0 0 1 2.6 0l.4.4a1.8 1.8 0 0 1 0 2.6L8 19z" />
+      </symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 7h14M10 7V5h4v2M6.5 7l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9L17.5 7M10 11v6M14 11v6" />
       </symbol>
 
       <!-- File-type glyphs (tinted via .ic--<type> color) -->

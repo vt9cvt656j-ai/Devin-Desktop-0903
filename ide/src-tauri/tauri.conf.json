@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Devin IDE",
+  "productName": "Michael IDE",
   "version": "0.1.0",
   "identifier": "ai.devin.ide",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Devin IDE",
+        "title": "Michael IDE",
         "width": 1180,
         "height": 760,
         "minWidth": 880,
@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self' blob:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {
@@ -40,7 +40,7 @@
     "category": "DeveloperTool",
     "copyright": "Copyright (c) 2026 weiligon",
     "shortDescription": "A macOS-style code editor with an AI assistant sidebar.",
-    "longDescription": "Devin IDE is a native-feeling macOS code editor built on Tauri and Monaco, with a built-in AI assistant sidebar that connects to any OpenAI-compatible model."
+    "longDescription": "Michael IDE is a native-feeling macOS code editor built on Tauri and Monaco, with a built-in AI assistant sidebar that connects to any OpenAI-compatible model."
   },
   "plugins": {}
 }

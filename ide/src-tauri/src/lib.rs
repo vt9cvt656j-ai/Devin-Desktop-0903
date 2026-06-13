@@ -1,4 +1,5 @@
 mod ai;
+mod extensions;
 mod files;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -17,8 +18,20 @@ pub fn run() {
             files::read_text_file,
             files::write_text_file,
             files::home_dir,
+            files::create_file,
+            files::create_dir,
+            files::rename_path,
+            files::delete_path,
+            files::search_in_project,
             ai::ai_chat,
+            extensions::ext_list_installed,
+            extensions::ext_read_asset,
+            extensions::ext_set_enabled,
+            extensions::ext_uninstall,
+            extensions::ext_available_builtin,
+            extensions::ext_install_builtin,
+            extensions::ext_install_from_path,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Devin IDE");
+        .expect("error while running Michael IDE");
 }

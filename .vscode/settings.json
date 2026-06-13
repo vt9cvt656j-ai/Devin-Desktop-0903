@@ -1,0 +1,20 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "ide/Cargo.toml"
+  ],
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/dist": true,
+    "**/node_modules": true,
+    "Cargo.lock": true,
+    "**/package-lock.json": true
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  }
+}
