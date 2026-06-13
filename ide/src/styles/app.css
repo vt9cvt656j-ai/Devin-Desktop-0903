@@ -747,9 +747,22 @@ kbd {
 .menu__item.is-active {
   color: var(--accent);
 }
-.menu__item.is-active .ic,
 .menu__item.is-active .check {
   color: var(--accent);
+}
+
+/* brand logo tints (keep brand colour even on active rows) */
+.ic.brand--openai {
+  color: #10a37f;
+}
+.ic.brand--anthropic {
+  color: #d97757;
+}
+.ic.brand--meta {
+  color: #0866ff;
+}
+.ic.brand--qwen {
+  color: #615ced;
 }
 .menu__item .check {
   margin-left: auto;

@@ -359,12 +359,26 @@ const MODEL_GROUPS = [
 
 const modelPicker = $("modelPicker");
 const modelPickerBtn = $("modelPickerBtn");
+const modelPickerBtnIcon = modelPickerBtn.querySelector("use");
 const modelPickerLabel = $("modelPickerLabel");
 const modelMenu = $("modelMenu");
+
+/** Map a model id to its provider brand logo + brand colour. */
+function brandOf(id = "") {
+  const s = id.toLowerCase();
+  if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
+  if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
+  if (s.includes("llama")) return { sym: "i-brand-meta", cls: "brand--meta" };
+  if (s.includes("qwen")) return { sym: "i-brand-qwen", cls: "brand--qwen" };
+  return { sym: "i-cpu", cls: "" };
+}
 
 function syncModelPicker() {
   const c = loadConfig();
   modelPickerLabel.textContent = c.model || "Select model";
+  const b = brandOf(c.model);
+  modelPickerBtnIcon.setAttribute("href", "#" + b.sym);
+  modelPickerBtn.querySelector(".ic").setAttribute("class", "ic " + b.cls);
 }
 
 function buildModelMenu() {
@@ -384,7 +398,8 @@ function buildModelMenu() {
         m.id === current
           ? `<svg class="check"><use href="#i-check" /></svg>`
           : meta;
-      item.innerHTML = `<svg class="ic"><use href="#i-cpu" /></svg><span class="name"></span>${mark}`;
+      const b = brandOf(m.id);
+      item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
       item.querySelector(".name").textContent = m.id;
       item.addEventListener("click", () => {
         selectModel(m.id);
