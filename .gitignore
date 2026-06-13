@@ -24,4 +24,10 @@ yarn-error.log*
 # Editor / OS
 .DS_Store
 .idea/
-.vscode/
+
+# Ignore personal VS Code state, but keep the shared workspace config below.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json

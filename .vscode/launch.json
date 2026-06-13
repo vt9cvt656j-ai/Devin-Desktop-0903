@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Devin Desktop — Tauri Dev",
+      "cargo": {
+        "args": [
+          "build",
+          "--manifest-path=./src-tauri/Cargo.toml",
+          "--no-default-features"
+        ]
+      },
+      "preLaunchTask": "ui:dev"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Devin Desktop — Tauri Release",
+      "cargo": {
+        "args": [
+          "build",
+          "--release",
+          "--manifest-path=./src-tauri/Cargo.toml"
+        ]
+      },
+      "preLaunchTask": "ui:build"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Devin IDE — Tauri Dev",
+      "cargo": {
+        "args": [
+          "build",
+          "--manifest-path=./ide/src-tauri/Cargo.toml",
+          "--no-default-features"
+        ]
+      },
+      "preLaunchTask": "ui:dev:ide"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Devin IDE — Tauri Release",
+      "cargo": {
+        "args": [
+          "build",
+          "--release",
+          "--manifest-path=./ide/src-tauri/Cargo.toml"
+        ]
+      },
+      "preLaunchTask": "ui:build:ide"
+    }
+  ]
+}

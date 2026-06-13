@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `main`/`trunk` are the intended long-term trunk names; the repo's current
+    # default branch is included so push CI runs today (cleaned up once a single
+    # trunk is settled on).
+    branches: [main, trunk, "devin/initial-implementation"]
   pull_request:
 
 env:

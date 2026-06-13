@@ -1,0 +1,51 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ui:dev",
+      "type": "shell",
+      "isBackground": true,
+      "command": "npm",
+      "args": ["run", "dev"],
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "ready in"
+        }
+      }
+    },
+    {
+      "label": "ui:build",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "build"]
+    },
+    {
+      "label": "ui:dev:ide",
+      "type": "shell",
+      "isBackground": true,
+      "options": { "cwd": "${workspaceFolder}/ide" },
+      "command": "npm",
+      "args": ["run", "dev"],
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          "endsPattern": "ready in"
+        }
+      }
+    },
+    {
+      "label": "ui:build:ide",
+      "type": "shell",
+      "options": { "cwd": "${workspaceFolder}/ide" },
+      "command": "npm",
+      "args": ["run", "build"]
+    }
+  ]
+}
