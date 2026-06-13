@@ -11,6 +11,7 @@ A native-feeling, macOS-style code editor with a built-in AI assistant sidebar �
 - **Real editing** — syntax highlighting for many languages, dirty-state tabs, `⌘S` to save.
 - **AI assistant** — streaming chat that automatically includes the open file (and any selection) as context.
 - **Bring your own model** — any OpenAI-compatible endpoint: OpenAI, gateways, or a local server such as Ollama (`http://localhost:11434/v1`). Keys are stored locally.
+- **Extensions** — a lightweight, sandboxed extension system. Extensions add commands, command-palette entries, and status-bar items, and (with permission) read/write the editor and workspace. See [Writing a Devin IDE extension](docs/extensions.md).
 
 ## Architecture
 
@@ -45,6 +46,13 @@ Click the gear in the title bar and set:
 - **Base URL** — e.g. `https://api.openai.com/v1`
 - **API key** — your provider key (stored in `localStorage`, never committed)
 - **Model** — e.g. `gpt-4o-mini`
+
+## Extensions
+
+Open the **Extensions** panel (puzzle icon in the title bar) to install bundled
+samples or install your own from a `.zip`. Extensions run in a per-extension Web
+Worker sandbox and only get the capabilities their manifest declares. To build
+one, see **[Writing a Devin IDE extension](docs/extensions.md)**.
 
 ## License
 
