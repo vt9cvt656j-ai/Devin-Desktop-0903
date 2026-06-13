@@ -5,6 +5,7 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { renderMarkdownInto } from "./markdown.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -65,11 +66,40 @@ function mockBackend() {
     homeDir: async () => "/Users/andrew",
     pickFolder: async () => "/Users/andrew/my-app",
     aiChat: async (_config, messages, onEvent) => {
-      const last = messages[messages.length - 1]?.content ?? "";
-      const reply = `(preview mock) You said: "${last.slice(0, 80)}". Configure a real provider in settings to get live answers.`;
-      for (const word of reply.split(" ")) {
-        await new Promise((r) => setTimeout(r, 35));
-        onEvent({ kind: "token", delta: word + " " });
+      const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
+      const reply = [
+        `Here's how I'd approach **"${last || "your request"}"**. This is a _preview mock_ \u2014 configure a real provider in settings (\u2699\ufe0f) for live answers.`,
+        ``,
+        `### Plan`,
+        `1. Read the open file and locate the relevant function.`,
+        `2. Refactor \`greet()\` to be null-safe.`,
+        `3. Add a quick test.`,
+        ``,
+        `\`\`\`js:src/main.js`,
+        `function greet(name) {`,
+        `  // fall back to a friendly default`,
+        `  const who = name?.trim() || "world";`,
+        `  return \`Hello, \${who}!\`;`,
+        `}`,
+        ``,
+        `console.log(greet("Devin")); // "Hello, Devin!"`,
+        `\`\`\``,
+        ``,
+        `> Tip: select code in the editor and it's sent as context automatically.`,
+        ``,
+        `| Case | Input | Output |`,
+        `| --- | --- | --- |`,
+        `| normal | \`"Ada"\` | \`Hello, Ada!\` |`,
+        `| empty | \`""\` | \`Hello, world!\` |`,
+        ``,
+        `- [x] Handle empty names`,
+        `- [ ] Add unit tests`,
+        ``,
+        `Read more in the [docs](https://github.com/fendoushaonian/Devin-Desktop).`,
+      ].join("\n");
+      for (const tok of reply.match(/\S+\s*|\s+/g) ?? []) {
+        await new Promise((r) => setTimeout(r, 18));
+        onEvent({ kind: "token", delta: tok });
       }
       onEvent({ kind: "done" });
     },
@@ -449,6 +479,18 @@ document.addEventListener("keydown", (e) => {
 const history = [];
 let streaming = false;
 
+// Syntax-highlight code-card bodies by reusing Monaco's tokenizer (matches the
+// editor theme, no extra dependency). Returns null on failure so the card keeps
+// its plain, already-escaped text.
+async function highlightCode(code, lang) {
+  try {
+    let html = await monaco.editor.colorize(code, lang, { tabSize: 2 });
+    return html.replace(/<br\/?>\s*$/, "");
+  } catch {
+    return null;
+  }
+}
+
 function addMessage(role, text) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -456,7 +498,11 @@ function addMessage(role, text) {
   wrap.innerHTML = `<span class="msg__who">${whoIcon}<span></span></span><div class="msg__body"></div>`;
   wrap.querySelector(".msg__who span").textContent = role === "user" ? "You" : "Assistant";
   const body = wrap.querySelector(".msg__body");
-  body.textContent = text;
+  if (role === "assistant") {
+    if (text) renderMarkdownInto(body, text, { highlighter: highlightCode });
+  } else {
+    body.textContent = text;
+  }
   chatEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
   return body;
@@ -465,9 +511,25 @@ function addMessage(role, text) {
 function showChatHint() {
   if (chatEl.children.length) return;
   const hint = document.createElement("div");
-  hint.className = "hint";
-  hint.textContent =
-    "Ask the assistant about your code. The currently open file is sent as context automatically.";
+  hint.className = "chat-empty";
+  hint.innerHTML =
+    `<div class="chat-empty__icon"><svg class="ic"><use href="#i-sparkle" /></svg></div>` +
+    `<h3>Ask about your code</h3>` +
+    `<p>The open file — and any text you select — is sent as context automatically.</p>` +
+    `<div class="chat-empty__chips"></div>`;
+  const chips = hint.querySelector(".chat-empty__chips");
+  for (const s of ["Explain this file", "Find potential bugs", "Add doc comments", "Write a unit test"]) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip";
+    chip.textContent = s;
+    chip.addEventListener("click", () => {
+      promptEl.value = s;
+      promptEl.focus();
+      promptEl.dispatchEvent(new Event("input"));
+    });
+    chips.appendChild(chip);
+  }
   chatEl.appendChild(hint);
 }
 
@@ -479,7 +541,7 @@ async function sendPrompt(text) {
     return;
   }
   if (streaming) return;
-  chatEl.querySelector(".hint")?.remove();
+  chatEl.querySelector(".chat-empty")?.remove();
 
   addMessage("user", text);
 
@@ -500,23 +562,47 @@ async function sendPrompt(text) {
   history.push({ role: "user", content: text });
 
   const body = addMessage("assistant", "");
+  body.classList.add("is-thinking");
+  body.innerHTML = "<i></i><i></i><i></i>";
   let acc = "";
+  let err = null;
+  let raf = 0;
+  const flushStream = () => {
+    raf = 0;
+    body.classList.remove("is-thinking");
+    renderMarkdownInto(body, acc, { streaming: true });
+    chatEl.scrollTop = chatEl.scrollHeight;
+  };
+  const scheduleStream = () => {
+    if (!raf) raf = requestAnimationFrame(flushStream);
+  };
   streaming = true;
   try {
     await backend.aiChat(config, messages, (ev) => {
       if (ev.kind === "token") {
         acc += ev.delta;
-        body.textContent = acc;
-        chatEl.scrollTop = chatEl.scrollHeight;
+        scheduleStream();
       } else if (ev.kind === "error") {
-        body.textContent = "⚠️ " + ev.message;
+        err = ev.message;
       }
     });
   } catch (e) {
-    if (!acc) body.textContent = "⚠️ " + String(e);
+    if (!acc) err = String(e);
   } finally {
+    if (raf) cancelAnimationFrame(raf);
     streaming = false;
-    if (acc) history.push({ role: "assistant", content: acc });
+    body.classList.remove("is-thinking");
+    if (acc) {
+      renderMarkdownInto(body, acc, { highlighter: highlightCode });
+      history.push({ role: "assistant", content: acc });
+    }
+    if (err) {
+      const note = document.createElement("div");
+      note.className = "msg__error";
+      note.textContent = "⚠️ " + err;
+      body.appendChild(note);
+    }
+    chatEl.scrollTop = chatEl.scrollHeight;
   }
 }
 
