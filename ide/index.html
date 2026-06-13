@@ -8,7 +8,9 @@
   </head>
   <body>
     <div class="titlebar" data-tauri-drag-region>
-      <div class="titlebar__lead"></div>
+      <div class="titlebar__lead">
+        <svg class="brandmark" viewBox="0 0 64 64" aria-hidden="true"><use href="#i-logo" /></svg>
+      </div>
       <div class="titlebar__title" id="windowTitle">Devin IDE</div>
       <div class="titlebar__actions">
         <button class="tbtn" id="openFolderBtn" title="Open folder">
@@ -188,8 +190,10 @@
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M15 5.5A2.5 2.5 0 0 0 12.5 4H6.5A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 5.5 15" />
       </symbol>
       <symbol id="i-logo" viewBox="0 0 64 64">
-        <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#g-logo)" />
-        <path fill="#fff" d="M22 22h9c7 0 11 4 11 10s-4 10-11 10h-9zm6 5v10h3c3.4 0 5-1.8 5-5s-1.6-5-5-5z" />
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g-logo)" />
+        <rect x="4.5" y="4.5" width="55" height="55" rx="15.5" fill="none" stroke="#fff" stroke-opacity=".22" />
+        <path fill="#fff" d="M28 10c1.28 10.7 7.27 16.7 18 18c-10.7 1.28-16.7 7.27-18 18c-1.28-10.7-7.27-16.7-18-18c10.7-1.28 16.7-7.27 18-18Z" />
+        <path fill="#fff" opacity=".85" d="M47 40c.5 4.15 2.85 6.5 7 7c-4.15.5-6.5 2.85-7 7c-.5-4.15-2.85-6.5-7-7c4.15-.5 6.5-2.85 7-7Z" />
       </symbol>
 
       <!-- File-type glyphs (tinted via .ic--<type> color) -->

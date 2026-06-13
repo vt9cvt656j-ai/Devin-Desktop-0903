@@ -115,6 +115,17 @@ body {
   -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-bottom: 1px solid var(--line);
 }
+.titlebar__lead {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+.brandmark {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  filter: drop-shadow(0 1px 3px rgba(10, 132, 255, 0.4));
+}
 .titlebar__title {
   font-size: 13px;
   font-weight: 600;
@@ -542,6 +553,32 @@ kbd {
   width: 15px;
   height: 15px;
 }
+/* model-aware avatars: white provider glyph on the provider's brand colour */
+.msg__avatar.brand--openai,
+.assistant__avatar.brand--openai,
+.thinking__orb.brand--openai {
+  background: #10a37f;
+}
+.msg__avatar.brand--anthropic,
+.assistant__avatar.brand--anthropic,
+.thinking__orb.brand--anthropic {
+  background: #d97757;
+}
+.msg__avatar.brand--meta,
+.assistant__avatar.brand--meta,
+.thinking__orb.brand--meta {
+  background: #0866ff;
+}
+.msg__avatar.brand--qwen,
+.assistant__avatar.brand--qwen,
+.thinking__orb.brand--qwen {
+  background: #615ced;
+}
+.msg__avatar[class*="brand--"],
+.assistant__avatar[class*="brand--"],
+.thinking__orb[class*="brand--"] {
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.16);
+}
 .msg__main {
   display: flex;
   flex-direction: column;
@@ -853,7 +890,7 @@ kbd {
 .thinking__orb .ic {
   width: 13px;
   height: 13px;
-  animation: orb-spin 2.6s linear infinite;
+  animation: orb-pulse 1.6s ease-in-out infinite;
 }
 /* flowing highlight across the label text */
 .thinking__text {
@@ -882,9 +919,15 @@ kbd {
     transform: translateX(100%);
   }
 }
-@keyframes orb-spin {
-  to {
-    transform: rotate(360deg);
+@keyframes orb-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.92;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
   }
 }
 @keyframes text-shimmer {

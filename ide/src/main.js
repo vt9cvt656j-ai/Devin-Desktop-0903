@@ -362,25 +362,25 @@ const MODEL_GROUPS = [
   {
     label: "OpenAI",
     models: [
-      { id: "gpt-4o", meta: "Most capable" },
-      { id: "gpt-4o-mini", meta: "Fast · cheap" },
-      { id: "gpt-4.1", meta: "" },
-      { id: "o3-mini", meta: "Reasoning" },
+      { id: "gpt-4o", name: "GPT-4o", meta: "Most capable" },
+      { id: "gpt-4o-mini", name: "GPT-4o mini", meta: "Fast · cheap" },
+      { id: "gpt-4.1", name: "GPT-4.1", meta: "" },
+      { id: "o3-mini", name: "o3-mini", meta: "Reasoning" },
     ],
   },
   {
     label: "Anthropic",
     models: [
-      { id: "claude-3-7-sonnet", meta: "" },
-      { id: "claude-3-5-sonnet", meta: "" },
-      { id: "claude-3-5-haiku", meta: "Fast" },
+      { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", meta: "" },
+      { id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet", meta: "" },
+      { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", meta: "Fast" },
     ],
   },
   {
     label: "Local",
     models: [
-      { id: "llama3.1", meta: "Ollama" },
-      { id: "qwen2.5-coder", meta: "Ollama" },
+      { id: "llama3.1", name: "Llama 3.1", meta: "Ollama" },
+      { id: "qwen2.5-coder", name: "Qwen2.5 Coder", meta: "Ollama" },
     ],
   },
 ];
@@ -401,12 +401,43 @@ function brandOf(id = "") {
   return { sym: "i-cpu", cls: "" };
 }
 
+/** Friendly display name for a model id (falls back to the raw id). */
+const MODEL_NAMES = Object.fromEntries(
+  MODEL_GROUPS.flatMap((g) => g.models.map((m) => [m.id, m.name])),
+);
+function modelLabel(id = "") {
+  return MODEL_NAMES[id] || id;
+}
+function currentModel() {
+  return loadConfig().model || "";
+}
+
 function syncModelPicker() {
   const c = loadConfig();
-  modelPickerLabel.textContent = c.model || "Select model";
+  modelPickerLabel.textContent = c.model ? modelLabel(c.model) : "Select model";
   const b = brandOf(c.model);
   modelPickerBtnIcon.setAttribute("href", "#" + b.sym);
   modelPickerBtn.querySelector(".ic").setAttribute("class", "ic " + b.cls);
+  syncAssistantBrand();
+}
+
+// Reflect the active model in the assistant panel header (provider logo + name).
+function syncAssistantBrand() {
+  const avatar = document.querySelector(".assistant__avatar");
+  const nameEl = document.querySelector(".assistant__name");
+  if (!avatar || !nameEl) return;
+  const use = avatar.querySelector("use");
+  const id = currentModel();
+  if (!id) {
+    avatar.className = "assistant__avatar";
+    use.setAttribute("href", "#i-sparkle");
+    nameEl.textContent = "Assistant";
+    return;
+  }
+  const b = brandOf(id);
+  avatar.className = "assistant__avatar" + (b.cls ? " " + b.cls : "");
+  use.setAttribute("href", "#" + b.sym);
+  nameEl.textContent = modelLabel(id);
 }
 
 function buildModelMenu() {
@@ -428,7 +459,7 @@ function buildModelMenu() {
           : meta;
       const b = brandOf(m.id);
       item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
-      item.querySelector(".name").textContent = m.id;
+      item.querySelector(".name").textContent = m.name || m.id;
       item.addEventListener("click", () => {
         selectModel(m.id);
         closeModelMenu();
@@ -497,12 +528,16 @@ function addMessage(role, text) {
   wrap.className = "msg " + role;
   let body;
   if (role === "assistant") {
+    const id = currentModel();
+    const b = brandOf(id);
+    const sym = id ? b.sym : "i-sparkle";
     const avatar = document.createElement("div");
-    avatar.className = "msg__avatar";
-    avatar.innerHTML = `<svg class="ic"><use href="#i-sparkle" /></svg>`;
+    avatar.className = "msg__avatar" + (id && b.cls ? " " + b.cls : "");
+    avatar.innerHTML = `<svg class="ic"><use href="#${sym}" /></svg>`;
     const main = document.createElement("div");
     main.className = "msg__main";
-    main.innerHTML = `<span class="msg__who"><span>Devin</span></span><div class="msg__body"></div>`;
+    main.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
+    main.querySelector(".msg__who span").textContent = id ? modelLabel(id) : "Assistant";
     wrap.append(avatar, main);
     body = main.querySelector(".msg__body");
     if (text) renderMarkdownInto(body, text, { highlighter: highlightCode });
@@ -516,12 +551,15 @@ function addMessage(role, text) {
   return body;
 }
 
-// Devin-style "thinking" card shown while the first token is pending.
-function thinkingCard() {
+// Devin-style "thinking" card shown while the first token is pending. The orb
+// matches the active model's provider so it feels like that model is replying.
+function thinkingCard(brand) {
   const t = document.createElement("div");
   t.className = "thinking";
+  const orbCls = brand && brand.cls ? "thinking__orb " + brand.cls : "thinking__orb";
+  const sym = brand && brand.sym && brand.sym !== "i-cpu" ? brand.sym : "i-sparkle";
   t.innerHTML =
-    `<span class="thinking__orb"><svg class="ic"><use href="#i-sparkle" /></svg></span>` +
+    `<span class="${orbCls}"><svg class="ic"><use href="#${sym}" /></svg></span>` +
     `<span class="thinking__text">Thinking</span>`;
   return t;
 }
@@ -580,7 +618,7 @@ async function sendPrompt(text) {
   history.push({ role: "user", content: text });
 
   const body = addMessage("assistant", "");
-  body.appendChild(thinkingCard());
+  body.appendChild(thinkingCard(brandOf(currentModel())));
   let acc = "";
   let err = null;
   let raf = 0;
