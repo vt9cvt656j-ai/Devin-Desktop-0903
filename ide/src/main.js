@@ -662,6 +662,7 @@ async function sendDevinPrompt(text) {
     return;
   }
   if (devinBusy) return;
+  devinBusy = true;
   chatEl.querySelector(".hint")?.remove();
   addMessage("user", text);
   const status = addDevinStatus();
@@ -680,7 +681,6 @@ async function sendDevinPrompt(text) {
       await backend.devinSendMessage(cfg, devinSessionId, text);
       status.set("Devin is working…");
     }
-    devinBusy = true;
     await pollDevin(cfg, status);
   } catch (e) {
     status.set("⚠️ " + String(e), { done: true });
@@ -700,12 +700,15 @@ async function pollDevin(cfg, status) {
       status.set("⚠️ " + String(e), { done: true });
       return;
     }
-    for (const m of session.messages || []) {
-      const id = m.event_id || `${m.type}:${m.timestamp}`;
-      if (devinSeen.has(id)) continue;
+    const msgs = session.messages || [];
+    msgs.forEach((m, i) => {
+      // event_id is the stable key; fall back to type:timestamp:index so
+      // messages still dedup correctly if the API omits both fields.
+      const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
+      if (devinSeen.has(id)) return;
       devinSeen.add(id);
       if (m.type === "devin_message" && m.message) addMessage("assistant", m.message, "Devin");
-    }
+    });
     const state = session.status_enum || session.status;
     if (TERMINAL.has(state)) {
       status.set(devinStatusText(state), { done: true });
