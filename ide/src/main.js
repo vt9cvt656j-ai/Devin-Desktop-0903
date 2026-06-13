@@ -466,8 +466,8 @@ monaco.editor.registerEditorOpener({
     const path = resource.fsPath || resource.path;
     if (!path) return false;
     const name = path.split("/").pop();
-    Promise.resolve(openFile(path, name)).then(() => {
-      if (!selectionOrPosition) return;
+    Promise.resolve(openFile(path, name)).then((opened) => {
+      if (!opened || !selectionOrPosition) return;
       const pos =
         "startLineNumber" in selectionOrPosition
           ? { lineNumber: selectionOrPosition.startLineNumber, column: selectionOrPosition.startColumn }
@@ -525,19 +525,20 @@ function syncWelcome() {
 async function openFile(path, name) {
   if (openFiles.has(path)) {
     activate(path);
-    return;
+    return true;
   }
   let content;
   try {
     content = await backend.readTextFile(path);
   } catch (e) {
     showToast(String(e));
-    return;
+    return false;
   }
   const model = getOrCreateModel(path, name, content);
   openFiles.set(path, { model, name, dirty: false, viewState: null });
   renderTabs();
   activate(path);
+  return true;
 }
 
 function activate(path) {
@@ -814,6 +815,13 @@ async function preloadProjectModels(root) {
       }
       if (token !== preloadToken) return;
       if (content.length > PRELOAD_MAX_BYTES) continue;
+      // Never clobber a file the user has open (and may be editing): its model
+      // is already alive in the language service.
+      if (openFiles.has(entry.path)) {
+        projectModels.add(entry.path);
+        count++;
+        continue;
+      }
       getOrCreateModel(entry.path, entry.name, content);
       projectModels.add(entry.path);
       count++;
@@ -835,7 +843,8 @@ function pathForDisplay(p) {
 }
 
 function gotoMarker(path, marker) {
-  Promise.resolve(openFile(path, pathBase(path))).then(() => {
+  Promise.resolve(openFile(path, pathBase(path))).then((opened) => {
+    if (!opened) return;
     monacoEditor.revealLineInCenter(marker.startLineNumber);
     monacoEditor.setPosition({ lineNumber: marker.startLineNumber, column: marker.startColumn });
     monacoEditor.focus();
