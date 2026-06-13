@@ -13,7 +13,9 @@ directory (repo root for Devin Desktop, `ide/` for Devin IDE).
 
 ## Prerequisites
 
-- **Rust** stable, **≥ 1.85** (the dependency tree uses the 2024 edition).
+- **Rust** stable, **≥ 1.85**. The workspace crates are edition 2021, but a
+  transitive dependency ships as edition 2024, which Cargo only supports on
+  1.85+ (older toolchains fail to build the dependency tree).
 - **Node** 18+ (CI pins Node 20 — see [`.nvmrc`](.nvmrc)).
 - The [Tauri system dependencies](https://tauri.app/start/prerequisites/) for your OS.
 
