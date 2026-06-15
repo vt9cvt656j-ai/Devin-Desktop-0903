@@ -127,7 +127,7 @@ img.ic {
   border-bottom: 1px solid var(--line);
 }
 /* macOS native overlay: keep clear of the traffic-light buttons */
-body.is-tauri .titlebar {
+body.is-tauri.is-mac .titlebar {
   padding-left: 84px;
 }
 .titlebar__lead {
