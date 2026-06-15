@@ -1379,7 +1379,8 @@ function showSide(which) {
   $("viewExplorer").hidden = which !== "explorer";
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
-  $("tabExplorer").classList.toggle("is-active", which === "explorer");
+  // Search has no dedicated tab; keep Explorer highlighted since it shares the sidebar.
+  $("tabExplorer").classList.toggle("is-active", which === "explorer" || which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
