@@ -52,8 +52,11 @@ self.MonacoEnvironment = {
 
 // ---- backend abstraction (Tauri when available, mock in a plain browser) ----
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-// Reserve room for the macOS traffic-light buttons only when running natively.
+// Reserve room for the macOS traffic-light buttons only when running natively on macOS.
 if (inTauri) document.body.classList.add("is-tauri");
+if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
+  document.body.classList.add("is-mac");
+}
 const backend = inTauri ? await tauriBackend() : mockBackend();
 
 async function tauriBackend() {
@@ -1377,7 +1380,6 @@ function showSide(which) {
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
   $("tabExplorer").classList.toggle("is-active", which === "explorer");
-  $("tabSearch").classList.toggle("is-active", which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
@@ -2422,7 +2424,6 @@ $("saveBtn").addEventListener("click", saveActive);
 
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
-$("tabSearch").addEventListener("click", () => showSide("search"));
 $("tabGit").addEventListener("click", () => showSide("git"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
 $("gitPullBtn").addEventListener("click", () => gitPull());
