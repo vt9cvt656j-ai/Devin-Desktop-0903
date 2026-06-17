@@ -2943,19 +2943,37 @@ const termPanel = $("terminalPanel");
 const termBody = $("terminalBody");
 const editorwrapEl = document.querySelector(".editorwrap");
 
-function termTheme() {
-  const ansi = {
-    black:   "#3C3C43", red:     "#FF3B30", green:   "#28CD41", yellow:  "#FF9F0A",
-    blue:    "#007AFF", magenta: "#AF52DE", cyan:    "#59ADC4", white:   "#8E8E93",
-    brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#4CD964",
-    brightYellow: "#FFD60A", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
-    brightCyan: "#70D7FF", brightWhite: "#D1D1D6",
-  };
+function termIsDark() {
+  const attr = document.documentElement.getAttribute("data-theme");
+  if (attr === "dark") return true;
+  if (attr === "light") return false;
+  return matchMedia("(prefers-color-scheme: dark)").matches;
+}
 
+// macOS Terminal-inspired palettes: vibrant Apple system colors that stay
+// punchy on both the light ("Basic") and dark ("Pro") backgrounds.
+function termTheme() {
+  if (termIsDark()) {
+    return {
+      background: "#1C1C1E", foreground: "#F2F2F7", cursor: "#FFD60A",
+      cursorAccent: "#1C1C1E", selectionBackground: "rgba(10,132,255,0.45)",
+      selectionForeground: "#FFFFFF",
+      black:   "#48484A", red:     "#FF453A", green:   "#32D74B", yellow:  "#FFD60A",
+      blue:    "#0A84FF", magenta: "#BF5AF2", cyan:    "#64D2FF", white:   "#D1D1D6",
+      brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#5DE96B",
+      brightYellow: "#FFE34D", brightBlue: "#64B5FF", brightMagenta: "#DA8FFF",
+      brightCyan: "#A0E9FF", brightWhite: "#FFFFFF",
+    };
+  }
   return {
     background: "#FFFFFF", foreground: "#1D1D1F", cursor: "#007AFF",
     cursorAccent: "#FFFFFF", selectionBackground: "#B4D8FD",
-    selectionForeground: "#1D1D1F", ...ansi,
+    selectionForeground: "#1D1D1F",
+    black:   "#3C3C43", red:     "#FF3B30", green:   "#28CD41", yellow:  "#FF9F0A",
+    blue:    "#007AFF", magenta: "#AF52DE", cyan:    "#1499B8", white:   "#8E8E93",
+    brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#4CD964",
+    brightYellow: "#FFB340", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
+    brightCyan: "#70D7FF", brightWhite: "#D1D1D6",
   };
 }
 
