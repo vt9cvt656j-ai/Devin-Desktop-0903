@@ -74,6 +74,11 @@ pub fn term_open(
         cmd.cwd(dir);
     }
     cmd.env("TERM", "xterm-256color");
+    cmd.env("CLICOLOR", "1");
+    cmd.env("CLICOLOR_FORCE", "1");
+    cmd.env("LSCOLORS", "ExGxFxDxCxegedabagaced");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("PROMPT_EOL_MARK", "");
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     // The slave handle is no longer needed once the child owns it; dropping it

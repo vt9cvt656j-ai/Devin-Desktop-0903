@@ -45,11 +45,33 @@ function makeIde() {
       getText: () => postRpc("editor.getText", [], "editor"),
       getSelection: () => postRpc("editor.getSelection", [], "editor"),
       insertText: (text) => postRpc("editor.insertText", [String(text)], "editor"),
+      replaceText: (range, text) => postRpc("editor.replaceText", [range, String(text)], "editor"),
+      setDecorations: (decorations) => postRpc("editor.setDecorations", [decorations], "editor"),
+      clearDecorations: () => postRpc("editor.clearDecorations", [], "editor"),
+      getFilePath: () => postRpc("editor.getFilePath", [], "editor"),
+      getLanguage: () => postRpc("editor.getLanguage", [], "editor"),
+      getLineCount: () => postRpc("editor.getLineCount", [], "editor"),
+      getLine: (lineNumber) => postRpc("editor.getLine", [lineNumber], "editor"),
     },
     workspace: {
       readFile: (path) => postRpc("workspace.readFile", [String(path)], "workspace-read"),
       writeFile: (path, content) =>
         postRpc("workspace.writeFile", [String(path), String(content)], "workspace-write"),
+      listDir: (path) => postRpc("workspace.listDir", [String(path)], "workspace-read"),
+    },
+    network: {
+      fetch: (url, opts) => postRpc("network.fetch", [String(url), opts || {}], "network"),
+    },
+    diagnostics: {
+      set: (uri, diagnostics) =>
+        postRpc("diagnostics.set", [String(uri), diagnostics], "diagnostics"),
+      clear: (uri) => postRpc("diagnostics.clear", [String(uri)], "diagnostics"),
+    },
+    locale: {
+      registerLocale: (locale, translations) =>
+        postRpc("locale.registerLocale", [String(locale), translations], "locale"),
+      setLocale: (locale) =>
+        postRpc("locale.setLocale", [String(locale)], "locale"),
     },
     subscriptions: [],
   };

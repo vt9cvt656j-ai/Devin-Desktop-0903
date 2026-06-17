@@ -333,6 +333,41 @@ pub fn git_checkout(root: String, branch: String, create: bool) -> Result<(), St
     }
 }
 
+/// A single commit from the log.
+#[derive(Serialize)]
+pub struct GitLogEntry {
+    hash: String,
+    short_hash: String,
+    author: String,
+    date: String,
+    message: String,
+}
+
+/// Return the last N commits (default 50) from the current branch.
+#[tauri::command]
+pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, String> {
+    let n = count.unwrap_or(50).min(200);
+    let format = "%H%n%h%n%an%n%ar%n%s";
+    let out = run_git_checked(
+        &root,
+        &["log", &format!("-{n}"), &format!("--format={format}")],
+    )?;
+    let lines: Vec<&str> = out.lines().collect();
+    let mut entries = Vec::new();
+    let mut i = 0;
+    while i + 4 < lines.len() {
+        entries.push(GitLogEntry {
+            hash: lines[i].to_string(),
+            short_hash: lines[i + 1].to_string(),
+            author: lines[i + 2].to_string(),
+            date: lines[i + 3].to_string(),
+            message: lines[i + 4].to_string(),
+        });
+        i += 5;
+    }
+    Ok(entries)
+}
+
 /// Pull the current branch from its upstream (`git pull`).
 ///
 /// Returns combined stdout/stderr because git reports progress on stderr even

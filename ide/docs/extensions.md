@@ -109,8 +109,19 @@ export function activate(ide) {
 | `ide.editor.getText()` | `editor` | Resolve to the full text of the active editor (`""` if none). |
 | `ide.editor.getSelection()` | `editor` | Resolve to the currently selected text. |
 | `ide.editor.insertText(text)` | `editor` | Insert `text` at the cursor. |
+| `ide.editor.replaceText(range, text)` | `editor` | Replace text in the given range `{ startLineNumber, startColumn, endLineNumber, endColumn }`. |
+| `ide.editor.setDecorations(decorations)` | `editor` | Set editor decorations (highlights, gutter marks, inline hints). Each decoration: `{ range, className?, inlineClassName?, linesDecorationsClassName?, hoverMessage?, isWholeLine?, after? }`. |
+| `ide.editor.clearDecorations()` | `editor` | Clear all decorations set by this extension. |
+| `ide.editor.getFilePath()` | `editor` | Resolve to the absolute path of the active file (or `null`). |
+| `ide.editor.getLanguage()` | `editor` | Resolve to the language id of the active editor (e.g. `"javascript"`). |
+| `ide.editor.getLineCount()` | `editor` | Resolve to the number of lines in the active editor. |
+| `ide.editor.getLine(lineNumber)` | `editor` | Resolve to the text content of a specific line. |
 | `ide.workspace.readFile(path)` | `workspace-read` | Resolve to the contents of a file in the open workspace. |
 | `ide.workspace.writeFile(path, content)` | `workspace-write` | Write `content` to a file in the open workspace. |
+| `ide.workspace.listDir(path)` | `workspace-read` | List directory entries. Returns `[{ name, path, is_dir }]`. |
+| `ide.network.fetch(url, opts)` | `network` | Make an HTTP request. `opts = { method?, headers?, body? }`. Returns `{ status, ok, text, json, headers }`. |
+| `ide.diagnostics.set(uri, diagnostics)` | `diagnostics` | Set diagnostic markers on a file. Each: `{ severity, message, startLine, startColumn, endLine?, endColumn? }`. Severity: `"error"`, `"warning"`, `"info"`, `"hint"`. |
+| `ide.diagnostics.clear(uri)` | `diagnostics` | Clear diagnostics set by this extension for the given URI (or all if omitted). |
 
 All methods that talk to the host return Promises — `await` them. Calling a
 method whose permission you did **not** declare rejects with
@@ -122,9 +133,11 @@ Extensions are deny-by-default. List only what you need in `permissions`:
 
 | Permission | Grants |
 |---|---|
-| `editor` | `ide.editor.*` (read text/selection, insert text) |
-| `workspace-read` | `ide.workspace.readFile` |
+| `editor` | `ide.editor.*` (read text/selection, insert/replace text, decorations, file info) |
+| `workspace-read` | `ide.workspace.readFile`, `ide.workspace.listDir` |
 | `workspace-write` | `ide.workspace.writeFile` |
+| `network` | `ide.network.fetch` (make HTTP requests to external APIs) |
+| `diagnostics` | `ide.diagnostics.*` (set/clear editor diagnostics/markers) |
 
 `ide.commands.*` and `ide.window.*` are always available and need no permission.
 

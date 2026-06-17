@@ -1,13 +1,15 @@
 // A minimal command palette (Ctrl/Cmd+Shift+P) shared by built-in IDE actions
 // and extension-contributed commands.
 
+import { t } from "../i18n.js";
+
 export function createCommandPalette({ getCommands }) {
   const overlay = document.createElement("div");
   overlay.className = "palette";
   overlay.hidden = true;
   overlay.innerHTML = `
     <div class="palette__panel" role="dialog" aria-label="Command palette">
-      <input class="palette__input" type="text" placeholder="Type a command…" spellcheck="false" />
+      <input class="palette__input" type="text" data-i18n-placeholder="palette.placeholder" placeholder="Type a command…" spellcheck="false" />
       <div class="palette__list" role="listbox"></div>
     </div>`;
   document.body.appendChild(overlay);
@@ -41,7 +43,7 @@ export function createCommandPalette({ getCommands }) {
     if (filtered.length === 0) {
       const empty = document.createElement("div");
       empty.className = "palette__empty";
-      empty.textContent = "No matching commands";
+      empty.textContent = t("palette.noResults");
       list.appendChild(empty);
       return;
     }
@@ -78,6 +80,7 @@ export function createCommandPalette({ getCommands }) {
   function open() {
     commands = getCommands();
     input.value = "";
+    input.placeholder = t("palette.placeholder");
     overlay.hidden = false;
     refresh();
     input.focus();

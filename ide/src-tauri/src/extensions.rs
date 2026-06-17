@@ -72,6 +72,30 @@ const BUILTINS: &[(&str, &str)] = &[
         include_str!("../extensions/insert-date/extension.json"),
         include_str!("../extensions/insert-date/index.js"),
     ),
+    (
+        include_str!("../extensions/ai-assistant/extension.json"),
+        include_str!("../extensions/ai-assistant/index.js"),
+    ),
+    (
+        include_str!("../extensions/code-formatter/extension.json"),
+        include_str!("../extensions/code-formatter/index.js"),
+    ),
+    (
+        include_str!("../extensions/bracket-colorizer/extension.json"),
+        include_str!("../extensions/bracket-colorizer/index.js"),
+    ),
+    (
+        include_str!("../extensions/todo-highlight/extension.json"),
+        include_str!("../extensions/todo-highlight/index.js"),
+    ),
+    (
+        include_str!("../extensions/color-picker/extension.json"),
+        include_str!("../extensions/color-picker/index.js"),
+    ),
+    (
+        include_str!("../extensions/chinese-language-pack/extension.json"),
+        include_str!("../extensions/chinese-language-pack/index.js"),
+    ),
 ];
 
 /// An extension id is used as a directory name, so keep it to a safe charset.

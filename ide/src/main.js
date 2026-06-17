@@ -13,6 +13,7 @@ import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
 import { createExtensionsPanel } from "./ext/panel.js";
+import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM } from "./i18n.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -84,6 +85,7 @@ async function tauriBackend() {
     gitBranches: (root) => core.invoke("git_branches", { root }),
     gitCheckout: (root, branch, create) => core.invoke("git_checkout", { root, branch, create }),
     gitPull: (root) => core.invoke("git_pull", { root }),
+    gitLog: (root, count) => core.invoke("git_log", { root, count }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -392,6 +394,10 @@ function mockBackend() {
       GIT_BRANCH = name;
     },
     gitPull: async (_root) => "Already up to date. (preview mock)",
+    gitLog: async () => [
+      { hash: "a1b2c3d", short_hash: "a1b2c3d", author: "Michael", date: "2 hours ago", message: "Initial commit" },
+      { hash: "e4f5g6h", short_hash: "e4f5g6h", author: "Michael", date: "1 day ago", message: "Add feature X" },
+    ],
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -476,9 +482,35 @@ const monacoEditor = monaco.editor.create(editorEl, {
   renderWhitespace: "selection",
   padding: { top: 10 },
 });
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  monaco.editor.setTheme(e.matches ? "vs-dark" : "vs");
-  if (term) term.options.theme = termTheme();
+const THEME_KEY = "michael-ide.theme";
+let currentTheme = localStorage.getItem(THEME_KEY) || "system";
+
+function applyEditorTheme() {
+  let dark;
+  if (currentTheme === "dark") dark = true;
+  else if (currentTheme === "light") dark = false;
+  else dark = matchMedia("(prefers-color-scheme: dark)").matches;
+
+  monaco.editor.setTheme(dark ? "vs-dark" : "vs");
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+}
+
+function setTheme(theme) {
+  currentTheme = theme;
+  localStorage.setItem(THEME_KEY, theme);
+  applyEditorTheme();
+  for (const tab of (typeof termTabs !== "undefined" ? termTabs : [])) {
+    tab.term.options.theme = termTheme();
+  }
+}
+
+applyEditorTheme();
+
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  applyEditorTheme();
+  for (const tab of (typeof termTabs !== "undefined" ? termTabs : [])) {
+    tab.term.options.theme = termTheme();
+  }
 });
 
 // Route "go to definition" (and similar) to a resource other than the current
@@ -616,7 +648,7 @@ async function saveActive() {
   try {
     await backend.writeTextFile(activePath, f.model.getValue());
     markDirty(activePath, false);
-    showToast("Saved " + f.name);
+    showToast(t("file.saved", { name: f.name }));
   } catch (e) {
     showToast(String(e));
   }
@@ -881,7 +913,7 @@ function renderProblems(markers) {
   if (!markers.length) {
     const empty = document.createElement("div");
     empty.className = "problems__empty";
-    empty.textContent = "No problems have been detected.";
+    empty.textContent = t("problems.empty");
     problemsBody.appendChild(empty);
     return;
   }
@@ -1044,9 +1076,9 @@ async function expandDir(path) {
 
 async function newEntry(targetDir, isDir) {
   const name = await ioPrompt({
-    title: isDir ? "New Folder" : "New File",
+    title: isDir ? t("explorer.newFolder") : t("explorer.newFile"),
     placeholder: isDir ? "folder name" : "file-name.ext",
-    okLabel: "Create",
+    okLabel: t("dialog.create"),
   });
   if (!name) return;
   const dest = targetDir.replace(/\/+$/, "") + "/" + name;
@@ -1067,7 +1099,7 @@ async function newEntry(targetDir, isDir) {
 }
 
 async function renameEntry(path, name, isDir) {
-  const next = await ioPrompt({ title: "Rename", value: name, okLabel: "Rename" });
+  const next = await ioPrompt({ title: t("dialog.rename"), value: name, okLabel: t("dialog.rename") });
   if (!next || next === name) return;
   const parent = parentDir(path);
   const dest = parent + "/" + next;
@@ -1087,9 +1119,9 @@ async function renameEntry(path, name, isDir) {
 
 async function deleteEntry(path, name, isDir) {
   const ok = await ioConfirm({
-    title: "Delete " + (isDir ? "Folder" : "File"),
-    message: `Are you sure you want to delete \u201C${name}\u201D? This cannot be undone.`,
-    okLabel: "Delete",
+    title: t("delete.title", { type: isDir ? t("delete.folder") : t("delete.file") }),
+    message: t("delete.confirm", { name }),
+    okLabel: t("ctx.delete"),
     danger: true,
   });
   if (!ok) return;
@@ -1108,7 +1140,7 @@ async function deleteEntry(path, name, isDir) {
 function copyText(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(
-      () => showToast("Copied path"),
+      () => showToast(t("file.copiedPath")),
       () => showToast(text),
     );
   } else {
@@ -1130,17 +1162,17 @@ function openContextMenu(x, y, entry) {
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isRoot = entry.path === rootPath;
   const items = [
-    { label: "New File\u2026", icon: "i-new-file", action: () => newEntry(targetDir, false) },
-    { label: "New Folder\u2026", icon: "i-new-folder", action: () => newEntry(targetDir, true) },
+    { label: t("ctx.newFile"), icon: "i-new-file", action: () => newEntry(targetDir, false) },
+    { label: t("ctx.newFolder"), icon: "i-new-folder", action: () => newEntry(targetDir, true) },
   ];
   if (!isRoot) {
     items.push(
       { sep: true },
-      { label: "Rename\u2026", icon: "i-rename", action: () => renameEntry(entry.path, entry.name, isDir) },
-      { label: "Delete", icon: "i-trash", danger: true, action: () => deleteEntry(entry.path, entry.name, isDir) },
+      { label: t("ctx.rename"), icon: "i-rename", action: () => renameEntry(entry.path, entry.name, isDir) },
+      { label: t("ctx.delete"), icon: "i-trash", danger: true, action: () => deleteEntry(entry.path, entry.name, isDir) },
     );
   }
-  items.push({ sep: true }, { label: "Copy Path", icon: "i-copy", action: () => copyText(entry.path) });
+  items.push({ sep: true }, { label: t("ctx.copyPath"), icon: "i-copy", action: () => copyText(entry.path) });
 
   const menu = document.createElement("div");
   menu.className = "menu ctx-menu";
@@ -1282,7 +1314,7 @@ async function runSearch() {
   const seq = ++searchSeq;
   if (!rootPath) {
     resultsEl.innerHTML = "";
-    metaEl.textContent = "Open a folder to search.";
+    metaEl.textContent = t("search.openFolder");
     return;
   }
   if (!query) {
@@ -1290,7 +1322,7 @@ async function runSearch() {
     metaEl.textContent = "";
     return;
   }
-  metaEl.textContent = "Searching\u2026";
+  metaEl.textContent = t("search.searching");
   let files;
   try {
     files = await backend.searchInProject(rootPath, query, searchCaseSensitive);
@@ -1305,12 +1337,12 @@ async function runSearch() {
 function renderSearchResults(files, metaEl, resultsEl) {
   resultsEl.innerHTML = "";
   if (!files.length) {
-    metaEl.textContent = "No results";
+    metaEl.textContent = t("search.noResults");
     return;
   }
   let total = 0;
   for (const f of files) total += f.matches.length;
-  metaEl.textContent = `${total} result${total === 1 ? "" : "s"} in ${files.length} file${files.length === 1 ? "" : "s"}`;
+  metaEl.textContent = t("search.resultsMeta", { total, s1: total === 1 ? "" : "s", files: files.length, s2: files.length === 1 ? "" : "s" });
   for (const f of files) {
     const group = document.createElement("div");
     group.className = "sr-group";
@@ -1379,9 +1411,10 @@ function showSide(which) {
   $("viewExplorer").hidden = which !== "explorer";
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
-  // Search has no dedicated tab; keep Explorer highlighted since it shares the sidebar.
+  $("viewOutline").hidden = which !== "outline";
   $("tabExplorer").classList.toggle("is-active", which === "explorer" || which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
+  $("tabOutline")?.classList.toggle("is-active", which === "outline");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
   if (which === "search") {
@@ -1390,6 +1423,111 @@ function showSide(which) {
     si.select();
   } else if (which === "git") {
     refreshGitStatus();
+  } else if (which === "outline") {
+    refreshOutline();
+  }
+}
+
+// ---- outline panel ----
+const outlineListEl = $("outlineList");
+
+async function refreshOutline() {
+  if (!outlineListEl) return;
+  outlineListEl.innerHTML = "";
+  if (!activePath) {
+    const empty = document.createElement("div");
+    empty.className = "outline-empty";
+    empty.textContent = t("outline.noFile");
+    outlineListEl.appendChild(empty);
+    return;
+  }
+  const model = monacoEditor.getModel();
+  if (!model) return;
+
+  let symbols;
+  try {
+    symbols = await monaco.languages.getLanguages();
+    const docSymbols = await getDocumentSymbols(model);
+    if (!docSymbols || !docSymbols.length) {
+      const empty = document.createElement("div");
+      empty.className = "outline-empty";
+      empty.textContent = t("outline.noSymbols");
+      outlineListEl.appendChild(empty);
+      return;
+    }
+    renderOutlineSymbols(docSymbols, outlineListEl, 0);
+  } catch {
+    const empty = document.createElement("div");
+    empty.className = "outline-empty";
+    empty.textContent = t("outline.noSymbols");
+    outlineListEl.appendChild(empty);
+  }
+}
+
+async function getDocumentSymbols(model) {
+  const providers = monaco.languages.DocumentSymbolProviderRegistry?.all?.(model);
+  if (!providers || !providers.length) {
+    return fallbackSymbols(model);
+  }
+  try {
+    const result = await providers[0].provideDocumentSymbols(model);
+    return result && result.length ? result : fallbackSymbols(model);
+  } catch {
+    return fallbackSymbols(model);
+  }
+}
+
+function fallbackSymbols(model) {
+  const symbols = [];
+  const text = model.getValue();
+  const lines = text.split("\n");
+  const funcRegex = /(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(?|class\s+(\w+))/;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(funcRegex);
+    if (m) {
+      const name = m[1] || m[2] || m[3];
+      const kind = m[3] ? 4 : (m[1] ? 11 : 5);
+      symbols.push({
+        name,
+        kind,
+        range: { startLineNumber: i + 1, startColumn: 1, endLineNumber: i + 1, endColumn: lines[i].length + 1 },
+        children: [],
+      });
+    }
+  }
+  return symbols;
+}
+
+const SYMBOL_ICONS = {
+  4: "i-code",  // Class
+  5: "i-code",  // Method
+  11: "i-code", // Function
+  12: "i-code", // Variable
+  13: "i-code", // Constant
+  1: "i-file",  // File
+  2: "i-folder", // Module
+  6: "i-code",  // Property
+  7: "i-code",  // Field
+};
+
+function renderOutlineSymbols(symbols, container, depth) {
+  for (const sym of symbols) {
+    const item = document.createElement("div");
+    item.className = "outline-item";
+    item.style.paddingLeft = (12 + depth * 14) + "px";
+    const iconId = SYMBOL_ICONS[sym.kind] || "i-code";
+    item.innerHTML = `<svg class="ic"><use href="#${iconId}" /></svg><span class="outline-name"></span>`;
+    item.querySelector(".outline-name").textContent = sym.name;
+    item.addEventListener("click", () => {
+      const line = sym.range?.startLineNumber || sym.selectionRange?.startLineNumber || 1;
+      monacoEditor.revealLineInCenter(line);
+      monacoEditor.setPosition({ lineNumber: line, column: 1 });
+      monacoEditor.focus();
+    });
+    container.appendChild(item);
+    if (sym.children && sym.children.length) {
+      renderOutlineSymbols(sym.children, container, depth + 1);
+    }
   }
 }
 
@@ -1422,7 +1560,8 @@ function gitBadge(file) {
 async function refreshGitStatus() {
   if (!rootPath) {
     gitBranchNameEl.textContent = "—";
-    gitListEl.innerHTML = `<div class="git-empty">Open a folder to see source control.</div>`;
+    gitListEl.innerHTML = `<div class="git-empty"></div>`;
+    gitListEl.firstChild.textContent = t("git.openFolder");
     return;
   }
   let status;
@@ -1439,23 +1578,59 @@ async function refreshGitStatus() {
   if (!status.is_repo) {
     gitIsRepo = false;
     gitBranchNameEl.textContent = "—";
-    gitListEl.innerHTML = `<div class="git-empty">This folder is not a Git repository.</div>`;
+    gitListEl.innerHTML = `<div class="git-empty"></div>`;
+    gitListEl.firstChild.textContent = t("git.notRepo");
     refreshGutter();
     return;
   }
   gitIsRepo = true;
   gitBranchNameEl.textContent = status.branch;
-  gitBranchNameEl.parentElement.title = "On branch " + status.branch;
+  gitBranchNameEl.parentElement.title = t("git.onBranch", { name: status.branch });
   renderGitFiles(status.files);
   refreshGutter();
+  refreshGitLog();
 }
+
+async function refreshGitLog() {
+  const logTitle = $("gitLogTitle");
+  const logEl = $("gitLog");
+  if (!logTitle || !logEl) return;
+  if (!rootPath || !gitIsRepo) {
+    logTitle.style.display = "none";
+    logEl.hidden = true;
+    return;
+  }
+  logTitle.style.display = "";
+  let entries;
+  try {
+    entries = await backend.gitLog(rootPath, 30);
+  } catch {
+    return;
+  }
+  logEl.innerHTML = "";
+  for (const e of entries) {
+    const row = document.createElement("div");
+    row.className = "git-log-row";
+    row.innerHTML = `<span class="git-log-hash"></span><span class="git-log-msg"></span><span class="git-log-meta"></span>`;
+    row.querySelector(".git-log-hash").textContent = e.short_hash;
+    row.querySelector(".git-log-msg").textContent = e.message;
+    row.querySelector(".git-log-meta").textContent = `${e.author} · ${e.date}`;
+    row.title = `${e.hash}\n${e.author} · ${e.date}\n${e.message}`;
+    logEl.appendChild(row);
+  }
+}
+
+$("gitLogToggle")?.addEventListener("click", () => {
+  const logEl = $("gitLog");
+  if (logEl) logEl.hidden = !logEl.hidden;
+});
 
 function renderGitFiles(files) {
   gitListEl.innerHTML = "";
   if (!files.length) {
     const empty = document.createElement("div");
     empty.className = "git-empty";
-    empty.textContent = "No changes — working tree clean.";
+    empty.textContent = t("git.noChanges");
     gitListEl.appendChild(empty);
     return;
   }
@@ -1478,15 +1653,15 @@ function renderGitFiles(files) {
     gitListEl.appendChild(head);
     for (const f of group) gitListEl.appendChild(gitRow(f));
   };
-  addSection("Staged Changes", staged, {
-    title: "Unstage all",
+  addSection(t("git.stagedChanges"), staged, {
+    title: t("git.unstageAll"),
     icon: "i-minus",
-    run: () => gitRunOp(() => backend.gitUnstageAll(rootPath), "Unstaged all changes"),
+    run: () => gitRunOp(() => backend.gitUnstageAll(rootPath), t("git.unstagedAll")),
   });
-  addSection("Changes", unstaged, {
-    title: "Stage all",
+  addSection(t("git.changes"), unstaged, {
+    title: t("git.stageAll"),
     icon: "i-plus",
-    run: () => gitRunOp(() => backend.gitStageAll(rootPath), "Staged all changes"),
+    run: () => gitRunOp(() => backend.gitStageAll(rootPath), t("git.stagedAll")),
   });
 }
 
@@ -1518,18 +1693,18 @@ function gitRow(file) {
   act.className = "git-row__act";
   act.type = "button";
   if (file.staged) {
-    act.title = "Unstage";
+    act.title = t("git.unstage");
     act.innerHTML = `<svg class="ic"><use href="#i-minus" /></svg>`;
     act.addEventListener("click", (e) => {
       e.stopPropagation();
-      gitRunOp(() => backend.gitUnstage(rootPath, file.rel), "Unstaged " + file.name);
+      gitRunOp(() => backend.gitUnstage(rootPath, file.rel), t("git.unstaged", { name: file.name }));
     });
   } else {
-    act.title = "Stage";
+    act.title = t("git.stage");
     act.innerHTML = `<svg class="ic"><use href="#i-plus" /></svg>`;
     act.addEventListener("click", (e) => {
       e.stopPropagation();
-      gitRunOp(() => backend.gitStage(rootPath, file.rel), "Staged " + file.name);
+      gitRunOp(() => backend.gitStage(rootPath, file.rel), t("git.staged", { name: file.name }));
     });
   }
 
@@ -1559,7 +1734,7 @@ async function gitCommit() {
   const input = $("gitCommitMsg");
   const msg = input.value.trim();
   if (!msg) {
-    showToast("Enter a commit message first.");
+    showToast(t("git.emptyMsg"));
     input.focus();
     return;
   }
@@ -1567,7 +1742,7 @@ async function gitCommit() {
     const res = await backend.gitCommit(rootPath, msg);
     input.value = "";
     closeDiffView();
-    showToast("Committed " + res);
+    showToast(t("git.committed", { hash: res }));
   } catch (e) {
     showToast(String(e && e.message ? e.message : e));
   }
@@ -1576,10 +1751,10 @@ async function gitCommit() {
 
 async function gitPush() {
   if (!rootPath) return;
-  showToast("Pushing…");
+  showToast(t("git.pushing"));
   try {
     const res = await backend.gitPush(rootPath);
-    showToast(res.split("\n").pop() || "Pushed.");
+    showToast(res.split("\n").pop() || t("git.pushed"));
   } catch (e) {
     showToast(String(e && e.message ? e.message : e));
   }
@@ -1587,10 +1762,10 @@ async function gitPush() {
 
 async function gitPull() {
   if (!rootPath) return;
-  showToast("Pulling…");
+  showToast(t("git.pulling"));
   try {
     const res = await backend.gitPull(rootPath);
-    showToast(res.split("\n").pop() || "Pulled.");
+    showToast(res.split("\n").pop() || t("git.pulled"));
   } catch (e) {
     showToast(String(e && e.message ? e.message : e));
   }
@@ -1613,7 +1788,7 @@ async function toggleBranchMenu() {
     return;
   }
   if (!rootPath || !gitIsRepo) {
-    showToast("Open a Git repository first.");
+    showToast(t("git.notRepo"));
     return;
   }
   let info;
@@ -1655,17 +1830,18 @@ function renderBranchMenu(info) {
   const create = document.createElement("button");
   create.type = "button";
   create.className = "git-branch-create";
-  create.innerHTML = `<svg class="ic"><use href="#i-plus" /></svg><span>Create new branch…</span>`;
+  create.innerHTML = `<svg class="ic"><use href="#i-plus" /></svg><span></span>`;
+  create.querySelector("span").textContent = t("git.newBranch");
   create.addEventListener("click", () => createBranch());
   gitBranchMenuEl.appendChild(create);
 }
 
 async function switchBranch(name) {
   closeBranchMenu();
-  showToast("Switching to " + name + "…");
+  showToast(t("git.switchingTo", { name }));
   try {
     await backend.gitCheckout(rootPath, name, false);
-    showToast("Switched to branch '" + name + "'");
+    showToast(t("git.switchedTo", { name }));
   } catch (e) {
     showToast(String(e && e.message ? e.message : e));
     return;
@@ -1675,11 +1851,11 @@ async function switchBranch(name) {
 
 async function createBranch() {
   closeBranchMenu();
-  const name = (window.prompt("New branch name:") || "").trim();
+  const name = (window.prompt(t("git.newBranchPrompt")) || "").trim();
   if (!name) return;
   try {
     await backend.gitCheckout(rootPath, name, true);
-    showToast("Created and switched to '" + name + "'");
+    showToast(t("git.createdBranch", { name }));
   } catch (e) {
     showToast(String(e && e.message ? e.message : e));
     return;
@@ -1989,7 +2165,7 @@ function currentModel() {
 
 function syncModelPicker() {
   const c = loadConfig();
-  modelPickerLabel.textContent = c.model ? modelLabel(c.model) : "Select model";
+  modelPickerLabel.textContent = c.model ? modelLabel(c.model) : t("assistant.selectModel");
   const b = brandOf(c.model);
   modelPickerBtnIcon.setAttribute("href", "#" + b.sym);
   modelPickerBtn.querySelector(".ic").setAttribute("class", "ic " + b.cls);
@@ -2006,7 +2182,7 @@ function syncAssistantBrand() {
   if (!id) {
     avatar.className = "assistant__avatar";
     use.setAttribute("href", "#i-sparkle");
-    nameEl.textContent = "Assistant";
+    nameEl.textContent = t("assistant.name");
     return;
   }
   const b = brandOf(id);
@@ -2047,7 +2223,8 @@ function buildModelMenu() {
   modelMenu.appendChild(sep);
   const cfg = document.createElement("div");
   cfg.className = "menu__item";
-  cfg.innerHTML = `<svg class="ic"><use href="#i-gear" /></svg><span>Configure provider…</span>`;
+  cfg.innerHTML = `<svg class="ic"><use href="#i-gear" /></svg><span></span>`;
+  cfg.querySelector("span").textContent = t("settings.configure");
   cfg.addEventListener("click", () => {
     closeModelMenu();
     openSettings();
@@ -2112,12 +2289,13 @@ function addMessage(role, text) {
     const main = document.createElement("div");
     main.className = "msg__main";
     main.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
-    main.querySelector(".msg__who span").textContent = id ? modelLabel(id) : "Assistant";
+    main.querySelector(".msg__who span").textContent = id ? modelLabel(id) : t("assistant.name");
     wrap.append(avatar, main);
     body = main.querySelector(".msg__body");
     if (text) renderMarkdownInto(body, text, { highlighter: highlightCode });
   } else {
-    wrap.innerHTML = `<span class="msg__who"><span>You</span></span><div class="msg__body"></div>`;
+    wrap.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
+    wrap.querySelector(".msg__who span").textContent = t("assistant.you");
     body = wrap.querySelector(".msg__body");
     body.textContent = text;
   }
@@ -2135,7 +2313,7 @@ function thinkingCard(brand) {
   const sym = brand && brand.sym && brand.sym !== "i-cpu" ? brand.sym : "i-sparkle";
   t.innerHTML =
     `<span class="${orbCls}"><svg class="ic"><use href="#${sym}" /></svg></span>` +
-    `<span class="thinking__text">Thinking</span>`;
+    `<span class="thinking__text">${t("assistant.thinking")}</span>`;
   return t;
 }
 
@@ -2145,11 +2323,13 @@ function showChatHint() {
   hint.className = "chat-empty";
   hint.innerHTML =
     `<div class="chat-empty__icon"><svg class="ic"><use href="#i-monogram" /></svg></div>` +
-    `<h3>Ask about your code</h3>` +
-    `<p>The open file — and any text you select — is sent as context automatically.</p>` +
+    `<h3></h3>` +
+    `<p></p>` +
     `<div class="chat-empty__chips"></div>`;
+  hint.querySelector("h3").textContent = t("assistant.chatHintTitle");
+  hint.querySelector("p").textContent = t("assistant.chatHintDesc");
   const chips = hint.querySelector(".chat-empty__chips");
-  for (const s of ["Explain this file", "Find potential bugs", "Add doc comments", "Write a unit test"]) {
+  for (const s of [t("assistant.chip.explain"), t("assistant.chip.bugs"), t("assistant.chip.comments"), t("assistant.chip.test")]) {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "chip";
@@ -2168,7 +2348,7 @@ async function sendPrompt(text) {
   const config = loadConfig();
   if (!config.baseUrl || !config.apiKey || !config.model) {
     openSettings();
-    showToast("Configure an AI provider first");
+    showToast(t("assistant.configFirst"));
     return;
   }
   if (streaming) return;
@@ -2254,7 +2434,7 @@ $("settingsForm").addEventListener("submit", (e) => {
       model: $("cfgModel").value.trim(),
     });
     refreshModelBadge();
-    showToast("AI settings saved");
+    showToast(t("settings.saved"));
   }
 });
 
@@ -2283,55 +2463,64 @@ function openExternal(url) {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-const MENUS = [
-  {
-    label: "File",
-    items: [
-      { label: "Open Folder…", icon: "i-folder", hint: "⌘O", action: () => chooseFolder() },
-      { label: "Save", icon: "i-save", hint: "⌘S", action: () => saveActive() },
+function getMenus() {
+  return [
+    {
+      label: t("menu.file"),
+      items: [
+        { label: t("menu.openFolder"), icon: "i-folder", hint: "⌘O", action: () => chooseFolder() },
+      { label: t("menu.save"), icon: "i-save", hint: "⌘S", action: () => saveActive() },
       { sep: true },
-      { label: "Close File", icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
-    ],
-  },
-  {
-    label: "Edit",
-    items: [
-      { label: "Undo", icon: "i-undo", hint: "⌘Z", action: () => editorTrigger("undo") },
-      { label: "Redo", icon: "i-redo", hint: "⇧⌘Z", action: () => editorTrigger("redo") },
+      { label: t("menu.closeFile"), icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
       { sep: true },
-      { label: "Find…", icon: "i-search", hint: "⌘F", action: () => editorAction("actions.find") },
-      { label: "Replace…", icon: "i-replace", hint: "⌥⌘F", action: () => editorAction("editor.action.startFindReplaceAction") },
-    ],
-  },
-  {
-    label: "View",
-    items: [
-      { label: "Explorer", icon: "i-files", hint: "⇧⌘E", action: () => showSide("explorer") },
-      { label: "Search", icon: "i-search", hint: "⇧⌘F", action: () => showSide("search") },
-      { label: "Source Control", icon: "i-git", hint: "⌃⇧G", action: () => showSide("git") },
-      { sep: true },
-      { label: "Toggle Explorer", icon: "i-sidebar-left", action: () => togglePane("explorer") },
-      { label: "Toggle Assistant", icon: "i-sidebar-right", action: () => togglePane("assistant") },
-      { label: "Toggle Terminal", icon: "i-terminal", hint: "⌃`", action: () => toggleTerminal() },
-      { label: "Problems", icon: "i-error", hint: "⇧⌘M", action: () => toggleProblems() },
-      { sep: true },
-      { label: "Command Palette…", icon: "i-command", hint: "⌘⇧P", action: () => editorAction("editor.action.quickCommand") },
-    ],
-  },
-  {
-    label: "Help",
-    items: [
-      { label: "Documentation", icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
-      { label: "AI Settings…", icon: "i-gear", action: () => openSettings() },
-      { sep: true },
-      { label: "About Michael IDE", icon: "i-info", action: () => showToast("Michael IDE — a macOS-style editor with a built-in AI assistant") },
-    ],
-  },
-];
+      { label: autoSaveEnabled ? "✓ Auto Save" : "  Auto Save", icon: "i-save", action: () => { toggleAutoSave(); buildMenubar(); } },
+      ],
+    },
+    {
+      label: t("menu.edit"),
+      items: [
+        { label: t("menu.undo"), icon: "i-undo", hint: "⌘Z", action: () => editorTrigger("undo") },
+        { label: t("menu.redo"), icon: "i-redo", hint: "⇧⌘Z", action: () => editorTrigger("redo") },
+        { sep: true },
+        { label: t("menu.find"), icon: "i-search", hint: "⌘F", action: () => editorAction("actions.find") },
+        { label: t("menu.replace"), icon: "i-replace", hint: "⌥⌘F", action: () => editorAction("editor.action.startFindReplaceAction") },
+      ],
+    },
+    {
+      label: t("menu.view"),
+      items: [
+        { label: t("menu.explorer"), icon: "i-files", hint: "⇧⌘E", action: () => showSide("explorer") },
+        { label: t("menu.search"), icon: "i-search", hint: "⇧⌘F", action: () => showSide("search") },
+        { label: t("menu.sourceControl"), icon: "i-git", hint: "⌃⇧G", action: () => showSide("git") },
+        { sep: true },
+        { label: t("menu.toggleExplorer"), icon: "i-sidebar-left", action: () => togglePane("explorer") },
+        { label: t("menu.toggleAssistant"), icon: "i-sidebar-right", action: () => togglePane("assistant") },
+        { label: t("menu.toggleTerminal"), icon: "i-terminal", hint: "⌃`", action: () => toggleTerminal() },
+        { label: t("menu.problems"), icon: "i-error", hint: "⇧⌘M", action: () => toggleProblems() },
+        { sep: true },
+        { label: t("menu.commandPalette"), icon: "i-command", hint: "⌘⇧P", action: () => editorAction("editor.action.quickCommand") },
+      ],
+    },
+    {
+      label: t("menu.help"),
+      items: [
+        { label: t("menu.documentation"), icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
+        { label: t("menu.aiSettings"), icon: "i-gear", action: () => openSettings() },
+        { sep: true },
+        { label: t("menu.about"), icon: "i-info", action: () => showToast(t("menu.aboutMsg")) },
+        { sep: true },
+        { label: t("theme.light"), icon: "i-sparkle", action: () => setTheme("light") },
+        { label: t("theme.dark"), icon: "i-sparkle", action: () => setTheme("dark") },
+        { label: t("theme.system"), icon: "i-sparkle", action: () => setTheme("system") },
+      ],
+    },
+  ];
+}
 
 function buildMenubar() {
   const bar = $("menubar");
   if (!bar) return;
+  bar.innerHTML = "";
   const buttons = [];
   const panels = [];
   let openIdx = -1;
@@ -2352,6 +2541,7 @@ function buildMenubar() {
     openIdx = i;
   };
 
+  const MENUS = getMenus();
   MENUS.forEach((menu, i) => {
     const wrap = document.createElement("div");
     wrap.className = "tb-menu";
@@ -2426,6 +2616,7 @@ $("saveBtn").addEventListener("click", saveActive);
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabGit").addEventListener("click", () => showSide("git"));
+$("tabOutline")?.addEventListener("click", () => showSide("outline"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
 $("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
@@ -2490,11 +2681,245 @@ promptEl.addEventListener("keydown", (e) => {
   }
 });
 
+// ---- quick open (⌘P) ----
+const quickOpenOverlay = document.createElement("div");
+quickOpenOverlay.className = "palette";
+quickOpenOverlay.hidden = true;
+quickOpenOverlay.innerHTML = `
+  <div class="palette__panel" role="dialog" aria-label="Quick open">
+    <input class="palette__input" type="text" placeholder="" spellcheck="false" />
+    <div class="palette__list" role="listbox"></div>
+  </div>`;
+document.body.appendChild(quickOpenOverlay);
+
+const qoInput = quickOpenOverlay.querySelector(".palette__input");
+const qoList = quickOpenOverlay.querySelector(".palette__list");
+let qoFiles = [];
+let qoFiltered = [];
+let qoCursor = 0;
+
+async function collectProjectFiles() {
+  if (!rootPath) return [];
+  const result = [];
+  const skip = new Set(["node_modules", ".git", "dist", "build", "out", "target", ".next", "coverage", ".cache", "vendor"]);
+  const stack = [rootPath];
+  const prefix = rootPath.endsWith("/") ? rootPath : rootPath + "/";
+  while (stack.length && result.length < 5000) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await backend.readDir(dir); } catch { continue; }
+    for (const e of entries) {
+      if (e.is_dir) {
+        if (!skip.has(e.name)) stack.push(e.path);
+      } else {
+        const rel = e.path.startsWith(prefix) ? e.path.slice(prefix.length) : e.name;
+        result.push({ path: e.path, name: e.name, rel });
+      }
+    }
+  }
+  return result;
+}
+
+function qoFuzzyMatch(str, query) {
+  const lower = str.toLowerCase();
+  const q = query.toLowerCase();
+  let qi = 0, score = 0, lastMatch = -1;
+  for (let i = 0; i < lower.length && qi < q.length; i++) {
+    if (lower[i] === q[qi]) {
+      score += (lastMatch === i - 1) ? 10 : 1;
+      if (i === 0 || str[i - 1] === "/" || str[i - 1] === "." || str[i - 1] === "-" || str[i - 1] === "_")
+        score += 5;
+      lastMatch = i;
+      qi++;
+    }
+  }
+  return qi === q.length ? score : -1;
+}
+
+function qoRefresh() {
+  const q = qoInput.value.trim();
+  if (!q) {
+    qoFiltered = qoFiles.slice(0, 50);
+  } else {
+    qoFiltered = qoFiles
+      .map((f) => ({ f, s: qoFuzzyMatch(f.rel, q) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 50)
+      .map((x) => x.f);
+  }
+  qoCursor = 0;
+  qoRender();
+}
+
+function qoRender() {
+  qoList.innerHTML = "";
+  if (!qoFiltered.length) {
+    const empty = document.createElement("div");
+    empty.className = "palette__empty";
+    empty.textContent = t("quickOpen.noResults");
+    qoList.appendChild(empty);
+    return;
+  }
+  qoFiltered.forEach((file, i) => {
+    const row = document.createElement("div");
+    row.className = "palette__item" + (i === qoCursor ? " is-active" : "");
+    row.setAttribute("role", "option");
+    row.innerHTML = `${iconImg(fileIconUrl(file.name))}<span class="palette__title"></span><span class="palette__cat"></span>`;
+    row.querySelector(".palette__title").textContent = file.name;
+    const dir = file.rel.includes("/") ? file.rel.slice(0, file.rel.lastIndexOf("/")) : "";
+    if (dir) row.querySelector(".palette__cat").textContent = dir;
+    row.addEventListener("mousemove", () => { if (qoCursor !== i) { qoCursor = i; qoRender(); } });
+    row.addEventListener("click", () => qoSelect(file));
+    qoList.appendChild(row);
+  });
+  const active = qoList.querySelector(".is-active");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function qoSelect(file) {
+  qoClose();
+  openFile(file.path, file.name);
+}
+
+async function qoOpen() {
+  qoInput.value = "";
+  qoInput.placeholder = t("quickOpen.placeholder");
+  quickOpenOverlay.hidden = false;
+  qoFiles = await collectProjectFiles();
+  qoRefresh();
+  qoInput.focus();
+}
+
+function qoClose() {
+  quickOpenOverlay.hidden = true;
+}
+
+qoInput.addEventListener("input", qoRefresh);
+qoInput.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); qoCursor = Math.min(qoCursor + 1, qoFiltered.length - 1); qoRender(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); qoCursor = Math.max(qoCursor - 1, 0); qoRender(); }
+  else if (e.key === "Enter") { e.preventDefault(); if (qoFiltered[qoCursor]) qoSelect(qoFiltered[qoCursor]); }
+  else if (e.key === "Escape") { e.preventDefault(); qoClose(); }
+});
+quickOpenOverlay.addEventListener("mousedown", (e) => { if (e.target === quickOpenOverlay) qoClose(); });
+
+// ---- auto-save ----
+const AUTOSAVE_KEY = "michael-ide.autosave";
+let autoSaveEnabled = localStorage.getItem(AUTOSAVE_KEY) !== "false";
+let autoSaveTimer = null;
+
+function scheduleAutoSave() {
+  if (!autoSaveEnabled || !activePath) return;
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(async () => {
+    if (!activePath) return;
+    const f = openFiles.get(activePath);
+    if (f && f.dirty) {
+      try {
+        await backend.writeTextFile(activePath, f.model.getValue());
+        markDirty(activePath, false);
+      } catch { /* silent */ }
+    }
+  }, 1500);
+}
+
+monacoEditor.onDidChangeModelContent(() => {
+  scheduleAutoSave();
+});
+
+function toggleAutoSave() {
+  autoSaveEnabled = !autoSaveEnabled;
+  localStorage.setItem(AUTOSAVE_KEY, String(autoSaveEnabled));
+  showToast(autoSaveEnabled ? t("autosave.enabled") : t("autosave.disabled"));
+}
+
+// ---- search & replace ----
+const replaceInputEl = document.createElement("input");
+replaceInputEl.type = "text";
+replaceInputEl.className = "search-replace-input";
+replaceInputEl.spellcheck = false;
+replaceInputEl.autocomplete = "off";
+replaceInputEl.placeholder = t("search.replacePlaceholder");
+
+const replaceBar = document.createElement("div");
+replaceBar.className = "search-replace-bar";
+replaceBar.innerHTML = `<div class="search-replace-row"></div>`;
+const replaceRow = replaceBar.querySelector(".search-replace-row");
+replaceRow.appendChild(replaceInputEl);
+
+const replaceSingleBtn = document.createElement("button");
+replaceSingleBtn.className = "iconbtn";
+replaceSingleBtn.type = "button";
+replaceSingleBtn.title = t("search.replace");
+replaceSingleBtn.innerHTML = `<svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3"/></svg>`;
+
+const replaceAllBtn = document.createElement("button");
+replaceAllBtn.className = "iconbtn";
+replaceAllBtn.type = "button";
+replaceAllBtn.title = t("search.replaceAll");
+replaceAllBtn.innerHTML = `<svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3M4 16h12l-3-3m3 3-3 3"/></svg>`;
+
+replaceRow.append(replaceSingleBtn, replaceAllBtn);
+
+const searchBox = document.querySelector(".search-box");
+if (searchBox) searchBox.after(replaceBar);
+
+async function replaceInFiles(replaceAll) {
+  const query = $("searchInput").value;
+  const replacement = replaceInputEl.value;
+  if (!query || !rootPath) return;
+
+  let totalCount = 0, fileCount = 0;
+  let files;
+  try {
+    files = await backend.searchInProject(rootPath, query, searchCaseSensitive);
+  } catch { return; }
+
+  for (const f of files) {
+    if (!replaceAll && totalCount > 0) break;
+    let content;
+    try { content = await backend.readTextFile(f.path); } catch { continue; }
+    const regex = searchCaseSensitive
+      ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
+      : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    const newContent = content.replace(regex, replacement);
+    if (newContent !== content) {
+      try {
+        await backend.writeTextFile(f.path, newContent);
+        const count = (content.match(regex) || []).length;
+        totalCount += count;
+        fileCount++;
+        if (openFiles.has(f.path)) {
+          const model = openFiles.get(f.path).model;
+          model.setValue(newContent);
+          markDirty(f.path, false);
+        }
+      } catch { /* skip */ }
+    }
+    if (!replaceAll) break;
+  }
+  if (totalCount > 0) {
+    showToast(replaceAll
+      ? t("search.replaced", { count: totalCount, s: totalCount === 1 ? "" : "s", files: fileCount, s2: fileCount === 1 ? "" : "s" })
+      : t("search.replacedInFile", { count: totalCount, s: totalCount === 1 ? "" : "s" })
+    );
+    runSearch();
+  }
+}
+
+replaceSingleBtn.addEventListener("click", () => replaceInFiles(false));
+replaceAllBtn.addEventListener("click", () => replaceInFiles(true));
+
 window.addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey;
   if (e.ctrlKey && e.key === "`") {
     e.preventDefault();
     toggleTerminal();
+  } else if (mod && !e.shiftKey && e.key.toLowerCase() === "p") {
+    e.preventDefault();
+    e.stopPropagation();
+    qoOpen();
   } else if (mod && !e.shiftKey && e.key.toLowerCase() === "s") {
     e.preventDefault();
     saveActive();
@@ -2513,92 +2938,218 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// ---- integrated terminal ----
-let term = null;
-let termFit = null;
-let termId = null;
-let termOpening = false;
+// ---- integrated terminal (multi-tab) ----
 const termPanel = $("terminalPanel");
 const termBody = $("terminalBody");
 const editorwrapEl = document.querySelector(".editorwrap");
 
 function termTheme() {
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-  return dark
-    ? { background: "#1e1e1e", foreground: "#d4d4d4", cursor: "#d4d4d4", selectionBackground: "#264f78" }
-    : { background: "#ffffff", foreground: "#1f2328", cursor: "#1f2328", selectionBackground: "#b3d4fc" };
+  const ansi = {
+    black:   "#3C3C43", red:     "#FF3B30", green:   "#28CD41", yellow:  "#FF9F0A",
+    blue:    "#007AFF", magenta: "#AF52DE", cyan:    "#59ADC4", white:   "#8E8E93",
+    brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#4CD964",
+    brightYellow: "#FFD60A", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
+    brightCyan: "#70D7FF", brightWhite: "#D1D1D6",
+  };
+
+  return {
+    background: "#FFFFFF", foreground: "#1D1D1F", cursor: "#007AFF",
+    cursorAccent: "#FFFFFF", selectionBackground: "#B4D8FD",
+    selectionForeground: "#1D1D1F", ...ansi,
+  };
 }
 
 const termIsOpen = () => termPanel && !termPanel.hidden;
 
 const termResizeObserver = new ResizeObserver(() => {
-  if (termIsOpen() && termFit) {
-    try {
-      termFit.fit();
-    } catch {
-      /* container not measurable yet */
-    }
+  if (termIsOpen() && activeTermTab >= 0 && termTabs[activeTermTab]?.fit) {
+    try { termTabs[activeTermTab].fit.fit(); } catch {}
   }
 });
+
+let termTabs = [];
+let activeTermTab = -1;
+let termSeq = 0;
+
+function renderTermTabs() {
+  let tabBar = termPanel.querySelector(".term-tabs");
+  if (!tabBar) {
+    tabBar = document.createElement("div");
+    tabBar.className = "term-tabs";
+    const head = termPanel.querySelector(".terminal-panel__head");
+    const titleSpan = head.querySelector(".terminal-panel__title");
+    titleSpan.after(tabBar);
+  }
+  tabBar.innerHTML = "";
+  termTabs.forEach((tab, i) => {
+    const btn = document.createElement("button");
+    btn.className = "term-tab" + (i === activeTermTab ? " is-active" : "");
+    btn.type = "button";
+    btn.innerHTML = `<span></span><span class="term-tab__x">&times;</span>`;
+    btn.querySelector("span").textContent = tab.label;
+    btn.addEventListener("click", (e) => {
+      if (e.target.classList.contains("term-tab__x")) {
+        closeTermTab(i);
+      } else {
+        switchTermTab(i);
+      }
+    });
+    tabBar.appendChild(btn);
+  });
+  const addBtn = document.createElement("button");
+  addBtn.className = "term-tab term-tab--add";
+  addBtn.type = "button";
+  addBtn.textContent = "+";
+  addBtn.title = t("terminal.new");
+  addBtn.addEventListener("click", () => createTermTab());
+  tabBar.appendChild(addBtn);
+}
+
+function switchTermTab(idx) {
+  if (idx === activeTermTab || idx < 0 || idx >= termTabs.length) return;
+  if (activeTermTab >= 0 && termTabs[activeTermTab]) {
+    termTabs[activeTermTab].container.hidden = true;
+  }
+  activeTermTab = idx;
+  const tab = termTabs[idx];
+  tab.container.hidden = false;
+  renderTermTabs();
+  requestAnimationFrame(() => {
+    try { tab.fit.fit(); } catch {}
+    tab.term.focus();
+  });
+}
+
+async function createTermTab() {
+  const idx = termTabs.length;
+  const label = `${t("terminal.title")} ${++termSeq}`;
+  const container = document.createElement("div");
+  container.className = "terminal-panel__instance";
+  container.hidden = activeTermTab >= 0;
+  termBody.appendChild(container);
+
+  const term = new Terminal({
+    fontSize: 13,
+    fontFamily: "Menlo, SF Mono, ui-monospace, monospace",
+    fontWeight: "normal",
+    fontWeightBold: "bold",
+    lineHeight: 1.2,
+    letterSpacing: 0.5,
+    theme: termTheme(),
+    cursorBlink: true,
+    cursorStyle: "block",
+    scrollback: 10000,
+    allowProposedApi: true,
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(container);
+  termResizeObserver.observe(container);
+
+  let backendId = null;
+  const entry = { term, fit, container, label, backendId, opening: false };
+  termTabs.push(entry);
+
+  term.onData((d) => { if (entry.backendId != null) backend.termWrite(entry.backendId, d); });
+  term.onResize(({ cols, rows }) => { if (entry.backendId != null) backend.termResize(entry.backendId, cols, rows); });
+
+  switchTermTab(idx);
+
+  entry.opening = true;
+  try {
+    entry.backendId = await backend.termOpen(
+      { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
+      (ev) => {
+        if (ev.kind === "data") term.write(ev.data);
+        else if (ev.kind === "exit") {
+          term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
+          entry.backendId = null;
+        }
+      },
+    );
+    setTimeout(() => {
+      if (entry.backendId != null) {
+        const lines = [
+          "export PROMPT='%F{34}%n@%m%f %F{33}%1~%f %F{default}%#%f '",
+          "export ZSH_HIGHLIGHT_HIGHLIGHTERS=(main brackets pattern)",
+          "typeset -A ZSH_HIGHLIGHT_STYLES",
+          "ZSH_HIGHLIGHT_STYLES[command]='fg=blue,bold'",
+          "ZSH_HIGHLIGHT_STYLES[builtin]='fg=blue,bold'",
+          "ZSH_HIGHLIGHT_STYLES[alias]='fg=blue,bold'",
+          "ZSH_HIGHLIGHT_STYLES[function]='fg=blue,bold'",
+          "ZSH_HIGHLIGHT_STYLES[unknown-token]='fg=red'",
+          "ZSH_HIGHLIGHT_STYLES[reserved-word]='fg=magenta,bold'",
+          "ZSH_HIGHLIGHT_STYLES[single-hyphen-option]='fg=cyan'",
+          "ZSH_HIGHLIGHT_STYLES[double-hyphen-option]='fg=cyan'",
+          "ZSH_HIGHLIGHT_STYLES[path]='fg=yellow'",
+          "ZSH_HIGHLIGHT_STYLES[globbing]='fg=magenta'",
+          "ZSH_HIGHLIGHT_STYLES[single-quoted-argument]='fg=green'",
+          "ZSH_HIGHLIGHT_STYLES[double-quoted-argument]='fg=green'",
+          "ZSH_HIGHLIGHT_STYLES[dollar-quoted-argument]='fg=green'",
+          "ZSH_HIGHLIGHT_STYLES[back-quoted-argument]='fg=cyan'",
+          "ZSH_HIGHLIGHT_STYLES[commandseparator]='fg=magenta,bold'",
+          "ZSH_HIGHLIGHT_STYLES[redirection]='fg=magenta,bold'",
+          "ZSH_HIGHLIGHT_STYLES[assign]='fg=yellow'",
+          "autoload -Uz compinit && compinit -u 2>/dev/null",
+          "zstyle ':completion:*' menu select",
+          "zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'",
+          "zstyle ':completion:*:descriptions' format '%F{blue}-- %d --%f'",
+          "zstyle ':completion:*:warnings' format '%F{red}no matches%f'",
+          "[ -f /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+          "[ -f /usr/local/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /usr/local/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+          "alias ls='ls -G'",
+          "alias ll='ls -lhG'",
+          "alias la='ls -lahG'",
+          "clear",
+        ];
+        backend.termWrite(entry.backendId, " " + lines.join("; ") + "\n");
+      }
+    }, 300);
+  } catch (err) {
+    term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
+  } finally {
+    entry.opening = false;
+  }
+}
+
+function closeTermTab(idx) {
+  if (idx < 0 || idx >= termTabs.length) return;
+  const tab = termTabs[idx];
+  if (tab.backendId != null) backend.termClose(tab.backendId);
+  tab.term.dispose();
+  termResizeObserver.unobserve(tab.container);
+  tab.container.remove();
+  termTabs.splice(idx, 1);
+  if (termTabs.length === 0) {
+    activeTermTab = -1;
+    closeTerminal();
+    return;
+  }
+  if (activeTermTab >= termTabs.length) activeTermTab = termTabs.length - 1;
+  else if (activeTermTab === idx) activeTermTab = Math.min(idx, termTabs.length - 1);
+  termTabs[activeTermTab].container.hidden = false;
+  renderTermTabs();
+  requestAnimationFrame(() => {
+    try { termTabs[activeTermTab].fit.fit(); } catch {}
+    termTabs[activeTermTab].term.focus();
+  });
+}
 
 async function openTerminal() {
   if (!termPanel) return;
   if (termIsOpen()) {
-    term?.focus();
+    if (activeTermTab >= 0) termTabs[activeTermTab]?.term.focus();
     return;
   }
   termPanel.hidden = false;
   editorwrapEl?.classList.add("has-terminal");
   monacoEditor.layout();
 
-  if (!term) {
-    term = new Terminal({
-      fontSize: 12,
-      fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
-      theme: termTheme(),
-      cursorBlink: true,
-      scrollback: 5000,
-    });
-    termFit = new FitAddon();
-    term.loadAddon(termFit);
-    term.open(termBody);
-    term.onData((d) => {
-      if (termId != null) backend.termWrite(termId, d);
-    });
-    term.onResize(({ cols, rows }) => {
-      if (termId != null) backend.termResize(termId, cols, rows);
-    });
-    termResizeObserver.observe(termBody);
+  if (termTabs.length === 0) {
+    await createTermTab();
+  } else {
+    switchTermTab(activeTermTab);
   }
-
-  requestAnimationFrame(() => {
-    try {
-      termFit.fit();
-    } catch {
-      /* ignore */
-    }
-  });
-
-  if (termId == null && !termOpening) {
-    termOpening = true;
-    try {
-      termId = await backend.termOpen(
-        { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
-        (ev) => {
-          if (ev.kind === "data") term.write(ev.data);
-          else if (ev.kind === "exit") {
-            term.write("\r\n\x1b[2m[process exited — press ⌃` to reopen]\x1b[0m\r\n");
-            termId = null;
-          }
-        },
-      );
-    } catch (err) {
-      term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
-    } finally {
-      termOpening = false;
-    }
-  }
-  term.focus();
 }
 
 function closeTerminal() {
@@ -2616,12 +3167,20 @@ function toggleTerminal() {
 
 $("terminalClose")?.addEventListener("click", closeTerminal);
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
-// Clean up the backend shell process when the window goes away.
 window.addEventListener("beforeunload", () => {
-  if (termId != null) backend.termClose(termId);
+  for (const tab of termTabs) {
+    if (tab.backendId != null) backend.termClose(tab.backendId);
+  }
 });
 
 buildMenubar();
+
+onLocaleChange(() => {
+  buildMenubar();
+  applyToDOM();
+  chatEl.querySelector(".chat-empty")?.remove();
+  showChatHint();
+});
 
 // ---- extensions ----
 const statusbarRight = $("statusbarRight");
@@ -2659,6 +3218,9 @@ function insertAtCursor(text) {
   monacoEditor.focus();
 }
 
+// Per-extension decoration collections keyed by extension id.
+const extDecorations = new Map();
+
 const extHost = new ExtensionHost({
   getEditorText: () => monacoEditor.getModel()?.getValue() ?? "",
   getSelectionText: () => {
@@ -2667,11 +3229,93 @@ const extHost = new ExtensionHost({
     return sel && model && !sel.isEmpty() ? model.getValueInRange(sel) : "";
   },
   insertText: insertAtCursor,
+  replaceText: (range, text) => {
+    if (!range) return;
+    const r = new monaco.Range(
+      range.startLineNumber, range.startColumn,
+      range.endLineNumber, range.endColumn,
+    );
+    monacoEditor.executeEdits("extension", [{ range: r, text, forceMoveMarkers: true }]);
+    monacoEditor.focus();
+  },
   showInformationMessage: (text) => showToast(text),
   setStatusBarItem,
   removeStatusBarItem,
   readFile: (path) => backend.readTextFile(path),
   writeFile: (path, content) => backend.writeTextFile(path, content),
+  listDir: (path) => backend.readDir(path),
+  getFilePath: () => activePath,
+  getLanguage: () => monacoEditor.getModel()?.getLanguageId() ?? "plaintext",
+  getLineCount: () => monacoEditor.getModel()?.getLineCount() ?? 0,
+  getLine: (n) => monacoEditor.getModel()?.getLineContent(n) ?? "",
+  setDecorations: (extId, decorations) => {
+    let coll = extDecorations.get(extId);
+    if (!coll) {
+      coll = monacoEditor.createDecorationsCollection([]);
+      extDecorations.set(extId, coll);
+    }
+    const decos = (decorations || []).map((d) => ({
+      range: new monaco.Range(
+        d.range.startLineNumber, d.range.startColumn,
+        d.range.endLineNumber, d.range.endColumn,
+      ),
+      options: {
+        isWholeLine: d.isWholeLine ?? false,
+        className: d.className || undefined,
+        inlineClassName: d.inlineClassName || undefined,
+        linesDecorationsClassName: d.linesDecorationsClassName || undefined,
+        glyphMarginClassName: d.glyphMarginClassName || undefined,
+        hoverMessage: d.hoverMessage ? { value: d.hoverMessage } : undefined,
+        after: d.after ? { content: d.after.content, inlineClassName: d.after.className } : undefined,
+      },
+    }));
+    coll.set(decos);
+    return extId;
+  },
+  clearDecorations: (extId) => {
+    const coll = extDecorations.get(extId);
+    if (coll) coll.set([]);
+  },
+  networkFetch: async (url, opts) => {
+    const fetchOpts = {};
+    if (opts.method) fetchOpts.method = opts.method;
+    if (opts.headers) fetchOpts.headers = opts.headers;
+    if (opts.body) fetchOpts.body = typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body);
+    const resp = await fetch(url, fetchOpts);
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* not json */ }
+    return { status: resp.status, ok: resp.ok, text, json, headers: Object.fromEntries(resp.headers.entries()) };
+  },
+  setDiagnostics: (extId, uri, diagnostics) => {
+    const model = monaco.editor.getModels().find((m) => m.uri.toString() === uri || m.uri.fsPath === uri);
+    if (!model) return;
+    const markers = (diagnostics || []).map((d) => ({
+      severity: d.severity === "error" ? monaco.MarkerSeverity.Error
+        : d.severity === "warning" ? monaco.MarkerSeverity.Warning
+        : d.severity === "info" ? monaco.MarkerSeverity.Info
+        : monaco.MarkerSeverity.Hint,
+      message: d.message || "",
+      startLineNumber: d.startLine || 1,
+      startColumn: d.startColumn || 1,
+      endLineNumber: d.endLine || d.startLine || 1,
+      endColumn: d.endColumn || d.startColumn || 1,
+      source: extId,
+    }));
+    monaco.editor.setModelMarkers(model, extId, markers);
+  },
+  clearDiagnostics: (extId, uri) => {
+    if (uri) {
+      const model = monaco.editor.getModels().find((m) => m.uri.toString() === uri || m.uri.fsPath === uri);
+      if (model) monaco.editor.setModelMarkers(model, extId, []);
+    } else {
+      for (const model of monaco.editor.getModels()) {
+        monaco.editor.setModelMarkers(model, extId, []);
+      }
+    }
+  },
+  registerLocale: (locale, dict) => registerLocale(locale, dict),
+  setLocale: (locale) => setLocale(locale),
 });
 
 const extManager = await createExtensionManager();
@@ -2683,31 +3327,14 @@ const extPanel = createExtensionsPanel({
 
 const palette = createCommandPalette({
   getCommands: () => [
-    { id: "file.save", title: "Save File", category: "File", run: () => saveActive() },
-    {
-      id: "file.openFolder",
-      title: "Open Folder\u2026",
-      category: "File",
-      run: () => chooseFolder(),
-    },
-    {
-      id: "view.extensions",
-      title: "Show Extensions",
-      category: "View",
-      run: () => extPanel.open(),
-    },
-    {
-      id: "view.terminal",
-      title: "Toggle Terminal",
-      category: "View",
-      run: () => toggleTerminal(),
-    },
-    {
-      id: "ai.settings",
-      title: "AI Provider Settings",
-      category: "Preferences",
-      run: () => openSettings(),
-    },
+    { id: "file.save", title: t("menu.save"), category: t("menu.file"), run: () => saveActive() },
+    { id: "file.openFolder", title: t("menu.openFolder"), category: t("menu.file"), run: () => chooseFolder() },
+    { id: "file.quickOpen", title: "Quick Open (⌘P)", category: t("menu.file"), run: () => qoOpen() },
+    { id: "file.autoSave", title: "Toggle Auto Save", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
+    { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
+    { id: "view.terminal", title: t("menu.toggleTerminal"), category: t("menu.view"), run: () => toggleTerminal() },
+    { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
+    { id: "ai.settings", title: t("menu.aiSettings"), category: "Preferences", run: () => openSettings() },
     ...extHost.listCommands().map((c) => ({
       ...c,
       run: () => extHost.invokeCommand(c.id),
@@ -2740,6 +3367,7 @@ window.addEventListener(
   }
 })();
 
+initLocale();
 refreshModelBadge();
 showChatHint();
 syncWelcome();

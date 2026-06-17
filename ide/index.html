@@ -16,16 +16,16 @@
       <div class="titlebar__actions">
         <button class="tbtn" id="openFolderBtn" title="Open folder">
           <svg class="ic"><use href="#i-folder" /></svg>
-          <span>Open</span>
+          <span data-i18n="titlebar.open">Open</span>
         </button>
         <button class="tbtn" id="saveBtn" title="Save (⌘S)" disabled>
           <svg class="ic"><use href="#i-save" /></svg>
-          <span>Save</span>
+          <span data-i18n="titlebar.save">Save</span>
         </button>
-        <button class="tbtn tbtn--icon" id="terminalBtn" title="Toggle terminal (⌃`)">
+        <button class="tbtn tbtn--icon" id="terminalBtn" data-i18n-title="terminal.toggle" title="Toggle terminal (⌃`)">
           <svg class="ic"><use href="#i-terminal" /></svg>
         </button>
-        <button class="tbtn tbtn--icon" id="extensionsBtn" title="Extensions">
+        <button class="tbtn tbtn--icon" id="extensionsBtn" data-i18n-title="ext.title" title="Extensions">
           <svg class="ic"><use href="#i-ext" /></svg>
         </button>
         <button class="tbtn tbtn--icon" id="settingsBtn" title="AI settings">
@@ -40,10 +40,13 @@
         <header class="panel__head">
           <div class="seg" id="sideTabs" role="tablist">
             <button class="seg__btn is-active" id="tabExplorer" type="button" role="tab" title="Explorer (⇧⌘E)">
-              <svg class="ic"><use href="#i-files" /></svg><span>Explorer</span>
+              <svg class="ic"><use href="#i-files" /></svg><span data-i18n="sidebar.explorer">Explorer</span>
             </button>
             <button class="seg__btn" id="tabGit" type="button" role="tab" title="Source Control (⌃⇧G)">
-              <svg class="ic"><use href="#i-git" /></svg><span>Source</span>
+              <svg class="ic"><use href="#i-git" /></svg><span data-i18n="sidebar.source">Source</span>
+            </button>
+            <button class="seg__btn" id="tabOutline" type="button" role="tab" title="Outline">
+              <svg class="ic"><use href="#i-code" /></svg><span data-i18n="outline.title">Outline</span>
             </button>
           </div>
         </header>
@@ -51,18 +54,18 @@
         <!-- Explorer view -->
         <div class="side-view" id="viewExplorer">
           <div class="explorer__bar">
-            <span class="explorer__root" id="rootName" title="">No folder</span>
+            <span class="explorer__root" id="rootName" title="" data-i18n="explorer.noFolder">No folder</span>
             <span class="explorer__tools">
-              <button class="iconbtn" id="newFileBtn" type="button" title="New File" disabled><svg class="ic"><use href="#i-new-file" /></svg></button>
-              <button class="iconbtn" id="newFolderBtn" type="button" title="New Folder" disabled><svg class="ic"><use href="#i-new-folder" /></svg></button>
-              <button class="iconbtn" id="refreshTreeBtn" type="button" title="Refresh" disabled><svg class="ic"><use href="#i-refresh" /></svg></button>
+              <button class="iconbtn" id="newFileBtn" type="button" data-i18n-title="explorer.newFile" title="New File" disabled><svg class="ic"><use href="#i-new-file" /></svg></button>
+              <button class="iconbtn" id="newFolderBtn" type="button" data-i18n-title="explorer.newFolder" title="New Folder" disabled><svg class="ic"><use href="#i-new-folder" /></svg></button>
+              <button class="iconbtn" id="refreshTreeBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh" disabled><svg class="ic"><use href="#i-refresh" /></svg></button>
             </span>
           </div>
           <div class="tree" id="tree">
             <div class="empty">
               <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
-              <p>Open a folder to get started.</p>
-              <button class="btn btn--primary" id="emptyOpenBtn">Open folder…</button>
+              <p data-i18n="explorer.openHint">Open a folder to get started.</p>
+              <button class="btn btn--primary" id="emptyOpenBtn" data-i18n="explorer.openBtn">Open folder…</button>
             </div>
           </div>
         </div>
@@ -72,34 +75,48 @@
           <div class="search-box">
             <div class="search-input">
               <svg class="ic"><use href="#i-search" /></svg>
-              <input id="searchInput" type="text" placeholder="Search in folder…" spellcheck="false" autocomplete="off" />
-              <button class="iconbtn search-case" id="searchCaseBtn" type="button" title="Match Case" aria-pressed="false">Aa</button>
+              <input id="searchInput" type="text" data-i18n-placeholder="search.placeholder" placeholder="Search in folder…" spellcheck="false" autocomplete="off" />
+              <button class="iconbtn search-case" id="searchCaseBtn" type="button" data-i18n-title="search.matchCase" title="Match Case" aria-pressed="false">Aa</button>
             </div>
             <div class="search-meta" id="searchMeta"></div>
           </div>
           <div class="search-results" id="searchResults"></div>
         </div>
 
+        <!-- Outline view -->
+        <div class="side-view" id="viewOutline" hidden>
+          <div class="outline-list" id="outlineList">
+            <div class="outline-empty" data-i18n="outline.noFile">Open a file to see its outline.</div>
+          </div>
+        </div>
+
         <!-- Source Control (Git) view -->
         <div class="side-view" id="viewGit" hidden>
           <div class="git-bar">
-            <button class="git-branch" id="gitBranchBtn" type="button" title="Current branch — click to switch" aria-haspopup="true" aria-expanded="false">
+            <button class="git-branch" id="gitBranchBtn" type="button" data-i18n-title="git.branchHint" title="Current branch — click to switch" aria-haspopup="true" aria-expanded="false">
               <svg class="ic"><use href="#i-git" /></svg>
               <span id="gitBranchName">—</span>
               <svg class="ic git-branch__caret"><use href="#i-chevron" /></svg>
             </button>
-            <button class="iconbtn" id="gitPullBtn" type="button" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
-            <button class="iconbtn" id="gitPushBtn" type="button" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
-            <button class="iconbtn" id="gitRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+            <button class="iconbtn" id="gitPullBtn" type="button" data-i18n-title="git.pull" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
+            <button class="iconbtn" id="gitPushBtn" type="button" data-i18n-title="git.push" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
+            <button class="iconbtn" id="gitRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
             <div class="git-branch-menu" id="gitBranchMenu" hidden></div>
           </div>
           <div class="git-commit">
-            <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" placeholder="Message (commit staged changes)"></textarea>
+            <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" data-i18n-placeholder="git.commitPlaceholder" placeholder="Message (commit staged changes)"></textarea>
             <button class="git-commit__btn" id="gitCommitBtn" type="button" title="Commit staged changes">
-              <svg class="ic"><use href="#i-check" /></svg><span>Commit</span>
+              <svg class="ic"><use href="#i-check" /></svg><span data-i18n="git.commit">Commit</span>
             </button>
           </div>
           <div class="git-list" id="gitList"></div>
+          <div class="git-section-title git-log-title" style="display:none" id="gitLogTitle">
+            <span>History</span>
+            <button class="git-section-act" id="gitLogToggle" type="button" title="Toggle history">
+              <svg class="ic"><use href="#i-chevron" /></svg>
+            </button>
+          </div>
+          <div class="git-log" id="gitLog" hidden></div>
         </div>
       </aside>
 
@@ -111,10 +128,10 @@
           <div class="diff-view__head">
             <span class="diff-view__title">
               <svg class="ic"><use href="#i-git" /></svg>
-              <span id="diffTitle">Diff</span>
-              <span class="diff-view__sub">HEAD ↔ Working Tree</span>
+              <span id="diffTitle" data-i18n="diff.title">Diff</span>
+              <span class="diff-view__sub" data-i18n="diff.sub">HEAD ↔ Working Tree</span>
             </span>
-            <button class="diff-view__close" id="diffClose" type="button" title="Close diff" aria-label="Close diff">
+            <button class="diff-view__close" id="diffClose" type="button" data-i18n-title="diff.close" data-i18n-aria-label="diff.close" title="Close diff" aria-label="Close diff">
               <svg class="ic"><use href="#i-close" /></svg>
             </button>
           </div>
@@ -122,20 +139,20 @@
         </div>
         <div class="welcome" id="welcome">
           <svg class="welcome__hero" viewBox="0 0 240 160"><use href="#art-hero" /></svg>
-          <h1>Michael IDE</h1>
-          <p>A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+          <h1 data-i18n="welcome.title">Michael IDE</h1>
+          <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
           <div class="welcome__tips">
-            <span class="kbd-tip"><kbd>⌘</kbd><kbd>S</kbd> Save</span>
-            <span class="kbd-tip"><kbd>⌘</kbd><kbd>↩</kbd> Ask assistant</span>
+            <span class="kbd-tip"><kbd>⌘</kbd><kbd>S</kbd> <span data-i18n="welcome.tipSave">Save</span></span>
+            <span class="kbd-tip"><kbd>⌘</kbd><kbd>↩</kbd> <span data-i18n="welcome.tipAsk">Ask assistant</span></span>
           </div>
         </div>
         <div class="problems-panel" id="problemsPanel" hidden>
           <div class="problems-panel__head">
             <span class="problems-panel__title">
               <svg class="ic" aria-hidden="true"><use href="#i-error" /></svg>
-              <span>Problems</span>
+              <span data-i18n="problems.title">Problems</span>
             </span>
-            <button class="problems-panel__close" id="problemsClose" type="button" title="Close panel" aria-label="Close problems">
+            <button class="problems-panel__close" id="problemsClose" type="button" data-i18n-title="problems.close" title="Close panel" aria-label="Close problems">
               <svg class="ic"><use href="#i-close" /></svg>
             </button>
           </div>
@@ -145,9 +162,9 @@
           <div class="terminal-panel__head">
             <span class="terminal-panel__title">
               <svg class="ic" aria-hidden="true"><use href="#i-terminal" /></svg>
-              <span>Terminal</span>
+              <span data-i18n="terminal.title">Terminal</span>
             </span>
-            <button class="terminal-panel__close" id="terminalClose" type="button" title="Close panel (⌃`)" aria-label="Close terminal">
+            <button class="terminal-panel__close" id="terminalClose" type="button" data-i18n-title="terminal.close" title="Close panel (⌃`)" aria-label="Close terminal">
               <svg class="ic"><use href="#i-close" /></svg>
             </button>
           </div>
@@ -162,24 +179,24 @@
             <span class="assistant__avatar">
               <svg class="ic"><use href="#i-sparkle" /></svg>
             </span>
-            <span class="assistant__name">Assistant</span>
+            <span class="assistant__name" data-i18n="assistant.name">Assistant</span>
           </span>
         </header>
         <div class="chat" id="chat"></div>
         <form class="composer" id="composer">
           <div class="composer__box">
-            <textarea id="prompt" rows="1" placeholder="Ask about the open file…"></textarea>
+            <textarea id="prompt" rows="1" data-i18n-placeholder="assistant.placeholder" placeholder="Ask about the open file…"></textarea>
             <div class="composer__bar">
               <div class="model-picker" id="modelPicker">
-                <button class="model-picker__btn" id="modelPickerBtn" type="button" title="Switch model" aria-haspopup="listbox" aria-expanded="false">
+                <button class="model-picker__btn" id="modelPickerBtn" type="button" data-i18n-title="assistant.switchModel" title="Switch model" aria-haspopup="listbox" aria-expanded="false">
                   <svg class="ic"><use href="#i-cpu" /></svg>
-                  <span class="model-picker__label" id="modelPickerLabel">Select model</span>
+                  <span class="model-picker__label" id="modelPickerLabel" data-i18n="assistant.selectModel">Select model</span>
                   <svg class="ic model-picker__caret"><use href="#i-caret" /></svg>
                 </button>
                 <div class="menu" id="modelMenu" role="listbox" hidden></div>
               </div>
               <span class="composer__hint">⌘↩</span>
-              <button class="send" id="sendBtn" type="submit" title="Send (⌘↩)">
+              <button class="send" id="sendBtn" type="submit" data-i18n-title="assistant.send" title="Send (⌘↩)">
                 <svg class="ic"><use href="#i-arrow-up" /></svg>
               </button>
             </div>
@@ -193,7 +210,7 @@
       <div class="statusbar__left">
         <button class="statusbar__item statusbar__item--btn" id="paletteBtn" title="Command Palette (⇧⌘P)">
           <svg class="ic"><use href="#i-command" /></svg>
-          <span>Commands</span>
+          <span data-i18n="statusbar.commands">Commands</span>
         </button>
         <button class="statusbar__item statusbar__item--btn" id="problemsBtn" title="Problems" aria-label="Problems">
           <span class="statusbar__diag"><svg class="ic"><use href="#i-error" /></svg><span id="problemsErrCount">0</span></span>
@@ -207,20 +224,20 @@
     <dialog class="sheet" id="settings">
       <form method="dialog" class="sheet__body" id="settingsForm">
         <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
-        <h2>AI provider</h2>
-        <p class="sheet__sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
-        <label>Base URL
+        <h2 data-i18n="settings.title">AI provider</h2>
+        <p class="sheet__sub" data-i18n="settings.sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
+        <label><span data-i18n="settings.baseUrl">Base URL</span>
           <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" />
         </label>
-        <label>API key
+        <label><span data-i18n="settings.apiKey">API key</span>
           <input id="cfgApiKey" type="password" placeholder="sk-…" />
         </label>
-        <label>Model
+        <label><span data-i18n="settings.model">Model</span>
           <input id="cfgModel" type="text" placeholder="gpt-4o-mini" />
         </label>
         <div class="sheet__actions">
-          <button class="btn" value="cancel" formnovalidate>Cancel</button>
-          <button class="btn btn--primary" id="saveCfgBtn" value="save">Save</button>
+          <button class="btn" value="cancel" formnovalidate data-i18n="settings.cancel">Cancel</button>
+          <button class="btn btn--primary" id="saveCfgBtn" value="save" data-i18n="settings.save">Save</button>
         </div>
       </form>
     </dialog>
@@ -234,8 +251,8 @@
           <input id="ioInput" type="text" spellcheck="false" autocomplete="off" />
         </label>
         <div class="sheet__actions">
-          <button class="btn" type="button" id="ioCancel">Cancel</button>
-          <button class="btn btn--primary" id="ioOk" value="ok">OK</button>
+          <button class="btn" type="button" id="ioCancel" data-i18n="dialog.cancel">Cancel</button>
+          <button class="btn btn--primary" id="ioOk" value="ok" data-i18n="dialog.ok">OK</button>
         </div>
       </form>
     </dialog>

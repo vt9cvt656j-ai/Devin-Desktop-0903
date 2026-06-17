@@ -9,10 +9,28 @@ import wordCountManifest from "../../src-tauri/extensions/word-count/extension.j
 import wordCountSource from "../../src-tauri/extensions/word-count/index.js?raw";
 import insertDateManifest from "../../src-tauri/extensions/insert-date/extension.json";
 import insertDateSource from "../../src-tauri/extensions/insert-date/index.js?raw";
+import aiAssistantManifest from "../../src-tauri/extensions/ai-assistant/extension.json";
+import aiAssistantSource from "../../src-tauri/extensions/ai-assistant/index.js?raw";
+import codeFormatterManifest from "../../src-tauri/extensions/code-formatter/extension.json";
+import codeFormatterSource from "../../src-tauri/extensions/code-formatter/index.js?raw";
+import bracketColorizerManifest from "../../src-tauri/extensions/bracket-colorizer/extension.json";
+import bracketColorizerSource from "../../src-tauri/extensions/bracket-colorizer/index.js?raw";
+import todoHighlightManifest from "../../src-tauri/extensions/todo-highlight/extension.json";
+import todoHighlightSource from "../../src-tauri/extensions/todo-highlight/index.js?raw";
+import colorPickerManifest from "../../src-tauri/extensions/color-picker/extension.json";
+import colorPickerSource from "../../src-tauri/extensions/color-picker/index.js?raw";
+import chineseLangManifest from "../../src-tauri/extensions/chinese-language-pack/extension.json";
+import chineseLangSource from "../../src-tauri/extensions/chinese-language-pack/index.js?raw";
 
 const BUILTIN = [
   { manifest: wordCountManifest, source: wordCountSource },
   { manifest: insertDateManifest, source: insertDateSource },
+  { manifest: aiAssistantManifest, source: aiAssistantSource },
+  { manifest: codeFormatterManifest, source: codeFormatterSource },
+  { manifest: bracketColorizerManifest, source: bracketColorizerSource },
+  { manifest: todoHighlightManifest, source: todoHighlightSource },
+  { manifest: colorPickerManifest, source: colorPickerSource },
+  { manifest: chineseLangManifest, source: chineseLangSource },
 ];
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;

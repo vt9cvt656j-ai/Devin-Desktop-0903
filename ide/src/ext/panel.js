@@ -1,24 +1,26 @@
 // The "Extensions" sheet: install bundled extensions, install from a file,
 // enable/disable, and uninstall. Mirrors the look of the settings dialog.
 
+import { t } from "../i18n.js";
+
 export function createExtensionsPanel({ manager, host, showToast }) {
   const dialog = document.createElement("dialog");
   dialog.className = "sheet sheet--ext";
   dialog.innerHTML = `
     <div class="sheet__body">
       <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-ext" /></svg></div>
-      <h2>Extensions</h2>
-      <p class="sheet__sub">Extensions run in a sandbox and only get the capabilities they declare.</p>
+      <h2 data-i18n="ext.title"></h2>
+      <p class="sheet__sub" data-i18n="ext.sub"></p>
       <div class="ext-actions">
-        <button class="btn" id="extInstallFile" type="button">Install from file…</button>
-        <button class="btn" id="extClose" type="button" value="cancel">Done</button>
+        <button class="btn" id="extInstallFile" type="button" data-i18n="ext.installFile"></button>
+        <button class="btn" id="extClose" type="button" value="cancel" data-i18n="ext.done"></button>
       </div>
       <div class="ext-section">
-        <div class="ext-section__title">Installed</div>
+        <div class="ext-section__title" data-i18n="ext.installed"></div>
         <div class="ext-list" id="extInstalled"></div>
       </div>
       <div class="ext-section">
-        <div class="ext-section__title">Available</div>
+        <div class="ext-section__title" data-i18n="ext.available"></div>
         <div class="ext-list" id="extAvailable"></div>
       </div>
     </div>`;
@@ -75,7 +77,10 @@ export function createExtensionsPanel({ manager, host, showToast }) {
 
     installedEl.innerHTML = "";
     if (installed.length === 0) {
-      installedEl.innerHTML = `<div class="ext-empty">No extensions installed yet.</div>`;
+      const emptyEl = document.createElement("div");
+      emptyEl.className = "ext-empty";
+      emptyEl.textContent = t("ext.noInstalled");
+      installedEl.appendChild(emptyEl);
     }
     for (const item of installed) {
       const el = card(item.manifest);
@@ -83,7 +88,7 @@ export function createExtensionsPanel({ manager, host, showToast }) {
 
       const toggle = document.createElement("button");
       toggle.className = "btn ext-btn";
-      toggle.textContent = item.enabled ? "Disable" : "Enable";
+      toggle.textContent = item.enabled ? t("ext.disable") : t("ext.enable");
       toggle.addEventListener("click", async () => {
         try {
           await manager.setEnabled(item.manifest.id, !item.enabled);
@@ -97,7 +102,7 @@ export function createExtensionsPanel({ manager, host, showToast }) {
 
       const remove = document.createElement("button");
       remove.className = "btn ext-btn ext-btn--danger";
-      remove.textContent = "Uninstall";
+      remove.textContent = t("ext.uninstall");
       remove.addEventListener("click", async () => {
         try {
           host.deactivate(item.manifest.id);
@@ -116,19 +121,22 @@ export function createExtensionsPanel({ manager, host, showToast }) {
     availableEl.innerHTML = "";
     const notInstalled = available.filter((m) => !installedIds.has(m.id));
     if (notInstalled.length === 0) {
-      availableEl.innerHTML = `<div class="ext-empty">All bundled extensions are installed.</div>`;
+      const allEl = document.createElement("div");
+      allEl.className = "ext-empty";
+      allEl.textContent = t("ext.allInstalled");
+      availableEl.appendChild(allEl);
     }
     for (const manifest of notInstalled) {
       const el = card(manifest);
       const actions = el.querySelector(".ext-card__actions");
       const install = document.createElement("button");
       install.className = "btn btn--primary ext-btn";
-      install.textContent = "Install";
+      install.textContent = t("ext.install");
       install.addEventListener("click", async () => {
         try {
           const item = await manager.installBuiltin(manifest.id);
           await host.activate(item, manager);
-          showToast(`Installed ${manifest.name}`);
+          showToast(t("ext.installedMsg", { name: manifest.name }));
           await render();
         } catch (err) {
           showToast(String(err));
@@ -144,7 +152,7 @@ export function createExtensionsPanel({ manager, host, showToast }) {
       const item = await manager.installFromFile();
       if (!item) return;
       await host.activate(item, manager);
-      showToast(`Installed ${item.manifest.name}`);
+      showToast(t("ext.installedMsg", { name: item.manifest.name }));
       await render();
     } catch (err) {
       showToast(String(err));
@@ -152,7 +160,15 @@ export function createExtensionsPanel({ manager, host, showToast }) {
   });
   dialog.querySelector("#extClose").addEventListener("click", () => dialog.close());
 
+  function applyI18n() {
+    for (const el of dialog.querySelectorAll("[data-i18n]")) {
+      const key = el.getAttribute("data-i18n");
+      if (key) el.textContent = t(key);
+    }
+  }
+
   async function open() {
+    applyI18n();
     await render();
     dialog.showModal();
   }

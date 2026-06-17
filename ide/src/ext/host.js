@@ -11,8 +11,21 @@ const PERMISSION_FOR = {
   "editor.getText": "editor",
   "editor.getSelection": "editor",
   "editor.insertText": "editor",
+  "editor.replaceText": "editor",
+  "editor.setDecorations": "editor",
+  "editor.clearDecorations": "editor",
+  "editor.getFilePath": "editor",
+  "editor.getLanguage": "editor",
+  "editor.getLineCount": "editor",
+  "editor.getLine": "editor",
   "workspace.readFile": "workspace-read",
   "workspace.writeFile": "workspace-write",
+  "workspace.listDir": "workspace-read",
+  "network.fetch": "network",
+  "diagnostics.set": "diagnostics",
+  "diagnostics.clear": "diagnostics",
+  "locale.registerLocale": "locale",
+  "locale.setLocale": "locale",
 };
 
 export class ExtensionHost {
@@ -21,11 +34,22 @@ export class ExtensionHost {
    * @param {() => string} ctx.getEditorText
    * @param {() => string} ctx.getSelectionText
    * @param {(text: string) => void} ctx.insertText
+   * @param {(range: object, text: string) => void} ctx.replaceText
    * @param {(text: string) => void} ctx.showInformationMessage
    * @param {(key: string, opts: object, onClick: (()=>void)|null) => void} ctx.setStatusBarItem
    * @param {(key: string) => void} ctx.removeStatusBarItem
    * @param {(path: string) => Promise<string>} ctx.readFile
    * @param {(path: string, content: string) => Promise<void>} ctx.writeFile
+   * @param {(path: string) => Promise<object[]>} ctx.listDir
+   * @param {() => string|null} ctx.getFilePath
+   * @param {() => string} ctx.getLanguage
+   * @param {() => number} ctx.getLineCount
+   * @param {(n: number) => string} ctx.getLine
+   * @param {(decorations: object[]) => string} ctx.setDecorations
+   * @param {(handle: string) => void} ctx.clearDecorations
+   * @param {(url: string, opts: object) => Promise<object>} ctx.networkFetch
+   * @param {(uri: string, diagnostics: object[]) => void} ctx.setDiagnostics
+   * @param {(uri: string) => void} ctx.clearDiagnostics
    * @param {() => void} [ctx.onChange] called when commands/extensions change
    */
   constructor(ctx) {
@@ -159,10 +183,44 @@ export class ExtensionHost {
       case "editor.insertText":
         this.ctx.insertText(args[0]);
         return null;
+      case "editor.replaceText":
+        this.ctx.replaceText(args[0], args[1]);
+        return null;
+      case "editor.setDecorations": {
+        const handle = this.ctx.setDecorations(entry.manifest.id, args[0]);
+        return handle;
+      }
+      case "editor.clearDecorations":
+        this.ctx.clearDecorations(entry.manifest.id);
+        return null;
+      case "editor.getFilePath":
+        return this.ctx.getFilePath();
+      case "editor.getLanguage":
+        return this.ctx.getLanguage();
+      case "editor.getLineCount":
+        return this.ctx.getLineCount();
+      case "editor.getLine":
+        return this.ctx.getLine(args[0]);
       case "workspace.readFile":
         return this.ctx.readFile(args[0]);
       case "workspace.writeFile":
         await this.ctx.writeFile(args[0], args[1]);
+        return null;
+      case "workspace.listDir":
+        return this.ctx.listDir(args[0]);
+      case "network.fetch":
+        return this.ctx.networkFetch(args[0], args[1]);
+      case "diagnostics.set":
+        this.ctx.setDiagnostics(entry.manifest.id, args[0], args[1]);
+        return null;
+      case "diagnostics.clear":
+        this.ctx.clearDiagnostics(entry.manifest.id, args[0]);
+        return null;
+      case "locale.registerLocale":
+        this.ctx.registerLocale(args[0], args[1]);
+        return null;
+      case "locale.setLocale":
+        this.ctx.setLocale(args[0]);
         return null;
       default:
         throw new Error(`unknown host method: ${method}`);

@@ -37,6 +37,7 @@ pub fn run() {
             git::git_branches,
             git::git_checkout,
             git::git_pull,
+            git::git_log,
             ai::ai_chat,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
