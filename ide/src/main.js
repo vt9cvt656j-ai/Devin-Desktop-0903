@@ -2955,25 +2955,25 @@ function termIsDark() {
 function termTheme() {
   if (termIsDark()) {
     return {
-      background: "#1C1C1E", foreground: "#F2F2F7", cursor: "#FFD60A",
-      cursorAccent: "#1C1C1E", selectionBackground: "rgba(10,132,255,0.45)",
+      background: "#1E1F22", foreground: "#E4E4E7", cursor: "#5AC8FA",
+      cursorAccent: "#1E1F22", selectionBackground: "rgba(90,200,250,0.28)",
       selectionForeground: "#FFFFFF",
-      black:   "#48484A", red:     "#FF453A", green:   "#32D74B", yellow:  "#FFD60A",
-      blue:    "#0A84FF", magenta: "#BF5AF2", cyan:    "#64D2FF", white:   "#D1D1D6",
-      brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#5DE96B",
-      brightYellow: "#FFE34D", brightBlue: "#64B5FF", brightMagenta: "#DA8FFF",
-      brightCyan: "#A0E9FF", brightWhite: "#FFFFFF",
+      black:   "#5A5A60", red:     "#FF6B6B", green:   "#5CE08A", yellow:  "#FFD479",
+      blue:    "#67A9FF", magenta: "#D58CFF", cyan:    "#6FE0E0", white:   "#D1D1D6",
+      brightBlack: "#7C7C84", brightRed: "#FF8A8A", brightGreen: "#86F0A8",
+      brightYellow: "#FFE4A3", brightBlue: "#93C2FF", brightMagenta: "#E3AEFF",
+      brightCyan: "#9FF0F0", brightWhite: "#FFFFFF",
     };
   }
   return {
-    background: "#FFFFFF", foreground: "#1D1D1F", cursor: "#007AFF",
-    cursorAccent: "#FFFFFF", selectionBackground: "#B4D8FD",
+    background: "#FBFBFD", foreground: "#1D1D1F", cursor: "#007AFF",
+    cursorAccent: "#FBFBFD", selectionBackground: "rgba(0,122,255,0.20)",
     selectionForeground: "#1D1D1F",
-    black:   "#3C3C43", red:     "#FF3B30", green:   "#28CD41", yellow:  "#FF9F0A",
-    blue:    "#007AFF", magenta: "#AF52DE", cyan:    "#1499B8", white:   "#8E8E93",
-    brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#4CD964",
-    brightYellow: "#FFB340", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
-    brightCyan: "#70D7FF", brightWhite: "#D1D1D6",
+    black:   "#3C3C43", red:     "#E0352B", green:   "#1E9E3E", yellow:  "#C7820A",
+    blue:    "#0A6CFF", magenta: "#A33BD6", cyan:    "#0E8FA8", white:   "#8E8E93",
+    brightBlack: "#636366", brightRed: "#FF3B30", brightGreen: "#28CD41",
+    brightYellow: "#FF9F0A", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
+    brightCyan: "#34AADC", brightWhite: "#D1D1D6",
   };
 }
 
@@ -3048,14 +3048,15 @@ async function createTermTab() {
 
   const term = new Terminal({
     fontSize: 13,
-    fontFamily: "Menlo, SF Mono, ui-monospace, monospace",
-    fontWeight: "normal",
-    fontWeightBold: "bold",
-    lineHeight: 1.2,
-    letterSpacing: 0.5,
+    fontFamily: "'SF Mono', Menlo, 'JetBrains Mono', ui-monospace, monospace",
+    fontWeight: "400",
+    fontWeightBold: "600",
+    lineHeight: 1.35,
+    letterSpacing: 0,
     theme: termTheme(),
     cursorBlink: true,
-    cursorStyle: "block",
+    cursorStyle: "bar",
+    cursorWidth: 2,
     scrollback: 10000,
     allowProposedApi: true,
   });
@@ -3088,7 +3089,7 @@ async function createTermTab() {
     setTimeout(() => {
       if (entry.backendId != null) {
         const lines = [
-          "export PROMPT='%F{34}%n@%m%f %F{33}%1~%f %F{default}%#%f '",
+          "export PROMPT='%F{green}%n@%m%f %F{blue}%1~%f %F{magenta}❯%f '",
           "export ZSH_HIGHLIGHT_HIGHLIGHTERS=(main brackets pattern)",
           "typeset -A ZSH_HIGHLIGHT_STYLES",
           "ZSH_HIGHLIGHT_STYLES[command]='fg=blue,bold'",

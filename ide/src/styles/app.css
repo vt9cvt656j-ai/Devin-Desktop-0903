@@ -20,7 +20,7 @@
   --shimmer: rgba(10, 132, 255, 0.1);
 
   /* integrated terminal (macOS Terminal look) */
-  --term-bg: #ffffff;
+  --term-bg: #fbfbfd;
   --term-head: linear-gradient(#fbfbfd, #eef0f2);
   --term-head-line: rgba(0, 0, 0, 0.1);
   --term-scroll: rgba(0, 0, 0, 0.18);
@@ -68,8 +68,8 @@
     --shimmer: rgba(255, 255, 255, 0.08);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 16px 40px rgba(0, 0, 0, 0.5);
-    --term-bg: #1c1c1e;
-    --term-head: linear-gradient(#343437, #2a2a2c);
+    --term-bg: #1e1f22;
+    --term-head: linear-gradient(#34353a, #28292d);
     --term-head-line: rgba(0, 0, 0, 0.55);
     --term-scroll: rgba(255, 255, 255, 0.2);
     --term-scroll-hover: rgba(255, 255, 255, 0.36);
@@ -91,8 +91,8 @@
   --shimmer: rgba(255, 255, 255, 0.08);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 16px 40px rgba(0, 0, 0, 0.5);
-  --term-bg: #1c1c1e;
-  --term-head: linear-gradient(#343437, #2a2a2c);
+  --term-bg: #1e1f22;
+  --term-head: linear-gradient(#34353a, #28292d);
   --term-head-line: rgba(0, 0, 0, 0.55);
   --term-scroll: rgba(255, 255, 255, 0.2);
   --term-scroll-hover: rgba(255, 255, 255, 0.36);
