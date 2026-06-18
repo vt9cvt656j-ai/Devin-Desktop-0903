@@ -153,9 +153,11 @@ body.is-tauri.is-mac .titlebar {
   flex: none;
 }
 .brandmark {
+  display: block;
   width: 22px;
   height: 22px;
   flex: none;
+  object-fit: contain;
   filter: drop-shadow(0 1px 3px rgba(10, 132, 255, 0.4));
 }
 .titlebar__title {
