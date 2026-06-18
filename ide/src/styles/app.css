@@ -557,17 +557,20 @@ body.is-tauri.is-mac .titlebar {
   min-height: 0;
 }
 
-/* ---- integrated terminal (macOS + iOS hybrid) ---- */
+/* ---- integrated terminal (professional IDE panel) ---- */
 .terminal-panel[hidden] { display: none; }
 .terminal-panel {
   display: flex;
   flex-direction: column;
-  flex: 0 0 260px;
-  min-height: 140px;
-  border-top: none;
-  background: rgba(246, 246, 246, 0.82);
-  backdrop-filter: blur(40px) saturate(1.8);
-  -webkit-backdrop-filter: blur(40px) saturate(1.8);
+  flex: 0 0 300px;
+  min-height: 180px;
+  border-top: 1px solid rgba(10, 132, 255, 0.18);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(238, 240, 248, 0.86)),
+    var(--panel);
+  box-shadow: 0 -18px 42px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(28px) saturate(1.45);
+  -webkit-backdrop-filter: blur(28px) saturate(1.45);
   z-index: 3;
   position: relative;
 }
@@ -575,23 +578,22 @@ body.is-tauri.is-mac .titlebar {
   content: "";
   position: absolute;
   top: 0;
-  left: 12px;
-  right: 12px;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(0,0,0,0.08) 15%, rgba(0,0,0,0.08) 85%, transparent);
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, #0a84ff, #7c5cff 48%, #35d49b);
+  opacity: 0.85;
 }
 
-/* macOS window-style titlebar */
+/* terminal toolbar */
 .terminal-panel__head {
   display: flex;
   align-items: center;
-  height: 36px;
-  padding: 0 12px;
-  gap: 8px;
-  background: rgba(232, 232, 237, 0.6);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-bottom: 1px solid rgba(0,0,0,0.06);
+  height: 42px;
+  padding: 0 10px 0 12px;
+  gap: 10px;
+  background: rgba(247, 248, 252, 0.78);
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
   -webkit-app-region: no-drag;
 }
 
@@ -651,28 +653,48 @@ body.is-tauri.is-mac .titlebar {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text);
   flex-shrink: 0;
 }
-.terminal-panel__title .ic { width: 14px; height: 14px; opacity: 0.6; }
+.terminal-panel__title .ic {
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+.terminal-panel__badge {
+  height: 18px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(10, 132, 255, 0.2);
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  background: rgba(10, 132, 255, 0.08);
+}
 .terminal-panel__close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px; height: 26px;
-  border: 0; border-radius: 7px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 8px;
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   margin-left: auto;
   flex-shrink: 0;
 }
 .terminal-panel__close:hover {
-  background: rgba(0,0,0,0.06);
+  background: rgba(255, 95, 87, 0.12);
+  border-color: rgba(255, 95, 87, 0.18);
   color: var(--text);
 }
 .terminal-panel__close .ic { width: 13px; height: 13px; }
@@ -681,12 +703,17 @@ body.is-tauri.is-mac .titlebar {
 .terminal-panel__body {
   flex: 1;
   min-height: 0;
-  padding: 6px 6px 4px 6px;
+  padding: 9px;
   overflow: hidden;
-  background: #FFFFFF;
-  margin: 0 6px 6px 6px;
-  border-radius: 8px;
-  box-shadow: inset 0 1px 3px rgba(0,0,0,0.04);
+  background:
+    radial-gradient(circle at 8% 0%, rgba(91, 141, 239, 0.14), transparent 28%),
+    #0b1020;
+  margin: 0 10px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 13px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 18px 36px rgba(2, 6, 23, 0.18);
 }
 .terminal-panel__body .xterm,
 .terminal-panel__body .terminal { height: 100%; }
@@ -694,20 +721,20 @@ body.is-tauri.is-mac .titlebar {
 .terminal-panel__body .xterm .xterm-viewport,
 .terminal-panel__body .xterm .xterm-screen,
 .terminal-panel__body .xterm-viewport {
-  background-color: #FFFFFF !important;
+  background-color: transparent !important;
 }
 
-/* iOS-style thin scrollbar */
+/* terminal scrollbar */
 .terminal-panel__body .xterm-viewport::-webkit-scrollbar { width: 5px; }
 .terminal-panel__body .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
 .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.12);
+  background: rgba(148, 163, 184, 0.32);
   border-radius: 3px;
 }
 .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.25);
+  background: rgba(148, 163, 184, 0.5);
 }
-.editorwrap.has-terminal .welcome { bottom: 260px; }
+.editorwrap.has-terminal .welcome { bottom: 300px; }
 
 /* ---- problems panel ---- */
 .problems-panel[hidden] { display: none; }
@@ -2829,12 +2856,12 @@ kbd {
   flex: none;
 }
 
-/* ---- terminal tabs (iOS capsule style) ---- */
+/* ---- terminal tabs ---- */
 .term-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin-left: 6px;
+  gap: 6px;
+  margin-left: 2px;
   flex: 1;
   min-width: 0;
   overflow-x: auto;
@@ -2844,59 +2871,83 @@ kbd {
 .term-tab {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 10px;
-  font-size: 11.5px;
+  gap: 7px;
+  height: 28px;
+  max-width: 180px;
+  padding: 0 9px;
+  font-size: 12px;
   font-family: var(--font);
-  font-weight: 500;
-  border: none;
-  background: transparent;
+  font-weight: 650;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.42);
   color: var(--text-dim);
-  border-radius: 14px;
+  border-radius: 9px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-  letter-spacing: -0.01em;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+  letter-spacing: 0.01em;
 }
 .term-tab:hover {
-  background: rgba(0,0,0,0.05);
+  background: rgba(255, 255, 255, 0.72);
+  border-color: rgba(15, 23, 42, 0.08);
   color: var(--text);
 }
 .term-tab.is-active {
-  background: rgba(255,255,255,0.85);
+  background: #fff;
   color: var(--text);
-  box-shadow: 0 0.5px 2px rgba(0,0,0,0.08), 0 0.5px 0.5px rgba(0,0,0,0.04);
+  border-color: rgba(10, 132, 255, 0.24);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08), inset 0 -2px 0 var(--accent);
+}
+.term-tab__status {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: #35d49b;
+  box-shadow: 0 0 0 3px rgba(53, 212, 155, 0.12);
+}
+.term-tab__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .term-tab--add {
-  font-size: 16px;
-  font-weight: 400;
-  padding: 2px 8px;
+  width: 28px;
+  justify-content: center;
+  padding: 0;
+  font-size: 18px;
+  font-weight: 500;
   color: var(--text-dim);
-  border-radius: 14px;
 }
 .term-tab--add:hover {
-  background: rgba(0,0,0,0.05);
+  background: rgba(10, 132, 255, 0.1);
+  border-color: rgba(10, 132, 255, 0.18);
   color: var(--accent);
 }
 .term-tab__x {
-  font-size: 12px;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  font-size: 13px;
   line-height: 1;
   opacity: 0;
-  padding: 0 1px;
   border-radius: 50%;
   transition: opacity 0.12s ease;
 }
 .term-tab:hover .term-tab__x {
-  opacity: 0.5;
+  opacity: 0.65;
 }
 .term-tab__x:hover {
   opacity: 1 !important;
-  background: rgba(0,0,0,0.06);
+  background: rgba(15, 23, 42, 0.08);
 }
 .terminal-panel__instance {
   width: 100%;
   height: 100%;
-  padding: 2px 6px 0 6px;
+  padding: 5px 7px 0;
 }
 .terminal-panel__body {
   position: relative;
@@ -2984,92 +3035,114 @@ kbd {
   cursor: pointer;
 }
 
-/* ---- terminal dark-mode (macOS + iOS) ---- */
+/* ---- terminal dark-mode ---- */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .terminal-panel {
-    background: rgba(30, 30, 32, 0.82);
+    background:
+      linear-gradient(180deg, rgba(28, 29, 36, 0.92), rgba(18, 20, 28, 0.94)),
+      var(--panel);
+    border-top-color: rgba(124, 92, 255, 0.28);
+    box-shadow: 0 -18px 42px rgba(0, 0, 0, 0.28);
   }
   :root:not([data-theme="light"]) .terminal-panel::before {
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.06) 15%, rgba(255,255,255,0.06) 85%, transparent);
+    background: linear-gradient(90deg, #5b8def, #7c5cff 48%, #35d49b);
   }
   :root:not([data-theme="light"]) .terminal-panel__head {
-    background: rgba(44, 44, 48, 0.6);
-    border-bottom-color: rgba(255,255,255,0.05);
+    background: rgba(30, 32, 41, 0.76);
+    border-bottom-color: rgba(255, 255, 255, 0.08);
   }
   :root:not([data-theme="light"]) .terminal-panel__body {
-    background: #1E1E1E;
-    box-shadow: inset 0 1px 3px rgba(0,0,0,0.15);
+    background:
+      radial-gradient(circle at 8% 0%, rgba(124, 92, 255, 0.16), transparent 28%),
+      #0d1117;
+    border-color: rgba(148, 163, 184, 0.18);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 18px 36px rgba(0, 0, 0, 0.26);
   }
   :root:not([data-theme="light"]) .terminal-panel__body .xterm,
   :root:not([data-theme="light"]) .terminal-panel__body .xterm .xterm-viewport,
   :root:not([data-theme="light"]) .terminal-panel__body .xterm .xterm-screen,
   :root:not([data-theme="light"]) .terminal-panel__body .xterm-viewport {
-    background-color: #1E1E1E !important;
+    background-color: transparent !important;
   }
   :root:not([data-theme="light"]) .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.16);
   }
   :root:not([data-theme="light"]) .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.28);
   }
   :root:not([data-theme="light"]) .term-tab:hover {
-    background: rgba(255,255,255,0.06);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.08);
   }
   :root:not([data-theme="light"]) .term-tab.is-active {
-    background: rgba(255,255,255,0.1);
-    box-shadow: 0 0.5px 2px rgba(0,0,0,0.25);
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(124, 92, 255, 0.34);
+    box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24), inset 0 -2px 0 var(--accent-2);
   }
   :root:not([data-theme="light"]) .terminal-panel__close:hover {
-    background: rgba(255,255,255,0.08);
+    background: rgba(255, 95, 87, 0.16);
   }
   :root:not([data-theme="light"]) .term-tab--add:hover {
-    background: rgba(255,255,255,0.06);
+    background: rgba(124, 92, 255, 0.16);
   }
   :root:not([data-theme="light"]) .term-tab__x:hover {
-    background: rgba(255,255,255,0.1);
+    background: rgba(255, 255, 255, 0.12);
   }
 }
 :root[data-theme="dark"] .terminal-panel {
-  background: rgba(30, 30, 32, 0.82);
+  background:
+    linear-gradient(180deg, rgba(28, 29, 36, 0.92), rgba(18, 20, 28, 0.94)),
+    var(--panel);
+  border-top-color: rgba(124, 92, 255, 0.28);
+  box-shadow: 0 -18px 42px rgba(0, 0, 0, 0.28);
 }
 :root[data-theme="dark"] .terminal-panel::before {
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.06) 15%, rgba(255,255,255,0.06) 85%, transparent);
+  background: linear-gradient(90deg, #5b8def, #7c5cff 48%, #35d49b);
 }
 :root[data-theme="dark"] .terminal-panel__head {
-  background: rgba(44, 44, 48, 0.6);
-  border-bottom-color: rgba(255,255,255,0.05);
+  background: rgba(30, 32, 41, 0.76);
+  border-bottom-color: rgba(255, 255, 255, 0.08);
 }
 :root[data-theme="dark"] .terminal-panel__body {
-  background: #1E1E1E;
-  box-shadow: inset 0 1px 3px rgba(0,0,0,0.15);
+  background:
+    radial-gradient(circle at 8% 0%, rgba(124, 92, 255, 0.16), transparent 28%),
+    #0d1117;
+  border-color: rgba(148, 163, 184, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 18px 36px rgba(0, 0, 0, 0.26);
 }
 :root[data-theme="dark"] .terminal-panel__body .xterm,
 :root[data-theme="dark"] .terminal-panel__body .xterm .xterm-viewport,
 :root[data-theme="dark"] .terminal-panel__body .xterm .xterm-screen,
 :root[data-theme="dark"] .terminal-panel__body .xterm-viewport {
-  background-color: #1E1E1E !important;
+  background-color: transparent !important;
 }
 :root[data-theme="dark"] .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.16);
 }
 :root[data-theme="dark"] .terminal-panel__body .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.28);
 }
 :root[data-theme="dark"] .term-tab:hover {
-  background: rgba(255,255,255,0.06);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.08);
 }
 :root[data-theme="dark"] .term-tab.is-active {
-  background: rgba(255,255,255,0.1);
-  box-shadow: 0 0.5px 2px rgba(0,0,0,0.25);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(124, 92, 255, 0.34);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.24), inset 0 -2px 0 var(--accent-2);
 }
 :root[data-theme="dark"] .terminal-panel__close:hover {
-  background: rgba(255,255,255,0.08);
+  background: rgba(255, 95, 87, 0.16);
 }
 :root[data-theme="dark"] .term-tab--add:hover {
-  background: rgba(255,255,255,0.06);
+  background: rgba(124, 92, 255, 0.16);
 }
 :root[data-theme="dark"] .term-tab__x:hover {
-  background: rgba(255,255,255,0.1);
+  background: rgba(255, 255, 255, 0.12);
 }
 
 /* ---- advanced feature panel ---- */

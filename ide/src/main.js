@@ -4013,26 +4013,26 @@ function termTheme() {
 
   if (isDark) {
     return {
-      background: "#1E1E1E", foreground: "#CCCCCC", cursor: "#AEAFAD",
-      cursorAccent: "#1E1E1E", selectionBackground: "rgba(255,255,255,0.18)",
+      background: "#0D1117", foreground: "#D6DEEB", cursor: "#7C5CFF",
+      cursorAccent: "#0D1117", selectionBackground: "rgba(124, 92, 255, 0.28)",
       selectionForeground: "#FFFFFF",
-      black: "#000000", red: "#CD3131", green: "#0DBC79", yellow: "#E5E510",
-      blue: "#2472C8", magenta: "#BC3FBC", cyan: "#11A8CD", white: "#E5E5E5",
-      brightBlack: "#666666", brightRed: "#F14C4C", brightGreen: "#23D18B",
-      brightYellow: "#F5F543", brightBlue: "#3B8EEA", brightMagenta: "#D670D6",
-      brightCyan: "#29B8DB", brightWhite: "#F5F5F5",
+      black: "#0B1020", red: "#FF6B7A", green: "#3DDC97", yellow: "#FFD166",
+      blue: "#5B8DEF", magenta: "#C792EA", cyan: "#5DE4C7", white: "#D6DEEB",
+      brightBlack: "#637083", brightRed: "#FF8FA3", brightGreen: "#63E6BE",
+      brightYellow: "#FFE08A", brightBlue: "#7AA2FF", brightMagenta: "#D9A8FF",
+      brightCyan: "#84F0D8", brightWhite: "#FFFFFF",
     };
   }
 
   return {
-    background: "#FFFFFF", foreground: "#383A42", cursor: "#526FFF",
-    cursorAccent: "#FFFFFF", selectionBackground: "rgba(0,122,255,0.12)",
-    selectionForeground: "#000000",
-    black: "#383A42", red: "#E45649", green: "#50A14F", yellow: "#C18401",
-    blue: "#4078F2", magenta: "#A626A4", cyan: "#0184BC", white: "#A0A1A7",
-    brightBlack: "#4F525E", brightRed: "#E06C75", brightGreen: "#98C379",
-    brightYellow: "#D19A66", brightBlue: "#61AFEF", brightMagenta: "#C678DD",
-    brightCyan: "#56B6C2", brightWhite: "#FAFAFA",
+    background: "#0B1020", foreground: "#D6DEEB", cursor: "#0A84FF",
+    cursorAccent: "#0B1020", selectionBackground: "rgba(10, 132, 255, 0.24)",
+    selectionForeground: "#FFFFFF",
+    black: "#0B1020", red: "#FF5F7A", green: "#35D49B", yellow: "#F7C948",
+    blue: "#5B8DEF", magenta: "#B77CFF", cyan: "#4DDDD0", white: "#D6DEEB",
+    brightBlack: "#6B7280", brightRed: "#FF87A0", brightGreen: "#6EE7B7",
+    brightYellow: "#FFE082", brightBlue: "#8AB4FF", brightMagenta: "#D8B4FE",
+    brightCyan: "#99F6E4", brightWhite: "#FFFFFF",
   };
 }
 
@@ -4062,8 +4062,8 @@ function renderTermTabs() {
     const btn = document.createElement("button");
     btn.className = "term-tab" + (i === activeTermTab ? " is-active" : "");
     btn.type = "button";
-    btn.innerHTML = `<span></span><span class="term-tab__x">&times;</span>`;
-    btn.querySelector("span").textContent = tab.label;
+    btn.innerHTML = `<span class="term-tab__status"></span><span class="term-tab__label"></span><span class="term-tab__x">&times;</span>`;
+    btn.querySelector(".term-tab__label").textContent = tab.label;
     btn.addEventListener("click", (e) => {
       if (e.target.classList.contains("term-tab__x")) {
         closeTermTab(i);
