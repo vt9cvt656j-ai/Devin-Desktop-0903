@@ -1227,7 +1227,7 @@ const PRELOAD_SKIP_DIRS = new Set([
   "node_modules", ".git", "dist", "build", "out", "target",
   ".next", "coverage", ".cache", ".vscode", "vendor",
 ]);
-const PRELOAD_MAX_FILES = 1500;
+const PRELOAD_MAX_FILES = 150;
 const PRELOAD_MAX_BYTES = 512 * 1024;
 let preloadToken = 0;
 
