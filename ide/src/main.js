@@ -571,6 +571,7 @@ const welcomeEl = $("welcome");
 const chatEl = $("chat");
 const rootNameEl = $("rootName");
 const saveBtn = $("saveBtn");
+const runBtn = $("runBtn");
 const toastEl = $("toast");
 
 // ---- editor state ----
@@ -873,6 +874,7 @@ function activate(path) {
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
+  if (runBtn) runBtn.disabled = false;
   $("windowTitle").textContent = f.name + " — Michael IDE";
   refreshGutter();
   updateBreadcrumb(path);
@@ -925,6 +927,7 @@ function closeFile(path) {
     else {
       monacoEditor.setModel(monaco.editor.createModel("", "plaintext"));
       saveBtn.disabled = true;
+      if (runBtn) runBtn.disabled = true;
       $("windowTitle").textContent = "Michael IDE";
       refreshGutter();
       updateBreadcrumb(null);
@@ -3568,6 +3571,7 @@ $("openFolderBtn").addEventListener("click", chooseFolder);
 $("emptyOpenBtn").addEventListener("click", chooseFolder);
 $("settingsBtn").addEventListener("click", openSettings);
 $("saveBtn").addEventListener("click", saveActive);
+$("runBtn")?.addEventListener("click", runCurrentFile);
 
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
