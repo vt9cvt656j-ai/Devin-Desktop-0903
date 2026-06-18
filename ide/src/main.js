@@ -3021,6 +3021,73 @@ function writeToActiveTerminal(data, tries = 30) {
   if (tries > 0) setTimeout(() => writeToActiveTerminal(data, tries - 1), 150);
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function dirname(path) {
+  const clean = path.replace(/\/+$/, "");
+  const idx = clean.lastIndexOf("/");
+  return idx > 0 ? clean.slice(0, idx) : "/";
+}
+
+function runCommandForFile(path) {
+  const name = basename(path);
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  const q = shellQuote(path);
+  switch (ext) {
+    case "js":
+    case "mjs":
+    case "cjs":
+      return `node ${q}`;
+    case "ts":
+    case "tsx":
+      return `npx tsx ${q}`;
+    case "py":
+      return `python3 ${q}`;
+    case "sh":
+    case "bash":
+    case "zsh":
+      return `bash ${q}`;
+    case "rb":
+      return `ruby ${q}`;
+    case "php":
+      return `php ${q}`;
+    case "go":
+      return `go run ${q}`;
+    case "rs": {
+      const out = `/tmp/michael-ide-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}`;
+      return `rustc ${q} -o ${shellQuote(out)} && ${shellQuote(out)}`;
+    }
+    case "java": {
+      const className = name.replace(/\.java$/i, "");
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(className)) return null;
+      return `cd ${shellQuote(dirname(path))} && javac ${shellQuote(name)} && java ${className}`;
+    }
+    case "json":
+      return `python3 -m json.tool ${q}`;
+    default:
+      return null;
+  }
+}
+
+async function runCurrentFile() {
+  if (!activePath) {
+    showToast("Open a file to run.");
+    return;
+  }
+  const command = runCommandForFile(activePath);
+  if (!command) {
+    showToast(`No run command configured for ${basename(activePath)}.`);
+    return;
+  }
+  const file = openFiles.get(activePath);
+  if (file?.dirty) await saveActive();
+  await openTerminal();
+  writeToActiveTerminal(`\n${command}\n`);
+  showToast(`Running ${basename(activePath)} in terminal`);
+}
+
 function renderRemoteTool(body) {
   createToolHeader(body, "Remote Development", "Create SSH terminal sessions tied to the current workspace. Use a mounted or synced path as a folder root when you need remote files in the editor.");
   const form = document.createElement("div");
@@ -3375,6 +3442,8 @@ function getMenus() {
     {
       label: "Tools",
       items: [
+        { label: "Run Current File", icon: "i-terminal", hint: "⌘R", action: () => runCurrentFile() },
+        { sep: true },
         { label: "Workspace Manager", icon: "i-folder", action: () => openFeaturePanel("workspace") },
         { label: "Remote Development", icon: "i-terminal", action: () => openFeaturePanel("remote") },
         { label: "Extension Marketplace", icon: "i-ext", action: () => openFeaturePanel("marketplace") },
@@ -3810,6 +3879,7 @@ const DEFAULT_KEYBINDINGS = {
   "mod+shift+m": "view.problems",
   "mod+shift+p": "commandPalette",
   "mod+\\": "view.splitEditor",
+  "mod+r": "code.runCurrentFile",
 };
 
 let userKeybindings = {};
@@ -3840,6 +3910,7 @@ const KB_ACTIONS = {
   "view.problems": () => toggleProblems(),
   "commandPalette": () => palette.open(),
   "view.splitEditor": () => toggleSplitEditor(),
+  "code.runCurrentFile": () => runCurrentFile(),
 };
 
 function keyCombo(e) {
@@ -4259,6 +4330,7 @@ const palette = createCommandPalette({
     { id: "workspace.manager", title: "Workspace Manager", category: "Workspace", run: () => openFeaturePanel("workspace") },
     { id: "file.quickOpen", title: "Quick Open (⌘P)", category: t("menu.file"), run: () => qoOpen() },
     { id: "file.autoSave", title: "Toggle Auto Save", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
+    { id: "code.runCurrentFile", title: "Run Current File", category: "Code", run: () => runCurrentFile() },
     { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
     { id: "view.terminal", title: t("menu.toggleTerminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
