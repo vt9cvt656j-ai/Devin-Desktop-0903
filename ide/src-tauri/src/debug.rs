@@ -37,11 +37,15 @@ pub struct DapConfig {
     pub cwd: Option<String>,
 }
 
+// Default *DAP* adapter commands (must speak the Debug Adapter Protocol over
+// stdio). python/go/lldb have clean stdio adapters; node realistically needs
+// vscode-js-debug, so its default is a placeholder users override in the
+// advanced launcher.
 const KNOWN_ADAPTERS: &[(&str, &str, &[&str])] = &[
-    ("node", "node", &["--inspect-brk"]),
-    ("python", "debugpy", &["--listen", "5678", "--wait-for-client"]),
-    ("lldb", "lldb-vscode", &[]),
+    ("python", "python3", &["-m", "debugpy.adapter"]),
     ("go", "dlv", &["dap"]),
+    ("lldb", "lldb-dap", &[]),
+    ("node", "js-debug-adapter", &[]),
 ];
 
 fn find_adapter(id: &str) -> Option<(&'static str, &'static [&'static str])> {
@@ -61,6 +65,29 @@ fn prune_stopped(inner: &mut HashMap<String, DapProcess>) {
 
 fn encode_dap_message(content: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
+}
+
+/// PATH that includes the workspace `node_modules/.bin` plus common toolchain
+/// dirs so debug adapters (debugpy, delve, lldb-dap, vscode-js-debug) resolve.
+#[cfg(not(windows))]
+fn augmented_path(workspace: Option<&str>) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
+        parts.push(format!("{ws}/node_modules/.bin"));
+    }
+    parts.push(format!("{home}/.cargo/bin"));
+    parts.push("/opt/homebrew/bin".into());
+    parts.push("/usr/local/bin".into());
+    parts.push(format!("{home}/go/bin"));
+    parts.push(format!("{home}/.local/bin"));
+    parts.push("/usr/bin".into());
+    parts.push("/bin".into());
+    let extra = parts.join(":");
+    match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
+        _ => extra,
+    }
 }
 
 #[tauri::command]
@@ -112,6 +139,8 @@ pub fn dap_start(
     if let Some(ref cwd) = config.cwd {
         builder.current_dir(cwd);
     }
+    #[cfg(not(windows))]
+    builder.env("PATH", augmented_path(config.cwd.as_deref()));
 
     let mut child = builder
         .spawn()

@@ -18,6 +18,7 @@ import { load as loadStore } from "@tauri-apps/plugin-store";
 import { registerSnippetProviders } from "./snippets.js";
 import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
+import { createDapManager } from "./dap-client.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -66,6 +67,10 @@ const backend = inTauri ? await tauriBackend() : mockBackend();
 
 // Real LSP client manager (wired up after the workspace state exists below).
 let lspManager = null;
+// Debug Adapter Protocol manager (wired up alongside the LSP manager below).
+let dapManager = null;
+// Cached debug launch configurations discovered from launch.json (null = unloaded).
+let _launchConfigsCache = null;
 
 async function tauriBackend() {
   const core = await import("@tauri-apps/api/core");
@@ -198,6 +203,76 @@ function mockBackend() {
   FILES[ROOT + "/src/utils/format.js"] = MERGE_VERSIONS["src/utils/format.js"].merged;
   const mockLspRunning = new Set();
   const mockDapRunning = new Set();
+  // Minimal in-browser DAP simulation so the debugger is demoable without a
+  // native adapter. Echoes responses and drives a tiny stopped/continue flow.
+  let mockDap = null;
+  const mockDapReply = (req, body) =>
+    mockDap?.onEvent?.({ kind: "message", data: JSON.stringify({ type: "response", request_seq: req.seq, success: true, command: req.command, body }) });
+  const mockDapEvent = (event, body) =>
+    mockDap?.onEvent?.({ kind: "message", data: JSON.stringify({ type: "event", event, body }) });
+  function mockDapHandle(raw) {
+    let req;
+    try { req = JSON.parse(raw); } catch { return; }
+    if (req.type !== "request") return;
+    const file = (req.arguments && req.arguments.program) || `${mockDap.program}/src/main.js`;
+    switch (req.command) {
+      case "initialize":
+        mockDapReply(req, { supportsConfigurationDoneRequest: true, supportsTerminateRequest: true, supportsEvaluateForHovers: true });
+        setTimeout(() => mockDapEvent("initialized", {}), 10);
+        break;
+      case "launch":
+      case "attach":
+        mockDapReply(req, {});
+        mockDapEvent("output", { category: "console", output: "Mock debug session started (browser preview).\n" });
+        setTimeout(() => mockDapEvent("stopped", { reason: "breakpoint", threadId: 1, allThreadsStopped: true }), 60);
+        break;
+      case "setBreakpoints":
+        mockDapReply(req, { breakpoints: (req.arguments.breakpoints || []).map((b) => ({ verified: true, line: b.line })) });
+        break;
+      case "setExceptionBreakpoints":
+      case "configurationDone":
+        mockDapReply(req, {});
+        break;
+      case "threads":
+        mockDapReply(req, { threads: [{ id: 1, name: "main" }] });
+        break;
+      case "stackTrace":
+        mockDapReply(req, { stackFrames: [
+          { id: 1, name: "main", line: 1, column: 1, source: { path: file, name: file.split("/").pop() } },
+          { id: 2, name: "greet", line: 2, column: 3, source: { path: file, name: file.split("/").pop() } },
+        ], totalFrames: 2 });
+        break;
+      case "scopes":
+        mockDapReply(req, { scopes: [{ name: "Locals", variablesReference: 1000, expensive: false }, { name: "Globals", variablesReference: 1001, expensive: true }] });
+        break;
+      case "variables":
+        mockDapReply(req, { variables: req.arguments.variablesReference === 1000
+          ? [{ name: "name", value: '"world"', type: "string", variablesReference: 0 }, { name: "count", value: "42", type: "number", variablesReference: 0 }]
+          : [{ name: "globalThis", value: "Window", type: "object", variablesReference: 0 }] });
+        break;
+      case "evaluate":
+        mockDapReply(req, { result: `${req.arguments.expression} = (mock) 42`, variablesReference: 0 });
+        break;
+      case "continue":
+        mockDapReply(req, { allThreadsContinued: true });
+        setTimeout(() => mockDapEvent("terminated", {}), 30);
+        break;
+      case "next":
+      case "stepIn":
+      case "stepOut":
+        mockDapReply(req, {});
+        setTimeout(() => mockDapEvent("stopped", { reason: "step", threadId: 1 }), 30);
+        break;
+      case "terminate":
+      case "disconnect":
+        mockDapReply(req, {});
+        mockDapEvent("terminated", {});
+        break;
+      default:
+        mockDapReply(req, {});
+        break;
+    }
+  }
   const MARKETPLACE = [
     {
       id: "michael.theme-pack",
@@ -492,11 +567,15 @@ function mockBackend() {
       .map((adapter) => ({ adapter, running: mockDapRunning.has(adapter) })),
     dapStart: async (config, onEvent) => {
       mockDapRunning.add(config.adapterId);
+      mockDap = { onEvent, program: config.cwd || ROOT, step: 0 };
       onEvent?.({ kind: "started", adapter: config.adapterId });
     },
-    dapSend: async () => {},
+    dapSend: async (_adapterId, message) => {
+      if (mockDap) mockDapHandle(message);
+    },
     dapStop: async (adapterId) => {
       mockDapRunning.delete(adapterId);
+      mockDap = null;
     },
     marketplaceList: async () => [...MARKETPLACE],
     marketplaceSearch: async (query) => {
@@ -604,6 +683,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
   minimap: { enabled: false },
   scrollBeyondLastLine: false,
   renderWhitespace: "selection",
+  glyphMargin: true,
   padding: { top: 10 },
 });
 
@@ -818,6 +898,114 @@ monaco.editor.registerEditorOpener({
   },
 });
 
+// ---- breakpoints + debug location (editor-side state) ----
+const breakpoints = new Map(); // path -> Set<lineNumber>
+const bpDecorations = monacoEditor.createDecorationsCollection([]);
+const debugLineDecorations = monacoEditor.createDecorationsCollection([]);
+let debugStopLocation = null; // { path, line }
+
+function getAllBreakpoints() {
+  const out = new Map();
+  for (const [path, set] of breakpoints) out.set(path, [...set]);
+  return out;
+}
+
+function toggleBreakpoint(path, line) {
+  if (!path || !line) return;
+  let set = breakpoints.get(path);
+  if (!set) {
+    set = new Set();
+    breakpoints.set(path, set);
+  }
+  if (set.has(line)) set.delete(line);
+  else set.add(line);
+  if (set.size === 0) breakpoints.delete(path);
+  renderBreakpointDecorations();
+  if (dapManager?.isActive()) {
+    dapManager.sendBreakpoints(path, [...(breakpoints.get(path) || [])]);
+  }
+  refreshDebugUI();
+}
+
+function renderBreakpointDecorations() {
+  if (!activePath) {
+    bpDecorations.set([]);
+    return;
+  }
+  const set = breakpoints.get(activePath);
+  if (!set || set.size === 0) {
+    bpDecorations.set([]);
+    return;
+  }
+  const decos = [...set]
+    .sort((a, b) => a - b)
+    .map((line) => ({
+      range: new monaco.Range(line, 1, line, 1),
+      options: {
+        glyphMarginClassName: "bp-glyph",
+        glyphMarginHoverMessage: { value: "Breakpoint" },
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      },
+    }));
+  bpDecorations.set(decos);
+}
+
+function showDebugLocation(path, line) {
+  debugStopLocation = { path, line };
+  Promise.resolve(openFile(path, basename(path))).then((ok) => {
+    if (!ok) return;
+    applyDebugLineDecoration();
+    monacoEditor.revealLineInCenter(line);
+  });
+}
+
+function applyDebugLineDecoration() {
+  if (debugStopLocation && activePath === debugStopLocation.path) {
+    const line = debugStopLocation.line;
+    debugLineDecorations.set([
+      {
+        range: new monaco.Range(line, 1, line, 1),
+        options: {
+          isWholeLine: true,
+          className: "debug-current-line",
+          glyphMarginClassName: "debug-current-glyph",
+          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+        },
+      },
+    ]);
+  } else {
+    debugLineDecorations.set([]);
+  }
+}
+
+function clearDebugLocation() {
+  debugStopLocation = null;
+  debugLineDecorations.set([]);
+}
+
+monacoEditor.onMouseDown((e) => {
+  if (e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
+    const line = e.target.position?.lineNumber;
+    if (line && activePath) toggleBreakpoint(activePath, line);
+  }
+});
+
+// Standard debugger keybindings.
+monacoEditor.addCommand(monaco.KeyCode.F9, () => {
+  if (activePath) toggleBreakpoint(activePath, monacoEditor.getPosition().lineNumber);
+});
+monacoEditor.addCommand(monaco.KeyCode.F5, () => {
+  if (dapManager?.isActive()) {
+    if (dapManager.isStopped()) dapManager.cont();
+  } else {
+    openFeaturePanel("debugger");
+  }
+});
+monacoEditor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F5, () => dapManager?.stop());
+monacoEditor.addCommand(monaco.KeyCode.F10, () => dapManager?.next());
+monacoEditor.addCommand(monaco.KeyCode.F11, () => dapManager?.stepIn());
+monacoEditor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F11, () => dapManager?.stepOut());
+
 /** path -> { model, name, dirty, viewState } */
 const openFiles = new Map();
 let activePath = null;
@@ -913,6 +1101,8 @@ function activate(path) {
   $("windowTitle").textContent = f.name + " — Michael IDE";
   refreshGutter();
   updateBreadcrumb(path);
+  renderBreakpointDecorations();
+  applyDebugLineDecoration();
 }
 
 function updateBreadcrumb(path) {
@@ -1089,6 +1279,46 @@ function updateLspStatusBar() {
   }
 }
 
+// Wire the real debug adapter client.
+dapManager = createDapManager({
+  backend,
+  getWorkspaceRoots: () => (workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : []),
+  getAllBreakpoints,
+  runInTerminal: (args) => debugRunInTerminal(args),
+  showToast: (msg) => showToast(msg),
+  callbacks: {
+    onState: () => refreshDebugUI(),
+    onOutput: (cat, text) => appendDebugConsole(cat, text),
+    onShowLocation: (path, line) => showDebugLocation(path, line),
+    onStopped: () => { openFeaturePanel("debugger"); refreshDebugUI(); },
+    onContinued: () => clearDebugLocation(),
+    onTerminated: () => { clearDebugLocation(); refreshDebugUI(); },
+  },
+});
+
+async function debugRunInTerminal(args) {
+  await openTerminal();
+  const parts = args?.args || [];
+  if (!parts.length) return;
+  const cmd = parts.map((p) => shellQuote(String(p))).join(" ");
+  const cd = args.cwd ? `cd ${shellQuote(args.cwd)} && ` : "";
+  writeToActiveTerminal(`\n${cd}${cmd}\n`);
+}
+
+function updateDebugStatusBar() {
+  if (!dapManager) return;
+  if (dapManager.isActive()) {
+    const state = dapManager.isStopped() ? "paused" : "running";
+    setStatusBarItem(
+      "debug",
+      { text: `Debug: ${state}`, tooltip: "Active debug session" },
+      () => openFeaturePanel("debugger"),
+    );
+  } else {
+    removeStatusBarItem("debug");
+  }
+}
+
 function iconSvg(id, cls = "") {
   return `<svg class="ic ${cls}"><use href="#${id}" /></svg>`;
 }
@@ -1228,6 +1458,7 @@ function basename(path) {
 
 function setActiveWorkspaceRoot(path) {
   rootPath = path;
+  _launchConfigsCache = null; // re-discover launch.json for the new root
   if (workspaceRoots.length > 1) {
     rootNameEl.textContent = `${workspaceRoots.length} folders`;
     rootNameEl.title = workspaceRoots.join("\n");
@@ -3520,66 +3751,352 @@ async function openConflictDetail(file, detail) {
   detail.append(grid, merged, actions);
 }
 
+// Built-in debug configuration templates per adapter. launchArgs carry the
+// adapter-specific shape; the active file / workspace fill in the program.
+function defaultDebugConfigs() {
+  const root = rootPath || "";
+  const program = activePath || "";
+  return [
+    {
+      name: "Python: Current File",
+      adapterId: "python",
+      request: "launch",
+      launchArgs: { type: "python", request: "launch", program, console: "integratedTerminal", cwd: root, stopOnEntry: false },
+    },
+    {
+      name: "Node: Current File",
+      adapterId: "node",
+      request: "launch",
+      launchArgs: { type: "pwa-node", request: "launch", program, cwd: root, console: "integratedTerminal" },
+    },
+    {
+      name: "Go: Debug Package",
+      adapterId: "go",
+      request: "launch",
+      launchArgs: { type: "go", request: "launch", mode: "debug", program: root, cwd: root },
+    },
+    {
+      name: "LLDB: Launch Executable",
+      adapterId: "lldb",
+      request: "launch",
+      launchArgs: { type: "lldb", request: "launch", program, cwd: root },
+    },
+  ];
+}
+
+async function loadLaunchConfigs() {
+  const configs = [];
+  for (const rel of [".vscode/launch.json", ".michael/launch.json"]) {
+    if (!rootPath) break;
+    try {
+      const raw = await backend.readTextFile(`${rootPath}/${rel}`);
+      const json = JSON.parse(raw.replace(/\/\/.*$/gm, ""));
+      for (const c of json.configurations || []) {
+        configs.push({
+          name: c.name || `${c.type} ${c.request}`,
+          adapterId: dapAdapterForType(c.type),
+          request: c.request || "launch",
+          launchArgs: c,
+        });
+      }
+    } catch {
+      /* no launch.json — fine */
+    }
+  }
+  _launchConfigsCache = configs;
+  return configs;
+}
+
+function dapAdapterForType(type) {
+  const t = String(type || "").toLowerCase();
+  if (t.includes("python") || t === "debugpy") return "python";
+  if (t.includes("node") || t === "pwa-node" || t.includes("chrome")) return "node";
+  if (t === "go") return "go";
+  if (t === "lldb" || t === "cppdbg" || t.includes("lldb")) return "lldb";
+  return type || "node";
+}
+
+let debugConsoleEl = null;
+
+function appendDebugConsole(category, text) {
+  if (!debugConsoleEl || !text) return;
+  const span = document.createElement("span");
+  span.className = "dbg-console__line dbg-console__line--" + (category || "console").replace(/[^a-z]/gi, "");
+  span.textContent = text;
+  debugConsoleEl.appendChild(span);
+  debugConsoleEl.scrollTop = debugConsoleEl.scrollHeight;
+}
+
+function refreshDebugUI() {
+  updateDebugStatusBar();
+  if (!featureOverlay.hidden && activeFeatureTab === "debugger") {
+    renderFeaturePanel();
+  }
+}
+
 function renderDebuggerTool(body) {
-  createToolHeader(body, "Debugger", "Start and stop DAP adapters. Custom command and args are supported when a default adapter is not enough.");
+  createToolHeader(
+    body,
+    "Debugger",
+    "A real Debug Adapter Protocol client: set breakpoints in the editor gutter, launch a configuration, then step through code with live call stack, variables and a Debug Console. Requires the matching adapter installed (debugpy, vscode-js-debug/node, delve, lldb-dap).",
+  );
+
+  const active = dapManager?.isActive();
+  debugConsoleEl = null;
+
+  if (_launchConfigsCache === null && rootPath) {
+    _launchConfigsCache = [];
+    loadLaunchConfigs().then(() => refreshDebugUI());
+  }
+
+  if (!active) {
+    renderDebugLauncher(body);
+    return;
+  }
+  renderDebugSession(body);
+}
+
+function renderDebugLauncher(body) {
   const form = document.createElement("div");
   form.className = "tool-form";
+  const configs = [...defaultDebugConfigs(), ...(_launchConfigsCache || [])];
+  const optionsHtml = configs.map((c, i) => `<option value="${i}">${c.name}</option>`).join("");
   form.innerHTML = `
-    <label><span>Adapter</span><select id="dapAdapter"><option>node</option><option>python</option><option>lldb</option><option>go</option></select></label>
-    <label><span>Custom command</span><input id="dapCommand" spellcheck="false" placeholder="leave empty for default adapter" /></label>
-    <label><span>Args</span><input id="dapArgs" spellcheck="false" placeholder="space separated" /></label>
-    <label><span>Working directory</span><input id="dapCwd" spellcheck="false" /></label>
-    <div class="tool-actions"><button class="btn btn--primary" id="dapStartBtn" type="button">Start</button><button class="btn" id="dapStopBtn" type="button">Stop</button><button class="btn" id="dapRefreshBtn" type="button">Refresh</button></div>
-    <div class="tool-list" id="dapList"></div>
-    <pre class="tool-log" id="dapLog"></pre>`;
+    <label><span>Configuration</span><select id="dapConfig">${optionsHtml}</select></label>
+    <details class="dbg-advanced"><summary>Advanced (custom adapter command)</summary>
+      <label><span>Adapter id</span><input id="dapAdapter" spellcheck="false" placeholder="python / node / go / lldb" /></label>
+      <label><span>Custom command</span><input id="dapCommand" spellcheck="false" placeholder="leave empty for the bundled default" /></label>
+      <label><span>Args</span><input id="dapArgs" spellcheck="false" placeholder="space separated" /></label>
+      <label><span>Working directory</span><input id="dapCwd" spellcheck="false" /></label>
+    </details>
+    <div class="tool-actions">
+      <button class="btn btn--primary" id="dapStartBtn" type="button">Start Debugging</button>
+      <button class="btn" id="dapReloadBtn" type="button">Reload launch.json</button>
+    </div>`;
   body.appendChild(form);
   form.querySelector("#dapCwd").value = rootPath || "";
-  const log = form.querySelector("#dapLog");
-  const refresh = async () => {
-    const list = form.querySelector("#dapList");
-    list.innerHTML = "";
-    try {
-      const adapters = await backend.dapList();
-      for (const item of adapters) {
-        const row = document.createElement("div");
-        row.className = "tool-card";
-        row.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div>`;
-        row.querySelector("strong").textContent = item.adapter;
-        row.querySelector("span").textContent = item.running ? "Running" : "Stopped";
-        list.appendChild(row);
-      }
-    } catch (e) {
-      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
-    }
-  };
+
+  renderBreakpointsSection(body);
+
   form.querySelector("#dapStartBtn").addEventListener("click", async () => {
-    const adapterId = form.querySelector("#dapAdapter").value;
-    const command = form.querySelector("#dapCommand").value.trim();
-    const args = form.querySelector("#dapArgs").value.trim().split(/\s+/).filter(Boolean);
-    const cwd = form.querySelector("#dapCwd").value.trim() || null;
-    try {
-      await backend.dapStart({ adapterId, command, args, cwd }, (ev) => {
-        log.textContent += JSON.stringify(ev) + "\n";
-        log.scrollTop = log.scrollHeight;
+    const idx = +form.querySelector("#dapConfig").value;
+    const base = configs[idx] ? structuredCloneSafe(configs[idx]) : null;
+    const customCmd = form.querySelector("#dapCommand").value.trim();
+    const customAdapter = form.querySelector("#dapAdapter").value.trim();
+    const cwd = form.querySelector("#dapCwd").value.trim() || rootPath || null;
+    let config = base || { name: customAdapter || "Custom", adapterId: customAdapter || "node", request: "launch", launchArgs: {} };
+    if (customAdapter) config.adapterId = customAdapter;
+    if (customCmd) {
+      config.command = customCmd;
+      config.args = form.querySelector("#dapArgs").value.trim().split(/\s+/).filter(Boolean);
+    }
+    config.cwd = cwd;
+    if (config.launchArgs) {
+      config.launchArgs.cwd = config.launchArgs.cwd || cwd;
+      if (!config.launchArgs.program && activePath) config.launchArgs.program = activePath;
+    }
+    await dapManager.start(config);
+  });
+  form.querySelector("#dapReloadBtn").addEventListener("click", async () => {
+    await loadLaunchConfigs();
+    refreshDebugUI();
+    showToast("Reloaded launch configurations");
+  });
+}
+
+function structuredCloneSafe(obj) {
+  try { return structuredClone(obj); } catch { return JSON.parse(JSON.stringify(obj)); }
+}
+
+function renderDebugSession(body) {
+  // Toolbar.
+  const bar = document.createElement("div");
+  bar.className = "dbg-toolbar";
+  const stopped = dapManager.isStopped();
+  const mk = (label, title, fn, disabled) =>
+    `<button class="btn dbg-ctl" data-act="${label}" title="${title}" ${disabled ? "disabled" : ""}>${title}</button>`;
+  bar.innerHTML =
+    mk("continue", stopped ? "Continue" : "Running…", null, !stopped) +
+    mk("stepOver", "Step Over", null, !stopped) +
+    mk("stepIn", "Step Into", null, !stopped) +
+    mk("stepOut", "Step Out", null, !stopped) +
+    mk("pause", "Pause", null, stopped) +
+    mk("restart", "Restart", null, false) +
+    mk("stop", "Stop", null, false);
+  body.appendChild(bar);
+  bar.addEventListener("click", (e) => {
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (!act) return;
+    const map = {
+      continue: () => dapManager.cont(),
+      stepOver: () => dapManager.next(),
+      stepIn: () => dapManager.stepIn(),
+      stepOut: () => dapManager.stepOut(),
+      pause: () => dapManager.pause(),
+      restart: () => dapManager.restart(),
+      stop: () => dapManager.stop(),
+    };
+    map[act]?.();
+  });
+
+  const grid = document.createElement("div");
+  grid.className = "dbg-grid";
+  body.appendChild(grid);
+
+  // Call stack.
+  const stackCol = document.createElement("div");
+  stackCol.className = "dbg-col";
+  stackCol.innerHTML = `<h4 class="dbg-h">Call Stack</h4>`;
+  const stackList = document.createElement("div");
+  stackList.className = "dbg-stack";
+  stackCol.appendChild(stackList);
+  const frames = dapManager.currentFrames();
+  if (!frames.length) {
+    stackList.appendChild(createEmptyState(stopped ? "No frames." : "Running — pause or hit a breakpoint to inspect."));
+  } else {
+    for (const f of frames) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "dbg-frame" + (f.id === dapManager.activeFrameId() ? " is-active" : "");
+      row.innerHTML = `<strong></strong><span></span>`;
+      row.querySelector("strong").textContent = f.name;
+      row.querySelector("span").textContent = f.source?.path
+        ? `${basename(f.source.path)}:${f.line}`
+        : `line ${f.line}`;
+      row.addEventListener("click", async () => {
+        await dapManager.setActiveFrame(f.id);
+        if (f.source?.path) showDebugLocation(f.source.path, f.line);
       });
-      showToast(`Debugger ${adapterId} started`);
-      refresh();
-    } catch (e) {
-      showToast(String(e && e.message ? e.message : e));
+      stackList.appendChild(row);
     }
-  });
-  form.querySelector("#dapStopBtn").addEventListener("click", async () => {
-    const adapterId = form.querySelector("#dapAdapter").value;
-    try {
-      await backend.dapStop(adapterId);
-      showToast(`Debugger ${adapterId} stopped`);
-      refresh();
-    } catch (e) {
-      showToast(String(e && e.message ? e.message : e));
+  }
+  grid.appendChild(stackCol);
+
+  // Variables.
+  const varCol = document.createElement("div");
+  varCol.className = "dbg-col";
+  varCol.innerHTML = `<h4 class="dbg-h">Variables</h4>`;
+  const varTree = document.createElement("div");
+  varTree.className = "dbg-vars";
+  varCol.appendChild(varTree);
+  grid.appendChild(varCol);
+  if (stopped && dapManager.activeFrameId() != null) {
+    loadDebugScopes(varTree, dapManager.activeFrameId());
+  } else {
+    varTree.appendChild(createEmptyState("Variables appear when paused."));
+  }
+
+  // Breakpoints.
+  renderBreakpointsSection(body);
+
+  // Debug Console.
+  const consoleWrap = document.createElement("div");
+  consoleWrap.className = "dbg-console-wrap";
+  consoleWrap.innerHTML = `<h4 class="dbg-h">Debug Console</h4>`;
+  const consoleEl = document.createElement("div");
+  consoleEl.className = "dbg-console";
+  const inputRow = document.createElement("div");
+  inputRow.className = "dbg-console__input";
+  inputRow.innerHTML = `<input spellcheck="false" placeholder="Evaluate expression…" /><button class="btn" type="button">Eval</button>`;
+  consoleWrap.append(consoleEl, inputRow);
+  body.appendChild(consoleWrap);
+  debugConsoleEl = consoleEl;
+  for (const entry of dapManager.consoleLog()) appendDebugConsole(entry.category, entry.text);
+
+  const evalInput = inputRow.querySelector("input");
+  const doEval = async () => {
+    const expr = evalInput.value.trim();
+    if (!expr) return;
+    appendDebugConsole("input", `> ${expr}\n`);
+    evalInput.value = "";
+    const res = await dapManager.evaluate(expr, dapManager.activeFrameId(), "repl");
+    appendDebugConsole("result", `${res?.result ?? "(no result)"}\n`);
+  };
+  inputRow.querySelector("button").addEventListener("click", doEval);
+  evalInput.addEventListener("keydown", (e) => { if (e.key === "Enter") doEval(); });
+}
+
+async function loadDebugScopes(container, frameId) {
+  container.innerHTML = "";
+  const scopes = await dapManager.scopes(frameId);
+  if (!scopes.length) {
+    container.appendChild(createEmptyState("No scopes."));
+    return;
+  }
+  for (const scope of scopes) {
+    const node = document.createElement("details");
+    node.className = "dbg-scope";
+    node.open = !scope.expensive;
+    node.innerHTML = `<summary>${scope.name}</summary>`;
+    const inner = document.createElement("div");
+    inner.className = "dbg-var-children";
+    node.appendChild(inner);
+    container.appendChild(node);
+    let loaded = false;
+    const load = async () => {
+      if (loaded) return;
+      loaded = true;
+      await renderVariables(inner, scope.variablesReference);
+    };
+    if (node.open) load();
+    node.addEventListener("toggle", () => { if (node.open) load(); });
+  }
+}
+
+async function renderVariables(container, variablesReference) {
+  if (!variablesReference) return;
+  const vars = await dapManager.variables(variablesReference);
+  for (const v of vars) {
+    const hasChildren = v.variablesReference && v.variablesReference > 0;
+    const row = document.createElement(hasChildren ? "details" : "div");
+    row.className = "dbg-var";
+    if (hasChildren) {
+      row.innerHTML = `<summary><span class="dbg-var__name"></span><span class="dbg-var__val"></span></summary>`;
+      const kids = document.createElement("div");
+      kids.className = "dbg-var-children";
+      row.appendChild(kids);
+      let loaded = false;
+      row.addEventListener("toggle", async () => {
+        if (row.open && !loaded) { loaded = true; await renderVariables(kids, v.variablesReference); }
+      });
+    } else {
+      row.innerHTML = `<span class="dbg-var__name"></span><span class="dbg-var__val"></span>`;
     }
-  });
-  form.querySelector("#dapRefreshBtn").addEventListener("click", refresh);
-  refresh();
+    row.querySelector(".dbg-var__name").textContent = v.name;
+    row.querySelector(".dbg-var__val").textContent = v.value;
+    container.appendChild(row);
+  }
+}
+
+function renderBreakpointsSection(body) {
+  const col = document.createElement("div");
+  col.className = "dbg-col dbg-breakpoints";
+  col.innerHTML = `<h4 class="dbg-h">Breakpoints</h4>`;
+  const list = document.createElement("div");
+  list.className = "dbg-bp-list";
+  col.appendChild(list);
+  body.appendChild(col);
+  const all = getAllBreakpoints();
+  if (!all.size) {
+    list.appendChild(createEmptyState("Click the editor gutter to add a breakpoint."));
+    return;
+  }
+  for (const [path, lines] of all) {
+    for (const line of lines.sort((a, b) => a - b)) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "dbg-bp";
+      row.innerHTML = `<span class="dbg-bp__dot"></span><span class="dbg-bp__file"></span>`;
+      row.querySelector(".dbg-bp__file").textContent = `${basename(path)}:${line}`;
+      row.title = path;
+      row.addEventListener("click", () => {
+        Promise.resolve(openFile(path, basename(path))).then((ok) => {
+          if (ok) { monacoEditor.revealLineInCenter(line); monacoEditor.setPosition({ lineNumber: line, column: 1 }); }
+        });
+      });
+      list.appendChild(row);
+    }
+  }
 }
 
 function renderLspTool(body) {
