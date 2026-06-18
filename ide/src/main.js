@@ -2610,17 +2610,12 @@ function syncAssistantBrand() {
   const avatar = document.querySelector(".assistant__avatar");
   const nameEl = document.querySelector(".assistant__name");
   if (!avatar || !nameEl) return;
-  const use = avatar.querySelector("use");
   const id = currentModel();
+  avatar.className = "assistant__avatar assistant__avatar--logo";
   if (!id) {
-    avatar.className = "assistant__avatar";
-    use.setAttribute("href", "#i-sparkle");
     nameEl.textContent = t("assistant.name");
     return;
   }
-  const b = brandOf(id);
-  avatar.className = "assistant__avatar" + (b.cls ? " " + b.cls : "");
-  use.setAttribute("href", "#" + b.sym);
   nameEl.textContent = modelLabel(id);
 }
 
@@ -2714,11 +2709,9 @@ function addMessage(role, text) {
   let body;
   if (role === "assistant") {
     const id = currentModel();
-    const b = brandOf(id);
-    const sym = id ? b.sym : "i-sparkle";
     const avatar = document.createElement("div");
-    avatar.className = "msg__avatar" + (id && b.cls ? " " + b.cls : "");
-    avatar.innerHTML = `<svg class="ic"><use href="#${sym}" /></svg>`;
+    avatar.className = "msg__avatar msg__avatar--logo";
+    avatar.innerHTML = `<img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" />`;
     const main = document.createElement("div");
     main.className = "msg__main";
     main.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
@@ -2737,15 +2730,12 @@ function addMessage(role, text) {
   return body;
 }
 
-// Devin-style "thinking" card shown while the first token is pending. The orb
-// matches the active model's provider so it feels like that model is replying.
-function thinkingCard(brand) {
+// Devin-style "thinking" card shown while the first token is pending.
+function thinkingCard() {
   const t = document.createElement("div");
   t.className = "thinking";
-  const orbCls = brand && brand.cls ? "thinking__orb " + brand.cls : "thinking__orb";
-  const sym = brand && brand.sym && brand.sym !== "i-cpu" ? brand.sym : "i-sparkle";
   t.innerHTML =
-    `<span class="${orbCls}"><svg class="ic"><use href="#${sym}" /></svg></span>` +
+    `<span class="thinking__orb thinking__orb--logo"><img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" /></span>` +
     `<span class="thinking__text">${t("assistant.thinking")}</span>`;
   return t;
 }
@@ -2755,7 +2745,7 @@ function showChatHint() {
   const hint = document.createElement("div");
   hint.className = "chat-empty";
   hint.innerHTML =
-    `<div class="chat-empty__icon"><svg class="ic"><use href="#i-monogram" /></svg></div>` +
+    `<div class="chat-empty__icon chat-empty__icon--logo"><img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" /></div>` +
     `<h3></h3>` +
     `<p></p>` +
     `<div class="chat-empty__chips"></div>`;
@@ -2806,7 +2796,7 @@ async function sendPrompt(text) {
   history.push({ role: "user", content: text });
 
   const body = addMessage("assistant", "");
-  body.appendChild(thinkingCard(brandOf(currentModel())));
+  body.appendChild(thinkingCard());
   let acc = "";
   let err = null;
   let raf = 0;
