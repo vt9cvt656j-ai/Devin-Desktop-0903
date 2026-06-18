@@ -111,6 +111,7 @@ async function tauriBackend() {
     marketplaceList: () => core.invoke("marketplace_list"),
     marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
     marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
+    tasksList: (root) => core.invoke("tasks_list", { root }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -502,6 +503,11 @@ function mockBackend() {
       );
     },
     marketplaceInstall: async (entry) => `Installed ${entry.name} v${entry.version} (preview mock)`,
+    tasksList: async (root) => [
+      { id: "npm:dev", label: "npm: dev", command: "npm run dev", cwd: root, source: "npm", group: "run", problemMatcher: null },
+      { id: "npm:build", label: "npm: build", command: "npm run build", cwd: root, source: "npm", group: "build", problemMatcher: "$tsc" },
+      { id: "npm:test", label: "npm: test", command: "npm test", cwd: root, source: "npm", group: "test", problemMatcher: null },
+    ],
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -2877,6 +2883,7 @@ function showToast(msg) {
 // ---- advanced feature panels (workspace / remote / marketplace / debug) ----
 const FEATURE_TABS = [
   { id: "workspace", title: "Workspace", icon: "i-folder" },
+  { id: "tasks", title: "Tasks", icon: "i-play" },
   { id: "remote", title: "Remote", icon: "i-terminal" },
   { id: "marketplace", title: "Marketplace", icon: "i-ext" },
   { id: "conflicts", title: "Merge Conflicts", icon: "i-git" },
@@ -2941,6 +2948,7 @@ function renderFeaturePanel() {
   body.innerHTML = "";
   const renderers = {
     workspace: renderWorkspaceTool,
+    tasks: renderTasksTool,
     remote: renderRemoteTool,
     marketplace: renderMarketplaceTool,
     conflicts: renderConflictsTool,
@@ -3089,6 +3097,66 @@ async function runCurrentFile() {
   await openTerminal();
   writeToActiveTerminal(`\n${command}\n`);
   showToast(`Running ${basename(activePath)} in terminal`);
+}
+
+async function runTask(task) {
+  if (!task?.command) return;
+  await openTerminal();
+  const cwd = task.cwd || rootPath;
+  const prefix = cwd ? `cd ${shellQuote(cwd)} && ` : "";
+  writeToActiveTerminal(`\n${prefix}${task.command}\n`);
+  showToast(`Running task: ${task.label}`);
+}
+
+function renderTasksTool(body) {
+  createToolHeader(body, "Task Runner", "Discover npm, Cargo, Makefile, .michael/tasks.json, and .vscode/tasks.json tasks, then run them in the integrated terminal.");
+  const actions = document.createElement("div");
+  actions.className = "tool-actions";
+  const refresh = document.createElement("button");
+  refresh.className = "btn";
+  refresh.type = "button";
+  refresh.textContent = "Refresh";
+  actions.appendChild(refresh);
+  const list = document.createElement("div");
+  list.className = "tool-list";
+  body.append(actions, list);
+
+  const load = async () => {
+    list.innerHTML = "";
+    if (!rootPath) {
+      list.appendChild(createEmptyState("Open a workspace before running tasks."));
+      return;
+    }
+    list.appendChild(createEmptyState("Loading tasks…"));
+    try {
+      const tasks = await backend.tasksList(rootPath);
+      list.innerHTML = "";
+      if (!tasks.length) {
+        list.appendChild(createEmptyState("No tasks found. Add package.json scripts, Cargo.toml, Makefile, .michael/tasks.json, or .vscode/tasks.json."));
+        return;
+      }
+      for (const task of tasks) {
+        const card = document.createElement("div");
+        card.className = "tool-card";
+        card.innerHTML = `
+          <div class="tool-card__main">
+            <strong></strong>
+            <span></span>
+          </div>
+          <button class="btn btn--primary" type="button">Run</button>`;
+        card.querySelector("strong").textContent = task.label;
+        card.querySelector("span").textContent = `${task.source} · ${task.group} · ${task.command}`;
+        card.querySelector("button").addEventListener("click", () => runTask(task));
+        list.appendChild(card);
+      }
+    } catch (e) {
+      list.innerHTML = "";
+      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    }
+  };
+
+  refresh.addEventListener("click", load);
+  load();
 }
 
 function renderRemoteTool(body) {
@@ -3446,6 +3514,7 @@ function getMenus() {
       label: "Tools",
       items: [
         { label: "Run Current File", icon: "i-terminal", hint: "⌘R", action: () => runCurrentFile() },
+        { label: "Task Runner", icon: "i-play", action: () => openFeaturePanel("tasks") },
         { sep: true },
         { label: "Workspace Manager", icon: "i-folder", action: () => openFeaturePanel("workspace") },
         { label: "Remote Development", icon: "i-terminal", action: () => openFeaturePanel("remote") },
@@ -4335,6 +4404,7 @@ const palette = createCommandPalette({
     { id: "file.quickOpen", title: "Quick Open (⌘P)", category: t("menu.file"), run: () => qoOpen() },
     { id: "file.autoSave", title: "Toggle Auto Save", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
     { id: "code.runCurrentFile", title: "Run Current File", category: "Code", run: () => runCurrentFile() },
+    { id: "tasks.open", title: "Task Runner", category: "Tasks", run: () => openFeaturePanel("tasks") },
     { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
     { id: "view.terminal", title: t("menu.toggleTerminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },

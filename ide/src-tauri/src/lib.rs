@@ -5,6 +5,7 @@ mod files;
 mod git;
 mod lsp;
 mod marketplace;
+mod tasks;
 mod terminal;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -79,6 +80,7 @@ pub fn run() {
             marketplace::marketplace_list,
             marketplace::marketplace_install,
             marketplace::marketplace_search,
+            tasks::tasks_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");
