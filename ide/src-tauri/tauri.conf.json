@@ -5,8 +5,8 @@
   "identifier": "ai.devin.ide",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5174 --strictPort",
     "beforeBuildCommand": "npm run build"
   },
   "app": {
@@ -48,7 +48,7 @@
       "endpoints": [
         "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json"
       ],
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5QjAyOUI0QUYxRTA1RjkKUldUNUJSNnZ0Q213bWNhMkRoYVdWaTZRMVFub2YweFcvNHNmQzhTUVhrZVJUWVNHWkxPMlB1eUQK",
       "windows": {
         "installMode": "passive"
       }
