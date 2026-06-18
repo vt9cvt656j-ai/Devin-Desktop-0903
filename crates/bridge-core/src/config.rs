@@ -21,6 +21,13 @@ pub struct BridgeConfig {
     pub port: u16,
     /// When false, write/mkdir/delete endpoints are rejected.
     pub allow_write: bool,
+    /// Maximum requests per second. `0` disables rate limiting.
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: u64,
+}
+
+fn default_rate_limit() -> u64 {
+    100
 }
 
 impl BridgeConfig {
@@ -33,6 +40,7 @@ impl BridgeConfig {
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             allow_write: true,
+            rate_limit: default_rate_limit(),
         }
     }
 
@@ -53,6 +61,11 @@ impl BridgeConfig {
 
     pub fn read_only(mut self) -> Self {
         self.allow_write = false;
+        self
+    }
+
+    pub fn with_rate_limit(mut self, rps: u64) -> Self {
+        self.rate_limit = rps;
         self
     }
 }

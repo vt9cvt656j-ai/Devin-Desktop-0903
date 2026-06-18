@@ -303,3 +303,102 @@ pub fn search_in_project(
     results.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(results)
 }
+
+#[derive(Serialize)]
+pub struct ReplaceResult {
+    files_changed: usize,
+    replacements: usize,
+}
+
+/// Replace all occurrences of `query` with `replacement` in `file_path`.
+/// Returns the number of replacements made.
+#[tauri::command]
+pub fn replace_in_file(
+    file_path: String,
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+) -> Result<usize, String> {
+    let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
+    if bytes.iter().take(8000).any(|&b| b == 0) {
+        return Err("cannot replace in binary files".into());
+    }
+    let content = String::from_utf8_lossy(&bytes).to_string();
+    let (new_content, count) = if case_sensitive {
+        let c = content.matches(&query).count();
+        (content.replace(&query, &replacement), c)
+    } else {
+        let lower = content.to_lowercase();
+        let needle = query.to_lowercase();
+        let mut result = String::with_capacity(content.len());
+        let mut last = 0;
+        let mut found = 0;
+        while let Some(pos) = lower[last..].find(&needle) {
+            let abs = last + pos;
+            result.push_str(&content[last..abs]);
+            result.push_str(&replacement);
+            last = abs + query.len();
+            found += 1;
+        }
+        result.push_str(&content[last..]);
+        (result, found)
+    };
+    if count > 0 {
+        std::fs::write(&file_path, &new_content).map_err(|e| e.to_string())?;
+    }
+    Ok(count)
+}
+
+/// Replace all occurrences of `query` with `replacement` across the project.
+#[tauri::command]
+pub fn replace_in_project(
+    root: String,
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+) -> Result<ReplaceResult, String> {
+    if query.is_empty() {
+        return Ok(ReplaceResult { files_changed: 0, replacements: 0 });
+    }
+    let root_path = PathBuf::from(&root);
+    let mut files_changed = 0usize;
+    let mut replacements = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root_path];
+
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut children: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        children.sort();
+        for path in children {
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            if name.starts_with('.') { continue; }
+            if path.is_dir() {
+                if !IGNORED_DIRS.contains(&name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > SEARCH_MAX_FILE { continue; }
+            let path_str = path.to_string_lossy().to_string();
+            match replace_in_file(path_str, query.clone(), replacement.clone(), case_sensitive) {
+                Ok(c) if c > 0 => {
+                    files_changed += 1;
+                    replacements += c;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(ReplaceResult { files_changed, replacements })
+}

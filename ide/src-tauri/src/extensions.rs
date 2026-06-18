@@ -202,11 +202,40 @@ pub fn ext_list_installed(app: AppHandle) -> Result<Vec<InstalledExtension>, Str
     Ok(out)
 }
 
+/// Verify an extension is installed, enabled, and (optionally) holds a required
+/// permission before allowing the caller to proceed.
+fn require_active(
+    dir: &Path,
+    id: &str,
+    required_perm: Option<&str>,
+) -> Result<ExtensionManifest, String> {
+    let ext_dir = dir.join(id);
+    if !ext_dir.is_dir() {
+        return Err(format!("extension '{id}' is not installed"));
+    }
+    let state = load_state(dir);
+    if !*state.get(id).unwrap_or(&true) {
+        return Err(format!("extension '{id}' is disabled"));
+    }
+    let manifest = read_manifest(&ext_dir)?;
+    if let Some(perm) = required_perm {
+        if !manifest.permissions.iter().any(|p| p == perm) {
+            return Err(format!(
+                "extension '{id}' does not declare the '{perm}' permission"
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
 /// Read a UTF-8 asset (e.g. the entry script) from an installed extension.
+/// Rejects disabled extensions and enforces the declared permission model.
 #[tauri::command]
 pub fn ext_read_asset(app: AppHandle, id: String, rel: String) -> Result<String, String> {
     validate_id(&id)?;
-    let ext_dir = extensions_dir(&app)?.join(&id);
+    let dir = extensions_dir(&app)?;
+    require_active(&dir, &id, None)?;
+    let ext_dir = dir.join(&id);
     let target = safe_join(&ext_dir, &rel)?;
     let meta = fs::metadata(&target).map_err(|e| e.to_string())?;
     if meta.len() > MAX_ASSET {

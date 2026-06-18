@@ -123,7 +123,10 @@
       <!-- Center: tabs + editor -->
       <section class="editorwrap">
         <div class="tabs" id="tabs"></div>
-        <div class="editor" id="editor"></div>
+        <nav class="breadcrumb" id="breadcrumb" hidden aria-label="File path"></nav>
+        <div class="editor-container" id="editorContainer">
+          <div class="editor" id="editor"></div>
+        </div>
         <div class="diff-view" id="diffView" hidden>
           <div class="diff-view__head">
             <span class="diff-view__title">
@@ -160,11 +163,22 @@
         </div>
         <div class="terminal-panel" id="terminalPanel" hidden>
           <div class="terminal-panel__head">
+            <div class="term-traffic">
+              <button class="term-traffic__dot term-traffic__dot--close" id="termTrafficClose" type="button" title="Close terminal">
+                <svg viewBox="0 0 12 12"><path d="M3.5 3.5l5 5M8.5 3.5l-5 5" stroke="#4d0000" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
+              </button>
+              <button class="term-traffic__dot term-traffic__dot--minimize" type="button" title="Minimize">
+                <svg viewBox="0 0 12 12"><path d="M3 6h6" stroke="#995700" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
+              </button>
+              <button class="term-traffic__dot term-traffic__dot--maximize" type="button" title="Maximize">
+                <svg viewBox="0 0 12 12"><path d="M4.5 7.5L3 9h6L7.5 7.5M7.5 4.5L9 3H3l1.5 1.5" stroke="#006500" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+              </button>
+            </div>
             <span class="terminal-panel__title">
               <svg class="ic" aria-hidden="true"><use href="#i-terminal" /></svg>
               <span data-i18n="terminal.title">Terminal</span>
             </span>
-            <button class="terminal-panel__close" id="terminalClose" type="button" data-i18n-title="terminal.close" title="Close panel (⌃`)" aria-label="Close terminal">
+            <button class="terminal-panel__close" id="terminalClose" type="button" data-i18n-title="terminal.close" title="Close panel (⌃`)" aria-label="Close terminal" style="display:none">
               <svg class="ic"><use href="#i-close" /></svg>
             </button>
           </div>

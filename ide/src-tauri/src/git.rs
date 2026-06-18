@@ -368,6 +368,100 @@ pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, S
     Ok(entries)
 }
 
+/// List files with merge conflicts (unmerged entries in `git status`).
+#[derive(Serialize)]
+pub struct ConflictFile {
+    path: String,
+    rel: String,
+    name: String,
+}
+
+#[tauri::command]
+pub fn git_conflicts(root: String) -> Result<Vec<ConflictFile>, String> {
+    let out = run_git(&root, &["diff", "--name-only", "--diff-filter=U"])?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let root_path = PathBuf::from(&root);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let files: Vec<ConflictFile> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|rel| {
+            let abs = root_path.join(rel);
+            ConflictFile {
+                path: abs.to_string_lossy().to_string(),
+                name: Path::new(rel)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.to_string()),
+                rel: rel.to_string(),
+            }
+        })
+        .collect();
+    Ok(files)
+}
+
+/// Get the base, ours, and theirs versions for a conflicted file.
+#[derive(Serialize)]
+pub struct MergeVersions {
+    base: String,
+    ours: String,
+    theirs: String,
+    merged: String,
+}
+
+#[tauri::command]
+pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, String> {
+    let base = run_git(&root, &["show", &format!(":1:{rel}")])
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let ours = run_git(&root, &["show", &format!(":2:{rel}")])
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let theirs = run_git(&root, &["show", &format!(":3:{rel}")])
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let root_path = PathBuf::from(&root);
+    let merged = std::fs::read_to_string(root_path.join(&rel)).unwrap_or_default();
+    Ok(MergeVersions {
+        base,
+        ours,
+        theirs,
+        merged,
+    })
+}
+
+/// Accept one side of a merge conflict for a file.
+#[tauri::command]
+pub fn git_resolve_conflict(
+    root: String,
+    rel: String,
+    resolution: String,
+) -> Result<(), String> {
+    let root_path = PathBuf::from(&root);
+    let file_path = root_path.join(&rel);
+    match resolution.as_str() {
+        "ours" => {
+            let ours = run_git(&root, &["show", &format!(":2:{rel}")])
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .map_err(|e| format!("cannot get ours: {e}"))?;
+            std::fs::write(&file_path, &ours).map_err(|e| e.to_string())?;
+        }
+        "theirs" => {
+            let theirs = run_git(&root, &["show", &format!(":3:{rel}")])
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .map_err(|e| format!("cannot get theirs: {e}"))?;
+            std::fs::write(&file_path, &theirs).map_err(|e| e.to_string())?;
+        }
+        "manual" => {
+            // File was manually edited; just mark as resolved
+        }
+        _ => return Err(format!("unknown resolution: {resolution}")),
+    }
+    run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
+}
+
 /// Pull the current branch from its upstream (`git pull`).
 ///
 /// Returns combined stdout/stderr because git reports progress on stderr even

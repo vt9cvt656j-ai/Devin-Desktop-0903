@@ -14,6 +14,8 @@ import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
 import { createExtensionsPanel } from "./ext/panel.js";
 import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM } from "./i18n.js";
+import { load as loadStore } from "@tauri-apps/plugin-store";
+import { registerSnippetProviders } from "./snippets.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -86,6 +88,29 @@ async function tauriBackend() {
     gitCheckout: (root, branch, create) => core.invoke("git_checkout", { root, branch, create }),
     gitPull: (root) => core.invoke("git_pull", { root }),
     gitLog: (root, count) => core.invoke("git_log", { root, count }),
+    gitConflicts: (root) => core.invoke("git_conflicts", { root }),
+    gitMergeVersions: (root, rel) => core.invoke("git_merge_versions", { root, rel }),
+    gitResolveConflict: (root, rel, resolution) =>
+      core.invoke("git_resolve_conflict", { root, rel, resolution }),
+    lspList: () => core.invoke("lsp_list"),
+    lspStart: (config, onEvent) => {
+      const channel = new core.Channel();
+      channel.onmessage = onEvent;
+      return core.invoke("lsp_start", { config, onEvent: channel });
+    },
+    lspSend: (lang, message) => core.invoke("lsp_send", { lang, message }),
+    lspStop: (lang) => core.invoke("lsp_stop", { lang }),
+    dapList: () => core.invoke("dap_list"),
+    dapStart: (config, onEvent) => {
+      const channel = new core.Channel();
+      channel.onmessage = onEvent;
+      return core.invoke("dap_start", { config, onEvent: channel });
+    },
+    dapSend: (adapterId, message) => core.invoke("dap_send", { adapterId, message }),
+    dapStop: (adapterId) => core.invoke("dap_stop", { adapterId }),
+    marketplaceList: () => core.invoke("marketplace_list"),
+    marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
+    marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -151,6 +176,42 @@ function mockBackend() {
     { rel: "README.md", code: " M", label: "Modified", staged: false, deleted: false },
     { rel: "src/utils/format.js", code: "M ", label: "Modified", staged: true, deleted: false },
     { rel: "components/Card.js", code: "??", label: "Untracked", staged: false, deleted: false },
+  ];
+  const GIT_CONFLICTS = [
+    { rel: "src/utils/format.js", name: "format.js" },
+  ];
+  const MERGE_VERSIONS = {
+    "src/utils/format.js": {
+      base: "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
+      ours: "export function greet(name) {\n  const who = name?.trim() || \"world\";\n  return `Hello, ${who}!`;\n}\n",
+      theirs: "export function greet(name) {\n  return `Hi, ${name || \"friend\"}!`;\n}\n",
+      merged: "<<<<<<< HEAD\nexport function greet(name) {\n  const who = name?.trim() || \"world\";\n  return `Hello, ${who}!`;\n}\n=======\nexport function greet(name) {\n  return `Hi, ${name || \"friend\"}!`;\n}\n>>>>>>> feature/greeting\n",
+    },
+  };
+  FILES[ROOT + "/src/utils/format.js"] = MERGE_VERSIONS["src/utils/format.js"].merged;
+  const mockLspRunning = new Set();
+  const mockDapRunning = new Set();
+  const MARKETPLACE = [
+    {
+      id: "michael.theme-pack",
+      name: "Michael Theme Pack",
+      version: "1.2.0",
+      description: "A curated set of editor themes for Michael IDE.",
+      author: "Michael Labs",
+      download_url: "https://example.com/michael-theme-pack.zip",
+      tags: ["theme", "ui"],
+      downloads: 12840,
+    },
+    {
+      id: "michael.git-tools",
+      name: "Git Tools",
+      version: "0.4.1",
+      description: "Extra source-control commands and status-bar actions.",
+      author: "Michael Labs",
+      download_url: "https://example.com/git-tools.zip",
+      tags: ["git", "productivity"],
+      downloads: 7331,
+    },
   ];
   // Simulated branches for the browser preview's branch picker.
   let GIT_BRANCH = "main";
@@ -398,6 +459,49 @@ function mockBackend() {
       { hash: "a1b2c3d", short_hash: "a1b2c3d", author: "Michael", date: "2 hours ago", message: "Initial commit" },
       { hash: "e4f5g6h", short_hash: "e4f5g6h", author: "Michael", date: "1 day ago", message: "Add feature X" },
     ],
+    gitConflicts: async (root) => {
+      const prefix = root.endsWith("/") ? root : root + "/";
+      return GIT_CONFLICTS.map((c) => ({ ...c, path: prefix + c.rel }));
+    },
+    gitMergeVersions: async (_root, rel) => MERGE_VERSIONS[rel] || { base: "", ours: "", theirs: "", merged: "" },
+    gitResolveConflict: async (root, rel, resolution) => {
+      const prefix = root.endsWith("/") ? root : root + "/";
+      const versions = MERGE_VERSIONS[rel];
+      if (versions && resolution === "ours") FILES[prefix + rel] = versions.ours;
+      else if (versions && resolution === "theirs") FILES[prefix + rel] = versions.theirs;
+      GIT_CONFLICTS.splice(0, GIT_CONFLICTS.length, ...GIT_CONFLICTS.filter((c) => c.rel !== rel));
+    },
+    lspList: async () => ["typescript", "javascript", "rust", "python", "go", "html", "css", "json"]
+      .map((lang) => ({ lang, running: mockLspRunning.has(lang) })),
+    lspStart: async (config, onEvent) => {
+      mockLspRunning.add(config.lang);
+      onEvent?.({ kind: "started", lang: config.lang });
+    },
+    lspSend: async () => {},
+    lspStop: async (lang) => {
+      mockLspRunning.delete(lang);
+    },
+    dapList: async () => ["node", "python", "lldb", "go"]
+      .map((adapter) => ({ adapter, running: mockDapRunning.has(adapter) })),
+    dapStart: async (config, onEvent) => {
+      mockDapRunning.add(config.adapterId);
+      onEvent?.({ kind: "started", adapter: config.adapterId });
+    },
+    dapSend: async () => {},
+    dapStop: async (adapterId) => {
+      mockDapRunning.delete(adapterId);
+    },
+    marketplaceList: async () => [...MARKETPLACE],
+    marketplaceSearch: async (query) => {
+      const q = query.trim().toLowerCase();
+      if (!q) return [...MARKETPLACE];
+      return MARKETPLACE.filter((entry) =>
+        entry.name.toLowerCase().includes(q) ||
+        entry.description.toLowerCase().includes(q) ||
+        entry.tags.some((tag) => tag.toLowerCase().includes(q)),
+      );
+    },
+    marketplaceInstall: async (entry) => `Installed ${entry.name} v${entry.version} (preview mock)`,
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -482,29 +586,189 @@ const monacoEditor = monaco.editor.create(editorEl, {
   renderWhitespace: "selection",
   padding: { top: 10 },
 });
-const THEME_KEY = "michael-ide.theme";
-let currentTheme = localStorage.getItem(THEME_KEY) || "system";
 
-function applyEditorTheme() {
-  let dark;
-  if (currentTheme === "dark") dark = true;
-  else if (currentTheme === "light") dark = false;
-  else dark = matchMedia("(prefers-color-scheme: dark)").matches;
+let splitEditor = null;
+const editorContainer = $("editorContainer");
 
-  monaco.editor.setTheme(dark ? "vs-dark" : "vs");
-  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+function toggleSplitEditor() {
+  if (splitEditor) {
+    splitEditor.dispose();
+    const splitDiv = document.getElementById("editorSplit");
+    if (splitDiv) splitDiv.remove();
+    splitEditor = null;
+    return;
+  }
+  if (!activePath) return;
+  const splitDiv = document.createElement("div");
+  splitDiv.id = "editorSplit";
+  splitDiv.className = "editor-split";
+  editorContainer.appendChild(splitDiv);
+  const f = openFiles.get(activePath);
+  if (!f) return;
+  splitEditor = monaco.editor.create(splitDiv, {
+    model: f.model,
+    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
+    automaticLayout: true,
+    fontSize: 13,
+    fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+    minimap: { enabled: false },
+    scrollBeyondLastLine: false,
+    renderWhitespace: "selection",
+    padding: { top: 10 },
+  });
 }
 
-function setTheme(theme) {
+const EDITOR_PREFS_KEY = "editor-prefs";
+let _editorPrefs = null;
+
+async function loadEditorPrefs() {
+  if (_editorPrefs) return _editorPrefs;
+  const store = await getStore();
+  _editorPrefs = (await store.get(EDITOR_PREFS_KEY)) || {};
+  // Migrate from localStorage
+  const oldTheme = localStorage.getItem("michael-ide.theme");
+  const oldAutoSave = localStorage.getItem("michael-ide.autosave");
+  if (oldTheme && !_editorPrefs.theme) {
+    _editorPrefs.theme = oldTheme;
+    localStorage.removeItem("michael-ide.theme");
+  }
+  if (oldAutoSave !== null && _editorPrefs.autoSave === undefined) {
+    _editorPrefs.autoSave = oldAutoSave !== "false";
+    localStorage.removeItem("michael-ide.autosave");
+  }
+  return _editorPrefs;
+}
+
+async function saveEditorPrefs() {
+  const store = await getStore();
+  await store.set(EDITOR_PREFS_KEY, _editorPrefs);
+  await store.save();
+}
+
+let currentTheme = "system";
+
+monaco.editor.defineTheme("monokai", {
+  base: "vs-dark",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "75715E", fontStyle: "italic" },
+    { token: "keyword", foreground: "F92672" },
+    { token: "string", foreground: "E6DB74" },
+    { token: "number", foreground: "AE81FF" },
+    { token: "type", foreground: "66D9EF", fontStyle: "italic" },
+    { token: "function", foreground: "A6E22E" },
+    { token: "variable", foreground: "F8F8F2" },
+  ],
+  colors: {
+    "editor.background": "#272822",
+    "editor.foreground": "#F8F8F2",
+    "editor.selectionBackground": "#49483E",
+    "editor.lineHighlightBackground": "#3E3D32",
+    "editorCursor.foreground": "#F8F8F0",
+    "editorWhitespace.foreground": "#3B3A32",
+  },
+});
+
+monaco.editor.defineTheme("github-light", {
+  base: "vs",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "6A737D", fontStyle: "italic" },
+    { token: "keyword", foreground: "D73A49" },
+    { token: "string", foreground: "032F62" },
+    { token: "number", foreground: "005CC5" },
+    { token: "type", foreground: "6F42C1" },
+    { token: "function", foreground: "6F42C1" },
+    { token: "variable", foreground: "24292E" },
+  ],
+  colors: {
+    "editor.background": "#FFFFFF",
+    "editor.foreground": "#24292E",
+    "editor.selectionBackground": "#C8E1FF",
+    "editor.lineHighlightBackground": "#F6F8FA",
+  },
+});
+
+monaco.editor.defineTheme("solarized-dark", {
+  base: "vs-dark",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "586E75", fontStyle: "italic" },
+    { token: "keyword", foreground: "859900" },
+    { token: "string", foreground: "2AA198" },
+    { token: "number", foreground: "D33682" },
+    { token: "type", foreground: "B58900" },
+    { token: "function", foreground: "268BD2" },
+    { token: "variable", foreground: "839496" },
+  ],
+  colors: {
+    "editor.background": "#002B36",
+    "editor.foreground": "#839496",
+    "editor.selectionBackground": "#073642",
+    "editor.lineHighlightBackground": "#073642",
+  },
+});
+
+monaco.editor.defineTheme("nord", {
+  base: "vs-dark",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "616E88", fontStyle: "italic" },
+    { token: "keyword", foreground: "81A1C1" },
+    { token: "string", foreground: "A3BE8C" },
+    { token: "number", foreground: "B48EAD" },
+    { token: "type", foreground: "8FBCBB" },
+    { token: "function", foreground: "88C0D0" },
+    { token: "variable", foreground: "D8DEE9" },
+  ],
+  colors: {
+    "editor.background": "#2E3440",
+    "editor.foreground": "#D8DEE9",
+    "editor.selectionBackground": "#434C5E",
+    "editor.lineHighlightBackground": "#3B4252",
+  },
+});
+
+const THEME_MAP = {
+  light: { monaco: "vs", css: "light" },
+  dark: { monaco: "vs-dark", css: "dark" },
+  monokai: { monaco: "monokai", css: "dark" },
+  "github-light": { monaco: "github-light", css: "light" },
+  "solarized-dark": { monaco: "solarized-dark", css: "dark" },
+  nord: { monaco: "nord", css: "dark" },
+};
+
+function applyEditorTheme() {
+  let resolved = currentTheme;
+  if (resolved === "system") {
+    resolved = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  const mapping = THEME_MAP[resolved] || THEME_MAP.dark;
+  monaco.editor.setTheme(mapping.monaco);
+  document.documentElement.setAttribute("data-theme", mapping.css);
+}
+
+async function setTheme(theme) {
   currentTheme = theme;
-  localStorage.setItem(THEME_KEY, theme);
+  if (_editorPrefs) {
+    _editorPrefs.theme = theme;
+    await saveEditorPrefs();
+  }
   applyEditorTheme();
+  const th = termTheme();
   for (const tab of (typeof termTabs !== "undefined" ? termTabs : [])) {
-    tab.term.options.theme = termTheme();
+    tab.term.options.theme = th;
+  }
+  const termBodyEl = document.getElementById("terminalBody");
+  if (termBodyEl) {
+    termBodyEl.querySelectorAll(".xterm, .xterm-viewport, .xterm-screen").forEach(el => {
+      el.style.backgroundColor = th.background;
+    });
   }
 }
 
 applyEditorTheme();
+registerSnippetProviders();
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   applyEditorTheme();
@@ -611,6 +875,41 @@ function activate(path) {
   saveBtn.disabled = !f.dirty;
   $("windowTitle").textContent = f.name + " — Michael IDE";
   refreshGutter();
+  updateBreadcrumb(path);
+}
+
+function updateBreadcrumb(path) {
+  const bc = $("breadcrumb");
+  if (!path) { bc.hidden = true; return; }
+  bc.hidden = false;
+  bc.innerHTML = "";
+  const rel = rootPath ? path.replace(rootPath, "").replace(/^\//, "") : path;
+  const segments = rel.split("/").filter(Boolean);
+  segments.forEach((seg, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "breadcrumb__sep";
+      sep.textContent = "›";
+      bc.appendChild(sep);
+    }
+    const el = document.createElement("span");
+    el.className = "breadcrumb__seg";
+    el.textContent = seg;
+    if (i < segments.length - 1) {
+      const partial = rootPath + "/" + segments.slice(0, i + 1).join("/");
+      el.addEventListener("click", () => revealInTree(partial));
+    }
+    bc.appendChild(el);
+  });
+}
+
+function revealInTree(path) {
+  const item = document.querySelector(`.tree-item[data-path="${CSS.escape(path)}"]`);
+  if (item) {
+    item.scrollIntoView({ block: "center" });
+    item.classList.add("flash");
+    setTimeout(() => item.classList.remove("flash"), 600);
+  }
 }
 
 function closeFile(path) {
@@ -628,6 +927,7 @@ function closeFile(path) {
       saveBtn.disabled = true;
       $("windowTitle").textContent = "Michael IDE";
       refreshGutter();
+      updateBreadcrumb(null);
     }
   }
   renderTabs();
@@ -654,11 +954,15 @@ async function saveActive() {
   }
 }
 
+let dragSrcPath = null;
+
 function renderTabs() {
   tabsEl.innerHTML = "";
   for (const [path, f] of openFiles) {
     const tab = document.createElement("div");
     tab.className = "tab" + (path === activePath ? " is-active" : "") + (f.dirty ? " dirty" : "");
+    tab.draggable = true;
+    tab.dataset.path = path;
     tab.innerHTML =
       `${iconImg(fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
@@ -668,12 +972,43 @@ function renderTabs() {
       e.stopPropagation();
       closeFile(path);
     });
+    tab.addEventListener("dragstart", (e) => {
+      dragSrcPath = path;
+      tab.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+    tab.addEventListener("dragend", () => {
+      dragSrcPath = null;
+      tab.classList.remove("dragging");
+      tabsEl.querySelectorAll(".tab").forEach(t => t.classList.remove("drag-over"));
+    });
+    tab.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      tab.classList.add("drag-over");
+    });
+    tab.addEventListener("dragleave", () => tab.classList.remove("drag-over"));
+    tab.addEventListener("drop", (e) => {
+      e.preventDefault();
+      tab.classList.remove("drag-over");
+      if (!dragSrcPath || dragSrcPath === path) return;
+      const entries = [...openFiles.entries()];
+      const srcIdx = entries.findIndex(([p]) => p === dragSrcPath);
+      const dstIdx = entries.findIndex(([p]) => p === path);
+      if (srcIdx < 0 || dstIdx < 0) return;
+      const [moved] = entries.splice(srcIdx, 1);
+      entries.splice(dstIdx, 0, moved);
+      openFiles.clear();
+      for (const [p, v] of entries) openFiles.set(p, v);
+      renderTabs();
+    });
     tabsEl.appendChild(tab);
   }
 }
 
 // ---- file tree ----
 let rootPath = null;
+let workspaceRoots = [];
 
 function iconSvg(id, cls = "") {
   return `<svg class="ic ${cls}"><use href="#${id}" /></svg>`;
@@ -808,18 +1143,79 @@ function setExplorerToolsEnabled(on) {
 
 const parentDir = (p) => p.slice(0, p.lastIndexOf("/")) || "/";
 
-async function openFolder(path) {
+function basename(path) {
+  return path.split("/").filter(Boolean).pop() || path;
+}
+
+function setActiveWorkspaceRoot(path) {
   rootPath = path;
-  rootNameEl.textContent = path.split("/").filter(Boolean).pop() || path;
-  rootNameEl.title = path;
+  if (workspaceRoots.length > 1) {
+    rootNameEl.textContent = `${workspaceRoots.length} folders`;
+    rootNameEl.title = workspaceRoots.join("\n");
+  } else {
+    rootNameEl.textContent = basename(path);
+    rootNameEl.title = path;
+  }
+  setExplorerToolsEnabled(Boolean(path));
+}
+
+async function renderWorkspaceRoots() {
   dirNodes.clear();
   treeEl.innerHTML = "";
   rootContainer = document.createElement("div");
   treeEl.appendChild(rootContainer);
-  setExplorerToolsEnabled(true);
-  await renderChildren(path, rootContainer);
+
+  for (const root of workspaceRoots) {
+    const section = document.createElement("div");
+    section.className = "workspace-root";
+
+    const row = document.createElement("div");
+    row.className = "row workspace-root__row" + (root === rootPath ? " is-active" : "");
+    row.dataset.path = root;
+    row.innerHTML = `${iconImg(folderIconUrl(basename(root), true), "folder-ic")}<span class="name"></span><span class="workspace-root__path"></span>`;
+    row.querySelector(".name").textContent = basename(root);
+    row.querySelector(".workspace-root__path").textContent = root;
+    row.title = root;
+    row.addEventListener("click", async () => {
+      if (root !== rootPath) {
+        setActiveWorkspaceRoot(root);
+        await refreshGitStatus();
+        preloadProjectModels(root);
+        renderTreeActive();
+      }
+    });
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openContextMenu(e.clientX, e.clientY, { path: root, name: basename(root), is_dir: true });
+    });
+
+    const kids = document.createElement("div");
+    kids.className = "children workspace-root__children";
+    section.append(row, kids);
+    rootContainer.appendChild(section);
+    await renderChildren(root, kids);
+  }
   renderTreeActive();
+}
+
+async function openFolder(path) {
+  workspaceRoots = [path];
+  setActiveWorkspaceRoot(path);
+  await renderWorkspaceRoots();
   preloadProjectModels(path);
+  await refreshGitStatus();
+}
+
+async function addFolderToWorkspace() {
+  const picked = await backend.pickFolder();
+  if (!picked) return;
+  if (!workspaceRoots.includes(picked)) workspaceRoots.push(picked);
+  setActiveWorkspaceRoot(picked);
+  await renderWorkspaceRoots();
+  preloadProjectModels(picked);
+  await refreshGitStatus();
+  showToast(`Added ${basename(picked)} to workspace`);
 }
 
 // Eagerly load the workspace's JS/TS/JSON files into the TypeScript language
@@ -1032,12 +1428,8 @@ async function renderChildren(path, container) {
 /** Re-read a directory and re-render its children (root or any expanded dir). */
 async function reloadDir(path) {
   if (!rootPath) return;
-  if (path === rootPath) {
-    dirNodes.clear();
-    treeEl.innerHTML = "";
-    rootContainer = document.createElement("div");
-    treeEl.appendChild(rootContainer);
-    await renderChildren(path, rootContainer);
+  if (workspaceRoots.includes(path)) {
+    await renderWorkspaceRoots();
     renderTreeActive();
     return;
   }
@@ -2093,16 +2485,48 @@ function closeDiffView() {
 }
 
 // ---- AI assistant ----
-const CFG_KEY = "devin-ide.ai-config";
-function loadConfig() {
-  try {
-    return JSON.parse(localStorage.getItem(CFG_KEY)) || {};
-  } catch {
-    return {};
-  }
+const CFG_KEY = "ai-config";
+let _cfgCache = null;
+let _store = null;
+
+async function getStore() {
+  if (!_store) _store = await loadStore("settings.json");
+  return _store;
 }
-function saveConfig(c) {
-  localStorage.setItem(CFG_KEY, JSON.stringify(c));
+
+async function migrateFromLocalStorage() {
+  const OLD_KEY = "devin-ide.ai-config";
+  const raw = localStorage.getItem(OLD_KEY);
+  if (!raw) return;
+  try {
+    const old = JSON.parse(raw);
+    if (old && (old.baseUrl || old.apiKey || old.model)) {
+      const store = await getStore();
+      await store.set(CFG_KEY, old);
+      await store.save();
+      _cfgCache = old;
+      localStorage.removeItem(OLD_KEY);
+    }
+  } catch { /* ignore corrupt legacy data */ }
+}
+
+function loadConfig() {
+  return _cfgCache || {};
+}
+
+async function loadConfigAsync() {
+  if (_cfgCache) return _cfgCache;
+  await migrateFromLocalStorage();
+  const store = await getStore();
+  _cfgCache = (await store.get(CFG_KEY)) || {};
+  return _cfgCache;
+}
+
+async function saveConfig(c) {
+  _cfgCache = c;
+  const store = await getStore();
+  await store.set(CFG_KEY, c);
+  await store.save();
 }
 function refreshModelBadge() {
   syncModelPicker();
@@ -2232,9 +2656,9 @@ function buildModelMenu() {
   modelMenu.appendChild(cfg);
 }
 
-function selectModel(model) {
+async function selectModel(model) {
   const c = loadConfig();
-  saveConfig({ ...c, model });
+  await saveConfig({ ...c, model });
   refreshModelBadge();
 }
 
@@ -2426,9 +2850,9 @@ function openSettings() {
   $("cfgModel").value = c.model || "gpt-4o-mini";
   settingsEl.showModal();
 }
-$("settingsForm").addEventListener("submit", (e) => {
+$("settingsForm").addEventListener("submit", async (e) => {
   if (e.submitter && e.submitter.value === "save") {
-    saveConfig({
+    await saveConfig({
       baseUrl: $("cfgBaseUrl").value.trim(),
       apiKey: $("cfgApiKey").value.trim(),
       model: $("cfgModel").value.trim(),
@@ -2445,6 +2869,452 @@ function showToast(msg) {
   toastEl.classList.add("is-visible");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastEl.classList.remove("is-visible"), 1900);
+}
+
+// ---- advanced feature panels (workspace / remote / marketplace / debug) ----
+const FEATURE_TABS = [
+  { id: "workspace", title: "Workspace", icon: "i-folder" },
+  { id: "remote", title: "Remote", icon: "i-terminal" },
+  { id: "marketplace", title: "Marketplace", icon: "i-ext" },
+  { id: "conflicts", title: "Merge Conflicts", icon: "i-git" },
+  { id: "debugger", title: "Debugger", icon: "i-code" },
+  { id: "lsp", title: "Language Servers", icon: "i-code" },
+];
+
+const featureOverlay = document.createElement("div");
+featureOverlay.className = "feature-panel";
+featureOverlay.hidden = true;
+featureOverlay.innerHTML = `
+  <div class="feature-panel__sheet" role="dialog" aria-label="Advanced tools">
+    <header class="feature-panel__head">
+      <div class="feature-panel__title">
+        <svg class="ic"><use href="#i-code" /></svg>
+        <span>Advanced Tools</span>
+      </div>
+      <button class="feature-panel__close" type="button" aria-label="Close">
+        <svg class="ic"><use href="#i-close" /></svg>
+      </button>
+    </header>
+    <div class="feature-panel__main">
+      <nav class="feature-panel__tabs" aria-label="Advanced tool tabs"></nav>
+      <section class="feature-panel__body"></section>
+    </div>
+  </div>`;
+document.body.appendChild(featureOverlay);
+
+let activeFeatureTab = "workspace";
+
+function featureBody() {
+  return featureOverlay.querySelector(".feature-panel__body");
+}
+
+function openFeaturePanel(tab = activeFeatureTab) {
+  activeFeatureTab = tab;
+  featureOverlay.hidden = false;
+  renderFeaturePanel();
+}
+
+function closeFeaturePanel() {
+  featureOverlay.hidden = true;
+}
+
+function renderFeaturePanel() {
+  const tabs = featureOverlay.querySelector(".feature-panel__tabs");
+  const body = featureBody();
+  tabs.innerHTML = "";
+  for (const tab of FEATURE_TABS) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "feature-tab" + (tab.id === activeFeatureTab ? " is-active" : "");
+    btn.innerHTML = `<svg class="ic"><use href="#${tab.icon}" /></svg><span></span>`;
+    btn.querySelector("span").textContent = tab.title;
+    btn.addEventListener("click", () => {
+      activeFeatureTab = tab.id;
+      renderFeaturePanel();
+    });
+    tabs.appendChild(btn);
+  }
+
+  body.innerHTML = "";
+  const renderers = {
+    workspace: renderWorkspaceTool,
+    remote: renderRemoteTool,
+    marketplace: renderMarketplaceTool,
+    conflicts: renderConflictsTool,
+    debugger: renderDebuggerTool,
+    lsp: renderLspTool,
+  };
+  renderers[activeFeatureTab]?.(body);
+}
+
+featureOverlay.querySelector(".feature-panel__close").addEventListener("click", closeFeaturePanel);
+featureOverlay.addEventListener("mousedown", (e) => {
+  if (e.target === featureOverlay) closeFeaturePanel();
+});
+window.addEventListener("keydown", (e) => {
+  if (!featureOverlay.hidden && e.key === "Escape") closeFeaturePanel();
+});
+
+function createToolHeader(body, title, desc) {
+  const head = document.createElement("div");
+  head.className = "tool-head";
+  head.innerHTML = `<h2></h2><p></p>`;
+  head.querySelector("h2").textContent = title;
+  head.querySelector("p").textContent = desc;
+  body.appendChild(head);
+}
+
+function createEmptyState(text) {
+  const el = document.createElement("div");
+  el.className = "tool-empty";
+  el.textContent = text;
+  return el;
+}
+
+function renderWorkspaceTool(body) {
+  createToolHeader(body, "Multi-root Workspace", "Add folders to one workspace, then switch which root powers Git, search, terminal, and language indexing.");
+  const actions = document.createElement("div");
+  actions.className = "tool-actions";
+  const add = document.createElement("button");
+  add.className = "btn btn--primary";
+  add.type = "button";
+  add.textContent = "Add Folder";
+  add.addEventListener("click", async () => {
+    await addFolderToWorkspace();
+    renderFeaturePanel();
+  });
+  actions.appendChild(add);
+  body.appendChild(actions);
+
+  const list = document.createElement("div");
+  list.className = "tool-list";
+  if (!workspaceRoots.length) {
+    list.appendChild(createEmptyState("Open a folder to start a workspace."));
+  }
+  for (const root of workspaceRoots) {
+    const card = document.createElement("div");
+    card.className = "tool-card" + (root === rootPath ? " is-active" : "");
+    card.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div><button class="btn" type="button"></button>`;
+    card.querySelector("strong").textContent = basename(root);
+    card.querySelector("span").textContent = root;
+    const btn = card.querySelector("button");
+    btn.textContent = root === rootPath ? "Active" : "Use Root";
+    btn.disabled = root === rootPath;
+    btn.addEventListener("click", async () => {
+      setActiveWorkspaceRoot(root);
+      await renderWorkspaceRoots();
+      preloadProjectModels(root);
+      await refreshGitStatus();
+      renderFeaturePanel();
+    });
+    list.appendChild(card);
+  }
+  body.appendChild(list);
+}
+
+function writeToActiveTerminal(data, tries = 30) {
+  const tab = typeof termTabs !== "undefined" && activeTermTab >= 0 ? termTabs[activeTermTab] : null;
+  if (tab?.backendId != null) {
+    backend.termWrite(tab.backendId, data);
+    return;
+  }
+  if (tries > 0) setTimeout(() => writeToActiveTerminal(data, tries - 1), 150);
+}
+
+function renderRemoteTool(body) {
+  createToolHeader(body, "Remote Development", "Create SSH terminal sessions tied to the current workspace. Use a mounted or synced path as a folder root when you need remote files in the editor.");
+  const form = document.createElement("div");
+  form.className = "tool-form";
+  form.innerHTML = `
+    <label><span>SSH target</span><input id="remoteTarget" spellcheck="false" placeholder="user@example.com" /></label>
+    <label><span>Remote path</span><input id="remotePath" spellcheck="false" placeholder="/home/user/project" /></label>
+    <div class="tool-actions"><button class="btn btn--primary" type="button" id="remoteConnect">Open SSH Terminal</button></div>
+    <p class="tool-note">For full remote file editing, mount the remote folder locally first, then add that mounted folder to the workspace.</p>`;
+  body.appendChild(form);
+  form.querySelector("#remoteConnect").addEventListener("click", async () => {
+    const target = form.querySelector("#remoteTarget").value.trim();
+    const remotePath = form.querySelector("#remotePath").value.trim();
+    if (!target) {
+      showToast("Enter an SSH target first.");
+      return;
+    }
+    if (!/^[A-Za-z0-9_.@%:+-]+$/.test(target)) {
+      showToast("SSH target contains unsupported characters.");
+      return;
+    }
+    await openTerminal();
+    const remoteCommand = remotePath ? ` 'cd ${remotePath.replace(/'/g, "'\\''")} && exec $SHELL -l'` : "";
+    writeToActiveTerminal(`ssh -t ${target}${remoteCommand}\n`);
+    showToast(`Opening SSH session for ${target}`);
+  });
+}
+
+function renderMarketplaceTool(body) {
+  createToolHeader(body, "Extension Marketplace", "Search the online registry and install extensions directly into Michael IDE.");
+  const box = document.createElement("div");
+  box.className = "tool-search";
+  box.innerHTML = `<input spellcheck="false" placeholder="Search extensions…" /><button class="btn" type="button">Search</button>`;
+  const list = document.createElement("div");
+  list.className = "tool-list";
+  body.append(box, list);
+
+  const load = async () => {
+    list.innerHTML = "";
+    list.appendChild(createEmptyState("Loading marketplace…"));
+    try {
+      const query = box.querySelector("input").value.trim();
+      const entries = query ? await backend.marketplaceSearch(query) : await backend.marketplaceList();
+      list.innerHTML = "";
+      if (!entries.length) list.appendChild(createEmptyState("No extensions found."));
+      for (const entry of entries) {
+        const card = document.createElement("div");
+        card.className = "tool-card";
+        card.innerHTML = `
+          <div class="tool-card__main">
+            <strong></strong>
+            <span></span>
+            <div class="tool-tags"></div>
+          </div>
+          <button class="btn btn--primary" type="button">Install</button>`;
+        card.querySelector("strong").textContent = `${entry.name} ${entry.version}`;
+        card.querySelector("span").textContent = `${entry.description} · ${entry.author} · ${entry.downloads || 0} downloads`;
+        card.querySelector(".tool-tags").textContent = (entry.tags || []).join("  ");
+        card.querySelector("button").addEventListener("click", async () => {
+          try {
+            const msg = await backend.marketplaceInstall(entry);
+            showToast(msg);
+            extPanel.refresh?.();
+          } catch (e) {
+            showToast(String(e && e.message ? e.message : e));
+          }
+        });
+        list.appendChild(card);
+      }
+    } catch (e) {
+      list.innerHTML = "";
+      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    }
+  };
+
+  box.querySelector("button").addEventListener("click", load);
+  box.querySelector("input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") load();
+  });
+  load();
+}
+
+function renderConflictsTool(body) {
+  createToolHeader(body, "Merge Conflict Resolver", "Review base, ours, theirs, and merged content, then accept a side or mark your manual edit as resolved.");
+  const list = document.createElement("div");
+  list.className = "tool-list";
+  const detail = document.createElement("div");
+  detail.className = "merge-detail";
+  body.append(list, detail);
+
+  const loadConflicts = async () => {
+    list.innerHTML = "";
+    detail.innerHTML = "";
+    if (!rootPath) {
+      list.appendChild(createEmptyState("Open a Git workspace first."));
+      return;
+    }
+    let conflicts = [];
+    try {
+      conflicts = await backend.gitConflicts(rootPath);
+    } catch (e) {
+      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+      return;
+    }
+    if (!conflicts.length) {
+      list.appendChild(createEmptyState("No merge conflicts found."));
+      return;
+    }
+    for (const file of conflicts) {
+      const row = document.createElement("button");
+      row.className = "tool-row";
+      row.type = "button";
+      row.innerHTML = `${iconImg(fileIconUrl(file.name))}<span></span>`;
+      row.querySelector("span").textContent = file.rel;
+      row.addEventListener("click", () => openConflictDetail(file, detail));
+      list.appendChild(row);
+    }
+    openConflictDetail(conflicts[0], detail);
+  };
+  loadConflicts();
+}
+
+async function openConflictDetail(file, detail) {
+  detail.innerHTML = "";
+  let versions;
+  try {
+    versions = await backend.gitMergeVersions(rootPath, file.rel);
+  } catch (e) {
+    detail.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    return;
+  }
+  const grid = document.createElement("div");
+  grid.className = "merge-grid";
+  const parts = [
+    ["Base", versions.base],
+    ["Ours", versions.ours],
+    ["Theirs", versions.theirs],
+  ];
+  for (const [title, text] of parts) {
+    const pane = document.createElement("div");
+    pane.className = "merge-pane";
+    pane.innerHTML = `<strong></strong><pre></pre>`;
+    pane.querySelector("strong").textContent = title;
+    pane.querySelector("pre").textContent = text || "(empty)";
+    grid.appendChild(pane);
+  }
+  const merged = document.createElement("textarea");
+  merged.className = "merge-editor";
+  merged.spellcheck = false;
+  merged.value = versions.merged || "";
+  const actions = document.createElement("div");
+  actions.className = "tool-actions";
+  const resolve = async (resolution) => {
+    try {
+      if (resolution === "manual") await backend.writeTextFile(file.path, merged.value);
+      await backend.gitResolveConflict(rootPath, file.rel, resolution);
+      showToast(`Resolved ${file.rel}`);
+      await afterWorktreeChange();
+      renderFeaturePanel();
+    } catch (e) {
+      showToast(String(e && e.message ? e.message : e));
+    }
+  };
+  for (const [label, resolution] of [["Accept Ours", "ours"], ["Accept Theirs", "theirs"], ["Mark Manual", "manual"]]) {
+    const btn = document.createElement("button");
+    btn.className = resolution === "manual" ? "btn btn--primary" : "btn";
+    btn.type = "button";
+    btn.textContent = label;
+    btn.addEventListener("click", () => resolve(resolution));
+    actions.appendChild(btn);
+  }
+  detail.append(grid, merged, actions);
+}
+
+function renderDebuggerTool(body) {
+  createToolHeader(body, "Debugger", "Start and stop DAP adapters. Custom command and args are supported when a default adapter is not enough.");
+  const form = document.createElement("div");
+  form.className = "tool-form";
+  form.innerHTML = `
+    <label><span>Adapter</span><select id="dapAdapter"><option>node</option><option>python</option><option>lldb</option><option>go</option></select></label>
+    <label><span>Custom command</span><input id="dapCommand" spellcheck="false" placeholder="leave empty for default adapter" /></label>
+    <label><span>Args</span><input id="dapArgs" spellcheck="false" placeholder="space separated" /></label>
+    <label><span>Working directory</span><input id="dapCwd" spellcheck="false" /></label>
+    <div class="tool-actions"><button class="btn btn--primary" id="dapStartBtn" type="button">Start</button><button class="btn" id="dapStopBtn" type="button">Stop</button><button class="btn" id="dapRefreshBtn" type="button">Refresh</button></div>
+    <div class="tool-list" id="dapList"></div>
+    <pre class="tool-log" id="dapLog"></pre>`;
+  body.appendChild(form);
+  form.querySelector("#dapCwd").value = rootPath || "";
+  const log = form.querySelector("#dapLog");
+  const refresh = async () => {
+    const list = form.querySelector("#dapList");
+    list.innerHTML = "";
+    try {
+      const adapters = await backend.dapList();
+      for (const item of adapters) {
+        const row = document.createElement("div");
+        row.className = "tool-card";
+        row.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div>`;
+        row.querySelector("strong").textContent = item.adapter;
+        row.querySelector("span").textContent = item.running ? "Running" : "Stopped";
+        list.appendChild(row);
+      }
+    } catch (e) {
+      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    }
+  };
+  form.querySelector("#dapStartBtn").addEventListener("click", async () => {
+    const adapterId = form.querySelector("#dapAdapter").value;
+    const command = form.querySelector("#dapCommand").value.trim();
+    const args = form.querySelector("#dapArgs").value.trim().split(/\s+/).filter(Boolean);
+    const cwd = form.querySelector("#dapCwd").value.trim() || null;
+    try {
+      await backend.dapStart({ adapterId, command, args, cwd }, (ev) => {
+        log.textContent += JSON.stringify(ev) + "\n";
+        log.scrollTop = log.scrollHeight;
+      });
+      showToast(`Debugger ${adapterId} started`);
+      refresh();
+    } catch (e) {
+      showToast(String(e && e.message ? e.message : e));
+    }
+  });
+  form.querySelector("#dapStopBtn").addEventListener("click", async () => {
+    const adapterId = form.querySelector("#dapAdapter").value;
+    try {
+      await backend.dapStop(adapterId);
+      showToast(`Debugger ${adapterId} stopped`);
+      refresh();
+    } catch (e) {
+      showToast(String(e && e.message ? e.message : e));
+    }
+  });
+  form.querySelector("#dapRefreshBtn").addEventListener("click", refresh);
+  refresh();
+}
+
+function renderLspTool(body) {
+  createToolHeader(body, "Language Servers", "Start and stop LSP servers for languages that need external intelligence beyond Monaco's built-in services.");
+  const form = document.createElement("div");
+  form.className = "tool-form";
+  form.innerHTML = `
+    <label><span>Language</span><select id="lspLang"><option>typescript</option><option>javascript</option><option>rust</option><option>python</option><option>go</option><option>html</option><option>css</option><option>json</option></select></label>
+    <label><span>Custom command</span><input id="lspCommand" spellcheck="false" placeholder="leave empty for default server" /></label>
+    <label><span>Args</span><input id="lspArgs" spellcheck="false" placeholder="space separated" /></label>
+    <div class="tool-actions"><button class="btn btn--primary" id="lspStartBtn" type="button">Start</button><button class="btn" id="lspStopBtn" type="button">Stop</button><button class="btn" id="lspRefreshBtn" type="button">Refresh</button></div>
+    <div class="tool-list" id="lspList"></div>
+    <pre class="tool-log" id="lspLog"></pre>`;
+  body.appendChild(form);
+  const log = form.querySelector("#lspLog");
+  const refresh = async () => {
+    const list = form.querySelector("#lspList");
+    list.innerHTML = "";
+    try {
+      const servers = await backend.lspList();
+      for (const item of servers) {
+        const row = document.createElement("div");
+        row.className = "tool-card";
+        row.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div>`;
+        row.querySelector("strong").textContent = item.lang;
+        row.querySelector("span").textContent = item.running ? "Running" : "Stopped";
+        list.appendChild(row);
+      }
+    } catch (e) {
+      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    }
+  };
+  form.querySelector("#lspStartBtn").addEventListener("click", async () => {
+    const lang = form.querySelector("#lspLang").value;
+    const command = form.querySelector("#lspCommand").value.trim();
+    const args = form.querySelector("#lspArgs").value.trim().split(/\s+/).filter(Boolean);
+    const rootUri = rootPath ? `file://${rootPath}` : "";
+    try {
+      await backend.lspStart({ lang, command, args, rootUri }, (ev) => {
+        log.textContent += JSON.stringify(ev) + "\n";
+        log.scrollTop = log.scrollHeight;
+      });
+      showToast(`LSP ${lang} started`);
+      refresh();
+    } catch (e) {
+      showToast(String(e && e.message ? e.message : e));
+    }
+  });
+  form.querySelector("#lspStopBtn").addEventListener("click", async () => {
+    const lang = form.querySelector("#lspLang").value;
+    try {
+      await backend.lspStop(lang);
+      showToast(`LSP ${lang} stopped`);
+      refresh();
+    } catch (e) {
+      showToast(String(e && e.message ? e.message : e));
+    }
+  });
+  form.querySelector("#lspRefreshBtn").addEventListener("click", refresh);
+  refresh();
 }
 
 // ---- titlebar menu bar (Cursor/Devin-style) ----
@@ -2469,11 +3339,12 @@ function getMenus() {
       label: t("menu.file"),
       items: [
         { label: t("menu.openFolder"), icon: "i-folder", hint: "⌘O", action: () => chooseFolder() },
-      { label: t("menu.save"), icon: "i-save", hint: "⌘S", action: () => saveActive() },
-      { sep: true },
-      { label: t("menu.closeFile"), icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
-      { sep: true },
-      { label: autoSaveEnabled ? "✓ Auto Save" : "  Auto Save", icon: "i-save", action: () => { toggleAutoSave(); buildMenubar(); } },
+        { label: "Add Folder to Workspace…", icon: "i-folder-open", action: () => addFolderToWorkspace() },
+        { label: t("menu.save"), icon: "i-save", hint: "⌘S", action: () => saveActive() },
+        { sep: true },
+        { label: t("menu.closeFile"), icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
+        { sep: true },
+        { label: autoSaveEnabled ? "✓ Auto Save" : "  Auto Save", icon: "i-save", action: () => { toggleAutoSave(); buildMenubar(); } },
       ],
     },
     {
@@ -2502,6 +3373,18 @@ function getMenus() {
       ],
     },
     {
+      label: "Tools",
+      items: [
+        { label: "Workspace Manager", icon: "i-folder", action: () => openFeaturePanel("workspace") },
+        { label: "Remote Development", icon: "i-terminal", action: () => openFeaturePanel("remote") },
+        { label: "Extension Marketplace", icon: "i-ext", action: () => openFeaturePanel("marketplace") },
+        { label: "Merge Conflicts", icon: "i-git", action: () => openFeaturePanel("conflicts") },
+        { sep: true },
+        { label: "Debugger", icon: "i-code", action: () => openFeaturePanel("debugger") },
+        { label: "Language Servers", icon: "i-code", action: () => openFeaturePanel("lsp") },
+      ],
+    },
+    {
       label: t("menu.help"),
       items: [
         { label: t("menu.documentation"), icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
@@ -2511,6 +3394,10 @@ function getMenus() {
         { sep: true },
         { label: t("theme.light"), icon: "i-sparkle", action: () => setTheme("light") },
         { label: t("theme.dark"), icon: "i-sparkle", action: () => setTheme("dark") },
+        { label: "Monokai", icon: "i-sparkle", action: () => setTheme("monokai") },
+        { label: "GitHub Light", icon: "i-sparkle", action: () => setTheme("github-light") },
+        { label: "Solarized Dark", icon: "i-sparkle", action: () => setTheme("solarized-dark") },
+        { label: "Nord", icon: "i-sparkle", action: () => setTheme("nord") },
         { label: t("theme.system"), icon: "i-sparkle", action: () => setTheme("system") },
       ],
     },
@@ -2805,8 +3692,7 @@ qoInput.addEventListener("keydown", (e) => {
 quickOpenOverlay.addEventListener("mousedown", (e) => { if (e.target === quickOpenOverlay) qoClose(); });
 
 // ---- auto-save ----
-const AUTOSAVE_KEY = "michael-ide.autosave";
-let autoSaveEnabled = localStorage.getItem(AUTOSAVE_KEY) !== "false";
+let autoSaveEnabled = true;
 let autoSaveTimer = null;
 
 function scheduleAutoSave() {
@@ -2828,9 +3714,12 @@ monacoEditor.onDidChangeModelContent(() => {
   scheduleAutoSave();
 });
 
-function toggleAutoSave() {
+async function toggleAutoSave() {
   autoSaveEnabled = !autoSaveEnabled;
-  localStorage.setItem(AUTOSAVE_KEY, String(autoSaveEnabled));
+  if (_editorPrefs) {
+    _editorPrefs.autoSave = autoSaveEnabled;
+    await saveEditorPrefs();
+  }
   showToast(autoSaveEnabled ? t("autosave.enabled") : t("autosave.disabled"));
 }
 
@@ -2911,30 +3800,71 @@ async function replaceInFiles(replaceAll) {
 replaceSingleBtn.addEventListener("click", () => replaceInFiles(false));
 replaceAllBtn.addEventListener("click", () => replaceInFiles(true));
 
+const DEFAULT_KEYBINDINGS = {
+  "ctrl+`": "terminal.toggle",
+  "mod+p": "file.quickOpen",
+  "mod+s": "file.save",
+  "mod+shift+e": "view.explorer",
+  "mod+shift+f": "view.search",
+  "ctrl+shift+g": "view.git",
+  "mod+shift+m": "view.problems",
+  "mod+shift+p": "commandPalette",
+  "mod+\\": "view.splitEditor",
+};
+
+let userKeybindings = {};
+
+async function loadKeybindings() {
+  const store = await getStore();
+  userKeybindings = (await store.get("keybindings")) || {};
+}
+
+async function saveKeybinding(combo, action) {
+  userKeybindings[combo] = action;
+  const store = await getStore();
+  await store.set("keybindings", userKeybindings);
+  await store.save();
+}
+
+function getKeybindings() {
+  return { ...DEFAULT_KEYBINDINGS, ...userKeybindings };
+}
+
+const KB_ACTIONS = {
+  "terminal.toggle": () => toggleTerminal(),
+  "file.quickOpen": () => qoOpen(),
+  "file.save": () => saveActive(),
+  "view.explorer": () => showSide("explorer"),
+  "view.search": () => showSide("search"),
+  "view.git": () => showSide("git"),
+  "view.problems": () => toggleProblems(),
+  "commandPalette": () => palette.open(),
+  "view.splitEditor": () => toggleSplitEditor(),
+};
+
+function keyCombo(e) {
+  const parts = [];
+  if (e.ctrlKey && !e.metaKey) parts.push("ctrl");
+  if (e.metaKey || (e.ctrlKey && !navigator.platform.match(/Mac/))) {
+    if (!parts.includes("ctrl")) parts.push("mod");
+  }
+  if (e.shiftKey) parts.push("shift");
+  if (e.altKey) parts.push("alt");
+  const key = e.key.toLowerCase();
+  if (!["control", "shift", "alt", "meta"].includes(key)) parts.push(key);
+  return parts.join("+");
+}
+
+loadKeybindings().catch(console.error);
+
 window.addEventListener("keydown", (e) => {
-  const mod = e.metaKey || e.ctrlKey;
-  if (e.ctrlKey && e.key === "`") {
-    e.preventDefault();
-    toggleTerminal();
-  } else if (mod && !e.shiftKey && e.key.toLowerCase() === "p") {
+  const combo = keyCombo(e);
+  const bindings = getKeybindings();
+  const action = bindings[combo];
+  if (action && KB_ACTIONS[action]) {
     e.preventDefault();
     e.stopPropagation();
-    qoOpen();
-  } else if (mod && !e.shiftKey && e.key.toLowerCase() === "s") {
-    e.preventDefault();
-    saveActive();
-  } else if (mod && e.shiftKey && e.key.toLowerCase() === "e") {
-    e.preventDefault();
-    showSide("explorer");
-  } else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
-    e.preventDefault();
-    showSide("search");
-  } else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "g") {
-    e.preventDefault();
-    showSide("git");
-  } else if (mod && e.shiftKey && e.key.toLowerCase() === "m") {
-    e.preventDefault();
-    toggleProblems();
+    KB_ACTIONS[action]();
   }
 });
 
@@ -2944,18 +3874,31 @@ const termBody = $("terminalBody");
 const editorwrapEl = document.querySelector(".editorwrap");
 
 function termTheme() {
-  const ansi = {
-    black:   "#3C3C43", red:     "#FF3B30", green:   "#28CD41", yellow:  "#FF9F0A",
-    blue:    "#007AFF", magenta: "#AF52DE", cyan:    "#59ADC4", white:   "#8E8E93",
-    brightBlack: "#636366", brightRed: "#FF6961", brightGreen: "#4CD964",
-    brightYellow: "#FFD60A", brightBlue: "#5AC8FA", brightMagenta: "#BF5AF2",
-    brightCyan: "#70D7FF", brightWhite: "#D1D1D6",
-  };
+  const isDark = document.documentElement.dataset.theme === "dark" ||
+    (document.documentElement.dataset.theme !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+
+  if (isDark) {
+    return {
+      background: "#1E1E1E", foreground: "#CCCCCC", cursor: "#AEAFAD",
+      cursorAccent: "#1E1E1E", selectionBackground: "rgba(255,255,255,0.18)",
+      selectionForeground: "#FFFFFF",
+      black: "#000000", red: "#CD3131", green: "#0DBC79", yellow: "#E5E510",
+      blue: "#2472C8", magenta: "#BC3FBC", cyan: "#11A8CD", white: "#E5E5E5",
+      brightBlack: "#666666", brightRed: "#F14C4C", brightGreen: "#23D18B",
+      brightYellow: "#F5F543", brightBlue: "#3B8EEA", brightMagenta: "#D670D6",
+      brightCyan: "#29B8DB", brightWhite: "#F5F5F5",
+    };
+  }
 
   return {
-    background: "#FFFFFF", foreground: "#1D1D1F", cursor: "#007AFF",
-    cursorAccent: "#FFFFFF", selectionBackground: "#B4D8FD",
-    selectionForeground: "#1D1D1F", ...ansi,
+    background: "#FFFFFF", foreground: "#383A42", cursor: "#526FFF",
+    cursorAccent: "#FFFFFF", selectionBackground: "rgba(0,122,255,0.12)",
+    selectionForeground: "#000000",
+    black: "#383A42", red: "#E45649", green: "#50A14F", yellow: "#C18401",
+    blue: "#4078F2", magenta: "#A626A4", cyan: "#0184BC", white: "#A0A1A7",
+    brightBlack: "#4F525E", brightRed: "#E06C75", brightGreen: "#98C379",
+    brightYellow: "#D19A66", brightBlue: "#61AFEF", brightMagenta: "#C678DD",
+    brightCyan: "#56B6C2", brightWhite: "#FAFAFA",
   };
 }
 
@@ -3030,16 +3973,19 @@ async function createTermTab() {
 
   const term = new Terminal({
     fontSize: 13,
-    fontFamily: "Menlo, SF Mono, ui-monospace, monospace",
+    fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
     fontWeight: "normal",
     fontWeightBold: "bold",
-    lineHeight: 1.2,
-    letterSpacing: 0.5,
+    lineHeight: 1.35,
+    letterSpacing: 0.3,
     theme: termTheme(),
     cursorBlink: true,
-    cursorStyle: "block",
+    cursorStyle: "bar",
+    cursorWidth: 2,
     scrollback: 10000,
     allowProposedApi: true,
+    drawBoldTextInBrightColors: false,
+    minimumContrastRatio: 4.5,
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
@@ -3047,6 +3993,8 @@ async function createTermTab() {
   termResizeObserver.observe(container);
 
   let backendId = null;
+  let initDone = false;
+  let initBuffer = "";
   const entry = { term, fit, container, label, backendId, opening: false };
   termTabs.push(entry);
 
@@ -3060,51 +4008,28 @@ async function createTermTab() {
     entry.backendId = await backend.termOpen(
       { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
       (ev) => {
-        if (ev.kind === "data") term.write(ev.data);
-        else if (ev.kind === "exit") {
+        if (ev.kind === "data") {
+          if (!initDone) {
+            initBuffer += ev.data;
+            return;
+          }
+          term.write(ev.data);
+        } else if (ev.kind === "exit") {
           term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
           entry.backendId = null;
         }
       },
     );
-    setTimeout(() => {
+    const finishInit = () => {
+      if (initDone) return;
+      term.reset();
+      term.write("\x1b[0m\x1b[?25h");
+      initDone = true;
       if (entry.backendId != null) {
-        const lines = [
-          "export PROMPT='%F{34}%n@%m%f %F{33}%1~%f %F{default}%#%f '",
-          "export ZSH_HIGHLIGHT_HIGHLIGHTERS=(main brackets pattern)",
-          "typeset -A ZSH_HIGHLIGHT_STYLES",
-          "ZSH_HIGHLIGHT_STYLES[command]='fg=blue,bold'",
-          "ZSH_HIGHLIGHT_STYLES[builtin]='fg=blue,bold'",
-          "ZSH_HIGHLIGHT_STYLES[alias]='fg=blue,bold'",
-          "ZSH_HIGHLIGHT_STYLES[function]='fg=blue,bold'",
-          "ZSH_HIGHLIGHT_STYLES[unknown-token]='fg=red'",
-          "ZSH_HIGHLIGHT_STYLES[reserved-word]='fg=magenta,bold'",
-          "ZSH_HIGHLIGHT_STYLES[single-hyphen-option]='fg=cyan'",
-          "ZSH_HIGHLIGHT_STYLES[double-hyphen-option]='fg=cyan'",
-          "ZSH_HIGHLIGHT_STYLES[path]='fg=yellow'",
-          "ZSH_HIGHLIGHT_STYLES[globbing]='fg=magenta'",
-          "ZSH_HIGHLIGHT_STYLES[single-quoted-argument]='fg=green'",
-          "ZSH_HIGHLIGHT_STYLES[double-quoted-argument]='fg=green'",
-          "ZSH_HIGHLIGHT_STYLES[dollar-quoted-argument]='fg=green'",
-          "ZSH_HIGHLIGHT_STYLES[back-quoted-argument]='fg=cyan'",
-          "ZSH_HIGHLIGHT_STYLES[commandseparator]='fg=magenta,bold'",
-          "ZSH_HIGHLIGHT_STYLES[redirection]='fg=magenta,bold'",
-          "ZSH_HIGHLIGHT_STYLES[assign]='fg=yellow'",
-          "autoload -Uz compinit && compinit -u 2>/dev/null",
-          "zstyle ':completion:*' menu select",
-          "zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'",
-          "zstyle ':completion:*:descriptions' format '%F{blue}-- %d --%f'",
-          "zstyle ':completion:*:warnings' format '%F{red}no matches%f'",
-          "[ -f /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
-          "[ -f /usr/local/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /usr/local/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
-          "alias ls='ls -G'",
-          "alias ll='ls -lhG'",
-          "alias la='ls -lahG'",
-          "clear",
-        ];
-        backend.termWrite(entry.backendId, " " + lines.join("; ") + "\n");
+        backend.termWrite(entry.backendId, " clear\n");
       }
-    }, 300);
+    };
+    setTimeout(finishInit, 1500);
   } catch (err) {
     term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
   } finally {
@@ -3166,6 +4091,7 @@ function toggleTerminal() {
 }
 
 $("terminalClose")?.addEventListener("click", closeTerminal);
+$("termTrafficClose")?.addEventListener("click", closeTerminal);
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
 window.addEventListener("beforeunload", () => {
   for (const tab of termTabs) {
@@ -3329,11 +4255,19 @@ const palette = createCommandPalette({
   getCommands: () => [
     { id: "file.save", title: t("menu.save"), category: t("menu.file"), run: () => saveActive() },
     { id: "file.openFolder", title: t("menu.openFolder"), category: t("menu.file"), run: () => chooseFolder() },
+    { id: "workspace.addFolder", title: "Add Folder to Workspace", category: "Workspace", run: () => addFolderToWorkspace() },
+    { id: "workspace.manager", title: "Workspace Manager", category: "Workspace", run: () => openFeaturePanel("workspace") },
     { id: "file.quickOpen", title: "Quick Open (⌘P)", category: t("menu.file"), run: () => qoOpen() },
     { id: "file.autoSave", title: "Toggle Auto Save", category: t("menu.file"), run: () => { toggleAutoSave(); buildMenubar(); } },
     { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
     { id: "view.terminal", title: t("menu.toggleTerminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
+    { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
+    { id: "remote.open", title: "Remote Development", category: "Tools", run: () => openFeaturePanel("remote") },
+    { id: "marketplace.open", title: "Extension Marketplace", category: "Tools", run: () => openFeaturePanel("marketplace") },
+    { id: "git.conflicts", title: "Resolve Merge Conflicts", category: "Tools", run: () => openFeaturePanel("conflicts") },
+    { id: "debug.open", title: "Debugger", category: "Tools", run: () => openFeaturePanel("debugger") },
+    { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
     { id: "ai.settings", title: t("menu.aiSettings"), category: "Preferences", run: () => openSettings() },
     ...extHost.listCommands().map((c) => ({
       ...c,
@@ -3368,6 +4302,14 @@ window.addEventListener(
 })();
 
 initLocale();
-refreshModelBadge();
+Promise.all([
+  loadConfigAsync().then(() => refreshModelBadge()),
+  loadEditorPrefs().then((prefs) => {
+    if (prefs.theme) { currentTheme = prefs.theme; applyEditorTheme(); }
+    if (prefs.autoSave !== undefined) autoSaveEnabled = prefs.autoSave;
+    if (prefs.fontSize) monacoEditor.updateOptions({ fontSize: prefs.fontSize });
+    if (prefs.wordWrap) monacoEditor.updateOptions({ wordWrap: prefs.wordWrap });
+  }),
+]).catch(console.error);
 showChatHint();
 syncWelcome();

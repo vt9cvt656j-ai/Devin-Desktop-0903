@@ -1,7 +1,10 @@
 mod ai;
+mod debug;
 mod extensions;
 mod files;
 mod git;
+mod lsp;
+mod marketplace;
 mod terminal;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -15,7 +18,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            Ok(())
+        })
         .manage(terminal::TerminalState::default())
+        .manage(lsp::LspManager::default())
+        .manage(debug::DebugManager::default())
         .invoke_handler(tauri::generate_handler![
             files::read_dir,
             files::read_text_file,
@@ -26,6 +39,8 @@ pub fn run() {
             files::rename_path,
             files::delete_path,
             files::search_in_project,
+            files::replace_in_file,
+            files::replace_in_project,
             git::git_status,
             git::git_file_head,
             git::git_stage,
@@ -37,6 +52,9 @@ pub fn run() {
             git::git_branches,
             git::git_checkout,
             git::git_pull,
+            git::git_conflicts,
+            git::git_merge_versions,
+            git::git_resolve_conflict,
             git::git_log,
             ai::ai_chat,
             extensions::ext_list_installed,
@@ -50,6 +68,17 @@ pub fn run() {
             terminal::term_write,
             terminal::term_resize,
             terminal::term_close,
+            lsp::lsp_start,
+            lsp::lsp_send,
+            lsp::lsp_stop,
+            lsp::lsp_list,
+            debug::dap_start,
+            debug::dap_send,
+            debug::dap_stop,
+            debug::dap_list,
+            marketplace::marketplace_list,
+            marketplace::marketplace_install,
+            marketplace::marketplace_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");

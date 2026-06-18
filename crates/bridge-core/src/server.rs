@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -18,12 +19,53 @@ use crate::config::BridgeConfig;
 use crate::error::BridgeError;
 use crate::fs::ScopedFs;
 
+/// Token-bucket rate limiter that refills once per second.
+#[derive(Clone)]
+pub struct RateLimiter {
+    tokens: Arc<AtomicU64>,
+}
+
+impl RateLimiter {
+    fn new(max_per_second: u64) -> Self {
+        let limiter = Self {
+            tokens: Arc::new(AtomicU64::new(max_per_second)),
+        };
+        let tokens = limiter.tokens.clone();
+        let cap = max_per_second;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                tokens.store(cap, Ordering::Relaxed);
+            }
+        });
+        limiter
+    }
+
+    fn try_acquire(&self) -> bool {
+        loop {
+            let current = self.tokens.load(Ordering::Relaxed);
+            if current == 0 {
+                return false;
+            }
+            if self
+                .tokens
+                .compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
 /// Shared, cloneable application state.
 #[derive(Clone)]
 pub struct AppState {
     pub fs: ScopedFs,
     pub token: Arc<String>,
     pub allow_write: bool,
+    pub rate_limiter: Option<RateLimiter>,
 }
 
 impl IntoResponse for BridgeError {
@@ -50,6 +92,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/write", post(write))
         .route("/api/mkdir", post(mkdir))
         .route("/api/delete", post(delete))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(cors)
         .with_state(state)
@@ -68,10 +111,16 @@ pub async fn serve_with_shutdown(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let fs = ScopedFs::new(&config.root)?;
+    let rate_limiter = if config.rate_limit > 0 {
+        Some(RateLimiter::new(config.rate_limit))
+    } else {
+        None
+    };
     let state = AppState {
         fs,
         token: Arc::new(config.token.clone()),
         allow_write: config.allow_write,
+        rate_limiter,
     };
     let listener = tokio::net::TcpListener::bind((config.host, config.port)).await?;
     let addr = listener.local_addr()?;
@@ -100,6 +149,28 @@ async fn auth(
         )
             .into_response(),
     }
+}
+
+async fn rate_limit(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(ref limiter) = state.rate_limiter {
+        if !limiter.try_acquire() {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": {
+                        "code": "rate_limited",
+                        "message": "too many requests — try again in a moment"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
