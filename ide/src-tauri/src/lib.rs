@@ -81,6 +81,7 @@ pub fn run() {
             marketplace::marketplace_install,
             marketplace::marketplace_search,
             tasks::tasks_list,
+            tasks::task_run_capture,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");

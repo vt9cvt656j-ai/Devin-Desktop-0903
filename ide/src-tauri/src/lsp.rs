@@ -43,6 +43,8 @@ const KNOWN_SERVERS: &[(&str, &str, &[&str])] = &[
     ("rust", "rust-analyzer", &[]),
     ("python", "pyright-langserver", &["--stdio"]),
     ("go", "gopls", &["serve"]),
+    ("c", "clangd", &[]),
+    ("cpp", "clangd", &[]),
     ("html", "vscode-html-language-server", &["--stdio"]),
     ("css", "vscode-css-language-server", &["--stdio"]),
     ("json", "vscode-json-language-server", &["--stdio"]),

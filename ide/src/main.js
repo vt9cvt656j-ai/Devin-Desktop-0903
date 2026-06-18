@@ -16,6 +16,8 @@ import { createExtensionsPanel } from "./ext/panel.js";
 import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM } from "./i18n.js";
 import { load as loadStore } from "@tauri-apps/plugin-store";
 import { registerSnippetProviders } from "./snippets.js";
+import { createLspManager } from "./lsp-client.js";
+import { parseProblems } from "./problem-matchers.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -61,6 +63,9 @@ if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
   document.body.classList.add("is-mac");
 }
 const backend = inTauri ? await tauriBackend() : mockBackend();
+
+// Real LSP client manager (wired up after the workspace state exists below).
+let lspManager = null;
 
 async function tauriBackend() {
   const core = await import("@tauri-apps/api/core");
@@ -112,6 +117,7 @@ async function tauriBackend() {
     marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
     marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
     tasksList: (root) => core.invoke("tasks_list", { root }),
+    taskRunCapture: (cwd, command) => core.invoke("task_run_capture", { cwd, command }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -508,6 +514,13 @@ function mockBackend() {
       { id: "npm:build", label: "npm: build", command: "npm run build", cwd: root, source: "npm", group: "build", problemMatcher: "$tsc" },
       { id: "npm:test", label: "npm: test", command: "npm test", cwd: root, source: "npm", group: "test", problemMatcher: null },
     ],
+    taskRunCapture: async (cwd, command) => ({
+      code: 1,
+      stdout: `src/main.js(530,7): warning TS6133: 'reply' is declared but its value is never read.\n`,
+      stderr: "",
+      combined: `src/main.js(530,7): warning TS6133: 'reply' is declared but its value is never read.\n`,
+      truncated: false,
+    }),
     pickFolder: async () => ROOT,
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
@@ -817,15 +830,30 @@ const projectModels = new Set();
 // Create (or reuse) a model addressed by its real path so the TypeScript
 // language service treats files as one project and can resolve imports across
 // them. Reuses any model preloaded by the project walk.
+const modelsWithListeners = new WeakSet();
+function attachModelListeners(path, model) {
+  if (modelsWithListeners.has(model)) return;
+  modelsWithListeners.add(model);
+  model.onDidChangeContent(() => {
+    markDirty(path, true);
+    lspManager?.didChange(path, model);
+  });
+}
+
 function getOrCreateModel(path, name, content) {
   const uri = monaco.Uri.file(path);
   let model = monaco.editor.getModel(uri);
   if (model) {
+    // A model may have been created lazily (e.g. for cross-file diagnostics)
+    // with an unresolved language — correct it now that we know the real file.
+    const want = extLang(name);
+    if (want && model.getLanguageId() !== want) monaco.editor.setModelLanguage(model, want);
     if (content != null && model.getValue() !== content) model.setValue(content);
+    attachModelListeners(path, model);
     return model;
   }
   model = monaco.editor.createModel(content ?? "", extLang(name), uri);
-  model.onDidChangeContent(() => markDirty(path, true));
+  attachModelListeners(path, model);
   return model;
 }
 
@@ -863,6 +891,7 @@ async function openFile(path, name) {
   openFiles.set(path, { model, name, dirty: false, viewState: null });
   renderTabs();
   activate(path);
+  lspManager?.didOpen(path, model);
   return true;
 }
 
@@ -923,6 +952,7 @@ function revealInTree(path) {
 function closeFile(path) {
   const f = openFiles.get(path);
   if (!f) return;
+  lspManager?.didClose(path);
   // Keep project models alive so language features still resolve this file.
   if (!projectModels.has(path)) f.model.dispose();
   openFiles.delete(path);
@@ -957,6 +987,7 @@ async function saveActive() {
   try {
     await backend.writeTextFile(activePath, f.model.getValue());
     markDirty(activePath, false);
+    lspManager?.didSave(activePath, f.model);
     showToast(t("file.saved", { name: f.name }));
   } catch (e) {
     showToast(String(e));
@@ -1018,6 +1049,45 @@ function renderTabs() {
 // ---- file tree ----
 let rootPath = null;
 let workspaceRoots = [];
+
+// Wire the real LSP client now that workspace state exists. Disabled in the
+// plain-browser mock (no real servers to talk to). Providers are registered for
+// the "gap" languages Monaco's bundled service does not cover.
+lspManager = createLspManager({
+  backend,
+  enabled: inTauri,
+  getWorkspaceRoots: () => (workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : []),
+  showToast: (msg) => showToast(msg),
+  onStatus: () => updateLspStatusBar(),
+  onLog: (lang, line) => lspLogSink(lang, line),
+});
+lspManager.registerProviders();
+
+const lspLogBuffers = new Map();
+function lspLogSink(lang, line) {
+  let buf = lspLogBuffers.get(lang);
+  if (!buf) {
+    buf = [];
+    lspLogBuffers.set(lang, buf);
+  }
+  buf.push(line);
+  if (buf.length > 400) buf.shift();
+  document.dispatchEvent(new CustomEvent("lsp-log", { detail: { lang } }));
+}
+
+function updateLspStatusBar() {
+  if (!lspManager) return;
+  const ready = lspManager.status().filter((s) => s.initialized).map((s) => s.lang);
+  if (ready.length) {
+    setStatusBarItem(
+      "lsp",
+      { text: `LSP: ${ready.join(", ")}`, tooltip: "Active language servers (real LSP)" },
+      () => openFeaturePanel("lsp"),
+    );
+  } else {
+    removeStatusBarItem("lsp");
+  }
+}
 
 function iconSvg(id, cls = "") {
   return `<svg class="ic ${cls}"><use href="#${id}" /></svg>`;
@@ -3098,15 +3168,138 @@ async function runTask(task) {
   showToast(`Running task: ${task.label}`);
 }
 
+// Owner used for markers produced by task/problem-matcher runs, so they can be
+// cleared independently of LSP and extension diagnostics.
+const TASK_MARKER_OWNER = "task";
+const MAX_PROBLEM_FILES = 80;
+
+function clearTaskProblems() {
+  for (const model of monaco.editor.getModels()) {
+    monaco.editor.setModelMarkers(model, TASK_MARKER_OWNER, []);
+  }
+}
+
+function resolveTaskPath(file, cwd) {
+  if (!file) return null;
+  let f = file.trim().replace(/^\.[\\/]/, "");
+  if (f.startsWith("/") || /^[A-Za-z]:[\\/]/.test(f)) return f;
+  const base = (cwd || rootPath || "").replace(/[\\/]+$/, "");
+  return base ? `${base}/${f}` : f;
+}
+
+function taskSeverityToMarker(sev) {
+  return sev === "error" ? monaco.MarkerSeverity.Error
+    : sev === "warning" ? monaco.MarkerSeverity.Warning
+    : sev === "info" ? monaco.MarkerSeverity.Info
+    : monaco.MarkerSeverity.Hint;
+}
+
+async function ensureModelForPath(absPath) {
+  const uri = monaco.Uri.file(absPath);
+  const existing = monaco.editor.getModel(uri);
+  if (existing) return existing;
+  try {
+    const content = await backend.readTextFile(absPath);
+    return getOrCreateModel(absPath, basename(absPath), content);
+  } catch {
+    return null;
+  }
+}
+
+// Run a task non-interactively, capture its output, parse it through the
+// matching problem matcher, and surface the results in the Problems panel and
+// as inline squiggles.
+async function runTaskWithProblems(task) {
+  if (!task?.command) return;
+  const cwd = task.cwd || rootPath;
+  if (!cwd) {
+    showToast("Open a workspace first.");
+    return;
+  }
+  clearTaskProblems();
+  showToast(`Analyzing: ${task.label}…`);
+  let result;
+  try {
+    result = await backend.taskRunCapture(cwd, task.command);
+  } catch (e) {
+    showToast(`Task failed to start: ${String(e && e.message ? e.message : e)}`);
+    return;
+  }
+
+  const problems = parseProblems(result.combined || `${result.stdout || ""}${result.stderr || ""}`, {
+    matcher: task.problemMatcher,
+    command: task.command,
+  });
+
+  // Group by resolved absolute path.
+  const byPath = new Map();
+  for (const p of problems) {
+    const abs = resolveTaskPath(p.file, cwd);
+    if (!abs) continue;
+    if (!byPath.has(abs)) byPath.set(abs, []);
+    byPath.get(abs).push(p);
+  }
+
+  let errs = 0;
+  let warns = 0;
+  let fileCount = 0;
+  for (const [abs, items] of byPath.entries()) {
+    if (fileCount >= MAX_PROBLEM_FILES) break;
+    const model = await ensureModelForPath(abs);
+    if (!model) continue;
+    fileCount++;
+    const markers = items.map((p) => {
+      const line = Math.min(p.line, model.getLineCount());
+      const maxCol = model.getLineMaxColumn(line);
+      const startCol = Math.min(p.col, maxCol);
+      const word = model.getWordAtPosition({ lineNumber: line, column: startCol });
+      const endCol = word ? word.endColumn : maxCol;
+      if (p.severity === "error") errs++;
+      else if (p.severity === "warning") warns++;
+      return {
+        severity: taskSeverityToMarker(p.severity),
+        message: p.code ? `${p.message} (${p.code})` : p.message,
+        source: p.source || task.label,
+        startLineNumber: line,
+        startColumn: startCol,
+        endLineNumber: line,
+        endColumn: Math.max(endCol, startCol + 1),
+      };
+    });
+    monaco.editor.setModelMarkers(model, TASK_MARKER_OWNER, markers);
+  }
+
+  if (problems.length) {
+    if (problemsPanel && problemsPanel.hidden) toggleProblems();
+    else updateProblems();
+    showToast(`${task.label}: ${errs} error(s), ${warns} warning(s) across ${fileCount} file(s)`);
+  } else if (result.code === 0) {
+    showToast(`${task.label}: completed with no problems`);
+  } else {
+    await openTerminal();
+    showToast(`${task.label}: exited ${result.code}, no parseable problems — running in terminal`);
+    runTask(task);
+  }
+}
+
 function renderTasksTool(body) {
-  createToolHeader(body, "Task Runner", "Discover npm, Cargo, Makefile, .michael/tasks.json, and .vscode/tasks.json tasks, then run them in the integrated terminal.");
+  createToolHeader(body, "Task Runner", "Discover npm, Cargo, Makefile, .michael/tasks.json, and .vscode/tasks.json tasks. Run them in the terminal, or use Problems to capture output and route compiler/linter errors into the Problems panel.");
   const actions = document.createElement("div");
   actions.className = "tool-actions";
   const refresh = document.createElement("button");
   refresh.className = "btn";
   refresh.type = "button";
   refresh.textContent = "Refresh";
-  actions.appendChild(refresh);
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "btn";
+  clearBtn.type = "button";
+  clearBtn.textContent = "Clear Problems";
+  clearBtn.addEventListener("click", () => {
+    clearTaskProblems();
+    updateProblems();
+    showToast("Cleared task problems");
+  });
+  actions.append(refresh, clearBtn);
   const list = document.createElement("div");
   list.className = "tool-list";
   body.append(actions, list);
@@ -3133,10 +3326,14 @@ function renderTasksTool(body) {
             <strong></strong>
             <span></span>
           </div>
-          <button class="btn btn--primary" type="button">Run</button>`;
+          <div class="tool-card__actions">
+            <button class="btn" type="button" data-act="problems">Problems</button>
+            <button class="btn btn--primary" type="button" data-act="run">Run</button>
+          </div>`;
         card.querySelector("strong").textContent = task.label;
         card.querySelector("span").textContent = `${task.source} · ${task.group} · ${task.command}`;
-        card.querySelector("button").addEventListener("click", () => runTask(task));
+        card.querySelector('[data-act="run"]').addEventListener("click", () => runTask(task));
+        card.querySelector('[data-act="problems"]').addEventListener("click", () => runTaskWithProblems(task));
         list.appendChild(card);
       }
     } catch (e) {
@@ -3386,55 +3583,75 @@ function renderDebuggerTool(body) {
 }
 
 function renderLspTool(body) {
-  createToolHeader(body, "Language Servers", "Start and stop LSP servers for languages that need external intelligence beyond Monaco's built-in services.");
+  createToolHeader(
+    body,
+    "Language Servers",
+    "Real LSP intelligence — completion, diagnostics, hover, go-to-definition, references, rename, symbols and code actions. Servers for Rust, Python, Go and C/C++ start automatically when you open a matching file; Monaco's bundled service still powers TS/JS/JSON/CSS/HTML.",
+  );
   const form = document.createElement("div");
   form.className = "tool-form";
   form.innerHTML = `
-    <label><span>Language</span><select id="lspLang"><option>typescript</option><option>javascript</option><option>rust</option><option>python</option><option>go</option><option>html</option><option>css</option><option>json</option></select></label>
-    <label><span>Custom command</span><input id="lspCommand" spellcheck="false" placeholder="leave empty for default server" /></label>
+    <label><span>Language</span><select id="lspLang"><option>rust</option><option>python</option><option>go</option><option>c</option><option>cpp</option><option>typescript</option><option>javascript</option><option>html</option><option>css</option><option>json</option></select></label>
+    <label><span>Custom command</span><input id="lspCommand" spellcheck="false" placeholder="leave empty for the bundled default server" /></label>
     <label><span>Args</span><input id="lspArgs" spellcheck="false" placeholder="space separated" /></label>
     <div class="tool-actions"><button class="btn btn--primary" id="lspStartBtn" type="button">Start</button><button class="btn" id="lspStopBtn" type="button">Stop</button><button class="btn" id="lspRefreshBtn" type="button">Refresh</button></div>
     <div class="tool-list" id="lspList"></div>
     <pre class="tool-log" id="lspLog"></pre>`;
   body.appendChild(form);
   const log = form.querySelector("#lspLog");
-  const refresh = async () => {
+  const langSel = form.querySelector("#lspLang");
+
+  const refresh = () => {
     const list = form.querySelector("#lspList");
     list.innerHTML = "";
-    try {
-      const servers = await backend.lspList();
-      for (const item of servers) {
-        const row = document.createElement("div");
-        row.className = "tool-card";
-        row.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div>`;
-        row.querySelector("strong").textContent = item.lang;
-        row.querySelector("span").textContent = item.running ? "Running" : "Stopped";
-        list.appendChild(row);
-      }
-    } catch (e) {
-      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+    const status = lspManager ? lspManager.status() : [];
+    const running = new Map(status.map((s) => [s.lang, s]));
+    const known = ["rust", "python", "go", "c", "cpp", "typescript", "javascript", "html", "css", "json"];
+    for (const lang of known) {
+      const s = running.get(lang);
+      const managed = lspManager?.managedLangs.includes(lang);
+      const row = document.createElement("div");
+      row.className = "tool-card";
+      row.innerHTML = `<div class="tool-card__main"><strong></strong><span></span></div><span class="lsp-dot"></span>`;
+      row.querySelector("strong").textContent = lang;
+      let state;
+      if (s && s.initialized) state = "Running · initialized";
+      else if (s) state = "Starting…";
+      else if (managed) state = "Auto-starts on open";
+      else state = "Monaco built-in";
+      row.querySelector("span").textContent = state;
+      const dot = row.querySelector(".lsp-dot");
+      dot.style.cssText = `width:8px;height:8px;border-radius:50%;margin-left:auto;background:${s && s.initialized ? "#3fb950" : s ? "#d29922" : "#6e7681"}`;
+      list.appendChild(row);
     }
   };
+
+  const renderLog = () => {
+    const lang = langSel.value;
+    log.textContent = (lspLogBuffers.get(lang) || []).join("\n");
+    log.scrollTop = log.scrollHeight;
+  };
+  const onLogEvent = (e) => { if (e.detail?.lang === langSel.value) renderLog(); };
+  document.addEventListener("lsp-log", onLogEvent);
+  langSel.addEventListener("change", renderLog);
+
   form.querySelector("#lspStartBtn").addEventListener("click", async () => {
-    const lang = form.querySelector("#lspLang").value;
+    const lang = langSel.value;
     const command = form.querySelector("#lspCommand").value.trim();
     const args = form.querySelector("#lspArgs").value.trim().split(/\s+/).filter(Boolean);
-    const rootUri = rootPath ? `file://${rootPath}` : "";
     try {
-      await backend.lspStart({ lang, command, args, rootUri }, (ev) => {
-        log.textContent += JSON.stringify(ev) + "\n";
-        log.scrollTop = log.scrollHeight;
-      });
-      showToast(`LSP ${lang} started`);
+      const client = await lspManager.startManual(lang, command ? { command, args } : undefined);
+      if (client) showToast(`LSP ${lang} started`);
       refresh();
+      renderLog();
     } catch (e) {
       showToast(String(e && e.message ? e.message : e));
     }
   });
   form.querySelector("#lspStopBtn").addEventListener("click", async () => {
-    const lang = form.querySelector("#lspLang").value;
+    const lang = langSel.value;
     try {
-      await backend.lspStop(lang);
+      await lspManager.stop(lang);
       showToast(`LSP ${lang} stopped`);
       refresh();
     } catch (e) {
@@ -3443,6 +3660,7 @@ function renderLspTool(body) {
   });
   form.querySelector("#lspRefreshBtn").addEventListener("click", refresh);
   refresh();
+  renderLog();
 }
 
 // ---- titlebar menu bar (Cursor/Devin-style) ----

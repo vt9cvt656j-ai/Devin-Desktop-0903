@@ -3298,6 +3298,12 @@ kbd {
   flex-direction: column;
   gap: 3px;
 }
+.tool-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
 .tool-card__main strong { font-size: 13.5px; }
 .tool-card__main span,
 .tool-tags {

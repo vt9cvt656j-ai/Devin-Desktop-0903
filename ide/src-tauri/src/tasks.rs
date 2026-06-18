@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Serialize;
 
@@ -186,6 +187,102 @@ pub fn tasks_list(root: String) -> Result<Vec<TaskDefinition>, String> {
     Ok(discover_tasks(&root))
 }
 
+/// Captured result of running a task to completion (non-interactive).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunResult {
+    code: i32,
+    stdout: String,
+    stderr: String,
+    combined: String,
+    truncated: bool,
+}
+
+const MAX_TASK_OUTPUT: usize = 2 * 1024 * 1024;
+
+/// Truncate a UTF-8 string to at most `max` bytes without splitting a code
+/// point. Returns true when truncation happened.
+fn truncate_on_boundary(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    s.truncate(idx);
+    true
+}
+
+#[cfg(not(windows))]
+fn task_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+}
+
+#[cfg(not(windows))]
+fn augmented_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let extra = format!(
+        "{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:{home}/go/bin:{home}/.local/bin:/usr/bin:/bin"
+    );
+    match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
+        _ => extra,
+    }
+}
+
+/// Run a discovered task to completion and capture stdout/stderr so the
+/// frontend can feed it through a problem matcher into the Problems panel.
+/// This is the non-interactive complement to running a task in the terminal.
+#[tauri::command]
+pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, String> {
+    let dir = PathBuf::from(&cwd);
+    if !dir.is_dir() {
+        return Err("task working directory is not a directory".into());
+    }
+    if command.trim().is_empty() {
+        return Err("empty task command".into());
+    }
+
+    #[cfg(windows)]
+    let output = {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        Command::new(shell)
+            .arg("/C")
+            .arg(&command)
+            .current_dir(&dir)
+            .output()
+    };
+
+    #[cfg(not(windows))]
+    let output = {
+        // A login shell loads the user's profile so cargo/npm/go resolve, and we
+        // prepend the usual toolchain dirs as a belt-and-suspenders fallback.
+        Command::new(task_shell())
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&dir)
+            .env("PATH", augmented_path())
+            .env("CI", "1")
+            .env("TERM", "dumb")
+            .output()
+    };
+
+    let output = output.map_err(|e| format!("failed to run task: {e}"))?;
+    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let truncated =
+        truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT) | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
+    let combined = format!("{stdout}{stderr}");
+    Ok(TaskRunResult {
+        code: output.status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        combined,
+        truncated,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +341,50 @@ mod tests {
         assert_eq!(task.command, "npm run typecheck");
         assert_eq!(task.problem_matcher.as_deref(), Some("$tsc"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        // Each "é" is two bytes; truncating at an odd byte must not panic.
+        let mut s = "é".repeat(10);
+        let truncated = truncate_on_boundary(&mut s, 5);
+        assert!(truncated);
+        assert!(s.len() <= 5);
+        // The result must still be valid UTF-8 (no partial code point).
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_noop_when_short() {
+        let mut s = "hello".to_string();
+        assert!(!truncate_on_boundary(&mut s, 100));
+        assert_eq!(s, "hello");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capture_runs_command_and_collects_output() {
+        let root = temp_root("capture");
+        let result = task_run_capture(root.to_string_lossy().to_string(), "echo michael-ide".into())
+            .expect("task should run");
+        assert_eq!(result.code, 0);
+        assert!(result.combined.contains("michael-ide"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capture_reports_nonzero_exit() {
+        let root = temp_root("capture-fail");
+        let result = task_run_capture(root.to_string_lossy().to_string(), "exit 3".into())
+            .expect("task should run");
+        assert_eq!(result.code, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_rejects_bad_dir() {
+        let err = task_run_capture("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
+        assert!(err.is_err());
     }
 }
