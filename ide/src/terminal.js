@@ -1,7 +1,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-let termPanel, termBody, editorwrapEl;
+let termPanel, termBody, editorwrapEl, termTabBar;
 let backend, monacoEditor, getRootPath, t;
 
 let termTabs = [];
@@ -9,33 +9,29 @@ let activeTermTab = -1;
 let termSeq = 0;
 
 function termTheme() {
-  const isDark =
-    document.documentElement.dataset.theme === "dark" ||
-    (document.documentElement.dataset.theme !== "light" &&
-      window.matchMedia("(prefers-color-scheme: dark)").matches);
-
-  if (isDark) {
-    return {
-      background: "#0D1117", foreground: "#D6DEEB", cursor: "#7C5CFF",
-      cursorAccent: "#0D1117", selectionBackground: "rgba(124, 92, 255, 0.28)",
-      selectionForeground: "#FFFFFF",
-      black: "#0B1020", red: "#FF6B7A", green: "#3DDC97", yellow: "#FFD166",
-      blue: "#5B8DEF", magenta: "#C792EA", cyan: "#5DE4C7", white: "#D6DEEB",
-      brightBlack: "#637083", brightRed: "#FF8FA3", brightGreen: "#63E6BE",
-      brightYellow: "#FFE08A", brightBlue: "#7AA2FF", brightMagenta: "#D9A8FF",
-      brightCyan: "#84F0D8", brightWhite: "#FFFFFF",
-    };
-  }
-
   return {
-    background: "#0B1020", foreground: "#D6DEEB", cursor: "#0A84FF",
-    cursorAccent: "#0B1020", selectionBackground: "rgba(10, 132, 255, 0.24)",
-    selectionForeground: "#FFFFFF",
-    black: "#0B1020", red: "#FF5F7A", green: "#35D49B", yellow: "#F7C948",
-    blue: "#5B8DEF", magenta: "#B77CFF", cyan: "#4DDDD0", white: "#D6DEEB",
-    brightBlack: "#6B7280", brightRed: "#FF87A0", brightGreen: "#6EE7B7",
-    brightYellow: "#FFE082", brightBlue: "#8AB4FF", brightMagenta: "#D8B4FE",
-    brightCyan: "#99F6E4", brightWhite: "#FFFFFF",
+    background: "#0e1116",
+    foreground: "#e6edf3",
+    cursor: "#58a6ff",
+    cursorAccent: "#0e1116",
+    selectionBackground: "rgba(56, 139, 253, 0.25)",
+    selectionForeground: "#ffffff",
+    black: "#0d1117",
+    red: "#ff7b72",
+    green: "#3fb950",
+    yellow: "#d29922",
+    blue: "#58a6ff",
+    magenta: "#bc8cff",
+    cyan: "#39d353",
+    white: "#e6edf3",
+    brightBlack: "#484f58",
+    brightRed: "#ffa198",
+    brightGreen: "#56d364",
+    brightYellow: "#e3b341",
+    brightBlue: "#79c0ff",
+    brightMagenta: "#d2a8ff",
+    brightCyan: "#56d364",
+    brightWhite: "#ffffff",
   };
 }
 
@@ -48,15 +44,8 @@ const termResizeObserver = new ResizeObserver(() => {
 });
 
 function renderTermTabs() {
-  let tabBar = termPanel.querySelector(".term-tabs");
-  if (!tabBar) {
-    tabBar = document.createElement("div");
-    tabBar.className = "term-tabs";
-    const head = termPanel.querySelector(".terminal-panel__head");
-    const titleSpan = head.querySelector(".terminal-panel__title");
-    titleSpan.after(tabBar);
-  }
-  tabBar.innerHTML = "";
+  if (!termTabBar) return;
+  termTabBar.innerHTML = "";
   termTabs.forEach((tab, i) => {
     const btn = document.createElement("button");
     btn.className = "term-tab" + (i === activeTermTab ? " is-active" : "");
@@ -70,15 +59,8 @@ function renderTermTabs() {
         switchTermTab(i);
       }
     });
-    tabBar.appendChild(btn);
+    termTabBar.appendChild(btn);
   });
-  const addBtn = document.createElement("button");
-  addBtn.className = "term-tab term-tab--add";
-  addBtn.type = "button";
-  addBtn.textContent = "+";
-  addBtn.title = t("terminal.new");
-  addBtn.addEventListener("click", () => createTermTab());
-  tabBar.appendChild(addBtn);
 }
 
 function switchTermTab(idx) {
@@ -109,8 +91,8 @@ async function createTermTab() {
     fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
     fontWeight: "normal",
     fontWeightBold: "bold",
-    lineHeight: 1.35,
-    letterSpacing: 0.3,
+    lineHeight: 1.4,
+    letterSpacing: 0.2,
     theme: termTheme(),
     cursorBlink: true,
     cursorStyle: "bar",
@@ -225,14 +207,72 @@ function cleanupAllTerminals() {
   }
 }
 
+function initResize(resizeHandle) {
+  if (!resizeHandle) return;
+  let startY = 0;
+  let startH = 0;
+  let dragging = false;
+
+  const onMouseMove = (e) => {
+    if (!dragging) return;
+    const delta = startY - e.clientY;
+    const newH = Math.max(140, Math.min(window.innerHeight * 0.7, startH + delta));
+    termPanel.style.flex = `0 0 ${newH}px`;
+    requestAnimationFrame(() => {
+      monacoEditor.layout();
+      if (activeTermTab >= 0 && termTabs[activeTermTab]?.fit) {
+        try { termTabs[activeTermTab].fit.fit(); } catch {}
+      }
+    });
+  };
+
+  const onMouseUp = () => {
+    dragging = false;
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onMouseUp);
+  };
+
+  resizeHandle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    startY = e.clientY;
+    startH = termPanel.getBoundingClientRect().height;
+    document.body.style.cursor = "ns-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  });
+}
+
+function initMaximize(maxBtn) {
+  if (!maxBtn) return;
+  let maximized = false;
+  let savedFlex = "";
+
+  maxBtn.addEventListener("click", () => {
+    if (maximized) {
+      termPanel.style.flex = savedFlex;
+      maxBtn.title = "Maximize Panel";
+      maximized = false;
+    } else {
+      savedFlex = termPanel.style.flex;
+      termPanel.style.flex = "1 1 0";
+      maxBtn.title = "Restore Panel";
+      maximized = true;
+    }
+    requestAnimationFrame(() => {
+      monacoEditor.layout();
+      if (activeTermTab >= 0 && termTabs[activeTermTab]?.fit) {
+        try { termTabs[activeTermTab].fit.fit(); } catch {}
+      }
+    });
+  });
+}
+
 /**
  * Initialise the terminal module with required dependencies.
- *
- * @param {object} deps
- * @param {object} deps.backend     - Backend abstraction (termOpen/Write/Resize/Close)
- * @param {object} deps.editor      - Monaco editor instance (for layout calls)
- * @param {Function} deps.getRootPath - Returns the current workspace root path
- * @param {Function} deps.t          - i18n translation function
  */
 export function initTerminal(deps) {
   backend = deps.backend;
@@ -243,11 +283,16 @@ export function initTerminal(deps) {
   const $ = (id) => document.getElementById(id);
   termPanel = $("terminalPanel");
   termBody = $("terminalBody");
+  termTabBar = $("termTabBar");
   editorwrapEl = document.querySelector(".editorwrap");
 
   $("terminalClose")?.addEventListener("click", closeTerminal);
-  $("termTrafficClose")?.addEventListener("click", closeTerminal);
   $("terminalBtn")?.addEventListener("click", toggleTerminal);
+  $("termNewBtn")?.addEventListener("click", () => createTermTab());
+
+  initResize($("terminalResize"));
+  initMaximize($("termMaxBtn"));
+
   window.addEventListener("beforeunload", cleanupAllTerminals);
 }
 

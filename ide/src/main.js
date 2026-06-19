@@ -142,6 +142,14 @@ async function tauriBackend() {
     termWrite: (id, data) => core.invoke("term_write", { id, data }),
     termResize: (id, cols, rows) => core.invoke("term_resize", { id, cols, rows }),
     termClose: (id) => core.invoke("term_close", { id }),
+    fsWatch: (paths) => core.invoke("fs_watch", { paths }),
+    fsUnwatch: (paths) => core.invoke("fs_unwatch", { paths }),
+    replaceInFile: (filePath, query, replacement, caseSensitive) =>
+      core.invoke("replace_in_file", { filePath, query, replacement, caseSensitive }),
+    replaceInProject: (root, query, replacement, caseSensitive) =>
+      core.invoke("replace_in_project", { root, query, replacement, caseSensitive }),
+    gitStash: () => Promise.resolve("stash not yet wired"),
+    gitStashPop: () => Promise.resolve("stash pop not yet wired"),
   };
 }
 
@@ -680,11 +688,19 @@ const monacoEditor = monaco.editor.create(editorEl, {
   automaticLayout: true,
   fontSize: 13,
   fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
-  minimap: { enabled: false },
+  minimap: { enabled: true, maxColumn: 80, renderCharacters: false },
   scrollBeyondLastLine: false,
   renderWhitespace: "selection",
   glyphMargin: true,
   padding: { top: 10 },
+  bracketPairColorization: { enabled: true, independentColorPoolPerBracketType: true },
+  guides: { bracketPairs: true, indentation: true, highlightActiveIndentation: true },
+  smoothScrolling: true,
+  cursorBlinking: "smooth",
+  cursorSmoothCaretAnimation: "on",
+  stickyScroll: { enabled: true },
+  linkedEditing: true,
+  colorDecorators: true,
 });
 
 let splitEditor = null;
@@ -1063,11 +1079,25 @@ function syncWelcome() {
   welcomeEl.hidden = openFiles.size > 0;
 }
 
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"]);
+function isImageFile(name) {
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  return IMAGE_EXTS.has(ext);
+}
+
 async function openFile(path, name) {
   if (openFiles.has(path)) {
     activate(path);
     return true;
   }
+
+  if (isImageFile(name)) {
+    openFiles.set(path, { model: null, name, dirty: false, viewState: null, isImage: true });
+    renderTabs();
+    activate(path);
+    return true;
+  }
+
   let content;
   try {
     content = await backend.readTextFile(path);
@@ -1085,24 +1115,83 @@ async function openFile(path, name) {
 
 function activate(path) {
   closeDiffView();
+  hideImagePreview();
+  hideMarkdownPreview();
   if (activePath && openFiles.has(activePath)) {
-    openFiles.get(activePath).viewState = monacoEditor.saveViewState();
+    const prev = openFiles.get(activePath);
+    if (prev && prev.model) prev.viewState = monacoEditor.saveViewState();
   }
   activePath = path;
   const f = openFiles.get(path);
-  monacoEditor.setModel(f.model);
-  if (f.viewState) monacoEditor.restoreViewState(f.viewState);
-  monacoEditor.focus();
+
+  if (f.isImage) {
+    monacoEditor.setModel(null);
+    showImagePreview(path);
+    editorEl.style.display = "none";
+  } else {
+    editorEl.style.display = "";
+    monacoEditor.setModel(f.model);
+    if (f.viewState) monacoEditor.restoreViewState(f.viewState);
+    monacoEditor.focus();
+    if (path.endsWith(".md")) showMarkdownPreview(f.model);
+  }
+
   syncWelcome();
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
-  if (runBtn) runBtn.disabled = false;
+  if (runBtn) runBtn.disabled = !f.isImage;
   $("windowTitle").textContent = f.name + " — Michael IDE";
-  refreshGutter();
-  updateBreadcrumb(path);
-  renderBreakpointDecorations();
-  applyDebugLineDecoration();
+  if (!f.isImage) {
+    refreshGutter();
+    updateBreadcrumb(path);
+    renderBreakpointDecorations();
+    applyDebugLineDecoration();
+  } else {
+    updateBreadcrumb(path);
+  }
+  updateStatusBar();
+}
+
+// ---- image preview ----
+let _imagePreviewEl = null;
+function showImagePreview(path) {
+  if (!_imagePreviewEl) {
+    _imagePreviewEl = document.createElement("div");
+    _imagePreviewEl.className = "image-preview";
+    editorContainer.appendChild(_imagePreviewEl);
+  }
+  const src = inTauri ? `asset://localhost/${encodeURIComponent(path)}` : path;
+  _imagePreviewEl.innerHTML = `<div class="image-preview__inner"><img src="${src}" alt="" /><p class="image-preview__path"></p></div>`;
+  _imagePreviewEl.querySelector(".image-preview__path").textContent = path;
+  _imagePreviewEl.hidden = false;
+}
+function hideImagePreview() {
+  if (_imagePreviewEl) _imagePreviewEl.hidden = true;
+}
+
+// ---- markdown preview ----
+let _mdPreviewEl = null;
+let _mdPreviewDisposable = null;
+function showMarkdownPreview(model) {
+  if (!_mdPreviewEl) {
+    _mdPreviewEl = document.createElement("div");
+    _mdPreviewEl.className = "md-preview";
+    editorContainer.appendChild(_mdPreviewEl);
+  }
+  function render() {
+    const html = _mdPreviewEl.querySelector(".md-preview__body") || document.createElement("div");
+    html.className = "md-preview__body";
+    if (!_mdPreviewEl.contains(html)) _mdPreviewEl.appendChild(html);
+    renderMarkdownInto(model.getValue(), html);
+  }
+  render();
+  _mdPreviewDisposable = model.onDidChangeContent(() => render());
+  _mdPreviewEl.hidden = false;
+}
+function hideMarkdownPreview() {
+  if (_mdPreviewEl) _mdPreviewEl.hidden = true;
+  if (_mdPreviewDisposable) { _mdPreviewDisposable.dispose(); _mdPreviewDisposable = null; }
 }
 
 function updateBreadcrumb(path) {
@@ -1139,12 +1228,19 @@ function revealInTree(path) {
   }
 }
 
+const pinnedTabs = new Set();
+function togglePinTab(path) {
+  if (pinnedTabs.has(path)) pinnedTabs.delete(path);
+  else pinnedTabs.add(path);
+  renderTabs();
+}
+
 function closeFile(path) {
   const f = openFiles.get(path);
   if (!f) return;
+  if (pinnedTabs.has(path)) return; // pinned tabs cannot be closed
   lspManager?.didClose(path);
-  // Keep project models alive so language features still resolve this file.
-  if (!projectModels.has(path)) f.model.dispose();
+  if (!projectModels.has(path) && f.model) f.model.dispose();
   openFiles.delete(path);
   if (activePath === path) {
     activePath = null;
@@ -1190,7 +1286,7 @@ function renderTabs() {
   tabsEl.innerHTML = "";
   for (const [path, f] of openFiles) {
     const tab = document.createElement("div");
-    tab.className = "tab" + (path === activePath ? " is-active" : "") + (f.dirty ? " dirty" : "");
+    tab.className = "tab" + (path === activePath ? " is-active" : "") + (f.dirty ? " dirty" : "") + (pinnedTabs.has(path) ? " is-pinned" : "");
     tab.draggable = true;
     tab.dataset.path = path;
     tab.innerHTML =
@@ -1515,6 +1611,47 @@ async function openFolder(path) {
   await renderWorkspaceRoots();
   preloadProjectModels(path);
   await refreshGitStatus();
+  startFileWatcher();
+  addRecentProject(path);
+}
+
+let _fsWatcherActive = false;
+let _fsChangeDebounce = null;
+async function startFileWatcher() {
+  if (_fsWatcherActive || !inTauri) return;
+  const roots = workspaceRoots.length ? [...workspaceRoots] : rootPath ? [rootPath] : [];
+  if (!roots.length) return;
+  try {
+    await backend.fsWatch(roots);
+    _fsWatcherActive = true;
+    const { listen } = await import("@tauri-apps/api/event");
+    listen("fs-change", (event) => {
+      clearTimeout(_fsChangeDebounce);
+      _fsChangeDebounce = setTimeout(() => {
+        const changed = event.payload?.paths || [];
+        handleFsChanges(changed);
+      }, 200);
+    });
+  } catch (e) {
+    console.warn("[watcher] failed to start:", e);
+  }
+}
+
+function handleFsChanges(paths) {
+  if (!rootPath) return;
+  const dirsToReload = new Set();
+  for (const p of paths) {
+    const dir = parentDir(p);
+    if (dir && (workspaceRoots.some((r) => dir.startsWith(r)) || dir.startsWith(rootPath))) {
+      dirsToReload.add(dir);
+    }
+  }
+  for (const dir of dirsToReload) {
+    if (dirNodes.has(dir) || workspaceRoots.includes(dir)) {
+      reloadDir(dir);
+    }
+  }
+  refreshGitStatus();
 }
 
 async function addFolderToWorkspace() {
@@ -4740,34 +4877,33 @@ window.addEventListener("keydown", (e) => {
 // ---- integrated terminal (multi-tab) ----
 const termPanel = $("terminalPanel");
 const termBody = $("terminalBody");
+const termTabBar = $("termTabBar");
 const editorwrapEl = document.querySelector(".editorwrap");
 
 function termTheme() {
-  const isDark = document.documentElement.dataset.theme === "dark" ||
-    (document.documentElement.dataset.theme !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-
-  if (isDark) {
-    return {
-      background: "#0D1117", foreground: "#D6DEEB", cursor: "#7C5CFF",
-      cursorAccent: "#0D1117", selectionBackground: "rgba(124, 92, 255, 0.28)",
-      selectionForeground: "#FFFFFF",
-      black: "#0B1020", red: "#FF6B7A", green: "#3DDC97", yellow: "#FFD166",
-      blue: "#5B8DEF", magenta: "#C792EA", cyan: "#5DE4C7", white: "#D6DEEB",
-      brightBlack: "#637083", brightRed: "#FF8FA3", brightGreen: "#63E6BE",
-      brightYellow: "#FFE08A", brightBlue: "#7AA2FF", brightMagenta: "#D9A8FF",
-      brightCyan: "#84F0D8", brightWhite: "#FFFFFF",
-    };
-  }
-
   return {
-    background: "#0B1020", foreground: "#D6DEEB", cursor: "#0A84FF",
-    cursorAccent: "#0B1020", selectionBackground: "rgba(10, 132, 255, 0.24)",
-    selectionForeground: "#FFFFFF",
-    black: "#0B1020", red: "#FF5F7A", green: "#35D49B", yellow: "#F7C948",
-    blue: "#5B8DEF", magenta: "#B77CFF", cyan: "#4DDDD0", white: "#D6DEEB",
-    brightBlack: "#6B7280", brightRed: "#FF87A0", brightGreen: "#6EE7B7",
-    brightYellow: "#FFE082", brightBlue: "#8AB4FF", brightMagenta: "#D8B4FE",
-    brightCyan: "#99F6E4", brightWhite: "#FFFFFF",
+    background: "#0e1116",
+    foreground: "#e6edf3",
+    cursor: "#58a6ff",
+    cursorAccent: "#0e1116",
+    selectionBackground: "rgba(56, 139, 253, 0.25)",
+    selectionForeground: "#ffffff",
+    black: "#0d1117",
+    red: "#ff7b72",
+    green: "#3fb950",
+    yellow: "#d29922",
+    blue: "#58a6ff",
+    magenta: "#bc8cff",
+    cyan: "#39d353",
+    white: "#e6edf3",
+    brightBlack: "#484f58",
+    brightRed: "#ffa198",
+    brightGreen: "#56d364",
+    brightYellow: "#e3b341",
+    brightBlue: "#79c0ff",
+    brightMagenta: "#d2a8ff",
+    brightCyan: "#56d364",
+    brightWhite: "#ffffff",
   };
 }
 
@@ -4784,15 +4920,8 @@ let activeTermTab = -1;
 let termSeq = 0;
 
 function renderTermTabs() {
-  let tabBar = termPanel.querySelector(".term-tabs");
-  if (!tabBar) {
-    tabBar = document.createElement("div");
-    tabBar.className = "term-tabs";
-    const head = termPanel.querySelector(".terminal-panel__head");
-    const titleSpan = head.querySelector(".terminal-panel__title");
-    titleSpan.after(tabBar);
-  }
-  tabBar.innerHTML = "";
+  if (!termTabBar) return;
+  termTabBar.innerHTML = "";
   termTabs.forEach((tab, i) => {
     const btn = document.createElement("button");
     btn.className = "term-tab" + (i === activeTermTab ? " is-active" : "");
@@ -4806,15 +4935,8 @@ function renderTermTabs() {
         switchTermTab(i);
       }
     });
-    tabBar.appendChild(btn);
+    termTabBar.appendChild(btn);
   });
-  const addBtn = document.createElement("button");
-  addBtn.className = "term-tab term-tab--add";
-  addBtn.type = "button";
-  addBtn.textContent = "+";
-  addBtn.title = t("terminal.new");
-  addBtn.addEventListener("click", () => createTermTab());
-  tabBar.appendChild(addBtn);
 }
 
 function switchTermTab(idx) {
@@ -4845,8 +4967,8 @@ async function createTermTab() {
     fontFamily: "'SF Mono', Menlo, ui-monospace, 'JetBrains Mono', Consolas, monospace",
     fontWeight: "normal",
     fontWeightBold: "bold",
-    lineHeight: 1.35,
-    letterSpacing: 0.3,
+    lineHeight: 1.4,
+    letterSpacing: 0.2,
     theme: termTheme(),
     cursorBlink: true,
     cursorStyle: "bar",
@@ -4861,10 +4983,9 @@ async function createTermTab() {
   term.open(container);
   termResizeObserver.observe(container);
 
-  let backendId = null;
   let initDone = false;
   let initBuffer = "";
-  const entry = { term, fit, container, label, backendId, opening: false };
+  const entry = { term, fit, container, label, backendId: null, opening: false };
   termTabs.push(entry);
 
   term.onData((d) => { if (entry.backendId != null) backend.termWrite(entry.backendId, d); });
@@ -4960,8 +5081,69 @@ function toggleTerminal() {
 }
 
 $("terminalClose")?.addEventListener("click", closeTerminal);
-$("termTrafficClose")?.addEventListener("click", closeTerminal);
+$("termNewBtn")?.addEventListener("click", () => createTermTab());
 $("terminalBtn")?.addEventListener("click", toggleTerminal);
+
+// terminal panel resize
+{
+  const resizeHandle = $("terminalResize");
+  if (resizeHandle) {
+    let startY = 0, startH = 0, dragging = false;
+    const onMove = (e) => {
+      if (!dragging) return;
+      const h = Math.max(140, Math.min(window.innerHeight * 0.7, startH + (startY - e.clientY)));
+      termPanel.style.flex = `0 0 ${h}px`;
+      requestAnimationFrame(() => {
+        monacoEditor.layout();
+        if (activeTermTab >= 0 && termTabs[activeTermTab]?.fit)
+          try { termTabs[activeTermTab].fit.fit(); } catch {}
+      });
+    };
+    const onUp = () => {
+      dragging = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    resizeHandle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      dragging = true;
+      startY = e.clientY;
+      startH = termPanel.getBoundingClientRect().height;
+      document.body.style.cursor = "ns-resize";
+      document.body.style.userSelect = "none";
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+  }
+}
+
+// terminal maximize/restore
+{
+  const maxBtn = $("termMaxBtn");
+  if (maxBtn) {
+    let maximized = false, savedFlex = "";
+    maxBtn.addEventListener("click", () => {
+      if (maximized) {
+        termPanel.style.flex = savedFlex;
+        maxBtn.title = "Maximize Panel";
+        maximized = false;
+      } else {
+        savedFlex = termPanel.style.flex;
+        termPanel.style.flex = "1 1 0";
+        maxBtn.title = "Restore Panel";
+        maximized = true;
+      }
+      requestAnimationFrame(() => {
+        monacoEditor.layout();
+        if (activeTermTab >= 0 && termTabs[activeTermTab]?.fit)
+          try { termTabs[activeTermTab].fit.fit(); } catch {}
+      });
+    });
+  }
+}
+
 window.addEventListener("beforeunload", () => {
   for (const tab of termTabs) {
     if (tab.backendId != null) backend.termClose(tab.backendId);
@@ -4977,9 +5159,55 @@ onLocaleChange(() => {
   showChatHint();
 });
 
-// ---- extensions ----
+// ---- status bar core items ----
 const statusbarRight = $("statusbarRight");
 const statusItems = new Map();
+
+function updateStatusBar() {
+  const pos = monacoEditor.getPosition();
+  const model = monacoEditor.getModel();
+  const sel = monacoEditor.getSelection();
+
+  if (pos) {
+    let posText = `Ln ${pos.lineNumber}, Col ${pos.column}`;
+    if (sel && !sel.isEmpty()) {
+      const selCount = model ? model.getValueInRange(sel).length : 0;
+      if (selCount > 0) posText += ` (${selCount} selected)`;
+    }
+    setStatusBarItem("_cursor", { text: posText, tooltip: "Go to Line" });
+  }
+
+  if (model) {
+    const langId = model.getLanguageId();
+    const langLabel = langId.charAt(0).toUpperCase() + langId.slice(1);
+    setStatusBarItem("_lang", { text: langLabel, tooltip: "Select Language Mode" });
+  } else {
+    removeStatusBarItem("_lang");
+  }
+
+  setStatusBarItem("_encoding", { text: "UTF-8", tooltip: "Select Encoding" });
+
+  if (model) {
+    const eol = model.getEOL() === "\r\n" ? "CRLF" : "LF";
+    setStatusBarItem("_eol", { text: eol, tooltip: "Select End of Line" });
+  }
+
+  const lspItems = lspManager?.status() || [];
+  const running = lspItems.filter((s) => s.running);
+  if (running.length) {
+    setStatusBarItem("_lsp", {
+      text: `LSP: ${running.map((s) => s.lang).join(", ")}`,
+      tooltip: "Language Servers",
+    });
+  } else {
+    removeStatusBarItem("_lsp");
+  }
+}
+
+monacoEditor.onDidChangeCursorPosition(() => updateStatusBar());
+monacoEditor.onDidChangeCursorSelection(() => updateStatusBar());
+monacoEditor.onDidChangeModel(() => updateStatusBar());
+updateStatusBar();
 
 function setStatusBarItem(key, opts, onClick) {
   let el = statusItems.get(key);
@@ -5139,6 +5367,8 @@ const palette = createCommandPalette({
     { id: "git.conflicts", title: "Resolve Merge Conflicts", category: "Tools", run: () => openFeaturePanel("conflicts") },
     { id: "debug.open", title: "Debugger", category: "Tools", run: () => openFeaturePanel("debugger") },
     { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
+    { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
+    { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
     { id: "ai.settings", title: t("menu.aiSettings"), category: "Preferences", run: () => openSettings() },
     ...extHost.listCommands().map((c) => ({
       ...c,
@@ -5184,3 +5414,169 @@ Promise.all([
 ]).catch(console.error);
 showChatHint();
 syncWelcome();
+
+// ---- recent projects ----
+const RECENT_PROJECTS_KEY = "michael-ide.recent-projects";
+const MAX_RECENT = 8;
+
+async function addRecentProject(path) {
+  if (!inTauri || !path) return;
+  try {
+    const store = await loadStore("session.json");
+    let list = (await store.get(RECENT_PROJECTS_KEY)) || [];
+    list = list.filter((p) => p !== path);
+    list.unshift(path);
+    if (list.length > MAX_RECENT) list.length = MAX_RECENT;
+    await store.set(RECENT_PROJECTS_KEY, list);
+    await store.save();
+    renderRecentProjects(list);
+  } catch (e) {
+    console.warn("[recent] save failed:", e);
+  }
+}
+
+async function loadRecentProjects() {
+  if (!inTauri) return;
+  try {
+    const store = await loadStore("session.json");
+    const list = (await store.get(RECENT_PROJECTS_KEY)) || [];
+    renderRecentProjects(list);
+  } catch { /* ignore */ }
+}
+
+function renderRecentProjects(list) {
+  const container = $("welcomeRecent");
+  const ul = $("recentList");
+  if (!container || !ul) return;
+  if (!list.length) { container.hidden = true; return; }
+  container.hidden = false;
+  ul.innerHTML = "";
+  for (const path of list) {
+    const li = document.createElement("li");
+    const name = path.split("/").filter(Boolean).pop() || path;
+    li.innerHTML = `<span class="recent-name"></span><span class="recent-path"></span>`;
+    li.querySelector(".recent-name").textContent = name;
+    li.querySelector(".recent-path").textContent = path;
+    li.addEventListener("click", () => openFolder(path));
+    ul.appendChild(li);
+  }
+}
+
+loadRecentProjects();
+
+// ---- session persistence ----
+const SESSION_STORE_KEY = "michael-ide.session";
+
+async function saveSession() {
+  if (!inTauri) return;
+  const tabList = [];
+  for (const [path, f] of openFiles) {
+    tabList.push({ path, name: f.name, dirty: false });
+  }
+  const session = {
+    workspaceRoots: [...workspaceRoots],
+    rootPath,
+    activePath,
+    tabs: tabList,
+  };
+  try {
+    const store = await loadStore("session.json");
+    await store.set(SESSION_STORE_KEY, session);
+    await store.save();
+  } catch (e) {
+    console.warn("[session] save failed:", e);
+  }
+}
+
+async function restoreSession() {
+  if (!inTauri) return;
+  try {
+    const store = await loadStore("session.json");
+    const session = await store.get(SESSION_STORE_KEY);
+    if (!session) return;
+    if (Array.isArray(session.workspaceRoots) && session.workspaceRoots.length) {
+      workspaceRoots = session.workspaceRoots;
+      setActiveWorkspaceRoot(session.rootPath || workspaceRoots[0]);
+      await renderWorkspaceRoots();
+      startFileWatcher();
+      await refreshGitStatus();
+      for (const root of workspaceRoots) preloadProjectModels(root);
+    }
+    if (Array.isArray(session.tabs)) {
+      for (const t of session.tabs) {
+        await openFile(t.path, t.name).catch(() => {});
+      }
+    }
+    if (session.activePath && openFiles.has(session.activePath)) {
+      activate(session.activePath);
+    }
+    updateStatusBar();
+  } catch (e) {
+    console.warn("[session] restore failed:", e);
+  }
+}
+
+// ---- zen mode ----
+let zenModeActive = false;
+function toggleZenMode() {
+  zenModeActive = !zenModeActive;
+  document.body.classList.toggle("zen-mode", zenModeActive);
+  monacoEditor.updateOptions({
+    lineNumbers: zenModeActive ? "off" : "on",
+    glyphMargin: !zenModeActive,
+    folding: !zenModeActive,
+    minimap: { enabled: !zenModeActive },
+  });
+  monacoEditor.layout();
+}
+
+// ---- drag & drop files from Finder ----
+editorContainer.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+  editorContainer.classList.add("drag-target");
+});
+editorContainer.addEventListener("dragleave", () => editorContainer.classList.remove("drag-target"));
+editorContainer.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  editorContainer.classList.remove("drag-target");
+  if (inTauri) {
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      // Tauri drag-drop handled via event
+    } catch { /* ignore */ }
+  }
+  const files = e.dataTransfer?.files;
+  if (!files || !files.length) return;
+  for (const file of files) {
+    if (file.path) {
+      await openFile(file.path, file.name);
+    }
+  }
+});
+if (inTauri) {
+  import("@tauri-apps/api/event").then(({ listen }) => {
+    listen("tauri://drag-drop", async (event) => {
+      const paths = event.payload?.paths || [];
+      for (const p of paths) {
+        const name = p.split("/").pop() || p;
+        const isDir = await backend.readDir(p).then(() => true).catch(() => false);
+        if (isDir) {
+          await openFolder(p);
+        } else {
+          await openFile(p, name);
+        }
+      }
+    });
+  }).catch(() => {});
+}
+
+window.addEventListener("beforeunload", () => saveSession());
+if (inTauri) {
+  import("@tauri-apps/api/event").then(({ listen }) => {
+    listen("tauri://close-requested", () => {
+      saveSession();
+    });
+  }).catch(() => {});
+}
+restoreSession();
