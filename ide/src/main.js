@@ -3510,6 +3510,7 @@ function renderFeaturePanel() {
   }
 
   body.innerHTML = "";
+  body.classList.remove("mkt-body");
   const renderers = {
     workspace: renderWorkspaceTool,
     tasks: renderTasksTool,
@@ -3880,369 +3881,295 @@ function renderRemoteTool(body) {
 
 function renderMarketplaceTool(body) {
   body.classList.add("mkt-body");
-
   const wrap = document.createElement("div");
   wrap.className = "mkt";
   body.appendChild(wrap);
 
-  const CATEGORIES = ["All", "Featured", "Languages", "Themes", "Formatters", "Linters", "Web", "AI", "SCM", "DevOps", "Other"];
-  const SORT_OPTIONS = [
-    { value: "downloads", label: "Most Popular" },
-    { value: "rating", label: "Highest Rated" },
-    { value: "name", label: "Name A-Z" },
-    { value: "recent", label: "Recently Updated" },
+  const GRADIENTS = [
+    "linear-gradient(135deg,#667eea 0%,#764ba2 100%)",
+    "linear-gradient(135deg,#f093fb 0%,#f5576c 100%)",
+    "linear-gradient(135deg,#4facfe 0%,#00f2fe 100%)",
+    "linear-gradient(135deg,#43e97b 0%,#38f9d7 100%)",
+    "linear-gradient(135deg,#fa709a 0%,#fee140 100%)",
+    "linear-gradient(135deg,#a18cd1 0%,#fbc2eb 100%)",
+    "linear-gradient(135deg,#fccb90 0%,#d57eeb 100%)",
+    "linear-gradient(135deg,#e0c3fc 0%,#8ec5fc 100%)",
+    "linear-gradient(135deg,#f5576c 0%,#ff5858 100%)",
+    "linear-gradient(135deg,#13547a 0%,#80d0c7 100%)",
+    "linear-gradient(135deg,#ff9a9e 0%,#fecfef 100%)",
+    "linear-gradient(135deg,#a1c4fd 0%,#c2e9fb 100%)",
   ];
+  const ICON_SVGS = {
+    theme: `<path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.8-.1 2.6-.4-.3-.6-.4-1.3-.4-2.1 0-1.7.9-3.2 2.3-4 .2-.1.4-.3.5-.5.8-1 1.3-2.2 1.3-3.5 0-2-1.1-3.8-2.7-4.8L12 2z" fill="none" stroke="white" stroke-width="1.5"/><circle cx="7.5" cy="11.5" r="1.5" fill="white"/><circle cx="12" cy="7.5" r="1.5" fill="white"/><circle cx="16.5" cy="11.5" r="1.5" fill="white"/>`,
+    git: `<circle cx="12" cy="6" r="2" fill="none" stroke="white" stroke-width="1.5"/><circle cx="12" cy="18" r="2" fill="none" stroke="white" stroke-width="1.5"/><circle cx="18" cy="12" r="2" fill="none" stroke="white" stroke-width="1.5"/><line x1="12" y1="8" x2="12" y2="16" stroke="white" stroke-width="1.5"/><path d="M18 10c0-2-2-4-4-4" fill="none" stroke="white" stroke-width="1.5"/>`,
+    formatter: `<rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="white" stroke-width="1.5"/><line x1="7" y1="8" x2="17" y2="8" stroke="white" stroke-width="1.5"/><line x1="7" y1="12" x2="14" y2="12" stroke="white" stroke-width="1.5"/><line x1="7" y1="16" x2="11" y2="16" stroke="white" stroke-width="1.5"/>`,
+    linter: `<path d="M12 2L2 7l10 5 10-5-10-5z" fill="none" stroke="white" stroke-width="1.5"/><path d="M2 17l10 5 10-5" fill="none" stroke="white" stroke-width="1.5"/><path d="M2 12l10 5 10-5" fill="none" stroke="white" stroke-width="1.5"/>`,
+    language: `<polyline points="16 18 22 12 16 6" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"/><polyline points="8 6 2 12 8 18" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"/>`,
+    docker: `<rect x="2" y="10" width="20" height="10" rx="2" fill="none" stroke="white" stroke-width="1.5"/><path d="M6 10V6a2 2 0 012-2h8a2 2 0 012 2v4" fill="none" stroke="white" stroke-width="1.5"/><line x1="10" y1="14" x2="10" y2="16" stroke="white" stroke-width="1.5"/><line x1="14" y1="14" x2="14" y2="16" stroke="white" stroke-width="1.5"/>`,
+    ai: `<circle cx="12" cy="12" r="3" fill="none" stroke="white" stroke-width="1.5"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4" stroke="white" stroke-width="1.5"/><path d="M4.9 4.9l2.85 2.85m8.5 8.5l2.85 2.85M4.9 19.1l2.85-2.85m8.5-8.5l2.85-2.85" stroke="white" stroke-width="1.5"/>`,
+    web: `<circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.5"/><line x1="2" y1="12" x2="22" y2="12" stroke="white" stroke-width="1.5"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" fill="none" stroke="white" stroke-width="1.5"/>`,
+    default: `<path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z" fill="none" stroke="white" stroke-width="1.5"/><polyline points="3.27 6.96 12 12.01 20.73 6.96" fill="none" stroke="white" stroke-width="1.5"/><line x1="12" y1="22.08" x2="12" y2="12" stroke="white" stroke-width="1.5"/>`,
+  };
 
-  let activeCategory = "All";
-  let activeSort = "downloads";
+  let activeFilter = "all";
   let searchQuery = "";
   let allEntries = [];
   let detailEntry = null;
 
-  const header = document.createElement("div");
-  header.className = "mkt-header";
-  header.innerHTML = `
-    <div class="mkt-header__top">
-      <div class="mkt-header__title">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
-        <span>Extension Marketplace</span>
-      </div>
-      <div class="mkt-search">
-        <svg class="mkt-search__icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input class="mkt-search__input" type="text" spellcheck="false" placeholder="Search extensions by name, tag, or keyword…" />
-      </div>
-    </div>
-    <div class="mkt-header__filters">
-      <div class="mkt-cats"></div>
-      <select class="mkt-sort"></select>
-    </div>`;
-  wrap.appendChild(header);
-
-  const catsEl = header.querySelector(".mkt-cats");
-  for (const cat of CATEGORIES) {
-    const btn = document.createElement("button");
-    btn.className = "mkt-cat" + (cat === activeCategory ? " is-active" : "");
-    btn.type = "button";
-    btn.textContent = cat;
-    btn.addEventListener("click", () => { activeCategory = cat; renderList(); });
-    catsEl.appendChild(btn);
+  function iconFor(entry) {
+    const tags = (entry.tags || []).map((t) => t.toLowerCase());
+    if (tags.includes("theme") || tags.includes("icons")) return ICON_SVGS.theme;
+    if (tags.includes("git")) return ICON_SVGS.git;
+    if (tags.includes("formatter")) return ICON_SVGS.formatter;
+    if (tags.includes("linter")) return ICON_SVGS.linter;
+    if (tags.includes("rust") || tags.includes("python") || tags.includes("language")) return ICON_SVGS.language;
+    if (tags.includes("docker") || tags.includes("devops")) return ICON_SVGS.docker;
+    if (tags.includes("ai") || tags.includes("completion")) return ICON_SVGS.ai;
+    if (tags.includes("web") || tags.includes("css") || tags.includes("server")) return ICON_SVGS.web;
+    return ICON_SVGS.default;
+  }
+  function gradFor(entry) {
+    let h = 0;
+    for (const c of entry.id) h = ((h << 5) - h + c.charCodeAt(0)) | 0;
+    return GRADIENTS[Math.abs(h) % GRADIENTS.length];
+  }
+  function fmtDl(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+    return String(n);
+  }
+  function stars(r) {
+    let s = "";
+    for (let i = 1; i <= 5; i++) s += `<span class="mkt-star${i <= Math.round(r || 0) ? " mkt-star--on" : ""}">★</span>`;
+    return s;
   }
 
-  const sortEl = header.querySelector(".mkt-sort");
-  for (const opt of SORT_OPTIONS) {
-    const o = document.createElement("option");
-    o.value = opt.value;
-    o.textContent = opt.label;
-    sortEl.appendChild(o);
-  }
-  sortEl.addEventListener("change", () => { activeSort = sortEl.value; renderList(); });
-
-  const searchInput = header.querySelector(".mkt-search__input");
+  const searchEl = document.createElement("div");
+  searchEl.className = "mkt-search";
+  searchEl.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" spellcheck="false" placeholder="Search extensions…" />`;
+  wrap.appendChild(searchEl);
+  const searchInput = searchEl.querySelector("input");
   let searchTimer = null;
   searchInput.addEventListener("input", () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => { searchQuery = searchInput.value.trim().toLowerCase(); renderList(); }, 200);
+    searchTimer = setTimeout(() => { searchQuery = searchInput.value.trim().toLowerCase(); renderAll(); }, 180);
   });
 
-  const content = document.createElement("div");
-  content.className = "mkt-content";
-  wrap.appendChild(content);
+  const filters = document.createElement("div");
+  filters.className = "mkt-filters";
+  const FILTERS = [
+    { id: "all", label: "All" }, { id: "featured", label: "Featured" },
+    { id: "languages", label: "Languages" }, { id: "themes", label: "Themes" },
+    { id: "tools", label: "Tools" }, { id: "ai", label: "AI" },
+  ];
+  for (const f of FILTERS) {
+    const btn = document.createElement("button");
+    btn.className = "mkt-pill" + (f.id === activeFilter ? " is-on" : "");
+    btn.type = "button";
+    btn.textContent = f.label;
+    btn.addEventListener("click", () => { activeFilter = f.id; renderAll(); });
+    filters.appendChild(btn);
+  }
+  wrap.appendChild(filters);
 
-  const grid = document.createElement("div");
-  grid.className = "mkt-grid";
-  content.appendChild(grid);
+  const mainArea = document.createElement("div");
+  mainArea.className = "mkt-main";
+  wrap.appendChild(mainArea);
 
-  const detail = document.createElement("div");
-  detail.className = "mkt-detail";
-  detail.hidden = true;
-  content.appendChild(detail);
+  const listView = document.createElement("div");
+  listView.className = "mkt-list";
+  mainArea.appendChild(listView);
 
-  function formatCount(n) {
-    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
-    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "K";
-    return String(n);
+  const detailView = document.createElement("div");
+  detailView.className = "mkt-detail";
+  detailView.hidden = true;
+  mainArea.appendChild(detailView);
+
+  function matchFilter(e) {
+    if (activeFilter === "all") return true;
+    if (activeFilter === "featured") return e.featured;
+    const cat = (e.category || "").toLowerCase();
+    const tags = (e.tags || []).map((t) => t.toLowerCase());
+    if (activeFilter === "languages") return cat === "languages" || tags.some((t) => ["rust", "python", "language", "jupyter"].includes(t));
+    if (activeFilter === "themes") return cat === "themes" || tags.some((t) => ["theme", "icons", "ui"].includes(t));
+    if (activeFilter === "tools") return ["formatters", "linters", "web", "devops", "scm", "other"].includes(cat.toLowerCase()) || tags.some((t) => ["formatter", "linter", "docker", "git", "server", "web", "markdown"].includes(t));
+    if (activeFilter === "ai") return cat === "ai" || tags.some((t) => ["ai", "completion"].includes(t));
+    return true;
   }
 
-  function renderStars(rating) {
-    const r = rating || 0;
-    let html = "";
-    for (let i = 1; i <= 5; i++) {
-      if (i <= Math.floor(r)) {
-        html += `<svg class="mkt-star mkt-star--filled" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
-      } else if (i === Math.ceil(r) && r % 1 >= 0.3) {
-        html += `<svg class="mkt-star mkt-star--half" width="12" height="12" viewBox="0 0 24 24"><defs><linearGradient id="half-${i}"><stop offset="50%" stop-color="currentColor"/><stop offset="50%" stop-color="var(--line)" /></linearGradient></defs><path fill="url(#half-${i})" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
-      } else {
-        html += `<svg class="mkt-star" width="12" height="12" viewBox="0 0 24 24" fill="var(--line)"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
-      }
-    }
-    return html;
-  }
-
-  function entryIconColor(entry) {
-    const colors = ["#4FC1FF", "#C678DD", "#98C379", "#E5C07B", "#E06C75", "#61AFEF", "#56B6C2", "#D19A66"];
-    let hash = 0;
-    for (const ch of entry.id) hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
-    return colors[Math.abs(hash) % colors.length];
-  }
-
-  function createExtCard(entry) {
-    const card = document.createElement("div");
-    card.className = "mkt-card";
-    if (entry.featured) card.classList.add("mkt-card--featured");
-
-    const iconLetter = (entry.name[0] || "E").toUpperCase();
-    const color = entryIconColor(entry);
-
-    card.innerHTML = `
-      <div class="mkt-card__icon" style="background:${color}">${iconLetter}</div>
-      <div class="mkt-card__body">
-        <div class="mkt-card__row1">
-          <span class="mkt-card__name"></span>
-          <span class="mkt-card__ver"></span>
-        </div>
-        <p class="mkt-card__desc"></p>
-        <div class="mkt-card__meta">
-          <span class="mkt-card__author"></span>
-          <span class="mkt-card__stats">
-            <span class="mkt-card__dl">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              <span></span>
-            </span>
-            <span class="mkt-card__rating">${renderStars(entry.rating)}<span class="mkt-card__rating-num"></span></span>
-          </span>
-        </div>
-        <div class="mkt-card__tags"></div>
-      </div>
-      <div class="mkt-card__actions">
-        <button class="mkt-btn mkt-btn--install" type="button">Install</button>
-        <button class="mkt-btn mkt-btn--detail" type="button" title="Details">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-        </button>
-      </div>`;
-
-    card.querySelector(".mkt-card__name").textContent = entry.name;
-    card.querySelector(".mkt-card__ver").textContent = "v" + entry.version;
-    card.querySelector(".mkt-card__desc").textContent = entry.description;
-    card.querySelector(".mkt-card__author").textContent = entry.author;
-    card.querySelector(".mkt-card__dl span").textContent = formatCount(entry.downloads || 0);
-    card.querySelector(".mkt-card__rating-num").textContent = entry.rating ? entry.rating.toFixed(1) : "—";
-
-    const tagsEl = card.querySelector(".mkt-card__tags");
-    for (const tag of (entry.tags || []).slice(0, 4)) {
-      const pill = document.createElement("span");
-      pill.className = "mkt-tag";
-      pill.textContent = tag;
-      pill.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        searchInput.value = tag;
-        searchQuery = tag.toLowerCase();
-        activeCategory = "All";
-        renderList();
-      });
-      tagsEl.appendChild(pill);
-    }
-
-    card.querySelector(".mkt-btn--install").addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      const btn = ev.currentTarget;
-      btn.disabled = true;
-      btn.textContent = "Installing…";
-      try {
-        const msg = await backend.marketplaceInstall(entry);
-        btn.textContent = "Installed";
-        btn.classList.add("mkt-btn--installed");
-        showToast(msg);
-        extPanel.refresh?.();
-      } catch (e) {
-        btn.textContent = "Retry";
-        btn.disabled = false;
-        showToast(String(e && e.message ? e.message : e));
-      }
-    });
-
-    const detailBtn = card.querySelector(".mkt-btn--detail");
-    detailBtn.addEventListener("click", (ev) => { ev.stopPropagation(); showDetail(entry); });
-    card.addEventListener("click", () => showDetail(entry));
-
-    return card;
-  }
-
-  function showDetail(entry) {
-    detailEntry = entry;
-    grid.hidden = true;
-    detail.hidden = false;
-    header.querySelector(".mkt-header__filters").hidden = true;
-
-    const color = entryIconColor(entry);
-    const iconLetter = (entry.name[0] || "E").toUpperCase();
-
-    detail.innerHTML = `
-      <button class="mkt-back" type="button">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-        Back to list
-      </button>
-      <div class="mkt-detail__hero">
-        <div class="mkt-detail__icon" style="background:${color}">${iconLetter}</div>
-        <div class="mkt-detail__info">
-          <h2 class="mkt-detail__name"></h2>
-          <div class="mkt-detail__pub">
-            <span class="mkt-detail__author"></span>
-            <span class="mkt-detail__ver"></span>
-          </div>
-          <div class="mkt-detail__stats">
-            <span class="mkt-detail__rating">${renderStars(entry.rating)}<span></span></span>
-            <span class="mkt-detail__dl">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              <span></span> installs
-            </span>
-          </div>
-          <div class="mkt-detail__tags"></div>
-          <button class="mkt-btn mkt-btn--install mkt-btn--lg" type="button">Install Extension</button>
-        </div>
-      </div>
-      <div class="mkt-detail__body">
-        <div class="mkt-detail__section">
-          <h3>Description</h3>
-          <p class="mkt-detail__desc"></p>
-        </div>
-        <div class="mkt-detail__section">
-          <h3>Details</h3>
-          <table class="mkt-detail__table">
-            <tr><td>Publisher</td><td class="det-author"></td></tr>
-            <tr><td>Version</td><td class="det-version"></td></tr>
-            <tr><td>Extension ID</td><td class="det-id"><code></code></td></tr>
-            <tr><td>Downloads</td><td class="det-downloads"></td></tr>
-            <tr><td>Rating</td><td class="det-rating"></td></tr>
-            <tr><td>Categories</td><td class="det-category"></td></tr>
-          </table>
-        </div>
-      </div>`;
-
-    detail.querySelector(".mkt-detail__name").textContent = entry.name;
-    detail.querySelector(".mkt-detail__author").textContent = entry.author;
-    detail.querySelector(".mkt-detail__ver").textContent = "v" + entry.version;
-    detail.querySelector(".mkt-detail__rating span").textContent = entry.rating ? entry.rating.toFixed(1) : "—";
-    detail.querySelector(".mkt-detail__dl span").textContent = formatCount(entry.downloads || 0);
-    detail.querySelector(".mkt-detail__desc").textContent = entry.description;
-
-    detail.querySelector(".det-author").textContent = entry.author;
-    detail.querySelector(".det-version").textContent = entry.version;
-    detail.querySelector(".det-id code").textContent = entry.id;
-    detail.querySelector(".det-downloads").textContent = (entry.downloads || 0).toLocaleString();
-    detail.querySelector(".det-rating").textContent = entry.rating ? entry.rating.toFixed(1) + " / 5.0" : "No ratings";
-    detail.querySelector(".det-category").textContent = entry.category || "Other";
-
-    const tagsEl = detail.querySelector(".mkt-detail__tags");
-    for (const tag of (entry.tags || [])) {
-      const pill = document.createElement("span");
-      pill.className = "mkt-tag";
-      pill.textContent = tag;
-      tagsEl.appendChild(pill);
-    }
-
-    detail.querySelector(".mkt-back").addEventListener("click", () => {
-      detailEntry = null;
-      grid.hidden = false;
-      detail.hidden = true;
-      header.querySelector(".mkt-header__filters").hidden = false;
-    });
-
-    detail.querySelector(".mkt-btn--install").addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      btn.disabled = true;
-      btn.textContent = "Installing…";
-      try {
-        const msg = await backend.marketplaceInstall(entry);
-        btn.textContent = "Installed";
-        btn.classList.add("mkt-btn--installed");
-        showToast(msg);
-        extPanel.refresh?.();
-      } catch (e) {
-        btn.textContent = "Retry";
-        btn.disabled = false;
-        showToast(String(e && e.message ? e.message : e));
-      }
-    });
-  }
-
-  function filterAndSort(entries) {
-    let filtered = [...entries];
-    if (activeCategory === "Featured") {
-      filtered = filtered.filter((e) => e.featured);
-    } else if (activeCategory !== "All") {
-      filtered = filtered.filter((e) => (e.category || "Other") === activeCategory);
-    }
+  function filtered() {
+    let list = allEntries.filter(matchFilter);
     if (searchQuery) {
-      filtered = filtered.filter((e) =>
+      list = list.filter((e) =>
         e.name.toLowerCase().includes(searchQuery) ||
         e.description.toLowerCase().includes(searchQuery) ||
-        e.id.toLowerCase().includes(searchQuery) ||
         (e.tags || []).some((t) => t.toLowerCase().includes(searchQuery)),
       );
     }
-    switch (activeSort) {
-      case "downloads": filtered.sort((a, b) => (b.downloads || 0) - (a.downloads || 0)); break;
-      case "rating": filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0)); break;
-      case "name": filtered.sort((a, b) => a.name.localeCompare(b.name)); break;
-      case "recent": filtered.sort((a, b) => b.version.localeCompare(a.version)); break;
-    }
-    return filtered;
+    list.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
+    return list;
   }
 
-  function renderList() {
-    catsEl.querySelectorAll(".mkt-cat").forEach((btn) => {
-      btn.classList.toggle("is-active", btn.textContent === activeCategory);
+  function makeCard(entry, big) {
+    const el = document.createElement("div");
+    el.className = big ? "mkt-hero-card" : "mkt-card";
+    const grad = gradFor(entry);
+    const svg = iconFor(entry);
+
+    if (big) {
+      el.innerHTML = `
+        <div class="mkt-hero-card__icon" style="background:${grad}"><svg viewBox="0 0 24 24" width="40" height="40">${svg}</svg></div>
+        <div class="mkt-hero-card__body">
+          <div class="mkt-hero-card__name"></div>
+          <div class="mkt-hero-card__desc"></div>
+          <div class="mkt-hero-card__foot">
+            <span class="mkt-hero-card__author"></span>
+            <span class="mkt-hero-card__stars">${stars(entry.rating)}</span>
+            <button class="mkt-install" type="button">Install</button>
+          </div>
+        </div>`;
+      el.querySelector(".mkt-hero-card__name").textContent = entry.name;
+      el.querySelector(".mkt-hero-card__desc").textContent = entry.description;
+      el.querySelector(".mkt-hero-card__author").textContent = entry.author;
+    } else {
+      el.innerHTML = `
+        <div class="mkt-card__icon" style="background:${grad}"><svg viewBox="0 0 24 24" width="22" height="22">${svg}</svg></div>
+        <div class="mkt-card__info">
+          <div class="mkt-card__top"><span class="mkt-card__name"></span><span class="mkt-card__ver"></span></div>
+          <div class="mkt-card__desc"></div>
+          <div class="mkt-card__bottom">
+            <span class="mkt-card__author"></span>
+            <span class="mkt-card__dl">${fmtDl(entry.downloads || 0)}</span>
+            <span class="mkt-card__stars">${stars(entry.rating)}</span>
+          </div>
+        </div>
+        <button class="mkt-install" type="button">Install</button>`;
+      el.querySelector(".mkt-card__name").textContent = entry.name;
+      el.querySelector(".mkt-card__ver").textContent = "v" + entry.version;
+      el.querySelector(".mkt-card__desc").textContent = entry.description;
+      el.querySelector(".mkt-card__author").textContent = entry.author;
+    }
+
+    el.querySelector(".mkt-install").addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const btn = ev.currentTarget;
+      btn.disabled = true; btn.textContent = "Installing…"; btn.classList.add("is-busy");
+      try {
+        const msg = await backend.marketplaceInstall(entry);
+        btn.textContent = "Installed"; btn.classList.remove("is-busy"); btn.classList.add("is-done");
+        showToast(msg); extPanel.refresh?.();
+      } catch (e) {
+        btn.textContent = "Retry"; btn.disabled = false; btn.classList.remove("is-busy");
+        showToast(String(e && e.message ? e.message : e));
+      }
     });
+    el.addEventListener("click", () => openDetail(entry));
+    return el;
+  }
 
-    grid.innerHTML = "";
-    if (detailEntry) return;
+  function openDetail(entry) {
+    detailEntry = entry;
+    listView.hidden = true;
+    detailView.hidden = false;
+    const grad = gradFor(entry);
+    const svg = iconFor(entry);
+    detailView.innerHTML = `
+      <button class="mkt-back" type="button"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>Back</button>
+      <div class="mkt-det-hero" style="background:${grad}">
+        <div class="mkt-det-icon"><svg viewBox="0 0 24 24" width="56" height="56">${svg}</svg></div>
+        <h2 class="mkt-det-name"></h2>
+        <p class="mkt-det-author"></p>
+        <div class="mkt-det-stats">
+          <span>${stars(entry.rating)} <b>${(entry.rating || 0).toFixed(1)}</b></span>
+          <span><b>${fmtDl(entry.downloads || 0)}</b> installs</span>
+          <span>v${entry.version}</span>
+        </div>
+        <button class="mkt-install mkt-install--hero" type="button">Install Extension</button>
+      </div>
+      <div class="mkt-det-body">
+        <div class="mkt-det-section"><h3>About</h3><p class="mkt-det-desc"></p></div>
+        <div class="mkt-det-section"><h3>Tags</h3><div class="mkt-det-tags"></div></div>
+        <div class="mkt-det-section"><h3>Information</h3>
+          <table class="mkt-det-table"><tbody>
+            <tr><td>Publisher</td><td class="d-pub"></td></tr>
+            <tr><td>Extension ID</td><td class="d-id"></td></tr>
+            <tr><td>Category</td><td class="d-cat"></td></tr>
+          </tbody></table>
+        </div>
+      </div>`;
+    detailView.querySelector(".mkt-det-name").textContent = entry.name;
+    detailView.querySelector(".mkt-det-author").textContent = "by " + entry.author;
+    detailView.querySelector(".mkt-det-desc").textContent = entry.description;
+    detailView.querySelector(".d-pub").textContent = entry.author;
+    detailView.querySelector(".d-id").textContent = entry.id;
+    detailView.querySelector(".d-cat").textContent = entry.category || "Other";
+    const tagsWrap = detailView.querySelector(".mkt-det-tags");
+    for (const tag of (entry.tags || [])) {
+      const pill = document.createElement("span");
+      pill.className = "mkt-pill mkt-pill--tag";
+      pill.textContent = tag;
+      tagsWrap.appendChild(pill);
+    }
+    detailView.querySelector(".mkt-back").addEventListener("click", closeDetail);
+    detailView.querySelector(".mkt-install").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true; btn.textContent = "Installing…"; btn.classList.add("is-busy");
+      try {
+        const msg = await backend.marketplaceInstall(entry);
+        btn.textContent = "Installed"; btn.classList.remove("is-busy"); btn.classList.add("is-done");
+        showToast(msg); extPanel.refresh?.();
+      } catch (e) { btn.textContent = "Retry"; btn.disabled = false; btn.classList.remove("is-busy"); showToast(String(e?.message || e)); }
+    });
+  }
 
-    const filtered = filterAndSort(allEntries);
-    if (!filtered.length) {
-      const empty = document.createElement("div");
-      empty.className = "mkt-empty";
-      empty.innerHTML = `
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.3"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <p>No extensions found</p>
-        <span>Try adjusting your search or filters</span>`;
-      grid.appendChild(empty);
+  function closeDetail() {
+    detailEntry = null;
+    listView.hidden = false;
+    detailView.hidden = true;
+  }
+
+  function renderAll() {
+    filters.querySelectorAll(".mkt-pill").forEach((b, i) => b.classList.toggle("is-on", FILTERS[i].id === activeFilter));
+    listView.innerHTML = "";
+
+    const items = filtered();
+    if (!items.length) {
+      listView.innerHTML = `<div class="mkt-empty"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".25"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><p>No extensions found</p></div>`;
       return;
     }
 
-    const countEl = document.createElement("div");
-    countEl.className = "mkt-count";
-    countEl.textContent = `${filtered.length} extension${filtered.length > 1 ? "s" : ""}`;
-    grid.appendChild(countEl);
-
-    for (const entry of filtered) {
-      grid.appendChild(createExtCard(entry));
+    const feat = items.filter((e) => e.featured);
+    if (!searchQuery && activeFilter === "all" && feat.length) {
+      const sec = document.createElement("div");
+      sec.className = "mkt-section";
+      sec.innerHTML = `<h3 class="mkt-section__title">Featured</h3>`;
+      const row = document.createElement("div");
+      row.className = "mkt-hero-row";
+      for (const e of feat.slice(0, 4)) row.appendChild(makeCard(e, true));
+      sec.appendChild(row);
+      listView.appendChild(sec);
     }
+
+    const sec2 = document.createElement("div");
+    sec2.className = "mkt-section";
+    const title = searchQuery ? `Results for "${searchQuery}"` : (activeFilter === "all" ? "All Extensions" : FILTERS.find((f) => f.id === activeFilter)?.label || "Extensions");
+    sec2.innerHTML = `<h3 class="mkt-section__title">${title} <span class="mkt-section__count">${items.length}</span></h3>`;
+    const grid = document.createElement("div");
+    grid.className = "mkt-grid";
+    for (const e of items) grid.appendChild(makeCard(e, false));
+    sec2.appendChild(grid);
+    listView.appendChild(sec2);
   }
 
-  const loadData = async () => {
-    grid.innerHTML = "";
-    const loading = document.createElement("div");
-    loading.className = "mkt-loading";
-    loading.innerHTML = `<div class="mkt-spinner"></div><span>Loading marketplace…</span>`;
-    grid.appendChild(loading);
+  (async () => {
+    listView.innerHTML = `<div class="mkt-loading"><div class="mkt-spinner"></div><span>Loading marketplace…</span></div>`;
     try {
       allEntries = await backend.marketplaceList();
-      renderList();
+      renderAll();
     } catch (e) {
-      grid.innerHTML = "";
-      const err = document.createElement("div");
-      err.className = "mkt-empty mkt-empty--error";
-      err.innerHTML = `
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        <p>Failed to load marketplace</p>
-        <span></span>
-        <button class="mkt-btn" type="button" style="margin-top:12px">Retry</button>`;
-      err.querySelector("span").textContent = String(e && e.message ? e.message : e);
-      err.querySelector("button").addEventListener("click", loadData);
-      grid.appendChild(err);
+      listView.innerHTML = `<div class="mkt-empty"><p>Failed to load</p><span>${String(e?.message || e)}</span><button class="mkt-install" style="margin-top:12px" onclick="this.closest('.mkt').querySelector('.mkt-list').innerHTML=''">Retry</button></div>`;
     }
-  };
-  loadData();
+  })();
 }
 
 function renderConflictsTool(body) {
