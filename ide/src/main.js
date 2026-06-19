@@ -286,21 +286,157 @@ function mockBackend() {
       id: "michael.theme-pack",
       name: "Michael Theme Pack",
       version: "1.2.0",
-      description: "A curated set of editor themes for Michael IDE.",
+      description: "A curated set of editor themes including Monokai Pro, Nord, Solarized, and 12 more hand-crafted color palettes for comfortable coding.",
       author: "Michael Labs",
       download_url: "https://example.com/michael-theme-pack.zip",
       tags: ["theme", "ui"],
-      downloads: 12840,
+      downloads: 128400,
+      rating: 4.8,
+      featured: true,
+      category: "Themes",
     },
     {
       id: "michael.git-tools",
-      name: "Git Tools",
+      name: "Git Tools Pro",
       version: "0.4.1",
-      description: "Extra source-control commands and status-bar actions.",
+      description: "Advanced Git integration with interactive rebase, cherry-pick UI, stash manager, and inline blame annotations.",
       author: "Michael Labs",
       download_url: "https://example.com/git-tools.zip",
       tags: ["git", "productivity"],
-      downloads: 7331,
+      downloads: 73310,
+      rating: 4.6,
+      featured: true,
+      category: "SCM",
+    },
+    {
+      id: "michael.prettier",
+      name: "Prettier Formatter",
+      version: "3.5.0",
+      description: "Opinionated code formatter supporting JS, TS, CSS, HTML, JSON, Markdown, and more. Format on save.",
+      author: "Prettier Team",
+      download_url: "https://example.com/prettier.zip",
+      tags: ["formatter", "javascript", "typescript"],
+      downloads: 245000,
+      rating: 4.9,
+      featured: true,
+      category: "Formatters",
+    },
+    {
+      id: "michael.eslint",
+      name: "ESLint",
+      version: "4.2.1",
+      description: "Integrates ESLint into Michael IDE. Highlights problems in your code and offers quick-fix actions.",
+      author: "Microsoft",
+      download_url: "https://example.com/eslint.zip",
+      tags: ["linter", "javascript", "typescript"],
+      downloads: 312000,
+      rating: 4.7,
+      featured: false,
+      category: "Linters",
+    },
+    {
+      id: "michael.docker",
+      name: "Docker",
+      version: "1.8.0",
+      description: "Docker container management, Dockerfile syntax highlighting, compose support, and image explorer.",
+      author: "Microsoft",
+      download_url: "https://example.com/docker.zip",
+      tags: ["docker", "devops", "containers"],
+      downloads: 89000,
+      rating: 4.5,
+      featured: false,
+      category: "DevOps",
+    },
+    {
+      id: "michael.rust-analyzer",
+      name: "Rust Analyzer",
+      version: "0.4.2094",
+      description: "Smart Rust language support with completion, diagnostics, refactoring, and inline type hints.",
+      author: "rust-lang",
+      download_url: "https://example.com/rust-analyzer.zip",
+      tags: ["rust", "language"],
+      downloads: 156000,
+      rating: 4.9,
+      featured: true,
+      category: "Languages",
+    },
+    {
+      id: "michael.python",
+      name: "Python",
+      version: "2024.8.0",
+      description: "Rich Python support including IntelliSense, linting, debugging, Jupyter Notebooks, and virtual env management.",
+      author: "Microsoft",
+      download_url: "https://example.com/python.zip",
+      tags: ["python", "language", "jupyter"],
+      downloads: 420000,
+      rating: 4.6,
+      featured: true,
+      category: "Languages",
+    },
+    {
+      id: "michael.icons",
+      name: "Material Icon Theme",
+      version: "5.12.0",
+      description: "Material Design icons for files and folders in the explorer. Over 1000 icons for every file type.",
+      author: "Philipp Kief",
+      download_url: "https://example.com/material-icons.zip",
+      tags: ["icons", "theme", "ui"],
+      downloads: 198000,
+      rating: 4.8,
+      featured: false,
+      category: "Themes",
+    },
+    {
+      id: "michael.copilot",
+      name: "AI Code Companion",
+      version: "1.3.0",
+      description: "AI-powered code completion with multi-line suggestions, chat, and inline code generation.",
+      author: "Michael Labs",
+      download_url: "https://example.com/ai-companion.zip",
+      tags: ["ai", "completion", "productivity"],
+      downloads: 67000,
+      rating: 4.4,
+      featured: true,
+      category: "AI",
+    },
+    {
+      id: "michael.tailwind",
+      name: "Tailwind CSS IntelliSense",
+      version: "0.12.8",
+      description: "Autocomplete, syntax highlighting, color preview, and linting for Tailwind CSS classes.",
+      author: "Tailwind Labs",
+      download_url: "https://example.com/tailwind.zip",
+      tags: ["css", "tailwind", "web"],
+      downloads: 145000,
+      rating: 4.7,
+      featured: false,
+      category: "Web",
+    },
+    {
+      id: "michael.live-server",
+      name: "Live Server",
+      version: "5.7.9",
+      description: "Launch a local development server with live reload for static and dynamic web pages.",
+      author: "Ritwick Dey",
+      download_url: "https://example.com/live-server.zip",
+      tags: ["server", "web", "preview"],
+      downloads: 92000,
+      rating: 4.3,
+      featured: false,
+      category: "Web",
+    },
+    {
+      id: "michael.markdown-all-in-one",
+      name: "Markdown All in One",
+      version: "3.6.2",
+      description: "All you need for Markdown: keyboard shortcuts, table of contents, auto preview, math support, and list editing.",
+      author: "Yu Zhang",
+      download_url: "https://example.com/markdown-aio.zip",
+      tags: ["markdown", "writing", "docs"],
+      downloads: 108000,
+      rating: 4.5,
+      featured: false,
+      category: "Other",
     },
   ];
   // Simulated branches for the browser preview's branch picker.
@@ -3743,57 +3879,370 @@ function renderRemoteTool(body) {
 }
 
 function renderMarketplaceTool(body) {
-  createToolHeader(body, "Extension Marketplace", "Search the online registry and install extensions directly into Michael IDE.");
-  const box = document.createElement("div");
-  box.className = "tool-search";
-  box.innerHTML = `<input spellcheck="false" placeholder="Search extensions…" /><button class="btn" type="button">Search</button>`;
-  const list = document.createElement("div");
-  list.className = "tool-list";
-  body.append(box, list);
+  body.classList.add("mkt-body");
 
-  const load = async () => {
-    list.innerHTML = "";
-    list.appendChild(createEmptyState("Loading marketplace…"));
-    try {
-      const query = box.querySelector("input").value.trim();
-      const entries = query ? await backend.marketplaceSearch(query) : await backend.marketplaceList();
-      list.innerHTML = "";
-      if (!entries.length) list.appendChild(createEmptyState("No extensions found."));
-      for (const entry of entries) {
-        const card = document.createElement("div");
-        card.className = "tool-card";
-        card.innerHTML = `
-          <div class="tool-card__main">
-            <strong></strong>
-            <span></span>
-            <div class="tool-tags"></div>
-          </div>
-          <button class="btn btn--primary" type="button">Install</button>`;
-        card.querySelector("strong").textContent = `${entry.name} ${entry.version}`;
-        card.querySelector("span").textContent = `${entry.description} · ${entry.author} · ${entry.downloads || 0} downloads`;
-        card.querySelector(".tool-tags").textContent = (entry.tags || []).join("  ");
-        card.querySelector("button").addEventListener("click", async () => {
-          try {
-            const msg = await backend.marketplaceInstall(entry);
-            showToast(msg);
-            extPanel.refresh?.();
-          } catch (e) {
-            showToast(String(e && e.message ? e.message : e));
-          }
-        });
-        list.appendChild(card);
+  const wrap = document.createElement("div");
+  wrap.className = "mkt";
+  body.appendChild(wrap);
+
+  const CATEGORIES = ["All", "Featured", "Languages", "Themes", "Formatters", "Linters", "Web", "AI", "SCM", "DevOps", "Other"];
+  const SORT_OPTIONS = [
+    { value: "downloads", label: "Most Popular" },
+    { value: "rating", label: "Highest Rated" },
+    { value: "name", label: "Name A-Z" },
+    { value: "recent", label: "Recently Updated" },
+  ];
+
+  let activeCategory = "All";
+  let activeSort = "downloads";
+  let searchQuery = "";
+  let allEntries = [];
+  let detailEntry = null;
+
+  const header = document.createElement("div");
+  header.className = "mkt-header";
+  header.innerHTML = `
+    <div class="mkt-header__top">
+      <div class="mkt-header__title">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        <span>Extension Marketplace</span>
+      </div>
+      <div class="mkt-search">
+        <svg class="mkt-search__icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input class="mkt-search__input" type="text" spellcheck="false" placeholder="Search extensions by name, tag, or keyword…" />
+      </div>
+    </div>
+    <div class="mkt-header__filters">
+      <div class="mkt-cats"></div>
+      <select class="mkt-sort"></select>
+    </div>`;
+  wrap.appendChild(header);
+
+  const catsEl = header.querySelector(".mkt-cats");
+  for (const cat of CATEGORIES) {
+    const btn = document.createElement("button");
+    btn.className = "mkt-cat" + (cat === activeCategory ? " is-active" : "");
+    btn.type = "button";
+    btn.textContent = cat;
+    btn.addEventListener("click", () => { activeCategory = cat; renderList(); });
+    catsEl.appendChild(btn);
+  }
+
+  const sortEl = header.querySelector(".mkt-sort");
+  for (const opt of SORT_OPTIONS) {
+    const o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = opt.label;
+    sortEl.appendChild(o);
+  }
+  sortEl.addEventListener("change", () => { activeSort = sortEl.value; renderList(); });
+
+  const searchInput = header.querySelector(".mkt-search__input");
+  let searchTimer = null;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { searchQuery = searchInput.value.trim().toLowerCase(); renderList(); }, 200);
+  });
+
+  const content = document.createElement("div");
+  content.className = "mkt-content";
+  wrap.appendChild(content);
+
+  const grid = document.createElement("div");
+  grid.className = "mkt-grid";
+  content.appendChild(grid);
+
+  const detail = document.createElement("div");
+  detail.className = "mkt-detail";
+  detail.hidden = true;
+  content.appendChild(detail);
+
+  function formatCount(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+    return String(n);
+  }
+
+  function renderStars(rating) {
+    const r = rating || 0;
+    let html = "";
+    for (let i = 1; i <= 5; i++) {
+      if (i <= Math.floor(r)) {
+        html += `<svg class="mkt-star mkt-star--filled" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
+      } else if (i === Math.ceil(r) && r % 1 >= 0.3) {
+        html += `<svg class="mkt-star mkt-star--half" width="12" height="12" viewBox="0 0 24 24"><defs><linearGradient id="half-${i}"><stop offset="50%" stop-color="currentColor"/><stop offset="50%" stop-color="var(--line)" /></linearGradient></defs><path fill="url(#half-${i})" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
+      } else {
+        html += `<svg class="mkt-star" width="12" height="12" viewBox="0 0 24 24" fill="var(--line)"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>`;
       }
+    }
+    return html;
+  }
+
+  function entryIconColor(entry) {
+    const colors = ["#4FC1FF", "#C678DD", "#98C379", "#E5C07B", "#E06C75", "#61AFEF", "#56B6C2", "#D19A66"];
+    let hash = 0;
+    for (const ch of entry.id) hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
+    return colors[Math.abs(hash) % colors.length];
+  }
+
+  function createExtCard(entry) {
+    const card = document.createElement("div");
+    card.className = "mkt-card";
+    if (entry.featured) card.classList.add("mkt-card--featured");
+
+    const iconLetter = (entry.name[0] || "E").toUpperCase();
+    const color = entryIconColor(entry);
+
+    card.innerHTML = `
+      <div class="mkt-card__icon" style="background:${color}">${iconLetter}</div>
+      <div class="mkt-card__body">
+        <div class="mkt-card__row1">
+          <span class="mkt-card__name"></span>
+          <span class="mkt-card__ver"></span>
+        </div>
+        <p class="mkt-card__desc"></p>
+        <div class="mkt-card__meta">
+          <span class="mkt-card__author"></span>
+          <span class="mkt-card__stats">
+            <span class="mkt-card__dl">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span></span>
+            </span>
+            <span class="mkt-card__rating">${renderStars(entry.rating)}<span class="mkt-card__rating-num"></span></span>
+          </span>
+        </div>
+        <div class="mkt-card__tags"></div>
+      </div>
+      <div class="mkt-card__actions">
+        <button class="mkt-btn mkt-btn--install" type="button">Install</button>
+        <button class="mkt-btn mkt-btn--detail" type="button" title="Details">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+      </div>`;
+
+    card.querySelector(".mkt-card__name").textContent = entry.name;
+    card.querySelector(".mkt-card__ver").textContent = "v" + entry.version;
+    card.querySelector(".mkt-card__desc").textContent = entry.description;
+    card.querySelector(".mkt-card__author").textContent = entry.author;
+    card.querySelector(".mkt-card__dl span").textContent = formatCount(entry.downloads || 0);
+    card.querySelector(".mkt-card__rating-num").textContent = entry.rating ? entry.rating.toFixed(1) : "—";
+
+    const tagsEl = card.querySelector(".mkt-card__tags");
+    for (const tag of (entry.tags || []).slice(0, 4)) {
+      const pill = document.createElement("span");
+      pill.className = "mkt-tag";
+      pill.textContent = tag;
+      pill.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        searchInput.value = tag;
+        searchQuery = tag.toLowerCase();
+        activeCategory = "All";
+        renderList();
+      });
+      tagsEl.appendChild(pill);
+    }
+
+    card.querySelector(".mkt-btn--install").addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Installing…";
+      try {
+        const msg = await backend.marketplaceInstall(entry);
+        btn.textContent = "Installed";
+        btn.classList.add("mkt-btn--installed");
+        showToast(msg);
+        extPanel.refresh?.();
+      } catch (e) {
+        btn.textContent = "Retry";
+        btn.disabled = false;
+        showToast(String(e && e.message ? e.message : e));
+      }
+    });
+
+    const detailBtn = card.querySelector(".mkt-btn--detail");
+    detailBtn.addEventListener("click", (ev) => { ev.stopPropagation(); showDetail(entry); });
+    card.addEventListener("click", () => showDetail(entry));
+
+    return card;
+  }
+
+  function showDetail(entry) {
+    detailEntry = entry;
+    grid.hidden = true;
+    detail.hidden = false;
+    header.querySelector(".mkt-header__filters").hidden = true;
+
+    const color = entryIconColor(entry);
+    const iconLetter = (entry.name[0] || "E").toUpperCase();
+
+    detail.innerHTML = `
+      <button class="mkt-back" type="button">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        Back to list
+      </button>
+      <div class="mkt-detail__hero">
+        <div class="mkt-detail__icon" style="background:${color}">${iconLetter}</div>
+        <div class="mkt-detail__info">
+          <h2 class="mkt-detail__name"></h2>
+          <div class="mkt-detail__pub">
+            <span class="mkt-detail__author"></span>
+            <span class="mkt-detail__ver"></span>
+          </div>
+          <div class="mkt-detail__stats">
+            <span class="mkt-detail__rating">${renderStars(entry.rating)}<span></span></span>
+            <span class="mkt-detail__dl">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span></span> installs
+            </span>
+          </div>
+          <div class="mkt-detail__tags"></div>
+          <button class="mkt-btn mkt-btn--install mkt-btn--lg" type="button">Install Extension</button>
+        </div>
+      </div>
+      <div class="mkt-detail__body">
+        <div class="mkt-detail__section">
+          <h3>Description</h3>
+          <p class="mkt-detail__desc"></p>
+        </div>
+        <div class="mkt-detail__section">
+          <h3>Details</h3>
+          <table class="mkt-detail__table">
+            <tr><td>Publisher</td><td class="det-author"></td></tr>
+            <tr><td>Version</td><td class="det-version"></td></tr>
+            <tr><td>Extension ID</td><td class="det-id"><code></code></td></tr>
+            <tr><td>Downloads</td><td class="det-downloads"></td></tr>
+            <tr><td>Rating</td><td class="det-rating"></td></tr>
+            <tr><td>Categories</td><td class="det-category"></td></tr>
+          </table>
+        </div>
+      </div>`;
+
+    detail.querySelector(".mkt-detail__name").textContent = entry.name;
+    detail.querySelector(".mkt-detail__author").textContent = entry.author;
+    detail.querySelector(".mkt-detail__ver").textContent = "v" + entry.version;
+    detail.querySelector(".mkt-detail__rating span").textContent = entry.rating ? entry.rating.toFixed(1) : "—";
+    detail.querySelector(".mkt-detail__dl span").textContent = formatCount(entry.downloads || 0);
+    detail.querySelector(".mkt-detail__desc").textContent = entry.description;
+
+    detail.querySelector(".det-author").textContent = entry.author;
+    detail.querySelector(".det-version").textContent = entry.version;
+    detail.querySelector(".det-id code").textContent = entry.id;
+    detail.querySelector(".det-downloads").textContent = (entry.downloads || 0).toLocaleString();
+    detail.querySelector(".det-rating").textContent = entry.rating ? entry.rating.toFixed(1) + " / 5.0" : "No ratings";
+    detail.querySelector(".det-category").textContent = entry.category || "Other";
+
+    const tagsEl = detail.querySelector(".mkt-detail__tags");
+    for (const tag of (entry.tags || [])) {
+      const pill = document.createElement("span");
+      pill.className = "mkt-tag";
+      pill.textContent = tag;
+      tagsEl.appendChild(pill);
+    }
+
+    detail.querySelector(".mkt-back").addEventListener("click", () => {
+      detailEntry = null;
+      grid.hidden = false;
+      detail.hidden = true;
+      header.querySelector(".mkt-header__filters").hidden = false;
+    });
+
+    detail.querySelector(".mkt-btn--install").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Installing…";
+      try {
+        const msg = await backend.marketplaceInstall(entry);
+        btn.textContent = "Installed";
+        btn.classList.add("mkt-btn--installed");
+        showToast(msg);
+        extPanel.refresh?.();
+      } catch (e) {
+        btn.textContent = "Retry";
+        btn.disabled = false;
+        showToast(String(e && e.message ? e.message : e));
+      }
+    });
+  }
+
+  function filterAndSort(entries) {
+    let filtered = [...entries];
+    if (activeCategory === "Featured") {
+      filtered = filtered.filter((e) => e.featured);
+    } else if (activeCategory !== "All") {
+      filtered = filtered.filter((e) => (e.category || "Other") === activeCategory);
+    }
+    if (searchQuery) {
+      filtered = filtered.filter((e) =>
+        e.name.toLowerCase().includes(searchQuery) ||
+        e.description.toLowerCase().includes(searchQuery) ||
+        e.id.toLowerCase().includes(searchQuery) ||
+        (e.tags || []).some((t) => t.toLowerCase().includes(searchQuery)),
+      );
+    }
+    switch (activeSort) {
+      case "downloads": filtered.sort((a, b) => (b.downloads || 0) - (a.downloads || 0)); break;
+      case "rating": filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0)); break;
+      case "name": filtered.sort((a, b) => a.name.localeCompare(b.name)); break;
+      case "recent": filtered.sort((a, b) => b.version.localeCompare(a.version)); break;
+    }
+    return filtered;
+  }
+
+  function renderList() {
+    catsEl.querySelectorAll(".mkt-cat").forEach((btn) => {
+      btn.classList.toggle("is-active", btn.textContent === activeCategory);
+    });
+
+    grid.innerHTML = "";
+    if (detailEntry) return;
+
+    const filtered = filterAndSort(allEntries);
+    if (!filtered.length) {
+      const empty = document.createElement("div");
+      empty.className = "mkt-empty";
+      empty.innerHTML = `
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.3"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <p>No extensions found</p>
+        <span>Try adjusting your search or filters</span>`;
+      grid.appendChild(empty);
+      return;
+    }
+
+    const countEl = document.createElement("div");
+    countEl.className = "mkt-count";
+    countEl.textContent = `${filtered.length} extension${filtered.length > 1 ? "s" : ""}`;
+    grid.appendChild(countEl);
+
+    for (const entry of filtered) {
+      grid.appendChild(createExtCard(entry));
+    }
+  }
+
+  const loadData = async () => {
+    grid.innerHTML = "";
+    const loading = document.createElement("div");
+    loading.className = "mkt-loading";
+    loading.innerHTML = `<div class="mkt-spinner"></div><span>Loading marketplace…</span>`;
+    grid.appendChild(loading);
+    try {
+      allEntries = await backend.marketplaceList();
+      renderList();
     } catch (e) {
-      list.innerHTML = "";
-      list.appendChild(createEmptyState(String(e && e.message ? e.message : e)));
+      grid.innerHTML = "";
+      const err = document.createElement("div");
+      err.className = "mkt-empty mkt-empty--error";
+      err.innerHTML = `
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <p>Failed to load marketplace</p>
+        <span></span>
+        <button class="mkt-btn" type="button" style="margin-top:12px">Retry</button>`;
+      err.querySelector("span").textContent = String(e && e.message ? e.message : e);
+      err.querySelector("button").addEventListener("click", loadData);
+      grid.appendChild(err);
     }
   };
-
-  box.querySelector("button").addEventListener("click", load);
-  box.querySelector("input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") load();
-  });
-  load();
+  loadData();
 }
 
 function renderConflictsTool(body) {
