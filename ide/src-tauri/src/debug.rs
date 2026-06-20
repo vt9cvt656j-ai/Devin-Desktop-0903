@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::process_util;
+
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -67,28 +69,6 @@ fn encode_dap_message(content: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
 }
 
-/// PATH that includes the workspace `node_modules/.bin` plus common toolchain
-/// dirs so debug adapters (debugpy, delve, lldb-dap, vscode-js-debug) resolve.
-#[cfg(not(windows))]
-fn augmented_path(workspace: Option<&str>) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
-        parts.push(format!("{ws}/node_modules/.bin"));
-    }
-    parts.push(format!("{home}/.cargo/bin"));
-    parts.push("/opt/homebrew/bin".into());
-    parts.push("/usr/local/bin".into());
-    parts.push(format!("{home}/go/bin"));
-    parts.push(format!("{home}/.local/bin"));
-    parts.push("/usr/bin".into());
-    parts.push("/bin".into());
-    let extra = parts.join(":");
-    match std::env::var("PATH") {
-        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
-        _ => extra,
-    }
-}
 
 #[tauri::command]
 pub fn dap_start(
@@ -104,6 +84,9 @@ pub fn dap_start(
             "Debug adapter '{}' is already running",
             config.adapter_id
         ));
+    }
+    if inner.len() >= process_util::MAX_CHILD_PROCESSES {
+        return Err("too many debug adapters running; stop one first".into());
     }
 
     let command = if config.command.is_empty() {
@@ -140,7 +123,7 @@ pub fn dap_start(
         builder.current_dir(cwd);
     }
     #[cfg(not(windows))]
-    builder.env("PATH", augmented_path(config.cwd.as_deref()));
+    builder.env("PATH", process_util::augmented_path(config.cwd.as_deref()));
 
     let mut child = builder
         .spawn()

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::process_util;
+
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -73,30 +75,6 @@ fn encode_lsp_message(content: &str) -> String {
     )
 }
 
-/// Build a PATH that also includes the workspace's `node_modules/.bin` plus the
-/// usual toolchain dirs, so project-local and user-installed language servers
-/// (typescript-language-server, pyright, rust-analyzer, gopls, clangd, …)
-/// resolve even when the app was launched from a GUI with a minimal PATH.
-#[cfg(not(windows))]
-fn augmented_path(workspace: Option<&str>) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
-        parts.push(format!("{ws}/node_modules/.bin"));
-    }
-    parts.push(format!("{home}/.cargo/bin"));
-    parts.push("/opt/homebrew/bin".into());
-    parts.push("/usr/local/bin".into());
-    parts.push(format!("{home}/go/bin"));
-    parts.push(format!("{home}/.local/bin"));
-    parts.push("/usr/bin".into());
-    parts.push("/bin".into());
-    let extra = parts.join(":");
-    match std::env::var("PATH") {
-        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
-        _ => extra,
-    }
-}
 
 /// Strip a `file://` prefix from a root URI to get a filesystem path.
 fn workspace_dir_from_uri(uri: &str) -> Option<String> {
@@ -119,6 +97,9 @@ pub fn lsp_start(
 
     if inner.contains_key(&config.lang) {
         return Err(format!("LSP for '{}' is already running", config.lang));
+    }
+    if inner.len() >= process_util::MAX_CHILD_PROCESSES {
+        return Err("too many language servers running; stop one first".into());
     }
 
     let command = if config.command.is_empty() {
@@ -147,10 +128,10 @@ pub fn lsp_start(
     if let Some(ws) = workspace_dir_from_uri(&config.root_uri) {
         builder.current_dir(&ws);
         #[cfg(not(windows))]
-        builder.env("PATH", augmented_path(Some(&ws)));
+        builder.env("PATH", process_util::augmented_path(Some(&ws)));
     } else {
         #[cfg(not(windows))]
-        builder.env("PATH", augmented_path(None));
+        builder.env("PATH", process_util::augmented_path(None));
     }
     let mut child = builder
         .spawn()

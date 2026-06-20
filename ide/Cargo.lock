@@ -731,6 +731,7 @@ dependencies = [
  "futures-util",
  "notify",
  "notify-debouncer-mini",
+ "once_cell",
  "portable-pty",
  "reqwest 0.12.28",
  "serde",

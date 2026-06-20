@@ -1,4 +1,16 @@
 // Michael IDE — editor + AI assistant orchestration.
+
+// Global error boundary: catch unhandled errors/rejections so the IDE never
+// silently dies. Shows a transient toast and logs to the console.
+window.addEventListener("error", (e) => {
+  console.error("[michael-ide] uncaught:", e.error || e.message);
+  try { showToast?.(`Error: ${e.message}`, 5000); } catch { /* too early */ }
+});
+window.addEventListener("unhandledrejection", (e) => {
+  console.error("[michael-ide] unhandled rejection:", e.reason);
+  try { showToast?.(`Unhandled: ${e.reason?.message || e.reason}`, 5000); } catch { /* too early */ }
+});
+
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
@@ -76,6 +88,7 @@ async function tauriBackend() {
   const core = await import("@tauri-apps/api/core");
   const dialog = await import("@tauri-apps/plugin-dialog");
   return {
+    registerWorkspaceRoot: (path) => core.invoke("register_workspace_root", { path }),
     readDir: (path) => core.invoke("read_dir", { path }),
     readTextFile: (path) => core.invoke("read_text_file", { path }),
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
@@ -1883,6 +1896,7 @@ async function renderWorkspaceRoots() {
 async function openFolder(path) {
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
+  try { await backend.registerWorkspaceRoot(path); } catch { /* browser preview */ }
   await renderWorkspaceRoots();
   preloadProjectModels(path);
   await refreshGitStatus();
@@ -1933,6 +1947,7 @@ async function addFolderToWorkspace() {
   const picked = await backend.pickFolder();
   if (!picked) return;
   if (!workspaceRoots.includes(picked)) workspaceRoots.push(picked);
+  try { await backend.registerWorkspaceRoot(picked); } catch { /* browser preview */ }
   setActiveWorkspaceRoot(picked);
   await renderWorkspaceRoots();
   preloadProjectModels(picked);

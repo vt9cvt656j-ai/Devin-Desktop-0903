@@ -1,13 +1,20 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 const REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/fendoushaonian/Devin-Desktop/main/marketplace/registry.json";
 const MAX_MARKETPLACE_ARCHIVE: usize = 64 * 1024 * 1024;
+const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+type RegistryCache = Option<(Instant, Vec<MarketplaceEntry>)>;
+static REGISTRY_CACHE: Lazy<Mutex<RegistryCache>> = Lazy::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceEntry {
@@ -113,8 +120,17 @@ async fn download_archive_with_limit(resp: reqwest::Response) -> Result<Vec<u8>,
 
 #[tauri::command]
 pub async fn marketplace_list() -> Result<Vec<MarketplaceEntry>, String> {
+    {
+        let cache = REGISTRY_CACHE.lock().map_err(|e| e.to_string())?;
+        if let Some((fetched_at, entries)) = cache.as_ref() {
+            if fetched_at.elapsed() < REGISTRY_CACHE_TTL {
+                return Ok(entries.clone());
+            }
+        }
+    }
+
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -125,10 +141,7 @@ pub async fn marketplace_list() -> Result<Vec<MarketplaceEntry>, String> {
         .map_err(|e| format!("failed to fetch registry: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "registry returned status {}",
-            resp.status()
-        ));
+        return Err(format!("registry returned status {}", resp.status()));
     }
 
     let registry: RegistryResponse = resp
@@ -136,7 +149,11 @@ pub async fn marketplace_list() -> Result<Vec<MarketplaceEntry>, String> {
         .await
         .map_err(|e| format!("invalid registry format: {e}"))?;
 
-    Ok(registry.extensions)
+    let entries = registry.extensions;
+    if let Ok(mut cache) = REGISTRY_CACHE.lock() {
+        *cache = Some((Instant::now(), entries.clone()));
+    }
+    Ok(entries)
 }
 
 #[tauri::command]

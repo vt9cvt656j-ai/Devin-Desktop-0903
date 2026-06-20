@@ -1,5 +1,8 @@
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+
+use once_cell::sync::Lazy;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
 
 /// Maximum size of a file we will load into the editor (5 MiB).
 const MAX_FILE: u64 = 5 * 1024 * 1024;
@@ -26,6 +29,78 @@ const IGNORED_DIRS: &[&str] = &[
     "coverage",
 ];
 
+/// Workspace roots that have been opened by the user via the native folder
+/// dialog.  Every file-system command that operates on arbitrary paths
+/// (read / write / delete / rename / search / replace) checks that the target
+/// path falls inside one of these roots, blocking path-traversal attacks from
+/// XSS or extension sandbox escapes.
+static ALLOWED_ROOTS: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Register a workspace root that the user explicitly opened.
+/// Called from the frontend after a successful folder-open dialog.
+#[tauri::command]
+pub fn register_workspace_root(path: String) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let mut roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
+    if !roots.contains(&canonical) {
+        roots.push(canonical);
+    }
+    Ok(())
+}
+
+/// Verify `target` is inside an allowed workspace root.  Resolves symlinks and
+/// normalises components so that `../../etc/passwd` tricks are caught even when
+/// intermediate directories exist.
+fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
+    let target_path = Path::new(target);
+
+    // For paths that don't exist yet (create_file, create_dir), resolve the
+    // deepest existing ancestor and append the remaining components.
+    let resolved = if target_path.exists() {
+        std::fs::canonicalize(target_path).map_err(|e| e.to_string())?
+    } else {
+        let mut base = target_path.to_path_buf();
+        let mut pending: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            if base.exists() {
+                break;
+            }
+            if let Some(name) = base.file_name() {
+                pending.push(name.to_os_string());
+            } else {
+                break;
+            }
+            match base.parent() {
+                Some(p) => base = p.to_path_buf(),
+                None => break,
+            }
+        }
+        let mut resolved = std::fs::canonicalize(&base).map_err(|e| e.to_string())?;
+        for seg in pending.into_iter().rev() {
+            let comp = Path::new(&seg);
+            for c in comp.components() {
+                match c {
+                    Component::Normal(s) => resolved.push(s),
+                    Component::CurDir => {}
+                    _ => return Err("path contains disallowed components".into()),
+                }
+            }
+        }
+        resolved
+    };
+
+    let roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
+    if roots.is_empty() {
+        return Ok(resolved);
+    }
+    for root in roots.iter() {
+        if resolved.starts_with(root) {
+            return Ok(resolved);
+        }
+    }
+    Err("access denied: path is outside all workspace roots".to_string())
+}
+
 #[derive(Serialize)]
 pub struct DirEntry {
     name: String,
@@ -37,6 +112,7 @@ pub struct DirEntry {
 /// Dotfiles are hidden by default to keep the tree tidy.
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    require_inside_workspace(&path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -64,6 +140,7 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 /// never tries to render garbage.
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
+    require_inside_workspace(&path)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
@@ -78,6 +155,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 /// Overwrite a file with new text content.
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+    require_inside_workspace(&path)?;
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
@@ -92,6 +170,7 @@ pub fn home_dir() -> Option<String> {
 /// Create a new empty file. Errors if anything already exists at `path`.
 #[tauri::command]
 pub fn create_file(path: String) -> Result<(), String> {
+    require_inside_workspace(&path)?;
     let p = Path::new(&path);
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
@@ -105,6 +184,7 @@ pub fn create_file(path: String) -> Result<(), String> {
 /// Create a new directory (including any missing parents).
 #[tauri::command]
 pub fn create_dir(path: String) -> Result<(), String> {
+    require_inside_workspace(&path)?;
     let p = Path::new(&path);
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
@@ -115,6 +195,8 @@ pub fn create_dir(path: String) -> Result<(), String> {
 /// Rename or move a file/folder. Errors if the destination already exists.
 #[tauri::command]
 pub fn rename_path(from: String, to: String) -> Result<(), String> {
+    require_inside_workspace(&from)?;
+    require_inside_workspace(&to)?;
     let to_p = Path::new(&to);
     if to_p.exists() {
         return Err("a file or folder with that name already exists".into());
@@ -128,6 +210,7 @@ pub fn rename_path(from: String, to: String) -> Result<(), String> {
 /// Delete a file, or a directory and all of its contents.
 #[tauri::command]
 pub fn delete_path(path: String) -> Result<(), String> {
+    require_inside_workspace(&path)?;
     let p = Path::new(&path);
     let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
     if meta.is_dir() {

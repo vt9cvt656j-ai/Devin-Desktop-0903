@@ -5,6 +5,7 @@ mod files;
 mod git;
 mod lsp;
 mod marketplace;
+mod process_util;
 mod tasks;
 mod terminal;
 mod watcher;
@@ -33,6 +34,7 @@ pub fn run() {
         .manage(debug::DebugManager::default())
         .manage(watcher::WatcherState::default())
         .invoke_handler(tauri::generate_handler![
+            files::register_workspace_root,
             files::read_dir,
             files::read_text_file,
             files::write_text_file,
