@@ -142,14 +142,20 @@ async function tauriBackend() {
     termWrite: (id, data) => core.invoke("term_write", { id, data }),
     termResize: (id, cols, rows) => core.invoke("term_resize", { id, cols, rows }),
     termClose: (id) => core.invoke("term_close", { id }),
+    termListCommands: () => core.invoke("term_list_commands"),
+    termHistory: () => core.invoke("term_history"),
     fsWatch: (paths) => core.invoke("fs_watch", { paths }),
     fsUnwatch: (paths) => core.invoke("fs_unwatch", { paths }),
     replaceInFile: (filePath, query, replacement, caseSensitive) =>
       core.invoke("replace_in_file", { filePath, query, replacement, caseSensitive }),
     replaceInProject: (root, query, replacement, caseSensitive) =>
       core.invoke("replace_in_project", { root, query, replacement, caseSensitive }),
-    gitStash: () => Promise.resolve("stash not yet wired"),
-    gitStashPop: () => Promise.resolve("stash pop not yet wired"),
+    gitStash: (root) => core.invoke("git_stash", { root }),
+    gitStashPop: (root, index) => core.invoke("git_stash_pop", { root, index: index ?? null }),
+    gitStashApply: (root, index) => core.invoke("git_stash_apply", { root, index }),
+    gitStashDrop: (root, index) => core.invoke("git_stash_drop", { root, index }),
+    gitStashList: (root) => core.invoke("git_stash_list", { root }),
+    gitBlame: (root, rel) => core.invoke("git_blame", { root, rel }),
   };
 }
 
@@ -200,6 +206,8 @@ function mockBackend() {
   const GIT_CONFLICTS = [
     { rel: "src/utils/format.js", name: "format.js" },
   ];
+  // In-memory stash list for the browser preview.
+  const GIT_STASHES = [];
   const MERGE_VERSIONS = {
     "src/utils/format.js": {
       base: "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
@@ -697,6 +705,40 @@ function mockBackend() {
       else if (versions && resolution === "theirs") FILES[prefix + rel] = versions.theirs;
       GIT_CONFLICTS.splice(0, GIT_CONFLICTS.length, ...GIT_CONFLICTS.filter((c) => c.rel !== rel));
     },
+    gitStash: async () => {
+      if (!GIT_CHANGES.length && !GIT_STASHES.length) return "No local changes to stash.";
+      const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+      GIT_STASHES.unshift(`stash@{0}: On main: Michael IDE stash (${ts})`);
+      return GIT_STASHES[0];
+    },
+    gitStashList: async () =>
+      GIT_STASHES.map((s, i) => s.replace(/^stash@\{\d+\}/, `stash@{${i}}`)),
+    gitStashPop: async (_root, index) => {
+      const i = index ?? 0;
+      if (i >= GIT_STASHES.length) throw new Error("No stash entry found.");
+      GIT_STASHES.splice(i, 1);
+      return "Stash applied.";
+    },
+    gitStashApply: async (_root, index) => {
+      if ((index ?? 0) >= GIT_STASHES.length) throw new Error("No stash entry found.");
+      return "Stash applied.";
+    },
+    gitStashDrop: async (_root, index) => {
+      const i = index ?? 0;
+      if (i >= GIT_STASHES.length) throw new Error("No stash entry found.");
+      GIT_STASHES.splice(i, 1);
+      return "Stash dropped.";
+    },
+    gitBlame: async (_root, rel) => {
+      const now = Math.floor(Date.now() / 1000);
+      const lines = (FILES[ROOT + "/" + rel] || "").split("\n");
+      return lines.map((_, idx) => ({
+        commit: idx % 3 === 0 ? "a1b2c3d4" : "e4f5g6h7",
+        author: idx % 3 === 0 ? "Michael" : "Andrew",
+        date: String(now - (idx % 3 === 0 ? 7200 : 86400)),
+        line: idx + 1,
+      }));
+    },
     lspList: async () => ["typescript", "javascript", "rust", "python", "go", "html", "css", "json"]
       .map((lang) => ({ lang, running: mockLspRunning.has(lang) })),
     lspStart: async (config, onEvent) => {
@@ -801,6 +843,8 @@ function mockBackend() {
     termClose: async (id) => {
       mockTerms.delete(id);
     },
+    termListCommands: async () => [],
+    termHistory: async () => [],
   };
 }
 
@@ -873,6 +917,25 @@ function toggleSplitEditor() {
 const EDITOR_PREFS_KEY = "editor-prefs";
 let _editorPrefs = null;
 
+const DEFAULT_EDITOR_SETTINGS = {
+  theme: "system",
+  fontSize: 13,
+  fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
+  lineHeight: 0,
+  tabSize: 4,
+  wordWrap: "off",
+  minimap: true,
+  stickyScroll: true,
+  renderWhitespace: "selection",
+  cursorBlinking: "smooth",
+  bracketColorization: true,
+  autoSave: true,
+};
+
+function effectivePrefs() {
+  return { ...DEFAULT_EDITOR_SETTINGS, ...(_editorPrefs || {}) };
+}
+
 async function loadEditorPrefs() {
   if (_editorPrefs) return _editorPrefs;
   const store = await getStore();
@@ -892,10 +955,42 @@ async function loadEditorPrefs() {
 }
 
 async function saveEditorPrefs() {
+  _editorPrefs = _editorPrefs || {};
   const store = await getStore();
   await store.set(EDITOR_PREFS_KEY, _editorPrefs);
   await store.save();
 }
+
+function applyModelOptions() {
+  const p = effectivePrefs();
+  const tabSize = Math.max(1, Math.min(8, Number(p.tabSize) || 4));
+  monacoEditor.getModel()?.updateOptions({ tabSize, insertSpaces: true });
+}
+
+function applyEditorPrefs() {
+  const p = effectivePrefs();
+  const opts = {
+    fontSize: Math.max(8, Math.min(48, Number(p.fontSize) || 13)),
+    fontFamily: p.fontFamily || DEFAULT_EDITOR_SETTINGS.fontFamily,
+    lineHeight: Math.max(0, Number(p.lineHeight) || 0),
+    wordWrap: p.wordWrap || "off",
+    minimap: { enabled: p.minimap !== false, maxColumn: 80, renderCharacters: false },
+    stickyScroll: { enabled: p.stickyScroll !== false },
+    renderWhitespace: p.renderWhitespace || "selection",
+    cursorBlinking: p.cursorBlinking || "smooth",
+    bracketPairColorization: {
+      enabled: p.bracketColorization !== false,
+      independentColorPoolPerBracketType: true,
+    },
+  };
+  monacoEditor.updateOptions(opts);
+  if (splitEditor) splitEditor.updateOptions(opts);
+  applyModelOptions();
+  if (p.theme) { currentTheme = p.theme; applyEditorTheme(); }
+  autoSaveEnabled = p.autoSave !== false;
+}
+
+monacoEditor.onDidChangeModel(() => applyModelOptions());
 
 let currentTheme = "system";
 
@@ -1280,6 +1375,7 @@ function activate(path) {
   $("windowTitle").textContent = f.name + " — Michael IDE";
   if (!f.isImage) {
     refreshGutter();
+    refreshBlame();
     updateBreadcrumb(path);
     renderBreakpointDecorations();
     applyDebugLineDecoration();
@@ -1319,7 +1415,7 @@ function showMarkdownPreview(model) {
     const html = _mdPreviewEl.querySelector(".md-preview__body") || document.createElement("div");
     html.className = "md-preview__body";
     if (!_mdPreviewEl.contains(html)) _mdPreviewEl.appendChild(html);
-    renderMarkdownInto(model.getValue(), html);
+    renderMarkdownInto(html, model.getValue());
   }
   render();
   _mdPreviewDisposable = model.onDidChangeContent(() => render());
@@ -1395,6 +1491,44 @@ function closeFile(path) {
   syncWelcome();
 }
 
+function closeOtherTabs(keepPath) {
+  for (const path of [...openFiles.keys()]) {
+    if (path !== keepPath) closeFile(path);
+  }
+}
+
+function closeTabsToRight(fromPath) {
+  const paths = [...openFiles.keys()];
+  const idx = paths.indexOf(fromPath);
+  if (idx < 0) return;
+  for (const path of paths.slice(idx + 1)) closeFile(path);
+}
+
+function closeAllTabs() {
+  for (const path of [...openFiles.keys()]) closeFile(path);
+}
+
+function relativePath(path) {
+  if (rootPath && path.startsWith(rootPath + "/")) return path.slice(rootPath.length + 1);
+  return basename(path);
+}
+
+function openTabContextMenu(x, y, path) {
+  const isPinned = pinnedTabs.has(path);
+  renderMenuAt(x, y, [
+    { label: t("tabctx.close"), icon: "i-close", action: () => closeFile(path) },
+    { label: t("tabctx.closeOthers"), action: () => closeOtherTabs(path) },
+    { label: t("tabctx.closeRight"), action: () => closeTabsToRight(path) },
+    { label: t("tabctx.closeAll"), action: () => closeAllTabs() },
+    { sep: true },
+    { label: isPinned ? t("tabctx.unpin") : t("tabctx.pin"), action: () => togglePinTab(path) },
+    { label: t("tabctx.reveal"), icon: "i-files", action: () => { showSide("explorer"); revealInTree(path); } },
+    { sep: true },
+    { label: t("tabctx.copyPath"), icon: "i-copy", action: () => copyText(path) },
+    { label: t("tabctx.copyRelPath"), icon: "i-copy", action: () => copyText(relativePath(path)) },
+  ]);
+}
+
 function markDirty(path, dirty) {
   const f = openFiles.get(path);
   if (!f || f.dirty === dirty) return;
@@ -1411,6 +1545,7 @@ async function saveActive() {
     markDirty(activePath, false);
     lspManager?.didSave(activePath, f.model);
     showToast(t("file.saved", { name: f.name }));
+    refreshBlame();
   } catch (e) {
     showToast(String(e));
   }
@@ -1430,6 +1565,10 @@ function renderTabs() {
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
     tab.querySelector(".label").textContent = f.name;
     tab.addEventListener("click", () => activate(path));
+    tab.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openTabContextMenu(e.clientX, e.clientY, path);
+    });
     tab.querySelector(".x").addEventListener("click", (e) => {
       e.stopPropagation();
       closeFile(path);
@@ -2149,6 +2288,11 @@ function openContextMenu(x, y, entry) {
   }
   items.push({ sep: true }, { label: t("ctx.copyPath"), icon: "i-copy", action: () => copyText(entry.path) });
 
+  renderMenuAt(x, y, items);
+}
+
+function renderMenuAt(x, y, items) {
+  closeContextMenu();
   const menu = document.createElement("div");
   menu.className = "menu ctx-menu";
   for (const it of items) {
@@ -2160,7 +2304,9 @@ function openContextMenu(x, y, entry) {
     }
     const mi = document.createElement("div");
     mi.className = "menu__item" + (it.danger ? " menu__item--danger" : "");
-    mi.innerHTML = `<svg class="ic"><use href="#${it.icon}" /></svg><span class="name"></span>`;
+    mi.innerHTML =
+      (it.icon ? `<svg class="ic"><use href="#${it.icon}" /></svg>` : `<span class="ic"></span>`) +
+      `<span class="name"></span>`;
     mi.querySelector(".name").textContent = it.label;
     mi.addEventListener("click", () => {
       closeContextMenu();
@@ -2564,6 +2710,7 @@ async function refreshGitStatus() {
   renderGitFiles(status.files);
   refreshGutter();
   refreshGitLog();
+  refreshStashList();
 }
 
 async function refreshGitLog() {
@@ -2598,6 +2745,219 @@ async function refreshGitLog() {
 $("gitLogToggle")?.addEventListener("click", () => {
   const logEl = $("gitLog");
   if (logEl) logEl.hidden = !logEl.hidden;
+});
+
+// ---- stash ----
+function parseStashIndex(line) {
+  const m = /^stash@\{(\d+)\}/.exec(line);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function stashLabel(line) {
+  const colon = line.indexOf(":");
+  return colon >= 0 ? line.slice(colon + 1).trim() : line;
+}
+
+async function doStash() {
+  if (!rootPath || !gitIsRepo) {
+    showToast(t("git.notRepo"));
+    return;
+  }
+  try {
+    const res = await backend.gitStash(rootPath);
+    showToast(res || t("git.stashed"));
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
+  await afterWorktreeChange();
+  refreshStashList(true);
+}
+
+// Run a stash mutation, then refresh the worktree + stash list.
+async function stashOp(op, okMsg) {
+  try {
+    const res = await op();
+    showToast(typeof res === "string" && res ? res : okMsg);
+  } catch (e) {
+    showToast(String(e && e.message ? e.message : e));
+  }
+  await afterWorktreeChange();
+  refreshStashList(true);
+}
+
+async function refreshStashList(forceShow) {
+  const titleEl = $("gitStashTitle");
+  const listEl = $("gitStashList");
+  if (!titleEl || !listEl) return;
+  if (!rootPath || !gitIsRepo) {
+    titleEl.style.display = "none";
+    listEl.hidden = true;
+    listEl.innerHTML = "";
+    return;
+  }
+  let entries = [];
+  try {
+    entries = await backend.gitStashList(rootPath);
+  } catch {
+    entries = [];
+  }
+  if (!entries.length) {
+    titleEl.style.display = "none";
+    listEl.hidden = true;
+    listEl.innerHTML = "";
+    return;
+  }
+  titleEl.style.display = "";
+  const countEl = titleEl.querySelector("span");
+  if (countEl) countEl.textContent = `${t("git.stashes")} (${entries.length})`;
+  if (forceShow) listEl.hidden = false;
+  listEl.innerHTML = "";
+  for (const line of entries) {
+    const idx = parseStashIndex(line);
+    const row = document.createElement("div");
+    row.className = "git-stash-row";
+
+    const label = document.createElement("span");
+    label.className = "git-stash-row__label";
+    label.textContent = stashLabel(line);
+    label.title = line;
+
+    const acts = document.createElement("span");
+    acts.className = "git-stash-row__acts";
+    const mkBtn = (icon, title, run) => {
+      const b = document.createElement("button");
+      b.className = "git-stash-act";
+      b.type = "button";
+      b.title = title;
+      b.innerHTML = `<svg class="ic"><use href="#${icon}" /></svg>`;
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        run();
+      });
+      return b;
+    };
+    acts.append(
+      mkBtn("i-arrow-down", t("git.stashApply"), () =>
+        stashOp(() => backend.gitStashApply(rootPath, idx), t("git.stashApplied"))),
+      mkBtn("i-check", t("git.stashPop"), () =>
+        stashOp(() => backend.gitStashPop(rootPath, idx), t("git.stashPopped"))),
+      mkBtn("i-trash", t("git.stashDrop"), () =>
+        stashOp(() => backend.gitStashDrop(rootPath, idx), t("git.stashDropped"))),
+    );
+    row.append(label, acts);
+    listEl.appendChild(row);
+  }
+}
+
+$("gitStashBtn")?.addEventListener("click", doStash);
+$("gitStashToggle")?.addEventListener("click", () => {
+  const listEl = $("gitStashList");
+  if (listEl) listEl.hidden = !listEl.hidden;
+});
+
+// ---- git blame (GitLens-style current-line annotation) ----
+let blameEnabled = false;
+let blameMap = null; // Map<lineNumber, { author, date, commit }>
+let blameMapPath = null; // path the map was built for
+const blameDecorations = monacoEditor.createDecorationsCollection([]);
+
+// `author-time` is a unix epoch; render a compact relative label.
+function formatBlameDate(epochStr) {
+  const sec = parseInt(epochStr, 10);
+  if (!Number.isFinite(sec)) return "";
+  const then = sec * 1000;
+  const diff = Date.now() - then;
+  const day = 86400000;
+  if (diff < day) return t("git.blameToday");
+  if (diff < 2 * day) return t("git.blameYesterday");
+  if (diff < 30 * day) return t("git.blameDaysAgo", { n: Math.floor(diff / day) });
+  if (diff < 365 * day) return t("git.blameMonthsAgo", { n: Math.floor(diff / (30 * day)) });
+  return new Date(then).toISOString().slice(0, 10);
+}
+
+// Fetch blame for the active file and cache a line→info map. Blame reflects the
+// committed file, so it is skipped for dirty / untracked / non-repo buffers.
+async function refreshBlame() {
+  if (!blameEnabled) return;
+  const path = activePath;
+  const rel = relForPath(path);
+  const f = path ? openFiles.get(path) : null;
+  if (!gitIsRepo || !rel || !f || f.dirty || f.isImage) {
+    blameMap = null;
+    blameMapPath = null;
+    blameDecorations.set([]);
+    return;
+  }
+  let lines = [];
+  try {
+    lines = await backend.gitBlame(rootPath, rel);
+  } catch {
+    lines = [];
+  }
+  if (path !== activePath) return; // user switched files during the fetch
+  if (!lines.length) {
+    blameMap = null;
+    blameMapPath = null;
+    blameDecorations.set([]);
+    return;
+  }
+  const map = new Map();
+  for (const b of lines) map.set(b.line, b);
+  blameMap = map;
+  blameMapPath = path;
+  updateBlameLine();
+}
+
+// Paint the annotation at the end of the caret's current line.
+function updateBlameLine() {
+  if (!blameEnabled || !blameMap || blameMapPath !== activePath) {
+    blameDecorations.set([]);
+    return;
+  }
+  const pos = monacoEditor.getPosition();
+  const info = pos && blameMap.get(pos.lineNumber);
+  if (!info) {
+    blameDecorations.set([]);
+    return;
+  }
+  const when = formatBlameDate(info.date);
+  const text = `    ${info.author}, ${when} · ${info.commit}`;
+  const model = monacoEditor.getModel();
+  const col = model ? model.getLineMaxColumn(pos.lineNumber) : 1;
+  blameDecorations.set([
+    {
+      range: new monaco.Range(pos.lineNumber, col, pos.lineNumber, col),
+      options: { after: { content: text, inlineClassName: "blame-inline" } },
+    },
+  ]);
+}
+
+function toggleBlame() {
+  blameEnabled = !blameEnabled;
+  if (blameEnabled) {
+    setStatusBarItem("_blame", { text: t("git.blameLabel"), tooltip: t("git.blameToggle") }, toggleBlame);
+    refreshBlame();
+    showToast(t("git.blameOn"));
+  } else {
+    blameMap = null;
+    blameMapPath = null;
+    blameDecorations.set([]);
+    removeStatusBarItem("_blame");
+    showToast(t("git.blameOff"));
+  }
+}
+
+monacoEditor.onDidChangeCursorPosition(() => {
+  if (blameEnabled) updateBlameLine();
+});
+// Edits shift line numbers, so the cached blame becomes stale — hide until the
+// file is saved again (refreshBlame re-runs from saveActive / activate).
+monacoEditor.onDidChangeModelContent(() => {
+  if (blameEnabled) {
+    blameMap = null;
+    blameMapPath = null;
+    blameDecorations.set([]);
+  }
 });
 
 function renderGitFiles(files) {
@@ -3446,6 +3806,8 @@ function showToast(msg) {
 
 // ---- advanced feature panels (workspace / remote / marketplace / debug) ----
 const FEATURE_TABS = [
+  { id: "settings", title: "Settings", icon: "i-gear" },
+  { id: "shortcuts", title: "Shortcuts", icon: "i-command" },
   { id: "workspace", title: "Workspace", icon: "i-folder" },
   { id: "tasks", title: "Tasks", icon: "i-play" },
   { id: "remote", title: "Remote", icon: "i-terminal" },
@@ -3512,6 +3874,8 @@ function renderFeaturePanel() {
   body.innerHTML = "";
   body.classList.remove("mkt-body");
   const renderers = {
+    settings: renderSettingsTool,
+    shortcuts: renderShortcutsTool,
     workspace: renderWorkspaceTool,
     tasks: renderTasksTool,
     remote: renderRemoteTool,
@@ -3545,6 +3909,296 @@ function createEmptyState(text) {
   el.className = "tool-empty";
   el.textContent = text;
   return el;
+}
+
+const SETTINGS_SCHEMA = [
+  {
+    group: "Appearance",
+    items: [
+      { key: "theme", label: "Color Theme", type: "select", options: [
+        ["system", "Follow System"], ["light", "Light"], ["dark", "Dark"],
+        ["monokai", "Monokai"], ["github-light", "GitHub Light"],
+        ["solarized-dark", "Solarized Dark"], ["nord", "Nord"],
+      ] },
+      { key: "fontSize", label: "Font Size", hint: "px", type: "number", min: 8, max: 48 },
+      { key: "fontFamily", label: "Font Family", type: "text" },
+      { key: "lineHeight", label: "Line Height", hint: "0 = auto", type: "number", min: 0, max: 60 },
+    ],
+  },
+  {
+    group: "Editor",
+    items: [
+      { key: "wordWrap", label: "Word Wrap", type: "select", options: [
+        ["off", "Off"], ["on", "On"], ["wordWrapColumn", "At Column"], ["bounded", "Bounded"],
+      ] },
+      { key: "tabSize", label: "Tab Size", type: "number", min: 1, max: 8 },
+      { key: "renderWhitespace", label: "Render Whitespace", type: "select", options: [
+        ["none", "None"], ["boundary", "Boundary"], ["selection", "Selection"],
+        ["trailing", "Trailing"], ["all", "All"],
+      ] },
+      { key: "cursorBlinking", label: "Cursor Animation", type: "select", options: [
+        ["blink", "Blink"], ["smooth", "Smooth"], ["phase", "Phase"], ["expand", "Expand"], ["solid", "Solid"],
+      ] },
+      { key: "minimap", label: "Minimap", type: "toggle" },
+      { key: "stickyScroll", label: "Sticky Scroll", type: "toggle" },
+      { key: "bracketColorization", label: "Bracket Pair Colorization", type: "toggle" },
+    ],
+  },
+  {
+    group: "Files",
+    items: [
+      { key: "autoSave", label: "Auto Save", type: "toggle" },
+    ],
+  },
+];
+
+async function renderSettingsTool(body) {
+  createToolHeader(body, "Settings", "Editor preferences save automatically and persist across sessions.");
+  await loadEditorPrefs();
+  const p = effectivePrefs();
+
+  const update = async (key, value) => {
+    _editorPrefs = _editorPrefs || {};
+    _editorPrefs[key] = value;
+    await saveEditorPrefs();
+    applyEditorPrefs();
+  };
+
+  for (const section of SETTINGS_SCHEMA) {
+    const sec = document.createElement("div");
+    sec.className = "settings-group";
+    const h = document.createElement("h3");
+    h.className = "settings-group__title";
+    h.textContent = section.group;
+    sec.appendChild(h);
+
+    for (const item of section.items) {
+      const row = document.createElement("div");
+      row.className = "settings-row";
+
+      const meta = document.createElement("div");
+      meta.className = "settings-row__meta";
+      const lbl = document.createElement("span");
+      lbl.className = "settings-row__label";
+      lbl.textContent = item.label;
+      meta.appendChild(lbl);
+      if (item.hint) {
+        const hint = document.createElement("span");
+        hint.className = "settings-row__hint";
+        hint.textContent = item.hint;
+        meta.appendChild(hint);
+      }
+      row.appendChild(meta);
+
+      const control = document.createElement("div");
+      control.className = "settings-row__control";
+      const cur = p[item.key];
+
+      if (item.type === "select") {
+        const sel = document.createElement("select");
+        sel.className = "settings-input";
+        for (const [val, text] of item.options) {
+          const opt = document.createElement("option");
+          opt.value = val;
+          opt.textContent = text;
+          if (String(val) === String(cur)) opt.selected = true;
+          sel.appendChild(opt);
+        }
+        sel.addEventListener("change", () => update(item.key, sel.value));
+        control.appendChild(sel);
+      } else if (item.type === "number") {
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.className = "settings-input settings-input--num";
+        inp.value = cur;
+        if (item.min != null) inp.min = item.min;
+        if (item.max != null) inp.max = item.max;
+        inp.addEventListener("change", () => update(item.key, Number(inp.value)));
+        control.appendChild(inp);
+      } else if (item.type === "text") {
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.className = "settings-input settings-input--text";
+        inp.value = cur;
+        inp.addEventListener("change", () => update(item.key, inp.value));
+        control.appendChild(inp);
+      } else if (item.type === "toggle") {
+        const sw = document.createElement("button");
+        sw.type = "button";
+        sw.className = "settings-toggle" + (cur !== false ? " is-on" : "");
+        sw.setAttribute("role", "switch");
+        sw.setAttribute("aria-checked", String(cur !== false));
+        sw.innerHTML = `<span class="settings-toggle__knob"></span>`;
+        sw.addEventListener("click", () => {
+          const on = !sw.classList.contains("is-on");
+          sw.classList.toggle("is-on", on);
+          sw.setAttribute("aria-checked", String(on));
+          update(item.key, on);
+        });
+        control.appendChild(sw);
+      }
+      row.appendChild(control);
+      sec.appendChild(row);
+    }
+    body.appendChild(sec);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "tool-actions settings-actions";
+  const reset = document.createElement("button");
+  reset.className = "btn";
+  reset.type = "button";
+  reset.textContent = "Reset to Defaults";
+  reset.addEventListener("click", async () => {
+    _editorPrefs = {};
+    await saveEditorPrefs();
+    applyEditorPrefs();
+    renderFeaturePanel();
+  });
+  actions.appendChild(reset);
+  body.appendChild(actions);
+}
+
+const ACTION_LABELS = {
+  "terminal.toggle": "Toggle Terminal",
+  "file.quickOpen": "Quick Open",
+  "file.save": "Save File",
+  "view.explorer": "Show Explorer",
+  "view.search": "Show Search",
+  "view.git": "Show Source Control",
+  "view.problems": "Toggle Problems Panel",
+  "commandPalette": "Command Palette",
+  "view.splitEditor": "Toggle Split Editor",
+  "code.runCurrentFile": "Run Current File",
+};
+
+const DISABLED_BINDING = "__none__";
+
+function formatCombo(combo) {
+  const isMac = /Mac/i.test(navigator.platform);
+  const map = {
+    mod: isMac ? "\u2318" : "Ctrl",
+    ctrl: isMac ? "\u2303" : "Ctrl",
+    shift: "\u21e7",
+    alt: isMac ? "\u2325" : "Alt",
+    " ": "Space",
+  };
+  return combo.split("+").map((part) => {
+    if (map[part]) return map[part];
+    return part.length === 1 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1);
+  });
+}
+
+async function rebindAction(action, newCombo) {
+  const bindings = getKeybindings();
+  for (const [combo, act] of Object.entries(bindings)) {
+    if (act === action && combo !== newCombo) {
+      if (DEFAULT_KEYBINDINGS[combo] === action) userKeybindings[combo] = DISABLED_BINDING;
+      else delete userKeybindings[combo];
+    }
+  }
+  userKeybindings[newCombo] = action;
+  const store = await getStore();
+  await store.set("keybindings", userKeybindings);
+  await store.save();
+}
+
+async function resetKeybindings() {
+  userKeybindings = {};
+  const store = await getStore();
+  await store.set("keybindings", {});
+  await store.save();
+}
+
+function recordKeybinding(action, btn, onDone) {
+  if (btn.classList.contains("is-recording")) return;
+  const original = btn.textContent;
+  btn.textContent = "Press keys\u2026";
+  btn.classList.add("is-recording");
+  const cleanup = () => {
+    window.removeEventListener("keydown", handler, true);
+    btn.textContent = original;
+    btn.classList.remove("is-recording");
+  };
+  const handler = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+    if (e.key === "Escape") { cleanup(); return; }
+    const combo = keyCombo(e);
+    cleanup();
+    await rebindAction(action, combo);
+    onDone();
+  };
+  window.addEventListener("keydown", handler, true);
+}
+
+function renderShortcutsTool(body) {
+  createToolHeader(body, "Keyboard Shortcuts", "View and customize keybindings. Click Change, then press the new key combination (Esc to cancel).");
+  const bindings = getKeybindings();
+  const actionToCombo = {};
+  for (const [combo, act] of Object.entries(bindings)) {
+    if (!actionToCombo[act]) actionToCombo[act] = combo;
+  }
+
+  const list = document.createElement("div");
+  list.className = "shortcuts-list";
+  for (const action of Object.keys(ACTION_LABELS)) {
+    const combo = actionToCombo[action];
+    const isCustom = combo && userKeybindings[combo] === action;
+    const row = document.createElement("div");
+    row.className = "shortcut-row";
+
+    const left = document.createElement("div");
+    left.className = "shortcut-row__label";
+    left.textContent = ACTION_LABELS[action];
+    if (isCustom) {
+      const badge = document.createElement("span");
+      badge.className = "shortcut-row__badge";
+      badge.textContent = "Custom";
+      left.appendChild(badge);
+    }
+    row.appendChild(left);
+
+    const keys = document.createElement("div");
+    keys.className = "shortcut-row__keys";
+    if (combo) {
+      for (const k of formatCombo(combo)) {
+        const kbd = document.createElement("kbd");
+        kbd.textContent = k;
+        keys.appendChild(kbd);
+      }
+    } else {
+      const none = document.createElement("span");
+      none.className = "shortcut-row__unbound";
+      none.textContent = "Unbound";
+      keys.appendChild(none);
+    }
+    row.appendChild(keys);
+
+    const change = document.createElement("button");
+    change.className = "btn btn--sm shortcut-row__change";
+    change.type = "button";
+    change.textContent = "Change";
+    change.addEventListener("click", () => recordKeybinding(action, change, () => renderFeaturePanel()));
+    row.appendChild(change);
+
+    list.appendChild(row);
+  }
+  body.appendChild(list);
+
+  const foot = document.createElement("div");
+  foot.className = "tool-actions settings-actions";
+  const reset = document.createElement("button");
+  reset.className = "btn";
+  reset.type = "button";
+  reset.textContent = "Reset All to Defaults";
+  reset.addEventListener("click", async () => {
+    await resetKeybindings();
+    renderFeaturePanel();
+  });
+  foot.appendChild(reset);
+  body.appendChild(foot);
 }
 
 function renderWorkspaceTool(body) {
@@ -3885,36 +4539,23 @@ function renderMarketplaceTool(body) {
   wrap.className = "mkt";
   body.appendChild(wrap);
 
-  const GRADIENTS = [
-    "linear-gradient(135deg,#667eea 0%,#764ba2 100%)",
-    "linear-gradient(135deg,#f093fb 0%,#f5576c 100%)",
-    "linear-gradient(135deg,#4facfe 0%,#00f2fe 100%)",
-    "linear-gradient(135deg,#43e97b 0%,#38f9d7 100%)",
-    "linear-gradient(135deg,#fa709a 0%,#fee140 100%)",
-    "linear-gradient(135deg,#a18cd1 0%,#fbc2eb 100%)",
-    "linear-gradient(135deg,#fccb90 0%,#d57eeb 100%)",
-    "linear-gradient(135deg,#e0c3fc 0%,#8ec5fc 100%)",
-    "linear-gradient(135deg,#f5576c 0%,#ff5858 100%)",
-    "linear-gradient(135deg,#13547a 0%,#80d0c7 100%)",
-    "linear-gradient(135deg,#ff9a9e 0%,#fecfef 100%)",
-    "linear-gradient(135deg,#a1c4fd 0%,#c2e9fb 100%)",
-  ];
+  // Per-extension hue drives a soft tile tint that adapts to light/dark in CSS,
+  // keeping the gallery calm and cohesive instead of loud rainbow gradients.
   const ICON_SVGS = {
-    theme: `<path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.8-.1 2.6-.4-.3-.6-.4-1.3-.4-2.1 0-1.7.9-3.2 2.3-4 .2-.1.4-.3.5-.5.8-1 1.3-2.2 1.3-3.5 0-2-1.1-3.8-2.7-4.8L12 2z" fill="none" stroke="white" stroke-width="1.5"/><circle cx="7.5" cy="11.5" r="1.5" fill="white"/><circle cx="12" cy="7.5" r="1.5" fill="white"/><circle cx="16.5" cy="11.5" r="1.5" fill="white"/>`,
-    git: `<circle cx="12" cy="6" r="2" fill="none" stroke="white" stroke-width="1.5"/><circle cx="12" cy="18" r="2" fill="none" stroke="white" stroke-width="1.5"/><circle cx="18" cy="12" r="2" fill="none" stroke="white" stroke-width="1.5"/><line x1="12" y1="8" x2="12" y2="16" stroke="white" stroke-width="1.5"/><path d="M18 10c0-2-2-4-4-4" fill="none" stroke="white" stroke-width="1.5"/>`,
-    formatter: `<rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="white" stroke-width="1.5"/><line x1="7" y1="8" x2="17" y2="8" stroke="white" stroke-width="1.5"/><line x1="7" y1="12" x2="14" y2="12" stroke="white" stroke-width="1.5"/><line x1="7" y1="16" x2="11" y2="16" stroke="white" stroke-width="1.5"/>`,
-    linter: `<path d="M12 2L2 7l10 5 10-5-10-5z" fill="none" stroke="white" stroke-width="1.5"/><path d="M2 17l10 5 10-5" fill="none" stroke="white" stroke-width="1.5"/><path d="M2 12l10 5 10-5" fill="none" stroke="white" stroke-width="1.5"/>`,
-    language: `<polyline points="16 18 22 12 16 6" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"/><polyline points="8 6 2 12 8 18" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"/>`,
-    docker: `<rect x="2" y="10" width="20" height="10" rx="2" fill="none" stroke="white" stroke-width="1.5"/><path d="M6 10V6a2 2 0 012-2h8a2 2 0 012 2v4" fill="none" stroke="white" stroke-width="1.5"/><line x1="10" y1="14" x2="10" y2="16" stroke="white" stroke-width="1.5"/><line x1="14" y1="14" x2="14" y2="16" stroke="white" stroke-width="1.5"/>`,
-    ai: `<circle cx="12" cy="12" r="3" fill="none" stroke="white" stroke-width="1.5"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4" stroke="white" stroke-width="1.5"/><path d="M4.9 4.9l2.85 2.85m8.5 8.5l2.85 2.85M4.9 19.1l2.85-2.85m8.5-8.5l2.85-2.85" stroke="white" stroke-width="1.5"/>`,
-    web: `<circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.5"/><line x1="2" y1="12" x2="22" y2="12" stroke="white" stroke-width="1.5"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" fill="none" stroke="white" stroke-width="1.5"/>`,
-    default: `<path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z" fill="none" stroke="white" stroke-width="1.5"/><polyline points="3.27 6.96 12 12.01 20.73 6.96" fill="none" stroke="white" stroke-width="1.5"/><line x1="12" y1="22.08" x2="12" y2="12" stroke="white" stroke-width="1.5"/>`,
+    theme: `<circle cx="13.5" cy="6.5" r="1.4" fill="currentColor"/><circle cx="17.3" cy="10.5" r="1.4" fill="currentColor"/><circle cx="8.4" cy="7.4" r="1.4" fill="currentColor"/><circle cx="6.6" cy="12.4" r="1.4" fill="currentColor"/><path d="M12 2.5C6.75 2.5 2.5 6.75 2.5 12S6.75 21.5 12 21.5c1.1 0 2-.9 2-2 0-.5-.2-.96-.5-1.3-.3-.34-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.3c1.98 0 3.7-1.6 3.7-3.6 0-4.86-4.07-8.8-9-8.8z" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
+    git: `<circle cx="7" cy="7" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="17" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="17" cy="9" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 9.1v5.8M17 11.1c0 3-3 3.7-6.4 3.7" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
+    formatter: `<rect x="3.5" y="3.5" width="17" height="17" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.5 8.5h9M7.5 12h6M7.5 15.5h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
+    linter: `<path d="M12 3l8 3.6v5c0 4.3-3.4 7.5-8 8.9-4.6-1.4-8-4.6-8-8.9v-5L12 3z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
+    language: `<polyline points="15 17 20 12 15 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><polyline points="9 7 4 12 9 17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
+    docker: `<rect x="2.5" y="10" width="19" height="9" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 10V6.5a2 2 0 012-2h8a2 2 0 012 2V10" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
+    ai: `<circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
+    web: `<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
+    default: `<path d="M20 16.5v-9a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 7.5v9a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0020 16.5z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.3 7.5L12 12.5l8.7-5M12 22V12.5" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
   };
 
   let activeFilter = "all";
   let searchQuery = "";
   let allEntries = [];
-  let detailEntry = null;
 
   function iconFor(entry) {
     const tags = (entry.tags || []).map((t) => t.toLowerCase());
@@ -3928,21 +4569,18 @@ function renderMarketplaceTool(body) {
     if (tags.includes("web") || tags.includes("css") || tags.includes("server")) return ICON_SVGS.web;
     return ICON_SVGS.default;
   }
-  function gradFor(entry) {
+  function hueFor(entry) {
     let h = 0;
     for (const c of entry.id) h = ((h << 5) - h + c.charCodeAt(0)) | 0;
-    return GRADIENTS[Math.abs(h) % GRADIENTS.length];
+    return Math.abs(h) % 360;
   }
   function fmtDl(n) {
     if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
     if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
-    return String(n);
+    return String(n || 0);
   }
-  function stars(r) {
-    let s = "";
-    for (let i = 1; i <= 5; i++) s += `<span class="mkt-star${i <= Math.round(r || 0) ? " mkt-star--on" : ""}">★</span>`;
-    return s;
-  }
+  const STAR_SVG = `<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l7.1-1.01z"/></svg>`;
+  const DL_SVG = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>`;
 
   const searchEl = document.createElement("div");
   searchEl.className = "mkt-search";
@@ -4010,49 +4648,13 @@ function renderMarketplaceTool(body) {
     return list;
   }
 
-  function makeCard(entry, big) {
-    const el = document.createElement("div");
-    el.className = big ? "mkt-hero-card" : "mkt-card";
-    const grad = gradFor(entry);
-    const svg = iconFor(entry);
-
-    if (big) {
-      el.innerHTML = `
-        <div class="mkt-hero-card__icon" style="background:${grad}"><svg viewBox="0 0 24 24" width="40" height="40">${svg}</svg></div>
-        <div class="mkt-hero-card__body">
-          <div class="mkt-hero-card__name"></div>
-          <div class="mkt-hero-card__desc"></div>
-          <div class="mkt-hero-card__foot">
-            <span class="mkt-hero-card__author"></span>
-            <span class="mkt-hero-card__stars">${stars(entry.rating)}</span>
-            <button class="mkt-install" type="button">Install</button>
-          </div>
-        </div>`;
-      el.querySelector(".mkt-hero-card__name").textContent = entry.name;
-      el.querySelector(".mkt-hero-card__desc").textContent = entry.description;
-      el.querySelector(".mkt-hero-card__author").textContent = entry.author;
-    } else {
-      el.innerHTML = `
-        <div class="mkt-card__icon" style="background:${grad}"><svg viewBox="0 0 24 24" width="22" height="22">${svg}</svg></div>
-        <div class="mkt-card__info">
-          <div class="mkt-card__top"><span class="mkt-card__name"></span><span class="mkt-card__ver"></span></div>
-          <div class="mkt-card__desc"></div>
-          <div class="mkt-card__bottom">
-            <span class="mkt-card__author"></span>
-            <span class="mkt-card__dl">${fmtDl(entry.downloads || 0)}</span>
-            <span class="mkt-card__stars">${stars(entry.rating)}</span>
-          </div>
-        </div>
-        <button class="mkt-install" type="button">Install</button>`;
-      el.querySelector(".mkt-card__name").textContent = entry.name;
-      el.querySelector(".mkt-card__ver").textContent = "v" + entry.version;
-      el.querySelector(".mkt-card__desc").textContent = entry.description;
-      el.querySelector(".mkt-card__author").textContent = entry.author;
-    }
-
-    el.querySelector(".mkt-install").addEventListener("click", async (ev) => {
+  function installButton(entry, label) {
+    const btn = document.createElement("button");
+    btn.className = "mkt-install";
+    btn.type = "button";
+    btn.textContent = label || "Install";
+    btn.addEventListener("click", async (ev) => {
       ev.stopPropagation();
-      const btn = ev.currentTarget;
       btn.disabled = true; btn.textContent = "Installing…"; btn.classList.add("is-busy");
       try {
         const msg = await backend.marketplaceInstall(entry);
@@ -4063,37 +4665,65 @@ function renderMarketplaceTool(body) {
         showToast(String(e && e.message ? e.message : e));
       }
     });
+    return btn;
+  }
+
+  function makeCard(entry, featured) {
+    const el = document.createElement("div");
+    el.className = "mkt-card" + (featured ? " mkt-card--feat" : "");
+    el.style.setProperty("--h", hueFor(entry));
+    el.innerHTML = `
+      <div class="mkt-card__icon"><svg viewBox="0 0 24 24" width="24" height="24">${iconFor(entry)}</svg></div>
+      <div class="mkt-card__info">
+        <div class="mkt-card__name"></div>
+        <div class="mkt-card__desc"></div>
+        <div class="mkt-card__meta">
+          <span class="mkt-card__author"></span>
+          <span class="mkt-card__sep">·</span>
+          <span class="mkt-card__stat">${DL_SVG}${fmtDl(entry.downloads)}</span>
+          <span class="mkt-card__stat">${STAR_SVG}${(entry.rating || 0).toFixed(1)}</span>
+        </div>
+      </div>
+      <div class="mkt-card__cta"></div>`;
+    el.querySelector(".mkt-card__name").textContent = entry.name;
+    el.querySelector(".mkt-card__desc").textContent = entry.description;
+    el.querySelector(".mkt-card__author").textContent = entry.author;
+    el.querySelector(".mkt-card__cta").appendChild(installButton(entry));
     el.addEventListener("click", () => openDetail(entry));
     return el;
   }
 
   function openDetail(entry) {
-    detailEntry = entry;
     listView.hidden = true;
     detailView.hidden = false;
-    const grad = gradFor(entry);
-    const svg = iconFor(entry);
+    detailView.scrollTop = 0;
+    detailView.style.setProperty("--h", hueFor(entry));
     detailView.innerHTML = `
-      <button class="mkt-back" type="button"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>Back</button>
-      <div class="mkt-det-hero" style="background:${grad}">
-        <div class="mkt-det-icon"><svg viewBox="0 0 24 24" width="56" height="56">${svg}</svg></div>
-        <h2 class="mkt-det-name"></h2>
-        <p class="mkt-det-author"></p>
-        <div class="mkt-det-stats">
-          <span>${stars(entry.rating)} <b>${(entry.rating || 0).toFixed(1)}</b></span>
-          <span><b>${fmtDl(entry.downloads || 0)}</b> installs</span>
-          <span>v${entry.version}</span>
+      <button class="mkt-back" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg> Back</button>
+      <div class="mkt-det-head">
+        <div class="mkt-det-icon"><svg viewBox="0 0 24 24" width="34" height="34">${iconFor(entry)}</svg></div>
+        <div class="mkt-det-headinfo">
+          <h2 class="mkt-det-name"></h2>
+          <div class="mkt-det-author"></div>
+          <div class="mkt-det-stats">
+            <span>${STAR_SVG}${(entry.rating || 0).toFixed(1)}</span>
+            <i class="mkt-det-sep"></i>
+            <span>${fmtDl(entry.downloads)} installs</span>
+            <i class="mkt-det-sep"></i>
+            <span>v${entry.version}</span>
+          </div>
         </div>
-        <button class="mkt-install mkt-install--hero" type="button">Install Extension</button>
+        <div class="mkt-det-cta"></div>
       </div>
       <div class="mkt-det-body">
         <div class="mkt-det-section"><h3>About</h3><p class="mkt-det-desc"></p></div>
-        <div class="mkt-det-section"><h3>Tags</h3><div class="mkt-det-tags"></div></div>
+        <div class="mkt-det-section mkt-det-tagsec"><h3>Tags</h3><div class="mkt-det-tags"></div></div>
         <div class="mkt-det-section"><h3>Information</h3>
           <table class="mkt-det-table"><tbody>
             <tr><td>Publisher</td><td class="d-pub"></td></tr>
             <tr><td>Extension ID</td><td class="d-id"></td></tr>
             <tr><td>Category</td><td class="d-cat"></td></tr>
+            <tr><td>Version</td><td class="d-ver"></td></tr>
           </tbody></table>
         </div>
       </div>`;
@@ -4103,27 +4733,21 @@ function renderMarketplaceTool(body) {
     detailView.querySelector(".d-pub").textContent = entry.author;
     detailView.querySelector(".d-id").textContent = entry.id;
     detailView.querySelector(".d-cat").textContent = entry.category || "Other";
+    detailView.querySelector(".d-ver").textContent = "v" + entry.version;
+    const tags = entry.tags || [];
     const tagsWrap = detailView.querySelector(".mkt-det-tags");
-    for (const tag of (entry.tags || [])) {
+    if (!tags.length) detailView.querySelector(".mkt-det-tagsec").style.display = "none";
+    for (const tag of tags) {
       const pill = document.createElement("span");
-      pill.className = "mkt-pill mkt-pill--tag";
+      pill.className = "mkt-tag";
       pill.textContent = tag;
       tagsWrap.appendChild(pill);
     }
     detailView.querySelector(".mkt-back").addEventListener("click", closeDetail);
-    detailView.querySelector(".mkt-install").addEventListener("click", async (ev) => {
-      const btn = ev.currentTarget;
-      btn.disabled = true; btn.textContent = "Installing…"; btn.classList.add("is-busy");
-      try {
-        const msg = await backend.marketplaceInstall(entry);
-        btn.textContent = "Installed"; btn.classList.remove("is-busy"); btn.classList.add("is-done");
-        showToast(msg); extPanel.refresh?.();
-      } catch (e) { btn.textContent = "Retry"; btn.disabled = false; btn.classList.remove("is-busy"); showToast(String(e?.message || e)); }
-    });
+    detailView.querySelector(".mkt-det-cta").appendChild(installButton(entry, "Install Extension"));
   }
 
   function closeDetail() {
-    detailEntry = null;
     listView.hidden = false;
     detailView.hidden = true;
   }
@@ -4144,7 +4768,7 @@ function renderMarketplaceTool(body) {
       sec.className = "mkt-section";
       sec.innerHTML = `<h3 class="mkt-section__title">Featured</h3>`;
       const row = document.createElement("div");
-      row.className = "mkt-hero-row";
+      row.className = "mkt-grid mkt-grid--feat";
       for (const e of feat.slice(0, 4)) row.appendChild(makeCard(e, true));
       sec.appendChild(row);
       listView.appendChild(sec);
@@ -4761,6 +5385,9 @@ function getMenus() {
         { sep: true },
         { label: "Debugger", icon: "i-code", action: () => openFeaturePanel("debugger") },
         { label: "Language Servers", icon: "i-code", action: () => openFeaturePanel("lsp") },
+        { sep: true },
+        { label: "Settings", icon: "i-gear", action: () => openFeaturePanel("settings") },
+        { label: "Keyboard Shortcuts", icon: "i-command", action: () => openFeaturePanel("shortcuts") },
       ],
     },
     {
@@ -5208,7 +5835,11 @@ async function saveKeybinding(combo, action) {
 }
 
 function getKeybindings() {
-  return { ...DEFAULT_KEYBINDINGS, ...userKeybindings };
+  const merged = { ...DEFAULT_KEYBINDINGS, ...userKeybindings };
+  for (const k of Object.keys(merged)) {
+    if (merged[k] === DISABLED_BINDING) delete merged[k];
+  }
+  return merged;
 }
 
 const KB_ACTIONS = {
@@ -5256,30 +5887,271 @@ const termBody = $("terminalBody");
 const termTabBar = $("termTabBar");
 const editorwrapEl = document.querySelector(".editorwrap");
 
+// ---- terminal command suggestions (history + common commands + paths) ----
+const TERM_COMMON_CMDS = [
+  // git
+  "git status", "git status -s", "git add .", "git add -A", "git add -p",
+  "git commit -m \"\"", "git commit -am \"\"", "git commit --amend",
+  "git push", "git push -u origin ", "git push --force-with-lease", "git push --tags",
+  "git pull", "git pull --rebase", "git fetch", "git fetch --all --prune",
+  "git log", "git log --oneline", "git log --oneline --graph --all", "git log -p",
+  "git checkout ", "git checkout -b ", "git switch ", "git switch -c ", "git switch -",
+  "git branch", "git branch -a", "git branch -d ", "git branch -D ", "git branch -m ",
+  "git merge ", "git merge --abort", "git rebase ", "git rebase -i ", "git rebase --abort", "git rebase --continue",
+  "git diff", "git diff --staged", "git diff HEAD", "git diff --stat",
+  "git stash", "git stash pop", "git stash list", "git stash apply", "git stash drop", "git stash show -p",
+  "git reset ", "git reset --hard ", "git reset --soft HEAD~1", "git restore ", "git restore --staged ",
+  "git clone ", "git remote -v", "git remote add origin ", "git tag ", "git cherry-pick ",
+  "git show ", "git blame ", "git clean -fd", "git revert ", "git config --global ", "git init",
+  // npm
+  "npm install", "npm install ", "npm install -D ", "npm install -g ", "npm uninstall ",
+  "npm run ", "npm run dev", "npm run build", "npm run test", "npm run lint", "npm run start",
+  "npm start", "npm test", "npm ci", "npm update", "npm outdated", "npm audit", "npm audit fix",
+  "npm publish", "npm version patch", "npm list", "npm cache clean --force", "npx ",
+  // pnpm / yarn / bun
+  "pnpm install", "pnpm add ", "pnpm add -D ", "pnpm remove ", "pnpm dev", "pnpm build", "pnpm test", "pnpm run ", "pnpm up",
+  "yarn", "yarn add ", "yarn add -D ", "yarn remove ", "yarn dev", "yarn build", "yarn test", "yarn install",
+  "bun install", "bun add ", "bun run ", "bun dev",
+  // cargo / rust
+  "cargo build", "cargo build --release", "cargo run", "cargo run --release", "cargo test",
+  "cargo check", "cargo clippy", "cargo clippy --all-targets -- -D warnings", "cargo fmt",
+  "cargo add ", "cargo update", "cargo install ", "cargo new ", "cargo doc --open", "rustup update", "rustc ",
+  // python
+  "python3 ", "python3 -m venv venv", "python3 -m pip install ", "pip install ", "pip install -r requirements.txt",
+  "pip freeze > requirements.txt", "pip list", "pip3 install ", "source venv/bin/activate", "pytest", "python -m http.server",
+  // node / go / others
+  "node ", "deno run ", "deno task ", "tsx ", "ts-node ",
+  "go run .", "go build", "go test ./...", "go mod tidy", "go get ", "go install ",
+  "java -jar ", "javac ", "mvn ", "gradle ", "ruby ", "rails ", "php ", "php artisan ", "composer install",
+  "dotnet run", "dotnet build", "dotnet test",
+  // docker / k8s
+  "docker ps", "docker ps -a", "docker images", "docker build -t ", "docker run ", "docker exec -it ",
+  "docker stop ", "docker rm ", "docker rmi ", "docker logs -f ", "docker pull ", "docker push ", "docker system prune",
+  "docker compose up", "docker compose up -d", "docker compose down", "docker compose logs -f", "docker compose build",
+  "kubectl get pods", "kubectl get svc", "kubectl get nodes", "kubectl apply -f ", "kubectl delete -f ",
+  "kubectl logs ", "kubectl describe pod ", "kubectl exec -it ", "helm install ",
+  // filesystem
+  "cd ", "cd ..", "cd ~", "cd -", "ls", "ls -la", "ls -lah", "pwd", "clear",
+  "mkdir ", "mkdir -p ", "rmdir ", "rm ", "rm -rf ", "rm -f ", "cp ", "cp -r ", "mv ",
+  "touch ", "cat ", "less ", "head ", "tail ", "tail -f ", "ln -s ", "stat ", "file ", "tree",
+  "chmod +x ", "chmod 755 ", "chown ", "open ", "open .", "code .", "du -sh ", "df -h",
+  // text / search
+  "grep -r ", "grep -rn ", "grep -i ", "rg ", "rg -i ", "find . -name ", "find . -type f -name ",
+  "sed -i ", "awk ", "sort ", "uniq ", "wc -l ", "xargs ", "diff ", "pbcopy < ", "pbpaste",
+  // net / process
+  "curl ", "curl -O ", "curl -L ", "wget ", "ssh ", "scp ", "rsync -av ", "ping ",
+  "ps aux", "ps aux | grep ", "kill ", "kill -9 ", "killall ", "lsof -i :", "top", "htop",
+  "netstat -an", "ifconfig", "nslookup ", "dig ",
+  // archive / pkg managers
+  "tar -xzf ", "tar -czf ", "zip -r ", "unzip ", "gzip ", "gunzip ",
+  "brew install ", "brew update", "brew upgrade", "brew list", "brew search ", "brew uninstall ",
+  "apt install ", "apt update", "apt upgrade", "sudo apt install ",
+  // misc
+  "echo ", "export ", "source ", "which ", "whereis ", "man ", "history", "alias ", "env",
+  "sudo ", "watch ", "sleep ", "date", "whoami", "uname -a", "say ", "code .",
+];
+
+let termHistory = [];
+function pushTermHistory(cmd) {
+  termHistory = termHistory.filter((c) => c !== cmd);
+  termHistory.unshift(cmd);
+  if (termHistory.length > 300) termHistory.length = 300;
+}
+
+// Cache of workspace-relative paths (files + dirs) for argument completion.
+let termPathCache = [];
+async function refreshTermPathCache() {
+  if (!rootPath) { termPathCache = []; return; }
+  const out = [];
+  const skip = new Set(["node_modules", ".git", "dist", "build", "target", ".next", "coverage", ".cache", "vendor"]);
+  const base = rootPath.endsWith("/") ? rootPath : rootPath + "/";
+  const stack = [rootPath];
+  let count = 0;
+  while (stack.length && count < 4000) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await backend.readDir(dir); } catch { continue; }
+    for (const e of entries) {
+      const rel = e.path.startsWith(base) ? e.path.slice(base.length) : e.name;
+      out.push(e.is_dir ? rel + "/" : rel);
+      count++;
+      if (e.is_dir && !skip.has(e.name)) stack.push(e.path);
+    }
+  }
+  termPathCache = out;
+}
+
+// System commands ($PATH) + the user's shell history, loaded once from the
+// backend so suggestions cover every installed tool and real past command.
+let termPathCommands = [];
+let _termDataLoaded = false;
+async function loadTermData() {
+  if (_termDataLoaded) return;
+  _termDataLoaded = true;
+  try {
+    const hist = await backend.termHistory?.();
+    if (Array.isArray(hist) && hist.length) {
+      const existing = new Set(termHistory);
+      for (const c of hist) if (!existing.has(c)) termHistory.push(c);
+    }
+  } catch { /* ignore */ }
+  try {
+    const cmds = await backend.termListCommands?.();
+    if (Array.isArray(cmds)) termPathCommands = cmds;
+  } catch { /* ignore */ }
+}
+
+function getTermSuggestions(prefix) {
+  if (!prefix || prefix.length < 1) return [];
+  const seen = new Set();
+  const out = [];
+  const add = (cmd) => {
+    if (cmd.length <= prefix.length || !cmd.startsWith(prefix) || seen.has(cmd)) return;
+    seen.add(cmd);
+    out.push(cmd);
+  };
+  for (const c of termHistory) add(c);
+  for (const c of TERM_COMMON_CMDS) add(c);
+  // Every installed command on $PATH — only when completing the first word.
+  if (!prefix.includes(" ")) {
+    for (const c of termPathCommands) {
+      add(c);
+      if (out.length >= 6) break;
+    }
+  }
+  // Argument path completion: complete the last token against workspace paths.
+  if (out.length === 0 && prefix.includes(" ")) {
+    const cut = prefix.lastIndexOf(" ");
+    const head = prefix.slice(0, cut + 1);
+    const token = prefix.slice(cut + 1);
+    if (token && !token.startsWith("-")) {
+      for (const rel of termPathCache) {
+        if (rel.length > token.length && rel.startsWith(token)) {
+          const full = head + rel;
+          if (!seen.has(full)) { seen.add(full); out.push(full); }
+          if (out.length >= 6) break;
+        }
+      }
+    }
+  }
+  return out.slice(0, 6);
+}
+
+let _ghostTimer = null;
+let _ghostDeco = null;
+let _ghostMarker = null;
+
+// Remove the ghost overlay. This ONLY disposes the decoration — it never writes
+// to the PTY buffer or moves the cursor, so the shell's line editing (backspace,
+// arrows, history) is never disturbed.
+function clearTermGhost(entry) {
+  if (_ghostDeco) { try { _ghostDeco.dispose(); } catch { /* ignore */ } _ghostDeco = null; }
+  if (_ghostMarker) { try { _ghostMarker.dispose(); } catch { /* ignore */ } _ghostMarker = null; }
+  if (entry) entry.ghost = "";
+}
+
+// Render the suggestion as a non-intrusive overlay decoration positioned at the
+// cursor. Because nothing is written into the terminal buffer, editing keys keep
+// working exactly as the shell expects.
+function renderTermGhost(entry) {
+  clearTermGhost(entry);
+  if (!entry || entry !== termTabs[activeTermTab] || entry.backendId == null) return;
+  const prefix = entry.inputLine;
+  const sug = getTermSuggestions(prefix)[0] || "";
+  entry.suggestion = sug;
+  const ghost = sug ? sug.slice(prefix.length) : "";
+  if (!ghost) return;
+  const term = entry.term;
+  let marker = null;
+  let deco = null;
+  try {
+    marker = term.registerMarker(0);
+    if (!marker) return;
+    deco = term.registerDecoration({
+      marker,
+      x: term.buffer.active.cursorX,
+      width: Math.min(ghost.length, term.cols),
+      layer: "top",
+    });
+  } catch { return; }
+  if (!deco) { try { marker.dispose(); } catch { /* ignore */ } return; }
+  _ghostMarker = marker;
+  _ghostDeco = deco;
+  entry.ghost = ghost;
+  deco.onRender((el) => {
+    el.textContent = ghost;
+    el.classList.add("term-ghost");
+  });
+}
+
+function scheduleTermGhost(entry) {
+  clearTimeout(_ghostTimer);
+  _ghostTimer = setTimeout(() => renderTermGhost(entry), 30);
+}
+
+// Accept the current ghost: send the remaining characters to the shell.
+function acceptTermGhost(entry) {
+  if (!entry || !entry.ghost || !entry.suggestion) return false;
+  const rest = entry.suggestion.slice(entry.inputLine.length);
+  clearTermGhost(entry);
+  if (entry.backendId != null && rest) backend.termWrite(entry.backendId, rest);
+  entry.inputLine = entry.suggestion;
+  return true;
+}
+
+function trackTermInput(entry, d) {
+  for (const ch of d) {
+    const code = ch.charCodeAt(0);
+    if (ch === "\r" || ch === "\n") {
+      const line = entry.inputLine.trim();
+      if (line) pushTermHistory(line);
+      entry.inputLine = "";
+      clearTermGhost(entry);
+      return;
+    } else if (code === 127 || code === 8) {
+      entry.inputLine = entry.inputLine.slice(0, -1);
+    } else if (code === 27 || code === 3 || code === 21 || code === 23 || code === 9) {
+      // ESC sequences (arrow keys), Ctrl-C/U/W, or Tab: stop tracking this line
+      entry.inputLine = "";
+      clearTermGhost(entry);
+      return;
+    } else if (code >= 32) {
+      entry.inputLine += ch;
+    }
+  }
+  scheduleTermGhost(entry);
+}
+
 function termTheme() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  if (dark) {
+    return {
+      background: "#0d1017",
+      foreground: "#e6edf3",
+      cursor: "#58a6ff",
+      cursorAccent: "#0d1017",
+      selectionBackground: "rgba(56, 139, 253, 0.28)",
+      selectionForeground: "#ffffff",
+      black: "#0d1117", red: "#ff7b72", green: "#3fb950", yellow: "#d29922",
+      blue: "#58a6ff", magenta: "#bc8cff", cyan: "#39d353", white: "#e6edf3",
+      brightBlack: "#484f58", brightRed: "#ffa198", brightGreen: "#56d364",
+      brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
+      brightCyan: "#56d364", brightWhite: "#ffffff",
+    };
+  }
+  // Light terminal (GitHub Light palette) — dark text on white.
   return {
-    background: "#0e1116",
-    foreground: "#e6edf3",
-    cursor: "#58a6ff",
-    cursorAccent: "#0e1116",
-    selectionBackground: "rgba(56, 139, 253, 0.25)",
-    selectionForeground: "#ffffff",
-    black: "#0d1117",
-    red: "#ff7b72",
-    green: "#3fb950",
-    yellow: "#d29922",
-    blue: "#58a6ff",
-    magenta: "#bc8cff",
-    cyan: "#39d353",
-    white: "#e6edf3",
-    brightBlack: "#484f58",
-    brightRed: "#ffa198",
-    brightGreen: "#56d364",
-    brightYellow: "#e3b341",
-    brightBlue: "#79c0ff",
-    brightMagenta: "#d2a8ff",
-    brightCyan: "#56d364",
-    brightWhite: "#ffffff",
+    background: "#ffffff",
+    foreground: "#1f2328",
+    cursor: "#0a84ff",
+    cursorAccent: "#ffffff",
+    selectionBackground: "rgba(10, 132, 255, 0.18)",
+    selectionForeground: "#1f2328",
+    black: "#24292f", red: "#cf222e", green: "#116329", yellow: "#7d4e00",
+    blue: "#0969da", magenta: "#8250df", cyan: "#1b7c83", white: "#6e7781",
+    brightBlack: "#57606a", brightRed: "#a40e26", brightGreen: "#1a7f37",
+    brightYellow: "#633c01", brightBlue: "#218bff", brightMagenta: "#a475f9",
+    brightCyan: "#3192aa", brightWhite: "#8c959f",
   };
 }
 
@@ -5302,14 +6174,17 @@ function renderTermTabs() {
     const btn = document.createElement("button");
     btn.className = "term-tab" + (i === activeTermTab ? " is-active" : "");
     btn.type = "button";
-    btn.innerHTML = `<span class="term-tab__status"></span><span class="term-tab__label"></span><span class="term-tab__x">&times;</span>`;
+    btn.title = tab.cwd ? `${tab.label} — ${tab.cwd}` : tab.label;
+    btn.innerHTML =
+      `<svg class="term-tab__icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-terminal" /></svg>` +
+      `<span class="term-tab__label"></span>` +
+      `<span class="term-tab__x" title="Close" aria-label="Close terminal">` +
+      `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>` +
+      `</span>`;
     btn.querySelector(".term-tab__label").textContent = tab.label;
     btn.addEventListener("click", (e) => {
-      if (e.target.classList.contains("term-tab__x")) {
-        closeTermTab(i);
-      } else {
-        switchTermTab(i);
-      }
+      if (e.target.closest(".term-tab__x")) closeTermTab(i);
+      else switchTermTab(i);
     });
     termTabBar.appendChild(btn);
   });
@@ -5317,6 +6192,7 @@ function renderTermTabs() {
 
 function switchTermTab(idx) {
   if (idx === activeTermTab || idx < 0 || idx >= termTabs.length) return;
+  clearTermGhost(termTabs[activeTermTab]);
   if (activeTermTab >= 0 && termTabs[activeTermTab]) {
     termTabs[activeTermTab].container.hidden = true;
   }
@@ -5332,7 +6208,8 @@ function switchTermTab(idx) {
 
 async function createTermTab() {
   const idx = termTabs.length;
-  const label = `${t("terminal.title")} ${++termSeq}`;
+  const label = `Terminal ${++termSeq}`;
+  const cwd = rootPath || "";
   const container = document.createElement("div");
   container.className = "terminal-panel__instance";
   container.hidden = activeTermTab >= 0;
@@ -5361,11 +6238,27 @@ async function createTermTab() {
 
   let initDone = false;
   let initBuffer = "";
-  const entry = { term, fit, container, label, backendId: null, opening: false };
+  const entry = { term, fit, container, label, cwd, backendId: null, opening: false, inputLine: "", ghost: "", suggestion: "" };
   termTabs.push(entry);
 
-  term.onData((d) => { if (entry.backendId != null) backend.termWrite(entry.backendId, d); });
+  term.onData((d) => {
+    // Drop the ghost overlay immediately; it is rebuilt after the echo settles.
+    clearTermGhost(entry);
+    if (entry.backendId != null) backend.termWrite(entry.backendId, d);
+    trackTermInput(entry, d);
+  });
   term.onResize(({ cols, rows }) => { if (entry.backendId != null) backend.termResize(entry.backendId, cols, rows); });
+  // Tab accepts the inline ghost suggestion when one is shown; otherwise it
+  // falls through to the shell's own completion.
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type === "keydown" && e.key === "Tab" && entry.ghost) {
+      e.preventDefault();
+      acceptTermGhost(entry);
+      scheduleTermGhost(entry);
+      return false;
+    }
+    return true;
+  });
 
   switchTermTab(idx);
 
@@ -5435,6 +6328,8 @@ async function openTerminal() {
   termPanel.hidden = false;
   editorwrapEl?.classList.add("has-terminal");
   monacoEditor.layout();
+  loadTermData();
+  refreshTermPathCache().catch(() => {});
 
   if (termTabs.length === 0) {
     await createTermTab();
@@ -5445,6 +6340,7 @@ async function openTerminal() {
 
 function closeTerminal() {
   if (!termIsOpen()) return;
+  clearTermGhost(termTabs[activeTermTab]);
   termPanel.hidden = true;
   editorwrapEl?.classList.remove("has-terminal");
   monacoEditor.layout();
@@ -5643,6 +6539,8 @@ const extHost = new ExtensionHost({
   readFile: (path) => backend.readTextFile(path),
   writeFile: (path, content) => backend.writeTextFile(path, content),
   listDir: (path) => backend.readDir(path),
+  getWorkspaceRoots: () =>
+    workspaceRoots && workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : [],
   getFilePath: () => activePath,
   getLanguage: () => monacoEditor.getModel()?.getLanguageId() ?? "plaintext",
   getLineCount: () => monacoEditor.getModel()?.getLineCount() ?? 0,
@@ -5745,6 +6643,11 @@ const palette = createCommandPalette({
     { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
     { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
     { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
+    { id: "git.stash", title: t("git.stash"), category: "Git", run: () => doStash() },
+    { id: "git.stashPop", title: t("git.stashPopLatest"), category: "Git", run: () => stashOp(() => backend.gitStashPop(rootPath), t("git.stashPopped")) },
+    { id: "git.blame", title: t("git.blameToggle"), category: "Git", run: () => toggleBlame() },
+    { id: "pref.settings", title: "Settings", category: "Preferences", run: () => openFeaturePanel("settings") },
+    { id: "pref.shortcuts", title: "Keyboard Shortcuts", category: "Preferences", run: () => openFeaturePanel("shortcuts") },
     { id: "ai.settings", title: t("menu.aiSettings"), category: "Preferences", run: () => openSettings() },
     ...extHost.listCommands().map((c) => ({
       ...c,
@@ -5781,12 +6684,7 @@ window.addEventListener(
 initLocale();
 Promise.all([
   loadConfigAsync().then(() => refreshModelBadge()),
-  loadEditorPrefs().then((prefs) => {
-    if (prefs.theme) { currentTheme = prefs.theme; applyEditorTheme(); }
-    if (prefs.autoSave !== undefined) autoSaveEnabled = prefs.autoSave;
-    if (prefs.fontSize) monacoEditor.updateOptions({ fontSize: prefs.fontSize });
-    if (prefs.wordWrap) monacoEditor.updateOptions({ wordWrap: prefs.wordWrap });
-  }),
+  loadEditorPrefs().then(() => applyEditorPrefs()),
 ]).catch(console.error);
 showChatHint();
 syncWelcome();

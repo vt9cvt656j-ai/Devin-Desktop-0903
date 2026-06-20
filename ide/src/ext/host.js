@@ -28,6 +28,23 @@ const PERMISSION_FOR = {
   "locale.setLocale": "locale",
 };
 
+// Collapse "." and ".." segments without touching the filesystem so a granted
+// extension still can't escape the workspace via "../../../etc/passwd".
+function normalizePath(p) {
+  const isAbs = p.startsWith("/");
+  const stack = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      if (stack.length && stack[stack.length - 1] !== "..") stack.pop();
+      else if (!isAbs) stack.push("..");
+    } else {
+      stack.push(seg);
+    }
+  }
+  return (isAbs ? "/" : "") + stack.join("/");
+}
+
 export class ExtensionHost {
   /**
    * @param {object} ctx IDE bridge.
@@ -103,6 +120,24 @@ export class ExtensionHost {
     for (const key of [...this.statusKeysFor(id)]) this.ctx.removeStatusBarItem(key);
     this.active.delete(id);
     this.notifyChange();
+  }
+
+  // Resolve an extension-supplied path and guarantee it stays inside an open
+  // workspace root. Returns the normalized absolute path or throws. This is the
+  // last line of defense for the file APIs: extensions run in a Worker sandbox
+  // and can only reach the filesystem through this host, so enforcing the
+  // boundary here blocks path-traversal sandbox escapes.
+  resolveWorkspacePath(rawPath) {
+    const roots = (this.ctx.getWorkspaceRoots?.() || []).filter(Boolean).map(normalizePath);
+    if (!roots.length) throw new Error("no workspace is open");
+    const raw = String(rawPath ?? "");
+    const candidates = raw.startsWith("/")
+      ? [normalizePath(raw)]
+      : roots.map((root) => normalizePath(root + "/" + raw));
+    for (const abs of candidates) {
+      if (roots.some((root) => abs === root || abs.startsWith(root + "/"))) return abs;
+    }
+    throw new Error(`access denied: "${raw}" is outside the workspace`);
   }
 
   statusKeysFor(id) {
@@ -202,12 +237,12 @@ export class ExtensionHost {
       case "editor.getLine":
         return this.ctx.getLine(args[0]);
       case "workspace.readFile":
-        return this.ctx.readFile(args[0]);
+        return this.ctx.readFile(this.resolveWorkspacePath(args[0]));
       case "workspace.writeFile":
-        await this.ctx.writeFile(args[0], args[1]);
+        await this.ctx.writeFile(this.resolveWorkspacePath(args[0]), args[1]);
         return null;
       case "workspace.listDir":
-        return this.ctx.listDir(args[0]);
+        return this.ctx.listDir(this.resolveWorkspacePath(args[0]));
       case "network.fetch":
         return this.ctx.networkFetch(args[0], args[1]);
       case "diagnostics.set":

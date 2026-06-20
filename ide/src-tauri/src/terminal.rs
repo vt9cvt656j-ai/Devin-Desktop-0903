@@ -165,3 +165,90 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// List every executable found on the user's `$PATH` (deduped, sorted).
+/// Powers terminal autosuggestions so completion covers all installed tools,
+/// not just a hand-written list.
+#[tauri::command]
+pub fn term_list_commands() -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            continue;
+                        }
+                    }
+                    let name = match entry.file_name().into_string() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = entry.metadata() {
+                            if meta.permissions().mode() & 0o111 == 0 {
+                                continue;
+                            }
+                        }
+                    }
+                    set.insert(name);
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Read the user's shell history (zsh or bash), returning recent commands
+/// most-recent-first and deduped. Powers history-aware autosuggestions.
+#[tauri::command]
+pub fn term_history() -> Vec<String> {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return Vec::new(),
+    };
+    let mut raw: Vec<String> = Vec::new();
+    for name in [".zsh_history", ".bash_history"] {
+        let path = home.join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                // zsh extended history format: ": <ts>:<dur>;<cmd>"
+                let cmd = if line.starts_with(':') {
+                    line.find(';').map(|i| &line[i + 1..]).unwrap_or(line)
+                } else {
+                    line
+                };
+                let cmd = cmd.trim();
+                if !cmd.is_empty() && cmd.len() <= 256 {
+                    raw.push(cmd.to_string());
+                }
+            }
+            if !raw.is_empty() {
+                break;
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for cmd in raw.into_iter().rev() {
+        if seen.insert(cmd.clone()) {
+            out.push(cmd);
+        }
+        if out.len() >= 600 {
+            break;
+        }
+    }
+    out
+}

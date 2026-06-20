@@ -7,6 +7,7 @@ mod lsp;
 mod marketplace;
 mod tasks;
 mod terminal;
+mod watcher;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
 pub fn run() {
@@ -30,6 +31,7 @@ pub fn run() {
         .manage(terminal::TerminalState::default())
         .manage(lsp::LspManager::default())
         .manage(debug::DebugManager::default())
+        .manage(watcher::WatcherState::default())
         .invoke_handler(tauri::generate_handler![
             files::read_dir,
             files::read_text_file,
@@ -57,6 +59,12 @@ pub fn run() {
             git::git_merge_versions,
             git::git_resolve_conflict,
             git::git_log,
+            git::git_stash,
+            git::git_stash_pop,
+            git::git_stash_apply,
+            git::git_stash_drop,
+            git::git_stash_list,
+            git::git_blame,
             ai::ai_chat,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
@@ -69,6 +77,8 @@ pub fn run() {
             terminal::term_write,
             terminal::term_resize,
             terminal::term_close,
+            terminal::term_list_commands,
+            terminal::term_history,
             lsp::lsp_start,
             lsp::lsp_send,
             lsp::lsp_stop,
@@ -82,6 +92,8 @@ pub fn run() {
             marketplace::marketplace_search,
             tasks::tasks_list,
             tasks::task_run_capture,
+            watcher::fs_watch,
+            watcher::fs_unwatch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");

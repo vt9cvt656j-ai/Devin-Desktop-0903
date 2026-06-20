@@ -153,10 +153,17 @@ pub async fn marketplace_install(
         .map_err(|e| e.to_string())?;
 
     let resp = client
-        .get(download_url)
+        .get(download_url.clone())
         .send()
         .await
         .map_err(|e| format!("download failed: {e}"))?;
+
+    // DNS rebinding guard: verify the resolved IP is not private/local.
+    if let Some(addr) = resp.remote_addr() {
+        if is_blocked_ip(addr.ip()) {
+            return Err("download resolved to a private/local IP (DNS rebinding blocked)".into());
+        }
+    }
 
     if !resp.status().is_success() {
         return Err(format!("download returned status {}", resp.status()));

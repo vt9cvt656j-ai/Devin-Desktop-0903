@@ -104,6 +104,7 @@
             </button>
             <button class="iconbtn" id="gitPullBtn" type="button" data-i18n-title="git.pull" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
             <button class="iconbtn" id="gitPushBtn" type="button" data-i18n-title="git.push" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
+            <button class="iconbtn" id="gitStashBtn" type="button" data-i18n-title="git.stash" title="Stash changes"><svg class="ic"><use href="#i-archive" /></svg></button>
             <button class="iconbtn" id="gitRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
             <div class="git-branch-menu" id="gitBranchMenu" hidden></div>
           </div>
@@ -114,9 +115,16 @@
             </button>
           </div>
           <div class="git-list" id="gitList"></div>
+          <div class="git-section-title git-stash-title" style="display:none" id="gitStashTitle">
+            <span data-i18n="git.stashes">Stashes</span>
+            <button class="git-section-act" id="gitStashToggle" type="button" data-i18n-title="git.toggleStashes" title="Toggle stashes">
+              <svg class="ic"><use href="#i-chevron" /></svg>
+            </button>
+          </div>
+          <div class="git-stash-list" id="gitStashList" hidden></div>
           <div class="git-section-title git-log-title" style="display:none" id="gitLogTitle">
-            <span>History</span>
-            <button class="git-section-act" id="gitLogToggle" type="button" title="Toggle history">
+            <span data-i18n="git.history">History</span>
+            <button class="git-section-act" id="gitLogToggle" type="button" data-i18n-title="git.toggleHistory" title="Toggle history">
               <svg class="ic"><use href="#i-chevron" /></svg>
             </button>
           </div>
@@ -179,10 +187,6 @@
         <div class="terminal-panel" id="terminalPanel" hidden>
           <div class="terminal-panel__resize" id="terminalResize"></div>
           <div class="terminal-panel__head">
-            <div class="terminal-panel__label">
-              <svg class="ic" aria-hidden="true"><use href="#i-terminal" /></svg>
-              <span data-i18n="terminal.title">TERMINAL</span>
-            </div>
             <div class="term-tabs" id="termTabBar"></div>
             <div class="terminal-panel__actions">
               <button class="terminal-panel__action" id="termNewBtn" type="button" title="New Terminal (⌃⇧`)">
@@ -463,6 +467,12 @@
         <circle cx="6" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
         <circle cx="18" cy="8.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M6 8.4v7.2M18 11v.5a4 4 0 0 1-4 4H8.4" />
+      </symbol>
+      <symbol id="i-archive" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 7.5h16M5.5 7.5V18a1.6 1.6 0 0 0 1.6 1.6h9.8A1.6 1.6 0 0 0 18.5 18V7.5M4.5 4.5h15a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1v-1a1 1 0 0 1 1-1ZM10 11.5h4" />
+      </symbol>
+      <symbol id="i-history" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1M3.5 5v3.5H7M12 7.5V12l3 2" />
       </symbol>
 
       <!-- File-type glyphs (tinted via .ic--<type> color) -->

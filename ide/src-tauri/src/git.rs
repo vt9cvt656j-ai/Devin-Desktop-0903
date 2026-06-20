@@ -462,6 +462,121 @@ pub fn git_resolve_conflict(
     run_git_checked(&root, &["add", "--", &rel]).map(|_| ())
 }
 
+/// Stash the current working directory changes.
+#[tauri::command]
+pub fn git_stash(root: String) -> Result<String, String> {
+    let out = run_git(&root, &["stash", "push", "-m", "Michael IDE stash"])?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        Ok(if text.is_empty() { "No local changes to stash.".into() } else { text })
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Pop a stash entry, applying it and removing it from the stash list.
+///
+/// Defaults to the most recent stash (`stash@{0}`) when no index is given.
+#[tauri::command]
+pub fn git_stash_pop(root: String, index: Option<usize>) -> Result<String, String> {
+    let spec = index.map(|i| format!("stash@{{{i}}}"));
+    let mut args: Vec<&str> = vec!["stash", "pop"];
+    if let Some(ref s) = spec {
+        args.push(s.as_str());
+    }
+    let out = run_git(&root, &args)?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if text.is_empty() { "Stash applied.".into() } else { text })
+    } else {
+        Err(if err.is_empty() { "git stash pop failed".into() } else { err })
+    }
+}
+
+/// Apply a stash entry without removing it from the stash list.
+#[tauri::command]
+pub fn git_stash_apply(root: String, index: usize) -> Result<String, String> {
+    let spec = format!("stash@{{{index}}}");
+    let out = run_git(&root, &["stash", "apply", &spec])?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if text.is_empty() { "Stash applied.".into() } else { text })
+    } else {
+        Err(if err.is_empty() { "git stash apply failed".into() } else { err })
+    }
+}
+
+/// Drop (delete) a stash entry without applying it.
+#[tauri::command]
+pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
+    let spec = format!("stash@{{{index}}}");
+    let out = run_git(&root, &["stash", "drop", &spec])?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok(if text.is_empty() { "Stash dropped.".into() } else { text })
+    } else {
+        Err(if err.is_empty() { "git stash drop failed".into() } else { err })
+    }
+}
+
+/// List stash entries.
+#[tauri::command]
+pub fn git_stash_list(root: String) -> Result<Vec<String>, String> {
+    let out = run_git(&root, &["stash", "list"])?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect())
+}
+
+/// Show git blame for a file (line-by-line author + commit info).
+#[derive(Serialize)]
+pub struct BlameLine {
+    pub commit: String,
+    pub author: String,
+    pub date: String,
+    pub line: usize,
+}
+
+#[tauri::command]
+pub fn git_blame(root: String, rel: String) -> Result<Vec<BlameLine>, String> {
+    let out = run_git(&root, &["blame", "--porcelain", "--", &rel])?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    let mut cur_commit = String::new();
+    let mut cur_author = String::new();
+    let mut cur_date = String::new();
+    let mut cur_line = 0usize;
+    for line in text.lines() {
+        if let Some(a) = line.strip_prefix("author ") {
+            cur_author = a.to_string();
+        } else if let Some(d) = line.strip_prefix("author-time ") {
+            cur_date = d.to_string();
+        } else if !line.starts_with('\t') && !line.is_empty() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && parts[0].len() == 40 {
+                cur_commit = parts[0].to_string();
+                cur_line = parts[2].parse().unwrap_or(0);
+            }
+        } else if line.starts_with('\t') && !cur_commit.is_empty() {
+            result.push(BlameLine {
+                commit: cur_commit[..8.min(cur_commit.len())].to_string(),
+                author: cur_author.clone(),
+                date: cur_date.clone(),
+                line: cur_line,
+            });
+        }
+    }
+    Ok(result)
+}
+
 /// Pull the current branch from its upstream (`git pull`).
 ///
 /// Returns combined stdout/stderr because git reports progress on stderr even
