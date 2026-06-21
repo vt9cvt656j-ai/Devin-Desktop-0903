@@ -2728,6 +2728,126 @@ async function refreshGitStatus() {
   refreshStashList();
 }
 
+const GRAPH_LANE_COLORS = [
+  "#0969da", "#8250df", "#1a7f37", "#cf222e", "#bf8700",
+  "#e16f24", "#0550ae", "#6e7781", "#953800", "#1b7c83",
+];
+
+function layoutGitGraph(entries) {
+  const lanes = [];
+  const hashToLane = new Map();
+  const rows = [];
+
+  for (const e of entries) {
+    let lane = hashToLane.get(e.hash);
+    if (lane == null) {
+      lane = lanes.indexOf(null);
+      if (lane < 0) lane = lanes.length;
+      if (lane >= lanes.length) lanes.push(e.hash);
+      else lanes[lane] = e.hash;
+    }
+
+    const merges = [];
+    const forks = [];
+
+    for (let i = 0; i < lanes.length; i++) {
+      if (i !== lane && lanes[i] === e.hash) {
+        merges.push(i);
+        lanes[i] = null;
+      }
+    }
+
+    const parents = e.parents || [];
+    if (parents.length > 0) {
+      lanes[lane] = parents[0];
+      hashToLane.set(parents[0], lane);
+    } else {
+      lanes[lane] = null;
+    }
+
+    for (let pi = 1; pi < parents.length; pi++) {
+      const ph = parents[pi];
+      let fl = hashToLane.get(ph);
+      if (fl == null) {
+        fl = lanes.indexOf(null);
+        if (fl < 0) fl = lanes.length;
+        if (fl >= lanes.length) lanes.push(ph);
+        else lanes[fl] = ph;
+        hashToLane.set(ph, fl);
+      }
+      forks.push(fl);
+    }
+
+    const activeLanes = lanes.map((v, i) => v != null ? i : -1).filter(i => i >= 0);
+    rows.push({ entry: e, lane, merges, forks, activeLanes: [...activeLanes], maxLane: lanes.length });
+  }
+  return rows;
+}
+
+function renderGitGraphSvg(rows, container) {
+  const ROW_H = 28;
+  const LANE_W = 14;
+  const PAD_L = 6;
+  const R = 4;
+  const maxLane = rows.reduce((m, r) => Math.max(m, r.maxLane), 0);
+  const svgW = PAD_L + maxLane * LANE_W + LANE_W;
+  const svgH = rows.length * ROW_H;
+
+  const lines = [];
+  const circles = [];
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    const { lane, merges, forks, activeLanes } = rows[ri];
+    const cx = PAD_L + lane * LANE_W + LANE_W / 2;
+    const cy = ri * ROW_H + ROW_H / 2;
+    const color = GRAPH_LANE_COLORS[lane % GRAPH_LANE_COLORS.length];
+
+    if (ri + 1 < rows.length) {
+      const nextLane = rows[ri + 1].lane;
+      for (const al of activeLanes) {
+        let targetLane = al;
+        if (al === lane) targetLane = lane;
+        const x1 = PAD_L + al * LANE_W + LANE_W / 2;
+        const x2 = PAD_L + targetLane * LANE_W + LANE_W / 2;
+        const y1 = cy;
+        const y2 = (ri + 1) * ROW_H + ROW_H / 2;
+        const lc = GRAPH_LANE_COLORS[al % GRAPH_LANE_COLORS.length];
+        if (x1 === x2) {
+          lines.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${lc}" stroke-width="2"/>`);
+        } else {
+          const my = (y1 + y2) / 2;
+          lines.push(`<path d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}" stroke="${lc}" stroke-width="2" fill="none"/>`);
+        }
+      }
+    }
+
+    for (const ml of merges) {
+      const mx = PAD_L + ml * LANE_W + LANE_W / 2;
+      const prevY = ri > 0 ? (ri - 1) * ROW_H + ROW_H / 2 : 0;
+      const mc = GRAPH_LANE_COLORS[ml % GRAPH_LANE_COLORS.length];
+      const my = (prevY + cy) / 2;
+      lines.push(`<path d="M${mx},${prevY} C${mx},${my} ${cx},${my} ${cx},${cy}" stroke="${mc}" stroke-width="2" fill="none"/>`);
+    }
+
+    for (const fl of forks) {
+      const fx = PAD_L + fl * LANE_W + LANE_W / 2;
+      const nextY = (ri + 1) * ROW_H + ROW_H / 2;
+      const fc = GRAPH_LANE_COLORS[fl % GRAPH_LANE_COLORS.length];
+      const my = (cy + nextY) / 2;
+      lines.push(`<path d="M${cx},${cy} C${cx},${my} ${fx},${my} ${fx},${nextY}" stroke="${fc}" stroke-width="2" fill="none"/>`);
+    }
+
+    circles.push(`<circle cx="${cx}" cy="${cy}" r="${R}" fill="${color}" stroke="var(--graph-node-stroke, #fff)" stroke-width="1.5"/>`);
+  }
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", svgW);
+  svg.setAttribute("height", svgH);
+  svg.setAttribute("class", "git-graph-svg");
+  svg.innerHTML = lines.join("") + circles.join("");
+  return { svg, svgW, ROW_H };
+}
+
 async function refreshGitLog() {
   const logTitle = $("gitLogTitle");
   const logEl = $("gitLog");
@@ -2740,21 +2860,60 @@ async function refreshGitLog() {
   logTitle.style.display = "";
   let entries;
   try {
-    entries = await backend.gitLog(rootPath, 30);
+    entries = await backend.gitLog(rootPath, 60);
   } catch {
     return;
   }
   logEl.innerHTML = "";
-  for (const e of entries) {
+  if (!entries.length) return;
+
+  const rows = layoutGitGraph(entries);
+  const { svg, svgW, ROW_H } = renderGitGraphSvg(rows, logEl);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "git-graph-wrap";
+
+  const graphCol = document.createElement("div");
+  graphCol.className = "git-graph-col";
+  graphCol.style.width = svgW + "px";
+  graphCol.appendChild(svg);
+
+  const infoCol = document.createElement("div");
+  infoCol.className = "git-graph-info";
+  for (const r of rows) {
     const row = document.createElement("div");
-    row.className = "git-log-row";
-    row.innerHTML = `<span class="git-log-hash"></span><span class="git-log-msg"></span><span class="git-log-meta"></span>`;
-    row.querySelector(".git-log-hash").textContent = e.short_hash;
-    row.querySelector(".git-log-msg").textContent = e.message;
-    row.querySelector(".git-log-meta").textContent = `${e.author} · ${e.date}`;
-    row.title = `${e.hash}\n${e.author} · ${e.date}\n${e.message}`;
-    logEl.appendChild(row);
+    row.className = "git-graph-row";
+    row.style.height = ROW_H + "px";
+
+    let refHtml = "";
+    if (r.entry.refs && r.entry.refs.length) {
+      for (const ref of r.entry.refs) {
+        const isHead = ref.includes("HEAD");
+        const cls = isHead ? "git-ref git-ref--head" : ref.startsWith("tag:") ? "git-ref git-ref--tag" : "git-ref git-ref--branch";
+        const label = ref.replace(/^HEAD -> /, "");
+        refHtml += `<span class="${cls}"></span>`;
+        const last = row; // will set text below
+      }
+    }
+
+    row.innerHTML = `<span class="git-graph-hash"></span>${refHtml}<span class="git-graph-msg"></span><span class="git-graph-meta"></span>`;
+    row.querySelector(".git-graph-hash").textContent = r.entry.short_hash;
+    row.querySelector(".git-graph-msg").textContent = r.entry.message;
+    row.querySelector(".git-graph-meta").textContent = `${r.entry.author} · ${r.entry.date}`;
+    row.title = `${r.entry.hash}\n${r.entry.author} · ${r.entry.date}\n${r.entry.message}`;
+
+    const refEls = row.querySelectorAll(".git-ref");
+    const refs = r.entry.refs || [];
+    refEls.forEach((el, idx) => {
+      if (refs[idx]) el.textContent = refs[idx].replace(/^HEAD -> /, "");
+    });
+
+    infoCol.appendChild(row);
   }
+
+  wrapper.appendChild(graphCol);
+  wrapper.appendChild(infoCol);
+  logEl.appendChild(wrapper);
 }
 
 $("gitLogToggle")?.addEventListener("click", () => {
@@ -6760,7 +6919,7 @@ async function saveSession() {
   if (!inTauri) return;
   const tabList = [];
   for (const [path, f] of openFiles) {
-    tabList.push({ path, name: f.name, dirty: false });
+    tabList.push({ path, name: f.name, dirty: false, pinned: pinnedTabs.has(path) });
   }
   const session = {
     workspaceRoots: [...workspaceRoots],
@@ -6794,6 +6953,7 @@ async function restoreSession() {
     if (Array.isArray(session.tabs)) {
       for (const t of session.tabs) {
         await openFile(t.path, t.name).catch(() => {});
+        if (t.pinned) pinnedTabs.add(t.path);
       }
     }
     if (session.activePath && openFiles.has(session.activePath)) {
@@ -6810,11 +6970,12 @@ let zenModeActive = false;
 function toggleZenMode() {
   zenModeActive = !zenModeActive;
   document.body.classList.toggle("zen-mode", zenModeActive);
+  const p = effectivePrefs();
   monacoEditor.updateOptions({
     lineNumbers: zenModeActive ? "off" : "on",
     glyphMargin: !zenModeActive,
     folding: !zenModeActive,
-    minimap: { enabled: !zenModeActive },
+    minimap: { enabled: zenModeActive ? false : p.minimap !== false },
   });
   monacoEditor.layout();
 }
@@ -6863,8 +7024,10 @@ if (inTauri) {
 window.addEventListener("beforeunload", () => saveSession());
 if (inTauri) {
   import("@tauri-apps/api/event").then(({ listen }) => {
-    listen("tauri://close-requested", () => {
-      saveSession();
+    listen("tauri://close-requested", async (event) => {
+      await saveSession();
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().destroy();
     });
   }).catch(() => {});
 }

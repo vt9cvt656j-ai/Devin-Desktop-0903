@@ -3202,39 +3202,101 @@ body.zen-mode .editor {
 /* ---- git log ---- */
 .git-log {
   overflow-y: auto;
-  max-height: 220px;
-  padding: 0 4px;
+  max-height: 320px;
+  padding: 0;
 }
-.git-log-row {
+.git-graph-wrap {
   display: flex;
-  align-items: baseline;
+  align-items: stretch;
+}
+.git-graph-col {
+  flex: none;
+  overflow: hidden;
+}
+.git-graph-svg {
+  display: block;
+}
+.git-graph-svg line, .git-graph-svg path { opacity: 0.7; }
+.git-graph-svg circle { filter: drop-shadow(0 0 1px rgba(0,0,0,.15)); }
+:root { --graph-node-stroke: #fff; }
+[data-theme="dark"] { --graph-node-stroke: #1e1e1e; }
+.git-graph-info {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.git-graph-row {
+  display: flex;
+  align-items: center;
   gap: 6px;
-  padding: 4px 8px;
+  padding: 0 8px;
   font-size: 11.5px;
-  border-radius: 4px;
   cursor: default;
 }
-.git-log-row:hover {
+.git-graph-row:hover {
   background: var(--hover);
 }
-.git-log-hash {
+.git-graph-hash {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--accent);
   flex: none;
-  min-width: 52px;
+  min-width: 48px;
 }
-.git-log-msg {
+.git-graph-msg {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.git-log-meta {
+.git-graph-meta {
   font-size: 10px;
   color: var(--text-dim);
   flex: none;
   white-space: nowrap;
+}
+.git-ref {
+  display: inline-block;
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.4;
+  white-space: nowrap;
+  margin-right: 3px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.git-ref--branch {
+  background: rgba(9, 105, 218, 0.12);
+  color: #0969da;
+  border: 1px solid rgba(9, 105, 218, 0.25);
+}
+.git-ref--head {
+  background: rgba(130, 80, 223, 0.12);
+  color: #8250df;
+  border: 1px solid rgba(130, 80, 223, 0.25);
+}
+.git-ref--tag {
+  background: rgba(26, 127, 55, 0.12);
+  color: #1a7f37;
+  border: 1px solid rgba(26, 127, 55, 0.25);
+}
+[data-theme="dark"] .git-ref--branch {
+  background: rgba(88, 166, 255, 0.15);
+  color: #58a6ff;
+  border-color: rgba(88, 166, 255, 0.3);
+}
+[data-theme="dark"] .git-ref--head {
+  background: rgba(188, 140, 255, 0.15);
+  color: #bc8cff;
+  border-color: rgba(188, 140, 255, 0.3);
+}
+[data-theme="dark"] .git-ref--tag {
+  background: rgba(63, 185, 80, 0.15);
+  color: #3fb950;
+  border-color: rgba(63, 185, 80, 0.3);
 }
 .git-log-title {
   cursor: pointer;

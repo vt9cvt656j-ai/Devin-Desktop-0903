@@ -341,29 +341,46 @@ pub struct GitLogEntry {
     author: String,
     date: String,
     message: String,
+    /// Parent commit hashes (empty for root commit, 2+ for merge commits).
+    parents: Vec<String>,
+    /// Ref decorations: branch names, tags, HEAD.
+    refs: Vec<String>,
 }
 
-/// Return the last N commits (default 50) from the current branch.
+/// Return the last N commits (default 50) from all branches.
 #[tauri::command]
 pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, String> {
     let n = count.unwrap_or(50).min(200);
-    let format = "%H%n%h%n%an%n%ar%n%s";
+    // %P = parent hashes (space-separated), %D = ref names
+    let format = "%H%n%h%n%an%n%ar%n%s%n%P%n%D";
     let out = run_git_checked(
         &root,
-        &["log", &format!("-{n}"), &format!("--format={format}")],
+        &["log", "--all", &format!("-{n}"), &format!("--format={format}")],
     )?;
     let lines: Vec<&str> = out.lines().collect();
     let mut entries = Vec::new();
     let mut i = 0;
-    while i + 4 < lines.len() {
+    while i + 6 < lines.len() {
+        let parents: Vec<String> = lines[i + 5]
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let refs: Vec<String> = lines[i + 6]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         entries.push(GitLogEntry {
             hash: lines[i].to_string(),
             short_hash: lines[i + 1].to_string(),
             author: lines[i + 2].to_string(),
             date: lines[i + 3].to_string(),
             message: lines[i + 4].to_string(),
+            parents,
+            refs,
         });
-        i += 5;
+        i += 7;
     }
     Ok(entries)
 }
