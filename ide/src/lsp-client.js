@@ -901,7 +901,11 @@ export function createLspManager(options) {
     if (it.tags?.includes(1) || it.deprecated) {
       monacoItem.tags = [monaco.languages.CompletionItemTag.Deprecated];
     }
-    // Keep the original for resolve.
+    const isCallable = it.kind === 2 || it.kind === 3 || it.kind === 4;
+    if (isCallable && it.insertTextFormat !== 2 && !insertText.includes("(")) {
+      monacoItem.insertText = insertText + "($1)";
+      monacoItem.insertTextRules = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+    }
     monacoItem.__lspItem = it;
     monacoItem.__lspLang = langId;
     return monacoItem;

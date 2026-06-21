@@ -890,7 +890,8 @@ const monacoEditor = monaco.editor.create(editorEl, {
   language: "plaintext",
   theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
   automaticLayout: true,
-  fixedOverflowWidgets: true,
+  fixedOverflowWidgets: false,
+  suggest: { showStatusBar: true, shareSuggestSelections: true },
   fontSize: 13,
   fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
   minimap: { enabled: true, maxColumn: 80, renderCharacters: false },
@@ -1870,16 +1871,22 @@ function lspLogSink(lang, line) {
   }
   buf.push(line);
   if (buf.length > 400) buf.shift();
+  console.log(`[LSP:${lang}] ${line}`);
   document.dispatchEvent(new CustomEvent("lsp-log", { detail: { lang } }));
 }
 
 function updateLspStatusBar() {
   if (!lspManager) return;
-  const ready = lspManager.status().filter((s) => s.initialized).map((s) => s.lang);
-  if (ready.length) {
+  const all = lspManager.status();
+  const ready = all.filter((s) => s.initialized).map((s) => s.lang);
+  const starting = all.filter((s) => !s.initialized).map((s) => s.lang);
+  if (ready.length || starting.length) {
+    const parts = [];
+    if (ready.length) parts.push(ready.join(", "));
+    if (starting.length) parts.push(`(${starting.join(",")} starting…)`);
     setStatusBarItem(
       "lsp",
-      { text: `LSP: ${ready.join(", ")}`, tooltip: "Active language servers (real LSP)" },
+      { text: `LSP: ${parts.join(" ")}`, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}\nClick for logs` },
       () => openFeaturePanel("lsp"),
     );
   } else {

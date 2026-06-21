@@ -496,6 +496,15 @@ body.is-tauri.is-mac .titlebar {
   overflow: hidden;
   background: var(--editor-bg);
 }
+.overflowingContentWidgets { z-index: 999; }
+.monaco-editor .suggest-widget {
+  overflow: hidden !important;
+  max-width: calc(100vw - 400px) !important;
+}
+.monaco-editor .suggest-widget .monaco-list-row {
+  overflow: hidden !important;
+}
+/* Monaco default codicon symbol icons — VS Code standard, no overrides */
 .tabs {
   display: flex;
   height: 38px;

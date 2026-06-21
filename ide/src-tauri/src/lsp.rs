@@ -67,6 +67,20 @@ fn prune_stopped(inner: &mut HashMap<String, LspProcess>) {
     });
 }
 
+fn extract_method(json: &str) -> String {
+    if let Some(start) = json.find("\"method\"") {
+        let rest = &json[start + 9..];
+        if let Some(q1) = rest.find('"') {
+            let inner = &rest[q1 + 1..];
+            if let Some(q2) = inner.find('"') {
+                return inner[..q2].to_string();
+            }
+        }
+    }
+    if json.contains("\"result\"") { return "response".to_string(); }
+    "?".to_string()
+}
+
 fn encode_lsp_message(content: &str) -> String {
     format!(
         "Content-Length: {}\r\n\r\n{}",
@@ -199,10 +213,14 @@ pub fn lsp_start(
     let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<String>();
 
     let mut stdin_handle = child.stdin.take().ok_or("no stdin")?;
+    let send_lang = config.lang.clone();
     std::thread::spawn(move || {
         while let Ok(msg) = stdin_rx.recv() {
+            let method = extract_method(&msg);
+            tracing::debug!("[lsp-{send_lang}] → {method}");
             let encoded = encode_lsp_message(&msg);
             if stdin_handle.write_all(encoded.as_bytes()).is_err() {
+                tracing::warn!("[lsp-{send_lang}] stdin write failed");
                 break;
             }
             if stdin_handle.flush().is_err() {
@@ -240,7 +258,10 @@ pub fn lsp_start(
                     break;
                 }
                 let data = String::from_utf8_lossy(&body).to_string();
+                let recv_method = extract_method(&data);
+                tracing::debug!("[lsp-{lang}] ← {recv_method}");
                 if evt.send(LspEvent::Message { data }).is_err() {
+                    tracing::warn!("[lsp-{lang}] channel send failed");
                     break;
                 }
             }
