@@ -201,10 +201,6 @@ const EN = {
   "autosave.enabled": "Auto-save enabled",
   "autosave.disabled": "Auto-save disabled",
 
-  "outline.title": "Outline",
-  "outline.noSymbols": "No symbols found in this file.",
-  "outline.noFile": "Open a file to see its outline.",
-
   "theme.title": "Theme",
   "theme.light": "Light",
   "theme.dark": "Dark",

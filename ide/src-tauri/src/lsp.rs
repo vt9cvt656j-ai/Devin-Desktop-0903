@@ -76,13 +76,40 @@ fn encode_lsp_message(content: &str) -> String {
 }
 
 
-/// Strip a `file://` prefix from a root URI to get a filesystem path.
+/// Strip a `file://` prefix from a root URI and URL-decode to get a real path.
 fn workspace_dir_from_uri(uri: &str) -> Option<String> {
     let trimmed = uri.strip_prefix("file://").unwrap_or(uri);
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+        return None;
+    }
+    let decoded = percent_decode(trimmed);
+    if decoded.is_empty() { None } else { Some(decoded) }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -119,23 +146,52 @@ pub fn lsp_start(
         config.args.clone()
     };
 
-    let mut builder = Command::new(&command);
+    let ws = workspace_dir_from_uri(&config.root_uri);
+    #[cfg(not(windows))]
+    let resolved = process_util::resolve_command(&command, ws.as_deref());
+    #[cfg(windows)]
+    let resolved = command.clone();
+
+    // Detect Node.js shebang scripts and run them through node directly,
+    // because the kernel's shebang handler uses the parent process PATH
+    // which is minimal when launched from macOS Finder.
+    #[cfg(not(windows))]
+    let (actual_cmd, extra_args) = {
+        if let Ok(content) = std::fs::read_to_string(&resolved) {
+            if content.starts_with("#!/usr/bin/env node") || content.starts_with("#!/usr/bin/env -S node") {
+                let node = process_util::resolve_command("node", ws.as_deref());
+                (node, vec![resolved.clone()])
+            } else {
+                (resolved.clone(), vec![])
+            }
+        } else {
+            (resolved.clone(), vec![])
+        }
+    };
+    #[cfg(windows)]
+    let (actual_cmd, extra_args) = (resolved.clone(), Vec::<String>::new());
+
+    let mut builder = Command::new(&actual_cmd);
     builder
+        .args(&extra_args)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(ws) = workspace_dir_from_uri(&config.root_uri) {
-        builder.current_dir(&ws);
+    if let Some(ref ws_dir) = ws {
+        builder.current_dir(ws_dir);
         #[cfg(not(windows))]
-        builder.env("PATH", process_util::augmented_path(Some(&ws)));
+        builder.env("PATH", process_util::augmented_path(Some(ws_dir)));
     } else {
         #[cfg(not(windows))]
         builder.env("PATH", process_util::augmented_path(None));
     }
+    tracing::info!(
+        "[lsp] spawning: cmd={actual_cmd:?} extra={extra_args:?} args={args:?} resolved={resolved:?}"
+    );
     let mut child = builder
         .spawn()
-        .map_err(|e| format!("failed to start '{}': {}", command, e))?;
+        .map_err(|e| format!("failed to start '{}' (resolved={}, actual={}): {}", command, resolved, actual_cmd, e))?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -234,6 +290,23 @@ pub fn lsp_stop(
         let _ = proc.child.kill();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn lsp_check_available(lang: String) -> bool {
+    let (cmd, _) = match find_server(&lang) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    #[cfg(not(windows))]
+    {
+        let resolved = process_util::resolve_command(cmd, None);
+        resolved != cmd || std::path::Path::new(cmd).exists()
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
 }
 
 #[derive(Serialize)]

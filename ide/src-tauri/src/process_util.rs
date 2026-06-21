@@ -24,5 +24,25 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     }
 }
 
+/// Resolve a command name to its full path using the augmented PATH.
+/// Rust's `Command::new` only searches the *current* process PATH, which is
+/// minimal when a Tauri app is launched from macOS Finder. This function
+/// searches the augmented PATH so tools in `~/.local/bin`, `~/.cargo/bin`,
+/// etc. are found even from a GUI launch.
+#[cfg(not(windows))]
+pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
+    if cmd.contains('/') {
+        return cmd.to_string();
+    }
+    let path = augmented_path(workspace);
+    for dir in path.split(':') {
+        let full = format!("{dir}/{cmd}");
+        if std::path::Path::new(&full).exists() {
+            return full;
+        }
+    }
+    cmd.to_string()
+}
+
 /// Maximum number of concurrent LSP or DAP processes allowed.
 pub const MAX_CHILD_PROCESSES: usize = 16;

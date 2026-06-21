@@ -432,6 +432,7 @@ export function createLspManager(options) {
     enabled = true,
     getWorkspaceRoots = () => [],
     showToast = () => {},
+    showNotification = null,
     onLog = null,
     onStatus = null,
   } = options;
@@ -502,8 +503,33 @@ export function createLspManager(options) {
     } catch (e) {
       clients.delete(langId);
       const msg = String(e && e.message ? e.message : e);
-      // "already running" means a manual start owns it; surface quietly.
-      if (!/already running/i.test(msg)) showToast(`LSP ${langId}: ${msg}`);
+      const alreadyRunning = /already running/i.test(msg);
+      if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }
+      const installHints = {
+        python: "npm i -g pyright",
+        rust: "rustup component add rust-analyzer",
+        go: "go install golang.org/x/tools/gopls@latest",
+        c: "brew install llvm (clangd)",
+        cpp: "brew install llvm (clangd)",
+      };
+      const names = { python: "Pyright", rust: "rust-analyzer", go: "gopls", c: "clangd", cpp: "clangd" };
+      const hint = installHints[langId];
+      let toolExists = false;
+      try { toolExists = await backend.lspCheckAvailable(langId); } catch { /* ignore */ }
+      if (!toolExists && hint && showNotification) {
+        showNotification({
+          title: `缺少 ${names[langId] || langId} 语言服务器`,
+          message: `安装后可获得智能补全、跳转定义、悬停文档等功能`,
+          actionLabel: "安装",
+          duration: 20000,
+          installCmd: hint,
+        });
+      } else if (toolExists) {
+        showToast(`${names[langId] || langId} 启动失败: ${msg}`);
+      } else {
+        showToast(`LSP ${langId}: ${msg}`);
+      }
+      onLog?.(`[lsp] ${langId}: ${msg}`);
       return null;
     }
   }

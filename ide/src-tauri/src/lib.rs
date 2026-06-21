@@ -1,4 +1,5 @@
 mod ai;
+mod auth;
 mod debug;
 mod extensions;
 mod files;
@@ -27,6 +28,13 @@ pub fn run() {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
+
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = auth::init_db().await {
+                    tracing::warn!("Auth DB init skipped: {e}");
+                }
+            });
+
             Ok(())
         })
         .manage(terminal::TerminalState::default())
@@ -85,6 +93,7 @@ pub fn run() {
             lsp::lsp_send,
             lsp::lsp_stop,
             lsp::lsp_list,
+            lsp::lsp_check_available,
             debug::dap_start,
             debug::dap_send,
             debug::dap_stop,
@@ -96,6 +105,10 @@ pub fn run() {
             tasks::task_run_capture,
             watcher::fs_watch,
             watcher::fs_unwatch,
+            auth::auth_login_or_register,
+            auth::auth_check_email,
+            auth::auth_send_code,
+            auth::auth_verify_code,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");

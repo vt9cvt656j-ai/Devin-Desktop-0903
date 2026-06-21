@@ -168,38 +168,42 @@ pub fn term_close(state: State<TerminalState>, id: u32) -> Result<(), String> {
 
 /// List every executable found on the user's `$PATH` (deduped, sorted).
 /// Powers terminal autosuggestions so completion covers all installed tools,
-/// not just a hand-written list.
+/// not just a hand-written list. Uses augmented PATH to find tools installed
+/// in ~/.local/bin, ~/.cargo/bin, etc. even from a Finder-launched app.
 #[tauri::command]
 pub fn term_list_commands() -> Vec<String> {
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = BTreeSet::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Ok(ft) = entry.file_type() {
-                        if ft.is_dir() {
+    #[cfg(not(windows))]
+    let path_str = crate::process_util::augmented_path(None);
+    #[cfg(windows)]
+    let path_str = std::env::var("PATH").unwrap_or_default();
+    for dir_str in path_str.split(':') {
+        let dir = std::path::PathBuf::from(dir_str);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        continue;
+                    }
+                }
+                let name = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.permissions().mode() & 0o111 == 0 {
                             continue;
                         }
                     }
-                    let name = match entry.file_name().into_string() {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(meta) = entry.metadata() {
-                            if meta.permissions().mode() & 0o111 == 0 {
-                                continue;
-                            }
-                        }
-                    }
-                    set.insert(name);
                 }
+                set.insert(name);
             }
         }
     }

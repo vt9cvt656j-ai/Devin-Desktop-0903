@@ -123,6 +123,7 @@ async function tauriBackend() {
     },
     lspSend: (lang, message) => core.invoke("lsp_send", { lang, message }),
     lspStop: (lang) => core.invoke("lsp_stop", { lang }),
+    lspCheckAvailable: (lang) => core.invoke("lsp_check_available", { lang }),
     dapList: () => core.invoke("dap_list"),
     dapStart: (config, onEvent) => {
       const channel = new core.Channel();
@@ -169,6 +170,11 @@ async function tauriBackend() {
     gitStashDrop: (root, index) => core.invoke("git_stash_drop", { root, index }),
     gitStashList: (root) => core.invoke("git_stash_list", { root }),
     gitBlame: (root, rel) => core.invoke("git_blame", { root, rel }),
+    authLoginOrRegister: (email, password) => core.invoke("auth_login_or_register", { email, password }),
+    authCheckEmail: (email) => core.invoke("auth_check_email", { email }),
+    authSendCode: (email) => core.invoke("auth_send_code", { email }),
+    authVerifyCode: (email, code) => core.invoke("auth_verify_code", { email, code }),
+    invoke: (cmd, args) => core.invoke(cmd, args || {}),
   };
 }
 
@@ -858,6 +864,11 @@ function mockBackend() {
     },
     termListCommands: async () => [],
     termHistory: async () => [],
+    authLoginOrRegister: async () => ({ success: true, message: "mock login" }),
+    authCheckEmail: async () => ({ exists: false }),
+    authSendCode: async () => "验证码已发送（模拟）",
+    authVerifyCode: async () => ({ success: true, message: "mock verify" }),
+    invoke: async () => ({}),
   };
 }
 
@@ -879,6 +890,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
   language: "plaintext",
   theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
   automaticLayout: true,
+  fixedOverflowWidgets: true,
   fontSize: 13,
   fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
   minimap: { enabled: true, maxColumn: 80, renderCharacters: false },
@@ -896,36 +908,173 @@ const monacoEditor = monaco.editor.create(editorEl, {
   colorDecorators: true,
 });
 
-let splitEditor = null;
 const editorContainer = $("editorContainer");
 
+const splitState = {
+  active: false,
+  editor: null,
+  sash: null,
+  wrap: null,
+  path: null,
+  focusedPane: "left",
+  ratio: 0.5,
+};
+
 function toggleSplitEditor() {
-  if (splitEditor) {
-    splitEditor.dispose();
-    const splitDiv = document.getElementById("editorSplit");
-    if (splitDiv) splitDiv.remove();
-    splitEditor = null;
+  if (splitState.active) {
+    closeSplitEditor();
     return;
   }
   if (!activePath) return;
-  const splitDiv = document.createElement("div");
-  splitDiv.id = "editorSplit";
-  splitDiv.className = "editor-split";
-  editorContainer.appendChild(splitDiv);
-  const f = openFiles.get(activePath);
-  if (!f) return;
-  splitEditor = monaco.editor.create(splitDiv, {
+  openSplitEditor(activePath);
+}
+
+function openSplitEditor(filePath) {
+  if (splitState.active) {
+    switchSplitFile(filePath);
+    return;
+  }
+
+  const sash = document.createElement("div");
+  sash.className = "editor-sash";
+  editorContainer.appendChild(sash);
+
+  const wrap = document.createElement("div");
+  wrap.className = "editor-split";
+  editorContainer.appendChild(wrap);
+
+  const f = openFiles.get(filePath);
+  if (!f || f.isImage) return;
+
+  const ed = monaco.editor.create(wrap, {
     model: f.model,
-    theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
+    theme: currentTheme === "dark" || currentTheme === "solarized-dark" || currentTheme === "nord" ? "vs-dark" : "vs",
     automaticLayout: true,
-    fontSize: 13,
+    fixedOverflowWidgets: true,
+    fontSize: monacoEditor.getOptions().get(52),
     fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
     renderWhitespace: "selection",
     padding: { top: 10 },
+    bracketPairColorization: { enabled: true },
+    guides: { indentation: true },
+  });
+
+  wrap.addEventListener("mousedown", () => { splitState.focusedPane = "right"; updateSplitFocus(); });
+  $("editor").addEventListener("mousedown", () => { splitState.focusedPane = "left"; updateSplitFocus(); }, { once: false });
+
+  initSashDrag(sash);
+
+  splitState.active = true;
+  splitState.editor = ed;
+  splitState.sash = sash;
+  splitState.wrap = wrap;
+  splitState.path = filePath;
+  splitState.ratio = 0.5;
+
+  applySplitRatio(0.5);
+  updateSplitFocus();
+}
+
+function switchSplitFile(filePath) {
+  if (!splitState.active || !splitState.editor) return;
+  const f = openFiles.get(filePath);
+  if (!f || f.isImage) return;
+  splitState.editor.setModel(f.model);
+  splitState.path = filePath;
+}
+
+function closeSplitEditor() {
+  if (!splitState.active) return;
+  if (splitState.editor) splitState.editor.dispose();
+  if (splitState.sash) splitState.sash.remove();
+  if (splitState.wrap) splitState.wrap.remove();
+  splitState.active = false;
+  splitState.editor = null;
+  splitState.sash = null;
+  splitState.wrap = null;
+  splitState.path = null;
+  splitState.focusedPane = "left";
+  $("editor").style.flex = "";
+}
+
+function applySplitRatio(ratio) {
+  const r = Math.max(0.15, Math.min(0.85, ratio));
+  splitState.ratio = r;
+  $("editor").style.flex = `${r * 100} 0 0`;
+  if (splitState.wrap) splitState.wrap.style.flex = `${(1 - r) * 100} 0 0`;
+}
+
+function updateSplitFocus() {
+  $("editor").classList.toggle("pane-focused", splitState.focusedPane === "left");
+  if (splitState.wrap) splitState.wrap.classList.toggle("pane-focused", splitState.focusedPane === "right");
+}
+
+function initSashDrag(sash) {
+  let dragging = false;
+  sash.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const rect = editorContainer.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    applySplitRatio(ratio);
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   });
 }
+
+// ---- panel sash (sidebar / assistant resize) ----
+(function initPanelSashes() {
+  const layout = document.querySelector(".layout");
+  const sashL = $("sashLeft");
+  const sashR = $("sashRight");
+  const explorerEl = $("explorer");
+  const assistantEl = $("assistant");
+  if (!layout) return;
+
+  function makePanelSash(sash, getTarget, cssProp, direction) {
+    if (!sash) return;
+    let dragging = false;
+    sash.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      dragging = true;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const target = getTarget();
+      if (!target) return;
+      const layoutRect = layout.getBoundingClientRect();
+      let w;
+      if (direction === "left") {
+        w = e.clientX - layoutRect.left;
+      } else {
+        w = layoutRect.right - e.clientX;
+      }
+      w = Math.max(140, Math.min(layoutRect.width * 0.5, w));
+      layout.style.setProperty(cssProp, w + "px");
+    });
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    });
+  }
+  makePanelSash(sashL, () => explorerEl, "--sidebar-w", "left");
+  makePanelSash(sashR, () => assistantEl, "--assistant-w", "right");
+})();
 
 const EDITOR_PREFS_KEY = "editor-prefs";
 let _editorPrefs = null;
@@ -997,7 +1146,7 @@ function applyEditorPrefs() {
     },
   };
   monacoEditor.updateOptions(opts);
-  if (splitEditor) splitEditor.updateOptions(opts);
+  if (splitState.editor) splitState.editor.updateOptions(opts);
   applyModelOptions();
   if (p.theme) { currentTheme = p.theme; applyEditorTheme(); }
   autoSaveEnabled = p.autoSave !== false;
@@ -1378,6 +1527,9 @@ function activate(path) {
     if (f.viewState) monacoEditor.restoreViewState(f.viewState);
     monacoEditor.focus();
     if (path.endsWith(".md")) showMarkdownPreview(f.model);
+    const lang = f.model?.getLanguageId();
+    // Tool detection is handled by the LSP client's ensureServer(); no need to
+    // run a redundant check here that races and sometimes double-notifies.
   }
 
   syncWelcome();
@@ -1417,27 +1569,88 @@ function hideImagePreview() {
 
 // ---- markdown preview ----
 let _mdPreviewEl = null;
+let _mdThumbEl = null;
 let _mdPreviewDisposable = null;
+let _mdPreviewOpen = false;
+let _mdActiveModel = null;
+
+function _createMdElements() {
+  if (_mdPreviewEl) return;
+
+  // preview pane
+  _mdPreviewEl = document.createElement("div");
+  _mdPreviewEl.className = "md-preview";
+  _mdPreviewEl.hidden = true;
+  const header = document.createElement("div");
+  header.className = "md-preview__header";
+  header.innerHTML = `<span class="md-preview__title">Markdown 预览</span>
+    <button class="md-preview__close" title="关闭预览 ⌘.">✕</button>`;
+  _mdPreviewEl.appendChild(header);
+  const body = document.createElement("div");
+  body.className = "md-preview__body";
+  _mdPreviewEl.appendChild(body);
+  editorContainer.appendChild(_mdPreviewEl);
+  header.querySelector(".md-preview__close").addEventListener("click", () => _toggleMdPreview(false));
+
+  // thumbnail strip
+  _mdThumbEl = document.createElement("div");
+  _mdThumbEl.className = "md-thumb";
+  _mdThumbEl.hidden = true;
+  _mdThumbEl.innerHTML = `<div class="md-thumb__mini"></div>`;
+  _mdThumbEl.addEventListener("click", () => _toggleMdPreview(true));
+  editorContainer.appendChild(_mdThumbEl);
+}
+
+function _toggleMdPreview(open) {
+  _mdPreviewOpen = open;
+  // preview: show or hide
+  if (_mdPreviewEl) _mdPreviewEl.hidden = !open;
+  // thumbnail: opposite of preview
+  if (_mdThumbEl) _mdThumbEl.hidden = open;
+}
+
+function _renderMdThumb() {
+  if (!_mdThumbEl || !_mdPreviewEl) return;
+  const body = _mdPreviewEl.querySelector(".md-preview__body");
+  const mini = _mdThumbEl.querySelector(".md-thumb__mini");
+  if (!body || !mini) return;
+  mini.textContent = "";
+  const clone = body.cloneNode(true);
+  clone.className = "md-thumb__content";
+  mini.appendChild(clone);
+}
+
 function showMarkdownPreview(model) {
-  if (!_mdPreviewEl) {
-    _mdPreviewEl = document.createElement("div");
-    _mdPreviewEl.className = "md-preview";
-    editorContainer.appendChild(_mdPreviewEl);
-  }
+  _createMdElements();
+  _mdActiveModel = model;
+  const body = _mdPreviewEl.querySelector(".md-preview__body");
   function render() {
-    const html = _mdPreviewEl.querySelector(".md-preview__body") || document.createElement("div");
-    html.className = "md-preview__body";
-    if (!_mdPreviewEl.contains(html)) _mdPreviewEl.appendChild(html);
-    renderMarkdownInto(html, model.getValue());
+    renderMarkdownInto(body, model.getValue());
+    if (!_mdPreviewOpen) _renderMdThumb();
   }
   render();
+  if (_mdPreviewDisposable) _mdPreviewDisposable.dispose();
   _mdPreviewDisposable = model.onDidChangeContent(() => render());
-  _mdPreviewEl.hidden = false;
+  _toggleMdPreview(false);
 }
+
 function hideMarkdownPreview() {
+  _mdPreviewOpen = false;
+  _mdActiveModel = null;
   if (_mdPreviewEl) _mdPreviewEl.hidden = true;
+  if (_mdThumbEl) _mdThumbEl.hidden = true;
   if (_mdPreviewDisposable) { _mdPreviewDisposable.dispose(); _mdPreviewDisposable = null; }
 }
+
+// ⌘. to toggle markdown preview
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === ".") {
+    e.preventDefault();
+    if (!_mdActiveModel) return;
+    _toggleMdPreview(!_mdPreviewOpen);
+    if (!_mdPreviewOpen) _renderMdThumb();
+  }
+});
 
 function updateBreadcrumb(path) {
   const bc = $("breadcrumb");
@@ -1632,6 +1845,17 @@ lspManager = createLspManager({
   enabled: inTauri,
   getWorkspaceRoots: () => (workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : []),
   showToast: (msg) => showToast(msg),
+  showNotification: ({ title, message, actionLabel, duration, installCmd }) => {
+    const toolName = (title || "").replace(/^缺少\s*/, "").replace(/\s*语言服务器$/, "") || "LSP";
+    showNotification({
+      title, message, actionLabel, duration,
+      action: installCmd ? async () => {
+        await openTerminal();
+        writeToActiveTerminal(installCmd + "\n");
+        _showInstallProgress(installCmd, toolName);
+      } : undefined,
+    });
+  },
   onStatus: () => updateLspStatusBar(),
   onLog: (lang, line) => lspLogSink(lang, line),
 });
@@ -2547,10 +2771,8 @@ function showSide(which) {
   $("viewExplorer").hidden = which !== "explorer";
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
-  $("viewOutline").hidden = which !== "outline";
   $("tabExplorer").classList.toggle("is-active", which === "explorer" || which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
-  $("tabOutline")?.classList.toggle("is-active", which === "outline");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
   if (which === "search") {
@@ -2559,113 +2781,9 @@ function showSide(which) {
     si.select();
   } else if (which === "git") {
     refreshGitStatus();
-  } else if (which === "outline") {
-    refreshOutline();
   }
 }
 
-// ---- outline panel ----
-const outlineListEl = $("outlineList");
-
-async function refreshOutline() {
-  if (!outlineListEl) return;
-  outlineListEl.innerHTML = "";
-  if (!activePath) {
-    const empty = document.createElement("div");
-    empty.className = "outline-empty";
-    empty.textContent = t("outline.noFile");
-    outlineListEl.appendChild(empty);
-    return;
-  }
-  const model = monacoEditor.getModel();
-  if (!model) return;
-
-  let symbols;
-  try {
-    symbols = await monaco.languages.getLanguages();
-    const docSymbols = await getDocumentSymbols(model);
-    if (!docSymbols || !docSymbols.length) {
-      const empty = document.createElement("div");
-      empty.className = "outline-empty";
-      empty.textContent = t("outline.noSymbols");
-      outlineListEl.appendChild(empty);
-      return;
-    }
-    renderOutlineSymbols(docSymbols, outlineListEl, 0);
-  } catch {
-    const empty = document.createElement("div");
-    empty.className = "outline-empty";
-    empty.textContent = t("outline.noSymbols");
-    outlineListEl.appendChild(empty);
-  }
-}
-
-async function getDocumentSymbols(model) {
-  const providers = monaco.languages.DocumentSymbolProviderRegistry?.all?.(model);
-  if (!providers || !providers.length) {
-    return fallbackSymbols(model);
-  }
-  try {
-    const result = await providers[0].provideDocumentSymbols(model);
-    return result && result.length ? result : fallbackSymbols(model);
-  } catch {
-    return fallbackSymbols(model);
-  }
-}
-
-function fallbackSymbols(model) {
-  const symbols = [];
-  const text = model.getValue();
-  const lines = text.split("\n");
-  const funcRegex = /(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(?|class\s+(\w+))/;
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(funcRegex);
-    if (m) {
-      const name = m[1] || m[2] || m[3];
-      const kind = m[3] ? 4 : (m[1] ? 11 : 5);
-      symbols.push({
-        name,
-        kind,
-        range: { startLineNumber: i + 1, startColumn: 1, endLineNumber: i + 1, endColumn: lines[i].length + 1 },
-        children: [],
-      });
-    }
-  }
-  return symbols;
-}
-
-const SYMBOL_ICONS = {
-  4: "i-code",  // Class
-  5: "i-code",  // Method
-  11: "i-code", // Function
-  12: "i-code", // Variable
-  13: "i-code", // Constant
-  1: "i-file",  // File
-  2: "i-folder", // Module
-  6: "i-code",  // Property
-  7: "i-code",  // Field
-};
-
-function renderOutlineSymbols(symbols, container, depth) {
-  for (const sym of symbols) {
-    const item = document.createElement("div");
-    item.className = "outline-item";
-    item.style.paddingLeft = (12 + depth * 14) + "px";
-    const iconId = SYMBOL_ICONS[sym.kind] || "i-code";
-    item.innerHTML = `<svg class="ic"><use href="#${iconId}" /></svg><span class="outline-name"></span>`;
-    item.querySelector(".outline-name").textContent = sym.name;
-    item.addEventListener("click", () => {
-      const line = sym.range?.startLineNumber || sym.selectionRange?.startLineNumber || 1;
-      monacoEditor.revealLineInCenter(line);
-      monacoEditor.setPosition({ lineNumber: line, column: 1 });
-      monacoEditor.focus();
-    });
-    container.appendChild(item);
-    if (sym.children && sym.children.length) {
-      renderOutlineSymbols(sym.children, container, depth + 1);
-    }
-  }
-}
 
 function renderTreeActive() {
   treeEl.querySelectorAll(".row.is-active").forEach((r) => r.classList.remove("is-active"));
@@ -3798,6 +3916,29 @@ document.addEventListener("keydown", (e) => {
 
 const history = [];
 let streaming = false;
+const CHAT_STORE_KEY = "michael-ide.chat-history";
+
+async function saveChatHistory() {
+  if (!inTauri || history.length === 0) return;
+  try {
+    const store = await loadStore("session.json");
+    await store.set(CHAT_STORE_KEY, history.slice(-50));
+    await store.save();
+  } catch (e) { console.warn("[chat] save failed:", e); }
+}
+
+async function restoreChatHistory() {
+  if (!inTauri) return;
+  try {
+    const store = await loadStore("session.json");
+    const saved = await store.get(CHAT_STORE_KEY);
+    if (!Array.isArray(saved) || saved.length === 0) return;
+    for (const m of saved) {
+      history.push(m);
+      addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
+    }
+  } catch (e) { console.warn("[chat] restore failed:", e); }
+}
 
 // Syntax-highlight code-card bodies by reusing Monaco's tokenizer (matches the
 // editor theme, no extra dependency). Returns null on failure so the card keeps
@@ -3936,7 +4077,7 @@ async function sendPrompt(text) {
       renderMarkdownInto(body, acc, { highlighter: highlightCode });
       // Don't push a truncated/errored reply into history — it would feed
       // incomplete context into later requests.
-      if (!err) history.push({ role: "assistant", content: acc });
+      if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
     }
     if (err) {
       const note = document.createElement("div");
@@ -3947,6 +4088,210 @@ async function sendPrompt(text) {
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 }
+
+// ---- AI inline code completion (Edit Prediction) ----
+let _completionTimer = null;
+const COMPLETION_DEBOUNCE = 600;
+let _completionAbort = null;
+
+function initInlineCompletion() {
+  monaco.languages.registerInlineCompletionsProvider("*", {
+    provideInlineCompletions: async (model, position, _context, token) => {
+      const config = loadConfig();
+      if (!config.baseUrl || !config.apiKey || !config.model) return { items: [] };
+
+      const textBefore = model.getValueInRange({
+        startLineNumber: Math.max(1, position.lineNumber - 50),
+        startColumn: 1,
+        endLineNumber: position.lineNumber,
+        endColumn: position.column,
+      });
+      const textAfter = model.getValueInRange({
+        startLineNumber: position.lineNumber,
+        startColumn: position.column,
+        endLineNumber: Math.min(model.getLineCount(), position.lineNumber + 10),
+        endColumn: model.getLineMaxColumn(Math.min(model.getLineCount(), position.lineNumber + 10)),
+      });
+
+      if (textBefore.trim().length < 3) return { items: [] };
+
+      const lang = model.getLanguageId();
+      const fileName = activePath ? activePath.split("/").pop() : "untitled";
+
+      const msgs = [
+        { role: "system", content: `You are a code completion engine. Complete the code at the cursor position. Output ONLY the completion text (the code that should be inserted at the cursor). No explanations, no markdown, no code fences. If no meaningful completion, output nothing.` },
+        { role: "user", content: `File: ${fileName} (${lang})\n\n--- CODE BEFORE CURSOR ---\n${textBefore.slice(-2000)}\n--- CURSOR IS HERE ---\n--- CODE AFTER CURSOR ---\n${textAfter.slice(0, 500)}` },
+      ];
+
+      try {
+        if (_completionAbort) _completionAbort.abort();
+        const controller = new AbortController();
+        _completionAbort = controller;
+
+        const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${config.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: config.model,
+            messages: msgs,
+            max_tokens: 128,
+            temperature: 0,
+            stream: false,
+          }),
+          signal: controller.signal,
+        });
+        if (token.isCancellationRequested) return { items: [] };
+        if (!resp.ok) return { items: [] };
+        const data = await resp.json();
+        const text = data?.choices?.[0]?.message?.content;
+        if (!text || !text.trim()) return { items: [] };
+        return {
+          items: [{
+            insertText: text,
+            range: {
+              startLineNumber: position.lineNumber,
+              startColumn: position.column,
+              endLineNumber: position.lineNumber,
+              endColumn: position.column,
+            },
+          }],
+        };
+      } catch {
+        return { items: [] };
+      }
+    },
+    freeInlineCompletions: () => {},
+  });
+}
+if (typeof monaco !== "undefined") initInlineCompletion();
+
+// ---- Inline AI Assistant (Ctrl+Enter) ----
+let _inlineWidget = null;
+
+function openInlineAssistant() {
+  const sel = monacoEditor.getSelection();
+  if (!sel || sel.isEmpty()) {
+    showToast("Select code first, then press Ctrl+Enter");
+    return;
+  }
+  const config = loadConfig();
+  if (!config.baseUrl || !config.apiKey || !config.model) {
+    openSettings();
+    showToast(t("assistant.configFirst"));
+    return;
+  }
+  closeInlineAssistant();
+
+  const selectedCode = monacoEditor.getModel().getValueInRange(sel);
+  const lang = monacoEditor.getModel().getLanguageId();
+
+  const overlay = document.createElement("div");
+  overlay.className = "inline-assist";
+  overlay.innerHTML = `
+    <div class="inline-assist__head">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a5 5 0 015 5c0 2-1.5 3.5-3 4.5V14a2 2 0 01-2 2h-0a2 2 0 01-2-2v-2.5C8.5 10.5 7 9 7 7a5 5 0 015-5z"/><path d="M10 18h4"/><path d="M10 22h4"/></svg>
+      <span>Inline Assistant</span>
+      <button class="inline-assist__close" type="button">&times;</button>
+    </div>
+    <input class="inline-assist__input" type="text" placeholder="Describe the change…" spellcheck="false" autofocus />
+    <div class="inline-assist__actions" hidden>
+      <button class="btn btn--sm btn--primary inline-assist__accept">Accept</button>
+      <button class="btn btn--sm inline-assist__reject">Reject</button>
+    </div>
+    <div class="inline-assist__status" hidden></div>
+  `;
+
+  const editorDom = $("editor");
+  editorDom.parentElement.appendChild(overlay);
+
+  const coords = monacoEditor.getScrolledVisiblePosition(sel.getStartPosition());
+  if (coords) {
+    overlay.style.top = (coords.top + coords.height + editorDom.offsetTop) + "px";
+    overlay.style.left = Math.max(20, coords.left + editorDom.offsetLeft) + "px";
+  }
+
+  const input = overlay.querySelector(".inline-assist__input");
+  const actionsDiv = overlay.querySelector(".inline-assist__actions");
+  const statusDiv = overlay.querySelector(".inline-assist__status");
+  let originalText = selectedCode;
+  let newText = null;
+
+  input.focus();
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "Escape") { closeInlineAssistant(); return; }
+    if (e.key !== "Enter" || !input.value.trim()) return;
+    e.preventDefault();
+    const prompt = input.value.trim();
+    input.disabled = true;
+    statusDiv.hidden = false;
+    statusDiv.textContent = "Thinking…";
+
+    const msgs = [
+      { role: "system", content: `You are a code transformation assistant. The user selected code in a ${lang} file and wants you to modify it. Output ONLY the modified code. No explanations, no markdown fences, no comments about changes. Just the raw modified code.` },
+      { role: "user", content: `Instruction: ${prompt}\n\nSelected code:\n${originalText}` },
+    ];
+
+    try {
+      let result = "";
+      await backend.aiChat(config, msgs, (ev) => {
+        if (ev.kind === "token") {
+          result += ev.delta;
+          statusDiv.textContent = `Generating… (${result.length} chars)`;
+        } else if (ev.kind === "error") {
+          statusDiv.textContent = "Error: " + ev.message;
+        }
+      });
+
+      newText = result.trim();
+      if (newText) {
+        monacoEditor.executeEdits("inline-assist", [{
+          range: sel,
+          text: newText,
+        }]);
+        statusDiv.textContent = "Applied — Accept or Reject?";
+        actionsDiv.hidden = false;
+        input.hidden = true;
+      }
+    } catch (err) {
+      statusDiv.textContent = "Error: " + (err.message || err);
+      input.disabled = false;
+    }
+  });
+
+  overlay.querySelector(".inline-assist__accept").addEventListener("click", () => {
+    closeInlineAssistant();
+  });
+  overlay.querySelector(".inline-assist__reject").addEventListener("click", () => {
+    if (newText !== null) {
+      monacoEditor.trigger("inline-assist", "undo");
+    }
+    closeInlineAssistant();
+  });
+  overlay.querySelector(".inline-assist__close").addEventListener("click", () => {
+    closeInlineAssistant();
+  });
+
+  _inlineWidget = overlay;
+}
+
+function closeInlineAssistant() {
+  if (_inlineWidget) {
+    _inlineWidget.remove();
+    _inlineWidget = null;
+  }
+}
+
+monacoEditor.addAction({
+  id: "inline-assistant",
+  label: "Inline AI Assistant",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+  precondition: "editorHasSelection",
+  run: () => openInlineAssistant(),
+});
 
 // ---- settings dialog ----
 const settingsEl = $("settings");
@@ -3976,6 +4321,99 @@ function showToast(msg) {
   toastEl.classList.add("is-visible");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastEl.classList.remove("is-visible"), 1900);
+}
+
+// ---- notification cards (bottom-right) ----
+const _notifContainer = document.createElement("div");
+_notifContainer.className = "notif-stack";
+document.body.appendChild(_notifContainer);
+
+function showNotification({ title, message, action, actionLabel = "安装", duration = 8000 }) {
+  const card = document.createElement("div");
+  card.className = "notif-card";
+  card.innerHTML = `
+    <div class="notif-card__content">
+      <div class="notif-card__title">${title}</div>
+      <div class="notif-card__msg">${message}</div>
+    </div>
+    <div class="notif-card__actions">
+      ${action ? `<button class="notif-card__btn notif-card__btn--primary">${actionLabel}</button>` : ""}
+      <button class="notif-card__btn notif-card__btn--dismiss">忽略</button>
+    </div>`;
+  _notifContainer.appendChild(card);
+  requestAnimationFrame(() => card.classList.add("notif-card--visible"));
+  const dismiss = () => { card.classList.remove("notif-card--visible"); setTimeout(() => card.remove(), 300); };
+  card.querySelector(".notif-card__btn--dismiss")?.addEventListener("click", dismiss);
+  if (action) card.querySelector(".notif-card__btn--primary")?.addEventListener("click", () => { action(); dismiss(); });
+  if (duration > 0) setTimeout(dismiss, duration);
+}
+
+function _showInstallProgress(cmd, name) {
+  const card = document.createElement("div");
+  card.className = "notif-card";
+  card.innerHTML = `
+    <div class="notif-card__content">
+      <div class="notif-card__title">正在安装 ${name}</div>
+      <div class="notif-card__msg">${cmd}</div>
+      <div class="notif-progress"><div class="notif-progress__bar"></div></div>
+    </div>`;
+  _notifContainer.appendChild(card);
+  requestAnimationFrame(() => card.classList.add("notif-card--visible"));
+  const bar = card.querySelector(".notif-progress__bar");
+  let width = 0;
+  const tick = setInterval(() => {
+    width = Math.min(width + (90 - width) * 0.05, 95);
+    bar.style.width = width + "%";
+  }, 300);
+  const checkDone = setInterval(async () => {
+    try {
+      const cmds = await backend.termListCommands();
+      const toolCmd = cmd.split(/\s+/).pop();
+      if (cmds.includes(toolCmd)) {
+        clearInterval(tick); clearInterval(checkDone);
+        bar.style.width = "100%";
+        card.querySelector(".notif-card__title").textContent = `${name} 安装完成`;
+        card.querySelector(".notif-card__msg").textContent = "重新打开文件即可使用智能补全";
+        bar.style.background = "#34c759";
+        setTimeout(() => { card.classList.remove("notif-card--visible"); setTimeout(() => card.remove(), 300); }, 4000);
+      }
+    } catch {}
+  }, 3000);
+  setTimeout(() => { clearInterval(tick); clearInterval(checkDone); card.remove(); }, 120000);
+}
+
+// ---- auto-detect missing tools ----
+const TOOL_REQUIREMENTS = {
+  python: { cmd: "pyright", install: "npm install -g pyright", name: "Pyright (Python LSP)" },
+  rust: { cmd: "rust-analyzer", install: "brew install rust-analyzer", name: "rust-analyzer" },
+  go: { cmd: "gopls", install: "go install golang.org/x/tools/gopls@latest", name: "gopls (Go LSP)" },
+};
+
+const _checkedLangs = new Set();
+async function checkToolForLanguage(lang) {
+  if (_checkedLangs.has(lang)) return;
+  const req = TOOL_REQUIREMENTS[lang];
+  if (!req) return;
+  _checkedLangs.add(lang);
+  try {
+    if (inTauri) {
+      const cmds = await backend.termListCommands();
+      if (cmds.includes(req.cmd)) return;
+    }
+    showNotification({
+      title: `缺少 ${req.name}`,
+      message: `安装后可获得 ${lang} 智能补全、跳转定义等功能`,
+      actionLabel: "安装",
+      duration: 15000,
+      action: async () => {
+        await openTerminal();
+        writeToActiveTerminal(req.install + "\n");
+        showToast(`正在自动安装 ${req.name}...`);
+      },
+    });
+  } catch (e) {
+    console.warn("[tool-check]", lang, e);
+  }
 }
 
 // ---- advanced feature panels (workspace / remote / marketplace / debug) ----
@@ -5677,14 +6115,131 @@ async function chooseFolder() {
 }
 $("openFolderBtn").addEventListener("click", chooseFolder);
 $("emptyOpenBtn").addEventListener("click", chooseFolder);
-$("settingsBtn").addEventListener("click", openSettings);
+// settings dropdown
+const settingsDropdown = $("settingsDropdown");
+$("settingsBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (settingsDropdown) settingsDropdown.hidden = !settingsDropdown.hidden;
+});
+document.addEventListener("click", () => { if (settingsDropdown) settingsDropdown.hidden = true; });
+if (settingsDropdown) {
+  settingsDropdown.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const item = e.target.closest("[data-action]");
+    if (!item) return;
+    settingsDropdown.hidden = true;
+    const action = item.dataset.action;
+    if (action === "ai-settings") openSettings();
+    else if (action === "general-settings") openAdvancedTool("settings");
+    else if (action === "shortcuts") openAdvancedTool("shortcuts");
+    else if (action === "login") {
+      const dlg = $("loginDialog");
+      if (dlg) { $("loginStep1").hidden = false; $("loginStep2").hidden = true; dlg.showModal(); }
+    }
+    else if (action === "logout") {
+      _loggedInEmail = null;
+      _updateLoginUI();
+    }
+    else if (action === "profile") {
+      alert("个人资料功能开发中");
+    }
+  });
+}
 $("saveBtn").addEventListener("click", saveActive);
 $("runBtn")?.addEventListener("click", runCurrentFile);
+
+// login state
+let _loggedInEmail = null;
+function _updateLoginUI() {
+  const dropName = document.querySelector(".settings-dropdown__name");
+  const dropHint = document.querySelector(".settings-dropdown__hint");
+  const profileBtn = $("profileBtn");
+  const logoutBtn = $("logoutBtn");
+  const loginHeader = document.querySelector(".settings-dropdown__header");
+  if (_loggedInEmail) {
+    if (dropName) dropName.textContent = _loggedInEmail;
+    if (dropHint) dropHint.textContent = "已登录";
+    if (profileBtn) profileBtn.hidden = false;
+    if (logoutBtn) logoutBtn.hidden = false;
+    if (loginHeader) loginHeader.dataset.action = "profile";
+  } else {
+    if (dropName) dropName.textContent = "未登录";
+    if (dropHint) dropHint.textContent = "点击登录";
+    if (profileBtn) profileBtn.hidden = true;
+    if (logoutBtn) logoutBtn.hidden = true;
+    if (loginHeader) loginHeader.dataset.action = "login";
+  }
+}
+
+// login flow
+const loginLogoEl = $("loginLogo");
+if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" src="/src/assets/logo.png" alt="Michael IDE" style="width:52px;height:52px;border-radius:13px" />`;
+$("loginCloseBtn")?.addEventListener("click", () => $("loginDialog")?.close());
+$("loginNextBtn")?.addEventListener("click", () => {
+  const email = $("loginEmail")?.value?.trim();
+  if (!email) { $("loginEmail")?.focus(); return; }
+  $("loginStep2Hint").textContent = email;
+  $("loginStep1").hidden = true;
+  $("loginStep2").hidden = false;
+  $("loginPassword")?.focus();
+});
+$("loginBackBtn")?.addEventListener("click", () => {
+  $("loginStep1").hidden = false;
+  $("loginStep2").hidden = true;
+  $("loginEmail")?.focus();
+});
+$("loginSubmitBtn")?.addEventListener("click", async () => {
+  const email = $("loginEmail")?.value?.trim();
+  const password = $("loginPassword")?.value;
+  if (!email || !password) return;
+  const btn = $("loginSubmitBtn");
+  const origText = btn.textContent;
+  btn.textContent = "处理中...";
+  btn.disabled = true;
+  try {
+    const result = _loginCodeMode
+      ? await backend.authVerifyCode(email, password)
+      : await backend.authLoginOrRegister(email, password);
+    if (result.success) {
+      $("loginDialog")?.close();
+      _loggedInEmail = email;
+      _updateLoginUI();
+    } else {
+      alert(result.message || "登录失败");
+    }
+  } catch (e) {
+    alert("登录失败: " + (e?.message || e));
+  } finally {
+    btn.textContent = origText;
+    btn.disabled = false;
+  }
+});
+let _loginCodeMode = false;
+$("loginUseCodeBtn")?.addEventListener("click", async () => {
+  const pw = $("loginPassword");
+  _loginCodeMode = !_loginCodeMode;
+  if (_loginCodeMode) {
+    pw.type = "text"; pw.placeholder = "输入 6 位验证码";
+    $("loginUseCodeBtn").textContent = "使用密码登录";
+    $("loginSubmitBtn").textContent = "验证";
+    const email = $("loginEmail")?.value?.trim();
+    if (email) {
+      try {
+        const msg = await backend.authSendCode(email);
+        alert(msg);
+      } catch (e) { alert("发送失败: " + (e?.message || e)); }
+    }
+  } else {
+    pw.type = "password"; pw.placeholder = "输入密码";
+    $("loginUseCodeBtn").textContent = "使用验证码登录";
+    $("loginSubmitBtn").textContent = "登录";
+  }
+  pw.value = ""; pw.focus();
+});
 
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabGit").addEventListener("click", () => showSide("git"));
-$("tabOutline")?.addEventListener("click", () => showSide("outline"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
 $("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
@@ -6862,6 +7417,7 @@ Promise.all([
 ]).catch(console.error);
 showChatHint();
 syncWelcome();
+restoreChatHistory().catch(console.warn);
 
 // ---- recent projects ----
 const RECENT_PROJECTS_KEY = "michael-ide.recent-projects";
@@ -6934,6 +7490,7 @@ async function saveSession() {
   } catch (e) {
     console.warn("[session] save failed:", e);
   }
+  await saveChatHistory();
 }
 
 async function restoreSession() {

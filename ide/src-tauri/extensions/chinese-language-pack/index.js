@@ -170,10 +170,6 @@ const ZH_CN = {
   "autosave.enabled": "已开启自动保存",
   "autosave.disabled": "已关闭自动保存",
 
-  "outline.title": "大纲",
-  "outline.noSymbols": "当前文件中未找到符号。",
-  "outline.noFile": "打开文件以查看大纲。",
-
   "theme.title": "主题",
   "theme.light": "浅色",
   "theme.dark": "深色",

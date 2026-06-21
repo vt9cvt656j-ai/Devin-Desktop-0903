@@ -296,4 +296,13 @@ export function initTerminal(deps) {
   window.addEventListener("beforeunload", cleanupAllTerminals);
 }
 
-export { openTerminal, closeTerminal, toggleTerminal, createTermTab };
+async function runCommandInTerminal(cmd) {
+  await openTerminal();
+  await new Promise(r => setTimeout(r, 800));
+  const entry = termTabs[activeTermTab];
+  if (entry?.backendId != null) {
+    backend.termWrite(entry.backendId, cmd + "\n");
+  }
+}
+
+export { openTerminal, closeTerminal, toggleTerminal, createTermTab, runCommandInTerminal };

@@ -112,7 +112,12 @@ pub fn dap_start(
         config.args.clone()
     };
 
-    let mut builder = Command::new(&command);
+    #[cfg(not(windows))]
+    let resolved = process_util::resolve_command(&command, config.cwd.as_deref());
+    #[cfg(windows)]
+    let resolved = command.clone();
+
+    let mut builder = Command::new(&resolved);
     builder
         .args(&args)
         .stdin(Stdio::piped())
