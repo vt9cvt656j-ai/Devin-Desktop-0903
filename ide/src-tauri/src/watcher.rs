@@ -7,6 +7,24 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKi
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
+/// High-churn directories whose changes must NOT be forwarded to the UI: an
+/// `npm install` / build / `cargo build` rewrites thousands of files in these,
+/// which previously flooded the frontend (and its git refresh) and froze the app
+/// while a command ran — even a backgrounded one, since the churn happens anyway.
+const IGNORED_WATCH_DIRS: &[&str] = &[
+    "node_modules", ".git", "target", "dist", "build", "out", ".next", "coverage",
+    ".cache", ".venv", "__pycache__", "vendor", ".gradle", ".idea", "Pods", "DerivedData",
+];
+
+fn is_ignored_path(path: &std::path::Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(name) => IGNORED_WATCH_DIRS
+            .iter()
+            .any(|d| name == std::ffi::OsStr::new(d)),
+        _ => false,
+    })
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FsChangeEvent {
@@ -59,12 +77,15 @@ pub fn fs_watch(
     let mut debouncer = new_debouncer(Duration::from_millis(300), move |res: DebounceEventResult| {
         match res {
             Ok(events) => {
-                let changed: Vec<String> = events
+                let mut changed: Vec<String> = events
                     .iter()
-                    .filter(|e| e.kind == DebouncedEventKind::Any)
+                    .filter(|e| e.kind == DebouncedEventKind::Any && !is_ignored_path(&e.path))
                     .map(|e| e.path.to_string_lossy().to_string())
                     .collect();
                 if !changed.is_empty() {
+                    // Bound the batch so a huge legitimate change (e.g. a big
+                    // `git checkout`) still can't hand the UI thousands of paths.
+                    changed.truncate(500);
                     let _ = app_handle.emit("fs-change", FsChangeEvent { paths: changed });
                 }
             }

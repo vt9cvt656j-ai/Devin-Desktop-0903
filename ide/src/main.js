@@ -3233,9 +3233,15 @@ async function startFileWatcher() {
   }
 }
 
+const _FS_IGNORE_RE = /(^|\/)(node_modules|\.git|target|dist|build|out|\.next|coverage|\.cache|\.venv|__pycache__|vendor|\.gradle)(\/|$)/;
 function handleFsChanges(paths) {
   if (!rootPath) return;
   if (_autoSaving) return;
+
+  // Defense in depth (the watcher already filters these at the source): never do
+  // work for changes inside high-churn build/dependency dirs.
+  paths = paths.filter((p) => !_FS_IGNORE_RE.test(p));
+  if (!paths.length) return;
 
   const openPaths = new Set(openFiles.keys());
   const onlyOpenFiles = paths.every((p) => openPaths.has(p));
@@ -3248,9 +3254,11 @@ function handleFsChanges(paths) {
       dirsToReload.add(dir);
     }
   }
+  let reloaded = 0;
   for (const dir of dirsToReload) {
     if (dirNodes.has(dir) || workspaceRoots.includes(dir)) {
       reloadDir(dir);
+      if (++reloaded >= 40) break; // never reload an unbounded number of dirs at once
     }
   }
   refreshGitStatus();
@@ -5516,6 +5524,12 @@ const _AI_MODE_PROMPTS = {
 5. 自我验证——改完尽量用 run_cmd 跑测试/构建/类型检查（cargo check、npm run build、go build、pytest 等）。失败就读报错→定位→（必要时联网查解决方案）→修复→再验证，循环到通过为止。
 6. 收尾——完成后用 1-3 句话总结：改了什么、为什么、怎么验证的；列出你做的关键假设。
 
+# 做真实可用的东西，不是 demo（最重要的总原则）
+- 默认交付**真正能跑、逻辑完整**的实现，不是占位/假数据/写死的 demo。该连后端就连后端，该落库就落库，该处理边界就处理——别用「TODO」「假装成功」「mock 数据」糊弄。
+- 动手前先想清楚**这东西到底需要什么**：要不要持久化？要就按下面「数据与数据库」一节认真设计 schema/索引/迁移，而不是塞内存或平面文件应付；要不要鉴权、配置、错误处理？把真实需求想全再实现。
+- 做完**一定要验证它真的成立**：用 run_cmd 跑构建/测试/类型检查、用 get_diagnostics 看报错、能起服务就起来点一下关键路径。没验证过的「做完了」不算做完。
+- 宁可范围小但每块都真，也不要范围大但全是空壳。
+
 # 工程判断（默认这样思考，没人提也要做到）
 - 先顺着项目已有约定走——命名、目录结构、错误处理、状态管理、技术选型，都先看现有代码怎么做并保持一致；优先复用已有的工具/组件/模式，别另起一套。
 - 默认就把安全和健壮性做对：校验外部输入，处理空/错误/加载/边界四类情况，绝不把密钥/密码硬编码或提交进仓库。
@@ -5533,6 +5547,11 @@ const _AI_MODE_PROMPTS = {
 - 颜色克制：一个主强调色 + 中性灰阶 + 少量语义色（成功/警告/危险）；正文对比度达 WCAG AA（≥4.5:1）。
 - 状态做全：hover / focus（键盘焦点要可见）/ active / disabled / loading / 空状态 / 错误态，别只做"正常态"。
 - 细节出质感：一致的圆角与柔和阴影、对齐、克制的过渡（150–200ms）、语义标签+aria+键盘可达、响应式不溢出、深浅色主题都用变量照顾到。
+
+# 图标与视觉资源（做界面/产品时，别用 emoji 凑数）
+- 图标优先复用项目已有图标集 / SVG sprite，保持风格统一。需要新图标时：① 用成熟图标库（Lucide / Material Symbols / Heroicons / Feather）——可 web_search 查它们官方 SVG 或 CDN 用法再用；② 或自己**手写干净的 SVG**：统一 24×24 viewBox、用 currentColor 继承主题色、1.5–2px 描边、几何简洁、对齐像素，别堆一堆杂乱 path。**正式 UI 图标不要用 emoji。**
+- 图片/插画分清场景：原型可用占位服务（picsum 等）；正式素材联网找**可商用并注明出处**的（Unsplash 等）；图标性质的优先 SVG（清晰、可缩放、可换色）而非位图。外链资源注意许可与可用性。
+- 图标/插画/配色都和项目既有设计语言一致（用「UI 质量」里的设计变量），别东拼西凑。
 
 # 数据与数据库（涉及持久化/存储时）
 - 选对存储：简单本地配置用文件/KV；有关系、要查询、要事务才上关系型数据库——别为存几个键值上重型库，也别把关系数据硬塞进平面文件。
