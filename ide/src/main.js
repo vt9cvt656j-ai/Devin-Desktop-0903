@@ -5556,8 +5556,11 @@ const _AI_MODE_PROMPTS = {
 - web_fetch(url)：抓取公网网页正文，读 web_search 找到的页面或已知文档 URL（仅 http/https 公网）
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
+- remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
 - edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
 - write_file(path, content)：新建或整文件重写
+- delete_path(path)：删除文件/目录（递归），用于清理/重构
+- move_path(from, to)：移动或重命名文件/目录
 - run_cmd(command)：在隔离子进程里运行一条 shell 命令并拿到完整输出（装依赖、跑测试、构建、git 等）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录就写「cd 子目录 && 你的命令」；② 路径含空格务必加引号，如 cd "未命名文件夹 2/client"；③ 要启动服务器/前端来测试，用后台方式让命令立刻返回：「nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」——千万别前台直接跑服务（不返回会卡住）
 
 # 输出风格
@@ -5795,6 +5798,12 @@ async function _gatherAgentContext() {
     } catch { /* not present */ }
   }
 
+  // Agent-authored project memory (persisted via the `remember` tool).
+  const _mem = _loadMemory(root);
+  if (_mem && _mem.trim()) {
+    parts.push(`\n--- 项目记忆（你之前用 remember 记下的，跨会话保留，开工前先看）---\n${_mem.slice(0, 4000)}`);
+  }
+
   const treeDom = document.querySelectorAll("#tree .row");
   if (treeDom.length > 0) {
     parts.push("\n项目结构:");
@@ -5875,6 +5884,9 @@ async function sendPrompt(text, attachedImages = []) {
 
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
+
+  // Compact a long conversation before this turn (summarize older history).
+  await _compactHistoryIfHuge(config);
 
   // Keep the active chat's project label in sync with the folder it's actually
   // operating on (handles opening a different project mid-conversation).
@@ -6791,12 +6803,15 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进项目记忆（按工作区持久保存，下次自动加载进上下文）。适合记：技术栈/架构决定、约定、构建与测试命令、用户偏好、易踩的坑。只记真正长期有用的事实，别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一句话（简洁、自包含）" } }, required: ["content"] } } },
   ];
   if (includeWrite) {
     tools.push(
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。改已有文件请优先用它。old_string 必须能在文件中唯一定位（带足够上下文），否则会报错。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
       { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条 shell 命令（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+      { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
+      { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。重构、改名时用。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
     );
   }
   return tools;
@@ -6817,6 +6832,9 @@ function _mapToolCall(name, args) {
     case "run_cmd": return { type: "cmd", command: args.command || "" };
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
     case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
+    case "remember": return { type: "memory", path: "项目记忆", content: args.content || "" };
+    case "delete_path": return { type: "delete", path: args.path || "" };
+    case "move_path": return { type: "move", path: args.from || "", to: args.to || "" };
     default: return null;
   }
 }
@@ -6865,27 +6883,109 @@ function _renderPlan(container, steps, existingEl) {
   return el;
 }
 
+// ============================================================================
+// Agent infrastructure: caching, project memory, context compaction.
+// ============================================================================
+
+// --- Caching: avoid re-reading the same file / re-fetching the same URL during
+// a run. The read cache is cleared at the start of each agent run and on any
+// command (which may mutate files), and invalidated per-path on edit/write/
+// delete/move. The web cache lives for the session (page content is stable). ---
+const _agentReadCache = new Map(); // absolute path -> file text
+const _agentWebCache = new Map(); // url|query -> result text
+function _clearAgentReadCache() { _agentReadCache.clear(); }
+function _invalidateRead(path) {
+  if (!path) return;
+  const root = rootPath || workspaceRoots[0] || "";
+  for (const k of [path, root ? root + "/" + path.replace(/^\/+/, "") : null]) {
+    if (k) _agentReadCache.delete(k);
+  }
+}
+
+// --- Project memory: notes the agent writes with the `remember` tool, persisted
+// per-workspace in localStorage and auto-injected into the agent's context so it
+// carries knowledge across turns and sessions (like CLAUDE.md, but agent-authored). ---
+function _memoryKey(root) { return "michael-ide.memory:" + (root || "_global"); }
+function _loadMemory(root) {
+  try { return localStorage.getItem(_memoryKey(root)) || ""; } catch { return ""; }
+}
+function _appendMemory(root, note) {
+  const clean = String(note || "").trim().replace(/\n+/g, " ");
+  if (!clean) return false;
+  let lines = _loadMemory(root).split("\n").filter(Boolean);
+  lines.push("- " + clean);
+  if (lines.length > 60) lines = lines.slice(-60); // keep the most recent notes
+  let mem = lines.join("\n");
+  if (mem.length > 8000) mem = mem.slice(mem.length - 8000);
+  try { localStorage.setItem(_memoryKey(root), mem); } catch {}
+  _agentContextCache = { root: null, ts: 0, data: "" }; // force context rebuild so the note shows
+  return true;
+}
+
 /**
  * Keep the running `messages` array from blowing past the context window on long
- * autonomous tasks: once it gets large, truncate the *older* tool outputs to a
- * stub. Messages are never removed (that would orphan a tool_call), only shrunk.
+ * autonomous tasks. Once it gets large, fold the *older* tool outputs (and, when
+ * very large, older assistant prose) down to a stub. Only message CONTENT is
+ * shortened — roles and tool_call ids are never touched, so the tool-call
+ * structure the API requires stays intact.
  */
 function _trimMessagesIfHuge(messages) {
-  const LIMIT = 140000; // ~chars; conservative stand-in for the context budget
+  const HARD = 140000, SOFT = 90000;
   let total = 0;
   for (const m of messages) total += m.content ? String(m.content).length : 0;
-  if (total <= LIMIT) return;
-  const KEEP = 6;
+  if (total <= SOFT) return;
+  const aggressive = total > HARD;
+  const KEEP = aggressive ? 4 : 8;
+  const cap = aggressive ? 120 : 300;
   const toolIdx = [];
   for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdx.push(i);
   const trimUpTo = toolIdx.length - KEEP;
   for (let k = 0; k < trimUpTo; k++) {
     const i = toolIdx[k];
     const c = messages[i].content ? String(messages[i].content) : "";
-    if (c.length > 300) {
-      messages[i] = { ...messages[i], content: c.slice(0, 200) + `\n…（较早的工具输出已省略以节省上下文，原 ${c.length} 字）` };
+    if (c.length > cap + 80) {
+      messages[i] = { ...messages[i], content: c.slice(0, cap) + `\n…（较早工具输出已折叠以省上下文，原 ${c.length} 字）` };
     }
   }
+  if (aggressive) {
+    const lastKeep = messages.length - 6;
+    for (let i = 1; i < lastKeep; i++) {
+      const m = messages[i];
+      if (m.role === "assistant" && !m.tool_calls && m.content && String(m.content).length > 600) {
+        messages[i] = { ...m, content: String(m.content).slice(0, 400) + "\n…（较早回复已折叠）" };
+      }
+    }
+  }
+}
+
+/**
+ * Conversation-level compaction (between turns): when the text-only chat
+ * `history` gets long, summarize the older turns into one compact note and keep
+ * only the most recent few verbatim. `history` holds plain user/assistant text
+ * (no tool_call structure), so replacing a prefix is structurally safe. Guarded:
+ * any failure falls back to a short marker rather than touching the structure.
+ */
+async function _compactHistoryIfHuge(config) {
+  if (!Array.isArray(history) || history.length < 8) return;
+  let total = 0;
+  for (const m of history) total += m.content ? String(m.content).length : 0;
+  if (total < 60000) return;
+  const KEEP = 4;
+  if (history.length <= KEEP + 2) return;
+  const older = history.slice(0, history.length - KEEP);
+  const transcript = older.map((m) => `[${m.role}] ${String(m.content || "").slice(0, 4000)}`).join("\n\n").slice(0, 50000);
+  let summary = "";
+  try {
+    summary = await backend.aiComplete(config, [
+      { role: "system", content: "把下面这段编程助手对话压缩成简洁要点，保留：用户目标与约束、已完成的关键改动与决定、已确认的事实/文件结构、未完成事项。用中文，分条，尽量短。" },
+      { role: "user", content: transcript },
+    ], 1024);
+  } catch { summary = ""; }
+  const note = summary && summary.trim()
+    ? "【早先对话的压缩摘要】\n" + summary.trim()
+    : "【早先对话较长，已省略以节省上下文】";
+  history.splice(0, older.length, { role: "assistant", content: note });
+  try { saveChatHistory(); } catch {}
 }
 
 /** Serialize a tool's result into the `tool` message content the model reads next turn. */
@@ -7157,6 +7257,7 @@ async function _runAgenticLoop({ config, messages, root }) {
 
   streaming = true;
   _setSendBtnStop(true);
+  _clearAgentReadCache(); // fresh file reads each run
 
   let finalErr = null;
   let summaryText = "";
@@ -7271,7 +7372,7 @@ function _createToolStep(call) {
   const pathDisplay = call.path || call.command || "";
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -7287,7 +7388,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -7321,7 +7422,7 @@ async function _executeToolStep(step, call, root) {
   const row = step.querySelector(".agent-tool-row");
 
   const readOnlyMode = _currentAiMode === "explorer" || _currentAiMode === "reviewer" || _currentAiMode === "plan";
-  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "cmd")) {
+  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "cmd" || call.type === "delete" || call.type === "move")) {
     const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" ? "运行命令" : "修改文件";
     res.className = "atc-result atc-result--blocked";
@@ -7359,16 +7460,23 @@ async function _executeToolStep(step, call, root) {
       let usedPath = candidates[0];
 
       let isDir = false;
+      // Cache hit: serve a previously-read file without another backend call.
       for (const fp of candidates) {
-        try {
-          txt = await backend.readTextFile(fp);
-          readFailed = false;
-          usedPath = fp;
-          break;
-        } catch (e) {
-          const msg = String(e?.message || e);
-          if (/is a directory|os error 21/i.test(msg)) { isDir = true; usedPath = fp; break; }
-          readError = msg.slice(0, 200);
+        if (_agentReadCache.has(fp)) { txt = _agentReadCache.get(fp); readFailed = false; usedPath = fp; break; }
+      }
+      if (readFailed) {
+        for (const fp of candidates) {
+          try {
+            txt = await backend.readTextFile(fp);
+            readFailed = false;
+            usedPath = fp;
+            _agentReadCache.set(fp, txt);
+            break;
+          } catch (e) {
+            const msg = String(e?.message || e);
+            if (/is a directory|os error 21/i.test(msg)) { isDir = true; usedPath = fp; break; }
+            readError = msg.slice(0, 200);
+          }
         }
       }
 
@@ -7517,6 +7625,8 @@ async function _executeToolStep(step, call, root) {
         const dir = fp.split("/").slice(0, -1).join("/");
         if (dir) await backend.taskRunCapture(writeRoot, `mkdir -p "${dir}"`).catch(() => {});
         await backend.writeTextFile(fp, newContent);
+        _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
+        _invalidateRead(call.path);
       } catch (e1) {
         try {
           await backend.taskRunCapture(root, `mkdir -p "$(dirname '${fp}')" && cat > "${fp}" << 'AGENT_EOF'\n${newContent}\nAGENT_EOF`);
@@ -7588,16 +7698,56 @@ async function _executeToolStep(step, call, root) {
       vp.innerHTML = `<pre>${_escHtml(r.text)}</pre>`;
       return { type: "find", path: call.path, content: `find_files "${call.pattern || call.path}":\n${r.text}` };
 
+    } else if (call.type === "memory") {
+      const ok = _appendMemory(root, call.content);
+      res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+      res.textContent = ok ? "已记住" : "空内容";
+      if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml((call.content || "").slice(0, 500))}</pre>`;
+      return { type: "memory", path: call.path, content: ok ? `已记入项目记忆：${call.content}` : "[ERROR] 空内容，未记录。" };
+
+    } else if (call.type === "delete") {
+      const p = call.path || "";
+      if (!p.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "delete", path: p, content: "[ERROR] 空路径。" }; }
+      const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
+      try {
+        await backend.deletePath(fp);
+        _invalidateRead(p); _agentReadCache.delete(fp);
+        res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
+        return { type: "delete", path: p, content: `已删除 ${p}` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
+        return { type: "delete", path: p, content: `[ERROR] 删除失败: ${String(e?.message || e).slice(0, 160)}` };
+      }
+
+    } else if (call.type === "move") {
+      const from = call.path || "", to = call.to || "";
+      if (!from.trim() || !to.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "缺少 from/to"; return { type: "move", path: from, content: "[ERROR] 需要 from 和 to。" }; }
+      const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
+      const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
+      try {
+        await backend.renamePath(fromFp, toFp);
+        _invalidateRead(from); _agentReadCache.delete(fromFp);
+        res.className = "atc-result atc-result--ok"; res.textContent = "已移动";
+        return { type: "move", path: from, content: `已移动 ${from} → ${to}` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
+        return { type: "move", path: from, content: `[ERROR] 移动失败: ${String(e?.message || e).slice(0, 160)}` };
+      }
+
     } else if (call.type === "web") {
       const url = (call.url || call.path || "").trim();
       if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "web", path: call.path, content: "[ERROR] 空 URL。" }; }
       let text = "";
-      try { text = await backend.invoke("web_fetch", { url }); }
-      catch (e) {
-        const msg = String(e?.message || e).slice(0, 160);
-        res.className = "atc-result atc-result--err";
-        res.textContent = msg.slice(0, 80);
-        return { type: "web", path: call.path, content: `[ERROR] 抓取失败: ${msg}` };
+      if (_agentWebCache.has(url)) {
+        text = _agentWebCache.get(url);
+      } else {
+        try { text = await backend.invoke("web_fetch", { url }); _agentWebCache.set(url, text); }
+        catch (e) {
+          const msg = String(e?.message || e).slice(0, 160);
+          res.className = "atc-result atc-result--err";
+          res.textContent = msg.slice(0, 80);
+          return { type: "web", path: call.path, content: `[ERROR] 抓取失败: ${msg}` };
+        }
       }
       const chars = text.length;
       res.className = "atc-result atc-result--ok";
@@ -7609,12 +7759,16 @@ async function _executeToolStep(step, call, root) {
       const q = (call.query || call.path || "").trim();
       if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "空搜索词"; return { type: "websearch", path: call.path, content: "[ERROR] 空搜索词。" }; }
       let text = "";
-      try { text = await backend.invoke("web_search", { query: q }); }
-      catch (e) {
-        const msg = String(e?.message || e).slice(0, 160);
-        res.className = "atc-result atc-result--err";
-        res.textContent = msg.slice(0, 80);
-        return { type: "websearch", path: call.path, content: `[ERROR] 搜索失败: ${msg}` };
+      if (_agentWebCache.has("q:" + q)) {
+        text = _agentWebCache.get("q:" + q);
+      } else {
+        try { text = await backend.invoke("web_search", { query: q }); _agentWebCache.set("q:" + q, text); }
+        catch (e) {
+          const msg = String(e?.message || e).slice(0, 160);
+          res.className = "atc-result atc-result--err";
+          res.textContent = msg.slice(0, 80);
+          return { type: "websearch", path: call.path, content: `[ERROR] 搜索失败: ${msg}` };
+        }
       }
       const hits = (text.match(/^\s*\d+\.\s/gm) || []).length;
       res.className = "atc-result atc-result--ok";
@@ -7626,6 +7780,7 @@ async function _executeToolStep(step, call, root) {
       if (!call.command || !call.command.trim()) {
         return null;
       }
+      _clearAgentReadCache(); // a command may have changed files on disk
       step.className = "agent-term-card agent-term-card--running";
       step.innerHTML =
         `<div class="agent-term-card__header">` +
