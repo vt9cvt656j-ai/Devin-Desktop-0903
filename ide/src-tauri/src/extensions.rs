@@ -96,42 +96,9 @@ const BUILTINS: &[(&str, &str)] = &[
         include_str!("../extensions/chinese-language-pack/extension.json"),
         include_str!("../extensions/chinese-language-pack/index.js"),
     ),
-    (
-        include_str!("../extensions/tailwind-intellisense/extension.json"),
-        include_str!("../extensions/tailwind-intellisense/index.js"),
-    ),
-    (
-        include_str!("../extensions/hanzi-counter/extension.json"),
-        include_str!("../extensions/hanzi-counter/index.js"),
-    ),
-    (
-        include_str!("../extensions/translate-helper/extension.json"),
-        include_str!("../extensions/translate-helper/index.js"),
-    ),
-    (
-        include_str!("../extensions/docker-tools/extension.json"),
-        include_str!("../extensions/docker-tools/index.js"),
-    ),
-    (
-        include_str!("../extensions/polacode-screenshot/extension.json"),
-        include_str!("../extensions/polacode-screenshot/index.js"),
-    ),
-    (
-        include_str!("../extensions/project-manager/extension.json"),
-        include_str!("../extensions/project-manager/index.js"),
-    ),
-    (
-        include_str!("../extensions/spell-checker/extension.json"),
-        include_str!("../extensions/spell-checker/index.js"),
-    ),
-    (
-        include_str!("../extensions/material-icons/extension.json"),
-        include_str!("../extensions/material-icons/index.js"),
-    ),
-    (
-        include_str!("../extensions/svelte-language/extension.json"),
-        include_str!("../extensions/svelte-language/index.js"),
-    ),
+    // NOTE: only extensions whose source is committed to the repo may be listed
+    // here — `include_str!` is resolved at compile time, so referencing an
+    // uncommitted extension breaks `cargo build` on a clean checkout.
 ];
 
 /// An extension id is used as a directory name, so keep it to a safe charset.
