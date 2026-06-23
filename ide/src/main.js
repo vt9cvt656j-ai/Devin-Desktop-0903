@@ -33,6 +33,7 @@ import { registerSnippetProviders } from "./snippets.js";
 import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
 import { createDapManager } from "./dap-client.js";
+import * as growth from "./growth.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -5980,7 +5981,9 @@ async function sendPrompt(text, attachedImages = []) {
     }
   }
 
-  const fullPrompt = sysPrompt + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
+  // Growth: inject the adaptive teaching block (tailored to this user's learner
+  // model — fades scaffolding as mastery rises; see growth.js).
+  const fullPrompt = sysPrompt + growth.promptBlock() + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
 
   _compactHistoryIfNeeded();
 
@@ -6018,6 +6021,20 @@ async function sendPrompt(text, attachedImages = []) {
     : text + _extra;
   messages.push({ role: "user", content: userContent });
   history.push({ role: "user", content: text });
+
+  // Growth: record this turn's engagement signals for the learner model, tagged
+  // with the project so skill practice accumulates across projects (越战越勇).
+  {
+    const _gRoot = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
+    growth.signal("message-sent", {
+      mode: _currentAiMode,
+      len: text.length,
+      complex: _looksComplexTask(text),
+      usedAt: _mentioned.length > 0,
+      project: _gRoot,
+      projectName: _gRoot ? _gRoot.split("/").pop() : "",
+    });
+  }
 
   const isAgent = _currentAiMode === "agent";
   const isExplorer = _currentAiMode === "explorer";
@@ -7600,12 +7617,16 @@ async function _runAgenticLoop({ config, messages, root }) {
         if (streaming) return;
         revert.disabled = true;
         revert.innerHTML = "正在撤销…";
+        growth.signal("revert-run", { n });
         const { ok, fail } = await _revertRun(snapshot);
         revert.innerHTML = fail ? `已撤销 ${ok} 个，${fail} 个失败` : `✓ 已撤销 ${ok} 个文件`;
         showToast(fail ? `撤销完成（${ok} 成功 / ${fail} 失败）` : `已撤销本轮 ${ok} 个文件的改动`);
       });
       body.appendChild(revert);
     }
+    // Growth: an edit-bearing run that verified its own work (tests/build/diag)
+    // vs shipped unverified — the beneficial-usage signal that counters deskilling.
+    if (didMutate) growth.signal("run-complete", { verified: didVerify });
     saveChatHistory();
     const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
     if (stopBtn) stopBtn.style.display = "none";
@@ -7647,7 +7668,13 @@ function _createToolStep(call) {
     `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${actionLabel}</span>${pathHtml}</div></div>` +
     `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
     `<div class="atc-viewport"></div>`;
-  step.querySelector(".agent-tool-row").addEventListener("click", () => step.classList.toggle("is-open"));
+  step.querySelector(".agent-tool-row").addEventListener("click", () => {
+    const opened = step.classList.toggle("is-open");
+    // Growth: opening an edit's diff to inspect it is a "reviewing AI output" signal.
+    if (opened && (call.type === "write" || call.type === "edit" || call.type === "multiedit")) {
+      growth.signal("review-diff", { ctype: call.type });
+    }
+  });
   const clickablePath = step.querySelector(".atc-path--clickable");
   if (clickablePath) {
     clickablePath.addEventListener("click", (e) => {
@@ -7891,6 +7918,8 @@ async function _executeToolStep(step, call, root) {
         return { type: call.type, path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
       }
 
+      growth.signal("edit-applied", { ctype: "write" });
+      growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
       res.className = "atc-result atc-result--ok";
       res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">Undo</button>`;
@@ -7902,6 +7931,7 @@ async function _executeToolStep(step, call, root) {
       if (undoBtn) {
         undoBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
+          growth.signal("undo-edit", { ctype: "write" });
           try {
             if (existed) await backend.writeTextFile(fp, old);
             else await backend.deletePath(fp).catch(() => backend.writeTextFile(fp, ""));
@@ -7976,6 +8006,8 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--err"; res.textContent = writeErr.slice(0, 80);
         return { type: "multiedit", path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
       }
+      growth.signal("edit-applied", { ctype: "multiedit" });
+      growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
       res.className = "atc-result atc-result--ok";
       res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span><button class="atc-undo-btn" type="button">Undo</button>`;
@@ -7986,6 +8018,7 @@ async function _executeToolStep(step, call, root) {
       if (undoBtn) {
         undoBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
+          growth.signal("undo-edit", { ctype: "multiedit" });
           try {
             await backend.writeTextFile(fp, old);
             _agentReadCache.set(fp, old); _invalidateRead(call.path); _refreshTreeFor(fp);
@@ -8796,6 +8829,7 @@ async function checkToolForLanguage(lang) {
 // ---- advanced feature panels (workspace / remote / marketplace / debug) ----
 const FEATURE_TABS = [
   { id: "settings", title: "Settings", icon: "i-gear" },
+  { id: "growth", title: "Growth", icon: "i-sparkle" },
   { id: "shortcuts", title: "Shortcuts", icon: "i-command" },
   { id: "workspace", title: "Workspace", icon: "i-folder" },
   { id: "tasks", title: "Tasks", icon: "i-play" },
@@ -8864,6 +8898,7 @@ function renderFeaturePanel() {
   body.classList.remove("mkt-body");
   const renderers = {
     settings: renderSettingsTool,
+    growth: renderGrowthTool,
     shortcuts: renderShortcutsTool,
     workspace: renderWorkspaceTool,
     tasks: renderTasksTool,
@@ -8898,6 +8933,18 @@ function createEmptyState(text) {
   el.className = "tool-empty";
   el.textContent = text;
   return el;
+}
+
+// Growth — the Open Learner Model panel (see growth.js). We pass in the agent's
+// per-workspace project memory so the panel can show the "越来越懂你的项目" half
+// of the model alongside the user's skills.
+function renderGrowthTool(body) {
+  const _root = rootPath || workspaceRoots[0] || "";
+  growth.renderPanel(body, {
+    projectName: _root ? _root.replace(/\/$/, "").split("/").pop() : "",
+    projectMemory: _loadMemory(_root),
+    onOpenMemory: openMemoryPanel,
+  });
 }
 
 const SETTINGS_SCHEMA = [
