@@ -24,9 +24,29 @@ struct LspProcess {
     stdin_tx: std::sync::mpsc::Sender<String>,
 }
 
+// LSP servers (rust-analyzer/gopls/tsserver…) are heavy — hundreds of MB each.
+// Killing on drop ensures clearing the map (reload / exit) reaps them and their
+// reader threads (which exit on EOF) instead of leaving them resident forever.
+impl Drop for LspProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Default)]
 pub struct LspManager {
     inner: Mutex<HashMap<String, LspProcess>>,
+}
+
+impl LspManager {
+    /// Kill every language server and clear the map — reaps a previous page
+    /// session on webview reload and on app exit.
+    pub fn stop_all(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.clear();
+        }
+    }
 }
 
 #[derive(Deserialize)]

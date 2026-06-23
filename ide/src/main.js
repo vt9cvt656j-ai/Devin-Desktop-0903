@@ -79,6 +79,13 @@ if (/Mac/i.test(navigator.platform || navigator.userAgent)) {
 }
 const backend = inTauri ? await tauriBackend() : mockBackend();
 
+// Reap any backend processes (shells / LSP servers / debug adapters) orphaned by
+// a previous page session — runs before this session starts any of its own, so a
+// webview reload no longer piles up zombie processes that eventually freeze the IDE.
+if (inTauri) {
+  try { await backend.invoke("cleanup_stale"); } catch { /* older backend without the command */ }
+}
+
 // Real LSP client manager (wired up after the workspace state exists below).
 let lspManager = null;
 // Debug Adapter Protocol manager (wired up alongside the LSP manager below).

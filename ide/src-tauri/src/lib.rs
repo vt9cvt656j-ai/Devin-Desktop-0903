@@ -11,6 +11,21 @@ mod tasks;
 mod terminal;
 mod watcher;
 
+/// Reap any backend processes left over from a previous page session. The
+/// frontend calls this once on startup, so a webview reload (common during dev)
+/// no longer orphans the old terminals / LSP servers / debug adapters — the main
+/// cause of "the IDE gets slower and freezes after running a while".
+#[tauri::command]
+fn cleanup_stale(
+    term: tauri::State<terminal::TerminalState>,
+    lsp: tauri::State<lsp::LspManager>,
+    dap: tauri::State<debug::DebugManager>,
+) {
+    term.reset_all();
+    lsp.stop_all();
+    dap.stop_all();
+}
+
 /// Entry point shared by the binary and (potentially) mobile targets.
 pub fn run() {
     tracing_subscriber::fmt()
@@ -124,7 +139,18 @@ pub fn run() {
             auth::auth_verify_code,
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
+            cleanup_stale,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Michael IDE");
+        .build(tauri::generate_context!())
+        .expect("error while building Michael IDE")
+        .run(|handle, event| {
+            // On app exit, kill every child process (shells / LSP servers / debug
+            // adapters) so nothing is left running after the window closes.
+            if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                handle.state::<terminal::TerminalState>().reset_all();
+                handle.state::<lsp::LspManager>().stop_all();
+                handle.state::<debug::DebugManager>().stop_all();
+            }
+        });
 }

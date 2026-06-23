@@ -24,9 +24,28 @@ struct DapProcess {
     stdin_tx: std::sync::mpsc::Sender<String>,
 }
 
+// Kill the debug adapter on drop so clearing the map (reload / exit) reaps it and
+// its reader threads instead of leaving it resident.
+impl Drop for DapProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Default)]
 pub struct DebugManager {
     inner: Mutex<HashMap<String, DapProcess>>,
+}
+
+impl DebugManager {
+    /// Kill every debug adapter and clear the map — reaps a previous page session
+    /// on webview reload and on app exit.
+    pub fn stop_all(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.clear();
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -30,9 +30,28 @@ struct Term {
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
+// Kill the shell whenever a Term is dropped — so clearing the table (on reload /
+// app exit) reaps the child process and its reader thread (which exits on EOF),
+// instead of leaving zombie shells to pile up over a long session.
+impl Drop for Term {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
 #[derive(Default)]
 pub struct TerminalState {
     inner: Mutex<Inner>,
+}
+
+impl TerminalState {
+    /// Kill every shell and clear the table — reaps a previous page session on
+    /// webview reload and on app exit.
+    pub fn reset_all(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.terms.clear();
+        }
+    }
 }
 
 #[derive(Default)]
