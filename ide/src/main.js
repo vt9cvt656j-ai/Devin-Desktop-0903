@@ -22,7 +22,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { renderMarkdownInto, langLabel, monacoLang } from "./markdown.js";
+import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
@@ -5453,6 +5453,13 @@ function addMessage(role, text) {
     }
   }
   target.appendChild(wrap);
+  // Bound DOM growth on very long sessions: keep at most the most recent N
+  // message nodes rendered (the conversation data in `history` is untouched, so
+  // nothing is lost — only the oldest off-screen nodes are pruned). The newest
+  // (possibly streaming) message is at the end and never pruned.
+  const MSG_CAP = 250;
+  const msgs = target.querySelectorAll(":scope > .msg");
+  for (let i = 0; i < msgs.length - MSG_CAP; i++) msgs[i].remove();
   chatEl.scrollTop = chatEl.scrollHeight;
   return body;
 }
@@ -6060,7 +6067,7 @@ async function sendPrompt(text, attachedImages = []) {
         if (!_streamEl) { _streamEl = document.createElement("div"); _streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(_streamEl); }
         if (tail.type === "text") {
           const clean = _cleanAgentText(tail.content);
-          if (clean) renderMarkdownInto(_streamEl, clean, { streaming: true });
+          if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true });
         } else if (tail.type === "code" && !tail.complete) {
           const lineCount = tail.content.split("\n").length;
           const langDisplay = tail.lang ? langLabel(tail.lang) : 'Code';
@@ -6324,15 +6331,25 @@ function _updateFilesBar(bar, list, tracked) {
   if (total === 0) { bar.style.display = "none"; return; }
   bar.style.display = "";
   bar.querySelector(".agent-files-bar__count").textContent = `${fileEntries.length} File${fileEntries.length !== 1 ? 's' : ''}`;
-  list.innerHTML = "";
+  // Incremental: append only newly-tracked entries and update a row's status when
+  // its type changes, instead of rebuilding the whole <ul> on every tool call
+  // (which was an O(n²) reflow storm during long agent runs).
+  const rendered = list.__rendered || (list.__rendered = new Map()); // name -> { li, type }
   for (const [name, type] of tracked) {
-    const li = document.createElement("li");
-    li.className = "agent-files-list__item";
-    const badge = _langBadge(name);
     const statusLabel = { write: "Edited", code: "Edited", read: "Read", list: "Listed", cmd: "Command" }[type] || type;
     const statusCls = type === "cmd" ? "cmd" : (type === "read" || type === "list" ? "read" : "write");
-    li.innerHTML = `${badge}<span>${_escHtml(name)}</span><span class="agent-files-list__status agent-files-list__status--${statusCls}">${statusLabel}</span>`;
-    list.appendChild(li);
+    const prev = rendered.get(name);
+    if (!prev) {
+      const li = document.createElement("li");
+      li.className = "agent-files-list__item";
+      li.innerHTML = `${_langBadge(name)}<span>${_escHtml(name)}</span><span class="agent-files-list__status agent-files-list__status--${statusCls}">${statusLabel}</span>`;
+      list.appendChild(li);
+      rendered.set(name, { li, type });
+    } else if (prev.type !== type) {
+      const stEl = prev.li.querySelector(".agent-files-list__status");
+      if (stEl) { stEl.className = `agent-files-list__status agent-files-list__status--${statusCls}`; stEl.textContent = statusLabel; }
+      prev.type = type;
+    }
   }
 }
 
@@ -7125,7 +7142,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
     const clean = _cleanAgentText(acc);
     if (clean.trim()) {
       if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
-      renderMarkdownInto(streamEl, clean, { streaming: true });
+      renderMarkdownStream(streamEl, clean, { streaming: true });
     }
     chatEl.scrollTop = chatEl.scrollHeight;
   };
@@ -8042,7 +8059,7 @@ async function _agentFollowUp(toolResults, container) {
     const tail = ce < segs.length ? segs[segs.length - 1] : null;
     if (tail) {
       if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
-      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownInto(_streamE2, c, { streaming: true }); }
+      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true }); }
     }
     chatEl.scrollTop = chatEl.scrollHeight;
   };

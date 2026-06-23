@@ -538,3 +538,53 @@ export function renderMarkdownInto(container, text, opts = {}) {
     container.appendChild(caret);
   }
 }
+
+// The end-offset of the last "settled" markdown block: the position after the
+// last blank line that is NOT inside a code fence. Everything before it is made
+// of complete blocks that won't change as more text streams in.
+function _settledLen(text) {
+  const lines = text.split("\n");
+  let offset = 0, boundary = 0, inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s{0,3}(```|~~~)/.test(line)) inFence = !inFence;
+    if (!inFence && line.trim() === "" && i < lines.length - 1) boundary = offset + line.length + 1;
+    offset += line.length + 1;
+  }
+  return boundary;
+}
+
+/**
+ * Incremental streaming render. Settled blocks (before the last block boundary)
+ * are parsed once and left untouched; only the still-growing tail block is
+ * re-parsed on each call. This keeps per-frame cost ∝ the current block instead
+ * of re-parsing/rebuilding the whole reply every token (which was O(n²) and, with
+ * terminal output, froze the UI). Resets to a clean full render if the text
+ * diverges from what was committed or the container was modified externally.
+ * @param {HTMLElement} container
+ * @param {string} text
+ * @param {object} [opts]
+ */
+export function renderMarkdownStream(container, text, opts = {}) {
+  text = String(text ?? "").replace(/\r\n?/g, "\n");
+  let st = container.__mdStream;
+  if (!st || !text.startsWith(st.src) || (st.tail && st.tail.parentNode !== container)) {
+    container.textContent = "";
+    st = container.__mdStream = { src: "", tail: null };
+  }
+  const settled = _settledLen(text);
+  if (settled > st.src.length) {
+    const chunk = text.slice(st.src.length, settled);
+    if (chunk.trim()) {
+      const node = parseBlocks(chunk.split("\n"), opts);
+      if (st.tail) container.insertBefore(node, st.tail);
+      else container.appendChild(node);
+    }
+    st.src = text.slice(0, settled);
+  }
+  const tailText = text.slice(st.src.length);
+  if (!st.tail) { st.tail = el("div", "md-stream-tail"); container.appendChild(st.tail); }
+  st.tail.textContent = "";
+  if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts));
+  if (opts.streaming) st.tail.appendChild(el("span", "md-caret"));
+}
