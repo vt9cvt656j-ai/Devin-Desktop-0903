@@ -81,6 +81,7 @@ pub fn run() {
             git::git_blame,
             ai::ai_chat,
             ai::ai_chat_with_tools,
+            ai::ai_complete,
             ai::web_fetch,
             ai::web_search,
             extensions::ext_list_installed,

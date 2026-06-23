@@ -6082,3 +6082,59 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
   .mktm__det-info p { color: #9aa0a6; }
   .mktm__tag { background: #35363a; color: #9aa0a6; }
 }
+
+/* ---- Cmd+K inline edit (AI) ---- */
+.cmdk {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 380px;
+  max-width: min(640px, 80%);
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--panel, #1e1e22);
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.cmdk__spark { font-size: 13px; opacity: 0.85; flex: none; }
+.cmdk__input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text, #eee);
+  font: inherit;
+  font-size: 13px;
+}
+.cmdk__hint { font-size: 11px; opacity: 0.6; flex: none; }
+.cmdk-review {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 9px;
+  background: var(--panel, #1e1e22);
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.cmdk-review__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text, #eee);
+  background: rgba(128, 128, 128, 0.16);
+}
+.cmdk-review__btn:hover { background: rgba(128, 128, 128, 0.28); }
+.cmdk-review__keep { color: #3fb950; }
+.cmdk-review__undo { color: #f85149; }
+.cmdk-review__btn kbd { font: inherit; font-size: 10px; opacity: 0.6; }
+.ai-edit-line { background: rgba(63, 185, 80, 0.14); }

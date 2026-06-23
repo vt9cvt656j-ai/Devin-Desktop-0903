@@ -45,6 +45,51 @@ pub async fn ai_chat(
     ai_chat_inner(config, messages, None, on_event).await
 }
 
+/// One-shot, non-streaming completion for in-editor AI (the Cmd+K inline editor).
+/// Returns the assistant message content as a plain string. `max_tokens` is
+/// bounded by the caller so the rewrite stays fast.
+#[tauri::command]
+pub async fn ai_complete(
+    config: AiConfig,
+    messages: Vec<serde_json::Value>,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let base = config.base_url.trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("AI base URL must start with http:// or https://".into());
+    }
+    let url = format!("{base}/chat/completions");
+    let payload = serde_json::json!({
+        "model": config.model,
+        "stream": false,
+        "max_tokens": max_tokens,
+        "temperature": config.temperature.unwrap_or(0.1),
+        "messages": messages,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&config.api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("AI request failed ({status}): {text}"));
+    }
+
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let content = v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    Ok(content)
+}
+
 /// Tool-enabled chat. `messages` is forwarded verbatim to the provider, so the
 /// frontend can send the full OpenAI shape — assistant turns carrying
 /// `tool_calls` and `{"role":"tool","tool_call_id":...}` results — which is what
