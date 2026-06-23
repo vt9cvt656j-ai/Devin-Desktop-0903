@@ -2131,6 +2131,27 @@ body.zen-mode .editor {
 }
 .agent-tool-step--subagent > .atc-viewport > .agent-tool-step { margin-top: 6px; }
 .agent-tool-step--subagent > .atc-viewport > .agent-tool-step:first-child { margin-top: 0; }
+/* Lighter weight so nested steps read as sub-items, not equal siblings:
+   flatter surface, compact row, smaller type icon. */
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step {
+  border-radius: 7px;
+  box-shadow: none;
+  border-color: rgba(128, 128, 128, 0.18);
+  animation-duration: .18s;
+}
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step:hover {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .05);
+}
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step .agent-tool-row {
+  padding: 5px 10px;
+  background: transparent;
+}
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step .atc-type-icon {
+  width: 20px; height: 20px; border-radius: 5px;
+}
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step .atc-type-icon svg {
+  width: 11px; height: 11px;
+}
 
 /* Code / file preview */
 .atc-viewport pre {
