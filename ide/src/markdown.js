@@ -466,7 +466,7 @@ function codeCard(code, lang, filename, ctx) {
   copy.type = "button";
   copy.appendChild(icon("i-copy"));
   const copyText = el("span");
-  copyText.textContent = "Copy";
+  copyText.textContent = "";
   copy.appendChild(copyText);
   copy.addEventListener("click", () => {
     const write = navigator.clipboard?.writeText

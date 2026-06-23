@@ -36,23 +36,83 @@ const IGNORED_DIRS: &[&str] = &[
 /// XSS or extension sandbox escapes.
 static ALLOWED_ROOTS: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
+/// Pre-register the user's HOME directory so files are accessible before any
+/// folder is explicitly opened.  Called from `lib.rs` during app setup.
+pub fn bootstrap_home_root() {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home_path = PathBuf::from(&home);
+        if let Ok(canonical) = std::fs::canonicalize(&home_path) {
+            if let Ok(mut roots) = ALLOWED_ROOTS.lock() {
+                if !roots.contains(&canonical) {
+                    roots.push(canonical);
+                }
+                let raw = home_path;
+                if !roots.contains(&raw) {
+                    roots.push(raw);
+                }
+            }
+        } else if let Ok(mut roots) = ALLOWED_ROOTS.lock() {
+            if !roots.contains(&home_path) {
+                roots.push(home_path);
+            }
+        }
+    }
+}
+
 /// Register a workspace root that the user explicitly opened.
 /// Called from the frontend after a successful folder-open dialog.
 #[tauri::command]
 pub fn register_workspace_root(path: String) -> Result<(), String> {
+    let raw_path = PathBuf::from(&path);
     let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
     let mut roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
     if !roots.contains(&canonical) {
         roots.push(canonical);
     }
+    if raw_path != *roots.last().unwrap_or(&PathBuf::new()) && !roots.contains(&raw_path) {
+        roots.push(raw_path);
+    }
+    bootstrap_home_root_inner(&mut roots);
     Ok(())
 }
+
+fn bootstrap_home_root_inner(roots: &mut Vec<PathBuf>) {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home_path = PathBuf::from(&home);
+        if let Ok(home_canonical) = std::fs::canonicalize(&home_path) {
+            if !roots.contains(&home_canonical) {
+                roots.push(home_canonical);
+            }
+        }
+        if !roots.contains(&home_path) {
+            roots.push(home_path);
+        }
+    }
+}
+
+/// Paths always allowed regardless of workspace roots (temp dirs, macOS firmlinks).
+const SAFE_PREFIXES: &[&str] = &[
+    "/tmp",
+    "/private/tmp",
+    "/var/folders",
+    "/private/var/folders",
+];
 
 /// Verify `target` is inside an allowed workspace root.  Resolves symlinks and
 /// normalises components so that `../../etc/passwd` tricks are caught even when
 /// intermediate directories exist.
 fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
     let target_path = Path::new(target);
+    let raw_target = target.to_string();
+
+    // Fast-path: always allow temp / safe system directories before canonicalize.
+    for prefix in SAFE_PREFIXES {
+        if raw_target.starts_with(prefix) {
+            let resolved = std::fs::canonicalize(target_path)
+                .unwrap_or_else(|_| target_path.to_path_buf());
+            return Ok(resolved);
+        }
+    }
 
     // For paths that don't exist yet (create_file, create_dir), resolve the
     // deepest existing ancestor and append the remaining components.
@@ -89,16 +149,48 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
         resolved
     };
 
+    let resolved_str = resolved.to_string_lossy().to_string();
+
+    // Post-canonicalize safe-prefix check (handles firmlinks like /tmp → /private/tmp).
+    for prefix in SAFE_PREFIXES {
+        if resolved_str.starts_with(prefix) {
+            return Ok(resolved);
+        }
+    }
+
     let roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
     if roots.is_empty() {
         return Ok(resolved);
     }
+
     for root in roots.iter() {
-        if resolved.starts_with(root) {
+        let root_str = root.to_string_lossy().to_string();
+        if resolved.starts_with(root)
+            || resolved_str.starts_with(&root_str)
+            || raw_target.starts_with(&root_str)
+        {
             return Ok(resolved);
         }
     }
-    Err("access denied: path is outside all workspace roots".to_string())
+
+    // Always allow paths under HOME regardless of what roots are registered.
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        if resolved_str.starts_with(&home) || raw_target.starts_with(&home) {
+            return Ok(resolved);
+        }
+        if let Ok(home_canonical) = std::fs::canonicalize(&home) {
+            let hc = home_canonical.to_string_lossy().to_string();
+            if resolved_str.starts_with(&hc) || raw_target.starts_with(&hc) {
+                return Ok(resolved);
+            }
+        }
+    }
+
+    let root_list: Vec<String> = roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+    Err(format!(
+        "access denied: path '{}' (resolved '{}') is outside all workspace roots. Allowed: [{}].",
+        raw_target, resolved_str, root_list.join(", ")
+    ))
 }
 
 #[derive(Serialize)]
@@ -136,16 +228,26 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
-/// Read a UTF-8 text file. Rejects oversized and binary files so the editor
-/// never tries to render garbage.
+/// Read a UTF-8 text file. Rejects directories, oversized and binary files so
+/// the editor never tries to render garbage.
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
     require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let meta = std::fs::metadata(&path).map_err(|e| {
+        format!("cannot stat '{}': {}", path, e)
+    })?;
+    if meta.is_dir() {
+        return Err(format!(
+            "'{}' is a directory, not a file. Use read_dir to list its contents.",
+            path
+        ));
+    }
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
     }
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        format!("cannot read '{}': {}", path, e)
+    })?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot open a binary file in the editor".into());
     }
@@ -157,6 +259,14 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     require_inside_workspace(&path)?;
     std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+/// Write a file to /tmp for internal tools (no workspace restriction).
+#[tauri::command]
+pub fn write_tmp_file(name: String, content: String) -> Result<String, String> {
+    let path = std::path::Path::new("/tmp").join(&name);
+    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// The current user's home directory, used as the default tree root.

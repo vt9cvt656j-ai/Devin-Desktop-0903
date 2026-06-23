@@ -24,10 +24,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_macos_fps::init())
         .setup(|app| {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
+
+            files::bootstrap_home_root();
 
             tauri::async_runtime::spawn(async {
                 if let Err(e) = auth::init_db().await {
@@ -46,6 +49,7 @@ pub fn run() {
             files::read_dir,
             files::read_text_file,
             files::write_text_file,
+            files::write_tmp_file,
             files::home_dir,
             files::create_file,
             files::create_dir,
@@ -76,6 +80,8 @@ pub fn run() {
             git::git_stash_list,
             git::git_blame,
             ai::ai_chat,
+            ai::ai_chat_with_tools,
+            ai::web_fetch,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
             extensions::ext_set_enabled,
@@ -94,6 +100,11 @@ pub fn run() {
             lsp::lsp_stop,
             lsp::lsp_list,
             lsp::lsp_check_available,
+            lsp::lsp_detect_python,
+            lsp::lsp_python_env_symbols,
+            lsp::lsp_node_env_symbols,
+            lsp::lsp_go_env_symbols,
+            lsp::lsp_lang_env_symbols,
             debug::dap_start,
             debug::dap_send,
             debug::dap_stop,
@@ -109,6 +120,8 @@ pub fn run() {
             auth::auth_check_email,
             auth::auth_send_code,
             auth::auth_verify_code,
+            auth::db_marketplace_list,
+            auth::db_marketplace_upsert,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Michael IDE");

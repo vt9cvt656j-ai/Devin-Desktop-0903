@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' blob:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
+      "csp": "default-src 'self'; script-src 'self' blob:; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost https:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
     }
   },
   "bundle": {
@@ -44,6 +44,7 @@
     "longDescription": "Michael IDE is a native-feeling macOS code editor built on Tauri and Monaco, with a built-in AI assistant sidebar that connects to any OpenAI-compatible model."
   },
   "plugins": {
+    "macos-fps": {},
     "updater": {
       "endpoints": [
         "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json"

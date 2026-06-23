@@ -58,7 +58,20 @@ const LSP_TO_COMPLETION_KIND = {
   21: CK.Constant, 22: CK.Struct, 23: CK.Event, 24: CK.Operator, 25: CK.TypeParameter,
 };
 
-const REQUEST_TIMEOUT_MS = 12000;
+const REQUEST_TIMEOUT_MS = 20000;
+
+const PYTHON_SETTINGS = {
+  pythonPath: "python3",
+  analysis: {
+    autoSearchPaths: true,
+    diagnosticMode: "openFilesOnly",
+    typeCheckingMode: "standard",
+    useLibraryCodeForTypes: true,
+    autoImportCompletions: true,
+    extraPaths: [],
+  },
+};
+
 
 // ---- coordinate conversions (LSP is 0-based, Monaco is 1-based) ----
 function toMonacoPosition(p) {
@@ -207,7 +220,7 @@ class LspClient {
     switch (msg.method) {
       case "workspace/configuration": {
         const items = msg.params?.items || [];
-        reply(items.map(() => null));
+        reply(items.map((item) => this._getConfigForSection(item.section)));
         break;
       }
       case "workspace/applyEdit": {
@@ -288,16 +301,48 @@ class LspClient {
         ? roots.map((r) => ({ uri: pathToUri(r), name: baseName(r) }))
         : null,
       capabilities: clientCapabilities(),
-      initializationOptions: {},
+      initializationOptions: this._getInitOptions(),
     };
     const result = await this.request("initialize", params);
     this.capabilities = result?.capabilities || {};
     this._send("initialized", {});
-    this._send("workspace/didChangeConfiguration", { settings: {} });
+    this._send("workspace/didChangeConfiguration", {
+      settings: this._getLangSettings(),
+    });
     this.initialized = true;
     this.manager.onStatus?.();
     this.log("[initialized]");
     return this;
+  }
+
+  _getInitOptions() {
+    if (this.serverLang === "python") {
+      return this.manager._pythonSettings || {};
+    }
+    return {};
+  }
+
+  _getLangSettings() {
+    if (this.serverLang === "python") {
+      return { python: this.manager._pythonSettings || {} };
+    }
+    return {};
+  }
+
+  _getConfigForSection(section) {
+    if (this.serverLang === "python") {
+      const pythonSettings = this.manager._pythonSettings || {};
+      if (!section || section === "python") return pythonSettings;
+      if (section === "python.analysis") return pythonSettings.analysis || {};
+      const parts = section.split(".");
+      let obj = pythonSettings;
+      for (const part of parts.slice(parts[0] === "python" ? 1 : 0)) {
+        obj = obj?.[part];
+        if (obj === undefined) return {};
+      }
+      return obj ?? {};
+    }
+    return {};
   }
 
   supports(name) {
@@ -313,6 +358,22 @@ class LspClient {
       case "formatting": return !!c.documentFormattingProvider;
       case "codeAction": return !!c.codeActionProvider;
       case "resolveCompletion": return !!(c.completionProvider && c.completionProvider.resolveProvider);
+      case "inlayHint": return !!c.inlayHintProvider;
+      case "semanticTokens": return !!(c.semanticTokensProvider);
+      case "implementation": return !!c.implementationProvider;
+      case "typeDefinition": return !!c.typeDefinitionProvider;
+      case "declaration": return !!c.declarationProvider;
+      case "callHierarchy": return !!c.callHierarchyProvider;
+      case "codeLens": return !!c.codeLensProvider;
+      case "documentHighlight": return !!c.documentHighlightProvider;
+      case "colorProvider": return !!c.colorProvider;
+      case "linkedEditingRange": return !!c.linkedEditingRangeProvider;
+      case "foldingRange": return !!c.foldingRangeProvider;
+      case "onTypeFormatting": return !!c.documentOnTypeFormattingProvider;
+      case "rangeFormatting": return !!c.documentRangeFormattingProvider;
+      case "selectionRange": return !!c.selectionRangeProvider;
+      case "documentLink": return !!c.documentLinkProvider;
+      case "workspaceSymbol": return !!c.workspaceSymbolProvider;
       default: return false;
     }
   }
@@ -393,7 +454,20 @@ function clientCapabilities() {
         },
       },
       definition: { dynamicRegistration: false, linkSupport: true },
+      declaration: { dynamicRegistration: false, linkSupport: true },
+      implementation: { dynamicRegistration: false, linkSupport: true },
+      typeDefinition: { dynamicRegistration: false, linkSupport: true },
       references: { dynamicRegistration: false },
+      callHierarchy: { dynamicRegistration: false },
+      codeLens: { dynamicRegistration: false },
+      documentHighlight: { dynamicRegistration: false },
+      colorProvider: { dynamicRegistration: false },
+      linkedEditingRange: { dynamicRegistration: false },
+      foldingRange: { dynamicRegistration: false, foldingRangeKind: { valueSet: ["comment", "imports", "region"] }, lineFoldingOnly: true },
+      onTypeFormatting: { dynamicRegistration: false },
+      rangeFormatting: { dynamicRegistration: false },
+      selectionRange: { dynamicRegistration: false },
+      documentLink: { dynamicRegistration: false, tooltipSupport: true },
       documentSymbol: {
         dynamicRegistration: false,
         hierarchicalDocumentSymbolSupport: true,
@@ -411,6 +485,27 @@ function clientCapabilities() {
         },
         isPreferredSupport: true,
         resolveSupport: { properties: ["edit"] },
+      },
+      inlayHint: {
+        dynamicRegistration: false,
+        resolveSupport: { properties: ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"] },
+      },
+      semanticTokens: {
+        dynamicRegistration: false,
+        tokenTypes: [
+          "namespace","type","class","enum","interface","struct","typeParameter",
+          "parameter","variable","property","enumMember","event","function",
+          "method","macro","keyword","modifier","comment","string","number",
+          "regexp","operator","decorator",
+        ],
+        tokenModifiers: [
+          "declaration","definition","readonly","static","deprecated",
+          "abstract","async","modification","documentation","defaultLibrary",
+        ],
+        formats: ["relative"],
+        requests: { full: { delta: false }, range: false },
+        multilineTokenSupport: false,
+        overlappingTokenSupport: false,
       },
     },
     workspace: {
@@ -438,7 +533,7 @@ export function createLspManager(options) {
   } = options;
 
   const clients = new Map(); // monaco lang id -> LspClient
-  const changeTimers = new Map(); // uri -> debounce timer
+  const changeTimers = new Map(); // uri -> { timer, langId, modelUri }
   const lazyModels = new Set(); // uris of models we created for cross-file diagnostics
   let executeCommandRegistered = false;
 
@@ -451,6 +546,7 @@ export function createLspManager(options) {
     applyDiagnostics,
     applyWorkspaceEdit,
     _handleStopped,
+    _pythonSettings: null,
   };
 
   function workspaceRoots() {
@@ -492,6 +588,24 @@ export function createLspManager(options) {
         try { await client.initPromise; } catch { /* fall through */ }
       }
       return clients.get(langId) || null;
+    }
+    if (langId === "python" && !manager._pythonSettings) {
+      try {
+        const info = await backend.lspDetectPython();
+        if (info && info.pythonPath) {
+          manager._pythonSettings = {
+            pythonPath: info.pythonPath,
+            analysis: {
+              ...PYTHON_SETTINGS.analysis,
+              extraPaths: info.sitePackages || [],
+            },
+          };
+        } else {
+          manager._pythonSettings = PYTHON_SETTINGS;
+        }
+      } catch {
+        manager._pythonSettings = PYTHON_SETTINGS;
+      }
     }
     client = new LspClient(langId, manager);
     clients.set(langId, client);
@@ -555,13 +669,15 @@ export function createLspManager(options) {
     const client = clients.get(langId);
     if (!client || !client.initialized) return;
     const uri = model.uri.toString();
-    if (changeTimers.has(uri)) clearTimeout(changeTimers.get(uri));
-    changeTimers.set(uri, setTimeout(() => {
+    const existing = changeTimers.get(uri);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
       changeTimers.delete(uri);
       const live = monaco.editor.getModel(model.uri);
       if (!live) return;
       client.didChange(uri, live.getVersionId(), live.getValue());
-    }, 180));
+    }, 180);
+    changeTimers.set(uri, { timer, langId, modelUri: model.uri });
   }
 
   function didSave(path, model) {
@@ -577,6 +693,19 @@ export function createLspManager(options) {
     if (!enabled || !path) return;
     const uri = pathToUri(path);
     for (const client of clients.values()) client.didClose(uri);
+  }
+
+  function flushPendingChange(uri) {
+    const entry = changeTimers.get(uri);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    changeTimers.delete(uri);
+    const live = monaco.editor.getModel(entry.modelUri);
+    if (!live) return;
+    const client = clients.get(entry.langId);
+    if (client && client.initialized) {
+      client.didChange(uri, live.getVersionId(), live.getValue());
+    }
   }
 
   // ---- diagnostics ----
@@ -696,20 +825,29 @@ export function createLspManager(options) {
 
     monaco.languages.registerCompletionItemProvider(MANAGED_LANGS, {
       triggerCharacters: [".", ":", ">", "<", "\"", "'", "/", "@", "(", "#", "$", "*", "&"],
-      async provideCompletionItems(model, position) {
+      async provideCompletionItems(model, position, context) {
         const client = clientForModel(model);
         if (!client || !client.supports("completion")) return { suggestions: [] };
+        flushPendingChange(model.uri.toString());
+        const lspTrigger = (context.triggerKind || 0) + 1;
+        const lspContext = { triggerKind: lspTrigger };
+        if (context.triggerCharacter) lspContext.triggerCharacter = context.triggerCharacter;
         const result = await client.request("textDocument/completion", {
           textDocument: { uri: model.uri.toString() },
           position: fromMonacoPosition(position),
-          context: { triggerKind: 1 },
+          context: lspContext,
         });
         if (!result) return { suggestions: [] };
         const items = Array.isArray(result) ? result : result.items || [];
+        const isIncomplete = !Array.isArray(result) && !!result.isIncomplete;
+        if (items.length > 0 && manager.onCompletionSymbols) {
+          const labels = items.map((it) => typeof it.label === "string" ? it.label : it.label?.label).filter(Boolean);
+          try { manager.onCompletionSymbols(labels); } catch { /* ignore */ }
+        }
         const word = model.getWordUntilPosition(position);
         const defaultRange = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
         return {
-          incomplete: !!result.isIncomplete,
+          incomplete: isIncomplete,
           suggestions: items.map((it) => completionToMonaco(it, defaultRange, client.lang)),
         };
       },
@@ -734,6 +872,7 @@ export function createLspManager(options) {
       async provideHover(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("hover")) return null;
+        flushPendingChange(model.uri.toString());
         const result = await client.request("textDocument/hover", {
           textDocument: { uri: model.uri.toString() },
           position: fromMonacoPosition(position),
@@ -750,6 +889,42 @@ export function createLspManager(options) {
         const client = clientForModel(model);
         if (!client || !client.supports("definition")) return null;
         const result = await client.request("textDocument/definition", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+        });
+        return locationsToMonaco(result);
+      },
+    });
+
+    monaco.languages.registerImplementationProvider(MANAGED_LANGS, {
+      async provideImplementation(model, position) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("implementation")) return null;
+        const result = await client.request("textDocument/implementation", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+        });
+        return locationsToMonaco(result);
+      },
+    });
+
+    monaco.languages.registerTypeDefinitionProvider(MANAGED_LANGS, {
+      async provideTypeDefinition(model, position) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("typeDefinition")) return null;
+        const result = await client.request("textDocument/typeDefinition", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+        });
+        return locationsToMonaco(result);
+      },
+    });
+
+    monaco.languages.registerDeclarationProvider(MANAGED_LANGS, {
+      async provideDeclaration(model, position) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("declaration")) return null;
+        const result = await client.request("textDocument/declaration", {
           textDocument: { uri: model.uri.toString() },
           position: fromMonacoPosition(position),
         });
@@ -803,6 +978,7 @@ export function createLspManager(options) {
       async provideSignatureHelp(model, position) {
         const client = clientForModel(model);
         if (!client || !client.supports("signatureHelp")) return null;
+        flushPendingChange(model.uri.toString());
         const result = await client.request("textDocument/signatureHelp", {
           textDocument: { uri: model.uri.toString() },
           position: fromMonacoPosition(position),
@@ -849,6 +1025,316 @@ export function createLspManager(options) {
         return { actions, dispose() {} };
       },
     });
+
+    monaco.languages.registerInlayHintsProvider(MANAGED_LANGS, {
+      async provideInlayHints(model, range) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("inlayHint")) return { hints: [], dispose() {} };
+        const result = await client.request("textDocument/inlayHint", {
+          textDocument: { uri: model.uri.toString() },
+          range: {
+            start: fromMonacoPosition({ lineNumber: range.startLineNumber, column: range.startColumn }),
+            end: fromMonacoPosition({ lineNumber: range.endLineNumber, column: range.endColumn }),
+          },
+        });
+        if (!Array.isArray(result)) return { hints: [], dispose() {} };
+        const hints = result.map((h) => ({
+          position: toMonacoPosition(h.position),
+          label: typeof h.label === "string" ? h.label : Array.isArray(h.label) ? h.label.map((p) => p.value).join("") : "",
+          kind: h.kind === 1 ? monaco.languages.InlayHintKind.Type : h.kind === 2 ? monaco.languages.InlayHintKind.Parameter : undefined,
+          paddingLeft: h.paddingLeft,
+          paddingRight: h.paddingRight,
+        }));
+        return { hints, dispose() {} };
+      },
+    });
+
+    // ---- CodeLens ----
+    monaco.languages.registerCodeLensProvider(MANAGED_LANGS, {
+      async provideCodeLenses(model) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("codeLens")) return { lenses: [], dispose() {} };
+        const result = await client.request("textDocument/codeLens", {
+          textDocument: { uri: model.uri.toString() },
+        });
+        if (!Array.isArray(result)) return { lenses: [], dispose() {} };
+        const lenses = result.map((cl) => {
+          const lens = { range: toMonacoRange(cl.range) };
+          if (cl.command) {
+            lens.command = {
+              id: "michael.lsp.executeCommand",
+              title: cl.command.title || "",
+              arguments: [client.lang, cl.command],
+            };
+          }
+          lens.__lspItem = cl;
+          lens.__lspLang = client.lang;
+          return lens;
+        });
+        return { lenses, dispose() {} };
+      },
+      async resolveCodeLens(_model, codeLens) {
+        const client = clients.get(codeLens.__lspLang);
+        if (!client || !codeLens.__lspItem) return codeLens;
+        const cap = client.capabilities?.codeLensProvider;
+        if (!cap?.resolveProvider) return codeLens;
+        const resolved = await client.request("codeLens/resolve", codeLens.__lspItem);
+        if (!resolved) return codeLens;
+        if (resolved.command) {
+          codeLens.command = {
+            id: "michael.lsp.executeCommand",
+            title: resolved.command.title || "",
+            arguments: [client.lang, resolved.command],
+          };
+        }
+        return codeLens;
+      },
+    });
+
+    // ---- Document Highlight (highlight all occurrences of selected symbol) ----
+    monaco.languages.registerDocumentHighlightProvider(MANAGED_LANGS, {
+      async provideDocumentHighlights(model, position) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("documentHighlight")) return [];
+        const result = await client.request("textDocument/documentHighlight", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((h) => ({
+          range: toMonacoRange(h.range),
+          kind: h.kind === 2 ? monaco.languages.DocumentHighlightKind.Read
+            : h.kind === 3 ? monaco.languages.DocumentHighlightKind.Write
+            : monaco.languages.DocumentHighlightKind.Text,
+        }));
+      },
+    });
+
+    // ---- Color Provider (inline color swatches in CSS/code) ----
+    monaco.languages.registerColorProvider(MANAGED_LANGS, {
+      async provideDocumentColors(model) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("colorProvider")) return [];
+        const result = await client.request("textDocument/documentColor", {
+          textDocument: { uri: model.uri.toString() },
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((c) => ({
+          range: toMonacoRange(c.range),
+          color: { red: c.color.red, green: c.color.green, blue: c.color.blue, alpha: c.color.alpha },
+        }));
+      },
+      async provideColorPresentations(model, colorInfo) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("colorProvider")) return [];
+        const result = await client.request("textDocument/colorPresentation", {
+          textDocument: { uri: model.uri.toString() },
+          color: colorInfo.color,
+          range: {
+            start: fromMonacoPosition({ lineNumber: colorInfo.range.startLineNumber, column: colorInfo.range.startColumn }),
+            end: fromMonacoPosition({ lineNumber: colorInfo.range.endLineNumber, column: colorInfo.range.endColumn }),
+          },
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((p) => {
+          const pres = { label: p.label };
+          if (p.textEdit) {
+            pres.textEdit = { range: toMonacoRange(p.textEdit.range), text: p.textEdit.newText };
+          }
+          if (Array.isArray(p.additionalTextEdits)) {
+            pres.additionalTextEdits = p.additionalTextEdits.map((e) => ({
+              range: toMonacoRange(e.range), text: e.newText,
+            }));
+          }
+          return pres;
+        });
+      },
+    });
+
+    // ---- Linked Editing Ranges (rename HTML open/close tags together) ----
+    monaco.languages.registerLinkedEditingRangeProvider(MANAGED_LANGS, {
+      async provideLinkedEditingRanges(model, position) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("linkedEditingRange")) return null;
+        const result = await client.request("textDocument/linkedEditingRange", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+        });
+        if (!result || !Array.isArray(result.ranges)) return null;
+        return {
+          ranges: result.ranges.map(toMonacoRange),
+          wordPattern: result.wordPattern ? new RegExp(result.wordPattern) : undefined,
+        };
+      },
+    });
+
+    // ---- Folding Range Provider ----
+    monaco.languages.registerFoldingRangeProvider(MANAGED_LANGS, {
+      async provideFoldingRanges(model) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("foldingRange")) return [];
+        const result = await client.request("textDocument/foldingRange", {
+          textDocument: { uri: model.uri.toString() },
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((fr) => ({
+          start: fr.startLine + 1,
+          end: fr.endLine + 1,
+          kind: fr.kind === "comment" ? monaco.languages.FoldingRangeKind.Comment
+            : fr.kind === "imports" ? monaco.languages.FoldingRangeKind.Imports
+            : monaco.languages.FoldingRangeKind.Region,
+        }));
+      },
+    });
+
+    // ---- On-Type Formatting ----
+    const onTypeCandidates = [";", "}", "\n", ":", ")"];
+    monaco.languages.registerOnTypeFormattingEditProvider(MANAGED_LANGS, {
+      autoFormatTriggerCharacters: onTypeCandidates,
+      async provideOnTypeFormattingEdits(model, position, ch, formatOptions) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("onTypeFormatting")) return [];
+        const serverChars = [
+          client.capabilities?.documentOnTypeFormattingProvider?.firstTriggerCharacter,
+          ...(client.capabilities?.documentOnTypeFormattingProvider?.moreTriggerCharacter || []),
+        ].filter(Boolean);
+        if (!serverChars.includes(ch)) return [];
+        const result = await client.request("textDocument/onTypeFormatting", {
+          textDocument: { uri: model.uri.toString() },
+          position: fromMonacoPosition(position),
+          ch,
+          options: { tabSize: formatOptions?.tabSize ?? 4, insertSpaces: formatOptions?.insertSpaces ?? true },
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((e) => ({ range: toMonacoRange(e.range), text: e.newText }));
+      },
+    });
+
+    // ---- Range Formatting ----
+    monaco.languages.registerDocumentRangeFormattingEditProvider(MANAGED_LANGS, {
+      async provideDocumentRangeFormattingEdits(model, range, formatOptions) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("rangeFormatting")) return [];
+        const result = await client.request("textDocument/rangeFormatting", {
+          textDocument: { uri: model.uri.toString() },
+          range: {
+            start: fromMonacoPosition({ lineNumber: range.startLineNumber, column: range.startColumn }),
+            end: fromMonacoPosition({ lineNumber: range.endLineNumber, column: range.endColumn }),
+          },
+          options: {
+            tabSize: formatOptions?.tabSize ?? 4,
+            insertSpaces: formatOptions?.insertSpaces ?? true,
+            trimTrailingWhitespace: true,
+            insertFinalNewline: true,
+          },
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((e) => ({ range: toMonacoRange(e.range), text: e.newText }));
+      },
+    });
+
+    // ---- Call Hierarchy (only if Monaco exposes the API) ----
+    if (typeof monaco.languages.registerCallHierarchyProvider === "function") {
+      monaco.languages.registerCallHierarchyProvider(MANAGED_LANGS, {
+        async prepareCallHierarchy(model, position) {
+          const client = clientForModel(model);
+          if (!client || !client.supports("callHierarchy")) return [];
+          const result = await client.request("textDocument/prepareCallHierarchy", {
+            textDocument: { uri: model.uri.toString() },
+            position: fromMonacoPosition(position),
+          });
+          if (!Array.isArray(result) || !result.length) return [];
+          return result.map((item) => callHierarchyItemToMonaco(item, client.lang));
+        },
+        async provideIncomingCalls(item) {
+          const client = clients.get(item.__lspLang);
+          if (!client) return [];
+          const result = await client.request("callHierarchy/incomingCalls", { item: item.__lspItem });
+          if (!Array.isArray(result)) return [];
+          return result.map((call) => ({
+            from: callHierarchyItemToMonaco(call.from, client.lang),
+            fromRanges: (call.fromRanges || []).map(toMonacoRange),
+          }));
+        },
+        async provideOutgoingCalls(item) {
+          const client = clients.get(item.__lspLang);
+          if (!client) return [];
+          const result = await client.request("callHierarchy/outgoingCalls", { item: item.__lspItem });
+          if (!Array.isArray(result)) return [];
+          return result.map((call) => ({
+            to: callHierarchyItemToMonaco(call.to, client.lang),
+            fromRanges: (call.fromRanges || []).map(toMonacoRange),
+          }));
+        },
+      });
+    }
+
+    // ---- Selection Range ----
+    monaco.languages.registerSelectionRangeProvider(MANAGED_LANGS, {
+      async provideSelectionRanges(model, positions) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("selectionRange")) return [];
+        const result = await client.request("textDocument/selectionRange", {
+          textDocument: { uri: model.uri.toString() },
+          positions: positions.map(fromMonacoPosition),
+        });
+        if (!Array.isArray(result)) return [];
+        return result.map((sr) => {
+          const ranges = [];
+          let cur = sr;
+          while (cur) {
+            ranges.push({ range: toMonacoRange(cur.range) });
+            cur = cur.parent;
+          }
+          return ranges;
+        });
+      },
+    });
+
+    // ---- Document Link ----
+    monaco.languages.registerLinkProvider(MANAGED_LANGS, {
+      async provideLinks(model) {
+        const client = clientForModel(model);
+        if (!client || !client.supports("documentLink")) return { links: [] };
+        const result = await client.request("textDocument/documentLink", {
+          textDocument: { uri: model.uri.toString() },
+        });
+        if (!Array.isArray(result)) return { links: [] };
+        return {
+          links: result.map((l) => ({
+            range: toMonacoRange(l.range),
+            url: l.target,
+            tooltip: l.tooltip,
+          })),
+        };
+      },
+    });
+
+    // ---- Workspace Symbol (only if Monaco exposes the API) ----
+    if (typeof monaco.languages.registerWorkspaceSymbolProvider === "function") {
+      monaco.languages.registerWorkspaceSymbolProvider({
+        async provideWorkspaceSymbols(query) {
+          const results = [];
+          for (const [langId, client] of clients) {
+            if (!client.initialized || !client.supports("workspaceSymbol")) continue;
+            const symbols = await client.request("workspace/symbol", { query });
+            if (!Array.isArray(symbols)) continue;
+            for (const s of symbols) {
+              results.push({
+                name: s.name,
+                kind: (s.kind ?? 1) - 1,
+                containerName: s.containerName || "",
+                location: {
+                  uri: monaco.Uri.parse(s.location.uri),
+                  range: toMonacoRange(s.location.range),
+                },
+              });
+            }
+          }
+          return results;
+        },
+      });
+    }
   }
 
   function registerExecuteCommand() {
@@ -1007,6 +1493,26 @@ export function createLspManager(options) {
     return action;
   }
 
+  const LSP_SYMBOL_KIND_MAP = {
+    1: 0, 2: 10, 3: 4, 4: 2, 5: 22, 6: 10, 7: 10, 8: 2, 9: 11,
+    10: 3, 11: 7, 12: 5, 13: 0, 14: 14, 15: 17, 16: 17, 17: 9,
+    18: 8, 19: 6, 20: 1, 21: 12, 22: 13, 23: 18, 24: 23, 25: 24, 26: 25,
+  };
+
+  function callHierarchyItemToMonaco(item, langId) {
+    return {
+      name: item.name,
+      kind: LSP_SYMBOL_KIND_MAP[item.kind] ?? 0,
+      detail: item.detail || "",
+      uri: monaco.Uri.parse(item.uri),
+      range: toMonacoRange(item.range),
+      selectionRange: toMonacoRange(item.selectionRange),
+      tags: (item.tags || []).map(() => 1),
+      __lspItem: item,
+      __lspLang: langId,
+    };
+  }
+
   // ---- public surface ----
   return {
     registerProviders,
@@ -1044,5 +1550,33 @@ export function createLspManager(options) {
       return clients.get(langId)?.logLines.join("\n") || "";
     },
     managedLangs: MANAGED_LANGS.slice(),
+    onCompletionSymbols: null,
+    async queryDocumentSymbols(uri, langId) {
+      const client = clients.get(langId);
+      if (!client || !client.initialized || !client.supports("documentSymbol")) return [];
+      const result = await client.request("textDocument/documentSymbol", {
+        textDocument: { uri },
+      });
+      if (!Array.isArray(result)) return [];
+      const names = [];
+      const walk = (items) => {
+        for (const item of items) {
+          const name = item.name || item.label;
+          if (name) names.push(name);
+          if (Array.isArray(item.children)) walk(item.children);
+        }
+      };
+      walk(result);
+      return names;
+    },
+    async queryWorkspaceSymbols(langId, query = "") {
+      const client = clients.get(langId);
+      if (!client || !client.initialized) return [];
+      const cap = client.capabilities || {};
+      if (!cap.workspaceSymbolProvider) return [];
+      const result = await client.request("workspace/symbol", { query });
+      if (!Array.isArray(result)) return [];
+      return result.map((s) => s.name).filter(Boolean);
+    },
   };
 }

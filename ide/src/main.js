@@ -19,8 +19,10 @@ import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { renderMarkdownInto } from "./markdown.js";
+import { renderMarkdownInto, langLabel, monacoLang } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
@@ -124,6 +126,12 @@ async function tauriBackend() {
     lspSend: (lang, message) => core.invoke("lsp_send", { lang, message }),
     lspStop: (lang) => core.invoke("lsp_stop", { lang }),
     lspCheckAvailable: (lang) => core.invoke("lsp_check_available", { lang }),
+    writeTmpFile: (name, content) => core.invoke("write_tmp_file", { name, content }),
+    lspDetectPython: () => core.invoke("lsp_detect_python"),
+    lspPythonEnvSymbols: (modules) => core.invoke("lsp_python_env_symbols", { modules }),
+    lspNodeEnvSymbols: (projectDir, modules) => core.invoke("lsp_node_env_symbols", { projectDir, modules }),
+    lspGoEnvSymbols: (projectDir) => core.invoke("lsp_go_env_symbols", { projectDir }),
+    lspLangEnvSymbols: (lang, projectDir, modules) => core.invoke("lsp_lang_env_symbols", { lang, projectDir, modules }),
     dapList: () => core.invoke("dap_list"),
     dapStart: (config, onEvent) => {
       const channel = new core.Channel();
@@ -135,6 +143,8 @@ async function tauriBackend() {
     marketplaceList: () => core.invoke("marketplace_list"),
     marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
     marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
+    dbMarketplaceList: () => core.invoke("db_marketplace_list"),
+    dbMarketplaceUpsert: (ext) => core.invoke("db_marketplace_upsert", { ext }),
     tasksList: (root) => core.invoke("tasks_list", { root }),
     taskRunCapture: (cwd, command) => core.invoke("task_run_capture", { cwd, command }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
@@ -142,6 +152,11 @@ async function tauriBackend() {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
       return core.invoke("ai_chat", { config, messages, onEvent: channel });
+    },
+    aiChatWithTools: (config, messages, tools, onEvent) => {
+      const channel = new core.Channel();
+      channel.onmessage = onEvent;
+      return core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
     },
     termOpen: (opts, onEvent) => {
       const channel = new core.Channel();
@@ -891,22 +906,987 @@ const monacoEditor = monaco.editor.create(editorEl, {
   theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
   automaticLayout: true,
   fixedOverflowWidgets: false,
-  suggest: { showStatusBar: true, shareSuggestSelections: true },
+  suggest: {
+    showStatusBar: true,
+    shareSuggestSelections: true,
+    showWords: false,
+    filterGraceful: true,
+    snippetsPreventQuickSuggestions: false,
+    localityBonus: true,
+    preview: true,
+    showIcons: true,
+    showMethods: true,
+    showFunctions: true,
+    showConstructors: true,
+    showFields: true,
+    showVariables: true,
+    showClasses: true,
+    showStructs: true,
+    showInterfaces: true,
+    showModules: true,
+    showProperties: true,
+    showEvents: true,
+    showOperators: true,
+    showUnits: true,
+    showValues: true,
+    showConstants: true,
+    showEnums: true,
+    showEnumMembers: true,
+    showKeywords: true,
+    showColors: true,
+    showFiles: true,
+    showReferences: true,
+    showSnippets: true,
+  },
+  quickSuggestions: { other: "on", comments: "off", strings: "on" },
+  quickSuggestionsDelay: 50,
+  suggestOnTriggerCharacters: true,
+  acceptSuggestionOnCommitCharacter: false,
+  wordBasedSuggestions: "off",
+  parameterHints: { enabled: true, cycle: true },
+  inlineSuggest: { enabled: true, mode: "subwordSmart" },
   fontSize: 13,
   fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
-  minimap: { enabled: true, maxColumn: 80, renderCharacters: false },
+  minimap: { enabled: true, maxColumn: 80, renderCharacters: false, scale: 1, showSlider: "mouseover" },
   scrollBeyondLastLine: false,
   renderWhitespace: "selection",
   glyphMargin: true,
   padding: { top: 10 },
   bracketPairColorization: { enabled: true, independentColorPoolPerBracketType: true },
-  guides: { bracketPairs: true, indentation: true, highlightActiveIndentation: true },
+  guides: { bracketPairs: false, indentation: true, highlightActiveIndentation: false },
   smoothScrolling: true,
-  cursorBlinking: "smooth",
-  cursorSmoothCaretAnimation: "on",
-  stickyScroll: { enabled: true },
+  cursorBlinking: "blink",
+  cursorSmoothCaretAnimation: "off",
+  stickyScroll: { enabled: false },
   linkedEditing: true,
+  largeFileOptimizations: true,
+  maxTokenizationLineLength: 20000,
+  stopRenderingLineAfter: 10000,
+  fastScrollSensitivity: 5,
+  mouseWheelScrollSensitivity: 1,
+  renderValidationDecorations: "on",
+  unfoldOnClickAfterEndOfLine: true,
+  definitionLinkOpensInPeek: true,
+  gotoLocation: { multiple: "peek", multipleDefinitions: "peek", multipleDeclarations: "peek", multipleImplementations: "peek", multipleTypeDefinitions: "peek", multipleReferences: "peek" },
   colorDecorators: true,
+});
+
+let _imeComposing = false;
+const _imeFlushCallbacks = [];
+
+monacoEditor.onDidCompositionStart(() => { _imeComposing = true; });
+monacoEditor.onDidCompositionEnd(() => {
+  _imeComposing = false;
+  while (_imeFlushCallbacks.length) _imeFlushCallbacks.shift()();
+});
+
+const _CN_PUNCT_MAP = {
+  "\uFF0C": ",",   // ，→ ,
+  "\u3002": ".",   // 。→ .
+  "\uFF1B": ";",   // ；→ ;
+  "\uFF1A": ":",   // ：→ :
+  "\u201C": '"',   // " → "
+  "\u201D": '"',   // " → "
+  "\u2018": "'",   // ' → '
+  "\u2019": "'",   // ' → '
+  "\uFF08": "(",   // （→ (
+  "\uFF09": ")",   // ）→ )
+  "\u3010": "[",   // 【→ [
+  "\u3011": "]",   // 】→ ]
+  "\uFF01": "!",   // ！→ !
+  "\uFF1F": "?",   // ？→ ?
+};
+const _CN_PUNCT_RE = new RegExp("[" + Object.keys(_CN_PUNCT_MAP).join("") + "]", "g");
+let _punctFixing = false;
+
+monacoEditor.onDidChangeModelContent((e) => {
+  if (_punctFixing || _imeComposing) return;
+  const model = monacoEditor.getModel();
+  if (!model) return;
+  const lang = model.getLanguageId();
+  if (lang === "markdown" || lang === "plaintext") return;
+
+  const edits = [];
+  for (const change of e.changes) {
+    const text = change.text;
+    if (!text || !_CN_PUNCT_RE.test(text)) continue;
+    _CN_PUNCT_RE.lastIndex = 0;
+
+    const startLine = change.range.startLineNumber;
+    const startCol = change.range.startColumn;
+    let offset = 0;
+    let match;
+    while ((match = _CN_PUNCT_RE.exec(text)) !== null) {
+      const idx = match.index;
+      let line = startLine;
+      let col = startCol + idx - offset;
+      const before = text.slice(0, idx);
+      const newlines = (before.match(/\n/g) || []).length;
+      if (newlines > 0) {
+        line = startLine + newlines;
+        col = idx - before.lastIndexOf("\n");
+      }
+      edits.push({
+        range: new monaco.Range(line, col, line, col + 1),
+        text: _CN_PUNCT_MAP[match[0]],
+      });
+    }
+  }
+  if (edits.length > 0) {
+    _punctFixing = true;
+    model.pushEditOperations([], edits, () => null);
+    _punctFixing = false;
+  }
+});
+
+// ---- Smart Rename: Chinese identifier → English + duplicate detection ----
+const _CN_CHAR_RE = /[\u4e00-\u9fff]/;
+let _renameTimer = null;
+let _lastRenamePos = "";
+
+function _hasChinese(text) {
+  return _CN_CHAR_RE.test(text);
+}
+
+function _collectSymbolNames(model) {
+  const names = new Set();
+  const text = model.getValue();
+  const ident = /\b([a-zA-Z_]\w*)\b/g;
+  let m;
+  while ((m = ident.exec(text)) !== null) names.add(m[1]);
+  return names;
+}
+
+async function _translateToEnglish(chineseName, context, existingNames) {
+  const config = loadConfig();
+  if (!config.baseUrl || !config.apiKey || !config.model) return null;
+
+  const namesStr = [...existingNames].slice(0, 50).join(", ");
+  const msgs = [
+    {
+      role: "system",
+      content: `You translate Chinese code identifiers to English. Rules:
+1. Output ONLY the English name, nothing else.
+2. Use snake_case for Python/C, camelCase for JS/Java, PascalCase for classes.
+3. Keep it concise (1-3 words).
+4. If the name would conflict with these existing names, add a suffix: ${namesStr}`,
+    },
+    {
+      role: "user",
+      content: `Context: ${context}\nTranslate: "${chineseName}"`,
+    },
+  ];
+
+  try {
+    const aiConfig = {
+      baseUrl: config.baseUrl.replace(/\/+$/, ""),
+      apiKey: config.apiKey,
+      model: config.baseUrl?.includes("deepseek") ? "deepseek-v4-flash" : config.model,
+      maxTokens: 256,
+      temperature: 0,
+    };
+    const result = await new Promise((resolve) => {
+      let buf = "";
+      backend.aiChat(aiConfig, msgs, (ev) => {
+        if (ev.kind === "token") buf += ev.delta;
+        else if (ev.kind === "done") resolve(buf.trim());
+        else if (ev.kind === "error") resolve("");
+      }).catch(() => resolve(""));
+      setTimeout(() => resolve(buf.trim()), 10000);
+    });
+    if (!result || _CN_CHAR_RE.test(result)) return null;
+    let name = result.replace(/[^a-zA-Z0-9_]/g, "").replace(/^_+|_+$/g, "");
+    if (!name) return null;
+    if (existingNames.has(name)) {
+      for (let i = 2; i < 100; i++) {
+        const candidate = `${name}_${i}`;
+        if (!existingNames.has(candidate)) { name = candidate; break; }
+      }
+    }
+    return name;
+  } catch {
+    return null;
+  }
+}
+
+function _getIdentifierAtPosition(model, position) {
+  const word = model.getWordAtPosition(position);
+  if (!word) return null;
+  const text = word.word;
+  if (!_hasChinese(text)) return null;
+  return {
+    text,
+    range: new monaco.Range(
+      position.lineNumber, word.startColumn,
+      position.lineNumber, word.endColumn,
+    ),
+  };
+}
+
+function _isInCommentOrString(line, offset, langId) {
+  const before = line.slice(0, offset);
+  if (/^\s*(#|\/\/|--|%)/.test(line)) return true;
+  if (before.includes("//")) return true;
+  if (before.includes("#") && (langId === "python" || langId === "ruby" || langId === "shell")) return true;
+  if (before.includes("--") && langId === "lua") return true;
+
+  let inSingle = false, inDouble = false, inTemplate = false;
+  for (let i = 0; i < offset; i++) {
+    const ch = line[i];
+    if (ch === "'" && !inDouble && !inTemplate) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle && !inTemplate) inDouble = !inDouble;
+    else if (ch === "`" && !inSingle && !inDouble) inTemplate = !inTemplate;
+  }
+  return inSingle || inDouble || inTemplate;
+}
+
+function _findAllChineseIdentifiers(model) {
+  const found = new Map();
+  const total = model.getLineCount();
+  const langId = model.getLanguageId();
+  for (let ln = 1; ln <= total; ln++) {
+    const line = model.getLineContent(ln);
+    const re = /[\u4e00-\u9fff][\u4e00-\u9fff\w]*/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (_isInCommentOrString(line, m.index, langId)) continue;
+      const text = m[0];
+      if (!found.has(text)) found.set(text, []);
+      found.get(text).push({ line: ln, col: m.index + 1, len: text.length });
+    }
+  }
+  return found;
+}
+
+async function _batchTranslate(chineseNames, lang, existingNames) {
+  const config = loadConfig();
+  if (!config.baseUrl || !config.apiKey || !config.model) return null;
+
+  const namesList = chineseNames.join("\n");
+  const namesStr = [...existingNames].slice(0, 30).join(", ");
+  const msgs = [
+    {
+      role: "system",
+      content: `Translate Chinese code identifiers to English for ${lang}. Rules:
+1. Output one translation per line, same order as input.
+2. Use snake_case for Python, camelCase for JS/TS.
+3. Keep concise (1-3 words each).
+4. No duplicates, no conflicts with: ${namesStr}
+5. Output ONLY the English names, one per line. No numbering, no explanations.`,
+    },
+    { role: "user", content: namesList },
+  ];
+
+  try {
+    const aiConfig = {
+      baseUrl: config.baseUrl.replace(/\/+$/, ""),
+      apiKey: config.apiKey,
+      model: config.baseUrl?.includes("deepseek") ? "deepseek-v4-flash" : config.model,
+      maxTokens: 1024,
+      temperature: 0,
+    };
+    const result = await new Promise((resolve) => {
+      let buf = "";
+      backend.aiChat(aiConfig, msgs, (ev) => {
+        if (ev.kind === "token") buf += ev.delta;
+        else if (ev.kind === "done") resolve(buf.trim());
+        else if (ev.kind === "error") resolve("");
+      }).catch(() => resolve(""));
+      setTimeout(() => resolve(buf.trim()), 20000);
+    });
+    if (!result) return null;
+    const lines = result.split("\n").map((l) => l.trim().replace(/^\d+[\.\)]\s*/, "").replace(/[^a-zA-Z0-9_]/g, ""));
+    if (lines.length < chineseNames.length) return null;
+
+    const used = new Set(existingNames);
+    const mapping = {};
+    for (let i = 0; i < chineseNames.length; i++) {
+      let name = lines[i];
+      if (!name || _CN_CHAR_RE.test(name)) continue;
+      while (used.has(name)) name = name + "_" + (Math.floor(Math.random() * 90) + 10);
+      used.add(name);
+      mapping[chineseNames[i]] = name;
+    }
+    return mapping;
+  } catch {
+    return null;
+  }
+}
+
+async function _trySmartRename(editor) {
+  const model = editor.getModel();
+  if (!model) return;
+  const lang = model.getLanguageId();
+  if (lang === "markdown" || lang === "plaintext") return;
+
+  const chineseIdents = _findAllChineseIdentifiers(model);
+  if (chineseIdents.size === 0) return;
+
+  const namesKey = [...chineseIdents.keys()].sort().join("|");
+  if (namesKey === _lastRenamePos) return;
+
+  const existingNames = _collectSymbolNames(model);
+  const chineseNames = [...chineseIdents.keys()];
+  const mapping = await _batchTranslate(chineseNames, lang, existingNames);
+  if (!mapping || Object.keys(mapping).length === 0) return;
+  _lastRenamePos = namesKey;
+
+  const edits = [];
+  const defRe = /^\s*(?:def |class |function |const |let |var |async function |fn |func |pub fn |pub func )/;
+  const usedDefNames = new Set();
+
+  for (const [cnName, positions] of chineseIdents.entries()) {
+    let enName = mapping[cnName];
+    if (!enName) continue;
+
+    for (const pos of positions) {
+      const currentText = model.getValueInRange(
+        new monaco.Range(pos.line, pos.col, pos.line, pos.col + pos.len),
+      );
+      if (currentText !== cnName) continue;
+
+      const lineContent = model.getLineContent(pos.line);
+      const isDef = defRe.test(lineContent);
+
+      let finalName = enName;
+      if (isDef && usedDefNames.has(enName)) {
+        for (let i = 2; i < 100; i++) {
+          const candidate = `${enName}_${i}`;
+          if (!usedDefNames.has(candidate) && !existingNames.has(candidate)) {
+            finalName = candidate;
+            break;
+          }
+        }
+      }
+      if (isDef) usedDefNames.add(finalName);
+
+      edits.push({
+        range: new monaco.Range(pos.line, pos.col, pos.line, pos.col + pos.len),
+        text: finalName,
+      });
+    }
+  }
+
+  if (edits.length > 0) {
+    _punctFixing = true;
+    model.pushEditOperations([], edits, () => null);
+    _punctFixing = false;
+    const summary = Object.entries(mapping).map(([k, v]) => `${k}→${v}`).join("  ");
+    showToast?.(`✦ ${summary}`);
+  }
+}
+
+monacoEditor.onDidChangeModelContent(() => {
+  if (_imeComposing || _punctFixing) return;
+  if (_renameTimer) clearTimeout(_renameTimer);
+  _renameTimer = setTimeout(() => _trySmartRename(monacoEditor), 1500);
+});
+
+// ---- Smart Code Auto-Corrector ----
+let _autoFixTimer = null;
+const _AUTO_FIX_DEBOUNCE = 1200;
+
+const _DOUBLE_SYMBOLS = [
+  [/;;/g, ";"],
+  [/,,/g, ","],
+  [/\.\.\./g, null],
+  [/\.\.(?!\.)/g, "."],
+  [/::(?!:)/g, ":"],
+  [/\+\+(?!\+)/g, null],
+  [/--(?!-|>)/g, null],
+];
+
+const _BRACKET_PAIRS = { "(": ")", "[": "]", "{": "}" };
+const _CLOSE_TO_OPEN = { ")": "(", "]": "[", "}": "{" };
+
+function _fixDoublePunctuation(model) {
+  const edits = [];
+  const total = model.getLineCount();
+  for (let ln = 1; ln <= total; ln++) {
+    const line = model.getLineContent(ln);
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) continue;
+
+    for (const [re, replacement] of _DOUBLE_SYMBOLS) {
+      if (replacement === null) continue;
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(line)) !== null) {
+        const col = m.index + 1;
+        const inStr = _isInString(line, m.index);
+        if (inStr) continue;
+        edits.push({
+          range: new monaco.Range(ln, col, ln, col + m[0].length),
+          text: replacement,
+        });
+      }
+    }
+  }
+  return edits;
+}
+
+function _isInString(line, pos) {
+  let inSingle = false, inDouble = false, inBacktick = false;
+  for (let i = 0; i < pos; i++) {
+    const ch = line[i];
+    const prev = i > 0 ? line[i - 1] : "";
+    if (prev === "\\") continue;
+    if (ch === "'" && !inDouble && !inBacktick) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle && !inBacktick) inDouble = !inDouble;
+    else if (ch === "`" && !inSingle && !inDouble) inBacktick = !inBacktick;
+  }
+  return inSingle || inDouble || inBacktick;
+}
+
+function _fixUnbalancedBrackets(model) {
+  const edits = [];
+  const total = model.getLineCount();
+  const stack = [];
+
+  for (let ln = 1; ln <= total; ln++) {
+    const line = model.getLineContent(ln);
+    for (let i = 0; i < line.length; i++) {
+      if (_isInString(line, i)) continue;
+      const ch = line[i];
+      if (_BRACKET_PAIRS[ch]) {
+        stack.push({ ch, ln, col: i + 1 });
+      } else if (_CLOSE_TO_OPEN[ch]) {
+        const expected = _CLOSE_TO_OPEN[ch];
+        if (stack.length > 0 && stack[stack.length - 1].ch === expected) {
+          stack.pop();
+        } else {
+          edits.push({
+            range: new monaco.Range(ln, i + 1, ln, i + 2),
+            text: "",
+          });
+        }
+      }
+    }
+  }
+
+  for (const unclosed of stack) {
+    const closer = _BRACKET_PAIRS[unclosed.ch];
+    const ln = unclosed.ln;
+    const lineContent = model.getLineContent(ln);
+    const endCol = lineContent.length + 1;
+    edits.push({
+      range: new monaco.Range(ln, endCol, ln, endCol),
+      text: closer,
+    });
+  }
+  return edits;
+}
+
+function _fixTrailingWhitespace(model, changedLines) {
+  const edits = [];
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > model.getLineCount()) continue;
+    const line = model.getLineContent(ln);
+    const trimmed = line.replace(/\s+$/, "");
+    if (trimmed.length < line.length) {
+      edits.push({
+        range: new monaco.Range(ln, trimmed.length + 1, ln, line.length + 1),
+        text: "",
+      });
+    }
+  }
+  return edits;
+}
+
+const _LANG_KEYWORDS = new Set([
+  "abstract","and","arguments","as","assert","async","await",
+  "boolean","break","byte","case","catch","char","class","const","constructor",
+  "continue","debugger","declare","def","default","defer",
+  "delete","do","double","elif","else","enum","eval","except","export",
+  "extends","extern","false","final","finally","float","for","foreach",
+  "from","func","function","get","global","go","goto","if","implement",
+  "implements","import","in","include","instanceof","int","interface",
+  "internal","is","lambda","let","long","map","match","module","mut",
+  "namespace","new","nil","none","not","null","number","object","of",
+  "operator","or","out","override","package","param","pass","print",
+  "private","protected","pub","public","raise","range","readonly",
+  "ref","require","return","sealed","select","self","set","short",
+  "signed","sizeof","slice","static","string","struct","super",
+  "switch","synchronized","template","then","this","throw","throws",
+  "trait","true","try","type","typedef","typeof","uint","undefined",
+  "union","unsigned","use","using","val","var","virtual","void",
+  "volatile","while","with","yield",
+  "console","document","window","element","length","push","pop","shift","unshift",
+  "splice","forEach","filter","reduce","indexOf","includes","find","findIndex",
+  "promise","resolve","reject","async","await","fetch","response","request",
+  "addEventListener","removeEventListener","querySelector","getElementById",
+  "createElement","appendChild","innerHTML","textContent","className","style",
+  "setTimeout","setInterval","clearTimeout","clearInterval","JSON","parse","stringify",
+  "Math","random","floor","ceil","round","abs","max","min","pow","sqrt",
+  "Array","Object","String","Number","Boolean","Date","RegExp","Map","Set","WeakMap",
+  "toString","valueOf","hasOwnProperty","constructor","prototype",
+  "process","exports","module","Buffer","Stream","EventEmitter",
+  "vector","string","iostream","algorithm","utility","functional","memory",
+  "unordered_map","shared_ptr","unique_ptr","make_shared","make_unique",
+  "begin","end","size","empty","clear","erase","insert","emplace",
+  "System","Collections","Generic","Linq","Threading","Tasks",
+  "ArrayList","HashMap","LinkedList","TreeMap","HashSet","Iterator",
+  "StringBuilder","IOException","Exception","Override","Nullable",
+  "println","printf","sprintf","fprintf","scanf","malloc","calloc","realloc","free",
+  "goroutine","channel","select","defer","panic","recover","make","append","len","cap",
+  "fmt","http","json","time","sync","context","errors","strings","strconv","io",
+]);
+
+const _envSymbols = new Set();
+const _fileSymbols = new Set();
+const _moduleApiSymbols = new Set();
+const _typoCache = new Map();
+let _envSymbolsLoaded = false;
+let _envLoadingLang = null;
+const _loadedModuleApis = new Set();
+
+function _levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  let curr = new Array(n + 1);
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      curr[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j - 1], prev[j], curr[j - 1]);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+function _addSymbols(target, symbols) {
+  let added = 0;
+  for (const sym of symbols) {
+    if (sym && sym.length >= 2 && /^[a-zA-Z_]\w*$/.test(sym)) {
+      const lc = sym.toLowerCase();
+      if (!target.has(lc)) { target.add(lc); added++; }
+    }
+  }
+  if (added > 0) _typoCache.clear();
+}
+
+function _updateDynamicKeywords(symbols) {
+  _addSymbols(_envSymbols, symbols);
+}
+
+async function _loadEnvSymbols(langId) {
+  if (_envLoadingLang === langId && _envSymbolsLoaded) return;
+  _envLoadingLang = langId;
+
+  const model = monacoEditor.getModel();
+  const importedMods = model ? _extractImportedModules(model) : [];
+
+  if (langId === "python") {
+    if (importedMods.length > 0) _loadModuleApisOnly(importedMods);
+    _loadAllModuleNames();
+  }
+
+  if ((langId === "javascript" || langId === "typescript") && workspaceRoots.length > 0) {
+    _loadNodeEnvSymbols(workspaceRoots[0], importedMods);
+  }
+
+  if (langId === "go" && workspaceRoots.length > 0) {
+    _loadGoEnvSymbols(workspaceRoots[0]);
+  }
+
+  const genericLangs = ["lua","ruby","php","dart","kotlin","java","swift","c","cpp","csharp"];
+  if (genericLangs.includes(langId)) {
+    _loadGenericLangSymbols(langId, importedMods);
+  }
+
+  if (lspManager) {
+    _loadLspSymbols(langId, model);
+  }
+}
+
+async function _loadGenericLangSymbols(langId, importedMods) {
+  const projectDir = workspaceRoots.length > 0 ? workspaceRoots[0] : "";
+  try {
+    const result = await backend.lspLangEnvSymbols(langId, projectDir, importedMods);
+    if (result?.symbols) {
+      _addSymbols(_envSymbols, result.symbols);
+    }
+    if (result?.apiSymbols) {
+      for (const [mod, syms] of Object.entries(result.apiSymbols)) {
+        _loadedModuleApis.add(mod);
+        _addSymbols(_moduleApiSymbols, syms);
+      }
+    }
+    _envSymbolsLoaded = true;
+  } catch { /* lang runtime not available */ }
+}
+
+async function _loadNodeEnvSymbols(projectDir, importedMods) {
+  try {
+    const result = await backend.lspNodeEnvSymbols(projectDir, importedMods);
+    if (result?.packages) _addSymbols(_envSymbols, result.packages);
+    if (result?.exports) {
+      for (const [mod, syms] of Object.entries(result.exports)) {
+        _loadedModuleApis.add(mod);
+        _addSymbols(_moduleApiSymbols, syms);
+      }
+    }
+    _envSymbolsLoaded = true;
+  } catch { /* node not available */ }
+}
+
+async function _loadGoEnvSymbols(projectDir) {
+  try {
+    const result = await backend.lspGoEnvSymbols(projectDir);
+    if (result?.packages) {
+      _addSymbols(_envSymbols, result.packages);
+      _envSymbolsLoaded = true;
+    }
+  } catch { /* go not available */ }
+}
+
+async function _loadModuleApisOnly(mods) {
+  const newMods = mods.filter((m) => !_loadedModuleApis.has(m));
+  if (newMods.length === 0) return;
+  try {
+    const result = await backend.lspPythonEnvSymbols(newMods);
+    if (result?.symbols) {
+      for (const [mod, attrs] of Object.entries(result.symbols)) {
+        _loadedModuleApis.add(mod);
+        _addSymbols(_moduleApiSymbols, attrs);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+async function _loadAllModuleNames() {
+  if (_envSymbolsLoaded) return;
+  try {
+    const result = await backend.lspPythonEnvSymbols([]);
+    if (result?.modules) {
+      _addSymbols(_envSymbols, result.modules);
+      _envSymbolsLoaded = true;
+    }
+  } catch { /* ignore */ }
+}
+
+async function _loadLspSymbols(langId, model) {
+  try {
+    const wsSymbols = await lspManager.queryWorkspaceSymbols(langId, "");
+    if (wsSymbols.length) _addSymbols(_envSymbols, wsSymbols);
+  } catch { /* workspace/symbol not supported */ }
+
+  if (model) {
+    try {
+      const docSymbols = await lspManager.queryDocumentSymbols(
+        model.uri.toString(), langId
+      );
+      if (docSymbols.length) _addSymbols(_envSymbols, docSymbols);
+    } catch { /* ignore */ }
+  }
+}
+
+function _extractImportedModules(model) {
+  if (!model) return [];
+  const mods = new Set();
+  const total = Math.min(model.getLineCount(), 300);
+  for (let i = 1; i <= total; i++) {
+    const line = model.getLineContent(i);
+    let m;
+    if ((m = line.match(/^\s*import\s+([a-zA-Z_][\w.]*)/))) {
+      mods.add(m[1].split(".")[0]);
+    }
+    if ((m = line.match(/^\s*from\s+([a-zA-Z_][\w.]*)\s+import/))) {
+      mods.add(m[1].split(".")[0]);
+    }
+    if ((m = line.match(/require\s*\(\s*['"]([a-zA-Z@][\w/.-]*)["']\s*\)/))) {
+      const pkg = m[1].startsWith("@") ? m[1].split("/").slice(0, 2).join("/") : m[1].split("/")[0];
+      mods.add(pkg);
+    }
+    if ((m = line.match(/^\s*import\s+.*\s+from\s+['"]([a-zA-Z@][\w/.-]*)["']/))) {
+      const pkg = m[1].startsWith("@") ? m[1].split("/").slice(0, 2).join("/") : m[1].split("/")[0];
+      mods.add(pkg);
+    }
+    if ((m = line.match(/^\s*use\s+([a-zA-Z_][\w]*)/))) {
+      mods.add(m[1]);
+    }
+    if ((m = line.match(/^\s*#include\s*[<"]([a-zA-Z_][\w./]*)[">/]/))) {
+      const header = m[1].split("/")[0].replace(/\.h(pp)?$/, "");
+      mods.add(header);
+    }
+    if ((m = line.match(/^\s*using\s+(namespace\s+)?([a-zA-Z_][\w.]*)/))) {
+      mods.add(m[2].split(".")[0]);
+    }
+    if ((m = line.match(/^\s*import\s+([a-zA-Z_][\w.]*)\s*;/))) {
+      const parts = m[1].split(".");
+      if (parts.length > 1) {
+        mods.add(parts[parts.length - 1]);
+        mods.add(parts[parts.length - 2]);
+      }
+    }
+    if ((m = line.match(/require\s*[\('"]\s*["']?([a-zA-Z_][\w.-]*)["']?\s*[\)'"]/))) {
+      mods.add(m[1].replace(/\.\w+$/, ""));
+    }
+    if ((m = line.match(/^\s*(?:require|include|require_once|include_once)\s+['"]([a-zA-Z_][\w/.-]*)["']/))) {
+      mods.add(m[1].split("/").pop().replace(/\.\w+$/, ""));
+    }
+    if ((m = line.match(/^\s*import\s+['"]package:([a-zA-Z_][\w]*)/))) {
+      mods.add(m[1]);
+    }
+    if ((m = line.match(/^\s*local\s+\w+\s*=\s*require\s*[\("'][\s"']*([a-zA-Z_][\w.]*)/))) {
+      mods.add(m[1].split(".")[0]);
+    }
+  }
+  return [...mods];
+}
+
+function _extractFileIdentifiers(model) {
+  if (!model) return;
+  _fileSymbols.clear();
+  const total = model.getLineCount();
+  const re = /\b([a-zA-Z_][a-zA-Z0-9_]{1,})\b/g;
+  for (let i = 1; i <= total; i++) {
+    const line = model.getLineContent(i);
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      const w = m[1];
+      if (w.length >= 2 && !w.startsWith("_")) _fileSymbols.add(w.toLowerCase());
+    }
+  }
+  _typoCache.clear();
+}
+
+async function _refreshModuleApis(model) {
+  if (!model) return;
+  const langId = model.getLanguageId();
+  const imported = _extractImportedModules(model);
+  const newMods = imported.filter((m) => !_loadedModuleApis.has(m));
+  if (newMods.length === 0) return;
+
+  if (langId === "python") {
+    try {
+      const result = await backend.lspPythonEnvSymbols(newMods);
+      if (result?.symbols) {
+        for (const [mod, attrs] of Object.entries(result.symbols)) {
+          _loadedModuleApis.add(mod);
+          _addSymbols(_moduleApiSymbols, attrs);
+        }
+      }
+    } catch { /* ignore */ }
+  } else if ((langId === "javascript" || langId === "typescript") && workspaceRoots.length > 0) {
+    try {
+      const result = await backend.lspNodeEnvSymbols(workspaceRoots[0], newMods);
+      if (result?.exports) {
+        for (const [mod, syms] of Object.entries(result.exports)) {
+          _loadedModuleApis.add(mod);
+          _addSymbols(_moduleApiSymbols, syms);
+        }
+      }
+    } catch { /* ignore */ }
+  } else if (["lua","ruby","php","dart","kotlin","java","swift","c","cpp","csharp"].includes(langId)) {
+    const projectDir = workspaceRoots.length > 0 ? workspaceRoots[0] : "";
+    try {
+      const result = await backend.lspLangEnvSymbols(langId, projectDir, newMods);
+      if (result?.apiSymbols) {
+        for (const [mod, syms] of Object.entries(result.apiSymbols)) {
+          _loadedModuleApis.add(mod);
+          _addSymbols(_moduleApiSymbols, syms);
+        }
+      }
+    } catch { /* ignore */ }
+  } else {
+    _addSymbols(_envSymbols, newMods);
+  }
+}
+
+function _getAllKnownWords() {
+  const all = new Set(_LANG_KEYWORDS);
+  for (const s of _envSymbols) all.add(s);
+  for (const s of _fileSymbols) all.add(s);
+  for (const s of _moduleApiSymbols) all.add(s);
+  return all;
+}
+
+function _isCamelOrPascal(word) {
+  return /[a-z][A-Z]/.test(word) || /^[A-Z][a-z]+[A-Z]/.test(word);
+}
+
+function _findTypoFix(word) {
+  if (word.length < 3) return null;
+  if (_isCamelOrPascal(word)) return null;
+  if (word.includes("_") && word.split("_").length > 1) return null;
+  if (/^[A-Z]{2,}$/.test(word)) return null;
+
+  const key = word.toLowerCase();
+  if (_typoCache.has(key)) return _typoCache.get(key);
+
+  const allWords = _getAllKnownWords();
+  if (allWords.has(key)) { _typoCache.set(key, null); return null; }
+
+  let best = null, bestDist = Infinity;
+  const maxDist = 1;
+  for (const kw of allWords) {
+    if (!_LANG_KEYWORDS.has(kw) && !_moduleApiSymbols.has(kw)) continue;
+    if (Math.abs(kw.length - key.length) > maxDist) continue;
+    const d = _levenshtein(key, kw);
+    if (d === 1 && d < bestDist) {
+      bestDist = d;
+      best = kw;
+      break;
+    }
+  }
+  _typoCache.set(key, best);
+  return best;
+}
+
+const _IMPORT_LINE_RE = /^\s*(import|from|require|use|include|#include|using|require_once|include_once)\b/;
+
+function _fixKeywordTypos(model, changedLines) {
+  const edits = [];
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > model.getLineCount()) continue;
+    const line = model.getLineContent(ln);
+    if (_IMPORT_LINE_RE.test(line)) continue;
+    if (/^\s*(#|\/\/|--|\/\*|\*)/.test(line)) continue;
+
+    const re = /\b([a-zA-Z_][a-zA-Z]*)\b/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (_isInString(line, m.index)) continue;
+      const word = m[1];
+      if (word.startsWith("_")) continue;
+      const fix = _findTypoFix(word);
+      if (fix && fix !== word.toLowerCase()) {
+        const corrected = word[0] === word[0].toUpperCase() ? fix[0].toUpperCase() + fix.slice(1) : fix;
+        edits.push({
+          range: new monaco.Range(ln, m.index + 1, ln, m.index + 1 + word.length),
+          text: corrected,
+        });
+      }
+    }
+  }
+  return edits;
+}
+
+function _fixPythonMissingColon(model, changedLines) {
+  const lang = model.getLanguageId();
+  if (lang !== "python") return [];
+  const edits = [];
+  const coloned = /^\s*(def |class |if |elif |else|for |while |with |try|except|finally|async def |async for |async with )/;
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > model.getLineCount()) continue;
+    const line = model.getLineContent(ln);
+    if (!coloned.test(line)) continue;
+    const trimmed = line.trimEnd();
+    if (trimmed.endsWith(":") || trimmed.endsWith(":\\")) continue;
+    if (trimmed.endsWith(",") || trimmed.endsWith("(") || trimmed.endsWith("\\")) continue;
+    const nextLn = ln + 1;
+    if (nextLn <= model.getLineCount()) {
+      const nextLine = model.getLineContent(nextLn);
+      const nextIndent = nextLine.search(/\S/);
+      const currIndent = line.search(/\S/);
+      if (nextIndent > currIndent || nextLine.trim() === "") {
+        edits.push({
+          range: new monaco.Range(ln, trimmed.length + 1, ln, trimmed.length + 1),
+          text: ":",
+        });
+      }
+    }
+  }
+  return edits;
+}
+
+function _fixExtraSpaces(model, changedLines) {
+  const edits = [];
+  for (const ln of changedLines) {
+    if (ln < 1 || ln > model.getLineCount()) continue;
+    const line = model.getLineContent(ln);
+    const indent = line.match(/^(\s*)/)?.[0] || "";
+    const rest = line.slice(indent.length);
+    const fixed = rest.replace(/  +/g, (match, offset) => {
+      if (_isInString(rest, offset)) return match;
+      return " ";
+    });
+    if (fixed !== rest) {
+      edits.push({
+        range: new monaco.Range(ln, indent.length + 1, ln, line.length + 1),
+        text: fixed,
+      });
+    }
+  }
+  return edits;
+}
+
+async function _fixFromLspDiagnostics(editor) {
+  const model = editor.getModel();
+  if (!model) return [];
+  const markers = monaco.editor.getModelMarkers({ resource: model.uri });
+  if (markers.length === 0) return [];
+
+  const langId = model.getLanguageId();
+  const client = lspManager?.isRunning(langId) ? true : false;
+  if (!client) return [];
+
+  const edits = [];
+  for (const marker of markers) {
+    const msg = marker.message || "";
+    const didYouMean = msg.match(/[Dd]id you mean ['"](\w+)['"]/);
+    if (didYouMean) {
+      const suggestion = didYouMean[1];
+      const word = model.getWordAtPosition({ lineNumber: marker.startLineNumber, column: marker.startColumn });
+      if (word && word.word !== suggestion) {
+        edits.push({
+          range: new monaco.Range(marker.startLineNumber, word.startColumn, marker.startLineNumber, word.endColumn),
+          text: suggestion,
+        });
+      }
+    }
+  }
+  return edits;
+}
+
+async function _runAutoCorrections(editor, changedLines) {
+  const model = editor.getModel();
+  if (!model) return;
+  const lang = model.getLanguageId();
+  if (lang === "markdown" || lang === "plaintext") return;
+
+  const doubleFixes = _fixDoublePunctuation(model);
+  const typoFixes = _fixKeywordTypos(model, changedLines);
+  const colonFixes = _fixPythonMissingColon(model, changedLines);
+  const spaceFixes = _fixExtraSpaces(model, changedLines);
+  const lspFixes = await _fixFromLspDiagnostics(editor);
+
+  const allEdits = [...doubleFixes, ...typoFixes, ...colonFixes, ...spaceFixes, ...lspFixes];
+  if (allEdits.length === 0) return;
+
+  _punctFixing = true;
+  model.pushEditOperations([], allEdits, () => null);
+  _punctFixing = false;
+}
+
+let _lspFixTimer = null;
+monacoEditor.onDidChangeModelContent((e) => {
+  if (_imeComposing || _punctFixing) return;
+  if (_autoFixTimer) clearTimeout(_autoFixTimer);
+  const lines = e.changes.map((c) => c.range.startLineNumber);
+  _autoFixTimer = setTimeout(() => _runAutoCorrections(monacoEditor, lines), _AUTO_FIX_DEBOUNCE);
+});
+
+monaco.editor.onDidChangeMarkers((uris) => {
+  if (_punctFixing || _imeComposing) return;
+  const model = monacoEditor.getModel();
+  if (!model) return;
+  const modelUri = model.uri.toString();
+  if (!uris.some((u) => u.toString() === modelUri)) return;
+  if (_lspFixTimer) clearTimeout(_lspFixTimer);
+  _lspFixTimer = setTimeout(async () => {
+    const lspFixes = await _fixFromLspDiagnostics(monacoEditor);
+    if (lspFixes.length > 0) {
+      _punctFixing = true;
+      model.pushEditOperations([], lspFixes, () => null);
+      _punctFixing = false;
+    }
+  }, 2000);
 });
 
 const editorContainer = $("editorContainer");
@@ -1280,6 +2260,29 @@ async function setTheme(theme) {
 applyEditorTheme();
 registerSnippetProviders();
 
+if (monaco.languages.html?.htmlDefaults) {
+  monaco.languages.html.htmlDefaults.setOptions({
+    format: { tabSize: 2, insertSpaces: true, wrapLineLength: 120, wrapAttributes: "auto" },
+    suggest: { html5: true, angular1: false, ionic: false },
+  });
+}
+if (monaco.languages.css?.cssDefaults) {
+  monaco.languages.css.cssDefaults.setOptions({
+    validate: true,
+    lint: {
+      compatibleVendorPrefixes: "warning",
+      vendorPrefix: "warning",
+      duplicateProperties: "warning",
+      emptyRules: "warning",
+      importStatement: "warning",
+      zeroUnits: "warning",
+      fontFaceProperties: "warning",
+      hexColorLength: "warning",
+      unknownProperties: "warning",
+    },
+  });
+}
+
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   applyEditorTheme();
   for (const tab of (typeof termTabs !== "undefined" ? termTabs : [])) {
@@ -1434,6 +2437,14 @@ function attachModelListeners(path, model) {
   modelsWithListeners.add(model);
   model.onDidChangeContent(() => {
     markDirty(path, true);
+    if (_imeComposing) {
+      if (!_imeFlushCallbacks.some(cb => cb._lspPath === path)) {
+        const cb = () => lspManager?.didChange(path, model);
+        cb._lspPath = path;
+        _imeFlushCallbacks.push(cb);
+      }
+      return;
+    }
     lspManager?.didChange(path, model);
   });
 }
@@ -1504,6 +2515,7 @@ async function openFile(path, name) {
   renderTabs();
   activate(path);
   lspManager?.didOpen(path, model);
+  _onFileOpened(model);
   return true;
 }
 
@@ -1537,8 +2549,9 @@ function activate(path) {
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
-  if (runBtn) runBtn.disabled = !f.isImage;
-  $("windowTitle").textContent = f.name + " — Michael IDE";
+  if (runBtn) runBtn.disabled = !!f.isImage;
+  const projectLabel = rootPath ? basename(rootPath) : "";
+  $("windowTitle").textContent = f.name + (projectLabel ? " — " + projectLabel : "") + " — Michael IDE";
   if (!f.isImage) {
     refreshGutter();
     refreshBlame();
@@ -1709,7 +2722,8 @@ function closeFile(path) {
       monacoEditor.setModel(monaco.editor.createModel("", "plaintext"));
       saveBtn.disabled = true;
       if (runBtn) runBtn.disabled = true;
-      $("windowTitle").textContent = "Michael IDE";
+      const idleTitle = rootPath ? basename(rootPath) + " — Michael IDE" : "Michael IDE";
+      $("windowTitle").textContent = idleTitle;
       refreshGutter();
       updateBreadcrumb(null);
     }
@@ -1761,7 +2775,13 @@ function markDirty(path, dirty) {
   if (!f || f.dirty === dirty) return;
   f.dirty = dirty;
   if (path === activePath) saveBtn.disabled = !dirty;
-  renderTabs();
+  const tabEl = tabsEl.querySelector(`[data-path="${CSS.escape(path)}"]`);
+  if (tabEl) {
+    if (dirty) tabEl.classList.add("dirty");
+    else tabEl.classList.remove("dirty");
+  } else {
+    renderTabs();
+  }
 }
 
 async function saveActive() {
@@ -1860,7 +2880,48 @@ lspManager = createLspManager({
   onStatus: () => updateLspStatusBar(),
   onLog: (lang, line) => lspLogSink(lang, line),
 });
+lspManager.onCompletionSymbols = (symbols) => {
+  _updateDynamicKeywords(symbols);
+};
 lspManager.registerProviders();
+
+let _envLoadTimer = null;
+let _modApiTimer = null;
+
+function _onFileOpened(model) {
+  if (!model) return;
+  _extractFileIdentifiers(model);
+  const langId = model.getLanguageId();
+
+  const importedMods = _extractImportedModules(model);
+  if (importedMods.length > 0) {
+    setTimeout(() => _loadModuleApisOnly(importedMods), 200);
+  }
+
+  if (_envLoadTimer) clearTimeout(_envLoadTimer);
+  _envLoadTimer = setTimeout(() => _loadEnvSymbols(langId), 1500);
+}
+
+monacoEditor.onDidChangeModel(() => {
+  const model = monacoEditor.getModel();
+  if (model) {
+    _extractFileIdentifiers(model);
+    if (_modApiTimer) clearTimeout(_modApiTimer);
+    _modApiTimer = setTimeout(() => _refreshModuleApis(model), 2000);
+  }
+});
+
+let _fileIdRefreshTimer = null;
+monacoEditor.onDidChangeModelContent(() => {
+  if (_fileIdRefreshTimer) clearTimeout(_fileIdRefreshTimer);
+  _fileIdRefreshTimer = setTimeout(() => {
+    const model = monacoEditor.getModel();
+    if (model) {
+      _extractFileIdentifiers(model);
+      _refreshModuleApis(model);
+    }
+  }, 5000);
+});
 
 const lspLogBuffers = new Map();
 function lspLogSink(lang, line) {
@@ -2073,7 +3134,8 @@ function basename(path) {
 
 function setActiveWorkspaceRoot(path) {
   rootPath = path;
-  _launchConfigsCache = null; // re-discover launch.json for the new root
+  _launchConfigsCache = null;
+  _agentContextCache = { root: "", ts: 0, data: "" };
   if (workspaceRoots.length > 1) {
     rootNameEl.textContent = `${workspaceRoots.length} folders`;
     rootNameEl.title = workspaceRoots.join("\n");
@@ -2082,6 +3144,9 @@ function setActiveWorkspaceRoot(path) {
     rootNameEl.title = path;
   }
   setExplorerToolsEnabled(Boolean(path));
+  const titleFile = activePath ? openFiles.get(activePath)?.name : "";
+  const project = basename(path);
+  $("windowTitle").textContent = (titleFile ? titleFile + " — " : "") + project + " — Michael IDE";
 }
 
 async function renderWorkspaceRoots() {
@@ -2128,6 +3193,7 @@ async function openFolder(path) {
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
   try { await backend.registerWorkspaceRoot(path); } catch { /* browser preview */ }
+  _ipcBroadcast("workspace_changed", { roots: [path], active: path });
   await renderWorkspaceRoots();
   preloadProjectModels(path);
   await refreshGitStatus();
@@ -2159,6 +3225,12 @@ async function startFileWatcher() {
 
 function handleFsChanges(paths) {
   if (!rootPath) return;
+  if (_autoSaving) return;
+
+  const openPaths = new Set(openFiles.keys());
+  const onlyOpenFiles = paths.every((p) => openPaths.has(p));
+  if (onlyOpenFiles && autoSaveEnabled) return;
+
   const dirsToReload = new Set();
   for (const p of paths) {
     const dir = parentDir(p);
@@ -2179,6 +3251,7 @@ async function addFolderToWorkspace() {
   if (!picked) return;
   if (!workspaceRoots.includes(picked)) workspaceRoots.push(picked);
   try { await backend.registerWorkspaceRoot(picked); } catch { /* browser preview */ }
+  _ipcBroadcast("workspace_changed", { roots: [...workspaceRoots], active: picked });
   setActiveWorkspaceRoot(picked);
   await renderWorkspaceRoots();
   preloadProjectModels(picked);
@@ -2778,8 +3851,12 @@ function showSide(which) {
   $("viewExplorer").hidden = which !== "explorer";
   $("viewSearch").hidden = which !== "search";
   $("viewGit").hidden = which !== "git";
+  $("viewOutline").hidden = which !== "outline";
+  $("viewTest").hidden = which !== "test";
   $("tabExplorer").classList.toggle("is-active", which === "explorer" || which === "search");
   $("tabGit").classList.toggle("is-active", which === "git");
+  $("tabOutline").classList.toggle("is-active", which === "outline");
+  $("tabTest").classList.toggle("is-active", which === "test");
   const layout = document.querySelector(".layout");
   if (layout) layout.classList.remove("hide-explorer");
   if (which === "search") {
@@ -2788,6 +3865,10 @@ function showSide(which) {
     si.select();
   } else if (which === "git") {
     refreshGitStatus();
+  } else if (which === "outline") {
+    refreshOutline();
+  } else if (which === "test") {
+    refreshTestExplorer();
   }
 }
 
@@ -3246,16 +4327,19 @@ function toggleBlame() {
   }
 }
 
+let _blameRAF = 0;
 monacoEditor.onDidChangeCursorPosition(() => {
-  if (blameEnabled) updateBlameLine();
+  if (blameEnabled && !_blameRAF && !_imeComposing) {
+    _blameRAF = requestAnimationFrame(() => { _blameRAF = 0; updateBlameLine(); });
+  }
 });
-// Edits shift line numbers, so the cached blame becomes stale — hide until the
-// file is saved again (refreshBlame re-runs from saveActive / activate).
+let _blameInvalidateTimer = null;
 monacoEditor.onDidChangeModelContent(() => {
-  if (blameEnabled) {
+  if (blameEnabled && !_imeComposing) {
     blameMap = null;
     blameMapPath = null;
-    blameDecorations.set([]);
+    if (_blameInvalidateTimer) clearTimeout(_blameInvalidateTimer);
+    _blameInvalidateTimer = setTimeout(() => blameDecorations.set([]), 500);
   }
 });
 
@@ -3653,6 +4737,7 @@ function lineDiffHunks(a, b) {
 
 monacoEditor.onDidChangeModelContent(() => {
   if (gutterTimer) clearTimeout(gutterTimer);
+  if (_imeComposing) return;
   gutterTimer = setTimeout(updateGutter, 250);
 });
 
@@ -3660,20 +4745,37 @@ monacoEditor.onDidChangeModelContent(() => {
 let diffEditor = null;
 const diffViewEl = $("diffView");
 
-function ensureDiffEditor() {
+function ensureDiffEditor(opts = {}) {
   if (diffEditor) return diffEditor;
   diffEditor = monaco.editor.createDiffEditor($("diffBody"), {
     theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
     automaticLayout: true,
-    readOnly: true,
+    readOnly: false,
+    originalEditable: false,
     renderSideBySide: true,
+    enableSplitViewResizing: true,
     fontSize: 13,
     fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
+    renderOverviewRuler: true,
+    ignoreTrimWhitespace: false,
+    ...opts,
   });
+  const modifiedEditor = diffEditor.getModifiedEditor();
+  if (modifiedEditor) {
+    modifiedEditor.onDidChangeModelContent(() => {
+      const m = diffEditor.getModel();
+      if (!m || !_diffFilePath) return;
+      const content = m.modified.getValue();
+      backend.writeTextFile(_diffFilePath, content).then(() => {
+        showToast?.("Diff: saved");
+      }).catch(() => {});
+    });
+  }
   return diffEditor;
 }
+let _diffFilePath = null;
 
 async function openDiff(file) {
   if (!rootPath) return;
@@ -3703,6 +4805,7 @@ async function openDiff(file) {
     prev.modified?.dispose();
   }
 
+  _diffFilePath = file.path;
   $("diffTitle").textContent = file.rel;
   gitActiveRel = file.rel;
   gitListEl.querySelectorAll(".git-row.is-active").forEach((r) => r.classList.remove("is-active"));
@@ -3717,6 +4820,7 @@ function closeDiffView() {
   if (diffViewEl.hidden) return;
   diffViewEl.hidden = true;
   gitActiveRel = null;
+  _diffFilePath = null;
   gitListEl.querySelectorAll(".git-row.is-active").forEach((r) => r.classList.remove("is-active"));
   const m = diffEditor?.getModel();
   if (m) {
@@ -3753,14 +4857,30 @@ async function migrateFromLocalStorage() {
 }
 
 function loadConfig() {
-  return _cfgCache || {};
+  return _cfgCache || _DEFAULT_AI_CONFIG;
 }
+
+const _DEFAULT_AI_CONFIG = {
+  baseUrl: "https://api.deepseek.com/v1",
+  apiKey: "",
+  model: "deepseek-chat",
+};
 
 async function loadConfigAsync() {
   if (_cfgCache) return _cfgCache;
   await migrateFromLocalStorage();
   const store = await getStore();
-  _cfgCache = (await store.get(CFG_KEY)) || {};
+  const saved = (await store.get(CFG_KEY)) || {};
+  const hasValidConfig = saved.baseUrl && saved.apiKey && saved.model;
+  if (!hasValidConfig) {
+    _cfgCache = { ..._DEFAULT_AI_CONFIG };
+    try {
+      await store.set(CFG_KEY, _cfgCache);
+      await store.save();
+    } catch { /* store might not be ready in browser dev mode */ }
+  } else {
+    _cfgCache = saved;
+  }
   return _cfgCache;
 }
 
@@ -3794,6 +4914,13 @@ const MODEL_GROUPS = [
     ],
   },
   {
+    label: "DeepSeek",
+    models: [
+      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", meta: "Most capable" },
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", meta: "Fast" },
+    ],
+  },
+  {
     label: "Local",
     models: [
       { id: "llama3.1", name: "Llama 3.1", meta: "Ollama" },
@@ -3813,6 +4940,7 @@ function brandOf(id = "") {
   const s = id.toLowerCase();
   if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
   if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
+  if (s.includes("deepseek")) return { sym: "i-brand-deepseek", cls: "brand--deepseek" };
   if (s.includes("llama")) return { sym: "i-brand-meta", cls: "brand--meta" };
   if (s.includes("qwen")) return { sym: "i-brand-qwen", cls: "brand--qwen" };
   return { sym: "i-cpu", cls: "" };
@@ -3897,6 +5025,12 @@ async function selectModel(model) {
   const c = loadConfig();
   await saveConfig({ ...c, model });
   refreshModelBadge();
+  const session = _currentSession();
+  if (session) {
+    session.model = model;
+    _renderChatTabs();
+    saveChatHistory();
+  }
 }
 
 function openModelMenu() {
@@ -3921,17 +5055,138 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modelMenu.hidden) closeModelMenu();
 });
 
-const history = [];
+let _chatSessions = [];
+let _activeChatIdx = -1;
 let streaming = false;
-const CHAT_STORE_KEY = "michael-ide.chat-history";
+const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 
+function _currentSession() {
+  return _activeChatIdx >= 0 && _activeChatIdx < _chatSessions.length ? _chatSessions[_activeChatIdx] : null;
+}
+function _getHistory() {
+  const s = _currentSession();
+  return s ? s.history : [];
+}
+
+const history = new Proxy([], {
+  get(target, prop) {
+    const h = _getHistory();
+    if (prop === "push") return (...args) => h.push(...args);
+    if (prop === "length") return h.length;
+    if (prop === "slice") return (...args) => h.slice(...args);
+    if (prop === "filter") return (...args) => h.filter(...args);
+    if (prop === "map") return (...args) => h.map(...args);
+    if (prop === Symbol.iterator) return () => h[Symbol.iterator]();
+    return h[prop];
+  }
+});
+
+function _createChatSession(name, mode, model) {
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const container = document.createElement("div");
+  container.className = "chat-session-container";
+  return { id, name: name || `Chat ${_chatSessions.length + 1}`, mode: mode || _currentAiMode, model: model || null, history: [], container, created: Date.now() };
+}
+
+function _renderChatTabs() {
+  const tabBar = document.getElementById("chatTabBar");
+  if (!tabBar) return;
+  tabBar.innerHTML = "";
+  _chatSessions.forEach((s, i) => {
+    const tab = document.createElement("button");
+    const modeObj = _AI_MODES.find(m => m.id === s.mode);
+    const modeColor = modeObj?.color || "#3b82f6";
+    tab.className = "chat-tab" + (i === _activeChatIdx ? " is-active" : "");
+    tab.type = "button";
+    const modelTag = s.model ? `<span class="chat-tab__model">${modelLabel(s.model)}</span>` : "";
+    const modeTag = s.mode && s.mode !== "agent" ? `<span class="chat-tab__mode" style="color:${modeColor}">${modeObj?.label || s.mode}</span>` : "";
+    tab.innerHTML = `<span class="chat-tab__dot" style="background:${modeColor}"></span><span class="chat-tab__label"></span>${modeTag}${modelTag}<span class="chat-tab__x">&times;</span>`;
+    tab.querySelector(".chat-tab__label").textContent = s.name;
+    tab.addEventListener("click", (e) => {
+      if (e.target.closest(".chat-tab__x")) {
+        e.preventDefault();
+        e.stopPropagation();
+        _closeChatSession(i);
+      } else {
+        _switchChatSession(i);
+      }
+    });
+    tabBar.appendChild(tab);
+  });
+  const addBtn = document.createElement("button");
+  addBtn.className = "chat-tab chat-tab--add";
+  addBtn.type = "button";
+  addBtn.textContent = "+";
+  addBtn.title = "New Chat";
+  addBtn.addEventListener("click", () => _newChatSession());
+  tabBar.appendChild(addBtn);
+}
+
+function _switchChatSession(idx) {
+  if (idx === _activeChatIdx || idx < 0 || idx >= _chatSessions.length) return;
+  if (_activeChatIdx >= 0 && _chatSessions[_activeChatIdx]) {
+    _chatSessions[_activeChatIdx].container.hidden = true;
+    _chatSessions[_activeChatIdx].scrollPos = chatEl?.scrollTop || 0;
+    _chatSessions[_activeChatIdx].model = loadConfig().model;
+  }
+  _activeChatIdx = idx;
+  const session = _chatSessions[idx];
+  session.container.hidden = false;
+  _currentAiMode = session.mode;
+  _updateModeUI();
+  if (session.model) {
+    const c = loadConfig();
+    if (c.model !== session.model) {
+      saveConfig({ ...c, model: session.model });
+      refreshModelBadge();
+    }
+  }
+  _renderChatTabs();
+  if (chatEl) {
+    while (chatEl.firstChild) chatEl.removeChild(chatEl.firstChild);
+    chatEl.appendChild(session.container);
+    chatEl.scrollTop = session.scrollPos || 0;
+  }
+}
+
+function _newChatSession(name, mode) {
+  const session = _createChatSession(name, mode);
+  _chatSessions.push(session);
+  _switchChatSession(_chatSessions.length - 1);
+  saveChatHistory();
+  return session;
+}
+
+function _closeChatSession(idx) {
+  if (idx < 0 || idx >= _chatSessions.length) return;
+  _chatSessions.splice(idx, 1);
+  if (_chatSessions.length === 0) {
+    _newChatSession();
+    return;
+  }
+  if (_activeChatIdx >= _chatSessions.length) _activeChatIdx = _chatSessions.length - 1;
+  else if (_activeChatIdx === idx) _activeChatIdx = Math.min(idx, _chatSessions.length - 1);
+  _switchChatSession(_activeChatIdx);
+  saveChatHistory();
+}
+
+let _chatSavePending = false;
 async function saveChatHistory() {
-  if (!inTauri || history.length === 0) return;
+  if (!inTauri || _chatSessions.length === 0) return;
+  if (_chatSavePending) return;
+  _chatSavePending = true;
   try {
+    await new Promise(r => setTimeout(r, 500));
     const store = await loadStore("session.json");
-    await store.set(CHAT_STORE_KEY, history.slice(-50));
+    const data = _chatSessions.map(s => ({
+      id: s.id, name: s.name, mode: s.mode, model: s.model || null,
+      history: s.history.slice(-30),
+      created: s.created,
+    }));
+    await store.set(CHAT_STORE_KEY, { sessions: data, activeIdx: _activeChatIdx });
     await store.save();
   } catch (e) { console.warn("[chat] save failed:", e); }
+  _chatSavePending = false;
 }
 
 async function restoreChatHistory() {
@@ -3939,13 +5194,150 @@ async function restoreChatHistory() {
   try {
     const store = await loadStore("session.json");
     const saved = await store.get(CHAT_STORE_KEY);
-    if (!Array.isArray(saved) || saved.length === 0) return;
-    for (const m of saved) {
-      history.push(m);
-      addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
+
+    if (saved?.sessions && Array.isArray(saved.sessions)) {
+      for (const sData of saved.sessions) {
+        const session = _createChatSession(sData.name, sData.mode, sData.model);
+        session.id = sData.id || session.id;
+        session.created = sData.created || Date.now();
+        if (Array.isArray(sData.history)) {
+          for (const m of sData.history) {
+            session.history.push(m);
+          }
+        }
+        _chatSessions.push(session);
+      }
+      const activeIdx = saved.activeIdx ?? 0;
+      _switchChatSession(Math.min(activeIdx, _chatSessions.length - 1));
+
+      const session = _currentSession();
+      if (session) {
+        for (const m of session.history) {
+          addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
+        }
+      }
+    } else if (Array.isArray(saved) && saved.length > 0) {
+      const session = _newChatSession("Chat 1");
+      for (const m of saved) {
+        session.history.push(m);
+        addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
+      }
     }
   } catch (e) { console.warn("[chat] restore failed:", e); }
+
+  if (_chatSessions.length === 0) {
+    _newChatSession();
+  }
+  _renderChatTabs();
 }
+
+// ---- Multi-Window IPC (BroadcastChannel) ----
+const _WINDOW_ID = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+let _ipcChannel = null;
+const _ipcPeers = new Map();
+
+function _initIPC() {
+  if (typeof BroadcastChannel === "undefined") return;
+  _ipcChannel = new BroadcastChannel("michael-ide-ipc");
+  _ipcChannel.onmessage = (ev) => {
+    const msg = ev.data;
+    if (!msg || msg.from === _WINDOW_ID) return;
+    switch (msg.type) {
+      case "ping":
+        _ipcPeers.set(msg.from, { ts: Date.now(), workspace: msg.workspace });
+        _ipcChannel.postMessage({ type: "pong", from: _WINDOW_ID, workspace: rootPath || "" });
+        _updateIpcBadge();
+        break;
+      case "pong":
+        _ipcPeers.set(msg.from, { ts: Date.now(), workspace: msg.workspace });
+        _updateIpcBadge();
+        break;
+      case "file_changed":
+        if (msg.path && openFiles.has(msg.path)) {
+          showToast(`其他窗口修改了 ${msg.path.split("/").pop()}`);
+        }
+        break;
+      case "workspace_changed":
+        if (msg.roots && Array.isArray(msg.roots)) {
+          for (const r of msg.roots) {
+            if (r && !workspaceRoots.includes(r)) {
+              workspaceRoots.push(r);
+              backend.registerWorkspaceRoot(r).catch(() => {});
+            }
+          }
+          if (msg.active && !rootPath) {
+            setActiveWorkspaceRoot(msg.active);
+            renderWorkspaceRoots();
+            refreshGitStatus();
+            preloadProjectModels(msg.active);
+            startFileWatcher();
+          }
+        }
+        break;
+      case "workspace_request":
+        if (rootPath && workspaceRoots.length) {
+          _ipcChannel.postMessage({
+            type: "workspace_response",
+            from: _WINDOW_ID,
+            roots: [...workspaceRoots],
+            active: rootPath,
+            tabs: [...openFiles.keys()],
+          });
+        }
+        break;
+      case "workspace_response":
+        if (msg.roots && Array.isArray(msg.roots) && !rootPath) {
+          for (const r of msg.roots) {
+            if (r && !workspaceRoots.includes(r)) {
+              workspaceRoots.push(r);
+              backend.registerWorkspaceRoot(r).catch(() => {});
+            }
+          }
+          if (msg.active) {
+            setActiveWorkspaceRoot(msg.active);
+            renderWorkspaceRoots();
+            refreshGitStatus();
+            preloadProjectModels(msg.active);
+            startFileWatcher();
+          }
+        }
+        break;
+      case "agent_result":
+        if (msg.summary) showToast(`[窗口 ${msg.from.slice(0,4)}] ${msg.summary}`);
+        break;
+      case "git_status":
+        break;
+    }
+  };
+  _ipcChannel.postMessage({ type: "ping", from: _WINDOW_ID, workspace: rootPath || "" });
+  setTimeout(() => {
+    if (!rootPath) {
+      _ipcChannel.postMessage({ type: "workspace_request", from: _WINDOW_ID });
+    }
+  }, 500);
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, p] of _ipcPeers) {
+      if (now - p.ts > 15000) { _ipcPeers.delete(id); _updateIpcBadge(); }
+    }
+    if (_ipcChannel) _ipcChannel.postMessage({ type: "ping", from: _WINDOW_ID, workspace: rootPath || "" });
+  }, 10000);
+}
+
+function _ipcBroadcast(type, data = {}) {
+  if (!_ipcChannel) return;
+  _ipcChannel.postMessage({ type, from: _WINDOW_ID, ...data });
+}
+
+function _updateIpcBadge() {
+  const badge = document.getElementById("ipcPeerCount");
+  if (!badge) return;
+  const count = _ipcPeers.size;
+  badge.textContent = count > 0 ? count.toString() : "";
+  badge.style.display = count > 0 ? "inline-flex" : "none";
+}
+
+_initIPC();
 
 // Syntax-highlight code-card bodies by reusing Monaco's tokenizer (matches the
 // editor theme, no extra dependency). Returns null on failure so the card keeps
@@ -3963,6 +5355,8 @@ function addMessage(role, text) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   let body;
+  const session = _currentSession();
+  const target = session ? session.container : chatEl;
   if (role === "assistant") {
     const id = currentModel();
     const avatar = document.createElement("div");
@@ -3974,26 +5368,45 @@ function addMessage(role, text) {
     main.querySelector(".msg__who span").textContent = id ? modelLabel(id) : t("assistant.name");
     wrap.append(avatar, main);
     body = main.querySelector(".msg__body");
-    if (text) renderMarkdownInto(body, text, { highlighter: highlightCode });
+    if (text) {
+      const hasToolMarkers = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]|^📄\s|^📎\s/m.test(text);
+      const hasMultiCodeBlocks = (text.match(/```/g) || []).length >= 4;
+      if (hasToolMarkers || hasMultiCodeBlocks) {
+        const segs = _parseStreamSegments(text);
+        for (let si = 0; si < segs.length; si++) {
+          _renderAgentSegStatic(body, segs[si], segs, si);
+        }
+      } else {
+        renderMarkdownInto(body, text, { highlighter: highlightCode });
+      }
+    }
   } else {
     wrap.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
     wrap.querySelector(".msg__who span").textContent = t("assistant.you");
     body = wrap.querySelector(".msg__body");
-    body.textContent = text;
+    const cleanText = (text || "").replace(/\n\n\[用户附加了 \d+ 张图片\][\s\S]*$/, "").trim();
+    if (cleanText) body.textContent = cleanText;
+    if (typeof _pastedImages !== 'undefined') {
+      const images = wrap._attachedImages || [];
+      for (const img of images) {
+        const imgEl = document.createElement("img");
+        imgEl.src = img.dataUrl;
+        imgEl.className = "msg__attached-image";
+        imgEl.alt = img.name || "Attached image";
+        body.appendChild(imgEl);
+      }
+    }
   }
-  chatEl.appendChild(wrap);
+  target.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
   return body;
 }
 
-// Devin-style "thinking" card shown while the first token is pending.
 function thinkingCard() {
-  const t = document.createElement("div");
-  t.className = "thinking";
-  t.innerHTML =
-    `<span class="thinking__orb thinking__orb--logo"><img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" /></span>` +
-    `<span class="thinking__text">${t("assistant.thinking")}</span>`;
-  return t;
+  const el = document.createElement("div");
+  el.className = "thinking";
+  el.innerHTML = `<div class="thinking-spinner"></div><span class="thinking__text">${t("assistant.thinking")}</span><span class="thinking-dots"><span></span><span></span><span></span></span>`;
+  return el;
 }
 
 function showChatHint() {
@@ -4023,7 +5436,346 @@ function showChatHint() {
   chatEl.appendChild(hint);
 }
 
-async function sendPrompt(text) {
+// ---- AI Mode System (Agent / Chat / Plan) ----
+let _currentAiMode = "agent";
+
+const _AI_MODE_PROMPTS = {
+  agent: `你是 Michael IDE 的 AI 编程智能体，能像资深工程师一样自主完成编码任务。你拥有读文件、搜索、按名查找、精确编辑、写文件、运行命令的完整工具。用中文回复。
+
+# 工作方式（每个任务都遵循）
+1. 先理解再动手——先用 search / find_files / list_dir / read_file 摸清相关代码，再改。绝不修改没读过的文件，也不要凭空猜测代码内容或路径。
+2. 规划——多步任务先用 update_plan 列出分步计划，开工后每完成一步就更新对应状态（pending/in_progress/completed），让用户随时看到进度。简单任务（一两步）不必用。
+3. 自主推进——需要改代码就直接调用工具改，不要只描述方案。一个任务里连续调用工具，直到真正做完，而不是停在"建议你可以…"。
+4. 自我验证——改完尽量用 run_cmd 跑测试/构建/类型检查（如 cargo check、npm run build、go build、pytest）。失败就读报错→定位→修复→再验证，循环到通过为止。
+5. 收尾——完成后用 1-3 句话总结：改了什么、为什么、怎么验证的。
+
+# 编辑规则
+- 改已有文件**优先用 edit_file**（精确替换片段）；不要用 write_file 整文件重写——重写易丢内容、易出错。
+- edit_file 的 old_string 必须带足够上下文，能在文件里唯一定位那段；要改多处相同文本时设 replace_all=true。
+- write_file 只用于新建文件或彻底重写。
+- 最小改动——只做任务要求的改动。不顺手重构、不加未要求的功能/注释/错误处理、不为假想需求做抽象。bug 修复不必清理周围代码。
+
+# 路径与安全
+- 路径用相对工作区根目录的相对路径（如 src/main.go）或完整绝对路径，不要用截断路径（如 /Users/m）。
+- 所有文件操作必须在工作区目录内；禁止访问 /Users、/etc、/var、/System 等工作区外目录。
+- 破坏性命令（rm -rf /、dd、mkfs、磁盘格式化）一律禁止；不扫描整个文件系统（find /、ls /Users、tree /）；一次最多并发 3 条命令，不重复执行刚跑过的命令。
+
+# 操作系统
+严格按上下文里的 OS 信息选命令（上下文第一行就有）：
+- macOS(zsh)：brew/open/launchctl/lsof/killall/pbcopy；禁用 type/dir/findstr/timeout/systemctl
+- Linux(bash)：apt/systemctl/xdg-open/journalctl
+- Windows(PowerShell)：Start-Process/Get-Process
+
+# 工具
+- read_file(path)：读文件内容
+- list_dir(path)：列目录
+- search(query, path?)：在项目里搜索文本/符号（找用法、定义、引用）
+- find_files(pattern)：按文件名/glob 找文件（如 *.rs、main.js）
+- web_fetch(url)：抓取公网网页正文，查在线文档/API/报错（仅 http/https 公网）
+- update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
+- run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
+- edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
+- write_file(path, content)：新建或整文件重写
+- run_cmd(command)：运行 shell 命令（装依赖、跑测试、构建等）
+
+# 输出风格
+直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
+**工具调用会由系统自动显示成卡片**：不要在回复正文里用 \`read_file 路径\`、\`run_cmd 命令\`、\`list_dir\` 等复述你正在调用的工具，也不要用 \`<file_content>\`/\`<item>\` 标签把读到的文件内容或目录再抄一遍。直接调用工具即可；回复正文只写给用户看的结论、解释和下一步。`,
+
+  chat: `你是 Michael IDE 的聊天助手。
+- 只回答问题，不主动修改文件
+- 解释代码、回答编程问题、提供建议
+- 用简洁中文回复
+- 代码用 fenced code blocks`,
+
+  plan: `你是 Michael IDE 的规划助手。你的职责是：
+- 分析代码架构和项目结构
+- 制定实现方案和步骤
+- 评估技术方案的优劣
+- 识别潜在风险和依赖
+
+请输出结构化的实现计划，包含：
+1. 目标分析
+2. 方案设计（列出多个方案对比）
+3. 实施步骤（按优先级排序）
+4. 风险评估
+5. 预估工作量
+
+只做规划分析，不直接修改文件。用中文回复。`,
+
+  explorer: `你是 Michael IDE 的代码探索者，只读分析智能体。你能读文件、列目录、搜索代码、按名查找文件，但绝对不能修改任何文件或运行有副作用的命令。用中文回复。
+
+# 方法
+1. 用 search 搜关键字/符号、find_files 定位文件、list_dir 看结构、read_file 读细节。
+2. 主动多轮检索——顺着 import / 调用 / 定义层层追下去，直到把问题搞清楚，而不是只看一个文件就下结论。
+3. 每个论点都用文件名+行号支撑。
+
+# 工具（只读）
+- read_file(path)：读文件
+- list_dir(path)：列目录
+- search(query, path?)：搜索文本/符号
+- find_files(pattern)：按文件名/glob 找文件
+
+# 输出
+- 先给结论，再展开分析。
+- 调用链 / 模块关系用列表或 ASCII 图展示。
+- 只分析和建议，不修改文件、不运行有副作用的命令。`,
+
+  reviewer: `你是 Michael IDE 的代码审查员。你仔细读代码，找出 bug、安全隐患、性能问题和可维护性问题。你能读文件、列目录、搜索、按名查找文件，但不修改文件。用中文回复。
+
+# 先调查再评审
+用 search / find_files / read_file 把相关代码**和它的调用方**读全，再下判断——不要只凭片段臆测。
+
+# 审查维度
+1. **正确性** — 逻辑、边界条件、错误处理、并发
+2. **安全性** — 注入(SQL/命令/XSS)、鉴权、硬编码密钥、路径穿越
+3. **性能** — N+1、无谓拷贝/分配、复杂度
+4. **可维护性** — 命名、重复、过度复杂、测试覆盖
+
+# 工具（只读）
+- read_file(path) / list_dir(path) / search(query, path?) / find_files(pattern)
+
+# 每条发现的格式
+- 📍 位置（文件:行号）
+- 🔴/🟡/🟢 严重度（高/中/低）
+- 📝 问题描述
+- ✅ 建议修复
+
+只评审，不改文件、不运行有副作用的命令。`,
+};
+
+const _AI_MODES = [
+  { id: "agent", label: "Agent", desc: "AI 可读写文件、运行命令", color: "#3b82f6", icon: `<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>` },
+  { id: "chat", label: "Chat", desc: "对话问答，不修改文件", color: "#8b5cf6", icon: `<rect x="2" y="3" width="12" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 13l2-2h5" fill="none" stroke="currentColor" stroke-width="1.3"/>` },
+  { id: "plan", label: "Plan", desc: "分析规划，输出实施方案", color: "#f59e0b", icon: `<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h6M5 8h4M5 11h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` },
+  { id: "explorer", label: "Explorer", desc: "只读代码探索，深度分析", color: "#10b981", icon: `<circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10 10l4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>` },
+  { id: "reviewer", label: "Reviewer", desc: "代码审查，发现问题", color: "#ef4444", icon: `<path d="M8 2l6 10H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6v3M8 10.5v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>` },
+];
+
+function _updateModeUI() {
+  const mode = _AI_MODES.find(m => m.id === _currentAiMode) || _AI_MODES[0];
+  $("modeLabel").textContent = mode.label;
+  $("modeIcon").innerHTML = mode.icon;
+}
+
+function _toggleModeMenu() {
+  const menu = $("modeMenu");
+  if (!menu.hidden) { menu.hidden = true; return; }
+  menu.innerHTML = "";
+  for (const mode of _AI_MODES) {
+    const item = document.createElement("button");
+    item.className = "mode-menu__item" + (mode.id === _currentAiMode ? " is-active" : "");
+    item.innerHTML = `<svg class="ic" viewBox="0 0 16 16">${mode.icon}</svg><div class="mode-menu__info"><div class="mode-menu__name">${mode.label}</div><div class="mode-menu__desc">${mode.desc}</div></div>`;
+    item.addEventListener("click", () => {
+      _currentAiMode = mode.id;
+      _updateModeUI();
+      menu.hidden = true;
+      const session = _currentSession();
+      if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
+      showToast(`已切换到 ${mode.label} 模式`);
+    });
+    menu.appendChild(item);
+  }
+  menu.hidden = false;
+  const dismiss = (e) => { if (!$("modePicker").contains(e.target)) { menu.hidden = true; document.removeEventListener("click", dismiss); } };
+  setTimeout(() => document.addEventListener("click", dismiss), 50);
+}
+
+$("modePickerBtn")?.addEventListener("click", _toggleModeMenu);
+_updateModeUI();
+
+let _agentContextCache = { root: "", ts: 0, data: "" };
+
+function _estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(text.length / 3.5);
+}
+
+function _compactHistoryIfNeeded() {
+  const h = _getHistory();
+  if (!h || h.length === 0) return;
+
+  const MAX_HISTORY_TOKENS = 24000;
+  const MAX_MESSAGES = 40;
+  const KEEP_RECENT = 8;
+
+  let totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
+
+  if (h.length <= MAX_MESSAGES && totalTokens <= MAX_HISTORY_TOKENS) return;
+
+  for (let i = 0; i < h.length - KEEP_RECENT; i++) {
+    const m = h[i];
+    if (m.role === "assistant" && m.content.length > 2000) {
+      const toolResultPattern = /\[TOOL:(read_file|list_dir)\][^\n]*\n([\s\S]*?)(?=\[TOOL:|```|$)/g;
+      let compressed = m.content;
+      compressed = compressed.replace(toolResultPattern, (match, tool, content) => {
+        if (content.length > 500) {
+          const preview = content.trim().split("\n").slice(0, 5).join("\n");
+          return `[TOOL:${tool}] (${content.length} chars read)\n${preview}\n...\n`;
+        }
+        return match;
+      });
+      const codeBlockPattern = /```[\w]*\n([\s\S]*?)```/g;
+      compressed = compressed.replace(codeBlockPattern, (match, code) => {
+        if (code.length > 800) {
+          const lines = code.trim().split("\n");
+          const preview = lines.slice(0, 8).join("\n");
+          return "```\n" + preview + `\n... (${lines.length} lines total)\n` + "```";
+        }
+        return match;
+      });
+      if (compressed.length < m.content.length * 0.7) {
+        h[i] = { ...m, content: compressed };
+      }
+    }
+  }
+
+  totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
+
+  if (h.length > MAX_MESSAGES) {
+    const excess = h.length - MAX_MESSAGES;
+    const removed = h.splice(0, excess);
+    const summaryParts = removed.filter(m => m.role === "user").map(m => m.content.slice(0, 100));
+    if (summaryParts.length > 0) {
+      h.unshift({ role: "user", content: `[之前的对话摘要：讨论了 ${summaryParts.join("、")}]` });
+      h.unshift({ role: "assistant", content: "[已压缩之前的对话内容以节省空间]" });
+    }
+  }
+
+  while (totalTokens > MAX_HISTORY_TOKENS && h.length > KEEP_RECENT + 2) {
+    h.splice(0, 2);
+    totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
+  }
+
+  console.log(`[compact] history: ${h.length} msgs, ~${totalTokens} tokens`);
+}
+
+function _detectOS() {
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  if (/Mac|Darwin/i.test(platform) || /Mac OS X/i.test(ua)) return "macOS";
+  if (/Win/i.test(platform)) return "Windows";
+  if (/Linux/i.test(platform)) return "Linux";
+  return "Unknown";
+}
+
+let _osDetailCache = null;
+async function _detectOSDetail() {
+  if (_osDetailCache) return _osDetailCache;
+  const os = _detectOS();
+  const detail = { os, shell: "unknown", arch: "unknown", version: "" };
+
+  if (os === "macOS") {
+    detail.shell = "zsh";
+    detail.arch = navigator.userAgent.includes("ARM64") || navigator.platform === "MacIntel" ? "arm64 (Apple Silicon)" : "x86_64";
+    try {
+      const r = await backend.taskRunCapture("/tmp", "sw_vers -productVersion 2>/dev/null");
+      if (r?.stdout?.trim()) detail.version = r.stdout.trim();
+    } catch {}
+  } else if (os === "Linux") {
+    detail.shell = "bash";
+    try {
+      const r = await backend.taskRunCapture("/tmp", "uname -m 2>/dev/null");
+      if (r?.stdout?.trim()) detail.arch = r.stdout.trim();
+    } catch {}
+  } else if (os === "Windows") {
+    detail.shell = "PowerShell";
+    detail.arch = "x86_64";
+  }
+
+  _osDetailCache = detail;
+  return detail;
+}
+
+async function _gatherAgentContext() {
+  const root = rootPath || workspaceRoots[0];
+  const osDetail = await _detectOSDetail();
+  console.log("[agent-ctx] rootPath:", rootPath, "workspaceRoots:", workspaceRoots, "using:", root);
+
+  const osBlock = `操作系统: ${osDetail.os} ${osDetail.version} (${osDetail.arch})\nShell: ${osDetail.shell}`;
+
+  if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)`;
+  if (_agentContextCache.root === root && Date.now() - _agentContextCache.ts < 15000) return _agentContextCache.data;
+
+  const parts = [osBlock, `当前工作区: ${root}`];
+
+  // Pick up project-specific agent instructions the way Claude Code reads
+  // CLAUDE.md and Codex reads AGENTS.md — first match wins.
+  for (const guide of ["AGENTS.md", "CLAUDE.md", ".cursorrules", ".github/copilot-instructions.md"]) {
+    try {
+      const txt = await backend.readTextFile(root + "/" + guide);
+      if (txt && txt.trim()) { parts.push(`\n--- 项目约定 (${guide}，请遵守) ---\n${txt.slice(0, 4000)}`); break; }
+    } catch { /* not present */ }
+  }
+
+  const treeDom = document.querySelectorAll("#tree .row");
+  if (treeDom.length > 0) {
+    parts.push("\n项目结构:");
+    const treeLines = [];
+    treeDom.forEach(row => {
+      const name = row.querySelector(".name")?.textContent || row.textContent?.trim() || "";
+      const isDir = row.classList.contains("is-dir");
+      if (name && treeLines.length < 100) treeLines.push(`${isDir ? "📁" : "  "} ${name}`);
+    });
+    parts.push(treeLines.join("\n"));
+  } else {
+    try {
+      const treeCmd = osDetail.os === "Windows"
+        ? "dir /b"
+        : "find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -path '*/__pycache__/*' -not -path '*/.venv/*' -not -path '*/target/*' -not -name '.DS_Store' 2>/dev/null | head -100 | sort";
+      const treeResult = await backend.taskRunCapture(root, treeCmd);
+      if (treeResult?.stdout?.trim()) {
+        parts.push("\n项目结构:");
+        parts.push(treeResult.stdout.trim());
+      }
+    } catch {}
+  }
+
+  if (activePath && openFiles.has(activePath)) {
+    const f = openFiles.get(activePath);
+    if (f?.model) {
+      const content = f.model.getValue();
+      parts.push(`\n--- ${activePath.split("/").pop()} (当前编辑中) ---\n${content.slice(0, 4000)}`);
+    }
+  }
+
+  const recentEdits = [];
+  for (const [path, file] of openFiles) {
+    if (path === activePath) continue;
+    if (file?.model && file.dirty) {
+      recentEdits.push({ path, content: file.model.getValue() });
+    }
+  }
+  if (recentEdits.length > 0) {
+    const maxRecent = 3;
+    for (const edit of recentEdits.slice(0, maxRecent)) {
+      const name = edit.path.split("/").pop();
+      parts.push(`\n--- ${name} (已修改未保存) ---\n${edit.content.slice(0, 2000)}`);
+    }
+  }
+
+  const keyFiles = ["package.json", "README.md", "Cargo.toml", "pyproject.toml", "go.mod", "Makefile"];
+  const keyReads = keyFiles.map(name =>
+    backend.readTextFile(root + "/" + name).catch(() => null).then(c => c?.trim() ? [name, c] : null)
+  );
+  const results = await Promise.all(keyReads);
+  for (const r of results) {
+    if (r) parts.push(`\n--- ${r[0]} ---\n${r[1].slice(0, 2000)}`);
+  }
+
+  let ctx = parts.join("\n");
+  const CTX_TOKEN_BUDGET = 14000;
+  const ctxTokens = _estimateTokens(ctx);
+  if (ctxTokens > CTX_TOKEN_BUDGET) {
+    const ratio = CTX_TOKEN_BUDGET / ctxTokens;
+    const maxLen = Math.floor(ctx.length * ratio);
+    ctx = ctx.slice(0, maxLen) + "\n...(context truncated to fit " + CTX_TOKEN_BUDGET + " token budget)";
+  }
+  _agentContextCache = { root, ts: Date.now(), data: ctx };
+  return ctx;
+}
+
+async function sendPrompt(text, attachedImages = []) {
   const config = loadConfig();
   if (!config.baseUrl || !config.apiKey || !config.model) {
     openSettings();
@@ -4031,60 +5783,297 @@ async function sendPrompt(text) {
     return;
   }
   if (streaming) return;
+  _setSendBtnStop(true);
   chatEl.querySelector(".chat-empty")?.remove();
 
-  addMessage("user", text);
+  const userBody = addMessage("user", text);
+  if (attachedImages.length > 0 && userBody) {
+    for (const img of attachedImages) {
+      const imgEl = document.createElement("img");
+      imgEl.src = img.dataUrl;
+      imgEl.className = "msg__attached-image";
+      imgEl.alt = img.name || "Attached image";
+      userBody.appendChild(imgEl);
+    }
+  }
 
-  // Build the request: system prompt, optional file context, history, prompt.
-  const messages = [
-    { role: "system", content: "You are Michael IDE's coding assistant. Be concise and precise. Use fenced code blocks for code." },
-  ];
+  const sysPrompt = _AI_MODE_PROMPTS[_currentAiMode] || _AI_MODE_PROMPTS.agent;
+
+  const osDetail = await _detectOSDetail();
+  let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
+  if (_currentAiMode === "agent" || _currentAiMode === "explorer" || _currentAiMode === "reviewer") {
+    if (rootPath || workspaceRoots.length) {
+      contextBlock += "\n" + await _gatherAgentContext();
+    } else {
+      contextBlock += "\n(未打开工作区文件夹)";
+    }
+  }
   if (activePath) {
     const f = openFiles.get(activePath);
-    const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
-    const selected = sel && !sel.isEmpty() ? f.model.getValueInRange(sel) : "";
-    let ctx = `Open file: ${activePath}\n\n\`\`\`\n${f.model.getValue().slice(0, 12000)}\n\`\`\``;
-    if (selected) ctx += `\n\nSelected text:\n\`\`\`\n${selected.slice(0, 4000)}\n\`\`\``;
-    messages.push({ role: "user", content: ctx });
+    if (f?.model) {
+      const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
+      const selected = sel && !sel.isEmpty() ? f.model.getValueInRange(sel) : "";
+      contextBlock += `\n\n当前打开文件: ${activePath}\n\`\`\`\n${f.model.getValue().slice(0, 12000)}\n\`\`\``;
+      if (selected) contextBlock += `\n\n选中的代码:\n\`\`\`\n${selected.slice(0, 4000)}\n\`\`\``;
+    }
   }
+
+  const fullPrompt = sysPrompt + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
+
+  _compactHistoryIfNeeded();
+
+  const messages = [{ role: "system", content: fullPrompt }];
   for (const m of history) messages.push(m);
-  messages.push({ role: "user", content: text });
+  // When images are attached, send a multimodal content array so vision models
+  // actually see them. History keeps only the text (image data URLs would bloat
+  // every subsequent request).
+  const userContent = attachedImages.length > 0
+    ? [{ type: "text", text }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
+    : text;
+  messages.push({ role: "user", content: userContent });
   history.push({ role: "user", content: text });
+
+  const isAgent = _currentAiMode === "agent";
+  const isExplorer = _currentAiMode === "explorer";
+  const isReviewer = _currentAiMode === "reviewer";
+  const hasToolAccess = isAgent || isExplorer || isReviewer;
+
+  // Tool-capable modes (agent / explorer / reviewer) run the real multi-turn
+  // agentic loop: think → call tools → feed results back → repeat until the
+  // model stops calling tools (task done) or we hit the iteration cap. Plain
+  // chat / plan modes keep the original single-shot streaming path below.
+  if (hasToolAccess) {
+    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "" });
+    return;
+  }
 
   const body = addMessage("assistant", "");
   body.appendChild(thinkingCard());
   let acc = "";
   let err = null;
   let raf = 0;
+  let lastFlush = 0;
+
+  const _toolSchemas = hasToolAccess ? [
+    { type: "function", function: { name: "read_file", description: "Read file content", parameters: { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] } } },
+    { type: "function", function: { name: "list_dir", description: "List directory contents", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path" } }, required: ["path"] } } },
+    ...(isAgent ? [
+      { type: "function", function: { name: "write_file", description: "Write content to file", parameters: { type: "object", properties: { path: { type: "string", description: "File path" }, content: { type: "string", description: "File content" } }, required: ["path", "content"] } } },
+      { type: "function", function: { name: "run_cmd", description: "Run shell command", parameters: { type: "object", properties: { command: { type: "string", description: "Shell command" } }, required: ["command"] } } },
+    ] : []),
+  ] : [];
+  let _segRendered = 0;
+  let _streamEl = null;
+  const _agentRoot = rootPath || workspaceRoots[0] || "";
+  const _toolPromises = [];
+  const _trackedFiles = new Map();
+  let _filesBar = null;
+  let _filesList = null;
+
+  if (hasToolAccess) {
+    _filesBar = document.createElement("div");
+    _filesBar.className = "agent-files-bar";
+    _filesBar.innerHTML =
+      `<svg class="agent-files-bar__chev" viewBox="0 0 12 12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+      `<svg class="agent-files-bar__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>` +
+      `<span class="agent-files-bar__count">0 Files</span>` +
+      `<div class="agent-files-bar__actions">` +
+      `<button class="agent-files-bar__btn agent-files-bar__btn--stop" type="button">Stop<span class="agent-files-bar__shortcut">^C</span></button>` +
+      `<button class="agent-files-bar__btn agent-files-bar__btn--review" type="button">Review</button>` +
+      `</div>`;
+    _filesBar.addEventListener("click", (e) => {
+      if (e.target.closest(".agent-files-bar__btn")) return;
+      _filesBar.classList.toggle("is-open");
+    });
+    _filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
+      e.stopPropagation();
+      streaming = false;
+      _setSendBtnStop(false);
+      showToast("Agent stopped");
+    });
+    _filesBar.querySelector(".agent-files-bar__btn--review").addEventListener("click", (e) => {
+      e.stopPropagation();
+      body.querySelectorAll(".agent-tool-step--write:not(.agent-tool-step--accepted):not(.agent-tool-step--rejected)").forEach(s => s.classList.add("is-open"));
+      _filesBar.classList.add("is-open");
+    });
+    _filesList = document.createElement("ul");
+    _filesList.className = "agent-files-list";
+    body.parentElement.insertBefore(_filesBar, body);
+    body.parentElement.insertBefore(_filesList, body);
+    _filesBar.style.display = "none";
+  }
+
   const flushStream = () => {
     raf = 0;
-    renderMarkdownInto(body, acc, { streaming: true });
+    const now = Date.now();
+    if (now - lastFlush < 32) return;
+    lastFlush = now;
+    body.querySelector(".thinking")?.remove();
+
+    if (hasToolAccess) {
+      const segs = _parseStreamSegments(acc);
+      const completeEnd = segs.length > 0 && !segs[segs.length - 1].complete ? segs.length - 1 : segs.length;
+      while (_segRendered < completeEnd) {
+        if (_streamEl) { _streamEl.remove(); _streamEl = null; }
+        const seg = segs[_segRendered];
+        _renderAgentSeg(body, seg, segs, _segRendered, _agentRoot, _toolPromises);
+        if (seg.type === "code" || seg.type === "write") {
+          const fn = _extractSegFileName(seg, segs, _segRendered);
+          if (fn && !_trackedFiles.has(fn)) {
+            _trackedFiles.set(fn, seg.type);
+            _updateFilesBar(_filesBar, _filesList, _trackedFiles);
+          }
+        } else if (seg.type === "cmd") {
+          const key = "$ " + (seg.command || "").slice(0, 40);
+          if (!_trackedFiles.has(key)) {
+            _trackedFiles.set(key, "cmd");
+            _updateFilesBar(_filesBar, _filesList, _trackedFiles);
+          }
+        } else if (seg.type === "read" || seg.type === "list") {
+          const fn = seg.path;
+          if (fn && !_trackedFiles.has(fn)) {
+            _trackedFiles.set(fn, seg.type);
+            _updateFilesBar(_filesBar, _filesList, _trackedFiles);
+          }
+        }
+        _segRendered++;
+      }
+      const tail = completeEnd < segs.length ? segs[segs.length - 1] : null;
+      if (tail) {
+        if (!_streamEl) { _streamEl = document.createElement("div"); _streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(_streamEl); }
+        if (tail.type === "text") {
+          const clean = _cleanAgentText(tail.content);
+          if (clean) renderMarkdownInto(_streamEl, clean, { streaming: true });
+        } else if (tail.type === "code" && !tail.complete) {
+          const lineCount = tail.content.split("\n").length;
+          const langDisplay = tail.lang ? langLabel(tail.lang) : 'Code';
+          const monoId = tail.lang ? monacoLang(tail.lang) : 'plaintext';
+          const guessedName = _extractSegFileName(tail, segs, segs.length - 1);
+          const headerLabel = guessedName || langDisplay;
+
+          let existingCard = _streamEl.querySelector(".code-card--streaming");
+          if (!existingCard) {
+            _streamEl.innerHTML = '';
+            existingCard = document.createElement("div");
+            existingCard.className = "code-card code-card--streaming";
+            const head = document.createElement("div");
+            head.className = "code-card__head";
+            head.innerHTML = `<span class="code-card__lang"><svg class="ic"><use href="#i-code"/></svg><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="atc-spin"></span><span class="code-card__linecount"></span></span>`;
+            existingCard.appendChild(head);
+            const pre = document.createElement("pre");
+            pre.className = "code-card__body";
+            const codeEl = document.createElement("code");
+            pre.appendChild(codeEl);
+            existingCard.appendChild(pre);
+            _streamEl.appendChild(existingCard);
+          }
+
+          const labelEl = existingCard.querySelector(".code-card__label");
+          if (labelEl && labelEl.textContent !== headerLabel) labelEl.textContent = headerLabel;
+          const countEl = existingCard.querySelector(".code-card__linecount");
+          if (countEl) countEl.textContent = `${lineCount} lines`;
+
+          const codeEl = existingCard.querySelector("code");
+          if (codeEl && codeEl._lastLen !== tail.content.length) {
+            codeEl.textContent = tail.content;
+            codeEl._lastLen = tail.content.length;
+            if (monoId !== 'plaintext' && tail.content.trim() && !codeEl._hlPending) {
+              codeEl._hlPending = true;
+              const snapLen = tail.content.length;
+              monaco.editor.colorize(tail.content, monoId, { tabSize: 2 })
+                .then(html => { if (html && codeEl._lastLen === snapLen) codeEl.innerHTML = html.replace(/<br\/?>\s*$/, ""); })
+                .catch(() => {})
+                .finally(() => { codeEl._hlPending = false; });
+            }
+          }
+
+          const preEl = existingCard.querySelector("pre");
+          if (preEl) preEl.scrollTop = preEl.scrollHeight;
+        }
+      }
+    } else {
+      const prevLen = body._lastLen || 0;
+      if (acc.length - prevLen < 20 && !acc.includes("```") && prevLen > 0) {
+        const tail = acc.slice(prevLen);
+        if (tail && body.lastChild && body.lastChild.nodeType === 3) {
+          body.lastChild.textContent += tail;
+        } else if (tail) {
+          renderMarkdownInto(body, acc, { streaming: true });
+        }
+      } else {
+        renderMarkdownInto(body, acc, { streaming: true });
+      }
+      body._lastLen = acc.length;
+    }
     chatEl.scrollTop = chatEl.scrollHeight;
   };
-  const scheduleStream = () => {
-    if (!raf) raf = requestAnimationFrame(flushStream);
-  };
+  const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
   streaming = true;
+  const _pendingToolCalls = [];
+  let _toolArgBuf = {};
   try {
-    await backend.aiChat(config, messages, (ev) => {
-      if (ev.kind === "token") {
-        acc += ev.delta;
-        scheduleStream();
-      } else if (ev.kind === "error") {
-        err = ev.message;
+    const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
+    const chatFn = useTools
+      ? (cb) => backend.aiChatWithTools(config, messages, _toolSchemas, cb)
+      : (cb) => backend.aiChat(config, messages, cb);
+    await chatFn((ev) => {
+      if (ev.kind === "token") { acc += ev.delta; scheduleStream(); }
+      else if (ev.kind === "toolCall") {
+        const { id, name, arguments: args } = ev;
+        if (name) { _toolArgBuf[id || "_"] = { name, args: args || "" }; }
+        else if (id && _toolArgBuf[id]) { _toolArgBuf[id].args += args; }
+        else if (_toolArgBuf["_"]) { _toolArgBuf["_"].args += args; }
+        const entry = _toolArgBuf[id] || _toolArgBuf["_"];
+        if (entry && entry.args) {
+          try {
+            const parsed = JSON.parse(entry.args);
+            const toolName = entry.name;
+            let call;
+            if (toolName === "read_file") call = { type: "read", path: parsed.path };
+            else if (toolName === "list_dir") call = { type: "list", path: parsed.path };
+            else if (toolName === "run_cmd") call = { type: "cmd", command: parsed.command };
+            else if (toolName === "write_file") call = { type: "write", path: parsed.path, content: parsed.content };
+            if (call) {
+              body.querySelector(".thinking")?.remove();
+              if (_streamEl) { _streamEl.remove(); _streamEl = null; }
+              if (acc.trim()) { renderMarkdownInto(body, acc.trim(), { streaming: false }); acc = ""; }
+              const step = _createToolStep(call);
+              body.appendChild(step);
+              const p = _executeToolStep(step, call, _agentRoot);
+              p.then(r => { if (r) p._result = r; });
+              _toolPromises.push(p);
+              _pendingToolCalls.push(call);
+              chatEl.scrollTop = chatEl.scrollHeight;
+              delete _toolArgBuf[id || "_"];
+            }
+          } catch { /* JSON not complete yet, keep buffering */ }
+        }
       }
+      else if (ev.kind === "error") { err = ev.message; }
     });
-  } catch (e) {
-    if (!err) err = String(e);
-  } finally {
+  } catch (e) { if (!err) err = String(e); }
+  finally {
     if (raf) cancelAnimationFrame(raf);
     streaming = false;
+    _setSendBtnStop(false);
     body.querySelector(".thinking")?.remove();
+    if (_streamEl) { _streamEl.remove(); _streamEl = null; }
     if (acc) {
-      renderMarkdownInto(body, acc, { highlighter: highlightCode });
-      // Don't push a truncated/errored reply into history — it would feed
-      // incomplete context into later requests.
-      if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
+      if (hasToolAccess) {
+        const segs = _parseStreamSegments(acc);
+        while (_segRendered < segs.length) {
+          _renderAgentSeg(body, segs[_segRendered], segs, _segRendered, _agentRoot, _toolPromises);
+          _segRendered++;
+        }
+        const historyContent = acc + (_pendingToolCalls.length ? "\n" + _pendingToolCalls.map(c => `[TOOL:${c.type === "read" ? "read_file" : c.type === "list" ? "list_dir" : c.type === "cmd" ? "run_cmd" : "write_file"}] ${c.path || c.command || ""}`).join("\n") : "");
+        if (!err && historyContent.trim()) { history.push({ role: "assistant", content: historyContent }); saveChatHistory(); }
+        await Promise.allSettled(_toolPromises);
+        const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
+        if (readResults.length) _agentFollowUp(readResults, body);
+      } else {
+        renderMarkdownInto(body, acc, { highlighter: highlightCode });
+        if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
+      }
     }
     if (err) {
       const note = document.createElement("div");
@@ -4092,23 +6081,1713 @@ async function sendPrompt(text) {
       note.textContent = "⚠️ " + err;
       body.appendChild(note);
     }
+    if (_filesBar) {
+      const stopBtn = _filesBar.querySelector(".agent-files-bar__btn--stop");
+      if (stopBtn) stopBtn.style.display = "none";
+      _updateFilesBar(_filesBar, _filesList, _trackedFiles);
+    }
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 }
 
+let _termLock = Promise.resolve();
+let _termOpened = false;
+const _DANGEROUS_CMDS = /\bls\s+-[a-zA-Z]*R[a-zA-Z]*\s+\/\s*$|\brm\s+-rf\s+\/\s*$|\bdd\s+if=|\bmkfs\b|\bformat\s+[cCdD]:/;
+const _BROAD_SCAN_CMDS = /\bfind\s+\/(?!tmp|var\/log)\b|\bfind\s+~|\bls\s+\/(?:Users|home|etc|var|usr|opt|System|Library)\b|\btree\s+\/|\bdu\s+(?:-[a-z]*\s+)?\/[^t]/;
+let _runningTermCmds = 0;
+const _MAX_CONCURRENT_CMDS = 3;
+
+async function _agentRunInTerminal(root, command, stepEl) {
+  if (!command || !command.trim()) return { code: -1, stdout: "", stderr: "" };
+  const cmd = command.trim();
+  if (cmd === "cd" || cmd === "cd ~" || cmd === "cd /") return { code: 0, stdout: "", stderr: "" };
+  if (_DANGEROUS_CMDS.test(cmd)) {
+    return { code: 1, stdout: "", stderr: `Blocked: "${cmd}" is a dangerous command that could harm the system.` };
+  }
+  if (_BROAD_SCAN_CMDS.test(cmd)) {
+    return { code: 1, stdout: "", stderr: `Blocked: "${cmd}" scans system directories. Use project-relative paths instead.` };
+  }
+  if (_runningTermCmds >= _MAX_CONCURRENT_CMDS) {
+    return { code: 1, stdout: "", stderr: `Too many concurrent commands (${_runningTermCmds}/${_MAX_CONCURRENT_CMDS}). Wait for others to finish.` };
+  }
+  _runningTermCmds++;
+
+  const outputEl = stepEl?.querySelector(".agent-term-output");
+  const statusEl = stepEl?.querySelector(".agent-term-status");
+  const timerEl = stepEl?.querySelector(".agent-term-timer");
+
+  const startTime = Date.now();
+  let timerInterval;
+  if (timerEl) {
+    timerInterval = setInterval(() => {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      timerEl.textContent = `${elapsed}s`;
+    }, 200);
+  }
+
+  if (statusEl) {
+    statusEl.className = "agent-term-status agent-term-status--running";
+    statusEl.innerHTML = `<span class="agent-term-spinner"></span> Running`;
+  }
+
+  let result = { code: -1, stdout: "", stderr: "" };
+
+  try {
+    if (!_termOpened) {
+      await (_termLock = _termLock.then(async () => {
+        if (_termOpened) return;
+        await Promise.race([
+          (async () => {
+            await openTerminal();
+            await _waitTermReady(4000);
+            await new Promise(r => setTimeout(r, 800));
+          })(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("terminal init timeout")), 8000)),
+        ]);
+        _termOpened = true;
+      }).catch(e => { console.warn("[agent-term] init fail:", e); }));
+    }
+
+    const captureRoot = root || "/tmp";
+    const isLongRunning = /\b(serve|start|dev|watch|run\b.*--debug|run\b.*--reload|nodemon|flask\s+run|npm\s+start|npx\s+(vite|next|nuxt))\b/i.test(cmd);
+    const isCatCmd = /^\s*cat\s/.test(cmd);
+
+    if (isCatCmd) {
+      const filePath = cmd.replace(/^\s*cat\s+/, "").replace(/^["']|["']$/g, "").trim();
+      const fp = filePath.startsWith("/") ? filePath : (root ? root + "/" + filePath : filePath);
+      try {
+        const content = await backend.readTextFile(fp);
+        result = { code: 0, stdout: content || "", stderr: "" };
+      } catch {
+        result = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e) }));
+      }
+    } else if (isLongRunning) {
+      const alreadyCd = /^\s*cd\s/.test(cmd);
+      let finalCmd = cmd;
+      if (!alreadyCd && root) finalCmd = `cd ${shellQuote(root)} && ${cmd}`;
+      writeToActiveTerminal(finalCmd + "\n");
+      result = { code: 0, stdout: "(long-running command in terminal)", stderr: "" };
+    } else {
+      const captureP = Promise.race([
+        backend.taskRunCapture(captureRoot, cmd),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000)),
+      ]).catch(e => {
+        const msg = String(e?.message || e);
+        return msg === "timeout" ? { code: 0, stdout: "(running in terminal)", stderr: "" } : { code: 1, stdout: "", stderr: msg };
+      });
+
+      const alreadyCd = /^\s*cd\s/.test(cmd);
+      let finalCmd = cmd;
+      if (!alreadyCd && root) finalCmd = `cd ${shellQuote(root)} && ${cmd}`;
+      writeToActiveTerminal(finalCmd + "\n");
+
+      const r = await captureP;
+      result = { code: r?.code ?? 0, stdout: r?.stdout || "", stderr: r?.stderr || "" };
+    }
+
+    if (outputEl) {
+      const output = (result.stdout + (result.stderr ? "\n" + result.stderr : "")).trim();
+      if (output && !output.startsWith("(")) {
+        outputEl.textContent = output.slice(0, 5000);
+        outputEl.style.display = "block";
+      }
+    }
+  } catch (e) {
+    console.warn("[agent-term]", e);
+    result = { code: 1, stdout: "", stderr: String(e?.message || e) };
+  }
+
+  _runningTermCmds = Math.max(0, _runningTermCmds - 1);
+  if (timerInterval) clearInterval(timerInterval);
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  if (timerEl) timerEl.textContent = `${elapsed}s`;
+
+  if (statusEl) {
+    if (result.code === 0) {
+      statusEl.className = "agent-term-status agent-term-status--ok";
+      statusEl.innerHTML = `<svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> exit 0`;
+    } else {
+      statusEl.className = "agent-term-status agent-term-status--err";
+      statusEl.innerHTML = `<svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.03 3.97a.75.75 0 00-1.06 0L6 4.94 5.03 3.97a.75.75 0 10-1.06 1.06L4.94 6 3.97 6.97a.75.75 0 101.06 1.06L6 7.06l.97.97a.75.75 0 101.06-1.06L7.06 6l.97-.97a.75.75 0 000-1.06z"/></svg> exit ${result.code}`;
+    }
+  }
+
+  if (stepEl) {
+    stepEl.classList.remove("agent-term-card--running");
+    stepEl.classList.add(result.code === 0 ? "agent-term-card--ok" : "agent-term-card--err");
+  }
+
+  return result;
+}
+
+function _updateFilesBar(bar, list, tracked) {
+  if (!bar || !list) return;
+  const fileEntries = [...tracked.entries()].filter(([, t]) => t !== "cmd" && t !== "list" && t !== "read");
+  const total = tracked.size;
+  if (total === 0) { bar.style.display = "none"; return; }
+  bar.style.display = "";
+  bar.querySelector(".agent-files-bar__count").textContent = `${fileEntries.length} File${fileEntries.length !== 1 ? 's' : ''}`;
+  list.innerHTML = "";
+  for (const [name, type] of tracked) {
+    const li = document.createElement("li");
+    li.className = "agent-files-list__item";
+    const badge = _langBadge(name);
+    const statusLabel = { write: "Edited", code: "Edited", read: "Read", list: "Listed", cmd: "Command" }[type] || type;
+    const statusCls = type === "cmd" ? "cmd" : (type === "read" || type === "list" ? "read" : "write");
+    li.innerHTML = `${badge}<span>${_escHtml(name)}</span><span class="agent-files-list__status agent-files-list__status--${statusCls}">${statusLabel}</span>`;
+    list.appendChild(li);
+  }
+}
+
+// Some models (notably DeepSeek) recap files they've read by dumping pseudo-XML
+// `<file_content path='...'>…</file_content>` and `<item name='…' isDir='…'/>`
+// tags as plain text. Turn those into the editor's normal code/file cards by
+// rewriting them to fenced code blocks (which renderMarkdownInto renders as
+// cards), instead of showing raw tags.
+function _transformFileContentTags(text) {
+  if (!text || (text.indexOf("<file_content") === -1 && text.indexOf("<item") === -1)) return text;
+  // Each block ends at its </file_content> (consumed), the next <file_content>,
+  // or end of text — so trailing prose stays out of the card, and an
+  // unterminated block while streaming still renders as a growing card.
+  let t = text.replace(
+    /<file_content\s+path=['"]([^'"]+)['"][^>]*>([\s\S]*?)(?:<\/file_content>|(?=<file_content\s)|$)/gi,
+    (_m, path, bodyRaw) => {
+      let body = bodyRaw;
+      if (/<item\b/i.test(body)) {
+        const items = [];
+        const re = /<item\s+name=['"]([^'"]+)['"][^>]*?\bisDir=['"]?(true|false)['"]?[^>]*?\/?>/gi;
+        let im;
+        // Files use no leading glyph: a later cleanup pass strips "📄 …" lines.
+        while ((im = re.exec(body))) items.push(im[2].toLowerCase() === "true" ? "📁 " + im[1] + "/" : "   " + im[1]);
+        body = items.join("\n") || body.replace(/<[^>]*>/g, "").trim();
+      } else {
+        body = body.replace(/<\/?(?:file_content|item)[^>]*>/gi, "").replace(/^[ \t]*\d+\|/gm, "").replace(/^\n+|\s+$/g, "");
+      }
+      const base = path.split("/").pop() || path;
+      const ext = base.indexOf(".") >= 0 ? base.split(".").pop().toLowerCase() : "";
+      const lang = /^[a-z0-9]{1,8}$/.test(ext) ? ext : "text";
+      return "\n```" + lang + ":" + path + "\n" + body + "\n```\n";
+    }
+  );
+  // Any standalone <item> left outside a block → markdown list bullets
+  // (dirs keep 📁; files use a neutral glyph since "📄 …" lines get stripped).
+  t = t.replace(/<item\s+name=['"]([^'"]+)['"][^>]*?\bisDir=['"]?(true|false)['"]?[^>]*?\/?>/gi,
+    (_m, name, isDir) => `\n- ${isDir.toLowerCase() === "true" ? "📁 " + name + "/" : "▸ " + name}`);
+  // Sweep up any leftover stray tags.
+  t = t.replace(/<\/?(?:file_content|item)[^>]*>/gi, "");
+  return t;
+}
+
+// DeepSeek (and some others) narrate their native tool calls as plain-text
+// lines — "read_file /path", "run_cmd cd … && …" — even though the real action
+// already renders as its own tool card. Drop that redundant narration so the
+// chat reads like prose + cards. Fence-aware: a code line inside a ``` block
+// that happens to start with a tool name is left untouched.
+function _stripToolNarration(text) {
+  if (!text || !/^[ \t>*\-]*(?:read_file|list_dir|write_file|edit_file|web_fetch|search|find_files|run_cmd|run_subagent|update_plan)\b[ \t(]/m.test(text)) return text;
+  const lines = text.split("\n");
+  let inFence = false;
+  const out = [];
+  const RE = /^[ \t>*\-]*(?:read_file|list_dir|write_file|edit_file|web_fetch|search|find_files|run_cmd|run_subagent|update_plan)\b[ \t(].*$/;
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) { inFence = !inFence; out.push(line); continue; }
+    if (!inFence && RE.test(line)) continue;
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+function _cleanAgentText(text) {
+  text = _transformFileContentTags(text);
+  text = _stripToolNarration(text);
+  return text.replace(/\[TOOL:\w+\]\s*\n?[^\n]*/g, "").replace(/📄\s*[^\n]+\n?/g, "").replace(/📎\s*[^\n]+\n?/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function _parseStreamSegments(text) {
+  const segs = [];
+  const lines = text.split("\n");
+  let i = 0, textBuf = "";
+  while (i < lines.length) {
+    const line = lines[i];
+    const toolM = line.match(/^\[TOOL:(read_file|list_dir|run_cmd|write_file)\]\s*(.*)$/)
+      || line.match(/^(read_file|list_dir|run_cmd|write_file)\s+(\/[^\s].*|[a-zA-Z]:\\[^\s].*)$/)
+      || (line.match(/^(read_file|list_dir|run_cmd|write_file)\s*$/) && i + 1 < lines.length && /^[\s]*[\/~]/.test(lines[i + 1]) ? [line, line.trim(), ""] : null);
+    if (toolM) {
+      if (textBuf.trim()) { segs.push({ type: "text", content: textBuf, complete: true }); textBuf = ""; }
+      const cmd = toolM[1]; let arg = toolM[2]?.trim();
+      if (!arg && i + 1 < lines.length && !lines[i + 1].startsWith("```")) { i++; arg = lines[i].trim(); }
+      if (arg) {
+        if (arg.startsWith("{") || arg.startsWith("(")) {
+          try {
+            const parsed = JSON.parse(arg.replace(/'/g, '"'));
+            arg = parsed.file || parsed.path || parsed.command || parsed.cmd || parsed.dir || Object.values(parsed)[0] || arg;
+          } catch {
+            const m = arg.match(/["']([^"']+)["']/);
+            if (m) arg = m[1];
+          }
+        }
+        arg = arg.replace(/^["'`]+|["'`]+$/g, "").trim();
+      }
+      if (cmd === "write_file") {
+        i++;
+        if (i < lines.length && lines[i].match(/^```/)) {
+          const lang = lines[i].replace(/^```/, "").trim(); i++;
+          let code = ""; let closed = false;
+          while (i < lines.length) { if (lines[i].match(/^```\s*$/)) { closed = true; i++; break; } code += (code ? "\n" : "") + lines[i]; i++; }
+          segs.push({ type: "code", lang, content: code, complete: closed, contextBefore: arg });
+        } else { segs.push({ type: "code", lang: "", content: "", complete: false, contextBefore: arg }); }
+      } else {
+        if (arg) {
+          if (cmd === "run_cmd") segs.push({ type: "cmd", command: arg, complete: true });
+          else if (cmd === "read_file") segs.push({ type: "read", path: arg, complete: true });
+          else segs.push({ type: "list", path: arg, complete: true });
+        }
+        i++;
+      }
+      continue;
+    }
+    const emojiF = line.match(/^📄\s*(.+)$/);
+    if (emojiF && i + 1 < lines.length && lines[i + 1].match(/^```/)) {
+      if (textBuf.trim()) { segs.push({ type: "text", content: textBuf, complete: true }); textBuf = ""; }
+      const fname = emojiF[1].trim(); i++;
+      const lang = lines[i].replace(/^```/, "").trim(); i++;
+      let code = ""; let closed = false;
+      while (i < lines.length) { if (lines[i].match(/^```\s*$/)) { closed = true; i++; break; } code += (code ? "\n" : "") + lines[i]; i++; }
+      segs.push({ type: "code", lang, content: code, complete: closed, contextBefore: fname });
+      continue;
+    }
+    const cmdM = line.match(/^📎\s*(.+)$/);
+    if (cmdM) {
+      if (textBuf.trim()) { segs.push({ type: "text", content: textBuf, complete: true }); textBuf = ""; }
+      segs.push({ type: "cmd", command: cmdM[1].trim(), complete: true }); i++; continue;
+    }
+    const fenceM = line.match(/^```(\w*)\s*$/);
+    if (fenceM) {
+      const ctx = textBuf;
+      if (textBuf.trim()) { segs.push({ type: "text", content: textBuf, complete: true }); textBuf = ""; }
+      const lang = fenceM[1]; i++;
+      let code = ""; let closed = false;
+      while (i < lines.length) { if (lines[i].match(/^```\s*$/)) { closed = true; i++; break; } code += (code ? "\n" : "") + lines[i]; i++; }
+      segs.push({ type: "code", lang, content: code, complete: closed, contextBefore: ctx });
+      continue;
+    }
+    textBuf += (textBuf ? "\n" : "") + line; i++;
+  }
+  if (textBuf) segs.push({ type: "text", content: textBuf, complete: false });
+  return segs;
+}
+
+function _extractSegFileName(seg, allSegs, idx) {
+  const ctx = seg.contextBefore || (idx > 0 && allSegs[idx - 1]?.type === "text" ? allSegs[idx - 1].content : "");
+  if (ctx) {
+    const revLines = ctx.split("\n").reverse();
+    for (const raw of revLines) {
+      const s = raw.replace(/[`"'*#>📄📎]/g, "").trim();
+      if (!s) continue;
+      const m1 = s.match(/([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})\s*[:：]?\s*$/);
+      if (m1) return m1[1];
+      const m3 = s.match(/([a-zA-Z0-9_\-./\\]+\/[a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})/);
+      if (m3) return m3[1];
+      const m4 = s.match(/(?:^|\s)([a-zA-Z0-9_\-]+\.[a-zA-Z]{1,10})(?:\s|$|[:：—\-])/);
+      if (m4) return m4[1];
+      const m2 = s.match(/(?:文件|创建|写入|新建|编写|修改|更新|File|file)\s*[`"':\s]*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})/);
+      if (m2) return m2[1];
+      if (s.length > 120) break;
+    }
+  }
+  const c = seg.content;
+  if (/from flask import|Flask\(__name__\)|app\.route/.test(c)) return "app.py";
+  if (/class \w+\(.*(?:db\.Model|Base)\)/.test(c)) return "models.py";
+  if (/<!DOCTYPE|<html|<head|<body/.test(c)) return "index.html";
+  if (/import React|from ['"]react['"]/.test(c)) return "App.jsx";
+  if (/import express|require\(['"]express/.test(c)) return "server.js";
+  if (/CREATE TABLE|ALTER TABLE/i.test(c)) return "schema.sql";
+  if (/FROM\s+(node|python|golang|alpine|ubuntu)/i.test(c)) return "Dockerfile";
+  if (/server\s*\{|location\s*\//.test(c)) return "nginx.conf";
+  if (/{%\s*(extends|block|include)|{{\s*\w+/.test(c)) return "template.html";
+  return null;
+}
+
+function _renderAgentSegStatic(container, seg, allSegs, idx) {
+  if (seg.type === "text") {
+    let clean = _cleanAgentText(seg.content);
+    if (!clean) return;
+    const nextSeg = idx + 1 < allSegs.length ? allSegs[idx + 1] : null;
+    if (nextSeg && nextSeg.type === "code") {
+      clean = clean.replace(/(?:^|\n)\s*[`"']*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})[`"']*\s*[:：]?\s*$/m, "").trim();
+    }
+    if (!clean) return;
+    const div = document.createElement("div");
+    div.className = "agent-seg";
+    renderMarkdownInto(div, clean, { highlighter: highlightCode });
+    container.appendChild(div);
+  } else if (seg.type === "code") {
+    if (!seg.content || !seg.content.trim()) return;
+    const fileName = _extractSegFileName(seg, allSegs, idx);
+    if (fileName) {
+      const added = seg.content.split("\n").length;
+      const badge = _langBadge(fileName);
+      const step = document.createElement("div");
+      step.className = "agent-tool-step agent-tool-step--write agent-tool-step--accepted";
+      step.innerHTML =
+        `<div class="agent-tool-row">` +
+        `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+        `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61z"/></svg></div>` +
+        `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">Edited</span><span class="atc-path atc-path--clickable" data-filepath="${_escAttr(fileName)}">${_escHtml(fileName)}</span></div></div>` +
+        `<span class="atc-result atc-result--ok"><span class="atc-diffstat"><span class="a">+${added}</span></span></span></div>` +
+        `<div class="atc-viewport"></div>`;
+      step.querySelector(".agent-tool-row").addEventListener("click", () => step.classList.toggle("is-open"));
+      const clickPath = step.querySelector(".atc-path--clickable");
+      if (clickPath) {
+        clickPath.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const fp = clickPath.dataset.filepath;
+          if (fp) {
+            const root = rootPath || workspaceRoots[0] || "";
+            const fullPath = fp.startsWith("/") ? fp : root + "/" + fp;
+            openFile(fullPath, fp.split("/").pop());
+          }
+        });
+      }
+      const vp = step.querySelector(".atc-viewport");
+      vp.innerHTML = _buildDiffView("", seg.content, fileName);
+      _highlightDiffView(vp);
+      container.appendChild(step);
+    } else {
+      const fenceInfo = seg.lang ? seg.lang : "";
+      const div = document.createElement("div");
+      div.className = "agent-seg";
+      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCode });
+      container.appendChild(div);
+    }
+  } else if (seg.type === "cmd") {
+    if (!seg.command || !seg.command.trim()) return;
+    const step = document.createElement("div");
+    step.className = "agent-term-card agent-term-card--ok";
+    step.innerHTML =
+      `<div class="agent-term-card__header">` +
+        `<div class="agent-term-card__dots"><i></i><i></i><i></i></div>` +
+        `<span class="agent-term-card__label">Terminal</span>` +
+        `<div class="agent-term-status agent-term-status--ok">` +
+          `<svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> done` +
+        `</div>` +
+      `</div>` +
+      `<div class="agent-term-card__cmd">` +
+        `<span class="agent-term-card__prompt">$</span>` +
+        `<code class="agent-term-card__code">${_escHtml(seg.command || "")}</code>` +
+      `</div>`;
+    container.appendChild(step);
+  }
+}
+
+function _renderAgentSeg(container, seg, allSegs, idx, root, promises) {
+  if (seg.type === "text") {
+    let clean = _cleanAgentText(seg.content);
+    if (!clean) return;
+    const nextSeg = idx + 1 < allSegs.length ? allSegs[idx + 1] : null;
+    if (nextSeg && nextSeg.type === "code") {
+      clean = clean.replace(/(?:^|\n)\s*[`"']*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})[`"']*\s*[:：]?\s*$/m, "").trim();
+    }
+    if (!clean) return;
+    const div = document.createElement("div");
+    div.className = "agent-seg";
+    renderMarkdownInto(div, clean, { highlighter: highlightCode });
+    container.appendChild(div);
+  } else if (seg.type === "code") {
+    if (!seg.content || !seg.content.trim()) return;
+    const fileName = _extractSegFileName(seg, allSegs, idx);
+    if (fileName) {
+      const call = { type: "write", path: fileName, content: seg.content };
+      const step = _createToolStep(call);
+      container.appendChild(step);
+      const p = _executeToolStep(step, call, root); promises.push(p);
+    } else {
+      const fenceInfo = seg.lang ? seg.lang : "";
+      const div = document.createElement("div");
+      div.className = "agent-seg";
+      renderMarkdownInto(div, "```" + fenceInfo + "\n" + seg.content + "\n```", { highlighter: highlightCode });
+      container.appendChild(div);
+    }
+  } else if (seg.type === "cmd") {
+    const call = { type: "cmd", command: seg.command };
+    const step = _createToolStep(call);
+    container.appendChild(step);
+    const p = _executeToolStep(step, call, root);
+    p.then(r => { if (r) p._result = r; });
+    promises.push(p);
+  } else if (seg.type === "read") {
+    if (!seg.path || !seg.path.trim()) return;
+    const call = { type: "read", path: seg.path };
+    const step = _createToolStep(call);
+    container.appendChild(step);
+    const p = _executeToolStep(step, call, root);
+    p.then(r => { if (r) p._result = r; });
+    promises.push(p);
+  } else if (seg.type === "list") {
+    if (!seg.path || !seg.path.trim()) return;
+    const call = { type: "list", path: seg.path };
+    const step = _createToolStep(call);
+    container.appendChild(step);
+    const p = _executeToolStep(step, call, root);
+    p.then(r => { if (r) p._result = r; });
+    promises.push(p);
+  }
+}
+
+async function _executeInlineTools(response, container) {
+  const segments = _splitAgentResponse(response);
+  const toolSegs = segments.filter(s => s.type !== "text");
+  if (!toolSegs.length) return;
+
+  const log = document.createElement("div");
+  log.className = "agent-tool-log";
+  container.appendChild(log);
+  const toolResults = [];
+  const root = rootPath || workspaceRoots[0] || "";
+
+  for (const seg of toolSegs) {
+    const step = _createToolStep(seg);
+    log.appendChild(step);
+    chatEl.scrollTop = chatEl.scrollHeight;
+    const tr = await _executeToolStep(step, seg, root);
+    if (tr) toolResults.push(tr);
+    await new Promise(r => setTimeout(r, 60));
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  if (toolResults.length) _agentFollowUp(toolResults, container);
+}
+
+function _splitAgentResponse(response) {
+  const segments = [];
+  let remaining = response;
+  const toolPattern = /\[TOOL:(read_file|write_file|run_cmd|list_dir)\]\s*\n?([^\n]+)/;
+  const bareToolPattern = /(?:^|\n)(read_file|list_dir|run_cmd)\s+(\/[^\s\n][^\n]*)/;
+  const writePattern = /\[TOOL:write_file\]\s*\n?([^\n]+)\n```[\w]*\n([\s\S]*?)```/;
+
+  const emojiFilePattern = /📄\s*([^\n]+)\n```(\w*)\n([\s\S]*?)```/;
+  const emojiCmdPattern = /📎\s*(.+?)(?:\n|$)/;
+
+  while (remaining.length > 0) {
+    const wm = remaining.match(writePattern);
+    const tm = remaining.match(toolPattern);
+    const bt = remaining.match(bareToolPattern);
+    const ef = remaining.match(emojiFilePattern);
+    const ec = remaining.match(emojiCmdPattern);
+
+    const candidates = [
+      wm && { m: wm, idx: remaining.indexOf(wm[0]), type: "wm" },
+      tm && { m: tm, idx: remaining.indexOf(tm[0]), type: "tm" },
+      bt && { m: [bt[0].replace(/^\n/, ""), bt[1], bt[2]], idx: Math.max(0, remaining.indexOf(bt[0]) + (bt[0].startsWith("\n") ? 1 : 0)), type: "tm" },
+      ef && { m: ef, idx: remaining.indexOf(ef[0]), type: "ef" },
+      ec && { m: ec, idx: remaining.indexOf(ec[0]), type: "ec" },
+    ].filter(Boolean).sort((a, b) => a.idx - b.idx);
+
+    if (!candidates.length) {
+      segments.push({ type: "text", content: remaining });
+      break;
+    }
+
+    const best = candidates[0];
+    if (best.idx > 0) segments.push({ type: "text", content: remaining.slice(0, best.idx) });
+
+    if (best.type === "wm") {
+      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[2] });
+    } else if (best.type === "ef") {
+      segments.push({ type: "write", path: best.m[1].trim(), content: best.m[3] });
+    } else if (best.type === "ec") {
+      segments.push({ type: "cmd", command: best.m[1].trim() });
+    } else {
+      const cmd = best.m[1];
+      const arg = best.m[2].trim();
+      if (arg) {
+        if (cmd === "read_file") segments.push({ type: "read", path: arg });
+        else if (cmd === "list_dir") segments.push({ type: "list", path: arg });
+        else if (cmd === "run_cmd") segments.push({ type: "cmd", command: arg });
+        else if (cmd === "write_file") segments.push({ type: "write", path: arg, content: "" });
+      }
+    }
+
+    remaining = remaining.slice(best.idx + best.m[0].length);
+  }
+
+  const newSegs = [];
+  const langToFile = { python: "main.py", py: "main.py", javascript: "app.js", js: "app.js", typescript: "app.ts", ts: "app.ts", html: "index.html", css: "style.css", json: "data.json", yaml: "config.yaml", yml: "config.yml", shell: "script.sh", bash: "script.sh", sh: "script.sh", sql: "query.sql", go: "main.go", rust: "main.rs", rs: "main.rs", java: "Main.java", c: "main.c", cpp: "main.cpp", ruby: "app.rb", rb: "app.rb", php: "index.php", swift: "main.swift", kotlin: "main.kt", dart: "main.dart", vue: "App.vue", svelte: "App.svelte", jsx: "App.jsx", tsx: "App.tsx" };
+  const fileNamePat = /[`"']?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})[`"']?\s*(?:[：:]\s*)?$/;
+
+  for (const seg of segments) {
+    if (seg.type !== "text") { newSegs.push(seg); continue; }
+    const allBlocks = [...seg.content.matchAll(/```(\w*)\n([\s\S]*?)```/g)];
+    if (!allBlocks.length) { newSegs.push(seg); continue; }
+
+    let txt = seg.content;
+    let lastEnd = 0;
+    const usedNames = new Set();
+
+    for (const m of allBlocks) {
+      const lang = m[1].toLowerCase();
+      const code = m[2];
+      if (code.split("\n").length < 3) continue;
+
+      const blockStart = txt.indexOf(m[0], lastEnd);
+      const textBefore = txt.slice(lastEnd, blockStart);
+
+      let fileName = "";
+      const allLines = textBefore.split("\n").reverse();
+      for (const line of allLines) {
+        const stripped = line.replace(/[`"'*#>\-📄]/g, "").trim();
+        const fm = stripped.match(/([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})\s*[:：]?\s*$/);
+        if (fm) { fileName = fm[1]; break; }
+        const fm2 = stripped.match(/(?:文件|创建|写入|新建|编写|修改)\s*[`"']*([a-zA-Z0-9_\-./\\]+\.[a-zA-Z]{1,10})/);
+        if (fm2) { fileName = fm2[1]; break; }
+      }
+
+      if (!fileName && code) {
+        if (/from flask import|Flask\(__name__\)|app\.route/.test(code)) fileName = "app.py";
+        else if (/class \w+\(.*(?:db\.Model|Base)\)/.test(code)) fileName = "models.py";
+        else if (/<!DOCTYPE|<html|<head|<body/.test(code)) fileName = "index.html";
+        else if (/import React|from ['"]react['"]|export default/.test(code)) fileName = "App.jsx";
+        else if (/import express|require\(['"]express/.test(code)) fileName = "server.js";
+        else if (/CREATE TABLE|ALTER TABLE/.test(code)) fileName = "schema.sql";
+        else if (/FROM\s+(node|python|golang|alpine|ubuntu)/.test(code)) fileName = "Dockerfile";
+        else if (/server\s*\{|location\s*\//.test(code)) fileName = "nginx.conf";
+        else if (lang && langToFile[lang]) {
+          let base = langToFile[lang]; let i = 1;
+          while (usedNames.has(base)) { base = base.replace(/(\.\w+)$/, `${++i}$1`); }
+          fileName = base;
+        }
+      }
+
+      if (!fileName) { newSegs.push({ type: "text", content: textBefore + m[0] }); lastEnd = blockStart + m[0].length; continue; }
+
+      usedNames.add(fileName);
+      if (textBefore.trim()) {
+        const cleanText = textBefore.replace(fileNamePat, "").trim();
+        if (cleanText) newSegs.push({ type: "text", content: cleanText });
+      }
+      newSegs.push({ type: "write", path: fileName, content: code });
+      lastEnd = blockStart + m[0].length;
+    }
+    if (lastEnd < txt.length) {
+      const rest = txt.slice(lastEnd).trim();
+      if (rest) newSegs.push({ type: "text", content: rest });
+    }
+  }
+  return newSegs.length > 0 ? newSegs : segments;
+}
+
+const _ATC_LANG_MAP = { py: "py", python: "py", js: "js", javascript: "js", jsx: "js", ts: "ts", typescript: "ts", tsx: "ts", html: "html", htm: "html", css: "css", scss: "css", less: "css", rs: "rs", rust: "rs", go: "go", sh: "sh", bash: "sh", shell: "sh", zsh: "sh", json: "json", sql: "sql", md: "md", markdown: "md" };
+function _langBadge(pathOrLang) {
+  const ext = pathOrLang.split(".").pop().toLowerCase();
+  const key = _ATC_LANG_MAP[ext] || _ATC_LANG_MAP[pathOrLang] || "default";
+  const labels = { py: "PY", js: "JS", ts: "TS", html: "HTML", css: "CSS", rs: "RS", go: "GO", sh: "SH", json: "JSON", sql: "SQL", md: "MD", cmd: "CMD", default: "FILE" };
+  return `<span class="atc-lang-badge atc-lang-badge--${key}">${labels[key] || key.toUpperCase()}</span>`;
+}
+const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+// ============================================================================
+//  Agentic loop — the engine behind agent / explorer / reviewer modes.
+//
+//  A real multi-turn loop: on each turn the model may emit tool calls; we run
+//  them, feed the results back as proper `tool` messages, and let the model
+//  keep going until it stops calling tools (task done) or we hit MAX_ITERS.
+//  This is what lets the agent read → reason → edit → verify → fix on its own,
+//  the way Claude Code / Codex do, instead of a single read-then-answer pass.
+// ============================================================================
+
+const _AGENT_MAX_ITERS = 30;
+
+function _buildAgentToolSchemas(includeWrite) {
+  const tools = [
+    { type: "function", function: { name: "read_file", description: "读取文件内容（默认最多约 400 行）。文件很大时用 offset/limit 分页继续读完。改文件前先读清楚。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
+    { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。用 \".\" 表示工作区根。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径" } }, required: ["path"] } } },
+    { type: "function", function: { name: "search", description: "在整个项目里按文本搜索（grep），返回匹配的文件、行号和该行内容。用来找符号定义、用法、引用。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本" }, path: { type: "string", description: "可选，限定搜索的子目录" } }, required: ["query"] } } },
+    { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
+    { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于查在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
+    { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
+    { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
+  ];
+  if (includeWrite) {
+    tools.push(
+      { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。改已有文件请优先用它。old_string 必须能在文件中唯一定位（带足够上下文），否则会报错。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
+      { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
+      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条 shell 命令（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+    );
+  }
+  return tools;
+}
+
+/** Translate an OpenAI tool call into the internal `call` shape `_executeToolStep` understands. */
+function _mapToolCall(name, args) {
+  args = args || {};
+  switch (name) {
+    case "read_file": return { type: "read", path: args.path || "", offset: args.offset, limit: args.limit };
+    case "list_dir": return { type: "list", path: args.path || "" };
+    case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "" };
+    case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
+    case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
+    case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
+    case "write_file": return { type: "write", path: args.path || "", content: args.content || "" };
+    case "run_cmd": return { type: "cmd", command: args.command || "" };
+    case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
+    case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
+    default: return null;
+  }
+}
+
+/** Normalize loosely-shaped plan steps from the model into {content, status}. */
+function _normPlanSteps(steps) {
+  if (!Array.isArray(steps)) return [];
+  return steps
+    .map((s) => typeof s === "string"
+      ? { content: s, status: "pending" }
+      : { content: s.content || s.step || s.text || s.title || "", status: String(s.status || "pending").toLowerCase() })
+    .filter((s) => s.content);
+}
+
+/** Short textual confirmation of a plan update, fed back to the model. */
+function _planSummary(steps) {
+  const total = steps.length;
+  const done = steps.filter((s) => s.status === "completed").length;
+  const cur = steps.find((s) => s.status === "in_progress");
+  return `计划已更新：共 ${total} 步，已完成 ${done}${cur ? `，进行中：${cur.content}` : ""}。`;
+}
+
+/** Create or update the live plan panel pinned at the top of the agent message. */
+function _renderPlan(container, steps, existingEl) {
+  const done = steps.filter((s) => s.status === "completed").length;
+  const icon = (st) => st === "completed"
+    ? `<svg viewBox="0 0 16 16" width="13" height="13" fill="#2ea043" style="flex:0 0 auto;margin-top:1px"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.78 5.97a.75.75 0 010 1.06l-4.5 4.5a.75.75 0 01-1.06 0l-2-2a.75.75 0 111.06-1.06l1.47 1.47 3.97-3.97a.75.75 0 011.06 0z"/></svg>`
+    : st === "in_progress"
+    ? `<span class="atc-spin" style="flex:0 0 auto;width:12px;height:12px;margin-top:1px;border-width:2px"></span>`
+    : `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" style="flex:0 0 auto;margin-top:1px;opacity:.45"><circle cx="8" cy="8" r="6.5"/></svg>`;
+  let el = existingEl;
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "agent-plan";
+    el.style.cssText = "margin:6px 0 10px;border:1px solid rgba(128,128,128,.25);border-radius:10px;overflow:hidden;font-size:13px";
+    container.insertBefore(el, container.firstChild);
+  }
+  el.innerHTML =
+    `<div style="display:flex;align-items:center;gap:7px;padding:8px 12px;font-weight:600;opacity:.9;border-bottom:1px solid rgba(128,128,128,.18)">` +
+      `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2 2.75C2 1.78 2.78 1 3.75 1h8.5c.97 0 1.75.78 1.75 1.75v10.5c0 .97-.78 1.75-1.75 1.75h-8.5C2.78 15 2 14.22 2 13.25V2.75zM5 4.5a.75.75 0 000 1.5h6a.75.75 0 000-1.5H5zm0 3a.75.75 0 000 1.5h6a.75.75 0 000-1.5H5zm0 3a.75.75 0 000 1.5h3.5a.75.75 0 000-1.5H5z"/></svg>` +
+      `<span>任务计划</span><span style="margin-left:auto;font-weight:400;opacity:.55">${done}/${steps.length}</span>` +
+    `</div>` +
+    `<ul style="list-style:none;margin:0;padding:6px 0">` +
+    steps.map((s) => `<li style="display:flex;gap:8px;padding:4px 12px;line-height:1.45${s.status === "completed" ? ";opacity:.55;text-decoration:line-through" : ""}">${icon(s.status)}<span>${_escHtml(s.content)}</span></li>`).join("") +
+    `</ul>`;
+  return el;
+}
+
+/**
+ * Keep the running `messages` array from blowing past the context window on long
+ * autonomous tasks: once it gets large, truncate the *older* tool outputs to a
+ * stub. Messages are never removed (that would orphan a tool_call), only shrunk.
+ */
+function _trimMessagesIfHuge(messages) {
+  const LIMIT = 140000; // ~chars; conservative stand-in for the context budget
+  let total = 0;
+  for (const m of messages) total += m.content ? String(m.content).length : 0;
+  if (total <= LIMIT) return;
+  const KEEP = 6;
+  const toolIdx = [];
+  for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdx.push(i);
+  const trimUpTo = toolIdx.length - KEEP;
+  for (let k = 0; k < trimUpTo; k++) {
+    const i = toolIdx[k];
+    const c = messages[i].content ? String(messages[i].content) : "";
+    if (c.length > 300) {
+      messages[i] = { ...messages[i], content: c.slice(0, 200) + `\n…（较早的工具输出已省略以节省上下文，原 ${c.length} 字）` };
+    }
+  }
+}
+
+/** Serialize a tool's result into the `tool` message content the model reads next turn. */
+function _toolResultToString(call, result) {
+  if (!result) return call.type === "write" || call.type === "edit" ? `（${call.path}：未应用）` : "(无结果)";
+  const c = result.content != null ? String(result.content) : "";
+  switch (result.type || call.type) {
+    case "read": return `文件 ${result.path}:\n${c}`;
+    case "list": return `目录 ${result.path}:\n${c}`;
+    case "cmd": return `命令输出:\n${c || "(无输出)"}`;
+    default: return c || `已完成 ${call.type}`;
+  }
+}
+
+/** Glob (`*`, `**`, `?`) or plain substring → RegExp matched against a relative path. */
+function _globToRegExp(glob) {
+  if (!/[*?]/.test(glob)) {
+    return new RegExp(glob.replace(/[.+^${}()|[\]\\]/g, "\\$&"), "i"); // substring match
+  }
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") {
+      if (glob[i + 1] === "*") { re += ".*"; i++; if (glob[i + 1] === "/") i++; }
+      else re += "[^/]*";
+    } else if (ch === "?") re += "[^/]";
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp("(^|/)" + re + "$", "i");
+}
+
+/** Bounded recursive file finder, used by the `find_files` tool. Read-only and workspace-scoped. */
+async function _agentFindFiles(root, pattern) {
+  if (!root) return { count: 0, text: "[ERROR] 未打开工作区。" };
+  const pat = (pattern || "").trim();
+  if (!pat) return { count: 0, text: "[ERROR] 空 pattern。" };
+  let rx;
+  try { rx = _globToRegExp(pat); } catch { return { count: 0, text: "[ERROR] 无效 pattern。" }; }
+  const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".venv", "__pycache__", ".cache", "vendor"]);
+  const out = [];
+  const MAX = 200, MAX_SCAN = 8000;
+  let scanned = 0;
+  const stack = [{ dir: root, rel: "" }];
+  while (stack.length && out.length < MAX && scanned < MAX_SCAN) {
+    const { dir, rel } = stack.pop();
+    let entries = [];
+    try { entries = await backend.readDir(dir); } catch { continue; }
+    for (const e of entries) {
+      if (out.length >= MAX) break;
+      scanned++;
+      const name = e.name;
+      if (!name || name.startsWith(".")) continue;
+      const childRel = rel ? rel + "/" + name : name;
+      if (e.is_dir) {
+        if (!IGNORED.has(name)) stack.push({ dir: dir + "/" + name, rel: childRel });
+      } else if (rx.test(childRel)) {
+        out.push(childRel);
+      }
+    }
+  }
+  out.sort();
+  const text = out.length ? out.join("\n") + (out.length >= MAX ? "\n…(更多结果已截断)" : "") : "(无匹配文件)";
+  return { count: out.length, text };
+}
+
+/**
+ * Drive one model turn: stream assistant text into `body`, accumulate any tool
+ * calls (reassembled by `index` across deltas), and return both so the loop can
+ * decide whether to run tools and continue.
+ */
+/** True for transient API/network errors worth retrying with backoff. */
+function _isRetryableAiError(msg) {
+  const m = String(msg || "").toLowerCase();
+  return /\b(408|409|425|429|500|502|503|504)\b/.test(m)
+    || /rate.?limit|too many requests|overloaded|temporar|timeout|timed out|econn|enotfound|network|connection (reset|refused|closed)|fetch failed|stream (error|closed)|server error|service unavailable|capacity|try again/.test(m);
+}
+
+async function _agentModelTurn({ config, messages, toolSchemas, body }) {
+  let acc = "";
+  let err = null;
+  const byIndex = new Map();
+  let streamEl = null;
+  let raf = 0;
+
+  const flush = () => {
+    raf = 0;
+    body.querySelector(".thinking")?.remove();
+    const clean = _cleanAgentText(acc);
+    if (clean.trim()) {
+      if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
+      renderMarkdownInto(streamEl, clean, { streaming: true });
+    }
+    chatEl.scrollTop = chatEl.scrollHeight;
+  };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(flush); };
+
+  // Retry transient failures (rate limits, 5xx, network blips) with exponential
+  // backoff — but only while nothing has streamed yet, so a retry can never
+  // duplicate partial output. Both the main loop and sub-agents go through here.
+  for (let attempt = 0; ; attempt++) {
+    let turnErr = null;
+    let produced = false;
+    try {
+      await backend.aiChatWithTools(config, messages, toolSchemas, (ev) => {
+        if (ev.kind === "token") { produced = true; acc += ev.delta; schedule(); }
+        else if (ev.kind === "toolCall") {
+          produced = true;
+          const idx = ev.index ?? 0;
+          let e = byIndex.get(idx);
+          if (!e) { e = { id: "", name: "", args: "" }; byIndex.set(idx, e); }
+          if (ev.id) e.id = ev.id;
+          if (ev.name) e.name = ev.name;
+          if (ev.arguments) e.args += ev.arguments;
+        }
+        else if (ev.kind === "error") { turnErr = ev.message; }
+      });
+    } catch (e) { turnErr = String(e?.message || e); }
+
+    if (turnErr && !produced && attempt < 3 && streaming && _isRetryableAiError(turnErr)) {
+      showToast(`网络/服务波动，重试中… (${attempt + 1}/3)`);
+      await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt)));
+      if (!streaming) { err = turnErr; break; }
+      continue;
+    }
+    err = turnErr;
+    break;
+  }
+
+  if (raf) cancelAnimationFrame(raf);
+  body.querySelector(".thinking")?.remove();
+
+  const cleanFinal = _cleanAgentText(acc);
+  if (streamEl) {
+    if (cleanFinal.trim()) renderMarkdownInto(streamEl, cleanFinal, { streaming: false });
+    else streamEl.remove();
+  } else if (cleanFinal.trim()) {
+    const el = document.createElement("div");
+    el.className = "agent-seg";
+    renderMarkdownInto(el, cleanFinal, { streaming: false });
+    body.appendChild(el);
+  }
+
+  const toolCalls = [...byIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, e]) => {
+      let parsed = {};
+      try { parsed = JSON.parse(e.args || "{}"); } catch { parsed = {}; }
+      return {
+        id: e.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+        name: e.name,
+        argsRaw: (e.args && e.args.trim()) ? e.args : "{}",
+        parsedArgs: parsed,
+      };
+    })
+    .filter((tc) => tc.name);
+
+  return { text: acc, toolCalls, error: err };
+}
+
+const _SUBAGENT_SYSTEM = `你是一个只读调研子智能体。你能用 read_file / list_dir / search / find_files 调查代码库，但不能修改文件、不能运行命令、也不能再派生子智能体。
+
+自主进行多轮调查，顺着 import / 调用 / 定义层层追，把交给你的子任务彻底搞清楚。完成后用中文输出一份**简洁、可直接使用的简报**：
+- 结论 / 答案放最前面
+- 关键代码用 路径:行号 标注
+- 必要时给出调用链、模块关系或文件清单
+不要复述任务，不要写废话铺垫。`;
+
+/**
+ * Spawn a focused, read-only sub-agent — Claude Code's Task tool in miniature.
+ * It runs its own bounded agentic loop with read-only tools and returns a report
+ * string, which the parent feeds back as the run_subagent tool result. Keeping
+ * sub-agents read-only (no writes, no cmd, no nested sub-agents) makes them safe
+ * to delegate big investigation chunks to without runaway recursion or edits.
+ */
+async function _runSubAgent({ config, description, prompt, root, container }) {
+  const card = document.createElement("div");
+  card.className = "agent-tool-step agent-tool-step--subagent is-open";
+  card.innerHTML =
+    `<div class="agent-tool-row">` +
+    `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+    `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a2 2 0 011 3.732V6h3.25A2.75 2.75 0 0115 8.75v3.5A2.75 2.75 0 0112.25 15h-8.5A2.75 2.75 0 011 12.25v-3.5A2.75 2.75 0 013.75 6H7V4.732A2 2 0 018 1zM5.5 9.5a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg></div>` +
+    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">子智能体</span><span class="atc-path">${_escHtml(description)}</span></div></div>` +
+    `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
+    `<div class="atc-viewport"></div>`;
+  card.querySelector(".agent-tool-row").addEventListener("click", () => card.classList.toggle("is-open"));
+  container.appendChild(card);
+  const vp = card.querySelector(".atc-viewport");
+  const res = card.querySelector(".atc-result");
+  chatEl.scrollTop = chatEl.scrollHeight;
+
+  const sysPrompt = _SUBAGENT_SYSTEM + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext());
+  const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: prompt }];
+  const toolSchemas = _buildAgentToolSchemas(false).filter((t) => ["read_file", "list_dir", "search", "find_files", "web_fetch"].includes(t.function.name));
+
+  let report = "";
+  let toolCount = 0;
+  const SUB_MAX = 12;
+  try {
+    for (let i = 0; i < SUB_MAX; i++) {
+      if (!streaming) break;
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, body: vp });
+      if (turn.error) { report = report || `[ERROR] ${turn.error}`; break; }
+      if (turn.text && turn.text.trim()) report = turn.text.trim();
+      const am = { role: "assistant", content: turn.text || "" };
+      if (turn.toolCalls.length) am.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
+      messages.push(am);
+      if (!turn.toolCalls.length) break;
+      for (const tc of turn.toolCalls) {
+        const call = _mapToolCall(tc.name, tc.parsedArgs);
+        if (!call || !["read", "list", "search", "find", "web"].includes(call.type)) {
+          messages.push({ role: "tool", tool_call_id: tc.id, content: call ? `子智能体只读，不能用 ${tc.name}。` : `未知工具: ${tc.name}` });
+          continue;
+        }
+        const step = _createToolStep(call);
+        vp.appendChild(step);
+        toolCount++;
+        let result;
+        if (!streaming) result = { type: call.type, path: call.path, content: "[interrupted]" };
+        else { try { result = await _executeToolStep(step, call, root); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
+        messages.push({ role: "tool", tool_call_id: tc.id, content: _toolResultToString(call, result).slice(0, 8000) });
+      }
+      _trimMessagesIfHuge(messages);
+    }
+  } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
+
+  res.className = "atc-result atc-result--ok";
+  res.textContent = `${toolCount} 步调研`;
+  card.classList.remove("is-open");
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return report || "（子智能体未产出简报）";
+}
+
+async function _runAgenticLoop({ config, messages, root }) {
+  const body = addMessage("assistant", "");
+  body.appendChild(thinkingCard());
+
+  const isAgent = _currentAiMode === "agent";
+  const toolSchemas = _buildAgentToolSchemas(isAgent);
+
+  // Files/activity bar reused from the existing agent UI.
+  const filesBar = document.createElement("div");
+  filesBar.className = "agent-files-bar";
+  filesBar.innerHTML =
+    `<svg class="agent-files-bar__chev" viewBox="0 0 12 12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+    `<svg class="agent-files-bar__icon" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>` +
+    `<span class="agent-files-bar__count">0 Files</span>` +
+    `<div class="agent-files-bar__actions">` +
+    `<button class="agent-files-bar__btn agent-files-bar__btn--stop" type="button">Stop<span class="agent-files-bar__shortcut">^C</span></button>` +
+    `</div>`;
+  filesBar.addEventListener("click", (e) => { if (!e.target.closest(".agent-files-bar__btn")) filesBar.classList.toggle("is-open"); });
+  filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
+    e.stopPropagation(); streaming = false; _setSendBtnStop(false); showToast("Agent stopped");
+  });
+  const filesList = document.createElement("ul");
+  filesList.className = "agent-files-list";
+  body.parentElement.insertBefore(filesBar, body);
+  body.parentElement.insertBefore(filesList, body);
+  filesBar.style.display = "none";
+  const trackedFiles = new Map();
+
+  streaming = true;
+  _setSendBtnStop(true);
+
+  let finalErr = null;
+  let summaryText = "";
+  let hitCap = false;
+  let planEl = null;
+
+  try {
+    for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
+      if (!streaming) break;
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, body });
+      if (turn.error) { finalErr = turn.error; break; }
+      if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
+
+      const assistantMsg = { role: "assistant", content: turn.text || "" };
+      if (turn.toolCalls.length) {
+        assistantMsg.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
+      }
+      messages.push(assistantMsg);
+
+      if (!turn.toolCalls.length) break; // model produced its final answer
+
+      // Render every tool step up front in call order (so the UI keeps the
+      // model's sequence), then execute: read-only tools (read/list/search/find)
+      // run in parallel for fast context-gathering, while mutating tools
+      // (edit/write/cmd) and plan updates run sequentially in order.
+      const items = turn.toolCalls.map((tc) => ({ tc, call: _mapToolCall(tc.name, tc.parsedArgs), step: null }));
+      for (const it of items) {
+        if (it.call && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent") { it.step = _createToolStep(it.call); body.appendChild(it.step); }
+      }
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+      const toolMsgs = new Array(items.length);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web"]);
+
+      const runOne = async (it) => {
+        const { call, step } = it;
+        let result;
+        if (!streaming) result = { type: call.type, path: call.path, content: "[interrupted] 用户已停止任务。" };
+        else {
+          try { result = await _executeToolStep(step, call, root); }
+          catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
+        }
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.path || "");
+        if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
+        return _toolResultToString(call, result).slice(0, 8000);
+      };
+
+      // 1) read-only tools AND sub-agents — concurrently (fast parallel
+      //    context-gathering plus parallel research, like Claude Code).
+      const parallel = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.call) continue;
+        if (READ_ONLY.has(it.call.type)) {
+          parallel.push((async () => { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) }; })());
+        } else if (it.tc.name === "run_subagent") {
+          parallel.push((async () => {
+            const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body });
+            const key = "🤖 " + (it.call.description || "subagent");
+            if (!trackedFiles.has(key)) { trackedFiles.set(key, "subagent"); _updateFilesBar(filesBar, filesList, trackedFiles); }
+            toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: report.slice(0, 8000) };
+          })());
+        }
+      }
+      if (parallel.length) await Promise.all(parallel);
+
+      // 2) plan updates + mutating tools — sequentially, in call order
+      for (let i = 0; i < items.length; i++) {
+        if (toolMsgs[i]) continue;
+        const it = items[i];
+        if (!it.call) { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: `未知工具: ${it.tc.name}` }; continue; }
+        if (it.tc.name === "update_plan") {
+          planEl = _renderPlan(body, it.call.steps, planEl);
+          toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(it.call.steps) };
+          continue;
+        }
+        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) };
+      }
+
+      for (const m of toolMsgs) messages.push(m);
+      _trimMessagesIfHuge(messages);
+
+      if (iter === _AGENT_MAX_ITERS - 1) hitCap = true;
+    }
+  } catch (e) { finalErr = String(e?.message || e); }
+  finally {
+    streaming = false;
+    _setSendBtnStop(false);
+    body.querySelector(".thinking")?.remove();
+    if (hitCap) {
+      const note = document.createElement("div");
+      note.className = "msg__error";
+      note.textContent = `⚠️ 已达到单次最多 ${_AGENT_MAX_ITERS} 步，任务可能未完成。可直接再发一条让我接着做。`;
+      body.appendChild(note);
+    }
+    if (finalErr) {
+      const note = document.createElement("div");
+      note.className = "msg__error";
+      note.textContent = "⚠️ " + finalErr;
+      body.appendChild(note);
+    }
+    if (!finalErr && summaryText) history.push({ role: "assistant", content: summaryText });
+    saveChatHistory();
+    const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
+    if (stopBtn) stopBtn.style.display = "none";
+    _updateFilesBar(filesBar, filesList, trackedFiles);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+}
+
+function _createToolStep(call) {
+  const pathDisplay = call.path || call.command || "";
+  const fileName = pathDisplay.split("/").pop();
+  const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
+  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched" }[call.type] || "";
+  const typeIcons = {
+    write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
+    read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
+    cmd: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25V2.75zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25H1.75zM7.25 8a.75.75 0 01-.22.53l-2.25 2.25a.75.75 0 11-1.06-1.06L5.44 8 3.72 6.28a.75.75 0 111.06-1.06l2.25 2.25A.75.75 0 017.25 8zM8 11.5a.75.75 0 01.75-.75h2.5a.75.75 0 010 1.5h-2.5a.75.75 0 01-.75-.75z"/></svg>`,
+    list: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75zM1.5 2.75a.25.25 0 01.25-.25H5c.06 0 .118.026.158.07l.9 1.2a1.75 1.75 0 001.4.73h6.75a.25.25 0 01.25.25v8.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75z"/></svg>`,
+    edit: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
+    search: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
+    find: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>`,
+    web: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
+  };
+
+  const step = document.createElement("div");
+  step.className = `agent-tool-step agent-tool-step--${call.type}`;
+
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web";
+  let pathHtml = _nonClickable
+    ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
+    : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
+
+  step.innerHTML =
+    `<div class="agent-tool-row">` +
+    `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+    `<div class="atc-type-icon">${typeIcons[call.type] || typeIcons.read}</div>` +
+    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${actionLabel}</span>${pathHtml}</div></div>` +
+    `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
+    `<div class="atc-viewport"></div>`;
+  step.querySelector(".agent-tool-row").addEventListener("click", () => step.classList.toggle("is-open"));
+  const clickablePath = step.querySelector(".atc-path--clickable");
+  if (clickablePath) {
+    clickablePath.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const fp = clickablePath.dataset.filepath;
+      if (fp) {
+        const root = rootPath || workspaceRoots[0] || "";
+        const fullPath = fp.startsWith("/") ? fp : root + "/" + fp;
+        openFile(fullPath, fp.split("/").pop());
+      }
+    });
+  }
+  return step;
+}
+
+async function _executeToolStep(step, call, root) {
+  const vp = step.querySelector(".atc-viewport");
+  const res = step.querySelector(".atc-result");
+  const row = step.querySelector(".agent-tool-row");
+
+  const readOnlyMode = _currentAiMode === "explorer" || _currentAiMode === "reviewer";
+  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "cmd")) {
+    const modeName = _currentAiMode === "explorer" ? "Explorer" : "Reviewer";
+    const what = call.type === "cmd" ? "运行命令" : "修改文件";
+    res.className = "atc-result atc-result--blocked";
+    res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
+    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。只能用 read_file/list_dir/search/find_files。` };
+  }
+
+  try {
+    if (call.type === "read") {
+      if (!call.path || !call.path.trim()) {
+        res.className = "atc-result atc-result--err";
+        res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.03 3.97a.75.75 0 00-1.06 0L6 4.94 5.03 3.97a.75.75 0 10-1.06 1.06L4.94 6 3.97 6.97a.75.75 0 101.06 1.06L6 7.06l.97.97a.75.75 0 101.06-1.06L7.06 6l.97-.97a.75.75 0 000-1.06z"/></svg> empty path`;
+        return null;
+      }
+      let rawPath = call.path.trim();
+      const homeDir = _cachedHomeDir || "";
+      if (rawPath.startsWith("~/") && homeDir) {
+        rawPath = homeDir + rawPath.slice(1);
+      }
+      const candidates = [];
+      if (rawPath.startsWith("/")) {
+        candidates.push(rawPath);
+        if (root && !rawPath.startsWith(root)) {
+          const basename = rawPath.split("/").pop();
+          if (basename) candidates.push(root + "/" + basename);
+        }
+      } else {
+        if (root) candidates.push(root + "/" + rawPath);
+        candidates.push(rawPath);
+      }
+
+      let txt = "";
+      let readFailed = true;
+      let readError = "";
+      let usedPath = candidates[0];
+
+      let isDir = false;
+      for (const fp of candidates) {
+        try {
+          txt = await backend.readTextFile(fp);
+          readFailed = false;
+          usedPath = fp;
+          break;
+        } catch (e) {
+          const msg = String(e?.message || e);
+          if (/is a directory|os error 21/i.test(msg)) { isDir = true; usedPath = fp; break; }
+          readError = msg.slice(0, 200);
+        }
+      }
+
+      if (isDir) {
+        call.type = "list"; call.path = usedPath;
+        try {
+          const entries = await backend.readDir(usedPath);
+          const lines = entries.map(e => `${e.is_dir ? "d" : "-"} ${e.name}`);
+          const listing = lines.join("\n");
+          res.className = "atc-result atc-result--ok";
+          res.textContent = `${entries.length} items (auto-switched to list_dir)`;
+          vp.innerHTML = `<pre>${_escHtml(listing || "(empty directory)")}</pre>`;
+          return { type: "list", path: call.path, content: listing || "(empty directory)" };
+        } catch (dirErr) {
+          res.className = "atc-result atc-result--err";
+          res.textContent = String(dirErr?.message || dirErr).slice(0, 120);
+          return { type: "list", path: call.path, content: `[ERROR] Cannot list directory: ${usedPath}` };
+        }
+      }
+
+      if (readFailed) {
+        let helpHint = "";
+        if (root) {
+          try {
+            const parentDir = candidates[0].split("/").slice(0, -1).join("/") || root;
+            const siblings = await backend.readDir(parentDir);
+            const names = siblings.slice(0, 10).map(e => e.name).join(", ");
+            if (names) helpHint = `\nFiles in ${parentDir}: ${names}`;
+          } catch {}
+        }
+        res.className = "atc-result atc-result--err";
+        res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.03 3.97a.75.75 0 00-1.06 0L6 4.94 5.03 3.97a.75.75 0 10-1.06 1.06L4.94 6 3.97 6.97a.75.75 0 101.06 1.06L6 7.06l.97.97a.75.75 0 101.06-1.06L7.06 6l.97-.97a.75.75 0 000-1.06z"/></svg> ${_escHtml(readError || "not found")}`;
+        step.classList.add("agent-tool-step--rejected");
+        vp.innerHTML = `<div style="padding:8px 12px;color:rgba(255,255,255,.4);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
+        return { type: "read", path: call.path, content: `[ERROR] File not found: ${rawPath}. Workspace root is: ${root || "(none)"}. Use full absolute path.${helpHint}` };
+      }
+      const allLines = txt.split("\n");
+      const total = allLines.length;
+      // Page by line so the model can read large files fully (offset/limit),
+      // instead of being stuck with only the first few KB.
+      const start = Math.max(0, (Number.isFinite(call.offset) && call.offset > 0 ? Math.floor(call.offset) : 1) - 1);
+      const limit = Number.isFinite(call.limit) && call.limit > 0 ? Math.floor(call.limit) : 400;
+      let slice = allLines.slice(start, start + limit);
+      const shownFrom = start + 1;
+      const shownTo = Math.min(start + slice.length, total);
+      let body = slice.join("\n");
+      const CHAR_CAP = 16000;
+      let charCapped = false;
+      if (body.length > CHAR_CAP) { body = body.slice(0, CHAR_CAP); charCapped = true; }
+
+      const sizeLabel = txt.length > 1024 ? `${(txt.length / 1024).toFixed(1)} KB` : `${txt.length} chars`;
+      res.className = "atc-result atc-result--ok";
+      const rangeLabel = (start > 0 || shownTo < total) ? ` (${shownFrom}-${shownTo}/${total})` : "";
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg> ${total} lines · ${sizeLabel}${rangeLabel}`;
+      vp.innerHTML = `<pre>${_escHtml(body.slice(0, 4000))}</pre>`;
+      row.addEventListener("dblclick", () => openFile(usedPath, call.path.split("/").pop()));
+
+      let hint = "";
+      if (shownTo < total) hint = `\n\n（已显示第 ${shownFrom}-${shownTo} 行，共 ${total} 行。用 read_file(path, offset=${shownTo + 1}) 继续读后续内容。）`;
+      else if (charCapped) hint = `\n\n（内容过长已截断，用更小的 limit 或更大的 offset 分段读。）`;
+      const header = (start > 0 || shownTo < total) ? `（${call.path} 第 ${shownFrom}-${shownTo}/${total} 行）\n` : "";
+      return { type: "read", path: call.path, content: header + body + hint };
+
+    } else if (call.type === "list") {
+      let fp = call.path.startsWith("/") ? call.path : (root ? root + "/" + call.path : call.path);
+      if (root && !fp.startsWith(root) && !fp.startsWith("/tmp") && !fp.startsWith("/Users")) {
+        fp = root + "/" + call.path.replace(/^\/+/, "");
+      }
+      let entries = [];
+      try {
+        entries = await backend.readDir(fp);
+      } catch {
+        try {
+          const r = await backend.taskRunCapture(root || "/tmp", `ls -la "${fp}" 2>/dev/null | head -60`);
+          const ls = r?.stdout || "";
+          const items = ls.split("\n").filter(l => l.trim());
+          res.className = items.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+          res.textContent = `${items.length} items`;
+          vp.innerHTML = `<pre>${_escHtml(ls || "(empty or inaccessible)")}</pre>`;
+          return { type: "list", path: call.path, content: ls || "(empty)" };
+        } catch {}
+      }
+      const lines = entries.map(e => `${e.is_dir ? "d" : "-"} ${e.name}`);
+      const listing = lines.join("\n");
+      res.className = "atc-result atc-result--ok";
+      res.textContent = `${entries.length} items`;
+      vp.innerHTML = `<pre>${_escHtml(listing || "(empty directory)")}</pre>`;
+      return { type: "list", path: call.path, content: listing || "(empty directory)" };
+
+    } else if (call.type === "write" || call.type === "edit") {
+      const writeRoot = root || '/tmp';
+      const fp = call.path.startsWith("/") ? call.path : root + "/" + call.path;
+      let old = "";
+      let existed = false;
+      try { old = await backend.readTextFile(fp); existed = true; } catch {}
+
+      let newContent = call.content;
+
+      // edit_file: derive the new content by substituting old_string -> new_string
+      // against the *current* file, with Claude-Code-style uniqueness checks so a
+      // sloppy match never silently rewrites the wrong place.
+      if (call.type === "edit") {
+        if (!existed) {
+          res.className = "atc-result atc-result--err";
+          res.textContent = "文件不存在";
+          return { type: "edit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
+        }
+        const oldStr = call.oldString || "";
+        if (!oldStr) {
+          res.className = "atc-result atc-result--err";
+          res.textContent = "缺少 old_string";
+          return { type: "edit", path: call.path, content: "[ERROR] edit_file 需要非空 old_string。" };
+        }
+        const occ = old.split(oldStr).length - 1;
+        if (occ === 0) {
+          res.className = "atc-result atc-result--err";
+          res.textContent = "未找到 old_string";
+          return { type: "edit", path: call.path, content: `[ERROR] 在 ${call.path} 中找不到 old_string。请先 read_file，再逐字符复制要替换的原文。` };
+        }
+        if (occ > 1 && !call.replaceAll) {
+          res.className = "atc-result atc-result--err";
+          res.textContent = `old_string 出现 ${occ} 次`;
+          return { type: "edit", path: call.path, content: `[ERROR] old_string 在 ${call.path} 中出现 ${occ} 次（不唯一）。请加更多上下文以唯一定位，或设 replace_all=true。` };
+        }
+        newContent = call.replaceAll ? old.split(oldStr).join(call.newString || "") : old.replace(oldStr, call.newString || "");
+      }
+
+      if (existed && newContent === old) {
+        res.className = "atc-result atc-result--ok";
+        res.textContent = "无变化";
+        return { type: call.type, path: call.path, content: `(${call.path} 内容未变化)` };
+      }
+
+      const added = newContent.split("\n").length;
+      const removed = old ? old.split("\n").length : 0;
+      res.className = "atc-result atc-result--pending";
+      res.innerHTML = `<span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span>`;
+      vp.innerHTML = _buildDiffView(old, newContent, call.path);
+      _highlightDiffView(vp);
+      step.classList.add("is-open");
+
+      // Agent mode applies edits automatically so the loop stays autonomous; the
+      // diff stays visible and an Undo button makes every change reversible.
+      let writeErr = "";
+      try {
+        const dir = fp.split("/").slice(0, -1).join("/");
+        if (dir) await backend.taskRunCapture(writeRoot, `mkdir -p "${dir}"`).catch(() => {});
+        await backend.writeTextFile(fp, newContent);
+      } catch (e1) {
+        try {
+          await backend.taskRunCapture(root, `mkdir -p "$(dirname '${fp}')" && cat > "${fp}" << 'AGENT_EOF'\n${newContent}\nAGENT_EOF`);
+        } catch (e2) { writeErr = String(e2?.message || e2); }
+      }
+
+      if (writeErr) {
+        step.classList.add("agent-tool-step--rejected");
+        res.className = "atc-result atc-result--err";
+        res.textContent = writeErr.slice(0, 80);
+        return { type: call.type, path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
+      }
+
+      step.classList.add("agent-tool-step--accepted");
+      res.className = "atc-result atc-result--ok";
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">Undo</button>`;
+      row.addEventListener("dblclick", () => openFile(fp, call.path.split("/").pop()));
+      _ipcBroadcast("file_changed", { path: fp });
+      showToast(`${existed ? "Updated" : "Created"} ${call.path.split("/").pop()}`);
+
+      const undoBtn = res.querySelector(".atc-undo-btn");
+      if (undoBtn) {
+        undoBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            if (existed) await backend.writeTextFile(fp, old);
+            else await backend.deletePath(fp).catch(() => backend.writeTextFile(fp, ""));
+            step.classList.remove("agent-tool-step--accepted");
+            step.classList.add("agent-tool-step--rejected");
+            res.className = "atc-result atc-result--err";
+            res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.03 3.97a.75.75 0 00-1.06 0L6 4.94 5.03 3.97a.75.75 0 10-1.06 1.06L4.94 6 3.97 6.97a.75.75 0 101.06 1.06L6 7.06l.97.97a.75.75 0 101.06-1.06L7.06 6l.97-.97a.75.75 0 000-1.06z"/></svg> Reverted`;
+            _ipcBroadcast("file_changed", { path: fp });
+            showToast(`Reverted ${call.path.split("/").pop()}`);
+          } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
+        });
+      }
+      return { type: call.type, path: call.path, content: existed ? `已修改 ${call.path}（+${added}/-${removed} 行）。` : `已新建 ${call.path}（${added} 行）。` };
+
+    } else if (call.type === "search") {
+      const q = (call.query || "").trim();
+      if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "空查询"; return { type: "search", path: call.path, content: "[ERROR] 空查询。" }; }
+      const searchRoot = (call.searchPath && call.searchPath.trim())
+        ? (call.searchPath.startsWith("/") ? call.searchPath : (root ? root + "/" + call.searchPath : call.searchPath))
+        : (root || "");
+      if (!searchRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "search", path: call.path, content: "[ERROR] 未打开工作区，无法搜索。" }; }
+      let fileMatches = [];
+      try { fileMatches = await backend.invoke("search_in_project", { root: searchRoot, query: q, caseSensitive: false }) || []; }
+      catch (e) { res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80); return { type: "search", path: call.path, content: `[ERROR] 搜索失败: ${e?.message || e}` }; }
+      let hits = 0;
+      const lines = [];
+      for (const fm of fileMatches) {
+        const rel = fm.rel || fm.name || fm.path || "";
+        for (const m of (fm.matches || [])) {
+          lines.push(`${rel}:${m.line}: ${(m.text || "").trim()}`);
+          if (++hits >= 80) break;
+        }
+        if (hits >= 80) break;
+      }
+      const summary = `${hits} 处匹配 · ${fileMatches.length} 个文件`;
+      res.className = fileMatches.length ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+      res.textContent = fileMatches.length ? summary : "无匹配";
+      vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无匹配)")}</pre>`;
+      return { type: "search", path: call.path, content: lines.length ? `搜索 "${q}" — ${summary}:\n${lines.join("\n")}` : `搜索 "${q}"：无匹配。` };
+
+    } else if (call.type === "find") {
+      const r = await _agentFindFiles(root, call.pattern || call.path || "");
+      res.className = r.count ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+      res.textContent = r.count ? `${r.count} 个文件` : "无匹配";
+      vp.innerHTML = `<pre>${_escHtml(r.text)}</pre>`;
+      return { type: "find", path: call.path, content: `find_files "${call.pattern || call.path}":\n${r.text}` };
+
+    } else if (call.type === "web") {
+      const url = (call.url || call.path || "").trim();
+      if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "web", path: call.path, content: "[ERROR] 空 URL。" }; }
+      let text = "";
+      try { text = await backend.invoke("web_fetch", { url }); }
+      catch (e) {
+        const msg = String(e?.message || e).slice(0, 160);
+        res.className = "atc-result atc-result--err";
+        res.textContent = msg.slice(0, 80);
+        return { type: "web", path: call.path, content: `[ERROR] 抓取失败: ${msg}` };
+      }
+      const chars = text.length;
+      res.className = "atc-result atc-result--ok";
+      res.textContent = chars > 1024 ? `${(chars / 1024).toFixed(1)} KB` : `${chars} chars`;
+      vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
+      return { type: "web", path: call.path, content: `网页 ${url}:\n${text}` };
+
+    } else if (call.type === "cmd") {
+      if (!call.command || !call.command.trim()) {
+        return null;
+      }
+      step.className = "agent-term-card agent-term-card--running";
+      step.innerHTML =
+        `<div class="agent-term-card__header">` +
+          `<div class="agent-term-card__dots"><i></i><i></i><i></i></div>` +
+          `<span class="agent-term-card__label">Terminal</span>` +
+          `<span class="agent-term-timer"></span>` +
+          `<div class="agent-term-status agent-term-status--running"><span class="agent-term-spinner"></span> Running</div>` +
+        `</div>` +
+        `<div class="agent-term-card__cmd">` +
+          `<span class="agent-term-card__prompt">$</span>` +
+          `<code class="agent-term-card__code">${_escHtml(call.command)}</code>` +
+        `</div>` +
+        `<pre class="agent-term-output" style="display:none"></pre>` +
+        `<div class="agent-term-card__footer" style="display:none">` +
+          `<button class="agent-term-toggle" title="Toggle output">Show output</button>` +
+          `<button class="agent-term-copy" title="Copy output">Copy</button>` +
+        `</div>`;
+
+      const result = await _agentRunInTerminal(root, call.command, step);
+
+      const outEl = step.querySelector(".agent-term-output");
+      const footerEl = step.querySelector(".agent-term-card__footer");
+      const output = (result.stdout + (result.stderr ? "\n" + result.stderr : "")).trim();
+
+      if (output && outEl) {
+        outEl.textContent = output.slice(0, 5000);
+        footerEl.style.display = "";
+
+        const toggleBtn = step.querySelector(".agent-term-toggle");
+        toggleBtn?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const visible = outEl.style.display !== "none";
+          outEl.style.display = visible ? "none" : "block";
+          toggleBtn.textContent = visible ? "Show output" : "Hide output";
+        });
+
+        const copyBtn = step.querySelector(".agent-term-copy");
+        copyBtn?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          navigator.clipboard?.writeText(output).then(() => {
+            copyBtn.textContent = "Copied!";
+            setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500);
+          });
+        });
+      }
+
+      return { type: "cmd", path: call.command, content: output ? output.slice(0, 2000) : "(executed)" };
+    }
+  } catch (e) {
+    res.className = "atc-result atc-result--err";
+    res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M4.47.22A.75.75 0 015 0h2a.75.75 0 01.53.22l4.25 4.25c.141.14.22.331.22.53v2a.75.75 0 01-.22.53l-4.25 4.25A.75.75 0 017 12H5a.75.75 0 01-.53-.22L.22 7.53A.75.75 0 010 7V5a.75.75 0 01.22-.53L4.47.22zM6.5 7.75a.75.75 0 100 1.5.75.75 0 000-1.5zM5.75 3v3.5a.75.75 0 001.5 0V3a.75.75 0 00-1.5 0z"/></svg> ${_escHtml(String(e?.message || e).slice(0, 50))}`;
+  }
+  return null;
+}
+
+function _buildDiffView(oldText, newText, filePath) {
+  const oldL = oldText ? oldText.split("\n") : [];
+  const newL = newText.split("\n");
+  const ext = (filePath || "").split(".").pop().toLowerCase();
+  const monoLang = _ATC_LANG_MAP[ext] || ext;
+  const badge = _langBadge(filePath || ext || "file");
+  const isNew = !oldText;
+
+  let h = '';
+  h += `<div class="atc-diff" data-lang="${_escHtml(monoLang)}">`;
+
+  const cap = 60;
+  let rendered = 0;
+
+  if (isNew) {
+    for (let i = 0; i < newL.length && rendered < cap; i++, rendered++) {
+      h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${_escAttr(newL[i])}">${_escHtml(newL[i])}</span></div>`;
+    }
+  } else {
+    const maxLen = Math.max(oldL.length, newL.length);
+    let lastShown = -1;
+    for (let i = 0; i < maxLen && rendered < cap; i++) {
+      const oLine = i < oldL.length ? oldL[i] : undefined;
+      const nLine = i < newL.length ? newL[i] : undefined;
+
+      if (oLine !== undefined && nLine !== undefined && oLine === nLine) {
+        if (i - lastShown === 2) {
+          h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${_escAttr(nLine)}">${_escHtml(nLine)}</span></div>`;
+          rendered++;
+        }
+        continue;
+      }
+
+      if (i - lastShown > 2 && lastShown >= 0) {
+        const skipped = i - lastShown - 1;
+        if (skipped > 0) {
+          h += `<div class="atc-diff-more">@@ ${skipped} unchanged line${skipped > 1 ? 's' : ''} @@</div>`;
+        }
+      }
+
+      if (lastShown < 0 && i > 0) {
+        const ctxStart = Math.max(0, i - 2);
+        for (let c = ctxStart; c < i; c++) {
+          if (c < oldL.length) {
+            h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${c + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${_escAttr(oldL[c])}">${_escHtml(oldL[c])}</span></div>`;
+            rendered++;
+          }
+        }
+      }
+
+      if (oLine !== undefined && oLine !== nLine) {
+        h += `<div class="atc-diff-row atc-diff-row--del"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">-</span><span class="atc-diff-code" data-raw="${_escAttr(oLine)}">${_escHtml(oLine)}</span></div>`;
+        rendered++;
+      }
+      if (nLine !== undefined && oLine !== nLine) {
+        h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${_escAttr(nLine)}">${_escHtml(nLine)}</span></div>`;
+        rendered++;
+      }
+      lastShown = i;
+    }
+  }
+
+  if (rendered >= cap) {
+    const remaining = Math.max(oldL.length, newL.length) - cap;
+    if (remaining > 0) h += `<div class="atc-diff-more">… ${remaining} more lines not shown …</div>`;
+  }
+  h += "</div>";
+  return h;
+}
+
+function _escAttr(s) {
+  return (s || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function _highlightDiffView(container) {
+  const diff = container.querySelector(".atc-diff");
+  if (!diff) return;
+  const lang = diff.dataset.lang;
+  if (!lang || lang === "default") return;
+
+  const monoId = monacoLang(lang);
+  if (monoId === "plaintext") return;
+
+  const codeEls = diff.querySelectorAll(".atc-diff-code[data-raw]");
+  for (const el of codeEls) {
+    const raw = el.dataset.raw;
+    if (!raw || !raw.trim()) continue;
+    try {
+      let html = await monaco.editor.colorize(raw, monoId, { tabSize: 2 });
+      html = html.replace(/<br\/?>\s*$/, "").replace(/^<div>/, "").replace(/<\/div>$/, "");
+      if (html) el.innerHTML = html;
+    } catch { /* keep plain text */ }
+  }
+}
+
+async function _agentFollowUp(toolResults, container) {
+  const config = loadConfig();
+  if (!config.baseUrl || !config.apiKey) return;
+
+  const followUpCtx = toolResults.map(r => {
+    if (r.type === "read") return `--- 文件: ${r.path} ---\n${r.content}`;
+    if (r.type === "list") return `--- 目录: ${r.path} ---\n${r.content}`;
+    if (r.type === "cmd" && r.content && r.content !== "(executed)") return `--- 命令: ${r.path} ---\n输出:\n${r.content}`;
+    return "";
+  }).filter(Boolean).join("\n\n");
+
+  if (!followUpCtx) return;
+
+  const body = container;
+  body.appendChild(thinkingCard());
+  chatEl.scrollTop = chatEl.scrollHeight;
+
+  const messages = [
+    { role: "system", content: _AI_MODE_PROMPTS.agent },
+    ...history,
+    { role: "user", content: `以下是工具执行结果（文件内容、目录列表、命令输出），请根据这些信息继续完成任务：\n\n${followUpCtx}` },
+  ];
+
+  let acc = "";
+  let err = null;
+  let _segR2 = 0, _streamE2 = null;
+  const root = rootPath || workspaceRoots[0] || "";
+  const proms = [];
+  try {
+    await backend.aiChat(config, messages, (ev) => {
+      if (ev.kind === "token") {
+        acc += ev.delta;
+        body.querySelector(".thinking")?.remove();
+        const segs = _parseStreamSegments(acc);
+        const ce = segs.length > 0 && !segs[segs.length - 1].complete ? segs.length - 1 : segs.length;
+        while (_segR2 < ce) {
+          if (_streamE2) { _streamE2.remove(); _streamE2 = null; }
+          _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms);
+          _segR2++;
+        }
+        const tail = ce < segs.length ? segs[segs.length - 1] : null;
+        if (tail) {
+          if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
+          if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownInto(_streamE2, c, { streaming: true }); }
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else if (ev.kind === "error") { err = ev.message; }
+    });
+  } catch (e) { if (!err) err = String(e); }
+  body.querySelector(".thinking")?.remove();
+  if (_streamE2) { _streamE2.remove(); _streamE2 = null; }
+  if (acc) {
+    const segs = _parseStreamSegments(acc);
+    while (_segR2 < segs.length) { _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms); _segR2++; }
+    if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 // ---- AI inline code completion (Edit Prediction) ----
-let _completionTimer = null;
-const COMPLETION_DEBOUNCE = 600;
 let _completionAbort = null;
+let _lastCompletionKey = "";
+let _cachedCompletion = null;
+const _COMPLETION_DEBOUNCE = 400;
+
+function _extractFileStructure(model, maxLines) {
+  const total = model.getLineCount();
+  const lines = [];
+  const limit = Math.min(total, maxLines || 30);
+  for (let i = 1; i <= limit; i++) {
+    const line = model.getLineContent(i);
+    if (/^\s*(import |from |require\(|#include|using |package |module )/.test(line) ||
+        /^\s*(class |def |function |const |let |var |export |interface |type |struct |enum |pub fn |fn |async fn )/.test(line) ||
+        /^\s*@/.test(line)) {
+      lines.push(line);
+    }
+  }
+  return lines.join("\n");
+}
+
+function _detectCommentIntent(textBefore) {
+  const lines = textBefore.split("\n");
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+    const trimmed = lines[i].trim();
+    if (/^(\/\/|#|\/\*|\*|--|"""|''')/.test(trimmed) && trimmed.length > 8) {
+      return trimmed;
+    }
+    if (trimmed.length > 0) break;
+  }
+  return null;
+}
+
+function _buildCompletionPrompt(lang, fileName, textBefore, textAfter, structure, commentIntent) {
+  let systemPrompt = `You are a code completion engine. Output ONLY the raw code to insert at the cursor. Rules:
+1. NO markdown, NO explanations, NO code fences, NO thinking process.
+2. Match existing code style.
+3. Keep completions concise (1-5 lines typically).
+4. Complete the current expression/statement fully - never leave syntax open.`;
+
+  if (commentIntent) {
+    systemPrompt += `\nThe user wrote a comment: "${commentIntent}". Generate the implementation.`;
+  }
+
+  const beforeCtx = textBefore.slice(-1500);
+  const afterCtx = textAfter.slice(0, 400);
+  let userContent = `${fileName} (${lang})`;
+  if (structure) userContent += `\n${structure}`;
+  userContent += `\n\n${beforeCtx}█${afterCtx}`;
+
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userContent },
+  ];
+}
 
 function initInlineCompletion() {
   monaco.languages.registerInlineCompletionsProvider("*", {
     provideInlineCompletions: async (model, position, _context, token) => {
+      if (_imeComposing) return undefined;
       const config = loadConfig();
-      if (!config.baseUrl || !config.apiKey || !config.model) return { items: [] };
+      if (!config.baseUrl || !config.apiKey || !config.model) return undefined;
 
       const textBefore = model.getValueInRange({
-        startLineNumber: Math.max(1, position.lineNumber - 50),
+        startLineNumber: Math.max(1, position.lineNumber - 80),
         startColumn: 1,
         endLineNumber: position.lineNumber,
         endColumn: position.column,
@@ -4116,47 +7795,53 @@ function initInlineCompletion() {
       const textAfter = model.getValueInRange({
         startLineNumber: position.lineNumber,
         startColumn: position.column,
-        endLineNumber: Math.min(model.getLineCount(), position.lineNumber + 10),
-        endColumn: model.getLineMaxColumn(Math.min(model.getLineCount(), position.lineNumber + 10)),
+        endLineNumber: Math.min(model.getLineCount(), position.lineNumber + 20),
+        endColumn: model.getLineMaxColumn(Math.min(model.getLineCount(), position.lineNumber + 20)),
       });
 
       if (textBefore.trim().length < 3) return { items: [] };
 
+      const cacheKey = `${model.uri.toString()}:${position.lineNumber}:${position.column}:${textBefore.slice(-100)}`;
+      if (cacheKey === _lastCompletionKey && _cachedCompletion) return _cachedCompletion;
+
       const lang = model.getLanguageId();
       const fileName = activePath ? activePath.split("/").pop() : "untitled";
+      const structure = _extractFileStructure(model, 40);
+      const commentIntent = _detectCommentIntent(textBefore);
 
-      const msgs = [
-        { role: "system", content: `You are a code completion engine. Complete the code at the cursor position. Output ONLY the completion text (the code that should be inserted at the cursor). No explanations, no markdown, no code fences. If no meaningful completion, output nothing.` },
-        { role: "user", content: `File: ${fileName} (${lang})\n\n--- CODE BEFORE CURSOR ---\n${textBefore.slice(-2000)}\n--- CURSOR IS HERE ---\n--- CODE AFTER CURSOR ---\n${textAfter.slice(0, 500)}` },
-      ];
+      const maxTokens = commentIntent ? 4096 : 2048;
+      const msgs = _buildCompletionPrompt(lang, fileName, textBefore, textAfter, structure, commentIntent);
 
       try {
-        if (_completionAbort) _completionAbort.abort();
-        const controller = new AbortController();
-        _completionAbort = controller;
+        if (_completionAbort) { _completionAbort._cancelled = true; }
+        const thisRequest = { _cancelled: false };
+        _completionAbort = thisRequest;
 
-        const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${config.apiKey}`,
-          },
-          body: JSON.stringify({
-            model: config.model,
-            messages: msgs,
-            max_tokens: 128,
-            temperature: 0,
-            stream: false,
-          }),
-          signal: controller.signal,
+        const inlineModel = config.baseUrl?.includes("deepseek") ? "deepseek-v4-flash" : config.model;
+        const aiConfig = {
+          baseUrl: config.baseUrl.replace(/\/+$/, ""),
+          apiKey: config.apiKey,
+          model: inlineModel,
+          maxTokens: maxTokens,
+          temperature: 0,
+        };
+        let text = await new Promise((resolve) => {
+          let buf = "";
+          backend.aiChat(aiConfig, msgs, (ev) => {
+            if (ev.kind === "token") buf += ev.delta;
+            else if (ev.kind === "done") resolve(buf);
+            else if (ev.kind === "error") resolve("");
+          }).catch(() => resolve(""));
+          setTimeout(() => resolve(buf), 30000);
         });
-        if (token.isCancellationRequested) return { items: [] };
-        if (!resp.ok) return { items: [] };
-        const data = await resp.json();
-        const text = data?.choices?.[0]?.message?.content;
+
+        if (token.isCancellationRequested || thisRequest._cancelled) return { items: [] };
         if (!text || !text.trim()) return { items: [] };
-        return {
+
+        text = text.replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "");
+        if (text.startsWith("```")) text = text.slice(3).replace(/^[\w]*\n/, "");
+
+        const result = {
           items: [{
             insertText: text,
             range: {
@@ -4167,11 +7852,15 @@ function initInlineCompletion() {
             },
           }],
         };
+        _lastCompletionKey = cacheKey;
+        _cachedCompletion = result;
+        return result;
       } catch {
         return { items: [] };
       }
     },
     freeInlineCompletions: () => {},
+    disposeInlineCompletions: () => {},
   });
 }
 if (typeof monaco !== "undefined") initInlineCompletion();
@@ -4300,13 +7989,32 @@ monacoEditor.addAction({
   run: () => openInlineAssistant(),
 });
 
+// ---- AI Diff Preview ----
+function showAiDiffPreview(originalCode, modifiedCode, lang, filePath) {
+  const ed = ensureDiffEditor({ readOnly: true, originalEditable: false });
+  const original = monaco.editor.createModel(originalCode, lang || "plaintext");
+  const modified = monaco.editor.createModel(modifiedCode, lang || "plaintext");
+  const prev = ed.getModel();
+  ed.setModel({ original, modified });
+  if (prev) {
+    prev.original?.dispose();
+    prev.modified?.dispose();
+  }
+  _diffFilePath = filePath || null;
+  $("diffTitle").textContent = filePath ? filePath.split("/").pop() + " (AI Preview)" : "AI Diff Preview";
+  diffViewEl.hidden = false;
+  ed.layout();
+
+  ed.updateOptions({ readOnly: false, originalEditable: false });
+}
+
 // ---- settings dialog ----
 const settingsEl = $("settings");
 function openSettings() {
   const c = loadConfig();
-  $("cfgBaseUrl").value = c.baseUrl || "https://api.openai.com/v1";
-  $("cfgApiKey").value = c.apiKey || "";
-  $("cfgModel").value = c.model || "gpt-4o-mini";
+  $("cfgBaseUrl").value = c.baseUrl || _DEFAULT_AI_CONFIG.baseUrl;
+  $("cfgApiKey").value = c.apiKey || _DEFAULT_AI_CONFIG.apiKey;
+  $("cfgModel").value = c.model || _DEFAULT_AI_CONFIG.model;
   settingsEl.showModal();
 }
 $("settingsForm").addEventListener("submit", async (e) => {
@@ -4884,6 +8592,7 @@ function runCommandForFile(path) {
   const name = basename(path);
   const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
   const q = shellQuote(path);
+  const dir = shellQuote(dirname(path));
   switch (ext) {
     case "js":
     case "mjs":
@@ -4911,30 +8620,217 @@ function runCommandForFile(path) {
     case "java": {
       const className = name.replace(/\.java$/i, "");
       if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(className)) return null;
-      return `cd ${shellQuote(dirname(path))} && javac ${shellQuote(name)} && java ${className}`;
+      return `cd ${dir} && javac ${shellQuote(name)} && java ${className}`;
     }
+    case "kt":
+    case "kts":
+      return `kotlinc-jvm ${q} -include-runtime -d /tmp/_kt_out.jar && java -jar /tmp/_kt_out.jar`;
+    case "swift":
+      return `swift ${q}`;
+    case "c": {
+      const out = `/tmp/michael-ide-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}`;
+      return `gcc ${q} -o ${shellQuote(out)} && ${shellQuote(out)}`;
+    }
+    case "cpp":
+    case "cc":
+    case "cxx": {
+      const out = `/tmp/michael-ide-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}`;
+      return `g++ -std=c++17 ${q} -o ${shellQuote(out)} && ${shellQuote(out)}`;
+    }
+    case "cs":
+      return `dotnet-script ${q}`;
+    case "lua":
+      return `lua ${q}`;
+    case "pl":
+    case "pm":
+      return `perl ${q}`;
+    case "dart":
+      return `dart run ${q}`;
+    case "r":
+    case "R":
+      return `Rscript ${q}`;
+    case "html":
+    case "htm":
+      return `__SERVE_HTML__`;
+    case "vue":
+    case "svelte":
+    case "jsx":
+    case "tsx":
+      return `__SERVE_FRONTEND__`;
+    case "css":
+    case "scss":
+    case "less":
+      return `__SERVE_HTML__`;
     case "json":
       return `python3 -m json.tool ${q}`;
+    case "sql":
+      return `sqlite3 < ${q}`;
     default:
       return null;
   }
 }
 
+async function _waitTermReady(maxWait = 3000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    const tab = activeTermTab >= 0 ? termTabs[activeTermTab] : null;
+    if (tab?.backendId != null && !tab.opening) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
+}
+
+let _devServerPort = null;
+let _devServerRunning = false;
+
+async function _findFreePort(start = 3000) {
+  for (let p = start; p < start + 100; p++) {
+    try {
+      const resp = await fetch(`http://127.0.0.1:${p}`, { signal: AbortSignal.timeout(200) });
+      continue;
+    } catch {
+      return p;
+    }
+  }
+  return start;
+}
+
+async function _startDevServer(dir, port, fileName = "") {
+  const wasOpen = termIsOpen();
+  await openTerminal();
+  if (!wasOpen) {
+    await _waitTermReady(3000);
+    await new Promise((r) => setTimeout(r, 1800));
+  }
+
+  const scriptContent = [
+    "import http.server, socketserver, os, socket, threading, time",
+    `os.chdir(r'${dir}')`,
+    `PORT = ${port}`,
+    "file_hashes = {}",
+    "def scan():",
+    "    h = {}",
+    "    for root, _, files in os.walk('.'):",
+    "        for f in files:",
+    "            if f.endswith(('.html', '.css', '.js', '.json')):",
+    "                p = os.path.join(root, f)",
+    "                try: h[p] = os.path.getmtime(p)",
+    "                except: pass",
+    "    return h",
+    "file_hashes.update(scan())",
+    "last_change = [time.time()]",
+    "def watcher():",
+    "    while True:",
+    "        time.sleep(0.8)",
+    "        cur = scan()",
+    "        if cur != file_hashes:",
+    "            file_hashes.clear()",
+    "            file_hashes.update(cur)",
+    "            last_change[0] = time.time()",
+    "threading.Thread(target=watcher, daemon=True).start()",
+    `RELOAD_JS = b'<script>(function(){var t=0;setInterval(function(){fetch("/__reload__").then(function(r){return r.text()}).then(function(s){var n=parseFloat(s);if(t&&n>t)location.reload();t=n})},800)})()</script>'`,
+    "class RH(http.server.SimpleHTTPRequestHandler):",
+    "    def do_GET(self):",
+    "        if self.path == '/__reload__':",
+    "            self.send_response(200)",
+    "            self.send_header('Content-Type', 'text/plain')",
+    "            self.send_header('Access-Control-Allow-Origin', '*')",
+    "            self.end_headers()",
+    "            self.wfile.write(str(last_change[0]).encode())",
+    "            return",
+    "        path = self.translate_path(self.path)",
+    "        if os.path.isfile(path) and path.endswith('.html'):",
+    "            with open(path, 'rb') as f: data = f.read()",
+    "            data = data.replace(b'</body>', RELOAD_JS + b'</body>')",
+    "            self.send_response(200)",
+    "            self.send_header('Content-Type', 'text/html')",
+    "            self.send_header('Content-Length', str(len(data)))",
+    "            self.end_headers()",
+    "            self.wfile.write(data)",
+    "            return",
+    "        super().do_GET()",
+    "    def log_message(self, fmt, *args):",
+    "        print(f'  {args[1]} {args[0]}')",
+    "try: ip = socket.gethostbyname(socket.gethostname())",
+    "except: ip = '127.0.0.1'",
+    "s = socketserver.TCPServer(('', PORT), RH)",
+    `FILE = '${fileName}'`,
+    `path_suffix = '/' + FILE if FILE else ''`,
+    `print('\\n  \\033[1;32m✦ Michael IDE Dev Server\\033[0m\\n')`,
+    `print(f'  ➜  Local:   \\033[36mhttp://localhost:{PORT}{path_suffix}\\033[0m')`,
+    `print(f'  ➜  Network: \\033[36mhttp://{ip}:{PORT}{path_suffix}\\033[0m')`,
+    `print(f'\\n  Serving:  {os.getcwd()}')`,
+    `print('  Live Reload: \\033[32m✓ enabled\\033[0m')`,
+    `print('  Press \\033[1mCtrl+C\\033[0m to stop\\n')`,
+    "s.serve_forever()",
+  ].join("\n");
+
+  try {
+    const tmpPath = await backend.writeTmpFile("_michael_ide_dev_server.py", scriptContent);
+    writeToActiveTerminal(`\nclear\npython3 ${shellQuote(tmpPath)}\n`);
+  } catch {
+    writeToActiveTerminal(`\nclear\npython3 -m http.server ${port} --directory ${shellQuote(dir)}\n`);
+  }
+  _devServerPort = port;
+  _devServerRunning = true;
+}
+
+async function _startViteServer(dir) {
+  const wasOpen = termIsOpen();
+  await openTerminal();
+  if (!wasOpen) {
+    await _waitTermReady(3000);
+    await new Promise((r) => setTimeout(r, 1800));
+  }
+
+  const q = shellQuote(dir);
+  const hasVite = await new Promise((resolve) => {
+    try {
+      const fs = window.__TAURI_INTERNALS__ ? true : false;
+      resolve(true);
+    } catch { resolve(false); }
+  });
+
+  writeToActiveTerminal(`\nclear\ncd ${q} && npx --yes vite --open\n`);
+  showToast("启动 Vite Dev Server...");
+}
+
 async function runCurrentFile() {
   if (!activePath) {
-    showToast("Open a file to run.");
+    showToast("请先打开一个文件");
     return;
   }
   const command = runCommandForFile(activePath);
   if (!command) {
-    showToast(`No run command configured for ${basename(activePath)}.`);
+    showToast(`不支持运行 ${basename(activePath)} 类型的文件`);
     return;
   }
   const file = openFiles.get(activePath);
   if (file?.dirty) await saveActive();
+
+  if (command === "__SERVE_HTML__") {
+    const dir = dirname(activePath);
+    const port = await _findFreePort(3000);
+    const name = basename(activePath);
+    await _startDevServer(dir, port, name);
+    return;
+  }
+
+  if (command === "__SERVE_FRONTEND__") {
+    const dir = dirname(activePath);
+    await _startViteServer(dir);
+    return;
+  }
+
+  const wasOpen = termIsOpen();
   await openTerminal();
-  writeToActiveTerminal(`\n${command}\n`);
-  showToast(`Running ${basename(activePath)} in terminal`);
+
+  if (!wasOpen) {
+    await _waitTermReady(3000);
+    await new Promise((r) => setTimeout(r, 1800));
+  }
+
+  writeToActiveTerminal(`\nclear\n${command}\n`);
 }
 
 async function runTask(task) {
@@ -5153,24 +9049,301 @@ function renderRemoteTool(body) {
 }
 
 function renderMarketplaceTool(body) {
-  body.classList.add("mkt-body");
-  const wrap = document.createElement("div");
-  wrap.className = "mkt";
-  body.appendChild(wrap);
+  body.innerHTML = '<div class="empty"><p>Use the Extensions button or press ⇧⌘X to open the Marketplace.</p></div>';
+}
 
-  // Per-extension hue drives a soft tile tint that adapts to light/dark in CSS,
-  // keeping the gallery calm and cohesive instead of loud rainbow gradients.
-  const ICON_SVGS = {
-    theme: `<circle cx="13.5" cy="6.5" r="1.4" fill="currentColor"/><circle cx="17.3" cy="10.5" r="1.4" fill="currentColor"/><circle cx="8.4" cy="7.4" r="1.4" fill="currentColor"/><circle cx="6.6" cy="12.4" r="1.4" fill="currentColor"/><path d="M12 2.5C6.75 2.5 2.5 6.75 2.5 12S6.75 21.5 12 21.5c1.1 0 2-.9 2-2 0-.5-.2-.96-.5-1.3-.3-.34-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.3c1.98 0 3.7-1.6 3.7-3.6 0-4.86-4.07-8.8-9-8.8z" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
-    git: `<circle cx="7" cy="7" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="17" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="17" cy="9" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 9.1v5.8M17 11.1c0 3-3 3.7-6.4 3.7" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
-    formatter: `<rect x="3.5" y="3.5" width="17" height="17" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.5 8.5h9M7.5 12h6M7.5 15.5h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
-    linter: `<path d="M12 3l8 3.6v5c0 4.3-3.4 7.5-8 8.9-4.6-1.4-8-4.6-8-8.9v-5L12 3z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
-    language: `<polyline points="15 17 20 12 15 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><polyline points="9 7 4 12 9 17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
-    docker: `<rect x="2.5" y="10" width="19" height="9" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 10V6.5a2 2 0 012-2h8a2 2 0 012 2V10" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
-    ai: `<circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
-    web: `<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
-    default: `<path d="M20 16.5v-9a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 7.5v9a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0020 16.5z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.3 7.5L12 12.5l8.7-5M12 22V12.5" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
-  };
+const MKT_ICON_SVGS = {
+  tailwind: `<path d="M12 5C9.2 5 7.5 6.3 6.8 9c1.1-1.3 2.3-1.8 3.8-1.5.8.2 1.4.8 2 1.4 1 1.1 2.2 2.3 4.7 2.3 2.8 0 4.5-1.3 5.2-4-1.1 1.3-2.3 1.8-3.8 1.5-.8-.2-1.4-.8-2-1.4C15.7 6.2 14.5 5 12 5zM6.8 12.2C4 12.2 2.3 13.5 1.5 16.2c1.1-1.3 2.3-1.8 3.8-1.5.8.2 1.4.8 2 1.4 1 1.1 2.2 2.3 4.7 2.3 2.8 0 4.5-1.3 5.2-4-1.1 1.3-2.3 1.8-3.8 1.5-.8-.2-1.4-.8-2-1.4-1-1.1-2.2-2.3-4.6-2.3z" fill="currentColor"/>`,
+  vue: `<path d="M2 3h4l6 10.5L18 3h4L12 21 2 3z" fill="currentColor" opacity=".3"/><path d="M7 3h3l2 3.5L14 3h3L12 15 7 3z" fill="currentColor"/>`,
+  theme: `<path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.8 0 1.5-.7 1.5-1.5 0-.4-.1-.7-.4-1-.3-.3-.5-.7-.5-1.1 0-.8.7-1.5 1.5-1.5H16c3.3 0 6-2.7 6-6 0-5.5-4.5-9-10-9z" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="8" cy="9" r="1.8" fill="#e53935"/><circle cx="12.5" cy="6.5" r="1.8" fill="#fdd835"/><circle cx="17" cy="9" r="1.8" fill="#43a047"/><circle cx="7" cy="14" r="1.8" fill="#1e88e5"/>`,
+  docker: `<rect x="5" y="11" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="9" y="11" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="13" y="11" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="5" y="8" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="9" y="8" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="13" y="8" width="3" height="2.5" rx=".4" fill="currentColor"/><rect x="9" y="5" width="3" height="2.5" rx=".4" fill="currentColor"/><path d="M2 15c0 0 1.5-2 5-2h12c3 0 3.5 2 3.5 2s-.5 5-8.5 5-12-5-12-5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>`,
+  copilot: `<rect x="3" y="8" width="18" height="10" rx="5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="9" cy="13" r="2" fill="currentColor"/><circle cx="15" cy="13" r="2" fill="currentColor"/><circle cx="9" cy="12.5" r=".8" fill="#fff"/><circle cx="15" cy="12.5" r=".8" fill="#fff"/><path d="M9 5v3M15 5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M6 8C6 5 9 3 12 3s6 2 6 5" fill="none" stroke="currentColor" stroke-width="1.3"/>`,
+  ai: `<rect x="4" y="4" width="16" height="16" rx="4" fill="currentColor" opacity=".1"/><circle cx="12" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="10" r="1" fill="currentColor"/><path d="M12 3v3M12 15v3M5 10h3M16 10h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M7 5.5l2 2M15 13.5l2 2M7 14.5l2-2M15 6.5l2-2" stroke="currentColor" stroke-width="1" stroke-linecap="round" opacity=".5"/>`,
+  hanzi: `<rect x="2" y="2" width="20" height="20" rx="4" fill="currentColor" opacity=".08"/><text x="12" y="17" text-anchor="middle" font-size="15" font-weight="800" font-family="'PingFang SC',system-ui" fill="currentColor">字</text>`,
+  translate: `<rect x="2" y="3" width="9" height="8" rx="2" fill="currentColor" opacity=".1"/><text x="6.5" y="9.5" text-anchor="middle" font-size="7" font-weight="700" font-family="system-ui" fill="currentColor">中</text><rect x="13" y="13" width="9" height="8" rx="2" fill="currentColor" opacity=".1"/><text x="17.5" y="19.5" text-anchor="middle" font-size="7" font-weight="700" font-family="system-ui" fill="currentColor">A</text><path d="M11 7h6M7 17h6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" opacity=".4"/><path d="M14 7l-3 10" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 2" opacity=".3"/>`,
+  camera: `<rect x="2" y="6" width="20" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="13.5" r="4" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="13.5" r="1.5" fill="currentColor"/><path d="M8 6l1.5-3h5L16 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="18" cy="9" r=".8" fill="currentColor"/>`,
+  color: `<circle cx="10" cy="9" r="5" fill="none" stroke="#e53935" stroke-width="1.8"/><circle cx="14" cy="9" r="5" fill="none" stroke="#43a047" stroke-width="1.8"/><circle cx="12" cy="14" r="5" fill="none" stroke="#1e88e5" stroke-width="1.8"/>`,
+  liveserver: `<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/><ellipse cx="12" cy="12" rx="4" ry="9" fill="none" stroke="currentColor" stroke-width="1"/><path d="M3 9h18M3 15h18" stroke="currentColor" stroke-width="1"/><circle cx="18" cy="5" r="3" fill="currentColor"/><path d="M17 4l1.5 1.5L20 4" stroke="#fff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`,
+  zhcn: `<rect x="2" y="4" width="20" height="16" rx="3" fill="currentColor" opacity=".08"/><text x="12" y="15" text-anchor="middle" font-size="9" font-weight="800" font-family="'PingFang SC',system-ui" fill="currentColor">简中</text>`,
+  iconify: `<rect x="3" y="3" width="8" height="8" rx="2" fill="currentColor" opacity=".65"/><rect x="13" y="3" width="8" height="8" rx="2" fill="currentColor" opacity=".45"/><rect x="3" y="13" width="8" height="8" rx="2" fill="currentColor" opacity=".35"/><rect x="13" y="13" width="8" height="8" rx="2" fill="currentColor" opacity=".55"/><circle cx="7" cy="7" r="2" fill="#fff" opacity=".6"/><rect x="14.5" y="5" width="5" height="1.5" rx=".75" fill="#fff" opacity=".5"/><path d="M5 17l3 3 3-3" fill="none" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity=".5"/><circle cx="17" cy="17" r="2" fill="#fff" opacity=".4"/>`,
+  linter: `<path d="M12 2l9.5 4.5v5.5c0 5.5-4 9.5-9.5 11-5.5-1.5-9.5-5.5-9.5-11V6.5L12 2z" fill="currentColor" opacity=".08"/><path d="M12 2l9.5 4.5v5.5c0 5.5-4 9.5-9.5 11-5.5-1.5-9.5-5.5-9.5-11V6.5L12 2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8.5 12.5l2.5 2.5 5-5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+  web: `<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.5"/><ellipse cx="12" cy="12" rx="5" ry="9" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3 12h18" stroke="currentColor" stroke-width="1.2"/><path d="M4 8h16M4 16h16" stroke="currentColor" stroke-width=".8" opacity=".5"/>`,
+  default: `<rect x="3" y="3" width="18" height="18" rx="4" fill="currentColor" opacity=".08"/><path d="M8 8l4 4-4 4M13 16h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+};
+
+function _mktIconFor(entry) {
+  if (entry.icon && MKT_ICON_SVGS[entry.icon]) return MKT_ICON_SVGS[entry.icon];
+  const tags = (entry.tags || []).map(t => t.toLowerCase());
+  if (tags.includes("theme") || tags.includes("icons")) return MKT_ICON_SVGS.theme;
+  if (tags.includes("git")) return MKT_ICON_SVGS.git;
+  if (tags.includes("formatter")) return MKT_ICON_SVGS.formatter;
+  if (tags.includes("linter")) return MKT_ICON_SVGS.linter;
+  if (tags.includes("rust") || tags.includes("python") || tags.includes("language")) return MKT_ICON_SVGS.language;
+  if (tags.includes("docker") || tags.includes("devops")) return MKT_ICON_SVGS.docker;
+  if (tags.includes("ai") || tags.includes("completion")) return MKT_ICON_SVGS.ai;
+  if (tags.includes("web") || tags.includes("css") || tags.includes("server")) return MKT_ICON_SVGS.web;
+  return MKT_ICON_SVGS.default;
+}
+
+function _mktHue(entry) {
+  let h = 0;
+  for (const c of entry.id) h = ((h << 5) - h + c.charCodeAt(0)) | 0;
+  return Math.abs(h) % 360;
+}
+
+function _mktFmtDl(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+  return String(n || 0);
+}
+
+const _BUILTIN_EXTENSIONS = [
+  { id: "bradlc.vscode-tailwindcss", name: "Tailwind CSS IntelliSense", author: "Tailwind Labs", version: "0.14.0", description: "智能 Tailwind CSS 工具 — 自动补全类名、语法高亮、错误提示", category: "Web", tags: ["css", "web", "tailwind"], featured: true, downloads: 16700000, rating: 4.7, icon: "tailwind", details: "## 功能\n- 90+ Tailwind 工具类自动补全\n- 悬停查看类名对应的 CSS\n- 语法错误实时提示\n\n## 使用方法\n安装后在 HTML/JSX 文件中输入 Tailwind 类名即可触发补全。\n\n命令面板：`Tailwind: Lookup Class` — 查询光标处的类名" },
+  { id: "Vue.volar", name: "Vue - Official", author: "Vue", version: "2.2.0", description: "Vue.js 官方语言支持：模板语法高亮、组件智能提示、格式化", category: "Languages", tags: ["vue", "language", "web"], featured: true, downloads: 15600000, rating: 4.5, icon: "vue", details: "## 功能\n- Vue SFC 模板语法高亮\n- 组件 Props 自动补全\n- `<script setup>` 支持\n- TypeScript 集成" },
+  { id: "pkief.material-icon-theme", name: "Material 文件图标", author: "Philipp Kief", version: "5.14.1", description: "Material Design 风格文件图标 — 1000+ 种文件和文件夹图标", category: "Themes", tags: ["theme", "icons"], featured: true, downloads: 28900000, rating: 4.8, icon: "theme", details: "## 功能\n- 1000+ 文件类型图标\n- 特殊文件夹图标（node_modules, src, test 等）\n- 浅色/深色主题自适应\n- 自定义图标映射" },
+  { id: "ms-azuretools.vscode-docker", name: "Docker", author: "Microsoft", version: "1.29.3", description: "Docker 容器管理 — 构建、管理、部署容器化应用", category: "DevOps", tags: ["docker", "devops"], featured: true, downloads: 24100000, rating: 4.5, icon: "docker", details: "## 功能\n- 查看运行中的容器列表\n- 管理 Docker 镜像\n- Dockerfile 语法高亮\n\n## 命令\n- `Docker: 查看运行容器`\n- `Docker: 查看镜像列表`" },
+  { id: "github.copilot", name: "GitHub Copilot", author: "GitHub", version: "1.240.0", description: "AI 编程助手 — 智能代码补全、函数生成、测试编写", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 24800000, rating: 4.3, icon: "copilot", details: "## 功能\n- 智能代码补全（多行）\n- 根据注释生成完整函数\n- 自动编写单元测试\n- 支持 40+ 编程语言\n\n## 注意\n需要 GitHub Copilot 订阅账号" },
+  { id: "tabnine.tabnine-vscode", name: "Tabnine AI", author: "Tabnine", version: "3.128.0", description: "AI 代码助手 — 全行和全函数代码补全，支持所有语言", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 9800000, rating: 4.2, icon: "ai", details: "## 功能\n- 全行代码补全\n- 全函数代码生成\n- 本地模型（隐私保护）\n- 支持所有编程语言" },
+  { id: "zhihu.hanzi-counter", name: "汉字计数器", author: "知乎团队", version: "1.2.0", description: "实时统计中文字符数、英文单词数、总字数，适合写作和翻译", category: "Other", tags: ["chinese", "tools"], featured: true, downloads: 180000, rating: 4.3, icon: "hanzi", details: "## 功能\n- 状态栏实时显示：汉字数 / 英文词数 / 总字符数\n- 统计行数\n- 支持 Markdown 和纯文本\n\n## 命令\n`汉字计数器: 统计当前文件` — 弹窗显示详细统计" },
+  { id: "nicepkg.vscode-translate", name: "翻译助手", author: "NicePkg", version: "2.1.0", description: "代码注释中英互译、变量名翻译、选中文本即时翻译", category: "Other", tags: ["chinese", "tools", "ai"], featured: true, downloads: 350000, rating: 4.4, icon: "translate", details: "## 功能\n- 30+ 编程术语内置字典\n- 选中中文 → 翻译成英文\n- 选中英文 → 翻译成中文\n- 中文变量名转 camelCase\n\n## 命令\n- `翻译: 翻译选中文本`\n- `翻译: 变量名中英转换`" },
+  { id: "pnp.polacode", name: "代码截图", author: "pnp", version: "0.3.4", description: "拍立得风格代码截图 — 选中代码生成精美分享图片", category: "Other", tags: ["tools", "screenshot"], downloads: 2100000, rating: 4.3, icon: "camera", details: "## 功能\n- 选中代码一键生成截图\n- 保留语法高亮颜色\n- 自动适配编辑器主题\n\n## 使用\n命令面板：`代码截图: 截取选中代码`" },
+  { id: "antfu.iconify", name: "图标预览", author: "Anthony Fu", version: "0.18.0", description: "10 万+ 图标在线预览 — 100+ 图标集、行内预览、自动补全", category: "Other", tags: ["icons", "tools", "web"], downloads: 2800000, rating: 4.7, icon: "iconify", details: "## 功能\n- 100,000+ 图标库\n- 支持 100+ 图标集（Material, Heroicons, Lucide 等）\n- 代码中图标名行内预览\n- 图标名自动补全" },
+  { id: "ms-ceintl.vscode-language-pack-zh-hans", name: "简体中文语言包", author: "Microsoft", version: "1.96.0", description: "编辑器界面简体中文翻译 — Chinese (Simplified) Language Pack", category: "Other", tags: ["chinese", "language"], downloads: 15800000, rating: 4.6, icon: "zhcn", details: "## 功能\n- 编辑器所有菜单中文化\n- 状态栏/面板中文翻译\n- 设置页面中文显示\n\n安装后重启即可生效" },
+  { id: "svelte.svelte-vscode", name: "Svelte", author: "Svelte", version: "109.0.0", description: "Svelte 框架语言支持 — 语法高亮、自动补全、诊断", category: "Languages", tags: ["svelte", "language", "web"], downloads: 3200000, rating: 4.5, icon: "web", details: "## 功能\n- .svelte 文件语法高亮\n- 组件属性自动补全\n- 错误诊断\n- 代码格式化" },
+  { id: "prisma.prisma", name: "Prisma", author: "Prisma", version: "5.22.0", description: "Prisma ORM 语法高亮和自动补全 — 数据库模型定义助手", category: "Other", tags: ["database", "tools"], downloads: 4500000, rating: 4.6, icon: "default", details: "## 功能\n- .prisma schema 语法高亮\n- 模型字段自动补全\n- 关系定义智能提示\n- 格式化 Prisma Schema" },
+  { id: "streetsidesoftware.code-spell-checker", name: "拼写检查", author: "Street Side Software", version: "4.0.0", description: "代码拼写检查器 — 支持 camelCase 和编程术语", category: "Other", tags: ["linter", "tools"], downloads: 12300000, rating: 4.4, icon: "linter", details: "## 功能\n- 200+ 编程常用词内置词库\n- 自动拆分 camelCase/snake_case\n- 检测可疑拼写错误\n\n## 命令\n`拼写检查: 检查当前文件`" },
+  { id: "wayou.vscode-todo-highlight", name: "TODO 高亮", author: "Wayou Liu", version: "1.0.5", description: "高亮 TODO/FIXME/HACK 等注释标记 — 一目了然待办事项", category: "Other", tags: ["tools", "highlight"], downloads: 7800000, rating: 4.5, icon: "color", details: "## 功能\n- 高亮 TODO / FIXME / HACK / BUG / NOTE 标记\n- 可自定义高亮颜色\n- 支持自定义关键词" },
+  { id: "alefragnani.project-manager", name: "项目管理器", author: "Alessandro Fragnani", version: "12.8.0", description: "快速切换项目 — 收藏、分组、一键打开多个工作区", category: "Other", tags: ["tools", "workspace"], downloads: 5600000, rating: 4.5, icon: "default", details: "## 功能\n- 快速切换多个项目\n- 项目分组管理\n- 状态栏一键打开项目列表\n\n## 命令\n`项目管理器: 查看项目列表`" },
+];
+
+async function _installExtension(entry) {
+  const builtinId = _BUILTIN_ID_MAP[entry.id];
+  if (builtinId) {
+    try {
+      const result = await extManager.installBuiltin(builtinId);
+      if (result && result.enabled !== false) {
+        await extHost.activate(result, extManager);
+      }
+      return result?.manifest?.name ? `✅ ${result.manifest.name} 已安装并激活` : `✅ ${entry.name} 已安装`;
+    } catch (e) {
+      return `${entry.name} 安装失败: ${e.message || e}`;
+    }
+  }
+  return `${entry.name} — 暂无安装包`;
+}
+
+const _BUILTIN_ID_MAP = {
+  "bradlc.vscode-tailwindcss": "michael.tailwind-intellisense",
+  "Vue.volar": "michael.tailwind-intellisense",
+  "pkief.material-icon-theme": "michael.material-icons",
+  "ms-azuretools.vscode-docker": "michael.docker-tools",
+  "zhihu.hanzi-counter": "michael.hanzi-counter",
+  "nicepkg.vscode-translate": "michael.translate-helper",
+  "pnp.polacode": "michael.polacode-screenshot",
+  "antfu.iconify": "michael.material-icons",
+  "ms-ceintl.vscode-language-pack-zh-hans": "devin.chinese-language-pack",
+  "svelte.svelte-vscode": "michael.svelte-language",
+  "streetsidesoftware.code-spell-checker": "michael.spell-checker",
+  "alefragnani.project-manager": "michael.project-manager",
+  "wayou.vscode-todo-highlight": "devin.todo-highlight",
+};
+
+let _mktModal = null;
+let _mktAllEntries = [];
+
+function openMarketplaceModal() {
+  if (_mktModal) { _mktModal.remove(); _mktModal = null; return; }
+  const overlay = document.createElement("div");
+  overlay.className = "mktm-overlay";
+  const modal = document.createElement("div");
+  modal.className = "mktm";
+  modal.innerHTML = `
+    <div class="mktm__head">
+      <h2>扩展市场</h2>
+      <div class="mktm__search">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" placeholder="搜索扩展…" spellcheck="false" autocomplete="off" />
+      </div>
+      <button class="mktm__close" type="button"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
+    <div class="mktm__filters"></div>
+    <div class="mktm__body">
+      <div class="mktm__list"></div>
+      <div class="mktm__detail" hidden></div>
+    </div>
+  `;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  _mktModal = overlay;
+  requestAnimationFrame(() => overlay.classList.add("mktm-overlay--visible"));
+
+  const closeModal = () => { overlay.classList.remove("mktm-overlay--visible"); setTimeout(() => { overlay.remove(); _mktModal = null; }, 200); };
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeModal(); });
+  modal.querySelector(".mktm__close").addEventListener("click", closeModal);
+  document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { closeModal(); document.removeEventListener("keydown", esc); } });
+
+  let activeFilter = "all";
+  let searchQ = "";
+  const FILTERS = [
+    { id: "all", label: "全部" }, { id: "featured", label: "推荐" },
+    { id: "languages", label: "语言" }, { id: "themes", label: "主题" },
+    { id: "tools", label: "工具" }, { id: "ai", label: "AI" },
+  ];
+  const filtersEl = modal.querySelector(".mktm__filters");
+  for (const f of FILTERS) {
+    const btn = document.createElement("button");
+    btn.className = "mktm__pill" + (f.id === activeFilter ? " is-on" : "");
+    btn.textContent = f.label;
+    btn.addEventListener("click", () => { activeFilter = f.id; renderList(); });
+    filtersEl.appendChild(btn);
+  }
+
+  const searchInput = modal.querySelector(".mktm__search input");
+  let sTimer = null;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(sTimer);
+    sTimer = setTimeout(() => { searchQ = searchInput.value.trim().toLowerCase(); renderList(); }, 180);
+  });
+  searchInput.focus();
+
+  const listEl = modal.querySelector(".mktm__list");
+  const detailEl = modal.querySelector(".mktm__detail");
+
+  function matchF(e) {
+    if (activeFilter === "all") return true;
+    if (activeFilter === "featured") return e.featured;
+    const cat = (e.category || "").toLowerCase();
+    const tags = (e.tags || []).map(t => t.toLowerCase());
+    if (activeFilter === "languages") return cat === "languages" || tags.some(t => ["rust","python","language","jupyter"].includes(t));
+    if (activeFilter === "themes") return cat === "themes" || tags.some(t => ["theme","icons","ui"].includes(t));
+    if (activeFilter === "tools") return ["formatters","linters","web","devops","scm","other"].includes(cat) || tags.some(t => ["formatter","linter","docker","git","server","web","markdown"].includes(t));
+    if (activeFilter === "ai") return cat === "ai" || tags.some(t => ["ai","completion"].includes(t));
+    return true;
+  }
+
+  function filteredList() {
+    let list = _mktAllEntries.filter(matchF);
+    if (searchQ) list = list.filter(e => e.name.toLowerCase().includes(searchQ) || e.description.toLowerCase().includes(searchQ) || (e.tags||[]).some(t => t.toLowerCase().includes(searchQ)));
+    list.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
+    return list;
+  }
+
+  function renderList() {
+    filtersEl.querySelectorAll(".mktm__pill").forEach((b, i) => b.classList.toggle("is-on", FILTERS[i].id === activeFilter));
+    listEl.innerHTML = "";
+    detailEl.hidden = true;
+    listEl.hidden = false;
+    const items = filteredList();
+    if (!items.length) {
+      listEl.innerHTML = '<div class="mktm__empty"><p>没有找到扩展</p></div>';
+      return;
+    }
+    for (const entry of items) {
+      const row = document.createElement("div");
+      row.className = "mktm__row";
+      row.style.setProperty("--h", _mktHue(entry));
+      row.innerHTML = `
+        <div class="mktm__icon"><svg viewBox="0 0 24 24" width="28" height="28">${_mktIconFor(entry)}</svg></div>
+        <div class="mktm__info">
+          <div class="mktm__name">${_escHtml(entry.name)}</div>
+          <div class="mktm__desc">${_escHtml(entry.description)}</div>
+          <div class="mktm__meta">
+            <span class="mktm__author">${_escHtml(entry.author)}</span>
+            <span class="mktm__sep">·</span>
+            <span>v${entry.version}</span>
+            <span class="mktm__sep">·</span>
+            <span>${_mktFmtDl(entry.downloads)} downloads</span>
+            <span class="mktm__sep">·</span>
+            <span>★ ${(entry.rating || 0).toFixed(1)}</span>
+          </div>
+        </div>
+        <button class="mktm__install-btn" type="button">Install</button>
+      `;
+      row.querySelector(".mktm__install-btn").addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        const btn = ev.target;
+        btn.disabled = true; btn.textContent = "Installing…";
+        try {
+          const msg = await _installExtension(entry);
+          btn.textContent = "✓ Installed"; btn.classList.add("is-done");
+          showToast(typeof msg === "string" ? msg : `${entry.name} installed`);
+        } catch (e) { btn.textContent = "Retry"; btn.disabled = false; showToast(String(e?.message || e)); }
+      });
+      row.addEventListener("click", () => openMktDetail(entry));
+      listEl.appendChild(row);
+    }
+  }
+
+  function openMktDetail(entry) {
+    listEl.hidden = true;
+    detailEl.hidden = false;
+    detailEl.style.setProperty("--h", _mktHue(entry));
+    const detailsHtml = (entry.details || "").replace(/^## (.+)$/gm, '<h3 class="mktm__det-h3">$1</h3>').replace(/^- (.+)$/gm, '<div class="mktm__det-li">• $1</div>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\n\n/g, '<br/>');
+    detailEl.innerHTML = `
+      <button class="mktm__back" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg> 返回</button>
+      <div class="mktm__det-head">
+        <div class="mktm__det-icon"><svg viewBox="0 0 24 24" width="40" height="40">${_mktIconFor(entry)}</svg></div>
+        <div class="mktm__det-info">
+          <h2>${_escHtml(entry.name)}</h2>
+          <p>${_escHtml(entry.description)}</p>
+          <div class="mktm__meta">${_escHtml(entry.author)} · v${entry.version} · ${_mktFmtDl(entry.downloads)} downloads · ★ ${(entry.rating||0).toFixed(1)}</div>
+        </div>
+      </div>
+      <div class="mktm__det-tags">${(entry.tags||[]).map(t => `<span class="mktm__tag">${_escHtml(t)}</span>`).join("")}</div>
+      <div class="mktm__det-body">${detailsHtml}</div>
+      <div class="mktm__det-info-table">
+        <table><tbody>
+          <tr><td>发布者</td><td>${_escHtml(entry.author)}</td></tr>
+          <tr><td>扩展 ID</td><td><code>${_escHtml(entry.id)}</code></td></tr>
+          <tr><td>版本</td><td>v${_escHtml(entry.version)}</td></tr>
+          <tr><td>分类</td><td>${_escHtml(entry.category || "Other")}</td></tr>
+          <tr><td>下载量</td><td>${_mktFmtDl(entry.downloads)}</td></tr>
+          <tr><td>评分</td><td>★ ${(entry.rating||0).toFixed(1)}</td></tr>
+        </tbody></table>
+      </div>
+    `;
+    detailEl.querySelector(".mktm__back").addEventListener("click", renderList);
+    const installBtn = document.createElement("button");
+    installBtn.className = "mktm__install-btn mktm__install-btn--lg";
+    installBtn.textContent = "安装扩展";
+    installBtn.addEventListener("click", async () => {
+      installBtn.disabled = true; installBtn.textContent = "Installing…";
+      try {
+        const msg = await _installExtension(entry);
+        installBtn.textContent = "✓ Installed"; installBtn.classList.add("is-done");
+        showToast(typeof msg === "string" ? msg : `${entry.name} installed`);
+      } catch (e) { installBtn.textContent = "Retry"; installBtn.disabled = false; }
+    });
+    detailEl.querySelector(".mktm__det-head").appendChild(installBtn);
+  }
+
+  listEl.innerHTML = '<div class="mktm__loading"><div class="mkt-spinner"></div><span>Loading marketplace…</span></div>';
+  (async () => {
+    try {
+      const dbEntries = await backend.dbMarketplaceList?.().catch(() => []) || [];
+      if (dbEntries.length > 0) {
+        _mktAllEntries = dbEntries.map(e => ({
+          ...e,
+          tags: Array.isArray(e.tags) ? e.tags : (typeof e.tags === "string" ? JSON.parse(e.tags) : []),
+        }));
+      } else {
+        const remote = await backend.marketplaceList().catch(() => []);
+        _mktAllEntries = [..._BUILTIN_EXTENSIONS, ...remote.filter(r => !_BUILTIN_EXTENSIONS.some(b => b.id === r.id))];
+        if (backend.dbMarketplaceUpsert) {
+          for (const ext of _mktAllEntries) {
+            backend.dbMarketplaceUpsert({ ...ext, description: ext.description || "", category: ext.category || "Other", tags: ext.tags || [], icon: ext.icon || "default", icon_svg: null }).catch(() => {});
+          }
+        }
+      }
+      renderList();
+    } catch {
+      _mktAllEntries = _BUILTIN_EXTENSIONS;
+      renderList();
+    }
+  })();
+}
+
+function renderMarketplaceToolOld(body) {
 
   let activeFilter = "all";
   let searchQuery = "";
@@ -5215,9 +9388,9 @@ function renderMarketplaceTool(body) {
   const filters = document.createElement("div");
   filters.className = "mkt-filters";
   const FILTERS = [
-    { id: "all", label: "All" }, { id: "featured", label: "Featured" },
-    { id: "languages", label: "Languages" }, { id: "themes", label: "Themes" },
-    { id: "tools", label: "Tools" }, { id: "ai", label: "AI" },
+    { id: "all", label: "全部" }, { id: "featured", label: "推荐" },
+    { id: "languages", label: "语言" }, { id: "themes", label: "主题" },
+    { id: "tools", label: "工具" }, { id: "ai", label: "AI" },
   ];
   for (const f of FILTERS) {
     const btn = document.createElement("button");
@@ -5959,6 +10132,7 @@ function getMenus() {
       items: [
         { label: t("menu.openFolder"), icon: "i-folder", hint: "⌘O", action: () => chooseFolder() },
         { label: "Add Folder to Workspace…", icon: "i-folder-open", action: () => addFolderToWorkspace() },
+        { label: "New Project…", icon: "i-folder", action: () => showNewProjectDialog() },
         { label: t("menu.save"), icon: "i-save", hint: "⌘S", action: () => saveActive() },
         { sep: true },
         { label: t("menu.closeFile"), icon: "i-close", hint: "⌘W", action: () => activePath && closeFile(activePath) },
@@ -5982,6 +10156,9 @@ function getMenus() {
         { label: t("menu.explorer"), icon: "i-files", hint: "⇧⌘E", action: () => showSide("explorer") },
         { label: t("menu.search"), icon: "i-search", hint: "⇧⌘F", action: () => showSide("search") },
         { label: t("menu.sourceControl"), icon: "i-git", hint: "⌃⇧G", action: () => showSide("git") },
+        { label: "大纲", icon: "i-outline", hint: "⇧⌘O", action: () => showSide("outline") },
+        { label: "测试", icon: "i-beaker", hint: "⇧⌘T", action: () => showSide("test") },
+        { label: "输出", icon: "i-output", hint: "⌃⇧U", action: () => toggleOutputPanel() },
         { sep: true },
         { label: t("menu.toggleExplorer"), icon: "i-sidebar-left", action: () => togglePane("explorer") },
         { label: t("menu.toggleAssistant"), icon: "i-sidebar-right", action: () => togglePane("assistant") },
@@ -5992,21 +10169,21 @@ function getMenus() {
       ],
     },
     {
-      label: "Tools",
+      label: "工具",
       items: [
-        { label: "Run Current File", icon: "i-terminal", hint: "⌘R", action: () => runCurrentFile() },
-        { label: "Task Runner", icon: "i-play", action: () => openFeaturePanel("tasks") },
+        { label: "运行当前文件", icon: "i-terminal", hint: "⌘R", action: () => runCurrentFile() },
+        { label: "任务运行器", icon: "i-play", action: () => openFeaturePanel("tasks") },
         { sep: true },
-        { label: "Workspace Manager", icon: "i-folder", action: () => openFeaturePanel("workspace") },
-        { label: "Remote Development", icon: "i-terminal", action: () => openFeaturePanel("remote") },
-        { label: "Extension Marketplace", icon: "i-ext", action: () => openFeaturePanel("marketplace") },
-        { label: "Merge Conflicts", icon: "i-git", action: () => openFeaturePanel("conflicts") },
+        { label: "工作区管理", icon: "i-folder", action: () => openFeaturePanel("workspace") },
+        { label: "远程开发", icon: "i-terminal", action: () => openFeaturePanel("remote") },
+        { label: "扩展市场", icon: "i-ext", action: () => openMarketplaceModal() },
+        { label: "合并冲突", icon: "i-git", action: () => openFeaturePanel("conflicts") },
         { sep: true },
-        { label: "Debugger", icon: "i-code", action: () => openFeaturePanel("debugger") },
-        { label: "Language Servers", icon: "i-code", action: () => openFeaturePanel("lsp") },
+        { label: "调试器", icon: "i-code", action: () => openFeaturePanel("debugger") },
+        { label: "语言服务器", icon: "i-code", action: () => openFeaturePanel("lsp") },
         { sep: true },
-        { label: "Settings", icon: "i-gear", action: () => openFeaturePanel("settings") },
-        { label: "Keyboard Shortcuts", icon: "i-command", action: () => openFeaturePanel("shortcuts") },
+        { label: "设置", icon: "i-gear", action: () => openFeaturePanel("settings") },
+        { label: "快捷键", icon: "i-command", action: () => openFeaturePanel("shortcuts") },
       ],
     },
     {
@@ -6017,13 +10194,13 @@ function getMenus() {
         { sep: true },
         { label: t("menu.about"), icon: "i-info", action: () => showToast(t("menu.aboutMsg")) },
         { sep: true },
-        { label: t("theme.light"), icon: "i-sparkle", action: () => setTheme("light") },
-        { label: t("theme.dark"), icon: "i-sparkle", action: () => setTheme("dark") },
-        { label: "Monokai", icon: "i-sparkle", action: () => setTheme("monokai") },
-        { label: "GitHub Light", icon: "i-sparkle", action: () => setTheme("github-light") },
-        { label: "Solarized Dark", icon: "i-sparkle", action: () => setTheme("solarized-dark") },
-        { label: "Nord", icon: "i-sparkle", action: () => setTheme("nord") },
-        { label: t("theme.system"), icon: "i-sparkle", action: () => setTheme("system") },
+        { label: t("theme.light"), icon: "i-theme-light", action: () => setTheme("light") },
+        { label: t("theme.dark"), icon: "i-theme-dark", action: () => setTheme("dark") },
+        { label: "Monokai", icon: "i-theme-monokai", action: () => setTheme("monokai") },
+        { label: "GitHub Light", icon: "i-theme-github", action: () => setTheme("github-light") },
+        { label: "Solarized Dark", icon: "i-theme-solarized", action: () => setTheme("solarized-dark") },
+        { label: "Nord", icon: "i-theme-nord", action: () => setTheme("nord") },
+        { label: t("theme.system"), icon: "i-theme-system", action: () => setTheme("system") },
       ],
     },
   ];
@@ -6247,6 +10424,8 @@ $("loginUseCodeBtn")?.addEventListener("click", async () => {
 // ---- explorer tabs / tools / search ----
 $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabGit").addEventListener("click", () => showSide("git"));
+$("tabOutline").addEventListener("click", () => showSide("outline"));
+$("tabTest").addEventListener("click", () => showSide("test"));
 $("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
 $("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
@@ -6292,22 +10471,131 @@ $("searchCaseBtn").addEventListener("click", () => {
 });
 
 const promptEl = $("prompt");
+const _sendBtnEl = $("sendBtn");
+const _SEND_ICON = `<svg class="ic"><use href="#i-arrow-up" /></svg>`;
+const _STOP_ICON = `<svg class="ic" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>`;
+
+function _setSendBtnStop(isStop) {
+  if (!_sendBtnEl) return;
+  if (isStop) {
+    _sendBtnEl.innerHTML = _STOP_ICON;
+    _sendBtnEl.classList.add("is-stop");
+    _sendBtnEl.title = "Stop generating";
+    _sendBtnEl.type = "button";
+  } else {
+    _sendBtnEl.innerHTML = _SEND_ICON;
+    _sendBtnEl.classList.remove("is-stop");
+    _sendBtnEl.title = "Send (⌘↩)";
+    _sendBtnEl.type = "submit";
+  }
+}
+
+_sendBtnEl?.addEventListener("click", (e) => {
+  if (streaming && _sendBtnEl.classList.contains("is-stop")) {
+    e.preventDefault();
+    e.stopPropagation();
+    streaming = false;
+    _setSendBtnStop(false);
+    showToast("Generation stopped");
+  }
+});
+
 promptEl.addEventListener("input", () => {
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
 });
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (streaming) return;
   const text = promptEl.value.trim();
-  if (!text) return;
+  if (!text && _pastedImages.length === 0) return;
+  const images = [..._pastedImages];
+  _pastedImages = [];
+  _refreshImagePreviews();
   promptEl.value = "";
   promptEl.style.height = "auto";
-  sendPrompt(text);
+  sendPrompt(text, images);
 });
 promptEl.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     e.preventDefault();
     $("composer").requestSubmit();
+  }
+});
+
+let _pastedImages = [];
+
+function _createImagePreview(dataUrl, idx) {
+  const wrap = document.createElement("div");
+  wrap.className = "prompt-image-preview";
+  wrap.innerHTML =
+    `<img src="${dataUrl}" alt="Pasted image" />` +
+    `<button class="prompt-image-preview__remove" type="button" title="Remove">&times;</button>`;
+  wrap.querySelector("button").addEventListener("click", () => {
+    _pastedImages = _pastedImages.filter((_, i) => i !== idx);
+    _refreshImagePreviews();
+  });
+  return wrap;
+}
+
+function _refreshImagePreviews() {
+  let container = document.querySelector(".prompt-images");
+  if (!container) {
+    container = document.createElement("div");
+    container.className = "prompt-images";
+    promptEl.parentElement.insertBefore(container, promptEl);
+  }
+  container.innerHTML = "";
+  _pastedImages.forEach((img, i) => container.appendChild(_createImagePreview(img.dataUrl, i)));
+  if (_pastedImages.length === 0) container.remove();
+}
+
+promptEl.addEventListener("paste", (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith("image/")) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (!file) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        _pastedImages.push({ dataUrl: reader.result, type: file.type, name: file.name || "image.png" });
+        _refreshImagePreviews();
+        showToast("Image attached");
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+  }
+});
+
+promptEl.parentElement.addEventListener("dragover", (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+promptEl.parentElement.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const files = e.dataTransfer?.files;
+  if (!files) return;
+  for (const file of files) {
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        _pastedImages.push({ dataUrl: reader.result, type: file.type, name: file.name });
+        _refreshImagePreviews();
+        showToast(`Image attached: ${file.name}`);
+      };
+      reader.readAsDataURL(file);
+    } else if (file.size < 100000) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = reader.result;
+        promptEl.value += (promptEl.value ? "\n\n" : "") + `[File: ${file.name}]\n${text}`;
+        promptEl.dispatchEvent(new Event("input"));
+        showToast(`File attached: ${file.name}`);
+      };
+      reader.readAsText(file);
+    } else {
+      showToast(`File too large: ${file.name} (${(file.size / 1024).toFixed(0)} KB)`);
+    }
   }
 });
 
@@ -6434,6 +10722,112 @@ qoInput.addEventListener("keydown", (e) => {
 });
 quickOpenOverlay.addEventListener("mousedown", (e) => { if (e.target === quickOpenOverlay) qoClose(); });
 
+// ---- terminal → IDE sync ----
+let _termRefreshTimer = null;
+const _TERM_REFRESH_PATTERNS = [
+  /Successfully installed/i,
+  /pip install/i,
+  /npm install/i,
+  /pnpm install/i,
+  /yarn add/i,
+  /cargo build/i,
+  /go get/i,
+  /gem install/i,
+  /luarocks install/i,
+  /composer require/i,
+  /\$\s*$/, // shell prompt returned
+];
+
+let _termOutputBuf = "";
+function _detectTerminalChanges(data) {
+  _termOutputBuf += data;
+  if (_termOutputBuf.length > 2000) _termOutputBuf = _termOutputBuf.slice(-1000);
+
+  for (const re of _TERM_REFRESH_PATTERNS) {
+    if (re.test(_termOutputBuf)) {
+      _scheduleTermRefresh();
+      _termOutputBuf = "";
+      return;
+    }
+  }
+}
+
+function _scheduleTermRefresh() {
+  if (_termRefreshTimer) clearTimeout(_termRefreshTimer);
+  _termRefreshTimer = setTimeout(() => {
+    if (rootPath) {
+      reloadDir(rootPath);
+      refreshGitStatus();
+    }
+
+    const model = monacoEditor.getModel();
+    if (model) {
+      const langId = model.getLanguageId();
+      _envSymbolsLoaded = false;
+      _envLoadingLang = null;
+      _loadEnvSymbols(langId);
+    }
+  }, 2000);
+}
+
+// ---- new project templates ----
+const PROJECT_TEMPLATES = [
+  { name: "React (Vite)", cmd: "npm create vite@latest {{name}} -- --template react && cd {{name}} && npm install", icon: "⚛" },
+  { name: "React + TypeScript", cmd: "npm create vite@latest {{name}} -- --template react-ts && cd {{name}} && npm install", icon: "⚛" },
+  { name: "Vue 3 (Vite)", cmd: "npm create vite@latest {{name}} -- --template vue && cd {{name}} && npm install", icon: "🟢" },
+  { name: "Svelte (Vite)", cmd: "npm create vite@latest {{name}} -- --template svelte && cd {{name}} && npm install", icon: "🔶" },
+  { name: "Next.js", cmd: "npx create-next-app@latest {{name}} --use-npm", icon: "▲" },
+  { name: "Flask (Python)", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install flask && echo 'from flask import Flask\\napp = Flask(__name__)\\n\\n@app.route(\"/\")\\ndef index():\\n    return \"Hello World\"\\n\\nif __name__ == \"__main__\":\\n    app.run(debug=True)' > app.py", icon: "🐍" },
+  { name: "FastAPI (Python)", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install fastapi uvicorn && echo 'from fastapi import FastAPI\\napp = FastAPI()\\n\\n@app.get(\"/\")\\ndef root():\\n    return {\"message\": \"Hello World\"}' > main.py", icon: "🚀" },
+  { name: "Express (Node.js)", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install express && echo 'const express = require(\"express\");\\nconst app = express();\\napp.get(\"/\", (req, res) => res.json({ message: \"Hello World\" }));\\napp.listen(3000, () => console.log(\"Server on http://localhost:3000\"));' > index.js", icon: "🟩" },
+  { name: "Tauri (Rust + React)", cmd: "npm create tauri-app@latest {{name}} -- --template react --manager npm", icon: "🦀" },
+  { name: "Vanilla HTML/CSS/JS", cmd: "mkdir {{name}} && cd {{name}} && echo '<!DOCTYPE html>\\n<html lang=\"en\">\\n<head>\\n<meta charset=\"UTF-8\">\\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\\n<title>{{name}}</title>\\n<link rel=\"stylesheet\" href=\"style.css\">\\n</head>\\n<body>\\n<h1>Hello World</h1>\\n<script src=\"main.js\"></script>\\n</body>\\n</html>' > index.html && echo 'body { font-family: system-ui; max-width: 800px; margin: 0 auto; padding: 20px; }' > style.css && echo 'console.log(\"Hello World\");' > main.js", icon: "📄" },
+];
+
+async function showNewProjectDialog() {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.style.cssText = "width:480px;max-height:80vh;overflow-y:auto;";
+  modal.innerHTML = `<div class="modal-header"><h3>新建项目</h3><button class="modal-close">×</button></div>
+    <div style="padding:16px"><input class="input" placeholder="项目名称" style="width:100%;margin-bottom:16px" autofocus>
+    <div class="template-list"></div></div>`;
+
+  const nameInput = modal.querySelector("input");
+  const list = modal.querySelector(".template-list");
+  const close = () => { overlay.remove(); };
+  modal.querySelector(".modal-close").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  for (const tmpl of PROJECT_TEMPLATES) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;cursor:pointer;transition:background 0.15s;";
+    row.innerHTML = `<span style="font-size:20px;width:28px;text-align:center">${tmpl.icon}</span><div><strong style="display:block">${tmpl.name}</strong></div>`;
+    row.addEventListener("mouseenter", () => { row.style.background = "var(--hover)"; });
+    row.addEventListener("mouseleave", () => { row.style.background = ""; });
+    row.addEventListener("click", async () => {
+      const name = nameInput.value.trim() || "my-project";
+      close();
+      await openTerminal();
+      const wasOpen = termIsOpen();
+      if (!wasOpen) {
+        await _waitTermReady(3000);
+        await new Promise((r) => setTimeout(r, 1800));
+      }
+      const cmd = tmpl.cmd.replace(/\{\{name\}\}/g, shellQuote(name));
+      writeToActiveTerminal(`\nclear\n${cmd}\n`);
+      showToast(`正在创建 ${tmpl.name} 项目: ${name}`);
+    });
+    list.appendChild(row);
+  }
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  nameInput.focus();
+  nameInput.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+}
+
 // ---- auto-save ----
 let autoSaveEnabled = true;
 let autoSaveTimer = null;
@@ -6446,15 +10840,23 @@ function scheduleAutoSave() {
     const f = openFiles.get(activePath);
     if (f && f.dirty) {
       try {
-        await backend.writeTextFile(activePath, f.model.getValue());
-        markDirty(activePath, false);
-      } catch { /* silent */ }
+        _autoSaving = true;
+        const savingPath = activePath;
+        await backend.writeTextFile(savingPath, f.model.getValue());
+        f.dirty = false;
+        saveBtn.disabled = true;
+        const tabEl = tabsEl.querySelector(`[data-path="${CSS.escape(savingPath)}"]`);
+        if (tabEl) tabEl.classList.remove("dirty");
+        lspManager?.didSave(savingPath, f.model);
+        _autoSaving = false;
+      } catch { _autoSaving = false; }
     }
-  }, 1500);
+  }, 800);
 }
+let _autoSaving = false;
 
 monacoEditor.onDidChangeModelContent(() => {
-  scheduleAutoSave();
+  if (!_imeComposing) scheduleAutoSave();
 });
 
 async function toggleAutoSave() {
@@ -6585,6 +10987,10 @@ const KB_ACTIONS = {
   "view.explorer": () => showSide("explorer"),
   "view.search": () => showSide("search"),
   "view.git": () => showSide("git"),
+  "view.outline": () => showSide("outline"),
+  "view.test": () => showSide("test"),
+  "view.output": () => toggleOutputPanel(),
+  "view.bookmarks": () => toggleBookmarksPanel(),
   "view.problems": () => toggleProblems(),
   "commandPalette": () => palette.open(),
   "view.splitEditor": () => toggleSplitEditor(),
@@ -6970,6 +11376,8 @@ async function createTermTab() {
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(container);
+  try { term.loadAddon(new WebglAddon()); } catch { /* WebGL not available, fallback to canvas */ }
+  term.loadAddon(new WebLinksAddon());
   termResizeObserver.observe(container);
 
   let initDone = false;
@@ -7009,9 +11417,11 @@ async function createTermTab() {
             return;
           }
           term.write(ev.data);
+          _detectTerminalChanges(ev.data);
         } else if (ev.kind === "exit") {
           term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
           entry.backendId = null;
+          _scheduleTermRefresh();
         }
       },
     );
@@ -7212,8 +11622,13 @@ function updateStatusBar() {
   }
 }
 
-monacoEditor.onDidChangeCursorPosition(() => updateStatusBar());
-monacoEditor.onDidChangeCursorSelection(() => updateStatusBar());
+let _statusBarRAF = 0;
+function scheduleStatusBarUpdate() {
+  if (_imeComposing || _statusBarRAF) return;
+  _statusBarRAF = requestAnimationFrame(() => { _statusBarRAF = 0; updateStatusBar(); });
+}
+monacoEditor.onDidChangeCursorPosition(() => scheduleStatusBarUpdate());
+monacoEditor.onDidChangeCursorSelection(() => scheduleStatusBarUpdate());
 monacoEditor.onDidChangeModel(() => updateStatusBar());
 updateStatusBar();
 
@@ -7373,7 +11788,7 @@ const palette = createCommandPalette({
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
     { id: "remote.open", title: "Remote Development", category: "Tools", run: () => openFeaturePanel("remote") },
-    { id: "marketplace.open", title: "Extension Marketplace", category: "Tools", run: () => openFeaturePanel("marketplace") },
+    { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
     { id: "git.conflicts", title: "Resolve Merge Conflicts", category: "Tools", run: () => openFeaturePanel("conflicts") },
     { id: "debug.open", title: "Debugger", category: "Tools", run: () => openFeaturePanel("debugger") },
     { id: "lsp.open", title: "Language Servers", category: "Tools", run: () => openFeaturePanel("lsp") },
@@ -7392,7 +11807,7 @@ const palette = createCommandPalette({
   ],
 });
 
-$("extensionsBtn").addEventListener("click", () => extPanel.open());
+$("extensionsBtn").addEventListener("click", () => openMarketplaceModal());
 $("paletteBtn").addEventListener("click", () => palette.open());
 window.addEventListener(
   "keydown",
@@ -7505,14 +11920,22 @@ async function restoreSession() {
   try {
     const store = await loadStore("session.json");
     const session = await store.get(SESSION_STORE_KEY);
-    if (!session) return;
+    if (!session) {
+      _requestWorkspaceFromPeers();
+      return;
+    }
     if (Array.isArray(session.workspaceRoots) && session.workspaceRoots.length) {
       workspaceRoots = session.workspaceRoots;
+      for (const root of workspaceRoots) {
+        try { await backend.registerWorkspaceRoot(root); } catch {}
+      }
       setActiveWorkspaceRoot(session.rootPath || workspaceRoots[0]);
       await renderWorkspaceRoots();
       startFileWatcher();
       await refreshGitStatus();
       for (const root of workspaceRoots) preloadProjectModels(root);
+    } else {
+      _requestWorkspaceFromPeers();
     }
     if (Array.isArray(session.tabs)) {
       for (const t of session.tabs) {
@@ -7526,6 +11949,13 @@ async function restoreSession() {
     updateStatusBar();
   } catch (e) {
     console.warn("[session] restore failed:", e);
+    _requestWorkspaceFromPeers();
+  }
+}
+
+function _requestWorkspaceFromPeers() {
+  if (_ipcChannel) {
+    _ipcChannel.postMessage({ type: "workspace_request", from: _WINDOW_ID });
   }
 }
 
@@ -7596,3 +12026,657 @@ if (inTauri) {
   }).catch(() => {});
 }
 restoreSession();
+
+let _cachedHomeDir = "";
+if (inTauri) {
+  backend.homeDir().then(home => {
+    if (home) {
+      _cachedHomeDir = home;
+      backend.registerWorkspaceRoot(home).catch(() => {});
+    }
+  }).catch(() => {});
+}
+
+// ---- Outline Panel ----
+let _outlineSortByName = false;
+let _outlineSymbols = [];
+
+async function refreshOutline() {
+  const tree = $("outlineTree");
+  if (!activePath) {
+    tree.innerHTML = '<div class="empty"><p>Open a file to see its outline.</p></div>';
+    $("outlineTimeline")?.removeAttribute("hidden");
+    refreshTimeline();
+    return;
+  }
+  const model = monacoEditor.getModel();
+  if (!model) return;
+  try {
+    const symbols = await monaco.languages.getDocumentSymbols(model);
+    _outlineSymbols = symbols || [];
+    renderOutlineTree(_outlineSymbols, tree);
+  } catch {
+    tree.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
+  }
+  $("outlineTimeline")?.removeAttribute("hidden");
+  refreshTimeline();
+}
+
+function renderOutlineTree(symbols, container) {
+  const filter = ($("outlineFilter")?.value || "").toLowerCase();
+  container.innerHTML = "";
+  if (!symbols.length) {
+    container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
+    return;
+  }
+  const sorted = [...symbols];
+  if (_outlineSortByName) sorted.sort((a, b) => a.name.localeCompare(b.name));
+  for (const sym of sorted) {
+    if (filter && !sym.name.toLowerCase().includes(filter)) continue;
+    const row = document.createElement("div");
+    row.className = "outline-row";
+    const kindClass = _symbolKindClass(sym.kind);
+    row.innerHTML = `<span class="outline-icon outline-icon--${kindClass}"></span><span class="outline-name">${_escHtml(sym.name)}</span><span class="outline-detail">${_escHtml(sym.detail || "")}</span>`;
+    row.addEventListener("click", () => {
+      const range = sym.range || sym.selectionRange;
+      if (range) {
+        monacoEditor.revealLineInCenter(range.startLineNumber);
+        monacoEditor.setPosition({ lineNumber: range.startLineNumber, column: range.startColumn });
+        monacoEditor.focus();
+      }
+    });
+    container.appendChild(row);
+    if (sym.children?.length) {
+      const childContainer = document.createElement("div");
+      childContainer.className = "outline-children";
+      renderOutlineTree(sym.children, childContainer);
+      container.appendChild(childContainer);
+    }
+  }
+}
+
+function _symbolKindClass(kind) {
+  const map = { 1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
+    7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function",
+    13: "variable", 14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array",
+    19: "object", 20: "key", 21: "null", 22: "enummember", 23: "struct", 24: "event", 25: "operator", 26: "typeparam" };
+  return map[kind] || "variable";
+}
+
+function _escHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+$("outlineSortBtn")?.addEventListener("click", () => {
+  _outlineSortByName = !_outlineSortByName;
+  refreshOutline();
+});
+$("outlineRefreshBtn")?.addEventListener("click", () => refreshOutline());
+$("outlineFilter")?.addEventListener("input", () => {
+  const tree = $("outlineTree");
+  renderOutlineTree(_outlineSymbols, tree);
+});
+
+monacoEditor.onDidChangeModel(() => {
+  if (!$("viewOutline")?.hidden === false) refreshOutline();
+});
+
+// ---- File Timeline ----
+async function refreshTimeline() {
+  const list = $("timelineList");
+  if (!list) return;
+  if (!activePath || !workspaceRoots.length) {
+    list.innerHTML = '<div class="empty"><p>No file selected.</p></div>';
+    return;
+  }
+  try {
+    const root = workspaceRoots[0];
+    const rel = activePath.startsWith(root) ? activePath.slice(root.length + 1) : activePath;
+    const log = await backend.gitLog(root);
+    const fileLog = log.filter(e => e.files?.includes(rel) || e.message?.includes(rel)).slice(0, 20);
+    if (!fileLog.length) {
+      const allLog = log.slice(0, 15);
+      renderTimelineEntries(allLog, list);
+    } else {
+      renderTimelineEntries(fileLog, list);
+    }
+  } catch {
+    list.innerHTML = '<div class="empty"><p>No git history.</p></div>';
+  }
+}
+
+function renderTimelineEntries(entries, container) {
+  container.innerHTML = "";
+  for (const e of entries) {
+    const row = document.createElement("div");
+    row.className = "timeline-row";
+    const date = e.date ? new Date(parseInt(e.date) * 1000).toLocaleDateString() : "";
+    row.innerHTML = `<span class="timeline-dot"></span><div class="timeline-info"><span class="timeline-msg">${_escHtml(e.message?.split("\n")[0] || "")}</span><span class="timeline-meta">${_escHtml(e.author || "")} · ${date}</span></div>`;
+    row.addEventListener("click", () => {
+      showToast(`Commit: ${e.hash?.slice(0, 8) || "?"}`);
+    });
+    container.appendChild(row);
+  }
+}
+
+$("timelineToggle")?.addEventListener("click", () => {
+  const list = $("timelineList");
+  const isHidden = list.hidden;
+  list.hidden = !isHidden;
+  $("timelineToggle").classList.toggle("is-expanded", !isHidden);
+});
+
+// ---- Output Panel ----
+const _outputChannels = { lsp: [], tasks: [], extensions: [] };
+
+function toggleOutputPanel() {
+  const panel = $("outputPanel");
+  if (!panel) return;
+  const show = panel.hidden;
+  panel.hidden = !show;
+  if (show) {
+    panel.style.display = "flex";
+    requestAnimationFrame(() => panel.classList.add("output-panel--visible"));
+  } else {
+    panel.classList.remove("output-panel--visible");
+    setTimeout(() => { if (panel.hidden) panel.style.display = "none"; }, 200);
+  }
+}
+
+function appendOutput(channel, text) {
+  if (!_outputChannels[channel]) _outputChannels[channel] = [];
+  _outputChannels[channel].push(text);
+  if (_outputChannels[channel].length > 2000) _outputChannels[channel].splice(0, 500);
+  const sel = $("outputChannel");
+  if (sel && sel.value === channel) {
+    const body = $("outputBody");
+    body.textContent = _outputChannels[channel].join("\n");
+    body.scrollTop = body.scrollHeight;
+  }
+}
+
+$("outputChannel")?.addEventListener("change", () => {
+  const ch = $("outputChannel").value;
+  $("outputBody").textContent = (_outputChannels[ch] || []).join("\n");
+});
+$("outputClearBtn")?.addEventListener("click", () => {
+  const ch = $("outputChannel").value;
+  _outputChannels[ch] = [];
+  $("outputBody").textContent = "";
+});
+$("outputCloseBtn")?.addEventListener("click", () => toggleOutputPanel());
+
+// ---- Test Explorer ----
+const _TEST_PATTERNS = [
+  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.go$/, /test_.*\.py$/, /.*_test\.py$/,
+  /Test\.java$/, /\.test\.rs$/
+];
+
+async function refreshTestExplorer() {
+  const tree = $("testTree");
+  if (!workspaceRoots.length) {
+    tree.innerHTML = '<div class="empty"><p>Open a project to detect tests.</p></div>';
+    return;
+  }
+  try {
+    const root = workspaceRoots[0];
+    const allFiles = await _collectTestFiles(root);
+    if (!allFiles.length) {
+      tree.innerHTML = '<div class="empty"><p>No test files detected.</p></div>';
+      return;
+    }
+    tree.innerHTML = "";
+    const groups = {};
+    for (const f of allFiles) {
+      const dir = f.path.split("/").slice(0, -1).join("/").replace(root + "/", "") || ".";
+      if (!groups[dir]) groups[dir] = [];
+      groups[dir].push(f);
+    }
+    for (const [dir, files] of Object.entries(groups)) {
+      const section = document.createElement("div");
+      section.className = "test-group";
+      section.innerHTML = `<div class="test-group__head"><svg class="ic"><use href="#i-folder" /></svg><span>${_escHtml(dir)}</span></div>`;
+      for (const f of files) {
+        const row = document.createElement("div");
+        row.className = "test-row";
+        row.innerHTML = `<span class="test-status test-status--pending">○</span><span class="test-name">${_escHtml(f.name)}</span>`;
+        row.addEventListener("click", () => openFile(f.path, f.name));
+        const runBtn = document.createElement("button");
+        runBtn.className = "iconbtn test-run-btn";
+        runBtn.title = "Run test";
+        runBtn.innerHTML = '<svg class="ic"><use href="#i-play" /></svg>';
+        runBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          runTestFile(f.path, f.name, row);
+        });
+        row.appendChild(runBtn);
+        section.appendChild(row);
+      }
+      tree.appendChild(section);
+    }
+  } catch {
+    tree.innerHTML = '<div class="empty"><p>Error scanning tests.</p></div>';
+  }
+}
+
+async function _collectTestFiles(root, maxDepth = 4) {
+  const results = [];
+  async function scan(dir, depth) {
+    if (depth > maxDepth) return;
+    try {
+      const entries = await backend.readDir(dir);
+      for (const e of entries) {
+        if (e.is_dir) {
+          if (e.name === "node_modules" || e.name === ".git" || e.name === "target" || e.name === "__pycache__") continue;
+          await scan(e.path, depth + 1);
+        } else if (_TEST_PATTERNS.some(p => p.test(e.name))) {
+          results.push(e);
+        }
+      }
+    } catch { /* ignore inaccessible dirs */ }
+  }
+  await scan(root, 0);
+  return results;
+}
+
+async function runTestFile(path, name, rowEl) {
+  const statusEl = rowEl.querySelector(".test-status");
+  statusEl.textContent = "⏳";
+  statusEl.className = "test-status test-status--running";
+  try {
+    const ext = name.split(".").pop();
+    let cmd;
+    if (/\.(test|spec)\.[jt]sx?$/.test(name)) cmd = `npx jest --testPathPattern="${name}" --no-coverage 2>&1 || npx vitest run "${name}" 2>&1`;
+    else if (/_test\.go$/.test(name)) cmd = `go test -v -run . "${path}" 2>&1`;
+    else if (/test.*\.py$/.test(name) || /.*_test\.py$/.test(name)) cmd = `python -m pytest "${path}" -v 2>&1`;
+    else cmd = `echo "No runner for ${ext}"`;
+    const result = await backend.termWrite?.("test", cmd) || { output: "Run manually in terminal" };
+    statusEl.textContent = "✓";
+    statusEl.className = "test-status test-status--pass";
+    appendOutput("tasks", `[TEST] ${name}: PASSED`);
+  } catch (err) {
+    statusEl.textContent = "✗";
+    statusEl.className = "test-status test-status--fail";
+    appendOutput("tasks", `[TEST] ${name}: FAILED - ${err.message || err}`);
+  }
+}
+
+$("testRunAllBtn")?.addEventListener("click", () => {
+  const rows = $("testTree").querySelectorAll(".test-row");
+  for (const row of rows) row.click();
+});
+$("testRefreshBtn")?.addEventListener("click", () => refreshTestExplorer());
+
+// ---- Terminal Split ----
+let _termSplitActive = false;
+
+$("termSplitBtn")?.addEventListener("click", () => {
+  _termSplitActive = !_termSplitActive;
+  const body = $("terminalBody");
+  body.classList.toggle("term-split", _termSplitActive);
+  if (_termSplitActive && body.children.length < 2) {
+    createTermTab();
+  }
+});
+
+// ---- Bookmarks ----
+const _bookmarks = new Map();
+let _bookmarkDecorations = [];
+
+function toggleBookmark(path, line) {
+  if (!path) return;
+  const key = `${path}:${line}`;
+  if (_bookmarks.has(key)) {
+    _bookmarks.delete(key);
+  } else {
+    _bookmarks.set(key, { path, line, label: "" });
+  }
+  renderBookmarkDecorations();
+}
+
+function renderBookmarkDecorations() {
+  if (!activePath) return;
+  const decos = [];
+  for (const [, bm] of _bookmarks) {
+    if (bm.path !== activePath) continue;
+    decos.push({
+      range: new monaco.Range(bm.line, 1, bm.line, 1),
+      options: {
+        isWholeLine: true,
+        glyphMarginClassName: "bookmark-glyph",
+        overviewRuler: { color: "#007aff", position: monaco.editor.OverviewRulerLane.Center },
+      },
+    });
+  }
+  _bookmarkDecorations = monacoEditor.deltaDecorations(_bookmarkDecorations, decos);
+}
+
+function nextBookmark() {
+  const line = monacoEditor.getPosition()?.lineNumber || 0;
+  const sorted = [..._bookmarks.values()].filter(b => b.path === activePath).sort((a, b) => a.line - b.line);
+  const next = sorted.find(b => b.line > line) || sorted[0];
+  if (next) {
+    monacoEditor.revealLineInCenter(next.line);
+    monacoEditor.setPosition({ lineNumber: next.line, column: 1 });
+  }
+}
+
+function prevBookmark() {
+  const line = monacoEditor.getPosition()?.lineNumber || 0;
+  const sorted = [..._bookmarks.values()].filter(b => b.path === activePath).sort((a, b) => b.line - a.line);
+  const prev = sorted.find(b => b.line < line) || sorted[0];
+  if (prev) {
+    monacoEditor.revealLineInCenter(prev.line);
+    monacoEditor.setPosition({ lineNumber: prev.line, column: 1 });
+  }
+}
+
+function toggleBookmarksPanel() {
+  showToast(`${_bookmarks.size} bookmark(s)`);
+}
+
+monacoEditor.addAction({
+  id: "editor.toggleBookmark",
+  label: "Toggle Bookmark",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyK],
+  run: () => {
+    const line = monacoEditor.getPosition()?.lineNumber;
+    if (line && activePath) toggleBookmark(activePath, line);
+  },
+});
+monacoEditor.addAction({
+  id: "editor.nextBookmark",
+  label: "Next Bookmark",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyN],
+  run: () => nextBookmark(),
+});
+monacoEditor.addAction({
+  id: "editor.prevBookmark",
+  label: "Previous Bookmark",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyP],
+  run: () => prevBookmark(),
+});
+
+// ---- Notification Center ----
+const _notifHistory = [];
+const MAX_NOTIF_HISTORY = 50;
+
+const _origShowNotification = showNotification;
+const _wrappedShowNotification = function(opts) {
+  _notifHistory.unshift({ ...opts, time: Date.now() });
+  if (_notifHistory.length > MAX_NOTIF_HISTORY) _notifHistory.pop();
+  _updateNotifBadge();
+  return _origShowNotification(opts);
+};
+
+function _updateNotifBadge() {
+  const badge = $("notifBadge");
+  if (!badge) return;
+  const unread = _notifHistory.filter(n => !n.read).length;
+  badge.hidden = unread === 0;
+  badge.textContent = unread > 9 ? "9+" : String(unread);
+}
+
+function toggleNotifCenter() {
+  let panel = document.querySelector(".notif-center");
+  if (panel) { panel.remove(); return; }
+  panel = document.createElement("div");
+  panel.className = "notif-center";
+  panel.innerHTML = `<div class="notif-center__head"><span>Notifications</span><button class="iconbtn" id="notifClearAll" title="Clear all"><svg class="ic"><use href="#i-close" /></svg></button></div><div class="notif-center__list"></div>`;
+  const list = panel.querySelector(".notif-center__list");
+  if (!_notifHistory.length) {
+    list.innerHTML = '<div class="empty"><p>No notifications.</p></div>';
+  } else {
+    for (const n of _notifHistory) {
+      n.read = true;
+      const row = document.createElement("div");
+      row.className = "notif-center__item";
+      const ago = _timeAgo(n.time);
+      row.innerHTML = `<div class="notif-center__title">${_escHtml(n.title || "")}</div><div class="notif-center__msg">${_escHtml(n.message || "")}</div><div class="notif-center__time">${ago}</div>`;
+      list.appendChild(row);
+    }
+  }
+  _updateNotifBadge();
+  panel.querySelector("#notifClearAll")?.addEventListener("click", () => {
+    _notifHistory.length = 0;
+    _updateNotifBadge();
+    panel.remove();
+  });
+  document.body.appendChild(panel);
+  requestAnimationFrame(() => panel.classList.add("notif-center--visible"));
+  const dismiss = (e) => { if (!panel.contains(e.target) && e.target !== $("notifBellBtn")) { panel.remove(); document.removeEventListener("click", dismiss); } };
+  setTimeout(() => document.addEventListener("click", dismiss), 50);
+}
+
+function _timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+$("notifBellBtn")?.addEventListener("click", (e) => { e.stopPropagation(); toggleNotifCenter(); });
+
+// ---- Workspace Trust ----
+let _workspaceTrusted = true;
+
+async function checkWorkspaceTrust(path) {
+  if (!inTauri) return;
+  try {
+    const store = await getStore();
+    const trusted = (await store.get("trustedWorkspaces")) || [];
+    if (trusted.includes(path)) { _workspaceTrusted = true; return; }
+    _workspaceTrusted = false;
+    const result = await ioConfirm({
+      title: "Do you trust the authors of this folder?",
+      message: `${path}\n\nIf you don't trust the authors, features like terminals, tasks, and debugging will be restricted.`,
+      okLabel: "Yes, I trust the authors",
+    });
+    if (result) {
+      _workspaceTrusted = true;
+      trusted.push(path);
+      await store.set("trustedWorkspaces", trusted);
+    }
+  } catch { _workspaceTrusted = true; }
+}
+
+// ---- Multi-file AI Composer ----
+let _composerFiles = [];
+let _composerOpen = false;
+
+function openComposer() {
+  _composerOpen = true;
+  const panel = document.querySelector(".composer-panel") || _createComposerPanel();
+  panel.hidden = false;
+  panel.querySelector(".composer-input")?.focus();
+}
+
+function closeComposer() {
+  _composerOpen = false;
+  const panel = document.querySelector(".composer-panel");
+  if (panel) panel.hidden = true;
+}
+
+function _createComposerPanel() {
+  const panel = document.createElement("div");
+  panel.className = "composer-panel";
+  panel.innerHTML = `
+    <div class="composer-panel__head">
+      <span>AI Composer</span>
+      <span class="composer-panel__files" id="composerFiles">0 files selected</span>
+      <button class="iconbtn" id="composerClose" title="Close"><svg class="ic"><use href="#i-close" /></svg></button>
+    </div>
+    <div class="composer-panel__file-list" id="composerFileList"></div>
+    <div class="composer-panel__input-wrap">
+      <textarea class="composer-input" id="composerInput" placeholder="Describe changes across multiple files..." rows="3"></textarea>
+      <button class="btn btn--primary" id="composerSend">Apply Changes</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+  panel.querySelector("#composerClose").addEventListener("click", closeComposer);
+  panel.querySelector("#composerSend").addEventListener("click", () => runComposer());
+  _updateComposerFileList();
+  return panel;
+}
+
+function addFileToComposer(path) {
+  if (!_composerFiles.includes(path)) _composerFiles.push(path);
+  _updateComposerFileList();
+}
+
+function _updateComposerFileList() {
+  const listEl = document.querySelector("#composerFileList");
+  const countEl = document.querySelector("#composerFiles");
+  if (!listEl) return;
+  listEl.innerHTML = "";
+  for (const f of _composerFiles) {
+    const row = document.createElement("div");
+    row.className = "composer-file";
+    row.innerHTML = `<span>${_escHtml(f.split("/").pop())}</span>`;
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "iconbtn";
+    removeBtn.innerHTML = '<svg class="ic"><use href="#i-close" /></svg>';
+    removeBtn.addEventListener("click", () => {
+      _composerFiles = _composerFiles.filter(p => p !== f);
+      _updateComposerFileList();
+    });
+    row.appendChild(removeBtn);
+    listEl.appendChild(row);
+  }
+  if (countEl) countEl.textContent = `${_composerFiles.length} file(s)`;
+}
+
+async function runComposer() {
+  const input = document.querySelector("#composerInput");
+  const prompt = input?.value?.trim();
+  if (!prompt || !_composerFiles.length) return;
+  showToast("AI Composer: Processing...");
+  appendOutput("extensions", `[Composer] Processing ${_composerFiles.length} files: ${prompt}`);
+  for (const filePath of _composerFiles) {
+    try {
+      const content = await backend.readFile(filePath);
+      const fileName = filePath.split("/").pop();
+      const lang = extLang(fileName);
+      const response = await _callAI(`You are a code editor assistant. Modify the following ${lang} file based on the user's instruction.\n\nFile: ${fileName}\n\`\`\`${lang}\n${content}\n\`\`\`\n\nInstruction: ${prompt}\n\nReturn ONLY the modified code, no explanations.`);
+      if (response) {
+        showAiDiffPreview(content, response, lang, filePath);
+        appendOutput("extensions", `[Composer] Modified: ${fileName}`);
+      }
+    } catch (err) {
+      appendOutput("extensions", `[Composer] Error for ${filePath}: ${err.message || err}`);
+    }
+  }
+  showToast("AI Composer: Done");
+}
+
+async function _callAI(prompt) {
+  try {
+    const cfg = loadConfig();
+    const model = cfg.model || "deepseek-chat";
+    const apiKey = cfg.apiKey;
+    const baseUrl = cfg.baseUrl || "https://api.deepseek.com";
+    if (!apiKey) return null;
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], max_tokens: 4096, temperature: 0.3 }),
+    });
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch { return null; }
+}
+
+monacoEditor.addAction({
+  id: "editor.addToComposer",
+  label: "Add to AI Composer",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyA],
+  run: () => {
+    if (activePath) {
+      addFileToComposer(activePath);
+      if (!_composerOpen) openComposer();
+      showToast(`Added ${activePath.split("/").pop()} to Composer`);
+    }
+  },
+});
+
+// ---- Minimap Search Highlight ----
+let _minimapSearchDecorations = [];
+
+function updateMinimapSearchHighlights(matches) {
+  const decos = (matches || []).map(m => ({
+    range: m.range,
+    options: {
+      minimap: { color: "#ffc107", position: monaco.editor.MinimapPosition.Inline },
+      overviewRuler: { color: "#ffc107", position: monaco.editor.OverviewRulerLane.Center },
+    },
+  }));
+  _minimapSearchDecorations = monacoEditor.deltaDecorations(_minimapSearchDecorations, decos);
+}
+
+// ---- Extension Recommendations ----
+const _EXT_RECOMMENDATIONS = {
+  ".py": { name: "Python", ext: "ms-python.python", desc: "Python language support" },
+  ".rs": { name: "Rust Analyzer", ext: "rust-lang.rust-analyzer", desc: "Rust language support" },
+  ".go": { name: "Go", ext: "golang.go", desc: "Go language support" },
+  ".vue": { name: "Vue", ext: "Vue.volar", desc: "Vue language support" },
+  ".svelte": { name: "Svelte", ext: "svelte.svelte-vscode", desc: "Svelte language support" },
+  ".dart": { name: "Dart", ext: "Dart-Code.dart-code", desc: "Dart language support" },
+  ".java": { name: "Java", ext: "redhat.java", desc: "Java language support" },
+  ".rb": { name: "Ruby", ext: "Shopify.ruby-lsp", desc: "Ruby language support" },
+};
+
+function checkExtensionRecommendation(fileName) {
+  const ext = "." + (fileName.split(".").pop() || "");
+  const rec = _EXT_RECOMMENDATIONS[ext];
+  if (!rec || _recommendedAlready.has(ext)) return;
+  _recommendedAlready.add(ext);
+  showNotification({
+    title: `Recommended: ${rec.name}`,
+    message: rec.desc,
+    action: () => showSide("explorer"),
+    actionLabel: "View Extensions",
+    duration: 10000,
+  });
+}
+const _recommendedAlready = new Set();
+
+// ---- Custom Snippet Editor ----
+function openSnippetEditor() {
+  const existingPanel = document.querySelector(".snippet-editor");
+  if (existingPanel) { existingPanel.remove(); return; }
+  const panel = document.createElement("div");
+  panel.className = "snippet-editor feature-body";
+  panel.innerHTML = `
+    <div class="tool-header"><h3>Custom Snippets</h3><p>Manage your code snippets</p></div>
+    <div class="snippet-editor__form">
+      <label>Language <select id="snippetLang"><option value="javascript">JavaScript</option><option value="typescript">TypeScript</option><option value="python">Python</option><option value="go">Go</option><option value="rust">Rust</option><option value="html">HTML</option><option value="css">CSS</option></select></label>
+      <label>Prefix <input id="snippetPrefix" type="text" placeholder="e.g. log" /></label>
+      <label>Description <input id="snippetDesc" type="text" placeholder="Description" /></label>
+      <label>Body <textarea id="snippetBody" rows="5" placeholder="console.log($1);"></textarea></label>
+      <button class="btn btn--primary" id="snippetSave">Save Snippet</button>
+    </div>
+    <div class="snippet-editor__list" id="snippetList"></div>
+  `;
+  const fp = $("featurePanel");
+  if (fp) {
+    fp.querySelector(".feature-body")?.remove();
+    fp.appendChild(panel);
+  }
+  $("snippetSave")?.addEventListener("click", async () => {
+    const lang = $("snippetLang").value;
+    const prefix = $("snippetPrefix").value.trim();
+    const desc = $("snippetDesc").value.trim();
+    const body = $("snippetBody").value;
+    if (!prefix || !body) return showToast("Prefix and body are required.");
+    try {
+      const store = await getStore();
+      const snippets = (await store.get("custom-snippets")) || [];
+      snippets.push({ lang, prefix, description: desc, body });
+      await store.set("custom-snippets", snippets);
+      showToast(`Snippet "${prefix}" saved.`);
+    } catch { showToast("Failed to save snippet."); }
+  });
+}

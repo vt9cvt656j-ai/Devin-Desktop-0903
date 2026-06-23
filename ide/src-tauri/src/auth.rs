@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{MySqlPool, Row};
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{Row, SqlitePool};
 use std::sync::OnceLock;
 use tauri::command;
 
-static DB_POOL: OnceLock<MySqlPool> = OnceLock::new();
+static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthResult {
@@ -16,39 +16,117 @@ pub struct AuthResult {
 }
 
 pub async fn init_db() -> Result<(), String> {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:@127.0.0.1:3306/michael_ide".to_string());
+    // Default to an on-disk SQLite file under ~/.michael_ide (created if needed);
+    // `mode=rwc` lets SQLite create the database file itself.
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let dir = format!("{home}/.michael_ide");
+        let _ = std::fs::create_dir_all(&dir);
+        format!("sqlite://{dir}/auth.db?mode=rwc")
+    });
 
-    let pool = MySqlPoolOptions::new()
+    let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&url)
         .await
-        .map_err(|e| format!("MySQL connection failed: {e}"))?;
+        .map_err(|e| format!("SQLite connection failed: {e}"))?;
 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS users (
-            id VARCHAR(36) PRIMARY KEY,
-            email VARCHAR(255) NOT NULL UNIQUE,
-            password_hash VARCHAR(255) NOT NULL,
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         "#,
     )
     .execute(&pool)
     .await
     .map_err(|e| format!("Failed to create users table: {e}"))?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS marketplace_extensions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            author TEXT NOT NULL,
+            version TEXT NOT NULL DEFAULT '1.0.0',
+            description TEXT,
+            category TEXT DEFAULT 'Other',
+            tags TEXT,
+            featured INTEGER DEFAULT 0,
+            downloads INTEGER DEFAULT 0,
+            rating REAL DEFAULT 0.0,
+            icon TEXT DEFAULT 'default',
+            icon_svg TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("Failed to create marketplace_extensions table: {e}"))?;
+
     DB_POOL
         .set(pool)
         .map_err(|_| "DB pool already initialized".to_string())?;
 
-    tracing::info!("MySQL connected, users table ready");
+    tracing::info!("SQLite connected, tables ready");
     Ok(())
 }
 
-fn pool() -> Result<&'static MySqlPool, String> {
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
+pub struct DbExtension {
+    pub id: String,
+    pub name: String,
+    pub author: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub tags: Option<serde_json::Value>,
+    pub featured: bool,
+    pub downloads: i64,
+    pub rating: f32,
+    pub icon: Option<String>,
+    pub icon_svg: Option<String>,
+}
+
+#[command]
+pub async fn db_marketplace_list() -> Result<Vec<DbExtension>, String> {
+    let p = pool()?;
+    let rows: Vec<DbExtension> = sqlx::query_as::<_, DbExtension>(
+        "SELECT id, name, author, version, description, category, tags, featured, downloads, rating, icon, icon_svg FROM marketplace_extensions ORDER BY downloads DESC"
+    )
+    .fetch_all(p)
+    .await
+    .map_err(|e| format!("Query failed: {e}"))?;
+    Ok(rows)
+}
+
+#[command]
+pub async fn db_marketplace_upsert(ext: DbExtension) -> Result<String, String> {
+    let p = pool()?;
+    let tags_json = ext.tags.unwrap_or(serde_json::json!([]));
+    sqlx::query(
+        r#"INSERT INTO marketplace_extensions (id, name, author, version, description, category, tags, featured, downloads, rating, icon, icon_svg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name, author=excluded.author, version=excluded.version, description=excluded.description,
+        category=excluded.category, tags=excluded.tags, featured=excluded.featured, downloads=excluded.downloads, rating=excluded.rating, icon=excluded.icon, icon_svg=excluded.icon_svg"#
+    )
+    .bind(&ext.id).bind(&ext.name).bind(&ext.author).bind(&ext.version)
+    .bind(&ext.description).bind(&ext.category).bind(&tags_json)
+    .bind(ext.featured).bind(ext.downloads).bind(ext.rating)
+    .bind(&ext.icon).bind(&ext.icon_svg)
+    .execute(p)
+    .await
+    .map_err(|e| format!("Upsert failed: {e}"))?;
+    Ok(format!("Extension {} saved", ext.id))
+}
+
+fn pool() -> Result<&'static SqlitePool, String> {
     DB_POOL.get().ok_or_else(|| "Database not connected".to_string())
 }
 

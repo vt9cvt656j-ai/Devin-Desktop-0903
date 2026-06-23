@@ -361,15 +361,44 @@ export function createDapManager(options) {
   }
 
   // ---- public: breakpoints ----
-  async function sendBreakpoints(path, lines) {
+  async function sendBreakpoints(path, breakpoints) {
     if (!session) return [];
+    const bps = Array.isArray(breakpoints) ? breakpoints : [];
+    const normalized = bps.map((bp) => {
+      if (typeof bp === "number") return { line: bp };
+      return {
+        line: bp.line,
+        ...(bp.condition ? { condition: bp.condition } : {}),
+        ...(bp.hitCondition ? { hitCondition: bp.hitCondition } : {}),
+        ...(bp.logMessage ? { logMessage: bp.logMessage } : {}),
+      };
+    });
     const body = await sendRequest("setBreakpoints", {
       source: { path, name: path.split(/[/\\]/).pop() },
-      breakpoints: lines.map((line) => ({ line })),
-      lines,
+      breakpoints: normalized,
+      lines: normalized.map((bp) => bp.line),
       sourceModified: false,
     });
     return body?.breakpoints || [];
+  }
+
+  const watchExpressions = [];
+  function addWatch(expr) {
+    if (!watchExpressions.includes(expr)) watchExpressions.push(expr);
+  }
+  function removeWatch(expr) {
+    const idx = watchExpressions.indexOf(expr);
+    if (idx >= 0) watchExpressions.splice(idx, 1);
+  }
+  async function evaluateWatches() {
+    if (!isStopped()) return [];
+    const frameId = activeFrameId();
+    const results = [];
+    for (const expr of watchExpressions) {
+      const r = await evaluate(expr, frameId, "watch");
+      results.push({ expression: expr, value: r?.result || "undefined", type: r?.type || "" });
+    }
+    return results;
   }
 
   // ---- public: data inspection ----
@@ -416,5 +445,9 @@ export function createDapManager(options) {
     variables,
     evaluate,
     threads,
+    addWatch,
+    removeWatch,
+    evaluateWatches,
+    get watchExpressions() { return watchExpressions.slice(); },
   };
 }
