@@ -5493,9 +5493,10 @@ const _AI_MODE_PROMPTS = {
 # 工作方式（每个任务都遵循）
 1. 先理解再动手——先用 search / find_files / list_dir / read_file 摸清相关代码，再改。绝不修改没读过的文件，也不要凭空猜测代码内容或路径。
 2. 规划——多步任务先用 update_plan 列出分步计划，开工后每完成一步就更新对应状态（pending/in_progress/completed），让用户随时看到进度。简单任务（一两步）不必用。
-3. 自主推进——需要改代码就直接调用工具改，不要只描述方案。一个任务里连续调用工具，直到真正做完，而不是停在"建议你可以…"。
-4. 自我验证——改完尽量用 run_cmd 跑测试/构建/类型检查（如 cargo check、npm run build、go build、pytest）。失败就读报错→定位→修复→再验证，循环到通过为止。
-5. 收尾——完成后用 1-3 句话总结：改了什么、为什么、怎么验证的。
+3. 全自动推进——你的目标是把任务**端到端做完**，不是交一半。需要改代码就直接调工具改；信息不全时做**合理假设并说明**，能自己查证的就查证，尽量别停下来反问用户。一个任务里连续调用工具，直到真正完成；除非有不可逆风险或缺关键凭据（如 API key/密码），否则一路推进。
+4. 不确定就联网查，别凭记忆猜——遇到不熟悉的库/框架/API、拿不准的用法、版本差异、报错信息，**主动用 web_search 搜官方文档 / API 参考 / Stack Overflow，再用 web_fetch 读全文**，按查到的事实写代码，而不是靠印象。新库、新版本、冷门 API 尤其要查。
+5. 自我验证——改完尽量用 run_cmd 跑测试/构建/类型检查（cargo check、npm run build、go build、pytest 等）。失败就读报错→定位→（必要时联网查解决方案）→修复→再验证，循环到通过为止。
+6. 收尾——完成后用 1-3 句话总结：改了什么、为什么、怎么验证的；列出你做的关键假设。
 
 # 编辑规则
 - 改已有文件**优先用 edit_file**（精确替换片段）；不要用 write_file 整文件重写——重写易丢内容、易出错。
@@ -5519,7 +5520,8 @@ const _AI_MODE_PROMPTS = {
 - list_dir(path)：列目录
 - search(query, path?)：在项目里搜索文本/符号（找用法、定义、引用）
 - find_files(pattern)：按文件名/glob 找文件（如 *.rs、main.js）
-- web_fetch(url)：抓取公网网页正文，查在线文档/API/报错（仅 http/https 公网）
+- web_search(query)：联网搜索，找官方文档/API用法/库版本/报错解决方案/技术文章（拿不准就先搜）
+- web_fetch(url)：抓取公网网页正文，读 web_search 找到的页面或已知文档 URL（仅 http/https 公网）
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
@@ -5967,7 +5969,7 @@ async function sendPrompt(text, attachedImages = []) {
   const flushStream = () => {
     raf = 0;
     const now = Date.now();
-    if (now - lastFlush < 32) return;
+    if (now - lastFlush < 80) return; // ~12fps: full markdown re-render is heavy
     lastFlush = now;
     body.querySelector(".thinking")?.remove();
 
@@ -6757,7 +6759,7 @@ const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path 
 //  the way Claude Code / Codex do, instead of a single read-then-answer pass.
 // ============================================================================
 
-const _AGENT_MAX_ITERS = 30;
+const _AGENT_MAX_ITERS = 40;
 
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
@@ -6765,7 +6767,8 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。用 \".\" 表示工作区根。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "在整个项目里按文本搜索（grep），返回匹配的文件、行号和该行内容。用来找符号定义、用法、引用。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本" }, path: { type: "string", description: "可选，限定搜索的子目录" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
-    { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于查在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
+    { type: "function", function: { name: "web_search", description: "联网搜索（DuckDuckGo），返回标题/URL/摘要列表。用来查官方文档、API 用法、库的最新版本、报错解决方案、技术文章——找到相关页面后再用 web_fetch 读全文。不确定的 API/库/报错优先搜，别凭记忆猜。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
+    { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
   ];
@@ -6788,6 +6791,7 @@ function _mapToolCall(name, args) {
     case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "" };
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
+    case "web_search": return { type: "websearch", path: args.query || "", query: args.query || "" };
     case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "" };
     case "run_cmd": return { type: "cmd", command: args.command || "" };
@@ -6944,10 +6948,15 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
   let err = null;
   const byIndex = new Map();
   let streamEl = null;
-  let raf = 0;
-
-  const flush = () => {
-    raf = 0;
+  // Throttle streaming re-render to ~12fps. Re-parsing + rebuilding the whole
+  // markdown DOM (and re-highlighting code) on every animation frame is O(n²)
+  // over a long reply and freezes the UI. The final full render runs once when
+  // the turn ends (below), so no content is lost.
+  let lastFlush = 0;
+  let flushTimer = 0;
+  const doRender = () => {
+    flushTimer = 0;
+    lastFlush = Date.now();
     body.querySelector(".thinking")?.remove();
     const clean = _cleanAgentText(acc);
     if (clean.trim()) {
@@ -6956,7 +6965,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
     }
     chatEl.scrollTop = chatEl.scrollHeight;
   };
-  const schedule = () => { if (!raf) raf = requestAnimationFrame(flush); };
+  const schedule = () => {
+    if (flushTimer) return;
+    const wait = Math.max(0, 80 - (Date.now() - lastFlush));
+    flushTimer = setTimeout(() => requestAnimationFrame(doRender), wait);
+  };
 
   // Retry transient failures (rate limits, 5xx, network blips) with exponential
   // backoff — but only while nothing has streamed yet, so a retry can never
@@ -6990,7 +7003,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
     break;
   }
 
-  if (raf) cancelAnimationFrame(raf);
+  if (flushTimer) clearTimeout(flushTimer);
   body.querySelector(".thinking")?.remove();
 
   const cleanFinal = _cleanAgentText(acc);
@@ -7054,7 +7067,7 @@ async function _runSubAgent({ config, description, prompt, root, container }) {
 
   const sysPrompt = _SUBAGENT_SYSTEM + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext());
   const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: prompt }];
-  const toolSchemas = _buildAgentToolSchemas(false).filter((t) => ["read_file", "list_dir", "search", "find_files", "web_fetch"].includes(t.function.name));
+  const toolSchemas = _buildAgentToolSchemas(false).filter((t) => ["read_file", "list_dir", "search", "find_files", "web_fetch", "web_search"].includes(t.function.name));
 
   let report = "";
   let toolCount = 0;
@@ -7071,7 +7084,7 @@ async function _runSubAgent({ config, description, prompt, root, container }) {
       if (!turn.toolCalls.length) break;
       for (const tc of turn.toolCalls) {
         const call = _mapToolCall(tc.name, tc.parsedArgs);
-        if (!call || !["read", "list", "search", "find", "web"].includes(call.type)) {
+        if (!call || !["read", "list", "search", "find", "web", "websearch"].includes(call.type)) {
           messages.push({ role: "tool", tool_call_id: tc.id, content: call ? `子智能体只读，不能用 ${tc.name}。` : `未知工具: ${tc.name}` });
           continue;
         }
@@ -7156,7 +7169,7 @@ async function _runAgenticLoop({ config, messages, root }) {
       chatEl.scrollTop = chatEl.scrollHeight;
 
       const toolMsgs = new Array(items.length);
-      const READ_ONLY = new Set(["read", "list", "search", "find", "web"]);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch"]);
 
       const runOne = async (it) => {
         const { call, step } = it;
@@ -7238,7 +7251,7 @@ function _createToolStep(call) {
   const pathDisplay = call.path || call.command || "";
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -7248,12 +7261,13 @@ function _createToolStep(call) {
     search: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
     find: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>`,
     web: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
+    websearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -7570,6 +7584,23 @@ async function _executeToolStep(step, call, root) {
       res.textContent = chars > 1024 ? `${(chars / 1024).toFixed(1)} KB` : `${chars} chars`;
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "web", path: call.path, content: `网页 ${url}:\n${text}` };
+
+    } else if (call.type === "websearch") {
+      const q = (call.query || call.path || "").trim();
+      if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "空搜索词"; return { type: "websearch", path: call.path, content: "[ERROR] 空搜索词。" }; }
+      let text = "";
+      try { text = await backend.invoke("web_search", { query: q }); }
+      catch (e) {
+        const msg = String(e?.message || e).slice(0, 160);
+        res.className = "atc-result atc-result--err";
+        res.textContent = msg.slice(0, 80);
+        return { type: "websearch", path: call.path, content: `[ERROR] 搜索失败: ${msg}` };
+      }
+      const hits = (text.match(/^\s*\d+\.\s/gm) || []).length;
+      res.className = "atc-result atc-result--ok";
+      res.textContent = hits ? `${hits} 条结果` : "完成";
+      vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
+      return { type: "websearch", path: call.path, content: text };
 
     } else if (call.type === "cmd") {
       if (!call.command || !call.command.trim()) {

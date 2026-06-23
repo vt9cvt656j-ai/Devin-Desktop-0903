@@ -301,3 +301,121 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     };
     Ok(text.chars().take(24_000).collect())
 }
+
+fn percent_decode_str(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) =
+                ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
+            {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// DuckDuckGo wraps result links as `//duckduckgo.com/l/?uddg=<encoded>&...`.
+fn ddg_unwrap(href: &str) -> String {
+    if let Some(p) = href.find("uddg=") {
+        let enc = href[p + 5..].split('&').next().unwrap_or("");
+        percent_decode_str(enc)
+    } else if href.starts_with("http") {
+        href.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find("result__a") {
+        rest = &rest[pos + 9..];
+        let href = rest
+            .find("href=\"")
+            .and_then(|h| {
+                let s = &rest[h + 6..];
+                s.find('"').map(|e| s[..e].to_string())
+            })
+            .unwrap_or_default();
+        let url = ddg_unwrap(&href);
+        let title = rest
+            .find('>')
+            .and_then(|g| {
+                let s = &rest[g + 1..];
+                s.find("</a>").map(|e| html_to_text(&s[..e]))
+            })
+            .unwrap_or_default();
+        let snippet = rest
+            .find("result__snippet")
+            .and_then(|sp| {
+                let s = &rest[sp..];
+                s.find('>').and_then(|g| {
+                    let s2 = &s[g + 1..];
+                    s2.find("</a>")
+                        .or_else(|| s2.find("</div>"))
+                        .map(|e| html_to_text(&s2[..e]))
+                })
+            })
+            .unwrap_or_default();
+        if !url.is_empty() && !title.is_empty() && !out.iter().any(|(_, u, _)| u == &url) {
+            out.push((title, url, snippet));
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out
+}
+
+/// Web search (DuckDuckGo HTML, no API key) so the agent can FIND docs/articles,
+/// then `web_fetch` the ones it wants. Returns title + real URL + snippet.
+#[tauri::command]
+pub async fn web_search(query: String) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("空搜索词".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36",
+        )
+        .form(&[("q", q)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("搜索失败 HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+    let results = parse_ddg_results(&html);
+    if results.is_empty() {
+        return Ok(format!("「{q}」没有搜到结果。"));
+    }
+    let mut out = format!("搜索「{q}」的结果：\n");
+    for (i, (title, url, snippet)) in results.iter().take(8).enumerate() {
+        out.push_str(&format!(
+            "\n{}. {}\n   {}\n   {}\n",
+            i + 1,
+            title,
+            url,
+            snippet.chars().take(240).collect::<String>()
+        ));
+    }
+    out.push_str("\n（用 web_fetch 打开上面任意 URL 读全文）");
+    Ok(out)
+}

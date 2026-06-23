@@ -82,6 +82,7 @@ pub fn run() {
             ai::ai_chat,
             ai::ai_chat_with_tools,
             ai::web_fetch,
+            ai::web_search,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
             extensions::ext_set_enabled,
