@@ -6023,7 +6023,7 @@ async function sendPrompt(text, attachedImages = []) {
   const flushStream = () => {
     raf = 0;
     const now = Date.now();
-    if (now - lastFlush < 80) return; // ~12fps: full markdown re-render is heavy
+    if (now - lastFlush < 80) { scheduleStream(); return; } // ~12fps; reschedule so the tail still renders
     lastFlush = now;
     body.querySelector(".thinking")?.remove();
 
@@ -8025,27 +8025,38 @@ async function _agentFollowUp(toolResults, container) {
   let _segR2 = 0, _streamE2 = null;
   const root = rootPath || workspaceRoots[0] || "";
   const proms = [];
+  // Throttle streaming re-render to ~12fps. Re-parsing the whole reply and
+  // rebuilding its markdown DOM on every token is O(n²) and, combined with
+  // terminal output, freezes the UI. The final full render below loses nothing.
+  let _ffLast = 0, _ffTimer = 0;
+  const _ffRender = () => {
+    _ffTimer = 0; _ffLast = Date.now();
+    body.querySelector(".thinking")?.remove();
+    const segs = _parseStreamSegments(acc);
+    const ce = segs.length > 0 && !segs[segs.length - 1].complete ? segs.length - 1 : segs.length;
+    while (_segR2 < ce) {
+      if (_streamE2) { _streamE2.remove(); _streamE2 = null; }
+      _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms);
+      _segR2++;
+    }
+    const tail = ce < segs.length ? segs[segs.length - 1] : null;
+    if (tail) {
+      if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
+      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownInto(_streamE2, c, { streaming: true }); }
+    }
+    chatEl.scrollTop = chatEl.scrollHeight;
+  };
+  const _ffSchedule = () => {
+    if (_ffTimer) return;
+    _ffTimer = setTimeout(() => requestAnimationFrame(_ffRender), Math.max(0, 80 - (Date.now() - _ffLast)));
+  };
   try {
     await backend.aiChat(config, messages, (ev) => {
-      if (ev.kind === "token") {
-        acc += ev.delta;
-        body.querySelector(".thinking")?.remove();
-        const segs = _parseStreamSegments(acc);
-        const ce = segs.length > 0 && !segs[segs.length - 1].complete ? segs.length - 1 : segs.length;
-        while (_segR2 < ce) {
-          if (_streamE2) { _streamE2.remove(); _streamE2 = null; }
-          _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms);
-          _segR2++;
-        }
-        const tail = ce < segs.length ? segs[segs.length - 1] : null;
-        if (tail) {
-          if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
-          if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownInto(_streamE2, c, { streaming: true }); }
-        }
-        chatEl.scrollTop = chatEl.scrollHeight;
-      } else if (ev.kind === "error") { err = ev.message; }
+      if (ev.kind === "token") { acc += ev.delta; _ffSchedule(); }
+      else if (ev.kind === "error") { err = ev.message; }
     });
   } catch (e) { if (!err) err = String(e); }
+  if (_ffTimer) { clearTimeout(_ffTimer); _ffTimer = 0; }
   body.querySelector(".thinking")?.remove();
   if (_streamE2) { _streamE2.remove(); _streamE2 = null; }
   if (acc) {
@@ -11094,7 +11105,10 @@ const _TERM_REFRESH_PATTERNS = [
   /gem install/i,
   /luarocks install/i,
   /composer require/i,
-  /\$\s*$/, // shell prompt returned
+  // NOTE: deliberately no "shell prompt" pattern — `/\$\s*$/` matched almost any
+  // output containing `$`, so it fired a full reloadDir + git + LSP refresh on
+  // nearly every terminal chunk while the agent ran commands (a periodic freeze).
+  // We only refresh after recognizably state-changing commands (installs/builds).
 ];
 
 let _termOutputBuf = "";
@@ -11126,7 +11140,7 @@ function _scheduleTermRefresh() {
       _envLoadingLang = null;
       _loadEnvSymbols(langId);
     }
-  }, 2000);
+  }, 5000);
 }
 
 // ---- new project templates ----
@@ -11739,13 +11753,22 @@ async function createTermTab() {
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(container);
-  try { term.loadAddon(new WebglAddon()); } catch { /* WebGL not available, fallback to canvas */ }
+  // WebGL renderer is much faster, but a lost GPU context (sleep/wake, driver
+  // reset, too many contexts) silently stops it rendering — the classic "typing
+  // shows nothing / terminal frozen" bug. Dispose the addon on context loss so
+  // xterm falls back to the canvas renderer instead of freezing.
+  let webglAddon = null;
+  try {
+    webglAddon = new WebglAddon();
+    webglAddon.onContextLoss(() => { try { webglAddon.dispose(); } catch {} webglAddon = null; });
+    term.loadAddon(webglAddon);
+  } catch { webglAddon = null; /* WebGL unavailable → canvas renderer */ }
   term.loadAddon(new WebLinksAddon());
   termResizeObserver.observe(container);
 
   let initDone = false;
   let initBuffer = "";
-  const entry = { term, fit, container, label, cwd, backendId: null, opening: false, inputLine: "", ghost: "", suggestion: "" };
+  const entry = { term, fit, container, label, cwd, backendId: null, opening: false, inputLine: "", ghost: "", suggestion: "", webgl: webglAddon };
   termTabs.push(entry);
 
   term.onData((d) => {
@@ -11809,6 +11832,7 @@ function closeTermTab(idx) {
   if (idx < 0 || idx >= termTabs.length) return;
   const tab = termTabs[idx];
   if (tab.backendId != null) backend.termClose(tab.backendId);
+  try { tab.webgl?.dispose(); } catch {} // release the GPU context (avoid leaking WebGL contexts)
   tab.term.dispose();
   termResizeObserver.unobserve(tab.container);
   tab.container.remove();
