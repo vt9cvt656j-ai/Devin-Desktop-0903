@@ -6979,6 +6979,27 @@ function _refreshTreeFor(absPath) {
   try { refreshGitStatus(); } catch { /* git panel not ready */ }
 }
 
+// Run-level checkpoint: snapshot each file the moment before the agent FIRST
+// changes it this run, so the whole run's edits can be reverted in one click.
+const _runCheckpoint = new Map(); // absPath -> { existed: bool, content: string }
+function _checkpointRecord(absPath, existed, content) {
+  if (!absPath || _runCheckpoint.has(absPath)) return;
+  _runCheckpoint.set(absPath, { existed: !!existed, content: existed ? (content || "") : "" });
+}
+async function _revertRun(snapshot) {
+  let ok = 0, fail = 0;
+  for (const [path, snap] of snapshot) {
+    try {
+      if (snap.existed) await backend.writeTextFile(path, snap.content);
+      else await backend.deletePath(path).catch(() => {});
+      _agentReadCache.delete(path); _invalidateRead(path); _refreshTreeFor(path);
+      _ipcBroadcast("file_changed", { path });
+      ok++;
+    } catch { fail++; }
+  }
+  return { ok, fail };
+}
+
 // Heuristic for "this is a multi-step / build-something task" → worth a plan-first
 // approach. Deliberately conservative so quick fixes aren't slowed down.
 function _looksComplexTask(text) {
@@ -7384,6 +7405,7 @@ async function _runAgenticLoop({ config, messages, root }) {
   streaming = true;
   _setSendBtnStop(true);
   _clearAgentReadCache(); // fresh file reads each run
+  _runCheckpoint.clear(); // start a fresh revert checkpoint for this run
 
   let finalErr = null;
   let summaryText = "";
@@ -7534,6 +7556,25 @@ async function _runAgenticLoop({ config, messages, root }) {
         sendPrompt("按上面给出的方案逐步实施：先用 update_plan 列出步骤，再逐步实现，收尾前验证。");
       });
       body.appendChild(exec);
+    }
+    // Whole-run revert: one click restores every file this run touched to its
+    // pre-run state (created files are removed). A checkpoint of each file was
+    // taken before its first change.
+    if (_runCheckpoint.size > 0) {
+      const snapshot = new Map(_runCheckpoint);
+      const n = snapshot.size;
+      const revert = document.createElement("button");
+      revert.className = "run-revert-btn";
+      revert.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h5.5a2.5 2.5 0 010 5H7M4 7l2.4-2.4M4 7l2.4 2.4"/></svg> 撤销本轮全部改动（${n} 个文件）`;
+      revert.addEventListener("click", async () => {
+        if (streaming) return;
+        revert.disabled = true;
+        revert.innerHTML = "正在撤销…";
+        const { ok, fail } = await _revertRun(snapshot);
+        revert.innerHTML = fail ? `已撤销 ${ok} 个，${fail} 个失败` : `✓ 已撤销 ${ok} 个文件`;
+        showToast(fail ? `撤销完成（${ok} 成功 / ${fail} 失败）` : `已撤销本轮 ${ok} 个文件的改动`);
+      });
+      body.appendChild(revert);
     }
     saveChatHistory();
     const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
@@ -7748,6 +7789,7 @@ async function _executeToolStep(step, call, root) {
       let old = "";
       let existed = false;
       try { old = await backend.readTextFile(fp); existed = true; } catch {}
+      _checkpointRecord(fp, existed, old); // snapshot before first change (for revert-all)
 
       let newContent = call.content;
 
@@ -7850,6 +7892,7 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
         return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
       }
+      _checkpointRecord(fp, true, old); // snapshot before first change (for revert-all)
       const edits = Array.isArray(call.edits) ? call.edits : [];
       if (!edits.length) {
         res.className = "atc-result atc-result--err"; res.textContent = "edits 为空";
@@ -7990,6 +8033,7 @@ async function _executeToolStep(step, call, root) {
       if (!p.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "delete", path: p, content: "[ERROR] 空路径。" }; }
       const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
       try {
+        try { _checkpointRecord(fp, true, await backend.readTextFile(fp)); } catch { /* dir/binary — not snapshotted */ }
         await backend.deletePath(fp);
         _invalidateRead(p); _agentReadCache.delete(fp);
         _refreshTreeFor(fp);
@@ -8006,6 +8050,7 @@ async function _executeToolStep(step, call, root) {
       const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
       const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
       try {
+        try { _checkpointRecord(fromFp, true, await backend.readTextFile(fromFp)); _checkpointRecord(toFp, false, ""); } catch {}
         await backend.renamePath(fromFp, toFp);
         _invalidateRead(from); _agentReadCache.delete(fromFp);
         _refreshTreeFor(fromFp); _refreshTreeFor(toFp);

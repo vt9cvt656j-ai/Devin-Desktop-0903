@@ -6145,3 +6145,17 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 .plan-exec-btn:hover { filter: brightness(1.08); }
 .plan-exec-btn:disabled { opacity: .5; cursor: default; }
 .plan-exec-btn svg { flex: none; }
+
+/* Whole-run "revert all changes" button (neutral, turns danger on hover). */
+.run-revert-btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  margin-top: 10px; padding: 6px 12px;
+  border-radius: 8px; cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 500;
+  color: var(--text-dim, #8b949e); background: transparent;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
+  transition: color .15s ease, border-color .15s ease, background .15s ease;
+}
+.run-revert-btn:hover { color: #f85149; border-color: rgba(248, 81, 73, 0.5); background: rgba(248, 81, 73, 0.06); }
+.run-revert-btn:disabled { opacity: .6; cursor: default; }
+.run-revert-btn svg { flex: none; }
