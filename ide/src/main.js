@@ -5398,6 +5398,10 @@ _initIPC();
 // editor theme, no extra dependency). Returns null on failure so the card keeps
 // its plain, already-escaped text.
 async function highlightCode(code, lang) {
+  // monaco.editor.colorize tokenizes on the main thread — a very large block can
+  // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
+  // once. Skip highlighting oversized blocks (plain text reads fine).
+  if (!code || code.length > 20000 || code.split("\n").length > 600) return null;
   try {
     let html = await monaco.editor.colorize(code, lang, { tabSize: 2 });
     return html.replace(/<br\/?>\s*$/, "");
@@ -6101,7 +6105,7 @@ async function sendPrompt(text, attachedImages = []) {
           if (codeEl && codeEl._lastLen !== tail.content.length) {
             codeEl.textContent = tail.content;
             codeEl._lastLen = tail.content.length;
-            if (monoId !== 'plaintext' && tail.content.trim() && !codeEl._hlPending) {
+            if (monoId !== 'plaintext' && tail.content.trim() && tail.content.length < 20000 && !codeEl._hlPending) {
               codeEl._hlPending = true;
               const snapLen = tail.content.length;
               monaco.editor.colorize(tail.content, monoId, { tabSize: 2 })
@@ -6913,6 +6917,12 @@ function _renderPlan(container, steps, existingEl) {
 // delete/move. The web cache lives for the session (page content is stable). ---
 const _agentReadCache = new Map(); // absolute path -> file text
 const _agentWebCache = new Map(); // url|query -> result text
+// Bounded LRU-ish put: evict the oldest entry past the cap so a long session of
+// web_fetch/web_search can't grow this cache without limit.
+function _webCachePut(key, val) {
+  _agentWebCache.set(key, val);
+  if (_agentWebCache.size > 60) _agentWebCache.delete(_agentWebCache.keys().next().value);
+}
 function _clearAgentReadCache() { _agentReadCache.clear(); }
 function _invalidateRead(path) {
   if (!path) return;
@@ -7824,7 +7834,7 @@ async function _executeToolStep(step, call, root) {
       if (_agentWebCache.has(url)) {
         text = _agentWebCache.get(url);
       } else {
-        try { text = await backend.invoke("web_fetch", { url }); _agentWebCache.set(url, text); }
+        try { text = await backend.invoke("web_fetch", { url }); _webCachePut(url, text); }
         catch (e) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
@@ -7845,7 +7855,7 @@ async function _executeToolStep(step, call, root) {
       if (_agentWebCache.has("q:" + q)) {
         text = _agentWebCache.get("q:" + q);
       } else {
-        try { text = await backend.invoke("web_search", { query: q }); _agentWebCache.set("q:" + q, text); }
+        try { text = await backend.invoke("web_search", { query: q }); _webCachePut("q:" + q, text); }
         catch (e) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
@@ -11762,7 +11772,7 @@ async function createTermTab() {
     cursorBlink: true,
     cursorStyle: "bar",
     cursorWidth: 2,
-    scrollback: 10000,
+    scrollback: 3500, // bounded so a flooding command can't balloon terminal memory/CPU
     allowProposedApi: true,
     drawBoldTextInBrightColors: false,
     minimumContrastRatio: 4.5,
