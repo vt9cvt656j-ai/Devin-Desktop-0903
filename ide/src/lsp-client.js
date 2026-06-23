@@ -18,7 +18,11 @@ import * as monaco from "monaco-editor";
 // Languages we auto-start + wire Monaco providers for. Monaco's bundled service
 // covers ts/js/json/css/html, so we deliberately leave those to Monaco to avoid
 // duplicate completions and diagnostics.
-const MANAGED_LANGS = ["rust", "python", "go", "c", "cpp"];
+const MANAGED_LANGS = [
+  "rust", "python", "go", "c", "cpp", "objective-c",
+  "java", "ruby", "php", "lua", "shell", "yaml", "csharp", "kotlin", "swift",
+  "dart", "elixir", "clojure", "scala", "hcl", "graphql", "dockerfile", "vue",
+];
 
 // Monaco language id -> the `lang` key the backend's KNOWN_SERVERS table uses.
 const SERVER_LANG = {
@@ -44,6 +48,8 @@ const DOC_LANGUAGE_ID = {
   cpp: "cpp",
   typescript: "typescript",
   javascript: "javascript",
+  // bash-language-server identifies documents as "shellscript", not "shell".
+  shell: "shellscript",
 };
 
 const Sev = monaco.MarkerSeverity;
@@ -623,10 +629,33 @@ export function createLspManager(options) {
         python: "npm i -g pyright",
         rust: "rustup component add rust-analyzer",
         go: "go install golang.org/x/tools/gopls@latest",
-        c: "brew install llvm (clangd)",
-        cpp: "brew install llvm (clangd)",
+        c: "brew install llvm",
+        cpp: "brew install llvm",
+        "objective-c": "brew install llvm",
+        java: "brew install jdtls",
+        ruby: "gem install solargraph",
+        php: "npm i -g intelephense",
+        lua: "brew install lua-language-server",
+        shell: "npm i -g bash-language-server",
+        yaml: "npm i -g yaml-language-server",
+        csharp: "brew install omnisharp",
+        kotlin: "brew install kotlin-language-server",
+        elixir: "brew install elixir-ls",
+        clojure: "brew install clojure-lsp",
+        scala: "brew install coursier && cs install metals",
+        hcl: "brew install hashicorp/tap/terraform-ls",
+        graphql: "npm i -g graphql-language-service-cli",
+        dockerfile: "npm i -g dockerfile-language-server-nodejs",
+        vue: "npm i -g @vue/language-server",
       };
-      const names = { python: "Pyright", rust: "rust-analyzer", go: "gopls", c: "clangd", cpp: "clangd" };
+      const names = {
+        python: "Pyright", rust: "rust-analyzer", go: "gopls", c: "clangd", cpp: "clangd",
+        "objective-c": "clangd", java: "jdtls", ruby: "Solargraph", php: "Intelephense",
+        lua: "lua-language-server", shell: "bash-language-server", yaml: "yaml-language-server",
+        csharp: "OmniSharp", kotlin: "kotlin-language-server", dart: "Dart LSP", swift: "SourceKit-LSP",
+        elixir: "elixir-ls", clojure: "clojure-lsp", scala: "Metals", hcl: "terraform-ls",
+        graphql: "GraphQL LSP", dockerfile: "Docker LS", vue: "Vue LS",
+      };
       const hint = installHints[langId];
       let toolExists = false;
       try { toolExists = await backend.lspCheckAvailable(langId); } catch { /* ignore */ }

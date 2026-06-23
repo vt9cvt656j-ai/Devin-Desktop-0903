@@ -47,9 +47,29 @@ const KNOWN_SERVERS: &[(&str, &str, &[&str])] = &[
     ("go", "gopls", &["serve"]),
     ("c", "clangd", &[]),
     ("cpp", "clangd", &[]),
+    ("objective-c", "clangd", &[]),
     ("html", "vscode-html-language-server", &["--stdio"]),
     ("css", "vscode-css-language-server", &["--stdio"]),
     ("json", "vscode-json-language-server", &["--stdio"]),
+    // Extended language coverage. Each only activates when its server binary is
+    // installed; otherwise the UI offers a one-click install hint.
+    ("java", "jdtls", &[]),
+    ("ruby", "solargraph", &["stdio"]),
+    ("php", "intelephense", &["--stdio"]),
+    ("lua", "lua-language-server", &[]),
+    ("shell", "bash-language-server", &["start"]),
+    ("yaml", "yaml-language-server", &["--stdio"]),
+    ("csharp", "omnisharp", &["-lsp"]),
+    ("kotlin", "kotlin-language-server", &[]),
+    ("swift", "sourcekit-lsp", &[]),
+    ("dart", "dart", &["language-server", "--protocol=lsp"]),
+    ("elixir", "elixir-ls", &[]),
+    ("clojure", "clojure-lsp", &[]),
+    ("scala", "metals", &[]),
+    ("hcl", "terraform-ls", &["serve"]),
+    ("graphql", "graphql-lsp", &["server", "-m", "stream"]),
+    ("dockerfile", "docker-langserver", &["--stdio"]),
+    ("vue", "vue-language-server", &["--stdio"]),
 ];
 
 fn find_server(lang: &str) -> Option<(&'static str, &'static [&'static str])> {

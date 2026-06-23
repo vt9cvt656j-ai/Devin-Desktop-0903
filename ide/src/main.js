@@ -3192,6 +3192,9 @@ async function renderWorkspaceRoots() {
 async function openFolder(path) {
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
+  // Opening a different project should immediately retag the active chat tab.
+  const _sess = _currentSession();
+  if (_sess && _sess.project !== path) { _sess.project = path; _renderChatTabs(); saveChatHistory(); }
   try { await backend.registerWorkspaceRoot(path); } catch { /* browser preview */ }
   _ipcBroadcast("workspace_changed", { roots: [path], active: path });
   await renderWorkspaceRoots();
@@ -4871,16 +4874,14 @@ async function loadConfigAsync() {
   await migrateFromLocalStorage();
   const store = await getStore();
   const saved = (await store.get(CFG_KEY)) || {};
-  const hasValidConfig = saved.baseUrl && saved.apiKey && saved.model;
-  if (!hasValidConfig) {
-    _cfgCache = { ..._DEFAULT_AI_CONFIG };
-    try {
-      await store.set(CFG_KEY, _cfgCache);
-      await store.save();
-    } catch { /* store might not be ready in browser dev mode */ }
-  } else {
-    _cfgCache = saved;
-  }
+  // Merge saved settings over the defaults so a chosen model (or baseUrl) is kept
+  // across restarts even before an API key is entered — previously an empty
+  // apiKey wiped the whole config back to defaults, losing the user's model.
+  _cfgCache = { ..._DEFAULT_AI_CONFIG, ...saved };
+  try {
+    await store.set(CFG_KEY, _cfgCache);
+    await store.save();
+  } catch { /* store might not be ready in browser dev mode */ }
   return _cfgCache;
 }
 
@@ -5057,6 +5058,7 @@ document.addEventListener("keydown", (e) => {
 
 let _chatSessions = [];
 let _activeChatIdx = -1;
+let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats after a close
 let streaming = false;
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 
@@ -5081,11 +5083,27 @@ const history = new Proxy([], {
   }
 });
 
-function _createChatSession(name, mode, model) {
+function _createChatSession(name, mode, model, project) {
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const container = document.createElement("div");
   container.className = "chat-session-container";
-  return { id, name: name || `Chat ${_chatSessions.length + 1}`, mode: mode || _currentAiMode, model: model || null, history: [], container, created: Date.now() };
+  // Name from a monotonic counter, not length+1 — otherwise closing Chat 1 of
+  // [Chat 1, Chat 2] then adding a new one produces a second "Chat 2". A
+  // restored name bumps the counter so fresh tabs never collide with it.
+  let finalName = name;
+  if (finalName) {
+    const n = parseInt((finalName.match(/Chat\s+(\d+)/) || [])[1] || "0", 10);
+    if (n > _chatSeq) _chatSeq = n;
+  } else {
+    finalName = `Chat ${++_chatSeq}`;
+  }
+  return {
+    id, name: finalName, mode: mode || _currentAiMode, model: model || null,
+    // Which project this chat is about (folder it was started under); kept in
+    // sync on send. Lets each tab show its project.
+    project: project !== undefined ? project : (rootPath || workspaceRoots[0] || ""),
+    history: [], container, created: Date.now(),
+  };
 }
 
 function _renderChatTabs() {
@@ -5098,10 +5116,16 @@ function _renderChatTabs() {
     const modeColor = modeObj?.color || "#3b82f6";
     tab.className = "chat-tab" + (i === _activeChatIdx ? " is-active" : "");
     tab.type = "button";
+    const projName = s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "";
+    const projTag = projName
+      ? `<span class="chat-tab__project"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.75 2.75a.75.75 0 00-.75.75v9a.75.75 0 00.75.75h12.5a.75.75 0 00.75-.75v-7a.75.75 0 00-.75-.75H7.7L6.35 3.02a.75.75 0 00-.53-.27H1.75z"/></svg><span class="chat-tab__projname"></span></span>`
+      : "";
     const modelTag = s.model ? `<span class="chat-tab__model">${modelLabel(s.model)}</span>` : "";
     const modeTag = s.mode && s.mode !== "agent" ? `<span class="chat-tab__mode" style="color:${modeColor}">${modeObj?.label || s.mode}</span>` : "";
-    tab.innerHTML = `<span class="chat-tab__dot" style="background:${modeColor}"></span><span class="chat-tab__label"></span>${modeTag}${modelTag}<span class="chat-tab__x">&times;</span>`;
+    tab.innerHTML = `<span class="chat-tab__dot" style="background:${modeColor}"></span><span class="chat-tab__label"></span>${projTag}${modeTag}${modelTag}<span class="chat-tab__x" aria-label="关闭" title="关闭">&times;</span>`;
     tab.querySelector(".chat-tab__label").textContent = s.name;
+    if (projName) tab.querySelector(".chat-tab__projname").textContent = projName;
+    tab.title = (s.project ? `📁 ${s.project}\n` : "") + s.name;
     tab.addEventListener("click", (e) => {
       if (e.target.closest(".chat-tab__x")) {
         e.preventDefault();
@@ -5159,20 +5183,38 @@ function _newChatSession(name, mode) {
 
 function _closeChatSession(idx) {
   if (idx < 0 || idx >= _chatSessions.length) return;
+  const closing = _chatSessions[idx];
   _chatSessions.splice(idx, 1);
+  // Drop the closed session's DOM so it can't linger on screen.
+  closing?.container?.remove();
   if (_chatSessions.length === 0) {
-    _newChatSession();
+    // Truly close the last tab — go to an empty state instead of spawning a
+    // fresh "Chat N" (which made the tab feel impossible to close and kept
+    // bumping the counter). Numbering restarts at 1 next time.
+    _activeChatIdx = -1;
+    _chatSeq = 0;
+    _renderChatTabs();
+    if (chatEl) { while (chatEl.firstChild) chatEl.removeChild(chatEl.firstChild); }
+    showChatHint?.();
+    saveChatHistory();
     return;
   }
-  if (_activeChatIdx >= _chatSessions.length) _activeChatIdx = _chatSessions.length - 1;
-  else if (_activeChatIdx === idx) _activeChatIdx = Math.min(idx, _chatSessions.length - 1);
-  _switchChatSession(_activeChatIdx);
+  // Recompute which session stays active after the removal.
+  let target = _activeChatIdx;
+  if (target > idx) target--;                 // sessions after idx shifted left by one
+  else if (target === idx) target = Math.min(idx, _chatSessions.length - 1);
+  // target < idx → unchanged
+  // Force a full refresh even when target equals the current active index
+  // (closing a non-active tab): otherwise _switchChatSession's same-index
+  // early-return leaves the just-closed tab still rendered.
+  _activeChatIdx = -1;
+  _switchChatSession(target);
   saveChatHistory();
 }
 
 let _chatSavePending = false;
 async function saveChatHistory() {
-  if (!inTauri || _chatSessions.length === 0) return;
+  if (!inTauri) return; // allow persisting the empty state (all tabs closed)
   if (_chatSavePending) return;
   _chatSavePending = true;
   try {
@@ -5180,6 +5222,7 @@ async function saveChatHistory() {
     const store = await loadStore("session.json");
     const data = _chatSessions.map(s => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
+      project: s.project || "",
       history: s.history.slice(-30),
       created: s.created,
     }));
@@ -5196,8 +5239,13 @@ async function restoreChatHistory() {
     const saved = await store.get(CHAT_STORE_KEY);
 
     if (saved?.sessions && Array.isArray(saved.sessions)) {
+      const usedNames = new Set();
       for (const sData of saved.sessions) {
-        const session = _createChatSession(sData.name, sData.mode, sData.model);
+        // Heal any duplicate names left by the old length-based scheme: a
+        // collision (or empty name) gets a fresh monotonic "Chat N".
+        const nm = sData.name && !usedNames.has(sData.name) ? sData.name : undefined;
+        const session = _createChatSession(nm, sData.mode, sData.model, sData.project ?? "");
+        usedNames.add(session.name);
         session.id = sData.id || session.id;
         session.created = sData.created || Date.now();
         if (Array.isArray(sData.history)) {
@@ -5785,6 +5833,19 @@ async function sendPrompt(text, attachedImages = []) {
   if (streaming) return;
   _setSendBtnStop(true);
   chatEl.querySelector(".chat-empty")?.remove();
+
+  // If all chats were closed, sending starts a fresh one so history has a home.
+  if (!_currentSession()) _newChatSession();
+
+  // Keep the active chat's project label in sync with the folder it's actually
+  // operating on (handles opening a different project mid-conversation).
+  const _activeSess = _currentSession();
+  const _curRoot = rootPath || workspaceRoots[0] || "";
+  if (_activeSess && _curRoot && _activeSess.project !== _curRoot) {
+    _activeSess.project = _curRoot;
+    _renderChatTabs();
+    saveChatHistory();
+  }
 
   const userBody = addMessage("user", text);
   if (attachedImages.length > 0 && userBody) {
@@ -8080,21 +8141,46 @@ function _showInstallProgress(cmd, name) {
     width = Math.min(width + (90 - width) * 0.05, 95);
     bar.style.width = width + "%";
   }, 300);
-  const checkDone = setInterval(async () => {
+
+  // The binary name is NOT the last word of the command: e.g.
+  // "go install golang.org/x/tools/gopls@latest" installs `gopls`. Strip any
+  // @version and take the final path segment.
+  const lastArg = (cmd.trim().split(/\s+/).pop() || "");
+  const bin = lastArg.split("@")[0].split("/").pop() || lastArg;
+  const cwd = rootPath || workspaceRoots[0] || "/tmp";
+
+  let checkDone, giveUp, settled = false;
+  const finish = (ok, title, msg) => {
+    if (settled) return;
+    settled = true;
+    clearInterval(tick); clearInterval(checkDone); clearTimeout(giveUp);
+    bar.style.width = "100%";
+    bar.style.background = ok ? "#34c759" : "#ff9f0a";
+    card.querySelector(".notif-card__title").textContent = title;
+    card.querySelector(".notif-card__msg").textContent = msg;
+    setTimeout(() => { card.classList.remove("notif-card--visible"); setTimeout(() => card.remove(), 300); }, ok ? 4000 : 9000);
+  };
+
+  checkDone = setInterval(async () => {
     try {
-      const cmds = await backend.termListCommands();
-      const toolCmd = cmd.split(/\s+/).pop();
-      if (cmds.includes(toolCmd)) {
-        clearInterval(tick); clearInterval(checkDone);
-        bar.style.width = "100%";
-        card.querySelector(".notif-card__title").textContent = `${name} 安装完成`;
-        card.querySelector(".notif-card__msg").textContent = "重新打开文件即可使用智能补全";
-        bar.style.background = "#34c759";
-        setTimeout(() => { card.classList.remove("notif-card--visible"); setTimeout(() => card.remove(), 300); }, 4000);
+      // Check PATH *and* the usual install dirs — go installs to ~/go/bin,
+      // pip --user to ~/.local/bin, cargo to ~/.cargo/bin — which aren't always
+      // on the shell PATH that term_list_commands sees.
+      const r = await backend.taskRunCapture(
+        cwd,
+        `command -v ${bin} 2>/dev/null || ls "$HOME/go/bin/${bin}" "$HOME/.local/bin/${bin}" "$HOME/.cargo/bin/${bin}" /opt/homebrew/bin/${bin} /usr/local/bin/${bin} 2>/dev/null | head -1`
+      );
+      if (r && String(r.stdout || "").trim()) {
+        finish(true, `${name} 安装完成`, "重新打开文件即可使用智能补全");
       }
-    } catch {}
-  }, 3000);
-  setTimeout(() => { clearInterval(tick); clearInterval(checkDone); card.remove(); }, 120000);
+    } catch { /* keep polling */ }
+  }, 2500);
+
+  // Don't leave a silently-frozen bar: after 90s, tell the user to check the
+  // terminal (the install may have failed, e.g. base tool go/npm not present).
+  giveUp = setTimeout(() => {
+    finish(false, `${name} 安装未完成`, "请查看终端输出；如提示找不到 go/npm 等命令，需先装好对应的语言环境");
+  }, 90000);
 }
 
 // ---- auto-detect missing tools ----
@@ -11308,6 +11394,7 @@ const termResizeObserver = new ResizeObserver(() => {
 let termTabs = [];
 let activeTermTab = -1;
 let termSeq = 0;
+let _termSplitActive = false;
 
 function renderTermTabs() {
   if (!termTabBar) return;
@@ -11335,12 +11422,14 @@ function renderTermTabs() {
 function switchTermTab(idx) {
   if (idx === activeTermTab || idx < 0 || idx >= termTabs.length) return;
   clearTermGhost(termTabs[activeTermTab]);
-  if (activeTermTab >= 0 && termTabs[activeTermTab]) {
+  // In split view both panes stay visible; only single view hides the old one.
+  if (!_termSplitActive && activeTermTab >= 0 && termTabs[activeTermTab]) {
     termTabs[activeTermTab].container.hidden = true;
   }
   activeTermTab = idx;
   const tab = termTabs[idx];
   tab.container.hidden = false;
+  if (_termSplitActive) _applyTermSplit();
   renderTermTabs();
   requestAnimationFrame(() => {
     try { tab.fit.fit(); } catch {}
@@ -11458,6 +11547,10 @@ function closeTermTab(idx) {
   if (activeTermTab >= termTabs.length) activeTermTab = termTabs.length - 1;
   else if (activeTermTab === idx) activeTermTab = Math.min(idx, termTabs.length - 1);
   termTabs[activeTermTab].container.hidden = false;
+  if (_termSplitActive) {
+    if (termTabs.length >= 2) _applyTermSplit();
+    else { _termSplitActive = false; $("terminalBody")?.classList.remove("term-split"); }
+  }
   renderTermTabs();
   requestAnimationFrame(() => {
     try { termTabs[activeTermTab].fit.fit(); } catch {}
@@ -11573,6 +11666,7 @@ buildMenubar();
 onLocaleChange(() => {
   buildMenubar();
   applyToDOM();
+  refreshModelBadge(); // re-sync the (non-i18n) model label after applyToDOM
   chatEl.querySelector(".chat-empty")?.remove();
   showChatHint();
 });
@@ -11877,7 +11971,7 @@ function renderRecentProjects(list) {
   if (!list.length) { container.hidden = true; return; }
   container.hidden = false;
   ul.innerHTML = "";
-  for (const path of list) {
+  for (const path of list.slice(0, 4)) {
     const li = document.createElement("li");
     const name = path.split("/").filter(Boolean).pop() || path;
     li.innerHTML = `<span class="recent-name"></span><span class="recent-path"></span>`;
@@ -12310,16 +12404,30 @@ $("testRunAllBtn")?.addEventListener("click", () => {
 $("testRefreshBtn")?.addEventListener("click", () => refreshTestExplorer());
 
 // ---- Terminal Split ----
-let _termSplitActive = false;
-
-$("termSplitBtn")?.addEventListener("click", () => {
+$("termSplitBtn")?.addEventListener("click", async () => {
   _termSplitActive = !_termSplitActive;
   const body = $("terminalBody");
   body.classList.toggle("term-split", _termSplitActive);
-  if (_termSplitActive && body.children.length < 2) {
-    createTermTab();
+  if (_termSplitActive) {
+    if (termTabs.length < 2) await createTermTab(); // need a second pane to split into
+    _applyTermSplit();
+  } else {
+    // back to single view: show only the active terminal
+    termTabs.forEach((t, i) => { t.container.hidden = i !== activeTermTab; });
   }
+  requestAnimationFrame(() => termTabs.forEach((t) => {
+    if (!t.container.hidden) { try { t.fit.fit(); } catch {} }
+  }));
 });
+
+// Show two terminals side by side: the active one + the newest other one.
+function _applyTermSplit() {
+  const a = activeTermTab >= 0 ? activeTermTab : termTabs.length - 1;
+  let b = termTabs.length - 1;
+  if (b === a) b = termTabs.length - 2;
+  const show = new Set([a, b].filter((i) => i >= 0 && i < termTabs.length));
+  termTabs.forEach((t, i) => { t.container.hidden = !show.has(i); });
+}
 
 // ---- Bookmarks ----
 const _bookmarks = new Map();
