@@ -323,9 +323,15 @@ export function predictGate(viewportEl, opts = {}) {
 
 function levelLabel(p) { return p >= 0.7 ? "熟练" : p >= 0.4 ? "进阶" : "新手"; }
 
-export function promptBlock() {
+export function promptBlock(mode) {
   try {
     load();
+    // Do NOT pollute the autonomous tool-using agent's prompt. Its job is to DO
+    // the task well — telling it to "explain every step", "hold back / let the
+    // user write code", or "point out a transferable principle" makes it ramble
+    // and under-deliver. Adaptive teaching density belongs to the conversational
+    // modes (chat / plan), where the AI is actually talking to the user.
+    if (mode === "agent" || mode === "explorer" || mode === "reviewer") return "";
     const explain = state.prefs.explain;
     const overall = avgMastery();
     const weak = SKILLS.filter((s) => state.skills[s.id].p < 0.45);

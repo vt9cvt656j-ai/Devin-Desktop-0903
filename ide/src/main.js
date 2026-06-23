@@ -2543,6 +2543,7 @@ function activate(path) {
     if (prev && prev.model) prev.viewState = monacoEditor.saveViewState();
   }
   activePath = path;
+  scheduleSaveSession();   // keep the persisted session's tabs/active file current
   const f = openFiles.get(path);
 
   if (f.isImage) {
@@ -3217,6 +3218,7 @@ async function openFolder(path) {
   await refreshGitStatus();
   startFileWatcher();
   addRecentProject(path);
+  scheduleSaveSession();   // remember this project immediately, not just on close
 }
 
 let _fsWatcherActive = false;
@@ -5982,8 +5984,10 @@ async function sendPrompt(text, attachedImages = []) {
   }
 
   // Growth: inject the adaptive teaching block (tailored to this user's learner
-  // model — fades scaffolding as mastery rises; see growth.js).
-  const fullPrompt = sysPrompt + growth.promptBlock() + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
+  // model — fades scaffolding as mastery rises; see growth.js). Conversational
+  // modes only — promptBlock() returns "" for the autonomous agent so it never
+  // dilutes the agent's focus on actually doing the task.
+  const fullPrompt = sysPrompt + growth.promptBlock(_currentAiMode) + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
 
   _compactHistoryIfNeeded();
 
@@ -8427,26 +8431,59 @@ function _detectCommentIntent(textBefore) {
 }
 
 function _buildCompletionPrompt(lang, fileName, textBefore, textAfter, structure, commentIntent) {
-  let systemPrompt = `You are a code completion engine. Output ONLY the raw code to insert at the cursor. Rules:
-1. NO markdown, NO explanations, NO code fences, NO thinking process.
-2. Match existing code style.
-3. Keep completions concise (1-5 lines typically).
-4. Complete the current expression/statement fully - never leave syntax open.`;
+  // Fill-in-the-middle framing. The cursor sits between <|fim_prefix|> and
+  // <|fim_suffix|>; the model must emit ONLY the text that goes there. This is
+  // far less error-prone for generic chat models than an inline █ glyph, which
+  // they tend to "complete" by re-typing the surrounding code (the main cause of
+  // duplicated / misaligned garbage completions).
+  let systemPrompt = `You are an inline code completion engine doing fill-in-the-middle.
+The user's code is given as <|fim_prefix|>BEFORE<|fim_suffix|>AFTER<|fim_middle|>.
+Output ONLY the code that belongs at the cursor — the text to insert between BEFORE and AFTER.
+Hard rules:
+1. Raw code ONLY. No markdown, no code fences, no explanations, no leading/trailing prose.
+2. Do NOT repeat any code already present in BEFORE or AFTER.
+3. Match the surrounding indentation and style exactly.
+4. Continue naturally and stop once the current logical unit is complete (usually 1-8 lines); never leave syntax half-open.`;
 
   if (commentIntent) {
-    systemPrompt += `\nThe user wrote a comment: "${commentIntent}". Generate the implementation.`;
+    systemPrompt += `\nThe line above the cursor is a comment describing intent: "${commentIntent}". Implement it.`;
   }
 
   const beforeCtx = textBefore.slice(-1500);
   const afterCtx = textAfter.slice(0, 400);
   let userContent = `${fileName} (${lang})`;
   if (structure) userContent += `\n${structure}`;
-  userContent += `\n\n${beforeCtx}█${afterCtx}`;
+  userContent += `\n\n<|fim_prefix|>${beforeCtx}<|fim_suffix|>${afterCtx}<|fim_middle|>`;
 
   return [
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },
   ];
+}
+
+// Clean up a raw completion from a chat model: strip fences / stray prose, and —
+// crucially — remove any chunk that just repeats the code right before or after
+// the cursor (the #1 source of duplicated, misaligned "garbage" completions).
+function _sanitizeCompletion(text, textBefore, textAfter) {
+  if (!text) return "";
+  // strip code fences / fim sentinels the model may echo
+  text = text.replace(/<\|fim_[a-z]+\|>/g, "");
+  text = text.replace(/^\s*```[\w-]*\n?/, "").replace(/\n?```\s*$/, "");
+  // drop a leading natural-language preamble line ("Here's…", "Sure,…", "The …")
+  text = text.replace(/^[ \t]*(here(?:'s| is)|sure|okay|certainly|the completion)\b.*\n/i, "");
+  // trim a leading chunk that merely repeats the tail of the prefix
+  for (let k = Math.min(text.length, 160); k > 0; k--) {
+    if (textBefore.endsWith(text.slice(0, k))) { text = text.slice(k); break; }
+  }
+  // trim a trailing chunk that merely repeats the head of the suffix (prevents
+  // the double-paste where the model re-emits code that already follows)
+  const afterHead = textAfter.replace(/^[ \t]*\n?/, "");
+  for (let k = Math.min(text.length, afterHead.length, 200); k >= 6; k--) {
+    const tail = text.slice(text.length - k);
+    if (afterHead.startsWith(tail) && tail.trim().length >= 4) { text = text.slice(0, text.length - k); break; }
+  }
+  // collapse leading blank lines but keep the rest verbatim
+  return text.replace(/^\n+/, "");
 }
 
 function initInlineCompletion() {
@@ -8508,8 +8545,8 @@ function initInlineCompletion() {
         if (token.isCancellationRequested || thisRequest._cancelled) return { items: [] };
         if (!text || !text.trim()) return { items: [] };
 
-        text = text.replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "");
-        if (text.startsWith("```")) text = text.slice(3).replace(/^[\w]*\n/, "");
+        text = _sanitizeCompletion(text, textBefore, textAfter);
+        if (!text.trim()) return { items: [] };
 
         const result = {
           items: [{
@@ -12770,6 +12807,16 @@ async function saveSession() {
     console.warn("[session] save failed:", e);
   }
   await saveChatHistory();
+}
+
+// Persist the session eagerly (debounced) whenever the workspace or active file
+// changes — so the last project survives a crash / force-quit, not only a clean
+// close (webview `beforeunload` is unreliable and the close-requested save races
+// window destruction, which is why the last project was often forgotten).
+let _sessionSaveTimer = 0;
+function scheduleSaveSession() {
+  clearTimeout(_sessionSaveTimer);
+  _sessionSaveTimer = setTimeout(() => { saveSession().catch(() => {}); }, 600);
 }
 
 async function restoreSession() {
