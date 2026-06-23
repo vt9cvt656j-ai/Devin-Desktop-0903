@@ -1,0 +1,10 @@
+{
+  "id": "michael.hanzi-counter",
+  "name": "Hanzi Counter",
+  "version": "1.0.0",
+  "description": "Live Chinese-character / word / total counts for the active file in the status bar.",
+  "author": "Michael IDE",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [{ "id": "hanzi.count", "title": "Hanzi Counter: Count Active File" }] }
+}

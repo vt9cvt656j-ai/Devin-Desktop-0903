@@ -1,0 +1,10 @@
+{
+  "id": "michael.tailwind-intellisense",
+  "name": "Tailwind Helper",
+  "version": "1.0.0",
+  "description": "Tailwind utility cheatsheet and class counter for the active file.",
+  "author": "Michael IDE",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "tailwind.cheatsheet", "title": "Tailwind: Cheatsheet" }, { "id": "tailwind.count", "title": "Tailwind: Count Classes" } ] }
+}
