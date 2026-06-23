@@ -7517,6 +7517,24 @@ async function _runAgenticLoop({ config, messages, root }) {
       body.appendChild(note);
     }
     if (!finalErr && summaryText) history.push({ role: "assistant", content: summaryText });
+    // Plan mode: one-click handoff to execute the proposed plan in agent mode
+    // (Claude Code's plan → execute flow). The plan is already in `history`, so
+    // the agent sees it.
+    if (_currentAiMode === "plan" && !finalErr && summaryText && summaryText.trim()) {
+      const exec = document.createElement("button");
+      exec.className = "plan-exec-btn";
+      exec.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="currentColor"><path d="M4 2.5v9l7-4.5z"/></svg> 用 Agent 执行此方案`;
+      exec.addEventListener("click", () => {
+        if (streaming) return;
+        exec.disabled = true;
+        _currentAiMode = "agent";
+        _updateModeUI();
+        const s = _currentSession();
+        if (s) { s.mode = "agent"; _renderChatTabs(); saveChatHistory(); }
+        sendPrompt("按上面给出的方案逐步实施：先用 update_plan 列出步骤，再逐步实现，收尾前验证。");
+      });
+      body.appendChild(exec);
+    }
     saveChatHistory();
     const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
     if (stopBtn) stopBtn.style.display = "none";
