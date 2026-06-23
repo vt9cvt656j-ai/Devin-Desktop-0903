@@ -158,6 +158,8 @@ async function tauriBackend() {
       channel.onmessage = onEvent;
       return core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
     },
+    aiComplete: (config, messages, maxTokens) =>
+      core.invoke("ai_complete", { config, messages, maxTokens }),
     termOpen: (opts, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
@@ -821,6 +823,11 @@ function mockBackend() {
       truncated: false,
     }),
     pickFolder: async () => ROOT,
+    aiComplete: async (_config, messages) => {
+      const user = messages[messages.length - 1]?.content || "";
+      const code = user.split("\nCode:\n").slice(1).join("\nCode:\n");
+      return "// ✦ preview mock edit — set a real provider for live edits\n" + code;
+    },
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
       const reply = [
@@ -12798,3 +12805,127 @@ function openSnippetEditor() {
     } catch { showToast("Failed to save snippet."); }
   });
 }
+
+// ============================================================================
+// Cmd+K inline edit (AI): select code → ⌘K → describe → AI rewrites in place,
+// shown as a green diff with Keep (⌘↵) / Undo (Esc). Plain ⌘K was unbound
+// (⌘⌥K is Toggle Bookmark), so this is purely additive.
+// ============================================================================
+editorEl.style.position = "relative";
+function _aiConfigured() {
+  const c = loadConfig();
+  return !!(c.baseUrl && c.apiKey && c.model);
+}
+function _stripFence(s) {
+  return String(s || "").replace(/^\s*```[\w-]*\n?/, "").replace(/\n?```\s*$/, "");
+}
+let _cmdk = null;
+let _cmdkReview = null;
+function _closeCmdK() {
+  if (_cmdk) { _cmdk.box.remove(); _cmdk = null; }
+}
+function _openCmdK() {
+  if (!activePath) { showToast("Open a file to use Cmd+K"); return; }
+  _closeCmdK();
+  if (_cmdkReview) _cmdkReview.finish(false);
+  const model = monacoEditor.getModel();
+  const sel = monacoEditor.getSelection();
+  if (!model || !sel) return;
+  const range = sel.isEmpty()
+    ? new monaco.Range(sel.startLineNumber, 1, sel.startLineNumber, model.getLineMaxColumn(sel.startLineNumber))
+    : sel;
+  const coords = monacoEditor.getScrolledVisiblePosition({ lineNumber: range.startLineNumber, column: 1 });
+  const box = document.createElement("div");
+  box.className = "cmdk";
+  box.innerHTML =
+    `<span class="cmdk__spark">✦</span>` +
+    `<input class="cmdk__input" type="text" placeholder="Describe the edit…  (Enter to run · Esc to cancel)" />` +
+    `<span class="cmdk__hint"></span>`;
+  editorEl.appendChild(box);
+  box.style.top = ((coords ? coords.top + coords.height : 40) + 4) + "px";
+  box.style.left = Math.max(8, coords ? coords.left : 8) + "px";
+  const input = box.querySelector(".cmdk__input");
+  const hint = box.querySelector(".cmdk__hint");
+  _cmdk = { box };
+  let busy = false;
+  input.addEventListener("keydown", async (e) => {
+    e.stopPropagation();
+    if (e.key === "Escape") { e.preventDefault(); _closeCmdK(); monacoEditor.focus(); return; }
+    if (e.key !== "Enter" || busy) return;
+    e.preventDefault();
+    const instr = input.value.trim();
+    if (!instr) return;
+    if (!_aiConfigured()) { showToast("Configure an AI provider (⚙️) to use Cmd+K"); return; }
+    busy = true;
+    hint.textContent = "Thinking…";
+    input.disabled = true;
+    const code = model.getValueInRange(range);
+    const messages = [
+      { role: "system", content: "You are an expert code editor. Rewrite the user's code to satisfy the instruction. Output ONLY the new code for that region — no explanation, no markdown fences." },
+      { role: "user", content: `Instruction: ${instr}\n\nLanguage: ${model.getLanguageId()}\n\nCode:\n${code}` },
+    ];
+    let out;
+    try {
+      out = _stripFence(await backend.aiComplete(loadConfig(), messages, 1024));
+    } catch (err) {
+      showToast("AI edit failed: " + (err?.message || err));
+      _closeCmdK();
+      monacoEditor.focus();
+      return;
+    }
+    _closeCmdK();
+    if (!out) { showToast("No edit produced"); monacoEditor.focus(); return; }
+    _applyCmdKEdit(range, out);
+  });
+  input.focus();
+}
+function _applyCmdKEdit(range, newText) {
+  const model = monacoEditor.getModel();
+  const original = model.getValueInRange(range);
+  monacoEditor.pushUndoStop();
+  monacoEditor.executeEdits("ai-edit", [{ range, text: newText, forceMoveMarkers: true }]);
+  monacoEditor.pushUndoStop();
+  const lines = newText.split("\n");
+  const startLine = range.startLineNumber;
+  const endLine = startLine + lines.length - 1;
+  const endCol = lines.length === 1 ? range.startColumn + newText.length : lines[lines.length - 1].length + 1;
+  const newRange = new monaco.Range(startLine, range.startColumn, endLine, endCol);
+  const decos = monacoEditor.createDecorationsCollection([
+    { range: new monaco.Range(startLine, 1, endLine, 1), options: { isWholeLine: true, className: "ai-edit-line" } },
+  ]);
+  monacoEditor.revealRangeInCenterIfOutsideViewport(newRange);
+  const coords = monacoEditor.getScrolledVisiblePosition({ lineNumber: startLine, column: 1 });
+  const bar = document.createElement("div");
+  bar.className = "cmdk-review";
+  bar.innerHTML =
+    `<button class="cmdk-review__btn cmdk-review__keep">✓ Keep <kbd>⌘↵</kbd></button>` +
+    `<button class="cmdk-review__btn cmdk-review__undo">✗ Undo <kbd>Esc</kbd></button>`;
+  editorEl.appendChild(bar);
+  bar.style.top = Math.max(4, (coords ? coords.top : 40) - 30) + "px";
+  bar.style.left = Math.max(8, coords ? coords.left : 8) + "px";
+  const finish = (undo) => {
+    if (!_cmdkReview) return;
+    document.removeEventListener("keydown", onKey, true);
+    decos.clear();
+    bar.remove();
+    _cmdkReview = null;
+    if (undo) monacoEditor.executeEdits("ai-edit-undo", [{ range: newRange, text: original, forceMoveMarkers: true }]);
+    monacoEditor.focus();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); finish(true); }
+    else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); finish(false); }
+  };
+  document.addEventListener("keydown", onKey, true);
+  bar.querySelector(".cmdk-review__keep").onclick = () => finish(false);
+  bar.querySelector(".cmdk-review__undo").onclick = () => finish(true);
+  _cmdkReview = { finish };
+}
+monacoEditor.addAction({
+  id: "ai.inlineEdit",
+  label: "AI: Edit (Cmd+K)",
+  keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK],
+  contextMenuGroupId: "navigation",
+  contextMenuOrder: 0,
+  run: () => _openCmdK(),
+});

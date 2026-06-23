@@ -1,0 +1,10 @@
+{
+  "id": "michael.polacode-screenshot",
+  "name": "Polacode",
+  "version": "1.0.0",
+  "description": "Frame the current selection for a shareable code screenshot.",
+  "author": "Michael IDE",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "polacode.snippet", "title": "Polacode: Frame Selection" } ] }
+}

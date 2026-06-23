@@ -21,24 +21,27 @@ import colorPickerManifest from "../../src-tauri/extensions/color-picker/extensi
 import colorPickerSource from "../../src-tauri/extensions/color-picker/index.js?raw";
 import chineseLangManifest from "../../src-tauri/extensions/chinese-language-pack/extension.json";
 import chineseLangSource from "../../src-tauri/extensions/chinese-language-pack/index.js?raw";
-import tailwindManifest from "../../src-tauri/extensions/tailwind-intellisense/extension.json";
-import tailwindSource from "../../src-tauri/extensions/tailwind-intellisense/index.js?raw";
+// NOTE: every extension imported here MUST have its source committed — these
+// `?raw`/JSON imports are resolved at build time, so a missing one breaks the
+// Vite build on a clean checkout.
 import hanziManifest from "../../src-tauri/extensions/hanzi-counter/extension.json";
 import hanziSource from "../../src-tauri/extensions/hanzi-counter/index.js?raw";
-import translateManifest from "../../src-tauri/extensions/translate-helper/extension.json";
-import translateSource from "../../src-tauri/extensions/translate-helper/index.js?raw";
-import dockerManifest from "../../src-tauri/extensions/docker-tools/extension.json";
-import dockerSource from "../../src-tauri/extensions/docker-tools/index.js?raw";
-import polacodeManifest from "../../src-tauri/extensions/polacode-screenshot/extension.json";
-import polacodeSource from "../../src-tauri/extensions/polacode-screenshot/index.js?raw";
-import projectManifest from "../../src-tauri/extensions/project-manager/extension.json";
-import projectSource from "../../src-tauri/extensions/project-manager/index.js?raw";
 import spellManifest from "../../src-tauri/extensions/spell-checker/extension.json";
 import spellSource from "../../src-tauri/extensions/spell-checker/index.js?raw";
-import materialManifest from "../../src-tauri/extensions/material-icons/extension.json";
-import materialSource from "../../src-tauri/extensions/material-icons/index.js?raw";
+import dockerManifest from "../../src-tauri/extensions/docker-tools/extension.json";
+import dockerSource from "../../src-tauri/extensions/docker-tools/index.js?raw";
 import svelteManifest from "../../src-tauri/extensions/svelte-language/extension.json";
 import svelteSource from "../../src-tauri/extensions/svelte-language/index.js?raw";
+import tailwindManifest from "../../src-tauri/extensions/tailwind-intellisense/extension.json";
+import tailwindSource from "../../src-tauri/extensions/tailwind-intellisense/index.js?raw";
+import translateManifest from "../../src-tauri/extensions/translate-helper/extension.json";
+import translateSource from "../../src-tauri/extensions/translate-helper/index.js?raw";
+import projectManifest from "../../src-tauri/extensions/project-manager/extension.json";
+import projectSource from "../../src-tauri/extensions/project-manager/index.js?raw";
+import materialManifest from "../../src-tauri/extensions/material-icons/extension.json";
+import materialSource from "../../src-tauri/extensions/material-icons/index.js?raw";
+import polacodeManifest from "../../src-tauri/extensions/polacode-screenshot/extension.json";
+import polacodeSource from "../../src-tauri/extensions/polacode-screenshot/index.js?raw";
 
 const BUILTIN = [
   { manifest: wordCountManifest, source: wordCountSource },
@@ -49,15 +52,15 @@ const BUILTIN = [
   { manifest: todoHighlightManifest, source: todoHighlightSource },
   { manifest: colorPickerManifest, source: colorPickerSource },
   { manifest: chineseLangManifest, source: chineseLangSource },
-  { manifest: tailwindManifest, source: tailwindSource },
   { manifest: hanziManifest, source: hanziSource },
-  { manifest: translateManifest, source: translateSource },
-  { manifest: dockerManifest, source: dockerSource },
-  { manifest: polacodeManifest, source: polacodeSource },
-  { manifest: projectManifest, source: projectSource },
   { manifest: spellManifest, source: spellSource },
-  { manifest: materialManifest, source: materialSource },
+  { manifest: dockerManifest, source: dockerSource },
   { manifest: svelteManifest, source: svelteSource },
+  { manifest: tailwindManifest, source: tailwindSource },
+  { manifest: translateManifest, source: translateSource },
+  { manifest: projectManifest, source: projectSource },
+  { manifest: materialManifest, source: materialSource },
+  { manifest: polacodeManifest, source: polacodeSource },
 ];
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
