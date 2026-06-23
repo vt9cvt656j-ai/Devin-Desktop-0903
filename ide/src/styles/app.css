@@ -2024,7 +2024,8 @@ body.zen-mode .editor {
   display: flex; align-items: center; justify-content: center;
   border-radius: 6px;
 }
-.agent-tool-step--write .atc-type-icon { background: #fff1e5; color: #cf6a1c; }
+.agent-tool-step--write .atc-type-icon,
+.agent-tool-step--multiedit .atc-type-icon { background: #fff1e5; color: #cf6a1c; }
 .agent-tool-step--read .atc-type-icon { background: #dafbe1; color: #1a7f37; }
 .agent-tool-step--cmd .atc-type-icon { background: #ddf4ff; color: #0969da; }
 .agent-tool-step--list .atc-type-icon { background: #ede5ff; color: #6639ba; }
@@ -2542,7 +2543,9 @@ body.zen-mode .editor {
 [data-theme="dark"] .agent-tool-row:hover,
 .dark .agent-tool-row:hover { background: rgba(255,255,255,.04); }
 [data-theme="dark"] .agent-tool-step--write .atc-type-icon,
-.dark .agent-tool-step--write .atc-type-icon { background: #cf6a1c1a; }
+.dark .agent-tool-step--write .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--multiedit .atc-type-icon,
+.dark .agent-tool-step--multiedit .atc-type-icon { background: #cf6a1c1a; }
 [data-theme="dark"] .agent-tool-step--read .atc-type-icon,
 .dark .agent-tool-step--read .atc-type-icon { background: #3fb9501a; }
 [data-theme="dark"] .agent-tool-step--cmd .atc-type-icon,

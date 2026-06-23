@@ -5595,6 +5595,7 @@ const _AI_MODE_PROMPTS = {
 - remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
 - get_diagnostics(path?)：读 LSP/编辑器对文件的错误与警告，改完代码快速自检（比每次跑构建快）
 - edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
+- multi_edit(path, edits[])：对同一文件做多处精确替换，一次原子应用，重构/多点改动比连发多次 edit_file 更快更稳
 - write_file(path, content)：新建或整文件重写
 - delete_path(path)：删除文件/目录（递归），用于清理/重构
 - move_path(from, to)：移动或重命名文件/目录
@@ -6856,6 +6857,7 @@ function _buildAgentToolSchemas(includeWrite) {
   if (includeWrite) {
     tools.push(
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。改已有文件请优先用它。old_string 必须能在文件中唯一定位（带足够上下文），否则会报错。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
+      { type: "function", function: { name: "multi_edit", description: "对同一个文件做多处精确替换：edits 是一组 {old_string, new_string, replace_all?}，按顺序原子应用（任一处定位失败则整体不写入、报错）。重构或一个文件里改多个地方时用它，比连发多次 edit_file 更快更可靠。每个 old_string 同样需在当时的文件内容里唯一定位。", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "有序的替换列表", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
       { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条 shell 命令（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
@@ -6876,6 +6878,7 @@ function _mapToolCall(name, args) {
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: args.query || "", query: args.query || "" };
     case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
+    case "multi_edit": return { type: "multiedit", path: args.path || "", edits: Array.isArray(args.edits) ? args.edits : [] };
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "" };
     case "run_cmd": return { type: "cmd", command: args.command || "" };
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
@@ -7372,6 +7375,12 @@ async function _runAgenticLoop({ config, messages, root }) {
   let summaryText = "";
   let hitCap = false;
   let planEl = null;
+  // Harness-level discipline (the "Claude Code way"): track whether this run has
+  // mutated files, whether it has verified (build/test/diagnostics), and the
+  // latest plan — so we can nudge the model to finish its plan and to verify its
+  // changes before it stops. Bounded so it can never loop forever.
+  let didMutate = false, didVerify = false, planSteps = null;
+  let continueNudges = 0, verifyNudges = 0;
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
@@ -7386,7 +7395,22 @@ async function _runAgenticLoop({ config, messages, root }) {
       }
       messages.push(assistantMsg);
 
-      if (!turn.toolCalls.length) break; // model produced its final answer
+      if (!turn.toolCalls.length) {
+        // C — don't stop with unfinished plan steps.
+        const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
+        if (pending && continueNudges < 2) {
+          continueNudges++;
+          messages.push({ role: "user", content: "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾，别提前停。" });
+          continue;
+        }
+        // A — mutated files but never verified → make verification non-optional.
+        if (didMutate && !didVerify && verifyNudges < 1) {
+          verifyNudges++;
+          messages.push({ role: "user", content: "你改了文件但还没验证。先用 run_cmd 跑相关的构建/测试/类型检查（如 npm run build、cargo check、pytest、tsc --noEmit），或用 get_diagnostics 看报错；确认通过后再收尾。若这个项目确实没有可跑的验证，简短说明原因即可。" });
+          continue;
+        }
+        break; // truly done
+      }
 
       // Render every tool step up front in call order (so the UI keeps the
       // model's sequence), then execute: read-only tools (read/list/search/find)
@@ -7449,6 +7473,16 @@ async function _runAgenticLoop({ config, messages, root }) {
       for (const m of toolMsgs) messages.push(m);
       _trimMessagesIfHuge(messages);
 
+      // Track this turn for the finish/verify gates above.
+      for (const it of items) {
+        if (!it.call) continue;
+        const t = it.call.type;
+        if (t === "write" || t === "edit" || t === "multiedit" || t === "delete" || t === "move") didMutate = true;
+        if (t === "diag") didVerify = true;
+        if (t === "cmd" && /\b(test|tests|build|check|lint|tsc|typecheck|cargo|pytest|jest|vitest|mocha|phpunit|gradle|make|go\s+(build|test|vet))\b/i.test(it.call.command || "")) didVerify = true;
+        if (it.tc.name === "update_plan") planSteps = it.call.steps;
+      }
+
       if (iter === _AGENT_MAX_ITERS - 1) hitCap = true;
     }
   } catch (e) { finalErr = String(e?.message || e); }
@@ -7481,13 +7515,14 @@ function _createToolStep(call) {
   const pathDisplay = call.path || call.command || "";
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
     cmd: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0114.25 15H1.75A1.75 1.75 0 010 13.25V2.75zm1.75-.25a.25.25 0 00-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V2.75a.25.25 0 00-.25-.25H1.75zM7.25 8a.75.75 0 01-.22.53l-2.25 2.25a.75.75 0 11-1.06-1.06L5.44 8 3.72 6.28a.75.75 0 111.06-1.06l2.25 2.25A.75.75 0 017.25 8zM8 11.5a.75.75 0 01.75-.75h2.5a.75.75 0 010 1.5h-2.5a.75.75 0 01-.75-.75z"/></svg>`,
     list: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75zM1.5 2.75a.25.25 0 01.25-.25H5c.06 0 .118.026.158.07l.9 1.2a1.75 1.75 0 001.4.73h6.75a.25.25 0 01.25.25v8.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75z"/></svg>`,
     edit: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
+    multiedit: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     search: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
     find: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>`,
     web: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
@@ -7531,7 +7566,7 @@ async function _executeToolStep(step, call, root) {
   const row = step.querySelector(".agent-tool-row");
 
   const readOnlyMode = _currentAiMode === "explorer" || _currentAiMode === "reviewer" || _currentAiMode === "plan";
-  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "cmd" || call.type === "delete" || call.type === "move")) {
+  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move")) {
     const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" ? "运行命令" : "修改文件";
     res.className = "atc-result atc-result--blocked";
@@ -7774,6 +7809,87 @@ async function _executeToolStep(step, call, root) {
         });
       }
       return { type: call.type, path: call.path, content: existed ? `已修改 ${call.path}（+${added}/-${removed} 行）。` : `已新建 ${call.path}（${added} 行）。` };
+
+    } else if (call.type === "multiedit") {
+      const fp = call.path.startsWith("/") ? call.path : root + "/" + call.path;
+      let old = "";
+      try { old = await backend.readTextFile(fp); }
+      catch {
+        res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
+        return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
+      }
+      const edits = Array.isArray(call.edits) ? call.edits : [];
+      if (!edits.length) {
+        res.className = "atc-result atc-result--err"; res.textContent = "edits 为空";
+        return { type: "multiedit", path: call.path, content: "[ERROR] multi_edit 需要至少一处 edits。" };
+      }
+      // Apply edits in order against the evolving content; abort the whole op if
+      // any one fails to locate uniquely (atomic — nothing is written on error).
+      let content = old;
+      for (let k = 0; k < edits.length; k++) {
+        const oldStr = edits[k]?.old_string || "";
+        const newStr = edits[k]?.new_string ?? "";
+        if (!oldStr) {
+          res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处缺 old_string`;
+          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 edit 缺少 old_string，整体未写入。` };
+        }
+        const occ = content.split(oldStr).length - 1;
+        if (occ === 0) {
+          res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处未找到`;
+          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 找不到（可能被前面的替换改动了，请按应用后的内容重新定位）。整体未写入。` };
+        }
+        if (occ > 1 && !edits[k].replace_all) {
+          res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处不唯一(${occ})`;
+          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 出现 ${occ} 次（不唯一）。加更多上下文或设 replace_all=true。整体未写入。` };
+        }
+        content = edits[k].replace_all ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+      }
+      const newContent = content;
+      if (newContent === old) {
+        res.className = "atc-result atc-result--ok"; res.textContent = "无变化";
+        return { type: "multiedit", path: call.path, content: `(${call.path} 内容未变化)` };
+      }
+      const added = newContent.split("\n").length;
+      const removed = old.split("\n").length;
+      res.className = "atc-result atc-result--pending";
+      res.innerHTML = `<span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span>`;
+      vp.innerHTML = _buildDiffView(old, newContent, call.path);
+      _highlightDiffView(vp);
+      step.classList.add("is-open");
+
+      let writeErr = "";
+      try {
+        await backend.writeTextFile(fp, newContent);
+        _agentReadCache.set(fp, newContent);
+        _invalidateRead(call.path);
+        _refreshTreeFor(fp);
+      } catch (e) { writeErr = String(e?.message || e); }
+      if (writeErr) {
+        step.classList.add("agent-tool-step--rejected");
+        res.className = "atc-result atc-result--err"; res.textContent = writeErr.slice(0, 80);
+        return { type: "multiedit", path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
+      }
+      step.classList.add("agent-tool-step--accepted");
+      res.className = "atc-result atc-result--ok";
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span><button class="atc-undo-btn" type="button">Undo</button>`;
+      row.addEventListener("dblclick", () => openFile(fp, call.path.split("/").pop()));
+      _ipcBroadcast("file_changed", { path: fp });
+      showToast(`Updated ${call.path.split("/").pop()} (${edits.length} edits)`);
+      const undoBtn = res.querySelector(".atc-undo-btn");
+      if (undoBtn) {
+        undoBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await backend.writeTextFile(fp, old);
+            _agentReadCache.set(fp, old); _invalidateRead(call.path); _refreshTreeFor(fp);
+            step.classList.remove("agent-tool-step--accepted"); step.classList.add("agent-tool-step--rejected");
+            res.className = "atc-result atc-result--err"; res.textContent = "Reverted";
+            _ipcBroadcast("file_changed", { path: fp });
+            showToast(`Reverted ${call.path.split("/").pop()}`);
+          } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
+        });
+      }
+      return { type: "multiedit", path: call.path, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` };
 
     } else if (call.type === "search") {
       const q = (call.query || "").trim();
