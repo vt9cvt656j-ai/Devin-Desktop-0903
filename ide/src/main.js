@@ -11153,6 +11153,7 @@ promptEl.addEventListener("input", () => {
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
   _updateAtMenu();
+  _updateSlashMenu();
 });
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -11239,6 +11240,62 @@ promptEl.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.preventDefault(); _hideAtMenu(); }
 });
 promptEl.addEventListener("blur", () => setTimeout(_hideAtMenu, 150));
+
+// ---- slash commands: "/" at the start of the composer → quick agent prompts ----
+const _SLASH = [
+  { cmd: "fix", desc: "找出并修复 bug", prompt: "找出并修复当前文件里的 bug；修完用 run_cmd 或 get_diagnostics 验证。" },
+  { cmd: "test", desc: "写并跑单元测试", prompt: "为当前文件写单元测试，覆盖边界情况，并跑通。" },
+  { cmd: "explain", desc: "解释这段代码", prompt: "解释当前打开文件的代码：作用、关键逻辑、注意点。" },
+  { cmd: "review", desc: "审查改动", prompt: "审查当前的代码改动，找出正确性 / 安全 / 性能 / 可维护性问题，按严重度列出并给修复建议。" },
+  { cmd: "refactor", desc: "重构（保持行为）", prompt: "重构当前文件这段代码，提升可读性与结构，保持行为不变；改完验证。" },
+  { cmd: "docs", desc: "加文档注释", prompt: "给当前文件的关键函数 / 类型加清晰的文档注释。" },
+];
+let _slashMatches = [];
+let _slashActive = -1;
+const _slashMenu = document.createElement("div");
+_slashMenu.className = "atmenu";
+_slashMenu.hidden = true;
+document.body.appendChild(_slashMenu);
+function _hideSlash() { _slashMenu.hidden = true; _slashActive = -1; _slashMatches = []; }
+function _renderSlashActive() { [..._slashMenu.children].forEach((c, i) => c.classList.toggle("is-active", i === _slashActive)); }
+function _updateSlashMenu() {
+  const m = /^\/(\w*)$/.exec(promptEl.value);
+  if (!m) return _hideSlash();
+  const q = m[1].toLowerCase();
+  _slashMatches = _SLASH.filter((s) => s.cmd.startsWith(q));
+  if (!_slashMatches.length) return _hideSlash();
+  _slashMenu.innerHTML = "";
+  _slashMatches.forEach((s, i) => {
+    const item = document.createElement("div");
+    item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
+    item.innerHTML = `<b>/${_escHtml(s.cmd)}</b> <span style="opacity:.6;margin-left:6px">${_escHtml(s.desc)}</span>`;
+    item.addEventListener("mousedown", (e) => { e.preventDefault(); _pickSlash(i); });
+    _slashMenu.appendChild(item);
+  });
+  _slashActive = 0;
+  const r = promptEl.getBoundingClientRect();
+  _slashMenu.style.left = r.left + "px";
+  _slashMenu.style.width = Math.min(r.width, 520) + "px";
+  _slashMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
+  _slashMenu.hidden = false;
+}
+function _pickSlash(i) {
+  const s = _slashMatches[i];
+  if (!s) return _hideSlash();
+  promptEl.value = s.prompt;
+  promptEl.style.height = "auto";
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
+  _hideSlash();
+  promptEl.focus();
+}
+promptEl.addEventListener("keydown", (e) => {
+  if (_slashMenu.hidden) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); _slashActive = Math.min(_slashActive + 1, _slashMatches.length - 1); _renderSlashActive(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); _slashActive = Math.max(_slashActive - 1, 0); _renderSlashActive(); }
+  else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); _pickSlash(_slashActive); }
+  else if (e.key === "Escape") { e.preventDefault(); _hideSlash(); }
+});
+promptEl.addEventListener("blur", () => setTimeout(_hideSlash, 150));
 
 let _pastedImages = [];
 
