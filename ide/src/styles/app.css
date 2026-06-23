@@ -2119,6 +2119,19 @@ body.zen-mode .editor {
   animation: atcViewportOpen .2s ease both;
 }
 
+/* Sub-agent: its tool steps render NESTED inside its own viewport. Without a
+   nested surface + spacing they glue together and look clipped. Give the
+   viewport padding and a subtle inset background, and space the inner cards. */
+.agent-tool-step--subagent > .atc-viewport {
+  padding: 8px;
+  background: rgba(128, 128, 128, 0.06);
+  border-top: 1px solid var(--atc-border);
+  max-height: 420px;
+  overflow-y: auto;
+}
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step { margin-top: 6px; }
+.agent-tool-step--subagent > .atc-viewport > .agent-tool-step:first-child { margin-top: 0; }
+
 /* Code / file preview */
 .atc-viewport pre {
   margin: 0; padding: 12px 16px;
