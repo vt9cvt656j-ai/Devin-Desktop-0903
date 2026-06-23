@@ -5977,9 +5977,15 @@ async function sendPrompt(text, attachedImages = []) {
   // When images are attached, send a multimodal content array so vision models
   // actually see them. History keeps only the text (image data URLs would bloat
   // every subsequent request).
+  // D — for a clearly complex agent task, steer the model to investigate + plan
+  // before editing (Claude Code's plan-first habit). Injected only into this
+  // turn's request — not the visible bubble, not stored history.
+  const _planFirst = (_currentAiMode === "agent" && _looksComplexTask(text))
+    ? "\n\n（这看起来是个多步/复杂任务：先用 search / read_file 摸清相关代码与现有约定，再用 update_plan 列出分步计划，然后逐步实现、每步更新计划状态，最后用 run_cmd / get_diagnostics 验证。别一上来就直接改。）"
+    : "";
   const userContent = attachedImages.length > 0
-    ? [{ type: "text", text }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
-    : text;
+    ? [{ type: "text", text: text + _planFirst }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
+    : text + _planFirst;
   messages.push({ role: "user", content: userContent });
   history.push({ role: "user", content: text });
 
@@ -6971,6 +6977,14 @@ function _refreshTreeFor(absPath) {
     else reloadDir(rootPath || workspaceRoots[0] || dir);
   } catch { /* tree not ready */ }
   try { refreshGitStatus(); } catch { /* git panel not ready */ }
+}
+
+// Heuristic for "this is a multi-step / build-something task" → worth a plan-first
+// approach. Deliberately conservative so quick fixes aren't slowed down.
+function _looksComplexTask(text) {
+  const t = (text || "").trim();
+  if (t.length > 280) return true;
+  return /(实现|重构|搭建|做一个|做个|开发|新增功能|加.{0,4}功能|集成|迁移|设计.{0,6}(系统|架构|页面|功能|模块)|build |implement|refactor|create (a|an)|add (a|an).{0,30}(feature|page|component|endpoint|api|system|module)|scaffold|set ?up|migrate)/i.test(t);
 }
 
 // --- Project memory: notes the agent writes with the `remember` tool, persisted
