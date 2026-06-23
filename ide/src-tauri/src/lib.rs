@@ -2,6 +2,7 @@ mod ai;
 mod extensions;
 mod files;
 mod git;
+mod net;
 mod terminal;
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -16,7 +17,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(terminal::TerminalState::default())
+        .manage(files::Workspace::default())
         .invoke_handler(tauri::generate_handler![
+            files::set_workspace_root,
             files::read_dir,
             files::read_text_file,
             files::write_text_file,
@@ -39,6 +42,7 @@ pub fn run() {
             git::git_pull,
             git::git_log,
             ai::ai_chat,
+            net::ext_fetch,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
             extensions::ext_set_enabled,

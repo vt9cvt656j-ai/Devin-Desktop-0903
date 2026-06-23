@@ -120,6 +120,7 @@ export function activate(ide) {
 | `ide.workspace.writeFile(path, content)` | `workspace-write` | Write `content` to a file in the open workspace. |
 | `ide.workspace.listDir(path)` | `workspace-read` | List directory entries. Returns `[{ name, path, is_dir }]`. |
 | `ide.network.fetch(url, opts)` | `network` | Make an HTTP request. `opts = { method?, headers?, body? }`. Returns `{ status, ok, text, json, headers }`. |
+| `ide.assistant.ask(prompt)` | `ai` | Ask the user's configured AI model; the answer streams into the assistant chat panel (with the open file/selection as context). The provider and API key stay in the IDE — they are never exposed to the extension. |
 | `ide.diagnostics.set(uri, diagnostics)` | `diagnostics` | Set diagnostic markers on a file. Each: `{ severity, message, startLine, startColumn, endLine?, endColumn? }`. Severity: `"error"`, `"warning"`, `"info"`, `"hint"`. |
 | `ide.diagnostics.clear(uri)` | `diagnostics` | Clear diagnostics set by this extension for the given URI (or all if omitted). |
 
@@ -137,6 +138,7 @@ Extensions are deny-by-default. List only what you need in `permissions`:
 | `workspace-read` | `ide.workspace.readFile`, `ide.workspace.listDir` |
 | `workspace-write` | `ide.workspace.writeFile` |
 | `network` | `ide.network.fetch` (make HTTP requests to external APIs) |
+| `ai` | `ide.assistant.ask` (ask the user's configured AI model) |
 | `diagnostics` | `ide.diagnostics.*` (set/clear editor diagnostics/markers) |
 
 `ide.commands.*` and `ide.window.*` are always available and need no permission.

@@ -70,7 +70,6 @@ export function activate(ide) {
   ide.commands.register("formatter.format", async () => {
     const lang = await ide.editor.getLanguage();
     if (lang === "json") {
-      await ide.commands?.register?.("__noop__", () => {})?.catch?.(() => {});
       const text = await ide.editor.getText();
       try {
         const obj = JSON.parse(text);

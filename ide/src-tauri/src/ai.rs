@@ -37,7 +37,11 @@ pub async fn ai_chat(
     messages: Vec<ChatMessage>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let base = config.base_url.trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("AI base URL must start with http:// or https://".into());
+    }
+    let url = format!("{base}/chat/completions");
     let payload = serde_json::json!({
         "model": config.model,
         "stream": true,

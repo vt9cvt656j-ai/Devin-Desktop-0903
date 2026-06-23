@@ -2643,6 +2643,13 @@ kbd {
 
 /* ---- Extension: Color Preview ---- */
 .color-swatch { font-size: 10px; opacity: 0.7; }
+/* A real color chip: the per-color background is injected by extSwatchClass(). */
+.ext-color-swatch {
+  border-radius: 3px;
+  border: 1px solid rgba(128, 128, 128, 0.45);
+  margin: 0 1px 0 3px;
+  white-space: pre;
+}
 
 /* ---- search replace bar ---- */
 .search-replace-bar {

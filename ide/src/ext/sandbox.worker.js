@@ -62,6 +62,11 @@ function makeIde() {
     network: {
       fetch: (url, opts) => postRpc("network.fetch", [String(url), opts || {}], "network"),
     },
+    assistant: {
+      // Ask the IDE's configured AI provider and stream the answer into the
+      // assistant chat panel. The provider/key live in the host, never here.
+      ask: (prompt) => postRpc("assistant.ask", [String(prompt)], "ai"),
+    },
     diagnostics: {
       set: (uri, diagnostics) =>
         postRpc("diagnostics.set", [String(uri), diagnostics], "diagnostics"),

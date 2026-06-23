@@ -22,6 +22,7 @@ const PERMISSION_FOR = {
   "workspace.writeFile": "workspace-write",
   "workspace.listDir": "workspace-read",
   "network.fetch": "network",
+  "assistant.ask": "ai",
   "diagnostics.set": "diagnostics",
   "diagnostics.clear": "diagnostics",
   "locale.registerLocale": "locale",
@@ -210,6 +211,9 @@ export class ExtensionHost {
         return this.ctx.listDir(args[0]);
       case "network.fetch":
         return this.ctx.networkFetch(args[0], args[1]);
+      case "assistant.ask":
+        await this.ctx.assistantAsk(args[0]);
+        return null;
       case "diagnostics.set":
         this.ctx.setDiagnostics(entry.manifest.id, args[0], args[1]);
         return null;

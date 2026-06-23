@@ -5,7 +5,7 @@
   "description": "AI-powered code explanation, refactoring, and bug detection. Supports OpenAI, Claude, and local models.",
   "author": "Michael IDE",
   "main": "index.js",
-  "permissions": ["editor", "network"],
+  "permissions": ["editor", "ai"],
   "contributes": {
     "commands": [
       { "id": "ai.explain", "title": "AI: Explain Selected Code" },

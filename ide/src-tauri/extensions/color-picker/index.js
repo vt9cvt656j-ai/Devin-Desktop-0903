@@ -24,8 +24,8 @@ export function activate(ide) {
             endColumn: match.index + match[0].length + 1,
           },
           after: {
-            content: " ■ ",
-            className: "color-swatch",
+            content: "  ",
+            color: match[0],
           },
           hoverMessage: `Color: ${match[0]}`,
         });

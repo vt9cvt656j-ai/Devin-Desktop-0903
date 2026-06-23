@@ -64,6 +64,7 @@ async function tauriBackend() {
   const core = await import("@tauri-apps/api/core");
   const dialog = await import("@tauri-apps/plugin-dialog");
   return {
+    setWorkspaceRoot: (path) => core.invoke("set_workspace_root", { path }),
     readDir: (path) => core.invoke("read_dir", { path }),
     readTextFile: (path) => core.invoke("read_text_file", { path }),
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
@@ -87,6 +88,7 @@ async function tauriBackend() {
     gitPull: (root) => core.invoke("git_pull", { root }),
     gitLog: (root, count) => core.invoke("git_log", { root, count }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
+    extFetch: (req) => core.invoke("ext_fetch", { req }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
@@ -234,6 +236,8 @@ function mockBackend() {
     }
   };
   return {
+    // No-op in the browser preview — the mock filesystem is already sandboxed.
+    setWorkspaceRoot: async () => {},
     readDir: async (path) => {
       const out = [];
       for (const d of DIRS) {
@@ -399,6 +403,20 @@ function mockBackend() {
       { hash: "e4f5g6h", short_hash: "e4f5g6h", author: "Michael", date: "1 day ago", message: "Add feature X" },
     ],
     pickFolder: async () => ROOT,
+    extFetch: async (req) => {
+      const resp = await fetch(req.url, {
+        method: req.method || "GET",
+        headers: req.headers || {},
+        body: req.body ?? undefined,
+      });
+      const text = await resp.text();
+      return {
+        status: resp.status,
+        ok: resp.ok,
+        text,
+        headers: Object.fromEntries(resp.headers.entries()),
+      };
+    },
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
       const reply = [
@@ -613,6 +631,17 @@ function activate(path) {
   refreshGutter();
 }
 
+// A single reusable blank model shown when no file is open. Reusing one model
+// (instead of creating a fresh one each time the last tab closes) avoids leaking
+// orphaned Monaco models on repeated open/close cycles.
+let emptyModel = null;
+function showEmptyEditor() {
+  if (!emptyModel || emptyModel.isDisposed?.()) {
+    emptyModel = monaco.editor.createModel("", "plaintext");
+  }
+  monacoEditor.setModel(emptyModel);
+}
+
 function closeFile(path) {
   const f = openFiles.get(path);
   if (!f) return;
@@ -624,7 +653,7 @@ function closeFile(path) {
     const next = [...openFiles.keys()].pop();
     if (next) activate(next);
     else {
-      monacoEditor.setModel(monaco.editor.createModel("", "plaintext"));
+      showEmptyEditor();
       saveBtn.disabled = true;
       $("windowTitle").textContent = "Michael IDE";
       refreshGutter();
@@ -810,6 +839,8 @@ const parentDir = (p) => p.slice(0, p.lastIndexOf("/")) || "/";
 
 async function openFolder(path) {
   rootPath = path;
+  // Scope every subsequent file operation to this folder on the Rust side.
+  await backend.setWorkspaceRoot(path);
   rootNameEl.textContent = path.split("/").filter(Boolean).pop() || path;
   rootNameEl.title = path;
   dirNodes.clear();
@@ -1444,9 +1475,7 @@ async function refreshOutline() {
   const model = monacoEditor.getModel();
   if (!model) return;
 
-  let symbols;
   try {
-    symbols = await monaco.languages.getLanguages();
     const docSymbols = await getDocumentSymbols(model);
     if (!docSymbols || !docSymbols.length) {
       const empty = document.createElement("div");
@@ -1464,17 +1493,58 @@ async function refreshOutline() {
   }
 }
 
+// Map TypeScript navigation-tree kind strings to the numeric SymbolKind values
+// SYMBOL_ICONS / renderOutlineSymbols expect.
+const TS_SYMBOL_KIND = {
+  class: 4, interface: 4, type: 4, enum: 4,
+  method: 5, constructor: 5,
+  function: 11, "local function": 11,
+  var: 12, let: 12, parameter: 12,
+  property: 6, getter: 6, setter: 6, "get accessor": 6, "set accessor": 6,
+  const: 13, "enum member": 13,
+  module: 2, alias: 2,
+};
+
+// Monaco removed the old `DocumentSymbolProviderRegistry`, so the previous code
+// here always silently fell back to a regex. For JS/TS we now ask Monaco's
+// bundled TypeScript language service (the same engine powering completions in
+// this editor) for a real, nested symbol tree; everything else uses the regex.
 async function getDocumentSymbols(model) {
-  const providers = monaco.languages.DocumentSymbolProviderRegistry?.all?.(model);
-  if (!providers || !providers.length) {
-    return fallbackSymbols(model);
+  const lang = model.getLanguageId();
+  if (lang.startsWith("typescript") || lang.startsWith("javascript")) {
+    try {
+      const symbols = await tsNavigationSymbols(model, lang);
+      if (symbols && symbols.length) return symbols;
+    } catch {
+      /* fall through to the regex fallback below */
+    }
   }
-  try {
-    const result = await providers[0].provideDocumentSymbols(model);
-    return result && result.length ? result : fallbackSymbols(model);
-  } catch {
-    return fallbackSymbols(model);
-  }
+  return fallbackSymbols(model);
+}
+
+async function tsNavigationSymbols(model, lang) {
+  const getWorker = lang.startsWith("typescript")
+    ? monaco.languages.typescript.getTypeScriptWorker
+    : monaco.languages.typescript.getJavaScriptWorker;
+  if (!getWorker) return null;
+  const worker = await getWorker();
+  const client = await worker(model.uri);
+  const root = await client.getNavigationTree(model.uri.toString());
+  const convert = (node) => {
+    const span = node.spans && node.spans[0];
+    const pos = span ? model.getPositionAt(span.start) : { lineNumber: 1, column: 1 };
+    return {
+      name: node.text,
+      kind: TS_SYMBOL_KIND[node.kind] ?? 12,
+      range: {
+        startLineNumber: pos.lineNumber, startColumn: pos.column,
+        endLineNumber: pos.lineNumber, endColumn: pos.column + 1,
+      },
+      children: (node.childItems || []).map(convert),
+    };
+  };
+  // The root node is the file itself; its children are the top-level symbols.
+  return (root?.childItems || []).map(convert);
 }
 
 function fallbackSymbols(model) {
@@ -2307,14 +2377,14 @@ function addMessage(role, text) {
 // Devin-style "thinking" card shown while the first token is pending. The orb
 // matches the active model's provider so it feels like that model is replying.
 function thinkingCard(brand) {
-  const t = document.createElement("div");
-  t.className = "thinking";
+  const el = document.createElement("div");
+  el.className = "thinking";
   const orbCls = brand && brand.cls ? "thinking__orb " + brand.cls : "thinking__orb";
   const sym = brand && brand.sym && brand.sym !== "i-cpu" ? brand.sym : "i-sparkle";
-  t.innerHTML =
+  el.innerHTML =
     `<span class="${orbCls}"><svg class="ic"><use href="#${sym}" /></svg></span>` +
     `<span class="thinking__text">${t("assistant.thinking")}</span>`;
-  return t;
+  return el;
 }
 
 function showChatHint() {
@@ -2377,8 +2447,17 @@ async function sendPrompt(text) {
   let acc = "";
   let err = null;
   let raf = 0;
+  let lastRender = 0;
   const flushStream = () => {
     raf = 0;
+    // Re-parsing the full reply on every frame is O(n²) on long answers. Cap the
+    // live re-render to ~15fps; the final, complete render happens in `finally`.
+    const now = performance.now();
+    if (now - lastRender < 66) {
+      raf = requestAnimationFrame(flushStream);
+      return;
+    }
+    lastRender = now;
     renderMarkdownInto(body, acc, { streaming: true });
     chatEl.scrollTop = chatEl.scrollHeight;
   };
@@ -2517,6 +2596,18 @@ function getMenus() {
   ];
 }
 
+// The menubar is rebuilt whenever the locale or menu state changes. The
+// document-level "close on outside click / Escape" handlers must be registered
+// only ONCE — re-adding them on every rebuild leaked a pair of listeners each
+// time. `activeMenubar` always points at the current bar + close function.
+let activeMenubar = null;
+document.addEventListener("click", (e) => {
+  if (activeMenubar && !activeMenubar.bar.contains(e.target)) activeMenubar.close();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && activeMenubar) activeMenubar.close();
+});
+
 function buildMenubar() {
   const bar = $("menubar");
   if (!bar) return;
@@ -2595,12 +2686,7 @@ function buildMenubar() {
     panels.push(panel);
   });
 
-  document.addEventListener("click", (e) => {
-    if (openIdx >= 0 && !bar.contains(e.target)) closeMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeMenu();
-  });
+  activeMenubar = { bar, close: closeMenu };
 }
 
 // ---- wiring ----
@@ -3102,7 +3188,12 @@ async function createTermTab() {
           "alias la='ls -lahG'",
           "clear",
         ];
-        backend.termWrite(entry.backendId, " " + lines.join("; ") + "\n");
+        // Only feed this zsh-specific setup to an actual zsh shell; on bash and
+        // other shells the guarded block parses and is skipped without errors.
+        backend.termWrite(
+          entry.backendId,
+          ` if [ -n "$ZSH_VERSION" ]; then ${lines.join("; ")}; fi\n`,
+        );
       }
     }, 300);
   } catch (err) {
@@ -3221,6 +3312,27 @@ function insertAtCursor(text) {
 // Per-extension decoration collections keyed by extension id.
 const extDecorations = new Map();
 
+// Monaco injected-text decorations accept a CSS class but not an inline
+// background, so to render a real color swatch we mint one class per distinct
+// color value on demand. The color is strictly validated first to prevent any
+// style injection from an extension-supplied string.
+const extSwatchClasses = new Map();
+let extSwatchStyle = null;
+function extSwatchClass(color) {
+  if (typeof color !== "string") return null;
+  const c = color.trim();
+  if (!/^#[0-9a-fA-F]{3,8}$|^(?:rgb|rgba|hsl|hsla)\([0-9.,%\s/]+\)$/.test(c)) return null;
+  if (extSwatchClasses.has(c)) return extSwatchClasses.get(c);
+  if (!extSwatchStyle) {
+    extSwatchStyle = document.createElement("style");
+    document.head.appendChild(extSwatchStyle);
+  }
+  const cls = "ext-swatch-c" + extSwatchClasses.size;
+  extSwatchStyle.sheet.insertRule(`.${cls}{background:${c};}`, extSwatchStyle.sheet.cssRules.length);
+  extSwatchClasses.set(c, cls);
+  return cls;
+}
+
 const extHost = new ExtensionHost({
   getEditorText: () => monacoEditor.getModel()?.getValue() ?? "",
   getSelectionText: () => {
@@ -3254,21 +3366,31 @@ const extHost = new ExtensionHost({
       coll = monacoEditor.createDecorationsCollection([]);
       extDecorations.set(extId, coll);
     }
-    const decos = (decorations || []).map((d) => ({
-      range: new monaco.Range(
-        d.range.startLineNumber, d.range.startColumn,
-        d.range.endLineNumber, d.range.endColumn,
-      ),
-      options: {
-        isWholeLine: d.isWholeLine ?? false,
-        className: d.className || undefined,
-        inlineClassName: d.inlineClassName || undefined,
-        linesDecorationsClassName: d.linesDecorationsClassName || undefined,
-        glyphMarginClassName: d.glyphMarginClassName || undefined,
-        hoverMessage: d.hoverMessage ? { value: d.hoverMessage } : undefined,
-        after: d.after ? { content: d.after.content, inlineClassName: d.after.className } : undefined,
-      },
-    }));
+    const decos = (decorations || []).map((d) => {
+      let after;
+      if (d.after) {
+        const swatch = d.after.color ? extSwatchClass(d.after.color) : null;
+        const cls = [d.after.className, swatch && "ext-color-swatch", swatch]
+          .filter(Boolean)
+          .join(" ");
+        after = { content: d.after.content, inlineClassName: cls || undefined };
+      }
+      return {
+        range: new monaco.Range(
+          d.range.startLineNumber, d.range.startColumn,
+          d.range.endLineNumber, d.range.endColumn,
+        ),
+        options: {
+          isWholeLine: d.isWholeLine ?? false,
+          className: d.className || undefined,
+          inlineClassName: d.inlineClassName || undefined,
+          linesDecorationsClassName: d.linesDecorationsClassName || undefined,
+          glyphMarginClassName: d.glyphMarginClassName || undefined,
+          hoverMessage: d.hoverMessage ? { value: d.hoverMessage } : undefined,
+          after,
+        },
+      };
+    });
     coll.set(decos);
     return extId;
   },
@@ -3277,15 +3399,21 @@ const extHost = new ExtensionHost({
     if (coll) coll.set([]);
   },
   networkFetch: async (url, opts) => {
-    const fetchOpts = {};
-    if (opts.method) fetchOpts.method = opts.method;
-    if (opts.headers) fetchOpts.headers = opts.headers;
-    if (opts.body) fetchOpts.body = typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body);
-    const resp = await fetch(url, fetchOpts);
-    const text = await resp.text();
+    opts = opts || {};
+    // Always route through the backend's ext_fetch. A direct WebView fetch is
+    // blocked by the app's CSP (connect-src self/ipc), which previously made the
+    // extension `network` capability silently fail in the packaged app.
+    const { status, ok, text, headers } = await backend.extFetch({
+      url,
+      method: opts.method || "GET",
+      headers: opts.headers || {},
+      body: opts.body == null
+        ? null
+        : (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)),
+    });
     let json = null;
     try { json = JSON.parse(text); } catch { /* not json */ }
-    return { status: resp.status, ok: resp.ok, text, json, headers: Object.fromEntries(resp.headers.entries()) };
+    return { status, ok, text, json, headers };
   },
   setDiagnostics: (extId, uri, diagnostics) => {
     const model = monaco.editor.getModels().find((m) => m.uri.toString() === uri || m.uri.fsPath === uri);
@@ -3316,6 +3444,10 @@ const extHost = new ExtensionHost({
   },
   registerLocale: (locale, dict) => registerLocale(locale, dict),
   setLocale: (locale) => setLocale(locale),
+  // Extensions with the `ai` permission can pose a question to the user's
+  // configured model; the answer streams into the assistant chat panel. The
+  // open file/selection are attached as context automatically by sendPrompt.
+  assistantAsk: (prompt) => sendPrompt(String(prompt ?? "")),
 });
 
 const extManager = await createExtensionManager();

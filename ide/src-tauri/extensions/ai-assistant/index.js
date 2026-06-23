@@ -1,93 +1,85 @@
-// AI Code Assistant — uses the IDE's configured AI provider to analyze code.
-// Reads the configured provider from the main IDE settings (baseUrl/apiKey/model).
-
-const STORAGE_KEY = "devin-ide.ai-config";
-
-function getConfig() {
-  try {
-    return JSON.parse(self.__ideConfig || "{}");
-  } catch {
-    return {};
-  }
-}
-
-async function aiRequest(ide, systemPrompt, userContent) {
-  const resp = await ide.network.fetch("__IDE_AI_PROXY__", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system: systemPrompt, user: userContent }),
-  });
-  if (!resp.ok) throw new Error(resp.text || `HTTP ${resp.status}`);
-  return resp.json?.choices?.[0]?.message?.content || resp.text;
-}
+// AI Code Assistant — drives the IDE's configured model (set in Settings) and
+// streams answers into the assistant chat panel. The provider and API key live
+// in the IDE host, never in this sandboxed extension.
 
 export function activate(ide) {
-  ide.commands.register("ai.explain", async () => {
+  // Resolve the code a command should act on. When `needSelection` is true only
+  // a selection is acceptable; otherwise we fall back to the whole file. Returns
+  // null (after telling the user what to do) when there is nothing to work with.
+  async function target(needSelection, emptyMsg) {
     const selection = await ide.editor.getSelection();
-    if (!selection) {
-      ide.window.showInformationMessage("Select code to explain first");
-      return;
+    if (needSelection) {
+      if (!selection) {
+        ide.window.showInformationMessage(emptyMsg);
+        return null;
+      }
+      return selection;
     }
-    ide.window.showInformationMessage("Analyzing code...");
+    const text = selection || (await ide.editor.getText());
+    if (!text) {
+      ide.window.showInformationMessage(emptyMsg);
+      return null;
+    }
+    return text;
+  }
+
+  const fence = (lang, code) => "```" + (lang || "") + "\n" + code + "\n```";
+
+  async function run(prompt) {
+    ide.window.showInformationMessage("Asking the assistant…");
+    await ide.assistant.ask(prompt);
+  }
+
+  ide.commands.register("ai.explain", async () => {
+    const code = await target(true, "Select code to explain first");
+    if (code == null) return;
     const lang = await ide.editor.getLanguage();
-    const result = await ide.network.fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer __CONFIGURE_IN_SETTINGS__",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "You are a code explanation expert. Explain the following code clearly and concisely in Chinese." },
-          { role: "user", content: `Language: ${lang}\n\nCode:\n${selection}` },
-        ],
-      }),
-    });
-    const answer = result.json?.choices?.[0]?.message?.content || "Unable to get response";
-    ide.window.showInformationMessage(answer.slice(0, 180));
+    await run(`Explain what the following ${lang} code does, clearly and concisely:\n\n${fence(lang, code)}`);
   });
 
   ide.commands.register("ai.refactor", async () => {
-    const selection = await ide.editor.getSelection();
-    if (!selection) {
-      ide.window.showInformationMessage("Select code to refactor first");
-      return;
-    }
-    ide.window.showInformationMessage("AI Refactor: Select code and configure API key in settings");
+    const code = await target(true, "Select code to refactor first");
+    if (code == null) return;
+    const lang = await ide.editor.getLanguage();
+    await run(
+      `Refactor the following ${lang} code for readability and correctness without changing its behavior. ` +
+        `Return the improved code in a fenced block, then briefly list what you changed:\n\n${fence(lang, code)}`,
+    );
   });
 
   ide.commands.register("ai.findBugs", async () => {
-    const text = await ide.editor.getText();
-    if (!text) {
-      ide.window.showInformationMessage("Open a file first");
-      return;
-    }
-    ide.window.showInformationMessage("AI Bug Finder: Configure API key in settings to enable");
+    const code = await target(false, "Open a file or select code first");
+    if (code == null) return;
+    const lang = await ide.editor.getLanguage();
+    await run(
+      `Review the following ${lang} code for bugs, edge cases, and security issues. ` +
+        `List each finding with the offending snippet and a suggested fix:\n\n${fence(lang, code)}`,
+    );
   });
 
   ide.commands.register("ai.generateTests", async () => {
-    const selection = await ide.editor.getSelection();
-    const text = selection || (await ide.editor.getText());
-    if (!text) {
-      ide.window.showInformationMessage("Open a file or select code first");
-      return;
-    }
-    ide.window.showInformationMessage("AI Test Generator: Configure API key in settings to enable");
+    const code = await target(false, "Open a file or select code to test");
+    if (code == null) return;
+    const lang = await ide.editor.getLanguage();
+    await run(
+      `Write thorough unit tests for the following ${lang} code, covering edge cases. ` +
+        `Return only the test code in a fenced block:\n\n${fence(lang, code)}`,
+    );
   });
 
   ide.commands.register("ai.addComments", async () => {
-    const selection = await ide.editor.getSelection();
-    if (!selection) {
-      ide.window.showInformationMessage("Select code to add comments to");
-      return;
-    }
-    ide.window.showInformationMessage("AI Doc Comments: Configure API key in settings to enable");
+    const code = await target(true, "Select code to add comments to");
+    if (code == null) return;
+    const lang = await ide.editor.getLanguage();
+    await run(
+      `Add clear documentation comments to the following ${lang} code. ` +
+        `Return the fully commented code in a fenced block:\n\n${fence(lang, code)}`,
+    );
   });
 
   ide.window.setStatusBarItem("aiAssistant", {
     text: "AI Assistant",
-    tooltip: "AI Code Assistant — click for available commands",
+    tooltip: "AI Code Assistant — explain, refactor, find bugs, generate tests, add comments",
     command: "ai.explain",
   });
 }

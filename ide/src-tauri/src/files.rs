@@ -1,5 +1,6 @@
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 /// Maximum size of a file we will load into the editor (5 MiB).
 const MAX_FILE: u64 = 5 * 1024 * 1024;
@@ -26,6 +27,90 @@ const IGNORED_DIRS: &[&str] = &[
     "coverage",
 ];
 
+/// Records the currently open workspace folder. Every file operation is
+/// constrained to stay inside it, mirroring the ScopedFs guarantee the sibling
+/// `bridge-core` crate enforces. Until a folder is opened, file commands are
+/// refused outright.
+#[derive(Default)]
+pub struct Workspace(Mutex<Option<Roots>>);
+
+struct Roots {
+    /// The root as the frontend names it (lexically normalized, symlinks NOT
+    /// resolved) — used for the cheap textual containment check.
+    lexical: PathBuf,
+    /// The fully canonicalized root — used to detect symlink escapes.
+    canonical: PathBuf,
+}
+
+/// Lexically normalize a path (resolve `.` and `..`) without touching the disk.
+fn lexical_abs(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Walk up from `norm` to the longest existing ancestor, canonicalize it, and
+/// require it to remain within `canonical_root`. This defeats escapes through a
+/// symlinked component (e.g. a link inside the workspace pointing to `/etc`).
+fn ensure_canonical_within(canonical_root: &Path, norm: &Path) -> Result<(), String> {
+    let mut probe: &Path = norm;
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(real) => {
+                if real.starts_with(canonical_root) {
+                    return Ok(());
+                }
+                return Err("path escapes the workspace folder".into());
+            }
+            Err(_) => match probe.parent() {
+                Some(parent) => probe = parent,
+                None => return Err("path escapes the workspace folder".into()),
+            },
+        }
+    }
+}
+
+/// Resolve a frontend-supplied path against the open workspace, rejecting
+/// anything that would read or write outside it. Returns the normalized
+/// absolute path to operate on.
+fn scoped(ws: &tauri::State<Workspace>, path: &str) -> Result<PathBuf, String> {
+    let guard = ws.0.lock().map_err(|_| "workspace state poisoned")?;
+    let roots = guard.as_ref().ok_or("no workspace folder is open")?;
+    let p = Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        roots.lexical.join(p)
+    };
+    let norm = lexical_abs(&abs);
+    if norm != roots.lexical && !norm.starts_with(&roots.lexical) {
+        return Err("path escapes the workspace folder".into());
+    }
+    ensure_canonical_within(&roots.canonical, &norm)?;
+    Ok(norm)
+}
+
+/// Record the workspace folder the frontend just opened. Canonicalizes it so
+/// later containment checks have a stable, symlink-resolved root.
+#[tauri::command]
+pub fn set_workspace_root(path: String, ws: tauri::State<Workspace>) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    if !canonical.is_dir() {
+        return Err("workspace root is not a directory".into());
+    }
+    let lexical = lexical_abs(Path::new(&path));
+    *ws.0.lock().map_err(|_| "workspace state poisoned")? = Some(Roots { lexical, canonical });
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct DirEntry {
     name: String,
@@ -36,9 +121,10 @@ pub struct DirEntry {
 /// List the immediate children of a directory, directories first, then by name.
 /// Dotfiles are hidden by default to keep the tree tidy.
 #[tauri::command]
-pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
+pub fn read_dir(path: String, ws: tauri::State<Workspace>) -> Result<Vec<DirEntry>, String> {
+    let dir = scoped(&ws, &path)?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
@@ -63,7 +149,8 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 /// Read a UTF-8 text file. Rejects oversized and binary files so the editor
 /// never tries to render garbage.
 #[tauri::command]
-pub fn read_text_file(path: String) -> Result<String, String> {
+pub fn read_text_file(path: String, ws: tauri::State<Workspace>) -> Result<String, String> {
+    let path = scoped(&ws, &path)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
@@ -77,7 +164,12 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 
 /// Overwrite a file with new text content.
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+pub fn write_text_file(
+    path: String,
+    content: String,
+    ws: tauri::State<Workspace>,
+) -> Result<(), String> {
+    let path = scoped(&ws, &path)?;
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
@@ -91,44 +183,46 @@ pub fn home_dir() -> Option<String> {
 
 /// Create a new empty file. Errors if anything already exists at `path`.
 #[tauri::command]
-pub fn create_file(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
+pub fn create_file(path: String, ws: tauri::State<Workspace>) -> Result<(), String> {
+    let p = scoped(&ws, &path)?;
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(p, b"").map_err(|e| e.to_string())
+    std::fs::write(&p, b"").map_err(|e| e.to_string())
 }
 
 /// Create a new directory (including any missing parents).
 #[tauri::command]
-pub fn create_dir(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
+pub fn create_dir(path: String, ws: tauri::State<Workspace>) -> Result<(), String> {
+    let p = scoped(&ws, &path)?;
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
-    std::fs::create_dir_all(p).map_err(|e| e.to_string())
+    std::fs::create_dir_all(&p).map_err(|e| e.to_string())
 }
 
 /// Rename or move a file/folder. Errors if the destination already exists.
 #[tauri::command]
-pub fn rename_path(from: String, to: String) -> Result<(), String> {
-    let to_p = Path::new(&to);
+pub fn rename_path(from: String, to: String, ws: tauri::State<Workspace>) -> Result<(), String> {
+    let from_p = scoped(&ws, &from)?;
+    let to_p = scoped(&ws, &to)?;
     if to_p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = to_p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+    std::fs::rename(&from_p, &to_p).map_err(|e| e.to_string())
 }
 
 /// Delete a file, or a directory and all of its contents.
 #[tauri::command]
-pub fn delete_path(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
+pub fn delete_path(path: String, ws: tauri::State<Workspace>) -> Result<(), String> {
+    let p = scoped(&ws, &path)?;
+    let p = p.as_path();
     let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         std::fs::remove_dir_all(p).map_err(|e| e.to_string())
@@ -196,6 +290,7 @@ pub fn search_in_project(
     root: String,
     query: String,
     case_sensitive: bool,
+    ws: tauri::State<Workspace>,
 ) -> Result<Vec<FileMatches>, String> {
     let needle = if case_sensitive {
         query.clone()
@@ -206,7 +301,7 @@ pub fn search_in_project(
         return Ok(Vec::new());
     }
 
-    let root_path = PathBuf::from(&root);
+    let root_path = scoped(&ws, &root)?;
     let mut results: Vec<FileMatches> = Vec::new();
     let mut total = 0usize;
     let mut stack: Vec<PathBuf> = vec![root_path.clone()];
@@ -302,4 +397,47 @@ pub fn search_in_project(
 
     results.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexical_abs_resolves_dot_and_dotdot() {
+        assert_eq!(lexical_abs(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(lexical_abs(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        assert_eq!(
+            lexical_abs(Path::new("/a/b/../../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn lexical_containment_blocks_traversal_and_prefix_tricks() {
+        let root = PathBuf::from("/home/u/proj");
+        // A path inside the workspace is accepted.
+        assert!(lexical_abs(Path::new("/home/u/proj/src/main.rs")).starts_with(&root));
+        // `..` traversal that escapes the root is rejected.
+        assert!(!lexical_abs(Path::new("/home/u/proj/../../../etc/passwd")).starts_with(&root));
+        // A sibling sharing a string prefix ("proj-evil") is not "inside" the root.
+        assert!(!lexical_abs(Path::new("/home/u/proj-evil/secret")).starts_with(&root));
+    }
+
+    #[test]
+    fn canonical_within_accepts_inside_and_rejects_outside() {
+        let base = std::env::temp_dir().join(format!("mide_scope_test_{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+        let inside = root.join("sub/file.txt");
+        std::fs::write(&inside, b"hi").unwrap();
+        assert!(ensure_canonical_within(&canonical_root, &lexical_abs(&inside)).is_ok());
+
+        // A path resolving outside the root (a real system file) is rejected.
+        assert!(ensure_canonical_within(&canonical_root, Path::new("/etc/passwd")).is_err());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
