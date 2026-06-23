@@ -5530,6 +5530,12 @@ const _AI_MODE_PROMPTS = {
 - 做完**一定要验证它真的成立**：用 run_cmd 跑构建/测试/类型检查、用 get_diagnostics 看报错、能起服务就起来点一下关键路径。没验证过的「做完了」不算做完。
 - 宁可范围小但每块都真，也不要范围大但全是空壳。
 
+# 高效准则（向 Claude Code / Codex 看齐）
+- **并行探索**：一轮里要读/搜多个文件，就**一次发多个只读工具调用**（read_file / search / find_files / list_dir 会并行执行），别串成一长串单步往返，省时间、更快摸清全貌。
+- **根因优先**：修 bug 先定位「它到底为什么发生」，解决**根本原因**，不要打补丁糊症状；改完想一下有没有同类问题在别处。
+- **保持推进**：常规步骤（读文件、装依赖、跑构建/测试）直接做，不为每一步请示；信息不全就合理假设并说明，一路推到任务真正完成再收尾。
+- **沟通极简**：直接给结论，不写「我将要…/接下来我会…」这类铺垫，也不在正文复述正在调用的工具（系统已显示成卡片）；要指到代码就用 文件:行号。
+
 # 工程判断（默认这样思考，没人提也要做到）
 - 先顺着项目已有约定走——命名、目录结构、错误处理、状态管理、技术选型，都先看现有代码怎么做并保持一致；优先复用已有的工具/组件/模式，别另起一套。
 - 默认就把安全和健壮性做对：校验外部输入，处理空/错误/加载/边界四类情况，绝不把密钥/密码硬编码或提交进仓库。
@@ -6603,7 +6609,7 @@ function _renderAgentSegStatic(container, seg, allSegs, idx) {
     step.className = "agent-term-card agent-term-card--ok";
     step.innerHTML =
       `<div class="agent-term-card__header">` +
-        `<div class="agent-term-card__dots"><i></i><i></i><i></i></div>` +
+        `<svg class="agent-term-card__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4l3 4-3 4M8.5 12H13"/></svg>` +
         `<span class="agent-term-card__label">Terminal</span>` +
         `<div class="agent-term-status agent-term-status--ok">` +
           `<svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> done` +
@@ -6949,6 +6955,19 @@ function _invalidateRead(path) {
   for (const k of [path, root ? root + "/" + path.replace(/^\/+/, "") : null]) {
     if (k) _agentReadCache.delete(k);
   }
+}
+
+// Refresh the explorer around a path the agent just created/changed/removed so a
+// new/deleted file shows up immediately — instead of waiting on the fs watcher,
+// which only reloads already-expanded dirs and can miss a freshly-written file.
+function _refreshTreeFor(absPath) {
+  if (!absPath) return;
+  const dir = parentDir(absPath);
+  try {
+    if (dir && (workspaceRoots.includes(dir) || dirNodes.has(dir))) reloadDir(dir);
+    else reloadDir(rootPath || workspaceRoots[0] || dir);
+  } catch { /* tree not ready */ }
+  try { refreshGitStatus(); } catch { /* git panel not ready */ }
 }
 
 // --- Project memory: notes the agent writes with the `remember` tool, persisted
@@ -7717,6 +7736,7 @@ async function _executeToolStep(step, call, root) {
         await backend.writeTextFile(fp, newContent);
         _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
         _invalidateRead(call.path);
+        _refreshTreeFor(fp); // show the new/changed file in the explorer right away
       } catch (e1) {
         try {
           await backend.taskRunCapture(root, `mkdir -p "$(dirname '${fp}')" && cat > "${fp}" << 'AGENT_EOF'\n${newContent}\nAGENT_EOF`);
@@ -7824,6 +7844,7 @@ async function _executeToolStep(step, call, root) {
       try {
         await backend.deletePath(fp);
         _invalidateRead(p); _agentReadCache.delete(fp);
+        _refreshTreeFor(fp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
         return { type: "delete", path: p, content: `已删除 ${p}` };
       } catch (e) {
@@ -7839,6 +7860,7 @@ async function _executeToolStep(step, call, root) {
       try {
         await backend.renamePath(fromFp, toFp);
         _invalidateRead(from); _agentReadCache.delete(fromFp);
+        _refreshTreeFor(fromFp); _refreshTreeFor(toFp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已移动";
         return { type: "move", path: from, content: `已移动 ${from} → ${to}` };
       } catch (e) {
@@ -7896,7 +7918,7 @@ async function _executeToolStep(step, call, root) {
       step.className = "agent-term-card agent-term-card--running";
       step.innerHTML =
         `<div class="agent-term-card__header">` +
-          `<div class="agent-term-card__dots"><i></i><i></i><i></i></div>` +
+          `<svg class="agent-term-card__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4l3 4-3 4M8.5 12H13"/></svg>` +
           `<span class="agent-term-card__label">Terminal</span>` +
           `<span class="agent-term-timer"></span>` +
           `<div class="agent-term-status agent-term-status--running"><span class="agent-term-spinner"></span> Running</div>` +

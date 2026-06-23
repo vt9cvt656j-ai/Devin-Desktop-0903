@@ -2223,38 +2223,29 @@ body.zen-mode .editor {
 
 /* ═══ Agent Terminal Card v2 — Cursor-level quality ═══ */
 .agent-term-card {
-  border-radius: 12px;
+  border-radius: 10px;
   overflow: hidden;
-  border: 1px solid rgba(255,255,255,.06);
-  background: #0c0c0f;
-  box-shadow: 0 2px 12px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
-  transition: border-color .2s ease, box-shadow .2s ease, transform .15s ease;
-  animation: atcFadeIn .25s ease both;
+  border: 1px solid rgba(255,255,255,.08);
+  background: #0d1117;
+  box-shadow: 0 1px 3px rgba(0,0,0,.25);
+  transition: border-color .15s ease;
+  animation: atcFadeIn .2s ease both;
 }
-.agent-term-card:hover {
-  border-color: rgba(255,255,255,.1);
-  box-shadow: 0 4px 20px rgba(0,0,0,.4);
-  transform: translateY(-1px);
-}
+.agent-term-card:hover { border-color: rgba(255,255,255,.16); }
 .agent-term-card__header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
-  background: linear-gradient(180deg, rgba(255,255,255,.04) 0%, rgba(255,255,255,.01) 100%);
-  border-bottom: 1px solid rgba(255,255,255,.05);
-  min-height: 34px;
+  gap: 9px;
+  padding: 7px 12px;
+  background: rgba(255,255,255,.025);
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  min-height: 32px;
 }
-.agent-term-card__dots {
-  display: flex; gap: 6px; flex-shrink: 0;
+/* A clean terminal glyph instead of skeuomorphic macOS traffic-light dots. */
+.agent-term-card__icon {
+  width: 14px; height: 14px; flex-shrink: 0;
+  color: #8b949e;
 }
-.agent-term-card__dots i {
-  width: 9px; height: 9px; border-radius: 50%; display: block;
-  box-shadow: inset 0 -1px 1px rgba(0,0,0,.2);
-}
-.agent-term-card__dots i:nth-child(1) { background: linear-gradient(180deg, #ff6259, #e5453e); }
-.agent-term-card__dots i:nth-child(2) { background: linear-gradient(180deg, #ffbf2e, #e6a820); }
-.agent-term-card__dots i:nth-child(3) { background: linear-gradient(180deg, #2dce56, #20b845); }
 .agent-term-card__label {
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
   font-size: 11.5px;
