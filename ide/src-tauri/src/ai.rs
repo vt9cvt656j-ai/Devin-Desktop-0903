@@ -128,6 +128,30 @@ async fn ai_chat_inner(
         }
     }
 
+    // Prompt caching: Anthropic-compatible endpoints reuse content marked with a
+    // `cache_control` breakpoint across requests. Tag the large, stable system
+    // prompt so it isn't re-billed/re-processed every turn. Gated on Anthropic;
+    // other providers (DeepSeek, OpenAI, …) cache the stable prefix automatically,
+    // so their payload is left byte-for-byte unchanged.
+    if config.base_url.contains("anthropic") {
+        if let Some(arr) = payload["messages"].as_array_mut() {
+            if let Some(first) = arr
+                .iter_mut()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            {
+                if let Some(text) = first
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+                {
+                    first["content"] = serde_json::json!([
+                        { "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }
+                    ]);
+                }
+            }
+        }
+    }
+
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)

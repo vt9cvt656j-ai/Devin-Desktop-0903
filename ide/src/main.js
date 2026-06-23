@@ -5557,6 +5557,7 @@ const _AI_MODE_PROMPTS = {
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
+- get_diagnostics(path?)：读 LSP/编辑器对文件的错误与警告，改完代码快速自检（比每次跑构建快）
 - edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
 - write_file(path, content)：新建或整文件重写
 - delete_path(path)：删除文件/目录（递归），用于清理/重构
@@ -6804,6 +6805,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
     { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进项目记忆（按工作区持久保存，下次自动加载进上下文）。适合记：技术栈/架构决定、约定、构建与测试命令、用户偏好、易踩的坑。只记真正长期有用的事实，别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一句话（简洁、自包含）" } }, required: ["content"] } } },
+    { type: "function", function: { name: "get_diagnostics", description: "读取编辑器/LSP 对文件的诊断（错误与警告）。改完代码用它快速自检，比每次跑构建快。不传 path 则返回所有已打开文件的诊断。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要检查的文件路径；省略则查所有已打开文件" } } } } },
   ];
   if (includeWrite) {
     tools.push(
@@ -6833,6 +6835,7 @@ function _mapToolCall(name, args) {
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
     case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
     case "remember": return { type: "memory", path: "项目记忆", content: args.content || "" };
+    case "get_diagnostics": return { type: "diag", path: args.path || "" };
     case "delete_path": return { type: "delete", path: args.path || "" };
     case "move_path": return { type: "move", path: args.from || "", to: args.to || "" };
     default: return null;
@@ -6920,6 +6923,47 @@ function _appendMemory(root, note) {
   try { localStorage.setItem(_memoryKey(root), mem); } catch {}
   _agentContextCache = { root: null, ts: 0, data: "" }; // force context rebuild so the note shows
   return true;
+}
+
+// Memory panel: view / edit / clear the agent's project memory for the current
+// workspace. Opened via the "Manage Project Memory" command (⌘⇧P).
+function openMemoryPanel() {
+  const root = rootPath || workspaceRoots[0] || "";
+  const overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999";
+  const modal = document.createElement("div");
+  modal.style.cssText = "width:min(640px,92vw);max-height:80vh;display:flex;flex-direction:column;background:var(--panel,#1e1e22);border:1px solid var(--border,rgba(128,128,128,.35));border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden";
+  modal.innerHTML =
+    `<div style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border,rgba(128,128,128,.25))">` +
+      `<span style="font-size:14px;font-weight:600">🧠 项目记忆</span>` +
+      `<span style="font-size:11px;opacity:.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_escHtml(root || "(无工作区)")}</span>` +
+      `<button class="mem-close" style="margin-left:auto;background:none;border:none;color:inherit;cursor:pointer;font-size:16px;opacity:.6">✕</button>` +
+    `</div>` +
+    `<div style="padding:10px 14px 0;font-size:12px;opacity:.6">智能体用 remember 工具记下的、按工作区持久保存的知识，每轮自动注入它的上下文。可直接编辑或清空（一行一条）。</div>` +
+    `<textarea class="mem-text" spellcheck="false" style="flex:1;min-height:240px;margin:10px 14px;padding:10px;font:12px/1.5 ui-monospace,Menlo,monospace;background:var(--bg,#15151a);color:var(--text,#eee);border:1px solid var(--border,rgba(128,128,128,.3));border-radius:8px;resize:vertical;outline:none"></textarea>` +
+    `<div style="display:flex;gap:8px;padding:0 14px 14px;justify-content:flex-end">` +
+      `<button class="mem-clear" style="padding:6px 12px;border-radius:7px;border:1px solid var(--border,rgba(128,128,128,.35));background:none;color:#f85149;cursor:pointer;font:inherit;font-size:12px">清空</button>` +
+      `<button class="mem-save" style="padding:6px 14px;border-radius:7px;border:none;background:var(--accent,#3b82f6);color:#fff;cursor:pointer;font:inherit;font-size:12px">保存</button>` +
+    `</div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  const ta = modal.querySelector(".mem-text");
+  ta.value = _loadMemory(root);
+  const close = () => overlay.remove();
+  modal.querySelector(".mem-close").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  modal.querySelector(".mem-save").addEventListener("click", () => {
+    try { localStorage.setItem(_memoryKey(root), ta.value.slice(0, 8000)); } catch {}
+    _agentContextCache = { root: null, ts: 0, data: "" };
+    showToast("项目记忆已保存");
+    close();
+  });
+  modal.querySelector(".mem-clear").addEventListener("click", () => {
+    ta.value = "";
+    try { localStorage.removeItem(_memoryKey(root)); } catch {}
+    _agentContextCache = { root: null, ts: 0, data: "" };
+    showToast("项目记忆已清空");
+  });
 }
 
 /**
@@ -7372,7 +7416,7 @@ function _createToolStep(call) {
   const pathDisplay = call.path || call.command || "";
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -7388,7 +7432,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -7697,6 +7741,28 @@ async function _executeToolStep(step, call, root) {
       res.textContent = r.count ? `${r.count} 个文件` : "无匹配";
       vp.innerHTML = `<pre>${_escHtml(r.text)}</pre>`;
       return { type: "find", path: call.path, content: `find_files "${call.pattern || call.path}":\n${r.text}` };
+
+    } else if (call.type === "diag") {
+      const sevName = { 8: "error", 4: "warning", 2: "info", 1: "hint" };
+      let markers = [];
+      try {
+        if (call.path && call.path.trim()) {
+          const want = call.path.startsWith("/") ? call.path : (root ? root + "/" + call.path.replace(/^\/+/, "") : call.path);
+          const model = monaco.editor.getModels().find((m) => {
+            const p = m.uri.fsPath || m.uri.path || "";
+            return p === want || p.endsWith("/" + call.path.replace(/^\/+/, ""));
+          });
+          markers = model ? monaco.editor.getModelMarkers({ resource: model.uri }) : [];
+        } else {
+          markers = monaco.editor.getModelMarkers({});
+        }
+      } catch {}
+      const probs = markers.filter((m) => m.severity >= 4); // errors + warnings
+      const lines = probs.slice(0, 50).map((m) => `${sevName[m.severity] || "?"} ${(m.resource?.path || "").split("/").pop()}:${m.startLineNumber}:${m.startColumn} ${m.message}`);
+      res.className = probs.length ? "atc-result atc-result--err" : "atc-result atc-result--ok";
+      res.textContent = probs.length ? `${probs.length} 个问题` : "无错误/警告";
+      if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无诊断)")}</pre>`;
+      return { type: "diag", path: call.path, content: probs.length ? `诊断（${probs.length} 个错误/警告）:\n${lines.join("\n")}` : "无错误或警告（注意：LSP 分析可能略有延迟，改完稍等再查更准）。" };
 
     } else if (call.type === "memory") {
       const ok = _appendMemory(root, call.content);
@@ -8686,6 +8752,7 @@ const ACTION_LABELS = {
   "view.search": "Show Search",
   "view.git": "Show Source Control",
   "view.problems": "Toggle Problems Panel",
+  "memory.manage": "Manage Project Memory",
   "commandPalette": "Command Palette",
   "view.splitEditor": "Toggle Split Editor",
   "code.runCurrentFile": "Run Current File",
@@ -11284,6 +11351,7 @@ const KB_ACTIONS = {
   "view.output": () => toggleOutputPanel(),
   "view.bookmarks": () => toggleBookmarksPanel(),
   "view.problems": () => toggleProblems(),
+  "memory.manage": () => openMemoryPanel(),
   "commandPalette": () => palette.open(),
   "view.splitEditor": () => toggleSplitEditor(),
   "code.runCurrentFile": () => runCurrentFile(),
