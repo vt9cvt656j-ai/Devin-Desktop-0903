@@ -105,19 +105,38 @@ pub fn term_open(
     };
 
     // Pump shell output to the frontend on a dedicated thread.
+    //
+    // Coalesce output to avoid flooding the IPC channel / webview: a noisy
+    // command (build logs, `yes`, cat-ing a big file) otherwise fires hundreds
+    // of events per second — each one a `term.write` + change-detection pass on
+    // the main thread — which freezes and can OOM-crash the app. A read that
+    // fills the buffer signals a burst, so we keep accumulating (capped) and
+    // send fewer, larger batches; a short read means the burst is over (or it's
+    // a prompt awaiting input), so we flush immediately to stay interactive.
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut pending = String::new();
+        const MAX_BATCH: usize = 256 * 1024;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if on_event.send(TermEvent::Data { data }).is_err() {
-                        break;
+                    pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let bursting = n == buf.len();
+                    if !bursting || pending.len() >= MAX_BATCH {
+                        if on_event
+                            .send(TermEvent::Data { data: std::mem::take(&mut pending) })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 Err(_) => break,
             }
+        }
+        if !pending.is_empty() {
+            let _ = on_event.send(TermEvent::Data { data: pending });
         }
         let _ = on_event.send(TermEvent::Exit);
     });

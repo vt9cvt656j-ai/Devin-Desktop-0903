@@ -199,6 +199,9 @@ pub struct TaskRunResult {
 }
 
 const MAX_TASK_OUTPUT: usize = 2 * 1024 * 1024;
+/// Kill a captured command after this long so a server/watch/blocked command
+/// can't hang the caller forever (long but enough for slow builds/installs).
+const TASK_TIMEOUT_SECS: u64 = 300;
 
 /// Truncate a UTF-8 string to at most `max` bytes without splitting a code
 /// point. Returns true when truncation happened.
@@ -245,42 +248,91 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
     }
 
     #[cfg(windows)]
-    let output = {
+    let mut cmd = {
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-        Command::new(shell)
-            .arg("/C")
-            .arg(&command)
-            .current_dir(&dir)
-            .output()
+        let mut c = Command::new(shell);
+        c.arg("/C").arg(&command).current_dir(&dir);
+        c
     };
-
     #[cfg(not(windows))]
-    let output = {
+    let mut cmd = {
         // A login shell loads the user's profile so cargo/npm/go resolve, and we
         // prepend the usual toolchain dirs as a belt-and-suspenders fallback.
-        Command::new(task_shell())
-            .arg("-lc")
+        let mut c = Command::new(task_shell());
+        c.arg("-lc")
             .arg(&command)
             .current_dir(&dir)
             .env("PATH", augmented_path())
             .env("CI", "1")
-            .env("TERM", "dumb")
-            .output()
+            .env("TERM", "dumb");
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("failed to run task: {e}"))?;
+
+    // Drain stdout/stderr on threads (a full pipe buffer would otherwise deadlock
+    // the child), capping each so a flood can't exhaust memory.
+    let mut out_pipe = child.stdout.take().unwrap();
+    let mut err_pipe = child.stderr.take().unwrap();
+    let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || { let mut b = Vec::new(); read_capped(&mut out_pipe, &mut b, MAX_TASK_OUTPUT); let _ = tx_o.send(b); });
+    std::thread::spawn(move || { let mut b = Vec::new(); read_capped(&mut err_pipe, &mut b, MAX_TASK_OUTPUT); let _ = tx_e.send(b); });
+
+    // Wait with a timeout and kill a command that runs too long (a dev server, a
+    // watch, or one blocked on input) instead of hanging the caller forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TASK_TIMEOUT_SECS);
+    let mut timed_out = false;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break -1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(_) => break -1,
+        }
     };
 
-    let output = output.map_err(|e| format!("failed to run task: {e}"))?;
-    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let truncated =
+    let out_bytes = rx_o.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let err_bytes = rx_e.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let mut stdout = String::from_utf8_lossy(&out_bytes).into_owned();
+    let mut stderr = String::from_utf8_lossy(&err_bytes).into_owned();
+    let mut truncated =
         truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT) | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
+    if timed_out {
+        truncated = true;
+        stderr.push_str(&format!(
+            "\n[已超时 {TASK_TIMEOUT_SECS}s，命令被终止。长时间运行的命令（如启动服务器）请在终端里手动运行。]"
+        ));
+    }
     let combined = format!("{stdout}{stderr}");
-    Ok(TaskRunResult {
-        code: output.status.code().unwrap_or(-1),
-        stdout,
-        stderr,
-        combined,
-        truncated,
-    })
+    Ok(TaskRunResult { code, stdout, stderr, combined, truncated })
+}
+
+/// Read a stream into `out`, but stop storing past `cap` bytes (keep draining so
+/// the child process isn't blocked on a full pipe).
+fn read_capped<R: std::io::Read>(r: &mut R, out: &mut Vec<u8>, cap: usize) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    let take = (cap - out.len()).min(n);
+                    out.extend_from_slice(&buf[..take]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

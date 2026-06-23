@@ -5526,7 +5526,7 @@ const _AI_MODE_PROMPTS = {
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - edit_file(path, old_string, new_string, replace_all?)：精确替换，改已有文件首选
 - write_file(path, content)：新建或整文件重写
-- run_cmd(command)：运行 shell 命令（装依赖、跑测试、构建等）
+- run_cmd(command)：在隔离子进程里运行一条 shell 命令并拿到完整输出（装依赖、跑测试、构建、git 等）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录就写「cd 子目录 && 你的命令」；② 不要跑会一直运行的命令（服务器/watch/npm run dev/flask run 等），它们不退出、也不会动用户终端——要启服务请让用户自己在终端开
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -6196,23 +6196,12 @@ async function _agentRunInTerminal(root, command, stepEl) {
   let result = { code: -1, stdout: "", stderr: "" };
 
   try {
-    if (!_termOpened) {
-      await (_termLock = _termLock.then(async () => {
-        if (_termOpened) return;
-        await Promise.race([
-          (async () => {
-            await openTerminal();
-            await _waitTermReady(4000);
-            await new Promise(r => setTimeout(r, 800));
-          })(),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("terminal init timeout")), 8000)),
-        ]);
-        _termOpened = true;
-      }).catch(e => { console.warn("[agent-term] init fail:", e); }));
-    }
-
+    // Agent commands run in an ISOLATED subprocess (taskRunCapture), never typed
+    // into the user's interactive terminal — otherwise running another command
+    // would interrupt whatever the user already has running there (a dev server,
+    // a REPL, etc.). Each call gets a fresh shell at the workspace root.
     const captureRoot = root || "/tmp";
-    const isLongRunning = /\b(serve|start|dev|watch|run\b.*--debug|run\b.*--reload|nodemon|flask\s+run|npm\s+start|npx\s+(vite|next|nuxt))\b/i.test(cmd);
+    const isLongRunning = /\b(serve|start|dev|watch|nodemon|flask\s+run|npm\s+(run\s+)?(start|dev|serve)|yarn\s+(start|dev)|pnpm\s+(start|dev)|npx\s+(vite|next|nuxt)|http\.server|webpack(-dev-server)?|ng\s+serve|rails\s+server|gunicorn|uvicorn)\b/i.test(cmd);
     const isCatCmd = /^\s*cat\s/.test(cmd);
 
     if (isCatCmd) {
@@ -6222,29 +6211,14 @@ async function _agentRunInTerminal(root, command, stepEl) {
         const content = await backend.readTextFile(fp);
         result = { code: 0, stdout: content || "", stderr: "" };
       } catch {
-        result = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e) }));
+        result = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e?.message || e) }));
       }
     } else if (isLongRunning) {
-      const alreadyCd = /^\s*cd\s/.test(cmd);
-      let finalCmd = cmd;
-      if (!alreadyCd && root) finalCmd = `cd ${shellQuote(root)} && ${cmd}`;
-      writeToActiveTerminal(finalCmd + "\n");
-      result = { code: 0, stdout: "(long-running command in terminal)", stderr: "" };
+      // Don't run servers/watchers here: they never return (would hang the agent)
+      // and must NOT touch the user's terminal. Tell the model to delegate.
+      result = { code: 1, stdout: "", stderr: "[未执行] 这是长时间运行的命令（服务器 / watch / dev）。它不会自己退出，不能在这里跑，也不会动用户的终端。请让用户自己在终端运行，或改用会退出的命令（如只构建一次 npm run build）。" };
     } else {
-      const captureP = Promise.race([
-        backend.taskRunCapture(captureRoot, cmd),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000)),
-      ]).catch(e => {
-        const msg = String(e?.message || e);
-        return msg === "timeout" ? { code: 0, stdout: "(running in terminal)", stderr: "" } : { code: 1, stdout: "", stderr: msg };
-      });
-
-      const alreadyCd = /^\s*cd\s/.test(cmd);
-      let finalCmd = cmd;
-      if (!alreadyCd && root) finalCmd = `cd ${shellQuote(root)} && ${cmd}`;
-      writeToActiveTerminal(finalCmd + "\n");
-
-      const r = await captureP;
+      const r = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e?.message || e) }));
       result = { code: r?.code ?? 0, stdout: r?.stdout || "", stderr: r?.stderr || "" };
     }
 
