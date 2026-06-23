@@ -5983,9 +5983,27 @@ async function sendPrompt(text, attachedImages = []) {
   const _planFirst = (_currentAiMode === "agent" && _looksComplexTask(text))
     ? "\n\n（这看起来是个多步/复杂任务：先用 search / read_file 摸清相关代码与现有约定，再用 update_plan 列出分步计划，然后逐步实现、每步更新计划状态，最后用 run_cmd / get_diagnostics 验证。别一上来就直接改。）"
     : "";
+  // @file mentions → pull each pinned file's content into THIS turn's context
+  // (the visible bubble and stored history keep just the "@path" the user typed).
+  let _atContext = "";
+  const _mentioned = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+  if (_mentioned.length && (rootPath || workspaceRoots.length)) {
+    const _r = (rootPath || workspaceRoots[0]).replace(/\/$/, "");
+    const _seen = new Set();
+    for (const rel of _mentioned.slice(0, 6)) {
+      if (_seen.has(rel)) continue;
+      _seen.add(rel);
+      try {
+        const fp = rel.startsWith("/") ? rel : _r + "/" + rel.replace(/^\.?\//, "");
+        const content = await backend.readTextFile(fp);
+        _atContext += `\n\n文件 ${rel}:\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``;
+      } catch { /* unreadable — skip */ }
+    }
+  }
+  const _extra = _planFirst + _atContext;
   const userContent = attachedImages.length > 0
-    ? [{ type: "text", text: text + _planFirst }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
-    : text + _planFirst;
+    ? [{ type: "text", text: text + _extra }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
+    : text + _extra;
   messages.push({ role: "user", content: userContent });
   history.push({ role: "user", content: text });
 
@@ -11134,6 +11152,7 @@ _sendBtnEl?.addEventListener("click", (e) => {
 promptEl.addEventListener("input", () => {
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
+  _updateAtMenu();
 });
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -11153,6 +11172,73 @@ promptEl.addEventListener("keydown", (e) => {
     $("composer").requestSubmit();
   }
 });
+
+// ---- @file mentions: type "@" in the chat to pin a workspace file into context ----
+let _atMatches = [];
+let _atActive = -1;
+let _atTimer = 0;
+const _atMenu = document.createElement("div");
+_atMenu.className = "atmenu";
+_atMenu.hidden = true;
+document.body.appendChild(_atMenu);
+
+function _atToken() {
+  const pos = promptEl.selectionStart;
+  const m = /(?:^|\s)@([^\s]*)$/.exec(promptEl.value.slice(0, pos));
+  return m ? { query: m[1], start: pos - m[1].length - 1, end: pos } : null;
+}
+function _hideAtMenu() { _atMenu.hidden = true; _atActive = -1; _atMatches = []; }
+function _renderAtActive() { [..._atMenu.children].forEach((c, i) => c.classList.toggle("is-active", i === _atActive)); }
+function _updateAtMenu() {
+  const tok = _atToken();
+  const root = rootPath || workspaceRoots[0] || "";
+  if (!tok || !root) return _hideAtMenu();
+  clearTimeout(_atTimer);
+  _atTimer = setTimeout(async () => {
+    const t2 = _atToken();
+    if (!t2) return _hideAtMenu();
+    let res;
+    try { res = await _agentFindFiles(root, t2.query || "**"); } catch { return _hideAtMenu(); }
+    const files = (res.text || "").split("\n")
+      .filter((l) => l && !l.startsWith("(") && !l.startsWith("…") && !l.startsWith("["))
+      .slice(0, 8);
+    if (!files.length) return _hideAtMenu();
+    _atMatches = files;
+    _atMenu.innerHTML = "";
+    files.forEach((f, i) => {
+      const item = document.createElement("div");
+      item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
+      item.textContent = f;
+      item.addEventListener("mousedown", (ev) => { ev.preventDefault(); _pickAt(i); });
+      _atMenu.appendChild(item);
+    });
+    _atActive = 0;
+    const r = promptEl.getBoundingClientRect();
+    _atMenu.style.left = r.left + "px";
+    _atMenu.style.width = Math.min(r.width, 520) + "px";
+    _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
+    _atMenu.hidden = false;
+  }, 160);
+}
+function _pickAt(i) {
+  const tok = _atToken();
+  if (!tok || !_atMatches[i]) return _hideAtMenu();
+  const insert = "@" + _atMatches[i] + " ";
+  const v = promptEl.value;
+  promptEl.value = v.slice(0, tok.start) + insert + v.slice(tok.end);
+  const caret = tok.start + insert.length;
+  promptEl.setSelectionRange(caret, caret);
+  _hideAtMenu();
+  promptEl.focus();
+}
+promptEl.addEventListener("keydown", (e) => {
+  if (_atMenu.hidden) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); _atActive = Math.min(_atActive + 1, _atMatches.length - 1); _renderAtActive(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); _atActive = Math.max(_atActive - 1, 0); _renderAtActive(); }
+  else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); _pickAt(_atActive); }
+  else if (e.key === "Escape") { e.preventDefault(); _hideAtMenu(); }
+});
+promptEl.addEventListener("blur", () => setTimeout(_hideAtMenu, 150));
 
 let _pastedImages = [];
 
