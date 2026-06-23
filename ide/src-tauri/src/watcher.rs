@@ -16,8 +16,14 @@ const IGNORED_WATCH_DIRS: &[&str] = &[
     ".cache", ".venv", "__pycache__", "vendor", ".gradle", ".idea", "Pods", "DerivedData",
 ];
 
-fn is_ignored_path(path: &std::path::Path) -> bool {
-    path.components().any(|c| match c {
+fn is_ignored_path(path: &std::path::Path, roots: &[PathBuf]) -> bool {
+    // Only consider components BELOW a watched root, so a workspace that itself
+    // lives under a dir named e.g. "build"/"dist" isn't entirely ignored.
+    let rel = roots
+        .iter()
+        .find_map(|r| path.strip_prefix(r).ok())
+        .unwrap_or(path);
+    rel.components().any(|c| match c {
         std::path::Component::Normal(name) => IGNORED_WATCH_DIRS
             .iter()
             .any(|d| name == std::ffi::OsStr::new(d)),
@@ -74,12 +80,13 @@ pub fn fs_watch(
     }
 
     let app_handle = app.clone();
+    let roots_filter = new_paths.clone();
     let mut debouncer = new_debouncer(Duration::from_millis(300), move |res: DebounceEventResult| {
         match res {
             Ok(events) => {
                 let mut changed: Vec<String> = events
                     .iter()
-                    .filter(|e| e.kind == DebouncedEventKind::Any && !is_ignored_path(&e.path))
+                    .filter(|e| e.kind == DebouncedEventKind::Any && !is_ignored_path(&e.path, &roots_filter))
                     .map(|e| e.path.to_string_lossy().to_string())
                     .collect();
                 if !changed.is_empty() {

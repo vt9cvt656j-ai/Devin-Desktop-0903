@@ -3239,8 +3239,13 @@ function handleFsChanges(paths) {
   if (_autoSaving) return;
 
   // Defense in depth (the watcher already filters these at the source): never do
-  // work for changes inside high-churn build/dependency dirs.
-  paths = paths.filter((p) => !_FS_IGNORE_RE.test(p));
+  // work for changes inside high-churn build/dependency dirs. Test the path
+  // RELATIVE to its workspace root, so a project that itself lives under a dir
+  // named e.g. "build" isn't wholly ignored.
+  paths = paths.filter((p) => {
+    const r = workspaceRoots.find((wr) => p.startsWith(wr)) || (rootPath && p.startsWith(rootPath) ? rootPath : "");
+    return !_FS_IGNORE_RE.test(r ? p.slice(r.length) : p);
+  });
   if (!paths.length) return;
 
   const openPaths = new Set(openFiles.keys());
@@ -7837,7 +7842,9 @@ async function _executeToolStep(step, call, root) {
           res.textContent = `old_string 出现 ${occ} 次`;
           return { type: "edit", path: call.path, content: `[ERROR] old_string 在 ${call.path} 中出现 ${occ} 次（不唯一）。请加更多上下文以唯一定位，或设 replace_all=true。` };
         }
-        newContent = call.replaceAll ? old.split(oldStr).join(call.newString || "") : old.replace(oldStr, call.newString || "");
+        // Function replacement so `$&`, `$1`, `$$`… in new_string are inserted
+        // literally instead of being treated as replacement patterns.
+        newContent = call.replaceAll ? old.split(oldStr).join(call.newString || "") : old.replace(oldStr, () => call.newString || "");
       }
 
       if (existed && newContent === old) {
@@ -7935,7 +7942,7 @@ async function _executeToolStep(step, call, root) {
           res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处不唯一(${occ})`;
           return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 出现 ${occ} 次（不唯一）。加更多上下文或设 replace_all=true。整体未写入。` };
         }
-        content = edits[k].replace_all ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+        content = edits[k].replace_all ? content.split(oldStr).join(newStr) : content.replace(oldStr, () => newStr);
       }
       const newContent = content;
       if (newContent === old) {
