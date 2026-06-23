@@ -481,6 +481,9 @@
           <div class="login-field">
             <input id="loginPassword" type="password" placeholder="输入密码" class="login-input" />
           </div>
+          <div class="login-field" id="loginCodeField" hidden>
+            <input id="loginCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="输入 6 位邮箱验证码" class="login-input" />
+          </div>
           <button class="login-btn" type="button" id="loginSubmitBtn">登录</button>
           <div class="login-alt">
             <button class="login-link" type="button" id="loginUseCodeBtn">使用验证码登录</button>

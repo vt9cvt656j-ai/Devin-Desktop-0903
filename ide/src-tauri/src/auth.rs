@@ -207,48 +207,202 @@ pub async fn auth_check_email(email: String) -> Result<bool, String> {
     Ok(count > 0)
 }
 
-use std::sync::Mutex;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-static VERIFY_CODES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+// email -> (code, expires_at). In-memory by design — codes are short-lived.
+static VERIFY_CODES: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+const CODE_TTL: Duration = Duration::from_secs(600); // 10 minutes
 
-fn codes() -> &'static Mutex<HashMap<String, String>> {
+fn codes() -> &'static Mutex<HashMap<String, (String, Instant)>> {
     VERIFY_CODES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lightweight email-format check ("合规"): exactly one '@', a non-empty local
+/// part, a dotted domain, a 2+ char TLD, no whitespace, sane length.
+pub fn valid_email(email: &str) -> bool {
+    let e = email.trim();
+    if e.len() < 6 || e.len() > 254 || e.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = e.split('@');
+    let (local, domain) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(l), Some(d), None) => (l, d),
+        _ => return false, // zero, or more than one, '@'
+    };
+    if local.is_empty() || domain.len() < 3 || domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+    domain.contains('.') && domain.rsplit('.').next().is_some_and(|tld| tld.len() >= 2)
+}
+
+/// Send the 6-digit code to `to` via QQ SMTP. Credentials come from the
+/// environment: `QQ_SMTP_USER` = the full qq email, `QQ_SMTP_PASS` = the SMTP
+/// *authorization code* (NOT the QQ login password — generate it in QQ Mail →
+/// 设置 → 账户 → POP3/IMAP/SMTP). If they're unset we fall back to dev mode (the
+/// code is only logged) so the flow still works locally without secrets.
+/// Returns Ok(true) when a real email was sent, Ok(false) in dev mode.
+/// Load SMTP credentials: environment first, then a local, never-committed file
+/// at ~/.michael_ide/smtp.env (KEY=VALUE per line). This keeps the secret out of
+/// the source tree entirely — set it once and forget it.
+fn smtp_creds() -> (String, String) {
+    let mut user = std::env::var("QQ_SMTP_USER").unwrap_or_default();
+    let mut pass = std::env::var("QQ_SMTP_PASS").unwrap_or_default();
+    if user.is_empty() || pass.is_empty() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if let Ok(txt) = std::fs::read_to_string(format!("{home}/.michael_ide/smtp.env")) {
+            for line in txt.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim().trim_matches('"').to_string();
+                    match k.trim() {
+                        "QQ_SMTP_USER" if user.is_empty() => user = v,
+                        "QQ_SMTP_PASS" if pass.is_empty() => pass = v,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (user, pass)
+}
+
+async fn send_email_code(to: &str, code: &str) -> Result<bool, String> {
+    let (user, pass) = smtp_creds();
+    if user.is_empty() || pass.is_empty() {
+        tracing::warn!("[DEV] SMTP not configured (set QQ_SMTP_USER/QQ_SMTP_PASS or ~/.michael_ide/smtp.env). Code for {to}: {code}");
+        return Ok(false);
+    }
+
+    use lettre::message::header::ContentType;
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+    let msg = Message::builder()
+        .from(format!("Michael IDE <{user}>").parse().map_err(|e| format!("bad sender address: {e}"))?)
+        .to(to.parse().map_err(|e| format!("bad recipient address: {e}"))?)
+        .subject("Michael IDE 登录验证码")
+        .header(ContentType::TEXT_PLAIN)
+        .body(format!(
+            "你的 Michael IDE 验证码是：{code}\n\n10 分钟内有效。如非本人操作，请忽略本邮件。"
+        ))
+        .map_err(|e| format!("build email failed: {e}"))?;
+
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.qq.com")
+            .map_err(|e| format!("SMTP setup failed: {e}"))?
+            .credentials(Credentials::new(user, pass))
+            .build();
+
+    mailer.send(msg).await.map_err(|e| format!("发送邮件失败: {e}"))?;
+    Ok(true)
 }
 
 #[command]
 pub async fn auth_send_code(email: String) -> Result<String, String> {
-    if email.is_empty() || !email.contains('@') {
-        return Err("Invalid email".to_string());
+    if !valid_email(&email) {
+        return Err("邮箱格式不正确".to_string());
     }
     let code: String = (0..6).map(|_| (b'0' + (rand::random::<u8>() % 10)) as char).collect();
-    tracing::info!("[DEV] Verification code for {email}: {code}");
-    codes().lock().unwrap().insert(email.clone(), code.clone());
-    Ok("验证码已发送（开发模式：查看终端日志）".to_string())
+    codes()
+        .lock()
+        .unwrap()
+        .insert(email.clone(), (code.clone(), Instant::now() + CODE_TTL));
+    if send_email_code(&email, &code).await? {
+        Ok("验证码已发送到你的邮箱（10 分钟内有效）".to_string())
+    } else {
+        Ok("验证码已生成（开发模式：未配置 SMTP，请查看终端日志）".to_string())
+    }
 }
 
+/// Check a stored code matches and hasn't expired; consume it on success.
+fn take_valid_code(email: &str, code: &str) -> bool {
+    let mut map = codes().lock().unwrap();
+    match map.get(email) {
+        Some((expected, expires)) if expected == code && Instant::now() < *expires => {
+            map.remove(email);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Existing-account login: the email must already exist and the password match.
+#[command]
+pub async fn auth_login(email: String, password: String) -> Result<AuthResult, String> {
+    if !valid_email(&email) {
+        return Err("邮箱格式不正确".to_string());
+    }
+    let pool = pool()?;
+    let existing: Option<(String, String)> =
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB query failed: {e}"))?;
+    match existing {
+        None => Ok(AuthResult {
+            success: false,
+            email,
+            user_id: String::new(),
+            message: "该邮箱尚未注册".into(),
+            is_new_user: true,
+        }),
+        Some((user_id, hash)) => {
+            let valid = bcrypt::verify(&password, &hash)
+                .map_err(|e| format!("Password verification failed: {e}"))?;
+            if valid {
+                Ok(AuthResult { success: true, email, user_id, message: "登录成功".into(), is_new_user: false })
+            } else {
+                Ok(AuthResult { success: false, email, user_id: String::new(), message: "密码错误".into(), is_new_user: false })
+            }
+        }
+    }
+}
+
+/// New-account registration: verify the email code, then create the account with
+/// the password the user chose (the proper signup completion step).
+#[command]
+pub async fn auth_register(email: String, password: String, code: String) -> Result<AuthResult, String> {
+    if !valid_email(&email) {
+        return Err("邮箱格式不正确".to_string());
+    }
+    if password.len() < 6 {
+        return Err("密码至少 6 位".to_string());
+    }
+    if !take_valid_code(&email, &code) {
+        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "验证码错误或已过期".into(), is_new_user: true });
+    }
+    let pool = pool()?;
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
+        .bind(&email).fetch_optional(pool).await.map_err(|e| format!("DB query failed: {e}"))?;
+    if exists.is_some() {
+        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "该邮箱已注册，请直接登录".into(), is_new_user: false });
+    }
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let hash = bcrypt::hash(&password, 10).map_err(|e| format!("Password hashing failed: {e}"))?;
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
+        .bind(&user_id).bind(&email).bind(&hash)
+        .execute(pool).await.map_err(|e| format!("Failed to create user: {e}"))?;
+    Ok(AuthResult { success: true, email, user_id, message: "注册成功，已登录".into(), is_new_user: true })
+}
+
+/// Passwordless code login for an EXISTING account. (New accounts must go through
+/// auth_register so the user's chosen password gets stored.)
 #[command]
 pub async fn auth_verify_code(email: String, code: String) -> Result<AuthResult, String> {
-    let stored = codes().lock().unwrap().get(&email).cloned();
-    match stored {
-        Some(expected) if expected == code => {
-            codes().lock().unwrap().remove(&email);
-            let pool = pool()?;
-            let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
-                .bind(&email).fetch_optional(pool).await.map_err(|e| format!("{e}"))?;
-            let (user_id, is_new) = match existing {
-                Some((id,)) => (id, false),
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let hash = bcrypt::hash("code-login", 10).unwrap_or_default();
-                    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
-                        .bind(&id).bind(&email).bind(&hash)
-                        .execute(pool).await.map_err(|e| format!("{e}"))?;
-                    (id, true)
-                }
-            };
-            Ok(AuthResult { success: true, email, user_id, message: "验证码登录成功".into(), is_new_user: is_new })
-        }
-        _ => Ok(AuthResult { success: false, email, user_id: String::new(), message: "验证码错误或已过期".into(), is_new_user: false }),
+    if !take_valid_code(&email, &code) {
+        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "验证码错误或已过期".into(), is_new_user: false });
+    }
+    let pool = pool()?;
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
+        .bind(&email).fetch_optional(pool).await.map_err(|e| format!("DB query failed: {e}"))?;
+    match existing {
+        Some((user_id,)) => Ok(AuthResult { success: true, email, user_id, message: "验证码登录成功".into(), is_new_user: false }),
+        None => Ok(AuthResult { success: false, email, user_id: String::new(), message: "该邮箱尚未注册，请先设置密码注册".into(), is_new_user: true }),
     }
 }

@@ -134,6 +134,8 @@ pub fn run() {
             watcher::fs_watch,
             watcher::fs_unwatch,
             auth::auth_login_or_register,
+            auth::auth_login,
+            auth::auth_register,
             auth::auth_check_email,
             auth::auth_send_code,
             auth::auth_verify_code,

@@ -196,6 +196,8 @@ async function tauriBackend() {
     gitStashList: (root) => core.invoke("git_stash_list", { root }),
     gitBlame: (root, rel) => core.invoke("git_blame", { root, rel }),
     authLoginOrRegister: (email, password) => core.invoke("auth_login_or_register", { email, password }),
+    authLogin: (email, password) => core.invoke("auth_login", { email, password }),
+    authRegister: (email, password, code) => core.invoke("auth_register", { email, password, code }),
     authCheckEmail: (email) => core.invoke("auth_check_email", { email }),
     authSendCode: (email) => core.invoke("auth_send_code", { email }),
     authVerifyCode: (email, code) => core.invoke("auth_verify_code", { email, code }),
@@ -895,8 +897,10 @@ function mockBackend() {
     termListCommands: async () => [],
     termHistory: async () => [],
     authLoginOrRegister: async () => ({ success: true, message: "mock login" }),
-    authCheckEmail: async () => ({ exists: false }),
-    authSendCode: async () => "验证码已发送（模拟）",
+    authLogin: async (email) => ({ success: true, message: "mock login", email, user_id: "mock", is_new_user: false }),
+    authRegister: async (email) => ({ success: true, message: "mock register", email, user_id: "mock", is_new_user: true }),
+    authCheckEmail: async () => false,
+    authSendCode: async () => "验证码已发送（模拟，预览模式任意 6 位均可）",
     authVerifyCode: async () => ({ success: true, message: "mock verify" }),
     invoke: async () => ({}),
   };
@@ -11065,7 +11069,7 @@ if (settingsDropdown) {
     else if (action === "shortcuts") openAdvancedTool("shortcuts");
     else if (action === "login") {
       const dlg = $("loginDialog");
-      if (dlg) { $("loginStep1").hidden = false; $("loginStep2").hidden = true; dlg.showModal(); }
+      if (dlg) { _resetLoginUI(); const em = $("loginEmail"); if (em) em.value = ""; dlg.showModal(); setTimeout(() => em?.focus(), 0); }
     }
     else if (action === "logout") {
       _loggedInEmail = null;
@@ -11105,67 +11109,121 @@ function _updateLoginUI() {
 // login flow
 const loginLogoEl = $("loginLogo");
 if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" src="/src/assets/logo.png" alt="Michael IDE" style="width:52px;height:52px;border-radius:13px" />`;
-$("loginCloseBtn")?.addEventListener("click", () => $("loginDialog")?.close());
-$("loginNextBtn")?.addEventListener("click", () => {
-  const email = $("loginEmail")?.value?.trim();
-  if (!email) { $("loginEmail")?.focus(); return; }
-  $("loginStep2Hint").textContent = email;
-  $("loginStep1").hidden = true;
-  $("loginStep2").hidden = false;
-  $("loginPassword")?.focus();
-});
-$("loginBackBtn")?.addEventListener("click", () => {
+// Login / signup flow:
+//   step 1 — enter email → validate format → check DB for an existing account
+//   existing account → enter password → 登录                 (auth_login)
+//   new account      → set password → email code → 完成注册   (auth_send_code + auth_register)
+//   existing account may also opt into passwordless code login (auth_verify_code)
+let _loginEmail = "";
+let _loginMode = "login";   // "login" | "signup" | "code-login"
+let _codeSent = false;
+
+function _emailValid(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s || "");
+}
+function _showCodeField(show) {
+  const f = $("loginCodeField"), c = $("loginCode");
+  if (f) f.hidden = !show;
+  if (show && c) { c.value = ""; setTimeout(() => c.focus(), 0); }
+}
+function _resetLoginUI() {
   $("loginStep1").hidden = false;
   $("loginStep2").hidden = true;
-  $("loginEmail")?.focus();
-});
-$("loginSubmitBtn")?.addEventListener("click", async () => {
+  _showCodeField(false);
+  const pw = $("loginPassword");
+  if (pw) { pw.hidden = false; pw.disabled = false; pw.type = "password"; pw.value = ""; }
+  _codeSent = false; _loginMode = "login";
+}
+function _finishLogin(result) {
+  if (result && result.success) {
+    $("loginDialog")?.close();
+    _loggedInEmail = _loginEmail;
+    _updateLoginUI();
+    _resetLoginUI();
+  } else {
+    alert((result && result.message) || "操作失败");
+  }
+}
+// run an async action with the button showing a transient label, always restored
+async function _withBtn(btn, label, fn) {
+  const orig = btn.textContent;
+  btn.textContent = label; btn.disabled = true;
+  try { return await fn(); }
+  finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+$("loginCloseBtn")?.addEventListener("click", () => { $("loginDialog")?.close(); _resetLoginUI(); });
+
+$("loginNextBtn")?.addEventListener("click", async () => {
   const email = $("loginEmail")?.value?.trim();
-  const password = $("loginPassword")?.value;
-  if (!email || !password) return;
+  if (!_emailValid(email)) { alert("请输入有效的邮箱地址"); $("loginEmail")?.focus(); return; }
+  await _withBtn($("loginNextBtn"), "检测中…", async () => {
+    let exists;
+    try { exists = await backend.authCheckEmail(email); }
+    catch (e) { alert("检测邮箱失败：" + (e?.message || e)); return; }
+    _loginEmail = email;
+    _loginMode = exists ? "login" : "signup";
+    _codeSent = false;
+    const pw = $("loginPassword");
+    pw.hidden = false; pw.disabled = false; pw.type = "password"; pw.value = "";
+    pw.placeholder = exists ? "输入密码" : "设置密码（至少 6 位）";
+    _showCodeField(false);
+    $("loginStep2Hint").textContent = exists
+      ? `${email} · 欢迎回来，输入密码登录`
+      : `${email} · 新账号，设置密码后验证邮箱`;
+    $("loginSubmitBtn").textContent = exists ? "登录" : "下一步";
+    $("loginUseCodeBtn").hidden = !exists;          // passwordless code login: existing accounts only
+    $("loginUseCodeBtn").textContent = "使用验证码登录";
+    $("loginStep1").hidden = true;
+    $("loginStep2").hidden = false;
+    setTimeout(() => pw.focus(), 0);
+  });
+});
+
+$("loginBackBtn")?.addEventListener("click", () => { _resetLoginUI(); $("loginEmail")?.focus(); });
+
+$("loginSubmitBtn")?.addEventListener("click", async () => {
+  const email = _loginEmail || $("loginEmail")?.value?.trim();
+  const password = $("loginPassword")?.value || "";
+  const code = $("loginCode")?.value?.trim() || "";
   const btn = $("loginSubmitBtn");
-  const origText = btn.textContent;
-  btn.textContent = "处理中...";
-  btn.disabled = true;
   try {
-    const result = _loginCodeMode
-      ? await backend.authVerifyCode(email, password)
-      : await backend.authLoginOrRegister(email, password);
-    if (result.success) {
-      $("loginDialog")?.close();
-      _loggedInEmail = email;
-      _updateLoginUI();
-    } else {
-      alert(result.message || "登录失败");
+    if (_loginMode === "login") {
+      if (!password) { $("loginPassword")?.focus(); return; }
+      _finishLogin(await _withBtn(btn, "登录中…", () => backend.authLogin(email, password)));
+    } else if (_loginMode === "code-login") {
+      if (code.length !== 6) { $("loginCode")?.focus(); return; }
+      _finishLogin(await _withBtn(btn, "验证中…", () => backend.authVerifyCode(email, code)));
+    } else { // signup
+      if (!_codeSent) {
+        if (password.length < 6) { alert("密码至少 6 位"); $("loginPassword")?.focus(); return; }
+        const msg = await _withBtn(btn, "发送验证码…", () => backend.authSendCode(email));
+        _codeSent = true;
+        const pw = $("loginPassword"); if (pw) pw.disabled = true;   // lock the chosen password
+        _showCodeField(true);
+        $("loginSubmitBtn").textContent = "完成注册";
+        alert(msg);
+      } else {
+        if (code.length !== 6) { $("loginCode")?.focus(); return; }
+        _finishLogin(await _withBtn(btn, "注册中…", () => backend.authRegister(email, password, code)));
+      }
     }
   } catch (e) {
-    alert("登录失败: " + (e?.message || e));
-  } finally {
-    btn.textContent = origText;
-    btn.disabled = false;
+    alert("操作失败：" + (e?.message || e));
   }
 });
-let _loginCodeMode = false;
+
 $("loginUseCodeBtn")?.addEventListener("click", async () => {
-  const pw = $("loginPassword");
-  _loginCodeMode = !_loginCodeMode;
-  if (_loginCodeMode) {
-    pw.type = "text"; pw.placeholder = "输入 6 位验证码";
-    $("loginUseCodeBtn").textContent = "使用密码登录";
-    $("loginSubmitBtn").textContent = "验证";
-    const email = $("loginEmail")?.value?.trim();
-    if (email) {
-      try {
-        const msg = await backend.authSendCode(email);
-        alert(msg);
-      } catch (e) { alert("发送失败: " + (e?.message || e)); }
-    }
-  } else {
-    pw.type = "password"; pw.placeholder = "输入密码";
-    $("loginUseCodeBtn").textContent = "使用验证码登录";
-    $("loginSubmitBtn").textContent = "登录";
-  }
-  pw.value = ""; pw.focus();
+  // passwordless code login for an existing account
+  const email = _loginEmail || $("loginEmail")?.value?.trim();
+  if (!_emailValid(email)) return;
+  _loginMode = "code-login";
+  const pw = $("loginPassword"); if (pw) pw.hidden = true;
+  _showCodeField(true);
+  $("loginSubmitBtn").textContent = "验证";
+  $("loginUseCodeBtn").hidden = true;
+  try { alert(await backend.authSendCode(email)); }
+  catch (e) { alert("发送失败：" + (e?.message || e)); }
 });
 
 // ---- explorer tabs / tools / search ----
