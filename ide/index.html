@@ -497,20 +497,10 @@
     <dialog class="sheet" id="settings">
       <form method="dialog" class="sheet__body" id="settingsForm">
         <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
-        <h2 data-i18n="settings.title">AI provider</h2>
-        <p class="sheet__sub" data-i18n="settings.sub">Any OpenAI-compatible endpoint. Stored locally on this machine.</p>
-        <label><span data-i18n="settings.baseUrl">Base URL</span>
-          <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" />
-        </label>
-        <label><span data-i18n="settings.apiKey">API key</span>
-          <input id="cfgApiKey" type="password" placeholder="sk-…" />
-        </label>
-        <label><span data-i18n="settings.model">Model</span>
-          <input id="cfgModel" type="text" placeholder="gpt-4o-mini" />
-        </label>
+        <h2>AI 模型</h2>
+        <p class="sheet__sub">AI 模型由你的账号统一提供，无需自行配置。登录后在底部直接选择模型即可使用；额度、会员与钱包余额可在「个人资料」查看。</p>
         <div class="sheet__actions">
-          <button class="btn" value="cancel" formnovalidate data-i18n="settings.cancel">Cancel</button>
-          <button class="btn btn--primary" id="saveCfgBtn" value="save" data-i18n="settings.save">Save</button>
+          <button class="btn btn--primary" value="cancel" formnovalidate>知道了</button>
         </div>
       </form>
     </dialog>

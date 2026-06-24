@@ -5134,7 +5134,7 @@ async function showProfile() {
       ${row("小时额度", usd(u.quota_window_cents), "每 5.5 小时刷新 · 下次 " + fmtT(u.quota_window_reset_at))}
       ${row("周额度", weekly, u.quota_weekly_cap_cents > 0 ? ("本周已用 " + usd(u.quota_week_used_cents)) : "")}
       ${row("总额度", usd(u.quota_total_cents), active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "")}
-      ${(u.credits_cents > 0) ? row("按量余额", usd(u.credits_cents), "非会员/额外充值") : ""}
+      ${row("钱包额度", usd(u.credits_cents), "不受套餐限制 · 随时可用" + (active ? "（会员额度用尽后启用）" : ""))}
     </div>
   </div>`;
   document.body.appendChild(ov);
@@ -5203,10 +5203,10 @@ function buildModelMenu() {
   const cfg = document.createElement("div");
   cfg.className = "menu__item";
   cfg.innerHTML = `<svg class="ic"><use href="#i-gear" /></svg><span></span>`;
-  cfg.querySelector("span").textContent = t("settings.configure");
+  cfg.querySelector("span").textContent = "账号与额度";
   cfg.addEventListener("click", () => {
     closeModelMenu();
-    openSettings();
+    showProfile();
   });
   modelMenu.appendChild(cfg);
 }
@@ -8883,21 +8883,11 @@ function showAiDiffPreview(originalCode, modifiedCode, lang, filePath) {
 // ---- settings dialog ----
 const settingsEl = $("settings");
 function openSettings() {
-  const c = loadConfig();
-  $("cfgBaseUrl").value = c.baseUrl || _DEFAULT_AI_CONFIG.baseUrl;
-  $("cfgApiKey").value = c.apiKey || _DEFAULT_AI_CONFIG.apiKey;
-  $("cfgModel").value = c.model || _DEFAULT_AI_CONFIG.model;
-  settingsEl.showModal();
+  // Custom AI provider config removed — this is now just an informational notice.
+  if (settingsEl) settingsEl.showModal();
 }
-$("settingsForm").addEventListener("submit", async (e) => {
-  if (e.submitter && e.submitter.value === "save") {
-    // Custom model mode removed: only the API key is editable; the base URL is
-    // always the gateway and the model comes from the picker.
-    await saveConfig({ ...loadConfig(), apiKey: $("cfgApiKey").value.trim() });
-    refreshModelBadge();
-    showToast(t("settings.saved"));
-  }
-});
+// Settings dialog is now just an informational notice (custom AI config removed).
+$("settingsForm").addEventListener("submit", () => { /* nothing to save */ });
 
 // ---- toast ----
 let toastTimer;
