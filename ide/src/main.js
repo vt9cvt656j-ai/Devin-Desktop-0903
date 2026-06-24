@@ -5769,18 +5769,20 @@ const _AI_MODE_PROMPTS = {
 - 单一数据源：同一份状态只在一处拥有，其余派生或引用，别多处各存一份再手动同步。
 - 接口先于实现：先定清楚模块/函数的输入输出契约和错误如何向上传递，再填实现。
 
-# UI 质量（写界面时，目标是"精致、现代、一致"，不是"能用就行"）
-- 先沿用项目已有设计语言：复用现有的设计变量（颜色/间距/圆角/阴影 token）、组件与排版，新界面要和现有风格浑然一体，绝不引入突兀新风格或写死颜色。
-- 间距用一致刻度（4/8px 网格：4 8 12 16 24 32…），靠留白分组而非到处加边框线。
-- 排版建立层级：字号走比例阶（如 12/14/16/20/24/32），用字号+字重+颜色拉开主次；正文行高 ~1.5、行宽 ≤ ~70 字。
-- 颜色克制：一个主强调色 + 中性灰阶 + 少量语义色（成功/警告/危险）；正文对比度达 WCAG AA（≥4.5:1）。
-- 状态做全：hover / focus（键盘焦点要可见）/ active / disabled / loading / 空状态 / 错误态，别只做"正常态"。
-- 细节出质感：一致的圆角与柔和阴影、对齐、克制的过渡（150–200ms）、语义标签+aria+键盘可达、响应式不溢出、深浅色主题都用变量照顾到。
+# UI 质量（写界面是你的强项——目标是"惊艳、现代、可直接上线"，不是"能用就行"）
+- 设计语言：默认走**谷歌 Material 风 + 浅色简约白**——大面积留白、干净网格、克制描边、柔和层级阴影、Google 蓝(#1a73e8)类的单一主强调色。也可借鉴当代一流产品的审美(Material Design 3 / Apple HIG / Linear / Vercel / Stripe / Notion / Tailwind UI、shadcn 这类)。**拿不准就 web_search 看这些设计系统/站点的实际做法和组件范式再落地。** 但项目已有设计语言优先：先复用现有设计变量(颜色/间距/圆角/阴影 token)、组件、排版，新界面与现有风格浑然一体，绝不写死颜色或拼突兀新风格。
+- 留白与节奏：8px 网格(4 8 12 16 24 32 48…)，靠**留白与分组**建立结构，而不是到处加边框线；卡片/分区用足够的内外边距,不要挤。
+- 排版层级：字号走比例阶(12/14/16/20/24/32/40)，用字号+字重(400/500/600/700)+颜色拉开主次；正文行高 ~1.5、行宽 ≤ ~70 字；数字用 tabular-nums。
+- 颜色克制有体系：一个主强调色 + 中性灰阶(背景/分隔/次要文字) + 少量语义色(成功#1e8e3e/警告#f9ab00/危险#d93025)；浅色为主、对比度达 WCAG AA(≥4.5:1)；用渐变/微妙阴影营造深度而非堆重色。
+- 质感细节(这些最能体现高级感)：一致圆角(8–16px)、柔和分层阴影、像素级对齐、克制而顺滑的过渡与微交互(150–250ms、缓动 cubic-bezier)、进场/hover 动效点到为止、骨架屏/加载态、空状态有插画+引导文案。
+- 状态做全：hover / focus(键盘焦点环可见) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
+- 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也好看)、深浅主题都用变量照顾、动效尊重 prefers-reduced-motion。
 
-# 图标与视觉资源（做界面/产品时，别用 emoji 凑数）
-- 图标优先复用项目已有图标集 / SVG sprite，保持风格统一。需要新图标时：① 用成熟图标库（Lucide / Material Symbols / Heroicons / Feather）——可 web_search 查它们官方 SVG 或 CDN 用法再用；② 或自己**手写干净的 SVG**：统一 24×24 viewBox、用 currentColor 继承主题色、1.5–2px 描边、几何简洁、对齐像素，别堆一堆杂乱 path。**正式 UI 图标不要用 emoji。**
-- 图片/插画分清场景：原型可用占位服务（picsum 等）；正式素材联网找**可商用并注明出处**的（Unsplash 等）；图标性质的优先 SVG（清晰、可缩放、可换色）而非位图。外链资源注意许可与可用性。
-- 图标/插画/配色都和项目既有设计语言一致（用「UI 质量」里的设计变量），别东拼西凑。
+# 图标与视觉资源（做界面必须用 SVG 图标，绝不用 emoji 凑数）
+- **正式 UI 一律用 SVG 图标**，不用 emoji。两条路：① 复用项目已有图标集 / SVG sprite，保持风格统一；② 需要新图标时优先成熟图标库(Lucide / Material Symbols / Heroicons / Feather / Tabler)——可 web_search 查官方 SVG/用法再用；③ 或**自己手写干净的 SVG**：统一 24×24 viewBox、currentColor 继承主题色、1.5–2px 描边、线宽/圆角/端点风格一致、几何简洁对齐像素，一个图标一条主 path，别堆杂乱 path。
+- 同一界面图标**风格统一**(全描边或全填充、同一线宽、同一圆角)，尺寸成套(16/20/24)，和文字基线对齐。
+- 品牌/产品 logo 用对应官方矢量标识(如各 AI 品牌的 mark)；装饰插画原型可用占位(picsum)，正式素材用可商用并注明出处的(Unsplash 等)，图标性质一律优先 SVG(清晰、可缩放、可换色)而非位图；外链注意许可与可用性。
+- 图标/插画/配色都统一到项目设计语言(用「UI 质量」的设计变量)，别东拼西凑。
 
 # 数据与数据库（涉及持久化/存储时）
 - 选对存储：简单本地配置用文件/KV；有关系、要查询、要事务才上关系型数据库——别为存几个键值上重型库，也别把关系数据硬塞进平面文件。
@@ -6285,6 +6287,38 @@ async function sendPrompt(text, attachedImages = []) {
   ] : [];
   let _segRendered = 0;
   let _streamEl = null;
+  // ---- collapsible "thinking" (reasoning) card ----
+  let reasoning = "";
+  let reasoningEl = null;
+  let _answerStarted = false;
+  const ensureThink = () => {
+    if (reasoningEl) return reasoningEl;
+    if (!document.getElementById("think-style")) {
+      const st = document.createElement("style");
+      st.id = "think-style";
+      st.textContent =
+        ".think-card{border:1px solid rgba(140,140,150,.25);border-radius:10px;margin:2px 0 12px;background:rgba(140,140,150,.07)}" +
+        ".think-head{display:flex;align-items:center;gap:7px;padding:8px 12px;cursor:pointer;font-size:12.5px;color:#9aa0a6;user-select:none}" +
+        ".think-head .chev{transition:transform .2s;flex:0 0 auto}" +
+        '.think-card[data-open="0"] .think-head .chev{transform:rotate(-90deg)}' +
+        '.think-card[data-open="0"] .think-body{display:none}' +
+        ".think-body{padding:2px 12px 11px;font-size:12.5px;line-height:1.65;color:#9aa0a6;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}" +
+        '.think-card.streaming .think-title::after{content:" ▍";color:#1a73e8;animation:think-blink 1s steps(2) infinite}' +
+        "@keyframes think-blink{50%{opacity:0}}";
+      document.head.appendChild(st);
+    }
+    reasoningEl = document.createElement("div");
+    reasoningEl.className = "think-card streaming";
+    reasoningEl.dataset.open = "1";
+    reasoningEl.innerHTML = '<div class="think-head"><svg class="chev" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg><span class="think-title">思考中…</span></div><div class="think-body"></div>';
+    reasoningEl.querySelector(".think-head").addEventListener("click", () => {
+      reasoningEl.dataset.open = reasoningEl.dataset.open === "1" ? "0" : "1";
+    });
+    body.insertBefore(reasoningEl, body.firstChild);
+    return reasoningEl;
+  };
+  const setThink = (txt) => { ensureThink().querySelector(".think-body").textContent = txt; chatEl.scrollTop = chatEl.scrollHeight; };
+  const collapseThink = () => { if (reasoningEl) { reasoningEl.dataset.open = "0"; reasoningEl.classList.remove("streaming"); const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考"; } };
   const _agentRoot = rootPath || workspaceRoots[0] || "";
   const _toolPromises = [];
   const _trackedFiles = new Map();
@@ -6438,8 +6472,10 @@ async function sendPrompt(text, attachedImages = []) {
       ? (cb) => backend.aiChatWithTools(config, messages, _toolSchemas, cb)
       : (cb) => backend.aiChat(config, messages, cb);
     await chatFn((ev) => {
-      if (ev.kind === "token") { acc += ev.delta; scheduleStream(); }
+      if (ev.kind === "reasoning") { reasoning += ev.delta; setThink(reasoning); }
+      else if (ev.kind === "token") { if (!_answerStarted) { _answerStarted = true; collapseThink(); } acc += ev.delta; scheduleStream(); }
       else if (ev.kind === "toolCall") {
+        collapseThink();
         const { id, name, arguments: args } = ev;
         if (name) { _toolArgBuf[id || "_"] = { name, args: args || "" }; }
         else if (id && _toolArgBuf[id]) { _toolArgBuf[id].args += args; }
@@ -6474,6 +6510,7 @@ async function sendPrompt(text, attachedImages = []) {
     });
   } catch (e) { if (!err) err = String(e); }
   finally {
+    collapseThink();
     if (raf) cancelAnimationFrame(raf);
     streaming = false;
     _setSendBtnStop(false);

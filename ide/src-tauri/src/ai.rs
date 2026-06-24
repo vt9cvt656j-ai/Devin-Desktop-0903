@@ -20,6 +20,8 @@ pub struct AiConfig {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AiEvent {
     Token { delta: String },
+    /// Streamed model "thinking" (reasoning_content) — shown as a collapsible card.
+    Reasoning { delta: String },
     /// `index` lets the frontend reassemble a tool call whose `id`/`name` arrive
     /// in the first delta while `arguments` stream across later deltas (the
     /// OpenAI streaming contract). Multiple parallel tool calls are told apart
@@ -194,6 +196,12 @@ async fn ai_chat_inner(
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 let delta = &v["choices"][0]["delta"];
+                // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
+                if let Some(rt) = delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str()) {
+                    if !rt.is_empty() {
+                        let _ = on_event.send(AiEvent::Reasoning { delta: rt.to_string() });
+                    }
+                }
                 if let Some(text) = delta["content"].as_str() {
                     if !text.is_empty() {
                         let _ = on_event.send(AiEvent::Token { delta: text.to_string() });
