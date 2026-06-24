@@ -434,12 +434,18 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let uid: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE api_key = $1")
+    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>("SELECT user_id FROM api_keys WHERE api_key = $1")
         .bind(&token)
         .fetch_optional(&state.db)
         .await?
-        .ok_or_else(|| AppError::unauthorized("API Key 无效"))?;
-    let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1").bind(&token).execute(&state.db).await;
+    {
+        Some(u) => {
+            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1").bind(&token).execute(&state.db).await;
+            u
+        }
+        // Also accept the login JWT directly (the IDE authenticates with it).
+        None => crate::auth::user_from_jwt(&state.cfg, &token).ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+    };
 
     if !body.is_object() {
         return Err(AppError::bad("请求体需为 JSON 对象"));
@@ -454,11 +460,15 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         .find(|m| allowed_ids(m).contains(&model_id))
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
-    if conn.rate > 0.0 {
-        let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
-        if bal <= 0 {
-            return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: "额度不足，请充值".into() });
-        }
+    // Access gate: must have an active membership OR positive credits.
+    let (plan, plan_exp, credits): (String, Option<chrono::DateTime<chrono::Utc>>, i64) =
+        sqlx::query_as("SELECT plan, plan_expires_at, credits_cents FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&state.db)
+            .await?;
+    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
+    if !plan_active && credits <= 0 {
+        return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: "请先开通会员或充值额度".into() });
     }
 
     let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);

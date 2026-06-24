@@ -69,6 +69,18 @@ fn issue_token(cfg: &Config, user: &User) -> ApiResult<String> {
     Ok(encode(&Header::default(), &claims, &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()))?)
 }
 
+/// Resolve a user id from a raw JWT (used by the model gateway so the IDE can
+/// authenticate with the login token, not just an API key). None if invalid.
+pub fn user_from_jwt(cfg: &Config, token: &str) -> Option<uuid::Uuid> {
+    let data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .ok()?;
+    uuid::Uuid::parse_str(&data.claims.sub).ok()
+}
+
 /// Lightweight email format check ("合规").
 pub fn valid_email(e: &str) -> bool {
     let e = e.trim();

@@ -5041,21 +5041,65 @@ async function loadBackendModels() {
     /* offline / backend unreachable → keep built-in defaults */
   }
 }
-// Auto-configure the API key from the backend so the user never pastes one.
-async function bootstrapMichaelKey() {
+// Cached profile of the logged-in user (plan / credits), from /api/me.
+let _michaelUser = null;
+
+// Restore the login session from the saved token so the IDE stays logged in,
+// and use that token as the gateway credential (so usage bills THIS user).
+async function restoreMichaelSession() {
   try {
+    const token = localStorage.getItem("michael_token");
+    if (!token) { _updateLoginUI(); return; }
+    const r = await fetch(_michaelBase() + "/api/me", { headers: { Authorization: "Bearer " + token } });
+    if (!r.ok) { localStorage.removeItem("michael_token"); _loggedInEmail = null; _michaelUser = null; _updateLoginUI(); return; }
+    const u = await r.json();
+    _michaelUser = u;
+    _loggedInEmail = u.email || null;
     await loadConfigAsync();
     const cur = loadConfig();
-    if (cur.apiKey && cur.apiKey.startsWith("sk-michael-")) return; // already set
-    const r = await fetch(MICHAEL_API + "/api/ide-key");
-    if (!r.ok) return;
-    const j = await r.json();
-    if (j && j.api_key) {
-      await saveConfig({ ...cur, apiKey: j.api_key });
-      refreshModelBadge();
-    }
-  } catch (_) { /* ignore — user can still paste a key manually */ }
+    if (cur.apiKey !== token) await saveConfig({ ...cur, apiKey: token });
+    _updateLoginUI();
+    refreshModelBadge();
+  } catch (_) { _updateLoginUI(); }
 }
+
+function openLoginDialog() {
+  try {
+    const dlg = $("loginDialog");
+    if (!dlg) return;
+    _resetLoginUI();
+    const em = $("loginEmail"); if (em) em.value = "";
+    dlg.showModal();
+    setTimeout(() => em?.focus(), 0);
+  } catch (_) {}
+}
+
+// Gate before any AI use: require login + (active membership OR remaining credits).
+async function michaelAccessGate() {
+  const token = localStorage.getItem("michael_token");
+  if (!token) { showToast("请先登录账号"); openLoginDialog(); return false; }
+  let u;
+  try {
+    const r = await fetch(_michaelBase() + "/api/me", { headers: { Authorization: "Bearer " + token } });
+    if (r.status === 401 || r.status === 403) {
+      localStorage.removeItem("michael_token"); _loggedInEmail = null; _michaelUser = null; _updateLoginUI();
+      showToast("登录已失效，请重新登录"); openLoginDialog(); return false;
+    }
+    if (!r.ok) { showToast("无法验证账号，请稍后再试"); return false; }
+    u = await r.json();
+  } catch (_) { showToast("无法连接服务器"); return false; }
+  _michaelUser = u; _loggedInEmail = u.email || _loggedInEmail; _updateLoginUI();
+  const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
+  const hasCredits = (u.credits_cents || 0) > 0;
+  if (!active && !hasCredits) {
+    alert("你还不是会员，且额度已用完。\n请在后台开通会员或充值后再使用。");
+    return false;
+  }
+  const cur = loadConfig();
+  if (cur.apiKey !== token) await saveConfig({ ...cur, apiKey: token });
+  return true;
+}
+
 function currentModel() {
   return loadConfig().model || "";
 }
@@ -5158,9 +5202,8 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modelMenu.hidden) closeModelMenu();
 });
-// Auto-configure: fetch a working API key + the admin-curated model catalogue
-// from the central backend, so the IDE works with zero manual setup.
-bootstrapMichaelKey();
+// Load the admin-curated model catalogue into the picker. (Login session +
+// the user's gateway credential are restored later via restoreMichaelSession.)
 loadBackendModels();
 
 let _chatSessions = [];
@@ -6002,6 +6045,8 @@ async function _gatherAgentContext() {
 }
 
 async function sendPrompt(text, attachedImages = []) {
+  // Require login + active membership or credits before any AI call.
+  if (!(await michaelAccessGate())) return;
   const config = loadConfig();
   if (!config.baseUrl || !config.apiKey || !config.model) {
     openSettings();
@@ -11143,7 +11188,9 @@ if (settingsDropdown) {
       if (dlg) { _resetLoginUI(); const em = $("loginEmail"); if (em) em.value = ""; dlg.showModal(); setTimeout(() => em?.focus(), 0); }
     }
     else if (action === "logout") {
-      _loggedInEmail = null;
+      _loggedInEmail = null; _michaelUser = null;
+      try { localStorage.removeItem("michael_token"); } catch (_) {}
+      const c = loadConfig(); saveConfig({ ...c, apiKey: "" });
       _updateLoginUI();
     }
     else if (action === "profile") {
@@ -11209,6 +11256,9 @@ function _finishLogin(result) {
   if (result && result.success) {
     $("loginDialog")?.close();
     _loggedInEmail = _loginEmail;
+    if (result.user) _michaelUser = result.user;
+    // Use the login token as the gateway credential so chat bills this user.
+    if (result.token) { const c = loadConfig(); saveConfig({ ...c, apiKey: result.token }); }
     _updateLoginUI();
     _resetLoginUI();
   } else {
@@ -13059,6 +13109,8 @@ if (inTauri) {
   }).catch(() => {});
 }
 restoreSession();
+// Restore the Michael login session (keeps the user logged in across restarts).
+restoreMichaelSession();
 
 let _cachedHomeDir = "";
 if (inTauri) {
