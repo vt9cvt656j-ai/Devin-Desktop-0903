@@ -4893,14 +4893,20 @@ async function migrateFromLocalStorage() {
   } catch { /* ignore corrupt legacy data */ }
 }
 
+// Central model gateway. "Custom model mode" (per-user baseUrl/model) is removed:
+// every chat routes through this gateway; only the API key + picked model vary.
+const MICHAEL_API = (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
+
 function loadConfig() {
-  return _cfgCache || _DEFAULT_AI_CONFIG;
+  const c = _cfgCache || _DEFAULT_AI_CONFIG;
+  // Always force the gateway as the base URL — ignore any stale/custom baseUrl.
+  return { ...c, baseUrl: MICHAEL_API };
 }
 
 const _DEFAULT_AI_CONFIG = {
-  baseUrl: "https://api.deepseek.com/v1",
+  baseUrl: MICHAEL_API,
   apiKey: "",
-  model: "deepseek-chat",
+  model: "",
 };
 
 async function loadConfigAsync() {
@@ -4930,41 +4936,9 @@ function refreshModelBadge() {
 }
 
 // ---- model picker (bottom-bar dropdown) ----
-// Central backend serving the admin-curated model catalogue (/api/models).
-const MICHAEL_API = (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
-let MODEL_GROUPS = [
-  {
-    label: "OpenAI",
-    models: [
-      { id: "gpt-4o", name: "GPT-4o", meta: "Most capable" },
-      { id: "gpt-4o-mini", name: "GPT-4o mini", meta: "Fast · cheap" },
-      { id: "gpt-4.1", name: "GPT-4.1", meta: "" },
-      { id: "o3-mini", name: "o3-mini", meta: "Reasoning" },
-    ],
-  },
-  {
-    label: "Anthropic",
-    models: [
-      { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", meta: "" },
-      { id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet", meta: "" },
-      { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", meta: "Fast" },
-    ],
-  },
-  {
-    label: "DeepSeek",
-    models: [
-      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", meta: "Most capable" },
-      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", meta: "Fast" },
-    ],
-  },
-  {
-    label: "Local",
-    models: [
-      { id: "llama3.1", name: "Llama 3.1", meta: "Ollama" },
-      { id: "qwen2.5-coder", name: "Qwen2.5 Coder", meta: "Ollama" },
-    ],
-  },
-];
+// No built-in/custom models — the list is fetched from the central backend
+// (/api/models) by loadBackendModels(). (MICHAEL_API is defined above.)
+let MODEL_GROUPS = [];
 
 const modelPicker = $("modelPicker");
 const modelPickerBtn = $("modelPickerBtn");
@@ -5120,6 +5094,7 @@ async function selectModel(model) {
 
 function openModelMenu() {
   buildModelMenu();
+  loadBackendModels(); // refresh from backend each open (newly-enabled models)
   modelMenu.hidden = false;
   modelPicker.classList.add("is-open");
   modelPickerBtn.setAttribute("aria-expanded", "true");
@@ -8782,11 +8757,9 @@ function openSettings() {
 }
 $("settingsForm").addEventListener("submit", async (e) => {
   if (e.submitter && e.submitter.value === "save") {
-    await saveConfig({
-      baseUrl: $("cfgBaseUrl").value.trim(),
-      apiKey: $("cfgApiKey").value.trim(),
-      model: $("cfgModel").value.trim(),
-    });
+    // Custom model mode removed: only the API key is editable; the base URL is
+    // always the gateway and the model comes from the picker.
+    await saveConfig({ ...loadConfig(), apiKey: $("cfgApiKey").value.trim() });
     refreshModelBadge();
     showToast(t("settings.saved"));
   }
