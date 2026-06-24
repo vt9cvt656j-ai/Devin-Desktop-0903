@@ -4998,11 +4998,14 @@ function brandOf(id = "") {
   return { sym: "i-cpu", cls: "" };
 }
 
-/** Resolve a brand from an explicit provider key, falling back to the model id. */
+/** Resolve a brand: detect from the model id first (most reliable), then fall
+ *  back to the connection's explicit provider/brand. */
 function brandFor(m) {
+  const byId = brandOf((m && m.id) || "");
+  if (byId.sym !== "i-cpu") return byId;
   const key = (m && m.brand ? m.brand : "").toLowerCase();
   if (BRAND_SYM[key]) return { sym: BRAND_SYM[key], cls: "brand--" + key };
-  return brandOf((m && m.id) || "");
+  return byId;
 }
 
 /** Friendly display name for a model id (falls back to the raw id). */

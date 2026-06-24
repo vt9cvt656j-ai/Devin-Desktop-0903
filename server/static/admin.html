@@ -671,13 +671,46 @@ function renderModels(){
       </div>
     </div>
     <div class="toolbar"><button class="btn" id="mdReload">刷新</button></div>
-    <div class="box"><div id="modelsTable"><div class="muted">加载中…</div></div></div>
+    <div class="box" style="margin-bottom:20px"><div id="modelsTable"><div class="muted">加载中…</div></div></div>
+
+    <div class="box">
+      <h2>IDE 接入密钥 (Michael API Key)</h2>
+      <div style="padding:18px 20px">
+        <div class="t" style="margin-bottom:12px">在 IDE 设置里：<b>baseUrl</b> 填 <span class="codeval">http://209.97.172.123</span>，<b>API Key</b> 填下方生成的密钥，模型选你已启用的即可。调用按该密钥所属账号的额度计费。</div>
+        <div class="gen-form" style="margin-bottom:12px">
+          归属用户邮箱(留空=自己) <input id="akEmail" placeholder="留空给当前管理员" style="min-width:200px">
+          备注 <input id="akLabel" placeholder="如 我的IDE" style="min-width:120px">
+          <button class="btn b" id="akGen">生成新密钥</button>
+        </div>
+        <div id="akResult" style="margin-bottom:10px"></div>
+        <div id="akTable"><div class="muted">加载中…</div></div>
+      </div>
+    </div>
   </div>`;
 }
 function mountModels(){
   $("mdAdd").addEventListener("click",addModel);
   $("mdReload").addEventListener("click",loadModels);
-  loadModels();
+  $("akGen").addEventListener("click",genApiKey);
+  loadModels(); loadApiKeys();
+}
+async function genApiKey(){
+  const body={ label:$("akLabel").value.trim() }; const em=$("akEmail").value.trim(); if(em) body.email=em;
+  try{
+    const r=await api("/api/admin/apikeys",{method:"POST",body:JSON.stringify(body)});
+    $("akResult").innerHTML=`<div style="background:#e6f4ea;border:1px solid #b7e0c4;border-radius:8px;padding:12px"><div class="t" style="margin-bottom:6px">密钥已生成(仅显示这一次,请复制保存):</div><div style="display:flex;gap:8px;align-items:center"><input readonly value="${esc(r.api_key)}" style="flex:1;font-family:ui-monospace,monospace"><button class="btn sm" id="akCopy">复制</button></div></div>`;
+    $("akCopy").addEventListener("click",()=>navigator.clipboard.writeText(r.api_key).then(()=>toast("已复制"),()=>toast("复制失败")));
+    $("akLabel").value=""; loadApiKeys();
+  }catch(e){ toast(e.message||"生成失败"); }
+}
+async function loadApiKeys(){
+  try{
+    const rows=await api("/api/admin/apikeys"); const w=$("akTable"); if(!w) return;
+    if(!rows.length){ w.innerHTML='<div class="muted">还没有密钥</div>'; return; }
+    const body=rows.map(k=>`<tr><td class="codeval">${esc(k.key_masked)}</td><td class="email">${esc(k.email||"—")}</td><td>${esc(k.label||"")}</td><td class="t">${fmt(k.created_at)}</td><td class="t">${k.last_used_at?fmt(k.last_used_at):"未用"}</td><td><button class="btn sm danger" data-delak="${k.id}">吊销</button></td></tr>`).join("");
+    w.innerHTML=`<table><thead><tr><th>密钥</th><th>归属</th><th>备注</th><th>创建</th><th>最近使用</th><th>操作</th></tr></thead><tbody>${body}</tbody></table>`;
+    w.querySelectorAll("button[data-delak]").forEach(b=>b.addEventListener("click",async()=>{ if(!confirm("吊销该密钥?")) return; try{ await api(`/api/admin/apikeys/${b.dataset.delak}`,{method:"DELETE"}); toast("已吊销"); loadApiKeys(); }catch(e){ toast(e.message||"失败"); } }));
+  }catch(e){ if($("akTable")) $("akTable").innerHTML=`<div class="muted">加载失败：${esc(e.message)}</div>`; }
 }
 async function addModel(){
   const body={

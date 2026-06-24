@@ -1,5 +1,9 @@
+use axum::body::Body;
 use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -311,4 +315,170 @@ pub async fn admin_usage(State(state): State<AppState>, claims: Claims) -> ApiRe
     let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM model_usage").fetch_one(&state.db).await?;
     let spent: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_cents),0)::bigint FROM model_usage").fetch_one(&state.db).await?;
     Ok(Json(json!({ "calls": calls, "spent_cents": spent })))
+}
+
+// ================= Michael API keys + OpenAI-compatible gateway =================
+
+#[derive(sqlx::FromRow)]
+struct ApiKeyRow {
+    id: uuid::Uuid,
+    label: String,
+    api_key: String,
+    email: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn gen_api_key() -> String {
+    let mut rng = rand::thread_rng();
+    let hex: String = (0..40).map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap()).collect();
+    format!("sk-michael-{hex}")
+}
+
+fn mask_key(k: &str) -> String {
+    if k.len() <= 8 {
+        return "••••".into();
+    }
+    format!("{}…{}", &k[..11.min(k.len())], &k[k.len() - 4..])
+}
+
+#[derive(Deserialize)]
+pub struct ApiKeyReq {
+    pub label: Option<String>,
+    pub email: Option<String>,
+}
+
+/// POST /api/admin/apikeys — generate a gateway key for the admin (or a given user's email).
+pub async fn admin_create_apikey(State(state): State<AppState>, claims: Claims, Json(req): Json<ApiKeyReq>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let uid = match req.email.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(email) => sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE email = $1")
+            .bind(email)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::bad("用户不存在"))?,
+        None => uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?,
+    };
+    let key = gen_api_key();
+    sqlx::query("INSERT INTO api_keys (user_id, api_key, label) VALUES ($1,$2,$3)")
+        .bind(uid)
+        .bind(&key)
+        .bind(req.label.unwrap_or_default())
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true, "api_key": key })))
+}
+
+/// GET /api/admin/apikeys — list keys (masked) with their owner email.
+pub async fn admin_list_apikeys(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let rows = sqlx::query_as::<_, ApiKeyRow>(
+        "SELECT k.id, k.label, k.api_key, u.email, k.created_at, k.last_used_at \
+         FROM api_keys k LEFT JOIN users u ON u.id = k.user_id ORDER BY k.created_at DESC LIMIT 200",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| json!({ "id": r.id, "label": r.label, "email": r.email, "key_masked": mask_key(&r.api_key), "created_at": r.created_at, "last_used_at": r.last_used_at }))
+        .collect();
+    Ok(Json(json!(list)))
+}
+
+/// DELETE /api/admin/apikeys/:id
+pub async fn admin_delete_apikey(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let res = sqlx::query("DELETE FROM api_keys WHERE id = $1").bind(id).execute(&state.db).await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::bad("密钥不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
+/// key (Bearer). Resolves `model` to the connection that exposes it, forwards
+/// the request (streaming passthrough), and bills the key owner's credits.
+pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, Json(mut body): Json<serde_json::Value>) -> Result<Response, AppError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE api_key = $1")
+        .bind(&token)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("API Key 无效"))?;
+    let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1").bind(&token).execute(&state.db).await;
+
+    if !body.is_object() {
+        return Err(AppError::bad("请求体需为 JSON 对象"));
+    }
+    let model_id = body.get("model").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| AppError::bad("缺少 model"))?;
+
+    let conns = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
+        .fetch_all(&state.db)
+        .await?;
+    let conn = conns
+        .into_iter()
+        .find(|m| allowed_ids(m).contains(&model_id))
+        .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+
+    if conn.rate > 0.0 {
+        let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
+        if bal <= 0 {
+            return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: "额度不足，请充值".into() });
+        }
+    }
+
+    let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let url = format!("{}/chat/completions", api_base(&conn.base_url));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", conn.api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
+    let status = resp.status();
+
+    async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64) {
+        if cost > 0 {
+            let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2").bind(cost).bind(uid).execute(&state.db).await;
+        }
+        let _ = sqlx::query("INSERT INTO model_usage (user_id, model_id, cost_cents) VALUES ($1,$2,$3)").bind(uid).bind(conn_id).bind(cost).execute(&state.db).await;
+    }
+
+    if streaming {
+        // Can't read token usage from a passed-through stream, so charge a flat
+        // per-call fee (rounded rate). Stream the upstream SSE straight through.
+        bill(&state, uid, conn.id, conn.rate.round() as i64).await;
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
+        let out = Response::builder()
+            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
+            .header(axum::http::header::CONTENT_TYPE, ct)
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(resp.bytes_stream()))
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        Ok(out)
+    } else {
+        let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+        if !status.is_success() {
+            return Err(AppError { status: StatusCode::BAD_GATEWAY, msg: format!("模型供应商错误 {}: {}", status.as_u16(), data) });
+        }
+        let tokens = data.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
+        bill(&state, uid, conn.id, ((tokens as f64) / 1000.0 * conn.rate).round() as i64).await;
+        Ok(Json(data).into_response())
+    }
 }
