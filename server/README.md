@@ -1,0 +1,67 @@
+# Michael 总后台 — central real-time backend
+
+The central server for the Michael platform: shared accounts, a real-time admin
+dashboard, and an API the IDE talks to (replacing the IDE's local-only SQLite auth).
+
+## Stack (chosen for a large, high-traffic project)
+
+| Layer | Choice | Why |
+|---|---|---|
+| Database | **PostgreSQL 17** | Modern default; far better than MySQL for write-heavy, concurrent, JSON, analytical workloads; scales via partitioning / Citus |
+| Backend | **Rust + Axum** | Highest raw throughput; same language as the IDE backend (sqlx shared) |
+| Real-time | **WebSocket + Redis Pub/Sub** | Stateless app nodes, fanned out via a Redis backplane → horizontal scale |
+| Cache/Sessions | **Redis** | Verification-code TTL, online presence, future rate-limiting |
+| Auth | **JWT (HS256) + bcrypt** | Stateless tokens; password hashing |
+
+Everything is config-driven (env / `.env`); **no secrets in code or git**.
+
+## API
+
+```
+POST /api/auth/check-email   { email }            -> { exists }
+POST /api/auth/send-code     { email }            -> { sent }       # emails a 6-digit code
+POST /api/auth/register      { email, password, code } -> { token, user }
+POST /api/auth/login         { email, password }  -> { token, user }
+POST /api/auth/verify-code   { email, code }      -> { token, user } # passwordless login
+GET  /api/me                 (Bearer token)       -> user
+GET  /api/admin/users        (admin)              -> [user]
+GET  /api/admin/stats        (admin)              -> { total_users, today_users, online }
+GET  /ws                     -> WebSocket live event feed (register/login/…)
+GET  /health                 -> "ok"
+```
+
+## Run locally / on the server (Docker)
+
+```bash
+cp .env.example .env      # fill JWT_SECRET, POSTGRES_PASSWORD, QQ_SMTP_* …
+docker compose up -d --build
+curl localhost:8080/health
+```
+
+Postgres + Redis + the backend come up together. Without `QQ_SMTP_*` set, codes
+are printed to the server log (dev mode) instead of emailed.
+
+## Deploy to your server
+
+From a machine that can reach the server:
+
+```bash
+SERVER_HOST=103.39.67.244 SERVER_PORT=19537 SERVER_USER=root ./deploy.sh
+```
+
+It rsyncs the source, then runs `docker compose up -d --build` remotely. Put a
+real `.env` on the server first (the script reminds you).
+
+## Make yourself an admin
+
+After registering once:
+
+```sql
+UPDATE users SET role = 'admin' WHERE email = 'you@qq.com';
+```
+
+## Security
+
+- Real `.env` is git-ignored; never commit secrets.
+- Put this behind Nginx + TLS in production; only expose 443.
+- Use SSH keys (not the root password) and a firewall on the VPS.
