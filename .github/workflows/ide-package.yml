@@ -77,10 +77,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: michael-ide-${{ runner.os }}
-          if-no-files-found: ignore
+          # Fail loudly if the bundle paths stop matching (the cargo target dir
+          # is ide/target, NOT ide/src-tauri/target — the `ide/**` glob covers
+          # both that and the macOS universal-apple-darwin subdir).
+          if-no-files-found: error
           retention-days: 14
           path: |
-            ide/src-tauri/target/**/release/bundle/dmg/*.dmg
-            ide/src-tauri/target/**/release/bundle/macos/*.app
-            ide/src-tauri/target/**/release/bundle/msi/*.msi
-            ide/src-tauri/target/**/release/bundle/nsis/*.exe
+            ide/**/release/bundle/dmg/*.dmg
+            ide/**/release/bundle/macos/*.app
+            ide/**/release/bundle/msi/*.msi
+            ide/**/release/bundle/nsis/*.exe
