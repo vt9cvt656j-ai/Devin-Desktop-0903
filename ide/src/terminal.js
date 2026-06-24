@@ -43,6 +43,22 @@ const termResizeObserver = new ResizeObserver(() => {
   }
 });
 
+// Robustly fit the active terminal: wait until its container actually has a
+// size (the panel may have just become visible / not laid out yet), then fit,
+// repaint and focus. Fixes the intermittent "terminal opens blank" issue.
+function fitActive(tries = 10) {
+  const tab = termTabs[activeTermTab];
+  if (!tab || !termIsOpen()) return;
+  const el = tab.container;
+  if (el && el.clientWidth > 4 && el.clientHeight > 4) {
+    try { tab.fit.fit(); } catch {}
+    try { tab.term.refresh(0, Math.max(0, tab.term.rows - 1)); } catch {}
+    try { tab.term.focus(); } catch {}
+  } else if (tries > 0) {
+    requestAnimationFrame(() => fitActive(tries - 1));
+  }
+}
+
 function renderTermTabs() {
   if (!termTabBar) return;
   termTabBar.innerHTML = "";
@@ -72,10 +88,7 @@ function switchTermTab(idx) {
   const tab = termTabs[idx];
   tab.container.hidden = false;
   renderTermTabs();
-  requestAnimationFrame(() => {
-    try { tab.fit.fit(); } catch {}
-    tab.term.focus();
-  });
+  fitActive();
 }
 
 async function createTermTab() {
@@ -183,9 +196,11 @@ async function openTerminal() {
 
   if (termTabs.length === 0) {
     await createTermTab();
-  } else {
-    switchTermTab(activeTermTab);
+  } else if (activeTermTab >= 0) {
+    // reopen: switchTermTab early-returns when idx===active, so show + refit here.
+    termTabs[activeTermTab].container.hidden = false;
   }
+  fitActive();
 }
 
 function closeTerminal() {
