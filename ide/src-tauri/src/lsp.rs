@@ -366,7 +366,18 @@ pub fn lsp_check_available(lang: String) -> bool {
     }
     #[cfg(windows)]
     {
-        true
+        if std::path::Path::new(cmd).exists() {
+            return true;
+        }
+        let path = process_util::augmented_path(None);
+        for dir in path.split(';').filter(|d| !d.is_empty()) {
+            for ext in ["", ".exe", ".cmd", ".bat"] {
+                if std::path::Path::new(&format!("{dir}\\{cmd}{ext}")).exists() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

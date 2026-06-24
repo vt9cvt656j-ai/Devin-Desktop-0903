@@ -44,5 +44,23 @@ pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
     cmd.to_string()
 }
 
+/// Windows: prepend the workspace's `node_modules\.bin` to the existing PATH.
+#[cfg(windows)]
+pub fn augmented_path(workspace: Option<&str>) -> String {
+    let cur = std::env::var("PATH").unwrap_or_default();
+    match workspace.filter(|w| !w.is_empty()) {
+        Some(ws) if cur.is_empty() => format!("{ws}\\node_modules\\.bin"),
+        Some(ws) => format!("{ws}\\node_modules\\.bin;{cur}"),
+        None => cur,
+    }
+}
+
+/// Windows: let the OS resolve the command via PATH + PATHEXT (.exe/.cmd/.bat),
+/// so just hand the name back unchanged.
+#[cfg(windows)]
+pub fn resolve_command(cmd: &str, _workspace: Option<&str>) -> String {
+    cmd.to_string()
+}
+
 /// Maximum number of concurrent LSP or DAP processes allowed.
 pub const MAX_CHILD_PROCESSES: usize = 16;
