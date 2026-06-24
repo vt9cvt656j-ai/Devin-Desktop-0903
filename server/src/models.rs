@@ -271,6 +271,14 @@ pub async fn chat(State(state): State<AppState>, claims: Claims, Path(id): Path<
         return Err(AppError::bad("该连接未开放任何模型，请在后台编辑勾选"));
     }
     body["model"] = json!(chosen);
+
+    // Weak-vision models (deepseek/minimax/glm/…) can't read images well. If the
+    // request has images and the chosen model isn't vision-native, let gpt-5.5
+    // describe the images first, then hand the text to the chosen model.
+    if needs_vision_help(&chosen) {
+        vision_preprocess(&state, &mut body).await;
+    }
+
     let url = format!("{}/chat/completions", api_base(&model.base_url));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -421,6 +429,100 @@ pub async fn ide_key(State(state): State<AppState>) -> ApiResult<Json<serde_json
         }
     };
     Ok(Json(json!({ "api_key": key })))
+}
+
+/// A model id whose vision is weak/absent → route images through gpt-5.5 first.
+fn needs_vision_help(model_id: &str) -> bool {
+    let m = model_id.to_lowercase();
+    let native = m.contains("gpt") || m.contains("gemini") || m.contains("claude")
+        || m.contains("vision") || m.contains("-vl") || m.contains("image")
+        || m.contains("o3") || m.contains("o4");
+    !native
+}
+
+/// If the request carries images, ask gpt-5.5 to describe them, then rewrite the
+/// messages to plain text (description injected) so a non-vision model can work
+/// from it. No-op if there are no images or no gpt-5.5 connection is configured.
+async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
+    let mut images: Vec<serde_json::Value> = Vec::new();
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                for part in arr {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        images.push(part.clone());
+                    }
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        return;
+    }
+    // best-effort: have gpt-5.5 describe the images (may fail → we still strip them)
+    let mut desc: Option<String> = None;
+    let conns = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    if let Some(vconn) = conns.into_iter().find(|m| allowed_ids(m).iter().any(|id| id.eq_ignore_ascii_case("gpt-5.5"))) {
+        let mut vcontent = vec![json!({
+            "type": "text",
+            "text": "请详细、客观地描述这些图片的全部内容（文字、数据、图表、代码、界面元素、布局、配色等），让一个无法读图的模型也能据此完成工作。只输出描述本身。"
+        })];
+        vcontent.extend(images.clone());
+        let payload = json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": vcontent }], "stream": false });
+        if let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(90)).build() {
+            let url = format!("{}/chat/completions", api_base(&vconn.base_url));
+            if let Ok(r) = client.post(&url).header("Authorization", format!("Bearer {}", vconn.api_key)).json(&payload).send().await {
+                if let Ok(d) = r.json::<serde_json::Value>().await {
+                    if let Some(s) = d["choices"][0]["message"]["content"].as_str() {
+                        if !s.trim().is_empty() {
+                            desc = Some(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let note = match desc {
+        Some(d) => format!("【图片内容（由 GPT-5.5 视觉识别）】：\n{}", d),
+        None => "【图片】（视觉识别暂不可用，无法读取图片内容）".to_string(),
+    };
+    // ALWAYS strip images → plain text so a non-vision model never chokes on them.
+    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let mut last_img: Option<usize> = None;
+        for (i, m) in msgs.iter_mut().enumerate() {
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()).cloned() {
+                let mut text = String::new();
+                let mut had = false;
+                for part in &arr {
+                    match part.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                        Some("image_url") => had = true,
+                        _ => {}
+                    }
+                }
+                m["content"] = json!(text);
+                if had {
+                    last_img = Some(i);
+                }
+            }
+        }
+        if let Some(idx) = last_img {
+            if let Some(m) = msgs.get_mut(idx) {
+                let cur = m.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                m["content"] = json!(format!("{}\n\n{}", cur, note));
+            }
+        }
+    }
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
