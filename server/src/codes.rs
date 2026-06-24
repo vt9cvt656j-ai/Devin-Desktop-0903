@@ -146,23 +146,56 @@ pub async fn admin_delete(
 }
 
 // ---------- apply a grant to a user (shared by redeem + admin grant) ----------
+/// Per-plan quota spec: (total_cents, window_cap_cents, weekly_cap_cents, duration_days).
+/// Amounts are USD cents; weekly 0 = unlimited.
+pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
+    match plan {
+        "trial" => Some((5_000, 5_000, 0, 1)),       // $50 total, $50/5.5h, 1 day, ¥8.8
+        "basic" => Some((33_000, 3_000, 0, 30)),     // $330 total, $30/5.5h, 30 days, ¥88
+        "pro" => Some((65_000, 6_000, 0, 30)),       // $650 total, $60/5.5h, 30 days, ¥188
+        "power" => Some((180_000, 15_000, 0, 30)),   // $1800 total, $150/5.5h, 30 days, ¥488
+        "ultra" => Some((500_000, 30_000, 0, 30)),   // $5000 total, $300/5.5h, 30 days
+        _ => None,
+    }
+}
+
 pub(crate) async fn apply_plan(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     uid: uuid::Uuid,
     plan: &str,
     days: i32,
 ) -> ApiResult<()> {
-    // Extend from the later of (now, existing expiry) so stacking codes adds up.
-    sqlx::query(
-        "UPDATE users SET plan = $1, \
-         plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + ($2 * interval '1 day'), \
-         updated_at = now() WHERE id = $3",
-    )
-    .bind(plan)
-    .bind(days)
-    .bind(uid)
-    .execute(&mut **tx)
-    .await?;
+    if let Some((total, window, weekly, spec_days)) = plan_spec(plan) {
+        let dur = if days > 0 { days } else { spec_days };
+        // Grant: extend expiry, (re)allocate the quota pools, start fresh windows.
+        sqlx::query(
+            "UPDATE users SET plan = $1, \
+             plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + ($2 * interval '1 day'), \
+             quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
+             quota_window_reset_at = now() + interval '5 hours 30 minutes', \
+             quota_weekly_cap_cents = $5, quota_week_used_cents = 0, quota_week_reset_at = now() + interval '7 days', \
+             updated_at = now() WHERE id = $6",
+        )
+        .bind(plan)
+        .bind(dur)
+        .bind(total)
+        .bind(window)
+        .bind(weekly)
+        .bind(uid)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE users SET plan = $1, \
+             plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + ($2 * interval '1 day'), \
+             updated_at = now() WHERE id = $3",
+        )
+        .bind(plan)
+        .bind(days)
+        .bind(uid)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 

@@ -22,6 +22,13 @@ pub struct User {
     pub plan: String,
     pub plan_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub credits_cents: i64,
+    pub quota_total_cents: i64,
+    pub quota_window_cap_cents: i64,
+    pub quota_window_cents: i64,
+    pub quota_window_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub quota_weekly_cap_cents: i64,
+    pub quota_week_used_cents: i64,
+    pub quota_week_reset_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -236,6 +243,18 @@ pub async fn verify_code(State(state): State<AppState>, Json(req): Json<CodeReq>
 
 pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<User>> {
     let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    // Apply the 5h30m window refill + weekly reset so the profile shows current quota.
+    let _ = sqlx::query(
+        "UPDATE users SET \
+         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await;
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)

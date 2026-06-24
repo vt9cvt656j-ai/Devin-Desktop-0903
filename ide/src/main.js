@@ -5100,6 +5100,49 @@ async function michaelAccessGate() {
   return true;
 }
 
+// Personal profile: account, avatar, membership badge, hourly/weekly/total quota.
+async function showProfile() {
+  const token = localStorage.getItem("michael_token");
+  if (!token) { showToast("请先登录账号"); openLoginDialog(); return; }
+  let u;
+  try {
+    const r = await fetch(_michaelBase() + "/api/me", { headers: { Authorization: "Bearer " + token } });
+    if (r.status === 401 || r.status === 403) { localStorage.removeItem("michael_token"); _loggedInEmail = null; _updateLoginUI(); openLoginDialog(); return; }
+    if (!r.ok) { showToast("获取资料失败"); return; }
+    u = await r.json();
+  } catch (_) { showToast("无法连接服务器"); return; }
+  const usd = (c) => "$" + (((c || 0) / 100)).toFixed(2);
+  const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const planNames = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
+  const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
+  const fmtT = (t) => { if (!t) return "—"; const d = new Date(t); return isNaN(d) ? "—" : d.toLocaleString("zh-CN", { hour12: false }); };
+  const weekly = (u.quota_weekly_cap_cents > 0) ? usd(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents)) : "无上限";
+  const av = (u.email || "?").slice(0, 1).toUpperCase();
+  const badge = active
+    ? `<span style="background:#1a73e8;color:#fff;border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600">${esc2(planNames[u.plan] || u.plan)} 会员</span>`
+    : `<span style="background:#5f6368;color:#fff;border-radius:12px;padding:2px 10px;font-size:12px">未开通会员</span>`;
+  const row = (label, val, sub) => `<div style="display:flex;justify-content:space-between;align-items:baseline;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.08)"><span style="color:#9aa0a6">${label}</span><span style="text-align:right"><b style="font-size:17px">${val}</b>${sub ? `<div style="color:#9aa0a6;font-size:11px">${sub}</div>` : ""}</span></div>`;
+  const ov = document.createElement("div");
+  ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);display:grid;place-items:center;z-index:9999;font-family:inherit";
+  ov.innerHTML = `<div style="background:#1f2127;color:#e8eaed;border:1px solid rgba(255,255,255,.12);border-radius:14px;width:420px;max-width:92vw;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:14px;padding:22px 24px;border-bottom:1px solid rgba(255,255,255,.08)">
+      <span style="width:48px;height:48px;border-radius:50%;background:#1a73e8;color:#fff;display:grid;place-items:center;font-size:22px;font-weight:600">${esc2(av)}</span>
+      <div style="flex:1;min-width:0"><div style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc2(u.email || "")}</div><div style="margin-top:4px">${badge}</div></div>
+      <span id="pfClose" style="cursor:pointer;color:#9aa0a6;font-size:24px;line-height:1">&times;</span>
+    </div>
+    <div style="padding:8px 24px 20px">
+      ${row("小时额度", usd(u.quota_window_cents), "每 5.5 小时刷新 · 下次 " + fmtT(u.quota_window_reset_at))}
+      ${row("周额度", weekly, u.quota_weekly_cap_cents > 0 ? ("本周已用 " + usd(u.quota_week_used_cents)) : "")}
+      ${row("总额度", usd(u.quota_total_cents), active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "")}
+      ${(u.credits_cents > 0) ? row("按量余额", usd(u.credits_cents), "非会员/额外充值") : ""}
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  ov.querySelector("#pfClose").addEventListener("click", close);
+}
+
 function currentModel() {
   return loadConfig().model || "";
 }
@@ -11194,7 +11237,7 @@ if (settingsDropdown) {
       _updateLoginUI();
     }
     else if (action === "profile") {
-      alert("个人资料功能开发中");
+      showProfile();
     }
   });
 }

@@ -460,15 +460,39 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         .find(|m| allowed_ids(m).contains(&model_id))
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
-    // Access gate: must have an active membership OR positive credits.
-    let (plan, plan_exp, credits): (String, Option<chrono::DateTime<chrono::Utc>>, i64) =
-        sqlx::query_as("SELECT plan, plan_expires_at, credits_cents FROM users WHERE id = $1")
+    // Refill the 5h30m window + reset the weekly counter when due.
+    sqlx::query(
+        "UPDATE users SET \
+         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+         WHERE id = $1",
+    )
+    .bind(uid)
+    .execute(&state.db)
+    .await?;
+
+    // Access gate: active-membership quota (window/total/weekly) OR pay-as-you-go credits.
+    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64) =
+        sqlx::query_as("SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1")
             .bind(uid)
             .fetch_one(&state.db)
             .await?;
     let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
-    if !plan_active && credits <= 0 {
-        return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: "请先开通会员或充值额度".into() });
+    let quota_ok = plan_active && q_total > 0 && q_window > 0 && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let use_quota = quota_ok;
+    if !quota_ok && credits <= 0 {
+        let msg = if plan_active && q_total <= 0 {
+            "总额度已用完"
+        } else if plan_active && q_window <= 0 {
+            "本时段额度已用完，请等待刷新（每 5.5 小时）"
+        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
+            "本周额度已用完"
+        } else {
+            "请先开通会员或充值额度"
+        };
+        return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: msg.into() });
     }
 
     let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -486,9 +510,21 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
     let status = resp.status();
 
-    async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64) {
+    async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool) {
         if cost > 0 {
-            let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2").bind(cost).bind(uid).execute(&state.db).await;
+            if use_quota {
+                let _ = sqlx::query(
+                    "UPDATE users SET quota_total_cents = GREATEST(quota_total_cents - $1, 0), \
+                     quota_window_cents = GREATEST(quota_window_cents - $1, 0), \
+                     quota_week_used_cents = quota_week_used_cents + $1 WHERE id = $2",
+                )
+                .bind(cost)
+                .bind(uid)
+                .execute(&state.db)
+                .await;
+            } else {
+                let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2").bind(cost).bind(uid).execute(&state.db).await;
+            }
         }
         let _ = sqlx::query("INSERT INTO model_usage (user_id, model_id, cost_cents) VALUES ($1,$2,$3)").bind(uid).bind(conn_id).bind(cost).execute(&state.db).await;
     }
@@ -496,7 +532,7 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     if streaming {
         // Can't read token usage from a passed-through stream, so charge a flat
         // per-call fee (rounded rate). Stream the upstream SSE straight through.
-        bill(&state, uid, conn.id, conn.rate.round() as i64).await;
+        bill(&state, uid, conn.id, conn.rate.round() as i64, use_quota).await;
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -516,7 +552,7 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
             return Err(AppError { status: StatusCode::BAD_GATEWAY, msg: format!("模型供应商错误 {}: {}", status.as_u16(), data) });
         }
         let tokens = data.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
-        bill(&state, uid, conn.id, ((tokens as f64) / 1000.0 * conn.rate).round() as i64).await;
+        bill(&state, uid, conn.id, ((tokens as f64) / 1000.0 * conn.rate).round() as i64, use_quota).await;
         Ok(Json(data).into_response())
     }
 }
