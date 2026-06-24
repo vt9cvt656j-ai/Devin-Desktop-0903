@@ -5,6 +5,7 @@ mod realtime;
 
 use std::sync::Arc;
 
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { db, redis, redis_client, cfg: Arc::new(cfg) };
 
     let app = Router::new()
+        .route("/", get(admin_page))
         .route("/health", get(|| async { "ok" }))
         .route("/api/auth/check-email", post(auth::check_email))
         .route("/api/auth/send-code", post(auth::send_code))
@@ -55,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/verify-code", post(auth::verify_code))
         .route("/api/me", get(auth::me))
         .route("/api/admin/users", get(auth::admin_users))
+        .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))
         .route("/ws", get(realtime::ws_handler))
         .layer(TraceLayer::new_for_http())
@@ -65,4 +68,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Michael 总后台 listening on http://{bind_addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The admin dashboard SPA, baked into the binary (no separate build/deploy).
+async fn admin_page() -> Html<&'static str> {
+    Html(include_str!("../static/admin.html"))
 }

@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Michael 总后台</title>
+<style>
+  :root{--bg:#0d1017;--panel:#161b24;--panel2:#1c222d;--line:#232b38;--text:#e6e9ef;--dim:#8a94a6;--accent:#4f8cff;--green:#33d17a;--red:#e5484d}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC",sans-serif;background:var(--bg);color:var(--text)}
+  a{color:var(--accent)}
+  .hidden{display:none!important}
+  /* login */
+  .login{min-height:100vh;display:grid;place-items:center}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .card h1{margin:0 0 4px;font-size:19px}
+  .card p{margin:0 0 18px;color:var(--dim);font-size:13px}
+  input{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;color:var(--text);font-size:14px;margin-bottom:10px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{width:100%;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:11px;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{filter:brightness(1.08)} button:disabled{opacity:.6;cursor:default}
+  .err{color:var(--red);font-size:12.5px;min-height:16px;margin-bottom:8px}
+  /* dashboard */
+  header{display:flex;align-items:center;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header .brand{font-weight:700} header .sp{flex:1}
+  header .who{color:var(--dim);font-size:13px}
+  .logout{width:auto;background:transparent;border:1px solid var(--line);color:var(--dim);padding:6px 12px;font-weight:500}
+  .wrap{padding:22px;max-width:1100px;margin:0 auto}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .stat b{display:block;font-size:30px;font-variant-numeric:tabular-nums;line-height:1.1}
+  .stat span{color:var(--dim);font-size:12.5px}
+  .stat .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;vertical-align:middle}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .box h2{margin:0;padding:13px 16px;font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+  .live{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(51,209,122,.6);animation:pulse 1.6s infinite}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px rgba(51,209,122,0)}100%{box-shadow:0 0 0 0 rgba(51,209,122,0)}}
+  .feed{max-height:440px;overflow:auto;margin:0;padding:6px 0;list-style:none}
+  .feed li{padding:8px 16px;border-bottom:1px solid var(--line);font-size:13px;display:flex;gap:10px;align-items:baseline}
+  .feed li:last-child{border-bottom:0}
+  .tag{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--panel2);color:var(--dim);white-space:nowrap}
+  .tag.register{background:rgba(51,209,122,.16);color:var(--green)} .tag.login{background:rgba(79,140,255,.16);color:var(--accent)}
+  .feed .t{color:var(--dim);font-size:11.5px;margin-left:auto;white-space:nowrap}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 16px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  td.email{font-weight:500}
+  .role{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--panel2);color:var(--dim)} .role.admin{background:rgba(79,140,255,.16);color:var(--accent)}
+  .muted{color:var(--dim);padding:16px;font-size:13px}
+</style>
+</head>
+<body>
+  <!-- login -->
+  <div class="login" id="loginView">
+    <div class="card">
+      <h1>Michael 总后台</h1>
+      <p>管理员登录</p>
+      <div class="err" id="loginErr"></div>
+      <input id="email" type="email" placeholder="管理员邮箱" autocomplete="username" />
+      <input id="password" type="password" placeholder="密码" autocomplete="current-password" />
+      <button id="loginBtn">登录</button>
+    </div>
+  </div>
+
+  <!-- dashboard -->
+  <div class="hidden" id="dashView">
+    <header>
+      <span class="brand">Michael 总后台</span>
+      <span class="who" id="who"></span>
+      <span class="sp"></span>
+      <button class="logout" id="logoutBtn">退出</button>
+    </header>
+    <div class="wrap">
+      <div class="stats">
+        <div class="stat"><b id="sTotal">—</b><span>总用户</span></div>
+        <div class="stat"><b id="sToday">—</b><span>今日新增</span></div>
+        <div class="stat"><b id="sOnline">—</b><span><span class="dot"></span>当前在线</span></div>
+      </div>
+      <div class="grid">
+        <div class="box">
+          <h2><span class="live"></span> 实时动态</h2>
+          <ul class="feed" id="feed"><li class="muted">等待事件…</li></ul>
+        </div>
+        <div class="box">
+          <h2>最近用户</h2>
+          <div id="usersWrap"><div class="muted">加载中…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = "michael_admin_token";
+let token = localStorage.getItem(TOKEN_KEY) || "";
+let ws = null, statsTimer = null;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}), ...(opts.headers || {}) },
+  });
+  if (res.status === 401 || res.status === 403) { logout(); throw new Error("未授权"); }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function show(view) {
+  $("loginView").classList.toggle("hidden", view !== "login");
+  $("dashView").classList.toggle("hidden", view !== "dash");
+}
+
+$("loginBtn").addEventListener("click", doLogin);
+$("password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+async function doLogin() {
+  const email = $("email").value.trim(), password = $("password").value;
+  const btn = $("loginBtn"); $("loginErr").textContent = "";
+  if (!email || !password) return;
+  btn.disabled = true; btn.textContent = "登录中…";
+  try {
+    const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
+    const b = await r.json();
+    if (!r.ok) throw new Error(b.error || "登录失败");
+    if (b.user.role !== "admin") throw new Error("该账号不是管理员");
+    token = b.token; localStorage.setItem(TOKEN_KEY, token);
+    enterDashboard(b.user);
+  } catch (e) {
+    $("loginErr").textContent = e.message || String(e);
+  } finally { btn.disabled = false; btn.textContent = "登录"; }
+}
+
+function logout() {
+  token = ""; localStorage.removeItem(TOKEN_KEY);
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  show("login");
+}
+$("logoutBtn").addEventListener("click", logout);
+
+function enterDashboard(user) {
+  $("who").textContent = user.email;
+  show("dash");
+  refreshStats(); refreshUsers(); loadRecentEvents(); connectWs();
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(refreshStats, 15000);
+}
+
+async function loadRecentEvents() {
+  try {
+    const evs = await api("/api/admin/events");
+    const feed = $("feed"); feed.innerHTML = "";
+    evs.slice().reverse().forEach((e) => addEvent({ kind: e.kind, data: e.data, user_id: e.user_id, ts: e.created_at }));
+    if (!feed.children.length) feed.innerHTML = '<li class="muted">暂无动态</li>';
+  } catch {}
+}
+
+async function refreshStats() {
+  try {
+    const s = await api("/api/admin/stats");
+    $("sTotal").textContent = s.total_users;
+    $("sToday").textContent = s.today_users;
+    $("sOnline").textContent = s.online;
+  } catch {}
+}
+
+async function refreshUsers() {
+  try {
+    const users = await api("/api/admin/users");
+    if (!users.length) { $("usersWrap").innerHTML = '<div class="muted">暂无用户</div>'; return; }
+    const rows = users.slice(0, 50).map((u) => `<tr><td class="email">${esc(u.email)}</td><td><span class="role ${u.role === "admin" ? "admin" : ""}">${u.role}</span></td><td class="t">${fmt(u.created_at)}</td></tr>`).join("");
+    $("usersWrap").innerHTML = `<table><thead><tr><th>邮箱</th><th>角色</th><th>注册时间</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch {}
+}
+
+function connectWs() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    addEvent(e);
+    refreshStats();
+    if (e.kind === "register") refreshUsers();
+  };
+  ws.onclose = () => { if (token) setTimeout(connectWs, 3000); };
+}
+
+function addEvent(e) {
+  const feed = $("feed");
+  if (feed.querySelector(".muted")) feed.innerHTML = "";
+  const li = document.createElement("li");
+  const who = (e.data && e.data.email) ? e.data.email : (e.user_id || "");
+  const label = e.kind === "register" ? "注册" : e.kind === "login" ? "登录" : e.kind;
+  li.innerHTML = `<span class="tag ${esc(e.kind)}">${esc(label)}</span><span>${esc(who)}</span><span class="t">${fmt(e.ts)}</span>`;
+  feed.prepend(li);
+  while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+}
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function fmt(ts){ if(!ts) return ""; const d=new Date(ts); return isNaN(d)?"":d.toLocaleString("zh-CN",{hour12:false}); }
+
+// boot: resume session if a token is present and still valid+admin
+(async () => {
+  if (!token) { show("login"); return; }
+  try {
+    const u = await api("/api/me");
+    if (u.role === "admin") enterDashboard(u); else logout();
+  } catch { logout(); }
+})();
+</script>
+</body>
+</html>

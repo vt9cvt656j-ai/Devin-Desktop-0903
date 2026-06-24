@@ -88,6 +88,29 @@ async fn stream_feed(socket: &mut WebSocket, state: &AppState) -> ApiResult<()> 
     Ok(())
 }
 
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct Event {
+    pub id: i64,
+    pub user_id: Option<uuid::Uuid>,
+    pub kind: String,
+    pub data: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// GET /api/admin/events — recent activity for the dashboard's initial load
+/// (the live tail then arrives over /ws). Admin only.
+pub async fn recent_events(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<Vec<Event>>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    let rows = sqlx::query_as::<_, Event>(
+        "SELECT id, user_id, kind, data, created_at FROM events ORDER BY id DESC LIMIT 50",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
+}
+
 /// GET /api/admin/stats — headline numbers for the dashboard (admin only).
 pub async fn stats(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<serde_json::Value>> {
     if claims.role != "admin" {
