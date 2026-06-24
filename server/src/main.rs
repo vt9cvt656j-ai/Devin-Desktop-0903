@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/apikeys", get(models::admin_list_apikeys).post(models::admin_create_apikey))
         .route("/api/admin/apikeys/:id", delete(models::admin_delete_apikey))
         .route("/v1/chat/completions", post(models::chat_completions))
+        .route("/chat/completions", post(models::chat_completions))
         .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))
         .route("/ws", get(realtime::ws_handler))
