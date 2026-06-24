@@ -94,6 +94,23 @@ let dapManager = null;
 // Cached debug launch configurations discovered from launch.json (null = unloaded).
 let _launchConfigsCache = null;
 
+// Central backend base URL (overridable via localStorage michael_api).
+function _michaelBase() {
+  return (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
+}
+// POST to the central auth API; returns a _finishLogin-shaped result.
+async function _michaelAuth(path, body) {
+  const r = await fetch(_michaelBase() + "/api/auth/" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || "操作失败");
+  try { if (j.token) localStorage.setItem("michael_token", j.token); } catch (_) {}
+  return { success: true, message: "成功", email: body.email, token: j.token, user: j.user };
+}
+
 async function tauriBackend() {
   const core = await import("@tauri-apps/api/core");
   const dialog = await import("@tauri-apps/plugin-dialog");
@@ -195,12 +212,24 @@ async function tauriBackend() {
     gitStashDrop: (root, index) => core.invoke("git_stash_drop", { root, index }),
     gitStashList: (root) => core.invoke("git_stash_list", { root }),
     gitBlame: (root, rel) => core.invoke("git_blame", { root, rel }),
-    authLoginOrRegister: (email, password) => core.invoke("auth_login_or_register", { email, password }),
-    authLogin: (email, password) => core.invoke("auth_login", { email, password }),
-    authRegister: (email, password, code) => core.invoke("auth_register", { email, password, code }),
-    authCheckEmail: (email) => core.invoke("auth_check_email", { email }),
-    authSendCode: (email) => core.invoke("auth_send_code", { email }),
-    authVerifyCode: (email, code) => core.invoke("auth_verify_code", { email, code }),
+    // Auth goes through the central backend (Brevo email + unified accounts/credits),
+    // NOT the local SQLite + QQ-SMTP path (which couldn't send codes).
+    authLoginOrRegister: (email, password) => _michaelAuth("login", { email, password }),
+    authLogin: (email, password) => _michaelAuth("login", { email, password }),
+    authRegister: (email, password, code) => _michaelAuth("register", { email, password, code }),
+    authCheckEmail: async (email) => {
+      const r = await fetch(_michaelBase() + "/api/auth/check-email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "检测邮箱失败");
+      return !!j.exists;
+    },
+    authSendCode: async (email) => {
+      const r = await fetch(_michaelBase() + "/api/auth/send-code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "发送验证码失败");
+      return j.message || "验证码已发送到邮箱（请查收，含垃圾箱）";
+    },
+    authVerifyCode: (email, code) => _michaelAuth("verify-code", { email, code }),
     invoke: (cmd, args) => core.invoke(cmd, args || {}),
   };
 }
