@@ -1,0 +1,6 @@
+target
+.env
+.git
+deploy.sh
+deploy_key.pub
+*.md

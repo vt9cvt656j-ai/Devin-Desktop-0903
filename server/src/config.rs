@@ -14,6 +14,9 @@ pub struct Config {
     pub smtp_user: String,
     pub smtp_pass: String,
     pub smtp_host: String,
+    pub brevo_api_key: String,
+    pub mail_from: String,
+    pub mail_from_name: String,
 }
 
 impl Config {
@@ -29,11 +32,19 @@ impl Config {
             smtp_user: std::env::var("QQ_SMTP_USER").unwrap_or_default(),
             smtp_pass: std::env::var("QQ_SMTP_PASS").unwrap_or_default(),
             smtp_host: opt("SMTP_HOST", "smtp.qq.com"),
+            brevo_api_key: std::env::var("BREVO_API_KEY").unwrap_or_default(),
+            mail_from: std::env::var("MAIL_FROM").unwrap_or_else(|_| std::env::var("QQ_SMTP_USER").unwrap_or_default()),
+            mail_from_name: opt("MAIL_FROM_NAME", "Michael"),
         })
     }
 
     pub fn smtp_enabled(&self) -> bool {
         !self.smtp_user.is_empty() && !self.smtp_pass.is_empty()
+    }
+
+    /// Whether outbound mail can actually be sent (via the Brevo HTTP API over 443).
+    pub fn mail_enabled(&self) -> bool {
+        !self.brevo_api_key.is_empty() && !self.mail_from.is_empty()
     }
 }
 

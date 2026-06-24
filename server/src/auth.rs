@@ -1,5 +1,5 @@
 use axum::async_trait;
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::Json;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -19,6 +19,9 @@ pub struct User {
     #[serde(skip)]
     pub password_hash: String,
     pub role: String,
+    pub plan: String,
+    pub plan_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub credits_cents: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -117,25 +120,12 @@ async fn take_code(state: &AppState, email: &str, code: &str) -> ApiResult<bool>
 }
 
 async fn send_code_email(cfg: &Config, to: &str, code: &str) -> ApiResult<bool> {
-    if !cfg.smtp_enabled() {
-        tracing::warn!("[DEV] SMTP not configured. Code for {to}: {code}");
+    if !cfg.mail_enabled() {
+        tracing::warn!("[DEV] 邮件服务未配置. Code for {to}: {code}");
         return Ok(false);
     }
-    use lettre::message::header::ContentType;
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-
-    let msg = Message::builder()
-        .from(format!("Michael <{}>", cfg.smtp_user).parse()?)
-        .to(to.parse()?)
-        .subject("Michael 登录验证码")
-        .header(ContentType::TEXT_PLAIN)
-        .body(format!("你的验证码是：{code}\n\n10 分钟内有效。如非本人操作请忽略。"))?;
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.smtp_host)?
-            .credentials(Credentials::new(cfg.smtp_user.clone(), cfg.smtp_pass.clone()))
-            .build();
-    mailer.send(msg).await?;
+    let body = format!("你的验证码是：{code}\n\n10 分钟内有效。如非本人操作请忽略。");
+    crate::email::send_mail(cfg, to, "Michael 登录验证码", &body, false).await?;
     Ok(true)
 }
 
@@ -208,10 +198,10 @@ pub async fn register(State(state): State<AppState>, Json(req): Json<RegisterReq
 }
 
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> ApiResult<Json<serde_json::Value>> {
-    if !valid_email(&req.email) {
-        return Err(AppError::bad("邮箱格式不正确"));
+    if req.email.trim().is_empty() || req.password.is_empty() {
+        return Err(AppError::bad("账号或密码不能为空"));
     }
-    let user = find_user(&state, &req.email).await?.ok_or_else(|| AppError::bad("该邮箱尚未注册"))?;
+    let user = find_user(&state, req.email.trim()).await?.ok_or_else(|| AppError::bad("账号不存在"))?;
     if !bcrypt::verify(&req.password, &user.password_hash)? {
         return Err(AppError::unauthorized("密码错误"));
     }
@@ -250,4 +240,57 @@ pub async fn admin_users(State(state): State<AppState>, claims: Claims) -> ApiRe
         .fetch_all(&state.db)
         .await?;
     Ok(Json(users))
+}
+
+#[derive(Deserialize)]
+pub struct SetRoleReq { pub role: String }
+
+/// POST /api/admin/users/:id/role  { role: "admin"|"user" } — admin only.
+pub async fn set_user_role(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<SetRoleReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    if req.role != "admin" && req.role != "user" {
+        return Err(AppError::bad("角色只能是 admin 或 user"));
+    }
+    if claims.sub == id.to_string() {
+        return Err(AppError::bad("不能修改自己的角色"));
+    }
+    let res = sqlx::query("UPDATE users SET role = $1, updated_at = now() WHERE id = $2")
+        .bind(&req.role)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::bad("用户不存在"));
+    }
+    crate::realtime::record_event(&state, Some(id), "role_change", json!({ "role": req.role })).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// DELETE /api/admin/users/:id — admin only.
+pub async fn delete_user(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    if claims.sub == id.to_string() {
+        return Err(AppError::bad("不能删除自己"));
+    }
+    let res = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::bad("用户不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
 }

@@ -1,0 +1,314 @@
+use axum::extract::{Path, State};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::auth::Claims;
+use crate::error::{ApiResult, AppError};
+use crate::AppState;
+
+fn admin_only(claims: &Claims) -> ApiResult<()> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+    Ok(())
+}
+
+/// Normalize an OpenAI-compatible base URL: ensure it ends with a `/v1` segment
+/// (so `https://gateway.example` becomes `https://gateway.example/v1`). If the
+/// caller already included `/v1` (or any `/v1/...`), leave it untouched.
+fn api_base(base: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    if b.ends_with("/v1") || b.contains("/v1/") {
+        b.to_string()
+    } else {
+        format!("{}/v1", b)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub struct Model {
+    pub id: uuid::Uuid,
+    pub label: String,
+    pub provider: String,
+    pub base_url: String,
+    pub model_id: Option<String>,
+    pub api_key: String,
+    pub price_cents: i64,
+    pub rate: f64,
+    pub active: bool,
+    pub sort: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub enabled_models: Vec<String>,
+}
+
+fn allowed_ids(m: &Model) -> Vec<String> {
+    if !m.enabled_models.is_empty() {
+        return m.enabled_models.clone();
+    }
+    match &m.model_id {
+        Some(s) if !s.is_empty() => vec![s.clone()],
+        _ => vec![],
+    }
+}
+
+/// Mask a secret for display: keep the last 4 chars.
+fn mask(key: &str) -> String {
+    if key.len() <= 4 {
+        return "••••".into();
+    }
+    format!("••••{}", &key[key.len() - 4..])
+}
+
+// ---------- admin: list / create / delete ----------
+/// GET /api/admin/models — full list for management (api_key masked).
+pub async fn admin_list(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let rows = sqlx::query_as::<_, Model>("SELECT * FROM models ORDER BY sort, created_at")
+        .fetch_all(&state.db)
+        .await?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id, "label": m.label, "provider": m.provider, "base_url": m.base_url,
+                "model_id": m.model_id, "api_key_masked": mask(&m.api_key), "has_key": !m.api_key.is_empty(),
+                "price_cents": m.price_cents, "rate": m.rate, "active": m.active, "sort": m.sort, "created_at": m.created_at,
+                "enabled_models": m.enabled_models,
+            })
+        })
+        .collect();
+    Ok(Json(json!(list)))
+}
+
+#[derive(Deserialize)]
+pub struct ModelReq {
+    pub label: String,
+    pub provider: Option<String>,
+    pub base_url: String,
+    pub model_id: Option<String>,
+    pub api_key: String,
+    pub rate: Option<f64>,
+    pub sort: Option<i32>,
+}
+
+/// POST /api/admin/models — create a provider connection (admin). model_id is
+/// optional; the exposed models are chosen later via the edit/enabled set.
+pub async fn admin_create(State(state): State<AppState>, claims: Claims, Json(req): Json<ModelReq>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    if req.label.trim().is_empty() || req.base_url.trim().is_empty() {
+        return Err(AppError::bad("名称 / baseUrl 不能为空"));
+    }
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, sort) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+    )
+    .bind(req.label.trim())
+    .bind(req.provider.unwrap_or_default())
+    .bind(req.base_url.trim().trim_end_matches('/'))
+    .bind(req.model_id.unwrap_or_default().trim())
+    .bind(req.api_key.trim())
+    .bind(req.rate.unwrap_or(1.0).max(0.0))
+    .bind(req.sort.unwrap_or(0))
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// DELETE /api/admin/models/:id (admin).
+pub async fn admin_delete(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let res = sqlx::query("DELETE FROM models WHERE id = $1").bind(id).execute(&state.db).await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::bad("模型不存在"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// GET /api/admin/models/:id/available — proxy the provider's model catalogue
+/// (OpenAI-compatible GET /models) using this connection's key.
+pub async fn admin_available(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("模型连接不存在"))?;
+    if m.api_key.is_empty() {
+        return Err(AppError::bad("该连接未配置 API Key"));
+    }
+    let url = format!("{}/models", api_base(&m.base_url));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", m.api_key))
+        .send()
+        .await
+        .map_err(|e| AppError::internal(format!("拉取模型列表失败: {e}")))?;
+    let status = resp.status();
+    let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(AppError { status: axum::http::StatusCode::BAD_GATEWAY, msg: format!("供应商错误 {}: {}", status.as_u16(), data) });
+    }
+    let ids: Vec<String> = data
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from)).collect())
+        .unwrap_or_default();
+    Ok(Json(json!({ "models": ids, "enabled": m.enabled_models })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateReq {
+    pub label: Option<String>,
+    pub provider: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>, // empty/missing = keep existing
+    pub rate: Option<f64>,
+    pub active: Option<bool>,
+    pub sort: Option<i32>,
+    pub enabled_models: Option<Vec<String>>,
+}
+
+/// POST /api/admin/models/:id — update a connection (incl. enabled model set). admin.
+pub async fn admin_update(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>, Json(req): Json<UpdateReq>) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("模型连接不存在"))?;
+    let label = req.label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or(m.label);
+    let provider = req.provider.unwrap_or(m.provider);
+    let base_url = req.base_url.map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()).unwrap_or(m.base_url);
+    let api_key = match req.api_key {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => m.api_key,
+    };
+    let rate = req.rate.unwrap_or(m.rate).max(0.0);
+    let active = req.active.unwrap_or(m.active);
+    let sort = req.sort.unwrap_or(m.sort);
+    let enabled = req.enabled_models.unwrap_or(m.enabled_models);
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8 WHERE id=$9")
+        .bind(&label)
+        .bind(&provider)
+        .bind(&base_url)
+        .bind(&api_key)
+        .bind(rate)
+        .bind(active)
+        .bind(sort)
+        .bind(&enabled)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------- IDE-facing: list active models (safe fields, no secrets) ----------
+/// GET /api/models — active models for the IDE (no api_key / base_url leaked).
+pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let rows = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
+        .fetch_all(&state.db)
+        .await?;
+    let mut list = Vec::new();
+    for m in &rows {
+        for mid in allowed_ids(m) {
+            list.push(json!({
+                "conn_id": m.id,
+                "group": m.label,
+                "provider": m.provider,
+                "model_id": mid.clone(),
+                "name": mid,
+                "price_cents": m.price_cents,
+            }));
+        }
+    }
+    Ok(Json(json!(list)))
+}
+
+// ---------- IDE-facing: proxy a chat completion, billing credits ----------
+/// POST /api/models/:id/chat — forwards an OpenAI-style chat request to the
+/// model's provider, deducts the model's price from the caller's credits, and
+/// returns the upstream JSON. Non-streaming.
+pub async fn chat(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>, Json(mut body): Json<serde_json::Value>) -> ApiResult<Json<serde_json::Value>> {
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1 AND active = true")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("模型不存在或已停用"))?;
+
+    // pre-check: need a positive balance when the model isn't free
+    if model.rate > 0.0 {
+        let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&state.db)
+            .await?;
+        if bal <= 0 {
+            return Err(AppError { status: axum::http::StatusCode::PAYMENT_REQUIRED, msg: "额度不足，请充值".into() });
+        }
+    }
+
+    // forward to the provider (OpenAI-compatible /chat/completions)
+    if !body.is_object() {
+        return Err(AppError::bad("请求体需为 JSON 对象"));
+    }
+    // honour the requested model when it's in this connection's enabled set
+    let allowed = allowed_ids(&model);
+    let requested = body.get("model").and_then(|v| v.as_str()).map(String::from);
+    let chosen = match requested {
+        Some(r) if allowed.contains(&r) => r,
+        _ => allowed.first().cloned().unwrap_or_default(),
+    };
+    if chosen.is_empty() {
+        return Err(AppError::bad("该连接未开放任何模型，请在后台编辑勾选"));
+    }
+    body["model"] = json!(chosen);
+    let url = format!("{}/chat/completions", api_base(&model.base_url));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", model.api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
+    let status = resp.status();
+    let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+    if !status.is_success() {
+        return Err(AppError { status: axum::http::StatusCode::BAD_GATEWAY, msg: format!("模型供应商错误 {}: {}", status.as_u16(), data) });
+    }
+
+    // bill on success: credits = total_tokens/1000 * rate (USD cents)
+    let tokens = data.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
+    let cost = ((tokens as f64) / 1000.0 * model.rate).round() as i64;
+    if cost > 0 {
+        let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2")
+            .bind(cost)
+            .bind(uid)
+            .execute(&state.db)
+            .await;
+    }
+    let _ = sqlx::query("INSERT INTO model_usage (user_id, model_id, cost_cents) VALUES ($1,$2,$3)")
+        .bind(uid)
+        .bind(model.id)
+        .bind(cost)
+        .execute(&state.db)
+        .await;
+    Ok(Json(data))
+}
+
+// ---------- admin: usage stats ----------
+/// GET /api/admin/model-usage — recent usage + totals (admin).
+pub async fn admin_usage(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM model_usage").fetch_one(&state.db).await?;
+    let spent: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_cents),0)::bigint FROM model_usage").fetch_one(&state.db).await?;
+    Ok(Json(json!({ "calls": calls, "spent_cents": spent })))
+}

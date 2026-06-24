@@ -1,12 +1,16 @@
 mod auth;
+mod codes;
 mod config;
+mod email;
 mod error;
+mod models;
+mod pay;
 mod realtime;
 
 use std::sync::Arc;
 
 use axum::response::Html;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::CorsLayer;
@@ -49,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(admin_page))
+        .route("/register", get(register_page))
         .route("/health", get(|| async { "ok" }))
         .route("/api/auth/check-email", post(auth::check_email))
         .route("/api/auth/send-code", post(auth::send_code))
@@ -57,6 +62,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/verify-code", post(auth::verify_code))
         .route("/api/me", get(auth::me))
         .route("/api/admin/users", get(auth::admin_users))
+        .route("/api/admin/users/:id/role", post(auth::set_user_role))
+        .route("/api/admin/users/:id/grant", post(codes::admin_grant))
+        .route("/api/admin/users/:id", delete(auth::delete_user))
+        .route("/api/redeem", post(codes::redeem))
+        .route("/api/admin/codes", get(codes::admin_list).post(codes::admin_generate))
+        .route("/api/admin/codes/:id", delete(codes::admin_delete))
+        .route("/api/admin/notify", post(email::notify))
+        .route("/api/admin/email-logs", get(email::logs))
+        .route("/api/prices", get(pay::list_prices_public))
+        .route("/api/admin/prices", get(pay::admin_list_prices).post(pay::admin_create_price))
+        .route("/api/admin/prices/:id", delete(pay::admin_delete_price))
+        .route("/api/orders", post(pay::create_order))
+        .route("/api/admin/orders", get(pay::admin_list_orders))
+        .route("/api/admin/orders/:id/confirm", post(pay::admin_confirm_order))
+        .route("/api/admin/orders/:id/cancel", post(pay::admin_cancel_order))
+        .route("/api/models", get(models::list_for_client))
+        .route("/api/models/:id/chat", post(models::chat))
+        .route("/api/admin/models", get(models::admin_list).post(models::admin_create))
+        .route("/api/admin/models/:id", delete(models::admin_delete).post(models::admin_update))
+        .route("/api/admin/models/:id/available", get(models::admin_available))
+        .route("/api/admin/model-usage", get(models::admin_usage))
         .route("/api/admin/events", get(realtime::recent_events))
         .route("/api/admin/stats", get(realtime::stats))
         .route("/ws", get(realtime::ws_handler))
@@ -73,4 +99,9 @@ async fn main() -> anyhow::Result<()> {
 /// The admin dashboard SPA, baked into the binary (no separate build/deploy).
 async fn admin_page() -> Html<&'static str> {
     Html(include_str!("../static/admin.html"))
+}
+
+/// Public user registration page (email + verification code).
+async fn register_page() -> Html<&'static str> {
+    Html(include_str!("../static/register.html"))
 }

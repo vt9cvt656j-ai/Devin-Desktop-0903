@@ -4930,7 +4930,9 @@ function refreshModelBadge() {
 }
 
 // ---- model picker (bottom-bar dropdown) ----
-const MODEL_GROUPS = [
+// Central backend serving the admin-curated model catalogue (/api/models).
+const MICHAEL_API = (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
+let MODEL_GROUPS = [
   {
     label: "OpenAI",
     models: [
@@ -4970,23 +4972,68 @@ const modelPickerBtnIcon = modelPickerBtn.querySelector("use");
 const modelPickerLabel = $("modelPickerLabel");
 const modelMenu = $("modelMenu");
 
+/** Map a brand key to its logo symbol + colour class. */
+const BRAND_SYM = {
+  openai: "i-brand-openai", gpt: "i-brand-openai",
+  anthropic: "i-brand-anthropic", claude: "i-brand-anthropic",
+  deepseek: "i-brand-deepseek",
+  gemini: "i-brand-gemini", google: "i-brand-gemini",
+  minimax: "i-brand-minimax",
+  glm: "i-brand-glm", zhipu: "i-brand-glm",
+  meta: "i-brand-meta", llama: "i-brand-meta",
+  qwen: "i-brand-qwen",
+};
+
 /** Map a model id to its provider brand logo + brand colour. */
 function brandOf(id = "") {
   const s = id.toLowerCase();
   if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
   if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
   if (s.includes("deepseek")) return { sym: "i-brand-deepseek", cls: "brand--deepseek" };
+  if (s.includes("gemini")) return { sym: "i-brand-gemini", cls: "brand--gemini" };
+  if (s.includes("minimax")) return { sym: "i-brand-minimax", cls: "brand--minimax" };
+  if (s.includes("glm")) return { sym: "i-brand-glm", cls: "brand--glm" };
   if (s.includes("llama")) return { sym: "i-brand-meta", cls: "brand--meta" };
   if (s.includes("qwen")) return { sym: "i-brand-qwen", cls: "brand--qwen" };
   return { sym: "i-cpu", cls: "" };
 }
 
+/** Resolve a brand from an explicit provider key, falling back to the model id. */
+function brandFor(m) {
+  const key = (m && m.brand ? m.brand : "").toLowerCase();
+  if (BRAND_SYM[key]) return { sym: BRAND_SYM[key], cls: "brand--" + key };
+  return brandOf((m && m.id) || "");
+}
+
 /** Friendly display name for a model id (falls back to the raw id). */
-const MODEL_NAMES = Object.fromEntries(
-  MODEL_GROUPS.flatMap((g) => g.models.map((m) => [m.id, m.name])),
-);
+let MODEL_NAMES = {};
+function rebuildModelNames() {
+  MODEL_NAMES = Object.fromEntries(MODEL_GROUPS.flatMap((g) => g.models.map((m) => [m.id, m.name])));
+}
+rebuildModelNames();
 function modelLabel(id = "") {
   return MODEL_NAMES[id] || id;
+}
+
+/** Pull the admin-curated model list from the central backend into the picker. */
+async function loadBackendModels() {
+  try {
+    const res = await fetch(MICHAEL_API + "/api/models");
+    if (!res.ok) return;
+    const list = await res.json();
+    if (!Array.isArray(list) || !list.length) return;
+    const byGroup = {};
+    for (const it of list) {
+      const label = it.group || it.provider || "Models";
+      (byGroup[label] ||= []).push({ id: it.model_id, name: it.name || it.model_id, brand: it.provider, meta: "" });
+    }
+    MODEL_GROUPS = Object.entries(byGroup).map(([label, models]) => ({ label, models }));
+    rebuildModelNames();
+    buildModelMenu();
+    syncModelPicker();
+  } catch (_) {
+    /* offline / backend unreachable → keep built-in defaults */
+  }
 }
 function currentModel() {
   return loadConfig().model || "";
@@ -5032,7 +5079,7 @@ function buildModelMenu() {
         m.id === current
           ? `<svg class="check"><use href="#i-check" /></svg>`
           : meta;
-      const b = brandOf(m.id);
+      const b = brandFor(m);
       item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
       item.querySelector(".name").textContent = m.name || m.id;
       item.addEventListener("click", () => {
@@ -5089,6 +5136,8 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modelMenu.hidden) closeModelMenu();
 });
+// Load the admin-curated catalogue from the central backend into the picker.
+loadBackendModels();
 
 let _chatSessions = [];
 let _activeChatIdx = -1;

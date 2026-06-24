@@ -5,6 +5,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock* ./
 COPY src ./src
 COPY migrations ./migrations
+COPY static ./static
 RUN cargo build --release
 
 # --- runtime stage (rustls everywhere → no openssl needed) ---

@@ -3217,6 +3217,17 @@ body.zen-mode .editor {
 .ic.brand--deepseek {
   color: #4d6bfe;
 }
+.ic.brand--gemini,
+.ic.brand--google {
+  color: #4285f4;
+}
+.ic.brand--minimax {
+  color: #ff4d4f;
+}
+.ic.brand--glm,
+.ic.brand--zhipu {
+  color: #3859ff;
+}
 .menu__item .check {
   margin-left: auto;
   width: 15px;
