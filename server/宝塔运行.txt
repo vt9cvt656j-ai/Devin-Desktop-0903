@@ -1,0 +1,4 @@
+# 把下面这一整行，复制到【宝塔面板 → 终端】里运行（注意：是宝塔网页里的终端 = 服务器，不是你自己的 Mac！）
+# 作用：把部署密钥装到服务器上，之后由 Claude 用密钥登录、全自动完成部署。
+
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && curl -fsSL https://raw.githubusercontent.com/fendoushaonian/Devin-Desktop/refs/heads/devin/initial-implementation/server/deploy_key.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo 添加成功
