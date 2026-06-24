@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/orders/:id/confirm", post(pay::admin_confirm_order))
         .route("/api/admin/orders/:id/cancel", post(pay::admin_cancel_order))
         .route("/api/models", get(models::list_for_client))
+        .route("/api/ide-key", get(models::ide_key))
         .route("/api/models/:id/chat", post(models::chat))
         .route("/api/admin/models", get(models::admin_list).post(models::admin_create))
         .route("/api/admin/models/:id", delete(models::admin_delete).post(models::admin_update))

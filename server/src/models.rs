@@ -395,6 +395,34 @@ pub async fn admin_delete_apikey(State(state): State<AppState>, claims: Claims, 
     Ok(Json(json!({ "ok": true })))
 }
 
+/// GET /api/ide-key — convenience bootstrap: return a stable API key bound to
+/// the owner (first admin), creating it once. Lets the IDE auto-configure with
+/// no manual key. NOTE: public for single-tenant convenience; lock down (or
+/// require login) before exposing to untrusted users.
+pub async fn ide_key(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1")
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("尚无管理员账号"))?;
+    let existing: Option<String> = sqlx::query_scalar("SELECT api_key FROM api_keys WHERE user_id = $1 AND label = 'ide-auto' ORDER BY created_at LIMIT 1")
+        .bind(uid)
+        .fetch_optional(&state.db)
+        .await?;
+    let key = match existing {
+        Some(k) => k,
+        None => {
+            let k = gen_api_key();
+            sqlx::query("INSERT INTO api_keys (user_id, api_key, label) VALUES ($1, $2, 'ide-auto')")
+                .bind(uid)
+                .bind(&k)
+                .execute(&state.db)
+                .await?;
+            k
+        }
+    };
+    Ok(Json(json!({ "api_key": key })))
+}
+
 /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
 /// key (Bearer). Resolves `model` to the connection that exposes it, forwards
 /// the request (streaming passthrough), and bills the key owner's credits.

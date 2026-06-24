@@ -5012,6 +5012,21 @@ async function loadBackendModels() {
     /* offline / backend unreachable → keep built-in defaults */
   }
 }
+// Auto-configure the API key from the backend so the user never pastes one.
+async function bootstrapMichaelKey() {
+  try {
+    await loadConfigAsync();
+    const cur = loadConfig();
+    if (cur.apiKey && cur.apiKey.startsWith("sk-michael-")) return; // already set
+    const r = await fetch(MICHAEL_API + "/api/ide-key");
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && j.api_key) {
+      await saveConfig({ ...cur, apiKey: j.api_key });
+      refreshModelBadge();
+    }
+  } catch (_) { /* ignore — user can still paste a key manually */ }
+}
 function currentModel() {
   return loadConfig().model || "";
 }
@@ -5114,7 +5129,9 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !modelMenu.hidden) closeModelMenu();
 });
-// Load the admin-curated catalogue from the central backend into the picker.
+// Auto-configure: fetch a working API key + the admin-curated model catalogue
+// from the central backend, so the IDE works with zero manual setup.
+bootstrapMichaelKey();
 loadBackendModels();
 
 let _chatSessions = [];
