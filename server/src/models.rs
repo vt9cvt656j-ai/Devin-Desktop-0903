@@ -43,7 +43,9 @@ where
     B: Send + 'static,
 {
     use futures_util::StreamExt;
-    let idle = std::time::Duration::from_secs(60);
+    // 30s: long enough not to cut a model that briefly pauses, short enough that a
+    // real stall is detected quickly (the client then auto-retries).
+    let idle = std::time::Duration::from_secs(30);
     let upstream = Box::pin(upstream);
     futures_util::stream::unfold(upstream, move |mut s| async move {
         match tokio::time::timeout(idle, s.next()).await {

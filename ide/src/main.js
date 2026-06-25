@@ -6545,13 +6545,15 @@ async function sendPrompt(text, attachedImages = []) {
   const flushStream = () => {
     raf = 0;
     const now = Date.now();
-    // Adaptive throttle to bound O(n) re-render cost for long replies.
-    const _gap = acc.length > 40000 ? 100 : acc.length > 12000 ? 50 : 22;
+    // Render as fast as tokens arrive (capped only by frame rate); widen the gap
+    // only for very long replies to bound the O(n) markdown re-render cost. NO
+    // artificial per-char "typewriter" pacing — that made the output crawl out one
+    // line at a time and feel stuck.
+    const _gap = acc.length > 40000 ? 90 : acc.length > 12000 ? 45 : 16;
     if (now - lastFlush < _gap) { scheduleStream(); return; }
     lastFlush = now;
-    _shown = _revealStep(_shown, acc.length);
-    renderStream(acc.slice(0, _shown));
-    if (streaming || _shown < acc.length) scheduleStream(); // keep typing out the buffered tail
+    renderStream(acc);
+    if (streaming) scheduleStream();
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
   streaming = true;
@@ -6610,16 +6612,6 @@ async function sendPrompt(text, attachedImages = []) {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     streaming = false;
     _setSendBtnStop(false);
-    // Finish typing out the buffered tail before the final clean render — so the
-    // end types out instead of dumping. Snap if way behind (huge burst) or error.
-    if (!err) {
-      while (_shown < acc.length && acc.length - _shown <= 1500) {
-        _shown = _revealStep(_shown, acc.length);
-        renderStream(acc.slice(0, _shown));
-        await new Promise(r => setTimeout(r, 16));
-      }
-    }
-    _shown = acc.length;
     body.querySelector(".thinking")?.remove();
     if (_streamEl) { _streamEl.remove(); _streamEl = null; }
     if (acc) {
