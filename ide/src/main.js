@@ -7703,10 +7703,45 @@ function openMemoryPanel() {
  * shortened — roles and tool_call ids are never touched, so the tool-call
  * structure the API requires stays intact.
  */
+// Size of a message in chars, COUNTING multimodal image data URLs (a screenshot
+// base64 is ~200-300KB and otherwise stringifies to "[object Object]" — wildly
+// undercounted, which is how the payload silently grew past the 413 limit).
+function _msgSize(m) {
+  const c = m && m.content;
+  if (typeof c === "string") return c.length;
+  if (Array.isArray(c)) {
+    let s = 0;
+    for (const p of c) {
+      if (p && p.type === "text") s += (p.text || "").length;
+      else if (p && p.type === "image_url") s += (p.image_url && p.image_url.url ? p.image_url.url.length : 0);
+    }
+    return s;
+  }
+  return c ? String(c).length : 0;
+}
+
 function _trimMessagesIfHuge(messages) {
   const HARD = 140000, SOFT = 90000;
   let total = 0;
-  for (const m of messages) total += m.content ? String(m.content).length : 0;
+  for (const m of messages) total += _msgSize(m);
+
+  // Hard payload guard: even after text trimming, accumulated/huge screenshots can
+  // push the body past the gateway's limit (→ 413). If we're over a safe cap,
+  // strip image parts (oldest first) — the request succeeds as text; the agent can
+  // re-screenshot smaller. This runs regardless of the text-size check below.
+  const PAYLOAD_CAP = 1_200_000;
+  if (total > PAYLOAD_CAP) {
+    for (let i = 0; i < messages.length && total > PAYLOAD_CAP; i++) {
+      const m = messages[i];
+      if (m.role === "user" && Array.isArray(m.content) && m.content.some((p) => p && p.type === "image_url")) {
+        const before = _msgSize(m);
+        const txt = m.content.filter((p) => p && p.type === "text").map((p) => p.text).join("\n");
+        messages[i] = { ...m, content: (txt || "(截图)") + "\n（这张截图过大，已从本次请求中移除以避免超限；需要看就重新截一张更小的。）" };
+        total -= before - _msgSize(messages[i]);
+      }
+    }
+  }
+
   if (total <= SOFT) return;
   const aggressive = total > HARD;
   const KEEP = aggressive ? 4 : 8;

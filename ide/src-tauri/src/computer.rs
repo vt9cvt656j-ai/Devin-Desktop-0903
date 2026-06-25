@@ -20,29 +20,59 @@ pub struct ScreenState {
     screenshot: String, // data:image/png;base64,...
 }
 
-fn capture_png() -> Result<(u32, u32, Vec<u8>), String> {
-    let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
-    let mon = monitors
+/// Cap the screenshot width — keeps the JPEG small AND defines the coordinate
+/// space the agent works in. Clicks are scaled back to real pixels (see `to_real`).
+const SHOT_W: u32 = 1366;
+
+fn primary_monitor() -> Result<xcap::Monitor, String> {
+    let mons = xcap::Monitor::all().map_err(|e| e.to_string())?;
+    let idx = mons
         .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .or_else(|| monitors.first())
-        .ok_or("没有可用的显示器")?;
-    let img = mon.capture_image().map_err(|e| e.to_string())?; // RgbaImage
-    let (w, h) = (img.width(), img.height());
-    let mut buf = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    Ok((w, h, buf.into_inner()))
+        .position(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(0);
+    mons.into_iter()
+        .nth(idx)
+        .ok_or_else(|| "没有可用的显示器".to_string())
 }
 
 fn screen_state() -> Result<ScreenState, String> {
-    let (width, height, png) = capture_png()?;
+    let mon = primary_monitor()?;
+    let img = mon.capture_image().map_err(|e| e.to_string())?; // RgbaImage
+    let (rw, rh) = (img.width(), img.height());
+    // Reported coordinate space = the (possibly downscaled) screenshot size, so
+    // what the agent sees matches the coordinates it gives. The screenshot is
+    // downscaled + JPEG-compressed so a multi-MB grab can't blow the AI body
+    // limit (413). click/move scale these coords back to real pixels.
+    let (width, height) = if rw > SHOT_W {
+        (SHOT_W, ((rh as u64 * SHOT_W as u64) / rw.max(1) as u64) as u32)
+    } else {
+        (rw, rh)
+    };
+    let screenshot =
+        crate::capture::jpeg_data_url(image::DynamicImage::ImageRgba8(img), SHOT_W, 65)?;
     Ok(ScreenState {
         width,
         height,
-        screenshot: format!("data:image/png;base64,{}", crate::capture::b64(&png)),
+        screenshot,
     })
+}
+
+/// Scale a point from the reported (downscaled) coordinate space to real pixels.
+fn to_real(x: i32, y: i32) -> (i32, i32) {
+    let real_w = xcap::Monitor::all()
+        .ok()
+        .and_then(|m| {
+            let idx = m.iter().position(|x| x.is_primary().unwrap_or(false)).unwrap_or(0);
+            m.into_iter().nth(idx)
+        })
+        .and_then(|m| m.width().ok())
+        .unwrap_or(0);
+    if real_w > SHOT_W {
+        let s = real_w as f64 / SHOT_W as f64;
+        ((x as f64 * s).round() as i32, (y as f64 * s).round() as i32)
+    } else {
+        (x, y)
+    }
 }
 
 fn make_enigo() -> Result<Enigo, String> {
@@ -107,7 +137,8 @@ pub async fn computer_screenshot() -> Result<ScreenState, String> {
 pub async fn computer_move(x: i32, y: i32) -> Result<ScreenState, String> {
     run(move || {
         let mut e = make_enigo()?;
-        e.move_mouse(x, y, Coordinate::Abs).map_err(|er| er.to_string())
+        let (rx, ry) = to_real(x, y);
+        e.move_mouse(rx, ry, Coordinate::Abs).map_err(|er| er.to_string())
     })
     .await
 }
@@ -117,7 +148,8 @@ pub async fn computer_move(x: i32, y: i32) -> Result<ScreenState, String> {
 pub async fn computer_click(x: i32, y: i32, button: Option<String>) -> Result<ScreenState, String> {
     run(move || {
         let mut e = make_enigo()?;
-        e.move_mouse(x, y, Coordinate::Abs).map_err(|er| er.to_string())?;
+        let (rx, ry) = to_real(x, y);
+        e.move_mouse(rx, ry, Coordinate::Abs).map_err(|er| er.to_string())?;
         let b = match button.as_deref() {
             Some("right") => Button::Right,
             Some("middle") => Button::Middle,
@@ -133,7 +165,8 @@ pub async fn computer_click(x: i32, y: i32, button: Option<String>) -> Result<Sc
 pub async fn computer_double_click(x: i32, y: i32) -> Result<ScreenState, String> {
     run(move || {
         let mut e = make_enigo()?;
-        e.move_mouse(x, y, Coordinate::Abs).map_err(|er| er.to_string())?;
+        let (rx, ry) = to_real(x, y);
+        e.move_mouse(rx, ry, Coordinate::Abs).map_err(|er| er.to_string())?;
         e.button(Button::Left, Direction::Click)
             .map_err(|er| er.to_string())?;
         e.button(Button::Left, Direction::Click)

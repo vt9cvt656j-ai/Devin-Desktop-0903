@@ -86,6 +86,31 @@ pub fn b64(data: &[u8]) -> String {
     out
 }
 
+/// Downscale (to <= `max_w` wide) and JPEG-encode an image into a compact
+/// `data:image/jpeg;base64,...`. Screenshots (esp. full-screen PNGs) are huge —
+/// this keeps them ~100-200 KB so they don't blow the AI request body limit
+/// (the "413 Payload Too Large" the gateway returns).
+pub fn jpeg_data_url(img: image::DynamicImage, max_w: u32, quality: u8) -> Result<String, String> {
+    let img = if img.width() > max_w && max_w > 0 {
+        let h = ((img.height() as u64 * max_w as u64) / img.width().max(1) as u64).max(1) as u32;
+        img.resize(max_w, h, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8()); // JPEG has no alpha
+    let mut buf: Vec<u8> = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
+        .encode_image(&rgb)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("data:image/jpeg;base64,{}", b64(&buf)))
+}
+
+/// Decode raw image bytes (e.g. a PNG screenshot) and re-encode as a compact JPEG data URL.
+pub fn bytes_to_jpeg_data_url(bytes: &[u8], max_w: u32, quality: u8) -> Result<String, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    jpeg_data_url(img, max_w, quality)
+}
+
 fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<(), String> {
     let mut child = Command::new(browser)
         .args([
@@ -155,12 +180,7 @@ pub async fn capture_url(
     if bytes.is_empty() {
         return Err("截图为空（页面可能没加载出来，确认服务已起、URL 正确）".into());
     }
-    const MAX: usize = 4 * 1024 * 1024;
-    if bytes.len() > MAX {
-        return Err(format!(
-            "截图过大（{} KB），请用更小的窗口尺寸重试",
-            bytes.len() / 1024
-        ));
-    }
-    Ok(format!("data:image/png;base64,{}", b64(&bytes)))
+    // Re-encode as a downscaled JPEG so the data URL stays small (the raw PNG can
+    // be multi-MB and blow the AI request body limit → 413).
+    bytes_to_jpeg_data_url(&bytes, w.min(1280), 68)
 }

@@ -71,11 +71,13 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     let png = tab
         .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
         .map_err(|e| e.to_string())?;
+    // Compact JPEG so the screenshot data URL doesn't blow the AI body limit (413).
+    let screenshot = crate::capture::bytes_to_jpeg_data_url(&png, 1280, 68)?;
     Ok(BrowserState {
         title,
         url,
         text,
-        screenshot: format!("data:image/png;base64,{}", crate::capture::b64(&png)),
+        screenshot,
         result,
     })
 }
