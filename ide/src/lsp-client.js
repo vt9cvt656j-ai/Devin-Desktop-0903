@@ -52,6 +52,15 @@ const DOC_LANGUAGE_ID = {
   shell: "shellscript",
 };
 
+// LSP SymbolKind (1..26) -> short display name, for the agent's outline tool.
+const LSP_SYMBOL_KIND_NAMES = {
+  1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
+  7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface",
+  12: "function", 13: "variable", 14: "constant", 15: "string", 16: "number",
+  17: "boolean", 18: "array", 19: "object", 20: "key", 21: "null",
+  22: "enum-member", 23: "struct", 24: "event", 25: "operator", 26: "type-param",
+};
+
 const Sev = monaco.MarkerSeverity;
 const LSP_TO_SEVERITY = { 1: Sev.Error, 2: Sev.Warning, 3: Sev.Info, 4: Sev.Hint };
 
@@ -799,6 +808,26 @@ export function createLspManager(options) {
     } catch {
       return null;
     }
+  }
+
+  // ---- agent navigation: ensure the right server is up and the doc is synced
+  // before issuing an ad-hoc request for an arbitrary project file (which may not
+  // be open in the editor). Returns null when no managed LSP applies (e.g. JS/TS,
+  // which use Monaco's built-in worker, or a language with no installed server).
+  async function _agentEnsureDoc(path) {
+    if (!enabled || !path) return null;
+    const model = await lazilyCreateModel(pathToUri(path));
+    if (!model) return null;
+    const langId = model.getLanguageId();
+    if (!isManaged(langId)) return null;
+    const client = await ensureServer(langId);
+    if (!client || !client.initialized) return null;
+    const uri = model.uri.toString();
+    const docLang = DOC_LANGUAGE_ID[langId] || langId;
+    // didOpen is idempotent (the client tracks openDocs) and ordered before our
+    // request on the same stream, so the server has the doc when it answers.
+    client.didOpen(uri, docLang, model.getVersionId(), model.getValue());
+    return { uri, model, langId, client };
   }
 
   // ---- workspace edits (rename, code actions, server applyEdit) ----
@@ -1606,6 +1635,55 @@ export function createLspManager(options) {
       const result = await client.request("workspace/symbol", { query });
       if (!Array.isArray(result)) return [];
       return result.map((s) => s.name).filter(Boolean);
+    },
+
+    // ---- agent navigation tools (managed languages only; null = use a fallback) ----
+    // Document outline: [{ name, kind, line, depth }] (1-based line). Handles both
+    // hierarchical DocumentSymbol[] and flat SymbolInformation[].
+    async agentDocumentSymbols(path) {
+      const ctx = await _agentEnsureDoc(path);
+      if (!ctx || !ctx.client.supports("documentSymbol")) return null;
+      let result;
+      try { result = await ctx.client.request("textDocument/documentSymbol", { textDocument: { uri: ctx.uri } }); }
+      catch { return null; }
+      if (!Array.isArray(result)) return [];
+      const out = [];
+      const walk = (items, depth) => {
+        for (const it of items) {
+          const name = it.name || it.label;
+          const range = it.range || it.location?.range;
+          if (name) out.push({ name, kind: LSP_SYMBOL_KIND_NAMES[it.kind] || "", line: range ? range.start.line + 1 : null, depth });
+          if (Array.isArray(it.children)) walk(it.children, depth + 1);
+        }
+      };
+      walk(result, 0);
+      return out;
+    },
+
+    // Definition / references for the symbol at (line, character) — 1-based line,
+    // 0-based character. `kind` is "definition" or "references". Returns
+    // [{ path, line }] or null when no managed LSP / capability applies.
+    async agentLocate(path, line, character, kind) {
+      const ctx = await _agentEnsureDoc(path);
+      if (!ctx) return null;
+      const cap = kind === "references" ? "references" : "definition";
+      if (!ctx.client.supports(cap)) return null;
+      const position = { line: Math.max(0, (line | 0) - 1), character: Math.max(0, character | 0) };
+      const params = { textDocument: { uri: ctx.uri }, position };
+      if (kind === "references") params.context = { includeDeclaration: true };
+      let result;
+      try { result = await ctx.client.request("textDocument/" + cap, params); }
+      catch { return null; }
+      const arr = Array.isArray(result) ? result : (result ? [result] : []);
+      const locs = arr.map((loc) => {
+        const uri = loc.uri || loc.targetUri;
+        const range = loc.range || loc.targetSelectionRange || loc.targetRange;
+        if (!uri) return null;
+        let p = uri;
+        try { p = monaco.Uri.parse(uri).fsPath; } catch { /* keep raw uri */ }
+        return { path: p, line: range ? range.start.line + 1 : null };
+      }).filter(Boolean);
+      return locs;
     },
   };
 }

@@ -5948,6 +5948,10 @@ const _AI_MODE_PROMPTS = {
 - git_branch(name?, create?)：不传 name 列分支；传 name 切换，create=true 新建并切换
 - git_push() / git_pull()：推送 / 拉取当前分支（push 涉及对外发布，一般用户要求时才用）
 - 提示：优先用这些 git 工具而不是 run_cmd 跑 git（结果更结构化、UI 有卡片）；rebase/cherry-pick/tag 等没有专用工具的再用 run_cmd
+- lsp_symbols(path)：列出文件的符号大纲（函数/类/方法 + 行号），比读全文更快看清结构——理解陌生文件首选
+- lsp_definition(path, line, symbol)：按语义跳到符号定义所在的 文件:行（比 search 猜得准）
+- lsp_references(path, line, symbol)：按语义找符号的所有引用/用法（比纯文本 search 准，能区分同名不同物）
+- 提示：理解代码结构 / 找定义与用法时**优先用 lsp_* 工具**（语义级、更准）；JS/TS 内置可用，Python/Go/Rust 等需装对应语言服务器，不可用时会提示你改用 search
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止。
 
 # 输出风格
@@ -7358,6 +7362,9 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "git_status", description: "查看 git 仓库状态：当前分支、已暂存/未暂存/未跟踪的改动文件列表。要了解动了哪些文件、或提交前先看它。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_diff", description: "查看改动的 git diff（统一 diff 文本）。默认看工作区相对 HEAD 的未暂存改动；staged=true 看已暂存(--cached)的；path 只看某个文件。注意：不显示未跟踪的新文件（那些用 git_status 看）。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，只看这个文件的 diff" }, staged: { type: "boolean", description: "为 true 看已暂存的改动" } } } } },
     { type: "function", function: { name: "git_log", description: "查看最近的提交历史（短哈希、作者、时间、信息、所属分支/标签）。", parameters: { type: "object", properties: { count: { type: "integer", description: "返回多少条，默认 20" } } } } },
+    { type: "function", function: { name: "lsp_symbols", description: "列出一个文件的代码结构大纲——靠语言服务(LSP / Monaco TS)解析出函数/类/方法/变量等符号及其行号。比 read_file 读全文更快看清一个文件的骨架。需要该语言有可用的语言服务（JS/TS 内置可用；Python/Go/Rust 等需装对应 LSP）。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径" } }, required: ["path"] } } },
+    { type: "function", function: { name: "lsp_definition", description: "跳到某个符号的定义。给符号所在的文件、行号(line)和符号名(symbol)，返回定义所在的 文件:行。按语义解析，比靠 search 猜更准。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
+    { type: "function", function: { name: "lsp_references", description: "查找一个符号在项目里的所有引用/用法。给符号所在文件、行号(line)、符号名(symbol)，返回引用列表(文件:行)。按语义解析，比纯文本 search 准（能区分同名不同物）。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
   ];
   if (includeWrite) {
     tools.push(
@@ -7403,6 +7410,9 @@ function _mapToolCall(name, args) {
     case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
     case "git_push": return { type: "git", op: "push" };
     case "git_pull": return { type: "git", op: "pull" };
+    case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
+    case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
+    case "lsp_references": return { type: "lsp", op: "references", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     default: return null;
   }
 }
@@ -7675,6 +7685,69 @@ function _globToRegExp(glob) {
 }
 
 /** Bounded recursive file finder, used by the `find_files` tool. Read-only and workspace-scoped. */
+// ---- LSP navigation fallback via Monaco's built-in TS/JS worker ----
+// JS/TS don't go through the LSP manager (Monaco bundles a TypeScript worker),
+// so symbol/definition/reference navigation for them uses that worker instead.
+function _relTo(p, root) {
+  if (root && p && p.startsWith(root.replace(/\/+$/, "") + "/")) return p.slice(root.replace(/\/+$/, "").length + 1);
+  return p;
+}
+async function _modelForPath(fp) {
+  if (typeof monaco === "undefined") return null;
+  const uri = monaco.Uri.file(fp);
+  let model = monaco.editor.getModel(uri);
+  if (!model) {
+    try { const c = await backend.readTextFile(fp); model = monaco.editor.createModel(c ?? "", undefined, uri); }
+    catch { return null; }
+  }
+  return model;
+}
+async function _tsWorkerClient(model) {
+  const ns = monaco.languages?.typescript;
+  if (!ns) return null;
+  const lang = model.getLanguageId();
+  const get = lang === "typescript" ? ns.getTypeScriptWorker : lang === "javascript" ? ns.getJavaScriptWorker : null;
+  if (!get) return null;
+  try { const wf = await get(); return await wf(model.uri); } catch { return null; }
+}
+async function _tsWorkerSymbols(fp) {
+  const model = await _modelForPath(fp); if (!model) return null;
+  const client = await _tsWorkerClient(model); if (!client) return null;
+  let items; try { items = await client.getNavigationBarItems(model.uri.toString()); } catch { return null; }
+  if (!Array.isArray(items)) return null;
+  const out = [];
+  const walk = (arr, depth) => {
+    for (const it of arr) {
+      const span = (it.spans && it.spans[0]) || null;
+      const line = span ? model.getPositionAt(span.start).lineNumber : null;
+      const real = it.text && it.text !== "<global>";
+      if (real) out.push({ name: it.text, kind: it.kind || "", line, depth });
+      if (Array.isArray(it.childItems) && it.childItems.length) walk(it.childItems, depth + (real ? 1 : 0));
+    }
+  };
+  walk(items, 0);
+  return out;
+}
+async function _tsWorkerLocate(fp, line, character, op) {
+  const model = await _modelForPath(fp); if (!model) return null;
+  const client = await _tsWorkerClient(model); if (!client) return null;
+  let offset; try { offset = model.getOffsetAt({ lineNumber: line, column: (character | 0) + 1 }); } catch { return null; }
+  let res;
+  try {
+    res = op === "references"
+      ? await client.getReferencesAtPosition(model.uri.toString(), offset)
+      : await client.getDefinitionAtPosition(model.uri.toString(), offset);
+  } catch { return null; }
+  if (!Array.isArray(res)) return null;
+  return res.map((r) => {
+    let p = r.fileName;
+    try { p = monaco.Uri.parse(r.fileName).fsPath; } catch { /* keep raw */ }
+    let ln = null;
+    try { const m2 = monaco.editor.getModel(monaco.Uri.parse(r.fileName)); if (m2 && r.textSpan) ln = m2.getPositionAt(r.textSpan.start).lineNumber; } catch { /* unknown line */ }
+    return { path: p, line: ln };
+  });
+}
+
 async function _agentFindFiles(root, pattern) {
   if (!root) return { count: 0, text: "[ERROR] 未打开工作区。" };
   const pat = (pattern || "").trim();
@@ -7977,7 +8050,7 @@ async function _runAgenticLoop({ config, messages, root }) {
       chatEl.scrollTop = chatEl.scrollHeight;
 
       const toolMsgs = new Array(items.length);
-      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch"]);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp"]);
 
       const runOne = async (it) => {
         const { call, step } = it;
@@ -7987,7 +8060,7 @@ async function _runAgenticLoop({ config, messages, root }) {
           try { result = await _executeToolStep(step, call, root); }
           catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
         }
-        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : call.type === "git" ? "" : (call.path || "");
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp") ? "" : (call.path || "");
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
         return _toolResultToString(call, result).slice(0, 8000);
       };
@@ -8254,10 +8327,12 @@ function _removeWritePreview(entry) {
 function _createToolStep(call) {
   const pathDisplay = call.type === "git"
     ? ((call.op || "") + (call.op === "diff" && call.path ? " " + call.path : "") + (call.op === "branch" && call.branch ? " " + call.branch : ""))
+    : call.type === "lsp"
+    ? ((call.op || "") + (call.path ? " " + call.path : "") + (call.symbol ? " · " + call.symbol : ""))
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8270,12 +8345,13 @@ function _createToolStep(call) {
     web: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
     websearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
     git: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.25 2.25 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.5 2.5 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"/></svg>`,
+    lsp: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M5.28 4.22a.75.75 0 010 1.06L2.56 8l2.72 2.72a.75.75 0 01-1.06 1.06L.97 8.53a.75.75 0 010-1.06l3.25-3.25a.75.75 0 011.06 0zm5.44 0a.75.75 0 011.06 0l3.25 3.25a.75.75 0 010 1.06l-3.25 3.25a.75.75 0 11-1.06-1.06L13.44 8l-2.72-2.72a.75.75 0 010-1.06z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -8795,6 +8871,54 @@ async function _executeToolStep(step, call, root) {
       res.textContent = hits ? `${hits} 条结果` : "完成";
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "websearch", path: call.path, content: text };
+
+    } else if (call.type === "lsp") {
+      const lroot = root || rootPath || workspaceRoots[0] || "";
+      const rel = (call.path || "").trim();
+      if (!rel) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "lsp", path: call.op, content: "[ERROR] 空路径。" }; }
+      const fp = rel.startsWith("/") ? rel : (lroot ? lroot + "/" + rel.replace(/^\/+/, "") : rel);
+      try {
+        if (call.op === "symbols") {
+          let syms = null;
+          try { syms = await (lspManager && lspManager.agentDocumentSymbols ? lspManager.agentDocumentSymbols(fp) : null); } catch {}
+          if (!syms) { try { syms = await _tsWorkerSymbols(fp); } catch {} }
+          if (!syms || !syms.length) {
+            res.className = "atc-result atc-result--err"; res.textContent = syms ? "无符号" : "无 LSP";
+            if (vp) vp.innerHTML = `<pre>${_escHtml(syms ? "(无符号)" : "该语言无可用语言服务")}</pre>`;
+            return { type: "lsp", path: rel, content: syms ? `${rel} 未解析到符号。` : `[无 LSP] ${rel} 的语言没有可用的符号服务（可能未装语言服务器）。改用 read_file / search。` };
+          }
+          const lines = syms.map(s => `${"  ".repeat(Math.min(s.depth || 0, 6))}${s.kind ? "[" + s.kind + "] " : ""}${s.name}${s.line ? "  :" + s.line : ""}`);
+          res.className = "atc-result atc-result--ok"; res.textContent = `${syms.length} 个符号`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n").slice(0, 4000))}</pre>`;
+          return { type: "lsp", path: rel, content: `${rel} 的符号大纲（${syms.length}）:\n${lines.join("\n")}` };
+        } else {
+          const line = Number.isFinite(call.line) ? Math.floor(call.line) : 0;
+          if (!line) { res.className = "atc-result atc-result--err"; res.textContent = "缺行号"; return { type: "lsp", path: rel, content: "[ERROR] 需要 line（符号所在行号，1 基）。" }; }
+          let character = 0;
+          const sym = (call.symbol || "").trim();
+          if (sym) {
+            try { const t = await backend.readTextFile(fp); const lt = (t.split("\n")[line - 1] || ""); const idx = lt.indexOf(sym); if (idx >= 0) character = idx + Math.floor(sym.length / 2); } catch {}
+          }
+          let locs = null;
+          try { locs = await (lspManager && lspManager.agentLocate ? lspManager.agentLocate(fp, line, character, call.op) : null); } catch {}
+          if (!locs) { try { locs = await _tsWorkerLocate(fp, line, character, call.op); } catch {} }
+          const label = call.op === "references" ? "引用" : "定义";
+          if (!locs) {
+            res.className = "atc-result atc-result--err"; res.textContent = "无 LSP";
+            return { type: "lsp", path: rel, content: `[无 LSP] ${rel} 的语言没有可用的${label}服务。改用 search。` };
+          }
+          const seen = new Set(); const uniq = [];
+          for (const l of locs) { const k = (l.path || "") + ":" + (l.line || ""); if (!seen.has(k)) { seen.add(k); uniq.push(l); } }
+          const rels = uniq.map(l => `${_relTo(l.path || "", lroot)}${l.line ? ":" + l.line : ""}`);
+          res.className = uniq.length ? "atc-result atc-result--ok" : "atc-result atc-result--err"; res.textContent = uniq.length ? `${uniq.length} 处${label}` : `无${label}`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(rels.join("\n") || "(无结果)")}</pre>`;
+          return { type: "lsp", path: rel, content: uniq.length ? `${sym || rel}（${rel}:${line}）的${label}（${uniq.length}）:\n${rels.join("\n")}` : `未找到${label}（可能索引未就绪，可稍后重试或改用 search）。` };
+        }
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 200);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
+        return { type: "lsp", path: rel, content: `[ERROR] lsp ${call.op} 失败: ${msg}` };
+      }
 
     } else if (call.type === "git") {
       const gitRoot = root || rootPath || workspaceRoots[0] || "";
