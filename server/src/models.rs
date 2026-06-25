@@ -29,6 +29,31 @@ static GW_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
+/// Wrap an upstream byte stream with an IDLE timeout: if the provider (zyz et al.)
+/// goes silent mid-response for too long (it occasionally stalls a stream), we
+/// gracefully END the stream instead of leaving the IDE frozen forever. The client
+/// then hits EOF, finalizes whatever it has, and unblocks — far better than an
+/// infinite "跑着跑着卡住" hang. Generic over the byte type so we don't need to name
+/// `bytes::Bytes` directly.
+fn idle_guarded_stream<B, S>(
+    upstream: S,
+) -> impl futures_util::Stream<Item = Result<B, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = reqwest::Result<B>> + Send + 'static,
+    B: Send + 'static,
+{
+    use futures_util::StreamExt;
+    let idle = std::time::Duration::from_secs(60);
+    let upstream = Box::pin(upstream);
+    futures_util::stream::unfold(upstream, move |mut s| async move {
+        match tokio::time::timeout(idle, s.next()).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), s)),
+            // upstream finished, errored, or went idle past the timeout → end here
+            _ => None,
+        }
+    })
+}
+
 fn admin_only(claims: &Claims) -> ApiResult<()> {
     if claims.role != "admin" {
         return Err(AppError::forbidden("需要管理员权限"));
@@ -742,7 +767,7 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
             .header(axum::http::header::CONTENT_TYPE, ct)
             .header("cache-control", "no-cache")
-            .body(Body::from_stream(resp.bytes_stream()))
+            .body(Body::from_stream(idle_guarded_stream(resp.bytes_stream())))
             .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(out)
     } else {
