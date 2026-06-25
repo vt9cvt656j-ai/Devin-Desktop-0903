@@ -8169,7 +8169,18 @@ async function _executeToolStep(step, call, root) {
       res.className = "atc-result atc-result--ok";
       const rangeLabel = (start > 0 || shownTo < total) ? ` (${shownFrom}-${shownTo}/${total})` : "";
       res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg> ${total} lines · ${sizeLabel}${rangeLabel}`;
-      vp.innerHTML = `<pre>${_escHtml(body.slice(0, 4000))}</pre>`;
+      // Render the file content with syntax highlighting (same engine as the
+      // code cards) instead of a plain-text dump — much easier to read.
+      const _disp = body.slice(0, 4000);
+      const _lang = extLang((usedPath || call.path || "").split("/").pop() || "");
+      vp.innerHTML = `<pre><code></code></pre>`;
+      const _codeEl = vp.querySelector("code");
+      _codeEl.textContent = _disp;
+      if (_lang && _lang !== "plaintext" && _disp.trim()) {
+        monaco.editor.colorize(_disp, _lang, { tabSize: 2 })
+          .then((html) => { if (html) _codeEl.innerHTML = html.replace(/<br\/?>\s*$/, ""); })
+          .catch(() => {});
+      }
       row.addEventListener("dblclick", () => openFile(usedPath, call.path.split("/").pop()));
 
       let hint = "";
