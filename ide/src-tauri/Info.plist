@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The backend gateway (default http://209.97.172.123) is plain HTTP. macOS
+	     App Transport Security blocks cleartext HTTP from WKWebView by default,
+	     which breaks the JS-side auth/login fetches in the packaged app (they
+	     work in `tauri dev` only because the page is served from http://localhost).
+	     Allow cleartext loads so the webview can reach the HTTP backend. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+</dict>
+</plist>
