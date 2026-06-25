@@ -11,6 +11,24 @@ use crate::auth::Claims;
 use crate::error::{ApiResult, AppError};
 use crate::AppState;
 
+/// Shared, pooled HTTP client for upstream model calls. Building a fresh
+/// `reqwest::Client` per request (the old behaviour) forced a brand-new TCP+TLS
+/// handshake to the provider on every call — a large chunk of the "feels slow"
+/// latency, and it compounds badly for an agent firing many sequential requests.
+/// One pooled client keeps connections warm (keep-alive), so only the first call
+/// to a host pays the handshake. No global timeout: streamed chat responses are
+/// open-ended; only the connect phase is bounded (per-request timeouts are added
+/// for the non-streaming calls that need them).
+static GW_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(16)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
 fn admin_only(claims: &Claims) -> ApiResult<()> {
     if claims.role != "admin" {
         return Err(AppError::forbidden("需要管理员权限"));
@@ -599,14 +617,16 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
 
     let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let url = format!("{}/chat/completions", api_base(&conn.base_url));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    let resp = client
+    // Pooled client (warm keep-alive connections) instead of a fresh handshake
+    // per request. Streaming stays open-ended; non-streaming gets a sane cap.
+    let mut req = GW_HTTP
         .post(&url)
         .header("Authorization", format!("Bearer {}", conn.api_key))
-        .json(&body)
+        .json(&body);
+    if !streaming {
+        req = req.timeout(std::time::Duration::from_secs(120));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
@@ -634,7 +654,13 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     if streaming {
         // Can't read token usage from a passed-through stream, so charge a flat
         // per-call fee (rounded rate). Stream the upstream SSE straight through.
-        bill(&state, uid, conn.id, conn.rate.round() as i64, use_quota).await;
+        // Bill in the background so the first SSE byte isn't delayed by DB writes.
+        {
+            let st = state.clone();
+            let cid = conn.id;
+            let cost = conn.rate.round() as i64;
+            tokio::spawn(async move { bill(&st, uid, cid, cost, use_quota).await });
+        }
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
