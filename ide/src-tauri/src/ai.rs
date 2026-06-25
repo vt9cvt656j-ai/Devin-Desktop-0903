@@ -211,7 +211,20 @@ async fn ai_chat_inner(
     // is always valid.
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        // A mid-stream read error means the connection dropped partway (common on
+        // cross-border / lossy links — "error decoding response body"). Keep what
+        // we've already streamed and end the turn gracefully with a friendly note,
+        // instead of failing the whole agent run with a raw decode error.
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_e) => {
+                let _ = on_event.send(AiEvent::Error {
+                    message: "连接中断（网络波动），已保留生成的部分，请点重试继续。".to_string(),
+                });
+                let _ = on_event.send(AiEvent::Done);
+                return Ok(());
+            }
+        };
         buf.extend_from_slice(&chunk);
 
         // Server-sent events are newline-delimited `data: {...}` lines.
