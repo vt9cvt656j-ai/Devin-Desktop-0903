@@ -8218,10 +8218,12 @@ async function _runAgenticLoop({ config, messages, root }) {
 // e.g. write_file's `content` before the closing quote/brace has arrived. Handles
 // the common JSON escapes so the live code preview reads correctly mid-stream.
 function _partialJsonString(buf, key) {
-  const m = `"${key}":"`;
-  const i = buf.indexOf(m);
-  if (i === -1) return null;
-  const s = buf.slice(i + m.length);
+  // Tolerate whitespace the model may put around the colon, e.g. `"content": "`.
+  // The old exact `"key":"` match silently failed on spaced JSON — which is why
+  // the live preview card appeared but never showed any content.
+  const m = buf.match(new RegExp(`"${key}"\\s*:\\s*"`));
+  if (!m) return null;
+  const s = buf.slice(m.index + m[0].length);
   let out = "";
   for (let j = 0; j < s.length; j++) {
     const c = s[j];
@@ -8254,9 +8256,13 @@ function _streamWriteContent(entry, key) {
   if (!st || st.key !== key) st = entry._sc = { key, start: -1, pos: 0, out: "", done: false };
   if (st.done) return st.out;
   if (st.start < 0) {
-    const i = buf.indexOf(`"${key}":"`);
-    if (i === -1) return st.out || null;
-    st.start = i + key.length + 4; // past `"<key>":"`
+    // Tolerate whitespace around the colon (`"content": "`) and only lock on once
+    // the value's opening quote has arrived. Hardcoding `"content":"` (no spaces)
+    // was why the live preview never showed content for models that emit spaced
+    // JSON tool arguments.
+    const m = buf.match(new RegExp(`"${key}"\\s*:\\s*"`));
+    if (!m) return st.out || null;
+    st.start = m.index + m[0].length; // first char of the value
     st.pos = st.start;
   }
   let j = st.pos;
