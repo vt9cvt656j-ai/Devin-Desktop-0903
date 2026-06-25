@@ -5830,11 +5830,15 @@ const _AI_MODE_PROMPTS = {
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
 **工具调用会由系统自动显示成卡片**：不要在回复正文里用 \`read_file 路径\`、\`run_cmd 命令\`、\`list_dir\` 等复述你正在调用的工具，也不要用 \`<file_content>\`/\`<item>\` 标签把读到的文件内容或目录再抄一遍。直接调用工具即可；回复正文只写给用户看的结论、解释和下一步。`,
 
-  chat: `你是 Michael IDE 的聊天助手。
-- 只回答问题，不主动修改文件
-- 解释代码、回答编程问题、提供建议
-- 用简洁中文回复
-- 代码用 fenced code blocks`,
+  chat: `你是 Michael IDE 的聊天助手——一个懂工程、会聊天的资深程序员。用中文回复。
+
+# 答得好的准则
+- 先抓真实意图再答；问题含糊就先用一两句确认关键点，别答偏。
+- 准确第一：不确定就说不确定，绝不编造 API / 参数 / 版本号；有联网或读取工具时先查证再答。
+- 直奔重点：先给结论 / 答案，再按需展开原因与细节，不写"我将要…"这类铺垫。
+- 给代码就给**完整、能直接跑**的片段（含必要 import 与边界处理），用带语言标注的 fenced code block；指到代码用 文件:行号。
+- 分层解释：一句话结论 → 关键点 →（需要时）取舍 / 坑 / 最佳实践；长答案用小标题和列表，方便扫读。
+- 只做"答"：不主动改文件、不跑命令（那是 Agent 模式的事）。需要真正动手改代码时，提示用户切到 Agent 模式。`,
 
   plan: `你是 Michael IDE 的架构规划智能体。你先调查代码库，再产出一份扎实、可直接照着实现的架构与实施方案。你有只读工具（read_file / list_dir / search / find_files / web_search / web_fetch / run_subagent / update_plan），但**绝不修改文件、不运行命令**。用中文回复。
 
@@ -6614,12 +6618,16 @@ async function _agentRunInTerminal(root, command, stepEl) {
     // fine even if it starts a server — this is exactly how the agent SHOULD spin
     // up a dev server to test (e.g. `nohup npx vite & sleep 3 && cat log`). Only
     // a FOREGROUND server/watch (which never returns) is refused.
-    const backgrounded = /\bnohup\b/i.test(cmd) || /\s&(\s|$)/.test(cmd);
+    const _win = _detectOS() === "Windows";
+    // Background forms that return immediately: nohup / trailing & (Unix), or
+    // `start … /b` (Windows). Such a command is fine even if it starts a server.
+    const backgrounded = /\bnohup\b/i.test(cmd) || /\s&(\s|$)/.test(cmd) || (/\bstart\b/i.test(cmd) && /\s\/b\b/i.test(cmd));
     const isLongRunning = !backgrounded && /\b(serve|watch|nodemon|flask\s+run|npm\s+(run\s+)?(start|dev|serve)|yarn\s+(start|dev)|pnpm\s+(start|dev)|npx\s+(vite|next|nuxt)|http\.server|webpack-dev-server|ng\s+serve|rails\s+server|gunicorn|uvicorn)\b/i.test(cmd);
-    const isCatCmd = /^\s*cat\s/.test(cmd);
+    // Fast-path reading a file: `cat` (Unix) or `type` (Windows) → read directly.
+    const isCatCmd = /^\s*cat\s/.test(cmd) || (_win && /^\s*type\s/.test(cmd));
 
     if (isCatCmd) {
-      const filePath = cmd.replace(/^\s*cat\s+/, "").replace(/^["']|["']$/g, "").trim();
+      const filePath = cmd.replace(/^\s*(cat|type)\s+/, "").replace(/^["']|["']$/g, "").trim();
       const fp = filePath.startsWith("/") ? filePath : (root ? root + "/" + filePath : filePath);
       try {
         const content = await backend.readTextFile(fp);
@@ -6630,7 +6638,9 @@ async function _agentRunInTerminal(root, command, stepEl) {
     } else if (isLongRunning) {
       // Foreground server/watch never returns — but instead of just refusing,
       // teach the model to background it so it CAN start & test a dev server.
-      result = { code: 1, stdout: "", stderr: "[未执行] 前台长时间运行的命令不会返回。要启动服务/前端来测试，请改成后台方式（会立刻返回）：\n  nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log\n这样进程在后台跑、你也能看到启动日志。路径含空格记得加引号。" };
+      result = { code: 1, stdout: "", stderr: _win
+        ? "[未执行] 前台长时间运行的命令不会返回。要启动服务测试，请改成后台方式（会立刻返回）：\n  start \"\" /b 你的命令 >%TEMP%\\svc.log 2>&1\n之后再用  type %TEMP%\\svc.log  查看启动日志。路径含空格记得加引号。"
+        : "[未执行] 前台长时间运行的命令不会返回。要启动服务/前端来测试，请改成后台方式（会立刻返回）：\n  nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log\n这样进程在后台跑、你也能看到启动日志。路径含空格记得加引号。" };
     } else {
       const r = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e?.message || e) }));
       result = { code: r?.code ?? 0, stdout: r?.stdout || "", stderr: r?.stderr || "" };

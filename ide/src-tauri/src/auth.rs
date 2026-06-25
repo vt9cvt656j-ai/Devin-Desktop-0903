@@ -127,7 +127,9 @@ pub async fn db_marketplace_upsert(ext: DbExtension) -> Result<String, String> {
 }
 
 fn pool() -> Result<&'static SqlitePool, String> {
-    DB_POOL.get().ok_or_else(|| "Database not connected".to_string())
+    DB_POOL
+        .get()
+        .ok_or_else(|| "Database not connected".to_string())
 }
 
 #[command]
@@ -141,13 +143,12 @@ pub async fn auth_login_or_register(email: String, password: String) -> Result<A
 
     let pool = pool()?;
 
-    let existing: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, password_hash FROM users WHERE email = ?"
-    )
-    .bind(&email)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("DB query failed: {e}"))?;
+    let existing: Option<(String, String)> =
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB query failed: {e}"))?;
 
     match existing {
         Some((user_id, hash)) => {
@@ -172,8 +173,8 @@ pub async fn auth_login_or_register(email: String, password: String) -> Result<A
         }
         None => {
             let user_id = uuid::Uuid::new_v4().to_string();
-            let hash = bcrypt::hash(&password, 10)
-                .map_err(|e| format!("Password hashing failed: {e}"))?;
+            let hash =
+                bcrypt::hash(&password, 10).map_err(|e| format!("Password hashing failed: {e}"))?;
 
             sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
                 .bind(&user_id)
@@ -283,8 +284,14 @@ async fn send_email_code(to: &str, code: &str) -> Result<bool, String> {
     use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
     let msg = Message::builder()
-        .from(format!("Michael IDE <{user}>").parse().map_err(|e| format!("bad sender address: {e}"))?)
-        .to(to.parse().map_err(|e| format!("bad recipient address: {e}"))?)
+        .from(
+            format!("Michael IDE <{user}>")
+                .parse()
+                .map_err(|e| format!("bad sender address: {e}"))?,
+        )
+        .to(to
+            .parse()
+            .map_err(|e| format!("bad recipient address: {e}"))?)
         .subject("Michael IDE 登录验证码")
         .header(ContentType::TEXT_PLAIN)
         .body(format!(
@@ -298,7 +305,10 @@ async fn send_email_code(to: &str, code: &str) -> Result<bool, String> {
             .credentials(Credentials::new(user, pass))
             .build();
 
-    mailer.send(msg).await.map_err(|e| format!("发送邮件失败: {e}"))?;
+    mailer
+        .send(msg)
+        .await
+        .map_err(|e| format!("发送邮件失败: {e}"))?;
     Ok(true)
 }
 
@@ -307,7 +317,9 @@ pub async fn auth_send_code(email: String) -> Result<String, String> {
     if !valid_email(&email) {
         return Err("邮箱格式不正确".to_string());
     }
-    let code: String = (0..6).map(|_| (b'0' + (rand::random::<u8>() % 10)) as char).collect();
+    let code: String = (0..6)
+        .map(|_| (b'0' + (rand::random::<u8>() % 10)) as char)
+        .collect();
     codes()
         .lock()
         .unwrap()
@@ -356,9 +368,21 @@ pub async fn auth_login(email: String, password: String) -> Result<AuthResult, S
             let valid = bcrypt::verify(&password, &hash)
                 .map_err(|e| format!("Password verification failed: {e}"))?;
             if valid {
-                Ok(AuthResult { success: true, email, user_id, message: "登录成功".into(), is_new_user: false })
+                Ok(AuthResult {
+                    success: true,
+                    email,
+                    user_id,
+                    message: "登录成功".into(),
+                    is_new_user: false,
+                })
             } else {
-                Ok(AuthResult { success: false, email, user_id: String::new(), message: "密码错误".into(), is_new_user: false })
+                Ok(AuthResult {
+                    success: false,
+                    email,
+                    user_id: String::new(),
+                    message: "密码错误".into(),
+                    is_new_user: false,
+                })
             }
         }
     }
@@ -367,7 +391,11 @@ pub async fn auth_login(email: String, password: String) -> Result<AuthResult, S
 /// New-account registration: verify the email code, then create the account with
 /// the password the user chose (the proper signup completion step).
 #[command]
-pub async fn auth_register(email: String, password: String, code: String) -> Result<AuthResult, String> {
+pub async fn auth_register(
+    email: String,
+    password: String,
+    code: String,
+) -> Result<AuthResult, String> {
     if !valid_email(&email) {
         return Err("邮箱格式不正确".to_string());
     }
@@ -375,20 +403,45 @@ pub async fn auth_register(email: String, password: String, code: String) -> Res
         return Err("密码至少 6 位".to_string());
     }
     if !take_valid_code(&email, &code) {
-        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "验证码错误或已过期".into(), is_new_user: true });
+        return Ok(AuthResult {
+            success: false,
+            email,
+            user_id: String::new(),
+            message: "验证码错误或已过期".into(),
+            is_new_user: true,
+        });
     }
     let pool = pool()?;
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
-        .bind(&email).fetch_optional(pool).await.map_err(|e| format!("DB query failed: {e}"))?;
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB query failed: {e}"))?;
     if exists.is_some() {
-        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "该邮箱已注册，请直接登录".into(), is_new_user: false });
+        return Ok(AuthResult {
+            success: false,
+            email,
+            user_id: String::new(),
+            message: "该邮箱已注册，请直接登录".into(),
+            is_new_user: false,
+        });
     }
     let user_id = uuid::Uuid::new_v4().to_string();
     let hash = bcrypt::hash(&password, 10).map_err(|e| format!("Password hashing failed: {e}"))?;
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
-        .bind(&user_id).bind(&email).bind(&hash)
-        .execute(pool).await.map_err(|e| format!("Failed to create user: {e}"))?;
-    Ok(AuthResult { success: true, email, user_id, message: "注册成功，已登录".into(), is_new_user: true })
+        .bind(&user_id)
+        .bind(&email)
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create user: {e}"))?;
+    Ok(AuthResult {
+        success: true,
+        email,
+        user_id,
+        message: "注册成功，已登录".into(),
+        is_new_user: true,
+    })
 }
 
 /// Passwordless code login for an EXISTING account. (New accounts must go through
@@ -396,13 +449,34 @@ pub async fn auth_register(email: String, password: String, code: String) -> Res
 #[command]
 pub async fn auth_verify_code(email: String, code: String) -> Result<AuthResult, String> {
     if !take_valid_code(&email, &code) {
-        return Ok(AuthResult { success: false, email, user_id: String::new(), message: "验证码错误或已过期".into(), is_new_user: false });
+        return Ok(AuthResult {
+            success: false,
+            email,
+            user_id: String::new(),
+            message: "验证码错误或已过期".into(),
+            is_new_user: false,
+        });
     }
     let pool = pool()?;
     let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
-        .bind(&email).fetch_optional(pool).await.map_err(|e| format!("DB query failed: {e}"))?;
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB query failed: {e}"))?;
     match existing {
-        Some((user_id,)) => Ok(AuthResult { success: true, email, user_id, message: "验证码登录成功".into(), is_new_user: false }),
-        None => Ok(AuthResult { success: false, email, user_id: String::new(), message: "该邮箱尚未注册，请先设置密码注册".into(), is_new_user: true }),
+        Some((user_id,)) => Ok(AuthResult {
+            success: true,
+            email,
+            user_id,
+            message: "验证码登录成功".into(),
+            is_new_user: false,
+        }),
+        None => Ok(AuthResult {
+            success: false,
+            email,
+            user_id: String::new(),
+            message: "该邮箱尚未注册，请先设置密码注册".into(),
+            is_new_user: true,
+        }),
     }
 }

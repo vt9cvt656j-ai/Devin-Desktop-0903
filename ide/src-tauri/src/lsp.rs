@@ -117,18 +117,15 @@ fn extract_method(json: &str) -> String {
             }
         }
     }
-    if json.contains("\"result\"") { return "response".to_string(); }
+    if json.contains("\"result\"") {
+        return "response".to_string();
+    }
     "?".to_string()
 }
 
 fn encode_lsp_message(content: &str) -> String {
-    format!(
-        "Content-Length: {}\r\n\r\n{}",
-        content.len(),
-        content
-    )
+    format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
 }
-
 
 /// Strip a `file://` prefix from a root URI and URL-decode to get a real path.
 fn workspace_dir_from_uri(uri: &str) -> Option<String> {
@@ -137,7 +134,11 @@ fn workspace_dir_from_uri(uri: &str) -> Option<String> {
         return None;
     }
     let decoded = percent_decode(trimmed);
-    if decoded.is_empty() { None } else { Some(decoded) }
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
 }
 
 fn percent_decode(input: &str) -> String {
@@ -185,7 +186,10 @@ pub fn lsp_start(
 
     let command = if config.command.is_empty() {
         let (cmd, _) = find_server(&config.lang).ok_or_else(|| {
-            format!("no known LSP server for '{}'; provide a custom command", config.lang)
+            format!(
+                "no known LSP server for '{}'; provide a custom command",
+                config.lang
+            )
         })?;
         cmd.to_string()
     } else {
@@ -193,7 +197,10 @@ pub fn lsp_start(
     };
     let args: Vec<String> = if config.command.is_empty() {
         let (_, default_args) = find_server(&config.lang).ok_or_else(|| {
-            format!("no known LSP server for '{}'; provide a custom command", config.lang)
+            format!(
+                "no known LSP server for '{}'; provide a custom command",
+                config.lang
+            )
         })?;
         default_args.iter().map(|arg| (*arg).to_string()).collect()
     } else {
@@ -212,7 +219,9 @@ pub fn lsp_start(
     #[cfg(not(windows))]
     let (actual_cmd, extra_args) = {
         if let Ok(content) = std::fs::read_to_string(&resolved) {
-            if content.starts_with("#!/usr/bin/env node") || content.starts_with("#!/usr/bin/env -S node") {
+            if content.starts_with("#!/usr/bin/env node")
+                || content.starts_with("#!/usr/bin/env -S node")
+            {
                 let node = process_util::resolve_command("node", ws.as_deref());
                 (node, vec![resolved.clone()])
             } else {
@@ -243,9 +252,12 @@ pub fn lsp_start(
     tracing::info!(
         "[lsp] spawning: cmd={actual_cmd:?} extra={extra_args:?} args={args:?} resolved={resolved:?}"
     );
-    let mut child = builder
-        .spawn()
-        .map_err(|e| format!("failed to start '{}' (resolved={}, actual={}): {}", command, resolved, actual_cmd, e))?;
+    let mut child = builder.spawn().map_err(|e| {
+        format!(
+            "failed to start '{}' (resolved={}, actual={}): {}",
+            command, resolved, actual_cmd, e
+        )
+    })?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -329,23 +341,18 @@ pub fn lsp_start(
 }
 
 #[tauri::command]
-pub fn lsp_send(
-    state: State<LspManager>,
-    lang: String,
-    message: String,
-) -> Result<(), String> {
+pub fn lsp_send(state: State<LspManager>, lang: String, message: String) -> Result<(), String> {
     let inner = state.inner.lock().map_err(|e| e.to_string())?;
-    let proc = inner.get(&lang).ok_or_else(|| format!("no LSP for '{lang}'"))?;
+    let proc = inner
+        .get(&lang)
+        .ok_or_else(|| format!("no LSP for '{lang}'"))?;
     proc.stdin_tx
         .send(message)
         .map_err(|e| format!("failed to send to LSP: {e}"))
 }
 
 #[tauri::command]
-pub fn lsp_stop(
-    state: State<LspManager>,
-    lang: String,
-) -> Result<(), String> {
+pub fn lsp_stop(state: State<LspManager>, lang: String) -> Result<(), String> {
     let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
     if let Some(mut proc) = inner.remove(&lang) {
         let _ = proc.child.kill();
@@ -411,7 +418,11 @@ pub fn lsp_detect_python() -> Result<PythonEnvInfo, String> {
     let exec_path = parsed["exec"].as_str().unwrap_or(&python).to_string();
     let paths: Vec<String> = parsed["paths"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(PythonEnvInfo {
         python_path: exec_path,
@@ -465,7 +476,9 @@ pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbol
     let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
     let now = Instant::now();
 
-    let cache_valid = guard.as_ref().map_or(false, |c| now.duration_since(c.fetched_at).as_secs() < 300);
+    let cache_valid = guard
+        .as_ref()
+        .map_or(false, |c| now.duration_since(c.fetched_at).as_secs() < 300);
 
     let all_modules = if cache_valid {
         guard.as_ref().unwrap().modules.clone()
@@ -517,8 +530,10 @@ print(json.dumps(r))"#;
                     });
                     for (k, v) in obj {
                         if let Some(arr) = v.as_array() {
-                            let syms: Vec<String> =
-                                arr.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+                            let syms: Vec<String> = arr
+                                .iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect();
                             c.symbol_cache.insert(k.clone(), syms.clone());
                             symbols.insert(k.clone(), syms);
                         }
@@ -543,7 +558,10 @@ pub struct NodeEnvSymbols {
 }
 
 #[tauri::command]
-pub fn lsp_node_env_symbols(project_dir: String, modules: Vec<String>) -> Result<NodeEnvSymbols, String> {
+pub fn lsp_node_env_symbols(
+    project_dir: String,
+    modules: Vec<String>,
+) -> Result<NodeEnvSymbols, String> {
     let node = process_util::resolve_command("node", None);
     let aug_path = process_util::augmented_path(None);
 
@@ -599,7 +617,9 @@ pub fn lsp_node_env_symbols(project_dir: String, modules: Vec<String>) -> Result
                             if let Some(arr) = v.as_array() {
                                 exports.insert(
                                     k.clone(),
-                                    arr.iter().filter_map(|s| s.as_str().map(String::from)).collect(),
+                                    arr.iter()
+                                        .filter_map(|s| s.as_str().map(String::from))
+                                        .collect(),
                                 );
                             }
                         }
@@ -689,19 +709,21 @@ fn run_cmd_collect(cmd_name: &str, args: &[&str], cwd: Option<&str>) -> Vec<Stri
         cmd.current_dir(d);
     }
     match cmd.output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .collect()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect(),
         _ => vec![],
     }
 }
 
 #[tauri::command]
-pub fn lsp_lang_env_symbols(lang: String, project_dir: String, modules: Vec<String>) -> Result<LangEnvSymbols, String> {
+pub fn lsp_lang_env_symbols(
+    lang: String,
+    project_dir: String,
+    modules: Vec<String>,
+) -> Result<LangEnvSymbols, String> {
     let mut symbols = Vec::new();
     let mut api_symbols: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -732,7 +754,11 @@ for _,v in ipairs(r) do print(v) end"#;
             }
         }
         "ruby" => {
-            let lines = run_cmd_collect("ruby", &["-e", "puts Gem::Specification.map(&:name).sort.uniq"], None);
+            let lines = run_cmd_collect(
+                "ruby",
+                &["-e", "puts Gem::Specification.map(&:name).sort.uniq"],
+                None,
+            );
             symbols.extend(lines);
             let builtins = run_cmd_collect("ruby", &["-e", "puts Object.constants.sort"], None);
             symbols.extend(builtins);
@@ -750,11 +776,22 @@ for _,v in ipairs(r) do print(v) end"#;
         "php" => {
             let exts = run_cmd_collect("php", &["-m"], None);
             symbols.extend(exts.iter().filter(|e| !e.starts_with('[')).cloned());
-            let fns = run_cmd_collect("php", &["-r", "echo implode(\"\\n\",array_slice(get_defined_functions()['internal'],0,500));"], None);
+            let fns = run_cmd_collect(
+                "php",
+                &[
+                    "-r",
+                    "echo implode(\"\\n\",array_slice(get_defined_functions()['internal'],0,500));",
+                ],
+                None,
+            );
             symbols.extend(fns);
         }
         "dart" => {
-            let deps = run_cmd_collect("dart", &["pub", "deps", "--style=compact"], Some(&project_dir));
+            let deps = run_cmd_collect(
+                "dart",
+                &["pub", "deps", "--style=compact"],
+                Some(&project_dir),
+            );
             for line in &deps {
                 if let Some(name) = line.split_whitespace().next() {
                     if name.chars().next().map_or(false, |c| c.is_alphabetic()) {
@@ -767,32 +804,150 @@ for _,v in ipairs(r) do print(v) end"#;
             let script = r#"import java.util.jar.*;import java.io.*;public class _Ls{public static void main(String[] a){for(String p:System.getProperty("java.class.path","").split(File.pathSeparator)){try{JarFile j=new JarFile(p);j.stream().filter(e->e.getName().endsWith(".class")).forEach(e->{String n=e.getName().replace('/','.');n=n.substring(0,n.length()-6);String s=n.contains(".")?n.substring(n.lastIndexOf('.')+1):n;if(!s.isEmpty()&&!s.startsWith("_"))System.out.println(s);});j.close();}catch(Exception ex){}}}}"#;
             let _ = script;
             let common = vec![
-                "String","Integer","Long","Double","Float","Boolean","Character","Byte","Short",
-                "ArrayList","LinkedList","HashMap","TreeMap","HashSet","TreeSet","LinkedHashMap",
-                "Collections","Arrays","Objects","Optional","Stream","Collectors",
-                "List","Map","Set","Queue","Deque","Iterator","Iterable","Comparable",
-                "Thread","Runnable","Callable","Future","CompletableFuture","ExecutorService",
-                "IOException","Exception","RuntimeException","NullPointerException",
-                "StringBuilder","StringBuffer","Scanner","Random","BigDecimal","BigInteger",
-                "File","Path","Paths","Files","InputStream","OutputStream","Reader","Writer",
-                "BufferedReader","BufferedWriter","FileReader","FileWriter","PrintWriter",
-                "Socket","ServerSocket","URL","URI","HttpURLConnection",
-                "Pattern","Matcher","DateTimeFormatter","LocalDate","LocalDateTime","Instant",
-                "System","Math","Class","Object","Enum","Annotation","Override","Deprecated",
+                "String",
+                "Integer",
+                "Long",
+                "Double",
+                "Float",
+                "Boolean",
+                "Character",
+                "Byte",
+                "Short",
+                "ArrayList",
+                "LinkedList",
+                "HashMap",
+                "TreeMap",
+                "HashSet",
+                "TreeSet",
+                "LinkedHashMap",
+                "Collections",
+                "Arrays",
+                "Objects",
+                "Optional",
+                "Stream",
+                "Collectors",
+                "List",
+                "Map",
+                "Set",
+                "Queue",
+                "Deque",
+                "Iterator",
+                "Iterable",
+                "Comparable",
+                "Thread",
+                "Runnable",
+                "Callable",
+                "Future",
+                "CompletableFuture",
+                "ExecutorService",
+                "IOException",
+                "Exception",
+                "RuntimeException",
+                "NullPointerException",
+                "StringBuilder",
+                "StringBuffer",
+                "Scanner",
+                "Random",
+                "BigDecimal",
+                "BigInteger",
+                "File",
+                "Path",
+                "Paths",
+                "Files",
+                "InputStream",
+                "OutputStream",
+                "Reader",
+                "Writer",
+                "BufferedReader",
+                "BufferedWriter",
+                "FileReader",
+                "FileWriter",
+                "PrintWriter",
+                "Socket",
+                "ServerSocket",
+                "URL",
+                "URI",
+                "HttpURLConnection",
+                "Pattern",
+                "Matcher",
+                "DateTimeFormatter",
+                "LocalDate",
+                "LocalDateTime",
+                "Instant",
+                "System",
+                "Math",
+                "Class",
+                "Object",
+                "Enum",
+                "Annotation",
+                "Override",
+                "Deprecated",
             ];
             symbols.extend(common.into_iter().map(String::from));
         }
         "swift" => {
             let common = vec![
-                "String","Int","Double","Float","Bool","Array","Dictionary","Set","Optional",
-                "print","debugPrint","fatalError","precondition","assert",
-                "struct","class","enum","protocol","extension","func","var","let","guard",
-                "UIView","UIViewController","UILabel","UIButton","UITableView","UICollectionView",
-                "URLSession","URLRequest","JSONDecoder","JSONEncoder","Codable","Decodable","Encodable",
-                "DispatchQueue","OperationQueue","NotificationCenter","UserDefaults","Bundle",
-                "CGFloat","CGPoint","CGSize","CGRect","NSObject","NSError",
-                "SwiftUI","View","Text","Button","NavigationView","List","VStack","HStack","ZStack",
-                "State","Binding","ObservableObject","Published","EnvironmentObject",
+                "String",
+                "Int",
+                "Double",
+                "Float",
+                "Bool",
+                "Array",
+                "Dictionary",
+                "Set",
+                "Optional",
+                "print",
+                "debugPrint",
+                "fatalError",
+                "precondition",
+                "assert",
+                "struct",
+                "class",
+                "enum",
+                "protocol",
+                "extension",
+                "func",
+                "var",
+                "let",
+                "guard",
+                "UIView",
+                "UIViewController",
+                "UILabel",
+                "UIButton",
+                "UITableView",
+                "UICollectionView",
+                "URLSession",
+                "URLRequest",
+                "JSONDecoder",
+                "JSONEncoder",
+                "Codable",
+                "Decodable",
+                "Encodable",
+                "DispatchQueue",
+                "OperationQueue",
+                "NotificationCenter",
+                "UserDefaults",
+                "Bundle",
+                "CGFloat",
+                "CGPoint",
+                "CGSize",
+                "CGRect",
+                "NSObject",
+                "NSError",
+                "SwiftUI",
+                "View",
+                "Text",
+                "Button",
+                "NavigationView",
+                "List",
+                "VStack",
+                "HStack",
+                "ZStack",
+                "State",
+                "Binding",
+                "ObservableObject",
+                "Published",
+                "EnvironmentObject",
             ];
             symbols.extend(common.into_iter().map(String::from));
         }
@@ -801,7 +956,10 @@ for _,v in ipairs(r) do print(v) end"#;
 
     symbols.sort();
     symbols.dedup();
-    Ok(LangEnvSymbols { symbols, api_symbols })
+    Ok(LangEnvSymbols {
+        symbols,
+        api_symbols,
+    })
 }
 
 #[derive(Serialize)]

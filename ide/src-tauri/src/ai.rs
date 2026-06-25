@@ -36,16 +36,27 @@ pub struct AiConfig {
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AiEvent {
-    Token { delta: String },
+    Token {
+        delta: String,
+    },
     /// Streamed model "thinking" (reasoning_content) — shown as a collapsible card.
-    Reasoning { delta: String },
+    Reasoning {
+        delta: String,
+    },
     /// `index` lets the frontend reassemble a tool call whose `id`/`name` arrive
     /// in the first delta while `arguments` stream across later deltas (the
     /// OpenAI streaming contract). Multiple parallel tool calls are told apart
     /// by their index.
-    ToolCall { index: u32, id: String, name: String, arguments: String },
+    ToolCall {
+        index: u32,
+        id: String,
+        name: String,
+        arguments: String,
+    },
     Done,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Call any OpenAI-compatible `/chat/completions` endpoint with streaming.
@@ -191,14 +202,22 @@ async fn ai_chat_inner(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // Accumulate RAW BYTES, not lossily-decoded strings: a multibyte UTF-8 char
+    // (e.g. a Chinese character) can be split across two network chunks, and
+    // decoding each chunk on its own would turn the split char into a `�`
+    // replacement char — visible mojibake in the streamed answer. SSE lines are
+    // delimited by '\n' (0x0A), a byte that never appears inside a multibyte
+    // UTF-8 sequence, so splitting on the byte and decoding each *complete* line
+    // is always valid.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
         // Server-sent events are newline-delimited `data: {...}` lines.
-        while let Some(pos) = buf.find('\n') {
-            let line: String = buf.drain(..=pos).collect();
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim();
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
@@ -214,14 +233,21 @@ async fn ai_chat_inner(
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 let delta = &v["choices"][0]["delta"];
                 // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
-                if let Some(rt) = delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str()) {
+                if let Some(rt) = delta["reasoning_content"]
+                    .as_str()
+                    .or_else(|| delta["reasoning"].as_str())
+                {
                     if !rt.is_empty() {
-                        let _ = on_event.send(AiEvent::Reasoning { delta: rt.to_string() });
+                        let _ = on_event.send(AiEvent::Reasoning {
+                            delta: rt.to_string(),
+                        });
                     }
                 }
                 if let Some(text) = delta["content"].as_str() {
                     if !text.is_empty() {
-                        let _ = on_event.send(AiEvent::Token { delta: text.to_string() });
+                        let _ = on_event.send(AiEvent::Token {
+                            delta: text.to_string(),
+                        });
                     }
                 }
                 if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -229,9 +255,17 @@ async fn ai_chat_inner(
                         let index = tc["index"].as_u64().unwrap_or(0) as u32;
                         let id = tc["id"].as_str().unwrap_or("").to_string();
                         let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                        let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+                        let args = tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
                         if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                            let _ = on_event.send(AiEvent::ToolCall { index, id, name, arguments: args });
+                            let _ = on_event.send(AiEvent::ToolCall {
+                                index,
+                                id,
+                                name,
+                                arguments: args,
+                            });
                         }
                     }
                 }
@@ -276,7 +310,15 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
 }
 
 fn utf8_len(b: u8) -> usize {
-    if b < 0x80 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 }
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 /// Best-effort HTML → readable text: drop `<script>`/`<style>` blocks and tags,
@@ -290,16 +332,31 @@ fn html_to_text(html: &str) -> String {
     while i < n {
         if bytes[i] == b'<' {
             if lower[i..].starts_with("<script") {
-                match lower[i..].find("</script>") { Some(rel) => { i += rel + 9; } None => break }
+                match lower[i..].find("</script>") {
+                    Some(rel) => {
+                        i += rel + 9;
+                    }
+                    None => break,
+                }
                 out.push(' ');
                 continue;
             }
             if lower[i..].starts_with("<style") {
-                match lower[i..].find("</style>") { Some(rel) => { i += rel + 8; } None => break }
+                match lower[i..].find("</style>") {
+                    Some(rel) => {
+                        i += rel + 8;
+                    }
+                    None => break,
+                }
                 out.push(' ');
                 continue;
             }
-            match html[i..].find('>') { Some(rel) => { i += rel + 1; } None => break }
+            match html[i..].find('>') {
+                Some(rel) => {
+                    i += rel + 1;
+                }
+                None => break,
+            }
             out.push(' ');
             continue;
         }
@@ -402,9 +459,10 @@ fn percent_decode_str(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) =
-                ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
-            {
+            if let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            ) {
                 out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;

@@ -108,8 +108,8 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
     // Fast-path: always allow temp / safe system directories before canonicalize.
     for prefix in SAFE_PREFIXES {
         if raw_target.starts_with(prefix) {
-            let resolved = std::fs::canonicalize(target_path)
-                .unwrap_or_else(|_| target_path.to_path_buf());
+            let resolved =
+                std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
             return Ok(resolved);
         }
     }
@@ -186,10 +186,15 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
         }
     }
 
-    let root_list: Vec<String> = roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+    let root_list: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().to_string())
+        .collect();
     Err(format!(
         "access denied: path '{}' (resolved '{}') is outside all workspace roots. Allowed: [{}].",
-        raw_target, resolved_str, root_list.join(", ")
+        raw_target,
+        resolved_str,
+        root_list.join(", ")
     ))
 }
 
@@ -233,9 +238,7 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
     require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| {
-        format!("cannot stat '{}': {}", path, e)
-    })?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
     if meta.is_dir() {
         return Err(format!(
             "'{}' is a directory, not a file. Use read_dir to list its contents.",
@@ -245,9 +248,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
     }
-    let bytes = std::fs::read(&path).map_err(|e| {
-        format!("cannot read '{}': {}", path, e)
-    })?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot open a binary file in the editor".into());
     }
@@ -551,7 +552,10 @@ pub fn replace_in_project(
     case_sensitive: bool,
 ) -> Result<ReplaceResult, String> {
     if query.is_empty() {
-        return Ok(ReplaceResult { files_changed: 0, replacements: 0 });
+        return Ok(ReplaceResult {
+            files_changed: 0,
+            replacements: 0,
+        });
     }
     let root_path = PathBuf::from(&root);
     let mut files_changed = 0usize;
@@ -570,7 +574,9 @@ pub fn replace_in_project(
                 Some(n) => n.to_string_lossy().to_string(),
                 None => continue,
             };
-            if name.starts_with('.') { continue; }
+            if name.starts_with('.') {
+                continue;
+            }
             if path.is_dir() {
                 if !IGNORED_DIRS.contains(&name.as_str()) {
                     stack.push(path);
@@ -581,7 +587,9 @@ pub fn replace_in_project(
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if meta.len() > SEARCH_MAX_FILE { continue; }
+            if meta.len() > SEARCH_MAX_FILE {
+                continue;
+            }
             let path_str = path.to_string_lossy().to_string();
             match replace_in_file(path_str, query.clone(), replacement.clone(), case_sensitive) {
                 Ok(c) if c > 0 => {
@@ -593,5 +601,8 @@ pub fn replace_in_project(
         }
     }
 
-    Ok(ReplaceResult { files_changed, replacements })
+    Ok(ReplaceResult {
+        files_changed,
+        replacements,
+    })
 }

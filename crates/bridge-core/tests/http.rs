@@ -272,7 +272,11 @@ async fn search_by_name() {
 async fn search_by_content() {
     let (_d, app) = app();
     let resp = app
-        .oneshot(authed("GET", "/api/search?q=alpha&path=&content=true", None))
+        .oneshot(authed(
+            "GET",
+            "/api/search?q=alpha&path=&content=true",
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

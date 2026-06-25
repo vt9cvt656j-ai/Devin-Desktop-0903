@@ -107,7 +107,15 @@ fn add_cargo_tasks(root: &Path, out: &mut Vec<TaskDefinition>) {
         ("cargo: test", "cargo test", "test"),
         ("cargo: run", "cargo run", "run"),
     ] {
-        push_task(out, root, "cargo", label, command, group, Some("$rustc".into()));
+        push_task(
+            out,
+            root,
+            "cargo",
+            label,
+            command,
+            group,
+            Some("$rustc".into()),
+        );
     }
 }
 
@@ -283,7 +291,9 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to run task: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run task: {e}"))?;
 
     // Drain stdout/stderr on threads (a full pipe buffer would otherwise deadlock
     // the child), capping each so a flood can't exhaust memory.
@@ -291,8 +301,16 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
     let mut err_pipe = child.stderr.take().unwrap();
     let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
     let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || { let mut b = Vec::new(); read_capped(&mut out_pipe, &mut b, MAX_TASK_OUTPUT); let _ = tx_o.send(b); });
-    std::thread::spawn(move || { let mut b = Vec::new(); read_capped(&mut err_pipe, &mut b, MAX_TASK_OUTPUT); let _ = tx_e.send(b); });
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        read_capped(&mut out_pipe, &mut b, MAX_TASK_OUTPUT);
+        let _ = tx_o.send(b);
+    });
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        read_capped(&mut err_pipe, &mut b, MAX_TASK_OUTPUT);
+        let _ = tx_e.send(b);
+    });
 
     // Wait with a timeout and kill a command that runs too long (a dev server, a
     // watch, or one blocked on input) instead of hanging the caller forever.
@@ -314,12 +332,16 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
         }
     };
 
-    let out_bytes = rx_o.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
-    let err_bytes = rx_e.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or_default();
+    let out_bytes = rx_o
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or_default();
+    let err_bytes = rx_e
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or_default();
     let mut stdout = String::from_utf8_lossy(&out_bytes).into_owned();
     let mut stderr = String::from_utf8_lossy(&err_bytes).into_owned();
-    let mut truncated =
-        truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT) | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
+    let mut truncated = truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT)
+        | truncate_on_boundary(&mut stderr, MAX_TASK_OUTPUT);
     if timed_out {
         truncated = true;
         stderr.push_str(&format!(
@@ -327,7 +349,13 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
         ));
     }
     let combined = format!("{stdout}{stderr}");
-    Ok(TaskRunResult { code, stdout, stderr, combined, truncated })
+    Ok(TaskRunResult {
+        code,
+        stdout,
+        stderr,
+        combined,
+        truncated,
+    })
 }
 
 /// Read a stream into `out`, but stop storing past `cap` bytes (keep draining so
@@ -382,7 +410,11 @@ mod tests {
     #[test]
     fn discovers_cargo_tasks() {
         let root = temp_root("cargo");
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
 
         let tasks = discover_tasks(&root);
         assert!(tasks.iter().any(|task| task.command == "cargo check"));
@@ -401,7 +433,10 @@ mod tests {
         .unwrap();
 
         let tasks = discover_tasks(&root);
-        let task = tasks.iter().find(|task| task.label == "Type Check").unwrap();
+        let task = tasks
+            .iter()
+            .find(|task| task.label == "Type Check")
+            .unwrap();
         assert_eq!(task.command, "npm run typecheck");
         assert_eq!(task.problem_matcher.as_deref(), Some("$tsc"));
         let _ = std::fs::remove_dir_all(root);
@@ -429,8 +464,11 @@ mod tests {
     #[test]
     fn capture_runs_command_and_collects_output() {
         let root = temp_root("capture");
-        let result = task_run_capture(root.to_string_lossy().to_string(), "echo michael-ide".into())
-            .expect("task should run");
+        let result = task_run_capture(
+            root.to_string_lossy().to_string(),
+            "echo michael-ide".into(),
+        )
+        .expect("task should run");
         assert_eq!(result.code, 0);
         assert!(result.combined.contains("michael-ide"));
         let _ = std::fs::remove_dir_all(root);

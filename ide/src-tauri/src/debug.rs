@@ -88,7 +88,6 @@ fn encode_dap_message(content: &str) -> String {
     format!("Content-Length: {}\r\n\r\n{}", content.len(), content)
 }
 
-
 #[tauri::command]
 pub fn dap_start(
     state: State<DebugManager>,

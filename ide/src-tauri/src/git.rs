@@ -355,7 +355,12 @@ pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, S
     let format = "%H%n%h%n%an%n%ar%n%s%n%P%n%D";
     let out = run_git_checked(
         &root,
-        &["log", "--all", &format!("-{n}"), &format!("--format={format}")],
+        &[
+            "log",
+            "--all",
+            &format!("-{n}"),
+            &format!("--format={format}"),
+        ],
     )?;
     let lines: Vec<&str> = out.lines().collect();
     let mut entries = Vec::new();
@@ -451,11 +456,7 @@ pub fn git_merge_versions(root: String, rel: String) -> Result<MergeVersions, St
 
 /// Accept one side of a merge conflict for a file.
 #[tauri::command]
-pub fn git_resolve_conflict(
-    root: String,
-    rel: String,
-    resolution: String,
-) -> Result<(), String> {
+pub fn git_resolve_conflict(root: String, rel: String, resolution: String) -> Result<(), String> {
     let root_path = PathBuf::from(&root);
     let file_path = root_path.join(&rel);
     match resolution.as_str() {
@@ -485,7 +486,11 @@ pub fn git_stash(root: String) -> Result<String, String> {
     let out = run_git(&root, &["stash", "push", "-m", "Michael IDE stash"])?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if out.status.success() {
-        Ok(if text.is_empty() { "No local changes to stash.".into() } else { text })
+        Ok(if text.is_empty() {
+            "No local changes to stash.".into()
+        } else {
+            text
+        })
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
@@ -505,9 +510,17 @@ pub fn git_stash_pop(root: String, index: Option<usize>) -> Result<String, Strin
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if out.status.success() {
-        Ok(if text.is_empty() { "Stash applied.".into() } else { text })
+        Ok(if text.is_empty() {
+            "Stash applied.".into()
+        } else {
+            text
+        })
     } else {
-        Err(if err.is_empty() { "git stash pop failed".into() } else { err })
+        Err(if err.is_empty() {
+            "git stash pop failed".into()
+        } else {
+            err
+        })
     }
 }
 
@@ -519,9 +532,17 @@ pub fn git_stash_apply(root: String, index: usize) -> Result<String, String> {
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if out.status.success() {
-        Ok(if text.is_empty() { "Stash applied.".into() } else { text })
+        Ok(if text.is_empty() {
+            "Stash applied.".into()
+        } else {
+            text
+        })
     } else {
-        Err(if err.is_empty() { "git stash apply failed".into() } else { err })
+        Err(if err.is_empty() {
+            "git stash apply failed".into()
+        } else {
+            err
+        })
     }
 }
 
@@ -533,9 +554,17 @@ pub fn git_stash_drop(root: String, index: usize) -> Result<String, String> {
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if out.status.success() {
-        Ok(if text.is_empty() { "Stash dropped.".into() } else { text })
+        Ok(if text.is_empty() {
+            "Stash dropped.".into()
+        } else {
+            text
+        })
     } else {
-        Err(if err.is_empty() { "git stash drop failed".into() } else { err })
+        Err(if err.is_empty() {
+            "git stash drop failed".into()
+        } else {
+            err
+        })
     }
 }
 
@@ -547,7 +576,11 @@ pub fn git_stash_list(root: String) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    Ok(text.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect())
+    Ok(text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// Show git blame for a file (line-by-line author + commit info).

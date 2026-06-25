@@ -144,7 +144,9 @@ pub fn term_open(
                     let bursting = n == buf.len();
                     if !bursting || pending.len() >= MAX_BATCH {
                         if on_event
-                            .send(TermEvent::Data { data: std::mem::take(&mut pending) })
+                            .send(TermEvent::Data {
+                                data: std::mem::take(&mut pending),
+                            })
                             .is_err()
                         {
                             return;

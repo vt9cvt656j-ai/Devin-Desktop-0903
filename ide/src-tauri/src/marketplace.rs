@@ -202,7 +202,10 @@ pub async fn marketplace_install(
 
     let _ = std::fs::remove_file(&archive_path);
 
-    Ok(format!("Installed {} v{}", result.manifest.name, result.manifest.version))
+    Ok(format!(
+        "Installed {} v{}",
+        result.manifest.name, result.manifest.version
+    ))
 }
 
 #[tauri::command]

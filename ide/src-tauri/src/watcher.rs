@@ -12,8 +12,22 @@ use tauri::{AppHandle, Emitter, State};
 /// which previously flooded the frontend (and its git refresh) and froze the app
 /// while a command ran — even a backgrounded one, since the churn happens anyway.
 const IGNORED_WATCH_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "dist", "build", "out", ".next", "coverage",
-    ".cache", ".venv", "__pycache__", "vendor", ".gradle", ".idea", "Pods", "DerivedData",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    "coverage",
+    ".cache",
+    ".venv",
+    "__pycache__",
+    "vendor",
+    ".gradle",
+    ".idea",
+    "Pods",
+    "DerivedData",
 ];
 
 fn is_ignored_path(path: &std::path::Path, roots: &[PathBuf]) -> bool {
@@ -81,26 +95,32 @@ pub fn fs_watch(
 
     let app_handle = app.clone();
     let roots_filter = new_paths.clone();
-    let mut debouncer = new_debouncer(Duration::from_millis(300), move |res: DebounceEventResult| {
-        match res {
-            Ok(events) => {
-                let mut changed: Vec<String> = events
-                    .iter()
-                    .filter(|e| e.kind == DebouncedEventKind::Any && !is_ignored_path(&e.path, &roots_filter))
-                    .map(|e| e.path.to_string_lossy().to_string())
-                    .collect();
-                if !changed.is_empty() {
-                    // Bound the batch so a huge legitimate change (e.g. a big
-                    // `git checkout`) still can't hand the UI thousands of paths.
-                    changed.truncate(500);
-                    let _ = app_handle.emit("fs-change", FsChangeEvent { paths: changed });
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(300),
+        move |res: DebounceEventResult| {
+            match res {
+                Ok(events) => {
+                    let mut changed: Vec<String> = events
+                        .iter()
+                        .filter(|e| {
+                            e.kind == DebouncedEventKind::Any
+                                && !is_ignored_path(&e.path, &roots_filter)
+                        })
+                        .map(|e| e.path.to_string_lossy().to_string())
+                        .collect();
+                    if !changed.is_empty() {
+                        // Bound the batch so a huge legitimate change (e.g. a big
+                        // `git checkout`) still can't hand the UI thousands of paths.
+                        changed.truncate(500);
+                        let _ = app_handle.emit("fs-change", FsChangeEvent { paths: changed });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[watcher] error: {e}");
                 }
             }
-            Err(e) => {
-                tracing::warn!("[watcher] error: {e}");
-            }
-        }
-    })
+        },
+    )
     .map_err(|e| format!("failed to create watcher: {e}"))?;
 
     let mut watched = HashSet::new();
