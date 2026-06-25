@@ -249,9 +249,21 @@ pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, S
 
     #[cfg(windows)]
     let mut cmd = {
+        // run_cmd executes through cmd.exe (COMSPEC). Two Windows-only fixes so
+        // the agent can actually *read* what happened:
+        //   1. `chcp 65001` switches the console to UTF-8 for this child, so
+        //      non-ASCII output (Chinese paths / error text) comes back as UTF-8
+        //      instead of OEM-codepage (GBK/936) mojibake we can't decode.
+        //   2. PYTHONUTF8 / PYTHONIOENCODING make Python tooling emit UTF-8 too.
+        // raw_arg keeps cmd metacharacters (& | > "") intact — std's normal arg
+        // quoting would mangle them for cmd.exe.
+        use std::os::windows::process::CommandExt;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
         let mut c = Command::new(shell);
-        c.arg("/C").arg(&command).current_dir(&dir);
+        c.raw_arg(format!("/C chcp 65001>nul & {command}"));
+        c.current_dir(&dir)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8");
         c
     };
     #[cfg(not(windows))]

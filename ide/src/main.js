@@ -5802,11 +5802,11 @@ const _AI_MODE_PROMPTS = {
 - 所有文件操作必须在工作区目录内；禁止访问 /Users、/etc、/var、/System 等工作区外目录。
 - 破坏性命令（rm -rf /、dd、mkfs、磁盘格式化）一律禁止；不扫描整个文件系统（find /、ls /Users、tree /）；一次最多并发 3 条命令，不重复执行刚跑过的命令。
 
-# 操作系统
-严格按上下文里的 OS 信息选命令（上下文第一行就有）：
-- macOS(zsh)：brew/open/launchctl/lsof/killall/pbcopy；禁用 type/dir/findstr/timeout/systemctl
-- Linux(bash)：apt/systemctl/xdg-open/journalctl
-- Windows(PowerShell)：Start-Process/Get-Process
+# 操作系统（上下文第一行有当前 OS / Shell——选错命令是 Windows 上最常见的失败，务必照它选）
+- **run_cmd 在 Windows 上经 cmd.exe 执行（不是 PowerShell）**，所以默认写 cmd 语法。确实需要 PowerShell 专属能力(cmdlet)时显式调出来：「powershell -NoProfile -Command "Get-Process ..."」。别在 cmd 里直接写 PS 命令（Start-Process/Get-ChildItem 之类会报错）。
+- **macOS(zsh) / Linux(bash)**：列目录 ls、看文件 cat、搜 grep -rn、删 rm -rf、建目录 mkdir -p；切目录「cd 子目录 && 命令」；后台起服务「nohup 命令 >/tmp/svc.log 2>&1 &」；临时目录 /tmp，环境变量 \$VAR；mac 专属 brew/open/pbcopy/lsof/killall，Linux 专属 apt/systemctl/xdg-open/journalctl。
+- **Windows(cmd.exe)**：列目录 dir、看文件 type、搜文本 findstr /s /n、删 del 或 rmdir /s /q、建目录 mkdir、拷 copy；跨盘切目录「cd /d D:\\path && 命令」；链式 a && b（cmd 支持 && || &）；临时目录 %TEMP%，环境变量 %VAR%；后台/起服务用「start "" /b 命令」（**绝不用 nohup、绝不用结尾 &、绝不用 /tmp、绝不 cat**）。路径分隔符是反斜杠，含空格加引号。
+- **跨平台优先**：能用语言自带的跨平台工具就别依赖某个 OS 的 shell 命令——node script.js、python x.py、git、cargo、npm 本身三平台通用，比 ls|grep / dir|findstr 这种拼接更稳。不确定某命令在当前 OS 是否存在，就先按上面的表选，或 web_search 查。
 
 # 工具
 - read_file(path)：读文件内容
@@ -5824,7 +5824,7 @@ const _AI_MODE_PROMPTS = {
 - write_file(path, content)：新建或整文件重写
 - delete_path(path)：删除文件/目录（递归），用于清理/重构
 - move_path(from, to)：移动或重命名文件/目录
-- run_cmd(command)：在隔离子进程里运行一条 shell 命令并拿到完整输出（装依赖、跑测试、构建、git 等）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录就写「cd 子目录 && 你的命令」；② 路径含空格务必加引号，如 cd "未命名文件夹 2/client"；③ 要启动服务器/前端来测试，用后台方式让命令立刻返回：「nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」——千万别前台直接跑服务（不返回会卡住）
+- run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止。
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -6032,8 +6032,18 @@ async function _detectOSDetail() {
       if (r?.stdout?.trim()) detail.arch = r.stdout.trim();
     } catch {}
   } else if (os === "Windows") {
-    detail.shell = "PowerShell";
+    // run_cmd executes via cmd.exe (COMSPEC) — tell the agent the truth so it
+    // writes cmd syntax, not PowerShell that would silently fail inside cmd.
+    detail.shell = "cmd.exe";
     detail.arch = "x86_64";
+    try {
+      const r = await backend.taskRunCapture(".", "ver & echo %PROCESSOR_ARCHITECTURE%");
+      const lines = (r?.stdout || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const verLine = lines.find(l => /Windows/i.test(l));
+      if (verLine) detail.version = verLine;
+      const arch = lines.find(l => /^(AMD64|ARM64|x86)$/i.test(l));
+      if (arch) detail.arch = /ARM64/i.test(arch) ? "arm64" : /AMD64/i.test(arch) ? "x86_64" : "x86";
+    } catch {}
   }
 
   _osDetailCache = detail;
@@ -7167,7 +7177,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。改已有文件请优先用它。old_string 必须能在文件中唯一定位（带足够上下文），否则会报错。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "multi_edit", description: "对同一个文件做多处精确替换：edits 是一组 {old_string, new_string, replace_all?}，按顺序原子应用（任一处定位失败则整体不写入、报错）。重构或一个文件里改多个地方时用它，比连发多次 edit_file 更快更可靠。每个 old_string 同样需在当时的文件内容里唯一定位。", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "有序的替换列表", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
-      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条 shell 命令（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条命令并返回完整输出（装依赖、跑测试、构建、git 等）。按当前 OS 选语法：Windows 经 cmd.exe（dir/type/findstr、cd /d、start \"\" /b、%TEMP%），mac/Linux 经 bash/zsh（ls/cat/grep、nohup …&、/tmp）。绝不前台直接起服务/watch。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。重构、改名时用。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
     );
