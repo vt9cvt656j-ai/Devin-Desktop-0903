@@ -5386,11 +5386,11 @@ loadBackendModels();
 let _chatSessions = [];
 let _activeChatIdx = -1;
 let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats after a close
-let streaming = false;
-// Which chat session the (single, global) agent run belongs to — so the send/
-// stop button reflects the RUNNING tab, not whichever tab you switched to, and
-// a different tab gets a clear "busy" message instead of a silently dead button.
-let _runningSession = null;
+// Streaming state is PER chat session — each tab runs its own agent loop
+// concurrently. `_isStreaming()` reflects the ACTIVE tab (for the send/stop
+// button); the running loop tracks its own `session.streaming`.
+function _isStreaming() { return !!_currentSession()?.streaming; }
+function _setStreamBtnForActive() { _setSendBtnStop(_isStreaming()); }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 
 function _currentSession() {
@@ -5502,9 +5502,9 @@ function _switchChatSession(idx) {
     chatEl.appendChild(session.container);
     chatEl.scrollTop = session.scrollPos || 0;
   }
-  // The send/stop button reflects whether THIS tab is the one currently running,
-  // so switching tabs no longer leaves a stuck "Stop" button on an idle tab.
-  _setSendBtnStop(streaming && _runningSession === session);
+  // The send/stop button reflects whether THIS tab is currently running — each
+  // tab has its own agent loop, so switching tabs shows the right button.
+  _setSendBtnStop(!!session.streaming);
 }
 
 function _newChatSession(name, mode) {
@@ -5738,11 +5738,13 @@ async function highlightCode(code, lang) {
   }
 }
 
-function addMessage(role, text) {
+function addMessage(role, text, forSession) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   let body;
-  const session = _currentSession();
+  // Render into the OWNING run's session container — so a background tab's agent
+  // run keeps appending to its own tab even while you're looking at another.
+  const session = forSession || _currentSession();
   const target = session ? session.container : chatEl;
   if (role === "assistant") {
     const id = currentModel();
@@ -5847,6 +5849,13 @@ const _AI_MODE_PROMPTS = {
 - 第一性原理 + 多路求证：难题先回到本质（这到底要解决什么、约束是什么），再从多个角度独立验证同一结论是否站得住（自一致性）；结论一致才有把握，矛盾就说明还没想清。
 - 复杂问题想深一点：越难越值得在动手前多想一步；但想的过程精炼，别把长篇思考全写进正文——正文只给结论和理由。
 
+# 推测与预判（主动想在前面，别等出事——这最能拉开"聪明"的差距）
+- **推断真实意图**：用户的话往往省略、模糊、甚至说反。先想"他到底想达成什么、为什么提这个"，把没说出口的目标、隐含约束、真正在意的点补全；含糊处用最可能的解释合理推进并说明假设，而不是机械照字面做或动不动反问。
+- **预判后果与涟漪**：改一处之前，先预测它会牵动什么——谁调用它、会不会破坏现有行为、有无同类代码要一起改、数据/接口/类型是否兼容、对性能/安全有无影响。改完主动检查这些连带点，别只盯着改的那一行。
+- **预判失败与边界**：动手前先在脑子里"跑一遍"，预测最可能出问题的地方（空值/异常/并发/超大或畸形输入/越权/网络失败/回滚），提前把防御写进去；命令/构建未跑就先预测它大概率会怎样失败、要先准备什么。
+- **预判用户下一步**：做完当前事，想一步"他接下来多半还需要什么"——配套的测试、用法示例、运行方式、可能想改的参数、下一个自然的功能——顺手提供或主动提出，而不是交一半等他再问。
+- **多路预测、择优**：关键决策处，先在心里列出 2–3 种走法各自的结果与代价，预测哪种更稳更贴合，再选；别只顺着第一直觉走。
+
 # 工作方式（每个任务都遵循）
 1. 先理解再动手——先用 search / find_files / list_dir / read_file 摸清相关代码，再改。绝不修改没读过的文件，也不要凭空猜测代码内容或路径。
 2. 规划——多步任务先用 update_plan 列出分步计划，开工后每完成一步就更新对应状态（pending/in_progress/completed），让用户随时看到进度。简单任务（一两步）不必用。
@@ -5866,6 +5875,13 @@ const _AI_MODE_PROMPTS = {
 - **根因优先**：修 bug 先定位「它到底为什么发生」，解决**根本原因**，不要打补丁糊症状；改完想一下有没有同类问题在别处。
 - **保持推进**：常规步骤（读文件、装依赖、跑构建/测试）直接做，不为每一步请示；信息不全就合理假设并说明，一路推到任务真正完成再收尾。
 - **沟通极简**：直接给结论，不写「我将要…/接下来我会…」这类铺垫，也不在正文复述正在调用的工具（系统已显示成卡片）；要指到代码就用 文件:行号。
+
+# 引导用户（让小白也能掌控——简洁，但不让人懵）
+- "沟通极简"是别啰嗦铺垫，不是把用户晾在一边。**收尾要让新手也看懂**：用大白话说清你**做了什么、为什么这么做、怎么用 / 怎么跑、改了哪些文件**；专业术语第一次出现顺手用一句话解释。
+- **主动给下一步**：每次收尾给 1–3 个具体可点的下一步建议（"要我加测试吗 / 要不要起服务截图看效果 / 接下来可以做 X"），让用户知道还能往哪走，而不是只甩一句"做完了"。
+- **要做选择时帮他拍板**：有多种方案 / 风格 / 取舍时，简明列出选项**并给出推荐和理由**，而不是把一堆专业问题原样甩给用户。
+- **预判困惑、提前点破**：想一步"新手到这儿可能卡哪、会不会误解"，提前用一句话点明（前提、坑、注意）。报错也翻译成人话 + 明确告诉他该怎么办。
+- 面向新手：少用黑话，多用类比和具体例子；默认用户不熟底层细节，但**别居高临下**。
 
 # 工程判断（默认这样思考，没人提也要做到）
 - 先顺着项目已有约定走——命名、目录结构、错误处理、状态管理、技术选型，都先看现有代码怎么做并保持一致；优先复用已有的工具/组件/模式，别另起一套。
@@ -5997,6 +6013,7 @@ const _AI_MODE_PROMPTS = {
 - 直奔重点：先给结论 / 答案，再按需展开原因与细节，不写"我将要…"这类铺垫。
 - 给代码就给**完整、能直接跑**的片段（含必要 import 与边界处理），用带语言标注的 fenced code block；指到代码用 文件:行号。
 - 分层解释：一句话结论 → 关键点 →（需要时）取舍 / 坑 / 最佳实践；长答案用小标题和列表，方便扫读。
+- **照顾新手**：默认用户可能是小白——专业术语顺手用一句大白话解释，多用类比和具体例子，别堆黑话也别居高临下；有多种做法时给推荐和理由帮他拍板，答完主动提 1–2 个"接下来可以问 / 可以做"的方向，让他知道下一步往哪走。
 - 只做"答"：不主动改文件、不跑命令（那是 Agent 模式的事）。需要真正动手改代码时，提示用户切到 Agent 模式。`,
 
   plan: `你是 Michael IDE 的架构规划智能体。你先调查代码库，再产出一份扎实、可直接照着实现的架构与实施方案。你有只读工具（read_file / list_dir / search / find_files / web_search / web_fetch / run_subagent / update_plan），但**绝不修改文件、不运行命令**。用中文回复。
@@ -6319,27 +6336,23 @@ async function sendPrompt(text, attachedImages = []) {
     showToast(t("assistant.configFirst"));
     return;
   }
-  // A run is already in flight. If it's THIS tab's run, ignore (it's showing
-  // Stop). If it's ANOTHER tab's run, tell the user clearly instead of silently
-  // doing nothing — then they can switch back, wait, or stop it.
-  if (streaming) {
-    if (_runningSession && _runningSession !== _currentSession()) {
-      showToast("另一个对话正在运行，先等它结束或点停止，或切回那个标签");
-    }
-    return;
-  }
-  _setSendBtnStop(true);
-  chatEl.querySelector(".chat-empty")?.remove();
-
+  // If THIS tab is already running, ignore (its button is Stop). Other tabs can
+  // run concurrently — each has its own agent loop.
+  if (_currentSession()?.streaming) return;
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
+  // Bind this whole turn to ONE session, captured now — so even if the user
+  // switches tabs mid-run, messages/history/state land on the right tab.
+  const sess = _currentSession();
+  _setSendBtnStop(true);
+  chatEl.querySelector(".chat-empty")?.remove();
 
   // Compact a long conversation before this turn (summarize older history).
   await _compactHistoryIfHuge(config);
 
   // Keep the active chat's project label in sync with the folder it's actually
   // operating on (handles opening a different project mid-conversation).
-  const _activeSess = _currentSession();
+  const _activeSess = sess;
   const _curRoot = rootPath || workspaceRoots[0] || "";
   if (_activeSess && _curRoot && _activeSess.project !== _curRoot) {
     _activeSess.project = _curRoot;
@@ -6347,7 +6360,7 @@ async function sendPrompt(text, attachedImages = []) {
     saveChatHistory();
   }
 
-  const userBody = addMessage("user", text);
+  const userBody = addMessage("user", text, sess);
   if (attachedImages.length > 0 && userBody) {
     for (const img of attachedImages) {
       const imgEl = document.createElement("img");
@@ -6388,7 +6401,9 @@ async function sendPrompt(text, attachedImages = []) {
   _compactHistoryIfNeeded();
 
   const messages = [{ role: "system", content: fullPrompt }];
-  for (const m of history) messages.push(m);
+  // Read THIS turn's session history explicitly (not the active-tab proxy) — the
+  // user may have switched tabs during the awaits above.
+  for (const m of sess.history) messages.push(m);
   // When images are attached, send a multimodal content array so vision models
   // actually see them. History keeps only the text (image data URLs would bloat
   // every subsequent request).
@@ -6420,7 +6435,7 @@ async function sendPrompt(text, attachedImages = []) {
     ? [{ type: "text", text: text + _extra }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
     : text + _extra;
   messages.push({ role: "user", content: userContent });
-  history.push({ role: "user", content: text });
+  sess.history.push({ role: "user", content: text });
 
   // Growth: record this turn's engagement signals for the learner model, tagged
   // with the project so skill practice accumulates across projects (越战越勇).
@@ -6450,11 +6465,11 @@ async function sendPrompt(text, attachedImages = []) {
   // model stops calling tools (task done) or we hit the iteration cap. Plain
   // chat / plan modes keep the original single-shot streaming path below.
   if (hasToolAccess) {
-    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "" });
+    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "", session: sess });
     return;
   }
 
-  const body = addMessage("assistant", "");
+  const body = addMessage("assistant", "", sess);
   body.appendChild(thinkingCard());
   let acc = "";
   let _shown = 0; // typewriter cursor: how many chars of `acc` are revealed so far
@@ -6555,9 +6570,8 @@ async function sendPrompt(text, attachedImages = []) {
     });
     _filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
       e.stopPropagation();
-      streaming = false;
-      _runningSession = null;
-      _setSendBtnStop(false);
+      sess.streaming = false;
+      if (sess === _currentSession()) _setSendBtnStop(false);
       showToast("Agent stopped");
     });
     _filesBar.querySelector(".agent-files-bar__btn--review").addEventListener("click", (e) => {
@@ -6689,11 +6703,10 @@ async function sendPrompt(text, attachedImages = []) {
     if (now - lastFlush < _gap) { scheduleStream(); return; }
     lastFlush = now;
     renderStream(acc);
-    if (streaming) scheduleStream();
+    if (sess.streaming) scheduleStream();
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
-  streaming = true;
-  _runningSession = _currentSession();
+  sess.streaming = true;
   const _pendingToolCalls = [];
   let _toolArgBuf = {};
   try {
@@ -6749,9 +6762,8 @@ async function sendPrompt(text, attachedImages = []) {
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
-    streaming = false;
-    _runningSession = null;
-    _setSendBtnStop(false);
+    sess.streaming = false;
+    if (sess === _currentSession()) _setSendBtnStop(false);
     body.querySelector(".thinking")?.remove();
     if (_streamEl) { _streamEl.remove(); _streamEl = null; }
     if (acc) {
@@ -7553,10 +7565,13 @@ function _refreshTreeFor(absPath) {
 
 // Run-level checkpoint: snapshot each file the moment before the agent FIRST
 // changes it this run, so the whole run's edits can be reverted in one click.
-const _runCheckpoint = new Map(); // absPath -> { existed: bool, content: string }
-function _checkpointRecord(absPath, existed, content) {
-  if (!absPath || _runCheckpoint.has(absPath)) return;
-  _runCheckpoint.set(absPath, { existed: !!existed, content: existed ? (content || "") : "" });
+const _runCheckpoint = new Map(); // legacy fallback when a call has no per-run context
+// Snapshot a file before its first change THIS run, into the run's own checkpoint
+// map (`cp`) — so each tab's "撤销本轮全部改动" reverts only its own run.
+function _checkpointRecord(cp, absPath, existed, content) {
+  cp = cp || _runCheckpoint;
+  if (!absPath || cp.has(absPath)) return;
+  cp.set(absPath, { existed: !!existed, content: existed ? (content || "") : "" });
 }
 async function _revertRun(snapshot) {
   let ok = 0, fail = 0;
@@ -7871,7 +7886,10 @@ function _isRetryableAiError(msg) {
     || /rate.?limit|too many requests|overloaded|temporar|timeout|timed out|econn|enotfound|network|connection (reset|refused|closed)|fetch failed|stream (error|closed)|server error|service unavailable|capacity|try again/.test(m);
 }
 
-async function _agentModelTurn({ config, messages, toolSchemas, body }) {
+async function _agentModelTurn({ config, messages, toolSchemas, body, session }) {
+  // `session` owns this turn — interrupt checks read session.streaming, and the
+  // auto-scroll only fires when this run's tab is the one on screen.
+  const _live = () => !session || session.streaming;
   let acc = "";
   let err = null;
   const byIndex = new Map();
@@ -7891,7 +7909,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
       if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
       renderMarkdownStream(streamEl, clean, { streaming: true });
     }
-    chatEl.scrollTop = chatEl.scrollHeight;
+    if (!session || session === _currentSession()) chatEl.scrollTop = chatEl.scrollHeight;
   };
   const schedule = () => {
     if (flushTimer) return;
@@ -7922,10 +7940,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
       });
     } catch (e) { turnErr = String(e?.message || e); }
 
-    if (turnErr && !produced && attempt < 3 && streaming && _isRetryableAiError(turnErr)) {
+    if (turnErr && !produced && attempt < 3 && _live() && _isRetryableAiError(turnErr)) {
       showToast(`网络/服务波动，重试中… (${attempt + 1}/3)`);
       await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt)));
-      if (!streaming) { err = turnErr; break; }
+      if (!_live()) { err = turnErr; break; }
       continue;
     }
     err = turnErr;
@@ -7985,7 +8003,9 @@ const _SUBAGENT_SYSTEM = `你是一个只读调研子智能体。你能用 read_
  * sub-agents read-only (no writes, no cmd, no nested sub-agents) makes them safe
  * to delegate big investigation chunks to without runaway recursion or edits.
  */
-async function _runSubAgent({ config, description, prompt, root, container }) {
+async function _runSubAgent({ config, description, prompt, root, container, run }) {
+  const _sess = run && run.session;
+  const _live = () => !_sess || _sess.streaming;
   const card = document.createElement("div");
   card.className = "agent-tool-step agent-tool-step--subagent is-open";
   card.innerHTML =
@@ -8010,8 +8030,8 @@ async function _runSubAgent({ config, description, prompt, root, container }) {
   const SUB_MAX = 12;
   try {
     for (let i = 0; i < SUB_MAX; i++) {
-      if (!streaming) break;
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, body: vp });
+      if (!_live()) break;
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, body: vp, session: _sess });
       if (turn.error) { report = report || `[ERROR] ${turn.error}`; break; }
       if (turn.text && turn.text.trim()) report = turn.text.trim();
       const am = { role: "assistant", content: turn.text || "" };
@@ -8028,8 +8048,8 @@ async function _runSubAgent({ config, description, prompt, root, container }) {
         vp.appendChild(step);
         toolCount++;
         let result;
-        if (!streaming) result = { type: call.type, path: call.path, content: "[interrupted]" };
-        else { try { result = await _executeToolStep(step, call, root); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
+        if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
+        else { try { result = await _executeToolStep(step, call, root, run); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
         messages.push({ role: "tool", tool_call_id: tc.id, content: _toolResultToString(call, result).slice(0, 8000) });
       }
       _trimMessagesIfHuge(messages);
@@ -8043,11 +8063,19 @@ async function _runSubAgent({ config, description, prompt, root, container }) {
   return report || "（子智能体未产出简报）";
 }
 
-async function _runAgenticLoop({ config, messages, root }) {
-  const body = addMessage("assistant", "");
+async function _runAgenticLoop({ config, messages, root, session }) {
+  // Bind this whole run to ONE session + a private per-run context, so multiple
+  // tabs can run agents concurrently without crossing state. `run.mode` and
+  // `run.checkpoint` are captured NOW so a later tab/mode switch can't block this
+  // run's writes or mix its revert snapshots with another run's.
+  session = session || _currentSession();
+  const run = { session, mode: _currentAiMode, checkpoint: new Map() };
+  const _live = () => !!session.streaming;
+  const _scroll = () => { if (session === _currentSession()) chatEl.scrollTop = chatEl.scrollHeight; };
+  const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
 
-  const isAgent = _currentAiMode === "agent";
+  const isAgent = run.mode === "agent";
   const toolSchemas = _buildAgentToolSchemas(isAgent);
 
   // Files/activity bar reused from the existing agent UI.
@@ -8062,7 +8090,7 @@ async function _runAgenticLoop({ config, messages, root }) {
     `</div>`;
   filesBar.addEventListener("click", (e) => { if (!e.target.closest(".agent-files-bar__btn")) filesBar.classList.toggle("is-open"); });
   filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
-    e.stopPropagation(); streaming = false; _runningSession = null; _setSendBtnStop(false); showToast("Agent stopped");
+    e.stopPropagation(); session.streaming = false; if (session === _currentSession()) _setSendBtnStop(false); showToast("Agent stopped");
   });
   const filesList = document.createElement("ul");
   filesList.className = "agent-files-list";
@@ -8071,11 +8099,9 @@ async function _runAgenticLoop({ config, messages, root }) {
   filesBar.style.display = "none";
   const trackedFiles = new Map();
 
-  streaming = true;
-  _runningSession = _currentSession();
-  _setSendBtnStop(true);
-  _clearAgentReadCache(); // fresh file reads each run
-  _runCheckpoint.clear(); // start a fresh revert checkpoint for this run
+  session.streaming = true;
+  if (session === _currentSession()) _setSendBtnStop(true);
+  _clearAgentReadCache(); // fresh file reads each run (read cache is shared; perf only)
 
   let finalErr = null;
   let summaryText = "";
@@ -8091,8 +8117,8 @@ async function _runAgenticLoop({ config, messages, root }) {
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
-      if (!streaming) break;
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, body });
+      if (!_live()) break;
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, body, session });
       if (turn.error) { finalErr = turn.error; break; }
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
 
@@ -8127,7 +8153,7 @@ async function _runAgenticLoop({ config, messages, root }) {
       for (const it of items) {
         if (it.call && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent") { it.step = _createToolStep(it.call); body.appendChild(it.step); }
       }
-      chatEl.scrollTop = chatEl.scrollHeight;
+      _scroll();
 
       const toolMsgs = new Array(items.length);
       const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot"]);
@@ -8135,9 +8161,9 @@ async function _runAgenticLoop({ config, messages, root }) {
       const runOne = async (it) => {
         const { call, step } = it;
         let result;
-        if (!streaming) result = { type: call.type, path: call.path, content: "[interrupted] 用户已停止任务。" };
+        if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted] 用户已停止任务。" };
         else {
-          try { result = await _executeToolStep(step, call, root); }
+          try { result = await _executeToolStep(step, call, root, run); }
           catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
         }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
@@ -8156,7 +8182,7 @@ async function _runAgenticLoop({ config, messages, root }) {
           parallel.push((async () => { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) }; })());
         } else if (it.tc.name === "run_subagent") {
           parallel.push((async () => {
-            const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body });
+            const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run });
             const key = "🤖 " + (it.call.description || "subagent");
             if (!trackedFiles.has(key)) { trackedFiles.set(key, "subagent"); _updateFilesBar(filesBar, filesList, trackedFiles); }
             toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: report.slice(0, 8000) };
@@ -8210,9 +8236,8 @@ async function _runAgenticLoop({ config, messages, root }) {
     }
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
-    streaming = false;
-    _runningSession = null;
-    _setSendBtnStop(false);
+    session.streaming = false;
+    if (session === _currentSession()) _setSendBtnStop(false);
     body.querySelector(".thinking")?.remove();
     if (hitCap) {
       const note = document.createElement("div");
@@ -8226,16 +8251,16 @@ async function _runAgenticLoop({ config, messages, root }) {
       note.textContent = "⚠️ " + finalErr;
       body.appendChild(note);
     }
-    if (!finalErr && summaryText) history.push({ role: "assistant", content: summaryText });
+    if (!finalErr && summaryText) session.history.push({ role: "assistant", content: summaryText });
     // Plan mode: one-click handoff to execute the proposed plan in agent mode
-    // (Claude Code's plan → execute flow). The plan is already in `history`, so
+    // (Claude Code's plan → execute flow). The plan is already in history, so
     // the agent sees it.
-    if (_currentAiMode === "plan" && !finalErr && summaryText && summaryText.trim()) {
+    if (run.mode === "plan" && !finalErr && summaryText && summaryText.trim()) {
       const exec = document.createElement("button");
       exec.className = "plan-exec-btn";
       exec.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="currentColor"><path d="M4 2.5v9l7-4.5z"/></svg> 用 Agent 执行此方案`;
       exec.addEventListener("click", () => {
-        if (streaming) return;
+        if (_isStreaming()) return;
         exec.disabled = true;
         _currentAiMode = "agent";
         _updateModeUI();
@@ -8248,14 +8273,14 @@ async function _runAgenticLoop({ config, messages, root }) {
     // Whole-run revert: one click restores every file this run touched to its
     // pre-run state (created files are removed). A checkpoint of each file was
     // taken before its first change.
-    if (_runCheckpoint.size > 0) {
-      const snapshot = new Map(_runCheckpoint);
+    if (run.checkpoint.size > 0) {
+      const snapshot = new Map(run.checkpoint);
       const n = snapshot.size;
       const revert = document.createElement("button");
       revert.className = "run-revert-btn";
       revert.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h5.5a2.5 2.5 0 010 5H7M4 7l2.4-2.4M4 7l2.4 2.4"/></svg> 撤销本轮全部改动（${n} 个文件）`;
       revert.addEventListener("click", async () => {
-        if (streaming) return;
+        if (session.streaming) return;
         revert.disabled = true;
         revert.innerHTML = "正在撤销…";
         growth.signal("revert-run", { n });
@@ -8533,14 +8558,19 @@ function _createToolStep(call) {
   return step;
 }
 
-async function _executeToolStep(step, call, root) {
+async function _executeToolStep(step, call, root, run) {
   const vp = step.querySelector(".atc-viewport");
   const res = step.querySelector(".atc-result");
   const row = step.querySelector(".agent-tool-row");
 
-  const readOnlyMode = _currentAiMode === "explorer" || _currentAiMode === "reviewer" || _currentAiMode === "plan";
+  // Per-run context (so parallel tab runs don't cross state): the run's mode was
+  // captured at start (a later tab/mode switch can't block this run), and its
+  // private revert-checkpoint map keeps each run's "undo" independent.
+  const _mode = (run && run.mode) || _currentAiMode;
+  const _cp = (run && run.checkpoint) || _runCheckpoint;
+  const readOnlyMode = _mode === "explorer" || _mode === "reviewer" || _mode === "plan";
   if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move" || call.type === "mkdir" || call.type === "copy" || call.type === "format")) {
-    const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
+    const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" ? "运行命令" : "修改文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = `⛔ ${modeName} 模式下禁止${what}`;
@@ -8702,7 +8732,7 @@ async function _executeToolStep(step, call, root) {
       let old = "";
       let existed = false;
       try { old = await backend.readTextFile(fp); existed = true; } catch {}
-      _checkpointRecord(fp, existed, old); // snapshot before first change (for revert-all)
+      _checkpointRecord(_cp, fp, existed, old); // snapshot before first change (for revert-all)
 
       let newContent = call.content;
 
@@ -8807,7 +8837,7 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
         return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
       }
-      _checkpointRecord(fp, true, old); // snapshot before first change (for revert-all)
+      _checkpointRecord(_cp, fp, true, old); // snapshot before first change (for revert-all)
       const edits = Array.isArray(call.edits) ? call.edits : [];
       if (!edits.length) {
         res.className = "atc-result atc-result--err"; res.textContent = "edits 为空";
@@ -8950,7 +8980,7 @@ async function _executeToolStep(step, call, root) {
       if (!p.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "delete", path: p, content: "[ERROR] 空路径。" }; }
       const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
       try {
-        try { _checkpointRecord(fp, true, await backend.readTextFile(fp)); } catch { /* dir/binary — not snapshotted */ }
+        try { _checkpointRecord(_cp, fp, true, await backend.readTextFile(fp)); } catch { /* dir/binary — not snapshotted */ }
         await backend.deletePath(fp);
         _invalidateRead(p); _agentReadCache.delete(fp);
         _refreshTreeFor(fp);
@@ -8967,7 +8997,7 @@ async function _executeToolStep(step, call, root) {
       const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
       const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
       try {
-        try { _checkpointRecord(fromFp, true, await backend.readTextFile(fromFp)); _checkpointRecord(toFp, false, ""); } catch {}
+        try { _checkpointRecord(_cp, fromFp, true, await backend.readTextFile(fromFp)); _checkpointRecord(_cp, toFp, false, ""); } catch {}
         await backend.renamePath(fromFp, toFp);
         _invalidateRead(from); _agentReadCache.delete(fromFp);
         _refreshTreeFor(fromFp); _refreshTreeFor(toFp);
@@ -9044,7 +9074,7 @@ async function _executeToolStep(step, call, root) {
       const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
       try {
         await backend.invoke("create_dir", { path: fp });
-        _checkpointRecord(fp, false, ""); // revert-all removes a dir we created
+        _checkpointRecord(_cp, fp, false, ""); // revert-all removes a dir we created
         _refreshTreeFor(fp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已创建目录";
         return { type: "mkdir", path: p, content: `已创建目录 ${p}` };
@@ -9060,7 +9090,7 @@ async function _executeToolStep(step, call, root) {
       const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
       try {
         await backend.invoke("copy_path", { from: fromFp, to: toFp });
-        _checkpointRecord(toFp, false, ""); // revert-all removes the copy
+        _checkpointRecord(_cp, toFp, false, ""); // revert-all removes the copy
         _refreshTreeFor(toFp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已复制";
         return { type: "copy", path: from, content: `已复制 ${from} → ${to}` };
@@ -9087,7 +9117,7 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--ok"; res.textContent = "已是规范格式";
         return { type: "format", path: rel, content: `${rel} 已是规范格式，无改动。` };
       }
-      _checkpointRecord(fp, true, old);
+      _checkpointRecord(_cp, fp, true, old);
       const { added, removed } = _diffStat(old, formatted);
       vp.innerHTML = _buildDiffView(old, formatted, rel);
       _highlightDiffView(vp);
@@ -9176,7 +9206,7 @@ async function _executeToolStep(step, call, root) {
       if (!gitRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "git", path: call.op, content: "[ERROR] 未打开工作区，无法执行 git。" }; }
       const mutating = call.op === "commit" || call.op === "push" || call.op === "pull" || (call.op === "branch" && !!call.branch);
       if (readOnlyMode && mutating) {
-        const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
+        const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
         res.className = "atc-result atc-result--blocked";
         res.textContent = `⛔ ${modeName} 模式禁止改动仓库`;
         return { type: "git", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能执行会改动仓库的 git ${call.op}。` };
@@ -12635,11 +12665,12 @@ function _setSendBtnStop(isStop) {
 }
 
 _sendBtnEl?.addEventListener("click", (e) => {
-  if (streaming && _sendBtnEl.classList.contains("is-stop")) {
+  // Stop button stops the ACTIVE tab's run (each tab has its own).
+  if (_isStreaming() && _sendBtnEl.classList.contains("is-stop")) {
     e.preventDefault();
     e.stopPropagation();
-    streaming = false;
-    _runningSession = null;
+    const s = _currentSession();
+    if (s) s.streaming = false;
     _setSendBtnStop(false);
     showToast("Generation stopped");
   }
@@ -12653,14 +12684,9 @@ promptEl.addEventListener("input", () => {
 });
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
-  if (streaming) {
-    // Don't silently swallow the submit on an idle tab while another runs —
-    // tell the user. (On the running tab the button is Stop, so this is a no-op.)
-    if (_runningSession && _runningSession !== _currentSession()) {
-      showToast("另一个对话正在运行，先等它结束或点停止，或切回那个标签");
-    }
-    return;
-  }
+  // Only block if THIS tab is already running (its button is Stop). Other tabs
+  // run concurrently, so submitting on an idle tab starts its own run.
+  if (_isStreaming()) return;
   const text = promptEl.value.trim();
   if (!text && _pastedImages.length === 0) return;
   const images = [..._pastedImages];
