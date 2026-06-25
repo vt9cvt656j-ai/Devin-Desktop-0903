@@ -6579,6 +6579,7 @@ async function sendPrompt(text, attachedImages = []) {
         else if (_toolArgBuf["_"]) { _toolArgBuf["_"].args += args; }
         const entry = _toolArgBuf[id] || _toolArgBuf["_"];
         if (entry && entry.args) {
+          _liveWritePreview(entry, body); // show code typing live as the args stream
           try {
             const parsed = JSON.parse(entry.args);
             const toolName = entry.name;
@@ -6588,6 +6589,7 @@ async function sendPrompt(text, attachedImages = []) {
             else if (toolName === "run_cmd") call = { type: "cmd", command: parsed.command };
             else if (toolName === "write_file") call = { type: "write", path: parsed.path, content: parsed.content };
             if (call) {
+              _removeWritePreview(entry); // hand off from the live preview to the real card
               body.querySelector(".thinking")?.remove();
               if (_streamEl) { _streamEl.remove(); _streamEl = null; }
               if (acc.trim()) { renderMarkdownInto(body, acc.trim(), { streaming: false }); acc = ""; _shown = 0; body._lastLen = 0; }
@@ -7657,6 +7659,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
           if (ev.id) e.id = ev.id;
           if (ev.name) e.name = ev.name;
           if (ev.arguments) e.args += ev.arguments;
+          _liveWritePreview(e, body); // show code typing live as write_file args stream
         }
         else if (ev.kind === "error") { turnErr = ev.message; }
       });
@@ -7700,6 +7703,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
     })
     .filter((tc) => tc.name);
 
+  for (const [, e] of byIndex) _removeWritePreview(e); // hand off live previews to the real cards
   return { text: acc, toolCalls, error: err };
 }
 
@@ -7988,6 +7992,65 @@ async function _runAgenticLoop({ config, messages, root }) {
     _updateFilesBar(filesBar, filesList, trackedFiles);
     chatEl.scrollTop = chatEl.scrollHeight;
   }
+}
+
+// Pull a string field out of a STILL-STREAMING (incomplete) JSON args buffer,
+// e.g. write_file's `content` before the closing quote/brace has arrived. Handles
+// the common JSON escapes so the live code preview reads correctly mid-stream.
+function _partialJsonString(buf, key) {
+  const m = `"${key}":"`;
+  const i = buf.indexOf(m);
+  if (i === -1) return null;
+  const s = buf.slice(i + m.length);
+  let out = "";
+  for (let j = 0; j < s.length; j++) {
+    const c = s[j];
+    if (c === "\\") {
+      const n = s[j + 1];
+      if (n === undefined) break; // dangling escape at the stream edge
+      if (n === "n") out += "\n";
+      else if (n === "t") out += "\t";
+      else if (n === "r") out += "\r";
+      else if (n === "u") { const h = s.slice(j + 2, j + 6); if (h.length === 4) { out += String.fromCharCode(parseInt(h, 16)); j += 4; } }
+      else out += n;
+      j++;
+    } else if (c === '"') {
+      break; // closing quote → value complete
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+// Live "writing code" preview: while a write_file/edit_file tool call streams its
+// args, show the code typing into a card right away instead of a blank spinner
+// until the whole JSON arrives (that felt like "writes 1 line then hangs").
+function _liveWritePreview(entry, container) {
+  if (!entry || (entry.name !== "write_file" && entry.name !== "edit_file")) return;
+  const content = _partialJsonString(entry.args || "", entry.name === "write_file" ? "content" : "new_string");
+  if (content == null || !content.length) return;
+  if (!entry.streamCard) {
+    const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
+    const card = document.createElement("div");
+    card.className = "code-card code-card--streaming";
+    card.innerHTML = '<div class="code-card__head"><span class="code-card__lang"><svg class="ic"><use href="#i-code"/></svg><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="atc-spin"></span><span class="code-card__linecount"></span></span></div><pre class="code-card__body"><code></code></pre>';
+    card.querySelector(".code-card__label").textContent = fname ? ("正在写 " + fname) : "正在写文件…";
+    container.appendChild(card);
+    entry.streamCard = card;
+  }
+  const codeEl = entry.streamCard.querySelector("code");
+  if (codeEl && codeEl._len !== content.length) {
+    codeEl.textContent = content;
+    codeEl._len = content.length;
+    const lc = entry.streamCard.querySelector(".code-card__linecount");
+    if (lc) lc.textContent = content.split("\n").length + " 行";
+    const pre = entry.streamCard.querySelector("pre");
+    if (pre) pre.scrollTop = pre.scrollHeight;
+  }
+}
+function _removeWritePreview(entry) {
+  if (entry && entry.streamCard) { entry.streamCard.remove(); entry.streamCard = null; }
 }
 
 function _createToolStep(call) {
