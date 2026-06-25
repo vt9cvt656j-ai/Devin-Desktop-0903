@@ -505,6 +505,20 @@
       </form>
     </dialog>
 
+    <!-- Devin API key dialog -->
+    <dialog class="sheet" id="devinKeyDialog">
+      <form method="dialog" class="sheet__body" id="devinKeyForm">
+        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
+        <h2>连接 Devin</h2>
+        <p class="sheet__sub">输入你的 Devin API Key（以 <code>apk_</code> 开头），助手将直接对接真实的 Devin 会话。密钥只保存在本地。</p>
+        <input id="devinKeyInput" type="password" class="login-input" placeholder="apk_..." autocomplete="off" spellcheck="false" />
+        <div class="sheet__actions">
+          <button class="btn" value="cancel" formnovalidate>取消</button>
+          <button class="btn btn--primary" value="save">保存</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- File-operation dialog (prompt / confirm) -->
     <dialog class="sheet sheet--io" id="ioDialog">
       <form method="dialog" class="sheet__body" id="ioForm">

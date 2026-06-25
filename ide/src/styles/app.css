@@ -6250,3 +6250,25 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 }
 .atmenu__item.is-active,
 .atmenu__item:hover { background: var(--accent, #0a84ff); color: #fff; }
+
+/* ---- Devin session mode ---- */
+.devin-status {
+  display: flex; align-items: center; gap: 8px;
+  margin: 6px 0 10px; padding: 6px 10px;
+  font-size: 12px; color: var(--text-dim, #9aa0a6);
+  border-radius: 8px; background: var(--panel-2, rgba(127, 127, 127, 0.08));
+}
+.devin-status__dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: var(--accent, #0a84ff);
+  animation: devin-pulse 1.2s ease-in-out infinite;
+}
+.devin-status.is-done .devin-status__dot { background: var(--ok, #2ea043); animation: none; }
+@keyframes devin-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.devin-activity {
+  display: flex; align-items: flex-start; gap: 7px;
+  margin: 4px 0; padding: 4px 10px;
+  font-size: 12px; color: var(--text-dim, #9aa0a6);
+}
+.devin-activity .ic { width: 13px; height: 13px; flex: none; margin-top: 1px; opacity: 0.7; }
+.devin-activity__text { white-space: pre-wrap; }

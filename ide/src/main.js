@@ -185,6 +185,12 @@ async function tauriBackend() {
     },
     aiComplete: (config, messages, maxTokens) =>
       core.invoke("ai_complete", { config, messages, maxTokens }),
+    devinCreateSession: (config, prompt, title) =>
+      core.invoke("devin_create_session", { config, prompt, title }),
+    devinSendMessage: (config, sessionId, message) =>
+      core.invoke("devin_send_message", { config, sessionId, message }),
+    devinGetSession: (config, sessionId) =>
+      core.invoke("devin_get_session", { config, sessionId }),
     termOpen: (opts, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
@@ -867,6 +873,9 @@ function mockBackend() {
       const code = user.split("\nCode:\n").slice(1).join("\nCode:\n");
       return "// ✦ preview mock edit — set a real provider for live edits\n" + code;
     },
+    devinCreateSession: async () => { throw new Error("Devin 需要桌面应用环境"); },
+    devinSendMessage: async () => { throw new Error("Devin 需要桌面应用环境"); },
+    devinGetSession: async () => { throw new Error("Devin 需要桌面应用环境"); },
     aiChat: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
       const reply = [
@@ -4990,6 +4999,7 @@ const BRAND_SYM = {
 /** Map a model id to its provider brand logo + brand colour. */
 function brandOf(id = "") {
   const s = id.toLowerCase();
+  if (s === "devin") return { sym: "i-sparkle", cls: "" };
   if (/^(gpt|o\d|chatgpt|text-|davinci)/.test(s)) return { sym: "i-brand-openai", cls: "brand--openai" };
   if (s.includes("claude")) return { sym: "i-brand-anthropic", cls: "brand--anthropic" };
   if (s.includes("deepseek")) return { sym: "i-brand-deepseek", cls: "brand--deepseek" };
@@ -5018,6 +5028,7 @@ function rebuildModelNames() {
 }
 rebuildModelNames();
 function modelLabel(id = "") {
+  if (id === "devin") return "Devin";
   return MODEL_NAMES[id] || id;
 }
 
@@ -5211,6 +5222,24 @@ function syncAssistantBrand() {
 function buildModelMenu() {
   const current = loadConfig().model;
   modelMenu.innerHTML = "";
+  // Devin mode: talk to a real Devin session (its own API key) instead of a
+  // gateway model. Always available at the top of the picker.
+  {
+    const dg = document.createElement("div");
+    dg.className = "menu__group";
+    dg.textContent = "Devin";
+    modelMenu.appendChild(dg);
+    const di = document.createElement("div");
+    const active = current === "devin";
+    di.className = "menu__item" + (active ? " is-active" : "");
+    di.setAttribute("role", "option");
+    const dmark = active
+      ? `<svg class="check"><use href="#i-check" /></svg>`
+      : `<span class="meta">Agent · 完整会话</span>`;
+    di.innerHTML = `<svg class="ic"><use href="#i-sparkle" /></svg><span class="name">Devin</span>${dmark}`;
+    di.addEventListener("click", () => { selectModel("devin"); closeModelMenu(); });
+    modelMenu.appendChild(di);
+  }
   for (const group of MODEL_GROUPS) {
     const g = document.createElement("div");
     g.className = "menu__group";
@@ -5405,6 +5434,7 @@ function _switchChatSession(idx) {
 }
 
 function _newChatSession(name, mode) {
+  resetDevinSession();
   const session = _createChatSession(name, mode);
   _chatSessions.push(session);
   _switchChatSession(_chatSessions.length - 1);
@@ -6151,6 +6181,9 @@ async function _gatherAgentContext() {
 }
 
 async function sendPrompt(text, attachedImages = []) {
+  // Devin mode routes to a real Devin session (its own API key) — bypass the
+  // gateway login/credits gate and the agentic loop below.
+  if (isDevinMode()) return sendDevinPrompt(text);
   // Require login + active membership or credits before any AI call.
   if (!(await michaelAccessGate())) return;
   const config = loadConfig();
@@ -9042,6 +9075,168 @@ function showAiDiffPreview(originalCode, modifiedCode, lang, filePath) {
 
   ed.updateOptions({ readOnly: false, originalEditable: false });
 }
+
+// ---- Devin session mode (assistant talks to a real Devin session) ----
+// Selected via the model picker ("Devin"); uses the user's own Devin API key
+// (config.devinApiKey), independent of the gateway login. We create/continue a
+// session and poll it, streaming Devin's messages into the chat.
+function isDevinMode() {
+  return loadConfig().model === "devin";
+}
+function devinConfig() {
+  const c = loadConfig();
+  return { apiKey: (c.devinApiKey || "").trim(), baseUrl: (c.devinBaseUrl || "").trim() };
+}
+// `var` (hoisted) + guarded reset so an early _newChatSession() during init can't
+// hit a temporal-dead-zone on these.
+var _devinSessionId = null;
+var _devinBusy = false;
+var _devinStatusEl = null;
+var _devinPollTimer = null;
+var _devinSeen = new Set();
+const _DEVIN_DONE = new Set(["finished", "expired", "suspended"]);
+
+function _stopDevinPoller() {
+  if (_devinPollTimer) { clearInterval(_devinPollTimer); _devinPollTimer = null; }
+}
+function resetDevinSession() {
+  _stopDevinPoller();
+  _devinSessionId = null;
+  _devinStatusEl = null;
+  if (_devinSeen) _devinSeen.clear();
+}
+function _devinTarget() {
+  const s = _currentSession();
+  return (s && s.container) || chatEl;
+}
+function _devinProjectContext() {
+  try {
+    const parts = [];
+    if (rootPath) parts.push(`Project folder: ${rootPath}`);
+    if (activePath && openFiles.has(activePath)) {
+      const f = openFiles.get(activePath);
+      const val = f && f.model ? f.model.getValue() : "";
+      const sel = (f && monacoEditor.getModel() === f.model) ? monacoEditor.getSelection() : null;
+      const selected = sel && !sel.isEmpty() ? f.model.getValueInRange(sel) : "";
+      if (val) parts.push(`Open file: ${activePath}\n\n\`\`\`\n${val.slice(0, 12000)}\n\`\`\``);
+      if (selected) parts.push(`Selected:\n\`\`\`\n${selected.slice(0, 4000)}\n\`\`\``);
+    }
+    return parts.join("\n\n");
+  } catch { return ""; }
+}
+function _devinStatusText(s) {
+  const map = {
+    claimed: "Devin 工作中…", running: "Devin 工作中…", working: "Devin 工作中…",
+    blocked: "Devin 在等你回复。", finished: "Devin 已完成。",
+    expired: "会话已过期。", suspended: "会话已挂起。",
+  };
+  return map[s] || `Devin: ${s}`;
+}
+function _devinStatusRow() {
+  const target = _devinTarget();
+  if (!_devinStatusEl || _devinStatusEl.parentNode !== target) {
+    const row = document.createElement("div");
+    row.className = "devin-status";
+    row.innerHTML = `<span class="devin-status__dot"></span><span class="devin-status__text"></span>`;
+    _devinStatusEl = row;
+  }
+  target.appendChild(_devinStatusEl);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  const textEl = _devinStatusEl.querySelector(".devin-status__text");
+  const rowEl = _devinStatusEl;
+  return { set(text, done) { textEl.textContent = text; rowEl.classList.toggle("is-done", !!done); } };
+}
+function _renderDevinMessages(msgs) {
+  (msgs || []).forEach((m, i) => {
+    const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
+    if (_devinSeen.has(id)) return;
+    _devinSeen.add(id);
+    if (!m.message) return;
+    if ((m.type || "").endsWith("user_message")) return; // already shown locally
+    if (m.type === "devin_message") {
+      addMessage("assistant", m.message);
+    } else {
+      // Progress / thinking step → a lightweight activity line.
+      const row = document.createElement("div");
+      row.className = "devin-activity";
+      row.innerHTML = `<svg class="ic"><use href="#i-sparkle" /></svg><span class="devin-activity__text"></span>`;
+      row.querySelector(".devin-activity__text").textContent = m.message;
+      _devinTarget().appendChild(row);
+    }
+  });
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+function _startDevinPoller() {
+  if (_devinPollTimer) return;
+  const status = _devinStatusRow();
+  const tick = async () => {
+    let session;
+    try {
+      session = await backend.devinGetSession(devinConfig(), _devinSessionId);
+    } catch (e) {
+      status.set("⚠️ " + String(e), true);
+      _stopDevinPoller();
+      return;
+    }
+    _renderDevinMessages(session.messages || []);
+    const state = session.status_enum || session.status;
+    const done = _DEVIN_DONE.has(state);
+    status.set(_devinStatusText(state), done);
+    if (done) _stopDevinPoller();
+  };
+  tick();
+  _devinPollTimer = setInterval(tick, 3000);
+}
+async function sendDevinPrompt(text) {
+  const cfg = devinConfig();
+  if (!cfg.apiKey) { openDevinKeyDialog(text); return; }
+  if (_devinBusy) return;
+  _devinBusy = true;
+  chatEl.querySelector(".chat-empty")?.remove();
+  if (!_currentSession()) _newChatSession();
+  addMessage("user", text);
+  const status = _devinStatusRow();
+  try {
+    if (!_devinSessionId) {
+      status.set("正在创建 Devin 会话…");
+      const ctx = _devinProjectContext();
+      const prompt = ctx ? `${text}\n\n---\n我的编辑器上下文:\n${ctx}` : text;
+      const ref = await backend.devinCreateSession(cfg, prompt, text.slice(0, 60));
+      _devinSessionId = ref.session_id;
+    } else {
+      status.set("发送给 Devin…");
+      await backend.devinSendMessage(cfg, _devinSessionId, text);
+    }
+    status.set("Devin 工作中…");
+    _startDevinPoller();
+  } catch (e) {
+    status.set("⚠️ " + String(e), true);
+  } finally {
+    _devinBusy = false;
+  }
+}
+// Devin API key dialog (added to index.html). Opening with a pending prompt
+// resends it once the key is saved.
+const _devinKeyDialog = $("devinKeyDialog");
+let _devinPendingPrompt = null;
+function openDevinKeyDialog(pendingText) {
+  _devinPendingPrompt = pendingText || null;
+  const input = $("devinKeyInput");
+  if (input) input.value = loadConfig().devinApiKey || "";
+  if (_devinKeyDialog) _devinKeyDialog.showModal();
+  else showToast("缺少 Devin Key 输入框");
+}
+$("devinKeyForm")?.addEventListener("submit", async (e) => {
+  if (e.submitter && e.submitter.value === "save") {
+    const key = ($("devinKeyInput").value || "").trim();
+    await saveConfig({ ...loadConfig(), devinApiKey: key });
+    showToast("Devin API Key 已保存");
+    const pending = _devinPendingPrompt; _devinPendingPrompt = null;
+    if (key && pending) sendDevinPrompt(pending);
+  } else {
+    _devinPendingPrompt = null;
+  }
+});
 
 // ---- settings dialog ----
 const settingsEl = $("settings");

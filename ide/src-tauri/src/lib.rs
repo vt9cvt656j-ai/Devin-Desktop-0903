@@ -1,6 +1,7 @@
 mod ai;
 mod auth;
 mod debug;
+mod devin;
 mod extensions;
 mod files;
 mod git;
@@ -99,6 +100,9 @@ pub fn run() {
             ai::ai_complete,
             ai::web_fetch,
             ai::web_search,
+            devin::devin_create_session,
+            devin::devin_send_message,
+            devin::devin_get_session,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
             extensions::ext_set_enabled,
