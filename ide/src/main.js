@@ -240,6 +240,71 @@ async function tauriBackend() {
   };
 }
 
+// Real AI over fetch+SSE for the BROWSER build (the desktop app streams via a
+// Tauri Channel instead). Lets the hosted web demo show genuine agent behaviour
+// (streaming, tool calls, live code-writing) against the central gateway — only
+// the filesystem/terminal stay mocked, since a browser can't touch local files.
+async function _realAiFetch(config, messages, tools, onEvent) {
+  try {
+    let key = config.apiKey;
+    if (!key) {
+      try { const r = await fetch(config.baseUrl + "/api/ide-key"); key = (await r.json()).api_key; } catch {}
+    }
+    const payload = { model: config.model, messages, stream: true };
+    if (tools && tools.length) payload.tools = tools;
+    const resp = await fetch(config.baseUrl + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (key || "") },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok || !resp.body) {
+      let t = ""; try { t = await resp.text(); } catch {}
+      onEvent({ kind: "error", message: t || ("请求失败 " + resp.status) });
+      onEvent({ kind: "done" });
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") { onEvent({ kind: "done" }); return; }
+        if (!data) continue;
+        try {
+          const v = JSON.parse(data);
+          const d = (v.choices && v.choices[0] && v.choices[0].delta) || {};
+          const rt = d.reasoning_content || d.reasoning;
+          if (rt) onEvent({ kind: "reasoning", delta: rt });
+          if (d.content) onEvent({ kind: "token", delta: d.content });
+          if (Array.isArray(d.tool_calls)) {
+            for (const tc of d.tool_calls) {
+              onEvent({
+                kind: "toolCall",
+                index: tc.index ?? 0,
+                id: tc.id || "",
+                name: (tc.function && tc.function.name) || "",
+                arguments: (tc.function && tc.function.arguments) || "",
+              });
+            }
+          }
+        } catch { /* keep buffering */ }
+      }
+    }
+    onEvent({ kind: "done" });
+  } catch (e) {
+    onEvent({ kind: "error", message: String((e && e.message) || e) });
+    onEvent({ kind: "done" });
+  }
+}
+
 function mockBackend() {
   const ROOT = "/Users/andrew/my-app";
   const DIRS = new Set([
@@ -876,7 +941,9 @@ function mockBackend() {
     devinCreateSession: async () => { throw new Error("Devin 需要桌面应用环境"); },
     devinSendMessage: async () => { throw new Error("Devin 需要桌面应用环境"); },
     devinGetSession: async () => { throw new Error("Devin 需要桌面应用环境"); },
-    aiChat: async (_config, messages, onEvent) => {
+    aiChat: (config, messages, onEvent) => _realAiFetch(config, messages, null, onEvent),
+    aiChatWithTools: (config, messages, tools, onEvent) => _realAiFetch(config, messages, tools, onEvent),
+    _mockAiChatUnused: async (_config, messages, onEvent) => {
       const last = (messages[messages.length - 1]?.content ?? "").slice(0, 80);
       const reply = [
         `Here's how I'd approach **"${last || "your request"}"**. This is a _preview mock_ \u2014 configure a real provider in settings (\u2699\ufe0f) for live answers.`,
