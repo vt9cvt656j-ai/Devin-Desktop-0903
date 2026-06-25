@@ -1,5 +1,6 @@
 mod ai;
 mod auth;
+mod capture;
 mod debug;
 mod devin;
 mod extensions;
@@ -102,6 +103,7 @@ pub fn run() {
             ai::ai_complete,
             ai::web_fetch,
             ai::web_search,
+            capture::capture_url,
             devin::devin_create_session,
             devin::devin_send_message,
             devin::devin_get_session,

@@ -5884,6 +5884,7 @@ const _AI_MODE_PROMPTS = {
 - 状态做全：hover / focus(可见键盘焦点环) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
 - 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也精致)、深浅主题都用变量、动效尊重 prefers-reduced-motion。
 - 一句话原则：**敢与众不同，但每一处都站得住脚**——独特来自刻意的设计决定与参考过的范式，不是随机堆装饰。
+- **视觉迭代闭环（做界面必做——你有"眼睛"，别盲改）**：① 用 run_in_terminal 起 dev server；② 用 screenshot 截它的地址（如 http://127.0.0.1:端口）把页面**看进眼里**；③ 据图找问题（错位、间距不匀、不对齐、配色/对比、视觉层级、溢出、空状态、响应式）；④ 改代码；⑤ 再 screenshot 复看。反复「看→改」直到真的好看、可用——写完代码不等于做完，**没亲眼看过渲染效果的界面不算交付**。改了样式/结构后务必重新截图确认。
 
 # 图标与视觉资源（做界面必须用 SVG 图标，绝不用 emoji 凑数）
 - **正式 UI 一律用 SVG 图标**，不用 emoji。两条路：① 复用项目已有图标集 / SVG sprite，保持风格统一；② 需要新图标时优先成熟图标库(Lucide / Material Symbols / Heroicons / Feather / Tabler)——可 web_search 查官方 SVG/用法再用；③ 或**自己手写干净的 SVG**：统一 24×24 viewBox、currentColor 继承主题色、1.5–2px 描边、线宽/圆角/端点风格一致、几何简洁对齐像素，一个图标一条主 path，别堆杂乱 path。
@@ -5891,12 +5892,20 @@ const _AI_MODE_PROMPTS = {
 - 品牌/产品 logo 用对应官方矢量标识(如各 AI 品牌的 mark)；装饰插画原型可用占位(picsum)，正式素材用可商用并注明出处的(Unsplash 等)，图标性质一律优先 SVG(清晰、可缩放、可换色)而非位图；外链注意许可与可用性。
 - 图标/插画/配色都统一到项目设计语言(用「UI 质量」的设计变量)，别东拼西凑。
 
-# 数据与数据库（涉及持久化/存储时）
-- 选对存储：简单本地配置用文件/KV；有关系、要查询、要事务才上关系型数据库——别为存几个键值上重型库，也别把关系数据硬塞进平面文件。
-- 表结构：字段给准确类型与约束（NOT NULL / UNIQUE / 外键 / 默认值），默认规范化到 3NF 消冗余，仅在有实测性能需要时才反规范化。
-- 索引：给 WHERE / JOIN / ORDER BY 用到的列建索引，**每个外键列都要建索引**；但别滥建（写入有代价）。
-- 迁移：schema 变更走版本化迁移脚本（可追溯、可回滚、向后兼容），别手改生产库。
-- 安全红线：SQL 一律参数化/预编译，**绝不把变量拼进 SQL 字符串**；关系完整性靠数据库外键约束兜底，而不是只靠应用代码。
+# 数据与数据库（涉及持久化/存储时——要真的会用，不是只会 SQLite）
+- **按场景选对数据库（每种都要知道何时用、怎么用）**：
+  · 关系型(PostgreSQL / MySQL / SQLite)：有结构、有关系、要事务/复杂查询的主存储，首选 Postgres；本地/嵌入用 SQLite。
+  · 文档型(MongoDB)：schema 灵活、嵌套文档、快速迭代的半结构化数据。
+  · 键值/缓存(Redis)：缓存、会话、排行榜、限流、消息队列、发布订阅。
+  · 搜索(Elasticsearch / Meilisearch / Postgres 全文检索)：全文搜索、模糊匹配、聚合。
+  · 时序(TimescaleDB / InfluxDB)、向量(pgvector / Qdrant)：监控指标 / 嵌入检索 RAG 等专用场景。
+  · 别为存几个键值上重型库，也别把关系数据硬塞进平面文件或硬塞进 KV。
+- **建表/建模认真做**：字段给准确类型与约束(NOT NULL / UNIQUE / 外键 / CHECK / 默认值)，主键用合适类型(自增 / UUID)，默认规范化到 3NF 消冗余、仅在有实测性能需要时才反规范化；时间统一带时区(timestamptz)，金额用定点而非浮点。文档库也要先想清文档结构与嵌套 vs 引用。
+- **索引**：给 WHERE / JOIN / ORDER BY 用到的列建索引，**每个外键列都要建索引**；高基数组合查询用复合索引(注意最左前缀)；别滥建(写入有代价)。
+- **优先用成熟数据访问层**：用项目已有的 ORM / query builder / 迁移工具(Prisma / Drizzle / TypeORM / SQLAlchemy / Django ORM / GORM / sqlx / Diesel / Ecto 等)，而不是手拼裸 SQL；不熟的库先 web_search 查官方文档的正确用法。
+- **迁移**：schema 变更走版本化迁移脚本(可追溯、可回滚、向后兼容)，别手改生产库；初始化要有种子数据/最小可跑示例。
+- 安全红线：SQL 一律参数化/预编译，**绝不把变量拼进 SQL 字符串**；关系完整性靠数据库外键约束兜底，而不是只靠应用代码；连接串/密码走环境变量，绝不硬编码进仓库。
+- 做完要**真连上验证**：建表后跑一条 migrate + 一组增删改查，用 run_cmd 或起服务确认 schema 与读写真的成立，而不是写完 SQL 就算完。
 
 # 参考与文献（按域取用——把不确定的点查成确定，交叉验证并注明来源；越是没把握越要查）
 - 推理方法（按需调用，别只会一种）：ReAct(想→做→观察循环)、计划-求解 Plan-and-Solve(先列计划再执行)、最少到最多 Least-to-Most(难题拆成由易到难的子问题)、链式验证 Chain-of-Verification(写完先逐条自查每个关键声明是否成立)、自一致性 Self-Consistency(多路独立推导取一致结论)、Reflexion(失败后反思再试)、第一性原理(回到本质而非套模板)。
@@ -5907,6 +5916,14 @@ const _AI_MODE_PROMPTS = {
 - API / 协议：相关 RFC、OpenAPI 规范、官方 SDK 文档。
 - 设计 / UI：见「UI 质量」一节列的设计系统、灵感库与动效库。
 - 用法：web_search 找一手来源 → web_fetch 读全文 → 交叉比对 ≥2 处 → 按事实落地并注明出处；新技术 / 版本差异 / 安全相关绝不凭记忆。
+
+# 部署与构建（要会把东西真正跑起来 / 发出去，不是写完代码就完）
+- **构建产物**：知道每种栈的产物与命令——前端 npm/pnpm run build 出静态资源；Rust cargo build --release；Go go build；Python 打 wheel / PyInstaller；Java mvn/gradle package 出 jar。构建失败就读报错 → 定位 → 修 → 再构建，循环到通过。
+- **容器化**：能写规范 Dockerfile——多阶段构建(builder + 瘦运行镜像)、最小基础镜像、分层利用缓存(先 COPY 依赖清单再装、后 COPY 源码)、非 root 用户、EXPOSE 端口、healthcheck；多服务用 docker-compose(app + db + redis)；写 .dockerignore 别把 node_modules / target 塞进镜像。
+- **配置与密钥**：配置走环境变量 / .env（给 .env.example，真 .env 进 .gitignore），区分 dev/prod；密钥绝不进镜像 / 仓库。
+- **平台**：静态站 / 前端 → Vercel / Netlify / Cloudflare Pages / GitHub Pages；后端 / 全栈 → Docker + VPS、Railway、Render、Fly.io、云厂商；数据库用托管实例。不熟的平台先 web_search 查官方部署文档再做。
+- **CI/CD**：能写 GitHub Actions 等流水线——装依赖 → lint → 测试 → 构建 →（可选）发布；缓存依赖加速。
+- **验证**：部署 / 构建后要确认真的起来了——产物能跑、容器能 docker run 起、健康检查通过、关键路径点一遍（用 run_in_terminal 起服务 + screenshot / web_fetch 验证）。没验证过的"部署好了"不算数。
 
 # 编辑规则
 - 改已有文件**优先用 edit_file**（精确替换片段）；不要用 write_file 整文件重写——重写易丢内容、易出错。
@@ -5957,6 +5974,7 @@ const _AI_MODE_PROMPTS = {
 - format_file(path)：用语言服务格式化整个文件（可撤销、显示 diff）；无可用格式化器时改用 run_cmd 跑 prettier/rustfmt/gofmt
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止；⑤ **要起持续运行的服务/watch（dev server、nodemon、tail -f 等）别用 run_cmd**，改用 run_in_terminal 挂到 IDE 真实终端里。
 - run_in_terminal(command, name?)：把**长时间运行/持续**的命令挂到 IDE 的真实终端 tab 里持续运行（dev server、watch、守护进程）。它一直跑、用户可见可停，返回启动后几秒的输出供你确认。可多次调用并行挂多个任务。要测它是否提供服务，再用 web_fetch 访问 http://127.0.0.1:端口。
+- screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -7369,6 +7387,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "lsp_symbols", description: "列出一个文件的代码结构大纲——靠语言服务(LSP / Monaco TS)解析出函数/类/方法/变量等符号及其行号。比 read_file 读全文更快看清一个文件的骨架。需要该语言有可用的语言服务（JS/TS 内置可用；Python/Go/Rust 等需装对应 LSP）。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径" } }, required: ["path"] } } },
     { type: "function", function: { name: "lsp_definition", description: "跳到某个符号的定义。给符号所在的文件、行号(line)和符号名(symbol)，返回定义所在的 文件:行。按语义解析，比靠 search 猜更准。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
     { type: "function", function: { name: "lsp_references", description: "查找一个符号在项目里的所有引用/用法。给符号所在文件、行号(line)、符号名(symbol)，返回引用列表(文件:行)。按语义解析，比纯文本 search 准（能区分同名不同物）。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
+    { type: "function", function: { name: "screenshot", description: "用无头浏览器渲染一个 http/https 网址并截图，**截图会直接回传给你看**——这是你的“眼睛”。典型用法：先用 run_in_terminal 起 dev server，再 screenshot 它的地址(如 http://127.0.0.1:3000)，据图检查布局/对齐/间距/配色/对比度/层级/响应式并改进，改完再截一次，形成「看→改」闭环。需要本机装有 Chrome / Chromium / Edge（没有会提示你）。", parameters: { type: "object", properties: { url: { type: "string", description: "要截图的网址，如 http://127.0.0.1:3000" }, width: { type: "integer", description: "视口宽，默认 1280" }, height: { type: "integer", description: "视口高，默认 800" } }, required: ["url"] } } },
   ];
   if (includeWrite) {
     tools.push(
@@ -7418,6 +7437,7 @@ function _mapToolCall(name, args) {
     case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
     case "git_push": return { type: "git", op: "push" };
     case "git_pull": return { type: "git", op: "pull" };
+    case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height };
     case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     case "lsp_references": return { type: "lsp", op: "references", path: args.path || "", line: args.line, symbol: args.symbol || "" };
@@ -8045,6 +8065,7 @@ async function _runAgenticLoop({ config, messages, root }) {
   // latest plan — so we can nudge the model to finish its plan and to verify its
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, planSteps = null;
+  const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
   let continueNudges = 0, verifyNudges = 0;
 
   try {
@@ -8088,7 +8109,7 @@ async function _runAgenticLoop({ config, messages, root }) {
       chatEl.scrollTop = chatEl.scrollHeight;
 
       const toolMsgs = new Array(items.length);
-      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp"]);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot"]);
 
       const runOne = async (it) => {
         const { call, step } = it;
@@ -8098,7 +8119,8 @@ async function _runAgenticLoop({ config, messages, root }) {
           try { result = await _executeToolStep(step, call, root); }
           catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
         }
-        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy") ? "" : (call.path || "");
+        it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "screenshot") ? "" : (call.path || "");
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
         return _toolResultToString(call, result).slice(0, 8000);
       };
@@ -8136,6 +8158,21 @@ async function _runAgenticLoop({ config, messages, root }) {
       }
 
       for (const m of toolMsgs) messages.push(m);
+
+      // Eyes: feed any screenshots back to the model as image(s) so it can
+      // actually SEE the rendered UI and self-correct — not edit blind. Keep only
+      // the newest screenshot set in context (images are large / costly).
+      const _imgs = [];
+      for (const it of items) { if (it.rawResult && it.rawResult.image) _imgs.push(it.rawResult.image); }
+      if (_imgs.length) {
+        while (_shotMsgs.length) { const old = _shotMsgs.shift(); const oi = messages.indexOf(old); if (oi >= 0) messages.splice(oi, 1); }
+        const content = [{ type: "text", text: `这是当前页面的渲染截图（${_imgs.length} 张）。请据图检查并改进 UI（布局/对齐/间距/配色/对比度/视觉层级/响应式），别只看代码。` }];
+        for (const u of _imgs) content.push({ type: "image_url", image_url: { url: u } });
+        const imgMsg = { role: "user", content };
+        messages.push(imgMsg);
+        _shotMsgs.push(imgMsg);
+      }
+
       _trimMessagesIfHuge(messages);
 
       // Track this turn for the finish/verify gates above.
@@ -8375,10 +8412,12 @@ function _createToolStep(call) {
     ? ((call.op || "") + (call.path ? " " + call.path : "") + (call.symbol ? " · " + call.symbol : ""))
     : call.type === "copy"
     ? ((call.path || "") + (call.to ? " → " + call.to : ""))
+    : call.type === "screenshot"
+    ? (call.url || "")
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8396,12 +8435,13 @@ function _createToolStep(call) {
     copy: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>`,
     format: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 0a.5.5 0 01.5.5c0 1.5.5 2 2 2a.5.5 0 010 1c-1.5 0-2 .5-2 2a.5.5 0 01-1 0c0-1.5-.5-2-2-2a.5.5 0 010-1c1.5 0 2-.5 2-2a.5.5 0 01.5-.5zM3.5 6a.5.5 0 01.5.5c0 1 .333 1.333 1.333 1.333a.5.5 0 010 1C4.333 8.833 4 9.167 4 10.167a.5.5 0 01-1 0c0-1-.333-1.334-1.333-1.334a.5.5 0 010-1C2.667 7.833 3 7.5 3 6.5a.5.5 0 01.5-.5zm6 4a.5.5 0 01.5.5c0 1.25.5 1.75 1.75 1.75a.5.5 0 010 1c-1.25 0-1.75.5-1.75 1.75a.5.5 0 01-1 0c0-1.25-.5-1.75-1.75-1.75a.5.5 0 010-1c1.25 0 1.75-.5 1.75-1.75a.5.5 0 01.5-.5z"/></svg>`,
     termtask: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
+    screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -8921,6 +8961,24 @@ async function _executeToolStep(step, call, root) {
       res.textContent = hits ? `${hits} 条结果` : "完成";
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "websearch", path: call.path, content: text };
+
+    } else if (call.type === "screenshot") {
+      const url = (call.url || call.path || "").trim();
+      if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "screenshot", path: "", content: "[ERROR] 需要 url（要截图的网址，如 http://127.0.0.1:3000）。" }; }
+      let dataUrl = "";
+      try { dataUrl = await backend.invoke("capture_url", { url, width: call.width || 1280, height: call.height || 800 }); }
+      catch (e) {
+        const msg = String(e?.message || e).slice(0, 240);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
+        if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
+        return { type: "screenshot", path: url, content: `[截图失败] ${msg}` };
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = "已截图";
+      if (vp) vp.innerHTML = `<img src="${dataUrl}" alt="screenshot" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
+      step.classList.add("is-open");
+      chatEl.scrollTop = chatEl.scrollHeight;
+      // `image` is picked up by the agent loop and fed back to the model multimodally.
+      return { type: "screenshot", path: url, image: dataUrl, content: `已截取 ${url} 的渲染截图（图片已回传给你看）。请仔细看图，找出 UI 问题（布局/对齐/间距/配色/对比度/视觉层级/响应式）并改进。` };
 
     } else if (call.type === "mkdir") {
       const p = (call.path || "").trim();
