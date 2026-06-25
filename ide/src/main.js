@@ -8355,13 +8355,16 @@ function _liveWritePreview(entry, container) {
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 
-  // 2) Fill in the filename once the (small) `path` field has streamed in.
-  if (!entry._fnameSet) {
+  // 2) Keep the filename in sync as the `path` field streams. Do NOT lock onto
+  //    the first partial value — "comp" would freeze before "component.tsx"
+  //    finished arriving. Re-read every call (path is tiny) so the label always
+  //    shows the latest, complete-so-far name.
+  {
     const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
     if (fname) {
       const label = entry.streamCard.querySelector(".code-card__label");
-      if (label) label.textContent = "正在写 " + fname;
-      entry._fnameSet = true;
+      const want = "正在写 " + fname;
+      if (label && label.textContent !== want) label.textContent = want;
     }
   }
 
@@ -8371,9 +8374,11 @@ function _liveWritePreview(entry, container) {
   _scheduleWritePreviewFlush(entry);
 }
 
-// rAF typewriter: reveal a bit more of the decoded content each frame, appending
-// only the new slice. Geometric catch-up keeps the preview close behind a fast
-// stream without ever doing O(n) DOM work per delta.
+// rAF typewriter. Each frame reveals more of the decoded content as PLAIN text
+// (immediate, so the code visibly types in real time), with a geometric catch-up
+// so a fast/bursty stream never lags far behind. Syntax COLOR is applied on a
+// short debounce (monaco.colorize is async + O(n), so doing it every frame would
+// jank) — the code shows instantly and gains color a beat later.
 function _scheduleWritePreviewFlush(entry) {
   if (entry._flushReq) return;
   entry._flushReq = requestAnimationFrame(() => {
@@ -8385,24 +8390,55 @@ function _scheduleWritePreviewFlush(entry) {
     if (shown >= target.length) return;
     const remaining = target.length - shown;
     const step = Math.min(remaining, Math.max(8, Math.ceil(remaining / 3)));
-    const slice = target.slice(shown, shown + step);
     entry._shownLen = shown + step;
+    const shownText = target.slice(0, entry._shownLen);
     const codeEl = card.querySelector("code");
-    if (codeEl) codeEl.appendChild(document.createTextNode(slice));
-    for (let i = 0; i < slice.length; i++) if (slice.charCodeAt(i) === 10) entry._shownLines++;
+    if (codeEl) codeEl.textContent = shownText; // immediate plain render
+    let n = 1; for (let i = 0; i < shownText.length; i++) if (shownText.charCodeAt(i) === 10) n++;
     const lc = card.querySelector(".code-card__linecount");
-    if (lc) lc.textContent = entry._shownLines + " 行";
+    if (lc) lc.textContent = n + " 行";
     const pre = card.querySelector("pre");
     if (pre) pre.scrollTop = pre.scrollHeight;
+    _scheduleWritePreviewColor(entry); // colorize on a debounce
     if (entry._shownLen < target.length) _scheduleWritePreviewFlush(entry); // keep typing
   });
+}
+
+// Debounced syntax highlight for the live preview: colorize the shown text once
+// the stream pauses briefly, then again at the end — so the typing code is
+// colored, not flat plain text. Guarded by a generation counter so a stale async
+// colorize result can't overwrite newer content.
+function _scheduleWritePreviewColor(entry) {
+  if (entry._hlTimer) clearTimeout(entry._hlTimer);
+  entry._hlTimer = setTimeout(() => {
+    entry._hlTimer = 0;
+    const card = entry.streamCard;
+    if (!card) return;
+    const codeEl = card.querySelector("code");
+    if (!codeEl) return;
+    const shownText = (entry._target || "").slice(0, entry._shownLen || 0);
+    if (!shownText.trim()) return;
+    const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop() || "";
+    const lang = extLang(fname);
+    if (!lang || lang === "plaintext") return;
+    const gen = (entry._hlGen = (entry._hlGen || 0) + 1);
+    monaco.editor.colorize(shownText, lang, { tabSize: 2 }).then((html) => {
+      // Only apply if nothing newer was typed/colorized and the card still exists.
+      if (entry.streamCard === card && entry._hlGen === gen && codeEl.isConnected
+          && (entry._target || "").slice(0, entry._shownLen || 0) === shownText) {
+        codeEl.innerHTML = html;
+        if (card.querySelector("pre")) card.querySelector("pre").scrollTop = card.querySelector("pre").scrollHeight;
+      }
+    }).catch(() => {});
+  }, 130);
 }
 
 function _removeWritePreview(entry) {
   if (!entry) return;
   if (entry._flushReq) { cancelAnimationFrame(entry._flushReq); entry._flushReq = 0; }
+  if (entry._hlTimer) { clearTimeout(entry._hlTimer); entry._hlTimer = 0; }
   if (entry.streamCard) { entry.streamCard.remove(); entry.streamCard = null; }
-  entry._sc = null; entry._target = ""; entry._shownLen = 0; entry._fnameSet = false;
+  entry._sc = null; entry._target = ""; entry._shownLen = 0;
 }
 
 function _createToolStep(call) {
