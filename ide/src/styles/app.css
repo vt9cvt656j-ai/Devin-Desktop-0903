@@ -2272,39 +2272,40 @@ body.zen-mode .editor {
 .agent-term-card {
   border-radius: 10px;
   overflow: hidden;
-  border: 1px solid rgba(255,255,255,.08);
-  background: #0d1117;
-  box-shadow: 0 1px 3px rgba(0,0,0,.25);
-  transition: border-color .15s ease;
+  border: 1px solid var(--atc-border);
+  background: var(--atc-bg);
+  box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  transition: border-color .15s ease, box-shadow .15s ease;
   animation: atcFadeIn .2s ease both;
 }
-.agent-term-card:hover { border-color: rgba(255,255,255,.16); }
+.agent-term-card:hover { border-color: #d0d7de; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
 .agent-term-card__header {
   display: flex;
   align-items: center;
   gap: 9px;
   padding: 7px 12px;
-  background: rgba(255,255,255,.025);
-  border-bottom: 1px solid rgba(255,255,255,.06);
+  background: var(--atc-head);
+  border-bottom: 1px solid var(--atc-border);
   min-height: 32px;
 }
 /* A clean terminal glyph instead of skeuomorphic macOS traffic-light dots. */
 .agent-term-card__icon {
   width: 14px; height: 14px; flex-shrink: 0;
-  color: #8b949e;
+  color: var(--atc-dim);
 }
 .agent-term-card__label {
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
   font-size: 11.5px;
   font-weight: 600;
-  color: rgba(255,255,255,.4);
+  color: var(--atc-dim);
   letter-spacing: .01em;
 }
 .agent-term-timer {
   font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace;
   font-size: 10px;
   font-weight: 500;
-  color: rgba(255,255,255,.28);
+  color: var(--atc-dim);
+  opacity: .75;
   margin-left: auto;
   min-width: 32px;
   text-align: right;
@@ -2321,13 +2322,13 @@ body.zen-mode .editor {
   border-radius: 6px;
   letter-spacing: .01em;
 }
-.agent-term-status--running { color: #6cb6ff; background: rgba(108,182,255,.1); }
-.agent-term-status--ok { color: #56d364; background: rgba(86,211,100,.1); }
-.agent-term-status--err { color: #f47067; background: rgba(244,112,103,.1); }
+.agent-term-status--running { color: var(--atc-accent); background: rgba(9,105,218,.1); }
+.agent-term-status--ok { color: var(--atc-success); background: rgba(26,127,55,.1); }
+.agent-term-status--err { color: var(--atc-danger); background: rgba(207,34,46,.1); }
 .agent-term-spinner {
   width: 10px; height: 10px;
-  border: 1.5px solid rgba(108,182,255,.25);
-  border-top-color: #6cb6ff;
+  border: 1.5px solid rgba(9,105,218,.25);
+  border-top-color: var(--atc-accent);
   border-radius: 50%;
   animation: agent-term-spin .7s cubic-bezier(.5,.15,.5,.85) infinite;
   flex-shrink: 0;
@@ -2337,23 +2338,22 @@ body.zen-mode .editor {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 12px 16px;
-  background: rgba(0,0,0,.15);
+  padding: 11px 14px;
+  background: var(--atc-head);
 }
 .agent-term-card__prompt {
-  color: #56d364;
+  color: var(--atc-success);
   font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 700;
   flex-shrink: 0;
   line-height: 1.55;
   user-select: none;
-  opacity: .8;
 }
 .agent-term-card__code {
   font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace;
-  font-size: 13px;
-  color: #e6edf3;
+  font-size: 12.5px;
+  color: var(--atc-text);
   line-height: 1.55;
   word-break: break-word;
   background: none;
@@ -2364,36 +2364,36 @@ body.zen-mode .editor {
   font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace;
   font-size: 11.5px;
   line-height: 1.6;
-  color: rgba(230,237,243,.65);
-  background: rgba(0,0,0,.2);
-  padding: 10px 16px;
+  color: var(--atc-text);
+  background: #f6f8fa;
+  padding: 10px 14px;
   margin: 0;
   max-height: 280px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  border-top: 1px solid rgba(255,255,255,.04);
+  border-top: 1px solid var(--atc-border);
 }
-.agent-term-output::-webkit-scrollbar { width: 5px; }
+.agent-term-output::-webkit-scrollbar { width: 8px; height: 8px; }
 .agent-term-output::-webkit-scrollbar-track { background: transparent; }
-.agent-term-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
-.agent-term-output::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.2); }
+.agent-term-output::-webkit-scrollbar-thumb { background: rgba(0,0,0,.18); border-radius: 4px; }
+.agent-term-output::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,.28); }
 .agent-term-card__footer {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  background: rgba(255,255,255,.02);
-  border-top: 1px solid rgba(255,255,255,.04);
+  background: var(--atc-head);
+  border-top: 1px solid var(--atc-border);
 }
 .agent-term-toggle,
 .agent-term-copy {
   font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   font-size: 10.5px;
   font-weight: 600;
-  color: rgba(255,255,255,.35);
+  color: var(--atc-dim);
   background: transparent;
-  border: 1px solid rgba(255,255,255,.08);
+  border: 1px solid var(--atc-border);
   border-radius: 6px;
   padding: 3px 10px;
   cursor: pointer;
@@ -2402,13 +2402,13 @@ body.zen-mode .editor {
 }
 .agent-term-toggle:hover,
 .agent-term-copy:hover {
-  color: rgba(255,255,255,.7);
-  border-color: rgba(255,255,255,.15);
-  background: rgba(255,255,255,.05);
+  color: var(--atc-text);
+  border-color: #d0d7de;
+  background: var(--hover);
 }
-.agent-term-card--running { border-color: rgba(108,182,255,.25); box-shadow: 0 2px 12px rgba(0,0,0,.35), 0 0 0 1px rgba(108,182,255,.08); }
-.agent-term-card--ok { border-left: 3px solid #56d364; }
-.agent-term-card--err { border-left: 3px solid #f47067; }
+.agent-term-card--running { border-color: rgba(9,105,218,.3); box-shadow: 0 0 0 1px rgba(9,105,218,.08); }
+.agent-term-card--ok { border-left: 3px solid var(--atc-success); }
+.agent-term-card--err { border-left: 3px solid var(--atc-danger); }
 
 /* Light mode terminal card */
 [data-theme="light"] .agent-term-card,
@@ -2584,6 +2584,19 @@ body.zen-mode .editor {
   --atc-warning: #e3b341; --atc-danger: #f47067;
   box-shadow: 0 1px 3px rgba(0,0,0,.25);
 }
+/* Dark mode for the terminal card — mirror the tool-step palette so they match. */
+[data-theme="dark"] .agent-term-card,
+.dark .agent-term-card {
+  --atc-bg: #0d1117; --atc-border: rgba(255,255,255,.08); --atc-head: rgba(255,255,255,.04);
+  --atc-text: #e6edf3; --atc-dim: rgba(255,255,255,.4);
+  --atc-accent: #6cb6ff; --atc-success: #56d364; --atc-danger: #f47067;
+}
+[data-theme="dark"] .agent-term-card:hover,
+.dark .agent-term-card:hover { border-color: rgba(255,255,255,.16); box-shadow: 0 2px 12px rgba(0,0,0,.3); }
+[data-theme="dark"] .agent-term-output,
+.dark .agent-term-output { background: rgba(0,0,0,.2); }
+[data-theme="dark"] .agent-term-output::-webkit-scrollbar-thumb,
+.dark .agent-term-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); }
 [data-theme="dark"] .agent-tool-step:hover,
 .dark .agent-tool-step:hover { border-color: rgba(255,255,255,.16); }
 [data-theme="dark"] .agent-tool-row:hover,

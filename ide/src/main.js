@@ -8088,11 +8088,12 @@ async function _executeToolStep(step, call, root) {
         call.type = "list"; call.path = usedPath;
         try {
           const entries = await backend.readDir(usedPath);
-          const lines = entries.map(e => `${e.is_dir ? "d" : "-"} ${e.name}`);
-          const listing = lines.join("\n");
+          const _dirs = entries.filter(e => e.is_dir).map(e => e.name + "/").sort();
+          const _files = entries.filter(e => !e.is_dir).map(e => e.name).sort();
+          const listing = [..._dirs, ..._files].join("\n");
           res.className = "atc-result atc-result--ok";
-          res.textContent = `${entries.length} items (auto-switched to list_dir)`;
-          vp.innerHTML = `<pre>${_escHtml(listing || "(empty directory)")}</pre>`;
+          res.textContent = `${_dirs.length} 个文件夹 · ${_files.length} 个文件`;
+          vp.innerHTML = `<pre>${_escHtml(listing || "(空目录)")}</pre>`;
           return { type: "list", path: call.path, content: listing || "(empty directory)" };
         } catch (dirErr) {
           res.className = "atc-result atc-result--err";
@@ -8114,7 +8115,7 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--err";
         res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.03 3.97a.75.75 0 00-1.06 0L6 4.94 5.03 3.97a.75.75 0 10-1.06 1.06L4.94 6 3.97 6.97a.75.75 0 101.06 1.06L6 7.06l.97.97a.75.75 0 101.06-1.06L7.06 6l.97-.97a.75.75 0 000-1.06z"/></svg> ${_escHtml(readError || "not found")}`;
         step.classList.add("agent-tool-step--rejected");
-        vp.innerHTML = `<div style="padding:8px 12px;color:rgba(255,255,255,.4);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
+        vp.innerHTML = `<div style="padding:8px 12px;color:var(--atc-dim,#636c76);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
         return { type: "read", path: call.path, content: `[ERROR] File not found: ${rawPath}. Workspace root is: ${root || "(none)"}. Use full absolute path.${helpHint}` };
       }
       const allLines = txt.split("\n");
@@ -8163,11 +8164,12 @@ async function _executeToolStep(step, call, root) {
           return { type: "list", path: call.path, content: ls || "(empty)" };
         } catch {}
       }
-      const lines = entries.map(e => `${e.is_dir ? "d" : "-"} ${e.name}`);
-      const listing = lines.join("\n");
+      const _dirs = entries.filter(e => e.is_dir).map(e => e.name + "/").sort();
+      const _files = entries.filter(e => !e.is_dir).map(e => e.name).sort();
+      const listing = [..._dirs, ..._files].join("\n");
       res.className = "atc-result atc-result--ok";
-      res.textContent = `${entries.length} items`;
-      vp.innerHTML = `<pre>${_escHtml(listing || "(empty directory)")}</pre>`;
+      res.textContent = `${_dirs.length} 个文件夹 · ${_files.length} 个文件`;
+      vp.innerHTML = `<pre>${_escHtml(listing || "(空目录)")}</pre>`;
       return { type: "list", path: call.path, content: listing || "(empty directory)" };
 
     } else if (call.type === "write" || call.type === "edit") {
