@@ -43,7 +43,7 @@ fn candidate_browsers() -> Vec<String> {
 }
 
 /// First installed headless browser, or `None`.
-fn find_headless_browser() -> Option<String> {
+pub fn find_headless_browser() -> Option<String> {
     for c in candidate_browsers() {
         if c.contains('/') || c.contains('\\') {
             if Path::new(&c).exists() {
@@ -63,7 +63,7 @@ fn find_headless_browser() -> Option<String> {
 }
 
 /// Minimal standard base64 (no external crate, no line wrapping) for the data URL.
-fn b64(data: &[u8]) -> String {
+pub fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

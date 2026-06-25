@@ -6018,6 +6018,7 @@ const _AI_MODE_PROMPTS = {
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止；⑤ **要起持续运行的服务/watch（dev server、nodemon、tail -f 等）别用 run_cmd**，改用 run_in_terminal 挂到 IDE 真实终端里。
 - run_in_terminal(command, name?)：把**长时间运行/持续**的命令挂到 IDE 的真实终端 tab 里持续运行（dev server、watch、守护进程）。它一直跑、用户可见可停，返回启动后几秒的输出供你确认。可多次调用并行挂多个任务。要测它是否提供服务，再用 web_fetch 访问 http://127.0.0.1:端口。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
+- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate 打开网址、click 点、type 输入、press 按键、eval 跑 JS、screenshot 看、close 关。每个动作都回传当前页面截图 + 可见文本，所以你能像人一样"看着操作"。用于自主上网查资料、端到端测试你做的网页(点按钮、填表单、走完流程看截图确认)、抓取需要交互才出现的信息。打法：先 navigate，再 screenshot/eval 看清结构与 CSS 选择器，然后 click/type/press 操作、看截图确认。比 web_fetch 强在能交互、能渲染 JS、能看见。需本机装 Chrome/Chromium/Edge。
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -7455,6 +7456,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
+      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回当前页面的截图(回传给你看) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓页面信息。action：navigate(打开网址,需 url) / click(点击,需 selector=CSS选择器) / type(输入,需 selector+text) / press(按键如 Enter/Tab/Escape,需 key) / eval(在页面跑 JS,需 script,返回结果) / screenshot(只看当前页不动作) / close(关闭浏览器)。打法：先 navigate 打开 → screenshot 或 eval('document.body.innerHTML') 看清结构与选择器 → 再 click/type/press 操作 → 看截图确认。需本机装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, selector: { type: "string", description: "click/type 用：目标元素的 CSS 选择器" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
     );
   }
   return tools;
@@ -7495,6 +7497,7 @@ function _mapToolCall(name, args) {
     case "copy_path": return { type: "copy", path: args.from || "", to: args.to || "" };
     case "format_file": return { type: "format", path: args.path || "" };
     case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
+    case "browser": return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: args.selector || "", text: args.text || "", key: args.key || "", script: args.script || "" };
     default: return null;
   }
 }
@@ -8231,7 +8234,7 @@ async function _runAgenticLoop({ config, messages, root, session }) {
       for (const it of items) { if (it.rawResult && it.rawResult.image) _imgs.push(it.rawResult.image); }
       if (_imgs.length) {
         while (_shotMsgs.length) { const old = _shotMsgs.shift(); const oi = messages.indexOf(old); if (oi >= 0) messages.splice(oi, 1); }
-        const content = [{ type: "text", text: `这是当前页面的渲染截图（${_imgs.length} 张）。请据图检查并改进 UI（布局/对齐/间距/配色/对比度/视觉层级/响应式），别只看代码。` }];
+        const content = [{ type: "text", text: `这是相关页面的最新截图（${_imgs.length} 张）。仔细看图再决定下一步：做 UI 就据图检查并改进（布局/对齐/间距/配色/对比度/视觉层级/响应式）；在浏览或操作浏览器就据图判断接下来怎么点 / 填 / 读。` }];
         for (const u of _imgs) content.push({ type: "image_url", image_url: { url: u } });
         const imgMsg = { role: "user", content };
         messages.push(imgMsg);
@@ -8515,10 +8518,12 @@ function _createToolStep(call) {
     ? ((call.path || "") + (call.to ? " → " + call.to : ""))
     : call.type === "screenshot"
     ? (call.url || "")
+    : call.type === "browser"
+    ? ((call.action || "") + (call.url ? " " + call.url : "") + (call.selector ? " " + call.selector : ""))
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot", browser: "Browser" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8537,12 +8542,13 @@ function _createToolStep(call) {
     format: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 0a.5.5 0 01.5.5c0 1.5.5 2 2 2a.5.5 0 010 1c-1.5 0-2 .5-2 2a.5.5 0 01-1 0c0-1.5-.5-2-2-2a.5.5 0 010-1c1.5 0 2-.5 2-2a.5.5 0 01.5-.5zM3.5 6a.5.5 0 01.5.5c0 1 .333 1.333 1.333 1.333a.5.5 0 010 1C4.333 8.833 4 9.167 4 10.167a.5.5 0 01-1 0c0-1-.333-1.334-1.333-1.334a.5.5 0 010-1C2.667 7.833 3 7.5 3 6.5a.5.5 0 01.5-.5zm6 4a.5.5 0 01.5.5c0 1.25.5 1.75 1.75 1.75a.5.5 0 010 1c-1.25 0-1.75.5-1.75 1.75a.5.5 0 01-1 0c0-1.25-.5-1.75-1.75-1.75a.5.5 0 010-1c1.25 0 1.75-.5 1.75-1.75a.5.5 0 01.5-.5z"/></svg>`,
     termtask: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
+    browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot" || call.type === "browser";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9310,6 +9316,37 @@ async function _executeToolStep(step, call, root, run) {
       return { type: "termtask", path: label, content: exited
         ? `命令在 IDE 终端「${label}」里运行后已退出（可能不是持续任务，或启动即失败）：\n$ ${cmd}\n输出:\n${out || "(无)"}`
         : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。要确认它在提供服务，可用 web_fetch 访问其本地地址（如 http://127.0.0.1:端口）。` };
+
+    } else if (call.type === "browser") {
+      const act = call.action || "screenshot";
+      if (act === "close") {
+        try { await backend.invoke("browser_close"); } catch {}
+        res.className = "atc-result atc-result--ok"; res.textContent = "已关闭";
+        return { type: "browser", path: "close", content: "已关闭浏览器会话。" };
+      }
+      let state;
+      try {
+        if (act === "navigate") state = await backend.invoke("browser_navigate", { url: call.url || "" });
+        else if (act === "click") state = await backend.invoke("browser_click", { selector: call.selector || "" });
+        else if (act === "type") state = await backend.invoke("browser_type", { selector: call.selector || "", text: call.text || "" });
+        else if (act === "press") state = await backend.invoke("browser_press", { key: call.key || "Enter" });
+        else if (act === "eval") state = await backend.invoke("browser_eval", { script: call.script || "" });
+        else state = await backend.invoke("browser_screenshot");
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 240);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
+        if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
+        return { type: "browser", path: act, content: `[浏览器失败] ${msg}` };
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = act;
+      if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="page" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">` + (state.title || state.url ? `<div style="font-size:11px;opacity:.6;margin-top:5px">${_escHtml(state.title || "")} — ${_escHtml(state.url || "")}</div>` : "");
+      step.classList.add("is-open");
+      chatEl.scrollTop = chatEl.scrollHeight;
+      let content = `浏览器 [${act}] → ${state.title || ""}（${state.url || ""}）`;
+      if (state.result != null && state.result !== "") content += `\nJS 结果: ${state.result}`;
+      if (state.text) content += `\n页面可见文本(截断):\n${state.text}`;
+      content += `\n（截图已回传给你看，据图判断下一步；元素定位不准就先用 eval 看 document.body.innerHTML 或 querySelectorAll 找选择器。）`;
+      return { type: "browser", path: act, image: state.screenshot, content };
 
     } else if (call.type === "cmd") {
       if (!call.command || !call.command.trim()) {
@@ -12350,17 +12387,16 @@ function buildMenubar() {
 
 // ---- wiring ----
 async function chooseFolder() {
-  let picked = null, threw = false;
-  const t0 = Date.now();
+  let picked = null;
   try { picked = await backend.pickFolder(); }
-  catch { threw = true; } // native dialog errored (unavailable on this desktop)
+  catch { picked = null; } // native dialog errored (unavailable on this desktop)
   if (picked) { await openFolder(picked); return; }
-  // Returned nothing. If it errored, or came back almost instantly, the native
-  // picker isn't actually available (common on Linux without xdg-desktop-portal —
-  // which made the button look dead). Fall back to manual path entry so opening a
-  // folder ALWAYS works. If it took a moment, the user likely cancelled a working
-  // dialog → respect that and don't nag.
-  if (threw || Date.now() - t0 < 250) await _promptFolderPath();
+  // The native picker gave nothing — either it's unavailable (common on Linux
+  // without xdg-desktop-portal, which made the button look stone dead) or the
+  // user cancelled. EITHER way show the manual path entry so the button ALWAYS
+  // does something visible and opening a folder always works. The modal is
+  // dismissible, so a deliberate cancel costs one Esc.
+  await _promptFolderPath();
 }
 
 // Manual "open folder" via typed/pasted path + recent list — the reliable

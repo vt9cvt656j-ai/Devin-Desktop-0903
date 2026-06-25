@@ -39,6 +39,7 @@ uuid = { version = "1.23.3", features = ["v4"] }
 rand = "0.10.1"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
 tauri-plugin-macos-fps = "0.1.0"
+headless_chrome = { version = "1.0", default-features = false }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
