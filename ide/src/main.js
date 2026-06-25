@@ -5173,10 +5173,12 @@ async function showProfile() {
   document.body.appendChild(ov);
   // animate the bars after layout
   requestAnimationFrame(() => ov.querySelectorAll(".pf-bar > i").forEach((el) => { el.style.width = (el.dataset.pct || 0) + "%"; }));
-  const close = () => { ov.style.animation = "pf-fade .15s ease reverse both"; setTimeout(() => ov.remove(), 140); };
+  let onEsc;
+  const close = () => { document.removeEventListener("keydown", onEsc); ov.style.animation = "pf-fade .15s ease reverse both"; setTimeout(() => ov.remove(), 140); };
+  onEsc = (e) => { if (e.key === "Escape") close(); };
   ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
   ov.querySelector("#pfClose").addEventListener("click", close);
-  document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); } });
+  document.addEventListener("keydown", onEsc);
 }
 
 function currentModel() {
@@ -6287,6 +6289,7 @@ async function sendPrompt(text, attachedImages = []) {
   const body = addMessage("assistant", "");
   body.appendChild(thinkingCard());
   let acc = "";
+  let _shown = 0; // typewriter cursor: how many chars of `acc` are revealed so far
   let err = null;
   let raf = 0;
   let lastFlush = 0;
@@ -6400,19 +6403,17 @@ async function sendPrompt(text, attachedImages = []) {
     _filesBar.style.display = "none";
   }
 
-  const flushStream = () => {
-    raf = 0;
-    const now = Date.now();
-    // Adaptive throttle: re-parsing the whole accumulated reply each flush gets
-    // costly as it grows, so widen the frame gap for long replies (caps the
-    // O(n) work/sec instead of letting it pile up at a fixed 12fps).
-    const _gap = acc.length > 40000 ? 120 : acc.length > 12000 ? 64 : 32;
-    if (now - lastFlush < _gap) { scheduleStream(); return; } // reschedule so the tail still renders
-    lastFlush = now;
+  // Typewriter reveal: network tokens arrive in bursts, so rendering all of
+  // `acc` at once makes the answer "jump out" in chunks. Instead we advance a
+  // `_shown` cursor toward acc.length a little each frame — eased so it speeds up
+  // when far behind and gently finishes near the end — and only render up to it.
+  // Result: text types out smoothly no matter how bursty the stream is.
+  const _revealStep = (cur, total) => Math.min(total, cur + Math.max(2, Math.min(64, Math.ceil((total - cur) * 0.16))));
+  const renderStream = (view) => {
     body.querySelector(".thinking")?.remove();
 
     if (hasToolAccess) {
-      const segs = _parseStreamSegments(acc);
+      const segs = _parseStreamSegments(view);
       const completeEnd = segs.length > 0 && !segs[segs.length - 1].complete ? segs.length - 1 : segs.length;
       while (_segRendered < completeEnd) {
         if (_streamEl) { _streamEl.remove(); _streamEl = null; }
@@ -6494,19 +6495,30 @@ async function sendPrompt(text, attachedImages = []) {
       }
     } else {
       const prevLen = body._lastLen || 0;
-      if (acc.length - prevLen < 20 && !acc.includes("```") && prevLen > 0) {
-        const tail = acc.slice(prevLen);
+      if (view.length - prevLen < 20 && !view.includes("```") && prevLen > 0) {
+        const tail = view.slice(prevLen);
         if (tail && body.lastChild && body.lastChild.nodeType === 3) {
           body.lastChild.textContent += tail;
         } else if (tail) {
-          renderMarkdownInto(body, acc, { streaming: true });
+          renderMarkdownInto(body, view, { streaming: true });
         }
       } else {
-        renderMarkdownInto(body, acc, { streaming: true });
+        renderMarkdownInto(body, view, { streaming: true });
       }
-      body._lastLen = acc.length;
+      body._lastLen = view.length;
     }
     chatEl.scrollTop = chatEl.scrollHeight;
+  };
+  const flushStream = () => {
+    raf = 0;
+    const now = Date.now();
+    // Adaptive throttle to bound O(n) re-render cost for long replies.
+    const _gap = acc.length > 40000 ? 100 : acc.length > 12000 ? 50 : 22;
+    if (now - lastFlush < _gap) { scheduleStream(); return; }
+    lastFlush = now;
+    _shown = _revealStep(_shown, acc.length);
+    renderStream(acc.slice(0, _shown));
+    if (streaming || _shown < acc.length) scheduleStream(); // keep typing out the buffered tail
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
   streaming = true;
@@ -6543,7 +6555,7 @@ async function sendPrompt(text, attachedImages = []) {
             if (call) {
               body.querySelector(".thinking")?.remove();
               if (_streamEl) { _streamEl.remove(); _streamEl = null; }
-              if (acc.trim()) { renderMarkdownInto(body, acc.trim(), { streaming: false }); acc = ""; }
+              if (acc.trim()) { renderMarkdownInto(body, acc.trim(), { streaming: false }); acc = ""; _shown = 0; body._lastLen = 0; }
               const step = _createToolStep(call);
               body.appendChild(step);
               const p = _executeToolStep(step, call, _agentRoot);
@@ -6562,9 +6574,19 @@ async function sendPrompt(text, attachedImages = []) {
   finally {
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
-    if (raf) cancelAnimationFrame(raf);
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
     streaming = false;
     _setSendBtnStop(false);
+    // Finish typing out the buffered tail before the final clean render — so the
+    // end types out instead of dumping. Snap if way behind (huge burst) or error.
+    if (!err) {
+      while (_shown < acc.length && acc.length - _shown <= 1500) {
+        _shown = _revealStep(_shown, acc.length);
+        renderStream(acc.slice(0, _shown));
+        await new Promise(r => setTimeout(r, 16));
+      }
+    }
+    _shown = acc.length;
     body.querySelector(".thinking")?.remove();
     if (_streamEl) { _streamEl.remove(); _streamEl = null; }
     if (acc) {
@@ -10216,10 +10238,12 @@ function openMarketplaceModal() {
   _mktModal = overlay;
   requestAnimationFrame(() => overlay.classList.add("mktm-overlay--visible"));
 
-  const closeModal = () => { overlay.classList.remove("mktm-overlay--visible"); setTimeout(() => { overlay.remove(); _mktModal = null; }, 200); };
+  let onEsc;
+  const closeModal = () => { document.removeEventListener("keydown", onEsc); overlay.classList.remove("mktm-overlay--visible"); setTimeout(() => { overlay.remove(); _mktModal = null; }, 200); };
+  onEsc = (e) => { if (e.key === "Escape") closeModal(); };
   overlay.addEventListener("click", (e) => { if (e.target === overlay) closeModal(); });
   modal.querySelector(".mktm__close").addEventListener("click", closeModal);
-  document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { closeModal(); document.removeEventListener("keydown", esc); } });
+  document.addEventListener("keydown", onEsc);
 
   let activeFilter = "all";
   let searchQ = "";
