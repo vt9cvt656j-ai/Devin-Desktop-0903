@@ -178,6 +178,47 @@ pub fn git_file_head(root: String, rel: String) -> Result<String, String> {
     }
 }
 
+/// Unified diff of the working tree (or the staged index when `staged=true`)
+/// against HEAD, optionally scoped to one path. Returns the raw unified-diff
+/// text — empty when there are no changes. Output is capped so a huge diff can't
+/// blow up the IPC payload; note that `git diff` never lists *untracked* files
+/// (use `git_status` for those).
+#[tauri::command]
+pub fn git_diff(root: String, rel: Option<String>, staged: Option<bool>) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["diff"];
+    if staged.unwrap_or(false) {
+        args.push("--cached");
+    }
+    let rel = rel.unwrap_or_default();
+    let rel = rel.trim().to_string();
+    if !rel.is_empty() {
+        args.push("--");
+        args.push(&rel);
+    }
+    let out = run_git(&root, &args)?;
+    if out.status.success() {
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        const MAX: usize = 200_000;
+        if text.len() > MAX {
+            // Truncate on a char boundary.
+            let mut end = MAX;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str("\n…（diff 过大已截断）");
+        }
+        Ok(text)
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "git diff failed".into()
+        } else {
+            err
+        })
+    }
+}
+
 /// Run a git command and map a non-zero exit into a readable `Err`.
 fn run_git_checked(root: &str, args: &[&str]) -> Result<String, String> {
     let out = run_git(root, args)?;

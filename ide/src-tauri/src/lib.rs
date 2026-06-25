@@ -76,6 +76,7 @@ pub fn run() {
             files::replace_in_project,
             git::git_status,
             git::git_file_head,
+            git::git_diff,
             git::git_stage,
             git::git_unstage,
             git::git_stage_all,

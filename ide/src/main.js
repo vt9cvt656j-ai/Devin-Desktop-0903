@@ -5941,6 +5941,13 @@ const _AI_MODE_PROMPTS = {
 - write_file(path, content)：新建或整文件重写
 - delete_path(path)：删除文件/目录（递归），用于清理/重构
 - move_path(from, to)：移动或重命名文件/目录
+- git_status()：查看仓库状态——当前分支、已暂存/未暂存/未跟踪的改动文件
+- git_diff(path?, staged?)：看改动的 diff（默认未暂存相对 HEAD；staged=true 看已暂存；path 只看某文件；不含未跟踪文件）
+- git_log(count?)：看最近提交历史
+- git_commit(message, all?)：提交（默认先 add -A 再提交；all=false 只提交已暂存）
+- git_branch(name?, create?)：不传 name 列分支；传 name 切换，create=true 新建并切换
+- git_push() / git_pull()：推送 / 拉取当前分支（push 涉及对外发布，一般用户要求时才用）
+- 提示：优先用这些 git 工具而不是 run_cmd 跑 git（结果更结构化、UI 有卡片）；rebase/cherry-pick/tag 等没有专用工具的再用 run_cmd
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止。
 
 # 输出风格
@@ -7348,6 +7355,9 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
     { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进项目记忆（按工作区持久保存，下次自动加载进上下文）。适合记：技术栈/架构决定、约定、构建与测试命令、用户偏好、易踩的坑。只记真正长期有用的事实，别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一句话（简洁、自包含）" } }, required: ["content"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "读取编辑器/LSP 对文件的诊断（错误与警告）。改完代码用它快速自检，比每次跑构建快。不传 path 则返回所有已打开文件的诊断。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要检查的文件路径；省略则查所有已打开文件" } } } } },
+    { type: "function", function: { name: "git_status", description: "查看 git 仓库状态：当前分支、已暂存/未暂存/未跟踪的改动文件列表。要了解动了哪些文件、或提交前先看它。", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "git_diff", description: "查看改动的 git diff（统一 diff 文本）。默认看工作区相对 HEAD 的未暂存改动；staged=true 看已暂存(--cached)的；path 只看某个文件。注意：不显示未跟踪的新文件（那些用 git_status 看）。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，只看这个文件的 diff" }, staged: { type: "boolean", description: "为 true 看已暂存的改动" } } } } },
+    { type: "function", function: { name: "git_log", description: "查看最近的提交历史（短哈希、作者、时间、信息、所属分支/标签）。", parameters: { type: "object", properties: { count: { type: "integer", description: "返回多少条，默认 20" } } } } },
   ];
   if (includeWrite) {
     tools.push(
@@ -7357,6 +7367,10 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条命令并返回完整输出（装依赖、跑测试、构建、git 等）。按当前 OS 选语法：Windows 经 cmd.exe（dir/type/findstr、cd /d、start \"\" /b、%TEMP%），mac/Linux 经 bash/zsh（ls/cat/grep、nohup …&、/tmp）。绝不前台直接起服务/watch。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。重构、改名时用。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
+      { type: "function", function: { name: "git_commit", description: "提交改动。默认先把所有改动加入暂存区(相当于 git add -A)再提交；传 all=false 则只提交已暂存的。", parameters: { type: "object", properties: { message: { type: "string", description: "提交信息" }, all: { type: "boolean", description: "是否先暂存全部改动，默认 true" } }, required: ["message"] } } },
+      { type: "function", function: { name: "git_branch", description: "分支操作：不传 name 则列出所有分支并标出当前分支；传 name 切换到该分支，create=true 时新建并切换。", parameters: { type: "object", properties: { name: { type: "string", description: "要切换/新建的分支名；省略则列出分支" }, create: { type: "boolean", description: "为 true 时新建分支再切换" } } } } },
+      { type: "function", function: { name: "git_push", description: "把当前分支推送到远程(origin)。无凭据时快速失败而非卡住。涉及对外发布，一般在用户要求时才用。", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "git_pull", description: "从远程拉取并合并当前分支。", parameters: { type: "object", properties: {} } } },
     );
   }
   return tools;
@@ -7382,6 +7396,13 @@ function _mapToolCall(name, args) {
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
     case "delete_path": return { type: "delete", path: args.path || "" };
     case "move_path": return { type: "move", path: args.from || "", to: args.to || "" };
+    case "git_status": return { type: "git", op: "status" };
+    case "git_diff": return { type: "git", op: "diff", path: args.path || "", staged: !!args.staged };
+    case "git_log": return { type: "git", op: "log", count: args.count };
+    case "git_commit": return { type: "git", op: "commit", message: args.message || "", all: args.all !== false };
+    case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
+    case "git_push": return { type: "git", op: "push" };
+    case "git_pull": return { type: "git", op: "pull" };
     default: return null;
   }
 }
@@ -7966,7 +7987,7 @@ async function _runAgenticLoop({ config, messages, root }) {
           try { result = await _executeToolStep(step, call, root); }
           catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
         }
-        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.path || "");
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : call.type === "git" ? "" : (call.path || "");
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
         return _toolResultToString(call, result).slice(0, 8000);
       };
@@ -8231,10 +8252,12 @@ function _removeWritePreview(entry) {
 }
 
 function _createToolStep(call) {
-  const pathDisplay = call.path || call.command || "";
+  const pathDisplay = call.type === "git"
+    ? ((call.op || "") + (call.op === "diff" && call.path ? " " + call.path : "") + (call.op === "branch" && call.branch ? " " + call.branch : ""))
+    : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8246,12 +8269,13 @@ function _createToolStep(call) {
     find: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>`,
     web: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
     websearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
+    git: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.25 2.25 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.5 2.5 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -8771,6 +8795,80 @@ async function _executeToolStep(step, call, root) {
       res.textContent = hits ? `${hits} 条结果` : "完成";
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "websearch", path: call.path, content: text };
+
+    } else if (call.type === "git") {
+      const gitRoot = root || rootPath || workspaceRoots[0] || "";
+      if (!gitRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "git", path: call.op, content: "[ERROR] 未打开工作区，无法执行 git。" }; }
+      const mutating = call.op === "commit" || call.op === "push" || call.op === "pull" || (call.op === "branch" && !!call.branch);
+      if (readOnlyMode && mutating) {
+        const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = `⛔ ${modeName} 模式禁止改动仓库`;
+        return { type: "git", path: call.op, content: `[BLOCKED] ${modeName} 是只读模式，不能执行会改动仓库的 git ${call.op}。` };
+      }
+      try {
+        if (call.op === "status") {
+          const st = await backend.invoke("git_status", { root: gitRoot });
+          if (!st || !st.is_repo) { res.className = "atc-result atc-result--err"; res.textContent = "非 git 仓库"; if (vp) vp.innerHTML = `<pre>(not a git repo)</pre>`; return { type: "git", path: "status", content: "当前工作区不是 git 仓库。" }; }
+          const files = st.files || [];
+          const staged = files.filter(f => f.staged).length;
+          const body2 = `分支: ${st.branch || "(未知)"}\n改动 ${files.length} 个文件（已暂存 ${staged}）:\n` + (files.map(f => `${(f.code || "").padEnd(2)} ${f.rel}`).join("\n") || "(工作区干净)");
+          res.className = "atc-result atc-result--ok"; res.textContent = `${files.length} 改动 · ${st.branch || ""}`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(body2)}</pre>`;
+          return { type: "git", path: "status", content: body2 };
+        } else if (call.op === "diff") {
+          const diff = await backend.invoke("git_diff", { root: gitRoot, rel: call.path || null, staged: !!call.staged });
+          const text = (diff || "").trim();
+          res.className = "atc-result atc-result--ok"; res.textContent = text ? `${text.split("\n").length} 行 diff` : "无改动";
+          if (vp) vp.innerHTML = `<pre>${_escHtml((text || "(无改动)").slice(0, 4000))}</pre>`;
+          return { type: "git", path: "diff", content: text ? `git diff${call.staged ? " --cached" : ""}${call.path ? " -- " + call.path : ""}:\n${text}` : "（无改动）" };
+        } else if (call.op === "log") {
+          const n = (Number.isFinite(call.count) && call.count > 0) ? Math.floor(call.count) : 20;
+          const entries = await backend.invoke("git_log", { root: gitRoot, count: n }) || [];
+          const lines = entries.map(e => `${e.short_hash} ${e.message} — ${e.author}, ${e.date}${(e.refs && e.refs.length) ? " (" + e.refs.join(", ") + ")" : ""}`);
+          res.className = "atc-result atc-result--ok"; res.textContent = `${entries.length} 条提交`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无提交)")}</pre>`;
+          return { type: "git", path: "log", content: lines.join("\n") || "(无提交历史)" };
+        } else if (call.op === "commit") {
+          const msg = (call.message || "").trim();
+          if (!msg) { res.className = "atc-result atc-result--err"; res.textContent = "缺提交信息"; return { type: "git", path: "commit", content: "[ERROR] git_commit 需要 message。" }; }
+          if (call.all) { try { await backend.invoke("git_stage_all", { root: gitRoot }); } catch {} }
+          const out = await backend.invoke("git_commit", { root: gitRoot, message: msg });
+          try { refreshGitStatus(); } catch {}
+          res.className = "atc-result atc-result--ok"; res.textContent = "已提交";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
+          return { type: "git", path: "commit", content: `已提交：${msg}\n${out || ""}`.trim() };
+        } else if (call.op === "branch") {
+          if (!call.branch) {
+            const b = await backend.invoke("git_branches", { root: gitRoot });
+            const list = (b?.branches || []).map(x => (x === b.current ? "* " : "  ") + x);
+            res.className = "atc-result atc-result--ok"; res.textContent = `${(b?.branches || []).length} 个分支`;
+            if (vp) vp.innerHTML = `<pre>${_escHtml(list.join("\n") || "(无分支)")}</pre>`;
+            return { type: "git", path: "branch", content: `当前分支: ${b?.current || "(未知)"}\n${list.join("\n")}` };
+          }
+          await backend.invoke("git_checkout", { root: gitRoot, branch: call.branch, create: !!call.create });
+          try { refreshGitStatus(); } catch {}
+          res.className = "atc-result atc-result--ok"; res.textContent = call.create ? "已新建并切换" : "已切换";
+          return { type: "git", path: "branch", content: `${call.create ? "已新建并切换到" : "已切换到"}分支 ${call.branch}` };
+        } else if (call.op === "push") {
+          const out = await backend.invoke("git_push", { root: gitRoot });
+          res.className = "atc-result atc-result--ok"; res.textContent = "已推送";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
+          return { type: "git", path: "push", content: `git push:\n${out || "(完成)"}` };
+        } else if (call.op === "pull") {
+          const out = await backend.invoke("git_pull", { root: gitRoot });
+          _clearAgentReadCache();
+          try { refreshGitStatus(); } catch {}
+          res.className = "atc-result atc-result--ok"; res.textContent = "已拉取";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
+          return { type: "git", path: "pull", content: `git pull:\n${out || "(完成)"}` };
+        }
+        return { type: "git", path: call.op, content: `未知 git 操作: ${call.op}` };
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 200);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
+        return { type: "git", path: call.op, content: `[ERROR] git ${call.op} 失败: ${msg}` };
+      }
 
     } else if (call.type === "cmd") {
       if (!call.command || !call.command.trim()) {
