@@ -5955,7 +5955,8 @@ const _AI_MODE_PROMPTS = {
 - create_dir(path)：新建目录（write_file 会自动建父目录，一般只在确需空目录时用）
 - copy_path(from, to)：复制文件/目录（递归），用于按模板搭脚手架、备份
 - format_file(path)：用语言服务格式化整个文件（可撤销、显示 diff）；无可用格式化器时改用 run_cmd 跑 prettier/rustfmt/gofmt
-- run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止。
+- run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止；⑤ **要起持续运行的服务/watch（dev server、nodemon、tail -f 等）别用 run_cmd**，改用 run_in_terminal 挂到 IDE 真实终端里。
+- run_in_terminal(command, name?)：把**长时间运行/持续**的命令挂到 IDE 的真实终端 tab 里持续运行（dev server、watch、守护进程）。它一直跑、用户可见可停，返回启动后几秒的输出供你确认。可多次调用并行挂多个任务。要测它是否提供服务，再用 web_fetch 访问 http://127.0.0.1:端口。
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -6820,8 +6821,8 @@ async function _agentRunInTerminal(root, command, stepEl) {
       // Foreground server/watch never returns — but instead of just refusing,
       // teach the model to background it so it CAN start & test a dev server.
       result = { code: 1, stdout: "", stderr: _win
-        ? "[未执行] 前台长时间运行的命令不会返回。要启动服务测试，请改成后台方式（会立刻返回）：\n  start \"\" /b 你的命令 >%TEMP%\\svc.log 2>&1\n之后再用  type %TEMP%\\svc.log  查看启动日志。路径含空格记得加引号。"
-        : "[未执行] 前台长时间运行的命令不会返回。要启动服务/前端来测试，请改成后台方式（会立刻返回）：\n  nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log\n这样进程在后台跑、你也能看到启动日志。路径含空格记得加引号。" };
+        ? "[未执行] 前台长时间运行的命令不会返回。要启动这种持续运行的服务/watch，请改用 run_in_terminal 工具——它会把命令挂到 IDE 真实终端 tab 里持续运行、用户可见可停，并返回启动日志。（若一定要在隔离子进程里跑，也可改后台：start \"\" /b 你的命令 >%TEMP%\\svc.log 2>&1，之后 type %TEMP%\\svc.log 看日志。）"
+        : "[未执行] 前台长时间运行的命令不会返回。要启动这种持续运行的服务/watch，请改用 run_in_terminal 工具——它会把命令挂到 IDE 真实终端 tab 里持续运行、用户可见可停，并返回启动日志。（若一定要在隔离子进程里跑，也可改后台：nohup 你的命令 > /tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log。）" };
     } else {
       const r = await backend.taskRunCapture(captureRoot, cmd).catch(e => ({ code: 1, stdout: "", stderr: String(e?.message || e) }));
       result = { code: r?.code ?? 0, stdout: r?.stdout || "", stderr: r?.stderr || "" };
@@ -7384,6 +7385,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。注意：write_file 写文件时父目录会自动创建，所以一般只在确实需要空目录时才用。", parameters: { type: "object", properties: { path: { type: "string", description: "要创建的目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
+      { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
     );
   }
   return tools;
@@ -7422,6 +7424,7 @@ function _mapToolCall(name, args) {
     case "create_dir": return { type: "mkdir", path: args.path || "" };
     case "copy_path": return { type: "copy", path: args.from || "", to: args.to || "" };
     case "format_file": return { type: "format", path: args.path || "" };
+    case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
     default: return null;
   }
 }
@@ -8375,7 +8378,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8392,12 +8395,13 @@ function _createToolStep(call) {
     mkdir: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75zM8 7.75a.75.75 0 00-1.5 0V9H5.25a.75.75 0 000 1.5H6.5v1.25a.75.75 0 001.5 0V10.5h1.25a.75.75 0 000-1.5H8V7.75z"/></svg>`,
     copy: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>`,
     format: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 0a.5.5 0 01.5.5c0 1.5.5 2 2 2a.5.5 0 010 1c-1.5 0-2 .5-2 2a.5.5 0 01-1 0c0-1.5-.5-2-2-2a.5.5 0 010-1c1.5 0 2-.5 2-2a.5.5 0 01.5-.5zM3.5 6a.5.5 0 01.5.5c0 1 .333 1.333 1.333 1.333a.5.5 0 010 1C4.333 8.833 4 9.167 4 10.167a.5.5 0 01-1 0c0-1-.333-1.334-1.333-1.334a.5.5 0 010-1C2.667 7.833 3 7.5 3 6.5a.5.5 0 01.5-.5zm6 4a.5.5 0 01.5.5c0 1.25.5 1.75 1.75 1.75a.5.5 0 010 1c-1.25 0-1.75.5-1.75 1.75a.5.5 0 01-1 0c0-1.25-.5-1.75-1.75-1.75a.5.5 0 010-1c1.25 0 1.75-.5 1.75-1.75a.5.5 0 01.5-.5z"/></svg>`,
+    termtask: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9124,6 +9128,24 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
         return { type: "git", path: call.op, content: `[ERROR] git ${call.op} 失败: ${msg}` };
       }
+
+    } else if (call.type === "termtask") {
+      const cmd = (call.command || "").trim();
+      if (!cmd) { res.className = "atc-result atc-result--err"; res.textContent = "空命令"; return { type: "termtask", path: "", content: "[ERROR] 空命令。" }; }
+      const label = (call.name || "").trim() || cmd.split(/\s+/).slice(0, 3).join(" ").slice(0, 24);
+      let r;
+      try { r = await _runTaskInNewTerminal(cmd, "▶ " + label); }
+      catch (e) { res.className = "atc-result atc-result--err"; res.textContent = "启动失败"; return { type: "termtask", path: label, content: `[ERROR] 启动失败: ${e?.message || e}` }; }
+      if (!r.ok) { res.className = "atc-result atc-result--err"; res.textContent = "启动失败"; return { type: "termtask", path: label, content: `[ERROR] ${r.error || "终端启动失败"}` }; }
+      await new Promise((res2) => setTimeout(res2, 3500)); // let it print startup output
+      const out = (r.entry.recentOut || "").trim().slice(-3000);
+      const exited = !!r.entry.exited;
+      res.className = exited ? "atc-result atc-result--err" : "atc-result atc-result--ok";
+      res.textContent = exited ? "已退出" : "运行中";
+      if (vp) vp.innerHTML = `<pre>${_escHtml(out || "(暂无输出)")}</pre>`;
+      return { type: "termtask", path: label, content: exited
+        ? `命令在 IDE 终端「${label}」里运行后已退出（可能不是持续任务，或启动即失败）：\n$ ${cmd}\n输出:\n${out || "(无)"}`
+        : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。要确认它在提供服务，可用 web_fetch 访问其本地地址（如 http://127.0.0.1:端口）。` };
 
     } else if (call.type === "cmd") {
       if (!call.command || !call.command.trim()) {
@@ -13409,9 +13431,9 @@ function switchTermTab(idx) {
   });
 }
 
-async function createTermTab() {
+async function createTermTab(customLabel) {
   const idx = termTabs.length;
-  const label = `Terminal ${++termSeq}`;
+  const label = customLabel || `Terminal ${++termSeq}`;
   const cwd = rootPath || "";
   const container = document.createElement("div");
   container.className = "terminal-panel__instance";
@@ -13488,9 +13510,13 @@ async function createTermTab() {
           }
           term.write(ev.data);
           _detectTerminalChanges(ev.data);
+          // Keep a bounded tail of recent output so agent task tools can read
+          // back what a launched persistent task printed (e.g. a dev server URL).
+          entry.recentOut = ((entry.recentOut || "") + ev.data).slice(-8000);
         } else if (ev.kind === "exit") {
           term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
           entry.backendId = null;
+          entry.exited = true;
           _scheduleTermRefresh();
         }
       },
@@ -13503,6 +13529,7 @@ async function createTermTab() {
       if (entry.backendId != null) {
         backend.termWrite(entry.backendId, " clear\n");
       }
+      entry.ready = true; // past the init clear → safe to inject a command now
     };
     setTimeout(finishInit, 1500);
   } catch (err) {
@@ -13510,6 +13537,33 @@ async function createTermTab() {
   } finally {
     entry.opening = false;
   }
+  return entry;
+}
+
+// Launch a persistent / long-running command in a NEW real IDE terminal tab —
+// the task stays attached to the IDE (visible, user-stoppable) instead of dying
+// with the agent's one-shot capture subprocess. Returns once the command has been
+// written; the caller can read `entry.recentOut` after a short wait.
+async function _runTaskInNewTerminal(command, label) {
+  // Show the panel WITHOUT openTerminal's auto-create (which would add a stray
+  // empty default tab); we create exactly one dedicated tab for this task.
+  if (termPanel && !termIsOpen()) {
+    termPanel.hidden = false;
+    editorwrapEl?.classList.add("has-terminal");
+    try { monacoEditor.layout(); } catch {}
+  }
+  const entry = await createTermTab(label);
+  // Wait for the PTY to be up AND past finishInit's `clear`, so the command isn't
+  // wiped. finishInit fires ~1.5s after open; cap the wait at 6s.
+  const start = Date.now();
+  while (Date.now() - start < 6000) {
+    if (entry.backendId != null && entry.ready) break;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  if (entry.backendId == null) return { ok: false, entry, error: "终端启动失败" };
+  entry.recentOut = "";
+  backend.termWrite(entry.backendId, command + "\n");
+  return { ok: true, entry };
 }
 
 function closeTermTab(idx) {
@@ -13526,8 +13580,11 @@ function closeTermTab(idx) {
     closeTerminal();
     return;
   }
-  if (activeTermTab >= termTabs.length) activeTermTab = termTabs.length - 1;
-  else if (activeTermTab === idx) activeTermTab = Math.min(idx, termTabs.length - 1);
+  // Keep activeTermTab pointing at the SAME tab after the splice: closing a tab
+  // LEFT of the active one shifts it down by one (decrement); closing the active
+  // tab shows its neighbour (clamped); closing one to the right is a no-op.
+  if (idx < activeTermTab) activeTermTab--;
+  else if (idx === activeTermTab) activeTermTab = Math.min(idx, termTabs.length - 1);
   termTabs[activeTermTab].container.hidden = false;
   if (_termSplitActive) {
     if (termTabs.length >= 2) _applyTermSplit();

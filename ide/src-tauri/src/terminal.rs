@@ -18,7 +18,8 @@ use tauri::State;
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum TermEvent {
-    /// A chunk of output from the shell (UTF-8, lossily decoded).
+    /// A chunk of output from the shell, UTF-8 decoded on complete-char
+    /// boundaries (multibyte chars split across PTY reads are reassembled).
     Data { data: String },
     /// The shell process exited; the terminal is done.
     Exit,
@@ -128,31 +129,66 @@ pub fn term_open(
 
     // Pump shell output to the frontend on a dedicated thread.
     //
-    // Coalesce output to avoid flooding the IPC channel / webview: a noisy
-    // command (build logs, `yes`, cat-ing a big file) otherwise fires hundreds
-    // of events per second — each one a `term.write` + change-detection pass on
-    // the main thread — which freezes and can OOM-crash the app. A read that
-    // fills the buffer signals a burst, so we keep accumulating (capped) and
-    // send fewer, larger batches; a short read means the burst is over (or it's
-    // a prompt awaiting input), so we flush immediately to stay interactive.
+    // Two concerns handled here:
+    //  1) UTF-8 across read boundaries — a multibyte char (e.g. a 3-byte Chinese
+    //     character) can be split between two PTY reads. Decoding each read on its
+    //     own with `from_utf8_lossy` turns the split char into a `�` (the garbled-
+    //     Chinese bug). So we keep a `carry` of the trailing incomplete bytes and
+    //     only decode the complete UTF-8 prefix, carrying the tail to the next read.
+    //  2) Flooding — a noisy command (build logs, `yes`, big cat) otherwise fires
+    //     hundreds of events/sec, each a `term.write` on the main thread. We coalesce
+    //     during a burst, but cap each batch modestly so a single huge `term.write`
+    //     can't freeze xterm's parser (the old 256 KB cap caused visible stalls).
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut carry: Vec<u8> = Vec::new();
         let mut pending = String::new();
-        const MAX_BATCH: usize = 256 * 1024;
+        const MAX_BATCH: usize = 48 * 1024;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    carry.extend_from_slice(&buf[..n]);
+                    // Decode every complete UTF-8 char now; keep only an incomplete
+                    // trailing char (if any) in `carry` for the next read.
+                    loop {
+                        match std::str::from_utf8(&carry) {
+                            Ok(s) => {
+                                pending.push_str(s);
+                                carry.clear();
+                                break;
+                            }
+                            Err(e) => {
+                                let good = e.valid_up_to();
+                                if good > 0 {
+                                    // `good` bytes are valid UTF-8 → no replacement chars.
+                                    pending.push_str(&String::from_utf8_lossy(&carry[..good]));
+                                }
+                                match e.error_len() {
+                                    // Incomplete char at the end → wait for more bytes.
+                                    None => {
+                                        carry.drain(..good);
+                                        break;
+                                    }
+                                    // Genuinely invalid bytes → emit one replacement, skip them.
+                                    Some(bad) => {
+                                        pending.push('\u{FFFD}');
+                                        carry.drain(..good + bad);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let bursting = n == buf.len();
-                    if (!bursting || pending.len() >= MAX_BATCH)
-                        && on_event
+                    if (!bursting || pending.len() >= MAX_BATCH) && !pending.is_empty() {
+                        if on_event
                             .send(TermEvent::Data {
                                 data: std::mem::take(&mut pending),
                             })
                             .is_err()
-                    {
-                        return;
+                        {
+                            return;
+                        }
                     }
                 }
                 Err(_) => break,
@@ -160,6 +196,12 @@ pub fn term_open(
         }
         if !pending.is_empty() {
             let _ = on_event.send(TermEvent::Data { data: pending });
+        }
+        if !carry.is_empty() {
+            // Flush any leftover tail (a truncated char at EOF) lossily.
+            let _ = on_event.send(TermEvent::Data {
+                data: String::from_utf8_lossy(&carry).into_owned(),
+            });
         }
         let _ = on_event.send(TermEvent::Exit);
     });
