@@ -666,6 +666,31 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     };
     let status = resp.status();
 
+    // Translate raw upstream (zyz et al.) errors into a friendly, actionable
+    // Chinese message instead of dumping a scary "502 {json}" at the user. These
+    // are the provider's problem (forbidden key / no accounts / overloaded), not
+    // ours — tell the user to switch model or contact the provider.
+    if !status.is_success() {
+        let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("该模型").to_string();
+        let raw = resp.text().await.unwrap_or_default();
+        let low = raw.to_lowercase();
+        let friendly = if low.contains("forbidden") {
+            "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通/续费。"
+        } else if low.contains("no available account") || low.contains("no available") {
+            "上游暂无可用账号。请换个模型，或稍后再试。"
+        } else if status.as_u16() == 429 || low.contains("rate") || low.contains("frequent") || low.contains("过于频繁") {
+            "请求过于频繁，请稍后再试。"
+        } else if status.as_u16() == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
+            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
+        } else {
+            "上游暂时不可用，请换个模型或稍后再试。"
+        };
+        return Err(AppError {
+            status: StatusCode::BAD_GATEWAY,
+            msg: format!("【{model_name}】{friendly}"),
+        });
+    }
+
     async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool) {
         if cost > 0 {
             if use_quota {
