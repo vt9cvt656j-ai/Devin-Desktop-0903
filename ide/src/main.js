@@ -6018,6 +6018,7 @@ const _AI_MODE_PROMPTS = {
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止；⑤ **要起持续运行的服务/watch（dev server、nodemon、tail -f 等）别用 run_cmd**，改用 run_in_terminal 挂到 IDE 真实终端里。
 - run_in_terminal(command, name?)：把**长时间运行/持续**的命令挂到 IDE 的真实终端 tab 里持续运行（dev server、watch、守护进程）。它一直跑、用户可见可停，返回启动后几秒的输出供你确认。可多次调用并行挂多个任务。要测它是否提供服务，再用 web_fetch 访问 http://127.0.0.1:端口。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
+- computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
 - browser(action, …)：**自主操控真实浏览器并能看见它**——navigate 打开网址、click 点、type 输入、press 按键、eval 跑 JS、screenshot 看、close 关。每个动作都回传当前页面截图 + 可见文本，所以你能像人一样"看着操作"。用于自主上网查资料、端到端测试你做的网页(点按钮、填表单、走完流程看截图确认)、抓取需要交互才出现的信息。打法：先 navigate，再 screenshot/eval 看清结构与 CSS 选择器，然后 click/type/press 操作、看截图确认。比 web_fetch 强在能交互、能渲染 JS、能看见。需本机装 Chrome/Chromium/Edge。
 
 # 输出风格
@@ -7456,6 +7457,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
+      { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回当前页面的截图(回传给你看) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓页面信息。action：navigate(打开网址,需 url) / click(点击,需 selector=CSS选择器) / type(输入,需 selector+text) / press(按键如 Enter/Tab/Escape,需 key) / eval(在页面跑 JS,需 script,返回结果) / screenshot(只看当前页不动作) / close(关闭浏览器)。打法：先 navigate 打开 → screenshot 或 eval('document.body.innerHTML') 看清结构与选择器 → 再 click/type/press 操作 → 看截图确认。需本机装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, selector: { type: "string", description: "click/type 用：目标元素的 CSS 选择器" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
     );
   }
@@ -7498,6 +7500,7 @@ function _mapToolCall(name, args) {
     case "format_file": return { type: "format", path: args.path || "" };
     case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
     case "browser": return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: args.selector || "", text: args.text || "", key: args.key || "", script: args.script || "" };
+    case "computer": return { type: "computer", action: args.action || "screenshot", x: args.x, y: args.y, button: args.button || "", text: args.text || "", key: args.key || "", amount: args.amount };
     default: return null;
   }
 }
@@ -8520,10 +8523,12 @@ function _createToolStep(call) {
     ? (call.url || "")
     : call.type === "browser"
     ? ((call.action || "") + (call.url ? " " + call.url : "") + (call.selector ? " " + call.selector : ""))
+    : call.type === "computer"
+    ? ((call.action || "") + (Number.isFinite(call.x) ? ` ${Math.round(call.x)},${Math.round(call.y)}` : "") + (call.key ? " " + call.key : ""))
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot", browser: "Browser" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8543,12 +8548,13 @@ function _createToolStep(call) {
     termtask: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
+    computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot" || call.type === "browser";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9347,6 +9353,35 @@ async function _executeToolStep(step, call, root, run) {
       if (state.text) content += `\n页面可见文本(截断):\n${state.text}`;
       content += `\n（截图已回传给你看，据图判断下一步；元素定位不准就先用 eval 看 document.body.innerHTML 或 querySelectorAll 找选择器。）`;
       return { type: "browser", path: act, image: state.screenshot, content };
+
+    } else if (call.type === "computer") {
+      const cact = call.action || "screenshot";
+      const hasXY = Number.isFinite(call.x) && Number.isFinite(call.y);
+      if ((cact === "move" || cact === "click" || cact === "double_click") && !hasXY) {
+        res.className = "atc-result atc-result--err"; res.textContent = "缺坐标";
+        return { type: "computer", path: cact, content: `[ERROR] ${cact} 需要 x,y 坐标（先 screenshot 看清再给坐标）。` };
+      }
+      let state;
+      try {
+        if (cact === "move") state = await backend.invoke("computer_move", { x: Math.round(call.x), y: Math.round(call.y) });
+        else if (cact === "click") state = await backend.invoke("computer_click", { x: Math.round(call.x), y: Math.round(call.y), button: call.button || null });
+        else if (cact === "double_click") state = await backend.invoke("computer_double_click", { x: Math.round(call.x), y: Math.round(call.y) });
+        else if (cact === "type") state = await backend.invoke("computer_type", { text: call.text || "" });
+        else if (cact === "key") state = await backend.invoke("computer_key", { combo: call.key || "" });
+        else if (cact === "scroll") state = await backend.invoke("computer_scroll", { amount: Number.isFinite(call.amount) ? Math.round(call.amount) : 3 });
+        else state = await backend.invoke("computer_screenshot");
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 240);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
+        if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
+        return { type: "computer", path: cact, content: `[电脑操作失败] ${msg}` };
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = cact;
+      if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
+      step.classList.add("is-open");
+      chatEl.scrollTop = chatEl.scrollHeight;
+      const content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。全屏截图已回传给你看，据图判断下一步的坐标 / 操作。`;
+      return { type: "computer", path: cact, image: state.screenshot, content };
 
     } else if (call.type === "cmd") {
       if (!call.command || !call.command.trim()) {

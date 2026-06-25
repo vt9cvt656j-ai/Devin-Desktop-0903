@@ -2,6 +2,7 @@ mod ai;
 mod auth;
 mod browser;
 mod capture;
+mod computer;
 mod debug;
 mod devin;
 mod extensions;
@@ -112,6 +113,13 @@ pub fn run() {
             browser::browser_eval,
             browser::browser_screenshot,
             browser::browser_close,
+            computer::computer_screenshot,
+            computer::computer_move,
+            computer::computer_click,
+            computer::computer_double_click,
+            computer::computer_type,
+            computer::computer_key,
+            computer::computer_scroll,
             devin::devin_create_session,
             devin::devin_send_message,
             devin::devin_get_session,
