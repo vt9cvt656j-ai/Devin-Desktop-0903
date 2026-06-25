@@ -5387,6 +5387,10 @@ let _chatSessions = [];
 let _activeChatIdx = -1;
 let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats after a close
 let streaming = false;
+// Which chat session the (single, global) agent run belongs to — so the send/
+// stop button reflects the RUNNING tab, not whichever tab you switched to, and
+// a different tab gets a clear "busy" message instead of a silently dead button.
+let _runningSession = null;
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
 
 function _currentSession() {
@@ -5498,6 +5502,9 @@ function _switchChatSession(idx) {
     chatEl.appendChild(session.container);
     chatEl.scrollTop = session.scrollPos || 0;
   }
+  // The send/stop button reflects whether THIS tab is the one currently running,
+  // so switching tabs no longer leaves a stuck "Stop" button on an idle tab.
+  _setSendBtnStop(streaming && _runningSession === session);
 }
 
 function _newChatSession(name, mode) {
@@ -6312,7 +6319,15 @@ async function sendPrompt(text, attachedImages = []) {
     showToast(t("assistant.configFirst"));
     return;
   }
-  if (streaming) return;
+  // A run is already in flight. If it's THIS tab's run, ignore (it's showing
+  // Stop). If it's ANOTHER tab's run, tell the user clearly instead of silently
+  // doing nothing — then they can switch back, wait, or stop it.
+  if (streaming) {
+    if (_runningSession && _runningSession !== _currentSession()) {
+      showToast("另一个对话正在运行，先等它结束或点停止，或切回那个标签");
+    }
+    return;
+  }
   _setSendBtnStop(true);
   chatEl.querySelector(".chat-empty")?.remove();
 
@@ -6541,6 +6556,7 @@ async function sendPrompt(text, attachedImages = []) {
     _filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
       e.stopPropagation();
       streaming = false;
+      _runningSession = null;
       _setSendBtnStop(false);
       showToast("Agent stopped");
     });
@@ -6677,6 +6693,7 @@ async function sendPrompt(text, attachedImages = []) {
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
   streaming = true;
+  _runningSession = _currentSession();
   const _pendingToolCalls = [];
   let _toolArgBuf = {};
   try {
@@ -6733,6 +6750,7 @@ async function sendPrompt(text, attachedImages = []) {
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     streaming = false;
+    _runningSession = null;
     _setSendBtnStop(false);
     body.querySelector(".thinking")?.remove();
     if (_streamEl) { _streamEl.remove(); _streamEl = null; }
@@ -8044,7 +8062,7 @@ async function _runAgenticLoop({ config, messages, root }) {
     `</div>`;
   filesBar.addEventListener("click", (e) => { if (!e.target.closest(".agent-files-bar__btn")) filesBar.classList.toggle("is-open"); });
   filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
-    e.stopPropagation(); streaming = false; _setSendBtnStop(false); showToast("Agent stopped");
+    e.stopPropagation(); streaming = false; _runningSession = null; _setSendBtnStop(false); showToast("Agent stopped");
   });
   const filesList = document.createElement("ul");
   filesList.className = "agent-files-list";
@@ -8054,6 +8072,7 @@ async function _runAgenticLoop({ config, messages, root }) {
   const trackedFiles = new Map();
 
   streaming = true;
+  _runningSession = _currentSession();
   _setSendBtnStop(true);
   _clearAgentReadCache(); // fresh file reads each run
   _runCheckpoint.clear(); // start a fresh revert checkpoint for this run
@@ -8192,6 +8211,7 @@ async function _runAgenticLoop({ config, messages, root }) {
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
     streaming = false;
+    _runningSession = null;
     _setSendBtnStop(false);
     body.querySelector(".thinking")?.remove();
     if (hitCap) {
@@ -12542,6 +12562,7 @@ _sendBtnEl?.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
     streaming = false;
+    _runningSession = null;
     _setSendBtnStop(false);
     showToast("Generation stopped");
   }
@@ -12555,7 +12576,14 @@ promptEl.addEventListener("input", () => {
 });
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
-  if (streaming) return;
+  if (streaming) {
+    // Don't silently swallow the submit on an idle tab while another runs —
+    // tell the user. (On the running tab the button is Stop, so this is a no-op.)
+    if (_runningSession && _runningSession !== _currentSession()) {
+      showToast("另一个对话正在运行，先等它结束或点停止，或切回那个标签");
+    }
+    return;
+  }
   const text = promptEl.value.trim();
   if (!text && _pastedImages.length === 0) return;
   const images = [..._pastedImages];
