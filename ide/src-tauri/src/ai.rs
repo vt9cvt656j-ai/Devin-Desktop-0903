@@ -1,6 +1,23 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+use std::time::Duration;
 use tauri::ipc::Channel;
+
+/// Shared HTTP client. The agentic loop fires many sequential requests; a single
+/// pooled client reuses TCP+TLS connections (keep-alive) instead of doing a fresh
+/// handshake on every turn — the main source of "backend feels laggy" between
+/// turns. No total `.timeout()` is set because chat responses stream open-ended;
+/// only the connect phase is bounded.
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +86,7 @@ pub async fn ai_complete(
         "messages": messages,
     });
 
-    let client = reqwest::Client::new();
+    let client = &*HTTP;
     let resp = client
         .post(&url)
         .bearer_auth(&config.api_key)
@@ -154,7 +171,7 @@ async fn ai_chat_inner(
         }
     }
 
-    let client = reqwest::Client::new();
+    let client = &*HTTP;
     let resp = client
         .post(&url)
         .bearer_auth(&config.api_key)

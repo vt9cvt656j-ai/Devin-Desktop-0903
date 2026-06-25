@@ -5642,7 +5642,7 @@ function addMessage(role, text) {
     const id = currentModel();
     const avatar = document.createElement("div");
     avatar.className = "msg__avatar msg__avatar--logo";
-    avatar.innerHTML = `<img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" />`;
+    avatar.innerHTML = `<img class="assistant-logo" src="/logo.png" alt="" aria-hidden="true" />`;
     const main = document.createElement("div");
     main.className = "msg__main";
     main.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
@@ -5702,7 +5702,7 @@ function showChatHint() {
   const hint = document.createElement("div");
   hint.className = "chat-empty";
   hint.innerHTML =
-    `<div class="chat-empty__icon chat-empty__icon--logo"><img class="assistant-logo" src="/src/assets/logo.png" alt="" aria-hidden="true" /></div>` +
+    `<div class="chat-empty__icon chat-empty__icon--logo"><img class="assistant-logo" src="/logo.png" alt="" aria-hidden="true" /></div>` +
     `<h3></h3>` +
     `<p></p>` +
     `<div class="chat-empty__chips"></div>`;
@@ -6361,7 +6361,11 @@ async function sendPrompt(text, attachedImages = []) {
   const flushStream = () => {
     raf = 0;
     const now = Date.now();
-    if (now - lastFlush < 80) { scheduleStream(); return; } // ~12fps; reschedule so the tail still renders
+    // Adaptive throttle: re-parsing the whole accumulated reply each flush gets
+    // costly as it grows, so widen the frame gap for long replies (caps the
+    // O(n) work/sec instead of letting it pile up at a fixed 12fps).
+    const _gap = acc.length > 40000 ? 250 : acc.length > 12000 ? 140 : 80;
+    if (now - lastFlush < _gap) { scheduleStream(); return; } // reschedule so the tail still renders
     lastFlush = now;
     body.querySelector(".thinking")?.remove();
 
@@ -11341,7 +11345,7 @@ function _updateLoginUI() {
 
 // login flow
 const loginLogoEl = $("loginLogo");
-if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" src="/src/assets/logo.png" alt="Michael IDE" style="width:52px;height:52px;border-radius:13px" />`;
+if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" src="/logo.png" alt="Michael IDE" style="width:52px;height:52px;border-radius:13px" />`;
 // Login / signup flow:
 //   step 1 — enter email → validate format → check DB for an existing account
 //   existing account → enter password → 登录                 (auth_login)
