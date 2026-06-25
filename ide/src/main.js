@@ -6305,26 +6305,54 @@ async function sendPrompt(text, attachedImages = []) {
   let reasoning = "";
   let reasoningEl = null;
   let _answerStarted = false;
+  // Route inline <think>…</think> into the thinking card. Many "thinking" models
+  // (DeepSeek-R1 / V3.1-think, QwQ, GLM-Z1, Qwen3-think …) stream their reasoning
+  // *inside* `content` wrapped in these tags rather than a separate
+  // reasoning_content field — without this it'd leak raw <think> into the answer
+  // and the card would stay empty. Tags may be split across deltas, so we hold a
+  // small tail that could be the start of a tag until the next chunk arrives.
+  let _thinkIn = false, _thinkHold = "";
+  const _partialOpen = (s, tag) => { for (let k = Math.min(s.length, tag.length - 1); k > 0; k--) if (tag.startsWith(s.slice(-k))) return k; return 0; };
+  const _routeThink = (delta) => {
+    let s = _thinkHold + delta; _thinkHold = "";
+    let th = "", an = "";
+    while (s) {
+      if (!_thinkIn) {
+        const i = s.indexOf("<think>");
+        if (i === -1) { const k = _partialOpen(s, "<think>"); an += s.slice(0, s.length - k); _thinkHold = s.slice(s.length - k); break; }
+        an += s.slice(0, i); s = s.slice(i + 7); _thinkIn = true;
+      } else {
+        const i = s.indexOf("</think>");
+        if (i === -1) { const k = _partialOpen(s, "</think>"); th += s.slice(0, s.length - k); _thinkHold = s.slice(s.length - k); break; }
+        th += s.slice(0, i); s = s.slice(i + 8); _thinkIn = false;
+      }
+    }
+    return { th, an };
+  };
   const ensureThink = () => {
     if (reasoningEl) return reasoningEl;
     if (!document.getElementById("think-style")) {
       const st = document.createElement("style");
       st.id = "think-style";
       st.textContent =
-        ".think-card{border:1px solid rgba(140,140,150,.25);border-radius:10px;margin:2px 0 12px;background:rgba(140,140,150,.07)}" +
-        ".think-head{display:flex;align-items:center;gap:7px;padding:8px 12px;cursor:pointer;font-size:12.5px;color:#9aa0a6;user-select:none}" +
-        ".think-head .chev{transition:transform .2s;flex:0 0 auto}" +
+        ".think-card{border:1px solid var(--tk-bd,#e4e7ee);border-radius:12px;margin:2px 0 14px;background:var(--tk-bg,#f7f9fc);overflow:hidden;transition:border-color .2s}" +
+        ".think-card:hover{border-color:var(--tk-bdh,#d4dae4)}" +
+        ".think-head{display:flex;align-items:center;gap:8px;padding:9px 13px;cursor:pointer;font-size:12.5px;font-weight:500;color:var(--tk-fg,#5f6368);user-select:none}" +
+        ".think-head .tk-ic{flex:0 0 auto;color:#1a73e8}" +
+        ".think-head .think-title{flex:1 1 auto}" +
+        ".think-head .chev{transition:transform .25s cubic-bezier(.4,0,.2,1);flex:0 0 auto;opacity:.6}" +
         '.think-card[data-open="0"] .think-head .chev{transform:rotate(-90deg)}' +
-        '.think-card[data-open="0"] .think-body{display:none}' +
-        ".think-body{padding:2px 12px 11px;font-size:12.5px;line-height:1.65;color:#9aa0a6;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}" +
-        '.think-card.streaming .think-title::after{content:" ▍";color:#1a73e8;animation:think-blink 1s steps(2) infinite}' +
-        "@keyframes think-blink{50%{opacity:0}}";
+        ".think-body{padding:2px 14px 12px 14px;font-size:12.5px;line-height:1.7;color:var(--tk-bfg,#5f6368);white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;transition:max-height .28s cubic-bezier(.4,0,.2,1),opacity .2s,padding .2s}" +
+        '.think-card[data-open="0"] .think-body{max-height:0;opacity:0;padding-top:0;padding-bottom:0}' +
+        '.think-card.streaming .think-title::after{content:"";display:inline-block;width:5px;height:13px;margin-left:4px;vertical-align:-2px;background:#1a73e8;border-radius:1px;animation:think-blink 1.1s steps(2,start) infinite}' +
+        "@keyframes think-blink{50%{opacity:0}}" +
+        '[data-theme="dark"] .think-card,.dark .think-card{--tk-bd:rgba(150,160,180,.22);--tk-bg:rgba(150,160,180,.08);--tk-bdh:rgba(150,160,180,.34);--tk-fg:#9aa0a6;--tk-bfg:#b4b9c0}';
       document.head.appendChild(st);
     }
     reasoningEl = document.createElement("div");
     reasoningEl.className = "think-card streaming";
     reasoningEl.dataset.open = "1";
-    reasoningEl.innerHTML = '<div class="think-head"><svg class="chev" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg><span class="think-title">思考中…</span></div><div class="think-body"></div>';
+    reasoningEl.innerHTML = '<div class="think-head"><svg class="tk-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.5.5 1 1.2 1 2V16h6v-.5c0-.8.5-1.5 1-2A6 6 0 0 0 12 3Z"/></svg><span class="think-title">思考中…</span><svg class="chev" width="13" height="13" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg></div><div class="think-body"></div>';
     reasoningEl.querySelector(".think-head").addEventListener("click", () => {
       reasoningEl.dataset.open = reasoningEl.dataset.open === "1" ? "0" : "1";
     });
@@ -6378,7 +6406,7 @@ async function sendPrompt(text, attachedImages = []) {
     // Adaptive throttle: re-parsing the whole accumulated reply each flush gets
     // costly as it grows, so widen the frame gap for long replies (caps the
     // O(n) work/sec instead of letting it pile up at a fixed 12fps).
-    const _gap = acc.length > 40000 ? 250 : acc.length > 12000 ? 140 : 80;
+    const _gap = acc.length > 40000 ? 120 : acc.length > 12000 ? 64 : 32;
     if (now - lastFlush < _gap) { scheduleStream(); return; } // reschedule so the tail still renders
     lastFlush = now;
     body.querySelector(".thinking")?.remove();
@@ -6491,7 +6519,11 @@ async function sendPrompt(text, attachedImages = []) {
       : (cb) => backend.aiChat(config, messages, cb);
     await chatFn((ev) => {
       if (ev.kind === "reasoning") { reasoning += ev.delta; setThink(reasoning); }
-      else if (ev.kind === "token") { if (!_answerStarted) { _answerStarted = true; collapseThink(); } acc += ev.delta; scheduleStream(); }
+      else if (ev.kind === "token") {
+        const { th, an } = _routeThink(ev.delta);
+        if (th) { reasoning += th; setThink(reasoning); }
+        if (an) { if (!_answerStarted) { _answerStarted = true; collapseThink(); } acc += an; scheduleStream(); }
+      }
       else if (ev.kind === "toolCall") {
         collapseThink();
         const { id, name, arguments: args } = ev;
@@ -6528,6 +6560,7 @@ async function sendPrompt(text, attachedImages = []) {
     });
   } catch (e) { if (!err) err = String(e); }
   finally {
+    if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
     if (raf) cancelAnimationFrame(raf);
     streaming = false;
