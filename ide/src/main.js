@@ -12302,8 +12302,85 @@ function buildMenubar() {
 
 // ---- wiring ----
 async function chooseFolder() {
-  const picked = await backend.pickFolder();
-  if (picked) await openFolder(picked);
+  let picked = null, threw = false;
+  const t0 = Date.now();
+  try { picked = await backend.pickFolder(); }
+  catch { threw = true; } // native dialog errored (unavailable on this desktop)
+  if (picked) { await openFolder(picked); return; }
+  // Returned nothing. If it errored, or came back almost instantly, the native
+  // picker isn't actually available (common on Linux without xdg-desktop-portal —
+  // which made the button look dead). Fall back to manual path entry so opening a
+  // folder ALWAYS works. If it took a moment, the user likely cancelled a working
+  // dialog → respect that and don't nag.
+  if (threw || Date.now() - t0 < 250) await _promptFolderPath();
+}
+
+// Manual "open folder" via typed/pasted path + recent list — the reliable
+// fallback when the OS file picker is unavailable.
+async function _promptFolderPath() {
+  let home = "";
+  try { home = (await backend.homeDir()) || ""; } catch {}
+  home = home || rootPath || "";
+  let recents = [];
+  try { const store = await loadStore("session.json"); recents = (await store.get(RECENT_PROJECTS_KEY)) || []; } catch {}
+
+  const overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99999";
+  const modal = document.createElement("div");
+  modal.style.cssText = "width:min(560px,92vw);background:var(--panel,#1e1e22);border:1px solid var(--border,rgba(128,128,128,.35));border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden";
+  modal.innerHTML =
+    `<div style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border,rgba(128,128,128,.25))">` +
+      `<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>` +
+      `<span style="font-size:14px;font-weight:600">打开文件夹</span>` +
+      `<button class="pf-close" type="button" style="margin-left:auto;background:none;border:none;color:inherit;cursor:pointer;font-size:16px;opacity:.6">✕</button>` +
+    `</div>` +
+    `<div style="padding:12px 14px">` +
+      `<div style="font-size:12px;opacity:.65;margin-bottom:6px">输入或粘贴文件夹的完整路径：</div>` +
+      `<input class="pf-input" type="text" spellcheck="false" placeholder="${_escAttr(home || "/path/to/project")}" style="width:100%;box-sizing:border-box;padding:9px 10px;font:13px/1.4 ui-monospace,Menlo,monospace;background:var(--bg,#15151a);color:var(--text,#eee);border:1px solid var(--border,rgba(128,128,128,.3));border-radius:8px;outline:none">` +
+      `<div class="pf-err" style="color:#f85149;font-size:12px;min-height:16px;margin-top:6px"></div>` +
+      (recents.length ? `<div style="font-size:12px;opacity:.6;margin:2px 0 4px">最近打开：</div><div class="pf-recents" style="display:flex;flex-direction:column;gap:1px;max-height:150px;overflow:auto"></div>` : "") +
+    `</div>` +
+    `<div style="display:flex;gap:8px;padding:0 14px 14px;justify-content:flex-end">` +
+      `<button class="pf-cancel" type="button" style="padding:6px 12px;border-radius:7px;border:1px solid var(--border,rgba(128,128,128,.35));background:none;color:inherit;cursor:pointer;font:inherit;font-size:12px">取消</button>` +
+      `<button class="pf-open" type="button" style="padding:6px 14px;border-radius:7px;border:none;background:var(--accent,#3b82f6);color:#fff;cursor:pointer;font:inherit;font-size:12px">打开</button>` +
+    `</div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  const input = modal.querySelector(".pf-input");
+  const errEl = modal.querySelector(".pf-err");
+  input.value = home;
+  setTimeout(() => { input.focus(); input.select(); }, 30);
+  const close = () => overlay.remove();
+  const tryOpen = async (path) => {
+    const p = (path || "").trim().replace(/^['"]|['"]$/g, "");
+    if (!p) { errEl.textContent = "请输入路径"; return; }
+    try { await backend.readDir(p); }
+    catch { errEl.textContent = "找不到这个文件夹（检查路径是否写对）"; return; }
+    close();
+    await openFolder(p);
+  };
+  modal.querySelector(".pf-close").addEventListener("click", close);
+  modal.querySelector(".pf-cancel").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  modal.querySelector(".pf-open").addEventListener("click", () => tryOpen(input.value));
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); tryOpen(input.value); } else if (e.key === "Escape") close(); });
+
+  const recentsBox = modal.querySelector(".pf-recents");
+  if (recentsBox) {
+    for (const rp of recents.slice(0, 8)) {
+      const path = typeof rp === "string" ? rp : (rp && rp.path);
+      if (!path) continue;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.style.cssText = "text-align:left;padding:6px 8px;border-radius:6px;border:none;background:none;color:inherit;cursor:pointer;font:12px ui-monospace,Menlo,monospace;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      b.textContent = path;
+      b.addEventListener("mouseenter", () => { b.style.background = "rgba(128,128,128,.15)"; });
+      b.addEventListener("mouseleave", () => { b.style.background = "none"; });
+      b.addEventListener("click", () => tryOpen(path));
+      recentsBox.appendChild(b);
+    }
+  }
 }
 $("openFolderBtn").addEventListener("click", chooseFolder);
 $("emptyOpenBtn").addEventListener("click", chooseFolder);
