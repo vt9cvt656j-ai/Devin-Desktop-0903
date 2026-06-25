@@ -8477,12 +8477,16 @@ function _liveWritePreview(entry, container) {
     chatEl.scrollTop = chatEl.scrollHeight;
   }
 
-  // 2) Keep the filename in sync as the `path` field streams. Do NOT lock onto
-  //    the first partial value — "comp" would freeze before "component.tsx"
-  //    finished arriving. Re-read every call (path is tiny) so the label always
-  //    shows the latest, complete-so-far name.
+  // 2) Keep the filename in sync as the `path` field streams. Re-read every call
+  //    (path is tiny) so the label fills in to the complete name. Two ways to get
+  //    it, for robustness across models: the streaming regex, and — once the args
+  //    are a complete JSON object — a real parse (handles models that emit the
+  //    `content` field BEFORE `path`, where the regex can't see path until the end).
   {
-    const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
+    let fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
+    if (!fname) {
+      try { const p = JSON.parse(entry.args || ""); if (p && p.path) fname = String(p.path).split("/").pop(); } catch {}
+    }
     if (fname) {
       const label = entry.streamCard.querySelector(".code-card__label");
       const want = "正在写 " + fname;
@@ -8492,7 +8496,13 @@ function _liveWritePreview(entry, container) {
 
   // 3) Decode newly-arrived content incrementally; the rAF flusher types it out.
   //    Never touch the DOM straight from this (very frequent) delta callback.
-  entry._target = _streamWriteContent(entry, entry.name === "write_file" ? "content" : "new_string") || "";
+  const key = entry.name === "write_file" ? "content" : "new_string";
+  entry._target = _streamWriteContent(entry, key) || "";
+  // Fallback: if the incremental decode found nothing yet but the args are already
+  // a complete JSON object, pull the value out directly (robust to odd streaming).
+  if (!entry._target) {
+    try { const p = JSON.parse(entry.args || ""); const v = p && p[key]; if (v) entry._target = String(v); } catch {}
+  }
   _scheduleWritePreviewFlush(entry);
 }
 
