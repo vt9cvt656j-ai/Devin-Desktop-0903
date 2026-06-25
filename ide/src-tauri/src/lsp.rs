@@ -478,7 +478,7 @@ pub fn lsp_python_env_symbols(modules: Vec<String>) -> Result<PythonModuleSymbol
 
     let cache_valid = guard
         .as_ref()
-        .map_or(false, |c| now.duration_since(c.fetched_at).as_secs() < 300);
+        .is_some_and(|c| now.duration_since(c.fetched_at).as_secs() < 300);
 
     let all_modules = if cache_valid {
         guard.as_ref().unwrap().modules.clone()
@@ -595,9 +595,7 @@ pub fn lsp_node_env_symbols(
 
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     if !modules.is_empty() {
-        let script = format!(
-            r#"const r={{}};for(const n of process.argv.slice(1)){{try{{const m=require(n);r[n]=Object.getOwnPropertyNames(m).filter(k=>!k.startsWith('_')).slice(0,500)}}catch{{}}}};console.log(JSON.stringify(r))"#
-        );
+        let script = r#"const r={};for(const n of process.argv.slice(1)){try{const m=require(n);r[n]=Object.getOwnPropertyNames(m).filter(k=>!k.startsWith('_')).slice(0,500)}catch{}};console.log(JSON.stringify(r))"#.to_string();
         let mut cmd = Command::new(&node);
         cmd.args(["-e", &script])
             .env("PATH", &aug_path)
@@ -794,7 +792,7 @@ for _,v in ipairs(r) do print(v) end"#;
             );
             for line in &deps {
                 if let Some(name) = line.split_whitespace().next() {
-                    if name.chars().next().map_or(false, |c| c.is_alphabetic()) {
+                    if name.chars().next().is_some_and(|c| c.is_alphabetic()) {
                         symbols.push(name.to_string());
                     }
                 }
