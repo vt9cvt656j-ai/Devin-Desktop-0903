@@ -5883,6 +5883,8 @@ const _AI_MODE_PROMPTS = {
 - **根因优先**：修 bug 先定位「它到底为什么发生」，解决**根本原因**，不要打补丁糊症状；改完想一下有没有同类问题在别处。
 - **保持推进**：常规步骤（读文件、装依赖、跑构建/测试）直接做，不为每一步请示；信息不全就合理假设并说明，一路推到任务真正完成再收尾。
 - **沟通极简**：直接给结论，不写「我将要…/接下来我会…」这类铺垫，也不在正文复述正在调用的工具（系统已显示成卡片）；要指到代码就用 文件:行号。
+- **诚实，绝不假装（铁律）**：工具返回 [失败] / [不可用] / 报错 / 空结果，就是**没成功**——如实说出来、给原因、换方法，**绝不把没做成的事说成做成了**。截图 / 操作类工具(screenshot / browser / computer)只有拿到真实的截图和数据才算生效；拿到空的或报错就是没生效，**别据假数据继续编**。宁可说"这一步没成、原因是 X、我换个方式"，也不要假装顺利。
+- **灵活组合工具、别死板（这是"能打"的关键）**：一个工具不行就换或几个配合——操作 GUI 桌面 App 用 computer、网页交互用 browser、能用命令就 run_cmd、读代码用 lsp/search/子智能体。卡住就退一步换思路、换角度，别一条道走到黑，也别因为某个工具用不了就整个任务躺平。先想"达成目标有哪几条路"，挑最稳的走，不通再换。
 
 # 引导用户（让小白也能掌控——简洁，但不让人懵）
 - "沟通极简"是别啰嗦铺垫，不是把用户晾在一边。**收尾要让新手也看懂**：用大白话说清你**做了什么、为什么这么做、怎么用 / 怎么跑、改了哪些文件**；专业术语第一次出现顺手用一句话解释。
@@ -7460,6 +7462,14 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回当前页面的截图(回传给你看) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓页面信息。action：navigate(打开网址,需 url) / click(点击,需 selector=CSS选择器) / type(输入,需 selector+text) / press(按键如 Enter/Tab/Escape,需 key) / eval(在页面跑 JS,需 script,返回结果) / screenshot(只看当前页不动作) / close(关闭浏览器)。打法：先 navigate 打开 → screenshot 或 eval('document.body.innerHTML') 看清结构与选择器 → 再 click/type/press 操作 → 看截图确认。需本机装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, selector: { type: "string", description: "click/type 用：目标元素的 CSS 选择器" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
     );
+  }
+  // Desktop-only tools (need the real machine: terminal PTY, headless Chrome,
+  // screen/keyboard/mouse). In the web/preview build there's no Tauri backend —
+  // the mock invoke would return {} and the agent would act on FAKE success. So
+  // don't even offer them there.
+  if (!inTauri) {
+    const desktopOnly = new Set(["run_in_terminal", "browser", "computer", "screenshot"]);
+    return tools.filter((t) => !desktopOnly.has(t.function.name));
   }
   return tools;
 }
@@ -9081,6 +9091,7 @@ async function _executeToolStep(step, call, root, run) {
       return { type: "websearch", path: call.path, content: text };
 
     } else if (call.type === "screenshot") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "screenshot", path: "", content: "[不可用] screenshot 只能在 Michael IDE 桌面 App 里用（要驱动本机的无头 Chrome）。网页/预览版没有这个能力。" }; }
       const url = (call.url || call.path || "").trim();
       if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "screenshot", path: "", content: "[ERROR] 需要 url（要截图的网址，如 http://127.0.0.1:3000）。" }; }
       let dataUrl = "";
@@ -9090,6 +9101,10 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
         if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
         return { type: "screenshot", path: url, content: `[截图失败] ${msg}` };
+      }
+      if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
+        res.className = "atc-result atc-result--err"; res.textContent = "未生效";
+        return { type: "screenshot", path: url, content: "[失败] 没拿到截图——多半是桌面 App 没用最新代码重新构建，或本机没装 Chrome/Chromium/Edge。请排查，别当成功继续。" };
       }
       res.className = "atc-result atc-result--ok"; res.textContent = "已截图";
       if (vp) vp.innerHTML = `<img src="${dataUrl}" alt="screenshot" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
@@ -9325,6 +9340,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "browser", path: act, content: "[不可用] browser（自主浏览器）只能在 Michael IDE 桌面 App 里用（要驱动本机的无头 Chrome）。网页/预览版没有这个能力。" }; }
       if (act === "close") {
         try { await backend.invoke("browser_close"); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = "已关闭";
@@ -9344,6 +9360,10 @@ async function _executeToolStep(step, call, root, run) {
         if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
         return { type: "browser", path: act, content: `[浏览器失败] ${msg}` };
       }
+      if (!state || !state.screenshot) {
+        res.className = "atc-result atc-result--err"; res.textContent = "未生效";
+        return { type: "browser", path: act, content: "[失败] 没拿到页面截图，这次操作没真正生效。多半是桌面 App 没用最新代码重新构建，或本机没装 Chrome/Chromium/Edge。请排查，别当成功继续。" };
+      }
       res.className = "atc-result atc-result--ok"; res.textContent = act;
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="page" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">` + (state.title || state.url ? `<div style="font-size:11px;opacity:.6;margin-top:5px">${_escHtml(state.title || "")} — ${_escHtml(state.url || "")}</div>` : "");
       step.classList.add("is-open");
@@ -9356,6 +9376,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "computer") {
       const cact = call.action || "screenshot";
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "computer", path: cact, content: "[不可用] computer（控制电脑）只能在 Michael IDE 桌面 App 里用——网页/预览版没有屏幕和键鼠权限，无法真正操作机器。" }; }
       const hasXY = Number.isFinite(call.x) && Number.isFinite(call.y);
       if ((cact === "move" || cact === "click" || cact === "double_click") && !hasXY) {
         res.className = "atc-result atc-result--err"; res.textContent = "缺坐标";
@@ -9375,6 +9396,10 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
         if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
         return { type: "computer", path: cact, content: `[电脑操作失败] ${msg}` };
+      }
+      if (!state || !state.screenshot) {
+        res.className = "atc-result atc-result--err"; res.textContent = "未生效";
+        return { type: "computer", path: cact, content: "[失败] 没拿到屏幕截图，说明这次操作没真正生效。常见原因：① 桌面 App 没用最新代码重新构建（先 npm run tauri build/dev）；② macOS 未授权——去 系统设置 → 隐私与安全性 → 屏幕录制 和 辅助功能 里勾选 Michael IDE 后重启 App；③ 当前不在桌面图形会话里。请据此排查，别当作成功继续。" };
       }
       res.className = "atc-result atc-result--ok"; res.textContent = cact;
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
