@@ -626,9 +626,29 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     // blip is absorbed instead of surfaced. We only retry BEFORE streaming the
     // body has started (a send error or a bad status line), so no half-streamed
     // response is ever double-sent, and billing still happens once, after success.
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("该模型").to_string();
+    // Map an upstream error to a friendly, actionable Chinese message.
+    fn friendly_upstream(status: u16, low: &str) -> &'static str {
+        if low.contains("forbidden") || low.contains("未授权") {
+            "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
+        } else if low.contains("no available") || low.contains("没有可用") {
+            "上游暂无可用账号。请换个模型，或稍后再试。"
+        } else if status == 429 || low.contains("rate") || low.contains("frequent") || low.contains("过于频繁") {
+            "请求过于频繁，请稍后再试。"
+        } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
+            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
+        } else {
+            "上游暂时不可用，请换个模型或稍后再试。"
+        }
+    }
+    // Send with retry — but ONLY retry *transient* failures (502/503/504/429 or a
+    // dropped connection). "forbidden / unauthorized / no available account" is
+    // PERSISTENT: retrying just makes the user wait ~15s for the same error, so we
+    // fail FAST with a friendly message. Billing only happens after a success.
     let resp = {
-        let mut got = None;
-        let mut last = String::from("unknown");
+        let mut success = None;
+        let mut err_status = 502u16;
+        let mut err_low = String::new();
         for attempt in 0u32..3 {
             let mut req = GW_HTTP
                 .post(&url)
@@ -638,58 +658,50 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
                 req = req.timeout(std::time::Duration::from_secs(120));
             }
             match req.send().await {
-                Ok(r) => {
-                    let s = r.status().as_u16();
-                    if matches!(s, 502 | 503 | 504 | 429) && attempt < 2 {
-                        last = format!("上游 {s}");
-                        tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1))).await;
-                        continue;
-                    }
-                    got = Some(r);
+                Ok(r) if r.status().is_success() => {
+                    success = Some(r);
                     break;
+                }
+                Ok(r) => {
+                    err_status = r.status().as_u16();
+                    err_low = r.text().await.unwrap_or_default().to_lowercase();
+                    let persistent = err_status == 401
+                        || err_status == 403
+                        || err_low.contains("forbidden")
+                        || err_low.contains("unauthorized")
+                        || err_low.contains("invalid api key")
+                        || err_low.contains("未授权")
+                        || err_low.contains("no available")
+                        || err_low.contains("没有可用");
+                    let transient = matches!(err_status, 502 | 503 | 504 | 429);
+                    if persistent || !transient || attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
                 // A send error means the request almost certainly never reached the
                 // server (incl. a stale pooled connection) — safe to re-send.
                 Err(e) => {
-                    last = e.to_string();
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1))).await;
-                        continue;
+                    err_status = 502;
+                    err_low = e.to_string().to_lowercase();
+                    if attempt == 2 {
+                        break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
             }
         }
-        got.ok_or_else(|| AppError {
-            status: StatusCode::BAD_GATEWAY,
-            msg: format!("模型上游连续失败（已重试3次）: {last}"),
-        })?
+        match success {
+            Some(r) => r,
+            None => {
+                return Err(AppError {
+                    status: StatusCode::BAD_GATEWAY,
+                    msg: format!("【{model_name}】{}", friendly_upstream(err_status, &err_low)),
+                });
+            }
+        }
     };
     let status = resp.status();
-
-    // Translate raw upstream (zyz et al.) errors into a friendly, actionable
-    // Chinese message instead of dumping a scary "502 {json}" at the user. These
-    // are the provider's problem (forbidden key / no accounts / overloaded), not
-    // ours — tell the user to switch model or contact the provider.
-    if !status.is_success() {
-        let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("该模型").to_string();
-        let raw = resp.text().await.unwrap_or_default();
-        let low = raw.to_lowercase();
-        let friendly = if low.contains("forbidden") {
-            "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通/续费。"
-        } else if low.contains("no available account") || low.contains("no available") {
-            "上游暂无可用账号。请换个模型，或稍后再试。"
-        } else if status.as_u16() == 429 || low.contains("rate") || low.contains("frequent") || low.contains("过于频繁") {
-            "请求过于频繁，请稍后再试。"
-        } else if status.as_u16() == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
-            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
-        } else {
-            "上游暂时不可用，请换个模型或稍后再试。"
-        };
-        return Err(AppError {
-            status: StatusCode::BAD_GATEWAY,
-            msg: format!("【{model_name}】{friendly}"),
-        });
-    }
 
     async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool) {
         if cost > 0 {
