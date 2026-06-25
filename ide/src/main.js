@@ -96,7 +96,7 @@ let _launchConfigsCache = null;
 
 // Central backend base URL (overridable via localStorage michael_api).
 function _michaelBase() {
-  return (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
+  return (localStorage.getItem("michael_api") || "https://code.mrday.one:8443").replace(/\/+$/, "");
 }
 // POST to the central auth API; returns a _finishLogin-shaped result.
 async function _michaelAuth(path, body) {
@@ -4924,7 +4924,7 @@ async function migrateFromLocalStorage() {
 
 // Central model gateway. "Custom model mode" (per-user baseUrl/model) is removed:
 // every chat routes through this gateway; only the API key + picked model vary.
-const MICHAEL_API = (localStorage.getItem("michael_api") || "http://209.97.172.123").replace(/\/+$/, "");
+const MICHAEL_API = (localStorage.getItem("michael_api") || "https://code.mrday.one:8443").replace(/\/+$/, "");
 
 function loadConfig() {
   const c = _cfgCache || _DEFAULT_AI_CONFIG;

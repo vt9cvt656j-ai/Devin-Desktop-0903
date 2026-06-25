@@ -619,17 +619,51 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     let url = format!("{}/chat/completions", api_base(&conn.base_url));
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
-    let mut req = GW_HTTP
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", conn.api_key))
-        .json(&body);
-    if !streaming {
-        req = req.timeout(std::time::Duration::from_secs(120));
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
+    //
+    // Upstream providers (zyz et al.) intermittently return 502/503/504/429 or
+    // drop a kept-alive connection mid-flight — the user just sees "网关又出问题".
+    // Retry such *transient* failures up to 3 attempts with a short backoff so a
+    // blip is absorbed instead of surfaced. We only retry BEFORE streaming the
+    // body has started (a send error or a bad status line), so no half-streamed
+    // response is ever double-sent, and billing still happens once, after success.
+    let resp = {
+        let mut got = None;
+        let mut last = String::from("unknown");
+        for attempt in 0u32..3 {
+            let mut req = GW_HTTP
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", conn.api_key))
+                .json(&body);
+            if !streaming {
+                req = req.timeout(std::time::Duration::from_secs(120));
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    if matches!(s, 502 | 503 | 504 | 429) && attempt < 2 {
+                        last = format!("上游 {s}");
+                        tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    got = Some(r);
+                    break;
+                }
+                // A send error means the request almost certainly never reached the
+                // server (incl. a stale pooled connection) — safe to re-send.
+                Err(e) => {
+                    last = e.to_string();
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                }
+            }
+        }
+        got.ok_or_else(|| AppError {
+            status: StatusCode::BAD_GATEWAY,
+            msg: format!("模型上游连续失败（已重试3次）: {last}"),
+        })?
+    };
     let status = resp.status();
 
     async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool) {
