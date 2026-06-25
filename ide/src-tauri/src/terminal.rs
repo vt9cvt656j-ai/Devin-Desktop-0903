@@ -36,6 +36,9 @@ struct Term {
 impl Drop for Term {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // Reap it so the killed shell doesn't linger as a zombie (matches how the
+        // LSP/DAP child processes are torn down).
+        let _ = self.child.wait();
     }
 }
 

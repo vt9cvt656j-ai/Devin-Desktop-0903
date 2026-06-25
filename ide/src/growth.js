@@ -126,7 +126,18 @@ function load() {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      state = { ...freshState(), ...parsed };
+      const fresh = freshState();
+      // Deep-merge the nested objects: a shallow spread would let an OLDER save's
+      // partial `stats`/`prefs` replace the whole fresh object, leaving new fields
+      // undefined — then `stats.blind += n` → NaN, which persists and poisons the
+      // stats forever. Merge field-by-field so upgrades always have every key.
+      state = {
+        ...fresh,
+        ...parsed,
+        stats: { ...fresh.stats, ...(parsed.stats || {}) },
+        prefs: { ...fresh.prefs, ...(parsed.prefs || {}) },
+        skills: { ...fresh.skills, ...(parsed.skills || {}) },
+      };
       // heal: ensure every known skill exists (graph may grow across versions)
       for (const id of SKILL_IDS) if (!state.skills[id]) state.skills[id] = { p: BKT.pInit, n: 0, last: 0 };
     }

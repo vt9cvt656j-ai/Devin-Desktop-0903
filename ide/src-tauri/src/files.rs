@@ -163,11 +163,19 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
         return Ok(resolved);
     }
 
+    // Component-boundary containment: "/a/b" must NOT match sibling "/a/bcd".
+    // `Path::starts_with` already does this; the string forms add a trailing-'/'
+    // (or exact-equal) check so a shared name prefix can't widen access.
+    let within = |prefix: &str, candidate: &str| -> bool {
+        candidate == prefix
+            || candidate.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+    };
+
     for root in roots.iter() {
         let root_str = root.to_string_lossy().to_string();
         if resolved.starts_with(root)
-            || resolved_str.starts_with(&root_str)
-            || raw_target.starts_with(&root_str)
+            || within(&root_str, &resolved_str)
+            || within(&root_str, &raw_target)
         {
             return Ok(resolved);
         }
@@ -175,12 +183,12 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
 
     // Always allow paths under HOME regardless of what roots are registered.
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if resolved_str.starts_with(&home) || raw_target.starts_with(&home) {
+        if within(&home, &resolved_str) || within(&home, &raw_target) {
             return Ok(resolved);
         }
         if let Ok(home_canonical) = std::fs::canonicalize(&home) {
             let hc = home_canonical.to_string_lossy().to_string();
-            if resolved_str.starts_with(&hc) || raw_target.starts_with(&hc) {
+            if within(&hc, &resolved_str) || within(&hc, &raw_target) {
                 return Ok(resolved);
             }
         }
@@ -259,13 +267,26 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     require_inside_workspace(&path)?;
+    // Create parent dirs ourselves so callers don't have to shell out to
+    // `mkdir -p` (which the agent frontend did, interpolating model-controlled
+    // paths straight into a shell command).
+    if let Some(parent) = Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
 /// Write a file to /tmp for internal tools (no workspace restriction).
 #[tauri::command]
 pub fn write_tmp_file(name: String, content: String) -> Result<String, String> {
-    let path = std::path::Path::new("/tmp").join(&name);
+    // Only ever write a bare filename under /tmp — strip any directory components
+    // so a name like "../etc/x" can't escape the temp dir.
+    let safe = Path::new(&name)
+        .file_name()
+        .ok_or("invalid temp file name")?;
+    let path = std::path::Path::new("/tmp").join(safe);
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -361,21 +382,38 @@ fn find_matches_in_line(
     needle: &str,
     case_sensitive: bool,
 ) -> Vec<(usize, usize, usize)> {
-    let hay = if case_sensitive {
-        line.to_string()
-    } else {
-        line.to_lowercase()
-    };
-    let needle_chars = needle.chars().count();
+    // `needle` is already lowercased by the caller when !case_sensitive.
     let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(rel) = hay[from..].find(needle) {
-        let byte_start = from + rel;
-        let col0 = hay[..byte_start].chars().count();
-        out.push((col0, col0, col0 + needle_chars));
-        from = byte_start + needle.len();
-        if from > hay.len() {
-            break;
+    if needle.is_empty() {
+        return out;
+    }
+    if case_sensitive {
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(needle) {
+            let byte_start = from + rel;
+            let col0 = line[..byte_start].chars().count();
+            out.push((col0, col0, col0 + needle.chars().count()));
+            from = byte_start + needle.len();
+            if from >= line.len() {
+                break;
+            }
+        }
+    } else {
+        // Walk the ORIGINAL line so the returned char offsets index the displayed
+        // text — correct even when case folding changes byte/char length (e.g.
+        // 'İ'). The previous code computed offsets on the lowercased copy.
+        let mut i = 0usize;
+        while i < line.len() {
+            if let Some(consumed) = ci_prefix_len(&line[i..], needle) {
+                if consumed > 0 {
+                    let col0 = line[..i].chars().count();
+                    let col_end = line[..i + consumed].chars().count();
+                    out.push((col0, col0, col_end));
+                    i += consumed;
+                    continue;
+                }
+            }
+            i += line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         }
     }
     out
@@ -400,7 +438,8 @@ pub fn search_in_project(
         return Ok(Vec::new());
     }
 
-    let root_path = PathBuf::from(&root);
+    // Keep the search confined to a registered workspace root.
+    let root_path = require_inside_workspace(&root)?;
     let mut results: Vec<FileMatches> = Vec::new();
     let mut total = 0usize;
     let mut stack: Vec<PathBuf> = vec![root_path.clone()];
@@ -504,6 +543,38 @@ pub struct ReplaceResult {
     replacements: usize,
 }
 
+/// If the case-insensitive lowercasing of a leading run of chars in `s` equals
+/// `needle_lower` exactly (ending on a char boundary of `s`), return how many
+/// bytes of `s` that run occupies; otherwise `None`. `needle_lower` must already
+/// be lowercased and non-empty. Operating on the original `s` keeps the returned
+/// length a valid byte offset into `s` even when case folding changes length.
+fn ci_prefix_len(s: &str, needle_lower: &str) -> Option<usize> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let mut lowered = String::new();
+    for (off, ch) in s.char_indices() {
+        for lc in ch.to_lowercase() {
+            lowered.push(lc);
+        }
+        if lowered.len() >= needle_lower.len() {
+            // Accept only an exact match ending on this char boundary. If the last
+            // char's lowercase expansion overshot the needle, reject — advancing
+            // by a partial char would not be byte-accurate.
+            return if lowered == needle_lower {
+                Some(off + ch.len_utf8())
+            } else {
+                None
+            };
+        }
+        // Bail early once the lowercased prefix can no longer lead to the needle.
+        if !needle_lower.starts_with(&lowered) {
+            return None;
+        }
+    }
+    None
+}
+
 /// Replace all occurrences of `query` with `replacement` in `file_path`.
 /// Returns the number of replacements made.
 #[tauri::command]
@@ -513,6 +584,10 @@ pub fn replace_in_file(
     replacement: String,
     case_sensitive: bool,
 ) -> Result<usize, String> {
+    // Same workspace boundary every other mutating fs command enforces — without
+    // it this is an arbitrary-file-write primitive.
+    let resolved = require_inside_workspace(&file_path)?;
+    let file_path = resolved.to_string_lossy().to_string();
     let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot replace in binary files".into());
@@ -522,19 +597,34 @@ pub fn replace_in_file(
         let c = content.matches(&query).count();
         (content.replace(&query, &replacement), c)
     } else {
-        let lower = content.to_lowercase();
+        // Case-insensitive literal replace. Match positions MUST be byte offsets
+        // into the original `content`, never into its lowercased copy: a path like
+        // 'İ' lowercases to two chars, so offsets taken from the lowercased string
+        // would land mid-char in the original — corrupting output and panicking on
+        // a non-char-boundary slice. Walk the original by char boundary instead.
         let needle = query.to_lowercase();
         let mut result = String::with_capacity(content.len());
-        let mut last = 0;
-        let mut found = 0;
-        while let Some(pos) = lower[last..].find(&needle) {
-            let abs = last + pos;
-            result.push_str(&content[last..abs]);
-            result.push_str(&replacement);
-            last = abs + query.len();
-            found += 1;
+        let mut found = 0usize;
+        let mut i = 0usize;
+        while i < content.len() {
+            match ci_prefix_len(&content[i..], &needle) {
+                Some(consumed) if consumed > 0 => {
+                    result.push_str(&replacement);
+                    i += consumed;
+                    found += 1;
+                }
+                _ => {
+                    // Not a match here — copy one whole char and advance.
+                    let ch_len = content[i..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1);
+                    result.push_str(&content[i..i + ch_len]);
+                    i += ch_len;
+                }
+            }
         }
-        result.push_str(&content[last..]);
         (result, found)
     };
     if count > 0 {
@@ -557,7 +647,9 @@ pub fn replace_in_project(
             replacements: 0,
         });
     }
-    let root_path = PathBuf::from(&root);
+    // Confine the whole sweep to the workspace (each write is also guarded by
+    // replace_in_file, but this stops us from even scanning arbitrary trees).
+    let root_path = require_inside_workspace(&root)?;
     let mut files_changed = 0usize;
     let mut replacements = 0usize;
     let mut stack: Vec<PathBuf> = vec![root_path];

@@ -174,8 +174,12 @@ function closeTermTab(idx) {
     closeTerminal();
     return;
   }
-  if (activeTermTab >= termTabs.length) activeTermTab = termTabs.length - 1;
-  else if (activeTermTab === idx) activeTermTab = Math.min(idx, termTabs.length - 1);
+  // Keep activeTermTab pointing at the SAME tab after the splice:
+  //  - closing a tab left of the active one shifts it down by one → decrement;
+  //  - closing the active tab itself → show its neighbour (clamped);
+  //  - closing a tab to the right → active index is unaffected.
+  if (idx < activeTermTab) activeTermTab--;
+  else if (idx === activeTermTab) activeTermTab = Math.min(idx, termTabs.length - 1);
   termTabs[activeTermTab].container.hidden = false;
   renderTermTabs();
   requestAnimationFrame(() => {

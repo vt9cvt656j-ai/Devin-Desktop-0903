@@ -302,6 +302,12 @@ pub fn lsp_start(
                     Ok(n) => n,
                     Err(_) => continue,
                 };
+                // Cap up-front allocation: a buggy/malicious server sending a huge
+                // Content-Length must not OOM us via `vec![0u8; content_len]`.
+                if content_len > 64 * 1024 * 1024 {
+                    tracing::warn!("[lsp-{lang}] Content-Length {content_len} too large; dropping");
+                    break;
+                }
                 let mut sep = String::new();
                 let _ = reader.read_line(&mut sep);
 

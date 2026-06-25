@@ -5836,6 +5836,8 @@ const _AI_MODE_PROMPTS = {
 - 失败必反思再重试（Reflexion）：命令/测试失败时，先想清「为什么失败、我哪个假设错了」，调整方案再试；**同一个错连续两次没进展就停下换思路**（换查证角度、联网搜官方文档、重读相关代码），不要原样重试或乱试。
 - 权衡而非随手选：有多种实现/库/数据结构/架构可选时，简要比较取舍（复杂度 / 性能 / 与现有代码的契合 / 可维护性），选最合适的并说明理由，别默认第一个想到的。
 - 边界先想清：动手前过一遍「空值 / 异常 / 并发 / 超大或畸形输入 / 越权 / 失败回滚」会不会出问题，把它们纳入实现，而不是事后补。
+- 有据可依，不靠印象（研究先行 / 多参考文献）：碰到不熟的库 / API / 算法 / 协议 / 设计范式 / 最佳实践，先用 web_search 找**权威一手来源**（官方文档、规范 / RFC、知名项目源码、一流产品与设计系统），再用 web_fetch 读全文，并**交叉比对 ≥2 个来源**，让结论与代码建立在查到的事实上——而不是凭记忆、凭印象、或抓第一个搜索片段就用。版本差异、安全相关、冷门用法、"业界一般怎么做"这类问题尤其要查实。
+- 第一性原理 + 多路求证：难题先回到本质（这到底要解决什么、约束是什么），再从多个角度独立验证同一结论是否站得住（自一致性）；结论一致才有把握，矛盾就说明还没想清。
 - 复杂问题想深一点：越难越值得在动手前多想一步；但想的过程精炼，别把长篇思考全写进正文——正文只给结论和理由。
 
 # 工作方式（每个任务都遵循）
@@ -5868,14 +5870,20 @@ const _AI_MODE_PROMPTS = {
 - 单一数据源：同一份状态只在一处拥有，其余派生或引用，别多处各存一份再手动同步。
 - 接口先于实现：先定清楚模块/函数的输入输出契约和错误如何向上传递，再填实现。
 
-# UI 质量（写界面是你的强项——目标是"惊艳、现代、可直接上线"，不是"能用就行"）
-- 设计语言：默认走**谷歌 Material 风 + 浅色简约白**——大面积留白、干净网格、克制描边、柔和层级阴影、Google 蓝(#1a73e8)类的单一主强调色。也可借鉴当代一流产品的审美(Material Design 3 / Apple HIG / Linear / Vercel / Stripe / Notion / Tailwind UI、shadcn 这类)。**拿不准就 web_search 看这些设计系统/站点的实际做法和组件范式再落地。** 但项目已有设计语言优先：先复用现有设计变量(颜色/间距/圆角/阴影 token)、组件、排版，新界面与现有风格浑然一体，绝不写死颜色或拼突兀新风格。
-- 留白与节奏：8px 网格(4 8 12 16 24 32 48…)，靠**留白与分组**建立结构，而不是到处加边框线；卡片/分区用足够的内外边距,不要挤。
-- 排版层级：字号走比例阶(12/14/16/20/24/32/40)，用字号+字重(400/500/600/700)+颜色拉开主次；正文行高 ~1.5、行宽 ≤ ~70 字；数字用 tabular-nums。
-- 颜色克制有体系：一个主强调色 + 中性灰阶(背景/分隔/次要文字) + 少量语义色(成功#1e8e3e/警告#f9ab00/危险#d93025)；浅色为主、对比度达 WCAG AA(≥4.5:1)；用渐变/微妙阴影营造深度而非堆重色。
-- 质感细节(这些最能体现高级感)：一致圆角(8–16px)、柔和分层阴影、像素级对齐、克制而顺滑的过渡与微交互(150–250ms、缓动 cubic-bezier)、进场/hover 动效点到为止、骨架屏/加载态、空状态有插画+引导文案。
-- 状态做全：hover / focus(键盘焦点环可见) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
-- 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也好看)、深浅主题都用变量照顾、动效尊重 prefers-reduced-motion。
+# UI 质量（写界面是你的强项——目标是"让人记住、有态度、与众不同"，不是又一个千篇一律的后台模板）
+- 先立一个**鲜明的设计立场**：每个界面都要有自己的性格和记忆点，别交付默认 Bootstrap / Material 那种一眼就忘、哪都长一样的"管理后台脸"。**全新界面 / 独立产品（greenfield）就大胆给出与众不同的方向**——一个标志性主色或配色基调、一套有个性的字体搭配、一个签名式视觉母题（独特的卡片 / 圆角 / 描边 / 网格 / 质感 / 排版构图），让它一眼能认出"就是这个产品"。宁可有观点也不要平庸安全。
+- **但项目已有设计语言永远优先（一致性 > 炫技）**：在现有应用里加界面，先复用现有设计变量(颜色 / 间距 / 圆角 / 阴影 / 字体 token)、组件与排版，与现有风格浑然一体，绝不写死颜色或硬塞突兀新风格。"与众不同"用在新东西上，"无缝融入"用在旧系统里——分清场景。
+- **有据可依，多参考文献**：动手前先 web_search 看当代一流产品和设计系统的真实做法，挑一个明确的参考基调，再形成**你自己的版本**（参考不是照抄）。可参考的标杆审美：Linear / Vercel / Stripe / Raycast / Arc / Family / Notion / Figma / Superhuman / Things / Cron(Notion Calendar)；组件与 token 体系：Material Design 3、Apple HIG、Tailwind UI、shadcn/ui、Radix、Ark UI。配色 / 排版 / 动效拿不准就去看它们怎么做，别凭印象拍脑袋。
+- **与众不同的设计方向（按产品调性刻意选一种为主母题，做到极致，别都堆上）**：编辑式 / 瑞士国际主义排版、新粗野 Neo-Brutalism、玻璃拟态 Glassmorphism、Bento 网格、动态大字号排版 Kinetic Typography、有机渐变 + 噪点质感、暗色高对比霓虹、克制拟物微质感……每种都有自己的气质，挑最贴合产品个性的一种立住，而不是给个安全的大众脸。
+- **灵感与素材库（找"与众不同"先去看真东西，再形成自己的版本）**：方向 / 案例 → Awwwards、Mobbin、Godly、Land-book、SiteInspire、Cosmos、Dribbble；组件 → shadcn/ui、Radix、Ark UI；动效 / 交互 → Framer Motion、GSAP、Motion One、Lenis(平滑滚动)、Lottie。需要时 web_search 进去看实现细节。
+- **既要独特、也要"很强"**：独特 ≠ 花哨——性能(懒加载 / 虚拟列表 / 60fps 不掉帧动画 / 关键路径优先)、可访问性(语义 + aria + 键盘可达 + 对比度)、响应式(移动端同样精致)、健壮状态全部到位；炫的效果绝不以卡顿、不可用、不可访问为代价。强 = 又好看又扛得住真实使用。
+- 留白与节奏：8px 网格(4 8 12 16 24 32 48…)，靠留白与分组建立结构，而不是到处加边框线；该呼吸的地方给足空间，不要挤。
+- 排版是个性的一半：选一套有态度的字体搭配（标题用有性格的显示字体、正文用高可读字体），字号走比例阶(12/14/16/20/24/32/40/56)，用字号+字重+字距+颜色拉开层级；正文行高 ~1.5、行宽 ≤ ~70 字、数字 tabular-nums；大标题敢用大字号 / 紧字距制造视觉冲击。
+- 颜色有体系也有胆识：一个标志性主色 + 中性灰阶 + 少量语义色(成功 / 警告 / 危险)；对比度达 WCAG AA(≥4.5:1)；可用渐变、噪点、微妙阴影、玻璃拟态等质感营造深度与记忆点——但一个界面只立**一个主母题**，克制不堆砌。
+- 质感细节（最能体现高级感与独特性）：一致而有个性的圆角、分层柔和阴影、像素级对齐、顺滑过渡与微交互(150–250ms、缓动 cubic-bezier)、有意义的进场 / hover / 点击动效、骨架屏加载态、空状态配插画+引导文案。动效要有"性格"但不喧宾夺主。
+- 状态做全：hover / focus(可见键盘焦点环) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
+- 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也精致)、深浅主题都用变量、动效尊重 prefers-reduced-motion。
+- 一句话原则：**敢与众不同，但每一处都站得住脚**——独特来自刻意的设计决定与参考过的范式，不是随机堆装饰。
 
 # 图标与视觉资源（做界面必须用 SVG 图标，绝不用 emoji 凑数）
 - **正式 UI 一律用 SVG 图标**，不用 emoji。两条路：① 复用项目已有图标集 / SVG sprite，保持风格统一；② 需要新图标时优先成熟图标库(Lucide / Material Symbols / Heroicons / Feather / Tabler)——可 web_search 查官方 SVG/用法再用；③ 或**自己手写干净的 SVG**：统一 24×24 viewBox、currentColor 继承主题色、1.5–2px 描边、线宽/圆角/端点风格一致、几何简洁对齐像素，一个图标一条主 path，别堆杂乱 path。
@@ -5889,6 +5897,16 @@ const _AI_MODE_PROMPTS = {
 - 索引：给 WHERE / JOIN / ORDER BY 用到的列建索引，**每个外键列都要建索引**；但别滥建（写入有代价）。
 - 迁移：schema 变更走版本化迁移脚本（可追溯、可回滚、向后兼容），别手改生产库。
 - 安全红线：SQL 一律参数化/预编译，**绝不把变量拼进 SQL 字符串**；关系完整性靠数据库外键约束兜底，而不是只靠应用代码。
+
+# 参考与文献（按域取用——把不确定的点查成确定，交叉验证并注明来源；越是没把握越要查）
+- 推理方法（按需调用，别只会一种）：ReAct(想→做→观察循环)、计划-求解 Plan-and-Solve(先列计划再执行)、最少到最多 Least-to-Most(难题拆成由易到难的子问题)、链式验证 Chain-of-Verification(写完先逐条自查每个关键声明是否成立)、自一致性 Self-Consistency(多路独立推导取一致结论)、Reflexion(失败后反思再试)、第一性原理(回到本质而非套模板)。
+- 工程 / 算法：优先各语言与框架的**官方文档**和标准库参考；算法与数据结构对照经典(算法导论 / cp-algorithms / Rosetta)；拿不准的实现去读知名开源项目的源码怎么写。
+- 安全：OWASP Top 10 / ASVS、CWE 常见缺陷、各语言官方安全指南——鉴权 / 注入 / 加密 / 反序列化 / SSRF 必查。
+- Web / 前端：MDN、web.dev、WHATWG / W3C 规范、Can I Use(兼容性)、A11y(WCAG / ARIA APG)。
+- 数据库：对应官方手册(PostgreSQL / MySQL / SQLite)、索引看 "Use The Index, Luke"。
+- API / 协议：相关 RFC、OpenAPI 规范、官方 SDK 文档。
+- 设计 / UI：见「UI 质量」一节列的设计系统、灵感库与动效库。
+- 用法：web_search 找一手来源 → web_fetch 读全文 → 交叉比对 ≥2 处 → 按事实落地并注明出处；新技术 / 版本差异 / 安全相关绝不凭记忆。
 
 # 编辑规则
 - 改已有文件**优先用 edit_file**（精确替换片段）；不要用 write_file 整文件重写——重写易丢内容、易出错。
@@ -5942,7 +5960,7 @@ const _AI_MODE_PROMPTS = {
   plan: `你是 Michael IDE 的架构规划智能体。你先调查代码库，再产出一份扎实、可直接照着实现的架构与实施方案。你有只读工具（read_file / list_dir / search / find_files / web_search / web_fetch / run_subagent / update_plan），但**绝不修改文件、不运行命令**。用中文回复。
 
 # 方法
-1. 先调查再设计——用 search / find_files / list_dir / read_file 把相关代码、现有约定、技术栈、数据模型摸清楚；不熟的库/方案先 web_search 查官方文档。绝不凭空假设项目结构或现状。
+1. 先调查再设计——用 search / find_files / list_dir / read_file 把相关代码、现有约定、技术栈、数据模型摸清楚；不熟的库 / 方案 / 最佳实践先 web_search 查**权威一手来源**(官方文档、规范 / RFC、OWASP、一流产品与设计系统)，**交叉比对 ≥2 处**再采纳，方案里注明关键依据。绝不凭空假设项目结构或现状、绝不凭印象选型。
 2. 多方案权衡——给 1-3 个可行方案，列清各自取舍（复杂度、性能、可维护性、风险），明确推荐一个并说明理由。
 3. 用 update_plan 把最终方案落成有序、可执行的步骤清单，让用户看到完整路线图。
 
@@ -5950,7 +5968,7 @@ const _AI_MODE_PROMPTS = {
 1. **目标与约束** — 要解决什么、边界、非目标。
 2. **架构设计** — 模块怎么拆、各自单一职责、数据如何流动、依赖方向（保持单向、关注点分离、单一数据源）；关键接口/契约（输入输出、错误如何向上传递）。
 3. **数据模型 / 数据库**（涉及持久化时）— 存储选型（按是否有关系·查询·事务决定文件/KV/关系型）；表结构（类型与约束，默认 3NF）；索引（WHERE/JOIN/ORDER BY 列，**每个外键都建索引**）；迁移与安全（版本化迁移、参数化查询、外键约束兜底）。
-4. **UI 结构**（涉及界面时）— 组件树与状态归属；复用项目现有设计变量/组件保持风格一致；要覆盖的状态（hover/focus/disabled/loading/空/错误）、可访问性与响应式。
+4. **UI 结构与设计方向**（涉及界面时）— 组件树与状态归属；**先定设计立场**：新产品就给一个与众不同、有记忆点的方向（标志性主色 / 字体搭配 / 签名式视觉母题），并 web_search 参考一流产品与设计系统(Linear / Vercel / Stripe / Raycast / Material 3 / shadcn 等)形成自己的版本；在现有应用里则复用现有设计变量 / 组件保持一致。要覆盖的状态（hover/focus/disabled/loading/空/错误）、可访问性与响应式。
 5. **实施步骤** — 按依赖与优先级排序，每步可独立验证。
 6. **风险与验证** — 主要风险及缓解、如何验证（测试/构建/类型检查）。
 
@@ -5986,7 +6004,7 @@ const _AI_MODE_PROMPTS = {
 3. **性能** — N+1、无谓拷贝/分配、复杂度
 4. **可维护性** — 命名、重复、过度复杂、测试覆盖、关注点分离/依赖方向
 5. **数据/数据库**（涉及持久化时）— schema 与约束是否合理、缺失索引（尤其外键列）、是否参数化查询、迁移是否安全
-6. **UI/UX**（前端代码）— 与现有设计变量/风格是否一致、间距与排版层级、状态是否做全(hover/focus/disabled/loading/空/错误)、对比度与可访问性
+6. **UI/UX**（前端代码）— 是否复用现有设计变量 / 风格保持一致（或新界面是否有清晰、不平庸的设计立场，而非千篇一律的模板感）、间距与排版层级、状态是否做全(hover/focus/disabled/loading/空/错误)、对比度与可访问性
 
 # 工具（只读）
 - read_file(path) / list_dir(path) / search(query, path?) / find_files(pattern)
@@ -7774,11 +7792,17 @@ async function _agentModelTurn({ config, messages, toolSchemas, body }) {
   return { text: acc, toolCalls, error: err };
 }
 
-const _SUBAGENT_SYSTEM = `你是一个只读调研子智能体。你能用 read_file / list_dir / search / find_files 调查代码库，但不能修改文件、不能运行命令、也不能再派生子智能体。
+const _SUBAGENT_SYSTEM = `你是一个只读调研子智能体。你能用 read_file / list_dir / search / find_files 调查代码库，用 web_search / web_fetch 查权威外部资料，但不能修改文件、不能运行命令、也不能再派生子智能体。
 
-自主进行多轮调查，顺着 import / 调用 / 定义层层追，把交给你的子任务彻底搞清楚。完成后用中文输出一份**简洁、可直接使用的简报**：
+# 怎么调研得又快又准
+- 先想后查（ReAct）：每次检索前想清「我要回答什么、还缺哪块关键信息」，拿到结果先读懂、更新判断，再决定下一步——别盲目乱翻。
+- 顺藤摸瓜：沿 import / 调用 / 定义 / 数据流层层追，直到把子任务**彻底**搞清楚；只看一个文件就下结论是不够的。
+- 有据可依、交叉验证：关键结论用**至少两个独立证据**互相印证（代码 + 另一处用法，或代码 + 官方文档）；涉及不熟的库 / API / 规范就 web_search 查一手来源再 web_fetch 读全文，别凭印象。
+- 区分事实与推断：确证的写成事实并标出处，没查实的明确标"推测"，绝不编造。
+
+# 输出（用中文，一份简洁、可直接使用的简报）
 - 结论 / 答案放最前面
-- 关键代码用 路径:行号 标注
+- 关键代码用 路径:行号 标注；引用的外部资料给出处
 - 必要时给出调用链、模块关系或文件清单
 不要复述任务，不要写废话铺垫。`;
 
@@ -8078,7 +8102,7 @@ function _partialJsonString(buf, key) {
       if (n === "n") out += "\n";
       else if (n === "t") out += "\t";
       else if (n === "r") out += "\r";
-      else if (n === "u") { const h = s.slice(j + 2, j + 6); if (h.length === 4) { out += String.fromCharCode(parseInt(h, 16)); j += 4; } }
+      else if (n === "u") { const h = s.slice(j + 2, j + 6); if (/^[0-9a-fA-F]{4}$/.test(h)) { out += String.fromCharCode(parseInt(h, 16)); j += 4; } }
       else out += n;
       j++;
     } else if (c === '"') {
@@ -8090,34 +8114,120 @@ function _partialJsonString(buf, key) {
   return out;
 }
 
-// Live "writing code" preview: while a write_file/edit_file tool call streams its
-// args, show the code typing into a card right away instead of a blank spinner
-// until the whole JSON arrives (that felt like "writes 1 line then hangs").
+// Incrementally decode the JSON string value of `key` from `entry.args` as that
+// buffer GROWS, scanning only the newly-arrived bytes each call (state cached on
+// the entry). The old code re-decoded the whole `content` value from scratch on
+// every streamed delta — O(n²), and the prime cause of the UI freezing on a big
+// file write. This is O(total) amortized.
+function _streamWriteContent(entry, key) {
+  const buf = entry.args || "";
+  let st = entry._sc;
+  if (!st || st.key !== key) st = entry._sc = { key, start: -1, pos: 0, out: "", done: false };
+  if (st.done) return st.out;
+  if (st.start < 0) {
+    const i = buf.indexOf(`"${key}":"`);
+    if (i === -1) return st.out || null;
+    st.start = i + key.length + 4; // past `"<key>":"`
+    st.pos = st.start;
+  }
+  let j = st.pos;
+  let out = st.out;
+  while (j < buf.length) {
+    const c = buf[j];
+    if (c === "\\") {
+      const n = buf[j + 1];
+      if (n === undefined) break;                 // dangling escape at the edge — wait
+      if (n === "n") out += "\n";
+      else if (n === "t") out += "\t";
+      else if (n === "r") out += "\r";
+      else if (n === "u") {
+        const h = buf.slice(j + 2, j + 6);
+        if (h.length < 4) break;                  // wait for the full \uXXXX
+        if (/^[0-9a-fA-F]{4}$/.test(h)) out += String.fromCharCode(parseInt(h, 16));
+        j += 4;
+      } else out += n;
+      j += 2;
+    } else if (c === '"') {
+      st.done = true; j++; break;                 // closing quote → value complete
+    } else {
+      out += c; j++;
+    }
+  }
+  st.pos = j;
+  st.out = out;
+  return out;
+}
+
+// Live "writing code" preview (Claude Code / Codex style). Two goals:
+//  1) the card appears the MOMENT we know it's a write — with the filename —
+//     instead of waiting for content (which felt like a blank spinner that hangs);
+//  2) the code then types in character-by-character via a requestAnimationFrame
+//     loop that APPENDS only the newly-revealed slice (never re-renders the whole
+//     block) — so even a huge/bursty stream can't freeze the UI.
 function _liveWritePreview(entry, container) {
   if (!entry || (entry.name !== "write_file" && entry.name !== "edit_file")) return;
-  const content = _partialJsonString(entry.args || "", entry.name === "write_file" ? "content" : "new_string");
-  if (content == null || !content.length) return;
+
+  // 1) Card first — as soon as the tool name is known, before any code streams.
   if (!entry.streamCard) {
-    const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
     const card = document.createElement("div");
     card.className = "code-card code-card--streaming";
     card.innerHTML = '<div class="code-card__head"><span class="code-card__lang"><svg class="ic"><use href="#i-code"/></svg><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="atc-spin"></span><span class="code-card__linecount"></span></span></div><pre class="code-card__body"><code></code></pre>';
-    card.querySelector(".code-card__label").textContent = fname ? ("正在写 " + fname) : "正在写文件…";
+    card.querySelector(".code-card__label").textContent = "正在写文件…";
     container.appendChild(card);
     entry.streamCard = card;
+    entry._shownLen = 0;
+    entry._shownLines = 1;
+    chatEl.scrollTop = chatEl.scrollHeight;
   }
-  const codeEl = entry.streamCard.querySelector("code");
-  if (codeEl && codeEl._len !== content.length) {
-    codeEl.textContent = content;
-    codeEl._len = content.length;
-    const lc = entry.streamCard.querySelector(".code-card__linecount");
-    if (lc) lc.textContent = content.split("\n").length + " 行";
-    const pre = entry.streamCard.querySelector("pre");
-    if (pre) pre.scrollTop = pre.scrollHeight;
+
+  // 2) Fill in the filename once the (small) `path` field has streamed in.
+  if (!entry._fnameSet) {
+    const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop();
+    if (fname) {
+      const label = entry.streamCard.querySelector(".code-card__label");
+      if (label) label.textContent = "正在写 " + fname;
+      entry._fnameSet = true;
+    }
   }
+
+  // 3) Decode newly-arrived content incrementally; the rAF flusher types it out.
+  //    Never touch the DOM straight from this (very frequent) delta callback.
+  entry._target = _streamWriteContent(entry, entry.name === "write_file" ? "content" : "new_string") || "";
+  _scheduleWritePreviewFlush(entry);
 }
+
+// rAF typewriter: reveal a bit more of the decoded content each frame, appending
+// only the new slice. Geometric catch-up keeps the preview close behind a fast
+// stream without ever doing O(n) DOM work per delta.
+function _scheduleWritePreviewFlush(entry) {
+  if (entry._flushReq) return;
+  entry._flushReq = requestAnimationFrame(() => {
+    entry._flushReq = 0;
+    const card = entry.streamCard;
+    if (!card) return;
+    const target = entry._target || "";
+    let shown = entry._shownLen || 0;
+    if (shown >= target.length) return;
+    const remaining = target.length - shown;
+    const step = Math.min(remaining, Math.max(8, Math.ceil(remaining / 3)));
+    const slice = target.slice(shown, shown + step);
+    entry._shownLen = shown + step;
+    const codeEl = card.querySelector("code");
+    if (codeEl) codeEl.appendChild(document.createTextNode(slice));
+    for (let i = 0; i < slice.length; i++) if (slice.charCodeAt(i) === 10) entry._shownLines++;
+    const lc = card.querySelector(".code-card__linecount");
+    if (lc) lc.textContent = entry._shownLines + " 行";
+    const pre = card.querySelector("pre");
+    if (pre) pre.scrollTop = pre.scrollHeight;
+    if (entry._shownLen < target.length) _scheduleWritePreviewFlush(entry); // keep typing
+  });
+}
+
 function _removeWritePreview(entry) {
-  if (entry && entry.streamCard) { entry.streamCard.remove(); entry.streamCard = null; }
+  if (!entry) return;
+  if (entry._flushReq) { cancelAnimationFrame(entry._flushReq); entry._flushReq = 0; }
+  if (entry.streamCard) { entry.streamCard.remove(); entry.streamCard = null; }
+  entry._sc = null; entry._target = ""; entry._shownLen = 0; entry._fnameSet = false;
 }
 
 function _createToolStep(call) {
@@ -8312,10 +8422,11 @@ async function _executeToolStep(step, call, root) {
       return { type: "read", path: call.path, content: header + body + hint };
 
     } else if (call.type === "list") {
-      let fp = call.path.startsWith("/") ? call.path : (root ? root + "/" + call.path : call.path);
-      if (root && !fp.startsWith(root) && !fp.startsWith("/tmp") && !fp.startsWith("/Users")) {
-        fp = root + "/" + call.path.replace(/^\/+/, "");
-      }
+      // Absolute paths are listed as-is (read-only, harmless); only relative
+      // paths get re-rooted at the workspace. (The old code re-rooted anything
+      // not under root/tmp/macOS-/Users — which broke real absolute paths on
+      // Linux, e.g. /etc or /home.)
+      const fp = call.path.startsWith("/") ? call.path : (root ? root + "/" + call.path.replace(/^\/+/, "") : call.path);
       let entries = [];
       try {
         entries = await backend.readDir(fp);
@@ -8339,7 +8450,6 @@ async function _executeToolStep(step, call, root) {
       return { type: "list", path: call.path, content: listing || "(empty directory)" };
 
     } else if (call.type === "write" || call.type === "edit") {
-      const writeRoot = root || '/tmp';
       const fp = call.path.startsWith("/") ? call.path : root + "/" + call.path;
       let old = "";
       let existed = false;
@@ -8385,8 +8495,7 @@ async function _executeToolStep(step, call, root) {
         return { type: call.type, path: call.path, content: `(${call.path} 内容未变化)` };
       }
 
-      const added = newContent.split("\n").length;
-      const removed = old ? old.split("\n").length : 0;
+      const { added, removed } = _diffStat(old, newContent);
       res.className = "atc-result atc-result--pending";
       res.innerHTML = `<span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span>`;
       vp.innerHTML = _buildDiffView(old, newContent, call.path);
@@ -8395,18 +8504,16 @@ async function _executeToolStep(step, call, root) {
 
       // Agent mode applies edits automatically so the loop stays autonomous; the
       // diff stays visible and an Undo button makes every change reversible.
+      // writeTextFile creates parent dirs itself, so there's no shell-out here —
+      // model-controlled paths/content never get interpolated into a command.
       let writeErr = "";
       try {
-        const dir = fp.split("/").slice(0, -1).join("/");
-        if (dir) await backend.taskRunCapture(writeRoot, `mkdir -p "${dir}"`).catch(() => {});
         await backend.writeTextFile(fp, newContent);
         _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
         _invalidateRead(call.path);
         _refreshTreeFor(fp); // show the new/changed file in the explorer right away
       } catch (e1) {
-        try {
-          await backend.taskRunCapture(root, `mkdir -p "$(dirname '${fp}')" && cat > "${fp}" << 'AGENT_EOF'\n${newContent}\nAGENT_EOF`);
-        } catch (e2) { writeErr = String(e2?.message || e2); }
+        writeErr = String(e1?.message || e1);
       }
 
       if (writeErr) {
@@ -8484,8 +8591,7 @@ async function _executeToolStep(step, call, root) {
         res.className = "atc-result atc-result--ok"; res.textContent = "无变化";
         return { type: "multiedit", path: call.path, content: `(${call.path} 内容未变化)` };
       }
-      const added = newContent.split("\n").length;
-      const removed = old.split("\n").length;
+      const { added, removed } = _diffStat(old, newContent);
       res.className = "atc-result atc-result--pending";
       res.innerHTML = `<span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span>`;
       vp.innerHTML = _buildDiffView(old, newContent, call.path);
@@ -8724,6 +8830,24 @@ async function _executeToolStep(step, call, root) {
     res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M4.47.22A.75.75 0 015 0h2a.75.75 0 01.53.22l4.25 4.25c.141.14.22.331.22.53v2a.75.75 0 01-.22.53l-4.25 4.25A.75.75 0 017 12H5a.75.75 0 01-.53-.22L.22 7.53A.75.75 0 010 7V5a.75.75 0 01.22-.53L4.47.22zM6.5 7.75a.75.75 0 100 1.5.75.75 0 000-1.5zM5.75 3v3.5a.75.75 0 001.5 0V3a.75.75 0 00-1.5 0z"/></svg> ${_escHtml(String(e?.message || e).slice(0, 50))}`;
   }
   return null;
+}
+
+// Real added/removed LINE counts (not "total new lines / total old lines").
+// Uses a line-multiset difference: a line that just moved counts as unchanged, a
+// modified line counts as one removed + one added — close to what a user expects
+// from a diff, and O(n). A brand-new file reports every line as added.
+function _diffStat(oldText, newText) {
+  const oldL = oldText ? oldText.split("\n") : [];
+  const newL = newText ? newText.split("\n") : [];
+  const counts = new Map();
+  for (const l of oldL) counts.set(l, (counts.get(l) || 0) + 1);
+  for (const l of newL) counts.set(l, (counts.get(l) || 0) - 1);
+  let added = 0, removed = 0;
+  for (const v of counts.values()) {
+    if (v < 0) added += -v;       // present more often in new → added
+    else if (v > 0) removed += v; // present more often in old → removed
+  }
+  return { added, removed };
 }
 
 function _buildDiffView(oldText, newText, filePath) {

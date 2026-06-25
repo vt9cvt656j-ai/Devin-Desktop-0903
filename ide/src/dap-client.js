@@ -215,7 +215,8 @@ export function createDapManager(options) {
   }
 
   async function refreshStack() {
-    if (!session || session.threadId == null) {
+    if (!session) return;
+    if (session.threadId == null) {
       session.frames = [];
       return;
     }

@@ -408,7 +408,9 @@ export function t(key, params) {
   let str = dict[key] ?? EN[key] ?? key;
   if (params) {
     for (const [k, v] of Object.entries(params)) {
-      str = str.replaceAll(`{${k}}`, v);
+      // Function replacement so a value containing `$` (e.g. a branch name or
+      // commit message) is inserted literally, not parsed as `$&`/`$1`/`$$`.
+      str = str.replaceAll(`{${k}}`, () => String(v));
     }
   }
   return str;

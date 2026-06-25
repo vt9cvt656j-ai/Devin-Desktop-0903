@@ -191,6 +191,11 @@ pub fn dap_start(
                     Ok(n) => n,
                     Err(_) => continue,
                 };
+                // Cap up-front allocation against a huge/garbage Content-Length so
+                // a misbehaving debug adapter can't OOM us.
+                if content_len > 64 * 1024 * 1024 {
+                    break;
+                }
                 let mut sep = String::new();
                 let _ = reader.read_line(&mut sep);
 

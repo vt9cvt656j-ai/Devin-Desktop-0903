@@ -365,17 +365,30 @@ pub fn git_log(root: String, count: Option<usize>) -> Result<Vec<GitLogEntry>, S
     let lines: Vec<&str> = out.lines().collect();
     let mut entries = Vec::new();
     let mut i = 0;
-    while i + 6 < lines.len() {
-        let parents: Vec<String> = lines[i + 5]
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        let refs: Vec<String> = lines[i + 6]
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+    // Each commit is 7 lines (%H..%D). The 5 mandatory fields (hash..subject) must
+    // be present; the trailing parents/refs lines are optional because
+    // `run_git_checked` trims the output's trailing newline, so the OLDEST commit
+    // in the page loses its empty `%D` (and empty `%P`) line — without this the
+    // loop would silently drop that commit.
+    while i + 4 < lines.len() {
+        let parents: Vec<String> = lines
+            .get(i + 5)
+            .map(|l| {
+                l.split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let refs: Vec<String> = lines
+            .get(i + 6)
+            .map(|l| {
+                l.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         entries.push(GitLogEntry {
             hash: lines[i].to_string(),
             short_hash: lines[i + 1].to_string(),

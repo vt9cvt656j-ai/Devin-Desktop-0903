@@ -268,15 +268,27 @@ export class ExtensionHost {
       if (entry.commands.has(commandId)) {
         const reqId = `i${this.rpcSeq++}`;
         return new Promise((resolve) => {
+          // Time-box the wait so a worker that crashes / is terminated before it
+          // replies can't leak this listener and Promise forever.
+          let timer = 0;
+          const cleanup = () => {
+            entry.worker.removeEventListener("message", onMsg);
+            if (timer) clearTimeout(timer);
+          };
           const onMsg = (event) => {
             const m = event.data;
             if (m && m.t === "invokeResult" && m.reqId === reqId) {
-              entry.worker.removeEventListener("message", onMsg);
+              cleanup();
               if (!m.ok) this.ctx.showInformationMessage?.(`Command failed: ${m.error}`);
               resolve(m.ok);
             }
           };
           entry.worker.addEventListener("message", onMsg);
+          timer = setTimeout(() => {
+            cleanup();
+            this.ctx.showInformationMessage?.(`Command timed out: ${commandId}`);
+            resolve(false);
+          }, 30000);
           entry.worker.postMessage({ t: "invoke", id: commandId, reqId, args: [] });
         });
       }
