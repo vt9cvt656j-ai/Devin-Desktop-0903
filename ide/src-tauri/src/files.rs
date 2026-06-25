@@ -339,6 +339,48 @@ pub fn rename_path(from: String, to: String) -> Result<(), String> {
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else if ft.is_file() {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+        // symlinks / special files are skipped for safety
+    }
+    Ok(())
+}
+
+/// Copy a file, or a directory and all of its contents, to `to`. Errors if the
+/// destination already exists. Both endpoints must be inside the workspace.
+#[tauri::command]
+pub fn copy_path(from: String, to: String) -> Result<(), String> {
+    require_inside_workspace(&from)?;
+    let to_path = require_inside_workspace(&to)?;
+    let from_p = Path::new(&from);
+    if !from_p.exists() {
+        return Err("source does not exist".into());
+    }
+    if to_path.exists() {
+        return Err("a file or folder with that name already exists".into());
+    }
+    if let Some(parent) = to_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let meta = std::fs::symlink_metadata(from_p).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        copy_dir_recursive(from_p, &to_path).map_err(|e| e.to_string())
+    } else {
+        std::fs::copy(from_p, &to_path)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Delete a file, or a directory and all of its contents.
 #[tauri::command]
 pub fn delete_path(path: String) -> Result<(), String> {

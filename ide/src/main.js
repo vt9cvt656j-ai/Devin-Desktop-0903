@@ -5952,6 +5952,9 @@ const _AI_MODE_PROMPTS = {
 - lsp_definition(path, line, symbol)：按语义跳到符号定义所在的 文件:行（比 search 猜得准）
 - lsp_references(path, line, symbol)：按语义找符号的所有引用/用法（比纯文本 search 准，能区分同名不同物）
 - 提示：理解代码结构 / 找定义与用法时**优先用 lsp_* 工具**（语义级、更准）；JS/TS 内置可用，Python/Go/Rust 等需装对应语言服务器，不可用时会提示你改用 search
+- create_dir(path)：新建目录（write_file 会自动建父目录，一般只在确需空目录时用）
+- copy_path(from, to)：复制文件/目录（递归），用于按模板搭脚手架、备份
+- format_file(path)：用语言服务格式化整个文件（可撤销、显示 diff）；无可用格式化器时改用 run_cmd 跑 prettier/rustfmt/gofmt
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止。
 
 # 输出风格
@@ -7378,6 +7381,9 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "git_branch", description: "分支操作：不传 name 则列出所有分支并标出当前分支；传 name 切换到该分支，create=true 时新建并切换。", parameters: { type: "object", properties: { name: { type: "string", description: "要切换/新建的分支名；省略则列出分支" }, create: { type: "boolean", description: "为 true 时新建分支再切换" } } } } },
       { type: "function", function: { name: "git_push", description: "把当前分支推送到远程(origin)。无凭据时快速失败而非卡住。涉及对外发布，一般在用户要求时才用。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_pull", description: "从远程拉取并合并当前分支。", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。注意：write_file 写文件时父目录会自动创建，所以一般只在确实需要空目录时才用。", parameters: { type: "object", properties: { path: { type: "string", description: "要创建的目录路径" } }, required: ["path"] } } },
+      { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
+      { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
     );
   }
   return tools;
@@ -7413,6 +7419,9 @@ function _mapToolCall(name, args) {
     case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     case "lsp_references": return { type: "lsp", op: "references", path: args.path || "", line: args.line, symbol: args.symbol || "" };
+    case "create_dir": return { type: "mkdir", path: args.path || "" };
+    case "copy_path": return { type: "copy", path: args.from || "", to: args.to || "" };
+    case "format_file": return { type: "format", path: args.path || "" };
     default: return null;
   }
 }
@@ -7748,6 +7757,32 @@ async function _tsWorkerLocate(fp, line, character, op) {
   });
 }
 
+async function _tsWorkerFormat(fp) {
+  const model = await _modelForPath(fp); if (!model) return null;
+  const client = await _tsWorkerClient(model); if (!client) return null;
+  const opts = {
+    tabSize: 2, indentSize: 2, convertTabsToSpaces: true, newLineCharacter: "\n",
+    insertSpaceAfterCommaDelimiter: true, insertSpaceAfterSemicolonInForStatements: true,
+    insertSpaceBeforeAndAfterBinaryOperators: true, insertSpaceAfterKeywordsInControlFlowStatements: true,
+    insertSpaceAfterFunctionKeywordForAnonymousFunctions: true,
+  };
+  let edits;
+  try { edits = await client.getFormattingEditsForDocument(model.uri.toString(), opts); } catch { return null; }
+  if (!Array.isArray(edits)) return null;
+  const original = model.getValue();
+  if (!edits.length) return original;
+  const tmp = monaco.editor.createModel(original, model.getLanguageId());
+  try {
+    const ops = edits.map((e) => {
+      const a = tmp.getPositionAt(e.span.start);
+      const b = tmp.getPositionAt(e.span.start + e.span.length);
+      return { range: new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column), text: e.newText };
+    });
+    tmp.applyEdits(ops);
+    return tmp.getValue();
+  } catch { return null; } finally { tmp.dispose(); }
+}
+
 async function _agentFindFiles(root, pattern) {
   if (!root) return { count: 0, text: "[ERROR] 未打开工作区。" };
   const pat = (pattern || "").trim();
@@ -8060,7 +8095,7 @@ async function _runAgenticLoop({ config, messages, root }) {
           try { result = await _executeToolStep(step, call, root); }
           catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
         }
-        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp") ? "" : (call.path || "");
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy") ? "" : (call.path || "");
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
         return _toolResultToString(call, result).slice(0, 8000);
       };
@@ -8329,10 +8364,12 @@ function _createToolStep(call) {
     ? ((call.op || "") + (call.op === "diff" && call.path ? " " + call.path : "") + (call.op === "branch" && call.branch ? " " + call.branch : ""))
     : call.type === "lsp"
     ? ((call.op || "") + (call.path ? " " + call.path : "") + (call.symbol ? " · " + call.symbol : ""))
+    : call.type === "copy"
+    ? ((call.path || "") + (call.to ? " → " + call.to : ""))
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8346,12 +8383,15 @@ function _createToolStep(call) {
     websearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zm-.82 4.74a6 6 0 111.06-1.06l2.79 2.79a.75.75 0 11-1.06 1.06l-2.79-2.79z"/></svg>`,
     git: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.25 2.25 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.5 2.5 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"/></svg>`,
     lsp: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M5.28 4.22a.75.75 0 010 1.06L2.56 8l2.72 2.72a.75.75 0 01-1.06 1.06L.97 8.53a.75.75 0 010-1.06l3.25-3.25a.75.75 0 011.06 0zm5.44 0a.75.75 0 011.06 0l3.25 3.25a.75.75 0 010 1.06l-3.25 3.25a.75.75 0 11-1.06-1.06L13.44 8l-2.72-2.72a.75.75 0 010-1.06z"/></svg>`,
+    mkdir: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75zM8 7.75a.75.75 0 00-1.5 0V9H5.25a.75.75 0 000 1.5H6.5v1.25a.75.75 0 001.5 0V10.5h1.25a.75.75 0 000-1.5H8V7.75z"/></svg>`,
+    copy: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>`,
+    format: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 0a.5.5 0 01.5.5c0 1.5.5 2 2 2a.5.5 0 010 1c-1.5 0-2 .5-2 2a.5.5 0 01-1 0c0-1.5-.5-2-2-2a.5.5 0 010-1c1.5 0 2-.5 2-2a.5.5 0 01.5-.5zM3.5 6a.5.5 0 01.5.5c0 1 .333 1.333 1.333 1.333a.5.5 0 010 1C4.333 8.833 4 9.167 4 10.167a.5.5 0 01-1 0c0-1-.333-1.334-1.333-1.334a.5.5 0 010-1C2.667 7.833 3 7.5 3 6.5a.5.5 0 01.5-.5zm6 4a.5.5 0 01.5.5c0 1.25.5 1.75 1.75 1.75a.5.5 0 010 1c-1.25 0-1.75.5-1.75 1.75a.5.5 0 01-1 0c0-1.25-.5-1.75-1.75-1.75a.5.5 0 010-1c1.25 0 1.75-.5 1.75-1.75a.5.5 0 01.5-.5z"/></svg>`,
   };
 
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -8391,7 +8431,7 @@ async function _executeToolStep(step, call, root) {
   const row = step.querySelector(".agent-tool-row");
 
   const readOnlyMode = _currentAiMode === "explorer" || _currentAiMode === "reviewer" || _currentAiMode === "plan";
-  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move")) {
+  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move" || call.type === "mkdir" || call.type === "copy" || call.type === "format")) {
     const modeName = _currentAiMode === "explorer" ? "Explorer" : _currentAiMode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" ? "运行命令" : "修改文件";
     res.className = "atc-result atc-result--blocked";
@@ -8871,6 +8911,91 @@ async function _executeToolStep(step, call, root) {
       res.textContent = hits ? `${hits} 条结果` : "完成";
       vp.innerHTML = `<pre>${_escHtml(text.slice(0, 4000))}</pre>`;
       return { type: "websearch", path: call.path, content: text };
+
+    } else if (call.type === "mkdir") {
+      const p = (call.path || "").trim();
+      if (!p) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "mkdir", path: p, content: "[ERROR] 空路径。" }; }
+      const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
+      try {
+        await backend.invoke("create_dir", { path: fp });
+        _checkpointRecord(fp, false, ""); // revert-all removes a dir we created
+        _refreshTreeFor(fp);
+        res.className = "atc-result atc-result--ok"; res.textContent = "已创建目录";
+        return { type: "mkdir", path: p, content: `已创建目录 ${p}` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
+        return { type: "mkdir", path: p, content: `[ERROR] 创建目录失败: ${String(e?.message || e).slice(0, 160)}` };
+      }
+
+    } else if (call.type === "copy") {
+      const from = (call.path || "").trim(), to = (call.to || "").trim();
+      if (!from || !to) { res.className = "atc-result atc-result--err"; res.textContent = "缺少 from/to"; return { type: "copy", path: from, content: "[ERROR] 需要 from 和 to。" }; }
+      const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
+      const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
+      try {
+        await backend.invoke("copy_path", { from: fromFp, to: toFp });
+        _checkpointRecord(toFp, false, ""); // revert-all removes the copy
+        _refreshTreeFor(toFp);
+        res.className = "atc-result atc-result--ok"; res.textContent = "已复制";
+        return { type: "copy", path: from, content: `已复制 ${from} → ${to}` };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
+        return { type: "copy", path: from, content: `[ERROR] 复制失败: ${String(e?.message || e).slice(0, 160)}` };
+      }
+
+    } else if (call.type === "format") {
+      const rel = (call.path || "").trim();
+      if (!rel) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "format", path: rel, content: "[ERROR] 空路径。" }; }
+      const fp = rel.startsWith("/") ? rel : (root ? root + "/" + rel.replace(/^\/+/, "") : rel);
+      let old = "";
+      try { old = await backend.readTextFile(fp); }
+      catch { res.className = "atc-result atc-result--err"; res.textContent = "文件不存在"; return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}` }; }
+      let formatted = null;
+      try { formatted = await (lspManager && lspManager.agentFormat ? lspManager.agentFormat(fp) : null); } catch {}
+      if (formatted == null) { try { formatted = await _tsWorkerFormat(fp); } catch {} }
+      if (formatted == null) {
+        res.className = "atc-result atc-result--err"; res.textContent = "无格式化器";
+        return { type: "format", path: rel, content: `[无格式化服务] ${rel} 没有可用的语言格式化器。改用 run_cmd 跑 prettier / rustfmt / gofmt 等。` };
+      }
+      if (formatted === old) {
+        res.className = "atc-result atc-result--ok"; res.textContent = "已是规范格式";
+        return { type: "format", path: rel, content: `${rel} 已是规范格式，无改动。` };
+      }
+      _checkpointRecord(fp, true, old);
+      const { added, removed } = _diffStat(old, formatted);
+      vp.innerHTML = _buildDiffView(old, formatted, rel);
+      _highlightDiffView(vp);
+      step.classList.add("is-open");
+      let writeErr = "";
+      try {
+        await backend.writeTextFile(fp, formatted);
+        _agentReadCache.set(fp, formatted); _invalidateRead(rel); _refreshTreeFor(fp);
+      } catch (e) { writeErr = String(e?.message || e); }
+      if (writeErr) {
+        step.classList.add("agent-tool-step--rejected");
+        res.className = "atc-result atc-result--err"; res.textContent = writeErr.slice(0, 80);
+        return { type: "format", path: rel, content: `[ERROR] 写入失败: ${writeErr}` };
+      }
+      step.classList.add("agent-tool-step--accepted");
+      res.className = "atc-result atc-result--ok";
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm2.22 4.22a.75.75 0 010 1.06l-3 3a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 111.06-1.06L4.69 6.69l2.47-2.47a.75.75 0 011.06 0z"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">Undo</button>`;
+      _ipcBroadcast("file_changed", { path: fp });
+      showToast(`Formatted ${rel.split("/").pop()}`);
+      const undoBtn = res.querySelector(".atc-undo-btn");
+      if (undoBtn) {
+        undoBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await backend.writeTextFile(fp, old);
+            _agentReadCache.set(fp, old); _invalidateRead(rel); _refreshTreeFor(fp);
+            step.classList.remove("agent-tool-step--accepted"); step.classList.add("agent-tool-step--rejected");
+            res.className = "atc-result atc-result--err"; res.textContent = "Reverted";
+            _ipcBroadcast("file_changed", { path: fp });
+            showToast(`Reverted ${rel.split("/").pop()}`);
+          } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
+        });
+      }
+      return { type: "format", path: rel, content: `已格式化 ${rel}（+${added}/-${removed} 行）。` };
 
     } else if (call.type === "lsp") {
       const lroot = root || rootPath || workspaceRoots[0] || "";

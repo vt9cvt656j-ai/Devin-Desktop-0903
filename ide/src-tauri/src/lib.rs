@@ -70,6 +70,7 @@ pub fn run() {
             files::create_file,
             files::create_dir,
             files::rename_path,
+            files::copy_path,
             files::delete_path,
             files::search_in_project,
             files::replace_in_file,

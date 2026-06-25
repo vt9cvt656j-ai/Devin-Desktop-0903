@@ -1685,5 +1685,34 @@ export function createLspManager(options) {
       }).filter(Boolean);
       return locs;
     },
+
+    // Whole-document formatting. Returns the formatted text (applied to a
+    // throwaway model so the editor's live model is never mutated), the original
+    // text when the server reports no edits, or null when no managed formatter
+    // applies. The CALLER is responsible for writing it through the reversible
+    // edit path.
+    async agentFormat(path, options) {
+      const ctx = await _agentEnsureDoc(path);
+      if (!ctx || !ctx.client.supports("formatting")) return null;
+      let edits;
+      try {
+        edits = await ctx.client.request("textDocument/formatting", {
+          textDocument: { uri: ctx.uri },
+          options: { tabSize: options?.tabSize || 2, insertSpaces: options?.insertSpaces !== false },
+        });
+      } catch { return null; }
+      if (!Array.isArray(edits)) return null;
+      const original = ctx.model.getValue();
+      if (!edits.length) return original;
+      const tmp = monaco.editor.createModel(original, ctx.model.getLanguageId());
+      try {
+        tmp.applyEdits(edits.map((e) => ({ range: toMonacoRange(e.range), text: e.newText })));
+        return tmp.getValue();
+      } catch {
+        return null;
+      } finally {
+        tmp.dispose();
+      }
+    },
   };
 }
