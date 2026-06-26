@@ -6385,7 +6385,7 @@ async function _detectOSDetail() {
   return detail;
 }
 
-async function _gatherAgentContext() {
+async function _gatherAgentContext(query) {
   const root = rootPath || workspaceRoots[0];
   const osDetail = await _detectOSDetail();
   console.log("[agent-ctx] rootPath:", rootPath, "workspaceRoots:", workspaceRoots, "using:", root);
@@ -6393,7 +6393,9 @@ async function _gatherAgentContext() {
   const osBlock = `操作系统: ${osDetail.os} ${osDetail.version} (${osDetail.arch})\nShell: ${osDetail.shell}`;
 
   if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)`;
-  if (_agentContextCache.root === root && Date.now() - _agentContextCache.ts < 15000) return _agentContextCache.data;
+  // Knowledge-graph memory is retrieved per-query (relevant subgraph), so it lives
+  // OUTSIDE the cached project context and is appended fresh on every call.
+  if (_agentContextCache.root === root && Date.now() - _agentContextCache.ts < 15000) return _agentContextCache.data + _kgRetrieveBlock(root, query || "");
 
   const parts = [osBlock, `当前工作区: ${root}`];
 
@@ -6406,11 +6408,8 @@ async function _gatherAgentContext() {
     } catch { /* not present */ }
   }
 
-  // Agent-authored project memory (persisted via the `remember` tool).
-  const _mem = _loadMemory(root);
-  if (_mem && _mem.trim()) {
-    parts.push(`\n--- 项目记忆（你之前用 remember 记下的，跨会话保留，开工前先看）---\n${_mem.slice(0, 4000)}`);
-  }
+  // (Project memory is injected separately, per-query, via the knowledge graph —
+  //  see _kgRetrieveBlock appended at the return, OUTSIDE this cached block.)
 
   const treeDom = document.querySelectorAll("#tree .row");
   if (treeDom.length > 0) {
@@ -6476,7 +6475,7 @@ async function _gatherAgentContext() {
     ctx = ctx.slice(0, maxLen) + "\n...(context truncated to fit " + CTX_TOKEN_BUDGET + " token budget)";
   }
   _agentContextCache = { root, ts: Date.now(), data: ctx };
-  return ctx;
+  return ctx + _kgRetrieveBlock(root, query || "");
 }
 
 async function sendPrompt(text, attachedImages = []) {
@@ -6553,7 +6552,7 @@ async function sendPrompt(text, attachedImages = []) {
   let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
   if (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") {
     if (rootPath || workspaceRoots.length) {
-      contextBlock += "\n" + await _gatherAgentContext();
+      contextBlock += "\n" + await _gatherAgentContext(text);
     } else {
       contextBlock += "\n(未打开工作区文件夹)";
     }
@@ -7753,7 +7752,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
-    { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进项目记忆（按工作区持久保存，下次自动加载进上下文）。适合记：技术栈/架构决定、约定、构建与测试命令、用户偏好、易踩的坑。只记真正长期有用的事实，别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一句话（简洁、自包含）" } }, required: ["content"] } } },
+    { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进**项目记忆知识图谱**（按工作区持久保存）。每条会被自动打标签、自动关联到相关的旧笔记，下次按任务相关性 + 关联召回——所以**可以放心多记**，图谱会帮你筛。每条写成一个原子事实（单一概念、简洁自包含）。适合记：技术栈/架构决定、目录与命名约定、构建/测试/运行命令、用户偏好、踩过的坑及其根因与解法。别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一条原子知识（一个概念、简洁、自包含）" } }, required: ["content"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "读取编辑器/LSP 对文件的诊断（错误与警告）。改完代码用它快速自检，比每次跑构建快。不传 path 则返回所有已打开文件的诊断。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要检查的文件路径；省略则查所有已打开文件" } } } } },
     { type: "function", function: { name: "git_status", description: "查看 git 仓库状态：当前分支、已暂存/未暂存/未跟踪的改动文件列表。要了解动了哪些文件、或提交前先看它。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_diff", description: "查看改动的 git diff（统一 diff 文本）。默认看工作区相对 HEAD 的未暂存改动；staged=true 看已暂存(--cached)的；path 只看某个文件。注意：不显示未跟踪的新文件（那些用 git_status 看）。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，只看这个文件的 diff" }, staged: { type: "boolean", description: "为 true 看已暂存的改动" } } } } },
@@ -8072,6 +8071,124 @@ function _appendMemory(root, note) {
   return true;
 }
 
+// --- Knowledge-graph memory (A-MEM / Zettelkasten): the agent's `remember` notes
+// become atomic, auto-linked nodes — entities = extracted tags, edges = shared
+// tags. On insert a note auto-links to related notes (self-evolving graph). On
+// recall we surface the RELEVANT connected SUBGRAPH for the current task (not the
+// whole memory), so it scales and gets smarter as it grows ("越用越强"). Pure
+// localStorage, backward-compatible (migrates the old flat list once). ---
+function _kgKey(root) { return "michael-ide.kg:" + (root || "_global"); }
+const _KG_STOP = new Set("the a an and or to of in on for is are be it this that with you your from as at by we our 的 了 和 是 在 有 我 你 它 这 那 要 把 就 也 都 很 会 能 不 没 与 及 用 个 上 下 里 中".split(/\s+/));
+function _kgTokens(text) {
+  const t = String(text || "").toLowerCase();
+  const out = [];
+  const seen = new Set();
+  const m = t.match(/[a-z_][a-z0-9_./-]{2,}|[一-龥]{2,5}/g) || [];
+  for (let w of m) {
+    w = w.replace(/[.\-/]+$/, "");
+    if (w.length < 2 || _KG_STOP.has(w) || seen.has(w)) continue;
+    seen.add(w); out.push(w);
+    if (out.length >= 14) break;
+  }
+  return out;
+}
+function _kgClassify(c) {
+  const t = String(c || "");
+  if (/坑|bug|报错|失败|错误|崩溃|fix|pitfall|gotcha|不能|别|避免/i.test(t)) return "pitfall";
+  if (/命令|构建|build|测试|test|run|npm|cargo|pip|make|部署|deploy|启动/i.test(t)) return "command";
+  if (/约定|规范|命名|风格|convention|目录结构|放在|统一/i.test(t)) return "convention";
+  if (/架构|模块|依赖|architecture|module|结构|设计|数据流/i.test(t)) return "architecture";
+  if (/用户|喜欢|偏好|要求|prefer|想要|不要|口味/i.test(t)) return "preference";
+  return "fact";
+}
+function _kgInsert(notes, content) {
+  const clean = String(content || "").trim().replace(/\s+/g, " ");
+  if (!clean) return null;
+  const tags = _kgTokens(clean);
+  // Dedup: near-identical note already there → skip.
+  for (const n of notes) {
+    const shared = (n.tags || []).filter((x) => tags.includes(x)).length;
+    if (shared >= Math.max(3, Math.min(tags.length, (n.tags || []).length) - 1) && Math.abs((n.content || "").length - clean.length) < 40) return n;
+  }
+  const id = "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const note = { id, content: clean, tags, type: _kgClassify(clean), links: [], created: Date.now() };
+  const scored = [];
+  for (const n of notes) {
+    const shared = (n.tags || []).filter((x) => tags.includes(x)).length;
+    if (shared >= 2) scored.push([shared, n]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  for (const [, n] of scored.slice(0, 6)) {
+    note.links.push(n.id);
+    if (!n.links) n.links = [];
+    if (!n.links.includes(id)) { n.links.push(id); if (n.links.length > 8) n.links = n.links.slice(-8); }
+  }
+  notes.push(note);
+  return note;
+}
+function _kgLoad(root) {
+  let notes = [];
+  try { const raw = localStorage.getItem(_kgKey(root)); if (raw) notes = JSON.parse(raw); } catch { notes = []; }
+  if (!Array.isArray(notes)) notes = [];
+  if (!notes.length) { // one-time migration from the old flat memory list
+    try {
+      const flat = localStorage.getItem(_memoryKey(root)) || "";
+      const lines = flat.split("\n").map((l) => l.replace(/^[-*]\s*/, "").trim()).filter(Boolean);
+      for (const line of lines) _kgInsert(notes, line);
+      if (notes.length) localStorage.setItem(_kgKey(root), JSON.stringify(notes));
+    } catch {}
+  }
+  return notes;
+}
+function _kgSave(root, notes) {
+  try {
+    if (notes.length > 240) notes = notes.slice(-240); // generous cap (retrieval is filtered)
+    localStorage.setItem(_kgKey(root), JSON.stringify(notes));
+  } catch {}
+}
+function _kgAddNote(root, content) {
+  const notes = _kgLoad(root);
+  const n = _kgInsert(notes, content);
+  if (!n) return false;
+  _kgSave(root, notes);
+  _agentContextCache = { root: null, ts: 0, data: "" };
+  return true;
+}
+// Link-aware retrieval: top-K notes by tag-overlap with the query, expanded with
+// their 1-hop neighbours (the connected subgraph), plus a few most-recent notes so
+// general knowledge isn't missed. Returns the chosen note objects.
+function _kgRetrieve(root, query, K = 6, MAX = 13) {
+  const notes = _kgLoad(root);
+  if (!notes.length) return [];
+  const q = new Set(_kgTokens(query));
+  const byId = {};
+  for (const n of notes) byId[n.id] = n;
+  const scored = notes.map((n) => [(n.tags || []).reduce((a, t) => a + (q.has(t) ? 1 : 0), 0), n]);
+  scored.sort((a, b) => b[0] - a[0] || b[1].created - a[1].created);
+  const picked = new Map();
+  for (const [s, n] of scored) {
+    if (s <= 0 || picked.size >= K) break;
+    picked.set(n.id, n);
+  }
+  for (const n of [...notes].sort((a, b) => b.created - a.created).slice(0, 3)) {
+    if (picked.size < K + 3) picked.set(n.id, n);
+  }
+  for (const n of [...picked.values()]) {
+    for (const lid of (n.links || [])) {
+      if (picked.size >= MAX) break;
+      if (byId[lid] && !picked.has(lid)) picked.set(lid, byId[lid]);
+    }
+  }
+  return [...picked.values()];
+}
+function _kgRetrieveBlock(root, query) {
+  let notes;
+  try { notes = _kgRetrieve(root, query); } catch { return ""; }
+  if (!notes || !notes.length) return "";
+  const lines = notes.map((n) => `- [${n.type}] ${n.content}`);
+  return `\n--- 项目记忆（知识图谱·按本次任务相关性 + 关联召回；你之前用 remember 记的，跨会话保留，开工前先看）---\n${lines.join("\n").slice(0, 4000)}`;
+}
+
 // Memory panel: view / edit / clear the agent's project memory for the current
 // workspace. Opened via the "Manage Project Memory" command (⌘⇧P).
 function openMemoryPanel() {
@@ -8095,19 +8212,24 @@ function openMemoryPanel() {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
   const ta = modal.querySelector(".mem-text");
-  ta.value = _loadMemory(root);
+  ta.value = _kgLoad(root).map((n) => n.content).join("\n"); // knowledge-graph notes, one per line
   const close = () => overlay.remove();
   modal.querySelector(".mem-close").addEventListener("click", close);
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   modal.querySelector(".mem-save").addEventListener("click", () => {
-    try { localStorage.setItem(_memoryKey(root), ta.value.slice(0, 8000)); } catch {}
+    // Rebuild the graph from the edited lines (re-tag + re-link each note).
+    const lines = ta.value.split("\n").map((l) => l.replace(/^[-*]\s*/, "").trim()).filter(Boolean).slice(0, 240);
+    const notes = [];
+    for (const line of lines) _kgInsert(notes, line);
+    _kgSave(root, notes);
+    try { localStorage.removeItem(_memoryKey(root)); } catch {} // old flat list no longer the source of truth
     _agentContextCache = { root: null, ts: 0, data: "" };
-    showToast("项目记忆已保存");
+    showToast("项目记忆已保存（已重建知识图谱关联）");
     close();
   });
   modal.querySelector(".mem-clear").addEventListener("click", () => {
     ta.value = "";
-    try { localStorage.removeItem(_memoryKey(root)); } catch {}
+    try { localStorage.removeItem(_kgKey(root)); localStorage.removeItem(_memoryKey(root)); } catch {}
     _agentContextCache = { root: null, ts: 0, data: "" };
     showToast("项目记忆已清空");
   });
@@ -9614,11 +9736,12 @@ async function _executeToolStep(step, call, root, run) {
       return { type: "diag", path: call.path, content: probs.length ? `诊断（${probs.length} 个错误/警告）:\n${lines.join("\n")}` : "无错误或警告（注意：LSP 分析可能略有延迟，改完稍等再查更准）。" };
 
     } else if (call.type === "memory") {
-      const ok = _appendMemory(root, call.content);
+      // Write into the knowledge graph (auto-tagged + auto-linked to related notes).
+      const ok = _kgAddNote(root, call.content);
       res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = ok ? "已记住" : "空内容";
       if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml((call.content || "").slice(0, 500))}</pre>`;
-      return { type: "memory", path: call.path, content: ok ? `已记入项目记忆：${call.content}` : "[ERROR] 空内容，未记录。" };
+      return { type: "memory", path: call.path, content: ok ? `已记入项目记忆（知识图谱，已自动关联相关笔记）：${call.content}` : "[ERROR] 空内容，未记录。" };
 
     } else if (call.type === "delete") {
       const p = call.path || "";
