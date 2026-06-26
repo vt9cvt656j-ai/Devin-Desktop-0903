@@ -7627,7 +7627,17 @@ function _mapToolCall(name, args) {
     case "read_terminal": return { type: "termread", name: args.name || "" };
     case "list_terminals": return { type: "termlist" };
     case "stop_terminal": return { type: "termstop", name: args.name || "" };
-    case "http_request": return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: args.headers || null, body: args.body, timeout: args.timeout_secs };
+    case "http_request": {
+      // Models sometimes emit headers as a JSON string instead of an object —
+      // parse it so a well-meant request doesn't fail on a type mismatch.
+      let _h = args.headers || null;
+      if (typeof _h === "string") { try { _h = JSON.parse(_h); } catch { _h = null; } }
+      if (_h && typeof _h === "object") {
+        // Coerce any non-string header values to strings (Rust expects map<str,str>).
+        const _hh = {}; for (const k in _h) { if (_h[k] != null) _hh[k] = String(_h[k]); } _h = _hh;
+      } else { _h = null; }
+      return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs };
+    }
     case "download_file": return { type: "download", url: args.url || "", dest: args.dest || args.path || "" };
     case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height };
     case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
