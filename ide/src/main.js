@@ -6124,7 +6124,7 @@ const _AI_MODE_PROMPTS = {
 - list_terminals()：列出所有 run_in_terminal 任务终端及状态（运行中 / 已退出）。
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
-- computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
+- computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px 一条线 + x/y 数值标注）——**对着网格读出目标的 x,y 再点**，比凭感觉估坐标准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
 - browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / eval / screenshot / close。每个动作都回传：截图(上面每个可点元素标了**红色数字编号**) + **可交互元素列表**(每项 [编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)——比猜 CSS 选择器稳得多、也省 token；列表里没有的元素再用 selector / eval 找。打法：navigate → 看截图和元素列表 → 用 index 来 click/type → 看截图确认。用于自主上网、端到端测试你做的网页、抓需交互才出现的信息。需装 Chrome/Chromium/Edge。
 
 # 输出风格
@@ -9939,8 +9939,9 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "demostart") {
       _demoRec = { active: true, title: (call.title || "").trim() || "功能演示", frames: [] };
-      // Clean demo frames: hide the browser's Set-of-Mark number badges while recording.
-      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: false }); } catch {} }
+      // Clean demo frames: hide the browser's Set-of-Mark badges + the computer's
+      // coordinate grid while recording (they're agent-grounding aids, not for users).
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: false }); } catch {} try { await backend.invoke("computer_set_grid", { on: false }); } catch {} }
       res.className = "atc-result atc-result--ok"; res.textContent = "录制中";
       return { type: "demostart", path: _demoRec.title, content: `已开始录制演示「${_demoRec.title}」。现在用 browser / computer / screenshot **真实地走一遍功能流程**——每个动作都会自动录成一帧；走完用 stop_demo 收尾，把回放展示给用户。` };
 
@@ -9949,8 +9950,8 @@ async function _executeToolStep(step, call, root, run) {
       const title = _demoRec.title || "功能演示";
       const wasActive = _demoRec.active;
       _demoRec = { active: false, title: "", frames: [] };
-      // Restore the browser's Set-of-Mark badges for normal agent navigation.
-      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: true }); } catch {} }
+      // Restore the browser marks + computer grid for normal agent navigation.
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: true }); } catch {} try { await backend.invoke("computer_set_grid", { on: true }); } catch {} }
       if (!wasActive && !frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "未在录制"; return { type: "demostop", path: "", content: "[失败] 还没开始录制。先用 start_demo，再用 browser/computer/screenshot 走一遍流程，最后 stop_demo。" }; }
       if (!frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "无帧"; return { type: "demostop", path: title, content: "[失败] 录制期间没有产生任何截图帧——演示流程要用 browser / computer / screenshot 才会录到帧。" }; }
       try { const player = _buildDemoPlayer(frames, title); step.appendChild(player); } catch {}
@@ -10038,7 +10039,7 @@ async function _executeToolStep(step, call, root, run) {
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
       step.classList.add("is-open");
       chatEl.scrollTop = chatEl.scrollHeight;
-      const content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。全屏截图已回传给你看，据图判断下一步的坐标 / 操作。`;
+      const content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。截图上叠加了**坐标网格**（每 100px 一条青色线，线旁标了该处的 x / y 数值）——**对着网格读出目标的 x,y 再 click**，比凭感觉估坐标准得多。据图判断下一步。`;
       return { type: "computer", path: cact, image: state.screenshot, content };
 
     } else if (call.type === "cmd") {

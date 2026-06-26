@@ -122,6 +122,7 @@ pub fn run() {
             browser::browser_set_marks,
             browser::browser_close,
             computer::computer_screenshot,
+            computer::computer_set_grid,
             computer::computer_move,
             computer::computer_click,
             computer::computer_double_click,

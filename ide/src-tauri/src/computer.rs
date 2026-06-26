@@ -6,10 +6,15 @@
 //! input on a blocking thread; the prompt instructs the agent to act carefully and
 //! to look (screenshot) before and after every action.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Serialize;
+
+/// Whether to overlay the coordinate grid. ON for normal agent control (accurate
+/// clicking), turned OFF while recording a user-facing demo so frames stay clean.
+static DRAW_GRID: AtomicBool = AtomicBool::new(true);
 
 /// Screen state returned after every action: size (the agent's coordinate space)
 /// plus a fresh full-screen screenshot fed back to the model as vision.
@@ -35,6 +40,94 @@ fn primary_monitor() -> Result<xcap::Monitor, String> {
         .ok_or_else(|| "没有可用的显示器".to_string())
 }
 
+// 3x5 bitmap font for digits 0-9 (each row's low 3 bits = left/mid/right pixels).
+// Lets us draw coordinate labels with zero font dependencies.
+const DIGITS: [[u8; 5]; 10] = [
+    [7, 5, 5, 5, 7],
+    [2, 6, 2, 2, 7],
+    [7, 1, 7, 4, 7],
+    [7, 1, 7, 1, 7],
+    [5, 5, 7, 1, 1],
+    [7, 4, 7, 1, 7],
+    [7, 4, 7, 5, 7],
+    [7, 1, 2, 2, 2],
+    [7, 5, 7, 5, 7],
+    [7, 5, 7, 1, 7],
+];
+
+fn blend_px(img: &mut image::RgbaImage, x: u32, y: u32, c: [u8; 3], a: f32) {
+    if x >= img.width() || y >= img.height() {
+        return;
+    }
+    let p = img.get_pixel(x, y).0;
+    img.put_pixel(
+        x,
+        y,
+        image::Rgba([
+            (p[0] as f32 * (1.0 - a) + c[0] as f32 * a) as u8,
+            (p[1] as f32 * (1.0 - a) + c[1] as f32 * a) as u8,
+            (p[2] as f32 * (1.0 - a) + c[2] as f32 * a) as u8,
+            255,
+        ]),
+    );
+}
+
+/// Draw a number at (x,y) — a dark translucent plate for legibility on any
+/// background, then white digits via the bitmap font, scaled by `s`.
+fn put_number(img: &mut image::RgbaImage, x: u32, y: u32, n: u32, s: u32) {
+    let txt = n.to_string();
+    let dw = 3 * s + s; // digit cell + spacing
+    let w = txt.len() as u32 * dw + s;
+    let h = 5 * s + 2 * s;
+    for by in 0..h {
+        for bx in 0..w {
+            blend_px(img, x + bx, y + by, [0, 0, 0], 0.6);
+        }
+    }
+    let mut cx = x + s;
+    for ch in txt.bytes() {
+        let d = (ch.wrapping_sub(b'0')) as usize;
+        if d < 10 {
+            let pat = DIGITS[d];
+            for (r, &row) in pat.iter().enumerate() {
+                for c in 0..3u32 {
+                    if (row >> (2 - c)) & 1 == 1 {
+                        for yy in 0..s {
+                            for xx in 0..s {
+                                blend_px(img, cx + c * s + xx, y + s + r as u32 * s + yy, [255, 255, 255], 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += dw;
+    }
+}
+
+/// Overlay a faint coordinate grid + axis labels so the model can read off
+/// accurate click coordinates (the #1 fix for computer-use misclicks).
+fn draw_grid(img: &mut image::RgbaImage, step: u32) {
+    let (w, h) = (img.width(), img.height());
+    let line = [0u8, 200, 255];
+    let mut x = step;
+    while x < w {
+        for y in 0..h {
+            blend_px(img, x, y, line, 0.16);
+        }
+        put_number(img, x + 2, 2, x, 2);
+        x += step;
+    }
+    let mut y = step;
+    while y < h {
+        for xx in 0..w {
+            blend_px(img, xx, y, line, 0.16);
+        }
+        put_number(img, 2, y + 2, y, 2);
+        y += step;
+    }
+}
+
 fn screen_state() -> Result<ScreenState, String> {
     let mon = primary_monitor()?;
     let img = mon.capture_image().map_err(|e| e.to_string())?; // RgbaImage
@@ -48,8 +141,20 @@ fn screen_state() -> Result<ScreenState, String> {
     } else {
         (rw, rh)
     };
+    // Resize to the reported size, draw the coordinate grid (so labels match the
+    // coordinate space the agent works in), then JPEG-encode.
+    let mut rgba = if rw > SHOT_W {
+        image::DynamicImage::ImageRgba8(img)
+            .resize(width, height, image::imageops::FilterType::Triangle)
+            .to_rgba8()
+    } else {
+        img
+    };
+    if DRAW_GRID.load(Ordering::Relaxed) {
+        draw_grid(&mut rgba, 100);
+    }
     let screenshot =
-        crate::capture::jpeg_data_url(image::DynamicImage::ImageRgba8(img), SHOT_W, 65)?;
+        crate::capture::jpeg_data_url(image::DynamicImage::ImageRgba8(rgba), width, 65)?;
     Ok(ScreenState {
         width,
         height,
@@ -122,6 +227,13 @@ where
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Toggle the coordinate-grid overlay. The frontend turns it OFF while recording
+/// a user-facing demo (clean frames) and back ON after.
+#[tauri::command]
+pub fn computer_set_grid(on: bool) {
+    DRAW_GRID.store(on, Ordering::Relaxed);
 }
 
 /// Full-screen screenshot (no action) — look at the whole machine.
