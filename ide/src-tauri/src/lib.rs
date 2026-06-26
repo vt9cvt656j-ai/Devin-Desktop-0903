@@ -121,6 +121,8 @@ pub fn run() {
             browser::browser_eval,
             browser::browser_screenshot,
             browser::browser_set_marks,
+            browser::browser_scroll,
+            browser::browser_wait,
             browser::browser_close,
             computer::computer_screenshot,
             computer::computer_set_grid,

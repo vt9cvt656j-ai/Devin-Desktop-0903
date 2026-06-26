@@ -262,6 +262,49 @@ pub async fn browser_screenshot() -> Result<BrowserState, String> {
     with_tab(move |_tab| Ok(None)).await
 }
 
+/// Scroll the page vertically (positive = down, negative = up), then re-snapshot —
+/// so off-screen interactive elements come into view and get fresh refs/marks.
+/// Without this, the agent could only ever act on what was in the first viewport.
+#[tauri::command]
+pub async fn browser_scroll(amount: i32) -> Result<BrowserState, String> {
+    with_tab(move |tab| {
+        let js = format!("window.scrollBy(0, {});", amount);
+        let _ = tab.evaluate(&js, false);
+        std::thread::sleep(Duration::from_millis(350)); // let lazy content / sticky bars settle
+        Ok(None)
+    })
+    .await
+}
+
+/// Wait for the page to settle: either until a CSS `selector` appears (polled, up
+/// to ~8s) or for a fixed `ms`. Lets the agent act on a LOADED page instead of a
+/// transient one (the #1 cause of flaky automation on SPAs / AJAX).
+#[tauri::command]
+pub async fn browser_wait(selector: Option<String>, ms: Option<u64>) -> Result<BrowserState, String> {
+    with_tab(move |tab| {
+        match selector.filter(|s| !s.trim().is_empty()) {
+            Some(sel) => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    if tab.find_element(&sel).is_ok() {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            None => {
+                let d = ms.unwrap_or(1500).clamp(100, 15000);
+                std::thread::sleep(Duration::from_millis(d));
+            }
+        }
+        Ok(None)
+    })
+    .await
+}
+
 /// Toggle the visible Set-of-Mark number badges. The frontend turns them OFF
 /// while recording a user-facing demo (clean frames) and back ON after.
 #[tauri::command]
