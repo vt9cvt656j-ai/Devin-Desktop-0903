@@ -6184,6 +6184,28 @@ const _AI_MODE_PROMPTS = {
 2. **安全漏洞（真实可利用）**：注入(SQL/命令/XSS)、鉴权缺失或绕过、硬编码密钥、路径穿越、SSRF、不安全反序列化——给出**具体利用路径**，对照 OWASP/CWE。
 3. **确凿的性能问题**：有真实数据量支撑的 N+1、循环里干重活、错误复杂度——不是凭感觉的微优化。
 
+# 怎么深挖（系统性地毯式找——别只扫两眼表面）
+**主方法 = 污点 / 数据流追踪（找漏洞最有效，而且天然不误报：必须给出真实路径）**：
+1. 标出所有**不可信输入源(source)**：HTTP 参数 / 请求体 / header / cookie、命令行参数、环境变量、读入的文件、第三方 API 返回、消息 / 上传、反序列化输入。
+2. 标出所有**危险汇聚点(sink)**：拼 SQL / 执行命令(system/exec/eval) / 拼文件路径 / 渲染 HTML / 重定向 URL / 发外部请求(SSRF) / 反序列化 / 模板渲染(SSTI) / 起子进程。
+3. 沿每条 source→sink 路径看**中途有没有有效校验 / 转义 / 参数化 / 白名单**。**有真实路径且没被净化 = 真漏洞**（把这条路径写出来）；被挡住 = 不是。
+
+# 按类别地毯式过（挑与本语言 / 场景相关的；每类都要确认到一个真触发路径才报）
+**应用 / Web 漏洞（对照 OWASP Top 10:2025 与 CWE Top 25）**：
+- 注入：SQL / NoSQL / 命令 / LDAP / XSS / SSTI / XXE / HTTP 头注入 / 原型链污染(JS)。
+- 访问控制：越权(IDOR / 水平 / 垂直)、缺鉴权的接口、可被篡改的 role / owner 字段、JWT 不校验或弱算法。
+- 加密与机密：硬编码密钥 / 口令、弱哈希存密码(MD5/SHA1 / 不加盐)、ECB / 固定 IV、用非密码学随机(Math.random)生 token、明文传输。
+- SSRF / 路径穿越 / 任意文件读写 / 不安全反序列化 / 不安全上传 / 开放重定向。
+- ReDoS（灾难性回溯正则）、CSRF、CORS 过宽、安全响应头缺失、配置错误(调试开 / 默认口令)、日志泄露敏感信息。
+- 供应链：危险依赖、锁文件缺失、postinstall 脚本、版本不固定。
+**底层 / 系统 bug（C/C++ / Rust unsafe / Go / 并发场景重点查）**：
+- 内存安全：缓冲区溢出(读 / 写、堆 / 栈)、use-after-free、double-free、用未初始化或已释放内存、悬垂指针、越界(i<0 或 i≥n)、错误的 free / 所有权。
+- 整数：溢出 / 下溢 / 截断 / 有无符号混用 → 错误的大小或越界（C/C++ 里多为 UB）。
+- 未定义行为(C/C++)：空指针解引用、违反严格别名、移位越界、未初始化读取——编译器会按"UB 不发生"激进优化，后果不可控。
+- 并发：数据竞争、死锁、锁顺序不一致、TOCTOU、原子性破坏、忘加锁的共享可变状态。
+- 资源：fd / 内存 / 锁 / 连接 未释放（**异常 / 提前返回路径尤其**）、句柄泄漏。
+- 错误处理：忽略返回值或错误码、Rust 对不可信输入 unwrap / expect / panic、吞异常、出错不回滚。
+
 # 明确不报（这些就是用户嫌弃的"垃圾 bug"，一律压制）
 - 风格 / 命名 / 格式 / 缩进 / import 顺序（交给 linter/formatter）。
 - "建议加注释 / 加测试 / 可以考虑重构 / 也许更优雅"这类**主观可有可无**的东西。
@@ -7848,8 +7870,9 @@ function _looksComplexTask(text) {
 function _inferMode(text) {
   const t = (text || "").trim();
   const low = t.toLowerCase();
-  // 1) Code review / audit → reviewer.
-  if (/审查|审一下|评审|过一遍代码|code\s*review|\breview\b|找.{0,4}(bug|漏洞|隐患|问题)|有没有.{0,4}(bug|问题|漏洞|隐患)|安全审计|挑.{0,3}毛病/.test(low)) return "reviewer";
+  // 1) Code review / security audit → reviewer (read-only deep hunt). Terms here
+  //    are all "find/audit", never "fix" (which must stay agent).
+  if (/审查|审一下|评审|过一遍代码|code\s*review|\breview\b|\baudit\b|找.{0,4}(bug|漏洞|隐患|问题)|查.{0,4}(漏洞|隐患|安全)|有没有.{0,4}(bug|问题|漏洞|隐患)|安全审计|代码审计|审计代码|安全审查|安全检查|渗透|挑.{0,3}毛病/.test(low)) return "reviewer";
   // 2) Explicit "give me a plan/design, DON'T build it yet" → plan mode. Requires
   //    BOTH a plan/design noun AND a "not yet" signal, so a normal build request
   //    ("做个登录页") still goes to agent (which plans-first on its own).
@@ -13340,6 +13363,7 @@ const _SLASH = [
   { cmd: "test", desc: "写并跑单元测试", prompt: "为当前文件写单元测试，覆盖边界情况，并跑通。" },
   { cmd: "explain", desc: "解释这段代码", prompt: "解释当前打开文件的代码：作用、关键逻辑、注意点。" },
   { cmd: "review", desc: "审查改动", prompt: "高精度审查当前代码：**只报已证实为真的**正确性 / 安全 / 确凿性能问题，每条先读全相关上下文 + 构造具体触发场景再上报，报前自我反驳一遍，驳不倒才留。压制风格 / 命名 / 假设性 / 可有可无的「垃圾 bug」。按 🔴严重 / 🟡警告 两档列出并给修复；没有确凿问题就如实说没发现。" },
+  { cmd: "audit", desc: "深挖漏洞与底层 bug", prompt: "对相关代码做一次**彻底的安全 + 底层系统 bug 审计**。方法：① 先用 search / read_file 把入口、数据流、调用方读全；② 做**污点追踪**：列出不可信输入源(source)→危险汇聚点(sink)，沿每条路径看有没有有效校验 / 转义 / 参数化，没被净化且有真实路径的就是真漏洞，写出路径；③ 按类别地毯式过：注入(SQL/命令/XSS/SSTI/XXE/原型链)、访问控制 / 越权、加密与机密(硬编码密钥 / 弱哈希 / 弱随机)、SSRF / 路径穿越 / 反序列化、ReDoS / CSRF / CORS / 配置 / 供应链；底层：内存安全(溢出 / UAF / double-free / 越界 / 未初始化)、整数溢出 / 截断 / 符号、未定义行为、并发(数据竞争 / 死锁 / TOCTOU)、资源泄漏(异常路径)、错误处理(忽略错误码 / unwrap / 吞异常)。**每条都要确认到具体触发路径、报前自我反驳，对照 CWE/OWASP 标严重度(🔴/🟡)并给修复**；没确凿问题就如实说，绝不为凑数硬报。" },
   { cmd: "refactor", desc: "重构（保持行为）", prompt: "重构当前文件这段代码，提升可读性与结构，保持行为不变；改完验证。" },
   { cmd: "docs", desc: "加文档注释", prompt: "给当前文件的关键函数 / 类型加清晰的文档注释。" },
 ];
