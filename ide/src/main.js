@@ -6125,7 +6125,7 @@ const _AI_MODE_PROMPTS = {
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 - computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
-- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate 打开网址、click 点、type 输入、press 按键、eval 跑 JS、screenshot 看、close 关。每个动作都回传当前页面截图 + 可见文本，所以你能像人一样"看着操作"。用于自主上网查资料、端到端测试你做的网页(点按钮、填表单、走完流程看截图确认)、抓取需要交互才出现的信息。打法：先 navigate，再 screenshot/eval 看清结构与 CSS 选择器，然后 click/type/press 操作、看截图确认。比 web_fetch 强在能交互、能渲染 JS、能看见。需本机装 Chrome/Chromium/Edge。
+- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / eval / screenshot / close。每个动作都回传：截图(上面每个可点元素标了**红色数字编号**) + **可交互元素列表**(每项 [编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)——比猜 CSS 选择器稳得多、也省 token；列表里没有的元素再用 selector / eval 找。打法：navigate → 看截图和元素列表 → 用 index 来 click/type → 看截图确认。用于自主上网、端到端测试你做的网页、抓需交互才出现的信息。需装 Chrome/Chromium/Edge。
 
 # 输出风格
 直奔重点，先结论后细节。不复述用户的话，不写废话铺垫。文件改动一律通过 edit_file/write_file 工具完成——不要把整段新文件源码贴进聊天文本里。
@@ -7780,7 +7780,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回当前页面的截图(回传给你看) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓页面信息。action：navigate(打开网址,需 url) / click(点击,需 selector=CSS选择器) / type(输入,需 selector+text) / press(按键如 Enter/Tab/Escape,需 key) / eval(在页面跑 JS,需 script,返回结果) / screenshot(只看当前页不动作) / close(关闭浏览器)。打法：先 navigate 打开 → screenshot 或 eval('document.body.innerHTML') 看清结构与选择器 → 再 click/type/press 操作 → 看截图确认。需本机装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, selector: { type: "string", description: "click/type 用：目标元素的 CSS 选择器" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(回传给你看，上面每个可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / eval(跑 JS,需 script) / screenshot(只看) / close(关)。**点/填优先用 index=元素列表里的编号**(对应截图上的红数字，最准、不用猜选择器)；列表里没有的元素再用 selector(CSS)。打法：navigate → 看截图和元素列表 → 用 index 来 click/type → 看截图确认。需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, index: { type: "integer", description: "click/type 用(首选)：元素列表里的编号(截图上的红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：目标元素的 CSS 选择器，没有合适编号时才用" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -7867,7 +7867,13 @@ function _mapToolCall(name, args) {
     case "copy_path": return { type: "copy", path: args.from || "", to: args.to || "" };
     case "format_file": return { type: "format", path: args.path || "" };
     case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
-    case "browser": return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: args.selector || "", text: args.text || "", key: args.key || "", script: args.script || "" };
+    case "browser": {
+      // Prefer the element ref (Set-of-Mark index) → a precise [data-mref] selector,
+      // so the agent acts by number instead of guessing CSS. Falls back to selector.
+      let _bsel = args.selector || "";
+      if (args.index != null && args.index !== "" && Number.isFinite(Number(args.index))) _bsel = `[data-mref="${Number(args.index)}"]`;
+      return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: _bsel, text: args.text || "", key: args.key || "", script: args.script || "" };
+    }
     case "computer": return { type: "computer", action: args.action || "screenshot", x: args.x, y: args.y, button: args.button || "", text: args.text || "", key: args.key || "", amount: args.amount };
     default: return null;
   }
@@ -9933,6 +9939,8 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "demostart") {
       _demoRec = { active: true, title: (call.title || "").trim() || "功能演示", frames: [] };
+      // Clean demo frames: hide the browser's Set-of-Mark number badges while recording.
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: false }); } catch {} }
       res.className = "atc-result atc-result--ok"; res.textContent = "录制中";
       return { type: "demostart", path: _demoRec.title, content: `已开始录制演示「${_demoRec.title}」。现在用 browser / computer / screenshot **真实地走一遍功能流程**——每个动作都会自动录成一帧；走完用 stop_demo 收尾，把回放展示给用户。` };
 
@@ -9941,6 +9949,8 @@ async function _executeToolStep(step, call, root, run) {
       const title = _demoRec.title || "功能演示";
       const wasActive = _demoRec.active;
       _demoRec = { active: false, title: "", frames: [] };
+      // Restore the browser's Set-of-Mark badges for normal agent navigation.
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: true }); } catch {} }
       if (!wasActive && !frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "未在录制"; return { type: "demostop", path: "", content: "[失败] 还没开始录制。先用 start_demo，再用 browser/computer/screenshot 走一遍流程，最后 stop_demo。" }; }
       if (!frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "无帧"; return { type: "demostop", path: title, content: "[失败] 录制期间没有产生任何截图帧——演示流程要用 browser / computer / screenshot 才会录到帧。" }; }
       try { const player = _buildDemoPlayer(frames, title); step.appendChild(player); } catch {}
@@ -9988,8 +9998,13 @@ async function _executeToolStep(step, call, root, run) {
       chatEl.scrollTop = chatEl.scrollHeight;
       let content = `浏览器 [${act}] → ${state.title || ""}（${state.url || ""}）`;
       if (state.result != null && state.result !== "") content += `\nJS 结果: ${state.result}`;
-      if (state.text) content += `\n页面可见文本(截断):\n${state.text}`;
-      content += `\n（截图已回传给你看，据图判断下一步；元素定位不准就先用 eval 看 document.body.innerHTML 或 querySelectorAll 找选择器。）`;
+      const _els = Array.isArray(state.elements) ? state.elements : [];
+      if (_els.length) {
+        content += `\n可交互元素（截图上有对应红色数字标记，用 index=编号 直接 click/type，最准）:\n` +
+          _els.map(e => `[${e.ref}] <${e.tag}${e.type ? " " + e.type : ""}> ${(e.text || "").trim()}`.trim()).join("\n");
+      }
+      if (state.text) content += `\n页面可见文本(截断):\n${state.text.slice(0, 1500)}`;
+      content += `\n（截图里每个可点元素都标了**红色数字**；优先用 index=该数字 来 click / type，定位最准、不用猜选择器；列表里没有的元素再用 selector 或 eval 找。）`;
       return { type: "browser", path: act, image: state.screenshot, content };
 
     } else if (call.type === "computer") {

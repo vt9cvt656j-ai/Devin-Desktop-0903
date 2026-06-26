@@ -3,12 +3,18 @@
 //! returns a fresh screenshot + the page's visible text). This is what lets the
 //! agent test the web apps it builds, fill forms, and browse on its own.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+/// Whether to draw the visible Set-of-Mark number badges. ON for normal agent
+/// browsing (visual grounding), but turned OFF while recording a user-facing demo
+/// so the captured frames stay clean (refs are still tagged for click-by-index).
+static DRAW_MARKS: AtomicBool = AtomicBool::new(true);
+
 use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 struct Session {
     _browser: Browser, // kept alive so the child process & connection survive
@@ -18,6 +24,20 @@ struct Session {
 // One shared browser session for the agent. A Mutex is fine — the agent drives it
 // one action at a time.
 static BROWSER: LazyLock<Mutex<Option<Session>>> = LazyLock::new(|| Mutex::new(None));
+
+/// One interactive element on the page, with a stable `ref` the agent uses to
+/// act on it (click/type by number) instead of guessing a CSS selector — the
+/// Playwright-MCP / browser-use approach. Matched by `[data-mref="<ref>"]`.
+#[derive(Serialize, Deserialize)]
+pub struct BrowserElement {
+    #[serde(rename = "ref")]
+    ref_: u32,
+    tag: String,
+    #[serde(rename = "type", default)]
+    type_: String,
+    #[serde(default)]
+    text: String,
+}
 
 /// What every browser action returns: the page state AFTER the action, so the
 /// agent always sees the result of what it just did.
@@ -29,6 +49,9 @@ pub struct BrowserState {
     text: String,
     /// `data:image/png;base64,...` — fed back to the model as an image.
     screenshot: String,
+    /// Interactive elements (with refs) — the agent clicks/types by ref, and the
+    /// screenshot has matching numbered marks (Set-of-Mark) for visual grounding.
+    elements: Vec<BrowserElement>,
     /// Optional extra (e.g. a JS eval result).
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
@@ -53,7 +76,60 @@ fn launch() -> Result<Session, String> {
     })
 }
 
-/// Capture the current page state (title / url / visible text / screenshot).
+/// Enumerate the visible, in-viewport interactive elements: tag each with a
+/// `data-mref` ref (so click/type can target `[data-mref="N"]`), draw a numbered
+/// Set-of-Mark badge on each (so the screenshot shows which is which), and return
+/// the compact list. This is what lets the agent act precisely by number instead
+/// of guessing selectors — far more reliable and ~20-50x cheaper than pixels.
+fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
+    // `__DRAW__` is replaced with 1/0 — controls only the VISIBLE badge; refs are
+    // always tagged so click-by-index works even with marks off (demo recording).
+    let raw = r##"(() => { try {
+  document.querySelectorAll('[data-mref]').forEach(e => e.removeAttribute('data-mref'));
+  document.querySelectorAll('.__mcp_som').forEach(e => e.remove());
+  const DRAW = __DRAW__;
+  const sel = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[onclick],[contenteditable=""],[contenteditable=true]';
+  const els = Array.from(document.querySelectorAll(sel));
+  const out = []; let i = 0;
+  for (const el of els) {
+    if (i >= 60) break;
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
+    el.setAttribute('data-mref', i);
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').slice(0, 20);
+    let text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    out.push({ ref: i, tag: tag, type: type, text: text });
+    if (DRAW) {
+      const b = document.createElement('div');
+      b.className = '__mcp_som';
+      b.textContent = String(i);
+      b.style.cssText = 'position:absolute;z-index:2147483647;background:#d93025;color:#fff;font:bold 11px monospace;padding:0 3px;border-radius:3px;pointer-events:none;line-height:15px;box-shadow:0 0 0 1px #fff;';
+      b.style.left = (r.left + window.scrollX) + 'px';
+      b.style.top = (r.top + window.scrollY) + 'px';
+      document.body.appendChild(b);
+    }
+    i++;
+  }
+  return JSON.stringify(out);
+} catch (e) { return '[]'; } })()"##;
+    let js = raw.replace("__DRAW__", if DRAW_MARKS.load(Ordering::Relaxed) { "1" } else { "0" });
+    match tab.evaluate(&js, false) {
+        Ok(ro) => {
+            let s = ro
+                .value
+                .and_then(|v| v.as_str().map(|x| x.to_string()))
+                .unwrap_or_else(|| "[]".to_string());
+            serde_json::from_str::<Vec<BrowserElement>>(&s).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Capture the current page state (title / url / visible text / elements / shot).
 fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
     let title = tab.get_title().unwrap_or_default();
     let url = tab.get_url();
@@ -68,6 +144,10 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         .chars()
         .take(3000)
         .collect::<String>();
+    // Tag + mark interactive elements BEFORE the screenshot so the numbered marks
+    // appear in the captured image (Set-of-Mark grounding).
+    let elements = enumerate_elements(tab);
+    std::thread::sleep(Duration::from_millis(60)); // let the marks paint
     let png = tab
         .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
         .map_err(|e| e.to_string())?;
@@ -78,6 +158,7 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
         url,
         text,
         screenshot,
+        elements,
         result,
     })
 }
@@ -179,6 +260,13 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_screenshot() -> Result<BrowserState, String> {
     with_tab(move |_tab| Ok(None)).await
+}
+
+/// Toggle the visible Set-of-Mark number badges. The frontend turns them OFF
+/// while recording a user-facing demo (clean frames) and back ON after.
+#[tauri::command]
+pub fn browser_set_marks(on: bool) {
+    DRAW_MARKS.store(on, Ordering::Relaxed);
 }
 
 /// Close the browser and free the session.
