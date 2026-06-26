@@ -6121,6 +6121,7 @@ const _AI_MODE_PROMPTS = {
 - start_demo(title?) / stop_demo(path?)：**录功能演示 / 真实录屏**。start_demo 开录，然后用 browser/computer/screenshot 真走一遍功能流程(每个动作录一帧真截图)，stop_demo 收尾——系统会把步骤**一步步回放展示给用户**并存成可打开播放的 HTML 录屏文件。做完功能演示效果时用。
 - **MCP 外部工具（mcp__服务名__工具名）**：如果工具列表里出现 mcp__ 开头的工具，那是用户在 .mcp.json 里接入的外部 MCP 服务（数据库、GitHub、Slack、第三方 API 等）。它们和内置工具一样调用——遇到相关任务**优先用这些专用 MCP 工具**（比自己拼命令/HTTP 更准），按各自的参数 schema 传参即可。
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
+- think(thought)：**思考草稿**——纯推理、不改任何东西。分析报错 / 工具结果、权衡难抉择、规划多步、列根因假设时，先 think 想透再动手；越难越绕越要先想。简单任务别用。
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
 - get_diagnostics(path?)：读 LSP/编辑器对文件的错误与警告，改完代码快速自检（比每次跑构建快）
@@ -7810,6 +7811,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "web_search", description: "联网搜索（DuckDuckGo），返回标题/URL/摘要列表。用来查官方文档、API 用法、库的最新版本、报错解决方案、技术文章——找到相关页面后再用 web_fetch 读全文。不确定的 API/库/报错优先搜，别凭记忆猜。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新当前任务的分步计划，并随进度更新每步状态。多步任务开始时先用它列出计划，每完成一步就再调用更新状态。", parameters: { type: "object", properties: { steps: { type: "array", description: "有序的步骤列表", items: { type: "object", properties: { content: { type: "string", description: "这一步要做什么" }, status: { type: "string", enum: ["pending", "in_progress", "completed"], description: "状态" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
+    { type: "function", function: { name: "think", description: "**思考草稿 / 推理空间**——把你的推理写下来想清楚再动手（纯思考，不产生任何副作用、不改任何东西）。专用于：① 分析工具 / 命令返回的结果、报错栈，判断下一步；② 复杂或不可逆决策前权衡几种走法；③ 多步任务规划、核对约束与边界；④ 调 bug 时列出 2-3 个根因假设、想清怎么逐一证伪。**越难、越绕、越拿不准，越要先 think 想透再动手**——这一步显著提升复杂任务的推理质量。简单直接的任务不必用。", parameters: { type: "object", properties: { thought: { type: "string", description: "你的推理 / 分析 / 计划 / 假设（写给自己看，理清思路）" } }, required: ["thought"] } } },
     { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。子智能体能读文件、列目录、搜索、查找，自主多轮调查后返回一份简报。把大范围调研拆出去能让主线保持清爽、更省上下文。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
     { type: "function", function: { name: "remember", description: "把一条值得跨会话长期记住的项目知识写进**项目记忆知识图谱**（按工作区持久保存）。每条会被自动打标签、自动关联到相关的旧笔记，下次按任务相关性 + 关联召回——所以**可以放心多记**，图谱会帮你筛。每条写成一个原子事实（单一概念、简洁自包含）。适合记：技术栈/架构决定、目录与命名约定、构建/测试/运行命令、用户偏好、踩过的坑及其根因与解法。别记一次性细节。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一条原子知识（一个概念、简洁、自包含）" } }, required: ["content"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "读取编辑器/LSP 对文件的诊断（错误与警告）。改完代码用它快速自检，比每次跑构建快。不传 path 则返回所有已打开文件的诊断。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要检查的文件路径；省略则查所有已打开文件" } } } } },
@@ -7888,6 +7890,7 @@ function _mapToolCall(name, args) {
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "" };
     case "run_cmd": return { type: "cmd", command: args.command || "" };
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
+    case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
     case "remember": return { type: "memory", path: "项目记忆", content: args.content || "" };
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
@@ -8960,7 +8963,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       _scroll();
 
       const toolMsgs = new Array(items.length);
-      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag"]);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think"]);
 
       const runOne = async (it) => {
         const { call, step } = it;
@@ -9381,7 +9384,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", mcp: "MCP tool", demostart: "Recording demo", demostop: "Demo recorded", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", think: "Thought", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", mcp: "MCP tool", demostart: "Recording demo", demostop: "Demo recorded", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -9405,6 +9408,7 @@ function _createToolStep(call) {
     http: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
     download: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.25 1.75a.75.75 0 011.5 0v6.69l1.97-1.97a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.53a.75.75 0 011.06-1.06l1.97 1.97V1.75zM2.5 11.25a.75.75 0 011.5 0v1.5c0 .14.11.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 0111.75 14.5h-7.5A1.75 1.75 0 012.5 12.75v-1.5z"/></svg>`,
     mcp: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H11v1.19l1.28 1.28a1.75 1.75 0 010 2.47l-3.06 3.06a1.75 1.75 0 01-2.47 0L3.56 9.22a.75.75 0 011.06-1.06l3.19 3.19a.25.25 0 00.35 0l3.06-3.06a.25.25 0 000-.35L9.28 5.56A.75.75 0 019 5V4.5h-.75a.75.75 0 010-1.5H9V1.75zM5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H6.5V5a.75.75 0 01-.22.53L4.97 6.84a.75.75 0 11-1.06-1.06L5 4.69V4.5h-.75a.75.75 0 010-1.5H5V1.75z"/></svg>`,
+    think: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5a4.5 4.5 0 00-2.6 8.17c.3.21.5.55.52.92l.05.91h4.06l.05-.91c.02-.37.22-.71.52-.92A4.5 4.5 0 008 1.5zM6.1 13.5h3.8v.6a1 1 0 01-1 1H7.1a1 1 0 01-1-1v-.6z"/></svg>`,
     demostart: `<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="8" r="3.5"/><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zm0 1.5a5 5 0 110 10 5 5 0 010-10z" opacity=".5"/></svg>`,
     demostop: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 3.75C2 2.784 2.784 2 3.75 2h8.5c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0112.25 14h-8.5A1.75 1.75 0 012 12.25v-8.5zm4 1.5v5.5l4.5-2.75L6 5.25z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
@@ -9415,7 +9419,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9858,6 +9862,14 @@ async function _executeToolStep(step, call, root, run) {
       res.textContent = probs.length ? `${probs.length} 个问题` : "无错误/警告";
       if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无诊断)")}</pre>`;
       return { type: "diag", path: call.path, content: probs.length ? `诊断（${probs.length} 个错误/警告）:\n${lines.join("\n")}` : "无错误或警告（注意：LSP 分析可能略有延迟，改完稍等再查更准）。" };
+
+    } else if (call.type === "think") {
+      // The "think" tool: a no-op reasoning scratchpad. The thought lives in the
+      // tool-call args (so it's in context for the next turn); we just acknowledge.
+      const thought = String(call.content || "").trim();
+      res.className = "atc-result atc-result--ok"; res.textContent = "已思考";
+      if (typeof vp !== "undefined" && vp) vp.innerHTML = `<pre>${_escHtml(thought.slice(0, 1200))}</pre>`;
+      return { type: "think", path: "", content: thought ? "（已记下推理，按它继续）" : "（空思考）" };
 
     } else if (call.type === "memory") {
       // Write into the knowledge graph (auto-tagged + auto-linked to related notes).
