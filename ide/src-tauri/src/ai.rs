@@ -583,27 +583,15 @@ pub async fn web_search(query: String) -> Result<String, String> {
     if q.is_empty() {
         return Err("空搜索词".into());
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post("https://html.duckduckgo.com/html/")
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36",
-        )
-        .form(&[("q", q)])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("搜索失败 HTTP {}", resp.status().as_u16()));
-    }
-    let html = resp.text().await.map_err(|e| e.to_string())?;
-    let results = parse_ddg_results(&html);
+    // The old code hit ONE DuckDuckGo endpoint with no fallback — it gets rate-
+    // limited / blocked a lot, which is exactly why search "搜不到". Now we try the
+    // html endpoint then fall back to the lite endpoint (lighter, far less blocked),
+    // each with a rotated UA, returning the first non-empty result set.
+    let results = ddg_search_multi(q).await;
     if results.is_empty() {
-        return Ok(format!("「{q}」没有搜到结果。"));
+        return Ok(format!(
+            "「{q}」这次没搜到结果（搜索引擎可能临时限流，或关键词太宽泛）。可以：① 换更具体、用英文的关键词重试；② 直接用 web_fetch 打开你已知的相关网址 / 官方文档读全文。"
+        ));
     }
     let mut out = format!("搜索「{q}」的结果：\n");
     for (i, (title, url, snippet)) in results.iter().take(8).enumerate() {
@@ -617,4 +605,188 @@ pub async fn web_search(query: String) -> Result<String, String> {
     }
     out.push_str("\n（用 web_fetch 打开上面任意 URL 读全文）");
     Ok(out)
+}
+
+/// Try several DuckDuckGo endpoints / UAs, return the first non-empty result set.
+async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
+    const UAS: [&str; 2] = [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    ];
+    // 1) html.duckduckgo.com — richest snippets.
+    for ua in UAS {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            if let Ok(resp) = client
+                .post("https://html.duckduckgo.com/html/")
+                .header(reqwest::header::USER_AGENT, ua)
+                .form(&[("q", q), ("kl", "wt-wt")])
+                .send()
+                .await
+            {
+                if let Ok(html) = resp.text().await {
+                    let r = parse_ddg_results(&html);
+                    if !r.is_empty() {
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+    // 2) Bing — a DIFFERENT engine, so a DDG block falls through to it.
+    let bing_url = format!(
+        "https://www.bing.com/search?q={}&setlang=en",
+        urlencoding(q)
+    );
+    for ua in UAS {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            if let Ok(resp) = client
+                .get(&bing_url)
+                .header(reqwest::header::USER_AGENT, ua)
+                .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+                .send()
+                .await
+            {
+                if let Ok(html) = resp.text().await {
+                    let r = parse_bing(&html);
+                    if !r.is_empty() {
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+    // 3) lite.duckduckgo.com — much lighter HTML, rarely blocked.
+    for ua in UAS {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            if let Ok(resp) = client
+                .post("https://lite.duckduckgo.com/lite/")
+                .header(reqwest::header::USER_AGENT, ua)
+                .form(&[("q", q)])
+                .send()
+                .await
+            {
+                if let Ok(html) = resp.text().await {
+                    let r = parse_ddg_lite(&html);
+                    if !r.is_empty() {
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Minimal percent-encoding for a query string (no extra crate).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Parse Bing's organic results (`<li class="b_algo"> … <h2><a href>title</a> … <p>snippet</p>`).
+fn parse_bing(html: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = html[from..].find("b_algo") {
+        let abs = from + rel;
+        from = abs + 6;
+        let end = (abs + 4000).min(html.len());
+        let region = &html[abs..end]; // bound the per-result scan
+        let (href, title) = region
+            .find("<a ")
+            .and_then(|a| {
+                let s = &region[a..];
+                let href = s.find("href=\"").and_then(|h| {
+                    let s2 = &s[h + 6..];
+                    s2.find('"').map(|e| s2[..e].to_string())
+                })?;
+                let title = s.find('>').and_then(|g| {
+                    let s2 = &s[g + 1..];
+                    s2.find("</a>").map(|e| html_to_text(&s2[..e]))
+                })?;
+                Some((href, title))
+            })
+            .unwrap_or_default();
+        let snippet = region
+            .find("<p")
+            .and_then(|p| {
+                let s = &region[p..];
+                s.find('>').and_then(|g| {
+                    let s2 = &s[g + 1..];
+                    s2.find("</p>").map(|e| html_to_text(&s2[..e]))
+                })
+            })
+            .unwrap_or_default();
+        if href.starts_with("http") && !title.is_empty() && !out.iter().any(|(_, u, _)| u == &href) {
+            out.push((title, href, snippet));
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse the simple `lite.duckduckgo.com/lite/` results table.
+fn parse_ddg_lite(html: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = html[from..].find("result-link") {
+        let abs = from + rel;
+        from = abs + 11;
+        // The enclosing <a ...> starts before "result-link"; grab its href + text.
+        let a_start = html[..abs].rfind("<a").unwrap_or(abs);
+        let tag = &html[a_start..];
+        let href = tag
+            .find("href=\"")
+            .and_then(|h| {
+                let s = &tag[h + 6..];
+                s.find('"').map(|e| s[..e].to_string())
+            })
+            .unwrap_or_default();
+        let url = ddg_unwrap(&href);
+        let title = tag
+            .find('>')
+            .and_then(|g| {
+                let s = &tag[g + 1..];
+                s.find("</a>").map(|e| html_to_text(&s[..e]))
+            })
+            .unwrap_or_default();
+        // Snippet: the next `result-snippet` cell after this link.
+        let snippet = html[abs..]
+            .find("result-snippet")
+            .and_then(|sp| {
+                let s = &html[abs + sp..];
+                s.find('>').and_then(|g| {
+                    let s2 = &s[g + 1..];
+                    s2.find("</td>")
+                        .or_else(|| s2.find("</a>"))
+                        .map(|e| html_to_text(&s2[..e]))
+                })
+            })
+            .unwrap_or_default();
+        if !url.is_empty() && !title.is_empty() && !out.iter().any(|(_, u, _)| u == &url) {
+            out.push((title, url, snippet));
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out
 }
