@@ -1,3 +1,4 @@
+mod accessibility;
 mod ai;
 mod auth;
 mod browser;

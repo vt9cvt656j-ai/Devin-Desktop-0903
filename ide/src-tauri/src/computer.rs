@@ -23,6 +23,21 @@ pub struct ScreenState {
     width: u32,
     height: u32,
     screenshot: String, // data:image/png;base64,...
+    /// Interactive elements detected via accessibility (macOS), with a `ref` and
+    /// the click-ready CENTER coordinate in the reported space — matches the
+    /// numbered marks drawn on the screenshot (desktop Set-of-Mark). Empty when
+    /// unavailable (then the screenshot still has the coordinate grid).
+    elements: Vec<ScreenElement>,
+}
+
+#[derive(Serialize)]
+pub struct ScreenElement {
+    #[serde(rename = "ref")]
+    ref_: u32,
+    role: String,
+    text: String,
+    x: u32, // center, reported space (ready to click)
+    y: u32,
 }
 
 /// Cap the screenshot width — keeps the JPEG small AND defines the coordinate
@@ -130,6 +145,7 @@ fn draw_grid(img: &mut image::RgbaImage, step: u32) {
 
 fn screen_state() -> Result<ScreenState, String> {
     let mon = primary_monitor()?;
+    let scale = mon.scale_factor().unwrap_or(1.0) as f64; // points → pixels (Retina)
     let img = mon.capture_image().map_err(|e| e.to_string())?; // RgbaImage
     let (rw, rh) = (img.width(), img.height());
     // Reported coordinate space = the (possibly downscaled) screenshot size, so
@@ -141,8 +157,6 @@ fn screen_state() -> Result<ScreenState, String> {
     } else {
         (rw, rh)
     };
-    // Resize to the reported size, draw the coordinate grid (so labels match the
-    // coordinate space the agent works in), then JPEG-encode.
     let mut rgba = if rw > SHOT_W {
         image::DynamicImage::ImageRgba8(img)
             .resize(width, height, image::imageops::FilterType::Triangle)
@@ -150,15 +164,44 @@ fn screen_state() -> Result<ScreenState, String> {
     } else {
         img
     };
-    if DRAW_GRID.load(Ordering::Relaxed) {
+
+    // DRAW_GRID off ⇒ recording a clean demo: no grid, no marks, and skip the
+    // (slow) accessibility query entirely.
+    let draw = DRAW_GRID.load(Ordering::Relaxed);
+    let mut elements: Vec<ScreenElement> = Vec::new();
+    if draw {
         draw_grid(&mut rgba, 100);
+        // True desktop Set-of-Mark: pull the frontmost app's interactive elements
+        // and draw a numbered badge on each. A screen POINT maps to a downscaled
+        // pixel by `scale * reported/real` (the scale cancels the Retina factor).
+        let sx = scale * width as f64 / rw.max(1) as f64;
+        let sy = scale * height as f64 / rh.max(1) as f64;
+        for e in crate::accessibility::read_ui_elements() {
+            let rx = e.x * sx;
+            let ry = e.y * sy;
+            let rwd = e.w * sx;
+            let rhd = e.h * sy;
+            if rx < 0.0 || ry < 0.0 || rx as u32 >= width || ry as u32 >= height {
+                continue;
+            }
+            put_number(&mut rgba, rx as u32, ry as u32, e.ref_, 2); // badge on top of grid
+            elements.push(ScreenElement {
+                ref_: e.ref_,
+                role: e.role,
+                text: e.text,
+                x: (rx + rwd / 2.0).round().max(0.0) as u32,
+                y: (ry + rhd / 2.0).round().max(0.0) as u32,
+            });
+        }
     }
+
     let screenshot =
         crate::capture::jpeg_data_url(image::DynamicImage::ImageRgba8(rgba), width, 65)?;
     Ok(ScreenState {
         width,
         height,
         screenshot,
+        elements,
     })
 }
 

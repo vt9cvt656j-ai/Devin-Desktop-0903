@@ -6124,7 +6124,7 @@ const _AI_MODE_PROMPTS = {
 - list_terminals()：列出所有 run_in_terminal 任务终端及状态（运行中 / 已退出）。
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
-- computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px 一条线 + x/y 数值标注）——**对着网格读出目标的 x,y 再点**，比凭感觉估坐标准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
+- computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px + x/y 数值）；macOS 上还会列出**可点元素**(带红色编号 + 现成坐标)——**有元素列表就直接点它给的坐标(最准)；没有的目标对着网格读 x,y 再点**，都比凭感觉估准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
 - browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / eval / screenshot / close。每个动作都回传：截图(上面每个可点元素标了**红色数字编号**) + **可交互元素列表**(每项 [编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)——比猜 CSS 选择器稳得多、也省 token；列表里没有的元素再用 selector / eval 找。打法：navigate → 看截图和元素列表 → 用 index 来 click/type → 看截图确认。用于自主上网、端到端测试你做的网页、抓需交互才出现的信息。需装 Chrome/Chromium/Edge。
 
 # 输出风格
@@ -10039,7 +10039,13 @@ async function _executeToolStep(step, call, root, run) {
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
       step.classList.add("is-open");
       chatEl.scrollTop = chatEl.scrollHeight;
-      const content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。截图上叠加了**坐标网格**（每 100px 一条青色线，线旁标了该处的 x / y 数值）——**对着网格读出目标的 x,y 再 click**，比凭感觉估坐标准得多。据图判断下一步。`;
+      const _cels = Array.isArray(state.elements) ? state.elements : [];
+      let content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。`;
+      if (_cels.length) {
+        content += `\n**可点元素**（截图上有对应红色数字标记，直接点它给的坐标最准、不用估）:\n` +
+          _cels.map(e => `[${e.ref}] ${e.role}${e.text ? " 「" + e.text + "」" : ""} → 点 (${e.x},${e.y})`).join("\n");
+      }
+      content += `\n截图上还叠加了**坐标网格**（每 100px 一条线 + x/y 数值）——元素列表里没有的目标，对着网格读坐标再 click。据图判断下一步。`;
       return { type: "computer", path: cact, image: state.screenshot, content };
 
     } else if (call.type === "cmd") {
