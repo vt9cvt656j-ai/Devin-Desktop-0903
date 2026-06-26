@@ -210,19 +210,40 @@ async fn ai_chat_inner(
     // UTF-8 sequence, so splitting on the byte and decoding each *complete* line
     // is always valid.
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        // A mid-stream read error means the connection dropped partway (common on
-        // cross-border / lossy links — "error decoding response body"). Keep what
-        // we've already streamed and end the turn gracefully with a friendly note,
-        // instead of failing the whole agent run with a raw decode error.
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(_e) => {
+    // Stall guard for the hung turn ("半天不走内容"): the upstream sends the response
+    // headers, then stops producing — either fully silent (no bytes) OR dribbling
+    // keepalive/ping bytes with no actual content (which also defeats the gateway's
+    // own idle timeout, since from its side bytes are still flowing). Poll the read
+    // on a short interval and end the turn only when NO real progress
+    // (token/reasoning/tool-call) has happened for STALL_LIMIT — so a slow-but-alive
+    // stream is never killed, but a genuinely stuck one stops instead of hanging.
+    const READ_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+    const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(75);
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        let chunk = match tokio::time::timeout(READ_POLL, stream.next()).await {
+            Ok(Some(Ok(c))) => c,
+            // A mid-stream read error means the connection dropped partway (common
+            // on cross-border / lossy links — "error decoding response body"). Keep
+            // what we've already streamed and end the turn gracefully.
+            Ok(Some(Err(_e))) => {
                 let _ = on_event.send(AiEvent::Error {
                     message: "连接中断（网络波动），已保留生成的部分，请点重试继续。".to_string(),
                 });
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
+            }
+            Ok(None) => break, // stream ended normally
+            Err(_elapsed) => {
+                // No bytes this interval — only bail if nothing has progressed at all.
+                if last_progress.elapsed() >= STALL_LIMIT {
+                    let _ = on_event.send(AiEvent::Error {
+                        message: "模型长时间无响应（连接卡住），已停止本轮，请点重试。".to_string(),
+                    });
+                    let _ = on_event.send(AiEvent::Done);
+                    return Ok(());
+                }
+                continue;
             }
         };
         buf.extend_from_slice(&chunk);
@@ -254,6 +275,7 @@ async fn ai_chat_inner(
                         let _ = on_event.send(AiEvent::Reasoning {
                             delta: rt.to_string(),
                         });
+                        last_progress = std::time::Instant::now();
                     }
                 }
                 if let Some(text) = delta["content"].as_str() {
@@ -261,6 +283,7 @@ async fn ai_chat_inner(
                         let _ = on_event.send(AiEvent::Token {
                             delta: text.to_string(),
                         });
+                        last_progress = std::time::Instant::now();
                     }
                 }
                 if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -279,10 +302,21 @@ async fn ai_chat_inner(
                                 name,
                                 arguments: args,
                             });
+                            last_progress = std::time::Instant::now();
                         }
                     }
                 }
             }
+        }
+
+        // Bytes may keep flowing (keepalive / ping comments) with no content — if
+        // there has been no real progress for STALL_LIMIT, treat it as a stall too.
+        if last_progress.elapsed() >= STALL_LIMIT {
+            let _ = on_event.send(AiEvent::Error {
+                message: "模型长时间无响应（连接卡住），已停止本轮，请点重试。".to_string(),
+            });
+            let _ = on_event.send(AiEvent::Done);
+            return Ok(());
         }
     }
 
