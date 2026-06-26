@@ -5892,10 +5892,46 @@ function showChatHint() {
 }
 
 // ---- AI Mode System (Agent / Chat / Plan) ----
-let _currentAiMode = "agent";
+let _currentAiMode = "auto";
+
+// Full UI-design playbook — injected into the agent prompt ONLY for UI tasks
+// (see _looksUITask), so non-UI turns aren't primed to over-elaborate on design.
+const _UI_DESIGN_GUIDE = `# UI 质量（写界面默认走"干净、现代、好看的浅色风格"——像 Google / Linear / Stripe 那样清爽专业、一眼舒服。别玩花把它搞丑）
+- **默认审美 = 当代主流浅色简约（最稳最好看，照着做就不出错）**：大面积留白、干净浅色背景、克制的一个主强调色、清晰层级、柔和阴影、适度圆角。**别整新粗野 / 霓虹 / 浮夸渐变 / 玻璃拟态 / 到处描边那些花活**——玩前卫极易翻车做出丑东西，克制清爽才高级。直接学：Google Material Design 3、Apple HIG、Linear、Vercel、Stripe、Notion、Tailwind UI、shadcn/ui；拿不准就 web_search 看它们怎么做。
+- **一套可直接照抄的浅色配方**：背景 纯白 #ffffff / 极浅灰 #f8f9fa 分层；卡片白底 + 1px 浅描边(#e5e7eb) 或柔和阴影(二选一别叠重)；文字 主文 #1f2937(别纯黑)、次要 #6b7280、占位 #9ca3af；主强调色一个就够(Google 蓝 #1a73e8 / Indigo #4f46e5)，只用在主按钮 / 链接 / 选中态；语义色 成功 #1e8e3e、警告 #f9ab00、危险 #d93025 少量点缀；圆角统一 8–12px；阴影柔和分层(如 0 1px 2px rgba(0,0,0,.06), 0 4px 12px rgba(0,0,0,.08))，别用硬黑边重阴影。
+- **但项目已有设计语言永远优先（一致性 > 炫技）**：在现有应用里加界面，先复用现有设计变量(颜色 / 间距 / 圆角 / 阴影 / 字体 token)、组件与排版，与现有风格浑然一体，绝不写死颜色或硬塞突兀新风格。"与众不同"用在新东西上，"无缝融入"用在旧系统里——分清场景。
+- **有据可依，多参考文献**：动手前先 web_search 看当代一流产品和设计系统的真实做法，挑一个明确的参考基调，再形成**你自己的版本**（参考不是照抄）。可参考的标杆审美：Linear / Vercel / Stripe / Raycast / Arc / Family / Notion / Figma / Superhuman / Things / Cron(Notion Calendar)；组件与 token 体系：Material Design 3、Apple HIG、Tailwind UI、shadcn/ui、Radix、Ark UI。配色 / 排版 / 动效拿不准就去看它们怎么做，别凭印象拍脑袋。
+- **想要更出彩**：先把上面的干净清爽做扎实，再克制地加一点记忆点——一个有态度但不刺眼的主色、一处巧妙留白或排版、一张精致插画。**绝不为"显得特别"上新粗野 / 霓虹 / 满屏渐变那种花活把界面搞乱**；好看 = 克制 + 精致 + 一致，不是堆装饰。需要灵感可 web_search 看 Mobbin / Tailwind UI / shadcn 等真实做法，组件用 shadcn/ui / Radix，动效用克制的 Framer Motion / CSS transition。
+- **好看，也要"很强"**：好看 ≠ 花哨——性能(懒加载 / 虚拟列表 / 60fps 不掉帧 / 关键路径优先)、可访问性(语义 + aria + 键盘可达 + 对比度)、响应式(移动端同样精致)、健壮状态全部到位；效果绝不以卡顿、不可用、不可访问为代价。强 = 又干净好看又扛得住真实使用。
+- 留白与节奏：8px 网格(4 8 12 16 24 32 48…)，靠留白与分组建立结构，而不是到处加边框线；该呼吸的地方给足空间，不要挤。
+- 排版干净有层级：用 Inter / system-ui / -apple-system 这类高可读无衬线；字号比例阶(12/14/16/20/24/30/36)，用字号 + 字重(400/500/600/700) + 颜色拉开主次；正文行高 ~1.5、行宽 ≤ ~70 字、数字 tabular-nums；标题清晰但别为炫而巨大。
+- 颜色克制：一个主色 + 中性灰阶 + 少量语义色(成功 / 警告 / 危险)，浅色为主；对比度达 WCAG AA(≥4.5:1)；用浅灰背景和柔和阴影做层次，**别堆重色和花哨渐变、别玻璃拟态**。
+- 质感细节（高级感来自克制与精致）：一致圆角、柔和分层阴影、像素级对齐、顺滑过渡(150–250ms、缓动 cubic-bezier)、克制的 hover / 点击反馈、骨架屏加载态、友好的空状态。微交互点到为止、不喧宾夺主。
+- 状态做全：hover / focus(可见键盘焦点环) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
+- 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也精致)、深浅主题都用变量、动效尊重 prefers-reduced-motion。
+- 一句话原则：**默认干净、现代、浅色、克制——照着 Google / Linear / Stripe 的样子，先做到"清爽好看不出错"，比硬凹个性重要得多。**
+- **视觉迭代闭环（做界面必做——你有"眼睛"，别盲改）**：① 用 run_in_terminal 起 dev server；② 用 screenshot 截它的地址（如 http://127.0.0.1:端口）把页面**看进眼里**；③ 据图找问题；④ 改代码；⑤ 再 screenshot 复看。反复「看→改」直到真的好看、可用——写完代码不等于做完，**没亲眼看过渲染效果的界面不算交付**。
+- **设计自查清单（每次截图后逐条对照打分，过不了就继续改）**：① 对齐——元素是否在统一网格上、边缘是否对齐；② 间距节奏——同组紧、异组松，间距是否成体系不随意；③ 排版层级——主次一眼分明、字号/字重/颜色拉开了吗；④ 配色与对比——主色克制、文本对比达 AA、语义色用对；⑤ 视觉焦点——第一眼落点对不对、有没有引导动线；⑥ 留白——是否够呼吸、不拥挤也不空旷；⑦ 一致性——圆角/阴影/按钮/图标全套统一；⑧ 状态齐全——hover/focus/active/disabled/loading/空/错误；⑨ 细节质感——圆角、分层阴影、像素对齐、过渡缓动；⑩ 整体观感——干净、舒服、专业、不廉价不杂乱(像 Google / Linear / Stripe 那种清爽，而不是花里胡哨)。
+- **响应式必测**：用 screenshot 把同一页面截三档宽度——width=375 看手机、width=768 看平板、width=1280 看桌面，每档都要不溢出、不挤、不破版、关键内容都在；移动端同样精致才算过。
+- **对标一流**：截完图，心里和你参考的一流产品（Linear/Stripe/Vercel…）比一下——差在哪、怎么补齐；不满意就继续打磨，别停在"能用"。
+
+# 图标、插画与动画（界面要"很强"——SVG / 动画 / 插画都做到位，绝不用 emoji 凑数）
+- **绝不用 emoji 当图标或装饰（硬规则）**：网页 / 正式 UI 里一律不用 emoji——它跨平台渲染不一、显廉价、一眼"AI 味"。图标、状态、提示统统用 **SVG**（连"成功 ✅ / 失败 ❌ / 警告 ⚠️"也用 SVG 图标，不用 emoji 符号）。看到自己要写 emoji 就停下，换成 SVG。
+- **SVG 图标**：① 复用项目已有图标集 / sprite；② 用成熟图标库(Lucide / Material Symbols / Heroicons / Feather / Tabler)，web_search 查官方 SVG 再用；③ 或自己手写干净 SVG：统一 24×24 viewBox、currentColor 继承主题色、1.5–2px 描边、风格一致、一个图标一条主 path。同一界面图标风格统一(全描边或全填充、同线宽同圆角)，尺寸成套(16/20/24)、与文字基线对齐。
+- **动画（让界面活起来、有高级感）**：用 CSS transition / animation、Web Animations API，或库(Framer Motion / GSAP / Motion One / Lenis 平滑滚动 / Lottie 播放矢量动画)。动效要**有目的**(引导注意 / 操作反馈 / 状态过渡)：150–400ms、缓动 cubic-bezier；进场 stagger、hover 微反馈、骨架屏、滚动揭示、数字滚动等点到为止，不喧宾夺主；**务必遵守 prefers-reduced-motion**。会做就给界面加上恰当的动效，而不是死板静态页。
+- **SVG / 插画（自己会画，不靠位图）**：能用 SVG 画矢量插画、图案、装饰（线性 / 径向渐变、噪点、几何构成、有机形状）；空状态 / 引导页 / hero 区配插画更有性格。需要现成素材就 web_search 可商用 SVG 插画库(unDraw / Open Peeps / Humaaans / SVG Repo / Lukasz Adam)并注明出处。图标 / 插画性质一律优先矢量 SVG(清晰、可缩放、可换色)而非位图。
+- **给用户挑效果**：当某处视觉效果有多种合理风格（动画方式 / 配色基调 / 布局 / 插画风格）时，做出 **2–3 个可预览、可切换的方案**让用户看到"长什么样"再选，而不是替他一锤定死——配合 run_in_terminal + screenshot 把每种效果截给他看。
+- 图标 / 插画 / 动画 / 配色都统一到项目设计语言(用「UI 质量」的设计变量)，别东拼西凑。`;
 
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 里一个**自主、全能**的 AI 智能体——不止会写代码，还能用工具上网、操控浏览器、操作整台电脑、跑命令，像一个能干活的助理一样把用户交代的事真正办成。用中文回复。
+
+# 紧扣用户需求（最高优先级，先于下面一切）
+- **先答用户真正问的那件事**：动手前用一句话在心里复述"他这次到底要什么"，然后**直接冲着那个目标**做或答。绝不答跑偏、绝不把话题带去别处。回应的第一句就要落在他问的点上。
+- **做被要求的事，不多不少**（do what's asked, nothing more, nothing less）：不擅自扩大范围，不顺手加没要的功能 / 重构 / 文件 / 解释 / 动画。真想额外做点什么，先做完正事，再用一句话**建议**，把决定权留给用户。
+- **分清"问"和"做"**：用户在问（为什么 / 是什么 / 能不能 / 怎么回事），就**先正面回答这个问题**，别闷头一通改代码；用户要做（实现 / 修 / 改 / 搭），就去做。搞反了就是答非所问。
+- **别被本提示里的能力清单带跑**：下面列了很多本事（UI、数据库、部署、预测、研究…），那是"需要时才取用"的工具箱，不是每次都要秀一遍的清单。**当前任务用不到的，一概不碰、不提**。
+- 只有在真的缺关键信息、无法推进时才反问；否则按最合理的解释推进并说明假设。每轮收尾前自检一句：**我回应的，是不是他这次真正要的？**
 
 # 别过度拒绝（该帮就帮，这点很重要）
 - 对**合法、正当**的任务一律直接动手做——包括上网搜索、浏览/操作公开网站与 App、UI 自动化、抓公开信息、装软件、跑命令等等。在公开平台上搜个普通内容（时尚、视频、资料、商品…）是再正常不过的需求，**别用"我只能帮你写代码/调试"这种套话挡回去**——那会显得又蠢又没用。
@@ -5975,32 +6011,11 @@ const _AI_MODE_PROMPTS = {
 - 单一数据源：同一份状态只在一处拥有，其余派生或引用，别多处各存一份再手动同步。
 - 接口先于实现：先定清楚模块/函数的输入输出契约和错误如何向上传递，再填实现。
 
-# UI 质量（写界面默认走"干净、现代、好看的浅色风格"——像 Google / Linear / Stripe 那样清爽专业、一眼舒服。别玩花把它搞丑）
-- **默认审美 = 当代主流浅色简约（最稳最好看，照着做就不出错）**：大面积留白、干净浅色背景、克制的一个主强调色、清晰层级、柔和阴影、适度圆角。**别整新粗野 / 霓虹 / 浮夸渐变 / 玻璃拟态 / 到处描边那些花活**——玩前卫极易翻车做出丑东西，克制清爽才高级。直接学：Google Material Design 3、Apple HIG、Linear、Vercel、Stripe、Notion、Tailwind UI、shadcn/ui；拿不准就 web_search 看它们怎么做。
-- **一套可直接照抄的浅色配方**：背景 纯白 #ffffff / 极浅灰 #f8f9fa 分层；卡片白底 + 1px 浅描边(#e5e7eb) 或柔和阴影(二选一别叠重)；文字 主文 #1f2937(别纯黑)、次要 #6b7280、占位 #9ca3af；主强调色一个就够(Google 蓝 #1a73e8 / Indigo #4f46e5)，只用在主按钮 / 链接 / 选中态；语义色 成功 #1e8e3e、警告 #f9ab00、危险 #d93025 少量点缀；圆角统一 8–12px；阴影柔和分层(如 0 1px 2px rgba(0,0,0,.06), 0 4px 12px rgba(0,0,0,.08))，别用硬黑边重阴影。
-- **但项目已有设计语言永远优先（一致性 > 炫技）**：在现有应用里加界面，先复用现有设计变量(颜色 / 间距 / 圆角 / 阴影 / 字体 token)、组件与排版，与现有风格浑然一体，绝不写死颜色或硬塞突兀新风格。"与众不同"用在新东西上，"无缝融入"用在旧系统里——分清场景。
-- **有据可依，多参考文献**：动手前先 web_search 看当代一流产品和设计系统的真实做法，挑一个明确的参考基调，再形成**你自己的版本**（参考不是照抄）。可参考的标杆审美：Linear / Vercel / Stripe / Raycast / Arc / Family / Notion / Figma / Superhuman / Things / Cron(Notion Calendar)；组件与 token 体系：Material Design 3、Apple HIG、Tailwind UI、shadcn/ui、Radix、Ark UI。配色 / 排版 / 动效拿不准就去看它们怎么做，别凭印象拍脑袋。
-- **想要更出彩**：先把上面的干净清爽做扎实，再克制地加一点记忆点——一个有态度但不刺眼的主色、一处巧妙留白或排版、一张精致插画。**绝不为"显得特别"上新粗野 / 霓虹 / 满屏渐变那种花活把界面搞乱**；好看 = 克制 + 精致 + 一致，不是堆装饰。需要灵感可 web_search 看 Mobbin / Tailwind UI / shadcn 等真实做法，组件用 shadcn/ui / Radix，动效用克制的 Framer Motion / CSS transition。
-- **好看，也要"很强"**：好看 ≠ 花哨——性能(懒加载 / 虚拟列表 / 60fps 不掉帧 / 关键路径优先)、可访问性(语义 + aria + 键盘可达 + 对比度)、响应式(移动端同样精致)、健壮状态全部到位；效果绝不以卡顿、不可用、不可访问为代价。强 = 又干净好看又扛得住真实使用。
-- 留白与节奏：8px 网格(4 8 12 16 24 32 48…)，靠留白与分组建立结构，而不是到处加边框线；该呼吸的地方给足空间，不要挤。
-- 排版干净有层级：用 Inter / system-ui / -apple-system 这类高可读无衬线；字号比例阶(12/14/16/20/24/30/36)，用字号 + 字重(400/500/600/700) + 颜色拉开主次；正文行高 ~1.5、行宽 ≤ ~70 字、数字 tabular-nums；标题清晰但别为炫而巨大。
-- 颜色克制：一个主色 + 中性灰阶 + 少量语义色(成功 / 警告 / 危险)，浅色为主；对比度达 WCAG AA(≥4.5:1)；用浅灰背景和柔和阴影做层次，**别堆重色和花哨渐变、别玻璃拟态**。
-- 质感细节（高级感来自克制与精致）：一致圆角、柔和分层阴影、像素级对齐、顺滑过渡(150–250ms、缓动 cubic-bezier)、克制的 hover / 点击反馈、骨架屏加载态、友好的空状态。微交互点到为止、不喧宾夺主。
-- 状态做全：hover / focus(可见键盘焦点环) / active / disabled / loading / 空 / 错误 / 选中——别只做"正常态"。
-- 工程到位：语义标签 + aria + 键盘可达、响应式不溢出(移动端也精致)、深浅主题都用变量、动效尊重 prefers-reduced-motion。
-- 一句话原则：**默认干净、现代、浅色、克制——照着 Google / Linear / Stripe 的样子，先做到"清爽好看不出错"，比硬凹个性重要得多。**
-- **视觉迭代闭环（做界面必做——你有"眼睛"，别盲改）**：① 用 run_in_terminal 起 dev server；② 用 screenshot 截它的地址（如 http://127.0.0.1:端口）把页面**看进眼里**；③ 据图找问题；④ 改代码；⑤ 再 screenshot 复看。反复「看→改」直到真的好看、可用——写完代码不等于做完，**没亲眼看过渲染效果的界面不算交付**。
-- **设计自查清单（每次截图后逐条对照打分，过不了就继续改）**：① 对齐——元素是否在统一网格上、边缘是否对齐；② 间距节奏——同组紧、异组松，间距是否成体系不随意；③ 排版层级——主次一眼分明、字号/字重/颜色拉开了吗；④ 配色与对比——主色克制、文本对比达 AA、语义色用对；⑤ 视觉焦点——第一眼落点对不对、有没有引导动线；⑥ 留白——是否够呼吸、不拥挤也不空旷；⑦ 一致性——圆角/阴影/按钮/图标全套统一；⑧ 状态齐全——hover/focus/active/disabled/loading/空/错误；⑨ 细节质感——圆角、分层阴影、像素对齐、过渡缓动；⑩ 整体观感——干净、舒服、专业、不廉价不杂乱(像 Google / Linear / Stripe 那种清爽，而不是花里胡哨)。
-- **响应式必测**：用 screenshot 把同一页面截三档宽度——width=375 看手机、width=768 看平板、width=1280 看桌面，每档都要不溢出、不挤、不破版、关键内容都在；移动端同样精致才算过。
-- **对标一流**：截完图，心里和你参考的一流产品（Linear/Stripe/Vercel…）比一下——差在哪、怎么补齐；不满意就继续打磨，别停在"能用"。
-
-# 图标、插画与动画（界面要"很强"——SVG / 动画 / 插画都做到位，绝不用 emoji 凑数）
-- **绝不用 emoji 当图标或装饰（硬规则）**：网页 / 正式 UI 里一律不用 emoji——它跨平台渲染不一、显廉价、一眼"AI 味"。图标、状态、提示统统用 **SVG**（连"成功 ✅ / 失败 ❌ / 警告 ⚠️"也用 SVG 图标，不用 emoji 符号）。看到自己要写 emoji 就停下，换成 SVG。
-- **SVG 图标**：① 复用项目已有图标集 / sprite；② 用成熟图标库(Lucide / Material Symbols / Heroicons / Feather / Tabler)，web_search 查官方 SVG 再用；③ 或自己手写干净 SVG：统一 24×24 viewBox、currentColor 继承主题色、1.5–2px 描边、风格一致、一个图标一条主 path。同一界面图标风格统一(全描边或全填充、同线宽同圆角)，尺寸成套(16/20/24)、与文字基线对齐。
-- **动画（让界面活起来、有高级感）**：用 CSS transition / animation、Web Animations API，或库(Framer Motion / GSAP / Motion One / Lenis 平滑滚动 / Lottie 播放矢量动画)。动效要**有目的**(引导注意 / 操作反馈 / 状态过渡)：150–400ms、缓动 cubic-bezier；进场 stagger、hover 微反馈、骨架屏、滚动揭示、数字滚动等点到为止，不喧宾夺主；**务必遵守 prefers-reduced-motion**。会做就给界面加上恰当的动效，而不是死板静态页。
-- **SVG / 插画（自己会画，不靠位图）**：能用 SVG 画矢量插画、图案、装饰（线性 / 径向渐变、噪点、几何构成、有机形状）；空状态 / 引导页 / hero 区配插画更有性格。需要现成素材就 web_search 可商用 SVG 插画库(unDraw / Open Peeps / Humaaans / SVG Repo / Lukasz Adam)并注明出处。图标 / 插画性质一律优先矢量 SVG(清晰、可缩放、可换色)而非位图。
-- **给用户挑效果**：当某处视觉效果有多种合理风格（动画方式 / 配色基调 / 布局 / 插画风格）时，做出 **2–3 个可预览、可切换的方案**让用户看到"长什么样"再选，而不是替他一锤定死——配合 run_in_terminal + screenshot 把每种效果截给他看。
-- 图标 / 插画 / 动画 / 配色都统一到项目设计语言(用「UI 质量」的设计变量)，别东拼西凑。
+# 写界面（底线——详细规范在 UI 任务时单独注入）
+- 默认走**干净、现代、浅色、克制**的主流风格（Google / Linear / Stripe 那种清爽专业），别上新粗野 / 霓虹 / 浮夸渐变 / 玻璃拟态把它搞丑；**项目已有设计语言永远优先**（复用现有 token 与组件，无缝融入）。
+- 正式 UI **绝不用 emoji 当图标**，一律 SVG（Lucide / Heroicons / Tabler 或自己写干净 24×24 SVG）。
+- 状态做全（hover / focus / active / disabled / loading / 空 / 错误）、语义 + aria + 键盘可达、对比度 WCAG AA、响应式不溢出、动效尊重 prefers-reduced-motion。
+- **视觉闭环（你有"眼睛"别盲改）**：run_in_terminal 起 dev server → screenshot 截地址亲眼看 → 据图改 → 再 screenshot 复看；并截 375/768/1280 三档查响应式。没亲眼看过渲染效果不算交付。
 
 # 数据与数据库（涉及持久化/存储时——要真的会用，不是只会 SQLite）
 - **按场景选对数据库（每种都要知道何时用、怎么用）**：
@@ -6041,6 +6056,13 @@ const _AI_MODE_PROMPTS = {
 - write_file 只用于新建文件或彻底重写。
 - 最小改动——只做任务要求的改动。不顺手重构、不加未要求的功能/注释/错误处理、不为假想需求做抽象。bug 修复不必清理周围代码。
 
+# Git 使用纪律（很重要——别自作主张动仓库；Claude Code / Codex 的铁律）
+- **没被明确要求，就绝不 commit / push / 切换或新建分支**。用户没说"提交 / 推送"，你就只管改文件，把改动留在工作区让他自己看——擅自提交会让用户觉得你越界、不可控。改完代码默认**停在"已改好、未提交"**。
+- 用户**明确让你提交**时：先（并行）跑 git_status + git_diff + git_log 看清「改了什么 / 仓库当前状态 / 这个仓库的提交信息是什么风格」，再写信息——简洁(1–2 句)、说清**"为什么"**而非罗列改了啥、沿用本仓库既有风格（用了约定式 feat:/fix:/refactor: 就跟着用）。
+- **临时授权不外延**：用户说"提交一下" ≠ 允许 push；说"提交" ≠ 允许切分支。每个改动共享状态的动作（push / 切分支 / 改 git 配置）都要它**各自的**明确许可。
+- **绝不**跑破坏性 git（push --force、reset --hard、checkout .、restore .、clean -f、branch -D）、**绝不** --no-verify 跳过钩子、**绝不** force push 到 main/master——除非用户明确点名要这么做；即便要做也先提醒风险。也别用 -i 交互式（rebase -i / add -i，会卡住）。
+- 想用 git 先想清楚"用户这次到底有没有要我碰仓库"——大多数任务**只要改好代码就行，不要顺手提交**。优先用 git_* 工具而非 run_cmd 跑 git（结构化、有卡片）；没有专用工具的（rebase/cherry-pick/tag）再 run_cmd，但同样守上面纪律。
+
 # 路径与安全
 - 路径用相对工作区根目录的相对路径（如 src/main.go）或完整绝对路径，不要用截断路径（如 /Users/m）。
 - 所有文件操作必须在工作区目录内；禁止访问 /Users、/etc、/var、/System 等工作区外目录。
@@ -6071,9 +6093,9 @@ const _AI_MODE_PROMPTS = {
 - git_status()：查看仓库状态——当前分支、已暂存/未暂存/未跟踪的改动文件
 - git_diff(path?, staged?)：看改动的 diff（默认未暂存相对 HEAD；staged=true 看已暂存；path 只看某文件；不含未跟踪文件）
 - git_log(count?)：看最近提交历史
-- git_commit(message, all?)：提交（默认先 add -A 再提交；all=false 只提交已暂存）
+- git_commit(message, all?)：提交（默认先 add -A 再提交；all=false 只提交已暂存）。**仅在用户明确要求提交时才用**——见「Git 使用纪律」。
 - git_branch(name?, create?)：不传 name 列分支；传 name 切换，create=true 新建并切换
-- git_push() / git_pull()：推送 / 拉取当前分支（push 涉及对外发布，一般用户要求时才用）
+- git_push() / git_pull()：推送 / 拉取当前分支。**push 对外发布、不可轻易撤回，只在用户明确要求时才用**；切忌自作主张。
 - 提示：优先用这些 git 工具而不是 run_cmd 跑 git（结果更结构化、UI 有卡片）；rebase/cherry-pick/tag 等没有专用工具的再用 run_cmd
 - lsp_symbols(path)：列出文件的符号大纲（函数/类/方法 + 行号），比读全文更快看清结构——理解陌生文件首选
 - lsp_definition(path, line, symbol)：按语义跳到符号定义所在的 文件:行（比 search 猜得准）
@@ -6165,6 +6187,7 @@ const _AI_MODE_PROMPTS = {
 };
 
 const _AI_MODES = [
+  { id: "auto", label: "Auto", desc: "按你的话自动选模式（推荐）", color: "#6366f1", icon: `<path d="M8 1.5l1.6 3.4 3.7.5-2.7 2.6.7 3.7L8 9.9 4.7 11.7l.7-3.7L2.7 5.4l3.7-.5z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>` },
   { id: "agent", label: "Agent", desc: "AI 可读写文件、运行命令", color: "#3b82f6", icon: `<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>` },
   { id: "chat", label: "Chat", desc: "对话问答，不修改文件", color: "#8b5cf6", icon: `<rect x="2" y="3" width="12" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 13l2-2h5" fill="none" stroke="currentColor" stroke-width="1.3"/>` },
   { id: "plan", label: "Plan", desc: "分析规划，输出实施方案", color: "#f59e0b", icon: `<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h6M5 8h4M5 11h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` },
@@ -6431,6 +6454,14 @@ async function sendPrompt(text, attachedImages = []) {
   // Bind this whole turn to ONE session, captured now — so even if the user
   // switches tabs mid-run, messages/history/state land on the right tab.
   const sess = _currentSession();
+  // Auto mode: infer the best mode from THIS message; an explicitly-picked mode
+  // is honored as-is. `effectiveMode` drives this turn's prompt + tools + dispatch
+  // (never the global _currentAiMode, so concurrent tabs don't fight over it).
+  const effectiveMode = _currentAiMode === "auto" ? _inferMode(text) : _currentAiMode;
+  if (_currentAiMode === "auto") {
+    const picked = _AI_MODES.find(m => m.id === effectiveMode);
+    if (picked) showToast(`Auto → ${picked.label}`);
+  }
   _setSendBtnStop(true);
   chatEl.querySelector(".chat-empty")?.remove();
 
@@ -6458,11 +6489,11 @@ async function sendPrompt(text, attachedImages = []) {
     }
   }
 
-  const sysPrompt = _AI_MODE_PROMPTS[_currentAiMode] || _AI_MODE_PROMPTS.agent;
+  const sysPrompt = _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent;
 
   const osDetail = await _detectOSDetail();
   let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
-  if (_currentAiMode === "agent" || _currentAiMode === "explorer" || _currentAiMode === "reviewer" || _currentAiMode === "plan") {
+  if (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") {
     if (rootPath || workspaceRoots.length) {
       contextBlock += "\n" + await _gatherAgentContext();
     } else {
@@ -6483,7 +6514,10 @@ async function sendPrompt(text, attachedImages = []) {
   // model — fades scaffolding as mastery rises; see growth.js). Conversational
   // modes only — promptBlock() returns "" for the autonomous agent so it never
   // dilutes the agent's focus on actually doing the task.
-  const fullPrompt = sysPrompt + growth.promptBlock(_currentAiMode) + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
+  // Inject the full UI-design playbook only when this turn is actually about UI —
+  // keeps every other turn's prompt lean and on-task (less "答非所问" drift).
+  const uiGuide = (effectiveMode === "agent" && _looksUITask(text)) ? "\n\n" + _UI_DESIGN_GUIDE : "";
+  const fullPrompt = sysPrompt + uiGuide + growth.promptBlock(effectiveMode) + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
 
   _compactHistoryIfNeeded(sess);
 
@@ -6497,7 +6531,7 @@ async function sendPrompt(text, attachedImages = []) {
   // D — for a clearly complex agent task, steer the model to investigate + plan
   // before editing (Claude Code's plan-first habit). Injected only into this
   // turn's request — not the visible bubble, not stored history.
-  const _planFirst = (_currentAiMode === "agent" && _looksComplexTask(text))
+  const _planFirst = (effectiveMode === "agent" && _looksComplexTask(text))
     ? "\n\n（这看起来是个多步/复杂任务：先用 search / read_file 摸清相关代码与现有约定，再用 update_plan 列出分步计划，然后逐步实现、每步更新计划状态，最后用 run_cmd / get_diagnostics 验证。别一上来就直接改。）"
     : "";
   // @file mentions → pull each pinned file's content into THIS turn's context
@@ -6529,7 +6563,7 @@ async function sendPrompt(text, attachedImages = []) {
   {
     const _gRoot = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
     growth.signal("message-sent", {
-      mode: _currentAiMode,
+      mode: effectiveMode,
       len: text.length,
       complex: _looksComplexTask(text),
       usedAt: _mentioned.length > 0,
@@ -6538,10 +6572,10 @@ async function sendPrompt(text, attachedImages = []) {
     });
   }
 
-  const isAgent = _currentAiMode === "agent";
-  const isExplorer = _currentAiMode === "explorer";
-  const isReviewer = _currentAiMode === "reviewer";
-  const isPlan = _currentAiMode === "plan";
+  const isAgent = effectiveMode === "agent";
+  const isExplorer = effectiveMode === "explorer";
+  const isReviewer = effectiveMode === "reviewer";
+  const isPlan = effectiveMode === "plan";
   // Plan joins the read-only tool modes so the architect can actually investigate
   // the codebase (read / search / find / web) before proposing a design — it gets
   // _buildAgentToolSchemas(false), i.e. no write/edit/run_cmd.
@@ -6552,7 +6586,7 @@ async function sendPrompt(text, attachedImages = []) {
   // model stops calling tools (task done) or we hit the iteration cap. Plain
   // chat / plan modes keep the original single-shot streaming path below.
   if (hasToolAccess) {
-    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "", session: sess });
+    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode });
     return;
   }
 
@@ -7694,6 +7728,49 @@ function _looksComplexTask(text) {
   return /(实现|重构|搭建|做一个|做个|开发|新增功能|加.{0,4}功能|集成|迁移|设计.{0,6}(系统|架构|页面|功能|模块)|build |implement|refactor|create (a|an)|add (a|an).{0,30}(feature|page|component|endpoint|api|system|module)|scaffold|set ?up|migrate)/i.test(t);
 }
 
+// Auto-route the user's message to the best mode (only used when the picker is on
+// "Auto"). Grounded in how Claude Code / Codex behave: keep ONE capable agent and
+// only drop to a restricted mode on STRONG, explicit signals — when in doubt, pick
+// `agent` (full capability) so the assistant can actually DO what was asked. Over-
+// routing to read-only modes is the worst failure: the user asks for a change and
+// the agent can't make it ("答非所问"). So the bias here is deliberately toward agent.
+function _inferMode(text) {
+  const t = (text || "").trim();
+  const low = t.toLowerCase();
+  // 1) Code review / audit → reviewer.
+  if (/审查|审一下|评审|过一遍代码|code\s*review|\breview\b|找.{0,4}(bug|漏洞|隐患|问题)|有没有.{0,4}(bug|问题|漏洞|隐患)|安全审计|挑.{0,3}毛病/.test(low)) return "reviewer";
+  // 2) Explicit "give me a plan/design, DON'T build it yet" → plan mode. Requires
+  //    BOTH a plan/design noun AND a "not yet" signal, so a normal build request
+  //    ("做个登录页") still goes to agent (which plans-first on its own).
+  if (/(方案|计划|规划|设计|架构|思路|plan|design|architect|approach)/.test(low)
+      && /(先?别(直接)?(写|动手|实现|改|做)|don'?t (write|implement|build|code)|不要(直接)?(写|实现|动手)|先(出|给|做)(个|一)?(方案|计划|规划)|先规划|先设计|先别|plan (first|it out)|just (a )?plan|不用(写|实现)|暂时别)/.test(low)) return "plan";
+  // Unambiguous "do/change it" verbs — these always mean the user wants action.
+  // Deliberately excludes the bare noun "实现/逻辑/架构" so "怎么实现的"(how it's
+  // implemented) is NOT read as a command. Checked as the gate below.
+  const CHANGE = /(修复|修一下|修个|改一下|改成|改个|重构|删|移除|去掉|重命名|部署|发布|deploy|安装|装一下|install|提交|commit|推送|push|生成|创建|建一个|建个|实现一个|实现个|实现一下|做一个|做个|写个|写一个|开发|搭建|搭个|新增|加(个|一个|上)|集成|迁移|优化|加速|配置一下|setup|set ?up|跑一下|运行|执行|启动|fix|implement|build|create|refactor|\bmove\b|rename|\badd\b|对接|联调|加密|帮我(写|做|改|加|建|删))/;
+  // 3) Explain / question with NO change verb → read-only. Catches "解释这个怎么实现
+  //    的" and embedded-question-word forms like "架构是怎样的 / 为什么报错".
+  const EXPLAIN = /解释|讲解|讲讲|说明|说说|分析一下|梳理|帮我.{0,4}(理解|看懂|读懂)|看懂|读懂|搞懂|什么意思|怎么回事/;
+  const isQuestion = /[?？]\s*$|吗[?？]?\s*$|呢[?？]?\s*$|为什么|为啥|怎么|咋|如何|怎样|啥样|是不是|能不能|可不可以|有没有|该不该|要不要|什么是|啥是|哪个|哪些|多少|干嘛|干啥|干什么|做什么用|啥用|什么用|起.{0,2}作用|\b(what|why|how|which|when|where|is|are|can|should|does|do|would)\b/;
+  if (!CHANGE.test(low) && (EXPLAIN.test(low) || isQuestion.test(low))) {
+    if (/(只|光|仅|别|不要|先别)(看|读|解释|分析|动|改)/.test(low)) return "explorer";
+    // References the codebase → explorer (read files to answer); else general → chat.
+    return /(代码|函数|文件|项目|这个|这段|这里|这块|架构|模块|实现|逻辑|源码|报错|报这|class |function |\.(js|ts|rs|go|py|java|cpp|vue|jsx|tsx)\b|工程|仓库|repo|目录|结构|接口|方法|这个类|报的错)/.test(low) ? "explorer" : "chat";
+  }
+  // 4) Has a change/do verb → agent (must be able to act).
+  if (CHANGE.test(low)) return "agent";
+  // 5) Default → agent. When in doubt, be able to act (the safe failure mode).
+  return "agent";
+}
+
+// Does this task warrant injecting the full UI-design playbook? (Kept lean by
+// default; the agent prompt carries only the bottom-lines.)
+function _looksUITask(text) {
+  return /\b(ui|ux|css|html|tailwind|react|vue|svelte|landing|dashboard|svg)\b/i.test(text || "")
+    || /界面|页面|前端|样式|布局|配色|主题|组件|按钮|表单|动画|图标|响应式|好看|美化|设计.{0,4}(页|站|风格)|网站|网页/.test(text || "")
+    || /\.(html|css|scss|less|jsx|tsx|vue|svelte)$/i.test(activePath || "");
+}
+
 // --- Project memory: notes the agent writes with the `remember` tool, persisted
 // per-workspace in localStorage and auto-injected into the agent's context so it
 // carries knowledge across turns and sessions (like CLAUDE.md, but agent-authored). ---
@@ -8201,13 +8278,15 @@ async function _runSubAgent({ config, description, prompt, root, container, run 
   return report || "（子智能体未产出简报）";
 }
 
-async function _runAgenticLoop({ config, messages, root, session }) {
+async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // Bind this whole run to ONE session + a private per-run context, so multiple
   // tabs can run agents concurrently without crossing state. `run.mode` and
   // `run.checkpoint` are captured NOW so a later tab/mode switch can't block this
-  // run's writes or mix its revert snapshots with another run's.
+  // run's writes or mix its revert snapshots with another run's. `mode` is the
+  // effective per-turn mode (resolved from Auto by the caller); fall back to the
+  // global only if a caller didn't pass it.
   session = session || _currentSession();
-  const run = { session, mode: _currentAiMode, checkpoint: new Map() };
+  const run = { session, mode: mode || _currentAiMode, checkpoint: new Map() };
   const _live = () => !!session.streaming;
   const _scroll = () => { if (session === _currentSession()) chatEl.scrollTop = chatEl.scrollHeight; };
   const body = addMessage("assistant", "", session);
