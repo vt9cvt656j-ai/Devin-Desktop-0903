@@ -6542,10 +6542,16 @@ async function sendPrompt(text, attachedImages = []) {
     if (picked) showToast(`Auto → ${picked.label}`);
   }
   _setSendBtnStop(true);
+  // Mark this session streaming NOW — BEFORE any pre-processing await — so the
+  // Stop button is live through the whole turn and a hang in compaction / context
+  // gathering can be interrupted (was: streaming only set later, so an early hang
+  // left a dead Stop button + no response).
+  sess.streaming = true;
   chatEl.querySelector(".chat-empty")?.remove();
 
   // Compact a long conversation before this turn (summarize older history).
-  await _compactHistoryIfHuge(config, sess);
+  // Hard-bounded: a slow summary call must never silently hang the send.
+  try { await Promise.race([_compactHistoryIfHuge(config, sess), new Promise((r) => setTimeout(r, 20000))]); } catch {}
 
   // Keep the active chat's project label in sync with the folder it's actually
   // operating on (handles opening a different project mid-conversation).
@@ -6588,7 +6594,8 @@ async function sendPrompt(text, attachedImages = []) {
   let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
   if (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") {
     if (rootPath || workspaceRoots.length) {
-      contextBlock += "\n" + await _gatherAgentContext(text);
+      // Bounded: a slow context build (file reads / tree scan) must not hang the send.
+      try { contextBlock += "\n" + (await Promise.race([_gatherAgentContext(text), new Promise((r) => setTimeout(() => r(""), 20000))]) || ""); } catch {}
     } else {
       contextBlock += "\n(未打开工作区文件夹)";
     }
@@ -6679,12 +6686,23 @@ async function sendPrompt(text, attachedImages = []) {
   // _buildAgentToolSchemas(false), i.e. no write/edit/run_cmd.
   const hasToolAccess = isAgent || isExplorer || isReviewer || isPlan;
 
+  // If the user hit Stop during the (bounded) pre-processing above, abort cleanly.
+  if (!sess.streaming) { if (sess === _currentSession()) _setSendBtnStop(false); return; }
+
   // Tool-capable modes (agent / explorer / reviewer) run the real multi-turn
   // agentic loop: think → call tools → feed results back → repeat until the
   // model stops calling tools (task done) or we hit the iteration cap. Plain
   // chat / plan modes keep the original single-shot streaming path below.
   if (hasToolAccess) {
-    await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode });
+    try {
+      await _runAgenticLoop({ config, messages, root: rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode });
+    } catch (e) {
+      // Never leave a dead Stop button + silent no-response on an unexpected throw.
+      console.error("[agent] run failed:", e);
+      sess.streaming = false;
+      if (sess === _currentSession()) _setSendBtnStop(false);
+      try { addMessage("assistant", `⚠️ 运行出错：${String(e?.message || e)}`, sess); } catch {}
+    }
     return;
   }
 
