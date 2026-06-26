@@ -3388,17 +3388,34 @@ function handleFsChanges(paths) {
   refreshGitStatus();
 }
 
-async function addFolderToWorkspace() {
-  const picked = await backend.pickFolder();
+// Add one more project folder to the (multi-root) workspace WITHOUT closing the
+// others — this is "open multiple projects". Kept separate from openFolder, which
+// replaces the workspace.
+async function _addWorkspaceRoot(picked) {
   if (!picked) return;
-  if (!workspaceRoots.includes(picked)) workspaceRoots.push(picked);
+  if (workspaceRoots.includes(picked)) { setActiveWorkspaceRoot(picked); showToast(`${basename(picked)} 已在工作区`); return; }
+  workspaceRoots.push(picked);
   try { await backend.registerWorkspaceRoot(picked); } catch { /* browser preview */ }
   _ipcBroadcast("workspace_changed", { roots: [...workspaceRoots], active: picked });
   setActiveWorkspaceRoot(picked);
   await renderWorkspaceRoots();
   preloadProjectModels(picked);
   await refreshGitStatus();
-  showToast(`Added ${basename(picked)} to workspace`);
+  startFileWatcher();
+  addRecentProject(picked);
+  scheduleSaveSession();
+  showToast(`已添加 ${basename(picked)} 到工作区`);
+}
+
+async function addFolderToWorkspace() {
+  let picked = null;
+  try { picked = await backend.pickFolder(); }
+  catch { picked = null; } // native dialog unavailable on this desktop
+  if (picked) { await _addWorkspaceRoot(picked); return; }
+  // Same robust fallback as opening a folder: when the OS picker is unavailable
+  // (Linux without xdg-desktop-portal) or cancelled, show the manual path entry
+  // so multi-project actually works instead of the button doing nothing.
+  await _promptFolderPath({ title: "添加文件夹到工作区", onPick: _addWorkspaceRoot });
 }
 
 // Eagerly load the workspace's JS/TS/JSON files into the TypeScript language
@@ -5477,6 +5494,49 @@ function _renderChatTabs() {
   tabBar.appendChild(addBtn);
 }
 
+// Render a (restored) session's saved history into its OWN DOM container the
+// first time that tab is shown. Lazy: startup and tab-switching each pay for
+// only one tab, never all of them. Capped at _RENDER_LIMIT rendered bubbles so
+// a long thread can't freeze the UI — the FULL history always stays in
+// session.history for the agent's context, only the DOM is trimmed.
+const _RENDER_LIMIT = 80;
+function _renderMsgRange(session, from, to) {
+  const h = session.history || [];
+  for (let i = from; i < to; i++) {
+    const m = h[i];
+    if (m && m.content != null) {
+      addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session);
+    }
+  }
+}
+function _renderSessionHistory(session) {
+  if (!session || session._rendered) return;
+  session._rendered = true; // mark first, so a re-entrant switch can't double-render
+  const h = Array.isArray(session.history) ? session.history : [];
+  if (!h.length) return;
+  const start = Math.max(0, h.length - _RENDER_LIMIT);
+  if (start > 0) {
+    // Don't render hundreds of markdown bubbles on startup (that's a real freeze
+    // on weak machines) — show the last _RENDER_LIMIT and a button to load the
+    // rest on demand. The FULL history is always in session.history for context.
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "chat-earlier-note";
+    more.style.cssText = "display:block;width:max-content;margin:8px auto;padding:5px 12px;border:1px solid var(--border,rgba(128,128,128,.3));border-radius:999px;background:var(--panel,transparent);color:var(--text-dim,#6b7280);font:12px system-ui,sans-serif;cursor:pointer;opacity:.85";
+    more.textContent = `↑ 加载更早的 ${start} 条消息`;
+    more.addEventListener("click", () => {
+      more.disabled = true;
+      // User-initiated full re-render (rare): clear and lay out the whole thread
+      // oldest→newest so nothing is missing and ordering stays correct.
+      while (session.container.firstChild) session.container.removeChild(session.container.firstChild);
+      _renderMsgRange(session, 0, h.length);
+      if (session === _currentSession() && chatEl) chatEl.scrollTop = 0;
+    });
+    session.container.appendChild(more);
+  }
+  _renderMsgRange(session, start, h.length);
+}
+
 function _switchChatSession(idx) {
   if (idx === _activeChatIdx || idx < 0 || idx >= _chatSessions.length) return;
   if (_activeChatIdx >= 0 && _chatSessions[_activeChatIdx]) {
@@ -5486,6 +5546,7 @@ function _switchChatSession(idx) {
   }
   _activeChatIdx = idx;
   const session = _chatSessions[idx];
+  _renderSessionHistory(session); // restored tabs render here, on first view
   session.container.hidden = false;
   _currentAiMode = session.mode;
   _updateModeUI();
@@ -5558,7 +5619,10 @@ async function saveChatHistory() {
     const data = _chatSessions.map(s => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
       project: s.project || "",
-      history: s.history.slice(-30),
+      // Persist a generous window so a long conversation isn't truncated on
+      // restart (text-only, so it stays small). Was 30 — that silently dropped
+      // everything older the moment a chat passed 30 messages.
+      history: s.history.slice(-300),
       created: s.created,
     }));
     await store.set(CHAT_STORE_KEY, { sessions: data, activeIdx: _activeChatIdx });
@@ -5590,15 +5654,10 @@ async function restoreChatHistory() {
         }
         _chatSessions.push(session);
       }
+      // _switchChatSession lazily renders the active tab's history into its
+      // container (and every other tab renders the first time you click it).
       const activeIdx = saved.activeIdx ?? 0;
       _switchChatSession(Math.min(activeIdx, _chatSessions.length - 1));
-
-      const session = _currentSession();
-      if (session) {
-        for (const m of session.history) {
-          addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
-        }
-      }
     } else if (Array.isArray(saved) && saved.length > 0) {
       const session = _newChatSession("Chat 1");
       for (const m of saved) {
@@ -6152,8 +6211,8 @@ function _estimateTokens(text) {
   return Math.ceil(text.length / 3.5);
 }
 
-function _compactHistoryIfNeeded() {
-  const h = _getHistory();
+function _compactHistoryIfNeeded(session) {
+  const h = (session || _currentSession())?.history;
   if (!h || h.length === 0) return;
 
   const MAX_HISTORY_TOKENS = 24000;
@@ -6376,7 +6435,7 @@ async function sendPrompt(text, attachedImages = []) {
   chatEl.querySelector(".chat-empty")?.remove();
 
   // Compact a long conversation before this turn (summarize older history).
-  await _compactHistoryIfHuge(config);
+  await _compactHistoryIfHuge(config, sess);
 
   // Keep the active chat's project label in sync with the folder it's actually
   // operating on (handles opening a different project mid-conversation).
@@ -6426,7 +6485,7 @@ async function sendPrompt(text, attachedImages = []) {
   // dilutes the agent's focus on actually doing the task.
   const fullPrompt = sysPrompt + growth.promptBlock(_currentAiMode) + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
 
-  _compactHistoryIfNeeded();
+  _compactHistoryIfNeeded(sess);
 
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
@@ -6802,13 +6861,13 @@ async function sendPrompt(text, attachedImages = []) {
           _segRendered++;
         }
         const historyContent = acc + (_pendingToolCalls.length ? "\n" + _pendingToolCalls.map(c => `[TOOL:${c.type === "read" ? "read_file" : c.type === "list" ? "list_dir" : c.type === "cmd" ? "run_cmd" : "write_file"}] ${c.path || c.command || ""}`).join("\n") : "");
-        if (!err && historyContent.trim()) { history.push({ role: "assistant", content: historyContent }); saveChatHistory(); }
+        if (!err && historyContent.trim()) { sess.history.push({ role: "assistant", content: historyContent }); saveChatHistory(); }
         await Promise.allSettled(_toolPromises);
         const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
-        if (readResults.length) _agentFollowUp(readResults, body);
+        if (readResults.length) _agentFollowUp(readResults, body, sess);
       } else {
         renderMarkdownInto(body, acc, { highlighter: highlightCode });
-        if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
+        if (!err) { sess.history.push({ role: "assistant", content: acc }); saveChatHistory(); }
       }
     }
     if (err) {
@@ -7774,14 +7833,18 @@ function _trimMessagesIfHuge(messages) {
  * (no tool_call structure), so replacing a prefix is structurally safe. Guarded:
  * any failure falls back to a short marker rather than touching the structure.
  */
-async function _compactHistoryIfHuge(config) {
-  if (!Array.isArray(history) || history.length < 8) return;
+async function _compactHistoryIfHuge(config, session) {
+  // Operate on the OWNING session's history, captured by the caller — this awaits
+  // a summary call, and if the user switches tabs mid-await the global `history`
+  // proxy would point at a different session and we'd splice the wrong one.
+  const hist = (session || _currentSession())?.history;
+  if (!Array.isArray(hist) || hist.length < 8) return;
   let total = 0;
-  for (const m of history) total += m.content ? String(m.content).length : 0;
+  for (const m of hist) total += m.content ? String(m.content).length : 0;
   if (total < 60000) return;
   const KEEP = 4;
-  if (history.length <= KEEP + 2) return;
-  const older = history.slice(0, history.length - KEEP);
+  if (hist.length <= KEEP + 2) return;
+  const older = hist.slice(0, hist.length - KEEP);
   const transcript = older.map((m) => `[${m.role}] ${String(m.content || "").slice(0, 4000)}`).join("\n\n").slice(0, 50000);
   let summary = "";
   try {
@@ -7793,7 +7856,7 @@ async function _compactHistoryIfHuge(config) {
   const note = summary && summary.trim()
     ? "【早先对话的压缩摘要】\n" + summary.trim()
     : "【早先对话较长，已省略以节省上下文】";
-  history.splice(0, older.length, { role: "assistant", content: note });
+  hist.splice(0, older.length, { role: "assistant", content: note });
   try { saveChatHistory(); } catch {}
 }
 
@@ -9632,9 +9695,13 @@ async function _highlightDiffView(container) {
   }
 }
 
-async function _agentFollowUp(toolResults, container) {
+async function _agentFollowUp(toolResults, container, session) {
   const config = loadConfig();
   if (!config.baseUrl || !config.apiKey) return;
+  // Bind to the owning session so this follow-up's context + saved reply land on
+  // the right tab even if the user switches away mid-stream.
+  const sess = session || _currentSession();
+  const _hist = sess?.history || [];
 
   const followUpCtx = toolResults.map(r => {
     if (r.type === "read") return `--- 文件: ${r.path} ---\n${r.content}`;
@@ -9651,7 +9718,7 @@ async function _agentFollowUp(toolResults, container) {
 
   const messages = [
     { role: "system", content: _AI_MODE_PROMPTS.agent },
-    ...history,
+    ..._hist,
     { role: "user", content: `以下是工具执行结果（文件内容、目录列表、命令输出），请根据这些信息继续完成任务：\n\n${followUpCtx}` },
   ];
 
@@ -9697,7 +9764,7 @@ async function _agentFollowUp(toolResults, container) {
   if (acc) {
     const segs = _parseStreamSegments(acc);
     while (_segR2 < segs.length) { _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms); _segR2++; }
-    if (!err) { history.push({ role: "assistant", content: acc }); saveChatHistory(); }
+    if (!err) { _hist.push({ role: "assistant", content: acc }); saveChatHistory(); }
   }
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -12511,8 +12578,12 @@ async function chooseFolder() {
 }
 
 // Manual "open folder" via typed/pasted path + recent list — the reliable
-// fallback when the OS file picker is unavailable.
-async function _promptFolderPath() {
+// fallback when the OS file picker is unavailable. `onPick` lets the same modal
+// either OPEN a project (default, replaces the workspace) or ADD a folder to the
+// current multi-root workspace; `title` labels it accordingly.
+async function _promptFolderPath(opts) {
+  const onPick = (opts && opts.onPick) || openFolder;
+  const title = (opts && opts.title) || "打开文件夹";
   let home = "";
   try { home = (await backend.homeDir()) || ""; } catch {}
   home = home || rootPath || "";
@@ -12526,7 +12597,7 @@ async function _promptFolderPath() {
   modal.innerHTML =
     `<div style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border,rgba(128,128,128,.25))">` +
       `<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>` +
-      `<span style="font-size:14px;font-weight:600">打开文件夹</span>` +
+      `<span style="font-size:14px;font-weight:600">${title}</span>` +
       `<button class="pf-close" type="button" style="margin-left:auto;background:none;border:none;color:inherit;cursor:pointer;font-size:16px;opacity:.6">✕</button>` +
     `</div>` +
     `<div style="padding:12px 14px">` +
@@ -12553,7 +12624,7 @@ async function _promptFolderPath() {
     try { await backend.readDir(p); }
     catch { errEl.textContent = "找不到这个文件夹（检查路径是否写对）"; return; }
     close();
-    await openFolder(p);
+    await onPick(p);
   };
   modal.querySelector(".pf-close").addEventListener("click", close);
   modal.querySelector(".pf-cancel").addEventListener("click", close);
