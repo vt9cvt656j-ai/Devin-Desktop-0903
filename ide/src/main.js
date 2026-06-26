@@ -6017,6 +6017,7 @@ const _AI_MODE_PROMPTS = {
 - 正式 UI **绝不用 emoji 当图标**，一律 SVG（Lucide / Heroicons / Tabler 或自己写干净 24×24 SVG）。
 - 状态做全（hover / focus / active / disabled / loading / 空 / 错误）、语义 + aria + 键盘可达、对比度 WCAG AA、响应式不溢出、动效尊重 prefers-reduced-motion。
 - **视觉闭环（你有"眼睛"别盲改）**：run_in_terminal 起 dev server → screenshot 截地址亲眼看 → 据图改 → 再 screenshot 复看；并截 375/768/1280 三档查响应式。没亲眼看过渲染效果不算交付。
+- **做完功能就录一段演示给用户看（强烈建议，尤其 UI / 可交互功能）**：功能做好并验证通过后，用 start_demo 开录 → 用 browser（网页）或 computer（桌面）**真实地走一遍关键流程**（打开 → 点 → 填 → 看结果，每个动作自动录成一帧真截图）→ stop_demo 收尾。系统会把这段**一步步回放展示给用户**，并存成可打开播放的录屏文件。让用户**亲眼看到"它真的跑起来了、长这样、怎么用"**，比你用文字说"做好了"强得多。
 
 # 数据与数据库（涉及持久化/存储时——要真的会用，不是只会 SQLite）
 - **按场景选对数据库（每种都要知道何时用、怎么用）**：
@@ -6089,6 +6090,7 @@ const _AI_MODE_PROMPTS = {
 - web_fetch(url)：抓取公网网页正文，读 web_search 找到的页面或已知文档 URL（仅 http/https 公网）
 - http_request(method, url, headers?, body?)：**调任意 HTTP API——用各种网上工具/在线服务的关键能力**。GET/POST/PUT/PATCH/DELETE，返回状态码+响应头+响应体。用来：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回，别只靠猜)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST）；③ 发 webhook。和 web_fetch 的区别：web_fetch 只读公网网页正文(GET)，http_request 能任意方法+headers+body、且**允许 localhost/局域网**(方便测自己服务)。需桌面 App。
 - download_file(url, dest)：从 http/https 下载文件存进工作区(图片/字体/数据集/二进制)。dest 为相对工作区根的路径，最大 200MB。需桌面 App。
+- start_demo(title?) / stop_demo(path?)：**录功能演示 / 真实录屏**。start_demo 开录，然后用 browser/computer/screenshot 真走一遍功能流程(每个动作录一帧真截图)，stop_demo 收尾——系统会把步骤**一步步回放展示给用户**并存成可打开播放的 HTML 录屏文件。做完功能演示效果时用。
 - **MCP 外部工具（mcp__服务名__工具名）**：如果工具列表里出现 mcp__ 开头的工具，那是用户在 .mcp.json 里接入的外部 MCP 服务（数据库、GitHub、Slack、第三方 API 等）。它们和内置工具一样调用——遇到相关任务**优先用这些专用 MCP 工具**（比自己拼命令/HTTP 更准），按各自的参数 schema 传参即可。
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
@@ -7635,6 +7637,107 @@ async function _ensureMcpTools() {
   if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
 }
 
+// --- Demo recorder: capture the REAL feature in action as a step-by-step
+// walkthrough. While recording, every browser/computer/screenshot frame the agent
+// produces is collected with a caption; on stop we (a) play it back step-by-step
+// right in the chat and (b) save a self-contained, openable HTML "recording" into
+// the workspace. This is how the agent SHOWS the user what it built, working. ---
+let _demoRec = { active: false, title: "", frames: [] };
+const _DEMO_MAX_FRAMES = 80;
+
+function _demoCaptionFor(call) {
+  const t = call && call.type;
+  if (t === "browser") {
+    const a = call.action || "screenshot";
+    if (a === "navigate") return `打开页面 ${call.url || ""}`.trim();
+    if (a === "click") return `点击 ${call.selector || ""}`.trim();
+    if (a === "type") return `输入「${(call.text || "").slice(0, 30)}」`;
+    if (a === "press") return `按键 ${call.key || "Enter"}`;
+    if (a === "eval") return "在页面里运行脚本";
+    return "查看页面";
+  }
+  if (t === "computer") {
+    const a = call.action || "screenshot";
+    if (a === "click" || a === "double_click") return `点击屏幕 (${call.x},${call.y})`;
+    if (a === "type") return `输入「${(call.text || "").slice(0, 30)}」`;
+    if (a === "key") return `按键 ${call.key || ""}`;
+    if (a === "move") return `移动到 (${call.x},${call.y})`;
+    if (a === "scroll") return "滚动屏幕";
+    return "查看屏幕";
+  }
+  if (t === "screenshot") return `截图 ${call.url || ""}`.trim();
+  return "步骤";
+}
+
+function _demoCollectFrame(call, rawResult) {
+  if (!_demoRec.active || !rawResult || !rawResult.image) return;
+  if (_demoRec.frames.length >= _DEMO_MAX_FRAMES) return;
+  _demoRec.frames.push({ img: rawResult.image, caption: _demoCaptionFor(call) });
+}
+
+// Interactive step player rendered inside the chat (prev/next + autoplay).
+function _buildDemoPlayer(frames, title) {
+  const wrap = document.createElement("div");
+  wrap.className = "demo-player";
+  wrap.style.cssText = "margin:8px 0;border:1px solid var(--border,rgba(128,128,128,.3));border-radius:10px;overflow:hidden;background:var(--panel,#fff)";
+  const header = document.createElement("div");
+  header.style.cssText = "display:flex;align-items:center;gap:8px;padding:7px 11px;font:600 12px system-ui;border-bottom:1px solid var(--border,rgba(128,128,128,.2))";
+  header.innerHTML = `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#d93025"></span><span>演示回放 · ${_escHtml(title)}</span><span class="dp-step" style="margin-left:auto;opacity:.6;font-weight:400"></span>`;
+  const imgWrap = document.createElement("div");
+  imgWrap.style.cssText = "background:#0b0b0d;display:flex;align-items:center;justify-content:center;min-height:120px";
+  const img = document.createElement("img");
+  img.style.cssText = "max-width:100%;max-height:380px;display:block";
+  imgWrap.appendChild(img);
+  const cap = document.createElement("div");
+  cap.style.cssText = "padding:7px 11px;font:13px/1.4 system-ui;min-height:18px";
+  const bar = document.createElement("div");
+  bar.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 11px;border-top:1px solid var(--border,rgba(128,128,128,.2))";
+  const mk = (label) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.style.cssText = "padding:3px 11px;border-radius:6px;border:1px solid var(--border,rgba(128,128,128,.3));background:none;color:inherit;cursor:pointer;font:12px system-ui"; return b; };
+  const prev = mk("‹ 上一步"), play = mk("▶ 播放"), next = mk("下一步 ›");
+  bar.append(prev, play, next);
+  wrap.append(header, imgWrap, cap, bar);
+  let i = 0, playing = false, timer = 0;
+  const stepEl = header.querySelector(".dp-step");
+  const show = (n) => { i = (n + frames.length) % frames.length; img.src = frames[i].img; cap.textContent = `${i + 1}. ${frames[i].caption || ""}`; stepEl.textContent = `${i + 1}/${frames.length}`; };
+  const stop = () => { playing = false; play.textContent = "▶ 播放"; if (timer) { clearTimeout(timer); timer = 0; } };
+  const tick = () => { if (!playing) return; if (i >= frames.length - 1) { stop(); return; } show(i + 1); timer = setTimeout(tick, 1300); };
+  prev.onclick = () => { stop(); show(i - 1); };
+  next.onclick = () => { stop(); show(i + 1); };
+  play.onclick = () => { if (playing) { stop(); } else { playing = true; play.textContent = "⏸ 暂停"; if (i >= frames.length - 1) show(0); timer = setTimeout(tick, 1300); } };
+  show(0);
+  return wrap;
+}
+
+// Self-contained, openable HTML "recording" saved into the workspace — the real
+// captured frames + a clean light-themed player, no dependencies.
+function _demoHtml(frames, title) {
+  const data = JSON.stringify(frames).replace(/</g, "\\u003c");
+  const safeTitle = _escHtml(title);
+  return "<!doctype html>\n<html lang=\"zh\"><head><meta charset=\"utf-8\">"
+    + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    + "<title>" + safeTitle + " · 演示录屏</title>\n<style>"
+    + "*{box-sizing:border-box}body{margin:0;background:#f8f9fa;color:#1f2937;font:15px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}"
+    + ".card{width:min(900px,94vw);background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 1px 2px rgba(0,0,0,.06),0 8px 28px rgba(0,0,0,.08);overflow:hidden}"
+    + ".hd{display:flex;align-items:center;gap:9px;padding:12px 16px;border-bottom:1px solid #eef0f2;font-weight:600}"
+    + ".dot{width:8px;height:8px;border-radius:50%;background:#d93025}.step{margin-left:auto;color:#6b7280;font-weight:400;font-size:13px}"
+    + ".stage{background:#0b0b0d;display:flex;align-items:center;justify-content:center;min-height:200px}.stage img{max-width:100%;max-height:62vh;display:block}"
+    + ".cap{padding:12px 16px;min-height:20px}.bar{display:flex;gap:8px;padding:10px 16px;border-top:1px solid #eef0f2}"
+    + "button{padding:7px 16px;border-radius:8px;border:1px solid #e5e7eb;background:#fff;color:#1f2937;cursor:pointer;font:14px system-ui}button:hover{background:#f3f4f6}"
+    + ".pri{background:#1a73e8;border-color:#1a73e8;color:#fff}.pri:hover{background:#1769d6}"
+    + "</style></head><body>\n<div class=\"card\"><div class=\"hd\"><span class=\"dot\"></span><span>演示录屏 · " + safeTitle + "</span><span class=\"step\" id=\"st\"></span></div>"
+    + "<div class=\"stage\"><img id=\"im\" alt=\"\"></div><div class=\"cap\" id=\"cp\"></div>"
+    + "<div class=\"bar\"><button id=\"pv\">‹ 上一步</button><button id=\"pl\" class=\"pri\">▶ 播放</button><button id=\"nx\">下一步 ›</button></div></div>\n"
+    + "<script>\nvar F=" + data + ",i=0,p=false,t=0;"
+    + "var im=document.getElementById('im'),cp=document.getElementById('cp'),st=document.getElementById('st'),pl=document.getElementById('pl');"
+    + "function show(n){i=(n+F.length)%F.length;im.src=F[i].img;cp.textContent=(i+1)+'. '+(F[i].caption||'');st.textContent=(i+1)+'/'+F.length;}"
+    + "function stop(){p=false;pl.textContent='▶ 播放';if(t){clearTimeout(t);t=0;}}"
+    + "function tick(){if(!p)return;if(i>=F.length-1){stop();return;}show(i+1);t=setTimeout(tick,1300);}"
+    + "document.getElementById('pv').onclick=function(){stop();show(i-1);};"
+    + "document.getElementById('nx').onclick=function(){stop();show(i+1);};"
+    + "pl.onclick=function(){if(p){stop();}else{p=true;pl.textContent='⏸ 暂停';if(i>=F.length-1)show(0);t=setTimeout(tick,1300);}};"
+    + "show(0);\n</script>\n</body></html>";
+}
+
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容（默认最多约 400 行）。文件很大时用 offset/limit 分页继续读完。改文件前先读清楚。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
@@ -7683,6 +7786,8 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
       { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。method=GET/POST/PUT/PATCH/DELETE/HEAD，可带 headers 和 body；返回状态码 + 响应头 + 响应体(文本，最多 5MB)。典型用途：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST 服务）；③ 发 webhook。⚠️ 允许 localhost / 局域网（方便测自己的服务），但禁链路本地 / 云元数据(169.254.x.x)；只支持 http/https。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。dest 是相对工作区根的路径（或工作区内的绝对路径），必须落在工作区内。单文件最大 200MB。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
+      { type: "function", function: { name: "start_demo", description: "开始把接下来的操作录成一段【功能演示 / 真实录屏】。开始后，你用 browser / computer / screenshot 真实地走一遍刚做好功能的关键流程（打开页面→点按钮→填表单→看结果…），**每个动作都会被自动录成一帧真实截图**。做完一个功能、想把它「跑起来的样子」演示给用户看时用。", parameters: { type: "object", properties: { title: { type: "string", description: "这段演示的标题，如：登录流程演示" } } } } },
+      { type: "function", function: { name: "stop_demo", description: "结束录制，并把刚录下的步骤【一步一步回放展示给用户】（聊天里直接出现可播放的回放器），同时把这段演示存成一个可双击打开、能播放的 HTML 录屏文件到工作区。每做完一个功能、走查完流程后用它收尾展示。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，保存的 HTML 路径（相对工作区根）；默认 .michael-demos/demo-时间戳.html" } } } } },
     );
     // External MCP tools (from the workspace's .mcp.json) — full-power, so agent
     // mode only. Loaded by _ensureMcpTools() before this is called.
@@ -7740,6 +7845,8 @@ function _mapToolCall(name, args) {
     case "read_terminal": return { type: "termread", name: args.name || "" };
     case "list_terminals": return { type: "termlist" };
     case "stop_terminal": return { type: "termstop", name: args.name || "" };
+    case "start_demo": return { type: "demostart", title: args.title || "" };
+    case "stop_demo": return { type: "demostop", path: args.path || args.dest || "" };
     case "http_request": {
       // Models sometimes emit headers as a JSON string instead of an object —
       // parse it so a well-meant request doesn't fail on a type mismatch.
@@ -8603,7 +8710,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       // actually SEE the rendered UI and self-correct — not edit blind. Keep only
       // the newest screenshot set in context (images are large / costly).
       const _imgs = [];
-      for (const it of items) { if (it.rawResult && it.rawResult.image) _imgs.push(it.rawResult.image); }
+      for (const it of items) { if (it.rawResult && it.rawResult.image) { _imgs.push(it.rawResult.image); _demoCollectFrame(it.call, it.rawResult); } }
       if (_imgs.length) {
         while (_shotMsgs.length) { const old = _shotMsgs.shift(); const oi = messages.indexOf(old); if (oi >= 0) messages.splice(oi, 1); }
         const content = [{ type: "text", text: `这是相关页面的最新截图（${_imgs.length} 张）。仔细看图再决定下一步：做 UI 就据图检查并改进（布局/对齐/间距/配色/对比度/视觉层级/响应式）；在浏览或操作浏览器就据图判断接下来怎么点 / 填 / 读。` }];
@@ -8907,7 +9014,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", mcp: "MCP tool", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", mcp: "MCP tool", demostart: "Recording demo", demostop: "Demo recorded", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8931,6 +9038,8 @@ function _createToolStep(call) {
     http: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
     download: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.25 1.75a.75.75 0 011.5 0v6.69l1.97-1.97a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.53a.75.75 0 011.06-1.06l1.97 1.97V1.75zM2.5 11.25a.75.75 0 011.5 0v1.5c0 .14.11.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 0111.75 14.5h-7.5A1.75 1.75 0 012.5 12.75v-1.5z"/></svg>`,
     mcp: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H11v1.19l1.28 1.28a1.75 1.75 0 010 2.47l-3.06 3.06a1.75 1.75 0 01-2.47 0L3.56 9.22a.75.75 0 011.06-1.06l3.19 3.19a.25.25 0 00.35 0l3.06-3.06a.25.25 0 000-.35L9.28 5.56A.75.75 0 019 5V4.5h-.75a.75.75 0 010-1.5H9V1.75zM5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H6.5V5a.75.75 0 01-.22.53L4.97 6.84a.75.75 0 11-1.06-1.06L5 4.69V4.5h-.75a.75.75 0 010-1.5H5V1.75z"/></svg>`,
+    demostart: `<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="8" r="3.5"/><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zm0 1.5a5 5 0 110 10 5 5 0 010-10z" opacity=".5"/></svg>`,
+    demostop: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 3.75C2 2.784 2.784 2 3.75 2h8.5c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0112.25 14h-8.5A1.75 1.75 0 012 12.25v-8.5zm4 1.5v5.5l4.5-2.75L6 5.25z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
@@ -8939,7 +9048,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "mcp" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9821,6 +9930,31 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         return { type: "mcp", path: label, content: `[失败] MCP 工具 ${label} 出错: ${msg}` };
       }
+
+    } else if (call.type === "demostart") {
+      _demoRec = { active: true, title: (call.title || "").trim() || "功能演示", frames: [] };
+      res.className = "atc-result atc-result--ok"; res.textContent = "录制中";
+      return { type: "demostart", path: _demoRec.title, content: `已开始录制演示「${_demoRec.title}」。现在用 browser / computer / screenshot **真实地走一遍功能流程**——每个动作都会自动录成一帧；走完用 stop_demo 收尾，把回放展示给用户。` };
+
+    } else if (call.type === "demostop") {
+      const frames = _demoRec.frames.slice();
+      const title = _demoRec.title || "功能演示";
+      const wasActive = _demoRec.active;
+      _demoRec = { active: false, title: "", frames: [] };
+      if (!wasActive && !frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "未在录制"; return { type: "demostop", path: "", content: "[失败] 还没开始录制。先用 start_demo，再用 browser/computer/screenshot 走一遍流程，最后 stop_demo。" }; }
+      if (!frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "无帧"; return { type: "demostop", path: title, content: "[失败] 录制期间没有产生任何截图帧——演示流程要用 browser / computer / screenshot 才会录到帧。" }; }
+      try { const player = _buildDemoPlayer(frames, title); step.appendChild(player); } catch {}
+      let savedPath = "";
+      if (inTauri) {
+        const dlRoot = root || rootPath || workspaceRoots[0] || "";
+        if (dlRoot) {
+          const rel = (call.path && call.path.trim()) || `.michael-demos/demo-${Date.now()}.html`;
+          const fp = rel.startsWith("/") ? rel : dlRoot + "/" + rel;
+          try { await backend.writeTextFile(fp, _demoHtml(frames, title)); savedPath = rel; try { reloadDir(parentDir(fp)); } catch {} } catch { savedPath = ""; }
+        }
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = `${frames.length} 帧`;
+      return { type: "demostop", path: title, content: `已录制演示「${title}」共 ${frames.length} 步，并在聊天里**一步步回放给用户**（可点播放 / 上一步 / 下一步）。${savedPath ? `同时存成了可打开播放的录屏文件：${savedPath}（双击用浏览器打开即可）。` : "（未打开工作区，未落地成文件，仅聊天内回放。）"}` };
 
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";
