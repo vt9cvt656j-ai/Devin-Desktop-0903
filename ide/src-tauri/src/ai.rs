@@ -168,6 +168,10 @@ async fn ai_chat_inner(
         "model": config.model,
         "stream": true,
         "messages": messages,
+        // Ask the provider to emit a final `usage` chunk (incl. cached-prompt
+        // tokens) during streaming — without this most OpenAI-compatible providers
+        // send NO usage, so the cache meter has nothing to show ("缓存看不到").
+        "stream_options": { "include_usage": true },
     });
     if let Some(max_tokens) = config.max_tokens {
         payload["max_tokens"] = serde_json::json!(max_tokens);
@@ -216,13 +220,28 @@ async fn ai_chat_inner(
     }
 
     let client = &*HTTP;
-    let resp = client
+    let mut resp = client
         .post(&url)
         .bearer_auth(&config.api_key)
         .json(&payload)
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    // If a strict gateway rejects the request (4xx — most likely the optional
+    // `stream_options` it doesn't recognize), drop that field and retry ONCE. So
+    // asking for usage stats can never break chat.
+    if resp.status().is_client_error() && payload.get("stream_options").is_some() {
+        if let Some(o) = payload.as_object_mut() {
+            o.remove("stream_options");
+        }
+        resp = client
+            .post(&url)
+            .bearer_auth(&config.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -636,10 +655,17 @@ pub async fn web_search(query: String) -> Result<String, String> {
     // limited / blocked a lot, which is exactly why search "搜不到". Now we try the
     // html endpoint then fall back to the lite endpoint (lighter, far less blocked),
     // each with a rotated UA, returning the first non-empty result set.
-    let results = ddg_search_multi(q).await;
+    let mut results = ddg_search_multi(q).await;
+    if results.is_empty() {
+        // The bare HTTP scrape got blocked (anti-bot walls fingerprint reqwest's
+        // TLS / reject its UA). Fall back to a REAL headless-browser render — the
+        // agent's own Chrome does the search (real TLS fingerprint + JS + UA), which
+        // gets through where the scrape can't. This is "让智能体操控搜索".
+        results = browser_render_search(q).await;
+    }
     if results.is_empty() {
         return Ok(format!(
-            "「{q}」这次没搜到结果（搜索引擎可能临时限流，或关键词太宽泛）。可以：① 换更具体、用英文的关键词重试；② 直接用 web_fetch 打开你已知的相关网址 / 官方文档读全文。"
+            "「{q}」这次没搜到结果（搜索引擎临时限流/反爬，或关键词太宽泛）。**别停在这里——主动操控浏览器自己搜**：① 换更具体的英文关键词，多调几次 web_search；② 用 browser navigate 打开 https://www.bing.com/search?q=... 或 https://duckduckgo.com/?q=... 亲自看结果、点进去用 browser/ web_fetch 读全文；③ 直接 web_fetch 你已知的官方文档 / 仓库 README / API 页读原文。至少换 2 个来源交叉验证再下结论。"
         ));
     }
     let mut out = format!("搜索「{q}」的结果：\n");
@@ -733,6 +759,69 @@ async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
         }
     }
     Vec::new()
+}
+
+/// Last-resort search via a REAL headless-browser render (`chrome --dump-dom`).
+/// A real Chrome (genuine TLS fingerprint, runs JS, real UA) gets through the
+/// anti-bot walls that block the bare reqwest scrape — i.e. the agent's own
+/// browser performs the search. Bounded by a hard timeout so a wedged Chrome
+/// can't hang the turn; on timeout we just return what we have (often nothing).
+async fn browser_render_search(q: &str) -> Vec<(String, String, String)> {
+    let browser = match crate::capture::find_headless_browser() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    // (url, parser-kind): 0 = Bing b_algo, 1 = DDG html result__a.
+    let targets = [
+        (format!("https://www.bing.com/search?q={}&setlang=en", urlencoding(q)), 0u8),
+        (format!("https://html.duckduckgo.com/html/?q={}", urlencoding(q)), 1u8),
+    ];
+    for (url, kind) in targets {
+        let browser2 = browser.clone();
+        let url2 = url.clone();
+        let rendered = tokio::time::timeout(
+            std::time::Duration::from_secs(28),
+            tauri::async_runtime::spawn_blocking(move || render_dom(&browser2, &url2)),
+        )
+        .await;
+        if let Ok(Ok(Some(html))) = rendered {
+            let r = if kind == 0 {
+                parse_bing(&html)
+            } else {
+                parse_ddg_results(&html)
+            };
+            if !r.is_empty() {
+                return r;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Render `url` in headless Chrome and return its fully-rendered DOM (stdout of
+/// `--dump-dom`). Chrome exits on its own after `--virtual-time-budget`, so this
+/// doesn't hang; the caller still wraps it in a timeout as a backstop.
+fn render_dom(browser: &str, url: &str) -> Option<String> {
+    let out = std::process::Command::new(browser)
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--no-first-run",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "--virtual-time-budget=9000",
+            "--dump-dom",
+            url,
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.stdout.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Minimal percent-encoding for a query string (no extra crate).

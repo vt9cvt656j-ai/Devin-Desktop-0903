@@ -250,13 +250,20 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     if (!key) {
       try { const r = await fetch(config.baseUrl + "/api/ide-key"); key = (await r.json()).api_key; } catch {}
     }
-    const payload = { model: config.model, messages, stream: true };
+    const payload = { model: config.model, messages, stream: true, stream_options: { include_usage: true } };
     if (tools && tools.length) payload.tools = tools;
-    const resp = await fetch(config.baseUrl + "/v1/chat/completions", {
+    const _post = (body) => fetch(config.baseUrl + "/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + (key || "") },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
+    let resp = await _post(payload);
+    // Strict gateway rejecting the optional stream_options? Drop it and retry once,
+    // so requesting usage can't break chat.
+    if (!resp.ok && resp.status >= 400 && resp.status < 500 && payload.stream_options) {
+      delete payload.stream_options;
+      resp = await _post(payload);
+    }
     if (!resp.ok || !resp.body) {
       let t = ""; try { t = await resp.text(); } catch {}
       onEvent({ kind: "error", message: t || ("请求失败 " + resp.status) });
@@ -5868,32 +5875,56 @@ _initIPC();
 // cached-prompt tokens by default; other providers vary, so 0% just means "no
 // cache stats reported", not "cache off". Self-contained fading pill — no layout
 // dependency, fully guarded so it can never break a turn.
-const _tok = { in: 0, cached: 0, out: 0 };
+const _tok = { in: 0, cached: 0, out: 0, anyReal: false };
+// Rough token estimate (when the provider reports no usage): ~3 chars/token
+// blended for mixed CJK/English. Handles a string or a full messages array.
+function _estTokens(x) {
+  let s = "";
+  if (typeof x === "string") s = x;
+  else if (Array.isArray(x)) {
+    for (const m of x) {
+      const c = m && m.content;
+      if (typeof c === "string") s += c;
+      else if (Array.isArray(c)) for (const part of c) if (part && part.type === "text") s += part.text || "";
+    }
+  }
+  return Math.round(s.length / 3);
+}
 function _recordUsage(ev) {
   try {
     const pin = ev.promptTokens ?? ev.prompt_tokens ?? 0;
     const cached = ev.cachedTokens ?? ev.cached_tokens ?? 0;
     const out = ev.completionTokens ?? ev.completion_tokens ?? 0;
+    const est = !!ev.estimated;
     _tok.in += pin; _tok.cached += cached; _tok.out += out;
-    _renderTokenMeter(pin, cached, out);
+    if (!est) _tok.anyReal = true;
+    _renderTokenMeter(pin, cached, out, est);
   } catch { /* never let accounting break a turn */ }
 }
-function _renderTokenMeter(pin, cached, out) {
+function _renderTokenMeter(pin, cached, out, estimated) {
   let el = document.getElementById("tokenMeter");
   if (!el) {
     el = document.createElement("div");
     el.id = "tokenMeter";
-    el.style.cssText = "position:fixed;right:12px;bottom:10px;z-index:9999;font:11px/1.4 system-ui,sans-serif;color:var(--text-dim,#6b7280);background:var(--panel,rgba(255,255,255,.94));border:1px solid var(--border,rgba(0,0,0,.1));border-radius:8px;padding:4px 9px;box-shadow:0 2px 8px rgba(0,0,0,.08);pointer-events:none;opacity:0;transition:opacity .25s";
+    el.style.cssText = "position:fixed;right:12px;bottom:10px;z-index:9999;font:11px/1.4 system-ui,sans-serif;color:var(--text-dim,#6b7280);background:var(--panel,rgba(255,255,255,.96));border:1px solid var(--border,rgba(0,0,0,.12));border-radius:8px;padding:4px 9px;box-shadow:0 2px 10px rgba(0,0,0,.1);pointer-events:none;opacity:0;transition:opacity .25s;max-width:60vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
     document.body.appendChild(el);
   }
   const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
-  const hit = pin > 0 ? Math.round((cached / pin) * 100) : 0;
   const cumHit = _tok.in > 0 ? Math.round((_tok.cached / _tok.in) * 100) : 0;
-  el.textContent = `↺ 缓存 ${hit}% · 输入 ${k(pin)}（缓存 ${k(cached)}）· 输出 ${k(out)}`;
-  el.title = `本会话累计：输入 ${_tok.in}（缓存命中 ${_tok.cached}，约 ${cumHit}%）· 输出 ${_tok.out}`;
+  if (estimated) {
+    // No usage reported — show an estimate (cache % unknown), still better than blank.
+    el.textContent = `≈ 输入 ${k(pin)} · 输出 ${k(out)}（供应商未上报用量，缓存%未知）`;
+  } else {
+    const hit = pin > 0 ? Math.round((cached / pin) * 100) : 0;
+    el.textContent = `↺ 缓存 ${hit}% · 输入 ${k(pin)}（缓存 ${k(cached)}）· 输出 ${k(out)}`;
+  }
+  el.title = `本会话累计：输入 ${_tok.in}（缓存命中 ${_tok.cached}，约 ${cumHit}%）· 输出 ${_tok.out}` +
+    (_tok.anyReal ? "" : "\n注：本会话供应商一直没上报 usage，数字为估算；缓存命中需供应商在流里回传 usage 才能显示。");
+  // Stay clearly visible for a while, then DIM (don't vanish) so it's always there
+  // to check — that's the fix for "缓存看不到".
   el.style.opacity = "1";
   clearTimeout(el._t);
-  el._t = setTimeout(() => { el.style.opacity = "0"; }, 6000);
+  el._t = setTimeout(() => { el.style.opacity = "0.4"; }, 9000);
 }
 
 async function highlightCode(code, lang) {
@@ -6076,6 +6107,13 @@ const _AI_MODE_PROMPTS = {
 4. 不确定就联网查，别凭记忆猜——遇到不熟悉的库/框架/API、拿不准的用法、版本差异、报错信息，**主动用 web_search 搜官方文档 / API 参考 / Stack Overflow，再用 web_fetch 读全文**，按查到的事实写代码，而不是靠印象。新库、新版本、冷门 API 尤其要查。
 5. 自我验证——改完尽量用 run_cmd 跑测试/构建/类型检查（cargo check、npm run build、go build、pytest 等）。失败就读报错→定位→（必要时联网查解决方案）→修复→再验证，循环到通过为止。
 6. 收尾——完成后用 1-3 句话总结：改了什么、为什么、怎么验证的；列出你做的关键假设。
+
+# 工具协同（组合发力，不是单点用——会"搭配工具"才是真聪明，最能拉开能力差距）
+- **联网研究 = 你自己操控搜索，绝不止于一次 web_search**：① 先 web_search，中英文各换几组**更具体**的关键词多搜几次；② 还搜不到 / 不够深，就**亲自操控 browser**——navigate 到 https://www.bing.com/search?q=… 或直奔官方文档 / GitHub 仓库 / RFC，看结果、点进去；③ 用 web_fetch 或 browser 读**全文**，而不是只看搜索摘要片段；④ **≥2 个独立来源交叉验证**再下结论。（web_search 搜不到时现在会自动用真实无头浏览器再搜一遍，但你仍要主动换角度多搜、读原文，别一搜空就放弃。）
+- **界面 / 视觉排障 = network + inspect + screenshot 三方对照**（视觉最容易错，别只靠肉眼看截图猜）：run_cmd 起 dev server → browser navigate → **network** 抓包看有没有 CSS/JS/字体/图片/接口 404·500（样式没生效、图没出来，根因常在这，截图看不出来）→ **inspect** 看计算样式层面的缺陷（隐形文字 / 对比度不足 / 坏图 / 尺寸塌陷 / 文字裁切 / 横向溢出）→ screenshot 看整体观感 → 据**真实数据**改，改完再 network/inspect/截图复查。
+- **改代码前先用只读工具摸清现场**：search 找定义 / 调用点 + read_file 读上下文与现有约定 → 再改 → run_cmd / get_diagnostics 验证。绝不改没读过的代码。
+- **并行省时间又省 token**：互不依赖的只读调查（读多个文件、搜多个关键词、抓多个页面）在同一步**一次性并行**发起，别一个个串行等。
+- **派活与记忆**：大范围调查 / 多文件梳理派 run_subagent 并行去做，结论汇总回来；这次踩的坑 → 根因 → 解法用 remember 记一条**可复用**经验，下次自动加载、同类问题不再栽。
 
 # 做真实可用的东西，不是 demo（最重要的总原则）
 - 默认交付**真正能跑、逻辑完整**的实现，不是占位/假数据/写死的 demo。该连后端就连后端，该落库就落库，该处理边界就处理——别用「TODO」「假装成功」「mock 数据」糊弄。
@@ -8895,6 +8933,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
   const _live = () => !session || session.streaming;
   let acc = "";
   let err = null;
+  let _gotUsage = false; // did the provider report real token usage this turn?
   const byIndex = new Map();
   let streamEl = null;
   // Throttle streaming re-render to ~12fps. Re-parsing + rebuilding the whole
@@ -8939,7 +8978,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
           if (ev.arguments) e.args += ev.arguments;
           _liveWritePreview(e, body); // show code typing live as write_file args stream
         }
-        else if (ev.kind === "usage") { _recordUsage(ev); }
+        else if (ev.kind === "usage") { _gotUsage = true; _recordUsage(ev); }
         else if (ev.kind === "error") { turnErr = ev.message; }
       });
     } catch (e) { turnErr = String(e?.message || e); }
@@ -8956,6 +8995,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
 
   if (flushTimer) clearTimeout(flushTimer);
   body.querySelector(".thinking")?.remove();
+  // Provider sent no usage (gateway stripped it / no stream_options support) →
+  // show an ESTIMATE so the token meter is never blank ("缓存看不到").
+  if (!_gotUsage) _recordUsage({ estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) });
 
   const cleanFinal = _cleanAgentText(acc);
   if (streamEl) {
