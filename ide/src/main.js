@@ -3603,6 +3603,75 @@ $("problemsClose")?.addEventListener("click", () => {
 });
 updateProblems();
 
+// ---- file-tree multi-select (Shift range / Cmd toggle) + bulk delete ----
+let _treeSel = new Set();
+let _treeAnchor = null;
+function _treeRowPaths() {
+  return [...treeEl.querySelectorAll(".row[data-path]")].map((r) => r.dataset.path);
+}
+function _applyTreeSel() {
+  treeEl.querySelectorAll(".row.is-selected").forEach((r) => r.classList.remove("is-selected"));
+  for (const p of _treeSel) {
+    const r = treeEl.querySelector(`.row[data-path="${cssEscape(p)}"]`);
+    if (r) r.classList.add("is-selected");
+  }
+}
+function _clearTreeSel() { _treeSel.clear(); _applyTreeSel(); }
+// Returns true if this was a modifier multi-select click — caller must then NOT
+// open the file / expand the folder.
+function _treeSelectClick(e, path) {
+  if (e.shiftKey && _treeAnchor) {
+    const order = _treeRowPaths();
+    const a = order.indexOf(_treeAnchor), b = order.indexOf(path);
+    if (a !== -1 && b !== -1) {
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      _treeSel = new Set(order.slice(lo, hi + 1));
+      _applyTreeSel();
+      return true;
+    }
+  }
+  if (e.metaKey || e.ctrlKey) {
+    if (_treeSel.has(path)) _treeSel.delete(path); else _treeSel.add(path);
+    _treeAnchor = path;
+    _applyTreeSel();
+    return true;
+  }
+  // plain click → single-select + set range anchor; caller proceeds to open/expand
+  _treeSel = new Set([path]);
+  _treeAnchor = path;
+  _applyTreeSel();
+  return false;
+}
+async function _deleteSelectedTree() {
+  const paths = [..._treeSel];
+  if (!paths.length) return;
+  const ok = await ioConfirm({
+    title: "删除选中",
+    message: `确定要删除选中的 ${paths.length} 项吗？此操作无法撤消。`,
+    okLabel: t("ctx.delete"),
+    danger: true,
+  });
+  if (!ok) return;
+  for (const p of paths) {
+    for (const op of [...openFiles.keys()]) if (op === p || op.startsWith(p + "/")) closeFile(op);
+    try { await backend.deletePath(p); } catch (err) { showToast(String(err)); }
+  }
+  _clearTreeSel();
+  const parents = new Set(paths.map((p) => parentDir(p)));
+  for (const par of parents) await reloadDir(par);
+}
+// Cmd/Ctrl+Backspace (or Delete) removes the tree selection — guarded so it never
+// fires while editing in the editor / terminal / any input.
+window.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || (e.key !== "Backspace" && e.key !== "Delete")) return;
+  if (_treeSel.size === 0) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable ||
+      (ae.closest && (ae.closest(".monaco-editor") || ae.closest(".xterm"))))) return;
+  e.preventDefault();
+  _deleteSelectedTree();
+});
+
 async function renderChildren(path, container) {
   let entries;
   try {
@@ -3635,7 +3704,8 @@ async function renderChildren(path, container) {
       kids.hidden = true;
       container.appendChild(kids);
       dirNodes.set(entry.path, { row, kids, loaded: false });
-      row.addEventListener("click", async () => {
+      row.addEventListener("click", async (e) => {
+        if (_treeSelectClick(e, entry.path)) return;
         const node = dirNodes.get(entry.path);
         row.classList.toggle("open");
         kids.hidden = !kids.hidden;
@@ -3647,7 +3717,10 @@ async function renderChildren(path, container) {
         }
       });
     } else {
-      row.addEventListener("click", () => openFile(entry.path, entry.name));
+      row.addEventListener("click", (e) => {
+        if (_treeSelectClick(e, entry.path)) return;
+        openFile(entry.path, entry.name);
+      });
     }
   }
 }
@@ -3792,6 +3865,14 @@ function openContextMenu(x, y, entry) {
     );
   }
   items.push({ sep: true }, { label: t("ctx.copyPath"), icon: "i-copy", action: () => copyText(entry.path) });
+
+  // Bulk delete when right-clicking an item that's part of a multi-selection.
+  if (_treeSel.size > 1 && _treeSel.has(entry.path)) {
+    items.push(
+      { sep: true },
+      { label: `删除选中 (${_treeSel.size})`, icon: "i-trash", danger: true, action: () => _deleteSelectedTree() },
+    );
+  }
 
   renderMenuAt(x, y, items);
 }

@@ -309,8 +309,8 @@ body.is-tauri.is-mac .titlebar {
   flex: none;
 }
 .layout .assistant {
-  width: var(--assistant-w, 348px);
-  min-width: 200px;
+  width: var(--assistant-w, 440px);
+  min-width: 240px;
   max-width: 50vw;
   flex: none;
 }
@@ -546,6 +546,12 @@ body.is-tauri.is-mac .titlebar {
   color: var(--accent);
   font-weight: 550;
 }
+/* multi-selection highlight (Shift/Cmd-click) — distinct from the active file */
+.row.is-selected {
+  background: rgba(124, 92, 255, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.4);
+}
+.row.is-selected.is-active { background: rgba(124, 92, 255, 0.26); }
 .row .chev,
 .row .chev-spacer {
   width: 14px;
@@ -1520,13 +1526,29 @@ body.zen-mode .editor {
 /* ---- assistant chat ---- */
 .chat {
   flex: 1;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
   padding: 16px 14px;
   display: flex;
   flex-direction: column;
   gap: 16px;
   user-select: text;
 }
+/* Keep every chat element within the panel width so nothing overflows and gets
+   clipped on the right: containers can shrink (min-width:0), long inline code /
+   paths wrap, and wide blocks (code cards, tables, pre, images) cap at 100% and
+   scroll internally instead of pushing the layout wider. */
+.msg, .msg__main, .msg__body { min-width: 0; max-width: 100%; }
+.msg__body code { overflow-wrap: anywhere; word-break: break-word; }
+.msg__body pre,
+.msg__body img,
+.msg__body .code-card,
+.msg__body table,
+.msg__body .md-table { max-width: 100%; }
+.msg__body pre { overflow-x: auto; }
+.msg__body table,
+.msg__body .md-table { display: block; overflow-x: auto; }
 .msg {
   display: flex;
   flex-direction: column;
@@ -3440,6 +3462,10 @@ body.zen-mode .editor {
   font-weight: 500;
   color: #5f6368;
 }
+/* The IO dialog's input wrapper is a <label>, and `.sheet label { display:flex }`
+   overrode the [hidden] attribute — so confirm-only dialogs (e.g. delete) still
+   showed an empty text box. Force it hidden when JS sets hidden=true. */
+#ioInputWrap[hidden] { display: none; }
 .sheet input {
   font-family: -apple-system, system-ui, sans-serif;
   font-size: 14px;
