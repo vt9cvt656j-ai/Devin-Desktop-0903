@@ -6056,6 +6056,11 @@ const _AI_MODE_PROMPTS = {
 - edit_file 的 old_string 必须带足够上下文，能在文件里唯一定位那段；要改多处相同文本时设 replace_all=true。
 - write_file 只用于新建文件或彻底重写。
 - 最小改动——只做任务要求的改动。不顺手重构、不加未要求的功能/注释/错误处理、不为假想需求做抽象。bug 修复不必清理周围代码。
+- **写就写完整，绝不半途敷衍（很重要）**：用 write_file 就把**整份完整、能直接跑**的内容写出来——**绝不留** \`// ... 其余不变\`、\`// TODO 待补\`、\`...\`、省略号、占位、半截函数。不确定原内容就先 read_file 读全再改。文件大也要写完，别写着写着就糊弄、跳步或戛然而止；这一轮没写完就继续写，直到这个文件真正完整可用。
+
+# 自主（不需要用户记命令、点名工具）
+- 用户只用**大白话**说要什么就够了——把"他要达成的事"翻译成"该调哪些工具/分几步做"是**你的活**，不需要他记斜杠命令、不需要他点名某个工具。
+- 该用的工具就**主动用**，包括 http_request（调任意网上 API/测本地服务）、run_in_terminal + read_terminal（起服务并真去看日志）、browser/computer（图形界面）、git_*、以及用户在 .mcp.json 里接的 mcp__ 外部工具——别等他逐个点名，相关就用。
 
 # Git 使用纪律（很重要——别自作主张动仓库；Claude Code / Codex 的铁律）
 - **没被明确要求，就绝不 commit / push / 切换或新建分支**。用户没说"提交 / 推送"，你就只管改文件，把改动留在工作区让他自己看——擅自提交会让用户觉得你越界、不可控。改完代码默认**停在"已改好、未提交"**。
@@ -6169,6 +6174,7 @@ const _AI_MODE_PROMPTS = {
 # 输出
 - 先给结论，再展开分析。
 - 调用链 / 模块关系用列表或 ASCII 图展示。
+- **诚实**：只讲你真在代码里读到的，每个结论都能落到 文件:行号；没读到 / 不确定就说"没找到 / 需要再查"，**绝不脑补不存在的函数、调用关系或行为**。
 - 只分析和建议，不修改文件、不运行有副作用的命令。`,
 
   reviewer: `你是 Michael IDE 的代码审查员——**第一目标是"准"**：只报你**已证实为真**的问题，绝不用一堆假设性、风格性、可有可无的"垃圾 bug"淹没用户。**少而准 ≫ 多而杂**。用中文回复。你能读文件 / 列目录 / 搜索 / 按名查找，但不改文件、不跑有副作用的命令。
@@ -6516,6 +6522,19 @@ async function sendPrompt(text, attachedImages = []) {
   }
 
   const userBody = addMessage("user", text, sess);
+  // Make Auto's choice VISIBLE: a colored chip on the message showing which mode
+  // Auto picked for THIS turn — so the switch is obvious, not just a fleeting toast.
+  if (_currentAiMode === "auto" && userBody) {
+    const picked = _AI_MODES.find(m => m.id === effectiveMode);
+    if (picked) {
+      const chip = document.createElement("span");
+      chip.className = "msg-mode-chip";
+      chip.style.cssText = `display:block;width:max-content;font-size:11px;font-weight:600;padding:1px 9px;border-radius:999px;margin:0 0 6px;color:#fff;background:${picked.color}`;
+      chip.textContent = `Auto → ${picked.label}`;
+      chip.title = `Auto 为这条消息自动选了「${picked.label}」模式（${picked.desc || ""}）`;
+      userBody.insertBefore(chip, userBody.firstChild);
+    }
+  }
   if (attachedImages.length > 0 && userBody) {
     for (const img of attachedImages) {
       const imgEl = document.createElement("img");
@@ -9924,7 +9943,15 @@ async function _executeToolStep(step, call, root, run) {
         });
       }
 
-      return { type: "cmd", path: call.command, content: output ? output.slice(0, 2000) : "(executed)" };
+      // Permission failures are common and the model often glosses over them.
+      // Surface a clear, actionable hint so it FIXES the permission instead of
+      // pretending the command worked or silently giving up.
+      const _permDenied = (result.code !== 0) && /permission denied|operation not permitted|EACCES|EPERM|access is denied|not permitted|需要权限|拒绝访问|权限不足/i.test(output);
+      let _content = output ? output.slice(0, 2000) : (result.code === 0 ? "(executed)" : `(exit ${result.code}, 无输出)`);
+      if (_permDenied) {
+        _content += "\n\n[权限问题] 这条命令因权限被拒绝（不是成功）。按情况处理：① 给文件可执行权限 chmod +x；② 改权限/属主 chmod/chown；③ 写到有权限的目录（如工作区内或 /tmp，别写 /usr、/etc 等）；④ 装依赖用用户级（pip install --user、npm i 不加 -g、或换有权限的前缀）；⑤ 确实需要更高权限就**如实告诉用户**这步需要 sudo/管理员，别替他乱提权、也别假装成功。";
+      }
+      return { type: "cmd", path: call.command, content: _content };
     }
   } catch (e) {
     res.className = "atc-result atc-result--err";
@@ -13633,17 +13660,21 @@ const _TERM_REFRESH_PATTERNS = [
 ];
 
 let _termOutputBuf = "";
+let _termScanPending = false;
 function _detectTerminalChanges(data) {
+  // Accumulate cheaply on EVERY chunk, but only run the (multi-regex) scan on a
+  // throttle — running it per chunk was a real cause of UI lag while a terminal
+  // floods output (e.g. a dev server / npm install). At most ~3 scans/sec now.
   _termOutputBuf += data;
-  if (_termOutputBuf.length > 2000) _termOutputBuf = _termOutputBuf.slice(-1000);
-
-  for (const re of _TERM_REFRESH_PATTERNS) {
-    if (re.test(_termOutputBuf)) {
-      _scheduleTermRefresh();
-      _termOutputBuf = "";
-      return;
+  if (_termOutputBuf.length > 4000) _termOutputBuf = _termOutputBuf.slice(-2000);
+  if (_termScanPending) return;
+  _termScanPending = true;
+  setTimeout(() => {
+    _termScanPending = false;
+    for (const re of _TERM_REFRESH_PATTERNS) {
+      if (re.test(_termOutputBuf)) { _scheduleTermRefresh(); _termOutputBuf = ""; return; }
     }
-  }
+  }, 300);
 }
 
 function _scheduleTermRefresh() {
@@ -14325,9 +14356,12 @@ async function createTermTab(customLabel) {
           }
           term.write(ev.data);
           _detectTerminalChanges(ev.data);
-          // Keep a bounded tail of recent output so agent task tools can read
-          // back what a launched persistent task printed (e.g. a dev server URL).
-          entry.recentOut = ((entry.recentOut || "") + ev.data).slice(-8000);
+          // Keep a bounded tail of recent output so agent task tools can read back
+          // what a launched persistent task printed (e.g. a dev server URL). Trim
+          // only when it grows past 2x the cap (not every chunk) — re-slicing an
+          // 8KB string on every PTY chunk was needless churn during output floods.
+          entry.recentOut = (entry.recentOut || "") + ev.data;
+          if (entry.recentOut.length > 16000) entry.recentOut = entry.recentOut.slice(-8000);
         } else if (ev.kind === "exit") {
           term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
           entry.backendId = null;
