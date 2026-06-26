@@ -6084,6 +6084,7 @@ const _AI_MODE_PROMPTS = {
 - web_fetch(url)：抓取公网网页正文，读 web_search 找到的页面或已知文档 URL（仅 http/https 公网）
 - http_request(method, url, headers?, body?)：**调任意 HTTP API——用各种网上工具/在线服务的关键能力**。GET/POST/PUT/PATCH/DELETE，返回状态码+响应头+响应体。用来：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回，别只靠猜)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST）；③ 发 webhook。和 web_fetch 的区别：web_fetch 只读公网网页正文(GET)，http_request 能任意方法+headers+body、且**允许 localhost/局域网**(方便测自己服务)。需桌面 App。
 - download_file(url, dest)：从 http/https 下载文件存进工作区(图片/字体/数据集/二进制)。dest 为相对工作区根的路径，最大 200MB。需桌面 App。
+- **MCP 外部工具（mcp__服务名__工具名）**：如果工具列表里出现 mcp__ 开头的工具，那是用户在 .mcp.json 里接入的外部 MCP 服务（数据库、GitHub、Slack、第三方 API 等）。它们和内置工具一样调用——遇到相关任务**优先用这些专用 MCP 工具**（比自己拼命令/HTTP 更准），按各自的参数 schema 传参即可。
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
@@ -7531,6 +7532,63 @@ const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path 
 
 const _AGENT_MAX_ITERS = 40;
 
+// --- MCP (Model Context Protocol): plug the agent into ANY external MCP server
+// listed in the workspace's .mcp.json — the same standard Claude Code / Codex /
+// Cursor use. Each server's tools are discovered once and exposed to the model as
+// `mcp__<server>__<tool>`. A server that won't start / times out is skipped (the
+// Rust client times out every call, so a bad server can't hang the agent). ---
+let _mcpLoaded = false;
+let _mcpLoadedRoot = null;
+let _mcpToolCache = [];        // OpenAI tool schemas for the connected MCP tools
+const _mcpToolMap = new Map(); // sanitized full name -> { server, tool }
+
+// Tool names must match ^[a-zA-Z0-9_-]{1,64}$ for the OpenAI tool API.
+function _mcpSanitizeName(s) {
+  let n = String(s).replace(/[^a-zA-Z0-9_-]/g, "_");
+  return n.length > 64 ? n.slice(0, 64) : n;
+}
+
+async function _ensureMcpTools() {
+  if (!inTauri) return;
+  const root = rootPath || workspaceRoots[0] || "";
+  if (_mcpLoaded && _mcpLoadedRoot === root) return; // cached for this workspace
+  _mcpLoaded = true; _mcpLoadedRoot = root; _mcpToolCache = []; _mcpToolMap.clear();
+  if (!root) return;
+  let cfgText = "";
+  try { cfgText = await backend.readTextFile(root + "/.mcp.json"); }
+  catch { return; } // no .mcp.json → no MCP servers, totally fine
+  let cfg;
+  try { cfg = JSON.parse(cfgText); }
+  catch { showToast("⚠️ .mcp.json 格式有误，已跳过 MCP"); return; }
+  const servers = (cfg && (cfg.mcpServers || cfg.servers)) || {};
+  const names = Object.keys(servers);
+  if (!names.length) return;
+  let total = 0; const failed = [];
+  for (const sname of names) {
+    const s = servers[sname] || {};
+    if (!s.command) { failed.push(`${sname}: 缺 command`); continue; }
+    try {
+      const tools = await backend.invoke("mcp_connect", { name: sname, command: s.command, args: s.args || [], env: s.env || {}, cwd: root });
+      for (const t of (tools || [])) {
+        if (!t || !t.name) continue;
+        const full = _mcpSanitizeName(`mcp__${sname}__${t.name}`);
+        _mcpToolMap.set(full, { server: sname, tool: t.name });
+        const schema = (t.input_schema && typeof t.input_schema === "object" && t.input_schema.type)
+          ? t.input_schema
+          : { type: "object", properties: (t.input_schema && t.input_schema.properties) || {} };
+        _mcpToolCache.push({ type: "function", function: {
+          name: full,
+          description: `[MCP·${sname}] ${t.description || t.name}`.slice(0, 1024),
+          parameters: schema,
+        } });
+        total++;
+      }
+    } catch (e) { failed.push(`${sname}: ${String(e?.message || e).slice(0, 80)}`); }
+  }
+  if (total) showToast(`已接入 ${total} 个 MCP 工具（来自 ${names.length} 个服务）`);
+  if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
+}
+
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容（默认最多约 400 行）。文件很大时用 offset/limit 分页继续读完。改文件前先读清楚。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
@@ -7580,6 +7638,9 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。method=GET/POST/PUT/PATCH/DELETE/HEAD，可带 headers 和 body；返回状态码 + 响应头 + 响应体(文本，最多 5MB)。典型用途：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST 服务）；③ 发 webhook。⚠️ 允许 localhost / 局域网（方便测自己的服务），但禁链路本地 / 云元数据(169.254.x.x)；只支持 http/https。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。dest 是相对工作区根的路径（或工作区内的绝对路径），必须落在工作区内。单文件最大 200MB。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
     );
+    // External MCP tools (from the workspace's .mcp.json) — full-power, so agent
+    // mode only. Loaded by _ensureMcpTools() before this is called.
+    if (_mcpToolCache.length) tools.push(..._mcpToolCache);
   }
   // Desktop-only tools (need the real machine: terminal PTY, headless Chrome,
   // screen/keyboard/mouse). In the web/preview build there's no Tauri backend —
@@ -7595,6 +7656,12 @@ function _buildAgentToolSchemas(includeWrite) {
 /** Translate an OpenAI tool call into the internal `call` shape `_executeToolStep` understands. */
 function _mapToolCall(name, args) {
   args = args || {};
+  // External MCP tools are dynamic (mcp__<server>__<tool>) — route by the lookup
+  // built in _ensureMcpTools so server/tool names with odd chars resolve exactly.
+  if (typeof name === "string" && name.startsWith("mcp__")) {
+    const m = _mcpToolMap.get(name);
+    return { type: "mcp", server: m ? m.server : "", tool: m ? m.tool : "", mcpName: name, args };
+  }
   switch (name) {
     case "read_file": return { type: "read", path: args.path || "", offset: args.offset, limit: args.limit };
     case "list_dir": return { type: "list", path: args.path || "" };
@@ -8332,6 +8399,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   body.appendChild(thinkingCard());
 
   const isAgent = run.mode === "agent";
+  if (isAgent) { try { await _ensureMcpTools(); } catch {} } // connect external MCP servers (cached) before exposing their tools
   const toolSchemas = _buildAgentToolSchemas(isAgent);
 
   // Files/activity bar reused from the existing agent UI.
@@ -8792,7 +8860,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", mcp: "MCP tool", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8815,6 +8883,7 @@ function _createToolStep(call) {
     termstop: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm3.5 4.5h5.5v5h-5.5v-5z"/></svg>`,
     http: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
     download: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.25 1.75a.75.75 0 011.5 0v6.69l1.97-1.97a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.53a.75.75 0 011.06-1.06l1.97 1.97V1.75zM2.5 11.25a.75.75 0 011.5 0v1.5c0 .14.11.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 0111.75 14.5h-7.5A1.75 1.75 0 012.5 12.75v-1.5z"/></svg>`,
+    mcp: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H11v1.19l1.28 1.28a1.75 1.75 0 010 2.47l-3.06 3.06a1.75 1.75 0 01-2.47 0L3.56 9.22a.75.75 0 011.06-1.06l3.19 3.19a.25.25 0 00.35 0l3.06-3.06a.25.25 0 000-.35L9.28 5.56A.75.75 0 019 5V4.5h-.75a.75.75 0 010-1.5H9V1.75zM5 1.75a.75.75 0 011.5 0V3h.75a.75.75 0 010 1.5H6.5V5a.75.75 0 01-.22.53L4.97 6.84a.75.75 0 11-1.06-1.06L5 4.69V4.5h-.75a.75.75 0 010-1.5H5V1.75z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
@@ -8823,7 +8892,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "mcp" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9689,6 +9758,21 @@ async function _executeToolStep(step, call, root, run) {
         const msg = String(e?.message || e).slice(0, 240);
         res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
         return { type: "download", path: call.dest, content: `[失败] download_file 出错: ${msg}` };
+      }
+
+    } else if (call.type === "mcp") {
+      const label = `${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "mcp", path: label, content: "[不可用] MCP 外部工具只能在桌面 App 里用（要本地启动 MCP 服务进程）。" }; }
+      if (!call.server || !call.tool) { res.className = "atc-result atc-result--err"; res.textContent = "未知工具"; return { type: "mcp", path: call.mcpName || label, content: `[失败] 未知或未连接的 MCP 工具 ${call.mcpName || label}。确认 .mcp.json 里的服务已连上。` }; }
+      try {
+        const out = await backend.invoke("mcp_call", { name: call.server, tool: call.tool, args: call.args || {} });
+        res.className = "atc-result atc-result--ok"; res.textContent = "完成";
+        if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 4000))}</pre>`;
+        return { type: "mcp", path: label, content: String(out == null || out === "" ? "(空结果)" : out).slice(0, 8000) };
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 280);
+        res.className = "atc-result atc-result--err"; res.textContent = "失败";
+        return { type: "mcp", path: label, content: `[失败] MCP 工具 ${label} 出错: ${msg}` };
       }
 
     } else if (call.type === "browser") {
