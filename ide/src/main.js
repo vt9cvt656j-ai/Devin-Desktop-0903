@@ -6359,7 +6359,7 @@ const _AI_MODE_PROMPTS = {
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 - computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px + x/y 数值）；macOS 上还会列出**可点元素**(带红色编号 + 现成坐标)——**有元素列表就直接点它给的坐标(最准)；没有的目标对着网格读 x,y 再点**，都比凭感觉估准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
-- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / **design** / **network** / **inspect** / **nodes** / **assert** / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。**做 UI 设计时用 design**：navigate 到参考站点 → design 一键抓出它的**设计系统**(颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡动画、:root CSS 变量)，照着做你自己的版本，比凭记忆配色准得多。**视觉/样式是最容易翻车的环节，别只靠肉眼看截图猜——要三方对照(协同)**：① **network** 抓包看有没有 CSS/字体/图片/接口 404/500(样式或图没出来，根因常在这)；② **inspect** 用计算后样式+布局做结构化体检(看不见的文字、对比度不足、坏图、尺寸塌陷、文字裁切、横向溢出，传 selector 深查某元素 / 留空体检整页)；③ **screenshot + 元素编号** 看整体观感与定位。先用 network/inspect 拿到真实数字定位问题，再改，改完再 inspect/截图复查。**测交互/功能（点按钮、填表单、跑通流程）别靠一遍遍截图肉眼找——慢且不准**：先 **nodes** 把整页转成结构化「节点清单」(每个节点有 i=节点号、角色、名称、状态)，用 **node=i** 直接点 / 填，操作后用 **assert**(查某文本/元素是否出现可见)或再 **nodes** 看状态变化来**快速验证**，几步就跑完一条流程。需装 Chrome/Chromium/Edge。
+- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / **design** / **check** / **network** / **inspect** / **nodes** / **assert** / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。**做 UI 设计时用 design**：navigate 到参考站点 → design 一键抓出它的**设计系统**(颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡动画、:root CSS 变量)，照着做你自己的版本，比凭记忆配色准得多。**视觉/样式是最容易翻车的环节，别只靠肉眼看截图猜——要三方对照(协同)**：① **network** 抓包看有没有 CSS/字体/图片/接口 404/500(样式或图没出来，根因常在这)；② **inspect** 用计算后样式+布局做结构化体检(看不见的文字、对比度不足、坏图、尺寸塌陷、文字裁切、横向溢出，传 selector 深查某元素 / 留空体检整页)；③ **screenshot + 元素编号** 看整体观感与定位。先用 network/inspect 拿到真实数字定位问题，再改，改完再 inspect/截图复查。**测交互/功能（点按钮、填表单、跑通流程）别靠一遍遍截图肉眼找——慢且不准**，走「节点化 + 融合验证」闭环：navigate → wait → **check**(一眼看控制台报错/资源失败/视觉缺陷的总判断，**按钮没反应/页面坏多半是 JS 报错——只有 check 看得到**) → **nodes** 把整页转成节点清单 → **node=i** 直接点/填 → **assert**(查某文本/元素出现没)或再 **check/nodes** 看状态变化 → 几步跑完并**真验证**一条流程。需装 Chrome/Chromium/Edge。
 
 # 自动化巅峰打法（browser / computer 都按这个闭环走，别盲操作）
 - **看 → 动 → 验 → 纠** 的循环：① **看**(screenshot + 元素列表/网格摸清现状) → ② **动**(用 index / 坐标精确操作一步) → ③ **验**(动完再看一眼截图，确认真生效了——页面真变了 / 真填进去了 / 真跳转了) → ④ **纠**(没如预期就 scroll 找、wait 等加载、换元素或换法，绝不假设成功往下冲)。
@@ -8069,12 +8069,18 @@ const _DESIGN_EXTRACT_JS = `(() => {
 // survives until next navigation) that records method/status/short-body for calls
 // made afterwards. No regex (template-literal safe). Inspired by DevTools Network /
 // HAR — structured network data is far more reliable than vision for load bugs.
-const _NETWORK_CAPTURE_JS = `(() => {
-  try {
+// Shared page-instrumentation hook (idempotent): wraps fetch/XHR → window.__MNET__
+// (network traffic) and console.error/warn + window error events → window.__MERR__
+// (JS errors). Installed by network/check so the agent OBSERVES console errors (the
+// #1 cause of "按钮点了没反应 / 页面坏了") together with requests — the fused
+// observation that browser-agent harnesses (Playwright / browser-use / WebVoyager)
+// rely on. No regex / no ${ } (template-literal safe).
+function _pageHookSrc() {
+  return `
+    var now = function(){ try { return performance.now(); } catch(e){ return 0; } };
     if (!window.__MNET__) {
       window.__MNET__ = [];
       var log = function(rec){ try { window.__MNET__.push(rec); if (window.__MNET__.length > 200) window.__MNET__.shift(); } catch(e){} };
-      var now = function(){ try { return performance.now(); } catch(e){ return 0; } };
       if (window.fetch && !window.fetch.__mwrap) {
         var of = window.fetch.bind(window);
         var wf = function(input, init){
@@ -8097,6 +8103,20 @@ const _NETWORK_CAPTURE_JS = `(() => {
         XP.__mwrap = true;
       }
     }
+    if (!window.__MERR__) {
+      window.__MERR__ = [];
+      var elog = function(rec){ try { window.__MERR__.push(rec); if (window.__MERR__.length > 120) window.__MERR__.shift(); } catch(e){} };
+      var fmt = function(args){ try { return Array.prototype.map.call(args, function(a){ try { return (a && a.message) ? a.message : (typeof a === 'object' ? JSON.stringify(a).slice(0,160) : String(a)); } catch(e){ return '?'; } }).join(' ').slice(0,280); } catch(e){ return '?'; } };
+      try { var oce = console.error; console.error = function(){ try { elog({ level:'error', msg:fmt(arguments) }); } catch(e){} return oce.apply(console, arguments); }; } catch(e){}
+      try { var ocw = console.warn; console.warn = function(){ try { elog({ level:'warn', msg:fmt(arguments) }); } catch(e){} return ocw.apply(console, arguments); }; } catch(e){}
+      try { window.addEventListener('error', function(ev){ try { elog({ level:'error', msg:String((ev && (ev.message || (ev.error && ev.error.message))) || 'script error').slice(0,260), src:(ev && ev.filename ? String(ev.filename).slice(0,100) + ':' + (ev.lineno||'?') : '') }); } catch(e){} }, true); } catch(e){}
+      try { window.addEventListener('unhandledrejection', function(ev){ try { var r = ev && ev.reason; elog({ level:'error', msg:'unhandledrejection: ' + String((r && (r.message || r)) || '').slice(0,240) }); } catch(e){} }); } catch(e){}
+    }`;
+}
+
+const _NETWORK_CAPTURE_JS = `(() => {
+  try {
+    ${_pageHookSrc()}
     var res = [], entries = [];
     try { entries = performance.getEntriesByType('resource') || []; } catch(e){}
     var nav = null; try { nav = (performance.getEntriesByType('navigation')||[])[0] || null; } catch(e){}
@@ -8116,11 +8136,48 @@ const _NETWORK_CAPTURE_JS = `(() => {
       total: res.length, counts: byType,
       failures: fails.slice(0, 12),
       apiCalls: hooked, apiFailCount: apiFailCount,
+      consoleErrors: (window.__MERR__||[]).slice(-8),
       slowest: res.slice().sort(function(a,b){ return b.ms-a.ms; }).slice(0, 5),
-      hint: (fails.length||apiFailCount) ? '有资源/接口加载失败(看 failures、以及 apiCalls 里 ok:false 的)，多半就是样式或视觉问题的根因' : '本次未发现加载失败的资源'
+      hint: (fails.length||apiFailCount||(window.__MERR__||[]).length) ? '有资源/接口加载失败或控制台报错(看 failures、apiCalls 里 ok:false 的、consoleErrors)，多半就是问题根因' : '本次未发现加载失败或控制台错误'
     });
   } catch (e) { return JSON.stringify({ error: String(e) }); }
 })()`;
+
+// Fused health check (一次性协同观察): one call returns a unified verdict combining
+// the four signals — console errors, failed network/API, critical visual defects,
+// and how testable the page is (interactive-node count). The agent's "is this page/
+// app actually working?" probe; drills into network/inspect/nodes/assert for detail.
+// Grounded in ReAct (observe-after-act) + browser-agent harnesses that fuse
+// console+network+DOM. No regex / no ${ } beyond the hook (template-literal safe).
+function _checkJS() {
+  return `(() => {
+    try {
+      ${_pageHookSrc()}
+      var res = [], entries = []; try { entries = performance.getEntriesByType('resource') || []; } catch(e){}
+      for (var i=0;i<entries.length;i++){ var e=entries[i], sz=e.transferSize||0, enc=e.encodedBodySize||0; res.push({ url:String(e.name).slice(0,170), type:e.initiatorType, status:(e.responseStatus||0), tk:Math.round(sz/102.4)/10, ek:Math.round(enc/102.4)/10 }); }
+      var at = { script:1, link:1, css:1, img:1, image:1, font:1, fetch:1, xmlhttprequest:1 };
+      var netFails = res.filter(function(r){ return (r.status>=400) || (r.status===0 && r.tk===0 && r.ek===0 && at[r.type]); }).map(function(r){ return { url:r.url, type:r.type, status:r.status }; }).slice(0,10);
+      var apiFails = (window.__MNET__||[]).filter(function(r){ return !r.ok; }).map(function(r){ return { url:String(r.url||'').slice(0,140), method:r.method, status:r.status }; }).slice(0,8);
+      var errs = (window.__MERR__||[]).slice(-12);
+      var errCount = errs.filter(function(x){ return x.level==='error'; }).length;
+      var visual = [];
+      try { var imgs = document.querySelectorAll('img'); for (var k=0;k<imgs.length && visual.length<8;k++){ var im=imgs[k]; if (im.complete && im.naturalWidth===0 && (im.getAttribute('src')||'')) visual.push({ type:'broken-image', src:(im.currentSrc||im.src||'').slice(0,120) }); } } catch(e){}
+      var nodeCount = 0; try { nodeCount = document.querySelectorAll('a[href],button,input:not([type=hidden]),select,textarea,[role=button],[onclick]').length; } catch(e){}
+      var ok = netFails.length===0 && apiFails.length===0 && errCount===0 && visual.length===0;
+      return JSON.stringify({
+        url: location.href, title: String(document.title||'').slice(0,80),
+        healthy: ok,
+        verdict: ok ? '✓ 未发现控制台错误 / 资源失败 / 关键视觉缺陷——页面看起来正常运行' : '✗ 发现问题（见下），先把这些修掉再继续验证',
+        consoleErrors: errs,
+        networkFailures: netFails,
+        apiFailures: apiFails,
+        visualDefects: visual,
+        interactiveNodes: nodeCount,
+        drillDown: '要细节：network(完整请求+控制台) · inspect(完整视觉体检) · nodes(可点节点清单) · assert(查某文本/元素是否出现)'
+      });
+    } catch (e) { return JSON.stringify({ error: String(e) }); }
+  })()`;
+}
 
 // Visual / style parser (样式·视觉解析器): reads COMPUTED styles + layout and runs
 // a structured "visual lint" — invisible / low-contrast text, broken images,
@@ -8311,7 +8368,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / **network(抓包：返回这页加载/请求的真实情况——失败的 CSS/JS/字体/图片/接口、捕获到的 fetch/XHR 状态与响应片段。样式或图没出来先用它看是不是某资源 404/500，比看截图准)** / **inspect(视觉/样式解析：用计算后样式+布局做结构化体检——看不见的文字/低对比度/坏图/尺寸塌陷/文字裁切/横向溢出。传 selector 深查某元素，留空体检整页。视觉问题用它拿真实数字判断，别只靠肉眼看图)** / **nodes(把整页转成「节点」：返回一份结构化的可交互节点清单——每个节点带 i=节点号、r=角色(button/link/textbox…)、n=名称、s=状态(disabled/checked/expanded/value/href)、off=在视口外。拿到后用 node=i 直接点/填，改完再 nodes 看状态变化——比一遍遍截图快得多)** / **assert(快速验证：传 selector 和/或 text，一次返回「存在吗/可见吗/匹配几个/第一个是什么」。用来确认操作真生效了——比如点完按钮后 assert text=「保存成功」，不用截图肉眼找)** / close(关)。**点/填优先用 node=节点号(来自 nodes，最稳)或 index=编号(来自截图红数字)**；都没有再用 selector。打法：navigate → wait 加载好 → **nodes 把页面转成节点清单** → 用 node=i 操作 → **assert 或再 nodes 验证状态变了**，别每步都截图(慢)。**调试「样式/视觉没对」：navigate → network 看资源加载失败 → inspect 看计算样式缺陷 → 截图三方对照。** 需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现；inspect 用(可选)：深查的元素；assert 用(可选)：要检查的选择器" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / **network(抓包：返回这页加载/请求的真实情况——失败的 CSS/JS/字体/图片/接口、捕获到的 fetch/XHR 状态与响应片段。样式或图没出来先用它看是不是某资源 404/500，比看截图准)** / **inspect(视觉/样式解析：用计算后样式+布局做结构化体检——看不见的文字/低对比度/坏图/尺寸塌陷/文字裁切/横向溢出。传 selector 深查某元素，留空体检整页。视觉问题用它拿真实数字判断，别只靠肉眼看图)** / **nodes(把整页转成「节点」：返回一份结构化的可交互节点清单——每个节点带 i=节点号、r=角色(button/link/textbox…)、n=名称、s=状态(disabled/checked/expanded/value/href)、off=在视口外。拿到后用 node=i 直接点/填，改完再 nodes 看状态变化——比一遍遍截图快得多)** / **assert(快速验证：传 selector 和/或 text，一次返回「存在吗/可见吗/匹配几个/第一个是什么」。用来确认操作真生效了——比如点完按钮后 assert text=「保存成功」，不用截图肉眼找)** / **check(一次性体检：把控制台 JS 报错 + 网络/接口失败 + 关键视觉缺陷 + 可交互节点数**融合**成一个总判断 healthy/verdict。打开页面或操作后先 check 一眼——尤其 consoleErrors 是「按钮没反应/页面坏了」的头号原因，截图根本看不出来。有问题再用 network/inspect/nodes 深挖)** / close(关)。**点/填优先用 node=节点号(来自 nodes，最稳)或 index=编号(来自截图红数字)**；都没有再用 selector。打法：navigate → wait 加载好 → **nodes 把页面转成节点清单** → 用 node=i 操作 → **assert 或再 nodes 验证状态变了**，别每步都截图(慢)。**调试「样式/视觉没对」：navigate → network 看资源加载失败 → inspect 看计算样式缺陷 → 截图三方对照。** 需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现；inspect 用(可选)：深查的元素；assert 用(可选)：要检查的选择器" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -10837,6 +10894,7 @@ async function _executeToolStep(step, call, root, run) {
         else if (act === "inspect") state = await backend.invoke("browser_eval", { script: _visualInspectJS(call.selector || "") });
         else if (act === "nodes") state = await backend.invoke("browser_eval", { script: _NODES_EXTRACT_JS });
         else if (act === "assert") state = await backend.invoke("browser_eval", { script: _assertJS(call.selector || "", call.text || "") });
+        else if (act === "check") state = await backend.invoke("browser_eval", { script: _checkJS() });
         else state = await backend.invoke("browser_screenshot");
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
@@ -10863,6 +10921,8 @@ async function _executeToolStep(step, call, root, run) {
         content += `\n**页面节点清单**（整页已转成结构化节点，比一遍遍截图快得多）。每个 \`nodes[]\`：\`i\`=节点号、\`r\`=角色、\`n\`=名称、\`s\`=状态、\`off\`=在视口外。**用 \`browser click node=i\` / \`type node=i text=…\` 直接操作**；\`off\` 的先 scroll 让它进视口。操作后再 \`nodes\` 或 \`assert\` 看状态变化来验证：\n${state.result}`;
       } else if (act === "assert" && state.result != null && state.result !== "") {
         content += `\n**验证结果**（\`exists\`=是否存在、\`visible\`=是否可见、\`matches\`=匹配数、\`first\`=第一个匹配）。据此判断上一步操作到底有没有生效——别凭感觉，看这个：\n${state.result}`;
+      } else if (act === "check" && state.result != null && state.result !== "") {
+        content += `\n**页面体检（一次性融合：控制台错误 + 网络/接口失败 + 关键视觉缺陷 + 可交互节点数）**。\`healthy\`=总体是否正常、\`verdict\`=结论；\`consoleErrors\`=JS 报错(按钮没反应/页面坏了的头号原因，截图根本看不出来)、\`networkFailures\`/\`apiFailures\`=加载或接口失败、\`visualDefects\`=坏图等。**有问题先修这些再继续**；要细节按 \`drillDown\` 用 network/inspect/nodes/assert 深挖：\n${state.result}`;
       } else if (state.result != null && state.result !== "") {
         content += `\nJS 结果: ${state.result}`;
       }
