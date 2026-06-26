@@ -8602,6 +8602,13 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // If so and the model then tries to wrap up, we make it own the failure instead
   // of reporting fake success (the "实打实，不讲假话" rule, enforced structurally).
   let lastTurnHadFailure = false, lastFailKinds = "";
+  // Stuck/loop detection: a sliding log of recent tool-call signatures + whether
+  // they failed. If the agent repeats the SAME call or keeps failing without
+  // progress, we force a diagnostic rethink (escalation over repetition) — makes
+  // it noticeably smarter at recovering instead of flailing. Result-aware so
+  // genuine progress (same call, new result) doesn't false-trigger.
+  const _callLog = [];
+  let stuckNudges = 0;
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
@@ -8736,6 +8743,32 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
         if (t === "diag") didVerify = true;
         if (t === "cmd" && /\b(test|tests|build|check|lint|tsc|typecheck|cargo|pytest|jest|vitest|mocha|phpunit|gradle|make|go\s+(build|test|vet))\b/i.test(it.call.command || "")) didVerify = true;
         if (it.tc.name === "update_plan") planSteps = it.call.steps;
+      }
+
+      // --- Stuck / loop detection → diagnostic rethink (Reflexion-style). ---
+      for (let i = 0; i < items.length; i++) {
+        const c = items[i].call;
+        if (!c) continue;
+        const sig = c.type + ":" + String(c.command || c.path || c.selector || c.action || c.url || c.op || c.title || "").slice(0, 80);
+        const failed = /\[(失败|ERROR|BLOCKED|不可用|未执行)\]/.test((toolMsgs[i] && toolMsgs[i].content) || "");
+        _callLog.push({ sig, failed });
+      }
+      if (_callLog.length > 12) _callLog.splice(0, _callLog.length - 12);
+      {
+        const win = _callLog.slice(-8);
+        const counts = {};
+        let maxRepeat = 0, fails = 0;
+        for (const e of win) {
+          counts[e.sig] = (counts[e.sig] || 0) + 1;
+          if (counts[e.sig] > maxRepeat) maxRepeat = counts[e.sig];
+          if (e.failed) fails++;
+        }
+        // Same exact call 3+ times, or 4+ failures in the recent window = flailing.
+        if ((maxRepeat >= 3 || fails >= 4) && stuckNudges < 2 && _live()) {
+          stuckNudges++;
+          _callLog.length = 0; // fresh window after intervening
+          messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。**" });
+        }
       }
 
       if (iter === _AGENT_MAX_ITERS - 1) hitCap = true;
