@@ -6359,7 +6359,7 @@ const _AI_MODE_PROMPTS = {
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 - computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px + x/y 数值）；macOS 上还会列出**可点元素**(带红色编号 + 现成坐标)——**有元素列表就直接点它给的坐标(最准)；没有的目标对着网格读 x,y 再点**，都比凭感觉估准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
-- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / **design** / **network** / **inspect** / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。**做 UI 设计时用 design**：navigate 到参考站点 → design 一键抓出它的**设计系统**(颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡动画、:root CSS 变量)，照着做你自己的版本，比凭记忆配色准得多。**视觉/样式是最容易翻车的环节，别只靠肉眼看截图猜——要三方对照(协同)**：① **network** 抓包看有没有 CSS/字体/图片/接口 404/500(样式或图没出来，根因常在这)；② **inspect** 用计算后样式+布局做结构化体检(看不见的文字、对比度不足、坏图、尺寸塌陷、文字裁切、横向溢出，传 selector 深查某元素 / 留空体检整页)；③ **screenshot + 元素编号** 看整体观感与定位。先用 network/inspect 拿到真实数字定位问题，再改，改完再 inspect/截图复查。需装 Chrome/Chromium/Edge。
+- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / **design** / **network** / **inspect** / **nodes** / **assert** / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。**做 UI 设计时用 design**：navigate 到参考站点 → design 一键抓出它的**设计系统**(颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡动画、:root CSS 变量)，照着做你自己的版本，比凭记忆配色准得多。**视觉/样式是最容易翻车的环节，别只靠肉眼看截图猜——要三方对照(协同)**：① **network** 抓包看有没有 CSS/字体/图片/接口 404/500(样式或图没出来，根因常在这)；② **inspect** 用计算后样式+布局做结构化体检(看不见的文字、对比度不足、坏图、尺寸塌陷、文字裁切、横向溢出，传 selector 深查某元素 / 留空体检整页)；③ **screenshot + 元素编号** 看整体观感与定位。先用 network/inspect 拿到真实数字定位问题，再改，改完再 inspect/截图复查。**测交互/功能（点按钮、填表单、跑通流程）别靠一遍遍截图肉眼找——慢且不准**：先 **nodes** 把整页转成结构化「节点清单」(每个节点有 i=节点号、角色、名称、状态)，用 **node=i** 直接点 / 填，操作后用 **assert**(查某文本/元素是否出现可见)或再 **nodes** 看状态变化来**快速验证**，几步就跑完一条流程。需装 Chrome/Chromium/Edge。
 
 # 自动化巅峰打法（browser / computer 都按这个闭环走，别盲操作）
 - **看 → 动 → 验 → 纠** 的循环：① **看**(screenshot + 元素列表/网格摸清现状) → ② **动**(用 index / 坐标精确操作一步) → ③ **验**(动完再看一眼截图，确认真生效了——页面真变了 / 真填进去了 / 真跳转了) → ④ **纠**(没如预期就 scroll 找、wait 等加载、换元素或换法，绝不假设成功往下冲)。
@@ -8184,6 +8184,90 @@ function _visualInspectJS(selector) {
   })()`;
 }
 
+// Node-tree extractor (把网站转成"节点"): snapshot the page as a compact, flat list
+// of interactive/structural NODES — each tagged with a stable `data-mnode` id so
+// the agent can act by id (`browser click node=N`) and re-snapshot to VERIFY the
+// new state, fast, without re-screenshotting. role + accessible-name + state
+// (disabled/checked/expanded/value/href) per node, plus headings for structure.
+// This is the accessibility-tree / browser-use approach: structured nodes are
+// 20-50× cheaper and far more reliable than pixel vision for click-and-verify.
+// No regex (template-literal safe); capped to stay under the browser_eval limit.
+const _NODES_EXTRACT_JS = `(() => {
+  try {
+    var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
+    document.querySelectorAll('[data-mnode]').forEach(function(e){ e.removeAttribute('data-mnode'); });
+    var SEL = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=checkbox],[role=switch],[role=radio],[role=option],[role=combobox],[role=slider],[onclick],[contenteditable=""],[contenteditable=true],summary,label';
+    var nameOf = function(el){ var t = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || (el.tagName==='INPUT'||el.tagName==='SELECT'||el.tagName==='TEXTAREA'? '' : (el.innerText||el.textContent||'')) || el.getAttribute('name') || ''; return clean(t).slice(0,52); };
+    var isH = function(tag){ return tag.length===2 && tag.charAt(0)==='h' && tag.charAt(1)>='1' && tag.charAt(1)<='6'; };
+    var roleOf = function(el){ var r=el.getAttribute('role'); if (r) return r; var tag=el.tagName.toLowerCase();
+      if (tag==='a') return 'link'; if (tag==='button') return 'button';
+      if (tag==='input'){ var ty=(el.getAttribute('type')||'text').toLowerCase(); if (ty==='checkbox') return 'checkbox'; if (ty==='radio') return 'radio'; if (ty==='submit'||ty==='button'||ty==='reset'||ty==='image') return 'button'; if (ty==='range') return 'slider'; if (ty==='file') return 'file'; return 'textbox'; }
+      if (tag==='select') return 'combobox'; if (tag==='textarea') return 'textbox';
+      if (isH(tag)) return 'heading'; if (tag==='summary') return 'summary'; if (tag==='label') return 'label';
+      return tag; };
+    var stateOf = function(el){ var s={};
+      if (el.disabled || el.getAttribute('aria-disabled')==='true') s.disabled=true;
+      if (el.checked || el.getAttribute('aria-checked')==='true') s.checked=true;
+      var exp=el.getAttribute('aria-expanded'); if (exp!=null) s.expanded=(exp==='true');
+      if (el.getAttribute('aria-selected')==='true') s.selected=true;
+      if ((el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.tagName==='SELECT') && el.value) s.value=String(el.value).slice(0,32);
+      if (el.tagName==='A' && el.getAttribute('href')) s.href=el.getAttribute('href').slice(0,70);
+      return s; };
+    var nodes=[], id=0;
+    var els = Array.prototype.slice.call(document.querySelectorAll(SEL), 0, 1500);
+    for (var i=0;i<els.length;i++){
+      if (id>=110) break;
+      var el=els[i], r; try { r=el.getBoundingClientRect(); } catch(e){ continue; }
+      var cs=getComputedStyle(el);
+      if (r.width<1||r.height<1||cs.visibility==='hidden'||cs.display==='none'||cs.opacity==='0') continue;
+      el.setAttribute('data-mnode', String(id));
+      var inView = !(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth);
+      var node={ i:id, r:roleOf(el), n:nameOf(el) };
+      var st=stateOf(el); for (var kk in st){ node.s=st; break; }
+      if (!inView) node.off=1;
+      nodes.push(node); id++;
+    }
+    var heads = Array.prototype.slice.call(document.querySelectorAll('h1,h2,h3'), 0, 20)
+      .map(function(h){ return { r:'h'+(h.tagName.charAt(1)), n:clean(h.innerText||'').slice(0,56) }; })
+      .filter(function(h){ return h.n; }).slice(0,12);
+    return JSON.stringify({ url:location.href, title:clean(document.title).slice(0,80), total:id, structure:heads, nodes:nodes,
+      legend:'i=节点号(用 browser click/type node=i 操作)·r=角色·n=名称·s=状态(disabled/checked/expanded/value/href)·off=1 表示在视口外(先 scroll 再点)' });
+  } catch (e) { return JSON.stringify({ error: String(e) }); }
+})()`;
+
+// Fast structured assertion (快速验证): does an element matching {selector?, text?}
+// exist and is it visible/enabled? One cheap call returns yes/no + the first match
+// — so the agent verifies an action took effect (toast appeared, button disabled,
+// value set) WITHOUT a screenshot. No regex (template-literal safe).
+function _assertJS(selector, text) {
+  return `(() => {
+    try {
+      var SEL = ${JSON.stringify(selector || "")}, TXT = ${JSON.stringify(text || "")};
+      var clean = function(s){ s=String(s||''); var out='', sp=false; for (var k=0;k<s.length;k++){ var ch=s[k]; if (ch===' '||ch==='\\n'||ch==='\\t'||ch==='\\r'){ if(!sp){ out+=' '; sp=true; } } else { out+=ch; sp=false; } } return out.trim(); };
+      var pool; try { pool = Array.prototype.slice.call(document.querySelectorAll(SEL || 'body *'), 0, 4000); } catch(e){ return JSON.stringify({ error:'无效 selector: '+SEL }); }
+      var want = TXT ? TXT.toLowerCase() : '';
+      var matches=0, visibleCount=0, first=null;
+      for (var i=0;i<pool.length;i++){
+        var el=pool[i];
+        if (want){
+          var t = clean(el.innerText||el.textContent||el.value||'').toLowerCase();
+          if (t.indexOf(want)<0) continue;
+          // prefer the tightest element containing the text (skip if a child also has it)
+          var childHas=false; try { childHas = Array.prototype.some.call(el.children, function(c){ return clean(c.innerText||c.textContent||'').toLowerCase().indexOf(want)>=0; }); } catch(e){}
+          if (childHas) continue;
+        }
+        matches++;
+        var r; try { r=el.getBoundingClientRect(); } catch(e){ continue; }
+        var cs=getComputedStyle(el);
+        var vis=!(r.width<1||r.height<1||cs.visibility==='hidden'||cs.display==='none'||cs.opacity==='0');
+        if (vis) visibleCount++;
+        if (!first) first={ tag:el.tagName.toLowerCase(), node:(el.getAttribute('data-mnode')||null), text:clean(el.innerText||el.textContent||el.value||'').slice(0,80), visible:vis, disabled:!!el.disabled, box:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)} };
+      }
+      return JSON.stringify({ query:{selector:SEL,text:TXT}, exists:matches>0, visible:visibleCount>0, matches:matches, first:first });
+    } catch(e){ return JSON.stringify({ error:String(e) }); }
+  })()`;
+}
+
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容（默认最多约 400 行）。文件很大时用 offset/limit 分页继续读完。改文件前先读清楚。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
@@ -8227,7 +8311,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / **network(抓包：返回这页加载/请求的真实情况——失败的 CSS/JS/字体/图片/接口、捕获到的 fetch/XHR 状态与响应片段。样式或图没出来先用它看是不是某资源 404/500，比看截图准)** / **inspect(视觉/样式解析：用计算后样式+布局做结构化体检——看不见的文字/低对比度/坏图/尺寸塌陷/文字裁切/横向溢出。传 selector 深查某元素，留空体检整页。视觉问题用它拿真实数字判断，别只靠肉眼看图)** / close(关)。**点/填优先用 index=元素列表里的编号**(对应截图红数字，最准)；列表没有的元素先 scroll 找、或用 selector。打法：navigate → wait 让它加载好 → 看截图和元素列表 → 用 index 操作 → **再看截图确认动作真生效了**，没生效就 scroll/wait/换法。**调试「样式/视觉没对」时别只盯截图猜：navigate → network 看有没有资源加载失败 → inspect 看计算样式层面的缺陷 → 截图三方对照，定位才准。** 需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, index: { type: "integer", description: "click/type 用(首选)：元素列表里的编号(截图上的红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现；inspect 用(可选)：要深查的元素，留空体检整页" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / **network(抓包：返回这页加载/请求的真实情况——失败的 CSS/JS/字体/图片/接口、捕获到的 fetch/XHR 状态与响应片段。样式或图没出来先用它看是不是某资源 404/500，比看截图准)** / **inspect(视觉/样式解析：用计算后样式+布局做结构化体检——看不见的文字/低对比度/坏图/尺寸塌陷/文字裁切/横向溢出。传 selector 深查某元素，留空体检整页。视觉问题用它拿真实数字判断，别只靠肉眼看图)** / **nodes(把整页转成「节点」：返回一份结构化的可交互节点清单——每个节点带 i=节点号、r=角色(button/link/textbox…)、n=名称、s=状态(disabled/checked/expanded/value/href)、off=在视口外。拿到后用 node=i 直接点/填，改完再 nodes 看状态变化——比一遍遍截图快得多)** / **assert(快速验证：传 selector 和/或 text，一次返回「存在吗/可见吗/匹配几个/第一个是什么」。用来确认操作真生效了——比如点完按钮后 assert text=「保存成功」，不用截图肉眼找)** / close(关)。**点/填优先用 node=节点号(来自 nodes，最稳)或 index=编号(来自截图红数字)**；都没有再用 selector。打法：navigate → wait 加载好 → **nodes 把页面转成节点清单** → 用 node=i 操作 → **assert 或再 nodes 验证状态变了**，别每步都截图(慢)。**调试「样式/视觉没对」：navigate → network 看资源加载失败 → inspect 看计算样式缺陷 → 截图三方对照。** 需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现；inspect 用(可选)：深查的元素；assert 用(可选)：要检查的选择器" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -8320,6 +8404,9 @@ function _mapToolCall(name, args) {
       // so the agent acts by number instead of guessing CSS. Falls back to selector.
       let _bsel = args.selector || "";
       if (args.index != null && args.index !== "" && Number.isFinite(Number(args.index))) _bsel = `[data-mref="${Number(args.index)}"]`;
+      // Node id from the `nodes` snapshot → a stable [data-mnode] selector, so the
+      // agent acts on the page's structured nodes by number (node=N).
+      if (args.node != null && args.node !== "" && Number.isFinite(Number(args.node))) _bsel = `[data-mnode="${Number(args.node)}"]`;
       return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: _bsel, text: args.text || "", key: args.key || "", amount: args.amount, ms: args.ms, script: args.script || "" };
     }
     case "computer": return { type: "computer", action: args.action || "screenshot", x: args.x, y: args.y, button: args.button || "", text: args.text || "", key: args.key || "", amount: args.amount };
@@ -10748,6 +10835,8 @@ async function _executeToolStep(step, call, root, run) {
         else if (act === "design") state = await backend.invoke("browser_eval", { script: _DESIGN_EXTRACT_JS });
         else if (act === "network") state = await backend.invoke("browser_eval", { script: _NETWORK_CAPTURE_JS });
         else if (act === "inspect") state = await backend.invoke("browser_eval", { script: _visualInspectJS(call.selector || "") });
+        else if (act === "nodes") state = await backend.invoke("browser_eval", { script: _NODES_EXTRACT_JS });
+        else if (act === "assert") state = await backend.invoke("browser_eval", { script: _assertJS(call.selector || "", call.text || "") });
         else state = await backend.invoke("browser_screenshot");
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
@@ -10770,6 +10859,10 @@ async function _executeToolStep(step, call, root, run) {
         content += `\n**网络抓包**（这一页加载/请求的真实情况，结构化数据，比看截图可靠）。**样式 / 图片 / 视觉出问题，先看这里**：\`failures\` = 加载失败的资源(CSS/JS/字体/图片/接口，多半就是根因)，\`apiCalls\` = 捕获到的 fetch/XHR(看 \`ok:false\` 的就是失败接口，及其状态/响应片段)。逐条核对失败项再去改：\n${state.result}`;
       } else if (act === "inspect" && state.result != null && state.result !== "") {
         content += `\n**视觉/样式解析**（基于计算后样式 + 布局做的结构化体检——对比度、盒模型、坏图、塌陷、裁切、横向溢出；用真实数字判断，别只靠肉眼看图）。\`issues\` 里 \`sev=error\` 是确定的视觉缺陷（看不见的文字 / 坏图 / 尺寸塌陷），\`warn\` 是疑似问题。逐条核对并修，改完再 inspect 复查：\n${state.result}`;
+      } else if (act === "nodes" && state.result != null && state.result !== "") {
+        content += `\n**页面节点清单**（整页已转成结构化节点，比一遍遍截图快得多）。每个 \`nodes[]\`：\`i\`=节点号、\`r\`=角色、\`n\`=名称、\`s\`=状态、\`off\`=在视口外。**用 \`browser click node=i\` / \`type node=i text=…\` 直接操作**；\`off\` 的先 scroll 让它进视口。操作后再 \`nodes\` 或 \`assert\` 看状态变化来验证：\n${state.result}`;
+      } else if (act === "assert" && state.result != null && state.result !== "") {
+        content += `\n**验证结果**（\`exists\`=是否存在、\`visible\`=是否可见、\`matches\`=匹配数、\`first\`=第一个匹配）。据此判断上一步操作到底有没有生效——别凭感觉，看这个：\n${state.result}`;
       } else if (state.result != null && state.result !== "") {
         content += `\nJS 结果: ${state.result}`;
       }
