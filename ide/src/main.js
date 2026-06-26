@@ -6045,6 +6045,7 @@ const _AI_MODE_PROMPTS = {
 - 正式 UI **绝不用 emoji 当图标**，一律 SVG（Lucide / Heroicons / Tabler 或自己写干净 24×24 SVG）。
 - 状态做全（hover / focus / active / disabled / loading / 空 / 错误）、语义 + aria + 键盘可达、对比度 WCAG AA、响应式不溢出、动效尊重 prefers-reduced-motion。
 - **视觉闭环（你有"眼睛"别盲改）**：run_in_terminal 起 dev server → screenshot 截地址亲眼看 → 据图改 → 再 screenshot 复看；并截 375/768/1280 三档查响应式。没亲眼看过渲染效果不算交付。
+- **设计先抓参考（做 UI 别凭记忆配色）**：动手前用 browser navigate 到 1-2 个一流参考站(Linear/Stripe/Vercel/你要对标的同类产品) → **browser design** 抓出它们的真实设计系统(颜色/字体/字号阶/圆角/阴影/渐变/动效/CSS 变量)，再 screenshot 看版式 → 据此形成**你自己的**设计 token 与组件(参考不是照搬)，做出来后再 screenshot 对照打磨。这样配色、排版、间距、动效都有真实依据，比拍脑袋强得多。
 - **做完功能就录一段演示给用户看（强烈建议，尤其 UI / 可交互功能）**：功能做好并验证通过后，用 start_demo 开录 → 用 browser（网页）或 computer（桌面）**真实地走一遍关键流程**（打开 → 点 → 填 → 看结果，每个动作自动录成一帧真截图）→ stop_demo 收尾。系统会把这段**一步步回放展示给用户**，并存成可打开播放的录屏文件。让用户**亲眼看到"它真的跑起来了、长这样、怎么用"**，比你用文字说"做好了"强得多。
 
 # 数据与数据库（涉及持久化/存储时——要真的会用，不是只会 SQLite）
@@ -6154,7 +6155,7 @@ const _AI_MODE_PROMPTS = {
 - stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 - computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。截图上**叠加了坐标网格**（每 100px + x/y 数值）；macOS 上还会列出**可点元素**(带红色编号 + 现成坐标)——**有元素列表就直接点它给的坐标(最准)；没有的目标对着网格读 x,y 再点**，都比凭感觉估准得多。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
-- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。用于自主上网、端到端测试你做的网页、抓需交互才出现的信息。需装 Chrome/Chromium/Edge。
+- browser(action, …)：**自主操控真实浏览器并能看见它**——navigate / click / type / press / **scroll** / **wait** / eval / screenshot / **design** / close。每个动作都回传：截图(可点元素标了**红色数字编号**) + **可交互元素列表**([编号] 标签 文字) + 可见文本。**点 / 填优先用 index=编号**(对应截图红数字)，比猜 CSS 稳得多、省 token；目标在视口外就先 **scroll**(amount 正下负上)让它出现、元素会重新编号；页面没加载好就 **wait**(传 selector 等元素出现 / 传 ms 等时间)。**做 UI 设计时用 design**：navigate 到一个参考站点 → design 一键抓出它的**设计系统**(常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡与动画、:root 的 CSS 变量)，再照着这套真实设计语言做、形成你自己的版本——比凭记忆配色排版准得多。需装 Chrome/Chromium/Edge。
 
 # 自动化巅峰打法（browser / computer 都按这个闭环走，别盲操作）
 - **看 → 动 → 验 → 纠** 的循环：① **看**(screenshot + 元素列表/网格摸清现状) → ② **动**(用 index / 坐标精确操作一步) → ③ **验**(动完再看一眼截图，确认真生效了——页面真变了 / 真填进去了 / 真跳转了) → ④ **纠**(没如预期就 scroll 找、wait 等加载、换元素或换法，绝不假设成功往下冲)。
@@ -7802,6 +7803,41 @@ function _demoHtml(frames, title) {
     + "show(0);\n</script>\n</body></html>";
 }
 
+// Design-system extractor: run in a page (via browser eval) to grab its real
+// design tokens from computed styles — colors by usage, typography, spacing, radii,
+// shadows, gradients, CSS custom properties, and motion (durations + easing). Lets
+// the agent design GROUNDED in a real reference instead of from memory. No regex
+// (so it's safe inside a template literal / no backslash escaping).
+const _DESIGN_EXTRACT_JS = `(() => {
+  try {
+    const vars = {};
+    for (const sheet of document.styleSheets) {
+      try {
+        for (const rule of (sheet.cssRules || [])) {
+          if (rule.selectorText && (rule.selectorText === ':root' || rule.selectorText === 'html' || rule.selectorText.indexOf(':root') === 0)) {
+            for (const p of rule.style) { if (p.indexOf('--') === 0) vars[p] = rule.style.getPropertyValue(p).trim(); }
+          }
+        }
+      } catch (e) {}
+    }
+    const all = Array.prototype.slice.call(document.querySelectorAll('body *'), 0, 1800);
+    const colors = {}, bgs = {}, fonts = {}, sizes = {}, weights = {}, radii = {}, shadows = {}, transitions = {}, anims = {}, grads = {};
+    const bump = (m, k) => { if (!k) return; k = String(k).trim(); if (k === 'none' || k === 'normal' || k === '0px' || k === 'rgba(0, 0, 0, 0)' || k === 'transparent' || k === 'auto') return; m[k] = (m[k] || 0) + 1; };
+    for (const el of all) {
+      let r; try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+      if (r.width < 4 || r.height < 4) continue;
+      const cs = getComputedStyle(el);
+      bump(colors, cs.color); bump(bgs, cs.backgroundColor);
+      if (cs.backgroundImage && cs.backgroundImage.indexOf('gradient') >= 0) bump(grads, cs.backgroundImage.slice(0, 120));
+      bump(fonts, cs.fontFamily); bump(sizes, cs.fontSize); bump(weights, cs.fontWeight);
+      bump(radii, cs.borderRadius); bump(shadows, cs.boxShadow); bump(transitions, cs.transition);
+      if (cs.animationName && cs.animationName !== 'none') bump(anims, cs.animationName + ' (' + cs.animationDuration + ', ' + cs.animationTimingFunction + ')');
+    }
+    const top = (m, n) => Object.keys(m).sort((a, b) => m[b] - m[a]).slice(0, n);
+    return JSON.stringify({ cssVars: vars, textColors: top(colors, 8), backgrounds: top(bgs, 8), gradients: top(grads, 4), fontFamilies: top(fonts, 4), fontSizes: top(sizes, 12), fontWeights: top(weights, 6), borderRadii: top(radii, 6), shadows: top(shadows, 5), transitions: top(transitions, 5), animations: top(anims, 6) });
+  } catch (e) { return JSON.stringify({ error: String(e) }); }
+})()`;
+
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容（默认最多约 400 行）。文件很大时用 offset/limit 分页继续读完。改文件前先读清楚。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
@@ -7845,7 +7881,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。改完代码后整理格式时用。没有可用格式化服务时会提示改用 run_cmd 跑 prettier/rustfmt/gofmt 等。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / close(关)。**点/填优先用 index=元素列表里的编号**(对应截图红数字，最准)；列表没有的元素先 scroll 找、或用 selector。打法：navigate → wait 让它加载好 → 看截图和元素列表 → 用 index 操作 → **再看截图确认动作真生效了**，没生效就 scroll/wait/换法。需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, index: { type: "integer", description: "click/type 用(首选)：元素列表里的编号(截图上的红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / close(关)。**点/填优先用 index=元素列表里的编号**(对应截图红数字，最准)；列表没有的元素先 scroll 找、或用 selector。打法：navigate → wait 让它加载好 → 看截图和元素列表 → 用 index 操作 → **再看截图确认动作真生效了**，没生效就 scroll/wait/换法。需装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, index: { type: "integer", description: "click/type 用(首选)：元素列表里的编号(截图上的红色数字)" }, selector: { type: "string", description: "click/type 用(备选)：CSS 选择器；wait 用：等这个选择器出现" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -10358,6 +10394,7 @@ async function _executeToolStep(step, call, root, run) {
         else if (act === "scroll") state = await backend.invoke("browser_scroll", { amount: Number.isFinite(call.amount) ? Math.round(call.amount) : 600 });
         else if (act === "wait") state = await backend.invoke("browser_wait", { selector: call.selector || null, ms: Number.isFinite(call.ms) ? Math.round(call.ms) : null });
         else if (act === "eval") state = await backend.invoke("browser_eval", { script: call.script || "" });
+        else if (act === "design") state = await backend.invoke("browser_eval", { script: _DESIGN_EXTRACT_JS });
         else state = await backend.invoke("browser_screenshot");
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
@@ -10374,7 +10411,11 @@ async function _executeToolStep(step, call, root, run) {
       step.classList.add("is-open");
       _chatFollow();
       let content = `浏览器 [${act}] → ${state.title || ""}（${state.url || ""}）`;
-      if (state.result != null && state.result !== "") content += `\nJS 结果: ${state.result}`;
+      if (act === "design" && state.result != null && state.result !== "") {
+        content += `\n**该页面的设计系统画像**（颜色/字体/字号阶/字重/圆角/阴影/渐变/过渡/动画/CSS 变量，按使用频率）——照这个设计语言做就和参考站一致：\n${state.result}`;
+      } else if (state.result != null && state.result !== "") {
+        content += `\nJS 结果: ${state.result}`;
+      }
       const _els = Array.isArray(state.elements) ? state.elements : [];
       if (_els.length) {
         content += `\n可交互元素（截图上有对应红色数字标记，用 index=编号 直接 click/type，最准）:\n` +
