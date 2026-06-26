@@ -3347,7 +3347,8 @@ async function openFolder(path) {
   // Opening a different project should immediately retag the active chat tab.
   const _sess = _currentSession();
   if (_sess && _sess.project !== path) { _sess.project = path; _renderChatTabs(); saveChatHistory(); }
-  try { await backend.registerWorkspaceRoot(path); } catch { /* browser preview */ }
+  try { await backend.registerWorkspaceRoot(path); }
+  catch (e) { if (inTauri) showToast(`⚠️ 打开「${basename(path)}」时注册失败：${String(e?.message || e).slice(0, 80)}。该目录下读写可能被拒绝。`); }
   _ipcBroadcast("workspace_changed", { roots: [path], active: path });
   await renderWorkspaceRoots();
   preloadProjectModels(path);
@@ -3422,7 +3423,13 @@ async function _addWorkspaceRoot(picked) {
   if (!picked) return;
   if (workspaceRoots.includes(picked)) { setActiveWorkspaceRoot(picked); showToast(`${basename(picked)} 已在工作区`); return; }
   workspaceRoots.push(picked);
-  try { await backend.registerWorkspaceRoot(picked); } catch { /* browser preview */ }
+  try { await backend.registerWorkspaceRoot(picked); }
+  catch (e) {
+    // Desktop: failed registration ⇒ the backend sandbox rejects reads/writes
+    // under this folder ("access denied") — tell the user now instead of letting
+    // a later write fail mysteriously. (Browser preview mocks the cmd; ignore.)
+    if (inTauri) showToast(`⚠️ 添加「${basename(picked)}」失败：${String(e?.message || e).slice(0, 80)}。该目录下的读写可能被拒绝。`);
+  }
   _ipcBroadcast("workspace_changed", { roots: [...workspaceRoots], active: picked });
   setActiveWorkspaceRoot(picked);
   await renderWorkspaceRoots();
@@ -6636,7 +6643,8 @@ async function _gatherAgentContext(query) {
   if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)`;
   // Knowledge-graph memory is retrieved per-query (relevant subgraph), so it lives
   // OUTSIDE the cached project context and is appended fresh on every call.
-  if (_agentContextCache.root === root && Date.now() - _agentContextCache.ts < 15000) return _agentContextCache.data + _kgRetrieveBlock(root, query || "");
+  const rootsKey = _allRoots().join("|");
+  if (_agentContextCache.rootsKey === rootsKey && Date.now() - _agentContextCache.ts < 15000) return _agentContextCache.data + _kgRetrieveBlock(root, query || "");
 
   const parts = [osBlock, `当前工作区: ${root}`];
 
@@ -6673,6 +6681,26 @@ async function _gatherAgentContext(query) {
         parts.push(treeResult.stdout.trim());
       }
     } catch {}
+  }
+
+  // Multi-root awareness: list the OTHER open folders (with a short tree each) so
+  // the agent knows they exist and addresses files in them correctly — the cause
+  // of "读错目录". Path tools resolve across all roots, but the model should use a
+  // root-qualified or absolute path for non-active folders.
+  const _activeNorm = root.replace(/\/+$/, "");
+  const _others = _allRoots().filter((r) => r !== _activeNorm);
+  if (_others.length) {
+    parts.push(`\n⚠️ 现在打开了 ${_others.length + 1} 个工作区文件夹。跨目录操作时**用绝对路径，或在相对路径前加目标文件夹名**（如 ${_others[0].split("/").pop()}/子路径/文件），别默认都在当前工作区「${_activeNorm.split("/").pop()}」，否则会读/写错目录。`);
+    for (const r of _others.slice(0, 4)) {
+      parts.push(`\n另一个工作区: ${r}`);
+      try {
+        const treeCmd = osDetail.os === "Windows"
+          ? "dir /b"
+          : "find . -maxdepth 2 -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' -not -path '*/target/*' -not -path '*/.venv/*' 2>/dev/null | head -40 | sort";
+        const tr = await backend.taskRunCapture(r, treeCmd);
+        if (tr?.stdout?.trim()) parts.push(tr.stdout.trim());
+      } catch {}
+    }
   }
 
   if (activePath && openFiles.has(activePath)) {
@@ -6715,7 +6743,7 @@ async function _gatherAgentContext(query) {
     const maxLen = Math.floor(ctx.length * ratio);
     ctx = ctx.slice(0, maxLen) + "\n...(context truncated to fit " + CTX_TOKEN_BUDGET + " token budget)";
   }
-  _agentContextCache = { root, ts: Date.now(), data: ctx };
+  _agentContextCache = { rootsKey, root, ts: Date.now(), data: ctx };
   return ctx + _kgRetrieveBlock(root, query || "");
 }
 
@@ -9984,6 +10012,72 @@ function _createToolStep(call) {
   return step;
 }
 
+// ---- Multi-root path resolution -------------------------------------------
+// When several folders are open, a relative path must resolve against the RIGHT
+// root, not always the active one — otherwise the agent reads the wrong file (or
+// writes to the wrong place). active root first, then the others.
+function _allRoots() {
+  const active = (rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
+  const roots = [];
+  if (active) roots.push(active);
+  for (const r of workspaceRoots) { const rr = (r || "").replace(/\/+$/, ""); if (rr && !roots.includes(rr)) roots.push(rr); }
+  return roots;
+}
+// Every plausible absolute path for a (possibly relative) agent path, across ALL
+// roots — for read/list, tried in order until one exists. Order: active-root,
+// other-roots, root-name-qualified ("proj2/src/x" where a root folder is proj2),
+// then the raw path.
+function _relCandidates(rawPath) {
+  const out = [];
+  const push = (p) => { if (p && !out.includes(p)) out.push(p); };
+  const isAbs = rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath);
+  if (isAbs) {
+    push(rawPath);
+    const base = rawPath.split(/[\\/]/).pop();
+    for (const r of _allRoots()) if (base) push(r + "/" + base); // stale-abs fallback
+    return out;
+  }
+  const clean = rawPath.replace(/^\.\//, "").replace(/^\/+/, "");
+  for (const r of _allRoots()) push(r + "/" + clean);
+  for (const r of _allRoots()) {
+    const base = r.split("/").pop();
+    if (base && (clean === base || clean.startsWith(base + "/"))) {
+      const sub = clean.slice(base.length).replace(/^\/+/, "");
+      push(sub ? r + "/" + sub : r);
+    }
+  }
+  push(rawPath);
+  return out;
+}
+// Single deterministic resolution for a path we're about to WRITE/CREATE (no
+// existence probing): absolute as-is; root-name-qualified → that root; else the
+// active root.
+function _resolveRel(rel) {
+  if (!rel) return rel;
+  if (rel.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rel)) return rel;
+  const clean = rel.replace(/^\.\//, "").replace(/^\/+/, "");
+  const roots = _allRoots();
+  if (!roots.length) return rel;
+  for (const r of roots) {
+    const base = r.split("/").pop();
+    if (base && (clean === base || clean.startsWith(base + "/"))) {
+      const sub = clean.slice(base.length).replace(/^\/+/, "");
+      return sub ? r + "/" + sub : r;
+    }
+  }
+  return roots[0] + "/" + clean;
+}
+// Resolve a path that should already EXIST (edit / read target): the first
+// candidate across all roots that the backend can read; falls back to the
+// write-resolution if none exist yet (a brand-new file).
+async function _resolveExisting(rel) {
+  if (!rel) return rel;
+  for (const cand of _relCandidates(rel)) {
+    try { await backend.readTextFile(cand); return cand; } catch {}
+  }
+  return _resolveRel(rel);
+}
+
 async function _executeToolStep(step, call, root, run) {
   const vp = step.querySelector(".atc-viewport");
   const res = step.querySelector(".atc-result");
@@ -10015,17 +10109,9 @@ async function _executeToolStep(step, call, root, run) {
       if (rawPath.startsWith("~/") && homeDir) {
         rawPath = homeDir + rawPath.slice(1);
       }
-      const candidates = [];
-      if (rawPath.startsWith("/")) {
-        candidates.push(rawPath);
-        if (root && !rawPath.startsWith(root)) {
-          const basename = rawPath.split("/").pop();
-          if (basename) candidates.push(root + "/" + basename);
-        }
-      } else {
-        if (root) candidates.push(root + "/" + rawPath);
-        candidates.push(rawPath);
-      }
+      // Try EVERY open workspace root (active first), so a file in an added folder
+      // resolves there instead of reading the wrong file under the active root.
+      const candidates = _relCandidates(rawPath);
 
       let txt = "";
       let readFailed = true;
@@ -10130,11 +10216,16 @@ async function _executeToolStep(step, call, root, run) {
       // paths get re-rooted at the workspace. (The old code re-rooted anything
       // not under root/tmp/macOS-/Users — which broke real absolute paths on
       // Linux, e.g. /etc or /home.)
-      const fp = call.path.startsWith("/") ? call.path : (root ? root + "/" + call.path.replace(/^\/+/, "") : call.path);
+      // Multi-root: try the dir under each open root (active first) until one lists.
+      const _cands = _relCandidates(call.path);
+      let fp = _cands[0] || call.path;
       let entries = [];
-      try {
-        entries = await backend.readDir(fp);
-      } catch {
+      let _listed = false;
+      for (const cand of _cands) {
+        try { entries = await backend.readDir(cand); fp = cand; _listed = true; break; } catch {}
+      }
+      if (!_listed) {
+        // Fall back to a shell `ls` on the best-guess path (e.g. a dir outside all roots).
         try {
           const r = await backend.taskRunCapture(root || "/tmp", `ls -la "${fp}" 2>/dev/null | head -60`);
           const ls = r?.stdout || "";
@@ -10154,7 +10245,11 @@ async function _executeToolStep(step, call, root, run) {
       return { type: "list", path: call.path, content: listing || "(empty directory)" };
 
     } else if (call.type === "write" || call.type === "edit") {
-      const fp = call.path.startsWith("/") ? call.path : root + "/" + call.path;
+      // Multi-root: `edit` requires an existing file, so find it in whichever open
+      // root has it. `write` resolves deterministically (root-qualified or active
+      // root) — it must NOT hunt other roots, or a bare path could clobber a
+      // same-named file in a different project.
+      const fp = call.type === "edit" ? await _resolveExisting(call.path) : _resolveRel(call.path);
       let old = "";
       let existed = false;
       try { old = await backend.readTextFile(fp); existed = true; } catch {}
@@ -10256,7 +10351,7 @@ async function _executeToolStep(step, call, root, run) {
       return { type: call.type, path: call.path, content: existed ? `已修改 ${call.path}（+${added}/-${removed} 行）。` : `已新建 ${call.path}（${added} 行）。` };
 
     } else if (call.type === "multiedit") {
-      const fp = call.path.startsWith("/") ? call.path : root + "/" + call.path;
+      const fp = await _resolveExisting(call.path);
       let old = "";
       try { old = await backend.readTextFile(fp); }
       catch {
