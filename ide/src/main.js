@@ -6004,7 +6004,10 @@ function _renderTokenMeter(pin, cached, out, estimated) {
     el.textContent = `≈ 输入 ${k(pin)} · 输出 ${k(out)}（供应商未上报用量，缓存%未知）`;
   } else {
     const hit = pin > 0 ? Math.round((cached / pin) * 100) : 0;
-    el.textContent = `↺ 缓存 ${hit}% · 输入 ${k(pin)}（缓存 ${k(cached)}）· 输出 ${k(out)}`;
+    // Show the running SESSION hit rate too, so the user can see at a glance whether
+    // caching is actually working well across the whole conversation.
+    const sess = _tok.in > 0 ? ` · 本会话累计命中 ${cumHit}%` : "";
+    el.textContent = `↺ 本轮缓存 ${hit}% · 输入 ${k(pin)}（缓存 ${k(cached)}）· 输出 ${k(out)}${sess}`;
   }
   el.title = `本会话累计：输入 ${_tok.in}（缓存命中 ${_tok.cached}，约 ${cumHit}%）· 输出 ${_tok.out}` +
     (_tok.anyReal ? "" : "\n注：本会话供应商一直没上报 usage，数字为估算；缓存命中需供应商在流里回传 usage 才能显示。");
@@ -7949,6 +7952,9 @@ async function _ensureMcpTools() {
       }
     } catch (e) { failed.push(`${sname}: ${String(e?.message || e).slice(0, 80)}`); }
   }));
+  // Parallel connects resolve in arbitrary order; sort so the tool list (part of
+  // the cached prompt prefix) is byte-stable across loads — better prompt-cache hits.
+  _mcpToolCache.sort((a, b) => (a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0));
   if (total) showToast(`已接入 ${total} 个 MCP 工具（来自 ${names.length} 个服务）`);
   if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
 }
