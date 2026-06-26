@@ -9213,6 +9213,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
   let flushTimer = 0;
   const doRender = () => {
     flushTimer = 0;
+    if (!_live()) return; // stopped — don't render (and don't re-add the caret)
     lastFlush = Date.now();
     body.querySelector(".thinking")?.remove();
     const clean = _cleanAgentText(acc);
@@ -9236,6 +9237,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
     let produced = false;
     try {
       await backend.aiChatWithTools(config, messages, toolSchemas, (ev) => {
+        // User hit Stop: drop every further streamed event so output halts at once
+        // (the backend turn keeps running but we render nothing more, and the loop's
+        // `if (!_live()) break` ends the run after this turn settles).
+        if (!_live()) return;
         if (ev.kind === "token") { produced = true; acc += ev.delta; schedule(); }
         else if (ev.kind === "toolCall") {
           produced = true;
@@ -9419,7 +9424,14 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
     `</div>`;
   filesBar.addEventListener("click", (e) => { if (!e.target.closest(".agent-files-bar__btn")) filesBar.classList.toggle("is-open"); });
   filesBar.querySelector(".agent-files-bar__btn--stop").addEventListener("click", (e) => {
-    e.stopPropagation(); session.streaming = false; if (session === _currentSession()) _setSendBtnStop(false); showToast("Agent stopped");
+    e.stopPropagation();
+    session.streaming = false;
+    if (session === _currentSession()) _setSendBtnStop(false);
+    // Halt the UI immediately: drop the "thinking…" spinner + streaming caret now,
+    // instead of waiting for the in-flight backend turn to settle.
+    body.querySelector(".thinking")?.remove();
+    body.querySelectorAll(".md-caret").forEach((c) => c.remove());
+    showToast("Agent stopped");
   });
   const filesList = document.createElement("ul");
   filesList.className = "agent-files-list";
@@ -10171,7 +10183,19 @@ async function _executeToolStep(step, call, root, run) {
         } catch (dirErr) {
           res.className = "atc-result atc-result--err";
           res.textContent = String(dirErr?.message || dirErr).slice(0, 120);
-          return { type: "list", path: call.path, content: `[ERROR] Cannot list directory: ${usedPath}` };
+          // Grounding: a bare "cannot list" is a dead end the model tends to ignore
+          // and then re-guess. Show what actually exists in the parent so it self-
+          // corrects to a real path instead of chasing nonexistent ones.
+          let listHint = "";
+          try {
+            const par = usedPath.split("/").slice(0, -1).join("/") || root;
+            if (par) {
+              const sibs = await backend.readDir(par);
+              const names = sibs.slice(0, 20).map((e) => (e.is_dir ? e.name + "/" : e.name)).join(", ");
+              if (names) listHint = ` 上级目录 ${par} 里实际有: ${names}`;
+            }
+          } catch {}
+          return { type: "list", path: call.path, content: `[ERROR] 目录不存在或无法列出: ${usedPath}。别猜路径——先 list_dir 它的上级、或用 find_files 按名字搜，确认后再用真实存在的路径。${listHint}` };
         }
       }
 
