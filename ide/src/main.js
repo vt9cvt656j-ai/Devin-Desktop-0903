@@ -8108,6 +8108,15 @@ function openMemoryPanel() {
 // Size of a message in chars, COUNTING multimodal image data URLs (a screenshot
 // base64 is ~200-300KB and otherwise stringifies to "[object Object]" — wildly
 // undercounted, which is how the payload silently grew past the 413 limit).
+// Read-only tools whose old results are cheaply re-fetchable from the environment
+// — safe to elide hard (reversibly) when fighting context rot in a long run.
+const _REFETCHABLE = new Set([
+  "read_file", "list_dir", "search", "find_files", "git_diff", "git_log", "git_status",
+  "git_blame", "git_stash_list", "git_conflicts", "web_fetch", "web_search",
+  "get_diagnostics", "lsp_symbols", "lsp_definition", "lsp_references",
+  "read_terminal", "list_terminals",
+]);
+
 function _msgSize(m) {
   const c = m && m.content;
   if (typeof c === "string") return c.length;
@@ -8148,13 +8157,30 @@ function _trimMessagesIfHuge(messages) {
   const aggressive = total > HARD;
   const KEEP = aggressive ? 4 : 8;
   const cap = aggressive ? 120 : 300;
+  // Context-rot mitigation (the 2026 bottleneck): compact OLD tool results, but
+  // REVERSIBLY where possible. A result from a re-fetchable read-only tool (file
+  // read, search, diff, diagnostics…) can be elided down to a one-line pointer —
+  // no info is truly lost, the agent just re-runs the tool if it needs it again.
+  // Ephemeral / side-effectful results (run_cmd, browser, computer) are only
+  // truncated, since re-running them may differ or have effects. (Reversible
+  // compaction > lossy summarization — the grounded preference hierarchy.)
+  const idName = {};
+  for (const m of messages) {
+    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) { if (tc && tc.id && tc.function) idName[tc.id] = tc.function.name; }
+    }
+  }
   const toolIdx = [];
   for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdx.push(i);
   const trimUpTo = toolIdx.length - KEEP;
   for (let k = 0; k < trimUpTo; k++) {
     const i = toolIdx[k];
     const c = messages[i].content ? String(messages[i].content) : "";
-    if (c.length > cap + 80) {
+    const name = idName[messages[i].tool_call_id] || "";
+    if (_REFETCHABLE.has(name) && c.length > 90) {
+      const head = c.split("\n")[0].replace(/\s+/g, " ").slice(0, 70);
+      messages[i] = { ...messages[i], content: `[已折叠较早的 ${name} 结果（原 ${c.length} 字）：${head}…  需要就重新调用 ${name} 取回。]` };
+    } else if (c.length > cap + 80) {
       messages[i] = { ...messages[i], content: c.slice(0, cap) + `\n…（较早工具输出已折叠以省上下文，原 ${c.length} 字）` };
     }
   }
