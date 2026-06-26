@@ -8654,6 +8654,11 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // then recovered, prompt it once at the end to record the "pitfall → fix" lesson
   // via `remember` (auto-loaded next time → it stops re-hitting the same trap).
   let runHadTrouble = false, memoryNudges = 0;
+  // Multi-agent review gate (Planner/Worker/Judge): before a SUBSTANTIAL change is
+  // declared done, a fresh INDEPENDENT reviewer sub-agent audits the diff (no echo
+  // chamber); only confirmed real issues are fed back to fix. Runs once.
+  let reviewGates = 0;
+  const _mutatedFiles = new Set();
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
@@ -8681,6 +8686,26 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
           verifyNudges++;
           messages.push({ role: "user", content: "你改了文件但还没验证。先用 run_cmd 跑相关的构建/测试/类型检查（如 npm run build、cargo check、pytest、tsc --noEmit），或用 get_diagnostics 看报错；确认通过后再收尾。若这个项目确实没有可跑的验证，简短说明原因即可。" });
           continue;
+        }
+        // C — independent reviewer/judge gate: for a SUBSTANTIAL change (≥2 files),
+        // spawn a FRESH reviewer sub-agent to audit the diff before finishing. Only
+        // confirmed real issues block (it uses the high-precision reviewer discipline).
+        // "The lead only sees green-reviewed code." Runs once; bounded.
+        if (didMutate && _mutatedFiles.size >= 2 && reviewGates < 1 && _live() && run.mode === "agent") {
+          reviewGates++;
+          let _diff = "";
+          try { _diff = await backend.invoke("git_diff", { root, rel: null, staged: false }); } catch {}
+          _diff = String(_diff || "").trim().slice(0, 9000);
+          const _files = [..._mutatedFiles].join("\n");
+          const _revPrompt = "你是**独立代码审查员**（高精度：只报已证实为真、能构造出具体触发路径的确凿 bug；压制风格 / 命名 / 假设性 / 可有可无的「垃圾bug」）。审查**本次改动**有没有引入真问题：\n- 正确性：空值 / 越界 / 错误处理缺失 / 并发竞态 / 资源泄漏 / off-by-one / 契约不符。\n- 安全：注入(SQL/命令/XSS) / 越权 / SSRF / 路径穿越 / 硬编码密钥 / 不安全反序列化（用污点 source→sink 追踪）。\n用 read_file / search 把改动文件及其**定义与调用方**读全再下结论，每条问题给 位置 + 触发场景 + 修复。\n\n本次改动文件：\n" + _files + "\n\n" + (_diff ? "git diff（截断）:\n" + _diff : "（拿不到 diff，请直接 read_file 读上面文件审查改动）") + "\n\n**最后一行只输出一行**：\nVERDICT: PASS  （没有确凿问题）\n或\nVERDICT: ISSUES  （有确凿问题，已在上面逐条列出）";
+          let _rep = "";
+          try { _rep = await _runSubAgent({ config, description: "独立审查改动", prompt: _revPrompt, root, container: body, run }); } catch { _rep = ""; }
+          if (/VERDICT:\s*ISSUES/i.test(_rep || "")) {
+            const _body = String(_rep).replace(/VERDICT:\s*ISSUES[\s\S]*$/i, "").replace(/VERDICT:\s*PASS[\s\S]*$/i, "").trim();
+            messages.push({ role: "user", content: "**独立审查发现本次改动有确凿问题**（见下）。请逐条核实并修复，改完再验证一次（run_cmd / get_diagnostics），别带着已知 bug 收尾：\n\n" + (_body || _rep) });
+            continue;
+          }
+          // PASS / 无法解析 / 子智能体失败 → 不阻塞，继续收尾。
         }
         // B — honesty gate: a tool just FAILED / was unavailable, and now you're
         // wrapping up. Don't paper over it. Either actually fix it, or state plainly
@@ -8792,7 +8817,10 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       for (const it of items) {
         if (!it.call) continue;
         const t = it.call.type;
-        if (t === "write" || t === "edit" || t === "multiedit" || t === "delete" || t === "move") didMutate = true;
+        if (t === "write" || t === "edit" || t === "multiedit" || t === "delete" || t === "move") {
+          didMutate = true;
+          if (it.call.path) _mutatedFiles.add(it.call.path);
+        }
         if (t === "diag") didVerify = true;
         if (t === "cmd" && /\b(test|tests|build|check|lint|tsc|typecheck|cargo|pytest|jest|vitest|mocha|phpunit|gradle|make|go\s+(build|test|vet))\b/i.test(it.call.command || "")) didVerify = true;
         if (it.tc.name === "update_plan") planSteps = it.call.steps;
