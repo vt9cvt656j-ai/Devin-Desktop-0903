@@ -1027,7 +1027,7 @@ if (chatEl) {
     _chatPinned = (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight) < 90;
   }, { passive: true });
 }
-function _chatFollow() { if (_chatPinned && chatEl) _chatFollow(); }
+function _chatFollow() { if (_chatPinned && chatEl) chatEl.scrollTop = chatEl.scrollHeight; }
 const rootNameEl = $("rootName");
 const saveBtn = $("saveBtn");
 const runBtn = $("runBtn");
