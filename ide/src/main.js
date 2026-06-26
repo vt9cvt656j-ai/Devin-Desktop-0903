@@ -6589,8 +6589,13 @@ async function sendPrompt(text, attachedImages = []) {
   // D — for a clearly complex agent task, steer the model to investigate + plan
   // before editing (Claude Code's plan-first habit). Injected only into this
   // turn's request — not the visible bubble, not stored history.
+  // Adaptive compute: hard task → invest (plan-first); trivial task → spend less
+  // (do it directly, skip the heavy investigate/plan/verify ritual). This is the
+  // Plan-and-Budget idea — match effort to difficulty (more accurate AND cheaper).
   const _planFirst = (effectiveMode === "agent" && _looksComplexTask(text))
     ? "\n\n（这看起来是个多步/复杂任务：先用 search / read_file 摸清相关代码与现有约定，再用 update_plan 列出分步计划，然后逐步实现、每步更新计划状态，最后用 run_cmd / get_diagnostics 验证。别一上来就直接改。）"
+    : (effectiveMode === "agent" && _looksTrivialTask(text))
+    ? "\n\n（这是个简单直接的小改动：精准定位、改完即可——别长篇规划、别过度调查、别堆额外验证，省时间。改完一句话说清就行。）"
     : "";
   // @file mentions → pull each pinned file's content into THIS turn's context
   // (the visible bubble and stored history keep just the "@path" the user typed).
@@ -7993,6 +7998,16 @@ function _looksComplexTask(text) {
   return /(实现|重构|搭建|做一个|做个|开发|新增功能|加.{0,4}功能|集成|迁移|设计.{0,6}(系统|架构|页面|功能|模块)|build |implement|refactor|create (a|an)|add (a|an).{0,30}(feature|page|component|endpoint|api|system|module)|scaffold|set ?up|migrate)/i.test(t);
 }
 
+// Adaptive compute (Plan-and-Budget): the cheap half — spot a tiny, atomic task
+// so we can tell the agent to just DO it directly instead of over-investigating /
+// over-planning / over-verifying. Deliberately conservative (short + clearly
+// single-step) so a task that needs care is never under-served.
+function _looksTrivialTask(text) {
+  const t = (text || "").trim();
+  if (t.length > 90 || _looksComplexTask(t)) return false;
+  return /改个?名|重命名|rename|改成|换成|加个?(注释|日志|log|print|console)|删掉?这|去掉这|注释掉|格式化|format\b|改下|小改|微调|typo|拼写|错别字|加一行|挪到|移到|对齐/i.test(t);
+}
+
 // Auto-route the user's message to the best mode (only used when the picker is on
 // "Auto"). Grounded in how Claude Code / Codex behave: keep ONE capable agent and
 // only drop to a restricted mode on STRONG, explicit signals — when in doubt, pick
@@ -8635,6 +8650,10 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // genuine progress (same call, new result) doesn't false-trigger.
   const _callLog = [];
   let stuckNudges = 0;
+  // Procedural memory (self-improvement): if this run hit failures / got stuck and
+  // then recovered, prompt it once at the end to record the "pitfall → fix" lesson
+  // via `remember` (auto-loaded next time → it stops re-hitting the same trap).
+  let runHadTrouble = false, memoryNudges = 0;
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
@@ -8669,6 +8688,13 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
         if (lastTurnHadFailure && honestyNudges < 1) {
           honestyNudges++;
           messages.push({ role: "user", content: `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。` });
+          continue;
+        }
+        // B — procedural memory: this run hit a pitfall and got past it. Consolidate
+        // the lesson so the project gets easier over time (it auto-loads next run).
+        if (runHadTrouble && memoryNudges < 1) {
+          memoryNudges++;
+          messages.push({ role: "user", content: "这次过程中遇到过卡点 / 失败、最后绕过去了。收尾前用 remember 记**一条简短、可复用**的「坑 → 根因 → 解法」经验——比如某命令在这个项目要怎么跑、某依赖 / 环境的怪癖、某个约定。下次自动加载，遇到同类情况就不再栽。**只记长期有用的，一次性细节别记**；若这次的坑确实只是偶发、没有可复用的教训，跳过即可、别硬记。" });
           continue;
         }
         break; // truly done
@@ -8743,6 +8769,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
           .filter(Boolean).map(x => x[0]);
         lastTurnHadFailure = fails.length > 0;
         lastFailKinds = [...new Set(fails)].join(" ");
+        if (lastTurnHadFailure) runHadTrouble = true; // for the end-of-run "remember the lesson" nudge
       }
 
       // Eyes: feed any screenshots back to the model as image(s) so it can
@@ -8792,6 +8819,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
         // Same exact call 3+ times, or 4+ failures in the recent window = flailing.
         if ((maxRepeat >= 3 || fails >= 4) && stuckNudges < 2 && _live()) {
           stuckNudges++;
+          runHadTrouble = true;
           _callLog.length = 0; // fresh window after intervening
           messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。**" });
         }
