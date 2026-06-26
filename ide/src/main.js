@@ -14256,6 +14256,71 @@ _atMenu.className = "atmenu";
 _atMenu.hidden = true;
 document.body.appendChild(_atMenu);
 
+// File index for @-mentions: walk the workspace once and cache the relative file
+// list, so @-autocomplete fuzzy-matches INSTANTLY client-side instead of hitting
+// the backend on every keystroke. It rebuilds automatically when the root changes
+// or the cache ages out (30s), and is preloaded on composer focus.
+let _fileIndex = { root: "", files: [], ts: 0, building: null };
+async function _buildFileIndex(root) {
+  const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".nuxt", ".venv", "__pycache__", ".cache", "vendor", "coverage", ".turbo", ".parcel-cache"]);
+  const out = [];
+  const MAX = 6000, MAX_SCAN = 60000;
+  let scanned = 0;
+  const stack = [{ dir: root, rel: "" }];
+  while (stack.length && out.length < MAX && scanned < MAX_SCAN) {
+    const { dir, rel } = stack.pop();
+    let entries = [];
+    try { entries = await backend.readDir(dir); } catch { continue; }
+    for (const e of entries) {
+      if (out.length >= MAX) break;
+      scanned++;
+      const name = e.name;
+      if (!name || name.startsWith(".")) continue;
+      const childRel = rel ? rel + "/" + name : name;
+      if (e.is_dir) { if (!IGNORED.has(name)) stack.push({ dir: dir + "/" + name, rel: childRel }); }
+      else out.push(childRel);
+    }
+  }
+  return out;
+}
+function _ensureFileIndex() {
+  const root = rootPath || workspaceRoots[0] || "";
+  if (!root) return Promise.resolve([]);
+  if (_fileIndex.root === root && _fileIndex.files.length && (Date.now() - _fileIndex.ts) < 30000) return Promise.resolve(_fileIndex.files);
+  if (_fileIndex.building && _fileIndex.root === root) return _fileIndex.building;
+  const building = _buildFileIndex(root).then((files) => {
+    _fileIndex = { root, files, ts: Date.now(), building: null };
+    return files;
+  }).catch(() => { _fileIndex.building = null; return _fileIndex.files || []; });
+  _fileIndex = { root, files: _fileIndex.files, ts: 0, building };
+  return building;
+}
+// Open files (relative to root), active one first — surfaced when "@" has no query.
+function _openFilesRel(root) {
+  const pre = root.replace(/\/+$/, "") + "/";
+  const rels = [];
+  for (const p of openFiles.keys()) { if (p && p.startsWith(pre)) rels.push(p.slice(pre.length)); }
+  if (activePath && activePath.startsWith(pre)) {
+    const a = activePath.slice(pre.length);
+    return [a, ...rels.filter((r) => r !== a)];
+  }
+  return rels;
+}
+// Subsequence fuzzy score: basename hits rank far above path-only hits; prefix
+// and shorter matches win. Returns -1 for no match.
+function _fuzzyScore(q, path) {
+  if (!q) return 0;
+  const p = path.toLowerCase();
+  const base = p.slice(p.lastIndexOf("/") + 1);
+  if (base.startsWith(q)) return 1000 - base.length;
+  if (base.includes(q)) return 700 - base.length;
+  if (p.includes(q)) return 450 - Math.round(p.length * 0.2);
+  const sub = (s) => { let i = 0; for (let k = 0; k < s.length && i < q.length; k++) if (s[k] === q[i]) i++; return i === q.length; };
+  if (sub(base)) return 250 - base.length;
+  if (sub(p)) return 120 - Math.round(p.length * 0.2);
+  return -1;
+}
+
 function _atToken() {
   const pos = promptEl.selectionStart;
   const m = /(?:^|\s)@([^\s]*)$/.exec(promptEl.value.slice(0, pos));
@@ -14271,18 +14336,37 @@ function _updateAtMenu() {
   _atTimer = setTimeout(async () => {
     const t2 = _atToken();
     if (!t2) return _hideAtMenu();
-    let res;
-    try { res = await _agentFindFiles(root, t2.query || "**"); } catch { return _hideAtMenu(); }
-    const files = (res.text || "").split("\n")
-      .filter((l) => l && !l.startsWith("(") && !l.startsWith("…") && !l.startsWith("["))
-      .slice(0, 8);
-    if (!files.length) return _hideAtMenu();
-    _atMatches = files;
+    let files;
+    try { files = await _ensureFileIndex(); } catch { return _hideAtMenu(); }
+    if (!files || !files.length) return _hideAtMenu();
+    const q = (t2.query || "").toLowerCase();
+    let matches;
+    if (!q) {
+      // No query yet → most useful default: open files first, then a few others.
+      const open = _openFilesRel(root);
+      const seen = new Set(open);
+      matches = [...open, ...files.filter((f) => !seen.has(f)).slice(0, 8)].slice(0, 10);
+    } else {
+      const openSet = new Set(_openFilesRel(root));
+      matches = files
+        .map((f) => ({ f, s: _fuzzyScore(q, f) + (openSet.has(f) ? 60 : 0) }))
+        .filter((x) => x.s > -1)
+        .sort((a, b) => b.s - a.s)
+        .slice(0, 10)
+        .map((x) => x.f);
+    }
+    if (!matches.length) return _hideAtMenu();
+    _atMatches = matches;
     _atMenu.innerHTML = "";
-    files.forEach((f, i) => {
+    matches.forEach((f, i) => {
       const item = document.createElement("div");
       item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
-      item.textContent = f;
+      const slash = f.lastIndexOf("/");
+      const baseName = slash >= 0 ? f.slice(slash + 1) : f;
+      const dir = slash >= 0 ? f.slice(0, slash) : "";
+      // Basename first (always visible), dir after as dim context — so a long path
+      // truncates the directory, not the filename.
+      item.innerHTML = `<b>${_escHtml(baseName)}</b>` + (dir ? ` <span style="opacity:.5;font-size:11px">${_escHtml(dir)}</span>` : "");
       item.addEventListener("mousedown", (ev) => { ev.preventDefault(); _pickAt(i); });
       _atMenu.appendChild(item);
     });
@@ -14292,7 +14376,7 @@ function _updateAtMenu() {
     _atMenu.style.width = Math.min(r.width, 520) + "px";
     _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
     _atMenu.hidden = false;
-  }, 160);
+  }, 90);
 }
 function _pickAt(i) {
   const tok = _atToken();
@@ -14313,16 +14397,13 @@ promptEl.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.preventDefault(); _hideAtMenu(); }
 });
 promptEl.addEventListener("blur", () => setTimeout(_hideAtMenu, 150));
+// Preload the file index when the composer is focused, so the first "@" is instant.
+promptEl.addEventListener("focus", () => { try { _ensureFileIndex(); } catch {} });
 
 // ---- slash commands: "/" at the start of the composer → quick agent prompts ----
+// Only the two utility commands are kept — the prompt-shortcut commands were
+// removed as clutter (just type the request, or use @file mentions).
 const _SLASH = [
-  { cmd: "fix", desc: "找出并修复 bug", prompt: "找出当前文件里**确凿的真 bug**（能构造出具体触发场景的正确性 / 安全问题，不是风格或假设性边界）并修复；每个 bug 先证实再改，修完用 run_cmd 或 get_diagnostics 验证。没有真 bug 就直说。" },
-  { cmd: "test", desc: "写并跑单元测试", prompt: "为当前文件写单元测试，覆盖边界情况，并跑通。" },
-  { cmd: "explain", desc: "解释这段代码", prompt: "解释当前打开文件的代码：作用、关键逻辑、注意点。" },
-  { cmd: "review", desc: "审查改动", prompt: "高精度审查当前代码：**只报已证实为真的**正确性 / 安全 / 确凿性能问题，每条先读全相关上下文 + 构造具体触发场景再上报，报前自我反驳一遍，驳不倒才留。压制风格 / 命名 / 假设性 / 可有可无的「垃圾 bug」。按 🔴严重 / 🟡警告 两档列出并给修复；没有确凿问题就如实说没发现。" },
-  { cmd: "audit", desc: "深挖漏洞与底层 bug", prompt: "对相关代码做一次**彻底的安全 + 底层系统 bug 审计**。方法：① 先用 search / read_file 把入口、数据流、调用方读全；② 做**污点追踪**：列出不可信输入源(source)→危险汇聚点(sink)，沿每条路径看有没有有效校验 / 转义 / 参数化，没被净化且有真实路径的就是真漏洞，写出路径；③ 按类别地毯式过：注入(SQL/命令/XSS/SSTI/XXE/原型链)、访问控制 / 越权、加密与机密(硬编码密钥 / 弱哈希 / 弱随机)、SSRF / 路径穿越 / 反序列化、ReDoS / CSRF / CORS / 配置 / 供应链；底层：内存安全(溢出 / UAF / double-free / 越界 / 未初始化)、整数溢出 / 截断 / 符号、未定义行为、并发(数据竞争 / 死锁 / TOCTOU)、资源泄漏(异常路径)、错误处理(忽略错误码 / unwrap / 吞异常)。**每条都要确认到具体触发路径、报前自我反驳，对照 CWE/OWASP 标严重度(🔴/🟡)并给修复**；没确凿问题就如实说，绝不为凑数硬报。" },
-  { cmd: "refactor", desc: "重构（保持行为）", prompt: "重构当前文件这段代码，提升可读性与结构，保持行为不变；改完验证。" },
-  { cmd: "docs", desc: "加文档注释", prompt: "给当前文件的关键函数 / 类型加清晰的文档注释。" },
   { cmd: "sessions", desc: "查看 / 切换所有会话", action: () => _openSessionPicker() },
   { cmd: "memory", desc: "管理项目记忆（知识图谱）", action: () => openMemoryPanel() },
 ];
