@@ -246,7 +246,17 @@ fn augmented_path() -> String {
 /// frontend can feed it through a problem matcher into the Problems panel.
 /// This is the non-interactive complement to running a task in the terminal.
 #[tauri::command]
-pub fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, String> {
+pub async fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, String> {
+    // Run the blocking spawn + wait loop on the blocking pool, NOT the Tauri
+    // event-loop thread. A sync command here blocks that thread for the command's
+    // whole duration (up to the 300s timeout), freezing the whole IDE — the cause
+    // of "调用终端容易卡死一会". spawn_blocking keeps the UI responsive throughout.
+    tauri::async_runtime::spawn_blocking(move || task_run_capture_inner(cwd, command))
+        .await
+        .map_err(|e| format!("task thread join failed: {e}"))?
+}
+
+fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult, String> {
     let dir = PathBuf::from(&cwd);
     if !dir.is_dir() {
         return Err("task working directory is not a directory".into());
@@ -464,7 +474,7 @@ mod tests {
     #[test]
     fn capture_runs_command_and_collects_output() {
         let root = temp_root("capture");
-        let result = task_run_capture(
+        let result = task_run_capture_inner(
             root.to_string_lossy().to_string(),
             "echo michael-ide".into(),
         )
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn capture_reports_nonzero_exit() {
         let root = temp_root("capture-fail");
-        let result = task_run_capture(root.to_string_lossy().to_string(), "exit 3".into())
+        let result = task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into())
             .expect("task should run");
         assert_eq!(result.code, 3);
         let _ = std::fs::remove_dir_all(root);
@@ -486,7 +496,7 @@ mod tests {
 
     #[test]
     fn capture_rejects_bad_dir() {
-        let err = task_run_capture("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
+        let err = task_run_capture_inner("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
         assert!(err.is_err());
     }
 }
