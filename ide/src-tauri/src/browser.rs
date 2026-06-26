@@ -270,7 +270,10 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
             .map(|v| v.to_string())
             .or(ro.description)
             .unwrap_or_default();
-        Ok(Some(val.chars().take(4000).collect()))
+        // 8000 chars (~2.7k tokens worst case) so structured tools — network 抓包,
+        // inspect 视觉解析, design — can return their full JSON without truncating
+        // mid-string (which would hand the model invalid JSON).
+        Ok(Some(val.chars().take(8000).collect()))
     })
     .await
 }
