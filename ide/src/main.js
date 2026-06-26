@@ -1018,6 +1018,16 @@ const tabsEl = $("tabs");
 const editorEl = $("editor");
 const welcomeEl = $("welcome");
 const chatEl = $("chat");
+// Smart auto-scroll: follow new agent output ONLY while the user is pinned near the
+// bottom. If they scroll up to read, we stop forcing them down; when they scroll
+// back to the bottom, following resumes. (_chatFollow replaces blind scroll-to-end.)
+let _chatPinned = true;
+if (chatEl) {
+  chatEl.addEventListener("scroll", () => {
+    _chatPinned = (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight) < 90;
+  }, { passive: true });
+}
+function _chatFollow() { if (_chatPinned && chatEl) _chatFollow(); }
 const rootNameEl = $("rootName");
 const saveBtn = $("saveBtn");
 const runBtn = $("runBtn");
@@ -3257,10 +3267,14 @@ function basename(path) {
   return path.split("/").filter(Boolean).pop() || path;
 }
 
+const _kgSyncedRoots = new Set();
 function setActiveWorkspaceRoot(path) {
   rootPath = path;
   _launchConfigsCache = null;
   _agentContextCache = { root: "", ts: 0, data: "" };
+  // Reconcile this workspace's memory with its durable real file (once per root) —
+  // restores the knowledge graph if localStorage was cleared / lost.
+  if (path && inTauri && !_kgSyncedRoots.has(path)) { _kgSyncedRoots.add(path); _kgSyncFromStore(path); }
   if (workspaceRoots.length > 1) {
     rootNameEl.textContent = `${workspaceRoots.length} folders`;
     rootNameEl.title = workspaceRoots.join("\n");
@@ -5610,12 +5624,10 @@ function _closeChatSession(idx) {
 
 let _chatSavePending = false;
 async function saveChatHistory() {
-  if (!inTauri) return; // allow persisting the empty state (all tabs closed)
   if (_chatSavePending) return;
   _chatSavePending = true;
   try {
     await new Promise(r => setTimeout(r, 500));
-    const store = await loadStore("session.json");
     const data = _chatSessions.map(s => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
       project: s.project || "",
@@ -5625,17 +5637,33 @@ async function saveChatHistory() {
       history: s.history.slice(-300),
       created: s.created,
     }));
-    await store.set(CHAT_STORE_KEY, { sessions: data, activeIdx: _activeChatIdx });
-    await store.save();
+    const payload = { sessions: data, activeIdx: _activeChatIdx };
+    // Dual-channel durability: always mirror to localStorage so a Tauri-store
+    // permission / IO failure can't lose the chat (restoreChatHistory falls back
+    // to this). Then write the real store file when on desktop.
+    try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(payload)); } catch {}
+    if (inTauri) {
+      try {
+        const store = await loadStore("session.json");
+        await store.set(CHAT_STORE_KEY, payload);
+        await store.save();
+      } catch (e) { console.warn("[chat] store save failed (localStorage fallback kept):", e); }
+    }
   } catch (e) { console.warn("[chat] save failed:", e); }
   _chatSavePending = false;
 }
 
 async function restoreChatHistory() {
-  if (!inTauri) return;
   try {
-    const store = await loadStore("session.json");
-    const saved = await store.get(CHAT_STORE_KEY);
+    let saved = null;
+    if (inTauri) {
+      try { const store = await loadStore("session.json"); saved = await store.get(CHAT_STORE_KEY); }
+      catch (e) { console.warn("[chat] store read failed, trying localStorage fallback:", e); }
+    }
+    // Fallback (or web mode, or a store permission/IO failure): the localStorage mirror.
+    if (!saved || !(saved.sessions && saved.sessions.length)) {
+      try { const raw = localStorage.getItem(CHAT_STORE_KEY); if (raw) { const ls = JSON.parse(raw); if (ls && Array.isArray(ls.sessions) && ls.sessions.length) saved = ls; } } catch {}
+    }
 
     if (saved?.sessions && Array.isArray(saved.sessions)) {
       const usedNames = new Set();
@@ -5853,7 +5881,7 @@ function addMessage(role, text, forSession) {
   const MSG_CAP = 250;
   const msgs = target.querySelectorAll(":scope > .msg");
   for (let i = 0; i < msgs.length - MSG_CAP; i++) msgs[i].remove();
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
   return body;
 }
 
@@ -6522,6 +6550,7 @@ async function sendPrompt(text, attachedImages = []) {
     saveChatHistory();
   }
 
+  _chatPinned = true; // sending re-pins: always show your message + the reply that follows
   const userBody = addMessage("user", text, sess);
   // Make Auto's choice VISIBLE: a colored chip on the message showing which mode
   // Auto picked for THIS turn — so the switch is obvious, not just a fleeting toast.
@@ -6728,7 +6757,7 @@ async function sendPrompt(text, attachedImages = []) {
     body.insertBefore(reasoningEl, body.firstChild);
     return reasoningEl;
   };
-  const setThink = (txt) => { ensureThink().querySelector(".think-body").textContent = txt; chatEl.scrollTop = chatEl.scrollHeight; };
+  const setThink = (txt) => { ensureThink().querySelector(".think-body").textContent = txt; _chatFollow(); };
   const collapseThink = () => { if (reasoningEl) { reasoningEl.dataset.open = "0"; reasoningEl.classList.remove("streaming"); const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考"; } };
   const _agentRoot = rootPath || workspaceRoots[0] || "";
   const _toolPromises = [];
@@ -6873,7 +6902,7 @@ async function sendPrompt(text, attachedImages = []) {
       }
       body._lastLen = view.length;
     }
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   };
   const flushStream = () => {
     raf = 0;
@@ -6932,7 +6961,7 @@ async function sendPrompt(text, attachedImages = []) {
               p.then(r => { if (r) p._result = r; });
               _toolPromises.push(p);
               _pendingToolCalls.push(call);
-              chatEl.scrollTop = chatEl.scrollHeight;
+              _chatFollow();
               delete _toolArgBuf[id || "_"];
             }
           } catch { /* JSON not complete yet, keep buffering */ }
@@ -6977,7 +7006,7 @@ async function sendPrompt(text, attachedImages = []) {
       if (stopBtn) stopBtn.style.display = "none";
       _updateFilesBar(_filesBar, _filesList, _trackedFiles);
     }
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   }
 }
 
@@ -7435,11 +7464,11 @@ async function _executeInlineTools(response, container) {
   for (const seg of toolSegs) {
     const step = _createToolStep(seg);
     log.appendChild(step);
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
     const tr = await _executeToolStep(step, seg, root);
     if (tr) toolResults.push(tr);
     await new Promise(r => setTimeout(r, 60));
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   }
 
   if (toolResults.length) _agentFollowUp(toolResults, container);
@@ -8145,6 +8174,40 @@ function _kgSave(root, notes) {
     if (notes.length > 240) notes = notes.slice(-240); // generous cap (retrieval is filtered)
     localStorage.setItem(_kgKey(root), JSON.stringify(notes));
   } catch {}
+  _kgStoreSave(root, notes); // durable real-file mirror (async, best-effort)
+}
+// Mirror the knowledge graph to a REAL file via the Tauri store (app data dir under
+// the user's home) — so memory is durable and survives even if localStorage is
+// cleared / hits a quota or permission error. localStorage stays the fast sync cache.
+const _KG_STORE = "memory-kg.json";
+async function _kgStoreSave(root, notes) {
+  if (!inTauri) return;
+  try {
+    const s = await loadStore(_KG_STORE);
+    await s.set("kg:" + (root || "_global"), notes);
+    await s.save();
+  } catch (e) { console.warn("[kg] real-file mirror save failed:", e); }
+}
+// On workspace open: reconcile the durable file with localStorage. The file is the
+// source of truth — if localStorage was wiped, restore from it; if local is newer
+// (more notes), push local up to the file. Makes memory loss recoverable.
+async function _kgSyncFromStore(root) {
+  if (!inTauri) return;
+  try {
+    const s = await loadStore(_KG_STORE);
+    const fileNotes = await s.get("kg:" + (root || "_global"));
+    const local = _kgLoad(root);
+    if (Array.isArray(fileNotes) && fileNotes.length) {
+      if (local.length < fileNotes.length) {
+        try { localStorage.setItem(_kgKey(root), JSON.stringify(fileNotes)); } catch {}
+        _agentContextCache = { root: null, ts: 0, data: "" };
+      } else if (local.length > fileNotes.length) {
+        await _kgStoreSave(root, local);
+      }
+    } else if (local.length) {
+      await _kgStoreSave(root, local); // seed the file from local (incl. migrated flat memory)
+    }
+  } catch (e) { console.warn("[kg] real-file sync failed:", e); }
 }
 function _kgAddNote(root, content) {
   const notes = _kgLoad(root);
@@ -8553,7 +8616,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
       if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
       renderMarkdownStream(streamEl, clean, { streaming: true });
     }
-    if (!session || session === _currentSession()) chatEl.scrollTop = chatEl.scrollHeight;
+    if (!session || session === _currentSession()) _chatFollow();
   };
   const schedule = () => {
     if (flushTimer) return;
@@ -8663,7 +8726,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run 
   container.appendChild(card);
   const vp = card.querySelector(".atc-viewport");
   const res = card.querySelector(".atc-result");
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
 
   const sysPrompt = _SUBAGENT_SYSTEM + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext());
   const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: prompt }];
@@ -8703,7 +8766,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run 
   res.className = "atc-result atc-result--ok";
   res.textContent = `${toolCount} 步调研`;
   card.classList.remove("is-open");
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
   return report || "（子智能体未产出简报）";
 }
 
@@ -8717,7 +8780,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   session = session || _currentSession();
   const run = { session, mode: mode || _currentAiMode, checkpoint: new Map() };
   const _live = () => !!session.streaming;
-  const _scroll = () => { if (session === _currentSession()) chatEl.scrollTop = chatEl.scrollHeight; };
+  const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
 
@@ -8858,7 +8921,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       _scroll();
 
       const toolMsgs = new Array(items.length);
-      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot"]);
+      const READ_ONLY = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag"]);
 
       const runOne = async (it) => {
         const { call, step } = it;
@@ -8893,7 +8956,29 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       }
       if (parallel.length) await Promise.all(parallel);
 
-      // 2) plan updates + mutating tools — sequentially, in call order
+      // 2a) Independent file mutations (write/edit/multiedit) to DISTINCT files have
+      //     no ordering dependency between them → run them in parallel too (the
+      //     common "edit several files at once" case). Guarded: only when every
+      //     path is unique AND there's no delete/move in the turn (those could
+      //     depend on a path); otherwise everything stays strictly ordered below.
+      {
+        const fileMut = [];
+        let riskyOrder = false;
+        for (let i = 0; i < items.length; i++) {
+          if (toolMsgs[i] || !items[i].call) continue;
+          const t = items[i].call.type;
+          if (t === "write" || t === "edit" || t === "multiedit") fileMut.push(i);
+          else if (t === "delete" || t === "move") riskyOrder = true;
+        }
+        const paths = fileMut.map((i) => items[i].call.path);
+        if (fileMut.length >= 2 && !riskyOrder && new Set(paths).size === paths.length && _live()) {
+          await Promise.all(fileMut.map((i) => (async () => {
+            toolMsgs[i] = { role: "tool", tool_call_id: items[i].tc.id, content: await runOne(items[i]) };
+          })()));
+        }
+      }
+
+      // 2b) plan updates + remaining mutating tools — sequentially, in call order
       for (let i = 0; i < items.length; i++) {
         if (toolMsgs[i]) continue;
         const it = items[i];
@@ -9040,7 +9125,7 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
     const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
     if (stopBtn) stopBtn.style.display = "none";
     _updateFilesBar(filesBar, filesList, trackedFiles);
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   }
 }
 
@@ -9142,7 +9227,7 @@ function _liveWritePreview(entry, container) {
     entry.streamCard = card;
     entry._shownLen = 0;
     entry._shownLines = 1;
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   }
 
   // 2) Keep the filename in sync as the `path` field streams. Re-read every call
@@ -9837,7 +9922,7 @@ async function _executeToolStep(step, call, root, run) {
       res.className = "atc-result atc-result--ok"; res.textContent = "已截图";
       if (vp) vp.innerHTML = `<img src="${dataUrl}" alt="screenshot" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
       step.classList.add("is-open");
-      chatEl.scrollTop = chatEl.scrollHeight;
+      _chatFollow();
       // `image` is picked up by the agent loop and fed back to the model multimodally.
       return { type: "screenshot", path: url, image: dataUrl, content: `已截取 ${url} 的渲染截图（图片已回传给你看）。请仔细看图，找出 UI 问题（布局/对齐/间距/配色/对比度/视觉层级/响应式）并改进。` };
 
@@ -10234,7 +10319,7 @@ async function _executeToolStep(step, call, root, run) {
       res.className = "atc-result atc-result--ok"; res.textContent = act;
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="page" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">` + (state.title || state.url ? `<div style="font-size:11px;opacity:.6;margin-top:5px">${_escHtml(state.title || "")} — ${_escHtml(state.url || "")}</div>` : "");
       step.classList.add("is-open");
-      chatEl.scrollTop = chatEl.scrollHeight;
+      _chatFollow();
       let content = `浏览器 [${act}] → ${state.title || ""}（${state.url || ""}）`;
       if (state.result != null && state.result !== "") content += `\nJS 结果: ${state.result}`;
       const _els = Array.isArray(state.elements) ? state.elements : [];
@@ -10276,7 +10361,7 @@ async function _executeToolStep(step, call, root, run) {
       res.className = "atc-result atc-result--ok"; res.textContent = cact;
       if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
       step.classList.add("is-open");
-      chatEl.scrollTop = chatEl.scrollHeight;
+      _chatFollow();
       const _cels = Array.isArray(state.elements) ? state.elements : [];
       let content = `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}（坐标以此为准）。`;
       if (_cels.length) {
@@ -10486,7 +10571,7 @@ async function _agentFollowUp(toolResults, container, session) {
 
   const body = container;
   body.appendChild(thinkingCard());
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
 
   const messages = [
     { role: "system", content: _AI_MODE_PROMPTS.agent },
@@ -10518,7 +10603,7 @@ async function _agentFollowUp(toolResults, container, session) {
       if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
       if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true }); }
     }
-    chatEl.scrollTop = chatEl.scrollHeight;
+    _chatFollow();
   };
   const _ffSchedule = () => {
     if (_ffTimer) return;
@@ -10538,7 +10623,7 @@ async function _agentFollowUp(toolResults, container, session) {
     while (_segR2 < segs.length) { _renderAgentSeg(body, segs[_segR2], segs, _segR2, root, proms); _segR2++; }
     if (!err) { _hist.push({ role: "assistant", content: acc }); saveChatHistory(); }
   }
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
 }
 
 // ---- AI inline code completion (Edit Prediction) ----
@@ -10924,7 +11009,7 @@ function _devinStatusRow() {
     _devinStatusEl = row;
   }
   target.appendChild(_devinStatusEl);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
   const textEl = _devinStatusEl.querySelector(".devin-status__text");
   const rowEl = _devinStatusEl;
   return { set(text, done) { textEl.textContent = text; rowEl.classList.toggle("is-done", !!done); } };
@@ -10947,7 +11032,7 @@ function _renderDevinMessages(msgs) {
       _devinTarget().appendChild(row);
     }
   });
-  chatEl.scrollTop = chatEl.scrollHeight;
+  _chatFollow();
 }
 function _startDevinPoller() {
   if (_devinPollTimer) return;
