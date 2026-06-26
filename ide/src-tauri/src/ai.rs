@@ -54,6 +54,13 @@ pub enum AiEvent {
         arguments: String,
     },
     Done,
+    /// Token accounting from the final stream chunk — lets the UI show how much of
+    /// the prompt was served from cache (the payoff of the prompt-cache work).
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+    },
     Error {
         message: String,
     },
@@ -134,6 +141,22 @@ pub async fn ai_chat_with_tools(
     ai_chat_inner(config, messages, Some(tools), on_event).await
 }
 
+/// Tag a message's plain-string `content` with an ephemeral `cache_control`
+/// breakpoint (Anthropic prompt caching). No-op unless `content` is a plain
+/// string, so already-structured (multimodal / tool_result) messages are left
+/// untouched and can never be corrupted.
+fn mark_cache_breakpoint(msg: &mut serde_json::Value) {
+    if let Some(text) = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+    {
+        msg["content"] = serde_json::json!([
+            { "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }
+        ]);
+    }
+}
+
 async fn ai_chat_inner(
     config: AiConfig,
     messages: Vec<serde_json::Value>,
@@ -158,26 +181,36 @@ async fn ai_chat_inner(
         }
     }
 
-    // Prompt caching: Anthropic-compatible endpoints reuse content marked with a
-    // `cache_control` breakpoint across requests. Tag the large, stable system
-    // prompt so it isn't re-billed/re-processed every turn. Gated on Anthropic;
-    // other providers (DeepSeek, OpenAI, …) cache the stable prefix automatically,
-    // so their payload is left byte-for-byte unchanged.
-    if config.base_url.contains("anthropic") {
+    // ── Prompt caching for Anthropic / Claude upstreams ─────────────────────
+    // Anthropic reuses content marked with a `cache_control` breakpoint and serves
+    // the LONGEST matching cached prefix (up to 4 breakpoints). We mark (1) the
+    // system prompt — kept byte-stable in main.js so it caches across every turn —
+    // and (2) a ROLLING breakpoint on the most recent user message, so each new
+    // turn finds the prior conversation already cached instead of re-billing it.
+    //
+    // Gated on the MODEL name (the gateway routes by model — base_url is always the
+    // gateway, so the old base_url check never fired). Only PLAIN-STRING content is
+    // reshaped, so tool/multimodal messages — and any non-Anthropic upstream — are
+    // left byte-for-byte untouched and can't break. DeepSeek / OpenAI / Kimi cache
+    // the stable prefix automatically, so they need no markup at all.
+    let model_lc = config.model.to_ascii_lowercase();
+    if config.base_url.contains("anthropic")
+        || model_lc.contains("claude")
+        || model_lc.contains("anthropic")
+    {
         if let Some(arr) = payload["messages"].as_array_mut() {
             if let Some(first) = arr
                 .iter_mut()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
             {
-                if let Some(text) = first
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-                {
-                    first["content"] = serde_json::json!([
-                        { "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }
-                    ]);
-                }
+                mark_cache_breakpoint(first);
+            }
+            if let Some(last_user) = arr
+                .iter_mut()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            {
+                mark_cache_breakpoint(last_user);
             }
         }
     }
@@ -265,6 +298,27 @@ async fn ai_chat_inner(
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                // Usage normally rides the FINAL chunk (choices may be empty there).
+                // Cached-prompt tokens are reported differently per provider — take
+                // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
+                // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
+                // style `cache_read_input_tokens`.
+                if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+                    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                    let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+                    let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+                        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                        .unwrap_or(0);
+                    if prompt > 0 || completion > 0 {
+                        let _ = on_event.send(AiEvent::Usage {
+                            prompt_tokens: prompt as u32,
+                            completion_tokens: completion as u32,
+                            cached_tokens: cached as u32,
+                        });
+                    }
+                }
                 let delta = &v["choices"][0]["delta"];
                 // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
                 if let Some(rt) = delta["reasoning_content"]

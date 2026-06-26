@@ -280,6 +280,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
         if (!data) continue;
         try {
           const v = JSON.parse(data);
+          if (v.usage && typeof v.usage === "object") {
+            const u = v.usage;
+            const cached = (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || u.prompt_cache_hit_tokens || u.cache_read_input_tokens || 0;
+            if ((u.prompt_tokens || 0) > 0 || (u.completion_tokens || 0) > 0)
+              onEvent({ kind: "usage", prompt_tokens: u.prompt_tokens || 0, completion_tokens: u.completion_tokens || 0, cached_tokens: cached });
+          }
           const d = (v.choices && v.choices[0] && v.choices[0].delta) || {};
           const rt = d.reasoning_content || d.reasoning;
           if (rt) onEvent({ kind: "reasoning", delta: rt });
@@ -5857,6 +5863,39 @@ _initIPC();
 // Syntax-highlight code-card bodies by reusing Monaco's tokenizer (matches the
 // editor theme, no extra dependency). Returns null on failure so the card keeps
 // its plain, already-escaped text.
+// Token / cache meter: accumulate per-turn usage so the user can SEE the prompt
+// cache working (the payoff of keeping the system prefix static). DeepSeek reports
+// cached-prompt tokens by default; other providers vary, so 0% just means "no
+// cache stats reported", not "cache off". Self-contained fading pill — no layout
+// dependency, fully guarded so it can never break a turn.
+const _tok = { in: 0, cached: 0, out: 0 };
+function _recordUsage(ev) {
+  try {
+    const pin = ev.promptTokens ?? ev.prompt_tokens ?? 0;
+    const cached = ev.cachedTokens ?? ev.cached_tokens ?? 0;
+    const out = ev.completionTokens ?? ev.completion_tokens ?? 0;
+    _tok.in += pin; _tok.cached += cached; _tok.out += out;
+    _renderTokenMeter(pin, cached, out);
+  } catch { /* never let accounting break a turn */ }
+}
+function _renderTokenMeter(pin, cached, out) {
+  let el = document.getElementById("tokenMeter");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "tokenMeter";
+    el.style.cssText = "position:fixed;right:12px;bottom:10px;z-index:9999;font:11px/1.4 system-ui,sans-serif;color:var(--text-dim,#6b7280);background:var(--panel,rgba(255,255,255,.94));border:1px solid var(--border,rgba(0,0,0,.1));border-radius:8px;padding:4px 9px;box-shadow:0 2px 8px rgba(0,0,0,.08);pointer-events:none;opacity:0;transition:opacity .25s";
+    document.body.appendChild(el);
+  }
+  const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+  const hit = pin > 0 ? Math.round((cached / pin) * 100) : 0;
+  const cumHit = _tok.in > 0 ? Math.round((_tok.cached / _tok.in) * 100) : 0;
+  el.textContent = `↺ 缓存 ${hit}% · 输入 ${k(pin)}（缓存 ${k(cached)}）· 输出 ${k(out)}`;
+  el.title = `本会话累计：输入 ${_tok.in}（缓存命中 ${_tok.cached}，约 ${cumHit}%）· 输出 ${_tok.out}`;
+  el.style.opacity = "1";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.opacity = "0"; }, 6000);
+}
+
 async function highlightCode(code, lang) {
   // monaco.editor.colorize tokenizes on the main thread — a very large block can
   // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
@@ -6664,8 +6703,17 @@ async function sendPrompt(text, attachedImages = []) {
   // dilutes the agent's focus on actually doing the task.
   // Inject the full UI-design playbook only when this turn is actually about UI —
   // keeps every other turn's prompt lean and on-task (less "答非所问" drift).
-  const uiGuide = (effectiveMode === "agent" && _looksUITask(text)) ? "\n\n" + _UI_DESIGN_GUIDE : "";
-  const fullPrompt = sysPrompt + uiGuide + growth.promptBlock(effectiveMode) + (contextBlock ? `\n\n--- 项目上下文 ---\n${contextBlock}` : "");
+  const uiGuide = (effectiveMode === "agent" && _looksUITask(text)) ? _UI_DESIGN_GUIDE : "";
+  // ── 提示词缓存（省 token 的关键）──────────────────────────────────────────
+  // system 消息保持「纯静态前缀」= 只放模式提示词本身，逐字不变。这样上游的
+  // 前缀缓存（DeepSeek / OpenAI / Kimi 自动；Claude 见 ai.rs 的 cache_control）
+  // 能跨「每一轮对话」复用它，连带 tools 和更早的历史也一起命中缓存，不再每轮
+  // 重新计费/重算。所有「每轮都在变」的动态内容（项目上下文、当前文件、UI 指南、
+  // 自适应教学、plan-first 提示、@文件 注入）一律下沉到本轮的 user 消息末尾——
+  // 放在最后才不会顶掉前面已缓存的静态前缀。Anthropic / OpenAI / DeepSeek 的缓存
+  // 文档结论一致：静态内容在前，易变内容在后。
+  const _growthBlock = growth.promptBlock(effectiveMode);
+  const fullPrompt = sysPrompt;
 
   _compactHistoryIfNeeded(sess);
 
@@ -6704,10 +6752,19 @@ async function sendPrompt(text, attachedImages = []) {
       } catch { /* unreadable — skip */ }
     }
   }
+  // Per-turn DYNAMIC context lives HERE (end of the message list), not in the
+  // system prompt — so it never invalidates the cached static prefix above. Only
+  // the lean `text` is stored in history, so this big preamble is sent once (this
+  // turn) and doesn't bloat every future request.
+  const _dynPreamble =
+    (uiGuide ? uiGuide + "\n\n" : "") +
+    (_growthBlock ? _growthBlock + "\n\n" : "") +
+    (contextBlock ? `--- 项目上下文 ---\n${contextBlock}\n\n` : "");
   const _extra = _planFirst + _atContext;
+  const _userText = _dynPreamble + text + _extra;
   const userContent = attachedImages.length > 0
-    ? [{ type: "text", text: text + _extra }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
-    : text + _extra;
+    ? [{ type: "text", text: _userText }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))]
+    : _userText;
   messages.push({ role: "user", content: userContent });
   sess.history.push({ role: "user", content: text });
 
@@ -7040,6 +7097,7 @@ async function sendPrompt(text, attachedImages = []) {
           } catch { /* JSON not complete yet, keep buffering */ }
         }
       }
+      else if (ev.kind === "usage") { _recordUsage(ev); }
       else if (ev.kind === "error") { err = ev.message; }
     });
   } catch (e) { if (!err) err = String(e); }
@@ -8758,6 +8816,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
           if (ev.arguments) e.args += ev.arguments;
           _liveWritePreview(e, body); // show code typing live as write_file args stream
         }
+        else if (ev.kind === "usage") { _recordUsage(ev); }
         else if (ev.kind === "error") { turnErr = ev.message; }
       });
     } catch (e) { turnErr = String(e?.message || e); }
