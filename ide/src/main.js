@@ -7652,11 +7652,16 @@ async function _ensureMcpTools() {
   const names = Object.keys(servers);
   if (!names.length) return;
   let total = 0; const failed = [];
-  for (const sname of names) {
+  // Connect to all servers IN PARALLEL, each with its own 10s timeout, so one
+  // slow/wedged server can't serialize-block the others or hang the agent.
+  await Promise.all(names.map(async (sname) => {
     const s = servers[sname] || {};
-    if (!s.command) { failed.push(`${sname}: 缺 command`); continue; }
+    if (!s.command) { failed.push(`${sname}: 缺 command`); return; }
     try {
-      const tools = await backend.invoke("mcp_connect", { name: sname, command: s.command, args: s.args || [], env: s.env || {}, cwd: root });
+      const tools = await Promise.race([
+        backend.invoke("mcp_connect", { name: sname, command: s.command, args: s.args || [], env: s.env || {}, cwd: root }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("连接超时(10s)")), 10000)),
+      ]);
       for (const t of (tools || [])) {
         if (!t || !t.name) continue;
         const full = _mcpSanitizeName(`mcp__${sname}__${t.name}`);
@@ -7672,7 +7677,7 @@ async function _ensureMcpTools() {
         total++;
       }
     } catch (e) { failed.push(`${sname}: ${String(e?.message || e).slice(0, 80)}`); }
-  }
+  }));
   if (total) showToast(`已接入 ${total} 个 MCP 工具（来自 ${names.length} 个服务）`);
   if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
 }
@@ -8786,13 +8791,22 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // global only if a caller didn't pass it.
   session = session || _currentSession();
   const run = { session, mode: mode || _currentAiMode, checkpoint: new Map() };
+  // Mark streaming + flip the Stop button FIRST, before any await — otherwise an
+  // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
+  // while _isStreaming() is still false → the Stop click is a dead no-op.
+  session.streaming = true;
+  if (session === _currentSession()) _setSendBtnStop(true);
   const _live = () => !!session.streaming;
   const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
 
   const isAgent = run.mode === "agent";
-  if (isAgent) { try { await _ensureMcpTools(); } catch {} } // connect external MCP servers (cached) before exposing their tools
+  // Connect external MCP servers (cached), but HARD-BOUNDED so a wedged/slow
+  // server in .mcp.json can never hang the whole run (this was a real freeze).
+  if (isAgent) {
+    try { await Promise.race([_ensureMcpTools(), new Promise((r) => setTimeout(r, 12000))]); } catch {}
+  }
   const toolSchemas = _buildAgentToolSchemas(isAgent);
 
   // Files/activity bar reused from the existing agent UI.
@@ -13881,7 +13895,73 @@ const _SLASH = [
   { cmd: "audit", desc: "深挖漏洞与底层 bug", prompt: "对相关代码做一次**彻底的安全 + 底层系统 bug 审计**。方法：① 先用 search / read_file 把入口、数据流、调用方读全；② 做**污点追踪**：列出不可信输入源(source)→危险汇聚点(sink)，沿每条路径看有没有有效校验 / 转义 / 参数化，没被净化且有真实路径的就是真漏洞，写出路径；③ 按类别地毯式过：注入(SQL/命令/XSS/SSTI/XXE/原型链)、访问控制 / 越权、加密与机密(硬编码密钥 / 弱哈希 / 弱随机)、SSRF / 路径穿越 / 反序列化、ReDoS / CSRF / CORS / 配置 / 供应链；底层：内存安全(溢出 / UAF / double-free / 越界 / 未初始化)、整数溢出 / 截断 / 符号、未定义行为、并发(数据竞争 / 死锁 / TOCTOU)、资源泄漏(异常路径)、错误处理(忽略错误码 / unwrap / 吞异常)。**每条都要确认到具体触发路径、报前自我反驳，对照 CWE/OWASP 标严重度(🔴/🟡)并给修复**；没确凿问题就如实说，绝不为凑数硬报。" },
   { cmd: "refactor", desc: "重构（保持行为）", prompt: "重构当前文件这段代码，提升可读性与结构，保持行为不变；改完验证。" },
   { cmd: "docs", desc: "加文档注释", prompt: "给当前文件的关键函数 / 类型加清晰的文档注释。" },
+  { cmd: "sessions", desc: "查看 / 切换所有会话", action: () => _openSessionPicker() },
+  { cmd: "memory", desc: "管理项目记忆（知识图谱）", action: () => openMemoryPanel() },
 ];
+
+// Session picker (/sessions): browse every conversation in this workspace — name,
+// project, mode, message count, last-message preview — and jump into one to continue.
+function _openSessionPicker() {
+  const overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:99999";
+  const modal = document.createElement("div");
+  modal.style.cssText = "width:min(680px,94vw);max-height:80vh;display:flex;flex-direction:column;background:var(--panel,#fff);border:1px solid var(--border,rgba(128,128,128,.3));border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden";
+  modal.innerHTML =
+    `<div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--border,rgba(128,128,128,.2))">` +
+      `<span style="font-size:14px;font-weight:600">会话记忆</span>` +
+      `<span class="sp-count" style="font-size:12px;opacity:.55"></span>` +
+      `<button class="sp-close" type="button" style="margin-left:auto;background:none;border:none;color:inherit;cursor:pointer;font-size:16px;opacity:.6">✕</button>` +
+    `</div>` +
+    `<input class="sp-search" type="text" placeholder="搜索会话内容…" style="margin:10px 14px 4px;padding:8px 10px;font:13px system-ui;background:var(--bg,#f8f9fa);color:inherit;border:1px solid var(--border,rgba(128,128,128,.3));border-radius:8px;outline:none">` +
+    `<div class="sp-list" style="overflow:auto;padding:6px 8px 12px"></div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  modal.querySelector(".sp-close").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  const listEl = modal.querySelector(".sp-list");
+  const searchEl = modal.querySelector(".sp-search");
+  modal.querySelector(".sp-count").textContent = `${_chatSessions.length} 个`;
+
+  const render = (q) => {
+    q = (q || "").trim().toLowerCase();
+    listEl.innerHTML = "";
+    const rows = _chatSessions.map((s, i) => ({ s, i })).filter(({ s }) => {
+      if (!q) return true;
+      const hay = (s.name + " " + (s.project || "") + " " + s.history.map((m) => m.content || "").join(" ")).toLowerCase();
+      return hay.includes(q);
+    });
+    if (!rows.length) { listEl.innerHTML = `<div style="padding:20px;text-align:center;opacity:.5;font-size:13px">没有匹配的会话</div>`; return; }
+    for (const { s, i } of rows) {
+      const last = s.history.length ? String(s.history[s.history.length - 1].content || "") : "";
+      const preview = last.replace(/\s+/g, " ").slice(0, 90) || "(空会话)";
+      const proj = s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "";
+      const modeObj = _AI_MODES.find((m) => m.id === s.mode);
+      const active = i === _activeChatIdx;
+      const row = document.createElement("button");
+      row.type = "button";
+      row.style.cssText = `display:block;width:100%;text-align:left;padding:9px 11px;margin:3px 0;border:1px solid ${active ? "var(--accent,#1a73e8)" : "transparent"};border-radius:9px;background:${active ? "color-mix(in srgb,var(--accent,#1a73e8) 8%,transparent)" : "transparent"};color:inherit;cursor:pointer`;
+      row.innerHTML =
+        `<div style="display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600">` +
+          `<span class="sp-dot" style="width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:${modeObj?.color || "#888"}"></span>` +
+          `<span class="sp-name"></span>` +
+          (proj ? `<span class="sp-proj" style="font-size:11px;font-weight:400;opacity:.6;padding:1px 6px;border-radius:6px;background:var(--hover,rgba(128,128,128,.14))"></span>` : "") +
+          `<span style="margin-left:auto;font-size:11px;font-weight:400;opacity:.5">${s.history.length} 条 · ${modeObj?.label || s.mode}${active ? " · 当前" : ""}</span>` +
+        `</div>` +
+        `<div class="sp-prev" style="font-size:12px;opacity:.62;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>`;
+      row.querySelector(".sp-name").textContent = s.name;
+      if (proj) row.querySelector(".sp-proj").textContent = proj;
+      row.querySelector(".sp-prev").textContent = preview;
+      row.addEventListener("mouseenter", () => { if (!active) row.style.background = "var(--hover,rgba(128,128,128,.1))"; });
+      row.addEventListener("mouseleave", () => { if (!active) row.style.background = "transparent"; });
+      row.addEventListener("click", () => { _switchChatSession(i); close(); promptEl.focus(); });
+      listEl.appendChild(row);
+    }
+  };
+  render("");
+  searchEl.addEventListener("input", () => render(searchEl.value));
+  setTimeout(() => searchEl.focus(), 30);
+}
 let _slashMatches = [];
 let _slashActive = -1;
 const _slashMenu = document.createElement("div");
@@ -13914,10 +13994,12 @@ function _updateSlashMenu() {
 function _pickSlash(i) {
   const s = _slashMatches[i];
   if (!s) return _hideSlash();
+  _hideSlash();
+  // Action commands (e.g. /sessions) run a UI action instead of filling a prompt.
+  if (typeof s.action === "function") { promptEl.value = ""; promptEl.style.height = "auto"; try { s.action(); } catch (e) { console.warn("[slash]", e); } return; }
   promptEl.value = s.prompt;
   promptEl.style.height = "auto";
   promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
-  _hideSlash();
   promptEl.focus();
 }
 promptEl.addEventListener("keydown", (e) => {
