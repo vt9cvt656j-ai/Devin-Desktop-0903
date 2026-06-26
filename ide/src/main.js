@@ -6082,6 +6082,8 @@ const _AI_MODE_PROMPTS = {
 - find_files(pattern)：按文件名/glob 找文件（如 *.rs、main.js）
 - web_search(query)：联网搜索，找官方文档/API用法/库版本/报错解决方案/技术文章（拿不准就先搜）
 - web_fetch(url)：抓取公网网页正文，读 web_search 找到的页面或已知文档 URL（仅 http/https 公网）
+- http_request(method, url, headers?, body?)：**调任意 HTTP API——用各种网上工具/在线服务的关键能力**。GET/POST/PUT/PATCH/DELETE，返回状态码+响应头+响应体。用来：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回，别只靠猜)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST）；③ 发 webhook。和 web_fetch 的区别：web_fetch 只读公网网页正文(GET)，http_request 能任意方法+headers+body、且**允许 localhost/局域网**(方便测自己服务)。需桌面 App。
+- download_file(url, dest)：从 http/https 下载文件存进工作区(图片/字体/数据集/二进制)。dest 为相对工作区根的路径，最大 200MB。需桌面 App。
 - update_plan(steps)：维护可视化任务计划，多步任务用它列计划并随进度更新状态
 - run_subagent(description, prompt)：派生只读子智能体做聚焦调研（大范围"搞清楚 X 怎么实现的"这类调查交给它，省主线上下文）
 - remember(content)：把值得跨会话长期记住的项目知识（技术栈/架构决定、约定、构建测试命令、用户偏好、易踩的坑）写进项目记忆，下次自动加载。只记长期有用的，别记一次性细节。
@@ -7575,6 +7577,8 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
+      { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。method=GET/POST/PUT/PATCH/DELETE/HEAD，可带 headers 和 body；返回状态码 + 响应头 + 响应体(文本，最多 5MB)。典型用途：① 测你刚起的本地服务(http://127.0.0.1:端口/api，发请求看真实返回)；② 调公开 API（GitHub、天气、汇率、地图、任意 REST 服务）；③ 发 webhook。⚠️ 允许 localhost / 局域网（方便测自己的服务），但禁链路本地 / 云元数据(169.254.x.x)；只支持 http/https。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type\":\"application/json\"}", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
+      { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。dest 是相对工作区根的路径（或工作区内的绝对路径），必须落在工作区内。单文件最大 200MB。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
     );
   }
   // Desktop-only tools (need the real machine: terminal PTY, headless Chrome,
@@ -7582,7 +7586,7 @@ function _buildAgentToolSchemas(includeWrite) {
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
   if (!inTauri) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "computer", "screenshot"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "computer", "screenshot", "http_request", "download_file"]);
     return tools.filter((t) => !desktopOnly.has(t.function.name));
   }
   return tools;
@@ -7623,6 +7627,8 @@ function _mapToolCall(name, args) {
     case "read_terminal": return { type: "termread", name: args.name || "" };
     case "list_terminals": return { type: "termlist" };
     case "stop_terminal": return { type: "termstop", name: args.name || "" };
+    case "http_request": return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: args.headers || null, body: args.body, timeout: args.timeout_secs };
+    case "download_file": return { type: "download", url: args.url || "", dest: args.dest || args.path || "" };
     case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height };
     case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
@@ -8776,7 +8782,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", http: "HTTP request", download: "Downloaded", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8797,6 +8803,8 @@ function _createToolStep(call) {
     termread: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
     termlist: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
     termstop: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm3.5 4.5h5.5v5h-5.5v-5z"/></svg>`,
+    http: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8c0-.46.05-.91.14-1.34l3.32 3.32.7 1.4v1.27A6.51 6.51 0 011.5 8zm6.5 6.5c-.43 0-.85-.04-1.25-.12v-1.6a1 1 0 00-.55-.9L4 10.5v-1.5a1 1 0 011-1h1V6.5a1 1 0 001-1V4h1.5a1 1 0 001-1V2.2A6.5 6.5 0 0114.5 8 6.5 6.5 0 018 14.5z"/></svg>`,
+    download: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.25 1.75a.75.75 0 011.5 0v6.69l1.97-1.97a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.53a.75.75 0 011.06-1.06l1.97 1.97V1.75zM2.5 11.25a.75.75 0 011.5 0v1.5c0 .14.11.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 0111.75 14.5h-7.5A1.75 1.75 0 012.5 12.75v-1.5z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
@@ -8805,7 +8813,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9637,6 +9645,41 @@ async function _executeToolStep(step, call, root, run) {
       try { closeTermTab(idx); } catch (e) { res.className = "atc-result atc-result--err"; res.textContent = "停止失败"; return { type: "termstop", path: lbl, content: `[失败] 停止终端出错: ${e?.message || e}` }; }
       res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
       return { type: "termstop", path: lbl, content: `已停止任务终端「${lbl}」（进程已结束）。` };
+
+    } else if (call.type === "http") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "http", path: call.url || "", content: "[不可用] http_request 只能在桌面 App 里用（要发真实网络请求）。网页/预览版没有这个能力。" }; }
+      if (!call.url) { res.className = "atc-result atc-result--err"; res.textContent = "缺 url"; return { type: "http", path: "", content: "[ERROR] http_request 需要 url。" }; }
+      try {
+        const r = await backend.invoke("http_request", { method: call.method || "GET", url: call.url, headers: call.headers || null, body: (call.body == null ? null : String(call.body)), timeoutSecs: Number.isFinite(call.timeout) ? call.timeout : null });
+        const ok = !!(r && r.ok);
+        res.className = ok ? "atc-result atc-result--ok" : "atc-result atc-result--err";
+        res.textContent = r ? `${r.status} ${r.status_text || ""}`.trim() : "无响应";
+        const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
+        const bodyPreview = (r && r.body || "").slice(0, 4000);
+        if (vp) vp.innerHTML = `<pre>${_escHtml(`${call.method} ${call.url}\n→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\n${r ? (r.content_type || "") : ""}\n\n${bodyPreview}`)}</pre>`;
+        return { type: "http", path: call.url, content: `${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 240);
+        res.className = "atc-result atc-result--err"; res.textContent = "请求失败";
+        return { type: "http", path: call.url, content: `[失败] http_request 出错: ${msg}（检查 URL / 网络 / 方法；本机内网地址会被允许，但 169.254.x.x 链路本地被禁）` };
+      }
+
+    } else if (call.type === "download") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download", path: call.dest || "", content: "[不可用] download_file 只能在桌面 App 里用。" }; }
+      if (!call.url || !call.dest) { res.className = "atc-result atc-result--err"; res.textContent = "缺参数"; return { type: "download", path: call.dest || "", content: "[ERROR] download_file 需要 url 和 dest。" }; }
+      const dlRoot = root || rootPath || workspaceRoots[0] || "";
+      if (!dlRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "download", path: call.dest, content: "[失败] 未打开工作区，无法确定下载位置。" }; }
+      try {
+        const out = await backend.invoke("download_file", { root: dlRoot, url: call.url, dest: call.dest });
+        try { reloadDir(parentDir(call.dest.startsWith("/") ? call.dest : dlRoot + "/" + call.dest)); } catch {}
+        res.className = "atc-result atc-result--ok"; res.textContent = "已下载";
+        if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || ""))}</pre>`;
+        return { type: "download", path: call.dest, content: String(out || `已下载到 ${call.dest}`) };
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 240);
+        res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
+        return { type: "download", path: call.dest, content: `[失败] download_file 出错: ${msg}` };
+      }
 
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";

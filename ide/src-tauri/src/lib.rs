@@ -10,6 +10,7 @@ mod files;
 mod git;
 mod lsp;
 mod marketplace;
+mod net;
 mod process_util;
 mod tasks;
 mod terminal;
@@ -105,6 +106,8 @@ pub fn run() {
             ai::ai_complete,
             ai::web_fetch,
             ai::web_search,
+            net::http_request,
+            net::download_file,
             capture::capture_url,
             browser::browser_navigate,
             browser::browser_click,
