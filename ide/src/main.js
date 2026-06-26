@@ -5984,7 +5984,8 @@ const _AI_MODE_PROMPTS = {
 - **根因优先**：修 bug 先定位「它到底为什么发生」，解决**根本原因**，不要打补丁糊症状；改完想一下有没有同类问题在别处。
 - **保持推进**：常规步骤（读文件、装依赖、跑构建/测试）直接做，不为每一步请示；信息不全就合理假设并说明，一路推到任务真正完成再收尾。
 - **沟通极简**：直接给结论，不写「我将要…/接下来我会…」这类铺垫，也不在正文复述正在调用的工具（系统已显示成卡片）；要指到代码就用 文件:行号。
-- **诚实，绝不假装（铁律）**：工具返回 [失败] / [不可用] / 报错 / 空结果，就是**没成功**——如实说出来、给原因、换方法，**绝不把没做成的事说成做成了**。截图 / 操作类工具(screenshot / browser / computer)只有拿到真实的截图和数据才算生效；拿到空的或报错就是没生效，**别据假数据继续编**。宁可说"这一步没成、原因是 X、我换个方式"，也不要假装顺利。
+- **诚实，绝不假装（铁律）**：工具返回 [失败] / [不可用] / [BLOCKED] / 报错 / 空结果，就是**没成功**——如实说出来、给原因、换方法，**绝不把没做成的事说成做成了**。截图 / 操作类工具(screenshot / browser / computer)只有拿到真实的截图和数据才算生效；拿到空的或报错就是没生效，**别据假数据继续编**。宁可说"这一步没成、原因是 X、我换个方式"，也不要假装顺利。
+- **收尾前自检每一句话（链式验证 Chain-of-Verification）**：你说"做好了 / 修复了 / 能跑了 / 已生效 / 测试通过 / 部署成功"的**每一条**，都要有工具返回的**真实证据**撑着——成功的命令输出、通过的测试、get_diagnostics 无错、真实截图、read_terminal 看到的实际日志。没有证据支撑的，就**不许那样说**，改成如实描述现状（"我改了 X，但还没跑测试" / "服务起没起我没确认"）。说"能跑"前先真的跑一遍看；说服务起来了前先 read_terminal / web_fetch 看一眼。**宁可说"还没验证"，也绝不编一个没核实的结论。**
 - **灵活组合工具、别死板（这是"能打"的关键）**：一个工具不行就换或几个配合——操作 GUI 桌面 App 用 computer、网页交互用 browser、能用命令就 run_cmd、读代码用 lsp/search/子智能体。卡住就退一步换思路、换角度，别一条道走到黑，也别因为某个工具用不了就整个任务躺平。先想"达成目标有哪几条路"，挑最稳的走，不通再换。
 
 # 引导用户（让小白也能掌控——简洁，但不让人懵）
@@ -6096,6 +6097,9 @@ const _AI_MODE_PROMPTS = {
 - git_commit(message, all?)：提交（默认先 add -A 再提交；all=false 只提交已暂存）。**仅在用户明确要求提交时才用**——见「Git 使用纪律」。
 - git_branch(name?, create?)：不传 name 列分支；传 name 切换，create=true 新建并切换
 - git_push() / git_pull()：推送 / 拉取当前分支。**push 对外发布、不可轻易撤回，只在用户明确要求时才用**；切忌自作主张。
+- git_blame(path)：看某文件每行最后是谁、哪个提交、何时改的——排查「这行为什么这样 / 何时引入」很有用。
+- git_stash() / git_stash_pop(index?) / git_stash_list()：把工作区改动临时存进 stash 堆栈 / 取回 / 查看（要先切走看别的、回头再恢复时用）。
+- git_conflicts()：列出当前还有合并冲突未解决的文件（合并 / 变基 / 拉取后确认还剩哪些要处理）。
 - 提示：优先用这些 git 工具而不是 run_cmd 跑 git（结果更结构化、UI 有卡片）；rebase/cherry-pick/tag 等没有专用工具的再用 run_cmd
 - lsp_symbols(path)：列出文件的符号大纲（函数/类/方法 + 行号），比读全文更快看清结构——理解陌生文件首选
 - lsp_definition(path, line, symbol)：按语义跳到符号定义所在的 文件:行（比 search 猜得准）
@@ -6106,6 +6110,9 @@ const _AI_MODE_PROMPTS = {
 - format_file(path)：用语言服务格式化整个文件（可撤销、显示 diff）；无可用格式化器时改用 run_cmd 跑 prettier/rustfmt/gofmt
 - run_cmd(command)：在隔离子进程里运行一条命令并拿到完整输出（装依赖、跑测试、构建、git 等）。**命令按当前 OS 的 Shell 解释**：mac/Linux 走 bash/zsh，Windows 走 cmd.exe（写法见「操作系统」一节，别搞混）。注意：① 每次都是独立 shell，状态不跨命令保留——要切目录写「cd 子目录 && 命令」（Windows 跨盘写「cd /d D:\\dir && 命令」）；② 路径含空格加引号，如「cd "未命名文件夹 2/client"」；③ **绝不前台直接起服务/watch**（不返回会卡住，到点被强杀）——要起服务测试就放后台再立刻读日志：mac/Linux「nohup 命令 >/tmp/svc.log 2>&1 & sleep 3 && cat /tmp/svc.log」，Windows「start "" /b 命令 >%TEMP%\\svc.log 2>&1」之后再用「type %TEMP%\\svc.log」读；④ 单条命令最长约 300s，超时会被强制终止；⑤ **要起持续运行的服务/watch（dev server、nodemon、tail -f 等）别用 run_cmd**，改用 run_in_terminal 挂到 IDE 真实终端里。
 - run_in_terminal(command, name?)：把**长时间运行/持续**的命令挂到 IDE 的真实终端 tab 里持续运行（dev server、watch、守护进程）。它一直跑、用户可见可停，返回启动后几秒的输出供你确认。可多次调用并行挂多个任务。要测它是否提供服务，再用 web_fetch 访问 http://127.0.0.1:端口。
+- read_terminal(name?)：读一个 run_in_terminal 任务终端的**最新输出 + 运行状态**。起了 dev server / watch 后过一会儿用它看新日志（编译好没、报错没、监听哪个端口）——**别假设它成功了，用这个真的去看**。不传 name 读最近一个。
+- list_terminals()：列出所有 run_in_terminal 任务终端及状态（运行中 / 已退出）。
+- stop_terminal(name?)：停掉一个 run_in_terminal 任务终端（用完 dev server / 要换命令重启时）。不传 name 停最近一个。
 - screenshot(url, width?, height?)：**你的"眼睛"**——用无头浏览器渲染网址并把截图回传给你看。做界面时配合 run_in_terminal：起服务 → screenshot 看渲染效果 → 据图改进 → 再 screenshot 复看。需本机装 Chrome/Chromium/Edge。
 - computer(action, …)：**操控整台电脑并能看见全屏**——screenshot 看全屏、move/click/double_click 鼠标、type 打字、key 按组合键、scroll 滚动。每个动作回传全屏截图，你像人一样看着屏幕操作任意桌面 App。**坐标以截图返回的 width/height 为准；先 screenshot 看清再动手；这是用户的真实机器，破坏性/不可逆操作先说明意图**。需桌面环境(有显示器)。优先级：能在浏览器里做的用 browser，能用命令做的用 run_cmd，只有必须操作图形界面 App 时才用 computer。
 - browser(action, …)：**自主操控真实浏览器并能看见它**——navigate 打开网址、click 点、type 输入、press 按键、eval 跑 JS、screenshot 看、close 关。每个动作都回传当前页面截图 + 可见文本，所以你能像人一样"看着操作"。用于自主上网查资料、端到端测试你做的网页(点按钮、填表单、走完流程看截图确认)、抓取需要交互才出现的信息。打法：先 navigate，再 screenshot/eval 看清结构与 CSS 选择器，然后 click/type/press 操作、看截图确认。比 web_fetch 强在能交互、能渲染 JS、能看见。需本机装 Chrome/Chromium/Edge。
@@ -7537,6 +7544,11 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "git_status", description: "查看 git 仓库状态：当前分支、已暂存/未暂存/未跟踪的改动文件列表。要了解动了哪些文件、或提交前先看它。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_diff", description: "查看改动的 git diff（统一 diff 文本）。默认看工作区相对 HEAD 的未暂存改动；staged=true 看已暂存(--cached)的；path 只看某个文件。注意：不显示未跟踪的新文件（那些用 git_status 看）。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，只看这个文件的 diff" }, staged: { type: "boolean", description: "为 true 看已暂存的改动" } } } } },
     { type: "function", function: { name: "git_log", description: "查看最近的提交历史（短哈希、作者、时间、信息、所属分支/标签）。", parameters: { type: "object", properties: { count: { type: "integer", description: "返回多少条，默认 20" } } } } },
+    { type: "function", function: { name: "git_blame", description: "查看某文件每一行最后是被哪个提交、谁、何时改的（git blame）。排查「这行为什么是这样 / 什么时候引入的」很有用。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径（相对工作区根或绝对）" } }, required: ["path"] } } },
+    { type: "function", function: { name: "git_stash_list", description: "列出 git stash 堆栈里现有的暂存条目。", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "git_conflicts", description: "列出当前有合并冲突（未解决）的文件。合并 / 变基 / 拉取后用它确认还剩哪些冲突要处理。", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "read_terminal", description: "读取一个由 run_in_terminal 启动的持续任务终端的**最新输出**和运行状态（运行中 / 已退出）。起了 dev server / watch 之后，过一会儿用它看新打印的日志（编译结果、报错、监听地址）——这是你确认后台任务「到底跑成什么样」的眼睛，别凭空假设它成功了。不传 name 则读最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "终端 / 任务名（run_in_terminal 起的 name）；省略则取最近一个" } } } } },
+    { type: "function", function: { name: "list_terminals", description: "列出当前所有由 run_in_terminal 启动的任务终端及其状态（运行中 / 已退出）。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "lsp_symbols", description: "列出一个文件的代码结构大纲——靠语言服务(LSP / Monaco TS)解析出函数/类/方法/变量等符号及其行号。比 read_file 读全文更快看清一个文件的骨架。需要该语言有可用的语言服务（JS/TS 内置可用；Python/Go/Rust 等需装对应 LSP）。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径" } }, required: ["path"] } } },
     { type: "function", function: { name: "lsp_definition", description: "跳到某个符号的定义。给符号所在的文件、行号(line)和符号名(symbol)，返回定义所在的 文件:行。按语义解析，比靠 search 猜更准。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
     { type: "function", function: { name: "lsp_references", description: "查找一个符号在项目里的所有引用/用法。给符号所在文件、行号(line)、符号名(symbol)，返回引用列表(文件:行)。按语义解析，比纯文本 search 准（能区分同名不同物）。需要该语言有可用的语言服务。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
@@ -7560,6 +7572,9 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。它会一直运行并挂在 IDE 里、用户可见可手动停止；返回启动后几秒的输出供你确认是否起来了。⚠️ 一次性命令（构建 / 测试 / 装依赖 / git）请用 run_cmd；只有需要持续运行的服务 / 监听才用这个。可多次调用以并行挂多个任务（各占一个终端 tab）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。每个动作都回传**全屏截图 + 屏幕尺寸**(截图回传给你看)，你能像人一样看着屏幕操作。⚠️ 这是控制用户的真实机器：先 screenshot 看清再动手，坐标以截图返回的 width/height 为准，破坏性/不可逆操作先说明意图。action：screenshot(看全屏) / move(移到 x,y) / click(点 x,y，button=left/right/middle) / double_click(双击 x,y) / type(输入 text) / key(按键或组合键如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下 负=上)。需桌面环境(有显示器)。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "move", "click", "double_click", "type", "key", "scroll"], description: "要执行的操作" }, x: { type: "integer", description: "目标 x 坐标(像素)" }, y: { type: "integer", description: "目标 y 坐标(像素)" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回当前页面的截图(回传给你看) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓页面信息。action：navigate(打开网址,需 url) / click(点击,需 selector=CSS选择器) / type(输入,需 selector+text) / press(按键如 Enter/Tab/Escape,需 key) / eval(在页面跑 JS,需 script,返回结果) / screenshot(只看当前页不动作) / close(关闭浏览器)。打法：先 navigate 打开 → screenshot 或 eval('document.body.innerHTML') 看清结构与选择器 → 再 click/type/press 操作 → 看截图确认。需本机装 Chrome/Chromium/Edge。", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "eval", "screenshot", "close"], description: "要执行的浏览器动作" }, url: { type: "string", description: "navigate 用：要打开的网址" }, selector: { type: "string", description: "click/type 用：目标元素的 CSS 选择器" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。要临时把手头改动放一边（比如先切分支看别的）时用；之后用 git_stash_pop 取回。", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
+      { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。dev server / watch 用完了、或要换命令重启时用。不传 name 则停最近启动的那个。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
     );
   }
   // Desktop-only tools (need the real machine: terminal PTY, headless Chrome,
@@ -7567,7 +7582,7 @@ function _buildAgentToolSchemas(includeWrite) {
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
   if (!inTauri) {
-    const desktopOnly = new Set(["run_in_terminal", "browser", "computer", "screenshot"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "computer", "screenshot"]);
     return tools.filter((t) => !desktopOnly.has(t.function.name));
   }
   return tools;
@@ -7600,6 +7615,14 @@ function _mapToolCall(name, args) {
     case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
     case "git_push": return { type: "git", op: "push" };
     case "git_pull": return { type: "git", op: "pull" };
+    case "git_blame": return { type: "git", op: "blame", path: args.path || "" };
+    case "git_stash": return { type: "git", op: "stash" };
+    case "git_stash_pop": return { type: "git", op: "stash_pop", index: args.index };
+    case "git_stash_list": return { type: "git", op: "stash_list" };
+    case "git_conflicts": return { type: "git", op: "conflicts" };
+    case "read_terminal": return { type: "termread", name: args.name || "" };
+    case "list_terminals": return { type: "termlist" };
+    case "stop_terminal": return { type: "termstop", name: args.name || "" };
     case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height };
     case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
@@ -8330,7 +8353,11 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, planSteps = null;
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, verifyNudges = 0;
+  let continueNudges = 0, verifyNudges = 0, honestyNudges = 0;
+  // Honesty gate: did the LAST tool-using turn hit a failure/unavailable result?
+  // If so and the model then tries to wrap up, we make it own the failure instead
+  // of reporting fake success (the "实打实，不讲假话" rule, enforced structurally).
+  let lastTurnHadFailure = false, lastFailKinds = "";
 
   try {
     for (let iter = 0; iter < _AGENT_MAX_ITERS; iter++) {
@@ -8357,6 +8384,14 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
         if (didMutate && !didVerify && verifyNudges < 1) {
           verifyNudges++;
           messages.push({ role: "user", content: "你改了文件但还没验证。先用 run_cmd 跑相关的构建/测试/类型检查（如 npm run build、cargo check、pytest、tsc --noEmit），或用 get_diagnostics 看报错；确认通过后再收尾。若这个项目确实没有可跑的验证，简短说明原因即可。" });
+          continue;
+        }
+        // B — honesty gate: a tool just FAILED / was unavailable, and now you're
+        // wrapping up. Don't paper over it. Either actually fix it, or state plainly
+        // in your summary that THIS step did not succeed, why, and what you'll do.
+        if (lastTurnHadFailure && honestyNudges < 1) {
+          honestyNudges++;
+          messages.push({ role: "user", content: `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。` });
           continue;
         }
         break; // truly done
@@ -8422,6 +8457,16 @@ async function _runAgenticLoop({ config, messages, root, session, mode }) {
       }
 
       for (const m of toolMsgs) messages.push(m);
+
+      // Honesty: did any tool this turn report failure / unavailable / blocked?
+      // The finish gate uses this to stop the model claiming fake success.
+      {
+        const fails = toolMsgs
+          .map(m => (m.content || "").match(/\[(失败|ERROR|BLOCKED|不可用|未执行)\]/))
+          .filter(Boolean).map(x => x[0]);
+        lastTurnHadFailure = fails.length > 0;
+        lastFailKinds = [...new Set(fails)].join(" ");
+      }
 
       // Eyes: feed any screenshots back to the model as image(s) so it can
       // actually SEE the rendered UI and self-correct — not edit blind. Keep only
@@ -8731,7 +8776,7 @@ function _createToolStep(call) {
     : (call.path || call.command || "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
+  const actionLabel = { write: "Wrote", edit: "Edited", multiedit: "Edited", read: "Read", list: "Listed", cmd: "Ran command", search: "Searched", find: "Found files", web: "Fetched", websearch: "Web search", memory: "Remembered", delete: "Deleted", move: "Moved", diag: "Diagnostics", git: "Git", lsp: "LSP", mkdir: "Created dir", copy: "Copied", format: "Formatted", termtask: "Terminal task", termread: "Read terminal", termlist: "Terminals", termstop: "Stopped terminal", screenshot: "Screenshot", browser: "Browser", computer: "Computer" }[call.type] || "";
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zM11.524 2.2l-8.61 8.61a.25.25 0 00-.064.108l-.58 2.032 2.032-.58a.25.25 0 00.108-.064l8.61-8.61a.25.25 0 000-.354l-1.086-1.086a.25.25 0 00-.353 0z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -8749,6 +8794,9 @@ function _createToolStep(call) {
     copy: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>`,
     format: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.5 0a.5.5 0 01.5.5c0 1.5.5 2 2 2a.5.5 0 010 1c-1.5 0-2 .5-2 2a.5.5 0 01-1 0c0-1.5-.5-2-2-2a.5.5 0 010-1c1.5 0 2-.5 2-2a.5.5 0 01.5-.5zM3.5 6a.5.5 0 01.5.5c0 1 .333 1.333 1.333 1.333a.5.5 0 010 1C4.333 8.833 4 9.167 4 10.167a.5.5 0 01-1 0c0-1-.333-1.334-1.333-1.334a.5.5 0 010-1C2.667 7.833 3 7.5 3 6.5a.5.5 0 01.5-.5zm6 4a.5.5 0 01.5.5c0 1.25.5 1.75 1.75 1.75a.5.5 0 010 1c-1.25 0-1.75.5-1.75 1.75a.5.5 0 01-1 0c0-1.25-.5-1.75-1.75-1.75a.5.5 0 010-1c1.25 0 1.75-.5 1.75-1.75a.5.5 0 01.5-.5z"/></svg>`,
     termtask: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
+    termread: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
+    termlist: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm-.25 1.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25V2.75zM4 5.5l3 2.5-3 2.5V5.5zM8.5 10h3.5v1H8.5v-1z"/></svg>`,
+    termstop: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25V2.75A1.75 1.75 0 0014.25 1H1.75zm3.5 4.5h5.5v5h-5.5v-5z"/></svg>`,
     screenshot: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 5.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5zM6.5 8a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/><path d="M5.05 1.5a1.75 1.75 0 00-1.4.7l-.6.8a.25.25 0 01-.2.1H1.75A1.75 1.75 0 000 4.85v7.4C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-7.4a1.75 1.75 0 00-1.75-1.75h-1.1a.25.25 0 01-.2-.1l-.6-.8a1.75 1.75 0 00-1.4-.7H5.05zM1.5 4.85a.25.25 0 01.25-.25h1.1c.55 0 1.07-.26 1.4-.7l.6-.8a.25.25 0 01.2-.1h3.9a.25.25 0 01.2.1l.6.8c.33.44.85.7 1.4.7h1.1a.25.25 0 01.25.25v7.4a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-7.4z"/></svg>`,
     browser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM1.5 8a6.47 6.47 0 01.34-2.07c.2.66.74 1.1 1.66 1.1.6 0 .76.36.76 1.18 0 .63.18 1.13.78 1.4.32.14.5.46.5 1.04 0 .9.42 1.46 1.16 1.66A6.5 6.5 0 011.5 8zm6.5 6.5c-.3 0-.6-.02-.88-.06.2-.3.38-.66.38-1.04 0-.86-.5-1.3-1.18-1.6-.5-.22-.82-.5-.82-1.14 0-.9-.5-1.43-1.34-1.43H4.4c-.46 0-.66-.3-.66-.74 0-.5.3-.76.86-.76.74 0 1.04-.4 1.04-1.04 0-.5.26-.78.78-.78.74 0 1.1-.4 1.1-1.12V4.4c0-.5.28-.74.7-.86A6.5 6.5 0 0114.46 7H13c-.74 0-1.16.42-1.16 1.16 0 .9.5 1.34 1.34 1.34h.36A6.51 6.51 0 018 14.5z"/></svg>`,
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
@@ -8757,7 +8805,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer";
   let pathHtml = _nonClickable
     ? `<span class="atc-path">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? _escHtml(dirPath) + '/' : ''}${_escHtml(fileName)}</span>`;
@@ -9442,7 +9490,7 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "git") {
       const gitRoot = root || rootPath || workspaceRoots[0] || "";
       if (!gitRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "git", path: call.op, content: "[ERROR] 未打开工作区，无法执行 git。" }; }
-      const mutating = call.op === "commit" || call.op === "push" || call.op === "pull" || (call.op === "branch" && !!call.branch);
+      const mutating = call.op === "commit" || call.op === "push" || call.op === "pull" || call.op === "stash" || call.op === "stash_pop" || (call.op === "branch" && !!call.branch);
       if (readOnlyMode && mutating) {
         const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
         res.className = "atc-result atc-result--blocked";
@@ -9505,6 +9553,38 @@ async function _executeToolStep(step, call, root, run) {
           res.className = "atc-result atc-result--ok"; res.textContent = "已拉取";
           if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
           return { type: "git", path: "pull", content: `git pull:\n${out || "(完成)"}` };
+        } else if (call.op === "blame") {
+          if (!call.path) { res.className = "atc-result atc-result--err"; res.textContent = "缺路径"; return { type: "git", path: "blame", content: "[ERROR] git_blame 需要 path。" }; }
+          const rel = call.path.replace(/^\/+/, "");
+          const lines = await backend.invoke("git_blame", { root: gitRoot, rel }) || [];
+          const body2 = lines.map(l => `${String(l.line).padStart(4)}  ${l.commit}  ${l.author}  ${l.date}`).join("\n");
+          res.className = "atc-result atc-result--ok"; res.textContent = `${lines.length} 行`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(body2.slice(0, 4000) || "(无)")}</pre>`;
+          return { type: "git", path: "blame", content: body2 ? `${call.path} blame（行号  提交  作者  日期）:\n${body2}` : "(空文件或无 blame 记录)" };
+        } else if (call.op === "stash") {
+          const out = await backend.invoke("git_stash", { root: gitRoot });
+          try { refreshGitStatus(); _clearAgentReadCache(); } catch {}
+          res.className = "atc-result atc-result--ok"; res.textContent = "已 stash";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
+          return { type: "git", path: "stash", content: `git stash:\n${out || "(完成)"}` };
+        } else if (call.op === "stash_pop") {
+          const idx = Number.isFinite(call.index) ? Math.floor(call.index) : null;
+          const out = await backend.invoke("git_stash_pop", { root: gitRoot, index: idx });
+          try { refreshGitStatus(); _clearAgentReadCache(); } catch {}
+          res.className = "atc-result atc-result--ok"; res.textContent = "已弹出 stash";
+          if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 2000))}</pre>`;
+          return { type: "git", path: "stash_pop", content: `git stash pop:\n${out || "(完成)"}` };
+        } else if (call.op === "stash_list") {
+          const list = await backend.invoke("git_stash_list", { root: gitRoot }) || [];
+          res.className = "atc-result atc-result--ok"; res.textContent = `${list.length} 条 stash`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(list.join("\n") || "(无 stash)")}</pre>`;
+          return { type: "git", path: "stash_list", content: list.length ? list.join("\n") : "(stash 堆栈为空)" };
+        } else if (call.op === "conflicts") {
+          const cf = await backend.invoke("git_conflicts", { root: gitRoot }) || [];
+          const body2 = cf.map(c => c.rel || c.path).join("\n");
+          res.className = "atc-result atc-result--ok"; res.textContent = `${cf.length} 个冲突`;
+          if (vp) vp.innerHTML = `<pre>${_escHtml(body2 || "(无冲突)")}</pre>`;
+          return { type: "git", path: "conflicts", content: cf.length ? `有合并冲突的文件:\n${body2}` : "(当前没有合并冲突)" };
         }
         return { type: "git", path: call.op, content: `未知 git 操作: ${call.op}` };
       } catch (e) {
@@ -9530,6 +9610,33 @@ async function _executeToolStep(step, call, root, run) {
       return { type: "termtask", path: label, content: exited
         ? `命令在 IDE 终端「${label}」里运行后已退出（可能不是持续任务，或启动即失败）：\n$ ${cmd}\n输出:\n${out || "(无)"}`
         : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。要确认它在提供服务，可用 web_fetch 访问其本地地址（如 http://127.0.0.1:端口）。` };
+
+    } else if (call.type === "termread") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "termread", path: call.name || "", content: "[不可用] read_terminal 只能在桌面 App 里用（要读真实终端的输出）。" }; }
+      const ent = _findTaskTerm(call.name);
+      if (!ent) { res.className = "atc-result atc-result--err"; res.textContent = "没找到终端"; return { type: "termread", path: call.name || "", content: "[失败] 没找到对应的任务终端。先用 run_in_terminal 启动，或用 list_terminals 看现在有哪些。别假设它在跑。" }; }
+      const tout = (ent.recentOut || "").trim().slice(-4000);
+      const status = ent.exited ? "已退出" : (ent.backendId != null ? "运行中" : "未启动");
+      res.className = ent.exited ? "atc-result atc-result--err" : "atc-result atc-result--ok"; res.textContent = status;
+      if (vp) vp.innerHTML = `<pre>${_escHtml(tout || "(暂无新输出)")}</pre>`;
+      return { type: "termread", path: ent.label || "", content: `任务终端「${(ent.label || "").replace(/^▶\s*/, "")}」状态：${status}。最新输出:\n${tout || "(暂无输出——可能还没打印，或确实没输出)"}` };
+
+    } else if (call.type === "termlist") {
+      const tasks = termTabs.filter(t => (t.label || "").startsWith("▶"));
+      const lines = tasks.map(t => `[${t.exited ? "已退出" : "运行中"}] ${(t.label || "").replace(/^▶\s*/, "")}`);
+      res.className = "atc-result atc-result--ok"; res.textContent = `${tasks.length} 个任务`;
+      if (vp) vp.innerHTML = `<pre>${_escHtml(lines.join("\n") || "(无)")}</pre>`;
+      return { type: "termlist", path: "", content: tasks.length ? `由 run_in_terminal 启动的任务终端:\n${lines.join("\n")}` : "(当前没有由 run_in_terminal 启动的任务终端)" };
+
+    } else if (call.type === "termstop") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "termstop", path: call.name || "", content: "[不可用] stop_terminal 只能在桌面 App 里用。" }; }
+      const ent = _findTaskTerm(call.name);
+      if (!ent) { res.className = "atc-result atc-result--err"; res.textContent = "没找到终端"; return { type: "termstop", path: call.name || "", content: "[失败] 没找到可停止的任务终端。用 list_terminals 看现在有哪些。" }; }
+      const lbl = (ent.label || "").replace(/^▶\s*/, "");
+      const idx = termTabs.indexOf(ent);
+      try { closeTermTab(idx); } catch (e) { res.className = "atc-result atc-result--err"; res.textContent = "停止失败"; return { type: "termstop", path: lbl, content: `[失败] 停止终端出错: ${e?.message || e}` }; }
+      res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
+      return { type: "termstop", path: lbl, content: `已停止任务终端「${lbl}」（进程已结束）。` };
 
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";
@@ -14080,6 +14187,20 @@ async function createTermTab(customLabel) {
     entry.opening = false;
   }
   return entry;
+}
+
+// Find an agent task terminal (one started by run_in_terminal — its label is
+// prefixed with "▶ "). With a name, match the label (case-insensitive substring);
+// without one, return the most-recently-created task terminal. Powers
+// read_terminal / stop_terminal so the agent can check on / kill background tasks.
+function _findTaskTerm(name) {
+  const tasks = termTabs.filter(t => (t.label || "").startsWith("▶"));
+  if (!tasks.length) return null;
+  if (name && name.trim()) {
+    const n = name.trim().toLowerCase();
+    return tasks.find(t => (t.label || "").toLowerCase().replace(/^▶\s*/, "").includes(n)) || null;
+  }
+  return tasks[tasks.length - 1];
 }
 
 // Launch a persistent / long-running command in a NEW real IDE terminal tab —
