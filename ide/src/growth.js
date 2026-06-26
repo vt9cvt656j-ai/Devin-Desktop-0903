@@ -337,16 +337,29 @@ function levelLabel(p) { return p >= 0.7 ? "熟练" : p >= 0.4 ? "进阶" : "新
 export function promptBlock(mode) {
   try {
     load();
-    // Do NOT pollute the autonomous tool-using agent's prompt. Its job is to DO
-    // the task well — telling it to "explain every step", "hold back / let the
-    // user write code", or "point out a transferable principle" makes it ramble
-    // and under-deliver. Adaptive teaching density belongs to the conversational
-    // modes (chat / plan), where the AI is actually talking to the user.
-    if (mode === "agent" || mode === "explorer" || mode === "reviewer") return "";
     const explain = state.prefs.explain;
     const overall = avgMastery();
     const weak = SKILLS.filter((s) => state.skills[s.id].p < 0.45);
     const strong = SKILLS.filter((s) => state.skills[s.id].p >= 0.7);
+
+    // Agent / tool modes: teaching must NOT pollute the DOING (telling it to
+    // "explain every step" makes it ramble + under-deliver). So we give it a TIGHT
+    // directive scoped to the WRAP-UP only — adaptive by skill level. This is the
+    // "把新手提拔成高手 / 把高手伺候得更爽" lever, finally active in the mode the
+    // user actually uses most (before, agent mode got zero adaptive teaching).
+    if (mode === "agent" || mode === "explorer" || mode === "reviewer") {
+      const al = ["--- 因人而教（**只作用于收尾总结**，干活过程照常高效、绝不啰嗦；据该用户能力画像自适应）---"];
+      if (overall < 0.45) {
+        al.push("该用户偏**新手**：干活时照常麻利、别中途解释；但**收尾**用大白话讲清「做了什么 / 为什么这么做 / 怎么用 / 改了哪些文件」，第一次出现的术语顺手一句话点破，并**额外给一个可迁移的原理 + 一个他自己能上手试的小下一步**——目标是把他一步步带成「会用、会判断、会自己写」，越用越长本事。别居高临下。");
+      } else if (overall < 0.7) {
+        al.push("该用户**进阶**：收尾简明说清改动与关键决策，点一个值得注意的点或更优做法；少铺垫、别从头讲基础。");
+      } else {
+        al.push("该用户是**高手**：对等、精简、直给——跳过一切基础讲解，收尾只点深层取舍 / 边界 / 风险 / 你做的关键假设；把他当资深同行，别教学、别复述显然的东西，能省则省。");
+      }
+      if (weak.length && overall < 0.7) al.push(`可顺带培养的弱项（**仅收尾点到为止**，绝不打断干活）：${weak.map((s) => s.label).join("、")}。`);
+      if (strong.length) al.push(`其强项（${strong.map((s) => s.label).join("、")}）：直接给结论，别赘述。`);
+      return "\n\n" + al.join("\n");
+    }
 
     // base verbosity: pref override, else derived from overall mastery
     let density;
