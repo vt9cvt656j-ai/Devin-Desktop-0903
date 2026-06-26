@@ -323,13 +323,29 @@ async fn ai_chat_inner(
                 // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
                 // style `cache_read_input_tokens`.
                 if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
-                    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-                    let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+                    let completion = usage["completion_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
+                        .unwrap_or(0);
+                    let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
+                    let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                     let cached = usage["prompt_tokens_details"]["cached_tokens"]
                         .as_u64()
-                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
-                        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
+                        .or_else(|| cache_read)
                         .unwrap_or(0);
+                    let prompt_raw = usage["prompt_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
+                        .unwrap_or(0);
+                    // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
+                    // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
+                    // so add them — otherwise `cached / prompt` reads as >100%.
+                    let prompt = if cache_read.is_some() {
+                        prompt_raw + cached + cache_creation
+                    } else {
+                        prompt_raw
+                    };
                     if prompt > 0 || completion > 0 {
                         let _ = on_event.send(AiEvent::Usage {
                             prompt_tokens: prompt as u32,

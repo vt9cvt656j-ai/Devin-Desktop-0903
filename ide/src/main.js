@@ -5964,8 +5964,10 @@ _initIPC();
 // cache stats reported", not "cache off". Self-contained fading pill — no layout
 // dependency, fully guarded so it can never break a turn.
 const _tok = { in: 0, cached: 0, out: 0, anyReal: false };
-// Rough token estimate (when the provider reports no usage): ~3 chars/token
-// blended for mixed CJK/English. Handles a string or a full messages array.
+// Rough token estimate (only used when the provider reports no usage). CJK chars
+// are ~1 token each; ASCII/code is ~4 chars/token — counting them separately is far
+// closer than a flat ratio for mixed Chinese + code. Handles a string or a full
+// messages array. (Real usage from the provider is exact; this is the fallback.)
 function _estTokens(x) {
   let s = "";
   if (typeof x === "string") s = x;
@@ -5976,7 +5978,13 @@ function _estTokens(x) {
       else if (Array.isArray(c)) for (const part of c) if (part && part.type === "text") s += part.text || "";
     }
   }
-  return Math.round(s.length / 3);
+  let cjk = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    // CJK ideographs, kana, Hangul, CJK symbols/punct — count as ~1 token each.
+    if ((c >= 0x2e80 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xff00 && c <= 0xffef)) cjk++;
+  }
+  return Math.round(cjk + (s.length - cjk) / 4);
 }
 function _recordUsage(ev) {
   try {
@@ -5998,12 +6006,12 @@ function _renderTokenMeter(pin, cached, out, estimated) {
     document.body.appendChild(el);
   }
   const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
-  const cumHit = _tok.in > 0 ? Math.round((_tok.cached / _tok.in) * 100) : 0;
+  const cumHit = _tok.in > 0 ? Math.min(100, Math.round((_tok.cached / _tok.in) * 100)) : 0;
   if (estimated) {
     // No usage reported — show an estimate (cache % unknown), still better than blank.
     el.textContent = `≈ 输入 ${k(pin)} · 输出 ${k(out)}（供应商未上报用量，缓存%未知）`;
   } else {
-    const hit = pin > 0 ? Math.round((cached / pin) * 100) : 0;
+    const hit = pin > 0 ? Math.min(100, Math.round((cached / pin) * 100)) : 0;
     // Show the running SESSION hit rate too, so the user can see at a glance whether
     // caching is actually working well across the whole conversation.
     const sess = _tok.in > 0 ? ` · 本会话累计命中 ${cumHit}%` : "";
@@ -7201,6 +7209,7 @@ async function sendPrompt(text, attachedImages = []) {
   sess.streaming = true;
   const _pendingToolCalls = [];
   let _toolArgBuf = {};
+  let _legacyUsage = null; // record once (last wins) — avoid double-count per-chunk
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
     const chatFn = useTools
@@ -7247,11 +7256,12 @@ async function sendPrompt(text, attachedImages = []) {
           } catch { /* JSON not complete yet, keep buffering */ }
         }
       }
-      else if (ev.kind === "usage") { _recordUsage(ev); }
+      else if (ev.kind === "usage") { _legacyUsage = ev; } // keep latest; record once below
       else if (ev.kind === "error") { err = ev.message; }
     });
   } catch (e) { if (!err) err = String(e); }
   finally {
+    if (_legacyUsage) _recordUsage(_legacyUsage);
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
@@ -9192,7 +9202,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
   const _live = () => !session || session.streaming;
   let acc = "";
   let err = null;
-  let _gotUsage = false; // did the provider report real token usage this turn?
+  let _turnUsage = null; // last usage report this turn (avoid double-count if sent per-chunk)
   const byIndex = new Map();
   let streamEl = null;
   // Throttle streaming re-render to ~12fps. Re-parsing + rebuilding the whole
@@ -9237,7 +9247,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
           if (ev.arguments) e.args += ev.arguments;
           _liveWritePreview(e, body); // show code typing live as write_file args stream
         }
-        else if (ev.kind === "usage") { _gotUsage = true; _recordUsage(ev); }
+        else if (ev.kind === "usage") { _turnUsage = ev; } // keep the latest; record once below
         else if (ev.kind === "error") { turnErr = ev.message; }
       });
     } catch (e) { turnErr = String(e?.message || e); }
@@ -9254,9 +9264,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session })
 
   if (flushTimer) clearTimeout(flushTimer);
   body.querySelector(".thinking")?.remove();
-  // Provider sent no usage (gateway stripped it / no stream_options support) →
-  // show an ESTIMATE so the token meter is never blank ("缓存看不到").
-  if (!_gotUsage) _recordUsage({ estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) });
+  // Record token usage ONCE per turn: the real report if the provider sent one
+  // (last wins, so a per-chunk cumulative usage isn't double-counted), else an
+  // estimate so the meter is never blank ("缓存看不到").
+  if (_turnUsage) _recordUsage(_turnUsage);
+  else _recordUsage({ estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) });
 
   const cleanFinal = _cleanAgentText(acc);
   if (streamEl) {
