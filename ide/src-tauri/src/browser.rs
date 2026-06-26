@@ -60,16 +60,35 @@ pub struct BrowserState {
 fn launch() -> Result<Session, String> {
     let path = crate::capture::find_headless_browser()
         .ok_or("未找到 Chrome / Chromium / Edge，无法启动浏览器自动化。请先安装其一。")?;
+    // Make intranet/localhost dev servers reachable: ignore self-signed certs and
+    // bypass any system/corporate proxy for private addresses (so "内网不能访问"
+    // doesn't happen), while still letting public sites use the proxy.
+    let proxy_bypass = "--proxy-bypass-list=localhost;127.0.0.1;[::1];0.0.0.0;\
+        10.*;192.168.*;169.254.*;\
+        172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;\
+        172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;\
+        *.local;<local>";
+    let extra: Vec<std::ffi::OsString> = vec![
+        "--ignore-certificate-errors".into(),
+        "--allow-insecure-localhost".into(),
+        "--disable-background-networking".into(),
+        "--disable-dev-shm-usage".into(),
+        proxy_bypass.into(),
+    ];
+    let extra_ref: Vec<&std::ffi::OsStr> = extra.iter().map(|s| s.as_os_str()).collect();
     let opts = LaunchOptionsBuilder::default()
         .path(Some(std::path::PathBuf::from(path)))
         .headless(true)
         .sandbox(false)
+        .ignore_certificate_errors(true)
         .window_size(Some((1280, 900)))
+        .args(extra_ref)
         .build()
         .map_err(|e| e.to_string())?;
     let browser = Browser::new(opts).map_err(|e| e.to_string())?;
     let tab = browser.new_tab().map_err(|e| e.to_string())?;
-    tab.set_default_timeout(Duration::from_secs(15));
+    // Slow intranet pages need more headroom than the old 15s.
+    tab.set_default_timeout(Duration::from_secs(30));
     Ok(Session {
         _browser: browser,
         tab,

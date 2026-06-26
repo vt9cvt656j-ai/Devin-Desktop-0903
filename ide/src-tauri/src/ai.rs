@@ -324,34 +324,29 @@ async fn ai_chat_inner(
     Ok(())
 }
 
-/// SSRF guard: only allow public/global addresses, never loopback, private,
-/// link-local, CGNAT, multicast, etc.
-fn ip_is_public(ip: std::net::IpAddr) -> bool {
+/// SSRF policy for this single-user, on-device dev IDE. The user explicitly wants
+/// to fetch their own intranet / localhost dev servers, so loopback and private
+/// LAN are ALLOWED (matches the `net.rs` http_request tool). What stays blocked is
+/// what's never a legitimate fetch target and is the real danger: link-local
+/// (169.254/16 and fe80::/10 — i.e. the cloud-metadata 169.254.169.254 endpoint),
+/// plus unspecified / multicast / broadcast / documentation junk.
+fn ip_fetch_allowed(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
+            !(v4.is_link_local()        // 169.254/16 — blocks cloud metadata
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || v4.is_documentation()
                 || v4.is_multicast()
-                || o[0] == 0
-                // CGNAT 100.64.0.0/10
-                || (o[0] == 100 && (64..=127).contains(&o[1])))
+                || o[0] == 0)
         }
         std::net::IpAddr::V6(v6) => {
             let s = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
+            !(v6.is_unspecified()
                 || v6.is_multicast()
-                // unique-local fc00::/7
-                || (s[0] & 0xfe00) == 0xfc00
                 // link-local fe80::/10
-                || (s[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped ::ffff:0:0/96 — re-check the embedded v4
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff))
+                || (s[0] & 0xffc0) == 0xfe80)
         }
     }
 }
@@ -444,14 +439,14 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         return Err("无法解析主机".into());
     }
     for a in &addrs {
-        if !ip_is_public(a.ip()) {
-            return Err("拒绝访问本地/内网地址".into());
+        if !ip_fetch_allowed(a.ip()) {
+            return Err("拒绝访问该地址（link-local / 元数据 / 多播等）".into());
         }
     }
 
-    // Redirects disabled so a 3xx can't bounce us to an internal address; a
-    // redirect is surfaced to the model so it can choose to follow it (which
-    // re-runs this guard on the new URL).
+    // Redirects disabled so a 3xx can't silently bounce us to a link-local /
+    // metadata address; the redirect is surfaced to the model so it can choose to
+    // follow it (which re-runs ip_fetch_allowed on the new URL).
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))

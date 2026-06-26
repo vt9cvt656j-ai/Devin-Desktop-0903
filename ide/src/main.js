@@ -5526,6 +5526,17 @@ function _renderMsgRange(session, from, to) {
 function _renderSessionHistory(session) {
   if (!session || session._rendered) return;
   session._rendered = true; // mark first, so a re-entrant switch can't double-render
+  // Prefer the rendered-HTML snapshot from a prior run — it restores the full
+  // visual (tool cards, diffs, inline screenshots) exactly as it looked, fixing
+  // "样式都没". Only when there's no snapshot (localStorage fallback, or a thread
+  // too big to snapshot) do we rebuild from the text history.
+  if (session._htmlSnapshot) {
+    try {
+      session.container.innerHTML = session._htmlSnapshot;
+      session._htmlSnapshot = ""; // consumed; future saves re-snapshot the live DOM
+      return;
+    } catch { /* fall through to text re-render */ }
+  }
   const h = Array.isArray(session.history) ? session.history : [];
   if (!h.length) return;
   const start = Math.max(0, h.length - _RENDER_LIMIT);
@@ -5622,6 +5633,27 @@ function _closeChatSession(idx) {
   saveChatHistory();
 }
 
+// Capture a session's rendered transcript as sanitized HTML, so a restart can
+// restore the FULL visual (tool cards, diffs, inline screenshots) — not just the
+// text. Transient/interactive bits (spinners, dead buttons) are stripped, and an
+// over-large snapshot is skipped so a screenshot-heavy thread can't bloat the
+// store (restore then falls back to re-rendering from the text history).
+function _snapshotTranscript(session) {
+  try {
+    const c = session && session.container;
+    // Only snapshot what's actually been rendered; an un-viewed restored tab keeps
+    // whatever snapshot it was loaded with (see restoreChatHistory).
+    if (!c || !session._rendered) return session?._htmlSnapshot || "";
+    const clone = c.cloneNode(true);
+    clone.querySelectorAll(
+      ".thinking, .stream-cursor, .plan-exec-btn, .chat-earlier-note, [data-transient]"
+    ).forEach(e => e.remove());
+    const html = clone.innerHTML || "";
+    if (html.length > 4_000_000) return ""; // too big — fall back to text re-render
+    return html;
+  } catch { return ""; }
+}
+
 let _chatSavePending = false;
 async function saveChatHistory() {
   if (_chatSavePending) return;
@@ -5638,14 +5670,23 @@ async function saveChatHistory() {
       created: s.created,
     }));
     const payload = { sessions: data, activeIdx: _activeChatIdx };
-    // Dual-channel durability: always mirror to localStorage so a Tauri-store
-    // permission / IO failure can't lose the chat (restoreChatHistory falls back
-    // to this). Then write the real store file when on desktop.
+    // Dual-channel durability: always mirror a LIGHTWEIGHT (text-only) copy to
+    // localStorage so a Tauri-store permission / IO failure can't lose the chat
+    // (restoreChatHistory falls back to this). Text-only also keeps it under the
+    // ~5 MB localStorage quota even when a transcript is full of screenshots.
     try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(payload)); } catch {}
     if (inTauri) {
+      // The disk store has room, so ALSO snapshot each session's rendered
+      // transcript HTML. That's what brings the full visual back on restart —
+      // tool cards, diffs, inline screenshots — instead of only the plain summary
+      // text. Without it, reopening showed "聊天记录还在，但之前渲染的样式都没".
+      const rich = {
+        sessions: data.map((d, i) => ({ ...d, html: _snapshotTranscript(_chatSessions[i]) })),
+        activeIdx: _activeChatIdx,
+      };
       try {
         const store = await loadStore("session.json");
-        await store.set(CHAT_STORE_KEY, payload);
+        await store.set(CHAT_STORE_KEY, rich);
         await store.save();
       } catch (e) { console.warn("[chat] store save failed (localStorage fallback kept):", e); }
     }
@@ -5675,6 +5716,10 @@ async function restoreChatHistory() {
         usedNames.add(session.name);
         session.id = sData.id || session.id;
         session.created = sData.created || Date.now();
+        // Rendered-transcript snapshot (disk store only) — consumed lazily by
+        // _renderSessionHistory when this tab is first shown, restoring the full
+        // visual instead of re-rendering plain text.
+        if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
         if (Array.isArray(sData.history)) {
           for (const m of sData.history) {
             session.history.push(m);

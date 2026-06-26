@@ -111,28 +111,90 @@ pub fn bytes_to_jpeg_data_url(bytes: &[u8], max_w: u32, quality: u8) -> Result<S
     jpeg_data_url(img, max_w, quality)
 }
 
+/// True if the URL's host is loopback / private-LAN / `.local` / a bare hostname
+/// — i.e. an intranet address that must bypass any system proxy. Otherwise Chrome
+/// routes localhost/LAN through a corporate proxy and "can't reach" the dev server
+/// (the user's "内网不能访问").
+fn host_is_local(url: &str) -> bool {
+    let after = url.splitn(2, "://").nth(1).unwrap_or(url);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority); // drop userinfo
+    // host without port — handle bracketed IPv6 like [::1]:3000
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    if h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h == "::1"
+        || h == "0.0.0.0"
+    {
+        return true;
+    }
+    if h.starts_with("127.")
+        || h.starts_with("10.")
+        || h.starts_with("192.168.")
+        || h.starts_with("169.254.")
+    {
+        return true;
+    }
+    // 172.16.0.0 – 172.31.255.255
+    if let Some(rest) = h.strip_prefix("172.") {
+        if let Ok(n) = rest.split('.').next().unwrap_or("").parse::<u8>() {
+            if (16..=31).contains(&n) {
+                return true;
+            }
+        }
+    }
+    // A bare hostname with no dot (e.g. "myserver", "dev") is almost always intranet.
+    !h.contains('.')
+}
+
 fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<(), String> {
+    let mut args: Vec<String> = vec![
+        "--headless=new".into(),
+        "--disable-gpu".into(),
+        "--no-sandbox".into(),
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--disable-extensions".into(),
+        "--disable-background-networking".into(),
+        "--disable-sync".into(),
+        "--disable-dev-shm-usage".into(),
+        "--hide-scrollbars".into(),
+        // Local dev servers love self-signed HTTPS — don't let a cert error wedge
+        // the capture into a timeout ("内网不能访问").
+        "--ignore-certificate-errors".into(),
+        "--allow-insecure-localhost".into(),
+        format!("--window-size={w},{h}"),
+        format!("--screenshot={out}"),
+        // Let dynamic pages render before the shot. The budget fires even on pages
+        // with idle-but-open sockets (HMR / websockets), so it won't hang there.
+        "--virtual-time-budget=8000".into(),
+    ];
+    if host_is_local(url) {
+        // Intranet / localhost must NOT go through a system/corporate proxy, or
+        // Chrome can't reach the user's own dev server.
+        args.push("--no-proxy-server".into());
+    }
+    args.push(url.into());
+
     let mut child = Command::new(browser)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--no-first-run",
-            "--disable-extensions",
-            "--hide-scrollbars",
-            &format!("--window-size={w},{h}"),
-            &format!("--screenshot={out}"),
-            // Let dynamic pages render a little before the shot is taken.
-            "--virtual-time-budget=5000",
-            url,
-        ])
+        .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("启动浏览器失败: {e}"))?;
 
     // Headless --screenshot exits on its own; bound it so a wedged page can't hang.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Slow intranet pages / heavy SPAs need more headroom than the old 20s.
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(()),
@@ -140,7 +202,12 @@ fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<()
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("截图超时（页面加载太久）".into());
+                    // If the page rendered enough to leave a non-empty file, use it
+                    // rather than failing outright.
+                    if std::fs::metadata(out).map(|m| m.len() > 0).unwrap_or(false) {
+                        return Ok(());
+                    }
+                    return Err("截图超时（页面加载太久）。本地/内网地址已自动绕过代理并忽略自签证书；确认服务已启动且 URL 正确，或稍后重试。".into());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -156,7 +223,12 @@ pub async fn capture_url(
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<String, String> {
-    let url = url.trim().to_string();
+    let mut url = url.trim().to_string();
+    // Be forgiving: a bare host like "192.168.1.5:3000" or "localhost:5173" is a
+    // valid intranet target — default it to http:// instead of rejecting it.
+    if !url.contains("://") {
+        url = format!("http://{url}");
+    }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("只支持 http/https URL".into());
     }
