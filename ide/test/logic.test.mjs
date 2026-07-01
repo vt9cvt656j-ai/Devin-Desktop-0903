@@ -120,3 +120,18 @@ test("_buildRepoMap builds a per-file symbol map from the index, query-boosted +
   // empty index → empty string (graceful before the background index builds):
   assert.equal(load("_buildRepoMap", { _symbolIndex: new Map() })("x", 6000), "");
 });
+
+test("_safeJsonLoose repairs malformed \\u escapes (the 'unexpected end of hex escape' bug)", () => {
+  const f = load("_safeJsonLoose");
+  // model put a literal \u (a regex) in content without double-escaping → broken JSON:
+  const r = f('{"path":"a.js","content":"const re = /\\username/;"}');
+  assert.ok(r && r.path === "a.js", "recovers the object");
+  assert.match(r.content, /\\username/, "the literal \\u is preserved as text");
+  // truncated \u12 right before the closing quote:
+  const r2 = f('{"content":"tail\\u12"}');
+  assert.ok(r2 && typeof r2.content === "string" && r2.content.includes("tail"));
+  // a genuinely-valid ✓ must STILL decode to the checkmark (not get double-escaped):
+  assert.equal(f('{"content":"ok \\u2713"}').content, "ok ✓");
+  // an already-escaped \\u (literal backslash) must be left alone:
+  assert.equal(f('{"content":"C:\\\\users"}').content, "C:\\users");
+});

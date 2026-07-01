@@ -10468,6 +10468,13 @@ function _safeJsonLoose(s) {
   t = t.replace(/^```[a-z_]*\s*/i, "").replace(/```\s*$/i, "").trim();
   t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/,\s*([}\]])/g, "$1");
   try { return JSON.parse(t); } catch {}
+  // Malformed \u escapes ("unexpected end of hex escape"): the model wrote a literal \u —
+  // a regex \uXXXX, an ES6 \u{...}, or a Windows path — in the content WITHOUT double-escaping,
+  // so `\u` isn't followed by 4 hex digits and the whole JSON is unparseable. Escape the lone
+  // backslash that starts each broken unicode escape (matched only on an ODD backslash run, so
+  // a genuinely-escaped `\\u` is left untouched), then retry.
+  const _uFixed = t.replace(/(^|[^\\])((?:\\\\)*)\\u(?![0-9a-fA-F]{4})/g, "$1$2\\\\u");
+  if (_uFixed !== t) { t = _uFixed; try { return JSON.parse(t); } catch {} }
   // Prefer the LAST balanced {...} (handles `{}{real}` and `garbage{real}`).
   const lastOpen = t.lastIndexOf("{");
   if (lastOpen > 0) { try { return JSON.parse(t.slice(lastOpen)); } catch {} }
@@ -12362,12 +12369,21 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   let toolCalls = [...byIndex.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([, e]) => {
-      let parsed = {};
-      try { parsed = JSON.parse(e.args || "{}"); } catch { parsed = _safeJsonLoose(e.args) || {}; }
+      let parsed = {}, raw = (e.args && e.args.trim()) ? e.args.trim() : "{}";
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        // Broken arg JSON (e.g. a lone `\u` the model didn't double-escape → "unexpected
+        // end of hex escape"). Repair via _safeJsonLoose, then RE-SERIALIZE argsRaw from the
+        // clean object — never replay the broken original, or the gateway (serde) chokes on
+        // it when we send this tool call back in the next turn's history.
+        parsed = _safeJsonLoose(e.args) || {};
+        raw = JSON.stringify(parsed);
+      }
       return {
         id: e.id || ("call_" + Math.random().toString(36).slice(2, 10)),
         name: e.name,
-        argsRaw: (e.args && e.args.trim()) ? e.args : "{}",
+        argsRaw: raw,
         parsedArgs: parsed,
       };
     })
