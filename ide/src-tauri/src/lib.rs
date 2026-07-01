@@ -36,7 +36,43 @@ fn cleanup_stale(
 }
 
 /// Entry point shared by the binary and (potentially) mobile targets.
+/// Crash reporting: append every Rust panic (message + location + backtrace + timestamp)
+/// to `~/.michael-ide/crash.log`, so a crash on a user's machine leaves a trace we can ask
+/// them for — instead of the window just vanishing with nothing to go on. Chains the
+/// previous hook so normal panic printing still happens.
+fn install_panic_logger() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok() {
+            let dir = std::path::PathBuf::from(home).join(".michael-ide");
+            let _ = std::fs::create_dir_all(&dir);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_default();
+            let msg = format!(
+                "\n===== PANIC (unix {ts}) =====\n{info}\nat: {loc}\n{:#?}\n",
+                std::backtrace::Backtrace::force_capture()
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+            {
+                let _ = f.write_all(msg.as_bytes());
+            }
+        }
+        prev(info);
+    }));
+}
+
 pub fn run() {
+    install_panic_logger();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

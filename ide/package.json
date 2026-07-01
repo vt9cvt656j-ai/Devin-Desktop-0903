@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@neftaly/editcontext-polyfill": "^0.1.1",

@@ -25,13 +25,11 @@ jobs:
           - os: macos-latest
             label: macOS universal
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            # Disable updater artifacts: they require a signing key we don't set
-            # here, and would otherwise fail the build.
-            args: '--target universal-apple-darwin --config {"bundle":{"createUpdaterArtifacts":false}}'
+            args: '--target universal-apple-darwin'
           - os: windows-latest
             label: Windows x64
             rust_targets: ""
-            args: '--config {"bundle":{"createUpdaterArtifacts":false}}'
+            args: ''
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,9 +59,17 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Enable signed auto-update: set repo secrets TAURI_SIGNING_PRIVATE_KEY (contents
+          # of ~/.tauri/michael-ide.key) + TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Only used on a
+          # tagged release (below); empty is harmless for manual dispatch dev builds.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: ide
-          args: ${{ matrix.args }}
+          # Tagged release (push `ide-v*`) → build SIGNED updater artifacts + latest.json so
+          # installed apps auto-update. Manual "Run workflow" → disable updater (dev build,
+          # no signing key needed) — identical to before, so the existing flow can't break.
+          args: ${{ matrix.args }}${{ github.ref_type != 'tag' && ' --config {"bundle":{"createUpdaterArtifacts":false}}' || '' }}
           # When triggered by an `ide-v*` tag, publish a GitHub Release with the
           # installers. On a manual run these stay empty, so it just builds and
           # the bundles are uploaded as workflow artifacts (below).
