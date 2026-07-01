@@ -189,7 +189,7 @@ async function tauriBackend() {
     registerWorkspaceRoot: (path) => core.invoke("register_workspace_root", { path }),
     // Local-file URL for the webview (image / pdf preview) via the asset protocol.
     assetUrl: (p) => { try { return core.convertFileSrc(p); } catch { return p; } },
-    readDir: (path) => core.invoke("read_dir", { path }),
+    readDir: async (path) => { const es = await core.invoke("read_dir", { path }); return Array.isArray(es) ? es.map((e) => (e && typeof e.path === "string" ? { ...e, path: _toPosix(e.path) } : e)) : es; },
     readTextFile: (path) => core.invoke("read_text_file", { path }),
     readFileDataUrl: (path) => core.invoke("read_file_data_url", { path }),
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
@@ -3219,6 +3219,14 @@ function renderTabs() {
 let rootPath = null;
 let workspaceRoots = [];
 
+// Normalize a filesystem path to forward slashes. Windows dialogs / read_dir return
+// `C:\a\b`, but ALL path logic here joins & compares with "/" (rootPath + "/" + rel,
+// startsWith(rootPath + "/"), split("/")…). A backslash root then matches NOTHING →
+// relative paths don't resolve to the workspace ("不看当前工作目录"). Windows accepts
+// "/" in paths, so posix-normalizing at every boundary makes it all consistent.
+// No-op on macOS/Linux (they have no backslashes in paths).
+function _toPosix(p) { return typeof p === "string" ? p.replace(/\\/g, "/") : p; }
+
 // Wire the real LSP client now that workspace state exists. Disabled in the
 // plain-browser mock (no real servers to talk to). Providers are registered for
 // the "gap" languages Monaco's bundled service does not cover.
@@ -3499,6 +3507,7 @@ function basename(path) {
 
 const _kgSyncedRoots = new Set();
 function setActiveWorkspaceRoot(path) {
+  path = _toPosix(path);
   rootPath = path;
   _launchConfigsCache = null;
   _agentContextCache = { root: "", ts: 0, data: "" };
@@ -3565,6 +3574,7 @@ async function renderWorkspaceRoots() {
 }
 
 async function openFolder(path) {
+  path = _toPosix(path);
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
   // Opening a different project should immediately retag the active chat tab.
@@ -3664,6 +3674,7 @@ function handleFsChanges(paths) {
 // replaces the workspace.
 async function _addWorkspaceRoot(picked) {
   if (!picked) return;
+  picked = _toPosix(picked);
   if (workspaceRoots.includes(picked)) { setActiveWorkspaceRoot(picked); showToast(`${basename(picked)} 已在工作区`); return; }
   workspaceRoots.push(picked);
   try { await backend.registerWorkspaceRoot(picked); }

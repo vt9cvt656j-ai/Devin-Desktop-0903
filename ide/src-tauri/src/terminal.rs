@@ -99,6 +99,21 @@ pub fn term_open(
         .map_err(|e| e.to_string())?;
 
     let mut cmd = CommandBuilder::new(default_shell());
+    // Windows: force the console to UTF-8 so Chinese / non-ASCII output isn't GBK(936)
+    // mojibake (this terminal decodes bytes as UTF-8). cmd.exe → `/K chcp 65001`;
+    // PowerShell → chcp + set [Console]::OutputEncoding (chcp alone doesn't fix PS output).
+    #[cfg(windows)]
+    {
+        let sh = default_shell().to_lowercase();
+        if sh.contains("powershell") || sh.contains("pwsh") {
+            cmd.arg("-NoExit");
+            cmd.arg("-Command");
+            cmd.arg("chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8");
+        } else {
+            cmd.arg("/K");
+            cmd.arg("chcp 65001>nul");
+        }
+    }
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         cmd.cwd(dir);
     }

@@ -640,7 +640,18 @@ pub fn search_in_project(
             if name.starts_with('.') {
                 continue;
             }
-            if path.is_dir() {
+            // Never FOLLOW symlinks/junctions: on Windows a junction can point at an
+            // ancestor and is_dir()/metadata() (which follow the link) would loop forever
+            // → hang. symlink_metadata() describes the entry itself; is_symlink() is true
+            // for Windows reparse points (symlinks + junctions/mount points), so skip them.
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.is_dir() {
                 if !IGNORED_DIRS.contains(&name.as_str()) {
                     stack.push(path);
                 }
@@ -649,11 +660,7 @@ pub fn search_in_project(
             if total >= SEARCH_MAX_RESULTS {
                 break;
             }
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.len() > SEARCH_MAX_FILE {
+            if md.len() > SEARCH_MAX_FILE {
                 continue;
             }
             let bytes = match std::fs::read(&path) {
