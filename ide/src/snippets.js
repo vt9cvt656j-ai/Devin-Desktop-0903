@@ -148,9 +148,22 @@ const LANG_ALIAS = {
   less: "css",
 };
 
+// User-defined snippets (from the Snippet editor). Grouped by normalized langId.
+// Previously these were written to the "custom-snippets" store but NEVER read back,
+// so a saved snippet never showed up in completion — setCustomSnippets fixes that.
+let CUSTOM_SNIPPETS = {};
+export function setCustomSnippets(list) {
+  CUSTOM_SNIPPETS = {};
+  for (const s of (Array.isArray(list) ? list : [])) {
+    if (!s || !s.prefix || !s.body) continue;
+    const l = LANG_ALIAS[s.lang] || s.lang || "javascript";
+    (CUSTOM_SNIPPETS[l] ||= []).push({ prefix: s.prefix, body: s.body, description: s.description || "自定义片段" });
+  }
+}
+
 function snippetsForLang(langId) {
   const normalized = LANG_ALIAS[langId] || langId;
-  const results = [...(BUILTIN_SNIPPETS[normalized] || [])];
+  const results = [...(BUILTIN_SNIPPETS[normalized] || []), ...(CUSTOM_SNIPPETS[normalized] || [])];
   if (normalized === "typescript") {
     results.push(...(BUILTIN_SNIPPETS.javascript || []));
   }

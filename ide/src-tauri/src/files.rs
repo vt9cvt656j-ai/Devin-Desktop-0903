@@ -263,6 +263,142 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// Read any (binary) file as a `data:<mime>;base64,...` URL. Used to render images in the
+/// chat (e.g. `design_board` wardrobe previews) WITHOUT the Tauri asset protocol, whose glob
+/// scope rejects hidden directories like `.wardrobe/` → the `<img>` stays blank. Reusing the
+/// genimage `data_url` is the fast path; this is the universal fallback (works for pre-existing
+/// images, cross-session, any path inside the workspace).
+#[tauri::command]
+pub fn read_file_data_url(path: String) -> Result<String, String> {
+    require_inside_workspace(&path)?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    if meta.is_dir() {
+        return Err(format!("'{}' is a directory, not a file.", path));
+    }
+    if meta.len() > 25 * 1024 * 1024 {
+        return Err(format!("file too large ({} bytes) for a data URL", meta.len()));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    };
+    Ok(format!("data:{};base64,{}", mime, crate::capture::b64(&bytes)))
+}
+
+/// Extract readable TEXT from a document (PDF / Word / Excel / PowerPoint), so the agent
+/// can read specs / papers / manuals that `read_text_file` would otherwise return as
+/// binary garbage. Office formats are ZIP+XML (reuses the existing `zip` dep); PDF uses
+/// `pdf-extract` (pure Rust). The agent's read_file routes here automatically by extension.
+#[tauri::command]
+pub fn read_document(path: String) -> Result<String, String> {
+    require_inside_workspace(&path)?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    if meta.is_dir() {
+        return Err(format!("'{}' is a directory", path));
+    }
+    if meta.len() > 50 * 1024 * 1024 {
+        return Err("文档过大（>50MB），无法解析".into());
+    }
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let text = match ext.as_str() {
+        "pdf" => pdf_extract::extract_text(&path).map_err(|e| format!("PDF 解析失败: {e}"))?,
+        "docx" | "odt" => extract_office(&path, |n| n == "word/document.xml" || n == "content.xml")?,
+        "pptx" => extract_office(&path, |n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))?,
+        "xlsx" => extract_office(&path, |n| n == "xl/sharedStrings.xml")?,
+        other => {
+            return Err(format!(
+                "read_document 不支持 .{other}（支持 pdf/docx/pptx/xlsx/odt）；普通文本文件用 read_file 即可"
+            ))
+        }
+    };
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("没从文档里提取到文本（可能是扫描件/纯图片 PDF——需要 OCR，本工具只读文本层）".into());
+    }
+    Ok(t.to_string())
+}
+
+/// Pull the text out of the ZIP entries an Office doc keeps its content in.
+fn extract_office(path: &str, want: impl Fn(&str) -> bool) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("不是有效的 Office 文档(zip): {e}"))?;
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        if want(&name) {
+            if let Ok(mut f) = zip.by_name(&name) {
+                let mut xml = String::new();
+                if f.read_to_string(&mut xml).is_ok() {
+                    out.push(strip_xml(&xml));
+                }
+            }
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+/// Turn an Office XML part into plain text: paragraph/row/break tags → newlines, strip the
+/// rest of the tags, decode the common entities, collapse blank-line runs.
+fn strip_xml(xml: &str) -> String {
+    let mut s = xml.to_string();
+    for tag in ["</w:p>", "</a:p>", "</text:p>", "</si>", "</row>", "<w:br/>", "<w:br></w:br>"] {
+        s = s.replace(tag, "\n");
+    }
+    s = s.replace("<w:tab/>", "\t");
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "\n");
+    let mut res = String::new();
+    let mut blank = 0;
+    for l in out.lines().map(|l| l.trim_end()) {
+        if l.trim().is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        res.push_str(l);
+        res.push('\n');
+    }
+    res
+}
+
 /// Overwrite a file with new text content.
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {

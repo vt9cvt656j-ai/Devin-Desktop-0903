@@ -38,6 +38,14 @@ pub struct ScreenElement {
     text: String,
     x: u32, // center, reported space (ready to click)
     y: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    value: String,
+    #[serde(default, skip_serializing_if = "is_true")]
+    enabled: bool,
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// Cap the screenshot width — keeps the JPEG small AND defines the coordinate
@@ -184,14 +192,56 @@ fn screen_state() -> Result<ScreenState, String> {
             if rx < 0.0 || ry < 0.0 || rx as u32 >= width || ry as u32 >= height {
                 continue;
             }
-            put_number(&mut rgba, rx as u32, ry as u32, e.ref_, 2); // badge on top of grid
+            // Draw numbered badges for the first 200 elements only (interactive
+            // controls come first in the priority-sorted list). The full array
+            // still includes ALL elements — the agent can click any ref, not just
+            // the badged ones.
+            if e.ref_ < 200 {
+                put_number(&mut rgba, rx as u32, ry as u32, e.ref_, 2);
+            }
             elements.push(ScreenElement {
                 ref_: e.ref_,
                 role: e.role,
                 text: e.text,
                 x: (rx + rwd / 2.0).round().max(0.0) as u32,
                 y: (ry + rhd / 2.0).round().max(0.0) as u32,
+                value: e.value,
+                enabled: e.enabled,
             });
+        }
+        // Vision OCR: when AX tree is sparse (self-drawn apps), OCR the screen for text
+        let ax_count = elements.len();
+        if ax_count < 20 {
+            let ax_texts: std::collections::HashSet<String> = elements
+                .iter()
+                .filter(|e| !e.text.is_empty())
+                .map(|e| e.text.to_lowercase())
+                .collect();
+            for e in crate::accessibility::read_ocr_elements() {
+                if !e.text.is_empty() && ax_texts.contains(&e.text.to_lowercase()) {
+                    continue;
+                }
+                let rx = e.x * sx;
+                let ry = e.y * sy;
+                let rwd = e.w * sx;
+                let rhd = e.h * sy;
+                if rx < 0.0 || ry < 0.0 || rx as u32 >= width || ry as u32 >= height {
+                    continue;
+                }
+                let ref_ = elements.len() as u32;
+                if ref_ < 200 {
+                    put_number(&mut rgba, rx as u32, ry as u32, ref_, 2);
+                }
+                elements.push(ScreenElement {
+                    ref_,
+                    role: e.role,
+                    text: e.text,
+                    x: (rx + rwd / 2.0).round().max(0.0) as u32,
+                    y: (ry + rhd / 2.0).round().max(0.0) as u32,
+                    value: e.value,
+                    enabled: e.enabled,
+                });
+            }
         }
     }
 
@@ -265,8 +315,34 @@ where
 {
     tauri::async_runtime::spawn_blocking(move || -> Result<ScreenState, String> {
         f()?;
-        std::thread::sleep(Duration::from_millis(350)); // let the UI react before we look
-        screen_state()
+        std::thread::sleep(Duration::from_millis(250)); // let the UI react before we read nodes
+        node_state() // LIGHT: nodes only, no JPEG — acting shouldn't cost a screenshot each time
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Like `run`, but executes the input closure on the MAIN thread. macOS keyboard input
+/// (enigo's `key` path queries TSM / the input-source list) ASSERTS the main thread —
+/// running it on a spawn_blocking worker traps with SIGTRAP and kills the whole app
+/// (`dispatch_assert_queue_fail`). So keyboard ops are dispatched to the main run loop;
+/// we then settle + screenshot off-main. Mouse/scroll use CGEvents and are main-safe
+/// off-thread, so they keep using `run`.
+async fn run_kbd<F>(app: tauri::AppHandle, f: F) -> Result<ScreenState, String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f());
+    })
+    .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<ScreenState, String> {
+        // Wait for the main-thread key op (and propagate its error), then settle + read nodes.
+        rx.recv()
+            .map_err(|_| "键盘操作未返回（主线程繁忙？）".to_string())??;
+        std::thread::sleep(Duration::from_millis(250));
+        node_state() // LIGHT: nodes only, no JPEG
     })
     .await
     .map_err(|e| e.to_string())?
@@ -330,20 +406,42 @@ pub async fn computer_double_click(x: i32, y: i32) -> Result<ScreenState, String
     .await
 }
 
-/// Type a string at the current focus.
+/// Drag with the left button held from (x,y) to (to_x,to_y) — for sliders, reordering,
+/// drag-and-drop, canvas painting. Moves in small steps so drop targets register the motion.
 #[tauri::command]
-pub async fn computer_type(text: String) -> Result<ScreenState, String> {
+pub async fn computer_drag(x: i32, y: i32, tx: i32, ty: i32) -> Result<ScreenState, String> {
     run(move || {
+        let mut e = make_enigo()?;
+        let (sx, sy) = to_real(x, y);
+        let (dx, dy) = to_real(tx, ty);
+        e.move_mouse(sx, sy, Coordinate::Abs).map_err(|er| er.to_string())?;
+        e.button(Button::Left, Direction::Press).map_err(|er| er.to_string())?;
+        let steps = 14;
+        for i in 1..=steps {
+            let ix = sx + (dx - sx) * i / steps;
+            let iy = sy + (dy - sy) * i / steps;
+            e.move_mouse(ix, iy, Coordinate::Abs).map_err(|er| er.to_string())?;
+        }
+        e.button(Button::Left, Direction::Release).map_err(|er| er.to_string())
+    })
+    .await
+}
+
+/// Type a string at the current focus. Runs on the main thread (macOS keyboard/TSM).
+#[tauri::command]
+pub async fn computer_type(app: tauri::AppHandle, text: String) -> Result<ScreenState, String> {
+    run_kbd(app, move || {
         let mut e = make_enigo()?;
         e.text(&text).map_err(|er| er.to_string())
     })
     .await
 }
 
-/// Press a key or a chord like "ctrl+c", "cmd+space", "enter".
+/// Press a key or a chord like "ctrl+c", "cmd+space", "enter". Runs on the main thread
+/// (enigo's macOS key path queries TSM, which traps if called off the main thread).
 #[tauri::command]
-pub async fn computer_key(combo: String) -> Result<ScreenState, String> {
-    run(move || {
+pub async fn computer_key(app: tauri::AppHandle, combo: String) -> Result<ScreenState, String> {
+    run_kbd(app, move || {
         let mut e = make_enigo()?;
         let parts: Vec<&str> = combo
             .split('+')
@@ -379,4 +477,108 @@ pub async fn computer_scroll(amount: i32) -> Result<ScreenState, String> {
         e.scroll(amount, Axis::Vertical).map_err(|er| er.to_string())
     })
     .await
+}
+
+// ===== NODE-FIRST (no vision): act on accessibility elements directly by ref =====
+
+/// Enumerate the frontmost app's interactive nodes (ref/role/text + click-ready center)
+/// WITHOUT taking a screenshot — mirrors screen_state's element mapping so cached refs stay
+/// in the same coordinate space. Returns (width, height, elements).
+fn enumerate_nodes(with_ocr: bool) -> Result<(u32, u32, Vec<ScreenElement>), String> {
+    let mon = primary_monitor()?;
+    let scale = mon.scale_factor().unwrap_or(1.0) as f64;
+    let rw = mon.width().map_err(|e| e.to_string())? as f64;
+    let rh = mon.height().map_err(|e| e.to_string())? as f64;
+    let width = if rw as u32 > SHOT_W { SHOT_W } else { rw as u32 };
+    let height = if rw as u32 > SHOT_W {
+        ((rh * SHOT_W as f64) / rw.max(1.0)) as u32
+    } else {
+        rh as u32
+    };
+    let sx = scale * width as f64 / rw.max(1.0);
+    let sy = scale * height as f64 / rh.max(1.0);
+    let mut out = Vec::new();
+    for e in crate::accessibility::read_ui_elements() {
+        let rx = e.x * sx;
+        let ry = e.y * sy;
+        let rwd = e.w * sx;
+        let rhd = e.h * sy;
+        out.push(ScreenElement {
+            ref_: e.ref_,
+            role: e.role,
+            text: e.text,
+            x: (rx + rwd / 2.0).round().max(0.0) as u32,
+            y: (ry + rhd / 2.0).round().max(0.0) as u32,
+            value: e.value,
+            enabled: e.enabled,
+        });
+    }
+    if with_ocr && out.len() < 20 {
+        let ax_texts: std::collections::HashSet<String> = out
+            .iter()
+            .filter(|e| !e.text.is_empty())
+            .map(|e| e.text.to_lowercase())
+            .collect();
+        for e in crate::accessibility::read_ocr_elements() {
+            if !e.text.is_empty() && ax_texts.contains(&e.text.to_lowercase()) {
+                continue;
+            }
+            let rx = e.x * sx;
+            let ry = e.y * sy;
+            let rwd = e.w * sx;
+            let rhd = e.h * sy;
+            out.push(ScreenElement {
+                ref_: out.len() as u32,
+                role: e.role,
+                text: e.text,
+                x: (rx + rwd / 2.0).round().max(0.0) as u32,
+                y: (ry + rhd / 2.0).round().max(0.0) as u32,
+                value: e.value,
+                enabled: e.enabled,
+            });
+        }
+    }
+    Ok((width, height, out))
+}
+
+/// The LIGHT result returned after a single action: node list + screen size, but NO JPEG
+/// (empty `screenshot`). This is the whole point — acting shouldn't cost a screenshot every
+/// time. The agent calls action:"screenshot" only when it actually needs to SEE the pixels.
+fn node_state() -> Result<ScreenState, String> {
+    let (width, height, elements) = enumerate_nodes(false)?;
+    Ok(ScreenState {
+        width,
+        height,
+        screenshot: String::new(),
+        elements,
+    })
+}
+
+/// Text-only node dump (NO screenshot) — fast act-and-verify. Desktop twin of `browser nodes`.
+#[tauri::command]
+pub async fn computer_nodes() -> Result<Vec<ScreenElement>, String> {
+    tauri::async_runtime::spawn_blocking(|| enumerate_nodes(true).map(|(_, _, els)| els))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// AXPress a node by ref — a REAL accessibility action (no mouse move, no pixel guess).
+/// Returns JSON {ok, role, name, value}; on Err/ok:false the JS falls back to a pixel click.
+#[tauri::command]
+pub async fn computer_press(node: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::accessibility::perform_ax_action(node, "press", None)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set a node's value (type into a field by ref via accessibility, no pixel focus).
+#[tauri::command]
+pub async fn computer_set_value(node: u32, text: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::accessibility::perform_ax_action(node, "set_value", Some(&text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

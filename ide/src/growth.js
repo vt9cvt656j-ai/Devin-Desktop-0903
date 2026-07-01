@@ -474,7 +474,7 @@ export function renderPanel(body, ctx = {}) {
     const head = document.createElement("div");
     head.className = "tool-head";
     head.innerHTML = `<h2></h2><p></p>`;
-    head.querySelector("h2").textContent = "成长 · Growth";
+    head.querySelector("h2").textContent = "成长";
     head.querySelector("p").textContent = "这是你的开发者成长档案——跨所有项目积累、换项目也带着走。越战越勇：一项能力在越多样的项目里练过，就越是你的。你可以随时纠正我。";
     body.appendChild(head);
 
@@ -659,7 +659,7 @@ export function renderPanel(body, ctx = {}) {
     reset.className = "growth-reset";
     reset.textContent = "重置我的成长档案";
     reset.addEventListener("click", () => {
-      if (!confirm("确定清空 Growth 对你的全部画像与统计？此操作不可撤销。")) return;
+      if (!confirm("确定清空「成长」对你的全部画像与统计？此操作不可撤销。")) return;
       state = freshState();
       turn = { applied: 0, reviewed: 0, engaged: false };
       save();
@@ -667,6 +667,6 @@ export function renderPanel(body, ctx = {}) {
     });
     wrap.appendChild(reset);
   } catch (e) {
-    body.innerHTML = `<div style="padding:20px;color:var(--text-dim,#888)">Growth 面板渲染失败：${(e && e.message) || e}</div>`;
+    body.innerHTML = `<div style="padding:20px;color:var(--text-dim,#888)">「成长」面板渲染失败：${(e && e.message) || e}</div>`;
   }
 }

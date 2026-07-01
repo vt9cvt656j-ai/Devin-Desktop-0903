@@ -1,6 +1,8 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
 
@@ -19,6 +21,44 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
+/// In-flight request cancellation. The JS side passes a unique `request_id` with
+/// each streaming chat call and calls `cancel_ai(id)` when the user hits Stop —
+/// the streaming loop polls this flag and ends the turn immediately, closing the
+/// upstream connection and stopping token generation. (Stop used to only mute the
+/// UI while the backend kept generating + billing.)
+static CANCELS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_cancel(id: &str) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut m) = CANCELS.lock() {
+        m.insert(id.to_string(), flag.clone());
+    }
+    flag
+}
+
+/// RAII: drop removes the cancel flag from the registry on EVERY exit path of the
+/// turn (normal end, error, stall, cancel) — so the map never leaks entries.
+struct CancelGuard(String);
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = CANCELS.lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+/// Flip the cancel flag for an in-flight request (called from JS on Stop). No-op
+/// if the request already finished (its id is no longer registered).
+#[tauri::command]
+pub fn cancel_ai(request_id: String) {
+    if let Ok(m) = CANCELS.lock() {
+        if let Some(flag) = m.get(&request_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiConfig {
@@ -30,6 +70,28 @@ pub struct AiConfig {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// "max" thinking-budget hint (in tokens). Relays that support extended thinking
+    /// budgets honor this; others ignore it. Set together with reasoning_effort="high"
+    /// when the user picks the "极限/max" tier in the model hover card.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+    /// Unique per-run id from the JS side. `cancel_ai(id)` flips a flag the stream
+    /// loop polls, so the user's Stop actually aborts the in-flight upstream request
+    /// (frees the connection + stops token burn) instead of only muting the UI.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// L0 server-side assembly (anti-reverse), default-off on the JS side. When set,
+    /// the client ships the mode NAME + the static tool NAMES instead of the system
+    /// prompt and the tool schemas; ai.rs relays them as `x-ide-mode` / `x-ide-tools`
+    /// headers and the gateway injects the real prompt + schemas before proxying
+    /// upstream — so neither the bundle nor the request carries that IP. Absent →
+    /// byte-for-byte unchanged behavior.
+    #[serde(default)]
+    pub ide_mode: Option<String>,
+    #[serde(default)]
+    pub ide_tools: Option<String>,
 }
 
 /// Streamed back to the frontend over a Tauri channel as the model responds.
@@ -157,6 +219,21 @@ fn mark_cache_breakpoint(msg: &mut serde_json::Value) {
     }
 }
 
+/// Relay the optional L0 server-side-assembly headers. When the JS side set
+/// `ideMode`/`ideTools` (the default-off anti-reverse path), the gateway reads these
+/// and injects the system prompt + tool schemas itself; when unset, the builder is
+/// returned untouched so the request is byte-for-byte identical to before.
+fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::RequestBuilder {
+    let mut rb = rb;
+    if let Some(m) = config.ide_mode.as_deref().filter(|s| !s.is_empty()) {
+        rb = rb.header("x-ide-mode", m);
+    }
+    if let Some(t) = config.ide_tools.as_deref().filter(|s| !s.is_empty()) {
+        rb = rb.header("x-ide-tools", t);
+    }
+    rb
+}
+
 async fn ai_chat_inner(
     config: AiConfig,
     messages: Vec<serde_json::Value>,
@@ -184,45 +261,80 @@ async fn ai_chat_inner(
             payload["tools"] = serde_json::json!(t);
         }
     }
+    if let Some(ref effort) = config.reasoning_effort {
+        if !effort.is_empty() {
+            payload["reasoning_effort"] = serde_json::json!(effort);
+        }
+    }
+    if let Some(budget) = config.thinking_budget {
+        if budget > 0 {
+            payload["thinking_budget"] = serde_json::json!(budget);
+            // Anthropic-native shape for relays that route via /v1/messages.
+            payload["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+        }
+    }
 
     // ── Prompt caching for Anthropic / Claude upstreams ─────────────────────
     // Anthropic reuses content marked with a `cache_control` breakpoint and serves
     // the LONGEST matching cached prefix (up to 4 breakpoints). We mark (1) the
     // system prompt — kept byte-stable in main.js so it caches across every turn —
-    // and (2) a ROLLING breakpoint on the most recent user message, so each new
-    // turn finds the prior conversation already cached instead of re-billing it.
+    // and (2) a ROLLING TAIL breakpoint on the last up-to-2 plain-string messages
+    // (ANY role — crucially incl. tool results, where a long agentic turn's history
+    // piles up AFTER the last user message and would otherwise re-bill every step).
     //
     // Gated on the MODEL name (the gateway routes by model — base_url is always the
     // gateway, so the old base_url check never fired). Only PLAIN-STRING content is
     // reshaped, so tool/multimodal messages — and any non-Anthropic upstream — are
     // left byte-for-byte untouched and can't break. DeepSeek / OpenAI / Kimi cache
     // the stable prefix automatically, so they need no markup at all.
+    // ⚠️ DISABLED on the current relay (zyz / "AWS渠道"): sending cache_control there
+    // triggers cache CREATION (a 1.25× write premium) on the ~34K fixed prefix on
+    // EVERY call but NEVER returns a cache READ — so each call cost ~25% MORE than no
+    // caching at all (observed: one streaming call billed $0.65, ≈ 34.1K × $15/M × 1.25).
+    // Re-enable ONLY against an upstream that actually SERVES cache reads (Anthropic /
+    // Bedrock direct, or a caching-aware proxy like LiteLLM) — flip the flag to true.
+    const ENABLE_PROMPT_CACHE: bool = false;
     let model_lc = config.model.to_ascii_lowercase();
-    if config.base_url.contains("anthropic")
-        || model_lc.contains("claude")
-        || model_lc.contains("anthropic")
+    if ENABLE_PROMPT_CACHE
+        && (config.base_url.contains("anthropic")
+            || model_lc.contains("claude")
+            || model_lc.contains("anthropic"))
     {
         if let Some(arr) = payload["messages"].as_array_mut() {
+            // (1) System prompt — byte-stable across turns, caches once.
             if let Some(first) = arr
                 .iter_mut()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
             {
                 mark_cache_breakpoint(first);
             }
-            if let Some(last_user) = arr
-                .iter_mut()
-                .rev()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                mark_cache_breakpoint(last_user);
+            // (2) Rolling tail: walk from the end, mark the last up-to-2 messages
+            // that carry plain-string, NON-EMPTY content (any role). Anthropic
+            // serves the longest matching cached prefix, so marking the tail turns
+            // the whole prior conversation — including the accumulated tool history
+            // — into a cache hit next turn. `mark_cache_breakpoint` reshapes only
+            // plain strings, so multimodal (screenshot) and empty-content messages
+            // are skipped and can never be corrupted. ≤3 breakpoints total (budget 4).
+            let mut marked = 0;
+            for m in arr.iter_mut().rev() {
+                if marked >= 2 {
+                    break;
+                }
+                let has_text = m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_text {
+                    mark_cache_breakpoint(m);
+                    marked += 1;
+                }
             }
         }
     }
 
     let client = &*HTTP;
-    let mut resp = client
-        .post(&url)
-        .bearer_auth(&config.api_key)
+    let mut resp = with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
         .json(&payload)
         .send()
         .await
@@ -234,9 +346,7 @@ async fn ai_chat_inner(
         if let Some(o) = payload.as_object_mut() {
             o.remove("stream_options");
         }
-        resp = client
-            .post(&url)
-            .bearer_auth(&config.api_key)
+        resp = with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
             .json(&payload)
             .send()
             .await
@@ -272,7 +382,20 @@ async fn ai_chat_inner(
     const READ_POLL: std::time::Duration = std::time::Duration::from_secs(10);
     const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(75);
     let mut last_progress = std::time::Instant::now();
+    // Cancellation: register a flag keyed by the JS-supplied request_id (if any).
+    // The guard removes it on every return path; the loop polls it so Stop aborts.
+    let req_id = config.request_id.clone().filter(|s| !s.is_empty());
+    let cancel_flag = req_id.as_deref().map(register_cancel);
+    let _cancel_guard = req_id.map(CancelGuard);
     loop {
+        // User hit Stop → cancel_ai flipped this flag: end the turn now so the
+        // upstream connection closes and token generation stops (≤READ_POLL latency).
+        if let Some(f) = &cancel_flag {
+            if f.load(Ordering::SeqCst) {
+                let _ = on_event.send(AiEvent::Done);
+                return Ok(());
+            }
+        }
         let chunk = match tokio::time::timeout(READ_POLL, stream.next()).await {
             Ok(Some(Ok(c))) => c,
             // A mid-stream read error means the connection dropped partway (common
@@ -332,7 +455,9 @@ async fn ai_chat_inner(
                     let cached = usage["prompt_tokens_details"]["cached_tokens"]
                         .as_u64()
                         .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
-                        .or_else(|| cache_read)
+                        .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
+                        .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
+                        .or(cache_read)
                         .unwrap_or(0);
                     let prompt_raw = usage["prompt_tokens"]
                         .as_u64()

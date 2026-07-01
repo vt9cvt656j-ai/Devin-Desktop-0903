@@ -52,8 +52,14 @@ impl TerminalState {
     /// Kill every shell and clear the table — reaps a previous page session on
     /// webview reload and on app exit.
     pub fn reset_all(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.terms.clear();
+        // Drain + reap on a DETACHED thread — Term::drop does kill()+blocking wait() per
+        // shell, which stalled the caller (boot cleanup_stale / app exit). Off-thread = instant.
+        let drained: Vec<Term> = match self.inner.lock() {
+            Ok(mut inner) => std::mem::take(&mut inner.terms).into_values().collect(),
+            Err(_) => return,
+        };
+        if !drained.is_empty() {
+            std::thread::spawn(move || drop(drained));
         }
     }
 }

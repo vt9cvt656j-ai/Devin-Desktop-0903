@@ -124,11 +124,11 @@ const INLINE = [
   },
   { // autolink <https://...>
     re: /<((?:https?:\/\/|mailto:)[^>\s]+)>/,
-    make: (m) => linkNode(m[1], m[1]),
+    make: (m) => /^mailto:/i.test(m[1]) ? linkNode(m[1], m[1]) : urlCardNode(m[1]),
   },
   { // bare url
     re: /(?<![\w@/"'(=])((?:https?:\/\/)[^\s<]+[^\s<.,;:!?)\]}'"])/,
-    make: (m) => linkNode(m[1], m[1]),
+    make: (m) => urlCardNode(m[1]),
   },
 ];
 
@@ -141,6 +141,43 @@ function linkNode(text, url) {
   a.rel = "noreferrer noopener";
   a.textContent = text;
   return a;
+}
+
+function urlCardNode(url) {
+  const href = safeHref(url);
+  if (!href) return txt(url);
+  let domain;
+  try { domain = new URL(href).hostname.replace(/^www\./, ""); }
+  catch { domain = href; }
+
+  const card = el("a", "url-card");
+  card.href = href;
+  card.target = "_blank";
+  card.rel = "noreferrer noopener";
+
+  const ico = el("img", "url-card__ico");
+  ico.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32`;
+  ico.width = 16; ico.height = 16; ico.alt = "";
+  ico.loading = "lazy";
+  ico.onerror = function () { this.style.display = "none"; };
+  card.appendChild(ico);
+
+  const body = el("span", "url-card__body");
+  const site = el("span", "url-card__site");
+  site.textContent = domain;
+  body.appendChild(site);
+  let display = url;
+  if (display.length > 60) display = display.slice(0, 57) + "…";
+  const path = el("span", "url-card__path");
+  path.textContent = display;
+  body.appendChild(path);
+  card.appendChild(body);
+
+  const arrow = el("span", "url-card__arrow");
+  arrow.textContent = "↗";
+  card.appendChild(arrow);
+
+  return card;
 }
 function withChildren(node, inner) {
   node.appendChild(frag(parseInline(inner)));

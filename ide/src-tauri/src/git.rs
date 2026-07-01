@@ -239,6 +239,50 @@ fn run_git_checked(root: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// best-of-N 隔离：建一个 git worktree，让一个并行候选在独立工作树里改仓库、不碰主 checkout。
+/// 返回 worktree 的绝对路径。工作树放在 `<root>/.michael/worktrees/<name>`，挂一条临时分支
+/// `michael/bon-<name>`（HEAD 派生）。同名残留先强制清掉。**撤销该候选 = git_worktree_remove。**
+/// 注意：worktree 不含被 gitignore 的依赖（如 node_modules）——上层若要在里面跑测试，需自行
+/// symlink/复用主仓库的依赖（前端 flow 已写明）。
+#[tauri::command]
+pub fn git_worktree_add(root: String, name: String) -> Result<String, String> {
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() {
+        return Err("invalid worktree name (need [A-Za-z0-9_-])".into());
+    }
+    let inside = run_git(&root, &["rev-parse", "--is-inside-work-tree"])?;
+    if !inside.status.success() {
+        return Err("不是 git 仓库——best-of-N 的并行隔离需要 git worktree；先 `git init` 或改用基于 checkpoint 的顺序尝试。".into());
+    }
+    let abs = format!("{}/.michael/worktrees/{}", root.trim_end_matches('/'), safe);
+    let branch = format!("michael/bon-{safe}");
+    // 清掉同名残留（best-effort），避免 add 失败。
+    let _ = run_git(&root, &["worktree", "remove", "--force", &abs]);
+    let _ = run_git(&root, &["branch", "-D", &branch]);
+    run_git_checked(&root, &["worktree", "add", "-b", &branch, &abs, "HEAD"])?;
+    Ok(abs)
+}
+
+/// 列出当前所有 worktree（porcelain 文本）。
+#[tauri::command]
+pub fn git_worktree_list(root: String) -> Result<String, String> {
+    run_git_checked(&root, &["worktree", "list", "--porcelain"])
+}
+
+/// 移除一个 worktree（并尽力删掉它的临时分支）= 丢弃这个候选。
+#[tauri::command]
+pub fn git_worktree_remove(root: String, path: String) -> Result<String, String> {
+    run_git_checked(&root, &["worktree", "remove", "--force", &path])?;
+    // 临时分支名从路径末段推回，best-effort 删除（删不掉不算错）。
+    if let Some(seg) = path.rsplit('/').next() {
+        let _ = run_git(&root, &["branch", "-D", &format!("michael/bon-{seg}")]);
+    }
+    Ok("removed".into())
+}
+
 /// Whether the repo has at least one commit (i.e. `HEAD` resolves).
 ///
 /// `git restore --staged` / `git reset` need a HEAD to diff the index against;

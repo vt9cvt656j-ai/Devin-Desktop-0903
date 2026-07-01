@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
@@ -33,7 +33,7 @@ portable-pty = "0.9.0"
 notify = { version = "7", features = ["macos_fsevent"] }
 notify-debouncer-mini = "0.5"
 once_cell = "1"
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "json"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "json", "mysql", "postgres", "any", "tls-rustls-ring", "chrono"] }
 bcrypt = "0.19.2"
 uuid = { version = "1.23.3", features = ["v4"] }
 rand = "0.10.1"
@@ -43,6 +43,9 @@ headless_chrome = { version = "1.0", default-features = false }
 enigo = "0.3"
 xcap = { version = "0.4", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rqrr = "0.9"
+redis = { version = "1.2.4", features = ["tokio-comp"] }
+pdf-extract = "0.7"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

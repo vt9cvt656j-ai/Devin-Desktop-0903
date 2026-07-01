@@ -43,8 +43,16 @@ impl LspManager {
     /// Kill every language server and clear the map — reaps a previous page
     /// session on webview reload and on app exit.
     pub fn stop_all(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.clear();
+        // Reap on a DETACHED thread: each LspProcess::drop does kill()+blocking wait(),
+        // and heavy servers (rust-analyzer/gopls, hundreds of MB) reaped serially stalled
+        // the caller for seconds. This runs from cleanup_stale on boot (which used to
+        // freeze the window) and on app exit; draining + dropping off-thread returns at once.
+        let drained: Vec<LspProcess> = match self.inner.lock() {
+            Ok(mut inner) => inner.drain().map(|(_, v)| v).collect(),
+            Err(_) => return,
+        };
+        if !drained.is_empty() {
+            std::thread::spawn(move || drop(drained));
         }
     }
 }

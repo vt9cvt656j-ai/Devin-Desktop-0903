@@ -76,11 +76,32 @@ fn launch() -> Result<Session, String> {
         proxy_bypass.into(),
     ];
     let extra_ref: Vec<&std::ffi::OsStr> = extra.iter().map(|s| s.as_os_str()).collect();
+    // PERSISTENT profile: keep one stable user-data-dir so cookies / logins survive
+    // across sessions. The user logs in ONCE (e.g. scans a login QR) and the agent's
+    // browser stays signed in next time — instead of a clean, logged-out browser every
+    // run. (This is plain cookie persistence, like any normal browser profile.)
+    let profile_dir = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".michael-ide").join("browser-profile"));
+    if let Some(ref p) = profile_dir {
+        let _ = std::fs::create_dir_all(p);
+        // Remove stale singleton locks left by a previous crash / navigation timeout —
+        // otherwise Chrome refuses to reuse the profile and EVERY later browser action
+        // fails ("profile in use"). This makes the persistent profile crash-robust.
+        for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+            let _ = std::fs::remove_file(p.join(lock));
+        }
+    }
+    // VISIBLE by default — the user must actually SEE the browser being controlled
+    // (headless felt "根本没在控制电脑" because nothing showed on screen). A real Chrome
+    // window opens and the agent drives it (fast, node-based). Set MICHAEL_BROWSER_HEADLESS=1
+    // to force headless for pure background scraping where no window is wanted.
+    let headless = std::env::var("MICHAEL_BROWSER_HEADLESS").ok().as_deref() == Some("1");
     let opts = LaunchOptionsBuilder::default()
         .path(Some(std::path::PathBuf::from(path)))
-        .headless(true)
+        .headless(headless)
         .sandbox(false)
         .ignore_certificate_errors(true)
+        .user_data_dir(profile_dir)
         .window_size(Some((1280, 900)))
         .args(extra_ref)
         .build()
@@ -185,19 +206,57 @@ fn snapshot(tab: &Tab, result: Option<String>) -> Result<BrowserState, String> {
 /// Run a closure against the (lazily-launched) shared tab, on a blocking thread.
 async fn with_tab<F>(f: F) -> Result<BrowserState, String>
 where
-    F: FnOnce(&Tab) -> Result<Option<String>, String> + Send + 'static,
+    F: Fn(&Tab) -> Result<Option<String>, String> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || -> Result<BrowserState, String> {
-        let mut guard = BROWSER.lock().map_err(|_| "browser state poisoned")?;
-        if guard.is_none() {
-            *guard = Some(launch()?);
+        // Run against the shared tab. If the cached browser's CDP connection is DEAD
+        // (it timed out / crashed / was closed — "underlying connection is closed"),
+        // toss the stale session, relaunch a fresh browser, and retry ONCE. Without
+        // this, a single navigation timeout bricks the browser for the whole session.
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            let outcome = {
+                let mut guard = BROWSER.lock().map_err(|_| "browser state poisoned")?;
+                if guard.is_none() {
+                    *guard = Some(launch()?);
+                }
+                let tab = guard.as_ref().unwrap().tab.clone();
+                f(&tab).and_then(|result| snapshot(&tab, result))
+            };
+            match outcome {
+                Ok(state) => return Ok(state),
+                Err(e) => {
+                    last_err = e;
+                    if attempt == 0 && is_dead_browser(&last_err) {
+                        if let Ok(mut g) = BROWSER.lock() {
+                            *g = None; // drop the dead session → next attempt relaunches
+                        }
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            }
         }
-        let tab = guard.as_ref().unwrap().tab.clone();
-        let result = f(&tab)?;
-        snapshot(&tab, result)
+        Err(last_err)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Does this error mean the browser's CDP connection died (so we should relaunch a
+/// fresh browser instead of surfacing a dead-connection error to the user)?
+fn is_dead_browser(e: &str) -> bool {
+    let s = e.to_lowercase();
+    s.contains("underlying connection is closed")
+        || s.contains("connection is closed")
+        || s.contains("connection closed")
+        || s.contains("not connected")
+        || s.contains("websocket")
+        || s.contains("channel")
+        || s.contains("no longer")
+        || s.contains("session with given id not found")
+        || s.contains("target closed")
+        || s.contains("browser process")
 }
 
 /// Open a URL (launches the browser on first use).
@@ -241,6 +300,21 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
             .map_err(|_| format!("找不到输入框: {selector}"))?;
         el.click().map_err(|e| e.to_string())?;
         el.type_into(&text).map_err(|e| e.to_string())?;
+        Ok(None)
+    })
+    .await
+}
+
+/// Set the file(s) of a <input type=file> matching a CSS selector — so the agent can
+/// automate upload forms (which plain typing can't do). `paths` are absolute local paths.
+#[tauri::command]
+pub async fn browser_upload_file(selector: String, paths: Vec<String>) -> Result<BrowserState, String> {
+    with_tab(move |tab| {
+        let el = tab
+            .find_element(&selector)
+            .map_err(|_| format!("找不到文件输入框: {selector}（要选中一个 <input type=file>）"))?;
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        el.set_input_files(&refs).map_err(|e| format!("设置上传文件失败: {e}"))?;
         Ok(None)
     })
     .await
@@ -304,11 +378,12 @@ pub async fn browser_scroll(amount: i32) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_wait(selector: Option<String>, ms: Option<u64>) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        match selector.filter(|s| !s.trim().is_empty()) {
+        // borrow (don't move) selector — the closure is Fn (may run twice on relaunch)
+        match selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(sel) => {
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 loop {
-                    if tab.find_element(&sel).is_ok() {
+                    if tab.find_element(sel).is_ok() {
                         break;
                     }
                     if std::time::Instant::now() > deadline {

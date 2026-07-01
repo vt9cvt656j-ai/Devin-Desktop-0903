@@ -157,6 +157,13 @@ fn host_is_local(url: &str) -> bool {
 }
 
 fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<(), String> {
+    run_capture_t(browser, url, out, w, h, 8000)
+}
+
+/// Capture with a custom virtual-time budget (ms). A larger budget lets the page
+/// run longer before the shot — so a sequence of increasing budgets samples an
+/// animation at successive points in time (the basis of the filmstrip capture).
+fn run_capture_t(browser: &str, url: &str, out: &str, w: u32, h: u32, budget_ms: u32) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "--headless=new".into(),
         "--disable-gpu".into(),
@@ -176,7 +183,7 @@ fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<()
         format!("--screenshot={out}"),
         // Let dynamic pages render before the shot. The budget fires even on pages
         // with idle-but-open sockets (HMR / websockets), so it won't hang there.
-        "--virtual-time-budget=8000".into(),
+        format!("--virtual-time-budget={budget_ms}"),
     ];
     if host_is_local(url) {
         // Intranet / localhost must NOT go through a system/corporate proxy, or
@@ -255,4 +262,68 @@ pub async fn capture_url(
     // Re-encode as a downscaled JPEG so the data URL stays small (the raw PNG can
     // be multi-MB and blow the AI request body limit → 413).
     bytes_to_jpeg_data_url(&bytes, w.min(1280), 68)
+}
+
+/// Capture an ANIMATION as a vertical filmstrip: take `frames` screenshots at
+/// successive points in time (increasing virtual-time budgets across `duration_ms`)
+/// and stack them top→bottom into ONE labelled image, so the model can SEE motion —
+/// a single screenshot can't show an animation. The agent's "eyes" for animation work.
+#[tauri::command]
+pub async fn capture_url_frames(
+    url: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    frames: Option<u32>,
+    duration_ms: Option<u32>,
+) -> Result<String, String> {
+    let mut url = url.trim().to_string();
+    if !url.contains("://") {
+        url = format!("http://{url}");
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("只支持 http/https URL".into());
+    }
+    let browser = find_headless_browser().ok_or_else(|| {
+        "未找到无头浏览器。装上 Google Chrome / Chromium / Edge 后才能截图。".to_string()
+    })?;
+    let w = width.unwrap_or(1280).clamp(320, 3840);
+    let h = height.unwrap_or(800).clamp(240, 4000);
+    let n = frames.unwrap_or(4).clamp(2, 5);
+    let total = duration_ms.unwrap_or(2400).clamp(400, 8000);
+
+    // Capture each frame at budget = total * (i+1)/n (so frames sample 1/n..1 of the timeline).
+    let mut imgs: Vec<image::DynamicImage> = Vec::new();
+    for i in 0..n {
+        let budget = (total as u64 * (i as u64 + 1) / n as u64).max(200) as u32;
+        let out = std::env::temp_dir().join(format!("michael_ide_frame_{}.png", uuid::Uuid::new_v4()));
+        let out_str = out.to_string_lossy().to_string();
+        let (b, u2, o2) = (browser.clone(), url.clone(), out_str.clone());
+        tauri::async_runtime::spawn_blocking(move || run_capture_t(&b, &u2, &o2, w, h, budget))
+            .await
+            .map_err(|e| e.to_string())??;
+        if let Ok(bytes) = std::fs::read(&out) {
+            let _ = std::fs::remove_file(&out);
+            if !bytes.is_empty() {
+                if let Ok(img) = image::load_from_memory(&bytes) {
+                    imgs.push(img);
+                }
+            }
+        }
+    }
+    if imgs.is_empty() {
+        return Err("逐帧截图为空（确认服务已起、URL 正确）".into());
+    }
+
+    // Stack vertically with a 6px dark separator between frames.
+    let fw = imgs.iter().map(|i| i.width()).max().unwrap_or(w);
+    let sep: u32 = 6;
+    let total_h: u32 = imgs.iter().map(|i| i.height()).sum::<u32>() + sep * (imgs.len() as u32 - 1).max(0);
+    let mut canvas = image::RgbImage::from_pixel(fw, total_h.max(1), image::Rgb([24, 24, 28]));
+    let mut y: i64 = 0;
+    for img in &imgs {
+        let rgb = img.to_rgb8();
+        image::imageops::overlay(&mut canvas, &rgb, 0, y);
+        y += img.height() as i64 + sep as i64;
+    }
+    jpeg_data_url(image::DynamicImage::ImageRgb8(canvas), 900, 70)
 }

@@ -4,8 +4,8 @@ mod auth;
 mod browser;
 mod capture;
 mod computer;
+mod db;
 mod debug;
-mod devin;
 mod extensions;
 mod files;
 mod git;
@@ -14,6 +14,8 @@ mod marketplace;
 mod mcp;
 mod net;
 mod process_util;
+mod qr;
+mod sysctl;
 mod tasks;
 mod terminal;
 mod watcher;
@@ -70,6 +72,7 @@ pub fn run() {
             files::register_workspace_root,
             files::read_dir,
             files::read_text_file,
+            files::read_file_data_url,
             files::write_text_file,
             files::write_tmp_file,
             files::home_dir,
@@ -82,6 +85,9 @@ pub fn run() {
             files::replace_in_file,
             files::replace_in_project,
             git::git_status,
+            git::git_worktree_add,
+            git::git_worktree_list,
+            git::git_worktree_remove,
             git::git_file_head,
             git::git_diff,
             git::git_stage,
@@ -106,18 +112,25 @@ pub fn run() {
             ai::ai_chat,
             ai::ai_chat_with_tools,
             ai::ai_complete,
+            ai::cancel_ai,
             ai::web_fetch,
             ai::web_search,
             net::http_request,
             net::download_file,
+            net::generate_image_chat,
+            qr::decode_qr,
+            db::db_query,
             mcp::mcp_connect,
             mcp::mcp_call,
             mcp::mcp_disconnect,
             capture::capture_url,
+            capture::capture_url_frames,
             browser::browser_navigate,
             browser::browser_click,
             browser::browser_type,
+            files::read_document,
             browser::browser_press,
+            browser::browser_upload_file,
             browser::browser_eval,
             browser::browser_screenshot,
             browser::browser_set_marks,
@@ -129,12 +142,20 @@ pub fn run() {
             computer::computer_move,
             computer::computer_click,
             computer::computer_double_click,
+            computer::computer_drag,
             computer::computer_type,
             computer::computer_key,
             computer::computer_scroll,
-            devin::devin_create_session,
-            devin::devin_send_message,
-            devin::devin_get_session,
+            computer::computer_nodes,
+            computer::computer_press,
+            computer::computer_set_value,
+            sysctl::system_open_app,
+            sysctl::system_list_apps,
+            sysctl::system_app_windows,
+            sysctl::system_focus_window,
+            sysctl::system_menu,
+            sysctl::system_menu_items,
+            sysctl::system_frontmost,
             extensions::ext_list_installed,
             extensions::ext_read_asset,
             extensions::ext_set_enabled,

@@ -42,8 +42,14 @@ impl DebugManager {
     /// Kill every debug adapter and clear the map — reaps a previous page session
     /// on webview reload and on app exit.
     pub fn stop_all(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.clear();
+        // Drain + reap on a DETACHED thread — DapProcess::drop does kill()+blocking wait();
+        // off-thread keeps boot (cleanup_stale) and app exit from stalling on it.
+        let drained: Vec<DapProcess> = match self.inner.lock() {
+            Ok(mut inner) => inner.drain().map(|(_, v)| v).collect(),
+            Err(_) => return,
+        };
+        if !drained.is_empty() {
+            std::thread::spawn(move || drop(drained));
         }
     }
 }
