@@ -277,7 +277,7 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
         // quoting would mangle them for cmd.exe.
         use std::os::windows::process::CommandExt;
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-        let mut c = Command::new(shell);
+        let mut c = crate::process_util::command(shell);
         c.raw_arg(format!("/C chcp 65001>nul & {command}"));
         c.current_dir(&dir)
             .env("PYTHONUTF8", "1")
@@ -288,7 +288,7 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
     let mut cmd = {
         // A login shell loads the user's profile so cargo/npm/go resolve, and we
         // prepend the usual toolchain dirs as a belt-and-suspenders fallback.
-        let mut c = Command::new(task_shell());
+        let mut c = crate::process_util::command(task_shell());
         c.arg("-lc")
             .arg(&command)
             .current_dir(&dir)

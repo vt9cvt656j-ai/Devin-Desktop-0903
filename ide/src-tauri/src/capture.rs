@@ -192,7 +192,7 @@ fn run_capture_t(browser: &str, url: &str, out: &str, w: u32, h: u32, budget_ms:
     }
     args.push(url.into());
 
-    let mut child = Command::new(browser)
+    let mut child = crate::process_util::command(browser)
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// Spawn a program with args, bounded by `timeout_ms`; return trimmed stdout, or an error
 /// (stderr if stdout was empty). Platform-agnostic — compiles everywhere.
 fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<String, String> {
-    let mut child = Command::new(program)
+    let mut child = crate::process_util::command(program)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

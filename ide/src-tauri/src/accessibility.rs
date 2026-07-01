@@ -95,7 +95,7 @@ pub fn read_ui_elements() -> Vec<UiElement> {
   }catch(e){return '[]';}
 })()"##;
 
-    let mut child = match Command::new("osascript")
+    let mut child = match crate::process_util::command("osascript")
         .args(["-l", "JavaScript", "-e", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -175,7 +175,7 @@ $all=@($a1)+@($a2)+@($a3)+@($a4)
 $out=@();for($i=0;$i -lt [Math]::Min($all.Count,500);$i++){$m=$all[$i];$m.ref=$i;$out+=$m}
 if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
 
-    let mut child = match Command::new("powershell")
+    let mut child = match crate::process_util::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -227,7 +227,7 @@ fn run_osa(script: &str, ms: u64) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
-    let mut child = Command::new("osascript")
+    let mut child = crate::process_util::command("osascript")
         .args(["-l", "JavaScript", "-e", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -388,7 +388,7 @@ pub fn read_ocr_elements() -> Vec<UiElement> {
         }
         let arch = std::env::consts::ARCH;
         let target = format!("{}-apple-macos14.0", if arch == "aarch64" { "arm64" } else { "x86_64" });
-        let ok = Command::new("swiftc")
+        let ok = crate::process_util::command("swiftc")
             .args(["-O", "-target", &target, "-o", bin.to_str().unwrap_or(""), src])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
@@ -400,7 +400,7 @@ pub fn read_ocr_elements() -> Vec<UiElement> {
         }
     }
 
-    let mut child = match Command::new(&bin)
+    let mut child = match crate::process_util::command(&bin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

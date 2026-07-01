@@ -64,3 +64,21 @@ pub fn resolve_command(cmd: &str, _workspace: Option<&str>) -> String {
 
 /// Maximum number of concurrent LSP or DAP processes allowed.
 pub const MAX_CHILD_PROCESSES: usize = 16;
+
+/// Build a `std::process::Command` that will **NOT pop a console window on
+/// Windows** (sets `CREATE_NO_WINDOW`). No-op on macOS/Linux. Use this
+/// EVERYWHERE instead of `Command::new` — every subprocess this app spawns
+/// (git, LSP servers, shells, PowerShell, osascript, node, cargo…) otherwise
+/// flashes a cmd/PowerShell black window on Windows, and the constant spawn
+/// churn also wedges the UI. One helper → all spawns silent.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}

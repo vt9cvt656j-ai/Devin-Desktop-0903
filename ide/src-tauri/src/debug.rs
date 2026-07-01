@@ -141,7 +141,7 @@ pub fn dap_start(
     #[cfg(windows)]
     let resolved = command.clone();
 
-    let mut builder = Command::new(&resolved);
+    let mut builder = crate::process_util::command(&resolved);
     builder
         .args(&args)
         .stdin(Stdio::piped())

@@ -242,7 +242,7 @@ pub fn lsp_start(
     #[cfg(windows)]
     let (actual_cmd, extra_args) = (resolved.clone(), Vec::<String>::new());
 
-    let mut builder = Command::new(&actual_cmd);
+    let mut builder = crate::process_util::command(&actual_cmd);
     builder
         .args(&extra_args)
         .args(&args)
@@ -413,7 +413,7 @@ pub struct PythonEnvInfo {
 pub fn lsp_detect_python() -> Result<PythonEnvInfo, String> {
     let python = process_util::resolve_command("python3", None);
     let aug_path = process_util::augmented_path(None);
-    let output = Command::new(&python)
+    let output = crate::process_util::command(&python)
         .args(["-c", "import sys,site,json;p=list(site.getsitepackages());p.append(site.getusersitepackages());print(json.dumps({'exec':sys.executable,'paths':p}))"])
         .env("PATH", &aug_path)
         .stdout(Stdio::piped())
@@ -470,7 +470,7 @@ fn py_cache() -> &'static Mutex<Option<PythonModuleCache>> {
 fn run_python_script(script: &str, extra_args: &[&str]) -> Option<String> {
     let python = process_util::resolve_command("python3", None);
     let aug_path = process_util::augmented_path(None);
-    let mut cmd = Command::new(&python);
+    let mut cmd = crate::process_util::command(&python);
     cmd.args(["-c", script])
         .env("PATH", &aug_path)
         .stdout(Stdio::piped())
@@ -610,7 +610,7 @@ pub fn lsp_node_env_symbols(
     let mut exports: HashMap<String, Vec<String>> = HashMap::new();
     if !modules.is_empty() {
         let script = r#"const r={};for(const n of process.argv.slice(1)){try{const m=require(n);r[n]=Object.getOwnPropertyNames(m).filter(k=>!k.startsWith('_')).slice(0,500)}catch{}};console.log(JSON.stringify(r))"#.to_string();
-        let mut cmd = Command::new(&node);
+        let mut cmd = crate::process_util::command(&node);
         cmd.args(["-e", &script])
             .env("PATH", &aug_path)
             .env("NODE_PATH", node_mods.to_str().unwrap_or(""))
@@ -655,7 +655,7 @@ pub fn lsp_go_env_symbols(project_dir: String) -> Result<GoEnvSymbols, String> {
     let go_cmd = process_util::resolve_command("go", None);
     let aug_path = process_util::augmented_path(None);
 
-    let output = Command::new(&go_cmd)
+    let output = crate::process_util::command(&go_cmd)
         .args(["list", "-m", "all"])
         .env("PATH", &aug_path)
         .current_dir(&project_dir)
@@ -679,7 +679,7 @@ pub fn lsp_go_env_symbols(project_dir: String) -> Result<GoEnvSymbols, String> {
         }
     }
 
-    let output2 = Command::new(&go_cmd)
+    let output2 = crate::process_util::command(&go_cmd)
         .args(["list", "std"])
         .env("PATH", &aug_path)
         .stdout(Stdio::piped())
@@ -712,7 +712,7 @@ pub struct LangEnvSymbols {
 fn run_cmd_collect(cmd_name: &str, args: &[&str], cwd: Option<&str>) -> Vec<String> {
     let resolved = process_util::resolve_command(cmd_name, None);
     let aug_path = process_util::augmented_path(None);
-    let mut cmd = Command::new(&resolved);
+    let mut cmd = crate::process_util::command(&resolved);
     cmd.args(args)
         .env("PATH", &aug_path)
         .stdout(Stdio::piped())

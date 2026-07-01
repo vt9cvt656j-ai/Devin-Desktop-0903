@@ -943,7 +943,7 @@ async fn browser_render_search(q: &str) -> Vec<(String, String, String)> {
 /// `--dump-dom`). Chrome exits on its own after `--virtual-time-budget`, so this
 /// doesn't hang; the caller still wraps it in a timeout as a backstop.
 fn render_dom(browser: &str, url: &str) -> Option<String> {
-    let out = std::process::Command::new(browser)
+    let out = crate::process_util::command(browser)
         .args([
             "--headless=new",
             "--disable-gpu",

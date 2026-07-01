@@ -38,7 +38,7 @@ pub struct GitStatus {
 }
 
 fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    crate::process_util::command("git")
         .arg("-C")
         .arg(root)
         .args(args)

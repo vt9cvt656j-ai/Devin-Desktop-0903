@@ -103,7 +103,7 @@ fn spawn_session(
     env: &HashMap<String, String>,
     cwd: &str,
 ) -> Result<Session, String> {
-    let mut cmd = Command::new(command);
+    let mut cmd = crate::process_util::command(command);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
