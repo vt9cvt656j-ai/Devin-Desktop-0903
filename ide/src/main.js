@@ -6758,7 +6758,7 @@ function addMessage(role, text, forSession) {
   // message nodes rendered (the conversation data in `history` is untouched, so
   // nothing is lost — only the oldest off-screen nodes are pruned). The newest
   // (possibly streaming) message is at the end and never pruned.
-  const MSG_CAP = 250;
+  const MSG_CAP = 120; // keep the DOM lean on long sessions (older msgs stay in history/persisted; only off-screen nodes are pruned). Halved from 250 → ~half the DOM memory + faster reflow.
   const msgs = target.querySelectorAll(":scope > .msg");
   for (let i = 0; i < msgs.length - MSG_CAP; i++) msgs[i].remove();
   _chatFollow();
