@@ -7319,6 +7319,55 @@ function _formatStackHint(s) {
   return lines.join("\n");
 }
 
+// Repo-map (Aider-style): invert the background symbol index into a compact per-file
+// outline of the main definitions, injected into the agent context so the model gets an
+// X-ray of the codebase — "what's defined where" — WITHOUT reading every file. This is
+// the single biggest lever for project understanding after the model itself. Bounded so
+// it never bloats context; empty (harmless) until the background index finishes building.
+function _buildRepoMap(query, maxChars = 6000) {
+  try {
+    if (!_symbolIndex || _symbolIndex.size === 0) return "";
+    const byFile = new Map();
+    for (const arr of _symbolIndex.values()) {
+      if (!Array.isArray(arr)) continue;
+      for (const s of arr) {
+        if (!s || !s.path || !s.name) continue;
+        let list = byFile.get(s.path);
+        if (!list) { list = []; byFile.set(s.path, list); }
+        list.push(s);
+      }
+    }
+    if (!byFile.size) return "";
+    // Rank: definition count (a centrality proxy — "important" files define the most)
+    // PLUS a strong boost for files whose path or symbols match the task's terms, so the
+    // map surfaces the code the model needs NOW, not just the biggest files.
+    const terms = (String(query || "").toLowerCase().match(/[a-z_][a-z0-9_]{2,}|[一-鿿]{2,}/gi) || []).slice(0, 12);
+    const _score = (path, syms) => {
+      let sc = syms.length;
+      if (terms.length) {
+        const hay = (path + " " + syms.map((x) => x.name).join(" ")).toLowerCase();
+        for (const t of terms) if (hay.includes(t)) sc += 40;
+      }
+      return sc;
+    };
+    const files = [...byFile.entries()].sort((a, b) => _score(b[0], b[1]) - _score(a[0], a[1]));
+    const out = [];
+    let used = 0;
+    for (const [path, syms] of files) {
+      syms.sort((a, b) => (a.line || 0) - (b.line || 0));
+      const names = [...new Set(syms.map((s) => s.name).filter(Boolean))].slice(0, 16);
+      if (!names.length) continue;
+      const line = `${path}: ${names.join(", ")}`;
+      if (used + line.length + 1 > maxChars) break;
+      out.push(line);
+      used += line.length + 1;
+    }
+    return out.length
+      ? `\n项目符号地图（每个文件的主要定义——先看这个建立全局理解、快速定位，需要细节再 read_file，别盲读）:\n${out.join("\n")}`
+      : "";
+  } catch { return ""; }
+}
+
 async function _gatherAgentContext(query, sessionRoot) {
   const root = sessionRoot || rootPath || workspaceRoots[0];
   const osDetail = await _detectOSDetail();
@@ -7368,6 +7417,12 @@ async function _gatherAgentContext(query, sessionRoot) {
       }
     } catch {}
   }
+
+  // Repo-map: a compact per-file symbol outline from the background symbol index. Gives
+  // the model an X-ray of the codebase (what's defined where) — far stronger project
+  // understanding than a bare file list, and cuts blind file reads.
+  const _repoMap = _buildRepoMap(query, 6000);
+  if (_repoMap) parts.push(_repoMap);
 
   // Multi-root awareness: list the OTHER open folders (with a short tree each) so
   // the agent knows they exist and addresses files in them correctly — the cause
