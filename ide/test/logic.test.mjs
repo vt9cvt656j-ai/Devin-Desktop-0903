@@ -135,3 +135,52 @@ test("_safeJsonLoose repairs malformed \\u escapes (the 'unexpected end of hex e
   // an already-escaped \\u (literal backslash) must be left alone:
   assert.equal(f('{"content":"C:\\\\users"}').content, "C:\\users");
 });
+
+test("_modelSeesImages defaults TRUE (send real image) except known text-only models", () => {
+  const f = load("_modelSeesImages", { MODEL_GROUPS: [] });
+  // multimodal / unknown → assume it can see (the fix for '多模态读不懂图片'):
+  for (const id of ["claude-opus-4-8", "gpt-5.5", "gemini-3-pro", "glm-4.6", "qwen-max",
+                    "doubao-pro-32k", "hunyuan-turbo", "grok-4", "some-new-gateway-alias"]) {
+    assert.equal(f(id), true, `${id} should be treated as vision-capable`);
+  }
+  // genuinely text-only / non-chat → bridge via transcription:
+  for (const id of ["deepseek-chat", "deepseek-reasoner", "deepseek-coder", "o1-mini",
+                    "text-embedding-3-large", "whisper-1", "codestral-latest"]) {
+    assert.equal(f(id), false, `${id} should route through the text bridge`);
+  }
+  // deepseek's OWN vision model must NOT be denylisted:
+  assert.equal(f("deepseek-vl2"), true);
+});
+
+test("_looksQuickAsk excludes project/multi-file scope (so it isn't crippled to a tiny budget)", () => {
+  const f = load("_looksQuickAsk", { _looksUIBuildTask: () => false, _looksBugFixTask: () => false });
+  // trivial conversational asks are still 'quick':
+  assert.equal(f("什么是闭包？"), true);
+  assert.equal(f("这个函数是什么意思"), true);
+  // but anything project/codebase-scoped must NOT be quick — it needs real exploration:
+  assert.equal(f("看一下我的项目"), false);
+  assert.equal(f("帮我看看这几个文件"), false);
+  assert.equal(f("分析一下整个代码库"), false);
+  assert.equal(f("梳理一下这个工程的架构"), false);
+});
+
+test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上下文协议)", () => {
+  const f = load("_sharedCtxDigest");
+  assert.equal(f(null), "", "no ctx → empty");
+  assert.equal(f({}), "", "empty ctx → empty (nothing to share yet)");
+  const ctx = {
+    goal: "fix auth token refresh",
+    done: ["read config", "found the bug"],
+    modified: new Map([["auth.ts", "编辑"]]),
+    filesRead: new Set(["src/auth.ts", "src/token.ts"]),
+    findings: ["refreshToken() at auth.ts:42 never awaits"],
+    errors: ["401 on retry"],
+  };
+  const s = f(ctx);
+  assert.match(s, /主智能体已经掌握的上下文/);       // header so the child knows to reuse it
+  assert.match(s, /fix auth token refresh/);          // goal
+  assert.match(s, /auth\.ts\(编辑\)/);                // mutations w/ rationale
+  assert.match(s, /src\/token\.ts/);                  // files already read (don't re-read)
+  assert.match(s, /refreshToken\(\) at auth\.ts:42/); // prior findings
+  assert.match(s, /401 on retry/);                    // open errors
+});

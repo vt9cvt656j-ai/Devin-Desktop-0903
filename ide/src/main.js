@@ -3577,9 +3577,14 @@ async function openFolder(path) {
   path = _toPosix(path);
   workspaceRoots = [path];
   setActiveWorkspaceRoot(path);
-  // Opening a different project should immediately retag the active chat tab.
+  // Opening a different project should immediately retag the active chat tab AND keep the
+  // session's own root in sync (it was only updating .project, so session.workspaceRoots could
+  // drift stale and later re-override the global root on restore).
   const _sess = _currentSession();
-  if (_sess && _sess.project !== path) { _sess.project = path; _renderChatTabs(); saveChatHistory(); }
+  if (_sess) {
+    _sess.workspaceRoots = [path];
+    if (_sess.project !== path) { _sess.project = path; _renderChatTabs(); saveChatHistory(); }
+  }
   try { await backend.registerWorkspaceRoot(path); }
   catch (e) { if (inTauri) showToast(`⚠️ 打开「${basename(path)}」时注册失败：${String(e?.message || e).slice(0, 80)}。该目录下读写可能被拒绝。`); }
   _ipcBroadcast("workspace_changed", { roots: [path], active: path });
@@ -4427,39 +4432,48 @@ function gitBadge(file) {
   return { ch, cls: "git-badge--" + ch };
 }
 
+let _gitRefreshing = false;
 async function refreshGitStatus() {
-  if (!rootPath) {
-    gitBranchNameEl.textContent = "—";
-    gitListEl.innerHTML = `<div class="git-empty"></div>`;
-    gitListEl.firstChild.textContent = t("git.openFolder");
-    return;
-  }
-  let status;
+  // Coalesce rapid clicks: overlapping git_status calls completing out of order could leave the
+  // list looking unchanged → "刷新点了没效果". One at a time.
+  if (_gitRefreshing) return;
+  _gitRefreshing = true;
   try {
-    status = await backend.gitStatus(rootPath);
-  } catch (e) {
-    gitIsRepo = false;
-    gitBranchNameEl.textContent = "—";
-    gitListEl.innerHTML = `<div class="git-empty"></div>`;
-    gitListEl.firstChild.textContent = String(e);
-    refreshGutter();
-    return;
+    if (!rootPath) {
+      gitBranchNameEl.textContent = "—";
+      gitListEl.innerHTML = `<div class="git-empty"></div>`;
+      gitListEl.firstChild.textContent = t("git.openFolder");
+      return;
+    }
+    let status;
+    try {
+      status = await backend.gitStatus(rootPath);
+    } catch (e) {
+      gitIsRepo = false;
+      gitBranchNameEl.textContent = "—";
+      gitListEl.innerHTML = `<div class="git-empty"></div>`;
+      gitListEl.firstChild.textContent = String(e);
+      refreshGutter();
+      return;
+    }
+    if (!status.is_repo) {
+      gitIsRepo = false;
+      gitBranchNameEl.textContent = "—";
+      gitListEl.innerHTML = `<div class="git-empty"></div>`;
+      gitListEl.firstChild.textContent = t("git.notRepo");
+      refreshGutter();
+      return;
+    }
+    gitIsRepo = true;
+    gitBranchNameEl.textContent = status.branch;
+    gitBranchNameEl.parentElement.title = t("git.onBranch", { name: status.branch });
+    renderGitFiles(status.files);
+    // await so a throw in any sub-refresher surfaces (and can't leave a half-refreshed panel
+    // via an unhandled rejection); allSettled never rejects itself.
+    await Promise.allSettled([refreshGutter(), refreshGitLog(), refreshStashList()]);
+  } finally {
+    _gitRefreshing = false;
   }
-  if (!status.is_repo) {
-    gitIsRepo = false;
-    gitBranchNameEl.textContent = "—";
-    gitListEl.innerHTML = `<div class="git-empty"></div>`;
-    gitListEl.firstChild.textContent = t("git.notRepo");
-    refreshGutter();
-    return;
-  }
-  gitIsRepo = true;
-  gitBranchNameEl.textContent = status.branch;
-  gitBranchNameEl.parentElement.title = t("git.onBranch", { name: status.branch });
-  renderGitFiles(status.files);
-  refreshGutter();
-  refreshGitLog();
-  refreshStashList();
 }
 
 const GRAPH_LANE_COLORS = [
@@ -5307,6 +5321,10 @@ let _diffFilePath = null;
 
 async function openDiff(file) {
   if (!rootPath) return;
+  // Claim "latest click" synchronously BEFORE any await: a fast second click must supersede a
+  // slow first one, or whichever backend call resolves last wins the shared editor and you see a
+  // blank / mismatched diff ("点错内容、内容消失"). Same guard refreshGutter already uses.
+  gitActiveRel = file.rel;
   let headText = "";
   let workText = "";
   try {
@@ -5321,6 +5339,7 @@ async function openDiff(file) {
       workText = "";
     }
   }
+  if (gitActiveRel !== file.rel) return; // a newer click superseded us — don't clobber its diff
 
   const ed = ensureDiffEditor();
   const lang = extLang(file.name);
@@ -7711,10 +7730,10 @@ function _renderSuggestionChips(sess, items, label) {
 async function _maybeSuggestNext(sess, messages, config) {
   try {
     if (!sess || !inTauri) return;
-    const recent = (messages || []).filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim()).slice(-6);
+    const recent = (messages || []).filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim()).slice(-8);
     if (!recent.length) return;
     const msgs = [
-      { role: "system", content: _P("next_action", "你根据编程助手与用户的对话，预测用户**接下来最可能想做**的 2-4 个具体操作。每个≤14字、动词开头、能直接当指令发。只输出一个 JSON 字符串数组，别的什么都不要。") },
+      { role: "system", content: _P("next_action", "你根据编程助手与用户的**完整对话**，预判用户接下来最可能想做、或**最该做却还没意识到**的 2-4 个操作。要有洞察、别只顺水推舟——优先：刚暴露却没解决的问题、缺的验证/测试、下一个真正的里程碑、用户下一句大概率会问的事。绝不给「继续」这种废话。每个≤14字、动词开头、能直接当指令发。只输出一个 JSON 字符串数组，别的都不要。") },
       ...recent,
       { role: "user", content: "给出接下来的 2-4 个建议操作（只回 JSON 数组）。" },
     ];
@@ -7885,6 +7904,17 @@ async function sendPrompt(text, attachedImages = []) {
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
   for (const m of sess.history) messages.push(m);
+  // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
+  // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
+  // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
+  // root and forgets the stale paths. First send just records the root (no notice, no false alarm).
+  {
+    const _curRoot = rootPath || workspaceRoots[0] || "";
+    if (sess._anchorRoot && _curRoot && sess._anchorRoot !== _curRoot && sess.history.length) {
+      messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_curRoot}」。从这条之后：① 所有相对路径一律基于「${_curRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
+    }
+    sess._anchorRoot = _curRoot;
+  }
   // When images are attached, send a multimodal content array so vision models
   // actually see them. History keeps only the text (image data URLs would bloat
   // every subsequent request).
@@ -7902,7 +7932,7 @@ async function sendPrompt(text, attachedImages = []) {
 ② **必做** web_search 搜该品类设计趋势（如 "best ${text.match(/邮箱|email/i) ? "email" : text.match(/电商|shop/i) ? "ecommerce" : text.match(/后台|dashboard/i) ? "dashboard" : text.match(/官网|landing|落地/i) ? "SaaS landing page" : "SaaS"} design 2025"）
 ③ **必做·派子智能体去深度调研（别主智能体自己草草看——那样效果差）**：用 **run_subagent** 派一个调研子智能体（它有 browser/screenshot/读文件能力），在它的 prompt 里写清自包含任务，让它做三件事：**(a) 读真实产品**——用户若指了别的项目、或产品源码在 $HOME 下别的目录（如桌面的源码工程，$HOME 下的都能 read），让它 list_dir/read_file **真实产品源码**，提炼**真实的功能/卖点/界面结构/品牌调性**（用真的，别编）；**(b) browser 看真竞品**——用 browser **真的逐个打开 2-3 个真实竞品官网**（按品类选 cursor.com / zed.dev / linear.app / warp.dev / vercel.com 等），eval「document.body.innerText」取回**渲染后的真实文案/区块/功能描述/CTA/社会证明**（⚠️ 这些是 JS 渲染 SPA，web_fetch 抓的是空壳没用，必须 browser），并看当下真实的配色/字体/版式骨架/留白/动效；**(c) 产出「设计简报」**返回给你：真实产品定位+真实卖点、各竞品真做法（带真句子）、3 个候选风格方向的**灵感**（配色 hex/字体/版式素材）。⚠️ **简报只是弹药，不是决定**——最终走哪个方向由**用户在衣橱里亲眼选定**，研究再充分也不能替用户拍板、更不能因为"研究出方向了"就跳过衣橱。等子智能体回来，**衣橱和官网都基于这份简报里的真实内容**，绝不套通用模板
 ④ **必做·衣橱（研究≠做完！这步雷打不动，绝不能因为"研究出方向了"就跳过）**：研究只是给你弹药，**衣橱才是让用户亲眼挑定方向的关键交互**——没有它，用户没参与、就是你自说自话。研究子智能体已经把每个方向想透了，所以这步**你主智能体亲自动手、不必再派子智能体**：基于步骤③简报里的真实产品信息 + 真实竞品做法 + 配色/字体/版式素材，**为 3 个明显不同的风格方向各写一段精炼的英文 generate_image prompt**（关键：动态写、别套模板、别堆砌——2～4 句就够：一句主体+版式结构，一句风格气质，一句关键细节=真实文案 / 2～3 个 hex 主色 / 字体感 / 真实上线网站截图质感；写你脑子里那个具体页面，别塞"设计稿/Dribbble/mockup/UI kit"这种招 AI 味的空词。例:「A live SaaS landing page for an AI coding tool — dark charcoal #0B0C0E with one electric-blue accent, bold sans headline 『设计、编码、上线，一个 AI 全包』, a clean product screenshot in the hero, generous whitespace, crisp legible UI text, real running website not a mockup」）→ **亲自 generate_image ×3**（width 1536、height 1024，分别存 .wardrobe/s1.png / s2.png / s3.png）→ **亲自 design_board** 把 3 张图（label 风格名 / path 路径 / description 一句话特点）展示让用户点选。⚠️ **在用户从 design_board 里选定方向之前，绝对禁止写任何 .vue/.jsx/index.html 官网代码**——研究做得再好也一样，衣橱是用户的、不是你替他决定的。选定方向后才进入步骤⑤写代码
-⑤ 用户选定风格后 → **多页站 / 应用先「逐屏设计」（Figma 式）**：按选定的那个风格，用 generate_image 给**每个关键界面/页面各出一张设计图**（首页/功能/定价/登录…）当作各屏的实现目标，可再 design_board 给用户过目确认；**单页落地页**则直接以衣橱选中的那张图为设计目标，不必再逐屏。→ 然后 **真正的实现必须用 Vue/React 组件 + Tailwind**（读 package.json 确认栈）。**搭脚手架时：Vue 项目给 vite.config 加「vite-plugin-vue-inspector」、React 用「@vitejs/plugin-react」(默认带源码定位)——这样用户能在预览里点元素、直接改源码(免费可视化编辑)。** **先把选定风格落成一套「设计令牌」单一真源**（在 globals.css / tailwind.config 里定义 CSS 变量：主色+浅深变体、背景/表面、文字/次要文字、危险/成功/警告色、字体族、字阶、间距尺、圆角、阴影——成套 token），**之后每个组件、每一屏一律引用 token**（「var(--color-primary)」或 Tailwind theme 键），**绝不把颜色/字号/间距硬编码散落各处**——全站风格靠这套 token 保持一致，且**改一个 token 全站同步**（多屏一致性靠这个，不是每屏各写各的）。在这套 token 之上，**做成真·实物级官网（像真上线的产品站，不是占位 demo）**：
+⑤ 用户选定风格后 → **多页站 / 应用先「逐屏设计」（Figma 式）**：按选定的那个风格，用 generate_image 给**每个关键界面/页面各出一张设计图**（首页/功能/定价/登录…）当作各屏的实现目标，可再 design_board 给用户过目确认；**单页落地页**则直接以衣橱选中的那张图为设计目标，不必再逐屏。→ 然后 **真正的实现必须用 Vue/React 组件 + Tailwind**（读 package.json 确认栈）。**搭脚手架时给 vite.config 装框架无关的「code-inspector-plugin」（import { codeInspectorPlugin } from 'code-inspector-plugin' → 加进 plugins: codeInspectorPlugin({ bundler: 'vite' })；Vue/React/Svelte 都支持、React 19 也稳）——它给每个元素打 data-insp-path 源码定位属性，于是用户在预览里点元素就能拿到真实源码位置(file:line)、直接改那处源码(免费可视化编辑)，而不是盲改 CSS。（旧的 vite-plugin-vue-inspector / react-dev-inspector 属性也认，但新项目统一用 code-inspector-plugin。）** **先把选定风格落成一套「设计令牌」单一真源**（在 globals.css / tailwind.config 里定义 CSS 变量：主色+浅深变体、背景/表面、文字/次要文字、危险/成功/警告色、字体族、字阶、间距尺、圆角、阴影——成套 token），**之后每个组件、每一屏一律引用 token**（「var(--color-primary)」或 Tailwind theme 键），**绝不把颜色/字号/间距硬编码散落各处**——全站风格靠这套 token 保持一致，且**改一个 token 全站同步**（多屏一致性靠这个，不是每屏各写各的）。在这套 token 之上，**做成真·实物级官网（像真上线的产品站，不是占位 demo）**：
    · ✅ **真实文案**——写产品真实的卖点/功能/介绍，绝不要 Lorem ipsum 或「标题占位」；
    · ✅ **实打实设计、别投机取巧画废 SVG**——hero 大图/插画/场景图**一律用 generate_image 出真图**（没生图模型用 unsplash/picsum 真图）；**产品截图类配图优先用真实的**：真实产品源码仓库里若有现成截图/logo/品牌图就直接用，搭好后也可用 **screenshot 截自己跑起来的 dev server** 拿真实 UI 当展示图；用 generate_image 出产品界面图时**必须如实反映调研读到的真实界面**（真功能名/真布局），别编一个不存在的 UI（一眼假）；图标用 **lucide/heroicons 图标库的真实路径**；⚠️ **严禁自己即兴手画粗糙 SVG 插画/图形来充数**（很廉价、一眼假、用户极其反感）——SVG 只允许用于"图标库的标准图标"，绝不拿自造 SVG 当设计/配图；**绝不用灰色占位框**；
    · ✅ **排版与布局**——讲究留白、网格对齐、清晰的视觉层级与分区块（Nav/Hero/Features/…/CTA/Footer）；
@@ -7979,7 +8009,7 @@ async function sendPrompt(text, attachedImages = []) {
   // actually respond to.
   const _contextPreamble = _dynPreamble + _atContext + _toolHint + _expHint;
   const _userText = _contextPreamble
-    + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文 / 当前打开的文件只是背景参考，**不是**要你去处理的对象——除非用户这句话明确指向它。先答/做用户问的这一件事，别被上面的背景带跑。\n\n"
+    + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
     + text
     + _planFirst;
   let userContent;
@@ -9072,6 +9102,7 @@ const _AGENT_MAX_ITERS = 40; // base step budget per run
 const _AGENT_EXT_STEP = 30;        // steps added per extension
 const _AGENT_HARD_CEIL = 300;      // absolute max steps even with extensions (high → "一直自动做下去")
 const _AGENT_MAX_EXTENSIONS = 12;  // 40 → 70 → 100 → … → 300
+const _AGENT_MAX_REVIEWS = 3;      // evaluator-optimizer: max review→fix→re-review rounds before finishing
 
 // Pick a starting step budget from task-text signals + project size. Small focused
 // tasks finish in 3-6 steps (waste of 40); big "实现完整 X / 重构整套" tasks routinely
@@ -9084,8 +9115,16 @@ function _initialBudget(taskText, stack) {
   const BIG_HINTS = /(实现整套|实现完整|从零|从头|重构|重写|搭建|搭一个完整|整个系统|完整的|build a (whole|full|complete)|build the entire|implement (a )?(complete|full|whole)|refactor|migrate|porting|端到端|整体优化|全部优化|全部强化|all-in|全部|build out|production-ready)/i;
   // "Small task" cues — start lower so we don't burn the cache for trivial Q&A.
   const SMALL_HINTS = /(^(是|不是|对|错|.{1,40}吗)\?|^(what is|when|where|who|why|how do i)\b|这是什么|什么意思|怎么写|怎么用|.{0,30}\?$)/i;
+  // Quick/conversational ask (a question, or one tiny action) → a SMALL budget so it answers /
+  // does the one thing and stops, instead of ballooning into a multi-step autonomous run. Checked
+  // FIRST so a question containing "全部/完整的" (which live in BIG_HINTS) can't misroute to 60.
+  // Quick/small budgets are a CEILING, not a target — the model self-terminates on a
+  // trivial ask (it just answers, no tool calls), so a higher floor never slows simple
+  // Q&A. It ONLY matters when the model genuinely wants to explore. The old floor of 5
+  // crippled real investigations mis-tagged as "quick" ("看一下项目" → 5 steps → 做样子).
+  if (_looksQuickAsk(taskText)) return 14;
   if (BIG_HINTS.test(taskText || "")) return Math.min(60, _AGENT_HARD_CEIL);
-  if (SMALL_HINTS.test(taskText || "") && len < 200) return 12;
+  if (SMALL_HINTS.test(taskText || "") && len < 200) return 16;
   if (stack?.complexity === "large") return Math.min(50, _AGENT_HARD_CEIL); // big project default
   if (stack?.complexity === "medium") return _AGENT_MAX_ITERS; // 40
   return _AGENT_MAX_ITERS;
@@ -9825,27 +9864,28 @@ function _PICK_ELEMENT_JS(rx, ry) {
       var c = el.className.trim().split(' ').filter(Boolean).slice(0, 2).join('.');
       if (c) sel += '.' + c;
     }
-    // 源码定位：React dev 的 _debugSource 给 文件:行号（Vite + @vitejs/plugin-react 默认开）。
-    // 往上爬 fiber 找最近的有 _debugSource 的——直接拿到这个元素在源码里的位置，给"免费直接改"用。
+    // 源码定位（关键：拿到这个元素在源码里的真实位置 file:line:col，给"点元素→直接改源码"用，
+    // 而不是盲改 CSS）。优先读构建期注入的 DOM 属性——对所有框架都稳、React 19 也不受影响：
+    //   · code-inspector-plugin：data-insp-path="path:line:col:name"（框架无关，首选）
+    //   · react-dev-inspector：data-inspector-relative-path / -line / -column
+    //   · vite-plugin-vue-inspector：data-v-inspector="file:line:col"
+    // 往上爬最多 15 层父节点找最近的一个；都没有再退回 React fiber._debugSource（老版 React <19）。
     var source = null;
-    try {
-      var fk = Object.keys(el).find(function(k){ return k.indexOf('__reactFiber\$') === 0 || k.indexOf('__reactInternalInstance\$') === 0; });
-      var fb = fk ? el[fk] : null, hop = 0;
-      while (fb && hop < 40) {
-        if (fb._debugSource && fb._debugSource.fileName) { source = { file: fb._debugSource.fileName, line: fb._debugSource.lineNumber || 0, col: fb._debugSource.columnNumber || 0 }; break; }
-        fb = fb.return; hop++;
-      }
-    } catch (e2) {}
+    var _plc = function(s){ var m = String(s == null ? '' : s).match(/(.+):(\\d+):(\\d+)(?::[^:]*)?\$/); return m ? { file: m[1], line: parseInt(m[2],10)||0, col: parseInt(m[3],10)||0 } : null; };
+    for (var n = el, hop = 0; n && n.getAttribute && hop < 15 && !source; n = n.parentElement, hop++) {
+      source = _plc(n.getAttribute('data-insp-path')) || _plc(n.getAttribute('data-v-inspector'));
+      if (!source && n.getAttribute('data-inspector-line') != null) source = { file: n.getAttribute('data-inspector-relative-path') || '', line: parseInt(n.getAttribute('data-inspector-line'),10)||0, col: parseInt(n.getAttribute('data-inspector-column'),10)||0 };
+      if (!source && n.attributes) { try { for (var ai = 0; ai < n.attributes.length; ai++) { var a = n.attributes[ai]; if (/insp/i.test(a.name)) { var s2 = _plc(a.value); if (s2) { source = s2; break; } } } } catch (eA) {} }
+    }
     if (!source) {
-      // Vue：vite-plugin-vue-inspector 给元素打 data-v-inspector="file:line:col"，往上爬找最近的。
       try {
-        var vn = el;
-        for (var vh = 0; vn && vh < 12; vh++) {
-          var dv = vn.getAttribute && vn.getAttribute('data-v-inspector');
-          if (dv) { var pp = dv.split(':'); source = { file: pp[0], line: parseInt(pp[1], 10) || 0, col: parseInt(pp[2], 10) || 0 }; break; }
-          vn = vn.parentElement;
+        var fk = Object.keys(el).find(function(k){ return k.indexOf('__reactFiber\$') === 0 || k.indexOf('__reactInternalInstance\$') === 0; });
+        var fb = fk ? el[fk] : null, fhop = 0;
+        while (fb && fhop < 40) {
+          if (fb._debugSource && fb._debugSource.fileName) { source = { file: fb._debugSource.fileName, line: fb._debugSource.lineNumber || 0, col: fb._debugSource.columnNumber || 0 }; break; }
+          fb = fb.return; fhop++;
         }
-      } catch (e3) {}
+      } catch (e2) {}
     }
     return JSON.stringify({
       tag: el.tagName.toLowerCase(), selector: sel,
@@ -9963,7 +10003,9 @@ function _renderPickPanel(vp, bar, hint, info) {
     const lines = [
       "我在预览里点选了这个元素，请针对**它**改（只动这个元素 / 它的组件，别动别处）：",
       "· 元素：" + (info.selector || info.tag) + (info.text ? "（文字：" + info.text + "）" : ""),
-      (info.source && info.source.file ? "· 源码位置：" + info.source.file + ":" + info.source.line : ""),
+      (info.source && info.source.file
+        ? "· **源码位置：" + info.source.file + ":" + info.source.line + "** ← 直接打开这个文件、读它、改**这一处**的源码（JSX/模板结构 + 引用设计 token / Tailwind 类），别盲写内联样式或全局 CSS 去猜"
+        : "· （没解析到源码位置——用下面的选择器 + 现状样式在源码里搜到这个元素再改，别凭肉眼猜数值）"),
       "· 现状样式：颜色 " + info.color + " / 背景 " + info.background + " / 字号 " + info.fontSize + " 字重 " + info.fontWeight + " / 内边距 " + info.padding + " / 圆角 " + info.borderRadius + " / 尺寸 " + info.size,
       "· HTML：" + (info.outerHTML || ""),
       "",
@@ -11112,6 +11154,23 @@ function _looksBugFixTask(text) {
     || /(报错了|抛异常|stack\s*trace|traceback|undefined is not|cannot read|null\s*pointer|segfault|panic|nullpointer|为什么.{0,10}(不|没|报错|崩|失败|不对)|怎么.{0,6}(不|没|报错|崩|失败|不对|修))/i.test(t)
     || /(这个|该|此|帮我|给我)?\s*(bug|报错|崩溃|闪退|异常)\b|修\s*bug|de\s*bug|有个?\s*(bug|问题|错误)|出\s*(bug|问题|错)/i.test(t);
 }
+// 快速/对话式请求：就问一句，或让你做一件明确的小事。这种应该"答完 / 做完那一件事就停"，
+// 别自作主张升级成"读一堆文件 + 列计划 + 多步自动化"的长跑（用户抱怨的"需求不是让你一直跑
+// 你就一直跑"）。凡是带真·多步意图（搭建/重构/实现/修 bug/整套…）的一律不算 quick——宁可
+// 偶尔多跑几步，也别把真任务提前停掉。
+function _looksQuickAsk(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 240) return false;                          // 长 brief ⇒ 不是 quick
+  if (_looksUIBuildTask(t) || _looksBugFixTask(t)) return false;    // 真·搭建 / 修 bug
+  if (/(重构|重写|实现|搭建|迁移|整套|全部|批量|逐个|所有|整个|refactor|rewrite|implement|build|migrate|overhaul|revamp)/i.test(t)) return false; // 明确多步动作
+  //涉及项目 / 多文件 / 代码库范围 ⇒ 要真的探索，绝不是 quick（"看一下我的项目"曾被误判为 quick→5 步→做样子）
+  if (/项目|工程|代码库|整个|整体|这些|这几个|各个|目录|文件夹|架构|梳理|剖析|摸清|通读|排查|审查|分析一下|优化一下|codebase|repo|architecture/i.test(t)) return false;
+  const isQuestion = /[?？]\s*$/.test(t)
+    || /^(what|why|how|when|where|who|which|is|are|can|does|do|should|explain|tell me)\b/i.test(t)
+    || /(为什么|为啥|是什么|什么意思|这是啥|怎么回事|是不是|对不对|能不能|可不可以|讲讲|解释|说明一下|看一下|看下|是干嘛|干什么用|有什么用|啥意思)/.test(t);
+  const tinyAction = /^(把|将|帮我|给我)?[^。.\n]{0,40}(改成|改为|换成|重命名|删掉|删除|加一行|加个注释|注释掉|格式化|rename|delete|remove|改个|改一下)[^。.\n]{0,24}$/i.test(t);
+  return isQuestion || tinyAction;
+}
 const _DEBUG_FLOW = `\n\n🐞 **修 Bug 任务——按这套硬流程来，别"改一下试试"瞎猜乱改**：
 ① **先复现 + 拿到真错**：找到触发路径，拿到**真实的报错全文 / 调用栈 / 控制台日志**（前端 bug：用 browser 打开页面、跑用户那条操作、读 console 报错；服务端：run_cmd 跑起来看输出；有测试就跑）。**没亲眼看到真实错误信息之前，绝不动手改。**
 ② **拉全上下文再下结论**：read_file 把**报错点文件 + 它的调用方 + 它调用的定义**都读全（search / lsp_definition / lsp_references 顺藤摸瓜），理清数据从哪来到哪去——bug 常在"中间环节"，只盯报错那一行容易改错地方。
@@ -11544,7 +11603,11 @@ function _trimMessagesIfHuge(messages) {
   for (const m of messages) total += _msgSize(m);
 
   // Hard payload guard: accumulated screenshots can push past the gateway's limit.
-  const PAYLOAD_CAP = 1_200_000;
+  // 4MB (was 1.2MB — a SINGLE 4K screenshot is 3-8MB base64, so a normal attached image
+  // got silently stripped before the model ever saw it → "读不懂图片"). Pasted images are
+  // now downscaled to ≤1568px (~300KB) on capture, so this only trips on many-image turns,
+  // and strips OLDEST-first to keep the most recent screenshot the model needs.
+  const PAYLOAD_CAP = 4_000_000;
   if (total > PAYLOAD_CAP) {
     for (let i = 0; i < messages.length && total > PAYLOAD_CAP; i++) {
       const m = messages[i];
@@ -12484,6 +12547,20 @@ const _SUBAGENT_SYSTEM = _P("subagent_system", `你是只读调研子智能体�
  * sub-agents read-only (no writes, no cmd, no nested sub-agents) makes them safe
  * to delegate big investigation chunks to without runaway recursion or edits.
  */
+// 真·多智能体上下文协议：把 run 上的共享上下文（run.ctx = 主循环的运行草稿纸）渲染成一段
+// 开局摘要塞给子智能体/worker，让它**站在主智能体已有的进度上**干活——知道总目标、已读过哪些
+// 文件、已改了什么、已知的关键发现——不必从零重查、也不会跟主智能体的判断跑偏。空 → "".
+function _sharedCtxDigest(ctx) {
+  if (!ctx) return "";
+  const p = [];
+  if (ctx.goal) p.push(`· 总目标：${ctx.goal}`);
+  if (ctx.done && ctx.done.length) p.push(`· 主智能体已完成：${ctx.done.slice(-8).join(" → ")}`);
+  if (ctx.modified && ctx.modified.size) p.push(`· 已改的文件：${[...ctx.modified].map(([f, d]) => `${f}(${d})`).join("、")}`);
+  if (ctx.filesRead && ctx.filesRead.size) p.push(`· 已读过（不必重读，除非你要改它）：${[...ctx.filesRead].slice(-40).join("、")}`);
+  if (ctx.findings && ctx.findings.length) p.push(`· 已知关键发现：${ctx.findings.slice(-8).join("；")}`);
+  if (ctx.errors && ctx.errors.length) p.push(`· 当前未解决的错误：${ctx.errors.slice(-3).join("；")}`);
+  return p.length ? `【主智能体已经掌握的上下文——直接接着用，别从零重查】\n${p.join("\n")}` : "";
+}
 async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], depth = 1 }) {
   const _sess = run && run.session;
   const _live = () => !_sess || _sess.streaming;
@@ -12503,6 +12580,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   container.appendChild(card);
   const vp = card.querySelector(".atc-viewport");
   const res = card.querySelector(".atc-result");
+  // Auto-follow the sub-agent's OWN viewport as it streams: it's a 420px overflow:auto box, so
+  // _chatFollow on #chat can't reach inside it — the user had to mouse-wheel manually. Reuse
+  // _chatFollow's stick-to-bottom idea (only stick when near the bottom, so a scroll-up to read
+  // isn't yanked back), and only while the card is expanded (is-open); collapsed → never scroll.
+  let _vpPinned = true;
+  vp.addEventListener("scroll", () => { _vpPinned = (vp.scrollHeight - vp.scrollTop - vp.clientHeight) < 60; }, { passive: true });
+  try {
+    new MutationObserver(() => { if (_vpPinned && card.classList.contains("is-open")) vp.scrollTop = vp.scrollHeight; })
+      .observe(vp, { childList: true, subtree: true, characterData: true });
+  } catch {}
   _chatFollow();
 
   // Worker guards: read-only parent modes can't spawn a writing worker (else it'd
@@ -12529,17 +12616,29 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const sysPrompt = (write
     ? _WORKER_SYSTEM + `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`
     : _SUBAGENT_SYSTEM) + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
-  const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: prompt }];
+  // Context IN: prepend the shared run-context digest so this child stands on what the main
+  // agent already learned/did (真·上下文协议) instead of re-investigating from zero.
+  const _shared = _sharedCtxDigest(run && run.ctx);
+  const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: (_shared ? _shared + "\n\n——————\n\n" : "") + prompt }];
+  // Sub-agents now flexibly use the FULL capability-appropriate toolkit (not a crippled subset):
+  // read-only agents get EVERY investigation tool — lsp (跳定义/找所有调用方)、get_diagnostics
+  // (看真实报错)、semantic_search/find_symbol (按意图/符号找)、knowledge_search、browser——so a
+  // research child is genuinely thorough, not stuck on read_file+grep. Workers additionally get
+  // scoped writes PLUS run_cmd + diagnostics, so they can BUILD *and VERIFY* their own piece.
+  // Safety invariants kept: read-only agents get NO mutating type (truly can't change anything);
+  // workers' file writes stay scope-boxed; git-write and spawning further sub-agents stay OFF
+  // (no runaway recursion); everything still gated by the run's perm (approval) setting.
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "knowledge_search", "web_fetch", "web_search", "browser", "screenshot"];
+  const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "browser", "screenshot"];
   const _allow = write
-    ? ["read_file", "list_dir", "search", "find_files", "web_fetch", "web_search", "write_file", "edit_file", "multi_edit"]
-    : ["read_file", "list_dir", "search", "find_files", "web_fetch", "web_search", "browser", "screenshot"];
-  // 用全量 schema(true) 构建再按 _allow 过滤——否则 browser 等被关在 if(includeWrite) 里的工具
-  // 只读子智能体永远看不到(即便 _allow/_execTypes 已放行)，导致研究子智能体没 browser 只能退回
-  // web_fetch(SPA 抓空壳)。安全不变：能用啥仍由 _allow 决定，write/edit/cmd 不在 read-only _allow 里。
+    ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
+    : _READ_TOOLS;
+  // Build the full schema then filter by name — so a tool gated behind if(includeWrite) at build
+  // time (e.g. browser) is still visible to a read-only child that's allowed it.
   const toolSchemas = _buildAgentToolSchemas(true).filter((t) => _allow.includes(t.function.name));
   const _execTypes = write
-    ? ["read", "list", "search", "find", "web", "websearch", "write", "edit", "multiedit"]
-    : ["read", "list", "search", "find", "web", "websearch", "browser", "screenshot"];
+    ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
+    : _READ_TYPES;
   // Worker run context: inherit session + checkpoint (so edits are in the parent's
   // revert-all) + the user's approval setting, but tag it a worker with its scope so
   // _executeToolStep enforces the boundary. Read-only sub-agents reuse `run` as-is.
@@ -12574,6 +12673,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
         else { try { result = await _executeToolStep(step, call, root, execRun); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
         messages.push({ role: "tool", tool_call_id: tc.id, content: _toolResultToString(call, result).slice(0, 8000) });
+        // Context OUT: fold this child's reads/edits into the shared run-context so siblings +
+        // the main agent see them (siblings/parent skip re-reading; mutations surface in the
+        // main scratchpad automatically since it renders run.ctx).
+        if (run && run.ctx) {
+          const _ok = !/\[(失败|ERROR|BLOCKED|DENIED|不可用|未执行|权限问题|interrupted)\]/.test(String((result && result.content) || ""));
+          if (call.type === "read" && call.path && run.ctx.filesRead) run.ctx.filesRead.add(call.path);
+          else if (_ok && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path && run.ctx.modified) {
+            run.ctx.modified.set(String(call.path).split("/").pop(), write ? "worker改" : "改");
+          }
+        }
       }
       _trimMessagesIfHuge(messages);
     }
@@ -12590,6 +12699,13 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   res.textContent = `${toolCount} 步${write ? "（worker）" : "调研"}`;
   card.classList.remove("is-open");
   _chatFollow();
+  // Context OUT: fold this child's report into the shared findings so it integrates into the
+  // main agent's ongoing context (via its scratchpad) and later/sibling children can read it —
+  // instead of surviving only as the one ≤8000-char tool-result that gets compacted away.
+  if (run && run.ctx && Array.isArray(run.ctx.findings) && report && report.trim()) {
+    run.ctx.findings.push(`【${write ? "worker" : "子"}:${String(description || "").slice(0, 24)}】${report.replace(/\s+/g, " ").slice(0, 400)}`);
+    if (run.ctx.findings.length > 40) run.ctx.findings.splice(0, run.ctx.findings.length - 40);
+  }
   return report || (write ? "（worker 未产出简报）" : "（子智能体未产出简报）");
 }
 
@@ -12620,11 +12736,16 @@ async function _detectVerifyCmd(root) {
 // (OCR + layout + visual defects) as if it had eyes.
 function _modelSeesImages(id = "") {
   const s = String(id).toLowerCase();
-  // Conservative allowlist of known-multimodal families; anything else (deepseek,
-  // plain LLMs) is treated as text-only and goes through the bridge. Erring toward
-  // "text-only" only costs an extra transcription call — it still works; erring the
-  // other way would send an image a blind model silently drops (the bug we're fixing).
-  return /claude|gpt-4o|gpt-4\.1|gpt-4-?turbo|gpt-4-vision|gpt-5|chatgpt-4o|\bo[134]\b|gemini|qwen.*vl|qwen-?vl|glm-?4v|\bglm-4\.?\d*v|step-1v|yi-vision|internvl|llava|pixtral|llama.*vision|grok.*vision|minimax.*vl|kimi.*vl|doubao.*vision|abab.*vl|molmo|cogvlm|phi-3.*vision|phi-4.*vision/.test(s);
+  // Default TRUE — assume the model can SEE the image, and send the real image block.
+  // In 2026 nearly every frontier chat model is multimodal; the old narrow allowlist
+  // silently downgraded any unlisted-but-capable model (glm-4.6 / qwen-max / doubao /
+  // hunyuan / grok / a custom gateway alias …) to a LOSSY text transcription — that was
+  // the "多模态模型读不懂我发的图片" bug. Only route KNOWN text-only / non-chat models
+  // through the transcription bridge; sending an image to a truly-blind model just gets
+  // dropped upstream (no worse than before), while a real image to a capable model is
+  // vastly better than a paraphrase.
+  const textOnly = /deepseek-(chat|coder|reasoner|r1|prover|math|v2|v2\.5|v3)|(^|[^a-z0-9])o[13]-mini|text-embedding|(^|[^a-z])embedding|^text-|davinci|babbage|whisper|tts-|moderation|rerank|guard|codestral/i;
+  return !textOnly.test(s);
 }
 
 // Pick the cheapest available vision model from the admin-curated picker list to
@@ -13136,6 +13257,38 @@ async function _addRecordingExport(container, run, session) {
   } catch {}
 }
 
+// LLM intent ROUTER (Anthropic "Routing" pattern) — the MODEL classifies the request instead of
+// brittle keyword regex, so it's robust to any phrasing/language/compound ask. One cheap,
+// non-streaming, JSON-only call with a hard timeout; returns {kind,steps,needs_tools} or null
+// (caller falls back to the fast heuristic). Cost ≈ a few tokens; runs once per user turn.
+async function _classifyIntent(task, config) {
+  const t = String(task || "").trim();
+  if (!t || !config || !config.baseUrl) return null;
+  const sys = '给一个编码智能体的这条用户请求分类，只输出严格 JSON：{"kind":"answer"|"edit"|"project","steps":<1-60 预计自主步数>,"needs_tools":<true|false>}。'
+    + 'answer=纯问答/解释/闲聊，文字答完即止(steps 1-2)；但"这段有没有问题 / 为什么会崩 / 该怎么优化"这种要先读代码才答得好的，needs_tools=true、steps 8-15。'
+    + 'edit=一两处明确的小改动(steps 3-10)。'
+    + 'project=多步的活；尤其"找bug / 查漏洞 / 审查代码 / 安全审计 / 排查问题 / 整体优化 / 搭建 / 重构 / 实现"这类要深挖多步的，一律 project(steps 15-60)，绝不当成 answer 糊弄。'
+    + '只看请求本身、不臆测。只输出 JSON。';
+  try {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 9000) : null;
+    const res = await fetch(config.baseUrl.replace(/\/+$/, "") + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (config.apiKey || "") },
+      body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: t.slice(0, 2000) }], max_tokens: 100, temperature: 0, stream: false }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (to) clearTimeout(to);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const txt = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+    const j = _safeJsonLoose(txt);
+    if (!j || (j.kind !== "answer" && j.kind !== "edit" && j.kind !== "project")) return null;
+    let steps = Number(j.steps);
+    if (!(steps > 0)) steps = j.kind === "answer" ? 2 : j.kind === "edit" ? 8 : 40;
+    return { kind: j.kind, steps: Math.max(1, Math.min(60, Math.round(steps))), needs_tools: j.needs_tools !== false };
+  } catch { return null; }
+}
 async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // Enable extended thinking for models that support it (Claude / o-series) so the
@@ -13251,7 +13404,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Multi-agent review gate (Planner/Worker/Judge): before a SUBSTANTIAL change is
   // declared done, a fresh INDEPENDENT reviewer sub-agent audits the diff (no echo
   // chamber); only confirmed real issues are fed back to fix. Runs once.
-  let reviewGates = 0;
+  let reviewGates = 0, _reviewedAtImplOps = -1; // evaluator-optimizer: re-review only after NEW edits, so it converges instead of churning on an unchanged diff
   const _mutatedFiles = new Set();
   const _editCounts = new Map();   // path → how many times edited this run (churn detector)
   const _churnNudged = new Set();  // files we've already churn-warned (once each)
@@ -13261,7 +13414,30 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // budget (don't waste tokens on trivia); a "重构 / refactor / 实现整套 / build a
   // full X" gets a larger one (less mid-run scrambling for extensions).
   let budget = _initialBudget(task, _projectStack), extensions = 0;
+  // Intent ROUTING — the MODEL classifies this request, not brittle keyword regex. Fire it
+  // async: it overlaps the first model turn (~0 added latency) and resolves well before the
+  // stop/extend decisions. `_looksQuickAsk` is only the instant seed / fallback until then;
+  // run._intent (kind: answer|edit|project) is the real signal. Effort matches the ask —
+  // an "answer" answers-and-stops (Gate-D + extension exempt, no ballooning), a "project"
+  // grows the budget to the model's own scale.
+  run._intent = null;
+  const _quick = () => (run._intent ? run._intent.kind === "answer" : _looksQuickAsk(task));
+  _classifyIntent(task, config).then((r) => {
+    if (!r || !_live()) return;
+    run._intent = r;
+    // Recalibrate budget to the model's read of the task — GROW only (safe; the router resolves
+    // at iter 0-1). Fixes the over-correction: investigative asks now get room to actually dig.
+    if (r.kind === "project") budget = Math.max(budget, Math.min(_AGENT_HARD_CEIL, (r.steps || 20) * 2));
+    else if (r.kind === "edit") budget = Math.max(budget, 14);
+    else if (r.needs_tools) budget = Math.max(budget, 16); // "answer" that must read code (why/查/有没有问题) — not a shallow 5
+  }).catch(() => {});
   const _pad = { goal: (task || "").slice(0, 200), modified: new Map(), errors: [], findings: [], done: [] };
+  // 真·多智能体上下文协议：把这张运行草稿纸挂到 run 上（run 已经会传进每个子智能体/worker）。
+  // 于是子智能体开局就读得到「目标＋已读文件＋已改文件＋已知发现」(_sharedCtxDigest)，并把自己
+  // 读过/改过的文件与简报写回这里 → 主智能体的草稿纸(_padText)自动带上，兄弟/后续子智能体也看得到。
+  // 一个已存在、已传遍全场的对象（run）+ 在它上面读写 = 真正的共享上下文，不是空壳交接。
+  _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
+  run.ctx = _pad;
   function _padText() {
     if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length) return "";
     const parts = [`[运行进度草稿纸——你在长任务第 ${_pad._iter || 0} 步，这张纸帮你记住已做的事]`];
@@ -13290,7 +13466,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (Array.isArray(session._steerQueue) && session._steerQueue.length) {
         for (const s of session._steerQueue.splice(0)) messages.push({ role: "user", content: s });
       }
+      // Running self-memory (fixes "改完文件又改一遍"): just before each model turn, remind it —
+      // as an EPHEMERAL last message (highest attention) — which files it has ALREADY written/
+      // edited this run, so it treats them as done instead of re-creating / re-editing them.
+      // Spliced out right after the call (by identity, mutation-safe) so it never accumulates
+      // N copies or pollutes the replayed history. Only fires once ≥1 file has been changed.
+      let _selfMemMsg = null;
+      if (_mutatedFiles.size) {
+        const _seenRead = (run._readSeen && run._readSeen.size)
+          ? "；已读过（内容在上文，别整文件重读、要看某段用 offset/limit）：" + [...run._readSeen.keys()].map((p) => _normRel(p, root)).slice(-10).join("、")
+          : "";
+        _selfMemMsg = { role: "user", content: `〔进度自查·勿忘〕本次运行你**已经改好并落盘**这些文件（都是你上次编辑后的最新状态）：${[..._mutatedFiles].join("、")}。**别重复创建、别把同一处再改一遍**；要在其中某个继续改，先默认它已含你之前的改动（拿不准先 read_file 看最新内容再动）${_seenRead}。` };
+        messages.push(_selfMemMsg);
+      }
       const turn = await _agentModelTurn({ config, messages, toolSchemas, body, session, ideMode: "agent" });
+      if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
       if (turn.error) { finalErr = turn.error; break; }
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
 
@@ -13304,7 +13494,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // D — early-turn tool-first nudge: if the model just talks without calling
         // ANY tool in the first ~2 turns, that's the "too dumb" failure pattern — it
         // should be reading files / searching / planning, not writing prose. Force it.
-        if (iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
+        if (!_quick() && iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
           toolFirstNudges++;
           const _isUITask = _looksUIBuildTask(run._originalText || "");
           const _nudgeMsg = _isUITask
@@ -13351,22 +13541,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           messages.push({ role: "user", content: "你改了文件但还没验证。先用 run_cmd 跑相关的构建/测试/类型检查（如 npm run build、cargo check、pytest、tsc --noEmit），或用 get_diagnostics 看报错；确认通过后再收尾。若这个项目确实没有可跑的验证，简短说明原因即可。" });
           continue;
         }
-        // C — independent reviewer/judge gate: for a SUBSTANTIAL change (≥2 files),
-        // spawn a FRESH reviewer sub-agent to audit the diff before finishing. Only
-        // confirmed real issues block (it uses the high-precision reviewer discipline).
-        // "The lead only sees green-reviewed code." Runs once; bounded.
-        if (didMutate && _mutatedFiles.size >= 2 && reviewGates < 1 && _live() && run.mode === "agent") {
+        // C — independent reviewer gate = EVALUATOR-OPTIMIZER convergence loop: for a
+        // SUBSTANTIAL change (≥2 files), a FRESH reviewer sub-agent audits the diff before
+        // finishing; ISSUES → fix → the loop returns here and RE-reviews the NEW diff, until
+        // the reviewer says PASS or _AGENT_MAX_REVIEWS rounds. Re-reviews ONLY after new edits
+        // (_implOps grew) → converges, never churns on an unchanged diff. A separate agent =
+        // real external feedback, not the model self-grading. "The lead only sees green code."
+        if (didMutate && _mutatedFiles.size >= 2 && reviewGates < _AGENT_MAX_REVIEWS && _implOps > _reviewedAtImplOps && _live() && run.mode === "agent") {
           reviewGates++;
+          _reviewedAtImplOps = _implOps; // mark this diff reviewed; re-fire only after further edits
           let _diff = "";
           try { _diff = await backend.invoke("git_diff", { root, rel: null, staged: false }); } catch {}
           _diff = String(_diff || "").trim().slice(0, 9000);
           const _files = [..._mutatedFiles].join("\n");
-          const _revPrompt = "你是**独立代码审查员**（高精度：只报已证实为真、能构造出具体触发路径的确凿 bug；压制风格 / 命名 / 假设性 / 可有可无的「垃圾bug」）。审查**本次改动**有没有引入真问题：\n- 正确性：空值 / 越界 / 错误处理缺失 / 并发竞态 / 资源泄漏 / off-by-one / 契约不符。\n- 安全：注入(SQL/命令/XSS) / 越权 / SSRF / 路径穿越 / 硬编码密钥 / 不安全反序列化（用污点 source→sink 追踪）。\n用 read_file / search 把改动文件及其**定义与调用方**读全再下结论，每条问题给 位置 + 触发场景 + 修复。\n\n本次改动文件：\n" + _files + "\n\n" + (_diff ? "git diff（截断）:\n" + _diff : "（拿不到 diff，请直接 read_file 读上面文件审查改动）") + "\n\n**最后一行只输出一行**：\nVERDICT: PASS  （没有确凿问题）\n或\nVERDICT: ISSUES  （有确凿问题，已在上面逐条列出）";
+          const _revPrompt = "你是**独立代码审查员**（高精度：只报已证实为真、能构造出具体触发路径的确凿 bug；压制风格 / 命名 / 假设性 / 可有可无的「垃圾bug」）。审查**本次改动**有没有引入真问题：\n- 业务逻辑（最容易漏、重点看）：代码是否真做到了它**该做的事**——条件 / 计算 / 状态流转 / 边界业务规则是否符合意图与需求，有没有漏一个 case、跟注释 / 测试 / 需求不一致。\n- 正确性：空值 / 越界 / 错误处理缺失 / 并发竞态 / 资源泄漏 / off-by-one / 契约不符。\n- 安全：注入(SQL/命令/XSS) / 越权 / SSRF / 路径穿越 / 硬编码密钥 / 不安全反序列化（用污点 source→sink 追踪）。\n用 read_file / search 把改动文件及其**定义与调用方**读全再下结论，每条问题给 位置 + 触发场景 + 修复。\n\n本次改动文件：\n" + _files + "\n\n" + (_diff ? "git diff（截断）:\n" + _diff : "（拿不到 diff，请直接 read_file 读上面文件审查改动）") + "\n\n**最后一行只输出一行**：\nVERDICT: PASS  （没有确凿问题）\n或\nVERDICT: ISSUES  （有确凿问题，已在上面逐条列出）";
           let _rep = "";
           try { _rep = await _runSubAgent({ config, description: "独立审查改动", prompt: _revPrompt, root, container: body, run }); } catch { _rep = ""; }
           if (/VERDICT:\s*ISSUES/i.test(_rep || "")) {
             const _body = String(_rep).replace(/VERDICT:\s*ISSUES[\s\S]*$/i, "").replace(/VERDICT:\s*PASS[\s\S]*$/i, "").trim();
-            messages.push({ role: "user", content: "**独立审查发现本次改动有确凿问题**（见下）。请逐条核实并修复，改完再验证一次（run_cmd / get_diagnostics），别带着已知 bug 收尾：\n\n" + (_body || _rep) });
+            messages.push({ role: "user", content: "**独立审查发现本次改动有确凿问题**（见下）。请逐条核实并修复，改完再验证一次（run_cmd / get_diagnostics）——**改完我会让审查员复审一遍**，别带着已知 bug 收尾：\n\n" + (_body || _rep) });
             continue;
           }
           // PASS / 无法解析 / 子智能体失败 → 不阻塞，继续收尾。
@@ -13771,6 +13964,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (it.tc.name === "update_plan") {
           planSteps = run._planSteps || it.call.steps;
           if (Array.isArray(planSteps)) {
+            // Budget from the model's OWN decomposition (not a regex guess): a bigger plan ⇒ more
+            // room to finish autonomously; a tiny plan stays tight. The plan IS the complexity signal.
+            if (planSteps.length && !_quick()) budget = Math.max(budget, Math.min(_AGENT_HARD_CEIL, planSteps.length * 2 + 8));
             _pad.done = planSteps.filter(s => s.status === "completed").map(s => s.title || s.description || "step").map(s => s.slice(0, 40));
           }
         }
@@ -13886,12 +14082,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (iter === budget - 1 && extensions < _AGENT_MAX_EXTENSIONS && budget < _AGENT_HARD_CEIL && _live()) {
         const recent = _callLog.slice(-6);
         const recentFails = recent.filter((e) => e.failed).length;
-        const flailing = stuckNudges >= 3 || recentFails >= 5; // only stop extending when it's truly stuck-looping
+        // stuckNudges is capped at 2 (above), so the old `>= 3` was DEAD CODE → a run that kept
+        // "succeeding" at pointless repeats never flailed and extended to the 300 ceiling ("全面
+        // 死循环"). Use `>= 2`, and treat repeating the SAME call 4+ times as flailing too.
+        const _sigs = recent.map((e) => e.sig);
+        const spinning = _sigs.length >= 4 && new Set(_sigs).size <= 1;
+        const flailing = stuckNudges >= 2 || recentFails >= 5 || spinning;
+        // PROGRESS GATE: only extend if this window ACTUALLY advanced state (new files mutated or
+        // new plan steps completed) since the last extension — otherwise a run that just re-reads
+        // / re-plans without progress livelocks to 300. This is the real "死循环" brake.
+        const _doneSteps = Array.isArray(planSteps) ? planSteps.filter((s) => s.status === "completed").length : 0;
+        const _progress = _mutatedFiles.size + _doneSteps;
+        const madeProgress = _progress > (run._lastProgressMark || 0);
+        run._lastProgressMark = _progress;
         const pendingPlan = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
-        // Reaching the budget at all means the model never voluntarily stopped → it STILL
-        // has work. Keep extending so it finishes on its own (the user's "一直自动做下去"),
-        // as long as it's not flailing. recentFails<=1 = productively working, not spinning.
-        const moreToDo = pendingPlan || (didMutate && !didVerify) || recentFails <= 1;
+        // Reaching the budget means the model never voluntarily stopped → likely more to do,
+        // but REQUIRE forward motion to keep extending so it can't spin forever.
+        const moreToDo = (pendingPlan || (didMutate && !didVerify) || recentFails <= 1) && madeProgress;
         if (moreToDo && !flailing) {
           extensions++;
           budget = Math.min(budget + _AGENT_EXT_STEP, _AGENT_HARD_CEIL);
@@ -13933,7 +14140,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       note.textContent = "⚠️ " + finalErr;
       body.appendChild(note);
     }
-    if (!finalErr && summaryText) session.history.push({ role: "assistant", content: summaryText });
+    // Persist this run's assistant narrative + WHAT IT DID (files changed), ALWAYS — even on
+    // error / cap — so the next send continues with real context instead of restarting cold
+    // ("上下文挂不上、一直从头走"). summaryText already accumulates every assistant prose turn
+    // (see line ~13309). Text-only (no tool_calls / tool-role messages) so history stays safe
+    // for compaction + replay. The triggering user turn was already persisted before the run.
+    try {
+      const _parts = [];
+      if (summaryText && summaryText.trim()) _parts.push(summaryText.trim());
+      if (_mutatedFiles && _mutatedFiles.size) _parts.push(`〔本轮改动的文件：${[..._mutatedFiles].join("、")}〕`);
+      if (finalErr) _parts.push(`〔本轮中断/报错：${finalErr}〕`);
+      const _record = _parts.join("\n\n").trim();
+      if (_record) session.history.push({ role: "assistant", content: _record });
+    } catch {
+      if (!finalErr && summaryText) { try { session.history.push({ role: "assistant", content: summaryText }); } catch {} }
+    }
     saveChatHistory(); // CRITICAL: the agent path never persisted — agent chats were lost on reopen. Save now (also captures the rendered transcript snapshot).
     // Offer to export a replayable recording of everything the agent just did.
     if (run.recording && run.recording.length >= 2) { try { _addRecordingExport(body, run, session); } catch {} }
@@ -15515,6 +15736,18 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "git") {
       const gitRoot = root || rootPath || workspaceRoots[0] || "";
       if (!gitRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "git", path: call.op, content: "[ERROR] 未打开工作区，无法执行 git。" }; }
+      // One repo-ness gate for every op except status (which reports is_repo itself). Without it,
+      // diff/log/commit/branch on a non-repo folder surface git's raw "Not a git repository. Use
+      // --no-index…" warning as if it were an error. Report it cleanly — it's a state, not a failure.
+      if (call.op !== "status") {
+        let _isRepo = true;
+        try { const _st = await backend.invoke("git_status", { root: gitRoot }); _isRepo = !!(_st && _st.is_repo); } catch { _isRepo = false; }
+        if (!_isRepo) {
+          res.className = "atc-result atc-result--err"; res.textContent = "非 git 仓库";
+          if (vp) vp.innerHTML = `<pre>(not a git repo)</pre>`;
+          return { type: "git", path: call.op, content: `当前工作区「${gitRoot}」不是 git 仓库（没有 .git），无法 git ${call.op}。这不是报错，只是该项目还没纳入版本控制——需要的话先在该目录执行 \`git init\`。` };
+        }
+      }
       const mutating = call.op === "commit" || call.op === "push" || call.op === "pull" || call.op === "stash" || call.op === "stash_pop" || (call.op === "branch" && !!call.branch);
       if (readOnlyMode && mutating) {
         const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
@@ -19632,7 +19865,7 @@ $("tabExplorer").addEventListener("click", () => showSide("explorer"));
 $("tabGit").addEventListener("click", () => showSide("git"));
 $("tabOutline").addEventListener("click", () => showSide("outline"));
 $("tabTest").addEventListener("click", () => showSide("test"));
-$("gitRefreshBtn").addEventListener("click", () => refreshGitStatus());
+$("gitRefreshBtn").addEventListener("click", () => { refreshGitStatus().catch((e) => console.warn("[git] refresh failed:", e)); });
 $("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
 $("gitBranchBtn").addEventListener("click", (e) => {
@@ -20090,6 +20323,40 @@ function _refreshImagePreviews() {
   if (_pastedImages.length === 0) container.remove();
 }
 
+// Downscale a pasted/dropped image so vision models actually get a clean, in-budget
+// image. Frontier models internally resize to ~1.15MP anyway, and a raw 4K screenshot
+// (5-10MB base64) trips the payload cap and gets stripped ("读不懂图片"). Cap the long
+// edge at 1568px (Claude's text-optimal tile) → keep PNG when it stays small (crisp text),
+// else JPEG. Small images pass through untouched (best fidelity). Never throws.
+function _downscaleImageForVision(dataUrl, maxDim = 1568) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+          const long = Math.max(w, h);
+          if (!long) return resolve(dataUrl);
+          // Already small enough → keep original bytes.
+          if (long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
+          const scale = long > maxDim ? maxDim / long : 1;
+          const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+          const cv = document.createElement("canvas");
+          cv.width = cw; cv.height = ch;
+          const cx = cv.getContext("2d");
+          cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high";
+          cx.drawImage(img, 0, 0, cw, ch);
+          let out = cv.toDataURL("image/png");
+          if (out.length > 1_500_000) out = cv.toDataURL("image/jpeg", 0.9); // bound big/photographic
+          resolve(out && out.length < String(dataUrl).length ? out : dataUrl);
+        } catch { resolve(dataUrl); }
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    } catch { resolve(dataUrl); }
+  });
+}
+
 promptEl.addEventListener("paste", (e) => {
   const items = e.clipboardData?.items;
   if (!items) return;
@@ -20100,9 +20367,11 @@ promptEl.addEventListener("paste", (e) => {
       if (!file) continue;
       const reader = new FileReader();
       reader.onload = () => {
-        _pastedImages.push({ dataUrl: reader.result, type: file.type, name: file.name || "image.png" });
-        _refreshImagePreviews();
-        showToast("Image attached");
+        _downscaleImageForVision(reader.result).then((du) => {
+          _pastedImages.push({ dataUrl: du, type: file.type, name: file.name || "image.png" });
+          _refreshImagePreviews();
+          showToast("Image attached");
+        });
       };
       reader.readAsDataURL(file);
       return;
@@ -20119,9 +20388,11 @@ promptEl.parentElement.addEventListener("drop", (e) => {
     if (file.type.startsWith("image/")) {
       const reader = new FileReader();
       reader.onload = () => {
-        _pastedImages.push({ dataUrl: reader.result, type: file.type, name: file.name });
-        _refreshImagePreviews();
-        showToast(`Image attached: ${file.name}`);
+        _downscaleImageForVision(reader.result).then((du) => {
+          _pastedImages.push({ dataUrl: du, type: file.type, name: file.name });
+          _refreshImagePreviews();
+          showToast(`Image attached: ${file.name}`);
+        });
       };
       reader.readAsDataURL(file);
     } else if (file.size < 100000) {

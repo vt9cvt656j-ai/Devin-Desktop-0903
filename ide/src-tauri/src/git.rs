@@ -38,10 +38,18 @@ pub struct GitStatus {
 }
 
 fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    crate::process_util::command("git")
+    // Resolve `git` through the augmented PATH (Homebrew /opt/homebrew/bin, /usr/local/bin,
+    // Xcode) and pass that PATH to the child — so a Finder/Dock-launched app (whose inherited
+    // PATH is the minimal /usr/bin:/bin) can still FIND git AND its credential helper
+    // (git-credential-osxkeychain). Every other subprocess (lsp/dap/capture) already does this;
+    // run_git was the one git-critical caller spawning bare "git" → commit/push "传不过去" on
+    // Macs where git lives only under Homebrew.
+    let git = crate::process_util::resolve_command("git", Some(root));
+    crate::process_util::command(&git)
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("PATH", crate::process_util::augmented_path(Some(root)))
         // Never block waiting for an interactive credential prompt — fail fast
         // instead. This keeps network commands like `git push` from hanging
         // indefinitely on an auth prompt when no credential helper is set.
@@ -211,6 +219,10 @@ pub fn git_diff(root: String, rel: Option<String>, staged: Option<bool>) -> Resu
         Ok(text)
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let low = err.to_lowercase();
+        if low.contains("not a git repository") || low.contains("--no-index") {
+            return Err("当前目录不是 Git 仓库（没有 .git）。要用版本控制先在此目录执行 `git init`。".into());
+        }
         Err(if err.is_empty() {
             "git diff failed".into()
         } else {

@@ -147,6 +147,9 @@ async function createTermTab() {
     const finishInit = () => {
       if (initDone) return;
       term.reset();
+      // Replay any output buffered during the 1.5 s startup window so shell
+      // welcome messages / motd / early errors are not swallowed.
+      if (initBuffer) term.write(initBuffer);
       term.write("\x1b[0m\x1b[?25h");
       initDone = true;
       if (entry.backendId != null) {

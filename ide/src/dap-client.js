@@ -58,7 +58,7 @@ export function createDapManager(options) {
 
   // ---- raw protocol I/O ----
   function sendRequest(command, args) {
-    if (!session) return Promise.resolve(null);
+    if (!session) return Promise.reject(new Error("DAP session not connected"));
     const seq = session.seq++;
     const msg = { seq, type: "request", command, arguments: args || {} };
     return new Promise((resolve) => {

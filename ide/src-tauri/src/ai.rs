@@ -644,11 +644,22 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     let host = parsed.host_str().ok_or("URL 缺少主机名")?.to_string();
     let port = parsed.port_or_known_default().unwrap_or(80);
 
-    // Resolve and require every resolved address to be public (SSRF guard).
-    let addrs: Vec<_> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS 解析失败: {e}"))?
-        .collect();
+    // Resolve and require every resolved address to be public (SSRF guard). getaddrinfo is
+    // BLOCKING — on Windows a degraded network makes it serially probe DNS→LLMNR→NetBIOS and
+    // block 10-30s+, which (run directly on a Tokio worker) freezes that thread and can starve
+    // the whole IPC/UI ("联网搜索卡死"). Run it on a blocking thread with a hard 5s cap so a
+    // wedged resolver can never freeze the app.
+    let host_c = host.clone();
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            (host_c.as_str(), port).to_socket_addrs().map(|it| it.collect::<Vec<_>>())
+        }),
+    )
+    .await
+    .map_err(|_| "DNS 解析超时（网络异常，请重试）".to_string())?
+    .map_err(|_| "DNS 解析任务失败".to_string())?
+    .map_err(|e| format!("DNS 解析失败: {e}"))?;
     if addrs.is_empty() {
         return Err("无法解析主机".into());
     }
@@ -663,7 +674,9 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     // follow it (which re-runs ip_fetch_allowed on the new URL).
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(6)) // fail fast on a SYN black-hole (Windows)
         .timeout(std::time::Duration::from_secs(15))
+        .no_proxy() // never block on system-proxy/WPAD discovery
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -832,7 +845,9 @@ async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
     // 1) html.duckduckgo.com — richest snippets.
     for ua in UAS {
         if let Ok(client) = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(6))
             .timeout(std::time::Duration::from_secs(15))
+            .no_proxy()
             .build()
         {
             if let Ok(resp) = client
@@ -858,7 +873,9 @@ async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
     );
     for ua in UAS {
         if let Ok(client) = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(6))
             .timeout(std::time::Duration::from_secs(15))
+            .no_proxy()
             .build()
         {
             if let Ok(resp) = client
@@ -880,7 +897,9 @@ async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
     // 3) lite.duckduckgo.com — much lighter HTML, rarely blocked.
     for ua in UAS {
         if let Ok(client) = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(6))
             .timeout(std::time::Duration::from_secs(15))
+            .no_proxy()
             .build()
         {
             if let Ok(resp) = client

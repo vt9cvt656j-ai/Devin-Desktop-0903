@@ -61,6 +61,10 @@ function matchRustc(text) {
       cur = null;
     }
   }
+  // Defensive: if the last head had no matching loc line (truncated output),
+  // don't let it pollute a future call's state — cur is a local, but hygiene
+  // guarantees the dangling reference is dropped here explicitly.
+  cur = null;
   return out;
 }
 
