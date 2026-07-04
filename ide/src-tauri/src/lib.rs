@@ -33,6 +33,7 @@ fn cleanup_stale(
     term.reset_all();
     lsp.stop_all();
     dap.stop_all();
+    mcp::stop_all(); // MCP uses a global session map (not Tauri State) — reap it too on reload
 }
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -246,6 +247,7 @@ pub fn run() {
                 handle.state::<terminal::TerminalState>().reset_all();
                 handle.state::<lsp::LspManager>().stop_all();
                 handle.state::<debug::DebugManager>().stop_all();
+                mcp::stop_all(); // reap MCP servers on quit (global map, not Tauri State)
             }
         });
 }

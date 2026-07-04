@@ -27,8 +27,32 @@ struct Session {
     next_id: u64,
 }
 
+impl Drop for Session {
+    // Reap the child on ANY removal from the map (disconnect / same-name replace / dead-eviction /
+    // stop_all), so a wedged or forgotten MCP server never orphans its process + reader thread.
+    // Killing the child closes its stdout → the reader thread's `lines()` returns None → it exits.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Kill + reap ALL connected MCP servers. Wired into `cleanup_stale` (webview reload) and the app
+/// Exit handler in lib.rs — same as LSP/DAP/Terminal — so MCP children never survive a reload or a
+/// quit. Drains + drops on a detached thread (each `Session::drop` does kill()+blocking wait()) so a
+/// slow-dying server can't stall the caller.
+pub fn stop_all() {
+    let drained: Vec<Session> = match SESSIONS.lock() {
+        Ok(mut guard) => guard.drain().map(|(_, v)| v).collect(),
+        Err(_) => return,
+    };
+    if !drained.is_empty() {
+        std::thread::spawn(move || drop(drained));
+    }
+}
 
 #[derive(Serialize)]
 pub struct McpTool {
@@ -219,11 +243,24 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
         let session = guard
             .get_mut(&name)
             .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
-        let result = session.request(
+        let req = session.request(
             "tools/call",
             json!({ "name": tool, "arguments": args.unwrap_or(json!({})) }),
             60,
-        )?;
+        );
+        // If the call failed AND the server process has actually exited, evict the session so its
+        // child + reader thread are reaped now (Session::drop) instead of lingering forever; a later
+        // reconnect respawns cleanly. A mere slow-tool timeout on a still-alive server is kept.
+        let dead = req.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+        let result = match req {
+            Ok(r) => r,
+            Err(e) => {
+                if dead {
+                    guard.remove(&name);
+                }
+                return Err(e);
+            }
+        };
 
         // Flatten the content blocks into text.
         let mut text = String::new();

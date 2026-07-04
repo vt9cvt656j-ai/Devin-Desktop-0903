@@ -1,27 +1,75 @@
 //! Shared utilities for LSP and DAP child process management.
 
-/// Build a PATH that includes the workspace's `node_modules/.bin` plus common
-/// toolchain directories so project-local and user-installed tools resolve
-/// even when the app is launched from a GUI with a minimal PATH.
+/// The user's REAL login-shell PATH, captured ONCE (cached). A GUI-launched app inherits a
+/// minimal PATH that misses everything a version manager sets up in `.zshrc`/`.zprofile` —
+/// nvm's `~/.nvm/versions/node/<v>/bin`, volta, pyenv, asdf shims, a custom `npm -g` prefix,
+/// pipx, etc. So a language server the user (or the AI) installed is invisible → false "缺少
+/// 语言服务器" prompts and installs that "succeed" but still can't be found. Running the login
+/// shell and reading its `$PATH` makes the IDE resolve exactly what the user's terminal does.
+#[cfg(not(windows))]
+fn login_shell_path() -> &'static str {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        // Run in a thread with a timeout so a slow/pathological rc file can never wedge the app.
+        // Wrap $PATH in markers so any `.zshrc` echo/MOTD noise is trivially stripped. `-l -i -c`
+        // sources login + interactive rc (where version managers live). `command printf` dodges
+        // aliases/functions named printf.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&shell)
+                .args(["-lic", "command printf '__WP__%s__WP__' \"$PATH\""])
+                .output();
+            let _ = tx.send(out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default());
+        });
+        let raw = rx.recv_timeout(std::time::Duration::from_millis(4000)).unwrap_or_default();
+        match (raw.find("__WP__"), raw.rfind("__WP__")) {
+            (Some(a), Some(b)) if b > a + 6 => {
+                let p = &raw[a + 6..b];
+                if p.contains('/') { p.to_string() } else { String::new() }
+            }
+            _ => String::new(),
+        }
+    })
+}
+
+/// Build a PATH that includes the workspace's `node_modules/.bin` + a Python venv + common
+/// toolchain directories + the user's real login-shell PATH, so project-local and user-installed
+/// tools resolve even when the app is launched from a GUI with a minimal PATH.
 #[cfg(not(windows))]
 pub fn augmented_path(workspace: Option<&str>) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
         parts.push(format!("{ws}/node_modules/.bin"));
+        parts.push(format!("{ws}/.venv/bin")); // python venv (pyright/pylsp installed here)
+        parts.push(format!("{ws}/venv/bin"));
     }
     parts.push(format!("{home}/.cargo/bin"));
     parts.push("/opt/homebrew/bin".into());
     parts.push("/usr/local/bin".into());
     parts.push(format!("{home}/go/bin"));
-    parts.push(format!("{home}/.local/bin"));
+    parts.push(format!("{home}/.local/bin")); // pipx, pip --user
+    parts.push(format!("{home}/.bun/bin"));
+    parts.push(format!("{home}/.deno/bin"));
+    parts.push(format!("{home}/.volta/bin"));
+    parts.push(format!("{home}/.npm-global/bin")); // common custom `npm config set prefix`
     parts.push("/usr/bin".into());
     parts.push("/bin".into());
     let extra = parts.join(":");
-    match std::env::var("PATH") {
-        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
-        _ => extra,
+    // Append the user's real login-shell PATH (covers nvm/pyenv/asdf/custom prefixes we can't
+    // hardcode), then the minimal inherited PATH as a final fallback.
+    let mut all = extra;
+    let shell = login_shell_path();
+    if !shell.is_empty() {
+        all = format!("{all}:{shell}");
     }
+    if let Ok(p) = std::env::var("PATH") {
+        if !p.is_empty() {
+            all = format!("{all}:{p}");
+        }
+    }
+    all
 }
 
 /// Resolve a command name to its full path using the augmented PATH.

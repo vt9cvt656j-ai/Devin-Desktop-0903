@@ -31,3 +31,10 @@ yarn-error.log*
 !.vscode/settings.json
 !.vscode/launch.json
 !.vscode/tasks.json
+
+# build artifacts + editor backups (added for CI packaging, 2026-07-04)
+*.bak
+/*.dmg
+.michael-images/
+ide/src/_serve.mjs
+ide/src/*-test.html

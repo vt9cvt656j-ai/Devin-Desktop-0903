@@ -809,14 +809,22 @@ pub async fn web_search(query: String) -> Result<String, String> {
     // limited / blocked a lot, which is exactly why search "搜不到". Now we try the
     // html endpoint then fall back to the lite endpoint (lighter, far less blocked),
     // each with a rotated UA, returning the first non-empty result set.
-    let mut results = ddg_search_multi(q).await;
-    if results.is_empty() {
-        // The bare HTTP scrape got blocked (anti-bot walls fingerprint reqwest's
-        // TLS / reject its UA). Fall back to a REAL headless-browser render — the
-        // agent's own Chrome does the search (real TLS fingerprint + JS + UA), which
-        // gets through where the scrape can't. This is "让智能体操控搜索".
-        results = browser_render_search(q).await;
-    }
+    // Hard OVERALL deadline: a wedged network or a run of blocked engines must never hang the
+    // agent turn. The fast scrape race (~8s cap) → headless-browser fallback all live inside 30s;
+    // if even that blows through, return "no results" so the agent gets a graceful message, not a
+    // frozen tool call.
+    let results = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut r = ddg_search_multi(q).await;
+        if r.is_empty() {
+            // The bare HTTP scrape got blocked (anti-bot walls fingerprint reqwest's TLS / reject
+            // its UA). Fall back to a REAL headless-browser render — the agent's own Chrome does the
+            // search (real TLS fingerprint + JS + UA), getting through where the scrape can't.
+            r = browser_render_search(q).await;
+        }
+        r
+    })
+    .await
+    .unwrap_or_default();
     if results.is_empty() {
         return Ok(format!(
             "「{q}」这次没搜到结果（搜索引擎临时限流/反爬，或关键词太宽泛）。**别停在这里——主动操控浏览器自己搜**：① 换更具体的英文关键词，多调几次 web_search；② 用 browser navigate 打开 https://www.bing.com/search?q=... 或 https://duckduckgo.com/?q=... 亲自看结果、点进去用 browser/ web_fetch 读全文；③ 直接 web_fetch 你已知的官方文档 / 仓库 README / API 页读原文。至少换 2 个来源交叉验证再下结论。"
@@ -836,89 +844,89 @@ pub async fn web_search(query: String) -> Result<String, String> {
     Ok(out)
 }
 
-/// Try several DuckDuckGo endpoints / UAs, return the first non-empty result set.
+/// Race several search endpoints CONCURRENTLY and return the FIRST NON-EMPTY result set.
+/// The old code tried 6 attempts SEQUENTIALLY (html-DDG×2 UA → Bing×2 → lite×2), each with a
+/// 15s timeout, so a couple of slow/blocked engines stacked into ~90s of dead waiting — the
+/// "联网搜索卡顿/太久" the user hit. Racing means the tier finishes as soon as the fastest good
+/// source answers (typically 1-2s), hard-capped at the per-request 8s below.
 async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
-    const UAS: [&str; 2] = [
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    ];
-    // 1) html.duckduckgo.com — richest snippets.
-    for ua in UAS {
-        if let Ok(client) = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(6))
-            .timeout(std::time::Duration::from_secs(15))
-            .no_proxy()
-            .build()
-        {
-            if let Ok(resp) = client
-                .post("https://html.duckduckgo.com/html/")
-                .header(reqwest::header::USER_AGENT, ua)
-                .form(&[("q", q), ("kl", "wt-wt")])
-                .send()
-                .await
-            {
-                if let Ok(html) = resp.text().await {
-                    let r = parse_ddg_results(&html);
-                    if !r.is_empty() {
-                        return r;
-                    }
-                }
-            }
-        }
-    }
-    // 2) Bing — a DIFFERENT engine, so a DDG block falls through to it.
-    let bing_url = format!(
-        "https://www.bing.com/search?q={}&setlang=en",
-        urlencoding(q)
-    );
-    for ua in UAS {
-        if let Ok(client) = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(6))
-            .timeout(std::time::Duration::from_secs(15))
-            .no_proxy()
-            .build()
-        {
-            if let Ok(resp) = client
-                .get(&bing_url)
-                .header(reqwest::header::USER_AGENT, ua)
-                .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-                .send()
-                .await
-            {
-                if let Ok(html) = resp.text().await {
-                    let r = parse_bing(&html);
-                    if !r.is_empty() {
-                        return r;
-                    }
-                }
-            }
-        }
-    }
-    // 3) lite.duckduckgo.com — much lighter HTML, rarely blocked.
-    for ua in UAS {
-        if let Ok(client) = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(6))
-            .timeout(std::time::Duration::from_secs(15))
-            .no_proxy()
-            .build()
-        {
-            if let Ok(resp) = client
-                .post("https://lite.duckduckgo.com/lite/")
-                .header(reqwest::header::USER_AGENT, ua)
-                .form(&[("q", q)])
-                .send()
-                .await
-            {
-                if let Ok(html) = resp.text().await {
-                    let r = parse_ddg_lite(&html);
-                    if !r.is_empty() {
-                        return r;
-                    }
-                }
-            }
+    let mut racing: futures_util::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, String, String)>> + Send>>,
+    > = futures_util::stream::FuturesUnordered::new();
+    racing.push(Box::pin(scrape_ddg_html(q.to_string())));
+    racing.push(Box::pin(scrape_bing(q.to_string())));
+    racing.push(Box::pin(scrape_ddg_lite(q.to_string())));
+    while let Some(r) = racing.next().await {
+        if !r.is_empty() {
+            return r; // first engine to come back with results wins; losers are dropped
         }
     }
     Vec::new()
+}
+
+const SEARCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// A search should be fast; bound it much tighter than a page fetch. A source that hasn't
+/// answered in 8s is treated as blocked/dead so the race can settle on a working one.
+fn search_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
+        .no_proxy()
+        .build()
+        .ok()
+}
+
+async fn scrape_ddg_html(q: String) -> Vec<(String, String, String)> {
+    let client = match search_client() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .header(reqwest::header::USER_AGENT, SEARCH_UA)
+        .form(&[("q", q.as_str()), ("kl", "wt-wt")])
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.text().await.map(|h| parse_ddg_results(&h)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn scrape_bing(q: String) -> Vec<(String, String, String)> {
+    let client = match search_client() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let url = format!("https://www.bing.com/search?q={}&setlang=en", urlencoding(&q));
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, SEARCH_UA)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.text().await.map(|h| parse_bing(&h)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn scrape_ddg_lite(q: String) -> Vec<(String, String, String)> {
+    let client = match search_client() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let resp = client
+        .post("https://lite.duckduckgo.com/lite/")
+        .header(reqwest::header::USER_AGENT, SEARCH_UA)
+        .form(&[("q", q.as_str())])
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.text().await.map(|h| parse_ddg_lite(&h)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Last-resort search via a REAL headless-browser render (`chrome --dump-dom`).
@@ -940,7 +948,7 @@ async fn browser_render_search(q: &str) -> Vec<(String, String, String)> {
         let browser2 = browser.clone();
         let url2 = url.clone();
         let rendered = tokio::time::timeout(
-            std::time::Duration::from_secs(28),
+            std::time::Duration::from_secs(14), // was 28s ×2 targets = up to 56s; keep the fallback snappy
             tauri::async_runtime::spawn_blocking(move || render_dom(&browser2, &url2)),
         )
         .await;

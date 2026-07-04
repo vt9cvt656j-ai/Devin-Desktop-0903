@@ -29,11 +29,14 @@ import { createCommandPalette } from "./ext/palette.js";
 import { createExtensionsPanel } from "./ext/panel.js";
 import { t, initLocale, onLocaleChange, registerLocale, setLocale, applyToDOM } from "./i18n.js";
 import { load as loadStore } from "@tauri-apps/plugin-store";
+import { listen } from "@tauri-apps/api/event";
+import { join } from "@tauri-apps/api/path";
 import { registerSnippetProviders, setCustomSnippets } from "./snippets.js";
 import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
 import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
+import { ConversationMemory } from "./conversation-memory.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -253,25 +256,38 @@ async function tauriBackend() {
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
-      return core.invoke("ai_chat", { config, messages, onEvent: channel });
+      const p = core.invoke("ai_chat", { config, messages, onEvent: channel });
+      // Tauri never frees a Channel's callback on its own, so the onmessage closure (and everything
+      // it captures — the whole streaming render state) would leak once PER MESSAGE. The invoke
+      // resolves when the streamed turn ends, so drop the closure then.
+      const _free = () => { try { channel.onmessage = null; } catch {} };
+      p.then(_free, _free);
+      return p;
     },
     aiChatWithTools: (config, messages, tools, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
-      return core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
+      const p = core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
+      const _free = () => { try { channel.onmessage = null; } catch {} }; // release the per-turn streaming closure (see aiChat)
+      p.then(_free, _free);
+      return p;
     },
     aiComplete: (config, messages, maxTokens) =>
       core.invoke("ai_complete", { config, messages, maxTokens }),
     cancelAi: (requestId) => { try { return core.invoke("cancel_ai", { requestId }); } catch { return Promise.resolve(); } },
-    termOpen: (opts, onEvent) => {
+    termOpen: async (opts, onEvent) => {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
-      return core.invoke("term_open", {
+      const id = await core.invoke("term_open", {
         cwd: opts.cwd ?? null,
         cols: opts.cols,
         rows: opts.rows,
         onEvent: channel,
       });
+      // Return the channel too: closeTermTab nulls its callback so the captured xterm/entry can be
+      // GC'd. Tauri doesn't free Channel callbacks, so without this every terminal ever opened leaks
+      // its whole xterm instance.
+      return { id, channel };
     },
     termWrite: (id, data) => core.invoke("term_write", { id, data }),
     termResize: (id, cols, rows) => core.invoke("term_resize", { id, cols, rows }),
@@ -1077,7 +1093,7 @@ function mockBackend() {
         send("\x1b[2mSimulated shell — the native app runs your real shell via a PTY. Type 'help'.\x1b[0m\r\n\r\n");
         send(mockPrompt(cwd));
       }, 20);
-      return id;
+      return { id, channel: null }; // shape matches the real termOpen ({ id, channel })
     },
     termWrite: async (id, data) => mockTermInput(id, data),
     termResize: async () => {},
@@ -1103,6 +1119,16 @@ const tabsEl = $("tabs");
 const editorEl = $("editor");
 const welcomeEl = $("welcome");
 const chatEl = $("chat");
+// Delegated toggle for the reasoning ("思考过程") cards: ONE listener on the persistent chat
+// container handles every .think-card — live ones AND ones restored from an HTML snapshot (whose
+// per-element click listeners are LOST on innerHTML restore, so a restored card wouldn't expand).
+chatEl?.addEventListener("click", (e) => {
+  const t = e.target;
+  const head = t && t.closest ? t.closest(".think-head") : null;
+  if (!head) return;
+  const card = head.closest(".think-card");
+  if (card) card.dataset.open = card.dataset.open === "1" ? "0" : "1";
+});
 // Smart auto-scroll: follow new agent output ONLY while the user is pinned near the
 // bottom. If they scroll up to read, we stop forcing them down; when they scroll
 // back to the bottom, following resumes. (_chatFollow replaces blind scroll-to-end.)
@@ -2168,10 +2194,14 @@ function openSplitEditor(filePath) {
     guides: { indentation: true },
   });
 
-  wrap.addEventListener("mousedown", () => { splitState.focusedPane = "right"; updateSplitFocus(); });
-  $("editor").addEventListener("mousedown", () => { splitState.focusedPane = "left"; updateSplitFocus(); }, { once: false });
+  // One AbortController for the whole split session — the #editor mousedown and the window drag
+  // listeners live on PERSISTENT targets, so without this they'd stack on every open→close→reopen.
+  splitState.ac = new AbortController();
+  const _sig = splitState.ac.signal;
+  wrap.addEventListener("mousedown", () => { splitState.focusedPane = "right"; updateSplitFocus(); }, { signal: _sig });
+  $("editor").addEventListener("mousedown", () => { splitState.focusedPane = "left"; updateSplitFocus(); }, { signal: _sig });
 
-  initSashDrag(sash);
+  initSashDrag(sash, _sig);
 
   splitState.active = true;
   splitState.editor = ed;
@@ -2194,6 +2224,7 @@ function switchSplitFile(filePath) {
 
 function closeSplitEditor() {
   if (!splitState.active) return;
+  if (splitState.ac) { splitState.ac.abort(); splitState.ac = null; } // drop #editor + window drag listeners
   if (splitState.editor) splitState.editor.dispose();
   if (splitState.sash) splitState.sash.remove();
   if (splitState.wrap) splitState.wrap.remove();
@@ -2218,26 +2249,27 @@ function updateSplitFocus() {
   if (splitState.wrap) splitState.wrap.classList.toggle("pane-focused", splitState.focusedPane === "right");
 }
 
-function initSashDrag(sash) {
+function initSashDrag(sash, signal) {
   let dragging = false;
   sash.addEventListener("mousedown", (e) => {
     e.preventDefault();
     dragging = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-  });
+  }, { signal });
+  // window listeners — removed via the split session's AbortController on closeSplitEditor.
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
     const rect = editorContainer.getBoundingClientRect();
     const ratio = (e.clientX - rect.left) / rect.width;
     applySplitRatio(ratio);
-  });
+  }, { signal });
   window.addEventListener("mouseup", () => {
     if (!dragging) return;
     dragging = false;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-  });
+  }, { signal });
 }
 
 // ---- panel sash (sidebar / assistant resize) ----
@@ -2795,6 +2827,7 @@ function activate(path) {
   }
   activePath = path;
   scheduleSaveSession();   // keep the persisted session's tabs/active file current
+  _refreshChatHintIfEmpty(); // switched file → recompute the context-aware chat starters
   const f = openFiles.get(path);
 
   if (f.isImage) {
@@ -3606,7 +3639,7 @@ function _maybeOnboardProject(path) {
     _onboardedRoots.add(path);
     const sess = _currentSession();
     if (!sess || !sess.container) return;
-    if (Array.isArray(sess.history) && sess.history.length > 1) return; // don't interrupt an ongoing chat
+    if (sess.memory && sess.memory.recent.length > 1) return; // don't interrupt an ongoing chat
     _renderSuggestionChips(sess, [
       { label: "🔎 深挖这个项目", send: "用 research_project 深挖整个项目，给我一份上手地图：技术栈、目录结构、核心模块职责、数据/控制流、代码约定、常见改动入口。" },
       { label: "它是做什么的", send: "这个项目是做什么的？核心功能、目标用户、整体架构，简明讲一下。" },
@@ -3618,6 +3651,7 @@ function _maybeOnboardProject(path) {
 
 let _fsWatcherActive = false;
 let _fsChangeDebounce = null;
+const _pendingReloadDirs = new Set(); // tree reloads deferred while a right-click menu is open
 async function startFileWatcher() {
   if (_fsWatcherActive || !inTauri) return;
   const roots = workspaceRoots.length ? [...workspaceRoots] : rootPath ? [rootPath] : [];
@@ -3664,6 +3698,10 @@ function handleFsChanges(paths) {
       dirsToReload.add(dir);
     }
   }
+  // Don't rebuild the tree while the user has a right-click context menu open (delete / rename):
+  // recreating the rows + restoring scroll would close their menu and move the target out from
+  // under them ("AI 回复时右键删除文件被干扰"). Defer the reload until the menu closes.
+  if (ctxMenuEl) { for (const d of dirsToReload) _pendingReloadDirs.add(d); return; }
   let reloaded = 0;
   for (const dir of dirsToReload) {
     if (dirNodes.has(dir) || workspaceRoots.includes(dir)) {
@@ -3938,6 +3976,13 @@ window.addEventListener("keydown", (e) => {
   _deleteSelectedTree();
 });
 
+// Absolute workspace path → path relative to its workspace root (for @-mention references).
+function _pathToRel(abs) {
+  const r = (workspaceRoots.find((w) => abs === w || abs.startsWith(w.replace(/\/$/, "") + "/")) || rootPath || "").replace(/\/$/, "");
+  if (r && abs.startsWith(r + "/")) return abs.slice(r.length + 1);
+  return abs.split("/").filter(Boolean).pop() || abs;
+}
+
 async function renderChildren(path, container) {
   let entries;
   try {
@@ -3951,6 +3996,16 @@ async function renderChildren(path, container) {
     const row = document.createElement("div");
     row.className = "row";
     row.dataset.path = entry.path;
+    // Draggable → drop onto the AI composer to @-reference this file/dir (see the composer drop handler).
+    // Mouse-based drag → drop on the AI composer to @-reference it. (HTML5 drag-drop is swallowed
+    // by Tauri's native drag-drop handler under WKWebView, so we can't use it.) Record a candidate
+    // on mousedown; a global mousemove past a small threshold turns it into a real drag with a
+    // floating ghost (see _wireTreeDragToComposer).
+    row.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      _rowDragCandidate = { path: entry.path, name: entry.name, isDir: !!entry.is_dir, sx: e.clientX, sy: e.clientY };
+      document.body.classList.add("tree-selecting"); // suppress text selection while a drag may start
+    });
     if (entry.is_dir) {
       row.innerHTML = `<svg class="chev"><use href="#i-chevron" /></svg>${iconImg(folderIconUrl(entry.name, false), "folder-ic")}<span class="name"></span>`;
     } else {
@@ -3991,12 +4046,29 @@ async function renderChildren(path, container) {
   }
 }
 
-/** Re-read a directory and re-render its children (root or any expanded dir). */
+// Open a dir node in place WITHOUT toggling — used to RESTORE expansion after a reload
+// (mirrors the row click handler). Lazy-loads children if not yet loaded.
+async function _expandDirNode(dirPath) {
+  const node = dirNodes.get(dirPath);
+  if (!node || !node.row) return;
+  node.row.classList.add("open");
+  node.kids.hidden = false;
+  const fimg = node.row.querySelector(".folder-ic");
+  if (fimg) fimg.src = folderIconUrl(dirPath.split("/").filter(Boolean).pop() || "", true);
+  if (!node.loaded) { node.loaded = true; await renderChildren(dirPath, node.kids); }
+}
+
+/** Re-read a directory and re-render its children (root or any expanded dir).
+ *  PRESERVES the user's expanded sub-folders + tree scroll position, so an AI file
+ *  write (fs-change → reloadDir) never collapses folders or jumps the tree under them
+ *  ("展开的目录被一直合并" + "操作被干扰"). */
 async function reloadDir(path) {
   if (!rootPath) return;
+  const _scroll = treeEl ? treeEl.scrollTop : 0; // keep scroll steady across the DOM rebuild
   if (workspaceRoots.includes(path)) {
     await renderWorkspaceRoots();
     renderTreeActive();
+    if (treeEl) treeEl.scrollTop = _scroll;
     return;
   }
   const node = dirNodes.get(path);
@@ -4005,6 +4077,12 @@ async function reloadDir(path) {
     return;
   }
   const prefix = path + "/";
+  // Snapshot which descendant dirs are currently EXPANDED so the re-render below doesn't
+  // collapse them (renderChildren recreates every child row closed).
+  const wasOpen = [];
+  for (const [key, n] of dirNodes) {
+    if (key.startsWith(prefix) && n.row && n.row.classList.contains("open")) wasOpen.push(key);
+  }
   for (const key of [...dirNodes.keys()]) {
     if (key.startsWith(prefix)) dirNodes.delete(key);
   }
@@ -4014,7 +4092,12 @@ async function reloadDir(path) {
   const rfimg = node.row.querySelector(".folder-ic");
   if (rfimg) rfimg.src = folderIconUrl(path.split("/").filter(Boolean).pop() || "", true);
   await renderChildren(path, node.kids);
+  // Re-expand the previously-open descendants, shallowest-first so each parent node exists
+  // before we try to open its children.
+  wasOpen.sort((a, b) => a.split("/").length - b.split("/").length);
+  for (const key of wasOpen) { try { await _expandDirNode(key); } catch {} }
   renderTreeActive();
+  if (treeEl) treeEl.scrollTop = _scroll;
 }
 
 /** Open + lazy-load a directory so freshly created children become visible. */
@@ -4112,6 +4195,18 @@ function closeContextMenu() {
   if (ctxMenuEl) {
     ctxMenuEl.remove();
     ctxMenuEl = null;
+  }
+  // Flush any tree reloads that were deferred while the menu was open.
+  if (_pendingReloadDirs.size) {
+    const dirs = [..._pendingReloadDirs];
+    _pendingReloadDirs.clear();
+    setTimeout(() => {
+      let n = 0;
+      for (const d of dirs) {
+        if ((dirNodes.has(d) || workspaceRoots.includes(d)) && ++n <= 40) reloadDir(d);
+      }
+      try { refreshGitStatus(); } catch {}
+    }, 150);
   }
 }
 function openContextMenu(x, y, entry) {
@@ -4433,6 +4528,7 @@ function gitBadge(file) {
 }
 
 let _gitRefreshing = false;
+let _lastGitFiles = []; // last git status file list — read by the dynamic chat-starter chips
 async function refreshGitStatus() {
   // Coalesce rapid clicks: overlapping git_status calls completing out of order could leave the
   // list looking unchanged → "刷新点了没效果". One at a time.
@@ -4886,6 +4982,8 @@ monacoEditor.onDidChangeModelContent(() => {
 });
 
 function renderGitFiles(files) {
+  _lastGitFiles = Array.isArray(files) ? files : [];
+  _refreshChatHintIfEmpty(); // git changed → the "写提交信息/审查改动" starters may now apply
   gitListEl.innerHTML = "";
   if (!files.length) {
     const empty = document.createElement("div");
@@ -5492,9 +5590,13 @@ function _setModelAvatar(avatarEl, id) {
   avatarEl.dataset.model = id || "";
   const b = id ? brandOf(id) : null;
   const hasBrand = b && b.sym && b.sym !== "i-cpu";
-  avatarEl.className = "msg__avatar msg__avatar--logo" + (hasBrand && b.cls ? " " + b.cls : "");
+  // Match the model-picker list: a brand-COLOURED logo glyph on a light tile — NOT a white glyph on
+  // a saturated brand-colour square (that boxed avatar read as "ugly"). Keep the brand class OFF the
+  // tile (so .msg__avatar--logo's light background stays) and put it on the glyph (.ic.brand--x tints
+  // the logo its real brand colour, exactly like the selection list).
+  avatarEl.className = "msg__avatar msg__avatar--logo";
   avatarEl.innerHTML = hasBrand
-    ? `<svg class="ic"><use href="#${b.sym}" /></svg>`
+    ? `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg>`
     : `<img class="assistant-logo" src="/logo.png" alt="" aria-hidden="true" />`;
 }
 
@@ -5579,6 +5681,14 @@ async function refreshMichaelUser(force = false) {
   _lastUserRefresh = now;
   try {
     const r = await fetch(_michaelBase() + "/api/me?_=" + Date.now(), { cache: "no-store", headers: { Authorization: "Bearer " + token } });
+    // Dead/expired token → the session is over. Clear it and flip the UI to logged-out, so the
+    // "退出登录" button doesn't linger for a user whose login is no longer valid. (A transient
+    // network error throws or returns 5xx — handled by the `!r.ok` return below, which keeps state.)
+    if (r.status === 401 || r.status === 403) {
+      localStorage.removeItem("michael_token"); _loggedInEmail = null; _michaelUser = null;
+      try { _updateLoginUI(); } catch {} try { refreshModelBadge(); } catch {}
+      return;
+    }
     if (!r.ok) return;
     const u = await r.json();
     const had = !!_michaelUser;
@@ -5817,10 +5927,12 @@ function _isKnownThinkingModel(id) {
 function _thinkingPrefFor(id) {
   const prefs = _loadThinkingPrefs();
   if (prefs[id]) return prefs[id];
-  // Default to medium for KNOWN thinking-capable models, off for everything else.
-  // (UI still lets the user pick a level for any non-image model — but defaults
-  // shouldn't make a non-thinking model pay the reasoning premium for nothing.)
-  if (_isKnownThinkingModel(id)) return "medium";
+  // Default to HIGH for KNOWN thinking-capable models — deeper reasoning is the single
+  // biggest quality lever for a coding agent, and adaptive thinking keeps easy queries cheap
+  // (it only spends the budget when the problem is actually hard). Off for everything else so
+  // a non-thinking model doesn't pay the reasoning premium for nothing. User can still dial
+  // any model down per-card (off/low/medium) when they want speed over depth.
+  if (_isKnownThinkingModel(id)) return "high";
   return "off";
 }
 function _setThinkingPref(id, level) {
@@ -6100,7 +6212,7 @@ function _currentSession() {
 }
 function _getHistory() {
   const s = _currentSession();
-  return s ? s.history : [];
+  return s ? (s.memory ? s.memory.assemble() : s.history || []) : [];
 }
 
 const history = new Proxy([], {
@@ -6135,7 +6247,7 @@ function _createChatSession(name, mode, model, project) {
     // Which project this chat is about (folder it was started under); kept in
     // sync on send. Lets each tab show its project.
     project: project !== undefined ? project : (rootPath || workspaceRoots[0] || ""),
-    history: [], container, created: Date.now(),
+    memory: new ConversationMemory(), container, created: Date.now(),
   };
 }
 
@@ -6182,6 +6294,15 @@ function _renderChatTabs() {
   addBtn.addEventListener("click", () => _newChatSession());
   tabBar.appendChild(addBtn);
 }
+// Chat-panel HEADER actions (one layer above the tab bar): Skills + MCP. Book = skills, plug = MCP.
+const _ICON_SKILLS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
+const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v3a6 6 0 0 1-12 0V8z"/></svg>';
+{
+  const _sb = document.getElementById("skillsBtn");
+  if (_sb) { _sb.innerHTML = _ICON_SKILLS; _sb.addEventListener("click", () => openSkillsPanel()); }
+  const _mb = document.getElementById("mcpBtn");
+  if (_mb) { _mb.innerHTML = _ICON_MCP; _mb.addEventListener("click", () => openMcpPanel()); }
+}
 
 // Render a (restored) session's saved history into its OWN DOM container the
 // first time that tab is shown. Lazy: startup and tab-switching each pay for
@@ -6190,7 +6311,7 @@ function _renderChatTabs() {
 // session.history for the agent's context, only the DOM is trimmed.
 const _RENDER_LIMIT = 80;
 function _renderMsgRange(session, from, to) {
-  const h = session.history || [];
+  const h = session.memory ? session.memory.assemble() : (session.history || []);
   for (let i = from; i < to; i++) {
     const m = h[i];
     if (m && m.content != null) {
@@ -6215,7 +6336,7 @@ function _renderSessionHistory(session) {
       return;
     } catch { /* fall through to text re-render */ }
   }
-  const h = Array.isArray(session.history) ? session.history : [];
+  const h = session.memory ? session.memory.assemble() : (Array.isArray(session.history) ? session.history : []);
   if (!h.length) return;
   const start = Math.max(0, h.length - _RENDER_LIMIT);
   if (start > 0) {
@@ -6309,6 +6430,8 @@ function _switchChatSession(idx) {
     chatEl.appendChild(session.container);
     chatEl.scrollTop = session.scrollPos || 0;
   }
+  _ensureSessionHint(session); // empty tab → show the starter hint inside its container
+  _drainFollowups(session); // returning to a tab whose run finished while away → send its queued follow-up
   // Switch file explorer to this tab's working directory if it differs from current
   if (session.project && session.project !== rootPath && typeof openFolder === "function") {
     try { openFolder(session.project).catch(() => {}); } catch {}
@@ -6416,7 +6539,17 @@ function _flushChatHistorySync() {
   try {
     const data = _chatSessions.map((s) => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
-      project: s.project || "", history: (s.history || []).slice(-300), created: s.created,
+      project: s.project || "",
+      // Write the SAME shape restoreChatHistory reads: `memory` = the serialized
+      // ConversationMemory object. The old code stored it under `history` as an OBJECT,
+      // but restore only accepts `memory` (object) or `history` (ARRAY) — so the object
+      // under `history` was silently dropped and the WHOLE chat was lost whenever this
+      // sync mirror (beforeunload / HMR / crash) was the fallback. That was the real
+      // "内容全丢 / 偶尔丢失" bug: the disk store saved you only when its async write
+      // happened to have landed; otherwise this clobbered mirror lost everything.
+      memory: s.memory ? s.memory.toJSON() : undefined,
+      history: s.memory ? undefined : ((s.history || []).slice(-300)),
+      created: s.created,
     }));
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, activeIdx: _activeChatIdx }));
   } catch { /* quota / disabled — the async path is still the primary */ }
@@ -6432,10 +6565,8 @@ async function saveChatHistory() {
     const data = _chatSessions.map(s => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
       project: s.project || "",
-      // Persist a generous window so a long conversation isn't truncated on
-      // restart (text-only, so it stays small). Was 30 — that silently dropped
-      // everything older the moment a chat passed 30 messages.
-      history: s.history.slice(-300),
+      // Hierarchical memory — serializes recent + summaries + milestones
+      memory: s.memory.toJSON(),
       created: s.created,
     }));
     const payload = { sessions: data, activeIdx: _activeChatIdx };
@@ -6491,9 +6622,18 @@ async function restoreChatHistory() {
         // _renderSessionHistory when this tab is first shown, restoring the full
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
-        if (Array.isArray(sData.history)) {
+        if (sData.memory) {
+          session.memory = ConversationMemory.fromJSON(sData.memory);
+        } else if (sData.history && typeof sData.history === "object" && !Array.isArray(sData.history) &&
+                   (Array.isArray(sData.history.recent) || Array.isArray(sData.history.summaries))) {
+          // Recover chats written by the old buggy _flushChatHistorySync, which stored the
+          // memory OBJECT under `history` (the branches here couldn't read it → lost). This
+          // heals any such snapshot already sitting on a user's disk.
+          session.memory = ConversationMemory.fromJSON(sData.history);
+        } else if (Array.isArray(sData.history)) {
+          // Legacy: migrate old history array to new memory structure
           for (const m of sData.history) {
-            session.history.push(m);
+            session.memory.push(m);
           }
         }
         _chatSessions.push(session);
@@ -6505,7 +6645,7 @@ async function restoreChatHistory() {
     } else if (Array.isArray(saved) && saved.length > 0) {
       const session = _newChatSession("Chat 1");
       for (const m of saved) {
-        session.history.push(m);
+        session.memory.push(m);
         addMessage(m.role === "assistant" ? "assistant" : "user", m.content);
       }
     }
@@ -6723,6 +6863,19 @@ async function highlightCode(code, lang) {
   }
 }
 
+// Label for the USER's own messages: show the signed-in account (email) instead of a generic "你".
+// Falls back to the localized "你" when signed out.
+function _userLabel() {
+  try { if (typeof _loggedInEmail === "string" && _loggedInEmail.trim()) return _loggedInEmail.trim(); } catch {}
+  return t("assistant.you");
+}
+// Retro-update already-rendered user-message labels when sign-in state changes (login/logout).
+function _refreshUserLabels() {
+  try {
+    const label = _userLabel();
+    document.querySelectorAll(".msg.user .msg__who span").forEach((el) => { el.textContent = label; });
+  } catch {}
+}
 function addMessage(role, text, forSession) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -6731,6 +6884,7 @@ function addMessage(role, text, forSession) {
   // run keeps appending to its own tab even while you're looking at another.
   const session = forSession || _currentSession();
   const target = session ? session.container : chatEl;
+  try { target.querySelector(":scope > .chat-empty")?.remove(); } catch {} // first message → drop the starter hint
   if (role === "assistant") {
     const id = currentModel();
     const avatar = document.createElement("div");
@@ -6755,10 +6909,22 @@ function addMessage(role, text, forSession) {
     }
   } else {
     wrap.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
-    wrap.querySelector(".msg__who span").textContent = t("assistant.you");
+    wrap.querySelector(".msg__who span").textContent = _userLabel();
     body = wrap.querySelector(".msg__body");
     const cleanText = (text || "").replace(/\n\n\[用户附加了 \d+ 张图片\][\s\S]*$/, "").trim();
-    if (cleanText) body.textContent = cleanText;
+    if (cleanText) {
+      // Render @-references as clickable cards (rendered HTML → real padded chips, unlike the textarea).
+      body.innerHTML = _renderMentionsToHtml(cleanText);
+      body.querySelectorAll(".msg-mention").forEach((el) => {
+        el.addEventListener("click", () => {
+          const rel = el.dataset.rel; if (!rel) return;
+          const rootp = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
+          const abs = rel.startsWith("/") ? rel : rootp + "/" + rel;
+          if (el.dataset.dir === "1") { try { showSide("explorer"); } catch {} try { revealInTree(abs); } catch {} }
+          else openFile(abs, rel.split("/").filter(Boolean).pop() || rel);
+        });
+      });
+    }
     if (typeof _pastedImages !== 'undefined') {
       const images = wrap._attachedImages || [];
       for (const img of images) {
@@ -6784,6 +6950,24 @@ function addMessage(role, text, forSession) {
   return body;
 }
 
+// Render a user message's text to HTML, turning @-references into clickable file/folder cards.
+function _renderMentionsToHtml(text) {
+  const re = /(^|\s)@([^\s@]+)/g;
+  let out = "", last = 0, m;
+  while ((m = re.exec(text))) {
+    out += _escHtmlLite(text.slice(last, m.index + m[1].length));
+    const rel = m[2];
+    const name = rel.split("/").filter(Boolean).pop() || rel;
+    const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name); // heuristic: no extension → folder
+    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    out += `<span class="msg-mention" data-rel="${relAttr}" data-dir="${isDir ? 1 : 0}" title="${relAttr}">`
+      + `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(name)}</span></span>`;
+    last = re.lastIndex;
+  }
+  out += _escHtmlLite(text.slice(last));
+  return out.replace(/\n/g, "<br>");
+}
+
 function thinkingCard() {
   const el = document.createElement("div");
   el.className = "thinking";
@@ -6797,6 +6981,82 @@ function thinkingCard() {
 function _removeAllThinking(body) {
   if (!body) return;
   for (const el of body.querySelectorAll(".thinking")) { try { el.remove(); } catch {} }
+}
+// Shared markup for the collapsible model-reasoning ("思考过程") card — used by BOTH the plain-chat
+// and the agent paths so they look identical. Head = lightbulb icon + title + duration slot + chevron;
+// body holds the streamed reasoning (rendered as markdown). CSS lives in app.css (.think-card).
+const _THINK_CARD_HTML = (title) =>
+  '<div class="think-head"><svg class="tk-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.5.5 1 1.2 1 2V16h6v-.5c0-.8.5-1.5 1-2A6 6 0 0 0 12 3Z"/></svg>' +
+  '<span class="think-title">' + (title || "思考中…") + '</span><span class="tk-dur"></span>' +
+  '<svg class="chev" width="13" height="13" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg></div><div class="think-body"></div>';
+// Stamp "· N.Ns" thinking duration into the card head once reasoning settles (o1/Claude-style).
+function _thinkSetDuration(cardEl) {
+  try {
+    const d = cardEl && cardEl.querySelector(".tk-dur");
+    if (!d || !cardEl._t0) return;
+    const s = (Date.now() - cardEl._t0) / 1000;
+    d.textContent = " · " + (s < 10 ? s.toFixed(1) : Math.round(s)) + "s";
+  } catch {}
+}
+// Consecutive thinking cards — turn-after-turn with no answer / tool card between — read as a
+// redundant "一堆思考卡片" pile. Merge a trailing run of settled think-cards into the FIRST one so
+// the user sees a SINGLE "已思考" chip (expand → all the reasoning, joined by dividers). Only touches
+// settled (non-streaming) cards that are truly adjacent, so real steps (thinking→tool→thinking) are
+// never merged. Called after each turn settles → the pile stays collapsed into one live.
+function _mergeTrailingThinkCards(body) {
+  try {
+    if (!body) return;
+    const cards = [];
+    let el = body.lastElementChild;
+    while (el && el.classList && el.classList.contains("think-card") && !el.classList.contains("streaming")) {
+      cards.unshift(el);
+      el = el.previousElementSibling;
+    }
+    if (cards.length < 2) return; // nothing to merge
+    const first = cards[0];
+    const fb = first.querySelector(".think-body");
+    if (!fb) return;
+    let merged = (fb.dataset.rawText || fb.textContent || "").trim();
+    for (let i = 1; i < cards.length; i++) {
+      const b = cards[i].querySelector(".think-body");
+      const t = ((b && (b.dataset.rawText || b.textContent)) || "").trim();
+      if (t) merged += (merged ? "\n\n———\n\n" : "") + t;
+      cards[i].remove();
+    }
+    fb.dataset.rawText = merged;
+    try { renderMarkdownInto(fb, merged, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+    catch { fb.textContent = merged; }
+    if (first.dataset.open !== "1") first.dataset.open = "0"; // stay collapsed unless the user opened it
+  } catch {}
+}
+// Google-style light file/folder rows for the agent's list_dir card (replaces a plain monospace
+// dump). A name may carry a trailing "  ⚠️[…]" invisible-char annotation (from _annot) — split it
+// into a hover tooltip + a small ⚠️ marker so the row stays clean and the name ellipsizes.
+const _LS_FOLDER = '<svg class="atc-ls__ic" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8z"/></svg>';
+const _LS_FILE = '<svg class="atc-ls__ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+function _lsRowsHtml(dirs, files) {
+  const row = (name, isDir) => {
+    const m = /^([\s\S]*?)\s+⚠️(\[[\s\S]*\])$/.exec(String(name));
+    const note = m ? ("⚠️" + m[2]) : "";
+    let base = m ? m[1] : String(name);
+    if (isDir) base = base.replace(/\/$/, "");
+    return '<div class="atc-ls__row' + (isDir ? ' atc-ls__row--dir' : '') + '"' + (note ? ' title="' + _escAttr(note) + '"' : '') + '>'
+      + (isDir ? _LS_FOLDER : _LS_FILE)
+      + '<span class="atc-ls__name">' + _escHtml(base) + '</span>'
+      + (note ? '<span class="atc-ls__warn">⚠️</span>' : '') + '</div>';
+  };
+  const html = [...dirs.map((d) => row(d, true)), ...files.map((f) => row(f, false))].join("");
+  return '<div class="atc-ls">' + (html || '<div class="atc-ls__empty">(空目录)</div>') + '</div>';
+}
+// Client-side HARD cap on a backend invoke: a Promise.race backstop so a stalled/hung Rust command
+// can never wedge the agent turn forever (defense-in-depth on top of each command's own timeout).
+// Used for the网络 tools (web_fetch / web_search) — the "联网搜索卡死" root exposure was the JS side
+// awaiting the invoke with no independent timeout. On elapse it rejects (non-retryable wording) so
+// the turn gets a clean "timed out, moving on" instead of hanging.
+function _invokeCapped(cmd, args, ms, label) {
+  let timer;
+  const cap = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error((label || cmd) + " 放弃：" + Math.round(ms / 1000) + "s 内无响应（已跳过，别重试）")), ms); });
+  return Promise.race([backend.invoke(cmd, args), cap]).finally(() => clearTimeout(timer));
 }
 // Single source of truth for a session's streaming flag. Toggling `is-streaming` on the
 // session container lets CSS instantly HIDE any leftover blinking caret / "思考中…" dots
@@ -6817,8 +7077,116 @@ function _setStreaming(sess, on) {
   } catch {}
 }
 
-function showChatHint() {
-  if (chatEl.children.length) return;
+// Build the empty-chat starter chips DYNAMICALLY from the real current context — the open file &
+// its language, the editor selection, live diagnostics (errors/warnings), git changes, and whether a
+// project is open — instead of a fixed hardcoded list. Each candidate has a short `label` (shown) and
+// a detailed context-aware `send` prompt (filled into the composer on click). Ranked by relevance so
+// the most useful action for THIS moment comes first (e.g. "修复报错" when the file has errors).
+function _dynamicChatChips() {
+  const out = [];
+  const seen = new Set();
+  const add = (prio, label, send) => { if (!label || seen.has(label)) return; seen.add(label); out.push({ prio, label, send }); };
+
+  const path = activePath || "";
+  const rel = path ? _pathToRel(path) : "";
+  const base = rel ? (rel.split("/").pop() || rel) : "";
+  const isTest = !!base && (/\.(test|spec)\.[a-z0-9]+$/i.test(base) || /(^|\/)(tests?|__tests__|spec)\//i.test(rel));
+  const isDoc = /\.(md|markdown|mdx|txt|rst)$/i.test(base);
+  const isReadme = /(^|\/)readme(\.|$)/i.test(rel);
+  const isConfig = /(^|\/)(package\.json|tsconfig|Cargo\.toml|pyproject\.toml|go\.mod|pom\.xml|build\.gradle|requirements\.txt|dockerfile|docker-compose|vite\.config|webpack\.config|\.eslintrc|tailwind\.config)/i.test(rel);
+
+  let hasSel = false;
+  try { const s = monacoEditor.getSelection(); hasSel = !!s && !s.isEmpty(); } catch {}
+
+  let errs = 0, warns = 0;
+  try {
+    const m = (openFiles.get(path) || {}).model || monacoEditor.getModel();
+    if (m) for (const mk of monaco.editor.getModelMarkers({ resource: m.uri })) {
+      if (mk.severity === 8) errs++; else if (mk.severity === 4) warns++;
+    }
+  } catch {}
+
+  const gitFiles = Array.isArray(_lastGitFiles) ? _lastGitFiles : [];
+  const nChanged = gitFiles.length;
+  const root = (rootPath || (workspaceRoots && workspaceRoots[0]) || "").replace(/\/$/, "");
+  const activeDirty = !!path && gitFiles.some((f) => f && f.path && (path === f.path || (root && (root + "/" + f.path) === path) || path.endsWith("/" + f.path)));
+
+  // ── ranked candidates (higher prio = more relevant right now) ──
+  if (errs > 0) add(100, `🔧 修复报错 (${errs})`, `当前文件 ${rel} 有 ${errs} 个错误${warns ? `、${warns} 个警告` : ""}。请逐个定位根因并修复，改完用 get_diagnostics 确认全部消除、且没有引入新问题。`);
+  if (hasSel) add(90, "解释选中的代码", `解释我在 ${rel} 里选中的这段代码：它做什么、怎么工作、有没有边界问题或更清晰的写法。`);
+  if (activeDirty) add(80, "审查我的改动", `审查我对 ${rel} 未提交的改动（git diff），逐处指出潜在 bug、遗漏的错误处理、风格不一致和可改进点。`);
+  if (nChanged > 0) {
+    add(activeDirty ? 62 : 70, "✍️ 写提交信息", `看我未提交的改动（先 git diff --staged，没有暂存就 git diff），帮我写一条规范的中文提交信息：一句话主题 + 必要的正文。`);
+    if (!activeDirty) add(58, `审查全部改动 (${nChanged})`, `审查我当前所有未提交的改动（git diff），按文件逐处指出潜在 bug、错误处理缺失、风格问题和可改进点。`);
+  }
+
+  if (path) {
+    add(50, `解释「${base}」`, `解释 ${rel}：整体职责、关键函数/类型、数据流，以及它在项目里扮演的角色。`);
+    if (isReadme || isConfig) add(49, "怎么跑起来", `看 ${rel} 和相关配置，告诉我这个项目怎么装依赖、怎么启动/构建，给我可直接复制执行的命令。`);
+    if (isDoc) add(46, "润色这篇文档", `通读并润色 ${rel}：结构是否清晰、有无错别字或表述问题，在保持原意的前提下改得更专业易读。`);
+    else if (isTest) add(46, "补充测试用例", `看 ${rel}，找出还没覆盖到的分支和边界情况，补充测试用例（沿用本文件的测试框架与风格）。`);
+    add(40, "查找潜在 Bug", `仔细审查 ${rel}，找出潜在的 bug、竞态、边界情况和缺失的错误处理，按严重程度列出并给修复建议。`);
+    if (!isDoc) add(38, "优化重构", `审视 ${rel} 有没有能简化、提炼、去重或提升可读性/性能的地方，给出重构建议（保持行为不变、小步安全）。`);
+    if (!isDoc && !isTest) add(30, "编写单元测试", `为 ${rel} 编写单元测试：覆盖主要函数、关键分支和边界情况，沿用项目已有的测试框架和风格。`);
+    if (!isDoc) add(24, "添加文档注释", `给 ${rel} 里的公共函数/类型补充清晰的文档注释（用途、参数、返回值、副作用），沿用本语言的惯例。`);
+    if (!isDoc && !isTest) add(22, "加错误处理", `检查 ${rel} 的错误处理：哪些调用可能抛异常/返回错误却没被处理，补上健壮、清晰的处理。`);
+    if (!isDoc) add(18, "梳理调用关系", `梳理 ${rel} 与项目其他部分的关系：谁调用它、它依赖了什么、改动它的影响面有多大。`);
+  } else if (root || (workspaceRoots && workspaceRoots.length)) {
+    add(50, "🔎 深挖这个项目", "用 research_project 深挖整个项目，给我一份上手地图：技术栈、目录结构、核心模块职责、数据/控制流、代码约定、常见改动入口。");
+    add(44, "它是做什么的", "这个项目是做什么的？核心功能、目标用户、整体架构，简明讲一下。");
+    add(40, "怎么跑起来", "这个项目怎么安装依赖、怎么启动？看 README/package.json 等，给我可直接执行的步骤。");
+    add(34, "帮我加个功能", "我想给这个项目加个新功能。先帮我研究相关代码、找到合适的改动入口，再给方案。");
+    add(30, "找找有什么问题", "通览这个项目，找出明显的 bug、隐患、坏味道或过时依赖，按优先级列给我。");
+    add(26, "补点测试", "看项目现有测试情况，指出覆盖薄弱的关键模块，帮我补一批有价值的测试。");
+  } else {
+    add(30, "打开一个文件夹", "怎么在这个 IDE 里打开一个项目文件夹开始工作？");
+    add(26, "这个 IDE 能做什么", "简单介绍下这个 IDE 的核心能力：AI 智能体、运行命令、Git、调试等，我该怎么上手。");
+    add(22, "写段代码", "帮我写一段代码：");
+    add(18, "解释一段代码", "我贴一段代码，你帮我解释它做什么、怎么工作：");
+    add(14, "写个正则", "帮我写一个正则表达式，匹配：");
+    add(10, "写个小脚本", "帮我写一个小脚本（说明用途和语言）：");
+  }
+
+  out.sort((a, b) => b.prio - a.prio);
+  return out.slice(0, 6);
+}
+
+// Render the starter chips into `box`, diffing by label so an unchanged set is left alone (no
+// rebuild / flicker when e.g. the cursor moves but the suggestions are the same).
+function _renderChatChips(box) {
+  if (!box) return;
+  let next;
+  try { next = _dynamicChatChips(); } catch (e) { console.warn("[chat-chips] dynamic build failed:", e); }
+  if (!Array.isArray(next) || !next.length) {
+    // Fallback so the starters ALWAYS render even if the dynamic engine hiccups (never blank).
+    next = [
+      { label: "解释这个文件", send: "解释当前打开的文件：整体职责、关键函数/类型，以及它在项目里的角色。" },
+      { label: "查找潜在 Bug", send: "仔细审查当前文件，找出潜在的 bug、边界情况和缺失的错误处理。" },
+      { label: "优化重构", send: "审视当前文件有没有能简化、提炼或提升可读性/性能的地方，给出重构建议（保持行为不变）。" },
+      { label: "编写单元测试", send: "为当前文件编写单元测试，覆盖主要函数、关键分支和边界情况。" },
+      { label: "添加文档注释", send: "给当前文件的公共函数/类型补充清晰的文档注释（用途、参数、返回值）。" },
+      { label: "梳理调用关系", send: "梳理当前文件与项目其他部分的关系：谁调用它、它依赖了什么、改动的影响面。" },
+    ];
+  }
+  const key = next.map((c) => c.label).join("|");
+  if (box._chipKey === key) return;
+  box._chipKey = key;
+  box.innerHTML = "";
+  for (const s of next) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip";
+    chip.textContent = s.label;
+    chip.title = s.send; // hover shows the full prompt that gets filled in
+    chip.addEventListener("click", () => {
+      promptEl.value = s.send;
+      promptEl.focus();
+      promptEl.dispatchEvent(new Event("input"));
+    });
+    box.appendChild(chip);
+  }
+}
+function _buildChatHintEl() {
   const hint = document.createElement("div");
   hint.className = "chat-empty";
   hint.innerHTML =
@@ -6828,21 +7196,42 @@ function showChatHint() {
     `<div class="chat-empty__chips"></div>`;
   hint.querySelector("h3").textContent = t("assistant.chatHintTitle");
   hint.querySelector("p").textContent = t("assistant.chatHintDesc");
-  const chips = hint.querySelector(".chat-empty__chips");
-  for (const s of [t("assistant.chip.explain"), t("assistant.chip.bugs"), t("assistant.chip.comments"), t("assistant.chip.test")]) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "chip";
-    chip.textContent = s;
-    chip.addEventListener("click", () => {
-      promptEl.value = s;
-      promptEl.focus();
-      promptEl.dispatchEvent(new Event("input"));
-    });
-    chips.appendChild(chip);
-  }
-  chatEl.appendChild(hint);
+  _renderChatChips(hint.querySelector(".chat-empty__chips"));
+  return hint;
 }
+// Show/refresh the empty-state hint INSIDE a session's container — that's where messages render too,
+// so an empty tab shows the hint and it's replaced once the first message arrives. (Chat uses one
+// container per tab appended to #chat; the old code appended the hint to #chat directly, so once a
+// session container was in place the hint had nowhere to show → the "不显示内容" blank tab.)
+function _ensureSessionHint(session) {
+  if (!session || !session.container) return;
+  const container = session.container;
+  const hint = container.querySelector(":scope > .chat-empty");
+  if (container.querySelector(".msg")) { if (hint) hint.remove(); return; } // has messages → no hint
+  if (!hint) container.appendChild(_buildChatHintEl());
+  else _renderChatChips(hint.querySelector(".chat-empty__chips")); // already shown → just refresh chips
+}
+function showChatHint() {
+  const s = (typeof _currentSession === "function") ? _currentSession() : null;
+  if (s && s.container) { _ensureSessionHint(s); return; }   // session view → hint lives in the container
+  if (chatEl.children.length) return;                        // no session at all → #chat-level hint
+  chatEl.appendChild(_buildChatHintEl());
+}
+// Recompute the starters when context changes (file switch, git, diagnostics, selection) — only while
+// the active chat has no messages. Touches only the chip row (no logo/title flash); skips if unchanged.
+function _refreshChatHintIfEmpty() {
+  try {
+    const s = (typeof _currentSession === "function") ? _currentSession() : null;
+    const container = (s && s.container) || chatEl;
+    if (!container || container.querySelector(".msg")) return;
+    const hint = container.querySelector(":scope > .chat-empty");
+    if (hint) _renderChatChips(hint.querySelector(".chat-empty__chips"));
+  } catch {}
+}
+let _chatHintCtxTimer = 0;
+const _refreshChatHintSoon = () => { clearTimeout(_chatHintCtxTimer); _chatHintCtxTimer = setTimeout(_refreshChatHintIfEmpty, 400); };
+try { monaco.editor.onDidChangeMarkers(_refreshChatHintSoon); } catch {}          // diagnostics stream in → "修复报错 (N)"
+try { monacoEditor.onDidChangeCursorSelection(_refreshChatHintSoon); } catch {}   // selection → "解释选中的代码"
 
 // ---- AI Mode System (Agent / Chat / Plan) ----
 let _currentAiMode = "auto";
@@ -7104,7 +7493,8 @@ function _estimateTokens(text) {
 }
 
 function _compactHistoryIfNeeded(session) {
-  const h = (session || _currentSession())?.history;
+  const sess = session || _currentSession();
+  const h = sess?.memory ? sess.memory.assemble() : (sess?.history || []);
   if (!h || h.length === 0) return;
 
   // CONTINUOUS lossless squeeze (every turn, not just when huge): lexically compress
@@ -7256,6 +7646,13 @@ function _extractStackHints(fileMap) {
       out.formatCmd = scripts.format ? "npm run format" : scripts.fmt ? "npm run fmt" : "";
       out.devCmd = scripts.dev ? "npm run dev" : scripts.start ? "npm start" : "";
       out.buildCmd = scripts.build ? "npm run build" : "";
+      // A real "does it compile/typecheck" command so the mid-loop auto-check ACTUALLY fires for JS/TS
+      // (was "" before → the biggest population got no real verification). Author-defined scripts only.
+      out.checkCmd = scripts.typecheck ? "npm run typecheck" :
+                     scripts["type-check"] ? "npm run type-check" :
+                     scripts.check ? "npm run check" :
+                     scripts.build ? "npm run build" :
+                     scripts.lint ? "npm run lint" : "";
       // Framework detection by dependency.
       if (deps.next) out.framework = "Next.js";
       else if (deps.nuxt) out.framework = "Nuxt";
@@ -7581,7 +7978,7 @@ async function _runDirectImageGen(text, config, sess) {
   const body = addMessage("assistant", "", sess);
   if (body) { const sp = document.createElement("div"); sp.className = "agent-seg"; sp.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(config.model)} 生成图片中（自动优化提示词）…`; body.appendChild(sp); }
   try { _chatFollow(); } catch {}
-  sess.history.push({ role: "user", content: text });
+  sess.memory.push({ role: "user", content: text });
   saveChatHistory();
   try {
     if (!inTauri) throw new Error("生图只能在桌面 App 里用");
@@ -7607,12 +8004,12 @@ async function _runDirectImageGen(text, config, sess) {
       cap.textContent = `已生成并保存到 ${dest}（${out && out.bytes ? out.bytes : "?"} 字节，点图看原图）`;
       body.appendChild(cap);
     }
-    sess.history.push({ role: "assistant", content: `（已用 ${config.model} 生成图片，保存到 ${dest}）` });
+    sess.memory.push({ role: "assistant", content: `（已用 ${config.model} 生成图片，保存到 ${dest}）` });
     saveChatHistory();
   } catch (e) {
     const msg = String(e?.message || e).slice(0, 320);
     if (body) { body.innerHTML = ""; const er = document.createElement("div"); er.className = "msg__error"; er.textContent = `⚠️ 生图失败：${msg}（${config.model} 上游不可用或不是对话出图模型；稍后再试，或在后台检查这个生图模型的连接）`; body.appendChild(er); }
-    sess.history.push({ role: "assistant", content: "[失败] 生图（" + config.model + "）：" + msg });
+    sess.memory.push({ role: "assistant", content: "[失败] 生图（" + config.model + "）：" + msg });
     saveChatHistory();
   } finally {
     _setStreaming(sess, false);
@@ -7689,6 +8086,18 @@ function _modelStyleTuning(id) {
     default: return _TERSE_STYLE;                            // kimi / glm / qwen / other
   }
 }
+
+// The model's training cutoff makes it think it's still a year or two ago → it guesses stale
+// "latest" versions, refuses to believe recent events, computes ages/dates wrong. Feed it the
+// REAL wall-clock date every send (dynamic, so it's always current). One short line; same all
+// day, so the system-prompt prefix still caches within a day.
+function _currentDateBlock() {
+  try {
+    const d = new Date();
+    const wd = "日一二三四五六"[d.getDay()];
+    return `\n\n【当前真实日期】今天是 ${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日，星期${wd}。以此为"现在"的基准：凡涉及"今年 / 现在 / 最新 / 当前版本 / 截至目前 / 还有多久"，一律按这个真实日期算，别用训练截止的旧年份、也别怀疑它。\n你的训练知识大概率**已经落后于今天**——遇到**时效性强**的东西（最新版本号 / 当前最佳实践 / 某库·框架·模型·工具的现状 / 近期发布或变化 / 价格 / 排名 / 新闻 / "现在有哪些…"），**别凭记忆张口就答**（十有八九过时、就成了废话）：先用 web_search 查到**截至今天**的真实情况、交叉验证，再下结论。记忆只当线索，联网核实到的才算数。`;
+  } catch { return ""; }
+}
 function _modelNeedsCssGrounding(id) {
   const f = _modelFamilyOf(id);
   return f !== "claude" && f !== "gemini";
@@ -7697,6 +8106,8 @@ function _modelNeedsCssGrounding(id) {
 // Codex-style guidance: render a row of clickable suggestion chips into a chat session.
 // Clicking one sends it as the next prompt. Used for "next steps" (after a run) and for
 // "onboarding" (after opening a project).
+const _NS_SPARK = '<svg class="next-steps__ic" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5l1.55 4.95a3 3 0 0 0 1.99 1.99L20.5 11l-4.96 1.56a3 3 0 0 0-1.99 1.99L12 19.5l-1.55-4.95a3 3 0 0 0-1.99-1.99L3.5 11l4.96-1.56a3 3 0 0 0 1.99-1.99z"/></svg>';
+const _NS_ARROW = '<svg class="next-steps__arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h13"/><path d="m12 6 6 6-6 6"/></svg>';
 function _renderSuggestionChips(sess, items, label) {
   try {
     if (!sess || !sess.container || !Array.isArray(items)) return;
@@ -7706,18 +8117,95 @@ function _renderSuggestionChips(sess, items, label) {
     if (!list.length) return;
     const wrap = document.createElement("div");
     wrap.className = "next-steps";
-    wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin:8px 2px 6px";
-    if (label) { const l = document.createElement("div"); l.textContent = label; l.style.cssText = "width:100%;font-size:11px;opacity:.55;margin:0 0 2px"; wrap.appendChild(l); }
+    if (label) {
+      const l = document.createElement("div");
+      l.className = "next-steps__label";
+      l.innerHTML = _NS_SPARK + "<span></span>";
+      l.querySelector("span").textContent = String(label).replace(/\s*›\s*$/, ""); // icon carries the cue → drop the trailing ›
+      wrap.appendChild(l);
+    }
     list.forEach((it) => {
-      const label = typeof it === "string" ? it : it.label;
+      const text = typeof it === "string" ? it : it.label;
       const send = typeof it === "string" ? it : (it.send || it.label);
       const b = document.createElement("button");
       b.type = "button";
-      b.textContent = label;
-      b.style.cssText = "border:1px solid var(--border,#dadce0);background:var(--panel-solid,#f5f5f7);color:var(--accent,#1a73e8);border-radius:14px;padding:4px 11px;font-size:12px;cursor:pointer;line-height:1.3;transition:background .12s";
-      b.addEventListener("mouseenter", () => { b.style.background = "#e8f0fe"; });
-      b.addEventListener("mouseleave", () => { b.style.background = "var(--panel-solid,#f5f5f7)"; });
+      b.className = "next-steps__chip";
+      b.innerHTML = '<span class="next-steps__chip-t"></span>' + _NS_ARROW;
+      b.querySelector(".next-steps__chip-t").textContent = text;
       b.addEventListener("click", () => { wrap.remove(); sendPrompt(send); });
+      wrap.appendChild(b);
+    });
+    sess.container.appendChild(wrap);
+    if (sess === _currentSession()) { try { _chatFollow(); } catch {} }
+  } catch {}
+}
+
+// The model often OFFERS the user a choice as plain text ("A. … B. … C. …" / "1. … 2. …")
+// instead of calling the ask_user tool → the user has to type back "A". Detect a trailing
+// option list in the final answer and turn it into CLICKABLE chips (utilizing the choice UX
+// even when the model forgot the tool). Returns [{label,text,send}] or null. Conservative:
+// only fires on a short contiguous option block AT THE END, gated by a choice cue (so a plain
+// numbered STEP list doesn't become buttons).
+function _detectChoiceOptions(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 5000) return null;
+  const blocks = t.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean);
+  const tail = blocks.slice(-2).join("\n");
+  if (/```/.test(tail)) return null; // options never live inside a code fence
+  const lines = tail.split(/\n/).map((s) => s.trim()).filter(Boolean);
+  const optRe = /^[*>\-\s]*(?:选项\s*)?\**([A-Za-z]|[1-9]|[①②③④⑤⑥⑦⑧⑨⑩])\**\s*[\.\)、:：\-]\**\s*(.+?)\**\s*$/;
+  const opts = [];
+  for (const ln of lines) {
+    const m = ln.match(optRe);
+    if (m) {
+      const label = m[1].toUpperCase().replace(/[①②③④⑤⑥⑦⑧⑨⑩]/, (c) => "①②③④⑤⑥⑦⑧⑨⑩".indexOf(c) + 1 + "");
+      const body = m[2].replace(/\*+/g, "").trim();
+      if (body.length >= 1 && body.length <= 140) opts.push({ label, text: body });
+    }
+  }
+  if (opts.length < 2 || opts.length > 8) return null;
+  // Guard: a numbered STEP list isn't a choice. Require either LETTER labels (A/B/C) or an
+  // explicit choice cue somewhere in the message.
+  const isLetter = /^[A-Z]$/.test(opts[0].label);
+  const cue = /(选择|选一个|选哪|挑一个|哪个|哪种|你想要?|你倾向|更(喜欢|倾向|想)|要不要|哪条|方案|偏好|怎么(选|办)|如何选|按哪|倾向于|which|prefer|choose|pick|option|\?|？)/i.test(t);
+  if (!isLetter && !cue) return null;
+  return opts.map((o) => ({ ...o, send: "我选 " + o.label + (o.text ? "：" + o.text : "") }));
+}
+
+// Render detected choices as clickable chips under the finished answer; a click sends that
+// choice straight back (same as typing it), so the agent continues with a clear decision.
+function _maybeRenderChoices(sess, src) {
+  try {
+    if (!sess || !sess.container) return;
+    let finalText = "";
+    if (typeof src === "string") {
+      finalText = src; // plain-chat path passes the answer text directly
+    } else {
+      for (let i = (src || []).length - 1; i >= 0; i--) {
+        const m = src[i];
+        if (m && m.role === "user") break; // don't scan before the latest user turn
+        if (m && m.role === "assistant" && typeof m.content === "string" && m.content.trim()) { finalText = m.content; break; }
+      }
+    }
+    const opts = _detectChoiceOptions(finalText);
+    if (!opts) return;
+    if (sess.container.querySelector(":scope > .ai-choices:last-child")) return; // avoid dupes
+    const wrap = document.createElement("div");
+    wrap.className = "ai-choices";
+    const label = document.createElement("div");
+    label.className = "ai-choices__label";
+    label.textContent = "👉 点一个直接回复（也可以自己打字）";
+    wrap.appendChild(label);
+    opts.forEach((o) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ai-choice";
+      b.textContent = o.label + (o.text ? "、" + o.text : "");
+      b.addEventListener("click", () => {
+        wrap.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+        b.classList.add("is-picked");
+        sendPrompt(o.send);
+      });
       wrap.appendChild(b);
     });
     sess.container.appendChild(wrap);
@@ -7755,10 +8243,31 @@ function _steerRunningAgent(sess, text) {
     "【用户实时引导 / steer】" + t +
     "\n（这是任务进行中用户插入的新指令：立刻据此调整方向——必要时放弃或修改你正在做的，不必等本轮做完再返工。）"
   );
-  sess.history.push({ role: "user", content: text });
+  sess.memory.push({ role: "user", content: text });
   try { addMessage("user", "🧭 引导：" + t, sess); } catch {}
   saveChatHistory();
   showToast("🧭 已插入引导，正在并入当前任务…");
+}
+
+// A PLAIN chat (single-turn) reply has no agent loop to steer, so a message sent WHILE it is
+// streaming can't be injected mid-run. Instead we QUEUE it and auto-send it as a fresh turn the
+// moment the current reply finishes — so the user's 2nd (3rd…) message is actually processed
+// ("实时处理") instead of being silently dropped. Sequential: each drained send's own finally
+// drains the next, so N queued messages each get their own turn in order.
+function _queueFollowup(sess, text) {
+  const t = String(text || "").trim();
+  if (!sess || !t) return;
+  (sess._pendingSends = sess._pendingSends || []).push(t);
+  showToast("已排队：当前回答完成后自动发送");
+}
+function _drainFollowups(sess) {
+  try {
+    if (!sess || sess.streaming) return;
+    if (!Array.isArray(sess._pendingSends) || !sess._pendingSends.length) return;
+    if (sess !== _currentSession()) return; // only auto-fire into the tab in view; else waits for _switchChatSession
+    const next = sess._pendingSends.shift();
+    if (next) setTimeout(() => { try { sendPrompt(next); } catch {} }, 0);
+  } catch {}
 }
 
 async function sendPrompt(text, attachedImages = []) {
@@ -7778,7 +8287,7 @@ async function sendPrompt(text, attachedImages = []) {
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
   // inject it into the live run so the agent adapts mid-task instead of dropping it.
   // (Other tabs still run concurrently — each has its own loop.)
-  if (_currentSession()?.streaming) { _steerRunningAgent(_currentSession(), text); return; }
+  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text); else _queueFollowup(_rs, text); return; } }
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
   // Bind this whole turn to ONE session, captured now — so even if the user
@@ -7896,21 +8405,21 @@ async function sendPrompt(text, attachedImages = []) {
   const _growthBlock = growth.promptBlock(effectiveMode);
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
-  const fullPrompt = sysPrompt + _modelStyleTuning(config.model);
+  const fullPrompt = sysPrompt + _modelStyleTuning(config.model) + _activeSkillsBlock() + _currentDateBlock();
 
   _compactHistoryIfNeeded(sess);
 
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  for (const m of sess.history) messages.push(m);
+  for (const m of sess.memory.assemble()) messages.push(m);
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
   // root and forgets the stale paths. First send just records the root (no notice, no false alarm).
   {
     const _curRoot = rootPath || workspaceRoots[0] || "";
-    if (sess._anchorRoot && _curRoot && sess._anchorRoot !== _curRoot && sess.history.length) {
+    if (sess._anchorRoot && _curRoot && sess._anchorRoot !== _curRoot && sess.memory.recent.length) {
       messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_curRoot}」。从这条之后：① 所有相对路径一律基于「${_curRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
     }
     sess._anchorRoot = _curRoot;
@@ -7966,8 +8475,15 @@ async function sendPrompt(text, attachedImages = []) {
       _seen.add(rel);
       try {
         const fp = rel.startsWith("/") ? rel : _r + "/" + rel.replace(/^\.?\//, "");
-        const content = await backend.readTextFile(fp);
-        _atContext += `\n\n文件 ${rel}:\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``;
+        try {
+          const content = await backend.readTextFile(fp);
+          _atContext += `\n\n文件 ${rel}:\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``;
+        } catch {
+          // Not a readable file → likely a DIRECTORY the user dragged/@-referenced. Inject a listing.
+          const entries = await backend.readDir(fp);
+          const listing = entries.slice(0, 200).map((en) => (en.is_dir ? en.name + "/" : en.name)).join("\n");
+          _atContext += `\n\n目录 ${rel}/ 的内容:\n\`\`\`\n${listing || "(空目录)"}\n\`\`\``;
+        }
       } catch { /* unreadable — skip */ }
     }
   }
@@ -8029,7 +8545,7 @@ async function sendPrompt(text, attachedImages = []) {
     userContent = _userText;
   }
   messages.push({ role: "user", content: userContent });
-  sess.history.push({ role: "user", content: text });
+  sess.memory.push({ role: "user", content: text });
   saveChatHistory(); // persist the prompt now, so an interrupted run / app close keeps it
 
   // Growth: record this turn's engagement signals for the learner model, tagged
@@ -8071,6 +8587,7 @@ async function sendPrompt(text, attachedImages = []) {
       await _runAgenticLoop({ config, messages, root: sess.project || rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode, task: text });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
+      _maybeRenderChoices(sess, messages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, messages, config); // Codex-style: offer 2-4 clickable next steps
     } catch (e) {
       // Never leave a dead Stop button + silent no-response on an unexpected throw.
@@ -8133,31 +8650,12 @@ async function sendPrompt(text, attachedImages = []) {
     // Clean any leftover "..." thinking placeholders from earlier turns so they
     // don't end up scattered between the new reasoning card and the answer.
     _removeAllThinking(body);
-    if (!document.getElementById("think-style")) {
-      const st = document.createElement("style");
-      st.id = "think-style";
-      st.textContent =
-        ".think-card{border:1px solid var(--tk-bd,#e4e7ee);border-radius:12px;margin:2px 0 14px;background:var(--tk-bg,#f7f9fc);overflow:hidden;transition:border-color .2s}" +
-        ".think-card:hover{border-color:var(--tk-bdh,#d4dae4)}" +
-        ".think-head{display:flex;align-items:center;gap:8px;padding:9px 13px;cursor:pointer;font-size:12.5px;font-weight:500;color:var(--tk-fg,#5f6368);user-select:none}" +
-        ".think-head .tk-ic{flex:0 0 auto;color:#1a73e8}" +
-        ".think-head .think-title{flex:1 1 auto}" +
-        ".think-head .chev{transition:transform .25s cubic-bezier(.4,0,.2,1);flex:0 0 auto;opacity:.6}" +
-        '.think-card[data-open="0"] .think-head .chev{transform:rotate(-90deg)}' +
-        ".think-body{padding:2px 14px 12px 14px;font-size:12.5px;line-height:1.7;color:var(--tk-bfg,#5f6368);white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;transition:max-height .28s cubic-bezier(.4,0,.2,1),opacity .2s,padding .2s}" +
-        '.think-card[data-open="0"] .think-body{max-height:0;opacity:0;padding-top:0;padding-bottom:0}' +
-        '.think-card.streaming .think-title::after{content:"";display:inline-block;width:5px;height:13px;margin-left:4px;vertical-align:-2px;background:#1a73e8;border-radius:1px;animation:think-blink 1.1s steps(2,start) infinite}' +
-        "@keyframes think-blink{50%{opacity:0}}" +
-        '[data-theme="dark"] .think-card,.dark .think-card{--tk-bd:rgba(150,160,180,.22);--tk-bg:rgba(150,160,180,.08);--tk-bdh:rgba(150,160,180,.34);--tk-fg:#9aa0a6;--tk-bfg:#b4b9c0}';
-      document.head.appendChild(st);
-    }
     reasoningEl = document.createElement("div");
     reasoningEl.className = "think-card streaming";
     reasoningEl.dataset.open = "1";
-    reasoningEl.innerHTML = '<div class="think-head"><svg class="tk-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.5.5 1 1.2 1 2V16h6v-.5c0-.8.5-1.5 1-2A6 6 0 0 0 12 3Z"/></svg><span class="think-title">思考中…</span><svg class="chev" width="13" height="13" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg></div><div class="think-body"></div>';
-    reasoningEl.querySelector(".think-head").addEventListener("click", () => {
-      reasoningEl.dataset.open = reasoningEl.dataset.open === "1" ? "0" : "1";
-    });
+    reasoningEl._t0 = Date.now(); // for the "已思考 · Ns" duration badge
+    reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
+    // expand/collapse handled by the delegated listener on chatEl (survives snapshot restore)
     body.insertBefore(reasoningEl, body.firstChild);
     return reasoningEl;
   };
@@ -8167,10 +8665,12 @@ async function sendPrompt(text, attachedImages = []) {
   // half-typed fences/blocks don't blow up the parser.
   const setThink = (txt) => {
     const tb = ensureThink().querySelector(".think-body");
+    const _stick = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 48; // at the bottom?
     const raw = String(txt || "");
     tb.dataset.rawText = raw; // saved for collapseThink's final non-streaming pass
     try { renderMarkdownInto(tb, raw, { streaming: true, highlighter: highlightCode }); }
     catch { tb.textContent = raw; }
+    if (_stick) tb.scrollTop = tb.scrollHeight; // auto-follow the newest reasoning
     _chatFollow();
   };
   const collapseThink = () => {
@@ -8184,6 +8684,7 @@ async function sendPrompt(text, attachedImages = []) {
     reasoningEl.classList.remove("streaming");
     const tt = reasoningEl.querySelector(".think-title");
     if (tt) tt.textContent = "已思考";
+    _thinkSetDuration(reasoningEl);
   };
   const _agentRoot = rootPath || workspaceRoots[0] || "";
   const _toolPromises = [];
@@ -8315,17 +8816,13 @@ async function sendPrompt(text, attachedImages = []) {
         }
       }
     } else {
-      const prevLen = body._lastLen || 0;
-      if (view.length - prevLen < 20 && !view.includes("```") && prevLen > 0) {
-        const tail = view.slice(prevLen);
-        if (tail && body.lastChild && body.lastChild.nodeType === 3) {
-          body.lastChild.textContent += tail;
-        } else if (tail) {
-          renderMarkdownInto(body, view, { streaming: true });
-        }
-      } else {
-        renderMarkdownInto(body, view, { streaming: true });
-      }
+      // Plain-chat streaming: INCREMENTAL render — settled blocks are parsed once and only the
+      // growing tail block is re-parsed each frame. The old code called renderMarkdownInto here,
+      // which cleared + re-parsed the WHOLE reply every frame (O(n²)); its fast-append shortcut
+      // bailed to that full path the moment the reply contained a "```" fence, so any answer with a
+      // code block froze slower machines as it grew. renderMarkdownStream keeps per-frame cost ∝ the
+      // current block. (The final, highlighted render still runs once on completion.)
+      renderMarkdownStream(body, view, { streaming: true });
       body._lastLen = view.length;
     }
     _chatFollow();
@@ -8344,6 +8841,14 @@ async function sendPrompt(text, attachedImages = []) {
     if (sess.streaming) scheduleStream();
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
+  // Bind a cancel id so Stop can actually ABORT the in-flight backend request (stop burning
+  // tokens upstream), not merely mute the UI — the same mechanism the agent loop uses. Plain
+  // chat previously set no reqId, so _setStreaming(sess,false)'s cancel was a silent no-op.
+  // `_runIsLoop=false` marks this a single-turn run: a 2nd message becomes a queued follow-up
+  // (there is no loop to steer).
+  sess._reqId = "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+  try { config.requestId = sess._reqId; } catch {}
+  sess._runIsLoop = false;
   _setStreaming(sess, true);
   const _pendingToolCalls = [];
   let _toolArgBuf = {};
@@ -8354,6 +8859,11 @@ async function sendPrompt(text, attachedImages = []) {
       ? (cb) => backend.aiChatWithTools(config, messages, _toolSchemas, cb)
       : (cb) => backend.aiChat(config, messages, cb);
     await chatFn((ev) => {
+      // User hit Stop → drop every further event so output halts AT ONCE (mirrors the agent
+      // path's `if (!_live()) return`). Without this the callback kept appending to `acc` and
+      // kept firing tool calls after Stop, and the finally then rendered the full answer
+      // anyway — i.e. Stop didn't actually stop ("停不掉").
+      if (!sess.streaming) return;
       if (ev.kind === "reasoning") { reasoning += ev.delta; setThink(reasoning); }
       else if (ev.kind === "token") {
         const { th, an } = _routeThink(ev.delta);
@@ -8404,6 +8914,7 @@ async function sendPrompt(text, attachedImages = []) {
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     _setStreaming(sess, false);
+    sess._runIsLoop = null;
     if (sess === _currentSession()) _setSendBtnStop(false);
     _removeAllThinking(body);
     if (_streamEl) { _streamEl.remove(); _streamEl = null; }
@@ -8415,14 +8926,14 @@ async function sendPrompt(text, attachedImages = []) {
           _segRendered++;
         }
         const historyContent = acc + (_pendingToolCalls.length ? "\n" + _pendingToolCalls.map(c => `[TOOL:${c.type === "read" ? "read_file" : c.type === "list" ? "list_dir" : c.type === "cmd" ? "run_cmd" : "write_file"}] ${c.path || c.command || ""}`).join("\n") : "");
-        if (!err && historyContent.trim()) { sess.history.push({ role: "assistant", content: historyContent }); saveChatHistory(); }
+        if (!err && historyContent.trim()) { sess.memory.push({ role: "assistant", content: historyContent }); saveChatHistory(); }
         await Promise.allSettled(_toolPromises);
         const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
         if (readResults.length) _agentFollowUp(readResults, body, sess);
       } else {
         const _cc = _cleanAgentText(acc); // strip "..." filler / tool narration before render+persist
         if (_cc) renderMarkdownInto(body, _cc, { highlighter: highlightCode });
-        if (!err && _cc) { sess.history.push({ role: "assistant", content: _cc }); saveChatHistory(); }
+        if (!err && _cc) { sess.memory.push({ role: "assistant", content: _cc }); saveChatHistory(); _maybeRenderChoices(sess, _cc); }
       }
     }
     if (err) {
@@ -8437,6 +8948,7 @@ async function sendPrompt(text, attachedImages = []) {
       _updateFilesBar(_filesBar, _filesList, _trackedFiles);
     }
     _chatFollow();
+    _drainFollowups(sess); // a message sent while this reply streamed → process it now, as its own turn
   }
 }
 
@@ -9100,9 +9612,14 @@ const _AGENT_MAX_ITERS = 40; // base step budget per run
 // flailing (stuck-looping / repeated failures) — and when stuck it's told to ask_user
 // rather than spin. Bounded so a true infinite loop still can't run away.
 const _AGENT_EXT_STEP = 30;        // steps added per extension
-const _AGENT_HARD_CEIL = 300;      // absolute max steps even with extensions (high → "一直自动做下去")
-const _AGENT_MAX_EXTENSIONS = 12;  // 40 → 70 → 100 → … → 300
+const _AGENT_HARD_CEIL = Infinity; // NO step limit — the agent runs until it's actually done (model
+                                   // self-stops → finish gates) or it's FLAILING (spinning / repeated
+                                   // failures = real 空转, caught below). There is no step-count cap or
+                                   // "pause to ask 继续". Infinity cleanly no-ops every Math.min() clamp
+                                   // and `budget < CEIL` check, so budget just grows on productive work.
+const _AGENT_MAX_EXTENSIONS = Infinity; // unused as a gate now; kept so nothing referencing it breaks
 const _AGENT_MAX_REVIEWS = 3;      // evaluator-optimizer: max review→fix→re-review rounds before finishing
+const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test auto-runs per run (progress-gated: stops early once errors stop dropping)
 
 // Pick a starting step budget from task-text signals + project size. Small focused
 // tasks finish in 3-6 steps (waste of 40); big "实现完整 X / 重构整套" tasks routinely
@@ -9138,6 +9655,7 @@ function _initialBudget(taskText, stack) {
 let _mcpLoaded = false;
 let _mcpConnected = []; // server names currently connected → disconnect on workspace switch
 let _mcpLoadedRoot = null;
+let _mcpConnecting = false; // a connect pass is in flight → show "连接中…" instead of "未加载"
 let _mcpToolCache = [];        // OpenAI tool schemas for the connected MCP tools
 const _mcpToolMap = new Map(); // sanitized full name -> { server, tool }
 
@@ -9175,7 +9693,7 @@ async function _ensureMcpTools() {
     try {
       const tools = await Promise.race([
         backend.invoke("mcp_connect", { name: sname, command: s.command, args: s.args || [], env: s.env || {}, cwd: root }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("连接超时(10s)")), 10000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("连接超时(60s)")), 60000)), // first run downloads the pkg (npx/uvx) → 10s was far too short
       ]);
       for (const t of (tools || [])) {
         if (!t || !t.name) continue;
@@ -9199,6 +9717,497 @@ async function _ensureMcpTools() {
   _mcpToolCache.sort((a, b) => (a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0));
   if (total) showToast(`已接入 ${total} 个 MCP 工具（来自 ${names.length} 个服务）`);
   if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
+}
+
+// ===== Chat-tabbar tool panels: Skills (reusable prompts) + MCP (server manager) =====
+// Shared centered modal (theme-aware). Returns { body, close }.
+function _chatToolModal(opts) {
+  const o = opts || {};
+  const overlay = document.createElement("div");
+  overlay.className = "ctp-overlay";
+  const card = document.createElement("div");
+  card.className = "ctp-card" + (o.wide ? " ctp-card--wide" : "");
+  card.innerHTML =
+    `<div class="ctp-head"><span class="ctp-head__icon">${o.icon || ""}</span><span class="ctp-head__title"></span><button class="ctp-close" type="button" aria-label="关闭">✕</button></div>` +
+    `<div class="ctp-body"></div>`;
+  card.querySelector(".ctp-head__title").textContent = o.title || "";
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  const close = () => { try { overlay.remove(); } catch {} document.removeEventListener("keydown", onKey, true); };
+  const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", onKey, true);
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  card.querySelector(".ctp-close").addEventListener("click", close);
+  return { overlay, card, body: card.querySelector(".ctp-body"), close };
+}
+
+const _SKILLS_KEY = "michael-ide.skills.v1";
+// Active skills (Claude Code-style): a skill is toggled ON, and its instructions are then INJECTED into
+// the system prompt of every send until toggled OFF. Multiple can be active. Persisted across sessions.
+const _ACTIVE_SKILLS_KEY = "michael-ide.skills.active.v1";
+let _activeSkillIds = (() => { try { const a = JSON.parse(localStorage.getItem(_ACTIVE_SKILLS_KEY) || "[]"); return new Set(Array.isArray(a) ? a : []); } catch { return new Set(); } })();
+function _saveActiveSkills() { try { localStorage.setItem(_ACTIVE_SKILLS_KEY, JSON.stringify([..._activeSkillIds])); } catch {} }
+function _isSkillActive(id) { return !!id && _activeSkillIds.has(id); }
+function _toggleSkillActive(id) { if (!id) return; if (_activeSkillIds.has(id)) _activeSkillIds.delete(id); else _activeSkillIds.add(id); _saveActiveSkills(); _updateSkillBadge(); }
+// System-prompt injection for all currently-active skills ("" when none). Appended to the system
+// message so the model treats these as standing instructions for the whole conversation.
+function _activeSkillsBlock() {
+  try {
+    if (!_activeSkillIds.size) return "";
+    const active = _loadSkillsLocal().filter((s) => s && _activeSkillIds.has(s.id) && String(s.prompt || "").trim());
+    if (!active.length) return "";
+    let out = "\n\n# 已启用的技能（用户手动开启，本次对话请始终遵循这些指令）\n";
+    active.forEach((s, i) => { out += `\n## 技能 ${i + 1}：${s.name || "未命名"}\n${String(s.prompt).trim()}\n`; });
+    return out;
+  } catch { return ""; }
+}
+// Count badge on the Skills sidebar button so active skills are visible even when the panel is closed.
+function _updateSkillBadge() {
+  try {
+    const b = document.getElementById("skillsBtn"); if (!b) return;
+    const n = _activeSkillIds.size;
+    let dot = b.querySelector(".skills-badge");
+    if (n > 0) {
+      if (!dot) { dot = document.createElement("span"); dot.className = "skills-badge"; b.appendChild(dot); }
+      dot.textContent = n > 9 ? "9+" : String(n); b.classList.add("has-active");
+    } else if (dot) { dot.remove(); b.classList.remove("has-active"); }
+  } catch {}
+}
+try { _updateSkillBadge(); } catch {}
+// Colorful "real image" skill icons — each a rounded app-icon tile (solid brand color + white glyph).
+// Deliberately NO gradient <defs>/url() refs: shared ids break across removed DOM subtrees in WKWebView.
+// Glyphs are Lucide geometry drawn in a 24-box, centered inside a 40 tile via translate(8,8). KEY is stored per skill.
+const _SIC = (bg, glyph) =>
+  '<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" class="skill-tile" role="img">' +
+  '<rect width="40" height="40" rx="11" fill="' + bg + '"/>' +
+  '<path d="M0 11A11 11 0 0 1 11 0h18a11 11 0 0 1 11 11v9H0z" fill="#fff" fill-opacity=".16"/>' +
+  '<g transform="translate(8 8)" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">' + glyph + '</g>' +
+  '</svg>';
+const _SKILL_ICONS = {
+  sparkles: _SIC('#8b5cf6', '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0L14.06 8.5A2 2 0 0 0 15.5 9.94l6.14 1.58a.5.5 0 0 1 0 .96L15.5 14.06a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0Z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>'),
+  book: _SIC('#3b82f6', '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>'),
+  search: _SIC('#0ea5e9', '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
+  code: _SIC('#4f46e5', '<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>'),
+  doc: _SIC('#0d9488', '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M16 13H8"/><path d="M16 17H8"/>'),
+  commit: _SIC('#16a34a', '<circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/>'),
+  bolt: _SIC('#f59e0b', '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>'),
+  terminal: _SIC('#334155', '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>'),
+  chat: _SIC('#db2777', '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>'),
+  pen: _SIC('#e11d48', '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>'),
+  wrench: _SIC('#ea580c', '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
+  rocket: _SIC('#dc2626', '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>'),
+};
+function _skillIcon(key) { return _SKILL_ICONS[key] || _SKILL_ICONS.sparkles; }
+// Default skill icon — a game-style skill badge: green tile + embossed white plus. Solid colors only
+// (no gradient <defs>/url() — shared ids break across removed DOM subtrees in WKWebView). The preset
+// icon picker was removed, so every non-uploaded skill shows this; uploaded skills show their image.
+const _SKILL_DEFAULT_ICON =
+  '<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" class="skill-tile" role="img">' +
+  '<rect width="40" height="40" rx="11" fill="#16a34a"/>' +
+  '<path d="M0 11A11 11 0 0 1 11 0h18a11 11 0 0 1 11 11v8H0z" fill="#fff" fill-opacity=".18"/>' +
+  '<path d="M20 12.1v17M11.5 20.6h17" stroke="#0a4a25" stroke-opacity=".3" stroke-width="4.4" stroke-linecap="round"/>' +
+  '<path d="M20 11.5v17M11.5 20h17" stroke="#fff" stroke-width="4.4" stroke-linecap="round"/>' +
+  '</svg>';
+const _ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const _ICON_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+const _ICON_PENCIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+const _ICON_IMPORT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M12 18v-6"/><path d="m9 15 3 3 3-3"/></svg>';
+// A skill's `icon` is EITHER a "data:" image URL the user uploaded, OR anything else → the default badge.
+function _skillIconMarkup(icon) {
+  if (typeof icon === "string" && icon.slice(0, 5) === "data:") {
+    return '<img class="skill-tile skill-tile--img" src="' + _escAttr(icon) + '" alt="" draggable="false" />';
+  }
+  return _SKILL_DEFAULT_ICON;
+}
+// Read a user-picked image file, cover-crop to a square and re-encode small so it stays a few KB
+// (skills sync to the server as one JSON blob capped at 512KB — a raw photo would blow that instantly).
+function _skillImgFromFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type || "")) { reject(new Error("请选择图片文件")); return; }
+    if (file.size > 12 * 1024 * 1024) { reject(new Error("图片太大（请小于 12MB）")); return; }
+    const fr = new FileReader();
+    fr.onerror = () => reject(fr.error || new Error("读取失败"));
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("这不是有效的图片"));
+      img.onload = () => {
+        try {
+          const enc = (size, q) => {
+            const c = document.createElement("canvas"); c.width = size; c.height = size;
+            const ctx = c.getContext("2d");
+            const scale = Math.max(size / img.width, size / img.height); // cover
+            const w = img.width * scale, h = img.height * scale;
+            ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+            let out = "";
+            try { out = c.toDataURL("image/webp", q); } catch {}
+            if (!out || out.indexOf("data:image/webp") !== 0) { try { out = c.toDataURL("image/png"); } catch { out = ""; } }
+            return out;
+          };
+          let out = enc(128, 0.85);
+          if (out && out.length > 60000) out = enc(96, 0.72);   // still chunky (opaque PNG fallback) → shrink harder
+          if (out && out.length > 60000) out = enc(72, 0.6);
+          if (!out) { reject(new Error("图片编码失败")); return; }
+          resolve(out);
+        } catch (err) { reject(err); }
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+function _loadSkillsLocal() { try { const a = JSON.parse(localStorage.getItem(_SKILLS_KEY) || "null"); if (Array.isArray(a)) return a; } catch {} return []; }
+function _saveSkillsLocal(list) { try { localStorage.setItem(_SKILLS_KEY, JSON.stringify(list)); } catch {} }
+// Sync skills to the account server when logged in; localStorage stays the offline cache / fallback.
+async function _skillsApi(method, body) {
+  let token = ""; try { token = localStorage.getItem("michael_token") || ""; } catch {}
+  if (!token) return null;
+  try {
+    const r = await fetch(_michaelBase() + "/api/skills", {
+      method,
+      headers: { Authorization: "Bearer " + token, ...(body != null ? { "Content-Type": "application/json" } : {}) },
+      body: body != null ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) return null;
+    return method === "GET" ? await r.json() : true;
+  } catch { return null; }
+}
+async function _loadSkills() {
+  const remote = await _skillsApi("GET");
+  if (Array.isArray(remote)) { _saveSkillsLocal(remote); return remote; }
+  return _loadSkillsLocal();
+}
+async function _saveSkills(list) { _saveSkillsLocal(list); await _skillsApi("PUT", list); }
+// Fill a skill's instruction into the composer. APPENDS (blank line between) so several skills stack —
+// click 使用 on each. Validates empty prompts and toasts, so it's always clear something happened.
+function _useSkill(skill) {
+  const text = String((skill && skill.prompt) || "").trim();
+  if (!text) { showToast("这个技能没有指令内容"); return; }
+  try {
+    const cur = String(promptEl.value || "").replace(/\s+$/, "");
+    promptEl.value = cur ? cur + "\n\n" + text : text;
+    promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+    try { promptEl.focus(); const n = String(promptEl.value || "").length; if (promptEl.setSelectionRange) promptEl.setSelectionRange(n); } catch {}
+    showToast("已填入：" + (skill.name || "技能"));
+  } catch { showToast("填入失败，请重试"); }
+}
+async function openSkillsPanel() {
+  const m = _chatToolModal({ title: "Skills · 技能", icon: _ICON_SKILLS });
+  let editing = null, skills = [];
+  const persist = () => { _saveSkills(skills); }; // fire-and-forget local + server sync
+  m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
+  skills = await _loadSkills();
+  const renderList = () => {
+    m.body.innerHTML = "";
+    const intro = document.createElement("p"); intro.className = "ctp-intro";
+    intro.textContent = "把常用指令存成技能。点「使用」把技能注入到对话（像 Claude Code 的 skill——启用后它的指令会自动加进每次对话）。可同时启用多个，点「取消使用」关掉。登录后会自动同步到你的账号。";
+    m.body.appendChild(intro);
+    const list = document.createElement("div"); list.className = "ctp-list";
+    if (!skills.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有技能。点下面「新建技能」创建你自己的。"; list.appendChild(e); }
+    skills.forEach((s, i) => {
+      const on = _isSkillActive(s.id);
+      const row = document.createElement("div"); row.className = "skill-row" + (on ? " is-active" : "");
+      row.innerHTML =
+        `<span class="skill-row__icon">${_skillIconMarkup(s.icon)}</span>` +
+        `<div class="skill-row__main"><div class="skill-row__name"></div><div class="skill-row__desc"></div></div>` +
+        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消使用" : "使用"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
+      row.querySelector(".skill-row__name").textContent = s.name || "(未命名)";
+      row.querySelector(".skill-row__desc").textContent = s.desc || (s.prompt || "").slice(0, 64);
+      // 使用 = toggle this skill's injection into the prompt (Claude Code-style). Multiple can be active.
+      row.querySelector("._use").addEventListener("click", () => {
+        _toggleSkillActive(s.id);
+        showToast(_isSkillActive(s.id) ? "已启用技能：" + (s.name || "技能") + "（会注入到对话）" : "已取消：" + (s.name || "技能"));
+        renderList();
+      });
+      row.querySelector("._edit").addEventListener("click", () => { editing = { ...s, _idx: i }; renderForm(); });
+      row.querySelector("._del").addEventListener("click", () => { if (s.id) { _activeSkillIds.delete(s.id); _saveActiveSkills(); _updateSkillBadge(); } skills.splice(i, 1); persist(); renderList(); });
+      list.appendChild(row);
+    });
+    m.body.appendChild(list);
+    const foot = document.createElement("div"); foot.className = "ctp-foot";
+    // Import a document (.md / .txt) as a skill — reads the file, opens the form pre-filled for review.
+    const impFile = document.createElement("input");
+    impFile.type = "file"; impFile.accept = ".md,.markdown,.mdx,.txt,.text,text/plain,text/markdown"; impFile.style.display = "none";
+    impFile.addEventListener("change", async () => {
+      const f = impFile.files && impFile.files[0]; impFile.value = "";
+      if (!f) return;
+      try {
+        const body = String((await f.text()) || "").trim();
+        if (!body) { showToast("这个文档是空的"); return; }
+        const base = String(f.name || "技能").replace(/\.[^.]+$/, "").trim();
+        const h = body.match(/^\s*#\s+(.+?)\s*$/m);           // markdown "# Title" → skill name, else filename
+        editing = { name: String(h ? h[1] : base).slice(0, 60), icon: "", desc: "", prompt: body, _idx: -1 };
+        renderForm();
+      } catch { showToast("读取文档失败"); }
+    });
+    const impBtn = document.createElement("button"); impBtn.className = "ctp-btn"; impBtn.type = "button";
+    impBtn.style.cssText = "display:inline-flex;align-items:center;gap:6px;";
+    impBtn.innerHTML = _ICON_IMPORT + "<span>导入文档</span>";
+    impBtn.title = "从 .md / .txt 文档导入一个技能";
+    impBtn.addEventListener("click", () => impFile.click());
+    const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 新建技能";
+    addBtn.addEventListener("click", () => { editing = { name: "", icon: "", desc: "", prompt: "", _idx: -1 }; renderForm(); });
+    foot.appendChild(impFile); foot.appendChild(impBtn); foot.appendChild(addBtn);
+    m.body.appendChild(foot);
+  };
+  const renderForm = () => {
+    const e = editing;
+    const isImg = typeof e.icon === "string" && e.icon.slice(0, 5) === "data:";
+    let curIcon = isImg ? "sparkles" : (e.icon || "sparkles");
+    let curImg = isImg ? e.icon : "";   // user-uploaded image (data URL) or ""
+    let usingImg = isImg;               // is the uploaded image the chosen icon?
+    m.body.innerHTML = "";
+    const form = document.createElement("div"); form.className = "ctp-form";
+    form.innerHTML =
+      `<label class="ctp-lbl">名称</label><input class="ctp-input _name" placeholder="例如：代码审查" />` +
+      `<label class="ctp-lbl">图标</label><div class="skill-iconpick"></div>` +
+      `<label class="ctp-lbl">简介（可选）</label><input class="ctp-input _desc" placeholder="一句话说明这个技能" />` +
+      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="5" placeholder="点「使用」时填入对话框的完整指令…"></textarea>` +
+      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存</button></div>`;
+    m.body.appendChild(form);
+    const pick = form.querySelector(".skill-iconpick");
+    const fileInput = document.createElement("input");
+    fileInput.type = "file"; fileInput.accept = "image/*"; fileInput.style.display = "none";
+    form.appendChild(fileInput);
+    const rebuildPick = () => {
+      pick.innerHTML = "";
+      if (curImg) {                     // preview of the user's uploaded image
+        const prev = document.createElement("div");
+        prev.className = "skill-upload__preview";
+        prev.innerHTML = '<img class="skill-tile skill-tile--img" src="' + _escAttr(curImg) + '" alt="" draggable="false" />';
+        pick.appendChild(prev);
+      }
+      const up = document.createElement("button");
+      up.type = "button"; up.className = "skill-upload"; up.title = "上传图片作为技能图标";
+      up.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v10"/><path d="m8 9 4-4 4 4"/><path d="M4 15v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>' +
+        "<span>" + (curImg ? "换一张图片" : "上传图片") + "</span>";
+      up.addEventListener("click", () => fileInput.click());
+      pick.appendChild(up);
+    };
+    fileInput.addEventListener("change", async () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileInput.value = "";
+      if (!f) return;
+      try { curImg = await _skillImgFromFile(f); usingImg = true; rebuildPick(); }
+      catch (err) { showToast(err && err.message ? err.message : "图片处理失败"); }
+    });
+    rebuildPick();
+    form.querySelector("._name").value = e.name || "";
+    form.querySelector("._desc").value = e.desc || "";
+    form.querySelector("._prompt").value = e.prompt || "";
+    form.querySelector("._cancel").addEventListener("click", () => { editing = null; renderList(); });
+    form.querySelector("._save").addEventListener("click", () => {
+      const name = form.querySelector("._name").value.trim();
+      const prompt = form.querySelector("._prompt").value.trim();
+      if (!name || !prompt) { showToast("请填写名称和指令内容"); return; }
+      const skill = { id: e.id || ("s" + Date.now().toString(36)), name, icon: (usingImg && curImg) ? curImg : curIcon, desc: form.querySelector("._desc").value.trim(), prompt };
+      if (e._idx >= 0) skills[e._idx] = skill; else skills.push(skill);
+      persist(); editing = null; renderList();
+    });
+    setTimeout(() => { try { form.querySelector("._name").focus(); } catch {} }, 0);
+  };
+  renderList();
+}
+
+// Common MCP servers for one-click add (fills the form; user reviews args/token then saves).
+// Real, current MCP servers (verified 2026-07). npx = Node, uvx = Python (needs `uv`). Env keys are
+// shown blank in the form for the user to fill. Grouped like Claude Code's list.
+const _MCP_PRESETS = [
+  // —— 官方参考服务（github.com/modelcontextprotocol/servers）——
+  { group: "官方参考服务", name: "filesystem", desc: "读写本地文件（可配目录白名单）", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+  { group: "官方参考服务", name: "memory", desc: "知识图谱式持久记忆", command: "npx", args: ["-y", "@modelcontextprotocol/server-memory"] },
+  { group: "官方参考服务", name: "sequential-thinking", desc: "结构化多步推理", command: "npx", args: ["-y", "@modelcontextprotocol/server-sequential-thinking"] },
+  { group: "官方参考服务", name: "fetch", desc: "抓网页转 Markdown（需 uvx / Python）", command: "uvx", args: ["mcp-server-fetch"] },
+  { group: "官方参考服务", name: "git", desc: "读取 / 搜索 / 操作 Git 仓库（需 uvx）", command: "uvx", args: ["mcp-server-git", "--repository", "."] },
+  { group: "官方参考服务", name: "time", desc: "时间与时区转换（需 uvx）", command: "uvx", args: ["mcp-server-time"] },
+  { group: "官方参考服务", name: "everything", desc: "官方示例服务（prompt / 资源 / 工具全都有）", command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] },
+  // —— 常见第三方集成 ——
+  { group: "常见集成", name: "github", desc: "GitHub 仓库 / PR / issue（需 Token）", command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_PERSONAL_ACCESS_TOKEN: "" } },
+  { group: "常见集成", name: "gitlab", desc: "GitLab 项目 / MR / issue（需 Token）", command: "npx", args: ["-y", "@modelcontextprotocol/server-gitlab"], env: { GITLAB_PERSONAL_ACCESS_TOKEN: "" } },
+  { group: "常见集成", name: "brave-search", desc: "Brave 联网搜索（需 API Key）", command: "npx", args: ["-y", "@modelcontextprotocol/server-brave-search"], env: { BRAVE_API_KEY: "" } },
+  { group: "常见集成", name: "duckduckgo", desc: "DuckDuckGo 联网搜索（免费、免 key）", command: "uvx", args: ["duckduckgo-mcp-server"] },
+  { group: "常见集成", name: "postgres", desc: "查询 PostgreSQL（把连接串改成你的）", command: "npx", args: ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"] },
+  { group: "常见集成", name: "sqlite", desc: "查询 / 写入 SQLite 数据库", command: "uvx", args: ["mcp-server-sqlite", "--db-path", "./data.db"] },
+  { group: "常见集成", name: "puppeteer", desc: "Puppeteer 浏览器自动化", command: "npx", args: ["-y", "@modelcontextprotocol/server-puppeteer"] },
+  { group: "常见集成", name: "slack", desc: "Slack 收发消息 / 频道（需 Token）", command: "npx", args: ["-y", "@modelcontextprotocol/server-slack"], env: { SLACK_BOT_TOKEN: "", SLACK_TEAM_ID: "" } },
+  { group: "常见集成", name: "google-maps", desc: "Google 地图 / 地理编码（需 API Key）", command: "npx", args: ["-y", "@modelcontextprotocol/server-google-maps"], env: { GOOGLE_MAPS_API_KEY: "" } },
+  // —— 热门社区服务 ——
+  { group: "热门社区", name: "playwright", desc: "Playwright 浏览器自动化（微软官方）", command: "npx", args: ["@playwright/mcp@latest"] },
+  { group: "热门社区", name: "context7", desc: "拉取库 / 框架的最新官方文档（Upstash）", command: "npx", args: ["-y", "@upstash/context7-mcp"] },
+  { group: "热门社区", name: "firecrawl", desc: "Firecrawl 网页抓取 / 爬取（需 API Key）", command: "npx", args: ["-y", "firecrawl-mcp"], env: { FIRECRAWL_API_KEY: "" } },
+  { group: "热门社区", name: "tavily", desc: "Tavily 联网搜索 / 抓取 / 研究（需 API Key）", command: "npx", args: ["-y", "tavily-mcp"], env: { TAVILY_API_KEY: "" } },
+  { group: "热门社区", name: "notion", desc: "Notion 页面 / 数据库（需在 OPENAPI_MCP_HEADERS 填 token 头）", command: "npx", args: ["-y", "@notionhq/notion-mcp-server"], env: { OPENAPI_MCP_HEADERS: "" } },
+  // —— 更多真实服务（社区 + 官方，按需填 key/连接串；首次连接要下载包会慢一点）——
+  { group: "更多", name: "exa", desc: "Exa 语义联网搜索（需 API Key）", command: "npx", args: ["-y", "exa-mcp-server"], env: { EXA_API_KEY: "" } },
+  { group: "更多", name: "youtube-transcript", desc: "抓取 YouTube 视频字幕 / 文字稿", command: "npx", args: ["-y", "@kimtaeyoon83/mcp-server-youtube-transcript"] },
+  { group: "更多", name: "airtable", desc: "读写 Airtable 表格（需 Token）", command: "npx", args: ["-y", "airtable-mcp-server"], env: { AIRTABLE_API_KEY: "" } },
+  { group: "更多", name: "mongodb", desc: "查询 MongoDB（填连接串）", command: "npx", args: ["-y", "mongodb-mcp-server"], env: { MDB_MCP_CONNECTION_STRING: "" } },
+  { group: "更多", name: "supabase", desc: "Supabase 项目 / 数据库（需 Token）", command: "npx", args: ["-y", "@supabase/mcp-server-supabase", "--read-only"], env: { SUPABASE_ACCESS_TOKEN: "" } },
+  { group: "更多", name: "redis", desc: "读写 Redis（把连接串改成你的）", command: "npx", args: ["-y", "@modelcontextprotocol/server-redis", "redis://localhost:6379"] },
+  { group: "更多", name: "neon", desc: "Neon 云 Postgres（需 API Key）", command: "npx", args: ["-y", "@neondatabase/mcp-server-neon", "start"], env: { NEON_API_KEY: "" } },
+  { group: "更多", name: "kubernetes", desc: "操作 K8s 集群（用本机 kubeconfig）", command: "npx", args: ["-y", "mcp-server-kubernetes"] },
+  { group: "更多", name: "browserbase", desc: "Browserbase 云浏览器自动化（需 Key）", command: "npx", args: ["-y", "@browserbasehq/mcp-server-browserbase"], env: { BROWSERBASE_API_KEY: "", BROWSERBASE_PROJECT_ID: "" } },
+  { group: "更多", name: "e2b", desc: "E2B 云沙箱里跑代码（需 API Key）", command: "npx", args: ["-y", "@e2b/mcp-server"], env: { E2B_API_KEY: "" } },
+  { group: "更多", name: "figma", desc: "读取 Figma 设计稿 / 布局（需 Token）", command: "npx", args: ["-y", "figma-developer-mcp", "--stdio"], env: { FIGMA_API_KEY: "" } },
+  { group: "更多", name: "21st-magic", desc: "21st.dev Magic 生成 UI 组件（需 Key）", command: "npx", args: ["-y", "@21st-dev/magic"], env: { API_KEY: "" } },
+  { group: "更多", name: "everart", desc: "EverArt AI 生图（需 API Key）", command: "npx", args: ["-y", "@modelcontextprotocol/server-everart"], env: { EVERART_API_KEY: "" } },
+  { group: "更多", name: "stripe", desc: "Stripe 支付 / 客户 / 发票（把 --api-key 换成你的）", command: "npx", args: ["-y", "@stripe/mcp", "--tools=all", "--api-key=sk_test_你的密钥"] },
+  { group: "更多", name: "apify", desc: "Apify 爬虫 / Actor（需 Token）", command: "npx", args: ["-y", "@apify/actors-mcp-server"], env: { APIFY_TOKEN: "" } },
+  { group: "更多", name: "sentry", desc: "Sentry 错误监控（需 Auth Token）", command: "npx", args: ["-y", "@modelcontextprotocol/server-sentry"], env: { SENTRY_AUTH_TOKEN: "" } },
+  { group: "更多", name: "gdrive", desc: "Google Drive 搜索 / 读取（需 OAuth）", command: "npx", args: ["-y", "@modelcontextprotocol/server-gdrive"] },
+  { group: "更多", name: "aws-kb", desc: "AWS Bedrock 知识库检索（需 AWS 凭据）", command: "npx", args: ["-y", "@modelcontextprotocol/server-aws-kb-retrieval"], env: { AWS_ACCESS_KEY_ID: "", AWS_SECRET_ACCESS_KEY: "" } },
+];
+// Where to GET the API key/token for servers that need one — shown as a clickable link in the add form.
+const _MCP_KEY_URLS = {
+  GITHUB_PERSONAL_ACCESS_TOKEN: "https://github.com/settings/tokens",
+  GITLAB_PERSONAL_ACCESS_TOKEN: "https://gitlab.com/-/user_settings/personal_access_tokens",
+  BRAVE_API_KEY: "https://api-dashboard.search.brave.com/app/keys",
+  TAVILY_API_KEY: "https://app.tavily.com/home",
+  FIRECRAWL_API_KEY: "https://www.firecrawl.dev/app/api-keys",
+  GOOGLE_MAPS_API_KEY: "https://console.cloud.google.com/google/maps-apis/credentials",
+  SLACK_BOT_TOKEN: "https://api.slack.com/apps",
+  OPENAPI_MCP_HEADERS: "https://www.notion.so/my-integrations",
+  EXA_API_KEY: "https://dashboard.exa.ai/api-keys",
+  AIRTABLE_API_KEY: "https://airtable.com/create/tokens",
+  SUPABASE_ACCESS_TOKEN: "https://supabase.com/dashboard/account/tokens",
+  NEON_API_KEY: "https://console.neon.tech/app/settings/api-keys",
+  E2B_API_KEY: "https://e2b.dev/dashboard?tab=keys",
+  FIGMA_API_KEY: "https://www.figma.com/developers/api#access-tokens",
+  EVERART_API_KEY: "https://www.everart.ai/",
+  APIFY_TOKEN: "https://console.apify.com/settings/integrations",
+  SENTRY_AUTH_TOKEN: "https://sentry.io/settings/account/api/auth-tokens/",
+  BROWSERBASE_API_KEY: "https://www.browserbase.com/settings",
+};
+// Open an http(s) URL in the default browser (webview window.open won't route reliably → shell out to `open`).
+function _openMcpUrl(url) {
+  try { if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + url + '"').catch(() => { try { openExternal(url); } catch {} }); return; } } catch {}
+  try { openExternal(url); } catch {}
+}
+async function openMcpPanel() {
+  const m = _chatToolModal({ title: "MCP · 服务", icon: _ICON_MCP, wide: true });
+  const root = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
+  if (!root) { m.body.innerHTML = `<div class="ctp-empty">请先打开一个工作区文件夹。<br>MCP 配置保存在工作区根目录的 <code>.mcp.json</code>。</div>`; return; }
+  const mcpPath = root + "/.mcp.json";
+  const readCfg = async () => { try { const c = JSON.parse(await backend.readTextFile(mcpPath)); return (c && typeof c === "object") ? c : { mcpServers: {} }; } catch { return { mcpServers: {} }; } };
+  const writeCfg = async (cfg) => { await backend.writeTextFile(mcpPath, JSON.stringify(cfg, null, 2)); };
+  let editing = null;
+  const renderList = async () => {
+    m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
+    const cfg = await readCfg();
+    const servers = cfg.mcpServers || cfg.servers || {};
+    const names = Object.keys(servers);
+    m.body.innerHTML = "";
+    const intro = document.createElement("div"); intro.className = "ctp-intro";
+    intro.innerHTML = `接入外部 MCP 服务（与 Claude Code / Cursor 同一标准），其工具会以 <code>mcp__服务__工具</code> 提供给智能体。配置存于 <code>.mcp.json</code>。`;
+    m.body.appendChild(intro);
+    const list = document.createElement("div"); list.className = "ctp-list";
+    names.forEach((name) => {
+      const s = servers[name] || {};
+      const connected = _mcpConnected.includes(name);
+      const toolNames = [..._mcpToolMap.values()].filter((v) => v.server === name).map((v) => v.tool);
+      const toolCount = toolNames.length;
+      const item = document.createElement("div"); item.className = "mcp-item";
+      const row = document.createElement("div"); row.className = "mcp-row";
+      row.innerHTML =
+        `<span class="mcp-row__dot ${connected ? "is-on" : ""}"></span>` +
+        `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
+        `<span class="mcp-row__tag${connected ? " is-on" : ""}${connected && toolCount ? " is-clickable" : ""}">${connected ? toolCount + " 个工具 ▾" : (_mcpConnecting ? "连接中…" : (_mcpLoaded ? "未连接" : "未加载"))}</span>` +
+        `<div class="ctp-rowbtns"><button class="ctp-iconbtn _edit" type="button" title="编辑" aria-label="编辑">${_ICON_PENCIL}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
+      row.querySelector(".mcp-row__name").textContent = name;
+      row.querySelector(".mcp-row__cmd").textContent = [s.command, ...((s.args) || [])].join(" ");
+      row.querySelector("._edit").addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, _orig: name }; renderForm(); });
+      row.querySelector("._del").addEventListener("click", async () => {
+        const c = await readCfg(); const sv = c.mcpServers || c.servers || {}; delete sv[name]; c.mcpServers = sv; delete c.servers;
+        await writeCfg(c); backend.invoke("mcp_disconnect", { name }).catch(() => {});
+        _mcpLoaded = false; await _ensureMcpTools(); renderList();
+      });
+      item.appendChild(row);
+      // Click "N 个工具" to expand the exact tool names this server exposes (agent sees them as mcp__name__tool).
+      if (connected && toolCount) {
+        const det = document.createElement("div"); det.className = "mcp-tools"; det.hidden = true;
+        toolNames.forEach((t) => { const chip = document.createElement("span"); chip.className = "mcp-tool"; chip.textContent = t; det.appendChild(chip); });
+        item.appendChild(det);
+        const tag = row.querySelector(".mcp-row__tag");
+        tag.addEventListener("click", () => { det.hidden = !det.hidden; tag.textContent = toolCount + " 个工具 " + (det.hidden ? "▾" : "▴"); });
+      }
+      list.appendChild(item);
+    });
+    // Available common servers (not yet configured) — one FULL-WIDTH ROW each, like Claude Code's MCP list.
+    const presets = _MCP_PRESETS.filter((p) => !names.includes(p.name));
+    presets.forEach((p) => {
+      const row = document.createElement("div"); row.className = "mcp-row mcp-row--avail";
+      row.innerHTML =
+        `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
+        `<button class="ctp-btn ctp-btn--sm _add" type="button">＋ 添加</button>`;
+      row.querySelector(".mcp-row__name").textContent = p.name;
+      row.querySelector(".mcp-row__cmd").textContent = p.desc;
+      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, _orig: "" }; renderForm(); });
+      list.appendChild(row);
+    });
+    if (!list.children.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有 MCP 服务，点下面「添加服务」自定义一个。"; list.appendChild(e); }
+    m.body.appendChild(list);
+    const foot = document.createElement("div"); foot.className = "ctp-foot ctp-foot--between";
+    const reBtn = document.createElement("button"); reBtn.className = "ctp-btn"; reBtn.type = "button"; reBtn.textContent = "↻ 重新连接";
+    reBtn.addEventListener("click", async () => { reBtn.disabled = true; reBtn.textContent = "连接中…"; _mcpLoaded = false; await _ensureMcpTools(); renderList(); });
+    const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 添加服务";
+    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, _orig: "" }; renderForm(); });
+    foot.append(reBtn, addBtn);
+    m.body.appendChild(foot);
+  };
+  const renderForm = () => {
+    const e = editing;
+    m.body.innerHTML = "";
+    const form = document.createElement("div"); form.className = "ctp-form";
+    form.innerHTML =
+      `<label class="ctp-lbl">服务名（英文/数字）</label><input class="ctp-input _name" placeholder="例如：filesystem" />` +
+      `<label class="ctp-lbl">启动命令</label><input class="ctp-input _cmd" placeholder="例如：npx" />` +
+      `<label class="ctp-lbl">参数（每行一个）</label><textarea class="ctp-textarea _args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;."></textarea>` +
+      `<label class="ctp-lbl">环境变量（KEY=VALUE，每行一个，可选）</label><textarea class="ctp-textarea _env" rows="2" placeholder="API_KEY=xxxx"></textarea>` +
+      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存并连接</button></div>`;
+    m.body.appendChild(form);
+    form.querySelector("._name").value = e.name || "";
+    form.querySelector("._cmd").value = e.command || "";
+    form.querySelector("._args").value = (e.args || []).join("\n");
+    form.querySelector("._env").value = Object.entries(e.env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+    // Show WHERE to get the key/token for env vars we know about (clickable → opens in the browser).
+    const _keyLinks = Object.keys(e.env || {}).filter((k) => _MCP_KEY_URLS[k]);
+    if (_keyLinks.length) {
+      const hint = document.createElement("div"); hint.className = "mcp-keyhint";
+      _keyLinks.forEach((k) => {
+        const a = document.createElement("a"); a.href = "#"; a.className = "mcp-keyhint__link";
+        a.textContent = "🔑 去申请 " + k + " →";
+        a.addEventListener("click", (ev) => { ev.preventDefault(); _openMcpUrl(_MCP_KEY_URLS[k]); });
+        hint.appendChild(a);
+      });
+      const envEl = form.querySelector("._env");
+      if (envEl && envEl.parentNode) envEl.parentNode.insertBefore(hint, envEl.nextSibling);
+    }
+    form.querySelector("._cancel").addEventListener("click", () => { editing = null; renderList(); });
+    form.querySelector("._save").addEventListener("click", async () => {
+      const name = form.querySelector("._name").value.trim().replace(/\s+/g, "-");
+      const command = form.querySelector("._cmd").value.trim();
+      if (!name || !command) { showToast("请填写服务名和启动命令"); return; }
+      const args = form.querySelector("._args").value.split("\n").map((x) => x.trim()).filter(Boolean);
+      const env = {};
+      form.querySelector("._env").value.split("\n").map((x) => x.trim()).filter((l) => l.includes("=")).forEach((l) => {
+        const k = l.slice(0, l.indexOf("=")).trim(); if (k) env[k] = l.slice(l.indexOf("=") + 1).trim();
+      });
+      const c = await readCfg(); const sv = c.mcpServers || c.servers || {};
+      if (e._orig && e._orig !== name) delete sv[e._orig];
+      sv[name] = { command, ...(args.length ? { args } : {}), ...(Object.keys(env).length ? { env } : {}) };
+      c.mcpServers = sv; delete c.servers;
+      await writeCfg(c);
+      editing = null;
+      m.body.innerHTML = `<div class="ctp-loading">正在连接「${_escHtml(name)}」…</div>`;
+      _mcpLoaded = false; await _ensureMcpTools(); renderList();
+    });
+    setTimeout(() => { try { form.querySelector("._name").focus(); } catch {} }, 0);
+  };
+  // Auto-connect on open so the user sees LIVE status, not a stale 未加载. First run downloads the
+  // package (npx/uvx) so it can take a while → show 连接中… and re-render with the real result.
+  if (!_mcpLoaded) _mcpConnecting = true;
+  renderList();
+  if (_mcpConnecting) _ensureMcpTools().catch(() => {}).finally(() => { _mcpConnecting = false; renderList(); });
 }
 
 // --- Demo recorder: capture the REAL feature in action as a step-by-step
@@ -10264,7 +11273,7 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "nodes", "press", "set_value", "move", "click", "double_click", "drag", "type", "key", "scroll", "batch"], description: "要执行的操作。drag=按住左键从起点拖到终点(滑块/拖拽/排序/画布)。" }, ref: { type: "integer", description: "**节点操作必填/点击首选**：节点列表里的节点号（press/set_value/click/move、drag起点 用，最准，不用估坐标）" }, to_ref: { type: "integer", description: "drag 终点：拖到这个节点上（节点号）" }, to_x: { type: "integer", description: "drag 终点 x 坐标（没有 to_ref 时用）" }, to_y: { type: "integer", description: "drag 终点 y 坐标" }, steps: { type: "array", description: "batch 用：连续步骤数组，每项 {op:click/double_click/move/type/key/scrol…", items: { type: "object" } }, x: { type: "integer", description: "目标 x 坐标(像素)——没有合适 ref 时才用" }, y: { type: "integer", description: "目标 y 坐标(像素)——没有合适 ref 时才用" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元…", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navig…", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "**仅用于交互式 UI 测试 / 走登录多步表单**（抓网页数据请改用 http_request 或写爬虫脚本，别用它一页页看着抄）。自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元…", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navig…", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -10308,10 +11317,10 @@ function _buildAgentToolSchemas(includeWrite) {
 const _TOOL_BUNDLES = {
   design:  { tools: ["design_research", "style_wardrobe", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare"], triggers: /ui|界面|设计|design|页面|配色|landing|落地页|网站|网页|dashboard|后台|原型|风格|主题|好看|美化|前端|portfolio|作品集|首页|官网|商城|登录页|注册页|海报|banner/i },
   desktop: { tools: ["computer", "system", "decode_qr"], triggers: /电脑|桌面|鼠标|键盘|window|软件|computer|desktop|二维码|\bqr\b|操控.{0,4}(app|应用|软件)|自动化操作|点开.{0,4}(软件|应用)/i },
-  browser: { tools: ["browser", "screenshot"], triggers: /浏览器|网页|截图|browser|screenshot|渲染|预览|抓取|爬虫|爬取|页面.{0,4}(测|看|对)|https?:\/\//i },
+  browser: { tools: ["browser", "screenshot"], triggers: /浏览器|网页|截图|browser|screenshot|渲染|预览|页面.{0,4}(测|看|对)|https?:\/\//i },
   github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"], triggers: /\bpr\b|pull request|github|\bgh\b|\bci\b|actions|工作流|评审|代码审查|review|合并请求/i },
   db:      { tools: ["db_query"], triggers: /数据库|\bsql\b|mysql|postgres|redis|sqlite|\bdb\b|查表|建表|迁移|migration|索引|schema|存储过程/i },
-  net:     { tools: ["http_request", "download_file"], triggers: /\bapi\b|http|请求|下载|download|webhook|接口|抓包|调.{0,2}接口|rest|graphql/i },
+  net:     { tools: ["http_request", "download_file"], triggers: /\bapi\b|http|请求|下载|download|webhook|接口|抓包|调.{0,2}接口|rest|graphql|爬虫|爬取|抓取|抓数据|采集|scrape|crawl|spider/i },
   remote:  { tools: ["remote"], triggers: /远程|服务器|\bremote\b|\bssh\b|部署到|另一台|他的机器|生产机|远端/i },
   demo:    { tools: ["start_demo", "stop_demo"], triggers: /演示|录屏|\bdemo\b|回放|录制.{0,2}流程|走查/i },
 };
@@ -11716,7 +12725,8 @@ async function _compactHistoryIfHuge(config, session) {
   // Operate on the OWNING session's history, captured by the caller — this awaits
   // a summary call, and if the user switches tabs mid-await the global `history`
   // proxy would point at a different session and we'd splice the wrong one.
-  const hist = (session || _currentSession())?.history;
+  const sess = session || _currentSession();
+  const hist = sess?.memory ? sess.memory.assemble() : (sess?.history || []);
   if (!Array.isArray(hist) || hist.length < 8) return;
   let total = 0;
   for (const m of hist) total += m.content ? String(m.content).length : 0;
@@ -11776,15 +12786,17 @@ function _relTo(p, root) {
   if (root && p && p.startsWith(root.replace(/\/+$/, "") + "/")) return p.slice(root.replace(/\/+$/, "").length + 1);
   return p;
 }
+// Returns { model, created }. `created:true` means we made a TRANSIENT model for a file that isn't
+// open in a tab — the caller MUST dispose it when done (else one Monaco model leaks per distinct
+// file the agent's find_symbol/find_references/format tools ever touch). `created:false` = reused an
+// existing/open-tab model, which the caller must NOT dispose (it's live in the editor).
 async function _modelForPath(fp) {
   if (typeof monaco === "undefined") return null;
   const uri = monaco.Uri.file(fp);
-  let model = monaco.editor.getModel(uri);
-  if (!model) {
-    try { const c = await backend.readTextFile(fp); model = monaco.editor.createModel(c ?? "", undefined, uri); }
-    catch { return null; }
-  }
-  return model;
+  const existing = monaco.editor.getModel(uri);
+  if (existing) return { model: existing, created: false };
+  try { const c = await backend.readTextFile(fp); return { model: monaco.editor.createModel(c ?? "", undefined, uri), created: true }; }
+  catch { return null; }
 }
 async function _tsWorkerClient(model) {
   const ns = monaco.languages?.typescript;
@@ -12083,67 +13095,76 @@ function scheduleSymbolIndex() {
 }
 
 async function _tsWorkerSymbols(fp) {
-  const model = await _modelForPath(fp); if (!model) return null;
-  const client = await _tsWorkerClient(model); if (!client) return null;
-  let items; try { items = await client.getNavigationBarItems(model.uri.toString()); } catch { return null; }
-  if (!Array.isArray(items)) return null;
-  const out = [];
-  const walk = (arr, depth) => {
-    for (const it of arr) {
-      const span = (it.spans && it.spans[0]) || null;
-      const line = span ? model.getPositionAt(span.start).lineNumber : null;
-      const real = it.text && it.text !== "<global>";
-      if (real) out.push({ name: it.text, kind: it.kind || "", line, depth });
-      if (Array.isArray(it.childItems) && it.childItems.length) walk(it.childItems, depth + (real ? 1 : 0));
-    }
-  };
-  walk(items, 0);
-  return out;
+  const _m = await _modelForPath(fp); if (!_m) return null;
+  const { model, created } = _m;
+  try {
+    const client = await _tsWorkerClient(model); if (!client) return null;
+    let items; try { items = await client.getNavigationBarItems(model.uri.toString()); } catch { return null; }
+    if (!Array.isArray(items)) return null;
+    const out = [];
+    const walk = (arr, depth) => {
+      for (const it of arr) {
+        const span = (it.spans && it.spans[0]) || null;
+        const line = span ? model.getPositionAt(span.start).lineNumber : null;
+        const real = it.text && it.text !== "<global>";
+        if (real) out.push({ name: it.text, kind: it.kind || "", line, depth });
+        if (Array.isArray(it.childItems) && it.childItems.length) walk(it.childItems, depth + (real ? 1 : 0));
+      }
+    };
+    walk(items, 0);
+    return out;
+  } finally { if (created) { try { model.dispose(); } catch {} } }
 }
 async function _tsWorkerLocate(fp, line, character, op) {
-  const model = await _modelForPath(fp); if (!model) return null;
-  const client = await _tsWorkerClient(model); if (!client) return null;
-  let offset; try { offset = model.getOffsetAt({ lineNumber: line, column: (character | 0) + 1 }); } catch { return null; }
-  let res;
+  const _m = await _modelForPath(fp); if (!_m) return null;
+  const { model, created } = _m;
   try {
-    res = op === "references"
-      ? await client.getReferencesAtPosition(model.uri.toString(), offset)
-      : await client.getDefinitionAtPosition(model.uri.toString(), offset);
-  } catch { return null; }
-  if (!Array.isArray(res)) return null;
-  return res.map((r) => {
-    let p = r.fileName;
-    try { p = monaco.Uri.parse(r.fileName).fsPath; } catch { /* keep raw */ }
-    let ln = null;
-    try { const m2 = monaco.editor.getModel(monaco.Uri.parse(r.fileName)); if (m2 && r.textSpan) ln = m2.getPositionAt(r.textSpan.start).lineNumber; } catch { /* unknown line */ }
-    return { path: p, line: ln };
-  });
+    const client = await _tsWorkerClient(model); if (!client) return null;
+    let offset; try { offset = model.getOffsetAt({ lineNumber: line, column: (character | 0) + 1 }); } catch { return null; }
+    let res;
+    try {
+      res = op === "references"
+        ? await client.getReferencesAtPosition(model.uri.toString(), offset)
+        : await client.getDefinitionAtPosition(model.uri.toString(), offset);
+    } catch { return null; }
+    if (!Array.isArray(res)) return null;
+    return res.map((r) => {
+      let p = r.fileName;
+      try { p = monaco.Uri.parse(r.fileName).fsPath; } catch { /* keep raw */ }
+      let ln = null;
+      try { const m2 = monaco.editor.getModel(monaco.Uri.parse(r.fileName)); if (m2 && r.textSpan) ln = m2.getPositionAt(r.textSpan.start).lineNumber; } catch { /* unknown line */ }
+      return { path: p, line: ln };
+    });
+  } finally { if (created) { try { model.dispose(); } catch {} } }
 }
 
 async function _tsWorkerFormat(fp) {
-  const model = await _modelForPath(fp); if (!model) return null;
-  const client = await _tsWorkerClient(model); if (!client) return null;
-  const opts = {
-    tabSize: 2, indentSize: 2, convertTabsToSpaces: true, newLineCharacter: "\n",
-    insertSpaceAfterCommaDelimiter: true, insertSpaceAfterSemicolonInForStatements: true,
-    insertSpaceBeforeAndAfterBinaryOperators: true, insertSpaceAfterKeywordsInControlFlowStatements: true,
-    insertSpaceAfterFunctionKeywordForAnonymousFunctions: true,
-  };
-  let edits;
-  try { edits = await client.getFormattingEditsForDocument(model.uri.toString(), opts); } catch { return null; }
-  if (!Array.isArray(edits)) return null;
-  const original = model.getValue();
-  if (!edits.length) return original;
-  const tmp = monaco.editor.createModel(original, model.getLanguageId());
+  const _m = await _modelForPath(fp); if (!_m) return null;
+  const { model, created } = _m;
   try {
-    const ops = edits.map((e) => {
-      const a = tmp.getPositionAt(e.span.start);
-      const b = tmp.getPositionAt(e.span.start + e.span.length);
-      return { range: new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column), text: e.newText };
-    });
-    tmp.applyEdits(ops);
-    return tmp.getValue();
-  } catch { return null; } finally { tmp.dispose(); }
+    const client = await _tsWorkerClient(model); if (!client) return null;
+    const opts = {
+      tabSize: 2, indentSize: 2, convertTabsToSpaces: true, newLineCharacter: "\n",
+      insertSpaceAfterCommaDelimiter: true, insertSpaceAfterSemicolonInForStatements: true,
+      insertSpaceBeforeAndAfterBinaryOperators: true, insertSpaceAfterKeywordsInControlFlowStatements: true,
+      insertSpaceAfterFunctionKeywordForAnonymousFunctions: true,
+    };
+    let edits;
+    try { edits = await client.getFormattingEditsForDocument(model.uri.toString(), opts); } catch { return null; }
+    if (!Array.isArray(edits)) return null;
+    const original = model.getValue();
+    if (!edits.length) return original;
+    const tmp = monaco.editor.createModel(original, model.getLanguageId());
+    try {
+      const ops = edits.map((e) => {
+        const a = tmp.getPositionAt(e.span.start);
+        const b = tmp.getPositionAt(e.span.start + e.span.length);
+        return { range: new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column), text: e.newText };
+      });
+      tmp.applyEdits(ops);
+      return tmp.getValue();
+    } catch { return null; } finally { tmp.dispose(); }
+  } finally { if (created) { try { model.dispose(); } catch {} } }
 }
 
 async function _agentFindFiles(root, pattern) {
@@ -12289,21 +13310,23 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
     if (!_live() || !reasoningAcc.trim()) return;
     _removeAllThinking(body);
     if (!reasoningEl) {
-      reasoningEl = document.createElement("details");
-      reasoningEl.className = "agent-reasoning";
-      reasoningEl.open = true; // 默认展开，让用户看到它在想什么
-      reasoningEl.style.cssText = "margin:2px 0 8px";
-      reasoningEl.innerHTML = `<summary style="cursor:pointer;opacity:.6;font-size:12px;user-select:none;list-style:none">💭 思考过程（点击展开/收起）</summary><div class="agent-reasoning__body" style="margin-top:4px;padding:6px 10px;border-left:2px solid var(--border,#e5e7eb);opacity:.82;font-size:12.5px;line-height:1.6"></div>`;
+      reasoningEl = document.createElement("div");
+      reasoningEl.className = "think-card streaming"; // unified with the plain-chat reasoning card
+      reasoningEl.dataset.open = "1";
+      reasoningEl._t0 = Date.now();
+      reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
+      // expand/collapse handled by the delegated listener on chatEl (survives snapshot restore)
       body.appendChild(reasoningEl);
     }
-    const b = reasoningEl.querySelector(".agent-reasoning__body");
+    const b = reasoningEl.querySelector(".think-body");
     if (b) {
+      const _stick = b.scrollHeight - b.scrollTop - b.clientHeight < 48; // was the user at the bottom?
       b.dataset.rawText = reasoningAcc; // saved for the final non-streaming pass on settle
-      // Render reasoning as MARKDOWN (bold / lists / inline code / fenced blocks) —
-      // not raw text — so it reads naturally instead of showing literal ** and 1. ；
-      // streaming:true so a half-typed fence can't blow up the parser.
+      // Render reasoning as MARKDOWN so it reads naturally; streaming:true so a half-typed fence
+      // can't blow up the parser.
       try { renderMarkdownInto(b, reasoningAcc, { streaming: true, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
       catch { b.textContent = reasoningAcc; }
+      if (_stick) b.scrollTop = b.scrollHeight; // auto-follow the newest reasoning (unless the user scrolled up to read)
     }
     if (!session || session === _currentSession()) _chatFollow();
   };
@@ -12311,9 +13334,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   // open fence/list is finished), then collapse it (内容自动折叠).
   const settleReasoning = () => {
     if (!reasoningEl) return;
-    const b = reasoningEl.querySelector(".agent-reasoning__body");
+    const b = reasoningEl.querySelector(".think-body");
     if (b && b.dataset.rawText) { try { renderMarkdownInto(b, b.dataset.rawText, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); } catch {} }
-    reasoningEl.open = false;
+    reasoningEl.dataset.open = "0";
+    reasoningEl.classList.remove("streaming");
+    const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考";
+    _thinkSetDuration(reasoningEl);
   };
   const scheduleReasoning = () => { if (!reasoningTimer) reasoningTimer = setTimeout(renderReasoning, 90); };
 
@@ -12368,7 +13394,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
         if (ev.kind === "reasoning") { produced = true; reasoningAcc += (ev.delta || ""); scheduleReasoning(); }
         else if (ev.kind === "token") {
           produced = true; acc += ev.delta; schedule();
-          if (reasoningEl && reasoningEl.open) settleReasoning(); // answer started → final render + fold the thinking
+          if (reasoningEl && reasoningEl.dataset.open === "1") settleReasoning(); // answer started → final render + fold the thinking
         }
         else if (ev.kind === "toolCall") {
           produced = true;
@@ -12425,6 +13451,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   if (reasoningTimer) clearTimeout(reasoningTimer);
   renderReasoning(); // flush any pending reasoning text
   settleReasoning(); // final markdown render + collapse the thinking once the turn settles
+  _mergeTrailingThinkCards(body); // fold a run of consecutive think-cards into one (no card pile)
   _removeAllThinking(body);
 
   // Assemble tool calls from the NATIVE function-call stream (repairing malformed
@@ -12586,9 +13613,12 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // isn't yanked back), and only while the card is expanded (is-open); collapsed → never scroll.
   let _vpPinned = true;
   vp.addEventListener("scroll", () => { _vpPinned = (vp.scrollHeight - vp.scrollTop - vp.clientHeight) < 60; }, { passive: true });
+  // NOTE: captured + disconnected in the finally below. An un-disconnected MutationObserver stays
+  // active for the life of the page and pins `vp`/`card` in memory — one leaked per sub-agent/worker.
+  let _vpObserver = null;
   try {
-    new MutationObserver(() => { if (_vpPinned && card.classList.contains("is-open")) vp.scrollTop = vp.scrollHeight; })
-      .observe(vp, { childList: true, subtree: true, characterData: true });
+    _vpObserver = new MutationObserver(() => { if (_vpPinned && card.classList.contains("is-open")) vp.scrollTop = vp.scrollHeight; });
+    _vpObserver.observe(vp, { childList: true, subtree: true, characterData: true });
   } catch {}
   _chatFollow();
 
@@ -12688,6 +13718,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     }
   } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
   finally {
+    // Stop observing the sub-agent viewport — otherwise the observer (and the card/vp DOM it
+    // retains) leaks for the life of the page, one per sub-agent/worker call.
+    try { if (_vpObserver) _vpObserver.disconnect(); } catch {}
     // Free this worker's scope so a later sibling can reuse those paths.
     if (write && run._activeWorkerScopes) {
       const idx = run._activeWorkerScopes.indexOf(scopeRel);
@@ -12724,6 +13757,14 @@ async function _detectVerifyCmd(root) {
     if (s.typecheck) return "npm run typecheck";
     if (s["type-check"]) return "npm run type-check";
     if (s.build) return "npm run build";
+    // Plain-JS / no-tsconfig fallbacks — WITHOUT these the finish-gate verify was a no-op for the
+    // largest population of projects (web/JS), silently letting broken edits "finish". Prefer a
+    // user-defined check/lint script (safe: the user set it up), then a configured ESLint.
+    if (s.check) return "npm run check";
+    if (s.lint) return "npm run lint";
+    if (await has(".eslintrc.js") || await has(".eslintrc.json") || await has(".eslintrc.cjs") || await has(".eslintrc.yml") || await has("eslint.config.js") || await has("eslint.config.mjs")) {
+      return "npx --no-install eslint . 2>&1 || npx -y eslint .";
+    }
   } catch {}
   return null;
 }
@@ -12872,7 +13913,8 @@ const _TOOL_CATALOG = [
   { name: "get_diagnostics", desc: "看报错 / 类型检查", kw: ["报错", "错误", "诊断", "lint", "类型", "error", "红线", "编译错"] },
   { name: "web_search", desc: "联网搜资料/官方文档/报错解法", kw: ["搜索", "联网", "查文档", "最新", "怎么用", "怎么解", "官方", "教程", "web", "google"] },
   { name: "web_fetch", desc: "读网页全文", kw: ["网页", "url", "抓取", "读文章", "链接", "文档地址"] },
-  { name: "browser", desc: "操控真实浏览器（测网页/点按钮/填表单/抓数据）", kw: ["浏览器", "网页", "测试", "点击", "表单", "登录", "e2e", "自动化", "网站", "爬"] },
+  { name: "http_request", desc: "调 HTTP API / 直接拉网页数据——**爬虫/抓数据首选**（http_request 或写脚本跑 run_cmd，别开浏览器看着抄）", kw: ["爬", "爬虫", "抓数据", "采集", "抓取", "接口", "api", "http", "请求", "拉数据", "scrape", "crawl", "自动化", "网站数据"] },
+  { name: "browser", desc: "**交互式**操控真实浏览器做 UI 测试 / 走登录表单（只在必须看着点时用；抓数据请写脚本、别用它）", kw: ["浏览器", "点按钮", "填表单", "登录流程", "e2e", "端到端", "测网页"] },
   { name: "screenshot", desc: "截图看渲染效果", kw: ["截图", "看效果", "界面", "ui", "渲染", "样式", "好看", "长什么样", "预览"] },
   { name: "generate_image", desc: "AI 生成图片（配图/头像/logo/插画）+ **UI 设计稿/界面原型图**（先出图给用户看再写码）", kw: ["图片", "配图", "头像", "logo", "插画", "图标", "素材", "生图", "image", "banner", "封面", "设计稿", "界面图", "原型", "mockup", "ui设计", "设计图", "出图"] },
   { name: "design_board", desc: "多张设计稿排版展示+交互选择（用户点「选这个方向」后返回选择结果，不需要再问）", kw: ["设计", "排版", "对比", "方案", "方向", "看板", "网格", "展示", "选择", "design", "board", "grid", "variant", "comparison"] },
@@ -13315,6 +14357,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Mark streaming + flip the Stop button FIRST, before any await — otherwise an
   // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
   // while _isStreaming() is still false → the Stop click is a dead no-op.
+  session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   const _live = () => !!session.streaming;
@@ -13381,6 +14424,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
   let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
+  let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   const _readFiles = new Set();  // files explicitly read in this run (for read-before-edit check)
   let blindEditNudges = 0;       // nudge count when editing un-read files
   let _readOnlyOps = 0;          // cumulative read/search/find/list/lsp/semsearch ops this run
@@ -13400,7 +14444,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Procedural memory (self-improvement): if this run hit failures / got stuck and
   // then recovered, prompt it once at the end to record the "pitfall → fix" lesson
   // via `remember` (auto-loaded next time → it stops re-hitting the same trap).
-  let runHadTrouble = false, memoryNudges = 0, interleaveVerifies = 0;
+  let runHadTrouble = false, memoryNudges = 0, interleaveVerifies = 0, goalNudges = 0, quietTurns = 0;
   // Multi-agent review gate (Planner/Worker/Judge): before a SUBSTANTIAL change is
   // declared done, a fresh INDEPENDENT reviewer sub-agent audits the diff (no echo
   // chamber); only confirmed real issues are fed back to fix. Runs once.
@@ -13481,16 +14525,31 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       }
       const turn = await _agentModelTurn({ config, messages, toolSchemas, body, session, ideMode: "agent" });
       if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
+      // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
+      // calls (writing files / running commands). Previously the loop only re-checked _live()
+      // at the NEXT iteration's top, so a stopped agent still ran a whole turn of tools first
+      // — the core "点终止有时候停不掉" bug.
+      if (!_live()) break;
       if (turn.error) { finalErr = turn.error; break; }
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
 
       const assistantMsg = { role: "assistant", content: turn.text || "" };
       if (turn.toolCalls.length) {
         assistantMsg.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
+        quietTurns = 0; // real action → reset the consecutive-quiet counter
       }
       messages.push(assistantMsg);
 
       if (!turn.toolCalls.length) {
+        quietTurns++;
+        // Anti-pile / anti-runaway: once the model keeps going quiet AFTER being nudged to finish
+        // (it's re-confirming "done" without acting), stop firing more finish-gates — extra ones
+        // only burn turns and stack up "I'm done" thinking cards. 4 consecutive quiet turns on a
+        // verified build = genuinely done. Only short-circuits when there's nothing left to verify.
+        if (quietTurns >= 4 && (didVerify || !didMutate)) {
+          if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
+          break;
+        }
         // D — early-turn tool-first nudge: if the model just talks without calling
         // ANY tool in the first ~2 turns, that's the "too dumb" failure pattern — it
         // should be reading files / searching / planning, not writing prose. Force it.
@@ -13513,32 +14572,54 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // A — mutated files but never verified → make verification non-optional. Don't
         // just ASK: detect the project's check and RUN it ourselves, feed the real
         // result back. The model can no longer "finish" on top of broken code.
-        if (didMutate && !didVerify && verifyRuns < 3) {
+        // Converge to GREEN before finishing (the model can't "finish" on top of broken code).
+        // Improvements over the old blind 3-try cap: (1) RE-VERIFY after further edits — a later
+        // edit can re-break a passed build; (2) keep going while the error count is DROPPING (real
+        // progress), up to a generous hard ceiling; (3) once errors stop dropping, STOP forcing but
+        // make the wrap-up HONEST about what's still broken — never fake success.
+        const _needVerify = didMutate && (!didVerify || _implOps > _verifiedAtImplOps) && verifyRuns < _AGENT_MAX_VERIFY;
+        if (_needVerify && _live()) {
           let _vcmd = null;
           try { _vcmd = await _detectVerifyCmd(root); } catch {}
-          if (_vcmd && _live()) {
+          if (_vcmd) {
             verifyRuns++;
             let _vr;
-            try { _vr = await backend.taskRunCapture(root, _vcmd + " 2>&1"); }
+            try {
+              // 90s hard cap — a build stuck in watch/interactive mode must not wedge the finish.
+              // On timeout return an ambiguous result (no error markers) → treated as inconclusive,
+              // not a real failure, so the run can wrap up honestly instead of hanging.
+              _vr = await Promise.race([
+                backend.taskRunCapture(root, _vcmd + " 2>&1"),
+                new Promise((r) => setTimeout(() => r({ code: -1, stdout: "", stderr: "[verify 超时：90s 未结束，已跳过本次校验]" }), 90000)),
+              ]);
+            }
             catch (e) { _vr = { code: 1, stdout: "", stderr: String(e?.message || e) }; }
             const _vout = ((_vr.stdout || "") + (_vr.stderr || "")).trim();
-            // Only FORCE a fix on CLEAR error markers (a timeout/ambiguous exit on a big
-            // project must not be misread as a real failure).
-            const _vfail = /error\[|error TS\d|: error|error:|npm ERR!|panicked|cannot find (module|name)|\bFAILED\b|build failed|✖/i.test(_vout);
-            if (_vfail) {
-              // Don't mark verified → after the fix this gate re-fires and re-checks,
-              // CONVERGING to green (bounded to 3 auto-runs so it can't loop forever).
+            // Count CLEAR error markers (a timeout/ambiguous exit must not read as a real failure).
+            const _errs = (_vout.match(/error\[|error TS\d|: error|error:|npm ERR!|panicked|cannot find (module|name)|\bFAILED\b|build failed|✖/gi) || []).length;
+            if (_errs > 0) {
               runHadTrouble = true;
-              messages.push({ role: "user", content: `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次自动验证），**没通过**——先定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\`` });
+              // Progress guard: are errors dropping vs the previous auto-run?
+              const _progress = _prevVerifyErrs === null || _errs < _prevVerifyErrs;
+              _prevVerifyErrs = _errs;
+              _noProgressVerify = _progress ? 0 : _noProgressVerify + 1;
+              if (_noProgressVerify >= 2 || verifyRuns >= _AGENT_MAX_VERIFY) {
+                // Genuinely stuck — stop the auto-loop, but DEMAND honesty (no faking "done").
+                didVerify = true; _verifiedAtImplOps = _implOps;
+                messages.push({ role: "user", content: `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\`` });
+              } else {
+                messages.push({ role: "user", content: `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\`` });
+              }
             } else {
-              didVerify = true;
-              messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。可以收尾了（若还有该跑的测试再补）。` });
+              // Green. Record the op count so a LATER edit re-triggers verification.
+              didVerify = true; _verifiedAtImplOps = _implOps; _prevVerifyErrs = null; _noProgressVerify = 0;
+              messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。` });
             }
             continue;
           }
-          // No detectable check → nudge once, then stop re-nudging.
-          didVerify = true;
-          messages.push({ role: "user", content: "你改了文件但还没验证。先用 run_cmd 跑相关的构建/测试/类型检查（如 npm run build、cargo check、pytest、tsc --noEmit），或用 get_diagnostics 看报错；确认通过后再收尾。若这个项目确实没有可跑的验证，简短说明原因即可。" });
+          // No detectable check command → nudge once (don't re-nudge every round).
+          didVerify = true; _verifiedAtImplOps = _implOps;
+          messages.push({ role: "user", content: "你改了文件但还没验证。**光读代码不算验证——去实际跑一下**：\n· 能编译 / 测试的：run_cmd 跑构建 / 测试 / 类型检查（npm run build、cargo check、pytest、tsc --noEmit）或 get_diagnostics 看报错。\n· **能跑起来的东西（网站 / 服务 / 脚本 / CLI / 爬虫）：真正把它起起来跑一遍**——后台起服务后用 http_request / curl 访问关键路径，确认返回 200 且内容对；脚本 / CLI 就执行它看输出对不对；盯着有没有运行时报错。**编译过 ≠ 跑得起来**，亲眼看它跑通了才算数。\n确认真能跑通再收尾；若这项目确实没法自动验证，简短说明原因即可。" });
           continue;
         }
         // C — independent reviewer gate = EVALUATOR-OPTIMIZER convergence loop: for a
@@ -13547,7 +14628,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // the reviewer says PASS or _AGENT_MAX_REVIEWS rounds. Re-reviews ONLY after new edits
         // (_implOps grew) → converges, never churns on an unchanged diff. A separate agent =
         // real external feedback, not the model self-grading. "The lead only sees green code."
-        if (didMutate && _mutatedFiles.size >= 2 && reviewGates < _AGENT_MAX_REVIEWS && _implOps > _reviewedAtImplOps && _live() && run.mode === "agent") {
+        // Only for a genuinely SUBSTANTIAL change (≥3 real CODE files) — a small script + its config/data,
+        // or a few-line edit, does NOT need a full independent review pass (that was just noise on小事情).
+        const _codeMut = [..._mutatedFiles].filter((f) => !/\.(json|txt|csv|md|markdown|lock|ya?ml|toml|ini|env|cfg|conf|log|data)$/i.test(f)).length;
+        if (didMutate && _codeMut >= 3 && reviewGates < _AGENT_MAX_REVIEWS && _implOps > _reviewedAtImplOps && _live() && run.mode === "agent") {
           reviewGates++;
           _reviewedAtImplOps = _implOps; // mark this diff reviewed; re-fire only after further edits
           let _diff = "";
@@ -13564,6 +14648,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
           // PASS / 无法解析 / 子智能体失败 → 不阻塞，继续收尾。
         }
+        // D — goal-completeness gate: the model went quiet and is about to finish. For a
+        // non-trivial task that actually changed files, make it check its output against EVERY
+        // part of the original request before breaking — catches silent drift ("did A, forgot B",
+        // the #1 "用户要的根本没做完" failure). Fires ONCE, only for substantial work (skips
+        // 小事情 / quick edits per user feedback), and never while a steer is pending. Cheap:
+        // one self-check turn, no sub-agent (the review sub-agent was the noise the user hated).
+        {
+          const _origReq = String(run._originalText || "").trim();
+          const _substantial = _mutatedFiles.size >= 2 || _origReq.length >= 50;
+          const _steerPending = Array.isArray(session._steerQueue) && session._steerQueue.length;
+          if (didMutate && !_quick() && _substantial && goalNudges < 1 && !_steerPending && _live() && run.mode === "agent") {
+            goalNudges++;
+            messages.push({ role: "user", content: "收尾前，把你的产出**逐条对照用户最初那条需求**核对一遍：\n「" + _origReq.slice(0, 800) + "」\n把它拆成一个个具体要求，逐个问：这条做到了吗？有没有哪块**没做 / 只做了一半 / 做偏了 / 只搭了架子没填真内容**？\n· 全都做到、且验证过能用 → 一句话确认，收尾。\n· 有遗漏或跑偏 → **现在就补完 / 纠正再收尾**，绝不把没做完的当做完的交出去。（这是自检，别为此多绕流程；确实全做完了就直接收尾。）" });
+            continue;
+          }
+        }
         // B — honesty gate: a tool just FAILED / was unavailable, and now you're
         // wrapping up. Don't paper over it. Either actually fix it, or state plainly
         // in your summary that THIS step did not succeed, why, and what you'll do.
@@ -13579,6 +14679,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           messages.push({ role: "user", content: "这次过程中遇到过卡点 / 失败、最后绕过去了。收尾前用 remember 记**一条简短、可复用**的「坑 → 根因 → 解法」经验——比如某命令在这个项目要怎么跑、某依赖 / 环境的怪癖、某个约定。下次自动加载，遇到同类情况就不再栽。**只记长期有用的，一次性细节别记**；若这次的坑确实只是偶发、没有可复用的教训，跳过即可、别硬记。" });
           continue;
         }
+        // A steer ("引导" / a 2nd message) arrived during THIS turn — it's sitting in the
+        // queue but the loop was about to end and would never drain it. Loop once more so the
+        // top-of-loop drain splices it in and the model actually acts on the new message,
+        // instead of it being stranded until (maybe never) a future turn.
+        if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
         break; // truly done
       }
 
@@ -13951,7 +15056,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           didMutate = true;
           for (const s of (it.call.scope || [])) _mutatedFiles.add(_normRel(s, root));
         }
-        if (t === "diag") didVerify = true;
+        // (removed) merely CALLING get_diagnostics no longer counts as "verified" — only the finish-gate's
+        // real check (which counts actual error markers) sets didVerify. A tool call ≠ a passing result.
         if (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp") didInvestigate = true;
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
@@ -13960,7 +15066,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (t === "write" || t === "edit" || t === "multiedit") _implOps++;
         if (t === "read" && it.call.path) _readFiles.add(it.call.path);
         if (t === "edit" || t === "multiedit") didEdit = true;
-        if (t === "cmd" && /\b(test|tests|build|check|lint|tsc|typecheck|cargo|pytest|jest|vitest|mocha|phpunit|gradle|make|go\s+(build|test|vet))\b/i.test(it.call.command || "")) didVerify = true;
+        // (removed) running a build/test command no longer counts as "verified" by its NAME — the model
+        // could run a FAILING test and satisfy the gate. Only the finish-gate's real error-count sets it.
         if (it.tc.name === "update_plan") {
           planSteps = run._planSteps || it.call.steps;
           if (Array.isArray(planSteps)) {
@@ -14033,7 +15140,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       for (let i = 0; i < items.length; i++) {
         const c = items[i].call;
         if (!c) continue;
-        const sig = c.type + ":" + String(c.command || c.path || c.selector || c.action || c.url || c.op || c.title || "").slice(0, 80);
+        // Signature must DISTINGUISH distinct calls. Truncating to 80 chars collapsed different
+        // commands that share a boilerplate prefix (e.g. many `python3 -c "import requests…"`
+        // one-liners hitting DIFFERENT urls) into ONE sig → the loop-detector falsely screamed
+        // "repeating the same operation" and stopped a perfectly-progressing run. Keep a short
+        // readable prefix + a hash of the FULL arg string so distinct calls stay distinct.
+        const _sraw = String(c.command || c.path || c.selector || c.action || c.url || c.op || c.title || "");
+        let _sh = 5381; for (let _k = 0; _k < _sraw.length; _k++) _sh = ((_sh << 5) + _sh + _sraw.charCodeAt(_k)) | 0;
+        const sig = c.type + ":" + _sraw.slice(0, 48) + "#" + (_sh >>> 0);
         const failed = /\[(失败|ERROR|BLOCKED|DENIED|不可用|未执行|权限问题)\]/.test((toolMsgs[i] && toolMsgs[i].content) || "");
         _callLog.push({ sig, failed });
       }
@@ -14056,7 +15170,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // failures, OR same call repeated 4+ times even if succeeding (likely
         // pointless re-reads / re-lists). Tightening from the old maxRepeat>=3
         // which fired on benign "list_dir(.)" repeats during exploration.
-        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 4) && stuckNudges < 2 && _live()) {
+        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6) && stuckNudges < 2 && _live()) {
           stuckNudges++;
           runHadTrouble = true;
           const _stuckSig = win.map((e) => e.sig).join("; ").slice(0, 400);
@@ -14076,41 +15190,49 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
-      // Dynamic budget: about to run out of steps — if there's clearly MORE to do
-      // and we're still making real progress (not flailing), extend rather than
-      // dead-stop half-done. Bounded (≤2 extensions, ≤90 steps) so it can't run away.
-      if (iter === budget - 1 && extensions < _AGENT_MAX_EXTENSIONS && budget < _AGENT_HARD_CEIL && _live()) {
-        const recent = _callLog.slice(-6);
+      // Dynamic budget: about to run out of steps. The user wants runs to FINISH on their own, not
+      // stop at a step number to ask "继续" — so KEEP EXTENDING as long as the agent isn't flailing.
+      // A model that's actually done stops itself (goes quiet → finish gates) well before any cap.
+      // We only refuse to extend when it's FLAILING (real 空转) — that surfaces honestly below.
+      if (iter === budget - 1 && budget < _AGENT_HARD_CEIL && _live()) {
+        const recent = _callLog.slice(-8);
         const recentFails = recent.filter((e) => e.failed).length;
-        // stuckNudges is capped at 2 (above), so the old `>= 3` was DEAD CODE → a run that kept
-        // "succeeding" at pointless repeats never flailed and extended to the 300 ceiling ("全面
-        // 死循环"). Use `>= 2`, and treat repeating the SAME call 4+ times as flailing too.
-        const _sigs = recent.map((e) => e.sig);
-        const spinning = _sigs.length >= 4 && new Set(_sigs).size <= 1;
-        const flailing = stuckNudges >= 2 || recentFails >= 5 || spinning;
-        // PROGRESS GATE: only extend if this window ACTUALLY advanced state (new files mutated or
-        // new plan steps completed) since the last extension — otherwise a run that just re-reads
-        // / re-plans without progress livelocks to 300. This is the real "死循环" brake.
+        // Spinning = the recent window is dominated by a tiny set of repeated calls — a tight loop
+        // (all identical) OR a loose A-B-A-B livelock (≤2 distinct across the last 8): no forward motion.
+        const _sigs = recent.map((e) => e.sig).filter(Boolean);
+        // HARD-STOP only on GENUINE stuck — never on distinct, succeeding work (a scraper / poller
+        // legitimately makes many similar-looking calls; that's progress, not flailing). Real
+        // signals: a heavy failure streak, the stuck-rethink already fired twice AND failures
+        // persist, or the EXACT same call spun 5+ times (a true single-call infinite loop).
+        const _sigCounts = _sigs.reduce((m, s) => ((m[s] = (m[s] || 0) + 1), m), {});
+        const sameCallSpin = Object.values(_sigCounts).some((n) => n >= 5);
+        const flailing = recentFails >= 6 || (stuckNudges >= 2 && recentFails >= 2) || sameCallSpin;
+        // Progress = anything genuinely NEW since the last check: a file mutated, a plan step done,
+        // OR a new KIND of action taken (distinct tool signature). Reading / searching counts — a
+        // real investigation phase must NEVER read as "stalled" (that was the old false-stop at ~44
+        // steps). Only doing literally nothing new is a stall.
         const _doneSteps = Array.isArray(planSteps) ? planSteps.filter((s) => s.status === "completed").length : 0;
-        const _progress = _mutatedFiles.size + _doneSteps;
+        run._sigsSeen = run._sigsSeen || new Set();
+        for (const e of recent) if (e.sig) run._sigsSeen.add(e.sig);
+        const _progress = _mutatedFiles.size + _doneSteps + run._sigsSeen.size;
         const madeProgress = _progress > (run._lastProgressMark || 0);
         run._lastProgressMark = _progress;
-        const pendingPlan = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
-        // Reaching the budget means the model never voluntarily stopped → likely more to do,
-        // but REQUIRE forward motion to keep extending so it can't spin forever.
-        const moreToDo = (pendingPlan || (didMutate && !didVerify) || recentFails <= 1) && madeProgress;
-        if (moreToDo && !flailing) {
+        if (!flailing && madeProgress) {
           extensions++;
           budget = Math.min(budget + _AGENT_EXT_STEP, _AGENT_HARD_CEIL);
-          const why = pendingPlan ? "计划里还有未完成步骤" : (didMutate && !didVerify) ? "改了文件还没验证通过" : "还在持续推进";
-          const note = document.createElement("div");
-          note.className = "agent-seg";
-          note.style.cssText = "opacity:.65;font-size:12px;margin:4px 0";
-          note.textContent = `🔄 任务还没完（${why}），自动延长预算、继续把它做完（最多 ${budget} 步）…`;
-          body.appendChild(note);
-          _scroll();
+          if (extensions === 1 || extensions % 5 === 0) { // sparse, subtle "still working" reassurance
+            const note = document.createElement("div");
+            note.className = "agent-seg";
+            note.style.cssText = "opacity:.55;font-size:12px;margin:4px 0";
+            note.textContent = `🔄 还在持续推进，自动继续把它做完…`;
+            body.appendChild(note);
+            _scroll();
+          }
+        } else {
+          run._capReason = flailing ? "flailing" : "stalled"; // remember WHY → honest wrap-up below
         }
       }
+      if (iter === budget - 1 && budget >= _AGENT_HARD_CEIL) run._capReason = run._capReason || "ceiling";
 
       if (iter === budget - 1) hitCap = true;
     }
@@ -14119,7 +15241,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
     session._steerQueue = null; // run over → no live queue to drain into
+    session._runIsLoop = null;
     if (session === _currentSession()) _setSendBtnStop(false);
+    _drainFollowups(session); // safety net: any queued follow-up (if this wasn't steered) fires now
     _removeAllThinking(body);
     // Sweep the WHOLE conversation, not just this message body — orphan "思考中"
     // placeholders (the "..." dots) from intermediate turns / sub-agents could linger
@@ -14131,7 +15255,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (hitCap) {
       const note = document.createElement("div");
       note.className = "msg__error";
-      note.textContent = `⏸️ 已经自动连续推进了 ${budget} 步${extensions ? "（中途自动延长 " + extensions + " 次）" : ""}，先停一下避免空转。如果还没做完，说声「继续」我接着干。`;
+      // Only two ways to reach here now (a done task self-stops long before any cap): the agent was
+      // There is NO step limit now — a done task self-stops (finish gates). The only ways here:
+      // FLAILING (be honest, ask for a nudge — resuming a broken loop is pointless), or a genuine
+      // no-new-progress stall (kept doing the same things without advancing). Never a step-count pause.
+      note.textContent = run._capReason === "flailing"
+        ? `⏸️ 我好像卡在原地了（在重复同一个操作 / 连续失败），先停下来避免空烧——多半是思路撞墙了。告诉我哪里不对、或补一点信息，我换个思路再来。`
+        : `⏸️ 跑了一阵、暂时没有新进展了，先停一下。如果还没做完，说声「继续」我接着干；或者告诉我卡在哪，我换个方向。`;
       body.appendChild(note);
     }
     if (finalErr) {
@@ -14151,9 +15281,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (_mutatedFiles && _mutatedFiles.size) _parts.push(`〔本轮改动的文件：${[..._mutatedFiles].join("、")}〕`);
       if (finalErr) _parts.push(`〔本轮中断/报错：${finalErr}〕`);
       const _record = _parts.join("\n\n").trim();
-      if (_record) session.history.push({ role: "assistant", content: _record });
+      if (_record) session.memory.push({ role: "assistant", content: _record });
     } catch {
-      if (!finalErr && summaryText) { try { session.history.push({ role: "assistant", content: summaryText }); } catch {} }
+      if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText }); } catch {} }
     }
     saveChatHistory(); // CRITICAL: the agent path never persisted — agent chats were lost on reopen. Save now (also captures the rendered transcript snapshot).
     // Offer to export a replayable recording of everything the agent just did.
@@ -14857,9 +15987,9 @@ async function _executeToolStep(step, call, root, run) {
           const _dirs = entries.filter(e => e.is_dir).map(e => e.name + "/").sort();
           const _files = entries.filter(e => !e.is_dir).map(e => e.name).sort();
           const listing = [..._dirs, ..._files].join("\n");
-          res.className = "atc-result atc-result--ok";
-          res.textContent = `${_dirs.length} 个文件夹 · ${_files.length} 个文件`;
-          vp.innerHTML = `<pre>${_escHtml(listing || "(空目录)")}</pre>`;
+          res.className = "atc-result atc-result--info";
+          res.innerHTML = `<span class="atc-result__t">${_dirs.length} 个文件夹 · ${_files.length} 个文件</span>`;
+          vp.innerHTML = _lsRowsHtml(_dirs, _files);
           return { type: "list", path: call.path, content: listing || "(empty directory)" };
         } catch (dirErr) {
           res.className = "atc-result atc-result--err";
@@ -14984,9 +16114,9 @@ async function _executeToolStep(step, call, root, run) {
       if (run) { run._readSeen = run._readSeen || new Map(); run._readSeen.set(usedPath, Math.max(_seen, shownTo)); run._readStep = run._readStep || new Map(); run._readStep.set(usedPath, run._toolStep); }
 
       const sizeLabel = txt.length > 1024 ? `${(txt.length / 1024).toFixed(1)} KB` : `${txt.length} chars`;
-      res.className = "atc-result atc-result--ok";
+      res.className = "atc-result atc-result--info";
       const rangeLabel = (start > 0 || shownTo < total) ? ` (${shownFrom}-${shownTo}/${total})` : "";
-      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg> ${total} lines · ${sizeLabel}${rangeLabel}`;
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg><span class="atc-result__t">${total} 行 · ${sizeLabel}${rangeLabel}</span>`;
       // Render the file content with syntax highlighting (same engine as the
       // code cards) instead of a plain-text dump — much easier to read.
       const _disp = body.slice(0, 4000);
@@ -15051,9 +16181,9 @@ async function _executeToolStep(step, call, root, run) {
       const _dirsE = entries.filter(e => e.is_dir).sort((a, b) => a.name.localeCompare(b.name));
       const _filesE = entries.filter(e => !e.is_dir).sort((a, b) => a.name.localeCompare(b.name));
       const listing = [..._dirsE.map(e => _annot(e.name, true)), ..._filesE.map(e => _annot(e.name, false))].join("\n");
-      res.className = "atc-result atc-result--ok";
-      res.textContent = `${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件`;
-      vp.innerHTML = `<pre>${_escHtml(listing || "(空目录)")}</pre>`;
+      res.className = "atc-result atc-result--info";
+      res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件</span>`;
+      vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(e.name, true)), _filesE.map((e) => _annot(e.name, false)));
       const _listPath = fp !== call.path ? `${call.path} (${fp})` : call.path;
       return { type: "list", path: _listPath, content: listing || "(empty directory)" };
 
@@ -15480,7 +16610,7 @@ async function _executeToolStep(step, call, root, run) {
       if (_agentWebCache.has(url)) {
         text = _agentWebCache.get(url);
       } else {
-        try { text = await backend.invoke("web_fetch", { url }); _webCachePut(url, text); }
+        try { text = await _invokeCapped("web_fetch", { url }, 25000, "网页抓取"); _webCachePut(url, text); }
         catch (e) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
@@ -15501,7 +16631,7 @@ async function _executeToolStep(step, call, root, run) {
       if (_agentWebCache.has("q:" + q)) {
         text = _agentWebCache.get("q:" + q);
       } else {
-        try { text = await backend.invoke("web_search", { query: q }); _webCachePut("q:" + q, text); }
+        try { text = await _invokeCapped("web_search", { query: q }, 35000, "联网搜索"); _webCachePut("q:" + q, text); }
         catch (e) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
@@ -15816,7 +16946,7 @@ async function _executeToolStep(step, call, root, run) {
           const rel = call.path.replace(/^\/+/, "");
           const lines = await backend.invoke("git_blame", { root: gitRoot, rel }) || [];
           const body2 = lines.map(l => `${String(l.line).padStart(4)}  ${l.commit}  ${l.author}  ${l.date}`).join("\n");
-          res.className = "atc-result atc-result--ok"; res.textContent = `${lines.length} 行`;
+          res.className = "atc-result atc-result--info"; res.textContent = `${lines.length} 行`;
           if (vp) vp.innerHTML = `<pre>${_escHtml(body2.slice(0, 4000) || "(无)")}</pre>`;
           return { type: "git", path: "blame", content: body2 ? `${call.path} blame（行号  提交  作者  日期）:\n${body2}` : "(空文件或无 blame 记录)" };
         } else if (call.op === "stash") {
@@ -16996,7 +18126,7 @@ async function _agentFollowUp(toolResults, container, session) {
   // Bind to the owning session so this follow-up's context + saved reply land on
   // the right tab even if the user switches away mid-stream.
   const sess = session || _currentSession();
-  const _hist = sess?.history || [];
+  const _hist = sess?.memory ? sess.memory.assemble() : (sess?.history || []);
 
   const followUpCtx = toolResults.map(r => {
     if (r.type === "read") return `--- 文件: ${r.path} ---\n${r.content}`;
@@ -18769,7 +19899,7 @@ function openMarketplaceModal() {
     listEl.hidden = false;
     const items = filteredList();
     if (!items.length) {
-      listEl.innerHTML = '<div class="mktm__empty"><p>没有找到扩展</p></div>';
+      listEl.innerHTML = '<div class="mktm__empty"><p>扩展市场暂无内容</p></div>';
       return;
     }
     for (const entry of items) {
@@ -18851,30 +19981,9 @@ function openMarketplaceModal() {
     detailEl.querySelector(".mktm__det-head").appendChild(installBtn);
   }
 
-  listEl.innerHTML = '<div class="mktm__loading"><div class="mkt-spinner"></div><span>正在加载扩展市场…</span></div>';
-  (async () => {
-    try {
-      const dbEntries = await backend.dbMarketplaceList?.().catch(() => []) || [];
-      if (dbEntries.length > 0) {
-        _mktAllEntries = dbEntries.map(e => ({
-          ...e,
-          tags: Array.isArray(e.tags) ? e.tags : (typeof e.tags === "string" ? JSON.parse(e.tags) : []),
-        }));
-      } else {
-        const remote = await backend.marketplaceList().catch(() => []);
-        _mktAllEntries = [..._BUILTIN_EXTENSIONS, ...remote.filter(r => !_BUILTIN_EXTENSIONS.some(b => b.id === r.id))];
-        if (backend.dbMarketplaceUpsert) {
-          for (const ext of _mktAllEntries) {
-            backend.dbMarketplaceUpsert({ ...ext, description: ext.description || "", category: ext.category || "Other", tags: ext.tags || [], icon: ext.icon || "default", icon_svg: null }).catch(() => {});
-          }
-        }
-      }
-      renderList();
-    } catch {
-      _mktAllEntries = _BUILTIN_EXTENSIONS;
-      renderList();
-    }
-  })();
+  // 扩展市场已清空——不再展示任何内置 / 远程扩展。
+  _mktAllEntries = [];
+  renderList();
 }
 
 function renderConflictsTool(body) {
@@ -19317,6 +20426,9 @@ function renderBreakpointsSection(body) {
   }
 }
 
+// Hoisted so renderLspTool can drop the prior render's "lsp-log" listener before re-adding —
+// the feature panel re-renders on every tab click, so this would otherwise stack on `document`.
+let _lspLogHandler = null;
 function renderLspTool(body) {
   createToolHeader(
     body,
@@ -19366,8 +20478,11 @@ function renderLspTool(body) {
     log.textContent = (lspLogBuffers.get(lang) || []).join("\n");
     log.scrollTop = log.scrollHeight;
   };
-  const onLogEvent = (e) => { if (e.detail?.lang === langSel.value) renderLog(); };
-  document.addEventListener("lsp-log", onLogEvent);
+  // Drop the previous render's handler first (feature panel re-renders on every tab click) so this
+  // document-level listener doesn't stack, each closing over a now-detached langSel/log.
+  if (_lspLogHandler) document.removeEventListener("lsp-log", _lspLogHandler);
+  _lspLogHandler = (e) => { if (e.detail?.lang === langSel.value) renderLog(); };
+  document.addEventListener("lsp-log", _lspLogHandler);
   langSel.addEventListener("change", renderLog);
 
   form.querySelector("#lspStartBtn").addEventListener("click", async () => {
@@ -19463,25 +20578,14 @@ function getMenus() {
       label: "工具",
       items: [
         { label: "运行当前文件", icon: "i-terminal", hint: "⌘R", action: () => runCurrentFile() },
-        { label: "任务运行器", icon: "i-play", action: () => openFeaturePanel("tasks") },
-        { sep: true },
-        { label: "工作区管理", icon: "i-folder", action: () => openFeaturePanel("workspace") },
-        { label: "远程开发", icon: "i-terminal", action: () => openFeaturePanel("remote") },
-        { label: "扩展市场", icon: "i-ext", action: () => openMarketplaceModal() },
-        { label: "合并冲突", icon: "i-git", action: () => openFeaturePanel("conflicts") },
-        { sep: true },
-        { label: "调试器", icon: "i-code", action: () => openFeaturePanel("debugger") },
-        { label: "语言服务器", icon: "i-code", action: () => openFeaturePanel("lsp") },
         { sep: true },
         { label: "设置", icon: "i-gear", action: () => openFeaturePanel("settings") },
-        { label: "快捷键", icon: "i-command", action: () => openFeaturePanel("shortcuts") },
       ],
     },
     {
       label: t("menu.help"),
       items: [
         { label: t("menu.documentation"), icon: "i-book", action: () => openExternal("https://github.com/fendoushaonian/Devin-Desktop") },
-        { label: t("menu.aiSettings"), icon: "i-gear", action: () => openSettings() },
         { sep: true },
         { label: t("menu.about"), icon: "i-info", action: () => showToast(t("menu.aboutMsg")) },
         { sep: true },
@@ -19497,6 +20601,9 @@ function getMenus() {
   ];
 }
 
+// Hoisted so buildMenubar can remove the PRIOR build's document-level listeners before re-adding —
+// buildMenubar re-runs on every Auto-Save toggle, and these two would otherwise stack on `document`.
+let _menubarDocClick = null, _menubarDocKey = null;
 function buildMenubar() {
   const bar = $("menubar");
   if (!bar) return;
@@ -19575,12 +20682,14 @@ function buildMenubar() {
     panels.push(panel);
   });
 
-  document.addEventListener("click", (e) => {
-    if (openIdx >= 0 && !bar.contains(e.target)) closeMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeMenu();
-  });
+  // Remove the previous build's handlers before re-adding, so repeated buildMenubar() calls
+  // (every Auto-Save toggle) never leak stacked document listeners capturing stale menubar state.
+  if (_menubarDocClick) document.removeEventListener("click", _menubarDocClick);
+  if (_menubarDocKey) document.removeEventListener("keydown", _menubarDocKey);
+  _menubarDocClick = (e) => { if (openIdx >= 0 && !bar.contains(e.target)) closeMenu(); };
+  _menubarDocKey = (e) => { if (e.key === "Escape") closeMenu(); };
+  document.addEventListener("click", _menubarDocClick);
+  document.addEventListener("keydown", _menubarDocKey);
 }
 
 // ---- wiring ----
@@ -19688,18 +20797,14 @@ if (settingsDropdown) {
     if (!item) return;
     settingsDropdown.hidden = true;
     const action = item.dataset.action;
-    if (action === "ai-settings") openSettings();
-    else if (action === "general-settings") openAdvancedTool("settings");
-    else if (action === "shortcuts") openAdvancedTool("shortcuts");
+    if (action === "general-settings") openFeaturePanel("settings");
+    else if (action === "shortcuts") openFeaturePanel("shortcuts");
     else if (action === "login") {
       const dlg = $("loginDialog");
       if (dlg) { _resetLoginUI(); const em = $("loginEmail"); if (em) em.value = ""; dlg.showModal(); setTimeout(() => em?.focus(), 0); }
     }
     else if (action === "logout") {
-      _loggedInEmail = null; _michaelUser = null;
-      try { localStorage.removeItem("michael_token"); } catch (_) {}
-      const c = loadConfig(); saveConfig({ ...c, apiKey: "" });
-      _updateLoginUI();
+      _doLogout();
     }
     else if (action === "profile") {
       showProfile();
@@ -19712,12 +20817,17 @@ $("runBtn")?.addEventListener("click", runCurrentFile);
 // login state
 let _loggedInEmail = null;
 function _updateLoginUI() {
+  _refreshUserLabels(); // relabel already-sent user messages to the current account (or back to 你 on logout)
   const dropName = document.querySelector(".settings-dropdown__name");
   const dropHint = document.querySelector(".settings-dropdown__hint");
   const profileBtn = $("profileBtn");
   const logoutBtn = $("logoutBtn");
   const loginHeader = document.querySelector(".settings-dropdown__header");
-  if (_loggedInEmail) {
+  // Gate on the ACTUAL token, not just the in-memory flag: "logged in" ⟺ a real credential exists in
+  // localStorage. So a cleared/absent token can never leave "退出登录" showing even if _loggedInEmail
+  // went stale, and a not-logged-in user (no token) is guaranteed to see 登录, not 退出登录.
+  let _tok = ""; try { _tok = localStorage.getItem("michael_token") || ""; } catch (_) {}
+  if (_loggedInEmail && _tok) {
     if (dropName) dropName.textContent = _loggedInEmail;
     // Show the live plan right here (not only in the profile card) so a plan change is
     // visible at a glance — and so it's obvious WHICH account is logged in.
@@ -19736,6 +20846,11 @@ function _updateLoginUI() {
     if (loginHeader) loginHeader.dataset.action = "login";
   }
 }
+// Force the correct initial state NOW (logged-out → profile/logout hidden). Without this the UI
+// relied purely on the HTML `hidden` attribute until restoreMichaelSession() resolved — and a dev
+// HMR update (module state resets to _loggedInEmail=null while the DOM keeps a prior hidden=false)
+// or any stale DOM would leave "退出登录" showing for a user who isn't logged in.
+_updateLoginUI();
 
 // login flow
 const loginLogoEl = $("loginLogo");
@@ -19753,10 +20868,58 @@ function _emailValid(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s || "");
 }
 function _showCodeField(show) {
-  const f = $("loginCodeField"), c = $("loginCode");
+  const f = $("loginCodeField"), c = $("loginCode"), otp = $("loginOtp");
   if (f) f.hidden = !show;
-  if (show && c) { c.value = ""; setTimeout(() => c.focus(), 0); }
+  if (c) c.value = "";
+  if (otp && otp._reset) otp._reset();
+  if (show && otp && otp._focus) setTimeout(() => otp._focus(), 0);
 }
+// 6-box verification code (Google style): digits only, auto-advance, backspace-to-prev, paste-fill,
+// and auto-submit when all 6 are in. Assembles into the hidden #loginCode the existing flow reads.
+(function _wireLoginOtp() {
+  const otp = document.getElementById("loginOtp");
+  const hidden = document.getElementById("loginCode");
+  if (!otp || !hidden) return;
+  const boxes = [...otp.querySelectorAll(".login-otp__box")];
+  const sync = () => {
+    hidden.value = boxes.map((b) => (b.value.match(/\d/) || [""])[0]).join("").slice(0, 6);
+    boxes.forEach((b) => b.classList.toggle("is-filled", !!b.value));
+  };
+  const maybeSubmit = () => { if (hidden.value.length === 6) { try { document.getElementById("loginSubmitBtn")?.click(); } catch {} } };
+  boxes.forEach((box, i) => {
+    box.addEventListener("input", () => {
+      box.value = ((box.value.match(/\d/g) || []).pop()) || ""; // keep the last typed digit
+      sync();
+      if (box.value && i < boxes.length - 1) boxes[i + 1].focus();
+      maybeSubmit();
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Backspace" && !box.value && i > 0) { e.preventDefault(); boxes[i - 1].value = ""; boxes[i - 1].focus(); sync(); }
+      else if (e.key === "ArrowLeft" && i > 0) { e.preventDefault(); boxes[i - 1].focus(); }
+      else if (e.key === "ArrowRight" && i < boxes.length - 1) { e.preventDefault(); boxes[i + 1].focus(); }
+    });
+    box.addEventListener("paste", (e) => {
+      e.preventDefault();
+      const ds = ((e.clipboardData && e.clipboardData.getData("text")) || "").replace(/\D/g, "").slice(0, 6);
+      if (!ds) return;
+      ds.split("").forEach((d, k) => { if (boxes[k]) boxes[k].value = d; });
+      sync();
+      boxes[Math.min(ds.length, boxes.length - 1)].focus();
+      maybeSubmit();
+    });
+  });
+  otp._reset = () => { boxes.forEach((b) => { b.value = ""; b.classList.remove("is-filled"); }); hidden.value = ""; };
+  otp._focus = () => { if (boxes[0]) boxes[0].focus(); };
+})();
+document.getElementById("loginResendBtn")?.addEventListener("click", async () => {
+  const email = _loginEmail || $("loginEmail")?.value?.trim();
+  if (!_emailValid(email)) return;
+  const btn = document.getElementById("loginResendBtn");
+  await _withBtn(btn, "发送中…", async () => {
+    try { const msg = await backend.authSendCode(email); showToast(typeof msg === "string" ? msg : "验证码已重新发送"); }
+    catch (e) { alert("发送失败：" + (e?.message || e)); }
+  });
+});
 function _resetLoginUI() {
   $("loginStep1").hidden = false;
   $("loginStep2").hidden = true;
@@ -19777,6 +20940,46 @@ function _finishLogin(result) {
   } else {
     alert((result && result.message) || "操作失败");
   }
+}
+// Branded confirm modal (Google-light) → resolves true/false. Used for destructive actions like
+// logout so they're deliberate AND give visible feedback (the "退出登录没有提示" fix).
+function _confirmDialog(title, body, confirmLabel, danger) {
+  return new Promise((resolve) => {
+    const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:100000;font-family:'Roboto',-apple-system,'PingFang SC',sans-serif";
+    const card = document.createElement("div");
+    card.style.cssText = "background:#fff;color:#202124;border-radius:16px;width:360px;max-width:90vw;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);overflow:hidden";
+    card.innerHTML =
+      `<div style="padding:22px 24px 6px;font-size:17px;font-weight:600">${esc(title)}</div>` +
+      (body ? `<div style="padding:2px 24px 16px;font-size:13.5px;color:#5f6368;line-height:1.6">${esc(body)}</div>` : `<div style="height:12px"></div>`) +
+      `<div style="display:flex;justify-content:flex-end;gap:10px;padding:8px 20px 18px">` +
+        `<button class="_cd-cancel" style="padding:8px 18px;border-radius:8px;border:1px solid #dadce0;background:#fff;color:#3c4043;cursor:pointer;font-size:13.5px;font-weight:600">取消</button>` +
+        `<button class="_cd-ok" style="padding:8px 18px;border-radius:8px;border:0;background:${danger ? "#d93025" : "#1a73e8"};color:#fff;cursor:pointer;font-size:13.5px;font-weight:600">${esc(confirmLabel || "确定")}</button>` +
+      `</div>`;
+    ov.appendChild(card);
+    document.body.appendChild(ov);
+    const done = (val) => { try { ov.remove(); } catch {} document.removeEventListener("keydown", onKey, true); resolve(val); };
+    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); done(false); } else if (e.key === "Enter") { e.preventDefault(); done(true); } };
+    document.addEventListener("keydown", onKey, true);
+    ov.addEventListener("click", (e) => { if (e.target === ov) done(false); });
+    card.querySelector("._cd-cancel").addEventListener("click", () => done(false));
+    card.querySelector("._cd-ok").addEventListener("click", () => done(true));
+    setTimeout(() => { try { card.querySelector("._cd-ok").focus(); } catch {} }, 0);
+  });
+}
+// Log out: confirm → clear ALL client session state → refresh UI immediately → toast. Every step is
+// guarded and the UI update runs FIRST, so a slow/failed config write can never leave the "退出登录"
+// button stuck visible (the old handler ran an unguarded saveConfig BEFORE _updateLoginUI).
+async function _doLogout() {
+  const ok = await _confirmDialog("退出登录", "退出后需要重新登录才能使用 AI。当前账号会话将从这台设备清除。", "退出登录", true);
+  if (!ok) return;
+  _loggedInEmail = null; _michaelUser = null; _lastUserRefresh = 0;
+  try { _updateLoginUI(); } catch (_) {}       // hide profile/logout NOW, before any async work
+  try { refreshModelBadge(); } catch (_) {}
+  try { localStorage.removeItem("michael_token"); } catch (_) {}
+  try { const c = loadConfig(); saveConfig({ ...c, apiKey: "" }); } catch (_) {} // async; fire-and-forget
+  try { showToast("已退出登录"); } catch (_) {}
 }
 // run an async action with the button showing a transient label, always restored
 async function _withBtn(btn, label, fn) {
@@ -19911,6 +21114,293 @@ $("searchCaseBtn").addEventListener("click", () => {
 
 const promptEl = $("prompt");
 const _sendBtnEl = $("sendBtn");
+
+function _escHtmlLite(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+// ---- Rich composer engine: #prompt is a contenteditable div so @-references render as REAL inline
+// cards. The whole app still treats it like a textarea (.value / .selectionStart / .setSelectionRange);
+// these shims serialize the DOM ⇄ text (a chip → "@rel"), so send / @-menu / slash-menu / arrow-nav /
+// paste all keep working UNCHANGED. Chips are contenteditable=false → the browser makes them atomic
+// (arrows skip them, Backspace deletes the whole chip). Chinese IME works natively. ----
+function _ceSerialize(root) {
+  let out = "";
+  const walk = (node) => {
+    for (const c of node.childNodes) {
+      if (c.nodeType === 3) out += c.nodeValue.replace(/\u200b/g, ""); // strip zero-width caret pads
+      else if (c.nodeType === 1) {
+        if (c.classList && c.classList.contains("composer-chip")) {
+          // Chips carry NO editable spacer node in the DOM (so caret nav past a chip is one keypress).
+          // Emit VIRTUAL surrounding spaces HERE so every "@rel" the send-path regex sees is
+          // space-delimited — even two chips back-to-back ([chip][chip] → " @a  @b ") or a chip
+          // dropped straight after a word ("看这个[chip]" → "看这个 @rel "). Unconditional (not
+          // context-dependent) so _ceSetCaret can mirror the exact length below and stay in sync.
+          out += " @" + (c.dataset.rel || "") + " ";
+        }
+        else if (c.tagName === "BR") out += "\n";
+        else { if ((c.tagName === "DIV" || c.tagName === "P") && out && !out.endsWith("\n")) out += "\n"; walk(c); }
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+function _ceCaretOffset() {
+  try {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return _ceSerialize(promptEl).length;
+    const r = sel.getRangeAt(0);
+    const pre = r.cloneRange();
+    pre.selectNodeContents(promptEl);
+    pre.setEnd(r.endContainer, r.endOffset);
+    const tmp = document.createElement("div");
+    tmp.appendChild(pre.cloneContents());
+    return _ceSerialize(tmp).length;
+  } catch { return _ceSerialize(promptEl).length; }
+}
+function _ceSetCaret(offset) {
+  try {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    let remaining = Math.max(0, offset), placed = false;
+    const walk = (node) => {
+      for (const c of node.childNodes) {
+        if (placed) return;
+        if (c.nodeType === 3) {
+          const raw = c.nodeValue;
+          const len = raw.replace(/\u200b/g, "").length; // zero-width caret pads don't count (match _ceSerialize)
+          if (remaining <= len) {
+            // translate the zwsp-free offset back to a raw offset (skip over any zwsp before it)
+            let ro = 0, seen = 0;
+            while (ro < raw.length && seen < remaining) { if (raw.charCodeAt(ro) !== 0x200b) seen++; ro++; }
+            range.setStart(c, ro); placed = true; return;
+          }
+          remaining -= len;
+        } else if (c.nodeType === 1) {
+          if (c.classList && c.classList.contains("composer-chip")) {
+            const len = (" @" + (c.dataset.rel || "") + " ").length; // matches _ceSerialize (leading+trailing space)
+            if (remaining <= 0) { range.setStartBefore(c); placed = true; return; }
+            if (remaining < len) { range.setStartAfter(c); placed = true; return; }
+            remaining -= len;
+          } else if (c.tagName === "BR") {
+            if (remaining <= 0) { range.setStartBefore(c); placed = true; return; }
+            remaining -= 1;
+          } else walk(c);
+        }
+      }
+    };
+    walk(promptEl);
+    if (!placed) { range.selectNodeContents(promptEl); range.collapse(false); } else range.collapse(true);
+    sel.removeAllRanges(); sel.addRange(range);
+  } catch {}
+}
+function _cePlaceholder() { try { promptEl.classList.toggle("is-empty", !_ceSerialize(promptEl).trim()); } catch {} }
+Object.defineProperty(promptEl, "value", {
+  configurable: true,
+  get() { return _ceSerialize(promptEl); },
+  set(v) { promptEl.textContent = String(v == null ? "" : v); _cePlaceholder(); },
+});
+Object.defineProperty(promptEl, "selectionStart", { configurable: true, get() { return _ceCaretOffset(); } });
+Object.defineProperty(promptEl, "selectionEnd", { configurable: true, get() { return _ceCaretOffset(); } });
+promptEl.setSelectionRange = function (a) { _ceSetCaret(a); };
+
+// ---- Voice input (语音输入) — the mic button just left of ⌘↩ ----
+// Click → capture the mic, show a LIVE waveform, and transcribe in NEAR-REAL-TIME: raw PCM is captured
+// via Web Audio and every ~0.9s the growing clip is re-transcribed and streamed into the composer, so
+// text appears and extends as you speak. At a natural pause (or ~18s) the current text is committed and
+// the window resets, keeping each transcription fast. Click again (or send) to stop → a final pass.
+//
+// IMPORTANT: deliberately does NOT use webkitSpeechRecognition — on macOS that reaches Apple's Speech-
+// Recognition framework, a TCC resource that HARD-CRASHES the app (SIGABRT) when the responsible process
+// (the launching terminal / claude) lacks NSSpeechRecognitionUsageDescription. We touch ONLY the mic
+// (already permitted) → crash-proof. Raw PCM → WAV also sidesteps WKWebView's non-streamable mp4.
+let _voiceStream = null, _voiceCtx = null, _voiceSrc = null, _voiceProc = null, _voiceTimer = 0, _voiceRate = 16000;
+let _voicePcm = [], _voicePcmLen = 0, _voiceBase = "", _voiceCommitted = "", _voiceLive = "", _voiceBusy = false, _voiceActive = false, _voiceSilence = 0, _voiceVoicedMs = 0, _voiceKey = "";
+// Whisper hallucinates these subtitle-style fillers from silence/noise. Drop them when the window
+// barely had real speech (a genuinely-spoken "谢谢" in a loud window is kept).
+const _VOICE_HALLUC = new Set(["you", "thankyou", "thanksforwatching", "pleasesubscribe", "subscribe", "bye", "byebye", "so", "okay", "谢谢", "谢谢大家", "谢谢观看", "谢谢大家观看", "谢谢您的观看", "请订阅", "请点赞订阅", "点赞订阅", "下集再见", "下期再见", "不吝点赞订阅", "明镜与点点栏目", "字幕志愿者", "中文字幕"]);
+function _voiceIsHallucination(t, voicedMs) {
+  const s = String(t || "").toLowerCase().replace(/[\s\p{P}]+/gu, "");
+  if (!s) return true;
+  return (voicedMs || 0) < 900 && _VOICE_HALLUC.has(s);
+}
+function _voiceRender() {
+  const parts = [_voiceBase, _voiceCommitted, _voiceLive].map((s) => (s || "").trim()).filter(Boolean);
+  promptEl.value = parts.join(" ");
+  try { promptEl.focus(); const n = (promptEl.value || "").length; if (promptEl.setSelectionRange) promptEl.setSelectionRange(n); } catch {}
+}
+function _voiceFloatTo16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); out[i] = s < 0 ? s * 0x8000 : s * 0x7fff; }
+  return out;
+}
+// Flatten the accumulated Float32 chunks, downsample to 16k mono, wrap in a WAV (always decodable).
+function _voicePcmToWav(chunks, inRate) {
+  let len = 0; for (const c of chunks) len += c.length;
+  const flat = new Float32Array(len); let off = 0;
+  for (const c of chunks) { flat.set(c, off); off += c.length; }
+  // Adaptive trim: per-window RMS → noise floor (20th pct) → keep only the span clearly ABOVE ambient
+  // noise (+100ms pad). Kills the leading silence/noise Whisper hallucinates subtitle text from (the
+  // "I said 2 words but extra content appeared first" bug). No clear speech → return null → caller skips.
+  const win = Math.max(1, Math.floor(inRate * 0.02));
+  const rmss = [];
+  for (let i = 0; i < flat.length; i += win) {
+    const end = Math.min(flat.length, i + win);
+    let s = 0; for (let j = i; j < end; j++) s += flat[j] * flat[j];
+    rmss.push(Math.sqrt(s / (end - i)));
+  }
+  const sorted = rmss.slice().sort((x, y) => x - y);
+  const floor = sorted.length ? sorted[Math.floor(sorted.length * 0.2)] : 0;
+  const thr = Math.max(0.02, floor * 2.5);
+  let firstW = -1, lastW = -1;
+  for (let k = 0; k < rmss.length; k++) { if (rmss[k] > thr) { if (firstW < 0) firstW = k; lastW = k; } }
+  if (firstW < 0) return null; // uniform silence/noise, no clear speech → skip (no hallucination)
+  const padW = Math.ceil((0.1 * inRate) / win);
+  const src = flat.subarray(Math.max(0, (firstW - padW) * win), Math.min(flat.length, (lastW + 1 + padW) * win));
+  const outRate = 16000;
+  let ds = src;
+  if (inRate > outRate + 1) {
+    const ratio = inRate / outRate, outLen = Math.floor(src.length / ratio);
+    ds = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const a = Math.floor(i * ratio), b = Math.min(src.length, Math.floor((i + 1) * ratio));
+      let sum = 0, n = 0; for (let j = a; j < b; j++) { sum += src[j]; n++; }
+      ds[i] = n ? sum / n : 0;
+    }
+  }
+  const pcm = _voiceFloatTo16(ds), buf = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(buf);
+  const wr = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  wr(0, "RIFF"); dv.setUint32(4, 36 + pcm.length * 2, true); wr(8, "WAVE"); wr(12, "fmt ");
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, outRate, true); dv.setUint32(28, outRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  wr(36, "data"); dv.setUint32(40, pcm.length * 2, true); new Int16Array(buf, 44).set(pcm);
+  return new Blob([buf], { type: "audio/wav" });
+}
+async function _voiceGetKey() {
+  if (_voiceKey) return _voiceKey;
+  try { const tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; const r = await fetch(MICHAEL_API + "/api/ide-key", { headers: tok ? { Authorization: "Bearer " + tok } : {} }); _voiceKey = ((await r.json()) || {}).api_key || ""; } catch {}
+  return _voiceKey;
+}
+// POST a WAV clip to the gateway's Whisper endpoint; returns the transcript text (throws on HTTP error).
+async function _voiceTranscribeBlob(blob) {
+  const key = await _voiceGetKey();
+  const fd = new FormData();
+  fd.append("file", blob, "speech.wav");
+  fd.append("model", "whisper-1");
+  const resp = await fetch(MICHAEL_API + "/v1/audio/transcriptions", { method: "POST", headers: key ? { Authorization: "Bearer " + key } : {}, body: fd });
+  if (!resp.ok) throw new Error("http " + resp.status);
+  const j = await resp.json().catch(() => ({}));
+  return String((j && (j.text || j.transcript)) || "").trim();
+}
+function _voiceCommit() {
+  if (_voiceLive) _voiceCommitted = (_voiceCommitted + " " + _voiceLive).trim();
+  _voiceLive = ""; _voicePcm = []; _voicePcmLen = 0; _voiceSilence = 0; _voiceVoicedMs = 0;
+}
+// Every ~0.9s: re-transcribe the growing window → live text; commit at a pause (or ~18s) to stay fast.
+async function _voiceTick() {
+  if (_voiceBusy || !_voiceActive || _voicePcmLen < _voiceRate * 0.5) return;
+  const rate = _voiceRate, durSec = _voicePcmLen / rate;
+  // VAD gate: only transcribe when the window holds real speech (≥300ms voiced) AND we're not sitting
+  // in a pause. Skipping silence/noise is what stops Whisper hallucinating text when you're not talking.
+  if (_voiceVoicedMs >= 300 && _voiceSilence < 450) {
+    const wav = _voicePcmToWav(_voicePcm.slice(), rate);
+    if (wav) {
+      _voiceBusy = true;
+      try {
+        const text = await _voiceTranscribeBlob(wav);
+        if (_voiceActive && text && !_voiceIsHallucination(text, _voiceVoicedMs)) { _voiceLive = text; _voiceRender(); }
+      } catch {}
+      _voiceBusy = false;
+    }
+  }
+  if (_voiceActive && ((durSec > 3.5 && _voiceSilence > 500) || durSec > 18)) _voiceCommit();
+}
+function _voiceStop(btn, cancel) {
+  btn = btn || document.getElementById("voiceBtn");
+  if (!_voiceActive && !_voiceStream) { if (btn) btn.classList.remove("is-recording"); return; }
+  _voiceActive = false;
+  if (_voiceTimer) { clearInterval(_voiceTimer); _voiceTimer = 0; }
+  try { if (_voiceProc) { _voiceProc.onaudioprocess = null; _voiceProc.disconnect(); } } catch {}
+  try { if (_voiceSrc) _voiceSrc.disconnect(); } catch {}
+  try { if (_voiceStream) _voiceStream.getTracks().forEach((t) => t.stop()); } catch {}
+  if (btn) { btn.classList.remove("is-recording"); btn.style.removeProperty("--vol"); }
+  const rate = _voiceRate, chunks = _voicePcm.slice(), haveTail = _voicePcmLen > rate * 0.3;
+  const cleanup = () => { try { if (_voiceCtx) _voiceCtx.close(); } catch {} _voiceCtx = _voiceProc = _voiceSrc = _voiceStream = null; _voicePcm = []; _voicePcmLen = 0; _voiceBusy = false; };
+  const finalWav = (!cancel && haveTail && _voiceVoicedMs >= 200) ? _voicePcmToWav(chunks, rate) : null;
+  if (!finalWav) { cleanup(); return; } // nothing / no clear speech in the tail → don't hallucinate
+  // final pass over the tail window for accuracy (it actually held speech)
+  if (btn) btn.classList.add("is-transcribing");
+  const voiced = _voiceVoicedMs;
+  _voiceTranscribeBlob(finalWav)
+    .then((text) => {
+      if (text && !_voiceIsHallucination(text, voiced)) { _voiceLive = text; _voiceRender(); }
+      else if (!_voiceCommitted && !_voiceLive) showToast("没听清，再说一次试试");
+    })
+    .catch(() => { if (!_voiceCommitted && !_voiceLive) showToast("转写失败，检查网络后再试"); })
+    .finally(() => { if (btn) btn.classList.remove("is-transcribing"); cleanup(); });
+}
+async function _voiceStart(btn) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { showToast("这个环境不支持录音"); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); }
+  catch (err) {
+    const n = (err && err.name) || "";
+    if (n === "NotFoundError" || n === "OverconstrainedError") { showToast("没找到麦克风设备"); return; }
+    // Permission denied / no system授权框 — point at System Settings (mic string needs a rebuild to prompt).
+    _confirmDialog(
+      "麦克风没授权",
+      "语音输入需要麦克风权限，但系统没弹出授权框。\n请在「系统设置 › 隐私与安全性 › 麦克风」里给 Michael IDE 打开开关。\n（首次系统授权框需要重新构建 App 后才会自动弹出。）",
+      "打开系统设置", false
+    ).then((ok) => {
+      if (!ok) return;
+      const _u = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+      try { if (backend.taskRunCapture) { backend.taskRunCapture("/", 'open "' + _u + '"').catch(() => { try { openExternal(_u); } catch {} }); return; } } catch {}
+      try { openExternal(_u); } catch {}
+    }).catch(() => {});
+    return;
+  }
+  _voiceStream = stream;
+  _voiceActive = true;
+  _voiceBase = (promptEl.value || "").trim();
+  _voiceCommitted = ""; _voiceLive = ""; _voicePcm = []; _voicePcmLen = 0; _voiceSilence = 0; _voiceVoicedMs = 0; _voiceBusy = false;
+  btn.classList.add("is-recording");
+  _voiceGetKey(); // warm the api key so the first tick isn't slowed fetching it
+  try {
+    _voiceCtx = new AC();
+    _voiceRate = _voiceCtx.sampleRate || 48000;
+    _voiceSrc = _voiceCtx.createMediaStreamSource(stream);
+    _voiceProc = _voiceCtx.createScriptProcessor(4096, 1, 1);
+    _voiceProc.onaudioprocess = (e) => {
+      const inb = e.inputBuffer.getChannelData(0);
+      const copy = new Float32Array(inb.length); copy.set(inb);
+      _voicePcm.push(copy); _voicePcmLen += copy.length;
+      let sum = 0; for (let i = 0; i < inb.length; i++) sum += inb[i] * inb[i];
+      const rms = Math.sqrt(sum / inb.length);
+      const frameMs = (inb.length / _voiceRate) * 1000;
+      _voiceSilence = rms < 0.012 ? _voiceSilence + frameMs : 0;
+      if (rms > 0.02) _voiceVoicedMs += frameMs; // real-speech energy in this window (VAD)
+      btn.style.setProperty("--vol", (0.45 + Math.min(1, rms * 14) * 1.6).toFixed(2));
+      try { e.outputBuffer.getChannelData(0).fill(0); } catch {} // silent output — no echo
+    };
+    _voiceSrc.connect(_voiceProc); _voiceProc.connect(_voiceCtx.destination);
+    _voiceTimer = setInterval(_voiceTick, 900);
+  } catch { _voiceStop(btn, true); showToast("录音启动失败"); }
+}
+{ const _vb = document.getElementById("voiceBtn"); if (_vb) _vb.addEventListener("click", () => { if (_vb.classList.contains("is-recording")) _voiceStop(_vb); else _voiceStart(_vb); }); }
+// Build a real inline card element for an @-reference (icon + name; contenteditable=false → atomic).
+function _makeComposerChip(rel) {
+  const name = rel.split("/").filter(Boolean).pop() || rel;
+  const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
+  const chip = document.createElement("span");
+  chip.className = "composer-chip";
+  chip.contentEditable = "false";
+  chip.dataset.rel = rel;
+  chip.title = rel;
+  chip.innerHTML = `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="composer-chip__name">${_escHtmlLite(name)}</span>`;
+  return chip;
+}
+promptEl.addEventListener("input", _cePlaceholder);
+_cePlaceholder();
 const _SEND_ICON = `<svg class="ic"><use href="#i-arrow-up" /></svg>`;
 const _STOP_ICON = `<svg class="ic" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>`;
 
@@ -19942,31 +21432,161 @@ _sendBtnEl?.addEventListener("click", (e) => {
 });
 
 promptEl.addEventListener("input", () => {
-  promptEl.style.height = "auto";
-  promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + "px";
+  // contenteditable auto-grows via CSS min/max-height; chips are atomic natively (no manual height,
+  // no highlight layer, no custom arrow-nav needed). Just keep the placeholder + menus in sync.
+  _cePlaceholder();
   _updateAtMenu();
   _updateSlashMenu();
 });
+// Force PLAIN-TEXT paste (a contenteditable would otherwise paste rich HTML).
+promptEl.addEventListener("paste", (e) => {
+  const txt = e.clipboardData && e.clipboardData.getData("text/plain");
+  const hasImage = e.clipboardData && [...(e.clipboardData.items || [])].some((it) => it.type && it.type.startsWith("image/"));
+  if (txt && !hasImage) { e.preventDefault(); document.execCommand("insertText", false, txt); }
+  // image paste falls through to the existing image-paste handler
+});
+// Files/dirs dragged from the tree onto the composer become @-references (chips shown above the
+// input; their content is injected on send via the existing @-mention path). Declared before the
+// submit handler that reads them.
+let _droppedRefs = [];   // [{ path, rel, name, isDir }]
+let _refChipsEl = null;
+let _rowDragCandidate = null; // { path, name, isDir, sx, sy } — mousedown on a tree row
+let _rowDragging = false;
+let _rowDragGhost = null;
+let _suppressTreeClick = false;
+
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
-  const text = promptEl.value.trim();
+  if (_voiceActive) _voiceStop(null, true); // cancel recording on send so it can't re-fill the cleared composer
+  let text = promptEl.value.trim();
+  // Prepend dropped file/dir references as @-mentions so _atContext pulls their content in.
+  const _refMentions = _droppedRefs.map((r) => "@" + r.rel).join(" ");
+  if (_refMentions) text = (_refMentions + (text ? " " + text : "")).trim();
   if (!text && _pastedImages.length === 0) return;
   // If THIS tab is already running, the message is a real-time STEER ("引导"): clear the
   // input and inject it into the live run so the agent adapts mid-task — instead of being
   // dropped. (Other tabs run concurrently; submitting on an idle tab starts its own run.)
   if (_isStreaming()) {
     promptEl.value = "";
-    promptEl.style.height = "auto";
-    _steerRunningAgent(_currentSession(), text);
+    _clearDroppedRefs();
+    const _rs = _currentSession();
+    // Agent run → real-time steer (mid-loop). Plain chat → queue as a follow-up turn
+    // (no loop to steer), processed the instant the current reply finishes.
+    if (_rs && _rs._runIsLoop) _steerRunningAgent(_rs, text);
+    else _queueFollowup(_rs, text);
     return;
   }
   const images = [..._pastedImages];
   _pastedImages = [];
   _refreshImagePreviews();
+  _clearDroppedRefs();
   promptEl.value = "";
-  promptEl.style.height = "auto";
   sendPrompt(text, images);
 });
+
+// ---- Drag a file/dir from the file tree → drop on the composer → @-reference it ----
+function _renderRefChips() {
+  const box = promptEl.parentElement; // .composer__box
+  if (!box) return;
+  if (!_droppedRefs.length) { if (_refChipsEl) { _refChipsEl.remove(); _refChipsEl = null; } return; }
+  if (!_refChipsEl) { _refChipsEl = document.createElement("div"); _refChipsEl.className = "ref-chips"; box.insertBefore(_refChipsEl, box.firstChild); }
+  _refChipsEl.innerHTML = "";
+  _droppedRefs.forEach((r, i) => {
+    const chip = document.createElement("span");
+    chip.className = "ref-chip" + (r.isDir ? " ref-chip--dir" : "");
+    chip.title = r.rel;
+    chip.innerHTML = `${iconImg(r.isDir ? folderIconUrl(r.name, false) : fileIconUrl(r.name))}<span class="ref-chip__name"></span><button type="button" class="ref-chip__x" aria-label="移除引用">×</button>`;
+    chip.querySelector(".ref-chip__name").textContent = r.name;
+    chip.querySelector(".ref-chip__x").addEventListener("click", () => { _droppedRefs.splice(i, 1); _renderRefChips(); });
+    _refChipsEl.appendChild(chip);
+  });
+}
+function _clearDroppedRefs() { _droppedRefs = []; _renderRefChips(); }
+function _addDroppedRef(info) {
+  if (!info || !info.path) return;
+  const rel = _pathToRel(info.path);
+  if (_droppedRefs.some((r) => r.rel === rel)) return; // dedupe
+  _droppedRefs.push({ path: info.path, rel, name: info.name || rel.split("/").pop() || rel, isDir: !!info.isDir });
+  _renderRefChips();
+  try { promptEl.focus(); } catch {}
+}
+// Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
+// contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
+// spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
+function _insertRefAtCursor(rel) {
+  if (!rel) return;
+  promptEl.focus();
+  const chip = _makeComposerChip(rel);
+  const sel = window.getSelection();
+  // Insert at the caret if it's inside the composer; else append at the end. Supports MULTIPLE drags
+  // (each adds another chip). NO surrounding space so caret navigation past the chip is a single press.
+  let range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+  if (!range || !promptEl.contains(range.commonAncestorContainer)) {
+    range = document.createRange();
+    range.selectNodeContents(promptEl);
+    range.collapse(false); // end of the composer
+  }
+  if (!range.collapsed) range.deleteContents();
+  range.insertNode(chip);
+  // Give the caret a text node to land in: WKWebView renders NO visible caret directly after a
+  // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
+  // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
+  // layout shift, and stripped back out by _ceSerialize so it never reaches the sent text.
+  let pad = chip.nextSibling;
+  if (!pad || pad.nodeType !== 3) {
+    pad = document.createTextNode("\u200b");
+    chip.parentNode.insertBefore(pad, chip.nextSibling);
+  }
+  const after = document.createRange();
+  after.setStart(pad, 0); // right after the chip, but INSIDE a real text node → caret is visible
+  after.collapse(true);
+  if (sel) { sel.removeAllRanges(); sel.addRange(after); }
+  promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+(function _wireTreeDragToComposer() {
+  const box = promptEl.closest(".composer__box") || promptEl.parentElement;
+  if (!box) return;
+  const _overComposer = (x, y) => {
+    const r = box.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  document.addEventListener("mousemove", (e) => {
+    if (!_rowDragCandidate) return;
+    if (!_rowDragging) {
+      // Only start a drag once the pointer clearly moves — a plain click still opens/selects.
+      if (Math.abs(e.clientX - _rowDragCandidate.sx) + Math.abs(e.clientY - _rowDragCandidate.sy) < 6) return;
+      _rowDragging = true;
+      document.body.classList.add("tree-dragging");
+      try { window.getSelection().removeAllRanges(); } catch {} // drop any selection the drag started
+      _rowDragGhost = document.createElement("div");
+      _rowDragGhost.className = "row-drag-ghost";
+      _rowDragGhost.innerHTML = `${iconImg(_rowDragCandidate.isDir ? folderIconUrl(_rowDragCandidate.name, false) : fileIconUrl(_rowDragCandidate.name))}<span></span>`;
+      _rowDragGhost.querySelector("span").textContent = _rowDragCandidate.name;
+      document.body.appendChild(_rowDragGhost);
+    }
+    if (_rowDragGhost) { _rowDragGhost.style.left = (e.clientX + 14) + "px"; _rowDragGhost.style.top = (e.clientY + 10) + "px"; }
+    box.classList.toggle("drop-target", _overComposer(e.clientX, e.clientY));
+  });
+  document.addEventListener("mouseup", (e) => {
+    document.body.classList.remove("tree-selecting");
+    if (!_rowDragCandidate) return;
+    const cand = _rowDragCandidate, wasDragging = _rowDragging;
+    _rowDragCandidate = null; _rowDragging = false;
+    if (_rowDragGhost) { _rowDragGhost.remove(); _rowDragGhost = null; }
+    document.body.classList.remove("tree-dragging");
+    box.classList.remove("drop-target");
+    if (wasDragging) {
+      // Insert an @-reference as TEXT at the cursor so the user can write a sentence around it
+      // ("当前 @folder1 是干嘛的") — the @-mention path already injects its content/listing on send.
+      if (_overComposer(e.clientX, e.clientY)) _insertRefAtCursor(_pathToRel(cand.path));
+      _suppressTreeClick = true; // swallow the click that fires right after the drag
+      setTimeout(() => { _suppressTreeClick = false; }, 80);
+    }
+  });
+})();
+// Swallow the click that follows a drag so the dragged file isn't also opened/selected.
+document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
 promptEl.addEventListener("keydown", (e) => {
   // Enter 直接发送；Shift+Enter 换行（⌘/Ctrl+Enter 也照发）。但要避开两种情况：
   //  ① @文件 / 斜杠菜单打开时，Enter 是「选中菜单项」——交给各自的处理器；
@@ -20114,12 +21734,32 @@ function _pickAt(i) {
   const tok = _atToken();
   if (!tok || !_atMatches[i]) return _hideAtMenu();
   const insert = "@" + _atMatches[i] + " ";
-  const v = promptEl.value;
-  promptEl.value = v.slice(0, tok.start) + insert + v.slice(tok.end);
-  const caret = tok.start + insert.length;
-  promptEl.setSelectionRange(caret, caret);
+  // Replace just the typed "@query" span IN PLACE via a DOM range — the `promptEl.value` setter
+  // does `textContent = …`, which would flatten any existing dropped chips into plain text. Map the
+  // serialized token offsets back to DOM with the caret walker, delete that range, insert the text.
+  let replaced = false;
+  try {
+    const sel = window.getSelection();
+    _ceSetCaret(tok.start);
+    const a = sel.getRangeAt(0);
+    const sc = a.startContainer, so = a.startOffset;
+    _ceSetCaret(tok.end);
+    const b = sel.getRangeAt(0);
+    const range = document.createRange();
+    range.setStart(sc, so);
+    range.setEnd(b.startContainer, b.startOffset);
+    range.deleteContents();
+    range.insertNode(document.createTextNode(insert));
+    replaced = true;
+  } catch {}
+  if (!replaced) { // fallback: whole-value rebuild (flattens chips, but never leaves the token unresolved)
+    const v = promptEl.value;
+    promptEl.value = v.slice(0, tok.start) + insert + v.slice(tok.end);
+  }
+  promptEl.setSelectionRange(tok.start + insert.length);
   _hideAtMenu();
   promptEl.focus();
+  promptEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
 promptEl.addEventListener("keydown", (e) => {
   if (_atMenu.hidden) return;
@@ -20213,12 +21853,12 @@ function _openSessionPicker() {
     listEl.innerHTML = "";
     const rows = _chatSessions.map((s, i) => ({ s, i })).filter(({ s }) => {
       if (!q) return true;
-      const hay = (s.name + " " + (s.project || "") + " " + s.history.map((m) => m.content || "").join(" ")).toLowerCase();
+      const hay = (s.name + " " + (s.project || "") + " " + (s.memory ? s.memory.assemble() : (s.history || [])).map((m) => m.content || "").join(" ")).toLowerCase();
       return hay.includes(q);
     });
     if (!rows.length) { listEl.innerHTML = `<div style="padding:20px;text-align:center;opacity:.5;font-size:13px">没有匹配的会话</div>`; return; }
     for (const { s, i } of rows) {
-      const last = s.history.length ? String(s.history[s.history.length - 1].content || "") : "";
+      const last = s.memory.recent.length ? String(s.memory.recent[s.memory.recent.length - 1].content || "") : "";
       const preview = last.replace(/\s+/g, " ").slice(0, 90) || "(空会话)";
       const proj = s.project ? (s.project.split("/").filter(Boolean).pop() || "") : "";
       const modeObj = _AI_MODES.find((m) => m.id === s.mode);
@@ -20231,7 +21871,7 @@ function _openSessionPicker() {
           `<span class="sp-dot" style="width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:${modeObj?.color || "#888"}"></span>` +
           `<span class="sp-name"></span>` +
           (proj ? `<span class="sp-proj" style="font-size:11px;font-weight:400;opacity:.6;padding:1px 6px;border-radius:6px;background:var(--hover,rgba(128,128,128,.14))"></span>` : "") +
-          `<span style="margin-left:auto;font-size:11px;font-weight:400;opacity:.5">${s.history.length} 条 · ${modeObj?.label || s.mode}${active ? " · 当前" : ""}</span>` +
+          `<span style="margin-left:auto;font-size:11px;font-weight:400;opacity:.5">${s.memory ? s.memory.recent.length : (s.history || []).length} 条 · ${modeObj?.label || s.mode}${active ? " · 当前" : ""}</span>` +
         `</div>` +
         `<div class="sp-prev" style="font-size:12px;opacity:.62;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>`;
       row.querySelector(".sp-name").textContent = s.name;
@@ -20380,11 +22020,40 @@ promptEl.addEventListener("paste", (e) => {
 });
 
 promptEl.parentElement.addEventListener("dragover", (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
-promptEl.parentElement.addEventListener("drop", (e) => {
+promptEl.parentElement.addEventListener("drop", async (e) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
+  const items = e.dataTransfer?.items;
+  
+  // Handle directory drop (Electron only)
+  if (items) {
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const entry = item.webkitGetAsEntry?.();
+        if (entry?.isDirectory) {
+          const relativePath = await window.__TAURI__?.path.relative(rootPath, entry.fullPath);
+          const ref = `@${relativePath || entry.name}/`;
+          promptEl.value += (promptEl.value ? "\n" : "") + ref;
+          promptEl.dispatchEvent(new Event("input"));
+          showToast(`目录引用已插入: ${ref}`);
+          continue;
+        }
+      }
+    }
+  }
+  
   if (!files) return;
   for (const file of files) {
+    // Check if it's a file path reference (from Finder/Explorer)
+    if (file.path) {
+      const relativePath = await window.__TAURI__?.path.relative(rootPath, file.path);
+      const ref = `@${relativePath || file.name}`;
+      promptEl.value += (promptEl.value ? "\n" : "") + ref;
+      promptEl.dispatchEvent(new Event("input"));
+      showToast(`文件引用已插入: ${ref}`);
+      continue;
+    }
+    
     if (file.type.startsWith("image/")) {
       const reader = new FileReader();
       reader.onload = () => {
@@ -21247,7 +22916,7 @@ async function createTermTab(customLabel) {
 
   entry.opening = true;
   try {
-    entry.backendId = await backend.termOpen(
+    const _pty = await backend.termOpen(
       { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
       (ev) => {
         if (ev.kind === "data") {
@@ -21255,6 +22924,10 @@ async function createTermTab(customLabel) {
             initBuffer += ev.data;
             return;
           }
+          // xterm.js parses ANSI escape codes (colors/formatting/cursor moves) NATIVELY — write the
+          // raw PTY bytes straight through. (The old code did `require('ansi-to-html')` here, which
+          // both crashed with "Can't find variable: require" under ESM/Vite AND was wrong: piping HTML
+          // into term.write would render literal <span> tags, not colors. That broke the terminal.)
           term.write(ev.data);
           _detectTerminalChanges(ev.data);
           // Keep a bounded tail of recent output so agent task tools can read back
@@ -21271,6 +22944,8 @@ async function createTermTab(customLabel) {
         }
       },
     );
+    entry.backendId = _pty.id;
+    entry.channel = _pty.channel; // nulled in closeTermTab so the captured xterm/entry can be GC'd
     const finishInit = () => {
       if (initDone) return;
       term.reset();
@@ -21334,6 +23009,11 @@ function closeTermTab(idx) {
   if (idx < 0 || idx >= termTabs.length) return;
   const tab = termTabs[idx];
   if (tab.backendId != null) backend.termClose(tab.backendId);
+  // Release the PTY Channel's callback — it captures this tab's xterm + entry, and Tauri never frees
+  // Channel callbacks, so without this every closed terminal leaks its whole xterm instance.
+  try { if (tab.channel) { tab.channel.onmessage = null; tab.channel = null; } } catch {}
+  clearTimeout(_ghostTimer); // drop any pending ghost render that captured this tab
+  clearTermGhost(tab);
   try { tab.webgl?.dispose(); } catch {} // release the GPU context (avoid leaking WebGL contexts)
   tab.term.dispose();
   termResizeObserver.unobserve(tab.container);
@@ -21905,7 +23585,10 @@ async function restoreSession() {
       await renderWorkspaceRoots();
       startFileWatcher();
       await refreshGitStatus();
-      for (const root of workspaceRoots) preloadProjectModels(root);
+      // Sequential await: preloadProjectModels shares a module-level token + projectModels set and
+      // clears them on entry — firing it concurrently for N roots orphans earlier roots' models
+      // (their tracking gets wiped mid-walk, so they're never disposed). One at a time = no orphan.
+      for (const root of workspaceRoots) await preloadProjectModels(root);
     } else {
       _requestWorkspaceFromPeers();
     }
@@ -21972,43 +23655,101 @@ function toggleZenMode() {
   monacoEditor.layout();
 }
 
-// ---- drag & drop files from Finder ----
+// ---- drag & drop into the IDE, with TWO clearly-distinguished drop targets ----
+// Dragging OS files/folders over the IDE lights up two zones so you can SEE where they'll land:
+//   • the file-explorer sidebar → OPEN into the working directory (file → open, folder → workspace)
+//   • the AI composer           → @-REFERENCE the file(s) as context in the chat
+// The zone under the cursor is the ACTIVE target (bright + lifted badge); the other stays dimmed.
+// Purely visual (pointer-events:none) — Tauri catches the real drop and we route it by drop position.
+const _explorerEl = document.getElementById("explorer");
+const _composerEl = document.getElementById("composer");
+// Precise Lucide-geometry icons. folder-down = open into workspace; bot = reference in AI chat.
+const _ICON_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6"/><path d="m9 13 3 3 3-3"/></svg>';
+const _ICON_AI = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>';
+function _mkDropZone(cls, labelCls, icon, label) {
+  const z = document.createElement("div");
+  z.className = cls;
+  z.innerHTML = '<span class="dz-label ' + labelCls + '">' + icon + '<span>' + label + '</span></span>';
+  return z;
+}
+if (_explorerEl) _explorerEl.appendChild(_mkDropZone("explorer-dropzone", "dz-label--open", _ICON_OPEN, "打开到工作区"));
+if (_composerEl) _composerEl.appendChild(_mkDropZone("composer-dropzone", "dz-label--ai", _ICON_AI, "引用到对话"));
+
+let _dropHideTimer = 0;
+// Which target is the cursor over? Checks the composer rect against BOTH the raw position and the
+// devicePixelRatio-divided one, so it works whether Tauri reports physical or logical px (and for the
+// browser path where we pass client px). Anything not over the composer → "open" (sidebar/editor).
+function _dragTargetAt(payload) {
+  const p = payload && payload.position;
+  if (p && _composerEl) {
+    const r = _composerEl.getBoundingClientRect();
+    if (r.width && r.height) {
+      const dpr = window.devicePixelRatio || 1;
+      const hit = (x, y) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+      if (hit(p.x / dpr, p.y / dpr) || hit(p.x, p.y)) return "composer";
+    }
+  }
+  return "open";
+}
+function _showDrop(target) {
+  clearTimeout(_dropHideTimer);
+  const composer = target === "composer";
+  if (_explorerEl) { _explorerEl.classList.add("drag-into"); _explorerEl.classList.toggle("is-over", !composer); }
+  if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", composer); }
+}
+function _hideDrop() {
+  clearTimeout(_dropHideTimer);
+  for (const el of [_explorerEl, _composerEl]) { if (el) { el.classList.remove("drag-into"); el.classList.remove("is-over"); } }
+}
+// drag-leave can fire spuriously mid-drag; debounce the hide so the zones don't flicker.
+const _hideDropSoon = () => { clearTimeout(_dropHideTimer); _dropHideTimer = setTimeout(_hideDrop, 130); };
+
+// Reference an OS path in the composer: keep it workspace-relative when inside a root, else absolute
+// so the @-mention reader can still resolve a file from outside the workspace.
+function _pathToRefArg(abs) {
+  const inWs = (workspaceRoots || []).some((w) => abs === w || abs.startsWith(w.replace(/\/$/, "") + "/"))
+    || (rootPath && abs.startsWith(rootPath.replace(/\/$/, "") + "/"));
+  return inWs ? _pathToRel(abs) : abs;
+}
+async function _handleDrop(paths, target) {
+  if (!paths || !paths.length) return;
+  if (target === "composer") {
+    for (const p of paths) _insertRefAtCursor(_pathToRefArg(p)); // add a chip per file → @-referenced on send
+    try { promptEl.focus(); } catch {}
+  } else {
+    for (const p of paths) {
+      const name = p.split("/").pop() || p;
+      const isDir = await backend.readDir(p).then(() => true).catch(() => false);
+      if (isDir) await openFolder(p);
+      else await openFile(p, name);
+    }
+  }
+}
+
+// Browser / non-Tauri path (HTML5 DnD works there; it's swallowed under Tauri WKWebView).
 editorContainer.addEventListener("dragover", (e) => {
   e.preventDefault();
   e.dataTransfer.dropEffect = "copy";
-  editorContainer.classList.add("drag-target");
+  _showDrop(_dragTargetAt({ position: { x: e.clientX, y: e.clientY } }));
 });
-editorContainer.addEventListener("dragleave", () => editorContainer.classList.remove("drag-target"));
+editorContainer.addEventListener("dragleave", () => _hideDropSoon());
 editorContainer.addEventListener("drop", async (e) => {
   e.preventDefault();
-  editorContainer.classList.remove("drag-target");
-  if (inTauri) {
-    try {
-      const { listen } = await import("@tauri-apps/api/event");
-      // Tauri drag-drop handled via event
-    } catch { /* ignore */ }
-  }
-  const files = e.dataTransfer?.files;
-  if (!files || !files.length) return;
-  for (const file of files) {
-    if (file.path) {
-      await openFile(file.path, file.name);
-    }
-  }
+  const target = _dragTargetAt({ position: { x: e.clientX, y: e.clientY } });
+  _hideDrop();
+  const files = [...(e.dataTransfer?.files || [])].map((f) => f.path).filter(Boolean);
+  await _handleDrop(files, target);
 });
+// Tauri path: window-level drag events drive the zones AND route the drop by position.
 if (inTauri) {
   import("@tauri-apps/api/event").then(({ listen }) => {
+    listen("tauri://drag-enter", (e) => _showDrop(_dragTargetAt(e.payload)));
+    listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload)));
+    listen("tauri://drag-leave", () => _hideDropSoon());
     listen("tauri://drag-drop", async (event) => {
-      const paths = event.payload?.paths || [];
-      for (const p of paths) {
-        const name = p.split("/").pop() || p;
-        const isDir = await backend.readDir(p).then(() => true).catch(() => false);
-        if (isDir) {
-          await openFolder(p);
-        } else {
-          await openFile(p, name);
-        }
-      }
+      const target = _dragTargetAt(event.payload);
+      _hideDrop();
+      await _handleDrop(event.payload?.paths || [], target);
     });
   }).catch(() => {});
 }
@@ -22500,9 +24241,10 @@ function _updateNotifBadge() {
   badge.textContent = unread > 9 ? "9+" : String(unread);
 }
 
+let _notifCenterClose = null;
 function toggleNotifCenter() {
   let panel = document.querySelector(".notif-center");
-  if (panel) { panel.remove(); return; }
+  if (panel) { (_notifCenterClose || (() => panel.remove()))(); return; } // close via the abort path
   panel = document.createElement("div");
   panel.className = "notif-center";
   panel.innerHTML = `<div class="notif-center__head"><span>Notifications</span><button class="iconbtn" id="notifClearAll" title="Clear all"><svg class="ic"><use href="#i-close" /></svg></button></div><div class="notif-center__list"></div>`;
@@ -22520,15 +24262,19 @@ function toggleNotifCenter() {
     }
   }
   _updateNotifBadge();
+  // One AbortController per open — closing via ANY path (bell toggle / Clear all / click-outside)
+  // aborts it, so the document "dismiss" listener is ALWAYS removed and can't stack across opens.
+  const ac = new AbortController();
+  _notifCenterClose = () => { try { ac.abort(); } catch {} panel.remove(); _notifCenterClose = null; };
   panel.querySelector("#notifClearAll")?.addEventListener("click", () => {
     _notifHistory.length = 0;
     _updateNotifBadge();
-    panel.remove();
-  });
+    _notifCenterClose();
+  }, { signal: ac.signal });
   document.body.appendChild(panel);
   requestAnimationFrame(() => panel.classList.add("notif-center--visible"));
-  const dismiss = (e) => { if (!panel.contains(e.target) && e.target !== $("notifBellBtn")) { panel.remove(); document.removeEventListener("click", dismiss); } };
-  setTimeout(() => document.addEventListener("click", dismiss), 50);
+  const dismiss = (e) => { if (!panel.contains(e.target) && e.target !== $("notifBellBtn")) _notifCenterClose(); };
+  setTimeout(() => document.addEventListener("click", dismiss, { signal: ac.signal }), 50);
 }
 
 function _timeAgo(ts) {
@@ -22904,3 +24650,5 @@ monacoEditor.addAction({
   contextMenuOrder: 0,
   run: () => _openCmdK(),
 });
+
+// File drop support: drag files/directories from Finder to chat textarea

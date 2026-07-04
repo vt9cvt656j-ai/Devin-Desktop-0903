@@ -54,9 +54,10 @@ async fn sql_query(
     // which is most real tables. Concrete rows fetch fine; we then decode each cell
     // best-effort and tolerate the odd exotic type per-cell instead of failing the query.
     use sqlx::Connection;
-    // The boxed query future (under tokio::timeout) requires a `'static` SQL string.
-    // Agent queries are few and short, so leaking the statement is a negligible,
-    // bounded cost — and far simpler than threading lifetimes through three backends.
+    // The query future here genuinely requires a `'static` SQL string (sqlx's query borrow escapes
+    // through the boxed/timeout'd future — a reborrow fails to compile), so we leak the statement.
+    // Agent DB queries are few and short → this is a negligible, bounded cost, and far simpler than
+    // threading lifetimes through three concrete backends. (Verified: reborrow → E0521.)
     let q: &'static str = Box::leak(q.to_owned().into_boxed_str());
     let head = q.trim_start().to_lowercase();
     let is_read = head.starts_with("select")

@@ -12,5 +12,11 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<!-- Voice input: the composer's mic button records audio and transcribes it. macOS CRASHES the
+	     app if it accesses the mic / speech recognition without these usage strings present. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Michael IDE 用麦克风做语音输入——把你说的话转成文字填进 AI 对话框。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Michael IDE 用语音识别把你的语音转写成文字。</string>
 </dict>
 </plist>

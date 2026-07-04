@@ -184,3 +184,102 @@ test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上�
   assert.match(s, /refreshToken\(\) at auth\.ts:42/); // prior findings
   assert.match(s, /401 on retry/);                    // open errors
 });
+
+test("_ceSerialize renders composer chips as space-delimited @refs so MULTIPLE drops all parse", () => {
+  const f = load("_ceSerialize");
+  // Fake the minimal DOM the walker touches: text nodes, chip elements, a plain element.
+  const T = (v) => ({ nodeType: 3, nodeValue: v });
+  const CHIP = (rel) => ({ nodeType: 1, classList: { contains: (c) => c === "composer-chip" }, dataset: { rel } });
+  const ROOT = (...kids) => ({ childNodes: kids });
+  // The send-path mention regex (must stay identical to main.js line ~8057).
+  const refs = (s) => [...s.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+
+  // Two chips dropped back-to-back ([chip][chip]) — the bug the user hit ("只能拖一个").
+  const two = f(ROOT(CHIP("src/a.js"), CHIP("lib/b")));
+  assert.equal(two, " @src/a.js  @lib/b ");
+  assert.deepEqual(refs(two), ["src/a.js", "lib/b"], "BOTH refs must parse, not just one");
+
+  // A chip dropped straight after a word, no space ("看这个[chip]"): the leading virtual
+  // space is what rescues it — without it "看这个@rel" wouldn't match (?:^|\s)@.
+  const adj = f(ROOT(T("看这个"), CHIP("dir1")));
+  assert.equal(adj, "看这个 @dir1 ");
+  assert.deepEqual(refs(adj), ["dir1"]);
+
+  // Mixed: text + chip + text + chip, and a lone chip trims cleanly on send.
+  const mixed = f(ROOT(T("先看"), CHIP("a"), T("再看"), CHIP("b/c"), T("对比")));
+  assert.deepEqual(refs(mixed), ["a", "b/c"]);
+  assert.equal(f(ROOT(CHIP("only/one"))).trim(), "@only/one");
+
+  // The zero-width caret pad (U+200B) inserted after a dropped chip must be STRIPPED, so it never
+  // reaches the sent text nor breaks the @ref (regression: "拖进来后光标看不到了" fix added the pad).
+  const padded = f(ROOT(CHIP("src/x.js"), T("​")));
+  assert.ok(!padded.includes("​"), "zero-width pad must not survive serialization");
+  assert.deepEqual(refs(padded), ["src/x.js"]);
+  // pad between two chips (drop, drop) still yields two clean refs:
+  assert.deepEqual(refs(f(ROOT(CHIP("a"), T("​"), CHIP("b"), T("​")))), ["a", "b"]);
+});
+
+test("_dynamicChatChips predicts context-aware starters (not a fixed hardcoded list)", () => {
+  const markers = (n) => Array.from({ length: n }, () => ({ severity: 8 })); // 8 = Monaco error
+  const base = {
+    activePath: "/ws/src/a.js",
+    _pathToRel: (p) => p.replace(/^\/ws\//, ""),
+    monacoEditor: { getSelection: () => ({ isEmpty: () => true }), getModel: () => ({ uri: {} }) },
+    monaco: { editor: { getModelMarkers: () => [] } },
+    openFiles: new Map([["/ws/src/a.js", { model: { uri: {} } }]]),
+    _lastGitFiles: [],
+    rootPath: "/ws",
+    workspaceRoots: ["/ws"],
+  };
+  const run = (over) => load("_dynamicChatChips", { ...base, ...over })();
+  const labels = (chips) => chips.map((c) => c.label).join(" | ");
+
+  // errors in the open file → "修复报错 (N)" is ranked FIRST (the top prediction for right now)
+  const errs = run({ monaco: { editor: { getModelMarkers: () => markers(3) } } });
+  assert.match(errs[0].label, /修复报错 \(3\)/);
+  assert.notEqual(errs[0].send, errs[0].label, "chip send is a full prompt, not just the label");
+
+  // clean file, no git → generic file starters; NO commit-message chip (nothing to commit)
+  const clean = run({});
+  assert.ok(/解释/.test(labels(clean)) && /查找潜在 Bug/.test(labels(clean)));
+  assert.ok(!/提交信息/.test(labels(clean)), "no git changes ⇒ no commit-message starter");
+
+  // uncommitted changes ⇒ commit-message / review starters surface dynamically
+  const dirty = run({ _lastGitFiles: [{ path: "src/a.js" }, { path: "src/b.js" }] });
+  assert.ok(/写提交信息/.test(labels(dirty)));
+
+  // a *.test.js file ⇒ "补充测试用例", never "编写单元测试"
+  const tf = run({ activePath: "/ws/src/a.test.js", openFiles: new Map([["/ws/src/a.test.js", { model: { uri: {} } }]]) });
+  assert.ok(/补充测试用例/.test(labels(tf)) && !/编写单元测试/.test(labels(tf)));
+
+  // selecting code ⇒ "解释选中的代码" appears
+  const sel = run({ monacoEditor: { getSelection: () => ({ isEmpty: () => false }), getModel: () => ({ uri: {} }) } });
+  assert.ok(/解释选中的代码/.test(labels(sel)));
+
+  // no file open but a project is ⇒ project-level starters (深挖这个项目 …)
+  const proj = run({ activePath: "", openFiles: new Map() });
+  assert.ok(/深挖这个项目/.test(labels(proj)));
+
+  // always bounded to 6, and a normal file yields a full row of 6
+  assert.ok(errs.length <= 6 && clean.length <= 6 && proj.length <= 6);
+  assert.equal(clean.length, 6, "a normal code file should fill all 6 starter chips");
+});
+
+test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory object, not history-object) — the '聊天内容全丢' bug", () => {
+  const store = {};
+  const localStorage = { setItem: (k, v) => { store[k] = v; }, getItem: (k) => (k in store ? store[k] : null) };
+  const memJSON = { totalTurns: 3, recent: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }], summaries: [], milestones: [] };
+  const _chatSessions = [{ id: "s1", name: "Chat 1", mode: "chat", model: "m", project: "", created: 123, memory: { toJSON: () => memJSON } }];
+  const flush = load("_flushChatHistorySync", { _chatSessions, localStorage, CHAT_STORE_KEY: "michael-ide.chat-sessions", _activeChatIdx: 0 });
+  flush();
+  const saved = JSON.parse(store["michael-ide.chat-sessions"]);
+  const s0 = saved.sessions[0];
+  // Memory must be persisted under `memory` as the serialized object — that's the ONLY object
+  // shape restoreChatHistory accepts (`sData.memory`). The old code buried it under `history`
+  // as an object, which restore silently dropped → the whole chat vanished on this sync path.
+  assert.deepEqual(s0.memory, memJSON, "memory must persist under `memory` (object), readable by restore");
+  assert.ok(
+    !(s0.history && typeof s0.history === "object" && !Array.isArray(s0.history)),
+    "must NOT store the memory object under `history` (unreadable by restore → total loss)"
+  );
+});

@@ -536,6 +536,23 @@ function clientCapabilities() {
   };
 }
 
+// The "缺少 X 语言服务器" install prompt should appear AT MOST ONCE per language, ever — never
+// nag on every file-open. Once shown (or the server later resolves via a fixed PATH), we stay
+// silent; the user can still install any server from the 语言服务 panel. Persisted across sessions.
+const _LSP_DISMISS_KEY = "lsp_install_prompted_v1";
+function _lspAlreadyPrompted(langId) {
+  try {
+    const s = JSON.parse(localStorage.getItem(_LSP_DISMISS_KEY) || "[]");
+    return Array.isArray(s) && s.includes(langId);
+  } catch { return false; }
+}
+function _lspMarkPrompted(langId) {
+  try {
+    const s = JSON.parse(localStorage.getItem(_LSP_DISMISS_KEY) || "[]");
+    if (Array.isArray(s) && !s.includes(langId)) { s.push(langId); localStorage.setItem(_LSP_DISMISS_KEY, JSON.stringify(s)); }
+  } catch {}
+}
+
 export function createLspManager(options) {
   const {
     backend,
@@ -635,7 +652,9 @@ export function createLspManager(options) {
       const alreadyRunning = /already running/i.test(msg);
       if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }
       const installHints = {
-        python: "npm i -g pyright",
+        // pip route installs pyright-langserver into ~/.local/bin (on our augmented PATH) and works
+        // for Python users without needing a writable global npm prefix (the old `npm i -g` failed on perms).
+        python: "pip install --user pyright",
         rust: "rustup component add rust-analyzer",
         go: "go install golang.org/x/tools/gopls@latest",
         c: "brew install llvm",
@@ -668,10 +687,11 @@ export function createLspManager(options) {
       const hint = installHints[langId];
       let toolExists = false;
       try { toolExists = await backend.lspCheckAvailable(langId); } catch { /* ignore */ }
-      if (!toolExists && hint && showNotification) {
+      if (!toolExists && hint && showNotification && !_lspAlreadyPrompted(langId)) {
+        _lspMarkPrompted(langId); // show at most ONCE ever — never nag again on later file-opens
         showNotification({
           title: `缺少 ${names[langId] || langId} 语言服务器`,
-          message: `安装后可获得智能补全、跳转定义、悬停文档等功能`,
+          message: `装了能获得智能补全 / 跳转定义（不装也能正常写代码、运行程序，不影响用）`,
           actionLabel: "安装",
           duration: 20000,
           installCmd: hint,
