@@ -616,11 +616,11 @@ body.is-tauri.is-mac .titlebar {
    forgets to stamp data-open="0": no attribute == collapsed, so cards never pile up expanded. */
 .think-card:not(.streaming):not([data-open="1"]) .think-head .chev { transform: rotate(-90deg); }
 .think-body { padding: 0 14px 12px; font-size: 12.5px; line-height: 1.65; color: var(--text-dim, #6e6e73); word-break: break-word; overflow-wrap: anywhere; max-height: 340px; overflow-y: auto; overflow-x: hidden; transition: max-height .28s cubic-bezier(.4,0,.2,1), opacity .2s ease, padding .2s ease; scroll-behavior: smooth; }
-/* Settled cards show a PEEK of the reasoning (a few lines + a fade), not an empty chip — so you
-   can SEE it IS thinking (and roughly about what) without a fat pile. `settleReasoning` stamps
-   data-open="0" on settle, which this matches → peek is the default. Clicking the head toggles to
-   data-open="1" → full chain (base .think-body max-height); clicking again returns to the peek. */
-.think-card:not(.streaming):not([data-open="1"]) .think-body { max-height: 5em; opacity: .72; overflow: hidden; padding-top: 0; padding-bottom: 6px; -webkit-mask-image: linear-gradient(180deg, #000 46%, transparent); mask-image: linear-gradient(180deg, #000 46%, transparent); }
+/* Settled cards collapse to a compact CHIP — just the head ("💡 已思考 · Ns"), no body preview — so
+   consecutive thinking (merged into one) reads as a single unobtrusive line, never a pile of visible
+   text. The duration in the head shows it DID think (so it doesn't feel absent); click to expand the
+   full chain (data-open="1"). `settleReasoning` stamps data-open="0", which this matches. */
+.think-card:not(.streaming):not([data-open="1"]) .think-body { max-height: 0; opacity: 0; overflow: hidden; padding-top: 0; padding-bottom: 0; }
 .think-body > :first-child { margin-top: 0; }
 .think-body > :last-child { margin-bottom: 0; }
 /* Nothing inside a thinking card may push past the right edge: long code lines / paths wrap
@@ -912,6 +912,7 @@ body.is-tauri.is-mac .titlebar {
   min-height: 0;
   gap: 1px;
   background: var(--border, #e1e4e8);
+  position: relative; /* anchor for the floating debug toolbar */
 }
 [data-theme="dark"] .editor-container {
   background: var(--border, #333);
@@ -1055,6 +1056,80 @@ body.is-tauri.is-mac .titlebar {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* Non-modal debug dock — VS Code-style bottom panel, docked like the terminal.
+   Debugging shows HERE, never in the 高级工具 modal. */
+.debug-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 320px;
+  min-height: 150px;
+  max-height: 78vh;
+  background: var(--panel-solid, #f5f5f7);
+  color: var(--text, #1c1c1e);
+  border-top: 2px solid var(--accent, #0a84ff);
+  box-shadow: 0 -8px 26px rgba(0, 0, 0, 0.08);
+  z-index: 3;
+  position: relative;
+  animation: term-rise 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.debug-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  background: var(--panel-2, #fbfbfd);
+  border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.1));
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.debug-panel__title { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.debug-panel__title .ic { width: 14px; height: 14px; }
+.debug-panel__status { font-weight: 400; color: var(--text-dim, #6e6e73); margin-left: 4px; }
+.debug-panel__body { flex: 1 1 auto; overflow-y: auto; padding: 8px 12px; display: flex; flex-direction: column; }
+/* In the console-only dock, the console fills the panel and the eval row pins to the bottom
+   (override the modal's fixed 160px height). */
+.debug-panel__body .dbg-console { flex: 1 1 auto; height: auto; min-height: 0; }
+.debug-panel__body .dbg-console__input { flex: 0 0 auto; margin-top: 6px; }
+
+/* Debug console as a TAB inside the terminal panel (peer of the terminal). Fills the instance.
+   NOTE the :not([hidden]) — a bare `.dbg-console-tab{display:flex}` would beat the UA `[hidden]`
+   rule, so `el.hidden=true` wouldn't hide it and it'd cover the terminal when you switch tabs. */
+.dbg-console-tab:not([hidden]) { display: flex; flex-direction: column; }
+.dbg-console-tab .dbg-console { flex: 1 1 auto; height: auto; min-height: 0; }
+.dbg-console-tab .dbg-console__input { flex: 0 0 auto; margin-top: 6px; }
+.term-tab--debug .term-tab__icon { color: #e5484d; }
+
+/* Debug sidebar view — the 测试 tab becomes this during a session (variables / call stack / breakpoints). */
+.dbg-side { display: flex; flex-direction: column; overflow-y: auto; }
+.dbg-side__sec { border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.08)); }
+.dbg-side__title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-dim, #6e6e73); padding: 6px 12px; position: sticky; top: 0;
+  background: var(--panel-solid, #f5f5f7); z-index: 1;
+}
+.dbg-side__body { padding: 2px 8px 8px; font-size: 12px; }
+
+/* Floating debug toolbar — VS Code-style, top-center of the editor; controls are also keyboard shortcuts. */
+.dbg-float {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 1px; align-items: center;
+  background: var(--panel-2, #fbfbfd); border: 1px solid var(--border, rgba(0, 0, 0, 0.12));
+  border-radius: 9px; padding: 3px 5px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+  z-index: 20;
+}
+.dbg-float[hidden] { display: none; }
+.dbg-float__btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 26px; border: none; background: transparent; border-radius: 6px;
+  cursor: pointer; color: var(--text, #1c1c1e);
+}
+.dbg-float__btn:hover { background: var(--hover, rgba(0, 0, 0, 0.07)); }
+.dbg-float__btn:disabled { opacity: 0.32; cursor: default; }
+.dbg-float__btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.dbg-float__btn--go svg { fill: currentColor; stroke: none; }
+.dbg-float__btn--stop { color: #e5484d; }
+.dbg-float__sep { width: 1px; height: 16px; background: var(--border, rgba(0, 0, 0, 0.14)); margin: 0 3px; }
 
 /* resize handle */
 .terminal-panel__resize {
@@ -5750,6 +5825,21 @@ body.zen-mode .editor {
   background-image: radial-gradient(circle at center, #e51400 0 5px, transparent 6px);
   cursor: pointer;
 }
+/* The whole gutter (glyph margin + line numbers) toggles breakpoints — show it's clickable, and hint
+   a faint breakpoint dot on hover like VS Code. */
+.monaco-editor .margin { cursor: pointer; }
+.monaco-editor .margin-view-overlays > div:hover::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  transform: translateY(-50%);
+  border-radius: 50%;
+  background: rgba(229, 20, 0, 0.28);
+  pointer-events: none;
+}
 .debug-current-glyph {
   background-image: radial-gradient(circle at center, #f5c518 0 5px, transparent 6px);
 }
@@ -7698,3 +7788,33 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 .composer-chip:hover { background: #d2e3fc; border-color: #a8c7fa; }
 .composer-chip img { width: 13px; height: 13px; flex: 0 0 auto; }
 .composer-chip__name { white-space: nowrap; }
+/* ===== 抓包 (MITM capture inspector) ===== */
+.capture-tool { display: flex; flex-direction: column; height: 100%; min-height: 440px; gap: 8px; }
+.capture-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.capture-status { font-size: 12px; color: var(--text-dim); margin-right: auto; }
+.capture-port { font-size: 12px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 4px; }
+.capture-port input { width: 66px; padding: 4px 6px; border: 1px solid var(--border, rgba(0,0,0,.15)); border-radius: 6px; background: var(--panel-2); color: var(--text); }
+.capture-filter { width: 100%; padding: 6px 9px; border: 1px solid var(--border, rgba(0,0,0,.15)); border-radius: 7px; background: var(--panel-2); color: var(--text); box-sizing: border-box; }
+.capture-split { display: flex; gap: 8px; flex: 1 1 auto; min-height: 0; }
+.capture-list { flex: 1 1 42%; overflow-y: auto; border: 1px solid var(--border, rgba(0,0,0,.1)); border-radius: 8px; min-height: 0; background: var(--panel-2); }
+.capture-detail { flex: 1 1 58%; overflow-y: auto; border: 1px solid var(--border, rgba(0,0,0,.1)); border-radius: 8px; padding: 8px 10px; min-height: 0; }
+.cap-row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 5px 8px; border: none; border-bottom: 1px solid var(--border, rgba(0,0,0,.06)); background: transparent; cursor: pointer; font-size: 12px; color: var(--text); }
+.cap-row:hover { background: var(--hover, rgba(0,0,0,.05)); }
+.cap-row.is-active { background: var(--accent-soft, rgba(10,132,255,.12)); }
+.cap-row__status { width: 34px; flex: 0 0 auto; font-variant-numeric: tabular-nums; color: #1a7f37; font-weight: 600; }
+.cap-row.is-bad .cap-row__status { color: #e5484d; }
+.cap-row__method { width: 44px; flex: 0 0 auto; color: var(--accent); font-weight: 600; }
+.cap-row__host { flex: 0 0 auto; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.cap-row__path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cap-row__meta { flex: 0 0 auto; color: var(--text-dim); font-size: 11px; }
+.cap-sec__title { font-weight: 700; font-size: 12px; margin: 10px 0 4px; }
+.cap-sub { font-size: 11px; color: var(--text-dim); margin: 6px 0 2px; }
+.cap-pre { background: var(--panel-2, #f6f8fa); border-radius: 6px; padding: 6px 8px; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 240px; overflow: auto; margin: 0; }
+.cap-pre--err { color: #e5484d; }
+.cap-reqline { display: flex; gap: 6px; margin: 2px 0; }
+.cap-method { width: 72px; flex: 0 0 auto; }
+.cap-url { flex: 1 1 auto; }
+.cap-reqline input, .cap-edit { padding: 5px 8px; border: 1px solid var(--border, rgba(0,0,0,.15)); border-radius: 6px; background: var(--panel-2); color: var(--text); font-family: "SF Mono", ui-monospace, monospace; font-size: 11px; width: 100%; box-sizing: border-box; }
+.cap-edit { resize: vertical; }
+.cap-replay-out { margin-top: 8px; }
+[data-theme="dark"] .capture-list, [data-theme="dark"] .capture-detail { border-color: rgba(255,255,255,.08); }

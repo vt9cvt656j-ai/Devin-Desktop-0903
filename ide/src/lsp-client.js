@@ -283,14 +283,15 @@ class LspClient {
     return this.manager.backend.lspSend(this.serverLang, payload).catch(() => {});
   }
 
-  request(method, params) {
+  request(method, params, opts) {
     const id = this.nextId++;
+    const timeoutMs = (opts && opts.timeoutMs) || REQUEST_TIMEOUT_MS;
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         resolve(null);
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(id, { resolve, timer });
       this.manager.backend.lspSend(this.serverLang, payload).catch(() => {
         const p = this.pending.get(id);
@@ -318,8 +319,18 @@ class LspClient {
       capabilities: clientCapabilities(),
       initializationOptions: this._getInitOptions(),
     };
-    const result = await this.request("initialize", params);
-    this.capabilities = result?.capabilities || {};
+    // gopls/pyright can take much longer than the default 20s to answer `initialize` on a cold or
+    // large workspace (module download, indexing). If we let it time out and resolve null, we would
+    // set capabilities={} yet initialized=true → supports("completion") is poisoned false forever for
+    // that server (the "only ONE lsp loads / no autocomplete" bug). So: give initialize a generous
+    // timeout, and if it still fails, throw WITHOUT marking initialized — ensureServer's catch drops
+    // the client so the next open retries against a now-warmer server.
+    const result = await this.request("initialize", params, { timeoutMs: 120000 });
+    if (!result || !result.capabilities) {
+      this.initialized = false;
+      throw new Error(`LSP initialize failed/timed out: ${this.lang}`);
+    }
+    this.capabilities = result.capabilities;
     this._send("initialized", {});
     this._send("workspace/didChangeConfiguration", {
       settings: this._getLangSettings(),
@@ -623,7 +634,9 @@ export function createLspManager(options) {
     }
     if (langId === "python" && !manager._pythonSettings) {
       try {
-        const info = await backend.lspDetectPython();
+        // Pass the workspace root so the backend prefers the project's .venv interpreter — pyright then
+        // resolves the packages installed in the venv instead of flagging them "unresolved" on reopen.
+        const info = await backend.lspDetectPython(manager.workspaceRoots?.()[0] || null);
         if (info && info.pythonPath) {
           manager._pythonSettings = {
             pythonPath: info.pythonPath,
@@ -652,9 +665,10 @@ export function createLspManager(options) {
       const alreadyRunning = /already running/i.test(msg);
       if (alreadyRunning) { onLog?.(`[lsp] ${langId}: ${msg}`); return null; }
       const installHints = {
-        // pip route installs pyright-langserver into ~/.local/bin (on our augmented PATH) and works
-        // for Python users without needing a writable global npm prefix (the old `npm i -g` failed on perms).
-        python: "pip install --user pyright",
+        // venv-safe: inside an active project venv, `--user` is rejected, so fall back to a plain
+        // (venv) install → pyright-langserver lands in `.venv/bin` (persists with the project). No
+        // venv → `--user` puts it in `~/.local/bin` (on our augmented PATH). Either way it's found.
+        python: "pip install --user pyright 2>/dev/null || pip install pyright",
         rust: "rustup component add rust-analyzer",
         go: "go install golang.org/x/tools/gopls@latest",
         c: "brew install llvm",
@@ -904,7 +918,20 @@ export function createLspManager(options) {
     monaco.languages.registerCompletionItemProvider(MANAGED_LANGS, {
       triggerCharacters: [".", ":", ">", "<", "\"", "'", "/", "@", "(", "#", "$", "*", "&"],
       async provideCompletionItems(model, position, context) {
-        const client = clientForModel(model);
+        let client = clientForModel(model);
+        // A server still running its (sometimes slow) `initialize` handshake has no capabilities yet.
+        // Instead of silently returning empty for the entire cold-start window, wait briefly for init
+        // to settle so the first completion after opening a file actually works. Capped at 6s so a
+        // genuinely stuck server never hangs the completion popup — the next keystroke retries.
+        if (client && !client.initialized && client.initPromise) {
+          try {
+            await Promise.race([
+              client.initPromise.catch(() => {}),
+              new Promise((r) => setTimeout(r, 6000)),
+            ]);
+          } catch { /* ignore */ }
+          client = clientForModel(model);
+        }
         if (!client || !client.supports("completion")) return { suggestions: [] };
         flushPendingChange(model.uri.toString());
         const lspTrigger = (context.triggerKind || 0) + 1;

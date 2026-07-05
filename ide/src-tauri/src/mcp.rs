@@ -127,13 +127,24 @@ fn spawn_session(
     env: &HashMap<String, String>,
     cwd: &str,
 ) -> Result<Session, String> {
-    let mut cmd = crate::process_util::command(command);
+    let ws = if cwd.is_empty() { None } else { Some(cwd) };
+    // A GUI-launched app inherits a minimal PATH that misses nvm/volta/homebrew/pipx, so a bare `npx`
+    // or `uvx` would fail to spawn ("启动 MCP 服务失败（npx）"). Resolve the launcher against the
+    // augmented PATH and hand the subprocess that PATH too, so a resolved `npx` can still find `node`
+    // and the server package it launches. Same fix as LSP/debug/tasks/terminal.
+    #[cfg(not(windows))]
+    let resolved = crate::process_util::resolve_command(command, ws);
+    #[cfg(windows)]
+    let resolved = command.to_string();
+    let mut cmd = crate::process_util::command(&resolved);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(not(windows))]
+    cmd.env("PATH", crate::process_util::augmented_path(ws));
     for (k, v) in env {
-        cmd.env(k, v);
+        cmd.env(k, v); // user-provided env (API keys, or an explicit PATH override) wins
     }
     if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
         cmd.current_dir(cwd);

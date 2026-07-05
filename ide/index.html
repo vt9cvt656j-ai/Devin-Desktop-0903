@@ -16,6 +16,10 @@
       <div class="titlebar__actions">
         <button id="openFolderBtn" hidden></button>
         <button id="saveBtn" hidden></button>
+        <button class="tbtn" id="debugBtn" title="调试 / Debugger (断点、单步、变量)">
+          <svg class="ic"><use href="#i-bug" /></svg>
+          <span>Debug</span>
+        </button>
         <button class="tbtn" id="runBtn" title="Run current file (⌘R)" disabled>
           <svg class="ic"><use href="#i-play" /></svg>
           <span>Run</span>
@@ -209,6 +213,22 @@
             <div class="empty"><p>No tests detected. Open a project with test files.</p></div>
           </div>
           <div class="test-output" id="testOutput" hidden></div>
+        </div>
+
+        <!-- Debug view — the 测试 tab turns into this while a debug session is active -->
+        <div class="side-view dbg-side" id="viewDebug" hidden>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title">变量</div>
+            <div class="dbg-side__body" id="dbgSideVars"></div>
+          </div>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title">调用栈</div>
+            <div class="dbg-side__body" id="dbgSideStack"></div>
+          </div>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title">断点</div>
+            <div class="dbg-side__body" id="dbgSideBps"></div>
+          </div>
         </div>
       </aside>
 

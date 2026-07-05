@@ -115,7 +115,19 @@ pub fn term_open(
         }
     }
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        cmd.cwd(dir);
+        cmd.cwd(&dir);
+        // Full toolchain PATH (a Finder-launched app inherits a minimal PATH) + auto-activate a
+        // project venv, so `python`/`pip`/`pytest` in THIS terminal resolve INTO it. An AI-installed
+        // env then persists across restarts instead of looking "lost" and getting reinstalled.
+        cmd.env("PATH", crate::process_util::augmented_path(Some(dir.as_str())));
+        for name in [".venv", "venv"] {
+            let venv = std::path::Path::new(&dir).join(name);
+            if venv.join("bin/activate").exists() {
+                cmd.env("VIRTUAL_ENV", venv.to_string_lossy().to_string());
+                cmd.env_remove("PYTHONHOME");
+                break;
+            }
+        }
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("CLICOLOR", "1");

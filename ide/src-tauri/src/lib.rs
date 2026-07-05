@@ -14,6 +14,7 @@ mod marketplace;
 mod mcp;
 mod net;
 mod process_util;
+mod proxy;
 mod qr;
 mod sysctl;
 mod tasks;
@@ -104,6 +105,7 @@ pub fn run() {
         .manage(terminal::TerminalState::default())
         .manage(lsp::LspManager::default())
         .manage(debug::DebugManager::default())
+        .manage(proxy::ProxyState::default())
         .manage(watcher::WatcherState::default())
         .invoke_handler(tauri::generate_handler![
             files::register_workspace_root,
@@ -155,6 +157,12 @@ pub fn run() {
             net::http_request,
             net::download_file,
             net::generate_image_chat,
+            proxy::proxy_available,
+            proxy::proxy_status,
+            proxy::proxy_start,
+            proxy::proxy_stop,
+            proxy::proxy_ca_path,
+            proxy::proxy_set_system_proxy,
             qr::decode_qr,
             db::db_query,
             mcp::mcp_connect,
@@ -247,6 +255,7 @@ pub fn run() {
                 handle.state::<terminal::TerminalState>().reset_all();
                 handle.state::<lsp::LspManager>().stop_all();
                 handle.state::<debug::DebugManager>().stop_all();
+                proxy::stop_all(&handle.state::<proxy::ProxyState>()); // reap the mitmdump proxy
                 mcp::stop_all(); // reap MCP servers on quit (global map, not Tauri State)
             }
         });

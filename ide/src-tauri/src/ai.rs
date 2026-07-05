@@ -17,6 +17,10 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8)
         .tcp_keepalive(Duration::from_secs(60))
+        // The IDE↔LLM-gateway link must NEVER route through the macOS system proxy. Otherwise a
+        // capture/MITM proxy the user (or the agent) set up — and left dangling on a dead port —
+        // silently kills all AI requests ("无法连接服务器"). Talk to our gateway directly, always.
+        .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });

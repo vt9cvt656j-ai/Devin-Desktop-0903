@@ -230,18 +230,6 @@ fn task_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
 }
 
-#[cfg(not(windows))]
-fn augmented_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let extra = format!(
-        "{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:{home}/go/bin:{home}/.local/bin:/usr/bin:/bin"
-    );
-    match std::env::var("PATH") {
-        Ok(p) if !p.is_empty() => format!("{extra}:{p}"),
-        _ => extra,
-    }
-}
-
 /// Run a discovered task to completion and capture stdout/stderr so the
 /// frontend can feed it through a problem matcher into the Problems panel.
 /// This is the non-interactive complement to running a task in the terminal.
@@ -286,15 +274,27 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
     };
     #[cfg(not(windows))]
     let mut cmd = {
-        // A login shell loads the user's profile so cargo/npm/go resolve, and we
-        // prepend the usual toolchain dirs as a belt-and-suspenders fallback.
+        // A login shell loads the user's profile so cargo/npm/go resolve. Use the SHARED
+        // process_util::augmented_path(cwd) — it prepends the workspace's `.venv/bin` + `venv/bin` +
+        // node_modules/.bin and the user's real login-shell PATH. (A private helper here used to omit
+        // all of those, so an AI-installed venv was invisible → "环境丢失、重装" loop.)
         let mut c = crate::process_util::command(task_shell());
         c.arg("-lc")
             .arg(&command)
             .current_dir(&dir)
-            .env("PATH", augmented_path())
+            .env("PATH", crate::process_util::augmented_path(Some(&cwd)))
             .env("CI", "1")
             .env("TERM", "dumb");
+        // Auto-activate a project venv so bare `python`/`pip`/`pytest` resolve INTO it and an installed
+        // environment PERSISTS across restarts (previously they hit the system interpreter).
+        for name in [".venv", "venv"] {
+            let venv = dir.join(name);
+            if venv.join("bin/activate").exists() {
+                c.env("VIRTUAL_ENV", venv.to_string_lossy().to_string());
+                c.env_remove("PYTHONHOME");
+                break;
+            }
+        }
         c
     };
     cmd.stdin(std::process::Stdio::null())

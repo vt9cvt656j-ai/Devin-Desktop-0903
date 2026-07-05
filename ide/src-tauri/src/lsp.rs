@@ -409,10 +409,32 @@ pub struct PythonEnvInfo {
     pub site_packages: Vec<String>,
 }
 
+/// Pick the interpreter to introspect: the project's venv python if one exists (so pyright resolves
+/// the packages the user installed THERE — requests, debugpy, …), else the resolved system python3.
+/// Detecting only system python was why "import X could not be resolved" persisted across reopens
+/// even though the venv had X.
+fn pick_python(workspace: Option<&str>) -> String {
+    if let Some(ws) = workspace.filter(|w| !w.is_empty()) {
+        for rel in [
+            ".venv/bin/python3",
+            ".venv/bin/python",
+            "venv/bin/python3",
+            "venv/bin/python",
+        ] {
+            let p = format!("{ws}/{rel}");
+            if std::path::Path::new(&p).exists() {
+                return p;
+            }
+        }
+    }
+    process_util::resolve_command("python3", workspace)
+}
+
 #[tauri::command]
-pub fn lsp_detect_python() -> Result<PythonEnvInfo, String> {
-    let python = process_util::resolve_command("python3", None);
-    let aug_path = process_util::augmented_path(None);
+pub fn lsp_detect_python(workspace: Option<String>) -> Result<PythonEnvInfo, String> {
+    let ws = workspace.as_deref();
+    let python = pick_python(ws);
+    let aug_path = process_util::augmented_path(ws);
     let output = crate::process_util::command(&python)
         .args(["-c", "import sys,site,json;p=list(site.getsitepackages());p.append(site.getusersitepackages());print(json.dumps({'exec':sys.executable,'paths':p}))"])
         .env("PATH", &aug_path)

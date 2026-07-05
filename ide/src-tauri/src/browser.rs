@@ -68,13 +68,30 @@ fn launch() -> Result<Session, String> {
         172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;\
         172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;\
         *.local;<local>";
-    let extra: Vec<std::ffi::OsString> = vec![
+    let mut extra: Vec<std::ffi::OsString> = vec![
         "--ignore-certificate-errors".into(),
         "--allow-insecure-localhost".into(),
         "--disable-background-networking".into(),
         "--disable-dev-shm-usage".into(),
+        // Kill the nag bubbles that made every automation launch look broken: "个人资料出了点问题",
+        // "Chrome 未正确关闭 / 恢复页面", first-run, default-browser, translate/infobars. A controlled
+        // browser must start clean.
+        "--no-first-run".into(),
+        "--no-default-browser-check".into(),
+        "--disable-session-crashed-bubble".into(),
+        "--hide-crash-restore-bubble".into(),
+        "--disable-infobars".into(),
+        "--disable-features=Translate,InfobarScreenshot,MediaRouter,OptimizationHints".into(),
+        "--disable-backgrounding-occluded-windows".into(),
         proxy_bypass.into(),
     ];
+    // If the 抓包 capture proxy is running, route this browser THROUGH it so capture_flows sees the
+    // browser's traffic — this is what makes "抓包 + browser 走一遍登录" actually combine.
+    // --ignore-certificate-errors (above) makes Chrome accept mitmproxy's MITM cert, so the user
+    // doesn't even need to trust the CA for the automation browser.
+    if let Some(port) = crate::proxy::active_proxy_port() {
+        extra.push(format!("--proxy-server=127.0.0.1:{port}").into());
+    }
     let extra_ref: Vec<&std::ffi::OsStr> = extra.iter().map(|s| s.as_os_str()).collect();
     // PERSISTENT profile: keep one stable user-data-dir so cookies / logins survive
     // across sessions. The user logs in ONCE (e.g. scans a login QR) and the agent's
@@ -87,8 +104,45 @@ fn launch() -> Result<Session, String> {
         // Remove stale singleton locks left by a previous crash / navigation timeout —
         // otherwise Chrome refuses to reuse the profile and EVERY later browser action
         // fails ("profile in use"). This makes the persistent profile crash-robust.
-        for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
-            let _ = std::fs::remove_file(p.join(lock));
+        // Remove ALL singleton lock/socket files (they're symlinks on macOS). ANY leftover makes
+        // Chrome think the profile is "in use" → "个人资料出了点问题". A hard-coded list missed
+        // variants; sweep every file whose name starts with "Singleton".
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for ent in rd.flatten() {
+                if ent.file_name().to_string_lossy().starts_with("Singleton") {
+                    let _ = std::fs::remove_file(ent.path());
+                }
+            }
+        }
+        // Mark the profile as cleanly exited so Chrome doesn't nag "个人资料出了点问题 / 未正确关闭 /
+        // 恢复页面" after a previous kill/crash. KEY FIX: if a state file is CORRUPT (unparseable
+        // JSON — a real cause of the "profile problem" dialog), the old code silently skipped it and
+        // the dialog kept showing. Now we DELETE the corrupt file so Chrome regenerates a pristine one
+        // (cookies live in Default/Cookies + Keychain, not these files, so login persistence survives).
+        let prefs = p.join("Default").join("Preferences");
+        match std::fs::read_to_string(&prefs)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            Some(mut json) => {
+                if let Some(prof) = json.get_mut("profile").and_then(|v| v.as_object_mut()) {
+                    prof.insert("exit_type".into(), serde_json::Value::String("Normal".into()));
+                    prof.insert("exited_cleanly".into(), serde_json::Value::Bool(true));
+                }
+                let _ = std::fs::write(&prefs, json.to_string());
+            }
+            None if prefs.exists() => {
+                let _ = std::fs::remove_file(&prefs); // corrupt → let Chrome rebuild it clean
+            }
+            None => {}
+        }
+        // A corrupt root "Local State" ALSO triggers "个人资料出了点问题"; drop it if unreadable
+        // (on macOS it holds no cookie key, so this is safe — Chrome rebuilds it).
+        let local_state = p.join("Local State");
+        if let Ok(txt) = std::fs::read_to_string(&local_state) {
+            if serde_json::from_str::<serde_json::Value>(&txt).is_err() {
+                let _ = std::fs::remove_file(&local_state);
+            }
         }
     }
     // VISIBLE by default — the user must actually SEE the browser being controlled
@@ -97,16 +151,38 @@ fn launch() -> Result<Session, String> {
     // to force headless for pure background scraping where no window is wanted.
     let headless = std::env::var("MICHAEL_BROWSER_HEADLESS").ok().as_deref() == Some("1");
     let opts = LaunchOptionsBuilder::default()
-        .path(Some(std::path::PathBuf::from(path)))
+        .path(Some(std::path::PathBuf::from(&path)))
         .headless(headless)
         .sandbox(false)
         .ignore_certificate_errors(true)
-        .user_data_dir(profile_dir)
+        .user_data_dir(profile_dir.clone())
         .window_size(Some((1280, 900)))
-        .args(extra_ref)
+        .args(extra_ref.clone())
         .build()
         .map_err(|e| e.to_string())?;
-    let browser = Browser::new(opts).map_err(|e| e.to_string())?;
+    let browser = match Browser::new(opts) {
+        Ok(b) => b,
+        Err(_) => {
+            // The persistent profile is unusable (corrupt / created by a different Chrome version /
+            // still locked by a leftover instance). Fall back to a FRESH throwaway profile so the
+            // automation browser ALWAYS launches instead of dying on "个人资料出了点问题". We only lose
+            // this run's saved cookies, never the agent's ability to drive the browser.
+            let fresh = std::env::temp_dir()
+                .join(format!("michael-ide-browser-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&fresh);
+            let opts2 = LaunchOptionsBuilder::default()
+                .path(Some(std::path::PathBuf::from(&path)))
+                .headless(headless)
+                .sandbox(false)
+                .ignore_certificate_errors(true)
+                .user_data_dir(Some(fresh))
+                .window_size(Some((1280, 900)))
+                .args(extra_ref.clone())
+                .build()
+                .map_err(|e| e.to_string())?;
+            Browser::new(opts2).map_err(|e| e.to_string())?
+        }
+    };
     let tab = browser.new_tab().map_err(|e| e.to_string())?;
     // Slow intranet pages need more headroom than the old 15s.
     tab.set_default_timeout(Duration::from_secs(30));
