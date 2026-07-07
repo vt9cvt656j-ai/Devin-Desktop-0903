@@ -12671,46 +12671,51 @@ function _trimMessagesIfHuge(messages) {
 }
 
 /**
- * LLM-powered auto-compact: when the recent conversation exceeds a token budget,
- * summarize the older turns via an LLM call and store the summary in
- * ConversationMemory.summaries — keeping the latest turns verbatim.
- *
- * Previous version was broken: it spliced the throwaway array from assemble()
- * instead of the actual memory.recent, so compaction never persisted.
+ * Intelligent auto-compact: LLM reads the ENTIRE conversation and compresses
+ * by IMPORTANCE, not position. Everything gets replaced by one summary — no
+ * "keep last N" fallback. The summary alone is the context for the next turn.
  */
 async function _compactHistoryIfHuge(config, session) {
   const sess = session || _currentSession();
   const mem = sess?.memory;
   if (!mem) return;
   const recentTokens = mem.estimateRecentTokens();
-  if (recentTokens < 32000 || mem.recent.length < 10) return;
-  const KEEP = 10;
-  if (mem.recent.length <= KEEP + 2) return;
-  const olderCount = mem.recent.length - KEEP;
-  const older = mem.recent.slice(0, olderCount);
-  const transcript = older.map((m) => `[${m.role}] ${String(m.content || "").slice(0, 4000)}`).join("\n\n").slice(0, 60000);
-  const COMPACT_PROMPT = _P("compact", `你是对话压缩引擎。把下面这段编程对话压缩成一份简洁但信息完整的摘要。
-**必须保留（一条都不能漏）：**
-• 用户的原始需求和目标
-• 已做出的关键技术决定及理由
-• 已修改的文件路径和改动要点
-• 遇到的错误/坑及其解决方案
-• 当前进度（哪些完成了、哪些还没做）
-• 正在进行的任务的当前状态
-• 重要的代码结构/架构信息
-**格式：** 中文、分条、每条一行。文件路径保留完整。代码只保留关键签名/行号。尽量短但不丢信息。`);
+  if (recentTokens < 28000 || mem.recent.length < 8) return;
+  const transcript = mem.recent
+    .map((m, i) => `[#${i}][${m.role}] ${String(m.content || "").slice(0, 4000)}`)
+    .join("\n\n").slice(0, 80000);
+  const COMPACT_PROMPT = _P("compact", `你是智能对话压缩引擎。分析下面的**完整**对话，按**重要性**（不是按位置）生成压缩版本。
+
+**压缩策略——按内容判断，不是按新旧：**
+• 关键决定、架构选择、用户明确要求 → 近乎原文保留（无论在对话第几条）
+• 已解决的错误/坑 → 保留「问题+根因+解法」，删掉中间排查过程
+• 文件读取/工具输出 → 只留结论和关键路径，删掉原始输出
+• 重复的探索/试错 → 折叠成一句
+• 当前正在进行的任务 → 完整保留上下文和进度
+• 用户偏好/纠正/反馈 → 必须保留（影响后续行为）
+• 纯闲聊/确认性回复 → 可删
+
+**绝对不能丢：**
+• 用户的所有需求（原话核心）
+• 每个修改过的文件路径 + 改了什么
+• 每个错误的根因 + 解法
+• 当前任务状态（做到哪了、下一步是什么）
+• 技术栈/架构约束
+
+输出一份连贯的压缩摘要。重要内容详细，不重要的一笔带过。中文、分条。`);
   let summary = "";
   try {
     summary = await backend.aiComplete(config, [
       { role: "system", content: COMPACT_PROMPT },
       { role: "user", content: transcript },
-    ], 1500);
+    ], 2500);
   } catch { summary = ""; }
-  const note = summary?.trim() || "（早先对话已省略以节省上下文）";
-  mem.compactRecent(olderCount, note);
+  if (!summary?.trim()) return;
+  const total = mem.recent.length;
+  mem.compactRecent(total, summary.trim());
   try { saveChatHistory(); } catch {}
-  try { showToast("对话较长，已自动压缩上下文"); } catch {}
-  console.log(`[auto-compact] ${olderCount} msgs → summary (${note.length}c), kept ${mem.recent.length} recent, ~${mem.estimateRecentTokens()} tok`);
+  try { showToast("已智能压缩对话上下文"); } catch {}
+  console.log(`[auto-compact] ${compactCount}/${allMsgs.length + compactCount} msgs compressed, ${mem.recent.length} kept for flow, ~${mem.estimateRecentTokens()} tok`);
 }
 
 /** Serialize a tool's result into the `tool` message content the model reads next turn. */

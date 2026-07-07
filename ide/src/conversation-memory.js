@@ -1,24 +1,23 @@
 /**
- * Hierarchical conversation memory — prevents context overflow in ultra-long sessions
- * while preserving critical decisions/files/errors through LLM-powered compression:
- *   • Recent window (last N turns verbatim, short-term working memory)
- *   • Mid-term summaries (older messages summarized by LLM, stored as compact notes)
- *   • Milestones (key decisions/files/errors marked as permanent anchors)
+ * Hierarchical conversation memory with LLM-powered intelligent compression.
+ * The LLM decides what's important based on CONTENT, not position — a key
+ * decision from message #3 stays while a verbose tool dump from #48 gets
+ * condensed. No fixed "keep last N" window.
  *
- * LLM compaction is driven by main.js (_compactHistoryIfHuge); rule-based fallback
- * fires only as a safety net at a high threshold.
+ * Structure: summaries (compressed context) + recent (new messages since
+ * last compaction). LLM compaction is driven by main.js.
  */
 
-const RECENT_WINDOW = 100;    // Safety-net auto-compress threshold (LLM compact handles it earlier)
-const SUMMARY_BATCH = 10;
+const RECENT_WINDOW = 100;
 const MAX_SUMMARIES = 8;
+const SUMMARY_BATCH = 10;
 
 export class ConversationMemory {
   constructor() {
     this.totalTurns = 0;
-    this.recent = [];           // Last N messages (verbatim)
-    this.summaries = [];        // Mid-term compressed batches [{range, text}]
-    this.milestones = [];       // Permanent anchors [{turn, event}]
+    this.recent = [];
+    this.summaries = [];
+    this.milestones = [];
   }
 
   push(msg) {
@@ -41,14 +40,14 @@ export class ConversationMemory {
         .join('\n');
       result.push({ role: 'system', content: `📌 Key milestones from earlier:\n${text}` });
     }
-    for (const s of this.summaries) {
-      result.push({ role: 'assistant', content: `[Summary of ${s.range}] ${s.text}` });
+    if (this.summaries.length > 0) {
+      const merged = this.summaries.map(s => s.text).join('\n\n');
+      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}` });
     }
     result.push(...this.recent);
     return result;
   }
 
-  /** Estimate total tokens in the recent window. CJK ≈ 1 tok, ASCII ≈ 0.25 tok. */
   estimateRecentTokens() {
     let t = 0;
     for (const m of this.recent) {
@@ -58,10 +57,10 @@ export class ConversationMemory {
     return Math.ceil(t);
   }
 
-  /** Replace the oldest `count` messages in recent with an LLM-generated summary.
-   *  Returns the removed messages. */
+  /** Replace `count` oldest messages in recent with an LLM-generated summary.
+   *  count can equal recent.length (compress everything). */
   compactRecent(count, summaryText) {
-    if (count <= 0 || count >= this.recent.length) return [];
+    if (count <= 0 || count > this.recent.length) return [];
     const removed = this.recent.splice(0, count);
     const startTurn = Math.max(1, this.totalTurns - this.recent.length - removed.length + 1);
     const endTurn = startTurn + removed.length - 1;
@@ -85,83 +84,43 @@ export class ConversationMemory {
     const batch = this.recent.splice(0, SUMMARY_BATCH);
     const startTurn = this.totalTurns - this.recent.length - batch.length;
     const endTurn = startTurn + batch.length - 1;
-    const range = `turns ${startTurn}-${endTurn}`;
-    const summaryText = this._summarizeBatch(batch);
-    this.summaries.push({ range, text: summaryText });
+    this.summaries.push({ range: `turns ${startTurn}-${endTurn}`, text: this._summarizeBatch(batch) });
     if (this.summaries.length > MAX_SUMMARIES) {
-      const first = this.summaries.shift();
-      const second = this.summaries.shift();
-      this.summaries.unshift({
-        range: `${first.range} + ${second.range}`,
-        text: `${first.text}; ${second.text}`
-      });
+      const a = this.summaries.shift();
+      const b = this.summaries.shift();
+      this.summaries.unshift({ range: `${a.range} + ${b.range}`, text: `${a.text}; ${b.text}` });
     }
   }
 
   _summarizeBatch(batch) {
-    const actions = new Set();
-    const files = new Set();
-    const fixes = [];
-    const userRequests = [];
+    const actions = new Set(), files = new Set(), fixes = [], userReqs = [];
     for (const msg of batch) {
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          const name = tc.function?.name;
-          if (name) {
-            actions.add(name);
-            if (['write_file', 'edit_file', 'read_file'].includes(name)) {
-              try {
-                const args = JSON.parse(tc.function.arguments || '{}');
-                if (args.path) files.add(args.path);
-              } catch {}
-            }
-          }
-        }
+      if (msg.tool_calls) for (const tc of msg.tool_calls) {
+        const n = tc.function?.name;
+        if (n) { actions.add(n); if (['write_file','edit_file','read_file'].includes(n)) try { const a = JSON.parse(tc.function.arguments||'{}'); if (a.path) files.add(a.path); } catch {} }
       }
-      if (msg.role === 'user' && msg.content) {
-        const line = String(msg.content).split('\n')[0].slice(0, 120);
-        if (line.length > 5) userRequests.push(line);
-      }
-      if (msg.role === 'assistant' && /fixed|resolved|修复|已修复|解决|完成/i.test(msg.content)) {
-        const firstLine = msg.content.split('\n')[0];
-        if (firstLine.length < 150) fixes.push(firstLine);
-      }
+      if (msg.role === 'user' && msg.content) { const l = String(msg.content).split('\n')[0].slice(0,120); if (l.length > 5) userReqs.push(l); }
+      if (msg.role === 'assistant' && /fixed|resolved|修复|已修复|解决|完成/i.test(msg.content)) { const f = msg.content.split('\n')[0]; if (f.length < 150) fixes.push(f); }
     }
-    const parts = [];
-    if (userRequests.length > 0) parts.push(`User asked: ${userRequests.join('; ')}`);
-    if (actions.size > 0) parts.push(`Actions: ${[...actions].join(', ')}`);
-    if (files.size > 0) parts.push(`Files: ${[...files].join(', ')}`);
-    if (fixes.length > 0) parts.push(`Outcomes: ${fixes.join('; ')}`);
-    return parts.length > 0 ? parts.join(' | ') : 'Continued conversation.';
+    const p = [];
+    if (userReqs.length) p.push(`User: ${userReqs.join('; ')}`);
+    if (actions.size) p.push(`Actions: ${[...actions].join(', ')}`);
+    if (files.size) p.push(`Files: ${[...files].join(', ')}`);
+    if (fixes.length) p.push(`Outcomes: ${fixes.join('; ')}`);
+    return p.length ? p.join(' | ') : 'Continued conversation.';
   }
 
   stats() {
-    return {
-      totalTurns: this.totalTurns,
-      recentCount: this.recent.length,
-      summaryCount: this.summaries.length,
-      milestoneCount: this.milestones.length,
-      recentTokens: this.estimateRecentTokens()
-    };
+    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, recentTokens: this.estimateRecentTokens() };
   }
 
   toJSON() {
-    return {
-      totalTurns: this.totalTurns,
-      recent: this.recent,
-      summaries: this.summaries,
-      milestones: this.milestones
-    };
+    return { totalTurns: this.totalTurns, recent: this.recent, summaries: this.summaries, milestones: this.milestones };
   }
 
   static fromJSON(obj) {
     const mem = new ConversationMemory();
-    if (obj) {
-      mem.totalTurns = obj.totalTurns || 0;
-      mem.recent = obj.recent || [];
-      mem.summaries = obj.summaries || [];
-      mem.milestones = obj.milestones || [];
-    }
+    if (obj) { mem.totalTurns = obj.totalTurns || 0; mem.recent = obj.recent || []; mem.summaries = obj.summaries || []; mem.milestones = obj.milestones || []; }
     return mem;
   }
 }
