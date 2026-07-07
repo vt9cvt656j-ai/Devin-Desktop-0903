@@ -233,11 +233,17 @@ pub async fn capture_url(
     let mut url = url.trim().to_string();
     // Be forgiving: a bare host like "192.168.1.5:3000" or "localhost:5173" is a
     // valid intranet target — default it to http:// instead of rejecting it.
-    if !url.contains("://") {
+    // Accept file:// for local html, and map bare local paths → file:// (so "看本地 html" works and
+    // never gets mangled to https://file://…). Schemeless hosts default to http.
+    if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic() {
+        url = format!("file:///{}", url.replace('\\', "/")); // Windows drive path (D:\… / D:/…)
+    } else if url.starts_with('/') {
+        url = format!("file://{url}"); // unix absolute path
+    } else if !url.contains("://") {
         url = format!("http://{url}");
     }
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("只支持 http/https URL".into());
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
+        return Err("只支持 http/https/file URL".into());
     }
     let browser = find_headless_browser().ok_or_else(|| {
         "未找到无头浏览器。装上 Google Chrome / Chromium / Edge 后，智能体就能“看见”页面并据图改进 UI（截图依赖它渲染）。".to_string()
@@ -277,11 +283,17 @@ pub async fn capture_url_frames(
     duration_ms: Option<u32>,
 ) -> Result<String, String> {
     let mut url = url.trim().to_string();
-    if !url.contains("://") {
+    // Accept file:// for local html, and map bare local paths → file:// (so "看本地 html" works and
+    // never gets mangled to https://file://…). Schemeless hosts default to http.
+    if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic() {
+        url = format!("file:///{}", url.replace('\\', "/")); // Windows drive path (D:\… / D:/…)
+    } else if url.starts_with('/') {
+        url = format!("file://{url}"); // unix absolute path
+    } else if !url.contains("://") {
         url = format!("http://{url}");
     }
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("只支持 http/https URL".into());
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
+        return Err("只支持 http/https/file URL".into());
     }
     let browser = find_headless_browser().ok_or_else(|| {
         "未找到无头浏览器。装上 Google Chrome / Chromium / Edge 后才能截图。".to_string()

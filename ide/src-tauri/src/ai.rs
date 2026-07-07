@@ -16,7 +16,7 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8)
-        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(20))
         // The IDE↔LLM-gateway link must NEVER route through the macOS system proxy. Otherwise a
         // capture/MITM proxy the user (or the agent) set up — and left dangling on a dead port —
         // silently kills all AI requests ("无法连接服务器"). Talk to our gateway directly, always.
@@ -426,6 +426,10 @@ async fn ai_chat_inner(
             }
         };
         buf.extend_from_slice(&chunk);
+        // Any bytes at all (even SSE comments / heartbeats) prove the connection is alive
+        // and the upstream is still processing — reset the stall detector so a long
+        // "thinking" pause doesn't trigger a false timeout as long as heartbeats flow.
+        last_progress = std::time::Instant::now();
 
         // Server-sent events are newline-delimited `data: {...}` lines.
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -680,7 +684,6 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(6)) // fail fast on a SYN black-hole (Windows)
         .timeout(std::time::Duration::from_secs(15))
-        .no_proxy() // never block on system-proxy/WPAD discovery
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -876,7 +879,6 @@ fn search_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(8))
-        .no_proxy()
         .build()
         .ok()
 }

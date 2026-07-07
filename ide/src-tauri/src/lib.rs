@@ -1,9 +1,9 @@
 mod accessibility;
 mod ai;
 mod auth;
+mod automation;
 mod browser;
 mod capture;
-mod computer;
 mod db;
 mod debug;
 mod extensions;
@@ -34,7 +34,8 @@ fn cleanup_stale(
     term.reset_all();
     lsp.stop_all();
     dap.stop_all();
-    mcp::stop_all(); // MCP uses a global session map (not Tauri State) — reap it too on reload
+    mcp::stop_all();
+    browser::close_all();
 }
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -75,18 +76,25 @@ fn install_panic_logger() {
 
 pub fn run() {
     install_panic_logger();
+    browser::kill_orphaned_browsers();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(tauri_plugin_macos_fps::init())
+        .plugin(tauri_plugin_store::Builder::new().build());
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_plugin_macos_fps::init());
+    }
+
+    builder
         .setup(|app| {
             #[cfg(desktop)]
             app.handle()
@@ -182,18 +190,6 @@ pub fn run() {
             browser::browser_scroll,
             browser::browser_wait,
             browser::browser_close,
-            computer::computer_screenshot,
-            computer::computer_set_grid,
-            computer::computer_move,
-            computer::computer_click,
-            computer::computer_double_click,
-            computer::computer_drag,
-            computer::computer_type,
-            computer::computer_key,
-            computer::computer_scroll,
-            computer::computer_nodes,
-            computer::computer_press,
-            computer::computer_set_value,
             sysctl::system_open_app,
             sysctl::system_list_apps,
             sysctl::system_app_windows,
@@ -243,6 +239,7 @@ pub fn run() {
             auth::auth_verify_code,
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
+            automation::automation_call,
             cleanup_stale,
         ])
         .build(tauri::generate_context!())
@@ -257,6 +254,7 @@ pub fn run() {
                 handle.state::<debug::DebugManager>().stop_all();
                 proxy::stop_all(&handle.state::<proxy::ProxyState>()); // reap the mitmdump proxy
                 mcp::stop_all(); // reap MCP servers on quit (global map, not Tauri State)
+                automation::stop(); // reap the desktop-automation server
             }
         });
 }

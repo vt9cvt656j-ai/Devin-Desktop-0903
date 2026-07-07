@@ -122,20 +122,28 @@ pub fn term_open(
         cmd.env("PATH", crate::process_util::augmented_path(Some(dir.as_str())));
         for name in [".venv", "venv"] {
             let venv = std::path::Path::new(&dir).join(name);
-            if venv.join("bin/activate").exists() {
+            let has_venv = if cfg!(windows) {
+                venv.join("Scripts/activate").exists() || venv.join("Scripts/activate.bat").exists()
+            } else {
+                venv.join("bin/activate").exists()
+            };
+            if has_venv {
                 cmd.env("VIRTUAL_ENV", venv.to_string_lossy().to_string());
                 cmd.env_remove("PYTHONHOME");
                 break;
             }
         }
     }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("CLICOLOR", "1");
-    cmd.env("CLICOLOR_FORCE", "1");
-    cmd.env("LSCOLORS", "ExGxFxdaCxDaDahbadacec");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.env("PROMPT_EOL_MARK", "");
+    cmd.env("TERM", if cfg!(windows) { "dumb" } else { "xterm-256color" });
     cmd.env("LANG", "en_US.UTF-8");
+    #[cfg(not(windows))]
+    {
+        cmd.env("CLICOLOR", "1");
+        cmd.env("CLICOLOR_FORCE", "1");
+        cmd.env("LSCOLORS", "ExGxFxdaCxDaDahbadacec");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("PROMPT_EOL_MARK", "");
+    }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     // The slave handle is no longer needed once the child owns it; dropping it
@@ -295,7 +303,8 @@ pub fn term_list_commands() -> Vec<String> {
     let path_str = crate::process_util::augmented_path(None);
     #[cfg(windows)]
     let path_str = std::env::var("PATH").unwrap_or_default();
-    for dir_str in path_str.split(':') {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for dir_str in path_str.split(sep) {
         let dir = std::path::PathBuf::from(dir_str);
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -331,14 +340,23 @@ pub fn term_list_commands() -> Vec<String> {
 /// most-recent-first and deduped. Powers history-aware autosuggestions.
 #[tauri::command]
 pub fn term_history() -> Vec<String> {
-    let home = match std::env::var_os("HOME") {
+    let home = match std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
         Some(h) => std::path::PathBuf::from(h),
         None => return Vec::new(),
     };
     let mut raw: Vec<String> = Vec::new();
-    for name in [".zsh_history", ".bash_history"] {
-        let path = home.join(name);
-        if let Ok(bytes) = std::fs::read(&path) {
+    // Unix: zsh/bash history; Windows: PowerShell PSReadLine history
+    #[cfg(windows)]
+    let history_paths: Vec<std::path::PathBuf> = {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        if appdata.is_empty() { vec![] }
+        else { vec![std::path::PathBuf::from(&appdata).join("Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt")] }
+    };
+    #[cfg(not(windows))]
+    let history_paths: Vec<std::path::PathBuf> = [".zsh_history", ".bash_history"]
+        .iter().map(|n| home.join(n)).collect();
+    for path in &history_paths {
+        if let Ok(bytes) = std::fs::read(path) {
             let text = String::from_utf8_lossy(&bytes);
             for line in text.lines() {
                 let line = line.trim();

@@ -222,9 +222,6 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
         let p = entry.path();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         entries.push(DirEntry {

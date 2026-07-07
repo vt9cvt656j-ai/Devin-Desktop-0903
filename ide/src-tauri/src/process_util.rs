@@ -92,13 +92,22 @@ pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
     cmd.to_string()
 }
 
-/// Windows: prepend the workspace's `node_modules\.bin` to the existing PATH.
+/// Windows: prepend the workspace's `node_modules\.bin` + Python venv Scripts to the existing PATH.
 #[cfg(windows)]
 pub fn augmented_path(workspace: Option<&str>) -> String {
     let cur = std::env::var("PATH").unwrap_or_default();
     match workspace.filter(|w| !w.is_empty()) {
-        Some(ws) if cur.is_empty() => format!("{ws}\\node_modules\\.bin"),
-        Some(ws) => format!("{ws}\\node_modules\\.bin;{cur}"),
+        Some(ws) => {
+            let mut parts = vec![format!("{ws}\\node_modules\\.bin")];
+            for name in [".venv", "venv"] {
+                let scripts = format!("{ws}\\{name}\\Scripts");
+                if std::path::Path::new(&scripts).is_dir() {
+                    parts.push(scripts);
+                }
+            }
+            if !cur.is_empty() { parts.push(cur); }
+            parts.join(";")
+        }
         None => cur,
     }
 }

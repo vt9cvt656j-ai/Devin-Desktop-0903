@@ -263,6 +263,7 @@ async function tauriBackend() {
     dbMarketplaceUpsert: (ext) => core.invoke("db_marketplace_upsert", { ext }),
     tasksList: (root) => core.invoke("tasks_list", { root }),
     taskRunCapture: (cwd, command) => core.invoke("task_run_capture", { cwd, command }),
+    automationCall: (method, params) => core.invoke("automation_call", { method, params: params || {} }),
     pickFolder: () => dialog.open({ directory: true, multiple: false }),
     aiChat: (config, messages, onEvent) => {
       const channel = new core.Channel();
@@ -3730,6 +3731,7 @@ function _maybeOnboardProject(path) {
 
 let _fsWatcherActive = false;
 let _fsChangeDebounce = null;
+let _fsChangeBatch = [];
 const _pendingReloadDirs = new Set(); // tree reloads deferred while a right-click menu is open
 async function startFileWatcher() {
   if (_fsWatcherActive || !inTauri) return;
@@ -3740,10 +3742,13 @@ async function startFileWatcher() {
     _fsWatcherActive = true;
     const { listen } = await import("@tauri-apps/api/event");
     listen("fs-change", (event) => {
+      const paths = event.payload?.paths || [];
+      for (const p of paths) _fsChangeBatch.push(p);
       clearTimeout(_fsChangeDebounce);
       _fsChangeDebounce = setTimeout(() => {
-        const changed = event.payload?.paths || [];
-        handleFsChanges(changed);
+        const batch = _fsChangeBatch;
+        _fsChangeBatch = [];
+        if (batch.length) handleFsChanges(batch);
       }, 200);
     });
   } catch (e) {
@@ -5843,6 +5848,56 @@ async function michaelAccessGate() {
 }
 
 // Personal profile: account, avatar, membership badge, hourly/weekly/total quota.
+async function _showBillingPanel() {
+  const token = localStorage.getItem("michael_token");
+  if (!token) { showToast("请先登录"); return; }
+  const dlg = document.createElement("dialog");
+  dlg.className = "billing-dialog";
+  dlg.innerHTML = '<div class="billing-dialog__inner"><div class="billing-dialog__header"><h2>账单</h2><button class="billing-dialog__close"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div><div class="billing-dialog__body"><p style="text-align:center;color:#5f6368;padding:40px 0">加载中...</p></div></div>';
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  dlg.querySelector(".billing-dialog__close").onclick = () => { dlg.close(); dlg.remove(); };
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) { dlg.close(); dlg.remove(); } });
+  try {
+    const r = await fetch(_michaelBase() + "/api/usage", { headers: { Authorization: "Bearer " + token } });
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    const body = dlg.querySelector(".billing-dialog__body");
+    const bal = (d.credits_cents / 100).toFixed(2);
+    const spent = (d.total_spent_cents / 100).toFixed(2);
+    const all = (d.recent || []).map((u) => {
+      const date = new Date(u.time).toLocaleString("zh-CN", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+      const model = u.model || "—";
+      const inp = u.prompt_tokens ? (u.prompt_tokens / 1000).toFixed(1) + "k" : "—";
+      const out = u.completion_tokens ? (u.completion_tokens / 1000).toFixed(1) + "k" : "—";
+      const cost = (u.cost_cents / 100).toFixed(3);
+      const est = u.estimated ? ' <span style="opacity:.4">(估)</span>' : "";
+      return "<tr><td>" + date + "</td><td>" + model + "</td><td>" + inp + "</td><td>" + out + "</td><td>$" + cost + est + "</td></tr>";
+    });
+    const PER = 10;
+    let page = 0;
+    const totalPages = Math.max(1, Math.ceil(all.length / PER));
+    function render() {
+      const slice = all.slice(page * PER, (page + 1) * PER).join("");
+      const noData = '<tr><td colspan="5" style="text-align:center;color:#5f6368;padding:32px 0">暂无记录</td></tr>';
+      const pager = totalPages > 1
+        ? '<div class="billing-dialog__pager"><button class="billing-dialog__pager-btn" data-dir="prev"' + (page === 0 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg></button><span class="billing-dialog__pager-info">' + (page + 1) + ' / ' + totalPages + '</span><button class="billing-dialog__pager-btn" data-dir="next"' + (page >= totalPages - 1 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 18l6-6-6-6"/></svg></button></div>'
+        : "";
+      body.innerHTML =
+        '<div class="billing-dialog__balance"><div><div style="margin-bottom:4px">余额</div><strong>$' + bal + '</strong></div><div style="margin-left:auto;text-align:right"><div style="margin-bottom:4px">累计消费</div><span style="font-size:20px;font-weight:500;color:#202124">$' + spent + '</span></div></div>' +
+        '<div class="billing-dialog__table-wrap"><table class="billing-dialog__table"><thead><tr><th>时间</th><th>模型</th><th>输入</th><th>输出</th><th>费用</th></tr></thead><tbody>' +
+        (slice || noData) +
+        '</tbody></table></div>' + pager;
+      body.querySelectorAll(".billing-dialog__pager-btn").forEach((btn) => {
+        btn.onclick = () => { page += btn.dataset.dir === "prev" ? -1 : 1; render(); };
+      });
+    }
+    render();
+  } catch (e) {
+    dlg.querySelector(".billing-dialog__body").innerHTML = '<p style="color:#d93025;text-align:center;padding:32px 0">加载失败: ' + e.message + '</p>';
+  }
+}
+
 async function showProfile() {
   const token = localStorage.getItem("michael_token");
   if (!token) { showToast("请先登录账号"); openLoginDialog(); return; }
@@ -6195,7 +6250,9 @@ function hideModelInfoCard() {
 }
 
 function buildModelMenu() {
-  const current = loadConfig().model;
+  const _mc = loadConfig();
+  const current = _mc.model;
+  const currentGroup = _mc.modelGroup || "";
   modelMenu.innerHTML = "";
   if (!modelMenu._hoverBound) {
     modelMenu.addEventListener("mouseleave", hideModelInfoCard);
@@ -6205,24 +6262,23 @@ function buildModelMenu() {
     const g = document.createElement("div");
     g.className = "menu__group";
     g.textContent = group.label;
-    // Don't hide the card when the cursor crosses a group header — the user may
-    // be transiting from a model row to the card; closing here flickers.
     modelMenu.appendChild(g);
     for (const m of group.models) {
+      const active = m.id === current && (currentGroup ? group.label === currentGroup : true);
       const item = document.createElement("div");
-      item.className = "menu__item" + (m.id === current ? " is-active" : "");
+      item.className = "menu__item" + (active ? " is-active" : "");
       item.setAttribute("role", "option");
       const meta = m.meta ? `<span class="meta">${m.meta}</span>` : "";
-      const mark =
-        m.id === current
+      const mark = active
           ? `<svg class="check"><use href="#i-check" /></svg>`
           : meta;
       const b = brandFor(m);
       item.innerHTML = `<svg class="ic ${b.cls}"><use href="#${b.sym}" /></svg><span class="name"></span>${mark}`;
       item.querySelector(".name").textContent = m.name || m.id;
       item.addEventListener("mouseenter", () => showModelInfoCard(m, item));
+      const grpLabel = group.label;
       item.addEventListener("click", () => {
-        selectModel(m.id);
+        selectModel(m.id, grpLabel);
         closeModelMenu();
       });
       modelMenu.appendChild(item);
@@ -6243,9 +6299,9 @@ function buildModelMenu() {
   modelMenu.appendChild(cfg);
 }
 
-async function selectModel(model) {
+async function selectModel(model, modelGroup) {
   const c = loadConfig();
-  await saveConfig({ ...c, model });
+  await saveConfig({ ...c, model, modelGroup: modelGroup || "" });
   refreshModelBadge();
   const session = _currentSession();
   if (session) {
@@ -6336,7 +6392,7 @@ function _createChatSession(name, mode, model, project) {
     finalName = `Chat ${++_chatSeq}`;
   }
   return {
-    id, name: finalName, mode: mode || _currentAiMode, model: model || null,
+    id, name: finalName, mode: (mode || _currentAiMode) === "auto" ? "agent" : (mode || _currentAiMode), model: model || null,
     // Which project this chat is about (folder it was started under); kept in
     // sync on send. Lets each tab show its project.
     project: project !== undefined ? project : (rootPath || workspaceRoots[0] || ""),
@@ -7116,45 +7172,29 @@ function _mergeTrailingThinkCards(body) {
   try {
     if (!body) return;
     const isThink = (e) => e && e.classList && e.classList.contains("think-card") && !e.classList.contains("streaming");
-    // Empty "..." / caret / whitespace residue left between turns must NOT count as a real step —
-    // otherwise it breaks the adjacency and every turn's thinking stays its own card (the pile).
     const isFiller = (e) => {
       if (!e || e.nodeType !== 1 || (e.classList && e.classList.contains("think-card"))) return false;
       const t = (e.textContent || "").replace(/[.\s·…•​ ]/g, "");
       return t.length === 0;
     };
-    // Fold EVERY run of consecutive settled think-cards into one (not just the trailing run), skipping
-    // empty filler between them. A real tool card / real answer text is a genuine step boundary → stops
-    // a run, so think→act→think stays honest; but a stretch of pure thinking becomes a single chip.
-    const children = Array.from(body.children);
-    let i = 0;
-    while (i < children.length) {
-      if (!isThink(children[i])) { i++; continue; }
-      const run = [children[i]];
-      let j = i + 1;
-      while (j < children.length) {
-        if (isThink(children[j])) { run.push(children[j]); j++; }
-        else if (isFiller(children[j])) { children[j].remove(); j++; }
-        else break;
-      }
-      if (run.length >= 2) {
-        const first = run[0];
-        const fb = first.querySelector(".think-body");
-        if (fb) {
-          let merged = (fb.dataset.rawText || fb.textContent || "").trim();
-          for (let k = 1; k < run.length; k++) {
-            const b = run[k].querySelector(".think-body");
-            const t = ((b && (b.dataset.rawText || b.textContent)) || "").trim();
-            if (t) merged += (merged ? "\n\n———\n\n" : "") + t;
-            run[k].remove();
-          }
-          fb.dataset.rawText = merged;
-          try { renderMarkdownInto(fb, merged, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
-          catch { fb.textContent = merged; }
-          if (first.dataset.open !== "1") first.dataset.open = "0"; // stay collapsed unless user opened it
+    Array.from(body.children).forEach((e) => { if (isFiller(e)) e.remove(); });
+    const thinks = Array.from(body.children).filter(isThink);
+    if (thinks.length >= 2) {
+      const first = thinks[0];
+      const fb = first.querySelector(".think-body");
+      if (fb) {
+        let merged = (fb.dataset.rawText || fb.textContent || "").trim();
+        for (let k = 1; k < thinks.length; k++) {
+          const b = thinks[k].querySelector(".think-body");
+          const t = ((b && (b.dataset.rawText || b.textContent)) || "").trim();
+          if (t) merged += (merged ? "\n\n———\n\n" : "") + t;
+          thinks[k].remove();
         }
+        fb.dataset.rawText = merged;
+        try { renderMarkdownInto(fb, merged, { streaming: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+        catch { fb.textContent = merged; }
+        if (first.dataset.open !== "1") first.dataset.open = "0";
       }
-      i = j;
     }
   } catch {}
 }
@@ -7195,12 +7235,19 @@ function _invokeCapped(cmd, args, ms, label) {
 function _setStreaming(sess, on) {
   if (!sess) return;
   sess.streaming = !!on;
-  // Stop →真正中止后端在飞的请求（关掉上游连接 + 停止烧 token），不只是静音 UI。
-  // 请求已结束时 cancel_ai 是 no-op；mock 后端没有 cancelAi，&& 守卫直接跳过。
-  if (!on && sess._reqId) { try { backend.cancelAi && backend.cancelAi(sess._reqId); } catch {} }
+  // Stop → cancel ALL in-flight requests. Each _agentModelTurn registers a unique
+  // per-turn requestId in sess._cancelIds (so parallel sub-agents have separate
+  // cancel flags in Rust and don't overwrite each other). Cancel every one of them +
+  // the legacy sess._reqId fallback.
+  if (!on && backend.cancelAi) {
+    try { if (sess._reqId) backend.cancelAi(sess._reqId); } catch {}
+    if (sess._cancelIds && sess._cancelIds.size) {
+      for (const cid of sess._cancelIds) { try { backend.cancelAi(cid); } catch {} }
+    }
+  }
   try {
     const c = sess.container;
-    if (!c) return;
+    if (!c || !document.contains(c)) return;
     c.classList.toggle("is-streaming", !!on);
     if (!on) { _removeAllThinking(c); c.querySelectorAll(".md-caret").forEach((el) => { try { el.remove(); } catch {} }); }
   } catch {}
@@ -7374,14 +7421,14 @@ let _currentAiPerm = (() => { try { return localStorage.getItem("michael-ide.ai-
 function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
 // Tools that touch disk / the machine / the outside world. Pure reads, git
 // status/diff/log, lsp, think, screenshot, web search never ask.
-const _APPROVE_TYPES = new Set(["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "termtask", "computer", "download", "db"]);
+const _APPROVE_TYPES = new Set(["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "termtask", "automation", "download", "db"]);
 // Session allowlist: "always allow this session" remembers a KIND so it stops
 // asking. Per-command-word for shells (so "always npm" ≠ "always rm"); per-type
 // otherwise. Cleared on reload.
 const _sessionApproved = new Set();
 function _approvalKey(call) {
   if (call.type === "cmd" || call.type === "termtask") return "cmd:" + (String(call.command || "").trim().split(/\s+/)[0] || "");
-  if (call.type === "computer") return "computer:" + (call.action || "");
+  if (call.type === "automation") return "automation:" + (call.method || "").split(".")[0];
   return "type:" + call.type;
 }
 function _approvalLabel(call) {
@@ -7394,7 +7441,7 @@ function _approvalLabel(call) {
     case "copy": return { title: "复制？", detail: (call.path || "") + "  →  " + (call.to || "") };
     case "mkdir": return { title: "新建目录？", detail: call.path || "" };
     case "format": return { title: "格式化文件？", detail: call.path || "" };
-    case "computer": return { title: "操控这台电脑？", detail: "动作：" + (call.action || "") + (call.text ? "  输入：" + call.text : "") };
+    case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
     case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
     case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
     default: return { title: "执行该操作？", detail: call.path || call.type };
@@ -7456,20 +7503,6 @@ async function _approveToolCall(call, run) {
   return decision === "once";
 }
 
-// Full UI-design playbook — injected into the agent prompt ONLY for UI tasks
-// (see _looksUITask), so non-UI turns aren't primed to over-elaborate on design.
-const _UI_DESIGN_GUIDE = `# UI 质量\n做界面走干净现代的主流风格：注意对齐/留白/层级/配色/对比度/状态齐全/响应式，用现代框架组件化。（完整 UI 指引由云端提供，这是离线兜底。）`;
-
-// Injected for BUILD/DESIGN-a-UI tasks (not small CSS tweaks): the end-to-end product-
-// UI pipeline that BLENDS every capability — generate_image(设计稿) + update_plan +
-// 写码 + run_worker(并行) + browser/screenshot(视觉验证) — into one Agent-mode flow,
-// so the user doesn't switch modes. The agent runs design → code → verify in one go.
-const _UI_DESIGN_FLOW = `# UI 搭建流程
-调研竞品 → 定风格（衣橱 design_board 让用户选）→ 出设计稿 → update_plan → **用 Vite 脚手架 + Vue/React + Tailwind 写组件化代码** → 浏览器截图验证 → 迭代。
-⚠️ **硬性交付标准（不可协商）**：任何「官网 / 落地页 / 前端页面 / 网站 / 应用」的**交付物必须是 Vite + Vue/React 工程**（有 package.json + 组件文件 + 能 \`npm run dev\` 的开发服务器）。**即使只有一屏、即使你觉得裸 index.html 更快更省事，也绝不允许把单个 index.html / 裸 HTML+CSS 当成品交付**——那不算完成、会被判不合格。**第一步就 \`npm create vite\`（或读现有 package.json 确认栈）把脚手架搭好，再往组件里写内容**。任何时候你发现自己正准备直接写一个 index.html 当最终产物，**立刻停手、改成 Vite 脚手架**。（完整流水线由云端提供，这是离线兜底。）`;
-
-
-
 
 // CSS grounding for weaker models: concrete, COPY-ABLE code tokens + component
 // patterns + explicit anti-rules. Research shows weak models can't translate abstract
@@ -7527,13 +7560,6 @@ function _applyCloudToolDescs(tools) {
   return tools;
 }
 
-const _CSS_CONCRETE_TOKENS = `# CSS 设计系统\n用 :root CSS 变量定义设计令牌（颜色/间距/圆角/阴影/字阶），所有样式只用这些变量、不写死数值。（完整令牌由云端提供，这是离线兜底。）`;
-
-// Injected for git-related tasks: skilled, professional-developer git discipline. The
-// conservative default (never auto-commit) is preserved; this is how to do git WELL
-// once the user asks. References the real tools (git_status/diff/log/commit/branch/
-// push/pull/stash/conflicts) + run_cmd for the rest (git add -p / rebase / gh pr).
-const _GIT_GUIDE = _P("git_guide", `# Git 工作流\n用户明确让提交时：先并行 git_status/git_diff/git_log 看清改了什么 + 本仓库提交信息风格，再写简洁(1-2句)、说清"为什么"、沿用既有约定(用了 feat:/fix:/refactor: 就跟着用)的提交信息。`);
 
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：先 read_file/list_dir/search 调研现状，用 update_plan 列计划，逐步用 write_file/edit_file/run_cmd 等实现，再用 get_diagnostics/run_cmd 验证，最后总结。改文件前必先读、写就写完整、最小改动、风格随项目；需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）`,
@@ -7625,13 +7651,12 @@ function _estimateTokens(text) {
 
 function _compactHistoryIfNeeded(session) {
   const sess = session || _currentSession();
-  const h = sess?.memory ? sess.memory.assemble() : (sess?.history || []);
+  // Operate on the ACTUAL backing array — memory.recent for modern sessions,
+  // sess.history for legacy. Previous version used assemble() which returns
+  // a throwaway copy — splices were silently lost.
+  const h = sess?.memory ? sess.memory.recent : (sess?.history || []);
   if (!h || h.length === 0) return;
 
-  // CONTINUOUS lossless squeeze (every turn, not just when huge): lexically compress
-  // each message (collapse blank/repeated lines, trim ws). No info lost, but the
-  // PERSISTED history keeps shrinking — so every subsequent turn re-sends less → it
-  // gets cheaper the longer you use it, not just within one run.
   if (typeof _lexCompress === "function") {
     for (const m of h) {
       if (m && typeof m.content === "string" && m.content.length > 400) {
@@ -7642,37 +7667,30 @@ function _compactHistoryIfNeeded(session) {
   }
 
   const MAX_HISTORY_TOKENS = 48000;
-  const MAX_MESSAGES = 60;
-  const KEEP_RECENT = 12;
+  const MAX_MESSAGES = 50;
+  const KEEP_RECENT = 10;
 
   let totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
-
   if (h.length <= MAX_MESSAGES && totalTokens <= MAX_HISTORY_TOKENS) return;
 
   for (let i = 0; i < h.length - KEEP_RECENT; i++) {
     const m = h[i];
-    if (m.role === "assistant" && m.content.length > 2000) {
-      const toolResultPattern = /\[TOOL:(read_file|list_dir)\][^\n]*\n([\s\S]*?)(?=\[TOOL:|```|$)/g;
+    if (m && m.role === "assistant" && typeof m.content === "string" && m.content.length > 2000) {
       let compressed = m.content;
-      compressed = compressed.replace(toolResultPattern, (match, tool, content) => {
+      compressed = compressed.replace(/\[TOOL:(read_file|list_dir)\][^\n]*\n([\s\S]*?)(?=\[TOOL:|```|$)/g, (match, tool, content) => {
         if (content.length > 500) {
-          const preview = content.trim().split("\n").slice(0, 5).join("\n");
-          return `[TOOL:${tool}] (${content.length} chars read)\n${preview}\n...\n`;
+          return `[TOOL:${tool}] (${content.length}c)\n${content.trim().split("\n").slice(0, 5).join("\n")}\n...\n`;
         }
         return match;
       });
-      const codeBlockPattern = /```[\w]*\n([\s\S]*?)```/g;
-      compressed = compressed.replace(codeBlockPattern, (match, code) => {
+      compressed = compressed.replace(/```[\w]*\n([\s\S]*?)```/g, (match, code) => {
         if (code.length > 800) {
           const lines = code.trim().split("\n");
-          const preview = lines.slice(0, 8).join("\n");
-          return "```\n" + preview + `\n... (${lines.length} lines total)\n` + "```";
+          return "```\n" + lines.slice(0, 8).join("\n") + `\n... (${lines.length} lines)\n` + "```";
         }
         return match;
       });
-      if (compressed.length < m.content.length * 0.7) {
-        h[i] = { ...m, content: compressed };
-      }
+      if (compressed.length < m.content.length * 0.7) m.content = compressed;
     }
   }
 
@@ -7681,10 +7699,9 @@ function _compactHistoryIfNeeded(session) {
   if (h.length > MAX_MESSAGES) {
     const excess = h.length - MAX_MESSAGES;
     const removed = h.splice(0, excess);
-    const summaryParts = removed.filter(m => m.role === "user").map(m => m.content.slice(0, 100));
-    if (summaryParts.length > 0) {
-      h.unshift({ role: "user", content: `[之前的对话摘要：讨论了 ${summaryParts.join("、")}]` });
-      h.unshift({ role: "assistant", content: "[已压缩之前的对话内容以节省空间]" });
+    const topics = removed.filter(m => m.role === "user").map(m => String(m.content).slice(0, 100));
+    if (topics.length > 0) {
+      h.unshift({ role: "assistant", content: `[已压缩 ${removed.length} 条早期消息，涉及：${topics.join("、")}]` });
     }
   }
 
@@ -7693,7 +7710,7 @@ function _compactHistoryIfNeeded(session) {
     totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
   }
 
-  console.log(`[compact] history: ${h.length} msgs, ~${totalTokens} tokens`);
+  console.log(`[compact] recent: ${h.length} msgs, ~${totalTokens} tok`);
 }
 
 function _detectOS() {
@@ -7929,7 +7946,7 @@ async function _gatherAgentContext(query, sessionRoot) {
   // Change-driven cache: reuse the built context until a file actually changes (handleFsChanges resets
   // ts=0 on any create/edit/delete). The 5-min TTL is only a safety net for anything the watcher misses
   // — so a long task stops re-running `find` + re-reading key files every 15s when nothing changed.
-  if (_agentContextCache.rootsKey === rootsKey && _agentContextCache.ts && Date.now() - _agentContextCache.ts < 300000) return _agentContextCache.data + _memoryBlocks(root, query || "") + _crawlRecipeBlock(query || "");
+  if (_agentContextCache.rootsKey === rootsKey && _agentContextCache.ts && Date.now() - _agentContextCache.ts < 300000) return _agentContextCache.data + _memoryBlocks(root, query || "");
 
   const parts = [osBlock, `⚠️ 当前工作区根目录（所有相对路径基于此）: ${root}\n（list_dir "." = 列出 ${root}；read_file "src/main.js" = 读 ${root}/src/main.js）`];
 
@@ -8047,7 +8064,7 @@ async function _gatherAgentContext(query, sessionRoot) {
     ctx = ctx.slice(0, maxLen) + "\n...(context truncated to fit " + CTX_TOKEN_BUDGET + " token budget)";
   }
   _agentContextCache = { rootsKey, root, ts: Date.now(), data: ctx };
-  return ctx + _memoryBlocks(root, query || "") + _crawlRecipeBlock(query || "");
+  return ctx + _memoryBlocks(root, query || "");
 }
 
 // True if the SELECTED model is an image-generation model (can't act as a chat/agent
@@ -8440,7 +8457,7 @@ async function sendPrompt(text, attachedImages = []) {
   // Auto mode: infer the best mode from THIS message; an explicitly-picked mode
   // is honored as-is. `effectiveMode` drives this turn's prompt + tools + dispatch
   // (never the global _currentAiMode, so concurrent tabs don't fight over it).
-  const effectiveMode = _currentAiMode === "auto" ? _inferMode(text) : _currentAiMode;
+  const effectiveMode = _currentAiMode === "auto" ? "agent" : _currentAiMode;
   if (_currentAiMode === "auto") {
     const picked = _AI_MODES.find(m => m.id === effectiveMode);
     if (picked) showToast(`Auto → ${picked.label}`);
@@ -8524,28 +8541,7 @@ async function sendPrompt(text, attachedImages = []) {
     }
   }
 
-  // Growth: inject the adaptive teaching block (tailored to this user's learner
-  // model — fades scaffolding as mastery rises; see growth.js). Conversational
-  // modes only — promptBlock() returns "" for the autonomous agent so it never
-  // dilutes the agent's focus on actually doing the task.
-  // Inject the full UI-design playbook only when this turn is actually about UI —
-  // keeps every other turn's prompt lean and on-task (less "答非所问" drift).
-  // UI aesthetics guide for any UI-touching task; the full design→code PIPELINE on
-  // top for build/design-a-UI tasks (blends generate_image + plan + code + verify).
-  const _uiBase = (effectiveMode === "agent" && _looksUITask(text))
-    ? (_looksUIBuildTask(text) ? _P("ui_design_flow", _UI_DESIGN_FLOW) + "\n\n" + _P("ui_design_guide", _UI_DESIGN_GUIDE) : _P("ui_design_guide", _UI_DESIGN_GUIDE))
-    : "";
-  const uiGuide = _uiBase
-    ? (_modelNeedsCssGrounding(config.model) ? _P("css_concrete_tokens", _CSS_CONCRETE_TOKENS) + "\n\n" + _uiBase : _uiBase)
-    : "";
-  // ── 提示词缓存（省 token 的关键）──────────────────────────────────────────
-  // system 消息保持「纯静态前缀」= 只放模式提示词本身，逐字不变。这样上游的
-  // 前缀缓存（DeepSeek / OpenAI / Kimi 自动；Claude 见 ai.rs 的 cache_control）
-  // 能跨「每一轮对话」复用它，连带 tools 和更早的历史也一起命中缓存，不再每轮
-  // 重新计费/重算。所有「每轮都在变」的动态内容（项目上下文、当前文件、UI 指南、
-  // 自适应教学、plan-first 提示、@文件 注入）一律下沉到本轮的 user 消息末尾——
-  // 放在最后才不会顶掉前面已缓存的静态前缀。Anthropic / OpenAI / DeepSeek 的缓存
-  // 文档结论一致：静态内容在前，易变内容在后。
+  // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
   const _growthBlock = growth.promptBlock(effectiveMode);
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
@@ -8571,42 +8567,6 @@ async function sendPrompt(text, attachedImages = []) {
   // When images are attached, send a multimodal content array so vision models
   // actually see them. History keeps only the text (image data URLs would bloat
   // every subsequent request).
-  // D — for a clearly complex agent task, steer the model to investigate + plan
-  // before editing (Claude Code's plan-first habit). Injected only into this
-  // turn's request — not the visible bubble, not stored history.
-  // Adaptive compute: hard task → invest (plan-first); trivial task → spend less
-  // (do it directly, skip the heavy investigate/plan/verify ritual). This is the
-  // Plan-and-Budget idea — match effort to difficulty (more accurate AND cheaper).
-  const _planFirst = (effectiveMode === "agent" && _looksUIBuildTask(text))
-    ? `\n\n🚨 **UI 设计/搭建任务——先真吃透产品，再走流程（禁止跳步、禁止"我直接开始搭建"）**：
-**第 0 关·吃透真实产品（过不了这关，后面全是空中楼阁）**：动手前先 list_dir **逐层看全**工作区 + read **真实源码/真实文案/配置**（读源码，不是只扫 README），然后**明确写出这个产品 3 条真实、具体、别处不通用的事实**（真功能名 / 真卖点 / 真实文案或数据 / 真实技术栈）。⚠️**只要你写不出 3 条具体的、或只会说"一个 AI IDE / 类似 Cursor / 一个给 AI 用的工具"这种泛泛印象 = 你根本没读够，回去继续深读，别急着往下**——这正是用户最痛恨的"不仔细看项目内容就瞎做、推理浅"。若产品真身不在当前工作区（官网是给别的产品做的、源码在别的目录，$HOME 下都能 read）就去读它**真实源码**、或直接问用户要真实资料，**绝不脑补、绝不套通用模板**。
-**过了第 0 关（能列出真实具体事实=真懂了）再走下面的流程**——好看的官网来自"先看别人怎么做 + 让用户挑风格"，不是凭感觉直接写。每步必做：
-① read_file 读 README/package.json/现有 CSS/品牌色 → 搞清产品、品牌色、技术栈；**并抓住产品自己的视觉调性**（如这是 macOS 风的产品，官网就要呼应 macOS 的精致感/配色/圆角/毛玻璃质感）——官网要和产品本身视觉统一才显专业、更讨喜，别套跟产品无关的通用模板（快，并行几个调用一轮搞定）。**若这个官网是给另一个产品做的、而产品真身源码在别的目录（$HOME 下都能 read，如桌面上的源码工程），记下它的路径，交给步骤③的调研子智能体去深读真实功能与界面**
-② **必做** web_search 搜该品类设计趋势（如 "best ${text.match(/邮箱|email/i) ? "email" : text.match(/电商|shop/i) ? "ecommerce" : text.match(/后台|dashboard/i) ? "dashboard" : text.match(/官网|landing|落地/i) ? "SaaS landing page" : "SaaS"} design 2025"）
-③ **必做·派子智能体去深度调研（别主智能体自己草草看——那样效果差）**：用 **run_subagent** 派一个调研子智能体（它有 browser/screenshot/读文件能力），在它的 prompt 里写清自包含任务，让它做三件事：**(a) 读真实产品**——用户若指了别的项目、或产品源码在 $HOME 下别的目录（如桌面的源码工程，$HOME 下的都能 read），让它 list_dir/read_file **真实产品源码**，提炼**真实的功能/卖点/界面结构/品牌调性**（用真的，别编）；**(b) browser 看真竞品**——用 browser **真的逐个打开 2-3 个真实竞品官网**（按品类选 cursor.com / zed.dev / linear.app / warp.dev / vercel.com 等），eval「document.body.innerText」取回**渲染后的真实文案/区块/功能描述/CTA/社会证明**（⚠️ 这些是 JS 渲染 SPA，web_fetch 抓的是空壳没用，必须 browser），并看当下真实的配色/字体/版式骨架/留白/动效；**(c) 产出「设计简报」**返回给你：真实产品定位+真实卖点、各竞品真做法（带真句子）、3 个候选风格方向的**灵感**（配色 hex/字体/版式素材）。⚠️ **简报只是弹药，不是决定**——最终走哪个方向由**用户在衣橱里亲眼选定**，研究再充分也不能替用户拍板、更不能因为"研究出方向了"就跳过衣橱。等子智能体回来，**衣橱和官网都基于这份简报里的真实内容**，绝不套通用模板
-④ **必做·衣橱（研究≠做完！这步雷打不动，绝不能因为"研究出方向了"就跳过）**：研究只是给你弹药，**衣橱才是让用户亲眼挑定方向的关键交互**——没有它，用户没参与、就是你自说自话。研究子智能体已经把每个方向想透了，所以这步**你主智能体亲自动手、不必再派子智能体**：基于步骤③简报里的真实产品信息 + 真实竞品做法 + 配色/字体/版式素材，**为 3 个明显不同的风格方向各写一段精炼的英文 generate_image prompt**（关键：动态写、别套模板、别堆砌——2～4 句就够：一句主体+版式结构，一句风格气质，一句关键细节=真实文案 / 2～3 个 hex 主色 / 字体感 / 真实上线网站截图质感；写你脑子里那个具体页面，别塞"设计稿/Dribbble/mockup/UI kit"这种招 AI 味的空词。例:「A live SaaS landing page for an AI coding tool — dark charcoal #0B0C0E with one electric-blue accent, bold sans headline 『设计、编码、上线，一个 AI 全包』, a clean product screenshot in the hero, generous whitespace, crisp legible UI text, real running website not a mockup」）→ **亲自 generate_image ×3**（width 1536、height 1024，分别存 .wardrobe/s1.png / s2.png / s3.png）→ **亲自 design_board** 把 3 张图（label 风格名 / path 路径 / description 一句话特点）展示让用户点选。⚠️ **在用户从 design_board 里选定方向之前，绝对禁止写任何 .vue/.jsx/index.html 官网代码**——研究做得再好也一样，衣橱是用户的、不是你替他决定的。选定方向后才进入步骤⑤写代码
-⑤ 用户选定风格后 → **多页站 / 应用先「逐屏设计」（Figma 式）**：按选定的那个风格，用 generate_image 给**每个关键界面/页面各出一张设计图**（首页/功能/定价/登录…）当作各屏的实现目标，可再 design_board 给用户过目确认；**单页落地页**则直接以衣橱选中的那张图为设计目标，不必再逐屏。→ 然后 **真正的实现必须用 Vue/React 组件 + Tailwind**（读 package.json 确认栈）。**搭脚手架时给 vite.config 装框架无关的「code-inspector-plugin」（import { codeInspectorPlugin } from 'code-inspector-plugin' → 加进 plugins: codeInspectorPlugin({ bundler: 'vite' })；Vue/React/Svelte 都支持、React 19 也稳）——它给每个元素打 data-insp-path 源码定位属性，于是用户在预览里点元素就能拿到真实源码位置(file:line)、直接改那处源码(免费可视化编辑)，而不是盲改 CSS。（旧的 vite-plugin-vue-inspector / react-dev-inspector 属性也认，但新项目统一用 code-inspector-plugin。）** **先把选定风格落成一套「设计令牌」单一真源**（在 globals.css / tailwind.config 里定义 CSS 变量：主色+浅深变体、背景/表面、文字/次要文字、危险/成功/警告色、字体族、字阶、间距尺、圆角、阴影——成套 token），**之后每个组件、每一屏一律引用 token**（「var(--color-primary)」或 Tailwind theme 键），**绝不把颜色/字号/间距硬编码散落各处**——全站风格靠这套 token 保持一致，且**改一个 token 全站同步**（多屏一致性靠这个，不是每屏各写各的）。在这套 token 之上，**做成真·实物级官网（像真上线的产品站，不是占位 demo）**：
-   · ✅ **真实文案**——写产品真实的卖点/功能/介绍，绝不要 Lorem ipsum 或「标题占位」；
-   · ✅ **实打实设计、别投机取巧画废 SVG**——hero 大图/插画/场景图**一律用 generate_image 出真图**（没生图模型用 unsplash/picsum 真图）；**产品截图类配图优先用真实的**：真实产品源码仓库里若有现成截图/logo/品牌图就直接用，搭好后也可用 **screenshot 截自己跑起来的 dev server** 拿真实 UI 当展示图；用 generate_image 出产品界面图时**必须如实反映调研读到的真实界面**（真功能名/真布局），别编一个不存在的 UI（一眼假）；图标用 **lucide/heroicons 图标库的真实路径**；⚠️ **严禁自己即兴手画粗糙 SVG 插画/图形来充数**（很廉价、一眼假、用户极其反感）——SVG 只允许用于"图标库的标准图标"，绝不拿自造 SVG 当设计/配图；**绝不用灰色占位框**；
-   · ✅ **排版与布局**——讲究留白、网格对齐、清晰的视觉层级与分区块（Nav/Hero/Features/…/CTA/Footer）；
-   · ✅ **字体 + 配色**——精心的字体搭配（标题/正文层级）+ 完整配色全用选中 tokens；
-   · ✅ **特效 + 动画**——hover/渐变/阴影/玻璃质感等微交互 + 入场/滚动揭示动画（CSS transition/animation 或库），有生命感；
-   · ✅ **响应式** + 起 dev server 用 browser 自查视觉效果。
-   · 🚫 **反「AI 味」（关键，别做出一眼假的通用货）**：别啥都居中堆一个空 hero 完事——要**密度与信息层次**（多个真实区块：特性卡片网格 / 数据指标 / 客户 logo 墙 / 对比表 / 代码示例 / FAQ / footer）；**非对称、有节奏的版式**（左右图文交错、卡片错落），不是从上到下一根筋居中；**每个组件都精心 style**（按钮要有底色/圆角/阴影/hover 态，绝不是裸文字；卡片有边框/阴影/悬浮）；**具体复刻你调研的竞品手法**（那种间距、字重、配色对比、留白节奏）。宁可丰满精致，绝不空洞通用。
-   · 🚫 **避开 AI slop 三大破绽（文献实证最"一眼假"的信号，务必躲开）**：① **别全站默认 Inter 字体**——选契合品牌、有意图的字体搭配（标题/正文不同字族或字重对比）；② **别用烂大街的紫→蓝渐变**——用语义化的品牌专属配色（像 Notion/Stripe：颜色为功能服务、不是随手装饰）；③ **文案写这个产品的具体卖点/场景**，别用"平均出来的"通用空话（"赋能""一站式""高效"那种）。
-   · 🏗️ **按高转化官网的标准结构分区块**（文献实证的页面解剖）：导航栏 → **Hero**(具体大标题 + 一句副文案 + 单一主 CTA + 产品视觉/截图) → **社会证明**(⚠️ **绝不捏造假数据**——没有真实的下载量/评分/客户 logo 就别编"200K+ Downloads""4.9★"那种假的；产品是新的就先留占位文案或直接省略这一块，让用户后填) → **核心收益**(讲它如何改善用户的工作，不只是罗列功能) → **特性**(卡片网格) → **真实截图 / 案例指标** → **用户评价** → **FAQ** → **收尾 CTA** → footer。主 CTA 在 hero、关键收益后、页尾**各放一次**（用户的自然停顿点），移动端可加 sticky CTA。
-   **严禁裸 index.html、严禁空壳占位**——组件化、分区块、可维护、好看到能直接上线
-⑥ **善用「设计三件套」让用户全程参与（每个功能你都要熟练用，别只会写代码）**：① **design_board（衣橱）**=整站风格方向选择（步骤④，必做）；② **preview_choices（功能柜）**=实现某个组件/区块**有多种做法时**（hero 布局、卡片样式、动效方案、配色变体…）出 2-3 个实时预览让用户点选，别自己闷头拍板；③ 实现中遇到关键取舍也优先让用户挑。让用户参与挑选，永远比你猜得准。
-⑦ **必做·100% 还原设计（实现完别撒手，要把代码做到和设计图像素级一致）**：每实现完一个页面/屏、dev server 起着，就调 **visual_compare**（design=该屏对应的设计图路径，如 .wardrobe/ 选中的那张或步骤⑤的逐屏设计图；url=该页在 dev server 的网址）——它把【你的实现】和【目标设计】并排回传给你看，**逐项比对（整体布局/间距留白/配色 hex/字体字重字号/圆角阴影/组件细节）→ 改代码 → 再 visual_compare，循环到两边几乎一模一样**。⚠️ **对不上的元素，先用 browser 的 inspect（act=inspect + 该元素选择器）取它的精确现状样式（真实计算出来的 color / 字号 / padding / margin / 圆角），照设计目标值精确改、别凭肉眼猜数值**——这样一次改到位、不来回磨。差距肉眼可见就继续改，别停在"差不多就行"。**而且别只看长得像——还要真的用起来**：用 browser/computer 实际点一遍关键交互（导航跳转、按钮、表单提交、登录、tab 切换、悬停态），确认是**真接通的、不是只渲染出样子的空壳**（"Potemkin 界面"：好看但一点没反应）——发现没接上逻辑的就补上，再点一遍验证。**做 UI 时多用 browser 打开 dev server 给用户看实时预览**——每张 browser 预览图上用户能点「🎯 指元素给 AI」直接圈定要改的元素，你会收到那个元素的**精确选择器 + 现状计算样式**，据此精准改它（只动那个元素/它的组件，别动别处）。
-⑧ **做完 + visual_compare/自测都过后 → 问用户要不要上线**：用户要的话调 **deploy_site**（name 给个短 slug）→ 自动构建 + 上传服务器 + **自动分配 HTTPS 二级域名「名字.michaelide.xyz」**（泛解析+泛证书已配好、用户无需手动配任何 DNS），把返回的网址发给用户。**用户提"绑定/解析个二级域名、自定义域名、上线分享"也一律走 deploy_site——二级域名全自动，绝不要反问用户域名、也不要让用户去域名控制台手动加 A 记录（那是旧做法、已淘汰）。** 这是「想法→设计→建站→上线」闭环的最后一步，最能让人惊艳。
-**第一步只能是 read_file/list_dir，绝不能直接写 index.html。铁律：调研子智能体 → 衣橱(generate_image×3 + design_board) → 用户选定方向 →(多页先逐屏设计)→ Vue/React 组件实现 → visual_compare 100% 还原 →(用户要的话)deploy_site 一键上线。⚠️ design_board 选定前禁止写任何官网业务代码。**`
-    : (effectiveMode === "agent" && _looksBugFixTask(text))
-    ? _DEBUG_FLOW
-    : (effectiveMode === "agent" && _looksComplexTask(text))
-    ? "\n\n（这看起来是个多步/复杂任务：先用 search / read_file 摸清相关代码与现有约定，再用 update_plan 列出分步计划，然后逐步实现、每步更新计划状态，最后用 run_cmd / get_diagnostics 验证。别一上来就直接改。**难/不确定、又有项目测试或 visual_compare 能判对错的任务 → 可用 best-of-N**：worktree 开 2-3 个隔离工作树各出一个候选实现 → 各自跑项目自带测试（UI 用 visual_compare）→ 选最优、其余 worktree remove 丢弃。文献证明这是提正确率最有效的一招；**关键：用项目自带测试别用自己编的、「只选最优不合并」故并行也安全**。普通/简单任务别滥用，它费 2-3 倍 token。）"
-    : (effectiveMode === "agent" && _looksTrivialTask(text))
-    ? "\n\n（这是个简单直接的小改动：精准定位、改完即可——别长篇规划、别过度调查、别堆额外验证，省时间。改完一句话说清就行。）"
-    : "";
   // @file mentions → pull each pinned file's content into THIS turn's context
   // (the visible bubble and stored history keep just the "@path" the user typed).
   let _atContext = "";
@@ -8614,19 +8574,25 @@ async function sendPrompt(text, attachedImages = []) {
   if (_mentioned.length && (rootPath || workspaceRoots.length)) {
     const _r = (rootPath || workspaceRoots[0]).replace(/\/$/, "");
     const _seen = new Set();
-    for (const rel of _mentioned.slice(0, 6)) {
+    for (const rel of _mentioned.slice(0, 15)) {
       if (_seen.has(rel)) continue;
       _seen.add(rel);
       try {
         const fp = rel.startsWith("/") ? rel : _r + "/" + rel.replace(/^\.?\//, "");
         try {
           const content = await backend.readTextFile(fp);
-          _atContext += `\n\n文件 ${rel}:\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``;
+          _atContext += `\n\n文件 ${rel}:\n\`\`\`\n${content}\n\`\`\``;
         } catch {
-          // Not a readable file → likely a DIRECTORY the user dragged/@-referenced. Inject a listing.
           const entries = await backend.readDir(fp);
-          const listing = entries.slice(0, 200).map((en) => (en.is_dir ? en.name + "/" : en.name)).join("\n");
-          _atContext += `\n\n目录 ${rel}/ 的内容:\n\`\`\`\n${listing || "(空目录)"}\n\`\`\``;
+          const listing = entries.map((en) => (en.is_dir ? en.name + "/" : en.name)).join("\n");
+          _atContext += `\n\n目录 ${rel}/:\n\`\`\`\n${listing || "(空目录)"}\n\`\`\``;
+          for (const en of entries) {
+            if (en.is_dir) continue;
+            try {
+              const fc = await backend.readTextFile(fp + "/" + en.name);
+              _atContext += `\n\n文件 ${rel}/${en.name}:\n\`\`\`\n${fc}\n\`\`\``;
+            } catch {}
+          }
         }
       } catch { /* unreadable — skip */ }
     }
@@ -8635,21 +8601,13 @@ async function sendPrompt(text, attachedImages = []) {
   // system prompt — so it never invalidates the cached static prefix above. Only
   // the lean `text` is stored in history, so this big preamble is sent once (this
   // turn) and doesn't bloat every future request.
-  const gitGuide = (effectiveMode === "agent" && _looksGitTask(text)) ? _GIT_GUIDE : "";
   const _imgModelAvail = (effectiveMode === "agent") ? String(_autoImageModel() || "").trim() : "";
   const _imgHint = _imgModelAvail
-    ? `\n🎨 **生图能力已就绪**：后台有 \`${_imgModelAvail}\` 模型，调 generate_image 即可生成图片（配图/头像/logo/UI设计稿/插画）。做 UI/网页时**主动用它出设计稿和真实素材**，别用灰色占位框。`
-    : (effectiveMode === "agent" ? `\n🎨 **生图提示**：后台暂未配生图模型，generate_image 暂不可用。需要配图时用 picsum.photos / pravatar.cc / dicebear 等在线占位图服务，或提醒用户在后台加一个生图模型（如 gpt-image-2）。` : "");
-  const _proactiveImageGuide = (effectiveMode === "agent" && _imgModelAvail && _looksNeedsImage(text))
-    ? `\n\n💡 **这个任务可能需要生图**——检测到视觉/设计相关意图。主动用 generate_image 生成需要的图片素材（配图/hero/logo/banner/UI设计稿等），别偷懒用纯占位。做 UI 设计时出 2-3 个方向 + design_board 展示。`
-    : "";
-  const _designResearchHint = "";
+    ? `\n🎨 **生图能力已就绪**：后台有 \`${_imgModelAvail}\` 模型，调 generate_image 即可生成图片。`
+    : (effectiveMode === "agent" ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
   const _dynPreamble =
-    (uiGuide ? uiGuide + "\n\n" : "") +
-    (gitGuide ? gitGuide + "\n\n" : "") +
     (_growthBlock ? _growthBlock + "\n\n" : "") +
-    (_designResearchHint ? _designResearchHint + "\n\n" : "") +
-    (_imgHint ? _imgHint + _proactiveImageGuide + "\n\n" : "") +
+    (_imgHint ? _imgHint + "\n\n" : "") +
     (contextBlock ? `--- 项目上下文 ---\n${contextBlock}\n\n` : "");
   // Tool-RAG (A): spotlight the tools most relevant to this task, at the END of the
   // message (high-attention recency) so weak models actually reach for the right one.
@@ -8670,8 +8628,7 @@ async function sendPrompt(text, attachedImages = []) {
   const _contextPreamble = _dynPreamble + _atContext + _toolHint + _expHint;
   const _userText = _contextPreamble
     + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
-    + text
-    + _planFirst;
+    + text;
   let userContent;
   if (attachedImages.length > 0) {
     if (_modelSeesImages(config.model)) {
@@ -8699,7 +8656,7 @@ async function sendPrompt(text, attachedImages = []) {
     growth.signal("message-sent", {
       mode: effectiveMode,
       len: text.length,
-      complex: _looksComplexTask(text),
+      complex: text.length > 280,
       usedAt: _mentioned.length > 0,
       project: _gRoot,
       projectName: _gRoot ? _gRoot.split("/").pop() : "",
@@ -8791,15 +8748,12 @@ async function sendPrompt(text, attachedImages = []) {
   };
   const ensureThink = () => {
     if (reasoningEl) return reasoningEl;
-    // Clean any leftover "..." thinking placeholders from earlier turns so they
-    // don't end up scattered between the new reasoning card and the answer.
     _removeAllThinking(body);
     reasoningEl = document.createElement("div");
     reasoningEl.className = "think-card streaming";
     reasoningEl.dataset.open = "1";
-    reasoningEl._t0 = Date.now(); // for the "已思考 · Ns" duration badge
+    reasoningEl._t0 = Date.now();
     reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
-    // expand/collapse handled by the delegated listener on chatEl (survives snapshot restore)
     body.insertBefore(reasoningEl, body.firstChild);
     return reasoningEl;
   };
@@ -8819,7 +8773,6 @@ async function sendPrompt(text, attachedImages = []) {
   };
   const collapseThink = () => {
     if (!reasoningEl) return;
-    // Final non-streaming pass — close any open code fences/lists cleanly before collapsing.
     const tb = reasoningEl.querySelector(".think-body");
     if (tb && tb.dataset.rawText) {
       try { renderMarkdownInto(tb, tb.dataset.rawText, { streaming: false, highlighter: highlightCode }); } catch {}
@@ -8966,7 +8919,9 @@ async function sendPrompt(text, attachedImages = []) {
       // bailed to that full path the moment the reply contained a "```" fence, so any answer with a
       // code block froze slower machines as it grew. renderMarkdownStream keeps per-frame cost ∝ the
       // current block. (The final, highlighted render still runs once on completion.)
-      renderMarkdownStream(body, view, { streaming: true });
+      // Render into a dedicated sub-element so the think-card in body is not wiped.
+      if (!body._chatStreamEl) { body._chatStreamEl = document.createElement("div"); body._chatStreamEl.className = "chat-stream-wrap"; body.appendChild(body._chatStreamEl); }
+      renderMarkdownStream(body._chatStreamEl, view, { streaming: true });
       body._lastLen = view.length;
     }
     _chatFollow();
@@ -9035,7 +8990,7 @@ async function sendPrompt(text, attachedImages = []) {
               _removeWritePreview(entry); // hand off from the live preview to the real card
               _removeAllThinking(body);
               if (_streamEl) { _streamEl.remove(); _streamEl = null; }
-              if (acc.trim()) { renderMarkdownInto(body, acc.trim(), { streaming: false }); acc = ""; _shown = 0; body._lastLen = 0; }
+              if (acc.trim()) { const _tc = Array.from(body.querySelectorAll(".think-card")); _tc.forEach(e => e.remove()); renderMarkdownInto(body, acc.trim(), { streaming: false }); _tc.forEach(e => body.insertBefore(e, body.firstChild)); acc = ""; _shown = 0; body._lastLen = 0; }
               const step = _createToolStep(call);
               body.appendChild(step);
               const p = _executeToolStep(step, call, _agentRoot);
@@ -9076,7 +9031,7 @@ async function sendPrompt(text, attachedImages = []) {
         if (readResults.length) _agentFollowUp(readResults, body, sess);
       } else {
         const _cc = _cleanAgentText(acc); // strip "..." filler / tool narration before render+persist
-        if (_cc) renderMarkdownInto(body, _cc, { highlighter: highlightCode });
+        if (_cc) { const _target = body._chatStreamEl || body; if (_target === body) { const _tc = Array.from(body.querySelectorAll(".think-card")); _tc.forEach(e => e.remove()); renderMarkdownInto(body, _cc, { highlighter: highlightCode }); _tc.forEach(e => body.insertBefore(e, body.firstChild)); } else { renderMarkdownInto(_target, _cc, { highlighter: highlightCode }); } }
         if (!err && _cc) { sess.memory.push({ role: "assistant", content: _cc }); saveChatHistory(); _maybeRenderChoices(sess, _cc); }
       }
     }
@@ -9755,13 +9710,8 @@ const _AGENT_MAX_ITERS = 40; // base step budget per run
 // up to a high ceiling. The ONLY things that stop it early are: genuinely finishing, or
 // flailing (stuck-looping / repeated failures) — and when stuck it's told to ask_user
 // rather than spin. Bounded so a true infinite loop still can't run away.
-const _AGENT_EXT_STEP = 30;        // steps added per extension
-// Runaway backstop against 死循环. `Infinity` (the old value) let a run that kept making NEW but
-// pointless calls (reading different files / slightly-varied commands forever) count as "progress"
-// and extend without end → an actual infinite loop. 300 is a hard ceiling set FAR above any real
-// task (real coding tasks finish well under ~100 agent steps), so it never interrupts genuine work —
-// it only stops a loop. The loose-loop detection below usually catches a livelock long before this.
-const _AGENT_HARD_CEIL = 300;
+const _AGENT_EXT_STEP = 40;        // steps added per extension
+const _AGENT_HARD_CEIL = 500;
 const _AGENT_MAX_EXTENSIONS = 200; // effectively unbounded for real work; unused as a gate now
 const _AGENT_MAX_REVIEWS = 3;      // evaluator-optimizer: max review→fix→re-review rounds before finishing
 const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test auto-runs per run (progress-gated: stops early once errors stop dropping)
@@ -9771,24 +9721,14 @@ const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test au
 // need 50+ and shouldn't waste a turn extending. Heuristic, not exact — the dynamic
 // extension mechanism still kicks in when warranted.
 function _initialBudget(taskText, stack) {
-  const t = String(taskText || "").toLowerCase();
-  const len = t.length;
-  // "Big task" cues — start at ceiling so the run doesn't dead-stop mid-feature.
-  const BIG_HINTS = /(实现整套|实现完整|从零|从头|重构|重写|搭建|搭一个完整|整个系统|完整的|build a (whole|full|complete)|build the entire|implement (a )?(complete|full|whole)|refactor|migrate|porting|端到端|整体优化|全部优化|全部强化|all-in|全部|build out|production-ready)/i;
-  // "Small task" cues — start lower so we don't burn the cache for trivial Q&A.
-  const SMALL_HINTS = /(^(是|不是|对|错|.{1,40}吗)\?|^(what is|when|where|who|why|how do i)\b|这是什么|什么意思|怎么写|怎么用|.{0,30}\?$)/i;
-  // Quick/conversational ask (a question, or one tiny action) → a SMALL budget so it answers /
-  // does the one thing and stops, instead of ballooning into a multi-step autonomous run. Checked
-  // FIRST so a question containing "全部/完整的" (which live in BIG_HINTS) can't misroute to 60.
-  // Quick/small budgets are a CEILING, not a target — the model self-terminates on a
-  // trivial ask (it just answers, no tool calls), so a higher floor never slows simple
-  // Q&A. It ONLY matters when the model genuinely wants to explore. The old floor of 5
-  // crippled real investigations mis-tagged as "quick" ("看一下项目" → 5 steps → 做样子).
-  if (_looksQuickAsk(taskText)) return 14;
-  if (BIG_HINTS.test(taskText || "")) return Math.min(60, _AGENT_HARD_CEIL);
-  if (SMALL_HINTS.test(taskText || "") && len < 200) return 16;
-  if (stack?.complexity === "large") return Math.min(50, _AGENT_HARD_CEIL); // big project default
-  if (stack?.complexity === "medium") return _AGENT_MAX_ITERS; // 40
+  // Length-only heuristic — _classifyIntent (LLM) recalibrates budget within 1-2
+  // turns, so this just needs a reasonable starting point, not keyword classification.
+  // Budgets are CEILINGS, not targets — the model self-terminates on trivial asks.
+  const len = (taskText || "").trim().length;
+  if (len < 80) return 14;
+  if (len > 400) return Math.min(50, _AGENT_HARD_CEIL);
+  if (stack?.complexity === "large") return Math.min(50, _AGENT_HARD_CEIL);
+  if (stack?.complexity === "medium") return _AGENT_MAX_ITERS;
   return _AGENT_MAX_ITERS;
 }
 
@@ -10374,14 +10314,13 @@ function _demoCaptionFor(call) {
     if (a === "eval") return "在页面里运行脚本";
     return "查看页面";
   }
-  if (t === "computer") {
-    const a = call.action || "screenshot";
-    if (a === "click" || a === "double_click") return `点击屏幕 (${call.x},${call.y})`;
-    if (a === "type") return `输入「${(call.text || "").slice(0, 30)}」`;
-    if (a === "key") return `按键 ${call.key || ""}`;
-    if (a === "move") return `移动到 (${call.x},${call.y})`;
-    if (a === "scroll") return "滚动屏幕";
-    return "查看屏幕";
+  if (t === "automation") {
+    const m = call.method || "";
+    if (m.startsWith("mouse.")) return `自动化 ${m}`;
+    if (m.startsWith("keyboard.")) return `自动化 输入`;
+    if (m.startsWith("browser.")) return `自动化 浏览器 ${m.split(".")[1] || ""}`;
+    if (m.startsWith("recorder.")) return `自动化 ${m === "recorder.replay" ? "回放" : m === "recorder.save" ? "保存录制" : "录制"}`;
+    return `自动化 ${m}`;
   }
   if (t === "screenshot") return `截图 ${call.url || ""}`.trim();
   return "步骤";
@@ -11358,7 +11297,7 @@ function _assertJS(selector, text) {
 
 function _buildAgentToolSchemas(includeWrite) {
   const tools = [
-    { type: "function", function: { name: "read_file", description: "读取文件内容。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取的行数，默认 400" } }, required: ["path"] } } },
+    { type: "function", function: { name: "read_file", description: "读取文件内容。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取行数。**默认一次读完整个文件（不用传）——绝不要为了小文件自己传个小 limit 去分段读，几百行的文件一次就该全读进来，分段是浪费还容易漏**。只有几千行的超大文件才需要分段。" } }, required: ["path"] } } },
     { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "在项目里**按文本** grep——现在**每个命中都带 ±2 行上下文**（►标命中行），直接看懂代码，不用再 read_file。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本（支持正则，如 \"function\\s+login\"）" }, path: { type: "string", description: "可选，限定搜索的子目录（如 \"src/\"）" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
@@ -11367,7 +11306,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "update_plan", description: "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。", parameters: { type: "object", properties: { steps: { type: "array", description: "完整的有序步骤列表（每次传全量，不是增量）", items: { type: "object", properties: { content: { type: "string", description: "这一步做什么——具体但简洁，一眼看懂（含关键技术/文件）" }, status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "状态：pending待办 / in_progress进行中 / completed已完成 / cancelled已取消(用户取消的保持这个)" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "think", description: "**思考草稿 / 推理空间**——把你的推理写下来想清楚再动手（纯思考，不产生任何副作用、不改任何东西）。", parameters: { type: "object", properties: { thought: { type: "string", description: "你的推理 / 分析 / 计划 / 假设（写给自己看，理清思路）" } }, required: ["thought"] } } },
     { type: "function", function: { name: "ask_user", description: "**当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做**。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "派生一个独立的只读子智能体去完成一个聚焦的调研子任务（如「找出登录流程涉及哪些文件并总结」）。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "run_subagent", description: "**只在「大范围、可并行」的重型调研时才用**（例：同时摸清好几个大模块的全貌、跨几十个文件的架构梳理）。⚠️**小事别派**——找几个文件、读一段逻辑、搞清一个函数/流程这种聚焦小调查，你【直接自己 read_file/search 又快又省】；派子智能体等于双倍烧 token（它读一遍+总结，你再读它总结），还慢。拿不准就自己上，别无脑派。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
     { type: "function", function: { name: "research_project", description: "**深挖整个代码库/项目——一次性把它摸透**。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
     { type: "function", function: { name: "design_research", description: "**做网站/界面前，先把设计方向 + 完整 UI 架构研究规划好**（UI 版的 research_project）。", parameters: { type: "object", properties: { goal: { type: "string", description: "要做的网站/界面是什么（如「Michael IDE 的产品官网」「SaaS 后台 dashboard」「电商首页」）" } }, required: [] } } },
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
@@ -11416,15 +11355,15 @@ function _buildAgentToolSchemas(includeWrite) {
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
-      { type: "function", function: { name: "computer", description: "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。", parameters: { type: "object", properties: { action: { type: "string", enum: ["screenshot", "nodes", "press", "set_value", "move", "click", "double_click", "drag", "type", "key", "scroll", "batch"], description: "要执行的操作。drag=按住左键从起点拖到终点(滑块/拖拽/排序/画布)。" }, ref: { type: "integer", description: "**节点操作必填/点击首选**：节点列表里的节点号（press/set_value/click/move、drag起点 用，最准，不用估坐标）" }, to_ref: { type: "integer", description: "drag 终点：拖到这个节点上（节点号）" }, to_x: { type: "integer", description: "drag 终点 x 坐标（没有 to_ref 时用）" }, to_y: { type: "integer", description: "drag 终点 y 坐标" }, steps: { type: "array", description: "batch 用：连续步骤数组，每项 {op:click/double_click/move/type/key/scrol…", items: { type: "object" } }, x: { type: "integer", description: "目标 x 坐标(像素)——没有合适 ref 时才用" }, y: { type: "integer", description: "目标 y 坐标(像素)——没有合适 ref 时才用" }, button: { type: "string", description: "click 用：left/right/middle" }, text: { type: "string", description: "type 用：要输入的文本" }, key: { type: "string", description: "key 用：按键或组合，如 enter、ctrl+c、cmd+space" }, amount: { type: "integer", description: "scroll 用：滚动量，正=下 负=上" } }, required: ["action"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "**仅用于交互式 UI 测试 / 走登录多步表单**（抓网页数据请改用 http_request 或写爬虫脚本，别用它一页页看着抄）。自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元…", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navig…", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "**仅用于交互式 UI 测试 / 走登录多步表单**（抓网页数据请改用 http_request 或写爬虫脚本，别用它一页页看着抄）。**⚠️读源码 / 看文件内容 / 理解代码（含逆向、看 .html/.js/.json）一律用 read_file，绝不启动浏览器去「看」文件——就几个文件时更别开浏览器，那是浪费。browser / screenshot 只在需要真看「渲染后的视觉效果」或做点击/填表交互时才用。**自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元…", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navig…", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
       { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
       { type: "function", function: { name: "capture_start", description: "**启动系统级抓包（真·小黄鸟 / HttpCanary）**——基于 mitmproxy 的 MITM 代理，能抓任意 App / 浏览器的 HTTP/HTTPS 请求（含完整请求头/请求体/响应头/响应体）。启动后用 `capture_flows` 读抓到的请求、定位目标接口，再用 `http_request` 改参重发。**反接口 / 找『数据从哪个接口来』的利器**。首次用可能需要装 mitmproxy + 信任 CA 证书——工具会把要执行的命令返回给你，你转达用户执行即可。", parameters: { type: "object", properties: { port: { type: "integer", description: "代理端口，默认 8080" }, system_proxy: { type: "boolean", description: "是否自动把 macOS 系统代理指向本代理（默认 true → 所有 App 流量都被抓）" } }, required: [] } } },
+      { type: "function", function: { name: "automation", description: "**桌面自动化框架（录制回放 + 跨平台桌面 / 浏览器自动化）**——驱动本机的自动化服务：真实鼠标键盘、CDP 浏览器、桌面 UI 元素，并能把一串操作**录制成工作流存盘、之后一键回放**（这是 IDE 原生没有、由你桌面那个 Rust 自动化框架提供的能力）。首次先调 `system.init` 初始化一次。method 可选：system.init / mouse.move{x,y} / mouse.click{button} / mouse.drag{from_x,from_y,to_x,to_y} / mouse.scroll{amount} / keyboard.type{text} / keyboard.press{key} / keyboard.combo{keys:[]} / browser.start{headless} / browser.goto{url} / browser.click{selector} / browser.type{selector,text} / browser.eval{script} / browser.screenshot{path} / browser.content / recorder.save{name,steps:[{method,params}]} / recorder.replay{name 或 steps,delay_ms} / recorder.list。", parameters: { type: "object", properties: { method: { type: "string", description: "要调用的方法名，如 browser.goto / mouse.click / recorder.replay" }, params: { type: "object", description: "该方法的参数对象，如 {url:'https://…'} 或 {name:'login'}" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**读取已抓到的 HTTP/HTTPS 请求**（结构化：方法/URL/主机/路径/状态/耗时/请求头/请求体/响应头/响应体）。比看截图可靠，是反接口的第一步。用 filter 关键词筛（匹配 host/路径/URL/方法/状态/类型），limit 限条数（默认 30，最新在前）。", parameters: { type: "object", properties: { filter: { type: "string", description: "可选，关键词筛选（模糊匹配 host/路径/URL/方法/状态/content-type）" }, limit: { type: "integer", description: "可选，返回最新的多少条，默认 30" }, include_body: { type: "boolean", description: "可选，是否含请求/响应体（默认 true；只看列表设 false 省 token）" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "停止抓包并关闭已设置的系统代理。", parameters: { type: "object", properties: {}, required: [] } } },
       { type: "function", function: { name: "capture_replay", description: "**精确重放一条抓到的请求**（逆向/调试利器）。按 capture_flows 里的 `id` 取出原始请求，**原样带上抓到的所有请求头（cookie / token / 签名都在里面 → 这是能重放成功的关键）**，可选覆盖 url/method/headers/body 来改参试探。返回真实响应。比手拼 http_request 更可靠——不用重建那一堆头。", parameters: { type: "object", properties: { id: { type: "string", description: "capture_flows 返回里的 id=... 值" }, url: { type: "string", description: "可选，覆盖 URL（改 query / 路径试探）" }, method: { type: "string", description: "可选，覆盖方法" }, headers: { type: "object", description: "可选，覆盖/追加请求头（会合并进抓到的原始头）", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，覆盖请求体" } }, required: ["id"] } } },
@@ -11448,7 +11387,7 @@ function _buildAgentToolSchemas(includeWrite) {
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
   if (!inTauri) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "computer", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation"]);
     return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
   }
   return _applyCloudToolDescs(tools);
@@ -11463,61 +11402,62 @@ function _buildAgentToolSchemas(includeWrite) {
 //  注册表真源 = _buildAgentToolSchemas，两者永不漂移。
 // ============================================================================
 // 仅「重 / 专用」簇延迟加载；未列出的工具全留在核心集——保守，漏判也有 search_tools 兜底。
+// Tool bundles: deferred tool groups. NO regex triggers — the MODEL decides what it
+// needs via search_tools or direct-by-name calls (auto-healed at line ~14678).
+// Regex-based preloading was removed per user directive: "交给模型判断，不要老拿正则".
 const _TOOL_BUNDLES = {
-  design:  { tools: ["design_research", "style_wardrobe", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare"], triggers: /ui|界面|设计|design|页面|配色|landing|落地页|网站|网页|dashboard|后台|原型|风格|主题|好看|美化|前端|portfolio|作品集|首页|官网|商城|登录页|注册页|海报|banner/i },
-  desktop: { tools: ["computer", "system", "decode_qr"], triggers: /电脑|桌面|鼠标|键盘|window|软件|computer|desktop|二维码|\bqr\b|操控.{0,4}(app|应用|软件)|自动化操作|点开.{0,4}(软件|应用)/i },
-  browser: { tools: ["browser", "screenshot"], triggers: /浏览器|网页|截图|browser|screenshot|渲染|预览|页面.{0,4}(测|看|对)|https?:\/\//i },
-  github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"], triggers: /\bpr\b|pull request|github|\bgh\b|\bci\b|actions|工作流|评审|代码审查|review|合并请求/i },
-  db:      { tools: ["db_query"], triggers: /数据库|\bsql\b|mysql|postgres|redis|sqlite|\bdb\b|查表|建表|迁移|migration|索引|schema|存储过程/i },
-  net:     { tools: ["http_request", "download_file", "capture_start", "capture_flows", "capture_stop", "capture_replay"], triggers: /\bapi\b|http|请求|下载|download|webhook|接口|抓包|抓请求|拦截|mitm|charles|fiddler|小黄鸟|httpcanary|调.{0,2}接口|rest|graphql|爬虫|爬取|抓取|抓数据|采集|scrape|crawl|spider/i },
-  remote:  { tools: ["remote"], triggers: /远程|服务器|\bremote\b|\bssh\b|部署到|另一台|他的机器|生产机|远端/i },
-  demo:    { tools: ["start_demo", "stop_demo"], triggers: /演示|录屏|\bdemo\b|回放|录制.{0,2}流程|走查/i },
+  design:  { tools: ["design_research", "style_wardrobe", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare"] },
+  desktop: { tools: ["automation", "system", "decode_qr"] },
+  browser: { tools: ["browser", "screenshot"] },
+  github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"] },
+  db:      { tools: ["db_query"] },
+  net:     { tools: ["http_request", "download_file", "capture_start", "capture_flows", "capture_stop", "capture_replay"] },
+  remote:  { tools: ["remote"] },
+  demo:    { tools: ["start_demo", "stop_demo"] },
 };
 const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) => b.tools));
 // 常驻的 search_tools 元工具——provider 无关的 Tool-Search：模型描述需求即按需拉取。
-const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: "**按需加载工具**。为省 token，专用 / 重型工具默认不在你的工具列表里，但**全都随时可用、绝不会丢**——两种取用方式：①**直接按名调用**：你从下面目录或系统提示词里知道某工具名时，**直接发起调用即可**，系统会自动加载并执行（无需先 search）；②**不确定用哪个**时，用本工具一句话描述需求，把匹配工具的完整定义拉进来再用。\n\n**可加载工具目录**（按需取用，别因为没在工具列表里看到就以为没有）：\n· 网页 browser(操控/测试网页:打开/点击/填表/抓包/check) screenshot(渲染网址截图给你看)\n· 电脑桌面 computer(控制鼠标键盘/任意桌面App) system(跨软件跳转/直接走菜单) decode_qr(识别二维码)\n· 数据库 db_query(查改 MySQL/PostgreSQL/SQLite/Redis)\n· 网络 http_request(调任意 HTTP API/测本地服务) download_file(下载文件到工作区)\n· GitHub gh_pr_create gh_pr_view gh_pr_checks gh_actions_log gh_pr_review_comments gh_pr_reply\n· UI设计 generate_image(AI文生图:素材/设计稿) design_research(设计方向+UI架构调研) style_wardrobe(出3套风格让用户挑) design_board(多设计稿选方向) preview_choices(多方案实时预览) visual_explain(漫画讲解概念) visual_compare(实现↔设计图并排对比做到100%还原)\n· 远程 remote(连远程机器直接写代码/跑命令)\n· 演示 start_demo stop_demo(录制功能演示回放)\n\n例：query=\"操控浏览器测网页\" / \"查 mysql 数据库\" / \"生成 UI 设计稿\" / \"开 github PR\"。没命中换个说法再试。", parameters: { type: "object", properties: { query: { type: "string", description: "你要的能力 / 要做的事（中英文都行，一句话）" } }, required: ["query"] } } };
+const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: "**按需加载工具**。为省 token，专用 / 重型工具默认不在你的工具列表里，但**全都随时可用、绝不会丢**——两种取用方式：①**直接按名调用**：你从下面目录或系统提示词里知道某工具名时，**直接发起调用即可**，系统会自动加载并执行（无需先 search）；②**不确定用哪个**时，用本工具一句话描述需求，把匹配工具的完整定义拉进来再用。\n\n**可加载工具目录**（按需取用，别因为没在工具列表里看到就以为没有）：\n· 网页 browser(操控/测试网页:打开/点击/填表/抓包/check) screenshot(渲染网址截图给你看)\n· 电脑桌面 automation(桌面自动化框架:真实鼠标键盘/CDP浏览器/录制回放) system(跨软件跳转/直接走菜单) decode_qr(识别二维码)\n· 数据库 db_query(查改 MySQL/PostgreSQL/SQLite/Redis)\n· 网络 http_request(调任意 HTTP API/测本地服务) download_file(下载文件到工作区)\n· GitHub gh_pr_create gh_pr_view gh_pr_checks gh_actions_log gh_pr_review_comments gh_pr_reply\n· UI设计 generate_image(AI文生图:素材/设计稿) design_research(设计方向+UI架构调研) style_wardrobe(出3套风格让用户挑) design_board(多设计稿选方向) preview_choices(多方案实时预览) visual_explain(漫画讲解概念) visual_compare(实现↔设计图并排对比做到100%还原)\n· 远程 remote(连远程机器直接写代码/跑命令)\n· 演示 start_demo stop_demo(录制功能演示回放)\n\n例：query=\"操控浏览器测网页\" / \"查 mysql 数据库\" / \"生成 UI 设计稿\" / \"开 github PR\"。没命中换个说法再试。", parameters: { type: "object", properties: { query: { type: "string", description: "你要的能力 / 要做的事（中英文都行，一句话）" } }, required: ["query"] } } };
 // 全量注册表 { name → schema }。
 function _buildToolRegistry(includeWrite) {
   const reg = new Map();
   for (const t of _buildAgentToolSchemas(includeWrite)) if (t && t.function && t.function.name) reg.set(t.function.name, t);
   return reg;
 }
-// 一次 run 的初始工具载荷：核心集（非延迟的全部）+ search_tools + 任务文本命中的延迟簇。
-// 漏判的延迟簇可由模型 search_tools 拉回——只多一次往返，绝不丢能力。
+// Initial tool payload: core set (non-deferred) + search_tools.
+// Deferred tools load on demand: model calls search_tools OR calls them by name
+// directly (auto-healed). No regex preloading — model decides what it needs.
 function _selectInitialTools(includeWrite, taskText) {
   const all = _buildAgentToolSchemas(includeWrite);
-  // 预载信号 = 任务文本 + 当前打开文件路径（让相关延迟簇更常一开始就在位；
-  // 漏判仍由"自愈加载"兜底，所以这里保守即可）。
+  // File-extension context: if a .sql file is open, preload db_query (cheap, 1 tool).
+  // If a frontend file is open, preload browser+screenshot (2 tools). These are
+  // context-based, not regex-on-user-text — the open file IS the signal.
   const ap = (typeof activePath === "string" ? activePath : "");
-  const text = String(taskText || "") + " " + ap;
   const ext = (ap.split(".").pop() || "").toLowerCase();
   const seeded = new Set();
-  for (const b of Object.values(_TOOL_BUNDLES)) if (b.triggers.test(text)) for (const n of b.tools) seeded.add(n);
-  // 文件类型 → 簇（只加轻量的：db 1 个、browser 2 个；design 这种重簇只靠任务文本触发）。
   if (/^(sql|prisma)$/.test(ext)) for (const n of _TOOL_BUNDLES.db.tools) seeded.add(n);
   if (/^(vue|jsx|tsx|svelte|html|htm|css|scss|less|astro)$/.test(ext)) for (const n of _TOOL_BUNDLES.browser.tools) seeded.add(n);
   const out = all.filter((t) => { const n = t.function && t.function.name; return !_DEFERRED_TOOL_NAMES.has(n) || seeded.has(n); });
   out.push(_SEARCH_TOOLS_SCHEMA);
   return out;
 }
-// search_tools 查找：先整簇命中（触发词），再按 name/description 关键词重叠打分；
-// 返回要追加的 schema（已加载的跳过），单次最多 8 个。
+// search_tools lookup: keyword scoring against tool name + description.
+// Returns schemas to append (already-loaded skipped), max 8 per call.
 function _searchToolsLookup(query, registry, loadedNames) {
   const q = String(query || "").toLowerCase();
-  const picked = new Map();
-  for (const b of Object.values(_TOOL_BUNDLES)) if (b.triggers.test(q)) for (const n of b.tools) { const s = registry.get(n); if (s && !loadedNames.has(n)) picked.set(n, s); }
   const terms = q.split(/[^a-z0-9一-龥]+/i).filter((w) => w.length >= 2);
   const scored = [];
   for (const [n, s] of registry) {
-    if (loadedNames.has(n) || picked.has(n)) continue;
+    if (loadedNames.has(n)) continue;
     const name = n.toLowerCase(), desc = ((s.function && s.function.description) || "").toLowerCase();
     let score = 0;
     for (const t of terms) { if (name.includes(t)) score += 3; else if (desc.includes(t)) score += 1; }
     if (score > 0) scored.push([score, n, s]);
   }
   scored.sort((a, b) => b[0] - a[0]);
-  for (const [, n, s] of scored) { if (picked.size >= 8) break; picked.set(n, s); }
-  return [...picked.values()];
+  const picked = [];
+  for (const [, , s] of scored) { if (picked.length >= 8) break; picked.push(s); }
+  return picked;
 }
 
 /** Translate an OpenAI tool call into the internal `call` shape `_executeToolStep` understands. */
@@ -11540,7 +11480,7 @@ const _KNOWN_TOOLS = new Set([
   "git_pull", "git_blame", "git_stash", "git_stash_pop", "git_stash_list", "git_conflicts",
   "read_terminal", "list_terminals", "stop_terminal", "run_in_terminal", "start_demo", "stop_demo",
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
-  "lsp_symbols", "lsp_definition", "lsp_references", "browser", "computer",
+  "lsp_symbols", "lsp_definition", "lsp_references", "browser",
   "preview_choices", "style_wardrobe", "visual_explain", "design_research",
 ]);
 const _TOOL_ALIASES = {
@@ -11854,6 +11794,7 @@ function _mapToolCall(name, args) {
     }
     case "download_file": return { type: "download", url: args.url || "", dest: args.dest || args.path || "" };
     case "capture_start": return { type: "capture_start", port: Number.isFinite(+args.port) ? +args.port : 0, systemProxy: args.system_proxy !== false };
+    case "automation": return { type: "automation", method: String(args.method || ""), params: (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {} };
     case "capture_flows": return { type: "capture_flows", filter: String(args.filter || "").toLowerCase(), limit: Number.isFinite(+args.limit) ? +args.limit : 30, includeBody: args.include_body !== false };
     case "capture_stop": return { type: "capture_stop" };
     case "capture_replay": {
@@ -11886,7 +11827,7 @@ function _mapToolCall(name, args) {
       if (args.node != null && args.node !== "" && Number.isFinite(Number(args.node))) _bsel = `[data-mnode="${Number(args.node)}"]`;
       return { type: "browser", action: args.action || "screenshot", url: args.url || "", selector: _bsel, text: args.text || "", key: args.key || "", amount: args.amount, ms: args.ms, script: args.script || "", steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null), uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))) };
     }
-    case "computer": return { type: "computer", action: args.action || "screenshot", ref: (args.ref ?? args.node ?? args.element ?? args.index), x: args.x, y: args.y, button: args.button || "", text: args.text || "", key: args.key || "", amount: args.amount, steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null) };
+    case "computer": return { type: "automation", method: "mouse.click", params: {} };
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
     case "style_wardrobe": return { type: "wardrobe", title: args.title || "选一套风格", context: args.context || "", outfits: Array.isArray(args.outfits) ? args.outfits : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
@@ -11943,8 +11884,9 @@ function _planRowHtml(s, i) {
   const isDone = s.status === "completed", isCancel = s.status === "cancelled";
   const actionable = !isDone && !isCancel;
   const cls = "agent-plan__row" + (isDone ? " agent-plan__row--done" : isCancel ? " agent-plan__row--cancelled" : " agent-plan__row--actionable");
-  const tag = isCancel ? `<span class="agent-plan__tag">已取消</span>` : (actionable ? `<span class="agent-plan__cancelhint">点击取消 ✕</span>` : "");
-  return `<li class="${cls}" data-idx="${i}">${_planStepIcon(s.status)}<span class="agent-plan__txt">${_escHtml(s.content)}</span>${tag}</li>`;
+  const tag = isCancel ? `<span class="agent-plan__tag">点击恢复 ↩</span>` : (actionable ? `<span class="agent-plan__cancelhint">点击取消 ✕</span>` : "");
+  const rowCls = cls + (isCancel ? " agent-plan__row--restorable" : "");
+  return `<li class="${rowCls}" data-idx="${i}">${_planStepIcon(s.status)}<span class="agent-plan__txt">${_escHtml(s.content)}</span>${tag}</li>`;
 }
 // Cancel a plan step by its content — records it, re-renders the inline card (which also
 // refreshes the chip + its open panel), and queues a note so the next turn skips it.
@@ -11953,12 +11895,30 @@ function _cancelPlanStep(run, content) {
   const key = String(content).trim().toLowerCase();
   run._planCancelled = run._planCancelled || new Set();
   run._planCancelled.add(key);
+  if (run._planRestored) run._planRestored.delete(key);
   run._planPendingCancel = run._planPendingCancel || [];
   if (!run._planPendingCancel.includes(content)) run._planPendingCancel.push(content);
   const steps = (run._planSteps || []).map((s) => String(s.content).trim().toLowerCase() === key ? { ...s, status: "cancelled" } : s);
   if (run._planEl && run._planEl.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
   else { run._planSteps = steps; _syncPlanChip(run, steps); }
   try { showToast("已取消「" + String(content).slice(0, 18) + (String(content).length > 18 ? "…" : "") + "」，智能体会跳过"); } catch {}
+}
+function _restorePlanStep(run, content) {
+  if (!run || !content) return;
+  const key = String(content).trim().toLowerCase();
+  if (run._planCancelled) run._planCancelled.delete(key);
+  run._planRestored = run._planRestored || new Set();
+  run._planRestored.add(key);
+  if (run._planPendingCancel) {
+    const idx = run._planPendingCancel.indexOf(content);
+    if (idx >= 0) run._planPendingCancel.splice(idx, 1);
+  }
+  run._planPendingRestore = run._planPendingRestore || [];
+  if (!run._planPendingRestore.includes(content)) run._planPendingRestore.push(content);
+  const steps = (run._planSteps || []).map((s) => String(s.content).trim().toLowerCase() === key ? { ...s, status: "pending" } : s);
+  if (run._planEl && run._planEl.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
+  else { run._planSteps = steps; _syncPlanChip(run, steps); }
+  try { showToast("已恢复「" + String(content).slice(0, 18) + (String(content).length > 18 ? "…" : "") + "」"); } catch {}
 }
 // Render the chip's expand-panel: the full step list, click a row to cancel (live).
 function _renderPlanChipPanel(panel, run) {
@@ -11968,6 +11928,12 @@ function _renderPlanChipPanel(panel, run) {
     row.addEventListener("click", () => {
       const s = steps[+row.dataset.idx];
       if (s) _cancelPlanStep(run, s.content);
+    });
+  });
+  panel.querySelectorAll(".agent-plan__row--restorable").forEach((row) => {
+    row.addEventListener("click", () => {
+      const s = steps[+row.dataset.idx];
+      if (s) _restorePlanStep(run, s.content);
     });
   });
 }
@@ -12022,7 +11988,16 @@ function _renderPlan(container, steps, existingEl, run) {
   // user cancelled. A step the user ✕'d stays cancelled even if the model re-sends it.
   const norm = (c) => String(c || "").trim().toLowerCase();
   const cancelled = (run && run._planCancelled) || new Set();
-  steps = (steps || []).map((s) => cancelled.has(norm(s.content)) ? { ...s, status: "cancelled" } : s);
+  const restored = (run && run._planRestored) || new Set();
+  steps = (steps || []).map((s) => {
+    const n = norm(s.content);
+    if (cancelled.has(n)) return { ...s, status: "cancelled" };
+    if (restored.has(n)) {
+      if (s.status === "cancelled") return { ...s, status: "pending" };
+      restored.delete(n);
+    }
+    return s;
+  });
   if (run) run._planSteps = steps;
 
   const done = steps.filter((s) => s.status === "completed").length;
@@ -12048,12 +12023,16 @@ function _renderPlan(container, steps, existingEl, run) {
     `<ul class="agent-plan__list">` +
     steps.map((s, i) => _planRowHtml(s, i)).join("") +
     `</ul>`;
-  // Click an ACTIONABLE row → cancel that step (records it, re-renders the card + chip,
-  // tells the next turn to skip it). Done/cancelled rows aren't clickable.
   el.querySelectorAll(".agent-plan__row--actionable").forEach((row) => {
     row.addEventListener("click", () => {
       const s = steps[+row.dataset.idx];
       if (s) _cancelPlanStep(run, s.content);
+    });
+  });
+  el.querySelectorAll(".agent-plan__row--restorable").forEach((row) => {
+    row.addEventListener("click", () => {
+      const s = steps[+row.dataset.idx];
+      if (s) _restorePlanStep(run, s.content);
     });
   });
   _syncPlanChip(run, steps);
@@ -12068,9 +12047,8 @@ function _renderPlan(container, steps, existingEl, run) {
 // a run. The read cache is cleared at the start of each agent run and on any
 // command (which may mutate files), and invalidated per-path on edit/write/
 // delete/move. The web cache lives for the session (page content is stable). ---
-const _agentReadCache = new Map(); // absolute path -> file text
+const _agentReadCache = new Map(); // absolute path -> file text (populated on read; freshness handled by the content-signature dedup, not a stale fast-path)
 const _agentWebCache = new Map(); // url|query -> result text
-let _lastComputerEls = []; // last desktop accessibility elements [{ref,role,text,x,y}] — for ref-based (node) clicking instead of pixel guessing
 
 // ---- "正在控制电脑" 红光边框：全自动操控时屏幕四周亮录制红光，控制结束就灭 ----
 // A transparent, click-through, always-on-top fullscreen overlay window (overlay.html).
@@ -12205,6 +12183,8 @@ function _resetReadProgress(run, ...keys) {
       if (!v) continue;
       if (run._readSeen) run._readSeen.delete(v);
       if (run._readStep) run._readStep.delete(v);
+      if (run._readSig) run._readSig.delete(v);   // keep all per-file read maps in lockstep on
+      if (run._dupReadN) run._dupReadN.delete(v); // edit/move/delete, so none goes stale
     }
   }
 }
@@ -12246,115 +12226,6 @@ async function _revertRun(snapshot) {
   return { ok, fail };
 }
 
-// Heuristic for "this is a multi-step / build-something task" → worth a plan-first
-// approach. Deliberately conservative so quick fixes aren't slowed down.
-function _looksComplexTask(text) {
-  const t = (text || "").trim();
-  if (t.length > 280) return true;
-  return /(实现|重构|搭建|做一个|做个|开发|新增功能|加.{0,4}功能|集成|迁移|设计.{0,6}(系统|架构|页面|功能|模块)|build |implement|refactor|create (a|an)|add (a|an).{0,30}(feature|page|component|endpoint|api|system|module)|scaffold|set ?up|migrate)/i.test(t);
-}
-
-// Adaptive compute (Plan-and-Budget): the cheap half — spot a tiny, atomic task
-// so we can tell the agent to just DO it directly instead of over-investigating /
-// over-planning / over-verifying. Deliberately conservative (short + clearly
-// single-step) so a task that needs care is never under-served.
-function _looksTrivialTask(text) {
-  const t = (text || "").trim();
-  if (t.length > 90 || _looksComplexTask(t)) return false;
-  return /改个?名|重命名|rename|改成|换成|加个?(注释|日志|log|print|console)|删掉?这|去掉这|注释掉|格式化|format\b|改下|小改|微调|typo|拼写|错别字|加一行|挪到|移到|对齐/i.test(t);
-}
-
-// Auto-route the user's message to the best mode (only used when the picker is on
-// "Auto"). Grounded in how Claude Code / Codex behave: keep ONE capable agent and
-// only drop to a restricted mode on STRONG, explicit signals — when in doubt, pick
-// `agent` (full capability) so the assistant can actually DO what was asked. Over-
-// routing to read-only modes is the worst failure: the user asks for a change and
-// the agent can't make it ("答非所问"). So the bias here is deliberately toward agent.
-function _inferMode(text) {
-  const t = (text || "").trim();
-  const low = t.toLowerCase();
-  // 1) Code review / security audit → reviewer (read-only deep hunt). Terms here
-  //    are all "find/audit", never "fix" (which must stay agent).
-  if (/审查|审一下|评审|过一遍代码|code\s*review|\breview\b|\baudit\b|找.{0,4}(bug|漏洞|隐患|问题)|查.{0,4}(漏洞|隐患|安全)|有没有.{0,4}(bug|问题|漏洞|隐患)|安全审计|代码审计|审计代码|安全审查|安全检查|渗透|挑.{0,3}毛病/.test(low)) return "reviewer";
-  // 2) Explicit "give me a plan/design, DON'T build it yet" → plan mode. Requires
-  //    BOTH a plan/design noun AND a "not yet" signal, so a normal build request
-  //    ("做个登录页") still goes to agent (which plans-first on its own).
-  if (/(方案|计划|规划|设计|架构|思路|plan|design|architect|approach)/.test(low)
-      && /(先?别(直接)?(写|动手|实现|改|做)|don'?t (write|implement|build|code)|不要(直接)?(写|实现|动手)|先(出|给|做)(个|一)?(方案|计划|规划)|先规划|先设计|先别|plan (first|it out)|just (a )?plan|不用(写|实现)|暂时别)/.test(low)) return "plan";
-  // Unambiguous "do/change it" verbs — these always mean the user wants action.
-  // Deliberately excludes the bare noun "实现/逻辑/架构" so "怎么实现的"(how it's
-  // implemented) is NOT read as a command. Checked as the gate below.
-  const CHANGE = /(修复|修一下|修个|改一下|改成|改个|重构|删|移除|去掉|重命名|部署|发布|deploy|安装|装一下|install|提交|commit|推送|push|生成|创建|建一个|建个|实现一个|实现个|实现一下|做一个|做个|写个|写一个|开发|搭建|搭个|新增|加(个|一个|上)|集成|迁移|优化|加速|配置一下|setup|set ?up|跑一下|运行|执行|启动|fix|implement|build|create|refactor|\bmove\b|rename|\badd\b|对接|联调|加密|帮我(写|做|改|加|建|删|设计|搭|整|弄)|设计.{0,4}(一个|个|一套|套|出|下|ui|界面|页面|网站|app|系统|后台|方案)|画.{0,4}(一个|个|界面|原型|ui|图)|出.{0,4}(设计|稿|图|ui))/;
-  // 3) Explain / question with NO change verb → read-only. Catches "解释这个怎么实现
-  //    的" and embedded-question-word forms like "架构是怎样的 / 为什么报错".
-  const EXPLAIN = /解释|讲解|讲讲|说明|说说|分析一下|梳理|帮我.{0,4}(理解|看懂|读懂)|看懂|读懂|搞懂|什么意思|怎么回事/;
-  const isQuestion = /[?？]\s*$|吗[?？]?\s*$|呢[?？]?\s*$|为什么|为啥|怎么|咋|如何|怎样|啥样|是不是|能不能|可不可以|有没有|该不该|要不要|什么是|啥是|哪个|哪些|多少|干嘛|干啥|干什么|做什么用|啥用|什么用|起.{0,2}作用|\b(what|why|how|which|when|where|is|are|can|should|does|do|would)\b/;
-  if (!CHANGE.test(low) && (EXPLAIN.test(low) || isQuestion.test(low))) {
-    if (/(只|光|仅|别|不要|先别)(看|读|解释|分析|动|改)/.test(low)) return "explorer";
-    // References the codebase → explorer (read files to answer); else general → chat.
-    return /(代码|函数|文件|项目|这个|这段|这里|这块|架构|模块|实现|逻辑|源码|报错|报这|class |function |\.(js|ts|rs|go|py|java|cpp|vue|jsx|tsx)\b|工程|仓库|repo|目录|结构|接口|方法|这个类|报的错)/.test(low) ? "explorer" : "chat";
-  }
-  // 4) Has a change/do verb → agent (must be able to act).
-  if (CHANGE.test(low)) return "agent";
-  // 5) Default → agent. When in doubt, be able to act (the safe failure mode).
-  return "agent";
-}
-
-// Does this task warrant injecting the full UI-design playbook? (Kept lean by
-// default; the agent prompt carries only the bottom-lines.)
-function _looksUITask(text) {
-  return /\b(ui|ux|css|html|tailwind|react|vue|svelte|landing|dashboard|svg)\b/i.test(text || "")
-    || /界面|页面|前端|样式|布局|配色|主题|组件|按钮|表单|动画|图标|响应式|好看|美化|设计.{0,4}(页|站|风格)|网站|网页/.test(text || "")
-    || /\.(html|css|scss|less|jsx|tsx|vue|svelte)$/i.test(activePath || "");
-}
-// A BUILD/DESIGN-a-UI task (not a small CSS tweak) → run the full design→code pipeline
-// (_UI_DESIGN_FLOW), blending generate_image + plan + code + browser-verify.
-function _looksUIBuildTask(text) {
-  const t = String(text || "");
-  return /(做|设计|搭建|搭|建|写个|写一个|实现|生成|来个|来一个|整一个|build|create|design|make|generate|做一个|做个)[^。.\n]{0,12}(ui|界面|页面|落地页|landing|dashboard|仪表盘|网站|网页|app|应用|产品|后台|管理.{0,3}(系统|端)|主页|首页|官网|商城|登录页|注册页|个人主页|作品集|portfolio|原型|design)/i.test(t)
-    || /产品\s*ui|ui\s*设计|界面设计|设计.{0,3}(界面|页面|风格|稿|图|ui)|出.{0,2}设计稿|画.{0,2}(界面|原型|ui|图)/i.test(t);
-}
-// 是不是"修 bug / 排查问题"任务 → 走 _DEBUG_FLOW 硬流程（治"修 bug 能力弱"）。
-function _looksBugFixTask(text) {
-  const t = String(text || "");
-  return /(修复|修一下|修个|修修|解决|排查|查一下|定位|debug|调试|fix|repair|troubleshoot|resolve)[^。.\n]{0,18}(bug|错误|报错|崩溃|闪退|卡死|卡住|不工作|不对|不生效|没反应|没效果|失败|异常|挂了|坏了|白屏|死循环|crash|error|broken|fail|issue|exception|wrong|not\s*work|doesn'?t\s*work)/i.test(t)
-    || /(报错了|抛异常|stack\s*trace|traceback|undefined is not|cannot read|null\s*pointer|segfault|panic|nullpointer|为什么.{0,10}(不|没|报错|崩|失败|不对)|怎么.{0,6}(不|没|报错|崩|失败|不对|修))/i.test(t)
-    || /(这个|该|此|帮我|给我)?\s*(bug|报错|崩溃|闪退|异常)\b|修\s*bug|de\s*bug|有个?\s*(bug|问题|错误)|出\s*(bug|问题|错)/i.test(t);
-}
-// 快速/对话式请求：就问一句，或让你做一件明确的小事。这种应该"答完 / 做完那一件事就停"，
-// 别自作主张升级成"读一堆文件 + 列计划 + 多步自动化"的长跑（用户抱怨的"需求不是让你一直跑
-// 你就一直跑"）。凡是带真·多步意图（搭建/重构/实现/修 bug/整套…）的一律不算 quick——宁可
-// 偶尔多跑几步，也别把真任务提前停掉。
-function _looksQuickAsk(text) {
-  const t = String(text || "").trim();
-  if (!t || t.length > 240) return false;                          // 长 brief ⇒ 不是 quick
-  if (_looksUIBuildTask(t) || _looksBugFixTask(t)) return false;    // 真·搭建 / 修 bug
-  if (/(重构|重写|实现|搭建|迁移|整套|全部|批量|逐个|所有|整个|refactor|rewrite|implement|build|migrate|overhaul|revamp)/i.test(t)) return false; // 明确多步动作
-  //涉及项目 / 多文件 / 代码库范围 ⇒ 要真的探索，绝不是 quick（"看一下我的项目"曾被误判为 quick→5 步→做样子）
-  if (/项目|工程|代码库|整个|整体|这些|这几个|各个|目录|文件夹|架构|梳理|剖析|摸清|通读|排查|审查|分析一下|优化一下|codebase|repo|architecture/i.test(t)) return false;
-  const isQuestion = /[?？]\s*$/.test(t)
-    || /^(what|why|how|when|where|who|which|is|are|can|does|do|should|explain|tell me)\b/i.test(t)
-    || /(为什么|为啥|是什么|什么意思|这是啥|怎么回事|是不是|对不对|能不能|可不可以|讲讲|解释|说明一下|看一下|看下|是干嘛|干什么用|有什么用|啥意思)/.test(t);
-  const tinyAction = /^(把|将|帮我|给我)?[^。.\n]{0,40}(改成|改为|换成|重命名|删掉|删除|加一行|加个注释|注释掉|格式化|rename|delete|remove|改个|改一下)[^。.\n]{0,24}$/i.test(t);
-  return isQuestion || tinyAction;
-}
-const _DEBUG_FLOW = `\n\n🐞 **修 Bug 任务——按这套硬流程来，别"改一下试试"瞎猜乱改**：
-① **先复现 + 拿到真错**：找到触发路径，拿到**真实的报错全文 / 调用栈 / 控制台日志**（前端 bug：用 browser 打开页面、跑用户那条操作、读 console 报错；服务端：run_cmd 跑起来看输出；有测试就跑）。**没亲眼看到真实错误信息之前，绝不动手改。**
-② **拉全上下文再下结论**：read_file 把**报错点文件 + 它的调用方 + 它调用的定义**都读全（search / lsp_definition / lsp_references 顺藤摸瓜），理清数据从哪来到哪去——bug 常在"中间环节"，只盯报错那一行容易改错地方。
-③ **列 2-3 个最可能根因，逐一证伪**：写下假设（空值没判 / 异步竞态 / 类型不符 / 边界条件 / off-by-one / 状态没更新…），**用读代码 / 加日志 / 最小复现去证实或排除**，锁定**真正的根因**，别停在表面症状。
-④ **小改、对症**：只改根因那几行（优先小 diff），别大面积重写、别顺手改无关代码；改完能说清"为什么这就能修"。
-⑤ **必须验证（铁律）**：把复现步骤**重跑一遍确认真修好了**（browser 重测 / 重跑命令 / 跑测试 / get_diagnostics），再快速扫一眼**有没有引入回归**（同类调用点、边界）。**没亲自验证过，绝不说"修好了"。**
-⑥ **卡住就换思路**：别在同一条错误路径上反复试同一种改法打转——换假设、换工具、加更多日志、缩小复现范围，必要时退一步重新理解问题。`;
-function _looksNeedsImage(text) {
-  const t = String(text || "");
-  return _looksUIBuildTask(t) || _looksUITask(t)
-    || /logo|头像|配图|插画|banner|封面|海报|壁纸|背景图|hero|封面图|素材|图标设计|icon\s*design|生成.{0,4}图|出.{0,4}图|画.{0,4}图|设计稿|mockup|原型图|prototype/i.test(t)
-    || /\b(image|illustration|artwork|poster|thumbnail|cover|graphic|visual)\b/i.test(t);
-}
-// Git-related task → inject the professional git workflow guide (_GIT_GUIDE).
-function _looksGitTask(text) {
-  return /\bgit\b|提交代码|提交一下|去提交|commit|推送|\bpush\b|拉取|\bpull\b|分支|branch|合并代码|\bmerge\b|冲突|conflict|stash|暂存|rebase|cherry.?pick|pull.?request|\bpr\b|版本控制|回滚|revert|checkout|gh pr|\.gitignore/i.test(String(text || ""));
-}
 
 // --- Project memory: notes the agent writes with the `remember` tool, persisted
 // per-workspace in localStorage and auto-injected into the agent's context so it
@@ -12551,79 +12422,6 @@ function _memoryBlocks(root, query) {
   return _kgRetrieveBlock(root, query, false) + _kgRetrieveBlock("", query, true);
 }
 
-// === 「用户描述 → 爬虫」: 热词路由 + recipe 检索注入 ==========================
-// 不是死表：用户一句话描述要抓什么，命中后把「这类站/这种模式实测怎么抓」的打法注入
-// 上下文，智能体照着改 + 抓包优先 + 渐进修正 + 校验重试。依据 AutoScraper(渐进式理解) +
-// ScrapeGraphAI/Crawl4AI(NL→scraper) + 可靠性铁律(schema 校验 + 失败重试)。
-const _CRAWL_RECIPES = [
-  // ---- 通用模式（最值钱：抓包 / API 反推）----
-  { id: "api-reverse", kw: ["接口", "api", "xhr", "json", "数据从哪", "抓包", "ajax", "fetch", "动态加载", "异步"], site: "",
-    text: "【XHR/API 反推（首选，最稳）】别上来解析 HTML——先用 browser 打开页面、用 network 看数据来自哪个 XHR/fetch 接口（多半返回 JSON），直接打那个接口：复制 URL + 必要 query 参数 + header（UA/Referer/Cookie/token）。接口数据干净、翻页就是改 page/offset/cursor，比解析 DOM 稳十倍快十倍。找不到接口再退回 DOM 解析。" },
-  { id: "list-paging", kw: ["列表", "翻页", "分页", "全部", "所有", "批量", "多页", "下一页"], site: "",
-    text: "【列表+翻页】先定位翻页参数（page=N / offset / cursor / since_id），循环请求到无新数据或到上限；每页解析条目；唯一键去重；每次请求随机 sleep 限速；增量保存（边抓边写 json/csv，别全堆内存）。优先按 api-reverse 找翻页接口。" },
-  { id: "infinite-scroll", kw: ["无限滚动", "下拉", "滚动加载", "瀑布流", "scroll"], site: "",
-    text: "【无限滚动】两条路：①（首选）滚动其实触发了 XHR——按 api-reverse 找那个接口直接打，最稳；②用 browser scroll 反复下拉触发加载再从 DOM 取（慢且脆）。能走接口就走接口。" },
-  { id: "login-gated", kw: ["登录", "登陆", "账号", "cookie", "session", "会员", "需要登录"], site: "",
-    text: "【登录态抓取】先用 browser 真实登录（人工输账号/扫码，验证码人工过），登录后复用同一会话 cookie；或抓登录后接口带的 token/sign 一起发。绝不把账号密码写死进代码。" },
-  { id: "anti-bot", kw: ["反爬", "封ip", "403", "被封", "验证码", "风控", "cloudflare", "限制", "拦截"], site: "",
-    text: "【反爬应对】①用真浏览器(headless_chrome)而非纯 requests，带真实 UA/Referer/Accept；②限速：随机延迟+控并发+失败指数退避；③有代理就轮换 IP；④遇验证码/人机校验人工介入，绝不做自动绕过；⑤尊重 robots.txt 与站点 ToS、别高频打。" },
-  { id: "validate-retry", kw: ["保存", "导出", "csv", "excel", "结构化", "清洗", "校验", "入库"], site: "",
-    text: "【校验+重试+落地（可靠性底线，LLM 会幻觉）】先定义期望字段 schema，每条按 schema 校验（缺字段/类型不对就标记）；单条失败重试 2-3 次再跳过并记日志；增量写 json/csv（带表头、UTF-8）；最后如实报「成功 N 条 / 失败 M 条」，别假装全成功。" },
-  // ---- 热门站（浓缩真知识：优先走接口）----
-  { id: "jd", kw: ["京东", "jd", "商品评论"], site: "jd",
-    text: "【京东】商品/评论走接口别解析页面：评论在 club.jd.com 的 productPageComments 类接口（带 productId、page、score、sortType），价格走 p.3.cn 价格接口。先按 api-reverse 在商品页 network 确认当前真实接口名+参数（接口会变），带 Referer=商品页。" },
-  { id: "taobao", kw: ["淘宝", "天猫", "taobao", "tmall"], site: "taobao",
-    text: "【淘宝/天猫】强反爬：必须登录态 + 走 H5/mtop 接口（带 sign 签名，由参数+token 算）。最稳：在登录的 browser 里 eval 直接调它自己的接口拿数据（让页面自己带签名），别在外部硬复刻 sign。低频、人工过验证码。" },
-  { id: "weibo", kw: ["微博", "weibo"], site: "weibo",
-    text: "【微博】抓移动端 m.weibo.cn 接口（比 PC 好抓）：containerid 定位用户/话题，since_id 翻页；带登录 cookie 能抓更多。按 api-reverse 在 m.weibo.cn 确认接口。" },
-  { id: "bilibili", kw: ["b站", "bilibili", "哔哩哔哩", "弹幕", "up主"], site: "bilibili",
-    text: "【B站】完整公开 API：api.bilibili.com 下视频信息/评论/弹幕都有接口（视频 bvid/aid，评论 oid+type 翻 pn，弹幕 cid）。多数无需登录，限速即可。" },
-  { id: "xhs", kw: ["小红书", "xhs", "笔记"], site: "xiaohongshu",
-    text: "【小红书】强反爬 + 接口签名(x-s/x-t)：需登录态；最稳是在登录的 browser 里 eval 调它自己的 web 接口（让页面自己带签名），别外部硬复刻。低频、人工过验证码。" },
-  { id: "zhihu", kw: ["知乎", "zhihu", "回答", "专栏"], site: "zhihu",
-    text: "【知乎】走 v4 API：zhihu.com/api/v4/...（问题回答、专栏文章都有接口，limit/offset 翻页）；带登录 cookie 更稳；限速。" },
-  { id: "ecommerce", kw: ["电商", "商品", "价格", "库存", "sku", "amazon", "亚马逊", "shopee"], site: "",
-    text: "【通用电商】①先 api-reverse 找商品/列表接口；②没接口就解析商品页(标题/价格/库存/sku)+翻页；③价格/库存常动态加载→看 XHR；④Amazon 等反爬强→真浏览器+限速+(代理)。" },
-  { id: "news", kw: ["新闻", "资讯", "博客", "文章", "正文", "公众号", "媒体"], site: "",
-    text: "【通用新闻/博客/正文】列表页取所有文章链接(去重)→逐篇取正文：正文优先用 readability 思路(取主内容块、去导航/广告)或 browser 取渲染后文本→转 markdown 存档(适合喂 LLM/RAG)。" },
-];
-function _isCrawlTask(text) {
-  const t = String(text || "");
-  // explicit crawl terms (high precision)
-  if (/爬虫|爬取|网络爬|数据采集|采集|spider|scrap(e|ing)|crawl|批量(下载|抓取|采集|获取)/i.test(t)) return true;
-  // verb + (web/data object) within a short window — catches 爬京东评论 / 抓淘宝价格 / 扒数据
-  if (/[爬抓扒][^。！？\n]{0,8}(数据|评论|价格|库存|信息|内容|网站|网页|页面|商品|帖子|文章|图片|链接|列表|接口|资料)/.test(t)) return true;
-  // verb + a known site / url — catches 爬京东、抓 https://...
-  if (/[爬抓][^。！？\n]{0,6}(京东|淘宝|天猫|微博|b站|bilibili|哔哩|小红书|知乎|amazon|亚马逊|某网站|某站|http|www)/i.test(t)) return true;
-  // monitoring a site's data
-  if (/监控[^。！？\n]{0,10}(价格|库存|更新|上新|变化|动态)/.test(t)) return true;
-  // verb-trailing idiom — 数据扒下来 / 评论抓下来 / 全都爬下来
-  if (/[爬抓扒](下来|出来|取下来|到本地|回来|过来)/.test(t)) return true;
-  return false;
-}
-// Retrieve the recipes matching the user's description (the "hot-word mapping"), always
-// pinning the two universal pillars (api-reverse + validate-retry) for any crawl task.
-function _retrieveCrawlRecipes(text, K = 4) {
-  const t = String(text || "").toLowerCase();
-  if (!_isCrawlTask(t)) return [];
-  const scored = _CRAWL_RECIPES.map((r) => {
-    let s = 0;
-    for (const k of r.kw) if (t.includes(k.toLowerCase())) s += 2;
-    if (r.site && t.includes(r.site)) s += 4;
-    return [s, r];
-  }).filter((x) => x[0] > 0).sort((a, b) => b[0] - a[0]);
-  const picked = scored.slice(0, K).map((x) => x[1]);
-  for (const id of ["api-reverse", "validate-retry"]) {
-    if (!picked.find((r) => r.id === id)) { const r = _CRAWL_RECIPES.find((x) => x.id === id); if (r) picked.push(r); }
-  }
-  return picked.slice(0, 6);
-}
-function _crawlRecipeBlock(query) {
-  let rs;
-  try { rs = _retrieveCrawlRecipes(query); } catch { return ""; }
-  if (!rs || !rs.length) return "";
-  return `\n--- 抓取/爬虫打法（按你的描述匹配到的实测配方；照着改、抓包优先、跑完按 schema 校验，别瞎猜接口）---\n${rs.map((r) => "- " + r.text).join("\n").slice(0, 4200)}`;
-}
 
 // Memory panel: view / edit / clear the agent's project memory for the current
 // workspace. Opened via the "Manage Project Memory" command (⌘⇧P).
@@ -12873,50 +12671,83 @@ function _trimMessagesIfHuge(messages) {
 }
 
 /**
- * Conversation-level compaction (between turns): when the text-only chat
- * `history` gets long, summarize the older turns into one compact note and keep
- * only the most recent few verbatim. `history` holds plain user/assistant text
- * (no tool_call structure), so replacing a prefix is structurally safe. Guarded:
- * any failure falls back to a short marker rather than touching the structure.
+ * LLM-powered auto-compact: when the recent conversation exceeds a token budget,
+ * summarize the older turns via an LLM call and store the summary in
+ * ConversationMemory.summaries — keeping the latest turns verbatim.
+ *
+ * Previous version was broken: it spliced the throwaway array from assemble()
+ * instead of the actual memory.recent, so compaction never persisted.
  */
 async function _compactHistoryIfHuge(config, session) {
-  // Operate on the OWNING session's history, captured by the caller — this awaits
-  // a summary call, and if the user switches tabs mid-await the global `history`
-  // proxy would point at a different session and we'd splice the wrong one.
   const sess = session || _currentSession();
-  const hist = sess?.memory ? sess.memory.assemble() : (sess?.history || []);
-  if (!Array.isArray(hist) || hist.length < 8) return;
-  let total = 0;
-  for (const m of hist) total += m.content ? String(m.content).length : 0;
-  if (total < 60000) return;
-  const KEEP = 4;
-  if (hist.length <= KEEP + 2) return;
-  const older = hist.slice(0, hist.length - KEEP);
-  const transcript = older.map((m) => `[${m.role}] ${String(m.content || "").slice(0, 4000)}`).join("\n\n").slice(0, 50000);
+  const mem = sess?.memory;
+  if (!mem) return;
+  const recentTokens = mem.estimateRecentTokens();
+  if (recentTokens < 32000 || mem.recent.length < 10) return;
+  const KEEP = 10;
+  if (mem.recent.length <= KEEP + 2) return;
+  const olderCount = mem.recent.length - KEEP;
+  const older = mem.recent.slice(0, olderCount);
+  const transcript = older.map((m) => `[${m.role}] ${String(m.content || "").slice(0, 4000)}`).join("\n\n").slice(0, 60000);
+  const COMPACT_PROMPT = _P("compact", `你是对话压缩引擎。把下面这段编程对话压缩成一份简洁但信息完整的摘要。
+**必须保留（一条都不能漏）：**
+• 用户的原始需求和目标
+• 已做出的关键技术决定及理由
+• 已修改的文件路径和改动要点
+• 遇到的错误/坑及其解决方案
+• 当前进度（哪些完成了、哪些还没做）
+• 正在进行的任务的当前状态
+• 重要的代码结构/架构信息
+**格式：** 中文、分条、每条一行。文件路径保留完整。代码只保留关键签名/行号。尽量短但不丢信息。`);
   let summary = "";
   try {
     summary = await backend.aiComplete(config, [
-      { role: "system", content: _P("compact", "把下面这段编程助手对话压缩成简洁要点，**核心信息一条都不能丢**：用户需求 / 已完成的关键改动与决定(含文件路径) / 已确认事实与技术栈 / 踩过的坑及解法 / 当前进度与未完成项。用中文、分条、尽量短。") },
+      { role: "system", content: COMPACT_PROMPT },
       { role: "user", content: transcript },
-    ], 1024);
+    ], 1500);
   } catch { summary = ""; }
-  const note = summary && summary.trim()
-    ? "【早先对话的压缩摘要】\n" + summary.trim()
-    : "【早先对话较长，已省略以节省上下文】";
-  hist.splice(0, older.length, { role: "assistant", content: note });
+  const note = summary?.trim() || "（早先对话已省略以节省上下文）";
+  mem.compactRecent(olderCount, note);
   try { saveChatHistory(); } catch {}
+  try { showToast("对话较长，已自动压缩上下文"); } catch {}
+  console.log(`[auto-compact] ${olderCount} msgs → summary (${note.length}c), kept ${mem.recent.length} recent, ~${mem.estimateRecentTokens()} tok`);
 }
 
 /** Serialize a tool's result into the `tool` message content the model reads next turn. */
+function _stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)/g, "");
+}
 function _toolResultToString(call, result) {
   if (!result) return call.type === "write" || call.type === "edit" ? `（${call.path}：未应用）` : "(无结果)";
   const c = result.content != null ? String(result.content) : "";
+  if (c && /\[(ERROR|BLOCKED|DENIED|失败|不可用|error)\]/i.test(c)) return c;
   switch (result.type || call.type) {
     case "read": return `文件 ${result.path}:\n${c}`;
     case "list": return `目录 ${result.path}:\n${c}`;
-    case "cmd": return `命令输出:\n${c || "(无输出)"}`;
-    default: return c || `已完成 ${call.type}`;
+    case "cmd": return `命令输出:\n${_stripAnsi(c) || "(无输出)"}`;
+    case "http": return `HTTP 响应:\n${_stripAnsi(c).replace(/\r\n/g, "\n") || "(空)"}`;
+    default: return _stripAnsi(c) || `已完成 ${call.type}`;
   }
+}
+
+// Cap a tool result for the MODEL's context window. read_file / list_dir already SIZE their own
+// output (read paginates huge files and caps its body at ~55K) — their entire purpose is to DELIVER
+// that content, so hand it over in full. Chopping a read to 8K was the root cause of the "重复读 +
+// 卡死" loop: the model received only HALF a 17.8KB file while the read recorded it as fully shown
+// (`_seen=total`), so the model re-read to get the rest and hit "别重读 · 全在上方" — except it was
+// NEVER given the rest. It wasn't dumb, it was starved. cmd/http/mcp output can be arbitrarily huge
+// and noisy, so those keep the tight 8K guard.
+function _toolMsgForModel(call, result) {
+  const _rt = (result && result.type) || (call && call.type);
+  const _cap =
+    _rt === "read" || _rt === "list" ? 60000
+    // Retrieval tools size their own output to what the model asked for; chopping to 8K silently drops
+    // the tail (matches / symbols / diagnostics) so the model re-runs the query or edits on an
+    // incomplete set — the same starvation trap as reads, on the highest-volume tools.
+    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "diag" ? 30000
+    // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
+    : 8000;
+  return _toolResultToString(call, result).slice(0, _cap);
 }
 
 /** Glob (`*`, `**`, `?`) or plain substring → RegExp matched against a relative path. */
@@ -13422,6 +13253,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   // `session` owns this turn — interrupt checks read session.streaming, and the
   // auto-scroll only fires when this run's tab is the one on screen.
   const _live = () => !session || session.streaming;
+  // Per-turn cancel: each call gets its own requestId so parallel sub-agents register
+  // SEPARATE cancel flags in Rust (register_cancel does m.insert → replaces the old
+  // entry; shared IDs meant only the LAST sub-agent was cancellable). All active IDs
+  // live on session._cancelIds; _setStreaming(false) cancels every one of them.
+  const _turnReqId = "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+  const _turnConfig = { ...config, requestId: _turnReqId };
+  if (session) { session._cancelIds = session._cancelIds || new Set(); session._cancelIds.add(_turnReqId); }
   let acc = "";
   let err = null;
   let _turnUsage = null; // last usage report this turn (avoid double-count if sent per-chunk)
@@ -13456,40 +13294,51 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
     flushTimer = setTimeout(() => requestAnimationFrame(doRender), wait);
   };
 
-  // Reasoning ("thinking") stream — ai.rs emits AiEvent::Reasoning for models that
-  // expose reasoning_content / <think> (DeepSeek-R1, GLM-Z1, QwQ, Qwen3-think…). The
-  // agent loop used to DROP it; now we show it in a collapsible card so you see the
-  // model's actual reasoning ("show your work"), not just the final answer.
+  // Reasoning ("thinking") stream — show model reasoning in a SINGLE collapsible card.
+  // Instead of creating a new card per turn (which piles up "已思考" chips), REUSE an
+  // existing settled think-card in the body: re-open it, append a divider + new text,
+  // then re-collapse on settle. The user sees ONE "已思考" card they can expand to read
+  // ALL reasoning across turns — no pile.
   let reasoningAcc = "";
   let reasoningEl = null;
   let reasoningTimer = 0;
+  let _reasoningPrior = ""; // accumulated text from prior turns (before the divider)
   const renderReasoning = () => {
     reasoningTimer = 0;
     if (!_live() || !reasoningAcc.trim()) return;
     _removeAllThinking(body);
     if (!reasoningEl) {
-      reasoningEl = document.createElement("div");
-      reasoningEl.className = "think-card streaming"; // unified with the plain-chat reasoning card
-      reasoningEl.dataset.open = "1";
-      reasoningEl._t0 = Date.now();
-      reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
-      // expand/collapse handled by the delegated listener on chatEl (survives snapshot restore)
-      body.appendChild(reasoningEl);
+      const existing = body.querySelector(".think-card:not(.streaming)");
+      if (existing) {
+        reasoningEl = existing;
+        const b = existing.querySelector(".think-body");
+        _reasoningPrior = ((b && b.dataset.rawText) || "").trim();
+        existing.classList.add("streaming");
+        existing.dataset.open = "1";
+        existing._t0 = existing._t0 || Date.now();
+        const tt = existing.querySelector(".think-title");
+        if (tt) tt.textContent = "思考中…";
+      } else {
+        reasoningEl = document.createElement("div");
+        reasoningEl.className = "think-card streaming";
+        reasoningEl.dataset.open = "1";
+        reasoningEl._t0 = Date.now();
+        reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
+        body.appendChild(reasoningEl);
+        _reasoningPrior = "";
+      }
     }
     const b = reasoningEl.querySelector(".think-body");
     if (b) {
-      const _stick = b.scrollHeight - b.scrollTop - b.clientHeight < 48; // was the user at the bottom?
-      b.dataset.rawText = reasoningAcc; // saved for the final non-streaming pass on settle
-      // Render reasoning as MARKDOWN so it reads naturally; streaming:true so a half-typed fence
-      // can't blow up the parser.
-      try { renderMarkdownInto(b, reasoningAcc, { streaming: true, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
-      catch { b.textContent = reasoningAcc; }
-      if (_stick) b.scrollTop = b.scrollHeight; // auto-follow the newest reasoning (unless the user scrolled up to read)
+      const _stick = b.scrollHeight - b.scrollTop - b.clientHeight < 48;
+      const full = _reasoningPrior ? _reasoningPrior + "\n\n———\n\n" + reasoningAcc : reasoningAcc;
+      b.dataset.rawText = full;
+      try { renderMarkdownInto(b, full, { streaming: true, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+      catch { b.textContent = full; }
+      if (_stick) b.scrollTop = b.scrollHeight;
     }
     if (!session || session === _currentSession()) _chatFollow();
   };
-  // Close the reasoning card cleanly: one final non-streaming markdown render (so any
-  // open fence/list is finished), then collapse it (内容自动折叠).
   const settleReasoning = () => {
     if (!reasoningEl) return;
     const b = reasoningEl.querySelector(".think-body");
@@ -13498,6 +13347,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
     reasoningEl.classList.remove("streaming");
     const tt = reasoningEl.querySelector(".think-title"); if (tt) tt.textContent = "已思考";
     _thinkSetDuration(reasoningEl);
+    reasoningEl = null;
+    reasoningAcc = "";
   };
   const scheduleReasoning = () => { if (!reasoningTimer) reasoningTimer = setTimeout(renderReasoning, 90); };
 
@@ -13530,19 +13381,19 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
       // L0（防逆向，默认关）：把模式名 + 静态工具名交给网关，请求里剥掉系统提示词和静态
       // schema；MCP/运行时工具（不在网关目录）仍随 body 走，绝不丢。开关关→零行为变化。
       let _l0Msgs = messages, _l0Tools = toolSchemas;
-      delete config.ideMode; delete config.ideTools; // 每轮清干净，杜绝残留头部
+      delete _turnConfig.ideMode; delete _turnConfig.ideTools;
       if (ideMode && _l0On()) {
         const _stat = _staticToolNames(), _names = [], _keep = [];
         for (const _t of toolSchemas) {
           const _n = _t && _t.function && _t.function.name;
           if (_n && _stat.has(_n)) _names.push(_n); else if (_t) _keep.push(_t);
         }
-        config.ideMode = ideMode;
-        config.ideTools = _names.join(",");
-        _l0Tools = _keep; // 网关会把静态 schema **合并**进这个列表
+        _turnConfig.ideMode = ideMode;
+        _turnConfig.ideTools = _names.join(",");
+        _l0Tools = _keep;
         _l0Msgs = (messages[0] && messages[0].role === "system") ? messages.slice(1) : messages;
       }
-      await backend.aiChatWithTools(config, _l0Msgs, _l0Tools, (ev) => {
+      await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
         _lastEvAt = Date.now(); // 任何事件都复位心跳计时
         if (_stallEl) { _stallEl.remove(); _stallEl = null; } // 又有反应了→撤掉兜底停顿行
         // User hit Stop: drop every further streamed event so output halts at once
@@ -13654,7 +13505,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   // Claude doesn't brain-freeze-repeat — skip the dedup for it so a false positive can
   // never touch its output. Only the weaker families (which DO repeat) get deduped.
   const _cf0 = _cleanAgentText(acc);
-  const cleanFinal = _modelFamilyOf(config && config.model) === "claude" ? _cf0 : _dedupeRepeatedText(_cf0);
+  const cleanFinal = _modelFamilyOf(_turnConfig && _turnConfig.model) === "claude" ? _cf0 : _dedupeRepeatedText(_cf0);
   if (streamEl) {
     if (cleanFinal.trim()) renderMarkdownInto(streamEl, cleanFinal, { streaming: false });
     else streamEl.remove();
@@ -13669,6 +13520,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   body.querySelectorAll(".md-caret").forEach((c) => c.remove());
 
   for (const [, e] of byIndex) _removeWritePreview(e); // hand off live previews to the real cards
+  if (session && session._cancelIds) session._cancelIds.delete(_turnReqId);
   return { text: acc, toolCalls, error: err };
 }
 
@@ -13860,7 +13712,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
         else { try { result = await _executeToolStep(step, call, root, execRun); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
-        messages.push({ role: "tool", tool_call_id: tc.id, content: _toolResultToString(call, result).slice(0, 8000) });
+        messages.push({ role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) });
         // Context OUT: fold this child's reads/edits into the shared run-context so siblings +
         // the main agent see them (siblings/parent skip re-reading; mutations surface in the
         // main scratchpad automatically since it renders run.ctx).
@@ -14089,6 +13941,7 @@ const _TOOL_CATALOG = [
   { name: "decode_qr", desc: "识别图片/截图里的二维码内容", kw: ["二维码", "qr", "qrcode", "扫码", "scan"] },
   { name: "download_file", desc: "下载文件到工作区", kw: ["下载", "download", "拉取"] },
   { name: "capture_start", desc: "启动系统级抓包（真·小黄鸟 / mitmproxy MITM 代理，抓任意 App/浏览器的 HTTP/HTTPS）", kw: ["抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
+  { name: "automation", desc: "桌面自动化框架：真实鼠标键盘 / CDP 浏览器 / 桌面 UI 元素 + 录制回放（把一串操作存成工作流一键重放）", kw: ["自动化", "录制", "回放", "重放", "工作流", "rpa", "automation", "recorder", "replay", "鼠标", "键盘", "桌面自动化", "宏", "macro", "自动点击", "自动填表", "模拟操作"] },
   { name: "capture_flows", desc: "读已抓到的请求（方法/URL/头/请求体/响应体，反接口/找数据来源首选）", kw: ["抓包", "抓到的请求", "看请求", "反接口", "接口从哪来", "flows", "已抓", "数据从哪"] },
   { name: "capture_stop", desc: "停止抓包并关闭系统代理", kw: ["停止抓包", "关抓包", "结束抓包"] },
   { name: "capture_replay", desc: "精确重放一条抓到的请求(原样带真实头/cookie/token/签名，可改参)——逆向/重发利器", kw: ["重发", "重放", "replay", "逆向", "改参", "重放请求", "重发请求", "调接口", "试探接口"] },
@@ -14190,10 +14043,9 @@ async function _semanticToolRank(text, config) {
 // value (complex/tricky task, MCP tools present, or weak lexical signal); the cheap
 // lexical hit otherwise — so simple tasks pay nothing.
 async function _buildToolHint(text, config) {
-  if (typeof _looksTrivialTask === "function" && _looksTrivialTask(text)) return "";
   const lexical = _relevantTools(text, 6);
   const mcpCount = (_mcpToolCache || []).length;
-  const warrants = (typeof _looksComplexTask === "function" && _looksComplexTask(text)) || mcpCount > 0 || lexical.length < 3;
+  const warrants = mcpCount > 0 || lexical.length < 3;
   let rel = lexical;
   if (warrants) { try { rel = await _semanticToolRank(text, config); } catch { rel = lexical; } }
   if (!rel || rel.length < 2) return "";
@@ -14587,6 +14439,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
   let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
+  let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   const _readFiles = new Set();  // files explicitly read in this run (for read-before-edit check)
   let blindEditNudges = 0;       // nudge count when editing un-read files
   let _readOnlyOps = 0;          // cumulative read/search/find/list/lsp/semsearch ops this run
@@ -14606,11 +14459,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Procedural memory (self-improvement): if this run hit failures / got stuck and
   // then recovered, prompt it once at the end to record the "pitfall → fix" lesson
   // via `remember` (auto-loaded next time → it stops re-hitting the same trap).
-  let runHadTrouble = false, memoryNudges = 0, interleaveVerifies = 0, goalNudges = 0, quietTurns = 0;
+  let runHadTrouble = false, interleaveVerifies = 0, quietTurns = 0;
   // Multi-agent review gate (Planner/Worker/Judge): before a SUBSTANTIAL change is
   // declared done, a fresh INDEPENDENT reviewer sub-agent audits the diff (no echo
   // chamber); only confirmed real issues are fed back to fix. Runs once.
-  let reviewGates = 0, _reviewedAtImplOps = -1; // evaluator-optimizer: re-review only after NEW edits, so it converges instead of churning on an unchanged diff
+  // reviewer/goal/memory gates removed (2026-07-05)
   const _mutatedFiles = new Set();
   const _editCounts = new Map();   // path → how many times edited this run (churn detector)
   const _churnNudged = new Set();  // files we've already churn-warned (once each)
@@ -14620,14 +14473,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // budget (don't waste tokens on trivia); a "重构 / refactor / 实现整套 / build a
   // full X" gets a larger one (less mid-run scrambling for extensions).
   let budget = _initialBudget(task, _projectStack), extensions = 0;
-  // Intent ROUTING — the MODEL classifies this request, not brittle keyword regex. Fire it
-  // async: it overlaps the first model turn (~0 added latency) and resolves well before the
-  // stop/extend decisions. `_looksQuickAsk` is only the instant seed / fallback until then;
-  // run._intent (kind: answer|edit|project) is the real signal. Effort matches the ask —
-  // an "answer" answers-and-stops (Gate-D + extension exempt, no ballooning), a "project"
-  // grows the budget to the model's own scale.
+  // Intent ROUTING — the MODEL classifies this request (async, overlaps first turn).
+  // run._intent (kind: answer|edit|project) is the real signal; the inline _quick()
+  // fallback is only used until _classifyIntent resolves.
   run._intent = null;
-  const _quick = () => (run._intent ? run._intent.kind === "answer" : _looksQuickAsk(task));
+  const _quick = () => (run._intent ? run._intent.kind === "answer" : task.trim().length < 80);
   _classifyIntent(task, config).then((r) => {
     if (!r || !_live()) return;
     run._intent = r;
@@ -14664,6 +14514,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run._planPendingCancel && run._planPendingCancel.length) {
         const list = run._planPendingCancel.splice(0).map((c) => "・" + c).join("\n");
         messages.push({ role: "user", content: `用户在任务计划里**手动取消了这些步骤，别再做、也别把它们加回计划**：\n${list}\n继续完成计划里剩下的步骤即可。` });
+      }
+      if (run._planPendingRestore && run._planPendingRestore.length) {
+        const list = run._planPendingRestore.splice(0).map((c) => "・" + c).join("\n");
+        messages.push({ role: "user", content: `用户恢复了之前取消的这些步骤，请继续执行它们：\n${list}` });
       }
       // Real-time steering ("引导/Guide"): the user injected new instructions mid-run via
       // the composer while this task was running — splice them in NOW so the model adapts
@@ -14708,7 +14562,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // (it's re-confirming "done" without acting), stop firing more finish-gates — extra ones
         // only burn turns and stack up "I'm done" thinking cards. 4 consecutive quiet turns on a
         // verified build = genuinely done. Only short-circuits when there's nothing left to verify.
-        if (quietTurns >= 4 && (didVerify || !didMutate)) {
+        // Require REAL verification to short-circuit — not the loose `didVerify` that interleaved Monaco
+        // squiggles / auto-check also set. `_verifiedAtImplOps >= _implOps` means the finish-gate build
+        // actually ran at/after the current edit count; `_verifyExhausted` covers a project that
+        // genuinely can't be verified (budget spent) so it can still finish honestly.
+        if (quietTurns >= 4 && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted)) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           break;
         }
@@ -14717,10 +14575,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // should be reading files / searching / planning, not writing prose. Force it.
         if (!_quick() && iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
           toolFirstNudges++;
-          const _isUITask = _looksUIBuildTask(run._originalText || "");
-          const _nudgeMsg = _isUITask
-            ? "停！**这是 UI 设计任务，不是让你写文字讨论的**。立刻执行：\n① 调 list_dir(\".\") + read_file(README/package.json) 了解项目\n② 调 web_search 搜该品类设计趋势\n③ 调 browser 打开 + web_fetch **抓取** 2-3 个真实竞品官网的内容/版式\n④ 基于研究简报**你自己** generate_image ×3（3 个不同风格方向，存 .wardrobe/sN.png）→ **你自己** design_board 展示让用户选方向（⚠️ **研究≠做完，衣橱必做；用户在 design_board 选定前禁止写官网代码**）\n⑤ 用户选完方向 → 用 **Vue/React 组件** 实现（真图/SVG/动画/排版，实物级）\n**第一步调 list_dir 或 read_file，现在就调。**"
-            : "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。";
+          const _nudgeMsg = "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。";
           messages.push({ role: "user", content: _nudgeMsg });
           continue;
         }
@@ -14767,65 +14622,38 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _noProgressVerify = _progress ? 0 : _noProgressVerify + 1;
               if (_noProgressVerify >= 2 || verifyRuns >= _AGENT_MAX_VERIFY) {
                 // Genuinely stuck — stop the auto-loop, but DEMAND honesty (no faking "done").
-                didVerify = true; _verifiedAtImplOps = _implOps;
+                didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
                 messages.push({ role: "user", content: `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\`` });
+                continue;
               } else {
                 messages.push({ role: "user", content: `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\`` });
+                continue;
               }
             } else {
               // Green. Record the op count so a LATER edit re-triggers verification.
               didVerify = true; _verifiedAtImplOps = _implOps; _prevVerifyErrs = null; _noProgressVerify = 0;
-              messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。` });
+              const _planDone = !Array.isArray(planSteps) || !planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
+              if (_planDone) {
+                // Build passed AND plan is complete → fall through to break.
+              } else {
+                messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。` });
+                continue;
+              }
             }
-            continue;
-          }
-          // No detectable check command → nudge once (don't re-nudge every round).
-          didVerify = true; _verifiedAtImplOps = _implOps;
-          messages.push({ role: "user", content: "你改了文件但还没验证。**光读代码不算验证——去实际跑一下**：\n· 能编译 / 测试的：run_cmd 跑构建 / 测试 / 类型检查（npm run build、cargo check、pytest、tsc --noEmit）或 get_diagnostics 看报错。\n· **能跑起来的东西（网站 / 服务 / 脚本 / CLI / 爬虫）：真正把它起起来跑一遍**——后台起服务后用 http_request / curl 访问关键路径，确认返回 200 且内容对；脚本 / CLI 就执行它看输出对不对；盯着有没有运行时报错。**编译过 ≠ 跑得起来**，亲眼看它跑通了才算数。\n确认真能跑通再收尾；若这项目确实没法自动验证，简短说明原因即可。" });
-          continue;
-        }
-        // C — independent reviewer gate = EVALUATOR-OPTIMIZER convergence loop: for a
-        // SUBSTANTIAL change (≥2 files), a FRESH reviewer sub-agent audits the diff before
-        // finishing; ISSUES → fix → the loop returns here and RE-reviews the NEW diff, until
-        // the reviewer says PASS or _AGENT_MAX_REVIEWS rounds. Re-reviews ONLY after new edits
-        // (_implOps grew) → converges, never churns on an unchanged diff. A separate agent =
-        // real external feedback, not the model self-grading. "The lead only sees green code."
-        // Only for a genuinely SUBSTANTIAL change (≥3 real CODE files) — a small script + its config/data,
-        // or a few-line edit, does NOT need a full independent review pass (that was just noise on小事情).
-        const _codeMut = [..._mutatedFiles].filter((f) => !/\.(json|txt|csv|md|markdown|lock|ya?ml|toml|ini|env|cfg|conf|log|data)$/i.test(f)).length;
-        if (didMutate && _codeMut >= 3 && reviewGates < _AGENT_MAX_REVIEWS && _implOps > _reviewedAtImplOps && _live() && run.mode === "agent") {
-          reviewGates++;
-          _reviewedAtImplOps = _implOps; // mark this diff reviewed; re-fire only after further edits
-          let _diff = "";
-          try { _diff = await backend.invoke("git_diff", { root, rel: null, staged: false }); } catch {}
-          _diff = String(_diff || "").trim().slice(0, 9000);
-          const _files = [..._mutatedFiles].join("\n");
-          const _revPrompt = "你是**独立代码审查员**（高精度：只报已证实为真、能构造出具体触发路径的确凿 bug；压制风格 / 命名 / 假设性 / 可有可无的「垃圾bug」）。审查**本次改动**有没有引入真问题：\n- 业务逻辑（最容易漏、重点看）：代码是否真做到了它**该做的事**——条件 / 计算 / 状态流转 / 边界业务规则是否符合意图与需求，有没有漏一个 case、跟注释 / 测试 / 需求不一致。\n- 正确性：空值 / 越界 / 错误处理缺失 / 并发竞态 / 资源泄漏 / off-by-one / 契约不符。\n- 安全：注入(SQL/命令/XSS) / 越权 / SSRF / 路径穿越 / 硬编码密钥 / 不安全反序列化（用污点 source→sink 追踪）。\n用 read_file / search 把改动文件及其**定义与调用方**读全再下结论，每条问题给 位置 + 触发场景 + 修复。\n\n本次改动文件：\n" + _files + "\n\n" + (_diff ? "git diff（截断）:\n" + _diff : "（拿不到 diff，请直接 read_file 读上面文件审查改动）") + "\n\n**最后一行只输出一行**：\nVERDICT: PASS  （没有确凿问题）\n或\nVERDICT: ISSUES  （有确凿问题，已在上面逐条列出）";
-          let _rep = "";
-          try { _rep = await _runSubAgent({ config, description: "独立审查改动", prompt: _revPrompt, root, container: body, run }); } catch { _rep = ""; }
-          if (/VERDICT:\s*ISSUES/i.test(_rep || "")) {
-            const _body = String(_rep).replace(/VERDICT:\s*ISSUES[\s\S]*$/i, "").replace(/VERDICT:\s*PASS[\s\S]*$/i, "").trim();
-            messages.push({ role: "user", content: "**独立审查发现本次改动有确凿问题**（见下）。请逐条核实并修复，改完再验证一次（run_cmd / get_diagnostics）——**改完我会让审查员复审一遍**，别带着已知 bug 收尾：\n\n" + (_body || _rep) });
-            continue;
-          }
-          // PASS / 无法解析 / 子智能体失败 → 不阻塞，继续收尾。
-        }
-        // D — goal-completeness gate: the model went quiet and is about to finish. For a
-        // non-trivial task that actually changed files, make it check its output against EVERY
-        // part of the original request before breaking — catches silent drift ("did A, forgot B",
-        // the #1 "用户要的根本没做完" failure). Fires ONCE, only for substantial work (skips
-        // 小事情 / quick edits per user feedback), and never while a steer is pending. Cheap:
-        // one self-check turn, no sub-agent (the review sub-agent was the noise the user hated).
-        {
-          const _origReq = String(run._originalText || "").trim();
-          const _substantial = _mutatedFiles.size >= 2 || _origReq.length >= 50;
-          const _steerPending = Array.isArray(session._steerQueue) && session._steerQueue.length;
-          if (didMutate && !_quick() && _substantial && goalNudges < 1 && !_steerPending && _live() && run.mode === "agent") {
-            goalNudges++;
-            messages.push({ role: "user", content: "收尾前，把你的产出**逐条对照用户最初那条需求**核对一遍：\n「" + _origReq.slice(0, 800) + "」\n把它拆成一个个具体要求，逐个问：这条做到了吗？有没有哪块**没做 / 只做了一半 / 做偏了 / 只搭了架子没填真内容**？\n· 全都做到、且验证过能用 → 一句话确认，收尾。\n· 有遗漏或跑偏 → **现在就补完 / 纠正再收尾**，绝不把没做完的当做完的交出去。（这是自检，别为此多绕流程；确实全做完了就直接收尾。）" });
-            continue;
+          } else {
+            // No AUTO-detectable check command → the agent ITSELF must run it. Do NOT fake-mark
+            // verified — that was the "写完跑不起来" leak: the finish gate opened on code nobody ran.
+            verifyNudges++;
+            if (verifyNudges >= 2) {
+              didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
+            } else {
+              messages.push({ role: "user", content: "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。" });
+              continue;
+            }
           }
         }
+        // C — reviewer: removed (2026-07-05). Opt-in via /code-review.
+        // D — goal-completeness: removed (2026-07-05). Base prompt handles this.
         // B — honesty gate: a tool just FAILED / was unavailable, and now you're
         // wrapping up. Don't paper over it. Either actually fix it, or state plainly
         // in your summary that THIS step did not succeed, why, and what you'll do.
@@ -14834,13 +14662,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           messages.push({ role: "user", content: `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。` });
           continue;
         }
-        // B — procedural memory: this run hit a pitfall and got past it. Consolidate
-        // the lesson so the project gets easier over time (it auto-loads next run).
-        if (runHadTrouble && memoryNudges < 1) {
-          memoryNudges++;
-          messages.push({ role: "user", content: "这次过程中遇到过卡点 / 失败、最后绕过去了。收尾前用 remember 记**一条简短、可复用**的「坑 → 根因 → 解法」经验——比如某命令在这个项目要怎么跑、某依赖 / 环境的怪癖、某个约定。下次自动加载，遇到同类情况就不再栽。**只记长期有用的，一次性细节别记**；若这次的坑确实只是偶发、没有可复用的教训，跳过即可、别硬记。" });
-          continue;
-        }
+        // B — procedural memory: removed (2026-07-05). Model remembers on its own.
         // A steer ("引导" / a 2nd message) arrived during THIS turn — it's sitting in the
         // queue but the loop was about to end and would never drain it. Loop once more so the
         // top-of-loop drain splices it in and the model actually acts on the new message,
@@ -14900,8 +14722,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
+      // Same-batch EXACT-duplicate read: the model sometimes emits the IDENTICAL read (same path +
+      // same offset/limit range) more than once in ONE response. Fold every copy after the first —
+      // one read is enough. Handled exactly like the edit→multi_edit merge above: the duplicate gets
+      // NO card and runOne returns an instant stub (so the model is told to stop, but the UI shows a
+      // single read, not two). Range-aware: genuine pagination (same path, DIFFERENT offset) is kept.
+      {
+        const _seenRead = new Set();
+        for (const it of items) {
+          if (!it.call || it.call.type !== "read" || it.merged != null) continue;
+          const _off = Number.isFinite(it.call.offset) ? it.call.offset : "";
+          const _lim = Number.isFinite(it.call.limit) ? it.call.limit : "";
+          const _k = (it.call.path || "").trim() + "|" + _off + "|" + _lim;
+          if (_seenRead.has(_k)) it._dupRead = true; else _seenRead.add(_k);
+        }
+      }
+
       for (const it of items) {
-        if (it.call && !it.merged && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research" && it.tc.name !== "search_tools") { try { it.step = _createToolStep(it.call); body.appendChild(it.step); } catch (_e) { console.error("[toolstep]", _e); } }
+        if (it.call && !it.merged && !it._dupRead && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research" && it.tc.name !== "search_tools") { try { it.step = _createToolStep(it.call); body.appendChild(it.step); } catch (_e) { console.error("[toolstep]", _e); } }
       }
       // Live staging: drive the relevant panel(s) so the user watches the real work
       // (edit→open file, cmd→terminal, read→reveal). The LAST file op in the batch
@@ -14938,21 +14776,54 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           it.rawResult = r;
           return _toolResultToString(call, r);
         }
+        // Same-batch duplicate read: the model emitted the IDENTICAL read (same path + range) more than
+        // once in ONE response. Recognize it at dispatch and skip the extra execution entirely — one
+        // read is enough. (Correct logic, not hiding: the extra call never runs.)
+        if (it._dupRead) {
+          const r = { type: "read", path: call.path || "", content: `[重复读取·已跳过] 这一轮你对 ${call.path} 发了多次完全相同的 read——只执行一次就够，内容以第一次为准（在上方）。同一回合别对同一文件重复 read。` };
+          it.rawResult = r;
+          return _toolResultToString(call, r);
+        }
         // EXACT-duplicate guard — the model re-issued the IDENTICAL read-only call it just
         // made (the "脑抽重复2次" case). Short-circuit it instead of wasting a round-trip
         // re-running the same query. Only idempotent read-only types; excludes read_file
         // (it pages/auto-advances, so a same-path re-read is legitimately different).
         const _sig = call.type + ":" + String(call.command || call.query || call.path || call.selector || call.action || call.url || call.op || call.name || "").slice(0, 120);
         const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "web", "websearch", "diag"]);
-        // Claude doesn't brain-freeze-repeat; if it re-runs a read-only call it has a
-        // reason — never second-guess it. The guard is only for the weaker families.
-        if (run && _modelFamilyOf(config && config.model) !== "claude") {
+        // Weak models brain-freeze-repeat readily → catch a repeat within the last 2 calls. Claude
+        // rarely does, and a SPACED re-run after other work is usually intentional — but sonnet-5 CAN
+        // spin, so still catch a genuine BACK-TO-BACK repeat (this is the 3rd identical call in a row).
+        // read_file is excluded here — its own content-signature dedup handles re-reads for every family.
+        if (run && _live() && _dupGuardable.has(call.type)) {
           run._recentSigs = run._recentSigs || [];
-          if (_live() && _dupGuardable.has(call.type) && run._recentSigs.slice(-2).includes(_sig)) {
-            const r = { type: call.type, path: call.path || "", content: `（⚠️ 你刚执行过**完全相同**的 ${call.type} 调用，结果就在上方——这是"脑抽重复"，别再重复同一个调用、也别把同样的话再说一遍。直接基于已有结果继续下一步；要不同信息就换参数/换目标/换工具。）` };
+          const _tail = run._recentSigs.slice(-2);
+          const _dup = _modelFamilyOf(config && config.model) === "claude"
+            ? (_tail.length === 2 && _tail[0] === _sig && _tail[1] === _sig)
+            : _tail.includes(_sig);
+          if (_dup) {
+            const r = { type: call.type, path: call.path || "", content: `（⚠️ 你刚**连续**执行了完全相同的 ${call.type} 调用，结果就在上方——别再重复同一个调用、也别把同样的话再说一遍。直接基于已有结果继续下一步；要不同信息就换参数/换目标/换工具。）` };
             it.rawResult = r;
             run._recentSigs.push(_sig);
             return _toolResultToString(call, r);
+          }
+        }
+        // Fuzzy failed-search dedup: if a recent text search returned "无匹配" and the
+        // model tries an almost-identical query (case/substring variation), skip it.
+        // ONLY for text-search tools (search, websearch). NOT find_files — glob patterns
+        // like "*.js" are structurally different; stripping metacharacters poisons the pool.
+        if (run && _live() && (call.type === "search" || call.type === "websearch")) {
+          run._failedSearchQ = run._failedSearchQ || [];
+          const _qRaw = call.query || "";
+          const _qN = _qRaw.toLowerCase().replace(/[|\\.*+?^${}()[\]]/g, " ").replace(/\s+/g, " ").trim();
+          if (_qN.length >= 2) {
+            const _hit = run._failedSearchQ.find(fq => _qN === fq || _qN.includes(fq) || fq.includes(_qN));
+            if (_hit) {
+              const r = { type: call.type, path: call.path || "", content: `搜索 "${_qRaw}"：无匹配。（你之前搜 "${_hit}" 也没结果——同类词反复搜不会有新结果。换个**完全不同的关键词**、或用 find_files 按文件名找、或 read_file 直接读你已知的文件。）` };
+              it.rawResult = r;
+              if (it.step) { it.step.remove(); it.step = null; }
+              if (run._recentSigs) run._recentSigs.push(_sig);
+              return _toolResultToString(call, r);
+            }
           }
         }
         let result;
@@ -14972,11 +14843,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (_live()) result = await _exec();
           }
         }
+        // Track failed text searches for fuzzy dedup (search + websearch only, NOT find_files)
+        if (run && (call.type === "search" || call.type === "websearch")) {
+          const _c = (result && result.content) || "";
+          if (_c.includes("无匹配") || /\b0\s*处匹配/.test(_c)) {
+            run._failedSearchQ = run._failedSearchQ || [];
+            const _qN = (call.query || "").toLowerCase().replace(/[|\\.*+?^${}()[\]]/g, " ").replace(/\s+/g, " ").trim();
+            if (_qN.length >= 2 && !run._failedSearchQ.includes(_qN)) { run._failedSearchQ.push(_qN); if (run._failedSearchQ.length > 12) run._failedSearchQ.shift(); }
+          }
+        }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
         if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
         const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "screenshot") ? "" : (call.path || "");
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
-        return _toolResultToString(call, result).slice(0, 8000);
+        return _toolMsgForModel(call, result);
       };
 
       // 1) read-only tools AND sub-agents — concurrently (fast parallel
@@ -15009,7 +14889,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           })());
         }
       }
-      if (parallel.length) await Promise.all(parallel);
+      if (parallel.length) {
+        // Race with a stop-signal so clicking Stop unblocks the main loop immediately
+        // instead of waiting for every slow sub-agent/LLM call to settle.
+        await Promise.race([
+          Promise.all(parallel),
+          new Promise(resolve => { const _iv = setInterval(() => { if (!_live()) { clearInterval(_iv); resolve(); } }, 80); }),
+        ]);
+      }
+      if (!_live()) break;
 
       // 2a) Independent file mutations (write/edit/multiedit) to DISTINCT files have
       //     no ordering dependency between them → run them in parallel too (the
@@ -15027,14 +14915,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         const paths = fileMut.map((i) => items[i].call.path);
         if (fileMut.length >= 2 && !riskyOrder && new Set(paths).size === paths.length && _live()) {
-          await Promise.all(fileMut.map((i) => (async () => {
-            toolMsgs[i] = { role: "tool", tool_call_id: items[i].tc.id, content: await runOne(items[i]) };
-          })()));
+          await Promise.race([
+            Promise.all(fileMut.map((i) => (async () => {
+              toolMsgs[i] = { role: "tool", tool_call_id: items[i].tc.id, content: await runOne(items[i]) };
+            })())),
+            new Promise(resolve => { const _iv = setInterval(() => { if (!_live()) { clearInterval(_iv); resolve(); } }, 80); }),
+          ]);
         }
+        if (!_live()) break;
       }
 
       // 2b) plan updates + remaining mutating tools — sequentially, in call order
       for (let i = 0; i < items.length; i++) {
+        if (!_live()) break;
         if (toolMsgs[i]) continue;
         const it = items[i];
         if (!it.call) { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: `未知工具: ${it.tc.name}` }; continue; }
@@ -15044,6 +14937,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           continue;
         }
         toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) };
+      }
+      if (!_live()) {
+        for (let j = 0; j < items.length; j++) {
+          if (!toolMsgs[j]) toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id, content: "[interrupted]" };
+        }
+        for (const m of toolMsgs) messages.push(m);
+        break;
       }
 
       for (const m of toolMsgs) messages.push(m);
@@ -15221,6 +15121,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // (removed) merely CALLING get_diagnostics no longer counts as "verified" — only the finish-gate's
         // real check (which counts actual error markers) sets didVerify. A tool call ≠ a passing result.
         if (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp") didInvestigate = true;
+        // 有日志/报错就逼它照真实输出诊断——命令跑失败 → 硬把它拽回"照真实报错定位根因、直接改对应
+        // 文件:行"，而不是凭记忆瞎推断、绕远改别处（治"10分钟的事绕40分钟还烧token"）。报错已在上一条
+        // 工具结果里，这里只补一句硬指令，不重复贴。
+        if ((t === "run" || t === "termtask" || t === "termread") && it.rawResult
+            && /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|\[(失败|ERROR)\]|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || ""))) {
+          messages.push({ role: "user", content: "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_file 打开看细节；服务类的用 read_terminal 看它的运行日志。改完再把它跑一遍，确认真通了才算。" });
+        }
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
         if (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp"
@@ -15228,8 +15135,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (t === "write" || t === "edit" || t === "multiedit") _implOps++;
         if (t === "read" && it.call.path) _readFiles.add(it.call.path);
         if (t === "edit" || t === "multiedit") didEdit = true;
-        // (removed) running a build/test command no longer counts as "verified" by its NAME — the model
-        // could run a FAILING test and satisfy the gate. Only the finish-gate's real error-count sets it.
+        // Model-initiated verify: if the model ran http_request / run_cmd / browser AFTER
+        // being nudged to verify, count that as verification — don't nudge again.
+        if ((t === "run" || t === "http" || t === "browser") && didMutate && verifyNudges > 0) {
+          didVerify = true; _verifiedAtImplOps = _implOps;
+        }
         if (it.tc.name === "update_plan") {
           planSteps = run._planSteps || it.call.steps;
           if (Array.isArray(planSteps)) {
@@ -15310,42 +15220,41 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const _sraw = String(c.command || c.path || c.selector || c.action || c.url || c.op || c.title || "");
         let _sh = 5381; for (let _k = 0; _k < _sraw.length; _k++) _sh = ((_sh << 5) + _sh + _sraw.charCodeAt(_k)) | 0;
         const sig = c.type + ":" + _sraw.slice(0, 48) + "#" + (_sh >>> 0);
-        const failed = /\[(失败|ERROR|BLOCKED|DENIED|不可用|未执行|权限问题)\]/.test((toolMsgs[i] && toolMsgs[i].content) || "");
-        _callLog.push({ sig, failed });
+        const _tmsg = (toolMsgs[i] && toolMsgs[i].content) || "";
+        const failed = /\[(失败|ERROR|BLOCKED|DENIED|不可用|未执行|权限问题)\]/.test(_tmsg);
+        // A deduped re-read ("别重读" / "死循环") = the model tried to re-read an unchanged file it
+        // already has. Two of those = spinning, a stuck signal on par with repeated failures.
+        const dupRead = /\[别重读\]|\[停止·你在死循环\]/.test(_tmsg);
+        _callLog.push({ sig, failed, dupRead });
       }
       if (_callLog.length > 12) _callLog.splice(0, _callLog.length - 12);
       {
         const win = _callLog.slice(-8);
         const counts = {};
         const failCounts = {};
-        let maxRepeat = 0, maxFailRepeat = 0, fails = 0;
+        let maxRepeat = 0, maxFailRepeat = 0, fails = 0, dupReads = 0;
         for (const e of win) {
           counts[e.sig] = (counts[e.sig] || 0) + 1;
           if (counts[e.sig] > maxRepeat) maxRepeat = counts[e.sig];
+          if (e.dupRead) dupReads++;
           if (e.failed) {
             fails++;
             failCounts[e.sig] = (failCounts[e.sig] || 0) + 1;
             if (failCounts[e.sig] > maxFailRepeat) maxFailRepeat = failCounts[e.sig];
           }
         }
-        // STRONGER triggers: same call FAILED 3+ times (true stuck), OR 4+ total
-        // failures, OR same call repeated 4+ times even if succeeding (likely
-        // pointless re-reads / re-lists). Tightening from the old maxRepeat>=3
-        // which fired on benign "list_dir(.)" repeats during exploration.
-        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6) && stuckNudges < 2 && _live()) {
+        // STRONGER triggers: same call FAILED 3+ times (true stuck), OR 4+ total failures, OR same
+        // call repeated 6+ times even if succeeding, OR 2+ deduped re-reads (the model re-reading a
+        // file it already has = classic spin — intervene at 2, don't wait for 6 blind re-reads).
+        if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6 || dupReads >= 2) && stuckNudges < 2 && _live()) {
           stuckNudges++;
           runHadTrouble = true;
           const _stuckSig = win.map((e) => e.sig).join("; ").slice(0, 400);
           _callLog.length = 0; // fresh window after intervening
           if (stuckNudges >= 2) {
-            // Still stuck after one self-rethink → bring in FRESH EYES: a read-only
-            // sub-agent that re-reads the situation cold and proposes the likeliest root
-            // cause + a DIFFERENT path. Breaks flails the same model can't escape alone.
-            let _diag = "";
-            try {
-              _diag = await _runSubAgent({ config, description: "卡点诊断", prompt: "主智能体在当前任务里卡住了（反复同样的动作 / 连续失败）。请你以**全新视角、只读地**调查这个工作区，判断它**最可能卡在哪、根因是什么**，并给出**一条具体、不同于之前的破解路径**（换什么工具 / 思路 / 前提 / 命令）。直接给可执行的下一步，别复述问题。\n\n它最近在反复做的事：" + _stuckSig, root, container: body, run });
-            } catch { _diag = ""; }
-            messages.push({ role: "user", content: "你卡了一会儿了，我请了一个**全新视角的子智能体**重新诊断。它的判断在下面——据此**换个思路**再来，别继续原样打转：\n\n" + (_diag || "（诊断没产出。那你自己退一步：写下 2-3 个最可能的根因，逐一证伪，然后换工具 / 换路径，别原样重试。）") });
+            // De-subagent'd (refactor 2026-07-05): spawning a "卡点诊断" sub-agent when stuck was more
+            // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
+            messages.push({ role: "user", content: "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。" });
           } else {
             messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。** ④ 如果是**方向/需求本身定不下来**（不是技术卡点），别瞎试——直接 **ask_user 给用户 2-4 个选项**让他拍板，比闷头空转强。" });
           }
@@ -15385,8 +15294,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // file change / plan progress). Bounded so a genuine long investigation — which DOES eventually
         // write or complete a step — isn't cut short.
         run._noRealProgressExt = _madeRealProgress ? 0 : (run._noRealProgressExt || 0) + 1;
-        const churning = run._noRealProgressExt >= 6;
-        const flailing = recentFails >= 6 || (stuckNudges >= 2 && recentFails >= 2) || sameCallSpin || looseSpin || churning;
+        const churning = run._noRealProgressExt >= 10;
+        // The stuck-nudge block runs BEFORE this check and clears `_callLog` when it fires. If that
+        // happened this same (budget-boundary) iteration, `recent` is empty → every spin signal above
+        // reads false → we'd hand a just-flagged-as-stuck run a free +30 extension. A wiped window right
+        // after an intervention IS the flailing signal, not the absence of one.
+        const _windowWipedByNudge = stuckNudges >= 1 && recent.length === 0;
+        const flailing = recentFails >= 6 || (stuckNudges >= 2 && recentFails >= 2) || sameCallSpin || looseSpin || churning || _windowWipedByNudge;
         // Progress for the EXTEND decision stays lenient (a new KIND of action counts) so a real
         // investigation phase isn't cut short — the flailing guards above catch a genuine no-output loop.
         run._sigsSeen = run._sigsSeen || new Set();
@@ -15430,16 +15344,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (cont) { _removeAllThinking(cont); cont.querySelectorAll(".md-caret").forEach((c) => c.remove()); }
     } catch {}
     if (hitCap) {
-      const note = document.createElement("div");
-      note.className = "msg__error";
-      // Only two ways to reach here now (a done task self-stops long before any cap): the agent was
-      // There is NO step limit now — a done task self-stops (finish gates). The only ways here:
-      // FLAILING (be honest, ask for a nudge — resuming a broken loop is pointless), or a genuine
-      // no-new-progress stall (kept doing the same things without advancing). Never a step-count pause.
-      note.textContent = run._capReason === "flailing"
-        ? `⏸️ 我好像卡在原地了（在重复同一个操作 / 连续失败），先停下来避免空烧——多半是思路撞墙了。告诉我哪里不对、或补一点信息，我换个思路再来。`
-        : `⏸️ 跑了一阵、暂时没有新进展了，先停一下。如果还没做完，说声「继续」我接着干；或者告诉我卡在哪，我换个方向。`;
-      body.appendChild(note);
+      // Agent reached its budget ceiling. For flailing (genuine infinite loop), it already
+      // stopped itself — no alarming message needed, just a quiet note so the user knows
+      // they can resume. For stalled (ran out of extensions), same: silent stop, user types
+      // to continue. The old scary "卡在原地" message made users think the agent broke.
     }
     if (finalErr) {
       const note = document.createElement("div");
@@ -15481,10 +15389,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       exec.addEventListener("click", () => {
         if (_isStreaming()) return;
         exec.disabled = true;
-        _currentAiMode = "agent";
-        _updateModeUI();
         const s = _currentSession();
-        if (s) { s.mode = "agent"; _renderChatTabs(); saveChatHistory(); }
+        if (s) {
+          s.mode = "agent";
+          _currentAiMode = "agent";
+          _updateModeUI();
+          _renderChatTabs();
+          saveChatHistory();
+        }
         sendPrompt("按上面给出的方案逐步实施：先用 update_plan 列出步骤，再逐步实现，收尾前验证。");
       });
       body.appendChild(exec);
@@ -15754,8 +15666,8 @@ function _createToolStep(call) {
     ? (call.url || "")
     : call.type === "browser"
     ? ((call.action || "") + (call.url ? " " + call.url : "") + (call.selector ? " " + call.selector : ""))
-    : call.type === "computer"
-    ? ((call.action || "") + (Number.isFinite(call.x) ? ` ${Math.round(call.x)},${Math.round(call.y)}` : "") + (call.key ? " " + call.key : ""))
+    : call.type === "automation"
+    ? (call.method || "")
     : (call.path || call.command || "")) ?? "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
@@ -15795,7 +15707,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "computer" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "askuser";
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser";
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -15845,19 +15757,22 @@ function _allRoots() {
 // roots — for read/list, tried in order until one exists. Order: active-root,
 // other-roots, root-name-qualified ("proj2/src/x" where a root folder is proj2),
 // then the raw path.
-function _relCandidates(rawPath) {
+function _relCandidates(rawPath, fallbackRoot) {
   const out = [];
   const push = (p) => { if (p && !out.includes(p)) out.push(p); };
+  const roots = _allRoots();
+  // When global roots are empty but the agent loop passed a valid root, use it.
+  if (!roots.length && fallbackRoot) roots.push(fallbackRoot.replace(/\/+$/, ""));
   const isAbs = rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath);
   if (isAbs) {
     push(rawPath);
     const base = rawPath.split(/[\\/]/).pop();
-    for (const r of _allRoots()) if (base) push(r + "/" + base); // stale-abs fallback
+    for (const r of roots) if (base) push(r + "/" + base);
     return out;
   }
-  const clean = rawPath.replace(/^\.\//, "").replace(/^\/+/, "");
-  for (const r of _allRoots()) push(r + "/" + clean);
-  for (const r of _allRoots()) {
+  const clean = rawPath.replace(/^\.?\/?/, "").replace(/^\/+/, "");
+  for (const r of roots) push(clean ? r + "/" + clean : r);
+  for (const r of roots) {
     const base = r.split("/").pop();
     if (base && (clean === base || clean.startsWith(base + "/"))) {
       const sub = clean.slice(base.length).replace(/^\/+/, "");
@@ -16106,7 +16021,7 @@ async function _executeToolStep(step, call, root, run) {
   // Agent/Auto when they've opted into approvals (no-op in the default "auto").
   if (!readOnlyMode && !(await _approveToolCall(call, run))) {
     const what = (call.type === "cmd" || call.type === "termtask") ? "运行这条命令"
-      : call.type === "computer" ? "这个电脑操作"
+      : call.type === "automation" ? "这个自动化操作"
       : call.type === "download" ? "这次下载" : "改这个文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = "⛔ 你拒绝了该操作";
@@ -16127,7 +16042,7 @@ async function _executeToolStep(step, call, root, run) {
       }
       // Try EVERY open workspace root (active first), so a file in an added folder
       // resolves there instead of reading the wrong file under the active root.
-      const candidates = _relCandidates(rawPath);
+      const candidates = _relCandidates(rawPath, root);
 
       let txt = "";
       let readFailed = true;
@@ -16137,10 +16052,8 @@ async function _executeToolStep(step, call, root, run) {
       let _readNote = ""; // set when fuzzy basename recovery read a differently-pathed file
 
       let isDir = false;
-      // Cache hit: serve a previously-read file without another backend call.
-      for (const fp of candidates) {
-        if (_agentReadCache.has(fp)) { txt = _agentReadCache.get(fp); readFailed = false; usedPath = fp; fromCache = true; break; }
-      }
+      // No stale fast-path: always fetch FRESH below, so the content-signature dedup can distinguish a
+      // REAL on-disk change from an unchanged re-read. (A cached copy would hide edits → "拿到旧内容".)
       if (readFailed) {
         for (const fp of candidates) {
           try {
@@ -16152,6 +16065,11 @@ async function _executeToolStep(step, call, root, run) {
           } catch (e) {
             const msg = String(e?.message || e);
             if (/is a directory|os error 21/i.test(msg)) { isDir = true; usedPath = fp; break; }
+            // File FOUND at this candidate but unreadable (too large / binary) — that IS the real
+            // reason; STOP so a later non-existent fallback candidate can't overwrite it with a
+            // misleading "No such file". (A 343MB app.asar showed "找不到文件" because the real error
+            // "太大/二进制" got masked by the relative-path fallback's ENOENT.)
+            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB/i.test(msg)) { readError = msg; usedPath = fp; break; }
             readError = msg.slice(0, 200);
           }
         }
@@ -16167,7 +16085,7 @@ async function _executeToolStep(step, call, root, run) {
           res.className = "atc-result atc-result--info";
           res.innerHTML = `<span class="atc-result__t">${_dirs.length} 个文件夹 · ${_files.length} 个文件</span>`;
           vp.innerHTML = _lsRowsHtml(_dirs, _files);
-          return { type: "list", path: call.path, content: listing || "(empty directory)" };
+          return { type: "list", path: call.path, content: listing || "(空目录——没有任何文件或子文件夹。这是新/空项目，直接基于用户描述开始工作，不要猜测文件名去 read_file。)" };
         } catch (dirErr) {
           res.className = "atc-result atc-result--err";
           res.textContent = String(dirErr?.message || dirErr).slice(0, 120);
@@ -16211,7 +16129,16 @@ async function _executeToolStep(step, call, root, run) {
         }
         let fuzzy = { count: 0, files: [] };
         if (base && root && base.length > 1 && readFailed) { try { fuzzy = await _agentFindFiles(root, base); } catch {} }
-        const fmatch = (fuzzy.files || []);
+        let fmatch = (fuzzy.files || []);
+        // Suffix match: the model's path is often missing only a leading prefix (it gave
+        // "out/main/index.js" but the file is "app.asar.extracted/out/main/index.js"). Prefer the
+        // real files whose path ENDS WITH the model's relative path — resolves uniquely even when the
+        // bare basename (index.js) matches dozens, so the read "just works" instead of erroring.
+        const _relGuess = rawPath.replace(/^[.\/]+/, "").replace(/\\/g, "/");
+        if (fmatch.length > 1 && _relGuess.includes("/")) {
+          const suf = fmatch.filter((f) => f === _relGuess || f.endsWith("/" + _relGuess));
+          if (suf.length >= 1) fmatch = suf;
+        }
         if (fmatch.length === 1) {
           try {
             const fp2 = root + "/" + fmatch[0];
@@ -16246,34 +16173,76 @@ async function _executeToolStep(step, call, root, run) {
       // served by reading with offset/limit, which bypasses this. Zero-risk: only
       // fires for a same-run cache hit re-read within the last few tool calls.
       const allLines = txt.split("\n");
+      // A file ending in "\n" (near-universal) splits to a phantom trailing "" element → drop it so
+      // `total` is the real line count (accurate "全 N 行" label, correct ≤2500 pagination boundary) and
+      // the model never "reads" a phantom empty line.
+      if (allLines.length > 1 && allLines[allLines.length - 1] === "") allLines.pop();
       const total = allLines.length;
       const _explicitOffset = Number.isFinite(call.offset) && call.offset > 0;
       const _explicitLimit = Number.isFinite(call.limit) && call.limit > 0;
       const _defaultRead = !_explicitOffset && !_explicitLimit;
-      const _seen = (run && run._readSeen && run._readSeen.get(usedPath)) || 0; // lines already shown this run
+      // ── Content signature (cheap: line count + byte length + head + tail). Tells a REAL on-disk
+      // change from an unchanged re-read — robust to filesystem noise (no more fs-event guessing). ────
+      // djb2 over the WHOLE text (cheap ≤ 55K): a head+tail-96 sample missed mid-file edits of equal
+      // length (change a constant's value, swap two same-length names) → _contentChanged stayed false so
+      // the dedup wrongly blocked a re-read of content that HAD changed (esp. when the edit came via a
+      // shell command, which doesn't reset read progress).
+      let _sh = 5381; for (let _hk = 0; _hk < txt.length; _hk++) _sh = ((_sh << 5) + _sh + txt.charCodeAt(_hk)) | 0;
+      const _sig = total + ":" + txt.length + ":" + (_sh >>> 0);
+      const _prevSig = run && run._readSig ? run._readSig.get(usedPath) : undefined;
+      const _contentChanged = _prevSig != null && _prevSig !== _sig; // bytes genuinely differ from last time
       const _prevStep = run && run._readStep ? run._readStep.get(usedPath) : undefined;
-      const _recent = run && _prevStep != null && (run._toolStep - _prevStep) <= 4;
-      // Only short-circuit as "already read" when the WHOLE file was actually shown —
-      // NOT when it was truncated. (Old bug: a 600-line file shown 1-400 then re-read
-      // got "already read", so the model never saw 401+ → it "反复读同一段看不到完整结构".)
-      if (_defaultRead && _recent && total > 0 && _seen >= total && txt.length > 1500) {
-        res.className = "atc-result atc-result--ok";
-        res.textContent = `全文 ${total} 行`;
-        // Show YOU the full content in the card (so it's never "看不到内容")；只是不把整份重复喂给 AI（省 token）。
-        if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px;border-bottom:1px solid var(--atc-border,#dadce0)">${_escHtml(call.path)} · 全文 ${total} 行（最近已读过，为省 token 不重复计入 AI 上下文，但给你完整留档）</div><pre style="margin:0;padding:8px 12px;overflow:auto;max-height:360px;font:12px/1.55 var(--atc-mono,ui-monospace);color:var(--atc-text,#202124);white-space:pre;tab-size:2">${_escHtml(txt)}</pre>`;
-        return { type: "read", path: call.path, content: `（你最近已**完整**读过 ${call.path} 全 ${total} 行——内容在上方，别再整文件重读；要重看某段用 read_file 的 offset/limit。）` };
-      }
-      // Page by line. AUTO-ADVANCE: a default (no-offset) re-read of a partly-shown
-      // file continues from where it left off — so a big file gets read THROUGH instead
-      // of showing the same head every time.
+      const _recent = run && _prevStep != null && (run._toolStep - _prevStep) <= 6;
+      // Lines already shown this run — but if the content actually changed, forget it → re-read fresh.
+      const _seen = _contentChanged ? 0 : ((run && run._readSeen && run._readSeen.get(usedPath)) || 0);
+      if (_contentChanged && run && run._dupReadN) run._dupReadN.set(usedPath, 0); // content changed → reset re-read escalation
+
+      // Decide the range. Small file → whole (ignore a tiny passed limit that would chunk it). A default
+      // re-read of a partly-shown BIG file auto-advances through it. offset>1 + limit = deliberate slice.
       let startLine;
       if (_explicitOffset) startLine = Math.floor(call.offset);
       else if (_defaultRead && _seen > 0 && _seen < total) startLine = _seen + 1;
       else startLine = 1;
       const start = Math.max(0, startLine - 1);
       const _autoAdvanced = _defaultRead && start > 0;
-      const limit = _explicitLimit ? Math.floor(call.limit) : 1800; // 默认读全大多数源文件（看不全就修不好）——只有超大文件才分页
+      const _rangeRead = start > 0 && _explicitLimit; // deliberate mid-file slice
+      const limit = _rangeRead ? Math.floor(call.limit) : (total <= 2500 ? total : 1800);
       let slice = allLines.slice(start, start + limit);
+      const _reqEnd = start + slice.length; // last line this read would show
+
+      // EOF guard: offset is past the end of the file → there is NOTHING more. Say so plainly so the
+      // model STOPS trying to "read the rest" of a file it already finished (the "剩余部分" loop).
+      if (start >= total && total > 0) {
+        res.className = "atc-result atc-result--ok";
+        res.textContent = `到末尾 · 共 ${total} 行`;
+        return { type: "read", path: call.path, content: `（${call.path} 整个文件一共就 ${total} 行，offset=${startLine} 已超过文件末尾——**没有更多内容了，别再往后读**。整份都在上方上下文里，直接基于它继续干活。）` };
+      }
+      // ── ONE dedup, content + range aware ── unchanged content, read recently, asking for NOTHING new
+      // → don't re-feed it, point back to the copy already in context. Catches WHOLE and RANGE re-reads
+      // (the "同一文件读七八遍" bug). A real change OR a genuinely new range (past _seen) still reads fresh.
+      // Exempt EXPLICIT-offset reads: a deliberate `offset=1,limit=40` to re-inspect a specific region
+      // is a real request, not a blind re-read — serve it (cheap) instead of scolding "别重读". Dropped
+      // the old `txt.length>800` clause: a re-read loop on a SMALL unchanged file is just as much a spin
+      // (and it slipped past the stuck signal that keys off this dedup).
+      if (!_contentChanged && _recent && _seen > 0 && _reqEnd <= _seen && !_explicitOffset) {
+        // Redundant re-read of unchanged, already-shown content. Repeated re-reads of the SAME file
+        // are a top stuck-loop symptom (the model spins re-reading instead of acting) — so count how
+        // many times THIS run re-read THIS file and ESCALATE: 1st = "别读了，动手"; 2nd+ = a hard
+        // circuit-break telling it it's looping and to act OR report the blocker. The loop-detector
+        // also trips on 2 such re-reads (see the _callLog dupRead flag) instead of waiting for 6.
+        run._dupReadN = run._dupReadN || new Map();
+        const _dupN = (run._dupReadN.get(usedPath) || 0) + 1;
+        run._dupReadN.set(usedPath, _dupN);
+        res.className = "atc-result atc-result--err";
+        res.textContent = _dupN >= 2 ? `死循环 · 第 ${_dupN} 次重读` : `别重读 · ${total} 行`;
+        if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px;border-bottom:1px solid var(--atc-border,#dadce0)">${_escHtml(call.path)} · ${total} 行（刚读过、内容没变，不重复喂给 AI，给你完整留档）</div><pre style="margin:0;padding:8px 12px;overflow:auto;max-height:360px;font:12px/1.55 var(--atc-mono,ui-monospace);color:var(--atc-text,#202124);white-space:pre;tab-size:2">${_escHtml(txt)}</pre>`;
+        const _msg = _dupN >= 2
+          ? `[停止·你在死循环] 这是你第 ${_dupN} 次重复读 ${call.path}——内容一直没变、整份都在上方上下文里。**反复读同一个文件 = 你已经卡在原地空转了**。立刻停手，二选一：① 基于已经读到的内容**做出一个具体改动 / 换一种完全不同的方法**推进任务；② 如果你其实卡住了（没法验证、跑不起来、缺信息、平台不对…），**别再空转**——一句话如实告诉用户你卡在哪、需要什么才能继续。**绝对禁止再 read 这个文件。**`
+          : (_seen >= total
+            ? `[别重读] ${call.path} 全 ${total} 行你**刚刚就完整读过了、内容没变**——它全在上方上下文里，没有"剩余部分"。**立刻停止读取，现在就动手干活**（改代码 / 起服务 / 截图 / 下一步），别再调 read。`
+            : `[别重读] ${call.path} 这段（到第 ${_seen} 行）你刚读过、没变，在上文里。只有要读**还没看过的第 ${_seen + 1} 行往后**才用 offset=${_seen + 1}；否则别再 read。`);
+        return { type: "read", path: call.path, content: _msg };
+      }
       const shownFrom = start + 1;
       let shownTo = Math.min(start + slice.length, total);
       let body = slice.join("\n");
@@ -16288,7 +16257,7 @@ async function _executeToolStep(step, call, root, run) {
         charCapped = true;
       }
       // Record how far this file has now been shown (drives auto-advance on re-read).
-      if (run) { run._readSeen = run._readSeen || new Map(); run._readSeen.set(usedPath, Math.max(_seen, shownTo)); run._readStep = run._readStep || new Map(); run._readStep.set(usedPath, run._toolStep); }
+      if (run) { run._readSeen = run._readSeen || new Map(); run._readSeen.set(usedPath, Math.max(_seen, shownTo, run._readSeen.get(usedPath) || 0)); run._readStep = run._readStep || new Map(); run._readStep.set(usedPath, run._toolStep); run._readSig = run._readSig || new Map(); run._readSig.set(usedPath, _sig); }
 
       const sizeLabel = txt.length > 1024 ? `${(txt.length / 1024).toFixed(1)} KB` : `${txt.length} chars`;
       res.className = "atc-result atc-result--info";
@@ -16309,9 +16278,24 @@ async function _executeToolStep(step, call, root, run) {
       row.addEventListener("dblclick", () => openFile(usedPath, String(call.path || "").split("/").pop()));
 
       let hint = "";
-      if (shownTo < total) hint = `\n\n（显示第 ${shownFrom}-${shownTo} 行 / 共 ${total} 行${_autoAdvanced ? "，已接着上次自动往后翻" : ""}。还有后续——**再 read_file 一次会自动接着往下读**，或 offset=${shownTo + 1} 指定续读。）`;
-      else if (charCapped) hint = `\n\n（这段过长已按字符截断，用更小 limit 分段读。）`;
-      else if (_autoAdvanced) hint = `\n\n（已接续读到文件末尾，全文看完。）`;
+      if (total <= 3 && txt.length > 20000) {
+        // Minified / bundled into one giant line → reading it raw is useless; guide the right approach.
+        hint = `\n\n（⚠️这是**压缩/打包成一行**的文件（${total} 行 ${(txt.length / 1024).toFixed(0)}KB）——直接读原文没意义。要看懂它：① 用 search / grep 在里面找关键字符串或函数名来定位；② 或先跑格式化 / 反混淆（\`npx prettier\`、\`npx js-beautify\`）把它展开成多行再读；别一段段硬啃压缩串。）`;
+      } else if (shownTo < total) {
+        // Huge file that had to paginate → navigate by STRUCTURE, don't dumbly page through it.
+        hint = total > 2500
+          ? `\n\n（已显示第 ${shownFrom}-${shownTo} 行 / 共 ${total} 行。**这文件 ${total} 行很大——别一页页翻着读，又慢又容易漏**：① 先用 lsp_symbols 看它的结构大纲（函数/类 + 行号），② 或 find_symbol / search 直接定位你要的那部分，③ 再用 offset=起始行 只精读那一段。这才是读大文件的正确方式。）`
+          : `\n\n（显示第 ${shownFrom}-${shownTo} 行 / 共 ${total} 行${_autoAdvanced ? "，已接着上次自动往后翻" : ""}。还有后续——**再 read_file 一次会自动接着往下读**，或 offset=${shownTo + 1} 指定续读。）`;
+      } else if (charCapped) {
+        hint = `\n\n（这段过长已按字符截断——先 lsp_symbols 看结构、再 offset 精读你要的那段，别硬啃。）`;
+      } else if (_autoAdvanced) {
+        hint = `\n\n（已接续读到文件末尾，全文看完——别再读了。）`;
+      } else {
+        // Whole file shown in THIS single read (shownTo === total). Tell the model DEFINITIVELY it now
+        // has the COMPLETE file — so it never re-reads to "check if there's more" (there isn't). THIS is
+        // the detection: total lines is known up-front, shownTo === total ⇒ complete, said on read #1.
+        hint = `\n\n（✓ 已完整读取 ${call.path} 全 ${total} 行——这就是文件的**全部内容，没有更多、也没有"剩余部分"**。别再读这个文件了，直接基于它动手干活。）`;
+      }
       const header = (start > 0 || shownTo < total) ? `（${call.path} 第 ${shownFrom}-${shownTo}/${total} 行）\n` : "";
       // Redact credential values from the MODEL-facing copy only (the IDE card above
       // already rendered the real content for the user). Prevents secrets leaking off-machine.
@@ -16326,7 +16310,7 @@ async function _executeToolStep(step, call, root, run) {
       // not under root/tmp/macOS-/Users — which broke real absolute paths on
       // Linux, e.g. /etc or /home.)
       // Multi-root: try the dir under each open root (active first) until one lists.
-      const _cands = _relCandidates(call.path);
+      const _cands = _relCandidates(call.path, root);
       let fp = _cands[0] || call.path;
       let entries = [];
       let _listed = false;
@@ -16362,7 +16346,7 @@ async function _executeToolStep(step, call, root, run) {
       res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件</span>`;
       vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(e.name, true)), _filesE.map((e) => _annot(e.name, false)));
       const _listPath = fp !== call.path ? `${call.path} (${fp})` : call.path;
-      return { type: "list", path: _listPath, content: listing || "(empty directory)" };
+      return { type: "list", path: _listPath, content: listing || "(空目录——没有任何文件或子文件夹。这是新/空项目，直接基于用户描述开始工作，不要猜测文件名去 read_file。)" };
 
     } else if (call.type === "write" || call.type === "edit") {
       // Multi-root: `edit` requires an existing file, so find it in whichever open
@@ -17415,6 +17399,22 @@ async function _executeToolStep(step, call, root, run) {
         return { type: "http", path: call.url, content: `[失败] http_request 出错: ${msg}（检查 URL / 网络 / 方法；本机内网地址会被允许，但 169.254.x.x 链路本地被禁）` };
       }
 
+    } else if (call.type === "automation") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "automation", path: "", content: "[不可用] 桌面自动化只能在桌面 App 里用。" }; }
+      if (/^(mouse|keyboard)\./i.test(call.method || "")) _showControlGlow();
+      const _m = String(call.method || "").trim();
+      if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
+      try {
+        const r = await backend.automationCall(_m, call.params || {});
+        res.className = "atc-result atc-result--ok"; res.textContent = _m;
+        const _out = r == null ? "(ok)" : typeof r === "string" ? r : JSON.stringify(r);
+        return { type: "automation", path: _m, content: `✅ ${_m} → ${_out}`.slice(0, 4000) };
+      } catch (e) {
+        res.className = "atc-result atc-result--err"; res.textContent = "失败";
+        const _msg = String(e?.message || e);
+        const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
+        return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}` };
+      }
     } else if (call.type === "capture_start") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "capture_start", path: "", content: "[不可用] 抓包只能在桌面 App 里用。" }; }
       try {
@@ -18007,157 +18007,6 @@ async function _executeToolStep(step, call, root, run) {
       if (state.text) content += `\n页面可见文本(截断):\n${state.text.slice(0, 1500)}`;
       content += `\n（截图里每个可点元素都标了**红色数字**；优先用 index=该数字 来 click / type，定位最准、不用猜选择器；列表里没有的元素再用 selector 或 eval 找。）`;
       return { type: "browser", path: act, image: state.screenshot, content };
-
-    } else if (call.type === "computer") {
-      const cact = call.action || "screenshot";
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "computer", path: cact, content: "[不可用] computer（控制电脑）只能在 Michael IDE 桌面 App 里用——网页/预览版没有屏幕和键鼠权限，无法真正操作机器。" }; }
-      _showControlGlow(); // 红光边框：此刻起 agent 接管了鼠标键盘（幂等，整段自动化只亮一次）
-      // ---- NODE-FIRST act+verify (no vision): direct accessibility actions ----
-      // press/set_value/nodes act on the AX tree and return TEXT (no screenshot) — far
-      // faster than screenshot→locate→pixel-click. The desktop twin of `browser nodes`.
-      if (cact === "nodes" || cact === "press" || cact === "set_value") {
-        try {
-          if (cact === "nodes") {
-            const els = await backend.invoke("computer_nodes");
-            const list = Array.isArray(els) ? els : [];
-            _lastComputerEls = list;
-            res.className = "atc-result atc-result--ok"; res.textContent = `nodes (${list.length})`;
-            const _fmtNode = e => {
-              let s = `[${e.ref}] ${e.role}`;
-              if (e.text) s += ` 「${e.text}」`;
-              if (e.value && e.value !== e.text) s += ` val="${e.value}"`;
-              if (e.enabled === false) s += " [禁用]";
-              if (e.role === "OCRText") s += " ← 视觉OCR(用click)";
-              return s;
-            };
-            const txt = list.length
-              ? list.map(_fmtNode).join("\n")
-              : "（没枚举到节点——该 App 可能没暴露辅助功能树 / 未授权辅助功能；改用 screenshot 看）";
-            const ocrCount = list.filter(e => e.role === "OCRText").length;
-            const summary = list.length ? `共 ${list.length} 个节点（所有窗口、所有角色——按钮/输入框/文本标签/容器/菜单等全部抓取${ocrCount ? `，+ ${ocrCount} 个 Vision OCR 视觉文字` : ""}）` : "";
-            if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;margin:0">${_escHtml(txt)}</pre>`;
-            step.classList.add("is-open"); _chatFollow(run && run.session);
-            const ocrHint = ocrCount ? `\n（OCRText 节点是屏幕 OCR 识别的文字，无法 press/set_value——用 computer(action:"click", ref:号) 坐标点击。）` : "";
-            return { type: "computer", path: "nodes", content: `当前界面全部节点（深度扫描，无需截图）${summary ? "——" + summary : ""}：\n${txt}\n→ 用 computer(action:"press", ref:号) 直接点，computer(action:"set_value", ref:号, text:"…") 填值；点完再 nodes 复核状态变化，比截图快得多。${ocrHint}` };
-          }
-          const rn = Number.isFinite(+call.ref) ? Math.floor(+call.ref) : null;
-          if (rn == null) { res.className = "atc-result atc-result--err"; res.textContent = "缺 ref"; return { type: "computer", path: cact, content: `[ERROR] ${cact} 需要 ref（节点号）。先 computer(action:"nodes")（或 screenshot）拿到节点号再操作。` }; }
-          const raw = cact === "press"
-            ? await backend.invoke("computer_press", { node: rn })
-            : await backend.invoke("computer_set_value", { node: rn, text: call.text || "" });
-          let r = {}; try { r = JSON.parse(raw); } catch {}
-          if (!r || r.ok === false) {
-            res.className = "atc-result atc-result--err"; res.textContent = cact;
-            return { type: "computer", path: cact, content: `[节点操作未生效] ${cact} ref=${rn}：${(r && r.err) || raw || "无返回"}。该控件可能不支持直接动作——退回 computer(action:"click", ref:${rn}) 用坐标点，或 screenshot 看。` };
-          }
-          res.className = "atc-result atc-result--ok"; res.textContent = cact;
-          const desc = `${r.role || ""}${r.name ? " 「" + r.name + "」" : ""}`.trim();
-          const valTxt = (r.value != null && r.value !== "") ? `，当前值「${r.value}」` : "";
-          if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;margin:0">${_escHtml(cact + " ✓ " + desc + valTxt)}</pre>`;
-          step.classList.add("is-open"); _chatFollow(run && run.session);
-          return { type: "computer", path: cact, content: `电脑 [${cact}] ✓ 直接作用于节点 ${rn}：${desc}${valTxt}。（已是无截图的节点动作验证；要看整体布局再 screenshot，或 nodes 复核。）` };
-        } catch (e) {
-          const msg = String(e?.message || e).slice(0, 200);
-          res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 50);
-          return { type: "computer", path: cact, content: `[电脑节点操作失败] ${msg}（可能 macOS 未授权「辅助功能」，或该 App 无 AX 树；可退回 click 坐标点 / screenshot）。` };
-        }
-      }
-      // NODE-FIRST: if the model passed a `ref` (an accessibility element number from
-      // the last screenshot's list), resolve it to that element's exact CENTER — no
-      // pixel guessing, can't miss. This is the desktop twin of browser node=i.
-      let cx = call.x, cy = call.y;
-      const refNum = Number.isFinite(+call.ref) ? Math.floor(+call.ref) : null;
-      if (refNum != null && (cact === "move" || cact === "click" || cact === "double_click" || cact === "drag")) {
-        const el = (_lastComputerEls || []).find((e) => e.ref === refNum);
-        if (el) { cx = el.x; cy = el.y; }
-        else {
-          res.className = "atc-result atc-result--err"; res.textContent = `无节点 ${refNum}`;
-          return { type: "computer", path: cact, content: `[ERROR] 找不到节点 ref=${refNum}。先 computer(action:"nodes") 刷新节点清单（要看画面才 screenshot），再用清单里真实存在的 ref 点。` };
-        }
-      }
-      const hasXY = Number.isFinite(cx) && Number.isFinite(cy);
-      if ((cact === "move" || cact === "click" || cact === "double_click" || cact === "drag") && !hasXY) {
-        res.className = "atc-result atc-result--err"; res.textContent = "缺目标";
-        return { type: "computer", path: cact, content: `[ERROR] ${cact} 需要 ref（首选——截图元素列表里的节点号，最准）或 x,y 坐标。先 screenshot 看清，优先用 ref 点。` };
-      }
-      let state;
-      try {
-        if (cact === "move") state = await backend.invoke("computer_move", { x: Math.round(cx), y: Math.round(cy) });
-        else if (cact === "click") state = await backend.invoke("computer_click", { x: Math.round(cx), y: Math.round(cy), button: call.button || null });
-        else if (cact === "double_click") state = await backend.invoke("computer_double_click", { x: Math.round(cx), y: Math.round(cy) });
-        else if (cact === "drag") {
-          // start = cx,cy (resolved from ref or x,y above); end = to_ref(节点) 或 to_x,to_y 坐标
-          let ex = call.to_x, ey = call.to_y;
-          const toRef = Number.isFinite(+call.to_ref) ? Math.floor(+call.to_ref) : null;
-          if (toRef != null) { const el2 = (_lastComputerEls || []).find((e) => e.ref === toRef); if (el2) { ex = el2.x; ey = el2.y; } }
-          if (!Number.isFinite(ex) || !Number.isFinite(ey)) { res.className = "atc-result atc-result--err"; res.textContent = "缺终点"; return { type: "computer", path: "drag", content: "[ERROR] drag 需要终点：to_ref（目标节点号）或 to_x,to_y 坐标。起点用 ref 或 x,y。" }; }
-          state = await backend.invoke("computer_drag", { x: Math.round(cx), y: Math.round(cy), tx: Math.round(ex), ty: Math.round(ey) });
-        }
-        else if (cact === "type") state = await backend.invoke("computer_type", { text: call.text || "" });
-        else if (cact === "key") state = await backend.invoke("computer_key", { combo: call.key || "" });
-        else if (cact === "scroll") state = await backend.invoke("computer_scroll", { amount: Number.isFinite(call.amount) ? Math.round(call.amount) : 3 });
-        else if (cact === "batch") {
-          // FAST native automation: run a sequence of ops in ONE call. Click/move/dbl
-          // refs resolve against the PRE-batch node snapshot — so it's for same-screen
-          // multi-step (login forms, dialogs). One final screenshot refreshes nodes.
-          const steps = Array.isArray(call.steps) ? call.steps.slice(0, 20) : [];
-          if (!steps.length) { res.className = "atc-result atc-result--err"; res.textContent = "缺 steps"; return { type: "computer", path: "batch", content: "[ERROR] computer batch 需要 steps 数组。例：computer(action:\"batch\", steps:[{op:\"click\",ref:3},{op:\"type\",text:\"用户名\"},{op:\"key\",key:\"tab\"},{op:\"type\",text:\"密码\"},{op:\"click\",ref:8}])。op∈click/double_click/move/type/key/scroll；点击类用 ref(同屏节点号，先 screenshot 拿)。batch 适合同一屏的连续操作(填表/对话框)。" }; }
-          const blog = [];
-          for (let i = 0; i < steps.length; i++) {
-            const s = steps[i] || {}; const op = String(s.op || s.action || "").toLowerCase().trim();
-            try {
-              if (op === "click" || op === "double_click" || op === "move") {
-                let sx = s.x, sy = s.y; const rn = Number.isFinite(+s.ref) ? Math.floor(+s.ref) : null;
-                if (rn != null) { const el = (_lastComputerEls || []).find((e) => e.ref === rn); if (!el) { blog.push(`${i + 1}. ${op} ✗ 没有节点 ref=${rn}（停）`); break; } sx = el.x; sy = el.y; }
-                if (!(Number.isFinite(sx) && Number.isFinite(sy))) { blog.push(`${i + 1}. ${op} ✗ 缺 ref/坐标（停）`); break; }
-                if (op === "click") state = await backend.invoke("computer_click", { x: Math.round(sx), y: Math.round(sy), button: s.button || null });
-                else if (op === "double_click") state = await backend.invoke("computer_double_click", { x: Math.round(sx), y: Math.round(sy) });
-                else state = await backend.invoke("computer_move", { x: Math.round(sx), y: Math.round(sy) });
-                blog.push(`${i + 1}. ${op}${rn != null ? " ref=" + rn : " " + Math.round(sx) + "," + Math.round(sy)} ✓`);
-              }
-              else if (op === "type") { state = await backend.invoke("computer_type", { text: s.text || "" }); blog.push(`${i + 1}. type「${String(s.text || "").slice(0, 24)}」✓`); }
-              else if (op === "key") { state = await backend.invoke("computer_key", { combo: s.key || s.text || "" }); blog.push(`${i + 1}. key ${s.key || s.text || ""} ✓`); }
-              else if (op === "scroll") { state = await backend.invoke("computer_scroll", { amount: Number.isFinite(+s.amount) ? Math.round(+s.amount) : 3 }); blog.push(`${i + 1}. scroll ✓`); }
-              else { blog.push(`${i + 1}. 跳过未知 op「${op}」`); }
-            } catch (e) { blog.push(`${i + 1}. ${op} ✗ ${String(e?.message || e).slice(0, 50)}（停）`); break; }
-          }
-          try { state = await backend.invoke("computer_screenshot"); } catch {}
-          call._batchLog = blog.join("\n");
-        }
-        else state = await backend.invoke("computer_screenshot");
-      } catch (e) {
-        const msg = String(e?.message || e).slice(0, 240);
-        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 60);
-        if (vp) vp.innerHTML = `<pre>${_escHtml(msg)}</pre>`;
-        return { type: "computer", path: cact, content: `[电脑操作失败] ${msg}` };
-      }
-      // 只有 screenshot / batch 才必须有截图；其它动作走「快路」——只回节点文本不截图。
-      const _needsShot = (cact === "screenshot" || cact === "batch");
-      if (!state || (_needsShot && !state.screenshot)) {
-        res.className = "atc-result atc-result--err"; res.textContent = "未生效";
-        return { type: "computer", path: cact, content: "[失败] 操作没真正生效（没拿到屏幕状态）。常见原因：① 桌面 App 没用最新代码重新构建（先 npm run tauri build/dev）；② macOS 未授权——去 系统设置 → 隐私与安全性 → 屏幕录制 和 辅助功能 里勾选 Michael IDE 后重启 App；③ 当前不在桌面图形会话里。请据此排查，别当作成功继续。" };
-      }
-      const _hasShot = !!state.screenshot;
-      res.className = "atc-result atc-result--ok"; res.textContent = cact;
-      const _cels = Array.isArray(state.elements) ? state.elements : [];
-      _lastComputerEls = _cels; // cache for ref-based (node) actions on the next call
-      const _nodeTxt = _cels.length ? _cels.map(e => { let s = `[${e.ref}] ${e.role}`; if (e.text) s += ` 「${e.text}」`; if (e.value && e.value !== e.text) s += ` val="${e.value}"`; if (e.enabled === false) s += " [禁用]"; if (e.role === "OCRText") s += " ← OCR"; return s; }).join("\n") : "";
-      if (_hasShot) {
-        if (vp) vp.innerHTML = `<img src="${state.screenshot}" alt="screen" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)"><div style="font-size:11px;opacity:.6;margin-top:5px">屏幕 ${state.width}×${state.height}</div>`;
-      } else if (vp) {
-        vp.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;margin:0">${_escHtml(cact + " ✓" + (_nodeTxt ? "\n" + _nodeTxt : "（无节点）"))}</pre>`;
-      }
-      step.classList.add("is-open");
-      _chatFollow(run && run.session);
-      let content = _hasShot ? `电脑 [${cact}] 完成。屏幕 ${state.width}×${state.height}。` : `电脑 [${cact}] ✓（快路：没截图，省时间）。`;
-      if (cact === "batch" && call._batchLog) content += `\n**批量自动化结果**（一次调用跑完多步）：\n${call._batchLog}`;
-      if (_cels.length) {
-        content += `\n**当前可点节点**——操作优先用 ref：\`computer(action:"press", ref:号)\` 直接点 / \`set_value\` 填值 / \`click ref\` 坐标点：\n` + _nodeTxt;
-      }
-      content += _hasShot
-        ? `\n节点列表里没有的目标，才对着截图坐标网格读 x,y。`
-        : `\n${_cels.length ? "" : "（没枚举到节点——可能没授权「辅助功能」，或该 App 无 AX 树）"}**别每步都截图！** 动作已生效，靠上面的节点清单判断下一步；只有「连走好几步后」或「确实要看视觉效果/布局」时才 \`computer(action:"screenshot")\`。`;
-      return { type: "computer", path: cact, image: _hasShot ? state.screenshot : undefined, content };
 
     } else if (call.type === "system") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Michael IDE 桌面 App 里用。" }; }
@@ -19658,8 +19507,11 @@ function writeToActiveTerminal(data, tries = 30) {
 }
 
 function shellQuote(value) {
+  if (_isWin) return `"${String(value).replace(/"/g, '""')}"`;
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
+const _isWin = typeof navigator !== "undefined" && navigator.platform && navigator.platform.startsWith("Win");
+const _clearCmd = _isWin ? "cls" : "clear";
 
 function dirname(path) {
   const clean = path.replace(/\/+$/, "");
@@ -19846,9 +19698,9 @@ async function _startDevServer(dir, port, fileName = "") {
 
   try {
     const tmpPath = await backend.writeTmpFile("_michael_ide_dev_server.py", scriptContent);
-    writeToActiveTerminal(`\nclear\npython3 ${shellQuote(tmpPath)}\n`);
+    writeToActiveTerminal(`\n${_clearCmd}\npython3 ${shellQuote(tmpPath)}\n`);
   } catch {
-    writeToActiveTerminal(`\nclear\npython3 -m http.server ${port} --directory ${shellQuote(dir)}\n`);
+    writeToActiveTerminal(`\n${_clearCmd}\npython3 -m http.server ${port} --directory ${shellQuote(dir)}\n`);
   }
   _devServerPort = port;
   _devServerRunning = true;
@@ -19870,7 +19722,7 @@ async function _startViteServer(dir) {
     } catch { resolve(false); }
   });
 
-  writeToActiveTerminal(`\nclear\ncd ${q} && npx --yes vite --open\n`);
+  writeToActiveTerminal(`\n${_clearCmd}\ncd ${q} && npx --yes vite --open\n`);
   showToast("启动 Vite Dev Server...");
 }
 
@@ -19909,7 +19761,7 @@ async function runCurrentFile() {
     await new Promise((r) => setTimeout(r, 1800));
   }
 
-  writeToActiveTerminal(`\nclear\n${command}\n`);
+  writeToActiveTerminal(`\n${_clearCmd}\n${command}\n`);
 }
 
 async function runTask(task) {
@@ -21756,6 +21608,7 @@ if (settingsDropdown) {
     const action = item.dataset.action;
     if (action === "general-settings") openFeaturePanel("settings");
     else if (action === "shortcuts") openFeaturePanel("shortcuts");
+    else if (action === "billing") { _showBillingPanel(); }
     else if (action === "login") {
       const dlg = $("loginDialog");
       if (dlg) { _resetLoginUI(); const em = $("loginEmail"); if (em) em.value = ""; dlg.showModal(); setTimeout(() => em?.focus(), 0); }
@@ -21782,27 +21635,25 @@ function _updateLoginUI() {
   const dropHint = document.querySelector(".settings-dropdown__hint");
   const profileBtn = $("profileBtn");
   const logoutBtn = $("logoutBtn");
+  const billingBtn = $("billingBtn");
   const loginHeader = document.querySelector(".settings-dropdown__header");
-  // Gate on the ACTUAL token, not just the in-memory flag: "logged in" ⟺ a real credential exists in
-  // localStorage. So a cleared/absent token can never leave "退出登录" showing even if _loggedInEmail
-  // went stale, and a not-logged-in user (no token) is guaranteed to see 登录, not 退出登录.
   let _tok = ""; try { _tok = localStorage.getItem("michael_token") || ""; } catch (_) {}
   if (_loggedInEmail && _tok) {
     if (dropName) dropName.textContent = _loggedInEmail;
-    // Show the live plan right here (not only in the profile card) so a plan change is
-    // visible at a glance — and so it's obvious WHICH account is logged in.
     const _pn = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
     const _u = _michaelUser;
     const _active = _u && _u.plan && _u.plan !== "none" && (!_u.plan_expires_at || new Date(_u.plan_expires_at) > new Date());
     if (dropHint) dropHint.textContent = _active ? "★ " + (_pn[_u.plan] || _u.plan) + " 会员" : (_u ? "已登录 · 未开通会员" : "已登录");
     if (profileBtn) profileBtn.hidden = false;
     if (logoutBtn) logoutBtn.hidden = false;
+    if (billingBtn) billingBtn.hidden = false;
     if (loginHeader) loginHeader.dataset.action = "profile";
   } else {
     if (dropName) dropName.textContent = "未登录";
     if (dropHint) dropHint.textContent = "点击登录";
     if (profileBtn) profileBtn.hidden = true;
     if (logoutBtn) logoutBtn.hidden = true;
+    if (billingBtn) billingBtn.hidden = true;
     if (loginHeader) loginHeader.dataset.action = "login";
   }
 }
@@ -22511,25 +22362,28 @@ function _insertRefAtCursor(rel) {
     const r = box.getBoundingClientRect();
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   };
+  const _blockSelect = (e) => { e.preventDefault(); };
   document.addEventListener("mousemove", (e) => {
     if (!_rowDragCandidate) return;
     if (!_rowDragging) {
-      // Only start a drag once the pointer clearly moves — a plain click still opens/selects.
       if (Math.abs(e.clientX - _rowDragCandidate.sx) + Math.abs(e.clientY - _rowDragCandidate.sy) < 6) return;
       _rowDragging = true;
       document.body.classList.add("tree-dragging");
-      try { window.getSelection().removeAllRanges(); } catch {} // drop any selection the drag started
+      document.addEventListener("selectstart", _blockSelect, true);
+      try { window.getSelection().removeAllRanges(); } catch {}
       _rowDragGhost = document.createElement("div");
       _rowDragGhost.className = "row-drag-ghost";
       _rowDragGhost.innerHTML = `${iconImg(_rowDragCandidate.isDir ? folderIconUrl(_rowDragCandidate.name, false) : fileIconUrl(_rowDragCandidate.name))}<span></span>`;
       _rowDragGhost.querySelector("span").textContent = _rowDragCandidate.name;
       document.body.appendChild(_rowDragGhost);
     }
+    try { window.getSelection().removeAllRanges(); } catch {}
     if (_rowDragGhost) { _rowDragGhost.style.left = (e.clientX + 14) + "px"; _rowDragGhost.style.top = (e.clientY + 10) + "px"; }
     box.classList.toggle("drop-target", _overComposer(e.clientX, e.clientY));
   });
   document.addEventListener("mouseup", (e) => {
     document.body.classList.remove("tree-selecting");
+    document.removeEventListener("selectstart", _blockSelect, true);
     if (!_rowDragCandidate) return;
     const cand = _rowDragCandidate, wasDragging = _rowDragging;
     _rowDragCandidate = null; _rowDragging = false;
@@ -22537,10 +22391,9 @@ function _insertRefAtCursor(rel) {
     document.body.classList.remove("tree-dragging");
     box.classList.remove("drop-target");
     if (wasDragging) {
-      // Insert an @-reference as TEXT at the cursor so the user can write a sentence around it
-      // ("当前 @folder1 是干嘛的") — the @-mention path already injects its content/listing on send.
+      try { window.getSelection().removeAllRanges(); } catch {}
       if (_overComposer(e.clientX, e.clientY)) _insertRefAtCursor(_pathToRel(cand.path));
-      _suppressTreeClick = true; // swallow the click that fires right after the drag
+      _suppressTreeClick = true;
       setTimeout(() => { _suppressTreeClick = false; }, 80);
     }
   });
@@ -22574,7 +22427,7 @@ document.body.appendChild(_atMenu);
 // or the cache ages out (30s), and is preloaded on composer focus.
 let _fileIndex = { root: "", files: [], ts: 0, building: null };
 async function _buildFileIndex(root) {
-  const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".nuxt", ".venv", "__pycache__", ".cache", "vendor", "coverage", ".turbo", ".parcel-cache"]);
+  const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".nuxt", ".venv", "__pycache__", ".cache", "vendor", "coverage", ".turbo", ".parcel-cache", ".DS_Store"]);
   const out = [];
   const MAX = 6000, MAX_SCAN = 60000;
   let scanned = 0;
@@ -22587,10 +22440,12 @@ async function _buildFileIndex(root) {
       if (out.length >= MAX) break;
       scanned++;
       const name = e.name;
-      if (!name || name.startsWith(".")) continue;
+      if (!name || IGNORED.has(name)) continue;
       const childRel = rel ? rel + "/" + name : name;
-      if (e.is_dir) { if (!IGNORED.has(name)) stack.push({ dir: dir + "/" + name, rel: childRel }); }
-      else out.push(childRel);
+      if (e.is_dir) {
+        out.push(childRel + "/");
+        if (!IGNORED.has(name)) stack.push({ dir: dir + "/" + name, rel: childRel });
+      } else out.push(childRel);
     }
   }
   return out;
@@ -22622,7 +22477,7 @@ function _openFilesRel(root) {
 // and shorter matches win. Returns -1 for no match.
 function _fuzzyScore(q, path) {
   if (!q) return 0;
-  const p = path.toLowerCase();
+  const p = path.replace(/\/$/, "").toLowerCase();
   const base = p.slice(p.lastIndexOf("/") + 1);
   if (base.startsWith(q)) return 1000 - base.length;
   if (base.includes(q)) return 700 - base.length;
@@ -22657,14 +22512,14 @@ function _updateAtMenu() {
       // No query yet → most useful default: open files first, then a few others.
       const open = _openFilesRel(root);
       const seen = new Set(open);
-      matches = [...open, ...files.filter((f) => !seen.has(f)).slice(0, 8)].slice(0, 10);
+      matches = [...open, ...files.filter((f) => !seen.has(f)).slice(0, 12)].slice(0, 15);
     } else {
       const openSet = new Set(_openFilesRel(root));
       matches = files
         .map((f) => ({ f, s: _fuzzyScore(q, f) + (openSet.has(f) ? 60 : 0) }))
         .filter((x) => x.s > -1)
         .sort((a, b) => b.s - a.s)
-        .slice(0, 10)
+        .slice(0, 15)
         .map((x) => x.f);
     }
     if (!matches.length) return _hideAtMenu();
@@ -22673,12 +22528,13 @@ function _updateAtMenu() {
     matches.forEach((f, i) => {
       const item = document.createElement("div");
       item.className = "atmenu__item" + (i === 0 ? " is-active" : "");
-      const slash = f.lastIndexOf("/");
-      const baseName = slash >= 0 ? f.slice(slash + 1) : f;
-      const dir = slash >= 0 ? f.slice(0, slash) : "";
-      // Basename first (always visible), dir after as dim context — so a long path
-      // truncates the directory, not the filename.
-      item.innerHTML = `<b>${_escHtml(baseName)}</b>` + (dir ? ` <span style="opacity:.5;font-size:11px">${_escHtml(dir)}</span>` : "");
+      const isDir = f.endsWith("/");
+      const clean = isDir ? f.slice(0, -1) : f;
+      const slash = clean.lastIndexOf("/");
+      const baseName = slash >= 0 ? clean.slice(slash + 1) : clean;
+      const dir = slash >= 0 ? clean.slice(0, slash) : "";
+      const ico = isDir ? folderIconUrl(baseName, false) : fileIconUrl(baseName);
+      item.innerHTML = `${iconImg(ico)}<span class="at-name">${_escHtml(baseName)}${isDir ? "/" : ""}</span>` + (dir ? `<span class="at-dir">${_escHtml(dir)}</span>` : "");
       item.addEventListener("mousedown", (ev) => { ev.preventDefault(); _pickAt(i); });
       _atMenu.appendChild(item);
     });
@@ -22693,11 +22549,7 @@ function _updateAtMenu() {
 function _pickAt(i) {
   const tok = _atToken();
   if (!tok || !_atMatches[i]) return _hideAtMenu();
-  const insert = "@" + _atMatches[i] + " ";
-  // Replace just the typed "@query" span IN PLACE via a DOM range — the `promptEl.value` setter
-  // does `textContent = …`, which would flatten any existing dropped chips into plain text. Map the
-  // serialized token offsets back to DOM with the caret walker, delete that range, insert the text.
-  let replaced = false;
+  const rel = _atMatches[i].replace(/\/$/, "");
   try {
     const sel = window.getSelection();
     _ceSetCaret(tok.start);
@@ -22709,14 +22561,22 @@ function _pickAt(i) {
     range.setStart(sc, so);
     range.setEnd(b.startContainer, b.startOffset);
     range.deleteContents();
-    range.insertNode(document.createTextNode(insert));
-    replaced = true;
-  } catch {}
-  if (!replaced) { // fallback: whole-value rebuild (flattens chips, but never leaves the token unresolved)
+    const chip = _makeComposerChip(rel);
+    range.insertNode(chip);
+    let pad = chip.nextSibling;
+    if (!pad || pad.nodeType !== 3) {
+      pad = document.createTextNode("​");
+      chip.parentNode.insertBefore(pad, chip.nextSibling);
+    }
+    const after = document.createRange();
+    after.setStart(pad, 0);
+    after.collapse(true);
+    sel.removeAllRanges(); sel.addRange(after);
+  } catch {
     const v = promptEl.value;
-    promptEl.value = v.slice(0, tok.start) + insert + v.slice(tok.end);
+    promptEl.value = v.slice(0, tok.start) + "@" + rel + " " + v.slice(tok.end);
+    promptEl.setSelectionRange(tok.start + rel.length + 2);
   }
-  promptEl.setSelectionRange(tok.start + insert.length);
   _hideAtMenu();
   promptEl.focus();
   promptEl.dispatchEvent(new Event("input", { bubbles: true }));
@@ -23263,7 +23123,7 @@ async function showNewProjectDialog() {
         await new Promise((r) => setTimeout(r, 1800));
       }
       const cmd = tmpl.cmd.replace(/\{\{name\}\}/g, shellQuote(name));
-      writeToActiveTerminal(`\nclear\n${cmd}\n`);
+      writeToActiveTerminal(`\n${_clearCmd}\n${cmd}\n`);
       showToast(`正在创建 ${tmpl.name} 项目: ${name}`);
     });
     list.appendChild(row);
@@ -23934,7 +23794,8 @@ async function createTermTab(customLabel) {
       term.write("\x1b[0m\x1b[?25h");
       initDone = true;
       if (entry.backendId != null) {
-        backend.termWrite(entry.backendId, " clear\n");
+        const _clearCmd = navigator.platform && navigator.platform.startsWith("Win") ? "cls" : "clear";
+        backend.termWrite(entry.backendId, " " + _clearCmd + "\n");
       }
       entry.ready = true; // past the init clear → safe to inject a command now
     };
@@ -23993,7 +23854,10 @@ function closeTermTab(idx) {
   if (tab.backendId != null) backend.termClose(tab.backendId);
   // Release the PTY Channel's callback — it captures this tab's xterm + entry, and Tauri never frees
   // Channel callbacks, so without this every closed terminal leaks its whole xterm instance.
-  try { if (tab.channel) { tab.channel.onmessage = null; tab.channel = null; } } catch {}
+  // Release the streaming closure (avoid the xterm leak) WITHOUT nulling onmessage — Tauri's Channel
+  // calls `.onmessage.call()` on late PTY output, and null → "null is not an object" crash on close.
+  // A no-op swallows in-flight messages harmlessly (term_close below stops the PTY anyway).
+  try { if (tab.channel) { tab.channel.onmessage = () => {}; tab.channel = null; } } catch {}
   clearTimeout(_ghostTimer); // drop any pending ghost render that captured this tab
   clearTermGhost(tab);
   try { tab.webgl?.dispose(); } catch {} // release the GPU context (avoid leaking WebGL contexts)

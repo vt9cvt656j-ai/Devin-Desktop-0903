@@ -269,6 +269,29 @@ body.is-tauri.is-mac .titlebar {
 .settings-dropdown__item--danger svg { color: #ff3b30; }
 .settings-dropdown__item--danger:hover { background: rgba(255, 59, 48, .08); }
 
+/* ---- billing dialog (Material light) ---- */
+.billing-dialog { border: none; border-radius: 28px; padding: 0; width: min(560px, 92vw); max-height: 82vh; background: #fff; color: #1f1f1f; box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 1px 4px rgba(0,0,0,.08); font-family: "Google Sans", system-ui, -apple-system, sans-serif; }
+.billing-dialog::backdrop { background: rgba(0,0,0,.32); }
+.billing-dialog__inner { display: flex; flex-direction: column; max-height: 82vh; }
+.billing-dialog__header { display: flex; align-items: center; justify-content: space-between; padding: 24px 24px 16px; border-bottom: 1px solid #e8eaed; }
+.billing-dialog__header h2 { margin: 0; font-size: 22px; font-weight: 400; color: #202124; letter-spacing: 0; }
+.billing-dialog__close { background: none; border: none; color: #5f6368; font-size: 20px; cursor: pointer; padding: 8px; line-height: 1; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; transition: background .15s; }
+.billing-dialog__close:hover { background: #f1f3f4; color: #202124; }
+.billing-dialog__body { padding: 0 24px 24px; overflow-y: auto; flex: 1; }
+.billing-dialog__balance { font-size: 14px; margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 16px; display: flex; align-items: baseline; gap: 6px; color: #5f6368; }
+.billing-dialog__balance strong { font-size: 32px; font-weight: 500; color: #1a73e8; letter-spacing: -0.5px; }
+.billing-dialog__table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid #e8eaed; }
+.billing-dialog__table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.billing-dialog__table th { text-align: left; padding: 12px 16px; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: #5f6368; background: #f8f9fa; border-bottom: 1px solid #e8eaed; white-space: nowrap; }
+.billing-dialog__table td { padding: 12px 16px; border-bottom: 1px solid #f1f3f4; white-space: nowrap; color: #3c4043; }
+.billing-dialog__table tbody tr:hover { background: #f8f9fa; }
+.billing-dialog__table tbody tr:last-child td { border-bottom: none; }
+.billing-dialog__pager { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 16px 0 4px; }
+.billing-dialog__pager-btn { background: none; border: 1px solid #dadce0; color: #5f6368; width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background .15s, border-color .15s; }
+.billing-dialog__pager-btn:hover:not(:disabled) { background: #f1f3f4; border-color: #c6c9cc; color: #202124; }
+.billing-dialog__pager-btn:disabled { opacity: .3; cursor: default; }
+.billing-dialog__pager-info { font-size: 13px; color: #5f6368; min-width: 48px; text-align: center; }
+
 /* ---- titlebar menu bar (Cursor/Devin-style) ---- */
 .titlebar__menu {
   display: flex;
@@ -598,36 +621,25 @@ body.is-tauri.is-mac .titlebar {
 /* legacy single-shot think-card has its OWN blinking cursor as a ::after pseudo-element
    the .md-caret gate can't reach — kill it only when not streaming (never the live one). */
 .chat-session-container:not(.is-streaming) .think-card .think-title::after { content: none !important; }
-/* Model-reasoning ("思考过程") card — shared by the plain-chat + agent paths. Theme-aware via core
-   vars (border uses a translucent-gray fallback so it works in light AND dark; --panel-2/--text-dim
-   flip automatically). Collapsible with a rotating chevron + a "· Ns" thinking-duration badge. */
-.think-card { border: 1px solid var(--border, rgba(128,128,128,.22)); border-radius: 12px; margin: 4px 0 14px; background: var(--panel-2, #fbfbfd); overflow: hidden; transition: border-color .18s ease, box-shadow .18s ease; }
-/* Collapsed = compact chip: tighten spacing so a finish-phase run of several reads as a tidy
-   stack, not a sprawl of fat cards. */
-.think-card:not(.streaming):not([data-open="1"]) { margin: 3px 0; }
-.think-card:hover { border-color: color-mix(in srgb, var(--accent, #0a84ff) 40%, transparent); box-shadow: 0 2px 10px color-mix(in srgb, var(--accent, #0a84ff) 12%, transparent); }
-.think-head { display: flex; align-items: center; gap: 8px; padding: 9px 13px; cursor: pointer; font-size: 12.5px; font-weight: 500; color: var(--text-dim, #6e6e73); user-select: none; }
-.think-head .tk-ic { flex: 0 0 auto; display: inline-flex; color: var(--accent, #0a84ff); }
-.think-head .think-title { flex: 0 0 auto; }
-.think-head .tk-dur { flex: 1 1 auto; min-width: 0; font-size: 11px; font-weight: 400; opacity: .6; }
-.think-head .chev { flex: 0 0 auto; opacity: .5; transition: transform .25s cubic-bezier(.4,0,.2,1); }
-/* Collapsed is the DEFAULT for any settled card — it only opens while streaming live thinking
-   or when the user explicitly expands it (data-open="1"). Robust against a settle path that
-   forgets to stamp data-open="0": no attribute == collapsed, so cards never pile up expanded. */
+/* ── think-card: Google Material light ── */
+.think-card { background: #f8f9fa; border: 1px solid #e8eaed; border-radius: 12px; margin: 8px 0; overflow: hidden; transition: box-shadow .2s ease, border-color .2s ease; }
+.think-card:not(.streaming):not([data-open="1"]) { margin: 4px 0; }
+.think-card:hover { border-color: #d2e3fc; box-shadow: 0 1px 6px rgba(60,64,67,.1); }
+.think-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer; font-size: 13px; font-weight: 500; color: #5f6368; user-select: none; font-family: "Google Sans", system-ui, -apple-system, sans-serif; }
+.think-head .tk-ic { flex: 0 0 auto; display: inline-flex; color: #1a73e8; }
+.think-head .think-title { flex: 0 0 auto; color: #1a73e8; }
+.think-head .tk-dur { flex: 1 1 auto; min-width: 0; font-size: 11.5px; font-weight: 400; color: #80868b; }
+.think-head .chev { flex: 0 0 auto; color: #80868b; transition: transform .25s cubic-bezier(.4,0,.2,1); }
 .think-card:not(.streaming):not([data-open="1"]) .think-head .chev { transform: rotate(-90deg); }
-.think-body { padding: 0 14px 12px; font-size: 12.5px; line-height: 1.65; color: var(--text-dim, #6e6e73); word-break: break-word; overflow-wrap: anywhere; max-height: 340px; overflow-y: auto; overflow-x: hidden; transition: max-height .28s cubic-bezier(.4,0,.2,1), opacity .2s ease, padding .2s ease; scroll-behavior: smooth; }
-/* Settled cards collapse to a compact CHIP — just the head ("💡 已思考 · Ns"), no body preview — so
-   consecutive thinking (merged into one) reads as a single unobtrusive line, never a pile of visible
-   text. The duration in the head shows it DID think (so it doesn't feel absent); click to expand the
-   full chain (data-open="1"). `settleReasoning` stamps data-open="0", which this matches. */
+.think-body { padding: 0 14px 12px; font-size: 13px; line-height: 1.7; color: #3c4043; word-break: break-word; overflow-wrap: anywhere; max-height: 400px; overflow-y: auto; overflow-x: hidden; transition: max-height .28s cubic-bezier(.4,0,.2,1), opacity .2s ease, padding .2s ease; scroll-behavior: smooth; }
 .think-card:not(.streaming):not([data-open="1"]) .think-body { max-height: 0; opacity: 0; overflow: hidden; padding-top: 0; padding-bottom: 0; }
 .think-body > :first-child { margin-top: 0; }
 .think-body > :last-child { margin-bottom: 0; }
-/* Nothing inside a thinking card may push past the right edge: long code lines / paths wrap
-   instead of clipping under the card's overflow:hidden. */
-.think-body pre { white-space: pre-wrap; word-break: break-word; }
+.think-body pre { white-space: pre-wrap; word-break: break-word; background: #fff; border: 1px solid #e8eaed; border-radius: 8px; padding: 10px 12px; }
 .think-body pre, .think-body code, .think-body p, .think-body li { overflow-wrap: anywhere; max-width: 100%; }
-.think-card.streaming .think-title::after { content: ""; display: inline-block; width: 5px; height: 13px; margin-left: 5px; vertical-align: -2px; background: var(--accent, #0a84ff); border-radius: 1px; animation: think-blink 1.1s steps(2, start) infinite; }
+.think-body code { background: #e8eaed; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.think-body pre code { background: none; padding: 0; border-radius: 0; }
+.think-card.streaming .think-title::after { content: ""; display: inline-block; width: 5px; height: 14px; margin-left: 6px; vertical-align: -2px; background: #1a73e8; border-radius: 1.5px; animation: think-blink 1.1s steps(2, start) infinite; }
 @keyframes think-blink { 50% { opacity: 0; } }
 
 .panel__head {
@@ -2672,6 +2684,8 @@ body.zen-mode .editor {
 .agent-plan__row--actionable:hover { background: rgba(217, 48, 37, 0.08); }
 .agent-plan__row--actionable:hover .agent-plan__cancelhint { opacity: 1; }
 .agent-plan__row--done, .agent-plan__row--cancelled { opacity: .55; text-decoration: line-through; }
+.agent-plan__row--restorable { cursor: pointer; opacity: .7; }
+.agent-plan__row--restorable:hover { opacity: 1; text-decoration: none; background: rgba(207, 106, 28, 0.08); }
 .agent-plan__txt { flex: 1 1 auto; min-width: 0; word-break: break-word; }
 .agent-plan__cancelhint { flex: 0 0 auto; font-size: 11px; color: #d93025; opacity: 0; white-space: nowrap; transition: opacity .12s ease; }
 .agent-plan__tag { flex: 0 0 auto; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: rgba(207, 106, 28, 0.14); color: #cf6a1c; }
@@ -7091,23 +7105,30 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 /* @file mention dropdown in the chat composer. */
 .atmenu {
   position: fixed; z-index: 9999;
-  max-height: 240px; overflow-y: auto;
-  padding: 4px;
-  border-radius: 9px;
-  background: var(--panel, #1e1e22);
-  border: 1px solid var(--border, rgba(128, 128, 128, 0.35));
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  max-height: 320px; overflow-y: auto;
+  padding: 6px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
 }
 .atmenu__item {
-  padding: 6px 10px;
-  border-radius: 6px;
-  font-size: 12px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
   cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  color: var(--text, #ddd);
+  color: #1f1f1f;
+  transition: background .1s;
 }
+.atmenu__item img { width: 16px; height: 16px; flex: 0 0 16px; }
+.atmenu__item .at-name { font-weight: 500; }
+.atmenu__item .at-dir { font-size: 11px; color: #888; margin-left: auto; padding-left: 12px; }
 .atmenu__item.is-active,
-.atmenu__item:hover { background: var(--accent, #0a84ff); color: #fff; }
+.atmenu__item:hover { background: #f0f4ff; color: #1a73e8; }
+.atmenu__item.is-active .at-dir,
+.atmenu__item:hover .at-dir { color: #5f96e8; }
 
 /* ---- Devin session mode ---- */
 .devin-status {
@@ -7696,6 +7717,7 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
 /* Floating ghost that follows the cursor while dragging a tree item onto the composer. */
 body.tree-dragging { cursor: grabbing; }
 body.tree-dragging * { cursor: grabbing !important; }
+body.tree-dragging [contenteditable], body.tree-dragging .chat-messages, body.tree-dragging .msg-seg, body.tree-dragging .agent-seg { pointer-events: none !important; }
 /* While a tree row is pressed/dragged, block text selection everywhere (open files, chat, etc.). */
 body.tree-selecting, body.tree-selecting * { user-select: none !important; -webkit-user-select: none !important; }
 .row-drag-ghost {

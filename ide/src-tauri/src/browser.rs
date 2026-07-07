@@ -98,6 +98,7 @@ fn launch() -> Result<Session, String> {
     // browser stays signed in next time — instead of a clean, logged-out browser every
     // run. (This is plain cookie persistence, like any normal browser profile.)
     let profile_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| std::path::PathBuf::from(h).join(".michael-ide").join("browser-profile"));
     if let Some(ref p) = profile_dir {
         let _ = std::fs::create_dir_all(p);
@@ -339,9 +340,20 @@ fn is_dead_browser(e: &str) -> bool {
 #[tauri::command]
 pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
     let url = url.trim().to_string();
-    let url = if url.starts_with("http://") || url.starts_with("https://") {
+    // Don't mangle URLs that already carry a scheme — the old code did `https://{url}` for anything
+    // not http(s), turning `file:///D:/x.html` into `https://file:///D:/x.html` (看本地 html 就废了).
+    let url = if url.starts_with("http://") || url.starts_with("https://")
+        || url.starts_with("file://") || url.starts_with("about:") || url.starts_with("data:")
+    {
         url
+    } else if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic() {
+        // Windows drive path (D:\… or D:/…) → open as a local file
+        format!("file:///{}", url.replace('\\', "/"))
+    } else if url.starts_with('/') {
+        // Unix absolute path (/Users/…/x.html) → local file
+        format!("file://{url}")
     } else {
+        // bare host / domain → default to https
         format!("https://{url}")
     };
     with_tab(move |tab| {
@@ -495,4 +507,51 @@ pub async fn browser_close() -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Synchronous close — called from cleanup_stale on webview reload / app exit.
+pub fn close_all() {
+    if let Ok(mut g) = BROWSER.lock() {
+        *g = None;
+    }
+}
+
+/// Kill orphaned Chrome processes from previous IDE sessions.
+/// headless_chrome spawns a process tree (main + GPU + renderer + utility); if the IDE
+/// crashes or the webview reloads without dropping the Session, the children become
+/// permanent zombies. We sweep for any Chrome whose profile dir matches our temp/persistent
+/// patterns and was NOT launched by the current process.
+pub fn kill_orphaned_browsers() {
+    std::thread::spawn(|| {
+        #[cfg(not(windows))]
+        {
+            let my_pid = std::process::id().to_string();
+            let out = match std::process::Command::new("pgrep")
+                .args(["-f", "rust-headless-chrome-profile|michael-ide-browser"])
+                .output()
+            {
+                Ok(o) => o,
+                Err(_) => return,
+            };
+            let pids: Vec<&str> = std::str::from_utf8(&out.stdout)
+                .unwrap_or("")
+                .lines()
+                .filter(|p| !p.is_empty() && *p != my_pid)
+                .collect();
+            for pid in &pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .output();
+            }
+            if !pids.is_empty() {
+                eprintln!("[browser] killed {} orphaned Chrome process(es)", pids.len());
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/FI", "IMAGENAME eq chrome.exe", "/FI", "WINDOWTITLE eq rust-headless*"])
+                .output();
+        }
+    });
 }
