@@ -2471,6 +2471,29 @@ body.zen-mode .editor {
 .agent-tool-step--read .atc-type-icon { background: #e6f4ea; color: #188038; }
 .agent-tool-step--cmd .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
 .agent-tool-step--list .atc-type-icon { background: #f3e8fd; color: #8430ce; }
+.agent-tool-step--edit .atc-type-icon { background: #feefe3; color: #e8710a; }
+.agent-tool-step--search .atc-type-icon,
+.agent-tool-step--find .atc-type-icon,
+.agent-tool-step--websearch .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
+.agent-tool-step--git .atc-type-icon { background: #fce8e6; color: #d93025; }
+.agent-tool-step--delete .atc-type-icon { background: #fce8e6; color: #d93025; }
+.agent-tool-step--think .atc-type-icon,
+.agent-tool-step--memory .atc-type-icon { background: #fef7e0; color: #b8860b; }
+.agent-tool-step--web .atc-type-icon,
+.agent-tool-step--http .atc-type-icon { background: #e0f2f1; color: #00796b; }
+.agent-tool-step--browser .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
+.agent-tool-step--screenshot .atc-type-icon { background: #f3e8fd; color: #7b1fa2; }
+.agent-tool-step--download .atc-type-icon { background: #e8f0fe; color: #1565c0; }
+.agent-tool-step--current_time .atc-type-icon { background: #fff3e0; color: #e65100; }
+.agent-tool-step--game_scaffold .atc-type-icon { background: #e8f5e9; color: #2e7d32; }
+.agent-tool-step--game_asset .atc-type-icon { background: #e3f2fd; color: #1565c0; }
+.agent-tool-step--deep_search .atc-type-icon { background: #ede7f6; color: #4527a0; }
+.agent-tool-step--ksearch .atc-type-icon { background: #e0f2f1; color: #00897b; }
+.agent-tool-step--mcp .atc-type-icon { background: #fce4ec; color: #c62828; }
+.agent-tool-step--computer .atc-type-icon,
+.agent-tool-step--system .atc-type-icon { background: #e3f2fd; color: #1565c0; }
+.agent-tool-step--db .atc-type-icon { background: #fff8e1; color: #f57f17; }
+.agent-tool-step--askuser .atc-type-icon { background: #e8f0fe; color: #1a73e8; }
 .atc-type-icon svg { width: 13px; height: 13px; }
 
 /* Language badge (used inside viewport) */
@@ -2543,9 +2566,10 @@ body.zen-mode .editor {
   font-family: var(--atc-mono); font-size: 11px; font-weight: 600; color: var(--atc-dim);
   /* Was flex-shrink:0 → the meta badge kept its full width and SQUEEZED the filename/title
      (even wrapping "读取"). Now it shrinks + caps at ~half the row so the title always wins. */
-  flex-shrink: 1; min-width: 0; max-width: 50%; overflow: hidden;
+  flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
   display: flex; align-items: center; gap: 4px;
   padding: 3px 10px; border-radius: 999px;
+  white-space: nowrap; text-overflow: ellipsis;
 }
 .atc-result svg { flex: none; }
 .atc-result__t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2566,11 +2590,46 @@ body.zen-mode .editor {
 .atc-result--ok {
   color: var(--atc-success); background: #e6f4ea;
 }
+.atc-result--title {
+  color: var(--atc-text, #1d1d1f);
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  font-size: 12px; font-weight: 600;
+  padding: 0 4px;
+}
 .atc-result--err {
   color: var(--atc-danger); background: #fce8e6;
 }
 .atc-result--pending {
   color: var(--atc-accent); background: #e8f0fe;
+}
+/* Telegram-style link preview card below browser screenshots */
+.browser-url-card {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; margin-top: -1px;
+  background: rgba(128,128,128,.04);
+  border: 1px solid rgba(128,128,128,.2);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  overflow: hidden;
+}
+.browser-url-card__bar {
+  width: 3px; align-self: stretch; min-height: 24px;
+  border-radius: 1.5px; background: #4a9eff; flex-shrink: 0;
+}
+.browser-url-card__text {
+  flex: 1; min-width: 0; overflow: hidden;
+}
+.browser-url-card__title {
+  display: block; font-size: 12px; font-weight: 600; line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.browser-url-card__host {
+  display: block; font-size: 11px; opacity: .45; line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+[data-theme="dark"] .browser-url-card, .dark .browser-url-card {
+  background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.1);
 }
 /* "Undo" sits inside the result pill after a write/edit — render it as a subtle
    inline action (divider + link), not a raw OS button. */
@@ -2629,32 +2688,79 @@ body.zen-mode .editor {
 .agent-tool-step--askuser .atc-type-icon { color: #1a73e8; }
 .agent-tool-step--askuser .atc-action { color: var(--text-dim); }
 .agent-tool-step--askuser > .atc-viewport { display: block !important; background: transparent; }
+/* ── ask_user card ── */
 .au-card { padding: 14px 16px; }
 .au-q { font-size: 14px; font-weight: 600; color: var(--text); margin: 0 0 13px; line-height: 1.5; }
 .au-opt {
-  display: block; width: 100%; text-align: left; margin: 7px 0; padding: 11px 14px;
-  border: 1px solid rgba(128, 128, 128, 0.22); border-radius: 10px;
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; margin: 6px 0; padding: 10px 14px;
+  border: 1px solid var(--line); border-radius: 10px;
   background: var(--panel); color: var(--text); cursor: pointer;
-  font-size: 13px; line-height: 1.4; transition: background .13s ease, border-color .13s ease, color .13s ease;
+  font-size: 13px; line-height: 1.4; transition: background .13s ease, border-color .13s ease, color .13s ease, box-shadow .13s ease;
 }
-.au-opt:hover { background: #e8f0fe; border-color: #1a73e8; color: #1557b0; }
+.au-opt:hover { background: var(--sel); border-color: var(--accent); box-shadow: 0 1px 4px rgba(10,132,255,.1); }
+.au-badge {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center;
+  background: var(--sel); color: var(--accent); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.au-opt:hover .au-badge { background: var(--accent); color: #fff; }
+.au-timer { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.au-timer b { color: var(--text); font-weight: 600; }
 .au-row { display: flex; gap: 8px; margin-top: 13px; }
 .au-custom {
   flex: 1; min-width: 0; height: 38px; padding: 0 14px;
-  border: 1px solid rgba(128, 128, 128, 0.3); border-radius: 19px;
+  border: 1px solid var(--line-strong); border-radius: 19px;
   background: var(--panel-solid); color: var(--text); font-size: 13px;
 }
 .au-custom::placeholder { color: var(--text-dim); }
-.au-custom:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.18); }
+.au-custom:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--sel); }
 .au-send {
   height: 38px; padding: 0 20px; border: none; border-radius: 19px;
-  background: #1a73e8; color: #fff; cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
+  background: var(--accent); color: #fff; cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
   transition: background .13s ease;
 }
-.au-send:hover { background: #1557b0; }
-.au-auto { display: inline-block; margin-top: 12px; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12.5px; padding: 4px 0; }
-.au-auto:hover { color: #1a73e8; }
+.au-send:hover { opacity: .88; }
+.au-opt--rec { border-color: var(--accent); background: var(--sel); }
+.au-rec {
+  margin-left: auto; flex-shrink: 0; padding: 1px 7px; border-radius: 4px;
+  background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+}
+.au-check {
+  flex-shrink: 0; width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid var(--line-strong);
+  background: var(--panel-solid); transition: background .12s, border-color .12s;
+}
+.au-opt--checked .au-check { background: var(--accent); border-color: var(--accent); }
+.au-confirm-row { margin-top: 14px; }
+.au-confirm-warn { display: block; font-size: 12px; color: #d93025; font-weight: 600; margin-bottom: 6px; }
+.au-send--danger { background: #d93025; }
+.au-send--danger:hover { opacity: .88; }
+.au-send--danger:disabled { background: var(--line-strong); opacity: .5; }
+.au-auto { display: inline-block; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 4px 0; }
+.au-auto:hover { color: var(--accent); }
 .au-done { padding: 12px 16px; font-size: 13px; color: #34a853; font-weight: 500; }
+
+/* ── background_monitor card ── */
+@keyframes bm-pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+.bm-card { padding: 14px 16px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
+.bm-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.bm-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: bm-pulse 1.6s ease-in-out infinite; flex-shrink: 0; }
+.bm-dot.done { background: #34a853; animation: none; }
+.bm-dot.timeout { background: #f0a030; animation: none; }
+.bm-dot.cancelled { background: var(--text-dim); animation: none; }
+.bm-msg { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; line-height: 1.4; }
+.bm-meta { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1.6; }
+.bm-bar { height: 3px; border-radius: 2px; background: var(--line); margin-top: 10px; overflow: hidden; }
+.bm-fill { height: 100%; border-radius: 2px; background: var(--accent); transition: width .3s linear; }
+.bm-fill.timeout { background: #f0a030; }
+.bm-actions { display: flex; gap: 8px; margin-top: 10px; }
+.bm-btn {
+  padding: 5px 14px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); cursor: pointer; font-size: 12px;
+  transition: background .13s ease, border-color .13s ease;
+}
+.bm-btn:hover { border-color: var(--accent); color: var(--accent); }
+.bm-btn--primary { background: var(--accent); color: #fff; border-color: transparent; }
+.bm-btn--primary:hover { opacity: .88; color: #fff; }
+.bm-btn:disabled { opacity: .5; cursor: default; }
 
 /* Task plan card — Google-style light, inline (not pinned at top), click a row to cancel.
    Uses the IDE's own tokens so it tracks light/dark; blue #1a73e8 only as accent. */
@@ -3188,13 +3294,56 @@ body.zen-mode .editor {
 [data-theme="dark"] .agent-tool-step--write .atc-type-icon,
 .dark .agent-tool-step--write .atc-type-icon,
 [data-theme="dark"] .agent-tool-step--multiedit .atc-type-icon,
-.dark .agent-tool-step--multiedit .atc-type-icon { background: #cf6a1c1a; }
+.dark .agent-tool-step--multiedit .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--edit .atc-type-icon,
+.dark .agent-tool-step--edit .atc-type-icon { background: #cf6a1c1a; }
 [data-theme="dark"] .agent-tool-step--read .atc-type-icon,
 .dark .agent-tool-step--read .atc-type-icon { background: #3fb9501a; }
 [data-theme="dark"] .agent-tool-step--cmd .atc-type-icon,
 .dark .agent-tool-step--cmd .atc-type-icon { background: #58a6ff1a; }
 [data-theme="dark"] .agent-tool-step--list .atc-type-icon,
 .dark .agent-tool-step--list .atc-type-icon { background: #bc8cff1a; }
+[data-theme="dark"] .agent-tool-step--search .atc-type-icon,
+.dark .agent-tool-step--search .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--find .atc-type-icon,
+.dark .agent-tool-step--find .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--websearch .atc-type-icon,
+.dark .agent-tool-step--websearch .atc-type-icon { background: #58a6ff1a; }
+[data-theme="dark"] .agent-tool-step--git .atc-type-icon,
+.dark .agent-tool-step--git .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--delete .atc-type-icon,
+.dark .agent-tool-step--delete .atc-type-icon { background: #f851491a; }
+[data-theme="dark"] .agent-tool-step--think .atc-type-icon,
+.dark .agent-tool-step--think .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--memory .atc-type-icon,
+.dark .agent-tool-step--memory .atc-type-icon { background: #e3b3411a; }
+[data-theme="dark"] .agent-tool-step--web .atc-type-icon,
+.dark .agent-tool-step--web .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--http .atc-type-icon,
+.dark .agent-tool-step--http .atc-type-icon { background: #4db6ac1a; }
+[data-theme="dark"] .agent-tool-step--browser .atc-type-icon,
+.dark .agent-tool-step--browser .atc-type-icon { background: #66bb6a1a; }
+[data-theme="dark"] .agent-tool-step--screenshot .atc-type-icon,
+.dark .agent-tool-step--screenshot .atc-type-icon { background: #ce93d81a; }
+[data-theme="dark"] .agent-tool-step--current_time .atc-type-icon,
+.dark .agent-tool-step--current_time .atc-type-icon { background: #ff98001a; }
+[data-theme="dark"] .agent-tool-step--game_scaffold .atc-type-icon,
+.dark .agent-tool-step--game_scaffold .atc-type-icon { background: #4caf501a; }
+[data-theme="dark"] .agent-tool-step--game_asset .atc-type-icon,
+.dark .agent-tool-step--game_asset .atc-type-icon { background: #42a5f51a; }
+[data-theme="dark"] .agent-tool-step--deep_search .atc-type-icon,
+.dark .agent-tool-step--deep_search .atc-type-icon { background: #7c4dff1a; }
+[data-theme="dark"] .agent-tool-step--ksearch .atc-type-icon,
+.dark .agent-tool-step--ksearch .atc-type-icon { background: #26a69a1a; }
+[data-theme="dark"] .agent-tool-step--mcp .atc-type-icon,
+.dark .agent-tool-step--mcp .atc-type-icon { background: #ef53501a; }
+[data-theme="dark"] .agent-tool-step--computer .atc-type-icon,
+.dark .agent-tool-step--computer .atc-type-icon,
+[data-theme="dark"] .agent-tool-step--system .atc-type-icon,
+.dark .agent-tool-step--system .atc-type-icon { background: #42a5f51a; }
+[data-theme="dark"] .agent-tool-step--db .atc-type-icon,
+.dark .agent-tool-step--db .atc-type-icon { background: #fbc02d1a; }
+[data-theme="dark"] .atc-result--title, .dark .atc-result--title { color: #e6edf3; }
 [data-theme="dark"] .atc-diff-row--add,
 .dark .atc-diff-row--add { background: rgba(63,185,80,.08); border-left-color: #3fb950; }
 [data-theme="dark"] .atc-diff-row--add:hover,

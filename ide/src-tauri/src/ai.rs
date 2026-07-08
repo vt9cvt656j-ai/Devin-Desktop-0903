@@ -677,35 +677,23 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
         }
     }
 
-    // Redirects disabled so a 3xx can't silently bounce us to a link-local /
-    // metadata address; the redirect is surfaced to the model so it can choose to
-    // follow it (which re-runs ip_fetch_allowed on the new URL).
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(6)) // fail fast on a SYN black-hole (Windows)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(6))
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
 
     let resp = client
         .get(parsed)
-        .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,zh-CN;q=0.8")
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
     let status = resp.status();
-    if status.is_redirection() {
-        let loc = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("(unknown)");
-        return Ok(format!(
-            "[{} 重定向到: {loc}\n如需跟进，请用该完整 URL 再次调用 web_fetch。]",
-            status.as_u16()
-        ));
-    }
     if !status.is_success() {
         return Err(format!("HTTP {}", status.as_u16()));
     }
@@ -837,8 +825,8 @@ pub async fn web_search(query: String) -> Result<String, String> {
             "「{q}」这次没搜到结果（搜索引擎临时限流/反爬，或关键词太宽泛）。**别停在这里——主动操控浏览器自己搜**：① 换更具体的英文关键词，多调几次 web_search；② 用 browser navigate 打开 https://www.bing.com/search?q=... 或 https://duckduckgo.com/?q=... 亲自看结果、点进去用 browser/ web_fetch 读全文；③ 直接 web_fetch 你已知的官方文档 / 仓库 README / API 页读原文。至少换 2 个来源交叉验证再下结论。"
         ));
     }
-    let mut out = format!("搜索「{q}」的结果：\n");
-    for (i, (title, url, snippet)) in results.iter().take(8).enumerate() {
+    let mut out = format!("搜索「{q}」的结果（Bing+DuckDuckGo 合并去重）：\n");
+    for (i, (title, url, snippet)) in results.iter().take(12).enumerate() {
         out.push_str(&format!(
             "\n{}. {}\n   {}\n   {}\n",
             i + 1,
@@ -851,24 +839,25 @@ pub async fn web_search(query: String) -> Result<String, String> {
     Ok(out)
 }
 
-/// Race several search endpoints CONCURRENTLY and return the FIRST NON-EMPTY result set.
-/// The old code tried 6 attempts SEQUENTIALLY (html-DDG×2 UA → Bing×2 → lite×2), each with a
-/// 15s timeout, so a couple of slow/blocked engines stacked into ~90s of dead waiting — the
-/// "联网搜索卡顿/太久" the user hit. Racing means the tier finishes as soon as the fastest good
-/// source answers (typically 1-2s), hard-capped at the per-request 8s below.
+/// Run ALL search engines concurrently, MERGE and deduplicate results.
+/// Bing goes first in merge order (usually better quality, especially for Chinese),
+/// then DuckDuckGo HTML, then DDG Lite. Each engine has its own 8s timeout so the
+/// total wall-clock is max ~8s (all run in parallel).
 async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
-    let mut racing: futures_util::stream::FuturesUnordered<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, String, String)>> + Send>>,
-    > = futures_util::stream::FuturesUnordered::new();
-    racing.push(Box::pin(scrape_ddg_html(q.to_string())));
-    racing.push(Box::pin(scrape_bing(q.to_string())));
-    racing.push(Box::pin(scrape_ddg_lite(q.to_string())));
-    while let Some(r) = racing.next().await {
-        if !r.is_empty() {
-            return r; // first engine to come back with results wins; losers are dropped
+    let (google, bing, ddg, lite) = tokio::join!(
+        scrape_google(q.to_string()),
+        scrape_bing(q.to_string()),
+        scrape_ddg_html(q.to_string()),
+        scrape_ddg_lite(q.to_string()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for r in google.into_iter().chain(bing).chain(ddg).chain(lite) {
+        if seen.insert(r.1.clone()) {
+            merged.push(r);
         }
     }
-    Vec::new()
+    merged
 }
 
 const SEARCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -905,17 +894,111 @@ async fn scrape_bing(q: String) -> Vec<(String, String, String)> {
         Some(c) => c,
         None => return Vec::new(),
     };
-    let url = format!("https://www.bing.com/search?q={}&setlang=en", urlencoding(&q));
+    let has_cjk = q.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3040}'..='\u{30ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c));
+    let (domain, lang) = if has_cjk {
+        ("cn.bing.com", "zh-CN,zh;q=0.9,en;q=0.8")
+    } else {
+        ("www.bing.com", "en-US,en;q=0.9")
+    };
+    let url = format!("https://{domain}/search?q={}", urlencoding(&q));
     let resp = client
         .get(&url)
         .header(reqwest::header::USER_AGENT, SEARCH_UA)
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header(reqwest::header::ACCEPT_LANGUAGE, lang)
         .send()
         .await;
     match resp {
         Ok(r) => r.text().await.map(|h| parse_bing(&h)).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
+}
+
+async fn scrape_google(q: String) -> Vec<(String, String, String)> {
+    let client = match search_client() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let url = format!("https://www.google.com/search?q={}&num=10&hl=zh-CN", urlencoding(&q));
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, SEARCH_UA)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.text().await.map(|h| parse_google(&h)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_google(html: &str) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    let mut pos = 0;
+    while let Some(div_start) = html[pos..].find("<div class=\"g\"") {
+        let abs = pos + div_start;
+        let chunk_end = html[abs..].find("</div>").map(|e| abs + e + 6).unwrap_or(html.len().min(abs + 3000));
+        let chunk = &html[abs..chunk_end];
+
+        let title = extract_between(chunk, "<h3", "</h3>")
+            .map(|t| strip_tags(t))
+            .unwrap_or_default();
+        let url = extract_between(chunk, "<a href=\"/url?q=", "&")
+            .map(|s| s.to_string())
+            .or_else(|| extract_between(chunk, "<a href=\"http", "\"").map(|u| format!("http{u}")))
+            .unwrap_or_default()
+            .replace("&amp;", "&");
+        let snippet = extract_between(chunk, "<span class=\"", "</span>")
+            .map(|s| {
+                let inner = s.find('>').map(|i| &s[i+1..]).unwrap_or(s);
+                strip_tags(inner)
+            })
+            .unwrap_or_default();
+
+        if !title.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
+            results.push((title, url, snippet));
+        }
+        pos = chunk_end;
+        if results.len() >= 10 { break; }
+    }
+    if results.is_empty() {
+        let mut pos2 = 0;
+        while let Some(a_start) = html[pos2..].find("<a href=\"/url?q=") {
+            let abs2 = pos2 + a_start + 16;
+            if let Some(end) = html[abs2..].find('&') {
+                let raw = &html[abs2..abs2+end];
+                let url = percent_decode_str(raw);
+                if url.starts_with("http") && !url.contains("google.com") && !url.contains("accounts.google") {
+                    let title = extract_between(&html[abs2..], ">", "</a>")
+                        .map(|t| strip_tags(t))
+                        .unwrap_or_else(|| url.clone());
+                    if !title.is_empty() {
+                        results.push((title, url, String::new()));
+                    }
+                }
+            }
+            pos2 = abs2 + 10;
+            if results.len() >= 10 { break; }
+        }
+    }
+    results
+}
+
+fn extract_between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = hay.find(open)? + open.len();
+    let end = hay[start..].find(close)? + start;
+    Some(&hay[start..end])
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' { in_tag = true; }
+        else if c == '>' { in_tag = false; }
+        else if !in_tag { out.push(c); }
+    }
+    out.trim().to_string()
 }
 
 async fn scrape_ddg_lite(q: String) -> Vec<(String, String, String)> {

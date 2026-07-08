@@ -211,6 +211,154 @@ pub async fn download_file(root: String, url: String, dest: String) -> Result<St
     Ok(format!("已下载 {n} 字节到 {}", target.display()))
 }
 
+/// True when something is already listening on the local Tor SOCKS5 port.
+async fn tor_port_up() -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(("127.0.0.1", 9050)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+/// Make sure the local Tor SOCKS5 proxy is up. If it's not, launch the installed `tor`
+/// binary in the background and wait for it to bootstrap — so the deep-web tools "just
+/// work" and self-heal instead of silently returning nothing whenever Tor is stopped.
+/// (This is the fix for "不知道深网工具有没有用" — it can no longer be silently dead.)
+pub async fn ensure_tor() -> Result<(), String> {
+    if tor_port_up().await {
+        return Ok(());
+    }
+    // Find the tor binary — Finder's minimal PATH omits Homebrew, so probe known locations.
+    let bin = ["/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            crate::process_util::augmented_path(None)
+                .split(':')
+                .map(|d| format!("{d}/tor"))
+                .find(|c| std::path::Path::new(c).exists())
+        });
+    let bin = match bin {
+        Some(b) => b,
+        None => return Err("Tor 未安装——深网/.onion 访问需要它。装一下：brew install tor（装完自动就能用，会自愈启动）".into()),
+    };
+    // Launch detached; tor keeps running in the background after we drop the handle.
+    std::process::Command::new(&bin)
+        .args(["--SocksPort", "9050", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动 tor 失败: {e}"))?;
+    // Wait for bootstrap (a cold Tor start builds circuits — up to ~30s).
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if tor_port_up().await {
+            return Ok(());
+        }
+    }
+    Err("tor 已拉起但 30s 内未就绪（网络慢/被墙？）——稍等片刻再试，或手动 brew services start tor".into())
+}
+
+/// Make an HTTP request through the local Tor SOCKS5 proxy (127.0.0.1:9050).
+/// Supports .onion URLs and regular URLs (anonymized through Tor).
+/// Auto-starts `tor` if it isn't already running (self-heal).
+#[tauri::command]
+pub async fn tor_request(
+    method: String,
+    url: String,
+    headers: Option<HashMap<String, String>>,
+    body: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<HttpResponse, String> {
+    let trimmed = url.trim();
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| "无效的 URL".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("只允许 http/https 链接".into()),
+    }
+    let m = method.trim().to_uppercase();
+    let method =
+        reqwest::Method::from_bytes(m.as_bytes()).map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
+    let to = timeout_secs.unwrap_or(60).clamp(1, 300);
+
+    // Self-heal: make sure Tor is up (auto-launch it if the user's service is stopped).
+    ensure_tor().await?;
+
+    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9050")
+        .map_err(|e| format!("Tor 代理配置失败: {e}"))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(to))
+        .build()
+        .map_err(|e| format!("构建 Tor 客户端失败（tor 是否在运行？brew services start tor）: {e}"))?;
+
+    let mut req = client
+        .request(method, parsed)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0");
+    if let Some(hs) = headers {
+        for (k, v) in hs {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        if e.is_connect() {
+            format!("Tor 连接失败——确认 tor 在运行：brew services start tor（原始错误: {e}）")
+        } else {
+            e.to_string()
+        }
+    })?;
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut hmap = HashMap::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(s) = v.to_str() {
+            hmap.insert(k.as_str().to_string(), s.to_string());
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if buf.len() + chunk.len() > MAX_BODY {
+            let take = MAX_BODY.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..take]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let body_text = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => format!("[二进制响应，{} 字节，未作为文本返回]", e.into_bytes().len()),
+    };
+
+    Ok(HttpResponse {
+        status: status.as_u16(),
+        ok: status.is_success(),
+        status_text: status.canonical_reason().unwrap_or("").to_string(),
+        headers: hmap,
+        body: body_text,
+        truncated,
+        content_type,
+    })
+}
+
 /// Generate an image through the user's OpenAI-compatible gateway.
 /// Dedicated image-generation models (gpt-image-*, dall-e-*) → /images/generations API.
 /// Chat-based image models (gpt-4o-image, gemini-flash-image, etc.) → /chat/completions.

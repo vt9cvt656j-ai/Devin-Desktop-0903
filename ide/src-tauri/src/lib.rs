@@ -8,7 +8,10 @@ mod db;
 mod debug;
 mod extensions;
 mod files;
+mod game;
+mod game_assets;
 mod git;
+mod knowledge;
 mod lsp;
 mod marketplace;
 mod mcp;
@@ -20,6 +23,7 @@ mod sysctl;
 mod tasks;
 mod terminal;
 mod watcher;
+mod web_scaffold;
 
 /// Reap any backend processes left over from a previous page session. The
 /// frontend calls this once on startup, so a webview reload (common during dev)
@@ -100,6 +104,15 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
+            // Enable devtools in all builds (debug + release)
+            #[cfg(desktop)]
+            {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    w.open_devtools();
+                }
+            }
+
             files::bootstrap_home_root();
 
             tauri::async_runtime::spawn(async {
@@ -163,6 +176,7 @@ pub fn run() {
             ai::web_fetch,
             ai::web_search,
             net::http_request,
+            net::tor_request,
             net::download_file,
             net::generate_image_chat,
             proxy::proxy_available,
@@ -189,6 +203,8 @@ pub fn run() {
             browser::browser_set_marks,
             browser::browser_scroll,
             browser::browser_wait,
+            browser::browser_cookies,
+            browser::browser_storage,
             browser::browser_close,
             sysctl::system_open_app,
             sysctl::system_list_apps,
@@ -240,6 +256,66 @@ pub fn run() {
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
             automation::automation_call,
+            knowledge::academic_search,
+            knowledge::package_search,
+            knowledge::github_search,
+            knowledge::cve_search,
+            knowledge::wiki_search,
+            knowledge::stackoverflow_search,
+            knowledge::hackernews_search,
+            knowledge::dockerhub_search,
+            knowledge::pubmed_search,
+            knowledge::arxiv_search,
+            knowledge::crossref_search,
+            knowledge::openalex_search,
+            knowledge::pubchem_search,
+            knowledge::clinical_trials_search,
+            knowledge::gitlab_search,
+            knowledge::gitee_search,
+            knowledge::maven_search,
+            knowledge::packagist_search,
+            knowledge::rubygems_search,
+            knowledge::nuget_search,
+            knowledge::homebrew_search,
+            knowledge::mdn_search,
+            knowledge::cdnjs_search,
+            knowledge::bundlephobia_search,
+            knowledge::devto_search,
+            knowledge::reddit_search,
+            knowledge::steam_search,
+            knowledge::iconify_search,
+            knowledge::color_search,
+            knowledge::lobsters_search,
+            knowledge::juejin_search,
+            knowledge::codrops_search,
+            knowledge::smashingmag_search,
+            knowledge::css_tricks_search,
+            knowledge::codepen_search,
+            knowledge::dribbble_search,
+            knowledge::awwwards_search,
+            knowledge::v2ex_search,
+            knowledge::segmentfault_search,
+            knowledge::github_discussions_search,
+            knowledge::producthunt_search,
+            knowledge::freecodecamp_search,
+            knowledge::github_trending,
+            knowledge::infoq_search,
+            knowledge::hackernoon_search,
+            knowledge::codeberg_search,
+            knowledge::bestofjs_search,
+            knowledge::sourcegraph_search,
+            knowledge::deep_search,
+            game::game_scaffold,
+            web_scaffold::web_scaffold,
+            game_assets::generate_3d,
+            game_assets::generate_sound,
+            game_assets::generate_music,
+            game_assets::generate_voice,
+            game_assets::auto_rig,
+            game_assets::generate_motion,
+            game_assets::generate_texture,
+            game_assets::search_game_assets,
+            game_assets::download_asset,
             cleanup_stale,
         ])
         .build(tauri::generate_context!())

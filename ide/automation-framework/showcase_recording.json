@@ -1,0 +1,47 @@
+{
+  "name": "综合演示录制",
+  "commands": [
+    {
+      "Mouse": {
+        "Move": {
+          "x": 960,
+          "y": 540,
+          "mode": "Absolute"
+        }
+      }
+    },
+    {
+      "Mouse": {
+        "Click": {
+          "button": "Left"
+        }
+      }
+    },
+    {
+      "Keyboard": {
+        "Text": "这是录制的内容"
+      }
+    },
+    {
+      "Keyboard": {
+        "Press": "Return"
+      }
+    },
+    {
+      "Keyboard": {
+        "Combination": [
+          "Meta",
+          {
+            "Character": "a"
+          }
+        ]
+      }
+    }
+  ],
+  "timestamp": 1782904405,
+  "metadata": {
+    "os": "macos",
+    "screen_resolution": null,
+    "description": null
+  }
+}

@@ -57,6 +57,21 @@ pub struct BrowserState {
     result: Option<String>,
 }
 
+/// Check if Google Chrome is currently running (macOS).
+#[cfg(target_os = "macos")]
+fn is_chrome_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "Google Chrome"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_chrome_running() -> bool {
+    false
+}
+
 fn launch() -> Result<Session, String> {
     let path = crate::capture::find_headless_browser()
         .ok_or("未找到 Chrome / Chromium / Edge，无法启动浏览器自动化。请先安装其一。")?;
@@ -93,13 +108,32 @@ fn launch() -> Result<Session, String> {
         extra.push(format!("--proxy-server=127.0.0.1:{port}").into());
     }
     let extra_ref: Vec<&std::ffi::OsStr> = extra.iter().map(|s| s.as_os_str()).collect();
-    // PERSISTENT profile: keep one stable user-data-dir so cookies / logins survive
-    // across sessions. The user logs in ONCE (e.g. scans a login QR) and the agent's
-    // browser stays signed in next time — instead of a clean, logged-out browser every
-    // run. (This is plain cookie persistence, like any normal browser profile.)
-    let profile_dir = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| std::path::PathBuf::from(h).join(".michael-ide").join("browser-profile"));
+    // Use the user's REAL Chrome profile when Chrome is NOT running — this gives the
+    // agent their actual cookies, logins, saved passwords, and extensions (the #1 user
+    // request: "用我真实浏览器"). When Chrome IS running we can't share the locked profile,
+    // so fall back to our own persistent profile at ~/.michael-ide/browser-profile.
+    let profile_dir = if !is_chrome_running() {
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var_os("HOME")
+                .map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join("Library/Application Support/Google/Chrome")
+                })
+                .filter(|p| p.join("Default").exists())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None::<std::path::PathBuf>
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(".michael-ide").join("browser-profile"))
+    });
     if let Some(ref p) = profile_dir {
         let _ = std::fs::create_dir_all(p);
         // Remove stale singleton locks left by a previous crash / navigation timeout —
@@ -193,6 +227,56 @@ fn launch() -> Result<Session, String> {
     })
 }
 
+/// Try to attach to a user's already-running Chrome that has remote debugging
+/// enabled (e.g. launched with `--remote-debugging-port=9222`).  This lets the
+/// agent drive the user's REAL browser — with all their cookies, logged-in
+/// sessions, and extensions — instead of a separate automation instance.
+fn try_connect_existing() -> Option<Session> {
+    for port in [9222u16, 9223, 9224, 9225, 9226, 9229] {
+        let ws_url = match get_cdp_ws_url(port) {
+            Some(url) => url,
+            None => continue,
+        };
+        let browser = match Browser::connect_with_timeout(ws_url, Duration::from_secs(120)) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        match browser.new_tab() {
+            Ok(tab) => {
+                tab.set_default_timeout(Duration::from_secs(30));
+                tracing::info!("[browser] attached to existing Chrome on port {port}");
+                return Some(Session {
+                    _browser: browser,
+                    tab,
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Query Chrome's `/json/version` endpoint to get the DevTools WebSocket URL.
+fn get_cdp_ws_url(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .ok()?;
+    let req = format!("GET /json/version HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::with_capacity(2048);
+    let _ = stream.read_to_end(&mut buf);
+    let text = std::str::from_utf8(&buf).ok()?;
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("webSocketDebuggerUrl")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 /// Enumerate the visible, in-viewport interactive elements: tag each with a
 /// `data-mref` ref (so click/type can target `[data-mref="N"]`), draw a numbered
 /// Set-of-Mark badge on each (so the screenshot shows which is which), and return
@@ -231,6 +315,33 @@ fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
     }
     i++;
   }
+  try { var ifs=document.querySelectorAll('iframe');
+    for(var fi=0;fi<ifs.length&&i<60;fi++){try{
+      var idoc=ifs[fi].contentDocument; if(!idoc) continue;
+      idoc.querySelectorAll('[data-mref]').forEach(function(e){e.removeAttribute('data-mref')});
+      var ifr=ifs[fi].getBoundingClientRect();
+      var iels=Array.from(idoc.querySelectorAll(sel));
+      for(var ie=0;ie<iels.length&&i<60;ie++){
+        var iel=iels[ie]; var ir=iel.getBoundingClientRect();
+        if(ir.width<1||ir.height<1) continue;
+        var at=ifr.top+ir.top,al=ifr.left+ir.left;
+        if(at+ir.height<0||al+ir.width<0||at>innerHeight||al>innerWidth) continue;
+        try{var ics=idoc.defaultView.getComputedStyle(iel);
+          if(ics.visibility==='hidden'||ics.display==='none'||ics.opacity==='0') continue;
+        }catch(_){}
+        iel.setAttribute('data-mref',i);
+        var itag=iel.tagName.toLowerCase();
+        var itype=(iel.getAttribute('type')||'').slice(0,20);
+        var itext=(iel.innerText||iel.value||iel.getAttribute('aria-label')||iel.getAttribute('placeholder')||iel.getAttribute('title')||iel.getAttribute('name')||'').trim().replace(/\s+/g,' ').slice(0,60);
+        out.push({ref:i,tag:itag,type:itype,text:itext});
+        if(DRAW){var ib=document.createElement('div');ib.className='__mcp_som';ib.textContent=String(i);
+          ib.style.cssText='position:absolute;z-index:2147483647;background:#d93025;color:#fff;font:bold 11px monospace;padding:0 3px;border-radius:3px;pointer-events:none;line-height:15px;box-shadow:0 0 0 1px #fff;';
+          ib.style.left=(al+window.scrollX)+'px';ib.style.top=(at+window.scrollY)+'px';
+          document.body.appendChild(ib);}
+        i++;
+      }
+    }catch(e2){}}
+  }catch(e3){}
   return JSON.stringify(out);
 } catch (e) { return '[]'; } })()"##;
     let js = raw.replace("__DRAW__", if DRAW_MARKS.load(Ordering::Relaxed) { "1" } else { "0" });
@@ -295,7 +406,10 @@ where
             let outcome = {
                 let mut guard = BROWSER.lock().map_err(|_| "browser state poisoned")?;
                 if guard.is_none() {
-                    *guard = Some(launch()?);
+                    *guard = Some(match try_connect_existing() {
+                        Some(s) => s,
+                        None => launch()?,
+                    });
                 }
                 let tab = guard.as_ref().unwrap().tab.clone();
                 f(&tab).and_then(|result| snapshot(&tab, result))
@@ -364,13 +478,89 @@ pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
     .await
 }
 
+/// Click an element via JS eval — works inside iframes (same-origin) where
+/// CDP's `DOM.querySelector` can't reach. Last-resort fallback.
+fn click_via_eval(tab: &Tab, selector: &str) -> Result<(), String> {
+    let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(()=>{{var s={sel_js};
+var el=document.querySelector(s);
+if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
+var fs=document.querySelectorAll('iframe');
+for(var k=0;k<fs.length;k++){{try{{
+  el=fs[k].contentDocument.querySelector(s);
+  if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
+}}catch(e){{}}}}
+return 'no'}})()"#
+    );
+    let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
+    let v = ro
+        .value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if v == "ok" {
+        Ok(())
+    } else {
+        Err(format!("找不到元素: {selector}"))
+    }
+}
+
+/// Type into an element via JS eval — iframe-aware fallback.
+fn type_via_eval(tab: &Tab, selector: &str, text: &str) -> Result<(), String> {
+    let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let txt_js = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(()=>{{var s={sel_js},t={txt_js};
+function fill(el){{el.scrollIntoView({{block:'center'}});el.focus();el.click();
+  el.value=t;el.dispatchEvent(new Event('input',{{bubbles:true}}));
+  el.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok'}}
+var el=document.querySelector(s);if(el)return fill(el);
+var fs=document.querySelectorAll('iframe');
+for(var k=0;k<fs.length;k++){{try{{
+  el=fs[k].contentDocument.querySelector(s);if(el)return fill(el);
+}}catch(e){{}}}}
+return 'no'}})()"#
+    );
+    let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
+    let v = ro
+        .value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if v == "ok" {
+        Ok(())
+    } else {
+        Err(format!("找不到输入框: {selector}"))
+    }
+}
+
 /// Click the first element matching a CSS selector.
 #[tauri::command]
 pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        let el = tab
-            .find_element(&selector)
-            .map_err(|_| format!("找不到元素: {selector}"))?;
+        let el = match tab.find_element(&selector) {
+            Ok(el) => el,
+            Err(_) if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") => {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(150));
+                match tab.find_element(&selector) {
+                    Ok(el) => el,
+                    Err(_) => {
+                        click_via_eval(tab, &selector)?;
+                        std::thread::sleep(Duration::from_millis(400));
+                        let _ = tab.wait_until_navigated();
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(_) => {
+                click_via_eval(tab, &selector).map_err(|_| format!("找不到元素: {selector}"))?;
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = tab.wait_until_navigated();
+                return Ok(None);
+            }
+        };
         el.click().map_err(|e| e.to_string())?;
         std::thread::sleep(Duration::from_millis(400));
         let _ = tab.wait_until_navigated();
@@ -383,9 +573,25 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_type(selector: String, text: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        let el = tab
-            .find_element(&selector)
-            .map_err(|_| format!("找不到输入框: {selector}"))?;
+        let el = match tab.find_element(&selector) {
+            Ok(el) => el,
+            Err(_) if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") => {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(150));
+                match tab.find_element(&selector) {
+                    Ok(el) => el,
+                    Err(_) => {
+                        type_via_eval(tab, &selector, &text)?;
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(_) => {
+                type_via_eval(tab, &selector, &text)
+                    .map_err(|_| format!("找不到输入框: {selector}"))?;
+                return Ok(None);
+            }
+        };
         el.click().map_err(|e| e.to_string())?;
         el.type_into(&text).map_err(|e| e.to_string())?;
         Ok(None)
@@ -495,6 +701,52 @@ pub async fn browser_wait(selector: Option<String>, ms: Option<u64>) -> Result<B
 #[tauri::command]
 pub fn browser_set_marks(on: bool) {
     DRAW_MARKS.store(on, Ordering::Relaxed);
+}
+
+/// Return ALL cookies (including HttpOnly) for the current page via CDP.
+#[tauri::command]
+pub async fn browser_cookies(domain: Option<String>) -> Result<BrowserState, String> {
+    with_tab(move |tab| {
+        let all = tab.get_cookies().map_err(|e| format!("获取 cookies 失败: {e}"))?;
+        let result = serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into());
+        if let Some(ref d) = domain {
+            let filtered: Vec<serde_json::Value> = serde_json::from_str::<Vec<serde_json::Value>>(&result)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c.get("domain").and_then(|v| v.as_str()).unwrap_or("").contains(d.as_str()))
+                .collect();
+            Ok(Some(serde_json::to_string_pretty(&filtered).unwrap_or_else(|_| "[]".into())))
+        } else {
+            Ok(Some(result))
+        }
+    })
+    .await
+}
+
+/// Read localStorage / sessionStorage from the current page.
+#[tauri::command]
+pub async fn browser_storage(storage_type: Option<String>) -> Result<BrowserState, String> {
+    with_tab(move |tab| {
+        let st = storage_type.as_deref().unwrap_or("local");
+        let obj = if st == "session" { "sessionStorage" } else { "localStorage" };
+        let js = format!(r#"(() => {{
+            try {{
+                const s = {obj};
+                const out = {{}};
+                for (let i = 0; i < s.length; i++) {{
+                    const k = s.key(i);
+                    out[k] = s.getItem(k);
+                }}
+                return JSON.stringify(out);
+            }} catch(e) {{ return JSON.stringify({{ error: e.message }}); }}
+        }})()"#);
+        let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
+        let s = ro.value
+            .and_then(|v| v.as_str().map(|x| x.to_string()))
+            .unwrap_or_else(|| "{}".into());
+        Ok(Some(s))
+    })
+    .await
 }
 
 /// Close the browser and free the session.

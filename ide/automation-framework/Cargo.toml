@@ -1,0 +1,64 @@
+[package]
+name = "rust-automation-framework"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael"]
+description = "跨平台自动化框架 - 支持浏览器和系统级自动化"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.42", features = ["full"] }
+futures = "0.3"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], optional = true }
+enigo = { version = "0.2", features = ["serde"], optional = true }
+arboard = { version = "3.4", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+urlencoding = "2.1"
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.25"
+core-foundation = "0.10"
+core-graphics = "0.24"
+objc = "0.2"
+accessibility-sys = "0.1"
+
+[build-dependencies]
+
+[features]
+default = ["browser", "system"]
+browser = ["chromiumoxide"]
+system = ["enigo", "arboard"]
+server = ["axum", "tower", "tower-http"]
+full = ["browser", "system", "server"]
+
+[[example]]
+name = "desktop_automation_demo"
+required-features = ["system"]
+
+[[example]]
+name = "http_server_demo"
+required-features = ["system", "browser"]
+
+[[bin]]
+name = "automation-server"
+path = "src/bin/automation-server.rs"
+required-features = ["system", "browser"]
