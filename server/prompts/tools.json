@@ -1042,7 +1042,7 @@
     "type": "function",
     "function": {
       "name": "computer",
-      "description": "操控**整台电脑**(不止浏览器)——看见全屏、控制真实鼠标键盘、操作任意桌面 App。**默认每个动作只回「节点文本清单」不截图（快！省时间省 token）**；只有你主动 action:\"screenshot\" 时才回全屏图片——**别每步都截图，那样慢死了**；连走好几步后、或确实要看视觉效果/布局时，再截一张图看。**节点优先（这是关键，别再靠估坐标点了）**：screenshot 会把前台 App 的可交互控件(按钮/输入框/菜单…)枚举成带编号的「节点」，截图上每个控件标了红色数字。点击/移动时**优先传 ref=节点号**——系统直接点中那个控件的正中心，又快又准、不会点偏；只有节点列表里没有的目标，才退回用 x,y 坐标（对着截图网格读）。**最快、不靠视觉的方式（强烈优先）**：`nodes`(只回节点文本列表、不截图，刷新可点元素) → `press`(action:\"press\", ref:号——直接对该控件发辅助功能点击 AXPress，不动鼠标不估坐标，点完回控件名/值文本) → `set_value`(action:\"set_value\", ref:号, text:\"…\"——直接给输入框填值)；点完用 `nodes` 复核状态变化即可，比每步截图快十倍。screenshot 只在需要看整体布局/视觉效果时才用。⚠️ 控制的是用户真实机器：先 screenshot 看清再动手，破坏性操作先说明意图。action：screenshot(看全屏+刷新节点) / move(移到 ref 或 x,y) / click(点 ref 或 x,y，button=left/right/middle) / double_click(双击 ref 或 x,y) / type(输入 text) / key(按键或组合如 ctrl+c、cmd+space、enter) / scroll(滚动，amount 正=下负=上) / **batch(批量一次跑完多步——最快！需 steps 数组，把同一屏的连续操作如填表/登录打包一次执行，全程不逐步截图。每个 step={op, ref/x/y, text/key/amount/button}，op∈click/double_click/move/type/key/scroll。例 steps:[{op:\"click\",ref:3},{op:\"type\",text:\"用户名\"},{op:\"key\",key:\"tab\"},{op:\"type\",text:\"密码\"},{op:\"click\",ref:8}]。点击类的 ref 用本屏 screenshot 拿到的节点号。返回每步成功/失败 + 跑完后的最新屏幕)**。需桌面环境。",
+      "description": "操控整台电脑的真实鼠标、键盘和桌面应用。优先使用 nodes 获取可交互节点，再用 press 或 set_value 操作并用 nodes 复核；没有合适节点时才使用坐标。screenshot 用于查看整体布局，batch 用于执行同一界面的连续步骤。每次操作都会返回实际结果或失败信息。⚠️ 控制的是用户真实机器：操作前确认目标，破坏性操作先说明意图。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1062,7 +1062,7 @@
               "scroll",
               "batch"
             ],
-            "description": "要执行的操作。优先级：nodes/press/set_value(节点直接操作，不截图最快) > click/type(坐标) > screenshot(看整体) drag=按住左键从起点拖到终点(滑块/拖拽/排序/画布)。"
+            "description": "要执行的操作。优先使用 nodes/press/set_value 直接操作节点；没有合适节点时再用 click/type 坐标；screenshot 用于查看整体。drag 用于滑块、拖拽、排序或画布。"
           },
           "ref": {
             "type": "integer",
@@ -1173,7 +1173,7 @@
     "type": "function",
     "function": {
       "name": "browser",
-      "description": "自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元素列表**(每项带 index/编号、标签、文字) + 可见文本。用于自主上网、测试你做的网页、填表单点链接、抓信息。action：navigate(开网址,需 url) / click(点击) / type(输入,需 text) / press(按键,需 key) / **scroll(滚动,需 amount，正=下负=上；目标在视口外就先滚动让它出现+重新编号)** / **wait(等页面加载：传 selector 等某元素出现，或传 ms 等固定毫秒)** / eval(跑 JS,需 script) / screenshot(只看) / **design(抓取当前页面的设计系统：常用颜色/背景/渐变、字体族与字号阶、字重、圆角、阴影、过渡、动画、以及 :root 的 CSS 变量——做 UI 时打开一个参考站点抓它的设计语言，照着做)** / **network(抓包：返回这页加载/请求的真实情况——失败的 CSS/JS/字体/图片/接口、捕获到的 fetch/XHR 的**请求方法+URL+请求头(reqHeaders)+请求体(reqBody)+状态+响应片段**。样式或图没出来先用它看是不是某资源 404/500，比看截图准。**重发/构造/调试**：拿到某个 apiCalls 里的请求后，直接用 http_request 把它的 method/url/reqHeaders/reqBody 原样或改参数后重新发出去，看返回——这就是抓包→重放→改参调试的闭环)** / **inspect(视觉/样式解析：用计算后样式+布局做结构化体检——看不见的文字/低对比度/坏图/尺寸塌陷/文字裁切/横向溢出。传 selector 深查某元素，留空体检整页。视觉问题用它拿真实数字判断，别只靠肉眼看图)** / **nodes(把整页转成「节点」：返回一份结构化的可交互节点清单——每个节点带 i=节点号、r=角色(button/link/textbox…)、n=名称、s=状态(disabled/checked/expanded/value/href)、off=在视口外。拿到后用 node=i 直接点/填，改完再 nodes 看状态变化——比一遍遍截图快得多)** / **assert(快速验证：传 selector 和/或 text，一次返回「存在吗/可见吗/匹配几个/第一个是什么」。用来确认操作真生效了——比如点完按钮后 assert text=「保存成功」，不用截图肉眼找)** / **check(一次性体检：把控制台 JS 报错 + 网络/接口失败 + 关键视觉缺陷 + 可交互节点数**融合**成一个总判断 healthy/verdict。打开页面或操作后先 check 一眼——尤其 consoleErrors 是「按钮没反应/页面坏了」的头号原因，截图根本看不出来。有问题再用 network/inspect/nodes 深挖)** / **batch(批量一次跑完多步——最快！需 steps 数组)：把一串连续操作打包一次执行，全程不逐步截图、不逐步等模型，N 步变 1 次调用。每个 step={op, node/index/selector, text/key/url/amount/ms}，op∈click/type/press/scroll/wait/navigate。例 steps:[{op:\"type\",node:3,text:\"用户名\"},{op:\"type\",node:5,text:\"密码\"},{op:\"click\",node:8},{op:\"wait\",ms:800}]。返回每步成功/失败 + 跑完后的最新节点清单。登录、填表、连点这种确定的多步流程，全用 batch，别一步一个 click 慢慢来。某步找不到目标会停在那步并告诉你。** / close(关)。**点/填优先用 node=节点号(来自 nodes，最稳)或 index=编号(来自截图红数字)**；都没有再用 selector。打法：navigate → wait 加载好 → **nodes 把页面转成节点清单** → **确定的连续多步直接 batch 一次跑完** / 或单步 node=i → **assert 或再 nodes 验证状态变了**，别每步都截图(慢)。**调试「样式/视觉没对」：navigate → network 看资源加载失败 → inspect 看计算样式缺陷 → 截图三方对照。** 需装 Chrome/Chromium/Edge。",
+      "description": "操控真实浏览器并返回截图、可交互节点和可见文本。支持 navigate、click、type、press、scroll、wait、eval、screenshot、design、network、inspect、nodes、assert、check、batch 和 close。优先使用 nodes 返回的节点号进行点击或填表；连续步骤可用 batch，每步都会报告成功或失败。操作后用 assert、nodes 或 check 验证状态，样式和网络问题分别用 inspect 与 network 定位。需要本机安装 Chrome、Chromium 或 Edge。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1737,8 +1737,147 @@
   {
     "type": "function",
     "function": {
+      "name": "developer_community_search",
+      "description": "并行搜索当前已接入的开发者代码平台、问答论坛、中英文社区和技术文章站。结果逐来源标注响应或失败；来源返回内容不等于事实已经证实，重要结论仍需读取原文并交叉验证。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索主题或报错关键词" },
+          "scope": {
+            "type": "string",
+            "enum": ["all", "code", "forums", "chinese", "articles"],
+            "description": "来源分组，默认 all；all 指当前支持的来源，不代表互联网全部社区"
+          },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "可选，明确指定来源，如 github、stackoverflow、reddit、v2ex、juejin、gitlab、gitee"
+          },
+          "max_per_source": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "每个来源最多返回几项，默认 3"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "github_search",
+      "description": "搜索 GitHub 的仓库、代码或 issue。返回 GitHub API 的实时元数据和链接；仓库质量需结合源码、维护状态和 issue 进一步判断。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索词，支持 GitHub 搜索语法" },
+          "search_type": { "type": "string", "enum": ["repositories", "code", "issues"], "description": "搜索类型，默认 repositories" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10，最大 30" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "stackoverflow_search",
+      "description": "通过 Stack Exchange API 搜索 Stack Overflow 问答，返回分数、回答数、标签和原帖链接。帖子内容属于社区证据，不自动视为正确答案。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "问题、错误信息或技术关键词" },
+          "tag": { "type": "string", "description": "可选，限定技术标签" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 8，最大 20" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hackernews_search",
+      "description": "通过 Algolia API 搜索 Hacker News 技术讨论，返回热度、评论数、日期和原帖链接。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索关键词" },
+          "sort": { "type": "string", "enum": ["relevance", "date"], "description": "排序方式，默认 relevance" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10，最大 30" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "devto_search",
+      "description": "通过公开网页搜索查找 DEV Community 文章并返回原文链接；这不是 DEV 官方 API，搜索端点不可用时会明确说明。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "标签或技术关键词，如 rust、react、webdev" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10，最大 20" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "reddit_search",
+      "description": "搜索 Reddit 的公开帖子，可限定 subreddit。接口可能受 Reddit 限流或访问策略影响，失败时必须如实报告。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索关键词" },
+          "subreddit": { "type": "string", "description": "可选，限定 subreddit" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10，最大 25" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "gitlab_search",
+      "description": "通过 GitLab.com API 搜索公开项目，返回项目描述、star、更新时间和链接。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索关键词" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "gitee_search",
+      "description": "搜索 Gitee 的公开项目，适合查中文开源项目。接口可用性取决于 Gitee 当前公开访问策略。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索关键词" },
+          "max_results": { "type": "integer", "description": "返回数量，默认 10" }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "lobsters_search",
-      "description": "**Lobsters 技术社区搜索**——高质量策展型技术社区（比 HN 更深入技术），搜索技术文章/讨论/观点，附投票和评论数。选型对比/技术争论/最佳实践用。",
+      "description": "通过公开网页搜索查找 Lobsters 技术讨论并返回原帖链接；这不是 Lobsters 官方 API，搜索端点不可用时会明确说明。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1761,7 +1900,7 @@
     "type": "function",
     "function": {
       "name": "juejin_search",
-      "description": "**掘金搜索**——中文最大开发者技术社区，搜索技术博文/教程/实战经验。中文技术内容首选。",
+      "description": "搜索掘金公开技术文章，适合查中文教程和开发实践；文章质量需结合原文与其他来源判断。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1968,7 +2107,7 @@
     "type": "function",
     "function": {
       "name": "github_discussions_search",
-      "description": "**GitHub Discussions 搜索**——开源项目讨论区，搜索设计决策/选型争论/架构讨论。比 issue 更偏设计和最佳实践。",
+      "description": "通过公开网页搜索查找 GitHub Discussions 原帖，适合定位项目设计和架构讨论；这不是 GitHub GraphQL API。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1991,7 +2130,7 @@
     "type": "function",
     "function": {
       "name": "producthunt_search",
-      "description": "**ProductHunt 搜索**——发现新工具/新产品/新库，选型时看看最新出了什么好东西、开发者在用什么工具。",
+      "description": "通过公开网页搜索查找 Product Hunt 产品页并返回原链接；这不是 Product Hunt 官方 API，结果不代表产品质量或当前热度。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2083,7 +2222,7 @@
     "type": "function",
     "function": {
       "name": "hackernoon_search",
-      "description": "**HackerNoon 搜索**——全球开发者博客平台，搜索编程教程/工具评测/技术观点/创业经验。实战经验和独立开发者视角。",
+      "description": "通过公开网页搜索查找 HackerNoon 页面，并返回文章链接；这不是 HackerNoon 官方 API，搜索端点不可用时会明确说明。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2106,7 +2245,7 @@
     "type": "function",
     "function": {
       "name": "codeberg_search",
-      "description": "**Codeberg 搜索**——全球最大的开源替代代码托管平台（基于 Gitea），大量隐私/自由软件/去中心化项目不在 GitHub 上而在这里。搜索开源项目/工具/框架。",
+      "description": "通过 Codeberg API 搜索公开仓库，适合补充 GitHub/GitLab 之外的自由软件和开源项目来源。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2152,7 +2291,7 @@
     "type": "function",
     "function": {
       "name": "sourcegraph_search",
-      "description": "**Sourcegraph 全网代码搜索**——跨 GitHub/GitLab/Bitbucket 等所有公开仓库搜索代码实现。找某个函数/模式/架构在全世界是怎么写的。支持正则和语言过滤（如 lang:python / lang:go）。",
+      "description": "通过 Sourcegraph 当前索引搜索公开代码。支持语言和仓库过滤；覆盖范围取决于 Sourcegraph 的实时索引，不代表所有公开仓库。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2517,7 +2656,7 @@
     "type": "function",
     "function": {
       "name": "visual_compare",
-      "description": "**把你做的 UI 和目标设计图并排对比**——给它一张设计图路径 + 你实现页面的 dev server 网址，它截当前实现的实时图、和设计图拼成一张并排图回传给你看。用来把 UI 做到 100% 还原设计：对比→改→再对比，直到像素级吻合。做界面/还原设计稿时必用的外部视觉反馈。",
+      "description": "把当前 UI 和目标设计图并排展示，便于检查布局、间距、颜色和字体差异并继续迭代。它提供视觉对照，不保证自动达到像素级一致。",
       "parameters": {
         "type": "object",
         "properties": {

@@ -164,6 +164,20 @@ test("_looksQuickAsk excludes project/multi-file scope (so it isn't crippled to 
   assert.equal(f("梳理一下这个工程的架构"), false);
 });
 
+test("developer community search is wired through schema, normalization, execution, and truthful fallback", () => {
+  assert.match(SRC, /name: "developer_community_search"/);
+  assert.match(SRC, /case "developer_community_search": return \{ type: "developer_community_search"/);
+  assert.match(SRC, /backend\.invoke\(call\.type, _args\)/);
+  assert.match(SRC, /成功响应不等于内容已被证实/);
+  assert.match(SRC, /只调用工具或配置接口不等于成功/);
+
+  const directoryDescription = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1];
+  assert.ok(directoryDescription, "search_tools should have a concise runtime description");
+  assert.match(directoryDescription, /developer_community_search/);
+  assert.match(directoryDescription, /当前支持/);
+  assert.doesNotMatch(directoryDescription, /100%|十倍|全球最大|所有公开仓库|全部免费|秒回|绝不会丢/);
+});
+
 test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上下文协议)", () => {
   const f = load("_sharedCtxDigest");
   assert.equal(f(null), "", "no ctx → empty");

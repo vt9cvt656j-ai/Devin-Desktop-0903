@@ -266,6 +266,7 @@ pub fn run() {
             knowledge::wiki_search,
             knowledge::stackoverflow_search,
             knowledge::hackernews_search,
+            knowledge::developer_community_search,
             knowledge::dockerhub_search,
             knowledge::pubmed_search,
             knowledge::arxiv_search,

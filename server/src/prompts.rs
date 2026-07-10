@@ -353,6 +353,15 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     if !sys.is_empty() {
         prompt_blocks.push(prompt_name);
     }
+    // One shared evidence policy covers every IDE mode. Keeping it separate from
+    // tone/personality prompts prevents model-specific style tuning from turning
+    // guesses or partial integrations into confident product claims.
+    let truthfulness = read_prompt("truthfulness").unwrap_or_default();
+    if !truthfulness.is_empty() {
+        prompt_blocks.push("truthfulness");
+        sys.push_str("\n\n");
+        sys.push_str(&truthfulness);
+    }
     // Inject the design guide on any UI/frontend task — not just when the (never-emitted)
     // x-ide-ui header is present. `MICHAEL_UI_GUIDE=0` disables; `=always` forces it on.
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
@@ -548,6 +557,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
 /// hash is stable for identical content.
 const PROMPT_NAMES: &[&str] = &[
     "agent",
+    "truthfulness",
     "chat",
     "plan",
     "explorer",
@@ -601,7 +611,14 @@ mod tests {
 
     #[test]
     fn bundled_prompts_are_not_empty() {
-        for name in ["agent", "chat", "plan", "explorer", "reviewer"] {
+        for name in [
+            "agent",
+            "truthfulness",
+            "chat",
+            "plan",
+            "explorer",
+            "reviewer",
+        ] {
             let result = read_prompt(name);
             assert!(result.is_ok(), "prompt {name} should load successfully");
             assert!(!result.unwrap().trim().is_empty(), "prompt {name} is empty");
@@ -653,6 +670,79 @@ mod tests {
             tools.len(),
             MAX_STATIC_TOOLS_PER_REQUEST
         );
+    }
+
+    #[test]
+    fn developer_community_tools_have_cloud_schemas() {
+        let text = read_tools_file().expect("tools.json should be readable");
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("tools.json should be valid JSON");
+        let names = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "developer_community_search",
+            "github_search",
+            "stackoverflow_search",
+            "hackernews_search",
+            "devto_search",
+            "reddit_search",
+            "gitlab_search",
+            "gitee_search",
+        ] {
+            assert!(
+                names.contains(required),
+                "missing cloud schema for {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn truthfulness_policy_rejects_partial_success_claims() {
+        let policy = read_prompt("truthfulness").expect("truthfulness prompt should load");
+        assert!(policy.contains("已验证事实"));
+        assert!(policy.contains("不等于“接入成功"));
+        assert!(policy.contains("逐项报告"));
+    }
+
+    #[test]
+    fn server_assembly_injects_truthfulness_and_community_tools() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-tools",
+            "developer_community_search,github_search,stackoverflow_search"
+                .parse()
+                .unwrap(),
+        );
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "查 Rust async 错误处理"}]
+        });
+
+        assemble_into(&headers, &mut body);
+
+        let system = body["messages"][0]["content"]
+            .as_str()
+            .expect("assembled request should start with a system prompt");
+        assert!(system.contains("真实性与证据纪律"));
+        let names = body["tools"]
+            .as_array()
+            .expect("assembled request should contain tools")
+            .iter()
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("developer_community_search"));
+        assert!(names.contains("github_search"));
+        assert!(names.contains("stackoverflow_search"));
     }
 
     #[test]
