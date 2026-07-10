@@ -34,6 +34,9 @@ yarn-error.log*
 
 # build artifacts + editor backups (added for CI packaging, 2026-07-04)
 *.bak
+*.bak.*
+*.pre-*
+server/src/src/
 /*.dmg
 .michael-images/
 ide/src/_serve.mjs

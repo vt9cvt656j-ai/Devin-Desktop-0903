@@ -661,7 +661,9 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
-            (host_c.as_str(), port).to_socket_addrs().map(|it| it.collect::<Vec<_>>())
+            (host_c.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
         }),
     )
     .await
@@ -884,7 +886,11 @@ async fn scrape_ddg_html(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r.text().await.map(|h| parse_ddg_results(&h)).unwrap_or_default(),
+        Ok(r) => r
+            .text()
+            .await
+            .map(|h| parse_ddg_results(&h))
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -894,7 +900,11 @@ async fn scrape_bing(q: String) -> Vec<(String, String, String)> {
         Some(c) => c,
         None => return Vec::new(),
     };
-    let has_cjk = q.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3040}'..='\u{30ff}').contains(&c) || ('\u{ac00}'..='\u{d7af}').contains(&c));
+    let has_cjk = q.chars().any(|c| {
+        ('\u{4e00}'..='\u{9fff}').contains(&c)
+            || ('\u{3040}'..='\u{30ff}').contains(&c)
+            || ('\u{ac00}'..='\u{d7af}').contains(&c)
+    });
     let (domain, lang) = if has_cjk {
         ("cn.bing.com", "zh-CN,zh;q=0.9,en;q=0.8")
     } else {
@@ -918,12 +928,18 @@ async fn scrape_google(q: String) -> Vec<(String, String, String)> {
         Some(c) => c,
         None => return Vec::new(),
     };
-    let url = format!("https://www.google.com/search?q={}&num=10&hl=zh-CN", urlencoding(&q));
+    let url = format!(
+        "https://www.google.com/search?q={}&num=10&hl=zh-CN",
+        urlencoding(&q)
+    );
     let resp = client
         .get(&url)
         .header(reqwest::header::USER_AGENT, SEARCH_UA)
         .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
         .send()
         .await;
     match resp {
@@ -937,11 +953,14 @@ fn parse_google(html: &str) -> Vec<(String, String, String)> {
     let mut pos = 0;
     while let Some(div_start) = html[pos..].find("<div class=\"g\"") {
         let abs = pos + div_start;
-        let chunk_end = html[abs..].find("</div>").map(|e| abs + e + 6).unwrap_or(html.len().min(abs + 3000));
+        let chunk_end = html[abs..]
+            .find("</div>")
+            .map(|e| abs + e + 6)
+            .unwrap_or(html.len().min(abs + 3000));
         let chunk = &html[abs..chunk_end];
 
         let title = extract_between(chunk, "<h3", "</h3>")
-            .map(|t| strip_tags(t))
+            .map(strip_tags)
             .unwrap_or_default();
         let url = extract_between(chunk, "<a href=\"/url?q=", "&")
             .map(|s| s.to_string())
@@ -950,7 +969,7 @@ fn parse_google(html: &str) -> Vec<(String, String, String)> {
             .replace("&amp;", "&");
         let snippet = extract_between(chunk, "<span class=\"", "</span>")
             .map(|s| {
-                let inner = s.find('>').map(|i| &s[i+1..]).unwrap_or(s);
+                let inner = s.find('>').map(|i| &s[i + 1..]).unwrap_or(s);
                 strip_tags(inner)
             })
             .unwrap_or_default();
@@ -959,18 +978,23 @@ fn parse_google(html: &str) -> Vec<(String, String, String)> {
             results.push((title, url, snippet));
         }
         pos = chunk_end;
-        if results.len() >= 10 { break; }
+        if results.len() >= 10 {
+            break;
+        }
     }
     if results.is_empty() {
         let mut pos2 = 0;
         while let Some(a_start) = html[pos2..].find("<a href=\"/url?q=") {
             let abs2 = pos2 + a_start + 16;
             if let Some(end) = html[abs2..].find('&') {
-                let raw = &html[abs2..abs2+end];
+                let raw = &html[abs2..abs2 + end];
                 let url = percent_decode_str(raw);
-                if url.starts_with("http") && !url.contains("google.com") && !url.contains("accounts.google") {
+                if url.starts_with("http")
+                    && !url.contains("google.com")
+                    && !url.contains("accounts.google")
+                {
                     let title = extract_between(&html[abs2..], ">", "</a>")
-                        .map(|t| strip_tags(t))
+                        .map(strip_tags)
                         .unwrap_or_else(|| url.clone());
                     if !title.is_empty() {
                         results.push((title, url, String::new()));
@@ -978,7 +1002,9 @@ fn parse_google(html: &str) -> Vec<(String, String, String)> {
                 }
             }
             pos2 = abs2 + 10;
-            if results.len() >= 10 { break; }
+            if results.len() >= 10 {
+                break;
+            }
         }
     }
     results
@@ -994,9 +1020,13 @@ fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
     for c in s.chars() {
-        if c == '<' { in_tag = true; }
-        else if c == '>' { in_tag = false; }
-        else if !in_tag { out.push(c); }
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(c);
+        }
     }
     out.trim().to_string()
 }
@@ -1013,7 +1043,11 @@ async fn scrape_ddg_lite(q: String) -> Vec<(String, String, String)> {
         .send()
         .await;
     match resp {
-        Ok(r) => r.text().await.map(|h| parse_ddg_lite(&h)).unwrap_or_default(),
+        Ok(r) => r
+            .text()
+            .await
+            .map(|h| parse_ddg_lite(&h))
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -1030,8 +1064,17 @@ async fn browser_render_search(q: &str) -> Vec<(String, String, String)> {
     };
     // (url, parser-kind): 0 = Bing b_algo, 1 = DDG html result__a.
     let targets = [
-        (format!("https://www.bing.com/search?q={}&setlang=en", urlencoding(q)), 0u8),
-        (format!("https://html.duckduckgo.com/html/?q={}", urlencoding(q)), 1u8),
+        (
+            format!(
+                "https://www.bing.com/search?q={}&setlang=en",
+                urlencoding(q)
+            ),
+            0u8,
+        ),
+        (
+            format!("https://html.duckduckgo.com/html/?q={}", urlencoding(q)),
+            1u8,
+        ),
     ];
     for (url, kind) in targets {
         let browser2 = browser.clone();
@@ -1086,7 +1129,9 @@ fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{:02X}", b)),
         }
@@ -1128,7 +1173,8 @@ fn parse_bing(html: &str) -> Vec<(String, String, String)> {
                 })
             })
             .unwrap_or_default();
-        if href.starts_with("http") && !title.is_empty() && !out.iter().any(|(_, u, _)| u == &href) {
+        if href.starts_with("http") && !title.is_empty() && !out.iter().any(|(_, u, _)| u == &href)
+        {
             out.push((title, href, snippet));
         }
         if out.len() >= 10 {

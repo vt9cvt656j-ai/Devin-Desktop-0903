@@ -1,0 +1,74 @@
+# ⚠️ CSS 设计系统（必须照抄的变量 + 组件模板——写 CSS 前先复制这些 :root 变量，所有样式只用这些变量，禁止写死数值）
+
+## 第一步：把这组 :root 变量复制到你的 CSS 开头（有现有设计变量就复用现有的，别重复定义）
+```css
+:root {
+  /* 字体——别默认 Inter(满屏 AI 味)；正文挑个中性现代体、标题挑个有性格的展示体，从 Google Fonts 真加载 */
+  --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;      /* 正文：可换 Plus Jakarta Sans / Geist / Instrument Sans 等 */
+  --font-display: 'Space Grotesk', var(--font-sans);                 /* 标题：可换 Fraunces / Sora / Clash Display / Bricolage Grotesque 等 */
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
+  --text-lg: 1.125rem; --text-xl: 1.25rem; --text-2xl: 1.5rem;
+  --leading-tight: 1.15; --leading-normal: 1.55;
+  /* 间距（4px 网格——只用这些值，禁止自己编 px 数） */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
+  /* 颜色（浅色主题——禁止写死 hex/rgb，只用变量名） */
+  --bg: #ffffff; --surface: #f9fafb; --border: #e5e7eb;
+  --text: #1f2937; --text-muted: #6b7280; --text-faint: #9ca3af;
+  --primary: #2563eb; --primary-hover: #1d4ed8; --primary-light: #eff6ff;
+  --success: #16a34a; --warning: #d97706; --danger: #dc2626;
+  /* 圆角 */
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+  /* 动效 */
+  --duration: 150ms; --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --border: #334155;
+    --text: #e2e8f0; --text-muted: #94a3b8; --text-faint: #64748b;
+    --primary: #3b82f6; --primary-hover: #60a5fa; --primary-light: #1e3a5f;
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
+    --shadow-md: 0 4px 6px rgb(0 0 0 / 0.4);
+  }
+}
+```
+
+## 第二步：组件照这些模板写（可复制后改细节）
+**按钮：**
+```css
+.btn { display: inline-flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); font-size: var(--text-sm); font-weight: 500; border-radius: var(--radius-md); border: 1px solid transparent; cursor: pointer; transition: background var(--duration) var(--ease), border-color var(--duration) var(--ease), color var(--duration) var(--ease); min-height: 36px; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+```
+**输入框：**
+```css
+.input { width: 100%; padding: var(--sp-2) var(--sp-3); font-size: var(--text-sm); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); color: var(--text); transition: border-color var(--duration) var(--ease); min-height: 36px; }
+.input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgb(37 99 235 / 0.15); }
+.input::placeholder { color: var(--text-faint); }
+```
+**卡片：**
+```css
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--sp-6); box-shadow: var(--shadow-sm); }
+.card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); transition: box-shadow var(--duration) var(--ease), transform var(--duration) var(--ease); }
+```
+
+## 绝对禁止（违反任何一条 = 不合格）
+- ❌ **禁止写死颜色**：`color: #333` → ✅ `color: var(--text)`
+- ❌ **禁止写死间距**：`padding: 15px` → ✅ `padding: var(--sp-4)`（用最接近的变量）
+- ❌ **禁止写死圆角**：`border-radius: 5px` → ✅ `border-radius: var(--radius-sm)`
+- ❌ **禁止用 emoji 当图标**：✅ ❌ ⚠️ 这些 → 用 SVG 图标
+- ❌ **禁止只做 default 态**：每个按钮/输入框/链接必须有 hover + focus-visible + disabled 态
+- ❌ **禁止纯黑 #000 文字 / 纯白 #fff 背景**：用 --text / --bg
+- ❌ **禁止 transition: all**：指定具体属性 `transition: background var(--duration) var(--ease)`
+- ❌ **禁止 box-shadow: 0 0 10px black` 这种重阴影**：用 --shadow-sm / --shadow-md
+- ❌ **禁止没有 line-height**：正文 line-height: var(--leading-normal)，标题 var(--leading-tight)
+- ❌ **禁止文字满屏宽**：文本容器加 max-width: 65ch
+
+## 自查口诀（写完 CSS 对着过一遍）
+颜色用变量、间距用变量、圆角用变量、阴影用变量、所有交互元素有 hover+focus、文字对比度 ≥ 4.5:1、正文 line-height 1.5+、触摸目标 ≥ 44px、布局用 flex/grid 不用 float、transition 指定属性不用 all。

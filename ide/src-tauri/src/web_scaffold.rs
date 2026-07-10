@@ -5,7 +5,7 @@
 // starts from the same high-quality, non-AI-slop base. The agent then builds
 // pages on top (npm install + npm run dev).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 fn slug(name: &str) -> String {
@@ -13,10 +13,20 @@ fn slug(name: &str) -> String {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "my-site".to_string() } else { s }
+    if s.is_empty() {
+        "my-site".to_string()
+    } else {
+        s
+    }
 }
 
 #[tauri::command]
@@ -29,7 +39,10 @@ pub async fn web_scaffold(
     let fw = framework.unwrap_or_default().trim().to_lowercase();
     // Vue is the default per the house style; react is accepted but currently
     // shares the Vite+Tailwind+token base with a React entry.
-    let is_react = matches!(fw.as_str(), "react" | "reactjs" | "react.js" | "jsx" | "tsx");
+    let is_react = matches!(
+        fw.as_str(),
+        "react" | "reactjs" | "react.js" | "jsx" | "tsx"
+    );
 
     let root = PathBuf::from(&workspace);
     if !root.exists() {
@@ -41,15 +54,21 @@ pub async fn web_scaffold(
     }
 
     // ── write helper ────────────────────────────────────────────────
-    async fn put(dir: &PathBuf, rel: &str, content: &str) -> Result<(), String> {
+    async fn put(dir: &Path, rel: &str, content: &str) -> Result<(), String> {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| format!("建目录失败 {rel}: {e}"))?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("建目录失败 {rel}: {e}"))?;
         }
-        fs::write(&p, content).await.map_err(|e| format!("写入失败 {rel}: {e}"))
+        fs::write(&p, content)
+            .await
+            .map_err(|e| format!("写入失败 {rel}: {e}"))
     }
 
-    fs::create_dir_all(&dir).await.map_err(|e| format!("创建项目目录失败: {e}"))?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("创建项目目录失败: {e}"))?;
 
     // Files shared by both stacks
     put(&dir, "tailwind.config.js", TAILWIND_CONFIG).await?;
@@ -59,7 +78,11 @@ pub async fn web_scaffold(
     put(&dir, "README.md", &readme(&proj)).await?;
 
     let mut files: Vec<&str> = vec![
-        "tailwind.config.js", "postcss.config.js", "src/style.css", "README.md", ".gitignore",
+        "tailwind.config.js",
+        "postcss.config.js",
+        "src/style.css",
+        "README.md",
+        ".gitignore",
     ];
 
     if is_react {
@@ -68,7 +91,13 @@ pub async fn web_scaffold(
         put(&dir, "index.html", &index_html(&proj, true)).await?;
         put(&dir, "src/main.jsx", MAIN_JSX).await?;
         put(&dir, "src/App.jsx", APP_JSX).await?;
-        files.extend(["package.json", "vite.config.js", "index.html", "src/main.jsx", "src/App.jsx"]);
+        files.extend([
+            "package.json",
+            "vite.config.js",
+            "index.html",
+            "src/main.jsx",
+            "src/App.jsx",
+        ]);
     } else {
         put(&dir, "package.json", &pkg_json(&proj, false)).await?;
         put(&dir, "vite.config.js", VITE_CONFIG_VUE).await?;
@@ -77,8 +106,12 @@ pub async fn web_scaffold(
         put(&dir, "src/App.vue", APP_VUE).await?;
         put(&dir, "src/components/SiteHeader.vue", SITE_HEADER_VUE).await?;
         files.extend([
-            "package.json", "vite.config.js", "index.html", "src/main.js",
-            "src/App.vue", "src/components/SiteHeader.vue",
+            "package.json",
+            "vite.config.js",
+            "index.html",
+            "src/main.js",
+            "src/App.vue",
+            "src/components/SiteHeader.vue",
         ]);
     }
 
@@ -95,7 +128,8 @@ pub async fn web_scaffold(
 
 fn pkg_json(proj: &str, react: bool) -> String {
     if react {
-        format!(r#"{{
+        format!(
+            r#"{{
   "name": "{proj}",
   "private": true,
   "version": "0.1.0",
@@ -110,9 +144,11 @@ fn pkg_json(proj: &str, react: bool) -> String {
     "vite": "^6.0.7"
   }}
 }}
-"#)
+"#
+        )
     } else {
-        format!(r#"{{
+        format!(
+            r#"{{
   "name": "{proj}",
   "private": true,
   "version": "0.1.0",
@@ -127,7 +163,8 @@ fn pkg_json(proj: &str, react: bool) -> String {
     "vite": "^6.0.7"
   }}
 }}
-"#)
+"#
+        )
     }
 }
 
@@ -231,9 +268,18 @@ const STYLE_CSS: &str = r#"@tailwind base;
 "#;
 
 fn index_html(proj: &str, react: bool) -> String {
-    let entry = if react { "/src/main.jsx" } else { "/src/main.js" };
-    let mount = if react { r#"<div id="root"></div>"# } else { r#"<div id="app"></div>"# };
-    format!(r#"<!doctype html>
+    let entry = if react {
+        "/src/main.jsx"
+    } else {
+        "/src/main.js"
+    };
+    let mount = if react {
+        r#"<div id="root"></div>"#
+    } else {
+        r#"<div id="app"></div>"#
+    };
+    format!(
+        r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -248,7 +294,8 @@ fn index_html(proj: &str, react: bool) -> String {
     <script type="module" src="{entry}"></script>
   </body>
 </html>
-"#)
+"#
+    )
 }
 
 const MAIN_JS: &str = r#"import { createApp } from 'vue'
@@ -365,7 +412,8 @@ export default function App() {
 const GITIGNORE: &str = "node_modules\ndist\n.DS_Store\n*.local\n";
 
 fn readme(proj: &str) -> String {
-    format!(r#"# {proj}
+    format!(
+        r#"# {proj}
 
 Vite + Tailwind starter with a curated design-token system.
 
@@ -377,5 +425,6 @@ npm run dev      # http://127.0.0.1:3000
 - **Design tokens** live in `src/style.css` `:root` — change the theme there, never hardcode values.
 - **Fonts**: Space Grotesk (display) + Manrope (body), loaded in `index.html`.
 - **Base components**: `.btn`, `.btn-primary`, `.btn-ghost`, `.card` (+ Tailwind theme wired to the tokens).
-"#)
+"#
+    )
 }

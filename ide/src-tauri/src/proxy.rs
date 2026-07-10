@@ -133,10 +133,19 @@ pub fn proxy_status(state: tauri::State<ProxyState>) -> ProxyStatus {
     };
     let mitm = {
         let r = crate::process_util::resolve_command("mitmdump", None);
-        if std::path::Path::new(&r).exists() { Some(r) } else { None }
+        if std::path::Path::new(&r).exists() {
+            Some(r)
+        } else {
+            None
+        }
     };
     let ca = ca_cert_path().filter(|p| std::path::Path::new(p).exists());
-    ProxyStatus { running, port, mitmdump: mitm, ca_path: ca }
+    ProxyStatus {
+        running,
+        port,
+        mitmdump: mitm,
+        ca_path: ca,
+    }
 }
 
 /// Start capturing: spawn mitmdump with the bridge addon and stream each flow to `on_flow`.
@@ -262,8 +271,11 @@ fn macos_primary_service() -> Result<String, String> {
             .output()
             .map_err(|e| format!("route 失败: {e}"))?;
         let s = String::from_utf8_lossy(&out.stdout).to_string();
-        s.lines()
-            .find_map(|l| l.trim().strip_prefix("interface:").map(|d| d.trim().to_string()))
+        s.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("interface:")
+                .map(|d| d.trim().to_string())
+        })
     };
     let list = crate::process_util::command("networksetup")
         .args(["-listnetworkserviceorder"])

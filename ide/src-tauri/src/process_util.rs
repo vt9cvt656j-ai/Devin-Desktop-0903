@@ -20,13 +20,22 @@ fn login_shell_path() -> &'static str {
             let out = std::process::Command::new(&shell)
                 .args(["-lic", "command printf '__WP__%s__WP__' \"$PATH\""])
                 .output();
-            let _ = tx.send(out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default());
+            let _ = tx.send(
+                out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default(),
+            );
         });
-        let raw = rx.recv_timeout(std::time::Duration::from_millis(4000)).unwrap_or_default();
+        let raw = rx
+            .recv_timeout(std::time::Duration::from_millis(4000))
+            .unwrap_or_default();
         match (raw.find("__WP__"), raw.rfind("__WP__")) {
             (Some(a), Some(b)) if b > a + 6 => {
                 let p = &raw[a + 6..b];
-                if p.contains('/') { p.to_string() } else { String::new() }
+                if p.contains('/') {
+                    p.to_string()
+                } else {
+                    String::new()
+                }
             }
             _ => String::new(),
         }
@@ -105,7 +114,9 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
                     parts.push(scripts);
                 }
             }
-            if !cur.is_empty() { parts.push(cur); }
+            if !cur.is_empty() {
+                parts.push(cur);
+            }
             parts.join(";")
         }
         None => cur,

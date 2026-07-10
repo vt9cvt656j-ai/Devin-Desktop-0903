@@ -117,8 +117,7 @@ fn launch() -> Result<Session, String> {
         {
             std::env::var_os("HOME")
                 .map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join("Library/Application Support/Google/Chrome")
+                    std::path::PathBuf::from(h).join("Library/Application Support/Google/Chrome")
                 })
                 .filter(|p| p.join("Default").exists())
         }
@@ -132,7 +131,11 @@ fn launch() -> Result<Session, String> {
     .or_else(|| {
         std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(|h| std::path::PathBuf::from(h).join(".michael-ide").join("browser-profile"))
+            .map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".michael-ide")
+                    .join("browser-profile")
+            })
     });
     if let Some(ref p) = profile_dir {
         let _ = std::fs::create_dir_all(p);
@@ -161,7 +164,10 @@ fn launch() -> Result<Session, String> {
         {
             Some(mut json) => {
                 if let Some(prof) = json.get_mut("profile").and_then(|v| v.as_object_mut()) {
-                    prof.insert("exit_type".into(), serde_json::Value::String("Normal".into()));
+                    prof.insert(
+                        "exit_type".into(),
+                        serde_json::Value::String("Normal".into()),
+                    );
                     prof.insert("exited_cleanly".into(), serde_json::Value::Bool(true));
                 }
                 let _ = std::fs::write(&prefs, json.to_string());
@@ -202,8 +208,8 @@ fn launch() -> Result<Session, String> {
             // still locked by a leftover instance). Fall back to a FRESH throwaway profile so the
             // automation browser ALWAYS launches instead of dying on "个人资料出了点问题". We only lose
             // this run's saved cookies, never the agent's ability to drive the browser.
-            let fresh = std::env::temp_dir()
-                .join(format!("michael-ide-browser-{}", std::process::id()));
+            let fresh =
+                std::env::temp_dir().join(format!("michael-ide-browser-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&fresh);
             let opts2 = LaunchOptionsBuilder::default()
                 .path(Some(std::path::PathBuf::from(&path)))
@@ -344,7 +350,14 @@ fn enumerate_elements(tab: &Tab) -> Vec<BrowserElement> {
   }catch(e3){}
   return JSON.stringify(out);
 } catch (e) { return '[]'; } })()"##;
-    let js = raw.replace("__DRAW__", if DRAW_MARKS.load(Ordering::Relaxed) { "1" } else { "0" });
+    let js = raw.replace(
+        "__DRAW__",
+        if DRAW_MARKS.load(Ordering::Relaxed) {
+            "1"
+        } else {
+            "0"
+        },
+    );
     match tab.evaluate(&js, false) {
         Ok(ro) => {
             let s = ro
@@ -456,11 +469,15 @@ pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
     let url = url.trim().to_string();
     // Don't mangle URLs that already carry a scheme — the old code did `https://{url}` for anything
     // not http(s), turning `file:///D:/x.html` into `https://file:///D:/x.html` (看本地 html 就废了).
-    let url = if url.starts_with("http://") || url.starts_with("https://")
-        || url.starts_with("file://") || url.starts_with("about:") || url.starts_with("data:")
+    let url = if url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://")
+        || url.starts_with("about:")
+        || url.starts_with("data:")
     {
         url
-    } else if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic() {
+    } else if url.len() >= 2 && url.as_bytes()[1] == b':' && url.as_bytes()[0].is_ascii_alphabetic()
+    {
         // Windows drive path (D:\… or D:/…) → open as a local file
         format!("file:///{}", url.replace('\\', "/"))
     } else if url.starts_with('/') {
@@ -494,11 +511,7 @@ for(var k=0;k<fs.length;k++){{try{{
 return 'no'}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
-    let v = ro
-        .value
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
@@ -523,11 +536,7 @@ for(var k=0;k<fs.length;k++){{try{{
 return 'no'}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
-    let v = ro
-        .value
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
@@ -541,7 +550,9 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
-            Err(_) if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") => {
+            Err(_)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
                 enumerate_elements(tab);
                 std::thread::sleep(Duration::from_millis(150));
                 match tab.find_element(&selector) {
@@ -575,7 +586,9 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
     with_tab(move |tab| {
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
-            Err(_) if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") => {
+            Err(_)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
                 enumerate_elements(tab);
                 std::thread::sleep(Duration::from_millis(150));
                 match tab.find_element(&selector) {
@@ -602,13 +615,17 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
 /// Set the file(s) of a <input type=file> matching a CSS selector — so the agent can
 /// automate upload forms (which plain typing can't do). `paths` are absolute local paths.
 #[tauri::command]
-pub async fn browser_upload_file(selector: String, paths: Vec<String>) -> Result<BrowserState, String> {
+pub async fn browser_upload_file(
+    selector: String,
+    paths: Vec<String>,
+) -> Result<BrowserState, String> {
     with_tab(move |tab| {
         let el = tab
             .find_element(&selector)
             .map_err(|_| format!("找不到文件输入框: {selector}（要选中一个 <input type=file>）"))?;
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-        el.set_input_files(&refs).map_err(|e| format!("设置上传文件失败: {e}"))?;
+        el.set_input_files(&refs)
+            .map_err(|e| format!("设置上传文件失败: {e}"))?;
         Ok(None)
     })
     .await
@@ -630,9 +647,7 @@ pub async fn browser_press(key: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        let ro = tab
-            .evaluate(&script, true)
-            .map_err(|e| e.to_string())?;
+        let ro = tab.evaluate(&script, true).map_err(|e| e.to_string())?;
         let val = ro
             .value
             .map(|v| v.to_string())
@@ -670,7 +685,10 @@ pub async fn browser_scroll(amount: i32) -> Result<BrowserState, String> {
 /// to ~8s) or for a fixed `ms`. Lets the agent act on a LOADED page instead of a
 /// transient one (the #1 cause of flaky automation on SPAs / AJAX).
 #[tauri::command]
-pub async fn browser_wait(selector: Option<String>, ms: Option<u64>) -> Result<BrowserState, String> {
+pub async fn browser_wait(
+    selector: Option<String>,
+    ms: Option<u64>,
+) -> Result<BrowserState, String> {
     with_tab(move |tab| {
         // borrow (don't move) selector — the closure is Fn (may run twice on relaunch)
         match selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -707,15 +725,25 @@ pub fn browser_set_marks(on: bool) {
 #[tauri::command]
 pub async fn browser_cookies(domain: Option<String>) -> Result<BrowserState, String> {
     with_tab(move |tab| {
-        let all = tab.get_cookies().map_err(|e| format!("获取 cookies 失败: {e}"))?;
+        let all = tab
+            .get_cookies()
+            .map_err(|e| format!("获取 cookies 失败: {e}"))?;
         let result = serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into());
         if let Some(ref d) = domain {
-            let filtered: Vec<serde_json::Value> = serde_json::from_str::<Vec<serde_json::Value>>(&result)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|c| c.get("domain").and_then(|v| v.as_str()).unwrap_or("").contains(d.as_str()))
-                .collect();
-            Ok(Some(serde_json::to_string_pretty(&filtered).unwrap_or_else(|_| "[]".into())))
+            let filtered: Vec<serde_json::Value> =
+                serde_json::from_str::<Vec<serde_json::Value>>(&result)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| {
+                        c.get("domain")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .contains(d.as_str())
+                    })
+                    .collect();
+            Ok(Some(
+                serde_json::to_string_pretty(&filtered).unwrap_or_else(|_| "[]".into()),
+            ))
         } else {
             Ok(Some(result))
         }
@@ -728,8 +756,13 @@ pub async fn browser_cookies(domain: Option<String>) -> Result<BrowserState, Str
 pub async fn browser_storage(storage_type: Option<String>) -> Result<BrowserState, String> {
     with_tab(move |tab| {
         let st = storage_type.as_deref().unwrap_or("local");
-        let obj = if st == "session" { "sessionStorage" } else { "localStorage" };
-        let js = format!(r#"(() => {{
+        let obj = if st == "session" {
+            "sessionStorage"
+        } else {
+            "localStorage"
+        };
+        let js = format!(
+            r#"(() => {{
             try {{
                 const s = {obj};
                 const out = {{}};
@@ -739,9 +772,11 @@ pub async fn browser_storage(storage_type: Option<String>) -> Result<BrowserStat
                 }}
                 return JSON.stringify(out);
             }} catch(e) {{ return JSON.stringify({{ error: e.message }}); }}
-        }})()"#);
+        }})()"#
+        );
         let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
-        let s = ro.value
+        let s = ro
+            .value
             .and_then(|v| v.as_str().map(|x| x.to_string()))
             .unwrap_or_else(|| "{}".into());
         Ok(Some(s))
@@ -796,13 +831,22 @@ pub fn kill_orphaned_browsers() {
                     .output();
             }
             if !pids.is_empty() {
-                eprintln!("[browser] killed {} orphaned Chrome process(es)", pids.len());
+                eprintln!(
+                    "[browser] killed {} orphaned Chrome process(es)",
+                    pids.len()
+                );
             }
         }
         #[cfg(windows)]
         {
             let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/FI", "IMAGENAME eq chrome.exe", "/FI", "WINDOWTITLE eq rust-headless*"])
+                .args([
+                    "/F",
+                    "/FI",
+                    "IMAGENAME eq chrome.exe",
+                    "/FI",
+                    "WINDOWTITLE eq rust-headless*",
+                ])
                 .output();
         }
     });

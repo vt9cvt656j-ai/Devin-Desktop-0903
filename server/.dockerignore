@@ -1,6 +1,8 @@
-target
-.env
 .git
-deploy.sh
-deploy_key.pub
-*.md
+.env
+.env.*
+target
+*.bak
+*.bak.*
+*.pre-*
+src/src

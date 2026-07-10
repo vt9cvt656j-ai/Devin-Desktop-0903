@@ -17,6 +17,11 @@ pub struct Config {
     pub brevo_api_key: String,
     pub mail_from: String,
     pub mail_from_name: String,
+    // Speech-to-text (voice input) upstream — OpenAI-compatible /audio/transcriptions.
+    // Defaults to Groq's free Whisper-large-v3. Key from GROQ_API_KEY (or TRANSCRIBE_API_KEY).
+    pub transcribe_api_key: String,
+    pub transcribe_url: String,
+    pub transcribe_model: String,
 }
 
 impl Config {
@@ -33,8 +38,17 @@ impl Config {
             smtp_pass: std::env::var("QQ_SMTP_PASS").unwrap_or_default(),
             smtp_host: opt("SMTP_HOST", "smtp.qq.com"),
             brevo_api_key: std::env::var("BREVO_API_KEY").unwrap_or_default(),
-            mail_from: std::env::var("MAIL_FROM").unwrap_or_else(|_| std::env::var("QQ_SMTP_USER").unwrap_or_default()),
+            mail_from: std::env::var("MAIL_FROM")
+                .unwrap_or_else(|_| std::env::var("QQ_SMTP_USER").unwrap_or_default()),
             mail_from_name: opt("MAIL_FROM_NAME", "Michael"),
+            transcribe_api_key: std::env::var("GROQ_API_KEY")
+                .or_else(|_| std::env::var("TRANSCRIBE_API_KEY"))
+                .unwrap_or_default(),
+            transcribe_url: opt(
+                "TRANSCRIBE_URL",
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+            ),
+            transcribe_model: opt("TRANSCRIBE_MODEL", "whisper-large-v3"),
         })
     }
 

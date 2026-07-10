@@ -170,7 +170,7 @@ let _launchConfigsCache = null;
 
 // Central backend base URL (overridable via localStorage michael_api).
 function _michaelBase() {
-  return (localStorage.getItem("michael_api") || (inTauri ? "https://code.mrday.one:8443" : window.location.origin)).replace(/\/+$/, "");
+  return (localStorage.getItem("michael_api") || (inTauri ? "https://code.mrday.one" : window.location.origin)).replace(/\/+$/, "");
 }
 // POST to the central auth API; returns a _finishLogin-shaped result.
 async function _michaelAuth(path, body) {
@@ -5579,6 +5579,21 @@ let _cfgCache = null;
 let _store = null;
 
 async function getStore() {
+  if (!_store && !inTauri) {
+    const prefix = "michael-ide.browser-store.settings.";
+    _store = {
+      async get(key) {
+        try {
+          const raw = localStorage.getItem(prefix + key);
+          return raw == null ? null : JSON.parse(raw);
+        } catch { return null; }
+      },
+      async set(key, value) {
+        try { localStorage.setItem(prefix + key, JSON.stringify(value)); } catch {}
+      },
+      async save() {},
+    };
+  }
   if (!_store) _store = await loadStore("settings.json");
   return _store;
 }
@@ -5601,7 +5616,7 @@ async function migrateFromLocalStorage() {
 
 // Central model gateway. "Custom model mode" (per-user baseUrl/model) is removed:
 // every chat routes through this gateway; only the API key + picked model vary.
-const MICHAEL_API = (localStorage.getItem("michael_api") || (inTauri ? "https://code.mrday.one:8443" : window.location.origin)).replace(/\/+$/, "");
+const MICHAEL_API = (localStorage.getItem("michael_api") || (inTauri ? "https://code.mrday.one" : window.location.origin)).replace(/\/+$/, "");
 
 function loadConfig() {
   const c = _cfgCache || _DEFAULT_AI_CONFIG;
@@ -9774,6 +9789,22 @@ const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test au
 // tasks finish in 3-6 steps (waste of 40); big "实现完整 X / 重构整套" tasks routinely
 // need 50+ and shouldn't waste a turn extending. Heuristic, not exact — the dynamic
 // extension mechanism still kicks in when warranted.
+// Fast fallback used while the model-based intent classifier is still resolving.
+// Project-wide, implementation, and debugging requests must never be squeezed into
+// the short conversational budget.
+function _looksQuickAsk(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 240) return false;
+  if (_looksUIBuildTask(t) || _looksBugFixTask(t)) return false;
+  if (/(重构|重写|实现|搭建|迁移|整套|全部|批量|逐个|所有|整个|refactor|rewrite|implement|build|migrate|overhaul|revamp)/i.test(t)) return false;
+  if (/项目|工程|代码库|整个|整体|这些|这几个|各个|目录|文件夹|架构|梳理|剖析|摸清|通读|排查|审查|分析一下|优化一下|codebase|repo|architecture/i.test(t)) return false;
+  const isQuestion = /[?？]\s*$/.test(t)
+    || /^(what|why|how|when|where|who|which|is|are|can|does|do|should|explain|tell me)\b/i.test(t)
+    || /(为什么|为啥|是什么|什么意思|这是啥|怎么回事|是不是|对不对|能不能|可不可以|讲讲|解释|说明一下|看一下|看下|是干嘛|干什么用|有什么用|啥意思)/.test(t);
+  const tinyAction = /^(把|将|帮我|给我)?[^。.\n]{0,40}(改成|改为|换成|重命名|删掉|删除|加一行|加个注释|注释掉|格式化|rename|delete|remove|改个|改一下)[^。.\n]{0,24}$/i.test(t);
+  return isQuestion || tinyAction;
+}
+
 function _initialBudget(taskText, stack) {
   // Length-only heuristic — _classifyIntent (LLM) recalibrates budget within 1-2
   // turns, so this just needs a reasonable starting point, not keyword classification.
@@ -11862,7 +11893,7 @@ function _mapToolCall(name, args) {
       // 安全部署：构建 → 打包 → 带用户 JWT POST 到网关 /api/deploy（账号绑定 + 白名单 + 限大小 +
       // 防路径穿越安全解压 + 按账号隔离 + 纯静态无执行）。绝不给用户 SSH/root——多租户安全的关键。
       const _dn = (String(args.name || "site").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40)) || "site";
-      let _tok = "", _gw = "http://154.44.13.133";
+      let _tok = "", _gw = "https://code.mrday.one";
       try { _tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; } catch (_e) {}
       try { if (typeof _michaelBase === "function") _gw = _michaelBase() || _gw; } catch (_e) {}
       const _cmd = `set -e; echo '构建中…'; npm run build; d=''; for x in dist build out .output/public public; do [ -d "$x" ] && { d="$x"; break; }; done; [ -n "$d" ] || { echo '❌ 没找到构建产物目录(dist/build/out/.output/public)——先确保项目能 npm run build'; exit 1; }; echo "打包 $d/ …"; tar czf /tmp/mi-deploy.tar.gz -C "$d" .; echo "上传到网关（账号鉴权·隔离·限大小·安全解压）…"; curl -sS -X POST -H "Authorization: Bearer ${_tok}" --data-binary @/tmp/mi-deploy.tar.gz "${_gw}/api/deploy?name=${_dn}"; echo ""; rm -f /tmp/mi-deploy.tar.gz; echo '（返回的 url 就是自动分配好的 HTTPS 二级域名 名字.michaelide.xyz，可直接访问分享，不用再配任何 DNS；报 401=没登录、太大就精简后再传）'`;

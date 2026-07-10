@@ -167,8 +167,7 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
     // `Path::starts_with` already does this; the string forms add a trailing-'/'
     // (or exact-equal) check so a shared name prefix can't widen access.
     let within = |prefix: &str, candidate: &str| -> bool {
-        candidate == prefix
-            || candidate.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+        candidate == prefix || candidate.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
     };
 
     for root in roots.iter() {
@@ -273,7 +272,10 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
         return Err(format!("'{}' is a directory, not a file.", path));
     }
     if meta.len() > 25 * 1024 * 1024 {
-        return Err(format!("file too large ({} bytes) for a data URL", meta.len()));
+        return Err(format!(
+            "file too large ({} bytes) for a data URL",
+            meta.len()
+        ));
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
     let ext = std::path::Path::new(&path)
@@ -292,7 +294,11 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
         "avif" => "image/avif",
         _ => "application/octet-stream",
     };
-    Ok(format!("data:{};base64,{}", mime, crate::capture::b64(&bytes)))
+    Ok(format!(
+        "data:{};base64,{}",
+        mime,
+        crate::capture::b64(&bytes)
+    ))
 }
 
 /// Extract readable TEXT from a document (PDF / Word / Excel / PowerPoint), so the agent
@@ -327,7 +333,9 @@ pub fn read_document(path: String) -> Result<String, String> {
     };
     let t = text.trim();
     if t.is_empty() {
-        return Err("没从文档里提取到文本（可能是扫描件/纯图片 PDF——需要 OCR，本工具只读文本层）".into());
+        return Err(
+            "没从文档里提取到文本（可能是扫描件/纯图片 PDF——需要 OCR，本工具只读文本层）".into(),
+        );
     }
     Ok(t.to_string())
 }
@@ -336,7 +344,8 @@ pub fn read_document(path: String) -> Result<String, String> {
 fn extract_office(path: &str, want: impl Fn(&str) -> bool) -> Result<String, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("不是有效的 Office 文档(zip): {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| format!("不是有效的 Office 文档(zip): {e}"))?;
     let names: Vec<String> = (0..zip.len())
         .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
         .collect();
@@ -358,7 +367,15 @@ fn extract_office(path: &str, want: impl Fn(&str) -> bool) -> Result<String, Str
 /// rest of the tags, decode the common entities, collapse blank-line runs.
 fn strip_xml(xml: &str) -> String {
     let mut s = xml.to_string();
-    for tag in ["</w:p>", "</a:p>", "</text:p>", "</si>", "</row>", "<w:br/>", "<w:br></w:br>"] {
+    for tag in [
+        "</w:p>",
+        "</a:p>",
+        "</text:p>",
+        "</si>",
+        "</row>",
+        "<w:br/>",
+        "<w:br></w:br>",
+    ] {
         s = s.replace(tag, "\n");
     }
     s = s.replace("<w:tab/>", "\t");

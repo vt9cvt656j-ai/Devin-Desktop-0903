@@ -1,7 +1,19 @@
+name: server
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # CIS Docker: block in-container privilege escalation (setuid binaries can't
+    # gain new caps) — a defense-in-depth blast-radius limiter if a service is RCE'd.
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -13,30 +25,65 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging: *default-logging
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
 
   backend:
     build: .
     restart: unless-stopped
+    # Hardest containment on the only public-facing service: no privilege escalation,
+    # and drop ALL Linux capabilities (a Rust/axum HTTP server on :8080 needs none —
+    # no <1024 bind, no chown/setuid). If this is ever RCE'd, the shell is unprivileged
+    # and capability-less. Revert cap_drop if a future feature needs a capability.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     env_file: .env
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
       BIND_ADDR: 0.0.0.0:8080
+      DEPLOY_MAX_MB: "30"
+      # DEPLOY_ALLOWLIST: 逗号分隔的账号 id；admin 永远可部署，其他账号须在此白名单里（在 .env 配）。
+    volumes:
+      # 部署上传的静态站落到这里（按账号隔离），host 上 nginx 的 /s/ 服务它。
+      - /var/www/michael-sites:/var/www/michael-sites
+      # MusicGen weights are downloaded once on first use and survive image rebuilds.
+      - musiccache:/var/cache/michael/huggingface
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     ports:
-      - "8080:8080"
+      # Loopback-only: nginx (on the host) proxies to 127.0.0.1:8080. Publishing on
+      # 0.0.0.0 exposed the backend to the public internet, bypassing the 8443 TLS
+      # vhost — close that. Bind to 127.0.0.1 so only the local nginx can reach it.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging: *default-logging
 
 volumes:
   pgdata:
   redisdata:
+  musiccache:

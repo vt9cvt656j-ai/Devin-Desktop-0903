@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 fn tpl(s: &str, name: &str) -> String {
@@ -616,7 +616,7 @@ const GODOT_ICON_SVG: &str = r##"<svg height="128" width="128" xmlns="http://www
 
 // ─────────────────────────────────────────────────────────────────────
 
-async fn scaffold_web(dir: &PathBuf, proj: &str, html: &str, js: &str) -> Result<String, String> {
+async fn scaffold_web(dir: &Path, proj: &str, html: &str, js: &str) -> Result<String, String> {
     fs::write(dir.join("index.html"), tpl(html, proj))
         .await
         .map_err(|e| format!("写入 index.html 失败: {e}"))?;
@@ -634,22 +634,31 @@ async fn scaffold_web(dir: &PathBuf, proj: &str, html: &str, js: &str) -> Result
     ))
 }
 
-async fn scaffold_godot(dir: &PathBuf, proj: &str) -> Result<String, String> {
+async fn scaffold_godot(dir: &Path, proj: &str) -> Result<String, String> {
     let scenes = dir.join("scenes");
     let scripts = dir.join("scripts");
-    fs::create_dir_all(&scenes).await.map_err(|e| format!("mkdir scenes: {e}"))?;
-    fs::create_dir_all(&scripts).await.map_err(|e| format!("mkdir scripts: {e}"))?;
+    fs::create_dir_all(&scenes)
+        .await
+        .map_err(|e| format!("mkdir scenes: {e}"))?;
+    fs::create_dir_all(&scripts)
+        .await
+        .map_err(|e| format!("mkdir scripts: {e}"))?;
 
     fs::write(dir.join("project.godot"), tpl(GODOT_PROJECT, proj))
-        .await.map_err(|e| format!("写入 project.godot: {e}"))?;
+        .await
+        .map_err(|e| format!("写入 project.godot: {e}"))?;
     fs::write(scenes.join("main.tscn"), tpl(GODOT_MAIN_SCENE, proj))
-        .await.map_err(|e| format!("写入 main.tscn: {e}"))?;
+        .await
+        .map_err(|e| format!("写入 main.tscn: {e}"))?;
     fs::write(scripts.join("player.gd"), tpl(GODOT_PLAYER_GD, proj))
-        .await.map_err(|e| format!("写入 player.gd: {e}"))?;
+        .await
+        .map_err(|e| format!("写入 player.gd: {e}"))?;
     fs::write(scripts.join("hud.gd"), tpl(GODOT_HUD_GD, proj))
-        .await.map_err(|e| format!("写入 hud.gd: {e}"))?;
+        .await
+        .map_err(|e| format!("写入 hud.gd: {e}"))?;
     fs::write(dir.join("icon.svg"), GODOT_ICON_SVG)
-        .await.map_err(|e| format!("写入 icon.svg: {e}"))?;
+        .await
+        .map_err(|e| format!("写入 icon.svg: {e}"))?;
 
     Ok(format!(
         "✅ Godot 4 项目「{proj}」已创建\n\n\
@@ -682,7 +691,13 @@ pub async fn game_scaffold(
         name.trim()
             .to_lowercase()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>()
     };
 
@@ -693,8 +708,12 @@ pub async fn game_scaffold(
 
     match eng.as_str() {
         "godot" | "godot4" | "gd" | "gdscript" => scaffold_godot(&dir, &proj).await,
-        "threejs" | "three.js" | "three" => scaffold_web(&dir, &proj, THREEJS_HTML, THREEJS_JS).await,
-        "babylon" | "babylonjs" | "babylon.js" => scaffold_web(&dir, &proj, BABYLON_HTML, BABYLON_JS).await,
+        "threejs" | "three.js" | "three" => {
+            scaffold_web(&dir, &proj, THREEJS_HTML, THREEJS_JS).await
+        }
+        "babylon" | "babylonjs" | "babylon.js" => {
+            scaffold_web(&dir, &proj, BABYLON_HTML, BABYLON_JS).await
+        }
         "phaser" | "2d" => scaffold_web(&dir, &proj, PHASER_HTML, PHASER_JS).await,
         _ => {
             // Default: 3D games → Godot, 2D → Phaser

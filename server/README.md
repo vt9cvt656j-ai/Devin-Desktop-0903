@@ -41,16 +41,36 @@ curl localhost:8080/health
 Postgres + Redis + the backend come up together. Without `QQ_SMTP_*` set, codes
 are printed to the server log (dev mode) instead of emailed.
 
-## Deploy to your server
+## Production operations
 
-From a machine that can reach the server:
+The production compose file binds the backend to loopback. Nginx terminates TLS on
+ports 443 and 8443; PostgreSQL and Redis are never published to the host network.
+
+Deploy from this directory:
 
 ```bash
-SERVER_HOST=103.39.67.244 SERVER_PORT=19537 SERVER_USER=root ./deploy.sh
+SERVER_HOST=154.44.13.133 \
+SERVER_KEY=~/.ssh/michael_server \
+./deploy.sh
 ```
 
-It rsyncs the source, then runs `docker compose up -d --build` remotely. Put a
-real `.env` on the server first (the script reminds you).
+The script creates a database/site backup first, syncs source without touching
+the server `.env`, validates Compose, rebuilds, and waits for `/health`.
+
+Install the tracked Nginx configuration and daily backup timer once:
+
+```bash
+sudo install -m 0644 nginx/michael-backend.conf /etc/nginx/sites-available/michael-backend
+sudo install -m 0644 nginx/michaelide-sites.conf /etc/nginx/sites-available/michaelide-sites
+sudo install -m 0644 systemd/michael-db-backup.* /etc/systemd/system/
+sudo nginx -t && sudo systemctl reload nginx
+sudo systemctl daemon-reload
+sudo systemctl enable --now michael-db-backup.timer
+```
+
+Backups are written atomically to `/var/backups/michael-ide`, verified with
+`pg_restore --list`, checksummed, and retained for 14 days by default. A separate
+off-host snapshot should still be configured for disaster recovery.
 
 ## Make yourself an admin
 
@@ -63,5 +83,5 @@ UPDATE users SET role = 'admin' WHERE email = 'you@qq.com';
 ## Security
 
 - Real `.env` is git-ignored; never commit secrets.
-- Put this behind Nginx + TLS in production; only expose 443.
+- Nginx terminates TLS; the backend is published only on `127.0.0.1:8080`.
 - Use SSH keys (not the root password) and a firewall on the VPS.

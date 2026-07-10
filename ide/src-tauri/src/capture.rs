@@ -3,7 +3,6 @@
 //! Chromium/Chrome/Edge is installed; degrades with a clear message when none is.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Candidate headless-browser binaries / app paths, in preference order.
@@ -116,10 +115,10 @@ pub fn bytes_to_jpeg_data_url(bytes: &[u8], max_w: u32, quality: u8) -> Result<S
 /// routes localhost/LAN through a corporate proxy and "can't reach" the dev server
 /// (the user's "内网不能访问").
 fn host_is_local(url: &str) -> bool {
-    let after = url.splitn(2, "://").nth(1).unwrap_or(url);
+    let after = url.split_once("://").map(|x| x.1).unwrap_or(url);
     let authority = after.split(['/', '?', '#']).next().unwrap_or("");
     let hostport = authority.rsplit('@').next().unwrap_or(authority); // drop userinfo
-    // host without port — handle bracketed IPv6 like [::1]:3000
+                                                                      // host without port — handle bracketed IPv6 like [::1]:3000
     let host = if let Some(rest) = hostport.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
     } else {
@@ -163,7 +162,14 @@ fn run_capture(browser: &str, url: &str, out: &str, w: u32, h: u32) -> Result<()
 /// Capture with a custom virtual-time budget (ms). A larger budget lets the page
 /// run longer before the shot — so a sequence of increasing budgets samples an
 /// animation at successive points in time (the basis of the filmstrip capture).
-fn run_capture_t(browser: &str, url: &str, out: &str, w: u32, h: u32, budget_ms: u32) -> Result<(), String> {
+fn run_capture_t(
+    browser: &str,
+    url: &str,
+    out: &str,
+    w: u32,
+    h: u32,
+    budget_ms: u32,
+) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "--headless=new".into(),
         "--disable-gpu".into(),
@@ -307,7 +313,8 @@ pub async fn capture_url_frames(
     let mut imgs: Vec<image::DynamicImage> = Vec::new();
     for i in 0..n {
         let budget = (total as u64 * (i as u64 + 1) / n as u64).max(200) as u32;
-        let out = std::env::temp_dir().join(format!("michael_ide_frame_{}.png", uuid::Uuid::new_v4()));
+        let out =
+            std::env::temp_dir().join(format!("michael_ide_frame_{}.png", uuid::Uuid::new_v4()));
         let out_str = out.to_string_lossy().to_string();
         let (b, u2, o2) = (browser.clone(), url.clone(), out_str.clone());
         tauri::async_runtime::spawn_blocking(move || run_capture_t(&b, &u2, &o2, w, h, budget))
@@ -329,7 +336,7 @@ pub async fn capture_url_frames(
     // Stack vertically with a 6px dark separator between frames.
     let fw = imgs.iter().map(|i| i.width()).max().unwrap_or(w);
     let sep: u32 = 6;
-    let total_h: u32 = imgs.iter().map(|i| i.height()).sum::<u32>() + sep * (imgs.len() as u32 - 1).max(0);
+    let total_h: u32 = imgs.iter().map(|i| i.height()).sum::<u32>() + sep * (imgs.len() as u32 - 1);
     let mut canvas = image::RgbImage::from_pixel(fw, total_h.max(1), image::Rgb([24, 24, 28]));
     let mut y: i64 = 0;
     for img in &imgs {

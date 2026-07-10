@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,11 +12,24 @@ fn safe_dest(root: &str, sub: &str, name: &str, ext: &str) -> Result<PathBuf, St
     let base = Path::new(root);
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let fname = if sanitized.is_empty() { "asset".to_string() } else { sanitized };
+    let fname = if sanitized.is_empty() {
+        "asset".to_string()
+    } else {
+        sanitized
+    };
     let target = base.join("assets").join(sub).join(format!("{fname}.{ext}"));
-    if target.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err("路径不能包含 ..".into());
     }
     if let Some(p) = target.parent() {
@@ -48,6 +60,9 @@ async fn gateway_post(
     Ok(resp)
 }
 
+// Mirrors the gateway route plus the destination tuple; keeping these fields
+// explicit makes every Tauri command call site auditable.
+#[allow(clippy::too_many_arguments)]
 async fn gateway_download(
     base_url: &str,
     api_key: &str,
@@ -128,7 +143,17 @@ pub async fn generate_3d(
         "style": style.unwrap_or_else(|| "realistic".into()),
         "model": model.unwrap_or_default(),
     });
-    gateway_download(&base_url, &api_key, "generate-3d", &body, &workspace, "models", &name, "glb").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-3d",
+        &body,
+        &workspace,
+        "models",
+        &name,
+        "glb",
+    )
+    .await
 }
 
 // ── 2. Sound Effect Generation ──────────────────────────────────────
@@ -149,7 +174,17 @@ pub async fn generate_sound(
         "prompt": prompt.trim(),
         "duration": duration.unwrap_or(5.0),
     });
-    gateway_download(&base_url, &api_key, "generate-sound", &body, &workspace, "audio", &name, "mp3").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-sound",
+        &body,
+        &workspace,
+        "audio",
+        &name,
+        "mp3",
+    )
+    .await
 }
 
 // ── 3. Music Generation ────────────────────────────────────────────
@@ -170,7 +205,17 @@ pub async fn generate_music(
         "prompt": prompt.trim(),
         "duration": duration.unwrap_or(30.0),
     });
-    gateway_download(&base_url, &api_key, "generate-music", &body, &workspace, "music", &name, "mp3").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-music",
+        &body,
+        &workspace,
+        "music",
+        &name,
+        "mp3",
+    )
+    .await
 }
 
 // ── 4. Voice / TTS ──────────────────────────────────────────────────
@@ -191,7 +236,17 @@ pub async fn generate_voice(
         "text": text.trim(),
         "voice": voice.unwrap_or_else(|| "default".into()),
     });
-    gateway_download(&base_url, &api_key, "generate-voice", &body, &workspace, "voice", &name, "mp3").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-voice",
+        &body,
+        &workspace,
+        "voice",
+        &name,
+        "mp3",
+    )
+    .await
 }
 
 // ── 5. Auto-Rig ────────────────────────────────────────────────────
@@ -215,7 +270,10 @@ pub async fn auto_rig(
         "model_data": b64,
         "format": ext,
     });
-    gateway_download(&base_url, &api_key, "auto-rig", &body, &workspace, "models", &name, "glb").await
+    gateway_download(
+        &base_url, &api_key, "auto-rig", &body, &workspace, "models", &name, "glb",
+    )
+    .await
 }
 
 // ── 6. Motion / Animation Generation ───────────────────────────────
@@ -236,7 +294,17 @@ pub async fn generate_motion(
         "prompt": prompt.trim(),
         "duration": duration.unwrap_or(3.0),
     });
-    gateway_download(&base_url, &api_key, "generate-motion", &body, &workspace, "animations", &name, "glb").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-motion",
+        &body,
+        &workspace,
+        "animations",
+        &name,
+        "glb",
+    )
+    .await
 }
 
 // ── 7. Texture / Material Generation ───────────────────────────────
@@ -257,7 +325,17 @@ pub async fn generate_texture(
         "prompt": prompt.trim(),
         "resolution": resolution.unwrap_or(1024),
     });
-    gateway_download(&base_url, &api_key, "generate-texture", &body, &workspace, "textures", &name, "png").await
+    gateway_download(
+        &base_url,
+        &api_key,
+        "generate-texture",
+        &body,
+        &workspace,
+        "textures",
+        &name,
+        "png",
+    )
+    .await
 }
 
 // ── 8. Search Game Assets ──────────────────────────────────────────

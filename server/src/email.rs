@@ -17,7 +17,13 @@ fn admin_only(claims: &Claims) -> ApiResult<()> {
 
 /// Send a single email via the Brevo transactional HTTP API (over HTTPS/443, so
 /// it works even when the host's outbound SMTP ports are blocked).
-pub async fn send_mail(cfg: &Config, to: &str, subject: &str, body: &str, html: bool) -> ApiResult<()> {
+pub async fn send_mail(
+    cfg: &Config,
+    to: &str,
+    subject: &str,
+    body: &str,
+    html: bool,
+) -> ApiResult<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -44,7 +50,14 @@ pub async fn send_mail(cfg: &Config, to: &str, subject: &str, body: &str, html: 
     Ok(())
 }
 
-async fn log_email(state: &AppState, to: &str, subject: &str, status: &str, error: Option<&str>, by: &str) {
+async fn log_email(
+    state: &AppState,
+    to: &str,
+    subject: &str,
+    status: &str,
+    error: Option<&str>,
+    by: &str,
+) {
     let _ = sqlx::query("INSERT INTO email_logs (to_email, subject, status, error, sent_by) VALUES ($1,$2,$3,$4,$5)")
         .bind(to)
         .bind(subject)
@@ -66,7 +79,11 @@ pub struct NotifyReq {
 }
 
 /// POST /api/admin/notify — send a notification to all users / a plan tier / one address.
-pub async fn notify(State(state): State<AppState>, claims: Claims, Json(req): Json<NotifyReq>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn notify(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<NotifyReq>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     if req.subject.trim().is_empty() || req.body.trim().is_empty() {
         return Err(AppError::bad("主题和内容不能为空"));
@@ -82,10 +99,12 @@ pub async fn notify(State(state): State<AppState>, claims: Claims, Json(req): Js
             if plan.is_empty() {
                 return Err(AppError::bad("请选择套餐"));
             }
-            sqlx::query_scalar("SELECT email FROM users WHERE plan = $1 ORDER BY created_at DESC LIMIT 2000")
-                .bind(plan)
-                .fetch_all(&state.db)
-                .await?
+            sqlx::query_scalar(
+                "SELECT email FROM users WHERE plan = $1 ORDER BY created_at DESC LIMIT 2000",
+            )
+            .bind(plan)
+            .fetch_all(&state.db)
+            .await?
         }
         "one" => {
             let e = req.email.as_deref().unwrap_or("").trim().to_string();
@@ -106,7 +125,15 @@ pub async fn notify(State(state): State<AppState>, claims: Claims, Json(req): Js
     let mut failed = 0u32;
     for to in &recipients {
         if dev {
-            log_email(&state, to, &req.subject, "dev", Some("SMTP 未配置"), &claims.email).await;
+            log_email(
+                &state,
+                to,
+                &req.subject,
+                "dev",
+                Some("SMTP 未配置"),
+                &claims.email,
+            )
+            .await;
             continue;
         }
         match send_mail(&state.cfg, to, &req.subject, &req.body, html).await {
@@ -116,12 +143,28 @@ pub async fn notify(State(state): State<AppState>, claims: Claims, Json(req): Js
             }
             Err(e) => {
                 failed += 1;
-                log_email(&state, to, &req.subject, "failed", Some(e.msg.as_str()), &claims.email).await;
+                log_email(
+                    &state,
+                    to,
+                    &req.subject,
+                    "failed",
+                    Some(e.msg.as_str()),
+                    &claims.email,
+                )
+                .await;
             }
         }
     }
-    crate::realtime::record_event(&state, None, "notify", json!({ "by": claims.email, "total": recipients.len(), "sent": sent })).await;
-    Ok(Json(json!({ "total": recipients.len(), "sent": sent, "failed": failed, "dev": dev })))
+    crate::realtime::record_event(
+        &state,
+        None,
+        "notify",
+        json!({ "by": claims.email, "total": recipients.len(), "sent": sent }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "total": recipients.len(), "sent": sent, "failed": failed, "dev": dev }),
+    ))
 }
 
 #[derive(Serialize, sqlx::FromRow)]

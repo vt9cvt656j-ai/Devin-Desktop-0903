@@ -1,7 +1,11 @@
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+
+type DeepSearchHit = (String, String, String, &'static str);
+type DeepSearchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DeepSearchHit>> + Send>>;
 
 fn kclient() -> Result<Client, String> {
     Client::builder()
@@ -25,10 +29,7 @@ fn trunc(s: &str, max: usize) -> &str {
 // ── Academic papers (Semantic Scholar) ──────────────────────────────
 
 #[tauri::command]
-pub async fn academic_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn academic_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
 
@@ -37,7 +38,10 @@ pub async fn academic_search(
         .query(&[
             ("query", query.as_str()),
             ("limit", &limit.to_string()),
-            ("fields", "title,abstract,year,citationCount,url,authors,externalIds"),
+            (
+                "fields",
+                "title,abstract,year,citationCount,url,authors,externalIds",
+            ),
         ])
         .send()
         .await
@@ -147,7 +151,7 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
 
 async fn search_pypi(c: &Client, q: &str) -> Result<String, String> {
     let resp = c
-        .get(&format!("https://pypi.org/pypi/{q}/json"))
+        .get(format!("https://pypi.org/pypi/{q}/json"))
         .send()
         .await
         .map_err(|e| format!("PyPI: {e}"))?;
@@ -242,17 +246,25 @@ async fn search_pub(c: &Client, q: &str, limit: u32) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("pub.dev returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("pub.dev JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("pub.dev JSON: {e}"))?;
     let mut out = String::from("pub.dev (Dart/Flutter) packages:\n\n");
     if let Some(packages) = json["packages"].as_array() {
         for (i, p) in packages.iter().take(limit as usize).enumerate() {
             let name = p["package"].as_str().unwrap_or("?");
-            if let Ok(dr) = c.get(&format!("https://pub.dev/api/packages/{name}")).send().await {
+            if let Ok(dr) = c
+                .get(format!("https://pub.dev/api/packages/{name}"))
+                .send()
+                .await
+            {
                 if let Ok(d) = dr.json::<Value>().await {
                     let ps = &d["latest"]["pubspec"];
                     out.push_str(&format!(
                         "{}. {} v{}\n   {}\n   https://pub.dev/packages/{}\n\n",
-                        i + 1, name,
+                        i + 1,
+                        name,
                         ps["version"].as_str().unwrap_or("?"),
                         trunc(ps["description"].as_str().unwrap_or("").trim(), 200),
                         name,
@@ -260,7 +272,12 @@ async fn search_pub(c: &Client, q: &str, limit: u32) -> Result<String, String> {
                     continue;
                 }
             }
-            out.push_str(&format!("{}. {}\n   https://pub.dev/packages/{}\n\n", i + 1, name, name));
+            out.push_str(&format!(
+                "{}. {}\n   https://pub.dev/packages/{}\n\n",
+                i + 1,
+                name,
+                name
+            ));
         }
     }
     Ok(out)
@@ -276,7 +293,10 @@ async fn search_conda(c: &Client, q: &str, limit: u32) -> Result<String, String>
     if !resp.status().is_success() {
         return Err(format!("Anaconda returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("Anaconda JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Anaconda JSON: {e}"))?;
     let mut out = String::from("Anaconda/Conda packages:\n\n");
     if let Some(pkgs) = json.as_array() {
         for (i, p) in pkgs.iter().take(limit as usize).enumerate() {
@@ -306,7 +326,10 @@ async fn search_cocoapods(c: &Client, q: &str, limit: u32) -> Result<String, Str
     if !resp.status().is_success() {
         return Err(format!("CocoaPods returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("CocoaPods JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("CocoaPods JSON: {e}"))?;
     let mut out = String::from("CocoaPods (iOS/macOS) pods:\n\n");
     if let Some(pods) = json.as_array() {
         for (i, p) in pods.iter().enumerate() {
@@ -317,7 +340,8 @@ async fn search_cocoapods(c: &Client, q: &str, limit: u32) -> Result<String, Str
                 id,
                 p["version"].as_str().unwrap_or("?"),
                 trunc(p["summary"].as_str().unwrap_or(""), 200),
-                p["source"].as_object()
+                p["source"]
+                    .as_object()
                     .and_then(|s| s.get("git"))
                     .and_then(|g| g.as_str())
                     .unwrap_or(""),
@@ -347,7 +371,11 @@ async fn search_hex(c: &Client, q: &str, limit: u32) -> Result<String, String> {
             let dl = p["downloads"]["all"].as_u64().unwrap_or(0);
             out.push_str(&format!(
                 "{}. {}\n   {}\n   Downloads: {} | https://hex.pm/packages/{}\n\n",
-                i + 1, name, trunc(desc, 200), dl, name,
+                i + 1,
+                name,
+                trunc(desc, 200),
+                dl,
+                name,
             ));
         }
     }
@@ -425,10 +453,7 @@ pub async fn github_search(
 // ── CVE / NVD vulnerability database ───────────────────────────────
 
 #[tauri::command]
-pub async fn cve_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
 
@@ -522,7 +547,9 @@ pub async fn wiki_search(
         .map_err(|e| format!("Wikipedia: {e}"))?;
 
     let json: Value = resp.json().await.map_err(|e| format!("Wiki JSON: {e}"))?;
-    let total = json["query"]["searchinfo"]["totalhits"].as_u64().unwrap_or(0);
+    let total = json["query"]["searchinfo"]["totalhits"]
+        .as_u64()
+        .unwrap_or(0);
     let mut out = format!("Wikipedia ({l}): {total} results\n\n");
 
     if let Some(results) = json["query"]["search"].as_array() {
@@ -665,7 +692,7 @@ pub async fn hackernews_search(
     };
 
     let resp = c
-        .get(&format!("https://hn.algolia.com/api/v1/{endpoint}"))
+        .get(format!("https://hn.algolia.com/api/v1/{endpoint}"))
         .query(&[
             ("query", query.as_str()),
             ("tags", "story"),
@@ -704,10 +731,7 @@ pub async fn hackernews_search(
 // ── PubMed (NCBI E-utilities) ─────────────────────────────────────
 
 #[tauri::command]
-pub async fn pubmed_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn pubmed_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
 
@@ -724,7 +748,10 @@ pub async fn pubmed_search(
         .await
         .map_err(|e| format!("PubMed search: {e}"))?;
 
-    let sj: Value = search_resp.json().await.map_err(|e| format!("PubMed JSON: {e}"))?;
+    let sj: Value = search_resp
+        .json()
+        .await
+        .map_err(|e| format!("PubMed JSON: {e}"))?;
     let ids: Vec<&str> = sj["esearchresult"]["idlist"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
@@ -743,7 +770,10 @@ pub async fn pubmed_search(
         .await
         .map_err(|e| format!("PubMed summary: {e}"))?;
 
-    let dj: Value = sum_resp.json().await.map_err(|e| format!("PubMed JSON: {e}"))?;
+    let dj: Value = sum_resp
+        .json()
+        .await
+        .map_err(|e| format!("PubMed JSON: {e}"))?;
     let mut out = format!("PubMed: {total} results (showing {}):\n\n", ids.len());
 
     if let Some(result) = dj["result"].as_object() {
@@ -891,7 +921,10 @@ pub async fn crossref_search(
             ("rows", &limit.to_string()),
             ("sort", "relevance"),
         ])
-        .header("User-Agent", "Michael-IDE/1.0 (mailto:contact@michaelide.xyz)")
+        .header(
+            "User-Agent",
+            "Michael-IDE/1.0 (mailto:contact@michaelide.xyz)",
+        )
         .send()
         .await
         .map_err(|e| format!("CrossRef: {e}"))?;
@@ -900,7 +933,10 @@ pub async fn crossref_search(
         return Err(format!("CrossRef returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("CrossRef JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("CrossRef JSON: {e}"))?;
     let total = json["message"]["total-results"].as_u64().unwrap_or(0);
     let mut out = format!("CrossRef: {total} results\n\n");
 
@@ -985,7 +1021,10 @@ pub async fn openalex_search(
         return Err(format!("OpenAlex returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("OpenAlex JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("OpenAlex JSON: {e}"))?;
     let total = json["meta"]["count"].as_u64().unwrap_or(0);
     let mut out = format!("OpenAlex ({etype}): {total} results\n\n");
 
@@ -994,16 +1033,25 @@ pub async fn openalex_search(
             "works" => {
                 for (i, w) in results.iter().enumerate() {
                     let title = w["title"].as_str().unwrap_or("?");
-                    let year = w["publication_year"].as_u64().map(|y| y.to_string()).unwrap_or_default();
+                    let year = w["publication_year"]
+                        .as_u64()
+                        .map(|y| y.to_string())
+                        .unwrap_or_default();
                     let cited = w["cited_by_count"].as_u64().unwrap_or(0);
                     let oa = w["open_access"]["is_oa"].as_bool().unwrap_or(false);
                     let doi = w["doi"].as_str().unwrap_or("");
-                    let venue = w["primary_location"]["source"]["display_name"].as_str().unwrap_or("");
+                    let venue = w["primary_location"]["source"]["display_name"]
+                        .as_str()
+                        .unwrap_or("");
                     let w_type = w["type"].as_str().unwrap_or("?");
 
                     let authors: Vec<&str> = w["authorships"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|x| x["author"]["display_name"].as_str()).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x["author"]["display_name"].as_str())
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let auth_str = if authors.len() > 3 {
                         format!("{}, {} et al.", authors[0], authors[1])
@@ -1013,7 +1061,12 @@ pub async fn openalex_search(
 
                     let topics: Vec<&str> = w["topics"]
                         .as_array()
-                        .map(|t| t.iter().take(3).filter_map(|x| x["display_name"].as_str()).collect())
+                        .map(|t| {
+                            t.iter()
+                                .take(3)
+                                .filter_map(|x| x["display_name"].as_str())
+                                .collect()
+                        })
                         .unwrap_or_default();
 
                     out.push_str(&format!(
@@ -1036,7 +1089,11 @@ pub async fn openalex_search(
                         .unwrap_or("?");
                     out.push_str(&format!(
                         "{}. {}\n   Institution: {} | Works: {} | Cited: {}\n\n",
-                        i + 1, name, inst, works, cited,
+                        i + 1,
+                        name,
+                        inst,
+                        works,
+                        cited,
                     ));
                 }
             }
@@ -1055,17 +1112,14 @@ pub async fn openalex_search(
 // ── PubChem (chemical compounds) ─────────────────────────────────
 
 #[tauri::command]
-pub async fn pubchem_search(
-    query: String,
-    search_type: Option<String>,
-) -> Result<String, String> {
+pub async fn pubchem_search(query: String, search_type: Option<String>) -> Result<String, String> {
     let c = kclient()?;
     let stype = search_type.as_deref().unwrap_or("compound");
 
     match stype {
         "compound" => {
             let auto_resp = c
-                .get(&format!(
+                .get(format!(
                     "https://pubchem.ncbi.nlm.nih.gov/rest/autocomplete/{stype}/{query}/json"
                 ))
                 .query(&[("limit", "8")])
@@ -1073,7 +1127,10 @@ pub async fn pubchem_search(
                 .await
                 .map_err(|e| format!("PubChem autocomplete: {e}"))?;
 
-            let auto_json: Value = auto_resp.json().await.map_err(|e| format!("PubChem JSON: {e}"))?;
+            let auto_json: Value = auto_resp
+                .json()
+                .await
+                .map_err(|e| format!("PubChem JSON: {e}"))?;
             let names: Vec<&str> = auto_json["dictionary_terms"]["compound"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
@@ -1085,7 +1142,7 @@ pub async fn pubchem_search(
 
             let first = names[0];
             let prop_resp = c
-                .get(&format!(
+                .get(format!(
                     "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{first}/property/MolecularFormula,MolecularWeight,IUPACName,InChIKey,XLogP,ExactMass,Charge/JSON"
                 ))
                 .send()
@@ -1095,7 +1152,10 @@ pub async fn pubchem_search(
             let mut out = format!("PubChem matches: {}\n\n", names.join(", "));
 
             if prop_resp.status().is_success() {
-                let pj: Value = prop_resp.json().await.map_err(|e| format!("PubChem JSON: {e}"))?;
+                let pj: Value = prop_resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("PubChem JSON: {e}"))?;
                 if let Some(props) = pj["PropertyTable"]["Properties"].as_array() {
                     if let Some(p) = props.first() {
                         let cid = p["CID"].as_u64().unwrap_or(0);
@@ -1117,7 +1177,9 @@ pub async fn pubchem_search(
             }
             Ok(out)
         }
-        _ => Err(format!("Unknown PubChem search_type '{stype}'. Use: compound")),
+        _ => Err(format!(
+            "Unknown PubChem search_type '{stype}'. Use: compound"
+        )),
     }
 }
 
@@ -1167,7 +1229,9 @@ pub async fn clinical_trials_search(
             let nct_id = id_mod["nctId"].as_str().unwrap_or("?");
             let title = id_mod["briefTitle"].as_str().unwrap_or("?");
             let overall_status = status_mod["overallStatus"].as_str().unwrap_or("?");
-            let start_date = status_mod["startDateStruct"]["date"].as_str().unwrap_or("?");
+            let start_date = status_mod["startDateStruct"]["date"]
+                .as_str()
+                .unwrap_or("?");
             let study_type = design_mod["studyType"].as_str().unwrap_or("?");
             let phases: Vec<&str> = design_mod["phases"]
                 .as_array()
@@ -1215,19 +1279,13 @@ pub async fn clinical_trials_search(
 // ── Docker Hub ────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn dockerhub_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(25);
 
     let resp = c
         .get("https://hub.docker.com/v2/search/repositories/")
-        .query(&[
-            ("query", query.as_str()),
-            ("page_size", &limit.to_string()),
-        ])
+        .query(&[("query", query.as_str()), ("page_size", &limit.to_string())])
         .send()
         .await
         .map_err(|e| format!("Docker Hub: {e}"))?;
@@ -1277,7 +1335,10 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
         .send()
         .await
         .map_err(|e| format!("GitLab: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("GitLab parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("GitLab parse: {e}"))?;
     let arr = data.as_array().ok_or("GitLab: unexpected response")?;
     if arr.is_empty() {
         return Ok(format!("No GitLab projects found for '{query}'"));
@@ -1413,10 +1474,7 @@ pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<Str
 // ── Packagist (PHP) ───────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn packagist_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -1425,10 +1483,11 @@ pub async fn packagist_search(
         .send()
         .await
         .map_err(|e| format!("Packagist: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("Packagist parse: {e}"))?;
-    let results = data["results"]
-        .as_array()
-        .ok_or("Packagist: no results")?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Packagist parse: {e}"))?;
+    let results = data["results"].as_array().ok_or("Packagist: no results")?;
     if results.is_empty() {
         return Ok(format!("No Packagist packages found for '{query}'"));
     }
@@ -1455,10 +1514,7 @@ pub async fn packagist_search(
 // ── RubyGems ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn rubygems_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = client
@@ -1467,7 +1523,10 @@ pub async fn rubygems_search(
         .send()
         .await
         .map_err(|e| format!("RubyGems: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("RubyGems parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("RubyGems parse: {e}"))?;
     let arr = data.as_array().ok_or("RubyGems: unexpected response")?;
     if arr.is_empty() {
         return Ok(format!("No RubyGems found for '{query}'"));
@@ -1524,12 +1583,7 @@ pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<Str
                     .collect::<Vec<_>>()
                     .join(", ")
             })
-            .unwrap_or_else(|| {
-                r["authors"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string()
-            });
+            .unwrap_or_else(|| r["authors"].as_str().unwrap_or("").to_string());
         out.push_str(&format!(
             "{}. {} (v{}){}\n   {}\n   Authors: {} | Downloads: {}\n   https://www.nuget.org/packages/{}\n\n",
             i + 1,
@@ -1692,7 +1746,10 @@ pub async fn bundlephobia_search(package: String) -> Result<String, String> {
             package
         ));
     }
-    let d: Value = resp.json().await.map_err(|e| format!("Bundlephobia parse: {e}"))?;
+    let d: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Bundlephobia parse: {e}"))?;
     let name = d["name"].as_str().unwrap_or("?");
     let version = d["version"].as_str().unwrap_or("?");
     let size = d["size"].as_u64().unwrap_or(0);
@@ -1739,7 +1796,10 @@ pub async fn devto_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("Dev.to: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("Dev.to parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Dev.to parse: {e}"))?;
     let arr = data.as_array().ok_or("Dev.to: unexpected response")?;
     if arr.is_empty() {
         return Ok(format!("No Dev.to articles found for '{query}'"));
@@ -1764,10 +1824,15 @@ pub async fn devto_search(query: String, max_results: Option<u32>) -> Result<Str
         let desc = a["description"].as_str().unwrap_or("");
         out.push_str(&format!(
             "{}. {}\n   by @{} | ❤️{} | 💬{} | {}\n   Tags: {}\n   {}\n   {}\n\n",
-            i + 1, title, user, reactions, comments,
+            i + 1,
+            title,
+            user,
+            reactions,
+            comments,
             &published[..published.len().min(10)],
             if tags.is_empty() { "-" } else { &tags },
-            trunc(desc, 120), url
+            trunc(desc, 120),
+            url
         ));
     }
     Ok(out)
@@ -1807,7 +1872,10 @@ pub async fn reddit_search(
             resp.status()
         ));
     }
-    let data: Value = resp.json().await.map_err(|e| format!("Reddit parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Reddit parse: {e}"))?;
     let posts = data["data"]["children"]
         .as_array()
         .ok_or("Reddit: no data")?;
@@ -1826,8 +1894,14 @@ pub async fn reddit_search(
         let permalink = d["permalink"].as_str().unwrap_or("");
         out.push_str(&format!(
             "{}. [r/{}] {}\n   by u/{} | ⬆️{} | 💬{}\n   {}\n   https://reddit.com{}\n\n",
-            i + 1, sub, title, author, score, comments,
-            trunc(selftext, 150), permalink
+            i + 1,
+            sub,
+            title,
+            author,
+            score,
+            comments,
+            trunc(selftext, 150),
+            permalink
         ));
     }
     Ok(out)
@@ -1841,11 +1915,7 @@ pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<Str
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
         .get("https://store.steampowered.com/api/storesearch/")
-        .query(&[
-            ("term", query.as_str()),
-            ("l", "schinese"),
-            ("cc", "CN"),
-        ])
+        .query(&[("term", query.as_str()), ("l", "schinese"), ("cc", "CN")])
         .send()
         .await
         .map_err(|e| format!("Steam: {e}"))?;
@@ -1858,19 +1928,28 @@ pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<Str
     for (i, g) in items.iter().take(n as usize).enumerate() {
         let name = g["name"].as_str().unwrap_or("?");
         let appid = g["id"].as_u64().unwrap_or(0);
-        let price = g["price"].as_object().map(|p| {
-            let final_price = p.get("final").and_then(|v| v.as_u64()).unwrap_or(0);
-            if final_price == 0 {
-                "Free".to_string()
-            } else {
-                format!("¥{:.2}", final_price as f64 / 100.0)
-            }
-        }).unwrap_or_else(|| "N/A".to_string());
+        let price = g["price"]
+            .as_object()
+            .map(|p| {
+                let final_price = p.get("final").and_then(|v| v.as_u64()).unwrap_or(0);
+                if final_price == 0 {
+                    "Free".to_string()
+                } else {
+                    format!("¥{:.2}", final_price as f64 / 100.0)
+                }
+            })
+            .unwrap_or_else(|| "N/A".to_string());
         let platforms = {
             let mut pl = Vec::new();
-            if g["platforms"]["windows"].as_bool().unwrap_or(false) { pl.push("Win"); }
-            if g["platforms"]["mac"].as_bool().unwrap_or(false) { pl.push("Mac"); }
-            if g["platforms"]["linux"].as_bool().unwrap_or(false) { pl.push("Linux"); }
+            if g["platforms"]["windows"].as_bool().unwrap_or(false) {
+                pl.push("Win");
+            }
+            if g["platforms"]["mac"].as_bool().unwrap_or(false) {
+                pl.push("Mac");
+            }
+            if g["platforms"]["linux"].as_bool().unwrap_or(false) {
+                pl.push("Linux");
+            }
             pl.join("/")
         };
         out.push_str(&format!(
@@ -1893,7 +1972,10 @@ pub async fn iconify_search(query: String, max_results: Option<u32>) -> Result<S
         .send()
         .await
         .map_err(|e| format!("Iconify: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("Iconify parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Iconify parse: {e}"))?;
     let icons = data["icons"].as_array().ok_or("Iconify: no icons")?;
     if icons.is_empty() {
         return Ok(format!("No icons found for '{query}'"));
@@ -1934,7 +2016,10 @@ pub async fn color_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("ColourLovers: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("ColourLovers parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("ColourLovers parse: {e}"))?;
     let palettes = data.as_array().ok_or("ColourLovers: unexpected response")?;
     if palettes.is_empty() {
         return Ok(format!("No color palettes found for '{query}'"));
@@ -1957,7 +2042,12 @@ pub async fn color_search(query: String, max_results: Option<u32>) -> Result<Str
         let url = p["url"].as_str().unwrap_or("");
         out.push_str(&format!(
             "{}. {} (by {})\n   Colors: {}\n   Votes: {} | {}\n\n",
-            i + 1, title, user, colors, votes, url
+            i + 1,
+            title,
+            user,
+            colors,
+            votes,
+            url
         ));
     }
     Ok(out)
@@ -1966,10 +2056,7 @@ pub async fn color_search(query: String, max_results: Option<u32>) -> Result<Str
 // ── Lobsters (curated tech community) ─────────────────────────────
 
 #[tauri::command]
-pub async fn lobsters_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn lobsters_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(25);
     let resp = c
@@ -1985,7 +2072,10 @@ pub async fn lobsters_search(
     if !resp.status().is_success() {
         return Err(format!("Lobsters returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("Lobsters JSON: {e}"))?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Lobsters JSON: {e}"))?;
     let mut out = String::from("Lobsters (curated tech) discussions:\n\n");
     if let Some(stories) = json.as_array() {
         for (i, s) in stories.iter().take(limit as usize).enumerate() {
@@ -1995,12 +2085,23 @@ pub async fn lobsters_search(
             let comments = s["comment_count"].as_u64().unwrap_or(0);
             let tags = s["tags"]
                 .as_array()
-                .map(|t| t.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
                 .unwrap_or_default();
             let discuss = s["comments_url"].as_str().unwrap_or("");
             out.push_str(&format!(
                 "{}. {} [{}]\n   Score: {} | Comments: {}\n   {}\n   Discussion: {}\n\n",
-                i + 1, title, tags, score, comments, url, discuss,
+                i + 1,
+                title,
+                tags,
+                score,
+                comments,
+                url,
+                discuss,
             ));
         }
     }
@@ -2010,10 +2111,7 @@ pub async fn lobsters_search(
 // ── 掘金 / Juejin (Chinese developer community) ──────────────────
 
 #[tauri::command]
-pub async fn juejin_search(
-    query: String,
-    max_results: Option<u32>,
-) -> Result<String, String> {
+pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
     let body = serde_json::json!({
@@ -2047,7 +2145,13 @@ pub async fn juejin_search(
             let likes = info["digg_count"].as_u64().unwrap_or(0);
             out.push_str(&format!(
                 "{}. {} (by {})\n   {}\n   Views: {} | Likes: {} | https://juejin.cn/post/{}\n\n",
-                i + 1, title, author, trunc(brief, 200), views, likes, aid,
+                i + 1,
+                title,
+                author,
+                trunc(brief, 200),
+                views,
+                likes,
+                aid,
             ));
         }
     }
@@ -2080,7 +2184,13 @@ fn strip_html(s: &str) -> String {
         .to_string()
 }
 
-async fn wp_search(c: &Client, base: &str, query: &str, n: u32, label: &str) -> Result<String, String> {
+async fn wp_search(
+    c: &Client,
+    base: &str,
+    query: &str,
+    n: u32,
+    label: &str,
+) -> Result<String, String> {
     let url = format!("{}/wp-json/wp/v2/posts", base);
     let resp = c
         .get(&url)
@@ -2134,15 +2244,22 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
         .send()
         .await
         .map_err(|e| format!("SmashingMag RSS: {e}"))?;
-    let xml = resp.text().await.map_err(|e| format!("SmashingMag RSS: {e}"))?;
+    let xml = resp
+        .text()
+        .await
+        .map_err(|e| format!("SmashingMag RSS: {e}"))?;
     let query_lower = query.to_lowercase();
     let keywords: Vec<&str> = query_lower.split_whitespace().collect();
     let mut out = format!("Smashing Magazine articles matching '{query}':\n\n");
     let mut count = 0;
     let mut pos = 0;
     while count < n {
-        let Some(item_start) = xml[pos..].find("<item>") else { break };
-        let Some(item_end) = xml[pos + item_start..].find("</item>") else { break };
+        let Some(item_start) = xml[pos..].find("<item>") else {
+            break;
+        };
+        let Some(item_end) = xml[pos + item_start..].find("</item>") else {
+            break;
+        };
         let item = &xml[pos + item_start..pos + item_start + item_end + 7];
         pos = pos + item_start + item_end + 7;
         let title = extract_xml_tag(item, "title");
@@ -2174,7 +2291,10 @@ fn extract_xml_tag(xml: &str, tag: &str) -> String {
     let close = format!("</{}>", tag);
     if let Some(start) = xml.find(&open) {
         let after_tag = start + open.len();
-        let content_start = xml[after_tag..].find('>').map(|i| after_tag + i + 1).unwrap_or(after_tag);
+        let content_start = xml[after_tag..]
+            .find('>')
+            .map(|i| after_tag + i + 1)
+            .unwrap_or(after_tag);
         if let Some(end) = xml[content_start..].find(&close) {
             let raw = &xml[content_start..content_start + end];
             return raw
@@ -2195,7 +2315,9 @@ pub async fn css_tricks_search(query: String, max_results: Option<u32>) -> Resul
     let n = max_results.unwrap_or(10).min(20);
     match wp_search(&c, "https://css-tricks.com", &query, n, "CSS-Tricks").await {
         Ok(r) => Ok(r),
-        Err(_) => Ok("CSS-Tricks search unavailable. Try web_search for CSS-Tricks content.".into()),
+        Err(_) => {
+            Ok("CSS-Tricks search unavailable. Try web_search for CSS-Tricks content.".into())
+        }
     }
 }
 
@@ -2207,7 +2329,11 @@ pub async fn codepen_search(query: String, max_results: Option<u32>) -> Result<S
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://dev.to/api/articles")
-        .query(&[("per_page", n.to_string()), ("tag", "codepen".into()), ("top", "365".into())])
+        .query(&[
+            ("per_page", n.to_string()),
+            ("tag", "codepen".into()),
+            ("top", "365".into()),
+        ])
         .send()
         .await;
     let query_lower = query.to_lowercase();
@@ -2228,9 +2354,15 @@ pub async fn codepen_search(query: String, max_results: Option<u32>) -> Result<S
                 let user = a["user"]["username"].as_str().unwrap_or("?");
                 out.push_str(&format!(
                     "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count, title, user, trunc(desc, 150), url,
+                    count,
+                    title,
+                    user,
+                    trunc(desc, 150),
+                    url,
                 ));
-                if count >= n as usize { break; }
+                if count >= n as usize {
+                    break;
+                }
             }
         }
     }
@@ -2249,7 +2381,11 @@ pub async fn dribbble_search(query: String, max_results: Option<u32>) -> Result<
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://dev.to/api/articles")
-        .query(&[("per_page", n.to_string()), ("tag", "design".into()), ("top", "365".into())])
+        .query(&[
+            ("per_page", n.to_string()),
+            ("tag", "design".into()),
+            ("top", "365".into()),
+        ])
         .send()
         .await;
     let query_lower = query.to_lowercase();
@@ -2261,7 +2397,15 @@ pub async fn dribbble_search(query: String, max_results: Option<u32>) -> Result<
             for a in &items {
                 let title = a["title"].as_str().unwrap_or("");
                 let desc = a["description"].as_str().unwrap_or("");
-                let tags = a["tag_list"].as_array().map(|t| t.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                let tags = a["tag_list"]
+                    .as_array()
+                    .map(|t| {
+                        t.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
                 let haystack = format!("{} {} {}", title, desc, tags).to_lowercase();
                 if !keywords.is_empty() && !keywords.iter().any(|k| haystack.contains(k)) {
                     continue;
@@ -2271,9 +2415,15 @@ pub async fn dribbble_search(query: String, max_results: Option<u32>) -> Result<
                 let user = a["user"]["username"].as_str().unwrap_or("?");
                 out.push_str(&format!(
                     "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count, title, user, trunc(desc, 150), url,
+                    count,
+                    title,
+                    user,
+                    trunc(desc, 150),
+                    url,
                 ));
-                if count >= n as usize { break; }
+                if count >= n as usize {
+                    break;
+                }
             }
         }
     }
@@ -2303,14 +2453,22 @@ pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<
     let mut pos = 0;
     let mut seen = std::collections::HashSet::new();
     while count < n && pos < html.len() {
-        let Some(idx) = html[pos..].find("/sites/") else { break };
+        let Some(idx) = html[pos..].find("/sites/") else {
+            break;
+        };
         let start = pos + idx;
-        let end = html[start + 7..].find(|c: char| c == '"' || c == '\'' || c == '<' || c == ' ' || c == '?').unwrap_or(0);
+        let end = html[start + 7..]
+            .find(['"', '\'', '<', ' ', '?'])
+            .unwrap_or(0);
         let path = &html[start..start + 7 + end.min(200)];
-        let slug = path.split('/').filter(|s| !s.is_empty()).last().unwrap_or("");
+        let slug = path.split('/').rfind(|s| !s.is_empty()).unwrap_or("");
         pos = start + 7 + end;
-        if slug.is_empty() || slug == "sites" || slug == "new" || slug.len() < 3 { continue; }
-        if !seen.insert(slug.to_string()) { continue; }
+        if slug.is_empty() || slug == "sites" || slug == "new" || slug.len() < 3 {
+            continue;
+        }
+        if !seen.insert(slug.to_string()) {
+            continue;
+        }
         let title = slug.replace('-', " ");
         count += 1;
         out.push_str(&format!(
@@ -2332,7 +2490,11 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://www.sov2ex.com/api/search")
-        .query(&[("q", query.as_str()), ("size", &n.to_string()), ("sort", "sumup")])
+        .query(&[
+            ("q", query.as_str()),
+            ("size", &n.to_string()),
+            ("sort", "sumup"),
+        ])
         .send()
         .await
         .map_err(|e| format!("V2EX (SOV2EX): {e}"))?;
@@ -2353,9 +2515,13 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
         let content = src["content"].as_str().unwrap_or("");
         out.push_str(&format!(
             "{}. {} (by @{}, {} replies)\n   {}\n   {} | https://www.v2ex.com/t/{}\n\n",
-            i + 1, title, member, replies,
+            i + 1,
+            title,
+            member,
+            replies,
             trunc(content, 200),
-            &created[..created.len().min(10)], id,
+            &created[..created.len().min(10)],
+            id,
         ));
     }
     Ok(out)
@@ -2364,7 +2530,10 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
 // ── SegmentFault / 思否 (Chinese developer Q&A) ───────────────────
 
 #[tauri::command]
-pub async fn segmentfault_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+pub async fn segmentfault_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
@@ -2373,7 +2542,10 @@ pub async fn segmentfault_search(query: String, max_results: Option<u32>) -> Res
         .send()
         .await
         .map_err(|e| format!("SegmentFault: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("SegmentFault parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("SegmentFault parse: {e}"))?;
     let rows = data["data"]["rows"].as_array();
     if rows.is_none() || rows.unwrap().is_empty() {
         return Ok(format!("No SegmentFault results found for '{query}'"));
@@ -2386,11 +2558,20 @@ pub async fn segmentfault_search(query: String, max_results: Option<u32>) -> Res
         let path = row["url"].as_str().unwrap_or("");
         let votes = row["votes"].as_i64().unwrap_or(0);
         let user = row["user"]["name"].as_str().unwrap_or("?");
-        let type_label = if rtype == "question" { "Q&A" } else { "Article" };
+        let type_label = if rtype == "question" {
+            "Q&A"
+        } else {
+            "Article"
+        };
         out.push_str(&format!(
             "{}. [{}] {} (by @{}, votes: {})\n   {}\n   https://segmentfault.com{}\n\n",
-            i + 1, type_label, title, user, votes,
-            trunc(excerpt, 200), path,
+            i + 1,
+            type_label,
+            title,
+            user,
+            votes,
+            trunc(excerpt, 200),
+            path,
         ));
     }
     Ok(out)
@@ -2399,12 +2580,19 @@ pub async fn segmentfault_search(query: String, max_results: Option<u32>) -> Res
 // ── GitHub Discussions (open-source project discussions) ───────────
 
 #[tauri::command]
-pub async fn github_discussions_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+pub async fn github_discussions_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://dev.to/api/articles")
-        .query(&[("per_page", n.to_string()), ("tag", "github".into()), ("top", "365".into())])
+        .query(&[
+            ("per_page", n.to_string()),
+            ("tag", "github".into()),
+            ("top", "365".into()),
+        ])
         .send()
         .await;
     let query_lower = query.to_lowercase();
@@ -2425,9 +2613,15 @@ pub async fn github_discussions_search(query: String, max_results: Option<u32>) 
                 let user = a["user"]["username"].as_str().unwrap_or("?");
                 out.push_str(&format!(
                     "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count, title, user, trunc(desc, 150), url,
+                    count,
+                    title,
+                    user,
+                    trunc(desc, 150),
+                    url,
                 ));
-                if count >= n as usize { break; }
+                if count >= n as usize {
+                    break;
+                }
             }
         }
     }
@@ -2446,7 +2640,11 @@ pub async fn producthunt_search(query: String, max_results: Option<u32>) -> Resu
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://dev.to/api/articles")
-        .query(&[("per_page", n.to_string()), ("tag", "producthunt".into()), ("top", "365".into())])
+        .query(&[
+            ("per_page", n.to_string()),
+            ("tag", "producthunt".into()),
+            ("top", "365".into()),
+        ])
         .send()
         .await;
     let query_lower = query.to_lowercase();
@@ -2467,9 +2665,15 @@ pub async fn producthunt_search(query: String, max_results: Option<u32>) -> Resu
                 let user = a["user"]["username"].as_str().unwrap_or("?");
                 out.push_str(&format!(
                     "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count, title, user, trunc(desc, 150), url,
+                    count,
+                    title,
+                    user,
+                    trunc(desc, 150),
+                    url,
                 ));
-                if count >= n as usize { break; }
+                if count >= n as usize {
+                    break;
+                }
             }
         }
     }
@@ -2481,7 +2685,10 @@ pub async fn producthunt_search(query: String, max_results: Option<u32>) -> Resu
 }
 
 #[tauri::command]
-pub async fn freecodecamp_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+pub async fn freecodecamp_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let body = serde_json::json!({
@@ -2502,14 +2709,27 @@ pub async fn freecodecamp_search(query: String, max_results: Option<u32>) -> Res
         for (i, h) in hits.iter().enumerate() {
             let title = h["title"].as_str().unwrap_or("");
             let url = h["url"].as_str().unwrap_or("");
-            let author = h["author"]["name"].as_str()
+            let author = h["author"]["name"]
+                .as_str()
                 .or_else(|| h["author"].as_str())
                 .unwrap_or("?");
-            let tags: Vec<&str> = h["tags"].as_array()
+            let tags: Vec<&str> = h["tags"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let tag_str = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
-            out.push_str(&format!("{}. {} (by {}){}\n   {}\n\n", i + 1, title, author, tag_str, url));
+            let tag_str = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join(", "))
+            };
+            out.push_str(&format!(
+                "{}. {} (by {}){}\n   {}\n\n",
+                i + 1,
+                title,
+                author,
+                tag_str,
+                url
+            ));
         }
     }
     if out.ends_with(":\n\n") {
@@ -2526,12 +2746,17 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
     let url = if lang.is_empty() || lang == "all" {
         "https://github.com/trending?since=weekly".to_string()
     } else {
-        format!("https://github.com/trending/{}?since=weekly", lang.to_lowercase().replace(' ', "-"))
+        format!(
+            "https://github.com/trending/{}?since=weekly",
+            lang.to_lowercase().replace(' ', "-")
+        )
     };
     let mut html = String::new();
     let mut last_err = String::from("unknown");
     for attempt in 0..3 {
-        if attempt > 0 { tokio::time::sleep(Duration::from_millis(800 * attempt as u64)).await; }
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(800 * attempt as u64)).await;
+        }
         match c.get(&url)
             .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -2555,11 +2780,22 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
             Err(e) => return Err(format!("request failed after retries: {}", e)),
         }
     }
-    if html.is_empty() { return Err(format!("all retries exhausted: {}", last_err)); }
-    let mut out = format!("GitHub Trending repos (weekly, {}):\n\n", if lang.is_empty() || lang == "all" { "all languages" } else { lang });
+    if html.is_empty() {
+        return Err(format!("all retries exhausted: {}", last_err));
+    }
+    let mut out = format!(
+        "GitHub Trending repos (weekly, {}):\n\n",
+        if lang.is_empty() || lang == "all" {
+            "all languages"
+        } else {
+            lang
+        }
+    );
     let mut count = 0;
     for chunk in html.split("Box-row") {
-        if count >= n { break; }
+        if count >= n {
+            break;
+        }
         // Extract repo href: href="/owner/repo"
         let repo = {
             let marker = "href=\"/";
@@ -2567,13 +2803,26 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
                 let rest = &chunk[pos + 7..];
                 if let Some(end) = rest.find('"') {
                     let path = &rest[..end];
-                    if path.contains('/') && !path.contains("login") && !path.contains("signup") && path.split('/').count() == 2 {
+                    if path.contains('/')
+                        && !path.contains("login")
+                        && !path.contains("signup")
+                        && path.split('/').count() == 2
+                    {
                         Some(path.to_string())
-                    } else { None }
-                } else { None }
-            } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
-        let repo = match repo { Some(r) => r, None => continue };
+        let repo = match repo {
+            Some(r) => r,
+            None => continue,
+        };
         // Extract description from <p class="col-9
         let desc = {
             let marker = "col-9";
@@ -2585,10 +2834,20 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
                         let raw = inner[..end].trim();
                         let clean: String = raw.chars().filter(|c| *c != '\n').collect();
                         let clean = clean.trim().to_string();
-                        if clean.is_empty() { String::new() } else { trunc(&clean, 200).to_string() }
-                    } else { String::new() }
-                } else { String::new() }
-            } else { String::new() }
+                        if clean.is_empty() {
+                            String::new()
+                        } else {
+                            trunc(&clean, 200).to_string()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
         };
         // Extract language
         let plang = {
@@ -2596,19 +2855,38 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
             if let Some(pos) = chunk.find(marker) {
                 let rest = &chunk[pos + marker.len()..];
                 rest.split('<').next().unwrap_or("").trim().to_string()
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         };
         // Extract stars this week
         let stars = {
             let marker = "stars this";
             if let Some(pos) = chunk.find(marker) {
                 let before = &chunk[..pos];
-                let num: String = before.chars().rev().take_while(|c| c.is_ascii_digit() || *c == ',').collect::<String>().chars().rev().collect();
-                if num.is_empty() { String::new() } else { format!(" +{} stars/week", num.trim()) }
-            } else { String::new() }
+                let num: String = before
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_digit() || *c == ',')
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                if num.is_empty() {
+                    String::new()
+                } else {
+                    format!(" +{} stars/week", num.trim())
+                }
+            } else {
+                String::new()
+            }
         };
         count += 1;
-        let lang_tag = if plang.is_empty() { String::new() } else { format!(" [{}]", plang) };
+        let lang_tag = if plang.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", plang)
+        };
         out.push_str(&format!("{}. {}{}{}\n", count, repo, lang_tag, stars));
         if !desc.is_empty() {
             out.push_str(&format!("   {}\n", desc));
@@ -2626,9 +2904,17 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
 pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
-    let html = c.get("https://www.infoq.com/search.action")
-        .query(&[("queryString", query.as_str()), ("page", "0"), ("searchOrder", "relevance")])
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+    let html = c
+        .get("https://www.infoq.com/search.action")
+        .query(&[
+            ("queryString", query.as_str()),
+            ("page", "0"),
+            ("searchOrder", "relevance"),
+        ])
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        )
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -2642,27 +2928,48 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
     let mut seen = std::collections::HashSet::new();
     for pat in &patterns {
         for piece in html.split(pat) {
-            if count >= n { break; }
+            if count >= n {
+                break;
+            }
             // Extract path
             let path = if let Some(end) = piece.find('"') {
                 let slug = &piece[..end];
-                if slug.contains('<') || slug.contains('>') || slug.len() > 200 { continue; }
-                let prefix = if pat.contains("articles") { "/articles/" } else { "/news/" };
+                if slug.contains('<') || slug.contains('>') || slug.len() > 200 {
+                    continue;
+                }
+                let prefix = if pat.contains("articles") {
+                    "/articles/"
+                } else {
+                    "/news/"
+                };
                 format!("{}{}", prefix, slug)
-            } else { continue };
-            if seen.contains(&path) { continue; }
+            } else {
+                continue;
+            };
+            if seen.contains(&path) {
+                continue;
+            }
             seen.insert(path.clone());
             // Extract title: next > then text until <
             let title = if let Some(gt) = piece.find('>') {
                 let rest = &piece[gt + 1..];
                 if let Some(lt) = rest.find('<') {
                     let t = rest[..lt].trim();
-                    if t.is_empty() || t.len() < 3 { continue; }
+                    if t.is_empty() || t.len() < 3 {
+                        continue;
+                    }
                     html_decode(t)
-                } else { continue }
-            } else { continue };
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
             count += 1;
-            out.push_str(&format!("{}. {}\n   https://www.infoq.com{}\n\n", count, title, path));
+            out.push_str(&format!(
+                "{}. {}\n   https://www.infoq.com{}\n\n",
+                count, title, path
+            ));
         }
     }
     if count == 0 {
@@ -2691,7 +2998,11 @@ pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Resul
     let n = max_results.unwrap_or(10).min(20);
     let resp = c
         .get("https://dev.to/api/articles")
-        .query(&[("per_page", n.to_string()), ("tag", "hackernoon".into()), ("top", "365".into())])
+        .query(&[
+            ("per_page", n.to_string()),
+            ("tag", "hackernoon".into()),
+            ("top", "365".into()),
+        ])
         .send()
         .await;
     let query_lower = query.to_lowercase();
@@ -2712,9 +3023,15 @@ pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Resul
                 let user = a["user"]["username"].as_str().unwrap_or("?");
                 out.push_str(&format!(
                     "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count, title, user, trunc(desc, 150), url,
+                    count,
+                    title,
+                    user,
+                    trunc(desc, 150),
+                    url,
                 ));
-                if count >= n as usize { break; }
+                if count >= n as usize {
+                    break;
+                }
             }
         }
     }
@@ -2731,7 +3048,11 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
     let n = max_results.unwrap_or(10).min(25) as usize;
     let resp = c
         .get("https://codeberg.org/api/v1/repos/search")
-        .query(&[("q", query.as_str()), ("sort", "stars"), ("limit", &n.to_string())])
+        .query(&[
+            ("q", query.as_str()),
+            ("sort", "stars"),
+            ("limit", &n.to_string()),
+        ])
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -2744,21 +3065,39 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
             let stars = r["stars_count"].as_u64().unwrap_or(0);
             let lang = r["language"].as_str().unwrap_or("");
             let url = r["html_url"].as_str().unwrap_or("");
-            let topics: Vec<&str> = r["topics"].as_array()
+            let topics: Vec<&str> = r["topics"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let lang_tag = if lang.is_empty() { String::new() } else { format!(" [{}]", lang) };
-            let topic_str = if topics.is_empty() { String::new() } else { format!(" ({})", topics.join(", ")) };
+            let lang_tag = if lang.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", lang)
+            };
+            let topic_str = if topics.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", topics.join(", "))
+            };
             out.push_str(&format!(
                 "{}. {} ★{}{}{}\n   {}\n   {}\n\n",
-                i + 1, name, stars, lang_tag, topic_str, trunc(desc, 150), url,
+                i + 1,
+                name,
+                stars,
+                lang_tag,
+                topic_str,
+                trunc(desc, 150),
+                url,
             ));
         }
     }
     if out.ends_with(":\n\n") {
         out.push_str("  No results found.\n");
     }
-    out.push_str(&format!("Codeberg search: https://codeberg.org/explore/repos?q={}\n", query.replace(' ', "+")));
+    out.push_str(&format!(
+        "Codeberg search: https://codeberg.org/explore/repos?q={}\n",
+        query.replace(' ', "+")
+    ));
     Ok(out)
 }
 
@@ -2778,14 +3117,18 @@ pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<
     let mut count = 0;
     if let Some(projects) = data["projects"].as_array() {
         for p in projects {
-            if count >= n { break; }
+            if count >= n {
+                break;
+            }
             let name = p["name"].as_str().unwrap_or("");
             let desc = p["description"].as_str().unwrap_or("");
             let full_name = p["full_name"].as_str().unwrap_or("");
-            let tags: Vec<&str> = p["tags"].as_array()
+            let tags: Vec<&str> = p["tags"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let haystack = format!("{} {} {} {}", name, desc, full_name, tags.join(" ")).to_lowercase();
+            let haystack =
+                format!("{} {} {} {}", name, desc, full_name, tags.join(" ")).to_lowercase();
             if !keywords.is_empty() && !keywords.iter().all(|k| haystack.contains(k)) {
                 continue;
             }
@@ -2796,17 +3139,29 @@ pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<
             } else {
                 format!("https://github.com/{}", full_name)
             };
-            let tag_str = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+            let tag_str = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join(", "))
+            };
             out.push_str(&format!(
                 "{}. {} ★{}{}\n   {}\n   {}\n\n",
-                count, name, stars, tag_str, trunc(desc, 150), url,
+                count,
+                name,
+                stars,
+                tag_str,
+                trunc(desc, 150),
+                url,
             ));
         }
     }
     if count == 0 {
         out.push_str("  No matching projects.\n");
     }
-    out.push_str(&format!("Best of JS: https://bestofjs.org/projects?query={}\n", query.replace(' ', "+")));
+    out.push_str(&format!(
+        "Best of JS: https://bestofjs.org/projects?query={}\n",
+        query.replace(' ', "+")
+    ));
     Ok(out)
 }
 
@@ -2828,7 +3183,9 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let result_count = data["data"]["search"]["results"]["resultCount"].as_u64().unwrap_or(0);
+    let result_count = data["data"]["search"]["results"]["resultCount"]
+        .as_u64()
+        .unwrap_or(0);
     let mut out = format!("Sourcegraph code search for '{query}' ({result_count} results):\n\n");
     let mut count = 0;
     if let Some(results) = data["data"]["search"]["results"]["results"].as_array() {
@@ -2848,7 +3205,8 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
                 "FileMatch" => {
                     let repo = r["repository"]["name"].as_str().unwrap_or("?");
                     let path = r["file"]["path"].as_str().unwrap_or("?");
-                    let preview = r["lineMatches"].as_array()
+                    let preview = r["lineMatches"]
+                        .as_array()
                         .and_then(|arr| arr.first())
                         .and_then(|m| m["preview"].as_str())
                         .unwrap_or("");
@@ -2856,7 +3214,10 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
                     if !preview.is_empty() {
                         out.push_str(&format!("   {}\n", trunc(preview.trim(), 120)));
                     }
-                    out.push_str(&format!("   https://sourcegraph.com/{}/-/blob/{}\n\n", repo, path));
+                    out.push_str(&format!(
+                        "   https://sourcegraph.com/{}/-/blob/{}\n\n",
+                        repo, path
+                    ));
                 }
                 _ => {}
             }
@@ -2875,8 +3236,8 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
 // ── Deep search (surface + Tor + onion engines) ───────────────────
 
 fn tor_client(timeout_secs: u64) -> Result<Client, String> {
-    let proxy = reqwest::Proxy::all("socks5h://127.0.0.1:9050")
-        .map_err(|e| format!("Tor proxy: {e}"))?;
+    let proxy =
+        reqwest::Proxy::all("socks5h://127.0.0.1:9050").map_err(|e| format!("Tor proxy: {e}"))?;
     Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(timeout_secs))
@@ -2949,16 +3310,20 @@ async fn ahmia_search_layer(q: &str) -> Vec<(String, String, String, &'static st
         let title = chunk
             .find("<h4")
             .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| chunk[start..].find("</").map(|end| {
-                html_decode(&chunk[start..start + end]).trim().to_string()
-            }))
+            .and_then(|start| {
+                chunk[start..]
+                    .find("</")
+                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
+            })
             .unwrap_or_default();
         let snippet = chunk
             .find("<p")
             .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| chunk[start..].find("</p").map(|end| {
-                html_decode(&chunk[start..start + end]).trim().to_string()
-            }))
+            .and_then(|start| {
+                chunk[start..]
+                    .find("</p")
+                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
+            })
             .unwrap_or_default();
         if !title.is_empty() || !snippet.is_empty() {
             results.push((title, url, trunc(&snippet, 200).to_string(), "暗网(Ahmia)"));
@@ -3011,25 +3376,35 @@ fn parse_ddg_html(html: &str, source: &'static str) -> Vec<(String, String, Stri
         let url = chunk
             .find("result__url")
             .and_then(|i| chunk[i..].find("href=\"").map(|j| i + j + 6))
-            .and_then(|start| chunk[start..].find('"').map(|end| {
-                let raw = &chunk[start..start + end];
-                if raw.starts_with("//") { format!("https:{raw}") }
-                else { raw.to_string() }
-            }))
+            .and_then(|start| {
+                chunk[start..].find('"').map(|end| {
+                    let raw = &chunk[start..start + end];
+                    if raw.starts_with("//") {
+                        format!("https:{raw}")
+                    } else {
+                        raw.to_string()
+                    }
+                })
+            })
             .unwrap_or_default();
         let title = chunk
             .find("result__a")
             .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| chunk[start..].find("</a").map(|end| {
-                html_decode(&chunk[start..start + end]).trim().to_string()
-            }))
+            .and_then(|start| {
+                chunk[start..]
+                    .find("</a")
+                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
+            })
             .unwrap_or_default();
         let snippet = chunk
             .find("result__snippet")
             .and_then(|i| chunk[i..].find('>').map(|j| i + j + 1))
-            .and_then(|start| chunk[start..].find("</a").or_else(|| chunk[start..].find("</td")).map(|end| {
-                html_decode(&chunk[start..start + end]).trim().to_string()
-            }))
+            .and_then(|start| {
+                chunk[start..]
+                    .find("</a")
+                    .or_else(|| chunk[start..].find("</td"))
+                    .map(|end| html_decode(&chunk[start..start + end]).trim().to_string())
+            })
             .unwrap_or_default();
         if !url.is_empty() && !title.is_empty() {
             results.push((title, url, trunc(&snippet, 200).to_string(), source));
@@ -3055,10 +3430,12 @@ fn looks_like_domain(q: &str) -> Option<String> {
     let tld_ok = host
         .rsplit('.')
         .next()
-        .map_or(false, |t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()));
+        .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()));
     if host.split('.').count() >= 2
         && tld_ok
-        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
         Some(host.to_lowercase())
     } else {
@@ -3140,7 +3517,12 @@ async fn crtsh_layer(domain: &str) -> Vec<(String, String, String, &'static str)
         Err(_) => return vec![],
     };
     let url = format!("https://crt.sh/?q=%25.{domain}&output=json");
-    let txt = match client.get(&url).timeout(Duration::from_secs(20)).send().await {
+    let txt = match client
+        .get(&url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+    {
         Ok(r) => r.text().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
@@ -3156,7 +3538,12 @@ async fn crtsh_layer(domain: &str) -> Vec<(String, String, String, &'static str)
                         continue;
                     }
                     seen.insert(h.clone());
-                    out.push((h.clone(), format!("https://{h}"), "证书透明记录里发现的主机".into(), "子域名(crt.sh)"));
+                    out.push((
+                        h.clone(),
+                        format!("https://{h}"),
+                        "证书透明记录里发现的主机".into(),
+                        "子域名(crt.sh)",
+                    ));
                     if out.len() >= 40 {
                         return out;
                     }
@@ -3169,7 +3556,10 @@ async fn crtsh_layer(domain: &str) -> Vec<(String, String, String, &'static str)
 
 /// Pull every distinct `.onion` link (+ anchor text) out of a dark-web engine's HTML.
 /// Parser-agnostic on purpose so it survives the frequent layout churn of onion engines.
-fn extract_onion_links(html: &str, label: &'static str) -> Vec<(String, String, String, &'static str)> {
+fn extract_onion_links(
+    html: &str,
+    label: &'static str,
+) -> Vec<(String, String, String, &'static str)> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for part in html.split("href=\"").skip(1) {
@@ -3190,10 +3580,16 @@ fn extract_onion_links(html: &str, label: &'static str) -> Vec<(String, String, 
             .find('>')
             .and_then(|g| {
                 let s = &part[end + g + 1..];
-                s.find("</a").map(|e2| html_decode(&s[..e2]).trim().to_string())
+                s.find("</a")
+                    .map(|e2| html_decode(&s[..e2]).trim().to_string())
             })
             .unwrap_or_default();
-        out.push((if title.is_empty() { url.clone() } else { title }, url, String::new(), label));
+        out.push((
+            if title.is_empty() { url.clone() } else { title },
+            url,
+            String::new(),
+            label,
+        ));
         if out.len() >= 12 {
             break;
         }
@@ -3225,24 +3621,48 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
     }
     // Best-effort: if Tor is down, kick a background start so the .onion layers self-heal
     // (this run or the next). Non-blocking — the clearnet layers never wait on Tor.
-    tokio::spawn(async { let _ = crate::net::ensure_tor().await; });
+    tokio::spawn(async {
+        let _ = crate::net::ensure_tor().await;
+    });
     let limit = max_results.unwrap_or(24).min(60);
     let domain = looks_like_domain(q);
 
-    let mut racing: FuturesUnordered<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, String, String, &'static str)>> + Send>>,
-    > = FuturesUnordered::new();
+    let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
     // Keyword layers — always run: surface + dorks (pastes/leaks/files) + 4 dark-web engines.
-    { let q = q.to_string(); racing.push(Box::pin(async move { ddg_surface(&q).await })); }
-    { let q = q.to_string(); racing.push(Box::pin(async move { dork_layer(&q).await })); }
-    { let q = q.to_string(); racing.push(Box::pin(async move { ahmia_search_layer(&q).await })); }
-    { let q = q.to_string(); racing.push(Box::pin(async move { ddg_onion(&q).await })); }
-    { let q = q.to_string(); racing.push(Box::pin(async move { torch_search_layer(&q).await })); }
-    { let q = q.to_string(); racing.push(Box::pin(async move { haystak_layer(&q).await })); }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { ddg_surface(&q).await }));
+    }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { dork_layer(&q).await }));
+    }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { ahmia_search_layer(&q).await }));
+    }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { ddg_onion(&q).await }));
+    }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { torch_search_layer(&q).await }));
+    }
+    {
+        let q = q.to_string();
+        racing.push(Box::pin(async move { haystak_layer(&q).await }));
+    }
     // Domain/OSINT layers — only when the query is a domain or URL: hidden subdomains + deleted-page archives.
     if let Some(d) = domain.clone() {
-        { let d = d.clone(); racing.push(Box::pin(async move { crtsh_layer(&d).await })); }
-        { let d = d.clone(); racing.push(Box::pin(async move { wayback_layer(&d).await })); }
+        {
+            let d = d.clone();
+            racing.push(Box::pin(async move { crtsh_layer(&d).await }));
+        }
+        {
+            let d = d.clone();
+            racing.push(Box::pin(async move { wayback_layer(&d).await }));
+        }
     }
 
     let mut all: Vec<(String, String, String, &str)> = Vec::new();
@@ -3266,7 +3686,10 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
         ));
     }
 
-    let mut out = format!("🔍 深层情报搜索「{q}」— {} 条结果（跨明网+定向dork+存档+子域名+暗网多引擎）：\n", all.len().min(limit));
+    let mut out = format!(
+        "🔍 深层情报搜索「{q}」— {} 条结果（跨明网+定向dork+存档+子域名+暗网多引擎）：\n",
+        all.len().min(limit)
+    );
     for (i, (title, url, snippet, source)) in all.iter().take(limit).enumerate() {
         out.push_str(&format!(
             "\n{}. [{}] {}\n   {}\n",

@@ -1,10 +1,10 @@
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::Claims;
@@ -35,6 +35,7 @@ static GW_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(
 /// then hits EOF, finalizes whatever it has, and unblocks — far better than an
 /// infinite "跑着跑着卡住" hang. Generic over the byte type so we don't need to name
 /// `bytes::Bytes` directly.
+#[allow(dead_code)]
 fn idle_guarded_stream<B, S>(
     upstream: S,
 ) -> impl futures_util::Stream<Item = Result<B, std::io::Error>> + Send + 'static
@@ -43,9 +44,11 @@ where
     B: Send + 'static,
 {
     use futures_util::StreamExt;
-    // 30s: long enough not to cut a model that briefly pauses, short enough that a
-    // real stall is detected quickly (the client then auto-retries).
-    let idle = std::time::Duration::from_secs(30);
+    // 180s: a "thinking" model can pause far longer than 30s — it reasons silently, or
+    // composes a long tool-call argument (a full-file write) the relay forwards in bursts.
+    // The old 30s cut those mid-stream (→ truncated tool call → empty write "内容为空").
+    // 180s still bounds a truly-hung upstream so the client eventually auto-retries.
+    let idle = std::time::Duration::from_secs(180);
     let upstream = Box::pin(upstream);
     futures_util::stream::unfold(upstream, move |mut s| async move {
         match tokio::time::timeout(idle, s.next()).await {
@@ -85,10 +88,113 @@ pub struct Model {
     pub api_key: String,
     pub price_cents: i64,
     pub rate: f64,
+    /// USD per 1,000,000 INPUT tokens (real-API unit). 0 = not set → bill the flat `rate`.
+    pub input_price: f64,
+    /// USD per 1,000,000 OUTPUT tokens. 0 = not set → bill the flat `rate`.
+    pub output_price: f64,
+    /// Per 1M CACHE-READ tokens (cheap). 0 = not set → fall back to 0.1× input_price.
+    pub cache_read_price: f64,
+    /// Per 1M CACHE-CREATE/write tokens (premium). 0 = not set → fall back to 1.25× input_price.
+    pub cache_create_price: f64,
+    /// Optional admin blurb shown in the IDE picker's hover card.
+    pub description: String,
     pub active: bool,
     pub sort: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub enabled_models: Vec<String>,
+    /// Billing mode: "rate" (token×price×倍率, default) or "per_call" (flat fee/call).
+    pub billing_mode: String,
+    /// Flat fee per call in cents, used only when billing_mode = "per_call".
+    pub per_call_cents: i64,
+    /// Friendly display-name overrides: { raw_model_id → label shown in the IDE }.
+    /// The IDE still sends the raw id upstream; this only renames the picker entry.
+    pub model_names: serde_json::Value,
+    /// Per-MODEL price overrides: { raw_model_id → {"in": usd_per_1M, "out": usd_per_1M} }.
+    /// When an entry is set (in>0 or out>0) it WINS over the built-in official catalog for
+    /// that model; empty → fall back to official, then the connection-level input/output
+    /// price. Lets the admin price each enabled model individually. (倍率 still applies on top.)
+    pub model_prices: serde_json::Value,
+    /// Upstream wire protocol: "anthropic" (native /v1/messages) or "openai" (/chat/completions
+    /// compat). When "anthropic", the gateway translates the OpenAI request/response ⇄ Anthropic.
+    pub protocol: String,
+}
+
+/// Per-MODEL (input, output) USD/1M price override from a connection's model_prices map.
+/// Returns (0.0, 0.0) when this model has no override — compute_cost then uses the built-in
+/// official price, then the connection-level fallback. Admin per-model prices beat both.
+fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f64, f64) {
+    match model_prices.get(model_id) {
+        Some(p) => (
+            p.get("in").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0),
+            p.get("out")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .max(0.0),
+        ),
+        None => (0.0, 0.0),
+    }
+}
+
+/// True for any image-GENERATION model (bills PER-IMAGE, not per-token) across vendors:
+/// OpenAI gpt-image / DALL·E, Google gemini *image* (gemini-3.1-flash-image-preview),
+/// gpt-4o-image, etc. Guarantees image calls never fall through to $0 token billing.
+/// Text/vision models never contain these substrings, so it won't misfire on them.
+fn is_image_gen_model(model_id: &str) -> bool {
+    let m = model_id.to_lowercase();
+    m.contains("gpt-image")
+        || m.contains("dall-e")
+        || m.contains("dall_e")
+        || m.contains("-image")
+        || m.contains("image-preview")
+        || m.contains("image-generation")
+}
+
+/// Look up a friendly display name for `mid` in a connection's model_names map,
+/// falling back to the raw id when there's no override.
+fn display_name_for(model_names: &serde_json::Value, mid: &str) -> String {
+    model_names
+        .get(mid)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| mid.to_string())
+}
+
+/// Pick the final cost for one successful upstream call based on the connection's
+/// billing mode. "per_call" → flat per_call_cents (token-count independent);
+/// otherwise → real token billing via compute_cost. Centralized so EVERY billing
+/// site (chat stream/non-stream, legacy chat, responses) stays consistent.
+#[allow(clippy::too_many_arguments)]
+fn resolve_cost(
+    billing_mode: &str,
+    per_call_cents: i64,
+    usage: Option<&serde_json::Value>,
+    model_id: &str,
+    rate: f64,
+    admin_in: f64,
+    admin_out: f64,
+    cache_read_price: f64,
+    cache_create_price: f64,
+    model_in: f64,
+    model_out: f64,
+) -> i64 {
+    if billing_mode == "per_call" {
+        let c = per_call_cents.max(0);
+        tracing::info!("[billing] model={} mode=per_call → {}¢", model_id, c);
+        return c;
+    }
+    compute_cost(
+        usage,
+        model_id,
+        rate,
+        admin_in,
+        admin_out,
+        cache_read_price,
+        cache_create_price,
+        model_in,
+        model_out,
+    )
 }
 
 fn allowed_ids(m: &Model) -> Vec<String> {
@@ -111,7 +217,10 @@ fn mask(key: &str) -> String {
 
 // ---------- admin: list / create / delete ----------
 /// GET /api/admin/models — full list for management (api_key masked).
-pub async fn admin_list(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_list(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let rows = sqlx::query_as::<_, Model>("SELECT * FROM models ORDER BY sort, created_at")
         .fetch_all(&state.db)
@@ -123,7 +232,14 @@ pub async fn admin_list(State(state): State<AppState>, claims: Claims) -> ApiRes
                 "id": m.id, "label": m.label, "provider": m.provider, "base_url": m.base_url,
                 "model_id": m.model_id, "api_key_masked": mask(&m.api_key), "has_key": !m.api_key.is_empty(),
                 "price_cents": m.price_cents, "rate": m.rate, "active": m.active, "sort": m.sort, "created_at": m.created_at,
+                "input_price": m.input_price, "output_price": m.output_price,
+                "cache_read_price": m.cache_read_price, "cache_create_price": m.cache_create_price,
+                "description": m.description,
                 "enabled_models": m.enabled_models,
+                "billing_mode": m.billing_mode, "per_call_cents": m.per_call_cents,
+                "model_names": m.model_names,
+                "model_prices": m.model_prices,
+                "protocol": m.protocol,
             })
         })
         .collect();
@@ -138,19 +254,34 @@ pub struct ModelReq {
     pub model_id: Option<String>,
     pub api_key: String,
     pub rate: Option<f64>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub cache_create_price: Option<f64>,
+    pub description: Option<String>,
     pub sort: Option<i32>,
+    pub billing_mode: Option<String>,
+    pub per_call_cents: Option<i64>,
 }
 
 /// POST /api/admin/models — create a provider connection (admin). model_id is
 /// optional; the exposed models are chosen later via the edit/enabled set.
-pub async fn admin_create(State(state): State<AppState>, claims: Claims, Json(req): Json<ModelReq>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_create(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<ModelReq>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     if req.label.trim().is_empty() || req.base_url.trim().is_empty() {
         return Err(AppError::bad("名称 / baseUrl 不能为空"));
     }
+    let bmode = match req.billing_mode.as_deref() {
+        Some("per_call") => "per_call",
+        _ => "rate",
+    };
     let id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, sort) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, input_price, output_price, description, sort, billing_mode, per_call_cents, cache_read_price, cache_create_price) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
     )
     .bind(req.label.trim())
     .bind(req.provider.unwrap_or_default())
@@ -158,16 +289,30 @@ pub async fn admin_create(State(state): State<AppState>, claims: Claims, Json(re
     .bind(req.model_id.unwrap_or_default().trim())
     .bind(req.api_key.trim())
     .bind(req.rate.unwrap_or(1.0).max(0.0))
+    .bind(req.input_price.unwrap_or(0.0).max(0.0))
+    .bind(req.output_price.unwrap_or(0.0).max(0.0))
+    .bind(req.description.unwrap_or_default().trim())
     .bind(req.sort.unwrap_or(0))
+    .bind(bmode)
+    .bind(req.per_call_cents.unwrap_or(0).max(0))
+    .bind(req.cache_read_price.unwrap_or(0.0).max(0.0))
+    .bind(req.cache_create_price.unwrap_or(0.0).max(0.0))
     .fetch_one(&state.db)
     .await?;
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
 /// DELETE /api/admin/models/:id (admin).
-pub async fn admin_delete(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_delete(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
-    let res = sqlx::query("DELETE FROM models WHERE id = $1").bind(id).execute(&state.db).await?;
+    let res = sqlx::query("DELETE FROM models WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::bad("模型不存在"));
     }
@@ -176,7 +321,11 @@ pub async fn admin_delete(State(state): State<AppState>, claims: Claims, Path(id
 
 /// GET /api/admin/models/:id/available — proxy the provider's model catalogue
 /// (OpenAI-compatible GET /models) using this connection's key.
-pub async fn admin_available(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_available(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
         .bind(id)
@@ -200,12 +349,19 @@ pub async fn admin_available(State(state): State<AppState>, claims: Claims, Path
     let status = resp.status();
     let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
-        return Err(AppError { status: axum::http::StatusCode::BAD_GATEWAY, msg: format!("供应商错误 {}: {}", status.as_u16(), data) });
+        return Err(AppError {
+            status: axum::http::StatusCode::BAD_GATEWAY,
+            msg: format!("供应商错误 {}: {}", status.as_u16(), data),
+        });
     }
     let ids: Vec<String> = data
         .get("data")
         .and_then(|d| d.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(Json(json!({ "models": ids, "enabled": m.enabled_models })))
 }
@@ -217,31 +373,88 @@ pub struct UpdateReq {
     pub base_url: Option<String>,
     pub api_key: Option<String>, // empty/missing = keep existing
     pub rate: Option<f64>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub cache_create_price: Option<f64>,
+    pub description: Option<String>,
     pub active: Option<bool>,
     pub sort: Option<i32>,
     pub enabled_models: Option<Vec<String>>,
+    pub billing_mode: Option<String>,
+    pub per_call_cents: Option<i64>,
+    /// { raw_model_id → friendly display name }. Replaces the whole map when present.
+    pub model_names: Option<serde_json::Value>,
+    /// { raw_model_id → {"in", "out"} } per-model price overrides. Replaces the whole map.
+    pub model_prices: Option<serde_json::Value>,
+    /// "anthropic" | "openai" — upstream wire protocol for this connection.
+    pub protocol: Option<String>,
 }
 
 /// POST /api/admin/models/:id — update a connection (incl. enabled model set). admin.
-pub async fn admin_update(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>, Json(req): Json<UpdateReq>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_update(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<UpdateReq>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::bad("模型连接不存在"))?;
-    let label = req.label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or(m.label);
+    let label = req
+        .label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(m.label);
     let provider = req.provider.unwrap_or(m.provider);
-    let base_url = req.base_url.map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()).unwrap_or(m.base_url);
+    let base_url = req
+        .base_url
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(m.base_url);
     let api_key = match req.api_key {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         _ => m.api_key,
     };
     let rate = req.rate.unwrap_or(m.rate).max(0.0);
+    let input_price = req.input_price.unwrap_or(m.input_price).max(0.0);
+    let output_price = req.output_price.unwrap_or(m.output_price).max(0.0);
+    let cache_read_price = req.cache_read_price.unwrap_or(m.cache_read_price).max(0.0);
+    let cache_create_price = req
+        .cache_create_price
+        .unwrap_or(m.cache_create_price)
+        .max(0.0);
+    let description = req
+        .description
+        .map(|s| s.trim().to_string())
+        .unwrap_or(m.description);
     let active = req.active.unwrap_or(m.active);
     let sort = req.sort.unwrap_or(m.sort);
     let enabled = req.enabled_models.unwrap_or(m.enabled_models);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8 WHERE id=$9")
+    let billing_mode = match req.billing_mode.as_deref() {
+        Some("per_call") => "per_call".to_string(),
+        Some("rate") => "rate".to_string(),
+        _ => m.billing_mode, // unspecified → keep existing
+    };
+    let per_call_cents = req.per_call_cents.unwrap_or(m.per_call_cents).max(0);
+    // model_names / model_prices: replace the whole map when the client sends one; keep existing otherwise.
+    let model_names = req
+        .model_names
+        .filter(|v| v.is_object())
+        .unwrap_or(m.model_names);
+    let model_prices = req
+        .model_prices
+        .filter(|v| v.is_object())
+        .unwrap_or(m.model_prices);
+    let protocol = match req.protocol.as_deref() {
+        Some("openai") => "openai".to_string(),
+        Some("anthropic") => "anthropic".to_string(),
+        _ => m.protocol, // unspecified → keep existing
+    };
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -250,6 +463,16 @@ pub async fn admin_update(State(state): State<AppState>, claims: Claims, Path(id
         .bind(active)
         .bind(sort)
         .bind(&enabled)
+        .bind(input_price)
+        .bind(output_price)
+        .bind(&description)
+        .bind(&billing_mode)
+        .bind(per_call_cents)
+        .bind(&model_names)
+        .bind(cache_read_price)
+        .bind(cache_create_price)
+        .bind(&model_prices)
+        .bind(&protocol)
         .bind(id)
         .execute(&state.db)
         .await?;
@@ -259,19 +482,26 @@ pub async fn admin_update(State(state): State<AppState>, claims: Claims, Path(id
 // ---------- IDE-facing: list active models (safe fields, no secrets) ----------
 /// GET /api/models — active models for the IDE (no api_key / base_url leaked).
 pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    let rows = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
-        .fetch_all(&state.db)
-        .await?;
+    let rows = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
     let mut list = Vec::new();
     for m in &rows {
         for mid in allowed_ids(m) {
+            let name = display_name_for(&m.model_names, &mid);
             list.push(json!({
                 "conn_id": m.id,
                 "group": m.label,
                 "provider": m.provider,
                 "model_id": mid.clone(),
-                "name": mid,
+                "name": name,
                 "price_cents": m.price_cents,
+                // Only the admin blurb is exposed. The operator's billing (input_price/
+                // output_price/rate + markup) is deliberately NOT sent to clients — the
+                // picker shows each model's OFFICIAL list price from a frontend catalog.
+                "description": m.description,
             }));
         }
     }
@@ -282,7 +512,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
 /// POST /api/models/:id/chat — forwards an OpenAI-style chat request to the
 /// model's provider, deducts the model's price from the caller's credits, and
 /// returns the upstream JSON. Non-streaming.
-pub async fn chat(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>, Json(mut body): Json<serde_json::Value>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn chat(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(mut body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
     let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
     let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1 AND active = true")
         .bind(id)
@@ -290,14 +525,22 @@ pub async fn chat(State(state): State<AppState>, claims: Claims, Path(id): Path<
         .await?
         .ok_or_else(|| AppError::bad("模型不存在或已停用"))?;
 
-    // pre-check: need a positive balance when the model isn't free
-    if model.rate > 0.0 {
+    // pre-check: need a positive balance when the model isn't free. per_call mode
+    // (with per_call_cents > 0) also requires balance even if rate/io-price are 0.
+    let not_free = model.rate > 0.0
+        || model.input_price > 0.0
+        || model.output_price > 0.0
+        || (model.billing_mode == "per_call" && model.per_call_cents > 0);
+    if not_free {
         let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1")
             .bind(uid)
             .fetch_one(&state.db)
             .await?;
         if bal <= 0 {
-            return Err(AppError { status: axum::http::StatusCode::PAYMENT_REQUIRED, msg: "额度不足，请充值".into() });
+            return Err(AppError {
+                status: axum::http::StatusCode::PAYMENT_REQUIRED,
+                msg: "额度不足，请充值".into(),
+            });
         }
     }
 
@@ -337,37 +580,122 @@ pub async fn chat(State(state): State<AppState>, claims: Claims, Path(id): Path<
         .await
         .map_err(|e| AppError::internal(format!("模型调用失败: {e}")))?;
     let status = resp.status();
-    let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
     if !status.is_success() {
-        return Err(AppError { status: axum::http::StatusCode::BAD_GATEWAY, msg: format!("模型供应商错误 {}: {}", status.as_u16(), data) });
+        return Err(AppError {
+            status: axum::http::StatusCode::BAD_GATEWAY,
+            msg: format!("模型供应商错误 {}: {}", status.as_u16(), data),
+        });
     }
 
-    // bill on success: credits = total_tokens/1000 * rate (USD cents)
-    let tokens = data.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
-    let cost = ((tokens as f64) / 1000.0 * model.rate).round() as i64;
-    if cost > 0 {
-        let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2")
-            .bind(cost)
-            .bind(uid)
-            .execute(&state.db)
-            .await;
-    }
-    let _ = sqlx::query("INSERT INTO model_usage (user_id, model_id, cost_cents) VALUES ($1,$2,$3)")
-        .bind(uid)
-        .bind(model.id)
-        .bind(cost)
-        .execute(&state.db)
-        .await;
+    // bill on success: per_call flat fee, or real token usage × official price × 倍率.
+    let (model_in, model_out) = model_price_override(&model.model_prices, &chosen);
+    let usage_val = data.get("usage");
+    let has_real = usage_val.is_some_and(|u| {
+        u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0) > 0
+            || u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0) > 0
+    });
+    let (effective_usage, is_est) = if has_real {
+        (usage_val.cloned().unwrap_or_else(|| json!({})), false)
+    } else {
+        let est_in = estimate_input_tokens(&body);
+        let resp_str = serde_json::to_string(&data).unwrap_or_default();
+        let est_out = (resp_str.len() as i64) / 4;
+        tracing::warn!(
+            "[billing] legacy chat no usage, estimating: in={} out={} model={}",
+            est_in,
+            est_out,
+            chosen
+        );
+        (estimated_usage(est_in, est_out), true)
+    };
+    let cost = resolve_cost(
+        &model.billing_mode,
+        model.per_call_cents,
+        Some(&effective_usage),
+        &chosen,
+        model.rate,
+        model.input_price,
+        model.output_price,
+        model.cache_read_price,
+        model.cache_create_price,
+        model_in,
+        model_out,
+    );
+    let tokens = extract_bill_tokens(Some(&effective_usage), &chosen, is_est);
+    bill(&state, uid, model.id, cost, false, &tokens).await;
     Ok(Json(data))
 }
 
 // ---------- admin: usage stats ----------
 /// GET /api/admin/model-usage — recent usage + totals (admin).
-pub async fn admin_usage(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_usage(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
-    let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM model_usage").fetch_one(&state.db).await?;
-    let spent: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(cost_cents),0)::bigint FROM model_usage").fetch_one(&state.db).await?;
+    let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM model_usage")
+        .fetch_one(&state.db)
+        .await?;
+    let spent: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(cost_cents),0)::bigint FROM model_usage")
+            .fetch_one(&state.db)
+            .await?;
     Ok(Json(json!({ "calls": calls, "spent_cents": spent })))
+}
+
+/// GET /api/usage — a logged-in user's own recent usage + current balance.
+pub async fn user_usage(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    type UsageRow = (
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        bool,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let rows: Vec<UsageRow> =
+        sqlx::query_as(
+            "SELECT cost_cents, prompt_tokens, completion_tokens, cached_tokens, model_name, estimated, created_at \
+             FROM model_usage WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200",
+        )
+        .bind(uid)
+        .fetch_all(&state.db)
+        .await?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "cost_cents": r.0, "prompt_tokens": r.1, "completion_tokens": r.2,
+                "cached_tokens": r.3, "model": r.4, "estimated": r.5, "time": r.6,
+            })
+        })
+        .collect();
+    let (credits, plan): (i64, String) =
+        sqlx::query_as("SELECT credits_cents, plan FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&state.db)
+            .await?;
+    let total_spent: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cost_cents),0)::bigint FROM model_usage WHERE user_id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(json!({
+        "credits_cents": credits,
+        "plan": plan,
+        "total_spent_cents": total_spent,
+        "recent": list,
+    })))
 }
 
 // ================= Michael API keys + OpenAI-compatible gateway =================
@@ -384,7 +712,9 @@ struct ApiKeyRow {
 
 fn gen_api_key() -> String {
     let mut rng = rand::thread_rng();
-    let hex: String = (0..40).map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap()).collect();
+    let hex: String = (0..40)
+        .map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap())
+        .collect();
     format!("sk-michael-{hex}")
 }
 
@@ -402,15 +732,26 @@ pub struct ApiKeyReq {
 }
 
 /// POST /api/admin/apikeys — generate a gateway key for the admin (or a given user's email).
-pub async fn admin_create_apikey(State(state): State<AppState>, claims: Claims, Json(req): Json<ApiKeyReq>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_create_apikey(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<ApiKeyReq>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
-    let uid = match req.email.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let uid = match req
+        .email
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(email) => sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE email = $1")
             .bind(email)
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| AppError::bad("用户不存在"))?,
-        None => uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?,
+        None => {
+            uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?
+        }
     };
     let key = gen_api_key();
     sqlx::query("INSERT INTO api_keys (user_id, api_key, label) VALUES ($1,$2,$3)")
@@ -423,7 +764,10 @@ pub async fn admin_create_apikey(State(state): State<AppState>, claims: Claims, 
 }
 
 /// GET /api/admin/apikeys — list keys (masked) with their owner email.
-pub async fn admin_list_apikeys(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_list_apikeys(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
     let rows = sqlx::query_as::<_, ApiKeyRow>(
         "SELECT k.id, k.label, k.api_key, u.email, k.created_at, k.last_used_at \
@@ -439,24 +783,34 @@ pub async fn admin_list_apikeys(State(state): State<AppState>, claims: Claims) -
 }
 
 /// DELETE /api/admin/apikeys/:id
-pub async fn admin_delete_apikey(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn admin_delete_apikey(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
-    let res = sqlx::query("DELETE FROM api_keys WHERE id = $1").bind(id).execute(&state.db).await?;
+    let res = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::bad("密钥不存在"));
     }
     Ok(Json(json!({ "ok": true })))
 }
 
-/// GET /api/ide-key — convenience bootstrap: return a stable API key bound to
-/// the owner (first admin), creating it once. Lets the IDE auto-configure with
-/// no manual key. NOTE: public for single-tenant convenience; lock down (or
-/// require login) before exposing to untrusted users.
-pub async fn ide_key(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1")
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::bad("尚无管理员账号"))?;
+/// GET /api/ide-key — return a stable API key bound to THE LOGGED-IN USER (creating
+/// it once), so the IDE can auto-configure a per-user key. REQUIRES a valid login JWT
+/// (the `Claims` extractor 401s otherwise). This is deliberate: previously this was
+/// public and returned the *first admin's* key — anyone could fetch it (full-gateway
+/// leak) and every anonymous caller's usage billed the admin. Now each caller gets
+/// THEIR OWN key, billed to THEIR account. The desktop IDE already authenticates chat
+/// with the login JWT directly; this endpoint is for clients that want a stable key.
+pub async fn ide_key(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<serde_json::Value>> {
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
     let existing: Option<String> = sqlx::query_scalar("SELECT api_key FROM api_keys WHERE user_id = $1 AND label = 'ide-auto' ORDER BY created_at LIMIT 1")
         .bind(uid)
         .fetch_optional(&state.db)
@@ -465,11 +819,13 @@ pub async fn ide_key(State(state): State<AppState>) -> ApiResult<Json<serde_json
         Some(k) => k,
         None => {
             let k = gen_api_key();
-            sqlx::query("INSERT INTO api_keys (user_id, api_key, label) VALUES ($1, $2, 'ide-auto')")
-                .bind(uid)
-                .bind(&k)
-                .execute(&state.db)
-                .await?;
+            sqlx::query(
+                "INSERT INTO api_keys (user_id, api_key, label) VALUES ($1, $2, 'ide-auto')",
+            )
+            .bind(uid)
+            .bind(&k)
+            .execute(&state.db)
+            .await?;
             k
         }
     };
@@ -479,9 +835,14 @@ pub async fn ide_key(State(state): State<AppState>) -> ApiResult<Json<serde_json
 /// A model id whose vision is weak/absent → route images through gpt-5.5 first.
 fn needs_vision_help(model_id: &str) -> bool {
     let m = model_id.to_lowercase();
-    let native = m.contains("gpt") || m.contains("gemini") || m.contains("claude")
-        || m.contains("vision") || m.contains("-vl") || m.contains("image")
-        || m.contains("o3") || m.contains("o4");
+    let native = m.contains("gpt")
+        || m.contains("gemini")
+        || m.contains("claude")
+        || m.contains("vision")
+        || m.contains("-vl")
+        || m.contains("image")
+        || m.contains("o3")
+        || m.contains("o4");
     !native
 }
 
@@ -506,20 +867,35 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
     }
     // best-effort: have gpt-5.5 describe the images (may fail → we still strip them)
     let mut desc: Option<String> = None;
-    let conns = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-    if let Some(vconn) = conns.into_iter().find(|m| allowed_ids(m).iter().any(|id| id.eq_ignore_ascii_case("gpt-5.5"))) {
+    let conns = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    if let Some(vconn) = conns.into_iter().find(|m| {
+        allowed_ids(m)
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case("gpt-5.5"))
+    }) {
         let mut vcontent = vec![json!({
             "type": "text",
             "text": "请详细、客观地描述这些图片的全部内容（文字、数据、图表、代码、界面元素、布局、配色等），让一个无法读图的模型也能据此完成工作。只输出描述本身。"
         })];
         vcontent.extend(images.clone());
         let payload = json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": vcontent }], "stream": false });
-        if let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(90)).build() {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+        {
             let url = format!("{}/chat/completions", api_base(&vconn.base_url));
-            if let Ok(r) = client.post(&url).header("Authorization", format!("Bearer {}", vconn.api_key)).json(&payload).send().await {
+            if let Ok(r) = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", vconn.api_key))
+                .json(&payload)
+                .send()
+                .await
+            {
                 if let Ok(d) = r.json::<serde_json::Value>().await {
                     if let Some(s) = d["choices"][0]["message"]["content"].as_str() {
                         if !s.trim().is_empty() {
@@ -563,17 +939,382 @@ async fn vision_preprocess(state: &AppState, body: &mut serde_json::Value) {
         }
         if let Some(idx) = last_img {
             if let Some(m) = msgs.get_mut(idx) {
-                let cur = m.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                let cur = m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 m["content"] = json!(format!("{}\n\n{}", cur, note));
             }
         }
     }
 }
 
+/// Cents to bill from an upstream `usage` object, CACHE-AWARE. `rate` is cents per
+/// 1000 tokens (same unit as the non-streaming path). Cached (read) input tokens are
+/// charged at CACHE_READ_FACTOR of the rate so caching savings reach the user;
+/// Anthropic cache-CREATION at CACHE_WRITE_FACTOR. Handles both usage shapes —
+/// OpenAI/DeepSeek: `prompt_tokens` INCLUDES cached; Anthropic: `input_tokens`
+/// EXCLUDES cached (cache_read/creation reported separately). Returns None when the
+/// upstream reported no usable token counts, so the caller falls back to a flat fee.
+#[allow(dead_code)] // kept for an optional token-based billing mode (currently flat)
+fn cost_from_usage(u: &serde_json::Value, rate: f64) -> Option<i64> {
+    const CACHE_READ_FACTOR: f64 = 0.1; // cached reads ~10% of input price
+    const CACHE_WRITE_FACTOR: f64 = 1.25; // Anthropic cache creation ~125%
+                                          // Sanity ceiling: a malformed/huge upstream usage must never saturate to i64::MAX
+                                          // and zero out a user's balance. No single call legitimately costs $10k.
+    const COST_CEILING: f64 = 1_000_000.0;
+    let completion = u
+        .get("completion_tokens")
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("output_tokens").and_then(|v| v.as_f64()));
+    let prompt = u
+        .get("prompt_tokens")
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("input_tokens").and_then(|v| v.as_f64()));
+    let (completion, prompt) = match (completion, prompt) {
+        (Some(c), Some(p)) => (c, p),
+        // Some providers report only total_tokens — bill that flat (matches the
+        // non-streaming path's formula).
+        _ => {
+            let total = u.get("total_tokens").and_then(|v| v.as_f64())?;
+            return Some((total / 1000.0 * rate).round().clamp(0.0, COST_CEILING) as i64);
+        }
+    };
+    let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_f64()); // Anthropic
+    let cache_creation = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_f64())) // DeepSeek
+        .or(cache_read)
+        .unwrap_or(0.0);
+    let billable_input = if cache_read.is_some() {
+        // Anthropic shape: input_tokens EXCLUDES cached.
+        prompt + cached * CACHE_READ_FACTOR + cache_creation * CACHE_WRITE_FACTOR
+    } else {
+        // OpenAI/DeepSeek shape: prompt_tokens INCLUDES cached.
+        (prompt - cached).max(0.0) + cached * CACHE_READ_FACTOR
+    };
+    Some(
+        ((billable_input + completion) / 1000.0 * rate)
+            .round()
+            .clamp(0.0, COST_CEILING) as i64,
+    )
+}
+
+/// Official public list prices (USD per 1,000,000 tokens) per model — the REAL cost basis
+/// for billing (the default when no per-model override is set). Per-MODEL, not per-connection,
+/// because one connection (e.g. the zyz aggregator) exposes many models at different prices.
+/// Matched by FAMILY substring so date/`-preview` suffixes still resolve (e.g.
+/// `claude-haiku-4-5-20251001`, `gemini-3.1-pro-preview`). Sources: vendor pricing pages, 2026-07
+/// (Anthropic prices from the claude-api skill; Gemini/GPT/DeepSeek/MiniMax from vendor pages).
+/// Returns (input, output). None → caller falls back to the connection-level price, then 0.
+fn official_price(model_id: &str) -> Option<(f64, f64)> {
+    let m = model_id.to_lowercase();
+    // ---- Anthropic Claude (official list price) ----
+    if m.contains("claude") {
+        if m.contains("fable-5") || m.contains("mythos-5") {
+            return Some((10.0, 50.0));
+        }
+        if m.contains("opus-4") {
+            return Some((5.0, 25.0));
+        } // opus 4.6 / 4.7 / 4.8
+          // sonnet 5 standard $3/$15 (intro $2/$10 through 2026-08-31; use the durable list price);
+          // sonnet 4.6 is also $3/$15.
+        if m.contains("sonnet-5") || m.contains("sonnet-4") {
+            return Some((3.0, 15.0));
+        }
+        if m.contains("haiku-4") {
+            return Some((1.0, 5.0));
+        } // haiku 4.5 (+date suffix)
+    }
+    // ---- Google Gemini (official list price, standard ≤200K-context tier) ----
+    if m.contains("gemini") {
+        if m.contains("image") {
+            return None;
+        } // image gen → billed per-image, not per-token
+        if m.contains("3.5-flash") || m.contains("3-5-flash") {
+            return Some((1.5, 9.0));
+        }
+        if m.contains("pro") {
+            return Some((2.0, 12.0));
+        } // gemini 3.1 pro (-preview)
+        if m.contains("flash") {
+            return Some((0.5, 3.0));
+        } // gemini 3 flash tier
+    }
+    // ---- OpenAI GPT / DeepSeek / MiniMax (exact ids as the aggregator exposes them) ----
+    let p = match m.as_str() {
+        "gpt-5.5" => (5.0, 30.0),
+        "gpt-5.4" => (2.5, 15.0),
+        "deepseek-v4-flash" => (0.14, 0.28),
+        "deepseek-v4-pro" => (0.435, 0.87),
+        "minimax-m3" => (0.30, 1.20),
+        "minimax-m2.7" | "minimax-m2.7-highspeed" => (0.25, 1.00),
+        "minimax-m2.5" | "minimax-m2.5-highspeed" => (0.30, 1.20),
+        "minimax-m2.1" | "minimax-m2.1-highspeed" => (0.15, 0.60),
+        "minimax-m2" => (0.10, 0.40),
+        _ => return None,
+    };
+    Some(p)
+}
+
+/// REAL billing — actual token usage × the model's REAL (official) price × the
+/// connection's 倍率 (markup multiplier):
+///   cost_cents = (input_tok·off_in + output_tok·off_out) / 1e6 · 100 · rate
+/// `off_in/off_out` come from the per-model official catalog, falling back to the admin's
+/// per-connection input/output price override when a model isn't catalogued. `rate` is the
+/// connection's 倍率 (e.g. 3 = bill 3× the real cost; the operator's margin, hidden from
+/// users). Uses ONLY the upstream's authoritative `usage`; no usage / no price → 0 (never
+/// guesses). Cache-aware (cached input 0.1×). Hard $50/call ceiling.
+#[allow(clippy::too_many_arguments)]
+fn compute_cost(
+    usage: Option<&serde_json::Value>,
+    model_id: &str,
+    rate: f64,
+    admin_in: f64,
+    admin_out: f64,
+    cache_read_price: f64,
+    cache_create_price: f64,
+    model_in: f64,
+    model_out: f64,
+) -> i64 {
+    const CACHE_READ_FACTOR: f64 = 0.1;
+    const CACHE_WRITE_FACTOR: f64 = 1.25;
+    const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
+    let u = match usage {
+        Some(u) if u.is_object() => u,
+        _ => return 0,
+    };
+    let completion = u
+        .get("completion_tokens")
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("output_tokens").and_then(|v| v.as_f64()))
+        .unwrap_or(0.0);
+    let prompt = u
+        .get("prompt_tokens")
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("input_tokens").and_then(|v| v.as_f64()))
+        // Only total_tokens reported → the non-output remainder is input.
+        .or_else(|| {
+            u.get("total_tokens")
+                .and_then(|v| v.as_f64())
+                .map(|t| (t - completion).max(0.0))
+        })
+        .unwrap_or(0.0);
+    if prompt <= 0.0 && completion <= 0.0 {
+        return 0;
+    }
+    // Price priority: admin's PER-MODEL override (model_in/out, set in the backend per enabled
+    // model) wins; else the built-in official catalog; else the connection-level input/output
+    // price. This lets each checked model be priced individually while keeping the catalog default.
+    let (off_in, off_out) = if model_in > 0.0 || model_out > 0.0 {
+        (model_in, model_out)
+    } else {
+        official_price(model_id).unwrap_or((admin_in, admin_out))
+    };
+    if off_in <= 0.0 && off_out <= 0.0 {
+        return 0; // no known price for this model → can't compute a real cost
+    }
+    let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_f64()); // Anthropic
+    let cache_creation = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_f64())
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_f64())) // DeepSeek
+        .or(cache_read)
+        .unwrap_or(0.0);
+    // Per-token CACHE prices: admin's explicit price if set (>0), else the old factor off
+    // input. cache READ is cheap, cache CREATE/write is a premium — billed separately now.
+    let read_price = if cache_read_price > 0.0 {
+        cache_read_price
+    } else {
+        off_in * CACHE_READ_FACTOR
+    };
+    let write_price = if cache_create_price > 0.0 {
+        cache_create_price
+    } else {
+        off_in * CACHE_WRITE_FACTOR
+    };
+    // Split input into plain (full price) + cache-read + cache-create, bill each at its own
+    // unit price; output at off_out. Then × 倍率. Anthropic reports input EXCLUDING cached;
+    // OpenAI/DeepSeek report prompt INCLUDING cached reads (and no separate write count).
+    let (plain_input, read_tok, write_tok) = if cache_read.is_some() {
+        (prompt, cached, cache_creation) // Anthropic shape
+    } else {
+        ((prompt - cached).max(0.0), cached, 0.0) // OpenAI / DeepSeek shape
+    };
+    let usd = (plain_input * off_in
+        + read_tok * read_price
+        + write_tok * write_price
+        + completion * off_out)
+        / 1_000_000.0;
+    let cents = (usd * 100.0 * rate.max(0.0))
+        .round()
+        .clamp(0.0, COST_CEILING_CENTS) as i64;
+    // Detailed breakdown so we can trace "why was this call charged X" — appears
+    // in `docker logs server-backend-1` at INFO level.
+    tracing::info!(
+        "[billing] model={} prompt={} completion={} cache_read={} cache_create={} | in_price={} read_price={:.4} write_price={:.4} out_price={} → usd={:.6} rate={} → {}¢",
+        model_id, prompt as i64, completion as i64, read_tok as i64, write_tok as i64,
+        off_in, read_price, write_price, off_out, usd, rate, cents
+    );
+    cents
+}
+
+/// Pull the final `usage` object out of an accumulated OpenAI-style SSE stream. With
+/// `stream_options.include_usage` the upstream emits a trailing `data:` chunk whose
+/// `usage` carries the real prompt/completion token counts; we scan every `data:` line
+/// and keep the LAST one that actually has token fields. None if the stream never
+/// reported usage (caller then bills the flat fee).
+fn parse_usage_from_sse(acc: &[u8]) -> Option<serde_json::Value> {
+    let text = String::from_utf8_lossy(acc);
+    let mut last: Option<serde_json::Value> = None;
+    for line in text.lines() {
+        let payload = match line.trim_start().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(u) = v.get("usage") {
+                let has_tokens = [
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                ]
+                .iter()
+                .any(|k| u.get(*k).and_then(|x| x.as_f64()).is_some());
+                if has_tokens {
+                    last = Some(u.clone());
+                }
+            }
+        }
+    }
+    last
+}
+
+/// Strip ALL `cache_control` before forwarding. PROVEN via per-call fingerprints that
+/// the [tools+system] prefix is byte-IDENTICAL on every call (16+ consecutive calls,
+/// same sys_hash + tools_hash) — yet the relay (zyz) still bills cache CREATION (a 1.25×
+/// write premium) on nearly every call and serves reads only sporadically (its prompt
+/// cache appears per-instance behind a load balancer, so identical calls keep missing).
+/// So on this relay cache_control is, on average, a pure write premium. Stripping it →
+/// flat 1× billing. The real win (write-once, then 0.1× reads) needs a RELIABLE-caching
+/// upstream (Anthropic / Bedrock direct, or LiteLLM), not this relay.
+fn strip_cache_control(body: &mut serde_json::Value) {
+    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in msgs.iter_mut() {
+            if let Some(content) = m.get_mut("content") {
+                if let Some(blocks) = content.as_array_mut() {
+                    for b in blocks.iter_mut() {
+                        if let Some(o) = b.as_object_mut() {
+                            o.remove("cache_control");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for t in tools.iter_mut() {
+            if let Some(o) = t.as_object_mut() {
+                o.remove("cache_control");
+            }
+        }
+    }
+}
+
+/// Deterministic cache key for a chat request: hashes the full request body (model
+/// + messages + params). serde_json serializes Map keys sorted, so it's stable.
+///
+/// 128-bit (two seeded hashes) so a collision — which would serve a WRONG cached
+/// response — is negligible.
+fn gw_cache_key(body: &serde_json::Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let bytes = serde_json::to_vec(body).unwrap_or_default();
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h1);
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    0x9e37_79b9_7f4a_7c15u64.hash(&mut h2);
+    bytes.hash(&mut h2);
+    format!("gwc:{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
 /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
 /// key (Bearer). Resolves `model` to the connection that exposes it, forwards
 /// the request (streaming passthrough), and bills the key owner's credits.
-pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap, Json(mut body): Json<serde_json::Value>) -> Result<Response, AppError> {
+/// Repair malformed `tool_calls[*].function.arguments` strings from upstream relays.
+/// Specifically targets the `'{}'` + `'{...}'` concatenation bug seen on Claude-via-
+/// OpenAI-compat relays, where the placeholder `{}` is glued to the real args JSON
+/// instead of replaced. We detect this exact pattern and keep only the trailing JSON.
+fn fix_tool_call_arguments(data: &mut serde_json::Value) {
+    let choices = match data.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        Some(c) => c,
+        None => return,
+    };
+    for ch in choices {
+        let tcs = match ch
+            .pointer_mut("/message/tool_calls")
+            .and_then(|t| t.as_array_mut())
+        {
+            Some(t) => t,
+            None => continue,
+        };
+        for tc in tcs {
+            let args_val = match tc.pointer_mut("/function/arguments") {
+                Some(v) => v,
+                None => continue,
+            };
+            let s = match args_val.as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            // Strip a literal leading `{}` followed by another JSON object — that's
+            // the exact concatenation bug. Don't touch valid single-object strings.
+            let trimmed = s.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("{}") {
+                let rest = rest.trim_start();
+                if rest.starts_with('{') && serde_json::from_str::<serde_json::Value>(rest).is_ok()
+                {
+                    *args_val = serde_json::Value::String(rest.to_string());
+                    continue;
+                }
+            }
+            // Fallback: try to parse; if it fails, attempt to locate the last valid
+            // JSON object in the string (handles `xxx{...}` garbage prefix).
+            if serde_json::from_str::<serde_json::Value>(&s).is_err() {
+                if let Some(last_open) = s.rfind('{') {
+                    let candidate = &s[last_open..];
+                    if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                        *args_val = serde_json::Value::String(candidate.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a caller to a user id from either an api_key or a login JWT (Bearer).
+/// Used by free, auth-gated endpoints (knowledge base) that need a valid user but
+/// don't bill.
+pub(crate) async fn auth_any_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<uuid::Uuid, AppError> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -581,27 +1322,903 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
-    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>("SELECT user_id FROM api_keys WHERE api_key = $1")
+    match sqlx::query_scalar::<_, uuid::Uuid>("SELECT user_id FROM api_keys WHERE api_key = $1")
         .bind(&token)
         .fetch_optional(&state.db)
         .await?
     {
+        Some(u) => Ok(u),
+        None => crate::auth::user_from_jwt(&state.cfg, &token)
+            .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效")),
+    }
+}
+
+/// POST /api/knowledge/search — agentic-RAG retrieval over the curated domain
+/// knowledge corpus. Body: { query, domain?, top_k? }. Free (no billing); auth
+/// only to prevent open abuse. Returns the most relevant best-practice sections.
+pub async fn knowledge_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    auth_any_user(&state, &headers).await?;
+    let query = body
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if query.is_empty() {
+        return Err(AppError::bad("缺少 query"));
+    }
+    let domain = body
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+    let hits = crate::knowledge::search(query, domain, top_k);
+    Ok(Json(json!({ "results": hits })))
+}
+
+/// GET /api/knowledge/domains — list the available knowledge domains + their topics
+/// so the agent (or the IDE) can see what's covered.
+pub async fn knowledge_domains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    auth_any_user(&state, &headers).await?;
+    let idx = crate::knowledge::get();
+    let domains: Vec<_> = idx
+        .domains
+        .iter()
+        .map(|(d, t)| json!({ "domain": d, "topics": t }))
+        .collect();
+    Ok(Json(json!({ "domains": domains })))
+}
+
+/// Per-call token detail for the model_usage audit trail.
+#[derive(Clone, Default)]
+struct BillTokens {
+    prompt: i64,
+    completion: i64,
+    cached: i64,
+    model_name: String,
+    estimated: bool,
+}
+
+/// Extract BillTokens from a provider usage JSON (OpenAI or Anthropic shape).
+fn extract_bill_tokens(
+    usage: Option<&serde_json::Value>,
+    model_name: &str,
+    estimated: bool,
+) -> BillTokens {
+    let u = match usage.and_then(|v| if v.is_object() { Some(v) } else { None }) {
+        Some(v) => v,
+        None => {
+            return BillTokens {
+                model_name: model_name.to_string(),
+                estimated,
+                ..Default::default()
+            }
+        }
+    };
+    let gi = |keys: &[&str]| -> i64 {
+        for k in keys {
+            if let Some(n) = u.get(*k).and_then(|x| x.as_i64()) {
+                return n;
+            }
+        }
+        0
+    };
+    let cached = gi(&["cache_read_input_tokens"])
+        .max(
+            u.pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+        )
+        .max(gi(&["prompt_cache_hit_tokens"]));
+    BillTokens {
+        prompt: gi(&["prompt_tokens", "input_tokens"]),
+        completion: gi(&["completion_tokens", "output_tokens"]),
+        cached,
+        model_name: model_name.to_string(),
+        estimated,
+    }
+}
+
+/// CJK-aware rough token estimate from a serialized JSON body (input side).
+fn estimate_input_tokens(body: &serde_json::Value) -> i64 {
+    let s = serde_json::to_string(body).unwrap_or_default();
+    let mut cjk = 0i64;
+    for c in s.chars() {
+        if ('\u{2E80}'..='\u{9FFF}').contains(&c)
+            || ('\u{AC00}'..='\u{D7A3}').contains(&c)
+            || ('\u{F900}'..='\u{FAFF}').contains(&c)
+            || ('\u{FF00}'..='\u{FFEF}').contains(&c)
+        {
+            cjk += 1;
+        }
+    }
+    cjk + (s.len() as i64 - cjk) / 4
+}
+
+/// Rough output token estimate from accumulated SSE response bytes.
+fn estimate_output_tokens(response_bytes: usize) -> i64 {
+    (response_bytes as f64 * 0.6 / 4.0).round().max(0.0) as i64
+}
+
+/// Build a synthetic usage JSON from estimates (fallback when provider reports nothing).
+fn estimated_usage(input_tok: i64, output_tok: i64) -> serde_json::Value {
+    json!({ "prompt_tokens": input_tok, "completion_tokens": output_tok, "total_tokens": input_tok + output_tok })
+}
+
+/// Deduct cost from the user's quota/credits and log the model_usage row with token detail.
+/// Module-scope so chat_completions, responses_proxy, and image_generations all share it.
+async fn bill(
+    state: &AppState,
+    uid: uuid::Uuid,
+    conn_id: uuid::Uuid,
+    cost: i64,
+    use_quota: bool,
+    tokens: &BillTokens,
+) {
+    if cost > 0 {
+        if use_quota {
+            let _ = sqlx::query(
+                "UPDATE users SET quota_total_cents = GREATEST(quota_total_cents - $1, 0), \
+                 quota_window_cents = GREATEST(quota_window_cents - $1, 0), \
+                 quota_week_used_cents = quota_week_used_cents + $1 WHERE id = $2",
+            )
+            .bind(cost)
+            .bind(uid)
+            .execute(&state.db)
+            .await;
+        } else {
+            let _ = sqlx::query(
+                "UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2",
+            )
+            .bind(cost)
+            .bind(uid)
+            .execute(&state.db)
+            .await;
+        }
+    }
+    let _ = sqlx::query(
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, model_name, estimated) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(uid)
+    .bind(conn_id)
+    .bind(cost)
+    .bind(tokens.prompt)
+    .bind(tokens.completion)
+    .bind(tokens.cached)
+    .bind(&tokens.model_name)
+    .bind(tokens.estimated)
+    .execute(&state.db)
+    .await;
+}
+
+// ============ Anthropic protocol bridge (OpenAI ⇄ Anthropic Messages API) ============
+// A connection with protocol="anthropic" talks the NATIVE Anthropic /v1/messages API instead
+// of the OpenAI-compat /chat/completions wrapper. Native = reliable prompt caching (0.1× reads,
+// proven working on this upstream) + correct tool-call streaming (the compat wrapper stalled /
+// garbled Claude tool writes). The IDE still speaks OpenAI, so the gateway translates the
+// request → Anthropic and the response (streaming + non-streaming) → OpenAI. protocol="openai"
+// paths are completely untouched.
+
+/// Flatten an OpenAI message `content` (string OR array of parts) to plain text.
+fn oai_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// OpenAI user `content` → Anthropic content (plain string, or blocks incl. images).
+fn oai_content_to_anthropic(content: Option<&serde_json::Value>) -> serde_json::Value {
+    match content {
+        Some(serde_json::Value::Array(parts)) => {
+            let mut blocks: Vec<serde_json::Value> = Vec::new();
+            for p in parts {
+                match p.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                            blocks.push(json!({"type":"text","text":t}));
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(u) = p.pointer("/image_url/url").and_then(|v| v.as_str()) {
+                            if let Some(rest) = u.strip_prefix("data:") {
+                                if let Some((meta, data)) = rest.split_once(',') {
+                                    let media = meta.split(';').next().unwrap_or("image/png");
+                                    blocks.push(json!({"type":"image","source":{"type":"base64","media_type":media,"data":data}}));
+                                }
+                            } else {
+                                blocks
+                                    .push(json!({"type":"image","source":{"type":"url","url":u}}));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if blocks.is_empty() {
+                json!("")
+            } else {
+                json!(blocks)
+            }
+        }
+        Some(serde_json::Value::String(s)) => json!(s.clone()),
+        _ => json!(""),
+    }
+}
+
+/// Extended-thinking config for a Claude model on the native Anthropic path, or None.
+/// Adaptive thinking (Opus/Sonnet 4.x+, Fable, Mythos) is Anthropic's smartest mode and
+/// auto-scales depth (minimal on trivial calls, deep on hard ones) — the single biggest IQ
+/// lever for the coding agent. Verified live against the upstream: adaptive is accepted, and
+/// replayed tool_use turns WITHOUT preserved thinking blocks are tolerated (200, not 400), so
+/// no thinking-signature round-trip through the OpenAI-format history is needed.
+/// Haiku stays fast/cheap (no thinking); 3.7 uses the older explicit-budget form; 3.5 none.
+/// Respects the client's per-model control: `reasoning_effort` present = thinking ON, absent /
+/// "off" = OFF (the IDE defaults Claude to "medium" and drops the field on "off").
+/// Master off-switch: env MICHAEL_ANTHROPIC_THINKING=0.
+fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::Value> {
+    if std::env::var("MICHAEL_ANTHROPIC_THINKING").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let eff = match effort {
+        Some(e) if !e.is_empty() && e != "off" => e,
+        _ => return None,
+    };
+    let m = model.to_lowercase();
+    if m.contains("haiku") {
+        return None;
+    } // fast tier → keep it fast
+    if m.contains("claude-3-5") || m.contains("claude-3.5") {
+        return None;
+    } // pre-thinking
+    if m.contains("claude-3-7") || m.contains("claude-3.7") {
+        // 3.7 → explicit budget
+        let budget = match eff {
+            "low" => 4000,
+            "high" | "max" => 12000,
+            _ => 8000,
+        };
+        return Some(json!({"type":"enabled","budget_tokens":budget}));
+    }
+    if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
+        return Some(json!({"type":"adaptive"})); // 4.x+ / Fable / Mythos
+    }
+    None
+}
+
+/// OpenAI /chat/completions body → Anthropic /v1/messages body.
+fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            match m.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
+                "system" => {
+                    let s = oai_content_text(m.get("content"));
+                    if !s.is_empty() {
+                        system_parts.push(s);
+                    }
+                }
+                "tool" => {
+                    // OpenAI tool result → Anthropic user turn w/ a tool_result block. Consecutive
+                    // tool results MUST be grouped into one user turn (Anthropic requirement).
+                    let tcid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let block = json!({"type":"tool_result","tool_use_id":tcid,"content":oai_content_text(m.get("content"))});
+                    let can_group = messages.last().is_some_and(|last| {
+                        last.get("role").and_then(|r| r.as_str()) == Some("user")
+                            && last
+                                .get("content")
+                                .and_then(|c| c.as_array())
+                                .is_some_and(|a| {
+                                    a.iter().all(|b| {
+                                        b.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_result")
+                                    })
+                                })
+                    });
+                    if can_group {
+                        if let Some(arr) = messages
+                            .last_mut()
+                            .and_then(|l| l.get_mut("content"))
+                            .and_then(|c| c.as_array_mut())
+                        {
+                            arr.push(block);
+                        }
+                    } else {
+                        messages.push(json!({"role":"user","content":[block]}));
+                    }
+                }
+                "assistant" => {
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    let s = oai_content_text(m.get("content"));
+                    if !s.is_empty() {
+                        blocks.push(json!({"type":"text","text":s}));
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tcs {
+                            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            let input: serde_json::Value =
+                                serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                            blocks
+                                .push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
+                        }
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(json!({"type":"text","text":"(no content)"}));
+                    }
+                    messages.push(json!({"role":"assistant","content":blocks}));
+                }
+                _ => messages.push(
+                    json!({"role":"user","content":oai_content_to_anthropic(m.get("content"))}),
+                ),
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(model) = body.get("model") {
+        out.insert("model".into(), model.clone());
+    }
+    out.insert("messages".into(), json!(messages));
+    if !system_parts.is_empty() {
+        out.insert("system".into(), json!(system_parts.join("\n\n")));
+    }
+    // Extended thinking — ALWAYS use the gateway's model-aware config, never the client's
+    // `thinking` field. Newer models (Sonnet 5, Opus 4.7/4.8, Fable 5) REJECT the old
+    // `{"type":"enabled","budget_tokens":N}` format with a 400/502 — they require
+    // `{"type":"adaptive"}` + `output_config.effort`. The IDE client may still send the old
+    // format; the gateway normalises it here per-model.
+    let model_str = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let effort = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            // If client sent thinking but no reasoning_effort, infer effort from presence
+            body.get("thinking").and(Some("high"))
+        });
+    let thinking = anthropic_thinking(model_str, effort);
+    let thinking_on = thinking.is_some();
+    // Anthropic REQUIRES max_tokens. Map from OpenAI, else a generous default.
+    let mut max_tokens = body
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| body.get("max_completion_tokens").and_then(|v| v.as_i64()))
+        .filter(|n| *n > 0)
+        .unwrap_or(8192);
+    // For adaptive thinking: no budget_tokens, just ensure a generous max_tokens.
+    // For budget-based (3.7): ensure max_tokens > budget_tokens.
+    if thinking_on {
+        let budget = thinking
+            .as_ref()
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // Give the deepest effort real headroom to think long. Both "high" and "max" map to
+        // output_config.effort="high" (Anthropic's top knob), so the ONLY thing that makes
+        // "max" deeper than "high" is more max_tokens room for adaptive thinking to stretch.
+        // Without this the top UI dial is a no-op. Gated by effort so low/medium stay lean;
+        // weak/fast models never reach here (thinking is None for haiku/3.5/non-Claude).
+        let floor = match effort {
+            Some("max") => 64000,
+            Some("high") => 40000,
+            _ => 32000,
+        };
+        let min_mt = (budget + 8000).max(floor);
+        if max_tokens < min_mt {
+            max_tokens = min_mt;
+        }
+    }
+    let max_tokens = max_tokens.clamp(1, 128000);
+    out.insert("max_tokens".into(), json!(max_tokens));
+    if let Some(t) = &thinking {
+        out.insert("thinking".into(), t.clone());
+        // Map reasoning_effort → output_config.effort (Anthropic's knob for thinking depth)
+        if let Some(e) = effort {
+            let mapped = match e {
+                "low" => "low",
+                "high" | "max" => "high",
+                _ => "medium",
+            };
+            out.insert("output_config".into(), json!({ "effort": mapped }));
+        }
+    }
+    // stream/stop always pass through; temperature/top_p are INCOMPATIBLE with thinking
+    // (Anthropic rejects non-default values), so copy them only when thinking is OFF.
+    for k in ["stream", "stop"] {
+        if let Some(v) = body.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    if !thinking_on {
+        for k in ["temperature", "top_p"] {
+            if let Some(v) = body.get(k) {
+                out.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let atools: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                let name = f.get("name")?.as_str()?;
+                let mut a = serde_json::Map::new();
+                a.insert("name".into(), json!(name));
+                if let Some(d) = f.get("description") {
+                    a.insert("description".into(), d.clone());
+                }
+                a.insert(
+                    "input_schema".into(),
+                    f.get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                );
+                Some(serde_json::Value::Object(a))
+            })
+            .collect();
+        if !atools.is_empty() {
+            out.insert("tools".into(), json!(atools));
+        }
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        let atc = match tc.as_str() {
+            Some("auto") => Some(json!({"type":"auto"})),
+            Some("required") => Some(json!({"type":"any"})),
+            Some("none") => None,
+            _ => tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .map(|n| json!({"type":"tool","name":n})),
+        };
+        if let Some(v) = atc {
+            out.insert("tool_choice".into(), v);
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Anthropic usage → an object carrying BOTH Anthropic token names (so compute_cost bills
+/// cache-correctly) and OpenAI names (so OpenAI clients read prompt/completion tokens).
+fn anthropic_usage_merged(au: &serde_json::Value) -> serde_json::Value {
+    let g = |k: &str| au.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    let (it, ot) = (g("input_tokens"), g("output_tokens"));
+    json!({
+        "input_tokens": it, "output_tokens": ot,
+        "cache_read_input_tokens": g("cache_read_input_tokens"),
+        "cache_creation_input_tokens": g("cache_creation_input_tokens"),
+        "prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot,
+    })
+}
+
+/// Anthropic non-streaming response → OpenAI /chat/completions response.
+fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
+    let mut text = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    if let Some(content) = av.get("content").and_then(|c| c.as_array()) {
+        for b in content {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
+                    tool_calls.push(json!({
+                        "id": b.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {"name": b.get("name").and_then(|v| v.as_str()).unwrap_or(""), "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())}
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    let finish = match av.get("stop_reason").and_then(|v| v.as_str()) {
+        Some("tool_use") => "tool_calls",
+        Some("max_tokens") => "length",
+        _ => "stop",
+    };
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), json!("assistant"));
+    message.insert(
+        "content".into(),
+        if text.is_empty() && !tool_calls.is_empty() {
+            serde_json::Value::Null
+        } else {
+            json!(text)
+        },
+    );
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), json!(tool_calls));
+    }
+    json!({
+        "id": av.get("id").cloned().unwrap_or_else(|| json!("chatcmpl-anthropic")),
+        "object": "chat.completion", "model": model,
+        "choices": [{"index": 0, "message": serde_json::Value::Object(message), "finish_reason": finish}],
+        "usage": anthropic_usage_merged(av.get("usage").unwrap_or(&json!({}))),
+    })
+}
+
+/// Stateful converter: Anthropic Messages SSE stream → OpenAI chat.completions SSE stream.
+/// Fed raw upstream bytes via `push` (handles chunk-split events); emits ready-to-forward
+/// OpenAI `data:` lines. Accumulates usage for billing. `finish` emits the terminal chunks.
+struct AnthSse {
+    buf: Vec<u8>,
+    model: String,
+    role_sent: bool,
+    next_tool_idx: i64,
+    block_tool: std::collections::HashMap<i64, i64>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read: i64,
+    cache_create: i64,
+    stop_reason: String,
+    out_bytes: usize, // incremental output byte counter for fallback estimation
+}
+impl AnthSse {
+    fn new(model: &str) -> Self {
+        AnthSse {
+            buf: Vec::new(),
+            model: model.to_string(),
+            role_sent: false,
+            next_tool_idx: 0,
+            block_tool: std::collections::HashMap::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_create: 0,
+            stop_reason: "stop".into(),
+            out_bytes: 0,
+        }
+    }
+    fn chunk(&self, delta: serde_json::Value, finish: Option<&str>) -> Vec<u8> {
+        let choice = json!({"index":0,"delta":delta,"finish_reason": match finish { Some(f) => json!(f), None => serde_json::Value::Null }});
+        format!(
+            "data: {}\n\n",
+            json!({"object":"chat.completion.chunk","model":self.model,"choices":[choice]})
+        )
+        .into_bytes()
+    }
+    fn ensure_role(&mut self, out: &mut Vec<u8>) {
+        if !self.role_sent {
+            out.extend(self.chunk(json!({"role":"assistant","content":""}), None));
+            self.role_sent = true;
+        }
+    }
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.buf.extend_from_slice(bytes);
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(0..=nl).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim();
+            let data = match line.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+            if data.is_empty() {
+                continue;
+            }
+            let ev: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match ev.get("type").and_then(|t| t.as_str()) {
+                Some("message_start") => {
+                    if let Some(u) = ev.pointer("/message/usage") {
+                        self.input_tokens =
+                            u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.cache_read = u
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        self.cache_create = u
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                    }
+                    self.ensure_role(&mut out);
+                }
+                Some("content_block_start") => {
+                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cb = ev.get("content_block");
+                    if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                        let ti = self.next_tool_idx;
+                        self.next_tool_idx += 1;
+                        self.block_tool.insert(idx, ti);
+                        let id = cb
+                            .and_then(|c| c.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let name = cb
+                            .and_then(|c| c.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        self.ensure_role(&mut out);
+                        out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}), None));
+                    }
+                }
+                Some("content_block_delta") => {
+                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
+                                self.out_bytes += t.len();
+                                self.ensure_role(&mut out);
+                                out.extend(self.chunk(json!({"content": t}), None));
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(t) = ev.pointer("/delta/thinking").and_then(|v| v.as_str())
+                            {
+                                self.out_bytes += t.len();
+                                self.ensure_role(&mut out);
+                                out.extend(self.chunk(json!({"reasoning_content": t}), None));
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(pj) =
+                                ev.pointer("/delta/partial_json").and_then(|v| v.as_str())
+                            {
+                                let ti = *self.block_tool.get(&idx).unwrap_or(&0);
+                                out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"function":{"arguments": pj}}]}), None));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(sr) = ev.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                        self.stop_reason = match sr {
+                            "tool_use" => "tool_calls",
+                            "max_tokens" => "length",
+                            _ => "stop",
+                        }
+                        .into();
+                    }
+                    if let Some(v) = ev.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                        self.output_tokens = v;
+                    }
+                    if let Some(v) = ev.pointer("/usage/input_tokens").and_then(|v| v.as_i64()) {
+                        if v > 0 {
+                            self.input_tokens = v;
+                        }
+                    }
+                    if let Some(v) = ev
+                        .pointer("/usage/cache_read_input_tokens")
+                        .and_then(|v| v.as_i64())
+                    {
+                        if v > 0 {
+                            self.cache_read = v;
+                        }
+                    }
+                }
+                _ => {} // ping / content_block_stop / message_stop → emit nothing
+            }
+        }
+        out
+    }
+    fn usage(&self) -> serde_json::Value {
+        let ot = if self.output_tokens > 0 {
+            self.output_tokens
+        } else if self.out_bytes > 0 {
+            // Stream broke before message_delta reported output_tokens.
+            // Estimate from the content bytes we DID forward (~4 chars/token).
+            (self.out_bytes as i64 / 4).max(1)
+        } else {
+            0
+        };
+        json!({
+            "input_tokens": self.input_tokens, "output_tokens": ot,
+            "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_create,
+            "prompt_tokens": self.input_tokens, "completion_tokens": ot,
+            "total_tokens": self.input_tokens + ot,
+        })
+    }
+    fn finish(&self) -> Vec<u8> {
+        let mut out = self.chunk(json!({}), Some(&self.stop_reason));
+        out.extend(format!("data: {}\n\n", json!({"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":self.usage()})).into_bytes());
+        out.extend_from_slice(b"data: [DONE]\n\n");
+        out
+    }
+}
+
+/// POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text for the IDE's voice input.
+/// Auth via a Michael API key (or the login JWT), same as chat. Forwards the uploaded clip to the
+/// configured Whisper upstream (Groq's free whisper-large-v3 by default) and returns its JSON
+/// verbatim. Does NOT use the DB `models` connections — those aggregators don't do audio (404).
+pub async fn audio_transcriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Response, AppError> {
+    // ---- auth (mirror chat_completions: api_keys row, else login JWT) ----
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+    let _uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT user_id FROM api_keys WHERE api_key = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?
+    {
+        Some(u) => u,
+        None => crate::auth::user_from_jwt(&state.cfg, &token)
+            .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+    };
+
+    if state.cfg.transcribe_api_key.is_empty() {
+        return Err(AppError::bad("转写服务未配置"));
+    }
+
+    // ---- read the multipart form: file (required) + optional language ----
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "speech.m4a".to_string();
+    let mut content_type = "audio/mp4".to_string();
+    let mut language: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad(format!("表单解析失败: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => {
+                if let Some(n) = field.file_name() {
+                    if !n.is_empty() {
+                        file_name = n.to_string();
+                    }
+                }
+                if let Some(ct) = field.content_type() {
+                    if ct.contains('/') {
+                        content_type = ct.to_string();
+                    }
+                }
+                file_bytes = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| AppError::bad(format!("读取音频失败: {e}")))?
+                        .to_vec(),
+                );
+            }
+            "language" => language = field.text().await.ok().filter(|s| !s.is_empty()),
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+    let file_bytes = file_bytes.ok_or_else(|| AppError::bad("缺少音频文件"))?;
+    if file_bytes.len() < 256 {
+        return Err(AppError::bad("音频太短或为空"));
+    }
+
+    // ---- forward to the Whisper upstream ----
+    let part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(file_name)
+        .mime_str(&content_type)
+        .map_err(|e| AppError::bad(format!("音频类型无效: {e}")))?;
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", state.cfg.transcribe_model.clone())
+        .text("response_format", "json");
+    if let Some(l) = language {
+        form = form.text("language", l);
+    }
+
+    let resp = GW_HTTP
+        .post(&state.cfg.transcribe_url)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", state.cfg.transcribe_api_key),
+        )
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| AppError::bad(format!("转写上游连接失败: {e}")))?;
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::bad(format!("转写上游读取失败: {e}")))?;
+
+    Ok(Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, ctype)
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
+}
+
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT user_id FROM api_keys WHERE api_key = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?
+    {
         Some(u) => {
-            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1").bind(&token).execute(&state.db).await;
+            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
+                .bind(&token)
+                .execute(&state.db)
+                .await;
             u
         }
         // Also accept the login JWT directly (the IDE authenticates with it).
-        None => crate::auth::user_from_jwt(&state.cfg, &token).ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+        None => crate::auth::user_from_jwt(&state.cfg, &token)
+            .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
 
     if !body.is_object() {
         return Err(AppError::bad("请求体需为 JSON 对象"));
     }
-    let model_id = body.get("model").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| AppError::bad("缺少 model"))?;
+    // Strip cache_control: fingerprints proved the prefix is byte-stable yet this relay
+    // still bills cache WRITES (1.25×) almost every call → it's a pure premium here.
+    // Flat 1× is cheaper. (Real fix = a reliable-caching upstream; see fn doc.)
+    strip_cache_control(&mut body);
+    // L0 server-side assembly: when the IDE opts in (x-ide-mode header), inject the system
+    // prompt + requested tool schemas from the registry HERE, so the client ships neither.
+    // No header → no-op (existing behavior untouched).
+    crate::prompts::assemble_into(&headers, &mut body);
+    let model_id = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| AppError::bad("缺少 model"))?;
 
-    let conns = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
-        .fetch_all(&state.db)
-        .await?;
+    let conns = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
     let conn = conns
         .into_iter()
         .find(|m| allowed_ids(m).contains(&model_id))
@@ -626,8 +2243,11 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
             .bind(uid)
             .fetch_one(&state.db)
             .await?;
-    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
-    let quota_ok = plan_active && q_total > 0 && q_window > 0 && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+    let quota_ok = plan_active
+        && q_total > 0
+        && q_window > 0
+        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
     let use_quota = quota_ok;
     if !quota_ok && credits <= 0 {
         let msg = if plan_active && q_total <= 0 {
@@ -639,11 +2259,107 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         } else {
             "请先开通会员或充值额度"
         };
-        return Err(AppError { status: StatusCode::PAYMENT_REQUIRED, msg: msg.into() });
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: msg.into(),
+        });
     }
 
-    let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let url = format!("{}/chat/completions", api_base(&conn.base_url));
+    let streaming = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Ensure the upstream emits a final usage chunk so streaming billing can read
+    // real (cache-discounted) tokens instead of falling back to a flat fee. Only add
+    // it when the client didn't set stream_options itself (the IDE already does; this
+    // covers third-party OpenAI-compatible clients of this gateway).
+    if streaming {
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("stream_options")
+                .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+        }
+    }
+    // ── Gateway response cache ────────────────────────────────────────────────
+    // Identical request (same model + messages + params) → serve the stored
+    // response: NO upstream call, 0 cost. Real caching the user controls, working
+    // for EVERY model regardless of whether the upstream caches. Best-effort: any
+    // Redis hiccup or miss just falls through to a normal upstream call. The quota
+    // gate already ran above, so a hit still requires access — it just costs nothing.
+    let ckey = gw_cache_key(&body);
+    {
+        let mut rconn = state.redis.clone();
+        let hit: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(&ckey)
+            .query_async(&mut rconn)
+            .await
+            .ok()
+            .flatten();
+        if let Some(bytes) = hit {
+            bill(
+                &state,
+                uid,
+                conn.id,
+                0,
+                use_quota,
+                &BillTokens {
+                    model_name: model_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await; // record a 0-cost cache hit
+            let ct = if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, ct)
+                .header("x-gateway-cache", "hit")
+                .header("cache-control", "no-cache")
+                .body(Body::from(bytes))
+                .map_err(|e| AppError::internal(e.to_string()));
+        }
+    }
+    // ── max_tokens guardrail for thinking (all protocols) ───────────────────
+    // Chinese aggregators (zyz etc.) convert reasoning_effort / thinking to Anthropic thinking
+    // with budget_tokens; if max_tokens < budget_tokens the upstream rejects. The native
+    // Anthropic path (oai_to_anthropic) handles this, but OpenAI-protocol connections pass
+    // body through unchanged — so bump max_tokens here before the fork.
+    {
+        let has_thinking = body.get("thinking").is_some()
+            || body
+                .get("reasoning_effort")
+                .and_then(|v| v.as_str())
+                .is_some_and(|e| !e.is_empty() && e != "off");
+        if has_thinking {
+            let budget = body
+                .pointer("/thinking/budget_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let min_mt = (budget + 8000).max(32000);
+            let cur_mt = body.get("max_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            if cur_mt < min_mt {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("max_tokens".into(), json!(min_mt.min(128000)));
+                }
+            }
+        }
+    }
+    // protocol="anthropic" → native /v1/messages with a translated (OpenAI→Anthropic) body;
+    // else the OpenAI-compat /chat/completions passthrough. `upstream_body` is only built for
+    // the anthropic path (the OpenAI path sends `body` unchanged — no extra clone).
+    let anthropic = conn.protocol == "anthropic";
+    let url = if anthropic {
+        format!("{}/messages", api_base(&conn.base_url))
+    } else {
+        format!("{}/chat/completions", api_base(&conn.base_url))
+    };
+    let upstream_body = if anthropic {
+        oai_to_anthropic(&body)
+    } else {
+        serde_json::Value::Null
+    };
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
     //
@@ -653,14 +2369,22 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
     // blip is absorbed instead of surfaced. We only retry BEFORE streaming the
     // body has started (a send error or a bad status line), so no half-streamed
     // response is ever double-sent, and billing still happens once, after success.
-    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("该模型").to_string();
+    let model_name = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("该模型")
+        .to_string();
     // Map an upstream error to a friendly, actionable Chinese message.
     fn friendly_upstream(status: u16, low: &str) -> &'static str {
         if low.contains("forbidden") || low.contains("未授权") {
             "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
         } else if low.contains("no available") || low.contains("没有可用") {
             "上游暂无可用账号。请换个模型，或稍后再试。"
-        } else if status == 429 || low.contains("rate") || low.contains("frequent") || low.contains("过于频繁") {
+        } else if status == 429
+            || low.contains("rate")
+            || low.contains("frequent")
+            || low.contains("过于频繁")
+        {
             "请求过于频繁，请稍后再试。"
         } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
             "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
@@ -677,10 +2401,15 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
         let mut err_status = 502u16;
         let mut err_low = String::new();
         for attempt in 0u32..3 {
-            let mut req = GW_HTTP
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", conn.api_key))
-                .json(&body);
+            let req0 = GW_HTTP.post(&url);
+            let mut req = if anthropic {
+                req0.header("x-api-key", &conn.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&upstream_body)
+            } else {
+                req0.header("Authorization", format!("Bearer {}", conn.api_key))
+                    .json(&body)
+            };
             if !streaming {
                 req = req.timeout(std::time::Duration::from_secs(120));
             }
@@ -723,62 +2452,1662 @@ pub async fn chat_completions(State(state): State<AppState>, headers: HeaderMap,
             None => {
                 return Err(AppError {
                     status: StatusCode::BAD_GATEWAY,
-                    msg: format!("【{model_name}】{}", friendly_upstream(err_status, &err_low)),
+                    msg: format!(
+                        "【{model_name}】{}",
+                        friendly_upstream(err_status, &err_low)
+                    ),
                 });
             }
         }
     };
     let status = resp.status();
 
-    async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool) {
-        if cost > 0 {
-            if use_quota {
-                let _ = sqlx::query(
-                    "UPDATE users SET quota_total_cents = GREATEST(quota_total_cents - $1, 0), \
-                     quota_window_cents = GREATEST(quota_window_cents - $1, 0), \
-                     quota_week_used_cents = quota_week_used_cents + $1 WHERE id = $2",
-                )
-                .bind(cost)
-                .bind(uid)
-                .execute(&state.db)
-                .await;
-            } else {
-                let _ = sqlx::query("UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2").bind(cost).bind(uid).execute(&state.db).await;
-            }
-        }
-        let _ = sqlx::query("INSERT INTO model_usage (user_id, model_id, cost_cents) VALUES ($1,$2,$3)").bind(uid).bind(conn_id).bind(cost).execute(&state.db).await;
-    }
-
     if streaming {
-        // Can't read token usage from a passed-through stream, so charge a flat
-        // per-call fee (rounded rate). Stream the upstream SSE straight through.
-        // Bill in the background so the first SSE byte isn't delayed by DB writes.
-        {
-            let st = state.clone();
-            let cid = conn.id;
-            let cost = conn.rate.round() as i64;
-            tokio::spawn(async move { bill(&st, uid, cid, cost, use_quota).await });
-        }
+        // Pre-compute input token estimate BEFORE the spawn (body is consumed afterwards).
+        let est_in_tok = estimate_input_tokens(&body);
+        // Tee the upstream SSE: forward bytes to the client UNCHANGED while
+        // accumulating the full stream so a complete response can be cached. Billing is
+        // REAL: the trailing include_usage chunk gives true token counts → official price
+        // × 倍率 (see compute_cost). Cache hits bill 0 (handled at the cache-hit return
+        // above). 180s idle guard preserved inline.
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/event-stream")
             .to_string();
+        let st = state.clone();
+        let cid = conn.id;
+        let rate = conn.rate;
+        let admin_in = conn.input_price;
+        let admin_out = conn.output_price;
+        let cache_read_price = conn.cache_read_price;
+        let cache_create_price = conn.cache_create_price;
+        let bmode = conn.billing_mode.clone();
+        let percall = conn.per_call_cents;
+        let req_model = model_id.clone();
+        let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+        let ckey_task = ckey.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut upstream = Box::pin(resp.bytes_stream());
+            // 180s (was 30s): a thinking model pauses to reason / composes a long file write
+            // silently → the 30s guard cut the stream mid-tool-call (truncated args → empty
+            // write "内容为空"). 180s lets those through while still bounding a real hang.
+            let idle = std::time::Duration::from_secs(180);
+            let mut acc: Vec<u8> = Vec::new(); // OpenAI-shape SSE bytes, for the response cache (capped 1MB)
+                                               // Bounded tail for OpenAI usage extraction (the include_usage chunk is the LAST event;
+                                               // a >1MB response would miss it in the capped acc). Unused on the anthropic path — there
+                                               // usage comes from the converter's accumulated counts.
+            let mut tail: Vec<u8> = Vec::new();
+            let mut complete = false;
+            // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
+            let mut conv = if anthropic {
+                Some(AnthSse::new(&req_model))
+            } else {
+                None
+            };
+            // SSE heartbeat: Chinese carrier NATs kill TCP connections idle >30-60s.
+            // During model "thinking" the upstream is silent → zero bytes flow to the
+            // client → NAT drops it → "网络波动". Fix: send an SSE comment (`: ping\n\n`)
+            // every 15s of upstream silence. SSE comments are ignored by compliant parsers.
+            let hb_interval = std::time::Duration::from_secs(15);
+            let mut last_data = tokio::time::Instant::now();
+            loop {
+                match tokio::time::timeout(hb_interval, upstream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        last_data = tokio::time::Instant::now();
+                        let fwd: Vec<u8> = match conv.as_mut() {
+                            Some(c) => c.push(chunk.as_ref()),
+                            None => chunk.to_vec(),
+                        };
+                        if !fwd.is_empty() {
+                            if acc.len() < 1_000_000 {
+                                acc.extend_from_slice(&fwd);
+                            }
+                            if conv.is_none() {
+                                tail.extend_from_slice(&fwd);
+                                if tail.len() > 131_072 {
+                                    let cut = tail.len() - 65_536;
+                                    tail.drain(0..cut);
+                                }
+                            }
+                            if tx.send(Ok(axum::body::Bytes::from(fwd))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        complete = true;
+                        break;
+                    }
+                    Ok(Some(Err(_))) => break,
+                    Err(_elapsed) => {
+                        if last_data.elapsed() >= idle {
+                            break; // real stall — upstream dead for 180s
+                        }
+                        // Send SSE heartbeat to keep the client connection alive
+                        if tx
+                            .send(Ok(axum::body::Bytes::from_static(b": ping\n\n")))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            // anthropic: flush the terminal OpenAI chunks (finish_reason + usage + [DONE]) and bill
+            // from the converter's accumulated (cache-aware) usage. openai: bill from the trailing
+            // include_usage chunk. per_call mode ignores usage; rate mode → 0 if no usage/prices.
+            // FALLBACK: when the provider reports no usage (stream broke, no trailing chunk), estimate
+            // from the request body and accumulated response bytes so calls are never silently free.
+            let (usage, is_estimated) = if let Some(c) = conv.as_ref() {
+                if complete {
+                    let fin = c.finish();
+                    if acc.len() < 1_000_000 {
+                        acc.extend_from_slice(&fin);
+                    }
+                    let _ = tx.send(Ok(axum::body::Bytes::from(fin))).await;
+                }
+                (c.usage(), false)
+            } else {
+                match parse_usage_from_sse(&tail) {
+                    Some(u) => (u, false),
+                    None if !acc.is_empty() => {
+                        let est_out = estimate_output_tokens(acc.len());
+                        tracing::warn!(
+                            "[billing] no usage from provider, estimating: in={} out={} model={}",
+                            est_in_tok,
+                            est_out,
+                            req_model
+                        );
+                        (estimated_usage(est_in_tok, est_out), true)
+                    }
+                    None => (json!({}), false), // truly empty response, bill 0
+                }
+            };
+            let cost = resolve_cost(
+                &bmode,
+                percall,
+                Some(&usage),
+                &req_model,
+                rate,
+                admin_in,
+                admin_out,
+                cache_read_price,
+                cache_create_price,
+                model_in,
+                model_out,
+            );
+            let tokens = extract_bill_tokens(Some(&usage), &req_model, is_estimated);
+            // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
+            if complete && !acc.is_empty() && acc.len() < 1_000_000 {
+                let mut rconn = st.redis.clone();
+                let _: Result<(), redis::RedisError> = redis::cmd("SET")
+                    .arg(&ckey_task)
+                    .arg(acc)
+                    .arg("EX")
+                    .arg(3600i64)
+                    .query_async(&mut rconn)
+                    .await;
+            }
+            bill(&st, uid, cid, cost, use_quota, &tokens).await;
+        });
+        let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
         let out = Response::builder()
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
             .header(axum::http::header::CONTENT_TYPE, ct)
             .header("cache-control", "no-cache")
-            .body(Body::from_stream(idle_guarded_stream(resp.bytes_stream())))
+            .body(Body::from_stream(body_stream))
             .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(out)
     } else {
-        let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+        let raw: serde_json::Value = resp
+            .json()
+            .await
+            .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
         if !status.is_success() {
-            return Err(AppError { status: StatusCode::BAD_GATEWAY, msg: format!("模型供应商错误 {}: {}", status.as_u16(), data) });
+            return Err(AppError {
+                status: StatusCode::BAD_GATEWAY,
+                msg: format!("模型供应商错误 {}: {}", status.as_u16(), raw),
+            });
         }
-        let tokens = data.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
-        bill(&state, uid, conn.id, ((tokens as f64) / 1000.0 * conn.rate).round() as i64, use_quota).await;
+        // Anthropic native response → OpenAI shape for the IDE (usage kept in a form compute_cost bills).
+        let mut data = if anthropic {
+            anthropic_to_oai(&raw, &model_id)
+        } else {
+            raw
+        };
+        // Repair upstream's malformed `tool_calls[*].function.arguments`. Some relays
+        // (Claude→OpenAI-compat translators) concat the initial empty-arg placeholder
+        // `"{}"` with the actual JSON, producing `'{}{"path":"."}'` which clients then
+        // parse as `{}` (silent empty args). Strip leading `{}` when followed by `{`.
+        fix_tool_call_arguments(&mut data);
+        // Cache the successful response for identical future requests.
+        if let Ok(bytes) = serde_json::to_vec(&data) {
+            if !bytes.is_empty() && bytes.len() < 1_000_000 {
+                let mut rconn = state.redis.clone();
+                let _: Result<(), redis::RedisError> = redis::cmd("SET")
+                    .arg(&ckey)
+                    .arg(bytes)
+                    .arg("EX")
+                    .arg(3600i64)
+                    .query_async(&mut rconn)
+                    .await;
+            }
+        }
+        let (cost, tokens) = if is_image_gen_model(&model_id) {
+            let per = if conn.per_call_cents > 0 {
+                conn.per_call_cents
+            } else {
+                (30.0 * conn.rate).round() as i64
+            };
+            (
+                per.clamp(0, 5000),
+                BillTokens {
+                    model_name: model_id.clone(),
+                    ..Default::default()
+                },
+            )
+        } else {
+            let usage_val = data.get("usage");
+            let is_est = usage_val.is_none()
+                || usage_val.is_some_and(|u| {
+                    u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0) == 0
+                        && u.get("completion_tokens")
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0)
+                            == 0
+                        && u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0) == 0
+                });
+            let effective_usage = if is_est {
+                let est_in = estimate_input_tokens(&body);
+                let resp_str = serde_json::to_string(&data).unwrap_or_default();
+                let est_out = (resp_str.len() as i64) / 4;
+                tracing::warn!(
+                    "[billing] non-stream no usage, estimating: in={} out={} model={}",
+                    est_in,
+                    est_out,
+                    model_id
+                );
+                estimated_usage(est_in, est_out)
+            } else {
+                usage_val.cloned().unwrap_or_else(|| json!({}))
+            };
+            let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            let cost = resolve_cost(
+                &conn.billing_mode,
+                conn.per_call_cents,
+                Some(&effective_usage),
+                &model_id,
+                conn.rate,
+                conn.input_price,
+                conn.output_price,
+                conn.cache_read_price,
+                conn.cache_create_price,
+                model_in,
+                model_out,
+            );
+            (
+                cost,
+                extract_bill_tokens(Some(&effective_usage), &model_id, is_est),
+            )
+        };
+        bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
         Ok(Json(data).into_response())
+    }
+}
+
+/// OpenAI Responses API proxy — forwards POST /v1/responses to the upstream that
+/// owns the requested model. Used by the IDE's image-generation fallback chain:
+/// 中转站 like LaoZhang/Codex wrap gpt-image-2 behind ChatGPT Plus accounts via
+/// this endpoint with the image_generation built-in tool.
+///
+/// Smart model rewrite: if the IDE sends `model=gpt-image-2`, we route to the
+/// matching connection (UI生图密钥) BUT swap body.model to `gpt-5.4` before
+/// forwarding — because the Responses API requires a mainline text model in
+/// the `model` field (the image model itself is fixed by `tools.image_generation`).
+pub async fn responses_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT user_id FROM api_keys WHERE api_key = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?
+    {
+        Some(u) => {
+            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
+                .bind(&token)
+                .execute(&state.db)
+                .await;
+            u
+        }
+        None => crate::auth::user_from_jwt(&state.cfg, &token)
+            .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+    };
+
+    let model_id = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| AppError::bad("缺少 model"))?;
+
+    let conns = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let conn = conns
+        .into_iter()
+        .find(|m| allowed_ids(m).contains(&model_id))
+        .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+
+    // Same quota refill + check as image_generations.
+    sqlx::query(
+        "UPDATE users SET \
+         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+         WHERE id = $1",
+    )
+    .bind(uid)
+    .execute(&state.db)
+    .await?;
+
+    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+    let quota_ok = plan_active
+        && q_total > 0
+        && q_window > 0
+        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let use_quota = quota_ok;
+    if !quota_ok && credits <= 0 {
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: "请先开通会员或充值额度".into(),
+        });
+    }
+
+    // Always ensure image_generation tool is present for image models.
+    let is_image_model = model_id.to_lowercase().contains("gpt-image")
+        || model_id.to_lowercase().contains("dall-e")
+        || model_id.to_lowercase().contains("dall_e");
+    if is_image_model {
+        if let Some(obj) = body.as_object_mut() {
+            let has_image_tool = obj
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| a.iter().any(|t| t["type"] == "image_generation"))
+                .unwrap_or(false);
+            if !has_image_tool {
+                let mut tools = obj
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                tools.push(serde_json::json!({"type": "image_generation"}));
+                obj.insert("tools".into(), serde_json::json!(tools));
+            }
+        }
+    }
+
+    let url = format!("{}/responses", api_base(&conn.base_url));
+
+    // Two-stage attempt for image models:
+    //   stage 1: forward AS-IS — relay routes to real gpt-image-2 (full HD output).
+    //   stage 2: when stage 1 fails with "no Plus OAuth account" (relay's HD account
+    //   pool is empty), swap model → "gpt-5.4" and retry — relay's mainline-wrap
+    //   path doesn't need a Plus account but caps output at ~940×627.
+    // For non-image models, stage 2 is skipped (no model swap makes sense).
+    async fn send_once(
+        url: &str,
+        api_key: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, (u16, String)> {
+        for attempt in 0u32..3 {
+            match GW_HTTP
+                .post(url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(body)
+                .timeout(std::time::Duration::from_secs(180))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => return Ok(r),
+                Ok(r) => {
+                    let st = r.status().as_u16();
+                    let txt = r.text().await.unwrap_or_default();
+                    let transient = matches!(st, 502 | 503 | 504 | 429);
+                    if !transient || attempt == 2 {
+                        return Err((st, txt));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    if attempt == 2 {
+                        return Err((0, e.to_string()));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        Err((0, "exhausted".into()))
+    }
+
+    let resp = match send_once(&url, &conn.api_key, &body).await {
+        Ok(r) => r,
+        Err((st, msg)) if is_image_model && msg.to_lowercase().contains("no active plus oauth") => {
+            // HD pool empty → fall back to mainline-wrap (model=gpt-5.4) for low-res but functional output.
+            tracing::info!(
+                "[responses] {model_id} HD pool empty, falling back to gpt-5.4 mainline-wrap"
+            );
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("model".into(), serde_json::json!("gpt-5.4"));
+            }
+            match send_once(&url, &conn.api_key, &body).await {
+                Ok(r) => r,
+                Err((st2, msg2)) => {
+                    return Err(AppError {
+                        status: StatusCode::BAD_GATEWAY,
+                        msg: format!(
+                            "【{model_id}】responses 双路径都失败: HD={} | mainline={}: {}",
+                            st,
+                            st2,
+                            msg2.chars().take(150).collect::<String>()
+                        ),
+                    });
+                }
+            }
+        }
+        Err((st, msg)) => {
+            return Err(AppError {
+                status: StatusCode::BAD_GATEWAY,
+                msg: format!(
+                    "【{model_id}】responses 上游不可用 ({}): {}",
+                    st,
+                    msg.chars().take(200).collect::<String>()
+                ),
+            });
+        }
+    };
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error": "上游返回非 JSON"}));
+    let has_error = data.get("error").is_some();
+
+    // Bill: image models = per-image (per_call_cents if set, else 30分×倍率), text = per-token.
+    if !has_error {
+        if is_image_gen_model(&model_id) {
+            let mut n_images = data
+                .get("output")
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|i| i["type"] == "image_generation_call")
+                        .count() as f64
+                })
+                .unwrap_or(0.0);
+            // Non-OpenAI image models (e.g. gemini-*-image) may not emit `image_generation_call`;
+            // a successful image call still costs → bill at least 1 image, never $0.
+            if n_images == 0.0 {
+                n_images = 1.0;
+            }
+            let cost = if conn.per_call_cents > 0 {
+                (conn.per_call_cents as f64 * n_images).round().min(5000.0) as i64
+            } else {
+                (30.0 * n_images * conn.rate).round().min(5000.0) as i64
+            };
+            bill(
+                &state,
+                uid,
+                conn.id,
+                cost,
+                use_quota,
+                &BillTokens {
+                    model_name: model_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        } else {
+            let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            let cost = resolve_cost(
+                &conn.billing_mode,
+                conn.per_call_cents,
+                data.get("usage"),
+                &model_id,
+                conn.rate,
+                conn.input_price,
+                conn.output_price,
+                conn.cache_read_price,
+                conn.cache_create_price,
+                model_in,
+                model_out,
+            );
+            let tokens = extract_bill_tokens(data.get("usage"), &model_id, false);
+            bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
+        }
+    }
+
+    Ok(Json(data).into_response())
+}
+
+/// Image generation endpoint — proxies to upstream /images/generations.
+/// Same auth + quota as chat_completions; bills per-image (official price × 倍率).
+pub async fn image_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, AppError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT user_id FROM api_keys WHERE api_key = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await?
+    {
+        Some(u) => {
+            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
+                .bind(&token)
+                .execute(&state.db)
+                .await;
+            u
+        }
+        None => crate::auth::user_from_jwt(&state.cfg, &token)
+            .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+    };
+
+    let model_id = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| AppError::bad("缺少 model"))?;
+
+    let conns = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let conn = conns
+        .into_iter()
+        .find(|m| allowed_ids(m).contains(&model_id))
+        .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+
+    // Quota refill + check (same as chat_completions).
+    sqlx::query(
+        "UPDATE users SET \
+         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+         WHERE id = $1",
+    )
+    .bind(uid)
+    .execute(&state.db)
+    .await?;
+
+    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+    let quota_ok = plan_active
+        && q_total > 0
+        && q_window > 0
+        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+    let use_quota = quota_ok;
+    if !quota_ok && credits <= 0 {
+        let msg = if plan_active && q_total <= 0 {
+            "总额度已用完"
+        } else if plan_active && q_window <= 0 {
+            "本时段额度已用完，请等待刷新（每 5.5 小时）"
+        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
+            "本周额度已用完"
+        } else {
+            "请先开通会员或充值额度"
+        };
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: msg.into(),
+        });
+    }
+
+    // Proxy to upstream /images/generations with retry for transient failures.
+    let url = format!("{}/images/generations", api_base(&conn.base_url));
+    let resp = {
+        let mut success = None;
+        let mut last_err = String::new();
+        for attempt in 0u32..3 {
+            match GW_HTTP
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", conn.api_key))
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(120))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    success = Some(r);
+                    break;
+                }
+                Ok(r) => {
+                    let st = r.status().as_u16();
+                    last_err = r.text().await.unwrap_or_default();
+                    let transient = matches!(st, 502 | 503 | 504 | 429);
+                    if !transient || attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        match success {
+            Some(r) => r,
+            None => {
+                return Err(AppError {
+                    status: StatusCode::BAD_GATEWAY,
+                    msg: format!(
+                        "【{model_id}】生图上游不可用: {}",
+                        last_err.chars().take(200).collect::<String>()
+                    ),
+                });
+            }
+        }
+    };
+
+    let mut data: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| json!({"error": "上游返回非 JSON"}));
+
+    // Async task support: some upstreams queue large-size requests and return a task_id.
+    if data.get("status").and_then(|s| s.as_str()) == Some("queued")
+        || data.get("status").and_then(|s| s.as_str()) == Some("running")
+    {
+        if let Some(task_id) = data
+            .get("task_id")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+        {
+            let poll_url = format!(
+                "{}/images/generations/{}",
+                api_base(&conn.base_url),
+                task_id
+            );
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if let Ok(pr) = GW_HTTP
+                    .get(&poll_url)
+                    .header("Authorization", format!("Bearer {}", conn.api_key))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await
+                {
+                    if let Ok(pv) = pr.json::<serde_json::Value>().await {
+                        let st = pv.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        if st == "failed" {
+                            data = pv;
+                            break;
+                        }
+                        if st == "completed" {
+                            data = pv;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fix relative URLs: some upstreams return "/api/v1/gen/..." instead of full URLs.
+    if let Some(arr) = data.get_mut("data").and_then(|d| d.as_array_mut()) {
+        let origin = conn.base_url.trim_end_matches('/');
+        for item in arr.iter_mut() {
+            if let Some(u) = item.get("url").and_then(|v| v.as_str()).map(String::from) {
+                if u.starts_with('/') {
+                    item["url"] = json!(format!("{}{}", origin, u));
+                }
+            }
+        }
+    }
+
+    let has_error = data.get("error").is_some()
+        || data.get("status").and_then(|s| s.as_str()) == Some("failed");
+
+    // Bill per image: per_call_cents × n_images (if set), else 30分 × n_images × 倍率.
+    let n_images = data
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| a.len() as f64)
+        .unwrap_or(0.0);
+    if !has_error && n_images > 0.0 {
+        let cost = if conn.per_call_cents > 0 {
+            (conn.per_call_cents as f64 * n_images).round().min(5000.0) as i64
+        } else {
+            (30.0 * n_images * conn.rate).round().min(5000.0) as i64
+        };
+        if cost > 0 {
+            bill(
+                &state,
+                uid,
+                conn.id,
+                cost,
+                use_quota,
+                &BillTokens {
+                    model_name: model_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    }
+
+    Ok(Json(data).into_response())
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::{
+        anthropic_thinking, anthropic_to_oai, compute_cost, is_image_gen_model,
+        model_price_override, oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost,
+        AnthSse,
+    };
+    use serde_json::json;
+
+    // per_call mode bills the flat fee, ignoring token usage entirely.
+    #[test]
+    fn per_call_mode_flat_fee() {
+        let usage = json!({"prompt_tokens": 999999, "completion_tokens": 50000});
+        // Huge usage, but per_call mode → exactly per_call_cents regardless.
+        assert_eq!(
+            resolve_cost(
+                "per_call",
+                20,
+                Some(&usage),
+                "claude-opus-4-8",
+                5.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            20
+        );
+        // Even with no usage at all, per_call still charges the flat fee.
+        assert_eq!(
+            resolve_cost(
+                "per_call",
+                35,
+                None,
+                "claude-opus-4-8",
+                5.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            35
+        );
+        // Negative per_call_cents floored to 0.
+        assert_eq!(
+            resolve_cost("per_call", -5, None, "x", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            0
+        );
+    }
+
+    // rate mode delegates to compute_cost (real token billing), unchanged.
+    #[test]
+    fn rate_mode_delegates_to_token_billing() {
+        let usage =
+            json!({"prompt_tokens": 22000, "completion_tokens": 2000, "total_tokens": 24000});
+        // (22000·5 + 2000·25)/1e6 = $0.16 = 16¢ × 1.0 rate.
+        assert_eq!(
+            resolve_cost(
+                "rate",
+                999,
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            16
+        );
+        // per_call_cents is IGNORED in rate mode.
+        assert_eq!(
+            resolve_cost(
+                "rate",
+                999,
+                Some(&usage),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            48
+        );
+        // Empty/unknown mode string → treated as rate (safe default).
+        assert_eq!(
+            resolve_cost(
+                "",
+                999,
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            16
+        );
+    }
+
+    // The per-model official catalog returns the published $/1M prices; unknown → None.
+    #[test]
+    fn official_catalog() {
+        assert_eq!(official_price("claude-opus-4-8"), Some((5.0, 25.0)));
+        assert_eq!(official_price("CLAUDE-OPUS-4-6"), Some((5.0, 25.0))); // case-insensitive
+        assert_eq!(official_price("gpt-5.5"), Some((5.0, 30.0)));
+        assert_eq!(official_price("gpt-5.4"), Some((2.5, 15.0)));
+        assert_eq!(official_price("deepseek-v4-flash"), Some((0.14, 0.28)));
+        assert_eq!(official_price("minimax-m3"), Some((0.30, 1.20)));
+        assert_eq!(official_price("some-unknown-model"), None);
+    }
+
+    // REAL billing = (in·off_in + out·off_out)/1e6 · 100 · 倍率. Normal agent turn on
+    // Claude Opus ($5/$25), 22k in + 2k out:
+    //   (22000·5 + 2000·25)/1e6 = $0.16 = 16¢ real cost. × 倍率 3 → 48¢ billed.
+    #[test]
+    fn real_cost_times_rate() {
+        let usage =
+            json!({"prompt_tokens": 22000, "completion_tokens": 2000, "total_tokens": 24000});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            48
+        ); // ×3
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            16
+        ); // ×1 = real cost
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                2.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            32
+        ); // ×2
+    }
+
+    // gpt-5.5 ($5/$30), 22k+2k, ×1: (110000+60000)/1e6 = $0.17 = 17¢.
+    #[test]
+    fn gpt55_real_cost() {
+        let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
+        assert_eq!(
+            compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            17
+        );
+    }
+
+    // Cheap model on a SMALL call rounds toward 0; the SAME model on a big agentic call
+    // bills real money. deepseek-v4-flash ($0.14/$0.28), ×1:
+    //   22k+2k  → $0.00364 → 0¢ (sub-cent).   200k+10k → $0.0308 → 3¢.
+    #[test]
+    fn cheap_model_scales_with_size() {
+        let small = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
+        let big = json!({"prompt_tokens": 200000, "completion_tokens": 10000});
+        assert_eq!(
+            compute_cost(
+                Some(&small),
+                "deepseek-v4-flash",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            0
+        );
+        assert_eq!(
+            compute_cost(
+                Some(&big),
+                "deepseek-v4-flash",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            3
+        );
+    }
+
+    // An uncatalogued model falls back to the admin's per-connection input/output price.
+    //   admin $2/$10, 22k+2k, ×1: (44000+20000)/1e6 = $0.064 = 6.4¢ → 6¢.
+    #[test]
+    fn admin_override_fallback() {
+        let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "mystery-model",
+                1.0,
+                2.0,
+                10.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            6
+        );
+        // No catalog AND no admin price → can't know the real cost → 0.
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "mystery-model",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            0
+        );
+    }
+
+    // A PER-MODEL price override WINS over the built-in official catalog. claude-opus-4-8's
+    // catalog price is $5/$25, but with a per-model override of $1/$2 the bill uses $1/$2:
+    //   22k·$1 + 2k·$2 = 26000/1e6 = $0.026 = 2.6¢ → 3¢ (×1). Catalog would give 16¢.
+    #[test]
+    fn per_model_price_override_wins() {
+        let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                2.0
+            ),
+            3
+        );
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                2.0
+            ),
+            8
+        ); // ×3 → 7.8→8
+           // No override (0,0) → catalog price used (16¢), proving the override is what changed it.
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            16
+        );
+    }
+
+    // model_price_override reads {in,out} from the connection map; missing/empty → (0,0).
+    #[test]
+    fn model_price_override_reads_map() {
+        let mp = json!({"claude-opus-4-8": {"in": 1.5, "out": 2.5}, "gpt-5.5": {}});
+        assert_eq!(model_price_override(&mp, "claude-opus-4-8"), (1.5, 2.5));
+        assert_eq!(model_price_override(&mp, "gpt-5.5"), (0.0, 0.0)); // empty entry → no override
+        assert_eq!(model_price_override(&mp, "absent"), (0.0, 0.0));
+        assert_eq!(model_price_override(&json!({}), "anything"), (0.0, 0.0));
+    }
+
+    // Image-gen models (any vendor) must be detected so they bill per-image, never $0-tokens.
+    #[test]
+    fn image_gen_models_detected_across_vendors() {
+        for id in [
+            "gpt-image-1",
+            "gpt-image-2",
+            "dall-e-3",
+            "gemini-3.1-flash-image-preview",
+            "gpt-4o-image",
+        ] {
+            assert!(is_image_gen_model(id), "should be image: {id}");
+        }
+        // text / vision models must NOT be treated as image-gen (else they'd bill a flat image fee):
+        for id in [
+            "claude-opus-4-8",
+            "gemini-3.5-flash",
+            "gemini-3.1-pro-preview",
+            "gpt-5.5",
+            "deepseek-v4-pro",
+        ] {
+            assert!(!is_image_gen_model(id), "should NOT be image: {id}");
+        }
+    }
+
+    // ---- Anthropic protocol bridge ----
+    #[test]
+    fn oai_to_anthropic_translates_system_tools_and_toolcalls() {
+        let body = json!({
+            "model": "claude-haiku-4-5-20251001", "max_tokens": 100,
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "read foo"},
+                {"role": "assistant", "content": "ok", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"foo\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "file body"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file", "description": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        });
+        let a = oai_to_anthropic(&body);
+        assert_eq!(a["system"], json!("You are helpful.")); // system hoisted out of messages
+        assert_eq!(a["max_tokens"], json!(100)); // haiku (fast tier) → no thinking bump
+        assert!(
+            a.get("thinking").is_none(),
+            "haiku stays fast — no extended thinking"
+        );
+        let msgs = a["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3); // system removed; user, assistant, tool-result-user
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][1]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][1]["name"], "read_file");
+        assert_eq!(msgs[1]["content"][1]["input"]["path"], "foo"); // arguments string parsed to object
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
+        assert_eq!(a["tools"][0]["name"], "read_file");
+        assert!(a["tools"][0]["input_schema"]["properties"]["path"].is_object()); // parameters → input_schema
+        assert!(a["tools"][0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn oai_to_anthropic_enables_adaptive_thinking_and_drops_temp() {
+        // Opus 4.x + reasoning_effort → adaptive thinking on; temperature/top_p dropped;
+        // max_tokens gets headroom; the chosen depth is honored via output_config.effort.
+        let body = json!({
+            "model": "claude-opus-4-8", "max_tokens": 4096, "temperature": 0.7, "top_p": 0.9,
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let a = oai_to_anthropic(&body);
+        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(a["output_config"], json!({"effort":"high"}));
+        assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra adaptive-thinking headroom
+        assert!(
+            a.get("temperature").is_none(),
+            "temperature must be dropped when thinking is on"
+        );
+        assert!(
+            a.get("top_p").is_none(),
+            "top_p must be dropped when thinking is on"
+        );
+
+        // Fable → adaptive too.
+        assert_eq!(
+            oai_to_anthropic(
+                &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
+            )["thinking"],
+            json!({"type":"adaptive"})
+        );
+
+        // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking; temp passes through.
+        let off = oai_to_anthropic(&json!({
+            "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"messages":[]
+        }));
+        assert!(off.get("thinking").is_none());
+        assert_eq!(off["max_tokens"], json!(4096));
+        assert_eq!(off["temperature"], json!(0.5));
+    }
+
+    #[test]
+    fn thinking_normalized_per_model() {
+        // Opus 4.8 with reasoning_effort: client's old budget_tokens is IGNORED,
+        // gateway uses adaptive (Anthropic rejects budget_tokens on 4.7+/Fable/Sonnet5).
+        let a = oai_to_anthropic(&json!({
+            "model": "claude-opus-4-8",
+            "reasoning_effort": "max",
+            "thinking": {"type": "enabled", "budget_tokens": 32000},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(
+            a["thinking"]["type"], "adaptive",
+            "4.8 must use adaptive, not budget_tokens"
+        );
+        assert!(
+            a["thinking"].get("budget_tokens").is_none(),
+            "no budget_tokens for 4.8"
+        );
+        assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
+        assert_eq!(a["output_config"]["effort"], "high"); // "max" → "high"
+
+        // Sonnet 5: also adaptive
+        let s5 = oai_to_anthropic(&json!({
+            "model": "claude-sonnet-5",
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled", "budget_tokens": 16000},
+            "messages": []
+        }));
+        assert_eq!(s5["thinking"]["type"], "adaptive");
+
+        // Claude 3.7: explicit budget is correct (gateway generates it, not client).
+        let b = oai_to_anthropic(&json!({
+            "model": "claude-3-7-sonnet-20250219",
+            "reasoning_effort": "high",
+            "messages": []
+        }));
+        assert_eq!(b["thinking"]["type"], "enabled");
+        assert!(b["thinking"]["budget_tokens"].as_i64().unwrap() > 0);
+        assert!(b["max_tokens"].as_i64().unwrap() >= 32000);
+
+        // Haiku: no thinking even with effort
+        let h = oai_to_anthropic(&json!({
+            "model": "claude-haiku-4-5",
+            "reasoning_effort": "high",
+            "messages": []
+        }));
+        assert!(
+            h.get("thinking").is_none(),
+            "haiku should not have thinking"
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_gate_by_model() {
+        // effort present → on for capable Claude; mapped to adaptive.
+        assert_eq!(
+            anthropic_thinking("claude-opus-4-8", Some("medium")),
+            Some(json!({"type":"adaptive"}))
+        );
+        assert_eq!(
+            anthropic_thinking("claude-sonnet-4-6", Some("high")),
+            Some(json!({"type":"adaptive"}))
+        );
+        assert_eq!(
+            anthropic_thinking("claude-fable-5", Some("low")),
+            Some(json!({"type":"adaptive"}))
+        );
+        assert_eq!(
+            anthropic_thinking("claude-haiku-4-5-20251001", Some("high")),
+            None
+        ); // fast tier
+        assert_eq!(anthropic_thinking("gpt-5.5", Some("high")), None); // non-Claude
+                                                                       // effort absent / "off" → thinking off (respect the user's control).
+        assert_eq!(anthropic_thinking("claude-opus-4-8", None), None);
+        assert_eq!(anthropic_thinking("claude-opus-4-8", Some("off")), None);
+    }
+
+    #[test]
+    fn anthropic_to_oai_maps_content_tools_usage() {
+        let av = json!({
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "Hello"}, {"type": "tool_use", "id": "t1", "name": "get_time", "input": {"tz": "Asia/Tokyo"}}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 0}
+        });
+        let o = anthropic_to_oai(&av, "claude-opus-4-8");
+        assert_eq!(o["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(o["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(o["choices"][0]["message"]["tool_calls"][0]["id"], "t1");
+        assert_eq!(
+            o["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_time"
+        );
+        assert!(
+            o["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .contains("Asia/Tokyo")
+        );
+        assert_eq!(o["usage"]["input_tokens"], 10); // Anthropic name (compute_cost reads this)
+        assert_eq!(o["usage"]["prompt_tokens"], 10); // OpenAI name (clients read this)
+        assert_eq!(o["usage"]["cache_read_input_tokens"], 3);
+    }
+
+    #[test]
+    fn anth_sse_converts_stream_to_openai() {
+        // Event shapes copied verbatim from a real zyz streaming response (tool call).
+        let mut c = AnthSse::new("claude-opus-4-8");
+        let mut out: Vec<u8> = Vec::new();
+        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n"));
+        out.extend(c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+        out.extend(c.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"get_time\",\"input\":{}}}\n\n"));
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\": \\\"As\"}}\n\n"));
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ia/Tokyo\\\"}\"}}\n\n"));
+        out.extend(c.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":18,\"input_tokens\":15,\"cache_read_input_tokens\":46}}\n\n"));
+        out.extend(c.finish());
+        // Parse the emitted OpenAI SSE back (no key-order assumptions).
+        let s = String::from_utf8(out).unwrap();
+        let (mut role, mut id, mut name, mut args, mut finish, mut done, mut idx) = (
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            -1i64,
+        );
+        for line in s.lines() {
+            let d = match line.strip_prefix("data:") {
+                Some(x) => x.trim(),
+                None => continue,
+            };
+            if d == "[DONE]" {
+                done = true;
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(d).unwrap();
+            let delta = &v["choices"][0]["delta"];
+            if delta["role"] == "assistant" {
+                role = true;
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    if let Some(i) = tc["index"].as_i64() {
+                        idx = i;
+                    }
+                    if let Some(x) = tc["id"].as_str() {
+                        if !x.is_empty() {
+                            id = x.into();
+                        }
+                    }
+                    if let Some(n) = tc["function"]["name"].as_str() {
+                        if !n.is_empty() {
+                            name = n.into();
+                        }
+                    }
+                    if let Some(a) = tc["function"]["arguments"].as_str() {
+                        args.push_str(a);
+                    }
+                }
+            }
+            if let Some(f) = v["choices"][0]["finish_reason"].as_str() {
+                finish = f.into();
+            }
+        }
+        assert!(role, "role bootstrap chunk emitted");
+        assert_eq!(id, "tooluse_1");
+        assert_eq!(name, "get_time");
+        assert_eq!(idx, 0);
+        assert_eq!(args, "{\"tz\": \"Asia/Tokyo\"}"); // input_json_delta pieces concatenated
+        assert_eq!(finish, "tool_calls");
+        assert!(done);
+        let u = c.usage(); // accumulated for billing (cache-aware)
+        assert_eq!(u["input_tokens"], 15);
+        assert_eq!(u["output_tokens"], 18);
+        assert_eq!(u["cache_read_input_tokens"], 46);
+    }
+
+    // The official catalog must cover every token model live on the gateway, matched by
+    // family so date/`-preview` suffixes still resolve. (Image models → per-image, None here.)
+    #[test]
+    fn official_catalog_covers_live_models() {
+        assert_eq!(official_price("claude-fable-5"), Some((10.0, 50.0)));
+        assert_eq!(official_price("claude-opus-4-8"), Some((5.0, 25.0)));
+        assert_eq!(official_price("claude-opus-4-6"), Some((5.0, 25.0)));
+        assert_eq!(official_price("claude-sonnet-5"), Some((3.0, 15.0)));
+        assert_eq!(official_price("claude-sonnet-4-6"), Some((3.0, 15.0)));
+        assert_eq!(
+            official_price("claude-haiku-4-5-20251001"),
+            Some((1.0, 5.0))
+        ); // date suffix matches
+        assert_eq!(official_price("gemini-3.1-pro-preview"), Some((2.0, 12.0)));
+        assert_eq!(official_price("gemini-3.5-flash"), Some((1.5, 9.0)));
+        assert_eq!(official_price("gemini-3.1-flash-image-preview"), None); // image → per-image billing
+        assert_eq!(official_price("gpt-5.5"), Some((5.0, 30.0)));
+        assert_eq!(official_price("gpt-5.4"), Some((2.5, 15.0)));
+        assert_eq!(official_price("deepseek-v4-flash"), Some((0.14, 0.28)));
+        assert_eq!(official_price("deepseek-v4-pro"), Some((0.435, 0.87)));
+        assert_eq!(official_price("MiniMax-M3"), Some((0.30, 1.20))); // case-insensitive
+        assert_eq!(official_price("MiniMax-M2.7-highspeed"), Some((0.25, 1.00)));
+        assert_eq!(official_price("MiniMax-M2.1"), Some((0.15, 0.60)));
+        assert_eq!(official_price("MiniMax-M2"), Some((0.10, 0.40)));
+        assert_eq!(official_price("some-unknown-model"), None); // → connection fallback, then 0
+    }
+
+    // No usage reported → 0 (never guesses token counts).
+    #[test]
+    fn no_usage_is_zero() {
+        assert_eq!(
+            compute_cost(None, "claude-opus-4-8", 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            0
+        );
+        assert_eq!(
+            compute_cost(
+                Some(&json!({})),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            0
+        );
+    }
+
+    // Anthropic-style field names (input_tokens/output_tokens) are honored.
+    #[test]
+    fn anthropic_field_names() {
+        let usage = json!({"input_tokens": 22000, "output_tokens": 2000});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            16
+        );
+    }
+
+    // OpenAI cached-prompt shape: cached input billed at 0.1×. opus, prompt 10000 (8000
+    // cached), completion 0, ×1: billable = 2000 + 800 = 2800; 2800·5/1e6 = $0.014 → 1¢.
+    #[test]
+    fn cached_input_discount() {
+        let usage = json!({"prompt_tokens": 10000, "completion_tokens": 0,
+                           "prompt_tokens_details": {"cached_tokens": 8000}});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            1
+        );
+    }
+
+    // A malformed/huge usage can never drain a balance — capped at $50 (5000¢).
+    #[test]
+    fn ceiling_caps_runaway() {
+        let usage = json!({"prompt_tokens": 999_999_999i64, "completion_tokens": 999_999_999i64});
+        assert_eq!(
+            compute_cost(
+                Some(&usage),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            5000
+        );
+    }
+
+    // Pull the trailing usage chunk out of a real-shaped SSE stream and bill it.
+    #[test]
+    fn sse_usage_extraction() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":22000,\"completion_tokens\":2000,\"total_tokens\":24000}}\n\n\
+                   data: [DONE]\n\n";
+        let u = parse_usage_from_sse(sse.as_bytes()).expect("usage present");
+        assert_eq!(u.get("prompt_tokens").and_then(|v| v.as_i64()), Some(22000));
+        assert_eq!(
+            compute_cost(
+                Some(&u),
+                "claude-opus-4-8",
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ),
+            48
+        );
+    }
+
+    // The 64KB usage tail can begin MID-LINE (cut from a bigger stream): leading garbage
+    // is skipped and the trailing usage still extracted.
+    #[test]
+    fn sse_usage_from_truncated_tail() {
+        let tail = "ent\":\" tokens\"}}]}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":50000,\"completion_tokens\":3000}}\n\n\
+                    data: [DONE]\n\n";
+        let u = parse_usage_from_sse(tail.as_bytes()).expect("usage present in tail");
+        assert_eq!(
+            u.get("completion_tokens").and_then(|v| v.as_i64()),
+            Some(3000)
+        );
+    }
+
+    // A stream that never reported usage → None → caller bills 0.
+    #[test]
+    fn sse_no_usage() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert!(parse_usage_from_sse(sse.as_bytes()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cache_price_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn explicit_cache_prices_used() {
+        // Anthropic shape: 1000 plain input + 2000 cache_read + 500 cache_create + 300 output
+        let u = json!({"input_tokens":1000,"output_tokens":300,"cache_read_input_tokens":2000,"cache_creation_input_tokens":500});
+        // off_in=5, off_out=25 (official claude). explicit read=0.5, create=6.5. rate=1.
+        // usd = (1000*5 + 2000*0.5 + 500*6.5 + 300*25)/1e6 = (5000+1000+3250+7500)/1e6 = 16750/1e6
+        // cents = 16750/1e6 *100 *1 = 1.675 → round 2
+        let c = compute_cost(
+            Some(&u),
+            "claude-opus-4-6",
+            1.0,
+            0.0,
+            0.0,
+            0.5,
+            6.5,
+            0.0,
+            0.0,
+        );
+        assert_eq!(c, 2, "explicit cache prices: got {}", c);
+        // with cache prices = 0 → falls back to factors (read 0.1*5=0.5, write 1.25*5=6.25)
+        // usd = (1000*5 + 2000*0.5 + 500*6.25 + 300*25)/1e6 = (5000+1000+3125+7500)/1e6=16625 → 1.66 → 2
+        let c2 = compute_cost(
+            Some(&u),
+            "claude-opus-4-6",
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(c2, 2, "factor fallback: got {}", c2);
+    }
+}
+
+#[cfg(test)]
+mod estimation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_input_tokens_counts_cjk_and_ascii() {
+        let body = json!({"messages": [{"role": "user", "content": "你好世界 hello"}]});
+        let est = estimate_input_tokens(&body);
+        assert!(est > 10, "should estimate > 10 tokens, got {}", est);
+    }
+
+    #[test]
+    fn estimate_output_tokens_from_sse_bytes() {
+        let est = estimate_output_tokens(4000);
+        assert!(est > 0 && est < 4000, "should be reasonable, got {}", est);
+        assert_eq!(estimate_output_tokens(0), 0);
+    }
+
+    #[test]
+    fn estimated_usage_produces_valid_json() {
+        let u = estimated_usage(1000, 200);
+        assert_eq!(u["prompt_tokens"], 1000);
+        assert_eq!(u["completion_tokens"], 200);
+        assert_eq!(u["total_tokens"], 1200);
+    }
+
+    #[test]
+    fn extract_bill_tokens_openai_shape() {
+        let u = json!({"prompt_tokens": 500, "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 50}});
+        let bt = extract_bill_tokens(Some(&u), "gpt-5.5", false);
+        assert_eq!(bt.prompt, 500);
+        assert_eq!(bt.completion, 100);
+        assert_eq!(bt.cached, 50);
+        assert_eq!(bt.model_name, "gpt-5.5");
+        assert!(!bt.estimated);
+    }
+
+    #[test]
+    fn extract_bill_tokens_anthropic_shape() {
+        let u = json!({"input_tokens": 800, "output_tokens": 300,
+                        "cache_read_input_tokens": 200});
+        let bt = extract_bill_tokens(Some(&u), "claude-opus-4-8", false);
+        assert_eq!(bt.prompt, 800);
+        assert_eq!(bt.completion, 300);
+        assert_eq!(bt.cached, 200);
+    }
+
+    #[test]
+    fn extract_bill_tokens_none_returns_zeros() {
+        let bt = extract_bill_tokens(None, "test", true);
+        assert_eq!(bt.prompt, 0);
+        assert_eq!(bt.completion, 0);
+        assert!(bt.estimated);
+    }
+
+    #[test]
+    fn anth_sse_fallback_output_estimation() {
+        let mut c = AnthSse::new("claude-opus-4-8");
+        // Simulate receiving text deltas without a final message_delta (stream broke)
+        let bytes = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world, this is a test response with some content.\"}}\n";
+        c.push(bytes);
+        let u = c.usage();
+        assert_eq!(u["input_tokens"], 1000);
+        // output_tokens should be estimated from out_bytes since message_delta never arrived
+        assert!(
+            u["output_tokens"].as_i64().unwrap_or(0) > 0,
+            "should estimate output from forwarded bytes, got {}",
+            u["output_tokens"]
+        );
+    }
+
+    #[test]
+    fn fallback_estimation_produces_nonzero_cost() {
+        let est = estimated_usage(50000, 500);
+        // Claude Opus: $5/1M in, $25/1M out, rate=1
+        let cost = compute_cost(
+            Some(&est),
+            "claude-opus-4-8",
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert!(
+            cost > 0,
+            "estimated usage should produce nonzero cost, got {}",
+            cost
+        );
     }
 }

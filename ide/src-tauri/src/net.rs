@@ -82,8 +82,8 @@ pub async fn http_request(
 ) -> Result<HttpResponse, String> {
     let parsed = validate(&url)?;
     let m = method.trim().to_uppercase();
-    let method =
-        reqwest::Method::from_bytes(m.as_bytes()).map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
+    let method = reqwest::Method::from_bytes(m.as_bytes())
+        .map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
     let to = timeout_secs.unwrap_or(30).clamp(1, 120);
 
     let client = reqwest::Client::builder()
@@ -134,7 +134,10 @@ pub async fn http_request(
     }
     let body_text = match String::from_utf8(buf) {
         Ok(s) => s,
-        Err(e) => format!("[二进制响应，{} 字节，未作为文本返回]", e.into_bytes().len()),
+        Err(e) => format!(
+            "[二进制响应，{} 字节，未作为文本返回]",
+            e.into_bytes().len()
+        ),
     };
 
     Ok(HttpResponse {
@@ -231,16 +234,20 @@ pub async fn ensure_tor() -> Result<(), String> {
         return Ok(());
     }
     // Find the tor binary — Finder's minimal PATH omits Homebrew, so probe known locations.
-    let bin = ["/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor"]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            crate::process_util::augmented_path(None)
-                .split(':')
-                .map(|d| format!("{d}/tor"))
-                .find(|c| std::path::Path::new(c).exists())
-        });
+    let bin = [
+        "/opt/homebrew/bin/tor",
+        "/usr/local/bin/tor",
+        "/usr/bin/tor",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|s| s.to_string())
+    .or_else(|| {
+        crate::process_util::augmented_path(None)
+            .split(':')
+            .map(|d| format!("{d}/tor"))
+            .find(|c| std::path::Path::new(c).exists())
+    });
     let bin = match bin {
         Some(b) => b,
         None => return Err("Tor 未安装——深网/.onion 访问需要它。装一下：brew install tor（装完自动就能用，会自愈启动）".into()),
@@ -260,7 +267,10 @@ pub async fn ensure_tor() -> Result<(), String> {
             return Ok(());
         }
     }
-    Err("tor 已拉起但 30s 内未就绪（网络慢/被墙？）——稍等片刻再试，或手动 brew services start tor".into())
+    Err(
+        "tor 已拉起但 30s 内未就绪（网络慢/被墙？）——稍等片刻再试，或手动 brew services start tor"
+            .into(),
+    )
 }
 
 /// Make an HTTP request through the local Tor SOCKS5 proxy (127.0.0.1:9050).
@@ -281,8 +291,8 @@ pub async fn tor_request(
         _ => return Err("只允许 http/https 链接".into()),
     }
     let m = method.trim().to_uppercase();
-    let method =
-        reqwest::Method::from_bytes(m.as_bytes()).map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
+    let method = reqwest::Method::from_bytes(m.as_bytes())
+        .map_err(|_| format!("不支持的 HTTP 方法: {m}"))?;
     let to = timeout_secs.unwrap_or(60).clamp(1, 300);
 
     // Self-heal: make sure Tor is up (auto-launch it if the user's service is stopped).
@@ -295,11 +305,14 @@ pub async fn tor_request(
         .redirect(reqwest::redirect::Policy::limited(5))
         .timeout(Duration::from_secs(to))
         .build()
-        .map_err(|e| format!("构建 Tor 客户端失败（tor 是否在运行？brew services start tor）: {e}"))?;
+        .map_err(|e| {
+            format!("构建 Tor 客户端失败（tor 是否在运行？brew services start tor）: {e}")
+        })?;
 
-    let mut req = client
-        .request(method, parsed)
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0");
+    let mut req = client.request(method, parsed).header(
+        reqwest::header::USER_AGENT,
+        "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
+    );
     if let Some(hs) = headers {
         for (k, v) in hs {
             req = req.header(k, v);
@@ -345,7 +358,10 @@ pub async fn tor_request(
     }
     let body_text = match String::from_utf8(buf) {
         Ok(s) => s,
-        Err(e) => format!("[二进制响应，{} 字节，未作为文本返回]", e.into_bytes().len()),
+        Err(e) => format!(
+            "[二进制响应，{} 字节，未作为文本返回]",
+            e.into_bytes().len()
+        ),
     };
 
     Ok(HttpResponse {
@@ -364,6 +380,7 @@ pub async fn tor_request(
 /// Chat-based image models (gpt-4o-image, gemini-flash-image, etc.) → /chat/completions.
 /// Saves to the workspace → {path, bytes, data_url}.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_image_chat(
     root: String,
     base_url: String,
@@ -401,16 +418,22 @@ pub async fn generate_image_chat(
     //   3. /v1/chat/completions (chat-wrapped image gen)
     // The first one is the standard for relay stations like LaoZhang/Codex that
     // wrap gpt-image-2 behind ChatGPT Plus accounts via the Responses API.
-    let (bytes, mime): (Vec<u8>, String) = match try_responses_api(&client, b, &api_key, &model, prompt, &size_str).await {
-        Ok(ok) => ok,
-        Err(e0) => match try_images_api(&client, b, &api_key, &model, prompt, &size_str).await {
+    let (bytes, mime): (Vec<u8>, String) =
+        match try_responses_api(&client, b, &api_key, &model, prompt, &size_str).await {
             Ok(ok) => ok,
-            Err(e1) => match try_chat_image_api(&client, b, &api_key, &model, prompt).await {
-                Ok(ok) => ok,
-                Err(e2) => return Err(format!("responses: {e0} ｜images: {e1} ｜chat: {e2}")),
-            },
-        },
-    };
+            Err(e0) => {
+                match try_images_api(&client, b, &api_key, &model, prompt, &size_str).await {
+                    Ok(ok) => ok,
+                    Err(e1) => match try_chat_image_api(&client, b, &api_key, &model, prompt).await
+                    {
+                        Ok(ok) => ok,
+                        Err(e2) => {
+                            return Err(format!("responses: {e0} ｜images: {e1} ｜chat: {e2}"))
+                        }
+                    },
+                }
+            }
+        };
 
     if bytes.is_empty() {
         return Err("生成结果为空".into());
@@ -421,9 +444,16 @@ pub async fn generate_image_chat(
     let basep = std::path::Path::new(&root);
     let target = {
         let d = std::path::Path::new(&dest);
-        if d.is_absolute() { d.to_path_buf() } else { basep.join(d) }
+        if d.is_absolute() {
+            d.to_path_buf()
+        } else {
+            basep.join(d)
+        }
     };
-    if target.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err("目标路径不能包含 ..".into());
     }
     if !basep.as_os_str().is_empty() && !target.starts_with(basep) {
@@ -434,7 +464,9 @@ pub async fn generate_image_chat(
     }
     std::fs::write(&target, &bytes).map_err(|e| format!("写入失败: {e}"))?;
     let data_url = format!("data:{};base64,{}", mime, crate::capture::b64(&bytes));
-    Ok(serde_json::json!({ "path": dest, "bytes": bytes.len(), "data_url": data_url, "via": model.trim() }))
+    Ok(
+        serde_json::json!({ "path": dest, "bytes": bytes.len(), "data_url": data_url, "via": model.trim() }),
+    )
 }
 
 /// Try /v1/responses with the image_generation built-in tool. This is the modern
@@ -449,7 +481,11 @@ async fn try_responses_api(
     prompt: &str,
     size: &str,
 ) -> Result<(Vec<u8>, String), String> {
-    let url = if b.ends_with("/v1") { format!("{b}/responses") } else { format!("{b}/v1/responses") };
+    let url = if b.ends_with("/v1") {
+        format!("{b}/responses")
+    } else {
+        format!("{b}/v1/responses")
+    };
     let body = serde_json::json!({
         "model": model.trim(),
         "input": prompt,
@@ -460,17 +496,33 @@ async fn try_responses_api(
             "output_format": "png",
         }],
     });
-    let resp = client.post(&url).bearer_auth(api_key.trim()).json(&body).send().await
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key.trim())
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| format!("responses 请求失败: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("responses HTTP {}: {}", status.as_u16(), text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "responses HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>()
+        ));
     }
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("responses 解析失败: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("responses 解析失败: {e}"))?;
     if let Some(err) = v.get("error") {
-        let msg = err["message"].as_str().or(err.as_str()).unwrap_or("unknown");
-        return Err(format!("responses 上游报错: {}", msg.chars().take(200).collect::<String>()));
+        let msg = err["message"]
+            .as_str()
+            .or(err.as_str())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "responses 上游报错: {}",
+            msg.chars().take(200).collect::<String>()
+        ));
     }
     // Walk the output array for an image_generation_call item with a base64 result.
     let output = v.get("output").and_then(|o| o.as_array());
@@ -478,18 +530,44 @@ async fn try_responses_api(
         for item in arr {
             if item["type"] == "image_generation_call" {
                 if let Some(b64) = item["result"].as_str().or(item["b64_json"].as_str()) {
-                    let raw = if b64.contains(',') { b64.splitn(2, ',').nth(1).unwrap_or(b64) } else { b64 };
+                    let raw = if b64.contains(',') {
+                        b64.split_once(',').map(|x| x.1).unwrap_or(b64)
+                    } else {
+                        b64
+                    };
                     let bytes = b64_decode(raw).ok_or("responses base64 解码失败")?;
                     return Ok((bytes, "image/png".into()));
                 }
                 if let Some(raw_url) = item["url"].as_str() {
-                    let img_url = if raw_url.starts_with('/') { format!("{}{}", b.trim_end_matches("/v1"), raw_url) } else { raw_url.to_string() };
-                    let r = client.get(&img_url).header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0").send().await
+                    let img_url = if raw_url.starts_with('/') {
+                        format!("{}{}", b.trim_end_matches("/v1"), raw_url)
+                    } else {
+                        raw_url.to_string()
+                    };
+                    let r = client
+                        .get(&img_url)
+                        .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
+                        .send()
+                        .await
                         .map_err(|e| format!("下载生成图失败: {e}"))?;
-                    if !r.status().is_success() { return Err(format!("下载生成图 HTTP {}", r.status().as_u16())); }
-                    let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|x| x.to_str().ok()).unwrap_or("image/png").to_string();
+                    if !r.status().is_success() {
+                        return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+                    }
+                    let ct = r
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|x| x.to_str().ok())
+                        .unwrap_or("image/png")
+                        .to_string();
                     let bb = r.bytes().await.map_err(|e| e.to_string())?;
-                    return Ok((bb.to_vec(), if ct.starts_with("image/") { ct } else { "image/png".into() }));
+                    return Ok((
+                        bb.to_vec(),
+                        if ct.starts_with("image/") {
+                            ct
+                        } else {
+                            "image/png".into()
+                        },
+                    ));
                 }
             }
             // Some relays return image as a message-content image_url instead.
@@ -497,8 +575,13 @@ async fn try_responses_api(
                 if let Some(content) = item["content"].as_array() {
                     for part in content {
                         if part["type"] == "output_image" || part["type"] == "image" {
-                            if let Some(b64) = part["b64_json"].as_str().or(part["image"].as_str()) {
-                                let raw = if b64.contains(',') { b64.splitn(2, ',').nth(1).unwrap_or(b64) } else { b64 };
+                            if let Some(b64) = part["b64_json"].as_str().or(part["image"].as_str())
+                            {
+                                let raw = if b64.contains(',') {
+                                    b64.split_once(',').map(|x| x.1).unwrap_or(b64)
+                                } else {
+                                    b64
+                                };
                                 let bytes = b64_decode(raw).ok_or("responses base64 解码失败")?;
                                 return Ok((bytes, "image/png".into()));
                             }
@@ -508,7 +591,10 @@ async fn try_responses_api(
             }
         }
     }
-    Err(format!("responses 响应里没有 image_generation_call 结果。片段：{}", text.chars().take(150).collect::<String>()))
+    Err(format!(
+        "responses 响应里没有 image_generation_call 结果。片段：{}",
+        text.chars().take(150).collect::<String>()
+    ))
 }
 
 /// Try /v1/images/generations. Returns (bytes, mime) or an error string.
@@ -520,7 +606,11 @@ async fn try_images_api(
     prompt: &str,
     size: &str,
 ) -> Result<(Vec<u8>, String), String> {
-    let url = if b.ends_with("/v1") { format!("{b}/images/generations") } else { format!("{b}/v1/images/generations") };
+    let url = if b.ends_with("/v1") {
+        format!("{b}/images/generations")
+    } else {
+        format!("{b}/v1/images/generations")
+    };
     let m_lower = model.to_lowercase();
     let mut body = serde_json::json!({
         "model": model.trim(),
@@ -533,53 +623,138 @@ async fn try_images_api(
     if m_lower.contains("gpt-image") {
         // gpt-image-* uses output_format instead of response_format, and returns b64 by default
         body.as_object_mut().unwrap().remove("response_format");
-        body.as_object_mut().unwrap().insert("output_format".into(), serde_json::json!("png"));
+        body.as_object_mut()
+            .unwrap()
+            .insert("output_format".into(), serde_json::json!("png"));
     }
-    let resp = client.post(&url).bearer_auth(api_key.trim()).json(&body).send().await
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key.trim())
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| format!("images-api 请求失败: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("images-api HTTP {}: {}", status.as_u16(), text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "images-api HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>()
+        ));
     }
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("images-api 响应解析失败: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("images-api 响应解析失败: {e}"))?;
     if let Some(err) = v.get("error") {
-        let msg = err["message"].as_str().or(err.as_str()).unwrap_or("unknown");
-        return Err(format!("images-api 上游报错: {}", msg.chars().take(200).collect::<String>()));
+        let msg = err["message"]
+            .as_str()
+            .or(err.as_str())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "images-api 上游报错: {}",
+            msg.chars().take(200).collect::<String>()
+        ));
     }
     let item = &v["data"][0];
     if let Some(b64) = item["b64_json"].as_str().or(item["image"].as_str()) {
-        let raw = if b64.contains(',') { b64.splitn(2, ',').nth(1).unwrap_or(b64) } else { b64 };
+        let raw = if b64.contains(',') {
+            b64.split_once(',').map(|x| x.1).unwrap_or(b64)
+        } else {
+            b64
+        };
         let bytes = b64_decode(raw).ok_or("images-api base64 解码失败")?;
         Ok((bytes, "image/png".into()))
     } else if let Some(raw_url) = item["url"].as_str() {
-        let img_url = if raw_url.starts_with('/') { format!("{}{}", b.trim_end_matches("/v1"), raw_url) } else { raw_url.to_string() };
-        let r = client.get(&img_url).header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0").send().await
+        let img_url = if raw_url.starts_with('/') {
+            format!("{}{}", b.trim_end_matches("/v1"), raw_url)
+        } else {
+            raw_url.to_string()
+        };
+        let r = client
+            .get(&img_url)
+            .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
+            .send()
+            .await
             .map_err(|e| format!("下载生成图失败: {e}"))?;
-        if !r.status().is_success() { return Err(format!("下载生成图 HTTP {}", r.status().as_u16())); }
-        let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|x| x.to_str().ok()).unwrap_or("image/png").to_string();
+        if !r.status().is_success() {
+            return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+        }
+        let ct = r
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|x| x.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
         let bb = r.bytes().await.map_err(|e| e.to_string())?;
-        Ok((bb.to_vec(), if ct.starts_with("image/") { ct } else { "image/png".into() }))
+        Ok((
+            bb.to_vec(),
+            if ct.starts_with("image/") {
+                ct
+            } else {
+                "image/png".into()
+            },
+        ))
     } else if let Some(task_id) = v.get("task_id").and_then(|t| t.as_str()) {
         // Async task (custom sizes) — poll until completed.
-        let poll_url = if b.ends_with("/v1") { format!("{b}/images/generations/{task_id}") } else { format!("{b}/v1/images/generations/{task_id}") };
+        let poll_url = if b.ends_with("/v1") {
+            format!("{b}/images/generations/{task_id}")
+        } else {
+            format!("{b}/v1/images/generations/{task_id}")
+        };
         for _ in 0..60 {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let pr = client.get(&poll_url).bearer_auth(api_key.trim()).send().await.map_err(|e| format!("轮询任务失败: {e}"))?;
-            if !pr.status().is_success() { continue; }
+            let pr = client
+                .get(&poll_url)
+                .bearer_auth(api_key.trim())
+                .send()
+                .await
+                .map_err(|e| format!("轮询任务失败: {e}"))?;
+            if !pr.status().is_success() {
+                continue;
+            }
             let pt: serde_json::Value = pr.json().await.unwrap_or_default();
             let status = pt["status"].as_str().unwrap_or("");
-            if status == "failed" { return Err(format!("生图任务失败: {}", pt["error"].as_str().unwrap_or("unknown"))); }
-            if status != "completed" { continue; }
+            if status == "failed" {
+                return Err(format!(
+                    "生图任务失败: {}",
+                    pt["error"].as_str().unwrap_or("unknown")
+                ));
+            }
+            if status != "completed" {
+                continue;
+            }
             if let Some(arr) = pt.get("data").and_then(|d| d.as_array()) {
                 if let Some(first) = arr.first() {
                     if let Some(u) = first["url"].as_str() {
-                        let full_url = if u.starts_with('/') { format!("{}{}", b.trim_end_matches("/v1"), u) } else { u.to_string() };
-                        let dr = client.get(&full_url).header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0").send().await.map_err(|e| format!("下载生成图失败: {e}"))?;
-                        if !dr.status().is_success() { return Err(format!("下载生成图 HTTP {}", dr.status().as_u16())); }
-                        let ct = dr.headers().get(reqwest::header::CONTENT_TYPE).and_then(|x| x.to_str().ok()).unwrap_or("image/png").to_string();
+                        let full_url = if u.starts_with('/') {
+                            format!("{}{}", b.trim_end_matches("/v1"), u)
+                        } else {
+                            u.to_string()
+                        };
+                        let dr = client
+                            .get(&full_url)
+                            .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
+                            .send()
+                            .await
+                            .map_err(|e| format!("下载生成图失败: {e}"))?;
+                        if !dr.status().is_success() {
+                            return Err(format!("下载生成图 HTTP {}", dr.status().as_u16()));
+                        }
+                        let ct = dr
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|x| x.to_str().ok())
+                            .unwrap_or("image/png")
+                            .to_string();
                         let bb = dr.bytes().await.map_err(|e| e.to_string())?;
-                        return Ok((bb.to_vec(), if ct.starts_with("image/") { ct } else { "image/png".into() }));
+                        return Ok((
+                            bb.to_vec(),
+                            if ct.starts_with("image/") {
+                                ct
+                            } else {
+                                "image/png".into()
+                            },
+                        ));
                     }
                 }
             }
@@ -587,7 +762,10 @@ async fn try_images_api(
         }
         Err("生图任务超时（3分钟）".into())
     } else {
-        Err(format!("images-api 返回的 data 里没有 b64_json 或 url。响应片段：{}", text.chars().take(150).collect::<String>()))
+        Err(format!(
+            "images-api 返回的 data 里没有 b64_json 或 url。响应片段：{}",
+            text.chars().take(150).collect::<String>()
+        ))
     }
 }
 
@@ -600,23 +778,42 @@ async fn try_chat_image_api(
     model: &str,
     prompt: &str,
 ) -> Result<(Vec<u8>, String), String> {
-    let url = if b.ends_with("/v1") { format!("{b}/chat/completions") } else { format!("{b}/v1/chat/completions") };
+    let url = if b.ends_with("/v1") {
+        format!("{b}/chat/completions")
+    } else {
+        format!("{b}/v1/chat/completions")
+    };
     let body = serde_json::json!({
         "model": model.trim(),
         "stream": false,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": 1500,
     });
-    let resp = client.post(&url).bearer_auth(api_key.trim()).json(&body).send().await
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key.trim())
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| format!("chat 请求失败: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("chat HTTP {}: {}", status.as_u16(), text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "chat HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>()
+        ));
     }
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("chat 响应解析失败: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("chat 响应解析失败: {e}"))?;
     let img = extract_image_ref(&v).ok_or_else(|| {
-        let snippet: String = v["choices"][0]["message"]["content"].as_str().unwrap_or("").chars().take(150).collect();
+        let snippet: String = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(150)
+            .collect();
         format!("chat 回复里没找到图片：{snippet}")
     })?;
     if img.starts_with("data:") {
@@ -626,12 +823,30 @@ async fn try_chat_image_api(
         let data = &img[comma + 1..];
         Ok((b64_decode(data).ok_or("base64 解码失败")?, m))
     } else if img.starts_with("http://") || img.starts_with("https://") {
-        let r = client.get(&img).header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0").send().await
+        let r = client
+            .get(&img)
+            .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0")
+            .send()
+            .await
             .map_err(|e| format!("下载生成图失败: {e}"))?;
-        if !r.status().is_success() { return Err(format!("下载生成图 HTTP {}", r.status().as_u16())); }
-        let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|x| x.to_str().ok()).unwrap_or("image/png").to_string();
+        if !r.status().is_success() {
+            return Err(format!("下载生成图 HTTP {}", r.status().as_u16()));
+        }
+        let ct = r
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|x| x.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
         let bb = r.bytes().await.map_err(|e| e.to_string())?;
-        Ok((bb.to_vec(), if ct.starts_with("image/") { ct } else { "image/png".into() }))
+        Ok((
+            bb.to_vec(),
+            if ct.starts_with("image/") {
+                ct
+            } else {
+                "image/png".into()
+            },
+        ))
     } else {
         Err("无法识别模型返回的图片引用".into())
     }
@@ -698,7 +913,13 @@ fn find_image_in_text(s: &str) -> Option<String> {
         if rest.starts_with("http://") || rest.starts_with("https://") {
             let end = rest
                 .find(|c: char| {
-                    c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == '>' || c == ']' || c == '('
+                    c.is_whitespace()
+                        || c == ')'
+                        || c == '"'
+                        || c == '\''
+                        || c == '>'
+                        || c == ']'
+                        || c == '('
                 })
                 .unwrap_or(rest.len());
             return Some(rest[..end].to_string());
@@ -737,7 +958,11 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
             out.push((buf >> bits) as u8);
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -748,27 +973,43 @@ mod img_tests {
     #[test]
     fn extract_markdown_url() {
         let v = json!({"choices":[{"message":{"content":"好的，这是图：\n![mockup](https://cdn.example.com/a/b.png)"}}]});
-        assert_eq!(extract_image_ref(&v).as_deref(), Some("https://cdn.example.com/a/b.png"));
+        assert_eq!(
+            extract_image_ref(&v).as_deref(),
+            Some("https://cdn.example.com/a/b.png")
+        );
     }
     #[test]
     fn extract_bare_url() {
-        let v = json!({"choices":[{"message":{"content":"生成完成 https://img.test/xyz.jpg 请查收"}}]});
-        assert_eq!(extract_image_ref(&v).as_deref(), Some("https://img.test/xyz.jpg"));
+        let v =
+            json!({"choices":[{"message":{"content":"生成完成 https://img.test/xyz.jpg 请查收"}}]});
+        assert_eq!(
+            extract_image_ref(&v).as_deref(),
+            Some("https://img.test/xyz.jpg")
+        );
     }
     #[test]
     fn extract_multimodal_image_url() {
         let v = json!({"choices":[{"message":{"content":[{"type":"text","text":"done"},{"type":"image_url","image_url":{"url":"https://m.test/i.webp"}}]}}]});
-        assert_eq!(extract_image_ref(&v).as_deref(), Some("https://m.test/i.webp"));
+        assert_eq!(
+            extract_image_ref(&v).as_deref(),
+            Some("https://m.test/i.webp")
+        );
     }
     #[test]
     fn extract_data_url() {
         let v = json!({"choices":[{"message":{"content":"data:image/png;base64,iVBORw0KG=="}}]});
-        assert_eq!(extract_image_ref(&v).as_deref(), Some("data:image/png;base64,iVBORw0KG=="));
+        assert_eq!(
+            extract_image_ref(&v).as_deref(),
+            Some("data:image/png;base64,iVBORw0KG==")
+        );
     }
     #[test]
     fn extract_images_field() {
         let v = json!({"choices":[{"message":{"content":"","images":[{"url":"https://x.test/p.png"}]}}]});
-        assert_eq!(extract_image_ref(&v).as_deref(), Some("https://x.test/p.png"));
+        assert_eq!(
+            extract_image_ref(&v).as_deref(),
+            Some("https://x.test/p.png")
+        );
     }
     #[test]
     fn no_image_in_plain_text() {

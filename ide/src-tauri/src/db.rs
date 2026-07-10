@@ -36,7 +36,9 @@ pub async fn db_query(
     let cap = limit.unwrap_or(MAX_ROWS).min(2000);
     match driver.as_str() {
         "redis" => redis_cmd(url.trim(), &q).await,
-        "mysql" | "postgres" | "postgresql" | "sqlite" => sql_query(&driver, url.trim(), &q, cap).await,
+        "mysql" | "postgres" | "postgresql" | "sqlite" => {
+            sql_query(&driver, url.trim(), &q, cap).await
+        }
         other => Err(format!(
             "不支持的 driver: {other}（支持 mysql / postgres / sqlite / redis）"
         )),
@@ -70,19 +72,32 @@ async fn sql_query(
     let started = std::time::Instant::now();
     let ms = |t: std::time::Instant| t.elapsed().as_millis() as u64;
     let ct = |_| "连接超时（10s）".to_string();
-    let qt = |_| (if is_read { "查询超时（20s）" } else { "执行超时（20s）" }).to_string();
+    let qt = |_| {
+        (if is_read {
+            "查询超时（20s）"
+        } else {
+            "执行超时（20s）"
+        })
+        .to_string()
+    };
 
     match driver {
         "sqlite" => {
             let mut c = tokio::time::timeout(CONNECT_TIMEOUT, sqlx::SqliteConnection::connect(url))
-                .await.map_err(ct)?.map_err(|e| format!("连接失败: {e}"))?;
+                .await
+                .map_err(ct)?
+                .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("查询出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "sqlite", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("执行出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("执行出错: {e}"))?;
                 Ok(affected_json("sqlite", res.rows_affected(), ms(started)))
             };
             let _ = c.close().await;
@@ -90,14 +105,20 @@ async fn sql_query(
         }
         "mysql" => {
             let mut c = tokio::time::timeout(CONNECT_TIMEOUT, sqlx::MySqlConnection::connect(url))
-                .await.map_err(ct)?.map_err(|e| format!("连接失败: {e}"))?;
+                .await
+                .map_err(ct)?
+                .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("查询出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "mysql", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("执行出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("执行出错: {e}"))?;
                 Ok(affected_json("mysql", res.rows_affected(), ms(started)))
             };
             let _ = c.close().await;
@@ -105,14 +126,20 @@ async fn sql_query(
         }
         "postgres" | "postgresql" => {
             let mut c = tokio::time::timeout(CONNECT_TIMEOUT, sqlx::PgConnection::connect(url))
-                .await.map_err(ct)?.map_err(|e| format!("连接失败: {e}"))?;
+                .await
+                .map_err(ct)?
+                .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("查询出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "postgres", cap, ms(started)))
             } else {
                 let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
-                    .await.map_err(qt)?.map_err(|e| format!("执行出错: {e}"))?;
+                    .await
+                    .map_err(qt)?
+                    .map_err(|e| format!("执行出错: {e}"))?;
                 Ok(affected_json("postgres", res.rows_affected(), ms(started)))
             };
             let _ = c.close().await;
@@ -138,7 +165,8 @@ where
     for<'r> bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    for<'r> sqlx::types::chrono::NaiveDateTime: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'r> sqlx::types::chrono::NaiveDateTime:
+        sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'r> sqlx::types::chrono::NaiveDate: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
     use sqlx::{Column, TypeInfo, ValueRef};
@@ -171,8 +199,18 @@ where
             } else if let Ok(v) = row.try_get::<Vec<u8>, _>(i) {
                 json!(String::from_utf8_lossy(&v).to_string())
             } else {
-                let t = row.try_get_raw(i).map(|r| r.type_info().name().to_string()).unwrap_or_default();
-                json!(format!("<{}>", if t.is_empty() { "unsupported".to_string() } else { t }))
+                let t = row
+                    .try_get_raw(i)
+                    .map(|r| r.type_info().name().to_string())
+                    .unwrap_or_default();
+                json!(format!(
+                    "<{}>",
+                    if t.is_empty() {
+                        "unsupported".to_string()
+                    } else {
+                        t
+                    }
+                ))
             };
             cells.push(v);
         }
@@ -274,7 +312,10 @@ mod tests {
     #[test]
     fn redis_args_split() {
         assert_eq!(split_args("GET key"), vec!["GET", "key"]);
-        assert_eq!(split_args(r#"SET k "hello world""#), vec!["SET", "k", "hello world"]);
+        assert_eq!(
+            split_args(r#"SET k "hello world""#),
+            vec!["SET", "k", "hello world"]
+        );
         assert_eq!(split_args("KEYS user:*"), vec!["KEYS", "user:*"]);
     }
 
@@ -289,7 +330,9 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
         let ddl = "CREATE TABLE t (id INTEGER, name TEXT, score REAL, active BOOLEAN)";
-        db_query("sqlite".into(), url.clone(), ddl.into(), None).await.expect("create");
+        db_query("sqlite".into(), url.clone(), ddl.into(), None)
+            .await
+            .expect("create");
 
         let ins = db_query(
             "sqlite".into(),
@@ -301,9 +344,14 @@ mod tests {
         .expect("insert");
         assert_eq!(ins["rows_affected"].as_u64(), Some(2), "two rows inserted");
 
-        let sel = db_query("sqlite".into(), url.clone(), "SELECT id,name,score,active FROM t ORDER BY id".into(), None)
-            .await
-            .expect("select");
+        let sel = db_query(
+            "sqlite".into(),
+            url.clone(),
+            "SELECT id,name,score,active FROM t ORDER BY id".into(),
+            None,
+        )
+        .await
+        .expect("select");
         assert_eq!(sel["columns"], json!(["id", "name", "score", "active"]));
         assert_eq!(sel["row_count"].as_u64(), Some(2));
         let rows = sel["rows"].as_array().unwrap();
@@ -312,7 +360,11 @@ mod tests {
         assert_eq!(rows[0][0], json!(1));
         assert_eq!(rows[0][1], json!("alice"));
         assert_eq!(rows[0][2].as_f64(), Some(9.5));
-        assert!(rows[0][3] == json!(1) || rows[0][3] == json!(true), "bool decodes, got {:?}", rows[0][3]);
+        assert!(
+            rows[0][3] == json!(1) || rows[0][3] == json!(true),
+            "bool decodes, got {:?}",
+            rows[0][3]
+        );
         // row 1: NULL score must decode to json null
         assert_eq!(rows[1][1], json!("bob"));
         assert_eq!(rows[1][2], serde_json::Value::Null, "NULL → json null");

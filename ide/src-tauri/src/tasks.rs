@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Serialize;
 
@@ -496,7 +495,8 @@ mod tests {
 
     #[test]
     fn capture_rejects_bad_dir() {
-        let err = task_run_capture_inner("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
+        let err =
+            task_run_capture_inner("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
         assert!(err.is_err());
     }
 }

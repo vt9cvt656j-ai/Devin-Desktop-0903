@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -96,7 +96,10 @@ impl Session {
                         continue;
                     }
                     if let Some(err) = v.get("error") {
-                        let m = err.get("message").and_then(|m| m.as_str()).unwrap_or("MCP error");
+                        let m = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("MCP error");
                         return Err(m.to_string());
                     }
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
@@ -216,7 +219,11 @@ pub async fn mcp_connect(
             .unwrap_or_default();
         let mut out = Vec::new();
         for t in tools {
-            let tname = t.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let tname = t
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
             if tname.is_empty() {
                 continue;
             }
@@ -296,7 +303,10 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
         if text.is_empty() {
             text = serde_json::to_string(&result).unwrap_or_default();
         }
-        let is_error = result.get("isError").and_then(|e| e.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false);
         if is_error {
             return Err(format!("[工具报错] {text}"));
         }

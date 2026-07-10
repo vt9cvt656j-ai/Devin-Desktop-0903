@@ -120,11 +120,16 @@ pub async fn admin_generate(
 }
 
 // ---------- admin: list ----------
-pub async fn admin_list(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<Code>>> {
+pub async fn admin_list(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> ApiResult<Json<Vec<Code>>> {
     admin_only(&claims)?;
-    let rows = sqlx::query_as::<_, Code>("SELECT * FROM activation_codes ORDER BY created_at DESC LIMIT 1000")
-        .fetch_all(&state.db)
-        .await?;
+    let rows = sqlx::query_as::<_, Code>(
+        "SELECT * FROM activation_codes ORDER BY created_at DESC LIMIT 1000",
+    )
+    .fetch_all(&state.db)
+    .await?;
     Ok(Json(rows))
 }
 
@@ -150,11 +155,11 @@ pub async fn admin_delete(
 /// Amounts are USD cents; weekly 0 = unlimited.
 pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
     match plan {
-        "trial" => Some((5_000, 5_000, 0, 1)),       // $50 total, $50/5.5h, 1 day, ¥8.8
-        "basic" => Some((33_000, 3_000, 0, 30)),     // $330 total, $30/5.5h, 30 days, ¥88
-        "pro" => Some((65_000, 6_000, 0, 30)),       // $650 total, $60/5.5h, 30 days, ¥188
-        "power" => Some((180_000, 15_000, 0, 30)),   // $1800 total, $150/5.5h, 30 days, ¥488
-        "ultra" => Some((500_000, 30_000, 0, 30)),   // $5000 total, $300/5.5h, 30 days
+        "trial" => Some((5_000, 5_000, 0, 1)), // $50 total, $50/5.5h, 1 day, ¥8.8
+        "basic" => Some((33_000, 3_000, 0, 30)), // $330 total, $30/5.5h, 30 days, ¥88
+        "pro" => Some((65_000, 6_000, 0, 30)), // $650 total, $60/5.5h, 30 days, ¥188
+        "power" => Some((180_000, 15_000, 0, 30)), // $1800 total, $150/5.5h, 30 days, ¥488
+        "ultra" => Some((500_000, 30_000, 0, 30)), // $5000 total, $300/5.5h, 30 days
         _ => None,
     }
 }
@@ -204,11 +209,13 @@ pub(crate) async fn apply_credits(
     uid: uuid::Uuid,
     cents: i64,
 ) -> ApiResult<()> {
-    sqlx::query("UPDATE users SET credits_cents = credits_cents + $1, updated_at = now() WHERE id = $2")
-        .bind(cents)
-        .bind(uid)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET credits_cents = credits_cents + $1, updated_at = now() WHERE id = $2",
+    )
+    .bind(cents)
+    .bind(uid)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -240,11 +247,12 @@ pub async fn redeem(
     }
 
     let mut tx = state.db.begin().await?;
-    let code = sqlx::query_as::<_, Code>("SELECT * FROM activation_codes WHERE code = $1 FOR UPDATE")
-        .bind(&input)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::bad("激活码无效"))?;
+    let code =
+        sqlx::query_as::<_, Code>("SELECT * FROM activation_codes WHERE code = $1 FOR UPDATE")
+            .bind(&input)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::bad("激活码无效"))?;
     if code.status != "unused" {
         return Err(AppError::bad("激活码已被使用"));
     }
@@ -256,15 +264,25 @@ pub async fn redeem(
         apply_credits(&mut tx, uid, code.credits_cents.unwrap_or(0)).await?;
         json!({ "kind": "credits", "credits_cents": code.credits_cents })
     };
-    sqlx::query("UPDATE activation_codes SET status = 'used', used_by = $1, used_at = now() WHERE id = $2")
-        .bind(uid)
-        .bind(code.id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE activation_codes SET status = 'used', used_by = $1, used_at = now() WHERE id = $2",
+    )
+    .bind(uid)
+    .bind(code.id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
-    crate::realtime::record_event(&state, Some(uid), "redeem", json!({ "email": claims.email, "grant": granted })).await;
-    Ok(Json(json!({ "ok": true, "granted": granted, "user": user_summary(&state, uid).await? })))
+    crate::realtime::record_event(
+        &state,
+        Some(uid),
+        "redeem",
+        json!({ "email": claims.email, "grant": granted }),
+    )
+    .await;
+    Ok(Json(
+        json!({ "ok": true, "granted": granted, "user": user_summary(&state, uid).await? }),
+    ))
 }
 
 // ---------- admin: manually grant a plan / credits to a user ----------
@@ -304,6 +322,150 @@ pub async fn admin_grant(
         _ => return Err(AppError::bad("类型只能是 plan 或 credits")),
     }
     tx.commit().await?;
-    crate::realtime::record_event(&state, Some(id), "grant", json!({ "by": claims.email, "kind": req.kind })).await;
-    Ok(Json(json!({ "ok": true, "user": user_summary(&state, id).await? })))
+    let summary = user_summary(&state, id).await?;
+    crate::realtime::record_event(
+        &state,
+        Some(id),
+        "user_updated",
+        json!({ "by": claims.email, "action": "grant", "kind": req.kind, "user": summary.clone() }),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "user": summary })))
+}
+
+// ---------- admin: SET (not add) credits to an exact balance ----------
+#[derive(Deserialize)]
+pub struct SetCreditsReq {
+    pub credits_cents: i64,
+}
+
+pub async fn admin_set_credits(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<SetCreditsReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    if req.credits_cents < 0 {
+        return Err(AppError::bad("额度不能为负数"));
+    }
+    sqlx::query("UPDATE users SET credits_cents = $1, updated_at = now() WHERE id = $2")
+        .bind(req.credits_cents)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    let summary = user_summary(&state, id).await?;
+    crate::realtime::record_event(&state, Some(id), "user_updated", json!({ "by": claims.email, "action": "set_credits", "credits_cents": req.credits_cents, "user": summary.clone() })).await;
+    Ok(Json(json!({ "ok": true, "user": summary })))
+}
+
+// ---------- admin: SET plan + expiry to specific absolute values ----------
+#[derive(Deserialize)]
+pub struct SetPlanReq {
+    pub plan: String,
+    /// ISO-8601 timestamp for when the plan expires. If null/missing → plan stays
+    /// active indefinitely (treated as far-future).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When true, also reset the per-window / weekly quota counters to the new
+    /// plan's caps (a fresh start). Defaults to true since admins usually want
+    /// the user to feel the plan change immediately.
+    #[serde(default = "default_true")]
+    pub reset_quotas: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub async fn admin_set_plan(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<SetPlanReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let plan = req.plan.trim();
+    if plan != "none" && !PLANS.contains(&plan) {
+        return Err(AppError::bad(
+            "套餐无效（合法值: trial / basic / pro / power / ultra / none）",
+        ));
+    }
+    if plan == "none" {
+        // Treat plan="none" as a cancel — clear membership.
+        sqlx::query(
+            "UPDATE users SET plan = 'none', plan_expires_at = NULL, \
+             quota_total_cents = 0, quota_window_cents = 0, quota_window_cap_cents = 0, \
+             quota_weekly_cap_cents = 0, quota_week_used_cents = 0, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    } else if req.reset_quotas {
+        if let Some((total, window, weekly, _)) = plan_spec(plan) {
+            sqlx::query(
+                "UPDATE users SET plan = $1, plan_expires_at = $2, \
+                 quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
+                 quota_window_reset_at = now() + interval '5 hours 30 minutes', \
+                 quota_weekly_cap_cents = $5, quota_week_used_cents = 0, quota_week_reset_at = now() + interval '7 days', \
+                 updated_at = now() WHERE id = $6",
+            )
+            .bind(plan)
+            .bind(req.expires_at)
+            .bind(total)
+            .bind(window)
+            .bind(weekly)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        } else {
+            // Unknown plan_spec — at least set plan + expiry; quotas left as-is.
+            sqlx::query("UPDATE users SET plan = $1, plan_expires_at = $2, updated_at = now() WHERE id = $3")
+                .bind(plan)
+                .bind(req.expires_at)
+                .bind(id)
+                .execute(&state.db)
+                .await?;
+        }
+    } else {
+        // Keep existing quotas, just retag the plan + expiry.
+        sqlx::query(
+            "UPDATE users SET plan = $1, plan_expires_at = $2, updated_at = now() WHERE id = $3",
+        )
+        .bind(plan)
+        .bind(req.expires_at)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    }
+    let summary = user_summary(&state, id).await?;
+    crate::realtime::record_event(&state, Some(id), "user_updated", json!({ "by": claims.email, "action": "set_plan", "plan": plan, "expires_at": req.expires_at, "user": summary.clone() })).await;
+    Ok(Json(json!({ "ok": true, "user": summary })))
+}
+
+// ---------- admin: CANCEL a user's membership ----------
+pub async fn admin_cancel_plan(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    sqlx::query(
+        "UPDATE users SET plan = 'none', plan_expires_at = NULL, \
+         quota_total_cents = 0, quota_window_cents = 0, quota_window_cap_cents = 0, \
+         quota_weekly_cap_cents = 0, quota_week_used_cents = 0, \
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    let summary = user_summary(&state, id).await?;
+    crate::realtime::record_event(
+        &state,
+        Some(id),
+        "user_updated",
+        json!({ "by": claims.email, "action": "cancel_plan", "user": summary.clone() }),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "user": summary })))
 }

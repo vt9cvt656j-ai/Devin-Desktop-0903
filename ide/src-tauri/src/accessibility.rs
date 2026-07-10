@@ -36,7 +36,7 @@ pub struct UiElement {
 #[cfg(target_os = "macos")]
 pub fn read_ui_elements() -> Vec<UiElement> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     // DEEP JXA: enumerate ALL accessibility elements from the frontmost app —
@@ -176,7 +176,14 @@ $out=@();for($i=0;$i -lt [Math]::Min($all.Count,500);$i++){$m=$all[$i];$m.ref=$i
 if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
 
     let mut child = match crate::process_util::command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -205,7 +212,9 @@ if($out.Count -eq 0){'[]'}else{ConvertTo-Json -Compress -InputObject @($out)}"#;
     }
     let t = s.trim();
     if t.starts_with('{') {
-        return serde_json::from_str::<UiElement>(t).map(|e| vec![e]).unwrap_or_default();
+        return serde_json::from_str::<UiElement>(t)
+            .map(|e| vec![e])
+            .unwrap_or_default();
     }
     serde_json::from_str::<Vec<UiElement>>(t).unwrap_or_default()
 }
@@ -225,7 +234,7 @@ pub fn read_ui_elements() -> Vec<UiElement> {
 #[cfg(target_os = "macos")]
 fn run_osa(script: &str, ms: u64) -> Option<String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let mut child = crate::process_util::command("osascript")
         .args(["-l", "JavaScript", "-e", script])
@@ -376,7 +385,7 @@ if let j = try? JSONSerialization.data(withJSONObject: out),
 #[cfg(target_os = "macos")]
 pub fn read_ocr_elements() -> Vec<UiElement> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     let bin = std::path::PathBuf::from("/tmp/michael_ide_vision_ocr_v1");
@@ -387,9 +396,19 @@ pub fn read_ocr_elements() -> Vec<UiElement> {
             return Vec::new();
         }
         let arch = std::env::consts::ARCH;
-        let target = format!("{}-apple-macos14.0", if arch == "aarch64" { "arm64" } else { "x86_64" });
+        let target = format!(
+            "{}-apple-macos14.0",
+            if arch == "aarch64" { "arm64" } else { "x86_64" }
+        );
         let ok = crate::process_util::command("swiftc")
-            .args(["-O", "-target", &target, "-o", bin.to_str().unwrap_or(""), src])
+            .args([
+                "-O",
+                "-target",
+                &target,
+                "-o",
+                bin.to_str().unwrap_or(""),
+                src,
+            ])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
             .status()

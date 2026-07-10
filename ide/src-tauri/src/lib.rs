@@ -1,3 +1,6 @@
+// Platform accessibility helpers are retained as a fallback for the desktop
+// automation bridge; not every target currently wires each helper into a command.
+#[allow(dead_code)]
 mod accessibility;
 mod ai;
 mod auth;
@@ -50,7 +53,7 @@ fn cleanup_stale(
 fn install_panic_logger() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok() {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             let dir = std::path::PathBuf::from(home).join(".michael-ide");
             let _ = std::fs::create_dir_all(&dir);
             let ts = std::time::SystemTime::now()

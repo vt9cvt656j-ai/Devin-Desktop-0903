@@ -119,7 +119,10 @@ pub fn term_open(
         // Full toolchain PATH (a Finder-launched app inherits a minimal PATH) + auto-activate a
         // project venv, so `python`/`pip`/`pytest` in THIS terminal resolve INTO it. An AI-installed
         // env then persists across restarts instead of looking "lost" and getting reinstalled.
-        cmd.env("PATH", crate::process_util::augmented_path(Some(dir.as_str())));
+        cmd.env(
+            "PATH",
+            crate::process_util::augmented_path(Some(dir.as_str())),
+        );
         for name in [".venv", "venv"] {
             let venv = std::path::Path::new(&dir).join(name);
             let has_venv = if cfg!(windows) {
@@ -134,7 +137,14 @@ pub fn term_open(
             }
         }
     }
-    cmd.env("TERM", if cfg!(windows) { "dumb" } else { "xterm-256color" });
+    cmd.env(
+        "TERM",
+        if cfg!(windows) {
+            "dumb"
+        } else {
+            "xterm-256color"
+        },
+    );
     cmd.env("LANG", "en_US.UTF-8");
     #[cfg(not(windows))]
     {
@@ -221,15 +231,15 @@ pub fn term_open(
                         }
                     }
                     let bursting = n == buf.len();
-                    if (!bursting || pending.len() >= MAX_BATCH) && !pending.is_empty() {
-                        if on_event
+                    if (!bursting || pending.len() >= MAX_BATCH)
+                        && !pending.is_empty()
+                        && on_event
                             .send(TermEvent::Data {
                                 data: std::mem::take(&mut pending),
                             })
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
                 Err(_) => break,
@@ -349,12 +359,18 @@ pub fn term_history() -> Vec<String> {
     #[cfg(windows)]
     let history_paths: Vec<std::path::PathBuf> = {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        if appdata.is_empty() { vec![] }
-        else { vec![std::path::PathBuf::from(&appdata).join("Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt")] }
+        if appdata.is_empty() {
+            vec![]
+        } else {
+            vec![std::path::PathBuf::from(&appdata)
+                .join("Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt")]
+        }
     };
     #[cfg(not(windows))]
     let history_paths: Vec<std::path::PathBuf> = [".zsh_history", ".bash_history"]
-        .iter().map(|n| home.join(n)).collect();
+        .iter()
+        .map(|n| home.join(n))
+        .collect();
     for path in &history_paths {
         if let Ok(bytes) = std::fs::read(path) {
             let text = String::from_utf8_lossy(&bytes);

@@ -12,7 +12,7 @@
 //! (classic Win32 / WinForms / WPF expose menus well; some Electron/UWP/custom UIs don't).
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Spawn a program with args, bounded by `timeout_ms`; return trimmed stdout, or an error
@@ -65,7 +65,14 @@ fn run_native(macos_jxa: &str, _windows_ps: &str, t: u64) -> Result<String, Stri
 fn run_native(_macos_jxa: &str, windows_ps: &str, t: u64) -> Result<String, String> {
     run_cmd_bounded(
         "powershell",
-        &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", windows_ps],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            windows_ps,
+        ],
         t,
     )
 }
@@ -92,7 +99,11 @@ const PS_FG: &str = "Add-Type @\"\nusing System;using System.Runtime.InteropServ
 // ── open / activate an app ────────────────────────────────────────────────────
 #[cfg(target_os = "macos")]
 fn do_open(name: &str, bg: bool) -> Result<String, String> {
-    let args: &[&str] = if bg { &["-g", "-a", name] } else { &["-a", name] };
+    let args: &[&str] = if bg {
+        &["-g", "-a", name]
+    } else {
+        &["-a", name]
+    };
     match run_cmd_bounded("open", args, 6000) {
         Ok(_) if bg => Ok(format!("✓ 已在后台启动「{name}」（不抢焦点、不打断你）。")),
         Ok(_) => Ok(format!("✓ 已打开/切换到「{name}」。它现在是前台 App，可以用 system menu 直接走它的菜单，或 computer screenshot 看它的界面节点。")),
@@ -120,7 +131,14 @@ fn do_open(name: &str, _bg: bool) -> Result<String, String> {
     );
     run_cmd_bounded(
         "powershell",
-        &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ],
         8000,
     )
 }
@@ -132,9 +150,16 @@ fn do_open(name: &str, _bg: bool) -> Result<String, String> {
 #[cfg(target_os = "linux")]
 mod lx {
     use super::run_cmd_bounded;
-    fn jstr(s: &str) -> String { serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()) }
+    fn jstr(s: &str) -> String {
+        serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+    }
     fn active_name() -> String {
-        run_cmd_bounded("sh", &["-c", "xdotool getactivewindow getwindowname 2>/dev/null"], 2500).unwrap_or_default()
+        run_cmd_bounded(
+            "sh",
+            &["-c", "xdotool getactivewindow getwindowname 2>/dev/null"],
+            2500,
+        )
+        .unwrap_or_default()
     }
     fn win_titles() -> Result<Vec<String>, String> {
         let out = run_cmd_bounded("wmctrl", &["-l"], 3000)
@@ -145,7 +170,9 @@ mod lx {
             let parts: Vec<&str> = line.splitn(4, char::is_whitespace).collect();
             if parts.len() == 4 {
                 let t = parts[3].trim();
-                if !t.is_empty() { v.push(t.to_string()); }
+                if !t.is_empty() {
+                    v.push(t.to_string());
+                }
             }
         }
         Ok(v)
@@ -165,20 +192,45 @@ mod lx {
     }
     pub fn frontmost() -> Result<String, String> {
         let n = active_name();
-        if n.is_empty() { return Err("拿不到前台窗口：装 xdotool（sudo apt install xdotool）或当前非图形会话".into()); }
+        if n.is_empty() {
+            return Err(
+                "拿不到前台窗口：装 xdotool（sudo apt install xdotool）或当前非图形会话".into(),
+            );
+        }
         Ok(format!("{{\"app\":{},\"window\":{}}}", jstr(&n), jstr(&n)))
     }
     pub fn list_apps() -> Result<String, String> {
         let mut apps: Vec<String> = Vec::new();
-        for t in win_titles()? { if !apps.iter().any(|a| a == &t) { apps.push(t); } }
+        for t in win_titles()? {
+            if !apps.iter().any(|a| a == &t) {
+                apps.push(t);
+            }
+        }
         let arr: Vec<String> = apps.iter().map(|a| jstr(a)).collect();
-        Ok(format!("{{\"frontmost\":{},\"count\":{},\"apps\":[{}]}}", jstr(&active_name()), apps.len(), arr.join(",")))
+        Ok(format!(
+            "{{\"frontmost\":{},\"count\":{},\"apps\":[{}]}}",
+            jstr(&active_name()),
+            apps.len(),
+            arr.join(",")
+        ))
     }
     pub fn windows(name: &str) -> Result<String, String> {
         let nl = name.to_lowercase();
-        let ws: Vec<String> = win_titles()?.into_iter().filter(|t| t.to_lowercase().contains(&nl)).collect();
-        let items: Vec<String> = ws.iter().enumerate().map(|(i, t)| format!("{{\"i\":{},\"title\":{}}}", i, jstr(t))).collect();
-        Ok(format!("{{\"app\":{},\"count\":{},\"windows\":[{}]}}", jstr(name), ws.len(), items.join(",")))
+        let ws: Vec<String> = win_titles()?
+            .into_iter()
+            .filter(|t| t.to_lowercase().contains(&nl))
+            .collect();
+        let items: Vec<String> = ws
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{{\"i\":{},\"title\":{}}}", i, jstr(t)))
+            .collect();
+        Ok(format!(
+            "{{\"app\":{},\"count\":{},\"windows\":[{}]}}",
+            jstr(name),
+            ws.len(),
+            items.join(",")
+        ))
     }
     pub fn focus(name: &str, title: &str) -> Result<String, String> {
         let q = if title.is_empty() { name } else { title };
@@ -317,7 +369,9 @@ pub async fn system_menu(app: Option<String>, path: Vec<String>) -> Result<Strin
     #[cfg(target_os = "linux")]
     return lx::menu_unsupported();
     if path.is_empty() {
-        return Err("system menu 需要 path，如 [\"File\",\"New\"] 或 [\"Edit\",\"Find\",\"Find…\"]".into());
+        return Err(
+            "system menu 需要 path，如 [\"File\",\"New\"] 或 [\"Edit\",\"Find\",\"Find…\"]".into(),
+        );
     }
     let ajs = match &app {
         Some(a) if !a.trim().is_empty() => serde_json::to_string(a).map_err(|e| e.to_string())?,

@@ -13,7 +13,12 @@ const ONLINE_KEY: &str = "online:count";
 
 /// Persist an event and publish it to the live feed. Best-effort: a telemetry
 /// failure must never break the request that triggered it.
-pub async fn record_event(state: &AppState, user_id: Option<uuid::Uuid>, kind: &str, data: serde_json::Value) {
+pub async fn record_event(
+    state: &AppState,
+    user_id: Option<uuid::Uuid>,
+    kind: &str,
+    data: serde_json::Value,
+) {
     let res: ApiResult<()> = async {
         sqlx::query("INSERT INTO events (user_id, kind, data) VALUES ($1, $2, $3)")
             .bind(user_id)
@@ -29,7 +34,11 @@ pub async fn record_event(state: &AppState, user_id: Option<uuid::Uuid>, kind: &
         })
         .to_string();
         let mut conn = state.redis.clone();
-        let _: () = redis::cmd("PUBLISH").arg(FEED_CHANNEL).arg(payload).query_async(&mut conn).await?;
+        let _: () = redis::cmd("PUBLISH")
+            .arg(FEED_CHANNEL)
+            .arg(payload)
+            .query_async(&mut conn)
+            .await?;
         Ok(())
     }
     .await;
@@ -40,7 +49,11 @@ pub async fn record_event(state: &AppState, user_id: Option<uuid::Uuid>, kind: &
 
 async fn bump_online(state: &AppState, delta: i64) {
     let mut conn = state.redis.clone();
-    let _: Result<i64, _> = redis::cmd("INCRBY").arg(ONLINE_KEY).arg(delta).query_async(&mut conn).await;
+    let _: Result<i64, _> = redis::cmd("INCRBY")
+        .arg(ONLINE_KEY)
+        .arg(delta)
+        .query_async(&mut conn)
+        .await;
 }
 
 /// GET /ws — upgrade to a WebSocket that streams the live event feed (fanned out
@@ -99,7 +112,10 @@ pub struct Event {
 
 /// GET /api/admin/events — recent activity for the dashboard's initial load
 /// (the live tail then arrives over /ws). Admin only.
-pub async fn recent_events(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<Vec<Event>>> {
+pub async fn recent_events(
+    State(state): State<AppState>,
+    claims: crate::auth::Claims,
+) -> ApiResult<Json<Vec<Event>>> {
     if claims.role != "admin" {
         return Err(AppError::forbidden("需要管理员权限"));
     }
@@ -112,16 +128,26 @@ pub async fn recent_events(State(state): State<AppState>, claims: crate::auth::C
 }
 
 /// GET /api/admin/stats — headline numbers for the dashboard (admin only).
-pub async fn stats(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<serde_json::Value>> {
+pub async fn stats(
+    State(state): State<AppState>,
+    claims: crate::auth::Claims,
+) -> ApiResult<Json<serde_json::Value>> {
     if claims.role != "admin" {
         return Err(AppError::forbidden("需要管理员权限"));
     }
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&state.db).await?;
-    let today: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE created_at >= date_trunc('day', now())")
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
         .fetch_one(&state.db)
         .await?;
+    let today: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE created_at >= date_trunc('day', now())",
+    )
+    .fetch_one(&state.db)
+    .await?;
     let mut conn = state.redis.clone();
-    let online: Option<i64> = redis::cmd("GET").arg(ONLINE_KEY).query_async(&mut conn).await?;
+    let online: Option<i64> = redis::cmd("GET")
+        .arg(ONLINE_KEY)
+        .query_async(&mut conn)
+        .await?;
     Ok(Json(json!({
         "total_users": total,
         "today_users": today,
