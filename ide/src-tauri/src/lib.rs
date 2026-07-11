@@ -28,6 +28,13 @@ mod terminal;
 mod watcher;
 mod web_scaffold;
 
+// DevTools remain compiled in for manual use, but the application window must
+// stay focused on startup instead of forcing the inspector open.
+#[cfg(desktop)]
+fn should_open_devtools_on_startup() -> bool {
+    false
+}
+
 /// Reap any backend processes left over from a previous page session. The
 /// frontend calls this once on startup, so a webview reload (common during dev)
 /// no longer orphans the old terminals / LSP servers / debug adapters — the main
@@ -107,9 +114,8 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
-            // Enable devtools in all builds (debug + release)
             #[cfg(desktop)]
-            {
+            if should_open_devtools_on_startup() {
                 use tauri::Manager;
                 if let Some(w) = app.get_webview_window("main") {
                     w.open_devtools();
@@ -342,4 +348,14 @@ pub fn run() {
                 automation::stop(); // reap the desktop-automation server
             }
         });
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::should_open_devtools_on_startup;
+
+    #[test]
+    fn devtools_stay_closed_on_startup() {
+        assert!(!should_open_devtools_on_startup());
+    }
 }

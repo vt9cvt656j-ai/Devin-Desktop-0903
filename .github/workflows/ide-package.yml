@@ -1,95 +1,89 @@
-name: Package Michael IDE (Mac + Windows)
+name: Package Michael IDE (macOS + Windows)
 
-# Builds installable Michael IDE bundles for macOS (universal: Intel + Apple
-# Silicon) and Windows (x64). Run it manually from the Actions tab
-# ("Run workflow"), or push a tag like `ide-v1.0.0` to also publish a GitHub
-# Release with the installers attached.
 on:
   workflow_dispatch:
-  push:
-    tags: ["ide-v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ide-package-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   package:
-    name: Package (${{ matrix.label }})
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            label: macOS universal
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            args: '--target universal-apple-darwin'
-          - os: windows-latest
-            label: Windows x64
-            rust_targets: ""
-            args: ''
-    runs-on: ${{ matrix.os }}
+          - label: macOS (Apple Silicon)
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            artifact_name: michael-ide-macos-apple-silicon
+            artifact_paths: |
+              ide/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - label: Windows (x64)
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            artifact_name: michael-ide-windows-x64
+            artifact_paths: |
+              ide/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              ide/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ide/src-tauri -> target
-
-      - name: Setup Node
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: ide/package-lock.json
 
-      - name: Install frontend deps
-        working-directory: ide
-        run: npm install
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
-      - name: Build & package
-        id: tauri
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ide -> target
+
+      - name: Install frontend dependencies
+        working-directory: ide
+        run: npm ci
+
+      - name: Verify bundled automation server (macOS)
+        if: runner.os == 'macOS'
+        run: test -f ide/src-tauri/binaries/automation-server-${{ matrix.rust_target }}
+
+      - name: Verify bundled automation server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "ide/src-tauri/binaries/automation-server-${{ matrix.rust_target }}.exe")) {
+            throw "Missing automation-server sidecar for ${{ matrix.rust_target }}"
+          }
+
+      - name: Build installable bundle
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Enable signed auto-update: set repo secrets TAURI_SIGNING_PRIVATE_KEY (contents
-          # of ~/.tauri/michael-ide.key) + TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Only used on a
-          # tagged release (below); empty is harmless for manual dispatch dev builds.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: ide
-          # Tagged release (push `ide-v*`) → build SIGNED updater artifacts + latest.json so
-          # installed apps auto-update. Manual "Run workflow" → disable updater (dev build,
-          # no signing key needed) — identical to before, so the existing flow can't break.
-          args: ${{ matrix.args }}${{ github.ref_type != 'tag' && ' --config {"bundle":{"createUpdaterArtifacts":false}}' || '' }}
-          # When triggered by an `ide-v*` tag, publish a GitHub Release with the
-          # installers. On a manual run these stay empty, so it just builds and
-          # the bundles are uploaded as workflow artifacts (below).
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('Michael IDE {0}', github.ref_name) || '' }}
-          releaseBody: "Auto-built Michael IDE installers for macOS (universal) and Windows."
-          releaseDraft: false
-          prerelease: false
+          args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json
 
-      - name: Upload installers as workflow artifacts
+      - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: michael-ide-${{ runner.os }}
-          # Fail loudly if the bundle paths stop matching (the cargo target dir
-          # is ide/target, NOT ide/src-tauri/target — the `ide/**` glob covers
-          # both that and the macOS universal-apple-darwin subdir).
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
           if-no-files-found: error
           retention-days: 14
-          path: |
-            ide/**/release/bundle/dmg/*.dmg
-            ide/**/release/bundle/macos/*.app
-            ide/**/release/bundle/msi/*.msi
-            ide/**/release/bundle/nsis/*.exe
+          compression-level: 0

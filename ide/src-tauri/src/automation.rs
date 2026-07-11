@@ -14,6 +14,10 @@ const PORT: u16 = 3037;
 /// spawn 出来的服务进程句柄，进程内唯一。
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
+fn packaged_server_filename(executable_suffix: &str) -> String {
+    format!("automation-server{executable_suffix}")
+}
+
 /// 解析 automation-server 二进制路径：env 覆盖 → **打进 App 的 sidecar**（发行版所有用户都有）
 /// → 开发期磁盘上的框架产物。sidecar 由 Tauri externalBin 放在主程序同目录（Contents/MacOS/）。
 fn server_bin() -> Option<std::path::PathBuf> {
@@ -23,10 +27,10 @@ fn server_bin() -> Option<std::path::PathBuf> {
             return Some(pb);
         }
     }
-    // 打包版：Tauri 把 externalBin 放到主程序旁（去掉三元组后缀 → automation-server）。
+    // 打包版：Tauri 把 externalBin 放到主程序旁，并去掉目标三元组后缀。
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let side = dir.join("automation-server");
+            let side = dir.join(packaged_server_filename(std::env::consts::EXE_SUFFIX));
             if side.exists() {
                 return Some(side);
             }
@@ -147,5 +151,20 @@ pub fn stop() {
         if let Some(mut ch) = guard.take() {
             let _ = ch.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packaged_server_filename;
+
+    #[test]
+    fn packaged_server_filename_uses_unix_executable_name() {
+        assert_eq!(packaged_server_filename(""), "automation-server");
+    }
+
+    #[test]
+    fn packaged_server_filename_uses_windows_executable_name() {
+        assert_eq!(packaged_server_filename(".exe"), "automation-server.exe");
     }
 }
