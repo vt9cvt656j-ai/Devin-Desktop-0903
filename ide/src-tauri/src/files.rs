@@ -35,6 +35,11 @@ const IGNORED_DIRS: &[&str] = &[
 /// path falls inside one of these roots, blocking path-traversal attacks from
 /// XSS or extension sandbox escapes.
 static ALLOWED_ROOTS: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::new()));
+/// Serialize IDE-originated workspace mutations. Conditional agent writes hold
+/// this lock across their final read/compare/write sequence, so two concurrent
+/// agent runs cannot both validate the same old version and silently overwrite
+/// one another.
+static FILE_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Pre-register the user's HOME directory so files are accessible before any
 /// folder is explicitly opened.  Called from `lib.rs` during app setup.
@@ -416,6 +421,7 @@ fn strip_xml(xml: &str) -> String {
 /// Overwrite a file with new text content.
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path)?;
     // Create parent dirs ourselves so callers don't have to shell out to
     // `mkdir -p` (which the agent frontend did, interpolating model-controlled
@@ -426,6 +432,60 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
         }
     }
     std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+/// Write only if the file still has the exact version the caller read. `None`
+/// means the caller observed no file and therefore requires an atomic create.
+/// Every normal IDE text write shares FILE_MUTATION_LOCK, making this comparison
+/// and write one critical section across editor saves and concurrent agent runs.
+#[tauri::command]
+pub fn write_text_file_if_unchanged(
+    path: String,
+    expected_content: Option<String>,
+    content: String,
+) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
+    let resolved = require_inside_workspace(&path)?;
+    let exists = resolved.exists();
+    match expected_content {
+        Some(expected) => {
+            if !exists {
+                return Err("[CONFLICT] file was deleted after it was read".into());
+            }
+            let current = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+            if current != expected {
+                return Err("[CONFLICT] file changed after it was read".into());
+            }
+        }
+        None if exists => {
+            return Err("[CONFLICT] file was created by another task".into());
+        }
+        None => {}
+    }
+    if let Some(parent) = resolved.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(resolved, content).map_err(|e| e.to_string())
+}
+
+/// Delete a text file only if it still contains the version the caller last
+/// wrote. This is the deletion counterpart to `write_text_file_if_unchanged`
+/// and keeps Undo/revert from removing a user's newer edit.
+#[tauri::command]
+pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
+    let resolved = require_inside_workspace(&path)?;
+    let meta = std::fs::symlink_metadata(&resolved).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("[CONFLICT] path is no longer the expected text file".into());
+    }
+    let current = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+    if current != expected_content {
+        return Err("[CONFLICT] file changed after it was written".into());
+    }
+    std::fs::remove_file(resolved).map_err(|e| e.to_string())
 }
 
 /// Write a file to /tmp for internal tools (no workspace restriction).
@@ -452,6 +512,7 @@ pub fn home_dir() -> Option<String> {
 /// Create a new empty file. Errors if anything already exists at `path`.
 #[tauri::command]
 pub fn create_file(path: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path)?;
     let p = Path::new(&path);
     if p.exists() {
@@ -466,6 +527,7 @@ pub fn create_file(path: String) -> Result<(), String> {
 /// Create a new directory (including any missing parents).
 #[tauri::command]
 pub fn create_dir(path: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path)?;
     let p = Path::new(&path);
     if p.exists() {
@@ -477,6 +539,7 @@ pub fn create_dir(path: String) -> Result<(), String> {
 /// Rename or move a file/folder. Errors if the destination already exists.
 #[tauri::command]
 pub fn rename_path(from: String, to: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&from)?;
     require_inside_workspace(&to)?;
     let to_p = Path::new(&to);
@@ -509,6 +572,7 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 /// destination already exists. Both endpoints must be inside the workspace.
 #[tauri::command]
 pub fn copy_path(from: String, to: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&from)?;
     let to_path = require_inside_workspace(&to)?;
     let from_p = Path::new(&from);
@@ -534,6 +598,7 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
 /// Delete a file, or a directory and all of its contents.
 #[tauri::command]
 pub fn delete_path(path: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path)?;
     let p = Path::new(&path);
     let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
@@ -783,6 +848,7 @@ pub fn replace_in_file(
     replacement: String,
     case_sensitive: bool,
 ) -> Result<usize, String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     // Same workspace boundary every other mutating fs command enforces — without
     // it this is an arbitrary-file-write primitive.
     let resolved = require_inside_workspace(&file_path)?;
@@ -896,4 +962,87 @@ pub fn replace_in_project(
         files_changed,
         replacements,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "michael-ide-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn conditional_write_rejects_stale_content() {
+        let path = temp_file("stale-write");
+        std::fs::write(&path, "v1").unwrap();
+        write_text_file_if_unchanged(
+            path.to_string_lossy().into_owned(),
+            Some("v1".into()),
+            "v2".into(),
+        )
+        .unwrap();
+        let error = write_text_file_if_unchanged(
+            path.to_string_lossy().into_owned(),
+            Some("v1".into()),
+            "stale".into(),
+        )
+        .unwrap_err();
+        assert!(error.contains("[CONFLICT]"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_conditional_writes_allow_only_one_winner() {
+        let path = temp_file("concurrent-write");
+        std::fs::write(&path, "v1").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for value in ["from-a", "from-b"] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_text_file_if_unchanged(
+                    path.to_string_lossy().into_owned(),
+                    Some("v1".into()),
+                    value.into(),
+                )
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let final_value = std::fs::read_to_string(&path).unwrap();
+        assert!(final_value == "from-a" || final_value == "from-b");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conditional_delete_preserves_a_newer_edit() {
+        let path = temp_file("conditional-delete");
+        std::fs::write(&path, "agent").unwrap();
+        std::fs::write(&path, "user").unwrap();
+        let error =
+            delete_text_file_if_unchanged(path.to_string_lossy().into_owned(), "agent".into())
+                .unwrap_err();
+        assert!(error.contains("[CONFLICT]"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user");
+
+        delete_text_file_if_unchanged(path.to_string_lossy().into_owned(), "user".into()).unwrap();
+        assert!(!path.exists());
+    }
 }

@@ -978,6 +978,7 @@ dependencies = [
  "headless_chrome",
  "image",
  "lettre",
+ "libc",
  "notify",
  "notify-debouncer-mini",
  "once_cell",

@@ -5,7 +5,7 @@
 //! Git the user already has configured (hooks, includes, credentials, etc.).
 
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// A single changed path reported by `git status`.
 #[derive(Serialize)]
@@ -44,7 +44,8 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
     // run_git was the one git-critical caller spawning bare "git" → commit/push "传不过去" on
     // Macs where git lives only under Homebrew.
     let git = crate::process_util::resolve_command("git", Some(root));
-    crate::process_util::command(&git)
+    let mut command = crate::process_util::command(&git);
+    command
         .arg("-C")
         .arg(root)
         .args(args)
@@ -53,6 +54,16 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
         // instead. This keeps network commands like `git push` from hanging
         // indefinitely on an auth prompt when no credential helper is set.
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never");
+    // SSH has its own prompts, independent of GIT_TERMINAL_PROMPT. Keep any
+    // user-supplied identity/wrapper command, but append non-interactive options.
+    // `accept-new` permits first contact while still rejecting changed host keys.
+    let ssh = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".into());
+    command.env(
+        "GIT_SSH_COMMAND",
+        format!("{ssh} -oBatchMode=yes -oStrictHostKeyChecking=accept-new"),
+    );
+    command
         .output()
         .map_err(|e| format!("failed to run git: {e}"))
 }
@@ -99,22 +110,27 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
         });
     }
 
-    let branch_out = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let mut branch = String::from_utf8_lossy(&branch_out.stdout)
-        .trim()
-        .to_string();
-    if branch == "HEAD" {
-        // Detached HEAD: show the short commit instead.
-        if let Ok(short) = run_git(&root, &["rev-parse", "--short", "HEAD"]) {
-            let s = String::from_utf8_lossy(&short.stdout).trim().to_string();
-            if !s.is_empty() {
-                branch = format!("detached @ {s}");
-            }
+    // `rev-parse --abbrev-ref HEAD` exits 128 and prints the literal "HEAD" on
+    // an unborn branch. symbolic-ref reads the ref itself, so it reports the real
+    // branch name both before and after the first commit.
+    let symbolic = run_git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = if symbolic.status.success() {
+        let name = String::from_utf8_lossy(&symbolic.stdout).trim().to_string();
+        if name.is_empty() {
+            "(no commits yet)".to_string()
+        } else {
+            name
         }
-    }
-    if branch.is_empty() {
-        branch = "(no commits yet)".to_string();
-    }
+    } else {
+        // A non-symbolic HEAD is detached. Show the commit when it resolves.
+        let short = run_git(&root, &["rev-parse", "--verify", "--short", "HEAD"])?;
+        let commit = String::from_utf8_lossy(&short.stdout).trim().to_string();
+        if short.status.success() && !commit.is_empty() {
+            format!("detached @ {commit}")
+        } else {
+            "(no commits yet)".to_string()
+        }
+    };
 
     let status_out = run_git(&root, &["status", "--porcelain=v1"])?;
     if !status_out.status.success() {
@@ -253,6 +269,136 @@ fn run_git_checked(root: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+fn validated_clone_source(source: &str) -> Result<String, String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err("Clone source is empty.".into());
+    }
+    if source.chars().any(char::is_control) || source.starts_with('-') {
+        return Err("Clone source contains unsafe characters.".into());
+    }
+
+    let local = Path::new(source);
+    if local.is_absolute() {
+        return std::fs::canonicalize(local)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|e| format!("Local clone source does not exist or is inaccessible: {e}"));
+    }
+
+    if source.chars().any(char::is_whitespace) || source.contains("::") {
+        return Err(
+            "Clone source must be a supported URL, SSH path, or absolute local path.".into(),
+        );
+    }
+    let lower = source.to_ascii_lowercase();
+    if ["https://", "http://", "ssh://", "git://", "file://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return Ok(source.to_string());
+    }
+    if source.contains("://") {
+        return Err("Unsupported Git clone URL scheme.".into());
+    }
+
+    // Git's SCP-style SSH syntax: [user@]host:path. Restrict the host side to
+    // hostname characters so remote-helper syntax cannot be smuggled through.
+    if let Some((host, path)) = source.split_once(':') {
+        let valid_host = !host.is_empty()
+            && host
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'-' | b'_' | b'@'));
+        if valid_host && !path.is_empty() {
+            return Ok(source.to_string());
+        }
+    }
+    Err("Clone source must be a supported URL, SSH path, or absolute local path.".into())
+}
+
+fn validated_clone_target(target: &str) -> Result<PathBuf, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Clone target is empty.".into());
+    }
+    if target.chars().any(char::is_control) {
+        return Err("Clone target contains unsafe characters.".into());
+    }
+    let target = PathBuf::from(target);
+    if !target.is_absolute() {
+        return Err("Clone target must be an absolute path.".into());
+    }
+    ensure_clone_target_absent(&target)?;
+    let name = match target.components().next_back() {
+        Some(Component::Normal(name)) => name.to_owned(),
+        _ => return Err("Clone target must name a new directory.".into()),
+    };
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Clone target has no parent directory.".to_string())?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("Clone target parent does not exist or is inaccessible: {e}"))?;
+    if !parent.is_dir() {
+        return Err("Clone target parent is not a directory.".into());
+    }
+    let normalized = parent.join(name);
+    ensure_clone_target_absent(&normalized)?;
+    Ok(normalized)
+}
+
+fn ensure_clone_target_absent(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => Err("Clone target already exists; choose a new directory.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Unable to inspect clone target: {error}")),
+    }
+}
+
+/// Clone a repository into a new, explicitly chosen absolute directory.
+///
+/// The parent must already exist and the target itself must not. Sources are
+/// limited to normal Git network URLs, SCP-style SSH paths, and existing absolute
+/// local paths; dangerous remote-helper schemes are rejected before Git runs.
+#[tauri::command]
+pub fn git_clone(source: String, target: String) -> Result<String, String> {
+    let source = validated_clone_source(&source)?;
+    let target = validated_clone_target(&target)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Clone target has no parent directory.".to_string())?;
+    let parent = parent.to_string_lossy().into_owned();
+    let target_arg = target.to_string_lossy().into_owned();
+    run_git_checked(
+        &parent,
+        &[
+            "-c",
+            "protocol.ext.allow=never",
+            "clone",
+            "--",
+            &source,
+            &target_arg,
+        ],
+    )?;
+    let inside = run_git(&target_arg, &["rev-parse", "--is-inside-work-tree"])?;
+    if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+        return Err("Git clone completed without creating a valid working tree.".into());
+    }
+    Ok(target_arg)
+}
+
+fn select_push_remote(remotes: &[String]) -> Result<String, String> {
+    if remotes.iter().any(|remote| remote == "origin") {
+        return Ok("origin".into());
+    }
+    match remotes {
+        [] => Err("Current branch has no upstream and this repository has no remotes.".into()),
+        [only] => Ok(only.clone()),
+        many => Err(format!(
+            "Current branch has no upstream and no `origin` remote; choose one of: {}",
+            many.join(", ")
+        )),
+    }
+}
+
 /// best-of-N 隔离：建一个 git worktree，让一个并行候选在独立工作树里改仓库、不碰主 checkout。
 /// 返回 worktree 的绝对路径。工作树放在 `<root>/.michael/worktrees/<name>`，挂一条临时分支
 /// `michael/bon-<name>`（HEAD 派生）。同名残留先强制清掉。**撤销该候选 = git_worktree_remove。**
@@ -358,13 +504,54 @@ pub fn git_commit(root: String, message: String) -> Result<String, String> {
     run_git_checked(&root, &["log", "-1", "--pretty=%h %s"])
 }
 
-/// Push the current branch to its upstream (`git push`).
+/// Push the current branch to its upstream. When the branch has no upstream,
+/// prefer `origin`, otherwise use the repository's sole remote, and establish
+/// tracking with `--set-upstream`.
 ///
 /// Returns combined stdout/stderr because git writes its progress to stderr
 /// even on success.
 #[tauri::command]
 pub fn git_push(root: String) -> Result<String, String> {
-    let out = run_git(&root, &["push"])?;
+    let symbolic = run_git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = String::from_utf8_lossy(&symbolic.stdout).trim().to_string();
+    if !symbolic.status.success() || branch.is_empty() {
+        return Err("Cannot push from detached HEAD; check out a branch first.".into());
+    }
+
+    let upstream = run_git(
+        &root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )?;
+    let out = if upstream.status.success()
+        && !String::from_utf8_lossy(&upstream.stdout).trim().is_empty()
+    {
+        run_git(&root, &["push"])?
+    } else {
+        let remote_out = run_git(&root, &["remote"])?;
+        if !remote_out.status.success() {
+            let error = String::from_utf8_lossy(&remote_out.stderr)
+                .trim()
+                .to_string();
+            return Err(if error.is_empty() {
+                "Unable to list Git remotes before push.".into()
+            } else {
+                error
+            });
+        }
+        let remotes: Vec<String> = String::from_utf8_lossy(&remote_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|remote| !remote.is_empty())
+            .map(str::to_string)
+            .collect();
+        let remote = select_push_remote(&remotes)?;
+        run_git(&root, &["push", "--set-upstream", "--", &remote, &branch])?
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}\n{stderr}").trim().to_string();
@@ -761,5 +948,171 @@ pub fn git_pull(root: String) -> Result<String, String> {
         } else {
             combined
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempGitRoot(PathBuf);
+
+    impl TempGitRoot {
+        fn new() -> Self {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "michael-ide-git-roundtrip-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempGitRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn path_string(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    fn configure_identity(root: &str) {
+        run_git_checked(root, &["config", "user.name", "Michael IDE Test"]).unwrap();
+        run_git_checked(root, &["config", "user.email", "ide-test@example.invalid"]).unwrap();
+    }
+
+    #[test]
+    fn status_diff_stage_commit_push_clone_roundtrip() {
+        let temp = TempGitRoot::new();
+        let base = path_string(&temp.0);
+        let source_path = temp.0.join("source");
+        let remote_path = temp.0.join("origin.git");
+        let clone_path = temp.0.join("clone");
+        let source = path_string(&source_path);
+        let remote = path_string(&remote_path);
+        let clone = path_string(&clone_path);
+
+        run_git_checked(&base, &["init", "--bare", &remote]).unwrap();
+        run_git_checked(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        run_git_checked(&base, &["init", &source]).unwrap();
+        run_git_checked(&source, &["checkout", "-b", "main"]).unwrap();
+        configure_identity(&source);
+
+        fs::write(source_path.join("README.md"), "v1\n").unwrap();
+        let status = git_status(source.clone()).unwrap();
+        assert!(status.is_repo);
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].rel, "README.md");
+        assert_eq!(status.files[0].code, "??");
+        assert!(!status.files[0].staged);
+
+        git_stage(source.clone(), "README.md".into()).unwrap();
+        let staged_status = git_status(source.clone()).unwrap();
+        assert_eq!(staged_status.files[0].code, "A ");
+        assert!(staged_status.files[0].staged);
+        let staged = git_diff(source.clone(), Some("README.md".into()), Some(true)).unwrap();
+        assert!(staged.contains("+v1"));
+        let first_commit = git_commit(source.clone(), "initial commit".into()).unwrap();
+        assert!(first_commit.contains("initial commit"));
+        assert_eq!(git_status(source.clone()).unwrap().branch, "main");
+
+        run_git_checked(&source, &["remote", "add", "upstream", &remote]).unwrap();
+        git_push(source.clone()).unwrap();
+        assert_eq!(
+            run_git_checked(
+                &source,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .unwrap(),
+            "upstream/main"
+        );
+
+        let source_head = run_git_checked(&source, &["rev-parse", "HEAD"]).unwrap();
+        let remote_head = run_git_checked(&remote, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(source_head, remote_head);
+
+        assert!(git_clone("ext::sh -c echo unsafe".into(), clone.clone()).is_err());
+        assert!(git_clone(remote.clone(), "relative/clone".into()).is_err());
+        assert!(git_clone(remote.clone(), base.clone()).is_err());
+        #[cfg(unix)]
+        {
+            let dangling = temp.0.join("dangling-clone");
+            std::os::unix::fs::symlink(temp.0.join("missing-target"), &dangling).unwrap();
+            assert!(git_clone(remote.clone(), path_string(&dangling)).is_err());
+            fs::remove_file(dangling).unwrap();
+        }
+        let cloned_to = git_clone(remote.clone(), clone.clone()).unwrap();
+        assert_eq!(
+            PathBuf::from(cloned_to),
+            std::fs::canonicalize(&temp.0).unwrap().join("clone")
+        );
+        configure_identity(&clone);
+        assert_eq!(
+            fs::read_to_string(clone_path.join("README.md")).unwrap(),
+            "v1\n"
+        );
+        let cloned_status = git_status(clone.clone()).unwrap();
+        assert!(cloned_status.is_repo);
+        assert_eq!(cloned_status.branch, "main");
+        assert!(cloned_status.files.is_empty());
+
+        fs::write(clone_path.join("README.md"), "v2\n").unwrap();
+        let changed = git_status(clone.clone()).unwrap();
+        assert_eq!(changed.files.len(), 1);
+        assert_eq!(changed.files[0].code, " M");
+        assert!(!changed.files[0].staged);
+        let unstaged = git_diff(clone.clone(), Some("README.md".into()), Some(false)).unwrap();
+        assert!(unstaged.contains("-v1"));
+        assert!(unstaged.contains("+v2"));
+
+        git_stage(clone.clone(), "README.md".into()).unwrap();
+        let staged_status = git_status(clone.clone()).unwrap();
+        assert_eq!(staged_status.files[0].code, "M ");
+        assert!(staged_status.files[0].staged);
+        let staged = git_diff(clone.clone(), Some("README.md".into()), Some(true)).unwrap();
+        assert!(staged.contains("-v1"));
+        assert!(staged.contains("+v2"));
+        let second_commit = git_commit(clone.clone(), "update from clone".into()).unwrap();
+        assert!(second_commit.contains("update from clone"));
+        git_push(clone.clone()).unwrap();
+
+        let clone_head = run_git_checked(&clone, &["rev-parse", "HEAD"]).unwrap();
+        let remote_head = run_git_checked(&remote, &["rev-parse", "refs/heads/main"]).unwrap();
+        let remote_content =
+            run_git_checked(&remote, &["show", "refs/heads/main:README.md"]).unwrap();
+        assert_eq!(clone_head, remote_head);
+        assert_eq!(remote_content, "v2");
+        assert!(git_status(clone.clone()).unwrap().files.is_empty());
+
+        run_git_checked(&clone, &["checkout", "--detach", "HEAD"]).unwrap();
+        let detached_error = git_push(clone).unwrap_err();
+        assert!(detached_error.contains("detached HEAD"));
+    }
+
+    #[test]
+    fn push_remote_selection_is_deterministic() {
+        assert_eq!(
+            select_push_remote(&["backup".into(), "origin".into()]).unwrap(),
+            "origin"
+        );
+        assert_eq!(select_push_remote(&["company".into()]).unwrap(), "company");
+        assert!(select_push_remote(&[]).unwrap_err().contains("no remotes"));
+        let error = select_push_remote(&["one".into(), "two".into()]).unwrap_err();
+        assert!(error.contains("no `origin` remote"));
+        assert!(error.contains("one, two"));
     }
 }

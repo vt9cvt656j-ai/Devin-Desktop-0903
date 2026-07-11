@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { writeFileSync } from "node:fs";
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const pending = new Map();
@@ -13,6 +14,31 @@ function reply(id, result) {
 }
 
 function toolPage(request) {
+  const configuredCount = Number(process.env.MCP_FIXTURE_TOOL_COUNT) || 0;
+  if (configuredCount > 0) {
+    return {
+      tools: Array.from({ length: configuredCount }, (_, index) => ({
+        name: `generated_${index}`,
+        description: "Generated fixture tool",
+        inputSchema: { type: "object", properties: {} },
+      })),
+    };
+  }
+  const configuredSchemaBytes = Number(process.env.MCP_FIXTURE_SCHEMA_BYTES) || 0;
+  if (configuredSchemaBytes > 0) {
+    return {
+      tools: [{
+        name: "oversized_schema",
+        description: "Oversized schema fixture",
+        inputSchema: {
+          type: "object",
+          properties: {
+            payload: { type: "string", description: "x".repeat(configuredSchemaBytes) },
+          },
+        },
+      }],
+    };
+  }
   const cursor = request.params?.cursor || "";
   if (!cursor) {
     return {
@@ -66,7 +92,14 @@ input.on("line", (line) => {
 
   if (message.method === "tools/call") {
     send({ jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } });
-    if (message.params?.name === "echo") {
+    if (message.params?.name === "delay_echo") {
+      const delay = Math.max(0, Math.min(5000, Number(message.params?.arguments?.delay_ms) || 0));
+      const startedPath = String(message.params?.arguments?.started_path || "");
+      if (startedPath) writeFileSync(startedPath, "started");
+      setTimeout(() => {
+        reply(message.id, { content: [{ type: "text", text: String(message.params?.arguments?.text || "") }] });
+      }, delay);
+    } else if (message.params?.name === "echo") {
       reply(message.id, { content: [{ type: "text", text: String(message.params?.arguments?.text || "") }] });
     } else if (message.params?.name === "resource_echo") {
       reply(message.id, {

@@ -16,6 +16,9 @@ pub struct AgentTrace {
     pub injected_tool_count: usize,
     pub missing_tool_count: usize,
     pub final_message_count: usize,
+    pub prompt_bytes: usize,
+    pub tool_schema_bytes: usize,
+    pub request_json_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +29,9 @@ pub struct AgentTraceInput {
     pub injected_tool_count: usize,
     pub missing_tool_count: usize,
     pub final_message_count: usize,
+    pub prompt_bytes: usize,
+    pub tool_schema_bytes: usize,
+    pub request_json_bytes: usize,
 }
 
 static TRACES: OnceLock<Mutex<VecDeque<AgentTrace>>> = OnceLock::new();
@@ -62,6 +68,9 @@ pub fn record_agent_trace(input: AgentTraceInput) {
         injected_tool_count: input.injected_tool_count,
         missing_tool_count: input.missing_tool_count,
         final_message_count: input.final_message_count,
+        prompt_bytes: input.prompt_bytes,
+        tool_schema_bytes: input.tool_schema_bytes,
+        request_json_bytes: input.request_json_bytes,
     };
 
     let mut guard = traces()
@@ -94,6 +103,9 @@ mod tests {
                 injected_tool_count: 1,
                 missing_tool_count: 0,
                 final_message_count: 2,
+                prompt_bytes: 100,
+                tool_schema_bytes: 200,
+                request_json_bytes: 500,
             });
         }
 

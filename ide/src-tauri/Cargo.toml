@@ -43,6 +43,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 rqrr = "0.9"
 redis = { version = "1.2.4", features = ["tokio-comp"] }
 pdf-extract = "0.7"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-plugin-macos-fps = "0.1.0"

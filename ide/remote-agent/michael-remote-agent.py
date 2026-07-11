@@ -26,10 +26,11 @@ Endpoints (all POST JSON unless noted):
   POST /fs/search {root, query, case_sensitive?, max?} → {hits:[{rel,line,text}]}
   POST /exec      {command, cwd?, timeout?}            → {stdout, stderr, code, timed_out}
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, time, platform, hmac
+import argparse, json, os, re, shutil, socket, subprocess, sys, time, platform, hmac, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CFG = {"token": "", "root": None, "max_read_bytes": 4_000_000}
+FILE_MUTATION_LOCK = threading.RLock()
 IGNORE_DIRS = {".git", "node_modules", "target", "dist", "build", ".next", ".venv",
                "__pycache__", ".cache", "vendor", ".idea", ".gradle"}
 
@@ -82,31 +83,62 @@ def h_fs_read(b):
 
 
 def h_fs_write(b):
-    p = _within_root(b["path"])
-    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     data = b.get("content", "")
-    open(p, "w", encoding="utf-8").write(data)
+    with FILE_MUTATION_LOCK:
+        p = _within_root(b["path"])
+        if "expected_content" in b:
+            expected = b.get("expected_content")
+            exists = os.path.exists(p)
+            if expected is None and exists:
+                return {"error": "[CONFLICT] file was created by another task"}
+            if expected is not None:
+                if not exists:
+                    return {"error": "[CONFLICT] file was deleted after it was read"}
+                current = open(p, "r", encoding="utf-8", errors="replace").read()
+                if current != expected:
+                    return {"error": "[CONFLICT] file changed after it was read"}
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        open(p, "w", encoding="utf-8").write(data)
     return {"ok": True, "bytes": len(data.encode("utf-8"))}
 
 
 def h_fs_mkdir(b):
-    os.makedirs(_within_root(b["path"]), exist_ok=True)
+    with FILE_MUTATION_LOCK:
+        os.makedirs(_within_root(b["path"]), exist_ok=True)
     return {"ok": True}
 
 
 def h_fs_delete(b):
-    p = _within_root(b["path"])
-    if os.path.isdir(p) and not os.path.islink(p):
-        shutil.rmtree(p)
-    elif os.path.exists(p) or os.path.islink(p):
-        os.remove(p)
+    with FILE_MUTATION_LOCK:
+        p = _within_root(b["path"])
+        if "expected_content" in b:
+            expected = b.get("expected_content")
+            if expected is None or not os.path.isfile(p) or os.path.islink(p):
+                return {"error": "[CONFLICT] path is no longer the expected text file"}
+            current = open(p, "r", encoding="utf-8", errors="replace").read()
+            if current != expected:
+                return {"error": "[CONFLICT] file changed after it was written"}
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        elif os.path.exists(p) or os.path.islink(p):
+            os.remove(p)
     return {"ok": True}
 
 
 def h_fs_rename(b):
-    src, dst = _within_root(b["from"]), _within_root(b["to"])
-    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    os.rename(src, dst)
+    with FILE_MUTATION_LOCK:
+        src, dst = _within_root(b["from"]), _within_root(b["to"])
+        if os.path.exists(dst) or os.path.islink(dst):
+            return {"error": "[CONFLICT] rename destination already exists"}
+        if "expected_content" in b:
+            expected = b.get("expected_content")
+            if expected is None or not os.path.isfile(src) or os.path.islink(src):
+                return {"error": "[CONFLICT] rename source is no longer the expected text file"}
+            current = open(src, "r", encoding="utf-8", errors="replace").read()
+            if current != expected:
+                return {"error": "[CONFLICT] rename source changed"}
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        os.rename(src, dst)
     return {"ok": True}
 
 

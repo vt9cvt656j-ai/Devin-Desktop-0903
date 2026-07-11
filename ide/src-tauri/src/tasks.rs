@@ -203,6 +203,7 @@ pub struct TaskRunResult {
     stderr: String,
     combined: String,
     truncated: bool,
+    timed_out: bool,
 }
 
 const MAX_TASK_OUTPUT: usize = 2 * 1024 * 1024;
@@ -233,17 +234,25 @@ fn task_shell() -> String {
 /// frontend can feed it through a problem matcher into the Problems panel.
 /// This is the non-interactive complement to running a task in the terminal.
 #[tauri::command]
-pub async fn task_run_capture(cwd: String, command: String) -> Result<TaskRunResult, String> {
+pub async fn task_run_capture(
+    cwd: String,
+    command: String,
+    timeout_secs: Option<u64>,
+) -> Result<TaskRunResult, String> {
     // Run the blocking spawn + wait loop on the blocking pool, NOT the Tauri
     // event-loop thread. A sync command here blocks that thread for the command's
     // whole duration (up to the 300s timeout), freezing the whole IDE — the cause
     // of "调用终端容易卡死一会". spawn_blocking keeps the UI responsive throughout.
-    tauri::async_runtime::spawn_blocking(move || task_run_capture_inner(cwd, command))
+    tauri::async_runtime::spawn_blocking(move || task_run_capture_inner(cwd, command, timeout_secs))
         .await
         .map_err(|e| format!("task thread join failed: {e}"))?
 }
 
-fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult, String> {
+fn task_run_capture_inner(
+    cwd: String,
+    command: String,
+    timeout_secs: Option<u64>,
+) -> Result<TaskRunResult, String> {
     let dir = PathBuf::from(&cwd);
     if !dir.is_dir() {
         return Err("task working directory is not a directory".into());
@@ -300,6 +309,14 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Make the shell a process-group leader so a timeout can terminate npm,
+        // cargo, test runners, and every grandchild instead of only the wrapper shell.
+        cmd.process_group(0);
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to run task: {e}"))?;
@@ -323,15 +340,17 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
 
     // Wait with a timeout and kill a command that runs too long (a dev server, a
     // watch, or one blocked on input) instead of hanging the caller forever.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TASK_TIMEOUT_SECS);
+    let timeout_secs = timeout_secs
+        .unwrap_or(TASK_TIMEOUT_SECS)
+        .clamp(1, TASK_TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut timed_out = false;
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_task_tree(&mut child);
                     timed_out = true;
                     break -1;
                 }
@@ -354,7 +373,7 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
     if timed_out {
         truncated = true;
         stderr.push_str(&format!(
-            "\n[已超时 {TASK_TIMEOUT_SECS}s，命令被终止。长时间运行的命令（如启动服务器）请在终端里手动运行。]"
+            "\n[已超时 {timeout_secs}s，命令及其子进程已被终止。长时间运行的命令（如启动服务器）请在终端里手动运行。]"
         ));
     }
     let combined = format!("{stdout}{stderr}");
@@ -364,7 +383,25 @@ fn task_run_capture_inner(cwd: String, command: String) -> Result<TaskRunResult,
         stderr,
         combined,
         truncated,
+        timed_out,
     })
+}
+
+fn terminate_task_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // Safe because the child was placed in its own process group above. A
+        // negative pid targets that group and cannot hit the IDE's process group.
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = crate::process_util::command("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Read a stream into `out`, but stop storing past `cap` bytes (keep draining so
@@ -476,6 +513,7 @@ mod tests {
         let result = task_run_capture_inner(
             root.to_string_lossy().to_string(),
             "echo michael-ide".into(),
+            None,
         )
         .expect("task should run");
         assert_eq!(result.code, 0);
@@ -487,16 +525,37 @@ mod tests {
     #[test]
     fn capture_reports_nonzero_exit() {
         let root = temp_root("capture-fail");
-        let result = task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into())
-            .expect("task should run");
+        let result =
+            task_run_capture_inner(root.to_string_lossy().to_string(), "exit 3".into(), None)
+                .expect("task should run");
         assert_eq!(result.code, 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn capture_rejects_bad_dir() {
-        let err =
-            task_run_capture_inner("/nonexistent-michael-ide-dir-xyz".into(), "echo hi".into());
+        let err = task_run_capture_inner(
+            "/nonexistent-michael-ide-dir-xyz".into(),
+            "echo hi".into(),
+            None,
+        );
         assert!(err.is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capture_timeout_terminates_the_command_tree() {
+        let root = temp_root("capture-timeout");
+        let started = std::time::Instant::now();
+        let result = task_run_capture_inner(
+            root.to_string_lossy().to_string(),
+            "sleep 10 & wait".into(),
+            Some(1),
+        )
+        .expect("timed command should return a result");
+        assert_eq!(result.code, -1);
+        assert!(result.timed_out);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

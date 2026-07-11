@@ -1,42 +1,56 @@
 ---
 name: testing-ide
-description: How to run and manually test the ide/ sub-app (Michael IDE) — the Vite + Monaco + vanilla-JS AI-assistant editor. Use when verifying AI chat rendering, the titlebar/menus, branding, or theme parity.
+description: How to run and manually test the ide/ sub-app (Michael IDE), including chat rendering, agent verification gates, and rendered UI checks.
 ---
 
-# Testing the `ide/` sub-app (Michael IDE)
+# Testing the `ide/` sub-app
 
-The `ide/` directory is a vanilla-JS + Vite + `monaco-editor` app (no framework, no markdown library — the markdown renderer in `src/markdown.js` is hand-rolled and DOM-safe). The right-hand AI assistant renders rich, card-based replies.
-
-## Run it
+## Baseline
 
 ```bash
 cd ide
-npm install        # first time
-npm run dev        # Vite dev server on http://localhost:5173 (strictPort)
-npm run build      # CI-critical production build (must exit 0)
-npm run tauri dev  # native desktop (Tauri) shell
+npm install                 # first run only
+npm test                    # frontend logic tests
+npm run build               # required production build
+npm run dev                 # browser preview: http://localhost:5174
+npm run tauri dev           # native desktop app
 ```
 
-## Backend selection
+`vite.config.js` uses port `5174` with `strictPort`; stop the existing process if that port is occupied.
 
-`main.js` picks a backend at startup: native **Tauri** backend when `__TAURI_INTERNALS__` exists on `window`, otherwise a **mock** backend (this is what runs in a plain browser at `localhost:5173`). The mock streams a fixed, rich markdown sample after a ~750ms delay, so the "thinking" card is visible before the reply renders. This is ideal for testing rendering without any real API key.
+## Browser preview versus desktop
 
-## Sending a message (manual test)
+- The browser preview uses an in-memory mock filesystem, Git state, task runner, terminal, LSP, and debugger. It is suitable for checking layout, Monaco/chat rendering, menus, model branding, responsive behavior, and light/dark themes. Mock task or terminal output is not evidence that a real project built or passed tests.
+- Browser AI is not a fixed canned reply: `aiChat` and `aiChatWithTools` stream from the configured gateway over HTTP/SSE. Sending requires a genuine Michael login token plus an active plan or credits and a reachable API (`VITE_API_TARGET` for the Vite `/api` proxy, or the `michael_api` development override). The preview login backend is mocked, so use an already valid session/token for AI tests; a dummy key such as `sk-test` does not bypass the access gate.
+- The Tauri app uses the real local filesystem, Git, shell/task runner, MCP backend, and browser/screenshot commands. Use `npm run tauri dev` for any claim about agent edits, commands, builds, tests, MCP, or rendered UI validation. Browser automation requires an installed Chrome, Chromium, or Edge.
 
-- The send keybinding is **Ctrl+Enter** (⌘↩ on macOS). Plain Enter inserts a newline — it does NOT send.
-- A send only fires if an AI config exists; otherwise the settings dialog opens. For browser testing, a dummy key (e.g. `sk-test`) saved in `localStorage` (key `devin-ide.ai-config`) is enough for the mock backend to respond.
-- Quick path: click a starter chip (e.g. "Find potential bugs"), then click the send (↑) button or press Ctrl+Enter. The mock reply exercises headings, an ordered list with inline code, a code card (filename + Copy + Monaco syntax highlighting), a blockquote, a 3-column table, a task list, and a link.
+## Verify the agent engineering gate
 
-## Model identity
+Use a disposable real project with deterministic, non-watch `typecheck`, `test`, `lint`, and/or `build` scripts, then open that folder in the Tauri app and use Agent mode.
 
-The selected model (model picker in the composer) drives the assistant header, per-message avatar, and thinking orb, using real provider glyphs (`#i-brand-openai|anthropic|meta|qwen`) defined in `index.html`. `brandOf(id)` maps a model id to a brand.
+1. Run the project's commands once outside the agent to establish the expected exit codes.
+2. Ask the agent for a small source change and a focused test. Confirm the file tool actually succeeded and the command cards contain real output from that project directory.
+3. Temporarily make one verification script exit non-zero, then request another edit. The failure must remain visible and the final reply must not claim the project passed.
+4. Restore the script, make a further edit, and confirm a successful verification runs after the latest mutation. Treat only exit code `0` from the real command as passing; prose, diagnostics alone, or a green-looking card is insufficient.
 
-## Dark-mode parity
+Also run `npm test` and `npm run build` in `ide/` after changes to the orchestration itself.
 
-There is no in-app theme toggle; dark mode follows `prefers-color-scheme`. To force dark in a headless/automation browser, emulate the media feature over CDP (`Emulation.setEmulatedMedia` with `prefers-color-scheme: dark`) and reload. Note the emulation reverts when the CDP client disconnects, so hold the connection open while viewing, then reload the page.
+## Verify a UI task
 
-## What to verify
+In the Tauri app, have the agent start the target project's real dev server and require this sequence:
 
-- Build: `npm run build` exits 0 (Rust under `src-tauri/` is untouched by frontend work).
-- Browser console shows only Vite HMR lines — no errors.
-- Rendering, titlebar menus (File/Edit/View/Help), logo placement, and branding look correct in BOTH light and dark.
+```text
+Use browser navigate with fresh=true on the actual local URL; run browser check;
+use nodes plus click/type and assert to verify the primary interaction; then use
+screenshot at 1440x900 and 390x844 (mobile=true) to inspect desktop and mobile rendering.
+Report the URL, assertions, console/network failures, and anything not verified.
+```
+
+`browser check` should report no unexplained console or network failures. Use `nodes`/`assert` for behavior and screenshots for visual layout; a screenshot alone does not prove an interaction works. Check that text is not clipped, controls do not overlap, and the primary workflow completes at both viewport sizes.
+
+## IDE UI checklist
+
+- Browser console has no application errors.
+- File tree, tabs, Monaco, assistant cards, titlebar menus, logo, and provider glyphs render correctly.
+- Ctrl+Enter sends on Windows/Linux and Command+Enter sends on macOS; plain Enter inserts a newline.
+- Light and dark modes both work. Dark mode follows `prefers-color-scheme`; keep browser media emulation active while inspecting it.

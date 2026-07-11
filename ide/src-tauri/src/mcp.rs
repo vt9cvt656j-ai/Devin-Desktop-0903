@@ -16,6 +16,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
+const MAX_TOOL_PAGES: usize = 100;
+const MAX_TOOLS_PER_SESSION: usize = 256;
+const MAX_TOOL_METADATA_BYTES: usize = 1024 * 1024;
 
 struct Session {
     child: Child,
@@ -26,7 +29,7 @@ struct Session {
 }
 
 impl Drop for Session {
-    // Reap the child on ANY removal from the map (disconnect / same-name replace / dead-eviction /
+    // Reap the child on ANY removal from its slot (disconnect / same-name replace / dead-eviction /
     // stop_all), so a wedged or forgotten MCP server never orphans its process + reader thread.
     // Killing the child closes its stdout → the reader thread's `lines()` returns None → it exits.
     fn drop(&mut self) {
@@ -35,20 +38,41 @@ impl Drop for Session {
     }
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> =
+type SessionSlot = Arc<Mutex<Option<Session>>>;
+
+static SESSIONS: LazyLock<Mutex<HashMap<String, SessionSlot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn get_or_create_session_slot(name: &str) -> Result<SessionSlot, String> {
+    let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
+    Ok(Arc::clone(
+        guard
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    ))
+}
+
+fn find_session_slot(name: &str) -> Result<Option<SessionSlot>, String> {
+    let guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
+    Ok(guard.get(name).map(Arc::clone))
+}
 
 /// Kill + reap ALL connected MCP servers. Wired into `cleanup_stale` (webview reload) and the app
 /// Exit handler in lib.rs — same as LSP/DAP/Terminal — so MCP children never survive a reload or a
 /// quit. Drains + drops on a detached thread (each `Session::drop` does kill()+blocking wait()) so a
 /// slow-dying server can't stall the caller.
 pub fn stop_all() {
-    let drained: Vec<Session> = match SESSIONS.lock() {
+    let drained: Vec<SessionSlot> = match SESSIONS.lock() {
         Ok(mut guard) => guard.drain().map(|(_, v)| v).collect(),
         Err(_) => return,
     };
     if !drained.is_empty() {
-        std::thread::spawn(move || drop(drained));
+        std::thread::spawn(move || {
+            for slot in drained {
+                let session = slot.lock().ok().and_then(|mut session| session.take());
+                drop(session);
+            }
+        });
     }
 }
 
@@ -57,6 +81,7 @@ pub struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
+    annotations: Value,
 }
 
 impl Session {
@@ -247,6 +272,11 @@ pub async fn mcp_connect(
     cwd: Option<String>,
 ) -> Result<Vec<McpTool>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<McpTool>, String> {
+        // The global map lock is held only long enough to clone this name's slot. Holding the
+        // per-name lock through spawn + handshake serializes connect/call/disconnect for one
+        // service while unrelated MCP services continue independently.
+        let slot = get_or_create_session_slot(&name)?;
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
         let args = args.unwrap_or_default();
         let env = env.unwrap_or_default();
         let cwd = cwd.unwrap_or_default();
@@ -268,9 +298,10 @@ pub async fn mcp_connect(
         // Discover every page. Some MCP servers paginate large tool registries; silently reading
         // only page one makes the missing tools impossible for the model to call.
         let mut tools = Vec::new();
+        let mut tool_metadata_bytes = 0usize;
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
-        for _ in 0..100 {
+        for page_index in 0..MAX_TOOL_PAGES {
             let remaining = connect_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("MCP 连接超时（initialize + tools/list 超过 60s）".into());
@@ -281,20 +312,42 @@ pub async fn mcp_connect(
                 .unwrap_or_else(|| json!({}));
             let timeout = remaining.as_secs().clamp(1, 15);
             let result = session.request("tools/list", params, timeout)?;
-            tools.extend(
-                result
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            let page_tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if tools.len().saturating_add(page_tools.len()) > MAX_TOOLS_PER_SESSION {
+                return Err(format!(
+                    "MCP 工具数量超过安全上限（每个服务最多 {MAX_TOOLS_PER_SESSION} 个）"
+                ));
+            }
+            for tool in &page_tools {
+                let bytes = serde_json::to_vec(tool)
+                    .map_err(|error| format!("MCP 工具定义无法序列化: {error}"))?
+                    .len();
+                tool_metadata_bytes = tool_metadata_bytes.saturating_add(bytes);
+                if tool_metadata_bytes > MAX_TOOL_METADATA_BYTES {
+                    return Err(format!(
+                        "MCP 工具定义超过安全上限（每个服务最多 {MAX_TOOL_METADATA_BYTES} 字节）"
+                    ));
+                }
+            }
+            tools.extend(page_tools);
             let next = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
             match next {
-                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(next) if seen_cursors.insert(next.clone()) => {
+                    if page_index + 1 == MAX_TOOL_PAGES {
+                        return Err(format!(
+                            "MCP 工具分页超过安全上限（每个服务最多 {MAX_TOOL_PAGES} 页）"
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => break,
             }
         }
@@ -319,15 +372,15 @@ pub async fn mcp_connect(
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                annotations: t.get("annotations").cloned().unwrap_or_else(|| json!({})),
             });
         }
 
-        // Replace any prior session of this name (kill the old child).
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        if let Some(mut old) = guard.remove(&name) {
-            let _ = old.child.kill();
-        }
-        guard.insert(name, session);
+        // Keep the stable per-name slot in the map. In particular, disconnect never removes this
+        // slot, so an in-flight call cannot resurrect an older session after a reconnect.
+        let old = active.replace(session);
+        drop(active);
+        drop(old);
         Ok(out)
     })
     .await
@@ -406,9 +459,10 @@ fn flatten_tool_content(result: &Value) -> String {
 #[tauri::command]
 pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        let session = guard
-            .get_mut(&name)
+        let slot = find_session_slot(&name)?.ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        let session = active
+            .as_mut()
             .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
         let req = session.request(
             "tools/call",
@@ -423,7 +477,7 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
             Ok(r) => r,
             Err(e) => {
                 if dead {
-                    guard.remove(&name);
+                    active.take();
                 }
                 return Err(e);
             }
@@ -448,8 +502,11 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
 #[tauri::command]
 pub async fn mcp_status(name: String) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        let dead = match guard.get_mut(&name) {
+        let Some(slot) = find_session_slot(&name)? else {
+            return Ok(false);
+        };
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        let dead = match active.as_mut() {
             Some(session) => session
                 .child
                 .try_wait()
@@ -458,7 +515,7 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
             None => return Ok(false),
         };
         if dead {
-            guard.remove(&name);
+            active.take();
             return Ok(false);
         }
         Ok(true)
@@ -470,36 +527,53 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
 /// Disconnect and kill an MCP server session.
 #[tauri::command]
 pub async fn mcp_disconnect(name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(mut guard) = SESSIONS.lock() {
-            if let Some(mut s) = guard.remove(&name) {
-                let _ = s.child.kill();
-            }
-        }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let Some(slot) = find_session_slot(&name)? else {
+            return Ok(());
+        };
+        let session = slot
+            .lock()
+            .map_err(|_| "MCP session state poisoned")?
+            .take();
+        drop(session);
+        Ok(())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stdio_client_handles_server_requests_pagination_calls_and_disconnect() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn fixture_path() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
-            .join("mcp_fixture.mjs");
-        let session_name = format!("fixture-{}", std::process::id());
-        let tools = mcp_connect(
-            session_name.clone(),
+            .join("mcp_fixture.mjs")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn connect_fixture(
+        session_name: &str,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<Vec<McpTool>, String> {
+        mcp_connect(
+            session_name.to_string(),
             "node".into(),
-            Some(vec![fixture.to_string_lossy().into_owned()]),
-            None,
+            Some(vec![fixture_path()]),
+            env,
             Some(env!("CARGO_MANIFEST_DIR").into()),
         )
         .await
-        .expect("fixture MCP server should connect");
+    }
+
+    #[tokio::test]
+    async fn stdio_client_handles_server_requests_pagination_calls_and_disconnect() {
+        let session_name = format!("fixture-{}", std::process::id());
+        let tools = connect_fixture(&session_name, None)
+            .await
+            .expect("fixture MCP server should connect");
 
         let names = tools
             .iter()
@@ -524,6 +598,108 @@ mod tests {
         assert!(resource.contains("resource body"));
 
         mcp_disconnect(session_name.clone()).await.unwrap();
+        assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_call_does_not_block_a_different_mcp_server() {
+        let suffix = std::process::id();
+        let slow_name = format!("fixture-slow-{suffix}");
+        let fast_name = format!("fixture-fast-{suffix}");
+        let (slow_tools, fast_tools) = tokio::join!(
+            connect_fixture(&slow_name, None),
+            connect_fixture(&fast_name, None)
+        );
+        slow_tools.expect("slow fixture should connect");
+        fast_tools.expect("fast fixture should connect");
+
+        let started_path = std::env::temp_dir().join(format!("mcp-delay-started-{suffix}"));
+        let _ = std::fs::remove_file(&started_path);
+        let started_arg = started_path.to_string_lossy().into_owned();
+        let slow_session = slow_name.clone();
+        let slow_call = tokio::spawn(async move {
+            mcp_call(
+                slow_session,
+                "delay_echo".into(),
+                Some(json!({
+                    "text": "slow",
+                    "delay_ms": 1_500,
+                    "started_path": started_arg,
+                })),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("slow fixture should acknowledge the active request");
+
+        let fast = tokio::time::timeout(
+            Duration::from_millis(800),
+            mcp_call(
+                fast_name.clone(),
+                "echo".into(),
+                Some(json!({"text":"fast"})),
+            ),
+        )
+        .await
+        .expect("a different MCP service must not wait for the slow service")
+        .expect("fast fixture call should succeed");
+        assert_eq!(fast, "fast");
+        assert_eq!(slow_call.await.unwrap().unwrap(), "slow");
+
+        let (slow_disconnect, fast_disconnect) =
+            tokio::join!(mcp_disconnect(slow_name), mcp_disconnect(fast_name));
+        slow_disconnect.unwrap();
+        fast_disconnect.unwrap();
+        let _ = std::fs::remove_file(started_path);
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_reconnect_reuse_the_same_serialization_slot() {
+        let session_name = format!("fixture-reconnect-{}", std::process::id());
+        connect_fixture(&session_name, None).await.unwrap();
+        let before = find_session_slot(&session_name).unwrap().unwrap();
+
+        mcp_disconnect(session_name.clone()).await.unwrap();
+        assert!(!mcp_status(session_name.clone()).await.unwrap());
+        connect_fixture(&session_name, None).await.unwrap();
+
+        let after = find_session_slot(&session_name).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(mcp_status(session_name.clone()).await.unwrap());
+        mcp_disconnect(session_name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_rejects_an_oversized_registry() {
+        let session_name = format!("fixture-too-many-tools-{}", std::process::id());
+        let env = HashMap::from([(
+            "MCP_FIXTURE_TOOL_COUNT".to_string(),
+            (MAX_TOOLS_PER_SESSION + 1).to_string(),
+        )]);
+        let error = connect_fixture(&session_name, Some(env))
+            .await
+            .expect_err("oversized MCP registries must be rejected");
+        assert!(error.contains("工具数量超过安全上限"), "{error}");
+        assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_rejects_oversized_schema_metadata() {
+        let session_name = format!("fixture-oversized-schema-{}", std::process::id());
+        let env = HashMap::from([(
+            "MCP_FIXTURE_SCHEMA_BYTES".to_string(),
+            (MAX_TOOL_METADATA_BYTES + 1).to_string(),
+        )]);
+        let error = connect_fixture(&session_name, Some(env))
+            .await
+            .expect_err("oversized MCP schemas must be rejected");
+        assert!(error.contains("工具定义超过安全上限"), "{error}");
         assert!(!mcp_status(session_name).await.unwrap());
     }
 

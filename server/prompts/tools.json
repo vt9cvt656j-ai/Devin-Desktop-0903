@@ -935,10 +935,34 @@
     "type": "function",
     "function": {
       "name": "git_push",
-      "description": "把当前分支推送到远程(origin)。无凭据时快速失败而非卡住。涉及对外发布，一般在用户要求时才用。",
+      "description": "把当前分支推送到已配置 upstream；首次推送自动选择 origin 或唯一远端并建立 tracking。无凭据时快速失败而非卡住。涉及对外发布，只在用户要求时使用。",
       "parameters": {
         "type": "object",
         "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "git_clone",
+      "description": "用本机真实 Git 把仓库克隆到一个尚不存在的绝对目录。只支持完整 http(s)/ssh/git/file URL、受限 SCP 风格 SSH 地址或已有的绝对本地路径；不会弹交互式凭据提示。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "仓库 URL、SSH 地址或绝对本地仓库路径"
+          },
+          "target": {
+            "type": "string",
+            "description": "要创建的绝对目标目录；该路径必须尚不存在"
+          }
+        },
+        "required": [
+          "source",
+          "target"
+        ]
       }
     }
   },
@@ -1173,15 +1197,16 @@
     "type": "function",
     "function": {
       "name": "browser",
-      "description": "操控真实浏览器并返回截图、可交互节点和可见文本。支持 navigate、click、type、press、scroll、wait、eval、screenshot、design、network、inspect、nodes、assert、check、batch 和 close。优先使用 nodes 返回的节点号进行点击或填表；连续步骤可用 batch，每步都会报告成功或失败。操作后用 assert、nodes 或 check 验证状态，样式和网络问题分别用 inspect 与 network 定位。需要本机安装 Chrome、Chromium 或 Edge。",
+    "description": "操控真实浏览器并返回截图、可交互节点和可见文本。支持 navigate、viewport、click、type、press、scroll、wait、eval、screenshot、design、network、inspect、nodes、assert、check、batch 和 close。UI 交付前用 viewport 分别设置桌面与手机尺寸并各跑一次 check。优先使用 nodes 返回的节点号进行点击或填表；连续步骤可用 batch，每步都会报告成功或失败。操作后用 assert、nodes 或 check 验证状态，样式和网络问题分别用 inspect 与 network 定位。需要本机安装 Chrome、Chromium 或 Edge。",
       "parameters": {
         "type": "object",
         "properties": {
           "action": {
             "type": "string",
-            "enum": [
-              "navigate",
-              "click",
+          "enum": [
+            "navigate",
+            "viewport",
+            "click",
               "type",
               "press",
               "scroll",
@@ -1200,10 +1225,26 @@
             ],
             "description": "要执行的浏览器动作。**upload(给 <input type=file> 上传文件——自动化上传表单，需 selector 选中文件框 + path/paths 给本地文件绝对路径)**"
           },
-          "url": {
-            "type": "string",
-            "description": "navigate 用：要打开的网址"
-          },
+        "url": {
+          "type": "string",
+          "description": "navigate 用：要打开的网址"
+        },
+        "width": {
+          "type": "integer",
+          "description": "viewport 用：视口宽度，如桌面 1440、手机 390"
+        },
+        "height": {
+          "type": "integer",
+          "description": "viewport 用：视口高度，如桌面 900、手机 844"
+        },
+        "device_scale_factor": {
+          "type": "number",
+          "description": "viewport 用：设备缩放，默认 1"
+        },
+        "mobile": {
+          "type": "boolean",
+          "description": "viewport 用：是否模拟移动设备"
+        },
           "paths": {
             "type": "array",
             "description": "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path",
