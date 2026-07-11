@@ -8599,6 +8599,7 @@ async function sendPrompt(text, attachedImages = []) {
 
   // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
   const _growthBlock = growth.promptBlock(effectiveMode);
+  try { await Promise.race([_refreshFileSkills(_curRoot), new Promise((resolve) => setTimeout(resolve, 5000))]); } catch {}
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
   const fullPrompt = sysPrompt + _modelStyleTuning(config.model) + _activeSkillsBlock() + _currentDateBlock() + _authContextBlock();
@@ -9818,76 +9819,199 @@ function _initialBudget(taskText, stack) {
   return _AGENT_MAX_ITERS;
 }
 
-// --- MCP (Model Context Protocol): plug the agent into ANY external MCP server
-// listed in the workspace's .mcp.json — the same standard Claude Code / Codex /
-// Cursor use. Each server's tools are discovered once and exposed to the model as
-// `mcp__<server>__<tool>`. A server that won't start / times out is skipped (the
-// Rust client times out every call, so a bad server can't hang the agent). ---
+// --- MCP (Model Context Protocol): connect stdio MCP servers listed in the workspace's
+// .mcp.json. Each server's tools are discovered and exposed to the model as
+// `mcp__<server>__<tool>`. Connection attempts are bounded and failures stay visible. ---
 let _mcpLoaded = false;
 let _mcpConnected = []; // server names currently connected → disconnect on workspace switch
 let _mcpLoadedRoot = null;
 let _mcpConnecting = false; // a connect pass is in flight → show "连接中…" instead of "未加载"
+let _mcpLoadPromise = null;
+let _mcpLoadPromiseRoot = null;
 let _mcpToolCache = [];        // OpenAI tool schemas for the connected MCP tools
 const _mcpToolMap = new Map(); // sanitized full name -> { server, tool }
+const _mcpFailures = new Map();
+const _MCP_AGENT_WAIT_MS = 65_000;
+const _MCP_MAX_SERVERS = 16;
 
 // Tool names must match ^[a-zA-Z0-9_-]{1,64}$ for the OpenAI tool API.
-function _mcpSanitizeName(s) {
-  let n = String(s).replace(/[^a-zA-Z0-9_-]/g, "_");
-  return n.length > 64 ? n.slice(0, 64) : n;
+function _mcpNameHash(s) {
+  let h = 2166136261;
+  for (const ch of String(s)) { h ^= ch.codePointAt(0); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36).padStart(7, "0").slice(-7);
+}
+
+function _mcpPublicToolName(server, tool, usedNames) {
+  const raw = `mcp__${server}__${tool}`;
+  let clean = raw.replace(/[^a-zA-Z0-9_-]/g, "_") || "mcp_tool";
+  const used = usedNames && typeof usedNames.has === "function" ? usedNames : new Set();
+  if (clean.length <= 64 && !used.has(clean)) return clean;
+  const suffix = "_" + _mcpNameHash(raw);
+  clean = clean.slice(0, 64 - suffix.length) + suffix;
+  let candidate = clean;
+  let i = 2;
+  while (used.has(candidate)) {
+    const extra = "_" + i++;
+    candidate = clean.slice(0, 64 - extra.length) + extra;
+  }
+  return candidate;
+}
+
+function _mcpServerCwd(root, configured) {
+  const cwd = String(configured || "").trim();
+  if (!cwd) return root;
+  if (/^(?:[a-zA-Z]:[\\/]|\/)/.test(cwd)) return cwd;
+  return String(root || "").replace(/[\\/]$/, "") + "/" + cwd.replace(/^\.\//, "");
 }
 
 async function _ensureMcpTools() {
-  if (!inTauri) return;
+  if (!inTauri) return { connected: 0, tools: 0, failed: [] };
   const root = rootPath || workspaceRoots[0] || "";
-  if (_mcpLoaded && _mcpLoadedRoot === root) return; // cached for this workspace
-  // Switching workspace → disconnect the previous workspace's MCP servers first, so we
-  // don't leak their subprocesses (they were only ever cleaned up on full app exit).
-  for (const name of _mcpConnected) backend.invoke("mcp_disconnect", { name }).catch(() => {});
-  _mcpConnected = [];
-  _mcpLoaded = true; _mcpLoadedRoot = root; _mcpToolCache = []; _mcpToolMap.clear();
-  if (!root) return;
-  let cfgText = "";
-  try { cfgText = await backend.readTextFile(root + "/.mcp.json"); }
-  catch { return; } // no .mcp.json → no MCP servers, totally fine
-  let cfg;
-  try { cfg = JSON.parse(cfgText); }
-  catch { showToast("⚠️ .mcp.json 格式有误，已跳过 MCP"); return; }
-  const servers = (cfg && (cfg.mcpServers || cfg.servers)) || {};
-  const names = Object.keys(servers);
-  if (!names.length) return;
-  let total = 0; const failed = [];
-  // Connect to all servers IN PARALLEL, each with its own 10s timeout, so one
-  // slow/wedged server can't serialize-block the others or hang the agent.
-  await Promise.all(names.map(async (sname) => {
-    const s = servers[sname] || {};
-    if (!s.command) { failed.push(`${sname}: 缺 command`); return; }
+
+  if (_mcpLoadPromise) {
+    if (_mcpLoadPromiseRoot === root) return _mcpLoadPromise;
+    try { await _mcpLoadPromise; } catch {}
+    return _ensureMcpTools();
+  }
+
+  if (_mcpLoaded && _mcpLoadedRoot === root) {
+    const statuses = await Promise.all(_mcpConnected.map(async (name) => {
+      try { return await backend.invoke("mcp_status", { name }); } catch { return true; }
+    }));
+    if (statuses.every(Boolean)) {
+      return {
+        connected: _mcpConnected.length,
+        tools: _mcpToolCache.length,
+        failed: [..._mcpFailures.entries()],
+      };
+    }
+    _mcpLoaded = false;
+  }
+
+  const load = (async () => {
+    _mcpConnecting = true;
+
+    // Await disconnects before reconnecting. A late disconnect for the same name
+    // must not kill the freshly-created replacement session.
+    await Promise.all(
+      _mcpConnected.map((name) => backend.invoke("mcp_disconnect", { name }).catch(() => {})),
+    );
+    _mcpConnected = [];
+    _mcpLoaded = false;
+    _mcpLoadedRoot = root;
+    _mcpToolCache = [];
+    _mcpToolMap.clear();
+    _mcpFailures.clear();
+
+    if (!root) {
+      _mcpLoaded = true;
+      return { connected: 0, tools: 0, failed: [] };
+    }
+
+    let cfgText = "";
     try {
-      const tools = await Promise.race([
-        backend.invoke("mcp_connect", { name: sname, command: s.command, args: s.args || [], env: s.env || {}, cwd: root }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("连接超时(60s)")), 60000)), // first run downloads the pkg (npx/uvx) → 10s was far too short
-      ]);
-      for (const t of (tools || [])) {
-        if (!t || !t.name) continue;
-        const full = _mcpSanitizeName(`mcp__${sname}__${t.name}`);
-        _mcpToolMap.set(full, { server: sname, tool: t.name });
-        const schema = (t.input_schema && typeof t.input_schema === "object" && t.input_schema.type)
-          ? t.input_schema
-          : { type: "object", properties: (t.input_schema && t.input_schema.properties) || {} };
-        _mcpToolCache.push({ type: "function", function: {
-          name: full,
-          description: `[MCP·${sname}] ${t.description || t.name}`.slice(0, 1024),
-          parameters: schema,
-        } });
-        total++;
+      cfgText = await backend.readTextFile(root + "/.mcp.json");
+    } catch {
+      _mcpLoaded = true;
+      return { connected: 0, tools: 0, failed: [] };
+    }
+
+    let cfg;
+    try {
+      cfg = JSON.parse(cfgText);
+    } catch {
+      _mcpFailures.set("config", "JSON 格式错误");
+      _mcpLoaded = true;
+      showToast(".mcp.json 格式有误，MCP 未加载");
+      return { connected: 0, tools: 0, failed: [..._mcpFailures.entries()] };
+    }
+
+    const servers = (cfg && (cfg.mcpServers || cfg.servers)) || {};
+    const allNames = Object.keys(servers);
+    const names = allNames.slice(0, _MCP_MAX_SERVERS);
+    if (allNames.length > names.length) {
+      _mcpFailures.set(
+        "config",
+        `最多同时连接 ${_MCP_MAX_SERVERS} 个服务，已跳过 ${allNames.length - names.length} 个`,
+      );
+    }
+    if (!names.length) {
+      _mcpLoaded = true;
+      return { connected: 0, tools: 0, failed: [..._mcpFailures.entries()] };
+    }
+
+    const seenSourceTools = new Set();
+    await Promise.all(names.map(async (serverName) => {
+      const server = servers[serverName] || {};
+      if (!server.command) {
+        _mcpFailures.set(serverName, "缺少启动命令 command");
+        return;
       }
-      _mcpConnected.push(sname); // track so we can mcp_disconnect it on workspace switch
-    } catch (e) { failed.push(`${sname}: ${String(e?.message || e).slice(0, 80)}`); }
-  }));
-  // Parallel connects resolve in arbitrary order; sort so the tool list (part of
-  // the cached prompt prefix) is byte-stable across loads — better prompt-cache hits.
-  _mcpToolCache.sort((a, b) => (a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0));
-  if (total) showToast(`已接入 ${total} 个 MCP 工具（来自 ${names.length} 个服务）`);
-  if (failed.length) console.warn("[mcp] 部分服务未接入:", failed);
+      try {
+        const tools = await backend.invoke("mcp_connect", {
+          name: serverName,
+          command: server.command,
+          args: server.args || [],
+          env: server.env || {},
+          cwd: _mcpServerCwd(root, server.cwd),
+        });
+        for (const tool of tools || []) {
+          if (!tool || !tool.name) continue;
+          const sourceKey = `${serverName}\0${tool.name}`;
+          if (seenSourceTools.has(sourceKey)) continue;
+          seenSourceTools.add(sourceKey);
+
+          const publicName = _mcpPublicToolName(serverName, tool.name, _mcpToolMap);
+          _mcpToolMap.set(publicName, { server: serverName, tool: tool.name });
+          const schema = (tool.input_schema && typeof tool.input_schema === "object" && tool.input_schema.type)
+            ? tool.input_schema
+            : { type: "object", properties: (tool.input_schema && tool.input_schema.properties) || {} };
+          _mcpToolCache.push({
+            type: "function",
+            function: {
+              name: publicName,
+              description: `[MCP·${serverName}] ${tool.description || tool.name}`.slice(0, 1024),
+              parameters: schema,
+            },
+          });
+        }
+        _mcpConnected.push(serverName);
+      } catch (error) {
+        _mcpFailures.set(serverName, String(error?.message || error).slice(0, 160));
+      }
+    }));
+
+    _mcpToolCache.sort((a, b) => (
+      a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0
+    ));
+    _mcpConnected.sort();
+    _mcpLoaded = true;
+
+    if (_mcpConnected.length) {
+      showToast(`已连接 ${_mcpConnected.length} 个 MCP 服务，发现 ${_mcpToolCache.length} 个工具`);
+    }
+    if (_mcpFailures.size) {
+      console.warn("[mcp] 部分服务未接入:", [..._mcpFailures.entries()]);
+      showToast(`MCP：${_mcpFailures.size} 个连接或配置问题，可在服务面板查看`);
+    }
+    return {
+      connected: _mcpConnected.length,
+      tools: _mcpToolCache.length,
+      failed: [..._mcpFailures.entries()],
+    };
+  })();
+
+  _mcpLoadPromise = load;
+  _mcpLoadPromiseRoot = root;
+  try {
+    return await load;
+  } finally {
+    if (_mcpLoadPromise === load) {
+      _mcpLoadPromise = null;
+      _mcpLoadPromiseRoot = null;
+    }
+    _mcpConnecting = false;
+  }
 }
 
 // ===== Chat-tabbar tool panels: Skills (reusable prompts) + MCP (server manager) =====
@@ -9917,6 +10041,9 @@ const _SKILLS_KEY = "michael-ide.skills.v1";
 // the system prompt of every send until toggled OFF. Multiple can be active. Persisted across sessions.
 const _ACTIVE_SKILLS_KEY = "michael-ide.skills.active.v1";
 let _activeSkillIds = (() => { try { const a = JSON.parse(localStorage.getItem(_ACTIVE_SKILLS_KEY) || "[]"); return new Set(Array.isArray(a) ? a : []); } catch { return new Set(); } })();
+let _fileSkills = [];
+let _fileSkillsCacheKey = "";
+let _fileSkillsLoadedAt = 0;
 function _saveActiveSkills() { try { localStorage.setItem(_ACTIVE_SKILLS_KEY, JSON.stringify([..._activeSkillIds])); } catch {} }
 function _isSkillActive(id) { return !!id && _activeSkillIds.has(id); }
 function _toggleSkillActive(id) { if (!id) return; if (_activeSkillIds.has(id)) _activeSkillIds.delete(id); else _activeSkillIds.add(id); _saveActiveSkills(); _updateSkillBadge(); }
@@ -9925,12 +10052,29 @@ function _toggleSkillActive(id) { if (!id) return; if (_activeSkillIds.has(id)) 
 function _activeSkillsBlock() {
   try {
     if (!_activeSkillIds.size) return "";
-    const active = _loadSkillsLocal().filter((s) => s && _activeSkillIds.has(s.id) && String(s.prompt || "").trim());
+    const byId = new Map();
+    for (const skill of [..._loadSkillsLocal(), ..._fileSkills]) if (skill && skill.id) byId.set(skill.id, skill);
+    const active = [...byId.values()].filter((s) => _activeSkillIds.has(s.id) && String(s.prompt || "").trim());
     if (!active.length) return "";
     let out = "\n\n# 已启用的技能（用户手动开启，本次对话请始终遵循这些指令）\n";
-    active.forEach((s, i) => { out += `\n## 技能 ${i + 1}：${s.name || "未命名"}\n${String(s.prompt).trim()}\n`; });
+    active.forEach((s, i) => {
+      out += `\n## 技能 ${i + 1}：${s.name || "未命名"}\n`;
+      if (s.sourcePath) out += `来源文件：${s.sourcePath}\n相对资源目录：${s.baseDir || parentDir(s.sourcePath)}\n`;
+      out += String(s.prompt).trim() + "\n";
+    });
     return out;
   } catch { return ""; }
+}
+
+// L0 removes the bundled local system prompt and asks the gateway to restore it. User-authored
+// skill instructions are dynamic and unknown to the gateway, so preserve them as a separate
+// system message instead of accidentally stripping them with the private static prompt.
+function _l0MessagesWithSkills(messages, skillsBlock) {
+  const source = Array.isArray(messages) ? messages : [];
+  const out = source[0] && source[0].role === "system" ? source.slice(1) : source.slice();
+  const skillText = String(skillsBlock || "").trim();
+  if (skillText) out.unshift({ role: "system", content: skillText });
+  return out;
 }
 // Count badge on the Skills sidebar button so active skills are visible even when the panel is closed.
 function _updateSkillBadge() {
@@ -10028,6 +10172,88 @@ function _skillImgFromFile(file) {
 }
 function _loadSkillsLocal() { try { const a = JSON.parse(localStorage.getItem(_SKILLS_KEY) || "null"); if (Array.isArray(a)) return a; } catch {} return []; }
 function _saveSkillsLocal(list) { try { localStorage.setItem(_SKILLS_KEY, JSON.stringify(list)); } catch {} }
+
+function _parseSkillDocument(text, sourcePath) {
+  const prompt = String(text || "").trim();
+  if (!prompt) return null;
+  const normalizedPath = String(sourcePath || "").replace(/\\/g, "/");
+  const parts = normalizedPath.split("/").filter(Boolean);
+  let name = parts.length > 1 ? parts[parts.length - 2] : "Skill";
+  let desc = "";
+  const frontmatter = prompt.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/);
+  if (frontmatter) {
+    for (const line of frontmatter[1].split("\n")) {
+      const match = line.match(/^\s*(name|description)\s*:\s*(.*?)\s*$/i);
+      if (!match) continue;
+      const value = match[2].replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, (_, a, b) => a ?? b ?? "").trim();
+      if (match[1].toLowerCase() === "name" && value) name = value;
+      if (match[1].toLowerCase() === "description" && value) desc = value;
+    }
+  }
+  if (!desc) {
+    const heading = prompt.match(/^#\s+(.+?)\s*$/m);
+    desc = heading ? heading[1].trim() : "标准 SKILL.md";
+  }
+  return {
+    id: `file:${normalizedPath}`,
+    name: name.slice(0, 80),
+    desc: desc.slice(0, 240),
+    prompt,
+    sourcePath: normalizedPath,
+    baseDir: normalizedPath.slice(0, normalizedPath.lastIndexOf("/")) || ".",
+    _readonly: true,
+  };
+}
+
+async function _refreshFileSkills(root) {
+  if (!inTauri) { _fileSkills = []; _fileSkillsCacheKey = ""; return _fileSkills; }
+  let home = "";
+  try { home = await backend.homeDir(); } catch {}
+  const projectRoot = String(root || "").replace(/\/$/, "");
+  const cacheKey = projectRoot + "\0" + home;
+  if (_fileSkillsCacheKey === cacheKey && Date.now() - _fileSkillsLoadedAt < 5000) return _fileSkills;
+  const bases = [...new Set([
+    projectRoot && projectRoot + "/.agents/skills",
+    projectRoot && projectRoot + "/.codex/skills",
+    projectRoot && projectRoot + "/.claude/skills",
+    home && home + "/.agents/skills",
+    home && home + "/.codex/skills",
+    home && home + "/.claude/skills",
+  ].filter(Boolean))];
+  const found = [];
+  const seen = new Set();
+  const visit = async (dir, depth) => {
+    if (found.length >= 64 || seen.has(dir)) return;
+    seen.add(dir);
+    try {
+      const text = await backend.readTextFile(dir + "/SKILL.md");
+      if (String(text || "").length <= 256_000) {
+        const skill = _parseSkillDocument(text, dir + "/SKILL.md");
+        if (skill) found.push(skill);
+      }
+    } catch {}
+    if (depth <= 0 || found.length >= 64) return;
+    let entries = [];
+    try { entries = await backend.readDir(dir); } catch { return; }
+    for (const entry of entries) {
+      if (found.length >= 64) break;
+      if (entry && entry.is_dir && entry.name && entry.name !== "node_modules" && entry.name !== "target") {
+        await visit(entry.path || (dir + "/" + entry.name), depth - 1);
+      }
+    }
+  };
+  await Promise.all(bases.map((base) => visit(base, 2)));
+  _fileSkills = found.sort((a, b) => a.name.localeCompare(b.name));
+  _fileSkillsCacheKey = cacheKey;
+  _fileSkillsLoadedAt = Date.now();
+  const validFileIds = new Set(_fileSkills.map((skill) => skill.id));
+  let pruned = false;
+  for (const id of [..._activeSkillIds]) {
+    if (String(id).startsWith("file:") && !validFileIds.has(id)) { _activeSkillIds.delete(id); pruned = true; }
+  }
+  if (pruned) { _saveActiveSkills(); _updateSkillBadge(); }
+  return _fileSkills;
+}
 // Sync skills to the account server when logged in; localStorage stays the offline cache / fallback.
 async function _skillsApi(method, body) {
   let token = ""; try { token = localStorage.getItem("michael_token") || ""; } catch {}
@@ -10064,23 +10290,26 @@ function _useSkill(skill) {
 async function openSkillsPanel() {
   const m = _chatToolModal({ title: "Skills · 技能", icon: _ICON_SKILLS });
   let editing = null, skills = [];
-  const persist = () => { _saveSkills(skills); }; // fire-and-forget local + server sync
+  const persist = () => { _saveSkills(skills.filter((skill) => !skill._readonly)); }; // file skills stay read-only
   m.body.innerHTML = `<div class="ctp-loading">加载中…</div>`;
-  skills = await _loadSkills();
+  const customSkills = await _loadSkills();
+  await _refreshFileSkills(rootPath || workspaceRoots[0] || "");
+  skills = [..._fileSkills, ...customSkills];
   const renderList = () => {
     m.body.innerHTML = "";
     const intro = document.createElement("p"); intro.className = "ctp-intro";
-    intro.textContent = "把常用指令存成技能。点「使用」把技能注入到对话（像 Claude Code 的 skill——启用后它的指令会自动加进每次对话）。可同时启用多个，点「取消使用」关掉。登录后会自动同步到你的账号。";
+    intro.textContent = "启用后的技能指令会进入每次模型请求，并传给 Agent 子任务。这里既支持自定义技能，也会发现项目和用户目录中 .agents/.codex/.claude/skills 下的 SKILL.md；文件型技能保持只读。登录后自定义技能会同步到账号。";
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
     if (!skills.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有技能。点下面「新建技能」创建你自己的。"; list.appendChild(e); }
     skills.forEach((s, i) => {
       const on = _isSkillActive(s.id);
+      const readonly = !!s._readonly;
       const row = document.createElement("div"); row.className = "skill-row" + (on ? " is-active" : "");
       row.innerHTML =
         `<span class="skill-row__icon">${_skillIconMarkup(s.icon)}</span>` +
         `<div class="skill-row__main"><div class="skill-row__name"></div><div class="skill-row__desc"></div></div>` +
-        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消使用" : "使用"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
+        `<div class="ctp-rowbtns"><button class="ctp-btn ${on ? "ctp-btn--on" : "ctp-btn--primary"} _use" type="button">${on ? "取消使用" : "使用"}</button><button class="ctp-iconbtn _edit" type="button" title="查看" aria-label="查看">${_ICON_EYE}</button>${readonly ? "" : `<button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button>`}</div>`;
       row.querySelector(".skill-row__name").textContent = s.name || "(未命名)";
       row.querySelector(".skill-row__desc").textContent = s.desc || (s.prompt || "").slice(0, 64);
       // 使用 = toggle this skill's injection into the prompt (Claude Code-style). Multiple can be active.
@@ -10090,7 +10319,7 @@ async function openSkillsPanel() {
         renderList();
       });
       row.querySelector("._edit").addEventListener("click", () => { editing = { ...s, _idx: i }; renderForm(); });
-      row.querySelector("._del").addEventListener("click", () => { if (s.id) { _activeSkillIds.delete(s.id); _saveActiveSkills(); _updateSkillBadge(); } skills.splice(i, 1); persist(); renderList(); });
+      row.querySelector("._del")?.addEventListener("click", () => { if (s.id) { _activeSkillIds.delete(s.id); _saveActiveSkills(); _updateSkillBadge(); } skills.splice(i, 1); persist(); renderList(); });
       list.appendChild(row);
     });
     m.body.appendChild(list);
@@ -10122,6 +10351,7 @@ async function openSkillsPanel() {
   };
   const renderForm = () => {
     const e = editing;
+    const readonly = !!e._readonly;
     const isImg = typeof e.icon === "string" && e.icon.slice(0, 5) === "data:";
     let curIcon = isImg ? "sparkles" : (e.icon || "sparkles");
     let curImg = isImg ? e.icon : "";   // user-uploaded image (data URL) or ""
@@ -10132,8 +10362,9 @@ async function openSkillsPanel() {
       `<label class="ctp-lbl">名称</label><input class="ctp-input _name" placeholder="例如：代码审查" />` +
       `<label class="ctp-lbl">图标</label><div class="skill-iconpick"></div>` +
       `<label class="ctp-lbl">简介（可选）</label><input class="ctp-input _desc" placeholder="一句话说明这个技能" />` +
-      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="5" placeholder="点「使用」时填入对话框的完整指令…"></textarea>` +
-      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存</button></div>`;
+      `${e.sourcePath ? `<div class="ctp-intro">来源：<code>${_escHtml(e.sourcePath)}</code></div>` : ""}` +
+      `<label class="ctp-lbl">指令内容</label><textarea class="ctp-textarea _prompt" rows="8" placeholder="启用后注入模型的完整指令…"></textarea>` +
+      `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">${readonly ? "返回" : "取消"}</button>${readonly ? "" : `<button class="ctp-btn ctp-btn--primary _save" type="button">保存</button>`}</div>`;
     m.body.appendChild(form);
     const pick = form.querySelector(".skill-iconpick");
     const fileInput = document.createElement("input");
@@ -10166,8 +10397,9 @@ async function openSkillsPanel() {
     form.querySelector("._name").value = e.name || "";
     form.querySelector("._desc").value = e.desc || "";
     form.querySelector("._prompt").value = e.prompt || "";
+    if (readonly) form.querySelectorAll("input,textarea,button.skill-upload").forEach((element) => { element.disabled = true; });
     form.querySelector("._cancel").addEventListener("click", () => { editing = null; renderList(); });
-    form.querySelector("._save").addEventListener("click", () => {
+    form.querySelector("._save")?.addEventListener("click", () => {
       const name = form.querySelector("._name").value.trim();
       const prompt = form.querySelector("._prompt").value.trim();
       if (!name || !prompt) { showToast("请填写名称和指令内容"); return; }
@@ -10180,9 +10412,9 @@ async function openSkillsPanel() {
   renderList();
 }
 
-// Common MCP servers for one-click add (fills the form; user reviews args/token then saves).
-// Real, current MCP servers (verified 2026-07). npx = Node, uvx = Python (needs `uv`). Env keys are
-// shown blank in the form for the user to fill. Grouped like Claude Code's list.
+// Common stdio MCP presets for one-click add (the user reviews args/token before saving).
+// External package names and authentication requirements can change; the live connection status
+// is the source of truth. npx = Node, uvx = Python (needs `uv`).
 const _MCP_PRESETS = [
   // —— 官方参考服务（github.com/modelcontextprotocol/servers）——
   { group: "官方参考服务", name: "filesystem", desc: "读写本地文件（可配目录白名单）", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] },
@@ -10203,7 +10435,7 @@ const _MCP_PRESETS = [
   { group: "常见集成", name: "slack", desc: "Slack 收发消息 / 频道（需 Token）", command: "npx", args: ["-y", "@modelcontextprotocol/server-slack"], env: { SLACK_BOT_TOKEN: "", SLACK_TEAM_ID: "" } },
   { group: "常见集成", name: "google-maps", desc: "Google 地图 / 地理编码（需 API Key）", command: "npx", args: ["-y", "@modelcontextprotocol/server-google-maps"], env: { GOOGLE_MAPS_API_KEY: "" } },
   // —— 热门社区服务 ——
-  { group: "热门社区", name: "playwright", desc: "Playwright 浏览器自动化（微软官方）", command: "npx", args: ["@playwright/mcp@latest"] },
+  { group: "热门社区", name: "playwright", desc: "Playwright 浏览器自动化（微软官方）", command: "npx", args: ["-y", "@playwright/mcp@latest"] },
   { group: "热门社区", name: "context7", desc: "拉取库 / 框架的最新官方文档（Upstash）", command: "npx", args: ["-y", "@upstash/context7-mcp"] },
   { group: "热门社区", name: "firecrawl", desc: "Firecrawl 网页抓取 / 爬取（需 API Key）", command: "npx", args: ["-y", "firecrawl-mcp"], env: { FIRECRAWL_API_KEY: "" } },
   { group: "热门社区", name: "tavily", desc: "Tavily 联网搜索 / 抓取 / 研究（需 API Key）", command: "npx", args: ["-y", "tavily-mcp"], env: { TAVILY_API_KEY: "" } },
@@ -10269,24 +10501,27 @@ async function openMcpPanel() {
     const names = Object.keys(servers);
     m.body.innerHTML = "";
     const intro = document.createElement("div"); intro.className = "ctp-intro";
-    intro.innerHTML = `接入外部 MCP 服务（与 Claude Code / Cursor 同一标准），其工具会以 <code>mcp__服务__工具</code> 提供给智能体。配置存于 <code>.mcp.json</code>。`;
+    intro.innerHTML = `接入本地 stdio MCP 服务，完成握手和工具发现后，其工具会以 <code>mcp__服务__工具</code> 提供给智能体。配置存于 <code>.mcp.json</code>；面板状态来自实际连接结果。`;
     m.body.appendChild(intro);
     const list = document.createElement("div"); list.className = "ctp-list";
     names.forEach((name) => {
       const s = servers[name] || {};
       const connected = _mcpConnected.includes(name);
+      const failure = _mcpFailures.get(name) || "";
       const toolNames = [..._mcpToolMap.values()].filter((v) => v.server === name).map((v) => v.tool);
       const toolCount = toolNames.length;
+      const statusText = connected ? toolCount + " 个工具 ▾" : (_mcpConnecting ? "连接中…" : (failure ? "连接失败" : (_mcpLoaded ? "未连接" : "未加载")));
       const item = document.createElement("div"); item.className = "mcp-item";
       const row = document.createElement("div"); row.className = "mcp-row";
       row.innerHTML =
-        `<span class="mcp-row__dot ${connected ? "is-on" : ""}"></span>` +
+        `<span class="mcp-row__dot ${connected ? "is-on" : (failure ? "is-error" : "")}"></span>` +
         `<div class="mcp-row__main"><div class="mcp-row__name"></div><div class="mcp-row__cmd"></div></div>` +
-        `<span class="mcp-row__tag${connected ? " is-on" : ""}${connected && toolCount ? " is-clickable" : ""}">${connected ? toolCount + " 个工具 ▾" : (_mcpConnecting ? "连接中…" : (_mcpLoaded ? "未连接" : "未加载"))}</span>` +
+        `<span class="mcp-row__tag${connected ? " is-on" : ""}${failure ? " is-error" : ""}${connected && toolCount ? " is-clickable" : ""}">${statusText}</span>` +
         `<div class="ctp-rowbtns"><button class="ctp-iconbtn _edit" type="button" title="编辑" aria-label="编辑">${_ICON_PENCIL}</button><button class="ctp-iconbtn ctp-iconbtn--danger _del" type="button" title="删除" aria-label="删除">${_ICON_TRASH}</button></div>`;
       row.querySelector(".mcp-row__name").textContent = name;
       row.querySelector(".mcp-row__cmd").textContent = [s.command, ...((s.args) || [])].join(" ");
-      row.querySelector("._edit").addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, _orig: name }; renderForm(); });
+      if (failure) row.querySelector(".mcp-row__tag").title = failure;
+      row.querySelector("._edit").addEventListener("click", () => { editing = { name, command: s.command || "", args: s.args || [], env: s.env || {}, cwd: s.cwd || "", _orig: name }; renderForm(); });
       row.querySelector("._del").addEventListener("click", async () => {
         const c = await readCfg(); const sv = c.mcpServers || c.servers || {}; delete sv[name]; c.mcpServers = sv; delete c.servers;
         await writeCfg(c); backend.invoke("mcp_disconnect", { name }).catch(() => {});
@@ -10312,7 +10547,7 @@ async function openMcpPanel() {
         `<button class="ctp-btn ctp-btn--sm _add" type="button">＋ 添加</button>`;
       row.querySelector(".mcp-row__name").textContent = p.name;
       row.querySelector(".mcp-row__cmd").textContent = p.desc;
-      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, _orig: "" }; renderForm(); });
+      row.querySelector("._add").addEventListener("click", () => { editing = { name: p.name, command: p.command, args: p.args || [], env: p.env || {}, cwd: p.cwd || "", _orig: "" }; renderForm(); });
       list.appendChild(row);
     });
     if (!list.children.length) { const e = document.createElement("div"); e.className = "ctp-empty"; e.textContent = "还没有 MCP 服务，点下面「添加服务」自定义一个。"; list.appendChild(e); }
@@ -10321,7 +10556,7 @@ async function openMcpPanel() {
     const reBtn = document.createElement("button"); reBtn.className = "ctp-btn"; reBtn.type = "button"; reBtn.textContent = "↻ 重新连接";
     reBtn.addEventListener("click", async () => { reBtn.disabled = true; reBtn.textContent = "连接中…"; _mcpLoaded = false; await _ensureMcpTools(); renderList(); });
     const addBtn = document.createElement("button"); addBtn.className = "ctp-btn ctp-btn--primary"; addBtn.type = "button"; addBtn.textContent = "＋ 添加服务";
-    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, _orig: "" }; renderForm(); });
+    addBtn.addEventListener("click", () => { editing = { name: "", command: "", args: [], env: {}, cwd: "", _orig: "" }; renderForm(); });
     foot.append(reBtn, addBtn);
     m.body.appendChild(foot);
   };
@@ -10333,12 +10568,14 @@ async function openMcpPanel() {
       `<label class="ctp-lbl">服务名（英文/数字）</label><input class="ctp-input _name" placeholder="例如：filesystem" />` +
       `<label class="ctp-lbl">启动命令</label><input class="ctp-input _cmd" placeholder="例如：npx" />` +
       `<label class="ctp-lbl">参数（每行一个）</label><textarea class="ctp-textarea _args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;."></textarea>` +
+      `<label class="ctp-lbl">工作目录（可选，相对工作区或绝对路径）</label><input class="ctp-input _cwd" placeholder="例如：packages/api" />` +
       `<label class="ctp-lbl">环境变量（KEY=VALUE，每行一个，可选）</label><textarea class="ctp-textarea _env" rows="2" placeholder="API_KEY=xxxx"></textarea>` +
       `<div class="ctp-foot"><button class="ctp-btn _cancel" type="button">取消</button><button class="ctp-btn ctp-btn--primary _save" type="button">保存并连接</button></div>`;
     m.body.appendChild(form);
     form.querySelector("._name").value = e.name || "";
     form.querySelector("._cmd").value = e.command || "";
     form.querySelector("._args").value = (e.args || []).join("\n");
+    form.querySelector("._cwd").value = e.cwd || "";
     form.querySelector("._env").value = Object.entries(e.env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
     // Show WHERE to get the key/token for env vars we know about (clickable → opens in the browser).
     const _keyLinks = Object.keys(e.env || {}).filter((k) => _MCP_KEY_URLS[k]);
@@ -10359,13 +10596,14 @@ async function openMcpPanel() {
       const command = form.querySelector("._cmd").value.trim();
       if (!name || !command) { showToast("请填写服务名和启动命令"); return; }
       const args = form.querySelector("._args").value.split("\n").map((x) => x.trim()).filter(Boolean);
+      const cwd = form.querySelector("._cwd").value.trim();
       const env = {};
       form.querySelector("._env").value.split("\n").map((x) => x.trim()).filter((l) => l.includes("=")).forEach((l) => {
         const k = l.slice(0, l.indexOf("=")).trim(); if (k) env[k] = l.slice(l.indexOf("=") + 1).trim();
       });
       const c = await readCfg(); const sv = c.mcpServers || c.servers || {};
       if (e._orig && e._orig !== name) delete sv[e._orig];
-      sv[name] = { command, ...(args.length ? { args } : {}), ...(Object.keys(env).length ? { env } : {}) };
+      sv[name] = { command, ...(args.length ? { args } : {}), ...(Object.keys(env).length ? { env } : {}), ...(cwd ? { cwd } : {}) };
       c.mcpServers = sv; delete c.servers;
       await writeCfg(c);
       editing = null;
@@ -13672,7 +13910,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
       }
     }, 1000);
     try {
-      // L0（防逆向，默认关）：把模式名 + 静态工具名交给网关，请求里剥掉系统提示词和静态
+      // L0（防逆向，默认开）：把模式名 + 静态工具名交给网关，请求里剥掉静态系统提示词和工具
       // schema；MCP/运行时工具（不在网关目录）仍随 body 走，绝不丢。开关关→零行为变化。
       let _l0Msgs = messages, _l0Tools = toolSchemas;
       delete _turnConfig.ideMode; delete _turnConfig.ideTools;
@@ -13685,7 +13923,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
         _turnConfig.ideMode = ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
-        _l0Msgs = (messages[0] && messages[0].role === "system") ? messages.slice(1) : messages;
+        _l0Msgs = _l0MessagesWithSkills(messages, _activeSkillsBlock());
       }
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
         _lastEvAt = Date.now(); // 任何事件都复位心跳计时
@@ -13951,7 +14189,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
 
   const sysPrompt = (write
     ? _WORKER_SYSTEM + `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`
-    : _SUBAGENT_SYSTEM) + _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
+    : _SUBAGENT_SYSTEM) + _activeSkillsBlock() + _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
   // Context IN: prepend the shared run-context digest so this child stands on what the main
   // agent already learned/did (真·上下文协议) instead of re-investigating from zero.
   const _shared = _sharedCtxDigest(run && run.ctx);
@@ -14748,7 +14986,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Connect external MCP servers (cached), but HARD-BOUNDED so a wedged/slow
   // server in .mcp.json can never hang the whole run (this was a real freeze).
   if (isAgent) {
-    try { await Promise.race([_ensureMcpTools(), new Promise((r) => setTimeout(r, 12000))]); } catch {}
+    try { await Promise.race([_ensureMcpTools(), new Promise((r) => setTimeout(r, _MCP_AGENT_WAIT_MS))]); } catch {}
   }
   // 按需加载：只发核心集 + search_tools + 任务命中的延迟簇（省 ~30k tokens/请求、
   // 还提准确率）。全量注册表挂在 run 上，search_tools 命中后把 schema 追加进
@@ -18502,9 +18740,11 @@ async function _executeToolStep(step, call, root, run) {
       if (!call.server || !call.tool) { res.className = "atc-result atc-result--err"; res.textContent = "未知工具"; return { type: "mcp", path: call.mcpName || label, content: `[失败] 未知或未连接的 MCP 工具 ${call.mcpName || label}。确认 .mcp.json 里的服务已连上。` }; }
       try {
         const out = await _invokeCapped("mcp_call", { name: call.server, tool: call.tool, args: call.args || {} }, 60_000, `MCP ${label}`);
+        const raw = String(out == null || out === "" ? "(空结果)" : out);
+        const content = raw.length > 8000 ? raw.slice(0, 8000) + `\n[结果已截断：原始 ${raw.length} 字符]` : raw;
         res.className = "atc-result atc-result--ok"; res.textContent = "完成";
-        if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || "").slice(0, 4000))}</pre>`;
-        return { type: "mcp", path: label, content: String(out == null || out === "" ? "(空结果)" : out).slice(0, 8000) };
+        if (vp) vp.innerHTML = `<pre>${_escHtml(raw.slice(0, 4000))}</pre>`;
+        return { type: "mcp", path: label, content };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 280);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";

@@ -192,6 +192,7 @@ pub fn run() {
             db::db_query,
             mcp::mcp_connect,
             mcp::mcp_call,
+            mcp::mcp_status,
             mcp::mcp_disconnect,
             capture::capture_url,
             capture::capture_url_frames,

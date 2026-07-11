@@ -45,7 +45,7 @@ function isRegexPos(s, i) {
   return /(?:^|[^\w$])(return|typeof|case|in|of|do|else|void|delete|instanceof|yield|await)$/.test(s.slice(Math.max(0, j - 12), j + 1));
 }
 function extractFn(name) {
-  const m = new RegExp(`function\\s+${name}\\s*\\(`).exec(SRC);
+  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
   if (!m) throw new Error(`function ${name} not found in main.js`);
   let i = SRC.indexOf("{", m.index), depth = 0;
   for (; i < SRC.length; i++) {
@@ -176,6 +176,100 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(directoryDescription, /developer_community_search/);
   assert.match(directoryDescription, /当前支持/);
   assert.doesNotMatch(directoryDescription, /100%|十倍|全球最大|所有公开仓库|全部免费|秒回|绝不会丢/);
+});
+
+test("active Skills survive L0 prompt stripping and are inherited by child work", () => {
+  const activeSkillsBlock = load("_activeSkillsBlock", {
+    _activeSkillIds: new Set(["review"]),
+    _fileSkills: [],
+    _loadSkillsLocal: () => [
+      { id: "review", name: "Strict review", prompt: "Run tests before reporting success." },
+      { id: "deploy", name: "Deploy", prompt: "Deploy immediately." },
+    ],
+  });
+  const skillText = activeSkillsBlock();
+  assert.match(skillText, /Strict review/);
+  assert.match(skillText, /Run tests before reporting success/);
+  assert.doesNotMatch(skillText, /Deploy immediately/);
+
+  const preserve = load("_l0MessagesWithSkills");
+  const messages = preserve([
+    { role: "system", content: "private bundled prompt" },
+    { role: "user", content: "review this" },
+  ], skillText);
+  assert.equal(messages[0].role, "system");
+  assert.match(messages[0].content, /Strict review/);
+  assert.equal(messages[1].content, "review this");
+  assert.ok(!messages.some((message) => message.content.includes("private bundled prompt")));
+  assert.match(SRC, /_SUBAGENT_SYSTEM\) \+ _activeSkillsBlock\(\) \+ _currentDateBlock/);
+});
+
+test("standard SKILL.md frontmatter is parsed with a stable source identity", () => {
+  const parse = load("_parseSkillDocument");
+  const skill = parse(`---\nname: "Release verifier"\ndescription: 'Runs release checks'\n---\n# Instructions\nRun the full test suite.`, "/repo/.agents/skills/release/SKILL.md");
+  assert.equal(skill.id, "file:/repo/.agents/skills/release/SKILL.md");
+  assert.equal(skill.name, "Release verifier");
+  assert.equal(skill.desc, "Runs release checks");
+  assert.equal(skill.baseDir, "/repo/.agents/skills/release");
+  assert.equal(skill._readonly, true);
+  assert.match(skill.prompt, /Run the full test suite/);
+  assert.match(SRC, /\.agents\/skills/);
+  assert.match(SRC, /\.codex\/skills/);
+  assert.match(SRC, /\.claude\/skills/);
+});
+
+test("workspace SKILL.md discovery reads a real skill directory", async () => {
+  const parse = load("_parseSkillDocument");
+  const backend = {
+    homeDir: async () => "/home/tester",
+    readTextFile: async (path) => {
+      if (path === "/repo/.agents/skills/release/SKILL.md") return "---\nname: Release\ndescription: Verify releases\n---\nRun tests.";
+      throw new Error("missing");
+    },
+    readDir: async (path) => {
+      if (path === "/repo/.agents/skills") return [{ name: "release", path: "/repo/.agents/skills/release", is_dir: true }];
+      return [];
+    },
+  };
+  const refresh = load("_refreshFileSkills", {
+    inTauri: true,
+    backend,
+    _fileSkills: [],
+    _fileSkillsCacheKey: "",
+    _fileSkillsLoadedAt: 0,
+    _parseSkillDocument: parse,
+    _activeSkillIds: new Set(),
+    _saveActiveSkills: () => {},
+    _updateSkillBadge: () => {},
+  });
+  const found = await refresh("/repo");
+  assert.equal(found.length, 1);
+  assert.equal(found[0].name, "Release");
+  assert.equal(found[0].sourcePath, "/repo/.agents/skills/release/SKILL.md");
+});
+
+test("MCP public tool names stay valid and collision-free", () => {
+  const hash = load("_mcpNameHash");
+  const publicName = load("_mcpPublicToolName", { _mcpNameHash: hash });
+  const used = new Set();
+  const first = publicName("filesystem", "read-file", used);
+  used.add(first);
+  const duplicate = publicName("filesystem", "read-file", used);
+  const longA = publicName("a".repeat(40), "tool-" + "x".repeat(80), used);
+  used.add(longA);
+  const longB = publicName("a".repeat(40), "tool-" + "y".repeat(80), used);
+
+  for (const name of [first, duplicate, longA, longB]) {
+    assert.match(name, /^[a-zA-Z0-9_-]{1,64}$/);
+  }
+  assert.notEqual(first, duplicate);
+  assert.notEqual(longA, longB);
+  assert.match(SRC, /backend\.invoke\("mcp_status", \{ name \}\)/);
+  assert.match(SRC, /_MCP_AGENT_WAIT_MS/);
+  const cwd = load("_mcpServerCwd");
+  assert.equal(cwd("/repo", "packages/api"), "/repo/packages/api");
+  assert.equal(cwd("/repo", "/tmp/service"), "/tmp/service");
+  assert.equal(cwd("C:\\repo", "tools"), "C:\\repo/tools");
 });
 
 test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上下文协议)", () => {

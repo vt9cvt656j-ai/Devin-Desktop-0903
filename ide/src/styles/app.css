@@ -535,7 +535,9 @@ body.is-tauri.is-mac .titlebar {
 .ctp-rowbtns { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
 .mcp-row__dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); opacity: .35; flex-shrink: 0; }
 .mcp-row__dot.is-on { background: #34a853; opacity: 1; box-shadow: 0 0 0 3px rgba(52,168,83,.18); }
+.mcp-row__dot.is-error { background: #d93025; opacity: 1; box-shadow: 0 0 0 3px rgba(217,48,37,.14); }
 .mcp-row__tag { font-size: 11px; color: var(--text-dim); white-space: nowrap; flex-shrink: 0; padding: 2px 9px; border-radius: 999px; background: var(--hover); }
+.mcp-row__tag.is-error { color: #b3261e; background: rgba(217,48,37,.1); }
 /* MCP catalog: available (not-yet-added) servers as full-width rows, like Claude Code's list. */
 .mcp-row--avail .mcp-row__cmd { font-family: inherit; }
 .ctp-btn--sm { padding: 6px 15px; font-size: 13px; flex-shrink: 0; }
