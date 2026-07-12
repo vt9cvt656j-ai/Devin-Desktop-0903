@@ -7,6 +7,8 @@ use std::time::Duration;
 
 const NOMINATIM_SEARCH_URL: &str = "https://nominatim.openstreetmap.org/search";
 const NOMINATIM_REVERSE_URL: &str = "https://nominatim.openstreetmap.org/reverse";
+const ARCGIS_GEOCODE_URL: &str =
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
 const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
 const OPEN_METEO_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -17,6 +19,7 @@ const MIN_RADIUS_M: u32 = 100;
 const MAX_RADIUS_M: u32 = 20_000;
 const DEFAULT_LIMIT: u32 = 12;
 const MAX_LIMIT: u32 = 30;
+const ARCGIS_MIN_MATCH_SCORE: f64 = 90.0;
 
 static HTTP: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
@@ -91,6 +94,9 @@ pub struct SourceStatus {
     pub status: SourceState,
     pub result_count: usize,
     pub detail: String,
+    /// Provider dataset/snapshot timestamp when the response exposes one. This
+    /// is not necessarily the observation or verification time of an item.
+    pub data_as_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -121,6 +127,12 @@ struct NominatimHit {
     display_name: String,
     lat: String,
     lon: String,
+    address: Option<NominatimAddress>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NominatimAddress {
+    house_number: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,10 +141,68 @@ struct NominatimReverse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ArcgisGeocodeResponse {
+    #[serde(default)]
+    candidates: Vec<ArcgisCandidate>,
+    error: Option<ArcgisServiceError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArcgisCandidate {
+    address: String,
+    location: ArcgisLocation,
+    score: f64,
+    attributes: ArcgisAttributes,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArcgisLocation {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArcgisAttributes {
+    #[serde(rename = "Match_addr")]
+    match_address: Option<String>,
+    #[serde(rename = "Addr_type")]
+    address_type: Option<String>,
+    #[serde(rename = "AddNum")]
+    address_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArcgisServiceError {
+    code: Option<i64>,
+    message: Option<String>,
+    #[serde(default)]
+    details: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ArcgisGeocodeMatch {
+    center: DiscoveryCenter,
+    score: f64,
+    address_type: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OverpassResponse {
     remark: Option<String>,
+    osm3s: Option<OverpassMetadata>,
     #[serde(default)]
     elements: Vec<OverpassElement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OverpassMetadata {
+    timestamp_osm_base: Option<String>,
+}
+
+#[derive(Debug)]
+struct OverpassPlacesResult {
+    places: Vec<DiscoveryPlace>,
+    data_as_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +365,248 @@ async fn response_json<T: DeserializeOwned>(
         .map_err(|error| format!("{source} returned invalid JSON: {error}"))
 }
 
+fn chinese_digit(character: char) -> Option<u64> {
+    match character {
+        '零' | '〇' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn is_chinese_number_character(character: char) -> bool {
+    chinese_digit(character).is_some() || matches!(character, '十' | '百' | '千' | '万')
+}
+
+fn parse_chinese_number(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.chars().all(is_chinese_number_character) {
+        return None;
+    }
+    if !value
+        .chars()
+        .any(|character| matches!(character, '十' | '百' | '千' | '万'))
+    {
+        return value.chars().try_fold(0_u64, |number, character| {
+            number
+                .checked_mul(10)?
+                .checked_add(chinese_digit(character)?)
+        });
+    }
+
+    let mut total = 0_u64;
+    let mut section = 0_u64;
+    let mut number = 0_u64;
+    for character in value.chars() {
+        if let Some(digit) = chinese_digit(character) {
+            number = digit;
+            continue;
+        }
+        let unit = match character {
+            '十' => 10,
+            '百' => 100,
+            '千' => 1_000,
+            '万' => 10_000,
+            _ => return None,
+        };
+        if unit == 10_000 {
+            section = section.checked_add(number)?;
+            total = total.checked_add(section.checked_mul(unit)?)?;
+            section = 0;
+        } else {
+            section = section.checked_add(number.max(1).checked_mul(unit)?)?;
+        }
+        number = 0;
+    }
+    total.checked_add(section)?.checked_add(number)
+}
+
+fn normalize_house_number(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .strip_suffix('号')
+        .unwrap_or(value.trim())
+        .trim();
+    if let Some(number) = parse_chinese_number(value) {
+        return Some(number.to_string());
+    }
+
+    let mut normalized = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_uppercase());
+        } else if matches!(character, '-' | '之') {
+            normalized.push('-');
+        } else if character == '/' {
+            normalized.push('/');
+        } else if !character.is_whitespace() {
+            return None;
+        }
+    }
+    (!normalized.is_empty()
+        && normalized
+            .chars()
+            .any(|character| character.is_ascii_digit()))
+    .then_some(normalized)
+}
+
+#[derive(Debug)]
+struct AddressToken<'a> {
+    value: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn ascii_address_tokens(value: &str) -> Vec<AddressToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '/' | '之') {
+            start.get_or_insert(index);
+        } else if let Some(token_start) = start.take() {
+            tokens.push(AddressToken {
+                value: &value[token_start..index],
+                start: token_start,
+                end: index,
+            });
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push(AddressToken {
+            value: &value[token_start..],
+            start: token_start,
+            end: value.len(),
+        });
+    }
+    tokens
+}
+
+fn is_ordinal_street_token(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["st", "nd", "rd", "th"].iter().any(|suffix| {
+        lower
+            .strip_suffix(suffix)
+            .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+fn requested_house_number(query: &str) -> Option<String> {
+    let tokens = ascii_address_tokens(query);
+    let numeric = |token: &AddressToken<'_>| {
+        token
+            .value
+            .chars()
+            .any(|character| character.is_ascii_digit())
+            && !is_ordinal_street_token(token.value)
+    };
+    for marker in ["大道", "胡同", "路", "街", "巷", "弄"] {
+        for (marker_start, _) in query.match_indices(marker) {
+            let marker_end = marker_start + marker.len();
+            if let Some(token) = tokens.iter().find(|token| {
+                numeric(token)
+                    && token.start >= marker_end
+                    && query[marker_end..token.start].trim().is_empty()
+                    && !query[token.end..].trim_start().starts_with("号线")
+            }) {
+                return normalize_house_number(token.value);
+            }
+        }
+    }
+
+    let lower_tokens: Vec<String> = tokens
+        .iter()
+        .map(|token| token.value.to_ascii_lowercase())
+        .collect();
+    let street_designators = [
+        "street",
+        "st",
+        "road",
+        "rd",
+        "avenue",
+        "ave",
+        "boulevard",
+        "blvd",
+        "lane",
+        "ln",
+        "drive",
+        "dr",
+        "court",
+        "ct",
+        "place",
+        "pl",
+        "parkway",
+        "pkwy",
+        "terrace",
+        "ter",
+        "circle",
+        "cir",
+    ];
+    if let Some(street_index) = lower_tokens
+        .iter()
+        .position(|token| street_designators.contains(&token.as_str()))
+    {
+        if tokens.first().is_some_and(numeric) {
+            return normalize_house_number(tokens[0].value);
+        }
+        if let Some(token) = tokens.get(street_index + 1).filter(|token| numeric(token)) {
+            return normalize_house_number(token.value);
+        }
+    }
+
+    let characters: Vec<(usize, char)> = query.char_indices().collect();
+    let mut explicit_numbers = Vec::new();
+    for (position, (number_end, character)) in characters.iter().enumerate() {
+        if *character != '号' {
+            continue;
+        }
+        let suffix_start = characters
+            .get(position + 1)
+            .map(|(index, _)| *index)
+            .unwrap_or(query.len());
+        let suffix = query[suffix_start..].trim_start();
+        if ["线", "出口", "航站楼", "航站", "站台", "口", "门"]
+            .iter()
+            .any(|excluded| suffix.starts_with(excluded))
+        {
+            continue;
+        }
+        let mut start = position;
+        while start > 0 && {
+            let previous = characters[start - 1].1;
+            previous.is_ascii_alphanumeric()
+                || is_chinese_number_character(previous)
+                || matches!(previous, '-' | '/' | '之')
+        } {
+            start -= 1;
+        }
+        if start < position {
+            let start_byte = characters[start].0;
+            if let Some(number) = normalize_house_number(&query[start_byte..*number_end]) {
+                explicit_numbers.push(number);
+            }
+        }
+    }
+    explicit_numbers.sort_unstable();
+    explicit_numbers.dedup();
+    (explicit_numbers.len() == 1).then(|| explicit_numbers.remove(0))
+}
+
+fn has_house_number_intent(query: &str) -> bool {
+    requested_house_number(query).is_some()
+}
+
+fn house_number_matches(query: &str, candidate: &str) -> bool {
+    requested_house_number(query)
+        .zip(normalize_house_number(candidate))
+        .is_some_and(|(requested, returned)| requested == returned)
+}
+
 async fn forward_geocode(query: &str, language: &str) -> Result<Option<DiscoveryCenter>, String> {
     let hits: Vec<NominatimHit> = response_json(
         "Nominatim",
@@ -310,6 +622,18 @@ async fn forward_geocode(query: &str, language: &str) -> Result<Option<Discovery
     let Some(hit) = hits.into_iter().next() else {
         return Ok(None);
     };
+    if has_house_number_intent(query)
+        && !hit
+            .address
+            .as_ref()
+            .and_then(|address| address.house_number.as_deref())
+            .is_some_and(|house_number| house_number_matches(query, house_number))
+    {
+        // A road or locality centroid is not an exact address result. Treat it
+        // as empty so the strict address fallback can run instead of silently
+        // presenting a coarse coordinate as the requested house number.
+        return Ok(None);
+    }
     let latitude = hit
         .lat
         .parse::<f64>()
@@ -332,6 +656,175 @@ async fn forward_geocode(query: &str, language: &str) -> Result<Option<Discovery
         source: "nominatim".into(),
         label_source: Some("nominatim".into()),
     }))
+}
+
+fn arcgis_match_from_response(
+    query: &str,
+    response: ArcgisGeocodeResponse,
+) -> Result<Option<ArcgisGeocodeMatch>, String> {
+    if let Some(error) = response.error {
+        let code = error
+            .code
+            .map(|value| format!(" code {value}"))
+            .unwrap_or_default();
+        let message = error
+            .message
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown service error".into());
+        let details = error
+            .details
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "ArcGIS World Geocoding returned{code}: {message}{}",
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(" ({details})")
+            }
+        ));
+    }
+
+    let requires_house_precision = has_house_number_intent(query);
+    let best = response
+        .candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let address_type = candidate
+                .attributes
+                .address_type
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let precise_address_type = matches!(
+                address_type.to_ascii_lowercase().as_str(),
+                "subaddress" | "pointaddress" | "streetaddress"
+            );
+            let label = candidate
+                .attributes
+                .match_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| candidate.address.trim())
+                .to_string();
+            let requested_number_matches = candidate
+                .attributes
+                .address_number
+                .as_deref()
+                .is_some_and(|number| house_number_matches(query, number));
+            if !candidate.score.is_finite()
+                || candidate.score < ARCGIS_MIN_MATCH_SCORE
+                || label.is_empty()
+                || (requires_house_precision
+                    && (!precise_address_type || !requested_number_matches))
+                || !candidate.location.y.is_finite()
+                || !candidate.location.x.is_finite()
+                || !(-90.0..=90.0).contains(&candidate.location.y)
+                || !(-180.0..=180.0).contains(&candidate.location.x)
+            {
+                return None;
+            }
+            Some((candidate, label, address_type))
+        })
+        .max_by(|(left, _, _), (right, _, _)| left.score.total_cmp(&right.score));
+
+    Ok(
+        best.map(|(candidate, label, address_type)| ArcgisGeocodeMatch {
+            center: DiscoveryCenter {
+                label,
+                latitude: candidate.location.y,
+                longitude: candidate.location.x,
+                source: "arcgis_world_geocoding".into(),
+                label_source: Some("arcgis_world_geocoding".into()),
+            },
+            score: candidate.score,
+            address_type,
+        }),
+    )
+}
+
+async fn forward_geocode_arcgis(query: &str) -> Result<Option<ArcgisGeocodeMatch>, String> {
+    let response: ArcgisGeocodeResponse = response_json(
+        "ArcGIS World Geocoding",
+        HTTP.get(ARCGIS_GEOCODE_URL).query(&[
+            ("SingleLine", query),
+            ("f", "json"),
+            ("forStorage", "false"),
+            ("maxLocations", "5"),
+            ("outSR", "4326"),
+            ("outFields", "Match_addr,Addr_type,AddNum"),
+        ]),
+    )
+    .await?;
+    arcgis_match_from_response(query, response)
+}
+
+async fn resolve_geocoded_center(
+    query: &str,
+    language: &str,
+    statuses: &mut Vec<SourceStatus>,
+) -> Option<DiscoveryCenter> {
+    match timed("Nominatim", forward_geocode(query, language)).await {
+        Ok(Some(center)) => {
+            statuses.push(status(
+                "nominatim",
+                SourceState::Success,
+                1,
+                "Place text resolved to a coordinate.",
+            ));
+            statuses.push(status(
+                "arcgis_world_geocoding",
+                SourceState::Skipped,
+                0,
+                "Nominatim returned an acceptable result, so the ArcGIS fallback was not requested.",
+            ));
+            return Some(center);
+        }
+        Ok(None) => statuses.push(status(
+            "nominatim",
+            SourceState::Empty,
+            0,
+            "No result with the requested place/address precision was returned.",
+        )),
+        Err(error) => statuses.push(status("nominatim", SourceState::Failed, 0, error)),
+    }
+
+    match timed("ArcGIS World Geocoding", forward_geocode_arcgis(query)).await {
+        Ok(Some(result)) => {
+            statuses.push(status(
+                "arcgis_world_geocoding",
+                SourceState::Success,
+                1,
+                format!(
+                    "Fallback accepted one {} candidate with provider match score {:.1}; the request used forStorage=false.",
+                    result.address_type, result.score
+                ),
+            ));
+            Some(result.center)
+        }
+        Ok(None) => {
+            statuses.push(status(
+                "arcgis_world_geocoding",
+                SourceState::Empty,
+                0,
+                "No candidate met the confidence and requested address-precision requirements.",
+            ));
+            None
+        }
+        Err(error) => {
+            statuses.push(status(
+                "arcgis_world_geocoding",
+                SourceState::Failed,
+                0,
+                error,
+            ));
+            None
+        }
+    }
 }
 
 async fn reverse_geocode(
@@ -850,12 +1343,22 @@ fn overpass_element_to_place(
     })
 }
 
+fn overpass_data_as_of(response: &OverpassResponse) -> Option<String> {
+    response
+        .osm3s
+        .as_ref()
+        .and_then(|metadata| metadata.timestamp_osm_base.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 async fn fetch_overpass_places(
     query: &str,
     center: &DiscoveryCenter,
     radius_m: u32,
     language: &str,
-) -> Result<Vec<DiscoveryPlace>, String> {
+) -> Result<OverpassPlacesResult, String> {
     let statement = overpass_query(query, center, radius_m);
     let response: OverpassResponse = response_json(
         "Overpass",
@@ -863,6 +1366,7 @@ async fn fetch_overpass_places(
             .form(&[("data", statement.as_str())]),
     )
     .await?;
+    let data_as_of = overpass_data_as_of(&response);
     let elements = complete_overpass_elements(response)?;
     let mut places = elements
         .into_iter()
@@ -873,7 +1377,7 @@ async fn fetch_overpass_places(
     // here would discard a slightly farther exact cuisine/name match before it
     // ever receives a relevance score.
     places.sort_by_key(|place| place.distance_m);
-    Ok(places)
+    Ok(OverpassPlacesResult { places, data_as_of })
 }
 
 fn complete_overpass_elements(response: OverpassResponse) -> Result<Vec<OverpassElement>, String> {
@@ -1118,6 +1622,23 @@ fn status(
         status: state,
         result_count: count,
         detail: detail.into(),
+        data_as_of: None,
+    }
+}
+
+fn status_as_of(
+    source: &str,
+    state: SourceState,
+    count: usize,
+    detail: impl Into<String>,
+    data_as_of: Option<String>,
+) -> SourceStatus {
+    SourceStatus {
+        source: source.into(),
+        status: state,
+        result_count: count,
+        detail: detail.into(),
+        data_as_of,
     }
 }
 
@@ -1134,9 +1655,13 @@ fn base_limitations(radius_m: u32) -> Vec<String> {
         "OpenStreetMap opening_hours is returned only as source text; open_now remains null because this command has no live open/closed feed.".into(),
         "Activity queries return mapped venues and POIs, not a live event schedule, ticket inventory, or proof that an event is happening today.".into(),
         "OpenStreetMap and Wikipedia coverage can be incomplete or stale; verify consequential details with the venue or an official source.".into(),
+        "retrieved_at is when this command finished retrieving its responses, not when any map record or venue detail was surveyed or updated.".into(),
+        "A source_statuses success means that provider returned a usable response; it does not prove address accuracy, freshness, current business state, or independent corroboration.".into(),
+        "Overpass data_as_of is the OSM base snapshot timestamp exposed by that response, not an on-site verification or per-venue update time; map databases are not real-time feeds.".into(),
+        "ArcGIS World Geocoding is queried only as a strict fallback with forStorage=false; its returned coordinate is not averaged with or inferred from another source.".into(),
         "Wikipedia GeoSearch is returned separately in nearby_context as background; it is never ranked as a POI, recommendation, endorsement, or popularity signal.".into(),
         "Open-Meteo current conditions are provider estimates for the reported timestamp, not a guarantee at a specific venue.".into(),
-        "The public Nominatim, Overpass, Open-Meteo, and Wikipedia endpoints have independent rate limits and no application SLA; source_statuses reports each request separately.".into(),
+        "The public Nominatim, ArcGIS World Geocoding, Overpass, Open-Meteo, and Wikipedia endpoints have independent rate limits and no application SLA; source_statuses reports each requested source separately.".into(),
     ];
     if radius_m > 10_000 {
         limitations.push(
@@ -1171,7 +1696,8 @@ fn empty_response(
 ///
 /// `near="current"` is only a location intent. The caller must obtain consent
 /// and pass both coordinates; this command never infers a position from timezone
-/// or IP address. A place name/address is geocoded through Nominatim instead.
+/// or IP address. Place text uses Nominatim first and a strict ArcGIS World
+/// Geocoding fallback; returned coordinates are never averaged or guessed.
 #[tauri::command]
 pub async fn local_discovery(
     query: String,
@@ -1192,7 +1718,7 @@ pub async fn local_discovery(
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let language = wikipedia_language(language.as_deref(), &query);
     let plan = location_plan(near.as_deref(), latitude, longitude)?;
-    let mut statuses = Vec::with_capacity(4);
+    let mut statuses = Vec::with_capacity(5);
 
     let (mut center, reverse_needed) = match plan {
         LocationPlan::Missing(reason) => {
@@ -1202,46 +1728,27 @@ pub async fn local_discovery(
                 0,
                 "No place text was supplied for geocoding.",
             ));
+            statuses.push(status(
+                "arcgis_world_geocoding",
+                SourceState::Skipped,
+                0,
+                "No place text was supplied for geocoding.",
+            ));
             append_spatial_skips(&mut statuses, "No resolved center is available.");
             return Ok(empty_response(radius_m, reason, statuses));
         }
         LocationPlan::Geocode(place) => {
-            match timed("Nominatim", forward_geocode(&place, &language)).await {
-                Ok(Some(center)) => {
-                    statuses.push(status(
-                        "nominatim",
-                        SourceState::Success,
-                        1,
-                        "Place text resolved to a coordinate.",
-                    ));
-                    (center, false)
-                }
-                Ok(None) => {
-                    statuses.push(status(
-                        "nominatim",
-                        SourceState::Empty,
-                        0,
-                        "No matching place was returned.",
-                    ));
+            match resolve_geocoded_center(&place, &language, &mut statuses).await {
+                Some(center) => (center, false),
+                None => {
                     append_spatial_skips(&mut statuses, "No resolved center is available.");
                     return Ok(empty_response(
-                        radius_m,
-                        format!(
-                            "Nominatim could not resolve '{place}'. Provide a more specific city, address, neighborhood, or coordinates."
-                        ),
-                        statuses,
-                    ));
-                }
-                Err(error) => {
-                    statuses.push(status("nominatim", SourceState::Failed, 0, error.clone()));
-                    append_spatial_skips(&mut statuses, "No resolved center is available.");
-                    return Ok(empty_response(
-                        radius_m,
-                        format!(
-                            "The location source failed, so nearby results were not guessed: {error}"
-                        ),
-                        statuses,
-                    ));
+                    radius_m,
+                    format!(
+                        "Neither Nominatim nor the strict ArcGIS fallback could resolve '{place}' at the requested precision. Provide a more specific city, address, neighborhood, or coordinates; no coordinate was guessed."
+                    ),
+                    statuses,
+                ));
                 }
             }
         }
@@ -1298,24 +1805,32 @@ pub async fn local_discovery(
                 ),
             )),
         }
+        statuses.push(status(
+            "arcgis_world_geocoding",
+            SourceState::Skipped,
+            0,
+            "Coordinates were supplied directly, so the ArcGIS forward-geocoding fallback was not requested.",
+        ));
     }
 
     let mut places = Vec::new();
     match overpass_result {
-        Ok(items) if items.is_empty() => statuses.push(status(
+        Ok(result) if result.places.is_empty() => statuses.push(status_as_of(
             "overpass",
             SourceState::Empty,
             0,
             "No named OpenStreetMap POIs matched this category and radius.",
+            result.data_as_of,
         )),
-        Ok(items) => {
-            let count = items.len();
-            places.extend(items);
-            statuses.push(status(
+        Ok(result) => {
+            let count = result.places.len();
+            places.extend(result.places);
+            statuses.push(status_as_of(
                 "overpass",
                 SourceState::Success,
                 count,
-                "Named OpenStreetMap POIs returned.",
+                "Named OpenStreetMap POIs returned. data_as_of is the Overpass OSM base snapshot, not a per-place verification time.",
+                result.data_as_of,
             ));
         }
         Err(error) => statuses.push(status("overpass", SourceState::Failed, 0, error)),
@@ -1435,7 +1950,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.center, None);
         assert!(response.places.is_empty());
-        assert_eq!(response.source_statuses.len(), 4);
+        assert_eq!(response.source_statuses.len(), 5);
         assert!(response
             .source_statuses
             .iter()
@@ -1459,12 +1974,180 @@ mod tests {
         .await
         .unwrap();
         assert!(response.center.is_some());
-        assert_eq!(response.source_statuses.len(), 4);
+        assert_eq!(response.source_statuses.len(), 5);
         assert!(response
             .source_statuses
             .iter()
             .any(|source| source.status == SourceState::Success));
         eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "calls the live public ArcGIS World Geocoding endpoint"]
+    async fn live_arcgis_resolves_the_shanghai_street_address_at_address_precision() {
+        let result = forward_geocode_arcgis("上海市静安区胶州路282号")
+            .await
+            .unwrap()
+            .expect("the live endpoint should return a strict address match");
+        assert_eq!(result.center.source, "arcgis_world_geocoding");
+        assert!(result.center.label.contains("胶州路282号"));
+        assert!(result.score >= ARCGIS_MIN_MATCH_SCORE);
+        assert!(matches!(
+            result.address_type.as_str(),
+            "Subaddress" | "PointAddress" | "StreetAddress"
+        ));
+        assert!((31.22..31.24).contains(&result.center.latitude));
+        assert!((121.42..121.45).contains(&result.center.longitude));
+    }
+
+    #[tokio::test]
+    #[ignore = "calls live public geocoding, POI, weather, and encyclopedia endpoints"]
+    async fn live_shanghai_address_uses_arcgis_fallback_in_the_full_discovery_flow() {
+        let response = local_discovery(
+            "餐厅".into(),
+            Some("上海市胶州路282号".into()),
+            None,
+            None,
+            Some(3_000),
+            Some(5),
+            Some("zh".into()),
+        )
+        .await
+        .unwrap();
+        let center = response
+            .center
+            .as_ref()
+            .expect("the exact address should resolve");
+        assert_eq!(center.source, "arcgis_world_geocoding");
+        assert!(center.label.contains("胶州路282号"));
+        assert!(response.source_statuses.iter().any(|status| {
+            status.source == "arcgis_world_geocoding" && status.status == SourceState::Success
+        }));
+        if let Some(overpass) = response
+            .source_statuses
+            .iter()
+            .find(|status| status.source == "overpass")
+        {
+            if matches!(overpass.status, SourceState::Success | SourceState::Empty) {
+                assert!(overpass.data_as_of.is_some());
+            }
+        }
+        eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+    }
+
+    #[test]
+    fn house_number_intent_requires_address_context() {
+        for place in [
+            "District 7, Ho Chi Minh City",
+            "90210",
+            "Terminal 2, Singapore Changi Airport",
+            "Route 66, California",
+            "5th Avenue, New York",
+            "上海市第2街",
+            "上海市66路",
+        ] {
+            assert!(
+                !has_house_number_intent(place),
+                "{place:?} must remain a general place query"
+            );
+        }
+        for address in [
+            "上海市静安区胶州路282号",
+            "上海市静安区胶州路十二号",
+            "1600 Amphitheatre Pkwy, Mountain View, CA 94043",
+            "Main St 12A",
+        ] {
+            assert!(
+                has_house_number_intent(address),
+                "{address:?} must request house-level precision"
+            );
+        }
+    }
+
+    #[test]
+    fn house_number_matching_is_exact_after_limited_normalization() {
+        assert!(house_number_matches("上海市胶州路282号", "282"));
+        assert!(house_number_matches("上海市胶州路十二号", "12"));
+        assert!(house_number_matches("Main St 12A", "12a"));
+        assert!(house_number_matches("胶州路12之1号", "12-1"));
+        assert!(!house_number_matches("Main St 12A", "12B"));
+        assert!(!house_number_matches("Main St 12A/12B", "12A"));
+        assert!(house_number_matches("Main St 12A/12B", "12A/12B"));
+        assert!(!house_number_matches("上海市胶州路282号", "999"));
+        assert!(!house_number_matches("上海市胶州路282号", "282-1"));
+        assert!(!house_number_matches("District 7, Ho Chi Minh City", "7"));
+        assert!(house_number_matches("地铁2号出口 上海市胶州路282号", "282"));
+        assert!(!house_number_matches("地铁2号出口 上海市胶州路282号", "2"));
+    }
+
+    #[test]
+    fn arcgis_fixture_accepts_only_a_high_confidence_precise_house_match() {
+        let fixture = r#"{
+          "candidates": [
+            {
+              "address": "上海市静安区曹家渡街道胶州路282号",
+              "location": {"x": 121.43875479716, "y": 31.230038216008},
+              "score": 100,
+              "attributes": {
+                "Match_addr": "上海市静安区曹家渡街道胶州路282号",
+                "Addr_type": "StreetAddress",
+                "AddNum": "282"
+              }
+            },
+            {
+              "address": "上海静安区",
+              "location": {"x": 121.41667, "y": 31.23333},
+              "score": 77.68,
+              "attributes": {"Match_addr": "上海静安区", "Addr_type": "Locality", "AddNum": null}
+            }
+          ]
+        }"#;
+        let response: ArcgisGeocodeResponse = serde_json::from_str(fixture).unwrap();
+        let result = arcgis_match_from_response("上海市静安区胶州路282号", response)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.center.source, "arcgis_world_geocoding");
+        assert_eq!(
+            result.center.label_source.as_deref(),
+            Some("arcgis_world_geocoding")
+        );
+        assert_eq!(result.address_type, "StreetAddress");
+        assert_eq!(result.score, 100.0);
+        assert_eq!(result.center.latitude, 31.230038216008);
+        assert_eq!(result.center.longitude, 121.43875479716);
+    }
+
+    #[test]
+    fn arcgis_fixture_rejects_locality_low_score_and_wrong_house_candidates() {
+        let fixture = r#"{
+          "candidates": [
+            {
+              "address": "上海市静安区胶州路282号",
+              "location": {"x": 121.42, "y": 31.23},
+              "score": 100,
+              "attributes": {"Match_addr": "上海市静安区胶州路282号", "Addr_type": "Locality", "AddNum": "282"}
+            },
+            {
+              "address": "上海市静安区胶州路282号",
+              "location": {"x": 121.43, "y": 31.23},
+              "score": 89.99,
+              "attributes": {"Match_addr": "上海市静安区胶州路282号", "Addr_type": "PointAddress", "AddNum": "282"}
+            },
+            {
+              "address": "上海市静安区胶州路999号",
+              "location": {"x": 121.44, "y": 31.23},
+              "score": 99,
+              "attributes": {"Match_addr": "上海市静安区胶州路999号", "Addr_type": "StreetAddress", "AddNum": "999"}
+            }
+          ]
+        }"#;
+        let response: ArcgisGeocodeResponse = serde_json::from_str(fixture).unwrap();
+        assert!(
+            arcgis_match_from_response("上海市静安区胶州路282号", response)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1700,12 +2383,36 @@ mod tests {
     fn overpass_remarks_reject_incomplete_candidate_sets() {
         let response = OverpassResponse {
             remark: Some("runtime error: Query ran out of memory".into()),
+            osm3s: None,
             elements: Vec::new(),
         };
 
         let error = complete_overpass_elements(response).unwrap_err();
         assert!(error.contains("did not return a complete result set"));
         assert!(error.contains("ran out of memory"));
+    }
+
+    #[test]
+    fn overpass_fixture_exposes_the_osm_base_snapshot_time() {
+        let response: OverpassResponse = serde_json::from_str(
+            r#"{
+              "osm3s": {"timestamp_osm_base": "2026-07-12T09:57:14Z"},
+              "elements": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            overpass_data_as_of(&response).as_deref(),
+            Some("2026-07-12T09:57:14Z")
+        );
+        let source = status_as_of(
+            "overpass",
+            SourceState::Success,
+            0,
+            "fixture",
+            overpass_data_as_of(&response),
+        );
+        assert_eq!(source.data_as_of.as_deref(), Some("2026-07-12T09:57:14Z"));
     }
 
     #[test]
@@ -1722,6 +2429,9 @@ mod tests {
         assert!(limitations.contains("open_now remains null"));
         assert!(limitations.contains("rating and price remain null"));
         assert!(limitations.contains("not a live event schedule"));
+        assert!(limitations.contains("retrieved_at"));
+        assert!(limitations.contains("OSM base snapshot"));
+        assert!(limitations.contains("map databases are not real-time"));
         assert!(limitations.contains("capped at 10 km"));
     }
 }

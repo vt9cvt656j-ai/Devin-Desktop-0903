@@ -122,7 +122,7 @@
     "type": "function",
     "function": {
       "name": "local_discovery",
-      "description": "查询某个地点周边的餐饮、景点、活动场所等 POI，并附天气、Haversine 直线距离、原始 opening_hours 和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；公共端点可能限流且没有应用 SLA。没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区或 IP 猜位置。",
+      "description": "查询某个地点周边的餐饮、景点、活动场所等信息：地址解析先使用 Nominatim，无法接受时才后备到 ArcGIS World Geocoding；POI 来自 OpenStreetMap Overpass，天气来自 Open-Meteo，Wikipedia GeoSearch 仅提供附近背景。distance_m 是 Haversine 直线距离，不是路线距离或时间。source_statuses[].status=success 只表示该端点本次成功响应且结果可解析，不证明数据完整、正确、新鲜或实时；顶层 retrieved_at 是 IDE 本次请求完成时间，不是地图、POI、地址或百科数据更新时间；source_statuses[].data_as_of（存在时）只是提供方暴露的数据集/快照时间，不是逐场所核验时间；weather.observed_at 是提供方报告的天气观测时间。OSM POI 与原始 opening_hours 只是数据源记录，不证明场所仍存在或当前营业；缺失的 rating、price、open_now 必须保持未知。公共端点可能限流且没有应用 SLA。near=current 必须有用户授权得到的坐标，绝不从时区或 IP 猜位置。",
       "parameters": {
         "type": "object",
         "properties": {

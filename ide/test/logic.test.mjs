@@ -1038,7 +1038,10 @@ test("local discovery is a registered read-only model tool", () => {
   assert.match(SRC, /backend\.invoke\("local_discovery"/);
   assert.match(SRC, /backend\.invoke\("request_current_location"/);
   assert.match(SRC, /_requestCurrentCoordinates/);
-  assert.match(SRC, /open_now 为未知时不得补猜/);
+  assert.match(SRC, /open_now=null 时不得说现在营业/);
+  assert.match(SRC, /opening_hours 是 OSM 标注的排班原文/);
+  assert.match(SRC, /Nominatim 与 ArcGIS 地理编码/);
+  assert.match(SRC, /retrieved_at 只是本次取回时间，不是 POI 更新时间/);
 });
 
 test("current location requests use the native permission flow without double prompting", async () => {
@@ -1164,12 +1167,25 @@ test("local discovery keeps address and permission failures separate", () => {
   const addressCall = { near: "上海市胶州路282号" };
   assert.deepEqual(cardState(addressCall, {
     center: null,
-    source_statuses: [{ source: "nominatim", status: "empty" }],
-  }), { modifier: "atc-result--err", text: "地址解析失败" });
+    source_statuses: [
+      { source: "nominatim", status: "empty" },
+      { source: "arcgis_world_geocoding", status: "empty" },
+    ],
+  }), { modifier: "atc-result--err", text: "地点或地址未解析" });
   assert.deepEqual(cardState(addressCall, {
     center: null,
-    source_statuses: [{ source: "nominatim", status: "failed" }],
-  }), { modifier: "atc-result--err", text: "地理编码服务失败" });
+    source_statuses: [
+      { source: "nominatim", status: "failed" },
+      { source: "arcgis_world_geocoding", status: "failed" },
+    ],
+  }), { modifier: "atc-result--err", text: "地理编码来源请求失败" });
+  assert.deepEqual(cardState(addressCall, {
+    center: null,
+    source_statuses: [
+      { source: "nominatim", status: "empty" },
+      { source: "arcgis_world_geocoding", status: "failed" },
+    ],
+  }), { modifier: "atc-result--err", text: "部分地理编码来源失败，且未解析到地点" });
   assert.equal(cardState({ near: "当前位置" }, { center: null }).text, "当前位置不可用");
   assert.equal(presentation({ status: "permission_denied" }).label, "定位权限已拒绝");
 
@@ -1183,14 +1199,37 @@ test("local discovery keeps address and permission failures separate", () => {
     ],
   });
   assert.equal(failedPoi.modifier, "atc-result--err");
-  assert.match(failedPoi.text, /地点数据源失败/);
+  assert.equal(failedPoi.text, "OSM 地点来源请求失败 · 2/3 来源返回可解析响应");
 
   const emptyPoi = cardState(addressCall, {
     center, places: [],
     source_statuses: [{ source: "overpass", status: "empty" }],
   });
   assert.equal(emptyPoi.modifier, "atc-result--info");
-  assert.match(emptyPoi.text, /未找到匹配地点/);
+  assert.equal(emptyPoi.text, "本次 OSM 数据未返回匹配地点 · 1/1 来源返回可解析响应");
+
+  const skippedFallback = cardState(addressCall, {
+    center,
+    places: [{ id: "1" }],
+    source_statuses: [
+      { source: "nominatim", status: "success" },
+      { source: "arcgis_world_geocoding", status: "skipped" },
+      { source: "overpass", status: "success" },
+    ],
+  });
+  assert.equal(skippedFallback.text, "1 个 OSM 收录候选 · 2/2 来源返回可解析响应");
+
+  const missingStatus = cardState(addressCall, { center, places: [{ id: "1" }], source_statuses: [] });
+  assert.equal(missingStatus.modifier, "atc-result--info");
+  assert.equal(missingStatus.text, "1 个 OSM 收录候选 · 来源状态缺失");
+
+  const missingOverpassStatus = cardState(addressCall, {
+    center,
+    places: [{ id: "1" }],
+    source_statuses: [{ source: "nominatim", status: "success" }],
+  });
+  assert.equal(missingOverpassStatus.modifier, "atc-result--info");
+  assert.match(missingOverpassStatus.text, /来源状态缺失/);
 
   const coarse = cardState({ near: "当前位置", radiusM: 3000 }, {
     center, places: [{ id: "1" }],
@@ -1248,8 +1287,10 @@ test("local discovery executor wires permission, coordinates, and address failur
       successArgs = args;
       return {
         center: { label: "Shanghai", latitude: 31.23, longitude: 121.47 },
-        places: [{ id: "one" }],
-        source_statuses: [{ source: "overpass", status: "success" }],
+        places: [{ id: "one", opening_hours: "Mo-Fr 08:00-17:00", open_now: null }],
+        weather: { observed_at: "2026-07-12T14:00", source: "open_meteo" },
+        source_statuses: [{ source: "overpass", status: "success", data_as_of: "2026-07-12T10:21:46Z" }],
+        retrieved_at: 1_783_888_800,
       };
     },
   });
@@ -1259,7 +1300,17 @@ test("local discovery executor wires permission, coordinates, and address failur
   assert.equal(successArgs.latitude, 31.23);
   assert.equal(successArgs.longitude, 121.47);
   assert.match(successUi.result.className, /--ok/);
+  assert.equal(successUi.result.textContent, "1 个 OSM 收录候选 · 1/1 来源返回可解析响应");
   assert.match(successResult.content, /"sample_age_ms": 1000/);
+  assert.match(successResult.content, /status=success 只表示该端点本次返回数据/);
+  assert.match(successResult.content, /retrieved_at 只是 IDE 完成本次取回的时间，不是 POI 更新时间/);
+  assert.match(successResult.content, /weather\.observed_at 时点/);
+  assert.match(successResult.content, /opening_hours 是 OSM 标注的排班原文/);
+  assert.match(successResult.content, /"retrieved_at": 1783888800/);
+  assert.match(successResult.content, /"observed_at": "2026-07-12T14:00"/);
+  assert.match(successResult.content, /"data_as_of": "2026-07-12T10:21:46Z"/);
+  assert.match(successUi.viewport.innerHTML, /"data_as_of": "2026-07-12T10:21:46Z"/);
+  assert.match(successResult.content, /"open_now": null/);
   assert.equal(successUi.opened.has("is-open"), true);
 
   const deniedUi = fakeStep();
@@ -1283,7 +1334,10 @@ test("local discovery executor wires permission, coordinates, and address failur
     invoke: async () => ({
       center: null,
       places: [],
-      source_statuses: [{ source: "nominatim", status: "empty" }],
+      source_statuses: [
+        { source: "nominatim", status: "empty" },
+        { source: "arcgis_world_geocoding", status: "empty" },
+      ],
       limitations: ["Nominatim could not resolve the address"],
     }),
   });
@@ -1291,7 +1345,7 @@ test("local discovery executor wires permission, coordinates, and address failur
     type: "localdiscovery", query: "food", near: "上海市胶州路282号",
   }, "", null);
   assert.equal(addressLocationCalls, 0);
-  assert.equal(addressUi.result.textContent, "地址解析失败");
+  assert.equal(addressUi.result.textContent, "地点或地址未解析");
   assert.match(addressUi.result.className, /--err/);
 });
 

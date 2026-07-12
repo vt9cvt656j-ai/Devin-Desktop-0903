@@ -70,8 +70,7 @@ mod macos {
         if !seconds_from_now.is_finite()
             || !observed_seconds_since_epoch.is_finite()
             || observed_seconds_since_epoch < 0.0
-            || !(-MAX_SAMPLE_AGE_SECONDS..=MAX_FUTURE_SKEW_SECONDS)
-                .contains(&seconds_from_now)
+            || !(-MAX_SAMPLE_AGE_SECONDS..=MAX_FUTURE_SKEW_SECONDS).contains(&seconds_from_now)
         {
             return None;
         }

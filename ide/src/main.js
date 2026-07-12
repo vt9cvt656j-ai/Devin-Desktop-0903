@@ -8398,7 +8398,7 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜。部分来源失败要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
+const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。部分来源失败要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态，不要先读一个不存在的路径。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
@@ -12894,7 +12894,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "联网搜索（桌面后端并行尝试 Google、Bing、DuckDuckGo，并合并实际返回结果），返回标题/URL/摘要；摘要只是线索，关键结论需读原文核实。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
-    { type: "function", function: { name: "local_discovery", description: "查询某个地点周边的餐饮、景点、活动场所等 POI，并附天气、直线距离、原始营业时间和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity venue" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
+    { type: "function", function: { name: "local_discovery", description: "查询公开地理数据中的周边候选。桌面后端接入 Nominatim 与 ArcGIS 地理编码、OpenStreetMap Overpass POI、Open-Meteo 和 Wikipedia GeoSearch；返回 OSM 收录候选、Haversine 直线距离、OSM opening_hours 原文、weather.observed_at 时点的区域天气估算和逐来源本次请求状态。source_statuses 的 success 只表示端点本次返回，不表示数据新鲜、完整、准确或商家已核实；retrieved_at 只是本次取回时间，不是 POI 更新时间。没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity venue" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
     { type: "function", function: { name: "read_screen", description: "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限" } }, required: [] } } },
     { type: "function", function: { name: "ui_click", description: "对 read_screen 返回的真实可访问性 ref 执行 press、set_value 或 focus。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "read_screen 返回的 AX 元素 ref" }, action: { type: "string", enum: ["press", "set_value", "focus"] }, value: { type: "string", description: "action=set_value 时必填" } }, required: ["ref", "action"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。", parameters: { type: "object", properties: { steps: { type: "array", description: "完整的有序步骤列表（每次传全量，不是增量）", items: { type: "object", properties: { content: { type: "string", description: "这一步做什么——具体但简洁，一眼看懂（含关键技术/文件）" }, status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "状态：pending待办 / in_progress进行中 / completed已完成 / cancelled已取消(用户取消的保持这个)" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
@@ -14339,26 +14339,41 @@ function _normalizeLocalDiscoveryLocation(call) {
 
 function _localDiscoveryCardState(call, output, location = null) {
   const statuses = Array.isArray(output?.source_statuses) ? output.source_statuses : [];
-  const successCount = statuses.filter((status) => status?.status === "success").length;
-  const ratio = statuses.length ? `${successCount}/${statuses.length} 来源成功` : "无来源状态";
+  const requestedStatuses = statuses.filter((status) => status?.status !== "skipped");
+  const responseCount = requestedStatuses.filter((status) => status?.status === "success" || status?.status === "empty").length;
+  const ratio = requestedStatuses.length ? `${responseCount}/${requestedStatuses.length} 来源返回可解析响应` : "来源状态缺失";
   const source = (name) => statuses.find((status) => status?.source === name);
   if (!output?.center) {
     if (_isCurrentLocationRequest(call?.near)) return { modifier: "atc-result--err", text: "当前位置不可用" };
-    const geocode = source("nominatim");
-    if (geocode?.status === "empty") return { modifier: "atc-result--err", text: "地址解析失败" };
-    if (geocode?.status === "failed") return { modifier: "atc-result--err", text: "地理编码服务失败" };
-    return { modifier: "atc-result--err", text: "没有解析到地点" };
+    const geocoders = statuses.filter((status) =>
+      (status?.source === "nominatim" || status?.source === "arcgis_world_geocoding")
+      && status?.status !== "skipped");
+    if (!geocoders.length) return { modifier: "atc-result--err", text: "地理编码状态缺失" };
+    if (geocoders.every((status) => status.status === "empty")) {
+      return { modifier: "atc-result--err", text: "地点或地址未解析" };
+    }
+    if (geocoders.every((status) => status.status === "failed")) {
+      return { modifier: "atc-result--err", text: "地理编码来源请求失败" };
+    }
+    if (geocoders.some((status) => status.status === "failed")) {
+      return { modifier: "atc-result--err", text: "部分地理编码来源失败，且未解析到地点" };
+    }
+    return { modifier: "atc-result--err", text: "地理编码结果不完整" };
   }
 
   const places = Array.isArray(output?.places) ? output.places : [];
   const overpass = source("overpass");
   let state;
-  if (overpass?.status === "failed") {
-    state = { modifier: "atc-result--err", text: `地点数据源失败 · ${ratio}` };
+  if (!overpass) {
+    state = { modifier: "atc-result--info", text: `${places.length ? `${places.length} 个 OSM 收录候选` : "地点结果"} · 来源状态缺失` };
+  } else if (overpass.status === "failed") {
+    state = { modifier: "atc-result--err", text: `OSM 地点来源请求失败 · ${ratio}` };
   } else if (overpass?.status === "empty" || !places.length) {
-    state = { modifier: "atc-result--info", text: `未找到匹配地点 · ${ratio}` };
+    state = { modifier: "atc-result--info", text: `本次 OSM 数据未返回匹配地点 · ${ratio}` };
+  } else if (overpass.status !== "success") {
+    state = { modifier: "atc-result--info", text: `OSM 地点来源未完成 · ${ratio}` };
   } else {
-    state = { modifier: "atc-result--ok", text: `${places.length} 个地点 · ${ratio}` };
+    state = { modifier: "atc-result--ok", text: `${places.length} 个 OSM 收录候选 · ${ratio}` };
   }
 
   const radiusM = Number.isFinite(call?.radiusM) ? call.radiusM : 3000;
@@ -17213,7 +17228,7 @@ const _TOOL_CATALOG = [
   { name: "lsp_definition / lsp_references", desc: "跳定义 / 找所有引用", kw: ["定义", "引用", "跳转", "符号", "调用方", "谁用了"] },
   { name: "http_request", desc: "调任意 HTTP API / webhook（也用于抓包后重发/改参/调试任意请求）", kw: ["api", "接口", "http", "请求", "webhook", "rest", "重发", "replay", "抓包"] },
   { name: "decode_qr", desc: "识别图片/截图里的二维码内容", kw: ["二维码", "qr", "qrcode", "扫码", "scan"] },
-  { name: "local_discovery", desc: "用 OSM、地理编码、天气和 Wikipedia 查询附近餐饮/景点，并报告逐来源状态", kw: ["附近", "周边", "美食", "餐厅", "吃饭", "旅游", "景点", "去哪", "nearby", "restaurant", "travel", "attraction", "places"] },
+  { name: "local_discovery", desc: "用 Nominatim/ArcGIS 地理编码、OSM、天气估算和 Wikipedia 查询附近候选，并报告逐来源状态", kw: ["附近", "周边", "美食", "餐厅", "吃饭", "旅游", "景点", "去哪", "nearby", "restaurant", "travel", "attraction", "places"] },
   { name: "read_screen / ui_click", desc: "读取前台原生应用可访问性元素；macOS 可按 ref 操作", kw: ["前台应用", "原生应用", "屏幕元素", "按钮", "输入框", "accessibility", "ax", "read screen", "ui click", "操作软件"] },
   { name: "download_file", desc: "下载文件到工作区", kw: ["下载", "download", "拉取"] },
   { name: "capture_start", desc: "启动系统级抓包（真·小黄鸟 / mitmproxy MITM 代理，抓任意 App/浏览器的 HTTP/HTTPS）", kw: ["抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
@@ -20951,17 +20966,30 @@ async function _executeToolStep(step, call, root, run) {
         const cardState = _localDiscoveryCardState(call, output, currentLocation);
         res.className = `atc-result ${cardState.modifier}`;
         res.textContent = cardState.text;
-        const modelOutput = currentLocation ? {
-          ...(output || {}),
-          location_input: _localDiscoveryLocationMetadata(call, currentLocation),
-        } : (output || {});
+        const baseOutput = output || {};
+        const modelOutput = {
+          center: baseOutput.center ?? null,
+          source_statuses: Array.isArray(baseOutput.source_statuses) ? baseOutput.source_statuses : [],
+          weather: baseOutput.weather ?? null,
+          retrieved_at: baseOutput.retrieved_at ?? null,
+          ...baseOutput,
+          ...(currentLocation ? { location_input: _localDiscoveryLocationMetadata(call, currentLocation) } : {}),
+        };
         const structured = JSON.stringify(modelOutput, null, 2);
         const visibleDetails = structured.length > 12000
           ? `${structured.slice(0, 12000)}\n…（详情已截断，完整结构化结果仍已提供给模型）`
           : structured;
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(visibleDetails)}</pre>`;
         if (vp) step.classList.add("is-open");
-        return { type: "localdiscovery", path: call.near || "", content: `local_discovery 结构化结果（距离是直线距离；评分、价格、路线时长、open_now 为未知时不得补猜）：\n${structured}` };
+        const evidenceNote = [
+          "local_discovery 本次公共数据请求结果：",
+          "- source_statuses 中 status=success 只表示该端点本次返回数据，不代表内容新鲜、完整、准确或商家已核实。",
+          "- retrieved_at 只是 IDE 完成本次取回的时间，不是 POI 更新时间。",
+          "- places 是 OSM 收录候选，不是质量、评分、人气或推荐背书；distance_m 是 Haversine 直线距离，不是路线距离或路线时长。",
+          "- weather 只是 Open-Meteo 对 weather.observed_at 时点、对应区域的估算；没有 observed_at 就不得称为当前天气。",
+          "- opening_hours 是 OSM 标注的排班原文，可能过期；open_now=null 时不得说现在营业。评分、价格、实时活动/票务和路线时间未知时不得补猜。",
+        ].join("\n");
+        return { type: "localdiscovery", path: call.near || "", content: `${evidenceNote}\n\n结构化数据：\n${structured}` };
       } catch (error) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "查询失败";

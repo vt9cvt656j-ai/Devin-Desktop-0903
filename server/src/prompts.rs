@@ -1297,6 +1297,13 @@ mod tests {
         assert!(policy.contains("一轮没有带来新的独立来源"));
         assert!(policy.contains("不因为事实难听"));
         assert!(policy.contains("不得提供可直接用于入侵"));
+        assert!(policy.contains("source_statuses[].status == success"));
+        assert!(policy.contains("retrieved_at"));
+        assert!(policy.contains("source_statuses[].data_as_of"));
+        assert!(policy.contains("weather.observed_at"));
+        assert!(policy.contains("opening_hours"));
+        assert!(policy.contains("缺失的 `rating`、`price`、`open_now` 必须保持未知"));
+        assert!(policy.contains("不得把全部结构化地理数据统称为“实时数据”"));
     }
 
     #[test]
@@ -1312,6 +1319,26 @@ mod tests {
                     == Some("local_discovery")
             })
             .expect("local_discovery should have a cloud schema");
+        let description = local
+            .pointer("/function/description")
+            .and_then(|value| value.as_str())
+            .expect("local_discovery should describe its real data contract");
+        for expected in [
+            "先使用 Nominatim，无法接受时才后备到 ArcGIS World Geocoding",
+            "OpenStreetMap Overpass",
+            "Open-Meteo",
+            "Haversine 直线距离",
+            "source_statuses[].status=success",
+            "retrieved_at 是 IDE 本次请求完成时间",
+            "source_statuses[].data_as_of（存在时）只是提供方暴露的数据集/快照时间",
+            "weather.observed_at 是提供方报告的天气观测时间",
+            "缺失的 rating、price、open_now 必须保持未知",
+        ] {
+            assert!(
+                description.contains(expected),
+                "local_discovery description should contain {expected}"
+            );
+        }
         assert_eq!(
             local
                 .pointer("/function/parameters/properties/radius_m/maximum")
