@@ -1456,11 +1456,15 @@ test("local discovery is a registered read-only model tool", () => {
 });
 
 test("keyless public data tools are registered, normalized, and read-only", () => {
-  for (const name of ["live_environment", "live_markets", "live_flights", "track_shipment"]) {
+  for (const name of ["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment"]) {
     assert.match(SRC, new RegExp(`name: "${name}"`));
     assert.match(SRC, new RegExp(`backend\\.invoke\\("${name}"|command = "${name}"`));
   }
-  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*trackshipment/);
+  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*roadenvironment.*trackshipment/);
+  assert.match(SRC, /desktopOnly = new Set\([^\n]*"road_environment"/,
+    "road data must not be offered by the browser mock backend");
+  assert.match(SRC, /name: "road_environment"[\s\S]{0,1800}enum: \["overview", "vehicle_counts", "traffic_flow", "road_incidents"\][\s\S]{0,1200}required: \["kind"\], anyOf: \[\{ required: \["near"\] \}, \{ required: \["latitude", "longitude"\] \}\]/,
+    "road schema must require either current-location permission or explicit coordinates");
   assert.match(SRC, /Coinbase 与 Kraken/);
   assert.match(SRC, /不抓网页、不绕验证码、不编造轨迹/);
   assert.match(SRC, /tracking_events 为空时绝不能声称包裹状态/);
@@ -1473,16 +1477,37 @@ test("keyless public data tools are registered, normalized, and read-only", () =
   assert.equal(schemaIssue("ABC_123", trackingSchema), "");
   assert.match(schemaIssue("含中文单号A", trackingSchema), /格式无效/);
   assert.match(schemaIssue("A".repeat(65), trackingSchema), /长度不能大于 64/);
-  assert.match(SRC, /const partial = successes > 0 && failures > 0/);
+  assert.match(SRC, /successes && `\$\{successes\}成功`[\s\S]{0,220}delayed && `\$\{delayed\}延迟`[\s\S]{0,220}empty && `\$\{empty\}空`[\s\S]{0,220}stale && `\$\{stale\}过期`[\s\S]{0,220}failures && `\$\{failures\}失败`[\s\S]{0,220}noCoverage && `\$\{noCoverage\}无覆盖`/,
+    "road cards must preserve every source-state category in mixed results");
+  assert.match(SRC, /data_as_of_kind 必须原样保留/);
+  assert.match(SRC, /California CHP 记录只表示 current public feed membership/);
+  assert.match(SRC, /data_as_of_kind=http_last_modified 只是 HTTP representation/);
+  assert.match(SRC, /不得输出 dispatch notes、车牌、电话号码、医疗或人物细节/);
+  assert.match(SRC, /statuses\.some\(\(item\) => item\?\.source === "caltrans_quickmap_chp_incidents" && item\?\.status !== "no_coverage"\)/,
+    "California-specific evidence must be injected only for an applicable CHP source status");
   assert.doesNotMatch(SRC, /_dupGuardable = new Set\([^\n]*liveenvironment/,
     "fresh live-data calls must not reuse a previous turn's result");
+  assert.doesNotMatch(SRC, /_dupGuardable = new Set\([^\n]*roadenvironment/,
+    "road observations must be fetched again on a later model turn");
   assert.match(SRC, /_seenLive[\s\S]{0,700}_dupLive/,
     "identical live-data calls in one batch must be collapsed before parallel dispatch");
+  assert.match(SRC, /\["liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment"\]\.includes/,
+    "identical road calls in one model response must be collapsed");
+  assert.match(SRC, /_READ_ONLY_TYPES = new Set\([^\n]*"roadenvironment"/,
+    "road_environment must stay in the read-only parallel tool set");
+  assert.match(SRC, /const _READ_TOOLS = \[[^\n]*"road_environment"/,
+    "read-only child agents must receive the structured road tool");
+  assert.match(SRC, /const _READ_TYPES = \[[^\n]*"roadenvironment"/,
+    "read-only child execution must allow road results");
+  assert.doesNotMatch(SRC, /traffic_incidents: "road_environment"|vehicle_counts: "road_environment"/,
+    "semantic aliases without a kind default must not create guaranteed-invalid calls");
+  assert.match(SRC, /_isCurrentLocationRequest\(call\.near\)[\s\S]{0,500}_requestCurrentCoordinates\(\)/,
+    "near=current road calls must use the real one-shot permission flow");
 
   const mapCall = load("_mapToolCall", {
     _normalizeArgKeys: (args) => args,
     _STR_ARG_KEYS: new Set(),
-    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "track_shipment"]),
+    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment"]),
     _canonicalToolName: () => "",
     _finiteNumberArg: load("_finiteNumberArg"),
   });
@@ -1499,12 +1524,99 @@ test("keyless public data tools are registered, normalized, and read-only", () =
   }, new Map()), {
     type: "livemarkets", path: "BTC/USD", kind: "crypto", base: "btc", quote: "usd",
   });
+  assert.deepEqual(mapCall("road_environment", {
+    kind: "road_incidents", latitude: 30.2672, longitude: -97.7431,
+    radius_km: 20, lookback_hours: 48, limit: 12,
+  }, new Map()), {
+    type: "roadenvironment", path: "road_incidents", kind: "road_incidents",
+    near: "", latitude: 30.2672, longitude: -97.7431, radiusKm: 20,
+    lookbackHours: 48, limit: 12,
+  });
+  assert.deepEqual(mapCall("road_environment", {
+    kind: "overview", near: "current", radius_km: 10,
+  }, new Map()), {
+    type: "roadenvironment", path: "overview", kind: "overview", near: "current",
+    latitude: null, longitude: null, radiusKm: 10, lookbackHours: null, limit: null,
+  });
   const shipment = mapCall("track_shipment", {
     tracking_number: "1Z999AA10123456784", carrier: "ups",
   }, new Map());
   assert.equal(shipment.type, "trackshipment");
   assert.equal(shipment.path, "官方核验", "tool cards must never persist model-supplied carrier text as their path");
   assert.equal(shipment.trackingNumber, "1Z999AA10123456784");
+});
+
+test("road model output keeps truth metadata and complete JSON inside the final model cap", () => {
+  const boundedOutput = load("_boundedRoadEnvironmentOutput");
+  const sourceStatus = {
+    source: "official", status: "delayed", result_count: 50,
+    data_as_of: "2026-07-12T12:00:00Z", data_as_of_kind: "aggregation_interval_end",
+  };
+  const output = {
+    topic: "road_environment",
+    records: Array.from({ length: 50 }, (_, index) => ({ index, description: "x".repeat(2000) })),
+    source_statuses: [sourceStatus],
+    limitations: ["empty does not prove safety"],
+    retrieved_at: 123,
+  };
+  const bounded = boundedOutput(output, 5000);
+  assert.deepEqual(bounded.source_statuses, output.source_statuses);
+  assert.deepEqual(bounded.limitations, output.limitations);
+  assert.equal(bounded.retrieved_at, 123);
+  assert.equal(bounded.record_count_total, 50);
+  assert.ok(bounded.records.length > 0 && bounded.records.length < 50);
+  assert.equal(bounded.records.length + bounded.records_omitted, 50);
+  assert.ok(JSON.stringify(bounded).length <= 5000);
+  assert.equal(bounded.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
+
+  const rebound = boundedOutput(bounded, 4000);
+  assert.equal(rebound.record_count_total, 50);
+  assert.equal(rebound.records.length + rebound.records_omitted, 50,
+    "rebudgeting an already bounded response must retain the provider's total count");
+
+  const modelMessage = load("_roadEnvironmentModelMessage", {
+    _boundedRoadEnvironmentOutput: boundedOutput,
+  });
+  const rebudgetMessage = load("_rebudgetRoadEnvironmentMessage", {
+    _roadEnvironmentModelMessage: modelMessage,
+  });
+  const toModel = load("_toolMsgForModel", {
+    _toolResultToString: (_call, result) => result.content,
+    _rebudgetRoadEnvironmentMessage: rebudgetMessage,
+  });
+  const content = `真实性证据\n\n结构化数据：\n${JSON.stringify(output)}`;
+  assert.ok(content.length > 30000, "fixture must exercise the model's 30k cap");
+  const message = toModel(
+    { type: "roadenvironment" },
+    { type: "roadenvironment", content },
+  );
+  assert.ok(message.length <= 30000);
+  const parsed = JSON.parse(message.split("结构化数据：\n")[1]);
+  assert.deepEqual(parsed.source_statuses, output.source_statuses);
+  assert.equal(parsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
+  assert.equal(parsed.record_count_total, 50);
+  assert.equal(parsed.records.length + parsed.records_omitted, 50);
+
+  const oversizedMetadata = {
+    topic: "road_environment",
+    records: [{ id: "one" }],
+    source_statuses: Array.from({ length: 40 }, (_, index) => ({
+      source: `provider-${index}-${"s".repeat(2000)}`,
+      status: "delayed",
+      result_count: 1,
+      detail: "d".repeat(20000),
+      data_as_of: "2026-07-12T12:00:00Z",
+      data_as_of_kind: "aggregation_interval_end",
+    })),
+    limitations: Array.from({ length: 40 }, () => "l".repeat(10000)),
+    retrieved_at: 123,
+  };
+  const metadataMessage = modelMessage("真实性证据", oversizedMetadata, 30000);
+  assert.ok(metadataMessage.length <= 30000, `oversized metadata escaped cap: ${metadataMessage.length}`);
+  const metadataJson = JSON.parse(metadataMessage.split("结构化数据：\n")[1]);
+  assert.equal(metadataJson.source_status_count_total ?? metadataJson.source_statuses.length, 40);
+  assert.ok(metadataJson.source_statuses.every((status) => status.data_as_of_kind === "aggregation_interval_end"));
+  assert.equal(metadataJson.records.length + metadataJson.records_omitted, 1);
 });
 
 test("current location requests use the native permission flow without double prompting", async () => {
@@ -1810,6 +1922,93 @@ test("local discovery executor wires permission, coordinates, and address failur
   assert.equal(addressLocationCalls, 0);
   assert.equal(addressUi.result.textContent, "地点或地址未解析");
   assert.match(addressUi.result.className, /--err/);
+});
+
+test("road executor visibly distinguishes delayed data and coarse current location", async () => {
+  const boundedOutput = load("_boundedRoadEnvironmentOutput");
+  const modelMessage = load("_roadEnvironmentModelMessage", {
+    _boundedRoadEnvironmentOutput: boundedOutput,
+  });
+  const rebudgetMessage = load("_rebudgetRoadEnvironmentMessage", {
+    _roadEnvironmentModelMessage: modelMessage,
+  });
+  const toModel = load("_toolMsgForModel", {
+    _toolResultToString: (_call, toolResult) => toolResult.content,
+    _rebudgetRoadEnvironmentMessage: rebudgetMessage,
+  });
+  const isCurrent = load("_isCurrentLocationRequest");
+  const roadMetadata = load("_roadLocationMetadata");
+  const accuracyWarning = load("_roadLocationAccuracyWarning");
+  const viewport = { innerHTML: "" };
+  const result = { className: "atc-result", textContent: "", innerHTML: "" };
+  const opened = new Set();
+  const step = {
+    classList: { add: (name) => opened.add(name) },
+    querySelector: (selector) => selector === ".atc-viewport" ? viewport
+      : selector === ".atc-result" ? result : selector === ".agent-tool-row" ? {} : null,
+  };
+  let invokeArgs;
+  const execute = load("_executeToolStep", {
+    _currentAiMode: "agent",
+    _runCheckpoint: new Map(),
+    _approveToolCall: async () => true,
+    _isCurrentLocationRequest: isCurrent,
+    _requestCurrentCoordinates: async () => ({
+      status: "success", latitude: 49.89, longitude: -97.14, accuracyM: 2500,
+      observedAtUnixMs: 1_783_888_800_000, sampleAgeMs: 500, source: "core_location",
+    }),
+    _roadLocationMetadata: roadMetadata,
+    _roadLocationAccuracyWarning: accuracyWarning,
+    _roadEnvironmentModelMessage: modelMessage,
+    _escHtml: (value) => String(value),
+    inTauri: true,
+    backend: { invoke: async (command, args) => {
+      assert.equal(command, "road_environment");
+      invokeArgs = args;
+      return {
+        topic: "road_environment",
+        records: Array.from({ length: 50 }, (_, index) => ({
+          source: "winnipeg", vehicle_count: index + 1, provider_payload: "x".repeat(2000),
+        })),
+        source_statuses: [{
+          source: "winnipeg", status: "delayed", result_count: 50,
+          data_as_of: "2026-07-12T12:00:00Z", data_as_of_kind: "aggregation_interval_end",
+        }, {
+          source: "caltrans_quickmap_chp_incidents", status: "no_coverage", result_count: 0,
+        }],
+        limitations: ["station count is not a simultaneous nearby total"],
+        retrieved_at: 1_783_888_800,
+      };
+    } },
+  });
+
+  const toolResult = await execute(step, {
+    type: "roadenvironment", path: "vehicle_counts", kind: "vehicle_counts",
+    near: "current", latitude: 1, longitude: 2, radiusKm: 1,
+  }, "", null);
+
+  assert.equal(invokeArgs.latitude, 49.89);
+  assert.equal(invokeArgs.longitude, -97.14);
+  assert.match(result.textContent, /1延迟/);
+  assert.match(result.textContent, /定位误差范围约 ±2500m，大于本次 1km 查询半径/);
+  assert.doesNotMatch(result.className, /--ok/, "delayed data must not render as ordinary success");
+  assert.match(toolResult.content, /定位精度警告/);
+  assert.match(toolResult.content, /delayed 表示数值已超过近实时窗口/);
+  assert.doesNotMatch(toolResult.content, /California CHP 记录只表示/,
+    "a no-coverage CHP status must not inject California-specific evidence");
+  const parsed = JSON.parse(toolResult.content.split("结构化数据：\n")[1]);
+  assert.equal(parsed.location_input.accuracy_exceeds_radius, true);
+  assert.equal(parsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
+  assert.equal(parsed.records.length + parsed.records_omitted, 50);
+  const finalModelMessage = toModel(
+    { type: "roadenvironment" },
+    { type: "roadenvironment", content: toolResult.content },
+  );
+  assert.ok(finalModelMessage.length <= 30000);
+  const finalParsed = JSON.parse(finalModelMessage.split("结构化数据：\n")[1]);
+  assert.equal(finalParsed.records.length + finalParsed.records_omitted, 50);
+  assert.equal(finalParsed.source_statuses[0].data_as_of_kind, "aggregation_interval_end");
+  assert.equal(opened.has("is-open"), true);
 });
 
 test("optional numeric tool arguments never coerce null into zero", () => {

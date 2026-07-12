@@ -254,6 +254,30 @@
   {
     "type": "function",
     "function": {
+      "name": "road_environment",
+      "description": "按用户明确提供或系统授权取得的坐标查询无需 API 密钥的道路环境公开源；查当前位置时传 near=current，IDE 会请求一次系统定位权限。vehicle_counts 返回温尼伯固定站时段计数，或挪威官方延迟约 2–3 小时的小时计数与覆盖率；traffic_flow 返回纽约/芝加哥道路速度原始值，或芬兰 TMS 带时间窗的 kpl/h 车流率与均速；road_incidents 返回奥斯汀、卡尔加里、DriveBC Open511、Fintraffic V2、TfL、芝加哥警察或 Caltrans QuickMap CHP 道路事件/报告；overview 查询当地适用类别。逐来源返回 success/delayed/empty/stale/no_coverage/failed；delayed 必须连同 data_as_of 和 data_as_of_kind 表述，不能冒充当前状态。空、过期或无覆盖绝不等于周围没有车、事故或危险。站点计数不是此刻同时在用户周围的车辆总数，不同站点不得相加；kpl/h 不是原始车辆数，速度也不能换算车辆数。California CHP 记录只表示 current public feed membership；data_as_of_kind=http_last_modified 只是 HTTP representation 的 Last-Modified 新鲜度代理，不是 feed 生成或事件更新时间，也不同于首次上报本地时间 event_time_local；不证明记录完整、已验证或仍在处置/活跃，也不覆盖 local-police-only 或未上报事故。不得输出 dispatch notes、车牌、电话号码、医疗或人物细节。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["overview", "vehicle_counts", "traffic_flow", "road_incidents"] },
+          "near": { "type": "string", "enum": ["current"], "description": "查询系统当前位置时传 current；会请求一次定位权限" },
+          "latitude": { "type": "number", "minimum": -90, "maximum": 90, "description": "用户明确提供或已授权的纬度；与 longitude 一起传" },
+          "longitude": { "type": "number", "minimum": -180, "maximum": 180, "description": "用户明确提供或已授权的经度；与 latitude 一起传" },
+          "radius_km": { "type": "integer", "minimum": 1, "maximum": 100, "description": "直线搜索半径公里，默认 10" },
+          "lookback_hours": { "type": "integer", "minimum": 1, "maximum": 720, "description": "仅 Austin 动态记录和 Chicago 警察报告的回看小时数，默认 24；其他来源是各自当前 feed" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "每个适用来源最多返回的记录数，默认 20；overview 可能包含多个来源" }
+        },
+        "required": ["kind"],
+        "anyOf": [
+          { "required": ["near"] },
+          { "required": ["latitude", "longitude"] }
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "track_shipment",
       "description": "免密快递真实性入口。17TRACK、AfterShip、快递100、DHL、FedEx、UPS、USPS 及中国主要承运商的正式机器 API 都需要账号凭据；本工具仅识别少数不歧义号码或使用用户提供的 carrier，返回承运商官方人工查询页并掩码单号。它不抓网页、不绕验证码、不把搜索结果冒充数据库，也不编造轨迹、位置、状态或 ETA。tracking_events 为空时必须直接说明本系统未核验物流状态。",
       "parameters": {

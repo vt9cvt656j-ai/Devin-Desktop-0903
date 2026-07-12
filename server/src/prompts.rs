@@ -75,6 +75,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_environment"
                 | "live_markets"
                 | "live_flights"
+                | "road_environment"
                 | "track_shipment"
                 | "ask_user"
         ),
@@ -96,6 +97,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_environment"
                 | "live_markets"
                 | "live_flights"
+                | "road_environment"
                 | "track_shipment"
                 | "research_project"
                 | "run_subagent"
@@ -124,6 +126,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_environment"
                 | "live_markets"
                 | "live_flights"
+                | "road_environment"
                 | "track_shipment"
                 | "research_project"
                 | "run_subagent"
@@ -1414,6 +1417,7 @@ mod tests {
             ("live_environment", "USGS"),
             ("live_markets", "Coinbase"),
             ("live_flights", "OpenSky"),
+            ("road_environment", "温尼伯"),
             ("track_shipment", "正式机器 API 都需要账号凭据"),
         ] {
             let tool = tools
@@ -1479,6 +1483,63 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("^[A-Za-z0-9_-]+$")
         );
+        let road = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|value| value.as_str())
+                    == Some("road_environment")
+            })
+            .unwrap();
+        let road_kinds = road
+            .pointer("/function/parameters/properties/kind/enum")
+            .and_then(|value| value.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            road_kinds,
+            [
+                "overview",
+                "vehicle_counts",
+                "traffic_flow",
+                "road_incidents"
+            ]
+        );
+        let road_required = road
+            .pointer("/function/parameters/required")
+            .and_then(|value| value.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(road_required, ["kind"]);
+        let road_location_options = road
+            .pointer("/function/parameters/anyOf")
+            .and_then(|value| value.as_array())
+            .unwrap();
+        assert_eq!(road_location_options.len(), 2);
+        assert_eq!(
+            road_location_options[0]
+                .pointer("/required/0")
+                .and_then(|value| value.as_str()),
+            Some("near")
+        );
+        assert_eq!(
+            road_location_options[1]
+                .pointer("/required")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        let road_description = road
+            .pointer("/function/description")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        assert!(road_description.contains("Caltrans QuickMap CHP"));
+        assert!(road_description.contains("data_as_of_kind=http_last_modified"));
+        assert!(road_description.contains("不得输出 dispatch notes"));
     }
 
     #[test]

@@ -332,6 +332,7 @@ pub fn run() {
             public_data::live_environment,
             public_data::live_markets,
             public_data::live_flights,
+            public_data::road_environment,
             public_data::track_shipment,
             game::game_scaffold,
             web_scaffold::web_scaffold,
