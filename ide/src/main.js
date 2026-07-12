@@ -44,6 +44,7 @@ import { parseProblems } from "./problem-matchers.js";
 import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
 import { ConversationMemory, serializeMessagesForPersistence } from "./conversation-memory.js";
+import exifr from "exifr";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -257,6 +258,7 @@ async function tauriBackend() {
     readDir: async (path) => { const es = await core.invoke("read_dir", { path }); return Array.isArray(es) ? es.map((e) => (e && typeof e.path === "string" ? { ...e, path: _toPosix(e.path) } : e)) : es; },
     readTextFile: (path) => core.invoke("read_text_file", { path }),
     readFileDataUrl: (path) => core.invoke("read_file_data_url", { path }),
+    reverseGeocodeCoordinates: (latitude, longitude, language) => core.invoke("reverse_geocode_coordinates", { latitude, longitude, language }),
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
     writeTextFileIfUnchanged: (path, expectedContent, content) => core.invoke("write_text_file_if_unchanged", { path, expectedContent, content }),
     deleteTextFileIfUnchanged: (path, expectedContent) => core.invoke("delete_text_file_if_unchanged", { path, expectedContent }),
@@ -8398,7 +8400,7 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。部分来源失败要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
+const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明，无 GPS 时只能用清晰路牌、门牌、店名或独特地标形成待核验候选，禁止仅凭建筑风格、语言或截图内容声称确定街区。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态，不要先读一个不存在的路径。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
@@ -9603,7 +9605,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  for (const m of await _memoryMessagesForModel(sess.memory, config)) messages.push(m);
+  for (const m of await _memoryMessagesForModel(sess.memory, config, text)) messages.push(m);
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
@@ -9680,7 +9682,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _userText = _contextPreamble
     + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
     + text;
-  const userContent = await _attachmentAwareContent(_userText, attachments, config);
+  const userContent = await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text);
   messages.push({ role: "user", content: userContent });
   sess.memory.push({ role: "user", content: text, attachments });
   saveChatHistory(); // persist the prompt now, so an interrupted run / app close keeps it
@@ -16945,6 +16947,15 @@ function _cheapHash(s = "") {
   return (h >>> 0).toString(36) + ":" + s.length;
 }
 
+async function _mediaSourceFingerprint(dataUrl) {
+  const value = String(dataUrl || "");
+  const comma = value.indexOf(",");
+  const payload = comma >= 0 ? value.slice(comma + 1) : value;
+  if (!globalThis.crypto?.subtle || typeof TextEncoder === "undefined") return "";
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload));
+  return `sha256:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
 const _visionCache = new Map(); // image-hash -> transcription (bounded below)
 async function _describeImageForTextModel(dataUrl, hint, baseConfig) {
   try {
@@ -16975,13 +16986,49 @@ async function _describeImageForTextModel(dataUrl, hint, baseConfig) {
 async function _attachmentImageInputs(attachment) {
   if (!attachment || typeof attachment !== "object") return [];
   if (attachment.kind === "video") return (Array.isArray(attachment.frames) ? attachment.frames : []).filter((value) => typeof value === "string" && value.startsWith("data:image/")).slice(0, 4);
-  if (typeof attachment.dataUrl === "string" && attachment.dataUrl.startsWith("data:image/")) return [attachment.dataUrl];
+  if (typeof attachment.dataUrl === "string" && attachment.dataUrl.startsWith("data:image/")) {
+    if (attachment.modelMediaSanitized === true) return [attachment.dataUrl];
+    const sanitized = await _downscaleImageForVision(attachment.dataUrl, 1568, true);
+    if (!sanitized) {
+      attachment.dataUrl = "";
+      attachment.modelMediaSanitized = false;
+      return [];
+    }
+    attachment.dataUrl = sanitized;
+    attachment.modelMediaSanitized = true;
+    return [sanitized];
+  }
+  if (attachment.modelMediaSanitized === false) return [];
   if (attachment.path && inTauri) {
     try {
-      const dataUrl = await backend.readFileDataUrl(attachment.path);
-      if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) {
-        attachment.dataUrl = dataUrl;
-        return [dataUrl];
+      const original = await backend.readFileDataUrl(attachment.path);
+      if (typeof original === "string" && original.startsWith("data:image/")) {
+        if (attachment.sourceFingerprint && await _mediaSourceFingerprint(original) !== attachment.sourceFingerprint) {
+          attachment.mediaSourceChanged = true;
+          attachment.locationEvidence = {
+            status: "embedded_location_absent",
+            coordinateSource: null,
+            metadataAuthenticity: "not_verified",
+            invalidatedReason: "source_file_changed",
+          };
+          return [];
+        }
+        if (!attachment.sourceFingerprint && attachment.locationEvidence?.status !== "embedded_location_absent") {
+          attachment.locationEvidence = {
+            status: "embedded_location_absent",
+            coordinateSource: null,
+            metadataAuthenticity: "not_verified",
+            invalidatedReason: "missing_source_fingerprint",
+          };
+        }
+        const sanitized = await _downscaleImageForVision(original, 1568, true);
+        if (!sanitized) {
+          attachment.modelMediaSanitized = false;
+          return [];
+        }
+        attachment.dataUrl = sanitized;
+        attachment.modelMediaSanitized = true;
+        return [sanitized];
       }
     } catch {}
   }
@@ -16990,9 +17037,10 @@ async function _attachmentImageInputs(attachment) {
 
 // Convert stored attachment metadata into a provider-valid user content value.
 // This function also caches a visual transcription for genuinely text-only models.
-async function _attachmentAwareContent(text, attachments, config, maxMediaChars = 7_000_000) {
+async function _attachmentAwareContent(text, attachments, config, maxMediaChars = 7_000_000, forceLocationEvidence = false, locationIntentText = text) {
   const list = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
   if (!list.length) return text;
+  const wantsLocationEvidence = forceLocationEvidence || _isImageLocationRequest(locationIntentText, true);
   const inputs = [];
   let remaining = Math.max(0, Number(maxMediaChars) || 0);
   for (const attachment of list) {
@@ -17005,10 +17053,18 @@ async function _attachmentAwareContent(text, attachments, config, maxMediaChars 
     }
     inputs.push({ attachment, images, omitted });
   }
+  if (wantsLocationEvidence) {
+    await Promise.all(inputs
+      .filter(({ attachment }) => attachment?.kind === "image" && !attachment.mediaSourceChanged)
+      .map(({ attachment }) => _ensureAttachmentLocationEvidence(attachment)));
+  }
   if (_modelSeesImages(config && config.model)) {
     const content = [{ type: "text", text }];
-    for (const { attachment, images, omitted } of inputs) {
-      if (attachment.kind === "video") content.push({ type: "text", text: `下面是视频「${attachment.name || "video"}」按时间顺序抽取的 ${images.length} 张关键帧。` });
+    for (let index = 0; index < inputs.length; index++) {
+      const { attachment, images, omitted } = inputs[index];
+      const label = `附件 ${index + 1}「${attachment.name || attachment.kind || "media"}」`;
+      if (attachment.kind === "video") content.push({ type: "text", text: `${label}是视频，下面是按时间顺序抽取的 ${images.length} 张关键帧。` });
+      else content.push({ type: "text", text: `${label}是图片。${wantsLocationEvidence ? `\n${_attachmentLocationEvidenceContext(attachment)}` : ""}` });
       for (const dataUrl of images) content.push({ type: "image_url", image_url: { url: dataUrl } });
       if (omitted) content.push({ type: "text", text: `附件「${attachment.name || attachment.kind || "media"}」另有 ${omitted} 个画面因本轮媒体总量上限未重复发送。` });
     }
@@ -17020,25 +17076,31 @@ async function _attachmentAwareContent(text, attachments, config, maxMediaChars 
     let description = String(attachment.visionText || "").trim();
     if (!description && images.length) {
       const frames = await Promise.all(images.map((dataUrl, frameIndex) =>
-        _describeImageForTextModel(dataUrl, attachment.kind === "video" ? `这是视频「${attachment.name || "video"}」的第 ${frameIndex + 1} 张关键帧。` : "这是用户随消息附上的图片。", config)));
+        _describeImageForTextModel(dataUrl, attachment.kind === "video" ? `这是视频「${attachment.name || "video"}」的第 ${frameIndex + 1} 张关键帧。` : wantsLocationEvidence ? "用户要求判断图片地点。请特别逐字读取路牌、门牌、店名、公交/地铁站名，但不要仅凭建筑风格猜地址。" : "这是用户随消息附上的图片。", config)));
       description = frames.filter(Boolean).map((value, frameIndex) => `画面 ${frameIndex + 1}:\n${value}`).join("\n\n");
       if (description) attachment.visionText = description;
     }
-    descriptions.push(description
+    const locationContext = wantsLocationEvidence && attachment.kind === "image" ? `\n${_attachmentLocationEvidenceContext(attachment)}` : "";
+    descriptions.push((description
       ? `【附件 ${index + 1}：${attachment.name || attachment.kind || "media"} 的视觉转写】\n${description}`
-      : `【附件 ${index + 1}：${attachment.name || attachment.kind || "media"}】无法读取有效画面。`);
+      : `【附件 ${index + 1}：${attachment.name || attachment.kind || "media"}】无法读取有效画面。`) + locationContext);
   }
   return text + "\n\n———\n当前模型不接收图片，我已把附件转写为文字：\n\n" + descriptions.join("\n\n———\n\n");
 }
 
 // Strip IDE-only attachment fields and rebuild valid multimodal history messages.
-async function _memoryMessagesForModel(memory, config) {
+async function _memoryMessagesForModel(memory, config, currentUserText = "") {
   const assembled = memory?.assemble?.() || [];
+  const latestUserText = currentUserText || [...assembled].reverse().find((message) => message?.role === "user")?.content || "";
   const mediaTurns = assembled
     .map((message, index) => Array.isArray(message?.attachments) && message.attachments.length ? index : -1)
     .filter((index) => index >= 0)
     .slice(-4);
+  const wantsPriorImageLocation = _isImageLocationRequest(latestUserText, mediaTurns.length > 0);
   const activeMediaTurns = new Set(mediaTurns);
+  const latestImageTurn = [...mediaTurns].reverse().find((index) =>
+    assembled[index]?.role === "user"
+    && assembled[index].attachments.some((attachment) => attachment?.kind === "image"));
   const out = [];
   for (let index = 0; index < assembled.length; index++) {
     const message = assembled[index];
@@ -17046,13 +17108,24 @@ async function _memoryMessagesForModel(memory, config) {
     const clean = { ...message };
     delete clean.attachments;
     if (activeMediaTurns.has(index) && message.role === "user") {
-      clean.content = await _attachmentAwareContent(String(message.content || ""), message.attachments, config, 3_000_000);
+      clean.content = await _attachmentAwareContent(String(message.content || ""), message.attachments, config, 3_000_000, wantsPriorImageLocation && index === latestImageTurn, "");
     } else if (Array.isArray(message.attachments) && message.attachments.length) {
       clean.content = String(message.content || "") + `\n（该轮曾附带 ${message.attachments.length} 个媒体文件；为控制请求大小，原始画面未在本轮重复发送。）`;
     }
     out.push(clean);
   }
   return out;
+}
+
+function _latestHistoricalImageAttachments(memory) {
+  const messages = memory?.assemble?.() || [];
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role !== "user" || !Array.isArray(message.attachments)) continue;
+    const images = message.attachments.filter((attachment) => attachment?.kind === "image");
+    if (images.length) return images;
+  }
+  return [];
 }
 
 // Build the message that feeds screenshots/images back to the model — natively
@@ -17885,7 +17958,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         for (const queued of session._steerQueue.splice(0)) {
           const steerText = typeof queued === "string" ? queued : String(queued?.text || "");
           const steerAttachments = typeof queued === "string" ? [] : (queued?.attachments || []);
-          const content = await _attachmentAwareContent(`[MICHAEL_USER_STEERING]\n\n${steerText}`, steerAttachments, config);
+          const priorImages = steerAttachments.length ? [] : _latestHistoricalImageAttachments(session.memory);
+          const effectiveAttachments = steerAttachments.length || !_isImageLocationRequest(steerText, priorImages.length > 0)
+            ? steerAttachments : priorImages;
+          const content = await _attachmentAwareContent(`[MICHAEL_USER_STEERING]\n\n${steerText}`, effectiveAttachments, config, 7_000_000, false, steerText);
           messages.push({ role: "user", content });
         }
       }
@@ -27582,23 +27658,141 @@ function _refreshImagePreviews() {
   if (_pastedImages.length === 0) container.remove();
 }
 
+function _validEmbeddedCoordinate(value, min, max) {
+  return Number.isFinite(value) && value >= min && value <= max ? value : null;
+}
+
+// Read only location-related EXIF fields from the original Blob. This must run
+// before Canvas resizing, which commonly strips metadata from the model image.
+async function _extractEmbeddedImageLocation(blob) {
+  try {
+    const gps = await exifr.gps(blob).catch(() => null);
+    const latitude = _validEmbeddedCoordinate(gps?.latitude, -90, 90);
+    const longitude = _validEmbeddedCoordinate(gps?.longitude, -180, 180);
+    if (latitude === null || longitude === null) {
+      return {
+        status: "embedded_location_absent",
+        coordinateSource: null,
+        metadataAuthenticity: "not_verified",
+      };
+    }
+    const tags = await exifr.parse(blob, ["GPSHPositioningError"]).catch(() => null);
+    const rawAccuracy = tags?.GPSHPositioningError;
+    const reportedAccuracyM = Number.isFinite(rawAccuracy) && rawAccuracy >= 0 ? rawAccuracy : null;
+    return {
+      status: "embedded_gps",
+      latitude,
+      longitude,
+      reportedAccuracyM,
+      coordinateSource: "embedded_exif_gps",
+      metadataAuthenticity: "not_verified",
+      reverseGeocoding: [],
+      sourceStatuses: [],
+      retrievedAt: null,
+      limitations: [
+        "EXIF GPS is metadata stored in the image file; it can be edited, copied, or stale and is not an authenticity proof.",
+        reportedAccuracyM === null
+          ? "The image does not report GPS horizontal positioning error, so coordinate accuracy is unknown."
+          : "reportedAccuracyM is the image metadata's GPSHPositioningError value, not an independently measured accuracy.",
+      ],
+    };
+  } catch {
+    return {
+      status: "embedded_location_absent",
+      coordinateSource: null,
+      metadataAuthenticity: "not_verified",
+    };
+  }
+}
+
+function _isImageLocationRequest(text, hasImageContext = false) {
+  if (!hasImageContext) return false;
+  const value = String(text || "").toLowerCase();
+  const developerContext = /\b(cdn|url|uri|src|href|css|html|object-fit|position|absolute|relative|fixed)\b|样式|布局|页面|代码|文件路径|资源地址|图片地址|链接地址|元素位置|定位属性/i.test(value);
+  const explicitGeography = /拍摄|拍的|拍于|经纬度|\bgps\b|\bexif\b|街区|街道|城市|国家|地理位置|geo[- ]?locat|where.{0,20}(taken|shot)|neighbou?rhood|coordinates?/i.test(value);
+  if (developerContext && !explicitGeography) return false;
+  return /(?:这张|这个|这幅|这是|它|照片|图片|图).{0,14}(?:在哪|哪里|哪儿|什么地方|哪个(?:街区|街道|城市|国家)|拍摄地|拍摄位置|在哪里拍|哪儿拍)|(?:在哪|哪里|哪儿|什么地方|哪个街区).{0,14}(?:拍|照片|图片|这张|这个|它)|(?:定位|地理定位).{0,10}(?:照片|图片|这张|这个|它)|what\s+neighbou?rhood\s+is\s+(?:this|it)|where.{0,20}(?:photo|image|picture|this|it).{0,20}(?:taken|shot|located)|(?:photo|image|picture).{0,16}(?:location|neighbou?rhood|where)/i.test(value);
+}
+
+async function _ensureAttachmentLocationEvidence(attachment) {
+  const evidence = attachment?.locationEvidence;
+  if (!evidence || evidence.status === "embedded_location_absent") return evidence || null;
+  if (Array.isArray(evidence.reverseGeocoding) && evidence.reverseGeocoding.length) return evidence;
+  if (!inTauri || typeof backend?.reverseGeocodeCoordinates !== "function") return evidence;
+  if (attachment._locationEvidencePromise) return attachment._locationEvidencePromise;
+  attachment._locationEvidencePromise = (async () => {
+    try {
+      const response = await backend.reverseGeocodeCoordinates(evidence.latitude, evidence.longitude, document.documentElement.lang || "zh");
+      evidence.reverseGeocoding = Array.isArray(response?.candidates) ? response.candidates.slice(0, 4) : [];
+      evidence.sourceStatuses = Array.isArray(response?.source_statuses) ? response.source_statuses.slice(0, 4) : [];
+      evidence.retrievedAt = Number.isFinite(response?.retrieved_at) ? response.retrieved_at : null;
+      evidence.limitations = [
+        ...(Array.isArray(evidence.limitations) ? evidence.limitations : []),
+        ...(Array.isArray(response?.limitations) ? response.limitations : []),
+      ].slice(0, 10);
+      evidence.status = evidence.reverseGeocoding.length ? "embedded_gps_resolved" : "embedded_gps_unresolved";
+    } catch (error) {
+      evidence.status = "embedded_gps_reverse_failed";
+      evidence.sourceStatuses = [{ source: "reverse_geocoding", status: "failed", detail: String(error?.message || error).slice(0, 360) }];
+    }
+    return evidence;
+  })().finally(() => { delete attachment._locationEvidencePromise; });
+  return attachment._locationEvidencePromise;
+}
+
+function _attachmentLocationEvidenceContext(attachment) {
+  const evidence = attachment?.locationEvidence;
+  if (attachment?.mediaSourceChanged || evidence?.invalidatedReason === "source_file_changed") {
+    return "图片定位证据不可用：会话保存的文件路径现在指向不同内容，旧画面与旧 EXIF/地图反查证据已全部停用，未把新文件冒充原附件。";
+  }
+  if (evidence?.invalidatedReason === "missing_source_fingerprint") {
+    return "图片定位证据不可用：这是旧版本保存的路径附件，没有原始内容指纹，无法证明当前文件仍是原图；旧 EXIF/地图反查证据已停用。";
+  }
+  if (!evidence || evidence.status === "embedded_location_absent") {
+    return [
+      "图片定位证据：原始图片没有可读取的嵌入式 GPS 坐标。",
+      "不得把截图/广告/翻拍内容中的地址当成拍摄位置；只能从清晰路牌、门牌、店名或独特地标提取候选，再调用真实地理数据核验。只有建筑风格、语言、植被等泛化视觉特征时必须回答无法可靠定位到街区。",
+    ].join("\n");
+  }
+  const structured = JSON.stringify({
+    status: evidence.status,
+    coordinates: {
+      latitude: evidence.latitude,
+      longitude: evidence.longitude,
+      source: evidence.coordinateSource,
+      reported_accuracy_m: evidence.reportedAccuracyM ?? null,
+    },
+    metadata_authenticity: evidence.metadataAuthenticity,
+    reverse_geocoding_candidates: evidence.reverseGeocoding || [],
+    source_statuses: evidence.sourceStatuses || [],
+    retrieved_at: evidence.retrievedAt ?? null,
+    limitations: evidence.limitations || [],
+  }, null, 2);
+  return [
+    "图片定位证据（从缩放前的原始图片本地提取）：",
+    structured,
+    "表达约束：坐标只能称为图片 EXIF 元数据报告的位置，EXIF 可被修改；地图反查标签是公开数据库中的附近候选。来源门牌或标签冲突时必须逐项报告，不得合并成确定地址；retrieved_at 不是照片拍摄时间或地图更新时间。",
+  ].join("\n");
+}
+
 // Downscale a pasted/dropped image so vision models actually get a clean, in-budget
 // image. Frontier models internally resize to ~1.15MP anyway, and a raw 4K screenshot
 // (5-10MB base64) trips the payload cap and gets stripped ("读不懂图片"). Cap the long
 // edge at 1568px (Claude's text-optimal tile) → keep PNG when it stays small (crisp text),
 // else JPEG. Small images pass through untouched (best fidelity). Never throws.
-function _downscaleImageForVision(dataUrl, maxDim = 1568) {
+function _downscaleImageForVision(dataUrl, maxDim = 1568, stripMetadata = false) {
   return new Promise((resolve) => {
+    const decodeFallback = () => resolve(stripMetadata ? "" : dataUrl);
     try {
       const img = new Image();
       img.onload = () => {
         try {
           const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
           const long = Math.max(w, h);
-          if (!long) return resolve(dataUrl);
+          if (!long) return decodeFallback();
           // Already small enough → keep original bytes.
           const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
-          if (!needsRaster && long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
+          if (!stripMetadata && !needsRaster && long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
           const scale = long > maxDim ? maxDim / long : 1;
           const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
           const cv = document.createElement("canvas");
@@ -27608,12 +27802,12 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568) {
           cx.drawImage(img, 0, 0, cw, ch);
           let out = cv.toDataURL("image/png");
           if (out.length > 1_500_000) out = cv.toDataURL("image/jpeg", 0.9); // bound big/photographic
-          resolve(out && out.length < String(dataUrl).length ? out : dataUrl);
-        } catch { resolve(dataUrl); }
+          resolve(stripMetadata ? (out || "") : (out && out.length < String(dataUrl).length ? out : dataUrl));
+        } catch { decodeFallback(); }
       };
-      img.onerror = () => resolve(dataUrl);
+      img.onerror = decodeFallback;
       img.src = dataUrl;
-    } catch { resolve(dataUrl); }
+    } catch { decodeFallback(); }
   });
 }
 
@@ -27688,8 +27882,12 @@ async function _mediaAttachmentFromFile(file) {
   if (kind === "video" && Number(file?.size || 0) > 40 * 1024 * 1024) throw new Error("视频超过 40 MB，请先压缩或截取关键片段");
   const readable = usableDeclaredMime ? file : new Blob([file], { type: mime });
   if (kind === "image") {
-    const original = await _readFileAsDataUrl(readable);
-    return { kind, mime, name: name || "image.png", path: file.path || "", dataUrl: await _downscaleImageForVision(original), frames: [] };
+    const [original, locationEvidence] = await Promise.all([
+      _readFileAsDataUrl(readable),
+      _extractEmbeddedImageLocation(readable),
+    ]);
+    const dataUrl = await _downscaleImageForVision(original, 1568, true);
+    return { kind, mime, name: name || "image.png", path: file.path || "", dataUrl, modelMediaSanitized: !!dataUrl, sourceFingerprint: await _mediaSourceFingerprint(original), frames: [], locationEvidence };
   }
   const objectUrl = URL.createObjectURL(readable);
   const frames = await _extractVideoFrames(objectUrl);
@@ -27727,8 +27925,12 @@ async function _mediaAttachmentFromPath(path) {
   const mime = responseMime && responseMime !== "application/octet-stream" ? responseMime : inferredMime;
   if (!mime.startsWith(kind + "/")) throw new Error(`${kind === "video" ? "视频" : "图片"}格式无法识别`);
   if (kind === "image") {
-    const original = await _readFileAsDataUrl(blob);
-    return { kind, mime, name, path: normalizedPath, dataUrl: await _downscaleImageForVision(original), frames: [] };
+    const [original, locationEvidence] = await Promise.all([
+      _readFileAsDataUrl(blob),
+      _extractEmbeddedImageLocation(blob),
+    ]);
+    const dataUrl = await _downscaleImageForVision(original, 1568, true);
+    return { kind, mime, name, path: normalizedPath, dataUrl, modelMediaSanitized: !!dataUrl, sourceFingerprint: await _mediaSourceFingerprint(original), frames: [], locationEvidence };
   }
   const objectUrl = URL.createObjectURL(blob);
   let frames;

@@ -14,6 +14,7 @@ mod files;
 mod game;
 mod game_assets;
 mod git;
+mod image_location;
 mod knowledge;
 mod local_discovery;
 mod location;
@@ -200,6 +201,7 @@ pub fn run() {
             proxy::proxy_ca_path,
             proxy::proxy_set_system_proxy,
             qr::decode_qr,
+            image_location::reverse_geocode_coordinates,
             location::request_current_location,
             db::db_query,
             mcp::mcp_connect,

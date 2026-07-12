@@ -13,6 +13,61 @@ const MAX_SUMMARIES = 8;
 const SUMMARY_BATCH = 10;
 const PERSISTED_MEDIA_BUDGET = 3_200_000;
 
+function serializeLocationEvidence(evidence) {
+  if (!evidence || typeof evidence !== 'object') return undefined;
+  const latitude = evidence.latitude;
+  const longitude = evidence.longitude;
+  const hasCoordinates = typeof latitude === 'number' && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90
+    && typeof longitude === 'number' && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180;
+  const statuses = new Set([
+    'embedded_location_absent',
+    'embedded_gps',
+    'embedded_gps_resolved',
+    'embedded_gps_unresolved',
+    'embedded_gps_reverse_failed',
+  ]);
+  const status = statuses.has(evidence.status) ? evidence.status : (hasCoordinates ? 'embedded_gps' : 'embedded_location_absent');
+  const cleanText = (value, max = 500) => typeof value === 'string' ? value.slice(0, max) : null;
+  const candidate = (value) => {
+    if (!value || typeof value !== 'object') return null;
+    const out = {};
+    for (const key of ['source', 'label', 'house_number', 'road', 'neighborhood', 'suburb', 'city_district', 'city', 'state', 'country', 'country_code']) {
+      const text = cleanText(value[key]);
+      if (text) out[key] = text;
+    }
+    const lat = value.latitude, lon = value.longitude;
+    if (typeof lat === 'number' && Number.isFinite(lat) && lat >= -90 && lat <= 90) out.latitude = lat;
+    if (typeof lon === 'number' && Number.isFinite(lon) && lon >= -180 && lon <= 180) out.longitude = lon;
+    return Object.keys(out).length ? out : null;
+  };
+  const out = {
+    status,
+    coordinateSource: hasCoordinates ? 'embedded_exif_gps' : null,
+    metadataAuthenticity: 'not_verified',
+  };
+  if (['source_file_changed', 'missing_source_fingerprint'].includes(evidence.invalidatedReason)) {
+    out.invalidatedReason = evidence.invalidatedReason;
+  }
+  if (hasCoordinates) {
+    out.latitude = latitude;
+    out.longitude = longitude;
+    const accuracy = evidence.reportedAccuracyM;
+    out.reportedAccuracyM = typeof accuracy === 'number' && Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null;
+  }
+  out.reverseGeocoding = (Array.isArray(evidence.reverseGeocoding) ? evidence.reverseGeocoding : [])
+    .slice(0, 4).map(candidate).filter(Boolean);
+  out.sourceStatuses = (Array.isArray(evidence.sourceStatuses) ? evidence.sourceStatuses : [])
+    .slice(0, 4).map((value) => ({
+      source: cleanText(value?.source, 120) || 'unknown',
+      status: cleanText(value?.status, 40) || 'unknown',
+      detail: cleanText(value?.detail, 500) || '',
+    }));
+  out.retrievedAt = typeof evidence.retrievedAt === 'number' && Number.isFinite(evidence.retrievedAt) ? evidence.retrievedAt : null;
+  out.limitations = (Array.isArray(evidence.limitations) ? evidence.limitations : [])
+    .slice(0, 10).map((value) => cleanText(value, 600)).filter(Boolean);
+  return out;
+}
+
 // Keep enough recent visual context to survive a restart without letting base64
 // media overflow localStorage. Raw videos are never persisted; their compressed
 // key frames (or a stable local path) are the durable representation.
@@ -26,7 +81,14 @@ function serializeAttachment(attachment, budget) {
     mime: String(attachment.mime || attachment.type || (kind === 'video' ? 'video/mp4' : 'image/png')).slice(0, 120),
     name: String(attachment.name || (kind === 'video' ? 'video' : 'image')).slice(0, 240),
     path: String(attachment.path || '').slice(0, 2048),
+    sourceFingerprint: typeof attachment.sourceFingerprint === 'string'
+      ? attachment.sourceFingerprint.slice(0, 120) : '',
     visionText: String(attachment.visionText || '').slice(0, 6000),
+    modelMediaSanitized: attachment.modelMediaSanitized === true
+      ? true
+      : attachment.modelMediaSanitized === false ? false : undefined,
+    mediaSourceChanged: attachment.mediaSourceChanged === true,
+    locationEvidence: serializeLocationEvidence(attachment.locationEvidence),
     frames: [],
   };
   const keepDataUrl = (value, prefix) => {

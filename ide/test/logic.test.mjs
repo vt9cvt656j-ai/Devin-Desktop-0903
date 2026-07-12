@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import exifr from "exifr";
 import { ConversationMemory, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -589,6 +590,51 @@ test("conversation media persistence keeps images/key frames but drops raw video
   assert.deepEqual(ConversationMemory.fromJSON(memory.toJSON()).recent[0].attachments, saved);
 });
 
+test("conversation media persistence keeps only bounded truthful image location evidence", () => {
+  const saved = serializeMessagesForPersistence([{
+    role: "user",
+    content: "这张照片在哪里",
+    attachments: [{
+      kind: "image",
+      dataUrl: "data:image/jpeg;base64,AAAA",
+      modelMediaSanitized: true,
+      locationEvidence: {
+        status: "embedded_gps_resolved",
+        latitude: -33.8688,
+        longitude: 151.2093,
+        reportedAccuracyM: 12,
+        coordinateSource: "untrusted_override",
+        metadataAuthenticity: "verified",
+        reverseGeocoding: [{ source: "nominatim", label: "Sydney", road: "George Street", secret: "drop" }],
+        sourceStatuses: [{ source: "nominatim", status: "success", detail: "ok" }],
+        retrievedAt: 123,
+        limitations: ["EXIF can be edited"],
+      },
+    }],
+  }])[0].attachments[0].locationEvidence;
+  assert.equal(saved.latitude, -33.8688);
+  assert.equal(saved.longitude, 151.2093);
+  assert.equal(saved.coordinateSource, "embedded_exif_gps");
+  assert.equal(saved.metadataAuthenticity, "not_verified");
+  assert.equal(saved.reverseGeocoding[0].secret, undefined);
+  assert.equal(saved.reverseGeocoding[0].road, "George Street");
+  assert.equal(serializeMessagesForPersistence([{
+    role: "user", attachments: [{ kind: "image", modelMediaSanitized: true }],
+  }])[0].attachments[0].modelMediaSanitized, true);
+
+  const absent = serializeMessagesForPersistence([{
+    role: "user",
+    attachments: [{ kind: "image", locationEvidence: {
+      status: "embedded_location_absent", latitude: null, longitude: null,
+      reportedAccuracyM: null, retrievedAt: null,
+    } }],
+  }])[0].attachments[0].locationEvidence;
+  assert.equal(absent.status, "embedded_location_absent");
+  assert.equal(absent.latitude, undefined, "null metadata must never become latitude zero");
+  assert.equal(absent.longitude, undefined, "null metadata must never become longitude zero");
+  assert.equal(absent.retrievedAt, null);
+});
+
 test("conversation media persistence records an explicit placeholder when its budget is exhausted", () => {
   const large = "data:image/png;base64," + "A".repeat(200);
   const small = "data:image/png;base64,B";
@@ -751,7 +797,7 @@ test("Tauri composer drops turn media paths into real attachments", async () => 
 test("native media paths produce durable image data and video key frames", async () => {
   const videoExts = new Set(["mp4", "webm", "ogv", "ogg", "mov", "m4v"]);
   const isVideo = load("isVideoFile", { VIDEO_EXTS: videoExts });
-  const fetched = [], extracted = [], revoked = [];
+  const fetched = [], extracted = [], revoked = [], resizeArgs = [];
   const fromPath = load("_mediaAttachmentFromPath", {
     _toPosix: TO_POSIX,
     basename: (path) => path.split("/").pop(),
@@ -770,7 +816,9 @@ test("native media paths produce durable image data and video key frames", async
       return { ok: true, blob: async () => new Blob([video ? "VIDEO" : "IMAGE"], { type }) };
     },
     _readFileAsDataUrl: async () => "data:image/png;base64,RAW",
-    _downscaleImageForVision: async (value) => value.replace("RAW", "SCALED"),
+    _mediaSourceFingerprint: (value) => `hash:${value.length}`,
+    _extractEmbeddedImageLocation: async () => ({ status: "embedded_gps", latitude: 31.2, longitude: 121.4 }),
+    _downscaleImageForVision: async (...args) => { resizeArgs.push(args); return args[0].replace("RAW", "SCALED"); },
     _extractVideoFrames: async (source) => { extracted.push(source); return ["data:image/jpeg;base64,FRAME"]; },
     URL: { createObjectURL: () => "blob:test-video", revokeObjectURL: (value) => revoked.push(value) },
   });
@@ -778,6 +826,7 @@ test("native media paths produce durable image data and video key frames", async
   const video = await fromPath("C:\\Users\\me\\clip.webm");
   assert.equal(image.dataUrl, "data:image/png;base64,SCALED");
   assert.equal(image.path, "C:/Users/me/shot.png");
+  assert.equal(image.locationEvidence.status, "embedded_gps");
   assert.equal(video.mime, "video/webm");
   assert.deepEqual(video.frames, ["data:image/jpeg;base64,FRAME"]);
   await assert.rejects(() => fromPath("C:/Users/me/huge.png"), /图片超过 25 MB/);
@@ -790,6 +839,7 @@ test("native media paths produce durable image data and video key frames", async
   ]);
   assert.deepEqual(extracted, ["blob:test-video"]);
   assert.deepEqual(revoked, ["blob:test-video"]);
+  assert.deepEqual(resizeArgs[0].slice(1), [1568, true], "model image bytes must be re-encoded without EXIF metadata");
   assert.equal(SRC.includes("registerWorkspaceRoot(parentDir(normalizedPath))"), false,
     "dropping one file must not grant the whole parent directory");
 });
@@ -804,6 +854,8 @@ test("empty OS MIME still produces a model-readable image data URL", async () =>
     isVideoFile: load("isVideoFile", { VIDEO_EXTS: videoExts }),
     _mediaMimeForName: inferredMime,
     _readFileAsDataUrl: async (blob) => { encodedType = blob.type; return `data:${blob.type};base64,IMAGE`; },
+    _mediaSourceFingerprint: (value) => `hash:${value.length}`,
+    _extractEmbeddedImageLocation: async () => ({ status: "embedded_location_absent" }),
     _downscaleImageForVision: async (value) => value,
     _extractVideoFrames: async () => [],
     URL,
@@ -814,6 +866,240 @@ test("empty OS MIME still produces a model-readable image data URL", async () =>
   assert.equal(encodedType, "image/jpeg");
   assert.equal(attachment.mime, "image/jpeg");
   assert.match(attachment.dataUrl, /^data:image\/jpeg;base64,/);
+  assert.equal(attachment.locationEvidence.status, "embedded_location_absent");
+});
+
+test("image GPS metadata is read before resize and remains explicitly unauthenticated", async () => {
+  const valid = load("_validEmbeddedCoordinate");
+  const extract = load("_extractEmbeddedImageLocation", {
+    exifr: {
+      gps: async () => ({ latitude: -33.8688, longitude: 151.2093 }),
+      parse: async () => ({ GPSHPositioningError: 8.5 }),
+    },
+    _validEmbeddedCoordinate: valid,
+  });
+  const evidence = await extract(new Blob(["original jpeg bytes"]));
+  assert.deepEqual({ latitude: evidence.latitude, longitude: evidence.longitude }, { latitude: -33.8688, longitude: 151.2093 });
+  assert.equal(evidence.reportedAccuracyM, 8.5);
+  assert.equal(evidence.coordinateSource, "embedded_exif_gps");
+  assert.equal(evidence.metadataAuthenticity, "not_verified");
+
+  const absent = load("_extractEmbeddedImageLocation", {
+    exifr: { gps: async () => undefined, parse: async () => ({}) },
+    _validEmbeddedCoordinate: valid,
+  });
+  assert.equal((await absent(new Blob(["screenshot"]))).status, "embedded_location_absent");
+  const nullGps = load("_extractEmbeddedImageLocation", {
+    exifr: { gps: async () => ({ latitude: null, longitude: null }), parse: async () => ({ GPSHPositioningError: null }) },
+    _validEmbeddedCoordinate: valid,
+  });
+  const nullEvidence = await nullGps(new Blob(["corrupt metadata"]));
+  assert.equal(nullEvidence.status, "embedded_location_absent");
+
+  // Minimal little-endian TIFF with real GPS IFD entries for Shanghai. This
+  // exercises the installed parser instead of only testing a mocked decoder.
+  const buffer = new ArrayBuffer(152), view = new DataView(buffer);
+  const u16 = (offset, value) => view.setUint16(offset, value, true);
+  const u32 = (offset, value) => view.setUint32(offset, value, true);
+  const rational = (offset, numerator, denominator) => { u32(offset, numerator); u32(offset + 4, denominator); };
+  const entry = (offset, tag, type, count, value) => { u16(offset, tag); u16(offset + 2, type); u32(offset + 4, count); u32(offset + 8, value); };
+  view.setUint8(0, 0x49); view.setUint8(1, 0x49); u16(2, 42); u32(4, 8);
+  u16(8, 1); entry(10, 0x8825, 4, 1, 26); u32(22, 0);
+  u16(26, 4); entry(28, 1, 2, 2, 0x4e); entry(40, 2, 5, 3, 80);
+  entry(52, 3, 2, 2, 0x45); entry(64, 4, 5, 3, 104); u32(76, 0);
+  rational(80, 31, 1); rational(88, 13, 1); rational(96, 4_813_752, 100_000);
+  rational(104, 121, 1); rational(112, 26, 1); rational(120, 1_951_728, 100_000);
+  const actualExtract = load("_extractEmbeddedImageLocation", { exifr, _validEmbeddedCoordinate: valid });
+  const actual = await actualExtract(buffer);
+  assert.ok(Math.abs(actual.latitude - 31.2300382) < 1e-7);
+  assert.ok(Math.abs(actual.longitude - 121.4387548) < 1e-7);
+});
+
+test("image location requests resolve EXIF coordinates but preserve provider disagreement", async () => {
+  const intent = load("_isImageLocationRequest");
+  for (const request of [
+    "帮我定位这张照片在哪个街区",
+    "这张是在哪个街区拍的",
+    "看一下这是哪儿",
+    "它在哪里拍的",
+    "what neighborhood is this?",
+  ]) assert.equal(intent(request, true), true, request);
+  for (const request of [
+    "修一下图片在页面里的位置",
+    "图片地址换成 CDN",
+    "图片定位 CSS 写错了",
+    "把这张图片压缩一下",
+  ]) assert.equal(intent(request, true), false, `${request} must not disclose photo GPS`);
+  assert.equal(intent("这张是在哪个街区拍的", false), false, "there must be a real image in context");
+
+  const attachment = { kind: "image", locationEvidence: {
+    status: "embedded_gps",
+    latitude: 31.2300382,
+    longitude: 121.4387548,
+    coordinateSource: "embedded_exif_gps",
+    metadataAuthenticity: "not_verified",
+    reverseGeocoding: [],
+    limitations: [],
+  } };
+  const ensure = load("_ensureAttachmentLocationEvidence", {
+    inTauri: true,
+    backend: { reverseGeocodeCoordinates: async () => ({
+      candidates: [
+        { source: "nominatim", label: "283 胶州路", house_number: "283", road: "胶州路" },
+        { source: "arcgis_world_geocoding", label: "282 Jiao Zhou Rd", house_number: "282", road: "282 Jiao Zhou Rd" },
+      ],
+      source_statuses: [{ source: "nominatim", status: "success" }, { source: "arcgis_world_geocoding", status: "success" }],
+      retrieved_at: 456,
+      limitations: ["conflicts must be reported"],
+    }) },
+    document: { documentElement: { lang: "zh" } },
+  });
+  await ensure(attachment);
+  assert.equal(attachment.locationEvidence.status, "embedded_gps_resolved");
+  assert.deepEqual(attachment.locationEvidence.reverseGeocoding.map((item) => item.house_number), ["283", "282"]);
+  const context = load("_attachmentLocationEvidenceContext")(attachment);
+  assert.match(context, /EXIF 元数据报告的位置/);
+  assert.match(context, /283 胶州路/);
+  assert.match(context, /282 Jiao Zhou Rd/);
+  assert.match(context, /冲突时必须逐项报告/);
+});
+
+test("multimodal requests inject location evidence only for location intent", async () => {
+  let reverseCalls = 0;
+  const aware = load("_attachmentAwareContent", {
+    _isImageLocationRequest: load("_isImageLocationRequest"),
+    _ensureAttachmentLocationEvidence: async () => { reverseCalls++; },
+    _attachmentImageInputs: async () => ["data:image/jpeg;base64,PHOTO"],
+    _modelSeesImages: () => true,
+    _attachmentLocationEvidenceContext: () => "EXIF GPS STRUCTURED EVIDENCE",
+  });
+  const attachment = { kind: "image", name: "street.jpg", locationEvidence: { status: "embedded_gps" } };
+  const ordinary = await aware("描述图片内容", [attachment], { model: "vision" });
+  assert.equal(reverseCalls, 0, "ordinary image analysis must not send embedded GPS to geocoders");
+  assert.doesNotMatch(JSON.stringify(ordinary), /EXIF GPS STRUCTURED EVIDENCE/);
+
+  const located = await aware("这张照片是哪里", [attachment], { model: "vision" });
+  assert.equal(reverseCalls, 1);
+  assert.match(JSON.stringify(located), /附件 1/);
+  assert.match(JSON.stringify(located), /EXIF GPS STRUCTURED EVIDENCE/);
+  assert.match(JSON.stringify(located), /data:image\/jpeg;base64,PHOTO/);
+  const withProjectPreamble = await aware("项目上下文含代码、页面和 CSS。用户请求：看一下这是哪儿", [attachment], { model: "vision" }, 7_000_000, false, "看一下这是哪儿");
+  assert.equal(reverseCalls, 2);
+  assert.match(JSON.stringify(withProjectPreamble), /EXIF GPS STRUCTURED EVIDENCE/);
+  assert.match(SRC, /wantsPriorImageLocation && index === latestImageTurn/,
+    "a follow-up location question must disclose only the most recent media turn's metadata");
+  assert.match(SRC, /_memoryMessagesForModel\(sess\.memory, config, text\)/,
+    "the current follow-up intent must reach historical media before the new turn is persisted");
+  assert.match(SRC, /_attachmentAwareContent\(_userText, attachments, config, 7_000_000, false, text\)/,
+    "project preamble words must not affect the location privacy decision");
+});
+
+test("historical image bytes are sanitized before model use and never fall back to raw EXIF", async () => {
+  const fingerprint = load("_mediaSourceFingerprint");
+  const pngFingerprint = await fingerprint("data:image/png;base64,SAME_BYTES");
+  const jpegFingerprint = await fingerprint("data:image/jpeg;base64,SAME_BYTES");
+  assert.match(pngFingerprint, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(pngFingerprint, jpegFingerprint, "MIME header changes must not make the same bytes look replaced");
+  assert.notEqual(pngFingerprint, await fingerprint("data:image/jpeg;base64,DIFFERENT_BYTES"));
+
+  let reads = 0, sanitizes = 0;
+  const inputs = load("_attachmentImageInputs", {
+    inTauri: true,
+    backend: { readFileDataUrl: async () => { reads++; return "data:image/jpeg;base64,RAW_PATH"; } },
+    _downscaleImageForVision: async (value, maxDim, stripMetadata) => {
+      sanitizes++;
+      assert.equal(maxDim, 1568);
+      assert.equal(stripMetadata, true);
+      return value.replace("RAW", "SANITIZED");
+    },
+    _mediaSourceFingerprint: (value) => `hash:${value}`,
+  });
+  const migrated = { kind: "image", dataUrl: "data:image/jpeg;base64,RAW_OLD", path: "/old.jpg" };
+  assert.deepEqual(await inputs(migrated), ["data:image/jpeg;base64,SANITIZED_OLD"]);
+  assert.equal(reads, 0);
+  assert.equal(migrated.modelMediaSanitized, true);
+
+  const restoredPath = { kind: "image", path: "/photo.jpg", modelMediaSanitized: true };
+  assert.deepEqual(await inputs(restoredPath), ["data:image/jpeg;base64,SANITIZED_PATH"]);
+  assert.equal(reads, 1, "path recovery may read locally but must sanitize before model use");
+
+  const failClosed = load("_attachmentImageInputs", {
+    inTauri: true,
+    backend: { readFileDataUrl: async () => { reads++; return "data:image/jpeg;base64,RAW_PATH"; } },
+    _downscaleImageForVision: async () => "",
+    _mediaSourceFingerprint: (value) => `hash:${value}`,
+  });
+  const broken = { kind: "image", dataUrl: "data:image/jpeg;base64,RAW", path: "/secret.jpg" };
+  const readsBefore = reads;
+  assert.deepEqual(await failClosed(broken), []);
+  assert.equal(reads, readsBefore, "failed sanitization must not retry with the original path bytes");
+  assert.equal(broken.modelMediaSanitized, false);
+  assert.ok(sanitizes >= 2);
+
+  const changed = load("_attachmentImageInputs", {
+    inTauri: true,
+    backend: { readFileDataUrl: async () => "data:image/jpeg;base64,NEW_FILE" },
+    _downscaleImageForVision: async () => { throw new Error("must reject before sanitizing a different file"); },
+    _mediaSourceFingerprint: (value) => `hash:${value}`,
+  });
+  const replaced = {
+    kind: "image",
+    path: "/replaced.jpg",
+    sourceFingerprint: "hash:data:image/jpeg;base64,ORIGINAL_FILE",
+    locationEvidence: { status: "embedded_gps_resolved", latitude: 31.2, longitude: 121.4 },
+  };
+  assert.deepEqual(await changed(replaced), []);
+  assert.equal(replaced.mediaSourceChanged, true);
+  assert.equal(replaced.locationEvidence.invalidatedReason, "source_file_changed");
+  assert.equal(replaced.locationEvidence.latitude, undefined);
+
+  let reverseCallsAfterMismatch = 0;
+  const aware = load("_attachmentAwareContent", {
+    _isImageLocationRequest: () => true,
+    _attachmentImageInputs: async (attachment) => { attachment.mediaSourceChanged = true; return []; },
+    _ensureAttachmentLocationEvidence: async () => { reverseCallsAfterMismatch++; },
+    _modelSeesImages: () => true,
+    _attachmentLocationEvidenceContext: () => "source changed",
+  });
+  await aware("这张图片在哪", [{ kind: "image" }], { model: "vision" });
+  assert.equal(reverseCallsAfterMismatch, 0, "path identity must be checked before any external GPS lookup");
+});
+
+test("a location follow-up applies only to the most recent historical media turn", async () => {
+  const calls = [];
+  const rebuild = load("_memoryMessagesForModel", {
+    _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /定位/.test(String(text)),
+    _attachmentAwareContent: async (text, attachments, _config, _budget, forced, intentText) => {
+      calls.push({ text, name: attachments[0].name, forced, intentText });
+      return text;
+    },
+  });
+  const messages = await rebuild({ assemble: () => [
+    { role: "user", content: "第一张", attachments: [{ kind: "image", name: "old.jpg" }] },
+    { role: "assistant", content: "看过了" },
+    { role: "user", content: "第二张", attachments: [{ kind: "image", name: "recent.jpg" }] },
+    { role: "user", content: "再看视频", attachments: [{ kind: "video", name: "clip.mp4" }] },
+  ] }, { model: "vision" }, "定位刚才那张图片");
+  assert.equal(messages.length, 4);
+  assert.deepEqual(calls, [
+    { text: "第一张", name: "old.jpg", forced: false, intentText: "" },
+    { text: "第二张", name: "recent.jpg", forced: true, intentText: "" },
+    { text: "再看视频", name: "clip.mp4", forced: false, intentText: "" },
+  ]);
+});
+
+test("historical image lookup selects the latest image turn and ignores a later video", () => {
+  const latest = load("_latestHistoricalImageAttachments");
+  const recentImage = { kind: "image", name: "recent.jpg" };
+  const images = latest({ assemble: () => [
+    { role: "user", attachments: [{ kind: "image", name: "old.jpg" }] },
+    { role: "user", attachments: [recentImage, { kind: "image", name: "second.jpg" }] },
+    { role: "user", attachments: [{ kind: "video", name: "clip.mp4" }] },
+  ] });
+  assert.equal(images[0], recentImage);
+  assert.deepEqual(images.map((item) => item.name), ["recent.jpg", "second.jpg"]);
+  assert.match(SRC, /_latestHistoricalImageAttachments\(session\.memory\)/);
+  assert.match(SRC, /_attachmentAwareContent\(`\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`,[\s\S]{0,160}false, steerText\)/);
 });
 
 test("model request budget drops older media before the current visual turn", () => {

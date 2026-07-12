@@ -1304,6 +1304,10 @@ mod tests {
         assert!(policy.contains("opening_hours"));
         assert!(policy.contains("缺失的 `rating`、`price`、`open_now` 必须保持未知"));
         assert!(policy.contains("不得把全部结构化地理数据统称为“实时数据”"));
+        assert!(policy.contains("缩放前原图的嵌入式 EXIF GPS"));
+        assert!(policy.contains("只能称“图片元数据报告的位置”"));
+        assert!(policy.contains("截图/广告/翻拍内容中的地址"));
+        assert!(policy.contains("不得平均、静默选边或编造置信百分比"));
     }
 
     #[test]
