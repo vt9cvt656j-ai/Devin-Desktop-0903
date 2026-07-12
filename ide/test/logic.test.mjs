@@ -79,6 +79,32 @@ const PATH_IDENTITY = load("_pathIdentity", {
 });
 const COHERENT_PATH = (path) => NORMALIZE_PATH(path);
 const NORM_REL = load("_normRel", { _normalizeFsPath: NORMALIZE_PATH, _pathIdentity: PATH_IDENTITY });
+const RUNTIME_OBLIGATION_ORDER = ["build", "run", "test", "install", "package"];
+const EXTERNAL_OBLIGATION_ORDER = ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"];
+
+function engineeringHelpers() {
+  const negatedEffectKinds = load("_negatedEffectKindsForTask");
+  const directDatabaseMutation = load("_looksLikeDirectDatabaseMutation");
+  const runtimeCommandKinds = load("_runtimeCommandKinds", { _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER });
+  const runtimeObligations = load("_runtimeObligationsForTask", {
+    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
+    _runtimeCommandKinds: runtimeCommandKinds,
+    _negatedEffectKindsForTask: negatedEffectKinds,
+  });
+  const externalObligations = load("_externalObligationsForTask", {
+    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
+    _negatedEffectKindsForTask: negatedEffectKinds,
+    _looksLikeDirectDatabaseMutation: directDatabaseMutation,
+  });
+  const explicitExternal = load("_explicitExternalEffectRequested", { _externalObligationsForTask: externalObligations });
+  const profile = load("_engineeringTaskProfile", {
+    _runtimeObligationsForTask: runtimeObligations,
+    _externalObligationsForTask: externalObligations,
+    _explicitExternalEffectRequested: explicitExternal,
+    _looksLikeDirectDatabaseMutation: directDatabaseMutation,
+  });
+  return { negatedEffectKinds, directDatabaseMutation, runtimeCommandKinds, runtimeObligations, externalObligations, explicitExternal, profile };
+}
 
 // ---- tests ---------------------------------------------------------------------------
 test("_isExpectedCancellation only accepts Monaco's exact cancellation shape", () => {
@@ -2137,8 +2163,17 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /name: "developer_community_search"/);
   assert.match(SRC, /case "developer_community_search": return \{ type: "developer_community_search"/);
   assert.match(SRC, /backend\.invoke\(call\.type, _args\)/);
-  assert.match(SRC, /成功响应不等于内容已被证实/);
+  assert.match(SRC, /success、empty、rate-limited、failed 或 timeout/);
+  assert.match(SRC, /timeout 表示该来源超过独立硬时限/);
+  assert.match(SRC, /empty 只表示适配器完成但没有可用命中/);
+  assert.match(SRC, /rust_users、python_discussions、swift_forums、kotlin_discussions/);
+  assert.match(SRC, /published_date、created_date、updated_date、last_activity_date 与 retrieved_at 不得互相代替/);
+  assert.match(SRC, /缺失保持 unknown/);
+  assert.match(SRC, /结果保留各来源的相关性或上游顺序，不保证按日期排序/);
+  assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "搜索主题或报错关键词" \}/);
   assert.match(SRC, /只调用工具或配置接口不等于成功/);
+  assert.doesNotMatch(SRC.match(/name: "codepen_search", description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
+  assert.doesNotMatch(SRC.match(/name: "bestofjs_search", description: "([^"]+)/)?.[1] || "", /生态里最好的|2000\+ 精选/);
 
   const directoryDescription = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1];
   assert.ok(directoryDescription, "search_tools should have a concise runtime description");
@@ -2544,7 +2579,7 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
 });
 
 test("engineering task profiling gates only substantial code work and detects UI/bug work", () => {
-  const profile = load("_engineeringTaskProfile");
+  const { runtimeObligations, externalObligations, profile } = engineeringHelpers();
   assert.equal(profile("把按钮文字改成保存").requiresPlan, false);
   assert.equal(profile("调整按钮和表单的样式布局").ui, true);
   assert.equal(profile("修复手机端视觉和交互动效问题").ui, true);
@@ -2557,25 +2592,407 @@ test("engineering task profiling gates only substantial code work and detects UI
   const uiBug = profile("修复 React 页面在手机端空白和横向溢出的 bug");
   assert.equal(uiBug.ui, true);
   assert.equal(uiBug.bug, true);
+  assert.equal(profile("修复登录按钮不响应").explicitMutation, true);
+  assert.equal(profile("这个架构怎么优化？").explicitMutation, false,
+    "advice questions must remain eligible for inspect even though they contain 优化");
+  assert.equal(profile("先看看原因，然后修复登录 bug").explicitMutation, true,
+    "an investigative preface must not let the classifier downgrade the requested fix");
+  assert.equal(profile("请分析调用链，并重构认证模块").explicitMutation, true);
+  assert.equal(profile("要不要重构认证模块？").explicitMutation, false);
+  assert.equal(profile("先调查原因后修复登录 bug").explicitMutation, true);
+  assert.equal(profile("Can you fix the login callback?").explicitMutation, true,
+    "English request prefixes must keep their real whitespace semantics");
+  assert.equal(profile("Please review the login callback and explain the risk").explicitReadOnly, true);
+  assert.equal(profile("请给出认证架构的重构建议").explicitReadOnly, true);
+  assert.equal(profile("Fix a small Promise.all callback").requiresPlan, false,
+    "the method name Promise.all and callback text must not imply whole-project scope");
+  assert.equal(profile("Explain how Promise.all schedules this callback").projectScope, false);
+  assert.equal(profile("Update strategy?").explicitMutation, false,
+    "an action-looking advisory phrase is not an imperative mutation");
+  assert.equal(profile("重构认证模块要注意什么？").explicitMutation, false);
+  assert.equal(profile("更新后的接口有什么变化？").explicitMutation, false);
+  assert.equal(profile("修复这个 bug 有什么建议？").explicitMutation, false);
+  assert.equal(profile("请重构认证模块").explicitMutation, true);
+  assert.equal(profile("增强代码推理然后接入开发者社区论坛知识库").needsReferences, true,
+    "an explicit community/knowledge request must enable bounded external references");
+  assert.deepEqual(runtimeObligations("先不要运行，只编译"), ["build"]);
+  assert.deepEqual(externalObligations("不要部署，只修代码"), []);
+  assert.deepEqual(externalObligations("不用 push，只提交"), ["commit"]);
+  assert.equal(profile("请给我重构建议并解释风险").explicitReadOnly, true);
+  assert.equal(profile("Please explain how to fix auth and update docs").explicitMutation, false);
+  assert.equal(profile("优化方案有哪些？").explicitMutation, false);
+  assert.equal(profile("重构思路").explicitReadOnly, true);
+  assert.equal(profile("修复建议系统的 bug").explicitMutation, true);
+  assert.equal(profile("新增分析页面").explicitMutation, true);
+  assert.equal(profile("实现代码审查功能").explicitMutation, true);
+  assert.equal(profile("Fix the review page").explicitMutation, true);
+  assert.equal(profile("请按照这个重构方案修改认证模块").explicitMutation, true);
+  assert.equal(profile("根据上述优化建议更新代码").explicitMutation, true);
+  assert.equal(profile("采用这个重构思路修复 bug").explicitMutation, true);
+  assert.deepEqual(runtimeObligations("重构建议"), [], "重构建议 must not contain a synthetic 构建 obligation");
+  assert.deepEqual(externalObligations("修复部署按钮"), []);
+  assert.deepEqual(externalObligations("修复部署流程和部署配置"), []);
+  assert.deepEqual(externalObligations("新增发布说明并修改上传接口和下载功能"), []);
+  assert.deepEqual(runtimeObligations("不需要编译和运行"), []);
+  assert.deepEqual(externalObligations("不用 commit 和 push"), []);
+  assert.deepEqual(externalObligations("不要部署或推送"), []);
+  assert.deepEqual(runtimeObligations("不要运行测试"), []);
+  assert.deepEqual(runtimeObligations("don't run tests"), []);
+  assert.deepEqual(runtimeObligations("不要启动构建"), []);
+
+  const commandObligations = new Map([
+    ["npm test", ["test"]],
+    ["cargo test", ["test"]],
+    ["npm run dev", ["run"]],
+    ["npm run check", ["build"]],
+    ["cargo check", ["build"]],
+    ["python -m unittest", ["test"]],
+    ["npm ci", ["install"]],
+    ["pnpm i", ["install"]],
+    ["gradlew.bat test", ["test"]],
+    [".\\gradlew.bat test", ["test"]],
+    ["mvn test", ["test"]],
+    ["dotnet test", ["test"]],
+    ["跑一下", ["run"]],
+    ["跑测试", ["test"]],
+    ["跑一下测试", ["test"]],
+    ["run pytest", ["test"]],
+    ["execute vitest", ["test"]],
+  ]);
+  for (const [request, expected] of commandObligations) {
+    assert.deepEqual(runtimeObligations(request), expected, request);
+    assert.equal(profile(request).explicitMutation, true, `${request} must not wait on a classifier to become executable`);
+  }
 });
 
 test("mutation intent cannot finish as a successful zero-effect run", () => {
+  const { runtimeObligations, externalObligations, explicitExternal, profile } = engineeringHelpers();
   const required = load("_runRequiredEffect");
   const target = load("_effectTargetForTask");
-  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
+  const runTarget = load("_runEffectTarget", {
+    _effectTargetForTask: target,
+    _engineeringTaskProfile: profile,
+    _runtimeObligationsForTask: runtimeObligations,
+    _externalObligationsForTask: externalObligations,
+    _explicitExternalEffectRequested: explicitExternal,
+  });
+  const contract = load("_requiredEffectContract", {
+    _runRequiredEffect: required,
+    _engineeringTaskProfile: profile,
+    _runtimeObligationsForTask: runtimeObligations,
+    _externalObligationsForTask: externalObligations,
+    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
+    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
+    _runEffectTarget: runTarget,
+  });
+  const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
   assert.equal(required({ mode: "agent", _intent: { effect: "mutate" }, engineering: {} }), "mutate");
-  assert.equal(required({ mode: "agent", _intent: null, engineering: { implementation: true } }), "mutate");
-  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { implementation: true } }), "inspect");
+  assert.equal(required({ mode: "agent", _intent: null, engineering: { explicitMutation: true } }), "mutate");
+  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { explicitMutation: true } }), "mutate",
+    "a classifier cannot downgrade a clear fix/implement imperative");
+  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect",
+    "advisory optimization questions stay read-only");
   assert.equal(target("修复登录按钮不响应", { bug: true }), "workspace");
   assert.equal(target("把最新版推送到 GitHub", { implementation: true }), "external");
   assert.equal(target("编译运行一下", { implementation: false }), "runtime");
-  assert.equal(runTarget({ _intent: { target: "external" }, _originalText: "修复代码", engineering: { bug: true } }), "external");
+  assert.equal(runTarget({ _intent: { target: "external" }, _originalText: "修复代码", engineering: profile("修复代码") }), "workspace",
+    "a classifier target cannot let an external action stand in for a clear local edit");
   assert.match(SRC, /run\._incompleteReason = "pending_plan"/);
   assert.match(SRC, /run\._incompleteReason = "required_mutation_missing"/);
-  assert.match(SRC, /_requiredTarget === "workspace" \? _implOps === 0 : _effectOps === 0/);
-  assert.match(SRC, /_effectTarget === "runtime"[\s\S]{0,100}_toolProducesRuntimeEffect/);
+  assert.match(SRC, /_missingRequiredEffects\(run, \{/);
+  assert.match(SRC, /runtimeEffects: _runtimeEffects/);
+  assert.match(SRC, /externalEffects: _externalEffects/);
   assert.match(SRC, /s\.content \|\| s\.title \|\| s\.description \|\| "step"/);
   assert.match(SRC, /run\._incompleteReason \|\| hitCap/);
+});
+
+test("compound workspace, runtime, and external obligations are reconciled by exact evidence type", () => {
+  const helpers = engineeringHelpers();
+  const required = load("_runRequiredEffect");
+  const target = load("_effectTargetForTask");
+  const runTarget = load("_runEffectTarget", {
+    _effectTargetForTask: target,
+    _engineeringTaskProfile: helpers.profile,
+    _runtimeObligationsForTask: helpers.runtimeObligations,
+    _externalObligationsForTask: helpers.externalObligations,
+  });
+  const contract = load("_requiredEffectContract", {
+    _runRequiredEffect: required,
+    _engineeringTaskProfile: helpers.profile,
+    _runtimeObligationsForTask: helpers.runtimeObligations,
+    _externalObligationsForTask: helpers.externalObligations,
+    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
+    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
+    _runEffectTarget: runTarget,
+  });
+  const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
+  const makeRun = (text) => ({ mode: "agent", _originalText: text, engineering: helpers.profile(text) });
+
+  const runtimeRun = makeRun("编译运行一下");
+  assert.deepEqual(contract(runtimeRun), { workspace: false, runtime: ["build", "run"], external: [] });
+  assert.deepEqual(missing(runtimeRun, { runtimeEffects: ["build"] }), ["runtime:run"]);
+  assert.deepEqual(missing(runtimeRun, { workspaceOps: 3, runtimeEffects: ["test"] }), ["runtime:build", "runtime:run"],
+    "edits and tests cannot impersonate build+run obligations");
+
+  const pushRun = makeRun("把项目更新到 GitHub");
+  assert.deepEqual(contract(pushRun).external, ["push"]);
+  assert.deepEqual(missing(pushRun, { externalEffects: ["commit", "external"] }), ["external:push"],
+    "a local commit cannot impersonate a requested push");
+
+  const compound = makeRun("修复登录代码，然后编译运行并推送到 GitHub");
+  assert.deepEqual(contract(compound), { workspace: true, runtime: ["build", "run"], external: ["push"] });
+  assert.deepEqual(missing(compound, {
+    workspaceOps: 1,
+    runtimeEffects: ["build", "run"],
+    externalEffects: ["push", "external"],
+  }), []);
+
+  assert.deepEqual(contract(makeRun("不要部署，只修代码")), { workspace: true, runtime: [], external: [] });
+  assert.deepEqual(contract(makeRun("不用 push，只提交")), { workspace: false, runtime: [], external: ["commit"] });
+  assert.deepEqual(contract(makeRun("先不要运行，只编译")), { workspace: false, runtime: ["build"], external: [] });
+
+  for (const request of [
+    "UPDATE users SET active=1",
+    "执行 DELETE FROM users WHERE id=7",
+    "please INSERT INTO audit_log(message) VALUES ('ok')",
+    "以下 SQL：CREATE TABLE jobs (id integer)",
+  ]) {
+    const rawDatabaseRun = makeRun(request);
+    assert.equal(rawDatabaseRun.engineering.explicitWorkspaceMutation, false, request);
+    assert.deepEqual(contract(rawDatabaseRun), { workspace: false, runtime: [], external: ["database"] }, request);
+  }
+  for (const request of [
+    "update docs",
+    "Please update config and set timeout to 30",
+    "update the auth module and set the default",
+    "update config set timeout = 30",
+    "DELETE local file",
+    "delete from array",
+    "create component",
+    "Create table component for users",
+    "Create table component (React + Tailwind)",
+    "/* TODO */ Create table component (React + Tailwind)",
+    "Create table grid (sortable columns);",
+    "create view component",
+    "create view component as select menu",
+    "drop support for Node 18",
+  ]) {
+    assert.equal(helpers.directDatabaseMutation(request), false, request);
+  }
+  for (const request of [
+    "-- cleanup\nDROP TABLE users CASCADE;",
+    "DROP TABLE users CASCADE",
+    "/* cleanup */ TRUNCATE TABLE users RESTART IDENTITY;",
+    "CREATE TABLE users (id integer)",
+    "CREATE TABLE users AS (SELECT * FROM old_users);",
+    "UPDATE pages SET body = '<button>save</button>' WHERE id = 1",
+  ]) {
+    assert.equal(helpers.directDatabaseMutation(request), true, request);
+  }
+});
+
+test("effect clauses follow the latest explicit directive without erasing other targets", () => {
+  const { runtimeObligations, externalObligations } = engineeringHelpers();
+
+  assert.deepEqual(externalObligations("update table component styling"), []);
+  assert.deepEqual(externalObligations("update the database table"), ["database"]);
+  assert.deepEqual(externalObligations("不要 push 到旧 remote，push 到 origin"), ["push"]);
+  assert.deepEqual(externalObligations("不要部署旧服务，但是部署新服务"), ["deploy"]);
+  assert.deepEqual(externalObligations("不要解释部署原理，直接部署"), ["deploy"]);
+  assert.deepEqual(runtimeObligations("不要测试旧模块，只测试新模块"), ["test"]);
+  assert.deepEqual(runtimeObligations("不要运行旧版本，运行新版本"), ["run"]);
+
+  assert.deepEqual(externalObligations("push 到 origin，然后取消 push"), []);
+  assert.deepEqual(externalObligations("不要部署，随后部署，最后取消部署"), []);
+  assert.deepEqual(runtimeObligations("测试，然后不要测试"), []);
+  assert.deepEqual(runtimeObligations("不需要编译和运行"), []);
+  assert.deepEqual(runtimeObligations("不要运行测试"), []);
+
+  assert.deepEqual(externalObligations("部署新服务，但不要部署旧服务"), ["deploy"]);
+  assert.deepEqual(externalObligations("push to origin, don't push to the old remote"), ["push"]);
+  assert.deepEqual(externalObligations("部署旧服务，但不要部署旧服务"), []);
+  assert.deepEqual(externalObligations("部署，然后不要部署"), []);
+});
+
+test("classified project work upgrades planning and complex plans cover the full engineering loop", () => {
+  const merge = load("_engineeringProfileWithIntent");
+  const requiresPlan = load("_runRequiresPlan");
+  const shouldAwaitIntent = load("_shouldAwaitIntentForPlan");
+  const quality = load("_planQualityIssue");
+  const base = { applies: true, substantial: false, requiresPlan: false };
+
+  const project = merge(base, { kind: "project", effect: "mutate", steps: 20 });
+  assert.equal(project.requiresPlan, true);
+  assert.equal(project.substantial, true);
+  assert.equal(merge(base, { kind: "edit", effect: "mutate", steps: 14 }).requiresPlan, true,
+    "a high-step mutation must not bypass planning merely because it was labelled edit");
+  assert.equal(merge(base, { kind: "answer", effect: "inspect", steps: 15 }).requiresPlan, false);
+  assert.equal(requiresPlan({ engineering: base, _intent: { kind: "project", effect: "mutate", steps: 20 } }), true);
+  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: false }, _intent: { kind: "project", effect: "inspect", steps: 20 } }), true,
+    "complex read-only investigations need an evidence-oriented plan");
+  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: true }, _intent: { kind: "project", effect: "inspect", steps: 20 } }), true,
+    "a classifier cannot remove the plan gate from a locally explicit mutation");
+  assert.equal(requiresPlan({ engineering: { ...base, explicitReadOnly: true, projectScope: false, longTask: false }, _intent: { kind: "answer", effect: "inspect", steps: 4 } }), false,
+    "simple advice must not receive a ritual plan gate");
+  assert.equal(shouldAwaitIntent({ engineering: { explicitMutation: true } }), false,
+    "a small clear mutation must not wait for the slow intent classifier before planning can be skipped");
+  assert.equal(shouldAwaitIntent({ engineering: { explicitReadOnly: true } }), false);
+  assert.equal(shouldAwaitIntent({ engineering: { requiresPlan: true, explicitMutation: true } }), true);
+  assert.equal(shouldAwaitIntent({ engineering: {} }), true,
+    "ambiguous work still waits for intent so complex tasks receive a plan");
+  const commandProfile = engineeringHelpers().profile;
+  for (const request of ["npm test", "cargo test", "npm run dev", "npm ci", "pnpm i", ".\\gradlew.bat test", "mvn test", "dotnet test", "跑一下"]) {
+    assert.equal(shouldAwaitIntent({ engineering: commandProfile(request) }), false, `${request} must not wait up to 9s for intent`);
+  }
+
+  assert.match(quality([], true, "mutate"), /尚未创建计划/);
+  assert.match(quality([
+    { content: "读取认证模块并定位调用链" },
+    { content: "修改登录状态机并同步调用方" },
+  ], true, "mutate"), /验证\/测试|至少 3/);
+  assert.equal(quality([
+    { content: "读取认证模块，复现错误并梳理调用链" },
+    { content: "修改登录状态机并同步所有调用方" },
+    { content: "运行类型检查和登录回归测试验证错误路径" },
+  ], true, "mutate"), "");
+  assert.match(quality([
+    { content: "读取认证模块并梳理真实调用链" },
+  ], true, "inspect"), /证据核验\/结论|至少 2/);
+  assert.equal(quality([
+    { content: "读取认证模块并梳理真实调用链" },
+    { content: "交叉核验证据并报告结论与限制" },
+  ], true, "inspect"), "", "read-only investigations need evidence and conclusions, not a fake implementation step");
+  assert.equal(quality([
+    { content: "检查项目脚本和运行环境" },
+    { content: "执行编译并启动真实程序" },
+    { content: "核验退出状态、输出和健康检查" },
+  ], true, "execute"), "", "runtime-only plans require execution evidence, not a fake code edit");
+  assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
+  assert.match(SRC, /_requiredPlanIssue\(run, run\?\._planSteps\)/);
+  assert.match(SRC, /复杂写入计划分别覆盖调查现状、实现改动、真实验证/);
+  assert.match(SRC, /复杂只读调查覆盖调查取证和证据核验\/结论/);
+});
+
+test("plan completion requires real run evidence and side-effect tools share the same quality gate", () => {
+  const issue = load("_unprovenPlanCompletionIssue");
+  const guard = load("_guardUnprovenPlanCompletion", { _unprovenPlanCompletionIssue: issue });
+  const allDone = [
+    { content: "调查", status: "completed" },
+    { content: "实现", status: "completed" },
+    { content: "验证", status: "completed" },
+  ];
+  assert.match(issue(allDone, 0), /还没有读取、修改、命令或外部操作证据/);
+  assert.deepEqual(guard(allDone, 0).map((step) => step.status), ["pending", "pending", "pending"]);
+  assert.equal(issue(allDone, 1), "");
+
+  const commandMutates = () => false;
+  const mutates = load("_toolMutatesWorkspace", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write", "download", "download_asset"]),
+    _looksLikeWorkspaceMutationCommand: commandMutates,
+    _mcpMutationHint: () => false,
+  });
+  const mayExternal = load("_toolMayProduceExternalEffect", {
+    _mcpMutationHint: () => false,
+    _sqlMayMutate: (query) => !/^\s*select\b/i.test(String(query || "")),
+    _dbCallMayMutate: (call) => !/^\s*select\b/i.test(String(call?.query || "")),
+    _commandProducesExternalEffect: () => false,
+  });
+  const gated = load("_toolRequiresPlanGate", {
+    _toolMutatesWorkspace: mutates,
+    _toolMayProduceExternalEffect: mayExternal,
+  });
+  for (const call of [
+    { type: "write" }, { type: "cmd" }, { type: "termtask" }, { type: "git", op: "push" },
+    { type: "gh", op: "pr_create" }, { type: "db", query: "UPDATE users SET x=1" },
+    { type: "remote", op: "connect" }, { type: "system", op: "open" },
+    { type: "automation", method: "mouse.click" }, { type: "uiclick" },
+    { type: "download" }, { type: "download_asset" },
+  ]) assert.equal(gated(call), true, `${call.type} side effect must be plan-gated when the run is complex`);
+  assert.equal(gated({ type: "git", op: "status" }), false);
+  assert.equal(gated({ type: "db", query: "SELECT 1" }), false);
+  assert.equal(gated({ type: "automation", method: "browser.status" }), false);
+  assert.match(SRC, /const _finishPlanIssue = _requiredPlanIssue\(run, planSteps\)/);
+  assert.match(SRC, /run\._incompleteReason = "required_plan_missing"/);
+});
+
+test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {
+  const extract = load("_extractRequirementsChecklist");
+  const requiresPlan = load("_runRequiresPlan");
+  const take = load("_takeRequirementsReconciliation", { _runRequiresPlan: requiresPlan });
+  const request = "增强代码推理然后接入开发者社区还有保留 limit 默认值 20 并且同步所有调用方同时处理空值和错误路径接着补聚焦测试；不要改界面。";
+  const checklist = extract(request);
+  assert.ok(checklist.length >= 6, `expected connector-aware requirements, got ${JSON.stringify(checklist)}`);
+  assert.ok(checklist.some((item) => item.includes("默认值 20")));
+  assert.ok(checklist.some((item) => item.includes("调用方")));
+  assert.ok(checklist.some((item) => item.includes("测试")));
+  assert.ok(checklist.length <= 10);
+  assert.ok(checklist.join("").length <= 1600);
+
+  const run = { engineering: { requiresPlan: true, explicitMutation: true }, _requirementsChecklist: checklist };
+  const first = take(run, {
+    files: ["src/auth.ts"],
+    planSteps: [{ content: "实现认证", status: "completed" }],
+  });
+  assert.match(first, /参数是否完整/);
+  assert.match(first, /默认值/);
+  assert.match(first, /调用方/);
+  assert.match(first, /错误、空值和边界/);
+  assert.match(first, /测试与真实验证/);
+  assert.match(first, /src\/auth\.ts/);
+  assert.equal(take(run, { files: ["src/again.ts"] }), "", "reconciliation is a one-shot finish gate");
+  assert.equal(take({ engineering: { requiresPlan: false }, _requirementsChecklist: checklist }), "");
+});
+
+test("requirements enter the running pad only for complex work or real progress", () => {
+  const requiresPlan = load("_runRequiresPlan");
+  const include = load("_shouldIncludeRequirementsInPad", { _runRequiresPlan: requiresPlan });
+  const emptyPad = () => ({
+    requirements: ["修复认证"],
+    modified: new Map(),
+    errors: [],
+    findings: [],
+    done: [],
+    filesRead: new Set(),
+  });
+
+  assert.equal(include({ engineering: { requiresPlan: false } }, emptyPad()), false,
+    "a simple untouched request must not inject a permanent scratchpad message");
+  assert.equal(include({ engineering: { requiresPlan: true, explicitMutation: true } }, emptyPad()), true);
+  const progressed = emptyPad();
+  progressed.filesRead.add("src/auth.ts");
+  assert.equal(include({ engineering: { requiresPlan: false } }, progressed), true,
+    "once real evidence exists, the pad should preserve it with the requirements");
+  assert.equal(include({ engineering: { requiresPlan: true, explicitMutation: true } }, { ...emptyPad(), requirements: [] }), false);
+});
+
+test("live steering appends bounded requirements but pure cancellation does not", () => {
+  const extract = load("_extractRequirementsChecklist");
+  const merge = load("_mergeRequirementsChecklist", { _extractRequirementsChecklist: extract });
+  const cancellationOnly = load("_isCancellationOnlySteering");
+  const original = ["保留 limit 默认值 20", "不要改界面"];
+  let requirements = [...original];
+  const steer = (text) => {
+    if (!cancellationOnly(text)) requirements = merge(requirements, text, 12, 2000, original);
+  };
+
+  steer("同时把 timeout 参数传到执行层然后补空值测试");
+  assert.ok(requirements.some((item) => item.includes("timeout 参数")));
+  assert.ok(requirements.some((item) => item.includes("空值测试")));
+  const beforeStop = [...requirements];
+  steer("停止");
+  assert.deepEqual(requirements, beforeStop);
+  assert.equal(cancellationOnly("取消"), true);
+  assert.equal(cancellationOnly("停止，但是改为只读检查"), false);
+
+  for (let index = 0; index < 20; index++) {
+    steer(`新增参数 ${index} ${"x".repeat(220)}`);
+  }
+  assert.ok(requirements.length <= 12);
+  assert.ok(requirements.join("").length <= 2000);
+  assert.ok(requirements.includes("保留 limit 默认值 20"), "bounded steering must never evict original requirements");
+  assert.ok(requirements.includes("不要改界面"));
+  assert.ok(requirements.some((item) => item.includes("新增参数 19")), "newest steering must survive the bound");
+  assert.match(SRC, /_mergeRequirementsChecklist\([\s\S]{0,220}run\._originalRequirementsChecklist/);
 });
 
 test("ending a run settles in-progress plan spinners without discarding resumable steps", () => {
@@ -2617,10 +3034,180 @@ test("bounded engineering retrieval keeps sources that finish before the deadlin
   assert.doesNotMatch(render(results[1], 1), /\nignore/);
   assert.match(render(results[2], 2), /来源 3超时/);
   assert.match(SRC, /Array\.from\(\{ length: jobs\.length \}/);
-  assert.match(extractFn("_agentContextForQuery"), /_buildEngineeringReferenceContext\(query, root, stack, profile\)/);
+  assert.match(extractFn("_agentContextForQuery"), /_promiseOrFallbackWithin\([\s\S]*_buildEngineeringReferenceContext\(query, root, stack, profile,/);
   assert.doesNotMatch(extractFn("_gatherAgentContext"), /queryKey/,
     "changing only the user wording must not rebuild the stable tree and key-file snapshot");
   assert.match(extractFn("_gatherAgentContext"), /return _agentContextForQuery\(_agentContextCache\.data, query \|\| "", root\)/);
+});
+
+test("slow community references cannot erase stable local engineering context", async () => {
+  const within = load("_promiseOrFallbackWithin");
+  const contextFor = (external) => load("_agentContextForQuery", {
+    _buildRepoMap: () => "REPO_MAP",
+    _engineeringTaskProfile: () => ({ applies: true, ui: false }),
+    _projectStacks: new Map([["/repo", { lang: "Rust" }]]),
+    _buildRetrievedCodeContext: async () => "LOCAL_SOURCE",
+    _buildEngineeringReferenceContext: external,
+    _promiseOrFallbackWithin: within,
+    _bm25Index: { root: "", built: false },
+    _estimateTokens: (text) => text.length / 4,
+    _memoryBlocks: () => "",
+  });
+
+  const slow = await contextFor(async () => new Promise(() => {}))("ROOT_AND_STACK", "fix api", "/repo", 5);
+  assert.match(slow, /ROOT_AND_STACK/);
+  assert.match(slow, /REPO_MAP/);
+  assert.match(slow, /LOCAL_SOURCE/);
+
+  const fast = await contextFor(async () => "COMMUNITY_SOURCE")("ROOT_AND_STACK", "fix api", "/repo", 50);
+  assert.match(fast, /COMMUNITY_SOURCE/);
+  assert.equal(await within(Promise.reject(new Error("offline")), 10, "fallback"), "fallback");
+});
+
+test("fast community summaries survive when optional page deep-reading is slow", async () => {
+  const settle = load("_settlePromisesWithin");
+  const render = load("_engineeringReferenceResultBlock");
+  const usable = load("_engineeringReferenceResultUsable");
+  const contextBlock = load("_engineeringReferenceContextBlock");
+  const build = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    _referenceQuery: () => "rust async cancellation",
+    _engineeringReferenceCache: new Map(),
+    _engineeringCommunitySources: () => ["rust_users"],
+    backend: { invoke: async () => "FAST_COMMUNITY_SUMMARY\npublished_date: 2026-06-01T00:00:00Z" },
+    _settlePromisesWithin: settle,
+    _engineeringReferenceResultBlock: render,
+    _engineeringReferenceResultUsable: usable,
+    _engineeringReferenceContextBlock: contextBlock,
+    _autoDeepRead: async () => new Promise(() => {}),
+  });
+
+  const result = await build("fix cancellation", "/repo", { lang: "Rust" }, { needsReferences: true }, 80);
+  assert.match(result, /FAST_COMMUNITY_SUMMARY/);
+  assert.match(result, /cache_status: miss/);
+  assert.match(result, /结果保留各来源的相关性或上游顺序，不表示按时间排序或一定是最新/);
+  assert.match(result, /created_date 只表示记录或仓库创建，不能冒充发布时间/);
+  assert.match(result, /日期为 unknown 时(?:也)?不能证明时效性/);
+});
+
+test("one slow forum cannot hide another community source that already returned", async () => {
+  const settle = load("_settlePromisesWithin");
+  const render = load("_engineeringReferenceResultBlock");
+  const usable = load("_engineeringReferenceResultUsable");
+  const contextBlock = load("_engineeringReferenceContextBlock");
+  const cache = new Map();
+  const build = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    _referenceQuery: () => "login state bug",
+    _engineeringReferenceCache: cache,
+    _engineeringCommunitySources: () => ["github", "rust_users"],
+    backend: {
+      invoke: async (_name, args) => args.sources[0] === "github"
+        ? "FAST_GITHUB_RESULT"
+        : new Promise(() => {}),
+    },
+    _settlePromisesWithin: settle,
+    _engineeringReferenceResultBlock: render,
+    _engineeringReferenceResultUsable: usable,
+    _engineeringReferenceContextBlock: contextBlock,
+    _autoDeepRead: async () => ({ text: "", count: 0 }),
+  });
+
+  const result = await build("fix login", "/repo", {}, { needsReferences: true }, 80);
+  assert.match(result, /FAST_GITHUB_RESULT/);
+  assert.match(result, /来源 2超时/);
+  assert.equal(cache.size, 0, "a sparse partial round must not be cached as all-successful");
+  assert.match(extractFn("_buildEngineeringReferenceContext"), /sources\.map\(\(source\) =>[\s\S]*sources: \[source\]/);
+});
+
+test("engineering reference cache reports hits, preserves provider retrieval time, and never caches all-failed rounds", async () => {
+  const settle = load("_settlePromisesWithin");
+  const render = load("_engineeringReferenceResultBlock");
+  const usable = load("_engineeringReferenceResultUsable");
+  const contextBlock = load("_engineeringReferenceContextBlock");
+  const cache = new Map();
+  let invokes = 0;
+  const build = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    _referenceQuery: () => "rust cache evidence",
+    _engineeringReferenceCache: cache,
+    _engineeringCommunitySources: () => ["github"],
+    backend: { invoke: async () => {
+      invokes++;
+      return "Status counts: success=1; empty=0; rate-limited=0; failed=0.\nretrieved_at: 2026-07-12T18:41:34Z\nREAL_RESULT";
+    } },
+    _settlePromisesWithin: settle,
+    _engineeringReferenceResultBlock: render,
+    _engineeringReferenceResultUsable: usable,
+    _engineeringReferenceContextBlock: contextBlock,
+    _autoDeepRead: async () => ({ text: "", count: 0 }),
+  });
+  const first = await build("fix cache", "/repo", {}, { needsReferences: true }, 100);
+  const second = await build("fix cache", "/repo", {}, { needsReferences: true }, 100);
+  assert.equal(invokes, 1);
+  assert.match(first, /cache_status: miss/);
+  assert.match(first, /context_generated_at:/);
+  assert.match(second, /cache_status: hit/);
+  assert.match(second, /cache_entry_created_at:/);
+  assert.match(second, /本次没有重新请求外部来源/);
+  assert.match(second, /retrieved_at: 2026-07-12T18:41:34Z/);
+  assert.doesNotMatch(second, /本次请求刚刚执行|实时检索/);
+
+  let failedInvokes = 0;
+  const failedCache = new Map();
+  const failedBuild = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    _referenceQuery: () => "always failed",
+    _engineeringReferenceCache: failedCache,
+    _engineeringCommunitySources: () => ["reddit"],
+    backend: { invoke: async () => { failedInvokes++; return "Status counts: success=0; empty=0; rate-limited=0; failed=1."; } },
+    _settlePromisesWithin: settle,
+    _engineeringReferenceResultBlock: render,
+    _engineeringReferenceResultUsable: usable,
+    _engineeringReferenceContextBlock: contextBlock,
+    _autoDeepRead: async () => ({ text: "", count: 0 }),
+  });
+  await failedBuild("fail", "/repo", {}, { needsReferences: true }, 100);
+  await failedBuild("fail", "/repo", {}, { needsReferences: true }, 100);
+  assert.equal(failedInvokes, 2, "all-failed retrieval rounds must not poison the cache for 15 minutes");
+  assert.equal(failedCache.size, 0);
+
+  let timedOutInvokes = 0;
+  const timedOutCache = new Map();
+  const timedOutBuild = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    _referenceQuery: () => "all sources time out",
+    _engineeringReferenceCache: timedOutCache,
+    _engineeringCommunitySources: () => ["github", "rust_users"],
+    backend: { invoke: async () => { timedOutInvokes++; return new Promise(() => {}); } },
+    _settlePromisesWithin: settle,
+    _engineeringReferenceResultBlock: render,
+    _engineeringReferenceResultUsable: usable,
+    _engineeringReferenceContextBlock: contextBlock,
+    _autoDeepRead: async () => ({ text: "", count: 0 }),
+  });
+  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true }, 100);
+  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true }, 100);
+  assert.equal(timedOutInvokes, 4, "all-timeout sparse rounds must be retried instead of cached");
+  assert.equal(timedOutCache.size, 0);
+});
+
+test("automatic engineering references add only stack-relevant official forums", () => {
+  const sources = load("_engineeringCommunitySources");
+  assert.deepEqual(sources({ bug: true }, { lang: "Rust" }, "tokio task panic"),
+    ["stackoverflow", "github", "github_discussions", "rust_users"]);
+  assert.deepEqual(sources({ bug: false }, { framework: "FastAPI", lang: "Python" }, "dependency injection"),
+    ["github", "sourcegraph", "github_discussions", "python_discussions"]);
+  assert.deepEqual(sources({ bug: false }, { framework: "Vite + React", lang: "JS/TS" }, "rendering"),
+    ["github", "sourcegraph", "github_discussions"]);
+  assert.deepEqual(sources({ bug: true }, { lang: "Rust + Python" }, "Swift Kotlin bridge"),
+    ["stackoverflow", "github", "github_discussions", "swift_forums", "kotlin_discussions"],
+    "the user's current query wins the two bounded official-forum slots over background stack signals");
 });
 
 test("stack extraction honors the declared package manager and project scripts", () => {
@@ -2817,7 +3404,7 @@ test("tool success and verification command checks reject fake green command res
   assert.doesNotMatch(SRC, /_looksLikeVerificationCommand\(it\.call\.command\)\) \|\| t === "http"/);
 });
 
-test("material effects are separated from real workspace mutations", () => {
+test("typed runtime and external evidence stays separate from workspace mutations", () => {
   const verify = load("_looksLikeVerificationCommand");
   const rewrite = load("_looksLikeShellFileRewrite");
   const readOnly = load("_looksLikeReadOnlyCommand");
@@ -2833,8 +3420,47 @@ test("material effects are separated from real workspace mutations", () => {
     _looksLikeWorkspaceMutationCommand: commandMutates,
     _mcpMutationHint: mcpHint,
   });
-  const effect = load("_toolProducesMaterialEffect", { _mcpMutationHint: mcpHint });
-  const runtimeEffect = load("_toolProducesRuntimeEffect", { _looksLikeReadOnlyCommand: readOnly });
+  const failureMatch = load("_toolFailureMatch");
+  const succeeded = load("_toolExecutionSucceeded", {
+    _toolFailureMatch: failureMatch,
+    _WORKSPACE_MUTATING_TYPES: workspaceTypes,
+  });
+  const runtimeKinds = load("_runtimeCommandKinds", { _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER });
+  const runtimeEvidence = load("_runtimeEvidenceKinds", {
+    _toolExecutionSucceeded: succeeded,
+    _runtimeCommandKinds: runtimeKinds,
+  });
+  const sqlWithoutLeadingTrivia = load("_sqlWithoutLeadingTrivia");
+  const sqlMutates = load("_sqlExplicitlyMutates", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
+  const sqlMayMutate = load("_sqlMayMutate", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
+  const redisVerb = load("_redisCommandVerb");
+  const redisReadOnly = load("_redisCommandIsDefinitelyReadOnly", { _redisCommandVerb: redisVerb });
+  const redisMutates = load("_redisCommandExplicitlyMutates", { _redisCommandVerb: redisVerb });
+  const dbMayMutate = load("_dbCallMayMutate", {
+    _redisCommandVerb: redisVerb,
+    _redisCommandIsDefinitelyReadOnly: redisReadOnly,
+    _sqlMayMutate: sqlMayMutate,
+  });
+  const dbExplicitlyMutates = load("_dbCallExplicitlyMutates", {
+    _redisCommandExplicitlyMutates: redisMutates,
+    _sqlExplicitlyMutates: sqlMutates,
+  });
+  const externalKinds = load("_externalCommandKinds", { _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER });
+  const mayExternal = load("_toolMayProduceExternalEffect", {
+    _mcpMutationHint: mcpHint,
+    _sqlMayMutate: sqlMayMutate,
+    _dbCallMayMutate: dbMayMutate,
+    _commandProducesExternalEffect: (command) => externalKinds(command).length > 0,
+  });
+  const externalEvidence = load("_externalEvidenceKinds", {
+    _toolExecutionSucceeded: succeeded,
+    _toolMayProduceExternalEffect: mayExternal,
+    _sqlExplicitlyMutates: sqlMutates,
+    _dbCallExplicitlyMutates: dbExplicitlyMutates,
+    _externalCommandKinds: externalKinds,
+    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
+  });
+  const ok = { code: 0, content: "ok" };
 
   assert.equal(commandMutates("ls -la"), false);
   assert.equal(commandMutates("npm test"), false);
@@ -2845,16 +3471,121 @@ test("material effects are separated from real workspace mutations", () => {
   assert.equal(mutates({ type: "termtask", command: "npx prettier --write src/app.js" }, {}), true);
   assert.equal(mutates({ type: "git", op: "branch", branch: "feature" }, {}), true);
   assert.equal(mutates({ type: "git", op: "pull" }, {}), true);
-  assert.equal(effect({ type: "git", op: "branch", branch: "" }, {}, false), false);
-  assert.equal(effect({ type: "git", op: "push" }, {}, false), true);
-  assert.equal(effect({ type: "gh", op: "pr_create" }, {}, false), true);
-  assert.equal(effect({ type: "db", query: "SELECT 1" }, {}, false), false);
-  assert.equal(effect({ type: "db", query: "UPDATE users SET active=1" }, {}, false), true);
-  assert.equal(runtimeEffect({ type: "cmd", command: "ls -la" }, {}), false);
-  assert.equal(runtimeEffect({ type: "cmd", command: "npm test" }, {}), true);
-  assert.equal(runtimeEffect({ type: "termtask" }, { running: false }), false);
-  assert.equal(runtimeEffect({ type: "termtask" }, { running: true }), true);
-  assert.equal(mutates({ type: "mcp", tool: "write_file", args: { path: "src/a.js" } }, {}), true);
+  assert.deepEqual(runtimeKinds("npm run build"), ["build"]);
+  assert.deepEqual(runtimeKinds("npm test"), ["test"]);
+  assert.deepEqual(runtimeKinds("echo test"), []);
+  assert.deepEqual(runtimeKinds("npm run build && npm start"), ["build", "run"]);
+  assert.deepEqual(runtimeKinds("npm ci"), ["install"]);
+  assert.deepEqual(runtimeKinds("npm i"), ["install"]);
+  assert.deepEqual(runtimeKinds("npm run package"), ["package"]);
+  assert.deepEqual(runtimeKinds("node --version"), []);
+  assert.deepEqual(runtimeKinds("gradlew.bat test"), ["test"]);
+  assert.deepEqual(runtimeKinds(".\\gradlew.bat test"), ["test"]);
+  assert.deepEqual(runtimeKinds("python -m unittest"), ["test"]);
+  assert.deepEqual(runtimeKinds("swift test"), ["test"]);
+  assert.deepEqual(runtimeKinds("npm run tauri dev"), ["run"]);
+  assert.deepEqual(runtimeKinds("npm run tauri build"), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("cargo tauri build"), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("tauri build"), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("npx tauri build"), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("pnpm exec tauri build"), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("tauri build --no-bundle"), ["build"]);
+  assert.deepEqual(runtimeKinds("npm run tauri build -- --no-bundle"), ["build"]);
+  assert.deepEqual(runtimeKinds("cargo tauri build --no-bundle"), ["build"]);
+  assert.deepEqual(runtimeKinds("tauri build --help"), []);
+  assert.deepEqual(runtimeKinds("npm run tauri build -- --help"), []);
+  assert.deepEqual(runtimeKinds("docker build ."), ["build", "package"]);
+  assert.deepEqual(runtimeKinds("npm test || true"), []);
+  assert.deepEqual(runtimeKinds("npm test | tee test.log"), []);
+  assert.deepEqual(runtimeKinds("npm test &"), []);
+  assert.deepEqual(runtimeEvidence({ type: "cmd", command: "npm run build" }, { code: 1, content: "failed" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "echo ok" }, { running: true, content: "ok" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "sleep 30" }, { running: true, content: "ok" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "npm test -- --watch" }, { running: true, content: "watching" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "npm install" }, { running: true, content: "installing" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "npm run build -- --watch" }, { running: true, content: "watching" }), []);
+  assert.deepEqual(runtimeEvidence({ type: "termtask", command: "node server.js" }, { running: true, content: "ok" }), ["run"]);
+  assert.deepEqual(externalEvidence({ type: "git", op: "commit" }, { content: "ok" }), ["commit", "external"]);
+  assert.deepEqual(externalEvidence({ type: "git", op: "push" }, { content: "ok" }), ["push", "external"]);
+  assert.deepEqual(externalKinds("./deploy.sh"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("env NODE_ENV=production npm run deploy"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("APP_ENV=prod ./deploy.sh"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("docker compose up -d"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("kubectl rollout restart deployment/api"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("systemctl restart michael-api"), ["deploy", "external"]);
+  assert.deepEqual(externalKinds("git push --dry-run"), []);
+  assert.deepEqual(externalKinds("git push -n"), []);
+  assert.deepEqual(externalKinds("kubectl apply --dry-run=server -f deploy.yml"), []);
+  assert.deepEqual(externalKinds("./deploy.sh --dry-run=true"), []);
+  assert.deepEqual(externalKinds("git push || true"), []);
+  assert.deepEqual(externalKinds("./deploy.sh | tee deploy.log"), []);
+  assert.deepEqual(externalKinds("./deploy.sh &"), []);
+  assert.deepEqual(externalKinds("curl -X POST https://example.test/deploy"), [],
+    "curl can exit zero on HTTP 500 unless fail-on-HTTP-error is enabled");
+  assert.deepEqual(externalKinds("curl --fail-with-body -X POST https://example.test/deploy"), ["deploy", "external"]);
+  assert.deepEqual(externalEvidence({ type: "remote", op: "connect" }, { content: "ok" }), ["external"],
+    "a generic remote connection cannot satisfy a deploy obligation");
+  assert.deepEqual(externalEvidence({ type: "cmd", command: "./deploy.sh" }, ok), ["deploy", "external"]);
+  assert.deepEqual(externalEvidence({ type: "git", op: "push", dryRun: true }, { content: "ok" }), []);
+  assert.deepEqual(externalEvidence({ type: "mcp", server: "github", tool: "push_files", args: {} }, { content: "ok" }), ["push"]);
+  assert.deepEqual(externalEvidence({ type: "mcp", server: "github", tool: "create_pull_request", args: {} }, { content: "ok" }), ["pr"]);
+  assert.deepEqual(externalEvidence({ type: "mcp", server: "cloud", tool: "deploy_service", args: {} }, { content: "ok" }), ["deploy"]);
+  assert.deepEqual(externalEvidence({ type: "mcp", server: "postgres", tool: "execute_sql", args: { query: "UPDATE users SET active=1" } }, { content: "ok" }), ["database"]);
+  assert.deepEqual(externalEvidence({ type: "mcp", server: "postgres", tool: "execute_sql", args: { query: "SELECT 1" } }, { content: "ok" }), [],
+    "read-only SQL cannot satisfy a database mutation obligation");
+  assert.deepEqual(externalEvidence({ type: "db", query: "UPDATE users SET active=1" }, { content: "ok" }), ["database", "external"]);
+  for (const query of [
+    "WITH active AS (SELECT 1) SELECT * FROM active",
+    "EXPLAIN SELECT * FROM users",
+    "PRAGMA table_info(users)",
+    "CALL refresh_users()",
+  ]) {
+    assert.equal(sqlMutates(query), false, query);
+    assert.equal(sqlMayMutate(query), true, `${query} must stay behind approval and the plan gate`);
+    assert.equal(mayExternal({ type: "mcp", server: "postgres", tool: "execute_sql", args: { query } }), true);
+    assert.equal(mayExternal({ type: "db", query }), true);
+    assert.deepEqual(externalEvidence({ type: "mcp", server: "postgres", tool: "execute_sql", args: { query } }, { content: "ok" }), []);
+    assert.deepEqual(externalEvidence({ type: "db", query }, { content: "ok" }), [],
+      "a direct DB call also needs explicit write syntax before it counts as mutation evidence");
+  }
+  for (const query of ["SELECT * FROM users", "SHOW search_path", "DESCRIBE users", "-- inspect only\nSELECT * FROM users"]) {
+    assert.equal(sqlMayMutate(query), false, query);
+    assert.equal(mayExternal({ type: "mcp", server: "postgres", tool: "execute_sql", args: { query } }), false);
+    assert.equal(mayExternal({ type: "db", query }), false);
+    assert.deepEqual(externalEvidence({ type: "db", query }, { content: "ok" }), []);
+  }
+  assert.equal(sqlMayMutate("SELECT 1; UPDATE users SET active=1"), true,
+    "a read followed by another statement is not unambiguously read-only");
+  assert.equal(sqlMutates("/* write */ UPDATE users SET active=1"), true);
+  for (const query of ["GET key", "HGETALL users", "LRANGE jobs 0 -1", "SCAN 0", "INFO"]) {
+    const call = { type: "db", driver: "redis", query };
+    assert.equal(dbMayMutate(call), false, query);
+    assert.equal(dbExplicitlyMutates(call), false, query);
+    assert.equal(mayExternal(call), false, query);
+    assert.deepEqual(externalEvidence(call, { content: "ok" }), []);
+  }
+  for (const query of ["SET key value", "HSET users a 1", "DEL key", "INCR counter", "LPUSH jobs 1", "ZADD scores 1 a"]) {
+    const call = { type: "db", driver: "redis", query };
+    assert.equal(dbMayMutate(call), true, query);
+    assert.equal(dbExplicitlyMutates(call), true, query);
+    assert.equal(mayExternal(call), true, query);
+    assert.deepEqual(externalEvidence(call, { content: "ok" }), ["database", "external"]);
+  }
+  const unknownRedis = { type: "db", driver: "redis", query: "EVAL return 1 0" };
+  assert.equal(dbMayMutate(unknownRedis), true, "unknown Redis commands stay plan/approval gated");
+  assert.equal(dbExplicitlyMutates(unknownRedis), false, "unknown Redis commands are not completion proof");
+  assert.deepEqual(externalEvidence(unknownRedis, { content: "ok" }), []);
+  assert.deepEqual(externalEvidence(
+    { type: "mcp", server: "github", tool: "push_files", args: {} },
+    { content: "ok", externalEffects: ["push"] },
+  ), ["push", "external"], "explicit MCP result metadata can prove a generic external effect");
+  assert.deepEqual(externalEvidence(
+    { type: "mcp", server: "custom", tool: "create_record", args: { path: "x" } },
+    { content: "ok" },
+  ), [], "an MCP may-effect name is an approval hint, not generic completion evidence");
+  assert.equal(mutates({ type: "mcp", server: "filesystem", tool: "write_file", args: { path: "src/a.js" } }, {}), false,
+    "an MCP tool name is an approval hint, not proof that the local workspace changed");
+  assert.equal(mutates({ type: "mcp", server: "filesystem", tool: "write_file", args: { path: "src/a.js" } }, { workspaceMutated: true }), true);
   assert.equal(mutates({ type: "mcp", tool: "read_file", mcpReadOnly: true, args: { path: "src/a.js" } }, {}), false);
   assert.match(extractFn("_executeToolStep"), /\[ERROR\] 命令在 IDE 终端.*启动后很快退出/,
     "an exited persistent terminal must not satisfy a runtime task");
@@ -3044,10 +3775,17 @@ test("ordered tool segments preserve mutation barriers while parallelizing only 
   assert.ok(events.indexOf("command") < events.indexOf("read4:new"));
   assert.equal(maxReads, 2, "adjacent reads still execute in parallel");
 
-  const parallel = load("_isReadOnlyParallel", { _READ_ONLY_TYPES: new Set(["read"]) });
+  const parallel = load("_isReadOnlyParallel", {
+    _READ_ONLY_TYPES: new Set(["read"]),
+    _dbCallMayMutate: (call) => String(call?.driver || "").toLowerCase() === "redis"
+      ? !/^(?:GET|HGETALL)\b/i.test(String(call?.query || ""))
+      : !/^\s*(?:select|show|describe|desc)\b/i.test(String(call?.query || "")),
+  });
   assert.equal(parallel({ type: "genimage", dest: "same.png" }), false, "asset writes must remain ordered");
   assert.equal(parallel({ type: "db", query: "WITH old AS (DELETE FROM jobs RETURNING *) SELECT * FROM old" }), false,
     "writable CTEs must not enter a parallel read segment");
+  assert.equal(parallel({ type: "db", driver: "redis", query: "GET key" }), true);
+  assert.equal(parallel({ type: "db", driver: "redis", query: "SET key value" }), false);
 });
 
 test("an edit merged into item zero never gets its own card or staging work", () => {
@@ -3416,8 +4154,8 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.ok(planFirst >= 0 && workerStart > planFirst);
   assert.match(SRC, /workerMutated = false/);
   assert.match(SRC, /onMutation: \(\) => \{ workerMutated = true; \}/);
-  assert.match(SRC, /启动写入型 worker 前必须先调用 update_plan/);
-  assert.match(SRC, /缺少计划 · 未执行/);
+  assert.match(SRC, /启动写入型 worker 前需要合格计划/);
+  assert.match(SRC, /计划不完整 · 未执行/);
   const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
   assert.match(subagentSrc, /0 步 · 未执行/);
   assert.doesNotMatch(subagentSrc, /toolCount === 0[\s\S]{0,120}card\.remove\(/);
@@ -3435,9 +4173,8 @@ test("MCP read-only annotations survive discovery and mapping", () => {
   assert.doesNotMatch(SRC, /perm !== "approve"[^\n]*call\.mcpReadOnly/);
   assert.match(SRC, /readOnlyMode && \([^\n]*call\.type === "mcp"/);
   assert.match(SRC, /const _workspaceMutated = _ok && \(it\._wikiMutated \|\| _toolMutatesWorkspace\(it\.call, it\.rawResult\)\)/);
-  assert.match(SRC, /const _materialEffect = _ok && \(_workspaceMutated/);
-  assert.match(SRC, /_effectTarget === "runtime"[\s\S]{0,120}_toolProducesRuntimeEffect/);
-  assert.match(SRC, /_toolProducesMaterialEffect\(it\.call, it\.rawResult, false\)/);
+  assert.match(SRC, /for \(const kind of _runtimeEvidenceKinds\(it\.call, it\.rawResult\)\) _runtimeEffects\.add\(kind\)/);
+  assert.match(SRC, /for \(const kind of _externalEvidenceKinds\(it\.call, it\.rawResult\)\) _externalEffects\.add\(kind\)/);
   assert.match(SRC, /worker 不能调用可写 MCP/);
   assert.match(SRC, /执行 MCP 工具/);
   assert.match(SRC, /mcp_status", \{ name \}.*catch \{ return false; \}/s);

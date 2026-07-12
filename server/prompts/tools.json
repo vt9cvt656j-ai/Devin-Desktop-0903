@@ -313,7 +313,7 @@
     "type": "function",
     "function": {
       "name": "update_plan",
-      "description": "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。**每步要具体但简洁，让人一眼看懂**：一句话写清做什么 + 关键技术/文件（如「用 Vite+React+TS 初始化」「在 src/api/auth.ts 实现登录，调 POST /api/login」）。禁止模糊步骤（「搭建项目」「实现功能」等于没说），也别写成一大段。**实时维护**：① 开始做某步前把它标 in_progress；② 那步一做完立刻再调一次 update_plan 把它标 completed（让用户实时看到进度，别攒着最后才更新）；③ 中途发现新的必要工作就**动态把新步骤加进来**。注意：用户可能在面板上**点击某一步把它取消掉**——你会收到「用户取消了X」的提示，那些步骤标成 cancelled 或直接别做、也别加回来。",
+      "description": "创建或更新任务的分步计划——只用于复杂、多文件或架构级工作，简单一步修改不要套仪式。复杂写入任务的计划必须分别包含调查/理解现状、实现改动、真实验证三个可独立核验的步骤；复杂只读调查则包含调查取证和证据核验/结论，不虚构实现步骤。每步具体但简洁，写清动作和关键文件/命令；开始前标 in_progress，拿到真实证据后才标 completed，中途发现必要工作就动态加入。用户在面板取消的步骤保持 cancelled，不得擅自加回。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1968,11 +1968,11 @@
     "type": "function",
     "function": {
       "name": "developer_community_search",
-      "description": "并行搜索当前已接入的开发者代码平台、问答论坛、中英文社区和技术文章站。结果逐来源标注响应或失败；来源返回内容不等于事实已经证实，重要结论仍需读取原文并交叉验证。",
+      "description": "并行搜索当前注册的开发者代码平台、问答站、技术社区和官方语言论坛。逐来源返回 success、empty、rate-limited、failed 或 timeout；empty 只表示适配器完成但没有可用命中，不证明站点没有相关内容；timeout 表示该来源超过本轮硬时限，不能当作 empty 或 success。结果区分 published_date、created_date、updated_date、last_activity_date 与 retrieved_at；all 仅指当前适配器清单，不代表互联网全部社区。帖子和摘要是待核验线索，重要结论仍需读取原文并用官方文档、源码或本项目测试复核。",
       "parameters": {
         "type": "object",
         "properties": {
-          "query": { "type": "string", "description": "搜索主题或报错关键词" },
+          "query": { "type": "string", "minLength": 1, "description": "搜索主题或报错关键词" },
           "scope": {
             "type": "string",
             "enum": ["all", "code", "forums", "chinese", "articles"],
@@ -1981,7 +1981,7 @@
           "sources": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "可选，明确指定来源，如 github、stackoverflow、reddit、v2ex、juejin、gitlab、gitee"
+            "description": "可选，明确指定来源，如 github、stackoverflow、reddit、v2ex、juejin、gitlab、gitee、rust_users、python_discussions、swift_forums、kotlin_discussions"
           },
           "max_per_source": {
             "type": "integer",
@@ -1998,7 +1998,7 @@
     "type": "function",
     "function": {
       "name": "github_search",
-      "description": "搜索 GitHub 的仓库、代码或 issue。返回 GitHub API 的实时元数据和链接；仓库质量需结合源码、维护状态和 issue 进一步判断。",
+      "description": "通过 GitHub API 搜索仓库、代码或 issue，并返回本次 API 响应里的元数据和链接。updated_at 不是最新提交、release 或持续维护的证明；仓库质量与兼容性仍需读取源码、release 和 issue 并在当前项目验证。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2222,7 +2222,7 @@
     "type": "function",
     "function": {
       "name": "codepen_search",
-      "description": "**CodePen 搜索**——真实可运行的 UI 组件/动画/布局实现，学习别人怎么写的（HTML+CSS+JS 代码全有）。找组件实现参考首选。",
+      "description": "通过公共网页搜索定位 codepen.io/pen 页面，并附 CodePen 站内搜索入口；这不是 CodePen 官方 API，也不保证能读取完整 HTML/CSS/JS、可运行性、发布日期或覆盖全部作品。空结果也可能是公共搜索端点不可用。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2245,7 +2245,7 @@
     "type": "function",
     "function": {
       "name": "dribbble_search",
-      "description": "**Dribbble 搜索**——专业 UI/UX 设计师作品，搜索高质量设计灵感：仪表盘/着陆页/App UI/配色/排版参考。学习布局和视觉风格。",
+      "description": "通过公共网页搜索定位 dribbble.com/shots 页面，并附 Dribbble 站内搜索入口；这不是 Dribbble 官方 API，不保证结果质量、发布日期或覆盖全部作品。只把结果当视觉候选，不能据此证明可用性或最佳实践。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2383,7 +2383,7 @@
     "type": "function",
     "function": {
       "name": "freecodecamp_search",
-      "description": "**FreeCodeCamp 搜索**——12700+编程教程/深度技术文章/项目实战指南。从入门到进阶，覆盖全栈/算法/DevOps/AI，找最佳实践和学习资源。",
+      "description": "通过 freeCodeCamp 当前公开 Algolia 索引搜索文章，返回索引暴露的标题、作者、标签和链接。索引覆盖与日期字段以本次响应为准，文章示例不是当前项目的已验证最佳实践。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2406,7 +2406,7 @@
     "type": "function",
     "function": {
       "name": "github_trending",
-      "description": "**GitHub Trending**——发现全球本周最热门的新开源项目/工具/框架。了解开发者社区在关注什么、有什么新项目值得用或借鉴。可按语言筛选。",
+      "description": "读取 GitHub Trending 当前 weekly 页面列出的项目，可按明确的编程语言路径筛选。它是页面当时的趋势列表，不是关键词搜索、全 GitHub 排名、项目质量或长期维护状态证明。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2429,7 +2429,7 @@
     "type": "function",
     "function": {
       "name": "infoq_search",
-      "description": "**InfoQ 搜索**——全球企业级技术媒体，搜索架构/微服务/云原生/AI/DevOps深度文章。了解大厂技术选型和行业最佳实践。",
+      "description": "解析 InfoQ 当前公开搜索页面中的文章和新闻链接。页面结果是媒体内容候选，不代表厂商方案适合当前项目，也不能替代原始文档、源码和版本验证。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2498,7 +2498,7 @@
     "type": "function",
     "function": {
       "name": "bestofjs_search",
-      "description": "**Best of JS 搜索**——2000+ 精选 JavaScript/TypeScript 生态项目排名。按 star 排序、按标签分类，找 JS 生态里最好的框架/库/工具。",
+      "description": "查询 Best of JS 当前公开项目数据集，并按名称、描述和标签过滤，返回数据集暴露的 star、标签与仓库链接。该数据集的收录和 star 不代表全生态排名、质量、维护状态或与当前项目兼容。",
       "parameters": {
         "type": "object",
         "properties": {
