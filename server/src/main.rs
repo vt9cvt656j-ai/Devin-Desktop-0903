@@ -147,8 +147,16 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/apikeys/:id",
             delete(models::admin_delete_apikey),
         )
-        .route("/v1/chat/completions", post(models::chat_completions))
-        .route("/chat/completions", post(models::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(models::chat_completions)
+                .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route(
+            "/chat/completions",
+            post(models::chat_completions)
+                .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(models::audio_transcriptions)

@@ -447,6 +447,30 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 /// scope rejects hidden directories like `.wardrobe/` → the `<img>` stays blank. Reusing the
 /// genimage `data_url` is the fast path; this is the universal fallback (works for pre-existing
 /// images, cross-session, any path inside the workspace).
+fn data_url_mime(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "ogv" | "ogg" => "video/ogg",
+        "mov" => "video/quicktime",
+        "m4v" => "video/x-m4v",
+        _ => "application/octet-stream",
+    }
+}
+
 #[tauri::command]
 pub fn read_file_data_url(path: String) -> Result<String, String> {
     require_inside_workspace(&path)?;
@@ -461,22 +485,7 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
         ));
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        "avif" => "image/avif",
-        _ => "application/octet-stream",
-    };
+    let mime = data_url_mime(std::path::Path::new(&path));
     Ok(format!(
         "data:{};base64,{}",
         mime,
@@ -1185,6 +1194,26 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn data_url_mime_recognizes_common_video_formats() {
+        assert_eq!(data_url_mime(Path::new("clip.mp4")), "video/mp4");
+        assert_eq!(data_url_mime(Path::new("clip.WEBM")), "video/webm");
+        assert_eq!(data_url_mime(Path::new("clip.ogv")), "video/ogg");
+        assert_eq!(data_url_mime(Path::new("clip.ogg")), "video/ogg");
+        assert_eq!(data_url_mime(Path::new("clip.mov")), "video/quicktime");
+        assert_eq!(data_url_mime(Path::new("clip.m4v")), "video/x-m4v");
+    }
+
+    #[test]
+    fn data_url_mime_keeps_known_images_and_rejects_unknown_types() {
+        assert_eq!(data_url_mime(Path::new("frame.png")), "image/png");
+        assert_eq!(data_url_mime(Path::new("frame.jpeg")), "image/jpeg");
+        assert_eq!(
+            data_url_mime(Path::new("payload.html")),
+            "application/octet-stream"
+        );
     }
 
     fn staged_files_for(path: &Path) -> Vec<PathBuf> {

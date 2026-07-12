@@ -6,7 +6,7 @@
 //! Requests have timeouts, so a slow or misbehaving server returns an error.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -19,6 +19,68 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_TOOL_PAGES: usize = 100;
 const MAX_TOOLS_PER_SESSION: usize = 256;
 const MAX_TOOL_METADATA_BYTES: usize = 1024 * 1024;
+// A valid tool result may contain the full 8 MiB inline-media budget plus JSON
+// framing/text. Bound transport frames before allocating a String/serde Value.
+const MAX_MCP_STDOUT_FRAME_BYTES: usize = 10 * 1024 * 1024;
+const MAX_MCP_STDERR_FRAME_BYTES: usize = 64 * 1024;
+const MCP_FRAME_ERROR_PREFIX: &str = "__MICHAEL_MCP_FRAME_ERROR__:";
+
+fn discard_through_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(());
+        }
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if output.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+            if output.len().saturating_add(index) > max_bytes {
+                reader.consume(index + 1);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("transport frame exceeds {max_bytes} bytes"),
+                ));
+            }
+            output.extend_from_slice(&available[..index]);
+            reader.consume(index + 1);
+            break;
+        }
+        let chunk_len = available.len();
+        if output.len().saturating_add(chunk_len) > max_bytes {
+            reader.consume(chunk_len);
+            discard_through_newline(reader)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("transport frame exceeds {max_bytes} bytes"),
+            ));
+        }
+        output.extend_from_slice(available);
+        reader.consume(chunk_len);
+    }
+    if output.last() == Some(&b'\r') {
+        output.pop();
+    }
+    String::from_utf8(output)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 struct Session {
     child: Child,
@@ -141,6 +203,9 @@ impl Session {
             }
             match self.rx.recv_timeout(remaining) {
                 Ok(raw) => {
+                    if let Some(message) = raw.strip_prefix(MCP_FRAME_ERROR_PREFIX) {
+                        return Err(message.to_string());
+                    }
                     let v: Value = match serde_json::from_str(&raw) {
                         Ok(v) => v,
                         Err(_) => continue, // not valid JSON (stray output) — ignore
@@ -220,18 +285,26 @@ fn spawn_session(
     let stdout = child.stdout.take().ok_or("无法获取 MCP stdout")?;
     let stderr = child.stderr.take().ok_or("无法获取 MCP stderr")?;
 
-    // Reader thread: every stdout line → channel. Ends when stdout closes.
-    let (tx, rx) = mpsc::channel::<String>();
+    // Reader thread: every bounded stdout frame → channel. A bounded channel also
+    // prevents a notification flood from queueing unbounded Strings while idle.
+    let (tx, rx) = mpsc::sync_channel::<String>(64);
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_MCP_STDOUT_FRAME_BYTES) {
+                Ok(Some(line)) => {
+                    if tx.send(line).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(None) => break,
+                Err(error) => {
+                    let message = format!(
+                        "{MCP_FRAME_ERROR_PREFIX}MCP stdout protocol frame rejected: {error}; service disconnected"
+                    );
+                    let _ = tx.send(message);
+                    break;
+                }
             }
         }
     });
@@ -239,9 +312,13 @@ fn spawn_session(
     let stderr_log = Arc::new(Mutex::new(VecDeque::with_capacity(40)));
     let stderr_sink = Arc::clone(&stderr_log);
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let line = line.chars().take(500).collect::<String>();
+        let mut reader = BufReader::new(stderr);
+        loop {
+            let line = match read_bounded_line(&mut reader, MAX_MCP_STDERR_FRAME_BYTES) {
+                Ok(Some(line)) => line.chars().take(500).collect::<String>(),
+                Ok(None) => break,
+                Err(error) => format!("[oversized/invalid MCP stderr frame omitted: {error}]"),
+            };
             let Ok(mut log) = stderr_sink.lock() else {
                 break;
             };
@@ -397,8 +474,64 @@ fn append_content(text: &mut String, value: &str) {
     text.push_str(value);
 }
 
+const MAX_INLINE_MCP_MEDIA_BASE64: usize = 5 * 1024 * 1024;
+const MAX_TOTAL_INLINE_MCP_MEDIA_BASE64: usize = 8 * 1024 * 1024;
+
+fn append_media_content(
+    text: &mut String,
+    kind: &str,
+    mime: &str,
+    data: Option<&str>,
+    inline_media_base64: &mut usize,
+) {
+    let safe_mime = mime
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '+' | '.' | '-'));
+    let encoded = data.unwrap_or_default();
+    let valid_media = safe_mime
+        && !encoded.is_empty()
+        && encoded.len() <= MAX_INLINE_MCP_MEDIA_BASE64
+        && matches!(kind, "image" | "audio" | "video");
+    let fits_total_budget = inline_media_base64
+        .checked_add(encoded.len())
+        .is_some_and(|total| total <= MAX_TOTAL_INLINE_MCP_MEDIA_BASE64);
+
+    if valid_media && fits_total_budget {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[MCP_MEDIA ");
+        text.push_str(kind);
+        text.push(' ');
+        text.push_str(mime);
+        text.push_str("]\ndata:");
+        text.push_str(mime);
+        text.push_str(";base64,");
+        text.push_str(encoded);
+        *inline_media_base64 += encoded.len();
+    } else if valid_media {
+        append_content(
+            text,
+            &format!(
+                "[{kind} content omitted: {mime}, {} base64 characters; would exceed the {}-character total inline MCP media budget]",
+                encoded.len(),
+                MAX_TOTAL_INLINE_MCP_MEDIA_BASE64
+            ),
+        );
+    } else {
+        append_content(
+            text,
+            &format!(
+                "[{kind} content: {mime}, {} base64 characters]",
+                encoded.len()
+            ),
+        );
+    }
+}
+
 fn flatten_tool_content(result: &Value) -> String {
     let mut text = String::new();
+    let mut inline_media_base64 = 0;
     if let Some(items) = result.get("content").and_then(Value::as_array) {
         for item in items {
             match item.get("type").and_then(Value::as_str) {
@@ -420,7 +553,18 @@ fn flatten_tool_content(result: &Value) -> String {
                             .get("mimeType")
                             .and_then(Value::as_str)
                             .unwrap_or("application/octet-stream");
-                        append_content(&mut text, &format!("[resource {uri}, {mime}, binary]"));
+                        let kind = mime.split('/').next().unwrap_or("resource");
+                        if matches!(kind, "image" | "audio" | "video") {
+                            append_media_content(
+                                &mut text,
+                                kind,
+                                mime,
+                                resource.get("blob").and_then(Value::as_str),
+                                &mut inline_media_base64,
+                            );
+                        } else {
+                            append_content(&mut text, &format!("[resource {uri}, {mime}, binary]"));
+                        }
                     }
                 }
                 Some("resource_link") => {
@@ -431,16 +575,18 @@ fn flatten_tool_content(result: &Value) -> String {
                         .unwrap_or("resource");
                     append_content(&mut text, &format!("[resource link: {name}] {uri}"));
                 }
-                Some("image") | Some("audio") => {
+                Some("image") | Some("audio") | Some("video") => {
                     let kind = item.get("type").and_then(Value::as_str).unwrap_or("media");
                     let mime = item
                         .get("mimeType")
                         .and_then(Value::as_str)
                         .unwrap_or("application/octet-stream");
-                    let encoded_len = item.get("data").and_then(Value::as_str).map_or(0, str::len);
-                    append_content(
+                    append_media_content(
                         &mut text,
-                        &format!("[{kind} content: {mime}, {encoded_len} base64 characters]"),
+                        kind,
+                        mime,
+                        item.get("data").and_then(Value::as_str),
+                        &mut inline_media_base64,
                     );
                 }
                 Some(other) => append_content(&mut text, &format!("[{other} content]")),
@@ -469,10 +615,14 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
             json!({ "name": tool, "arguments": args.unwrap_or(json!({})) }),
             60,
         );
-        // If the call failed AND the server process has actually exited, evict the session so its
-        // child + reader thread are reaped now (Session::drop) instead of lingering forever; a later
-        // reconnect respawns cleanly. A mere slow-tool timeout on a still-alive server is kept.
-        let dead = req.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+        // If the process exited or violated the bounded transport protocol, evict
+        // the session so Drop kills/reaps it. A mere timeout keeps a live server.
+        let protocol_violation = req
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.starts_with("MCP stdout protocol frame rejected:"));
+        let dead =
+            req.is_err() && (protocol_violation || matches!(session.child.try_wait(), Ok(Some(_))));
         let result = match req {
             Ok(r) => r,
             Err(e) => {
@@ -566,6 +716,76 @@ mod tests {
             Some(env!("CARGO_MANIFEST_DIR").into()),
         )
         .await
+    }
+
+    #[test]
+    fn media_content_keeps_bounded_data_for_the_ide_renderer() {
+        let image = flatten_tool_content(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}]
+        }));
+        assert!(image.contains("[MCP_MEDIA image image/png]"));
+        assert!(image.contains("data:image/png;base64,iVBORw0KGgo="));
+
+        let video = flatten_tool_content(&json!({
+            "content": [{"type": "resource", "resource": {"uri": "fixture://clip", "mimeType": "video/mp4", "blob": "AAAA"}}]
+        }));
+        assert!(video.contains("[MCP_MEDIA video video/mp4]"));
+    }
+
+    #[test]
+    fn bounded_transport_reader_rejects_oversized_frames_without_allocating_the_tail() {
+        let input = b"123456789\nnext\r\n";
+        let mut reader = std::io::BufReader::with_capacity(3, &input[..]);
+        let error = read_bounded_line(&mut reader, 8).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some("next".into())
+        );
+        assert_eq!(read_bounded_line(&mut reader, 8).unwrap(), None);
+    }
+
+    #[test]
+    fn bounded_transport_reader_accepts_a_frame_at_the_exact_limit() {
+        let input = b"12345678\n";
+        let mut reader = std::io::BufReader::with_capacity(2, &input[..]);
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some("12345678".into())
+        );
+    }
+
+    #[test]
+    fn media_content_enforces_a_total_inline_budget() {
+        let first = "A".repeat(MAX_INLINE_MCP_MEDIA_BASE64);
+        let second = "B".repeat(MAX_TOTAL_INLINE_MCP_MEDIA_BASE64 - MAX_INLINE_MCP_MEDIA_BASE64);
+        let result = flatten_tool_content(&json!({
+            "content": [
+                {"type": "image", "mimeType": "image/png", "data": first},
+                {"type": "audio", "mimeType": "audio/mpeg", "data": second},
+                {"type": "video", "mimeType": "video/mp4", "data": "AAAA"}
+            ]
+        }));
+
+        assert_eq!(result.matches("[MCP_MEDIA ").count(), 2);
+        assert!(result.contains("video content omitted: video/mp4, 4 base64 characters"));
+        assert!(result.contains("total inline MCP media budget"));
+        assert!(!result.contains("data:video/mp4;base64,AAAA"));
+    }
+
+    #[test]
+    fn media_content_keeps_the_per_item_limit() {
+        let oversized = "A".repeat(MAX_INLINE_MCP_MEDIA_BASE64 + 1);
+        let result = flatten_tool_content(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": oversized}]
+        }));
+
+        assert!(!result.contains("[MCP_MEDIA "));
+        assert!(result.contains(&format!(
+            "[image content: image/png, {} base64 characters]",
+            MAX_INLINE_MCP_MEDIA_BASE64 + 1
+        )));
     }
 
     #[tokio::test]

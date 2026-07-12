@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ConversationMemory } from "../src/conversation-memory.js";
+import { ConversationMemory, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
@@ -554,6 +554,315 @@ test("conversation file evidence merges coverage, persists, and invalidates by v
   assert.equal(restored.fileEvidenceForRoot("/repo").length, 0);
 });
 
+test("conversation media persistence keeps images/key frames but drops raw videos", () => {
+  const memory = new ConversationMemory();
+  memory.push({
+    role: "user",
+    content: "look at this",
+    attachments: [
+      { kind: "image", mime: "image/png", name: "shot.png", dataUrl: "data:image/png;base64,AAAA", frames: [] },
+      { kind: "video", mime: "video/mp4", name: "clip.mp4", dataUrl: "data:video/mp4;base64,RAWVIDEO", frames: ["data:image/jpeg;base64,FRAME"] },
+    ],
+  });
+  const saved = memory.toJSON().recent[0].attachments;
+  assert.equal(saved[0].dataUrl, "data:image/png;base64,AAAA");
+  assert.equal(saved[1].dataUrl, undefined, "raw video bytes must not bloat the chat store");
+  assert.deepEqual(saved[1].frames, ["data:image/jpeg;base64,FRAME"]);
+  assert.deepEqual(ConversationMemory.fromJSON(memory.toJSON()).recent[0].attachments, saved);
+});
+
+test("conversation media persistence records an explicit placeholder when its budget is exhausted", () => {
+  const large = "data:image/png;base64," + "A".repeat(200);
+  const small = "data:image/png;base64,B";
+  const saved = serializeMessagesForPersistence([
+    { role: "user", content: "older", attachments: [{ kind: "image", name: "large.png", dataUrl: large }] },
+    { role: "user", content: "newer", attachments: [{ kind: "image", name: "small.png", dataUrl: small }] },
+  ], small.length + 1);
+  const omitted = saved[0].attachments[0];
+  assert.equal(omitted.dataUrl, undefined);
+  assert.equal(omitted.omitted, true);
+  assert.equal(omitted.omittedReason, "persistence_media_budget");
+  assert.equal(omitted.omittedCount, 1);
+  assert.equal(saved[1].attachments[0].dataUrl, small, "newest media still gets persistence priority");
+
+  const resaved = serializeMessagesForPersistence(saved, small.length + 1);
+  assert.equal(resaved[0].attachments[0].omittedReason, "persistence_media_budget", "restart/resave must retain the reason");
+  const label = load("_attachmentOmissionLabel");
+  assert.match(label(resaved[0].attachments[0]), /large\.png/);
+  assert.match(label(resaved[0].attachments[0]), /存储空间已满/);
+  assert.match(SRC, /placeholder\.className = "msg__attachment-omitted"/);
+});
+
+test("conversation compaction reports removed media for object URL cleanup", () => {
+  const memory = new ConversationMemory();
+  const removed = [];
+  memory.setRemovalHandler((messages) => removed.push(...messages));
+  for (let index = 0; index < 101; index++) {
+    memory.push({ role: "user", content: `turn ${index}`, attachments: index === 0 ? [{ kind: "video", objectUrl: "blob:test-video" }] : [] });
+  }
+  assert.equal(memory.recent.length, 91);
+  assert.equal(removed.length, 10);
+  assert.equal(removed[0].attachments[0].objectUrl, "blob:test-video");
+
+  const compacted = memory.compactRecent(2, "summary");
+  assert.equal(compacted.length, 2);
+  assert.equal(removed.length, 12);
+});
+
+test("blob video snapshots fall back to durable key-frame rendering", () => {
+  assert.match(SRC, /const liveVideos = Array\.from\(c\.querySelectorAll\("video"\)\)/);
+  assert.match(SRC, /clonedVideo\.replaceWith\(image\)/);
+  assert.match(SRC, /if \(\/\\b\(\?:src\|poster\).*blob:/);
+  assert.match(SRC, /_releaseBlobMediaInNode\(msgs\[i\]\)/);
+  assert.match(SRC, /_bindSessionMemoryCleanup\(session\)/);
+});
+
+test("model request budget drops older media before the current visual turn", () => {
+  const enforce = load("_enforceModelRequestBudget");
+  const media = (name, size) => `data:image/jpeg;base64,${name}${"A".repeat(size)}`;
+  const oldOne = media("OLD1", 520);
+  const oldTwo = media("OLD2", 520);
+  const current = media("CURRENT", 620);
+  const messages = [
+    { role: "system", content: "真实性优先" },
+    { role: "user", content: [{ type: "text", text: "old 1" }, { type: "image_url", image_url: { url: oldOne } }] },
+    { role: "assistant", content: "seen" },
+    { role: "user", content: [{ type: "text", text: "old 2" }, { type: "image_url", image_url: { url: oldTwo } }] },
+    { role: "user", content: [{ type: "text", text: "current request" }, { type: "image_url", image_url: { url: current } }] },
+  ];
+  const tools = [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }];
+  const prepared = enforce(messages, tools, 1_350);
+  const json = JSON.stringify({ messages: prepared, tools });
+  assert.ok(new TextEncoder().encode(json).byteLength <= 1_350);
+  assert.match(json, /CURRENT/, "the newest media turn must be retained first");
+  assert.doesNotMatch(json, /OLD1/);
+  assert.doesNotMatch(json, /OLD2/);
+  assert.match(JSON.stringify(messages), /OLD1/, "request trimming must not mutate chat memory");
+});
+
+test("model request budget bounds a 13 MiB historical tool call without breaking its result pair", () => {
+  const enforce = load("_enforceModelRequestBudget");
+  const originalArguments = JSON.stringify({ path: "src/generated.js", content: "A".repeat(13 * 1024 * 1024) });
+  const originalEditArguments = JSON.stringify({
+    path: "src/existing.js",
+    old_string: "B".repeat(48 * 1024),
+    new_string: "C".repeat(48 * 1024),
+    replace_all: false,
+  });
+  const messages = [
+    { role: "system", content: "Keep tool protocol valid." },
+    { role: "user", content: "Generate the file." },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "call_write_13m", type: "function", function: { name: "write_file", arguments: originalArguments } },
+        { id: "call_edit_large", type: "function", function: { name: "edit_file", arguments: originalEditArguments } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_write_13m", content: "Wrote src/generated.js" },
+    { role: "tool", tool_call_id: "call_edit_large", content: "Edited src/existing.js" },
+    { role: "assistant", content: "The file was written." },
+    { role: "user", content: "Now continue with the next task." },
+  ];
+  const tools = [
+    { type: "function", function: { name: "write_file", parameters: { type: "object" } } },
+    { type: "function", function: { name: "edit_file", parameters: { type: "object" } } },
+  ];
+  const prepared = enforce(messages, tools, 64 * 1024);
+  const request = JSON.stringify({ messages: prepared, tools });
+  assert.ok(new TextEncoder().encode(request).byteLength <= 64 * 1024);
+
+  const callMessage = prepared.find((message) => message.role === "assistant" && message.tool_calls);
+  const resultMessages = prepared.filter((message) => message.role === "tool");
+  assert.equal(callMessage.tool_calls[0].id, "call_write_13m");
+  assert.equal(callMessage.tool_calls[0].type, "function");
+  assert.deepEqual(resultMessages.map((message) => message.tool_call_id), callMessage.tool_calls.map((call) => call.id));
+  const summarized = JSON.parse(callMessage.tool_calls[0].function.arguments);
+  assert.equal(summarized.path, "src/generated.js");
+  assert.match(summarized.content, /historical write_file argument omitted/);
+  const summarizedEdit = JSON.parse(callMessage.tool_calls[1].function.arguments);
+  assert.deepEqual(Object.keys(summarizedEdit), ["path", "old_string", "new_string", "replace_all"]);
+  assert.equal(summarizedEdit.path, "src/existing.js");
+  assert.match(summarizedEdit.old_string, /historical edit_file argument omitted/);
+  assert.match(summarizedEdit.new_string, /historical edit_file argument omitted/);
+  assert.equal(summarizedEdit.replace_all, false);
+
+  assert.notEqual(callMessage, messages[2]);
+  assert.notEqual(callMessage.tool_calls, messages[2].tool_calls);
+  assert.notEqual(callMessage.tool_calls[0].function, messages[2].tool_calls[0].function);
+  assert.equal(messages[2].tool_calls[0].function.arguments, originalArguments,
+    "budget enforcement must not mutate the transcript kept in memory");
+  assert.equal(messages[2].tool_calls[1].function.arguments, originalEditArguments);
+});
+
+test("model request budget fails explicitly when essential context cannot fit", () => {
+  const enforce = load("_enforceModelRequestBudget");
+  const messages = [
+    { role: "system", content: "S".repeat(8 * 1024) },
+    { role: "user", content: "current request" },
+  ];
+  assert.throws(
+    () => enforce(messages, [], 2 * 1024),
+    (error) => error instanceof RangeError
+      && error.code === "MODEL_REQUEST_TOO_LARGE"
+      && error.requestBytes > error.byteCap,
+  );
+  assert.equal(messages[0].content.length, 8 * 1024);
+});
+
+test("every streaming chat path applies the final request budget", () => {
+  assert.match(SRC, /const requestMessages = _enforceModelRequestBudget\(messages, useTools \? _toolSchemas : \[\]\)/);
+  assert.match(SRC, /_l0Msgs = _enforceModelRequestBudget\(_l0Msgs, _l0Tools\)/);
+  const rawCalls = [...SRC.matchAll(/backend\.aiChat\(([^\n]+)/g)].map((match) => match[1]);
+  assert.ok(rawCalls.every((call) => call.includes("_enforceModelRequestBudget") || call.includes("requestMessages")), rawCalls.join("\n"));
+});
+
+test("Claude tuning cannot override complete writes or force ritual searches", () => {
+  const start = SRC.indexOf("const _CLAUDE_TUNING");
+  const end = SRC.indexOf("function _modelStyleTuning", start);
+  const tuning = SRC.slice(start, end);
+  assert.match(tuning, /第一次 write_file 就写入完整、非空/);
+  assert.match(tuning, /检索只解决真实未知项/);
+  assert.doesNotMatch(tuning, /先用 write_file 建骨架|≤150 行|写核心代码\/算法\/架构前先看全世界/);
+  assert.doesNotMatch(tuning, /毒舌老炮|这方案垃圾|违反 = 被换掉/);
+});
+
+test("pending follow-ups persist with the shared bounded media serializer", () => {
+  const serialize = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
+  const saved = serialize([
+    { text: "first", attachments: [{ kind: "video", dataUrl: "data:video/mp4;base64,RAW", frames: ["data:image/jpeg;base64,F1"] }] },
+    { text: "second", attachments: [{ kind: "image", dataUrl: "data:image/png;base64,I2" }] },
+  ]);
+  assert.deepEqual(saved.map((item) => item.text), ["first", "second"]);
+  assert.equal(saved[0].attachments[0].dataUrl, undefined);
+  assert.deepEqual(saved[0].attachments[0].frames, ["data:image/jpeg;base64,F1"]);
+  assert.equal(saved[1].attachments[0].dataUrl, "data:image/png;base64,I2");
+  assert.match(SRC, /pendingSends: _pendingSendsForStorage\(s\._pendingSends\)/);
+  assert.match(SRC, /session\._pendingSends = _pendingSendsForStorage\(sData\.pendingSends\)/);
+});
+
+test("follow-up drain keeps the head until auth and config are ready", async () => {
+  const session = { streaming: false, _pendingSends: [{ text: "keep me", attachments: [] }] };
+  let sends = 0, saves = 0;
+  const makeDrain = (ready) => load("_drainFollowups", {
+    _currentSession: () => session,
+    _readyAiConfig: async () => ready,
+    sendPrompt: () => { sends++; },
+    saveChatHistory: () => { saves++; },
+  });
+
+  await makeDrain(null)(session);
+  assert.equal(session._pendingSends.length, 1, "failed auth/config must not consume the queue head");
+  await makeDrain({ baseUrl: "https://api.test", apiKey: "key", model: "model" })(session);
+  assert.equal(session._pendingSends.length, 0);
+  assert.equal(sends, 1);
+  assert.equal(saves, 1);
+});
+
+test("composer auth/config failure restores its draft and blob while success consumes it once", async () => {
+  const attachment = { kind: "video", objectUrl: "blob:composer-video" };
+  const draft = { text: "send me", composerText: "send me", droppedRefs: [], attachments: [attachment] };
+  let restored = null, released = 0, sends = 0;
+  const failedDispatch = load("_dispatchComposerSubmission", {
+    _readyAiConfig: async () => null,
+    _restoreComposerSubmission: (value) => { restored = value; return true; },
+    _releaseAttachmentObjectUrl: () => { released++; },
+    sendPrompt: () => { sends++; },
+  });
+  assert.equal(await failedDispatch(draft), false);
+  assert.equal(restored, draft);
+  assert.equal(released, 0, "a restored blob remains owned by the composer and must stay playable");
+  assert.equal(sends, 0);
+
+  const config = { baseUrl: "https://api.test", apiKey: "key", model: "model" };
+  const successfulDispatch = load("_dispatchComposerSubmission", {
+    _readyAiConfig: async () => config,
+    _restoreComposerSubmission: () => { throw new Error("must not restore an accepted send"); },
+    _releaseAttachmentObjectUrl: () => { released++; },
+    sendPrompt: (text, attachments, ready) => {
+      sends++;
+      assert.equal(text, draft.text);
+      assert.equal(attachments[0], attachment);
+      assert.equal(ready, config);
+    },
+  });
+  assert.equal(await successfulDispatch(draft), true);
+  assert.equal(sends, 1, "an accepted draft is transferred to sendPrompt exactly once");
+  assert.equal(released, 0);
+});
+
+test("composer draft recovery merges input that arrived while the gate was open", () => {
+  const merge = load("_mergeComposerDraftState");
+  const originalAttachment = { objectUrl: "blob:original" };
+  const laterAttachment = { dataUrl: "data:image/png;base64,LATER" };
+  const merged = merge(
+    { composerText: "original", droppedRefs: [{ path: "/r/a", rel: "a" }], attachments: [originalAttachment] },
+    { composerText: "typed later", droppedRefs: [{ path: "/r/a", rel: "a" }, { path: "/r/b", rel: "b" }], attachments: [laterAttachment] },
+  );
+  assert.equal(merged.composerText, "original\ntyped later");
+  assert.deepEqual(merged.droppedRefs.map((ref) => ref.rel), ["a", "b"]);
+  assert.deepEqual(merged.attachments, [originalAttachment, laterAttachment]);
+  assert.match(SRC, /_dispatchComposerSubmission\(\{ text, composerText, droppedRefs, attachments \}\)/);
+});
+
+test("a steer arriving during a model turn discards its stale tool batch", () => {
+  const turnPos = SRC.indexOf("const turn = await _agentModelTurn");
+  const discardPos = SRC.indexOf("if (turn.toolCalls.length && Array.isArray(session._steerQueue)", turnPos);
+  const executePos = SRC.indexOf("const items = turn.toolCalls.map", turnPos);
+  assert.ok(turnPos >= 0 && discardPos > turnPos && executePos > discardPos,
+    "pending steer must be checked after the model returns and before old tools are mapped/executed");
+});
+
+test("automatic deep read samples different domains and counts only valid bodies", async () => {
+  const fetched = [];
+  const deepRead = load("_autoDeepRead", {
+    _AR_URL_RE: /https?:\/\/[^\s)\]"'<>`,]+/g,
+    _AR_SKIP_RE: /$a/,
+    _agentWebCache: new Map(),
+    _invokeCapped: async (_tool, { url }) => {
+      fetched.push(url);
+      if (url.includes("second.test")) throw new Error("timeout");
+      return "real article body ".repeat(10);
+    },
+    _webCachePut: () => {},
+  });
+  const result = await deepRead("https://first.test/a https://first.test/b https://second.test/c", 2, 500);
+  assert.deepEqual(fetched, ["https://first.test/a", "https://second.test/c"]);
+  assert.equal(result.count, 1);
+  assert.match(result.text, /跨域抽样/);
+});
+
+test("local discovery is a registered read-only model tool", () => {
+  assert.match(SRC, /name: "local_discovery"/);
+  assert.match(SRC, /case "local_discovery": \{[\s\S]{0,700}type: "localdiscovery"/);
+  assert.match(SRC, /backend\.invoke\("local_discovery"/);
+  assert.match(SRC, /_requestCurrentCoordinates/);
+  assert.match(SRC, /open_now 为未知时不得补猜/);
+});
+
+test("optional numeric tool arguments never coerce null into zero", () => {
+  const finiteNumberArg = load("_finiteNumberArg");
+  assert.equal(finiteNumberArg(null), null);
+  assert.equal(finiteNumberArg(undefined), null);
+  assert.equal(finiteNumberArg(""), null);
+  assert.equal(finiteNumberArg(false), null);
+  assert.equal(finiteNumberArg("34.0522"), 34.0522);
+  assert.equal(finiteNumberArg(0), 0);
+  assert.match(SRC, /const latitude = _finiteNumberArg\(args\.latitude\)/);
+  assert.match(SRC, /anyOf: \[\{ required: \["near"\] \}, \{ required: \["latitude", "longitude"\] \}\]/);
+});
+
+test("native screen tools are mapped to real Tauri commands", () => {
+  assert.match(SRC, /name: "read_screen"/);
+  assert.match(SRC, /name: "ui_click"/);
+  assert.match(SRC, /case "read_screen": return \{ type: "readscreen"/);
+  assert.match(SRC, /case "ui_click"/);
+  assert.match(SRC, /backend\.invoke\("read_screen"/);
+  assert.match(SRC, /backend\.invoke\("ui_click"/);
+  assert.match(SRC, /"ui_click".*_STRICT_MUTATING_TOOL_NAMES|"automation", "ui_click", "db_query"/);
+});
+
 test("read ranges deduplicate only exact source still available in the current run context", () => {
   const merge = load("_mergeReadRanges");
   const covered = load("_readRangeCovered", { _mergeReadRanges: merge });
@@ -708,10 +1017,9 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
 });
 
 test("real-time user steering is marked separately from agent continuation nudges", () => {
-  assert.match(
-    SRC,
-    /messages\.push\(\{ role: "user", content: `\[MICHAEL_USER_STEERING\]\\n\\n\$\{s\}` \}\)/,
-  );
+  assert.match(SRC, /const content = await _attachmentAwareContent\(`\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`/);
+  assert.match(SRC, /const steerAttachments = typeof queued === "string" \? \[\] : \(queued\?\.attachments \|\| \[\]\)/);
+  assert.match(SRC, /_steerRunningAgent\(_rs, text, attachments\)/);
 });
 
 test("standard SKILL.md frontmatter is parsed with a stable source identity", () => {
@@ -1039,7 +1347,13 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
   const localStorage = { setItem: (k, v) => { store[k] = v; }, getItem: (k) => (k in store ? store[k] : null) };
   const memJSON = { totalTurns: 3, recent: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }], summaries: [], milestones: [] };
   const _chatSessions = [{ id: "s1", name: "Chat 1", mode: "chat", model: "m", project: "", created: 123, memory: { toJSON: () => memJSON } }];
-  const flush = load("_flushChatHistorySync", { _chatSessions, localStorage, CHAT_STORE_KEY: "michael-ide.chat-sessions", _activeChatIdx: 0 });
+  const flush = load("_flushChatHistorySync", {
+    _chatSessions,
+    localStorage,
+    CHAT_STORE_KEY: "michael-ide.chat-sessions",
+    _activeChatIdx: 0,
+    _pendingSendsForStorage: () => [],
+  });
   flush();
   const saved = JSON.parse(store["michael-ide.chat-sessions"]);
   const s0 = saved.sessions[0];

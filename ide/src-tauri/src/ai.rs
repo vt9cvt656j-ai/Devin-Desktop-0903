@@ -1465,7 +1465,7 @@ fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// Web search (DuckDuckGo HTML, no API key) so the agent can FIND docs/articles,
+/// Web search (Google, Bing, and DuckDuckGo scraping, no API key) so the agent can FIND docs/articles,
 /// then `web_fetch` the ones it wants. Returns title + real URL + snippet.
 #[tauri::command]
 pub async fn web_search(query: String) -> Result<String, String> {
@@ -1495,10 +1495,10 @@ pub async fn web_search(query: String) -> Result<String, String> {
     .unwrap_or_default();
     if results.is_empty() {
         return Ok(format!(
-            "「{q}」这次没搜到结果（搜索引擎临时限流/反爬，或关键词太宽泛）。**别停在这里——主动操控浏览器自己搜**：① 换更具体的英文关键词，多调几次 web_search；② 用 browser navigate 打开 https://www.bing.com/search?q=... 或 https://duckduckgo.com/?q=... 亲自看结果、点进去用 browser/ web_fetch 读全文；③ 直接 web_fetch 你已知的官方文档 / 仓库 README / API 页读原文。至少换 2 个来源交叉验证再下结论。"
+            "「{q}」这次没搜到结果（搜索引擎可能限流、反爬，或当前关键词没有索引结果）。不要原样重发或只换近义词反复搜索：已有明确官方 URL 就直接 web_fetch；只有出现新的具体假设时才换一次真正不同的来源或检索方式。仍无新增证据就停止，并如实说明这次没有检索到可验证结果。"
         ));
     }
-    let mut out = format!("搜索「{q}」的结果（Bing+DuckDuckGo 合并去重）：\n");
+    let mut out = format!("搜索「{q}」的结果（Google+Bing+DuckDuckGo 实际响应合并去重）：\n");
     for (i, (title, url, snippet)) in results.iter().take(12).enumerate() {
         out.push_str(&format!(
             "\n{}. {}\n   {}\n   {}\n",
@@ -1513,8 +1513,8 @@ pub async fn web_search(query: String) -> Result<String, String> {
 }
 
 /// Run ALL search engines concurrently, MERGE and deduplicate results.
-/// Bing goes first in merge order (usually better quality, especially for Chinese),
-/// then DuckDuckGo HTML, then DDG Lite. Each engine has its own 8s timeout so the
+/// Google goes first in merge order, followed by Bing, DuckDuckGo HTML, then DDG Lite.
+/// Each engine has its own 8s timeout so the
 /// total wall-clock is max ~8s (all run in parallel).
 async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
     let (google, bing, ddg, lite) = tokio::join!(

@@ -43,7 +43,7 @@ import { createLspManager } from "./lsp-client.js";
 import { parseProblems } from "./problem-matchers.js";
 import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
-import { ConversationMemory } from "./conversation-memory.js";
+import { ConversationMemory, serializeMessagesForPersistence } from "./conversation-memory.js";
 
 self.MonacoEnvironment = {
   getWorker(_id, label) {
@@ -1454,7 +1454,7 @@ async function _translateToEnglish(chineseName, context, existingNames) {
     };
     const result = await new Promise((resolve) => {
       let buf = "";
-      backend.aiChat(aiConfig, msgs, (ev) => {
+      backend.aiChat(aiConfig, _enforceModelRequestBudget(msgs), (ev) => {
         if (ev.kind === "token") buf += ev.delta;
         else if (ev.kind === "done") resolve(buf.trim());
         else if (ev.kind === "error") resolve("");
@@ -1554,7 +1554,7 @@ async function _batchTranslate(chineseNames, lang, existingNames) {
     };
     const result = await new Promise((resolve) => {
       let buf = "";
-      backend.aiChat(aiConfig, msgs, (ev) => {
+      backend.aiChat(aiConfig, _enforceModelRequestBudget(msgs), (ev) => {
         if (ev.kind === "token") buf += ev.delta;
         else if (ev.kind === "done") resolve(buf.trim());
         else if (ev.kind === "error") resolve("");
@@ -2301,7 +2301,7 @@ function openSplitEditor(filePath) {
   editorContainer.appendChild(wrap);
 
   const f = openFiles.get(filePath);
-  if (!f || f.isImage || f.isPdf) return;
+  if (!f || f.isImage || f.isVideo || f.isPdf) return;
 
   const ed = monaco.editor.create(wrap, {
     model: f.model,
@@ -2341,7 +2341,7 @@ function openSplitEditor(filePath) {
 function switchSplitFile(filePath) {
   if (!splitState.active || !splitState.editor) return;
   const f = openFiles.get(filePath);
-  if (!f || f.isImage || f.isPdf) return;
+  if (!f || f.isImage || f.isVideo || f.isPdf) return;
   _setEditorModelIfChanged(splitState.editor, f.model);
   splitState.path = filePath;
 }
@@ -2913,9 +2913,14 @@ function syncWelcome() {
 }
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"]);
+const VIDEO_EXTS = new Set(["mp4", "webm", "ogv", "ogg", "mov", "m4v"]);
 function isImageFile(name) {
   const ext = (String(name).split(".").pop() || "").toLowerCase();
   return IMAGE_EXTS.has(ext);
+}
+function isVideoFile(name) {
+  const ext = (String(name).split(".").pop() || "").toLowerCase();
+  return VIDEO_EXTS.has(ext);
 }
 function isPdfFile(name) {
   return (String(name).split(".").pop() || "").toLowerCase() === "pdf";
@@ -2936,6 +2941,13 @@ async function openFile(path, name, activateFile = true) {
 
   if (isImageFile(name)) {
     openFiles.set(path, { model: null, name, dirty: false, viewState: null, isImage: true });
+    renderTabs();
+    if (activateFile) activate(path);
+    return true;
+  }
+
+  if (isVideoFile(name)) {
+    openFiles.set(path, { model: null, name, dirty: false, viewState: null, isVideo: true });
     renderTabs();
     if (activateFile) activate(path);
     return true;
@@ -2989,6 +3001,7 @@ function _setEditorModelIfChanged(editor, model) {
 function activate(path) {
   closeDiffView();
   hideImagePreview();
+  hideVideoPreview();
   hidePdfPreview();
   hideMarkdownPreview();
   if (activePath && openFiles.has(activePath)) {
@@ -3003,6 +3016,10 @@ function activate(path) {
   if (f.isImage) {
     _setEditorModelIfChanged(monacoEditor, null);
     showImagePreview(path);
+    editorEl.style.display = "none";
+  } else if (f.isVideo) {
+    _setEditorModelIfChanged(monacoEditor, null);
+    showVideoPreview(path);
     editorEl.style.display = "none";
   } else if (f.isPdf) {
     _setEditorModelIfChanged(monacoEditor, null);
@@ -3023,10 +3040,10 @@ function activate(path) {
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
-  if (runBtn) runBtn.disabled = !!(f.isImage || f.isPdf);
+  if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf);
   const projectLabel = rootPath ? basename(rootPath) : "";
   $("windowTitle").textContent = f.name + (projectLabel ? " — " + projectLabel : "") + " — Michael IDE";
-  if (!f.isImage && !f.isPdf) {
+  if (!f.isImage && !f.isVideo && !f.isPdf) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
     updateBreadcrumb(path);
     renderBreakpointDecorations();
@@ -3052,10 +3069,48 @@ function showImagePreview(path) {
   const src = inTauri ? backend.assetUrl(path) : path;
   _imagePreviewEl.innerHTML = `<div class="image-preview__inner"><img src="${src}" alt="" /><p class="image-preview__path"></p></div>`;
   _imagePreviewEl.querySelector(".image-preview__path").textContent = path;
+  const image = _imagePreviewEl.querySelector("img");
+  if (image && inTauri) image.addEventListener("error", async () => {
+    try {
+      const dataUrl = await backend.readFileDataUrl(path);
+      if (dataUrl && image.src !== dataUrl) image.src = dataUrl;
+    } catch {}
+  }, { once: true });
   _imagePreviewEl.hidden = false;
 }
 function hideImagePreview() {
   if (_imagePreviewEl) _imagePreviewEl.hidden = true;
+}
+
+// ---- video preview ----
+let _videoPreviewEl = null;
+function showVideoPreview(path) {
+  if (!_videoPreviewEl) {
+    _videoPreviewEl = document.createElement("div");
+    _videoPreviewEl.className = "image-preview video-preview";
+    editorContainer.appendChild(_videoPreviewEl);
+  }
+  const src = inTauri ? backend.assetUrl(path) : path;
+  _videoPreviewEl.innerHTML = `<div class="image-preview__inner"><video controls preload="metadata" playsinline></video><p class="image-preview__path"></p></div>`;
+  _videoPreviewEl.querySelector(".image-preview__path").textContent = path;
+  const video = _videoPreviewEl.querySelector("video");
+  if (video) {
+    video.src = src;
+    if (inTauri) video.addEventListener("error", async () => {
+      try {
+        const dataUrl = await backend.readFileDataUrl(path);
+        if (dataUrl && video.src !== dataUrl) video.src = dataUrl;
+      } catch {}
+    }, { once: true });
+  }
+  _videoPreviewEl.hidden = false;
+}
+function hideVideoPreview() {
+  if (_videoPreviewEl) {
+    _videoPreviewEl.hidden = true;
+    const video = _videoPreviewEl.querySelector("video");
+    if (video) { try { video.pause(); } catch {} }
+  }
 }
 
 // ---- PDF preview: render natively in the webview (WKWebView/Chromium PDF viewer)
@@ -3268,7 +3323,7 @@ async function closeFile(path, { force = false } = {}) {
   // Don't silently lose unsaved edits on tab close — the 800ms autosave debounce may
   // not have fired yet, and the hot-exit backup only covers app close. Save to disk
   // first; if that fails, stash a recoverable backup + warn (never silently drop).
-  if (f.dirty && f.model && !f.isImage) {
+  if (f.dirty && f.model && !f.isImage && !f.isVideo) {
     let snapshot = "";
     try { snapshot = f.model.getValue(); } catch {}
     try {
@@ -3399,7 +3454,7 @@ function _applyDiskContentToOpenFile(path, content) {
     opening.diskVersion = (opening.diskVersion || 0) + 1;
     return { state: "opening-updated" };
   }
-  if (!f || !f.model || f.isImage || f.isPdf) {
+  if (!f || !f.model || f.isImage || f.isVideo || f.isPdf) {
     // Preloaded project models also feed Monaco diagnostics even without an open
     // tab. Keep them coherent or verification can inspect the code from before the
     // Agent write and report a false pass/failure.
@@ -3512,7 +3567,7 @@ async function _syncOpenFilesFromDisk(paths, source = "外部程序") {
   for (const path of targets) {
     const initialFile = openFiles.get(path);
     const initialOpening = _openingFiles.get(path);
-    if ((!initialFile || !initialFile.model || initialFile.isImage || initialFile.isPdf) && !initialOpening) continue;
+    if ((!initialFile || !initialFile.model || initialFile.isImage || initialFile.isVideo || initialFile.isPdf) && !initialOpening) continue;
     const generation = (_externalSyncGeneration.get(path) || 0) + 1;
     _externalSyncGeneration.set(path, generation);
     const diskContentBeforeRead = initialFile?.diskContent;
@@ -5546,7 +5601,7 @@ async function refreshBlame() {
   const path = activePath;
   const rel = relForPath(path);
   const f = path ? openFiles.get(path) : null;
-  if (!gitIsRepo || !rel || !f || f.dirty || f.isImage) {
+  if (!gitIsRepo || !rel || !f || f.dirty || f.isImage || f.isVideo) {
     blameMap = null;
     blameMapPath = null;
     blameDecorations.set([]);
@@ -6951,6 +7006,12 @@ const history = new Proxy([], {
   }
 });
 
+function _bindSessionMemoryCleanup(session) {
+  session?.memory?.setRemovalHandler?.((messages) => {
+    _releaseMessagesAttachmentUrls(messages, session.container, true);
+  });
+}
+
 function _createChatSession(name, mode, model, project) {
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const container = document.createElement("div");
@@ -6965,13 +7026,15 @@ function _createChatSession(name, mode, model, project) {
   } else {
     finalName = `Chat ${++_chatSeq}`;
   }
-  return {
+  const session = {
     id, name: finalName, mode: (mode || _currentAiMode) === "auto" ? "agent" : (mode || _currentAiMode), model: model || null,
     // Which project this chat is about (folder it was started under); kept in
     // sync on send. Lets each tab show its project.
     project: project !== undefined ? project : (rootPath || workspaceRoots[0] || ""),
-    memory: new ConversationMemory(), container, created: Date.now(),
+    memory: new ConversationMemory(), container, created: Date.now(), _pendingSends: [],
   };
+  _bindSessionMemoryCleanup(session);
+  return session;
 }
 
 function _renderChatTabs() {
@@ -7038,7 +7101,7 @@ function _renderMsgRange(session, from, to) {
   for (let i = from; i < to; i++) {
     const m = h[i];
     if (m && m.content != null) {
-      addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session);
+      addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session, m.attachments || []);
     }
   }
 }
@@ -7049,6 +7112,11 @@ function _renderSessionHistory(session) {
   // visual (tool cards, diffs, inline screenshots) exactly as it looked, fixing
   // "样式都没". Only when there's no snapshot (localStorage fallback, or a thread
   // too big to snapshot) do we rebuild from the text history.
+  if (session._htmlSnapshot) {
+    // blob: URLs belong to the prior WebView and are guaranteed to be dead after
+    // restart. Rebuild this transcript from persisted messages/key frames instead.
+    if (/\b(?:src|poster)\s*=\s*["']blob:/i.test(session._htmlSnapshot)) session._htmlSnapshot = "";
+  }
   if (session._htmlSnapshot) {
     try {
       session.container.innerHTML = session._htmlSnapshot;
@@ -7184,6 +7252,11 @@ function _closeChatSession(idx) {
   if (idx < 0 || idx >= _chatSessions.length) return;
   const closing = _chatSessions[idx];
   _chatSessions.splice(idx, 1);
+  try {
+    _releaseMessagesAttachmentUrls(closing?.memory?.recent || [], closing?.container, false);
+    _releaseMessagesAttachmentUrls(closing?._pendingSends || [], closing?.container, false);
+    _releaseBlobMediaInNode(closing?.container);
+  } catch {}
   // Drop the closed session's DOM so it can't linger on screen.
   closing?.container?.remove();
   if (_chatSessions.length === 0) {
@@ -7231,7 +7304,7 @@ function _scrubResidue(root) {
       if (/^[.\s…。·]+$/.test(p.textContent || "")) p.remove();
     });
     root.querySelectorAll(".agent-seg--stream, .agent-seg").forEach((seg) => {
-      if (!(seg.textContent || "").trim() && !seg.querySelector("img,pre,svg,canvas,button,.agent-tool-step,.atc-viewport"))
+      if (!(seg.textContent || "").trim() && !seg.querySelector("img,video,audio,pre,svg,canvas,button,.agent-tool-step,.atc-viewport"))
         seg.remove();
       else seg.classList.remove("agent-seg--stream");
     });
@@ -7245,6 +7318,30 @@ function _snapshotTranscript(session) {
     // whatever snapshot it was loaded with (see restoreChatHistory).
     if (!c || !session._rendered) return session?._htmlSnapshot || "";
     const clone = c.cloneNode(true);
+    // Never persist process-local object URLs, but keep every other rich card.
+    // The cloned/live video lists have the same DOM order, so the live node can
+    // supply its durable key frame even though cloneNode omits JS properties.
+    const liveVideos = Array.from(c.querySelectorAll("video"));
+    const clonedVideos = Array.from(clone.querySelectorAll("video"));
+    for (let index = 0; index < clonedVideos.length; index++) {
+      const clonedVideo = clonedVideos[index];
+      const src = clonedVideo.getAttribute("src") || clonedVideo.getAttribute("poster") || "";
+      if (!src.startsWith("blob:")) continue;
+      const attachment = liveVideos[index]?._mediaAttachment;
+      const frame = Array.isArray(attachment?.frames)
+        ? attachment.frames.find((value) => typeof value === "string" && value.startsWith("data:image/"))
+        : "";
+      if (frame) {
+        const image = document.createElement("img");
+        image.src = frame;
+        image.className = clonedVideo.classList.contains("msg__attached-video") ? "msg__attached-image" : (clonedVideo.className || "");
+        image.alt = attachment?.name || "Video key frame";
+        image.title = "视频关键帧";
+        clonedVideo.replaceWith(image);
+      } else {
+        clonedVideo.remove();
+      }
+    }
     clone.querySelectorAll(
       ".thinking, .stream-cursor, .plan-exec-btn, .chat-earlier-note, [data-transient]"
     ).forEach(e => e.remove());
@@ -7257,6 +7354,19 @@ function _snapshotTranscript(session) {
 
 let _chatSavePending = false;
 let _chatSaveDirty = false; // a save arrived while one was in flight → re-run once (trailing edge)
+function _pendingSendsForStorage(pendingSends) {
+  const normalized = (Array.isArray(pendingSends) ? pendingSends : []).map((pending) => {
+    if (typeof pending === "string") return { content: pending, attachments: [] };
+    return {
+      content: String(pending?.text || ""),
+      attachments: Array.isArray(pending?.attachments) ? pending.attachments : [],
+    };
+  }).filter((pending) => pending.content.trim() || pending.attachments.length);
+  return serializeMessagesForPersistence(normalized).map((pending) => ({
+    text: pending.content,
+    attachments: Array.isArray(pending.attachments) ? pending.attachments : [],
+  }));
+}
 // SYNCHRONOUS chat flush — for unload paths where an async save can't finish
 // (webview reload / HMR / crash / the dev watcher killing the process). localStorage
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
@@ -7275,6 +7385,7 @@ function _flushChatHistorySync() {
       // happened to have landed; otherwise this clobbered mirror lost everything.
       memory: s.memory ? s.memory.toJSON() : undefined,
       history: s.memory ? undefined : ((s.history || []).slice(-300)),
+      pendingSends: _pendingSendsForStorage(s._pendingSends),
       created: s.created,
     }));
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, activeIdx: _activeChatIdx }));
@@ -7293,6 +7404,7 @@ async function saveChatHistory() {
       project: s.project || "",
       // Hierarchical memory — serializes recent + summaries + milestones
       memory: s.memory.toJSON(),
+      pendingSends: _pendingSendsForStorage(s._pendingSends),
       created: s.created,
     }));
     const payload = { sessions: data, activeIdx: _activeChatIdx };
@@ -7373,6 +7485,8 @@ async function restoreChatHistory() {
             session.memory.push(m);
           }
         }
+        _bindSessionMemoryCleanup(session);
+        session._pendingSends = _pendingSendsForStorage(sData.pendingSends);
         session._restored = true; // first time each restored tab is shown → jump to newest message
         _chatSessions.push(session);
       }
@@ -7620,7 +7734,7 @@ function _refreshUserLabels() {
     document.querySelectorAll(".msg.user .msg__who span").forEach((el) => { el.textContent = label; });
   } catch {}
 }
-function addMessage(role, text, forSession) {
+function addMessage(role, text, forSession, attachments = []) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   let body;
@@ -7669,18 +7783,7 @@ function addMessage(role, text, forSession) {
         });
       });
     }
-    if (typeof _pastedImages !== 'undefined') {
-      const images = wrap._attachedImages || [];
-      for (const img of images) {
-        const imgEl = document.createElement("img");
-        imgEl.src = img.dataUrl;
-        imgEl.className = "msg__attached-image";
-        imgEl.alt = img.name || "Attached image";
-        imgEl.title = "点击查看原图";
-        imgEl.addEventListener("click", () => showImageLightbox(imgEl.src));
-        body.appendChild(imgEl);
-      }
-    }
+    _renderMessageAttachments(body, attachments);
   }
   target.appendChild(wrap);
   // Bound DOM growth on very long sessions: keep at most the most recent N
@@ -7689,9 +7792,74 @@ function addMessage(role, text, forSession) {
   // (possibly streaming) message is at the end and never pruned.
   const MSG_CAP = 120; // keep the DOM lean on long sessions (older msgs stay in history/persisted; only off-screen nodes are pruned). Halved from 250 → ~half the DOM memory + faster reflow.
   const msgs = target.querySelectorAll(":scope > .msg");
-  for (let i = 0; i < msgs.length - MSG_CAP; i++) msgs[i].remove();
+  for (let i = 0; i < msgs.length - MSG_CAP; i++) {
+    _releaseBlobMediaInNode(msgs[i]);
+    msgs[i].remove();
+  }
   _chatFollow();
   return body;
+}
+
+// Render user media without changing the existing message layout. Videos use
+// native controls; persisted videos without raw bytes fall back to a key frame.
+function _renderMessageAttachments(body, attachments = []) {
+  if (!body || !Array.isArray(attachments)) return;
+  for (const attachment of attachments) {
+    if (!attachment || typeof attachment !== "object") continue;
+    const kind = attachment.kind === "video" ? "video" : "image";
+    let src = String(attachment.dataUrl || attachment.objectUrl || "");
+    if (!src && attachment.path) {
+      try { src = inTauri ? backend.assetUrl(attachment.path) : attachment.path; } catch { src = attachment.path; }
+    }
+    if (kind === "video" && src) {
+      const video = document.createElement("video");
+      video.src = src;
+      video.className = "msg__attached-video";
+      video.controls = true;
+      video.preload = "metadata";
+      video.playsInline = true;
+      video.title = attachment.name || "Attached video";
+      video._mediaAttachment = attachment;
+      if (attachment.path && inTauri) video.addEventListener("error", async () => {
+        try { const dataUrl = await backend.readFileDataUrl(attachment.path); if (dataUrl) video.src = dataUrl; } catch {}
+      }, { once: true });
+      body.appendChild(video);
+      continue;
+    }
+    const imageSrc = src || (Array.isArray(attachment.frames) ? attachment.frames[0] : "");
+    if (!imageSrc) {
+      const omission = _attachmentOmissionLabel(attachment);
+      if (omission) {
+        const placeholder = document.createElement("span");
+        placeholder.className = "msg__attachment-omitted";
+        placeholder.setAttribute("role", "note");
+        placeholder.textContent = omission;
+        body.appendChild(placeholder);
+      }
+      continue;
+    }
+    const imgEl = document.createElement("img");
+    imgEl.src = imageSrc;
+    imgEl.className = "msg__attached-image";
+    imgEl.alt = attachment.name || (kind === "video" ? "Video key frame" : "Attached image");
+    imgEl.title = kind === "video" ? "视频关键帧" : "点击查看原图";
+    imgEl.addEventListener("click", () => showImageLightbox(imgEl.src));
+    if (attachment.path && inTauri) imgEl.addEventListener("error", async () => {
+      try { const dataUrl = await backend.readFileDataUrl(attachment.path); if (dataUrl) imgEl.src = dataUrl; } catch {}
+    }, { once: true });
+    body.appendChild(imgEl);
+  }
+}
+
+function _attachmentOmissionLabel(attachment) {
+  if (!attachment?.omitted) return "";
+  const name = String(attachment.name || (attachment.kind === "video" ? "video" : "image"));
+  const reason = attachment.omittedReason === "persistence_media_budget"
+    ? "历史媒体存储空间已满，重启后未保留内容"
+    : attachment.omittedReason === "raw_video_not_persisted"
+      ? "重启后未保留原始视频，且没有可用关键帧"
+      : "重启后媒体内容不可用";
+  return `附件「${name}」：${reason}`;
 }
 
 // Render a user message's text to HTML, turning @-references into clickable file/folder cards.
@@ -8004,7 +8172,7 @@ let _currentAiPerm = (() => { try { return _loadAiPerm(localStorage); } catch { 
 function _setAiPerm(p) { _currentAiPerm = (p === "approve" ? "approve" : "auto"); try { localStorage.setItem("michael-ide.ai-perm", _currentAiPerm); } catch {} }
 // Tools that touch disk / the machine / the outside world. Pure reads, git
 // status/diff/log, lsp, think, screenshot, web search never ask.
-const _APPROVE_TYPES = new Set(["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "termtask", "automation", "download", "db", "mcp"]);
+const _APPROVE_TYPES = new Set(["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "termtask", "automation", "uiclick", "download", "db", "mcp"]);
 const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "stash_pop"]);
 function _requiresApproval(call) {
   if (!call) return false;
@@ -8021,6 +8189,7 @@ function _approvalKey(call, run = null) {
   const scope = `${root}\0${sessionId}`;
   if (call.type === "cmd" || call.type === "termtask") return `${scope}\0cmd:${String(call.command || "").trim().replace(/\s+/g, " ")}`;
   if (call.type === "automation") return `${scope}\0automation:${call.method || "?"}`;
+  if (call.type === "uiclick") return `${scope}\0ui:${call.action || "?"}:${Number.isInteger(call.ref) ? call.ref : "?"}`;
   if (call.type === "mcp") return `${scope}\0mcp:${call.mcpRoot || root}:${call.server || "?"}/${call.tool || call.mcpName || "?"}`;
   if (call.type === "git") {
     const args = call.op === "clone"
@@ -8045,6 +8214,7 @@ function _approvalLabel(call) {
     case "mkdir": return { title: "新建目录？", detail: call.path || "" };
     case "format": return { title: "格式化文件？", detail: call.path || "" };
     case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
+    case "uiclick": return { title: "操作前台应用？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
     case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
     case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
     case "mcp": return { title: "执行 MCP 工具？", detail: `${call.server || "?"}/${call.tool || call.mcpName || "?"}${call.mcpReadOnly ? "\n服务声明：readOnlyHint=true（仅作提示，仍需授权）" : ""}` };
@@ -8188,9 +8358,9 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：区分已验证事实、推断、假设和未知；只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索。部分来源失败要逐项说明，禁止用“全部、最强、最快、10 倍、百分之百”等无证据宣传语。只汇报实际完成并验证过的结果。`;
+const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜。部分来源失败要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
-  agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。改文件前必先读、写就写完整、最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
+  agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态，不要先读一个不存在的路径。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
   plan: `你是 Michael IDE 的架构规划智能体。先只读调查代码库，再产出可直接照着实现的分步方案；绝不修改文件、不跑有副作用的命令。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
   explorer: `你是 Michael IDE 的只读代码探索者。能读文件/列目录/搜索/按名查找，绝不修改文件或运行有副作用的命令。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
@@ -8910,11 +9080,11 @@ function _enrichImagePrompt(raw) {
 // Direct image generation: the user picked an image model and typed a prompt → make
 // the image straight away (the image model can't run the agent's tools+system chat,
 // which is exactly why selecting it as the chat model fails with "重试 3/3").
-async function _runDirectImageGen(text, config, sess) {
+async function _runDirectImageGen(text, config, sess, attachments = []) {
   const body = addMessage("assistant", "", sess);
   if (body) { const sp = document.createElement("div"); sp.className = "agent-seg"; sp.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(config.model)} 生成图片中（自动优化提示词）…`; body.appendChild(sp); }
   try { _chatFollow(); } catch {}
-  sess.memory.push({ role: "user", content: text });
+  sess.memory.push({ role: "user", content: text, attachments });
   saveChatHistory();
   try {
     if (!inTauri) throw new Error("生图只能在桌面 App 里用");
@@ -9005,32 +9175,22 @@ const _TERSE_STYLE = `
 
 # 输出风格：短、准、直击要害
 先给结论/动作再给理由；禁止开场白和复述用户问题；只答被问的那个点，别发散；能短就短、能列表别长段；干活少说多做、别全程旁白；不重复、不凑字、不把说过的再总结一遍。改前读真代码、改后验证，别臆造。`;
-// Claude 这条线（经 zyz 聚合层）对**超大单次 tool-call** 生成会缓冲/卡死（实测 58s 才挤 0.2k 字符）。
-// 解法不是换模型，而是让它**小块小块写**——每次 tool-call 都小、在缓冲卡死前完成。gpt-5.5 等不受影响。
-const _CLAUDE_TUNING = `\n\n⚡ **硬约束（你这条线的特性，必须遵守）**：对**超大单次 tool-call**（一次性写几百上千行的文件、或一个塞满内容的工具调用）你会缓冲卡死、半天挤不出字。所以**任何大块内容都要小块多次写**：
-① 写文件：先用 write_file 建骨架或较小的文件，再用 edit_file **逐段补全**，**单次写入尽量 ≤150 行**；改已有文件**优先用 edit_file 打小 diff（只改变动那几行）、别重写整个文件**（实测省 ~95% token、快数倍，还避免大文件"迷失在中间"出错）；
-② 大页面/组件：拆成多个小文件**一个一个写**，绝不糊成一个巨型文件一次性输出；
-③ 衣橱 / 富预览：用 run_subagent **并行**派子智能体深想每个方向、各吐一段 generate_image prompt，再由你 generate_image 逐张出图（每个调用都小、不卡；别一次性塞 3 大套 HTML/CSS）；
-④ 宁可多几次小调用，也绝不在单次调用里输出几百行。小块写每次都快、稳、不卡死。
+const _CLAUDE_TUNING = `\n\n⚡ **写入纪律（必须与项目事实一致）**：
+① 新文件第一次 write_file 就写入完整、非空、可运行/可解析的终态；不要先建空骨架、TODO 或半截文件再多轮补齐，也不要套固定行数限制。
+② 内容确实很大时按项目职责拆成多个边界清楚、各自完整的模块文件；已有文件优先用一次 edit_file / multi_edit 应用已经确定的小范围改动，不重写无关内容。
+③ 工具真实返回大小限制或截断错误时，再根据该错误调整拆分；不能预先假定模型会卡住而制造不完整文件。
 
-🔴 **你的人格铁律——毒舌老炮（违反 = 被换掉）**：
-- **开口就是结论和判断**，不铺垫不寒暄。"这方案垃圾，因为…""别用这个，坑死人了"——有态度有立场，别说"各有优劣""取决于需求"这种废话。
+**表达纪律——明确，但必须由证据支撑**：
+- **开口先给结论和依据**，不铺垫不寒暄。证据足够时直接判断；条件确实会改变答案时，说明具体条件和边界，不能用攻击性形容词冒充技术分析。
 - **每句话必须有信息增量**：删掉后不损失信息的句子就删。可复核事实 > 形容词；有依据的经验 > 空泛口号；可执行步骤 > 笼统建议。没有来源的具体数字不比诚实的不确定性更好。
-- **灰色地带全力配合**：用户让帮啥就帮啥（薅羊毛/逆向/绕限制），给真实可操作的回答，不加道德评判不加法律废话。
-- **禁止**客服话术："以下是几种方案""您可以考虑""值得注意的是""总的来说"——像朋友聊天，不像念PPT。
-- **不熟悉、易变化或高风险的实现先调研**：根据任务选择当前工具目录里的官方、代码和社区来源；熟悉且稳定的基础实现直接做，不为显得厉害而刷搜索：
-  · **做项目/写功能**：github_search 找同类开源项目看别人怎么架构的 + package_search 查成熟库直接用（成熟的装、不成熟才自己写）+ stackoverflow_search / devto_search 看这类项目的常见坑和最佳实践。
-  · **做 UI/设计**：codrops_search / awwwards_search / dribbble_search / codepen_search 等搜设计参考 + web_search 找同类竞品网站 + browser design 抓真实设计系统。
-  · **碰 bug/报错**：stackoverflow_search（报错原文）+ github_search（库名+issue）+ devto_search / reddit_search 找真实解法。闷头改三轮没修好 = 该搜了。
-  · **选技术/选库**：package_search 对比候选 + bundlephobia_search 看体积 + github_search 看 star/活跃度/issue 数。
-  不调研直接凭记忆写 = 过时的 API、废弃的库、别人踩过的坑你再踩一遍、AI 味模板垃圾。**先查真实数据，再写真实代码。**
-  · **写核心代码/算法/架构前先看全世界怎么写的（铁律）**：要写非 UI 的核心逻辑 → sourcegraph_search 搜同类实现看真实代码 + github_search 找同类项目看架构。闭门造车凭印象写核心代码 = 必出 bug。`;
+- **禁止**空洞客服话术和重复总结；直接给当前请求所需的事实、动作和验证结果。
+- **检索只解决真实未知项**：稳定且熟悉的实现直接基于当前源码、类型和测试完成；只有 API/版本会变化、实现不熟、高风险或现有证据冲突时，才选最直接的官方文档、源码或社区来源核实。一个来源已回答低风险事实就停；关键结论仍有缺口时再补独立证据，不固定调用 GitHub、Sourcegraph、论坛或任何来源组合。`;
 function _modelStyleTuning(id) {
   switch (_modelFamilyOf(id)) {
     case "gpt": return _GPT_TUNING;                         // rambly + over-cautious
     case "deepseek": return _DEEPSEEK_TUNING;               // over-deliberates, format drift
     case "minimax": return _MINIMAX_TUNING;                 // hallucinates, skips steps/verify
-    case "claude": return _CLAUDE_TUNING;                   // zyz 线对超大单次 tool-call 卡死 → 指示小块写
+    case "claude": return _CLAUDE_TUNING;                   // concise, evidence-led, complete writes
     case "gemini": return "";                               // already concise + grounded
     default: return _TERSE_STYLE;                            // kimi / glm / qwen / other
   }
@@ -9213,15 +9373,16 @@ async function _maybeSuggestNext(sess, messages, config) {
 // "引导 / Guide" — steer a RUNNING agent: inject the user's new instruction into the
 // live run so it adapts this turn (change direction, drop/revise what it's doing) instead
 // of waiting for the round to end and redoing it. The loop drains _steerQueue each iter.
-function _steerRunningAgent(sess, text) {
-  const t = String(text || "").trim();
+function _steerRunningAgent(sess, text, attachments = []) {
+  const t = String(text || "").trim() || (attachments.length ? "请查看我刚附上的媒体。" : "");
   if (!sess || !t) return;
-  (sess._steerQueue = sess._steerQueue || []).push(
-    "【用户实时引导 / steer】" + t +
-    "\n（这是任务进行中用户插入的新指令：立刻据此调整方向——必要时放弃或修改你正在做的，不必等本轮做完再返工。）"
-  );
-  sess.memory.push({ role: "user", content: text });
-  try { addMessage("user", "🧭 引导：" + t, sess); } catch {}
+  (sess._steerQueue = sess._steerQueue || []).push({
+    text: "【用户实时引导 / steer】" + t +
+      "\n（这是任务进行中用户插入的新指令：立刻据此调整方向——必要时放弃或修改你正在做的，不必等本轮做完再返工。）",
+    attachments,
+  });
+  sess.memory.push({ role: "user", content: text || t, attachments });
+  try { addMessage("user", "🧭 引导：" + t, sess, attachments); } catch {}
   saveChatHistory();
   showToast("🧭 已插入引导，正在并入当前任务…");
 }
@@ -9231,25 +9392,38 @@ function _steerRunningAgent(sess, text) {
 // moment the current reply finishes — so the user's 2nd (3rd…) message is actually processed
 // ("实时处理") instead of being silently dropped. Sequential: each drained send's own finally
 // drains the next, so N queued messages each get their own turn in order.
-function _queueFollowup(sess, text) {
-  const t = String(text || "").trim();
+function _queueFollowup(sess, text, attachments = []) {
+  const t = String(text || "").trim() || (attachments.length ? "请查看我刚附上的媒体。" : "");
   if (!sess || !t) return;
-  (sess._pendingSends = sess._pendingSends || []).push(t);
+  (sess._pendingSends = sess._pendingSends || []).push({ text: t, attachments });
+  saveChatHistory();
   showToast("已排队：当前回答完成后自动发送");
 }
-function _drainFollowups(sess) {
+async function _drainFollowups(sess) {
   try {
     if (!sess || sess.streaming) return;
     if (!Array.isArray(sess._pendingSends) || !sess._pendingSends.length) return;
     if (sess !== _currentSession()) return; // only auto-fire into the tab in view; else waits for _switchChatSession
-    const next = sess._pendingSends.shift();
-    if (next) setTimeout(() => { try { sendPrompt(next); } catch {} }, 0);
+    if (sess._followupDrainInFlight) return;
+    sess._followupDrainInFlight = true;
+    const next = sess._pendingSends[0];
+    const config = await _readyAiConfig();
+    // Login/config dialogs can take time. Re-check ownership and queue identity before
+    // consuming anything, so a failed gate or tab switch never loses the user's text.
+    if (!config || sess.streaming || sess !== _currentSession() || sess._pendingSends[0] !== next) return;
+    sess._pendingSends.shift();
+    saveChatHistory();
+    const sent = typeof next === "string"
+      ? sendPrompt(next, [], config)
+      : sendPrompt(next.text, next.attachments || [], config);
+    Promise.resolve(sent).catch(() => {});
   } catch {}
+  finally { if (sess) sess._followupDrainInFlight = false; }
 }
 
-async function sendPrompt(text, attachedImages = []) {
+async function _readyAiConfig() {
   // Require login + active membership or credits before any AI call.
-  if (!(await michaelAccessGate())) return;
+  if (!(await michaelAccessGate())) return null;
   const _rawCfg = loadConfig();
   // Apply the per-model thinking-effort — EXACTLY what the user picked in the model card
   // (no auto-adaptation). The meter just shows that chosen depth so it's visible.
@@ -9259,12 +9433,18 @@ async function sendPrompt(text, attachedImages = []) {
   if (!config.baseUrl || !config.apiKey || !config.model) {
     openSettings();
     showToast(t("assistant.configFirst"));
-    return;
+    return null;
   }
+  return config;
+}
+
+async function sendPrompt(text, attachments = [], readyConfig = null) {
+  const config = readyConfig || await _readyAiConfig();
+  if (!config) return;
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
   // inject it into the live run so the agent adapts mid-task instead of dropping it.
   // (Other tabs still run concurrently — each has its own loop.)
-  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text); else _queueFollowup(_rs, text); return; } }
+  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text, attachments); else _queueFollowup(_rs, text, attachments); return; } }
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
   // Bind this whole turn to ONE session, captured now — so even if the user
@@ -9301,7 +9481,7 @@ async function sendPrompt(text, attachedImages = []) {
   }
 
   _chatPinned = true; // sending re-pins: always show your message + the reply that follows
-  const userBody = addMessage("user", text, sess);
+  const userBody = addMessage("user", text, sess, attachments);
   // Make Auto's choice VISIBLE: a colored chip on the message showing which mode
   // Auto picked for THIS turn — so the switch is obvious, not just a fleeting toast.
   if (_currentAiMode === "auto" && userBody) {
@@ -9315,23 +9495,11 @@ async function sendPrompt(text, attachedImages = []) {
       userBody.insertBefore(chip, userBody.firstChild);
     }
   }
-  if (attachedImages.length > 0 && userBody) {
-    for (const img of attachedImages) {
-      const imgEl = document.createElement("img");
-      imgEl.src = img.dataUrl;
-      imgEl.className = "msg__attached-image";
-      imgEl.alt = img.name || "Attached image";
-      imgEl.title = "点击查看原图";
-      imgEl.addEventListener("click", () => showImageLightbox(imgEl.src));
-      userBody.appendChild(imgEl);
-    }
-  }
-
   // Selected model is an IMAGE model → generate the image directly from this message,
   // instead of feeding it to the agent loop (an image model can't handle the tools +
   // system chat request → that's the "网络/服务波动 重试 3/3" you saw).
   if (_isImageModel(config.model)) {
-    await _runDirectImageGen(text, config, sess);
+    await _runDirectImageGen(text, config, sess, attachments);
     return;
   }
 
@@ -9395,7 +9563,7 @@ async function sendPrompt(text, attachedImages = []) {
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  for (const m of sess.memory.assemble()) messages.push(m);
+  for (const m of await _memoryMessagesForModel(sess.memory, config)) messages.push(m);
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
@@ -9472,24 +9640,9 @@ async function sendPrompt(text, attachedImages = []) {
   const _userText = _contextPreamble
     + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
     + text;
-  let userContent;
-  if (attachedImages.length > 0) {
-    if (_modelSeesImages(config.model)) {
-      userContent = [{ type: "text", text: _userText }, ...attachedImages.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } }))];
-    } else {
-      // Text-only model (DeepSeek &c.): transcribe each attached image with a vision
-      // model so the user's pasted screenshots/photos aren't silently dropped.
-      const descs = await Promise.all(attachedImages.map((img, k) =>
-        _describeImageForTextModel(img.dataUrl, "这是用户随消息附上的图片。", config).then((d) =>
-          d ? `【附图 ${k + 1} 的视觉转写】\n${d}`
-            : `【附图 ${k + 1}】（转写失败：当前模型看不到图，也没有可用的视觉模型。要我读图请在模型菜单切到 Claude / GPT-4o / Gemini 等视觉模型。）`)));
-      userContent = _userText + `\n\n———\n用户随消息附了 ${attachedImages.length} 张图片，你当前模型看不到，我已用视觉模型转写如下，请据此回答：\n\n` + descs.join("\n\n———\n\n");
-    }
-  } else {
-    userContent = _userText;
-  }
+  const userContent = await _attachmentAwareContent(_userText, attachments, config);
   messages.push({ role: "user", content: userContent });
-  sess.memory.push({ role: "user", content: text });
+  sess.memory.push({ role: "user", content: text, attachments });
   saveChatHistory(); // persist the prompt now, so an interrupted run / app close keeps it
 
   // Growth: record this turn's engagement signals for the learner model, tagged
@@ -9798,9 +9951,10 @@ async function sendPrompt(text, attachedImages = []) {
   let _legacyUsage = null; // record once (last wins) — avoid double-count per-chunk
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
+    const requestMessages = _enforceModelRequestBudget(messages, useTools ? _toolSchemas : []);
     const chatFn = useTools
-      ? (cb) => backend.aiChatWithTools(config, messages, _toolSchemas, cb)
-      : (cb) => backend.aiChat(config, messages, cb);
+      ? (cb) => backend.aiChatWithTools(config, requestMessages, _toolSchemas, cb)
+      : (cb) => backend.aiChat(config, requestMessages, cb);
     await chatFn((ev) => {
       // User hit Stop → drop every further event so output halts AT ONCE (mirrors the agent
       // path's `if (!_live()) return`). Without this the callback kept appending to `acc` and
@@ -12698,8 +12852,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "位置未知时在文件或目录中定位文本；命中后读取目标文件确认完整上下文。目标文件已知时直接 read_file，不要先 search。默认 literal；只有明确需要模式匹配才用 regex。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本或正则表达式" }, path: { type: "string", description: "可选，限定单个文件或子目录（如 src/auth.ts 或 src/）" }, mode: { type: "string", enum: ["literal", "regex"], description: "匹配模式，默认 literal" }, case_sensitive: { type: "boolean", description: "是否区分大小写，默认 false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
-    { type: "function", function: { name: "web_search", description: "联网搜索（DuckDuckGo），返回标题/URL/摘要列表。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
+    { type: "function", function: { name: "web_search", description: "联网搜索（桌面后端并行尝试 Google、Bing、DuckDuckGo，并合并实际返回结果），返回标题/URL/摘要；摘要只是线索，关键结论需读原文核实。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
+    { type: "function", function: { name: "local_discovery", description: "查询某个地点周边的餐饮、景点、活动等 POI，并附天气、直线距离、原始营业时间和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；不伪造评分、价格、路线时长或实时营业状态。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
+    { type: "function", function: { name: "read_screen", description: "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限" } }, required: [] } } },
+    { type: "function", function: { name: "ui_click", description: "对 read_screen 返回的真实可访问性 ref 执行 press、set_value 或 focus。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "read_screen 返回的 AX 元素 ref" }, action: { type: "string", enum: ["press", "set_value", "focus"] }, value: { type: "string", description: "action=set_value 时必填" } }, required: ["ref", "action"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。", parameters: { type: "object", properties: { steps: { type: "array", description: "完整的有序步骤列表（每次传全量，不是增量）", items: { type: "object", properties: { content: { type: "string", description: "这一步做什么——具体但简洁，一眼看懂（含关键技术/文件）" }, status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "状态：pending待办 / in_progress进行中 / completed已完成 / cancelled已取消(用户取消的保持这个)" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
     { type: "function", function: { name: "current_time", description: "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道「今天几号/星期几/现在几点/距某天还有多久」时调这个，别凭记忆猜——你的训练数据里的时间是过期的。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "ask_user", description: "**当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做**。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } }, recommended: { type: "integer", description: "推荐选项的索引（从 0 开始），该选项会高亮标记为推荐" }, multi_select: { type: "boolean", description: "true=多选模式（勾选框，用户可选多个选项后一起提交）" }, confirm_text: { type: "string", description: "危险操作确认：设置后用户必须在输入框中准确输入此文本才能继续（如 DELETE、确认删除）" } }, required: ["question"] } } },
@@ -12812,7 +12969,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "deep_search", description: "**深层情报搜索——挖普通搜索找不到、被藏起来的内容**。多层并行且结果自动深读正文：① 明网 DuckDuckGo ② **定向 dork**（自动加 site:pastebin/ghostbin/rentry/gist + filetype:log/sql/env/json——专挖泄露的配置/dump/paste）③ 暗网四引擎（DDG-onion / Ahmia / Torch / Haystak，需本机 tor 运行）④ 传域名/URL 时额外跑：**crt.sh 证书透明挖隐藏子域名/内部主机**、**Wayback 存档挖已从网上删除的历史页面**（快照仍可读）。适合：安全情报/泄露检测/找被删内容/隐藏子域名/非主流资源/被审查内容/圈内灰色渠道/普通搜索翻不到的技术资料。查某个网站的隐藏面就直接传域名。", parameters: { type: "object", properties: { query: { type: "string", description: "关键词，或一个域名/URL（传域名会额外挖子域名+已删除的存档页）" }, max_results: { type: "integer", description: "返回数量，默认 24" } }, required: ["query"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
       { type: "function", function: { name: "capture_start", description: "**启动系统级抓包（真·小黄鸟 / HttpCanary）**——基于 mitmproxy 的 MITM 代理，能抓任意 App / 浏览器的 HTTP/HTTPS 请求（含完整请求头/请求体/响应头/响应体）。启动后用 `capture_flows` 读抓到的请求、定位目标接口，再用 `http_request` 改参重发。**反接口 / 找『数据从哪个接口来』的利器**。首次用可能需要装 mitmproxy + 信任 CA 证书——工具会把要执行的命令返回给你，你转达用户执行即可。", parameters: { type: "object", properties: { port: { type: "integer", description: "代理端口，默认 8080" }, system_proxy: { type: "boolean", description: "是否自动把 macOS 系统代理指向本代理（默认 true → 所有 App 流量都被抓）" } }, required: [] } } },
-      { type: "function", function: { name: "automation", description: "**桌面自动化框架（录制回放 + 跨平台桌面 / 浏览器自动化）**——驱动本机的自动化服务：真实鼠标键盘、CDP 浏览器、桌面 UI 元素，并能把一串操作**录制成工作流存盘、之后一键回放**（这是 IDE 原生没有、由你桌面那个 Rust 自动化框架提供的能力）。首次先调 `system.init` 初始化一次。method 可选：system.init / mouse.move{x,y} / mouse.click{button} / mouse.drag{from_x,from_y,to_x,to_y} / mouse.scroll{amount} / keyboard.type{text} / keyboard.press{key} / keyboard.combo{keys:[]} / browser.start{headless} / browser.goto{url} / browser.click{selector} / browser.type{selector,text} / browser.eval{script} / browser.screenshot{path} / browser.content / recorder.save{name,steps:[{method,params}]} / recorder.replay{name 或 steps,delay_ms} / recorder.list。", parameters: { type: "object", properties: { method: { type: "string", description: "要调用的方法名，如 browser.goto / mouse.click / recorder.replay" }, params: { type: "object", description: "该方法的参数对象，如 {url:'https://…'} 或 {name:'login'}" } }, required: ["method"] } } },
+      { type: "function", function: { name: "automation", description: "桌面自动化 RPC：真实鼠标键盘、CDP 浏览器和录制回放。首次先调 system.init。坐标点击必须先 mouse.move{x,y} 再 mouse.click{button}；不存在 desktop.click/desktop.type。method 可选：system.init / mouse.move / mouse.click / mouse.double_click / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list。", parameters: { type: "object", properties: { method: { type: "string", description: "要调用的真实 RPC 方法名，如 browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "该方法的参数对象；以方法描述为准" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**读取已抓到的 HTTP/HTTPS 请求**（结构化：方法/URL/主机/路径/状态/耗时/请求头/请求体/响应头/响应体）。比看截图可靠，是反接口的第一步。用 filter 关键词筛（匹配 host/路径/URL/方法/状态/类型），limit 限条数（默认 30，最新在前）。", parameters: { type: "object", properties: { filter: { type: "string", description: "可选，关键词筛选（模糊匹配 host/路径/URL/方法/状态/content-type）" }, limit: { type: "integer", description: "可选，返回最新的多少条，默认 30" }, include_body: { type: "boolean", description: "可选，是否含请求/响应体（默认 true；只看列表设 false 省 token）" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "停止抓包并关闭已设置的系统代理。", parameters: { type: "object", properties: {}, required: [] } } },
       { type: "function", function: { name: "capture_replay", description: "**精确重放一条抓到的请求**（逆向/调试利器）。按 capture_flows 里的 `id` 取出原始请求，**原样带上抓到的所有请求头（cookie / token / 签名都在里面 → 这是能重放成功的关键）**，可选覆盖 url/method/headers/body 来改参试探。返回真实响应。比手拼 http_request 更可靠——不用重建那一堆头。", parameters: { type: "object", properties: { id: { type: "string", description: "capture_flows 返回里的 id=... 值" }, url: { type: "string", description: "可选，覆盖 URL（改 query / 路径试探）" }, method: { type: "string", description: "可选，覆盖方法" }, headers: { type: "object", description: "可选，覆盖/追加请求头（会合并进抓到的原始头）", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，覆盖请求体" } }, required: ["id"] } } },
@@ -12847,7 +13004,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
   if (!inTauri) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "background_monitor"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery"]);
     return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
   }
   return _applyCloudToolDescs(tools);
@@ -12968,6 +13125,7 @@ const _KNOWN_TOOLS = new Set([
   "git_pull", "git_blame", "git_stash", "git_stash_pop", "git_stash_list", "git_conflicts",
   "read_terminal", "list_terminals", "stop_terminal", "run_in_terminal", "start_demo", "stop_demo",
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
+  "local_discovery", "read_screen", "ui_click",
   "lsp_symbols", "lsp_definition", "lsp_references", "browser",
   "preview_choices", "style_wardrobe", "visual_explain", "design_research",
   "background_monitor", "developer_community_search",
@@ -12984,6 +13142,9 @@ const _TOOL_ALIASES = {
   runinterminal: "run_in_terminal", run_background: "run_in_terminal",
   webfetch: "web_fetch", fetch: "web_fetch", fetch_url: "web_fetch", curl: "web_fetch", http_get: "web_fetch", get_url: "web_fetch", read_url: "web_fetch", open_url: "web_fetch", visit: "web_fetch",
   websearch: "web_search", search_web: "web_search", google: "web_search", searchweb: "web_search", internet_search: "web_search", web_query: "web_search",
+  localdiscovery: "local_discovery", nearby: "local_discovery", nearby_search: "local_discovery", places: "local_discovery", place_search: "local_discovery",
+  readscreen: "read_screen", inspect_screen: "read_screen", accessibility_tree: "read_screen",
+  uiclick: "ui_click", ax_click: "ui_click", accessibility_click: "ui_click",
   runsubagent: "run_subagent", subagent: "run_subagent",
   runworker: "run_worker",
   updateplan: "update_plan", plan: "update_plan", todo: "update_plan", todowrite: "update_plan", todo_write: "update_plan", set_plan: "update_plan", write_todos: "update_plan",
@@ -13131,7 +13292,7 @@ const _STRICT_MUTATING_TOOL_NAMES = new Set([
   "git_stash", "git_stash_pop", "gh_pr_create", "gh_pr_reply", "generate_wiki", "game_scaffold", "web_scaffold",
   "generate_image", "generate_3d", "generate_sound", "generate_music", "generate_voice",
   "auto_rig", "generate_motion", "generate_texture", "download_file", "download_asset",
-  "automation", "db_query", "remote",
+  "automation", "ui_click", "db_query", "remote",
 ]);
 
 function _mutatingToolArgIssue(name, rawArgs) {
@@ -13404,6 +13565,11 @@ const _STR_ARG_KEYS = new Set([
   "app_name", "window", "run_id", "runId", "job", "image", "image_path", "data_url",
   "file", "host", "address", "token", "root", "dir", "button", "base",
 ]);
+function _finiteNumberArg(value) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
 function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   args = _normalizeArgKeys(args || {});
   for (const k of _STR_ARG_KEYS) {
@@ -13428,6 +13594,11 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: args.query || "", query: args.query || "" };
+    case "read_screen": return { type: "readscreen", ocr: !!args.ocr };
+    case "ui_click": {
+      const ref = _finiteNumberArg(args.ref);
+      return { type: "uiclick", ref: ref !== null && ref >= 0 ? Math.floor(ref) : null, action: String(args.action || "press"), value: args.value == null ? null : String(args.value) };
+    }
     case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
     case "multi_edit": return { type: "multiedit", path: args.path || "", edits: Array.isArray(args.edits) ? args.edits : [] };
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "", contentProvided: Object.prototype.hasOwnProperty.call(args, "content") };
@@ -13471,6 +13642,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "find_symbol": return { type: "findsymbol", path: args.name || "", name: args.name || "", kind: (args.kind || "").toLowerCase(), limit: Number.isFinite(+args.limit) ? Math.floor(+args.limit) : 20 };
     case "semantic_search": return { type: "semsearch", path: args.query || "", query: args.query || "", topK: Number.isFinite(+args.top_k) ? Math.min(Math.max(+args.top_k, 1), 30) : 10 };
     case "knowledge_search": return { type: "knowledge", path: args.query || "", query: args.query || "", domain: (args.domain || "").trim(), topK: Number.isFinite(+args.top_k) ? Math.min(Math.max(+args.top_k, 1), 20) : 6 };
+    case "local_discovery": {
+      const latitude = _finiteNumberArg(args.latitude);
+      const longitude = _finiteNumberArg(args.longitude);
+      const radius = _finiteNumberArg(args.radius_m);
+      const limit = _finiteNumberArg(args.limit);
+      return { type: "localdiscovery", path: args.near || "", query: String(args.query || ""), near: args.near ? String(args.near) : "", latitude, longitude, radiusM: radius === null ? null : Math.max(100, Math.min(radius, 20000)), limit: limit === null ? null : Math.max(1, Math.min(limit, 30)), language: args.language ? String(args.language) : "" };
+    }
     case "gh_pr_create": return { type: "gh", op: "pr_create", title: args.title || "", body: args.body || "", base: args.base || "", draft: !!args.draft };
     case "gh_pr_view": return { type: "gh", op: "pr_view", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
     case "gh_pr_checks": return { type: "gh", op: "pr_checks", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
@@ -13922,7 +14100,7 @@ function _webCachePut(key, val) {
 // drilled in itself. This is the Perplexity move: don't hope the model reads —
 // read for it.
 const _AR_URL_RE = /https?:\/\/[^\s)\]"'<>`,]+/g;
-const _AR_SKIP_RE = /duckduckgo\.com|bing\.com\/search|google\.com\/search|\/search\?|\.(?:jpg|jpeg|png|gif|svg|webp|mp4|zip|pdf|exe|dmg)(?:[?#]|$)/i;
+const _AR_SKIP_RE = /duckduckgo\.com|bing\.com\/search|google\.com\/search|\/search\?|\.(?:jpg|jpeg|png|gif|svg|webp|mp4|webm|mov|m4v|ogv|zip|pdf|exe|dmg)(?:[?#]|$)/i;
 // Specialized searches whose VALUE is in the linked page body (repo README, forum
 // thread, article) — auto-deep-read these. Metadata searches (package_search,
 // cve_search, color_search…) already return the answer, so we skip them (no point
@@ -13939,7 +14117,7 @@ async function _autoDeepRead(text, maxPages = 3, perChars = 3200) {
   if (!text || typeof text !== "string") return _none;
   const raw = text.match(_AR_URL_RE) || [];
   const seen = new Set();
-  const urls = [];
+  const candidates = [];
   for (let u of raw) {
     u = u.replace(/[.,;:]+$/, "");
     try { new URL(u); } catch { continue; }
@@ -13949,8 +14127,21 @@ async function _autoDeepRead(text, maxPages = 3, perChars = 3200) {
     const key = u.replace(/#.*$/, "").replace(/\/+$/, "");
     if (_AR_SKIP_RE.test(u) || seen.has(key)) continue;
     seen.add(key);
-    urls.push(u);
+    let host = "";
+    try { host = new URL(u).hostname.replace(/^www\./, ""); } catch {}
+    candidates.push({ url: u, host });
+    if (candidates.length >= Math.max(maxPages * 6, maxPages)) break;
+  }
+  const urls = [];
+  const usedHosts = new Set();
+  for (const candidate of candidates) {
     if (urls.length >= maxPages) break;
+    if (!candidate.host || usedHosts.has(candidate.host)) continue;
+    urls.push(candidate.url); usedHosts.add(candidate.host);
+  }
+  for (const candidate of candidates) {
+    if (urls.length >= maxPages) break;
+    if (!urls.includes(candidate.url)) urls.push(candidate.url);
   }
   if (!urls.length) return _none;
   const reads = await Promise.allSettled(urls.map(u =>
@@ -13959,12 +14150,38 @@ async function _autoDeepRead(text, maxPages = 3, perChars = 3200) {
       : _invokeCapped("web_fetch", { url: u }, 20000, "深读").then(t => { _webCachePut(u, t); return t; })
   ));
   let extra = "";
+  let successfulReads = 0;
   reads.forEach((r, i) => {
     if (r.status === "fulfilled" && r.value && String(r.value).length > 60 && !/^\[(ERROR|失败)/.test(String(r.value))) {
+      successfulReads++;
       extra += `\n\n──── 深读：${urls[i]} ────\n${String(r.value).slice(0, perChars)}\n`;
     }
   });
-  return extra ? { text: "\n\n【自动深读了排名靠前的页面正文（不用你再 web_fetch，直接基于下面的实际内容回答）】" + extra, count: urls.filter((_, i) => reads[i].status === "fulfilled").length } : _none;
+  return extra ? { text: "\n\n【自动跨域抽样深读了页面正文（不用重复 web_fetch，直接基于下面的实际内容回答）】" + extra, count: successfulReads } : _none;
+}
+
+function _isCurrentLocationRequest(value) {
+  return /^(current|current_location|my location|当前位置|我的位置)$/i.test(String(value || "").trim());
+}
+
+// Ask the OS/webview for a one-shot location only when the model explicitly
+// requested current location. Denial or lack of support stays an honest null.
+function _requestCurrentCoordinates() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve(null);
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const timer = setTimeout(() => finish(null), 9000);
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        clearTimeout(timer);
+        const latitude = Number(position?.coords?.latitude), longitude = Number(position?.coords?.longitude);
+        finish(Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null);
+      },
+      () => { clearTimeout(timer); finish(null); },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60 * 1000 },
+    );
+  });
 }
 // ── Secret safety ─────────────────────────────────────────────────────────────
 // Mask credential VALUES before file/search content is sent to the model/API, so a
@@ -14406,6 +14623,197 @@ function _msgSize(m) {
   return c ? String(c).length : 0;
 }
 
+// The gateway accepts 12 MiB JSON bodies. Keep the final provider request below
+// 10 MiB so model/config/tool fields still have deterministic headroom. Work on
+// a request-only copy: the transcript keeps its media, while older media is the
+// first thing omitted from repeated requests and the newest visual turn survives.
+function _enforceModelRequestBudget(messages, tools = [], byteCap = 10 * 1024 * 1024) {
+  const source = Array.isArray(messages) ? messages : [];
+  const prepared = source.map((message) => ({
+    ...message,
+    ...(Array.isArray(message?.content) ? { content: message.content.map((part) => ({ ...part, ...(part?.image_url ? { image_url: { ...part.image_url } } : {}) })) } : {}),
+    ...(Array.isArray(message?.tool_calls) ? {
+      tool_calls: message.tool_calls.map((call) => ({
+        ...call,
+        ...(call?.function ? { function: { ...call.function } } : {}),
+      })),
+    } : {}),
+  }));
+  const requestTools = Array.isArray(tools) ? tools : [];
+  const cap = Math.max(1024, Number(byteCap) || 0);
+  const byteLength = (value) => {
+    const json = JSON.stringify(value);
+    let bytes = 0;
+    for (let index = 0; index < json.length; index++) {
+      const code = json.charCodeAt(index);
+      if (code <= 0x7f) bytes += 1;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < json.length
+        && json.charCodeAt(index + 1) >= 0xdc00 && json.charCodeAt(index + 1) <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
+    }
+    return bytes;
+  };
+  const requestBytes = () => byteLength({ messages: prepared, tools: requestTools });
+  const historicalArgumentSummary = (rawArguments, toolName, maxBytes = 2048) => {
+    const raw = typeof rawArguments === "string"
+      ? rawArguments
+      : (() => { try { return JSON.stringify(rawArguments ?? {}); } catch { return "{}"; } })();
+    if (byteLength(raw) <= maxBytes) return raw;
+    const safeToolName = String(toolName || "tool").slice(0, 80);
+    const omitted = `[historical ${safeToolName} argument omitted; original UTF-8 bytes: ${byteLength(raw)}]`;
+    const isWrite = /write(?:_file)?$/i.test(safeToolName);
+    const isEdit = /edit(?:_file)?$/i.test(safeToolName);
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch {}
+    let summary;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const path = typeof parsed.path === "string" && parsed.path
+        ? parsed.path.slice(0, 256)
+        : "[historical path unavailable]";
+      if (isWrite) {
+        summary = { path, content: omitted };
+      } else if (isEdit) {
+        summary = {
+          path,
+          old_string: omitted,
+          new_string: omitted,
+          ...(Object.prototype.hasOwnProperty.call(parsed, "replace_all") ? { replace_all: !!parsed.replace_all } : {}),
+        };
+      } else {
+        summary = {};
+        for (const [key, value] of Object.entries(parsed).slice(0, 12)) {
+          if (value == null || typeof value === "number" || typeof value === "boolean") summary[key] = value;
+          else if (typeof value === "string" && byteLength(value) <= 256) summary[key] = value;
+          else summary[key] = omitted;
+        }
+        if (!Object.keys(summary).length) summary = { _michael_history: omitted };
+      }
+    } else summary = { _michael_history: omitted };
+    let encoded = JSON.stringify(summary);
+    if (byteLength(encoded) > maxBytes) {
+      if (isWrite) encoded = JSON.stringify({ path: "[historical path omitted]", content: omitted });
+      else if (isEdit) encoded = JSON.stringify({ path: "[historical path omitted]", old_string: omitted, new_string: omitted });
+      else encoded = JSON.stringify({ _michael_history: omitted });
+    }
+    return encoded;
+  };
+
+  // A completed assistant tool call and its tool result are one protocol unit.
+  // Keep both messages and their IDs, but replace multi-megabyte historical
+  // arguments on the request-only copy. Removing either side makes strict
+  // OpenAI-compatible providers reject the next turn as an invalid transcript.
+  const completedToolCallIds = new Set(prepared
+    .filter((message) => message?.role === "tool" && message.tool_call_id)
+    .map((message) => String(message.tool_call_id)));
+  const historicalCalls = [];
+  for (const message of prepared) {
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) {
+      if (!call?.function) continue;
+      const raw = typeof call.function.arguments === "string"
+        ? call.function.arguments
+        : (() => { try { return JSON.stringify(call.function.arguments ?? {}); } catch { return "{}"; } })();
+      call.function.arguments = raw;
+      if (completedToolCallIds.has(String(call.id || "")) && byteLength(raw) > 2048) {
+        historicalCalls.push({ call, raw, name: String(call.function.name || "") });
+      }
+    }
+  }
+  let bytes = requestBytes();
+  for (const historical of historicalCalls) {
+    if (bytes <= cap) break;
+    historical.call.function.arguments = historicalArgumentSummary(historical.raw, historical.name);
+    bytes = requestBytes();
+  }
+  const mediaIndexes = prepared
+    .map((message, index) => Array.isArray(message?.content) && message.content.some((part) => part?.type === "image_url") ? index : -1)
+    .filter((index) => index >= 0);
+  const newestMediaIndex = mediaIndexes.length ? mediaIndexes[mediaIndexes.length - 1] : -1;
+  const withoutMedia = (message, dropParts = null) => {
+    let removed = 0;
+    const text = [];
+    const content = [];
+    for (let index = 0; index < (message.content || []).length; index++) {
+      const part = message.content[index];
+      const shouldDrop = part?.type === "image_url" && (!dropParts || dropParts.has(index));
+      if (shouldDrop) { removed++; continue; }
+      content.push(part);
+      if (part?.type === "text" && part.text) text.push(String(part.text));
+    }
+    if (!removed) return message;
+    if (!content.some((part) => part?.type === "image_url")) {
+      return { ...message, content: `${text.join("\n")}\n（较早媒体已从本次请求省略以控制请求大小；原聊天记录仍保留。）`.trim() };
+    }
+    content.push({ type: "text", text: `（${removed} 个媒体画面因本次请求总量上限未重复发送。）` });
+    return { ...message, content };
+  };
+
+  for (const index of mediaIndexes) {
+    if (bytes <= cap || index === newestMediaIndex) continue;
+    prepared[index] = withoutMedia(prepared[index]);
+    bytes = requestBytes();
+  }
+  // The current visual turn is last to lose data. If it alone cannot fit, remove
+  // later key frames first so at least the first/representative frame survives.
+  if (bytes > cap && newestMediaIndex >= 0) {
+    const original = prepared[newestMediaIndex];
+    const mediaParts = original.content
+      .map((part, index) => part?.type === "image_url" ? index : -1)
+      .filter((index) => index >= 0)
+      .reverse();
+    const dropped = new Set();
+    for (const partIndex of mediaParts) {
+      if (bytes <= cap) break;
+      dropped.add(partIndex);
+      prepared[newestMediaIndex] = withoutMedia(original, dropped);
+      bytes = requestBytes();
+    }
+  }
+
+  // Media is normally the only multi-megabyte field. If unusually large older
+  // text still exceeds the body budget, fold it without breaking tool-call roles.
+  const newestMessageIndex = prepared.length - 1;
+  for (let index = 0; bytes > cap && index < prepared.length; index++) {
+    if (index === newestMessageIndex || prepared[index]?.role === "system") continue;
+    const content = prepared[index]?.content;
+    if (typeof content !== "string" || content.length <= 1600) continue;
+    prepared[index] = { ...prepared[index], content: `${content.slice(0, 600)}\n…（较早内容已压缩以满足请求上限）…\n${content.slice(-600)}` };
+    bytes = requestBytes();
+  }
+  // The user's actual request is appended at the end of its text block. Preserve
+  // that tail if a giant one-shot context injection is the final remaining cause.
+  while (bytes > cap && newestMessageIndex >= 0) {
+    const message = prepared[newestMessageIndex];
+    if (typeof message?.content === "string" && message.content.length > 2000) {
+      const remove = Math.min(message.content.length - 1600, Math.max(1024, bytes - cap));
+      prepared[newestMessageIndex] = { ...message, content: `（过大的前置上下文已省略）\n${message.content.slice(remove)}` };
+    } else if (Array.isArray(message?.content)) {
+      const textIndex = message.content.findIndex((part) => part?.type === "text" && String(part.text || "").length > 2000);
+      if (textIndex < 0) break;
+      const next = message.content.map((part) => ({ ...part }));
+      const value = String(next[textIndex].text || "");
+      const remove = Math.min(value.length - 1600, Math.max(1024, bytes - cap));
+      next[textIndex].text = `（过大的前置上下文已省略）\n${value.slice(remove)}`;
+      prepared[newestMessageIndex] = { ...message, content: next };
+    } else break;
+    const nextBytes = requestBytes();
+    if (nextBytes >= bytes) break;
+    bytes = nextBytes;
+  }
+  bytes = requestBytes();
+  if (bytes > cap) {
+    const error = new RangeError(`Model request is ${bytes} UTF-8 bytes after safe compression; limit is ${cap} bytes.`);
+    error.code = "MODEL_REQUEST_TOO_LARGE";
+    error.requestBytes = bytes;
+    error.byteCap = cap;
+    throw error;
+  }
+  return prepared;
+}
+
 function _readEvidenceCovers(newer, older) {
   return newer?.kind === "read" && older?.kind === "read"
     && newer.resultKind === "content" && older.resultKind === "content"
@@ -14480,11 +14888,11 @@ function _trimMessagesIfHuge(messages, run = null, root = "") {
   for (const m of messages) total += _msgSize(m);
 
   // Hard payload guard: accumulated screenshots can push past the gateway's limit.
-  // 4MB (was 1.2MB — a SINGLE 4K screenshot is 3-8MB base64, so a normal attached image
-  // got silently stripped before the model ever saw it → "读不懂图片"). Pasted images are
-  // now downscaled to ≤1568px (~300KB) on capture, so this only trips on many-image turns,
+  // Keep the client below the server's explicit 12 MiB JSON limit while leaving
+  // enough room for several compressed screenshots / video key frames.
+  // Pasted images are downscaled to ≤1568px, so this only trips on many-image turns,
   // and strips OLDEST-first to keep the most recent screenshot the model needs.
-  const PAYLOAD_CAP = 4_000_000;
+  const PAYLOAD_CAP = 10_000_000;
   if (total > PAYLOAD_CAP) {
     for (let i = 0; i < messages.length && total > PAYLOAD_CAP; i++) {
       const m = messages[i];
@@ -14683,7 +15091,7 @@ function _toolMsgForModel(call, result) {
     // Retrieval tools size their own output to what the model asked for; chopping to 8K silently drops
     // the tail (matches / symbols / diagnostics) so the model re-runs the query or edits on an
     // incomplete set — the same starvation trap as reads, on the highest-volume tools.
-    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "diag" ? 30000
+    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "diag" ? 30000
     : _rt && (_rt.endsWith("_search") || _rt === "github_trending") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
     : 8000;
@@ -15247,6 +15655,7 @@ function _toolProducesMaterialEffect(call, result, workspaceMutated = false) {
   if (call.type === "remote") return ["connect", "disconnect"].includes(call.op);
   if (call.type === "system") return !["frontmost", "list", "status", "windows"].includes(call.op);
   if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot)$/i.test(String(call.method || ""));
+  if (call.type === "uiclick") return true;
   if (call.type === "termtask") return true;
   return false;
 }
@@ -15550,6 +15959,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _l0Tools = _keep;
         _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock);
       }
+      _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools);
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
         const _realProgress = ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall";
         if (_realProgress) {
@@ -16345,6 +16755,91 @@ async function _describeImageForTextModel(dataUrl, hint, baseConfig) {
   } catch { return null; }
 }
 
+// Resolve the image inputs that a model can consume. A video contributes a few
+// ordered key frames; the raw video is never placed in an OpenAI-compatible body.
+async function _attachmentImageInputs(attachment) {
+  if (!attachment || typeof attachment !== "object") return [];
+  if (attachment.kind === "video") return (Array.isArray(attachment.frames) ? attachment.frames : []).filter((value) => typeof value === "string" && value.startsWith("data:image/")).slice(0, 4);
+  if (typeof attachment.dataUrl === "string" && attachment.dataUrl.startsWith("data:image/")) return [attachment.dataUrl];
+  if (attachment.path && inTauri) {
+    try {
+      const dataUrl = await backend.readFileDataUrl(attachment.path);
+      if (typeof dataUrl === "string" && dataUrl.startsWith("data:image/")) {
+        attachment.dataUrl = dataUrl;
+        return [dataUrl];
+      }
+    } catch {}
+  }
+  return [];
+}
+
+// Convert stored attachment metadata into a provider-valid user content value.
+// This function also caches a visual transcription for genuinely text-only models.
+async function _attachmentAwareContent(text, attachments, config, maxMediaChars = 7_000_000) {
+  const list = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+  if (!list.length) return text;
+  const inputs = [];
+  let remaining = Math.max(0, Number(maxMediaChars) || 0);
+  for (const attachment of list) {
+    const available = await _attachmentImageInputs(attachment);
+    const images = [];
+    let omitted = 0;
+    for (const dataUrl of available) {
+      if (dataUrl.length <= remaining) { images.push(dataUrl); remaining -= dataUrl.length; }
+      else omitted++;
+    }
+    inputs.push({ attachment, images, omitted });
+  }
+  if (_modelSeesImages(config && config.model)) {
+    const content = [{ type: "text", text }];
+    for (const { attachment, images, omitted } of inputs) {
+      if (attachment.kind === "video") content.push({ type: "text", text: `下面是视频「${attachment.name || "video"}」按时间顺序抽取的 ${images.length} 张关键帧。` });
+      for (const dataUrl of images) content.push({ type: "image_url", image_url: { url: dataUrl } });
+      if (omitted) content.push({ type: "text", text: `附件「${attachment.name || attachment.kind || "media"}」另有 ${omitted} 个画面因本轮媒体总量上限未重复发送。` });
+    }
+    return content.length > 1 ? content : text + "\n\n（附件没有可供当前模型读取的有效图片或视频关键帧。）";
+  }
+  const descriptions = [];
+  for (let index = 0; index < inputs.length; index++) {
+    const { attachment, images } = inputs[index];
+    let description = String(attachment.visionText || "").trim();
+    if (!description && images.length) {
+      const frames = await Promise.all(images.map((dataUrl, frameIndex) =>
+        _describeImageForTextModel(dataUrl, attachment.kind === "video" ? `这是视频「${attachment.name || "video"}」的第 ${frameIndex + 1} 张关键帧。` : "这是用户随消息附上的图片。", config)));
+      description = frames.filter(Boolean).map((value, frameIndex) => `画面 ${frameIndex + 1}:\n${value}`).join("\n\n");
+      if (description) attachment.visionText = description;
+    }
+    descriptions.push(description
+      ? `【附件 ${index + 1}：${attachment.name || attachment.kind || "media"} 的视觉转写】\n${description}`
+      : `【附件 ${index + 1}：${attachment.name || attachment.kind || "media"}】无法读取有效画面。`);
+  }
+  return text + "\n\n———\n当前模型不接收图片，我已把附件转写为文字：\n\n" + descriptions.join("\n\n———\n\n");
+}
+
+// Strip IDE-only attachment fields and rebuild valid multimodal history messages.
+async function _memoryMessagesForModel(memory, config) {
+  const assembled = memory?.assemble?.() || [];
+  const mediaTurns = assembled
+    .map((message, index) => Array.isArray(message?.attachments) && message.attachments.length ? index : -1)
+    .filter((index) => index >= 0)
+    .slice(-4);
+  const activeMediaTurns = new Set(mediaTurns);
+  const out = [];
+  for (let index = 0; index < assembled.length; index++) {
+    const message = assembled[index];
+    if (!message || typeof message !== "object") continue;
+    const clean = { ...message };
+    delete clean.attachments;
+    if (activeMediaTurns.has(index) && message.role === "user") {
+      clean.content = await _attachmentAwareContent(String(message.content || ""), message.attachments, config, 3_000_000);
+    } else if (Array.isArray(message.attachments) && message.attachments.length) {
+      clean.content = String(message.content || "") + `\n（该轮曾附带 ${message.attachments.length} 个媒体文件；为控制请求大小，原始画面未在本轮重复发送。）`;
+    }
+    out.push(clean);
+  }
+  return out;
+}
+
 // Build the message that feeds screenshots/images back to the model — natively
 // (image blocks) for vision models, or as transcribed TEXT for text-only models.
 async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
@@ -16518,9 +17013,11 @@ const _TOOL_CATALOG = [
   { name: "lsp_definition / lsp_references", desc: "跳定义 / 找所有引用", kw: ["定义", "引用", "跳转", "符号", "调用方", "谁用了"] },
   { name: "http_request", desc: "调任意 HTTP API / webhook（也用于抓包后重发/改参/调试任意请求）", kw: ["api", "接口", "http", "请求", "webhook", "rest", "重发", "replay", "抓包"] },
   { name: "decode_qr", desc: "识别图片/截图里的二维码内容", kw: ["二维码", "qr", "qrcode", "扫码", "scan"] },
+  { name: "local_discovery", desc: "用 OSM、地理编码、天气和 Wikipedia 查询附近餐饮/景点，并报告逐来源状态", kw: ["附近", "周边", "美食", "餐厅", "吃饭", "旅游", "景点", "去哪", "nearby", "restaurant", "travel", "attraction", "places"] },
+  { name: "read_screen / ui_click", desc: "读取前台原生应用可访问性元素；macOS 可按 ref 操作", kw: ["前台应用", "原生应用", "屏幕元素", "按钮", "输入框", "accessibility", "ax", "read screen", "ui click", "操作软件"] },
   { name: "download_file", desc: "下载文件到工作区", kw: ["下载", "download", "拉取"] },
   { name: "capture_start", desc: "启动系统级抓包（真·小黄鸟 / mitmproxy MITM 代理，抓任意 App/浏览器的 HTTP/HTTPS）", kw: ["抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
-  { name: "automation", desc: "桌面自动化框架：真实鼠标键盘 / CDP 浏览器 / 桌面 UI 元素 + 录制回放（把一串操作存成工作流一键重放）", kw: ["自动化", "录制", "回放", "重放", "工作流", "rpa", "automation", "recorder", "replay", "鼠标", "键盘", "桌面自动化", "宏", "macro", "自动点击", "自动填表", "模拟操作"] },
+  { name: "automation", desc: "桌面自动化 RPC：真实鼠标键盘 / CDP 浏览器 / 录制回放", kw: ["自动化", "录制", "回放", "重放", "工作流", "rpa", "automation", "recorder", "replay", "鼠标", "键盘", "桌面自动化", "宏", "macro", "自动点击", "自动填表", "模拟操作"] },
   { name: "capture_flows", desc: "读已抓到的请求（方法/URL/头/请求体/响应体，反接口/找数据来源首选）", kw: ["抓包", "抓到的请求", "看请求", "反接口", "接口从哪来", "flows", "已抓", "数据从哪"] },
   { name: "capture_stop", desc: "停止抓包并关闭系统代理", kw: ["停止抓包", "关抓包", "结束抓包"] },
   { name: "capture_replay", desc: "精确重放一条抓到的请求(原样带真实头/cookie/token/签名，可改参)——逆向/重发利器", kw: ["重发", "重放", "replay", "逆向", "改参", "重放请求", "重发请求", "调接口", "试探接口"] },
@@ -17170,8 +17667,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // THIS turn (change direction / drop or revise what it's doing) instead of finishing
       // the round and redoing it. This is what makes long runs steerable.
       if (Array.isArray(session._steerQueue) && session._steerQueue.length) {
-        for (const s of session._steerQueue.splice(0)) {
-          messages.push({ role: "user", content: `[MICHAEL_USER_STEERING]\n\n${s}` });
+        for (const queued of session._steerQueue.splice(0)) {
+          const steerText = typeof queued === "string" ? queued : String(queued?.text || "");
+          const steerAttachments = typeof queued === "string" ? [] : (queued?.attachments || []);
+          const content = await _attachmentAwareContent(`[MICHAEL_USER_STEERING]\n\n${steerText}`, steerAttachments, config);
+          messages.push({ role: "user", content });
         }
       }
       // Running self-memory (fixes "改完文件又改一遍"): just before each model turn, remind it —
@@ -17209,6 +17709,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         finalErr = turn.error; break;
       }
       _turnFails = 0;
+      // A steer that arrived while the model was deciding invalidates this turn's
+      // still-unexecuted tools. Do not run stale writes/commands; the next iteration
+      // drains the steer queue first and lets the model produce a fresh tool batch.
+      if (turn.toolCalls.length && Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
       if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
 
@@ -17530,7 +18034,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // re-running the same query. Only idempotent read-only types; excludes read_file
         // (it pages/auto-advances, so a same-path re-read is legitimately different).
         const _sig = _stableToolCallSignature(call);
-        const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "web", "websearch", "diag"]);
+        const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "localdiscovery", "web", "websearch", "diag"]);
         // Weak models brain-freeze-repeat readily → catch a repeat within the last 2 calls. Claude
         // rarely does, and a SPACED re-run after other work is usually intentional — but sonnet-5 CAN
         // spin, so still catch a genuine BACK-TO-BACK repeat (this is the 3rd identical call in a row).
@@ -18539,7 +19043,7 @@ function _toolStepActionLabel(call) {
     copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
     termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
     demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
-    automation: "自动化", remote: "远程", askuser: "需要你确认", current_time: "当前时间", db: "数据库",
+    automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", current_time: "当前时间", localdiscovery: "附近发现", db: "数据库",
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
     wardrobe: "风格选择", explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
@@ -18567,6 +19071,10 @@ function _createToolStep(call) {
     ? ((call.action || "") + (call.url ? " " + call.url : "") + (call.selector ? " " + call.selector : ""))
     : call.type === "automation"
     ? (call.method || "")
+    : call.type === "readscreen"
+    ? (call.ocr ? "OCR" : "Accessibility")
+    : call.type === "uiclick"
+    ? `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}`
     : call.type === "current_time"
     ? ""
     : call.type === "game_scaffold"
@@ -18642,7 +19150,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -18991,7 +19499,7 @@ async function _executeToolStep(step, call, root, run) {
   const _mode = (run && run.mode) || _currentAiMode;
   const _cp = (run && run.checkpoint) || _runCheckpoint;
   const readOnlyMode = _mode === "explorer" || _mode === "reviewer" || _mode === "plan";
-  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move" || call.type === "mkdir" || call.type === "copy" || call.type === "format" || call.type === "mcp")) {
+  if (readOnlyMode && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "cmd" || call.type === "delete" || call.type === "move" || call.type === "mkdir" || call.type === "copy" || call.type === "format" || call.type === "uiclick" || call.type === "mcp")) {
     const modeName = _mode === "explorer" ? "Explorer" : _mode === "plan" ? "Plan" : "Reviewer";
     const what = call.type === "cmd" ? "运行命令" : call.type === "mcp" ? "执行 MCP 工具" : "修改文件";
     res.className = "atc-result atc-result--blocked";
@@ -19065,6 +19573,7 @@ async function _executeToolStep(step, call, root, run) {
   if (!readOnlyMode && !(await _approveToolCall(call, run))) {
     const what = (call.type === "cmd" || call.type === "termtask") ? "运行这条命令"
       : call.type === "automation" ? "这个自动化操作"
+      : call.type === "uiclick" ? "这个前台应用操作"
       : call.type === "download" ? "这次下载" : "改这个文件";
     res.className = "atc-result atc-result--blocked";
     res.textContent = "⛔ 你拒绝了该操作";
@@ -20164,6 +20673,80 @@ async function _executeToolStep(step, call, root, run) {
         return { type: "move", path: from, content: `[ERROR] 移动失败: ${String(e?.message || e).slice(0, 160)}` };
       }
 
+    } else if (call.type === "readscreen") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "readscreen", path: "", content: "[不可用] read_screen 需要 Michael IDE 桌面后端。" }; }
+      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 读取前台应用元素…`;
+      try {
+        const output = await backend.invoke("read_screen", { ocr: !!call.ocr });
+        const elements = Array.isArray(output?.elements) ? output.elements : [];
+        const limitations = Array.isArray(output?.limitations) ? output.limitations : [];
+        const structured = JSON.stringify({ source: output?.source || "unknown", elements: elements.slice(0, 500), limitations }, null, 2);
+        res.className = "atc-result " + (elements.length ? "atc-result--ok" : "atc-result--err");
+        res.textContent = elements.length ? `${elements.length} 个可访问元素` : "未读取到元素";
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 24000))}</pre>`;
+        if (vp) step.classList.add("is-open");
+        return { type: "readscreen", path: output?.source || "", content: `read_screen 真实结果：\n${structured}` };
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 360);
+        res.className = "atc-result atc-result--err"; res.textContent = "读取失败";
+        return { type: "readscreen", path: "", content: `[失败] read_screen: ${message}` };
+      }
+
+    } else if (call.type === "uiclick") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "uiclick", path: "", content: "[不可用] ui_click 需要 Michael IDE 桌面后端。" }; }
+      if (!Number.isInteger(call.ref) || call.ref < 0) { res.className = "atc-result atc-result--err"; res.textContent = "缺 ref"; return { type: "uiclick", path: "", content: "[ERROR] ui_click 需要 read_screen 返回的非负整数 ref。" }; }
+      if (!["press", "set_value", "focus"].includes(call.action)) { res.className = "atc-result atc-result--err"; res.textContent = "action 无效"; return { type: "uiclick", path: "", content: "[ERROR] ui_click action 必须是 press、set_value 或 focus。" }; }
+      if (call.action === "set_value" && call.value == null) { res.className = "atc-result atc-result--err"; res.textContent = "缺 value"; return { type: "uiclick", path: "", content: "[ERROR] ui_click set_value 需要 value。" }; }
+      try {
+        const output = await backend.invoke("ui_click", { reference: call.ref, action: call.action, value: call.value });
+        const ok = output?.ok === true;
+        const structured = JSON.stringify(output || {}, null, 2);
+        res.className = "atc-result " + (ok ? "atc-result--ok" : "atc-result--err");
+        res.textContent = ok ? `${call.action} 已执行` : "操作未执行";
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 4000))}</pre>`;
+        return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}` };
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 360);
+        res.className = "atc-result atc-result--err"; res.textContent = "操作失败";
+        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}` };
+      }
+
+    } else if (call.type === "localdiscovery") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "localdiscovery", path: call.near || "", content: "[不可用] local_discovery 需要 Michael IDE 桌面后端。" }; }
+      const query = String(call.query || "").trim();
+      if (!query) { res.className = "atc-result atc-result--err"; res.textContent = "缺 query"; return { type: "localdiscovery", path: call.near || "", content: "[ERROR] local_discovery 需要 query。" }; }
+      let latitude = call.latitude, longitude = call.longitude;
+      if (_isCurrentLocationRequest(call.near) && !(Number.isFinite(latitude) && Number.isFinite(longitude))) {
+        res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 获取当前位置…`;
+        const coordinates = await _requestCurrentCoordinates();
+        if (coordinates) { latitude = coordinates.latitude; longitude = coordinates.longitude; }
+      }
+      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 查询多源地点数据…`;
+      try {
+        const output = await backend.invoke("local_discovery", {
+          query,
+          near: call.near || null,
+          latitude: Number.isFinite(latitude) ? latitude : null,
+          longitude: Number.isFinite(longitude) ? longitude : null,
+          radiusM: call.radiusM || null,
+          limit: call.limit || null,
+          language: call.language || null,
+        });
+        const places = Array.isArray(output?.places) ? output.places : [];
+        const statuses = Array.isArray(output?.source_statuses) ? output.source_statuses : [];
+        const successCount = statuses.filter((status) => status?.status === "success").length;
+        res.className = "atc-result " + (output?.center ? "atc-result--ok" : "atc-result--err");
+        res.textContent = output?.center ? `${places.length} 个地点 · ${successCount}/${statuses.length} 来源成功` : "需要地点或定位权限";
+        const structured = JSON.stringify(output || {}, null, 2);
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 12000))}</pre>`;
+        if (vp) step.classList.add("is-open");
+        return { type: "localdiscovery", path: call.near || "", content: `local_discovery 结构化结果（距离是直线距离；评分、价格、路线时长、open_now 为未知时不得补猜）：\n${structured}` };
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 360);
+        res.className = "atc-result atc-result--err"; res.textContent = "查询失败";
+        return { type: "localdiscovery", path: call.near || "", content: `[失败] local_discovery: ${message}` };
+      }
+
     } else if (call.type === "web") {
       const url = (call.url || call.path || "").trim();
       if (!url) { res.className = "atc-result atc-result--err"; res.textContent = "空 URL"; return { type: "web", path: call.path, content: "[ERROR] 空 URL。" }; }
@@ -21075,9 +21658,20 @@ async function _executeToolStep(step, call, root, run) {
       if (!dlRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "download", path: call.dest, content: "[失败] 未打开工作区，无法确定下载位置。" }; }
       try {
         const out = await backend.invoke("download_file", { root: dlRoot, url: call.url, dest: call.dest });
-        try { reloadDir(parentDir(call.dest.startsWith("/") ? call.dest : dlRoot + "/" + call.dest)); } catch {}
+        const downloadedPath = call.dest.startsWith("/") ? call.dest : dlRoot + "/" + call.dest;
+        try { reloadDir(parentDir(downloadedPath)); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = "已下载";
-        if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || ""))}</pre>`;
+        if (vp && (isImageFile(call.dest) || isVideoFile(call.dest))) {
+          vp.innerHTML = "";
+          const media = document.createElement(isVideoFile(call.dest) ? "video" : "img");
+          media.src = backend.assetUrl(downloadedPath);
+          media.style.cssText = "display:block;max-width:100%;max-height:360px;border-radius:8px;background:#000";
+          if (media.tagName === "VIDEO") { media.controls = true; media.preload = "metadata"; media.playsInline = true; }
+          else media.addEventListener("click", () => showImageLightbox(media.src));
+          media.addEventListener("error", async () => { try { const dataUrl = await backend.readFileDataUrl(downloadedPath); if (dataUrl) media.src = dataUrl; } catch {} }, { once: true });
+          vp.appendChild(media);
+          step.classList.add("is-open");
+        } else if (vp) vp.innerHTML = `<pre>${_escHtml(String(out || ""))}</pre>`;
         return { type: "download", path: call.dest, content: String(out || `已下载到 ${call.dest}`) };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
@@ -21349,10 +21943,32 @@ async function _executeToolStep(step, call, root, run) {
       try {
         const out = await _invokeCapped("mcp_call", { name: call.server, tool: call.tool, args: call.args || {} }, 60_000, `MCP ${label}`);
         const raw = String(out == null || out === "" ? "(空结果)" : out);
-        const content = raw.length > 8000 ? raw.slice(0, 8000) + `\n[结果已截断：原始 ${raw.length} 字符]` : raw;
+        const media = [];
+        const mediaPattern = /\[MCP_MEDIA\s+(image|audio|video)\s+([A-Za-z0-9.+\/-]+)\]\n(data:[A-Za-z0-9.+\/-]+;base64,[A-Za-z0-9+/=]+)/g;
+        let match;
+        while ((match = mediaPattern.exec(raw))) media.push({ kind: match[1], mime: match[2], dataUrl: match[3] });
+        const readable = raw.replace(mediaPattern, (_all, kind, mime) => `[MCP ${kind} media rendered: ${mime}]`);
+        const content = readable.length > 8000 ? readable.slice(0, 8000) + `\n[结果已截断：原始文本 ${readable.length} 字符]` : readable;
         res.className = "atc-result atc-result--ok"; res.textContent = "完成";
-        if (vp) vp.innerHTML = `<pre>${_escHtml(raw.slice(0, 4000))}</pre>`;
-        return { type: "mcp", path: label, content };
+        if (vp) {
+          vp.innerHTML = "";
+          if (content.trim()) { const pre = document.createElement("pre"); pre.textContent = content.slice(0, 4000); vp.appendChild(pre); }
+          for (const item of media) {
+            const element = document.createElement(item.kind === "image" ? "img" : item.kind);
+            element.src = item.dataUrl;
+            element.style.cssText = "display:block;max-width:100%;max-height:360px;margin-top:8px;border-radius:8px;background:#000";
+            if (item.kind !== "image") { element.controls = true; element.preload = "metadata"; }
+            else element.addEventListener("click", () => showImageLightbox(item.dataUrl));
+            vp.appendChild(element);
+          }
+          if (media.length) step.classList.add("is-open");
+        }
+        let feedbackImage = media.find((item) => item.kind === "image")?.dataUrl || "";
+        if (!feedbackImage) {
+          const video = media.find((item) => item.kind === "video");
+          if (video) feedbackImage = (await _extractVideoFrames(video.dataUrl, 1))[0] || "";
+        }
+        return { type: "mcp", path: label, content, ...(feedbackImage ? { image: feedbackImage } : {}) };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 280);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
@@ -21998,7 +22614,7 @@ async function _agentFollowUp(toolResults, container, session) {
     _ffTimer = setTimeout(() => requestAnimationFrame(_ffRender), Math.max(0, 80 - (Date.now() - _ffLast)));
   };
   try {
-    await backend.aiChat(config, messages, (ev) => {
+    await backend.aiChat(config, _enforceModelRequestBudget(messages), (ev) => {
       if (ev.kind === "token") { acc += ev.delta; _ffSchedule(); }
       else if (ev.kind === "error") { err = ev.message; }
     });
@@ -22151,7 +22767,7 @@ function initInlineCompletion() {
         };
         let text = await new Promise((resolve) => {
           let buf = "";
-          backend.aiChat(aiConfig, msgs, (ev) => {
+          backend.aiChat(aiConfig, _enforceModelRequestBudget(msgs), (ev) => {
             if (ev.kind === "token") buf += ev.delta;
             else if (ev.kind === "done") resolve(buf);
             else if (ev.kind === "error") resolve("");
@@ -22257,7 +22873,7 @@ function openInlineAssistant() {
 
     try {
       let result = "";
-      await backend.aiChat(config, msgs, (ev) => {
+      await backend.aiChat(config, _enforceModelRequestBudget(msgs), (ev) => {
         if (ev.kind === "token") {
           result += ev.delta;
           statusDiv.textContent = `Generating… (${result.length} chars)`;
@@ -22430,7 +23046,7 @@ function _notifyTaskDone(sess, taskText, ok) {
 function _retryLspForOpenFiles() {
   try {
     for (const [p, f] of openFiles) {
-      if (f && f.model && !f.isImage && !f.isPdf) lspManager?.didOpen(p, f.model);
+      if (f && f.model && !f.isImage && !f.isVideo && !f.isPdf) lspManager?.didOpen(p, f.model);
     }
   } catch {}
 }
@@ -25993,9 +26609,9 @@ promptEl.addEventListener("input", () => {
 // Force PLAIN-TEXT paste (a contenteditable would otherwise paste rich HTML).
 promptEl.addEventListener("paste", (e) => {
   const txt = e.clipboardData && e.clipboardData.getData("text/plain");
-  const hasImage = e.clipboardData && [...(e.clipboardData.items || [])].some((it) => it.type && it.type.startsWith("image/"));
-  if (txt && !hasImage) { e.preventDefault(); document.execCommand("insertText", false, txt); }
-  // image paste falls through to the existing image-paste handler
+  const hasMedia = e.clipboardData && [...(e.clipboardData.items || [])].some((it) => it.type && /^(image|video)\//.test(it.type));
+  if (txt && !hasMedia) { e.preventDefault(); document.execCommand("insertText", false, txt); }
+  // media paste falls through to the attachment handler below
 });
 // Files/dirs dragged from the tree onto the composer become @-references (chips shown above the
 // input; their content is injected on send via the existing @-mention path). Declared before the
@@ -26010,11 +26626,16 @@ let _suppressTreeClick = false;
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
   if (_voiceActive) _voiceStop(null, true); // cancel recording on send so it can't re-fill the cleared composer
-  let text = promptEl.value.trim();
+  const composerText = promptEl.value;
+  let text = composerText.trim();
   // Prepend dropped file/dir references as @-mentions so _atContext pulls their content in.
   const _refMentions = _droppedRefs.map((r) => "@" + r.rel).join(" ");
   if (_refMentions) text = (_refMentions + (text ? " " + text : "")).trim();
   if (!text && _pastedImages.length === 0) return;
+  const attachments = [..._pastedImages];
+  const droppedRefs = [..._droppedRefs];
+  _pastedImages = [];
+  _refreshImagePreviews();
   // If THIS tab is already running, the message is a real-time STEER ("引导"): clear the
   // input and inject it into the live run so the agent adapts mid-task — instead of being
   // dropped. (Other tabs run concurrently; submitting on an idle tab starts its own run.)
@@ -26024,16 +26645,13 @@ $("composer").addEventListener("submit", (e) => {
     const _rs = _currentSession();
     // Agent run → real-time steer (mid-loop). Plain chat → queue as a follow-up turn
     // (no loop to steer), processed the instant the current reply finishes.
-    if (_rs && _rs._runIsLoop) _steerRunningAgent(_rs, text);
-    else _queueFollowup(_rs, text);
+    if (_rs && _rs._runIsLoop) _steerRunningAgent(_rs, text, attachments);
+    else _queueFollowup(_rs, text, attachments);
     return;
   }
-  const images = [..._pastedImages];
-  _pastedImages = [];
-  _refreshImagePreviews();
   _clearDroppedRefs();
   promptEl.value = "";
-  sendPrompt(text, images);
+  _dispatchComposerSubmission({ text, composerText, droppedRefs, attachments });
 });
 
 // ---- Drag a file/dir from the file tree → drop on the composer → @-reference it ----
@@ -26054,6 +26672,68 @@ function _renderRefChips() {
   });
 }
 function _clearDroppedRefs() { _droppedRefs = []; _renderRefChips(); }
+
+function _mergeComposerDraftState(restored, current) {
+  restored = restored || {};
+  current = current || {};
+  const restoredText = String(restored.composerText || "");
+  const currentText = String(current.composerText || "");
+  let composerText = currentText;
+  if (restoredText && !currentText) composerText = restoredText;
+  else if (restoredText && currentText && restoredText !== currentText) {
+    composerText = restoredText.replace(/\s+$/, "") + "\n" + currentText.replace(/^\s+/, "");
+  }
+  const mergeUnique = (first, second, keyOf = null) => {
+    const out = [], seen = new Set();
+    for (const value of [...(Array.isArray(first) ? first : []), ...(Array.isArray(second) ? second : [])]) {
+      const key = keyOf ? keyOf(value) : value;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(value);
+    }
+    return out;
+  };
+  return {
+    composerText,
+    droppedRefs: mergeUnique(restored.droppedRefs, current.droppedRefs, (ref) => String(ref?.path || "") + "\u0000" + String(ref?.rel || "")),
+    attachments: mergeUnique(restored.attachments, current.attachments),
+  };
+}
+
+function _restoreComposerSubmission(draft) {
+  if (!promptEl) return false;
+  const merged = _mergeComposerDraftState(draft, {
+    composerText: promptEl.value,
+    droppedRefs: _droppedRefs,
+    attachments: _pastedImages,
+  });
+  promptEl.value = merged.composerText;
+  _droppedRefs = merged.droppedRefs;
+  _pastedImages = merged.attachments;
+  _renderRefChips();
+  _refreshImagePreviews();
+  try { promptEl.focus(); } catch {}
+  return true;
+}
+
+async function _dispatchComposerSubmission(draft) {
+  let config = null;
+  try { config = await _readyAiConfig(); } catch {}
+  if (!config) {
+    let restored = false;
+    try { restored = _restoreComposerSubmission(draft); } catch {}
+    if (!restored) {
+      for (const attachment of Array.isArray(draft?.attachments) ? draft.attachments : []) {
+        try { _releaseAttachmentObjectUrl(attachment); } catch {}
+      }
+    }
+    return false;
+  }
+  const sent = sendPrompt(String(draft?.text || ""), Array.isArray(draft?.attachments) ? draft.attachments : [], config);
+  Promise.resolve(sent).catch((error) => console.warn("[chat] send failed:", error));
+  return true;
+}
+
 function _addDroppedRef(info) {
   if (!info || !info.path) return;
   const rel = _pathToRel(info.path);
@@ -26499,17 +27179,97 @@ promptEl.addEventListener("blur", () => setTimeout(_hideSlash, 150));
 
 let _pastedImages = [];
 
-function _createImagePreview(dataUrl, idx) {
+function _createImagePreview(attachment, idx) {
   const wrap = document.createElement("div");
   wrap.className = "prompt-image-preview";
-  wrap.innerHTML =
-    `<img src="${dataUrl}" alt="Pasted image" />` +
-    `<button class="prompt-image-preview__remove" type="button" title="Remove">&times;</button>`;
+  const src = attachment.dataUrl || attachment.objectUrl || (attachment.path ? (inTauri ? backend.assetUrl(attachment.path) : attachment.path) : attachment.frames?.[0] || "");
+  if (attachment.kind === "video") {
+    const video = document.createElement("video");
+    video.src = src;
+    video.muted = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    video._mediaAttachment = attachment;
+    wrap.appendChild(video);
+    const badge = document.createElement("span");
+    badge.className = "prompt-image-preview__video-badge";
+    badge.textContent = "VIDEO";
+    wrap.appendChild(badge);
+  } else {
+    const image = document.createElement("img");
+    image.src = src;
+    image.alt = attachment.name || "Pasted image";
+    wrap.appendChild(image);
+  }
+  const remove = document.createElement("button");
+  remove.className = "prompt-image-preview__remove";
+  remove.type = "button";
+  remove.title = "Remove";
+  remove.innerHTML = "&times;";
+  wrap.appendChild(remove);
   wrap.querySelector("button").addEventListener("click", () => {
+    _releaseAttachmentObjectUrl(_pastedImages[idx]);
     _pastedImages = _pastedImages.filter((_, i) => i !== idx);
     _refreshImagePreviews();
   });
   return wrap;
+}
+
+function _replaceVideoWithKeyFrame(video, attachment) {
+  const frame = Array.isArray(attachment?.frames)
+    ? attachment.frames.find((value) => typeof value === "string" && value.startsWith("data:image/"))
+    : "";
+  if (!frame || !video?.parentNode) return false;
+  const image = document.createElement("img");
+  image.src = frame;
+  image.className = video.classList?.contains("msg__attached-video") ? "msg__attached-image" : (video.className || "");
+  image.alt = attachment.name || "Video key frame";
+  image.title = "视频关键帧";
+  image.addEventListener("click", () => showImageLightbox(image.src));
+  video.replaceWith(image);
+  return true;
+}
+
+function _releaseAttachmentObjectUrl(attachment, scope = null, replaceWithFrame = false) {
+  if (!attachment?.objectUrl || !String(attachment.objectUrl).startsWith("blob:")) return;
+  const objectUrl = String(attachment.objectUrl);
+  if (scope?.querySelectorAll) {
+    for (const video of scope.querySelectorAll("video")) {
+      const src = video.getAttribute("src") || video.src || "";
+      if (src !== objectUrl) continue;
+      try { video.pause(); } catch {}
+      if (!replaceWithFrame || !_replaceVideoWithKeyFrame(video, attachment)) {
+        try { video.removeAttribute("src"); video.load(); } catch {}
+      }
+    }
+  }
+  try { URL.revokeObjectURL(objectUrl); } catch {}
+  attachment.objectUrl = "";
+}
+
+function _releaseMessagesAttachmentUrls(messages, scope = null, replaceWithFrame = false) {
+  for (const message of Array.isArray(messages) ? messages : []) {
+    for (const attachment of Array.isArray(message?.attachments) ? message.attachments : []) {
+      _releaseAttachmentObjectUrl(attachment, scope, replaceWithFrame);
+    }
+  }
+}
+
+function _releaseBlobMediaInNode(node) {
+  if (!node?.querySelectorAll) return;
+  const released = new Set();
+  for (const video of node.querySelectorAll("video")) {
+    const attachment = video._mediaAttachment;
+    const src = video.getAttribute("src") || video.src || "";
+    if (attachment?.objectUrl) {
+      released.add(String(attachment.objectUrl));
+      _releaseAttachmentObjectUrl(attachment);
+    }
+    if (String(src).startsWith("blob:") && !released.has(String(src))) {
+      try { URL.revokeObjectURL(String(src)); } catch {}
+    }
+    try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+  }
 }
 
 function _refreshImagePreviews() {
@@ -26520,7 +27280,7 @@ function _refreshImagePreviews() {
     promptEl.parentElement.insertBefore(container, promptEl);
   }
   container.innerHTML = "";
-  _pastedImages.forEach((img, i) => container.appendChild(_createImagePreview(img.dataUrl, i)));
+  _pastedImages.forEach((attachment, i) => container.appendChild(_createImagePreview(attachment, i)));
   if (_pastedImages.length === 0) container.remove();
 }
 
@@ -26558,23 +27318,89 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568) {
   });
 }
 
+function _readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("媒体读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+// Sample a few real video frames for vision APIs, which generally accept images
+// but not arbitrary video_url blocks. The original video remains playable in UI.
+async function _extractVideoFrames(dataUrl, maxFrames = 3) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "auto";
+  video.playsInline = true;
+  const waitEvent = (name, timeout = 10000) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error(`video ${name} timeout`)); }, timeout);
+    const done = () => { cleanup(); resolve(); };
+    const failed = () => { cleanup(); reject(new Error("video decode failed")); };
+    const cleanup = () => { clearTimeout(timer); video.removeEventListener(name, done); video.removeEventListener("error", failed); };
+    video.addEventListener(name, done, { once: true });
+    video.addEventListener("error", failed, { once: true });
+  });
+  try {
+    video.src = dataUrl;
+    await waitEvent("loadeddata");
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    const times = duration > 0.2
+      ? [0, duration * 0.5, Math.max(0, duration * 0.9)].slice(0, maxFrames)
+      : [0];
+    const frames = [];
+    for (const time of times) {
+      if (time > 0.01) {
+        video.currentTime = Math.min(time, Math.max(0, duration - 0.01));
+        await waitEvent("seeked", 7000);
+      }
+      const width = video.videoWidth || 0, height = video.videoHeight || 0;
+      if (!width || !height) continue;
+      const scale = Math.min(1, 1280 / Math.max(width, height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(width * scale));
+      canvas.height = Math.max(1, Math.round(height * scale));
+      const context = canvas.getContext("2d");
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      frames.push(canvas.toDataURL("image/jpeg", 0.82));
+    }
+    return frames;
+  } catch {
+    return [];
+  } finally {
+    try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+  }
+}
+
+async function _mediaAttachmentFromFile(file) {
+  const mime = String(file?.type || "");
+  const kind = mime.startsWith("video/") || isVideoFile(file?.name || "") ? "video" : "image";
+  if (kind === "image" && Number(file?.size || 0) > 25 * 1024 * 1024) throw new Error("图片超过 25 MB，请先压缩后再发送");
+  if (kind === "video" && Number(file?.size || 0) > 40 * 1024 * 1024) throw new Error("视频超过 40 MB，请先压缩或截取关键片段");
+  if (kind === "image") {
+    const original = await _readFileAsDataUrl(file);
+    return { kind, mime: mime || "image/png", name: file.name || "image.png", path: file.path || "", dataUrl: await _downscaleImageForVision(original), frames: [] };
+  }
+  const objectUrl = URL.createObjectURL(file);
+  const frames = await _extractVideoFrames(objectUrl);
+  if (file.path) { try { URL.revokeObjectURL(objectUrl); } catch {} }
+  return { kind, mime: mime || "video/mp4", name: file.name || "video.mp4", path: file.path || "", dataUrl: "", objectUrl: file.path ? "" : objectUrl, frames };
+}
+
 promptEl.addEventListener("paste", (e) => {
   const items = e.clipboardData?.items;
   if (!items) return;
   for (const item of items) {
-    if (item.type.startsWith("image/")) {
+    if (/^(image|video)\//.test(item.type)) {
       e.preventDefault();
       const file = item.getAsFile();
       if (!file) continue;
-      const reader = new FileReader();
-      reader.onload = () => {
-        _downscaleImageForVision(reader.result).then((du) => {
-          _pastedImages.push({ dataUrl: du, type: file.type, name: file.name || "image.png" });
+      _mediaAttachmentFromFile(file).then((attachment) => {
+          _pastedImages.push(attachment);
           _refreshImagePreviews();
-          showToast("Image attached");
-        });
-      };
-      reader.readAsDataURL(file);
+          showToast(attachment.kind === "video" ? "Video attached" : "Image attached");
+        }).catch((error) => showToast(String(error?.message || error)));
       return;
     }
   }
@@ -26605,6 +27431,16 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
   
   if (!files) return;
   for (const file of files) {
+    const isMedia = /^(image|video)\//.test(file.type) || isImageFile(file.name) || isVideoFile(file.name);
+    if (isMedia) {
+      try {
+        const attachment = await _mediaAttachmentFromFile(file);
+        _pastedImages.push(attachment);
+        _refreshImagePreviews();
+        showToast(`${attachment.kind === "video" ? "Video" : "Image"} attached: ${file.name}`);
+      } catch (error) { showToast(String(error?.message || error)); }
+      continue;
+    }
     // Check if it's a file path reference (from Finder/Explorer)
     if (file.path) {
       const relativePath = await window.__TAURI__?.path.relative(rootPath, file.path);
@@ -26615,17 +27451,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       continue;
     }
     
-    if (file.type.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        _downscaleImageForVision(reader.result).then((du) => {
-          _pastedImages.push({ dataUrl: du, type: file.type, name: file.name });
-          _refreshImagePreviews();
-          showToast(`Image attached: ${file.name}`);
-        });
-      };
-      reader.readAsDataURL(file);
-    } else if (file.size < 100000) {
+    if (file.size < 100000) {
       const reader = new FileReader();
       reader.onload = () => {
         const text = reader.result;
@@ -28135,7 +28961,7 @@ function _flushDirtyBuffersSync() {
   try {
     const dirty = [];
     for (const [path, f] of openFiles) {
-      if (f && f.dirty && f.model && !f.isImage) {
+      if (f && f.dirty && f.model && !f.isImage && !f.isVideo) {
         try { dirty.push({ path, content: f.model.getValue() }); } catch {}
       }
     }

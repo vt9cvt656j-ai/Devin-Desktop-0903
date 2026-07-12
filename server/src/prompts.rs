@@ -68,7 +68,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
         // Plain chat should not silently grow into an autonomous tool-using agent.
         "chat" => matches!(
             name,
-            "web_search" | "web_fetch" | "knowledge_search" | "ask_user"
+            "web_search" | "web_fetch" | "knowledge_search" | "local_discovery" | "ask_user"
         ),
         "plan" => matches!(
             name,
@@ -84,6 +84,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "knowledge_search"
                 | "web_search"
                 | "web_fetch"
+                | "local_discovery"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -107,6 +108,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "knowledge_search"
                 | "web_search"
                 | "web_fetch"
+                | "local_discovery"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -639,6 +641,13 @@ fn looks_like_research_task(q: &str) -> bool {
         "dark web",
         "game asset",
         "package recommendation",
+        "nearby",
+        "near me",
+        "local food",
+        "restaurant",
+        "where to eat",
+        "travel itinerary",
+        "tourist attraction",
     ];
     const CJK: &[&str] = &[
         "调研",
@@ -664,6 +673,15 @@ fn looks_like_research_task(q: &str) -> bool {
         "资源搜索",
         "比价",
         "二手",
+        "附近",
+        "周边",
+        "好吃",
+        "餐厅",
+        "旅游",
+        "景点",
+        "去哪玩",
+        "当地美食",
+        "行程推荐",
     ];
     let github_research = lower.contains("github")
         && [
@@ -1274,6 +1292,60 @@ mod tests {
         assert!(policy.contains("逐项报告"));
         assert!(policy.contains("不可信数据"));
         assert!(policy.contains("绝不执行"));
+        assert!(policy.contains("搜索是取证手段，不是思考的替代品"));
+        assert!(policy.contains("检索轮次不固定"));
+        assert!(policy.contains("一轮没有带来新的独立来源"));
+    }
+
+    #[test]
+    fn local_discovery_schema_and_mode_access_are_real() {
+        let tools: serde_json::Value = serde_json::from_str(&read_tools_file().unwrap()).unwrap();
+        let local = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+                    == Some("local_discovery")
+            })
+            .expect("local_discovery should have a cloud schema");
+        assert_eq!(
+            local
+                .pointer("/function/parameters/properties/radius_m/maximum")
+                .and_then(|value| value.as_u64()),
+            Some(20_000)
+        );
+        assert_eq!(
+            local
+                .pointer("/function/parameters/properties/latitude/minimum")
+                .and_then(|value| value.as_i64()),
+            Some(-90)
+        );
+        assert_eq!(
+            local
+                .pointer("/function/parameters/anyOf/0/required/0")
+                .and_then(|value| value.as_str()),
+            Some("near")
+        );
+        assert_eq!(
+            local
+                .pointer("/function/parameters/anyOf/1/required/1")
+                .and_then(|value| value.as_str()),
+            Some("longitude")
+        );
+        assert_eq!(
+            requested_static_tools("chat", "local_discovery"),
+            ["local_discovery"]
+        );
+        assert_eq!(
+            requested_static_tools("plan", "local_discovery"),
+            ["local_discovery"]
+        );
+        assert!(looks_like_research_task("我在东京附近想找不只网红店的早餐"));
+        assert!(looks_like_research_task(
+            "plan a travel itinerary near Kyoto"
+        ));
     }
 
     #[test]
@@ -1639,6 +1711,18 @@ mod tests {
                     .contains("# 按任务加载：研究、社区与当前事实"),
                 "standalone Chinese GitHub request should route research for {model}"
             );
+
+            let mut local_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "我想知道附近有什么好吃的本地小店"}]
+            });
+            assemble_into(&headers, &mut local_body);
+            let local_system = local_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                local_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(local_system.contains("local_discovery"), "{model}");
         }
 
         let mut headers = HeaderMap::new();

@@ -15,6 +15,7 @@ mod game;
 mod game_assets;
 mod git;
 mod knowledge;
+mod local_discovery;
 mod lsp;
 mod marketplace;
 mod mcp;
@@ -269,6 +270,8 @@ pub fn run() {
             auth::auth_verify_code,
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
+            accessibility::read_screen,
+            accessibility::ui_click,
             automation::automation_call,
             knowledge::academic_search,
             knowledge::package_search,
@@ -320,6 +323,7 @@ pub fn run() {
             knowledge::bestofjs_search,
             knowledge::sourcegraph_search,
             knowledge::deep_search,
+            local_discovery::local_discovery,
             game::game_scaffold,
             web_scaffold::web_scaffold,
             game_assets::generate_3d,

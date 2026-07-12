@@ -103,7 +103,7 @@
     "type": "function",
     "function": {
       "name": "web_search",
-      "description": "联网搜索（DuckDuckGo），返回标题/URL/摘要列表。用来查官方文档、API 用法、库的最新版本、报错解决方案、技术文章——找到相关页面后再用 web_fetch 读全文。不确定的 API/库/报错优先搜，别凭记忆猜。",
+      "description": "联网搜索（当前桌面后端会并行尝试 Google、Bing、DuckDuckGo，并合并实际返回的结果），返回标题/URL/摘要列表。搜索摘要只是线索；关键结论要用 web_fetch 读原文并按来源可信度核实。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -114,6 +114,72 @@
         },
         "required": [
           "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "local_discovery",
+      "description": "查询某个地点周边的餐饮、景点、活动等 POI，并附天气、Haversine 直线距离、原始 opening_hours 和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；公共端点可能限流且没有应用 SLA。不得补猜评分、价格、路线时长或实时营业状态。near=current 必须有用户授权得到的坐标，绝不从时区或 IP 猜位置。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "想找什么，如 local breakfast、川菜、museum、family activity"
+          },
+          "near": {
+            "type": "string",
+            "minLength": 1,
+            "description": "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）"
+          },
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90,
+            "description": "已获用户授权的纬度；与 longitude 一起传"
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180,
+            "description": "已获用户授权的经度；与 latitude 一起传"
+          },
+          "radius_m": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 20000,
+            "description": "搜索半径（米），默认 3000"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "description": "最多返回地点数，默认 12"
+          },
+          "language": {
+            "type": "string",
+            "description": "Wikipedia 与地理编码语言，如 zh、en、ja"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "near"
+            ]
+          },
+          {
+            "required": [
+              "latitude",
+              "longitude"
+            ]
+          }
         ]
       }
     }
@@ -2953,21 +3019,13 @@
     "type": "function",
     "function": {
       "name": "read_screen",
-      "description": "**读前台 App 的真实可交互 UI 元素——像人一样看界面，绝不截图猜坐标**。走 macOS 辅助功能(AX)树，返回每个按钮/输入框/文本的 ref/role/名称/值/是否可用/坐标。操作原生桌面 App(微信/QQ/邮件/Finder/系统设置等)前先调它拿 ref，再用 ui_click 按 ref 点。只有自绘/游戏/Canvas(AX树空)才传 ocr:true 用OCR兜底。",
+      "description": "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。",
       "parameters": {
         "type": "object",
         "properties": {
           "ocr": {
             "type": "boolean",
-            "description": "(可选)true=用屏幕OCR读文字元素,仅AX树读不出(自绘/游戏)时用"
-          },
-          "window": {
-            "type": "string",
-            "description": "(可选·兜底)目标应用名如'微信'。仅当整屏AX+OCR都读空时,配合name走桌面框架原生AX按名字定位单个控件"
-          },
-          "name": {
-            "type": "string",
-            "description": "(可选·兜底)要定位的控件标题子串如'发送''登录'。配合window用"
+            "description": "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限"
           }
         },
         "required": []
@@ -2978,12 +3036,13 @@
     "type": "function",
     "function": {
       "name": "ui_click",
-      "description": "**按 read_screen 给的 ref 直接操作元素(node-first,不猜坐标)**:action=press点按钮、set_value把输入框设成value、focus聚焦。窗口移动也不错。先 read_screen 拿 ref。",
+      "description": "对 read_screen 返回的真实可访问性 ref 执行 press、set_value 或 focus。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。",
       "parameters": {
         "type": "object",
         "properties": {
           "ref": {
             "type": "integer",
+            "minimum": 0,
             "description": "read_screen返回的元素ref"
           },
           "action": {

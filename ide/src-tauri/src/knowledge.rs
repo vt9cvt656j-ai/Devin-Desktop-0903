@@ -560,11 +560,7 @@ pub async fn github_search(
     let url = format!("https://api.github.com/search/{stype}");
     let resp = c
         .get(&url)
-        .query(&[
-            ("q", query.as_str()),
-            ("per_page", &limit.to_string()),
-            ("sort", "stars"),
-        ])
+        .query(&[("q", query.as_str()), ("per_page", &limit.to_string())])
         .header("Accept", "application/vnd.github+json")
         .send()
         .await

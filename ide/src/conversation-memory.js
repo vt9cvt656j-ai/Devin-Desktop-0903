@@ -11,6 +11,69 @@
 const RECENT_WINDOW = 100;
 const MAX_SUMMARIES = 8;
 const SUMMARY_BATCH = 10;
+const PERSISTED_MEDIA_BUDGET = 3_200_000;
+
+// Keep enough recent visual context to survive a restart without letting base64
+// media overflow localStorage. Raw videos are never persisted; their compressed
+// key frames (or a stable local path) are the durable representation.
+function serializeAttachment(attachment, budget) {
+  if (!attachment || typeof attachment !== 'object') return null;
+  const kind = attachment.kind === 'video' ? 'video' : 'image';
+  let budgetOmitted = 0;
+  const out = {
+    kind,
+    mime: String(attachment.mime || attachment.type || (kind === 'video' ? 'video/mp4' : 'image/png')).slice(0, 120),
+    name: String(attachment.name || (kind === 'video' ? 'video' : 'image')).slice(0, 240),
+    path: String(attachment.path || '').slice(0, 2048),
+    visionText: String(attachment.visionText || '').slice(0, 6000),
+    frames: [],
+  };
+  const keepDataUrl = (value, prefix) => {
+    const data = typeof value === 'string' && value.startsWith(prefix) ? value : '';
+    if (!data) return '';
+    if (data.length > budget.remaining) {
+      budgetOmitted++;
+      return '';
+    }
+    budget.remaining -= data.length;
+    return data;
+  };
+  if (kind === 'image') {
+    const dataUrl = keepDataUrl(attachment.dataUrl, 'data:image/');
+    if (dataUrl) out.dataUrl = dataUrl;
+  }
+  for (const frame of Array.isArray(attachment.frames) ? attachment.frames.slice(0, 4) : []) {
+    const data = keepDataUrl(frame, 'data:image/');
+    if (data) out.frames.push(data);
+  }
+  const priorOmitted = !!attachment.omitted;
+  const hasDurableMedia = !!(out.path || out.dataUrl || out.frames.length);
+  if (budgetOmitted || priorOmitted || !hasDurableMedia) {
+    out.omitted = true;
+    out.omittedReason = budgetOmitted
+      ? 'persistence_media_budget'
+      : String(attachment.omittedReason || (kind === 'video' ? 'raw_video_not_persisted' : 'media_unavailable')).slice(0, 120);
+    out.omittedCount = Math.max(1, Number(attachment.omittedCount) || 0, budgetOmitted);
+  }
+  return out;
+}
+
+export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTED_MEDIA_BUDGET) {
+  const list = Array.isArray(messages) ? messages : [];
+  const budget = { remaining: Math.max(0, Number(mediaBudget) || 0) };
+  const out = new Array(list.length);
+  // Spend the bounded media budget on the newest turns first.
+  for (let i = list.length - 1; i >= 0; i--) {
+    const message = list[i] && typeof list[i] === 'object' ? { ...list[i] } : list[i];
+    if (message && Array.isArray(message.attachments)) {
+      message.attachments = message.attachments
+        .map((attachment) => serializeAttachment(attachment, budget))
+        .filter(Boolean);
+    }
+    out[i] = message;
+  }
+  return out;
+}
 
 export class ConversationMemory {
   constructor() {
@@ -19,6 +82,16 @@ export class ConversationMemory {
     this.summaries = [];
     this.milestones = [];
     this.fileEvidence = [];
+    this._onMessagesRemoved = null;
+  }
+
+  setRemovalHandler(handler) {
+    this._onMessagesRemoved = typeof handler === 'function' ? handler : null;
+  }
+
+  _notifyMessagesRemoved(messages) {
+    if (!messages?.length || !this._onMessagesRemoved) return;
+    try { this._onMessagesRemoved(messages); } catch {}
   }
 
   push(msg) {
@@ -110,6 +183,7 @@ export class ConversationMemory {
   compactRecent(count, summaryText) {
     if (count <= 0 || count > this.recent.length) return [];
     const removed = this.recent.splice(0, count);
+    this._notifyMessagesRemoved(removed);
     const startTurn = Math.max(1, this.totalTurns - this.recent.length - removed.length + 1);
     const endTurn = startTurn + removed.length - 1;
     this.summaries.push({
@@ -130,6 +204,7 @@ export class ConversationMemory {
   _compressOldestBatch() {
     if (this.recent.length < SUMMARY_BATCH) return;
     const batch = this.recent.splice(0, SUMMARY_BATCH);
+    this._notifyMessagesRemoved(batch);
     const startTurn = this.totalTurns - this.recent.length - batch.length;
     const endTurn = startTurn + batch.length - 1;
     this.summaries.push({ range: `turns ${startTurn}-${endTurn}`, text: this._summarizeBatch(batch) });
@@ -163,14 +238,14 @@ export class ConversationMemory {
   }
 
   toJSON() {
-    return { totalTurns: this.totalTurns, recent: this.recent, summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
+    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
   }
 
   static fromJSON(obj) {
     const mem = new ConversationMemory();
     if (obj) {
       mem.totalTurns = obj.totalTurns || 0;
-      mem.recent = obj.recent || [];
+      mem.recent = Array.isArray(obj.recent) ? obj.recent : [];
       mem.summaries = obj.summaries || [];
       mem.milestones = obj.milestones || [];
       mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
