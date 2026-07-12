@@ -1036,8 +1036,263 @@ test("local discovery is a registered read-only model tool", () => {
   assert.match(SRC, /name: "local_discovery"/);
   assert.match(SRC, /case "local_discovery": \{[\s\S]{0,700}type: "localdiscovery"/);
   assert.match(SRC, /backend\.invoke\("local_discovery"/);
+  assert.match(SRC, /backend\.invoke\("request_current_location"/);
   assert.match(SRC, /_requestCurrentCoordinates/);
   assert.match(SRC, /open_now 为未知时不得补猜/);
+});
+
+test("current location requests use the native permission flow without double prompting", async () => {
+  const normalize = load("_normalizeCurrentLocationResult");
+  assert.equal(normalize({ status: "success", latitude: null, longitude: null }).status, "error");
+  assert.equal(normalize({ status: "success", latitude: 0, longitude: 0, accuracy_m: null }).accuracyM, null);
+  assert.equal(normalize({ status: "success", latitude: 31, longitude: 121, sample_age_ms: 300001 }).status, "unavailable");
+  let webviewCalls = 0;
+  const requestNative = load("_requestCurrentCoordinates", {
+    inTauri: true,
+    backend: { invoke: async (command) => {
+      assert.equal(command, "request_current_location");
+      return { status: "success", latitude: 34.1, longitude: -118.2, accuracy_m: 42, source: "core_location" };
+    } },
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: () => { webviewCalls++; } } },
+    setTimeout,
+    clearTimeout,
+  });
+  assert.deepEqual(await requestNative(), {
+    status: "success", latitude: 34.1, longitude: -118.2, accuracyM: 42,
+    observedAtUnixMs: null, sampleAgeMs: null,
+    source: "core_location", message: "",
+  });
+  assert.equal(webviewCalls, 0);
+
+  const requestDenied = load("_requestCurrentCoordinates", {
+    inTauri: true,
+    backend: { invoke: async () => ({ status: "permission_denied", source: "core_location", message: "denied" }) },
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: () => { webviewCalls++; } } },
+    setTimeout,
+    clearTimeout,
+  });
+  const denied = await requestDenied();
+  assert.equal(denied.status, "permission_denied");
+  assert.equal(denied.message, "denied");
+  assert.equal(webviewCalls, 0, "a native denial must not trigger a second webview prompt");
+});
+
+test("webview location fallback reports success, denial, timeout, and unsupported distinctly", async () => {
+  const normalize = load("_normalizeCurrentLocationResult");
+  let options;
+  const success = load("_requestCurrentCoordinates", {
+    inTauri: true,
+    backend: { invoke: async () => ({ status: "unsupported" }) },
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: (ok, _fail, value) => {
+      options = value;
+      ok({ coords: { latitude: 31.23, longitude: 121.47, accuracy: 88 } });
+    } } },
+    setTimeout,
+    clearTimeout,
+  });
+  assert.equal((await success()).status, "success");
+  assert.deepEqual(options, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
+
+  const denied = load("_requestCurrentCoordinates", {
+    inTauri: false,
+    backend: null,
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: (_ok, fail) => fail({ code: 1 }) } },
+    setTimeout,
+    clearTimeout,
+  });
+  assert.equal((await denied()).status, "permission_denied");
+
+  let watchdog;
+  const timeout = load("_requestCurrentCoordinates", {
+    inTauri: false,
+    backend: null,
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: () => {} } },
+    setTimeout: (callback) => { watchdog = callback; return 1; },
+    clearTimeout: () => {},
+  });
+  const pending = timeout();
+  watchdog();
+  assert.equal((await pending).status, "timeout");
+
+  const unsupported = load("_requestCurrentCoordinates", {
+    inTauri: false,
+    backend: null,
+    _normalizeCurrentLocationResult: normalize,
+    navigator: {},
+    setTimeout,
+    clearTimeout,
+  });
+  assert.equal((await unsupported()).status, "unsupported");
+
+  let clearedTimer = null;
+  const securityError = new Error("blocked by permission policy");
+  securityError.name = "SecurityError";
+  const synchronousDenial = load("_requestCurrentCoordinates", {
+    inTauri: false,
+    backend: null,
+    _normalizeCurrentLocationResult: normalize,
+    navigator: { geolocation: { getCurrentPosition: () => { throw securityError; } } },
+    setTimeout: () => 77,
+    clearTimeout: (timer) => { clearedTimer = timer; },
+  });
+  assert.equal((await synchronousDenial()).status, "permission_denied");
+  assert.equal(clearedTimer, 77, "a synchronous provider failure must clear its watchdog");
+});
+
+test("local discovery keeps address and permission failures separate", () => {
+  const isCurrent = load("_isCurrentLocationRequest");
+  const normalizeLocation = load("_normalizeLocalDiscoveryLocation", { _isCurrentLocationRequest: isCurrent });
+  const cardState = load("_localDiscoveryCardState", { _isCurrentLocationRequest: isCurrent });
+  const locationMetadata = load("_localDiscoveryLocationMetadata");
+  const presentation = load("_currentLocationFailurePresentation");
+
+  assert.deepEqual(normalizeLocation({ near: "上海市胶州路282号", latitude: 31.2 }), {
+    latitude: null, longitude: null, needsCurrentLocation: false,
+  });
+  assert.deepEqual(normalizeLocation({ near: "当前位置", latitude: 31.2 }), {
+    latitude: null, longitude: null, needsCurrentLocation: true,
+  });
+  assert.deepEqual(normalizeLocation({ near: "当前位置", latitude: 31.2, longitude: 121.4 }), {
+    latitude: 31.2, longitude: 121.4, needsCurrentLocation: false,
+  });
+
+  const addressCall = { near: "上海市胶州路282号" };
+  assert.deepEqual(cardState(addressCall, {
+    center: null,
+    source_statuses: [{ source: "nominatim", status: "empty" }],
+  }), { modifier: "atc-result--err", text: "地址解析失败" });
+  assert.deepEqual(cardState(addressCall, {
+    center: null,
+    source_statuses: [{ source: "nominatim", status: "failed" }],
+  }), { modifier: "atc-result--err", text: "地理编码服务失败" });
+  assert.equal(cardState({ near: "当前位置" }, { center: null }).text, "当前位置不可用");
+  assert.equal(presentation({ status: "permission_denied" }).label, "定位权限已拒绝");
+
+  const center = { label: "Shanghai", latitude: 31.2, longitude: 121.4 };
+  const failedPoi = cardState(addressCall, {
+    center, places: [],
+    source_statuses: [
+      { source: "nominatim", status: "success" },
+      { source: "overpass", status: "failed" },
+      { source: "open_meteo", status: "success" },
+    ],
+  });
+  assert.equal(failedPoi.modifier, "atc-result--err");
+  assert.match(failedPoi.text, /地点数据源失败/);
+
+  const emptyPoi = cardState(addressCall, {
+    center, places: [],
+    source_statuses: [{ source: "overpass", status: "empty" }],
+  });
+  assert.equal(emptyPoi.modifier, "atc-result--info");
+  assert.match(emptyPoi.text, /未找到匹配地点/);
+
+  const coarse = cardState({ near: "当前位置", radiusM: 3000 }, {
+    center, places: [{ id: "1" }],
+    source_statuses: [{ source: "overpass", status: "success" }],
+  }, { accuracyM: 5000 });
+  assert.equal(coarse.modifier, "atc-result--info");
+  assert.match(coarse.text, /±5000m/);
+  assert.equal(locationMetadata({ radiusM: 3000 }, { source: "core_location", accuracyM: null }).accuracy_exceeds_radius, null);
+  assert.equal(locationMetadata({ radiusM: 3000 }, { source: "core_location", accuracyM: 5000 }).accuracy_exceeds_radius, true);
+});
+
+test("local discovery executor wires permission, coordinates, and address failures into real cards", async () => {
+  const isCurrent = load("_isCurrentLocationRequest");
+  const normalizeLocation = load("_normalizeLocalDiscoveryLocation", { _isCurrentLocationRequest: isCurrent });
+  const cardState = load("_localDiscoveryCardState", { _isCurrentLocationRequest: isCurrent });
+  const locationMetadata = load("_localDiscoveryLocationMetadata");
+  const presentation = load("_currentLocationFailurePresentation");
+  const fakeStep = () => {
+    const opened = new Set();
+    const viewport = { innerHTML: "" };
+    const result = { className: "atc-result", textContent: "", innerHTML: "" };
+    const row = {};
+    return {
+      opened, viewport, result,
+      step: {
+        classList: { add: (name) => opened.add(name) },
+        querySelector: (selector) => selector === ".atc-viewport" ? viewport
+          : selector === ".atc-result" ? result : selector === ".agent-tool-row" ? row : null,
+      },
+    };
+  };
+  const makeExecutor = ({ requestLocation, invoke }) => load("_executeToolStep", {
+    _currentAiMode: "agent",
+    _runCheckpoint: new Map(),
+    _approveToolCall: async () => true,
+    _normalizeLocalDiscoveryLocation: normalizeLocation,
+    _requestCurrentCoordinates: requestLocation,
+    _currentLocationFailurePresentation: presentation,
+    _localDiscoveryCardState: cardState,
+    _localDiscoveryLocationMetadata: locationMetadata,
+    _escHtml: (value) => String(value),
+    inTauri: true,
+    backend: { invoke },
+  });
+
+  const successUi = fakeStep();
+  let successArgs;
+  const executeSuccess = makeExecutor({
+    requestLocation: async () => ({
+      status: "success", latitude: 31.23, longitude: 121.47, accuracyM: 50,
+      observedAtUnixMs: 1_700_000_000_000, sampleAgeMs: 1000, source: "core_location",
+    }),
+    invoke: async (command, args) => {
+      assert.equal(command, "local_discovery");
+      successArgs = args;
+      return {
+        center: { label: "Shanghai", latitude: 31.23, longitude: 121.47 },
+        places: [{ id: "one" }],
+        source_statuses: [{ source: "overpass", status: "success" }],
+      };
+    },
+  });
+  const successResult = await executeSuccess(successUi.step, {
+    type: "localdiscovery", query: "food", near: "当前位置", radiusM: 3000,
+  }, "", null);
+  assert.equal(successArgs.latitude, 31.23);
+  assert.equal(successArgs.longitude, 121.47);
+  assert.match(successUi.result.className, /--ok/);
+  assert.match(successResult.content, /"sample_age_ms": 1000/);
+  assert.equal(successUi.opened.has("is-open"), true);
+
+  const deniedUi = fakeStep();
+  let deniedBackendCalls = 0;
+  const executeDenied = makeExecutor({
+    requestLocation: async () => ({ status: "permission_denied", source: "core_location", message: "denied" }),
+    invoke: async () => { deniedBackendCalls++; },
+  });
+  const deniedResult = await executeDenied(deniedUi.step, {
+    type: "localdiscovery", query: "food", near: "current",
+  }, "", null);
+  assert.equal(deniedBackendCalls, 0);
+  assert.equal(deniedUi.result.textContent, "定位权限已拒绝");
+  assert.match(deniedUi.result.className, /--err/);
+  assert.match(deniedResult.content, /没有从 IP、时区或其他线索猜测位置/);
+
+  const addressUi = fakeStep();
+  let addressLocationCalls = 0;
+  const executeAddress = makeExecutor({
+    requestLocation: async () => { addressLocationCalls++; throw new Error("must not request location"); },
+    invoke: async () => ({
+      center: null,
+      places: [],
+      source_statuses: [{ source: "nominatim", status: "empty" }],
+      limitations: ["Nominatim could not resolve the address"],
+    }),
+  });
+  await executeAddress(addressUi.step, {
+    type: "localdiscovery", query: "food", near: "上海市胶州路282号",
+  }, "", null);
+  assert.equal(addressLocationCalls, 0);
+  assert.equal(addressUi.result.textContent, "地址解析失败");
+  assert.match(addressUi.result.className, /--err/);
 });
 
 test("optional numeric tool arguments never coerce null into zero", () => {

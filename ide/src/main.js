@@ -14222,24 +14222,166 @@ function _isCurrentLocationRequest(value) {
   return /^(current|current_location|my location|当前位置|我的位置)$/i.test(String(value || "").trim());
 }
 
-// Ask the OS/webview for a one-shot location only when the model explicitly
-// requested current location. Denial or lack of support stays an honest null.
-function _requestCurrentCoordinates() {
+function _normalizeCurrentLocationResult(value, fallbackSource = "unknown") {
+  const status = String(value?.status || "error").trim().toLowerCase();
+  const latitude = Number.isFinite(value?.latitude) ? value.latitude : NaN;
+  const longitude = Number.isFinite(value?.longitude) ? value.longitude : NaN;
+  const accuracyRaw = value?.accuracy_m ?? value?.accuracyM;
+  const accuracyM = Number.isFinite(accuracyRaw) && accuracyRaw >= 0 ? accuracyRaw : null;
+  const observedRaw = value?.observed_at_unix_ms ?? value?.observedAtUnixMs;
+  const observedAtUnixMs = Number.isFinite(observedRaw) && observedRaw >= 0 ? observedRaw : null;
+  const ageRaw = value?.sample_age_ms ?? value?.sampleAgeMs;
+  const sampleAgeMs = Number.isFinite(ageRaw) && ageRaw >= 0 ? ageRaw : null;
+  const source = String(value?.source || fallbackSource || "unknown");
+  const message = String(value?.message || "");
+  if (status === "success") {
+    if (sampleAgeMs !== null && sampleAgeMs > 5 * 60 * 1000) {
+      return { status: "unavailable", latitude: null, longitude: null, accuracyM: null, observedAtUnixMs: null, sampleAgeMs, source, message: "定位服务只返回了超过 5 分钟的旧位置。" };
+    }
+    if (Number.isFinite(latitude) && Number.isFinite(longitude)
+      && latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180) {
+      return { status, latitude, longitude, accuracyM, observedAtUnixMs, sampleAgeMs, source, message };
+    }
+    return { status: "error", latitude: null, longitude: null, accuracyM: null, observedAtUnixMs: null, sampleAgeMs: null, source, message: "定位服务返回了无效坐标。" };
+  }
+  return { status, latitude: null, longitude: null, accuracyM: null, observedAtUnixMs: null, sampleAgeMs: null, source, message };
+}
+
+// Ask for a one-shot location only when the model explicitly requested the
+// user's current position. macOS uses native Core Location so the real system
+// permission sheet is shown; unsupported desktop platforms fall back once to
+// the webview provider. A denial never triggers a second permission request.
+async function _requestCurrentCoordinates() {
+  if (typeof inTauri !== "undefined" && inTauri && typeof backend !== "undefined" && typeof backend?.invoke === "function") {
+    try {
+      const nativeResult = _normalizeCurrentLocationResult(
+        await backend.invoke("request_current_location"),
+        "native",
+      );
+      if (nativeResult.status !== "unsupported") return nativeResult;
+    } catch {
+      // A platform without the native command can still use its webview's
+      // explicit geolocation permission flow below.
+    }
+  }
   return new Promise((resolve) => {
-    if (!navigator.geolocation) return resolve(null);
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      return resolve({ status: "unsupported", latitude: null, longitude: null, accuracyM: null, source: "web_geolocation", message: "当前平台不支持定位。" });
+    }
     let settled = false;
     const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
-    const timer = setTimeout(() => finish(null), 9000);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        clearTimeout(timer);
-        const latitude = Number(position?.coords?.latitude), longitude = Number(position?.coords?.longitude);
-        finish(Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null);
-      },
-      () => { clearTimeout(timer); finish(null); },
-      { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60 * 1000 },
-    );
+    const timer = setTimeout(() => finish({ status: "timeout", latitude: null, longitude: null, accuracyM: null, source: "web_geolocation", message: "定位请求等待超时。" }), 9000);
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          clearTimeout(timer);
+          const latitude = position?.coords?.latitude, longitude = position?.coords?.longitude;
+          const accuracyM = position?.coords?.accuracy;
+          finish(_normalizeCurrentLocationResult({
+            status: "success",
+            latitude,
+            longitude,
+            accuracy_m: Number.isFinite(accuracyM) && accuracyM >= 0 ? accuracyM : null,
+            observed_at_unix_ms: Number.isFinite(position?.timestamp) ? position.timestamp : null,
+            sample_age_ms: Number.isFinite(position?.timestamp) ? Math.max(0, Date.now() - position.timestamp) : null,
+            source: "web_geolocation",
+            message: "当前位置由系统 WebView 定位服务在用户授权后提供。",
+          }, "web_geolocation"));
+        },
+        (error) => {
+          clearTimeout(timer);
+          const code = Number(error?.code);
+          const status = code === 1 ? "permission_denied" : code === 3 ? "timeout" : "unavailable";
+          const message = status === "permission_denied" ? "用户拒绝了定位权限。"
+            : status === "timeout" ? "定位请求等待超时。" : "系统暂时无法确定当前位置。";
+          finish({ status, latitude: null, longitude: null, accuracyM: null, source: "web_geolocation", message });
+        },
+        { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60 * 1000 },
+      );
+    } catch (error) {
+      clearTimeout(timer);
+      const denied = error?.name === "SecurityError" || error?.name === "NotAllowedError";
+      finish({
+        status: denied ? "permission_denied" : "error",
+        latitude: null,
+        longitude: null,
+        accuracyM: null,
+        source: "web_geolocation",
+        message: denied ? "系统阻止了定位权限请求。" : `定位服务启动失败：${String(error?.message || error)}`,
+      });
+    }
   });
+}
+
+function _currentLocationFailurePresentation(location) {
+  const status = String(location?.status || "error");
+  const presentations = {
+    permission_denied: ["定位权限已拒绝", "用户没有授权当前位置；可在系统隐私设置中重新开启。"],
+    restricted: ["定位权限受限制", "系统或设备策略限制了定位访问。"],
+    services_disabled: ["系统定位已关闭", "系统定位服务处于关闭状态。"],
+    timeout: ["定位等待超时", "系统没有在限定时间内返回当前位置。"],
+    unavailable: ["当前位置不可用", "系统暂时无法确定当前位置。"],
+    unsupported: ["当前平台不支持定位", "当前平台没有可用的原生或 WebView 定位服务。"],
+    error: ["定位请求失败", "定位服务发生错误，没有取得坐标。"],
+  };
+  const [label, fallback] = presentations[status] || presentations.error;
+  return { label, message: String(location?.message || fallback) };
+}
+
+function _normalizeLocalDiscoveryLocation(call) {
+  const hasCoordinates = Number.isFinite(call?.latitude) && Number.isFinite(call?.longitude);
+  return {
+    latitude: hasCoordinates ? call.latitude : null,
+    longitude: hasCoordinates ? call.longitude : null,
+    needsCurrentLocation: _isCurrentLocationRequest(call?.near) && !hasCoordinates,
+  };
+}
+
+function _localDiscoveryCardState(call, output, location = null) {
+  const statuses = Array.isArray(output?.source_statuses) ? output.source_statuses : [];
+  const successCount = statuses.filter((status) => status?.status === "success").length;
+  const ratio = statuses.length ? `${successCount}/${statuses.length} 来源成功` : "无来源状态";
+  const source = (name) => statuses.find((status) => status?.source === name);
+  if (!output?.center) {
+    if (_isCurrentLocationRequest(call?.near)) return { modifier: "atc-result--err", text: "当前位置不可用" };
+    const geocode = source("nominatim");
+    if (geocode?.status === "empty") return { modifier: "atc-result--err", text: "地址解析失败" };
+    if (geocode?.status === "failed") return { modifier: "atc-result--err", text: "地理编码服务失败" };
+    return { modifier: "atc-result--err", text: "没有解析到地点" };
+  }
+
+  const places = Array.isArray(output?.places) ? output.places : [];
+  const overpass = source("overpass");
+  let state;
+  if (overpass?.status === "failed") {
+    state = { modifier: "atc-result--err", text: `地点数据源失败 · ${ratio}` };
+  } else if (overpass?.status === "empty" || !places.length) {
+    state = { modifier: "atc-result--info", text: `未找到匹配地点 · ${ratio}` };
+  } else {
+    state = { modifier: "atc-result--ok", text: `${places.length} 个地点 · ${ratio}` };
+  }
+
+  const radiusM = Number.isFinite(call?.radiusM) ? call.radiusM : 3000;
+  if (Number.isFinite(location?.accuracyM) && location.accuracyM > radiusM) {
+    return {
+      modifier: state.modifier === "atc-result--ok" ? "atc-result--info" : state.modifier,
+      text: `${state.text} · 定位精度约 ±${Math.round(location.accuracyM)}m`,
+    };
+  }
+  return state;
+}
+
+function _localDiscoveryLocationMetadata(call, location) {
+  const requestedRadiusM = Number.isFinite(call?.radiusM) ? call.radiusM : 3000;
+  const accuracyM = Number.isFinite(location?.accuracyM) ? location.accuracyM : null;
+  return {
+    source: String(location?.source || "unknown"),
+    accuracy_m: accuracyM,
+    observed_at_unix_ms: Number.isFinite(location?.observedAtUnixMs) ? location.observedAtUnixMs : null,
+    sample_age_ms: Number.isFinite(location?.sampleAgeMs) ? location.sampleAgeMs : null,
+    requested_radius_m: requestedRadiusM,
+    accuracy_exceeds_radius: accuracyM === null ? null : accuracyM > requestedRadiusM,
+  };
 }
 // ── Secret safety ─────────────────────────────────────────────────────────────
 // Mask credential VALUES before file/search content is sent to the model/API, so a
@@ -20773,11 +20915,27 @@ async function _executeToolStep(step, call, root, run) {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "localdiscovery", path: call.near || "", content: "[不可用] local_discovery 需要 Michael IDE 桌面后端。" }; }
       const query = String(call.query || "").trim();
       if (!query) { res.className = "atc-result atc-result--err"; res.textContent = "缺 query"; return { type: "localdiscovery", path: call.near || "", content: "[ERROR] local_discovery 需要 query。" }; }
-      let latitude = call.latitude, longitude = call.longitude;
-      if (_isCurrentLocationRequest(call.near) && !(Number.isFinite(latitude) && Number.isFinite(longitude))) {
-        res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 获取当前位置…`;
-        const coordinates = await _requestCurrentCoordinates();
-        if (coordinates) { latitude = coordinates.latitude; longitude = coordinates.longitude; }
+      const normalizedLocation = _normalizeLocalDiscoveryLocation(call);
+      let { latitude, longitude } = normalizedLocation;
+      let currentLocation = null;
+      if (normalizedLocation.needsCurrentLocation) {
+        res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 等待系统定位授权…`;
+        currentLocation = await _requestCurrentCoordinates();
+        if (currentLocation?.status !== "success") {
+          const presentation = _currentLocationFailurePresentation(currentLocation);
+          const structured = JSON.stringify(currentLocation || { status: "error" }, null, 2);
+          res.className = "atc-result atc-result--err";
+          res.textContent = presentation.label;
+          if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured)}</pre>`;
+          if (vp) step.classList.add("is-open");
+          return {
+            type: "localdiscovery",
+            path: call.near || "",
+            content: `[定位不可用] ${presentation.message}\n未调用地点数据源，也没有从 IP、时区或其他线索猜测位置。\n定位状态：\n${structured}`,
+          };
+        }
+        latitude = currentLocation.latitude;
+        longitude = currentLocation.longitude;
       }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 查询多源地点数据…`;
       try {
@@ -20790,13 +20948,18 @@ async function _executeToolStep(step, call, root, run) {
           limit: call.limit || null,
           language: call.language || null,
         });
-        const places = Array.isArray(output?.places) ? output.places : [];
-        const statuses = Array.isArray(output?.source_statuses) ? output.source_statuses : [];
-        const successCount = statuses.filter((status) => status?.status === "success").length;
-        res.className = "atc-result " + (output?.center ? "atc-result--ok" : "atc-result--err");
-        res.textContent = output?.center ? `${places.length} 个地点 · ${successCount}/${statuses.length} 来源成功` : "需要地点或定位权限";
-        const structured = JSON.stringify(output || {}, null, 2);
-        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 12000))}</pre>`;
+        const cardState = _localDiscoveryCardState(call, output, currentLocation);
+        res.className = `atc-result ${cardState.modifier}`;
+        res.textContent = cardState.text;
+        const modelOutput = currentLocation ? {
+          ...(output || {}),
+          location_input: _localDiscoveryLocationMetadata(call, currentLocation),
+        } : (output || {});
+        const structured = JSON.stringify(modelOutput, null, 2);
+        const visibleDetails = structured.length > 12000
+          ? `${structured.slice(0, 12000)}\n…（详情已截断，完整结构化结果仍已提供给模型）`
+          : structured;
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(visibleDetails)}</pre>`;
         if (vp) step.classList.add("is-open");
         return { type: "localdiscovery", path: call.near || "", content: `local_discovery 结构化结果（距离是直线距离；评分、价格、路线时长、open_now 为未知时不得补猜）：\n${structured}` };
       } catch (error) {

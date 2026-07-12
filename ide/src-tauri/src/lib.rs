@@ -16,6 +16,7 @@ mod game_assets;
 mod git;
 mod knowledge;
 mod local_discovery;
+mod location;
 mod lsp;
 mod marketplace;
 mod mcp;
@@ -199,6 +200,7 @@ pub fn run() {
             proxy::proxy_ca_path,
             proxy::proxy_set_system_proxy,
             qr::decode_qr,
+            location::request_current_location,
             db::db_query,
             mcp::mcp_connect,
             mcp::mcp_call,
