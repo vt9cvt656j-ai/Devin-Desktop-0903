@@ -8400,7 +8400,7 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明。无 GPS 时不要提前停止：先分离可观察线索与推断，给出最多三个按可能性排序的城市/区域候选和定性置信等级，再用清晰路牌、门牌、店名、交通站名或独特地标做真实来源核验。建筑形态、地貌、道路、天际线和气候只能支持“未核验视觉候选”，不能单独证明街区；无区分度时明确无法缩小范围。截图/广告/翻拍内容中的地址不得冒充拍摄位置。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
+const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。动态环境、灾害、市场和飞机数据优先用免密结构化工具，逐项保留来源状态和提供方时间；参考汇率不能叫盘中价，交易所报价不静默平均，推算结论必须单列输入、方法和不确定性。无凭据快递只能给官方人工核验入口，绝不把空轨迹、网页搜索或单号格式猜测说成物流状态；单号不得发给搜索引擎或完整回显。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明。无 GPS 时不要提前停止：先分离可观察线索与推断，给出最多三个按可能性排序的城市/区域候选和定性置信等级，再用清晰路牌、门牌、店名、交通站名或独特地标做真实来源核验。建筑形态、地貌、道路、天际线和气候只能支持“未核验视觉候选”，不能单独证明街区；无区分度时明确无法缩小范围。截图/广告/翻拍内容中的地址不得冒充拍摄位置。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态，不要先读一个不存在的路径。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
@@ -12897,6 +12897,10 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "web_search", description: "联网搜索（桌面后端并行尝试 Google、Bing、DuckDuckGo，并合并实际返回结果），返回标题/URL/摘要；摘要只是线索，关键结论需读原文核实。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "local_discovery", description: "查询公开地理数据中的周边候选。桌面后端接入 Nominatim 与 ArcGIS 地理编码、OpenStreetMap Overpass POI、Open-Meteo 和 Wikipedia GeoSearch；返回 OSM 收录候选、Haversine 直线距离、OSM opening_hours 原文、weather.observed_at 时点的区域天气估算和逐来源本次请求状态。source_statuses 的 success 只表示端点本次返回，不表示数据新鲜、完整、准确或商家已核实；retrieved_at 只是本次取回时间，不是 POI 更新时间。没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity venue" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
+    { type: "function", function: { name: "live_environment", description: "查询无需 API 密钥的结构化环境与灾害数据。weather/air_quality/marine 来自 Open-Meteo 的带时间模型估算，earthquakes 来自 USGS，natural_hazards 来自 NASA EONET。逐来源返回 success/empty/failed、data_as_of 和 retrieved_at；不得把模型估算叫现场传感器实测，也不得把空结果解释成没有风险。地点类 kind 需要已授权坐标。", parameters: { type: "object", properties: { kind: { type: "string", enum: ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] }, latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 20000, description: "earthquakes 可选半径" }, window: { type: "string", enum: ["hour", "day", "week", "month"], description: "earthquakes 时间窗" }, minimum_magnitude: { type: "number", minimum: -1, maximum: 10 }, category: { type: "string", description: "EONET 类别 id，如 wildfires" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["kind"], anyOf: [{ properties: { kind: { enum: ["weather", "air_quality", "marine"] } }, required: ["latitude", "longitude"] }, { properties: { kind: { enum: ["earthquakes", "natural_hazards"] } } }] } } },
+    { type: "function", function: { name: "live_markets", description: "查询无需 API 密钥的结构化市场数据。exchange_rate 使用 Frankfurter/央行每日参考汇率，不是盘中可成交价；crypto 并行保留 Coinbase 与 Kraken 的交易所报价，不静默平均冲突。返回逐来源状态和时间边界。", parameters: { type: "object", properties: { kind: { type: "string", enum: ["exchange_rate", "crypto"] }, base: { type: "string", description: "基础货币或资产，如 USD/BTC" }, quote: { type: "string", description: "计价货币，如 CNY/USD" } }, required: ["kind", "base", "quote"] } } },
+    { type: "function", function: { name: "live_flights", description: "查询 OpenSky Network 匿名公开的飞机状态向量，不需要 API 密钥。返回 feed time、position time、last contact、位置、高度和速度；覆盖取决于接收站且匿名端点限流，不能冒充完整航班表、售票状态或安全结论。需要已授权或用户明确提供的中心坐标。", parameters: { type: "object", properties: { latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 500 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["latitude", "longitude"] } } },
+    { type: "function", function: { name: "track_shipment", description: "免密快递真实性入口。主流快递正式机器 API 都需要账号凭据；本工具只识别少数不歧义单号或使用用户提供的 carrier，返回承运商官方查询页并掩码单号，不抓网页、不绕验证码、不编造轨迹、位置、状态或 ETA。它不会声称已查询到实时物流。", parameters: { type: "object", properties: { tracking_number: { type: "string", minLength: 6, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$", description: "用户主动提供的快递单号；结果只回显掩码" }, carrier: { type: "string", description: "承运商 id，如 ups/usps/fedex/dhl/sf/china_post/yto/zto/sto/yunda/jd；号码歧义时必须提供" } }, required: ["tracking_number"] } } },
     { type: "function", function: { name: "read_screen", description: "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限" } }, required: [] } } },
     { type: "function", function: { name: "ui_click", description: "对 read_screen 返回的真实可访问性 ref 执行 press、set_value 或 focus。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "read_screen 返回的 AX 元素 ref" }, action: { type: "string", enum: ["press", "set_value", "focus"] }, value: { type: "string", description: "action=set_value 时必填" } }, required: ["ref", "action"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。", parameters: { type: "object", properties: { steps: { type: "array", description: "完整的有序步骤列表（每次传全量，不是增量）", items: { type: "object", properties: { content: { type: "string", description: "这一步做什么——具体但简洁，一眼看懂（含关键技术/文件）" }, status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "状态：pending待办 / in_progress进行中 / completed已完成 / cancelled已取消(用户取消的保持这个)" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
@@ -13046,7 +13050,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
   if (!inTauri) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "live_markets", "live_flights", "track_shipment"]);
     return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
   }
   return _applyCloudToolDescs(tools);
@@ -13167,7 +13171,7 @@ const _KNOWN_TOOLS = new Set([
   "git_pull", "git_blame", "git_stash", "git_stash_pop", "git_stash_list", "git_conflicts",
   "read_terminal", "list_terminals", "stop_terminal", "run_in_terminal", "start_demo", "stop_demo",
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
-  "local_discovery", "read_screen", "ui_click",
+  "local_discovery", "live_environment", "live_markets", "live_flights", "track_shipment", "read_screen", "ui_click",
   "lsp_symbols", "lsp_definition", "lsp_references", "browser",
   "preview_choices", "style_wardrobe", "visual_explain", "design_research",
   "background_monitor", "developer_community_search",
@@ -13185,6 +13189,10 @@ const _TOOL_ALIASES = {
   webfetch: "web_fetch", fetch: "web_fetch", fetch_url: "web_fetch", curl: "web_fetch", http_get: "web_fetch", get_url: "web_fetch", read_url: "web_fetch", open_url: "web_fetch", visit: "web_fetch",
   websearch: "web_search", search_web: "web_search", google: "web_search", searchweb: "web_search", internet_search: "web_search", web_query: "web_search",
   localdiscovery: "local_discovery", nearby: "local_discovery", nearby_search: "local_discovery", places: "local_discovery", place_search: "local_discovery",
+  liveenvironment: "live_environment", environment_data: "live_environment", weather_data: "live_environment", air_quality: "live_environment", earthquake_data: "live_environment", hazard_data: "live_environment",
+  livemarkets: "live_markets", market_data: "live_markets", exchange_rate: "live_markets", crypto_price: "live_markets",
+  liveflights: "live_flights", flight_data: "live_flights", aircraft_data: "live_flights",
+  trackshipment: "track_shipment", shipment_tracking: "track_shipment", parcel_tracking: "track_shipment", track_package: "track_shipment",
   readscreen: "read_screen", inspect_screen: "read_screen", accessibility_tree: "read_screen",
   uiclick: "ui_click", ax_click: "ui_click", accessibility_click: "ui_click",
   runsubagent: "run_subagent", subagent: "run_subagent",
@@ -13415,6 +13423,11 @@ function _schemaValueIssue(value, schema, path = "参数") {
   } else if (type === "string") {
     if (typeof value !== "string") return `${path} 必须是字符串`;
     if (Number.isFinite(schema.minLength) && value.length < schema.minLength) return `${path} 长度不能小于 ${schema.minLength}`;
+    if (Number.isFinite(schema.maxLength) && value.length > schema.maxLength) return `${path} 长度不能大于 ${schema.maxLength}`;
+    if (typeof schema.pattern === "string") {
+      try { if (!(new RegExp(schema.pattern)).test(value)) return `${path} 格式无效`; }
+      catch { return `${path} 的校验规则无效`; }
+    }
   } else if (type === "integer") {
     if (!Number.isInteger(value)) return `${path} 必须是整数`;
   } else if (type === "number") {
@@ -13709,6 +13722,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       const limit = _finiteNumberArg(args.limit);
       return { type: "localdiscovery", path: args.near || "", query: String(args.query || ""), near: args.near ? String(args.near) : "", latitude, longitude, radiusM: radius === null ? null : Math.max(100, Math.min(radius, 20000)), limit: limit === null ? null : Math.max(1, Math.min(limit, 30)), language: args.language ? String(args.language) : "" };
     }
+    case "live_environment": return { type: "liveenvironment", path: String(args.kind || "environment"), kind: String(args.kind || ""), latitude: _finiteNumberArg(args.latitude), longitude: _finiteNumberArg(args.longitude), radiusKm: _finiteNumberArg(args.radius_km), window: args.window ? String(args.window) : "", minimumMagnitude: _finiteNumberArg(args.minimum_magnitude), category: args.category ? String(args.category) : "", limit: _finiteNumberArg(args.limit) };
+    case "live_markets": return { type: "livemarkets", path: `${String(args.base || "").toUpperCase()}/${String(args.quote || "").toUpperCase()}`, kind: String(args.kind || ""), base: String(args.base || ""), quote: String(args.quote || "") };
+    case "live_flights": return { type: "liveflights", path: "OpenSky", latitude: _finiteNumberArg(args.latitude), longitude: _finiteNumberArg(args.longitude), radiusKm: _finiteNumberArg(args.radius_km), limit: _finiteNumberArg(args.limit) };
+    case "track_shipment": return { type: "trackshipment", path: "官方核验", trackingNumber: String(args.tracking_number || ""), carrier: args.carrier ? String(args.carrier) : "" };
     case "gh_pr_create": return { type: "gh", op: "pr_create", title: args.title || "", body: args.body || "", base: args.base || "", draft: !!args.draft };
     case "gh_pr_view": return { type: "gh", op: "pr_view", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
     case "gh_pr_checks": return { type: "gh", op: "pr_checks", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
@@ -15308,7 +15325,7 @@ function _toolMsgForModel(call, result) {
     // Retrieval tools size their own output to what the model asked for; chopping to 8K silently drops
     // the tail (matches / symbols / diagnostics) so the model re-runs the query or edits on an
     // incomplete set — the same starvation trap as reads, on the highest-volume tools.
-    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "diag" ? 30000
+    : _rt === "search" || _rt === "find" || _rt === "lsp" || _rt === "semsearch" || _rt === "findsymbol" || _rt === "knowledge" || _rt === "localdiscovery" || _rt === "liveenvironment" || _rt === "livemarkets" || _rt === "liveflights" || _rt === "trackshipment" || _rt === "diag" ? 30000
     : _rt && (_rt.endsWith("_search") || _rt === "github_trending") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
     : 8000;
@@ -15934,7 +15951,7 @@ function _tauriSearchInvokeArgs(call) {
 // db queries and terminal reads — so a turn that batches many such calls finishes in
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "termread", "termlist", "search_tools", "current_time"]);
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "termread", "termlist", "search_tools", "current_time", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "trackshipment"]);
 function _isMergedToolItem(item) {
   return item?.merged != null;
 }
@@ -17403,6 +17420,10 @@ const _TOOL_CATALOG = [
   { name: "http_request", desc: "调任意 HTTP API / webhook（也用于抓包后重发/改参/调试任意请求）", kw: ["api", "接口", "http", "请求", "webhook", "rest", "重发", "replay", "抓包"] },
   { name: "decode_qr", desc: "识别图片/截图里的二维码内容", kw: ["二维码", "qr", "qrcode", "扫码", "scan"] },
   { name: "local_discovery", desc: "用 Nominatim/ArcGIS 地理编码、OSM、天气估算和 Wikipedia 查询附近候选，并报告逐来源状态", kw: ["附近", "周边", "美食", "餐厅", "吃饭", "旅游", "景点", "去哪", "nearby", "restaurant", "travel", "attraction", "places"] },
+  { name: "live_environment", desc: "免密查询 Open-Meteo 天气/空气/海洋、USGS 地震和 NASA 自然灾害结构化数据", kw: ["天气", "空气质量", "污染", "海浪", "海洋", "地震", "灾害", "台风", "火灾", "weather", "air quality", "marine", "earthquake", "hazard"] },
+  { name: "live_markets", desc: "免密查询 Frankfurter 每日参考汇率及 Coinbase/Kraken 交易所加密资产报价", kw: ["汇率", "兑换", "外汇", "币价", "比特币", "加密货币", "exchange rate", "fx", "crypto", "bitcoin", "price"] },
+  { name: "live_flights", desc: "免密查询 OpenSky 匿名飞机状态向量和各自观测时间", kw: ["航班", "飞机", "空中", "飞行", "flight", "aircraft", "opensky"] },
+  { name: "track_shipment", desc: "免密识别有限承运商并返回官方快递核验入口；不伪造实时物流轨迹", kw: ["快递", "物流", "包裹", "单号", "运单", "shipment", "parcel", "tracking", "courier", "delivery"] },
   { name: "read_screen / ui_click", desc: "读取前台原生应用可访问性元素；macOS 可按 ref 操作", kw: ["前台应用", "原生应用", "屏幕元素", "按钮", "输入框", "accessibility", "ax", "read screen", "ui click", "操作软件"] },
   { name: "download_file", desc: "下载文件到工作区", kw: ["下载", "download", "拉取"] },
   { name: "capture_start", desc: "启动系统级抓包（真·小黄鸟 / mitmproxy MITM 代理，抓任意 App/浏览器的 HTTP/HTTPS）", kw: ["抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
@@ -18335,12 +18356,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // single read, not two). Range-aware: genuine pagination (same path, DIFFERENT offset) is kept.
       {
         const _seenRead = new Set();
+        const _seenLive = new Set();
         for (const it of items) {
-          if (!it.call || it.call.type !== "read" || _isMergedToolItem(it)) continue;
-          const _off = Number.isFinite(it.call.offset) ? it.call.offset : "";
-          const _lim = Number.isFinite(it.call.limit) ? it.call.limit : "";
-          const _k = (it.call.path || "").trim() + "|" + _off + "|" + _lim;
-          if (_seenRead.has(_k)) it._dupRead = true; else _seenRead.add(_k);
+          if (!it.call || _isMergedToolItem(it)) continue;
+          if (it.call.type === "read") {
+            const _off = Number.isFinite(it.call.offset) ? it.call.offset : "";
+            const _lim = Number.isFinite(it.call.limit) ? it.call.limit : "";
+            const _k = (it.call.path || "").trim() + "|" + _off + "|" + _lim;
+            if (_seenRead.has(_k)) it._dupRead = true; else _seenRead.add(_k);
+          } else if (["liveenvironment", "livemarkets", "liveflights", "trackshipment"].includes(it.call.type)) {
+            const _k = _stableToolCallSignature(it.call);
+            if (_seenLive.has(_k)) it._dupLive = true; else _seenLive.add(_k);
+          }
         }
       }
 
@@ -18418,6 +18445,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _settleToolStep(step, r, "重复 · 已跳过");
           return _toolResultToString(call, r);
         }
+        if (it._dupLive) {
+          const r = { type: call.type, path: call.path || "", content: `[同批重复查询·已跳过] 本轮已经执行了参数完全相同的 ${call.type}，请使用同批第一次返回的结构化结果。` };
+          it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "重复 · 已跳过");
+          return _toolResultToString(call, r);
+        }
         if (it.stageReady && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "format")) {
           try { await it.stageReady; } catch {}
         }
@@ -18426,7 +18460,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // re-running the same query. Only idempotent read-only types; excludes read_file
         // (it pages/auto-advances, so a same-path re-read is legitimately different).
         const _sig = _stableToolCallSignature(call);
-        const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "localdiscovery", "web", "websearch", "diag"]);
+        const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "localdiscovery", "trackshipment", "web", "websearch", "diag"]);
         // Weak models brain-freeze-repeat readily → catch a repeat within the last 2 calls. Claude
         // rarely does, and a SPACED re-run after other work is usually intentional — but sonnet-5 CAN
         // spin, so still catch a genuine BACK-TO-BACK repeat (this is the 3rd identical call in a row).
@@ -19435,7 +19469,7 @@ function _toolStepActionLabel(call) {
     copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
     termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
     demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
-    automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", current_time: "当前时间", localdiscovery: "附近发现", db: "数据库",
+    automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", current_time: "当前时间", localdiscovery: "附近发现", liveenvironment: "环境数据", livemarkets: "市场数据", liveflights: "飞机状态", trackshipment: "快递核验", db: "数据库",
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
     wardrobe: "风格选择", explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
@@ -19542,7 +19576,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "trackshipment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -21171,6 +21205,57 @@ async function _executeToolStep(step, call, root, run) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "查询失败";
         return { type: "localdiscovery", path: call.near || "", content: `[失败] local_discovery: ${message}` };
+      }
+
+    } else if (call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "trackshipment") {
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: call.path || "", content: "[不可用] 免密结构化数据工具需要 Michael IDE 桌面后端。" }; }
+      let command = "";
+      let invokeArgs = {};
+      if (call.type === "liveenvironment") {
+        const kind = String(call.kind || "").trim();
+        if (!["weather", "air_quality", "marine", "earthquakes", "natural_hazards"].includes(kind)) { res.className = "atc-result atc-result--err"; res.textContent = "kind 无效"; return { type: call.type, path: kind, content: "[ERROR] live_environment kind 无效。" }; }
+        command = "live_environment";
+        invokeArgs = { kind, latitude: call.latitude, longitude: call.longitude, radiusKm: call.radiusKm, window: call.window || null, minimumMagnitude: call.minimumMagnitude, category: call.category || null, limit: call.limit };
+      } else if (call.type === "livemarkets") {
+        const kind = String(call.kind || "").trim();
+        if (!["exchange_rate", "crypto"].includes(kind) || !String(call.base || "").trim() || !String(call.quote || "").trim()) { res.className = "atc-result atc-result--err"; res.textContent = "参数无效"; return { type: call.type, path: call.path || "", content: "[ERROR] live_markets 需要有效 kind、base 和 quote。" }; }
+        command = "live_markets";
+        invokeArgs = { kind, base: String(call.base), quote: String(call.quote) };
+      } else if (call.type === "liveflights") {
+        if (!Number.isFinite(call.latitude) || !Number.isFinite(call.longitude)) { res.className = "atc-result atc-result--err"; res.textContent = "缺坐标"; return { type: call.type, path: "OpenSky", content: "[ERROR] live_flights 需要用户明确提供或授权得到的 latitude/longitude；不得从 IP 或时区猜位置。" }; }
+        command = "live_flights";
+        invokeArgs = { latitude: call.latitude, longitude: call.longitude, radiusKm: call.radiusKm, limit: call.limit };
+      } else {
+        if (!String(call.trackingNumber || "").trim()) { res.className = "atc-result atc-result--err"; res.textContent = "缺单号"; return { type: call.type, path: "官方核验", content: "[ERROR] track_shipment 需要用户主动提供 tracking_number。" }; }
+        command = "track_shipment";
+        invokeArgs = { trackingNumber: String(call.trackingNumber), carrier: call.carrier || null };
+      }
+      res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 查询免密公开源…`;
+      try {
+        const output = await backend.invoke(command, invokeArgs);
+        const statuses = Array.isArray(output?.source_statuses) ? output.source_statuses : [];
+        const records = Array.isArray(output?.records) ? output.records : [];
+        const successes = statuses.filter((item) => item?.status === "success").length;
+        const failures = statuses.filter((item) => item?.status === "failed").length;
+        const partial = successes > 0 && failures > 0;
+        res.className = `atc-result ${partial ? "" : successes ? "atc-result--ok" : failures ? "atc-result--err" : ""}`;
+        res.textContent = partial ? `${records.length} 条 · ${successes} 成功 / ${failures} 失败` : successes ? `${records.length} 条 · ${successes} 源` : records.length ? `${records.length} 条 · 未自动核验` : failures ? "数据源失败" : "无可核验数据";
+        const structured = JSON.stringify(output || {}, null, 2);
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 14000))}${structured.length > 14000 ? "\n…（显示已截断，模型仍收到完整结构）" : ""}</pre>`;
+        if (vp) step.classList.add("is-open");
+        const evidenceNote = [
+          `${command} 本次免密公开数据请求结果：`,
+          "- records 只包含提供方实际返回或官方入口注册表中的字段；不得补猜缺失值。",
+          "- source_statuses[].status=success 只表示本次端点响应可解析；empty/failed/skipped 必须原样说明。",
+          "- retrieved_at 是 IDE 收到结果的时间；data_as_of、observed_at、event_time、updated_at 和 rate_date 各有独立语义，不得混称实时。",
+          "- 多来源报价或记录不静默平均；推算必须单独写方法、输入和不确定性，不能伪装成来源观测。",
+          command === "track_shipment" ? "- 本工具没有免密机器物流轨迹。official_tracking_url 只是官方人工核验入口；tracking_events 为空时绝不能声称包裹状态、位置或 ETA。" : "",
+        ].filter(Boolean).join("\n");
+        return { type: call.type, path: call.path || "", content: `${evidenceNote}\n\n结构化数据：\n${structured}` };
+      } catch (error) {
+        const message = String(error?.message || error).slice(0, 360);
+        res.className = "atc-result atc-result--err"; res.textContent = "查询失败";
+        return { type: call.type, path: call.path || "", content: `[失败] ${command}: ${message}` };
       }
 
     } else if (call.type === "web") {

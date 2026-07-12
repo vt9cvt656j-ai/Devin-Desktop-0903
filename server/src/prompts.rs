@@ -68,7 +68,15 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
         // Plain chat should not silently grow into an autonomous tool-using agent.
         "chat" => matches!(
             name,
-            "web_search" | "web_fetch" | "knowledge_search" | "local_discovery" | "ask_user"
+            "web_search"
+                | "web_fetch"
+                | "knowledge_search"
+                | "local_discovery"
+                | "live_environment"
+                | "live_markets"
+                | "live_flights"
+                | "track_shipment"
+                | "ask_user"
         ),
         "plan" => matches!(
             name,
@@ -85,6 +93,10 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "web_search"
                 | "web_fetch"
                 | "local_discovery"
+                | "live_environment"
+                | "live_markets"
+                | "live_flights"
+                | "track_shipment"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -109,6 +121,10 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "web_search"
                 | "web_fetch"
                 | "local_discovery"
+                | "live_environment"
+                | "live_markets"
+                | "live_flights"
+                | "track_shipment"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -1304,6 +1320,12 @@ mod tests {
         assert!(policy.contains("opening_hours"));
         assert!(policy.contains("缺失的 `rating`、`price`、`open_now` 必须保持未知"));
         assert!(policy.contains("不得把全部结构化地理数据统称为“实时数据”"));
+        assert!(policy.contains("live_environment"));
+        assert!(policy.contains("Frankfurter 是带 `rate_date` 的每日参考汇率"));
+        assert!(policy.contains("Coinbase/Kraken 是各自交易所报价"));
+        assert!(policy.contains("推算必须单独标成 derived"));
+        assert!(policy.contains("tracking_events` 为空"));
+        assert!(policy.contains("单号属于敏感标识"));
         assert!(policy.contains("缩放前原图的嵌入式 EXIF GPS"));
         assert!(policy.contains("只能称“图片元数据报告的位置”"));
         assert!(policy.contains("没有 EXIF GPS 时不要提前停止"));
@@ -1382,6 +1404,81 @@ mod tests {
         assert!(looks_like_research_task(
             "plan a travel itinerary near Kyoto"
         ));
+    }
+
+    #[test]
+    fn keyless_public_data_tools_have_real_schemas_and_mode_access() {
+        let tools: serde_json::Value = serde_json::from_str(&read_tools_file().unwrap()).unwrap();
+        let tools = tools.as_array().unwrap();
+        for (name, expected_source) in [
+            ("live_environment", "USGS"),
+            ("live_markets", "Coinbase"),
+            ("live_flights", "OpenSky"),
+            ("track_shipment", "正式机器 API 都需要账号凭据"),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(|value| value.as_str())
+                        == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} schema"));
+            let description = tool
+                .pointer("/function/description")
+                .and_then(|value| value.as_str())
+                .unwrap();
+            assert!(
+                description.contains(expected_source),
+                "{name} must document {expected_source}"
+            );
+            assert_eq!(requested_static_tools("chat", name), [name]);
+            assert_eq!(requested_static_tools("plan", name), [name]);
+            assert_eq!(requested_static_tools("reviewer", name), [name]);
+        }
+        let environment = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|value| value.as_str())
+                    == Some("live_environment")
+            })
+            .unwrap();
+        assert_eq!(
+            environment
+                .pointer("/function/parameters/properties/kind/enum")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            environment
+                .pointer("/function/parameters/anyOf/0/required")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2),
+            "coordinate-bound environment kinds must require latitude and longitude"
+        );
+        let shipment = tools
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|value| value.as_str())
+                    == Some("track_shipment")
+            })
+            .unwrap();
+        assert_eq!(
+            shipment
+                .pointer("/function/parameters/required/0")
+                .and_then(|value| value.as_str()),
+            Some("tracking_number")
+        );
+        assert_eq!(
+            shipment
+                .pointer("/function/parameters/properties/tracking_number/pattern")
+                .and_then(|value| value.as_str()),
+            Some("^[A-Za-z0-9_-]+$")
+        );
     }
 
     #[test]

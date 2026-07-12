@@ -1455,6 +1455,58 @@ test("local discovery is a registered read-only model tool", () => {
   assert.match(SRC, /retrieved_at 只是本次取回时间，不是 POI 更新时间/);
 });
 
+test("keyless public data tools are registered, normalized, and read-only", () => {
+  for (const name of ["live_environment", "live_markets", "live_flights", "track_shipment"]) {
+    assert.match(SRC, new RegExp(`name: "${name}"`));
+    assert.match(SRC, new RegExp(`backend\\.invoke\\("${name}"|command = "${name}"`));
+  }
+  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*trackshipment/);
+  assert.match(SRC, /Coinbase 与 Kraken/);
+  assert.match(SRC, /不抓网页、不绕验证码、不编造轨迹/);
+  assert.match(SRC, /tracking_events 为空时绝不能声称包裹状态/);
+  assert.match(SRC, /anyOf: \[\{ properties: \{ kind: \{ enum: \["weather", "air_quality", "marine"\]/,
+    "environment schema must require coordinates for coordinate-bound kinds");
+  assert.match(SRC, /pattern: "\^\[A-Za-z0-9_-\]\+\$"/,
+    "shipment schema must match the native ASCII tracking-number contract");
+  const schemaIssue = load("_schemaValueIssue");
+  const trackingSchema = { type: "string", minLength: 6, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$" };
+  assert.equal(schemaIssue("ABC_123", trackingSchema), "");
+  assert.match(schemaIssue("含中文单号A", trackingSchema), /格式无效/);
+  assert.match(schemaIssue("A".repeat(65), trackingSchema), /长度不能大于 64/);
+  assert.match(SRC, /const partial = successes > 0 && failures > 0/);
+  assert.doesNotMatch(SRC, /_dupGuardable = new Set\([^\n]*liveenvironment/,
+    "fresh live-data calls must not reuse a previous turn's result");
+  assert.match(SRC, /_seenLive[\s\S]{0,700}_dupLive/,
+    "identical live-data calls in one batch must be collapsed before parallel dispatch");
+
+  const mapCall = load("_mapToolCall", {
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "track_shipment"]),
+    _canonicalToolName: () => "",
+    _finiteNumberArg: load("_finiteNumberArg"),
+  });
+  assert.deepEqual(mapCall("live_environment", {
+    kind: "earthquakes", latitude: 31.2, longitude: 121.5,
+    radius_km: 500, minimum_magnitude: 4.5, limit: 10,
+  }, new Map()), {
+    type: "liveenvironment", path: "earthquakes", kind: "earthquakes",
+    latitude: 31.2, longitude: 121.5, radiusKm: 500, window: "",
+    minimumMagnitude: 4.5, category: "", limit: 10,
+  });
+  assert.deepEqual(mapCall("live_markets", {
+    kind: "crypto", base: "btc", quote: "usd",
+  }, new Map()), {
+    type: "livemarkets", path: "BTC/USD", kind: "crypto", base: "btc", quote: "usd",
+  });
+  const shipment = mapCall("track_shipment", {
+    tracking_number: "1Z999AA10123456784", carrier: "ups",
+  }, new Map());
+  assert.equal(shipment.type, "trackshipment");
+  assert.equal(shipment.path, "官方核验", "tool cards must never persist model-supplied carrier text as their path");
+  assert.equal(shipment.trackingNumber, "1Z999AA10123456784");
+});
+
 test("current location requests use the native permission flow without double prompting", async () => {
   const normalize = load("_normalizeCurrentLocationResult");
   assert.equal(normalize({ status: "success", latitude: null, longitude: null }).status, "error");

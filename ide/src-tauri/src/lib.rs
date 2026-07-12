@@ -24,6 +24,7 @@ mod mcp;
 mod net;
 mod process_util;
 mod proxy;
+mod public_data;
 mod qr;
 mod sysctl;
 mod tasks;
@@ -328,6 +329,10 @@ pub fn run() {
             knowledge::sourcegraph_search,
             knowledge::deep_search,
             local_discovery::local_discovery,
+            public_data::live_environment,
+            public_data::live_markets,
+            public_data::live_flights,
+            public_data::track_shipment,
             game::game_scaffold,
             web_scaffold::web_scaffold,
             game_assets::generate_3d,

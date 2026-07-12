@@ -187,6 +187,88 @@
   {
     "type": "function",
     "function": {
+      "name": "live_environment",
+      "description": "查询不需要 API 密钥的结构化环境与灾害公开源：Open-Meteo 天气/空气质量/海洋、USGS 地震、NASA EONET 自然灾害。每次返回 records、逐来源 success/empty/failed、data_as_of、retrieved_at 和限制。Open-Meteo 是带时间的网格模型估算，不得称现场传感器实测；空结果也不等于没有风险。weather/air_quality/marine 必须提供用户明确给出或授权取得的坐标，禁止从 IP/时区猜位置。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] },
+          "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+          "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+          "radius_km": { "type": "integer", "minimum": 1, "maximum": 20000, "description": "earthquakes 可选半径" },
+          "window": { "type": "string", "enum": ["hour", "day", "week", "month"], "description": "earthquakes 时间窗" },
+          "minimum_magnitude": { "type": "number", "minimum": -1, "maximum": 10 },
+          "category": { "type": "string", "description": "NASA EONET 类别 id，如 wildfires" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+        },
+        "required": ["kind"],
+        "anyOf": [
+          {
+            "properties": {
+              "kind": { "enum": ["weather", "air_quality", "marine"] }
+            },
+            "required": ["latitude", "longitude"]
+          },
+          {
+            "properties": {
+              "kind": { "enum": ["earthquakes", "natural_hazards"] }
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "live_markets",
+      "description": "查询无需 API 密钥的结构化市场公开源。exchange_rate 使用 Frankfurter/央行每日参考汇率，不是盘中可成交价；crypto 并行保留 Coinbase 与 Kraken 各自交易所报价，来源失败和价格冲突逐项返回，不静默平均。retrieved_at 只是 IDE 收到数据的时间；提供方没有报价时间戳时必须明确未知。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["exchange_rate", "crypto"] },
+          "base": { "type": "string", "description": "基础货币或资产，如 USD/BTC" },
+          "quote": { "type": "string", "description": "计价货币，如 CNY/USD" }
+        },
+        "required": ["kind", "base", "quote"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "live_flights",
+      "description": "查询无需 API 密钥的 OpenSky Network 匿名飞机状态向量。返回 feed time、position time、last contact、位置、高度和速度；匿名端点限流且覆盖依赖接收站，不能冒充完整航班表、航线、售票状态或安全结论。必须使用用户明确给出或授权取得的中心坐标。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+          "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+          "radius_km": { "type": "integer", "minimum": 1, "maximum": 500 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+        },
+        "required": ["latitude", "longitude"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "track_shipment",
+      "description": "免密快递真实性入口。17TRACK、AfterShip、快递100、DHL、FedEx、UPS、USPS 及中国主要承运商的正式机器 API 都需要账号凭据；本工具仅识别少数不歧义号码或使用用户提供的 carrier，返回承运商官方人工查询页并掩码单号。它不抓网页、不绕验证码、不把搜索结果冒充数据库，也不编造轨迹、位置、状态或 ETA。tracking_events 为空时必须直接说明本系统未核验物流状态。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tracking_number": { "type": "string", "minLength": 6, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$", "description": "用户主动提供的单号；结果只回显掩码" },
+          "carrier": { "type": "string", "description": "ups/usps/fedex/dhl/sf/china_post/yto/zto/sto/yunda/jd；号码歧义时必须提供" }
+        },
+        "required": ["tracking_number"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "web_fetch",
       "description": "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。只支持 http/https 公网地址（本地/内网会被拒绝）。",
       "parameters": {

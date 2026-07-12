@@ -1462,6 +1462,15 @@ fn gw_cache_key(body: &serde_json::Value) -> String {
     format!("gwc:{:016x}{:016x}", h1.finish(), h2.finish())
 }
 
+fn response_cache_safe(bytes: &[u8]) -> bool {
+    // Tool-call arguments contain the user's full tracking number. The native tool
+    // masks its result, but caching the model response would retain the original
+    // argument in Redis. A false positive only costs one cache miss.
+    !bytes
+        .windows(b"track_shipment".len())
+        .any(|window| window == b"track_shipment")
+}
+
 /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
 /// key (Bearer). Resolves `model` to the connection that exposes it, forwards
 /// the request (streaming passthrough), and bills the key owner's credits.
@@ -2706,7 +2715,7 @@ pub async fn chat_completions(
             .await
             .ok()
             .flatten();
-        if let Some(bytes) = hit {
+        if let Some(bytes) = hit.filter(|bytes| response_cache_safe(bytes)) {
             bill(
                 &state,
                 uid,
@@ -3089,7 +3098,7 @@ pub async fn chat_completions(
             );
             let tokens = extract_bill_tokens(Some(&usage), &req_model, is_estimated);
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
-            if complete && !acc.is_empty() && acc.len() < 1_000_000 {
+            if complete && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
@@ -3135,7 +3144,7 @@ pub async fn chat_completions(
         fix_tool_call_arguments(&mut data);
         // Cache the successful response for identical future requests.
         if let Ok(bytes) = serde_json::to_vec(&data) {
-            if !bytes.is_empty() && bytes.len() < 1_000_000 {
+            if !bytes.is_empty() && bytes.len() < 1_000_000 && response_cache_safe(&bytes) {
                 let mut rconn = state.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey)
@@ -3713,10 +3722,20 @@ mod billing_tests {
     use super::{
         anthropic_thinking, anthropic_to_oai, compute_cost, is_image_gen_model,
         model_price_override, oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost,
-        tool_argument_rules, validate_openai_sse_eof, validate_openai_sse_with_rules, AnthSse,
-        OpenAiSseValidator,
+        response_cache_safe, tool_argument_rules, validate_openai_sse_eof,
+        validate_openai_sse_with_rules, AnthSse, OpenAiSseValidator,
     };
     use serde_json::json;
+
+    #[test]
+    fn shipment_tool_calls_are_never_response_cached() {
+        assert!(response_cache_safe(
+            br#"data: {\"content\":\"ordinary answer\"}"#
+        ));
+        assert!(!response_cache_safe(
+            br#"data: {\"name\":\"track_shipment\",\"arguments\":\"{\\\"tracking_number\\\":\\\"1Z999AA10123456784\\\"}\"}"#
+        ));
+    }
 
     // per_call mode bills the flat fee, ignoring token usage entirely.
     #[test]
