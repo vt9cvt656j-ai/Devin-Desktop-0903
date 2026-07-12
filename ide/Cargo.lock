@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "devin-ide"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "bcrypt",
  "futures-util",
@@ -986,6 +986,7 @@ dependencies = [
  "portable-pty",
  "rand 0.10.1",
  "redis",
+ "regex",
  "reqwest 0.12.28",
  "rqrr",
  "serde",

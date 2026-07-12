@@ -1142,6 +1142,39 @@ mod tests {
     }
 
     #[test]
+    fn write_file_schema_requires_non_empty_path_and_content() {
+        let text = read_tools_file().expect("tools.json should be readable");
+        let tools: serde_json::Value =
+            serde_json::from_str(&text).expect("tools.json should be valid JSON");
+        let write = tools
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|tool| {
+                    tool.pointer("/function/name").and_then(|v| v.as_str()) == Some("write_file")
+                })
+            })
+            .expect("write_file schema should exist");
+        let required = write
+            .pointer("/function/parameters/required")
+            .and_then(|value| value.as_array())
+            .expect("write_file should declare required arguments");
+        assert!(required.iter().any(|value| value == "path"));
+        assert!(required.iter().any(|value| value == "content"));
+        assert_eq!(
+            write.pointer("/function/parameters/properties/path/minLength"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            write.pointer("/function/parameters/properties/content/minLength"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            write.pointer("/function/parameters/additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[test]
     fn rejects_path_traversal_in_prompt_name() {
         let malicious = read_prompt("../../../etc/passwd");
         assert!(malicious.is_err(), "should reject path traversal");

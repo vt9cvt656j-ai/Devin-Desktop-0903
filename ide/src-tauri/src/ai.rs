@@ -27,6 +27,7 @@ const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
 const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_READ_POLL: Duration = Duration::from_secs(2);
+const INCOMPLETE_SSE_STREAM_ERROR: &str = "AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断，已拒绝本轮结果，请重试。";
 
 /// Shared HTTP client. The agentic loop fires many sequential requests; a single
 /// pooled client reuses TCP+TLS connections (keep-alive) instead of doing a fresh
@@ -466,6 +467,13 @@ fn delta_has_real_progress(delta: &serde_json::Value) -> bool {
         })
 }
 
+fn streamed_tool_call_index(call: &serde_json::Value) -> Result<u32, String> {
+    let raw = call["index"]
+        .as_u64()
+        .ok_or_else(|| "streamed tool call is missing its numeric index".to_string())?;
+    u32::try_from(raw).map_err(|_| "streamed tool call index is out of range".to_string())
+}
+
 #[cfg(test)]
 mod ide_header_tests {
     use super::*;
@@ -516,6 +524,7 @@ mod ide_header_tests {
 mod stream_timeout_tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::{Read, Write};
 
     fn config(reasoning_effort: Option<&str>, thinking_budget: Option<u32>) -> AiConfig {
         AiConfig {
@@ -536,6 +545,48 @@ mod stream_timeout_tests {
 
     fn timeouts(reasoning_effort: Option<&str>, thinking_budget: Option<u32>) -> StreamTimeouts {
         StreamTimeouts::for_config_with_env(&config(reasoning_effort, thinking_budget), |_| None)
+    }
+
+    async fn run_raw_sse_body(body: Vec<u8>) -> (Result<(), String>, Vec<serde_json::Value>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            socket.flush().unwrap();
+        });
+
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = events.clone();
+        let channel: Channel<AiEvent> = Channel::new(move |body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<serde_json::Value>().unwrap());
+            Ok(())
+        });
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+        let result = ai_chat_inner(
+            cfg,
+            vec![serde_json::json!({"role": "user", "content": "write it"})],
+            Some(vec![]),
+            channel,
+        )
+        .await;
+        server.join().unwrap();
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
     }
 
     #[test]
@@ -656,6 +707,16 @@ mod stream_timeout_tests {
     }
 
     #[test]
+    fn streamed_tool_calls_require_an_explicit_index() {
+        assert_eq!(
+            streamed_tool_call_index(&serde_json::json!({"index": 3})).unwrap(),
+            3
+        );
+        assert!(streamed_tool_call_index(&serde_json::json!({})).is_err());
+        assert!(streamed_tool_call_index(&serde_json::json!({"index": "0"})).is_err());
+    }
+
+    #[test]
     fn timeout_errors_report_the_configured_duration() {
         let timeouts = StreamTimeouts {
             response_headers: Duration::from_secs(73),
@@ -700,6 +761,123 @@ mod stream_timeout_tests {
             "AI request timed out waiting for response headers after 0.02 seconds"
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn clean_eof_without_done_rejects_partial_tool_arguments() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let partial_args = r#"{"path":"src/main.js","content":"partial"#;
+        let data = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_partial",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": partial_args,
+                        }
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {data}\n\n");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        });
+
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = events.clone();
+        let channel: Channel<AiEvent> = Channel::new(move |body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<serde_json::Value>().unwrap());
+            Ok(())
+        });
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+
+        let error = ai_chat_inner(
+            cfg,
+            vec![serde_json::json!({"role": "user", "content": "write it"})],
+            Some(vec![]),
+            channel,
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error, INCOMPLETE_SSE_STREAM_ERROR);
+        let events = events.lock().unwrap();
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|event| event["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, ["toolCall", "error"]);
+        assert_eq!(events[0]["arguments"], partial_args);
+        assert_eq!(events[1]["message"], INCOMPLETE_SSE_STREAM_ERROR);
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_before_done_rejects_complete_tool_argument_prefix() {
+        let arguments = r#"{"path":"src/main.js","content":"prefix"}"#;
+        let first = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_prefix",
+                        "function": {"name": "write_file", "arguments": arguments}
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {first}\n\ndata: {{malformed\n\ndata: [DONE]\n\n").into_bytes();
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("malformed SSE JSON"));
+        let kinds = events
+            .iter()
+            .filter_map(|event| event["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["toolCall", "error"]);
+        assert_eq!(events[0]["arguments"], arguments);
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_frame_before_done_rejects_the_stream() {
+        let mut body = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        body.push(0xff);
+        body.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("invalid UTF-8 SSE data"));
+        let kinds = events
+            .iter()
+            .filter_map(|event| event["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["error"]);
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
     }
 }
 
@@ -883,7 +1061,16 @@ async fn ai_chat_inner(
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
             }
-            Ok(None) => break, // stream ended normally
+            Ok(None) => {
+                // OpenAI-compatible SSE is complete only after the explicit [DONE]
+                // sentinel. A clean TCP EOF can still be a proxy/upstream truncation;
+                // treating it as Done would authorize partially streamed tool arguments.
+                let message = INCOMPLETE_SSE_STREAM_ERROR.to_string();
+                let _ = on_event.send(AiEvent::Error {
+                    message: message.clone(),
+                });
+                return Err(message);
+            }
             Err(_elapsed) => {
                 if progress.remaining(Instant::now()).is_none() {
                     let _ = on_event.send(AiEvent::Error {
@@ -900,8 +1087,16 @@ async fn ai_chat_inner(
         // Server-sent events are newline-delimited `data: {...}` lines.
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim();
+            let line = match std::str::from_utf8(&line_bytes) {
+                Ok(line) => line.trim(),
+                Err(error) => {
+                    let message = format!("AI stream contains invalid UTF-8 SSE data: {error}");
+                    let _ = on_event.send(AiEvent::Error {
+                        message: message.clone(),
+                    });
+                    return Err(message);
+                }
+            };
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
@@ -913,86 +1108,101 @@ async fn ai_chat_inner(
             if data.is_empty() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                // Usage normally rides the FINAL chunk (choices may be empty there).
-                // Cached-prompt tokens are reported differently per provider — take
-                // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
-                // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
-                // style `cache_read_input_tokens`.
-                if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
-                    let completion = usage["completion_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
-                        .unwrap_or(0);
-                    let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
-                    let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                    let cached = usage["prompt_tokens_details"]["cached_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
-                        .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
-                        .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
-                        .or(cache_read)
-                        .unwrap_or(0);
-                    let prompt_raw = usage["prompt_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
-                        .unwrap_or(0);
-                    // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
-                    // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
-                    // so add them — otherwise `cached / prompt` reads as >100%.
-                    let prompt = if cache_read.is_some() {
-                        prompt_raw + cached + cache_creation
-                    } else {
-                        prompt_raw
-                    };
-                    if prompt > 0 || completion > 0 {
-                        let _ = on_event.send(AiEvent::Usage {
-                            prompt_tokens: prompt as u32,
-                            completion_tokens: completion as u32,
-                            cached_tokens: cached as u32,
-                        });
-                    }
+            let v = match serde_json::from_str::<serde_json::Value>(data) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = format!("AI stream contains malformed SSE JSON: {error}");
+                    let _ = on_event.send(AiEvent::Error {
+                        message: message.clone(),
+                    });
+                    return Err(message);
                 }
-                let delta = &v["choices"][0]["delta"];
-                // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
-                if let Some(rt) = delta["reasoning_content"]
-                    .as_str()
-                    .or_else(|| delta["reasoning"].as_str())
-                {
-                    if !rt.is_empty() {
-                        let _ = on_event.send(AiEvent::Reasoning {
-                            delta: rt.to_string(),
-                        });
-                    }
+            };
+            // Usage normally rides the FINAL chunk (choices may be empty there).
+            // Cached-prompt tokens are reported differently per provider — take
+            // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
+            // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
+            // style `cache_read_input_tokens`.
+            if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+                let completion = usage["completion_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
+                    .unwrap_or(0);
+                let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
+                let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
+                    .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
+                    .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
+                    .or(cache_read)
+                    .unwrap_or(0);
+                let prompt_raw = usage["prompt_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
+                    .unwrap_or(0);
+                // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
+                // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
+                // so add them — otherwise `cached / prompt` reads as >100%.
+                let prompt = if cache_read.is_some() {
+                    prompt_raw + cached + cache_creation
+                } else {
+                    prompt_raw
+                };
+                if prompt > 0 || completion > 0 {
+                    let _ = on_event.send(AiEvent::Usage {
+                        prompt_tokens: prompt as u32,
+                        completion_tokens: completion as u32,
+                        cached_tokens: cached as u32,
+                    });
                 }
-                if let Some(text) = delta["content"].as_str() {
-                    if !text.is_empty() {
-                        let _ = on_event.send(AiEvent::Token {
-                            delta: text.to_string(),
-                        });
-                    }
-                }
-                if let Some(tcs) = delta["tool_calls"].as_array() {
-                    for tc in tcs {
-                        let index = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let id = tc["id"].as_str().unwrap_or("").to_string();
-                        let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                        let args = tc["function"]["arguments"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                            let _ = on_event.send(AiEvent::ToolCall {
-                                index,
-                                id,
-                                name,
-                                arguments: args,
-                            });
-                        }
-                    }
-                }
-                progress.record_delta(delta, Instant::now());
             }
+            let delta = &v["choices"][0]["delta"];
+            // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
+            if let Some(rt) = delta["reasoning_content"]
+                .as_str()
+                .or_else(|| delta["reasoning"].as_str())
+            {
+                if !rt.is_empty() {
+                    let _ = on_event.send(AiEvent::Reasoning {
+                        delta: rt.to_string(),
+                    });
+                }
+            }
+            if let Some(text) = delta["content"].as_str() {
+                if !text.is_empty() {
+                    let _ = on_event.send(AiEvent::Token {
+                        delta: text.to_string(),
+                    });
+                }
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    let index = match streamed_tool_call_index(tc) {
+                        Ok(index) => index,
+                        Err(message) => {
+                            let _ = on_event.send(AiEvent::Error { message });
+                            let _ = on_event.send(AiEvent::Done);
+                            return Ok(());
+                        }
+                    };
+                    let id = tc["id"].as_str().unwrap_or("").to_string();
+                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                    let args = tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                        let _ = on_event.send(AiEvent::ToolCall {
+                            index,
+                            id,
+                            name,
+                            arguments: args,
+                        });
+                    }
+                }
+            }
+            progress.record_delta(delta, Instant::now());
         }
 
         // Continuous heartbeat chunks may prevent the read timeout from firing, so
@@ -1005,9 +1215,6 @@ async fn ai_chat_inner(
             return Ok(());
         }
     }
-
-    let _ = on_event.send(AiEvent::Done);
-    Ok(())
 }
 
 /// SSRF policy for this single-user, on-device dev IDE. The user explicitly wants

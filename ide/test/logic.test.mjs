@@ -12,9 +12,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { ConversationMemory } from "../src/conversation-memory.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
+const REMOTE_AGENT = readFileSync(join(HERE, "../remote-agent/michael-remote-agent.py"), "utf8");
 
 // ---- source scanner (skip strings / templates / regex / comments) --------------------
 function skipString(s, i, q) { i++; for (; i < s.length; i++) { if (s[i] === "\\") { i++; continue; } if (s[i] === q) return i; } return i; }
@@ -66,6 +68,16 @@ function load(name, deps = {}) {
   const fn = new Function(...keys, `${extractFn(name)}\n;return ${name};`);
   return fn(...keys.map((k) => deps[k]));
 }
+
+const TO_POSIX = load("_toPosix");
+const NORMALIZE_PATH = load("_normalizeFsPath", { _toPosix: TO_POSIX });
+const PATH_IDENTITY = load("_pathIdentity", {
+  _normalizeFsPath: NORMALIZE_PATH,
+  _remote: { active: false, platform: "" },
+  navigator: { platform: "Linux", userAgent: "" },
+});
+const COHERENT_PATH = (path) => NORMALIZE_PATH(path);
+const NORM_REL = load("_normRel", { _normalizeFsPath: NORMALIZE_PATH, _pathIdentity: PATH_IDENTITY });
 
 // ---- tests ---------------------------------------------------------------------------
 test("_isExpectedCancellation only accepts Monaco's exact cancellation shape", () => {
@@ -136,7 +148,7 @@ test("AI permission startup preserves existing choices and never migrates by ove
 });
 
 test("_toPosix normalizes Windows backslashes, no-op elsewhere", () => {
-  const f = load("_toPosix");
+  const f = TO_POSIX;
   assert.equal(f("C:\\Users\\me\\proj"), "C:/Users/me/proj");
   assert.equal(f("/Users/me/proj"), "/Users/me/proj"); // mac untouched
   assert.equal(f("a\\b/c"), "a/b/c");
@@ -144,22 +156,124 @@ test("_toPosix normalizes Windows backslashes, no-op elsewhere", () => {
   assert.equal(f(42), 42);
 });
 
+test("filesystem paths collapse dot segments and use platform-correct identity", () => {
+  assert.equal(NORMALIZE_PATH("C:\\Repo\\src\\..\\a.js"), "C:/Repo/a.js");
+  assert.equal(NORMALIZE_PATH("/repo/src/./lib/../a.js"), "/repo/src/a.js");
+  assert.equal(NORMALIZE_PATH("src/../../outside.js"), "../outside.js");
+  assert.equal(NORMALIZE_PATH("/repo/name "), "/repo/name ", "real trailing whitespace in a filename must be preserved");
+
+  const windowsIdentity = load("_pathIdentity", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _remote: { active: false, platform: "" },
+    navigator: { platform: "Win32", userAgent: "Windows" },
+  });
+  assert.equal(windowsIdentity("C:/Repo/A.js"), windowsIdentity("c:\\repo\\a.js"));
+
+  const remoteLinuxIdentity = load("_pathIdentity", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _remote: { active: true, platform: "Linux-6.8" },
+    navigator: { platform: "MacIntel", userAgent: "Mac OS" },
+  });
+  assert.notEqual(remoteLinuxIdentity("/srv/App.js"), remoteLinuxIdentity("/srv/app.js"));
+});
+
+test("directory containment follows platform path identity", () => {
+  const windowsIdentity = load("_pathIdentity", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _remote: { active: false, platform: "" },
+    navigator: { platform: "Win32", userAgent: "Windows" },
+  });
+  const isUnder = load("_pathIsAtOrUnder", { _pathIdentity: windowsIdentity });
+  assert.equal(isUnder("C:\\Repo\\Src\\a.js", "c:/repo/src"), true);
+  assert.equal(isUnder("C:/Repo/src-other/a.js", "c:/repo/src"), false);
+  assert.equal(isUnder("/repo/src/a.js", "/repo/src/a.js"), true);
+});
+
+test("coherent paths reuse the existing Windows editor key despite slash and case differences", () => {
+  const identity = load("_pathIdentity", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _remote: { active: false, platform: "" },
+    navigator: { platform: "Win32", userAgent: "Windows" },
+  });
+  const coherent = load("_coherentFilePath", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: identity,
+    openFiles: new Map([["C:/Repo/src/A.js", {}]]),
+    projectModels: new Set(),
+  });
+  assert.equal(coherent("c:\\repo\\src\\.\\a.js"), "C:/Repo/src/A.js");
+});
+
 test("_resolveRel resolves relatives to the workspace + passes absolutes through (incl. Windows)", () => {
-  const f = load("_resolveRel", { _allRoots: () => ["/Users/me/proj"] });
+  const deps = { _normalizeFsPath: NORMALIZE_PATH, _coherentFilePath: COHERENT_PATH };
+  const f = load("_resolveRel", { ...deps, _allRoots: () => ["/Users/me/proj"] });
   assert.equal(f("src/main.js"), "/Users/me/proj/src/main.js"); // plain relative → prepend root
   assert.equal(f("proj/src/x"), "/Users/me/proj/src/x");        // redundant root-name stripped
   assert.equal(f("/etc/hosts"), "/etc/hosts");                  // unix absolute → as-is
-  assert.equal(f("C:\\Windows\\x"), "C:\\Windows\\x");          // windows absolute (backslash) → as-is
+  assert.equal(f("C:\\Windows\\x"), "C:/Windows/x");            // Windows keys use one slash form
   assert.equal(f("C:/Windows/x"), "C:/Windows/x");              // windows absolute (fwd slash) → as-is
   assert.equal(f(""), "");
   // Windows workspace (posix-normalized root) resolves correctly:
-  const fw = load("_resolveRel", { _allRoots: () => ["C:/Users/me/proj"] });
+  const fw = load("_resolveRel", { ...deps, _allRoots: () => ["C:/Users/me/proj"] });
   assert.equal(fw("src/x.js"), "C:/Users/me/proj/src/x.js");
 });
 
 test("_resolveRel with no open root leaves the path unchanged", () => {
-  const f = load("_resolveRel", { _allRoots: () => [] });
+  const f = load("_resolveRel", { _normalizeFsPath: NORMALIZE_PATH, _coherentFilePath: COHERENT_PATH, _allRoots: () => [] });
   assert.equal(f("src/x.js"), "src/x.js");
+});
+
+test("agent path resolution keeps the run root ahead of the active workspace", () => {
+  const allRoots = load("_allRoots", {
+    rootPath: "/work/active",
+    workspaceRoots: ["/work/active", "/work/other", "/work/run"],
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+  });
+  assert.deepEqual(allRoots("/work/run/"), ["/work/run", "/work/active", "/work/other"]);
+
+  const resolve = load("_resolveRel", { _allRoots: allRoots, _normalizeFsPath: NORMALIZE_PATH, _coherentFilePath: COHERENT_PATH });
+  assert.equal(resolve("server/db.js", "/work/run"), "/work/run/server/db.js");
+  assert.equal(resolve("active/src/main.js", "/work/run"), "/work/active/src/main.js");
+  assert.match(extractFn("_interleavedDiagnostics"), /_resolveExisting\(rel, root\)/);
+  assert.match(SRC, /_interleavedDiagnostics\(_successfulEdits, root\)/);
+});
+
+test("multi-root resolution never falls through to process cwd or guesses an ambiguous basename", async () => {
+  const roots = ["/work/a", "/work/b"];
+  const candidates = load("_relCandidates", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _coherentFilePath: COHERENT_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _allRoots: () => roots,
+  });
+  assert.deepEqual(candidates("src/x.js"), ["/work/a/src/x.js", "/work/b/src/x.js"]);
+  assert.deepEqual(candidates("b/src/x.js"), ["/work/b/src/x.js"]);
+  assert.deepEqual(candidates("/missing/absolute.js"), ["/missing/absolute.js"]);
+
+  const fuzzy = load("_fuzzyFileCandidates", {
+    _allRoots: () => roots,
+    _agentFindFiles: async () => ({ files: ["server/db.js"] }),
+    _coherentFilePath: COHERENT_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _normalizeFsPath: NORMALIZE_PATH,
+  });
+  const matches = await fuzzy("db.js", "/work/a");
+  assert.deepEqual(matches.map((match) => match.path), ["/work/a/server/db.js", "/work/b/server/db.js"]);
+});
+
+test("run path bindings reuse the exact file recovered by a fuzzy read", () => {
+  const norm = NORM_REL;
+  const bind = load("_bindRunFilePath", { _normRel: norm, _coherentFilePath: COHERENT_PATH });
+  const bound = load("_boundRunFilePath", { _normRel: norm });
+  const run = {};
+  const actual = "/repo/packages/api/server/db.js";
+
+  bind(run, "/repo", "server/db.js", actual);
+  assert.equal(bound(run, "/repo", "server/db.js"), actual);
+  assert.equal(bound(run, "/repo", "./server/db.js"), actual);
+  assert.equal(bound(run, "/repo", actual), actual);
+  assert.equal(bound(run, "/repo", "server/other.js"), "");
 });
 
 test("_lev computes edit distance", () => {
@@ -201,6 +315,306 @@ test("_safeJsonLoose repairs malformed \\u escapes (the 'unexpected end of hex e
   assert.equal(f('{"content":"ok \\u2713"}').content, "ok ✓");
   // an already-escaped \\u (literal backslash) must be left alone:
   assert.equal(f('{"content":"C:\\\\users"}').content, "C:\\users");
+});
+
+test("_fileToolArgIssue rejects incomplete writes but permits complete writes and deletions", () => {
+  const issue = load("_fileToolArgIssue", {
+    _canonicalToolName: (name) => name,
+    _normalizeArgKeys: load("_normalizeArgKeys"),
+    _safeJsonLoose: load("_safeJsonLoose"),
+  });
+
+  assert.match(issue("write_file", "{}"), /缺少 path/);
+  assert.match(issue("write_file", '{"path":"src/a.js"}'), /缺少 content/);
+  assert.match(issue("write_file", '{"path":"src/a.js","content":"   "}'), /content 为空/);
+  assert.match(issue("write_file", '{"path":"src/a.js","content":"cut'), /参数流被截断/);
+  assert.equal(issue("write_file", '{"path":"src/a.js","content":"export const ok = true;\\n"}'), "");
+  assert.equal(issue("edit_file", '{"path":"src/a.js","old_string":"remove me","new_string":""}'), "");
+});
+
+test("mutating native and text tool calls fail closed on any non-strict or truncated arguments", () => {
+  const canonical = (name) => name;
+  const normalizeKeys = load("_normalizeArgKeys");
+  const safeJson = load("_safeJsonLoose");
+  const fileIssue = load("_fileToolArgIssue", {
+    _canonicalToolName: canonical,
+    _normalizeArgKeys: normalizeKeys,
+    _safeJsonLoose: safeJson,
+  });
+  const strictNames = new Set([
+    "write_file", "edit_file", "multi_edit", "delete_path", "move_path",
+    "copy_path", "create_dir", "format_file", "run_cmd",
+  ]);
+  const mutationIssue = load("_mutatingToolArgIssue", {
+    _canonicalToolName: canonical,
+    _STRICT_MUTATING_TOOL_NAMES: strictNames,
+    _fileToolArgIssue: fileIssue,
+  });
+  const schemaFrom = load("_toolSchemaFromRegistry", { _canonicalToolName: canonical });
+  const schemaValueIssue = load("_schemaValueIssue");
+  const toolArgIssue = load("_toolArgIssue", {
+    _canonicalToolName: canonical,
+    _mutatingToolArgIssue: mutationIssue,
+    _normalizeArgKeys: normalizeKeys,
+    _toolSchemaFromRegistry: schemaFrom,
+    _schemaValueIssue: schemaValueIssue,
+  });
+  const assemble = load("_assembleStreamToolCalls", {
+    _toolArgIssue: toolArgIssue,
+    _safeJsonLoose: safeJson,
+  });
+
+  assert.equal(assemble(new Map([[0, { name: "write_file", args: '{"path":"a.js","content":"PARTIAL"' }]])).length, 0);
+  assert.equal(assemble(new Map([[0, { name: "run_cmd", args: '{"command":"rm -rf build"' }]])).length, 0);
+  assert.equal(assemble(new Map([[0, { name: "write_file", args: '{"path":"a.js","content":"complete"}' }]])).length, 1);
+
+  const toolObj = load("_toolObjOf", { _safeJsonLoose: safeJson });
+  const parseText = load("_parseTextToolCalls", {
+    _toolObjOf: toolObj,
+    _canonicalToolName: canonical,
+    _toolSchemaFromRegistry: schemaFrom,
+    _toolArgIssue: toolArgIssue,
+    _KNOWN_TOOLS: strictNames,
+    _STRICT_MUTATING_TOOL_NAMES: strictNames,
+    _safeJsonLoose: safeJson,
+  });
+  assert.equal(parseText('{"name":"write_file","args":{"path":"a.js","content":"ok"}}').length, 1);
+  assert.equal(parseText('{"name":"write_file","args":{"path":"a.js","content":"PARTIAL"').length, 0);
+  assert.equal(parseText(JSON.stringify({ name: "run_cmd", args: '{"command":"rm -rf build"' })).length, 0);
+  for (const name of ["generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture"]) {
+    assert.match(SRC, new RegExp(`_STRICT_MUTATING_TOOL_NAMES[\\s\\S]{0,900}\\b${name}\\b`), `${name} writes a workspace asset and must require strict arguments`);
+  }
+});
+
+test("runtime tool schemas reject missing required parameters for native and text calls", () => {
+  const canonical = (name) => name;
+  const normalizeKeys = load("_normalizeArgKeys");
+  const safeJson = load("_safeJsonLoose");
+  const fileIssue = load("_fileToolArgIssue", {
+    _canonicalToolName: canonical,
+    _normalizeArgKeys: normalizeKeys,
+    _safeJsonLoose: safeJson,
+  });
+  const mutationIssue = load("_mutatingToolArgIssue", {
+    _canonicalToolName: canonical,
+    _STRICT_MUTATING_TOOL_NAMES: new Set(["db_query", "edit_file"]),
+    _fileToolArgIssue: fileIssue,
+  });
+  const schemaFrom = load("_toolSchemaFromRegistry", { _canonicalToolName: canonical });
+  const schemaValueIssue = load("_schemaValueIssue");
+  const issue = load("_toolArgIssue", {
+    _canonicalToolName: canonical,
+    _mutatingToolArgIssue: mutationIssue,
+    _normalizeArgKeys: normalizeKeys,
+    _toolSchemaFromRegistry: schemaFrom,
+    _schemaValueIssue: schemaValueIssue,
+  });
+  const schema = (name, properties, required = []) => ({ type: "function", function: { name, parameters: { type: "object", properties, required } } });
+  const registry = new Map([
+    ["visual_compare", schema("visual_compare", { design: { type: "string" }, url: { type: "string" } }, ["design", "url"])],
+    ["db_query", schema("db_query", { driver: { type: "string", enum: ["sqlite"] }, url: { type: "string" }, query: { type: "string" } }, ["driver", "url", "query"])],
+    ["current_time", schema("current_time", {})],
+  ]);
+  assert.match(issue("visual_compare", "{}", registry), /design, url/);
+  assert.match(issue("db_query", '{"driver":"sqlite"}', registry), /url, query/);
+  assert.equal(issue("visual_compare", '{"design":"target.png","url":"http://127.0.0.1:3000"}', registry), "");
+  assert.equal(issue("current_time", "{}", registry), "");
+
+  const assemble = load("_assembleStreamToolCalls", { _toolArgIssue: issue, _safeJsonLoose: safeJson });
+  assert.equal(assemble(new Map([[0, { name: "visual_compare", args: "{}" }]]), registry).length, 0);
+
+  const toolObj = load("_toolObjOf", { _safeJsonLoose: safeJson });
+  const parseText = load("_parseTextToolCalls", {
+    _toolObjOf: toolObj,
+    _canonicalToolName: canonical,
+    _toolSchemaFromRegistry: schemaFrom,
+    _toolArgIssue: issue,
+    _KNOWN_TOOLS: new Set(),
+    _STRICT_MUTATING_TOOL_NAMES: new Set(),
+    _safeJsonLoose: safeJson,
+  });
+  const issues = [];
+  const rejected = [];
+  assert.equal(parseText('{"name":"visual_compare","args":{}}', registry, issues, rejected).length, 0);
+  assert.match(issues[0], /design, url/);
+  assert.equal(rejected[0].name, "visual_compare");
+  assert.equal(parseText('{"name":"visual_compare","args":{"design":"a.png","url":"http://localhost"}}', registry).length, 1,
+    "registry tools must not depend on the incomplete static _KNOWN_TOOLS set");
+  const unknownIssues = [], unknownRejected = [];
+  assert.equal(parseText('{"name":"made_up_tool","args":{}}', registry, unknownIssues, unknownRejected).length, 0);
+  assert.match(unknownIssues[0], /未知工具/);
+  assert.equal(unknownRejected[0].name, "made_up_tool");
+});
+
+test("tool cards always have a label and skipped paths settle their spinner", () => {
+  const label = load("_toolStepActionLabel");
+  for (const type of ["read", "search_tools", "vizcompare", "db", "capture_replay", "unknown", "future_tool_type"]) {
+    assert.ok(label({ type, _toolName: type === "future_tool_type" ? "future_real_tool" : "" }).trim(), `${type} needs a visible label`);
+  }
+
+  let textContent = "";
+  const classes = new Set();
+  const resultEl = {
+    className: "atc-result",
+    querySelector: (selector) => selector === ".atc-spin" && !textContent ? {} : null,
+    get textContent() { return textContent; },
+    set textContent(value) { textContent = value; },
+  };
+  const step = {
+    dataset: {},
+    classList: { add: (name) => classes.add(name) },
+    querySelector: (selector) => selector === ".atc-result" ? resultEl : null,
+  };
+  const settle = load("_settleToolStep");
+  assert.equal(settle(step, { content: "[重复读取·已跳过]" }, "重复 · 已跳过"), true);
+  assert.equal(textContent, "重复 · 已跳过");
+  assert.equal(step.dataset.toolSettled, "1");
+  assert.equal(resultEl.className.includes("--ok"), true);
+});
+
+test("rejected tool attempts stay visible as settled non-executable cards", () => {
+  let appended = 0;
+  let settled = null;
+  const viewport = { textContent: "" };
+  const step = { querySelector: (selector) => selector === ".atc-viewport" ? viewport : null };
+  const render = load("_renderRejectedToolAttempts", {
+    _mapToolCall: (name) => ({ type: name === "db_query" ? "db" : "unknown", path: "" }),
+    _safeJsonLoose: () => ({}),
+    _createToolStep: () => step,
+    _settleToolStep: (_step, result, label) => { settled = { result, label }; },
+  });
+  const count = render({ appendChild: () => { appended++; } }, [
+    { name: "db_query", argsRaw: "{}", parsedArgs: {}, issue: "db_query 缺少 url, query" },
+  ]);
+  assert.equal(count, 1);
+  assert.equal(appended, 1);
+  assert.equal(settled.label, "参数无效 · 未执行");
+  assert.match(settled.result.content, /拒绝执行/);
+  assert.match(viewport.textContent, /db_query/);
+});
+
+test("cosmetic staging has a deadline and cannot block tool execution", async () => {
+  const bounded = load("_stageWithDeadline");
+  const started = Date.now();
+  const result = await bounded(new Promise(() => {}), 15);
+  assert.equal(result.timedOut, true);
+  assert.ok(Date.now() - started < 250);
+  assert.deepEqual(await bounded(Promise.resolve(), 100), { timedOut: false });
+});
+
+test("read compaction only replaces same-version ranges with a proven superset", () => {
+  const covers = load("_readEvidenceCovers");
+  const full = { kind: "read", resultKind: "content", canonicalPath: "src/a.js", signature: "v1", from: 1, to: 200 };
+  const slice = { ...full, from: 80, to: 100 };
+  assert.equal(covers(full, slice), true);
+  assert.equal(covers(slice, full), false);
+  assert.equal(covers({ ...full, signature: "v2" }, full), false);
+  assert.equal(covers({ ...full, resultKind: "duplicate" }, full), false);
+});
+
+test("run narrative dedup removes exact cross-turn repeats for every model family", () => {
+  const dedupe = load("_dedupeRunNarrative");
+  const seen = new Set();
+  assert.equal(dedupe("这是一个足够长、应当保留的具体诊断段落。", seen), "这是一个足够长、应当保留的具体诊断段落。");
+  assert.equal(dedupe("这是一个足够长、应当保留的具体诊断段落。", seen), "");
+  assert.equal(dedupe("这是一个足够长、但是结论已经变化的具体诊断段落。", seen).includes("变化"), true);
+});
+
+test("provider tool-transcript echoes are removed without deleting preceding prose", () => {
+  const clean = load("_cleanAgentText", {
+    _transformFileContentTags: (value) => value,
+    _stripToolNarration: (value) => value,
+  });
+  const output = clean("我已经定位到路由问题。\n\nuser Tool results:\n\n[read_file] 文件 server/index.js:\nconst secret = true;");
+  assert.equal(output, "我已经定位到路由问题。");
+  assert.equal(clean("正常回答里提到 Tool results 但没有内部工具块。"), "正常回答里提到 Tool results 但没有内部工具块。");
+});
+
+test("tool signatures include complete normalized parameters, including search scope", () => {
+  const fingerprint = load("_resultFingerprint");
+  const stableValue = load("_stableToolValue");
+  const signature = load("_stableToolCallSignature", { _stableToolValue: stableValue, _resultFingerprint: fingerprint });
+  const a = signature({ type: "search", query: "login", searchPath: "src/a", mode: "literal" });
+  const b = signature({ mode: "literal", searchPath: "src/b", query: "login", type: "search" });
+  const aReordered = signature({ searchPath: "src/a", type: "search", mode: "literal", query: "login" });
+  assert.notEqual(a, b);
+  assert.equal(a, aReordered);
+});
+
+test("conversation file evidence merges coverage, persists, and invalidates by versioned path", () => {
+  const memory = new ConversationMemory();
+  memory.recordFileEvidence({ root: "/repo", path: "src/a.js", signature: "v1", total: 20, from: 1, to: 10, digest: "first" });
+  memory.recordFileEvidence({ root: "/repo", path: "src/a.js", signature: "v1", total: 20, from: 11, to: 20, digest: "second" });
+  let [entry] = memory.fileEvidenceForRoot("/repo");
+  assert.deepEqual(entry.ranges, [[1, 20]]);
+  assert.equal(entry.complete, true);
+  const restored = ConversationMemory.fromJSON(memory.toJSON());
+  assert.equal(restored.fileEvidenceForRoot("/repo")[0].signature, "v1");
+  restored.invalidateFileEvidence("/repo", "src/a.js");
+  assert.equal(restored.fileEvidenceForRoot("/repo").length, 0);
+});
+
+test("read ranges deduplicate only exact source still available in the current run context", () => {
+  const merge = load("_mergeReadRanges");
+  const covered = load("_readRangeCovered", { _mergeReadRanges: merge });
+  const through = load("_readCoverageThrough", { _mergeReadRanges: merge });
+  const known = load("_knownReadRanges", { _normRel: NORM_REL, _mergeReadRanges: merge });
+  assert.deepEqual(merge([[20, 30], [1, 10], [11, 19], [80, 90]]), [[1, 30], [80, 90]]);
+  assert.equal(covered([[1, 30]], 1, 30), true);
+  assert.equal(covered([[1, 30]], 1, 31), false);
+  assert.equal(through([[1, 30], [80, 90]]), 30);
+
+  const memory = new ConversationMemory();
+  memory.recordFileEvidence({ root: "/repo", path: "src/a.js", signature: "v1", total: 100, from: 1, to: 100 });
+  const run = {
+    session: { memory },
+    _readCoverage: new Map([["src/a.js", { signature: "v1", total: 100, ranges: [[1, 40]] }]]),
+  };
+  assert.deepEqual(known(run, "/repo", "v1", 100, "src/a.js"), [[1, 40]],
+    "the persisted digest is memory, not proof that exact source is still in the model context");
+  run._readCoverage.clear();
+  assert.deepEqual(known(run, "/repo", "v1", 100, "src/a.js"), []);
+  const executor = extractFn("_executeToolStep");
+  assert.match(executor, /const limit = _explicitLimit \? Math\.floor\(call\.limit\)/,
+    "offset=1 with an explicit limit must stay a bounded slice");
+  assert.match(executor, /_readRangeCovered\(_knownRanges, start \+ 1, _reqEnd\)/,
+    "explicit offsets must not bypass covered-range deduplication");
+  assert.doesNotMatch(executor, /_reqEnd <= _seen && !_explicitOffset/);
+});
+
+test("message compaction invalidates exact read coverage before allowing a refetch", () => {
+  let synced = 0;
+  const trim = load("_trimMessagesIfHuge", {
+    _msgSize: (message) => String(message?.content || "").length,
+    _readEvidenceCovers: () => false,
+    _REFETCHABLE: new Set(),
+    _IMPORTANT_LINE: /error/i,
+    _smartCompress: () => "compressed",
+    _syncRunReadCoverageFromMessages: () => { synced++; },
+  });
+  const calls = Array.from({ length: 11 }, (_, index) => ({
+    id: `call-${index}`, type: "function", function: { name: index === 0 ? "read_file" : "run_cmd", arguments: "{}" },
+  }));
+  const messages = [
+    { role: "system", content: "system" },
+    { role: "assistant", content: "", tool_calls: calls },
+    { role: "tool", tool_call_id: "call-0", content: "x".repeat(90_000), _ideMeta: { kind: "read", resultKind: "content", canonicalPath: "src/a.js", signature: "v1", from: 1, to: 100, total: 100 } },
+    ...calls.slice(1).map((call) => ({ role: "tool", tool_call_id: call.id, content: "ok" })),
+  ];
+  const run = { root: "/repo", ctx: { filesRead: new Set(["src/a.js"]) }, _contextPreambleAvailable: false };
+  trim(messages, run, "/repo");
+  assert.equal(messages[2]._ideMeta.contextAvailable, false);
+  assert.match(messages[2].content, /compressed/);
+  assert.equal(synced, 1, "coverage must be rebuilt after the exact source is compressed away");
+});
+
+test("retry exhaustion markers are owned by the inner turn and never retried again outside", () => {
+  const transient = load("_isTransientTurnErr", {
+    _isRetryableAiError: () => true,
+  });
+  assert.equal(transient("[tool-args-invalid] write_file truncated"), false);
+  assert.equal(transient("[tool-stream-retry-exhausted] missing DONE"), false);
+  assert.equal(transient("[turn-retry-exhausted] network reset"), false);
 });
 
 test("Codex image skill tool naming maps to Michael IDE's real image tool", () => {
@@ -644,13 +1058,58 @@ test("engineering task profiling gates only substantial code work and detects UI
   assert.equal(profile("把按钮文字改成保存").requiresPlan, false);
   assert.equal(profile("调整按钮和表单的样式布局").ui, true);
   assert.equal(profile("修复手机端视觉和交互动效问题").ui, true);
+  assert.equal(profile("修复登录按钮不响应").implementation, true);
   const architecture = profile("重构整个代码库的认证架构，消除硬编码并补齐测试");
   assert.equal(architecture.applies, true);
   assert.equal(architecture.requiresPlan, true);
-  assert.equal(architecture.needsReferences, true);
+  assert.equal(architecture.needsReferences, false, "local architecture work should read the repository before searching communities");
+  assert.equal(profile("接入最新版支付 API 并确认兼容性").needsReferences, true);
   const uiBug = profile("修复 React 页面在手机端空白和横向溢出的 bug");
   assert.equal(uiBug.ui, true);
   assert.equal(uiBug.bug, true);
+});
+
+test("mutation intent cannot finish as a successful zero-effect run", () => {
+  const required = load("_runRequiredEffect");
+  const target = load("_effectTargetForTask");
+  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
+  assert.equal(required({ mode: "agent", _intent: { effect: "mutate" }, engineering: {} }), "mutate");
+  assert.equal(required({ mode: "agent", _intent: null, engineering: { implementation: true } }), "mutate");
+  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { implementation: true } }), "inspect");
+  assert.equal(target("修复登录按钮不响应", { bug: true }), "workspace");
+  assert.equal(target("把最新版推送到 GitHub", { implementation: true }), "external");
+  assert.equal(target("编译运行一下", { implementation: false }), "runtime");
+  assert.equal(runTarget({ _intent: { target: "external" }, _originalText: "修复代码", engineering: { bug: true } }), "external");
+  assert.match(SRC, /run\._incompleteReason = "pending_plan"/);
+  assert.match(SRC, /run\._incompleteReason = "required_mutation_missing"/);
+  assert.match(SRC, /_requiredTarget === "workspace" \? _implOps === 0 : _effectOps === 0/);
+  assert.match(SRC, /_effectTarget === "runtime"[\s\S]{0,100}_toolProducesRuntimeEffect/);
+  assert.match(SRC, /s\.content \|\| s\.title \|\| s\.description \|\| "step"/);
+  assert.match(SRC, /run\._incompleteReason \|\| hitCap/);
+});
+
+test("ending a run settles in-progress plan spinners without discarding resumable steps", () => {
+  let rendered = null;
+  let cleared = 0;
+  const settle = load("_settleRunPlan", {
+    _renderPlan: (_container, steps) => { rendered = steps; },
+    _clearPlanChip: () => { cleared++; },
+  });
+  const run = {
+    _planSteps: [
+      { content: "done", status: "completed" },
+      { content: "working", status: "in_progress" },
+      { content: "later", status: "pending" },
+    ],
+    _planEl: { parentNode: {} },
+    session: { _planSteps: [], _planActive: true },
+  };
+  const steps = settle(run);
+  assert.deepEqual(steps.map((step) => step.status), ["completed", "pending", "pending"]);
+  assert.deepEqual(rendered, steps);
+  assert.deepEqual(run.session._planSteps, steps);
+  assert.equal(run.session._planActive, false);
+  assert.equal(cleared, 1);
 });
 
 test("bounded engineering retrieval keeps sources that finish before the deadline", async () => {
@@ -668,8 +1127,10 @@ test("bounded engineering retrieval keeps sources that finish before the deadlin
   assert.doesNotMatch(render(results[1], 1), /\nignore/);
   assert.match(render(results[2], 2), /来源 3超时/);
   assert.match(SRC, /Array\.from\(\{ length: jobs\.length \}/);
-  assert.match(SRC, /parts\.splice\(stackHint \? 3 : 2, 0, \.\.\.priority\)/);
-  assert.match(SRC, /retrievalPending \? 0 : Date\.now\(\)/);
+  assert.match(extractFn("_agentContextForQuery"), /_buildEngineeringReferenceContext\(query, root, stack, profile\)/);
+  assert.doesNotMatch(extractFn("_gatherAgentContext"), /queryKey/,
+    "changing only the user wording must not rebuild the stable tree and key-file snapshot");
+  assert.match(extractFn("_gatherAgentContext"), /return _agentContextForQuery\(_agentContextCache\.data, query \|\| "", root\)/);
 });
 
 test("stack extraction honors the declared package manager and project scripts", () => {
@@ -693,9 +1154,13 @@ test("repo map and path normalization cannot cross workspace roots", () => {
   const repoMap = load("_buildRepoMap", { _symbolIndex: idx, _symbolIndexRoot: "/workspace/a" });
   assert.match(repoMap("a", 1000, "/workspace/a"), /src\/a\.js/);
   assert.equal(repoMap("a", 1000, "/workspace/b"), "");
-  const norm = load("_normRel");
+  const norm = NORM_REL;
   assert.equal(norm("/workspace/a/src/a.js", "/workspace/a"), "src/a.js");
   assert.equal(norm("/etc/hosts", "/workspace/a"), "/etc/hosts");
+  assert.match(SRC, /const _activeForSession = activePath && _contextRoot && _pathIsAtOrUnder\(activePath, _contextRoot\)/,
+    "a chat must never receive the globally active file from another workspace");
+  assert.doesNotMatch(extractFn("_gatherAgentContext"), /\(当前编辑中\)/,
+    "the active file must not be injected twice by cached and per-turn context");
 });
 
 test("verification plans cover every declared check and deduplicate commands", () => {
@@ -824,13 +1289,20 @@ test("dev-server discovery is scoped to the current run and workspace", () => {
 });
 
 test("tool success and verification command checks reject fake green command results", () => {
-  const succeeded = load("_toolExecutionSucceeded", { _toolFailureMatch: load("_toolFailureMatch") });
+  const workspaceTypes = new Set(["write", "edit", "multiedit", "format", "mkdir"]);
+  const succeeded = load("_toolExecutionSucceeded", {
+    _toolFailureMatch: load("_toolFailureMatch"),
+    _WORKSPACE_MUTATING_TYPES: workspaceTypes,
+  });
   assert.equal(succeeded({ type: "cmd" }, { code: 0, content: "ok" }), true);
   assert.equal(succeeded({ type: "cmd" }, { code: 1, content: "no error keyword" }), false);
   assert.equal(succeeded({ type: "http" }, { ok: true, status: 200, content: "200 OK" }), true);
   assert.equal(succeeded({ type: "http" }, { ok: false, status: 500, content: "500 Internal Server Error" }), false);
   assert.equal(succeeded({ type: "edit" }, { content: "[BLOCKED] read first" }), false);
+  assert.equal(succeeded({ type: "write" }, { content: "[CONFLICT] dirty editor buffer" }), false);
   assert.equal(succeeded({ type: "browser" }, { content: "[浏览器失败] Chrome unavailable" }), false);
+  assert.equal(succeeded({ type: "format" }, { mutated: false, content: "already formatted" }), false);
+  assert.equal(succeeded({ type: "read" }, { evidence: { resultKind: "duplicate" }, content: "already read" }), false);
   const verify = load("_looksLikeVerificationCommand");
   assert.equal(verify("pnpm run typecheck && pnpm test"), true);
   assert.equal(verify("npx tsc --noEmit"), true);
@@ -853,6 +1325,49 @@ test("tool success and verification command checks reject fake green command res
   assert.equal(readOnlyCommand("git status"), true);
   assert.equal(readOnlyCommand("python3 -c 'print(1)'"), false);
   assert.doesNotMatch(SRC, /_looksLikeVerificationCommand\(it\.call\.command\)\) \|\| t === "http"/);
+});
+
+test("material effects are separated from real workspace mutations", () => {
+  const verify = load("_looksLikeVerificationCommand");
+  const rewrite = load("_looksLikeShellFileRewrite");
+  const readOnly = load("_looksLikeReadOnlyCommand");
+  const commandMutates = load("_looksLikeWorkspaceMutationCommand", {
+    _looksLikeReadOnlyCommand: readOnly,
+    _looksLikeVerificationCommand: verify,
+    _looksLikeShellFileRewrite: rewrite,
+  });
+  const mcpHint = load("_mcpMutationHint", { _looksLikeWorkspaceMutationCommand: commandMutates });
+  const workspaceTypes = new Set(["write", "edit", "multiedit", "format", "mkdir"]);
+  const mutates = load("_toolMutatesWorkspace", {
+    _WORKSPACE_MUTATING_TYPES: workspaceTypes,
+    _looksLikeWorkspaceMutationCommand: commandMutates,
+    _mcpMutationHint: mcpHint,
+  });
+  const effect = load("_toolProducesMaterialEffect", { _mcpMutationHint: mcpHint });
+  const runtimeEffect = load("_toolProducesRuntimeEffect", { _looksLikeReadOnlyCommand: readOnly });
+
+  assert.equal(commandMutates("ls -la"), false);
+  assert.equal(commandMutates("npm test"), false);
+  assert.equal(commandMutates("git status"), false);
+  assert.equal(commandMutates("printf changed > src/app.js"), true);
+  assert.equal(commandMutates("npm install zod"), true);
+  assert.equal(mutates({ type: "cmd", command: "npm test" }, {}), false);
+  assert.equal(mutates({ type: "termtask", command: "npx prettier --write src/app.js" }, {}), true);
+  assert.equal(mutates({ type: "git", op: "branch", branch: "feature" }, {}), true);
+  assert.equal(mutates({ type: "git", op: "pull" }, {}), true);
+  assert.equal(effect({ type: "git", op: "branch", branch: "" }, {}, false), false);
+  assert.equal(effect({ type: "git", op: "push" }, {}, false), true);
+  assert.equal(effect({ type: "gh", op: "pr_create" }, {}, false), true);
+  assert.equal(effect({ type: "db", query: "SELECT 1" }, {}, false), false);
+  assert.equal(effect({ type: "db", query: "UPDATE users SET active=1" }, {}, false), true);
+  assert.equal(runtimeEffect({ type: "cmd", command: "ls -la" }, {}), false);
+  assert.equal(runtimeEffect({ type: "cmd", command: "npm test" }, {}), true);
+  assert.equal(runtimeEffect({ type: "termtask" }, { running: false }), false);
+  assert.equal(runtimeEffect({ type: "termtask" }, { running: true }), true);
+  assert.equal(mutates({ type: "mcp", tool: "write_file", args: { path: "src/a.js" } }, {}), true);
+  assert.equal(mutates({ type: "mcp", tool: "read_file", mcpReadOnly: true, args: { path: "src/a.js" } }, {}), false);
+  assert.match(extractFn("_executeToolStep"), /\[ERROR\] 命令在 IDE 终端.*启动后很快退出/,
+    "an exited persistent terminal must not satisfy a runtime task");
 });
 
 test("stream deadlines trigger exactly the fast-retry path", () => {
@@ -909,7 +1424,7 @@ test("UI verification accepts only the required viewports and real visible asser
 });
 
 test("read-before-edit requires contiguous coverage of the current complete file", () => {
-  const norm = load("_normRel");
+  const norm = NORM_REL;
   const recordRange = load("_recordRunReadRange", { _normRel: norm });
   const hasRead = load("_runHasRead", { _normRel: norm });
   const signature = load("_contentSignature");
@@ -929,6 +1444,472 @@ test("read-before-edit requires contiguous coverage of the current complete file
   assert.equal(recordRange(run, "/repo", 1, 2, 2, signature(current), "src/current.js", "/repo/src/current.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", current, "src/current.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", "one\nchanged\n", "src/current.js"), false, "stale reads cannot authorize overwriting a newer version");
+  assert.match(extractFn("_executeToolStep"), /coverageTo = lastNl > 0 \? shownTo : start/,
+    "a character-capped partial giant line must not count as a fully-read line");
+});
+
+test("redacted reads remain marked for their exact content version", () => {
+  const signature = load("_contentSignature");
+  const record = load("_recordRunRedactedRead", { _normRel: NORM_REL });
+  const wasRedacted = load("_runReadWasRedacted", { _normRel: NORM_REL, _contentSignature: signature });
+  const run = {};
+  const secretVersion = "TOKEN=real-secret\ncode();\n";
+  const cleanVersion = "code();\n";
+
+  record(run, "/repo", signature(secretVersion), true, "src/a.js", "/repo/src/a.js");
+  record(run, "/repo", signature(secretVersion), false, "src/a.js");
+  assert.equal(wasRedacted(run, "/repo", secretVersion, "src/a.js"), true, "a clean page from the same file must not erase a prior redacted page");
+  assert.equal(wasRedacted(run, "/repo", cleanVersion, "src/a.js"), false);
+  assert.match(extractFn("_executeToolStep"), /redactedRead && call\.type === "write"/);
+});
+
+test("mutation paths reject relative traversal and unbound external targets", () => {
+  const boundPaths = new Map([["/tmp/read-first.js", "/tmp/read-first.js"]]);
+  const issue = load("_mutationPathIssue", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _coherentFilePath: COHERENT_PATH,
+    _resolveRel: (path) => NORMALIZE_PATH("/repo/" + path),
+    _pathIdentity: PATH_IDENTITY,
+    _allRoots: () => ["/repo"],
+    _boundRunFilePath: (_run, _root, path) => boundPaths.get(path) || "",
+  });
+  assert.match(issue("../outside.js", "/outside.js", "/repo", {}), /逃出当前工作区/);
+  assert.match(issue("/tmp/new.js", "/tmp/new.js", "/repo", {}), /不在本次运行/);
+  assert.equal(issue("/tmp/read-first.js", "/tmp/read-first.js", "/repo", {}), "");
+  assert.match(issue("/tmp/read-first.js", "/tmp/read-first.js", "/repo", {}, false), /不在本次运行/);
+});
+
+test("a successful structured write records its new content as the current readable version", () => {
+  const norm = NORM_REL;
+  const signature = load("_contentSignature");
+  const recordRange = load("_recordRunReadRange", { _normRel: norm });
+  const recordKnown = load("_recordRunKnownContent", {
+    _recordRunReadRange: recordRange,
+    _contentSignature: signature,
+  });
+  const hasCurrentRead = load("_runHasCurrentRead", {
+    _normRel: norm,
+    _contentSignature: signature,
+  });
+  const run = { ctx: { filesRead: new Set() } };
+  const written = "export const value = 2;\nexport default value;\n";
+
+  assert.equal(recordKnown(run, "/repo", written, "src/value.js", "/repo/src/value.js"), true);
+  assert.equal(hasCurrentRead(run, "/repo", written, "src/value.js"), true);
+  assert.equal(hasCurrentRead(run, "/repo", written, "/repo/src/value.js"), true);
+  assert.equal(
+    hasCurrentRead(run, "/repo", "export const value = 3;\nexport default value;\n", "src/value.js"),
+    false,
+    "a later external change must still invalidate the known version",
+  );
+});
+
+test("same-response reads and fuzzy bindings cannot authorize mutations before the model sees their results", () => {
+  const signature = load("_contentSignature");
+  const recordRange = load("_recordRunReadRange", { _normRel: NORM_REL });
+  const hasCurrentRead = load("_runHasCurrentRead", { _normRel: NORM_REL, _contentSignature: signature });
+  const bind = load("_bindRunFilePath", { _normRel: NORM_REL, _coherentFilePath: COHERENT_PATH });
+  const bound = load("_boundRunFilePath", { _normRel: NORM_REL });
+  const freshBinding = load("_sameBatchRunFilePathBinding", { _normRel: NORM_REL });
+  const content = "one\ntwo\n";
+  const run = { ctx: { filesRead: new Set() }, _toolBatch: 1 };
+
+  assert.equal(recordRange(run, "/repo", 1, 2, 2, signature(content), "a.js", "/repo/a.js"), true);
+  bind(run, "/repo", "wrong/a.js", "/repo/packages/a.js");
+  assert.equal(hasCurrentRead(run, "/repo", content, "a.js"), false, "a read from this model response cannot unlock its write");
+  assert.equal(bound(run, "/repo", "wrong/a.js"), "", "a fuzzy path learned this response cannot drive delete/move yet");
+  assert.equal(freshBinding(run, "/repo", "wrong/a.js"), "/repo/packages/a.js",
+    "the mutation guard must still see the fresh binding instead of falling back to the wrong requested path");
+  assert.match(extractFn("_executeToolStep"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,800}已阻止退回原始路径写错文件/);
+
+  run._toolBatch = 2;
+  assert.equal(hasCurrentRead(run, "/repo", content, "a.js"), true);
+  assert.equal(bound(run, "/repo", "wrong/a.js"), "/repo/packages/a.js");
+  assert.equal(freshBinding(run, "/repo", "wrong/a.js"), "");
+});
+
+test("ordered tool segments preserve mutation barriers while parallelizing only adjacent reads", async () => {
+  const schedule = load("_runOrderedToolSegments");
+  const events = [];
+  let disk = "old";
+  const items = [{ type: "write" }, { type: "read" }, { type: "read" }, { type: "command" }, { type: "read" }];
+  let activeReads = 0;
+  let maxReads = 0;
+  await schedule(
+    items,
+    (item) => item.type === "read",
+    async (item, index) => {
+      if (item.type === "write") { disk = "new"; events.push("write"); return; }
+      if (item.type === "command") { events.push("command"); return; }
+      activeReads++;
+      maxReads = Math.max(maxReads, activeReads);
+      await new Promise((resolve) => setImmediate(resolve));
+      events.push(`read${index}:${disk}`);
+      activeReads--;
+    },
+  );
+  assert.deepEqual(events.slice(0, 3).sort(), ["read1:new", "read2:new", "write"].sort());
+  assert.ok(events.indexOf("write") < events.indexOf("read1:new"), "write before read must not be reordered");
+  assert.ok(events.indexOf("read2:new") < events.indexOf("command"));
+  assert.ok(events.indexOf("command") < events.indexOf("read4:new"));
+  assert.equal(maxReads, 2, "adjacent reads still execute in parallel");
+
+  const parallel = load("_isReadOnlyParallel", { _READ_ONLY_TYPES: new Set(["read"]) });
+  assert.equal(parallel({ type: "genimage", dest: "same.png" }), false, "asset writes must remain ordered");
+  assert.equal(parallel({ type: "db", query: "WITH old AS (DELETE FROM jobs RETURNING *) SELECT * FROM old" }), false,
+    "writable CTEs must not enter a parallel read segment");
+});
+
+test("an edit merged into item zero never gets its own card or staging work", () => {
+  const isMerged = load("_isMergedToolItem");
+  assert.equal(isMerged({ merged: 0 }), true, "index zero is a valid merge target");
+  assert.equal(isMerged({ merged: 3 }), true);
+  assert.equal(isMerged({ merged: null }), false);
+  assert.equal(isMerged({}), false);
+
+  assert.ok((SRC.match(/!_isMergedToolItem\(it\)/g) || []).length >= 2,
+    "both card creation and live staging must exclude merged stubs");
+  assert.doesNotMatch(SRC, /!it\.merged/, "truthiness would misclassify merged = 0");
+});
+
+test("disk writes update clean open models, preserve dirty buffers, and are wired into Agent writes", () => {
+  let value = "old\n";
+  let setCalls = 0;
+  const model = {
+    getValue: () => value,
+    setValue(next) { value = next; setCalls++; },
+  };
+  const file = { model, name: "a.js", dirty: false, diskContent: "old\n", externalConflict: false };
+  const openFiles = new Map([["/repo/a.js", file]]);
+  const saved = [];
+  const apply = load("_applyDiskContentToOpenFile", {
+    _coherentFilePath: COHERENT_PATH,
+    _openingFiles: new Map(),
+    openFiles,
+    activePath: "",
+    monacoEditor: {},
+    _programmaticModelUpdates: new WeakSet(),
+    lspManager: {
+      didChange: (path) => saved.push(["change", path]),
+      didSave: (path) => saved.push(["save", path]),
+    },
+    markDirty: (path, dirty) => { openFiles.get(path).dirty = dirty; },
+  });
+
+  assert.deepEqual(apply("/repo/a.js", "agent\n"), { state: "updated" });
+  assert.equal(value, "agent\n");
+  assert.equal(file.diskContent, "agent\n");
+  assert.equal(file.dirty, false);
+  assert.deepEqual(saved, [["change", "/repo/a.js"], ["save", "/repo/a.js"]]);
+
+  file.dirty = true;
+  value = "user typing\n";
+  assert.deepEqual(apply("/repo/a.js", "external\n"), { state: "conflict" });
+  assert.equal(value, "user typing\n");
+  assert.equal(setCalls, 1, "dirty user content must never be replaced");
+  assert.equal(file.externalConflict, true);
+
+  const execute = extractFn("_executeToolStep");
+  assert.ok((execute.match(/_applyDiskContentToOpenFile\(fp, newContent\)/g) || []).length >= 2,
+    "both write/edit and multi_edit paths must synchronize Monaco after disk CAS succeeds");
+});
+
+test("preloaded project models are refreshed after Agent writes", () => {
+  let value = "old";
+  const model = { getValue: () => value, setValue: (next) => { value = next; } };
+  const apply = load("_applyDiskContentToOpenFile", {
+    _coherentFilePath: COHERENT_PATH,
+    _openingFiles: new Map(),
+    openFiles: new Map(),
+    projectModels: new Set(["/repo/src/a.js"]),
+    monaco: { Uri: { file: (path) => path }, editor: { getModel: () => model } },
+    _programmaticModelUpdates: new WeakSet(),
+  });
+  assert.deepEqual(apply("/repo/src/a.js", "new"), { state: "project-model-updated" });
+  assert.equal(value, "new");
+});
+
+test("a committed write wins over a stale file read that is still opening", () => {
+  const opening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0 };
+  const apply = load("_applyDiskContentToOpenFile", {
+    _coherentFilePath: COHERENT_PATH,
+    _openingFiles: new Map([["/repo/a.js", opening]]),
+    openFiles: new Map(),
+  });
+  assert.deepEqual(apply("/repo/a.js", "new-from-agent"), { state: "opening-updated" });
+  assert.equal(opening.hasDiskContent, true);
+  assert.equal(opening.diskContent, "new-from-agent");
+  assert.equal(opening.diskVersion, 1);
+  assert.match(extractFn("openFile"), /if \(opening\.hasDiskContent\) content = opening\.diskContent/);
+});
+
+test("a visible open model wins during the brief opening-map cleanup window", () => {
+  let value = "stale";
+  const model = { getValue: () => value, setValue: (next) => { value = next; } };
+  const file = { model, name: "a.js", dirty: false, diskContent: "stale" };
+  const opening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0, openedFile: file, finalDiskContent: "stale" };
+  const openFiles = new Map([["/repo/a.js", file]]);
+  const apply = load("_applyDiskContentToOpenFile", {
+    _coherentFilePath: COHERENT_PATH,
+    _openingFiles: new Map([["/repo/a.js", opening]]),
+    openFiles,
+    activePath: "",
+    monacoEditor: {},
+    _programmaticModelUpdates: new WeakSet(),
+    lspManager: { didChange: () => {}, didSave: () => {} },
+    markDirty: (path, dirty) => { openFiles.get(path).dirty = dirty; },
+  });
+  assert.deepEqual(apply("/repo/a.js", "committed"), { state: "updated" });
+  assert.equal(value, "committed");
+  assert.equal(file.diskContent, "committed");
+  assert.equal(opening.hasDiskContent, false, "the already-visible model, not the stale opening record, owns synchronization");
+});
+
+test("directory watcher events update in-flight opens without overriding a newer committed write", async () => {
+  let resolveRead;
+  const opening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0 };
+  const openingFiles = new Map([["/repo/src/a.js", opening]]);
+  const sync = load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles: new Map(),
+    _openingFiles: openingFiles,
+    projectModels: new Set(),
+    backend: { readTextFile: () => new Promise((resolve) => { resolveRead = resolve; }) },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _isMissingFileError: load("_isMissingFileError"),
+  });
+
+  const pending = sync(["/repo/src"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  opening.diskContent = "new-from-agent";
+  opening.hasDiskContent = true;
+  opening.diskVersion++;
+  resolveRead("stale-before-agent");
+  await pending;
+  assert.equal(opening.diskContent, "new-from-agent");
+  assert.equal(opening.diskVersion, 1);
+
+  const freshOpening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0 };
+  const freshSync = load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles: new Map(),
+    _openingFiles: new Map([["/repo/src/b.js", freshOpening]]),
+    projectModels: new Set(),
+    backend: { readTextFile: async () => "latest-on-disk" },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _isMissingFileError: load("_isMissingFileError"),
+  });
+  await freshSync(["/repo/src"]);
+  assert.equal(freshOpening.diskContent, "latest-on-disk");
+  assert.equal(freshOpening.hasDiskContent, true);
+  assert.equal(freshOpening.diskVersion, 1);
+});
+
+test("overlapping editor saves are serialized per path", async () => {
+  let disk = "v0";
+  let active = 0;
+  let maxActive = 0;
+  const calls = [];
+  const file = { model: {}, diskContent: disk, _savePromise: null };
+  const save = load("_writeOpenFileSnapshot", {
+    _coherentFilePath: COHERENT_PATH,
+    openFiles: new Map([["/repo/a.js", file]]),
+    _pendingEditorWrites: new Map(),
+    backend: {
+      async writeTextFileIfUnchanged(path, expected, content) {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        calls.push([path, expected, content]);
+        await new Promise((resolve) => setImmediate(resolve));
+        try {
+          if (disk !== expected) throw new Error("stale");
+          disk = content;
+        } finally { active--; }
+      },
+    },
+  });
+
+  await Promise.all([save("/repo/a.js", "v1"), save("/repo/a.js", "v2"), save("/repo/a.js", "v3")]);
+  assert.equal(maxActive, 1);
+  assert.equal(disk, "v3");
+  assert.deepEqual(calls.map((call) => call.slice(1)), [["v0", "v1"], ["v1", "v2"], ["v2", "v3"]]);
+});
+
+test("external sync normalizes Windows paths and discards stale async reads", async () => {
+  let resolveRead;
+  const file = { model: {}, name: "a.js", dirty: false, diskContent: "old" };
+  const applied = [];
+  const sync = load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles: new Map([["C:/repo/a.js", file]]),
+    _openingFiles: new Map(),
+    projectModels: new Set(),
+    backend: { readTextFile: () => new Promise((resolve) => { resolveRead = resolve; }) },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _applyDiskContentToOpenFile: (...args) => applied.push(args),
+    showToast: () => {},
+  });
+  const pending = sync(["C:\\repo\\a.js"]);
+  file.diskContent = "newer-agent-version";
+  resolveRead("old");
+  await pending;
+  assert.deepEqual(applied, [], "an older read must not roll a newer Agent sync back");
+});
+
+test("the newest external sync wins even when older disk reads finish later", async () => {
+  const resolvers = [];
+  const file = { model: {}, name: "a.js", dirty: false, diskContent: "v0" };
+  const applied = [];
+  const sync = load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles: new Map([["/repo/a.js", file]]),
+    _openingFiles: new Map(),
+    projectModels: new Set(),
+    backend: { readTextFile: () => new Promise((resolve) => { resolvers.push(resolve); }) },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _applyDiskContentToOpenFile: (_path, content) => { applied.push(content); file.diskContent = content; },
+    showToast: () => {},
+  });
+  const older = sync(["/repo/a.js"]);
+  const newer = sync(["/repo/a.js"]);
+  resolvers[0]("v1");
+  await older;
+  resolvers[1]("v2");
+  await newer;
+  assert.deepEqual(applied, ["v2"]);
+});
+
+test("external deletion closes clean tabs but preserves dirty buffers as explicit conflicts", async () => {
+  const missing = load("_isMissingFileError");
+  const makeSync = (file, openFiles, closed) => load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles,
+    _openingFiles: new Map(),
+    projectModels: new Set(),
+    backend: { readTextFile: async () => { throw new Error("cannot stat: No such file or directory (os error 2)"); } },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _applyDiskContentToOpenFile: () => { throw new Error("deleted content must not be applied"); },
+    _isMissingFileError: missing,
+    _dropProjectModel: () => {},
+    closeFile: async (path, options) => { closed.push([path, options]); openFiles.delete(path); return true; },
+    showToast: () => {},
+  });
+
+  const clean = { model: {}, name: "clean.js", dirty: false, diskContent: "old" };
+  const cleanFiles = new Map([["/repo/clean.js", clean]]);
+  const closed = [];
+  await makeSync(clean, cleanFiles, closed)(["/repo/clean.js"]);
+  assert.equal(cleanFiles.has("/repo/clean.js"), false);
+  assert.deepEqual(closed, [["/repo/clean.js", { force: true }]]);
+
+  const dirty = { model: {}, name: "dirty.js", dirty: true, diskContent: "old", externalConflict: false };
+  const dirtyFiles = new Map([["/repo/dirty.js", dirty]]);
+  const dirtyClosed = [];
+  await makeSync(dirty, dirtyFiles, dirtyClosed)(["/repo/dirty.js"]);
+  assert.equal(dirtyFiles.has("/repo/dirty.js"), true);
+  assert.equal(dirty.externalConflict, true);
+  assert.equal(dirty.externalDeleted, true);
+  assert.deepEqual(dirtyClosed, []);
+});
+
+test("deleted preloaded project models are disposed instead of serving stale diagnostics", () => {
+  let disposed = false;
+  const projectModels = new Set(["/repo/a.js"]);
+  const drop = load("_dropProjectModel", {
+    _coherentFilePath: COHERENT_PATH,
+    projectModels,
+    openFiles: new Map(),
+    monaco: { Uri: { file: (path) => path }, editor: { getModel: () => ({ dispose: () => { disposed = true; } }) } },
+  });
+  drop("/repo/a.js");
+  assert.equal(projectModels.has("/repo/a.js"), false);
+  assert.equal(disposed, true);
+});
+
+test("autosave clears dirty state only when the saved snapshot still matches the model", () => {
+  const autosave = extractFn("scheduleAutoSave");
+  assert.match(autosave, /const snapshot = f\.model\.getValue\(\)/);
+  assert.match(autosave, /await _writeOpenFileSnapshot\(path, snapshot\)/);
+  assert.match(autosave, /openFiles\.get\(path\) === f && f\.model\.getValue\(\) === snapshot/);
+  assert.match(autosave, /markDirty\(path, true\);\s*scheduleAutoSave\(path\)/);
+  const manualSave = extractFn("saveActive");
+  assert.match(manualSave, /f\.model\.getValue\(\) === snapshot[\s\S]*showToast\(t\("file\.saved"/);
+  assert.match(manualSave, /else if \(openFiles\.get\(savingPath\) === f\)[\s\S]*scheduleAutoSave\(savingPath\)/);
+  assert.match(manualSave, /return await _resolveManualSaveConflict\(savingPath, f, snapshot, e\)/);
+
+  const runFile = extractFn("runCurrentFile");
+  assert.match(runFile, /const runningPath = activePath/);
+  assert.match(runFile, /await saveActive\(runningPath\)/);
+  assert.match(runFile, /!saved \|\| openFiles\.get\(runningPath\)\?\.dirty/);
+  assert.doesNotMatch(runFile, /dirname\(activePath\)|basename\(activePath\)/);
+});
+
+test("manual conflict resolution uses a fresh CAS and never silently overwrites", () => {
+  const resolver = extractFn("_resolveManualSaveConflict");
+  assert.match(resolver, /await backend\.readTextFile\(path\)/);
+  assert.match(resolver, /await backend\.writeTextFileIfUnchanged\(path, missing \? null : disk, snapshot\)/);
+  assert.match(resolver, /file\.model\.getValue\(\) !== snapshot/);
+  assert.match(resolver, /_applyDiskContentToOpenFile\(path, latest\)/);
+});
+
+test("all non-editor direct source writes use CAS and synchronize Monaco", () => {
+  assert.match(extractFn("_directTextEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
+  assert.match(extractFn("_directStyleEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
+  assert.match(SRC, /writeFile: async \(path, content\)[\s\S]{0,500}_commitDiskTextIfUnchanged\(path, expected, content\)/);
+  assert.match(extractFn("_executeToolStep"), /_applyDiskContentToOpenFile\(fp, old\);[\s\S]{0,180}agentFormat/,
+    "formatting must refresh a stale project model from its disk baseline first");
+});
+
+test("remote filesystem routing cannot create locally, truncate existing files, or lose path identity", () => {
+  assert.match(SRC, /expected_content: null, content: ""/,
+    "remote createFile must use create-only CAS instead of truncating an existing file");
+  assert.match(SRC, /backend\.copyPath = \(from, to\) => _remote\.active \? _remoteCall\("\/fs\/copy"/);
+  assert.match(SRC, /await backend\.createDir\(fp\)/);
+  assert.match(SRC, /await backend\.copyPath\(fromFp, toFp\)/);
+  assert.match(SRC, /path: _normalizeFsPath\(String\(p \|\| ""\).*e\.name\)/s,
+    "remote readDir entries must carry full paths for the explorer");
+  assert.match(REMOTE_AGENT, /def h_fs_copy\(b\):/);
+  assert.match(REMOTE_AGENT, /create directory target already exists/);
+  assert.match(REMOTE_AGENT, /open\(p, "r", encoding="utf-8"\)\.read\(\)/,
+    "remote reads and CAS must reject non-UTF-8 instead of lossy rewriting it");
+  assert.match(REMOTE_AGENT, /os\.fchown\(out\.fileno\(\), old_stat\.st_uid, old_stat\.st_gid\)/,
+    "atomic replacement must preserve server-side ownership when possible");
+});
+
+test("remote search uses the active backend and preserves native file-match shape", () => {
+  const group = load("_groupRemoteSearchHits", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _coherentFilePath: COHERENT_PATH,
+  });
+  const files = group("C:\\repo", "needle", false, [
+    { rel: "src\\a.js", line: 3, column: 7, text: "const needle = 1", start: 6, end: 12 },
+    { rel: "src/a.js", line: 9, text: "return NEEDLE" },
+    { rel: "src/b.js", line: 1, text: "needle()" },
+  ]);
+
+  assert.equal(files.length, 2);
+  assert.deepEqual(files[0], {
+    path: "C:/repo/src/a.js",
+    name: "a.js",
+    rel: "src/a.js",
+    matches: [
+      { line: 3, column: 7, text: "const needle = 1", start: 6, end: 12 },
+      { line: 9, column: 8, text: "return NEEDLE", start: 7, end: 13 },
+    ],
+  });
+  assert.match(SRC, /backend\.searchInProject = \(root, query, cs, mode = "literal"\)[\s\S]{0,320}_groupRemoteSearchHits/);
+  assert.match(extractFn("_executeToolStep"), /fileMatches = await backend\.searchInProject\(searchRoot, q, !!call\.caseSensitive, call\.mode \|\| "literal"\)/,
+    "Agent search must route to the remote daemon when a remote workspace is active");
 });
 
 test("startup observer and detailed network capture coexist", () => {
@@ -946,6 +1927,16 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.match(SRC, /workerMutated = false/);
   assert.match(SRC, /onMutation: \(\) => \{ workerMutated = true; \}/);
   assert.match(SRC, /启动写入型 worker 前必须先调用 update_plan/);
+  assert.match(SRC, /缺少计划 · 未执行/);
+  const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
+  assert.match(subagentSrc, /0 步 · 未执行/);
+  assert.doesNotMatch(subagentSrc, /toolCount === 0[\s\S]{0,120}card\.remove\(/);
+  assert.match(subagentSrc, /rejectedStep = _createToolStep\(rejectedCall\)/,
+    "unknown and disallowed child tools must remain visible");
+  assert.match(subagentSrc, /_settleToolStep\(rejectedStep,[\s\S]{0,240}已拒绝/);
+  assert.match(subagentSrc, /_settleToolStep\(step, result\)/,
+    "child exceptions and interruptions must settle their spinner immediately");
+  assert.match(extractFn("_executeToolStep"), /mutated: false, content: `\$\{rel\} 已是规范格式，无改动/);
 });
 
 test("MCP read-only annotations survive discovery and mapping", () => {
@@ -953,7 +1944,10 @@ test("MCP read-only annotations survive discovery and mapping", () => {
   assert.match(SRC, /mcpReadOnly: !!m\?\.readOnly/);
   assert.doesNotMatch(SRC, /perm !== "approve"[^\n]*call\.mcpReadOnly/);
   assert.match(SRC, /readOnlyMode && \([^\n]*call\.type === "mcp"/);
-  assert.match(SRC, /const _workspaceMutated = _WORKSPACE_MUTATING_TYPES\.has\(t\) && _ok;/);
+  assert.match(SRC, /const _workspaceMutated = _ok && \(it\._wikiMutated \|\| _toolMutatesWorkspace\(it\.call, it\.rawResult\)\)/);
+  assert.match(SRC, /const _materialEffect = _ok && \(_workspaceMutated/);
+  assert.match(SRC, /_effectTarget === "runtime"[\s\S]{0,120}_toolProducesRuntimeEffect/);
+  assert.match(SRC, /_toolProducesMaterialEffect\(it\.call, it\.rawResult, false\)/);
   assert.match(SRC, /worker 不能调用可写 MCP/);
   assert.match(SRC, /执行 MCP 工具/);
   assert.match(SRC, /mcp_status", \{ name \}.*catch \{ return false; \}/s);
@@ -989,4 +1983,72 @@ test("UI and read-before-edit gates are structurally wired for every agent model
   assert.match(SRC, /_runHasCurrentRead\(run, root, old/);
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/);
   assert.match(SRC, /ideMode: run\.mode/);
+});
+
+test("manual conflict overwrite keeps newer typing dirty and queues another save", async () => {
+  let editorValue = "snapshot";
+  let resolveWrite;
+  let dirty = true;
+  let scheduled = 0;
+  let didSave = 0;
+  const file = {
+    name: "a.js",
+    diskContent: "old",
+    externalConflict: true,
+    externalDeleted: false,
+    model: { getValue: () => editorValue },
+  };
+  const openFiles = new Map([["/repo/a.js", file]]);
+  const resolver = load("_resolveManualSaveConflict", {
+    openFiles,
+    backend: {
+      readTextFile: async () => "changed-on-disk",
+      writeTextFileIfUnchanged: () => new Promise((resolve) => { resolveWrite = resolve; }),
+    },
+    _isMissingFileError: load("_isMissingFileError"),
+    ioConfirm: async () => true,
+    markDirty: (_path, value) => { dirty = value; file.dirty = value; },
+    scheduleAutoSave: () => { scheduled++; },
+    showToast: () => {},
+    lspManager: { didSave: () => { didSave++; } },
+    t: () => "saved",
+  });
+
+  const saving = resolver("/repo/a.js", file, "snapshot", new Error("stale"));
+  await new Promise((resolve) => setImmediate(resolve));
+  editorValue = "typed while overwrite was pending";
+  resolveWrite();
+  assert.equal(await saving, false);
+  assert.equal(file.diskContent, "snapshot", "the successful CAS snapshot becomes the next save baseline");
+  assert.equal(dirty, true, "newer editor input must never be marked saved");
+  assert.equal(scheduled, 1);
+  assert.equal(didSave, 0);
+});
+
+test("a stale watcher read cannot roll back a newer preloaded Monaco model", async () => {
+  let value = "v0";
+  let resolveRead;
+  const model = { getValue: () => value };
+  const applied = [];
+  const sync = load("_syncOpenFilesFromDisk", {
+    _coherentFilePath: COHERENT_PATH,
+    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    openFiles: new Map(),
+    _openingFiles: new Map(),
+    projectModels: new Set(["/repo/src/a.js"]),
+    monaco: { Uri: { file: (path) => path }, editor: { getModel: () => model } },
+    backend: { readTextFile: () => new Promise((resolve) => { resolveRead = resolve; }) },
+    _pendingEditorWrites: new Map(),
+    _externalSyncGeneration: new Map(),
+    _applyDiskContentToOpenFile: (_path, content) => applied.push(content),
+    _isMissingFileError: load("_isMissingFileError"),
+  });
+
+  const pending = sync(["/repo/src"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  value = "newer-agent-version";
+  resolveRead("stale-watcher-version");
+  await pending;
+  assert.deepEqual(applied, []);
+  assert.equal(value, "newer-agent-version");
 });

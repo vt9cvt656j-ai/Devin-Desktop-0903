@@ -18,6 +18,7 @@ export class ConversationMemory {
     this.recent = [];
     this.summaries = [];
     this.milestones = [];
+    this.fileEvidence = [];
   }
 
   push(msg) {
@@ -30,6 +31,53 @@ export class ConversationMemory {
 
   markMilestone(event) {
     this.milestones.push({ turn: this.totalTurns, event });
+  }
+
+  recordFileEvidence(evidence) {
+    if (!evidence || !evidence.root || !evidence.path || !evidence.signature) return;
+    const next = {
+      root: String(evidence.root),
+      path: String(evidence.path),
+      signature: String(evidence.signature),
+      total: Math.max(0, Number(evidence.total) || 0),
+      ranges: Array.isArray(evidence.ranges) ? evidence.ranges : [[evidence.from, evidence.to]],
+      digest: String(evidence.digest || "").slice(0, 700),
+      redacted: !!evidence.redacted,
+      updatedAt: Number(evidence.updatedAt) || Date.now(),
+    };
+    next.ranges = next.ranges
+      .map((range) => [Math.max(1, Number(range?.[0]) || 1), Math.max(0, Number(range?.[1]) || 0)])
+      .filter((range) => range[1] >= range[0])
+      .sort((a, b) => a[0] - b[0]);
+    const index = this.fileEvidence.findIndex((item) => item.root === next.root && item.path === next.path);
+    const current = index >= 0 ? this.fileEvidence[index] : null;
+    if (current && current.signature === next.signature) {
+      next.ranges.push(...(Array.isArray(current.ranges) ? current.ranges : []));
+      if (!next.digest) next.digest = current.digest || "";
+      next.redacted = next.redacted || !!current.redacted;
+    }
+    next.ranges.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const range of next.ranges) {
+      const last = merged[merged.length - 1];
+      if (last && range[0] <= last[1] + 1) last[1] = Math.max(last[1], range[1]);
+      else merged.push([...range]);
+    }
+    next.ranges = merged;
+    next.complete = next.total > 0 && next.ranges.length === 1 && next.ranges[0][0] === 1 && next.ranges[0][1] >= next.total;
+    if (index >= 0) this.fileEvidence.splice(index, 1);
+    this.fileEvidence.push(next);
+    if (this.fileEvidence.length > 80) this.fileEvidence.splice(0, this.fileEvidence.length - 80);
+  }
+
+  invalidateFileEvidence(root, path) {
+    const r = String(root || ""), p = String(path || "");
+    this.fileEvidence = this.fileEvidence.filter((item) => !(item.root === r && item.path === p));
+  }
+
+  fileEvidenceForRoot(root) {
+    const r = String(root || "");
+    return this.fileEvidence.filter((item) => item.root === r).map((item) => ({ ...item, ranges: (item.ranges || []).map((range) => [...range]) }));
   }
 
   assemble() {
@@ -115,12 +163,18 @@ export class ConversationMemory {
   }
 
   toJSON() {
-    return { totalTurns: this.totalTurns, recent: this.recent, summaries: this.summaries, milestones: this.milestones };
+    return { totalTurns: this.totalTurns, recent: this.recent, summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
   }
 
   static fromJSON(obj) {
     const mem = new ConversationMemory();
-    if (obj) { mem.totalTurns = obj.totalTurns || 0; mem.recent = obj.recent || []; mem.summaries = obj.summaries || []; mem.milestones = obj.milestones || []; }
+    if (obj) {
+      mem.totalTurns = obj.totalTurns || 0;
+      mem.recent = obj.recent || [];
+      mem.summaries = obj.summaries || [];
+      mem.milestones = obj.milestones || [];
+      mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
+    }
     return mem;
   }
 }

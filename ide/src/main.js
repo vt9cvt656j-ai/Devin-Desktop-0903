@@ -100,7 +100,7 @@ const backend = inTauri ? await tauriBackend() : mockBackend();
 // no scp. When `_remote.active`, the core file + command ops below route to the
 // daemon's HTTP API instead of the local filesystem. (Git on remote works for free —
 // the agent just runs git via run_cmd → /exec.)
-const _remote = { active: false, url: "", token: "", root: "", host: "" };
+const _remote = { active: false, url: "", token: "", root: "", host: "", platform: "" };
 async function _remoteCall(ep, body) {
   const r = await fetch(_remote.url + ep, {
     method: "POST", cache: "no-store",
@@ -119,6 +119,7 @@ async function connectRemote(url, token, root) {
   try {
     const ping = await _remoteCall("/ping", {});            // verify reachable + token
     _remote.host = ping.host || url;
+    _remote.platform = ping.platform || "";
     _remote.root = _remote.root || ping.root || ".";
     try { showToast("已连接远程：" + _remote.host + "（" + _remote.root + "）"); } catch {}
     // Load the remote root into the explorer — readDir is now routed to the daemon, so
@@ -131,20 +132,65 @@ async function connectRemote(url, token, root) {
     throw e;
   }
 }
-function disconnectRemote() { Object.assign(_remote, { active: false, url: "", token: "", root: "", host: "" }); try { showToast("已断开远程"); } catch {} }
+function disconnectRemote() { Object.assign(_remote, { active: false, url: "", token: "", root: "", host: "", platform: "" }); try { showToast("已断开远程"); } catch {} }
 if (typeof window !== "undefined") { window.connectRemote = connectRemote; window.disconnectRemote = disconnectRemote; window._remote = _remote; }
+
+// The remote daemon returns a compact flat hit list, while the editor and Agent
+// consume the same grouped FileMatches shape as the native Rust backend. Normalize
+// it once at the routing boundary so search, open, read and write keep one path
+// identity regardless of which machine is active.
+function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
+  const base = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
+  const groups = new Map();
+  let fallbackRegex = null;
+  try { fallbackRegex = new RegExp(String(query || ""), caseSensitive ? "" : "i"); }
+  catch { try { fallbackRegex = new RegExp(String(query || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), caseSensitive ? "" : "i"); } catch {} }
+  for (const hit of Array.isArray(hits) ? hits : []) {
+    const rel = _normalizeFsPath(String(hit?.rel || "")).replace(/^\/+/, "");
+    if (!rel) continue;
+    let group = groups.get(rel);
+    if (!group) {
+      group = {
+        path: _coherentFilePath(String(hit?.path || "") || (base ? base + "/" + rel : rel)),
+        name: rel.split("/").pop() || rel,
+        rel,
+        matches: [],
+      };
+      groups.set(rel, group);
+    }
+    const text = String(hit?.text || "");
+    const fallback = fallbackRegex ? fallbackRegex.exec(text) : null;
+    if (fallbackRegex) fallbackRegex.lastIndex = 0;
+    const start = Number.isFinite(hit?.start) ? Math.max(0, Math.floor(hit.start)) : Math.max(0, fallback?.index || 0);
+    const fallbackLength = fallback?.[0]?.length || String(query || "").length;
+    const end = Number.isFinite(hit?.end) ? Math.max(start, Math.floor(hit.end)) : start + fallbackLength;
+    group.matches.push({
+      line: Number.isFinite(hit?.line) ? Math.max(1, Math.floor(hit.line)) : 1,
+      column: Number.isFinite(hit?.column) ? Math.max(1, Math.floor(hit.column)) : start + 1,
+      text,
+      start,
+      end,
+    });
+  }
+  return [...groups.values()].sort((a, b) => a.rel.localeCompare(b.rel));
+}
 
 // Route the core file ops to the remote daemon when connected (else local backend).
 {
   const _local = {
     readDir: backend.readDir, readTextFile: backend.readTextFile, writeTextFile: backend.writeTextFile,
     writeTextFileIfUnchanged: backend.writeTextFileIfUnchanged,
-    createFile: backend.createFile, createDir: backend.createDir, renamePath: backend.renamePath,
+    createFile: backend.createFile, createDir: backend.createDir, copyPath: backend.copyPath, renamePath: backend.renamePath,
     deletePath: backend.deletePath, deleteTextFileIfUnchanged: backend.deleteTextFileIfUnchanged,
     searchInProject: backend.searchInProject,
   };
   backend.readDir = (p) => _remote.active
-    ? _remoteCall("/fs/list", { path: p }).then((j) => (j.entries || []).map((e) => ({ name: e.name, is_dir: e.is_dir, size: e.size })))
+    ? _remoteCall("/fs/list", { path: p }).then((j) => (j.entries || []).map((e) => ({
+      name: e.name,
+      path: _normalizeFsPath(String(p || "").replace(/\/+$/, "") + "/" + e.name),
+      is_dir: e.is_dir,
+      size: e.size,
+    })))
     : _local.readDir(p);
   backend.readTextFile = (p) => _remote.active ? _remoteCall("/fs/read", { path: p }).then((j) => j.content || "") : _local.readTextFile(p);
   backend.writeTextFile = (p, c) => _remote.active ? _remoteCall("/fs/write", { path: p, content: c }) : _local.writeTextFile(p, c);
@@ -154,13 +200,14 @@ if (typeof window !== "undefined") { window.connectRemote = connectRemote; windo
   backend.deleteTextFileIfUnchanged = (p, expectedContent) => _remote.active
     ? _remoteCall("/fs/delete", { path: p, expected_content: expectedContent })
     : _local.deleteTextFileIfUnchanged(p, expectedContent);
-  backend.createFile = (p) => _remote.active ? _remoteCall("/fs/write", { path: p, content: "" }) : _local.createFile(p);
+  backend.createFile = (p) => _remote.active ? _remoteCall("/fs/write", { path: p, expected_content: null, content: "" }) : _local.createFile(p);
   backend.createDir = (p) => _remote.active ? _remoteCall("/fs/mkdir", { path: p }) : _local.createDir(p);
+  backend.copyPath = (from, to) => _remote.active ? _remoteCall("/fs/copy", { from, to }) : _local.copyPath(from, to);
   backend.renamePath = (from, to) => _remote.active ? _remoteCall("/fs/rename", { from, to }) : _local.renamePath(from, to);
   backend.deletePath = (p) => _remote.active ? _remoteCall("/fs/delete", { path: p }) : _local.deletePath(p);
-  backend.searchInProject = (root, query, cs) => _remote.active
-    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs }).then((j) => (j.hits || []).map((h) => ({ path: (root.replace(/\/+$/, "") + "/" + h.rel), line: h.line, text: h.text })))
-    : _local.searchInProject(root, query, cs);
+  backend.searchInProject = (root, query, cs, mode = "literal") => _remote.active
+    ? _remoteCall("/fs/search", { root, query, case_sensitive: cs, mode }).then((j) => _groupRemoteSearchHits(root, query, cs, j.hits))
+    : _local.searchInProject(root, query, cs, mode);
 }
 
 // Reap any backend processes (shells / LSP servers / debug adapters) orphaned by
@@ -216,10 +263,15 @@ async function tauriBackend() {
     homeDir: () => core.invoke("home_dir"),
     createFile: (path) => core.invoke("create_file", { path }),
     createDir: (path) => core.invoke("create_dir", { path }),
+    copyPath: (from, to) => core.invoke("copy_path", { from, to }),
     renamePath: (from, to) => core.invoke("rename_path", { from, to }),
     deletePath: (path) => core.invoke("delete_path", { path }),
-    searchInProject: (root, query, caseSensitive) =>
-      core.invoke("search_in_project", { root, query, caseSensitive }),
+    searchInProject: async (root, query, caseSensitive, mode = "literal") => {
+      const results = await core.invoke("search_in_project", { root, query, caseSensitive, mode });
+      return Array.isArray(results)
+        ? results.map((result) => (result && typeof result.path === "string" ? { ...result, path: _toPosix(result.path) } : result))
+        : results;
+    },
     gitStatus: (root) => core.invoke("git_status", { root }),
     gitWorktreeAdd: (root, name) => core.invoke("git_worktree_add", { root, name }),
     gitWorktreeList: (root) => core.invoke("git_worktree_list", { root }),
@@ -420,9 +472,14 @@ async function _realAiFetch(config, messages, tools, onEvent) {
           if (d.content) onEvent({ kind: "token", delta: d.content });
           if (Array.isArray(d.tool_calls)) {
             for (const tc of d.tool_calls) {
+              if (!Number.isInteger(tc.index) || tc.index < 0) {
+                onEvent({ kind: "error", message: "streamed tool call is missing its numeric index" });
+                onEvent({ kind: "done" });
+                return;
+              }
               onEvent({
                 kind: "toolCall",
-                index: tc.index ?? 0,
+                index: tc.index,
                 id: tc.id || "",
                 name: (tc.function && tc.function.name) || "",
                 arguments: (tc.function && tc.function.arguments) || "",
@@ -843,6 +900,20 @@ function mockBackend() {
     createDir: async (path) => {
       if (exists(path)) throw new Error("a file or folder with that name already exists");
       ensureDir(path);
+    },
+    copyPath: async (from, to) => {
+      if (exists(to)) throw new Error("a file or folder with that name already exists");
+      ensureDir(parentOf(to));
+      if (from in FILES) {
+        FILES[to] = FILES[from];
+      } else if (DIRS.has(from)) {
+        ensureDir(to);
+        const prefix = from + "/";
+        for (const f of Object.keys(FILES)) if (f.startsWith(prefix)) FILES[to + f.slice(from.length)] = FILES[f];
+        for (const d of [...DIRS]) if (d.startsWith(prefix)) DIRS.add(to + d.slice(from.length));
+      } else {
+        throw new Error("not found");
+      }
     },
     renamePath: async (from, to) => {
       if (exists(to)) throw new Error("a file or folder with that name already exists");
@@ -1273,6 +1344,7 @@ monacoEditor.onDidCompositionStart(() => { _imeComposing = true; });
 monacoEditor.onDidCompositionEnd(() => {
   _imeComposing = false;
   while (_imeFlushCallbacks.length) _imeFlushCallbacks.shift()();
+  scheduleAutoSave(activePath);
 });
 
 const _CN_PUNCT_MAP = {
@@ -2769,12 +2841,19 @@ monacoEditor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F11, () => dapManag
 
 /** path -> { model, name, dirty, viewState } */
 const openFiles = new Map();
+const _openingFiles = new Map();
 let activePath = null;
 
 // Paths whose Monaco model is kept alive as part of the language-service
 // "project" (so cross-file go-to-definition / completion resolves even when the
 // target file isn't open in a tab). These models are not disposed on close.
 const projectModels = new Set();
+
+// Programmatic disk/agent refreshes must not look like user typing. Monaco emits the
+// same change event for setValue(), so keep a tiny synchronous guard around those
+// updates; otherwise a clean external refresh is immediately marked dirty and the
+// autosaver can write the previous buffer back over the real file.
+const _programmaticModelUpdates = new WeakSet();
 
 // Create (or reuse) a model addressed by its real path so the TypeScript
 // language service treats files as one project and can resolve imports across
@@ -2784,6 +2863,7 @@ function attachModelListeners(path, model) {
   if (modelsWithListeners.has(model)) return;
   modelsWithListeners.add(model);
   model.onDidChangeContent(() => {
+    if (_programmaticModelUpdates.has(model)) return;
     markDirty(path, true);
     if (_imeComposing) {
       if (!_imeFlushCallbacks.some(cb => cb._lspPath === path)) {
@@ -2842,9 +2922,16 @@ function isPdfFile(name) {
 }
 
 async function openFile(path, name, activateFile = true) {
+  path = _coherentFilePath(path);
   if (openFiles.has(path)) {
     if (activateFile) activate(path);
     return true;
+  }
+  const pendingOpen = _openingFiles.get(path);
+  if (pendingOpen) {
+    const opened = await pendingOpen.promise;
+    if (opened && activateFile) activate(path);
+    return opened;
   }
 
   if (isImageFile(name)) {
@@ -2861,20 +2948,36 @@ async function openFile(path, name, activateFile = true) {
     return true;
   }
 
-  let content;
-  try {
-    content = await backend.readTextFile(path);
-  } catch (e) {
-    showToast(String(e));
-    return false;
-  }
-  const model = getOrCreateModel(path, name, content);
-  openFiles.set(path, { model, name, dirty: false, viewState: null });
-  renderTabs();
-  if (activateFile) activate(path);
-  lspManager?.didOpen(path, model);
-  _onFileOpened(model);
-  return true;
+  const opening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0, promise: null };
+  opening.promise = (async () => {
+    let content;
+    try {
+      content = await backend.readTextFile(path);
+    } catch (e) {
+      showToast(String(e));
+      return false;
+    }
+    // A known write may have completed while the read was in flight. Its exact
+    // committed content wins over this potentially stale read result.
+    if (opening.externalDeleted) {
+      showToast(`${name} 在打开期间已被删除，未载入旧内容`);
+      return false;
+    }
+    if (opening.hasDiskContent) content = opening.diskContent;
+    const model = getOrCreateModel(path, name, content);
+    const openedFile = { model, name, dirty: false, viewState: null, diskContent: content, externalConflict: false, externalDeleted: false };
+    opening.openedFile = openedFile;
+    opening.finalDiskContent = content;
+    openFiles.set(path, openedFile);
+    renderTabs();
+    if (activateFile) activate(path);
+    lspManager?.didOpen(path, model);
+    _onFileOpened(model);
+    return true;
+  })();
+  _openingFiles.set(path, opening);
+  try { return await opening.promise; }
+  finally { if (_openingFiles.get(path) === opening) _openingFiles.delete(path); }
 }
 
 function _setEditorModelIfChanged(editor, model) {
@@ -3156,27 +3259,38 @@ function togglePinTab(path) {
   scheduleSaveSession(); // persist the pin now, not only when some other action saves
 }
 
-async function closeFile(path) {
+async function closeFile(path, { force = false } = {}) {
+  path = _coherentFilePath(path);
   const f = openFiles.get(path);
-  if (!f) return;
-  if (pinnedTabs.has(path)) return; // pinned tabs cannot be closed
+  if (!f) return true;
+  if (pinnedTabs.has(path) && !force) return false; // pinned tabs cannot be closed manually
+  if (force) pinnedTabs.delete(path);
   // Don't silently lose unsaved edits on tab close — the 800ms autosave debounce may
   // not have fired yet, and the hot-exit backup only covers app close. Save to disk
   // first; if that fails, stash a recoverable backup + warn (never silently drop).
   if (f.dirty && f.model && !f.isImage) {
-    let content = "";
-    try { content = f.model.getValue(); } catch {}
+    let snapshot = "";
+    try { snapshot = f.model.getValue(); } catch {}
     try {
-      await backend.writeTextFile(path, content);
-      f.dirty = false;
+      await _writeOpenFileSnapshot(path, snapshot);
+      if (f.model.getValue() !== snapshot) {
+        markDirty(path, true);
+        scheduleAutoSave(path);
+        showToast(`未关闭 ${f.name}：保存期间仍有新输入，已继续保存最新内容`);
+        return false;
+      }
+      markDirty(path, false);
     } catch (e) {
+      let latest = snapshot;
+      try { latest = f.model.getValue(); } catch {}
       try {
         const bak = JSON.parse(localStorage.getItem("michael-ide.unsaved-buffers") || "[]");
         const i = bak.findIndex((b) => b.path === path);
-        if (i >= 0) bak[i].content = content; else bak.push({ path, content });
+        if (i >= 0) bak[i].content = latest; else bak.push({ path, content: latest });
         localStorage.setItem("michael-ide.unsaved-buffers", JSON.stringify(bak));
       } catch {}
-      try { showToast("⚠ " + (f.name || path) + " 未能保存，已备份，下次打开可恢复"); } catch {}
+      try { showToast("⚠ " + (f.name || path) + " 未能保存，已保留标签并备份当前内容"); } catch {}
+      return false;
     }
   }
   lspManager?.didClose(path);
@@ -3198,6 +3312,26 @@ async function closeFile(path) {
   }
   renderTabs();
   syncWelcome();
+  return true;
+}
+
+async function _closeOpenFilesUnder(path) {
+  for (const openPath of [...openFiles.keys()]) {
+    if (!_pathIsAtOrUnder(openPath, path)) continue;
+    if (!(await closeFile(openPath))) {
+      showToast(`无法继续：${openFiles.get(openPath)?.name || openPath} 仍打开或尚未保存`);
+      return false;
+    }
+  }
+  return true;
+}
+
+function _dirtyOpenFileUnder(path) {
+  path = _coherentFilePath(path);
+  for (const [openPath, file] of openFiles) {
+    if (_pathIsAtOrUnder(openPath, path) && file?.dirty) return openPath;
+  }
+  return "";
 }
 
 function closeOtherTabs(keepPath) {
@@ -3252,20 +3386,320 @@ function markDirty(path, dirty) {
   }
 }
 
-async function saveActive() {
-  if (!activePath) return;
-  const f = openFiles.get(activePath);
-  try {
-    await backend.writeTextFile(activePath, f.model.getValue());
-    markDirty(activePath, false);
-    lspManager?.didSave(activePath, f.model);
-    showToast(t("file.saved", { name: f.name }));
-    refreshBlame();
-    // Keep the find_symbol index current — re-extract entries for the saved file.
-    if (typeof refreshSymbolIndexFor === "function") { try { refreshSymbolIndexFor(activePath); } catch {} }
-  } catch (e) {
-    showToast(String(e));
+// Update a clean open editor after a known disk write. Dirty buffers are never
+// replaced: they may contain user input that has not reached disk yet.
+function _applyDiskContentToOpenFile(path, content) {
+  path = _coherentFilePath(path);
+  const f = openFiles.get(path);
+  const opening = _openingFiles.get(path);
+  if (opening && !f) {
+    opening.diskContent = content;
+    opening.hasDiskContent = true;
+    opening.externalDeleted = false;
+    opening.diskVersion = (opening.diskVersion || 0) + 1;
+    return { state: "opening-updated" };
   }
+  if (!f || !f.model || f.isImage || f.isPdf) {
+    // Preloaded project models also feed Monaco diagnostics even without an open
+    // tab. Keep them coherent or verification can inspect the code from before the
+    // Agent write and report a false pass/failure.
+    let model = null;
+    try { if (projectModels.has(path)) model = monaco.editor.getModel(monaco.Uri.file(path)); } catch {}
+    if (!model) return { state: "closed" };
+    if (model.getValue() !== content) {
+      _programmaticModelUpdates.add(model);
+      try { model.setValue(content); }
+      finally { _programmaticModelUpdates.delete(model); }
+    }
+    return { state: "project-model-updated" };
+  }
+  if (f.dirty) {
+    f.externalConflict = true;
+    return { state: "conflict" };
+  }
+  const model = f.model;
+  const viewState = path === activePath ? monacoEditor.saveViewState() : null;
+  if (model.getValue() !== content) {
+    _programmaticModelUpdates.add(model);
+    try { model.setValue(content); }
+    finally { _programmaticModelUpdates.delete(model); }
+    if (viewState) monacoEditor.restoreViewState(viewState);
+    lspManager?.didChange(path, model);
+  }
+  f.diskContent = content;
+  f.externalConflict = false;
+  f.externalDeleted = false;
+  markDirty(path, false);
+  lspManager?.didSave(path, model);
+  return { state: "updated" };
+}
+
+function _openFileWriteConflict(path) {
+  path = _coherentFilePath(path);
+  const f = openFiles.get(path);
+  return !!(f && f.model && f.dirty);
+}
+
+async function _commitDiskTextIfUnchanged(path, expectedContent, content) {
+  path = _coherentFilePath(path);
+  if (_openFileWriteConflict(path)) throw new Error("编辑器有尚未保存的用户改动，已阻止覆盖");
+  await backend.writeTextFileIfUnchanged(path, expectedContent, content);
+  const sync = _applyDiskContentToOpenFile(path, content);
+  if (sync.state !== "conflict") return path;
+  let rolledBack = false;
+  try {
+    if (expectedContent == null) await backend.deleteTextFileIfUnchanged(path, content);
+    else await backend.writeTextFileIfUnchanged(path, content, expectedContent);
+    rolledBack = true;
+  } catch {}
+  const open = openFiles.get(path);
+  if (rolledBack && open) open.externalConflict = false;
+  throw new Error(rolledBack
+    ? "写入期间用户继续编辑，本次写入已撤销"
+    : "写入期间编辑器和磁盘都发生变化，已保留用户缓冲区");
+}
+
+// Serialize editor saves per path and use the last known disk snapshot as the CAS
+// expectation. A stale buffer can therefore never silently overwrite an Agent,
+// terminal, Git, or second-window change.
+const _pendingEditorWrites = new Map();
+const _externalSyncGeneration = new Map();
+async function _writeOpenFileSnapshot(path, snapshot) {
+  path = _coherentFilePath(path);
+  const f = openFiles.get(path);
+  if (!f || !f.model) throw new Error("文件已关闭");
+  // Re-check after every wait. If B and C both arrived while A was saving, B
+  // installs its operation before yielding, so C observes and waits for B too.
+  while (f._savePromise) {
+    try { await f._savePromise; } catch {}
+  }
+  const expected = typeof f.diskContent === "string"
+    ? f.diskContent
+    : await backend.readTextFile(path);
+  const op = backend.writeTextFileIfUnchanged(path, expected, snapshot);
+  const pending = { content: snapshot, op };
+  _pendingEditorWrites.set(path, pending);
+  f._savePromise = op;
+  try {
+    await op;
+    f.diskContent = snapshot;
+    f.externalConflict = false;
+    f.externalDeleted = false;
+  } finally {
+    if (f._savePromise === op) f._savePromise = null;
+    if (_pendingEditorWrites.get(path) === pending) _pendingEditorWrites.delete(path);
+  }
+}
+
+function _isMissingFileError(error) {
+  return /No such file or directory|not found|does not exist|cannot find|ENOENT|os error 2|找不到(?:指定的)?文件|文件不存在/i.test(String(error?.message || error || ""));
+}
+
+function _dropProjectModel(path) {
+  path = _coherentFilePath(path);
+  projectModels.delete(path);
+  if (openFiles.has(path)) return;
+  try {
+    const model = monaco.editor.getModel(monaco.Uri.file(path));
+    if (model) model.dispose();
+  } catch {}
+}
+
+async function _syncOpenFilesFromDisk(paths, source = "外部程序") {
+  const changedPaths = [...new Set((paths || []).map(_coherentFilePath).filter(Boolean))];
+  const trackedPaths = [...new Set([...openFiles.keys(), ..._openingFiles.keys()])];
+  const targets = trackedPaths.filter((path) => changedPaths.some((changedPath) => _pathIsAtOrUnder(path, changedPath)));
+  for (const path of targets) {
+    const initialFile = openFiles.get(path);
+    const initialOpening = _openingFiles.get(path);
+    if ((!initialFile || !initialFile.model || initialFile.isImage || initialFile.isPdf) && !initialOpening) continue;
+    const generation = (_externalSyncGeneration.get(path) || 0) + 1;
+    _externalSyncGeneration.set(path, generation);
+    const diskContentBeforeRead = initialFile?.diskContent;
+    const openingVersionBeforeRead = initialOpening?.diskVersion || 0;
+    let disk;
+    let readError = null;
+    try { disk = await backend.readTextFile(path); } catch (error) { readError = error; }
+    // A newer save/Agent sync won while this asynchronous read was in flight.
+    // Discard the stale result; its own watcher event (or immediate Agent sync)
+    // already owns the newer generation.
+    if (_externalSyncGeneration.get(path) !== generation) continue;
+    const opening = _openingFiles.get(path);
+    const f = openFiles.get(path);
+    const openingStillCurrent = !!initialOpening && opening === initialOpening
+      && (initialOpening.diskVersion || 0) === openingVersionBeforeRead;
+    const transitionedOpeningFileCurrent = !!f && !initialFile && !!initialOpening
+      && initialOpening.openedFile === f
+      && (initialOpening.diskVersion || 0) === openingVersionBeforeRead
+      && f.diskContent === initialOpening.finalDiskContent;
+    const fileStillCurrent = initialFile
+      ? (f === initialFile && f.diskContent === diskContentBeforeRead)
+      : transitionedOpeningFileCurrent;
+    if (!openingStillCurrent && !fileStillCurrent) continue;
+    if (readError) {
+      if (!_isMissingFileError(readError) || _pendingEditorWrites.has(path)) continue;
+      if (openingStillCurrent) {
+        initialOpening.externalDeleted = true;
+        initialOpening.diskVersion = openingVersionBeforeRead + 1;
+      }
+      if (!fileStillCurrent) continue;
+      if (f.dirty) {
+        if (!f.externalDeleted) showToast(`⚠️ ${source}删除了 ${f.name}；已保留你的未保存内容，未重新创建或覆盖磁盘`);
+        f.externalConflict = true;
+        f.externalDeleted = true;
+        continue;
+      }
+      _dropProjectModel(path);
+      if (await closeFile(path, { force: true })) showToast(`${f.name} 已被${source}删除，已关闭旧标签`);
+      continue;
+    }
+    if (openingStillCurrent) {
+      initialOpening.diskContent = disk;
+      initialOpening.hasDiskContent = true;
+      initialOpening.externalDeleted = false;
+      initialOpening.diskVersion = openingVersionBeforeRead + 1;
+    }
+    if (!fileStillCurrent) continue;
+    f.externalDeleted = false;
+    const pending = _pendingEditorWrites.get(path);
+    if (pending && disk === pending.content) {
+      f.diskContent = disk;
+      continue;
+    }
+    if (disk === f.diskContent) continue;
+    if (f.dirty) {
+      if (!f.externalConflict) showToast(`⚠️ ${source}修改了 ${f.name}；已保留你的未保存内容，未自动覆盖`);
+      f.externalConflict = true;
+      continue;
+    }
+    _applyDiskContentToOpenFile(path, disk);
+  }
+
+  // A preloaded Monaco model can exist without an open tab. Drop it when its
+  // exact file is externally deleted so diagnostics never inspect stale code.
+  const preloadedTargets = [...projectModels].filter((path) => changedPaths.some((changedPath) => _pathIsAtOrUnder(path, changedPath)));
+  for (const path of preloadedTargets) {
+    if (openFiles.has(path) || _openingFiles.has(path)) continue;
+    let model = null;
+    let contentBeforeRead = null;
+    try {
+      model = monaco.editor.getModel(monaco.Uri.file(path));
+      if (model) contentBeforeRead = model.getValue();
+    } catch {}
+    try {
+      const disk = await backend.readTextFile(path);
+      if (openFiles.has(path) || _openingFiles.has(path) || !projectModels.has(path)) continue;
+      if (model && model.getValue() !== contentBeforeRead) continue;
+      _applyDiskContentToOpenFile(path, disk);
+    } catch (error) {
+      if (_isMissingFileError(error) && !openFiles.has(path) && !_openingFiles.has(path)) _dropProjectModel(path);
+    }
+  }
+}
+
+async function _resolveManualSaveConflict(path, file, snapshot, originalError) {
+  if (openFiles.get(path) !== file || file.model.getValue() !== snapshot) return false;
+  let disk = "";
+  let missing = false;
+  try { disk = await backend.readTextFile(path); }
+  catch (error) {
+    if (_isMissingFileError(error)) missing = true;
+    else {
+      showToast(`保存失败：${String(originalError?.message || originalError || error).slice(0, 100)}`);
+      return false;
+    }
+  }
+  if (!missing && disk === file.diskContent) {
+    showToast(`保存失败：${String(originalError?.message || originalError).slice(0, 100)}`);
+    return false;
+  }
+  file.externalConflict = true;
+  file.externalDeleted = missing;
+  if (openFiles.get(path) !== file || file.model.getValue() !== snapshot) return false;
+
+  const overwrite = await ioConfirm({
+    title: missing ? `${file.name} 已被删除` : `${file.name} 已在磁盘上变化`,
+    message: missing
+      ? "是否用编辑器中的当前内容重新创建该文件？取消会继续保留未保存内容。"
+      : "是否用编辑器中的当前内容明确覆盖磁盘新版本？取消后还可以选择重新载入磁盘。",
+    okLabel: missing ? "重新创建" : "覆盖磁盘",
+    danger: true,
+  });
+  if (openFiles.get(path) !== file || file.model.getValue() !== snapshot) {
+    showToast(`${file.name} 在确认期间仍有新输入，本次保存已取消`);
+    return false;
+  }
+  if (overwrite) {
+    try {
+      await backend.writeTextFileIfUnchanged(path, missing ? null : disk, snapshot);
+      file.diskContent = snapshot;
+      file.externalConflict = false;
+      file.externalDeleted = false;
+      if (openFiles.get(path) !== file) return false;
+      if (file.model.getValue() !== snapshot) {
+        markDirty(path, true);
+        scheduleAutoSave(path);
+        showToast(`${file.name} 在覆盖期间仍有新输入，已继续排队保存最新内容`);
+        return false;
+      }
+      markDirty(path, false);
+      lspManager?.didSave(path, file.model);
+      if (typeof refreshSymbolIndexFor === "function") { try { refreshSymbolIndexFor(path); } catch {} }
+      showToast(t("file.saved", { name: file.name }));
+      return true;
+    } catch (error) {
+      showToast(`覆盖失败：磁盘又发生了变化；编辑器内容仍保留。${String(error?.message || error).slice(0, 80)}`);
+      return false;
+    }
+  }
+  if (missing) return false;
+
+  const reload = await ioConfirm({
+    title: `重新载入 ${file.name}？`,
+    message: "这会丢弃编辑器里尚未保存的冲突内容，并载入磁盘上的最新版本。",
+    okLabel: "重新载入",
+    danger: true,
+  });
+  if (!reload || openFiles.get(path) !== file || file.model.getValue() !== snapshot) return false;
+  try {
+    const latest = await backend.readTextFile(path);
+    if (openFiles.get(path) !== file || file.model.getValue() !== snapshot) return false;
+    markDirty(path, false);
+    _applyDiskContentToOpenFile(path, latest);
+    showToast(`已重新载入 ${file.name}`);
+  } catch (error) {
+    markDirty(path, true);
+    showToast(`重新载入失败：${String(error?.message || error).slice(0, 100)}`);
+  }
+  return false;
+}
+
+async function saveActive(path = activePath) {
+  if (!path) return false;
+  const savingPath = _coherentFilePath(path);
+  const f = openFiles.get(savingPath);
+  if (!f || !f.model) return false;
+  const snapshot = f.model.getValue();
+  try {
+    await _writeOpenFileSnapshot(savingPath, snapshot);
+    if (openFiles.get(savingPath) === f && f.model.getValue() === snapshot) {
+      markDirty(savingPath, false);
+      lspManager?.didSave(savingPath, f.model);
+      showToast(t("file.saved", { name: f.name }));
+      refreshBlame();
+      // Keep the find_symbol index current — re-extract entries for the saved file.
+      if (typeof refreshSymbolIndexFor === "function") { try { refreshSymbolIndexFor(savingPath); } catch {} }
+      return true;
+    } else if (openFiles.get(savingPath) === f) {
+      markDirty(savingPath, true);
+      scheduleAutoSave(savingPath);
+      showToast(`${f.name} 仍在编辑，已继续排队保存最新内容`);
+    }
+  } catch (e) {
+    f.externalConflict = true;
+    return await _resolveManualSaveConflict(savingPath, f, snapshot, e);
+  }
+  return false;
 }
 
 let dragSrcPath = null;
@@ -3335,6 +3769,68 @@ let workspaceRoots = [];
 // "/" in paths, so posix-normalizing at every boundary makes it all consistent.
 // No-op on macOS/Linux (they have no backslashes in paths).
 function _toPosix(p) { return typeof p === "string" ? p.replace(/\\/g, "/") : p; }
+
+function _normalizeFsPath(path) {
+  if (typeof path !== "string") return path;
+  // A filesystem name may legally end in whitespace on POSIX. Trimming the whole
+  // path turns `/repo/name ` into a different file (`/repo/name`) and defeats the
+  // invisible-whitespace recovery used by read_file. Call sites validate empty
+  // model arguments separately; path normalization itself must preserve identity.
+  let value = _toPosix(path);
+  if (!value) return value;
+  let prefix = "";
+  if (/^[A-Za-z]:\//.test(value)) {
+    prefix = value.slice(0, 2) + "/";
+    value = value.slice(3);
+  } else if (value.startsWith("//")) {
+    prefix = "//";
+    value = value.replace(/^\/+/, "");
+  } else if (value.startsWith("/")) {
+    prefix = "/";
+    value = value.replace(/^\/+/, "");
+  }
+  const parts = [];
+  for (const part of value.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!prefix) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  return prefix + parts.join("/");
+}
+
+function _pathIdentity(path) {
+  const normalized = _normalizeFsPath(path);
+  const remoteCaseInsensitive = _remote.active && /windows|darwin|mac(?:os)?/i.test(_remote.platform || "");
+  const localCaseInsensitive = !_remote.active && typeof navigator !== "undefined"
+    && /Mac|Win/i.test((navigator.platform || "") + " " + (navigator.userAgent || ""));
+  return typeof normalized === "string" && (remoteCaseInsensitive || localCaseInsensitive || /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//"))
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function _pathIsAtOrUnder(candidate, parent) {
+  const childIdentity = _pathIdentity(candidate);
+  const parentIdentity = _pathIdentity(parent);
+  if (!childIdentity || !parentIdentity) return false;
+  return childIdentity === parentIdentity
+    || childIdentity.startsWith(parentIdentity.endsWith("/") ? parentIdentity : parentIdentity + "/");
+}
+
+function _coherentFilePath(path) {
+  const normalized = _normalizeFsPath(path);
+  if (typeof normalized !== "string") return normalized;
+  const identity = _pathIdentity(normalized);
+  for (const known of openFiles.keys()) if (_pathIdentity(known) === identity) return known;
+  for (const known of projectModels) if (_pathIdentity(known) === identity) return known;
+  if (typeof _openingFiles !== "undefined") {
+    for (const known of _openingFiles.keys()) if (_pathIdentity(known) === identity) return known;
+  }
+  return normalized;
+}
 
 // Wire the real LSP client now that workspace state exists. Disabled in the
 // plain-browser mock (no real servers to talk to). Providers are registered for
@@ -3794,7 +4290,22 @@ async function startFileWatcher() {
 }
 
 const _FS_IGNORE_RE = /(^|\/)(node_modules|\.git|target|dist|build|out|\.next|coverage|\.cache|\.venv|__pycache__|vendor|\.gradle)(\/|$)/;
+function _invalidateSessionEvidenceForPaths(paths) {
+  for (const session of _chatSessions || []) {
+    const memory = session?.memory;
+    const project = _normalizeFsPath(String(session?.project || "")).replace(/\/+$/, "");
+    if (!project || typeof memory?.invalidateFileEvidence !== "function") continue;
+    for (const path of paths || []) {
+      const normalized = _normalizeFsPath(String(path || ""));
+      if (normalized === project || normalized.startsWith(project + "/")) {
+        memory.invalidateFileEvidence(project, _normRel(normalized, project));
+      }
+    }
+  }
+}
 function handleFsChanges(paths) {
+  paths = (paths || []).map(_coherentFilePath);
+  _invalidateSessionEvidenceForPaths(paths);
   // A file actually changed (agent write / user edit / external) → the agent context is now stale, so
   // let it rebuild ONCE next time (picking up the new/edited files). When nothing changes, the cache
   // stays valid and the agent reuses it instead of re-scanning + re-reading every turn ("别一直复读").
@@ -3804,6 +4315,9 @@ function handleFsChanges(paths) {
       _bm25Index.built = false;
     }
   } catch {}
+  // Clean open models follow disk changes; dirty models keep the user's buffer and
+  // become an explicit conflict instead of being overwritten.
+  void _syncOpenFilesFromDisk(paths, "磁盘上的文件被外部程序");
   if (!rootPath) return;
   if (_autoSaving) return;
 
@@ -3816,10 +4330,6 @@ function handleFsChanges(paths) {
     return !_FS_IGNORE_RE.test(r ? p.slice(r.length) : p);
   });
   if (!paths.length) return;
-
-  const openPaths = new Set(openFiles.keys());
-  const onlyOpenFiles = paths.every((p) => openPaths.has(p));
-  if (onlyOpenFiles && autoSaveEnabled) return;
 
   const dirsToReload = new Set();
   for (const p of paths) {
@@ -4087,7 +4597,7 @@ async function _deleteSelectedTree() {
   });
   if (!ok) return;
   for (const p of paths) {
-    for (const op of [...openFiles.keys()]) if (op === p || op.startsWith(p + "/")) closeFile(op);
+    if (!(await _closeOpenFilesUnder(p))) return;
     try { await backend.deletePath(p); } catch (err) { showToast(String(err)); }
   }
   _clearTreeSel();
@@ -4276,9 +4786,7 @@ async function renameEntry(path, name, isDir) {
   const dest = parent + "/" + next;
   const reopen = openFiles.has(path) && !isDir;
   try {
-    for (const op of [...openFiles.keys()]) {
-      if (op === path || op.startsWith(path + "/")) closeFile(op);
-    }
+    if (!(await _closeOpenFilesUnder(path))) return;
     await backend.renamePath(path, dest);
   } catch (e) {
     showToast(String(e));
@@ -4296,9 +4804,7 @@ async function deleteEntry(path, name, isDir) {
     danger: true,
   });
   if (!ok) return;
-  for (const op of [...openFiles.keys()]) {
-    if (op === path || op.startsWith(path + "/")) closeFile(op);
-  }
+  if (!(await _closeOpenFilesUnder(path))) return;
   try {
     await backend.deletePath(path);
   } catch (e) {
@@ -5371,13 +5877,8 @@ async function afterWorktreeChange() {
     try {
       const content = await backend.readTextFile(path);
       if (content !== f.model.getValue()) {
-        const pos = path === activePath ? monacoEditor.getPosition() : null;
-        f.model.setValue(content);
-        // setValue fires onDidChangeContent → markDirty(true); reset it since
-        // the file now matches disk again.
-        markDirty(path, false);
-        if (pos) monacoEditor.setPosition(pos);
-      }
+        _applyDiskContentToOpenFile(path, content);
+      } else { f.diskContent = content; f.externalConflict = false; }
     } catch {
       // File doesn't exist on the new branch — close its (clean) tab.
       gone.push(path);
@@ -5548,14 +6049,19 @@ function ensureDiffEditor(opts = {}) {
       const m = diffEditor.getModel();
       if (!m || !_diffFilePath) return;
       const content = m.modified.getValue();
-      backend.writeTextFile(_diffFilePath, content).then(() => {
+      const path = _diffFilePath;
+      _diffSavePromise = _diffSavePromise.catch(() => {}).then(async () => {
+        let expected = null;
+        try { expected = await backend.readTextFile(path); } catch {}
+        await _commitDiskTextIfUnchanged(path, expected, content);
         showToast?.("Diff: saved");
-      }).catch(() => {});
+      }).catch((error) => showToast?.("Diff 保存被阻止：" + String(error?.message || error).slice(0, 80)));
     });
   }
   return diffEditor;
 }
 let _diffFilePath = null;
+let _diffSavePromise = Promise.resolve();
 
 async function openDiff(file) {
   if (!rootPath) return;
@@ -6661,7 +7167,7 @@ function _switchChatSession(idx) {
   _setSendBtnStop(!!session.streaming);
   // Restore or clear the plan chip for THIS tab's session.
   _clearPlanChip();
-  if (session._planSteps && session._planSteps.some((s) => s.status !== "completed" && s.status !== "cancelled")) {
+  if (session._planActive && session._planSteps && session._planSteps.some((s) => s.status !== "completed" && s.status !== "cancelled")) {
     _syncPlanChip({ session, _planSteps: session._planSteps }, session._planSteps);
   }
 }
@@ -6912,8 +7418,13 @@ function _initIPC() {
         _updateIpcBadge();
         break;
       case "file_changed":
-        if (msg.path && openFiles.has(msg.path)) {
-          showToast(`其他窗口修改了 ${msg.path.split("/").pop()}`);
+        if (msg.path) {
+          const changedPath = _coherentFilePath(msg.path);
+          const tracksChangedPath = [...openFiles.keys(), ..._openingFiles.keys()]
+            .some((path) => _pathIsAtOrUnder(path, changedPath));
+          if (tracksChangedPath) {
+            void _syncOpenFilesFromDisk([changedPath], "其他窗口");
+          }
         }
         break;
       case "workspace_changed":
@@ -7679,7 +8190,7 @@ function _applyCloudToolDescs(tools) {
 
 const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：区分已验证事实、推断、假设和未知；只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索。部分来源失败要逐项说明，禁止用“全部、最强、最快、10 倍、百分之百”等无证据宣传语。只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
-  agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：先 read_file/list_dir/search 调研现状，用 update_plan 列计划，逐步用 write_file/edit_file/run_cmd 等实现，再用 get_diagnostics/run_cmd 验证，最后总结。改文件前必先读、写就写完整、最小改动、风格随项目；需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
+  agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。改文件前必先读、写就写完整、最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
   plan: `你是 Michael IDE 的架构规划智能体。先只读调查代码库，再产出可直接照着实现的分步方案；绝不修改文件、不跑有副作用的命令。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
   explorer: `你是 Michael IDE 的只读代码探索者。能读文件/列目录/搜索/按名查找，绝不修改文件或运行有副作用的命令。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
@@ -7759,12 +8270,26 @@ function _toggleModeMenu() {
 $("modePickerBtn")?.addEventListener("click", _toggleModeMenu);
 _updateModeUI();
 
-let _agentContextCache = { root: "", rootsKey: "", queryKey: "", activeKey: "", ts: 0, data: "" };
+let _agentContextCache = { root: "", rootsKey: "", activeKey: "", ts: 0, data: "" };
 const _engineeringReferenceCache = new Map();
 
 function _estimateTokens(text) {
   if (!text) return 0;
   return Math.ceil(text.length / 3.5);
+}
+
+function _fallbackConversationSummary(messages) {
+  const userRequests = [], outcomes = [];
+  for (const message of messages || []) {
+    const content = String(message?.content || "").trim();
+    if (!content) continue;
+    if (message.role === "user") userRequests.push(content.replace(/\s+/g, " ").slice(0, 220));
+    else if (/修复|完成|改动|未完成|报错|验证|failed|fixed/i.test(content)) outcomes.push(content.replace(/\s+/g, " ").slice(0, 260));
+  }
+  const parts = [];
+  if (userRequests.length) parts.push(`用户请求: ${userRequests.slice(-8).join("；")}`);
+  if (outcomes.length) parts.push(`执行结果: ${outcomes.slice(-8).join("；")}`);
+  return parts.join("\n") || `早期 ${messages?.length || 0} 条消息已压缩；文件读取版本与范围保留在证据账本。`;
 }
 
 function _compactHistoryIfNeeded(session) {
@@ -7816,15 +8341,14 @@ function _compactHistoryIfNeeded(session) {
 
   if (h.length > MAX_MESSAGES) {
     const excess = h.length - MAX_MESSAGES;
-    const removed = h.splice(0, excess);
-    const topics = removed.filter(m => m.role === "user").map(m => String(m.content).slice(0, 100));
-    if (topics.length > 0) {
-      h.unshift({ role: "assistant", content: `[已压缩 ${removed.length} 条早期消息，涉及：${topics.join("、")}]` });
-    }
+    if (sess?.memory?.compactRecent) sess.memory.compactRecent(excess, _fallbackConversationSummary(h.slice(0, excess)));
+    else h.splice(0, excess);
   }
 
+  totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
   while (totalTokens > MAX_HISTORY_TOKENS && h.length > KEEP_RECENT + 2) {
-    h.splice(0, 2);
+    if (sess?.memory?.compactRecent) sess.memory.compactRecent(2, _fallbackConversationSummary(h.slice(0, 2)));
+    else h.splice(0, 2);
     totalTokens = h.reduce((sum, m) => sum + _estimateTokens(m.content), 0);
   }
 
@@ -7887,7 +8411,7 @@ function _engineeringTaskProfile(text) {
   const ui = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|dashboard|landing|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
   const bug = /(?:\bbug\b|debug|error|exception|crash|fail(?:ed|ure)?|报错|错误|崩溃|跑不起来|不工作|修复|排查)/i.test(t);
   const architecture = /(?:architecture|architect|refactor|rewrite|migration|codebase|repository|模块化|架构|重构|重写|迁移|代码库|工程化|可维护|硬编码|技术债)/i.test(t);
-  const implementation = /(?:implement|build|create|add|integrat|develop|scaffold|实现|开发|新增|接入|搭建|创建|编写|做一个|做个|改造|优化)/i.test(t);
+  const implementation = /(?:implement|build|create|add|integrat|develop|scaffold|fix|update|实现|开发|新增|接入|搭建|创建|编写|做一个|做个|改造|优化|修复|解决|改一下|修一下|更新)/i.test(t);
   const projectScope = /(?:project|repo|codebase|workspace|multi-file|项目|工程|仓库|代码库|整个|全部|所有|多个文件|全局)/i.test(t);
   const applies = t.length >= 8 && (bug || architecture || implementation || (ui && projectScope));
   const substantial = applies && (architecture || projectScope || t.length >= 180 || /(?:完整|整套|从零|端到端|全量|系统性|multi-file)/i.test(t));
@@ -7896,9 +8420,10 @@ function _engineeringTaskProfile(text) {
     ui,
     bug,
     architecture,
+    implementation,
     substantial,
     requiresPlan: substantial,
-    needsReferences: applies && (bug || architecture || substantial || /(?:库|框架|api|依赖|性能|安全|算法|协议)/i.test(t)),
+    needsReferences: applies && /(?:第三方库|开源库|依赖库|框架|\bapi\b|依赖|安全|算法|协议|官方文档|公开实现|社区方案|最新|版本|兼容性)/i.test(t),
   };
 }
 
@@ -8179,6 +8704,29 @@ async function _buildRetrievedCodeContext(query, root, topK = 4) {
   } catch { return ""; }
 }
 
+async function _agentContextForQuery(baseContext, query, root) {
+  const parts = [];
+  const repoMap = _buildRepoMap(query, 6000, root);
+  if (repoMap) parts.push(repoMap);
+  const profile = _engineeringTaskProfile(query);
+  const stack = _projectStacks.get(root) || {};
+  if (profile.applies) {
+    let [localRefs, externalRefs] = await Promise.all([
+      _buildRetrievedCodeContext(query, root, 4),
+      _buildEngineeringReferenceContext(query, root, stack, profile),
+    ]);
+    if (!localRefs && _bm25Index.root === root && _bm25Index.built) localRefs = await _buildRetrievedCodeContext(query, root, 4);
+    parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.ui ? "\n4. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
+    if (localRefs) parts.push(localRefs);
+    if (externalRefs) parts.push(externalRefs);
+  }
+  let combined = [baseContext, ...parts].filter(Boolean).join("\n");
+  const maxTokens = 14000;
+  const tokens = _estimateTokens(combined);
+  if (tokens > maxTokens) combined = combined.slice(0, Math.floor(combined.length * (maxTokens / tokens))) + `\n...(context truncated to fit ${maxTokens} token budget)`;
+  return combined + _memoryBlocks(root, query || "");
+}
+
 async function _gatherAgentContext(query, sessionRoot) {
   const root = (sessionRoot || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   const osDetail = await _detectOSDetail();
@@ -8190,7 +8738,6 @@ async function _gatherAgentContext(query, sessionRoot) {
   // Knowledge-graph memory is retrieved per-query (relevant subgraph), so it lives
   // OUTSIDE the cached project context and is appended fresh on every call.
   const rootsKey = _allRoots().join("|");
-  const queryKey = String(query || "").trim().slice(0, 600);
   const activeForRoot = activePath && (activePath === root || activePath.startsWith(root + "/")) ? activePath : "";
   const activeModel = activeForRoot ? openFiles.get(activeForRoot)?.model : null;
   const activeKey = `${activeForRoot}|${activeModel?.getVersionId?.() || 0}`;
@@ -8198,9 +8745,9 @@ async function _gatherAgentContext(query, sessionRoot) {
   // ts=0 on any create/edit/delete). The 5-min TTL is only a safety net for anything the watcher misses
   // — so a long task stops re-running `find` + re-reading key files every 15s when nothing changed.
   if (_agentContextCache.root === root && _agentContextCache.rootsKey === rootsKey
-      && _agentContextCache.queryKey === queryKey && _agentContextCache.activeKey === activeKey
+      && _agentContextCache.activeKey === activeKey
       && _agentContextCache.ts && Date.now() - _agentContextCache.ts < 300000) {
-    return _agentContextCache.data + _memoryBlocks(root, query || "");
+    return _agentContextForQuery(_agentContextCache.data, query || "", root);
   }
 
   const parts = [osBlock, `⚠️ 当前工作区根目录（所有相对路径基于此）: ${root}\n（list_dir "." = 列出 ${root}；read_file "src/main.js" = 读 ${root}/src/main.js）`];
@@ -8240,12 +8787,6 @@ async function _gatherAgentContext(query, sessionRoot) {
     } catch {}
   }
 
-  // Repo-map: a compact per-file symbol outline from the background symbol index. Gives
-  // the model an X-ray of the codebase (what's defined where) — far stronger project
-  // understanding than a bare file list, and cuts blind file reads.
-  const _repoMap = _buildRepoMap(query, 6000, root);
-  if (_repoMap) parts.push(_repoMap);
-
   // Multi-root awareness: list the OTHER open folders (with a short tree each) so
   // the agent knows they exist and addresses files in them correctly — the cause
   // of "读错目录". Path tools resolve across all roots, but the model should use a
@@ -8263,14 +8804,6 @@ async function _gatherAgentContext(query, sessionRoot) {
         const tr = await backend.taskRunCapture(r, treeCmd);
         if (tr?.stdout?.trim()) parts.push(tr.stdout.trim());
       } catch {}
-    }
-  }
-
-  if (activeForRoot && openFiles.has(activeForRoot)) {
-    const f = openFiles.get(activeForRoot);
-    if (f?.model) {
-      const content = f.model.getValue();
-      parts.push(`\n--- ${activeForRoot.split("/").pop()} (当前编辑中) ---\n${content.slice(0, 4000)}`);
     }
   }
 
@@ -8314,37 +8847,9 @@ async function _gatherAgentContext(query, sessionRoot) {
     if (r) parts.push(`\n--- ${r[0]} ---\n${r[1].slice(0, 2000)}`);
   }
 
-  const profile = _engineeringTaskProfile(query);
-  if (profile.applies) {
-    let [localRefs, externalRefs] = await Promise.all([
-      _buildRetrievedCodeContext(query, root, 4),
-      _buildEngineeringReferenceContext(query, root, stack, profile),
-    ]);
-    // The index can finish while the external lookup is still running. Re-read it
-    // once before caching so the first task does not retain a reference-free context.
-    if (!localRefs && _bm25Index.root === root && _bm25Index.built) {
-      localRefs = await _buildRetrievedCodeContext(query, root, 4);
-    }
-    // Engineering constraints and retrieved evidence are high-priority context.
-    // Keep them near the front so prefix truncation cannot silently remove the
-    // very references this orchestration work was meant to provide.
-    const priority = [`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 改已有文件前必须读取它及相关调用方；多文件/架构任务先列可验证计划。\n2. 复用项目现有模式和成熟依赖，配置/设计令牌集中管理；不得把路径、密钥、颜色、端口或业务规则散落硬编码。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零退出、超时或未运行都不算通过。${profile.ui ? "\n4. 这是 UI 任务：构建通过后还必须启动真实页面，用 browser 的结构化 check/inspect 在桌面和移动宽度检查空白页、运行时错误、坏资源、溢出与关键交互。" : ""}`];
-    if (localRefs) priority.push(localRefs);
-    if (externalRefs) priority.push(externalRefs);
-    parts.splice(stackHint ? 3 : 2, 0, ...priority);
-  }
-
-  let ctx = parts.join("\n");
-  const CTX_TOKEN_BUDGET = 14000;
-  const ctxTokens = _estimateTokens(ctx);
-  if (ctxTokens > CTX_TOKEN_BUDGET) {
-    const ratio = CTX_TOKEN_BUDGET / ctxTokens;
-    const maxLen = Math.floor(ctx.length * ratio);
-    ctx = ctx.slice(0, maxLen) + "\n...(context truncated to fit " + CTX_TOKEN_BUDGET + " token budget)";
-  }
-  const retrievalPending = profile.applies && _bm25Index.root === root && _bm25Index.building;
-  _agentContextCache = { rootsKey, root, queryKey, activeKey, ts: retrievalPending ? 0 : Date.now(), data: ctx };
-  return ctx + _memoryBlocks(root, query || "");
+  const baseContext = parts.join("\n");
+  _agentContextCache = { rootsKey, root, activeKey, ts: Date.now(), data: baseContext };
+  return _agentContextForQuery(baseContext, query || "", root);
 }
 
 // True if the SELECTED model is an image-generation model (can't act as a chat/agent
@@ -8834,6 +9339,7 @@ async function sendPrompt(text, attachedImages = []) {
 
   const osDetail = await _detectOSDetail();
   let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
+  const _pendingContextEvidence = [];
   if (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") {
     if (rootPath || workspaceRoots.length) {
       // Bounded: a slow context build (file reads / tree scan) must not hang the send.
@@ -8842,12 +9348,36 @@ async function sendPrompt(text, attachedImages = []) {
       contextBlock += "\n(未打开工作区文件夹)";
     }
   }
-  if (activePath) {
-    const f = openFiles.get(activePath);
+  const _contextRoot = String(sess.project || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
+  const _activeForSession = activePath && _contextRoot && _pathIsAtOrUnder(activePath, _contextRoot) ? activePath : "";
+  if (_activeForSession) {
+    const f = openFiles.get(_activeForSession);
     if (f?.model) {
       const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
       const selected = sel && !sel.isEmpty() ? f.model.getValueInRange(sel) : "";
-      contextBlock += `\n\n当前打开文件: ${activePath}\n\`\`\`\n${f.model.getValue().slice(0, 12000)}\n\`\`\``;
+      const content = f.model.getValue();
+      const contextRoot = _contextRoot;
+      const rel = _normRel(_activeForSession, contextRoot);
+      const signature = _contentSignature(content);
+      const total = content.endsWith("\n") ? content.slice(0, -1).split("\n").length : content.split("\n").length;
+      const prior = typeof sess.memory?.fileEvidenceForRoot === "function"
+        ? sess.memory.fileEvidenceForRoot(contextRoot).some((evidence) => evidence.path === rel && evidence.signature === signature && evidence.complete)
+        : false;
+      const explicitlyAboutCurrent = !!selected || !!f.dirty
+        || /(?:当前|这个|这段|这里|刚才|上面|打开的).{0,8}(?:文件|代码|报错|函数|组件|页面)|(?:current|this|open)\s+(?:file|code|error|function|component)/i.test(text);
+      const includeFull = explicitlyAboutCurrent || (!prior && _engineeringTaskProfile(text).applies);
+      if (includeFull) {
+        contextBlock += `\n\n当前打开文件: ${_activeForSession}\n\`\`\`\n${content.slice(0, 12000)}\n\`\`\``;
+        const completeAndCurrent = content.length <= 12000 && !f.dirty && typeof f.diskContent === "string" && f.diskContent === content
+          && _redactSecrets(content) === content;
+        if (completeAndCurrent && contextRoot && rel) {
+          const evidence = { root: contextRoot, path: rel, signature, total, ranges: [[1, total]], complete: true, digest: _readEvidenceDigest(content), redacted: false };
+          _pendingContextEvidence.push(evidence);
+          sess.memory?.recordFileEvidence?.(evidence);
+        }
+      } else {
+        contextBlock += `\n\n当前打开文件: ${_activeForSession}（同一版本已在会话证据账本中，不重复注入全文；需要逐字符修改时再 read_file 取当前原文。）`;
+      }
       if (selected) contextBlock += `\n\n选中的代码:\n\`\`\`\n${selected.slice(0, 4000)}\n\`\`\``;
     }
   }
@@ -8998,6 +9528,7 @@ async function sendPrompt(text, attachedImages = []) {
       // (sess.project), so multiple tabs can target different projects at once. Falls
       // back to the global workspace root for tabs that never set one.
       if (sess.project && inTauri && !workspaceRoots.includes(sess.project)) { try { await backend.registerWorkspaceRoot(sess.project); } catch {} }
+      sess._pendingContextEvidence = _pendingContextEvidence;
       await _runAgenticLoop({ config, messages, root: sess.project || rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode, task: text, skillsBlock });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
@@ -9624,10 +10155,32 @@ function _dedupeRepeatedText(s) {
   return t;
 }
 
+// Exact paragraph memory across model turns in one run. Providers sometimes
+// repeat the same explanation before and after a tool call; rendering it twice
+// makes the run look stuck even when the tool did execute. Only byte-equivalent
+// normalized paragraphs are removed, so a conclusion changed by new evidence is
+// preserved.
+function _dedupeRunNarrative(text, seen) {
+  if (!text || !(seen instanceof Set)) return text || "";
+  const kept = [];
+  for (const paragraph of String(text).trim().split(/\n{2,}/)) {
+    const key = paragraph.replace(/\r\n/g, "\n").trim();
+    if (key.length >= 16 && seen.has(key)) continue;
+    kept.push(paragraph);
+    if (key.length >= 16) seen.add(key);
+  }
+  while (seen.size > 160) seen.delete(seen.values().next().value);
+  return kept.join("\n\n").trim();
+}
+
 function _cleanAgentText(text) {
   text = String(text == null ? "" : text);
   text = _transformFileContentTags(text);
   text = _stripToolNarration(text);
+  // Some upstream bridges occasionally echo their internal tool transcript as
+  // ordinary assistant tokens. Keep the real prose before it, but never render
+  // or persist the leaked `user Tool results: [read_file] ...` payload.
+  text = text.replace(/(?:^|\n)\s*user\s+Tool results:\s*\n+\s*\[[a-z][a-z0-9_]{1,50}\][\s\S]*$/i, "");
   return text.replace(/\[TOOL:\w+\]\s*\n?[^\n]*/g, "").replace(/📄\s*[^\n]+\n?/g, "").replace(/📎\s*[^\n]+\n?/g, "")
     // drop bare "..."/"…" filler lines the weak Claude provider streams as continuation
     // markers — they otherwise survive as real <p>...</p> content and freeze into snapshots
@@ -10287,7 +10840,7 @@ async function _protectLocalMcpConfig(root) {
   try {
     const current = await backend.readTextFile(excludePath);
     if (!current.split(/\r?\n/).some((line) => line.trim() === ".mcp.local.json")) {
-      await backend.writeTextFile(excludePath, current.replace(/\s*$/, "") + "\n.mcp.local.json\n");
+      await _commitDiskTextIfUnchanged(excludePath, current, current.replace(/\s*$/, "") + "\n.mcp.local.json\n");
     }
     return true;
   } catch { return false; }
@@ -10987,7 +11540,9 @@ async function openMcpPanel() {
   const readCfg = async () => { try { const c = JSON.parse((await _readWorkspaceMcpDocument(root)).text || "{}"); return (c && typeof c === "object") ? c : { mcpServers: {} }; } catch { return { mcpServers: {} }; } };
   const writeCfg = async (cfg) => {
     if (!(await _protectLocalMcpConfig(root))) throw new Error("无法把 .mcp.local.json 加入 Git 本地排除，已取消保存以避免提交 MCP 环境变量");
-    await backend.writeTextFile(mcpPath, JSON.stringify(cfg, null, 2));
+    let expected = null;
+    try { expected = await backend.readTextFile(mcpPath); } catch {}
+    await _commitDiskTextIfUnchanged(mcpPath, expected, JSON.stringify(cfg, null, 2));
   };
   let editing = null;
   const renderList = async () => {
@@ -11949,7 +12504,7 @@ function _renderPickPanel(vp, bar, hint, info) {
 }
 // 免费直接改源码文字：读源码文件 → 在源码行附近把旧文字替换成新文字 → 写回（dev server HMR 秒回显，零模型）。
 async function _directTextEdit(info, newText, msgEl) {
-  const file = info.source && info.source.file, old = info.text;
+  const file = _coherentFilePath(info.source && info.source.file), old = info.text;
   if (!file || !old) { if (msgEl) msgEl.textContent = "没源码定位或没文字，改用发给 AI"; return false; }
   try {
     const content = await backend.readTextFile(file);
@@ -11962,7 +12517,7 @@ async function _directTextEdit(info, newText, msgEl) {
         if (i >= 0 && i < rows.length && rows[i].indexOf(old) >= 0) { rows[i] = rows[i].replace(old, newText); done = true; break; }
       }
     }
-    await backend.writeTextFile(file, done ? rows.join("\n") : content.replace(old, newText));
+    await _commitDiskTextIfUnchanged(file, content, done ? rows.join("\n") : content.replace(old, newText));
     if (msgEl) msgEl.textContent = "✅ 已直接改源码（" + file.split("/").pop() + "）— dev server 热重载即生效，免费、没走 AI";
     return true;
   } catch (e) { if (msgEl) msgEl.textContent = "写源码失败：" + String((e && e.message) || e).slice(0, 90); return false; }
@@ -11989,7 +12544,7 @@ function _swapTwClass(classStr, prop, value) {
 // 免费直接改样式：在源码里定位这个元素的静态 class 串 → 换成任意值 Tailwind 类 → 写回（HMR 即生效，零模型）。
 // 仅对「源码里 class 是静态字符串」生效；动态/拼接 class 退回发给 AI。需项目用 Tailwind。
 async function _directStyleEdit(info, prop, value, msgEl) {
-  const file = info.source && info.source.file, cls = info.cls;
+  const file = _coherentFilePath(info.source && info.source.file), cls = info.cls;
   if (!file || !cls) { if (msgEl) msgEl.textContent = "没源码定位或元素无 class，改用发给 AI"; return false; }
   try {
     const content = await backend.readTextFile(file);
@@ -11997,7 +12552,7 @@ async function _directStyleEdit(info, prop, value, msgEl) {
     const attrRe = new RegExp('(class(?:Name)?\\s*=\\s*")(' + escaped + ')(")');
     if (!attrRe.test(content)) { if (msgEl) msgEl.textContent = "源码里没找到这个元素的静态 class（多为动态 / 拼接 class），请用「发给 AI 改」"; return false; }
     const newCls = _swapTwClass(cls, prop, value);
-    await backend.writeTextFile(file, content.replace(attrRe, "$1" + newCls + "$3"));
+    await _commitDiskTextIfUnchanged(file, content, content.replace(attrRe, "$1" + newCls + "$3"));
     info.cls = newCls;
     if (msgEl) msgEl.textContent = "✅ 已直接改样式（" + file.split("/").pop() + "）— HMR 即生效，免费、没走 AI";
     return true;
@@ -12141,7 +12696,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容。", parameters: { type: "object", properties: { path: { type: "string", description: "相对工作区根目录的路径或绝对路径" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取行数。**默认一次读完整个文件（不用传）——绝不要为了小文件自己传个小 limit 去分段读，几百行的文件一次就该全读进来，分段是浪费还容易漏**。只有几千行的超大文件才需要分段。" } }, required: ["path"] } } },
     { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" } }, required: ["path"] } } },
-    { type: "function", function: { name: "search", description: "在项目里**按文本** grep——现在**每个命中都带 ±2 行上下文**（►标命中行），直接看懂代码，不用再 read_file。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本（支持正则，如 \"function\\s+login\"）" }, path: { type: "string", description: "可选，限定搜索的子目录（如 \"src/\"）" } }, required: ["query"] } } },
+    { type: "function", function: { name: "search", description: "位置未知时在文件或目录中定位文本；命中后读取目标文件确认完整上下文。目标文件已知时直接 read_file，不要先 search。默认 literal；只有明确需要模式匹配才用 regex。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本或正则表达式" }, path: { type: "string", description: "可选，限定单个文件或子目录（如 src/auth.ts 或 src/）" }, mode: { type: "string", enum: ["literal", "regex"], description: "匹配模式，默认 literal" }, case_sensitive: { type: "boolean", description: "是否区分大小写，默认 false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "联网搜索（DuckDuckGo），返回标题/URL/摘要列表。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
@@ -12149,8 +12704,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "current_time", description: "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道「今天几号/星期几/现在几点/距某天还有多久」时调这个，别凭记忆猜——你的训练数据里的时间是过期的。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "ask_user", description: "**当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做**。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } }, recommended: { type: "integer", description: "推荐选项的索引（从 0 开始），该选项会高亮标记为推荐" }, multi_select: { type: "boolean", description: "true=多选模式（勾选框，用户可选多个选项后一起提交）" }, confirm_text: { type: "string", description: "危险操作确认：设置后用户必须在输入框中准确输入此文本才能继续（如 DELETE、确认删除）" } }, required: ["question"] } } },
     { type: "function", function: { name: "run_subagent", description: "**只在「大范围、可并行」的重型调研时才用**（例：同时摸清好几个大模块的全貌、跨几十个文件的架构梳理）。⚠️**小事别派**——找几个文件、读一段逻辑、搞清一个函数/流程这种聚焦小调查，你【直接自己 read_file/search 又快又省】；派子智能体等于双倍烧 token（它读一遍+总结，你再读它总结），还慢。拿不准就自己上，别无脑派。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
-    { type: "function", function: { name: "research_project", description: "**深挖整个代码库/项目——一次性把它摸透**。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
-    { type: "function", function: { name: "design_research", description: "**做网站/界面前，先把设计方向 + 完整 UI 架构研究规划好**（UI 版的 research_project）。", parameters: { type: "object", properties: { goal: { type: "string", description: "要做的网站/界面是什么（如「Michael IDE 的产品官网」「SaaS 后台 dashboard」「电商首页」）" } }, required: [] } } },
+    { type: "function", function: { name: "research_project", description: "仅用于用户明确要求完整代码库上手地图，或多个未知模块确实无法定位入口；目标文件/模块已知时不要调用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
+    { type: "function", function: { name: "design_research", description: "仅用于用户明确要求重新设计、比较视觉方向或制定完整 UI 架构蓝图；现有 UI 功能 bug/渲染问题不要调用。", parameters: { type: "object", properties: { goal: { type: "string", description: "要重新设计的网站/界面目标" } }, required: [] } } },
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
     { type: "function", function: { name: "run_worker", description: "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。", parameters: { type: "object", properties: { description: { type: "string", description: "这块子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给 worker 的完整、自包含的任务说明（它看不到当前对话）：要实现什么、改哪些文件、接口 / 约定是什么。" }, scope: { type: "array", items: { type: "string" }, description: "这个 worker 可修改的文件 / 目录列表（相对工作区根，如 [\"src/api/\", \"src/types.ts\"]）。" } }, required: ["description", "prompt", "scope"] } } },
     { type: "function", function: { name: "worktree", description: "**best-of-N 隔离**：建/列/删 git 工作树，让 2-3 个候选方案在各自独立工作树里并行实现、互不踩主代码（撤销=删工作树）。难/不确定的任务想「出多个候选选最优」时用——文献证明这是提升正确率最有效的一招。", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add=建一个新工作树(返回绝对路径) / list=列出 / remove=删一个(=丢弃该候选)" }, name: { type: "string", description: "add 时：候选名（短 slug，如 cand-a）" }, path: { type: "string", description: "remove 时：要删的工作树绝对路径" } }, required: ["action"] } } },
@@ -12184,7 +12739,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     tools.push(
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "multi_edit", description: "对同一个文件做多处精确替换：edits 是一组 {old_string, new_string, replace_all?}，按顺序原子应用（任一处定位失败则整体不写入、报错）。", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "有序的替换列表", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
-      { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
+      { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "本轮已确认的精确文件路径；相对路径固定基于本次任务的工作区根" }, content: { type: "string", minLength: 1, description: "要写入的完整非空 UTF-8 文件内容，不能省略或用占位内容" } }, required: ["path", "content"], additionalProperties: false } } },
       { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条命令并返回完整输出（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "deploy_site", description: "**一键把做好的网站部署上线**——自动 npm run build + 上传服务器 + **自动分配一个 HTTPS 二级域名 `名字.michaelide.xyz`**（泛解析 + 泛域名证书早已配好，用户完全无需手动配 DNS / 去域名控制台加 A 记录），返回可直接访问分享的网址（形如 https://my-portfolio.michaelide.xyz/）。**用户说「绑定/解析个二级域名、自定义域名、上线分享」时就直接用这个工具——二级域名是全自动的，别再反问用户域名是什么、也别让他去域名后台手动加记录。** 做完官网想让用户真能打开分享时用（idea→设计→建站→上线 闭环最后一步）。", parameters: { type: "object", properties: { name: { type: "string", description: "站点名（短 slug，做 URL 路径，如 mrday / my-portfolio）" } }, required: ["name"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
@@ -12528,6 +13083,153 @@ function _normalizeArgKeys(args) {
   alias("prompt", "description", "instruction", "instructions");
   return a;
 }
+
+// JSON Schema guides the model, but providers do not guarantee that a streamed tool
+// call obeys it. Validate the file mutations again before execution so `{}`, a
+// path-only write, or a cut-off content payload is retried instead of becoming an
+// empty write card. Empty new_string is valid for edit (deletion); empty write_file
+// content is deliberately not.
+function _fileToolArgIssue(name, rawArgs) {
+  const canonical = _canonicalToolName(name) || name;
+  if (canonical !== "write_file" && canonical !== "edit_file" && canonical !== "multi_edit") return "";
+  const raw = typeof rawArgs === "string" ? rawArgs.trim() : "";
+  let parsed = rawArgs;
+  if (typeof rawArgs === "string") {
+    if (!raw) return `${canonical} 没有参数`;
+    try { parsed = JSON.parse(raw); }
+    catch {
+      // Complete-but-malformed relay payloads such as `{}{real}` can be repaired;
+      // a stream cut in the middle cannot be trusted for a mutating operation.
+      if (!raw.endsWith("}")) return `${canonical} 的参数流被截断`;
+      parsed = _safeJsonLoose(raw);
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `${canonical} 的参数不是对象`;
+  const args = _normalizeArgKeys(parsed);
+  if (typeof args.path !== "string" || !args.path.trim()) return `${canonical} 缺少 path`;
+  if (canonical === "write_file") {
+    if (!Object.prototype.hasOwnProperty.call(args, "content")) return "write_file 缺少 content";
+    if (typeof args.content !== "string" || !args.content.trim()) return "write_file 的 content 为空";
+  } else if (canonical === "edit_file") {
+    if (typeof args.old_string !== "string" || !args.old_string) return "edit_file 缺少 old_string";
+    if (!Object.prototype.hasOwnProperty.call(args, "new_string") || typeof args.new_string !== "string") return "edit_file 缺少 new_string";
+  } else {
+    if (!Array.isArray(args.edits) || !args.edits.length) return "multi_edit 的 edits 为空";
+    for (let i = 0; i < args.edits.length; i++) {
+      const edit = args.edits[i];
+      if (!edit || typeof edit.old_string !== "string" || !edit.old_string) return `multi_edit 第 ${i + 1} 处缺少 old_string`;
+      if (!Object.prototype.hasOwnProperty.call(edit, "new_string") || typeof edit.new_string !== "string") return `multi_edit 第 ${i + 1} 处缺少 new_string`;
+    }
+  }
+  return "";
+}
+
+const _STRICT_MUTATING_TOOL_NAMES = new Set([
+  "write_file", "edit_file", "multi_edit", "delete_path", "move_path", "run_worker",
+  "create_dir", "copy_path", "format_file", "run_cmd", "run_in_terminal",
+  "deploy_site", "worktree", "git_commit", "git_branch", "git_push", "git_clone", "git_pull",
+  "git_stash", "git_stash_pop", "gh_pr_create", "gh_pr_reply", "generate_wiki", "game_scaffold", "web_scaffold",
+  "generate_image", "generate_3d", "generate_sound", "generate_music", "generate_voice",
+  "auto_rig", "generate_motion", "generate_texture", "download_file", "download_asset",
+  "automation", "db_query", "remote",
+]);
+
+function _mutatingToolArgIssue(name, rawArgs) {
+  const canonical = _canonicalToolName(name) || name;
+  const strict = _STRICT_MUTATING_TOOL_NAMES.has(canonical) || String(canonical || "").startsWith("mcp__");
+  if (!strict) return _fileToolArgIssue(canonical, rawArgs);
+  let parsed = rawArgs;
+  if (typeof rawArgs === "string") {
+    const raw = rawArgs.trim();
+    if (!raw) return `${canonical} 没有参数`;
+    try { parsed = JSON.parse(raw); }
+    catch { return `${canonical} 的变更参数不是完整严格 JSON`; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `${canonical} 的参数不是对象`;
+  return _fileToolArgIssue(canonical, parsed);
+}
+
+function _toolSchemaFromRegistry(registry, name) {
+  if (!registry || !name) return null;
+  const canonical = _canonicalToolName(name) || name;
+  if (registry instanceof Map) return registry.get(name) || registry.get(canonical) || null;
+  if (Array.isArray(registry)) {
+    return registry.find((schema) => {
+      const schemaName = schema?.function?.name;
+      return schemaName === name || schemaName === canonical;
+    }) || null;
+  }
+  return null;
+}
+
+function _schemaValueIssue(value, schema, path = "参数") {
+  if (!schema || typeof schema !== "object") return "";
+  const variants = Array.isArray(schema.oneOf) ? schema.oneOf : (Array.isArray(schema.anyOf) ? schema.anyOf : null);
+  if (variants?.length) {
+    const issues = variants.map((candidate) => _schemaValueIssue(value, candidate, path));
+    if (issues.some((issue) => !issue)) return "";
+    return issues.find(Boolean) || `${path} 不符合可用参数结构`;
+  }
+
+  const type = schema.type;
+  if (type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return `${path} 必须是对象`;
+    const missing = [];
+    for (const key of Array.isArray(schema.required) ? schema.required : []) {
+      const present = Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined && value[key] !== null;
+      const emptyRequiredString = present && typeof value[key] === "string" && !value[key].trim() && key !== "new_string";
+      if (!present || emptyRequiredString) missing.push(key);
+    }
+    if (missing.length) return `${path}缺少必填字段: ${missing.join(", ")}`;
+    for (const [key, childSchema] of Object.entries(schema.properties || {})) {
+      if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] === undefined || value[key] === null) continue;
+      const issue = _schemaValueIssue(value[key], childSchema, `${path}.${key}`);
+      if (issue) return issue;
+    }
+  } else if (type === "array") {
+    if (!Array.isArray(value)) return `${path} 必须是数组`;
+    if (Number.isFinite(schema.minItems) && value.length < schema.minItems) return `${path} 至少需要 ${schema.minItems} 项`;
+    if (schema.items) {
+      for (let index = 0; index < value.length; index++) {
+        const issue = _schemaValueIssue(value[index], schema.items, `${path}[${index}]`);
+        if (issue) return issue;
+      }
+    }
+  } else if (type === "string") {
+    if (typeof value !== "string") return `${path} 必须是字符串`;
+    if (Number.isFinite(schema.minLength) && value.length < schema.minLength) return `${path} 长度不能小于 ${schema.minLength}`;
+  } else if (type === "integer") {
+    if (!Number.isInteger(value)) return `${path} 必须是整数`;
+  } else if (type === "number") {
+    if (typeof value !== "number" || !Number.isFinite(value)) return `${path} 必须是数字`;
+  } else if (type === "boolean" && typeof value !== "boolean") {
+    return `${path} 必须是布尔值`;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return `${path} 必须是: ${schema.enum.join(" | ")}`;
+  return "";
+}
+
+// One validator for native SSE calls, text fallback calls and the final dispatch
+// gate. The runtime registry is the source of truth, including deferred and MCP
+// tools; keeping this outside the mapper prevents a valid `{}` from becoming an
+// empty card and only failing after execution starts.
+function _toolArgIssue(name, rawArgs, registry) {
+  const canonical = _canonicalToolName(name) || name;
+  const mutationIssue = _mutatingToolArgIssue(canonical, rawArgs);
+  if (mutationIssue) return mutationIssue;
+  let parsed = rawArgs;
+  if (typeof rawArgs === "string") {
+    const raw = rawArgs.trim();
+    if (!raw) return `${canonical || "工具"} 没有参数`;
+    try { parsed = JSON.parse(raw); }
+    catch { return `${canonical || "工具"} 的参数不是完整严格 JSON`; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `${canonical || "工具"} 的参数不是对象`;
+  const normalized = _normalizeArgKeys({ ...parsed });
+  const schema = _toolSchemaFromRegistry(registry, name) || _toolSchemaFromRegistry(registry, canonical);
+  const params = schema?.function?.parameters;
+  return params ? _schemaValueIssue(normalized, params, canonical || name || "工具") : "";
+}
 function _safeJsonLoose(s) {
   if (s && typeof s === "object") return s;
   if (typeof s !== "string") return null;
@@ -12571,6 +13273,33 @@ function _safeJsonLoose(s) {
   ["replace_all","staged","draft","all","create","width","height","frames","duration_ms","top_k","limit","line","offset","count","number","amount","ms"].forEach(grabLit);
   return Object.keys(out).length ? out : null;
 }
+
+function _assembleStreamToolCalls(byIndex, toolRegistry = null) {
+  return [...byIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, entry]) => {
+      if (!entry?.name) return null;
+      let parsed = {};
+      let raw = (entry.args && entry.args.trim()) ? entry.args.trim() : "{}";
+      // Mutating file arguments are never loose-repaired after validation says the
+      // stream is incomplete. This remains fail-closed even after retries exhaust.
+      if (_toolArgIssue(entry.name, raw, toolRegistry)) return null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = _safeJsonLoose(entry.args) || {};
+        raw = JSON.stringify(parsed);
+      }
+      return {
+        id: entry.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+        name: entry.name,
+        argsRaw: raw,
+        parsedArgs: parsed,
+      };
+    })
+    .filter(Boolean);
+}
+
 // Extract { name, args } from a parsed object in any common tool-call shape.
 function _toolObjOf(o) {
   if (!o || typeof o !== "object") return null;
@@ -12592,23 +13321,59 @@ function _toolObjOf(o) {
 }
 // Parse tool calls a model wrote as TEXT (no native function call). Returns native-
 // shaped {id,name,argsRaw,parsedArgs}. Only calls resolving to a REAL tool survive.
-function _parseTextToolCalls(text) {
+function _parseTextToolCalls(text, toolRegistry = null, issues = null, rejected = null) {
   if (!text || typeof text !== "string" || text.length > 24000) return [];
   const found = [];
-  const add = (raw) => {
+  const add = (raw, strictEnvelope) => {
     const t = _toolObjOf(raw); if (!t) return;
-    const canon = _canonicalToolName(t.name); if (!canon || (!_KNOWN_TOOLS.has(canon) && !canon.startsWith("mcp__"))) return;
+    const canon = _canonicalToolName(t.name) || t.name;
+    const registered = !!_toolSchemaFromRegistry(toolRegistry, t.name) || !!_toolSchemaFromRegistry(toolRegistry, canon);
+    if (!canon || (!registered && !_KNOWN_TOOLS.has(canon) && !canon.startsWith("mcp__"))) {
+      const issue = `未知工具: ${String(t.name || "(无名称)")}`;
+      if (Array.isArray(issues)) issues.push(issue);
+      if (Array.isArray(rejected)) rejected.push({ name: String(t.name || ""), argsRaw: JSON.stringify(t.args || {}), parsedArgs: t.args || {}, issue });
+      return;
+    }
+    // Text fallback is only a compatibility bridge. A loosely repaired/truncated
+    // envelope must never become a filesystem or shell mutation.
+    const strictMutation = _STRICT_MUTATING_TOOL_NAMES.has(canon) || canon.startsWith("mcp__");
+    if (strictMutation && !strictEnvelope) {
+      const issue = `${canon} 的文本工具调用不是完整严格 JSON`;
+      if (Array.isArray(issues)) issues.push(issue);
+      if (Array.isArray(rejected)) rejected.push({ name: canon, argsRaw: JSON.stringify(t.args || {}), parsedArgs: t.args || {}, issue });
+      return;
+    }
+    const originalArgs = raw?.function && typeof raw.function === "object"
+      ? raw.function.arguments
+      : raw?.arguments !== undefined ? raw.arguments
+      : raw?.args !== undefined ? raw.args
+      : raw?.parameters !== undefined ? raw.parameters
+      : raw?.input !== undefined ? raw.input
+      : raw?.action_input !== undefined ? raw.action_input : {};
+    const issue = _toolArgIssue(canon, originalArgs, toolRegistry);
+    if (issue) {
+      if (Array.isArray(issues)) issues.push(issue);
+      if (Array.isArray(rejected)) rejected.push({ name: canon, argsRaw: JSON.stringify(t.args || {}), parsedArgs: t.args || {}, issue });
+      return;
+    }
     found.push({ id: "call_" + Math.random().toString(36).slice(2, 10), name: canon, parsedArgs: t.args, argsRaw: JSON.stringify(t.args || {}) });
+  };
+  const parseCandidate = (rawText) => {
+    let strict = null;
+    try { strict = JSON.parse(rawText); } catch {}
+    const value = strict ?? _safeJsonLoose(rawText);
+    if (Array.isArray(value)) value.forEach((item) => add(item, strict !== null));
+    else if (value) add(value, strict !== null);
   };
   let m;
   const tagRe = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-  while ((m = tagRe.exec(text))) { const o = _safeJsonLoose(m[1]); if (Array.isArray(o)) o.forEach(add); else if (o) add(o); }
+  while ((m = tagRe.exec(text))) parseCandidate(m[1]);
   if (found.length) return found;
   const fenceRe = /```(?:json|tool|tool_call|tool_code|function)?\s*([\s\S]*?)```/gi;
-  while ((m = fenceRe.exec(text))) { const o = _safeJsonLoose(m[1]); if (Array.isArray(o)) o.forEach(add); else if (o) add(o); }
+  while ((m = fenceRe.exec(text))) parseCandidate(m[1]);
   if (found.length) return found;
   const tr = text.trim();
-  if ((tr[0] === "{" || tr[0] === "[") && tr.length < 8000) { const o = _safeJsonLoose(tr); if (Array.isArray(o)) o.forEach(add); else if (o) add(o); }
+  if ((tr[0] === "{" || tr[0] === "[") && tr.length < 8000) parseCandidate(tr);
   return found;
 }
 // Remove a tool-call block we parsed from text so it isn't shown as the answer.
@@ -12659,13 +13424,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "search_tools": return { type: "search_tools", query: args.query || args.q || args.description || "" };
     case "read_file": return { type: "read", path: args.path || "", offset: args.offset, limit: args.limit };
     case "list_dir": return { type: "list", path: args.path || "" };
-    case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "" };
+    case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "", mode: args.mode === "regex" ? "regex" : "literal", caseSensitive: !!args.case_sensitive };
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
     case "web_search": return { type: "websearch", path: args.query || "", query: args.query || "" };
     case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
     case "multi_edit": return { type: "multiedit", path: args.path || "", edits: Array.isArray(args.edits) ? args.edits : [] };
-    case "write_file": return { type: "write", path: args.path || "", content: args.content || "" };
+    case "write_file": return { type: "write", path: args.path || "", content: args.content || "", contentProvided: Object.prototype.hasOwnProperty.call(args, "content") };
     case "run_cmd": return { type: "cmd", command: args.command || "" };
     case "deploy_site": {
       // 安全部署：构建 → 打包 → 带用户 JWT POST 到网关 /api/deploy（账号绑定 + 白名单 + 限大小 +
@@ -12847,6 +13612,38 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   }
 }
 
+// Parameter repair can still fail after bounded retries. Keep those attempts
+// visible as settled, non-executable cards so users can see which tool failed
+// and why; never turn the rejected payload back into a dispatchable tool call.
+function _renderRejectedToolAttempts(body, attempts, fallbackIssue = "工具参数无效") {
+  if (!body?.appendChild) return 0;
+  const list = Array.isArray(attempts) && attempts.length
+    ? attempts
+    : [{ name: "", argsRaw: "", parsedArgs: {}, issue: fallbackIssue }];
+  const seen = new Set();
+  let rendered = 0;
+  for (const attempt of list) {
+    const name = String(attempt?.name || "").trim();
+    const issue = String(attempt?.issue || fallbackIssue || "工具参数无效").trim();
+    const key = `${name}\0${issue}\0${String(attempt?.argsRaw || "")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const parsed = attempt?.parsedArgs && typeof attempt.parsedArgs === "object"
+      ? attempt.parsedArgs
+      : (_safeJsonLoose(attempt?.argsRaw || "") || {});
+    const call = _mapToolCall(name, parsed) || { type: "unknown", path: name || "工具调用" };
+    call._toolName = name || call._toolName || "工具调用";
+    let step = null;
+    try { step = _createToolStep(call); body.appendChild(step); } catch { continue; }
+    const result = { type: call.type, path: call.path || "", content: `[ERROR] 参数校验失败：${issue}。IDE 已拒绝执行，未产生任何副作用。` };
+    _settleToolStep(step, result, "参数无效 · 未执行");
+    const viewport = step.querySelector?.(".atc-viewport");
+    if (viewport) viewport.textContent = result.content;
+    rendered++;
+  }
+  return rendered;
+}
+
 /** Normalize loosely-shaped plan steps from the model into {content, status}. */
 function _normPlanSteps(steps) {
   if (!Array.isArray(steps)) return [];
@@ -12958,6 +13755,7 @@ function _syncPlanChip(run, steps) {
   const done = steps.filter((s) => s.status === "completed").length;
   const cur = steps.find((s) => s.status === "in_progress") || steps.find((s) => s.status === "pending");
   const active = total > 0 && done < total;
+  if (run?.session) run.session._planActive = active;
   let wrap = document.getElementById("planChipWrap");
   if (!active) { if (wrap) wrap.remove(); return; }
   if (!wrap) {
@@ -12988,6 +13786,18 @@ function _syncPlanChip(run, steps) {
   if (panel && !panel.hasAttribute("hidden")) _renderPlanChipPanel(panel, run);
 }
 function _clearPlanChip() { try { document.getElementById("planChipWrap")?.remove(); } catch {} }
+function _settleRunPlan(run) {
+  if (!run || !Array.isArray(run._planSteps)) { _clearPlanChip(); return []; }
+  const steps = run._planSteps.map((step) => step.status === "in_progress" ? { ...step, status: "pending" } : step);
+  run._planSteps = steps;
+  if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
+  if (run.session) {
+    run.session._planSteps = steps;
+    run.session._planActive = false;
+  }
+  _clearPlanChip();
+  return steps;
+}
 
 function _renderPlan(container, steps, existingEl, run) {
   // Persist the steps + user-cancellations on the run so they survive across the
@@ -13282,11 +14092,36 @@ async function _revertRun(snapshot) {
   let ok = 0, fail = 0;
   for (const [path, snap] of snapshot) {
     try {
-      if (Object.prototype.hasOwnProperty.call(snap, "current")) {
+      if (_openFileWriteConflict(path)) { fail++; continue; }
+      const hasCurrent = Object.prototype.hasOwnProperty.call(snap, "current");
+      if (hasCurrent) {
         if (snap.existed) await backend.writeTextFileIfUnchanged(path, snap.current, snap.content);
         else if (snap.current != null) await backend.deleteTextFileIfUnchanged(path, snap.current);
-      } else if (snap.existed) await backend.writeTextFile(path, snap.content);
+      } else if (snap.existed) {
+        const current = await backend.readTextFile(path);
+        await backend.writeTextFileIfUnchanged(path, current, snap.content);
+      }
       else await backend.deletePath(path).catch(() => {});
+      if (snap.existed) {
+        const sync = _applyDiskContentToOpenFile(path, snap.content);
+        if (sync.state === "conflict") {
+          let restored = false;
+          if (hasCurrent) { try { await backend.writeTextFileIfUnchanged(path, snap.content, snap.current); restored = true; } catch {} }
+          const open = openFiles.get(path);
+          if (restored && open) open.externalConflict = false;
+          throw new Error("editor changed while reverting run");
+        }
+      }
+      else {
+        const open = openFiles.get(path);
+        if (open?.dirty) {
+          let restored = false;
+          if (hasCurrent && snap.current != null) { try { await backend.writeTextFileIfUnchanged(path, null, snap.current); restored = true; } catch {} }
+          if (restored) open.externalConflict = false;
+          throw new Error("editor changed while reverting run");
+        }
+        if (open) await closeFile(path);
+      }
       _agentReadCache.delete(path); _invalidateRead(path); _refreshTreeFor(path);
       _ipcBroadcast("file_changed", { path });
       ok++;
@@ -13571,6 +14406,13 @@ function _msgSize(m) {
   return c ? String(c).length : 0;
 }
 
+function _readEvidenceCovers(newer, older) {
+  return newer?.kind === "read" && older?.kind === "read"
+    && newer.resultKind === "content" && older.resultKind === "content"
+    && newer.canonicalPath === older.canonicalPath && newer.signature === older.signature
+    && Number(newer.from) <= Number(older.from) && Number(newer.to) >= Number(older.to);
+}
+
 // --- Smarter context/prompt compression (grounded in RECOMP extractive + Selective
 // Context + LLMLingua's keep-high-information idea). The old path truncated command
 // output to its HEAD — but errors live at the END, so it dropped the one thing that
@@ -13620,7 +14462,7 @@ function _smartCompress(text, budget) {
   return out;
 }
 
-function _trimMessagesIfHuge(messages) {
+function _trimMessagesIfHuge(messages, run = null, root = "") {
   // ── CONTINUOUS compression (一直压缩) ─────────────────────────────────────
   // Runs EVERY iteration, not just above a threshold. Without caching, every old
   // tool result is re-billed on EVERY one of a run's 40+ iterations. Compressing
@@ -13634,6 +14476,7 @@ function _trimMessagesIfHuge(messages) {
 
   const HARD = 150000, SOFT = 85000;
   let total = 0;
+  let readContextChanged = false;
   for (const m of messages) total += _msgSize(m);
 
   // Hard payload guard: accumulated screenshots can push past the gateway's limit.
@@ -13665,13 +14508,24 @@ function _trimMessagesIfHuge(messages) {
   for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdx.push(i);
 
   // ── Tier 1 (ALWAYS — lossless / reversible) ──────────────────────────────
-  // Dedup repeated reads: keep only the LATEST full content per file.
+  // Dedup reads only when the later result is proven to cover the earlier
+  // range of the same file version. A partial read, error or duplicate stub can
+  // never evict the only full-content source.
   {
-    const lastReadByPath = new Map();
+    const readsByPath = new Map();
     for (const i of toolIdx) {
-      const m0 = String(messages[i].content || "");
-      const pm = m0.match(/^文件 (.+?):\n/);
-      if (pm) { const p = pm[1]; if (lastReadByPath.has(p)) { const prev = lastReadByPath.get(p); if (String(messages[prev].content || "").length > 90) messages[prev] = { ...messages[prev], content: `[同一文件 ${p} 后面有更新的读取，这份较早的已折叠以省上下文]` }; } lastReadByPath.set(p, i); }
+      const meta = messages[i]?._ideMeta;
+      if (meta?.kind !== "read" || meta.resultKind !== "content" || !meta.canonicalPath) continue;
+      const prior = readsByPath.get(meta.canonicalPath) || [];
+      for (const prev of prior) {
+        const prevMeta = messages[prev]?._ideMeta;
+        if (_readEvidenceCovers(meta, prevMeta) && String(messages[prev].content || "").length > 90) {
+          messages[prev] = { ...messages[prev], _ideMeta: { ...prevMeta, contextAvailable: false }, content: `[同版本 ${meta.canonicalPath} 的较早读取已由后面的 ${meta.from}-${meta.to}/${meta.total} 行完整覆盖]` };
+          readContextChanged = true;
+        }
+      }
+      prior.push(i);
+      readsByPath.set(meta.canonicalPath, prior);
     }
   }
   // Fold refetchable tool results older than the last KEEP to one-line pointers.
@@ -13682,7 +14536,7 @@ function _trimMessagesIfHuge(messages) {
     const i = toolIdx[k];
     const c = messages[i].content ? String(messages[i].content) : "";
     const name = idName[messages[i].tool_call_id] || "";
-    if (_REFETCHABLE.has(name) && c.length > 90) {
+    if (_REFETCHABLE.has(name) && c.length > 90 && messages[i]?._ideMeta?.kind !== "read") {
       const lines = c.split("\n");
       const head = lines[0].replace(/\s+/g, " ").slice(0, 80);
       const keyLines = lines.filter((l) => _IMPORTANT_LINE.test(l)).slice(0, 3).map((l) => l.trim().slice(0, 80));
@@ -13699,7 +14553,13 @@ function _trimMessagesIfHuge(messages) {
       const c = messages[i].content ? String(messages[i].content) : "";
       if (c.length > cap + 80) {
         const comp = _smartCompress(c, cap);
-        messages[i] = { ...messages[i], content: comp.length < c.length ? comp + `\n（原 ${c.length} 字，已抽取压缩）` : comp };
+        const meta = messages[i]?._ideMeta;
+        messages[i] = {
+          ...messages[i],
+          ...(meta?.kind === "read" ? { _ideMeta: { ...meta, contextAvailable: false } } : {}),
+          content: comp.length < c.length ? comp + `\n（原 ${c.length} 字，已抽取压缩）` : comp,
+        };
+        if (meta?.kind === "read") readContextChanged = true;
       }
     }
   }
@@ -13721,6 +14581,10 @@ function _trimMessagesIfHuge(messages) {
         const request = m.content.slice(mk);
         const before = _msgSize(m);
         messages[i] = { ...m, content: "[较早的项目上下文 / 当前文件已折叠省上下文——需要项目结构或某文件内容就用 list_dir / read_file 取回]\n\n" + request };
+        if (run?._contextPreambleAvailable) {
+          run._contextPreambleAvailable = false;
+          readContextChanged = true;
+        }
         total -= before - _msgSize(messages[i]);
         break; // only the one big opener
       }
@@ -13737,6 +14601,7 @@ function _trimMessagesIfHuge(messages) {
       }
     }
   }
+  if (run && readContextChanged) _syncRunReadCoverageFromMessages(run, root || run.root || "", messages);
 }
 
 /**
@@ -14116,9 +14981,9 @@ async function buildBM25Index(root) {
     }, _SYMBOL_INDEX_MAX_FILES);
     _bm25Index.avgLen = _bm25Index.chunks.length ? _bm25Index.totalLen / _bm25Index.chunks.length : 0;
     _bm25Index.built = true;
-    // A first agent context may have timed out waiting for this index. Force its
-    // next turn to rebuild instead of reusing the reference-free five-minute cache.
-    if (_agentContextCache.root === root) _agentContextCache.ts = 0;
+    // Query-specific retrieval reads the completed index outside the stable
+    // filesystem-context cache, so finishing this build does not invalidate the
+    // already-cached tree / guide / package snapshot.
     console.log(`[bm25] indexed ${_bm25Index.chunks.length} chunks across the workspace in ${Date.now() - t0}ms`);
   } catch (e) {
     console.warn("[bm25] failed:", e?.message || e);
@@ -14285,7 +15150,7 @@ function _isStalledAiError(msg) {
   return /无有效进度|首个有效输出|连接卡住|模型长时间无响应|响应头超时|等待模型.*超时|没有(?:继续)?生成有效内容|timed out waiting for response headers/i.test(String(msg || ""));
 }
 function _isTransientTurnErr(msg) {
-  if (/^\[fast-retry-exhausted\]/.test(String(msg || ""))) return false;
+  if (/^\[(?:(?:fast|turn|tool-stream)-retry-exhausted|tool-args-invalid)\]/.test(String(msg || ""))) return false;
   return _isRetryableAiError(msg) || /连接中断|连接卡住|无响应|网络波动|被截断|模型长时间/i.test(String(msg || ""));
 }
 
@@ -14295,16 +15160,17 @@ function _isTransientTurnErr(msg) {
 // yet); a single retry lets the agent recover on its own instead of dead-ending.
 const _RETRYABLE_TOOL_TYPES = new Set(["web", "websearch", "screenshot", "genimage", "download"]);
 const _WORKSPACE_MUTATING_TYPES = new Set([
-  "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "mcp",
+  "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
   "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d", "generate_sound",
   "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture",
 ]);
 const _PLAN_GATED_TYPES = new Set(["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format", "cmd", "game_scaffold", "web_scaffold"]);
 function _toolFailureMatch(content) {
-  return String(content || "").match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|DENIED|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i);
+  return String(content || "").match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i);
 }
 function _toolExecutionSucceeded(call, result) {
   if (!call || !result) return false;
+  if (result?.evidence?.resultKind === "duplicate" || result?.mutated === false && _WORKSPACE_MUTATING_TYPES.has(call.type)) return false;
   const content = String(result.content || "");
   if (_toolFailureMatch(content)) return false;
   if (/\[已合并\]|内容未变化|\(.*内容未变化\)/.test(content)) return false;
@@ -14343,6 +15209,51 @@ function _looksLikeReadOnlyCommand(command) {
   const raw = String(command || "").trim();
   if (!raw || /[\r\n;&|<>`]|\$\(/.test(raw)) return false;
   return /^(?:pwd|ls|find|rg|grep|cat|head|tail|wc|file|stat|which|lsof|ps|uname|sw_vers|env|printenv|jq\b|sed\s+-n\b|git\s+(?:status|diff|log|show|blame|branch|remote)\b|(?:node|npm|pnpm|yarn|bun|python\d*|cargo|rustc|go|java|mvn|gradle\w*|dotnet)\s+(?:--version|-V|version)\b)(?:\s+[^;&|<>`]*)?$/i.test(raw);
+}
+function _looksLikeWorkspaceMutationCommand(command) {
+  const raw = String(command || "").trim();
+  if (!raw || _looksLikeReadOnlyCommand(raw) || _looksLikeVerificationCommand(raw)) return false;
+  if (_looksLikeShellFileRewrite(raw)) return true;
+  return /^(?:(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|uninstall|update|upgrade)\b|cargo\s+(?:add|rm|remove|update|fmt\b(?![^\n]*--check))|(?:npx\s+)?(?:prettier|eslint)\b[^\n]*(?:--write|--fix)\b|(?:git\s+apply|patch\s+-p\d*)\b)/i.test(raw);
+}
+function _mcpMutationHint(call, requireWorkspacePath = false) {
+  if (!call || call.type !== "mcp" || call.mcpReadOnly) return false;
+  const args = call.args && typeof call.args === "object" ? call.args : {};
+  if (typeof args.command === "string" && _looksLikeWorkspaceMutationCommand(args.command)) return true;
+  const tool = String(call.tool || call.mcpName || "").toLowerCase();
+  const mutatingName = /(?:^|[_-])(?:write|edit|patch|replace|create|delete|remove|move|rename|copy|mkdir|format|save|apply|update|set)(?:[_-]|$)/.test(tool);
+  if (!mutatingName) return false;
+  if (!requireWorkspacePath) return true;
+  return ["path", "file", "filepath", "file_path", "dest", "destination", "from", "to", "root"]
+    .some((key) => typeof args[key] === "string" && args[key].trim());
+}
+function _toolMutatesWorkspace(call, result) {
+  if (!call) return false;
+  if (_WORKSPACE_MUTATING_TYPES.has(call.type)) return true;
+  if (call.type === "cmd" || call.type === "termtask") return _looksLikeWorkspaceMutationCommand(call.command);
+  if (call.type === "mcp") return result?.workspaceMutated === true || _mcpMutationHint(call, true);
+  if (call.type === "git") return ["pull", "stash", "stash_pop"].includes(call.op) || (call.op === "branch" && !!call.branch);
+  return false;
+}
+function _toolProducesMaterialEffect(call, result, workspaceMutated = false) {
+  if (!call) return false;
+  if (workspaceMutated || result?.materialEffect === true) return true;
+  if (call.type === "mcp") return _mcpMutationHint(call, false);
+  if (call.type === "git") return ["commit", "push", "pull", "clone", "stash", "stash_pop"].includes(call.op)
+    || (call.op === "branch" && !!call.branch);
+  if (call.type === "gh") return ["pr_create", "pr_reply"].includes(call.op);
+  if (call.type === "worktree") return ["add", "remove"].includes(call.action);
+  if (call.type === "db") return !/^\s*(?:select|with|explain|pragma|show|describe)\b/i.test(String(call.query || ""));
+  if (call.type === "remote") return ["connect", "disconnect"].includes(call.op);
+  if (call.type === "system") return !["frontmost", "list", "status", "windows"].includes(call.op);
+  if (call.type === "automation") return !/(?:^|\.)(?:get|read|list|status|inspect|nodes|check|screenshot)$/i.test(String(call.method || ""));
+  if (call.type === "termtask") return true;
+  return false;
+}
+function _toolProducesRuntimeEffect(call, result) {
+  if (call?.type === "cmd") return !_looksLikeReadOnlyCommand(call.command);
+  if (call?.type === "termtask") return result?.running === true;
+  return false;
 }
 function _browserHealthPassed(call, result) {
   return call?.type === "browser" && call.action === "check" && _toolExecutionSucceeded(call, result)
@@ -14394,10 +15305,13 @@ function _tauriSearchInvokeArgs(call) {
 // MAXIMIZE PARALLELISM: every read-only / idempotent tool that's safe to run
 // concurrently in the per-turn parallel wave (alongside sub-agents + workers). Beyond
 // the basic reads, this now also parallelizes read-only git, GET http, SELECT/read
-// db queries, terminal reads, and multiple generate_image to distinct dests — so a
-// turn that batches many such calls finishes in one round-trip. Side-effecting tools
-// (write/edit/cmd/delete/move/git-write/POST/mutating-SQL) stay strictly sequential.
+// db queries and terminal reads — so a turn that batches many such calls finishes in
+// one round-trip. Every workspace-writing tool, including asset generation, stays
+// strictly sequential even when two calls happen to name different destinations.
 const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "termread", "termlist", "search_tools", "current_time"]);
+function _isMergedToolItem(item) {
+  return item?.merged != null;
+}
 function _isReadOnlyParallel(call) {
   if (!call) return false;
   const t = call.type;
@@ -14405,10 +15319,52 @@ function _isReadOnlyParallel(call) {
   if (t.endsWith("_search") || t === "github_trending" || t === "knowledge") return true;
   if (t === "git") return /^(status|diff|log|blame|conflicts|stash_list|branch)$/.test(call.op || "") && !call.create;
   if (t === "http") return /^(get|head)$/i.test((call.method || "GET").trim());
-  if (t === "db") return /^\s*(select|show|describe|desc|pragma|explain|with)\b/i.test(call.query || "")
+  // WITH/PRAGMA/EXPLAIN are not provably read-only: writable CTEs, assignment
+  // pragmas, and EXPLAIN ANALYZE can all execute mutations.
+  if (t === "db") return /^\s*(select|show|describe|desc)\b/i.test(call.query || "")
     || /^\s*(get|mget|keys|hget|hgetall|hkeys|hvals|lrange|llen|smembers|scard|sismember|zrange|zcard|exists|ttl|type|strlen|scan|hscan|sscan|zscan|getrange|lindex|hmget|dbsize|info)\b/i.test(call.query || "");
-  if (t === "genimage") return !!call.dest; // network-bound, distinct dest → safe to parallel (e.g. 3 mockup variants at once)
   return false;
+}
+
+async function _runOrderedToolSegments(items, canRunInParallel, execute, isLive = () => true) {
+  for (let index = 0; index < items.length && isLive();) {
+    if (!canRunInParallel(items[index], index)) {
+      await execute(items[index], index);
+      index++;
+      continue;
+    }
+    let end = index;
+    const segment = [];
+    while (end < items.length && canRunInParallel(items[end], end)) {
+      const current = end++;
+      segment.push(execute(items[current], current));
+    }
+    await Promise.all(segment);
+    index = end;
+  }
+}
+
+function _stableToolValue(value) {
+  if (Array.isArray(value)) return value.map(_stableToolValue);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const key of Object.keys(value).filter((key) => !key.startsWith("_")).sort()) {
+    const current = value[key];
+    if (typeof current !== "function" && current !== undefined) out[key] = _stableToolValue(current);
+  }
+  return out;
+}
+
+function _stableToolCallSignature(call) {
+  const serialized = JSON.stringify(_stableToolValue(call || {}));
+  return `${call?.type || "tool"}:${_resultFingerprint(serialized)}`;
+}
+
+function _resultFingerprint(value) {
+  const text = String(value || "");
+  let hash = 5381;
+  for (let index = 0; index < text.length; index++) hash = ((hash << 5) + hash + text.charCodeAt(index)) | 0;
+  return `${(hash >>> 0).toString(36)}:${text.length}`;
 }
 
 function _isTransientToolFail(s) {
@@ -14434,7 +15390,7 @@ function _staticToolNames() {
   return __staticToolNames;
 }
 
-async function _agentModelTurn({ config, messages, toolSchemas, body, session, ideMode, skillsBlock = "" }) {
+async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = null, body, session, ideMode, skillsBlock = "", narrativeSeen = null }) {
   // Final defensive bound: every provider turn sees one total static+runtime tool window.
   _applyToolPayloadWindow(toolSchemas);
   // `session` owns this turn — interrupt checks read session.streaming, and the
@@ -14489,6 +15445,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   let reasoningAcc = "";
   let reasoningEl = null;
   let reasoningTimer = 0;
+  let _argRepairMsg = null;
+  let fatalToolArgIssue = "";
+  let fatalRejectedToolAttempts = [];
   let _reasoningPrior = ""; // accumulated text from prior turns (before the divider)
   const renderReasoning = () => {
     reasoningTimer = 0;
@@ -14568,7 +15527,14 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
     try {
       // L0（防逆向，默认开）：把模式名 + 静态工具名交给网关，请求里剥掉静态系统提示词和工具
       // schema；MCP/运行时工具（不在网关目录）仍随 body 走，绝不丢。开关关→零行为变化。
-      let _l0Msgs = messages, _l0Tools = toolSchemas;
+      // `_ideMeta` is orchestration-only evidence used by context compaction. Do
+      // not leak non-standard message fields to strict OpenAI-compatible APIs.
+      const providerMessages = messages.map((message) => {
+        if (!message || !Object.prototype.hasOwnProperty.call(message, "_ideMeta")) return message;
+        const { _ideMeta, ...clean } = message;
+        return clean;
+      });
+      let _l0Msgs = providerMessages, _l0Tools = toolSchemas;
       const _turnTime = _currentTimeContext();
       _turnConfig.ideTimezone = _turnTime.timeZone;
       _turnConfig.ideUtcOffsetMinutes = _turnTime.utcOffsetMinutes;
@@ -14582,7 +15548,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
         _turnConfig.ideMode = ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
-        _l0Msgs = _l0MessagesWithSkills(messages, skillsBlock);
+        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock);
       }
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
         const _realProgress = ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall";
@@ -14630,34 +15596,83 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
       let okJson = false; try { JSON.parse(a); okJson = true; } catch {}
       if (!okJson && !a.endsWith("}")) { truncated = true; break; }
     }
+    let argIssue = "";
+    let rejectedToolAttempts = [];
+    for (const [, e] of byIndex) {
+      const issue = e.name ? _toolArgIssue(e.name, e.args || "", toolRegistry || toolSchemas) : "工具调用缺少 name";
+      if (issue) {
+        if (!argIssue) argIssue = issue;
+        rejectedToolAttempts.push({ name: e.name, argsRaw: e.args || "", parsedArgs: _safeJsonLoose(e.args || "") || {}, issue });
+      }
+    }
+    // Text-shaped tool calls used to be parsed only after the retry loop, so a
+    // missing required field was silently discarded. Probe them here and feed
+    // the same repair state machine as native SSE calls.
+    if (!argIssue && byIndex.size === 0 && acc.trim()) {
+      const textIssues = [];
+      const textRejected = [];
+      _parseTextToolCalls(acc, toolRegistry || toolSchemas, textIssues, textRejected);
+      if (textIssues.length) {
+        argIssue = textIssues[0];
+        rejectedToolAttempts = textRejected;
+      }
+    }
     // Usable output = real answer text, or ≥1 cleanly-parseable named tool call. Reasoning
     // alone is NOT usable — a relay that streamed only "thinking" then died should retry
     // (the old `!produced` check missed this, since reasoning also set produced=true).
     const hasUsable = acc.trim().length > 0 || [...byIndex.values()].some((e) => {
       if (!e.name || !(e.args || "").trim() || e.args.trim() === "{}") return false;
+      if (_toolArgIssue(e.name, e.args, toolRegistry || toolSchemas)) return false;
       try { JSON.parse(e.args); return true; } catch { return false; }
     });
     const stalled = !!turnErr && _isStalledAiError(turnErr);
-    const retryLimit = stalled ? 1 : 3;
-    if ((truncated || (turnErr && _isRetryableAiError(turnErr) && !hasUsable)) && attempt < retryLimit && _live()) {
+    // A stream error after a syntactically complete tool object is still unsafe:
+    // that object may only be a valid prefix of the intended write. Retry the whole
+    // turn and never execute any tool from an errored stream.
+    const erroredToolStream = !!turnErr && byIndex.size > 0;
+    const retryLimit = argIssue ? 2 : (stalled || erroredToolStream ? 1 : 2);
+    if ((argIssue || truncated || erroredToolStream || (turnErr && _isRetryableAiError(turnErr) && !hasUsable)) && attempt < retryLimit && _live()) {
       for (const [, e] of byIndex) _removeWritePreview(e); // drop the partial live previews
       byIndex.clear(); acc = ""; reasoningAcc = "";
       if (streamEl) { streamEl.remove(); streamEl = null; }
       if (reasoningEl) { reasoningEl.remove(); reasoningEl = null; }
+      if (argIssue) {
+        if (_argRepairMsg) { const i = messages.indexOf(_argRepairMsg); if (i >= 0) messages.splice(i, 1); }
+        _argRepairMsg = { role: "user", content: `[工具参数校验失败] ${argIssue}。请重新输出这次工具调用，并在同一个调用中一次传全 schema 要求的所有字段；不要先发空对象或残缺参数。` };
+        messages.push(_argRepairMsg);
+      }
       if (stalled) {
         const effort = String(_turnConfig.reasoningEffort || "").toLowerCase();
         if (effort === "high" || effort === "max") _turnConfig.reasoningEffort = "medium";
         else if (effort === "medium") _turnConfig.reasoningEffort = "low";
         delete _turnConfig.thinkingBudget;
       }
-      showToast(stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`));
+      showToast(argIssue ? `工具参数不完整，正在自动修复重试… (${attempt + 1}/2)` : (stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`)));
       await new Promise((r) => setTimeout(r, stalled ? 250 : 800 * Math.pow(2, attempt)));
       if (!_live()) { err = turnErr; break; }
       continue;
     }
-    err = stalled && attempt >= retryLimit ? `[fast-retry-exhausted] ${turnErr}` : turnErr;
+    if (argIssue || truncated) {
+      fatalToolArgIssue = argIssue || "工具参数流被截断";
+      fatalRejectedToolAttempts = rejectedToolAttempts.length
+        ? rejectedToolAttempts
+        : [...byIndex.values()].map((entry) => ({ name: entry.name || "", argsRaw: entry.args || "", parsedArgs: _safeJsonLoose(entry.args || "") || {}, issue: fatalToolArgIssue }));
+      err = `[tool-args-invalid] ${fatalToolArgIssue}；自动重试已耗尽，IDE 已拒绝执行这次工具调用，未写盘。`;
+    } else if (turnErr && attempt >= retryLimit) {
+      if (erroredToolStream) {
+        const issue = `上游工具调用流异常中断：${String(turnErr).slice(0, 160)}`;
+        fatalRejectedToolAttempts = [...byIndex.values()].map((entry) => ({
+          name: entry.name || "", argsRaw: entry.args || "", parsedArgs: _safeJsonLoose(entry.args || "") || {}, issue,
+        }));
+      }
+      err = `${erroredToolStream ? "[tool-stream-retry-exhausted]" : stalled ? "[fast-retry-exhausted]" : "[turn-retry-exhausted]"} ${turnErr}`;
+    } else {
+      err = turnErr;
+    }
     break;
   }
+
+  if (_argRepairMsg) { const i = messages.indexOf(_argRepairMsg); if (i >= 0) messages.splice(i, 1); }
 
   if (flushTimer) clearTimeout(flushTimer);
   if (reasoningTimer) clearTimeout(reasoningTimer);
@@ -14666,37 +15681,19 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   settleReasoning(); // final markdown render + collapse the thinking once the turn settles
   _mergeTrailingThinkCards(body); // fold a run of consecutive think-cards into one (no card pile)
   _removeAllThinking(body);
+  if (fatalToolArgIssue || fatalRejectedToolAttempts.length) {
+    _renderRejectedToolAttempts(body, fatalRejectedToolAttempts, fatalToolArgIssue || "工具调用流异常中断");
+  }
 
-  // Assemble tool calls from the NATIVE function-call stream (repairing malformed
-  // arg JSON instead of silently dropping to {}).
-  let toolCalls = [...byIndex.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([, e]) => {
-      let parsed = {}, raw = (e.args && e.args.trim()) ? e.args.trim() : "{}";
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        // Broken arg JSON (e.g. a lone `\u` the model didn't double-escape → "unexpected
-        // end of hex escape"). Repair via _safeJsonLoose, then RE-SERIALIZE argsRaw from the
-        // clean object — never replay the broken original, or the gateway (serde) chokes on
-        // it when we send this tool call back in the next turn's history.
-        parsed = _safeJsonLoose(e.args) || {};
-        raw = JSON.stringify(parsed);
-      }
-      return {
-        id: e.id || ("call_" + Math.random().toString(36).slice(2, 10)),
-        name: e.name,
-        argsRaw: raw,
-        parsedArgs: parsed,
-      };
-    })
-    .filter((tc) => tc.name);
+  // The assembly helper independently revalidates file mutations. Even if a future
+  // retry-loop change regresses, a truncated write still cannot reach execution.
+  let toolCalls = (fatalToolArgIssue || err) ? [] : _assembleStreamToolCalls(byIndex, toolRegistry || toolSchemas);
   // WEAK-MODEL fallback: the model produced NO native tool call but WROTE one as text
   // (```json {tool,args}```, <tool_call>…</tool_call>, or bare tool-shaped JSON). Parse
   // + execute it, and strip that block from the shown answer. Gated on the name being
   // a REAL tool, so a genuine ```json code example is never misfired.
-  if (!toolCalls.length) {
-    const fromText = _parseTextToolCalls(acc);
+  if (!toolCalls.length && !err) {
+    const fromText = _parseTextToolCalls(acc, toolRegistry || toolSchemas);
     if (fromText.length) { toolCalls = fromText; acc = _stripParsedToolCalls(acc); }
   }
 
@@ -14706,10 +15703,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   if (_turnUsage) _recordUsage(_turnUsage);
   else _recordUsage({ estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) });
 
-  // Claude doesn't brain-freeze-repeat — skip the dedup for it so a false positive can
-  // never touch its output. Only the weaker families (which DO repeat) get deduped.
   const _cf0 = _cleanAgentText(acc);
-  const cleanFinal = _modelFamilyOf(_turnConfig && _turnConfig.model) === "claude" ? _cf0 : _dedupeRepeatedText(_cf0);
+  const cleanFinal = _dedupeRunNarrative(_dedupeRepeatedText(_cf0), narrativeSeen);
   if (streamEl) {
     if (cleanFinal.trim()) renderMarkdownInto(streamEl, cleanFinal, { streaming: false });
     else streamEl.remove();
@@ -14725,7 +15720,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
 
   for (const [, e] of byIndex) _removeWritePreview(e); // hand off live previews to the real cards
   if (session && session._cancelIds) session._cancelIds.delete(_turnReqId);
-  return { text: acc, toolCalls, error: err, reasoning: _reasoningFinal };
+  return { text: cleanFinal, toolCalls, error: err, reasoning: _reasoningFinal };
 }
 
 // --- Worker sub-agents (parallel decomposition without conflicts) ---
@@ -14737,11 +15732,37 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
 // Normalize a path to workspace-root-relative form (so scope checks compare apples
 // to apples whether the model gave a relative or absolute path).
 function _normRel(p, root) {
-  let s = String(p || "").trim().replace(/\\/g, "/");
-  const r = String(root || "").replace(/\/+$/, "");
-  if (r && s.startsWith(r + "/")) s = s.slice(r.length + 1);
+  let s = _normalizeFsPath(String(p || ""));
+  const r = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
+  const sIdentity = _pathIdentity(s);
+  const rootIdentity = _pathIdentity(r);
+  if (r && (sIdentity === rootIdentity || sIdentity.startsWith(rootIdentity + "/"))) s = s.slice(r.length).replace(/^\/+/, "");
   else if (s.startsWith("/") || /^[A-Za-z]:\//.test(s)) return s.replace(/\/+$/, "");
   return s.replace(/^\.\//, "").replace(/\/+$/, "");
+}
+function _bindRunFilePath(run, root, requested, resolved) {
+  if (!run || !requested || !resolved) return;
+  run._filePathBindings = run._filePathBindings || new Map();
+  run._filePathBindingBatch = run._filePathBindingBatch || new Map();
+  const resolvedPath = _coherentFilePath(resolved);
+  const requestedKey = _normRel(requested, root);
+  const resolvedKey = _normRel(resolvedPath, root);
+  const batch = run._toolBatch || 0;
+  if (requestedKey) { run._filePathBindings.set(requestedKey, resolvedPath); run._filePathBindingBatch.set(requestedKey, batch); }
+  if (resolvedKey) { run._filePathBindings.set(resolvedKey, resolvedPath); run._filePathBindingBatch.set(resolvedKey, batch); }
+}
+function _boundRunFilePath(run, root, requested) {
+  const key = _normRel(requested, root);
+  if (!key || !run?._filePathBindings) return "";
+  const boundBatch = run._filePathBindingBatch?.get(key) || 0;
+  if (run._toolBatch && boundBatch >= run._toolBatch) return "";
+  return run._filePathBindings.get(key) || "";
+}
+function _sameBatchRunFilePathBinding(run, root, requested) {
+  const key = _normRel(requested, root);
+  if (!key || !run?._filePathBindings || !run._toolBatch) return "";
+  const boundBatch = run._filePathBindingBatch?.get(key) || 0;
+  return boundBatch >= run._toolBatch ? (run._filePathBindings.get(key) || "") : "";
 }
 function _recordRunRead(run, root, ...paths) {
   const reads = run?.ctx?.filesRead;
@@ -14757,6 +15778,100 @@ function _contentSignature(text) {
   let hash = 5381;
   for (let index = 0; index < value.length; index++) hash = ((hash << 5) + hash + value.charCodeAt(index)) | 0;
   return `${lines}:${value.length}:${hash >>> 0}`;
+}
+function _readEvidenceDigest(text) {
+  const lines = String(text || "").split("\n").map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return "(空文件)";
+  const picked = lines.length <= 9 ? lines : [...lines.slice(0, 6), `... ${lines.length - 9} 行略 ...`, ...lines.slice(-3)];
+  return picked.join("\n").slice(0, 700);
+}
+function _recordSessionReadEvidence(run, root, evidence) {
+  const memory = run?.session?.memory;
+  if (!memory || typeof memory.recordFileEvidence !== "function" || !evidence?.path) return;
+  memory.recordFileEvidence({ ...evidence, root, path: _normRel(evidence.path, root), updatedAt: Date.now() });
+}
+function _invalidateSessionReadEvidence(run, root, ...paths) {
+  const memory = run?.session?.memory;
+  if (!memory || typeof memory.invalidateFileEvidence !== "function") return;
+  const concrete = paths.filter(Boolean);
+  if (!concrete.length && typeof memory.fileEvidenceForRoot === "function") {
+    for (const evidence of memory.fileEvidenceForRoot(root)) memory.invalidateFileEvidence(root, evidence.path);
+    return;
+  }
+  for (const path of concrete) {
+    memory.invalidateFileEvidence(root, _normRel(path, root));
+  }
+}
+function _mergeReadRanges(ranges) {
+  const normalized = (Array.isArray(ranges) ? ranges : [])
+    .map((range) => [Math.max(1, Math.floor(Number(range?.[0]) || 1)), Math.max(0, Math.floor(Number(range?.[1]) || 0))])
+    .filter(([from, to]) => to >= from)
+    .sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const range of normalized) {
+    const previous = merged[merged.length - 1];
+    if (previous && range[0] <= previous[1] + 1) previous[1] = Math.max(previous[1], range[1]);
+    else merged.push([...range]);
+  }
+  return merged;
+}
+function _knownReadRanges(run, root, signature, total, ...paths) {
+  const keys = new Set(paths.map((path) => _normRel(path, root)).filter(Boolean));
+  const ranges = [];
+  for (const key of keys) {
+    const state = run?._readCoverage?.get?.(key);
+    if (state?.signature === signature && state?.total === total) ranges.push(...(state.ranges || []));
+  }
+  return _mergeReadRanges(ranges);
+}
+function _readRangeCovered(ranges, from, to) {
+  const start = Math.max(1, Math.floor(Number(from) || 1));
+  const end = Math.floor(Number(to) || 0);
+  if (end < start) return false;
+  return _mergeReadRanges(ranges).some(([knownFrom, knownTo]) => knownFrom <= start && knownTo >= end);
+}
+function _readCoverageThrough(ranges) {
+  const merged = _mergeReadRanges(ranges);
+  return merged.length && merged[0][0] === 1 ? merged[0][1] : 0;
+}
+function _hydrateRunContextEvidence(run, root, evidenceList) {
+  const entries = (Array.isArray(evidenceList) ? evidenceList : []).filter((evidence) =>
+    evidence?.signature && evidence?.path && evidence?.complete && Number(evidence.total) > 0);
+  run._contextReadEvidence = entries.map((evidence) => ({ ...evidence, ranges: (evidence.ranges || []).map((range) => [...range]) }));
+  run._contextPreambleAvailable = entries.length > 0;
+  for (const evidence of entries) {
+    _recordRunReadRange(run, root, 1, Number(evidence.total), Number(evidence.total), evidence.signature, evidence.path);
+    run._readSeen = run._readSeen || new Map();
+    run._readSig = run._readSig || new Map();
+    const absolute = _resolveRel(evidence.path, root);
+    run._readSeen.set(absolute, Number(evidence.total));
+    run._readSig.set(absolute, evidence.signature);
+  }
+}
+function _syncRunReadCoverageFromMessages(run, root, messages) {
+  if (!run?.ctx?.filesRead) return;
+  run.ctx.filesRead.clear();
+  run._readCoverage = new Map();
+  run._readSeen = new Map();
+  run._readSig = new Map();
+  run._dupReadN = new Map();
+  if (run._contextPreambleAvailable) {
+    for (const evidence of run._contextReadEvidence || []) {
+      _recordRunReadRange(run, root, 1, Number(evidence.total), Number(evidence.total), evidence.signature, evidence.path);
+      const absolute = _resolveRel(evidence.path, root);
+      run._readSeen.set(absolute, Number(evidence.total));
+      run._readSig.set(absolute, evidence.signature);
+    }
+  }
+  for (const message of messages || []) {
+    const meta = message?._ideMeta;
+    if (message?.role !== "tool" || meta?.kind !== "read" || meta.resultKind !== "content"
+        || meta.contextAvailable === false || !meta.canonicalPath || !meta.signature) continue;
+    _recordRunReadRange(run, root, Number(meta.from), Number(meta.to), Number(meta.total), meta.signature, meta.canonicalPath);
+    const absolute = _resolveRel(meta.canonicalPath, root);
+    run._readSeen.set(absolute, Math.max(run._readSeen.get(absolute) || 0, Number(meta.to) || 0));
+    run._readSig.set(absolute, meta.signature);
+  }
 }
 function _recordRunReadRange(run, root, start, end, total, signature, ...paths) {
   const reads = run?.ctx?.filesRead;
@@ -14789,7 +15904,10 @@ function _recordRunReadRange(run, root, start, end, total, signature, ...paths) 
   }
   state.ranges = merged;
   const complete = total <= 0 || (merged.length === 1 && merged[0][0] === 1 && merged[0][1] >= total);
-  if (complete) for (const key of state.keys) reads.add(key);
+  if (complete) {
+    state.completedBatch = run._toolBatch || 0;
+    for (const key of state.keys) reads.add(key);
+  }
   return complete;
 }
 function _runHasRead(run, root, ...paths) {
@@ -14808,8 +15926,32 @@ function _runHasCurrentRead(run, root, currentContent, ...paths) {
   return paths.some((path) => {
     const key = _normRel(path, root);
     const state = key ? coverage.get(key) : null;
-    return !!key && reads.has(key) && state?.signature === signature;
+    const fromPriorModelTurn = !run._toolBatch || !state?.completedBatch || state.completedBatch < run._toolBatch;
+    return !!key && reads.has(key) && state?.signature === signature && fromPriorModelTurn;
   });
+}
+function _recordRunRedactedRead(run, root, signature, redacted, ...paths) {
+  if (!run) return;
+  run._redactedReads = run._redactedReads || new Map();
+  for (const path of paths) {
+    const key = _normRel(path, root);
+    if (!key) continue;
+    if (redacted) run._redactedReads.set(key, signature);
+    else if (run._redactedReads.get(key) !== signature) run._redactedReads.delete(key);
+  }
+}
+function _runReadWasRedacted(run, root, currentContent, ...paths) {
+  if (!run?._redactedReads) return false;
+  const signature = _contentSignature(currentContent);
+  return paths.some((path) => {
+    const key = _normRel(path, root);
+    return !!key && run._redactedReads.get(key) === signature;
+  });
+}
+function _recordRunKnownContent(run, root, content, ...paths) {
+  const value = String(content ?? "");
+  const total = value.endsWith("\n") ? Math.max(1, value.slice(0, -1).split("\n").length) : value.split("\n").length;
+  return _recordRunReadRange(run, root, 1, total, total, _contentSignature(value), ...paths);
 }
 // Is `target` inside one of the worker's scope entries (a file == entry, or under a
 // dir entry)? Absolute paths that escape root, or "..", are never in scope.
@@ -14818,6 +15960,25 @@ function _pathInScope(target, scopeRel, root) {
   const t = _normRel(target, root);
   if (!t || t.startsWith("..") || t.startsWith("/")) return false;
   return scopeRel.some((s) => { const e = s.replace(/\/+$/, ""); return t === e || t.startsWith(e + "/"); });
+}
+function _mutationPathIssue(requested, resolved, root, run, allowReadBinding = true) {
+  const raw = String(requested || "").trim();
+  if (!raw) return "";
+  const absolute = raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw);
+  const normalizedRequest = _normalizeFsPath(raw);
+  if (!absolute && (normalizedRequest === ".." || normalizedRequest.startsWith("../"))) {
+    return `相对路径「${raw}」会逃出当前工作区`;
+  }
+  const target = _coherentFilePath(resolved || _resolveRel(raw, root));
+  const targetIdentity = _pathIdentity(target);
+  const inside = _allRoots(root).some((workspaceRoot) => {
+    const rootIdentity = _pathIdentity(workspaceRoot);
+    return targetIdentity === rootIdentity || targetIdentity.startsWith(rootIdentity + "/");
+  });
+  if (inside) return "";
+  const bound = allowReadBinding ? _boundRunFilePath(run, root, raw) : "";
+  if (absolute && bound && _pathIdentity(bound) === targetIdentity) return "";
+  return `路径「${raw}」不在本次运行的任何工作区内，也没有由本轮 read_file 明确绑定`;
 }
 // Do two scopes share any file? (entry equal, or one nested under the other.)
 function _scopesOverlap(a, b) {
@@ -14870,6 +16031,18 @@ function _sharedCtxDigest(ctx) {
   if (ctx.findings && ctx.findings.length) p.push(`· 已知关键发现：${ctx.findings.slice(-8).join("；")}`);
   if (ctx.errors && ctx.errors.length) p.push(`· 当前未解决的错误：${ctx.errors.slice(-3).join("；")}`);
   return p.length ? `【主智能体已经掌握的上下文——直接接着用，别从零重查】\n${p.join("\n")}` : "";
+}
+function _sessionFileEvidenceBlock(session, root, limit = 8) {
+  const memory = session?.memory;
+  if (!root || typeof memory?.fileEvidenceForRoot !== "function") return "";
+  const entries = memory.fileEvidenceForRoot(root).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, limit);
+  if (!entries.length) return "";
+  const lines = entries.map((entry) => {
+    const ranges = (entry.ranges || []).map((range) => `${range[0]}-${range[1]}`).join(",") || "未记录范围";
+    const digest = String(entry.digest || "").replace(/\s+/g, " ").slice(0, 180);
+    return `· ${entry.path} · 版本 ${entry.signature} · 已读 ${ranges}/${entry.total || "?"}${entry.complete ? "（完整）" : ""}${digest ? ` · 摘要: ${digest}` : ""}`;
+  });
+  return `〔本会话文件证据账本——复用已知路径与结论，不要重新 search 定位；逐字符修改所需原文若已离开当前上下文，只精读目标文件/范围〕\n${lines.join("\n")}`;
 }
 async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], depth = 1, onMutation = null }) {
   const _sess = run && run.session;
@@ -14958,13 +16131,15 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const execRun = write ? { ...run, mode: "agent", _isWorker: true, _scope: scopeRel } : run;
 
   let report = "";
+  const narrativeSeen = new Set();
   let toolCount = 0;
   const SUB_MAX = write ? 18 : 12;
   try {
     for (let i = 0; i < SUB_MAX; i++) {
       if (!_live()) break;
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, body: vp, session: _sess, skillsBlock: run?.skillsBlock ?? "" });
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: toolSchemas, body: vp, session: _sess, skillsBlock: run?.skillsBlock ?? "", narrativeSeen });
       if (turn.error) { report = report || `[ERROR] ${turn.error}`; break; }
+      execRun._toolBatch = (execRun._toolBatch || 0) + 1;
       if (turn.text && turn.text.trim()) report = turn.text.trim();
       const am = { role: "assistant", content: turn.text || "" };
       if (turn.toolCalls.length) am.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
@@ -14976,7 +16151,22 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // write/edit/multiedit (scope-enforced in _executeToolStep). Neither can spawn
         // a sub-agent/worker (not on the list) → recursion is structurally impossible.
         if (!call || !_execTypes.includes(call.type)) {
-          messages.push({ role: "tool", tool_call_id: tc.id, content: call ? `${write ? "worker 只能读 + 在 scope 内改文件" : "子智能体只读"}，不能用 ${tc.name}。` : `未知工具: ${tc.name}` });
+          const rejectedCall = call || { type: "unknown", path: "" };
+          rejectedCall._toolName = rejectedCall._toolName || tc.name || "unknown";
+          const rejectedContent = call
+            ? `[BLOCKED] ${write ? "worker 只能读 + 在 scope 内改文件" : "子智能体只读"}，不能用 ${tc.name}。`
+            : `[ERROR] 未知工具: ${tc.name}`;
+          let rejectedStep = null;
+          try {
+            rejectedStep = _createToolStep(rejectedCall);
+            vp.appendChild(rejectedStep);
+            _settleToolStep(rejectedStep, { type: rejectedCall.type, path: rejectedCall.path || "", content: rejectedContent }, call ? "已拒绝" : "未知工具");
+            const rejectedViewport = rejectedStep.querySelector?.(".atc-viewport");
+            if (rejectedViewport) rejectedViewport.textContent = rejectedContent;
+          } catch (error) {
+            console.error("[subagent-toolstep]", error);
+          }
+          messages.push({ role: "tool", tool_call_id: tc.id, content: rejectedContent });
           continue;
         }
         const step = _createToolStep(call);
@@ -14985,7 +16175,10 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
         else { try { result = await _executeToolStep(step, call, root, execRun); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
-        messages.push({ role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) });
+        _settleToolStep(step, result);
+        const toolMessage = { role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) };
+        if (result?.evidence) toolMessage._ideMeta = result.evidence;
+        messages.push(toolMessage);
         // Context OUT: fold this child's reads/edits into the shared run-context so siblings +
         // the main agent see them (siblings/parent skip re-reading; mutations surface in the
         // main scratchpad automatically since it renders run.ctx).
@@ -14999,7 +16192,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           }
         }
       }
-      _trimMessagesIfHuge(messages);
+      _trimMessagesIfHuge(messages, execRun, root);
     }
   } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
   finally {
@@ -15013,12 +16206,13 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     }
   }
 
-  // 0-step floor: a subagent/worker that did ZERO tool steps investigated nothing — pure
-  // "花架势" overhead (a card + an LLM round-trip that returned immediately). Don't render a
-  // misleading "--ok 0 步调研" card; remove it and tell the parent to just do the work itself,
-  // so speculative/empty spawns are invisible and self-correcting.
+  // 0-step floor: keep the attempt visible and settled. Hiding the card made a
+  // real model/tool attempt look as if nothing happened and left users unable to
+  // distinguish an empty child run from a missing card.
   if (toolCount === 0) {
-    try { card.remove(); } catch {}
+    res.className = "atc-result atc-result--err";
+    res.textContent = "0 步 · 未执行";
+    card.classList.remove("is-open");
     _chatFollow();
     return write
       ? "（worker 未执行任何步骤=没干活。别再派 worker，直接自己 edit/write 改这块）"
@@ -15176,7 +16370,7 @@ async function _buildImageFeedback(imgs, config, leadText, perImageHint) {
 // the loop, never steals focus from another chat tab. ---
 function _liveStageOn() { try { return localStorage.getItem("michael-ide.live-stage") !== "off"; } catch { return true; } }
 let _lastStagedPath = "";
-async function _stageForTool(call, root, session) {
+async function _stageForTool(call, root, session, run = null) {
   try {
     if (!call || !_liveStageOn()) return;
     if (session && typeof _currentSession === "function" && session !== _currentSession()) return; // don't hijack another tab
@@ -15187,7 +16381,8 @@ async function _stageForTool(call, root, session) {
     }
     const rel = call.path || call.dest || "";
     if (!rel) return;
-    const fp = _resolveRel(rel);
+    const fp = _boundRunFilePath(run, root, rel) || _resolveRel(rel, root);
+    call._resolvedPath = fp;
     if (!fp || fp === _lastStagedPath) return;
     if (t === "write" || t === "edit" || t === "multiedit") {
       _lastStagedPath = fp;
@@ -15198,6 +16393,21 @@ async function _stageForTool(call, root, session) {
       try { revealInTree(fp); } catch {} // lightweight: highlight in the tree, don't tab-spam on big sweeps
     }
   } catch { /* staging is cosmetic — never break the run */ }
+}
+
+async function _stageWithDeadline(stagePromise, timeoutMs = 1200) {
+  if (!stagePromise) return { timedOut: false };
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), Math.max(0, Number(timeoutMs) || 0));
+  });
+  const settled = Promise.resolve(stagePromise).then(
+    () => ({ timedOut: false }),
+    () => ({ timedOut: false }),
+  );
+  const result = await Promise.race([settled, timeout]);
+  if (timer != null) clearTimeout(timer);
+  return result;
 }
 
 // --- Agent session recording / replay: a timeline of every action the agent took,
@@ -15300,8 +16510,8 @@ const _TOOL_CATALOG = [
   { name: "db_query", desc: "查/改数据库（mysql/postgres/sqlite/redis）", kw: ["数据库", "查数据", "表", "sql", "mysql", "postgres", "redis", "记录", "字段", "查询", "db"] },
   { name: "run_worker", desc: "派多个 worker 并行改多文件", kw: ["多文件", "并行", "批量", "一批", "所有文件", "整个项目", "全部改", "好几个"] },
   { name: "run_subagent", desc: "派只读子智能体做大范围调研", kw: ["调研", "梳理", "搞清楚", "怎么实现", "整体", "全貌", "分析一下"] },
-  { name: "research_project", desc: "深挖整个项目→技术栈/结构/约定/改动入口上手地图", kw: ["摸清项目", "了解项目", "项目结构", "代码库", "上手", "通览", "深挖", "不熟悉", "这个项目", "整个工程"] },
-  { name: "design_research", desc: "做网站/UI前先研究设计方向+规划UI架构蓝图", kw: ["做网站", "官网", "落地页", "做个页面", "ui", "界面", "设计", "dashboard", "后台", "前端", "架构", "组件"] },
+  { name: "research_project", desc: "按用户要求生成完整代码库上手地图", kw: ["完整上手地图", "通览整个代码库", "深挖整个项目", "全项目架构地图"] },
+  { name: "design_research", desc: "按用户要求研究多个视觉方向并规划完整UI架构", kw: ["重新设计", "视觉方向", "设计蓝图", "完整UI架构", "竞品设计调研"] },
   { name: "update_plan", desc: "列/更新分步计划", kw: ["计划", "步骤", "分步", "规划", "todo", "拆解"] },
   { name: "remember", desc: "记跨会话的项目/全局长期记忆(自动去重清理)", kw: ["记住", "记一下", "经验", "以后", "下次", "约定", "偏好", "我喜欢", "全局", "记住我", "别忘", "用户级"] },
   { name: "ask_user", desc: "意图不明时弹选项按钮+自定义输入问用户", kw: ["不确定", "模糊", "歧义", "问用户", "选择", "确认需求", "哪种", "要不要", "澄清"] },
@@ -15599,7 +16809,7 @@ async function _maybeInduceWorkflow(currentEp, root, config) {
 }
 
 function _recLabel(call) {
-  const p = call.path || "";
+  const p = call._resolvedPath || call.path || "";
   switch (call.type) {
     case "read": return "读取 " + p;
     case "write": return "写入 " + p;
@@ -15669,7 +16879,7 @@ async function _addRecordingExport(container, run, session) {
         when: ts.replace("T", " "),
       });
       try {
-        await backend.writeTextFile(root + "/" + rel, html);
+        await _commitDiskTextIfUnchanged(root + "/" + rel, null, html);
         try { reloadDir(parentDir(root + "/" + rel)); } catch {}
         showToast(`录制已保存：${rel}（双击打开即可回放）`);
         btn.textContent = `✓ 已导出：${rel}`;
@@ -15684,13 +16894,24 @@ async function _addRecordingExport(container, run, session) {
 // brittle keyword regex, so it's robust to any phrasing/language/compound ask. One cheap,
 // non-streaming, JSON-only call with a hard timeout; returns {kind,steps,needs_tools} or null
 // (caller falls back to the fast heuristic). Cost ≈ a few tokens; runs once per user turn.
+function _effectTargetForTask(task, engineering = _engineeringTaskProfile(task)) {
+  const text = String(task || "");
+  if (engineering?.bug || engineering?.architecture || engineering?.ui
+      || /(?:代码|源码|文件|函数|组件|页面|模块|接口实现|\bcode\b|\bsource\b|\bfile\b|\bfunction\b|\bcomponent\b|\bmodule\b|\brefactor\b|\bfix\b)/i.test(text)) return "workspace";
+  if (/(?:github|gitlab|gitee|\bgit\b|pull request|\bpr\b|commit|push|pull|branch|仓库|提交|推送|分支|数据库|\bsql\b|部署|发布|上传|下载|自动化|远程|database|deploy|release|upload|download|automation|remote)/i.test(text)) return "external";
+  if (/(?:编译|构建|打包|运行|启动|测试|安装依赖|compile|build|package|run|start|test|install)/i.test(text)) return "runtime";
+  return engineering?.implementation ? "workspace" : "external";
+}
+
 async function _classifyIntent(task, config) {
   const t = String(task || "").trim();
   if (!t || !config || !config.baseUrl) return null;
-  const sys = '给一个编码智能体的这条用户请求分类，只输出严格 JSON：{"kind":"answer"|"edit"|"project","steps":<1-60 预计自主步数>,"needs_tools":<true|false>}。'
+  const sys = '给一个编码智能体的这条用户请求分类，只输出严格 JSON：{"kind":"answer"|"edit"|"project","effect":"answer"|"inspect"|"mutate","target":"workspace"|"runtime"|"external","steps":<1-60 预计自主步数>,"needs_tools":<true|false>}。'
     + 'answer=纯问答/解释/闲聊，文字答完即止(steps 1-2)；但"这段有没有问题 / 为什么会崩 / 该怎么优化"这种要先读代码才答得好的，needs_tools=true、steps 8-15。'
     + 'edit=一两处明确的小改动(steps 3-10)。'
     + 'project=多步的活；尤其"找bug / 查漏洞 / 审查代码 / 安全审计 / 排查问题 / 整体优化 / 搭建 / 重构 / 实现"这类要深挖多步的，一律 project(steps 15-60)，绝不当成 answer 糊弄。'
+    + 'effect=answer 表示只需文字；inspect 表示只读调查并给结论；mutate 表示用户要求修复/实现/更新，必须观察到真实文件或系统变更才算完成。'
+    + 'target=workspace 表示必须改项目文件（修 bug/实现/重构/UI）；runtime 表示只需真实编译、运行、测试或安装；external 表示 Git/GitHub/数据库/部署/远程/自动化副作用。'
     + '只看请求本身、不臆测。只输出 JSON。';
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -15709,8 +16930,22 @@ async function _classifyIntent(task, config) {
     if (!j || (j.kind !== "answer" && j.kind !== "edit" && j.kind !== "project")) return null;
     let steps = Number(j.steps);
     if (!(steps > 0)) steps = j.kind === "answer" ? 2 : j.kind === "edit" ? 8 : 40;
-    return { kind: j.kind, steps: Math.max(1, Math.min(60, Math.round(steps))), needs_tools: j.needs_tools !== false };
+    const effect = ["answer", "inspect", "mutate"].includes(j.effect)
+      ? j.effect : (j.kind === "answer" ? (j.needs_tools === false ? "answer" : "inspect") : "mutate");
+    const target = ["workspace", "runtime", "external"].includes(j.target)
+      ? j.target : _effectTargetForTask(t, _engineeringTaskProfile(t));
+    return { kind: j.kind, effect, target, steps: Math.max(1, Math.min(60, Math.round(steps))), needs_tools: j.needs_tools !== false };
   } catch { return null; }
+}
+function _runRequiredEffect(run) {
+  if (!run || run.mode !== "agent") return "inspect";
+  if (run._intent?.effect) return run._intent.effect;
+  if (run._intent?.kind === "edit" || run._intent?.kind === "project") return "mutate";
+  return run.engineering?.implementation ? "mutate" : (run.engineering?.applies ? "inspect" : "answer");
+}
+function _runEffectTarget(run) {
+  if (["workspace", "runtime", "external"].includes(run?._intent?.target)) return run._intent.target;
+  return _effectTargetForTask(run?._originalText || "", run?.engineering || {});
 }
 async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "" }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
@@ -15730,6 +16965,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   session = session || _currentSession();
   root = String(root || "").replace(/\/+$/, "");
   const run = { session, root, mode: mode || _currentAiMode, perm: _currentAiPerm, checkpoint: new Map(), recording: [], _recStart: (Date.now ? Date.now() : 0), _originalText: task || "" };
+  run._pendingContextEvidence = Array.isArray(session?._pendingContextEvidence) ? session._pendingContextEvidence.splice(0) : [];
   run.skillsBlock = skillsBlock;
   run.stack = _projectStacks.get(root) || null;
   run.engineering = _engineeringTaskProfile(task);
@@ -15834,7 +17070,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, verificationPassed = false, planSteps = null;
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0;
+  let continueNudges = 0, effectNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -15847,8 +17083,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _uiInteractionViewports = new Set();
   const _readFiles = new Set();  // files explicitly read in this run (for read-before-edit check)
   let blindEditNudges = 0;       // nudge count when editing un-read files
-  let _readOnlyOps = 0;          // cumulative read/search/find/list/lsp/semsearch ops this run
-  let _implOps = 0;              // cumulative successful workspace-affecting operations this run
+  let _novelEvidenceCount = 0;   // successful, non-duplicate read/search evidence this run
+  const _evidenceSeen = new Set();
+  let _implOps = 0;              // successful workspace changes that require fresh verification
+  let _effectOps = 0;            // successful material file/system/external side effects
   let _implNudges = 0;           // "stop researching, start implementing" nudge count
   // Honesty gate: did the LAST tool-using turn hit a failure/unavailable result?
   // If so and the model then tries to wrap up, we make it own the failure instead
@@ -15870,6 +17108,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // chamber); only confirmed real issues are fed back to fix. Runs once.
   // reviewer/goal/memory gates removed (2026-07-05)
   const _mutatedFiles = new Set();
+  run._narrativeSeen = new Set();
   const _editCounts = new Map();   // path → how many times edited this run (churn detector)
   const _churnNudged = new Set();  // files we've already churn-warned (once each)
   // Dynamic step budget — grows on real progress (see _AGENT_EXT_STEP), so big
@@ -15899,11 +17138,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 一个已存在、已传遍全场的对象（run）+ 在它上面读写 = 真正的共享上下文，不是空壳交接。
   _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
   run.ctx = _pad;
+  _hydrateRunContextEvidence(run, root, run._pendingContextEvidence);
   function _padText() {
-    if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length) return "";
+    if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length && !_pad.filesRead.size) return "";
     const parts = [`[运行进度草稿纸——你在长任务第 ${_pad._iter || 0} 步，这张纸帮你记住已做的事]`];
     parts.push(`目标: ${_pad.goal}`);
     if (_pad.done.length) parts.push(`已完成: ${_pad.done.slice(-8).join(" → ")}`);
+    if (_pad.filesRead.size) parts.push(`已读文件: ${[..._pad.filesRead].slice(-16).join("、")}（未变化时直接复用，不要重新搜索定位）`);
     if (_pad.modified.size) parts.push(`已改文件: ${[..._pad.modified].map(([f, d]) => `${f}(${d})`).join(", ")}`);
     if (_pad.errors.length) parts.push(`⚠ 当前未解决的错误: ${_pad.errors.slice(-3).join("; ")}`);
     if (_pad.findings.length) parts.push(`关键发现: ${_pad.findings.slice(-5).join("; ")}`);
@@ -15937,16 +17178,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // as an EPHEMERAL last message (highest attention) — which files it has ALREADY written/
       // edited this run, so it treats them as done instead of re-creating / re-editing them.
       // Spliced out right after the call (by identity, mutation-safe) so it never accumulates
-      // N copies or pollutes the replayed history. Only fires once ≥1 file has been changed.
+      // N copies or pollutes the replayed history.
       let _selfMemMsg = null;
-      if (_mutatedFiles.size) {
-        const _seenRead = (run._readSeen && run._readSeen.size)
-          ? "；已读过（内容在上文，别整文件重读、要看某段用 offset/limit）：" + [...run._readSeen.keys()].map((p) => _normRel(p, root)).slice(-10).join("、")
-          : "";
-        _selfMemMsg = { role: "user", content: `〔进度自查·勿忘〕本次运行你**已经改好并落盘**这些文件（都是你上次编辑后的最新状态）：${[..._mutatedFiles].join("、")}。**别重复创建、别把同一处再改一遍**；要在其中某个继续改，先默认它已含你之前的改动（拿不准先 read_file 看最新内容再动）${_seenRead}。` };
+      const _evidenceBlock = _sessionFileEvidenceBlock(session, root);
+      if (_mutatedFiles.size || _readFiles.size || _evidenceBlock) {
+        const _parts = ["〔执行状态·不要从头重查〕"];
+        if (_mutatedFiles.size) _parts.push(`本次运行已落盘: ${[..._mutatedFiles].join("、")}。不要重复创建或重复应用同一修改。`);
+        if (_readFiles.size) _parts.push(`本次运行已完整读取: ${[..._readFiles].slice(-12).join("、")}。文件未变化就直接使用已有内容；只缺某段原文时才按 offset/limit 精读。`);
+        if (_evidenceBlock) _parts.push(_evidenceBlock);
+        _parts.push("目标文件已经知道时直接 read/edit，不要再用 search/find 绕一圈；只有位置未知时才搜索一次定位。接着完成尚未完成的动作。");
+        _selfMemMsg = { role: "user", content: _parts.join("\n") };
         messages.push(_selfMemMsg);
       }
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock });
+      const turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen });
       if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
       // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
       // calls (writing files / running commands). Previously the loop only re-checked _live()
@@ -15985,8 +17229,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // squiggles / auto-check also set. `_verifiedAtImplOps >= _implOps` means the finish-gate build
         // actually ran at/after the current edit count; `_verifyExhausted` covers a project that
         // genuinely can't be verified (budget spent) so it can still finish honestly.
+        const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
+        const _requiredTarget = _runEffectTarget(run);
+        const _missingRequiredEffect = _runRequiredEffect(run) === "mutate"
+          && (_requiredTarget === "workspace" ? _implOps === 0 : _effectOps === 0);
         const _uiSettled = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps || uiVerifyNudges >= 2;
-        if (quietTurns >= 4 && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted) && _uiSettled) {
+        if (quietTurns >= 4 && !pending && !_missingRequiredEffect && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted) && _uiSettled) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           break;
         }
@@ -15995,16 +17243,35 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // should be reading files / searching / planning, not writing prose. Force it.
         if (!_quick() && iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
           toolFirstNudges++;
-          const _nudgeMsg = "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。";
+          const _nudgeMsg = "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；大任务再 update_plan，然后开始 edit/write/run。不要继续只输出说明文字。";
           messages.push({ role: "user", content: _nudgeMsg });
           continue;
         }
         // C — don't stop with unfinished plan steps.
-        const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
         if (pending && continueNudges < 2) {
           continueNudges++;
           messages.push({ role: "user", content: "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾，别提前停。" });
           continue;
+        }
+        if (pending) {
+          run._incompleteReason = "pending_plan";
+          hitCap = true;
+          break;
+        }
+        if (_missingRequiredEffect && effectNudges < 2) {
+          effectNudges++;
+          const targetInstruction = _requiredTarget === "workspace"
+            ? "直接基于已经读取的精确证据 edit/write 完成真实文件修改，再验证"
+            : _requiredTarget === "runtime"
+            ? "运行用户要求的真实编译/启动/测试命令，并以退出状态或持续进程状态为证据"
+            : "执行用户要求的 Git/GitHub/数据库/部署/远程操作，并以工具返回的真实状态为证据";
+          messages.push({ role: "user", content: `这项请求要求产生真实结果，但当前还没有符合目标类型的成功副作用。不要用总结代替执行：${targetInstruction}。若确认无需动作，必须给出具体证据，不能只说“已经好了”。` });
+          continue;
+        }
+        if (_missingRequiredEffect) {
+          run._incompleteReason = "required_mutation_missing";
+          hitCap = true;
+          break;
         }
         // A — mutated files but never verified → make verification non-optional. Don't
         // just ASK: detect the project's check and RUN it ourselves, feed the real
@@ -16105,7 +17372,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // model's sequence), then execute: read-only tools (read/list/search/find)
       // run in parallel for fast context-gathering, while mutating tools
       // (edit/write/cmd) and plan updates run sequentially in order.
-      const items = turn.toolCalls.map((tc) => ({ tc, call: _mapToolCall(tc.name, tc.parsedArgs, run.mcpToolMap), step: null }));
+      const items = turn.toolCalls.map((tc) => {
+        const mapped = _mapToolCall(tc.name, tc.parsedArgs, run.mcpToolMap);
+        const call = mapped || { type: "unknown", path: "", _toolName: tc.name || "unknown" };
+        call._runRoot = root;
+        call._toolName = call._toolName || tc.name || call.type;
+        return { tc, call, step: null, _unknown: !mapped };
+      });
+      run._toolBatch = (run._toolBatch || 0) + 1;
 
       // 工具不丢失（自愈加载）：模型若直接按名调用真实但当前未加载的工具，照常执行，
       // 并优先把 schema 换入有界窗口；完整注册表与 MCP 路由始终保留在 run 上。
@@ -16149,7 +17423,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           })).filter((e) => e.old_string);
           if (edits.length < 2) continue;
           // Rewrite first call → multi_edit with all merged edits.
-          first.call = { type: "multiedit", path, edits };
+          first.call = { type: "multiedit", path, edits, _runRoot: root };
           first.autoBatched = edits.length;
           // Mark the rest as merged-stub so runOne returns instantly.
           for (let k = 1; k < idxs.length; k++) {
@@ -16166,7 +17440,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       {
         const _seenRead = new Set();
         for (const it of items) {
-          if (!it.call || it.call.type !== "read" || it.merged != null) continue;
+          if (!it.call || it.call.type !== "read" || _isMergedToolItem(it)) continue;
           const _off = Number.isFinite(it.call.offset) ? it.call.offset : "";
           const _lim = Number.isFinite(it.call.limit) ? it.call.limit : "";
           const _k = (it.call.path || "").trim() + "|" + _off + "|" + _lim;
@@ -16175,18 +17449,37 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       }
 
       for (const it of items) {
-        if (it.call && !it.merged && !it._dupRead && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research" && it.tc.name !== "search_tools") { try { it.step = _createToolStep(it.call); body.appendChild(it.step); } catch (_e) { console.error("[toolstep]", _e); } }
+        if (it.call && !_isMergedToolItem(it) && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research") { try { it.step = _createToolStep(it.call); body.appendChild(it.step); } catch (_e) { console.error("[toolstep]", _e); } }
       }
       // Live staging: drive the relevant panel(s) so the user watches the real work
       // (edit→open file, cmd→terminal, read→reveal). The LAST file op in the batch
-      // wins the editor; cmd always pops the terminal. Fire-and-forget, never blocks.
-      for (const it of items) { if (it.call) _stageForTool(it.call, root, session); }
+      // wins the editor; cmd always pops the terminal. Mutations await their own
+      // staging read before writing so a late openFile(old) cannot overwrite the
+      // Monaco model after the Agent has already committed new content.
+      for (const it of items) {
+        if (it.call && !_isMergedToolItem(it) && !it._dupRead && !it._unknown) {
+          it.stagePromise = _stageForTool(it.call, root, session, run);
+          it.stageReady = _stageWithDeadline(it.stagePromise);
+        }
+      }
+      // Every file-stage open starts together. Wait for the whole mutation batch
+      // before the first write; otherwise a slower second openFile(old disk) can
+      // finish after the first write and reinstall stale Monaco content.
+      await Promise.allSettled(items
+        .filter((it) => it.stageReady && ["write", "edit", "multiedit", "format"].includes(it.call?.type))
+        .map((it) => it.stageReady));
       _scroll();
 
       const toolMsgs = new Array(items.length);
 
       const runOne = async (it) => {
         const { call, step } = it;
+        if (it._unknown || call?.type === "unknown") {
+          const r = { type: "unknown", path: "", content: `[ERROR] 未知工具: ${it.tc.name || "(无名称)"}` };
+          it.rawResult = r;
+          _settleToolStep(step, r, "未知工具");
+          return r.content;
+        }
         // search_tools — 元工具：把命中的延迟工具 schema 换入有界窗口。不走 _executeToolStep。
         if (call && call.type === "search_tools") {
           const loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
@@ -16209,6 +17502,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               ? `找到 ${adds.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
               : "没找到匹配的新工具——这个能力可能已在你现有工具列表里（直接按名调用即可），或换个说法再 search_tools。") };
           it.rawResult = r;
+          _settleToolStep(step, r, lines.length ? `已加载 ${lines.length}` : "无新工具");
           return r.content;
         }
         // Auto-batched duplicate edit calls were rewritten into a single multi_edit
@@ -16224,13 +17518,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (it._dupRead) {
           const r = { type: "read", path: call.path || "", content: `[重复读取·已跳过] 这一轮你对 ${call.path} 发了多次完全相同的 read——只执行一次就够，内容以第一次为准（在上方）。同一回合别对同一文件重复 read。` };
           it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "重复 · 已跳过");
           return _toolResultToString(call, r);
+        }
+        if (it.stageReady && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "format")) {
+          try { await it.stageReady; } catch {}
         }
         // EXACT-duplicate guard — the model re-issued the IDENTICAL read-only call it just
         // made (the "脑抽重复2次" case). Short-circuit it instead of wasting a round-trip
         // re-running the same query. Only idempotent read-only types; excludes read_file
         // (it pages/auto-advances, so a same-path re-read is legitimately different).
-        const _sig = call.type + ":" + String(call.command || call.query || call.path || call.selector || call.action || call.url || call.op || call.name || "").slice(0, 120);
+        const _sig = _stableToolCallSignature(call);
         const _dupGuardable = new Set(["list", "search", "find", "lsp", "semsearch", "findsymbol", "knowledge", "web", "websearch", "diag"]);
         // Weak models brain-freeze-repeat readily → catch a repeat within the last 2 calls. Claude
         // rarely does, and a SPACED re-run after other work is usually intentional — but sonnet-5 CAN
@@ -16245,7 +17544,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (_dup) {
             const r = { type: call.type, path: call.path || "", content: `（⚠️ 你刚**连续**执行了完全相同的 ${call.type} 调用，结果就在上方——别再重复同一个调用、也别把同样的话再说一遍。直接基于已有结果继续下一步；要不同信息就换参数/换目标/换工具。）` };
             it.rawResult = r;
+            it._skipped = true;
             run._recentSigs.push(_sig);
+            _settleToolStep(step, r, "重复 · 已复用");
             return _toolResultToString(call, r);
           }
         }
@@ -16257,12 +17558,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._failedSearchQ = run._failedSearchQ || [];
           const _qRaw = call.query || "";
           const _qN = _qRaw.toLowerCase().replace(/[|\\.*+?^${}()[\]]/g, " ").replace(/\s+/g, " ").trim();
+          const _scope = _normalizeFsPath(String(call.searchPath || call.path || call._runRoot || ""));
+          const _mode = call.mode || "literal";
+          const _caseSensitive = !!call.caseSensitive;
           if (_qN.length >= 2) {
-            const _hit = run._failedSearchQ.find(fq => _qN === fq || _qN.includes(fq) || fq.includes(_qN));
+            const _hit = run._failedSearchQ.find((entry) => entry.scope === _scope && entry.mode === _mode && entry.caseSensitive === _caseSensitive
+              && (_qN === entry.query || _qN.includes(entry.query) || entry.query.includes(_qN)));
             if (_hit) {
-              const r = { type: call.type, path: call.path || "", content: `搜索 "${_qRaw}"：无匹配。（你之前搜 "${_hit}" 也没结果——同类词反复搜不会有新结果。换个**完全不同的关键词**、或用 find_files 按文件名找、或 read_file 直接读你已知的文件。）` };
+              const r = { type: call.type, path: call.path || "", content: `搜索 "${_qRaw}"：无匹配。（你之前在同一范围搜 "${_hit.query}" 也没结果——同类词反复搜不会有新结果。目标文件已知就直接 read_file；位置未知才换完全不同的定位方式。）` };
               it.rawResult = r;
-              if (it.step) { it.step.remove(); it.step = null; }
+              it._skipped = true;
+              _settleToolStep(step, r, "相似搜索 · 已跳过");
               if (run._recentSigs) run._recentSigs.push(_sig);
               return _toolResultToString(call, r);
             }
@@ -16285,18 +17591,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (_live()) result = await _exec();
           }
         }
+        if (result?.evidence?.resultKind === "duplicate") it._skipped = true;
         // Track failed text searches for fuzzy dedup (search + websearch only, NOT find_files)
         if (run && (call.type === "search" || call.type === "websearch")) {
           const _c = (result && result.content) || "";
           if (_c.includes("无匹配") || /\b0\s*处匹配/.test(_c)) {
             run._failedSearchQ = run._failedSearchQ || [];
             const _qN = (call.query || "").toLowerCase().replace(/[|\\.*+?^${}()[\]]/g, " ").replace(/\s+/g, " ").trim();
-            if (_qN.length >= 2 && !run._failedSearchQ.includes(_qN)) { run._failedSearchQ.push(_qN); if (run._failedSearchQ.length > 12) run._failedSearchQ.shift(); }
+            const entry = { query: _qN, scope: _normalizeFsPath(String(call.searchPath || call.path || call._runRoot || "")), mode: call.mode || "literal", caseSensitive: !!call.caseSensitive };
+            if (_qN.length >= 2 && !run._failedSearchQ.some((item) => item.query === entry.query && item.scope === entry.scope && item.mode === entry.mode && item.caseSensitive === entry.caseSensitive)) {
+              run._failedSearchQ.push(entry); if (run._failedSearchQ.length > 12) run._failedSearchQ.shift();
+            }
           }
         }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
+        _settleToolStep(step, result);
         if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
-        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "screenshot") ? "" : (call.path || "");
+        const actualPath = call._resolvedPath || result?.path || call.path || "";
+        const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "screenshot") ? "" : _normRel(actualPath, root);
         if (key && !trackedFiles.has(key)) { trackedFiles.set(key, call.type); _updateFilesBar(filesBar, filesList, trackedFiles); }
         return _toolMsgForModel(call, result);
       };
@@ -16312,93 +17624,68 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(planSteps) };
       }
 
-      // 1) read-only tools AND sub-agents — concurrently (fast parallel
-      //    context-gathering plus parallel research, like Claude Code).
-      const parallel = [];
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i];
-        if (!it.call) continue;
-        if (_isReadOnlyParallel(it.call)) {
-          parallel.push((async () => { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) }; })());
-        } else if (it.tc.name === "run_subagent" || it.tc.name === "run_worker" || it.tc.name === "research_project" || it.tc.name === "design_research" || it.tc.name === "generate_wiki") {
-          const isWorker = it.tc.name === "run_worker";
-          if (isWorker && run.engineering.requiresPlan && !(Array.isArray(run._planSteps) && run._planSteps.length)) {
-            toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: "[BLOCKED] 这是多文件/架构级任务，启动写入型 worker 前必须先调用 update_plan。worker 自己没有计划工具，父任务列好计划后再派它。" };
-            continue;
-          }
-          parallel.push((async () => {
-            let workerMutated = false;
-            const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], onMutation: () => { workerMutated = true; } });
-            const key = (isWorker ? "🔧 " : "🤖 ") + (it.call.description || (isWorker ? "worker" : "subagent"));
-            if (!trackedFiles.has(key)) { trackedFiles.set(key, isWorker ? "worker" : "subagent"); _updateFilesBar(filesBar, filesList, trackedFiles); }
-            if (isWorker && workerMutated) it._workerMutated = true;
-            let _msg = report;
-            // generate_wiki（DeepWiki 式）：把子智能体产出的产品 Wiki 自动落盘，跨会话复用。
-            if (it.call._wiki && report && !/^\[ERROR\]/.test(report) && root) {
-              try {
-                const _wp = it.call.wikiDest || "PRODUCT_WIKI.md";
-                const _abs = _wp.startsWith("/") ? _wp : root.replace(/\/$/, "") + "/" + _wp;
-                await backend.writeTextFile(_abs, report);
-                try { reloadDir(parentDir(_abs)); } catch (_e) {}
-                _msg = "✅ 产品 Wiki 已生成并存到 " + _wp + "（" + report.length + " 字）。以后做官网 / 理解产品直接 read_file 读它，别重复调研。\n\n" + report;
-              } catch (e) { _msg = "[Wiki 存盘失败: " + String((e && e.message) || e).slice(0, 80) + "]\n\n" + report; }
-            }
-            toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _msg.slice(0, 8000) };
-          })());
+      const subagentNames = new Set(["run_subagent", "run_worker", "research_project", "design_research", "generate_wiki"]);
+      const runSubagentItem = async (it) => {
+        const isWorker = it.tc.name === "run_worker";
+        if (isWorker && run.engineering.requiresPlan && !(Array.isArray(run._planSteps) && run._planSteps.length)) {
+          const message = "[BLOCKED] 这是多文件/架构级任务，启动写入型 worker 前必须先调用 update_plan。worker 自己没有计划工具，父任务列好计划后再派它。";
+          it.rawResult = { type: "worker", path: it.call.description || "worker", content: message };
+          it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
+          body.appendChild(it.step);
+          _settleToolStep(it.step, it.rawResult, "缺少计划 · 未执行");
+          return message;
         }
-      }
-      if (parallel.length) {
-        // Race with a stop-signal so clicking Stop unblocks the main loop immediately
-        // instead of waiting for every slow sub-agent/LLM call to settle.
-        await Promise.race([
-          Promise.all(parallel),
-          new Promise(resolve => { const _iv = setInterval(() => { if (!_live()) { clearInterval(_iv); resolve(); } }, 80); }),
-        ]);
-      }
-      if (!_live()) break;
+        let workerMutated = false;
+        const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], onMutation: () => { workerMutated = true; } });
+        const key = (isWorker ? "🔧 " : "🤖 ") + (it.call.description || (isWorker ? "worker" : "subagent"));
+        if (!trackedFiles.has(key)) { trackedFiles.set(key, isWorker ? "worker" : "subagent"); _updateFilesBar(filesBar, filesList, trackedFiles); }
+        if (isWorker && workerMutated) it._workerMutated = true;
+        let message = report;
+        if (it.call._wiki && report && !/^\[ERROR\]/.test(report) && root) {
+          try {
+            const wikiPath = it.call.wikiDest || "PRODUCT_WIKI.md";
+            const absolute = _resolveRel(wikiPath, root);
+            let expected = null;
+            try { expected = await backend.readTextFile(absolute); } catch {}
+            await _commitDiskTextIfUnchanged(absolute, expected, report);
+            try { reloadDir(parentDir(absolute)); } catch {}
+            it._wikiMutated = true;
+            it._wikiPath = wikiPath;
+            message = "✅ 产品 Wiki 已生成并存到 " + wikiPath + "（" + report.length + " 字）。以后做官网 / 理解产品直接 read_file 读它，别重复调研。\n\n" + report;
+          } catch (error) { message = "[Wiki 存盘失败: " + String(error?.message || error).slice(0, 80) + "]\n\n" + report; }
+        }
+        message = message.slice(0, 8000);
+        it.rawResult = { type: isWorker ? "worker" : "subagent", path: it._wikiPath || it.call.description || "", content: message };
+        return message;
+      };
+      const executeScheduledItem = async (index) => {
+        const it = items[index];
+        if (!it.call) return `未知工具: ${it.tc.name}`;
+        if (subagentNames.has(it.tc.name)) return await runSubagentItem(it);
+        return await runOne(it);
+      };
+      const canRunInReadSegment = (it) => !!it.call && (_isReadOnlyParallel(it.call)
+        || ["run_subagent", "research_project", "design_research"].includes(it.tc.name));
 
-      // 2) Independent file mutations (write/edit/multiedit) to DISTINCT files have
-      //     no ordering dependency between them → run them in parallel too (the
-      //     common "edit several files at once" case). Guarded: only when every
-      //     path is unique AND there's no delete/move in the turn (those could
-      //     depend on a path); otherwise everything stays strictly ordered below.
-      {
-        const fileMut = [];
-        let riskyOrder = false;
-        for (let i = 0; i < items.length; i++) {
-          if (toolMsgs[i] || !items[i].call) continue;
-          const t = items[i].call.type;
-          if (t === "write" || t === "edit" || t === "multiedit") fileMut.push(i);
-          else if (t === "delete" || t === "move") riskyOrder = true;
-        }
-        const paths = fileMut.map((i) => items[i].call.path);
-        if (fileMut.length >= 2 && !riskyOrder && new Set(paths).size === paths.length && _live()) {
-          await Promise.race([
-            Promise.all(fileMut.map((i) => (async () => {
-              toolMsgs[i] = { role: "tool", tool_call_id: items[i].tc.id, content: await runOne(items[i]) };
-            })())),
-            new Promise(resolve => { const _iv = setInterval(() => { if (!_live()) { clearInterval(_iv); resolve(); } }, 80); }),
-          ]);
-        }
-        if (!_live()) break;
-      }
-
-      // 3) Remaining mutating tools — sequentially, in call order.
-      for (let i = 0; i < items.length; i++) {
-        if (!_live()) break;
-        if (toolMsgs[i]) continue;
-        const it = items[i];
-        if (!it.call) { toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: `未知工具: ${it.tc.name}` }; continue; }
-        if (it.tc.name === "update_plan") {
-          planEl = _renderPlan(body, it.call.steps, run._planEl || planEl, run);
-          toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: _planSummary(run._planSteps || it.call.steps) };
-          continue;
-        }
-        toolMsgs[i] = { role: "tool", tool_call_id: it.tc.id, content: await runOne(it) };
-      }
+      // Preserve model call order. Only a contiguous run of provably read-only calls
+      // may execute together; every mutation/command/worker is a hard barrier.
+      await _runOrderedToolSegments(
+        items,
+        (it, index) => !toolMsgs[index] && canRunInReadSegment(it),
+        async (it, index) => {
+          if (toolMsgs[index]) return;
+          const message = { role: "tool", tool_call_id: it.tc.id, content: await executeScheduledItem(index) };
+          if (it.rawResult?.evidence) message._ideMeta = it.rawResult.evidence;
+          toolMsgs[index] = message;
+        },
+        _live,
+      );
       if (!_live()) {
         for (let j = 0; j < items.length; j++) {
-          if (!toolMsgs[j]) toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id, content: "[interrupted]" };
+          if (!toolMsgs[j]) {
+            toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id, content: "[interrupted]" };
+            _settleToolStep(items[j].step, { content: "[interrupted]" }, "已停止");
+          }
         }
         for (const m of toolMsgs) messages.push(m);
         break;
@@ -16459,7 +17746,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const c = items[i].call;
         if (!c || !(c.type === "write" || c.type === "edit" || c.type === "multiedit") || !c.path) continue;
         if (!_toolExecutionSucceeded(c, items[i].rawResult)) continue;
-        if (!_successfulEdits.includes(c.path)) _successfulEdits.push(c.path);
+        const actualPath = c._resolvedPath || _resolveRel(c.path, root);
+        if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
       }
       // Always retain pending paths, even after the bounded diagnostics budget is
       // spent; otherwise later edits silently stop reaching check/test gates.
@@ -16476,7 +17764,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // bounded per run; defers everything else to the existing verify gate.
       if (_live() && interleaveVerifies < 3) {
         if (_successfulEdits.length) {
-          const _d = await _interleavedDiagnostics(_successfulEdits);
+          const _d = await _interleavedDiagnostics(_successfulEdits, root);
           if (_d.ran) didVerify = true; // we ran diagnostics → don't double-nag at the finish gate
           if (_d.report && _live()) {
             interleaveVerifies++;
@@ -16520,7 +17808,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
-      _trimMessagesIfHuge(messages);
+      _trimMessagesIfHuge(messages, run, root);
 
       // Running scratchpad (ACON): after compression, inject a compact progress
       // summary at the context tail so the model retains what it did/found even
@@ -16558,8 +17846,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           });
         }
         const _ok = _toolExecutionSucceeded(it.call, it.rawResult);
-        const _workspaceMutated = _WORKSPACE_MUTATING_TYPES.has(t) && _ok;
+        const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
+        const _effectTarget = _runEffectTarget(run);
+        const _materialEffect = _ok && (_workspaceMutated
+          || (_effectTarget === "runtime"
+            ? _toolProducesRuntimeEffect(it.call, it.rawResult)
+            : _toolProducesMaterialEffect(it.call, it.rawResult, false)));
+        if (_materialEffect) _effectOps++;
         if (_workspaceMutated) {
+          const mutationPath = it._wikiPath || it.call._resolvedPath || it.call.path || it.call.dest || it.call.to || "";
+          _invalidateSessionReadEvidence(run, root,
+            mutationPath,
+            it.call.from, it.call.to, it.call.dest);
           didMutate = true;
           verificationPassed = false;
           _implOps++;
@@ -16574,15 +17872,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiInteractionViewports.clear();
             if (_hadVerifiedUi) uiVerifyNudges = 0;
           }
-          if (it.call.path && t !== "cmd" && t !== "termtask") {
-            _mutatedFiles.add(it.call.path);
+          if (mutationPath && t !== "cmd" && t !== "termtask") {
+            const actualPath = _normRel(mutationPath, root);
+            _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
-            _pad.modified.set(it.call.path.split("/").pop(), _desc);
+            _pad.modified.set(actualPath.split("/").pop(), _desc);
           }
           // Churn detector: count successful write/edit ops per file. Repeated edits
           // to the SAME file = the "写写改改重复" anti-pattern → step-back nudge below.
           if ((t === "write" || t === "edit" || t === "multiedit") && it.call.path) {
-            _editCounts.set(it.call.path, (_editCounts.get(it.call.path) || 0) + 1);
+            const actualPath = it.call._resolvedPath ? _normRel(it.call._resolvedPath, root) : it.call.path;
+            _editCounts.set(actualPath, (_editCounts.get(actualPath) || 0) + 1);
           }
         }
         if (t === "worker" && it._workerMutated) {
@@ -16591,6 +17891,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           didMutate = true;
           verificationPassed = false;
           _implOps++;
+          _effectOps++;
           if (run.engineering.ui) {
             const _hadVerifiedUi = _uiVerifiedAtImplOps >= 0;
             _uiPassedViewports.clear();
@@ -16616,8 +17917,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
-        if (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp"
-            || t === "semsearch" || t === "findsymbol" || t === "knowledge" || t === "web" || t === "websearch") _readOnlyOps++;
+        if (!it._skipped && _ok && (t === "read" || t === "list" || t === "search" || t === "find" || t === "lsp"
+            || t === "semsearch" || t === "findsymbol" || t === "knowledge" || t === "web" || t === "websearch")) {
+          const meta = it.rawResult?.evidence;
+          const evidenceKey = meta?.resultKind === "content"
+            ? `read:${meta.canonicalPath}:${meta.signature}:${meta.from}-${meta.to}`
+            : `${_stableToolCallSignature(it.call)}@${_resultFingerprint(it.rawResult?.content || "")}`;
+          if (!_evidenceSeen.has(evidenceKey)) { _evidenceSeen.add(evidenceKey); _novelEvidenceCount++; }
+        }
         if ((t === "edit" || t === "multiedit") && _ok) didEdit = true;
         // Model-initiated verification counts only a complete, known check/test/build
         // command with exit 0. HTTP 2xx proves one endpoint responded, not that the
@@ -16665,7 +17972,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             // Budget from the model's OWN decomposition (not a regex guess): a bigger plan ⇒ more
             // room to finish autonomously; a tiny plan stays tight. The plan IS the complexity signal.
             if (planSteps.length && !_quick()) budget = Math.max(budget, Math.min(_AGENT_HARD_CEIL, planSteps.length * 2 + 8));
-            _pad.done = planSteps.filter(s => s.status === "completed").map(s => s.title || s.description || "step").map(s => s.slice(0, 40));
+            _pad.done = planSteps.filter(s => s.status === "completed").map(s => s.content || s.title || s.description || "step").map(s => s.slice(0, 40));
           }
         }
       }
@@ -16695,10 +18002,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // ── 调查死循环断路器：「一直查/读，就是不实现」──────────────────────────
       // churn 的反面：智能体把 search/read 当成了任务本身，查了一大堆却一行不写。
       // agent 模式下，读类操作攒到一定量、却零实现 → 强推它动手。每个 run 顶 2 次。
-      if (run.mode === "agent" && _live() && _implOps === 0 && _readOnlyOps >= 6 && _implNudges < 2) {
+      const _requiredProgressOps = _runEffectTarget(run) === "workspace" ? _implOps : _effectOps;
+      if (run.mode === "agent" && _live() && _requiredProgressOps === 0 && _novelEvidenceCount >= 6 && _implNudges < 2) {
         _implNudges++;
         runHadTrouble = true;
-        messages.push({ role: "user", content: `⚠️ 你已经查/读了 ${_readOnlyOps} 次，**一行代码都没写**——这正是用户最不满的"光看不做"。**调查是手段，不是目的；任务的目标是做出能用的东西，不是攒一堆搜索结果。** 现在马上转入实现：\n① **看够了就动手**——基于你已经掌握的，直接 write_file / edit_file 把它做出来，别再追加调查；\n② **看到方法/库/示例就直接用**——别光看，想清楚怎么套进当前任务，立刻用上；\n③ **没搜到的东西，自己从第一性原理设计实现**——"找不到现成的"不是停下的理由，是该你动脑子造一个的信号；\n④ 这一轮**必须有实质产出**（写文件 / 改代码）。如果这确实是个纯查询/解释任务（用户只是想知道答案、不需要写代码），那就**直接给出结论**收尾，别再空转查下去。` });
+        messages.push({ role: "user", content: `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。` });
       }
       if (_mutatedFiles.size >= 3 && !planSteps && !planNudged && _live()) {
         planNudged = true;
@@ -16714,15 +18022,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
-      // --- Churn breaker: 反复改同一个文件 = "写写改改重复"的垃圾循环 ---
-      // 同一文件被改 ≥4 次（且没在改前重读过最新内容）→ 多半在试错式 churn：
-      // 写一点→发现不对→再补→又不对…产出常是重复逻辑 + 命名不一致的烂摊子。
-      // 强制退一步：读全 → 想清最终正确形态 → 一次改对。每个文件只警告一次。
+      // Churn breaker: after several successful mutations to the same file, ask
+      // the model to consolidate the remaining changes. Do not force another read
+      // when the current version is still available in context.
       if (_live()) {
         for (const [p, n] of _editCounts) {
-          if (n >= 3 && !_churnNudged.has(p)) {
+          if (n >= 5 && !_churnNudged.has(p)) {
             _churnNudged.add(p);
-            messages.push({ role: "user", content: `⚠️ 你已经反复改 **${p}** ${n} 次了——这是典型的"写写改改、试错式 churn"，产出往往是重复逻辑 + 命名不一致的烂代码，很垃圾。**立刻停止零敲碎打**，换成"想透再一次写对"：\n① 先 read_file 读 ${p} 的**当前完整内容**（别凭记忆）；\n② 在脑子里（或用 think）**想清它最终正确的样子**——所有需要的逻辑、命名一致、不留重复/死代码、边界都处理好；\n③ 然后用**一次** write_file（整文件重写到正确终态）或**一个** multi_edit（把所有改动一次性原子应用）改对，别再一点点试；\n④ 改完 get_diagnostics / 跑测试验证。\n记住：好代码是**想清楚后一次写对**的，不是反复打补丁磨出来的。` });
+            messages.push({ role: "user", content: `你已经成功修改 **${p}** ${n} 次。先停一下并整合剩余工作：直接使用上下文里的当前版本；只有精确源码已经被上下文压缩掉时才重新 read_file。把还需要的修改合并成一个 multi_edit 或一次完整 write_file，然后运行真实诊断/测试确认，不要继续零散追加。` });
           }
         }
       }
@@ -16736,10 +18043,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // one-liners hitting DIFFERENT urls) into ONE sig → the loop-detector falsely screamed
         // "repeating the same operation" and stopped a perfectly-progressing run. Keep a short
         // readable prefix + a hash of the FULL arg string so distinct calls stay distinct.
-        const _sraw = String(c.command || c.path || c.selector || c.action || c.url || c.op || c.title || "");
-        let _sh = 5381; for (let _k = 0; _k < _sraw.length; _k++) _sh = ((_sh << 5) + _sh + _sraw.charCodeAt(_k)) | 0;
-        const sig = c.type + ":" + _sraw.slice(0, 48) + "#" + (_sh >>> 0);
         const _tmsg = (toolMsgs[i] && toolMsgs[i].content) || "";
+        const callSig = _stableToolCallSignature(c);
+        const sig = `${callSig}@${_resultFingerprint(_tmsg)}`;
         const failed = !!_toolFailureMatch(_tmsg);
         // A deduped re-read ("别重读" / "死循环") = the model tried to re-read an unchanged file it
         // already has. Two of those = spinning, a stuck signal on par with repeated failures.
@@ -16775,7 +18081,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
             messages.push({ role: "user", content: "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。" });
           } else {
-            messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。** ④ 如果是**方向/需求本身定不下来**（不是技术卡点），别瞎试——直接 **ask_user 给用户 2-4 个选项**让他拍板，比闷头空转强。" });
+            messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。" });
           }
         }
       }
@@ -16848,6 +18154,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
+    planSteps = _settleRunPlan(run);
     // Unified post-loop safety net: a cap, flailing stop, or model/API error must
     // not bypass verification merely because the model never emitted a quiet turn.
     if (didMutate && (!verificationPassed || _verifiedAtImplOps < _implOps) && session.streaming) {
@@ -16884,6 +18191,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (session === _currentSession()) _setSendBtnStop(false);
     _drainFollowups(session); // safety net: any queued follow-up (if this wasn't steered) fires now
     _removeAllThinking(body);
+    try {
+      body.querySelectorAll?.(".agent-tool-step").forEach((step) => {
+        if (step.querySelector?.(".atc-spin")) {
+          _settleToolStep(step, { content: finalErr ? `[ERROR] ${finalErr}` : "[interrupted]" }, finalErr ? "失败" : "已停止");
+        }
+      });
+    } catch {}
     // Sweep the WHOLE conversation, not just this message body — orphan "思考中"
     // placeholders (the "..." dots) from intermediate turns / sub-agents could linger
     // elsewhere in the transcript. Also clear any straggler blinking carets.
@@ -16919,6 +18233,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (summaryText && summaryText.trim()) _parts.push(summaryText.trim());
       if (reasoningAll && reasoningAll.trim()) _parts.push(`〔推理摘要〕${reasoningAll.trim().slice(0, 2000)}`);
       if (_mutatedFiles && _mutatedFiles.size) _parts.push(`〔本轮改动的文件：${[..._mutatedFiles].join("、")}〕`);
+      if (run._incompleteReason) {
+        const pendingItems = Array.isArray(planSteps)
+          ? planSteps.filter((step) => step.status === "pending" || step.status === "in_progress").map((step) => step.content).filter(Boolean).slice(0, 8)
+          : [];
+        _parts.push(`〔本轮未完成：${run._incompleteReason}${pendingItems.length ? `；剩余计划：${pendingItems.join("、")}` : ""}〕`);
+      }
       if (finalErr) _parts.push(`〔本轮中断/报错：${finalErr}〕`);
       if (finalVerificationNote) _parts.push(finalVerificationNote);
       const _record = _parts.join("\n\n").trim();
@@ -16932,7 +18252,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // Experiential memory: store this run as an episode + distill a reusable insight
     // (async, best-effort) so the agent learns from it next time (ExpeL/Reflexion).
     if (run.mode === "agent" && task) {
-      const _outcome = finalErr ? "failed" : (hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed)) ? "partial" : "success");
+      const _outcome = finalErr ? "failed" : (run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed)) ? "partial" : "success");
       try { _recordEpisode(run, task, root, _outcome, config); } catch {}
     }
     // Plan mode: one-click handoff to execute the proposed plan in agent mode
@@ -17210,6 +18530,28 @@ function _removeWritePreview(entry) {
   entry._sc = null; entry._target = ""; entry._shownLen = 0;
 }
 
+function _toolStepActionLabel(call) {
+  const labels = {
+    write: "写入", edit: "编辑", multiedit: "批量编辑", read: "读取", list: "列目录", cmd: "运行",
+    search: "搜索", find: "查找", web: "抓取", websearch: "联网搜索", search_tools: "查找工具",
+    memory: "记忆", think: "思考", delete: "删除", move: "移动", diag: "诊断", git: "Git", gh: "GitHub",
+    lsp: "LSP", findsymbol: "查找符号", semsearch: "语义搜索", knowledge: "知识检索", mkdir: "建目录",
+    copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表",
+    termstop: "停止终端", http: "HTTP", tor: "Tor", download: "下载", mcp: "MCP", demostart: "录制中",
+    demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
+    automation: "自动化", remote: "远程", askuser: "需要你确认", current_time: "当前时间", db: "数据库",
+    qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
+    wardrobe: "风格选择", explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
+    capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
+    game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", generate_3d: "3D 模型", generate_sound: "音效",
+    generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
+    generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具",
+  };
+  if (labels[call?.type]) return labels[call.type];
+  const raw = String(call?._toolName || call?.mcpName || call?.type || "工具").trim();
+  return raw ? raw.replace(/_/g, " ") : "工具";
+}
+
 function _createToolStep(call) {
   call = call || {};
   const _isKSearch = call.type.endsWith("_search") || call.type === "github_trending";
@@ -17240,11 +18582,11 @@ function _createToolStep(call) {
     : call.type === "download_asset" ? (call.name || "asset")
     : _isKSearch
     ? (call.query || "")
-    : (call.path || call.command || "")) ?? "");
+    : (call.path || call.command || (call.type === "unknown" ? call._toolName : ""))) ?? "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
   const _kLabels = { academic_search: "学术搜索", package_search: "包搜索", github_search: "GitHub", cve_search: "CVE", wiki_search: "维基百科", stackoverflow_search: "StackOverflow", hackernews_search: "HackerNews", dockerhub_search: "DockerHub", pubmed_search: "PubMed", arxiv_search: "arXiv", crossref_search: "CrossRef", openalex_search: "OpenAlex", pubchem_search: "PubChem", clinical_trials_search: "临床试验", gitlab_search: "GitLab", gitee_search: "Gitee", maven_search: "Maven", packagist_search: "Packagist", rubygems_search: "RubyGems", nuget_search: "NuGet", homebrew_search: "Homebrew", mdn_search: "MDN", cdnjs_search: "cdnjs", bundlephobia_search: "Bundlephobia", devto_search: "Dev.to", reddit_search: "Reddit", steam_search: "Steam", iconify_search: "Icons", color_search: "Colors", lobsters_search: "Lobsters", juejin_search: "掘金", codrops_search: "Codrops", smashingmag_search: "SmashingMag", css_tricks_search: "CSS-Tricks", codepen_search: "CodePen", dribbble_search: "Dribbble", awwwards_search: "Awwwards", v2ex_search: "V2EX", segmentfault_search: "思否", github_discussions_search: "Discussions", producthunt_search: "ProductHunt", freecodecamp_search: "FreeCodeCamp", github_trending: "Trending", infoq_search: "InfoQ", hackernoon_search: "HackerNoon", codeberg_search: "Codeberg", bestofjs_search: "Best of JS", sourcegraph_search: "Sourcegraph", deep_search: "深层搜索" };
-  const actionLabel = { write: "写入", edit: "编辑", multiedit: "批量编辑", read: "读取", list: "列目录", cmd: "运行", search: "搜索", find: "查找", web: "抓取", websearch: "联网搜索", memory: "记忆", think: "思考", delete: "删除", move: "移动", diag: "诊断", git: "Git", lsp: "LSP", mkdir: "建目录", copy: "复制", format: "格式化", termtask: "终端任务", termread: "读终端", termlist: "终端列表", termstop: "停止终端", http: "HTTP", download: "下载", mcp: "MCP", demostart: "录制中", demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统", remote: "远程", askuser: "需要你确认", current_time: "当前时间", game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", generate_3d: "3D 模型", generate_sound: "音效", generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画", generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源" }[call.type] || (_isKSearch ? (_kLabels[call.type] || "知识搜索") : "");
+  const actionLabel = _isKSearch ? (_kLabels[call.type] || _toolStepActionLabel(call)) : _toolStepActionLabel(call);
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9 1.5H4.25A1.75 1.75 0 002.5 3.25v9.5c0 .966.784 1.75 1.75 1.75h7.5a1.75 1.75 0 001.75-1.75V6L9 1.5zm.25 1.31L12.19 5.5H9.75a.5.5 0 01-.5-.5V2.81zM7.25 7.75a.75.75 0 011.5 0V9h1.25a.75.75 0 010 1.5H8.75v1.25a.75.75 0 01-1.5 0V10.5H6a.75.75 0 010-1.5h1.25V7.75z"/></svg>`,
     read: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1.75C1.5.784 2.284 0 3.25 0h5.5a.75.75 0 01.53.22l3.5 3.5a.75.75 0 01.22.53v9.5A1.75 1.75 0 0111.25 15.5h-8A1.75 1.75 0 011.5 13.75V1.75zm1.75-.25a.25.25 0 00-.25.25v12a.25.25 0 00.25.25h8a.25.25 0 00.25-.25V4.664L8.836 2H3.25zM5 8.75a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5A.75.75 0 015 8.75zm.75 2.25a.75.75 0 000 1.5h2.5a.75.75 0 000-1.5h-2.5z"/></svg>`,
@@ -17300,7 +18642,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -17326,8 +18668,7 @@ function _createToolStep(call) {
       e.stopPropagation();
       const fp = clickablePath.dataset.filepath;
       if (fp) {
-        const root = rootPath || workspaceRoots[0] || "";
-        const fullPath = fp.startsWith("/") ? fp : root + "/" + fp;
+        const fullPath = _resolveRel(fp, call._runRoot || rootPath || workspaceRoots[0] || "");
         openFile(fullPath, fp.split("/").pop());
       }
     });
@@ -17335,95 +18676,143 @@ function _createToolStep(call) {
   return step;
 }
 
+// Every created card must leave its initial spinner. Executors normally set a
+// rich result themselves; this is the common fallback for skipped, unknown,
+// interrupted and exceptional paths.
+function _settleToolStep(step, result, label = "") {
+  const res = step?.querySelector?.(".atc-result");
+  if (!res) return false;
+  const hasSpinner = !!res.querySelector?.(".atc-spin");
+  if (!hasSpinner && String(res.textContent || "").trim()) {
+    if (step?.dataset) step.dataset.toolSettled = "1";
+    return false;
+  }
+  const content = String(result?.content || "");
+  const failed = /\[(?:ERROR|BLOCKED|DENIED|失败|不可用|interrupted)\]|失败|缺参数|未知工具|已停止/i.test(content);
+  res.className = `atc-result ${failed ? "atc-result--err" : "atc-result--ok"}`;
+  res.textContent = label || (failed ? "失败" : "完成");
+  if (failed) step?.classList?.add?.("agent-tool-step--rejected");
+  if (step?.dataset) step.dataset.toolSettled = "1";
+  return true;
+}
+
+function _setToolStepResolvedPath(step, path) {
+  const link = step?.querySelector?.(".atc-path--clickable");
+  if (link && path) link.dataset.filepath = path;
+}
+
 // ---- Multi-root path resolution -------------------------------------------
 // When several folders are open, a relative path must resolve against the RIGHT
 // root, not always the active one — otherwise the agent reads the wrong file (or
 // writes to the wrong place). active root first, then the others.
-function _allRoots() {
-  const active = (rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
+function _allRoots(preferredRoot = "") {
+  const active = _normalizeFsPath(rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   const roots = [];
+  const preferred = _normalizeFsPath(String(preferredRoot || "")).replace(/\/+$/, "");
+  if (preferred) roots.push(preferred);
   if (active) roots.push(active);
-  for (const r of workspaceRoots) { const rr = (r || "").replace(/\/+$/, ""); if (rr && !roots.includes(rr)) roots.push(rr); }
-  return roots;
+  for (const r of workspaceRoots) { const rr = _normalizeFsPath(r || "").replace(/\/+$/, ""); if (rr && !roots.includes(rr)) roots.push(rr); }
+  return roots.filter((value, index) => roots.findIndex((other) => _pathIdentity(other) === _pathIdentity(value)) === index);
 }
 // Every plausible absolute path for a (possibly relative) agent path, across ALL
 // roots — for read/list, tried in order until one exists. Order: active-root,
 // other-roots, root-name-qualified ("proj2/src/x" where a root folder is proj2),
 // then the raw path.
 function _relCandidates(rawPath, fallbackRoot) {
+  rawPath = _normalizeFsPath(String(rawPath || ""));
   const out = [];
-  const push = (p) => { if (p && !out.includes(p)) out.push(p); };
-  const roots = _allRoots();
-  // When global roots are empty but the agent loop passed a valid root, use it.
-  if (!roots.length && fallbackRoot) roots.push(fallbackRoot.replace(/\/+$/, ""));
-  const isAbs = rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath);
+  const push = (p) => {
+    const normalized = _coherentFilePath(p);
+    if (normalized && !out.some((existing) => _pathIdentity(existing) === _pathIdentity(normalized))) out.push(normalized);
+  };
+  const roots = _allRoots(fallbackRoot);
+  const isAbs = rawPath.startsWith("/") || /^[A-Za-z]:\//.test(rawPath);
   if (isAbs) {
     push(rawPath);
-    const base = rawPath.split(/[\\/]/).pop();
-    for (const r of roots) if (base) push(r + "/" + base);
     return out;
   }
   const clean = rawPath.replace(/^\.?\/?/, "").replace(/^\/+/, "");
-  for (const r of roots) push(clean ? r + "/" + clean : r);
+  let rootQualified = false;
   for (const r of roots) {
     const base = r.split("/").pop();
     if (base && (clean === base || clean.startsWith(base + "/"))) {
       const sub = clean.slice(base.length).replace(/^\/+/, "");
       push(sub ? r + "/" + sub : r);
+      rootQualified = true;
     }
   }
-  push(rawPath);
+  if (rootQualified) return out;
+  for (const r of roots) push(clean ? r + "/" + clean : r);
+  if (!roots.length) push(rawPath);
   return out;
 }
 // Single deterministic resolution for a path we're about to WRITE/CREATE (no
 // existence probing): absolute as-is; root-name-qualified → that root; else the
 // active root.
-function _resolveRel(rel) {
+function _resolveRel(rel, preferredRoot = "") {
   if (!rel) return rel;
-  if (rel.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rel)) return rel;
+  rel = _normalizeFsPath(String(rel));
+  if (rel.startsWith("/") || /^[A-Za-z]:\//.test(rel)) return _coherentFilePath(rel);
   const clean = rel.replace(/^\.\//, "").replace(/^\/+/, "");
-  const roots = _allRoots();
+  const roots = _allRoots(preferredRoot);
   if (!roots.length) return rel;
   for (const r of roots) {
     const base = r.split("/").pop();
     if (base && (clean === base || clean.startsWith(base + "/"))) {
       const sub = clean.slice(base.length).replace(/^\/+/, "");
-      return sub ? r + "/" + sub : r;
+      return _coherentFilePath(sub ? r + "/" + sub : r);
     }
   }
-  return roots[0] + "/" + clean;
+  return _coherentFilePath(roots[0] + "/" + clean);
 }
 // Resolve a path that should already EXIST (edit / read target): the first
 // candidate across all roots that the backend can read; falls back to the
 // write-resolution if none exist yet (a brand-new file).
-async function _resolveExisting(rel) {
-  if (!rel) return rel;
-  for (const cand of _relCandidates(rel)) {
-    try { await backend.readTextFile(cand); return cand; } catch {}
+async function _fuzzyFileCandidates(rel, preferredRoot = "") {
+  const raw = String(rel || "");
+  if (!raw || raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) return [];
+  const base = raw.split(/[\\/]/).pop();
+  if (!base || base.length <= 1) return [];
+  const relGuess = _normalizeFsPath(raw.replace(/^[.\/]+/, ""));
+  const matches = [];
+  for (const root of _allRoots(preferredRoot)) {
+    let files = [];
+    try { files = (await _agentFindFiles(root, base)).files || []; } catch {}
+    for (const file of files) {
+      const path = _coherentFilePath(root + "/" + file);
+      if (!matches.some((item) => _pathIdentity(item.path) === _pathIdentity(path))) matches.push({ path, rel: _normalizeFsPath(file) });
+    }
   }
+  if (matches.length > 1 && relGuess.includes("/")) {
+    const suffix = matches.filter((item) => item.rel === relGuess || item.rel.endsWith("/" + relGuess));
+    if (suffix.length) return suffix;
+  }
+  return matches;
+}
+
+async function _resolveExisting(rel, preferredRoot = "") {
+  if (!rel) return rel;
+  const exact = [];
+  for (const cand of _relCandidates(rel, preferredRoot)) {
+    try {
+      await backend.readTextFile(cand);
+      if (!exact.some((path) => _pathIdentity(path) === _pathIdentity(cand))) exact.push(_coherentFilePath(cand));
+    } catch {}
+  }
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) throw new Error(`[AMBIGUOUS_PATH] 「${rel}」在多个工作区都存在：${exact.join("、")}。请使用带工作区文件夹名的明确路径。`);
   // Fuzzy fallback — PARITY WITH read_file. The exact path didn't resolve, but the
   // file usually DOES exist under a different prefix (nested/packed dirs, a folder
   // name with spaces or "(1)", an extra parent). read_file already recovers this by
   // basename; edit_file did NOT, so a file the agent just READ would fail edit with
   // "文件不存在". Find it by basename across roots and, if a UNIQUE suffix-match exists,
   // use it — so edit lands on the same file read did. Only runs on the miss path.
-  const base = rel.split(/[\\/]/).pop();
-  const relGuess = rel.replace(/^[.\/]+/, "").replace(/\\/g, "/");
-  if (base && base.length > 1) {
-    for (const root of _allRoots()) {
-      let files = [];
-      try { files = (await _agentFindFiles(root, base)).files || []; } catch {}
-      if (files.length > 1 && relGuess.includes("/")) {
-        const suf = files.filter((f) => f === relGuess || f.endsWith("/" + relGuess));
-        if (suf.length) files = suf;
-      }
-      if (files.length === 1) {
-        const fp = root + "/" + files[0];
-        try { await backend.readTextFile(fp); return fp; } catch {}
-      }
-    }
+  const fuzzy = await _fuzzyFileCandidates(rel, preferredRoot);
+  if (fuzzy.length === 1) {
+    try { await backend.readTextFile(fuzzy[0].path); return fuzzy[0].path; } catch {}
   }
-  return _resolveRel(rel);
+  if (fuzzy.length > 1) throw new Error(`[AMBIGUOUS_PATH] 「${rel}」匹配多个真实文件：${fuzzy.map((item) => item.path).join("、")}。请先用 find_files 确认并传入唯一完整路径。`);
+  return _resolveRel(rel, preferredRoot);
 }
 
 // --- Tolerant edit matching (parity boost for weaker models like DeepSeek) ---
@@ -17635,6 +19024,28 @@ async function _executeToolStep(step, call, root, run) {
     }
   }
 
+  if (["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format"].includes(call.type)) {
+    const source = call.path || call.dest || "";
+    const destination = (call.type === "move" || call.type === "copy") ? (call.to || "") : "";
+    const sameBatchSourceBinding = _sameBatchRunFilePathBinding(run, root, source);
+    const sameBatchDestinationBinding = destination ? _sameBatchRunFilePathBinding(run, root, destination) : "";
+    const sameBatchBinding = sameBatchSourceBinding || sameBatchDestinationBinding;
+    const sameBatchRequest = sameBatchSourceBinding ? source : destination;
+    if (sameBatchBinding) {
+      res.className = "atc-result atc-result--blocked";
+      res.textContent = "⛔ 等待读取结果后再修改";
+      return { type: call.type, path: sameBatchRequest, content: `[BLOCKED] 本次模型回复里的 read_file 才刚确认「${sameBatchRequest}」实际对应 ${sameBatchBinding}。模型尚未看到读取结果，IDE 已阻止退回原始路径写错文件；请在下一次回复基于真实路径和内容再修改。` };
+    }
+    const sourceResolved = _boundRunFilePath(run, root, source) || _resolveRel(source, root);
+    const sourceIssue = _mutationPathIssue(source, sourceResolved, root, run, true);
+    const destinationIssue = destination ? _mutationPathIssue(destination, _resolveRel(destination, root), root, run, false) : "";
+    const pathIssue = sourceIssue || destinationIssue;
+    if (pathIssue) {
+      res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 路径超出工作区";
+      return { type: call.type, path: source, content: `[BLOCKED] ${pathIssue}。IDE 已阻止这次文件变更，未改动磁盘；请使用工作区内路径，或先用绝对路径 read_file 明确读取要修改的外部文件。` };
+    }
+  }
+
   if (call.type === "cmd" && _looksLikeShellFileRewrite(call.command)) {
     res.className = "atc-result atc-result--blocked";
     res.textContent = "⛔ 请使用文件工具修改";
@@ -17672,6 +19083,7 @@ async function _executeToolStep(step, call, root, run) {
       if (rawPath.startsWith("~/") && homeDir) {
         rawPath = homeDir + rawPath.slice(1);
       }
+      const absoluteRequested = rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath);
       // Try EVERY open workspace root (active first), so a file in an added folder
       // resolves there instead of reading the wrong file under the active root.
       const candidates = _relCandidates(rawPath, root);
@@ -17684,27 +19096,45 @@ async function _executeToolStep(step, call, root, run) {
       let _readNote = ""; // set when fuzzy basename recovery read a differently-pathed file
 
       let isDir = false;
+      const readMatches = [];
+      const dirMatches = [];
+      const unreadableMatches = [];
       // No stale fast-path: always fetch FRESH below, so the content-signature dedup can distinguish a
       // REAL on-disk change from an unchanged re-read. (A cached copy would hide edits → "拿到旧内容".)
       if (readFailed) {
         for (const fp of candidates) {
           try {
-            txt = await _readFileOrDoc(fp);
-            readFailed = false;
-            usedPath = fp;
-            _agentReadCache.set(fp, txt);
-            break;
+            readMatches.push({ path: fp, content: await _readFileOrDoc(fp) });
           } catch (e) {
             const msg = String(e?.message || e);
-            if (/is a directory|os error 21/i.test(msg)) { isDir = true; usedPath = fp; break; }
+            if (/is a directory|os error 21/i.test(msg)) { dirMatches.push(fp); continue; }
             // File FOUND at this candidate but unreadable (too large / binary) — that IS the real
             // reason; STOP so a later non-existent fallback candidate can't overwrite it with a
             // misleading "No such file". (A 343MB app.asar showed "找不到文件" because the real error
             // "太大/二进制" got masked by the relative-path fallback's ENOENT.)
-            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB/i.test(msg)) { readError = msg; usedPath = fp; break; }
+            if (/too large|太大|过大|binary file|二进制|>\s*5\s*MB/i.test(msg)) { unreadableMatches.push({ path: fp, message: msg }); continue; }
             readError = msg.slice(0, 200);
           }
         }
+      }
+
+      const foundPaths = [...readMatches.map((match) => match.path), ...dirMatches, ...unreadableMatches.map((match) => match.path)];
+      if (foundPaths.length > 1) {
+        res.className = "atc-result atc-result--err"; res.textContent = "路径不唯一";
+        step.classList.add("agent-tool-step--rejected");
+        return { type: "read", path: call.path, content: `[AMBIGUOUS_PATH] 「${rawPath}」在多个工作区都存在：${foundPaths.join("、")}。IDE 没有猜测或读取其中任何一个；请用带工作区文件夹名的明确路径重试。` };
+      }
+      if (readMatches.length === 1) {
+        txt = readMatches[0].content;
+        usedPath = readMatches[0].path;
+        readFailed = false;
+        _agentReadCache.set(usedPath, txt);
+      } else if (dirMatches.length === 1) {
+        isDir = true;
+        usedPath = dirMatches[0];
+      } else if (unreadableMatches.length === 1) {
+        usedPath = unreadableMatches[0].path;
+        readError = unreadableMatches[0].message;
       }
 
       if (isDir) {
@@ -17740,50 +19170,44 @@ async function _executeToolStep(step, call, root, run) {
       if (readFailed) {
         // Fuzzy recovery: the path is wrong but a file with this BASENAME probably
         // exists somewhere in the project (model guessed the dir / case / a typo).
-        // Find it across the project — if EXACTLY ONE matches, just read that (the
-        // mistake "just works"); if several, list the real paths so the model picks.
-        const base = rawPath.split(/[\\/]/).pop();
-        // First: an INVISIBLE-whitespace variant in the same dir (the file tree trims
-        // leading/trailing spaces, so "2.1.1.exe" silently misses the real " 2.1.1.exe").
-        if (base && readFailed) {
-          try {
-            const parentAbs = candidates[0].split(/[\\/]/).slice(0, -1).join("/") || root;
-            const sibs = await backend.readDir(parentAbs);
-            const wsHit = sibs.find((e) => !e.is_dir && e.name !== base && e.name.trim() === base.trim());
-            if (wsHit) {
-              const fp2 = parentAbs + "/" + wsHit.name;
-              txt = await _readFileOrDoc(fp2);
-              _agentReadCache.set(fp2, txt);
-              usedPath = fp2; readFailed = false;
-              _readNote = `（注：你给的 ${base} 不存在——真实文件名带**看不见的空格**「${wsHit.name.replace(/ /g, "␣")}」，已读它；以后引用这个文件用真实名并整体加引号）`;
-            }
-          } catch {}
+        // Search every workspace first and only recover when the global result is
+        // unique. Picking the first root is exactly how a db.js from project A used
+        // to be read and then written while the user meant project B.
+        const base = (absoluteRequested || readError) ? "" : rawPath.split(/[\\/]/).pop();
+        const fuzzyMatches = [];
+        const addMatch = (path, rel = path) => {
+          path = _coherentFilePath(path);
+          if (path && !fuzzyMatches.some((item) => _pathIdentity(item.path) === _pathIdentity(path))) fuzzyMatches.push({ path, rel });
+        };
+        if (base) {
+          // Preserve the invisible-whitespace recovery, but inspect every candidate
+          // parent so multi-root workspaces cannot silently choose the first one.
+          for (const candidate of candidates) {
+            const parentAbs = candidate.split(/[\\/]/).slice(0, -1).join("/") || root;
+            try {
+              const siblings = await backend.readDir(parentAbs);
+              for (const entry of siblings) {
+                if (!entry.is_dir && entry.name !== base && entry.name.trim() === base.trim()) {
+                  addMatch(entry.path || (parentAbs + "/" + entry.name), entry.name);
+                }
+              }
+            } catch {}
+          }
+          for (const match of await _fuzzyFileCandidates(rawPath, root)) addMatch(match.path, match.rel);
         }
-        let fuzzy = { count: 0, files: [] };
-        if (base && root && base.length > 1 && readFailed) { try { fuzzy = await _agentFindFiles(root, base); } catch {} }
-        let fmatch = (fuzzy.files || []);
-        // Suffix match: the model's path is often missing only a leading prefix (it gave
-        // "out/main/index.js" but the file is "app.asar.extracted/out/main/index.js"). Prefer the
-        // real files whose path ENDS WITH the model's relative path — resolves uniquely even when the
-        // bare basename (index.js) matches dozens, so the read "just works" instead of erroring.
-        const _relGuess = rawPath.replace(/^[.\/]+/, "").replace(/\\/g, "/");
-        if (fmatch.length > 1 && _relGuess.includes("/")) {
-          const suf = fmatch.filter((f) => f === _relGuess || f.endsWith("/" + _relGuess));
-          if (suf.length >= 1) fmatch = suf;
-        }
-        if (fmatch.length === 1) {
+        if (fuzzyMatches.length === 1) {
           try {
-            const fp2 = root + "/" + fmatch[0];
-            txt = await _readFileOrDoc(fp2);
-            _agentReadCache.set(fp2, txt);
-            usedPath = fp2; readFailed = false;
-            _readNote = `（注：你给的路径 ${rawPath} 不存在，但项目里有唯一同名文件 ${fmatch[0]}，已读它）`;
+            txt = await _readFileOrDoc(fuzzyMatches[0].path);
+            usedPath = fuzzyMatches[0].path;
+            _agentReadCache.set(usedPath, txt);
+            readFailed = false;
+            _readNote = `（注：你给的路径 ${rawPath} 不存在，但全部工作区里只有一个匹配文件 ${usedPath}，已读它并绑定真实路径）`;
           } catch {}
         }
         if (readFailed) {
           let helpHint = "";
-          if (fmatch.length > 1) {
-            helpHint = `\n项目里有 ${fmatch.length} 个同名文件，你要的多半是其中之一（用真实路径重读）:\n${fmatch.slice(0, 10).join("\n")}`;
+          if (fuzzyMatches.length > 1) {
+            helpHint = `\n全部工作区里有 ${fuzzyMatches.length} 个匹配文件，IDE 不会猜是哪一个；请用下面的真实完整路径重读：\n${fuzzyMatches.slice(0, 10).map((item) => item.path).join("\n")}`;
           } else if (root) {
             try {
               const parentDir = candidates[0].split("/").slice(0, -1).join("/") || root;
@@ -17796,7 +19220,8 @@ async function _executeToolStep(step, call, root, run) {
           res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l6 6M10 4l-6 6"/></svg> ${_escHtml(readError || "not found")}`;
           step.classList.add("agent-tool-step--rejected");
           vp.innerHTML = `<div style="padding:8px 12px;color:var(--atc-dim,#636c76);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
-          return { type: "read", path: call.path, content: `[ERROR] 找不到文件: ${rawPath}（工作区根: ${root || "(无)"}）。${helpHint}` };
+          const code = fuzzyMatches.length > 1 ? "AMBIGUOUS_PATH" : "ERROR";
+          return { type: "read", path: call.path, content: `[${code}] 找不到唯一文件: ${rawPath}（工作区根: ${root || "(无)"}）。${helpHint}` };
         }
       }
       // Redundant-read saver: re-reading (in full) a file already read a few steps
@@ -17822,22 +19247,27 @@ async function _executeToolStep(step, call, root, run) {
       const _sig = _contentSignature(txt);
       const _prevSig = run && run._readSig ? run._readSig.get(usedPath) : undefined;
       const _contentChanged = _prevSig != null && _prevSig !== _sig; // bytes genuinely differ from last time
-      const _prevStep = run && run._readStep ? run._readStep.get(usedPath) : undefined;
-      const _recent = run && _prevStep != null && (run._toolStep - _prevStep) <= 6;
-      // Lines already shown this run — but if the content actually changed, forget it → re-read fresh.
-      const _seen = _contentChanged ? 0 : ((run && run._readSeen && run._readSeen.get(usedPath)) || 0);
+      // Reuse both this run's coverage and the persisted session ledger. Reading the
+      // bytes above gives us the current signature, so stale evidence can never hide a
+      // real disk change; unchanged ranges survive model turns without being re-fed.
+      const _knownRanges = _contentChanged ? [] : _knownReadRanges(run, root, _sig, total, call.path, usedPath);
+      const _seen = _contentChanged ? 0 : Math.max(
+        (run && run._readSeen && run._readSeen.get(usedPath)) || 0,
+        _readCoverageThrough(_knownRanges),
+      );
       if (_contentChanged && run && run._dupReadN) run._dupReadN.set(usedPath, 0); // content changed → reset re-read escalation
 
-      // Decide the range. Small file → whole (ignore a tiny passed limit that would chunk it). A default
-      // re-read of a partly-shown BIG file auto-advances through it. offset>1 + limit = deliberate slice.
+      // Decide the range. A default read consumes a normal file in one pass and
+      // auto-advances after partial coverage. When the model explicitly supplies a
+      // limit, always honor it — including offset=1 — so a requested slice cannot
+      // silently expand into another whole-file read.
       let startLine;
       if (_explicitOffset) startLine = Math.floor(call.offset);
       else if (_defaultRead && _seen > 0 && _seen < total) startLine = _seen + 1;
       else startLine = 1;
       const start = Math.max(0, startLine - 1);
       const _autoAdvanced = _defaultRead && start > 0;
-      const _rangeRead = start > 0 && _explicitLimit; // deliberate mid-file slice
-      const limit = _rangeRead ? Math.floor(call.limit) : (total <= 2500 ? total : 1800);
+      const limit = _explicitLimit ? Math.floor(call.limit) : (total <= 2500 ? total : 1800);
       let slice = allLines.slice(start, start + limit);
       const _reqEnd = start + slice.length; // last line this read would show
 
@@ -17851,11 +19281,10 @@ async function _executeToolStep(step, call, root, run) {
       // ── ONE dedup, content + range aware ── unchanged content, read recently, asking for NOTHING new
       // → don't re-feed it, point back to the copy already in context. Catches WHOLE and RANGE re-reads
       // (the "同一文件读七八遍" bug). A real change OR a genuinely new range (past _seen) still reads fresh.
-      // Exempt EXPLICIT-offset reads: a deliberate `offset=1,limit=40` to re-inspect a specific region
-      // is a real request, not a blind re-read — serve it (cheap) instead of scolding "别重读". Dropped
-      // the old `txt.length>800` clause: a re-read loop on a SMALL unchanged file is just as much a spin
-      // (and it slipped past the stuck signal that keys off this dedup).
-      if (!_contentChanged && _recent && _seen > 0 && _reqEnd <= _seen && !_explicitOffset) {
+      // Explicit offsets are not an escape hatch: an unchanged range already covered
+      // by this run or the session ledger is still a duplicate. New slices continue
+      // normally, so precise inspection remains available without permitting loops.
+      if (!_contentChanged && _readRangeCovered(_knownRanges, start + 1, _reqEnd)) {
         // Redundant re-read of unchanged, already-shown content. Repeated re-reads of the SAME file
         // are a top stuck-loop symptom (the model spins re-reading instead of acting) — so count how
         // many times THIS run re-read THIS file and ESCALATE: 1st = "别读了，动手"; 2nd+ = a hard
@@ -17872,25 +19301,38 @@ async function _executeToolStep(step, call, root, run) {
           : (_seen >= total
             ? `[别重读] ${call.path} 全 ${total} 行你**刚刚就完整读过了、内容没变**——它全在上方上下文里，没有"剩余部分"。**立刻停止读取，现在就动手干活**（改代码 / 起服务 / 截图 / 下一步），别再调 read。`
             : `[别重读] ${call.path} 这段（到第 ${_seen} 行）你刚读过、没变，在上文里。只有要读**还没看过的第 ${_seen + 1} 行往后**才用 offset=${_seen + 1}；否则别再 read。`);
-        return { type: "read", path: call.path, content: _msg };
+        return {
+          type: "read", path: call.path, content: _msg,
+          evidence: {
+            kind: "read", resultKind: "duplicate", canonicalPath: _normRel(usedPath || call.path, root),
+            signature: _sig, from: start + 1, to: _reqEnd, total, complete: false,
+          },
+        };
       }
       const shownFrom = start + 1;
       let shownTo = Math.min(start + slice.length, total);
       let body = slice.join("\n");
       const CHAR_CAP = 55000; // 读全大多数源文件（~1500-1800 行）；只有真·超大文件才截断分页
       let charCapped = false;
+      let coverageTo = shownTo;
       if (body.length > CHAR_CAP) {
         // cut at the last whole line inside the cap so we never show/count a partial line
         const cut = body.slice(0, CHAR_CAP);
         const lastNl = cut.lastIndexOf("\n");
         body = lastNl > 0 ? cut.slice(0, lastNl) : cut;
         shownTo = start + body.split("\n").length;
+        // A giant single line has no complete line inside the cap. It can be shown
+        // as a diagnostic preview, but must not authorize a whole-file overwrite.
+        coverageTo = lastNl > 0 ? shownTo : start;
         charCapped = true;
       }
       // Only contiguous ranges covering the current complete file authorize a
       // later edit/overwrite. A one-line offset read must never unlock a whole-file
       // write; large files can still be authorized by reading all ranges in order.
-      _recordRunReadRange(run, root, shownFrom, shownTo, total, _sig, call.path, usedPath);
+      _bindRunFilePath(run, root, call.path, usedPath);
+      call._resolvedPath = usedPath;
+      _setToolStepResolvedPath(step, usedPath);
+      _recordRunReadRange(run, root, shownFrom, coverageTo, total, _sig, call.path, usedPath);
       // Record how far this file has now been shown (drives auto-advance on re-read).
       if (run) { run._readSeen = run._readSeen || new Map(); run._readSeen.set(usedPath, Math.max(_seen, shownTo, run._readSeen.get(usedPath) || 0)); run._readStep = run._readStep || new Map(); run._readStep.set(usedPath, run._toolStep); run._readSig = run._readSig || new Map(); run._readSig.set(usedPath, _sig); }
 
@@ -17935,9 +19377,17 @@ async function _executeToolStep(step, call, root, run) {
       // Redact credential values from the MODEL-facing copy only (the IDE card above
       // already rendered the real content for the user). Prevents secrets leaking off-machine.
       const _safeBody = _redactSecrets(body);
+      _recordRunRedactedRead(run, root, _sig, _safeBody !== body, call.path, usedPath);
       const _redNote = _safeBody !== body ? "\n（注：本文件含疑似密钥/令牌，已对你打码——需要真实值时让用户直接提供，别把密钥写进代码或外发。）" : "";
       const _readPath = (usedPath && usedPath !== call.path) ? `${call.path} (${usedPath})` : call.path;
-      return { type: "read", path: _readPath, content: (_readNote ? _readNote + "\n" : "") + header + _safeBody + hint + _redNote };
+      const evidence = {
+        kind: "read", canonicalPath: _normRel(usedPath || call.path, root), signature: _sig,
+        from: shownFrom, to: coverageTo, total,
+        complete: shownFrom === 1 && coverageTo >= total,
+        resultKind: "content", digest: _readEvidenceDigest(_safeBody), redacted: _safeBody !== body,
+      };
+      _recordSessionReadEvidence(run, root, { ...evidence, path: usedPath || call.path, ranges: [[shownFrom, coverageTo]] });
+      return { type: "read", path: _readPath, content: (_readNote ? _readNote + "\n" : "") + header + _safeBody + hint + _redNote, evidence };
 
     } else if (call.type === "list") {
       // Absolute paths are listed as-is (read-only, harmless); only relative
@@ -17988,14 +19438,34 @@ async function _executeToolStep(step, call, root, run) {
       // root has it. `write` resolves deterministically (root-qualified or active
       // root) — it must NOT hunt other roots, or a bare path could clobber a
       // same-named file in a different project.
-      const fp = call.type === "edit" ? await _resolveExisting(call.path) : _resolveRel(call.path);
+      const boundPath = _boundRunFilePath(run, root, call.path);
+      const fp = boundPath || (call.type === "edit"
+        ? await _resolveExisting(call.path, root)
+        : _resolveRel(call.path, root));
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
       let old = "";
       let existed = false;
       try { old = await backend.readTextFile(fp); existed = true; } catch {}
+      if (boundPath && !existed) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "⛔ 已读取的文件已不存在";
+        return { type: call.type, path: fp, content: `[CONFLICT] 本次运行之前读取的真实文件 ${fp} 已被删除或移动。IDE 没有在旧位置重新创建它；先确认当前目录和真实路径，再决定是修改新位置还是明确新建文件。` };
+      }
+      if (_openFileWriteConflict(fp)) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "⛔ 编辑器有未保存内容";
+        return { type: call.type, path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动。IDE 已保留这些内容并阻止 Agent 覆盖；先保存或处理冲突后，再读取当前磁盘版本并重试。` };
+      }
       if (existed && run && !_runHasCurrentRead(run, root, old, call.path, fp)) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 先读取已有文件";
         return { type: call.type, path: call.path, content: `[BLOCKED] ${call.path} 已存在，但本次运行没有完整读取它的**当前版本**（可能从未读过，也可能在读取后被用户或另一个任务改过）。IDE 已阻止盲改/旧版本覆盖：重新 read_file("${call.path}") 读完当前内容，再基于新版本修改。` };
+      }
+      const redactedRead = existed && _runReadWasRedacted(run, root, old, call.path, fp);
+      if (redactedRead && call.type === "write") {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 含打码密钥，禁止整文件覆盖";
+        return { type: "write", path: fp, content: `[BLOCKED] ${call.path} 含密钥或令牌，read_file 提供给模型的是打码副本。为防止把 [REDACTED] 写回磁盘或丢失真实值，IDE 已禁止整文件 write_file 覆盖；请用 edit_file / multi_edit 只改与密钥无关的精确片段，或请用户亲自处理敏感值。` };
       }
       let newContent = call.content;
       let _editNote = ""; // set when tolerant matching recovered a fuzzy old_string
@@ -18005,14 +19475,19 @@ async function _executeToolStep(step, call, root, run) {
       // → an empty file (the "+0 / 不写内容" symptom). Block it and tell the model to
       // re-call with the full content, instead of clobbering/creating a blank file.
       if (call.type === "write" && !(newContent || "").trim()) {
-        res.className = "atc-result atc-result--err"; res.textContent = "内容为空";
-        return { type: "write", path: call.path, content: "[ERROR] write_file 的 content 为空——多半是这次工具调用的参数没传全 / 被截断（不是你的本意）。请重新调用 write_file，同时带上 path 和完整 content；不要用 shell 绕过结构化文件写入门禁。" };
+        const missing = !call.contentProvided;
+        res.className = "atc-result atc-result--err"; res.textContent = missing ? "缺少 content" : "内容为空";
+        return { type: "write", path: call.path, content: `[ERROR] write_file 的 content ${missing ? "字段缺失" : "为空"}——这次工具调用不完整，IDE 没有写盘。请重新调用 write_file，并在同一次调用里同时带上精确 path 和完整非空 content；不要用 shell 绕过结构化文件写入门禁。` };
       }
 
       // edit_file: derive the new content by substituting old_string -> new_string
       // against the *current* file, with Claude-Code-style uniqueness checks so a
       // sloppy match never silently rewrites the wrong place.
       if (call.type === "edit") {
+        if (redactedRead && /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(String(call.oldString || "") + String(call.newString || ""))) {
+          res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 不能编辑打码占位符";
+          return { type: "edit", path: fp, content: `[BLOCKED] ${call.path} 的 edit 参数包含打码占位符；它不是真实磁盘内容。请只选择不含敏感值的真实代码片段做精确局部编辑。` };
+        }
         if (!existed) {
           res.className = "atc-result atc-result--err";
           res.textContent = "文件不存在";
@@ -18077,7 +19552,7 @@ async function _executeToolStep(step, call, root, run) {
       if (existed && newContent === old) {
         res.className = "atc-result atc-result--ok";
         res.textContent = "无变化";
-        return { type: call.type, path: call.path, content: `(${call.path} 内容未变化)` };
+        return { type: call.type, path: call.path, mutated: false, content: `(${call.path} 内容未变化)` };
       }
 
       const { added, removed } = _diffStat(old, newContent);
@@ -18094,11 +19569,27 @@ async function _executeToolStep(step, call, root, run) {
       let writeErr = "";
       try {
         await backend.writeTextFileIfUnchanged(fp, existed ? old : null, newContent);
+        const sync = _applyDiskContentToOpenFile(fp, newContent);
+        if (sync.state === "conflict") {
+          let rolledBack = false;
+          try {
+            if (existed) await backend.writeTextFileIfUnchanged(fp, newContent, old);
+            else await backend.deleteTextFileIfUnchanged(fp, newContent);
+            rolledBack = true;
+          } catch {}
+          const open = openFiles.get(fp);
+          if (rolledBack && open) open.externalConflict = false;
+          throw new Error(rolledBack
+            ? "用户在 Agent 写入期间继续编辑；本次 Agent 写入已撤销，未覆盖用户缓冲区"
+            : "用户在 Agent 写入期间继续编辑，且磁盘又发生变化；已保留编辑器内容并停止自动覆盖");
+        }
         _checkpointRecord(_cp, fp, existed, old); // only successful mutations belong in revert-all
         _checkpointMarkCurrent(_cp, fp, newContent);
-        _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
         _invalidateRead(call.path);
-        _resetReadProgress(run, fp, call.path); // content changed → re-read fresh from top
+        _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
+        _resetReadProgress(run, fp, call.path);
+        _bindRunFilePath(run, root, call.path, fp);
+        _recordRunKnownContent(run, root, newContent, call.path, fp);
         _refreshTreeFor(fp); // show the new/changed file in the explorer right away
       } catch (e1) {
         writeErr = String(e1?.message || e1);
@@ -18126,8 +19617,29 @@ async function _executeToolStep(step, call, root, run) {
           e.stopPropagation();
           growth.signal("undo-edit", { ctype: "write" });
           try {
-            if (existed) await backend.writeTextFileIfUnchanged(fp, newContent, old);
-            else await backend.deleteTextFileIfUnchanged(fp, newContent);
+            if (_openFileWriteConflict(fp)) throw new Error("编辑器有未保存内容，已阻止撤销");
+            if (existed) {
+              await backend.writeTextFileIfUnchanged(fp, newContent, old);
+              const sync = _applyDiskContentToOpenFile(fp, old);
+              if (sync.state === "conflict") {
+                let restored = false;
+                try { await backend.writeTextFileIfUnchanged(fp, old, newContent); restored = true; } catch {}
+                const open = openFiles.get(fp);
+                if (restored && open) open.externalConflict = false;
+                throw new Error(restored ? "撤销期间仍有新输入，本次撤销已取消" : "撤销期间文件再次变化，已保留编辑器内容");
+              }
+              _recordRunKnownContent(run, root, old, call.path, fp);
+            } else {
+              await backend.deleteTextFileIfUnchanged(fp, newContent);
+              const open = openFiles.get(fp);
+              if (open?.dirty) {
+                let restored = false;
+                try { await backend.writeTextFileIfUnchanged(fp, null, newContent); restored = true; } catch {}
+                if (restored) open.externalConflict = false;
+                throw new Error(restored ? "撤销期间仍有新输入，本次撤销已取消" : "撤销期间文件再次变化，已保留编辑器内容");
+              }
+              if (open) await closeFile(fp);
+            }
             _checkpointMarkCurrent(_cp, fp, existed ? old : null);
             step.classList.remove("agent-tool-step--accepted");
             step.classList.add("agent-tool-step--rejected");
@@ -18138,15 +19650,22 @@ async function _executeToolStep(step, call, root, run) {
           } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
         });
       }
-      return { type: call.type, path: call.path, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行）。` : `已新建 ${call.path}（${added} 行）。`) + (_editNote || "") };
+      const resolvedNote = fp !== _resolveRel(call.path, root) ? `；实际文件 ${fp}` : "";
+      return { type: call.type, path: fp, mutated: true, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") };
 
     } else if (call.type === "multiedit") {
-      const fp = await _resolveExisting(call.path);
+      const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
       catch {
         res.className = "atc-result atc-result--err"; res.textContent = "文件不存在";
         return { type: "multiedit", path: call.path, content: `[ERROR] 文件不存在: ${call.path}。新建文件请用 write_file。` };
+      }
+      if (_openFileWriteConflict(fp)) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 编辑器有未保存内容";
+        return { type: "multiedit", path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动，已阻止批量编辑，未写盘。` };
       }
       if (run && !_runHasCurrentRead(run, root, old, call.path, fp)) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 先读取已有文件";
@@ -18156,6 +19675,11 @@ async function _executeToolStep(step, call, root, run) {
       if (!edits.length) {
         res.className = "atc-result atc-result--err"; res.textContent = "edits 为空";
         return { type: "multiedit", path: call.path, content: "[ERROR] multi_edit 需要至少一处 edits。" };
+      }
+      if (_runReadWasRedacted(run, root, old, call.path, fp)
+          && edits.some((edit) => /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(String(edit?.old_string || "") + String(edit?.new_string || "")))) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 不能编辑打码占位符";
+        return { type: "multiedit", path: fp, content: `[BLOCKED] ${call.path} 的 multi_edit 包含打码占位符；整体未写入。只编辑与敏感值无关的精确真实片段。` };
       }
       // Apply edits in order against the evolving content; abort the whole op if
       // any one fails to locate uniquely (atomic — nothing is written on error).
@@ -18187,7 +19711,7 @@ async function _executeToolStep(step, call, root, run) {
       const newContent = content;
       if (newContent === old) {
         res.className = "atc-result atc-result--ok"; res.textContent = "无变化";
-        return { type: "multiedit", path: call.path, content: `(${call.path} 内容未变化)` };
+        return { type: "multiedit", path: call.path, mutated: false, content: `(${call.path} 内容未变化)` };
       }
       const { added, removed } = _diffStat(old, newContent);
       res.className = "atc-result atc-result--pending";
@@ -18199,11 +19723,23 @@ async function _executeToolStep(step, call, root, run) {
       let writeErr = "";
       try {
         await backend.writeTextFileIfUnchanged(fp, old, newContent);
+        const sync = _applyDiskContentToOpenFile(fp, newContent);
+        if (sync.state === "conflict") {
+          let rolledBack = false;
+          try { await backend.writeTextFileIfUnchanged(fp, newContent, old); rolledBack = true; } catch {}
+          const open = openFiles.get(fp);
+          if (rolledBack && open) open.externalConflict = false;
+          throw new Error(rolledBack
+            ? "用户在 Agent 写入期间继续编辑；本次批量编辑已撤销"
+            : "用户在 Agent 写入期间继续编辑，已保留编辑器内容并停止自动覆盖");
+        }
         _checkpointRecord(_cp, fp, true, old); // only successful mutations belong in revert-all
         _checkpointMarkCurrent(_cp, fp, newContent);
-        _agentReadCache.set(fp, newContent);
         _invalidateRead(call.path);
-        _resetReadProgress(run, fp, call.path); // content changed → re-read fresh from top
+        _agentReadCache.set(fp, newContent);
+        _resetReadProgress(run, fp, call.path);
+        _bindRunFilePath(run, root, call.path, fp);
+        _recordRunKnownContent(run, root, newContent, call.path, fp);
         _refreshTreeFor(fp);
       } catch (e) { writeErr = String(e?.message || e); }
       if (writeErr) {
@@ -18225,9 +19761,20 @@ async function _executeToolStep(step, call, root, run) {
           e.stopPropagation();
           growth.signal("undo-edit", { ctype: "multiedit" });
           try {
+            if (_openFileWriteConflict(fp)) throw new Error("编辑器有未保存内容，已阻止撤销");
             await backend.writeTextFileIfUnchanged(fp, newContent, old);
+            const sync = _applyDiskContentToOpenFile(fp, old);
+            if (sync.state === "conflict") {
+              let restored = false;
+              try { await backend.writeTextFileIfUnchanged(fp, old, newContent); restored = true; } catch {}
+              const open = openFiles.get(fp);
+              if (restored && open) open.externalConflict = false;
+              throw new Error(restored ? "撤销期间仍有新输入，本次撤销已取消" : "撤销期间文件再次变化，已保留编辑器内容");
+            }
             _checkpointMarkCurrent(_cp, fp, old);
-            _agentReadCache.set(fp, old); _invalidateRead(call.path); _refreshTreeFor(fp);
+            _invalidateRead(call.path); _agentReadCache.set(fp, old);
+            _recordRunKnownContent(run, root, old, call.path, fp);
+            _refreshTreeFor(fp);
             step.classList.remove("agent-tool-step--accepted"); step.classList.add("agent-tool-step--rejected");
             res.className = "atc-result atc-result--err"; res.textContent = "Reverted";
             _ipcBroadcast("file_changed", { path: fp });
@@ -18235,7 +19782,7 @@ async function _executeToolStep(step, call, root, run) {
           } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
         });
       }
-      return { type: "multiedit", path: call.path, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") };
+      return { type: "multiedit", path: fp, mutated: true, content: `已对 ${call.path} 应用 ${edits.length} 处替换（+${added}/-${removed} 行）。` + (_mEditNote || "") };
 
     } else if (call.type === "search") {
       const q = (call.query || "").trim();
@@ -18245,19 +19792,10 @@ async function _executeToolStep(step, call, root, run) {
         : (root || "");
       if (!searchRoot) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "search", path: call.path, content: "[ERROR] 未打开工作区，无法搜索。" }; }
       let fileMatches = [];
-      try { fileMatches = await backend.invoke("search_in_project", { root: searchRoot, query: q, caseSensitive: false }) || []; }
+      try { fileMatches = await backend.searchInProject(searchRoot, q, !!call.caseSensitive, call.mode || "literal") || []; }
       catch (e) {
-        // Most search failures = the query is an invalid regex (model meant it
-        // literally, e.g. "foo[bar" or "a(b"). Auto-retry with the pattern escaped
-        // so a literal search just works instead of erroring out.
-        const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        if (escaped !== q) {
-          try { fileMatches = await backend.invoke("search_in_project", { root: searchRoot, query: escaped, caseSensitive: false }) || []; }
-          catch (e2) { res.className = "atc-result atc-result--err"; res.textContent = String(e2?.message || e2).slice(0, 80); return { type: "search", path: call.path, content: `[ERROR] 搜索失败: ${e2?.message || e2}` }; }
-        } else {
-          res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
-          return { type: "search", path: call.path, content: `[ERROR] 搜索失败: ${e?.message || e}` };
-        }
+        res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
+        return { type: "search", path: call.path, content: `[ERROR] 搜索失败: ${e?.message || e}` };
       }
       // STRONGER retrieval: show each hit WITH ±2 lines of surrounding context (like
       // `grep -C2`) so the agent understands the match in situ instead of guessing from a
@@ -18276,7 +19814,7 @@ async function _executeToolStep(step, call, root, run) {
         let fileLines = null;
         if (ctxFiles < FILE_CTX_CAP) {
           try {
-            const abs = rel.startsWith("/") ? rel : (searchRoot.replace(/\/+$/, "") + "/" + rel);
+            const abs = fm.path || (rel.startsWith("/") ? rel : (searchRoot.replace(/\/+$/, "") + "/" + rel));
             fileLines = (await backend.readTextFile(abs)).split("\n"); ctxFiles++;
           } catch {}
         }
@@ -18555,8 +20093,19 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "delete") {
       const p = call.path || "";
       if (!p.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "delete", path: p, content: "[ERROR] 空路径。" }; }
-      const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
+      const fp = _boundRunFilePath(run, root, p) || _resolveRel(p, root);
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
+      const dirtyPath = _dirtyOpenFileUnder(fp);
+      if (dirtyPath) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 文件有未保存内容";
+        return { type: "delete", path: fp, content: `[CONFLICT] ${dirtyPath} 有尚未保存的用户改动，已阻止删除，未改动磁盘。` };
+      }
+      const openBeforeDelete = [...openFiles.entries()]
+        .filter(([openPath]) => _pathIsAtOrUnder(openPath, fp))
+        .map(([openPath, file]) => ({ openPath, name: file.name, active: openPath === activePath }));
       try {
+        if (!(await _closeOpenFilesUnder(fp))) throw new Error("目标仍在编辑器中打开，已阻止删除");
         let oldText = null;
         try { oldText = await backend.readTextFile(fp); } catch { /* dir/binary */ }
         if (oldText != null) await backend.deleteTextFileIfUnchanged(fp, oldText);
@@ -18571,6 +20120,9 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
         return { type: "delete", path: p, content: `已删除 ${p}` };
       } catch (e) {
+        for (const tab of openBeforeDelete) {
+          if (!openFiles.has(tab.openPath)) await openFile(tab.openPath, tab.name, tab.active);
+        }
         res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
         return { type: "delete", path: p, content: `[ERROR] 删除失败: ${String(e?.message || e).slice(0, 160)}` };
       }
@@ -18578,17 +20130,36 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "move") {
       const from = call.path || "", to = call.to || "";
       if (!from.trim() || !to.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "缺少 from/to"; return { type: "move", path: from, content: "[ERROR] 需要 from 和 to。" }; }
-      const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
-      const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
+      const fromFp = _boundRunFilePath(run, root, from) || _resolveRel(from, root);
+      const toFp = _resolveRel(to, root);
+      call._resolvedPath = fromFp;
+      _setToolStepResolvedPath(step, fromFp);
+      const dirtyPath = _dirtyOpenFileUnder(fromFp);
+      if (dirtyPath) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 文件有未保存内容";
+        return { type: "move", path: fromFp, content: `[CONFLICT] ${dirtyPath} 有尚未保存的用户改动，已阻止移动，未改动磁盘。` };
+      }
+      const openBeforeMove = [...openFiles.entries()]
+        .filter(([openPath]) => _pathIsAtOrUnder(openPath, fromFp))
+        .map(([openPath, file]) => ({ openPath, name: file.name, active: openPath === activePath }));
       try {
+        if (!(await _closeOpenFilesUnder(fromFp))) throw new Error("目标仍在编辑器中打开，已阻止移动");
         try { _checkpointRecord(_cp, fromFp, true, await backend.readTextFile(fromFp)); _checkpointRecord(_cp, toFp, false, ""); } catch {}
         await backend.renamePath(fromFp, toFp);
+        _bindRunFilePath(run, root, to, toFp);
+        for (const tab of openBeforeMove) {
+          const movedPath = toFp + tab.openPath.slice(fromFp.length);
+          await openFile(movedPath, tab.openPath === fromFp ? (to.split(/[\\/]/).pop() || tab.name) : tab.name, tab.active);
+        }
         _invalidateRead(from); _agentReadCache.delete(fromFp);
         _resetReadProgress(run, fromFp, from, toFp, to); // moved → reset both old & new path progress
         _refreshTreeFor(fromFp); _refreshTreeFor(toFp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已移动";
         return { type: "move", path: from, content: `已移动 ${from} → ${to}` };
       } catch (e) {
+        for (const tab of openBeforeMove) {
+          if (!openFiles.has(tab.openPath)) await openFile(tab.openPath, tab.name, tab.active);
+        }
         res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
         return { type: "move", path: from, content: `[ERROR] 移动失败: ${String(e?.message || e).slice(0, 160)}` };
       }
@@ -18727,13 +20298,21 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "mkdir") {
       const p = (call.path || "").trim();
       if (!p) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "mkdir", path: p, content: "[ERROR] 空路径。" }; }
-      const fp = p.startsWith("/") ? p : (root ? root + "/" + p.replace(/^\/+/, "") : p);
+      const fp = _resolveRel(p, root);
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
       try {
-        await backend.invoke("create_dir", { path: fp });
+        let alreadyExists = false;
+        try { await backend.readDir(fp); alreadyExists = true; } catch {}
+        if (alreadyExists) {
+          res.className = "atc-result atc-result--ok"; res.textContent = "目录已存在";
+          return { type: "mkdir", path: p, mutated: false, content: `目录 ${p} 已存在，无需重复创建。` };
+        }
+        await backend.createDir(fp);
         _checkpointRecord(_cp, fp, false, ""); // revert-all removes a dir we created
         _refreshTreeFor(fp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已创建目录";
-        return { type: "mkdir", path: p, content: `已创建目录 ${p}` };
+        return { type: "mkdir", path: p, mutated: true, content: `已创建目录 ${p}` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = String(e?.message || e).slice(0, 80);
         return { type: "mkdir", path: p, content: `[ERROR] 创建目录失败: ${String(e?.message || e).slice(0, 160)}` };
@@ -18742,10 +20321,17 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "copy") {
       const from = (call.path || "").trim(), to = (call.to || "").trim();
       if (!from || !to) { res.className = "atc-result atc-result--err"; res.textContent = "缺少 from/to"; return { type: "copy", path: from, content: "[ERROR] 需要 from 和 to。" }; }
-      const fromFp = from.startsWith("/") ? from : (root ? root + "/" + from.replace(/^\/+/, "") : from);
-      const toFp = to.startsWith("/") ? to : (root ? root + "/" + to.replace(/^\/+/, "") : to);
+      const fromFp = _boundRunFilePath(run, root, from) || await _resolveExisting(from, root);
+      const toFp = _resolveRel(to, root);
+      call._resolvedPath = fromFp;
+      _setToolStepResolvedPath(step, fromFp);
+      const dirtyPath = _dirtyOpenFileUnder(fromFp);
+      if (dirtyPath) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 源文件有未保存内容";
+        return { type: "copy", path: fromFp, content: `[CONFLICT] ${dirtyPath} 有尚未保存的用户改动，已阻止复制旧磁盘版本。请先保存或处理冲突。` };
+      }
       try {
-        await backend.invoke("copy_path", { from: fromFp, to: toFp });
+        await backend.copyPath(fromFp, toFp);
         _checkpointRecord(_cp, toFp, false, ""); // revert-all removes the copy
         _refreshTreeFor(toFp);
         res.className = "atc-result atc-result--ok"; res.textContent = "已复制";
@@ -18758,10 +20344,20 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "format") {
       const rel = (call.path || "").trim();
       if (!rel) { res.className = "atc-result atc-result--err"; res.textContent = "空路径"; return { type: "format", path: rel, content: "[ERROR] 空路径。" }; }
-      const fp = rel.startsWith("/") ? rel : (root ? root + "/" + rel.replace(/^\/+/, "") : rel);
+      const fp = _boundRunFilePath(run, root, rel) || _resolveRel(rel, root);
+      call._resolvedPath = fp;
+      _setToolStepResolvedPath(step, fp);
       let old = "";
       try { old = await backend.readTextFile(fp); }
       catch { res.className = "atc-result atc-result--err"; res.textContent = "文件不存在"; return { type: "format", path: rel, content: `[ERROR] 文件不存在: ${rel}` }; }
+      if (_openFileWriteConflict(fp)) {
+        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 编辑器有未保存内容";
+        return { type: "format", path: fp, content: `[CONFLICT] ${fp} 在编辑器里有尚未保存的用户改动，已阻止格式化，未写盘。` };
+      }
+      // Formatters operate on Monaco's model. Refresh any clean/preloaded model
+      // from the exact disk baseline first, otherwise stale diagnostics state could
+      // be formatted and then CAS-written over newer terminal/external changes.
+      _applyDiskContentToOpenFile(fp, old);
       let formatted = null;
       try { formatted = await (lspManager && lspManager.agentFormat ? lspManager.agentFormat(fp) : null); } catch {}
       if (formatted == null) { try { formatted = await _tsWorkerFormat(fp); } catch {} }
@@ -18771,7 +20367,7 @@ async function _executeToolStep(step, call, root, run) {
       }
       if (formatted === old) {
         res.className = "atc-result atc-result--ok"; res.textContent = "已是规范格式";
-        return { type: "format", path: rel, content: `${rel} 已是规范格式，无改动。` };
+        return { type: "format", path: rel, mutated: false, content: `${rel} 已是规范格式，无改动。` };
       }
       const { added, removed } = _diffStat(old, formatted);
       vp.innerHTML = _buildDiffView(old, formatted, rel);
@@ -18780,9 +20376,21 @@ async function _executeToolStep(step, call, root, run) {
       let writeErr = "";
       try {
         await backend.writeTextFileIfUnchanged(fp, old, formatted);
+        const sync = _applyDiskContentToOpenFile(fp, formatted);
+        if (sync.state === "conflict") {
+          let rolledBack = false;
+          try { await backend.writeTextFileIfUnchanged(fp, formatted, old); rolledBack = true; } catch {}
+          const open = openFiles.get(fp);
+          if (rolledBack && open) open.externalConflict = false;
+          throw new Error(rolledBack ? "用户在格式化期间继续编辑；本次格式化已撤销" : "用户在格式化期间继续编辑，已保留编辑器内容并停止自动覆盖");
+        }
         _checkpointRecord(_cp, fp, true, old);
         _checkpointMarkCurrent(_cp, fp, formatted);
-        _agentReadCache.set(fp, formatted); _invalidateRead(rel); _refreshTreeFor(fp);
+        _invalidateRead(rel); _agentReadCache.set(fp, formatted);
+        _resetReadProgress(run, fp, rel);
+        _bindRunFilePath(run, root, rel, fp);
+        _recordRunKnownContent(run, root, formatted, rel, fp);
+        _refreshTreeFor(fp);
       } catch (e) { writeErr = String(e?.message || e); }
       if (writeErr) {
         step.classList.add("agent-tool-step--rejected");
@@ -18799,9 +20407,20 @@ async function _executeToolStep(step, call, root, run) {
         undoBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
           try {
+            if (_openFileWriteConflict(fp)) throw new Error("编辑器有未保存内容，已阻止撤销");
             await backend.writeTextFileIfUnchanged(fp, formatted, old);
+            const sync = _applyDiskContentToOpenFile(fp, old);
+            if (sync.state === "conflict") {
+              let restored = false;
+              try { await backend.writeTextFileIfUnchanged(fp, old, formatted); restored = true; } catch {}
+              const open = openFiles.get(fp);
+              if (restored && open) open.externalConflict = false;
+              throw new Error(restored ? "撤销期间仍有新输入，本次撤销已取消" : "撤销期间文件再次变化，已保留编辑器内容");
+            }
             _checkpointMarkCurrent(_cp, fp, old);
-            _agentReadCache.set(fp, old); _invalidateRead(rel); _refreshTreeFor(fp);
+            _invalidateRead(rel); _agentReadCache.set(fp, old);
+            _recordRunKnownContent(run, root, old, rel, fp);
+            _refreshTreeFor(fp);
             step.classList.remove("agent-tool-step--accepted"); step.classList.add("agent-tool-step--rejected");
             res.className = "atc-result atc-result--err"; res.textContent = "Reverted";
             _ipcBroadcast("file_changed", { path: fp });
@@ -18809,7 +20428,7 @@ async function _executeToolStep(step, call, root, run) {
           } catch (err) { showToast("Undo failed: " + (err?.message || err)); }
         });
       }
-      return { type: "format", path: rel, content: `已格式化 ${rel}（+${added}/-${removed} 行）。` };
+      return { type: "format", path: rel, mutated: true, content: `已格式化 ${rel}（+${added}/-${removed} 行）。` };
 
     } else if (call.type === "lsp") {
       const lroot = root || rootPath || workspaceRoots[0] || "";
@@ -19206,8 +20825,8 @@ async function _executeToolStep(step, call, root, run) {
       res.className = exited ? "atc-result atc-result--err" : "atc-result atc-result--ok";
       res.textContent = exited ? "已退出" : "运行中";
       if (vp) vp.innerHTML = `<pre>${_escHtml(out || "(暂无输出)")}</pre>`;
-      return { type: "termtask", path: label, devServerUrl, content: exited
-        ? `命令在 IDE 终端「${label}」里运行后已退出（可能不是持续任务，或启动即失败）：\n$ ${cmd}\n输出:\n${out || "(无)"}`
+      return { type: "termtask", path: label, devServerUrl, running: !exited, content: exited
+        ? `[ERROR] 命令在 IDE 终端「${label}」启动后很快退出，未形成持续运行任务。一次性命令应改用 run_cmd 取得真实退出码；持续服务请根据下面输出修复后重启：\n$ ${cmd}\n输出:\n${out || "(无)"}`
         : `已在 IDE 终端 tab「${label}」启动持续任务并保持运行：\n$ ${cmd}\n\n启动后输出（前几秒）:\n${out || "(暂无输出)"}\n\n该任务在 IDE 终端里持续运行、用户可见可手动停止。${devServerUrl ? `本 run 检测到的 dev server：${devServerUrl}` : "尚未从该终端识别出本地 URL；用 read_terminal 读取后续日志。"}` };
 
     } else if (call.type === "termread") {
@@ -19764,7 +21383,7 @@ async function _executeToolStep(step, call, root, run) {
         if (dlRoot) {
           const rel = (call.path && call.path.trim()) || `.michael-demos/demo-${Date.now()}.html`;
           const fp = rel.startsWith("/") ? rel : dlRoot + "/" + rel;
-          try { await backend.writeTextFile(fp, _demoHtml(frames, title)); savedPath = rel; try { reloadDir(parentDir(fp)); } catch {} } catch { savedPath = ""; }
+          try { await _commitDiskTextIfUnchanged(fp, null, _demoHtml(frames, title)); savedPath = rel; try { reloadDir(parentDir(fp)); } catch {} } catch { savedPath = ""; }
         }
       }
       res.className = "atc-result atc-result--ok"; res.textContent = `${frames.length} 帧`;
@@ -20143,6 +21762,14 @@ async function _executeToolStep(step, call, root, run) {
         `</div>`;
 
       const result = await _agentRunInTerminal(root, call.command, step);
+
+      // The native watcher observes only the local machine. After a remote command,
+      // explicitly reconcile every open file in this run's remote root so terminal
+      // edits cannot leave Monaco showing an old buffer indefinitely.
+      if (typeof _remote !== "undefined" && _remote?.active) {
+        const remoteOpenPaths = [...openFiles.keys()].filter((path) => !root || path === root || path.startsWith(root + "/"));
+        await _syncOpenFilesFromDisk(remoteOpenPaths, "远程命令");
+      }
 
       const outEl = step.querySelector(".agent-term-output");
       const footerEl = step.querySelector(".agent-term-card__footer");
@@ -21816,24 +23443,31 @@ async function runCurrentFile() {
     showToast("请先打开一个文件");
     return;
   }
-  const command = runCommandForFile(activePath);
+  const runningPath = activePath;
+  const command = runCommandForFile(runningPath);
   if (!command) {
-    showToast(`不支持运行 ${basename(activePath)} 类型的文件`);
+    showToast(`不支持运行 ${basename(runningPath)} 类型的文件`);
     return;
   }
-  const file = openFiles.get(activePath);
-  if (file?.dirty) await saveActive();
+  const file = openFiles.get(runningPath);
+  if (file?.dirty) {
+    const saved = await saveActive(runningPath);
+    if (!saved || openFiles.get(runningPath)?.dirty) {
+      showToast("当前内容尚未安全写入磁盘，已取消运行");
+      return;
+    }
+  }
 
   if (command === "__SERVE_HTML__") {
-    const dir = dirname(activePath);
+    const dir = dirname(runningPath);
     const port = await _findFreePort(3000);
-    const name = basename(activePath);
+    const name = basename(runningPath);
     await _startDevServer(dir, port, name);
     return;
   }
 
   if (command === "__SERVE_FRONTEND__") {
-    const dir = dirname(activePath);
+    const dir = dirname(runningPath);
     await _startViteServer(dir);
     return;
   }
@@ -21913,14 +23547,14 @@ function _tsCode(m) { const c = (m && typeof m.code === "object") ? (m.code.valu
 // free: open models are read-only (never setValue → never falsely marked dirty);
 // unopened files use a transient model (no listeners) that is disposed after the
 // read. Returns { ran, report } — ran=true when at least one JS/TS file was checked.
-async function _interleavedDiagnostics(editedRelPaths) {
+async function _interleavedDiagnostics(editedRelPaths, root = "") {
   if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "" };
   const targets = []; // { rel, model, created, isTs }
   for (const rel of editedRelPaths.slice(0, 6)) {
     const ext = (rel.split(".").pop() || "").toLowerCase();
     if (!_LINTABLE_EXT.has(ext)) continue;
     let abs = rel;
-    try { abs = await _resolveExisting(rel); } catch {}
+    try { abs = await _resolveExisting(rel, root); } catch {}
     let uri; try { uri = monaco.Uri.file(abs); } catch { continue; }
     const isTs = _TS_EXT.has(ext);
     let model = monaco.editor.getModel(uri);
@@ -21930,7 +23564,7 @@ async function _interleavedDiagnostics(editedRelPaths) {
       try { content = await backend.readTextFile(abs); } catch { continue; }
       try { model = monaco.editor.createModel(content, isTs ? "typescript" : "javascript", uri); created = true; } catch { continue; }
     }
-    targets.push({ rel, model, created, isTs });
+    targets.push({ rel: _normRel(abs, root), model, created, isTs });
   }
   if (!targets.length) return { ran: false, report: "" };
   // Semantic analysis is async — give the worker a bounded moment to publish.
@@ -22509,7 +24143,10 @@ async function openConflictDetail(file, detail) {
   actions.className = "tool-actions";
   const resolve = async (resolution) => {
     try {
-      if (resolution === "manual") await backend.writeTextFile(file.path, merged.value);
+      if (resolution === "manual") {
+        const current = await backend.readTextFile(file.path);
+        await _commitDiskTextIfUnchanged(file.path, current, merged.value);
+      }
       await backend.gitResolveConflict(rootPath, file.rel, resolution);
       showToast(`已解决 ${file.rel}`);
       await afterWorktreeChange();
@@ -25241,41 +26878,49 @@ async function showNewProjectDialog() {
 
 // ---- auto-save ----
 let autoSaveEnabled = true;
-let autoSaveTimer = null;
+const autoSaveTimers = new Map();
 
-function scheduleAutoSave() {
-  if (!autoSaveEnabled || !activePath) return;
-  clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(async () => {
-    if (!activePath) return;
-    const f = openFiles.get(activePath);
+function scheduleAutoSave(path = activePath) {
+  if (!autoSaveEnabled || !path) return;
+  const previous = autoSaveTimers.get(path);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(async () => {
+    autoSaveTimers.delete(path);
+    const f = openFiles.get(path);
     if (f && f.dirty) {
+      const snapshot = f.model.getValue();
       try {
-        _autoSaving = true;
-        const savingPath = activePath;
-        await backend.writeTextFile(savingPath, f.model.getValue());
-        f.dirty = false;
-        saveBtn.disabled = true;
-        const tabEl = tabsEl.querySelector(`[data-path="${CSS.escape(savingPath)}"]`);
-        if (tabEl) tabEl.classList.remove("dirty");
-        lspManager?.didSave(savingPath, f.model);
-        _autoSaving = false;
+        _autoSaving++;
+        await _writeOpenFileSnapshot(path, snapshot);
+        if (openFiles.get(path) === f && f.model.getValue() === snapshot) {
+          markDirty(path, false);
+          lspManager?.didSave(path, f.model);
+        } else if (openFiles.get(path) === f) {
+          // The user kept typing while the save was in flight. The snapshot reached
+          // disk, but the newer model must stay dirty and get its own queued save.
+          markDirty(path, true);
+          scheduleAutoSave(path);
+        }
       } catch (e) {
         // Don't fail silently: the buffer stays dirty (so it's not "saved" in the UI)
         // and we warn — otherwise the user keeps typing thinking it's saved and loses
         // it on close. Throttled so a persistent failure doesn't spam every 800ms.
-        _autoSaving = false;
+        if (openFiles.get(path) === f) { f.externalConflict = true; markDirty(path, true); }
         const now = Date.now ? Date.now() : 0;
         if (now - _lastAutosaveWarn > 8000) { _lastAutosaveWarn = now; showToast("⚠️ 自动保存失败：" + String(e?.message || e).slice(0, 80) + "（改动仍在，未写入磁盘）"); }
+      } finally {
+        _autoSaving = Math.max(0, _autoSaving - 1);
       }
     }
   }, 800);
+  autoSaveTimers.set(path, timer);
 }
-let _autoSaving = false;
+let _autoSaving = 0;
 let _lastAutosaveWarn = 0;
 
 monacoEditor.onDidChangeModelContent(() => {
-  if (!_imeComposing) scheduleAutoSave();
+  const model = monacoEditor.getModel();
+  if (!_imeComposing && !_programmaticModelUpdates.has(model)) scheduleAutoSave(activePath);
 });
 
 async function toggleAutoSave() {
@@ -25331,23 +26976,30 @@ async function replaceInFiles(replaceAll) {
 
   for (const f of files) {
     if (!replaceAll && totalCount > 0) break;
+    const filePath = _coherentFilePath(f.path);
     let content;
-    try { content = await backend.readTextFile(f.path); } catch { continue; }
+    try { content = await backend.readTextFile(filePath); } catch { continue; }
     const regex = searchCaseSensitive
       ? new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")
       : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
     const newContent = content.replace(regex, replacement);
     if (newContent !== content) {
       try {
-        await backend.writeTextFile(f.path, newContent);
+        const open = openFiles.get(filePath);
+        if (open?.dirty) continue;
+        await backend.writeTextFileIfUnchanged(filePath, content, newContent);
+        if (open) {
+          const sync = _applyDiskContentToOpenFile(filePath, newContent);
+          if (sync.state === "conflict") {
+            let rolledBack = false;
+            try { await backend.writeTextFileIfUnchanged(filePath, newContent, content); rolledBack = true; } catch {}
+            if (rolledBack) open.externalConflict = false;
+            throw new Error(rolledBack ? "编辑期间内容变化，替换已撤销" : "编辑期间内容变化，已保留编辑器内容");
+          }
+        }
         const count = (content.match(regex) || []).length;
         totalCount += count;
         fileCount++;
-        if (openFiles.has(f.path)) {
-          const model = openFiles.get(f.path).model;
-          model.setValue(newContent);
-          markDirty(f.path, false);
-        }
       } catch { /* skip */ }
     }
     if (!replaceAll) break;
@@ -26239,7 +27891,12 @@ const extHost = new ExtensionHost({
   setStatusBarItem,
   removeStatusBarItem,
   readFile: (path) => backend.readTextFile(path),
-  writeFile: (path, content) => backend.writeTextFile(path, content),
+  writeFile: async (path, content) => {
+    path = _coherentFilePath(_resolveRel(path, rootPath || workspaceRoots[0] || ""));
+    let expected = null;
+    try { expected = await backend.readTextFile(path); } catch {}
+    return await _commitDiskTextIfUnchanged(path, expected, content);
+  },
   listDir: (path) => backend.readDir(path),
   getWorkspaceRoots: () =>
     workspaceRoots && workspaceRoots.length ? workspaceRoots : rootPath ? [rootPath] : [],

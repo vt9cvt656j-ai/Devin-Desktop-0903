@@ -1207,6 +1207,214 @@ fn parse_usage_from_sse(acc: &[u8]) -> Option<serde_json::Value> {
     last
 }
 
+/// Incrementally validates OpenAI-compatible SSE before each upstream chunk is
+/// forwarded. A terminal marker alone is insufficient when an earlier frame was
+/// malformed: that frame may contain the missing suffix of a file-writing tool.
+#[derive(Clone, Debug, Default)]
+struct ToolArgumentRules {
+    required: Vec<String>,
+    min_lengths: std::collections::HashMap<String, usize>,
+}
+
+fn validate_streamed_tool_arguments(
+    provider: &str,
+    name: &str,
+    raw_arguments: &str,
+    rules: Option<&ToolArgumentRules>,
+) -> Result<String, String> {
+    let arguments = if raw_arguments.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        raw_arguments.to_string()
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&arguments).map_err(|error| {
+        format!("{provider} tool call {name:?} produced incomplete arguments JSON: {error}")
+    })?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| format!("{provider} tool call {name:?} arguments must be a JSON object"))?;
+    if let Some(rules) = rules {
+        let missing = rules
+            .required
+            .iter()
+            .filter(|key| !object.contains_key(key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{provider} tool call {name:?} is missing required arguments: {}",
+                missing.join(", ")
+            ));
+        }
+        for (key, min_length) in &rules.min_lengths {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            let text = value.as_str().ok_or_else(|| {
+                format!("{provider} tool call {name:?} argument {key:?} must be a string")
+            })?;
+            if text.chars().count() < *min_length {
+                return Err(format!(
+                    "{provider} tool call {name:?} argument {key:?} is shorter than minLength {min_length}"
+                ));
+            }
+        }
+    }
+    Ok(arguments)
+}
+
+#[derive(Default)]
+struct OpenAiToolStream {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct OpenAiSseValidator {
+    buf: Vec<u8>,
+    done_seen: bool,
+    tool_calls: std::collections::HashMap<(u64, u64), OpenAiToolStream>,
+    tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+}
+
+impl OpenAiSseValidator {
+    fn with_tool_argument_rules(
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    ) -> Self {
+        Self {
+            tool_argument_rules,
+            ..Self::default()
+        }
+    }
+
+    fn record_tool_calls(&mut self, event: &serde_json::Value) -> Result<(), String> {
+        let Some(choices) = event.get("choices").and_then(|value| value.as_array()) else {
+            return Ok(());
+        };
+        for (choice_position, choice) in choices.iter().enumerate() {
+            let choice_index = choice
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(choice_position as u64);
+            let calls = choice
+                .pointer("/delta/tool_calls")
+                .or_else(|| choice.pointer("/message/tool_calls"));
+            let Some(calls) = calls.and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for (call_position, call) in calls.iter().enumerate() {
+                let tool_index = call
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(call_position as u64);
+                let stream = self
+                    .tool_calls
+                    .entry((choice_index, tool_index))
+                    .or_default();
+                let Some(function) = call.get("function") else {
+                    continue;
+                };
+                let function = function
+                    .as_object()
+                    .ok_or_else(|| "OpenAI SSE tool call function must be an object".to_string())?;
+                if let Some(name) = function.get("name") {
+                    let name = name.as_str().ok_or_else(|| {
+                        "OpenAI SSE tool call function.name must be a string".to_string()
+                    })?;
+                    if !name.is_empty() {
+                        stream.name = name.to_string();
+                    }
+                }
+                if let Some(arguments) = function.get("arguments") {
+                    let arguments = arguments.as_str().ok_or_else(|| {
+                        "OpenAI SSE tool call function.arguments must be a string".to_string()
+                    })?;
+                    stream.arguments.push_str(arguments);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tool_calls(&self) -> Result<(), String> {
+        for stream in self.tool_calls.values() {
+            if stream.name.is_empty() {
+                return Err("OpenAI SSE tool call ended without function.name".to_string());
+            }
+            validate_streamed_tool_arguments(
+                "OpenAI",
+                &stream.name,
+                &stream.arguments,
+                self.tool_argument_rules.get(&stream.name),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.buf.extend_from_slice(bytes);
+        while let Some(newline) = self.buf.iter().position(|&byte| byte == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=newline).collect();
+            let line = std::str::from_utf8(&raw)
+                .map_err(|error| format!("OpenAI SSE contains invalid UTF-8: {error}"))?
+                .trim();
+            let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                if self.done_seen {
+                    return Err(
+                        "OpenAI SSE contains more than one terminal data: [DONE]".to_string()
+                    );
+                }
+                // Validate before the caller forwards the chunk containing [DONE]. This
+                // prevents clients from observing a successful terminal event for a
+                // truncated tool call and also keeps that response out of the cache.
+                self.validate_tool_calls()?;
+                self.done_seen = true;
+                continue;
+            }
+            if self.done_seen {
+                return Err("OpenAI SSE contains data after terminal data: [DONE]".to_string());
+            }
+            let event = serde_json::from_str::<serde_json::Value>(payload)
+                .map_err(|error| format!("OpenAI SSE contains malformed JSON: {error}"))?;
+            self.record_tool_calls(&event)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if !self.buf.iter().all(u8::is_ascii_whitespace) {
+            return Err("OpenAI upstream stream ended with an incomplete SSE frame".to_string());
+        }
+        if !self.done_seen {
+            return Err("OpenAI upstream stream ended without terminal data: [DONE]".to_string());
+        }
+        self.validate_tool_calls()
+    }
+}
+
+#[cfg(test)]
+fn validate_openai_sse_eof(bytes: &[u8]) -> Result<(), String> {
+    let mut validator = OpenAiSseValidator::default();
+    validator.push(bytes)?;
+    validator.finish()
+}
+
+#[cfg(test)]
+fn validate_openai_sse_with_rules(
+    bytes: &[u8],
+    rules: std::collections::HashMap<String, ToolArgumentRules>,
+) -> Result<(), String> {
+    let mut validator = OpenAiSseValidator::with_tool_argument_rules(rules);
+    validator.push(bytes)?;
+    validator.finish()
+}
+
 /// Strip ALL `cache_control` before forwarding. PROVEN via per-call fingerprints that
 /// the [tools+system] prefix is byte-IDENTICAL on every call (16+ consecutive calls,
 /// same sys_hash + tools_hash) — yet the relay (zyz) still bills cache CREATION (a 1.25×
@@ -1605,7 +1813,7 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
 }
 
 /// OpenAI /chat/completions body → Anthropic /v1/messages body.
-fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
+fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, String> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -1659,12 +1867,30 @@ fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
                                 .pointer("/function/name")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let args = tc
-                                .pointer("/function/arguments")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}");
-                            let input: serde_json::Value =
-                                serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                            let args = tc.pointer("/function/arguments").ok_or_else(|| {
+                                format!(
+                                    "assistant tool call {name:?} (id {id:?}) is missing function.arguments"
+                                )
+                            })?;
+                            let input = match args {
+                                serde_json::Value::String(args) => serde_json::from_str(args)
+                                    .map_err(|err| {
+                                        format!(
+                                            "assistant tool call {name:?} (id {id:?}) has malformed function.arguments JSON: {err}"
+                                        )
+                                    })?,
+                                serde_json::Value::Object(_) => args.clone(),
+                                _ => {
+                                    return Err(format!(
+                                        "assistant tool call {name:?} (id {id:?}) has non-object function.arguments"
+                                    ));
+                                }
+                            };
+                            if !input.is_object() {
+                                return Err(format!(
+                                    "assistant tool call {name:?} (id {id:?}) function.arguments must decode to a JSON object"
+                                ));
+                            }
                             blocks
                                 .push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
                         }
@@ -1799,7 +2025,7 @@ fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
             out.insert("tool_choice".into(), v);
         }
     }
-    serde_json::Value::Object(out)
+    Ok(serde_json::Value::Object(out))
 }
 
 /// Anthropic usage → an object carrying BOTH Anthropic token names (so compute_cost bills
@@ -1865,15 +2091,65 @@ fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
     })
 }
 
+fn tool_argument_rules(
+    body: &serde_json::Value,
+) -> std::collections::HashMap<String, ToolArgumentRules> {
+    body.get("tools")
+        .and_then(|tools| tools.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.as_str()?.to_string();
+            let required = function
+                .pointer("/parameters/required")
+                .and_then(|required| required.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|key| key.as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            let min_lengths = function
+                .pointer("/parameters/properties")
+                .and_then(|properties| properties.as_object())
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, schema)| {
+                    schema
+                        .get("minLength")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| usize::try_from(value).ok())
+                        .map(|value| (key.clone(), value))
+                })
+                .collect();
+            Some((
+                name,
+                ToolArgumentRules {
+                    required,
+                    min_lengths,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Stateful converter: Anthropic Messages SSE stream → OpenAI chat.completions SSE stream.
 /// Fed raw upstream bytes via `push` (handles chunk-split events); emits ready-to-forward
 /// OpenAI `data:` lines. Accumulates usage for billing. `finish` emits the terminal chunks.
+struct AnthToolStream {
+    tool_index: i64,
+    name: String,
+    arguments: String,
+    stopped: bool,
+}
+
 struct AnthSse {
     buf: Vec<u8>,
     model: String,
     role_sent: bool,
     next_tool_idx: i64,
-    block_tool: std::collections::HashMap<i64, i64>,
+    tool_blocks: std::collections::HashMap<i64, AnthToolStream>,
+    tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    message_stop_seen: bool,
     input_tokens: i64,
     output_tokens: i64,
     cache_read: i64,
@@ -1882,13 +2158,43 @@ struct AnthSse {
     out_bytes: usize, // incremental output byte counter for fallback estimation
 }
 impl AnthSse {
+    #[cfg(test)]
     fn new(model: &str) -> Self {
+        Self::with_tool_argument_rules(model, std::collections::HashMap::new())
+    }
+
+    #[cfg(test)]
+    fn with_required_tool_args(
+        model: &str,
+        required_tool_args: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let rules = required_tool_args
+            .into_iter()
+            .map(|(name, required)| {
+                (
+                    name,
+                    ToolArgumentRules {
+                        required,
+                        min_lengths: std::collections::HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        Self::with_tool_argument_rules(model, rules)
+    }
+
+    fn with_tool_argument_rules(
+        model: &str,
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    ) -> Self {
         AnthSse {
             buf: Vec::new(),
             model: model.to_string(),
             role_sent: false,
             next_tool_idx: 0,
-            block_tool: std::collections::HashMap::new(),
+            tool_blocks: std::collections::HashMap::new(),
+            tool_argument_rules,
+            message_stop_seen: false,
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -1896,6 +2202,15 @@ impl AnthSse {
             stop_reason: "stop".into(),
             out_bytes: 0,
         }
+    }
+
+    fn validated_tool_arguments(&self, block: &AnthToolStream) -> Result<String, String> {
+        validate_streamed_tool_arguments(
+            "Anthropic",
+            &block.name,
+            &block.arguments,
+            self.tool_argument_rules.get(&block.name),
+        )
     }
     fn chunk(&self, delta: serde_json::Value, finish: Option<&str>) -> Vec<u8> {
         let choice = json!({"index":0,"delta":delta,"finish_reason": match finish { Some(f) => json!(f), None => serde_json::Value::Null }});
@@ -1911,13 +2226,14 @@ impl AnthSse {
             self.role_sent = true;
         }
     }
-    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
         self.buf.extend_from_slice(bytes);
         let mut out: Vec<u8> = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = self.buf.drain(0..=nl).collect();
-            let line = String::from_utf8_lossy(&raw);
-            let line = line.trim();
+            let line = std::str::from_utf8(&raw)
+                .map_err(|err| format!("Anthropic SSE contains invalid UTF-8: {err}"))?
+                .trim();
             let data = match line.strip_prefix("data:") {
                 Some(d) => d.trim(),
                 None => continue,
@@ -1925,10 +2241,8 @@ impl AnthSse {
             if data.is_empty() {
                 continue;
             }
-            let ev: serde_json::Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let ev: serde_json::Value = serde_json::from_str(data)
+                .map_err(|err| format!("invalid Anthropic SSE JSON: {err}"))?;
             match ev.get("type").and_then(|t| t.as_str()) {
                 Some("message_start") => {
                     if let Some(u) = ev.pointer("/message/usage") {
@@ -1946,12 +2260,18 @@ impl AnthSse {
                     self.ensure_role(&mut out);
                 }
                 Some("content_block_start") => {
-                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let idx = ev.get("index").and_then(|v| v.as_i64()).ok_or_else(|| {
+                        "Anthropic content_block_start is missing a numeric index".to_string()
+                    })?;
                     let cb = ev.get("content_block");
                     if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                        if self.tool_blocks.contains_key(&idx) {
+                            return Err(format!(
+                                "Anthropic tool_use reused content block index {idx}"
+                            ));
+                        }
                         let ti = self.next_tool_idx;
                         self.next_tool_idx += 1;
-                        self.block_tool.insert(idx, ti);
                         let id = cb
                             .and_then(|c| c.get("id"))
                             .and_then(|v| v.as_str())
@@ -1960,12 +2280,37 @@ impl AnthSse {
                             .and_then(|c| c.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
+                        let input = cb
+                            .and_then(|c| c.get("input"))
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let initial_arguments = match input.as_object() {
+                            Some(input) if input.is_empty() => String::new(),
+                            Some(_) => serde_json::to_string(&input).map_err(|err| {
+                                format!(
+                                    "Anthropic tool_use {name:?} contains unserializable input: {err}"
+                                )
+                            })?,
+                            None => {
+                                return Err(format!(
+                                    "Anthropic tool_use {name:?} input must be a JSON object"
+                                ));
+                            }
+                        };
+                        self.tool_blocks.insert(
+                            idx,
+                            AnthToolStream {
+                                tool_index: ti,
+                                name: name.to_string(),
+                                arguments: initial_arguments.clone(),
+                                stopped: false,
+                            },
+                        );
                         self.ensure_role(&mut out);
-                        out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}), None));
+                        out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"id":id,"type":"function","function":{"name":name,"arguments":initial_arguments}}]}), None));
                     }
                 }
                 Some("content_block_delta") => {
-                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                     match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
@@ -1983,12 +2328,34 @@ impl AnthSse {
                             }
                         }
                         Some("input_json_delta") => {
-                            if let Some(pj) =
-                                ev.pointer("/delta/partial_json").and_then(|v| v.as_str())
-                            {
-                                let ti = *self.block_tool.get(&idx).unwrap_or(&0);
-                                out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"function":{"arguments": pj}}]}), None));
+                            let idx = ev.get("index").and_then(|v| v.as_i64()).ok_or_else(|| {
+                                "Anthropic input_json_delta is missing a numeric content block index"
+                                    .to_string()
+                            })?;
+                            let pj = ev
+                                .pointer("/delta/partial_json")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Anthropic input_json_delta for index {idx} is missing partial_json"
+                                    )
+                                })?;
+                            let block = self.tool_blocks.get_mut(&idx).ok_or_else(|| {
+                                format!(
+                                    "Anthropic input_json_delta references unknown content block index {idx}"
+                                )
+                            })?;
+                            if block.stopped {
+                                return Err(format!(
+                                    "Anthropic input_json_delta arrived after content_block_stop for index {idx}"
+                                ));
                             }
+                            block.arguments.push_str(pj);
+                            let ti = block.tool_index;
+                            out.extend(self.chunk(
+                                json!({"tool_calls":[{"index":ti,"function":{"arguments": pj}}]}),
+                                None,
+                            ));
                         }
                         _ => {}
                     }
@@ -2019,10 +2386,40 @@ impl AnthSse {
                         }
                     }
                 }
-                _ => {} // ping / content_block_stop / message_stop → emit nothing
+                Some("content_block_stop") => {
+                    if let Some(idx) = ev.get("index").and_then(|v| v.as_i64()) {
+                        if let Some(block) = self.tool_blocks.get(&idx) {
+                            if block.stopped {
+                                return Err(format!(
+                                    "Anthropic content block index {idx} stopped more than once"
+                                ));
+                            }
+                            let arguments = self.validated_tool_arguments(block)?;
+                            let emit_empty_object = block.arguments.trim().is_empty();
+                            let ti = block.tool_index;
+                            if emit_empty_object {
+                                out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"function":{"arguments":arguments}}]}), None));
+                            }
+                        }
+                        if let Some(block) = self.tool_blocks.get_mut(&idx) {
+                            block.stopped = true;
+                        }
+                    }
+                }
+                Some("message_stop") => {
+                    self.message_stop_seen = true;
+                }
+                Some("error") => {
+                    let message = ev
+                        .pointer("/error/message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown Anthropic streaming error");
+                    return Err(format!("Anthropic streaming error: {message}"));
+                }
+                _ => {} // ping / text block stops → emit nothing
             }
         }
-        out
+        Ok(out)
     }
     fn usage(&self) -> serde_json::Value {
         let ot = if self.output_tokens > 0 {
@@ -2041,11 +2438,26 @@ impl AnthSse {
             "total_tokens": self.input_tokens + ot,
         })
     }
-    fn finish(&self) -> Vec<u8> {
+    fn finish(&self) -> Result<Vec<u8>, String> {
+        if !self.buf.iter().all(u8::is_ascii_whitespace) {
+            return Err("Anthropic stream ended with an incomplete SSE frame".to_string());
+        }
+        if !self.message_stop_seen {
+            return Err("Anthropic stream ended before message_stop".to_string());
+        }
+        for block in self.tool_blocks.values() {
+            if !block.stopped {
+                return Err(format!(
+                    "Anthropic stream ended before tool_use {:?} completed",
+                    block.name
+                ));
+            }
+            self.validated_tool_arguments(block)?;
+        }
         let mut out = self.chunk(json!({}), Some(&self.stop_reason));
         out.extend(format!("data: {}\n\n", json!({"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":self.usage()})).into_bytes());
         out.extend_from_slice(b"data: [DONE]\n\n");
-        out
+        Ok(out)
     }
 }
 
@@ -2357,9 +2769,11 @@ pub async fn chat_completions(
     };
     let upstream_body = if anthropic {
         oai_to_anthropic(&body)
+            .map_err(|err| AppError::bad(format!("Anthropic request conversion failed: {err}")))?
     } else {
         serde_json::Value::Null
     };
+    let tool_argument_rules = tool_argument_rules(&body);
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
     //
@@ -2502,11 +2916,23 @@ pub async fn chat_completions(
                                                // usage comes from the converter's accumulated counts.
             let mut tail: Vec<u8> = Vec::new();
             let mut complete = false;
+            let mut client_closed = false;
+            let mut stream_failure: Option<String> = None;
             // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
             let mut conv = if anthropic {
-                Some(AnthSse::new(&req_model))
+                Some(AnthSse::with_tool_argument_rules(
+                    &req_model,
+                    tool_argument_rules.clone(),
+                ))
             } else {
                 None
+            };
+            let mut openai_validator = if anthropic {
+                None
+            } else {
+                Some(OpenAiSseValidator::with_tool_argument_rules(
+                    tool_argument_rules,
+                ))
             };
             // SSE heartbeat: Chinese carrier NATs kill TCP connections idle >30-60s.
             // During model "thinking" the upstream is silent → zero bytes flow to the
@@ -2519,8 +2945,22 @@ pub async fn chat_completions(
                     Ok(Some(Ok(chunk))) => {
                         last_data = tokio::time::Instant::now();
                         let fwd: Vec<u8> = match conv.as_mut() {
-                            Some(c) => c.push(chunk.as_ref()),
-                            None => chunk.to_vec(),
+                            Some(c) => match c.push(chunk.as_ref()) {
+                                Ok(fwd) => fwd,
+                                Err(err) => {
+                                    stream_failure = Some(err);
+                                    break;
+                                }
+                            },
+                            None => {
+                                if let Some(validator) = openai_validator.as_mut() {
+                                    if let Err(err) = validator.push(chunk.as_ref()) {
+                                        stream_failure = Some(err);
+                                        break;
+                                    }
+                                }
+                                chunk.to_vec()
+                            }
                         };
                         if !fwd.is_empty() {
                             if acc.len() < 1_000_000 {
@@ -2534,17 +2974,37 @@ pub async fn chat_completions(
                                 }
                             }
                             if tx.send(Ok(axum::body::Bytes::from(fwd))).await.is_err() {
+                                client_closed = true;
                                 break;
                             }
                         }
                     }
                     Ok(None) => {
-                        complete = true;
+                        if conv.is_some() {
+                            // Anthropic completion is validated by AnthSse::finish below.
+                            complete = true;
+                        } else {
+                            match openai_validator
+                                .as_ref()
+                                .expect("OpenAI validator")
+                                .finish()
+                            {
+                                Ok(()) => complete = true,
+                                Err(err) => stream_failure = Some(err),
+                            }
+                        }
                         break;
                     }
-                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Err(err))) => {
+                        stream_failure = Some(format!("upstream stream read failed: {err}"));
+                        break;
+                    }
                     Err(_elapsed) => {
                         if last_data.elapsed() >= idle {
+                            stream_failure = Some(format!(
+                                "upstream stream stalled for {} seconds",
+                                idle.as_secs()
+                            ));
                             break; // real stall — upstream dead for 180s
                         }
                         // Send SSE heartbeat to keep the client connection alive
@@ -2553,6 +3013,7 @@ pub async fn chat_completions(
                             .await
                             .is_err()
                         {
+                            client_closed = true;
                             break;
                         }
                     }
@@ -2565,11 +3026,24 @@ pub async fn chat_completions(
             // from the request body and accumulated response bytes so calls are never silently free.
             let (usage, is_estimated) = if let Some(c) = conv.as_ref() {
                 if complete {
-                    let fin = c.finish();
-                    if acc.len() < 1_000_000 {
-                        acc.extend_from_slice(&fin);
+                    match c.finish() {
+                        Ok(fin) => {
+                            if acc.len() < 1_000_000 {
+                                acc.extend_from_slice(&fin);
+                            }
+                            if tx.send(Ok(axum::body::Bytes::from(fin))).await.is_err() {
+                                client_closed = true;
+                            }
+                        }
+                        Err(err) => {
+                            complete = false;
+                            stream_failure = Some(err);
+                        }
                     }
-                    let _ = tx.send(Ok(axum::body::Bytes::from(fin))).await;
+                } else if stream_failure.is_none() && !client_closed {
+                    stream_failure = Some(
+                        "Anthropic upstream stream ended before protocol completion".to_string(),
+                    );
                 }
                 (c.usage(), false)
             } else {
@@ -2588,6 +3062,18 @@ pub async fn chat_completions(
                     None => (json!({}), false), // truly empty response, bill 0
                 }
             };
+            if let Some(err) = stream_failure.take() {
+                complete = false;
+                if !client_closed {
+                    tracing::warn!(model = %req_model, error = %err, "upstream model stream failed protocol validation");
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            err,
+                        )))
+                        .await;
+                }
+            }
             let cost = resolve_cost(
                 &bmode,
                 percall,
@@ -3227,7 +3713,8 @@ mod billing_tests {
     use super::{
         anthropic_thinking, anthropic_to_oai, compute_cost, is_image_gen_model,
         model_price_override, oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost,
-        AnthSse,
+        tool_argument_rules, validate_openai_sse_eof, validate_openai_sse_with_rules, AnthSse,
+        OpenAiSseValidator,
     };
     use serde_json::json;
 
@@ -3578,7 +4065,7 @@ mod billing_tests {
             ],
             "tools": [{"type": "function", "function": {"name": "read_file", "description": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
         });
-        let a = oai_to_anthropic(&body);
+        let a = oai_to_anthropic(&body).unwrap();
         assert_eq!(a["system"], json!("You are helpful.")); // system hoisted out of messages
         assert_eq!(a["max_tokens"], json!(100)); // haiku (fast tier) → no thinking bump
         assert!(
@@ -3600,6 +4087,29 @@ mod billing_tests {
     }
 
     #[test]
+    fn oai_to_anthropic_rejects_malformed_historical_tool_arguments() {
+        let error = oai_to_anthropic(&json!({
+            "model": "claude-sonnet-5",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"server/index.js\",\"content\":"
+                    }
+                }]
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("write_file"));
+        assert!(error.contains("call_write_1"));
+        assert!(error.contains("malformed"));
+    }
+
+    #[test]
     fn oai_to_anthropic_enables_adaptive_thinking_and_drops_temp() {
         // Opus 4.x + reasoning_effort → adaptive thinking on; temperature/top_p dropped;
         // max_tokens gets headroom; the chosen depth is honored via output_config.effort.
@@ -3608,7 +4118,7 @@ mod billing_tests {
             "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let a = oai_to_anthropic(&body);
+        let a = oai_to_anthropic(&body).unwrap();
         assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         assert_eq!(a["output_config"], json!({"effort":"high"}));
         assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra adaptive-thinking headroom
@@ -3625,14 +4135,16 @@ mod billing_tests {
         assert_eq!(
             oai_to_anthropic(
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
-            )["thinking"],
+            )
+            .unwrap()["thinking"],
             json!({"type":"adaptive"})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking; temp passes through.
         let off = oai_to_anthropic(&json!({
             "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"messages":[]
-        }));
+        }))
+        .unwrap();
         assert!(off.get("thinking").is_none());
         assert_eq!(off["max_tokens"], json!(4096));
         assert_eq!(off["temperature"], json!(0.5));
@@ -3647,7 +4159,8 @@ mod billing_tests {
             "reasoning_effort": "max",
             "thinking": {"type": "enabled", "budget_tokens": 32000},
             "messages": [{"role": "user", "content": "hi"}]
-        }));
+        }))
+        .unwrap();
         assert_eq!(
             a["thinking"]["type"], "adaptive",
             "4.8 must use adaptive, not budget_tokens"
@@ -3665,7 +4178,8 @@ mod billing_tests {
             "reasoning_effort": "high",
             "thinking": {"type": "enabled", "budget_tokens": 16000},
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert_eq!(s5["thinking"]["type"], "adaptive");
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
@@ -3673,7 +4187,8 @@ mod billing_tests {
             "model": "claude-3-7-sonnet-20250219",
             "reasoning_effort": "high",
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert_eq!(b["thinking"]["type"], "enabled");
         assert!(b["thinking"]["budget_tokens"].as_i64().unwrap() > 0);
         assert!(b["max_tokens"].as_i64().unwrap() >= 32000);
@@ -3683,7 +4198,8 @@ mod billing_tests {
             "model": "claude-haiku-4-5",
             "reasoning_effort": "high",
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert!(
             h.get("thinking").is_none(),
             "haiku should not have thinking"
@@ -3747,13 +4263,21 @@ mod billing_tests {
         // Event shapes copied verbatim from a real zyz streaming response (tool call).
         let mut c = AnthSse::new("claude-opus-4-8");
         let mut out: Vec<u8> = Vec::new();
-        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n"));
-        out.extend(c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
-        out.extend(c.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"get_time\",\"input\":{}}}\n\n"));
-        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\": \\\"As\"}}\n\n"));
-        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ia/Tokyo\\\"}\"}}\n\n"));
-        out.extend(c.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":18,\"input_tokens\":15,\"cache_read_input_tokens\":46}}\n\n"));
-        out.extend(c.finish());
+        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n").unwrap());
+        out.extend(
+            c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+                .unwrap(),
+        );
+        out.extend(c.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"get_time\",\"input\":{}}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\": \\\"As\"}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ia/Tokyo\\\"}\"}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
+        out.extend(c.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":18,\"input_tokens\":15,\"cache_read_input_tokens\":46}}\n\n").unwrap());
+        out.extend(
+            c.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .unwrap(),
+        );
+        out.extend(c.finish().unwrap());
         // Parse the emitted OpenAI SSE back (no key-order assumptions).
         let s = String::from_utf8(out).unwrap();
         let (mut role, mut id, mut name, mut args, mut finish, mut done, mut idx) = (
@@ -3814,6 +4338,141 @@ mod billing_tests {
         assert_eq!(u["input_tokens"], 15);
         assert_eq!(u["output_tokens"], 18);
         assert_eq!(u["cache_read_input_tokens"], 46);
+    }
+
+    #[test]
+    fn anth_sse_preserves_non_empty_tool_input_from_block_start() {
+        let required = std::collections::HashMap::from([(
+            "write_file".to_string(),
+            vec!["path".to_string(), "content".to_string()],
+        )]);
+        let mut c = AnthSse::with_required_tool_args("claude-sonnet-5", required);
+        let mut out = c
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"write_1\",\"name\":\"write_file\",\"input\":{\"path\":\"server/index.js\",\"content\":\"module.exports = {};\"}}}\n\n")
+            .unwrap();
+        out.extend(
+            c.push(b"data: {\"type\":\"content_block_stop\",\"index\":2}\n\n")
+                .unwrap(),
+        );
+        out.extend(
+            c.push(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            )
+            .unwrap(),
+        );
+        out.extend(c.push(b"data: {\"type\":\"message_stop\"}\n\n").unwrap());
+        out.extend(c.finish().unwrap());
+
+        let mut arguments = String::new();
+        for line in String::from_utf8(out).unwrap().lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_str(data).unwrap();
+            if let Some(fragment) =
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            {
+                arguments.push_str(fragment);
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(parsed["path"], "server/index.js");
+        assert_eq!(parsed["content"], "module.exports = {};");
+    }
+
+    #[test]
+    fn anth_sse_rejects_unknown_tool_delta_index() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        let error = c
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":7,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n")
+            .unwrap_err();
+        assert!(error.contains("unknown content block index 7"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_clean_eof_without_message_stop() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        c.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        )
+        .unwrap();
+        c.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+            .unwrap();
+        let error = c.finish().unwrap_err();
+        assert!(error.contains("before message_stop"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_incomplete_or_missing_required_tool_arguments() {
+        let required = std::collections::HashMap::from([(
+            "write_file".to_string(),
+            vec!["path".to_string(), "content".to_string()],
+        )]);
+        let mut incomplete = AnthSse::with_required_tool_args("claude-sonnet-5", required.clone());
+        incomplete
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"write_file\",\"input\":{}}}\n\n")
+            .unwrap();
+        incomplete
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"server/index.js\\\"\"}}\n\n")
+            .unwrap();
+        let error = incomplete
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("incomplete arguments JSON"));
+
+        let mut missing = AnthSse::with_required_tool_args("claude-sonnet-5", required);
+        missing
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w2\",\"name\":\"write_file\",\"input\":{}}}\n\n")
+            .unwrap();
+        let error = missing
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("missing required arguments: path, content"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_empty_schema_constrained_tool_arguments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let mut stream =
+            AnthSse::with_tool_argument_rules("claude-sonnet-5", tool_argument_rules(&body));
+        stream
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w3\",\"name\":\"write_file\",\"input\":{\"path\":\"src/a.js\",\"content\":\"\"}}}\n\n")
+            .unwrap();
+        let error = stream
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("argument \"content\" is shorter than minLength 1"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_invalid_utf8_even_when_message_stop_follows() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        let mut bytes = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        let error = c.push(&bytes).unwrap_err();
+
+        assert!(error.contains("invalid UTF-8"));
+        assert!(c.finish().is_err());
     }
 
     // The official catalog must cover every token model live on the gateway, matched by
@@ -3966,6 +4625,138 @@ mod billing_tests {
         );
     }
 
+    #[test]
+    fn openai_sse_clean_eof_without_done_is_incomplete() {
+        let partial = b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n";
+        let error = validate_openai_sse_eof(partial).unwrap_err();
+        assert!(error.contains("without terminal data: [DONE]"));
+
+        // A marker mentioned inside JSON content is not an SSE terminal event.
+        let embedded = b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n";
+        assert!(validate_openai_sse_eof(embedded).is_err());
+    }
+
+    #[test]
+    fn openai_sse_done_line_marks_clean_eof_complete() {
+        let complete = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n\
+                         data:[DONE]\r\n\r\n";
+        assert_eq!(validate_openai_sse_eof(complete), Ok(()));
+    }
+
+    #[test]
+    fn openai_sse_rejects_malformed_json_before_done() {
+        let stream = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                       data: {malformed\n\n\
+                       data: [DONE]\n\n";
+
+        let error = validate_openai_sse_eof(stream).unwrap_err();
+
+        assert!(error.contains("malformed JSON"));
+    }
+
+    #[test]
+    fn openai_sse_rejects_incomplete_missing_and_empty_required_tool_arguments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let rules = tool_argument_rules(&body);
+
+        let incomplete = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(incomplete, rules.clone()).unwrap_err();
+        assert!(error.contains("incomplete arguments JSON"));
+
+        let missing = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(missing, rules.clone()).unwrap_err();
+        assert!(error.contains("missing required arguments: content"));
+
+        let empty = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\\\"\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(empty, rules).unwrap_err();
+        assert!(error.contains("argument \"content\" is shorter than minLength 1"));
+    }
+
+    #[test]
+    fn openai_sse_rejects_terminal_event_before_incomplete_tool_call_can_complete() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let mut validator =
+            OpenAiSseValidator::with_tool_argument_rules(tool_argument_rules(&body));
+        validator
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\"}}]}}]}\n\n")
+            .unwrap();
+
+        // The streaming caller validates a chunk before forwarding it, so this
+        // error keeps [DONE] from reaching the client or being cached as success.
+        let error = validator.push(b"data: [DONE]\n\n").unwrap_err();
+
+        assert!(error.contains("incomplete arguments JSON"));
+        assert!(!validator.done_seen);
+    }
+
+    #[test]
+    fn openai_sse_accumulates_complete_tool_argument_fragments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let stream = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\":\\\"ok\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+
+        assert_eq!(
+            validate_openai_sse_with_rules(stream, tool_argument_rules(&body)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn openai_sse_rejects_invalid_utf8_before_done() {
+        let mut stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        stream.push(0xff);
+        stream.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+
+        let error = validate_openai_sse_eof(&stream).unwrap_err();
+
+        assert!(error.contains("invalid UTF-8"));
+    }
+
     // A stream that never reported usage → None → caller bills 0.
     #[test]
     fn sse_no_usage() {
@@ -4078,7 +4869,7 @@ mod estimation_tests {
         let bytes = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world, this is a test response with some content.\"}}\n";
-        c.push(bytes);
+        c.push(bytes).unwrap();
         let u = c.usage();
         assert_eq!(u["input_tokens"], 1000);
         // output_tokens should be estimated from out_bytes since message_delta never arrived

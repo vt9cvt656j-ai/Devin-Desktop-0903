@@ -1,7 +1,9 @@
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
+use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
 /// Maximum size of a file we will load into the editor (5 MiB).
@@ -13,6 +15,8 @@ const SEARCH_MAX_FILE: u64 = 2 * 1024 * 1024;
 const SEARCH_MAX_RESULTS: usize = 2000;
 /// Cap on matches reported per file so one file can't drown the results.
 const SEARCH_MAX_PER_FILE: usize = 50;
+/// Bound directory walks even when a query has no matches.
+const SEARCH_MAX_SCANNED_FILES: usize = 20_000;
 /// Display lines are truncated to this many characters in search results.
 const SEARCH_MAX_LINE_CHARS: usize = 500;
 
@@ -40,6 +44,194 @@ static ALLOWED_ROOTS: Lazy<Mutex<Vec<PathBuf>>> = Lazy::new(|| Mutex::new(Vec::n
 /// agent runs cannot both validate the same old version and silently overwrite
 /// one another.
 static FILE_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// Stage complete, durable contents beside `path`. Callers publish the staged
+/// inode with either replace or no-clobber semantics, then remove its temp name.
+fn stage_text_file(
+    path: &Path,
+    content: &str,
+    permissions: Option<std::fs::Permissions>,
+) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("cannot determine parent directory for '{}'", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create parent directory '{}': {e}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid file path '{}'", path.display()))?
+        .to_string_lossy();
+
+    let mut staged = None;
+    let mut last_error = None;
+    for _ in 0..8 {
+        let candidate = parent.join(format!(
+            ".{file_name}.michael-write-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                staged = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot stage write for '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let (temporary_path, mut temporary_file) = staged.ok_or_else(|| {
+        format!(
+            "cannot allocate a temporary file for '{}': {}",
+            path.display(),
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "temporary-name collision".into())
+        )
+    })?;
+
+    let stage_result = (|| -> Result<(), String> {
+        temporary_file
+            .write_all(content.as_bytes())
+            .map_err(|e| format!("cannot write staged contents for '{}': {e}", path.display()))?;
+        temporary_file
+            .flush()
+            .map_err(|e| format!("cannot flush staged write for '{}': {e}", path.display()))?;
+        if let Some(permissions) = permissions {
+            temporary_file.set_permissions(permissions).map_err(|e| {
+                format!("cannot preserve permissions for '{}': {e}", path.display())
+            })?;
+        }
+        temporary_file
+            .sync_all()
+            .map_err(|e| format!("cannot sync staged write for '{}': {e}", path.display()))
+    })();
+    drop(temporary_file);
+
+    if let Err(error) = stage_result {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(temporary_path)
+}
+
+fn sync_parent_directory(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
+/// Replace `path` only after the complete new contents have been staged and
+/// synced in the same directory. Keeping the temporary file beside the target
+/// makes the final rename atomic on the target filesystem, so an interrupted or
+/// failed write cannot leave the original file truncated or partially written.
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    let original_permissions = std::fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+    let temporary_path = stage_text_file(path, content, original_permissions)?;
+    if let Err(error) = atomic_replace_file(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(format!(
+            "cannot atomically replace '{}': {error}",
+            path.display()
+        ));
+    }
+
+    // The staged file itself is already durable. Syncing the directory also
+    // persists the rename on filesystems that support directory fsync; failure
+    // here is deliberately best-effort because the replacement has committed.
+    sync_parent_directory(path);
+    Ok(())
+}
+
+/// Publish a fully staged file only if `path` still does not exist. A hard link
+/// is an atomic no-clobber operation on the same filesystem: either the complete
+/// staged inode appears at `path`, or an independently-created target wins and
+/// remains untouched.
+fn atomic_create_text(path: &Path, content: &str) -> Result<(), String> {
+    let temporary_path = stage_text_file(path, content, None)?;
+    if let Err(error) = std::fs::hard_link(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err("[CONFLICT] file was created by another task".into());
+        }
+        return Err(format!(
+            "cannot atomically create '{}': {error}",
+            path.display()
+        ));
+    }
+
+    let cleanup = std::fs::remove_file(&temporary_path).map_err(|error| {
+        format!(
+            "file was created at '{}' but its staged link '{}' could not be removed: {error}",
+            path.display(),
+            temporary_path.display()
+        )
+    });
+    sync_parent_directory(path);
+    cleanup
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let from_wide = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to_wide = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Pre-register the user's HOME directory so files are accessible before any
 /// folder is explicitly opened.  Called from `lib.rs` during app setup.
@@ -103,21 +295,22 @@ const SAFE_PREFIXES: &[&str] = &[
     "/private/var/folders",
 ];
 
+fn has_safe_prefix(path: &Path) -> bool {
+    SAFE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(Path::new(prefix)))
+}
+
+fn is_within_allowed_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
 /// Verify `target` is inside an allowed workspace root.  Resolves symlinks and
 /// normalises components so that `../../etc/passwd` tricks are caught even when
 /// intermediate directories exist.
 fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
     let target_path = Path::new(target);
     let raw_target = target.to_string();
-
-    // Fast-path: always allow temp / safe system directories before canonicalize.
-    for prefix in SAFE_PREFIXES {
-        if raw_target.starts_with(prefix) {
-            let resolved =
-                std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
-            return Ok(resolved);
-        }
-    }
 
     // For paths that don't exist yet (create_file, create_dir), resolve the
     // deepest existing ancestor and append the remaining components.
@@ -157,10 +350,8 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
     let resolved_str = resolved.to_string_lossy().to_string();
 
     // Post-canonicalize safe-prefix check (handles firmlinks like /tmp → /private/tmp).
-    for prefix in SAFE_PREFIXES {
-        if resolved_str.starts_with(prefix) {
-            return Ok(resolved);
-        }
+    if has_safe_prefix(&resolved) {
+        return Ok(resolved);
     }
 
     let roots = ALLOWED_ROOTS.lock().map_err(|e| e.to_string())?;
@@ -168,31 +359,16 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
         return Ok(resolved);
     }
 
-    // Component-boundary containment: "/a/b" must NOT match sibling "/a/bcd".
-    // `Path::starts_with` already does this; the string forms add a trailing-'/'
-    // (or exact-equal) check so a shared name prefix can't widen access.
-    let within = |prefix: &str, candidate: &str| -> bool {
-        candidate == prefix || candidate.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
-    };
-
-    for root in roots.iter() {
-        let root_str = root.to_string_lossy().to_string();
-        if resolved.starts_with(root)
-            || within(&root_str, &resolved_str)
-            || within(&root_str, &raw_target)
-        {
-            return Ok(resolved);
-        }
+    // Compare only canonicalized paths. Checking the raw user-supplied path here
+    // would let a symlink inside a workspace authorize its target outside it.
+    if is_within_allowed_root(&resolved, &roots) {
+        return Ok(resolved);
     }
 
     // Always allow paths under HOME regardless of what roots are registered.
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if within(&home, &resolved_str) || within(&home, &raw_target) {
-            return Ok(resolved);
-        }
         if let Ok(home_canonical) = std::fs::canonicalize(&home) {
-            let hc = home_canonical.to_string_lossy().to_string();
-            if within(&hc, &resolved_str) || within(&hc, &raw_target) {
+            if resolved.starts_with(home_canonical) {
                 return Ok(resolved);
             }
         }
@@ -246,8 +422,9 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 /// the editor never tries to render garbage.
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
-    require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let resolved = require_inside_workspace(&path)?;
+    let meta =
+        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
     if meta.is_dir() {
         return Err(format!(
             "'{}' is a directory, not a file. Use read_dir to list its contents.",
@@ -257,11 +434,12 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("cannot read '{}': {}", path, e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot open a binary file in the editor".into());
     }
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    String::from_utf8(bytes)
+        .map_err(|_| format!("cannot open '{}': file is not valid UTF-8 text", path))
 }
 
 /// Read any (binary) file as a `data:<mime>;base64,...` URL. Used to render images in the
@@ -422,22 +600,15 @@ fn strip_xml(xml: &str) -> String {
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&path)?;
-    // Create parent dirs ourselves so callers don't have to shell out to
-    // `mkdir -p` (which the agent frontend did, interpolating model-controlled
-    // paths straight into a shell command).
-    if let Some(parent) = Path::new(&path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-    }
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    let resolved = require_inside_workspace(&path)?;
+    atomic_write_text(&resolved, &content)
 }
 
 /// Write only if the file still has the exact version the caller read. `None`
-/// means the caller observed no file and therefore requires an atomic create.
-/// Every normal IDE text write shares FILE_MUTATION_LOCK, making this comparison
-/// and write one critical section across editor saves and concurrent agent runs.
+/// means the caller observed no file and therefore uses a filesystem-level
+/// atomic no-clobber create. Existing-file compare-and-replace is serialized
+/// across IDE writers by FILE_MUTATION_LOCK; external processes do not share
+/// that lock and can still race in the small interval after the comparison.
 #[tauri::command]
 pub fn write_text_file_if_unchanged(
     path: String,
@@ -446,33 +617,25 @@ pub fn write_text_file_if_unchanged(
 ) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     let resolved = require_inside_workspace(&path)?;
-    let exists = resolved.exists();
     match expected_content {
         Some(expected) => {
-            if !exists {
+            if !resolved.exists() {
                 return Err("[CONFLICT] file was deleted after it was read".into());
             }
             let current = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
             if current != expected {
                 return Err("[CONFLICT] file changed after it was read".into());
             }
+            atomic_write_text(&resolved, &content)
         }
-        None if exists => {
-            return Err("[CONFLICT] file was created by another task".into());
-        }
-        None => {}
+        None => atomic_create_text(&resolved, &content),
     }
-    if let Some(parent) = resolved.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-    }
-    std::fs::write(resolved, content).map_err(|e| e.to_string())
 }
 
 /// Delete a text file only if it still contains the version the caller last
 /// wrote. This is the deletion counterpart to `write_text_file_if_unchanged`
-/// and keeps Undo/revert from removing a user's newer edit.
+/// and keeps Undo/revert from removing a newer IDE edit. External processes do
+/// not share FILE_MUTATION_LOCK and can still race after the content comparison.
 #[tauri::command]
 pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
@@ -513,15 +676,8 @@ pub fn home_dir() -> Option<String> {
 #[tauri::command]
 pub fn create_file(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&path)?;
-    let p = Path::new(&path);
-    if p.exists() {
-        return Err("a file or folder with that name already exists".into());
-    }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(p, b"").map_err(|e| e.to_string())
+    let resolved = require_inside_workspace(&path)?;
+    atomic_create_text(&resolved, "")
 }
 
 /// Create a new directory (including any missing parents).
@@ -634,171 +790,221 @@ pub struct FileMatches {
     matches: Vec<SearchMatch>,
 }
 
-fn find_matches_in_line(
-    line: &str,
-    needle: &str,
+fn build_search_matcher(
+    query: &str,
     case_sensitive: bool,
-) -> Vec<(usize, usize, usize)> {
-    // `needle` is already lowercased by the caller when !case_sensitive.
-    let mut out = Vec::new();
-    if needle.is_empty() {
-        return out;
+    mode: Option<&str>,
+) -> Result<Regex, String> {
+    if query.is_empty() {
+        return Err("[INVALID_SEARCH_QUERY] search query cannot be empty".into());
     }
-    if case_sensitive {
-        let mut from = 0usize;
-        while let Some(rel) = line[from..].find(needle) {
-            let byte_start = from + rel;
-            let col0 = line[..byte_start].chars().count();
-            out.push((col0, col0, col0 + needle.chars().count()));
-            from = byte_start + needle.len();
-            if from >= line.len() {
-                break;
-            }
+
+    let pattern = match mode
+        .unwrap_or("literal")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "literal" => regex::escape(query),
+        "regex" => query.to_string(),
+        other => {
+            return Err(format!(
+                "[INVALID_SEARCH_MODE] unsupported search mode '{other}'; expected 'literal' or 'regex'"
+            ));
         }
-    } else {
-        // Walk the ORIGINAL line so the returned char offsets index the displayed
-        // text — correct even when case folding changes byte/char length (e.g.
-        // 'İ'). The previous code computed offsets on the lowercased copy.
-        let mut i = 0usize;
-        while i < line.len() {
-            if let Some(consumed) = ci_prefix_len(&line[i..], needle) {
-                if consumed > 0 {
-                    let col0 = line[..i].chars().count();
-                    let col_end = line[..i + consumed].chars().count();
-                    out.push((col0, col0, col_end));
-                    i += consumed;
-                    continue;
-                }
-            }
-            i += line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        }
-    }
-    out
+    };
+
+    RegexBuilder::new(&pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|error| format!("[INVALID_SEARCH_PATTERN] invalid regex: {error}"))
 }
 
-/// Recursively search the project tree under `root` for `query`.
+fn find_matches_in_line<'a>(
+    line: &'a str,
+    matcher: &'a Regex,
+) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+    matcher.find_iter(line).map(|matched| {
+        let start = line[..matched.start()].chars().count();
+        let end = line[..matched.end()].chars().count();
+        (start, start, end)
+    })
+}
+
+struct ProjectSearch {
+    files: Vec<FileMatches>,
+    scanned_files: usize,
+}
+
+fn search_project_scope(
+    root: &str,
+    query: &str,
+    case_sensitive: bool,
+    mode: Option<&str>,
+) -> Result<ProjectSearch, String> {
+    let matcher = build_search_matcher(query, case_sensitive, mode)?;
+
+    // Keep the search confined to a registered workspace root and validate the
+    // resolved scope before traversal. `read_dir` on a file and `os.walk` on a
+    // missing path previously looked exactly like a legitimate no-match result.
+    let root_path = require_inside_workspace(root)?;
+    let root_meta = std::fs::symlink_metadata(&root_path).map_err(|error| {
+        format!(
+            "[INVALID_SEARCH_SCOPE] cannot inspect search scope '{}': {error}",
+            root_path.display()
+        )
+    })?;
+    if !root_meta.is_dir() && !root_meta.is_file() {
+        return Err(format!(
+            "[INVALID_SEARCH_SCOPE] search scope '{}' is neither a file nor a directory",
+            root_path.display()
+        ));
+    }
+
+    let root_is_file = root_meta.is_file();
+    let relative_base = if root_is_file {
+        root_path.parent().unwrap_or(&root_path)
+    } else {
+        &root_path
+    };
+    let mut results: Vec<FileMatches> = Vec::new();
+    let mut total = 0usize;
+    let mut scanned_files = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root_path.clone()];
+
+    while let Some(path) = stack.pop() {
+        if total >= SEARCH_MAX_RESULTS || scanned_files >= SEARCH_MAX_SCANNED_FILES {
+            break;
+        }
+
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if md.file_type().is_symlink() {
+            continue;
+        }
+        if md.is_dir() {
+            if path != root_path
+                && path
+                    .file_name()
+                    .is_some_and(|name| IGNORED_DIRS.contains(&name.to_string_lossy().as_ref()))
+            {
+                continue;
+            }
+            let rd = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            let mut children: Vec<PathBuf> = rd.flatten().map(|entry| entry.path()).collect();
+            children.sort_by(|a, b| b.cmp(a));
+            for child in children {
+                let Some(name) = child.file_name().map(|name| name.to_string_lossy()) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                stack.push(child);
+            }
+            continue;
+        }
+        if !md.is_file() || md.len() > SEARCH_MAX_FILE {
+            continue;
+        }
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if bytes.iter().take(8000).any(|&byte| byte == 0) {
+            continue;
+        }
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        scanned_files += 1;
+
+        let mut file_matches: Vec<SearchMatch> = Vec::new();
+        for (line_index, line) in content.lines().enumerate() {
+            if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
+                break;
+            }
+            let mut hits = find_matches_in_line(line, &matcher).peekable();
+            if hits.peek().is_none() {
+                continue;
+            }
+            let display = if line.chars().count() > SEARCH_MAX_LINE_CHARS {
+                let mut truncated: String = line.chars().take(SEARCH_MAX_LINE_CHARS).collect();
+                truncated.push('\u{2026}');
+                truncated
+            } else {
+                line.to_string()
+            };
+            for (column, start, end) in hits {
+                if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
+                    break;
+                }
+                file_matches.push(SearchMatch {
+                    line: line_index + 1,
+                    column: column + 1,
+                    text: display.clone(),
+                    start,
+                    end,
+                });
+                total += 1;
+            }
+        }
+
+        if !file_matches.is_empty() {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let rel = path
+                .strip_prefix(relative_base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            results.push(FileMatches {
+                path: path.to_string_lossy().to_string(),
+                name,
+                rel,
+                matches: file_matches,
+            });
+        }
+    }
+
+    if scanned_files == 0 {
+        return Err(format!(
+            "[NO_SEARCHABLE_FILES] search scope '{}' contained no readable UTF-8 text files",
+            root_path.display()
+        ));
+    }
+
+    results.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(ProjectSearch {
+        files: results,
+        scanned_files,
+    })
+}
+
+/// Search one file, or recursively search a directory, for `query`.
 ///
-/// Skips dot-entries, common build/dependency directories, oversized files,
-/// and binary files. Results are capped to keep responses bounded.
+/// `mode` defaults to literal matching for compatibility and accepts `regex`
+/// explicitly. Dot-entries, common build/dependency directories, oversized
+/// files, and binary files are skipped. Results and traversal are bounded.
 #[tauri::command]
 pub fn search_in_project(
     root: String,
     query: String,
     case_sensitive: bool,
+    mode: Option<String>,
 ) -> Result<Vec<FileMatches>, String> {
-    let needle = if case_sensitive {
-        query.clone()
-    } else {
-        query.to_lowercase()
-    };
-    if needle.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Keep the search confined to a registered workspace root.
-    let root_path = require_inside_workspace(&root)?;
-    let mut results: Vec<FileMatches> = Vec::new();
-    let mut total = 0usize;
-    let mut stack: Vec<PathBuf> = vec![root_path.clone()];
-
-    while let Some(dir) = stack.pop() {
-        if total >= SEARCH_MAX_RESULTS {
-            break;
-        }
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let mut children: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-        children.sort();
-        for path in children {
-            let name = match path.file_name() {
-                Some(n) => n.to_string_lossy().to_string(),
-                None => continue,
-            };
-            if name.starts_with('.') {
-                continue;
-            }
-            // Never FOLLOW symlinks/junctions: on Windows a junction can point at an
-            // ancestor and is_dir()/metadata() (which follow the link) would loop forever
-            // → hang. symlink_metadata() describes the entry itself; is_symlink() is true
-            // for Windows reparse points (symlinks + junctions/mount points), so skip them.
-            let md = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if md.file_type().is_symlink() {
-                continue;
-            }
-            if md.is_dir() {
-                if !IGNORED_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if total >= SEARCH_MAX_RESULTS {
-                break;
-            }
-            if md.len() > SEARCH_MAX_FILE {
-                continue;
-            }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if bytes.iter().take(8000).any(|&b| b == 0) {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            let mut file_matches: Vec<SearchMatch> = Vec::new();
-            for (i, line) in content.lines().enumerate() {
-                if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
-                    break;
-                }
-                let hits = find_matches_in_line(line, &needle, case_sensitive);
-                if hits.is_empty() {
-                    continue;
-                }
-                let mut chars = line.chars();
-                let display: String = if line.chars().count() > SEARCH_MAX_LINE_CHARS {
-                    let mut s: String = chars.by_ref().take(SEARCH_MAX_LINE_CHARS).collect();
-                    s.push('\u{2026}');
-                    s
-                } else {
-                    line.to_string()
-                };
-                for (col0, start, end) in hits {
-                    if file_matches.len() >= SEARCH_MAX_PER_FILE || total >= SEARCH_MAX_RESULTS {
-                        break;
-                    }
-                    file_matches.push(SearchMatch {
-                        line: i + 1,
-                        column: col0 + 1,
-                        text: display.clone(),
-                        start,
-                        end,
-                    });
-                    total += 1;
-                }
-            }
-            if !file_matches.is_empty() {
-                let rel = path
-                    .strip_prefix(&root_path)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                results.push(FileMatches {
-                    path: path.to_string_lossy().to_string(),
-                    name,
-                    rel,
-                    matches: file_matches,
-                });
-            }
-        }
-    }
-
-    results.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(results)
+    let search = search_project_scope(&root, &query, case_sensitive, mode.as_deref())?;
+    debug_assert!(search.scanned_files > 0);
+    Ok(search.files)
 }
 
 #[derive(Serialize)]
@@ -967,6 +1173,7 @@ pub fn replace_in_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
     fn temp_file(name: &str) -> PathBuf {
@@ -978,6 +1185,284 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn staged_files_for(path: &Path) -> Vec<PathBuf> {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        let prefix = format!(
+            ".{}.michael-write-",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn safe_prefixes_require_a_path_component_boundary() {
+        assert!(has_safe_prefix(Path::new("/tmp/project/file.txt")));
+        assert!(has_safe_prefix(Path::new(
+            "/private/var/folders/session/file.txt"
+        )));
+        assert!(!has_safe_prefix(Path::new("/tmp-evil/file.txt")));
+        assert!(!has_safe_prefix(Path::new("/tmpfoo/file.txt")));
+        assert!(!has_safe_prefix(Path::new(
+            "/private/var/folders_evil/file.txt"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_prefix_check_happens_after_parent_components_are_resolved() {
+        let escaped = std::fs::canonicalize("/tmp/../etc").unwrap();
+
+        assert!(!has_safe_prefix(&escaped));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_root_check_rejects_a_symlink_target_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_file("symlink-root-check");
+        let root = parent.join("workspace");
+        let outside = parent.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let escaped = std::fs::canonicalize(root.join("escape/secret.txt")).unwrap();
+
+        assert!(!is_within_allowed_root(&escaped, &[canonical_root]));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn text_read_rejects_invalid_utf8_without_changing_the_file() {
+        let path = temp_file("invalid-utf8");
+        let original = [b'v', b'a', b'l', 0x80, b'e'];
+        std::fs::write(&path, original).unwrap();
+
+        let error = read_text_file(path.to_string_lossy().into_owned()).unwrap_err();
+
+        assert!(error.contains("not valid UTF-8"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomic_create_paths_never_clobber_an_existing_target() {
+        let path = temp_file("existing-create-target");
+        std::fs::write(&path, "keep me").unwrap();
+
+        let create_error = create_file(path.to_string_lossy().into_owned()).unwrap_err();
+        assert!(create_error.contains("[CONFLICT]"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        assert!(staged_files_for(&path).is_empty());
+
+        let conditional_error = write_text_file_if_unchanged(
+            path.to_string_lossy().into_owned(),
+            None,
+            "replacement".into(),
+        )
+        .unwrap_err();
+        assert!(conditional_error.contains("[CONFLICT]"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        assert!(staged_files_for(&path).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomic_create_commands_publish_complete_new_files() {
+        let empty_path = temp_file("create-empty-file");
+        create_file(empty_path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(std::fs::read(&empty_path).unwrap(), b"");
+        assert!(staged_files_for(&empty_path).is_empty());
+
+        let content_path = temp_file("conditional-create-file");
+        write_text_file_if_unchanged(
+            content_path.to_string_lossy().into_owned(),
+            None,
+            "complete contents".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&content_path).unwrap(),
+            "complete contents"
+        );
+        assert!(staged_files_for(&content_path).is_empty());
+
+        let _ = std::fs::remove_file(empty_path);
+        let _ = std::fs::remove_file(content_path);
+    }
+
+    #[test]
+    fn concurrent_atomic_creates_publish_one_complete_winner() {
+        let path = temp_file("concurrent-atomic-create");
+        let first = "a".repeat(2 * 1024 * 1024);
+        let second = "b".repeat(2 * 1024 * 1024);
+        let barrier = Arc::new(Barrier::new(4));
+
+        let mut writers = Vec::new();
+        for content in [first.clone(), second.clone()] {
+            let writer_path = path.clone();
+            let writer_barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                writer_barrier.wait();
+                atomic_create_text(&writer_path, &content)
+            }));
+        }
+
+        let reader_path = path.clone();
+        let reader_barrier = Arc::clone(&barrier);
+        let expected_first = first.clone();
+        let expected_second = second.clone();
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            loop {
+                match std::fs::read_to_string(&reader_path) {
+                    Ok(observed) => {
+                        assert!(observed == expected_first || observed == expected_second);
+                        return observed;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("cannot observe atomic create: {error}"),
+                }
+            }
+        });
+
+        barrier.wait();
+        let results = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        let observed = reader.join().unwrap();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), observed);
+        assert!(staged_files_for(&path).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unconditional_write_allows_intentional_empty_content() {
+        let path = temp_file("empty-write");
+        std::fs::write(&path, "previous contents").unwrap();
+
+        write_text_file(path.to_string_lossy().into_owned(), String::new()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(staged_files_for(&path).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomic_write_never_exposes_truncated_or_partial_content() {
+        let path = temp_file("atomic-visibility");
+        let first = "a".repeat(2 * 1024 * 1024);
+        let second = "b".repeat(2 * 1024 * 1024);
+        std::fs::write(&path, &first).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Barrier::new(2));
+        let reader_done = Arc::clone(&done);
+        let reader_started = Arc::clone(&started);
+        let reader_path = path.clone();
+        let reader_first = first.clone();
+        let reader_second = second.clone();
+        let reader = std::thread::spawn(move || {
+            let initial = std::fs::read_to_string(&reader_path).unwrap();
+            assert_eq!(initial, reader_first);
+            let mut observations = 1;
+            reader_started.wait();
+            while !reader_done.load(Ordering::Acquire) {
+                let observed = std::fs::read_to_string(&reader_path).unwrap();
+                assert!(observed == reader_first || observed == reader_second);
+                observations += 1;
+            }
+            observations
+        });
+
+        started.wait();
+        for index in 0..6 {
+            let content = if index % 2 == 0 { &second } else { &first };
+            write_text_file(path.to_string_lossy().into_owned(), content.clone()).unwrap();
+        }
+        done.store(true, Ordering::Release);
+
+        assert!(reader.join().unwrap() > 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(staged_files_for(&path).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_atomic_replace_keeps_target_and_cleans_staged_file() {
+        let path = temp_file("atomic-replace-failure");
+        std::fs::create_dir(&path).unwrap();
+
+        let error =
+            write_text_file(path.to_string_lossy().into_owned(), "content".into()).unwrap_err();
+
+        assert!(error.contains("atomically replace"));
+        assert!(path.is_dir());
+        assert!(staged_files_for(&path).is_empty());
+        let _ = std::fs::remove_dir(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconditional_write_uses_the_resolved_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let target = temp_file("resolved-target");
+        let link = temp_file("resolved-link");
+        std::fs::write(&target, "old").unwrap();
+        symlink(&target, &link).unwrap();
+
+        write_text_file(link.to_string_lossy().into_owned(), "new".into()).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        assert!(staged_files_for(&target).is_empty());
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_file("preserve-permissions");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        write_text_file(path.to_string_lossy().into_owned(), "new".into()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o751);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1044,5 +1529,83 @@ mod tests {
 
         delete_text_file_if_unchanged(path.to_string_lossy().into_owned(), "user".into()).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn project_search_defaults_to_literal_and_supports_regex_for_file_scope() {
+        let path = temp_file("search-single-file");
+        std::fs::write(&path, "alpha[1]\nALPHA 42\nalpha111\n").unwrap();
+
+        let literal =
+            search_project_scope(&path.to_string_lossy(), "alpha[1]", false, None).unwrap();
+        assert_eq!(literal.scanned_files, 1);
+        assert_eq!(literal.files.len(), 1);
+        assert_eq!(
+            literal.files[0].rel,
+            path.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(literal.files[0].matches.len(), 1);
+        assert_eq!(literal.files[0].matches[0].line, 1);
+
+        let regex = search_project_scope(
+            &path.to_string_lossy(),
+            r"alpha(?:\[\d+\]|\s+\d+)",
+            false,
+            Some("regex"),
+        )
+        .unwrap();
+        assert_eq!(regex.scanned_files, 1);
+        assert_eq!(regex.files[0].matches.len(), 2);
+        assert_eq!(regex.files[0].matches[0].line, 1);
+        assert_eq!(regex.files[0].matches[1].line, 2);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_search_reports_invalid_mode_pattern_and_scope() {
+        let path = temp_file("search-errors");
+        std::fs::write(&path, "content\n").unwrap();
+
+        let bad_mode = search_project_scope(&path.to_string_lossy(), "x", false, Some("glob"))
+            .err()
+            .expect("glob mode must be rejected");
+        assert!(bad_mode.contains("[INVALID_SEARCH_MODE]"));
+
+        let bad_pattern = search_project_scope(&path.to_string_lossy(), "[", false, Some("regex"))
+            .err()
+            .expect("invalid regex must be rejected");
+        assert!(bad_pattern.contains("[INVALID_SEARCH_PATTERN]"));
+
+        let missing = temp_file("missing-search-scope");
+        let bad_scope = search_project_scope(&missing.to_string_lossy(), "x", false, None)
+            .err()
+            .expect("missing scope must be rejected");
+        assert!(bad_scope.contains("[INVALID_SEARCH_SCOPE]"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_search_distinguishes_no_matches_from_zero_scanned_files() {
+        let root = temp_file("search-directory");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("one.txt"), "first\n").unwrap();
+        std::fs::write(root.join("two.txt"), "second\n").unwrap();
+
+        let no_match =
+            search_project_scope(&root.to_string_lossy(), "absent", false, None).unwrap();
+        assert_eq!(no_match.scanned_files, 2);
+        assert!(no_match.files.is_empty());
+
+        let empty = temp_file("empty-search-directory");
+        std::fs::create_dir(&empty).unwrap();
+        let no_files = search_project_scope(&empty.to_string_lossy(), "anything", false, None)
+            .err()
+            .expect("empty scope must be rejected");
+        assert!(no_files.contains("[NO_SEARCHABLE_FILES]"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(empty);
     }
 }

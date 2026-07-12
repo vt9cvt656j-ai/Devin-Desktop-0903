@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "read_file",
-      "description": "读取文件内容。默认前 400 行；文件更大时用 offset/limit 分页（如 offset=401, limit=400 读 401-800 行）。**改文件前必须先 read_file**——edit_file 的 old_string 要逐字符匹配，凭印象写大概率失败。如果只想知道文件骨架（函数/类列表），用 lsp_symbols 比读全文快。**也能读文档**：.pdf/.docx/.pptx/.xlsx 自动抽取里面的文字（读规格书/论文/手册/表格直接 read_file 即可；扫描件纯图 PDF 无文字层需 OCR）。",
+      "description": "读取文件内容。正常文件默认一次读完整，不要自行切成小段；只有结果明确显示还有后续时，才用 offset/limit 读取尚未覆盖的新范围。文件版本未变化且证据账本已记录时不要重复整文件读取；需要逐字符修改而精确原文已离开当前上下文时，才重新读取目标范围。改已有文件前必须掌握当前真实版本；只看骨架可用 lsp_symbols。也能读取 .pdf/.docx/.pptx/.xlsx 的文字层（纯图扫描件需 OCR）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -17,7 +17,7 @@
           },
           "limit": {
             "type": "integer",
-            "description": "读取的行数，默认 400"
+            "description": "可选，精确读取的行数；省略时正常文件默认一次读完整"
           }
         },
         "required": [
@@ -30,7 +30,7 @@
     "type": "function",
     "function": {
       "name": "list_dir",
-      "description": "列出某个目录下的文件和子目录。用 \".\" 表示工作区根。**要了解项目结构必须逐层深入**——先 list_dir \".\"，然后对重要子目录再 list_dir，至少看到第三层。只看顶层 = 只看封面。结果包含解析后的绝对路径。",
+      "description": "按需列出某个目录下的直接子项，用 \".\" 表示工作区根。IDE 已提供项目树/符号地图时直接使用，不要重复逐层扫描；只有目标位置未知或目录确实可能变化时才列对应目录一次。结果包含解析后的绝对路径。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -49,7 +49,7 @@
     "type": "function",
     "function": {
       "name": "search",
-      "description": "在项目里**按文本** grep——现在**每个命中都带 ±2 行上下文**（►标命中行），直接看懂代码，不用再 read_file。用来找：字符串字面量、配置值、注释、出错信息出处、某写法/模式在项目里怎么用的、跨语言关键词。query 支持正则。**配合用更强**：找符号定义/所有调用方 → find_symbol / lsp_definition / lsp_references（区分同名异物）；按文件名 → find_files。研究代码时**这几个一轮并行发**，几轮摸透。",
+      "description": "位置未知时在单个文件或目录中定位文本，并返回命中行与上下文。目标文件已知时直接 read_file；搜索命中后读取目标源码确认完整上下文，不能只凭片段编辑。默认 literal，明确需要模式匹配时才用 regex。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -59,7 +59,19 @@
           },
           "path": {
             "type": "string",
-            "description": "可选，限定搜索的子目录（如 \"src/\"）"
+            "description": "可选，限定单个文件或子目录（如 \"src/auth.ts\" 或 \"src/\"）"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "literal",
+              "regex"
+            ],
+            "description": "匹配模式，默认 literal"
+          },
+          "case_sensitive": {
+            "type": "boolean",
+            "description": "是否区分大小写，默认 false"
           }
         },
         "required": [
@@ -221,7 +233,7 @@
     "type": "function",
     "function": {
       "name": "research_project",
-      "description": "**深挖整个代码库/项目——一次性把它摸透**。派一个专门的只读子智能体，多角度并行检索（list_dir/read_file/search/find_symbol/lsp/find_files），把**技术栈 + 目录地图 + 核心文件职责 + 数据/控制流 + 代码约定/模式 + 常见改动入口**全搞清，回一份结构化「上手地图」报告。**在一个不熟的项目里动手前、或要做较大改动前先调用一次**——比你自己零散 read/search 更系统、更省主线上下文。可选 focus 聚焦某块（如「登录鉴权流程」「构建发布」）。",
+      "description": "只在用户明确要求完整代码库上手地图，或任务确实跨多个未知模块且现有项目树/符号地图无法确定入口时，派一个只读子智能体梳理技术栈、核心职责、数据流和改动入口。目标文件或模块已经明确时不要调用，直接 read_file 相关源码和调用方；不要把它当成每个任务的固定前置步骤。可选 focus 聚焦某块（如认证流程、数据层或构建发布）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -238,7 +250,7 @@
     "type": "function",
     "function": {
       "name": "design_research",
-      "description": "**做网站/界面前，先把设计方向 + 完整 UI 架构研究规划好**（UI 版的 research_project）。派一个只读子智能体：研究该品类一流产品的设计语言（web_search 参考）、结合现有项目，规划出**页面/区块结构 + 组件树 + 具体设计 tokens(配色含hex/字阶/间距/圆角/阴影) + 布局与响应式 + 状态清单 + 动效清单 + 实现顺序**，回一份「设计+架构蓝图」。**做「官网/落地页/后台/电商首页/作品集」这类 UI 任务、动手写代码前先调一次**，避免凭空套一个浅薄骨架。可选 goal 说明要做什么。（实现阶段你再用 browser design 抓参考站真实设计系统对齐。）",
+      "description": "仅在用户明确要求重新设计界面、比较视觉方向或制定完整 UI 架构蓝图时，派只读子智能体研究同类产品并规划页面结构、组件树、设计 tokens、响应式、状态和动效。修复现有 UI 的功能 bug、卡片状态、渲染失败或局部交互时不要调用，直接读取相关实现并修复；也不要把它当成每个前端任务的固定前置步骤。可选 goal 说明设计目标。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -814,16 +826,21 @@
         "type": "object",
         "properties": {
           "path": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "description": "本轮已确认的精确文件路径；相对路径固定基于本次任务的工作区根"
           },
           "content": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "description": "要写入的完整非空 UTF-8 文件内容，不能省略或用占位内容"
           }
         },
         "required": [
           "path",
           "content"
-        ]
+        ],
+        "additionalProperties": false
       }
     }
   },
