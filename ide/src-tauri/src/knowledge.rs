@@ -3637,12 +3637,14 @@ async fn dork_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
         format!("{q} site:gist.github.com OR site:github.com OR site:gitlab.com"),
         format!("{q} filetype:log OR filetype:sql OR filetype:env OR filetype:json OR filetype:txt"),
     ];
-    let mut out = Vec::new();
-    for d in dorks {
-        let mut r = ddg_query(&d, "定向(dork)").await;
-        out.append(&mut r);
-    }
-    out
+    let (mut paste, mut code, mut files) = tokio::join!(
+        ddg_query(&dorks[0], "定向(dork)"),
+        ddg_query(&dorks[1], "定向(dork)"),
+        ddg_query(&dorks[2], "定向(dork)"),
+    );
+    paste.append(&mut code);
+    paste.append(&mut files);
+    paste
 }
 
 /// Wayback CDX: every archived URL under a domain — including pages DELETED from the
@@ -3781,22 +3783,45 @@ async fn haystak_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
     }
 }
 
+async fn tor_search_layers(q: &str) -> Vec<(String, String, String, &'static str)> {
+    // Fast paths must not wait through a full cold Tor bootstrap. Six seconds
+    // is enough when Tor is already running or nearly ready; ensure_tor starts
+    // the detached process, so a later search can use it if bootstrap is slower.
+    match tokio::time::timeout(Duration::from_secs(6), crate::net::ensure_tor()).await {
+        Ok(Ok(())) => {}
+        _ => return Vec::new(),
+    }
+    let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
+    for source in 0..3 {
+        let query = q.to_string();
+        racing.push(Box::pin(async move {
+            match source {
+                0 => ddg_onion(&query).await,
+                1 => torch_search_layer(&query).await,
+                _ => haystak_layer(&query).await,
+            }
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut results = Vec::new();
+    while let Ok(Some(mut batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
+        results.append(&mut batch);
+    }
+    results
+}
+
 #[tauri::command]
 pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
         return Err("空搜索词".into());
     }
-    // Best-effort: if Tor is down, kick a background start so the .onion layers self-heal
-    // (this run or the next). Non-blocking — the clearnet layers never wait on Tor.
-    tokio::spawn(async {
-        let _ = crate::net::ensure_tor().await;
-    });
     let limit = max_results.unwrap_or(24).min(60);
     let domain = looks_like_domain(q);
 
     let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
-    // Keyword layers — always run: surface + dorks (pastes/leaks/files) + 4 dark-web engines.
+    // Keyword layers run concurrently. Tor-backed engines share one readiness
+    // gate so a cold bootstrap cannot hold every public source for 30-40s.
     {
         let q = q.to_string();
         racing.push(Box::pin(async move { ddg_surface(&q).await }));
@@ -3811,15 +3836,7 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
     }
     {
         let q = q.to_string();
-        racing.push(Box::pin(async move { ddg_onion(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { torch_search_layer(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { haystak_layer(&q).await }));
+        racing.push(Box::pin(async move { tor_search_layers(&q).await }));
     }
     // Domain/OSINT layers — only when the query is a domain or URL: hidden subdomains + deleted-page archives.
     if let Some(d) = domain.clone() {
@@ -3833,11 +3850,14 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
         }
     }
 
+    let source_tasks = racing.len();
+    let mut completed_tasks = 0usize;
     let mut all: Vec<(String, String, String, &str)> = Vec::new();
     let mut seen_urls = std::collections::HashSet::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
     while let Ok(Some(batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
+        completed_tasks += 1;
         for item in batch {
             let norm = item.1.trim_end_matches('/').to_lowercase();
             if seen_urls.contains(&norm) {
@@ -3850,13 +3870,13 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
 
     if all.is_empty() {
         return Ok(format!(
-            "深层搜索「{q}」未找到结果（Tor 可能未运行：brew services start tor）。"
+            "深层搜索「{q}」未找到结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务。空结果可能表示无匹配、来源拒绝/超时，或 Tor 尚在冷启动。"
         ));
     }
 
     let mut out = format!(
-        "🔍 深层情报搜索「{q}」— {} 条结果（跨明网+定向dork+存档+子域名+暗网多引擎）：\n",
-        all.len().min(limit)
+        "🔍 深层情报搜索「{q}」— {} 条结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务（明网+定向dork+存档+子域名+暗网多引擎）：\n",
+        all.len().min(limit),
     );
     for (i, (title, url, snippet, source)) in all.iter().take(limit).enumerate() {
         out.push_str(&format!(
@@ -3872,7 +3892,7 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
     }
     out.push_str(
         "\n来源层：明网(DuckDuckGo) + 定向dork(paste/leak/filetype) + 存档(Wayback,含已删除页) + 子域名(crt.sh) + 暗网四引擎(DDG-onion/Ahmia/Torch/Haystak)\n\
-         提示：明网/存档 URL 用 web_fetch 读；.onion URL 用 tor_request 读（Tor 未运行则暗网层为空：brew services start tor）。存档快照能读到原网站已删除的内容。",
+         完成来源任务只表示请求已结束，不等于该层返回了结果；空层可能是无匹配、被拒绝、超时或 Tor 尚未就绪。明网/存档 URL 用 web_fetch 读，.onion URL 用 tor_request 读。",
     );
     Ok(out)
 }
@@ -3931,5 +3951,17 @@ mod tests {
             out.matches("\n## ").count(),
             DEVELOPER_COMMUNITY_SOURCES.len()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "calls live surface, archive, certificate, and Tor search sources"]
+    async fn deep_search_live_smoke_is_bounded_and_reports_coverage() {
+        let started = std::time::Instant::now();
+        let out = deep_search("rust async error handling".into(), Some(5))
+            .await
+            .unwrap();
+        println!("{out}");
+        assert!(out.contains("本轮完成"));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

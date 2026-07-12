@@ -10,6 +10,8 @@ const NOMINATIM_REVERSE_URL: &str = "https://nominatim.openstreetmap.org/reverse
 const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
 const OPEN_METEO_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SOURCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const OVERPASS_MAXSIZE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_RADIUS_M: u32 = 3_000;
 const MIN_RADIUS_M: u32 = 100;
 const MAX_RADIUS_M: u32 = 20_000;
@@ -128,6 +130,7 @@ struct NominatimReverse {
 
 #[derive(Debug, Deserialize)]
 struct OverpassResponse {
+    remark: Option<String>,
     #[serde(default)]
     elements: Vec<OverpassElement>,
 }
@@ -257,7 +260,7 @@ async fn response_json<T: DeserializeOwned>(
     source: &str,
     request: reqwest::RequestBuilder,
 ) -> Result<T, String> {
-    let response = request
+    let mut response = request
         .send()
         .await
         .map_err(|error| format!("{source} request failed: {error}"))?;
@@ -265,9 +268,30 @@ async fn response_json<T: DeserializeOwned>(
     if !status.is_success() {
         return Err(format!("{source} returned HTTP {status}"));
     }
-    response
-        .json::<T>()
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SOURCE_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "{source} response exceeded the {} byte limit",
+            MAX_SOURCE_RESPONSE_BYTES
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|error| format!("{source} response read failed: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_SOURCE_RESPONSE_BYTES {
+            return Err(format!(
+                "{source} response exceeded the {} byte limit",
+                MAX_SOURCE_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<T>(&body)
         .map_err(|error| format!("{source} returned invalid JSON: {error}"))
 }
 
@@ -646,7 +670,7 @@ fn poi_intent(query: &str) -> PoiIntent {
     }
 }
 
-fn overpass_query(query: &str, center: &DiscoveryCenter, radius_m: u32, limit: u32) -> String {
+fn overpass_query(query: &str, center: &DiscoveryCenter, radius_m: u32) -> String {
     let around = format!(
         "around:{radius_m},{:.7},{:.7}",
         center.latitude, center.longitude
@@ -708,11 +732,12 @@ fn overpass_query(query: &str, center: &DiscoveryCenter, radius_m: u32, limit: u
             format!("nwr({around})[\"historic\"];") ,
         ],
     };
-    // Fetch a wider but still bounded pool so a cuisine/name match has a fair
-    // chance in dense areas before the final relevance+distance ranking.
-    let fetch_limit = limit.saturating_mul(8).clamp(60, 200);
+    // Overpass does not order `out` rows by distance or text relevance. A row
+    // count here would create an arbitrary sample that cannot be ranked
+    // truthfully, so request the complete matching set under an explicit server
+    // memory cap. The client also enforces MAX_SOURCE_RESPONSE_BYTES.
     format!(
-        "[out:json][timeout:15];({});out center {fetch_limit};",
+        "[out:json][timeout:15][maxsize:{OVERPASS_MAXSIZE_BYTES}];({});out center;",
         selectors.join("")
     )
 }
@@ -776,6 +801,7 @@ fn overpass_element_to_place(
     element: OverpassElement,
     center: &DiscoveryCenter,
     language: &str,
+    radius_m: u32,
 ) -> Option<DiscoveryPlace> {
     let name = localized_name(&element.tags, language)?;
     let coordinates = match (element.lat, element.lon, element.center) {
@@ -794,20 +820,25 @@ fn overpass_element_to_place(
         "https://www.openstreetmap.org/{}/{}",
         element.element_type, element.id
     );
+    // For ways and relations Overpass's `center` is the bounding-box center,
+    // not the closest point on the feature. Keep only reported coordinates
+    // inside the requested radius so distance_m and radius_m remain comparable.
+    let distance_m = haversine_m(
+        center.latitude,
+        center.longitude,
+        coordinates.0,
+        coordinates.1,
+    );
+    if distance_m > f64::from(radius_m) {
+        return None;
+    }
     Some(DiscoveryPlace {
         id: format!("osm:{}/{}", element.element_type, element.id),
         name,
         category: category_from_tags(&element.tags),
         latitude: coordinates.0,
         longitude: coordinates.1,
-        distance_m: haversine_m(
-            center.latitude,
-            center.longitude,
-            coordinates.0,
-            coordinates.1,
-        )
-        .round()
-        .max(0.0) as u32,
+        distance_m: distance_m.round().max(0.0) as u32,
         source: "openstreetmap".into(),
         source_url: Some(source_url),
         address: address_from_tags(&element.tags),
@@ -823,20 +854,19 @@ async fn fetch_overpass_places(
     query: &str,
     center: &DiscoveryCenter,
     radius_m: u32,
-    limit: u32,
     language: &str,
 ) -> Result<Vec<DiscoveryPlace>, String> {
-    let statement = overpass_query(query, center, radius_m, limit);
+    let statement = overpass_query(query, center, radius_m);
     let response: OverpassResponse = response_json(
         "Overpass",
         HTTP.post(OVERPASS_URL)
             .form(&[("data", statement.as_str())]),
     )
     .await?;
-    let mut places = response
-        .elements
+    let elements = complete_overpass_elements(response)?;
+    let mut places = elements
         .into_iter()
-        .filter_map(|element| overpass_element_to_place(element, center, language))
+        .filter_map(|element| overpass_element_to_place(element, center, language, radius_m))
         .collect::<Vec<_>>();
     // Keep the full bounded Overpass candidate set. Text relevance is applied
     // together with distance only after all sources have returned; truncating
@@ -844,6 +874,19 @@ async fn fetch_overpass_places(
     // ever receives a relevance score.
     places.sort_by_key(|place| place.distance_m);
     Ok(places)
+}
+
+fn complete_overpass_elements(response: OverpassResponse) -> Result<Vec<OverpassElement>, String> {
+    if let Some(remark) = response
+        .remark
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Err(format!(
+            "Overpass did not return a complete result set: {remark}"
+        ));
+    }
+    Ok(response.elements)
 }
 
 fn weather_condition(code: i32) -> &'static str {
@@ -1089,6 +1132,7 @@ fn base_limitations(radius_m: u32) -> Vec<String> {
         "Distances are Haversine straight-line estimates, not walking, driving, transit, traffic, or accessibility routes.".into(),
         "No queried source supplies normalized ratings or prices, so rating and price remain null.".into(),
         "OpenStreetMap opening_hours is returned only as source text; open_now remains null because this command has no live open/closed feed.".into(),
+        "Activity queries return mapped venues and POIs, not a live event schedule, ticket inventory, or proof that an event is happening today.".into(),
         "OpenStreetMap and Wikipedia coverage can be incomplete or stale; verify consequential details with the venue or an official source.".into(),
         "Wikipedia GeoSearch is returned separately in nearby_context as background; it is never ranked as a POI, recommendation, endorsement, or popularity signal.".into(),
         "Open-Meteo current conditions are provider estimates for the reported timestamp, not a guarantee at a specific venue.".into(),
@@ -1217,7 +1261,7 @@ pub async fn local_discovery(
     };
     let overpass = timed(
         "Overpass",
-        fetch_overpass_places(&query, &center, radius_m, limit, &language),
+        fetch_overpass_places(&query, &center, radius_m, &language),
     );
     let weather = timed("Open-Meteo", fetch_weather(&center));
     let wikipedia = timed(
@@ -1450,15 +1494,17 @@ mod tests {
 
     #[test]
     fn food_query_uses_bounded_category_selectors_not_raw_user_ql() {
-        let statement = overpass_query("附近有什么好吃的 \" ); out body; //", &center(), 3_000, 12);
+        let statement = overpass_query("附近有什么好吃的 \" ); out body; //", &center(), 3_000);
         assert!(statement.contains("restaurant|cafe|fast_food"));
         assert!(!statement.contains("out body"));
-        assert!(statement.contains("out center 96"));
+        assert!(statement.contains(&format!("[maxsize:{OVERPASS_MAXSIZE_BYTES}]")));
+        assert!(statement.ends_with("out center;"));
+        assert!(!statement.contains("out center 96"));
     }
 
     #[test]
     fn category_detection_does_not_treat_theater_as_eat() {
-        let statement = overpass_query("nearby theater", &center(), 3_000, 12);
+        let statement = overpass_query("nearby theater", &center(), 3_000);
         assert_eq!(poi_intent("nearby theater"), PoiIntent::Entertainment);
         assert!(statement.contains("cinema|theatre|arts_centre"));
         assert!(!statement.contains("restaurant|cafe|fast_food"));
@@ -1466,12 +1512,12 @@ mod tests {
 
     #[test]
     fn bakery_and_family_queries_use_real_osm_categories() {
-        let bakery = overpass_query("nearby bakery", &center(), 3_000, 12);
+        let bakery = overpass_query("nearby bakery", &center(), 3_000);
         assert_eq!(poi_intent("nearby bakeries"), PoiIntent::Bakery);
         assert!(bakery.contains("[\"shop\"~\"^(bakery|pastry|confectionery)$\"]"));
         assert!(!bakery.contains("restaurant|cafe|fast_food"));
 
-        let family = overpass_query("family activity", &center(), 3_000, 12);
+        let family = overpass_query("family activity", &center(), 3_000);
         assert_eq!(poi_intent("family activities"), PoiIntent::FamilyActivity);
         assert!(family.contains("playground|water_park|miniature_golf"));
         assert!(family.contains("zoo|aquarium|theme_park|museum|attraction"));
@@ -1494,7 +1540,7 @@ mod tests {
         assert_eq!(poi_intent("local farmers market"), PoiIntent::Grocery);
         assert_eq!(poi_intent("bakery near a food market"), PoiIntent::Bakery);
 
-        let statement = overpass_query("food market", &center(), 3_000, 12);
+        let statement = overpass_query("food market", &center(), 3_000);
         assert!(statement.contains("supermarket|convenience|greengrocer|farm"));
         assert!(statement.contains("[\"amenity\"=\"marketplace\"]"));
         assert!(!statement.contains("restaurant|cafe|fast_food"));
@@ -1622,12 +1668,44 @@ mod tests {
                 ("opening_hours".into(), "Mo-Fr 08:00-17:00".into()),
             ]),
         };
-        let place = overpass_element_to_place(element, &center(), "en").unwrap();
+        let place = overpass_element_to_place(element, &center(), "en", 3_000).unwrap();
         assert_eq!(place.opening_hours.as_deref(), Some("Mo-Fr 08:00-17:00"));
         assert_eq!(place.rating, None);
         assert_eq!(place.price, None);
         assert_eq!(place.open_now, None);
         assert!(place.distance_m > 0);
+    }
+
+    #[test]
+    fn overpass_feature_centers_outside_the_requested_radius_are_excluded() {
+        let element = OverpassElement {
+            element_type: "way".into(),
+            id: 43,
+            lat: None,
+            lon: None,
+            center: Some(OverpassCenter {
+                lat: center().latitude + 0.002,
+                lon: center().longitude,
+            }),
+            tags: HashMap::from([
+                ("name".into(), "Large Park".into()),
+                ("leisure".into(), "park".into()),
+            ]),
+        };
+
+        assert!(overpass_element_to_place(element, &center(), "en", 100).is_none());
+    }
+
+    #[test]
+    fn overpass_remarks_reject_incomplete_candidate_sets() {
+        let response = OverpassResponse {
+            remark: Some("runtime error: Query ran out of memory".into()),
+            elements: Vec::new(),
+        };
+
+        let error = complete_overpass_elements(response).unwrap_err();
+        assert!(error.contains("did not return a complete result set"));
+        assert!(error.contains("ran out of memory"));
     }
 
     #[test]
@@ -1643,6 +1721,7 @@ mod tests {
         assert!(limitations.contains("straight-line"));
         assert!(limitations.contains("open_now remains null"));
         assert!(limitations.contains("rating and price remain null"));
+        assert!(limitations.contains("not a live event schedule"));
         assert!(limitations.contains("capped at 10 km"));
     }
 }

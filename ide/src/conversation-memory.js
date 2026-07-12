@@ -21,6 +21,7 @@ function serializeAttachment(attachment, budget) {
   const kind = attachment.kind === 'video' ? 'video' : 'image';
   let budgetOmitted = 0;
   const out = {
+    id: String(attachment.id || '').slice(0, 160),
     kind,
     mime: String(attachment.mime || attachment.type || (kind === 'video' ? 'video/mp4' : 'image/png')).slice(0, 120),
     name: String(attachment.name || (kind === 'video' ? 'video' : 'image')).slice(0, 240),
@@ -60,7 +61,12 @@ function serializeAttachment(attachment, budget) {
 
 export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTED_MEDIA_BUDGET) {
   const list = Array.isArray(messages) ? messages : [];
-  const budget = { remaining: Math.max(0, Number(mediaBudget) || 0) };
+  // Callers serializing several queues or sessions may pass one shared budget
+  // object so the aggregate media payload stays bounded.
+  const budget = mediaBudget && typeof mediaBudget === 'object'
+    ? mediaBudget
+    : { remaining: Math.max(0, Number(mediaBudget) || 0) };
+  budget.remaining = Math.max(0, Number(budget.remaining) || 0);
   const out = new Array(list.length);
   // Spend the bounded media budget on the newest turns first.
   for (let i = list.length - 1; i >= 0; i--) {
@@ -237,8 +243,13 @@ export class ConversationMemory {
     return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, recentTokens: this.estimateRecentTokens() };
   }
 
-  toJSON() {
-    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
+  toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET) {
+    // JSON.stringify calls toJSON with a string property key. Treat only an
+    // explicit number/shared-budget object as the serializer override.
+    const effectiveBudget = typeof mediaBudget === 'number' || (mediaBudget && typeof mediaBudget === 'object')
+      ? mediaBudget
+      : PERSISTED_MEDIA_BUDGET;
+    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent, effectiveBudget), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
   }
 
   static fromJSON(obj) {

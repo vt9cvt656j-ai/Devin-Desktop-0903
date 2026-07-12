@@ -122,7 +122,7 @@
     "type": "function",
     "function": {
       "name": "local_discovery",
-      "description": "查询某个地点周边的餐饮、景点、活动等 POI，并附天气、Haversine 直线距离、原始 opening_hours 和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；公共端点可能限流且没有应用 SLA。不得补猜评分、价格、路线时长或实时营业状态。near=current 必须有用户授权得到的坐标，绝不从时区或 IP 猜位置。",
+      "description": "查询某个地点周边的餐饮、景点、活动场所等 POI，并附天气、Haversine 直线距离、原始 opening_hours 和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；公共端点可能限流且没有应用 SLA。没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区或 IP 猜位置。",
       "parameters": {
         "type": "object",
         "properties": {

@@ -414,11 +414,29 @@ test("runtime tool schemas reject missing required parameters for native and tex
     ["visual_compare", schema("visual_compare", { design: { type: "string" }, url: { type: "string" } }, ["design", "url"])],
     ["db_query", schema("db_query", { driver: { type: "string", enum: ["sqlite"] }, url: { type: "string" }, query: { type: "string" } }, ["driver", "url", "query"])],
     ["current_time", schema("current_time", {})],
+    ["local_discovery", { type: "function", function: { name: "local_discovery", parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1 },
+        near: { type: "string", minLength: 1 },
+        latitude: { type: "number", minimum: -90, maximum: 90 },
+        longitude: { type: "number", minimum: -180, maximum: 180 },
+        radius_m: { type: "integer", minimum: 100, maximum: 20000 },
+      },
+      required: ["query"],
+      anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }],
+    } } }],
   ]);
   assert.match(issue("visual_compare", "{}", registry), /design, url/);
   assert.match(issue("db_query", '{"driver":"sqlite"}', registry), /url, query/);
   assert.equal(issue("visual_compare", '{"design":"target.png","url":"http://127.0.0.1:3000"}', registry), "");
   assert.equal(issue("current_time", "{}", registry), "");
+  assert.match(issue("local_discovery", "{}", registry), /query/);
+  assert.match(issue("local_discovery", '{"query":"coffee"}', registry), /near|latitude/);
+  assert.equal(issue("local_discovery", '{"query":"coffee","near":"Pasadena"}', registry), "");
+  assert.equal(issue("local_discovery", '{"query":"coffee","latitude":34.1,"longitude":-118.1}', registry), "");
+  assert.match(issue("local_discovery", '{"query":"coffee","near":"Pasadena","radius_m":50}', registry), /不能小于 100/);
+  assert.match(issue("local_discovery", '{"query":"coffee","latitude":91,"longitude":-118.1}', registry), /不能大于 90/);
 
   const assemble = load("_assembleStreamToolCalls", { _toolArgIssue: issue, _safeJsonLoose: safeJson });
   assert.equal(assemble(new Map([[0, { name: "visual_compare", args: "{}" }]]), registry).length, 0);
@@ -593,6 +611,33 @@ test("conversation media persistence records an explicit placeholder when its bu
   assert.match(SRC, /placeholder\.className = "msg__attachment-omitted"/);
 });
 
+test("localStorage chat mirror shares one strict media budget across every session", () => {
+  const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
+  const sessionsForStorage = load("_chatSessionsForLocalStorage", {
+    CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    _pendingSendsForStorage: pendingForStorage,
+    serializeMessagesForPersistence,
+  });
+  const olderMedia = "data:image/png;base64," + "A".repeat(80);
+  const activeMedia = "data:image/png;base64," + "B".repeat(80);
+  const makeSession = (created, dataUrl) => {
+    const memory = new ConversationMemory();
+    memory.push({ role: "user", content: "media", attachments: [{ kind: "image", dataUrl }] });
+    return { id: String(created), name: `Chat ${created}`, mode: "agent", memory, created, _pendingSends: [] };
+  };
+  const saved = sessionsForStorage([
+    makeSession(1, olderMedia),
+    makeSession(2, activeMedia),
+  ], 1, activeMedia.length);
+  assert.equal(saved[1].memory.recent[0].attachments[0].dataUrl, activeMedia, "active session gets recovery priority");
+  assert.equal(saved[0].memory.recent[0].attachments[0].dataUrl, undefined);
+  assert.equal(saved[0].memory.recent[0].attachments[0].omittedReason, "persistence_media_budget");
+  const keptMediaChars = saved.flatMap((session) => session.memory.recent)
+    .flatMap((message) => message.attachments || [])
+    .reduce((total, attachment) => total + String(attachment.dataUrl || "").length, 0);
+  assert.ok(keptMediaChars <= activeMedia.length);
+});
+
 test("conversation compaction reports removed media for object URL cleanup", () => {
   const memory = new ConversationMemory();
   const removed = [];
@@ -615,6 +660,160 @@ test("blob video snapshots fall back to durable key-frame rendering", () => {
   assert.match(SRC, /if \(\/\\b\(\?:src\|poster\).*blob:/);
   assert.match(SRC, /_releaseBlobMediaInNode\(msgs\[i\]\)/);
   assert.match(SRC, /_bindSessionMemoryCleanup\(session\)/);
+});
+
+test("failed historical video paths fall back to a persisted key frame", async () => {
+  let onError = null, replacements = 0;
+  const video = { addEventListener: (name, handler) => { if (name === "error") onError = handler; } };
+  const attachment = { kind: "video", path: "/gone/clip.mp4", frames: ["data:image/jpeg;base64,FRAME"] };
+  const bind = load("_bindVideoAttachmentFallback", {
+    inTauri: true,
+    backend: { readFileDataUrl: async () => { throw new Error("missing"); } },
+    _ensureAttachmentId: (value) => value.id || (value.id = "test-video"),
+    _replaceVideoWithKeyFrame: (node, value) => { assert.equal(node, video); assert.equal(value, attachment); replacements++; },
+  });
+  bind(video, attachment);
+  assert.equal(typeof onError, "function");
+  await onError();
+  assert.equal(replacements, 1);
+  assert.equal(video._mediaAttachment, attachment);
+  assert.match(SRC, /_rehydrateSnapshotVideoFallbacks\(session\)/, "restored rich snapshots must rebind the fallback");
+});
+
+test("rich snapshot videos rebind only by stable attachment id", () => {
+  const oldVideo = { dataset: { mediaAttachmentId: "old" } };
+  const currentVideo = { dataset: { mediaAttachmentId: "current" } };
+  const currentAttachment = { id: "current", kind: "video", path: "/clips/current.mp4", frames: [] };
+  const bound = [];
+  const rehydrate = load("_rehydrateSnapshotVideoFallbacks", {
+    _bindVideoAttachmentFallback: (video, attachment) => bound.push([video, attachment]),
+  });
+  rehydrate({
+    container: { querySelectorAll: () => [oldVideo, currentVideo] },
+    memory: { assemble: () => [{ role: "user", attachments: [currentAttachment] }] },
+  });
+  assert.deepEqual(bound, [[currentVideo, currentAttachment]], "a compacted old node must never borrow a newer attachment");
+  assert.match(SRC, /clonedVideo\.dataset\.mediaAttachmentId = attachmentId/);
+});
+
+test("an immediate chat save wakes the debounce and close waits for disk persistence", async () => {
+  let persisted = 0;
+  const save = load("saveChatHistory", {
+    _isSecondaryWindow: false,
+    _chatSaveDirty: false,
+    _chatSaveImmediate: false,
+    _chatSaveWake: null,
+    _chatSavePending: false,
+    _chatSavePromise: Promise.resolve(),
+    _persistChatHistoryOnce: async () => { persisted++; },
+  });
+  const started = Date.now();
+  const debounced = save();
+  const immediate = save({ immediate: true });
+  assert.equal(immediate, debounced);
+  await immediate;
+  assert.equal(persisted, 1);
+  assert.ok(Date.now() - started < 300, "immediate save must not wait for the 500ms debounce");
+  assert.match(SRC, /await Promise\.all\(\[saveChatHistory\(\{ immediate: true \}\), saveSession\(\)\]\)/);
+  const closeStart = SRC.indexOf("currentWindow.onCloseRequested");
+  const prevent = SRC.indexOf("event.preventDefault()", closeStart);
+  const savePos = SRC.indexOf("saveChatHistory({ immediate: true })", closeStart);
+  const destroy = SRC.indexOf("currentWindow.destroy()", closeStart);
+  assert.ok(closeStart >= 0 && prevent > closeStart && savePos > prevent && destroy > savePos,
+    "official close handler must prevent destruction, await persistence, then destroy");
+});
+
+test("Tauri composer drops turn media paths into real attachments", async () => {
+  const imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"]);
+  const videoExts = new Set(["mp4", "webm", "ogv", "ogg", "mov", "m4v"]);
+  const isImage = load("isImageFile", { IMAGE_EXTS: imageExts });
+  const isVideo = load("isVideoFile", { VIDEO_EXTS: videoExts });
+  const attached = [], refs = [];
+  const handleDrop = load("_handleDrop", {
+    _toPosix: TO_POSIX,
+    basename: (path) => path.split("/").pop(),
+    isImageFile: isImage,
+    isVideoFile: isVideo,
+    _mediaAttachmentFromPath: async (path) => ({ kind: "image", name: "shot.png", path }),
+    _pastedImages: attached,
+    _refreshImagePreviews: () => {},
+    showToast: () => {},
+    _insertRefAtCursor: (ref) => refs.push(ref),
+    _pathToRefArg: (path) => path,
+    promptEl: { focus: () => {} },
+  });
+  await handleDrop(["C:\\Users\\me\\shot.png", "C:\\Users\\me\\notes.txt"], "composer");
+  assert.deepEqual(attached.map((item) => item.path), ["C:/Users/me/shot.png"]);
+  assert.deepEqual(refs, ["C:/Users/me/notes.txt"]);
+  assert.match(SRC, /listen\("tauri:\/\/drag-drop"[\s\S]{0,180}_handleDrop/);
+});
+
+test("native media paths produce durable image data and video key frames", async () => {
+  const videoExts = new Set(["mp4", "webm", "ogv", "ogg", "mov", "m4v"]);
+  const isVideo = load("isVideoFile", { VIDEO_EXTS: videoExts });
+  const fetched = [], extracted = [], revoked = [];
+  const fromPath = load("_mediaAttachmentFromPath", {
+    _toPosix: TO_POSIX,
+    basename: (path) => path.split("/").pop(),
+    isVideoFile: isVideo,
+    _mediaMimeForName: load("_mediaMimeForName"),
+    backend: { assetUrl: (path) => `asset://${path}` },
+    fetch: async (source) => {
+      fetched.push(source);
+      if (source.endsWith("huge.png")) return {
+        ok: true,
+        headers: { get: () => String(25 * 1024 * 1024 + 1) },
+        blob: async () => { throw new Error("must reject from content-length before reading"); },
+      };
+      const video = source.endsWith(".webm");
+      const type = source.endsWith("wrong.png") ? "text/plain" : video ? "video/webm" : "image/png";
+      return { ok: true, blob: async () => new Blob([video ? "VIDEO" : "IMAGE"], { type }) };
+    },
+    _readFileAsDataUrl: async () => "data:image/png;base64,RAW",
+    _downscaleImageForVision: async (value) => value.replace("RAW", "SCALED"),
+    _extractVideoFrames: async (source) => { extracted.push(source); return ["data:image/jpeg;base64,FRAME"]; },
+    URL: { createObjectURL: () => "blob:test-video", revokeObjectURL: (value) => revoked.push(value) },
+  });
+  const image = await fromPath("C:\\Users\\me\\shot.png");
+  const video = await fromPath("C:\\Users\\me\\clip.webm");
+  assert.equal(image.dataUrl, "data:image/png;base64,SCALED");
+  assert.equal(image.path, "C:/Users/me/shot.png");
+  assert.equal(video.mime, "video/webm");
+  assert.deepEqual(video.frames, ["data:image/jpeg;base64,FRAME"]);
+  await assert.rejects(() => fromPath("C:/Users/me/huge.png"), /图片超过 25 MB/);
+  await assert.rejects(() => fromPath("C:/Users/me/wrong.png"), /图片格式无法识别/);
+  assert.deepEqual(fetched, [
+    "asset://C:/Users/me/shot.png",
+    "asset://C:/Users/me/clip.webm",
+    "asset://C:/Users/me/huge.png",
+    "asset://C:/Users/me/wrong.png",
+  ]);
+  assert.deepEqual(extracted, ["blob:test-video"]);
+  assert.deepEqual(revoked, ["blob:test-video"]);
+  assert.equal(SRC.includes("registerWorkspaceRoot(parentDir(normalizedPath))"), false,
+    "dropping one file must not grant the whole parent directory");
+});
+
+test("empty OS MIME still produces a model-readable image data URL", async () => {
+  const imageExts = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif"]);
+  const videoExts = new Set(["mp4", "webm", "ogv", "ogg", "mov", "m4v"]);
+  const inferredMime = load("_mediaMimeForName");
+  let encodedType = "";
+  const fromFile = load("_mediaAttachmentFromFile", {
+    isImageFile: load("isImageFile", { IMAGE_EXTS: imageExts }),
+    isVideoFile: load("isVideoFile", { VIDEO_EXTS: videoExts }),
+    _mediaMimeForName: inferredMime,
+    _readFileAsDataUrl: async (blob) => { encodedType = blob.type; return `data:${blob.type};base64,IMAGE`; },
+    _downscaleImageForVision: async (value) => value,
+    _extractVideoFrames: async () => [],
+    URL,
+  });
+  const file = new Blob(["jpeg bytes"]);
+  Object.defineProperties(file, { name: { value: "photo.jpg" }, path: { value: "" } });
+  const attachment = await fromFile(file);
+  assert.equal(encodedType, "image/jpeg");
+  assert.equal(attachment.mime, "image/jpeg");
+  assert.match(attachment.dataUrl, /^data:image\/jpeg;base64,/);
 });
 
 test("model request budget drops older media before the current visual turn", () => {
@@ -1347,12 +1546,18 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
   const localStorage = { setItem: (k, v) => { store[k] = v; }, getItem: (k) => (k in store ? store[k] : null) };
   const memJSON = { totalTurns: 3, recent: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }], summaries: [], milestones: [] };
   const _chatSessions = [{ id: "s1", name: "Chat 1", mode: "chat", model: "m", project: "", created: 123, memory: { toJSON: () => memJSON } }];
+  const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
+  const sessionsForStorage = load("_chatSessionsForLocalStorage", {
+    CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    _pendingSendsForStorage: pendingForStorage,
+    serializeMessagesForPersistence,
+  });
   const flush = load("_flushChatHistorySync", {
     _chatSessions,
     localStorage,
     CHAT_STORE_KEY: "michael-ide.chat-sessions",
     _activeChatIdx: 0,
-    _pendingSendsForStorage: () => [],
+    _chatSessionsForLocalStorage: sessionsForStorage,
   });
   flush();
   const saved = JSON.parse(store["michael-ide.chat-sessions"]);

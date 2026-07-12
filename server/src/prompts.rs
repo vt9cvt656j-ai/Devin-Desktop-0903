@@ -1295,6 +1295,8 @@ mod tests {
         assert!(policy.contains("搜索是取证手段，不是思考的替代品"));
         assert!(policy.contains("检索轮次不固定"));
         assert!(policy.contains("一轮没有带来新的独立来源"));
+        assert!(policy.contains("不因为事实难听"));
+        assert!(policy.contains("不得提供可直接用于入侵"));
     }
 
     #[test]

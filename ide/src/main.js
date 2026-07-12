@@ -6984,6 +6984,10 @@ let _chatSeq = 0; // monotonic counter for auto-naming so "Chat N" never repeats
 function _isStreaming() { return !!_currentSession()?.streaming; }
 function _setStreamBtnForActive() { _setSendBtnStop(_isStreaming()); }
 const CHAT_STORE_KEY = "michael-ide.chat-sessions";
+// localStorage is only the synchronous emergency mirror. Share one aggregate
+// media allowance across all tabs so several image-heavy chats cannot exhaust
+// its quota and silently lose the newest text turn.
+const CHAT_LOCAL_MEDIA_BUDGET = 1_500_000;
 
 function _currentSession() {
   return _activeChatIdx >= 0 && _activeChatIdx < _chatSessions.length ? _chatSessions[_activeChatIdx] : null;
@@ -7123,6 +7127,7 @@ function _renderSessionHistory(session) {
       // Scrub residue baked into snapshots written by older builds (the "..." filler + stuck
       // carets already sitting in session.json) so reopening a thread shows no ghost.
       _scrubResidue(session.container);
+      _rehydrateSnapshotVideoFallbacks(session);
       session._htmlSnapshot = ""; // consumed; future saves re-snapshot the live DOM
       return;
     } catch { /* fall through to text re-render */ }
@@ -7325,9 +7330,11 @@ function _snapshotTranscript(session) {
     const clonedVideos = Array.from(clone.querySelectorAll("video"));
     for (let index = 0; index < clonedVideos.length; index++) {
       const clonedVideo = clonedVideos[index];
+      const attachment = liveVideos[index]?._mediaAttachment;
+      const attachmentId = _ensureAttachmentId(attachment);
+      if (attachmentId) clonedVideo.dataset.mediaAttachmentId = attachmentId;
       const src = clonedVideo.getAttribute("src") || clonedVideo.getAttribute("poster") || "";
       if (!src.startsWith("blob:")) continue;
-      const attachment = liveVideos[index]?._mediaAttachment;
       const frame = Array.isArray(attachment?.frames)
         ? attachment.frames.find((value) => typeof value === "string" && value.startsWith("data:image/"))
         : "";
@@ -7354,7 +7361,10 @@ function _snapshotTranscript(session) {
 
 let _chatSavePending = false;
 let _chatSaveDirty = false; // a save arrived while one was in flight → re-run once (trailing edge)
-function _pendingSendsForStorage(pendingSends) {
+let _chatSaveImmediate = false;
+let _chatSaveWake = null;
+let _chatSavePromise = Promise.resolve();
+function _pendingSendsForStorage(pendingSends, mediaBudget) {
   const normalized = (Array.isArray(pendingSends) ? pendingSends : []).map((pending) => {
     if (typeof pending === "string") return { content: pending, attachments: [] };
     return {
@@ -7362,76 +7372,109 @@ function _pendingSendsForStorage(pendingSends) {
       attachments: Array.isArray(pending?.attachments) ? pending.attachments : [],
     };
   }).filter((pending) => pending.content.trim() || pending.attachments.length);
-  return serializeMessagesForPersistence(normalized).map((pending) => ({
+  return serializeMessagesForPersistence(normalized, mediaBudget).map((pending) => ({
     text: pending.content,
     attachments: Array.isArray(pending.attachments) ? pending.attachments : [],
   }));
 }
+
+function _chatSessionsForLocalStorage(sessions, activeIdx, mediaBudget = CHAT_LOCAL_MEDIA_BUDGET) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  const budget = { remaining: Math.max(0, Number(mediaBudget) || 0) };
+  const out = new Array(list.length);
+  // Preserve the active tab first, then the newest remaining tabs. The message
+  // serializer independently preserves the newest turns inside each tab.
+  const order = list.map((_, index) => index).sort((a, b) => {
+    if (a === activeIdx) return -1;
+    if (b === activeIdx) return 1;
+    return (Number(list[b]?.created) || 0) - (Number(list[a]?.created) || 0);
+  });
+  for (const index of order) {
+    const s = list[index];
+    const pendingSends = _pendingSendsForStorage(s?._pendingSends, budget);
+    out[index] = {
+      id: s?.id, name: s?.name, mode: s?.mode, model: s?.model || null,
+      project: s?.project || "",
+      memory: s?.memory ? s.memory.toJSON(budget) : undefined,
+      history: s?.memory ? undefined : serializeMessagesForPersistence((s?.history || []).slice(-300), budget),
+      pendingSends,
+      created: s?.created,
+    };
+  }
+  return out;
+}
 // SYNCHRONOUS chat flush — for unload paths where an async save can't finish
 // (webview reload / HMR / crash / the dev watcher killing the process). localStorage
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
-// fallback. Text-only (no HTML snapshot) to stay under quota and stay instant.
+// fallback. It has no HTML snapshot and a strict aggregate media budget.
 function _flushChatHistorySync() {
   try {
-    const data = _chatSessions.map((s) => ({
-      id: s.id, name: s.name, mode: s.mode, model: s.model || null,
-      project: s.project || "",
-      // Write the SAME shape restoreChatHistory reads: `memory` = the serialized
-      // ConversationMemory object. The old code stored it under `history` as an OBJECT,
-      // but restore only accepts `memory` (object) or `history` (ARRAY) — so the object
-      // under `history` was silently dropped and the WHOLE chat was lost whenever this
-      // sync mirror (beforeunload / HMR / crash) was the fallback. That was the real
-      // "内容全丢 / 偶尔丢失" bug: the disk store saved you only when its async write
-      // happened to have landed; otherwise this clobbered mirror lost everything.
-      memory: s.memory ? s.memory.toJSON() : undefined,
-      history: s.memory ? undefined : ((s.history || []).slice(-300)),
-      pendingSends: _pendingSendsForStorage(s._pendingSends),
-      created: s.created,
-    }));
+    // Keep the exact restore shape, but spend one strict media budget across all
+    // sessions instead of granting every tab a fresh multi-megabyte allowance.
+    const data = _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx);
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, activeIdx: _activeChatIdx }));
   } catch { /* quota / disabled — the async path is still the primary */ }
 }
 
-async function saveChatHistory() {
-  if (_isSecondaryWindow) return; // secondary windows don't persist into the main window's chat store
-  if (_chatSavePending) { _chatSaveDirty = true; return; } // coalesce, but don't drop the latest
-  _chatSavePending = true;
-  _chatSaveDirty = false;
-  try {
-    await new Promise(r => setTimeout(r, 500));
-    const data = _chatSessions.map(s => ({
+async function _persistChatHistoryOnce() {
+  const data = _chatSessions.map(s => ({
       id: s.id, name: s.name, mode: s.mode, model: s.model || null,
       project: s.project || "",
       // Hierarchical memory — serializes recent + summaries + milestones
       memory: s.memory.toJSON(),
       pendingSends: _pendingSendsForStorage(s._pendingSends),
       created: s.created,
-    }));
-    const payload = { sessions: data, activeIdx: _activeChatIdx };
-    // Dual-channel durability: always mirror a LIGHTWEIGHT (text-only) copy to
-    // localStorage so a Tauri-store permission / IO failure can't lose the chat
-    // (restoreChatHistory falls back to this). Text-only also keeps it under the
-    // ~5 MB localStorage quota even when a transcript is full of screenshots.
-    try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(payload)); } catch {}
-    if (inTauri) {
-      // The disk store has room, so ALSO snapshot each session's rendered
-      // transcript HTML. That's what brings the full visual back on restart —
-      // tool cards, diffs, inline screenshots — instead of only the plain summary
-      // text. Without it, reopening showed "聊天记录还在，但之前渲染的样式都没".
-      const rich = {
-        sessions: data.map((d, i) => ({ ...d, html: _snapshotTranscript(_chatSessions[i]) })),
-        activeIdx: _activeChatIdx,
-      };
-      try {
-        const store = await loadStore("session.json");
-        await store.set(CHAT_STORE_KEY, rich);
-        await store.save();
-      } catch (e) { console.warn("[chat] store save failed (localStorage fallback kept):", e); }
+  }));
+  const localPayload = {
+    sessions: _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx),
+    activeIdx: _activeChatIdx,
+  };
+  // The bounded local mirror stays recoverable even when the disk store fails.
+  try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(localPayload)); } catch {}
+  if (!inTauri) return;
+  const rich = {
+    sessions: data.map((d, i) => ({ ...d, html: _snapshotTranscript(_chatSessions[i]) })),
+    activeIdx: _activeChatIdx,
+  };
+  try {
+    const store = await loadStore("session.json");
+    await store.set(CHAT_STORE_KEY, rich);
+    await store.save();
+  } catch (e) { console.warn("[chat] store save failed (localStorage fallback kept):", e); }
+}
+
+function saveChatHistory(options) {
+  options = options || {};
+  const immediate = !!options.immediate;
+  if (_isSecondaryWindow) return Promise.resolve();
+  _chatSaveDirty = true;
+  if (immediate) {
+    _chatSaveImmediate = true;
+    if (_chatSaveWake) _chatSaveWake();
+  }
+  if (_chatSavePending) return _chatSavePromise;
+  _chatSavePending = true;
+  _chatSavePromise = (async () => {
+    try {
+      if (!_chatSaveImmediate) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          _chatSaveWake = () => { clearTimeout(timer); resolve(); };
+        });
+      }
+      _chatSaveWake = null;
+      do {
+        _chatSaveDirty = false;
+        _chatSaveImmediate = false;
+        await _persistChatHistoryOnce();
+      } while (_chatSaveDirty);
+    } catch (e) { console.warn("[chat] save failed:", e); }
+    finally {
+      _chatSaveWake = null;
+      _chatSavePending = false;
     }
-  } catch (e) { console.warn("[chat] save failed:", e); }
-  _chatSavePending = false;
-  // A message arrived mid-save → flush once more so the latest turn isn't dropped.
-  if (_chatSaveDirty) { _chatSaveDirty = false; saveChatHistory(); }
+  })();
+  return _chatSavePromise;
 }
 
 // Jump the chat to the newest message. Retries across several frames because restored history renders
@@ -7819,10 +7862,7 @@ function _renderMessageAttachments(body, attachments = []) {
       video.preload = "metadata";
       video.playsInline = true;
       video.title = attachment.name || "Attached video";
-      video._mediaAttachment = attachment;
-      if (attachment.path && inTauri) video.addEventListener("error", async () => {
-        try { const dataUrl = await backend.readFileDataUrl(attachment.path); if (dataUrl) video.src = dataUrl; } catch {}
-      }, { once: true });
+      _bindVideoAttachmentFallback(video, attachment);
       body.appendChild(video);
       continue;
     }
@@ -12854,7 +12894,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "联网搜索（桌面后端并行尝试 Google、Bing、DuckDuckGo，并合并实际返回结果），返回标题/URL/摘要；摘要只是线索，关键结论需读原文核实。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
-    { type: "function", function: { name: "local_discovery", description: "查询某个地点周边的餐饮、景点、活动等 POI，并附天气、直线距离、原始营业时间和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；不伪造评分、价格、路线时长或实时营业状态。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
+    { type: "function", function: { name: "local_discovery", description: "查询某个地点周边的餐饮、景点、活动场所等 POI，并附天气、直线距离、原始营业时间和逐来源状态。当前真实接入 Nominatim、OpenStreetMap Overpass、Open-Meteo、Wikipedia GeoSearch；没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity venue" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
     { type: "function", function: { name: "read_screen", description: "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限" } }, required: [] } } },
     { type: "function", function: { name: "ui_click", description: "对 read_screen 返回的真实可访问性 ref 执行 press、set_value 或 focus。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "read_screen 返回的 AX 元素 ref" }, action: { type: "string", enum: ["press", "set_value", "focus"] }, value: { type: "string", description: "action=set_value 时必填" } }, required: ["ref", "action"] } } },
     { type: "function", function: { name: "update_plan", description: "创建或更新任务的分步计划——用户在 IDE 里实时看到这块面板。", parameters: { type: "object", properties: { steps: { type: "array", description: "完整的有序步骤列表（每次传全量，不是增量）", items: { type: "object", properties: { content: { type: "string", description: "这一步做什么——具体但简洁，一眼看懂（含关键技术/文件）" }, status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"], description: "状态：pending待办 / in_progress进行中 / completed已完成 / cancelled已取消(用户取消的保持这个)" } }, required: ["content", "status"] } } }, required: ["steps"] } } },
@@ -13325,15 +13365,28 @@ function _toolSchemaFromRegistry(registry, name) {
 
 function _schemaValueIssue(value, schema, path = "参数") {
   if (!schema || typeof schema !== "object") return "";
-  const variants = Array.isArray(schema.oneOf) ? schema.oneOf : (Array.isArray(schema.anyOf) ? schema.anyOf : null);
+  const oneOf = Array.isArray(schema.oneOf) ? schema.oneOf : null;
+  const anyOf = !oneOf && Array.isArray(schema.anyOf) ? schema.anyOf : null;
+  const variants = oneOf || anyOf;
   if (variants?.length) {
+    // JSON Schema applies siblings of oneOf/anyOf as well as the selected
+    // branch. Validate the shared object contract first; otherwise a schema
+    // such as { required: ["query"], anyOf: [...] } silently skips query.
+    const baseSchema = { ...schema };
+    delete baseSchema.oneOf;
+    delete baseSchema.anyOf;
+    const baseIssue = _schemaValueIssue(value, baseSchema, path);
+    if (baseIssue) return baseIssue;
     const issues = variants.map((candidate) => _schemaValueIssue(value, candidate, path));
-    if (issues.some((issue) => !issue)) return "";
+    const validCount = issues.filter((issue) => !issue).length;
+    if (oneOf ? validCount === 1 : validCount > 0) return "";
+    if (oneOf && validCount > 1) return `${path} 同时符合多个互斥参数结构`;
     return issues.find(Boolean) || `${path} 不符合可用参数结构`;
   }
 
   const type = schema.type;
-  if (type === "object") {
+  const hasObjectContract = type === "object" || Array.isArray(schema.required) || schema.properties;
+  if (hasObjectContract) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return `${path} 必须是对象`;
     const missing = [];
     for (const key of Array.isArray(schema.required) ? schema.required : []) {
@@ -13350,6 +13403,7 @@ function _schemaValueIssue(value, schema, path = "参数") {
   } else if (type === "array") {
     if (!Array.isArray(value)) return `${path} 必须是数组`;
     if (Number.isFinite(schema.minItems) && value.length < schema.minItems) return `${path} 至少需要 ${schema.minItems} 项`;
+    if (Number.isFinite(schema.maxItems) && value.length > schema.maxItems) return `${path} 最多允许 ${schema.maxItems} 项`;
     if (schema.items) {
       for (let index = 0; index < value.length; index++) {
         const issue = _schemaValueIssue(value[index], schema.items, `${path}[${index}]`);
@@ -13365,6 +13419,10 @@ function _schemaValueIssue(value, schema, path = "参数") {
     if (typeof value !== "number" || !Number.isFinite(value)) return `${path} 必须是数字`;
   } else if (type === "boolean" && typeof value !== "boolean") {
     return `${path} 必须是布尔值`;
+  }
+  if ((type === "integer" || type === "number") && Number.isFinite(value)) {
+    if (Number.isFinite(schema.minimum) && value < schema.minimum) return `${path} 不能小于 ${schema.minimum}`;
+    if (Number.isFinite(schema.maximum) && value > schema.maximum) return `${path} 不能大于 ${schema.maximum}`;
   }
   if (Array.isArray(schema.enum) && !schema.enum.includes(value)) return `${path} 必须是: ${schema.enum.join(" | ")}`;
   return "";
@@ -27230,6 +27288,55 @@ function _replaceVideoWithKeyFrame(video, attachment) {
   return true;
 }
 
+let _mediaAttachmentSeq = 0;
+function _ensureAttachmentId(attachment) {
+  if (!attachment || typeof attachment !== "object") return "";
+  const existing = String(attachment.id || "").trim();
+  if (existing) return existing;
+  let generated = "";
+  try { generated = globalThis.crypto?.randomUUID?.() || ""; } catch {}
+  if (!generated) generated = `media-${Date.now().toString(36)}-${(++_mediaAttachmentSeq).toString(36)}`;
+  attachment.id = generated;
+  return generated;
+}
+
+function _bindVideoAttachmentFallback(video, attachment) {
+  if (!video || !attachment) return;
+  video._mediaAttachment = attachment;
+  const attachmentId = _ensureAttachmentId(attachment);
+  if (attachmentId && video.dataset) video.dataset.mediaAttachmentId = attachmentId;
+  video.addEventListener("error", async () => {
+    if (attachment.path && inTauri) {
+      try {
+        const dataUrl = await backend.readFileDataUrl(attachment.path);
+        if (typeof dataUrl === "string" && dataUrl.startsWith("data:video/")) {
+          video.addEventListener("error", () => _replaceVideoWithKeyFrame(video, attachment), { once: true });
+          video.src = dataUrl;
+          return;
+        }
+      } catch {}
+    }
+    _replaceVideoWithKeyFrame(video, attachment);
+  }, { once: true });
+}
+
+function _rehydrateSnapshotVideoFallbacks(session) {
+  const videos = Array.from(session?.container?.querySelectorAll?.("video.msg__attached-video") || []);
+  if (!videos.length) return;
+  const messages = session?.memory?.assemble?.() || [];
+  const attachmentsById = new Map(messages
+    .flatMap((message) => Array.isArray(message?.attachments) ? message.attachments : [])
+    .filter((attachment) => attachment?.kind === "video" && attachment.id)
+    .map((attachment) => [String(attachment.id), attachment]));
+  // Never infer by DOM order: conversation compaction can remove an old
+  // attachment from memory while its rendered node remains in the rich HTML.
+  for (const video of videos) {
+    const attachmentId = String(video.dataset?.mediaAttachmentId || "");
+    const attachment = attachmentId ? attachmentsById.get(attachmentId) : null;
+    if (attachment) _bindVideoAttachmentFallback(video, attachment);
+  }
+}
+
 function _releaseAttachmentObjectUrl(attachment, scope = null, replaceWithFrame = false) {
   if (!attachment?.objectUrl || !String(attachment.objectUrl).startsWith("blob:")) return;
   const objectUrl = String(attachment.objectUrl);
@@ -27299,7 +27406,8 @@ function _downscaleImageForVision(dataUrl, maxDim = 1568) {
           const long = Math.max(w, h);
           if (!long) return resolve(dataUrl);
           // Already small enough → keep original bytes.
-          if (long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
+          const needsRaster = String(dataUrl).startsWith("data:image/svg+xml");
+          if (!needsRaster && long <= maxDim && String(dataUrl).length < 1_300_000) return resolve(dataUrl);
           const scale = long > maxDim ? maxDim / long : 1;
           const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
           const cv = document.createElement("canvas");
@@ -27374,18 +27482,68 @@ async function _extractVideoFrames(dataUrl, maxFrames = 3) {
 }
 
 async function _mediaAttachmentFromFile(file) {
-  const mime = String(file?.type || "");
-  const kind = mime.startsWith("video/") || isVideoFile(file?.name || "") ? "video" : "image";
+  const name = String(file?.name || "");
+  const declaredMime = String(file?.type || "").toLowerCase();
+  const inferredMime = _mediaMimeForName(name);
+  const kind = declaredMime.startsWith("video/") || isVideoFile(name)
+    ? "video"
+    : declaredMime.startsWith("image/") || isImageFile(name) ? "image" : "";
+  if (!kind) throw new Error("媒体格式无法识别");
+  const usableDeclaredMime = declaredMime && declaredMime !== "application/octet-stream" ? declaredMime : "";
+  if (usableDeclaredMime && !usableDeclaredMime.startsWith(kind + "/")) throw new Error("媒体格式与文件扩展名不一致");
+  const mime = usableDeclaredMime || inferredMime;
+  if (!mime.startsWith(kind + "/")) throw new Error("媒体格式无法识别");
   if (kind === "image" && Number(file?.size || 0) > 25 * 1024 * 1024) throw new Error("图片超过 25 MB，请先压缩后再发送");
   if (kind === "video" && Number(file?.size || 0) > 40 * 1024 * 1024) throw new Error("视频超过 40 MB，请先压缩或截取关键片段");
+  const readable = usableDeclaredMime ? file : new Blob([file], { type: mime });
   if (kind === "image") {
-    const original = await _readFileAsDataUrl(file);
-    return { kind, mime: mime || "image/png", name: file.name || "image.png", path: file.path || "", dataUrl: await _downscaleImageForVision(original), frames: [] };
+    const original = await _readFileAsDataUrl(readable);
+    return { kind, mime, name: name || "image.png", path: file.path || "", dataUrl: await _downscaleImageForVision(original), frames: [] };
   }
-  const objectUrl = URL.createObjectURL(file);
+  const objectUrl = URL.createObjectURL(readable);
   const frames = await _extractVideoFrames(objectUrl);
   if (file.path) { try { URL.revokeObjectURL(objectUrl); } catch {} }
-  return { kind, mime: mime || "video/mp4", name: file.name || "video.mp4", path: file.path || "", dataUrl: "", objectUrl: file.path ? "" : objectUrl, frames };
+  return { kind, mime, name: name || "video.mp4", path: file.path || "", dataUrl: "", objectUrl: file.path ? "" : objectUrl, frames };
+}
+
+function _mediaMimeForName(name) {
+  const ext = (String(name || "").split(".").pop() || "").toLowerCase();
+  return ({
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+    svg: "image/svg+xml", ico: "image/x-icon", bmp: "image/bmp", avif: "image/avif",
+    mp4: "video/mp4", webm: "video/webm", ogv: "video/ogg", ogg: "video/ogg",
+    mov: "video/quicktime", m4v: "video/x-m4v",
+  })[ext] || "";
+}
+
+async function _mediaAttachmentFromPath(path) {
+  const normalizedPath = _toPosix(path);
+  const name = basename(normalizedPath);
+  const kind = isVideoFile(name) ? "video" : "image";
+  // Read only the exact file the user dropped. Registering its parent as a
+  // workspace would silently grant the agent access to every sibling file.
+  const source = backend.assetUrl(normalizedPath);
+  const response = await fetch(source);
+  if (!response.ok) throw new Error(`${kind === "video" ? "视频" : "图片"}读取失败`);
+  const maxBytes = (kind === "video" ? 40 : 25) * 1024 * 1024;
+  const announcedBytes = Number(response.headers?.get?.("content-length")) || 0;
+  if (announcedBytes > maxBytes) throw new Error(`${kind === "video" ? "视频超过 40 MB，请先压缩或截取关键片段" : "图片超过 25 MB，请先压缩后再发送"}`);
+  const blob = await response.blob();
+  if (blob.size > maxBytes) throw new Error(`${kind === "video" ? "视频超过 40 MB，请先压缩或截取关键片段" : "图片超过 25 MB，请先压缩后再发送"}`);
+  const inferredMime = _mediaMimeForName(name);
+  const responseMime = String(blob.type || "").toLowerCase();
+  if (responseMime && responseMime !== "application/octet-stream" && !responseMime.startsWith(kind + "/")) throw new Error(`${kind === "video" ? "视频" : "图片"}格式无法识别`);
+  const mime = responseMime && responseMime !== "application/octet-stream" ? responseMime : inferredMime;
+  if (!mime.startsWith(kind + "/")) throw new Error(`${kind === "video" ? "视频" : "图片"}格式无法识别`);
+  if (kind === "image") {
+    const original = await _readFileAsDataUrl(blob);
+    return { kind, mime, name, path: normalizedPath, dataUrl: await _downscaleImageForVision(original), frames: [] };
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  let frames;
+  try { frames = await _extractVideoFrames(objectUrl); }
+  finally { try { URL.revokeObjectURL(objectUrl); } catch {} }
+  return { kind, mime, name, path: normalizedPath, dataUrl: "", objectUrl: "", frames };
 }
 
 promptEl.addEventListener("paste", (e) => {
@@ -29175,7 +29333,22 @@ function _pathToRefArg(abs) {
 async function _handleDrop(paths, target) {
   if (!paths || !paths.length) return;
   if (target === "composer") {
-    for (const p of paths) _insertRefAtCursor(_pathToRefArg(p)); // add a chip per file → @-referenced on send
+    for (const p of paths) {
+      const normalizedPath = _toPosix(p);
+      const name = basename(normalizedPath);
+      if (isImageFile(name) || isVideoFile(name)) {
+        try {
+          const attachment = await _mediaAttachmentFromPath(normalizedPath);
+          _pastedImages.push(attachment);
+          _refreshImagePreviews();
+          showToast(`${attachment.kind === "video" ? "Video" : "Image"} attached: ${name}`);
+        } catch (error) {
+          showToast(String(error?.message || error));
+        }
+      } else {
+        _insertRefAtCursor(_pathToRefArg(normalizedPath));
+      }
+    }
     try { promptEl.focus(); } catch {}
   } else {
     for (const p of paths) {
@@ -29217,12 +29390,15 @@ if (inTauri) {
 
 window.addEventListener("beforeunload", () => { _flushChatHistorySync(); _flushDirtyBuffersSync(); _flushSessionSync(); saveSession(); });
 if (inTauri) {
-  import("@tauri-apps/api/event").then(({ listen }) => {
-    listen("tauri://close-requested", async (event) => {
+  import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+    const currentWindow = getCurrentWindow();
+    currentWindow.onCloseRequested(async (event) => {
+      event.preventDefault();
       _flushChatHistorySync(); _flushDirtyBuffersSync(); _flushSessionSync();
-      await saveSession();
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().destroy();
+      // Wake any debounced chat save and wait for the current in-flight write plus
+      // its trailing snapshot before destroying the WebView.
+      await Promise.all([saveChatHistory({ immediate: true }), saveSession()]);
+      await currentWindow.destroy();
     });
   }).catch(() => {});
 }
