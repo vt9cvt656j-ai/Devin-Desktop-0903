@@ -21,6 +21,7 @@ function serializeLocationEvidence(evidence) {
     && typeof longitude === 'number' && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180;
   const statuses = new Set([
     'embedded_location_absent',
+    'embedded_location_unreadable',
     'embedded_gps',
     'embedded_gps_resolved',
     'embedded_gps_unresolved',
@@ -84,6 +85,7 @@ function serializeAttachment(attachment, budget) {
     sourceFingerprint: typeof attachment.sourceFingerprint === 'string'
       ? attachment.sourceFingerprint.slice(0, 120) : '',
     visionText: String(attachment.visionText || '').slice(0, 6000),
+    locationVisionText: String(attachment.locationVisionText || '').slice(0, 6000),
     modelMediaSanitized: attachment.modelMediaSanitized === true
       ? true
       : attachment.modelMediaSanitized === false ? false : undefined,

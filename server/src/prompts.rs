@@ -1306,8 +1306,11 @@ mod tests {
         assert!(policy.contains("不得把全部结构化地理数据统称为“实时数据”"));
         assert!(policy.contains("缩放前原图的嵌入式 EXIF GPS"));
         assert!(policy.contains("只能称“图片元数据报告的位置”"));
+        assert!(policy.contains("没有 EXIF GPS 时不要提前停止"));
+        assert!(policy.contains("未核验视觉候选"));
         assert!(policy.contains("截图/广告/翻拍内容中的地址"));
-        assert!(policy.contains("不得平均、静默选边或编造置信百分比"));
+        assert!(policy.contains("不得编造置信百分比"));
+        assert!(policy.contains("不得平均或静默选边"));
     }
 
     #[test]

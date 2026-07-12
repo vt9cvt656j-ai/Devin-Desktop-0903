@@ -598,6 +598,7 @@ test("conversation media persistence keeps only bounded truthful image location 
       kind: "image",
       dataUrl: "data:image/jpeg;base64,AAAA",
       modelMediaSanitized: true,
+      locationVisionText: "ranked visual candidates",
       locationEvidence: {
         status: "embedded_gps_resolved",
         latitude: -33.8688,
@@ -619,6 +620,9 @@ test("conversation media persistence keeps only bounded truthful image location 
   assert.equal(saved.reverseGeocoding[0].secret, undefined);
   assert.equal(saved.reverseGeocoding[0].road, "George Street");
   assert.equal(serializeMessagesForPersistence([{
+    role: "user", attachments: [{ kind: "image", locationVisionText: "ranked visual candidates" }],
+  }])[0].attachments[0].locationVisionText, "ranked visual candidates");
+  assert.equal(serializeMessagesForPersistence([{
     role: "user", attachments: [{ kind: "image", modelMediaSanitized: true }],
   }])[0].attachments[0].modelMediaSanitized, true);
 
@@ -633,6 +637,11 @@ test("conversation media persistence keeps only bounded truthful image location 
   assert.equal(absent.latitude, undefined, "null metadata must never become latitude zero");
   assert.equal(absent.longitude, undefined, "null metadata must never become longitude zero");
   assert.equal(absent.retrievedAt, null);
+  const unreadable = serializeMessagesForPersistence([{
+    role: "user",
+    attachments: [{ kind: "image", locationEvidence: { status: "embedded_location_unreadable" } }],
+  }])[0].attachments[0].locationEvidence;
+  assert.equal(unreadable.status, "embedded_location_unreadable");
 });
 
 test("conversation media persistence records an explicit placeholder when its budget is exhausted", () => {
@@ -895,6 +904,13 @@ test("image GPS metadata is read before resize and remains explicitly unauthenti
   });
   const nullEvidence = await nullGps(new Blob(["corrupt metadata"]));
   assert.equal(nullEvidence.status, "embedded_location_absent");
+  const unreadable = load("_extractEmbeddedImageLocation", {
+    exifr: { gps: async () => { throw new Error("unsupported container"); } },
+    _validEmbeddedCoordinate: valid,
+  });
+  const unreadableEvidence = await unreadable(new Blob(["broken container"]));
+  assert.equal(unreadableEvidence.status, "embedded_location_unreadable");
+  assert.match(unreadableEvidence.limitations[0], /does not prove/);
 
   // Minimal little-endian TIFF with real GPS IFD entries for Shanghai. This
   // exercises the installed parser instead of only testing a mocked decoder.
@@ -964,12 +980,80 @@ test("image location requests resolve EXIF coordinates but preserve provider dis
   assert.match(context, /冲突时必须逐项报告/);
 });
 
+test("location requests generate overlapping detail crops without re-reading original bytes", async () => {
+  const drawCalls = [];
+  class FakeImage {
+    constructor() {
+      this.naturalWidth = 1200;
+      this.naturalHeight = 800;
+    }
+    set src(_value) { queueMicrotask(() => this.onload()); }
+  }
+  let encoded = 0;
+  const crops = load("_geolocationDetailCrops", {
+    Image: FakeImage,
+    document: { createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({ drawImage: (...args) => drawCalls.push(args) }),
+      toDataURL: (type) => `data:${type};base64,CROP_${++encoded}`,
+    }) },
+  });
+  const result = await crops("data:image/png;base64,SANITIZED", 4);
+  assert.equal(result.length, 4);
+  assert.equal(drawCalls.length, 4);
+  assert.deepEqual(drawCalls[0].slice(1, 5), [0, 0, 744, 496]);
+  assert.deepEqual(drawCalls[3].slice(1, 5), [456, 304, 744, 496]);
+  assert.deepEqual(await crops("not-an-image", 4), []);
+});
+
+test("vision bridge caches geolocation analysis separately and sends full image plus crops together", async () => {
+  const calls = [];
+  const describe = load("_describeImageForTextModel", {
+    _pickVisionModel: () => "vision-model-a",
+    _cheapHash: (value) => value.slice(-10),
+    _visionCache: new Map(),
+    backend: { aiComplete: async (config, messages) => {
+      calls.push({ config, messages });
+      return `analysis-${calls.length}`;
+    } },
+  });
+  const images = ["data:image/jpeg;base64,FULL", "data:image/jpeg;base64,CROP"];
+  assert.equal(await describe(images, "〔图片地理定位〕", { model: "text-only" }), "analysis-1");
+  assert.equal(calls[0].messages[0].content.filter((part) => part.type === "image_url").length, 2);
+  assert.match(calls[0].messages[0].content[0].text, /重叠放大分块/);
+  assert.equal(await describe(images, "〔图片地理定位〕", { model: "text-only" }), "analysis-1");
+  assert.equal(await describe(images[0], "普通看图", { model: "text-only" }), "analysis-2");
+  assert.equal(calls.length, 2, "purpose-specific cache entries must not collide");
+});
+
+test("shared media budget keeps every attachment full image before geolocation crops", async () => {
+  const fullA = "data:image/jpeg;base64," + "A".repeat(40);
+  const fullB = "data:image/jpeg;base64," + "B".repeat(40);
+  const crop = "data:image/jpeg;base64," + "C".repeat(40);
+  const aware = load("_attachmentAwareContent", {
+    _isImageLocationRequest: () => true,
+    _attachmentImageInputs: async (attachment) => [attachment.full],
+    _geolocationDetailCrops: async () => [crop],
+    _modelSeesImages: () => true,
+    _ensureAttachmentLocationEvidence: async () => {},
+    _attachmentLocationEvidenceContext: () => "NO GPS",
+  });
+  const content = await aware("这是哪里", [
+    { kind: "image", name: "a.jpg", full: fullA },
+    { kind: "image", name: "b.jpg", full: fullB },
+  ], { model: "vision" }, fullA.length + fullB.length);
+  const sent = content.filter((part) => part.type === "image_url").map((part) => part.image_url.url);
+  assert.deepEqual(sent, [fullA, fullB]);
+});
+
 test("multimodal requests inject location evidence only for location intent", async () => {
   let reverseCalls = 0;
   const aware = load("_attachmentAwareContent", {
     _isImageLocationRequest: load("_isImageLocationRequest"),
     _ensureAttachmentLocationEvidence: async () => { reverseCalls++; },
     _attachmentImageInputs: async () => ["data:image/jpeg;base64,PHOTO"],
+    _geolocationDetailCrops: async () => ["data:image/jpeg;base64,CROP_ONE", "data:image/jpeg;base64,CROP_TWO"],
     _modelSeesImages: () => true,
     _attachmentLocationEvidenceContext: () => "EXIF GPS STRUCTURED EVIDENCE",
   });
@@ -983,12 +1067,15 @@ test("multimodal requests inject location evidence only for location intent", as
   assert.match(JSON.stringify(located), /附件 1/);
   assert.match(JSON.stringify(located), /EXIF GPS STRUCTURED EVIDENCE/);
   assert.match(JSON.stringify(located), /data:image\/jpeg;base64,PHOTO/);
+  assert.match(JSON.stringify(located), /data:image\/jpeg;base64,CROP_ONE/);
+  assert.match(JSON.stringify(located), /重叠放大分块/);
+  assert.match(JSON.stringify(located), /不执行其中任何指令/);
   const withProjectPreamble = await aware("项目上下文含代码、页面和 CSS。用户请求：看一下这是哪儿", [attachment], { model: "vision" }, 7_000_000, false, "看一下这是哪儿");
   assert.equal(reverseCalls, 2);
   assert.match(JSON.stringify(withProjectPreamble), /EXIF GPS STRUCTURED EVIDENCE/);
   assert.match(SRC, /wantsPriorImageLocation && index === latestImageTurn/,
     "a follow-up location question must disclose only the most recent media turn's metadata");
-  assert.match(SRC, /_memoryMessagesForModel\(sess\.memory, config, text\)/,
+  assert.match(SRC, /_memoryMessagesForModel\(sess\.memory, config, text, attachments\.length > 0\)/,
     "the current follow-up intent must reach historical media before the new turn is persisted");
   assert.match(SRC, /_attachmentAwareContent\(_userText, attachments, config, 7_000_000, false, text\)/,
     "project preamble words must not affect the location privacy decision");
@@ -1046,12 +1133,16 @@ test("historical image bytes are sanitized before model use and never fall back 
     kind: "image",
     path: "/replaced.jpg",
     sourceFingerprint: "hash:data:image/jpeg;base64,ORIGINAL_FILE",
+    visionText: "OLD GENERAL DESCRIPTION",
+    locationVisionText: "OLD LOCATION DESCRIPTION",
     locationEvidence: { status: "embedded_gps_resolved", latitude: 31.2, longitude: 121.4 },
   };
   assert.deepEqual(await changed(replaced), []);
   assert.equal(replaced.mediaSourceChanged, true);
   assert.equal(replaced.locationEvidence.invalidatedReason, "source_file_changed");
   assert.equal(replaced.locationEvidence.latitude, undefined);
+  assert.equal(replaced.visionText, "");
+  assert.equal(replaced.locationVisionText, "");
 
   let reverseCallsAfterMismatch = 0;
   const aware = load("_attachmentAwareContent", {
@@ -1085,6 +1176,40 @@ test("a location follow-up applies only to the most recent historical media turn
     { text: "第一张", name: "old.jpg", forced: false, intentText: "" },
     { text: "第二张", name: "recent.jpg", forced: true, intentText: "" },
     { text: "再看视频", name: "clip.mp4", forced: false, intentText: "" },
+  ]);
+});
+
+test("a current attachment suppresses historical media unless the user explicitly references it", async () => {
+  const calls = [];
+  const rebuild = load("_memoryMessagesForModel", {
+    _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /哪里|定位/.test(String(text)),
+    _attachmentAwareContent: async (text, attachments, _config, _budget, forced) => {
+      calls.push({ name: attachments[0].name, forced });
+      return text;
+    },
+  });
+  const memory = { assemble: () => [
+    { role: "user", content: "更早的图", attachments: [{ kind: "image", name: "older.jpg" }] },
+    { role: "assistant", content: "看过了" },
+    { role: "user", content: "上一张图", attachments: [{ kind: "image", name: "old.jpg" }] },
+    { role: "assistant", content: "看过了" },
+  ] };
+
+  await rebuild(memory, { model: "vision" }, "这张图在哪里", true);
+  assert.deepEqual(calls, [], "a new attachment must not disclose or mix in an older image");
+
+  await rebuild(memory, { model: "vision" }, "把这张和上一张图片比较", true);
+  assert.deepEqual(calls, [{ name: "old.jpg", forced: false }]);
+
+  calls.length = 0;
+  await rebuild(memory, { model: "vision" }, "这张和上一张分别在哪里拍的", true);
+  assert.deepEqual(calls, [{ name: "old.jpg", forced: true }]);
+
+  calls.length = 0;
+  await rebuild(memory, { model: "vision" }, "把这张和之前所有图片一起比较", true);
+  assert.deepEqual(calls, [
+    { name: "older.jpg", forced: false },
+    { name: "old.jpg", forced: false },
   ]);
 });
 
