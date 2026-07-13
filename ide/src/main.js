@@ -9116,7 +9116,11 @@ function _engineeringReferenceContextBlock(body, cacheHit, cacheStoredAt) {
 }
 
 async function _buildEngineeringReferenceContext(text, root, stack, profile = _engineeringTaskProfile(text), referenceBudgetMs = 4000) {
-  if (!inTauri || !profile.needsReferences) return "";
+  // External communities are evidence sources the model may deliberately load through
+  // search_tools. They must never run as a hidden preflight merely because a coding task
+  // mentions a framework, API, version, or compatibility: local source, memory, the built-in
+  // knowledge base, and connected MCP/database tools get the first chance to answer.
+  if (!inTauri || !profile.needsReferences || !profile.externalReferencesApproved) return "";
   const startedAt = Date.now();
   const totalBudgetMs = Math.max(100, Math.min(12000, Number(referenceBudgetMs) || 4000));
   const query = _referenceQuery(text, stack);
@@ -9943,6 +9947,63 @@ async function _readyAiConfig() {
   return config;
 }
 
+// A declaration of location, identity, or preference is useful conversation
+// context, but it is not an instruction to inspect the workspace or query an
+// external source. Keep this conservative: any attachment, question, or action
+// signal falls through to the normal task path.
+function _isContextOnlyMessage(text, attachments = []) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  const hasAttachments = Array.isArray(attachments) ? attachments.length > 0 : !!attachments;
+  if (hasAttachments) return false;
+
+  const lower = value.toLowerCase();
+  const contextPrefixes = [
+    "我目前在", "我现在在", "我住在", "我位于", "我的位置是", "我的地址是",
+    "这是我的地址", "这里是我的地址", "我来自", "我叫", "我的名字是", "我喜欢",
+    "我不喜欢", "我的偏好是", "我偏好", "我通常", "我习惯", "我们目前在",
+    "我们现在在", "我们住在", "我们位于", "我们的地址是",
+  ];
+  const englishContextPrefixes = [
+    "i live ", "i live in ", "i am at ", "i'm at ", "my address is ",
+    "my location is ", "my name is ", "i like ", "i dislike ", "i prefer ",
+    "my preference is ", "we are at ", "we live in ",
+  ];
+  if (!contextPrefixes.some((prefix) => value.startsWith(prefix))
+      && !englishContextPrefixes.some((prefix) => lower.startsWith(prefix))) return false;
+
+  const requestSignals = [
+    "?", "？", "请", "帮我", "麻烦", "告诉我", "给我", "查询", "搜索", "查", "搜",
+    "找", "想知道", "想找", "想问", "想要", "推荐", "分析", "解释", "比较", "评估",
+    "规划", "定位", "导航", "列出", "带我", "记住", "记录", "保存", "别忘", "不要忘",
+    "看看", "看一下", "怎么", "如何", "为什么", "什么", "啥", "有没有", "有无", "附近有",
+    "周围有", "周边有", "你觉得", "建议", "哪里", "哪家", "哪种", "哪个",
+    "是否", "能否", "可以吗", "可不可以", "做一个", "做个", "修复", "解决", "修改",
+    "改进", "优化", "实现", "创建", "新增", "删除", "运行", "编译", "打包", "部署",
+    "测试", "审查", "检查", "调研", "研究", "继续", "生成", "打开", "关闭", "安装",
+    "更新", "提交", "推送", "下载", "上传",
+  ];
+  const englishRequestSignals = [
+    "please ", "can you", "could you", "would you", "tell me", "help me", "find ",
+    "search ", "look up", "recommend", "show me", "explain", "compare", "analyze",
+    "check ", "fix ", "build ", "create ", "implement", "run ", "test ", "deploy",
+    "remember", "save ", "update ", "what ", "where ", "which ", "how ", "why ",
+  ];
+  return !requestSignals.some((signal) => value.includes(signal))
+    && !englishRequestSignals.some((signal) => lower.includes(signal));
+}
+
+function _turnPreparationPolicy(text, attachments = []) {
+  const contextOnly = _isContextOnlyMessage(text, attachments);
+  return {
+    contextOnly,
+    gatherAgentContext: !contextOnly,
+    refreshFileSkills: !contextOnly,
+    buildToolHint: !contextOnly,
+    connectMcp: !contextOnly,
+  };
+}
+
 async function sendPrompt(text, attachments = [], readyConfig = null) {
   const config = readyConfig || await _readyAiConfig();
   if (!config) return;
@@ -9959,6 +10020,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // is honored as-is. `effectiveMode` drives this turn's prompt + tools + dispatch
   // (never the global _currentAiMode, so concurrent tabs don't fight over it).
   const effectiveMode = _currentAiMode === "auto" ? "agent" : _currentAiMode;
+  const _turnPolicy = _turnPreparationPolicy(text, attachments);
   if (_currentAiMode === "auto") {
     const picked = _AI_MODES.find(m => m.id === effectiveMode);
     if (picked) showToast(`Auto → ${picked.label}`);
@@ -9973,7 +10035,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
 
   // Compact a long conversation before this turn (summarize older history).
   // Hard-bounded: a slow summary call must never silently hang the send.
-  try { await Promise.race([_compactHistoryIfHuge(config, sess), new Promise((r) => setTimeout(r, 20000))]); } catch {}
+  if (!_turnPolicy.contextOnly) {
+    try { await Promise.race([_compactHistoryIfHuge(config, sess), new Promise((r) => setTimeout(r, 20000))]); } catch {}
+  }
 
   // Keep the active chat's project label in sync with the folder it's actually
   // operating on (handles opening a different project mid-conversation).
@@ -10003,17 +10067,22 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Selected model is an IMAGE model → generate the image directly from this message,
   // instead of feeding it to the agent loop (an image model can't handle the tools +
   // system chat request → that's the "网络/服务波动 重试 3/3" you saw).
-  if (_isImageModel(config.model)) {
+  if (!_turnPolicy.contextOnly && _isImageModel(config.model)) {
     await _runDirectImageGen(text, config, sess, attachments);
     return;
   }
 
-  const sysPrompt = _P(effectiveMode, _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent);
+  const sysPrompt = _turnPolicy.contextOnly
+    ? "你是 Michael IDE 的中文助手。用户这条消息只是在提供位置、身份、偏好或其他背景，没有提出问题或行动要求。简短确认已理解即可；不得替用户补造目标，不得查询附近内容、联网、读项目、调用 MCP/数据库或执行任何工具。等待用户给出具体问题。具体地址等敏感信息不必在回复中完整复述。"
+    : _P(effectiveMode, _AI_MODE_PROMPTS[effectiveMode] || _AI_MODE_PROMPTS.agent);
 
-  const osDetail = await _detectOSDetail();
-  let contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
+  let contextBlock = "";
+  if (_turnPolicy.gatherAgentContext) {
+    const osDetail = await _detectOSDetail();
+    contextBlock = `\n操作系统: ${osDetail.os} ${osDetail.version} | Shell: ${osDetail.shell} | 架构: ${osDetail.arch}`;
+  }
   const _pendingContextEvidence = [];
-  if (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan") {
+  if (_turnPolicy.gatherAgentContext && (effectiveMode === "agent" || effectiveMode === "explorer" || effectiveMode === "reviewer" || effectiveMode === "plan")) {
     if (rootPath || workspaceRoots.length) {
       // Bounded: a slow context build (file reads / tree scan) must not hang the send.
       try { contextBlock += "\n" + (await Promise.race([_gatherAgentContext(text, sess.project), new Promise((r) => setTimeout(() => r(""), 20000))]) || ""); } catch {}
@@ -10023,7 +10092,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   }
   const _contextRoot = String(sess.project || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
   const _activeForSession = activePath && _contextRoot && _pathIsAtOrUnder(activePath, _contextRoot) ? activePath : "";
-  if (_activeForSession) {
+  if (_turnPolicy.gatherAgentContext && _activeForSession) {
     const f = openFiles.get(_activeForSession);
     if (f?.model) {
       const sel = monacoEditor.getModel() === f.model ? monacoEditor.getSelection() : null;
@@ -10056,24 +10125,32 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   }
 
   // ── 提示词缓存: system = 纯静态前缀(跨轮复用), 动态内容下沉到 user 消息末尾 ──
-  const _growthBlock = growth.promptBlock(effectiveMode);
-  try { await Promise.race([_refreshFileSkills(_curRoot), new Promise((resolve) => setTimeout(resolve, 5000))]); } catch {}
+  const _growthBlock = _turnPolicy.contextOnly ? "" : growth.promptBlock(effectiveMode);
+  if (_turnPolicy.refreshFileSkills) {
+    try { await Promise.race([_refreshFileSkills(_curRoot), new Promise((resolve) => setTimeout(resolve, 5000))]); } catch {}
+  }
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
-  const skillsBlock = _activeSkillsBlock();
-  const fullPrompt = sysPrompt + _modelStyleTuning(config.model) + skillsBlock + _currentDateBlock() + _authContextBlock();
+  const skillsBlock = _turnPolicy.contextOnly ? "" : _activeSkillsBlock();
+  const fullPrompt = _turnPolicy.contextOnly
+    ? sysPrompt + _currentDateBlock()
+    : sysPrompt + _modelStyleTuning(config.model) + skillsBlock + _currentDateBlock() + _authContextBlock();
 
   _compactHistoryIfNeeded(sess);
 
   const messages = [{ role: "system", content: fullPrompt }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
-  for (const m of await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0)) messages.push(m);
+  // A context-only declaration needs no old project transcript to acknowledge it;
+  // omitting history also prevents stale file/media context from inventing a task.
+  if (!_turnPolicy.contextOnly) {
+    for (const m of await _memoryMessagesForModel(sess.memory, config, text, attachments.length > 0)) messages.push(m);
+  }
   // Workspace-switch re-anchor: if the user opened a DIFFERENT folder mid-conversation, the history
   // above is full of the OLD project's paths/files — the model keeps working on the old dir unless
   // told. Drop a loud, RECENT notice (right before the new request) so it re-anchors on the current
   // root and forgets the stale paths. First send just records the root (no notice, no false alarm).
-  {
+  if (!_turnPolicy.contextOnly) {
     const _curRoot = rootPath || workspaceRoots[0] || "";
     if (sess._anchorRoot && _curRoot && sess._anchorRoot !== _curRoot && sess.memory.recent.length) {
       messages.push({ role: "user", content: `⚠️【工作区已切换 — 最高优先级】当前项目根目录已从「${sess._anchorRoot}」换成「${_curRoot}」。从这条之后：① 所有相对路径一律基于「${_curRoot}」；② **彻底忘掉上面对话里旧目录「${sess._anchorRoot}」的目录结构、文件路径、代码内容**，那些已作废；③ 需要任何文件先在**新目录**里 list_dir / read_file 重新确认真实路径，**绝不要再去读写旧目录下的文件**。先按新目录重新摸清，再动手。` });
@@ -10086,7 +10163,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // @file mentions → pull each pinned file's content into THIS turn's context
   // (the visible bubble and stored history keep just the "@path" the user typed).
   let _atContext = "";
-  const _mentioned = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
+  const _mentioned = _turnPolicy.contextOnly ? [] : [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
   if (_mentioned.length && (rootPath || workspaceRoots.length)) {
     const _r = (rootPath || workspaceRoots[0]).replace(/\/$/, "");
     const _seen = new Set();
@@ -10117,10 +10194,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // system prompt — so it never invalidates the cached static prefix above. Only
   // the lean `text` is stored in history, so this big preamble is sent once (this
   // turn) and doesn't bloat every future request.
-  const _imgModelAvail = (effectiveMode === "agent") ? String(_autoImageModel() || "").trim() : "";
+  const _imgModelAvail = (!_turnPolicy.contextOnly && effectiveMode === "agent") ? String(_autoImageModel() || "").trim() : "";
   const _imgHint = _imgModelAvail
     ? `\n🎨 **生图能力已就绪**：后台有 \`${_imgModelAvail}\` 模型，调 generate_image 即可生成图片。`
-    : (effectiveMode === "agent" ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
+    : (!_turnPolicy.contextOnly && effectiveMode === "agent" ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
   const _dynPreamble =
     (_growthBlock ? _growthBlock + "\n\n" : "") +
     (_imgHint ? _imgHint + "\n\n" : "") +
@@ -10128,12 +10205,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Tool-RAG (A): spotlight the tools most relevant to this task, at the END of the
   // message (high-attention recency) so weak models actually reach for the right one.
   // Semantic rerank (cheap model, intent-aware, covers MCP tools) when it adds value.
-  const _toolHint = (effectiveMode === "agent") ? await _buildToolHint(text, config) : "";
+  const _toolHint = (_turnPolicy.buildToolHint && effectiveMode === "agent") ? await _buildToolHint(text, config) : "";
   // Experiential memory: a matching reusable WORKFLOW (AWM procedural memory, if this
   // task type recurred) + the most similar past episodes' insights (ExpeL) — both at
   // the recency slot so the agent reuses proven recipes for this project.
   const _expRoot = rootPath || workspaceRoots[0] || "";
-  const _expHint = (effectiveMode === "agent") ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
+  const _expHint = (!_turnPolicy.contextOnly && effectiveMode === "agent") ? (_workflowHintBlock(text, _expRoot) + _episodeHintBlock(text, _expRoot)) : "";
   // Put the user's ACTUAL request LAST, clearly delimited — recency = the model's
   // highest-attention slot. Burying the question in the MIDDLE of a big preamble
   // (project context + the up-to-12KB current-file dump + guides) was a top cause of
@@ -10142,9 +10219,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // background context + guidance first → then the real ask, marked as the thing to
   // actually respond to.
   const _contextPreamble = _dynPreamble + _atContext + _toolHint + _expHint;
-  const _userText = _contextPreamble
-    + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
-    + text;
+  const _requestBoundary = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑";
+  const _userText = _turnPolicy.contextOnly
+    ? _requestBoundary + "。\n\n" + text
+    : _contextPreamble + _requestBoundary
+      + "、别去处理用户没提的东西。**但**——用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时（小白经常这样），**当前打开的文件 / 选中的代码 / 最近的报错就是他最可能在说的东西**：用它把这句话还原成清晰的技术意图再动手，别反问「你指哪个」。先答 / 做用户要的这一件事。\n\n"
+      + text;
   const userContent = await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text);
   messages.push({ role: "user", content: userContent });
   sess.memory.push({ role: "user", content: text, attachments });
@@ -10152,7 +10232,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
 
   // Growth: record this turn's engagement signals for the learner model, tagged
   // with the project so skill practice accumulates across projects (越战越勇).
-  {
+  if (!_turnPolicy.contextOnly) {
     const _gRoot = (rootPath || workspaceRoots[0] || "").replace(/\/$/, "");
     growth.signal("message-sent", {
       mode: effectiveMode,
@@ -10185,13 +10265,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // Per-tab working directory: each chat tab runs its agent in its OWN folder
       // (sess.project), so multiple tabs can target different projects at once. Falls
       // back to the global workspace root for tabs that never set one.
-      if (sess.project && inTauri && !workspaceRoots.includes(sess.project)) { try { await backend.registerWorkspaceRoot(sess.project); } catch {} }
+      if (!_turnPolicy.contextOnly && sess.project && inTauri && !workspaceRoots.includes(sess.project)) { try { await backend.registerWorkspaceRoot(sess.project); } catch {} }
       sess._pendingContextEvidence = _pendingContextEvidence;
-      await _runAgenticLoop({ config, messages, root: sess.project || rootPath || workspaceRoots[0] || "", session: sess, mode: effectiveMode, task: text, skillsBlock });
+      await _runAgenticLoop({
+        config, messages, root: sess.project || rootPath || workspaceRoots[0] || "", session: sess,
+        mode: effectiveMode, task: text, skillsBlock, contextOnly: _turnPolicy.contextOnly,
+        connectMcp: _turnPolicy.connectMcp,
+      });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
       _maybeRenderChoices(sess, messages); // if the answer offered A/B/C… options → clickable chips
-      _maybeSuggestNext(sess, messages, config); // Codex-style: offer 2-4 clickable next steps
+      if (!_turnPolicy.contextOnly) _maybeSuggestNext(sess, messages, config); // Codex-style: offer 2-4 clickable next steps
     } catch (e) {
       // Never leave a dead Stop button + silent no-response on an unexpected throw.
       console.error("[agent] run failed:", e);
@@ -18782,7 +18866,7 @@ function _shouldAwaitIntentForPlan(run) {
   if (engineering.explicitMutation || engineering.explicitReadOnly) return false;
   return true;
 }
-async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "" }) {
+async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "", contextOnly = false, connectMcp = true }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // Enable extended thinking for models that support it (Claude / o-series) so the
   // user can see the model's reasoning in real-time (实时推理). For DeepSeek R1 /
@@ -18799,7 +18883,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // global only if a caller didn't pass it.
   session = session || _currentSession();
   root = String(root || "").replace(/\/+$/, "");
-  const run = { session, root, mode: mode || _currentAiMode, perm: _currentAiPerm, checkpoint: new Map(), recording: [], _recStart: (Date.now ? Date.now() : 0), _originalText: task || "" };
+  const run = {
+    session, root, mode: mode || _currentAiMode, perm: _currentAiPerm, checkpoint: new Map(),
+    recording: [], _recStart: (Date.now ? Date.now() : 0), _originalText: task || "",
+    _contextOnly: !!contextOnly, _connectMcp: connectMcp !== false,
+  };
   run._pendingContextEvidence = Array.isArray(session?._pendingContextEvidence) ? session._pendingContextEvidence.splice(0) : [];
   run.skillsBlock = skillsBlock;
   run.stack = _projectStacks.get(root) || null;
@@ -18813,7 +18901,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   try { config.requestId = run._reqId; } catch {}
   // 云端提示词：首次（_remotePrompts 为空）必须 await 拿到再发消息，否则模型收不到完整指引；
   // 后续有缓存时 fire-and-forget 异步刷新（不阻塞发送）。
-  try { if (!_remotePrompts) { await _fetchIdePrompts(); } else { _fetchIdePrompts(); } } catch {}
+  if (!run._contextOnly) {
+    try { if (!_remotePrompts) { await _fetchIdePrompts(); } else { _fetchIdePrompts(); } } catch {}
+  }
   // Mark streaming + flip the Stop button FIRST, before any await — otherwise an
   // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
   // while _isStreaming() is still false → the Stop click is a dead no-op.
@@ -18828,7 +18918,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const isAgent = run.mode === "agent";
   // Connect external MCP servers (cached), but HARD-BOUNDED so a wedged/slow
   // server in .mcp.json can never hang the whole run (this was a real freeze).
-  if (isAgent) {
+  if (isAgent && run._connectMcp) {
     try {
       const snapshot = await Promise.race([
         _ensureMcpTools(root),
@@ -18852,8 +18942,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   }
   // Keep the complete registry and MCP routing state on the run. Only the per-turn model payload
   // is windowed; search_tools/direct-by-name can swap an omitted schema into that bounded window.
-  run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache);
-  const initialTools = _selectInitialTools(isAgent, run._originalText, run.mcpToolCache);
+  run._toolRegistry = run._contextOnly ? new Map() : _buildToolRegistry(isAgent, run.mcpToolCache);
+  const initialTools = run._contextOnly ? [] : _selectInitialTools(isAgent, run._originalText, run.mcpToolCache);
   const desiredCoreNames = new Set(initialTools
     .map((tool) => tool?.function?.name || "")
     .filter((name) => name && !name.startsWith("mcp__")));
@@ -18960,7 +19050,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // fallback is only used until _classifyIntent resolves.
   run._intent = null;
   const _quick = () => (run._intent ? run._intent.kind === "answer" : task.trim().length < 80);
-  run._intentReady = _classifyIntent(task, config).then((r) => {
+  run._intentReady = (run._contextOnly ? Promise.resolve({
+    kind: "answer", effect: "answer", target: "external", steps: 1, needs_tools: false,
+  }) : _classifyIntent(task, config)).then((r) => {
     if (!r || !_live()) return null;
     run._intent = r;
     run.engineering = _engineeringProfileWithIntent(run.engineering, r);

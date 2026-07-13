@@ -134,6 +134,74 @@ test("_setEditorModelIfChanged skips redundant Monaco lifecycle resets", () => {
   assert.equal(editor.calls, 1);
 });
 
+test("context-only turn preparation skips workspace, skill, tool-rank, and MCP preflight", () => {
+  const isContextOnly = load("_isContextOnlyMessage");
+  const policyFor = load("_turnPreparationPolicy", { _isContextOnlyMessage: isContextOnly });
+  const contexts = [
+    "我目前在上海胶州路282号",
+    "我现在在 Tokyo Station",
+    "我叫 Michael",
+    "我喜欢旅游",
+    "我的偏好是清淡饮食",
+    "My location is 1 Market Street",
+    "I prefer quiet hotels",
+  ];
+  for (const context of contexts) {
+    assert.deepEqual(policyFor(context), {
+      contextOnly: true,
+      gatherAgentContext: false,
+      refreshFileSkills: false,
+      buildToolHint: false,
+      connectMcp: false,
+    }, `missed context-only declaration: ${context}`);
+  }
+});
+
+test("context-only fast path fails open for questions, actions, and attachments", () => {
+  const isContextOnly = load("_isContextOnlyMessage");
+  const policyFor = load("_turnPreparationPolicy", { _isContextOnlyMessage: isContextOnly });
+  const requests = [
+    "我目前在上海胶州路282号，附近有什么好吃的？",
+    "我目前在上海胶州路282号，附近有啥好吃的",
+    "我目前在上海胶州路282号，查附近餐厅",
+    "我目前在上海胶州路282号，找个咖啡店",
+    "我目前在上海胶州路282号，导航到外滩",
+    "我目前在上海胶州路282号，记住这个地址",
+    "我喜欢旅游，帮我规划上海三日行程",
+    "I am at 1 Market Street. Find nearby coffee.",
+    "I prefer quiet hotels; recommend three near Kyoto Station.",
+    "我是想让你继续修这个 bug",
+    "I'm trying to get you to fix this bug",
+  ];
+  for (const request of requests) {
+    assert.equal(policyFor(request).contextOnly, false, `explicit task was suppressed: ${request}`);
+  }
+  assert.equal(policyFor("我目前在上海胶州路282号", [{ kind: "image" }]).contextOnly, false,
+    "media needs the normal multimodal path even when its caption looks like context");
+});
+
+test("send path applies the context-only policy before every expensive preflight", () => {
+  const send = extractFn("sendPrompt");
+  const policyAt = send.indexOf("_turnPreparationPolicy(text, attachments)");
+  assert.ok(policyAt >= 0 && policyAt < send.indexOf("_gatherAgentContext(text, sess.project)"));
+  assert.match(send, /if \(_turnPolicy\.gatherAgentContext[\s\S]*?_gatherAgentContext\(text, sess\.project\)/);
+  assert.match(send, /if \(_turnPolicy\.refreshFileSkills\)[\s\S]*?_refreshFileSkills\(_curRoot\)/);
+  assert.match(send, /_turnPolicy\.buildToolHint && effectiveMode === "agent"\)[^\n]*_buildToolHint\(text, config\)/);
+  assert.match(send, /contextOnly: _turnPolicy\.contextOnly,[\s\S]*?connectMcp: _turnPolicy\.connectMcp/);
+  assert.match(send, /if \(!_turnPolicy\.contextOnly\) \{[\s\S]*?growth\.signal\("message-sent"/);
+  assert.match(send, /if \(!_turnPolicy\.contextOnly && sess\.project && inTauri && !workspaceRoots\.includes\(sess\.project\)\)/);
+
+  // extractFn's tiny scanner treats _runAgenticLoop's destructured parameter as
+  // the body, so inspect the shipped source for these loop-level guards.
+  assert.match(SRC, /if \(isAgent && run\._connectMcp\)[\s\S]*?_ensureMcpTools\(root\)/);
+  assert.match(SRC, /run\._toolRegistry = run\._contextOnly \? new Map\(\) : _buildToolRegistry/);
+  assert.match(SRC, /const initialTools = run\._contextOnly \? \[\] : _selectInitialTools/);
+  assert.match(SRC, /const toolSchemas = initialWindow\.tools/);
+  assert.match(SRC, /run\._contextOnly \? new Map\(\)[\s\S]*?run\._contextOnly \? \[\]/);
+  assert.match(SRC, /run\._contextOnly \? Promise\.resolve\([\s\S]*?needs_tools: false/);
+  assert.match(send, /if \(!_turnPolicy\.contextOnly\) \{[\s\S]*?_memoryMessagesForModel/);
+});
+
 test("session restore builds saved tabs before one final activation", () => {
   assert.match(SRC, /openFile\(t\.path, t\.name, false\)/);
   assert.match(SRC, /if \(session\.activePath && openFiles\.has\(session\.activePath\)\) \{\s*activate\(session\.activePath\)/);
@@ -3065,6 +3133,19 @@ test("slow community references cannot erase stable local engineering context", 
   assert.equal(await within(Promise.reject(new Error("offline")), 10, "fallback"), "fallback");
 });
 
+test("engineering context never performs hidden community retrieval before explicit approval", async () => {
+  const build = load("_buildEngineeringReferenceContext", {
+    inTauri: true,
+    _engineeringTaskProfile: () => ({ needsReferences: true }),
+    backend: { invoke: async () => { throw new Error("hidden external call"); } },
+  });
+  assert.equal(
+    await build("接入最新版支付 API 并确认兼容性", "/repo", {}, { needsReferences: true }, 80),
+    "",
+  );
+  assert.match(extractFn("_buildEngineeringReferenceContext"), /!profile\.externalReferencesApproved/);
+});
+
 test("fast community summaries survive when optional page deep-reading is slow", async () => {
   const settle = load("_settlePromisesWithin");
   const render = load("_engineeringReferenceResultBlock");
@@ -3084,7 +3165,7 @@ test("fast community summaries survive when optional page deep-reading is slow",
     _autoDeepRead: async () => new Promise(() => {}),
   });
 
-  const result = await build("fix cancellation", "/repo", { lang: "Rust" }, { needsReferences: true }, 80);
+  const result = await build("fix cancellation", "/repo", { lang: "Rust" }, { needsReferences: true, externalReferencesApproved: true }, 80);
   assert.match(result, /FAST_COMMUNITY_SUMMARY/);
   assert.match(result, /cache_status: miss/);
   assert.match(result, /结果保留各来源的相关性或上游顺序，不表示按时间排序或一定是最新/);
@@ -3116,7 +3197,7 @@ test("one slow forum cannot hide another community source that already returned"
     _autoDeepRead: async () => ({ text: "", count: 0 }),
   });
 
-  const result = await build("fix login", "/repo", {}, { needsReferences: true }, 80);
+  const result = await build("fix login", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 80);
   assert.match(result, /FAST_GITHUB_RESULT/);
   assert.match(result, /来源 2超时/);
   assert.equal(cache.size, 0, "a sparse partial round must not be cached as all-successful");
@@ -3146,8 +3227,8 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
     _engineeringReferenceContextBlock: contextBlock,
     _autoDeepRead: async () => ({ text: "", count: 0 }),
   });
-  const first = await build("fix cache", "/repo", {}, { needsReferences: true }, 100);
-  const second = await build("fix cache", "/repo", {}, { needsReferences: true }, 100);
+  const first = await build("fix cache", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
+  const second = await build("fix cache", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
   assert.equal(invokes, 1);
   assert.match(first, /cache_status: miss/);
   assert.match(first, /context_generated_at:/);
@@ -3172,8 +3253,8 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
     _engineeringReferenceContextBlock: contextBlock,
     _autoDeepRead: async () => ({ text: "", count: 0 }),
   });
-  await failedBuild("fail", "/repo", {}, { needsReferences: true }, 100);
-  await failedBuild("fail", "/repo", {}, { needsReferences: true }, 100);
+  await failedBuild("fail", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
+  await failedBuild("fail", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
   assert.equal(failedInvokes, 2, "all-failed retrieval rounds must not poison the cache for 15 minutes");
   assert.equal(failedCache.size, 0);
 
@@ -3192,8 +3273,8 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
     _engineeringReferenceContextBlock: contextBlock,
     _autoDeepRead: async () => ({ text: "", count: 0 }),
   });
-  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true }, 100);
-  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true }, 100);
+  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
+  await timedOutBuild("timeout", "/repo", {}, { needsReferences: true, externalReferencesApproved: true }, 100);
   assert.equal(timedOutInvokes, 4, "all-timeout sparse rounds must be retried instead of cached");
   assert.equal(timedOutCache.size, 0);
 });
