@@ -1268,20 +1268,35 @@ fn tools_requested_for_current_task(body: &serde_json::Value) -> HashSet<String>
     else {
         return HashSet::new();
     };
-    let task_start = messages
+    // IDE-owned markers are authoritative task boundaries. Internal verification/continuation
+    // nudges also use role=user, so a generic reverse search would incorrectly treat one of those
+    // as a new task and revoke a tool the model deliberately loaded moments earlier.
+    let marked_task_start = messages
         .iter()
         .enumerate()
         .rev()
         .find(|(_, message)| {
             message.get("role").and_then(|role| role.as_str()) == Some("user")
-                && user_message_text(message).is_some_and(|text| {
-                    extract_marked_user_request(&text).is_some()
-                        || extract_real_user_request(&text).is_some_and(|request| {
+                && user_message_text(message)
+                    .is_some_and(|text| extract_marked_user_request(&text).is_some())
+        })
+        .map(|(index, _)| index);
+    let plain_task_start = || {
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| {
+                message.get("role").and_then(|role| role.as_str()) == Some("user")
+                    && user_message_text(message).is_some_and(|text| {
+                        extract_real_user_request(&text).is_some_and(|request| {
                             !request.starts_with("[系统：") && !request.starts_with("[SYSTEM:")
                         })
-                })
-        })
-        .map_or(0, |(index, _)| index);
+                    })
+            })
+            .map(|(index, _)| index)
+    };
+    let task_start = marked_task_start.or_else(plain_task_start).unwrap_or(0);
 
     messages[task_start..]
         .iter()
@@ -2952,6 +2967,36 @@ mod tests {
             .filter_map(tool_function_name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["web_search", "web_fetch"]);
+
+        let wrapped = wrapped_user_request(
+            "--- 项目上下文 ---\nREADME 背景。",
+            "查最新 Rust 版本和官方迁移说明",
+        );
+        let mut continued_turn = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "user", "content": wrapped},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "tool-2",
+                    "type": "function",
+                    "function": {"name": "search_tools", "arguments": "{\"query\":\"web_search\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "tool-2", "content": "已加载 web_search"},
+                {"role": "user", "content": "[系统：继续完成当前任务并执行验证]"}
+            ]
+        });
+        assemble_into(&headers, &mut continued_turn);
+        let continued_names = continued_turn["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continued_names,
+            ["web_search", "web_fetch"],
+            "an internal continuation nudge must preserve the current task's tool selection"
+        );
 
         let mut next_task = serde_json::json!({
             "model": "claude-sonnet-5",
