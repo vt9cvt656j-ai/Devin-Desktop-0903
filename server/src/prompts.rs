@@ -446,6 +446,9 @@ fn looks_like_context_only_message(query: &str) -> bool {
         "给我",
         "查询",
         "搜索",
+        "查",
+        "搜",
+        "找",
         "查一下",
         "搜一下",
         "找一下",
@@ -458,6 +461,14 @@ fn looks_like_context_only_message(query: &str) -> bool {
         "解释",
         "比较",
         "评估",
+        "规划",
+        "定位",
+        "导航",
+        "列出",
+        "带我",
+        "记住",
+        "记录",
+        "保存",
         "看看",
         "看一下",
         "怎么",
@@ -1477,18 +1488,21 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     } else {
         (loaded_prompt, vec![prompt_name])
     };
-    if !sys.is_empty() {
-        prompt_blocks.extend(routed_blocks);
-    }
     if context_only {
+        // A background-only message needs neither the 60+ KiB agent core nor the shared evidence
+        // catalog. Keep the turn cheap and unambiguous while preserving the request-time clock
+        // that is prepended below.
+        sys.clear();
         prompt_blocks.push("context_only");
-        sys.push_str("\n\n--- 仅上下文消息 ---\n用户这条消息只是在提供位置、身份、偏好或其他背景，没有提出问题或行动要求。简短确认已理解即可；不得替用户补造目标，不得查询附近内容、联网、读项目、调用 MCP/数据库或执行任何工具。等待用户给出具体问题。具体地址等敏感信息不必在回复中完整复述。");
+        sys.push_str("你是 Michael IDE 的中文助手。用户这条消息只是在提供位置、身份、偏好或其他背景，没有提出问题或行动要求。简短确认已理解即可；不得替用户补造目标，不得查询附近内容、联网、读项目、调用 MCP/数据库或执行任何工具。等待用户给出具体问题。具体地址等敏感信息不必在回复中完整复述。");
+    } else if !sys.is_empty() {
+        prompt_blocks.extend(routed_blocks);
     }
     // One shared evidence policy covers every IDE mode. Keeping it separate from
     // tone/personality prompts prevents model-specific style tuning from turning
     // guesses or partial integrations into confident product claims.
     let truthfulness = read_prompt("truthfulness").unwrap_or_default();
-    if !truthfulness.is_empty() {
+    if !context_only && !truthfulness.is_empty() {
         prompt_blocks.push("truthfulness");
         sys.push_str("\n\n");
         sys.push_str(&truthfulness);
@@ -1496,7 +1510,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // Research is a shared task specialization, not a model-tier prompt fork. The compact block
     // describes evidence discipline and how to use the capabilities actually present this turn;
     // the old full-prompt chapter embedded a static catalog of every possible tool.
-    let research_intent = mode == "agent"
+    let research_intent = !context_only
+        && mode == "agent"
         && user_request
             .as_deref()
             .is_some_and(looks_like_research_task);
@@ -1509,7 +1524,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             sys.push_str(&research);
         }
     }
-    let automation_intent = mode == "agent"
+    let automation_intent = !context_only
+        && mode == "agent"
         && user_request
             .as_deref()
             .is_some_and(looks_like_desktop_automation_task);
@@ -1524,15 +1540,17 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // Inject the design guide on any UI/frontend task — not just when the (never-emitted)
     // x-ide-ui header is present. `MICHAEL_UI_GUIDE=0` disables; `=always` forces it on.
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
-    let ui_intent = ui_env.as_deref() == Some("always")
-        || (ui_env.as_deref() != Some("0")
-            && (hdr("x-ide-ui").is_some()
-                || user_request
-                    .as_deref()
-                    .map(|request| {
-                        looks_like_ui_task(request) && !looks_like_desktop_automation_task(request)
-                    })
-                    .unwrap_or(false)));
+    let ui_intent = !context_only
+        && (ui_env.as_deref() == Some("always")
+            || (ui_env.as_deref() != Some("0")
+                && (hdr("x-ide-ui").is_some()
+                    || user_request
+                        .as_deref()
+                        .map(|request| {
+                            looks_like_ui_task(request)
+                                && !looks_like_desktop_automation_task(request)
+                        })
+                        .unwrap_or(false))));
     if ui_intent {
         // Flow + the copy-paste concrete tokens are compact and high-signal → inject for all.
         for name in ["ui_design_flow", "css_concrete_tokens"] {
@@ -1565,16 +1583,18 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         prompt_blocks.push("reasoning_checkpoint");
         sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 我真的理解了吗？② 还缺什么关键信息？③ 这步要拿到什么？④ 可能出什么岔子？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
     }
-    if let Some(growth) = hdr("x-ide-growth").map(str::trim).filter(|g| !g.is_empty()) {
-        prompt_blocks.push("growth_final_only");
-        sys.push_str(&format!(
+    if !context_only {
+        if let Some(growth) = hdr("x-ide-growth").map(str::trim).filter(|g| !g.is_empty()) {
+            prompt_blocks.push("growth_final_only");
+            sys.push_str(&format!(
             "\n\n--- 因人而教（只作用于最终收尾总结）---\n{growth}\n\n执行任务、选择工具、修改代码、验证结果时忽略本段；只在最终回复里用它调整解释深度。"
         ));
+        }
     }
     // Model-independent engineering retrieval. Every agent model gets the same bounded
     // reference block for a concrete coding task; prompt tier only changes presentation density.
     // Env MICHAEL_AUTO_KNOWLEDGE=0 remains an operational kill switch.
-    if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
+    if !context_only && std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
         if let Some(block) = auto_knowledge_block(mode, user_request.as_deref()) {
             sys.push_str("\n\n");
             sys.push_str(&block);
@@ -2837,6 +2857,10 @@ mod tests {
 
         for request in [
             "我目前在上海胶州路282号，附近有什么好吃的？",
+            "我目前在上海胶州路282号，查附近餐厅",
+            "我目前在上海胶州路282号，找个咖啡店",
+            "我目前在上海胶州路282号，导航到外滩",
+            "我目前在上海胶州路282号，记住这个地址",
             "我喜欢旅游，帮我规划上海三日行程",
             "I am at 1 Market Street. Find nearby coffee.",
             "I prefer quiet hotels; recommend three near Kyoto Station.",
@@ -2877,8 +2901,15 @@ mod tests {
         assemble_into(&headers, &mut body);
 
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("--- 仅上下文消息 ---"));
+        assert!(system.contains("用户这条消息只是在提供位置"));
+        assert!(!system.contains("# 一、最高准则"));
+        assert!(!system.contains("# 真实性与证据纪律"));
         assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(
+            system.len() < 1_000,
+            "context-only prompt should stay compact, got {} bytes",
+            system.len()
+        );
         assert!(
             body.get("tools").is_none(),
             "context-only turn must expose no tools"
@@ -3035,7 +3066,7 @@ mod tests {
         assemble_into(&headers, &mut body);
 
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(!system.contains("--- 仅上下文消息 ---"));
+        assert!(!system.contains("用户这条消息只是在提供位置"));
         assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
         let names = body["tools"]
             .as_array()
