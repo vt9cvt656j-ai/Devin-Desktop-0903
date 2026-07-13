@@ -13547,11 +13547,13 @@ const _TOOL_BUNDLES = {
   // can't casually fire one (the "误触/0 步调研 花架势" noise). They stay fully reachable via
   // search_tools or a deliberate by-name call (auto-loaded), which is a real intent signal.
   subagent: { tools: ["run_subagent", "run_worker", "research_project", "generate_wiki"] },
-  // Keep the aggregate community/knowledge entry points visible, but defer every
-  // single-site/package catalog schema. They remain in the registry and load via
-  // search_tools/direct-by-name, so capability is unchanged while the first turn
-  // no longer pays tens of thousands of tokens for mutually-exclusive sources.
+  // External retrieval is deliberately absent from the first-turn payload. The
+  // project's files, memory, built-in knowledge_search, and connected MCP tools
+  // should answer first; public web/community tools load only after the model has
+  // identified a concrete current-fact gap. Direct-by-name/search_tools keeps the
+  // full capability available without making network lookup the reflex action.
   resources: { tools: [
+    "web_search", "web_fetch", "developer_community_search",
     "academic_search", "package_search", "github_search", "cve_search", "wiki_search",
     "stackoverflow_search", "hackernews_search", "dockerhub_search", "pubmed_search",
     "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
@@ -13596,9 +13598,28 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = []) {
   out.push(_SEARCH_TOOLS_SCHEMA);
   return out;
 }
-// search_tools lookup: keyword scoring against tool name + description.
-// Returns schemas to request into the bounded payload window (already-loaded skipped), max 8.
+// An identifier-shaped query is an explicit tool-name lookup, not natural-language
+// search. Keep the distinction so `local_discovery` cannot be split into `local`
+// / `discovery` and accidentally match another tool's description (for example
+// `http_request` mentioning localhost).
+function _searchToolsExactQuery(query, registry) {
+  const name = String(query || "").trim();
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) return null;
+  const schema = registry.get(name) || null;
+  // Existing one-word tools such as `browser` are exact. An unknown compound
+  // identifier such as `local_discovery` is also clearly a by-name request;
+  // an unknown plain word such as `github` remains a capability search.
+  if (!schema && !/[_-]/.test(name)) return null;
+  return { name, schema };
+}
+
+// search_tools lookup: exact tool name first, otherwise keyword scoring against
+// tool name + description. Returns schemas to request into the bounded payload
+// window (already-loaded skipped), max 8.
 function _searchToolsLookup(query, registry, loadedNames) {
+  const exact = _searchToolsExactQuery(query, registry);
+  if (exact) return exact.schema && !loadedNames.has(exact.name) ? [exact.schema] : [];
+
   const q = String(query || "").toLowerCase();
   const terms = q.split(/[^a-z0-9一-龥]+/i).filter((w) => w.length >= 2);
   const scored = [];
@@ -19415,7 +19436,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // search_tools — 元工具：把命中的延迟工具 schema 换入有界窗口。不走 _executeToolStep。
         if (call && call.type === "search_tools") {
           const loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
-          const adds = _searchToolsLookup(call.query, run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache)), loaded);
+          const registry = run._toolRegistry || (run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache));
+          const exact = _searchToolsExactQuery(call.query, registry);
+          const adds = _searchToolsLookup(call.query, registry, loaded);
           const update = _applyToolPayloadWindow(toolSchemas, adds, run._toolCoreNames);
           const admitted = new Set(update.admitted);
           const loadedAdds = adds.filter((schema) => admitted.has(schema?.function?.name));
@@ -19428,11 +19451,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const rejectedNote = update.rejected.length
             ? `\n另找到 ${update.rejected.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
             : "";
-          const r = { type: "search_tools", path: "", content: lines.length
-            ? ("已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + rejectedNote)
-            : (adds.length
-              ? `找到 ${adds.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
-              : "没找到匹配的新工具——这个能力可能已在你现有工具列表里（直接按名调用即可），或换个说法再 search_tools。") };
+          let content;
+          if (lines.length) content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + rejectedNote;
+          else if (exact && exact.schema && loaded.has(exact.name)) content = `工具 ${exact.name} 已在当前工具列表中，请直接调用。`;
+          else if (exact && !exact.schema) content = `当前注册表没有名为 ${exact.name} 的工具。`;
+          else if (adds.length) content = `找到 ${adds.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`;
+          else content = "没找到匹配的新工具——这个能力可能已在你现有工具列表里（直接按名调用即可），或换个说法再 search_tools。";
+          const r = { type: "search_tools", path: "", content };
           it.rawResult = r;
           _settleToolStep(step, r, lines.length ? `已加载 ${lines.length}` : "无新工具");
           return r.content;

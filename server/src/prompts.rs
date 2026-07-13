@@ -379,6 +379,157 @@ fn latest_user_request(body: &serde_json::Value) -> Option<String> {
     latest_plain
 }
 
+/// A location, identity, preference, or other background statement is context, not an
+/// instruction. Keep this deliberately narrow: any explicit question/action signal fails open
+/// to normal routing, while plain declarations get a zero-tool turn so the model cannot invent a
+/// nearby search or some other task the person never asked for.
+fn looks_like_context_only_message(query: &str) -> bool {
+    let text = query.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    let has_context_prefix = [
+        "我目前在",
+        "我现在在",
+        "我住在",
+        "我位于",
+        "我的位置是",
+        "我的地址是",
+        "这是我的地址",
+        "这里是我的地址",
+        "我来自",
+        "我叫",
+        "我的名字是",
+        "我喜欢",
+        "我不喜欢",
+        "我的偏好是",
+        "我偏好",
+        "我通常",
+        "我习惯",
+        "我们目前在",
+        "我们现在在",
+        "我们住在",
+        "我们位于",
+        "我们的地址是",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+        || [
+            "i live ",
+            "i live in ",
+            "i am at ",
+            "i'm at ",
+            "my address is ",
+            "my location is ",
+            "my name is ",
+            "i like ",
+            "i dislike ",
+            "i prefer ",
+            "my preference is ",
+            "we are at ",
+            "we live in ",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if !has_context_prefix {
+        return false;
+    }
+
+    let has_request_signal = [
+        "?",
+        "？",
+        "请",
+        "帮我",
+        "麻烦",
+        "告诉我",
+        "给我",
+        "查询",
+        "搜索",
+        "查一下",
+        "搜一下",
+        "找一下",
+        "想知道",
+        "想找",
+        "想问",
+        "想要",
+        "推荐",
+        "分析",
+        "解释",
+        "比较",
+        "评估",
+        "看看",
+        "看一下",
+        "怎么",
+        "如何",
+        "为什么",
+        "什么",
+        "哪里",
+        "哪家",
+        "哪种",
+        "哪个",
+        "是否",
+        "能否",
+        "可以吗",
+        "可不可以",
+        "做一个",
+        "做个",
+        "修复",
+        "解决",
+        "修改",
+        "改进",
+        "优化",
+        "实现",
+        "创建",
+        "新增",
+        "删除",
+        "运行",
+        "编译",
+        "打包",
+        "部署",
+        "测试",
+        "审查",
+        "检查",
+        "调研一下",
+        "研究一下",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+        || [
+            "please ",
+            "can you",
+            "could you",
+            "would you",
+            "tell me",
+            "help me",
+            "find ",
+            "search ",
+            "look up",
+            "recommend",
+            "show me",
+            "explain",
+            "compare",
+            "analyze",
+            "check ",
+            "fix ",
+            "build ",
+            "create ",
+            "implement",
+            "run ",
+            "test ",
+            "deploy",
+            "what ",
+            "where ",
+            "which ",
+            "how ",
+            "why ",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal));
+
+    !has_request_signal
+}
+
 /// Keep automatic retrieval limited to concrete engineering work. This intentionally requires
 /// both an action and a code/project object: long casual questions and generic discussion do not
 /// receive an unrelated best-practice dump.
@@ -965,6 +1116,9 @@ fn looks_like_ui_task(q: &str) -> bool {
 }
 
 fn looks_like_research_task(q: &str) -> bool {
+    if looks_like_context_only_message(q) {
+        return false;
+    }
     let lower = q.to_lowercase();
     const ASCII: &[&str] = &[
         "research",
@@ -1107,6 +1261,56 @@ fn looks_like_research_task(q: &str) -> bool {
         || CJK.iter().any(|term| q.contains(term))
 }
 
+fn tools_requested_for_current_task(body: &serde_json::Value) -> HashSet<String> {
+    let Some(messages) = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    else {
+        return HashSet::new();
+    };
+    let task_start = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| {
+            message.get("role").and_then(|role| role.as_str()) == Some("user")
+                && user_message_text(message).is_some_and(|text| {
+                    extract_marked_user_request(&text).is_some()
+                        || extract_real_user_request(&text).is_some_and(|request| {
+                            !request.starts_with("[系统：") && !request.starts_with("[SYSTEM:")
+                        })
+                })
+        })
+        .map_or(0, |(index, _)| index);
+
+    messages[task_start..]
+        .iter()
+        .flat_map(|message| {
+            message
+                .get("tool_calls")
+                .and_then(|calls| calls.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|call| {
+            call.pointer("/function/name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn allow_external_retrieval_tools(body: &serde_json::Value) -> bool {
+    // On later turns, search_tools/direct-by-name is the model's explicit capability decision.
+    // Preserve the requested external schema without exposing the whole public-search catalog.
+    !tools_requested_for_current_task(body).is_disjoint(&HashSet::from([
+        "search_tools".to_string(),
+        "web_search".to_string(),
+        "web_fetch".to_string(),
+        "developer_community_search".to_string(),
+    ]))
+}
+
 fn looks_like_desktop_automation_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     const ASCII: &[&str] = &[
@@ -1234,6 +1438,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // Snapshot the person's real request before mutating messages. The IDE wraps it in a large
     // dynamic project preamble; retrieval must not search that entire blob.
     let user_request = latest_user_request(body);
+    let context_only = user_request
+        .as_deref()
+        .is_some_and(looks_like_context_only_message);
     let loaded_prompt = read_prompt(prompt_name)
         .or_else(|_| {
             if prompt_name != mode {
@@ -1258,6 +1465,10 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     if !sys.is_empty() {
         prompt_blocks.extend(routed_blocks);
     }
+    if context_only {
+        prompt_blocks.push("context_only");
+        sys.push_str("\n\n--- 仅上下文消息 ---\n用户这条消息只是在提供位置、身份、偏好或其他背景，没有提出问题或行动要求。简短确认已理解即可；不得替用户补造目标，不得查询附近内容、联网、读项目、调用 MCP/数据库或执行任何工具。等待用户给出具体问题。具体地址等敏感信息不必在回复中完整复述。");
+    }
     // One shared evidence policy covers every IDE mode. Keeping it separate from
     // tone/personality prompts prevents model-specific style tuning from turning
     // guesses or partial integrations into confident product claims.
@@ -1274,6 +1485,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         && user_request
             .as_deref()
             .is_some_and(looks_like_research_task);
+    let external_retrieval_allowed = allow_external_retrieval_tools(body) && !context_only;
     if research_intent {
         let research = read_prompt("agent_research").unwrap_or_default();
         if !research.is_empty() {
@@ -1373,47 +1585,64 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     }
     // 2) inject the requested tool schemas from tools.json (client sends only the NAMES it
     //    selected via its lightweight bundle/catalog logic — never the heavy schema text).
-    if let Some(names) = hdr("x-ide-tools") {
-        let want = requested_static_tools(mode, names);
-        if !want.is_empty() {
-            if let Ok(text) = read_tools_file() {
-                match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(serde_json::Value::Array(all)) => {
-                        let mut catalog: HashMap<String, serde_json::Value> = all
-                            .into_iter()
-                            .filter_map(|tool| {
-                                tool_function_name(&tool)
-                                    .map(str::to_string)
-                                    .map(|name| (name, tool))
-                            })
-                            .collect();
-                        // Resolve from the ordered request, not registry order. This makes the
-                        // behavior stable even if tools.json is reorganized later.
-                        let picked: Vec<serde_json::Value> = want
-                            .iter()
-                            .filter_map(|name| catalog.remove(name))
-                            .collect();
-                        if !picked.is_empty() {
-                            // MERGE, don't overwrite: the client may ship MCP/runtime tools
-                            // in body.tools that we have no schema for — keep those, append
-                            // the static schemas we injected. The final L0 budget below dedupes
-                            // the complete list while preserving runtime priority.
-                            let mut merged =
-                                match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-                                    Some(arr) => std::mem::take(arr),
-                                    None => Vec::new(),
-                                };
-                            merged.extend(picked);
-                            body["tools"] = serde_json::Value::Array(merged);
-                        } else {
-                            tracing::warn!(mode, requested = ?want, "no matching static tools found");
+    if !context_only {
+        if let Some(names) = hdr("x-ide-tools") {
+            let want = requested_static_tools(mode, names)
+                .into_iter()
+                .filter(|name| {
+                    external_retrieval_allowed
+                        || !matches!(
+                            name.as_str(),
+                            "web_search" | "web_fetch" | "developer_community_search"
+                        )
+                })
+                .collect::<Vec<_>>();
+            if !want.is_empty() {
+                if let Ok(text) = read_tools_file() {
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(serde_json::Value::Array(all)) => {
+                            let mut catalog: HashMap<String, serde_json::Value> = all
+                                .into_iter()
+                                .filter_map(|tool| {
+                                    tool_function_name(&tool)
+                                        .map(str::to_string)
+                                        .map(|name| (name, tool))
+                                })
+                                .collect();
+                            // Resolve from the ordered request, not registry order. This makes the
+                            // behavior stable even if tools.json is reorganized later.
+                            let picked: Vec<serde_json::Value> = want
+                                .iter()
+                                .filter_map(|name| catalog.remove(name))
+                                .collect();
+                            if !picked.is_empty() {
+                                // MERGE, don't overwrite: the client may ship MCP/runtime tools
+                                // in body.tools that we have no schema for — keep those, append
+                                // the static schemas we injected. The final L0 budget below dedupes
+                                // the complete list while preserving runtime priority.
+                                let mut merged =
+                                    match body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                                        Some(arr) => std::mem::take(arr),
+                                        None => Vec::new(),
+                                    };
+                                merged.extend(picked);
+                                body["tools"] = serde_json::Value::Array(merged);
+                            } else {
+                                tracing::warn!(mode, requested = ?want, "no matching static tools found");
+                            }
                         }
+                        Ok(_) => tracing::warn!("prompts/tools.json is not a JSON array"),
+                        Err(err) => tracing::warn!(%err, "failed to parse prompts/tools.json"),
                     }
-                    Ok(_) => tracing::warn!("prompts/tools.json is not a JSON array"),
-                    Err(err) => tracing::warn!(%err, "failed to parse prompts/tools.json"),
                 }
             }
         }
+    } else if let Some(object) = body.as_object_mut() {
+        // This is an enforcement boundary, not just prompt advice. Runtime/MCP schemas arrive in
+        // body.tools and static schemas arrive via x-ide-tools; remove both routes for a message
+        // that contains no task. Also remove a stale forced tool choice if a provider sent one.
+        object.remove("tools");
+        object.remove("tool_choice");
     }
     // Always re-check opted-in requests, including those without x-ide-tools. The client can send
     // runtime/MCP schemas directly, and those need the same cross-service aggregate defense.
@@ -1777,6 +2006,11 @@ mod tests {
         assert!(policy.contains("一轮没有带来新的独立来源"));
         assert!(policy.contains("不因为事实难听"));
         assert!(policy.contains("不得提供可直接用于入侵"));
+        assert!(policy.contains("用户只提供地址、位置、身份、偏好、习惯或其他背景"));
+        assert!(policy.contains("不得调用任何工具"));
+        assert!(policy.contains("内置 `knowledge_search`"));
+        assert!(policy.contains("最后才是泛化 `web_search` / `web_fetch`"));
+        assert!(policy.contains("联网不是默认步骤"));
         assert!(policy.contains("source_statuses[].status == success"));
         assert!(policy.contains("retrieved_at"));
         assert!(policy.contains("published_date"));
@@ -2008,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn server_assembly_injects_truthfulness_and_community_tools() {
+    fn server_assembly_injects_truthfulness_but_gates_aggregate_public_search() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
         headers.insert(
@@ -2037,8 +2271,8 @@ mod tests {
                     .and_then(|name| name.as_str())
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(names.len(), 3);
-        assert!(names.contains("developer_community_search"));
+        assert_eq!(names.len(), 2);
+        assert!(!names.contains("developer_community_search"));
         assert!(names.contains("github_search"));
         assert!(names.contains("stackoverflow_search"));
     }
@@ -2564,6 +2798,207 @@ mod tests {
         ]});
 
         assert_eq!(latest_user_request(&body).as_deref(), Some(steering));
+    }
+
+    #[test]
+    fn context_only_messages_do_not_become_invented_tasks() {
+        for context in [
+            "我目前在上海胶州路282号",
+            "我现在在 Tokyo Station",
+            "我喜欢旅游",
+            "我的偏好是清淡饮食",
+            "My location is 1 Market Street",
+            "I prefer quiet hotels",
+        ] {
+            assert!(
+                looks_like_context_only_message(context),
+                "missed context-only message: {context}"
+            );
+            assert!(
+                !looks_like_research_task(context),
+                "background must not route research: {context}"
+            );
+        }
+
+        for request in [
+            "我目前在上海胶州路282号，附近有什么好吃的？",
+            "我喜欢旅游，帮我规划上海三日行程",
+            "I am at 1 Market Street. Find nearby coffee.",
+            "I prefer quiet hotels; recommend three near Kyoto Station.",
+            "我是想让你继续修这个 bug",
+            "I'm trying to get you to fix this bug",
+        ] {
+            assert!(
+                !looks_like_context_only_message(request),
+                "an explicit task must remain actionable: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_only_agent_turn_has_no_static_runtime_or_mcp_tools() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-tools",
+            "local_discovery,knowledge_search,web_search"
+                .parse()
+                .unwrap(),
+        );
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "我目前在上海胶州路282号"}],
+            "tool_choice": "required",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "mcp__memory__search",
+                    "description": "workspace memory",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("--- 仅上下文消息 ---"));
+        assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(
+            body.get("tools").is_none(),
+            "context-only turn must expose no tools"
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "stale forced tool choice must be removed"
+        );
+    }
+
+    #[test]
+    fn ordinary_agent_turn_keeps_local_knowledge_and_mcp_but_hides_public_search() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-tools",
+            "read_file,knowledge_search,web_search,web_fetch,developer_community_search"
+                .parse()
+                .unwrap(),
+        );
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "修复当前项目的空值错误并补测试"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "mcp__workspace__memory_search",
+                    "description": "workspace memory database",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+
+        let names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "mcp__workspace__memory_search",
+                "read_file",
+                "knowledge_search"
+            ]
+        );
+    }
+
+    #[test]
+    fn public_search_requires_an_explicit_tool_selection_turn() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert("x-ide-tools", "web_search,web_fetch".parse().unwrap());
+
+        let mut first_turn = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "查最新 Rust 版本和官方迁移说明"}]
+        });
+        assemble_into(&headers, &mut first_turn);
+        assert!(first_turn.get("tools").is_none());
+        assert!(first_turn["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# 按任务加载：研究、社区与当前事实"));
+
+        let mut selected_turn = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "user", "content": "查最新 Rust 版本和官方迁移说明"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "tool-1",
+                    "type": "function",
+                    "function": {"name": "search_tools", "arguments": "{\"query\":\"web_search\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "tool-1", "content": "已加载 web_search"}
+            ]
+        });
+        assemble_into(&headers, &mut selected_turn);
+        let names = selected_turn["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["web_search", "web_fetch"]);
+
+        let mut next_task = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [
+                {"role": "user", "content": "查最新 Rust 版本和官方迁移说明"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "tool-1",
+                    "type": "function",
+                    "function": {"name": "search_tools", "arguments": "{\"query\":\"web_search\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "tool-1", "content": "已加载 web_search"},
+                {"role": "assistant", "content": "Rust 版本调研完成"},
+                {"role": "user", "content": "现在修复当前项目的空值错误并补测试"}
+            ]
+        });
+        assemble_into(&headers, &mut next_task);
+        assert!(
+            next_task.get("tools").is_none(),
+            "a previous task's search_tools call must not authorize a new task"
+        );
+    }
+
+    #[test]
+    fn explicit_nearby_request_keeps_local_discovery_available() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert("x-ide-tools", "local_discovery".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{
+                "role": "user",
+                "content": "我目前在上海胶州路282号，附近有什么好吃的？"
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(!system.contains("--- 仅上下文消息 ---"));
+        assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
+        let names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["local_discovery"]);
     }
 
     #[test]

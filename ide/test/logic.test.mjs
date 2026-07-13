@@ -2388,7 +2388,8 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   assert.deepEqual(initial.tools.map((tool) => tool.function.name), [
     "read_file", "search_tools", "mcp__server__old_a", "mcp__server__old_b",
   ]);
-  const lookup = load("_searchToolsLookup")("requested deployment", registry, new Set(initial.tools.map((tool) => tool.function.name)));
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery })("requested deployment", registry, new Set(initial.tools.map((tool) => tool.function.name)));
   assert.equal(lookup[0]?.function?.name, "mcp__server__requested");
   const liveWindow = [...initial.tools];
   const swapped = applyWindow(liveWindow, lookup, initial.coreNames, 4, 64 * 1024);
@@ -3328,13 +3329,22 @@ test("auto-detected verification never downloads an unpinned eslint or tsc", asy
   assert.doesNotMatch(SRC, /npx -y eslint|npx -y tsc/);
 });
 
-test("specialized source tools stay real but load on demand", () => {
+test("external source tools stay real but load on demand", () => {
   const schema = (name) => ({ type: "function", function: { name } });
-  const bundles = { resources: { tools: ["github_search", "reddit_search"] } };
+  const bundles = { resources: { tools: ["web_search", "web_fetch", "developer_community_search", "github_search", "reddit_search"] } };
   const deferred = new Set(bundles.resources.tools);
   const searchSchema = schema("search_tools");
   const select = load("_selectInitialTools", {
-    _buildAgentToolSchemas: () => [schema("read_file"), schema("developer_community_search"), schema("github_search"), schema("reddit_search")],
+    _buildAgentToolSchemas: () => [
+      schema("read_file"),
+      schema("knowledge_search"),
+      schema("local_discovery"),
+      schema("web_search"),
+      schema("web_fetch"),
+      schema("developer_community_search"),
+      schema("github_search"),
+      schema("reddit_search"),
+    ],
     activePath: "",
     _TOOL_BUNDLES: bundles,
     _DEFERRED_TOOL_NAMES: deferred,
@@ -3342,8 +3352,55 @@ test("specialized source tools stay real but load on demand", () => {
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "developer_community_search", "search_tools"]);
+  assert.deepEqual(names, ["read_file", "knowledge_search", "local_discovery", "search_tools"]);
+  assert.ok(names.includes("knowledge_search"), "the built-in knowledge base must remain first-turn capable");
+  assert.ok(!names.includes("web_search"), "public web search must require an explicit capability decision");
+  assert.ok(!names.includes("developer_community_search"), "community search must not be a first-turn reflex");
   assert.match(SRC, /resources:\s*\{ tools:/);
+});
+
+test("search_tools treats an exact tool name as authoritative", () => {
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const schema = (name, description = "") => ({ type: "function", function: { name, description } });
+  const localDiscovery = schema("local_discovery", "Find nearby public places");
+  const httpRequest = schema("http_request", "Call APIs, including localhost services, over HTTP");
+  const registry = new Map([
+    ["local_discovery", localDiscovery],
+    ["http_request", httpRequest],
+  ]);
+
+  assert.deepEqual(lookup("local_discovery", registry, new Set(["local_discovery"])), [],
+    "an already-loaded exact tool must not fall through and match http_request via localhost");
+  assert.deepEqual(lookup("local_discovery", registry, new Set()), [localDiscovery],
+    "an unloaded exact tool name loads only that schema");
+
+  const registryWithoutLocalDiscovery = new Map([["http_request", httpRequest]]);
+  assert.deepEqual(lookup("local_discovery", registryWithoutLocalDiscovery, new Set()), [],
+    "a valid but unregistered tool name must not be split into fuzzy terms");
+  assert.deepEqual(exactQuery("local_discovery", registryWithoutLocalDiscovery), {
+    name: "local_discovery",
+    schema: null,
+  });
+  assert.match(SRC, /工具 \$\{exact\.name\} 已在当前工具列表中，请直接调用/);
+  assert.match(SRC, /当前注册表没有名为 \$\{exact\.name\} 的工具/);
+});
+
+test("search_tools keeps fuzzy scoring for natural-language capability queries", () => {
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const localDiscovery = { type: "function", function: { name: "local_discovery", description: "Find nearby public places" } };
+  const httpRequest = { type: "function", function: { name: "http_request", description: "Call a localhost API" } };
+  const registry = new Map([
+    ["local_discovery", localDiscovery],
+    ["http_request", httpRequest],
+  ]);
+
+  assert.deepEqual(lookup("find nearby public places", registry, new Set()), [localDiscovery]);
+  assert.deepEqual(lookup("github", new Map([
+    ["github_search", { type: "function", function: { name: "github_search", description: "Search GitHub repositories" } }],
+  ]), new Set()).map((tool) => tool.function.name), ["github_search"],
+  "an unknown plain word remains a fuzzy capability query");
 });
 
 test("dev-server discovery is scoped to the current run and workspace", () => {
