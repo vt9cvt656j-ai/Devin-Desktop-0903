@@ -510,6 +510,48 @@ test("_fileToolArgIssue rejects incomplete writes but permits complete writes an
   assert.equal(issue("edit_file", '{"path":"src/a.js","old_string":"remove me","new_string":""}'), "");
 });
 
+test("invalid file mutation arguments recover by reading target context once", () => {
+  const safeJson = load("_safeJsonLoose");
+  const normalizeKeys = load("_normalizeArgKeys");
+  const recover = load("_recoverableInvalidToolCalls", {
+    _canonicalToolName: (name) => name,
+    _safeJsonLoose: safeJson,
+    _normalizeArgKeys: normalizeKeys,
+  });
+  const instruction = load("_invalidToolRepairInstruction", {
+    _safeJsonLoose: safeJson,
+    _normalizeArgKeys: normalizeKeys,
+  });
+  const attempts = [{
+    name: "write_file",
+    argsRaw: '{"path":"package.json","content":""}',
+    parsedArgs: { path: "package.json", content: "" },
+    issue: "write_file 的 content 为空",
+  }];
+  const seen = new Set();
+  const calls = recover(attempts, seen);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "read_file");
+  assert.deepEqual(calls[0].parsedArgs, { path: "package.json" });
+  assert.match(calls[0].argsRaw, /package\.json/);
+  assert.deepEqual(calls[0]._invalidRepair, {
+    name: "write_file",
+    path: "package.json",
+    issue: "write_file 的 content 为空",
+  });
+  assert.equal(recover(attempts, seen).length, 0, "same invalid path should not auto-read forever");
+  assert.equal(recover([{ name: "run_cmd", parsedArgs: {}, argsRaw: "{}", issue: "run_cmd 缺少 command" }], new Set()).length, 0);
+  const msg = instruction(attempts, calls);
+  assert.match(msg, /参数不完整/);
+  assert.match(msg, /已自动补救读取/);
+  assert.match(msg, /edit_file \/ multi_edit/);
+  assert.match(msg, /完整非空 content/);
+  assert.match(SRC, /_recoverableInvalidToolCalls\(attempts, run\._invalidToolRecoverySigs\)/,
+    "agent loop must convert recoverable invalid file tool args into a safe read_file step");
+  assert.match(SRC, /turn\._invalidToolRepairInstruction/,
+    "agent loop must feed the recovery instruction back after the synthetic read result");
+});
+
 test("mutating native and text tool calls fail closed on any non-strict or truncated arguments", () => {
   const canonical = (name) => name;
   const normalizeKeys = load("_normalizeArgKeys");

@@ -14842,6 +14842,59 @@ function _renderRejectedToolAttempts(body, attempts, fallbackIssue = "工具参�
   return rendered;
 }
 
+function _recoverableInvalidToolCalls(attempts, seen = new Set()) {
+  const calls = [];
+  const list = Array.isArray(attempts) ? attempts : [];
+  for (const attempt of list) {
+    const name = String(attempt?.name || "").trim();
+    const canonical = _canonicalToolName(name) || name;
+    const parsed = attempt?.parsedArgs && typeof attempt.parsedArgs === "object"
+      ? attempt.parsedArgs
+      : (_safeJsonLoose(attempt?.argsRaw || "") || {});
+    const args = _normalizeArgKeys(parsed);
+    const path = typeof args.path === "string" ? args.path.trim() : "";
+    const issue = String(attempt?.issue || "").trim();
+    const fileArgFailure =
+      (canonical === "write_file" && /(?:缺少\s*content|content\s*(?:字段)?(?:缺失|为空)|content.*(?:缺少|为空)|内容为空)/i.test(issue)) ||
+      (canonical === "edit_file" && /(?:old_string|new_string|旧文本|新文本|替换文本)/i.test(issue)) ||
+      (canonical === "multi_edit" && /(?:edits|old_string|new_string|编辑项|为空)/i.test(issue));
+    if (!path || !fileArgFailure) continue;
+    const key = `${canonical}:${path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const readArgs = { path };
+    calls.push({
+      id: "call_recover_" + Math.random().toString(36).slice(2, 10),
+      name: "read_file",
+      parsedArgs: readArgs,
+      argsRaw: JSON.stringify(readArgs),
+      _invalidRepair: { name: canonical, path, issue },
+    });
+  }
+  return calls;
+}
+
+function _invalidToolRepairInstruction(attempts, recoveryCalls = []) {
+  const list = Array.isArray(attempts) ? attempts : [];
+  const bad = list.map((attempt) => {
+    const parsed = attempt?.parsedArgs && typeof attempt.parsedArgs === "object"
+      ? attempt.parsedArgs
+      : (_safeJsonLoose(attempt?.argsRaw || "") || {});
+    const args = _normalizeArgKeys(parsed);
+    const name = String(attempt?.name || "工具调用");
+    const path = typeof args.path === "string" && args.path.trim() ? ` path=${args.path.trim()}` : "";
+    const issue = String(attempt?.issue || "参数不完整").trim();
+    return `- ${name}${path}: ${issue}`;
+  }).join("\n") || "- 未知工具调用: 参数不完整";
+  const recoveredPaths = [...new Set((Array.isArray(recoveryCalls) ? recoveryCalls : [])
+    .map((call) => call?._invalidRepair?.path || call?.parsedArgs?.path)
+    .filter(Boolean))];
+  const recovery = recoveredPaths.length
+    ? `IDE 已自动补救读取这些目标文件：${recoveredPaths.join("、")}。下一步基于刚刚 read_file 的真实内容继续：修改已有文件用 edit_file / multi_edit；只有确认是新文件时才用 write_file，并且同一次调用必须带完整非空 content。`
+    : "下一步不要重复同一个残缺工具调用。先补齐缺失参数；如果要修改已有文件，先 read_file 读取当前版本，再用 edit_file / multi_edit；如果要新建文件，write_file 必须一次带完整非空 content。";
+  return `上一轮工具参数不完整，IDE 已拒绝执行，未产生副作用：\n${bad}\n${recovery}`;
+}
+
 /** Normalize loosely-shaped plan steps from the model into {content, status}. */
 function _normPlanSteps(steps) {
   if (!Array.isArray(steps)) return [];
@@ -18112,7 +18165,14 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
 
   for (const [, e] of byIndex) _removeWritePreview(e); // hand off live previews to the real cards
   if (session && session._cancelIds) session._cancelIds.delete(_turnReqId);
-  return { text: cleanFinal, toolCalls, error: err, reasoning: _reasoningFinal };
+  return {
+    text: cleanFinal,
+    toolCalls,
+    error: err,
+    reasoning: _reasoningFinal,
+    invalidToolAttempts: fatalRejectedToolAttempts,
+    invalidToolIssue: fatalToolArgIssue,
+  };
 }
 
 // --- Worker sub-agents (parallel decomposition without conflicts) ---
@@ -20007,7 +20067,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, verificationPassed = false, planSteps = null;
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, effectNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0;
+  let continueNudges = 0, effectNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -20177,13 +20237,36 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         _selfMemMsg = { role: "user", content: _parts.join("\n") };
         messages.push(_selfMemMsg);
       }
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen });
+      let turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen });
       if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
       // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
       // calls (writing files / running commands). Previously the loop only re-checked _live()
       // at the NEXT iteration's top, so a stopped agent still ran a whole turn of tools first
       // — the core "点终止有时候停不掉" bug.
       if (!_live()) break;
+      if (turn.error && /^\[tool-args-invalid\]/.test(String(turn.error || "")) && _live()) {
+        const attempts = Array.isArray(turn.invalidToolAttempts) ? turn.invalidToolAttempts : [];
+        run._invalidToolRecoverySigs = run._invalidToolRecoverySigs || new Set();
+        const recoveryCalls = _recoverableInvalidToolCalls(attempts, run._invalidToolRecoverySigs);
+        if (recoveryCalls.length && invalidArgNudges < 4) {
+          invalidArgNudges++;
+          runHadTrouble = true;
+          turn = {
+            ...turn,
+            error: null,
+            toolCalls: recoveryCalls,
+            text: turn.text || "",
+            _invalidToolRepairInstruction: _invalidToolRepairInstruction(attempts, recoveryCalls),
+          };
+          clearAgentRetryToast();
+        } else if (invalidArgNudges < 4) {
+          invalidArgNudges++;
+          runHadTrouble = true;
+          messages.push({ role: "user", content: _invalidToolRepairInstruction(attempts, []) + "\n现在继续任务；不要收尾，不要声称已完成。" });
+          clearAgentRetryToast();
+          continue;
+        }
+      }
       if (turn.error) {
         if (_isTransientTurnErr(turn.error) && _turnFails < 3 && _live()) {
           _turnFails++;
@@ -20776,6 +20859,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       }
 
       for (const m of toolMsgs) messages.push(m);
+      if (turn._invalidToolRepairInstruction && _live()) {
+        messages.push({ role: "user", content: turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。" });
+      }
 
       // If a guard/error fired, don't let the model "creatively" try a different
       // forbidden path (the classic edit blocked → perl/sed → write_file loop).
