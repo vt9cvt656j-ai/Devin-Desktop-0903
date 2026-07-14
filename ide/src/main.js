@@ -9099,7 +9099,11 @@ function _negatedEffectKindsForTask(text) {
 
 function _engineeringTaskProfile(text) {
   const t = String(text || "").trim();
-  const ui = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
+  const browserAutomation = /(?:浏览器自动化|有头|无头|无痕|隐身|隔离浏览器|点击|点一下|输入|填表|登录流程|验证码|端到端|抓包|抓请求|抓接口|真实请求|真实接口|反接口|重放请求|后台抓包|系统抓包|browser|headed|headless|screenshot|viewport|playwright|puppeteer|selenium|click|type|login|captcha|e2e|capture|mitm|proxy|network\s*(?:trace|capture))/i.test(t);
+  const capture = /(?:抓包|抓请求|抓接口|真实(?:请求|接口)|接口(?:从哪|来源|地址)|找(?:到)?接口|反接口|重放请求|无痕抓包|隔离抓包|后台抓包|系统抓包|系统代理|小黄鸟|httpcanary|charles|fiddler|capture|mitm|proxy|network\s*(?:trace|capture)|api.*(?:source|trace|real))/i.test(t);
+  const uiRaw = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
+  const uiDesignSignal = /(?:\bui\b|frontend|front-end|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
+  const ui = uiRaw && (!capture || uiDesignSignal);
   const bug = /(?:\bbug\b|debug|error|exception|crash|fail(?:ed|ure)?|报错|错误|问题|隐患|死循环|卡死|卡住|空白|不显示|崩溃|跑不起来|不工作|修复|排查)/i.test(t);
   const architecture = /(?:architecture|architect|refactor|rewrite|migration|codebase|repository|模块化|架构|重构|重写|迁移|代码库|工程化|可维护|硬编码|技术债)/i.test(t);
   // 关键词正则是轻量兜底——主力判断在基座提示词里（模型自己知道规则）。补齐最常见的中文
@@ -9146,6 +9150,8 @@ function _engineeringTaskProfile(text) {
     applies,
     ui,
     uiProject,
+    browserAutomation,
+    capture,
     debugProject,
     bug,
     architecture,
@@ -9245,6 +9251,7 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
   const scopedDebugFix = has(/(?:minimal|targeted|surgical|smallest|precise|patch|fix\s*point|guard|null|undefined|fallback|compat|caller|mapping|contract|no\s*(?:rewrite|workaround)|最小|精确|小范围|定点|补丁|修复点|防护|判空|回退|兼容|同步调用方|映射|契约|不重写|不绕过|不大改)/i);
   const regressionEvidence = has(/(?:regression|same\s*failing\s*path|same\s*error|re-?run|rerun|replay|focused\s*regression|original\s*failing\s*(?:case|path)|verify\s+(?:the\s+)?fix|回归|同一失败路径|原失败路径|同一报错|复测|重跑|再跑|重新运行|复查原报错|验证修复)/i);
   const impactEvidence = has(/(?:severity|priority|impact|risk|scope|affected|frequency|user\s*visible|recommend|fix\s*suggestion|remediation|优先级|严重|影响|风险|范围|受影响|频率|用户可见|修复建议|处理建议|建议修法|缓解)/i);
+  const needsObservationStrategy = !!(profile?.ui || profile?.uiProject || profile?.browserAutomation || profile?.capture);
   if (!has(/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|\u8c03\u67e5|\u68c0\u67e5|\u5206\u6790|\u590d\u73b0|\u5b9a\u4f4d|\u8ffd\u8e2a|\u9605\u8bfb|\u5ba1\u67e5|\u68b3\u7406|\u6478\u6e05|\u786e\u8ba4|\u76d8\u70b9|\u53d6\u8bc1)/i)) missing.push("调查/理解现状");
   if (effect === "inspect") {
     if (!has(/(?:evidence|validat|cross.?check|corroborat|conclu|finding|report|recommend|summar|source|limit|confidence|\u8bc1\u636e|\u6838\u9a8c|\u4ea4\u53c9\u68c0\u67e5|\u7ed3\u8bba|\u53d1\u73b0|\u62a5\u544a|\u5efa\u8bae|\u6c47\u603b|\u6765\u6e90|\u9650\u5236|\u53ef\u4fe1|\u628a\u63e1)/i)) missing.push("证据核验/结论");
@@ -9296,6 +9303,15 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
       if (concreteSteps < 2) missing.push("具体命令/输出/路径");
     }
     if (!has(/(?:test|check|verify|validat|confirm|status|output|exit|health|smoke|build|lint|type.?check|diagnostic|regression|\u6d4b\u8bd5|\u68c0\u67e5|\u9a8c\u8bc1|\u786e\u8ba4|\u72b6\u6001|\u8f93\u51fa|\u9000\u51fa|\u5065\u5eb7|\u5192\u70df|\u6784\u5efa|\u8bca\u65ad|\u56de\u5f52|\u6821\u9a8c)/i)) missing.push("验证/测试");
+  }
+  if (needsObservationStrategy) {
+    const hasBrowserOrScreenshotStrategy = has(/(?:browser|screenshot|viewport|nodes|assert|check|headed|headless|fresh|有头|无头|浏览器|截图|视口|节点|断言|真实渲染|交互验证|观察策略|自动化策略|模式选择)/i);
+    const hasCaptureStrategy = !profile?.capture || (
+      has(/(?:capture_start|capture_flows|capture_replay|抓包|抓请求|抓接口|真实流量|真实请求|流量取证|接口取证)/i)
+      && has(/(?:isolated_browser|无痕|隐身|隔离|system|系统级|系统代理|background|后台|手动代理|fresh|mode)/i)
+    );
+    if (!hasBrowserOrScreenshotStrategy) missing.push("浏览器有头/无头观察策略");
+    if (!hasCaptureStrategy) missing.push("抓包模式/流量取证策略");
   }
   return missing.length ? `计划缺少：${missing.join("、")}` : "";
 }
@@ -17461,6 +17477,26 @@ function _blockedToolRecoveryInstruction(content, call = null) {
     return mk("screenshot_interaction_preflight", "USE_HEADED_BROWSER_FLOW",
       `这不是静态看图任务。下一步用 browser 有头自动化：navigate(fresh:true) → nodes/check → click/type/assert；如果要找接口，先 capture_start({mode:"isolated_browser"}) 再打开页面。`);
   }
+  if (/\[BLOCKED_CAPTURE_FILTER_EMPTY\]/i.test(text)) {
+    return mk("capture_filter_empty", "BROADEN_CAPTURE_FILTER",
+      `抓包已经有流量，但当前 filter 没匹配。下一步不要重复同一个 filter：先 capture_flows({include_body:false, limit:50}) 看 host/path 总览，再换更宽关键词或去掉 filter；找到真实请求 id 后再 capture_replay/http_request。`);
+  }
+  if (/\[BLOCKED_CAPTURE_NOT_RUNNING\]/i.test(text)) {
+    return mk("capture_not_running", "START_CAPTURE_MODE",
+      `先按目标选择抓包模式再开始：网页自动化接口取证用 capture_start({mode:"isolated_browser"}) → browser navigate(fresh:true) → capture_flows；任意 App/全系统用 capture_start({mode:"system"})；只后台监听/手动代理用 capture_start({mode:"background"}) + background_monitor(check_type:"capture")。`);
+  }
+  if (/\[BLOCKED_CAPTURE_EMPTY\]/i.test(text)) {
+    if (/isolated_browser|无痕|隔离浏览器/i.test(text)) {
+      return mk("capture_empty_isolated", "PRODUCE_ISOLATED_BROWSER_TRAFFIC",
+        `隔离浏览器抓包已启动但没流量。下一步不要反复 capture_flows：用 browser navigate(fresh:true) 打开目标 URL，并真实点击/登录/触发接口；页面动作后立刻 capture_flows({include_body:false, limit:50}) 查看真实请求。`);
+    }
+    if (/background|后台|手动代理/i.test(text)) {
+      return mk("capture_empty_background", "CONFIGURE_BACKGROUND_PROXY",
+        `后台抓包只监听，不会自动拦截任何程序。下一步把目标程序代理手动设为 127.0.0.1 端口，或启动 background_monitor(check_type:"capture") 等用户/程序产生流量；需要自动化网页就改用 capture_start({mode:"isolated_browser"})。`);
+    }
+    return mk("capture_empty_system", "PRODUCE_SYSTEM_TRAFFIC",
+      `系统级抓包已启动但没流量。下一步确认系统代理仍指向本机代理、HTTPS CA 已信任，然后实际操作目标 App/网页产生请求；如果目标其实是自动化浏览器页面，也可以 browser navigate(fresh:true) 后再 capture_flows。`);
+  }
   if (/本次模型回复里的\s*read_file\s*才刚确认|模型尚未看到读取结果|退回原始路径写错文件/i.test(text)) {
     return mk("same_batch_read_binding", "WAIT_FOR_READ_RESULT",
       `下一步不要写文件：先读取刚才 read_file 的工具结果，确认真实路径和当前内容；再对真实路径用 edit_file / multi_edit。禁止继续用原始猜测路径或整文件覆盖。`);
@@ -17915,6 +17951,26 @@ function _screenshotModePreflightIssue(call, run = null) {
   if (modeSignals.staticVisual && !modeSignals.needsCapture) return "";
   return `[BLOCKED_PRECHECK] 这轮目标包含登录/点击/填表/验证码/会话等交互，单次无头 screenshot 只能看静态渲染，不能证明流程成功。` +
     `请改用 browser 有头自动化：browser navigate(fresh:true) → nodes/check → click/type/assert；如果还要找真实接口，先 capture_start({mode:"isolated_browser"}) 再打开页面。`;
+}
+
+function _captureFlowsEmptyMessage(run = null, filter = "", total = 0, running = false, port = 8080, currentMode = "auto") {
+  const q = String(filter || "").trim();
+  const count = Number(total) || 0;
+  if (count > 0) {
+    return `[BLOCKED_CAPTURE_FILTER_EMPTY] 已抓到 ${count} 条请求，但筛选「${q || "(空)"}」没有匹配。不要重复同一个 filter；先 capture_flows({include_body:false, limit:50}) 看真实 host/path 总览，再换更宽关键词或去掉 filter。`;
+  }
+  const proxy = `127.0.0.1:${Number(port) > 0 ? Math.floor(Number(port)) : 8080}`;
+  if (!running) {
+    return `[BLOCKED_CAPTURE_NOT_RUNNING] 未在抓包。先按目标选择 capture_start：网页自动化接口取证用 mode:"isolated_browser"；任意 App/全系统用 mode:"system"；后台监听/手动代理用 mode:"background"。`;
+  }
+  const mode = _normalizeCaptureModeName(run?._captureMode || currentMode || "auto");
+  if (mode === "system") {
+    return `[BLOCKED_CAPTURE_EMPTY] 系统级抓包 mode=system 已启动，但还没抓到请求。下一步不要反复读取空 flows：确认系统代理仍指向 ${proxy}、HTTPS CA 已信任，然后实际操作目标 App/网页产生流量；如果目标其实是网页自动化，也可以 browser navigate(fresh:true) 后再 capture_flows。`;
+  }
+  if (mode === "background") {
+    return `[BLOCKED_CAPTURE_EMPTY] 后台抓包 mode=background 只在 ${proxy} 监听，不会自动接管系统流量。下一步把目标程序手动设置代理到 ${proxy}，或用 background_monitor(check_type:"capture") 等待匹配流量；如果要自动化网页取证，改用 capture_start({mode:"isolated_browser"})。`;
+  }
+  return `[BLOCKED_CAPTURE_EMPTY] 无痕/隔离浏览器抓包 mode=isolated_browser 已启动，但还没抓到请求。下一步用 browser navigate(fresh:true) 打开目标 URL，并真实点击/登录/触发接口；自动化浏览器会走 ${proxy}，产生流量后再 capture_flows({include_body:false, limit:50})。`;
 }
 
 function _externalEvidenceKinds(call, result) {
@@ -24882,6 +24938,7 @@ async function _executeToolStep(step, call, root, run) {
         call.captureMode = captureMode.mode;
         call.systemProxy = captureMode.systemProxy;
         _capturePort = port;
+        _captureMode = captureMode.mode;
         _captureFlows = [];
         await backend.proxyStart(port, _onCaptureFlow);
         _captureRunning = true;
@@ -24918,7 +24975,8 @@ async function _executeToolStep(step, call, root, run) {
       const n = Math.max(1, Math.min(200, call.limit || 30));
       const picked = _captureFlows.filter(match).slice(-n).reverse();
       res.className = "atc-result atc-result--ok"; res.textContent = `${picked.length}/${_captureFlows.length} 条`;
-      if (!_captureFlows.length) return { type: "capture_flows", path: "", content: _captureRunning ? "（还没抓到请求。确认：①系统/浏览器代理指向本代理 ②已信任 CA 证书；然后访问目标页面再重试。）" : "（未在抓包。先调用 capture_start。）" };
+      if (!_captureFlows.length) return { type: "capture_flows", path: "", content: _captureFlowsEmptyMessage(run, q, 0, _captureRunning, _capturePort, _captureMode) };
+      if (!picked.length) return { type: "capture_flows", path: q || "all", content: _captureFlowsEmptyMessage(run, q, _captureFlows.length, _captureRunning, _capturePort, _captureMode) };
       const fmt = (f) => {
         const head = `[${f.status || (f.error ? "ERR" : "…")}] ${f.method} ${f.url}  (${(f.ctype||"").split(";")[0]}, ${f.ms||0}ms${f.error ? ", 错误:"+f.error : ""})  id=${f.id}`;
         if (!call.includeBody) return head;
@@ -24936,6 +24994,7 @@ async function _executeToolStep(step, call, root, run) {
       try { await backend.proxyStop(); } catch {}
       try { await backend.proxySetSystemProxy(false, _capturePort); } catch {}
       _captureRunning = false;
+      _captureMode = "auto";
       if (run) run._captureStarted = false;
       res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
       return { type: "capture_stop", path: "", content: `已停止抓包并关闭系统代理。共抓到 ${_captureFlows.length} 条（仍可用 capture_flows 回看）。` };
@@ -25658,6 +25717,12 @@ async function _executeToolStep(step, call, root, run) {
       _chatFollow(run && run.session);
       let content = `浏览器 [${act}]${call.fresh ? "（已清空旧会话、全新浏览器）" : ""} → ${state.title || ""}（${state.url || ""}）`;
       if (state._autoUrl) content += `\n（未指定 URL，已自动检测到运行中的 dev server → ${state._autoUrl}）`;
+      if (_captureRunning && run?._captureStarted && ["navigate", "click", "type", "press", "batch"].includes(act)) {
+        const captureSignals = _browserCaptureIntent([run?._originalText, run?._steeringText].filter(Boolean).join("\n"));
+        if (captureSignals.needsCapture) {
+          content += `\n[抓包下一步] 抓包正在运行（mode:${run._captureMode || _captureMode || "auto"}）。如果这步已经触发页面请求，下一步直接调用 capture_flows({include_body:false, limit:50}) 读取真实 host/path；不要凭页面截图猜接口。`;
+        }
+      }
       if (act === "batch") {
         content += `\n**批量自动化结果**（一次调用跑完多步，全程没逐步截图/没逐步等模型——这就是快的原因）：\n${call._batchLog || "(无步骤)"}` + (state.result != null && state.result !== "" ? `\n\n**执行后的页面节点清单**（已是最新状态，接着用 \`node=i\` 继续操作 / 或 assert 验证）：\n${state.result}` : "");
       } else if (act === "design" && state.result != null && state.result !== "") {
@@ -26649,6 +26714,7 @@ let _captureRunning = false;
 let _captureSelId = null;
 let _captureFilter = "";
 let _capturePort = 8080;
+let _captureMode = "auto";
 const _CAPTURE_CAP = 3000;
 
 function _onCaptureFlow(flow) {
@@ -26677,6 +26743,7 @@ async function _captureStart() {
     if (!st.mitmdump) { _captureOfferInstall(); return; }
     await backend.proxyStart(_capturePort, _onCaptureFlow);
     _captureRunning = true;
+    _captureMode = "background";
     showToast(`抓包已启动 · 代理 127.0.0.1:${_capturePort}`);
   } catch (e) { showToast("启动抓包失败：" + (e?.message || e)); _captureRunning = false; }
   if (!featureOverlay.hidden && activeFeatureTab === "capture") renderFeaturePanel();
@@ -26685,6 +26752,7 @@ async function _captureStop() {
   try { await backend.proxyStop(); } catch {}
   try { await backend.proxySetSystemProxy(false, _capturePort); } catch {}
   _captureRunning = false;
+  _captureMode = "auto";
   if (!featureOverlay.hidden && activeFeatureTab === "capture") renderFeaturePanel();
 }
 
@@ -26719,7 +26787,7 @@ function _renderCaptureList() {
   el.innerHTML = "";
   const flows = _captureFlows.filter(_captureFlowMatch);
   if (!flows.length) {
-    el.appendChild(createEmptyState(_captureRunning ? "等待流量…（把系统/浏览器代理指向本机并访问网页）" : "未在抓包。点上方“启动抓包”。"));
+    el.appendChild(createEmptyState(_captureRunning ? "等待流量…（后台监听模式：把目标程序代理指向本机，或用 Agent 的 isolated_browser/system 模式自动抓）" : "未在抓包。点上方“启动抓包”。"));
     return;
   }
   // newest first

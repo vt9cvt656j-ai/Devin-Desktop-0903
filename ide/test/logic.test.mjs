@@ -251,6 +251,14 @@ test("blocked tool failures produce concrete recovery instructions", () => {
     recover("[BLOCKED_PRECHECK] 这轮目标包含登录/点击/填表/验证码/会话等交互，单次无头 screenshot 只能看静态渲染，不能证明流程成功。", { type: "screenshot", url: "http://localhost:3000" }).text,
     /\[RECOVERY:USE_HEADED_BROWSER_FLOW\][\s\S]*browser 有头自动化/,
   );
+  assert.match(
+    recover("[BLOCKED_CAPTURE_EMPTY] 无痕/隔离浏览器抓包 mode=isolated_browser 已启动，但还没抓到请求。", { type: "capture_flows" }).text,
+    /\[RECOVERY:PRODUCE_ISOLATED_BROWSER_TRAFFIC\][\s\S]*browser navigate\(fresh:true\)[\s\S]*capture_flows/,
+  );
+  assert.match(
+    recover("[BLOCKED_CAPTURE_FILTER_EMPTY] 已抓到 8 条请求，但筛选「api」没有匹配。", { type: "capture_flows" }).text,
+    /\[RECOVERY:BROADEN_CAPTURE_FILTER\][\s\S]*去掉 filter/,
+  );
   assert.equal(recover("已修改 src/a.js（+1/-1 行）。", { type: "edit", path: "src/a.js" }), null);
 });
 
@@ -3444,6 +3452,9 @@ test("local engineering profiles drive planning without an extra classifier requ
   assert.equal(websiteProfile.uiProject, true);
   assert.equal(websiteProfile.requiresPlan, true,
     "creating an official-site/landing-page UI is a substantial project even if the prompt is short");
+  const captureProfile = profile("打开网页抓真实接口，看看请求从哪来并重放");
+  assert.equal(captureProfile.browserAutomation, true);
+  assert.equal(captureProfile.capture, true);
 
   assert.match(quality([], true, "mutate"), /尚未创建计划/);
   assert.match(quality([
@@ -3521,6 +3532,23 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
     { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
   ], true, "mutate", websiteProfile), "");
+  assert.match(quality([
+    { content: "读取页面和现有网络相关代码，确认目标 URL 与数据入口" },
+    { content: "打开页面观察请求" },
+    { content: "重放接口并验证响应" },
+    { content: "记录结果" },
+    { content: "汇总交付" },
+  ], true, "execute", captureProfile), /抓包模式\/流量取证策略/,
+    "network-capture plans must choose isolated/system/background capture mode before acting");
+  assert.equal(quality([
+    { content: "预检 mitmproxy、CA 信任、端口 8080、权限环境和目标 URL 是否可访问" },
+    { content: "读取目标页面入口、路由与数据契约，确认需要触发的接口和边界参数" },
+    { content: "选择抓包模式：网页自动化执行 capture_start mode=isolated_browser，不改系统代理" },
+    { content: "执行 browser navigate fresh=true 打开页面，nodes/click/type 触发真实请求" },
+    { content: "执行 capture_flows include_body=false limit=50 找真实 host/path，再用 capture_replay 重放" },
+    { content: "若超时、无流量、筛选为空、CA 未信任，读取错误日志/输出并切换 background/system 回退" },
+    { content: "验证接口响应状态、关键字段和错误路径，汇总可复现步骤与限制" },
+  ], true, "execute", captureProfile), "");
   assert.equal(quality([
     { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
     { content: "核对 AuthSession schema、登录 API contract、调用方参数和旧版本兼容边界" },
@@ -4198,6 +4226,9 @@ test("browser and capture mode preflights choose headed, headless, isolated, sys
   const screenshotIssue = load("_screenshotModePreflightIssue", {
     _browserCaptureIntent: intent,
   });
+  const emptyCapture = load("_captureFlowsEmptyMessage", {
+    _normalizeCaptureModeName: normalizeMode,
+  });
 
   assert.equal(normalizeMode("incognito"), "isolated_browser");
   assert.equal(normalizeMode("system_proxy"), "system");
@@ -4235,10 +4266,27 @@ test("browser and capture mode preflights choose headed, headless, isolated, sys
     "",
     "static visual checks should keep using headless screenshot",
   );
+  assert.match(
+    emptyCapture({ _captureMode: "isolated_browser" }, "", 0, true, 8080),
+    /\[BLOCKED_CAPTURE_EMPTY\][\s\S]*browser navigate\(fresh:true\)[\s\S]*capture_flows/,
+  );
+  assert.match(
+    emptyCapture({ _captureMode: "system" }, "", 0, true, 8080),
+    /系统级抓包[\s\S]*系统代理[\s\S]*目标 App/,
+  );
+  assert.match(
+    emptyCapture({ _captureMode: "background" }, "", 0, true, 8080),
+    /后台抓包[\s\S]*background_monitor/,
+  );
+  assert.match(
+    emptyCapture({ _captureMode: "isolated_browser" }, "api", 8, true, 8080),
+    /\[BLOCKED_CAPTURE_FILTER_EMPTY\][\s\S]*api[\s\S]*去掉 filter/,
+  );
   assert.match(SRC, /capture_start\(mode:\\"isolated_browser\\"\)/);
   assert.match(SRC, /mode: String\(args\.mode \|\| args\.capture_mode \|\| "auto"\)/);
   assert.match(SRC, /模式：无痕\/隔离浏览器抓包/);
   assert.match(SRC, /模式：后台抓包/);
+  assert.match(SRC, /抓包下一步/);
 });
 
 test("dev-server discovery is scoped to the current run and workspace", () => {
