@@ -6,6 +6,9 @@ use axum::Json;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::auth::Claims;
 use crate::error::{ApiResult, AppError};
@@ -19,15 +22,79 @@ use crate::AppState;
 /// to a host pays the handshake. No global timeout: streamed chat responses are
 /// open-ended; only the connect phase is bounded (per-request timeouts are added
 /// for the non-streaming calls that need them).
-static GW_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+static GW_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
+
+const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 6;
+const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
+
+static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn chat_upstream_retry_base_delay_ms(attempt: u32) -> u64 {
+    match attempt {
+        0 => 250,
+        1 => 650,
+        2 => 1_300,
+        3 => 2_500,
+        _ => 4_000,
+    }
+}
+
+fn chat_upstream_retry_delay(attempt: u32) -> Duration {
+    let jitter_ms = rand::thread_rng().gen_range(0..=175);
+    Duration::from_millis(chat_upstream_retry_base_delay_ms(attempt) + jitter_ms)
+}
+
+fn route_cooldown_remaining(id: uuid::Uuid, now: Instant) -> Option<Duration> {
+    let mut guard = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock().ok()?;
+    match guard.get(&id).copied() {
+        Some(until) if until > now => Some(until - now),
+        Some(_) => {
+            guard.remove(&id);
+            None
+        }
+        None => None,
+    }
+}
+
+fn mark_route_cooldown(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock() {
+        guard.insert(id, Instant::now() + CHAT_UPSTREAM_ROUTE_COOLDOWN);
+    }
+}
+
+fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: u16) -> String {
+    if route_count <= 1 {
+        format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
+    } else {
+        format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
+    }
+}
+
+fn safe_upstream_error_excerpt(low: &str) -> String {
+    let mut text = low
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .replace('\t', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for marker in ["sk-", "sk_live_", "sk-proj-"] {
+        if let Some(pos) = text.find(marker) {
+            let end = (pos + 48).min(text.len());
+            text.replace_range(pos..end, "[redacted-key]");
+        }
+    }
+    text.chars().take(220).collect()
+}
 
 /// Wrap an upstream byte stream with an IDLE timeout: if the provider (zyz et al.)
 /// goes silent mid-response for too long (it occasionally stalls a stream), we
@@ -78,7 +145,7 @@ fn api_base(base: &str) -> String {
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Clone)]
 pub struct Model {
     pub id: uuid::Uuid,
     pub label: String,
@@ -2640,9 +2707,14 @@ pub async fn chat_completions(
     )
     .fetch_all(&state.db)
     .await?;
-    let conn = conns
+    let candidates: Vec<Model> = conns
         .into_iter()
-        .find(|m| allowed_ids(m).contains(&model_id))
+        .filter(|m| allowed_ids(m).contains(&model_id))
+        .collect();
+    let route_count = candidates.len();
+    let primary_conn = candidates
+        .first()
+        .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Refill the 5h30m window + reset the weekly counter when due.
@@ -2719,7 +2791,7 @@ pub async fn chat_completions(
             bill(
                 &state,
                 uid,
-                conn.id,
+                primary_conn.id,
                 0,
                 use_quota,
                 &BillTokens {
@@ -2767,123 +2839,192 @@ pub async fn chat_completions(
             }
         }
     }
-    // protocol="anthropic" → native /v1/messages with a translated (OpenAI→Anthropic) body;
-    // else the OpenAI-compat /chat/completions passthrough. `upstream_body` is only built for
-    // the anthropic path (the OpenAI path sends `body` unchanged — no extra clone).
-    let anthropic = conn.protocol == "anthropic";
-    let url = if anthropic {
-        format!("{}/messages", api_base(&conn.base_url))
-    } else {
-        format!("{}/chat/completions", api_base(&conn.base_url))
-    };
-    let upstream_body = if anthropic {
-        oai_to_anthropic(&body)
-            .map_err(|err| AppError::bad(format!("Anthropic request conversion failed: {err}")))?
-    } else {
-        serde_json::Value::Null
-    };
     let tool_argument_rules = tool_argument_rules(&body);
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
     //
     // Upstream providers (zyz et al.) intermittently return 502/503/504/429 or
     // drop a kept-alive connection mid-flight — the user just sees "网关又出问题".
-    // Retry such *transient* failures up to 3 attempts with a short backoff so a
-    // blip is absorbed instead of surfaced. We only retry BEFORE streaming the
-    // body has started (a send error or a bad status line), so no half-streamed
-    // response is ever double-sent, and billing still happens once, after success.
+    // Retry such *transient* failures with bounded exponential backoff so a
+    // short provider flap is absorbed instead of surfaced. We only retry BEFORE
+    // streaming the body has started (a send error or a bad status line), so no
+    // half-streamed response is ever double-sent, and billing still happens once,
+    // after success. Failed routes get a short in-memory cooldown so the next
+    // request prefers another same-model route when the admin has configured one.
     let model_name = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("该模型")
         .to_string();
     // Map an upstream error to a friendly, actionable Chinese message.
-    fn friendly_upstream(status: u16, low: &str) -> &'static str {
+    fn friendly_upstream(status: u16, low: &str) -> String {
         if low.contains("forbidden") || low.contains("未授权") {
             "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
+                .into()
         } else if low.contains("no available") || low.contains("没有可用") {
-            "上游暂无可用账号。请换个模型，或稍后再试。"
+            "上游暂无可用账号。请换个模型，或稍后再试。".into()
         } else if status == 429
             || low.contains("rate")
             || low.contains("frequent")
             || low.contains("过于频繁")
         {
-            "请求过于频繁，请稍后再试。"
+            "请求过于频繁，请稍后再试。".into()
         } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
-            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
+            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。".into()
+        } else if status == 400 {
+            let detail = safe_upstream_error_excerpt(low);
+            if detail.is_empty() {
+                "上游拒绝了请求（400），但没有返回更细原因。".into()
+            } else {
+                format!("上游拒绝了请求（400）：{detail}")
+            }
         } else {
-            "上游暂时不可用，请换个模型或稍后再试。"
+            "上游暂时不可用，请换个模型或稍后再试。".into()
         }
     }
     // Send with retry — but ONLY retry *transient* failures (502/503/504/429 or a
     // dropped connection). "forbidden / unauthorized / no available account" is
     // PERSISTENT: retrying just makes the user wait ~15s for the same error, so we
     // fail FAST with a friendly message. Billing only happens after a success.
-    let resp = {
+    let (resp, conn) = {
         let mut success = None;
         let mut err_status = 502u16;
         let mut err_low = String::new();
-        for attempt in 0u32..3 {
-            let req0 = GW_HTTP.post(&url);
-            let mut req = if anthropic {
-                req0.header("x-api-key", &conn.api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&upstream_body)
+        let mut selected_conn = None;
+        let mut attempted_sends = 0u32;
+        let now = Instant::now();
+        let mut ordered_candidates: Vec<&Model> = Vec::with_capacity(candidates.len());
+        let mut cooled_candidates: Vec<&Model> = Vec::new();
+        for candidate in &candidates {
+            if route_count > 1 && route_cooldown_remaining(candidate.id, now).is_some() {
+                cooled_candidates.push(candidate);
             } else {
-                req0.header("Authorization", format!("Bearer {}", conn.api_key))
-                    .json(&body)
-            };
-            if !streaming {
-                req = req.timeout(std::time::Duration::from_secs(120));
-            }
-            match req.send().await {
-                Ok(r) if r.status().is_success() => {
-                    success = Some(r);
-                    break;
-                }
-                Ok(r) => {
-                    err_status = r.status().as_u16();
-                    err_low = r.text().await.unwrap_or_default().to_lowercase();
-                    let persistent = err_status == 401
-                        || err_status == 403
-                        || err_low.contains("forbidden")
-                        || err_low.contains("unauthorized")
-                        || err_low.contains("invalid api key")
-                        || err_low.contains("未授权")
-                        || err_low.contains("no available")
-                        || err_low.contains("没有可用");
-                    let transient = matches!(err_status, 502 | 503 | 504 | 429);
-                    if persistent || !transient || attempt == 2 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                // A send error means the request almost certainly never reached the
-                // server (incl. a stale pooled connection) — safe to re-send.
-                Err(e) => {
-                    err_status = 502;
-                    err_low = e.to_string().to_lowercase();
-                    if attempt == 2 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
+                ordered_candidates.push(candidate);
             }
         }
-        match success {
-            Some(r) => r,
-            None => {
+        ordered_candidates.extend(cooled_candidates);
+
+        'routes: for candidate in ordered_candidates {
+            // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
+            // else OpenAI-compat /chat/completions passthrough. Multiple active connections may
+            // expose the same model id; try the next line when the current one is dead instead of
+            // failing the whole IDE request on the first 502.
+            let candidate_anthropic = candidate.protocol == "anthropic";
+            let candidate_url = if candidate_anthropic {
+                format!("{}/messages", api_base(&candidate.base_url))
+            } else {
+                format!("{}/chat/completions", api_base(&candidate.base_url))
+            };
+            let candidate_upstream_body = if candidate_anthropic {
+                match oai_to_anthropic(&body) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        err_status = 400;
+                        err_low =
+                            format!("Anthropic request conversion failed: {err}").to_lowercase();
+                        continue;
+                    }
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            let mut route_attempts = 0u32;
+            let mut route_failed_transient = false;
+            for attempt in 0u32..CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                let req0 = GW_HTTP.post(&candidate_url);
+                let mut req = if candidate_anthropic {
+                    req0.header("x-api-key", &candidate.api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .json(&candidate_upstream_body)
+                } else {
+                    req0.header("Authorization", format!("Bearer {}", candidate.api_key))
+                        .json(&body)
+                };
+                if !streaming {
+                    req = req.timeout(Duration::from_secs(120));
+                }
+                route_attempts += 1;
+                attempted_sends += 1;
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => {
+                        success = Some(r);
+                        selected_conn = Some(candidate.clone());
+                        break 'routes;
+                    }
+                    Ok(r) => {
+                        err_status = r.status().as_u16();
+                        err_low = r.text().await.unwrap_or_default().to_lowercase();
+                        let persistent = err_status == 401
+                            || err_status == 403
+                            || err_low.contains("forbidden")
+                            || err_low.contains("unauthorized")
+                            || err_low.contains("invalid api key")
+                            || err_low.contains("未授权")
+                            || err_low.contains("no available")
+                            || err_low.contains("没有可用");
+                        let transient = matches!(err_status, 502 | 503 | 504 | 429);
+                        if persistent || !transient {
+                            break;
+                        }
+                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                            route_failed_transient = true;
+                            break;
+                        }
+                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                    }
+                    // A send error means the request almost certainly never reached the
+                    // server (incl. a stale pooled connection) — safe to re-send.
+                    Err(e) => {
+                        err_status = 502;
+                        err_low = e.to_string().to_lowercase();
+                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                            route_failed_transient = true;
+                            break;
+                        }
+                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                    }
+                }
+            }
+            if route_failed_transient {
+                mark_route_cooldown(candidate.id);
+                tracing::warn!(
+                    model = %model_name,
+                    provider = %candidate.provider,
+                    label = %candidate.label,
+                    attempts = route_attempts,
+                    status = err_status,
+                    "chat upstream route exhausted transient retries; cooling route"
+                );
+            }
+        }
+        match (success, selected_conn) {
+            (Some(r), Some(c)) => (r, c),
+            (None, _) => {
+                let msg = format!(
+                    "【{model_name}】{}{}",
+                    friendly_upstream(err_status, &err_low),
+                    chat_upstream_attempt_suffix(route_count, attempted_sends, err_status)
+                );
+                if headers.contains_key("x-ide-mode") {
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )
+                        .body(Body::from(msg))
+                        .map_err(|e| AppError::internal(e.to_string()));
+                }
                 return Err(AppError {
                     status: StatusCode::BAD_GATEWAY,
-                    msg: format!(
-                        "【{model_name}】{}",
-                        friendly_upstream(err_status, &err_low)
-                    ),
+                    msg,
                 });
             }
+            _ => unreachable!("success response and selected connection are set together"),
         }
     };
     let status = resp.status();
+    let anthropic = conn.protocol == "anthropic";
 
     if streaming {
         // Pre-compute input token estimate BEFORE the spawn (body is consumed afterwards).
@@ -3720,10 +3861,11 @@ pub async fn image_generations(
 #[cfg(test)]
 mod billing_tests {
     use super::{
-        anthropic_thinking, anthropic_to_oai, compute_cost, is_image_gen_model,
-        model_price_override, oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost,
-        response_cache_safe, tool_argument_rules, validate_openai_sse_eof,
-        validate_openai_sse_with_rules, AnthSse, OpenAiSseValidator,
+        anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
+        chat_upstream_retry_base_delay_ms, compute_cost, is_image_gen_model, model_price_override,
+        oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost, response_cache_safe,
+        tool_argument_rules, validate_openai_sse_eof, validate_openai_sse_with_rules, AnthSse,
+        OpenAiSseValidator,
     };
     use serde_json::json;
 
@@ -3735,6 +3877,28 @@ mod billing_tests {
         assert!(!response_cache_safe(
             br#"data: {\"name\":\"track_shipment\",\"arguments\":\"{\\\"tracking_number\\\":\\\"1Z999AA10123456784\\\"}\"}"#
         ));
+    }
+
+    #[test]
+    fn chat_gateway_transient_retry_backoff_is_bounded() {
+        assert_eq!(chat_upstream_retry_base_delay_ms(0), 250);
+        assert_eq!(chat_upstream_retry_base_delay_ms(1), 650);
+        assert_eq!(chat_upstream_retry_base_delay_ms(2), 1_300);
+        assert_eq!(chat_upstream_retry_base_delay_ms(3), 2_500);
+        assert_eq!(chat_upstream_retry_base_delay_ms(4), 4_000);
+        assert_eq!(chat_upstream_retry_base_delay_ms(99), 4_000);
+    }
+
+    #[test]
+    fn chat_gateway_error_suffix_reports_single_route_retries() {
+        assert_eq!(
+            chat_upstream_attempt_suffix(1, 6, 502),
+            "（已请求 6 次；当前只有 1 条同模型线路；最后状态 502）"
+        );
+        assert_eq!(
+            chat_upstream_attempt_suffix(3, 12, 504),
+            "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+        );
     }
 
     // per_call mode bills the flat fee, ignoring token usage entirely.

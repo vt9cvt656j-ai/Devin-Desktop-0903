@@ -187,11 +187,7 @@ pub async fn ai_complete(
     messages: Vec<serde_json::Value>,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let base = config.base_url.trim_end_matches('/');
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err("AI base URL must start with http:// or https://".into());
-    }
-    let url = format!("{base}/chat/completions");
+    let url = chat_completions_url(&config.base_url)?;
     let payload = serde_json::json!({
         "model": config.model,
         "stream": false,
@@ -212,7 +208,7 @@ pub async fn ai_complete(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("AI request failed ({status}): {text}"));
+        return Err(format_ai_http_error(status, &text));
     }
 
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -251,6 +247,71 @@ fn mark_cache_breakpoint(msg: &mut serde_json::Value) {
             { "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }
         ]);
     }
+}
+
+fn ai_error_detail_from_body(body: &str) -> String {
+    let raw = body.trim();
+    if raw.is_empty() {
+        return "empty response body".into();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(s) = v.get("error").and_then(|e| e.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v.get("message").and_then(|m| m.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v.get("detail").and_then(|m| m.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(code) = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .or_else(|| v.get("code"))
+            .and_then(|c| {
+                c.as_str()
+                    .map(str::to_string)
+                    .or_else(|| c.as_i64().map(|n| n.to_string()))
+            })
+        {
+            return format!("error code: {code}");
+        }
+    }
+    raw.to_string()
+}
+
+fn format_ai_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "AI request failed ({status}): {}",
+        ai_error_detail_from_body(body)
+    )
+}
+
+/// Normalize an OpenAI-compatible chat endpoint. Users usually paste a base URL
+/// such as `https://api.openai.com/v1`, but many paste the provider root
+/// (`https://api.openai.com`) or a full `/chat/completions` URL. Accept all three
+/// shapes so BYOK does not fail for a harmless missing `/v1`.
+fn chat_completions_url(base_url: &str) -> Result<String, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("AI base URL must start with http:// or https://".into());
+    }
+    if base.ends_with("/chat/completions") {
+        return Ok(base.to_string());
+    }
+    let api_base = if base.ends_with("/v1") || base.contains("/v1/") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
+    Ok(format!("{api_base}/chat/completions"))
 }
 
 /// Relay the optional L0 server-side-assembly headers. When the JS side set
@@ -517,6 +578,44 @@ mod ide_header_tests {
             .unwrap();
         assert!(!request.headers().contains_key("x-ide-timezone"));
         assert!(!request.headers().contains_key("x-ide-utc-offset-minutes"));
+    }
+
+    #[test]
+    fn normalizes_chat_completion_endpoint_shapes() {
+        assert_eq!(
+            chat_completions_url("https://api.openai.com").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/v1").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.example/v1/chat/completions").unwrap(),
+            "https://gateway.example/v1/chat/completions"
+        );
+        assert!(chat_completions_url("api.openai.com/v1").is_err());
+    }
+
+    #[test]
+    fn ai_http_error_prefers_gateway_json_error_message() {
+        let message = format_ai_http_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"error":"【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。"}"#,
+        );
+        assert_eq!(
+            message,
+            "AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。"
+        );
+    }
+
+    #[test]
+    fn ai_http_error_keeps_provider_code_when_no_message_exists() {
+        let message = format_ai_http_error(reqwest::StatusCode::BAD_GATEWAY, r#"{"code":502}"#);
+        assert_eq!(
+            message,
+            "AI request failed (502 Bad Gateway): error code: 502"
+        );
     }
 }
 
@@ -888,7 +987,7 @@ async fn ai_chat_inner(
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let timeouts = StreamTimeouts::for_config(&config);
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let url = chat_completions_url(&config.base_url)?;
     let mut payload = serde_json::json!({
         "model": config.model,
         "stream": true,
@@ -1005,7 +1104,7 @@ async fn ai_chat_inner(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let message = format!("AI request failed ({status}): {text}");
+        let message = format_ai_http_error(status, &text);
         let _ = on_event.send(AiEvent::Error {
             message: message.clone(),
         });
@@ -1056,7 +1155,7 @@ async fn ai_chat_inner(
             // what we've already streamed and end the turn gracefully.
             Ok(Some(Err(_e))) => {
                 let _ = on_event.send(AiEvent::Error {
-                    message: "连接中断（网络波动），已保留生成的部分，请点重试继续。".to_string(),
+                    message: "连接中断（网络波动），已保留生成的部分，正在自动恢复。".to_string(),
                 });
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
@@ -1360,15 +1459,44 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     let resp = client
         .get(parsed)
         .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,zh-CN;q=0.8")
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Cache-Control", "max-age=0")
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
     let status = resp.status();
+    let code = status.as_u16();
+
+    // Anti-bot wall (403/503/429): fall back to headless Chrome which has a real
+    // TLS fingerprint and runs JS — bypasses Dianping/Meituan/etc. cookie walls.
+    if code == 403 || code == 503 || code == 429 {
+        if let Some(browser) = crate::capture::find_headless_browser() {
+            let url_str = url.trim().to_string();
+            let rendered = tokio::time::timeout(
+                std::time::Duration::from_secs(16),
+                tauri::async_runtime::spawn_blocking(move || render_dom(&browser, &url_str)),
+            )
+            .await;
+            if let Ok(Ok(Some(html))) = rendered {
+                let text = html_to_text(&html);
+                if text.len() > 100 {
+                    return Ok(text.chars().take(24_000).collect());
+                }
+            }
+        }
+        return Err(format!("HTTP {} (反爬拦截，无头浏览器也未能获取内容)", code));
+    }
+
     if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+        return Err(format!("HTTP {}", code));
     }
 
     let ct = resp

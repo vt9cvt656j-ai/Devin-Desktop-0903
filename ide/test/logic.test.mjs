@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as acorn from "acorn";
 import exifr from "exifr";
 import { ConversationMemory, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 
@@ -69,9 +70,25 @@ function load(name, deps = {}) {
   const fn = new Function(...keys, `${extractFn(name)}\n;return ${name};`);
   return fn(...keys.map((k) => deps[k]));
 }
+function collectIdentifiers(source, name) {
+  const ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
+  const hits = [];
+  const walk = (node, parent = null) => {
+    if (!node || typeof node.type !== "string") return;
+    if (node.type === "Identifier" && node.name === name) hits.push({ node, parent });
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "start" || key === "end" || key === "loc") continue;
+      if (Array.isArray(value)) for (const child of value) walk(child, node);
+      else if (value && typeof value.type === "string") walk(value, node);
+    }
+  };
+  walk(ast);
+  return hits;
+}
 
 const TO_POSIX = load("_toPosix");
 const NORMALIZE_PATH = load("_normalizeFsPath", { _toPosix: TO_POSIX });
+const IS_ABSOLUTE_FS_PATH = load("_isAbsoluteFsPath", { _normalizeFsPath: NORMALIZE_PATH });
 const PATH_IDENTITY = load("_pathIdentity", {
   _normalizeFsPath: NORMALIZE_PATH,
   _remote: { active: false, platform: "" },
@@ -79,6 +96,7 @@ const PATH_IDENTITY = load("_pathIdentity", {
 });
 const COHERENT_PATH = (path) => NORMALIZE_PATH(path);
 const NORM_REL = load("_normRel", { _normalizeFsPath: NORMALIZE_PATH, _pathIdentity: PATH_IDENTITY });
+const BASENAME = load("basename");
 const RUNTIME_OBLIGATION_ORDER = ["build", "run", "test", "install", "package"];
 const EXTERNAL_OBLIGATION_ORDER = ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"];
 
@@ -158,6 +176,86 @@ test("Git clone is wired through L0 tools and mutating Git approvals are exact",
   assert.match(SRC, /gitClone: \(source, target\) => core\.invoke\("git_clone"/);
   assert.match(SRC, /case "git_clone": return \{ type: "git", op: "clone"/);
   assert.match(SRC, /await backend\.gitClone\(source, target\)/);
+});
+
+test("git non-repo guidance prevents fake validation and wrong-repo writes", () => {
+  const guidance = load("_gitNonRepoGuidance");
+  const readOnlyCanReroot = load("_gitReadOnlyOpCanAutoReroot");
+  const failureMatch = load("_toolFailureMatch");
+
+  const status = guidance("/workspace/project", ["/workspace/project/app"], "status", false);
+  assert.match(status, /\[GIT_NEEDS_REPO\]/);
+  assert.match(status, /发现可能仓库根：\/workspace\/project\/app/);
+  assert.match(status, /只读 Git 操作可以在唯一候选仓库根上重试/);
+  assert.match(status, /不要把这个状态当成已完成的 Git 验证/);
+  assert.ok(failureMatch(status), "GIT_NEEDS_REPO must not count as successful verification");
+
+  const push = guidance("/workspace/project", ["/workspace/project/app"], "push", true);
+  assert.match(push, /不会自动猜目录执行/);
+  assert.match(push, /避免 commit\/push\/pull 到错项目/);
+
+  const empty = guidance("/workspace/project", [], "status", false);
+  assert.match(empty, /未在当前目录、父级或子目录发现可用 \.git/);
+  assert.match(empty, /git init/);
+  assert.match(empty, /跳过 Git 验证/);
+
+  assert.equal(readOnlyCanReroot({ type: "git", op: "status" }), true);
+  assert.equal(readOnlyCanReroot({ type: "git", op: "diff" }), true);
+  assert.equal(readOnlyCanReroot({ type: "git", op: "push" }), false);
+  assert.equal(readOnlyCanReroot({ type: "git", op: "branch", branch: "feature/x" }), false);
+  assert.match(SRC, /_gitResolveRepoContext\(gitRoot, call\)/);
+  assert.match(SRC, /_gitNonRepoGuidance\(gitCtx\.requestedRoot \|\| gitRoot/);
+});
+
+test("blocked tool failures produce concrete recovery instructions", () => {
+  const recover = load("_blockedToolRecoveryInstruction");
+
+  assert.match(
+    recover("[BLOCKED] src/a.js 已存在，但本次运行没有完整读取它的当前版本。重新 read_file(\"src/a.js\") 读完当前内容，再基于新版本修改。", { type: "edit", path: "src/a.js" }).text,
+    /\[RECOVERY:READ_CURRENT_FILE\][\s\S]*read_file\("src\/a\.js"\)[\s\S]*禁止改用 run_cmd/,
+  );
+  assert.match(
+    recover("[BLOCKED] src/collector.js 尚未完整读取当前版本。当前版本签名 426:18320:2185398645；已读范围：60-79、230-269、297-426 / 426 行；缺少：1-59、80-229、270-296。下一步先 read_file(\"src/collector.js\", offset=1, limit=426) 一次完整读取。", { type: "multiedit", path: "src/collector.js" }).text,
+    /\[RECOVERY:READ_MISSING_RANGES\][\s\S]*不要再 edit_file[\s\S]*1-59、80-229、270-296/,
+  );
+  assert.match(
+    recover("[BLOCKED] 这条 shell 命令会通过重定向、原地替换或脚本 API 直接改文件，无法执行 read-before-edit 与版本冲突检查。请先 read_file 完整读取目标文件，再使用 edit_file / multi_edit / write_file。", { type: "cmd", command: "perl -0pi -e s/a/b/ src/a.js" }).text,
+    /\[RECOVERY:USE_FILE_TOOL\][\s\S]*停止重试 run_cmd[\s\S]*sed[\s\S]*perl/,
+  );
+  assert.match(
+    recover("[BLOCKED] 本次模型回复里的 read_file 才刚确认「src/a.js」实际对应 /repo/src/a.js。模型尚未看到读取结果。", { type: "write", path: "src/a.js" }).text,
+    /\[RECOVERY:WAIT_FOR_READ_RESULT\][\s\S]*真实路径/,
+  );
+  assert.match(
+    recover("[ERROR] write_file 的 content 字段缺失——这次工具调用不完整，IDE 没有写盘。", { type: "write", path: "src/a.js" }).text,
+    /\[RECOVERY:RETRY_COMPLETE_WRITE\][\s\S]*完整非空 content/,
+  );
+  assert.match(
+    recover("[ERROR] 在 src/a.js 中找不到你给的 old_string——多半是空白/缩进/标点对不上。", { type: "edit", path: "src/a.js" }).text,
+    /\[RECOVERY:PRECISE_EDIT_STRING\][\s\S]*逐字符复制 old_string/,
+  );
+  assert.match(
+    recover("[GIT_NEEDS_REPO] 当前工作区「/repo」不是 Git 仓库（没有 .git）。", { type: "git", op: "status" }).text,
+    /\[RECOVERY:SELECT_GIT_REPO\][\s\S]*不能猜目录/,
+  );
+  assert.equal(recover("已修改 src/a.js（+1/-1 行）。", { type: "edit", path: "src/a.js" }), null);
+});
+
+test("tool messages append recovery guidance and agent loop nudges after blocked failures", () => {
+  const recover = load("_blockedToolRecoveryInstruction");
+  const toModel = load("_toolMsgForModel", {
+    _toolResultToString: (_call, result) => result.content,
+    _rebudgetRoadEnvironmentMessage: (message) => message,
+    _blockedToolRecoveryInstruction: recover,
+  });
+  const message = toModel(
+    { type: "edit", path: "src/a.js" },
+    { type: "edit", content: "[BLOCKED] src/a.js 尚未完整读取当前版本，或读取后内容已变化，不能盲目批量修改。重新 read_file 读完当前内容，再调用 multi_edit。" },
+  );
+  assert.match(message, /\[RECOVERY:READ_CURRENT_FILE\]/);
+  assert.match(SRC, /工具刚被保护门\/错误挡住了，别换旁门左道/);
+  assert.match(SRC, /_blockedToolRecoveryInstruction\(m\.content \|\| "", null\)/);
+  assert.match(SRC, /recoveryNudges < 4/);
 });
 
 test("AI permission startup preserves existing choices and never migrates by overwriting", () => {
@@ -256,6 +354,8 @@ test("agent path resolution keeps the run root ahead of the active workspace", (
     workspaceRoots: ["/work/active", "/work/other", "/work/run"],
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: PATH_IDENTITY,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    basename: BASENAME,
   });
   assert.deepEqual(allRoots("/work/run/"), ["/work/run", "/work/active", "/work/other"]);
 
@@ -264,6 +364,57 @@ test("agent path resolution keeps the run root ahead of the active workspace", (
   assert.equal(resolve("active/src/main.js", "/work/run"), "/work/active/src/main.js");
   assert.match(extractFn("_interleavedDiagnostics"), /_resolveExisting\(rel, root\)/);
   assert.match(SRC, /_interleavedDiagnostics\(_successfulEdits, root\)/);
+});
+
+test("agent path resolution never treats a restored tab label as a filesystem root", () => {
+  const root = "/Users/michael/Desktop/Mrday.one";
+  const allRoots = load("_allRoots", {
+    rootPath: root,
+    workspaceRoots: [root],
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    basename: BASENAME,
+  });
+  assert.deepEqual(allRoots("Mrday.one"), [root]);
+
+  const resolve = load("_resolveRel", { _allRoots: allRoots, _normalizeFsPath: NORMALIZE_PATH, _coherentFilePath: COHERENT_PATH });
+  assert.equal(resolve("index.js", "Mrday.one"), `${root}/index.js`);
+  assert.equal(resolve("Mrday.one/index.js", "Mrday.one"), `${root}/index.js`);
+
+  const noRootAllRoots = load("_allRoots", {
+    rootPath: "",
+    workspaceRoots: [],
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    basename: BASENAME,
+  });
+  assert.deepEqual(noRootAllRoots("Mrday.one"), []);
+  const noRootResolve = load("_resolveRel", { _allRoots: noRootAllRoots, _normalizeFsPath: NORMALIZE_PATH, _coherentFilePath: COHERENT_PATH });
+  assert.equal(noRootResolve("index.js", "Mrday.one"), "index.js");
+});
+
+test("chat session project root heals short labels only through known real roots", () => {
+  const root = "/Users/michael/Desktop/Mrday.one";
+  const knownRoots = load("_knownWorkspaceRoots", {
+    rootPath: root,
+    workspaceRoots: [root],
+    _normalizeFsPath: NORMALIZE_PATH,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    _pathIdentity: PATH_IDENTITY,
+  });
+  const fromCandidate = load("_workspaceRootFromCandidate", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+    _knownWorkspaceRoots: knownRoots,
+    _pathIdentity: PATH_IDENTITY,
+    basename: BASENAME,
+  });
+  const sessionRoot = load("_sessionProjectRootSync", { _workspaceRootFromCandidate: fromCandidate });
+  assert.equal(sessionRoot({ project: "Mrday.one" }), root);
+  assert.equal(sessionRoot({ project: "unknown-project" }), "");
+  assert.equal(sessionRoot({ project: "/tmp/real-project" }), "/tmp/real-project");
 });
 
 test("multi-root resolution never falls through to process cwd or guesses an ambiguous basename", async () => {
@@ -1482,18 +1633,22 @@ test("local discovery is a registered read-only model tool", () => {
 });
 
 test("keyless public data tools are registered, normalized, and read-only", () => {
-  for (const name of ["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment"]) {
+  for (const name of ["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]) {
     assert.match(SRC, new RegExp(`name: "${name}"`));
     assert.match(SRC, new RegExp(`backend\\.invoke\\("${name}"|command = "${name}"`));
   }
-  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*roadenvironment.*trackshipment/);
-  assert.match(SRC, /desktopOnly = new Set\([^\n]*"road_environment"/,
-    "road data must not be offered by the browser mock backend");
+  assert.match(SRC, /liveenvironment.*livemarkets.*liveflights.*roadenvironment.*trackshipment.*shopcatalog/);
+  assert.match(SRC, /desktopOnly = new Set\([^\n]*"shop_catalog"/,
+    "structured public data tools must not be offered by the browser mock backend");
   assert.match(SRC, /name: "road_environment"[\s\S]{0,1800}enum: \["overview", "vehicle_counts", "traffic_flow", "road_incidents"\][\s\S]{0,1200}required: \["kind"\], anyOf: \[\{ required: \["near"\] \}, \{ required: \["latitude", "longitude"\] \}\]/,
     "road schema must require either current-location permission or explicit coordinates");
   assert.match(SRC, /Coinbase 与 Kraken/);
   assert.match(SRC, /不抓网页、不绕验证码、不编造轨迹/);
   assert.match(SRC, /tracking_events 为空时绝不能声称包裹状态/);
+  assert.match(SRC, /Shopify 公共 \/products\.json/);
+  assert.match(SRC, /JSON-LD Product\/Offer/);
+  assert.match(SRC, /不登录、不绕验证码\/反爬、不调用私有接口/);
+  assert.match(SRC, /currency=null 时不得从域名、语言或地区推断/);
   assert.match(SRC, /anyOf: \[\{ properties: \{ kind: \{ enum: \["weather", "air_quality", "marine"\]/,
     "environment schema must require coordinates for coordinate-bound kinds");
   assert.match(SRC, /pattern: "\^\[A-Za-z0-9_-\]\+\$"/,
@@ -1517,14 +1672,14 @@ test("keyless public data tools are registered, normalized, and read-only", () =
     "road observations must be fetched again on a later model turn");
   assert.match(SRC, /_seenLive[\s\S]{0,700}_dupLive/,
     "identical live-data calls in one batch must be collapsed before parallel dispatch");
-  assert.match(SRC, /\["liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment"\]\.includes/,
+  assert.match(SRC, /\["liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog"\]\.includes/,
     "identical road calls in one model response must be collapsed");
-  assert.match(SRC, /_READ_ONLY_TYPES = new Set\([^\n]*"roadenvironment"/,
-    "road_environment must stay in the read-only parallel tool set");
-  assert.match(SRC, /const _READ_TOOLS = \[[^\n]*"road_environment"/,
-    "read-only child agents must receive the structured road tool");
-  assert.match(SRC, /const _READ_TYPES = \[[^\n]*"roadenvironment"/,
-    "read-only child execution must allow road results");
+  assert.match(SRC, /_READ_ONLY_TYPES = new Set\([^\n]*"shopcatalog"/,
+    "shop_catalog must stay in the read-only parallel tool set");
+  assert.match(SRC, /const _READ_TOOLS = \[[^\n]*"shop_catalog"/,
+    "read-only child agents must receive the structured shop tool");
+  assert.match(SRC, /const _READ_TYPES = \[[^\n]*"shopcatalog"/,
+    "read-only child execution must allow shop results");
   assert.doesNotMatch(SRC, /traffic_incidents: "road_environment"|vehicle_counts: "road_environment"/,
     "semantic aliases without a kind default must not create guaranteed-invalid calls");
   assert.match(SRC, /_isCurrentLocationRequest\(call\.near\)[\s\S]{0,500}_requestCurrentCoordinates\(\)/,
@@ -1533,7 +1688,7 @@ test("keyless public data tools are registered, normalized, and read-only", () =
   const mapCall = load("_mapToolCall", {
     _normalizeArgKeys: (args) => args,
     _STR_ARG_KEYS: new Set(),
-    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment"]),
+    _KNOWN_TOOLS: new Set(["live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]),
     _canonicalToolName: () => "",
     _finiteNumberArg: load("_finiteNumberArg"),
   });
@@ -1570,6 +1725,21 @@ test("keyless public data tools are registered, normalized, and read-only", () =
   assert.equal(shipment.type, "trackshipment");
   assert.equal(shipment.path, "官方核验", "tool cards must never persist model-supplied carrier text as their path");
   assert.equal(shipment.trackingNumber, "1Z999AA10123456784");
+  assert.deepEqual(mapCall("shop_catalog", {
+    query: "查这个店价格", url: "https://shop.example", limit: 8,
+  }, new Map()), {
+    type: "shopcatalog", path: "https://shop.example", query: "查这个店价格",
+    url: "https://shop.example", limit: 8,
+  });
+  assert.deepEqual(mapCall("smzdm_search", {
+    query: "iPhone 16 优惠", max_results: 7,
+  }, new Map()), { type: "smzdm_search", query: "iPhone 16 优惠", max_results: 7 });
+  assert.deepEqual(mapCall("xianyu_search", {
+    query: "二手 iPhone 13", max_results: 5,
+  }, new Map()), { type: "xianyu_search", query: "二手 iPhone 13", max_results: 5 });
+  assert.deepEqual(mapCall("zhuanzhuan_search", {
+    query: "二手 iPhone 13", max_results: 5,
+  }, new Map()), { type: "zhuanzhuan_search", query: "二手 iPhone 13", max_results: 5 });
 });
 
 test("road model output keeps truth metadata and complete JSON inside the final model cap", () => {
@@ -1842,10 +2012,65 @@ test("local discovery keeps address and permission failures separate", () => {
   assert.equal(locationMetadata({ radiusM: 3000 }, { source: "core_location", accuracyM: 5000 }).accuracy_exceeds_radius, true);
 });
 
+test("local discovery visible card summarizes data instead of dumping raw JSON", () => {
+  const visibleSummary = load("_localDiscoveryVisibleSummary", {
+    _escHtml: (value) => String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;"),
+  });
+  const html = visibleSummary({
+    center: { label: "上海市静安区胶州路282号", latitude: 31.2288, longitude: 121.4398 },
+    radius_m: 3000,
+    places: [{
+      id: "osm-node-1",
+      name: "样例咖啡",
+      category: "cafe",
+      distance_m: 238,
+      opening_hours: "Mo-Fr 08:00-17:00",
+      source: "openstreetmap",
+      address: "胶州路附近",
+    }],
+    nearby_context: [{ id: "wiki-1", name: "静安寺", distance_m: 1100 }],
+    weather: {
+      condition: "阴",
+      temperature_c: 27.4,
+      apparent_temperature_c: 29.1,
+      precipitation_mm: 0,
+      wind_speed_kmh: 8,
+      observed_at: "2026-07-14T11:00",
+    },
+    source_statuses: [
+      { source: "overpass", status: "success", result_count: 1, data_as_of: "2026-07-12T10:21:46Z", detail: "Wikipedia GeoSearch is returned separately in nearby_context as background" },
+      { source: "wikipedia_geosearch", status: "success", result_count: 1, detail: "Wikipedia GeoSearch background only" },
+    ],
+    limitations: ["Open-Meteo current conditions are provider estimates for the reported timestamp, not a guarantee at a specific venue."],
+  }, { near: "上海市静安区胶州路282号" });
+
+  assert.match(html, /查询中心/);
+  assert.match(html, /样例咖啡/);
+  assert.match(html, /OSM 候选地点/);
+  assert.match(html, /天气估算/);
+  assert.match(html, /来源状态/);
+  assert.match(html, /完整结构化依据仍已提供给模型/);
+  assert.doesNotMatch(html, /source_statuses/);
+  assert.doesNotMatch(html, /data_as_of/);
+  assert.doesNotMatch(html, /Wikipedia GeoSearch/);
+  assert.doesNotMatch(html, /"places"/);
+});
+
 test("local discovery executor wires permission, coordinates, and address failures into real cards", async () => {
   const isCurrent = load("_isCurrentLocationRequest");
   const normalizeLocation = load("_normalizeLocalDiscoveryLocation", { _isCurrentLocationRequest: isCurrent });
   const cardState = load("_localDiscoveryCardState", { _isCurrentLocationRequest: isCurrent });
+  const visibleSummary = load("_localDiscoveryVisibleSummary", {
+    _escHtml: (value) => String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;"),
+  });
   const locationMetadata = load("_localDiscoveryLocationMetadata");
   const presentation = load("_currentLocationFailurePresentation");
   const fakeStep = () => {
@@ -1870,6 +2095,7 @@ test("local discovery executor wires permission, coordinates, and address failur
     _requestCurrentCoordinates: requestLocation,
     _currentLocationFailurePresentation: presentation,
     _localDiscoveryCardState: cardState,
+    _localDiscoveryVisibleSummary: visibleSummary,
     _localDiscoveryLocationMetadata: locationMetadata,
     _escHtml: (value) => String(value),
     inTauri: true,
@@ -1910,9 +2136,11 @@ test("local discovery executor wires permission, coordinates, and address failur
   assert.match(successResult.content, /"retrieved_at": 1783888800/);
   assert.match(successResult.content, /"observed_at": "2026-07-12T14:00"/);
   assert.match(successResult.content, /"data_as_of": "2026-07-12T10:21:46Z"/);
-  assert.match(successUi.viewport.innerHTML, /"data_as_of": "2026-07-12T10:21:46Z"/);
+  assert.match(successUi.viewport.innerHTML, /OSM 候选地点/);
+  assert.doesNotMatch(successUi.viewport.innerHTML, /"data_as_of"/);
+  assert.doesNotMatch(successUi.viewport.innerHTML, /source_statuses/);
   assert.match(successResult.content, /"open_now": null/);
-  assert.equal(successUi.opened.has("is-open"), true);
+  assert.equal(successUi.opened.has("is-open"), false);
 
   const deniedUi = fakeStep();
   let deniedBackendCalls = 0;
@@ -2059,6 +2287,16 @@ test("native screen tools are mapped to real Tauri commands", () => {
   assert.match(SRC, /"ui_click".*_STRICT_MUTATING_TOOL_NAMES|"automation", "ui_click", "db_query"/);
 });
 
+test("automation schema requires state verification and recovery", () => {
+  const description = SRC.match(/name: "automation", description: "([^"]+)"/)?.[1] || "";
+  assert.match(description, /按状态机用/);
+  assert.match(description, /前置状态/);
+  assert.match(description, /验证后置状态/);
+  assert.match(description, /发起点击或输入不等于成功/);
+  assert.match(description, /selector 失效要重新读取页面\/节点/);
+  assert.match(description, /登录\/验证码\/系统权限阻塞/);
+});
+
 test("read ranges deduplicate only exact source still available in the current run context", () => {
   const merge = load("_mergeReadRanges");
   const covered = load("_readRangeCovered", { _mergeReadRanges: merge });
@@ -2113,13 +2351,135 @@ test("message compaction invalidates exact read coverage before allowing a refet
   assert.equal(synced, 1, "coverage must be rebuilt after the exact source is compressed away");
 });
 
-test("retry exhaustion markers are owned by the inner turn and never retried again outside", () => {
+test("agent auto-recovers transient stream errors after inner turn retries are exhausted", () => {
+  const strip = load("_stripAiRetryPrefix");
+  const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
+  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway });
   const transient = load("_isTransientTurnErr", {
-    _isRetryableAiError: () => true,
+    _stripAiRetryPrefix: strip,
+    _isProviderGatewayStatusError: providerGateway,
+    _isRetryableAiError: retryable,
   });
+  assert.equal(transient("连接中断（网络波动），已保留生成的部分，正在自动恢复。"), true);
+  assert.equal(transient("AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断"), true);
+  assert.equal(transient("[turn-retry-exhausted] connection reset by peer"), true);
+  assert.equal(transient("[fast-retry-exhausted] 模型长时间无响应"), true);
+  assert.equal(transient("[tool-stream-retry-exhausted] AI stream closed before data: [DONE]（连接提前结束）"), true);
   assert.equal(transient("[tool-args-invalid] write_file truncated"), false);
-  assert.equal(transient("[tool-stream-retry-exhausted] missing DONE"), false);
-  assert.equal(transient("[turn-retry-exhausted] network reset"), false);
+});
+
+test("server-exhausted provider gateway failures do not trigger frontend retry storms", () => {
+  const strip = load("_stripAiRetryPrefix");
+  const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
+  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway });
+  const transient = load("_isTransientTurnErr", {
+    _stripAiRetryPrefix: strip,
+    _isProviderGatewayStatusError: providerGateway,
+    _isRetryableAiError: retryable,
+  });
+  const format = load("_formatAgentFinalError", {
+    _stripAiRetryPrefix: strip,
+    _isProviderGatewayStatusError: providerGateway,
+  });
+
+  const bare502 = "[turn-retry-exhausted] AI request failed (502 Bad Gateway): error code: 502";
+  const friendly502 = "[turn-retry-exhausted] AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。";
+  assert.equal(providerGateway(bare502), true);
+  assert.equal(providerGateway(friendly502), true);
+  assert.equal(retryable(bare502), false, "the server gateway already retried upstream 502s");
+  assert.equal(transient(bare502), false, "outer agent loop must not perform another 3x retry cycle");
+  assert.match(format(friendly502), /当前模型「claude-opus-4-6」线路失败/);
+  assert.match(format(bare502), /已停止继续重复撞同一路/);
+  assert.match(SRC, /const retryableTurnErr = turnErr && _isRetryableAiError\(turnErr\)/);
+  assert.match(SRC, /IDE 已停止继续重复撞同一路/);
+});
+
+test("browser AI HTTP errors prefer gateway JSON error messages", () => {
+  const detail = load("_aiErrorDetailFromBody");
+  const format = load("_formatAiHttpError", { _aiErrorDetailFromBody: detail });
+  const friendly = format(502, "Bad Gateway", "{\"error\":\"【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。\"}");
+  assert.equal(friendly, "AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。");
+  assert.equal(format(502, "Bad Gateway", "{\"code\":502}"), "AI request failed (502 Bad Gateway): error code: 502");
+  assert.equal(format(502, "Bad Gateway", ""), "AI request failed (502 Bad Gateway): empty response body");
+});
+
+test("AI provider config separates Michael gateway from user BYOK", () => {
+  const MICHAEL_API = "https://code.mrday.one";
+  const AI_PROVIDER_GATEWAY = "gateway";
+  const AI_PROVIDER_BYOK = "byok";
+  const clean = load("_cleanAiBaseUrl");
+  const chatUrl = load("_chatCompletionsUrl", { _cleanAiBaseUrl: clean });
+  assert.equal(chatUrl("https://api.openai.com"), "https://api.openai.com/v1/chat/completions");
+  assert.equal(chatUrl("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
+  assert.equal(chatUrl("https://api.openai.com/v1/chat/completions"), "https://api.openai.com/v1/chat/completions");
+
+  const activeMode = load("_activeAiProviderMode", { AI_PROVIDER_GATEWAY, AI_PROVIDER_BYOK });
+  const isGateway = load("_isGatewayConfig", { AI_PROVIDER_GATEWAY, AI_PROVIDER_BYOK, MICHAEL_API, _cleanAiBaseUrl: clean });
+  const baseDefault = {
+    baseUrl: MICHAEL_API,
+    apiKey: "",
+    gatewayApiKey: "",
+    customBaseUrl: "",
+    customApiKey: "",
+    customModel: "",
+    gatewayModel: "",
+    providerMode: AI_PROVIDER_GATEWAY,
+    model: "",
+  };
+  const makeStorage = (_cfgCache, token = "") => load("_configForStorage", {
+    _DEFAULT_AI_CONFIG: baseDefault,
+    _cfgCache,
+    _activeAiProviderMode: activeMode,
+    _cleanAiBaseUrl: clean,
+    AI_PROVIDER_BYOK,
+    MICHAEL_API,
+    localStorage: { getItem: () => token },
+  });
+
+  const byok = makeStorage({ ...baseDefault, model: "claude-opus-4-6", gatewayModel: "claude-opus-4-6" })({
+    providerMode: AI_PROVIDER_BYOK,
+    customBaseUrl: "https://api.openai.com/v1",
+    customApiKey: "sk-user",
+    customModel: "gpt-4.1",
+    model: "gpt-4.1",
+  });
+  assert.equal(byok.baseUrl, "https://api.openai.com/v1");
+  assert.equal(byok.apiKey, "sk-user");
+  assert.equal(byok.model, "gpt-4.1");
+  assert.equal(byok.gatewayModel, "claude-opus-4-6", "switching to BYOK must preserve the last gateway model separately");
+
+  const gateway = makeStorage(byok)({ providerMode: AI_PROVIDER_GATEWAY });
+  assert.equal(gateway.baseUrl, MICHAEL_API);
+  assert.equal(gateway.apiKey, "");
+  assert.equal(gateway.gatewayApiKey, "", "a user's custom provider key must never become the Michael gateway credential");
+  assert.equal(gateway.model, "claude-opus-4-6", "switching back to gateway must not send the BYOK model id to the Michael gateway");
+
+  const l0 = load("_l0On", {
+    _isGatewayConfig: isGateway,
+    loadConfig: () => ({ providerMode: AI_PROVIDER_GATEWAY, baseUrl: MICHAEL_API }),
+  });
+  assert.equal(l0({ providerMode: AI_PROVIDER_GATEWAY, baseUrl: MICHAEL_API }), true);
+  assert.equal(l0({ providerMode: AI_PROVIDER_BYOK, baseUrl: "https://api.openai.com/v1" }), false,
+    "BYOK direct calls cannot rely on gateway-side prompt/tool injection");
+
+  assert.match(SRC, /if \(!key && isGateway\)/, "BYOK must not call the Michael /api/ide-key helper");
+  assert.match(SRC, /if \(ideMode && _l0On\(_turnConfig\)\)/, "L0 must be decided from this turn's actual provider config");
+  assert.match(SRC, /providerMode: AI_PROVIDER_BYOK[\s\S]{0,220}customBaseUrl:[\s\S]{0,220}customApiKey:[\s\S]{0,220}customModel:/,
+    "settings save must persist BYOK base URL, key, and model");
+});
+
+test("agent retry toast is scoped and clears when real data resumes", () => {
+  assert.match(SRC, /const _AGENT_RETRY_TOAST_KIND = "agent-retry"/);
+  assert.match(SRC, /function showAgentRetryToast\(msg\)/);
+  assert.match(SRC, /function clearAgentRetryToast\(\)/);
+  assert.match(SRC, /showToast\(msg, \{ kind: _AGENT_RETRY_TOAST_KIND, duration: 3000 \}\)/);
+  assert.match(SRC, /const _realProgress = ev\.kind === "reasoning"[\s\S]{0,220}if \(_realProgress\) \{\s*clearAgentRetryToast\(\);/,
+    "retry toast should disappear as soon as reasoning/token/tool data starts streaming again");
+  assert.match(SRC, /body\.querySelectorAll\("\.md-caret"\)[\s\S]{0,140}if \(!err\) clearAgentRetryToast\(\);/,
+    "a successful model turn must not leave a stale retry toast visible");
+  assert.match(SRC, /showAgentRetryToast\(`网络\/服务波动 \(\$\{_turnFails\}\/3\)，自动恢复中…`\)/);
+  assert.match(SRC, /_turnFails = 0;\s*clearAgentRetryToast\(\);/,
+    "loop-level recovery toast should be cleared after the next successful turn");
 });
 
 test("Codex image skill tool naming maps to Michael IDE's real image tool", () => {
@@ -2159,6 +2519,25 @@ test("_looksQuickAsk excludes project/multi-file scope (so it isn't crippled to 
   assert.equal(f("梳理一下这个工程的架构"), false);
 });
 
+test("bare address statements are context while location questions stay actionable", () => {
+  const isContextOnly = load("_isContextOnlyLocationStatement");
+  for (const statement of [
+    "我目前在上海胶州路282号",
+    "我现在在静安区胶州路282号",
+    "我的地址是北京市朝阳区建国路88号",
+    "I'm at 282 Jiaozhou Road, Shanghai",
+  ]) assert.equal(isContextOnly(statement), true, statement);
+
+  for (const query of [
+    "我目前在上海胶州路282号，附近有什么好吃的？",
+    "我在上海，帮我查天气",
+    "我的地址是胶州路282号，记住这个地址",
+    "上海胶州路282号在哪里？",
+  ]) assert.equal(isContextOnly(query), false, query);
+
+  assert.match(SRC, /用户这轮只提供了位置上下文，没有提出查询/);
+});
+
 test("developer community search is wired through schema, normalization, execution, and truthful fallback", () => {
   assert.match(SRC, /name: "developer_community_search"/);
   assert.match(SRC, /case "developer_community_search": return \{ type: "developer_community_search"/);
@@ -2179,7 +2558,67 @@ test("developer community search is wired through schema, normalization, executi
   assert.ok(directoryDescription, "search_tools should have a concise runtime description");
   assert.match(directoryDescription, /developer_community_search/);
   assert.match(directoryDescription, /当前支持/);
+  assert.match(directoryDescription, /当前时间只表示本轮请求时间/);
+  assert.match(directoryDescription, /published_date、updated_at、version、observed_at、rate_date 或 retrieved_at/);
+  assert.match(directoryDescription, /最新论文\/SOTA\/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search/);
+  assert.match(directoryDescription, /新技术\/新版本\/API 兼容性先查官方文档、包注册表、GitHub\/GitLab\/Gitee\/Codeberg release\/issues 和开发者社区/);
+  assert.match(directoryDescription, /医学\/药物\/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search/);
+  assert.match(directoryDescription, /游戏价格\/平台加载 steam_search/);
+  assert.match(directoryDescription, /live_markets（参考汇率\/加密资产报价）/);
+  assert.match(directoryDescription, /提炼共识、分歧、适用版本\/时间、对当前问题的影响和验证动作/);
   assert.doesNotMatch(directoryDescription, /100%|十倍|全球最大|所有公开仓库|全部免费|秒回|绝不会丢/);
+});
+
+test("GitHub repo reader is a real built-in tool, not only an MCP preset", () => {
+  assert.match(SRC, /name: "github_repo"/);
+  assert.match(SRC, /直接读取指定 GitHub 仓库的真实内容/);
+  assert.match(SRC, /case "github_repo": return \{ type: "github_repo"/);
+  assert.match(SRC, /backend\.invoke\(call\.type, _args\)/);
+  assert.match(SRC, /github_repo: "GitHub 仓库读取"/);
+  assert.match(SRC, /if \(call\?\.owner\) args\.owner = call\.owner/);
+  assert.match(SRC, /if \(call\?\.repo\) args\.repo = call\.repo/);
+  assert.match(SRC, /if \(call\?\.action\) args\.action = call\.action/);
+  assert.match(SRC, /"github_search", "github_repo",\s*"gitlab_repo", "gitee_repo", "codeberg_repo", "cve_search"/);
+  assert.match(SRC, /要读具体代码仓库的 README\/目录\/源码\/release\/issue\/PR\/MR/);
+  assert.match(SRC, /读取指定 GitHub 仓库 README\/目录\/源码\/release\/issue\/PR/);
+});
+
+test("GitLab, Gitee, and Codeberg repo readers are real built-in tools", () => {
+  for (const name of ["gitlab_repo", "gitee_repo", "codeberg_repo"]) {
+    assert.match(SRC, new RegExp(`name: "${name}"`), `${name} schema is registered`);
+    assert.ok(SRC.includes(`case "${name}": return { type: "${name}"`), `${name} maps to an executable call type`);
+    assert.ok(SRC.includes(`call.type === "${name}"`), `${name} is in the knowledge execution branch`);
+    assert.ok(SRC.includes(`${name}: "`), `${name} has a user-visible label`);
+  }
+  assert.match(SRC, /GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo/);
+  assert.match(SRC, /GITLAB_TOKEN|GITEE_ACCESS_TOKEN|CODEBERG_TOKEN/);
+});
+
+test("deal and second-hand marketplace search tools are fully wired", () => {
+  for (const name of ["smzdm_search", "xianyu_search", "zhuanzhuan_search"]) {
+    assert.match(SRC, new RegExp(`name: "${name}"`), `${name} schema is registered`);
+    assert.ok(SRC.includes(`case "${name}": return { type: "${name}"`), `${name} maps to an executable call type`);
+    assert.ok(SRC.includes(`call.type === "${name}"`), `${name} must be in the generic search execution branch`);
+  }
+  assert.match(SRC, /不是官方 API，结果是公开索引候选/);
+  assert.match(SRC, /优惠\/薅羊毛\/返利\/比价加载 smzdm_search/);
+  assert.match(SRC, /二手\/闲鱼\/转转\/捡漏同时加载 xianyu_search 和 zhuanzhuan_search/);
+  assert.match(SRC, /"smzdm_search", "xianyu_search", "zhuanzhuan_search"/,
+    "marketplace search results should auto-deep-read top pages");
+
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const schema = (name, description) => ({ type: "function", function: { name, description } });
+  const smzdm = schema("smzdm_search", "查当前优惠 好价 券 返利 薅羊毛");
+  const xianyu = schema("xianyu_search", "查闲鱼 二手 挂牌 成色 捡漏 价格区间");
+  const zhuanzhuan = schema("zhuanzhuan_search", "查转转 二手 回收 验机 行情");
+  const registry = new Map([
+    ["smzdm_search", smzdm],
+    ["xianyu_search", xianyu],
+    ["zhuanzhuan_search", zhuanzhuan],
+  ]);
+  assert.deepEqual(lookup("薅羊毛 iPhone 优惠", registry, new Set()).map((tool) => tool.function.name), ["smzdm_search"]);
+  assert.ok(lookup("闲鱼二手捡漏", registry, new Set()).map((tool) => tool.function.name).includes("xianyu_search"));
 });
 
 test("active Skills survive L0 prompt stripping and are inherited by child work", () => {
@@ -2332,6 +2771,23 @@ test("workspace trust is requested only when repository MCP code is about to sta
   assert.match(extractFn("_ensureMcpTools"), /if \(!\(await checkWorkspaceTrust\(root\)\)\)/);
 });
 
+test("MCP presets prefer current repository-context servers over deprecated GitHub package", () => {
+  const start = SRC.indexOf("const _MCP_PRESETS = [");
+  const end = SRC.indexOf("const _MCP_KEY_URLS = {");
+  assert.ok(start > 0 && end > start, "MCP preset block should be present");
+  const presets = SRC.slice(start, end);
+
+  assert.match(presets, /ghcr\.io\/github\/github-mcp-server/);
+  assert.match(presets, /GITHUB_TOOLSETS/);
+  assert.doesNotMatch(presets, /@modelcontextprotocol\/server-github/);
+  assert.match(presets, /name:\s*"github-remote"[\s\S]*"https:\/\/api\.githubcopilot\.com\/mcp\/"/);
+  assert.match(presets, /name:\s*"context7"[\s\S]*"@upstash\/context7-mcp"/);
+  assert.match(presets, /name:\s*"deepwiki"[\s\S]*"https:\/\/mcp\.deepwiki\.com\/mcp"/);
+  assert.match(presets, /name:\s*"gitmcp"[\s\S]*"https:\/\/gitmcp\.io\/OWNER\/REPO"/);
+  assert.match(presets, /name:\s*"sourcegraph"[\s\S]*"https:\/\/sourcegraph\.example\.com\/\.api\/mcp"/);
+  assert.match(presets, /"npx", args: \["-y", "mcp-remote"/);
+});
+
 test("MCP public tool names stay valid and collision-free", () => {
   const hash = load("_mcpNameHash");
   const publicName = load("_mcpPublicToolName", { _mcpNameHash: hash });
@@ -2388,7 +2844,12 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   assert.deepEqual(initial.tools.map((tool) => tool.function.name), [
     "read_file", "search_tools", "mcp__server__old_a", "mcp__server__old_b",
   ]);
-  const lookup = load("_searchToolsLookup")("requested deployment", registry, new Set(initial.tools.map((tool) => tool.function.name)));
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery })(
+    "requested deployment",
+    registry,
+    new Set(initial.tools.map((tool) => tool.function.name)),
+  );
   assert.equal(lookup[0]?.function?.name, "mcp__server__requested");
   const liveWindow = [...initial.tools];
   const swapped = applyWindow(liveWindow, lookup, initial.coreNames, 4, 64 * 1024);
@@ -2584,6 +3045,9 @@ test("engineering task profiling gates only substantial code work and detects UI
   assert.equal(profile("调整按钮和表单的样式布局").ui, true);
   assert.equal(profile("修复手机端视觉和交互动效问题").ui, true);
   assert.equal(profile("修复登录按钮不响应").implementation, true);
+  assert.equal(profile("看看项目还有什么 bug").debugProject, true,
+    "project-wide bug hunts must use the debugging evidence plan gate");
+  assert.equal(profile("解决这些 bug，跑不起来还有死循环").debugProject, true);
   const architecture = profile("重构整个代码库的认证架构，消除硬编码并补齐测试");
   assert.equal(architecture.applies, true);
   assert.equal(architecture.requiresPlan, true);
@@ -2629,6 +3093,8 @@ test("engineering task profiling gates only substantial code work and detects UI
   assert.equal(profile("请按照这个重构方案修改认证模块").explicitMutation, true);
   assert.equal(profile("根据上述优化建议更新代码").explicitMutation, true);
   assert.equal(profile("采用这个重构思路修复 bug").explicitMutation, true);
+  assert.equal(profile("修复这个 bug 有什么建议？").debugProject, false,
+    "read-only advice about a bug must not be upgraded into a project-wide fix");
   assert.deepEqual(runtimeObligations("重构建议"), [], "重构建议 must not contain a synthetic 构建 obligation");
   assert.deepEqual(externalObligations("修复部署按钮"), []);
   assert.deepEqual(externalObligations("修复部署流程和部署配置"), []);
@@ -2665,7 +3131,7 @@ test("engineering task profiling gates only substantial code work and detects UI
   }
 });
 
-test("mutation intent cannot finish as a successful zero-effect run", () => {
+test("mutation effect routing cannot finish as a successful zero-effect run", () => {
   const { runtimeObligations, externalObligations, explicitExternal, profile } = engineeringHelpers();
   const required = load("_runRequiredEffect");
   const target = load("_effectTargetForTask");
@@ -2686,17 +3152,15 @@ test("mutation intent cannot finish as a successful zero-effect run", () => {
     _runEffectTarget: runTarget,
   });
   const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
-  assert.equal(required({ mode: "agent", _intent: { effect: "mutate" }, engineering: {} }), "mutate");
-  assert.equal(required({ mode: "agent", _intent: null, engineering: { explicitMutation: true } }), "mutate");
-  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { explicitMutation: true } }), "mutate",
-    "a classifier cannot downgrade a clear fix/implement imperative");
-  assert.equal(required({ mode: "agent", _intent: { effect: "inspect" }, engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect",
+  assert.equal(required({ mode: "agent", engineering: { applies: true } }), "mutate");
+  assert.equal(required({ mode: "agent", engineering: { explicitMutation: true } }), "mutate");
+  assert.equal(required({ mode: "agent", engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect",
     "advisory optimization questions stay read-only");
   assert.equal(target("修复登录按钮不响应", { bug: true }), "workspace");
   assert.equal(target("把最新版推送到 GitHub", { implementation: true }), "external");
   assert.equal(target("编译运行一下", { implementation: false }), "runtime");
-  assert.equal(runTarget({ _intent: { target: "external" }, _originalText: "修复代码", engineering: profile("修复代码") }), "workspace",
-    "a classifier target cannot let an external action stand in for a clear local edit");
+  assert.equal(runTarget({ _originalText: "修复代码", engineering: profile("修复代码") }), "workspace",
+    "external actions cannot stand in for a clear local edit");
   assert.match(SRC, /run\._incompleteReason = "pending_plan"/);
   assert.match(SRC, /run\._incompleteReason = "required_mutation_missing"/);
   assert.match(SRC, /_missingRequiredEffects\(run, \{/);
@@ -2814,63 +3278,158 @@ test("effect clauses follow the latest explicit directive without erasing other 
   assert.deepEqual(externalObligations("部署，然后不要部署"), []);
 });
 
-test("classified project work upgrades planning and complex plans cover the full engineering loop", () => {
-  const merge = load("_engineeringProfileWithIntent");
+test("local engineering profiles drive planning without an extra classifier request", () => {
   const requiresPlan = load("_runRequiresPlan");
-  const shouldAwaitIntent = load("_shouldAwaitIntentForPlan");
   const quality = load("_planQualityIssue");
   const base = { applies: true, substantial: false, requiresPlan: false };
+  const profile = engineeringHelpers().profile;
 
-  const project = merge(base, { kind: "project", effect: "mutate", steps: 20 });
-  assert.equal(project.requiresPlan, true);
-  assert.equal(project.substantial, true);
-  assert.equal(merge(base, { kind: "edit", effect: "mutate", steps: 14 }).requiresPlan, true,
-    "a high-step mutation must not bypass planning merely because it was labelled edit");
-  assert.equal(merge(base, { kind: "answer", effect: "inspect", steps: 15 }).requiresPlan, false);
-  assert.equal(requiresPlan({ engineering: base, _intent: { kind: "project", effect: "mutate", steps: 20 } }), true);
-  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: false }, _intent: { kind: "project", effect: "inspect", steps: 20 } }), true,
+  const project = { ...base, substantial: true, requiresPlan: true };
+  assert.equal(requiresPlan({ engineering: project }), true);
+  assert.equal(requiresPlan({ engineering: base }), false);
+  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: false } }), true,
     "complex read-only investigations need an evidence-oriented plan");
-  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: true }, _intent: { kind: "project", effect: "inspect", steps: 20 } }), true,
-    "a classifier cannot remove the plan gate from a locally explicit mutation");
-  assert.equal(requiresPlan({ engineering: { ...base, explicitReadOnly: true, projectScope: false, longTask: false }, _intent: { kind: "answer", effect: "inspect", steps: 4 } }), false,
+  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: true } }), true);
+  assert.equal(requiresPlan({ engineering: { ...base, explicitReadOnly: true, projectScope: false, longTask: false } }), false,
     "simple advice must not receive a ritual plan gate");
-  assert.equal(shouldAwaitIntent({ engineering: { explicitMutation: true } }), false,
-    "a small clear mutation must not wait for the slow intent classifier before planning can be skipped");
-  assert.equal(shouldAwaitIntent({ engineering: { explicitReadOnly: true } }), false);
-  assert.equal(shouldAwaitIntent({ engineering: { requiresPlan: true, explicitMutation: true } }), true);
-  assert.equal(shouldAwaitIntent({ engineering: {} }), true,
-    "ambiguous work still waits for intent so complex tasks receive a plan");
-  const commandProfile = engineeringHelpers().profile;
-  for (const request of ["npm test", "cargo test", "npm run dev", "npm ci", "pnpm i", ".\\gradlew.bat test", "mvn test", "dotnet test", "跑一下"]) {
-    assert.equal(shouldAwaitIntent({ engineering: commandProfile(request) }), false, `${request} must not wait up to 9s for intent`);
-  }
+  assert.doesNotMatch(SRC, /function _classifyIntent|_intentReady\s*=\s*_classifyIntent|_shouldAwaitIntent|_engineeringProfileWithIntent|(?:^|[^\w])_intent\s*[=:]/,
+    "every agent turn must not spend a second network request on intent classification");
+  assert.deepEqual(collectIdentifiers(SRC, "intent"), [],
+    "main.js must not contain a free/bare `intent` identifier; Safari reports that as `Can't find variable: intent`");
+  const websiteProfile = profile("帮我用谷歌，mac风格，白色浅色写一个 ide 官网");
+  assert.equal(websiteProfile.ui, true);
+  assert.equal(websiteProfile.uiProject, true);
+  assert.equal(websiteProfile.requiresPlan, true,
+    "creating an official-site/landing-page UI is a substantial project even if the prompt is short");
 
   assert.match(quality([], true, "mutate"), /尚未创建计划/);
   assert.match(quality([
     { content: "读取认证模块并定位调用链" },
     { content: "修改登录状态机并同步调用方" },
-  ], true, "mutate"), /验证\/测试|至少 3/);
+  ], true, "mutate"), /接口\/数据契约与边界|失败\/边界\/兼容处理|交付\/验收标准|至少 5/);
+  assert.match(quality([
+    { content: "搭建 Node CLI 与来源配置，定义统一游戏资料模型" },
+    { content: "实现 RSS 抓取、去重、失败隔离与 JSON 落盘" },
+    { content: "补齐文档和示例配置，运行真实验证" },
+  ], true, "mutate"), /至少 5|具体文件\/目录\/命令\/接口对象/,
+    "three slogan-like plan items from the UI screenshot must be rejected");
+  const bugFixProfile = profile("解决这些登录 bug，跑不起来还有死循环");
+  assert.equal(bugFixProfile.bug, true);
+  assert.equal(bugFixProfile.debugProject, true);
+  assert.equal(bugFixProfile.requiresPlan, true);
+  assert.match(quality([
+    { content: "读取登录模块并看看代码" },
+    { content: "修改登录逻辑" },
+    { content: "运行测试" },
+  ], true, "mutate", bugFixProfile), /复现\/日志\/失败证据|根因定位\/调用链|同一失败路径回归验证|项目级 bug 修复至少 6/,
+    "bug fixes must not pass with read/change/test slogans");
+  assert.match(quality([
+    { content: "用 npm test -- login 复现报错，记录 stderr 和 exit code" },
+    { content: "读取 src/auth/callback.ts 和 src/auth/session.ts，沿调用链定位根因" },
+    { content: "核对 AuthSession schema、callback API contract、调用方参数映射和兼容边界" },
+    { content: "修改 src/auth/callback.ts，做最小补丁、null guard 和 fallback，并同步调用方契约" },
+    { content: "补齐空 token、重复回调、超时和失败回退的聚焦单元测试" },
+    { content: "更新 README 验收标准和修复说明" },
+  ], true, "mutate", bugFixProfile), /同一失败路径回归验证/,
+    "a bug fix plan that never reruns the original failing path is still incomplete");
   assert.equal(quality([
-    { content: "读取认证模块，复现错误并梳理调用链" },
-    { content: "修改登录状态机并同步所有调用方" },
-    { content: "运行类型检查和登录回归测试验证错误路径" },
+    { content: "用 npm test -- login 复现同一报错路径，记录 stderr、stdout、exit code 和失败用例 login callback" },
+    { content: "读取 src/auth/callback.ts、src/auth/session.ts 和 test/auth.test.ts，沿调用链/数据流定位根因与状态机竞态" },
+    { content: "核对 AuthSession schema、callback API contract、调用方参数映射和旧版本兼容边界" },
+    { content: "修改 src/auth/callback.ts 做最小补丁：补 null/undefined guard、fallback，并同步 src/auth/session.ts 调用方契约" },
+    { content: "补齐空 token、重复回调、超时和失败回退的聚焦单元测试" },
+    { content: "重跑同一失败路径 npm test -- login callback && npm run typecheck，记录 stdout/stderr 和 exit code 0" },
+    { content: "更新 README 验收标准、影响范围和修复结果说明" },
+  ], true, "mutate", bugFixProfile), "");
+  assert.match(quality([
+    { content: "搭建 Vite React 官网骨架与项目脚本" },
+    { content: "实现 Google+mac 浅色 IDE 官网页面与响应式样式" },
+    { content: "安装依赖并构建验证" },
+  ], true, "mutate", websiteProfile), /UI\/官网项目至少 6|页面信息架构\/区块与文案|视觉系统\/配色\/排版令牌/,
+    "three-line website plans are too thin for a from-scratch UI project");
+  assert.match(quality([
+    { content: "检查空项目根目录、确认 package.json/vite 配置目标和 src/ public/ 文件结构" },
+    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
+    { content: "建立 Google+mac 白色浅色视觉系统：配色、字体排版、间距、圆角、阴影与浅玻璃 token" },
+    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
+    { content: "实现桌面与移动端响应式断点、hover/focus/键盘可达、空资源和图标加载失败回退" },
+    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
+    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
+  ], true, "mutate", websiteProfile), /项目真实内容\/数据源取证|shadcn\/ui 或 Radix 语义组件映射|Tailwind 调色板\/theme token/,
+    "front-end project plans must read real content and name the component/token system, not merely promise pretty styling");
+  assert.match(quality([
+    { content: "读取 README、package.json、PRODUCT_WIKI.md、src/data，取证 IDE 真实功能、产品文案与可用内容源" },
+    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
+    { content: "建立 Google+mac 白色浅色视觉系统：Tailwind palette/theme.extend/CSS variables、字体排版、间距、圆角、阴影与浅玻璃 token" },
+    { content: "映射 shadcn/ui + Radix primitives 语义组件：Button、Card、Tabs、Accordion、Progress、Dialog 到页面区块" },
+    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
+    { content: "实现桌面与移动端响应式断点、hover/focus/键盘可达、空资源和图标加载失败回退" },
+    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
+    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
+  ], true, "mutate", websiteProfile), /用户附图\/真实图片素材使用计划/,
+    "front-end project plans must say how user screenshots or real project images/assets will be used");
+  assert.equal(quality([
+    { content: "读取 README、package.json、PRODUCT_WIKI.md、src/data、public/assets 和用户附图/现有截图素材，取证 IDE 真实功能、产品文案、真实图片与可用内容源" },
+    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
+    { content: "建立 Google+mac 白色浅色视觉系统：Tailwind palette/theme.extend/CSS variables、字体排版、间距、圆角、阴影与浅玻璃 token" },
+    { content: "映射 shadcn/ui + Radix primitives 语义组件：Button、Card、Tabs、Accordion、Progress、Dialog 到页面区块" },
+    { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
+    { content: "实现桌面与移动端响应式断点、hover/focus/键盘可达、空资源和图标加载失败回退" },
+    { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
+    { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
+  ], true, "mutate", websiteProfile), "");
+  assert.equal(quality([
+    { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
+    { content: "核对 AuthSession schema、登录 API contract、调用方参数和旧版本兼容边界" },
+    { content: "修改 src/auth/state.ts 登录状态机，并同步 src/auth/login.ts 调用方映射" },
+    { content: "补齐 token 为空、请求失败、重复登录、旧缓存迁移的错误处理和回退" },
+    { content: "运行 npm run typecheck && npm test -- auth，确认退出码和错误路径回归" },
+    { content: "更新 README 的登录行为说明和验收标准，汇总改动文件与验证结果" },
   ], true, "mutate"), "");
   assert.match(quality([
     { content: "读取认证模块并梳理真实调用链" },
-  ], true, "inspect"), /证据核验\/结论|至少 2/);
+  ], true, "inspect"), /证据核验\/结论|结论边界\/不确定性|至少 3/);
+  const bugHuntProfile = profile("看看项目还有什么 bug");
+  assert.equal(bugHuntProfile.debugProject, true);
+  assert.match(quality([
+    { content: "读取 src/main.js 看看有没有问题" },
+    { content: "整理发现并总结" },
+    { content: "给修复建议" },
+  ], true, "inspect", bugHuntProfile), /复现\/日志\/诊断证据|根因\/调用链分析|影响范围\/优先级\/修复建议|项目级 bug 调查至少 4/,
+    "bug hunting needs evidence and impact, not subjective review only");
   assert.equal(quality([
-    { content: "读取认证模块并梳理真实调用链" },
-    { content: "交叉核验证据并报告结论与限制" },
+    { content: "运行 npm test 或读取现有失败日志，记录 stderr、stdout、exit code、失败用例作为复现/诊断证据" },
+    { content: "读取 src/main.js、test/logic.test.mjs 和 git diff，沿调用链/数据流定位根因假设并交叉核验" },
+    { content: "按 severity/priority 列出影响范围、风险、用户可见程度和修复建议" },
+    { content: "报告已核验证据、结论边界、不确定性和下一步建议" },
+  ], true, "inspect", bugHuntProfile), "");
+  assert.equal(quality([
+    { content: "读取 src/auth/state.ts 和测试，梳理真实调用链与现有诊断" },
+    { content: "用 git blame/log 与测试输出交叉核验证据来源" },
+    { content: "报告结论、风险限制、不确定性和下一步建议" },
   ], true, "inspect"), "", "read-only investigations need evidence and conclusions, not a fake implementation step");
-  assert.equal(quality([
+  assert.match(quality([
     { content: "检查项目脚本和运行环境" },
     { content: "执行编译并启动真实程序" },
     { content: "核验退出状态、输出和健康检查" },
-  ], true, "execute"), "", "runtime-only plans require execution evidence, not a fake code edit");
+  ], true, "execute"), /失败诊断\/日志检查|至少 4|具体命令\/输出\/路径/);
+  assert.equal(quality([
+    { content: "检查 package.json scripts、Node 版本和当前 cwd 环境是否匹配" },
+    { content: "执行 npm run build 并记录 stdout/stderr、退出码和产物路径 dist-web/" },
+    { content: "若失败读取终端日志/package.json，定位命令、依赖或配置错误并重试一次安全验证" },
+    { content: "核验 npm run preview 健康输出或产物入口，汇总可运行状态" },
+  ], true, "execute"), "", "runtime-only plans require execution evidence, diagnostics, and concrete commands");
   assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
   assert.match(SRC, /_requiredPlanIssue\(run, run\?\._planSteps\)/);
-  assert.match(SRC, /复杂写入计划分别覆盖调查现状、实现改动、真实验证/);
-  assert.match(SRC, /复杂只读调查覆盖调查取证和证据核验\/结论/);
+  assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
+  assert.match(SRC, /UI\/官网\/落地页\/从零前端项目至少 6 步/);
+  assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
+  assert.match(SRC, /Tailwind palette\/theme\.extend\/CSS variables/);
+  assert.match(SRC, /真实内容源/);
+  assert.match(SRC, /Bug\/调试修复必须像老手查案/);
+  assert.match(SRC, /同一失败路径或聚焦回归测试/);
+  assert.match(SRC, /接口\/数据契约与边界、实现改动、失败\/空值\/兼容处理/);
+  assert.match(SRC, /复杂只读调查至少覆盖取证、交叉核验、结论边界\/不确定性/);
 });
 
 test("plan completion requires real run evidence and side-effect tools share the same quality gate", () => {
@@ -2913,6 +3472,41 @@ test("plan completion requires real run evidence and side-effect tools share the
   assert.equal(gated({ type: "automation", method: "browser.status" }), false);
   assert.match(SRC, /const _finishPlanIssue = _requiredPlanIssue\(run, planSteps\)/);
   assert.match(SRC, /run\._incompleteReason = "required_plan_missing"/);
+});
+
+test("completed plan updates in place so final prose remains below the 7/7 card", () => {
+  assert.match(extractFn("_renderPlan"), /const allDone = total > 0 && done >= total/,
+    "the renderer must detect when a plan reaches 100%");
+  assert.match(extractFn("_renderPlan"), /else if \(!allDone && container\.lastChild !== el\)/,
+    "completed plan updates must not re-append the card below the model's final answer");
+  assert.match(extractFn("_renderPlan"), /A 7\/7 plan card must not be the last thing/,
+    "keep the user-facing reason in the code so future edits do not regress the ordering");
+});
+
+test("agent outcome summary is rendered after plan settlement", () => {
+  const summary = load("_buildAgentOutcomeSummary", {
+    _agentIncompleteLabel: load("_agentIncompleteLabel"),
+  });
+  const text = summary({}, {
+    planSteps: [
+      { content: "读取真实项目结构", status: "completed" },
+      { content: "运行测试", status: "completed" },
+    ],
+    mutatedFiles: ["src/main.js"],
+    runtimeEffects: ["test"],
+    didMutate: true,
+    didVerify: true,
+    verificationPassed: true,
+    uiVerificationPassed: true,
+  });
+  assert.match(text, /^### 本轮结果/);
+  assert.match(text, /已完成：读取真实项目结构；运行测试/);
+  assert.match(text, /改动文件：src\/main\.js/);
+  assert.match(text, /验证：已通过真实命令\/检查/);
+  const settleIdx = SRC.indexOf("planSteps = _settleRunPlan(run)");
+  const summaryIdx = SRC.indexOf("_buildAgentOutcomeSummary(run", settleIdx);
+  assert.ok(settleIdx >= 0 && summaryIdx > settleIdx,
+    "final outcome card must be appended after the plan is settled, so it appears below the final plan card");
 });
 
 test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {
@@ -3087,6 +3681,7 @@ test("fast community summaries survive when optional page deep-reading is slow",
   assert.match(result, /FAST_COMMUNITY_SUMMARY/);
   assert.match(result, /cache_status: miss/);
   assert.match(result, /结果保留各来源的相关性或上游顺序，不表示按时间排序或一定是最新/);
+  assert.match(result, /必须提炼为：社区\/仓库共识、明显分歧、对当前项目的适配点/);
   assert.match(result, /created_date 只表示记录或仓库创建，不能冒充发布时间/);
   assert.match(result, /日期为 unknown 时(?:也)?不能证明时效性/);
 });
@@ -3328,13 +3923,25 @@ test("auto-detected verification never downloads an unpinned eslint or tsc", asy
   assert.doesNotMatch(SRC, /npx -y eslint|npx -y tsc/);
 });
 
-test("specialized source tools stay real but load on demand", () => {
+test("external source tools stay real but load on demand", () => {
   const schema = (name) => ({ type: "function", function: { name } });
-  const bundles = { resources: { tools: ["github_search", "reddit_search"] } };
-  const deferred = new Set(bundles.resources.tools);
+  const bundles = {
+    net: { tools: ["web_search", "web_fetch"] },
+    resources: { tools: ["developer_community_search", "github_search", "reddit_search"] },
+  };
+  const deferred = new Set(Object.values(bundles).flatMap((bundle) => bundle.tools));
   const searchSchema = schema("search_tools");
   const select = load("_selectInitialTools", {
-    _buildAgentToolSchemas: () => [schema("read_file"), schema("developer_community_search"), schema("github_search"), schema("reddit_search")],
+    _buildAgentToolSchemas: () => [
+      schema("read_file"),
+      schema("knowledge_search"),
+      schema("local_discovery"),
+      schema("web_search"),
+      schema("web_fetch"),
+      schema("developer_community_search"),
+      schema("github_search"),
+      schema("reddit_search"),
+    ],
     activePath: "",
     _TOOL_BUNDLES: bundles,
     _DEFERRED_TOOL_NAMES: deferred,
@@ -3342,8 +3949,47 @@ test("specialized source tools stay real but load on demand", () => {
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "developer_community_search", "search_tools"]);
+  assert.deepEqual(names, ["read_file", "knowledge_search", "local_discovery", "search_tools"]);
+  assert.ok(names.includes("knowledge_search"), "the internal knowledge base stays first-turn capable");
+  assert.ok(!names.includes("web_search"), "public web search requires a concrete evidence gap");
+  assert.ok(!names.includes("developer_community_search"), "community search is not a first-turn reflex");
   assert.match(SRC, /resources:\s*\{ tools:/);
+});
+
+test("search_tools exact names cannot fall through to localhost descriptions", () => {
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const schema = (name, description = "") => ({ type: "function", function: { name, description } });
+  const localDiscovery = schema("local_discovery", "Find nearby public places");
+  const httpRequest = schema("http_request", "Call APIs, including localhost services, over HTTP");
+  const registry = new Map([
+    ["local_discovery", localDiscovery],
+    ["http_request", httpRequest],
+  ]);
+
+  assert.deepEqual(lookup("local_discovery", registry, new Set(["local_discovery"])), []);
+  assert.deepEqual(lookup("local_discovery", registry, new Set()), [localDiscovery]);
+  assert.deepEqual(lookup("LOCAL_DISCOVERY", registry, new Set()), [localDiscovery]);
+  assert.deepEqual(lookup("local_discovery", new Map([["http_request", httpRequest]]), new Set()), [],
+    "an unavailable compound tool name must not be split into loose fuzzy terms");
+  assert.match(SRC, /工具 \$\{exact\.name\} 已在当前工具列表中，请直接调用/);
+  assert.match(SRC, /当前注册表没有名为 \$\{exact\.name\} 的工具/);
+});
+
+test("search_tools keeps fuzzy matching for natural-language capability queries", () => {
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const localDiscovery = { type: "function", function: { name: "local_discovery", description: "Find nearby public places" } };
+  const httpRequest = { type: "function", function: { name: "http_request", description: "Call a localhost API" } };
+  const registry = new Map([
+    ["local_discovery", localDiscovery],
+    ["http_request", httpRequest],
+  ]);
+
+  assert.deepEqual(lookup("find nearby public places", registry, new Set()), [localDiscovery]);
+  assert.deepEqual(lookup("github", new Map([
+    ["github_search", { type: "function", function: { name: "github_search", description: "Search GitHub repositories" } }],
+  ]), new Set()).map((tool) => tool.function.name), ["github_search"]);
 });
 
 test("dev-server discovery is scoped to the current run and workspace", () => {
@@ -3597,8 +4243,34 @@ test("stream deadlines trigger exactly the fast-retry path", () => {
   assert.equal(stalled("模型连续 45 秒没有继续生成有效内容，已停止本轮，请重试。"), true);
   assert.equal(stalled("AI request timed out waiting for response headers after 20 seconds"), true);
   assert.equal(stalled("429 rate limit"), false);
-  const retryable = load("_isRetryableAiError");
+  const strip = load("_stripAiRetryPrefix");
+  const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
+  const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway });
   assert.equal(retryable("模型在 35 秒内没有生成有效内容"), true);
+});
+
+test("failed terminal commands extract evidence paths and permit one recovery re-read", () => {
+  const clean = load("_cleanCommandFailurePath");
+  const extract = load("_extractCommandFailureEvidence", {
+    _cleanCommandFailurePath: clean,
+    _normRel: NORM_REL,
+  });
+  const mark = load("_markCommandFailureRecovery", { _normRel: NORM_REL });
+  const consume = load("_consumeFailureReviewRead", { _normRel: NORM_REL });
+  const output = [
+    "npm error code EJSONPARSE",
+    "npm error JSON.parse Invalid package.json: JSONParseError: Expected double-quoted property name",
+    "npm error A complete log of this run can be found in: /Users/michael/.npm/_logs/2026-07-13T21_11_54_220Z-debug-0.log",
+  ].join("\n");
+
+  const evidence = extract("npm run check && npm test", output, "/repo");
+  assert.ok(evidence.files.includes("package.json"));
+  assert.ok(evidence.logs.includes("/Users/michael/.npm/_logs/2026-07-13T21_11_54_220Z-debug-0.log"));
+
+  const run = {};
+  mark(run, "/repo", { ...evidence, command: "npm run check && npm test" });
+  assert.equal(consume(run, "/repo", "package.json"), "上一条命令失败后的复核读取");
+  assert.equal(consume(run, "/repo", "package.json"), "", "the failure-review bypass is single-use, not a license to loop");
 });
 
 test("Tauri search invokes use camelCase command arguments", () => {
@@ -3650,6 +4322,35 @@ test("read-before-edit requires contiguous coverage of the current complete file
   const hasRead = load("_runHasRead", { _normRel: norm });
   const signature = load("_contentSignature");
   const hasCurrentRead = load("_runHasCurrentRead", { _normRel: norm, _contentSignature: signature });
+  const bindPath = load("_bindRunFilePath", { _normRel: norm, _coherentFilePath: COHERENT_PATH });
+  const boundPath = load("_boundRunFilePath", { _normRel: norm });
+  const knownSig = load("_recordRunKnownSignature", { _normRel: norm });
+  const mergeRanges = load("_mergeReadRanges");
+  const formatRanges = load("_formatReadRanges", { _mergeReadRanges: mergeRanges });
+  const missingRanges = load("_missingReadRanges", { _mergeReadRanges: mergeRanges });
+  const rangeCovered = load("_readRangeCovered", { _mergeReadRanges: mergeRanges });
+  const stateFor = load("_readCoverageStateFor", { _normRel: norm });
+  const hydrateContext = load("_hydrateRunContextEvidence", {
+    _recordRunReadRange: recordRange,
+    _readCoverageStateFor: stateFor,
+    _bindRunFilePath: bindPath,
+    _recordRunKnownSignature: knownSig,
+    _resolveRel: (path, root) => NORMALIZE_PATH(root + "/" + path.replace(/^\.?\//, "")),
+  });
+  const coverageHint = load("_readBeforeEditCoverageHint", {
+    _contentSignature: signature,
+    _readCoverageStateFor: stateFor,
+    _mergeReadRanges: mergeRanges,
+    _missingReadRanges: missingRanges,
+    _formatReadRanges: formatRanges,
+    _normRel: norm,
+  });
+  const refreshDuplicate = load("_refreshDuplicateReadAuthorization", {
+    _readCoverageStateFor: stateFor,
+    _readRangeCovered: rangeCovered,
+    _normRel: norm,
+    _isAbsoluteFsPath: IS_ABSOLUTE_FS_PATH,
+  });
   const run = { ctx: { filesRead: new Set() } };
 
   assert.equal(recordRange(run, "/repo", 50, 50, 100, "v1", "src/a.js", "/repo/src/a.js"), false);
@@ -3665,6 +4366,57 @@ test("read-before-edit requires contiguous coverage of the current complete file
   assert.equal(recordRange(run, "/repo", 1, 2, 2, signature(current), "src/current.js", "/repo/src/current.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", current, "src/current.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", "one\nchanged\n", "src/current.js"), false, "stale reads cannot authorize overwriting a newer version");
+
+  const duplicateRun = { ctx: { filesRead: new Set() }, _toolBatch: 1 };
+  const duplicateContent = "one\ntwo\n";
+  const duplicateSig = signature(duplicateContent);
+  assert.equal(recordRange(duplicateRun, "/repo", 1, 2, 2, duplicateSig, "src/collector.js"), true);
+  duplicateRun._toolBatch = 2;
+  assert.equal(refreshDuplicate(duplicateRun, "/repo", duplicateSig, 2, duplicateContent, "/repo/src/collector.js", "src/collector.js"), true);
+  assert.equal(hasCurrentRead(duplicateRun, "/repo", duplicateContent, "/repo/src/collector.js"), true,
+    "a duplicate whole-file read from prior context must refresh aliases so multi_edit is not falsely blocked");
+  assert.equal(duplicateRun._filePathBindingBatch.get("src/collector.js"), 1,
+    "duplicate-read aliasing must preserve the prior batch instead of looking like a same-batch read");
+
+  const contextRun = { ctx: { filesRead: new Set() }, _toolBatch: 1 };
+  const contextContent = "body {\n  color: red;\n}\n";
+  hydrateContext(contextRun, "/repo", [{
+    path: "src/styles.css",
+    signature: signature(contextContent),
+    total: 3,
+    complete: true,
+    ranges: [[1, 3]],
+  }]);
+  assert.equal(hasCurrentRead(contextRun, "/repo", contextContent, "src/styles.css", "/repo/src/styles.css"), true,
+    "a clean current editor file injected in the user preamble must authorize same-run edits");
+  assert.equal(boundPath(contextRun, "/repo", "src/styles.css"), "/repo/src/styles.css",
+    "context evidence must bind relative and absolute aliases before write gates run");
+  assert.equal(contextRun._readCoverage.get("src/styles.css").completedBatch, 0);
+  assert.equal(hasCurrentRead(contextRun, "/repo", "body {\n  color: blue;\n}\n", "src/styles.css"), false,
+    "current-editor context evidence must still reject stale disk content");
+
+  const sameBatchRun = { ctx: { filesRead: new Set() }, _toolBatch: 3 };
+  assert.equal(recordRange(sameBatchRun, "/repo", 1, 2, 2, duplicateSig, "src/collector.js", "/repo/src/collector.js"), true);
+  assert.equal(refreshDuplicate(sameBatchRun, "/repo", duplicateSig, 2, duplicateContent, "/repo/src/collector.js"), false);
+  assert.equal(hasCurrentRead(sameBatchRun, "/repo", duplicateContent, "/repo/src/collector.js"), false,
+    "same-response read_file + multi_edit still must wait until the model has seen the read result");
+
+  const gappyRun = { ctx: { filesRead: new Set() }, _toolBatch: 5 };
+  const collectorContent = Array.from({ length: 426 }, (_, index) => `line ${index + 1}`).join("\n");
+  const collectorSig = signature(collectorContent);
+  assert.equal(recordRange(gappyRun, "/repo", 60, 79, 426, collectorSig, "src/collector.js", "/repo/src/collector.js"), false);
+  assert.equal(recordRange(gappyRun, "/repo", 230, 269, 426, collectorSig, "src/collector.js", "/repo/src/collector.js"), false);
+  assert.equal(recordRange(gappyRun, "/repo", 297, 426, 426, collectorSig, "src/collector.js", "/repo/src/collector.js"), false);
+  assert.deepEqual(missingRanges([[60, 79], [230, 269], [297, 426]], 426), [[1, 59], [80, 229], [270, 296]]);
+  const hint = coverageHint(gappyRun, "/repo", collectorContent, "src/collector.js", "src/collector.js", "/repo/src/collector.js");
+  assert.match(hint, /已读范围：60-79、230-269、297-426 \/ 426 行/);
+  assert.match(hint, /缺少：1-59、80-229、270-296/);
+  assert.match(hint, /read_file\("src\/collector\.js", offset=1, limit=426\)/);
+  assert.match(hint, /不要把“共 426 行”误当成本次全文已读/);
+  assert.match(SRC, /const _seen = \(_contentChanged \|\| _failureReviewReason\) \? 0 : _readCoverageThrough\(_knownRanges\)/,
+    "default read continuation must use contiguous coverage, not the largest sampled line");
+  assert.doesNotMatch(SRC, /const _seen = [\s\S]{0,120}Math\.max\(\s*\(run && run\._readSeen/,
+    "targeted tail reads must not make the next default read skip earlier gaps");
   assert.match(extractFn("_executeToolStep"), /coverageTo = lastNl > 0 \? shownTo : start/,
     "a character-capped partial giant line must not count as a fully-read line");
 });
@@ -3682,6 +4434,45 @@ test("redacted reads remain marked for their exact content version", () => {
   assert.equal(wasRedacted(run, "/repo", secretVersion, "src/a.js"), true, "a clean page from the same file must not erase a prior redacted page");
   assert.equal(wasRedacted(run, "/repo", cleanVersion, "src/a.js"), false);
   assert.match(extractFn("_executeToolStep"), /redactedRead && call\.type === "write"/);
+});
+
+test("precise local edit anchors can safely bypass whole-file read gate", () => {
+  const count = load("_countOccurrences");
+  const strip = load("_stripLineNoPrefix");
+  const recover = load("_recoverEditMatch", { _stripLineNoPrefix: strip });
+  const precise = load("_localEditHasPreciseAnchors", {
+    _countOccurrences: count,
+    _recoverEditMatch: recover,
+  });
+  const content = [
+    ".hero {",
+    "  color: red;",
+    "}",
+    ".cta {",
+    "  color: blue;",
+    "}",
+    "",
+  ].join("\n");
+
+  assert.equal(precise(content, { type: "edit", oldString: "  color: red;", newString: "  color: green;" }), true);
+  assert.equal(precise(content, { type: "edit", oldString: "  color:", newString: "  background:", replaceAll: false }), false);
+  assert.equal(precise(content, { type: "edit", oldString: "  missing: true;", newString: "" }), false);
+  assert.equal(precise(content, { type: "edit", oldString: "  color:", newString: "  background:", replaceAll: true }), true);
+  assert.equal(precise(content, {
+    type: "multiedit",
+    edits: [
+      { old_string: "  color: red;", new_string: "  color: green;" },
+      { old_string: "  color: blue;", new_string: "  color: white;" },
+    ],
+  }), true);
+  assert.equal(precise(content, {
+    type: "multiedit",
+    edits: [
+      { old_string: "  color:", new_string: "  background:" },
+      { old_string: "  color: blue;", new_string: "  color: white;" },
+    ],
+  }), false);
+  assert.match(extractFn("_executeToolStep"), /_localEditHasPreciseAnchors\(old, call\)/);
 });
 
 test("mutation paths reject relative traversal and unbound external targets", () => {
@@ -3705,19 +4496,25 @@ test("a successful structured write records its new content as the current reada
   const signature = load("_contentSignature");
   const recordRange = load("_recordRunReadRange", { _normRel: norm });
   const recordKnown = load("_recordRunKnownContent", {
-    _recordRunReadRange: recordRange,
+    _normRel: norm,
     _contentSignature: signature,
+    _recordRunKnownSignature: load("_recordRunKnownSignature", { _normRel: norm }),
   });
   const hasCurrentRead = load("_runHasCurrentRead", {
     _normRel: norm,
     _contentSignature: signature,
   });
+  const knownRanges = load("_knownReadRanges", { _normRel: norm, _mergeReadRanges: load("_mergeReadRanges") });
   const run = { ctx: { filesRead: new Set() } };
   const written = "export const value = 2;\nexport default value;\n";
 
   assert.equal(recordKnown(run, "/repo", written, "src/value.js", "/repo/src/value.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", written, "src/value.js"), true);
   assert.equal(hasCurrentRead(run, "/repo", written, "/repo/src/value.js"), true);
+  assert.deepEqual(knownRanges(run, "/repo", signature(written), 2, "src/value.js"), [],
+    "a just-written version may authorize safe follow-up edits, but must not masquerade as model-visible read coverage");
+  assert.equal(run.ctx.filesRead.has("src/value.js"), false,
+    "write-known content should not tell the agent it has re-read the file body");
   assert.equal(
     hasCurrentRead(run, "/repo", "export const value = 3;\nexport default value;\n", "src/value.js"),
     false,
@@ -4208,6 +5005,10 @@ test("UI and read-before-edit gates are structurally wired for every agent model
   assert.match(SRC, /observerInstalledBeforeLoad/);
   assert.match(SRC, /blank-page/);
   assert.match(SRC, /_runHasCurrentRead\(run, root, old/);
+  assert.match(SRC, /_uiVisualEvidenceHint/);
+  assert.match(SRC, /用户附图\/真实图片素材使用计划/);
+  assert.match(SRC, /assets\/public\/screenshots/);
+  assert.match(SRC, /回答结构由用户问题、证据类型和风险决定/);
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/);
   assert.match(SRC, /ideMode: run\.mode/);
 });

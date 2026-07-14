@@ -449,9 +449,25 @@
       <form method="dialog" class="sheet__body" id="settingsForm">
         <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
         <h2>AI 模型</h2>
-        <p class="sheet__sub">AI 模型由你的账号统一提供，无需自行配置。登录后在底部直接选择模型即可使用；额度、会员与钱包余额可在「个人资料」查看。</p>
+        <p class="sheet__sub">默认使用 Michael 账号额度；如果用户有自己的 OpenAI 兼容 API，可切到本机直连，模型请求从这台电脑直接发往供应商。</p>
+        <div class="ai-provider-form">
+          <label class="ai-provider-option">
+            <input type="radio" name="aiProviderMode" value="gateway" id="aiProviderGateway" />
+            <span><strong>Michael 网关</strong><small>统一模型、额度、计费和线路容灾。</small></span>
+          </label>
+          <label class="ai-provider-option">
+            <input type="radio" name="aiProviderMode" value="byok" id="aiProviderByok" />
+            <span><strong>本机直连（BYOK）</strong><small>用户自己的 key 仅保存在本机；桌面端直接请求供应商。</small></span>
+          </label>
+          <div class="ai-provider-fields" id="aiProviderFields">
+            <input id="settingsBaseUrl" type="url" class="login-input" placeholder="Base URL，例如 https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
+            <input id="settingsApiKey" type="password" class="login-input" placeholder="API Key，仅保存在本机" autocomplete="off" spellcheck="false" />
+            <input id="settingsModel" type="text" class="login-input" placeholder="模型，例如 gpt-4.1 / deepseek-chat / qwen-max" autocomplete="off" spellcheck="false" />
+          </div>
+        </div>
         <div class="sheet__actions">
-          <button class="btn btn--primary" value="cancel" formnovalidate>知道了</button>
+          <button class="btn" value="cancel" formnovalidate>取消</button>
+          <button class="btn btn--primary" id="settingsSaveBtn" value="default">保存</button>
         </div>
       </form>
     </dialog>

@@ -71,12 +71,24 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
             "web_search"
                 | "web_fetch"
                 | "knowledge_search"
+                | "wiki_search"
+                | "academic_search"
+                | "arxiv_search"
+                | "crossref_search"
+                | "openalex_search"
+                | "pubmed_search"
+                | "pubchem_search"
+                | "clinical_trials_search"
+                | "steam_search"
                 | "local_discovery"
                 | "live_environment"
                 | "live_markets"
                 | "live_flights"
                 | "road_environment"
                 | "track_shipment"
+                | "smzdm_search"
+                | "xianyu_search"
+                | "zhuanzhuan_search"
                 | "ask_user"
         ),
         "plan" => matches!(
@@ -92,6 +104,19 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "lsp_references"
                 | "knowledge_search"
                 | "developer_community_search"
+                | "github_repo"
+                | "gitlab_repo"
+                | "gitee_repo"
+                | "codeberg_repo"
+                | "wiki_search"
+                | "academic_search"
+                | "arxiv_search"
+                | "crossref_search"
+                | "openalex_search"
+                | "pubmed_search"
+                | "pubchem_search"
+                | "clinical_trials_search"
+                | "steam_search"
                 | "web_search"
                 | "web_fetch"
                 | "local_discovery"
@@ -100,6 +125,9 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_flights"
                 | "road_environment"
                 | "track_shipment"
+                | "smzdm_search"
+                | "xianyu_search"
+                | "zhuanzhuan_search"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -122,6 +150,19 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "git_conflicts"
                 | "knowledge_search"
                 | "developer_community_search"
+                | "github_repo"
+                | "gitlab_repo"
+                | "gitee_repo"
+                | "codeberg_repo"
+                | "wiki_search"
+                | "academic_search"
+                | "arxiv_search"
+                | "crossref_search"
+                | "openalex_search"
+                | "pubmed_search"
+                | "pubchem_search"
+                | "clinical_trials_search"
+                | "steam_search"
                 | "web_search"
                 | "web_fetch"
                 | "local_discovery"
@@ -130,6 +171,9 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "live_flights"
                 | "road_environment"
                 | "track_shipment"
+                | "smzdm_search"
+                | "xianyu_search"
+                | "zhuanzhuan_search"
                 | "research_project"
                 | "run_subagent"
         ),
@@ -377,6 +421,160 @@ fn latest_user_request(body: &serde_json::Value) -> Option<String> {
         }
     }
     latest_plain
+}
+
+/// A location statement supplies conversation context; it is not permission to geocode, browse,
+/// or discover nearby places. Keep this conservative and require an address-shaped value so real
+/// questions such as "我在上海，附近有什么好吃的" retain the normal current-data tools.
+fn is_context_only_location_statement(query: &str) -> bool {
+    let value = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 180
+        || value.contains('?')
+        || value.contains('？')
+    {
+        return false;
+    }
+
+    let lower = value.to_lowercase();
+    let introduces_location = [
+        "我在",
+        "我现在在",
+        "我目前在",
+        "我住在",
+        "我居住在",
+        "我位于",
+        "我们在",
+        "我们现在在",
+        "我们目前在",
+        "我们住在",
+        "我的地址是",
+        "我的地址为",
+        "我的位置是",
+        "我的位置为",
+        "i'm at",
+        "i am at",
+        "i'm located at",
+        "i am located at",
+        "we're at",
+        "we are at",
+        "my address is",
+        "my location is",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    if !introduces_location {
+        return false;
+    }
+
+    let address_shape = value.chars().any(|ch| ch.is_ascii_digit())
+        || [
+            "省",
+            "市",
+            "区",
+            "县",
+            "镇",
+            "乡",
+            "村",
+            "路",
+            "街",
+            "道",
+            "巷",
+            "弄",
+            "小区",
+            "大厦",
+            "广场",
+            "酒店",
+            "机场",
+            "车站",
+            "地铁站",
+            " street",
+            " st ",
+            " road",
+            " rd ",
+            " avenue",
+            " ave ",
+            " boulevard",
+            " blvd",
+            " lane",
+            " ln ",
+        ]
+        .iter()
+        .any(|part| lower.contains(part));
+    if !address_shape {
+        return false;
+    }
+
+    ![
+        "帮",
+        "请",
+        "查",
+        "搜",
+        "找",
+        "推荐",
+        "告诉",
+        "看看",
+        "看下",
+        "想知道",
+        "想找",
+        "想吃",
+        "想去",
+        "需要",
+        "记住",
+        "附近",
+        "周围",
+        "周边",
+        "哪里",
+        "哪儿",
+        "哪家",
+        "哪个",
+        "有什么",
+        "怎么",
+        "如何",
+        "是否",
+        "能否",
+        "可以",
+        "天气",
+        "气温",
+        "空气",
+        "路况",
+        "交通",
+        "事故",
+        "餐厅",
+        "饭店",
+        "美食",
+        "景点",
+        "商场",
+        "路线",
+        "导航",
+        "距离",
+        "多久",
+        "营业",
+        "实时",
+        "几点",
+        "remember",
+        "search",
+        "find",
+        "show",
+        "tell",
+        "recommend",
+        "nearby",
+        "around",
+        "weather",
+        "traffic",
+        "restaurant",
+        "food",
+        "route",
+        "directions",
+        "how",
+        "what",
+        "where",
+        "can you",
+        "please",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
 }
 
 /// Keep automatic retrieval limited to concrete engineering work. This intentionally requires
@@ -969,6 +1167,13 @@ fn looks_like_research_task(q: &str) -> bool {
     const ASCII: &[&str] = &[
         "research",
         "latest",
+        "latest papers",
+        "latest literature",
+        "state of the art",
+        "sota",
+        "frontier",
+        "new technology",
+        "emerging technology",
         "current version",
         "compare libraries",
         "compare frameworks",
@@ -993,11 +1198,54 @@ fn looks_like_research_task(q: &str) -> bool {
         "where to eat",
         "travel itinerary",
         "tourist attraction",
+        "deal",
+        "coupon",
+        "cashback",
+        "discount",
+        "promo",
+        "promotion",
+        "side hustle",
+        "make money",
+        "save money",
+        "used goods",
+        "second hand",
+        "finance",
+        "financial",
+        "market data",
+        "crypto",
+        "bitcoin",
+        "exchange rate",
+        "stock",
+        "stocks",
+        "fund",
+        "etf",
+        "portfolio",
+        "earnings",
+        "medicine",
+        "medical",
+        "health",
+        "clinical",
+        "clinical trial",
+        "pubmed",
+        "drug",
+        "treatment",
+        "diagnosis",
+        "symptom",
+        "steam",
+        "game recommendation",
+        "game price",
+        "game review",
+        "patch notes",
     ];
     const CJK: &[&str] = &[
         "调研",
         "研究",
         "最新",
+        "最新论文",
+        "最新文献",
+        "最新技术",
+        "新技术",
+        "前沿",
         "现状",
         "开源资源",
         "代码库资源",
@@ -1016,6 +1264,45 @@ fn looks_like_research_task(q: &str) -> bool {
         "资源搜索",
         "比价",
         "二手",
+        "闲鱼",
+        "转转",
+        "赚钱",
+        "副业",
+        "薅羊毛",
+        "羊毛",
+        "省钱",
+        "优惠",
+        "折扣",
+        "返利",
+        "券",
+        "好价",
+        "捡漏",
+        "金融",
+        "财经",
+        "行情",
+        "股票",
+        "基金",
+        "投资组合",
+        "财报",
+        "加密货币",
+        "币价",
+        "汇率",
+        "医学",
+        "医疗",
+        "健康",
+        "临床",
+        "临床试验",
+        "药物",
+        "用药",
+        "治疗",
+        "诊断",
+        "症状",
+        "游戏",
+        "游戏推荐",
+        "Steam",
+        "打折",
+        "补丁",
+        "攻略",
         "附近",
         "周边",
         "好吃",
@@ -1234,6 +1521,52 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // Snapshot the person's real request before mutating messages. The IDE wraps it in a large
     // dynamic project preamble; retrieval must not search that entire blob.
     let user_request = latest_user_request(body);
+    let context_only = user_request
+        .as_deref()
+        .is_some_and(is_context_only_location_statement);
+    if context_only {
+        // This is a server-side capability boundary, not merely a prompt preference. Remove both
+        // client-provided runtime/MCP schemas and any chance of static schema injection below.
+        body.as_object_mut().map(|object| object.remove("tools"));
+    }
+    if context_only {
+        let mut sys = user_local_time_block_at(headers, chrono::Utc::now());
+        sys.push_str("\n\n你是 Michael IDE 助手。用户这句话只是在提供位置上下文，没有提出查询或执行请求。简短确认已理解；不要扩展成附近搜索、地理编码、联网查询、工具查找、文件操作或其他任务。不要声称已经永久记住；只说明可在当前对话中作为后续问题的上下文。");
+        let prompt_bytes = sys.len();
+        if let Some(msgs) = body
+            .get_mut("messages")
+            .and_then(|messages| messages.as_array_mut())
+        {
+            msgs.insert(0, serde_json::json!({ "role": "system", "content": sys }));
+        }
+        let final_message_count = body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .map_or(0, Vec::len);
+        let request_json_bytes = serde_json::to_vec(body).map_or(0, |request| request.len());
+        tracing::info!(
+            mode,
+            context_only,
+            requested_tool_count,
+            final_message_count,
+            prompt_bytes,
+            request_json_bytes,
+            "assembled context-only IDE request"
+        );
+        record_agent_trace(AgentTraceInput {
+            mode: mode.to_string(),
+            context_only,
+            prompt_blocks: vec!["context_only_location".to_string()],
+            requested_tool_count,
+            injected_tool_count: 0,
+            missing_tool_count: requested_tool_count,
+            final_message_count,
+            prompt_bytes,
+            tool_schema_bytes: 0,
+            request_json_bytes,
+        });
+        return;
+    }
     let loaded_prompt = read_prompt(prompt_name)
         .or_else(|_| {
             if prompt_name != mode {
@@ -1267,9 +1600,14 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         sys.push_str("\n\n");
         sys.push_str(&truthfulness);
     }
-    // Research is a shared task specialization, not a model-tier prompt fork. The compact block
-    // describes evidence discipline and how to use the capabilities actually present this turn;
-    // the old full-prompt chapter embedded a static catalog of every possible tool.
+    let answer_quality = read_prompt("answer_quality").unwrap_or_default();
+    if !answer_quality.is_empty() {
+        prompt_blocks.push("answer_quality");
+        sys.push_str("\n\n");
+        sys.push_str(&answer_quality);
+    }
+    // Specialized modules are intent-gated. Loading research, automation, and UI
+    // instructions for every request biases ordinary questions toward unrelated tools.
     let research_intent = mode == "agent"
         && user_request
             .as_deref()
@@ -1294,8 +1632,6 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             sys.push_str(&automation);
         }
     }
-    // Inject the design guide on any UI/frontend task — not just when the (never-emitted)
-    // x-ide-ui header is present. `MICHAEL_UI_GUIDE=0` disables; `=always` forces it on.
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
     let ui_intent = ui_env.as_deref() == Some("always")
         || (ui_env.as_deref() != Some("0")
@@ -1307,7 +1643,6 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                     })
                     .unwrap_or(false)));
     if ui_intent {
-        // Flow + the copy-paste concrete tokens are compact and high-signal → inject for all.
         for name in ["ui_design_flow", "css_concrete_tokens"] {
             let block = read_prompt(name).unwrap_or_default();
             if !block.is_empty() {
@@ -1316,8 +1651,6 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 sys.push_str(&block);
             }
         }
-        // The deep guide is large (~14KB); skip it for weak models to avoid drowning them,
-        // give it to capable models where the extra depth pays off.
         if !is_weak_model {
             let guide = read_prompt("ui_design_guide").unwrap_or_default();
             if !guide.is_empty() {
@@ -1327,16 +1660,13 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             }
         }
     }
-    // Keep every orchestration block in the leading system message. Inserting a system message
-    // near the tail can split assistant(tool_calls) from its required tool response on later
-    // agent turns, which OpenAI-compatible APIs correctly reject.
     let needs_reasoning_checkpoint = mode == "agent"
         && user_request.as_deref().is_some_and(|request| {
             looks_like_coding_task(request) || looks_like_engineering_diagnostic(request)
         });
     if needs_reasoning_checkpoint {
         prompt_blocks.push("reasoning_checkpoint");
-        sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 我真的理解了吗？② 还缺什么关键信息？③ 这步要拿到什么？④ 可能出什么岔子？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
+        sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 真实目标和成功终态是什么？② 输入/输出/状态变化/错误路径/调用方这些契约清了吗？③ 这一步要拿到或改变什么证据？④ 哪些边界、并发、空值、权限或版本差异会炸？⑤ 写入前每行代码是否都有来源、有用途、能编译、能被验证？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
     }
     if let Some(growth) = hdr("x-ide-growth").map(str::trim).filter(|g| !g.is_empty()) {
         prompt_blocks.push("growth_final_only");
@@ -1451,6 +1781,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     );
     record_agent_trace(AgentTraceInput {
         mode: mode.to_string(),
+        context_only,
         prompt_blocks: prompt_blocks.into_iter().map(str::to_string).collect(),
         requested_tool_count,
         injected_tool_count: final_tool_count,
@@ -1470,6 +1801,7 @@ const PROMPT_NAMES: &[&str] = &[
     "agent_research",
     "agent_automation",
     "truthfulness",
+    "answer_quality",
     "chat",
     "plan",
     "explorer",
@@ -1495,23 +1827,42 @@ const PROMPT_NAMES: &[&str] = &[
 /// 401s, so the prompts are only handed to logged-in IDE clients, not the open net.
 /// A missing prompt file degrades to an empty string for that key — the IDE falls
 /// back to its built-in minimal prompt per key, so a partial deploy can't brick it.
-pub async fn ide_prompts(_claims: Claims) -> ApiResult<Json<serde_json::Value>> {
+///
+/// PROMPT-IP CONTAINMENT: full bodies (prompt texts + the complete tools.json with
+/// every description) are returned ONLY to an ADMIN who explicitly asks with `?full=1`
+/// (curl/debug use). Any registered user could otherwise download the entire prompt/tool
+/// library in one plaintext response and clone the product — and even for the admin's
+/// own IDE session the full payload would sit readable in devtools/localStorage, which
+/// is exactly the complaint. The IDE itself NEVER requests `full=1`: normal clients get
+/// `{version, prompts:{}, tools:[]}`. They don't need bodies — chat requests are
+/// assembled SERVER-side (x-ide-mode / x-ide-tools), and for everything else the IDE
+/// keeps built-in short fallbacks by design.
+pub async fn ide_prompts(
+    claims: Claims,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let full = claims.role == "admin" && q.get("full").map(String::as_str) == Some("1");
     let mut map = serde_json::Map::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for name in PROMPT_NAMES {
         let text = read_prompt(name).unwrap_or_default();
         text.hash(&mut hasher);
-        map.insert((*name).to_string(), serde_json::Value::String(text));
+        if full {
+            map.insert((*name).to_string(), serde_json::Value::String(text));
+        }
     }
     let version = format!("{:x}", hasher.finish());
-    // Also serve the tool schemas (the ~37KB of tool + parameter descriptions) so the IDE
-    // can fetch them at runtime instead of shipping them in its bundle — the same migration
-    // as the prompts above. Falls back to an empty array if the file is missing, so the IDE
-    // keeps its built-in tool fallback and a partial deploy can't break tool-calling.
-    let tools = read_tools_file()
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+    // Admin also gets the tool schemas (the ~37KB of tool + parameter descriptions) so the
+    // library stays inspectable/debuggable without shelling into the server. Falls back to
+    // an empty array if the file is missing.
+    let tools = if full {
+        read_tools_file()
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]))
+    } else {
+        serde_json::Value::Array(vec![])
+    };
     Ok(Json(
         serde_json::json!({ "version": version, "prompts": map, "tools": tools }),
     ))
@@ -1544,6 +1895,7 @@ mod tests {
             "agent_research",
             "agent_automation",
             "truthfulness",
+            "answer_quality",
             "chat",
             "plan",
             "explorer",
@@ -1650,6 +2002,10 @@ mod tests {
         for required in [
             "developer_community_search",
             "github_search",
+            "github_repo",
+            "gitlab_repo",
+            "gitee_repo",
+            "codeberg_repo",
             "stackoverflow_search",
             "hackernews_search",
             "devto_search",
@@ -1685,6 +2041,8 @@ mod tests {
             "updated_date",
             "last_activity_date",
             "retrieved_at",
+            "新技术讨论",
+            "不代表互联网全部社区",
         ] {
             assert!(
                 description.contains(required),
@@ -1712,6 +2070,35 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn web_search_and_current_time_schema_preserve_freshness_boundaries() {
+        let text = read_tools_file().expect("tools.json should be readable");
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("tools.json should be valid JSON");
+        let description_for = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(|tool_name| tool_name.as_str())
+                        == Some(name)
+                })
+                .and_then(|tool| tool.pointer("/function/description"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let web = description_for("web_search");
+        assert!(web.contains("通用联网搜索兜底"));
+        assert!(web.contains("专业数据库"));
+        assert!(web.contains("不能把摘要或本轮 retrieved_at 当成最新事实"));
+
+        let current_time = description_for("current_time");
+        assert!(current_time.contains("当前时间只表示本轮请求时间"));
+        assert!(current_time.contains("不证明网页、论文、价格、版本、行情或规则是最新"));
+        assert!(current_time.contains("观测时间或报价时间"));
     }
 
     #[test]
@@ -1776,6 +2163,9 @@ mod tests {
         assert!(policy.contains("检索轮次不固定"));
         assert!(policy.contains("一轮没有带来新的独立来源"));
         assert!(policy.contains("不因为事实难听"));
+        assert!(policy.contains("不评价用户人格、动机或“道德高低”"));
+        assert!(policy.contains("哪一段越界"));
+        assert!(policy.contains("授权测试、防御检测、合规实现或风险降低路径"));
         assert!(policy.contains("不得提供可直接用于入侵"));
         assert!(policy.contains("source_statuses[].status == success"));
         assert!(policy.contains("retrieved_at"));
@@ -1783,6 +2173,8 @@ mod tests {
         assert!(policy.contains("created_date"));
         assert!(policy.contains("last_activity_date"));
         assert!(policy.contains("这些时间不得互相代替"));
+        assert!(policy.contains("当前真实时间只表示本轮请求发生的时间"));
+        assert!(policy.contains("只是在今天取回旧页面，不能写成“最新”"));
         assert!(policy.contains("source_statuses[].data_as_of"));
         assert!(policy.contains("weather.observed_at"));
         assert!(policy.contains("opening_hours"));
@@ -1871,6 +2263,9 @@ mod tests {
         assert!(looks_like_research_task("我在东京附近想找不只网红店的早餐"));
         assert!(looks_like_research_task(
             "plan a travel itinerary near Kyoto"
+        ));
+        assert!(looks_like_research_task(
+            "compare SOTA new technology directions in agentic coding"
         ));
     }
 
@@ -2028,6 +2423,19 @@ mod tests {
             .as_str()
             .expect("assembled request should start with a system prompt");
         assert!(system.contains("真实性与证据纪律"));
+        assert!(system.contains("专业回答合成层"));
+        assert!(system.contains("低道德化表达"));
+        assert!(system.contains("代码可用性推理"));
+        assert!(system.contains("时间锚点与最新性"));
+        assert!(system.contains("最新文献/新技术巡检"));
+        assert!(system.contains("共识是什么"));
+        assert!(system.contains("赚钱、省钱、薅羊毛"));
+        assert!(system.contains("金融、医学、游戏"));
+        assert_eq!(
+            body["messages"].as_array().map_or(0, Vec::len),
+            2,
+            "the server must inject one system prompt, not duplicate the same prompt"
+        );
         let names = body["tools"]
             .as_array()
             .expect("assembled request should contain tools")
@@ -2269,10 +2677,18 @@ mod tests {
     fn chat_mode_restricts_tools_correctly() {
         let result = requested_static_tools(
             "chat",
-            "web_search,web_fetch,developer_community_search,read_file,write_file",
+            "web_search,web_fetch,developer_community_search,academic_search,pubmed_search,pubchem_search,clinical_trials_search,steam_search,smzdm_search,xianyu_search,zhuanzhuan_search,read_file,write_file",
         );
         assert!(result.contains(&"web_search".to_string()));
         assert!(result.contains(&"web_fetch".to_string()));
+        assert!(result.contains(&"academic_search".to_string()));
+        assert!(result.contains(&"pubmed_search".to_string()));
+        assert!(result.contains(&"pubchem_search".to_string()));
+        assert!(result.contains(&"clinical_trials_search".to_string()));
+        assert!(result.contains(&"steam_search".to_string()));
+        assert!(result.contains(&"smzdm_search".to_string()));
+        assert!(result.contains(&"xianyu_search".to_string()));
+        assert!(result.contains(&"zhuanzhuan_search".to_string()));
         assert!(
             !result.contains(&"read_file".to_string()),
             "chat should not allow read_file"
@@ -2292,11 +2708,21 @@ mod tests {
         for mode in ["plan", "explorer", "reviewer"] {
             let result = requested_static_tools(
                 mode,
-                "developer_community_search,write_file,run_cmd,unknown_tool",
+                "developer_community_search,academic_search,pubmed_search,pubchem_search,clinical_trials_search,steam_search,smzdm_search,xianyu_search,zhuanzhuan_search,write_file,run_cmd,unknown_tool",
             );
             assert_eq!(
                 result,
-                vec!["developer_community_search".to_string()],
+                vec![
+                    "developer_community_search".to_string(),
+                    "academic_search".to_string(),
+                    "pubmed_search".to_string(),
+                    "pubchem_search".to_string(),
+                    "clinical_trials_search".to_string(),
+                    "steam_search".to_string(),
+                    "smzdm_search".to_string(),
+                    "xianyu_search".to_string(),
+                    "zhuanzhuan_search".to_string(),
+                ],
                 "{mode}"
             );
         }
@@ -2322,6 +2748,11 @@ mod tests {
         assert!(!lite.contains("# UI 组件库栈"));
         assert!(!lite.contains("联网研究协议"));
         assert!(lite.contains("UI / 研究 / 自动化专项由系统按用户真实请求动态注入"));
+        assert!(lite.contains("先建契约表 + 每行可用性检查"));
+        assert!(lite.contains("输入/输出/状态变化/错误路径/调用方/依赖 API/验证命令"));
+        assert!(lite.contains("不道德审判"));
+        assert!(lite.contains("授权复现实验、防御检测、加固或风险评估"));
+        assert!(!lite.contains("不设内容禁区"));
         let (routed_lite, lite_blocks) = routed_agent_core("agent_lite", &lite);
         assert_eq!(routed_lite, lite);
         assert_eq!(lite_blocks, vec!["agent_lite_core"]);
@@ -2335,20 +2766,29 @@ mod tests {
         assert!(full.contains("rust_users"));
         assert!(full.contains("success/empty/rate-limited/failed/timeout"));
         assert!(full.contains("`github_trending(query)`"));
+        assert!(full.contains("不做空洞道德审判"));
+        assert!(full.contains("授权测试/防御替代方案"));
+        assert!(full.contains("不粉饰灰色地带"));
+        assert!(full.contains("授权复现实验、防御检测、日志排查、加固方案或风险评估"));
         assert!(!full.contains("`github_trending(language)`"));
         assert!(!full.contains("真实可运行的 UI 组件"));
         assert!(!full.contains("JS 生态里最好的框架"));
+        assert!(!full.contains("不设内容禁区"));
+        assert!(!full.contains("不设禁区"));
         let (coding, coding_blocks) = routed_full_agent_prompt(&full);
         assert!(coding.contains("# 一、最高准则"));
         assert!(coding.contains("# 四、写代码的纪律"));
+        assert!(coding.contains("先建契约表，再写代码"));
+        assert!(coding.contains("每行可用性检查"));
+        assert!(coding.contains("导入是否真实存在且被使用"));
         assert!(coding.contains("# 十二、纪律"));
         assert!(!coding.contains("# 九、领域任务"));
         assert!(!coding.contains("# 十、自动化"));
         assert!(!coding.contains("# 十一、UI / 界面"));
         assert_eq!(coding_blocks, vec!["agent_core"]);
         assert!(
-            coding.len() * 5 < full.len() * 3,
-            "routine coding prompt should omit at least 40% of irrelevant bytes: {} vs {}",
+            coding.len() * 20 < full.len() * 13,
+            "routine coding prompt should omit at least 35% of irrelevant bytes: {} vs {}",
             coding.len(),
             full.len()
         );
@@ -2386,9 +2826,25 @@ mod tests {
                 system.contains("`published_date` 只表示提供方明确标注的发布时间"),
                 "{model}"
             );
+            assert!(system.contains("最新性巡检"), "{model}");
+            assert!(system.contains("SOTA"), "{model}");
             assert!(system.contains("权威机器字段或可复现命令即可"), "{model}");
             assert!(!system.contains("# 九、领域任务"), "{model}");
             assert!(!system.contains("开发者资源与专业数据源"), "{model}");
+
+            let mut frontier_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "查这个领域最新文献、SOTA 和新技术路线，别漏掉最近进展"}]
+            });
+            assemble_into(&headers, &mut frontier_body);
+            let frontier_system = frontier_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                frontier_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(frontier_system.contains("academic_search"), "{model}");
+            assert!(frontier_system.contains("arxiv_search"), "{model}");
+            assert!(frontier_system.contains("openalex_search"), "{model}");
 
             let mut github_body = serde_json::json!({
                 "model": model,
@@ -2417,6 +2873,56 @@ mod tests {
                 "{model}"
             );
             assert!(local_system.contains("local_discovery"), "{model}");
+
+            let mut deal_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "现在 iPhone 16 有没有优惠，闲鱼二手行情值不值得捡漏？"}]
+            });
+            assemble_into(&headers, &mut deal_body);
+            let deal_system = deal_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                deal_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(deal_system.contains("smzdm_search"), "{model}");
+            assert!(deal_system.contains("xianyu_search"), "{model}");
+
+            let mut finance_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "compare current BTC/USD crypto market data and exchange rate risk"}]
+            });
+            assemble_into(&headers, &mut finance_body);
+            let finance_system = finance_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                finance_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(finance_system.contains("live_markets"), "{model}");
+
+            let mut medical_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "查 PubMed 和 clinical trial 里这个药物治疗的最新证据"}]
+            });
+            assemble_into(&headers, &mut medical_body);
+            let medical_system = medical_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                medical_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(medical_system.contains("pubmed_search"), "{model}");
+            assert!(medical_system.contains("clinical_trials_search"), "{model}");
+
+            let mut game_body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Steam 上这个游戏现在价格和补丁版本值得买吗"}]
+            });
+            assemble_into(&headers, &mut game_body);
+            let game_system = game_body["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                game_system.contains("# 按任务加载：研究、社区与当前事实"),
+                "{model}"
+            );
+            assert!(game_system.contains("steam_search"), "{model}");
         }
 
         let mut headers = HeaderMap::new();
@@ -2455,12 +2961,86 @@ mod tests {
             "调研 Rust 开发者社区的 async 错误处理经验",
             "research Rust community discussions about async cancellation",
             "查论坛里这个报错的真实踩坑",
+            "查最新文献和新技术路线，别漏掉前沿进展",
         ] {
             assert!(
                 looks_like_research_task(research_request),
                 "missed technical community research: {research_request}"
             );
         }
+    }
+
+    #[test]
+    fn address_context_does_not_activate_research_or_unrelated_specializations() {
+        assert!(!looks_like_research_task("我目前在上海胶州路282号"));
+        assert!(is_context_only_location_statement(
+            "我目前在上海胶州路282号"
+        ));
+        assert!(!is_context_only_location_statement(
+            "我目前在上海胶州路282号，附近有什么好吃的？"
+        ));
+        assert!(!is_context_only_location_statement(
+            "帮我记住：我目前在上海胶州路282号"
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-tools",
+            "read_file,search_tools,knowledge_search,local_discovery,web_search,run_cmd"
+                .parse()
+                .unwrap(),
+        );
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "我目前在上海胶州路282号"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "mcp__maps__nearby", "parameters": {"type": "object"}}
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("只是在提供位置上下文"));
+        assert!(!system.contains("# 按任务加载"));
+        assert!(!system.contains("强制推理检查点"));
+        assert!(system.len() < 1000);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn explicit_nearby_question_keeps_requested_live_tools() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-tools",
+            "knowledge_search,local_discovery,live_environment,road_environment"
+                .parse()
+                .unwrap(),
+        );
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": "我目前在上海胶州路282号，附近有什么好吃的？"
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+        let names: HashSet<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(tool_function_name)
+            .collect();
+        assert!(names.contains("knowledge_search"));
+        assert!(names.contains("local_discovery"));
+        assert!(names.contains("live_environment"));
+        assert!(names.contains("road_environment"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# 按任务加载：研究、社区与当前事实"));
     }
 
     #[test]
@@ -2481,6 +3061,8 @@ mod tests {
                 system.contains("# 按任务加载：浏览器与桌面自动化"),
                 "{model}"
             );
+            assert!(system.contains("自动化任务按小状态机执行"), "{model}");
+            assert!(system.contains("失败恢复要换策略而不是原样重试"), "{model}");
             assert!(!system.contains("# 十、自动化"), "{model}");
             assert!(!system.contains("# UI 设计 token 与组件契约"), "{model}");
         }
@@ -2497,6 +3079,7 @@ mod tests {
         assemble_into(&headers, &mut browser_action);
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
+        assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
         assert!(!system.contains("# UI 设计 token 与组件契约"));
     }
 
@@ -2854,6 +3437,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("证据足够就停止"));
+        assert!(first_turn["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("每行代码是否都有来源、有用途、能编译、能被验证"));
 
         let mut diagnostic = serde_json::json!({
             "model": "gpt-5.5",

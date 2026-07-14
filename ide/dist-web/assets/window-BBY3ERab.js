@@ -1,0 +1,1 @@
+import{g as e}from"./vendor-CmXlEl_3.js";export{e as getCurrentWindow};

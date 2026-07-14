@@ -26,6 +26,7 @@ mod process_util;
 mod proxy;
 mod public_data;
 mod qr;
+mod shop_catalog;
 mod sysctl;
 mod tasks;
 mod terminal;
@@ -118,7 +119,10 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
-            #[cfg(desktop)]
+            // open_devtools only exists in debug builds or with the opt-in `devtools`
+            // feature — release builds no longer compile the inspector in at all, so a
+            // shipped app can't be opened up to read code / watch authorized requests.
+            #[cfg(all(desktop, any(debug_assertions, feature = "devtools")))]
             if should_open_devtools_on_startup() {
                 use tauri::Manager;
                 if let Some(w) = app.get_webview_window("main") {
@@ -281,6 +285,10 @@ pub fn run() {
             knowledge::academic_search,
             knowledge::package_search,
             knowledge::github_search,
+            knowledge::github_repo,
+            knowledge::gitlab_repo,
+            knowledge::gitee_repo,
+            knowledge::codeberg_repo,
             knowledge::cve_search,
             knowledge::wiki_search,
             knowledge::stackoverflow_search,
@@ -305,6 +313,9 @@ pub fn run() {
             knowledge::bundlephobia_search,
             knowledge::devto_search,
             knowledge::reddit_search,
+            knowledge::smzdm_search,
+            knowledge::xianyu_search,
+            knowledge::zhuanzhuan_search,
             knowledge::steam_search,
             knowledge::iconify_search,
             knowledge::color_search,
@@ -334,6 +345,7 @@ pub fn run() {
             public_data::live_flights,
             public_data::road_environment,
             public_data::track_shipment,
+            shop_catalog::shop_catalog,
             game::game_scaffold,
             web_scaffold::web_scaffold,
             game_assets::generate_3d,

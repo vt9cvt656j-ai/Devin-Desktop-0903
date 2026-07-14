@@ -255,6 +255,20 @@ async fn public_site_search(
     Ok(out)
 }
 
+fn url_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn kclient() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(30))
@@ -293,6 +307,75 @@ fn value_or_unknown(value: Option<&str>) -> &str {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
+}
+
+fn github_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    if suffix.is_empty() {
+        format!("https://api.github.com/repos/{owner}/{repo}")
+    } else {
+        format!("https://api.github.com/repos/{owner}/{repo}/{suffix}")
+    }
+}
+
+fn github_text_value(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn repo_text_value(value: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(value) = value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return value.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn github_repo_ref(owner: &str, repo: &str) -> Result<(String, String), String> {
+    let clean_owner = owner.trim().trim_matches('/');
+    let clean_repo = repo.trim().trim_matches('/');
+    if clean_owner.is_empty() || clean_repo.is_empty() {
+        return Err("github_repo 需要 owner 和 repo，例如 owner=vercel repo=next.js".into());
+    }
+    if clean_owner.contains('/') || clean_repo.contains('/') {
+        return Err(
+            "github_repo 的 owner/repo 必须分开传，不要把 owner/repo 写在同一个字段里".into(),
+        );
+    }
+    Ok((clean_owner.to_string(), clean_repo.to_string()))
+}
+
+fn hosted_repo_ref(
+    tool: &str,
+    owner: &str,
+    repo: &str,
+    allow_nested_owner: bool,
+) -> Result<(String, String), String> {
+    let clean_owner = owner.trim().trim_matches('/');
+    let clean_repo = repo.trim().trim_matches('/');
+    if clean_owner.is_empty() || clean_repo.is_empty() {
+        return Err(format!(
+            "{tool} 需要 owner 和 repo，例如 owner=gitlab-org repo=gitlab"
+        ));
+    }
+    if clean_repo.contains('/') || (!allow_nested_owner && clean_owner.contains('/')) {
+        return Err(format!(
+            "{tool} 的 owner/repo 必须分开传；GitLab 子组可写在 owner（如 group/subgroup）"
+        ));
+    }
+    Ok((clean_owner.to_string(), clean_repo.to_string()))
 }
 
 fn provider_date_value(value: Option<(&str, &str)>) -> String {
@@ -916,6 +999,1177 @@ pub async fn github_search(
         }
     }
     Ok(out)
+}
+
+fn format_github_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = github_text_value(repo, "full_name");
+    let dates = repository_date_lines("GitHub", repo, Some("pushed_at"), retrieved);
+    format!(
+        concat!(
+            "GitHub repo overview: {}\n",
+            "search_status: success\n",
+            "source: GitHub REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "License: {}\n",
+            "Homepage: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        github_text_value(repo, "language"),
+        repo.get("stargazers_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        repo.get("forks_count").and_then(Value::as_u64).unwrap_or(0),
+        repo.get("open_issues_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        github_text_value(repo, "default_branch"),
+        repo.pointer("/license/spdx_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        github_text_value(repo, "homepage"),
+        github_text_value(repo, "html_url"),
+        dates,
+    )
+}
+
+fn decode_github_base64(value: &str) -> Result<Vec<u8>, String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u8;
+    for byte in value.bytes() {
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\r' | b'\n' | b'\t' | b' ' => continue,
+            _ => return Err("GitHub 文件内容不是合法 base64".into()),
+        };
+        debug_assert_eq!(TABLE[val as usize], byte);
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+        buf &= if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+    }
+    Ok(out)
+}
+
+fn github_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("GITHUB_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(token) => req.header("Authorization", format!("Bearer {token}")),
+        None => req,
+    }
+}
+
+fn gitlab_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let token = std::env::var("GITLAB_TOKEN")
+        .or_else(|_| std::env::var("GITLAB_PERSONAL_ACCESS_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match token {
+        Some(token) => req.header("PRIVATE-TOKEN", token),
+        None => req,
+    }
+}
+
+fn codeberg_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let token = std::env::var("CODEBERG_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match token {
+        Some(token) => req.header("Authorization", format!("token {token}")),
+        None => req,
+    }
+}
+
+fn with_gitee_token(url: String) -> String {
+    let Some(token) = std::env::var("GITEE_ACCESS_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return url;
+    };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}access_token={}", url_query_component(&token))
+}
+
+async fn api_get_json(
+    c: &Client,
+    url: &str,
+    label: &str,
+    decorate: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<Value, String> {
+    let resp = decorate(c.get(url))
+        .send()
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
+    }
+    resp.json().await.map_err(|e| format!("{label} JSON: {e}"))
+}
+
+async fn api_get_text(
+    c: &Client,
+    url: &str,
+    label: &str,
+    decorate: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<String, String> {
+    let resp = decorate(c.get(url))
+        .send()
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
+    }
+    resp.text().await.map_err(|e| format!("{label} text: {e}"))
+}
+
+async fn github_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "GitHub", |req| {
+        github_auth_header(req.header("Accept", "application/vnd.github+json"))
+    })
+    .await
+}
+
+fn repo_reader_action(value: Option<String>) -> String {
+    let action = value.unwrap_or_else(|| "overview".into());
+    match action
+        .trim()
+        .to_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "summary" | "info" | "repo" | "overview" => "overview".into(),
+        "readme" | "read_me" => "readme".into(),
+        "tree" | "list" | "dir" | "directory" | "contents" => "tree".into(),
+        "file" | "read_file" | "content" => "file".into(),
+        "releases" | "release" | "versions" => "releases".into(),
+        "issues" | "issue" => "issues".into(),
+        "pulls" | "pull_requests" | "prs" | "pr" | "merge_requests" | "mrs" | "mr" => {
+            "pulls".into()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn github_repo_action(value: Option<String>) -> String {
+    repo_reader_action(value)
+}
+
+/// Read a real GitHub repository through the GitHub REST API.
+///
+/// This is intentionally separate from `github_search`: search finds candidates; this tool reads
+/// the selected repo's README/tree/file/releases/issues so the model can reason from repository
+/// evidence instead of titles and snippets.
+#[tauri::command]
+pub async fn github_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = github_repo_ref(&owner, &repo)?;
+    let action = github_repo_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let url = github_api_url(&owner, &repo, "");
+            let json = github_get_json(&c, &url).await?;
+            Ok(format_github_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let mut url = github_api_url(&owner, &repo, "readme");
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_github_base64(encoded)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let file_path = json.get("path").and_then(Value::as_str).unwrap_or("README");
+            Ok(format!(
+                "GitHub repo README: {owner}/{repo}/{file_path}\nsearch_status: success\nsource: GitHub REST API /readme\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                github_text_value(&json, "encoding"),
+                bytes.len(),
+                github_text_value(&json, "html_url"),
+                trunc(&text, 60_000),
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut url = github_api_url(
+                &owner,
+                &repo,
+                &format!("contents/{}", url_query_component(&clean_path).replace("%2F", "/")),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            let mut out = format!(
+                "GitHub repo tree: {owner}/{repo}/{}\nsearch_status: success\nsource: GitHub REST API /contents\nretrieved_at: {retrieved}\n\n",
+                if clean_path.is_empty() { "." } else { clean_path.as_str() },
+            );
+            if let Some(items) = json.as_array() {
+                for (i, item) in items.iter().take(limit as usize).enumerate() {
+                    out.push_str(&format!(
+                        "{}. {} {} ({} bytes)\n   path: {}\n   url: {}\n",
+                        i + 1,
+                        item.get("type").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("size").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("path").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                    ));
+                }
+                if items.len() > limit as usize {
+                    out.push_str(&format!(
+                        "\ntruncated: true (showing {limit} of {} entries; pass max_results for more)\n",
+                        items.len()
+                    ));
+                }
+            } else {
+                out.push_str("The requested path is not a directory; use action=file to read it.\n");
+            }
+            Ok(out)
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "github_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let mut url = github_api_url(
+                &owner,
+                &repo,
+                &format!("contents/{}", url_query_component(&clean_path).replace("%2F", "/")),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            if json.as_array().is_some() {
+                return Err("github_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_github_base64(encoded)?;
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(format!(
+                "GitHub repo file: {owner}/{repo}/{clean_path}\nsearch_status: success\nsource: GitHub REST API /contents\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nsha: {}\nhtml_url: {}\n\n{}",
+                github_text_value(&json, "encoding"),
+                bytes.len(),
+                github_text_value(&json, "sha"),
+                github_text_value(&json, "html_url"),
+                trunc(&text, 80_000),
+            ))
+        }
+        "releases" => {
+            let url = github_api_url(&owner, &repo, "releases");
+            let json = github_get_json(&c, &format!("{url}?per_page={limit}")).await?;
+            let mut out = format!(
+                "GitHub repo releases: {owner}/{repo}\nsearch_status: success\nsource: GitHub REST API /releases\nretrieved_at: {retrieved}\n\n"
+            );
+            if let Some(items) = json.as_array() {
+                if items.is_empty() {
+                    out.push_str("search_status: empty\nNo releases returned by GitHub.\n");
+                }
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}. {}{}\n   published_date: {}\n   created_date: {}\n   prerelease: {} | draft: {}\n   url: {}\n   notes: {}\n\n",
+                        i + 1,
+                        item.get("tag_name").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("name").and_then(Value::as_str).map(|name| format!(" — {name}")).unwrap_or_default(),
+                        provider_date_value(item.get("published_at").and_then(Value::as_str).map(|v| (v, "published_at"))),
+                        provider_date_value(item.get("created_at").and_then(Value::as_str).map(|v| (v, "created_at"))),
+                        item.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+                        item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                        trunc(item.get("body").and_then(Value::as_str).unwrap_or(""), 1200),
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let url = github_api_url(&owner, &repo, endpoint);
+            let json = github_get_json(&c, &format!("{url}?state=open&per_page={limit}")).await?;
+            let mut out = format!(
+                "GitHub repo {endpoint}: {owner}/{repo}\nsearch_status: success\nsource: GitHub REST API /{endpoint}\nretrieved_at: {retrieved}\nstate: open\n\n"
+            );
+            if let Some(items) = json.as_array() {
+                if items.is_empty() {
+                    out.push_str("search_status: empty\nNo open items returned by GitHub.\n");
+                }
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}. #{} {}\n   created_date: {}\n   updated_date: {}\n   user: {}\n   comments: {}\n   url: {}\n   body: {}\n\n",
+                        i + 1,
+                        item.get("number").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("title").and_then(Value::as_str).unwrap_or("?"),
+                        provider_date_value(item.get("created_at").and_then(Value::as_str).map(|v| (v, "created_at"))),
+                        provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|v| (v, "updated_at"))),
+                        item.pointer("/user/login").and_then(Value::as_str).unwrap_or("unknown"),
+                        item.get("comments").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                        trunc(item.get("body").and_then(Value::as_str).unwrap_or(""), 900),
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        other => Err(format!(
+            "unknown github_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn repo_array_items(json: &Value) -> Option<&Vec<Value>> {
+    json.as_array()
+        .or_else(|| json.get("data").and_then(Value::as_array))
+}
+
+fn repo_item_url(item: &Value) -> String {
+    repo_text_value(item, &["html_url", "web_url", "url", "download_url"])
+}
+
+fn repo_item_number(item: &Value) -> String {
+    item.get("number")
+        .and_then(Value::as_u64)
+        .map(|value| format!("#{value}"))
+        .or_else(|| {
+            item.get("iid")
+                .and_then(Value::as_u64)
+                .map(|value| format!("!{value}"))
+        })
+        .or_else(|| {
+            item.get("number")
+                .and_then(Value::as_str)
+                .map(|value| format!("#{value}"))
+        })
+        .unwrap_or_default()
+}
+
+fn repo_u64_value(item: &Value, keys: &[&str]) -> u64 {
+    for key in keys {
+        if let Some(value) = item.get(*key).and_then(Value::as_u64) {
+            return value;
+        }
+    }
+    0
+}
+
+fn repo_topics(item: &Value) -> String {
+    item.get("topics")
+        .or_else(|| item.get("tag_list"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn format_hosted_repo_tree(
+    provider: &str,
+    repo_name: &str,
+    path: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+    limit: u32,
+) -> String {
+    let shown_path = if path.is_empty() { "." } else { path };
+    let mut out = format!(
+        "{provider} repo tree: {repo_name}/{shown_path}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\n\n",
+    );
+    if let Some(items) = json.as_array() {
+        for (i, item) in items.iter().take(limit as usize).enumerate() {
+            let size = item
+                .get("size")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            out.push_str(&format!(
+                "{}. {} {}\n   path: {}\n   size_bytes: {}\n   sha/id: {}\n   url: {}\n",
+                i + 1,
+                item.get("type").and_then(Value::as_str).unwrap_or("?"),
+                item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                item.get("path").and_then(Value::as_str).unwrap_or("?"),
+                size,
+                repo_text_value(item, &["sha", "id"]),
+                repo_item_url(item),
+            ));
+        }
+        if items.len() > limit as usize {
+            out.push_str(&format!(
+                "\ntruncated: true (showing {limit} of {} entries; pass max_results for more)\n",
+                items.len()
+            ));
+        }
+    } else {
+        out.push_str("The requested path is not a directory; use action=file to read it.\n");
+    }
+    out
+}
+
+fn format_hosted_repo_file(
+    provider: &str,
+    repo_name: &str,
+    path: &str,
+    source: &str,
+    retrieved: &str,
+    encoding: &str,
+    bytes: &[u8],
+    sha: &str,
+    html_url: &str,
+) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    format!(
+        "{provider} repo file: {repo_name}/{path}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\nencoding: {encoding}\nsize_bytes: {}\nsha/id: {sha}\nhtml_url: {html_url}\n\n{}",
+        bytes.len(),
+        trunc(&text, 80_000),
+    )
+}
+
+fn decode_repo_content_base64(provider: &str, encoded: &str) -> Result<Vec<u8>, String> {
+    decode_github_base64(encoded)
+        .map_err(|_| format!("{provider} 文件内容不是合法 base64 或接口未返回 content 字段"))
+}
+
+fn format_hosted_repo_releases(
+    provider: &str,
+    repo_name: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+) -> String {
+    let mut out = format!(
+        "{provider} repo releases: {repo_name}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\n\n"
+    );
+    if let Some(items) = repo_array_items(json) {
+        if items.is_empty() {
+            out.push_str("search_status: empty\nNo releases returned by the provider.\n");
+        }
+        for (i, item) in items.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. {}{}\n   published_date: {}\n   created_date: {}\n   updated_date: {}\n   prerelease: {} | draft: {}\n   url: {}\n   notes: {}\n\n",
+                i + 1,
+                repo_text_value(item, &["tag_name", "tag"]),
+                item.get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| format!(" — {name}"))
+                    .unwrap_or_default(),
+                provider_date_value(item.get("released_at")
+                    .or_else(|| item.get("published_at"))
+                    .and_then(Value::as_str)
+                    .map(|value| (value, if item.get("released_at").is_some() { "released_at" } else { "published_at" }))),
+                provider_date_value(item.get("created_at").and_then(Value::as_str).map(|value| (value, "created_at"))),
+                provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|value| (value, "updated_at"))),
+                item.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+                item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+                repo_item_url(item),
+                trunc(item.get("description")
+                    .or_else(|| item.get("body"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""), 1200),
+            ));
+        }
+    }
+    out
+}
+
+fn format_hosted_repo_items(
+    provider: &str,
+    repo_name: &str,
+    label: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+) -> String {
+    let mut out = format!(
+        "{provider} repo {label}: {repo_name}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\nstate: open\n\n"
+    );
+    if let Some(items) = repo_array_items(json) {
+        if items.is_empty() {
+            out.push_str("search_status: empty\nNo open items returned by the provider.\n");
+        }
+        for (i, item) in items.iter().enumerate() {
+            let number = repo_item_number(item);
+            out.push_str(&format!(
+                "{}. {} {}\n   created_date: {}\n   updated_date: {}\n   user: {}\n   comments: {}\n   url: {}\n   body: {}\n\n",
+                i + 1,
+                number,
+                item.get("title").and_then(Value::as_str).unwrap_or("?"),
+                provider_date_value(item.get("created_at").and_then(Value::as_str).map(|value| (value, "created_at"))),
+                provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|value| (value, "updated_at"))),
+                item.pointer("/author/username")
+                    .or_else(|| item.pointer("/author/name"))
+                    .or_else(|| item.pointer("/user/login"))
+                    .or_else(|| item.pointer("/user/username"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                repo_u64_value(item, &["comments", "comments_count"]),
+                repo_item_url(item),
+                trunc(item.get("description")
+                    .or_else(|| item.get("body"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""), 900),
+            ));
+        }
+    }
+    out
+}
+
+fn format_gitlab_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["path_with_namespace", "name_with_namespace"]);
+    let dates = repository_date_lines("GitLab", repo, Some("last_activity_at"), retrieved);
+    format!(
+        concat!(
+            "GitLab repo overview: {}\n",
+            "search_status: success\n",
+            "source: GitLab REST API /projects/{{urlencoded path}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Topics: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "Visibility: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_topics(repo),
+        repo_u64_value(repo, &["star_count", "stars_count", "stargazers_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["visibility"]),
+        repo_text_value(repo, &["web_url", "html_url"]),
+        dates,
+    )
+}
+
+fn format_gitee_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["full_name", "human_name", "name"]);
+    let dates = repository_date_lines("Gitee", repo, Some("pushed_at"), retrieved);
+    format!(
+        concat!(
+            "Gitee repo overview: {}\n",
+            "search_status: success\n",
+            "source: Gitee REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_text_value(repo, &["language"]),
+        repo_u64_value(repo, &["stargazers_count", "stars_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["html_url", "web_url"]),
+        dates,
+    )
+}
+
+fn format_codeberg_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["full_name", "name"]);
+    let dates = repository_date_lines("Codeberg", repo, None, retrieved);
+    format!(
+        concat!(
+            "Codeberg repo overview: {}\n",
+            "search_status: success\n",
+            "source: Codeberg/Gitea REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_text_value(repo, &["language"]),
+        repo_u64_value(repo, &["stars_count", "stargazers_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["html_url", "web_url"]),
+        dates,
+    )
+}
+
+fn gitlab_project_id(owner: &str, repo: &str) -> String {
+    url_query_component(&format!("{owner}/{repo}"))
+}
+
+fn gitlab_project_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let id = gitlab_project_id(owner, repo);
+    if suffix.is_empty() {
+        format!("https://gitlab.com/api/v4/projects/{id}")
+    } else {
+        format!("https://gitlab.com/api/v4/projects/{id}/{suffix}")
+    }
+}
+
+async fn gitlab_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "GitLab", gitlab_auth_header).await
+}
+
+async fn gitlab_read_raw_file(
+    c: &Client,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let url = gitlab_project_url(
+        owner,
+        repo,
+        &format!(
+            "repository/files/{}/raw?ref={}",
+            url_query_component(path),
+            url_query_component(branch),
+        ),
+    );
+    api_get_text(c, &url, "GitLab", gitlab_auth_header).await
+}
+
+/// Read a real GitLab.com public or token-authorized repository.
+#[tauri::command]
+pub async fn gitlab_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("gitlab_repo", &owner, &repo, true)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            Ok(format_gitlab_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let overview = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let mut last_error = String::new();
+            for candidate in ["README.md", "README.rst", "README.txt", "README", "readme.md"] {
+                match gitlab_read_raw_file(&c, &owner, &repo, candidate, branch).await {
+                    Ok(text) => {
+                        return Ok(format!(
+                            "GitLab repo README: {owner}/{repo}/{candidate}\nsearch_status: success\nsource: GitLab REST API /repository/files/raw\nretrieved_at: {retrieved}\nencoding: utf-8/raw\nsize_bytes: {}\nhtml_url: https://gitlab.com/{owner}/{repo}/-/blob/{}/{}\n\n{}",
+                            text.len(),
+                            url_query_component(branch).replace("%2F", "/"),
+                            url_query_component(candidate).replace("%2F", "/"),
+                            trunc(&text, 60_000),
+                        ));
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(format!(
+                "GitLab README not found via common names on branch {branch}: {last_error}"
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut url = gitlab_project_url(
+                &owner,
+                &repo,
+                &format!("repository/tree?per_page={limit}"),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("&ref={}", url_query_component(branch)));
+            }
+            if !clean_path.is_empty() {
+                url.push_str(&format!("&path={}", url_query_component(&clean_path)));
+            }
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_tree(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "GitLab REST API /repository/tree",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "gitlab_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let overview = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let text = gitlab_read_raw_file(&c, &owner, &repo, &clean_path, branch).await?;
+            Ok(format!(
+                "GitLab repo file: {owner}/{repo}/{clean_path}\nsearch_status: success\nsource: GitLab REST API /repository/files/raw\nretrieved_at: {retrieved}\nencoding: utf-8/raw\nsize_bytes: {}\nsha/id: unknown\nhtml_url: https://gitlab.com/{owner}/{repo}/-/blob/{}/{}\n\n{}",
+                text.len(),
+                url_query_component(branch).replace("%2F", "/"),
+                url_query_component(&clean_path).replace("%2F", "/"),
+                trunc(&text, 80_000),
+            ))
+        }
+        "releases" => {
+            let url = gitlab_project_url(&owner, &repo, &format!("releases?per_page={limit}"));
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_releases(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                "GitLab REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let (endpoint, label) = if action == "pulls" {
+                ("merge_requests", "merge_requests")
+            } else {
+                ("issues", "issues")
+            };
+            let state = if action == "pulls" { "opened" } else { "opened" };
+            let url = gitlab_project_url(
+                &owner,
+                &repo,
+                &format!("{endpoint}?state={state}&per_page={limit}"),
+            );
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_items(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                label,
+                &format!("GitLab REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown gitlab_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn gitee_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    let url = if suffix.is_empty() {
+        format!("https://gitee.com/api/v5/repos/{owner}/{repo}")
+    } else {
+        format!("https://gitee.com/api/v5/repos/{owner}/{repo}/{suffix}")
+    };
+    with_gitee_token(url)
+}
+
+async fn gitee_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "Gitee", |req| req).await
+}
+
+fn gitee_ref_query(branch: &str) -> String {
+    if branch.trim().is_empty() {
+        String::new()
+    } else {
+        format!("ref={}", url_query_component(branch.trim()))
+    }
+}
+
+/// Read a real Gitee public or token-authorized repository.
+#[tauri::command]
+pub async fn gitee_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("gitee_repo", &owner, &repo, false)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, "")).await?;
+            Ok(format_gitee_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let ref_query = gitee_ref_query(branch);
+            let suffix = if ref_query.is_empty() {
+                "readme".to_string()
+            } else {
+                format!("readme?{ref_query}")
+            };
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Gitee", encoded)?;
+            let file_path = json.get("path").and_then(Value::as_str).unwrap_or("README");
+            Ok(format!(
+                "Gitee repo README: {owner}/{repo}/{file_path}\nsearch_status: success\nsource: Gitee REST API /readme\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                repo_text_value(&json, &["encoding"]),
+                bytes.len(),
+                repo_text_value(&json, &["html_url"]),
+                trunc(&String::from_utf8_lossy(&bytes), 60_000),
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let encoded_path = url_query_component(&clean_path).replace("%2F", "/");
+            let mut suffix = if clean_path.is_empty() {
+                "contents/".to_string()
+            } else {
+                format!("contents/{encoded_path}")
+            };
+            let ref_query = gitee_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            Ok(format_hosted_repo_tree(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Gitee REST API /contents",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "gitee_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let mut suffix = format!(
+                "contents/{}",
+                url_query_component(&clean_path).replace("%2F", "/")
+            );
+            let ref_query = gitee_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            if json.as_array().is_some() {
+                return Err("gitee_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Gitee", encoded)?;
+            Ok(format_hosted_repo_file(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Gitee REST API /contents",
+                &retrieved,
+                &repo_text_value(&json, &["encoding"]),
+                &bytes,
+                &repo_text_value(&json, &["sha"]),
+                &repo_text_value(&json, &["html_url"]),
+            ))
+        }
+        "releases" => {
+            let json = gitee_get_json(
+                &c,
+                &gitee_api_url(&owner, &repo, &format!("releases?per_page={limit}")),
+            )
+            .await?;
+            Ok(format_hosted_repo_releases(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                "Gitee REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let json = gitee_get_json(
+                &c,
+                &gitee_api_url(
+                    &owner,
+                    &repo,
+                    &format!("{endpoint}?state=open&per_page={limit}"),
+                ),
+            )
+            .await?;
+            Ok(format_hosted_repo_items(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                endpoint,
+                &format!("Gitee REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown gitee_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn codeberg_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    if suffix.is_empty() {
+        format!("https://codeberg.org/api/v1/repos/{owner}/{repo}")
+    } else {
+        format!("https://codeberg.org/api/v1/repos/{owner}/{repo}/{suffix}")
+    }
+}
+
+async fn codeberg_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "Codeberg", codeberg_auth_header).await
+}
+
+fn codeberg_ref_query(branch: &str) -> String {
+    if branch.trim().is_empty() {
+        String::new()
+    } else {
+        format!("ref={}", url_query_component(branch.trim()))
+    }
+}
+
+async fn codeberg_read_content(
+    c: &Client,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    branch: &str,
+) -> Result<Value, String> {
+    let mut suffix = format!("contents/{}", url_query_component(path).replace("%2F", "/"));
+    let ref_query = codeberg_ref_query(branch);
+    if !ref_query.is_empty() {
+        suffix.push('?');
+        suffix.push_str(&ref_query);
+    }
+    codeberg_get_json(c, &codeberg_api_url(owner, repo, &suffix)).await
+}
+
+/// Read a real Codeberg/Gitea public or token-authorized repository.
+#[tauri::command]
+pub async fn codeberg_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("codeberg_repo", &owner, &repo, false)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, "")).await?;
+            Ok(format_codeberg_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let overview = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let mut last_error = String::new();
+            for candidate in ["README.md", "README.rst", "README.txt", "README", "readme.md"] {
+                match codeberg_read_content(&c, &owner, &repo, candidate, branch).await {
+                    Ok(json) => {
+                        let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+                        let bytes = decode_repo_content_base64("Codeberg", encoded)?;
+                        return Ok(format!(
+                            "Codeberg repo README: {owner}/{repo}/{candidate}\nsearch_status: success\nsource: Codeberg/Gitea REST API /contents\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                            repo_text_value(&json, &["encoding"]),
+                            bytes.len(),
+                            repo_text_value(&json, &["html_url"]),
+                            trunc(&String::from_utf8_lossy(&bytes), 60_000),
+                        ));
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(format!(
+                "Codeberg README not found via common names on branch {branch}: {last_error}"
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut suffix = if clean_path.is_empty() {
+                "contents/".to_string()
+            } else {
+                format!(
+                    "contents/{}",
+                    url_query_component(&clean_path).replace("%2F", "/")
+                )
+            };
+            let ref_query = codeberg_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, &suffix)).await?;
+            Ok(format_hosted_repo_tree(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Codeberg/Gitea REST API /contents",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "codeberg_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let json = codeberg_read_content(&c, &owner, &repo, &clean_path, branch).await?;
+            if json.as_array().is_some() {
+                return Err("codeberg_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Codeberg", encoded)?;
+            Ok(format_hosted_repo_file(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Codeberg/Gitea REST API /contents",
+                &retrieved,
+                &repo_text_value(&json, &["encoding"]),
+                &bytes,
+                &repo_text_value(&json, &["sha"]),
+                &repo_text_value(&json, &["html_url"]),
+            ))
+        }
+        "releases" => {
+            let json = codeberg_get_json(
+                &c,
+                &codeberg_api_url(&owner, &repo, &format!("releases?limit={limit}")),
+            )
+            .await?;
+            Ok(format_hosted_repo_releases(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                "Codeberg/Gitea REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let json = codeberg_get_json(
+                &c,
+                &codeberg_api_url(
+                    &owner,
+                    &repo,
+                    &format!("{endpoint}?state=open&limit={limit}"),
+                ),
+            )
+            .await?;
+            Ok(format_hosted_repo_items(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                endpoint,
+                &format!("Codeberg/Gitea REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown codeberg_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
 }
 
 // ── CVE / NVD vulnerability database ───────────────────────────────
@@ -2823,6 +4077,50 @@ pub async fn reddit_search(
     Ok(out)
 }
 
+// ── Deal / second-hand marketplace public searches ───────────────
+
+#[tauri::command]
+pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("smzdm_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://search.smzdm.com/?c=home&s={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "smzdm.com", None, "什么值得买/SMZDM", n, &direct).await
+}
+
+#[tauri::command]
+pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("xianyu_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://www.goofish.com/search?q={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "goofish.com", None, "闲鱼/Goofish", n, &direct).await
+}
+
+#[tauri::command]
+pub async fn zhuanzhuan_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("zhuanzhuan_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://www.zhuanzhuan.com/search?keyword={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "zhuanzhuan.com", None, "转转/Zhuanzhuan", n, &direct).await
+}
+
 // ── Steam (game search) ──────────────────────────────────────────
 
 #[tauri::command]
@@ -4670,6 +5968,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn marketplace_search_urls_percent_encode_cjk_queries() {
+        assert_eq!(
+            url_query_component("iPhone 16 优惠"),
+            "iPhone%2016%20%E4%BC%98%E6%83%A0"
+        );
+        assert_eq!(
+            url_query_component("二手 3080 显卡"),
+            "%E4%BA%8C%E6%89%8B%203080%20%E6%98%BE%E5%8D%A1"
+        );
+    }
+
+    #[test]
     fn developer_source_scopes_are_explicit_and_bounded() {
         let all = select_developer_sources(Some("all"), None).unwrap();
         assert_eq!(all.len(), DEVELOPER_COMMUNITY_SOURCES.len());
@@ -4751,6 +6061,112 @@ mod tests {
         assert!(code_output.contains("created_date: unknown"));
         assert!(code_output.contains("updated_date: unknown"));
         assert!(code_output.contains("last_activity_date: unknown"));
+    }
+
+    #[test]
+    fn github_repo_helpers_normalize_actions_and_decode_content() {
+        assert_eq!(
+            github_repo_ref("vercel", "next.js").unwrap(),
+            ("vercel".to_string(), "next.js".to_string())
+        );
+        assert!(github_repo_ref("vercel/next.js", "").is_err());
+        assert_eq!(github_repo_action(Some("read-file".into())), "file");
+        assert_eq!(github_repo_action(Some("pull requests".into())), "pulls");
+        assert_eq!(repo_reader_action(Some("merge requests".into())), "pulls");
+        assert_eq!(
+            hosted_repo_ref("gitlab_repo", "group/subgroup", "project", true).unwrap(),
+            ("group/subgroup".to_string(), "project".to_string())
+        );
+        assert!(hosted_repo_ref("gitee_repo", "group/subgroup", "project", false).is_err());
+        assert_eq!(
+            String::from_utf8(decode_github_base64("SGVsbG8sIHJlcG8h\n").unwrap()).unwrap(),
+            "Hello, repo!"
+        );
+    }
+
+    #[test]
+    fn github_repo_overview_keeps_provider_date_semantics() {
+        let repo = serde_json::json!({
+            "full_name": "example/project",
+            "description": "Example project",
+            "language": "Rust",
+            "stargazers_count": 42,
+            "forks_count": 3,
+            "open_issues_count": 7,
+            "default_branch": "main",
+            "license": {"spdx_id": "MIT"},
+            "homepage": "https://example.com",
+            "html_url": "https://github.com/example/project",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2025-02-02T00:00:00Z",
+            "pushed_at": "2026-03-03T00:00:00Z"
+        });
+        let output = format_github_repo_overview(&repo, "2026-07-12T18:00:00Z");
+        assert!(output.contains("GitHub repo overview: example/project"));
+        assert!(output.contains("Stars: 42"));
+        assert!(output.contains("License: MIT"));
+        assert!(output.contains("created_date: 2024-01-01T00:00:00Z (provider field: created_at)"));
+        assert!(output.contains("updated_date: 2025-02-02T00:00:00Z (provider field: updated_at)"));
+        assert!(
+            output.contains("last_activity_date: 2026-03-03T00:00:00Z (provider field: pushed_at)")
+        );
+    }
+
+    #[test]
+    fn hosted_repo_overviews_keep_provider_date_semantics() {
+        let gitlab = serde_json::json!({
+            "path_with_namespace": "gitlab-org/gitlab",
+            "description": "GitLab",
+            "topics": ["ruby", "vue"],
+            "star_count": 10,
+            "forks_count": 2,
+            "open_issues_count": 3,
+            "default_branch": "master",
+            "visibility": "public",
+            "web_url": "https://gitlab.com/gitlab-org/gitlab",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z",
+            "last_activity_at": "2022-01-01T00:00:00Z"
+        });
+        let gitlab_output = format_gitlab_repo_overview(&gitlab, "2026-07-12T18:00:00Z");
+        assert!(gitlab_output.contains("GitLab repo overview: gitlab-org/gitlab"));
+        assert!(gitlab_output.contains(
+            "last_activity_date: 2022-01-01T00:00:00Z (provider field: last_activity_at)"
+        ));
+
+        let gitee = serde_json::json!({
+            "full_name": "oschina/git-osc",
+            "description": "Gitee Feedback",
+            "language": "Ruby",
+            "stargazers_count": 9,
+            "forks_count": 4,
+            "open_issues_count": 5,
+            "default_branch": "master",
+            "html_url": "https://gitee.com/oschina/git-osc",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z",
+            "pushed_at": "2022-01-01T00:00:00Z"
+        });
+        let gitee_output = format_gitee_repo_overview(&gitee, "2026-07-12T18:00:00Z");
+        assert!(gitee_output.contains("Gitee repo overview: oschina/git-osc"));
+        assert!(gitee_output
+            .contains("last_activity_date: 2022-01-01T00:00:00Z (provider field: pushed_at)"));
+
+        let codeberg = serde_json::json!({
+            "full_name": "forgejo/forgejo",
+            "description": "Forgejo",
+            "language": "Go",
+            "stars_count": 11,
+            "forks_count": 6,
+            "open_issues_count": 7,
+            "default_branch": "forgejo",
+            "html_url": "https://codeberg.org/forgejo/forgejo",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z"
+        });
+        let codeberg_output = format_codeberg_repo_overview(&codeberg, "2026-07-12T18:00:00Z");
+        assert!(codeberg_output.contains("Codeberg repo overview: forgejo/forgejo"));
+        assert!(codeberg_output.contains("last_activity_date: unknown (Codeberg repository response did not expose a last-activity field)"));
     }
 
     #[test]

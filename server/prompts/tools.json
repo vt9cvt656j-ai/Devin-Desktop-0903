@@ -103,7 +103,7 @@
     "type": "function",
     "function": {
       "name": "web_search",
-      "description": "联网搜索（当前桌面后端会并行尝试 Google、Bing、DuckDuckGo，并合并实际返回的结果），返回标题/URL/摘要列表。搜索摘要只是线索；关键结论要用 web_fetch 读原文并按来源可信度核实。",
+      "description": "通用联网搜索兜底（当前桌面后端会并行尝试 Google、Bing、DuckDuckGo，并合并实际返回的结果），返回标题/URL/摘要列表。优先使用已有知识库、结构化实时源、专业数据库、官方文档、包注册表、GitHub/开发者社区等更贴近问题的工具；web_search 只在专用来源不适用或需要补充通用网页证据时使用。搜索摘要只是线索；关键结论要用 web_fetch 读原文并按来源可信度核实，不能把摘要或本轮 retrieved_at 当成最新事实。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1968,7 +1968,7 @@
     "type": "function",
     "function": {
       "name": "developer_community_search",
-      "description": "并行搜索当前注册的开发者代码平台、问答站、技术社区和官方语言论坛。逐来源返回 success、empty、rate-limited、failed 或 timeout；empty 只表示适配器完成但没有可用命中，不证明站点没有相关内容；timeout 表示该来源超过本轮硬时限，不能当作 empty 或 success。结果区分 published_date、created_date、updated_date、last_activity_date 与 retrieved_at；all 仅指当前适配器清单，不代表互联网全部社区。帖子和摘要是待核验线索，重要结论仍需读取原文并用官方文档、源码或本项目测试复核。",
+      "description": "并行搜索当前注册的开发者代码平台、问答站、技术社区和官方语言论坛，用来找真实踩坑、GitHub 资源、新技术讨论、版本迁移争议和维护状态线索。逐来源返回 success、empty、rate-limited、failed 或 timeout；empty 只表示适配器完成但没有可用命中，不证明站点没有相关内容；timeout 表示该来源超过本轮硬时限，不能当作 empty 或 success。结果区分 published_date、created_date、updated_date、last_activity_date 与 retrieved_at；all 仅指当前适配器清单，不代表互联网全部社区。帖子和摘要是待核验线索，重要结论仍需读取原文并用官方文档、源码或本项目测试复核。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -2007,6 +2007,82 @@
           "max_results": { "type": "integer", "description": "返回数量，默认 10，最大 30" }
         },
         "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "github_repo",
+      "description": "直接读取指定 GitHub 仓库的真实内容：overview/readme/tree/file/releases/issues/pulls。用于看开源项目结构、README、源码文件、版本发布和真实 issue，而不是只拿搜索结果标题。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string", "description": "仓库 owner/org，例如 vercel" },
+          "repo": { "type": "string", "description": "仓库名，例如 next.js" },
+          "action": { "type": "string", "enum": ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], "description": "要读取的内容，默认 overview" },
+          "path": { "type": "string", "description": "tree/file 用：仓库内路径，如 packages/next/src/server" },
+          "branch": { "type": "string", "description": "可选分支/tag/SHA；不填用默认分支" },
+          "max_results": { "type": "integer", "description": "tree/releases/issues/pulls 返回数量，默认 20，最大 100" }
+        },
+        "required": ["owner", "repo"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "gitlab_repo",
+      "description": "直接读取指定 GitLab.com 仓库的真实内容：overview/readme/tree/file/releases/issues/pulls（pulls 对应 GitLab merge requests）。支持公开仓库；配置 GITLAB_TOKEN 或 GITLAB_PERSONAL_ACCESS_TOKEN 后可提升额度/读取授权仓库。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string", "description": "仓库 namespace/group，可含子组，例如 gitlab-org 或 group/subgroup" },
+          "repo": { "type": "string", "description": "仓库名，例如 gitlab" },
+          "action": { "type": "string", "enum": ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], "description": "要读取的内容，默认 overview；pulls=merge requests" },
+          "path": { "type": "string", "description": "tree/file 用：仓库内路径，如 app/models" },
+          "branch": { "type": "string", "description": "可选分支/tag/SHA；不填用默认分支" },
+          "max_results": { "type": "integer", "description": "tree/releases/issues/pulls 返回数量，默认 20，最大 100" }
+        },
+        "required": ["owner", "repo"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "gitee_repo",
+      "description": "直接读取指定 Gitee（码云）仓库的真实内容：overview/readme/tree/file/releases/issues/pulls。支持公开仓库；配置 GITEE_ACCESS_TOKEN 后可提升额度/读取授权仓库。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string", "description": "仓库 owner/org，例如 oschina" },
+          "repo": { "type": "string", "description": "仓库名，例如 git-osc" },
+          "action": { "type": "string", "enum": ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], "description": "要读取的内容，默认 overview" },
+          "path": { "type": "string", "description": "tree/file 用：仓库内路径，如 README.md" },
+          "branch": { "type": "string", "description": "可选分支/tag/SHA；不填用默认分支" },
+          "max_results": { "type": "integer", "description": "tree/releases/issues/pulls 返回数量，默认 20，最大 100" }
+        },
+        "required": ["owner", "repo"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "codeberg_repo",
+      "description": "直接读取指定 Codeberg/Gitea 仓库的真实内容：overview/readme/tree/file/releases/issues/pulls。支持公开仓库；配置 CODEBERG_TOKEN 后可提升额度/读取授权仓库。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "owner": { "type": "string", "description": "仓库 owner/org，例如 forgejo" },
+          "repo": { "type": "string", "description": "仓库名，例如 forgejo" },
+          "action": { "type": "string", "enum": ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], "description": "要读取的内容，默认 overview" },
+          "path": { "type": "string", "description": "tree/file 用：仓库内路径，如 README.md" },
+          "branch": { "type": "string", "description": "可选分支/tag/SHA；不填用默认分支" },
+          "max_results": { "type": "integer", "description": "tree/releases/issues/pulls 返回数量，默认 20，最大 100" }
+        },
+        "required": ["owner", "repo"]
       }
     }
   },
@@ -2567,7 +2643,7 @@
     "type": "function",
     "function": {
       "name": "current_time",
-      "description": "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道今天几号/星期几/现在几点时调这个，别凭记忆猜。",
+      "description": "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道今天几号/星期几/现在几点时调这个，别凭记忆猜。当前时间只表示本轮请求时间，不证明网页、论文、价格、版本、行情或规则是最新；动态事实仍需读取对应来源的发布时间、更新时间、版本号、观测时间或报价时间。",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -3056,7 +3132,7 @@
     "type": "function",
     "function": {
       "name": "smzdm_search",
-      "description": "**什么值得买(smzdm)——中文头号薅羊毛/优惠/好价/值得买平台**。搜商品真实优惠/好价/券/历史价/线报/众测。用户要薅羊毛/哪买便宜/有没有优惠/值不值时首选。走 site:smzdm.com 精搜+自动深读。",
+      "description": "什么值得买/SMZDM 公开网页搜索。用于查当前商品优惠、好价、券、线报和真实讨论；不是官方 API，结果是公开索引候选，价格、库存和活动有效性必须继续核验。用户问薅羊毛、哪里便宜、优惠、返利、值不值时优先用。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3079,7 +3155,7 @@
     "type": "function",
     "function": {
       "name": "xianyu_search",
-      "description": "**闲鱼(goofish)二手搜索**——搜二手挂牌/行情/成色/价格区间。要二手/闲鱼/捡漏/收二手时用。走 site:goofish.com 精搜+深读。",
+      "description": "闲鱼/Goofish 二手公开网页搜索。用于查二手挂牌、成色描述、价格区间和捡漏线索；不是官方 API，不证明成交价或仍在售。用户问二手、闲鱼、捡漏、行情时和 zhuanzhuan_search 交叉比价。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3102,7 +3178,7 @@
     "type": "function",
     "function": {
       "name": "zhuanzhuan_search",
-      "description": "**转转二手搜索**——另一大二手平台,和闲鱼互补(手机数码回收行情尤全)。搜二手行情时和 xianyu_search 一起用。走 site:zhuanzhuan.com 精搜+深读。",
+      "description": "转转二手公开网页搜索。用于查二手挂牌、回收/验机相关行情和价格区间；不是官方 API，不证明成交价或仍在售。查二手行情时和 xianyu_search 一起用。",
       "parameters": {
         "type": "object",
         "properties": {

@@ -9,7 +9,16 @@ const NOMINATIM_SEARCH_URL: &str = "https://nominatim.openstreetmap.org/search";
 const NOMINATIM_REVERSE_URL: &str = "https://nominatim.openstreetmap.org/reverse";
 const ARCGIS_GEOCODE_URL: &str =
     "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates";
-const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
+const OVERPASS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const OVERPASS_TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
+const OVERPASS_ENDPOINTS: [(&str, &str); 3] = [
+    ("overpass.osm.ch", "https://overpass.osm.ch/api/interpreter"),
+    (
+        "overpass.openstreetmap.fr",
+        "https://overpass.openstreetmap.fr/api/interpreter",
+    ),
+    ("overpass-api.de", "https://overpass-api.de/api/interpreter"),
+];
 const OPEN_METEO_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SOURCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -20,6 +29,29 @@ const MAX_RADIUS_M: u32 = 20_000;
 const DEFAULT_LIMIT: u32 = 12;
 const MAX_LIMIT: u32 = 30;
 const ARCGIS_MIN_MATCH_SCORE: f64 = 90.0;
+
+// ── 百度/高德 POI 富化（评分/人均/营业时间） ──────────────────────────────────
+// AK/Key 通过环境变量注入。未设置时静默跳过，不影响 OSM 基础数据。
+const BAIDU_PLACE_URL: &str = "https://api.map.baidu.com/place/v2/search";
+const AMAP_PLACE_URL: &str = "https://restapi.amap.com/v3/place/around";
+
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => { out.push('%'); out.push_str(&format!("{:02X}", b)); }
+        }
+    }
+    out
+}
+
+fn baidu_ak() -> Option<String> {
+    std::env::var("BAIDU_MAP_AK").ok().filter(|s| !s.is_empty())
+}
+fn amap_key() -> Option<String> {
+    std::env::var("AMAP_KEY").ok().filter(|s| !s.is_empty())
+}
 
 static HTTP: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
@@ -203,6 +235,14 @@ struct OverpassMetadata {
 struct OverpassPlacesResult {
     places: Vec<DiscoveryPlace>,
     data_as_of: Option<String>,
+    warning: Option<String>,
+    endpoint: String,
+}
+
+#[derive(Debug)]
+struct OverpassCompletion {
+    elements: Vec<OverpassElement>,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,6 +362,23 @@ where
         Err(_) => Err(format!(
             "{source} timed out after {} seconds",
             SOURCE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn timed_with_timeout<T, F>(
+    source: &'static str,
+    timeout: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "{source} timed out after {} seconds",
+            timeout.as_secs()
         )),
     }
 }
@@ -1173,7 +1230,9 @@ fn overpass_query(query: &str, center: &DiscoveryCenter, radius_m: u32) -> Strin
             "nwr({around})[\"shop\"~\"^(bakery|pastry|confectionery)$\"];"
         )],
         PoiIntent::Food => vec![format!(
-            "nwr({around})[\"amenity\"~\"^(restaurant|cafe|fast_food|food_court|ice_cream)$\"];"
+            "nwr({around})[\"amenity\"~\"^(restaurant|cafe|fast_food|food_court|ice_cream|biergarten)$\"];"
+        ), format!(
+            "nwr({around})[\"shop\"~\"^(bakery|pastry|confectionery|deli|tea|coffee)$\"];"
         )],
         PoiIntent::Lodging => vec![format!(
             "nwr({around})[\"tourism\"~\"^(hotel|hostel|motel|guest_house|apartment|camp_site)$\"];"
@@ -1353,6 +1412,24 @@ fn overpass_data_as_of(response: &OverpassResponse) -> Option<String> {
         .map(str::to_string)
 }
 
+fn overpass_result_or_remember_empty(
+    empty_result: &mut Option<OverpassPlacesResult>,
+    partial_empty_result: &mut Option<OverpassPlacesResult>,
+    result: OverpassPlacesResult,
+) -> Option<OverpassPlacesResult> {
+    if !result.places.is_empty() {
+        return Some(result);
+    }
+    if result.warning.is_none() {
+        if empty_result.is_none() {
+            *empty_result = Some(result);
+        }
+    } else if partial_empty_result.is_none() {
+        *partial_empty_result = Some(result);
+    }
+    None
+}
+
 async fn fetch_overpass_places(
     query: &str,
     center: &DiscoveryCenter,
@@ -1360,37 +1437,73 @@ async fn fetch_overpass_places(
     language: &str,
 ) -> Result<OverpassPlacesResult, String> {
     let statement = overpass_query(query, center, radius_m);
-    let response: OverpassResponse = response_json(
-        "Overpass",
-        HTTP.post(OVERPASS_URL)
-            .form(&[("data", statement.as_str())]),
-    )
-    .await?;
-    let data_as_of = overpass_data_as_of(&response);
-    let elements = complete_overpass_elements(response)?;
-    let mut places = elements
-        .into_iter()
-        .filter_map(|element| overpass_element_to_place(element, center, language, radius_m))
-        .collect::<Vec<_>>();
-    // Keep the full bounded Overpass candidate set. Text relevance is applied
-    // together with distance only after all sources have returned; truncating
-    // here would discard a slightly farther exact cuisine/name match before it
-    // ever receives a relevance score.
-    places.sort_by_key(|place| place.distance_m);
-    Ok(OverpassPlacesResult { places, data_as_of })
+    let mut errors = Vec::new();
+    let mut empty_result: Option<OverpassPlacesResult> = None;
+    let mut partial_empty_result: Option<OverpassPlacesResult> = None;
+
+    for (endpoint_name, endpoint_url) in OVERPASS_ENDPOINTS {
+        let response: OverpassResponse = match response_json(
+            "Overpass",
+            HTTP.post(endpoint_url)
+                .timeout(OVERPASS_REQUEST_TIMEOUT)
+                .form(&[("data", statement.as_str())]),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("{endpoint_name}: {error}"));
+                continue;
+            }
+        };
+        let data_as_of = overpass_data_as_of(&response);
+        let completion = complete_overpass_elements(response);
+        let mut places = completion
+            .elements
+            .into_iter()
+            .filter_map(|element| overpass_element_to_place(element, center, language, radius_m))
+            .collect::<Vec<_>>();
+        // Keep the full bounded Overpass candidate set. Text relevance is applied
+        // together with distance only after all sources have returned; truncating
+        // here would discard a slightly farther exact cuisine/name match before it
+        // ever receives a relevance score.
+        places.sort_by_key(|place| place.distance_m);
+        let result = OverpassPlacesResult {
+            places,
+            data_as_of,
+            warning: completion.warning,
+            endpoint: endpoint_name.to_string(),
+        };
+        if let Some(result) =
+            overpass_result_or_remember_empty(&mut empty_result, &mut partial_empty_result, result)
+        {
+            return Ok(result);
+        }
+    }
+
+    if let Some(result) = empty_result {
+        return Ok(result);
+    }
+    if let Some(result) = partial_empty_result {
+        return Ok(result);
+    }
+
+    Err(if errors.is_empty() {
+        "Overpass returned no usable response".into()
+    } else {
+        errors.join("; ")
+    })
 }
 
-fn complete_overpass_elements(response: OverpassResponse) -> Result<Vec<OverpassElement>, String> {
-    if let Some(remark) = response
+fn complete_overpass_elements(response: OverpassResponse) -> OverpassCompletion {
+    let warning = response
         .remark
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Err(format!(
-            "Overpass did not return a complete result set: {remark}"
-        ));
+        .filter(|value| !value.is_empty());
+    OverpassCompletion {
+        elements: response.elements,
+        warning,
     }
-    Ok(response.elements)
 }
 
 fn weather_condition(code: i32) -> &'static str {
@@ -1465,6 +1578,232 @@ fn wikipedia_language(language: Option<&str>, query: &str) -> String {
             "en".into()
         }
     })
+}
+
+// ── 百度地图 POI 搜索（scope=2 含评分/人均/营业时间/评论数） ─────────────────
+async fn fetch_baidu_places(
+    query: &str,
+    center: &DiscoveryCenter,
+    radius_m: u32,
+    limit: u32,
+) -> Result<Vec<DiscoveryPlace>, String> {
+    let ak = match baidu_ak() {
+        Some(k) => k,
+        None => return Ok(Vec::new()),
+    };
+    let url = format!(
+        "{}?query={}&location={},{}&radius={}&scope=2&page_size={}&output=json&ak={}",
+        BAIDU_PLACE_URL,
+        percent_encode_query(query),
+        center.latitude,
+        center.longitude,
+        radius_m,
+        limit.min(20),
+        ak,
+    );
+    let resp: serde_json::Value = HTTP
+        .get(&url)
+        .timeout(SOURCE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("baidu: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("baidu json: {e}"))?;
+    if resp.get("status").and_then(|v| v.as_i64()) != Some(0) {
+        let msg = resp
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("baidu api: {msg}"));
+    }
+    let results = resp
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut places = Vec::with_capacity(results.len());
+    for r in &results {
+        let name = r.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let loc = r.get("location");
+        let lat = loc.and_then(|l| l.get("lat")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let lng = loc.and_then(|l| l.get("lng")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let detail = r.get("detail_info");
+        let rating = detail
+            .and_then(|d| d.get("overall_rating"))
+            .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_f64() } else { s.parse::<f64>().ok() }));
+        let price_str = detail
+            .and_then(|d| d.get("price"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("¥{s}/人"));
+        let hours = detail
+            .and_then(|d| d.get("shop_hours"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let address = r
+            .get("address")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let phone = r
+            .get("telephone")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let comment_num = detail
+            .and_then(|d| d.get("comment_num"))
+            .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_u64().map(|n| n.to_string()) } else { Some(s.to_string()) }));
+        let tag = detail
+            .and_then(|d| d.get("tag"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let dist_m = haversine_m(center.latitude, center.longitude, lat, lng) as u32;
+        let mut src_parts = vec!["baidu_map".to_string()];
+        if let Some(n) = &comment_num {
+            src_parts.push(format!("{n}条评论"));
+        }
+        if let Some(p) = phone {
+            src_parts.push(format!("tel:{p}"));
+        }
+        places.push(DiscoveryPlace {
+            id: r
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: name.to_string(),
+            category: tag.clone(),
+            latitude: lat,
+            longitude: lng,
+            distance_m: dist_m,
+            source: src_parts.join(" | "),
+            source_url: r
+                .get("detail_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            address,
+            cuisine: tag,
+            opening_hours: hours,
+            rating,
+            price: price_str,
+            open_now: None,
+        });
+    }
+    Ok(places)
+}
+
+// ── 高德地图 POI 搜索（extensions=all 含评分/人均） ──────────────────────────
+async fn fetch_amap_places(
+    query: &str,
+    center: &DiscoveryCenter,
+    radius_m: u32,
+    limit: u32,
+) -> Result<Vec<DiscoveryPlace>, String> {
+    let key = match amap_key() {
+        Some(k) => k,
+        None => return Ok(Vec::new()),
+    };
+    let url = format!(
+        "{}?keywords={}&location={},{}&radius={}&offset={}&extensions=all&output=json&key={}",
+        AMAP_PLACE_URL,
+        percent_encode_query(query),
+        center.longitude,
+        center.latitude,
+        radius_m,
+        limit.min(25),
+        key,
+    );
+    let resp: serde_json::Value = HTTP
+        .get(&url)
+        .timeout(SOURCE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("amap: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("amap json: {e}"))?;
+    if resp.get("status").and_then(|v| v.as_str()) != Some("1") {
+        let msg = resp
+            .get("info")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("amap api: {msg}"));
+    }
+    let pois = resp
+        .get("pois")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut places = Vec::with_capacity(pois.len());
+    for p in &pois {
+        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let loc_str = p
+            .get("location")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0,0");
+        let mut parts = loc_str.split(',');
+        let lng: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let lat: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let biz = p.get("biz_ext");
+        let rating = biz
+            .and_then(|b| b.get("rating"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&r| r > 0.0);
+        let cost = biz
+            .and_then(|b| b.get("cost"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "[]")
+            .map(|s| format!("¥{s}/人"));
+        let category = p
+            .get("type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let address = p
+            .get("address")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "[]")
+            .map(|s| s.to_string());
+        let phone = p
+            .get("tel")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "[]");
+        let dist_m = haversine_m(center.latitude, center.longitude, lat, lng) as u32;
+        let mut src = "amap".to_string();
+        if let Some(ph) = phone {
+            src.push_str(&format!(" | tel:{ph}"));
+        }
+        places.push(DiscoveryPlace {
+            id: p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: name.to_string(),
+            category: category.clone(),
+            latitude: lat,
+            longitude: lng,
+            distance_m: dist_m,
+            source: src,
+            source_url: None,
+            address,
+            cuisine: category,
+            opening_hours: None,
+            price: cost,
+            rating,
+            open_now: None,
+        });
+    }
+    Ok(places)
 }
 
 async fn fetch_wikipedia_places(
@@ -1766,8 +2105,9 @@ pub async fn local_discovery(
             Ok(None)
         }
     };
-    let overpass = timed(
+    let overpass = timed_with_timeout(
         "Overpass",
+        OVERPASS_TOTAL_TIMEOUT,
         fetch_overpass_places(&query, &center, radius_m, &language),
     );
     let weather = timed("Open-Meteo", fetch_weather(&center));
@@ -1775,8 +2115,16 @@ pub async fn local_discovery(
         "Wikipedia GeoSearch",
         fetch_wikipedia_places(&center, radius_m, limit, &language),
     );
-    let (reverse_result, overpass_result, weather_result, wikipedia_result) =
-        tokio::join!(reverse, overpass, weather, wikipedia);
+    let baidu = timed(
+        "Baidu Place",
+        fetch_baidu_places(&query, &center, radius_m, limit),
+    );
+    let amap = timed(
+        "Amap Place",
+        fetch_amap_places(&query, &center, radius_m, limit),
+    );
+    let (reverse_result, overpass_result, weather_result, wikipedia_result, baidu_result, amap_result) =
+        tokio::join!(reverse, overpass, weather, wikipedia, baidu, amap);
 
     if reverse_needed {
         match reverse_result {
@@ -1815,25 +2163,129 @@ pub async fn local_discovery(
 
     let mut places = Vec::new();
     match overpass_result {
-        Ok(result) if result.places.is_empty() => statuses.push(status_as_of(
-            "overpass",
-            SourceState::Empty,
-            0,
-            "No named OpenStreetMap POIs matched this category and radius.",
-            result.data_as_of,
-        )),
+        Ok(result) if result.places.is_empty() => {
+            let detail = result.warning.as_deref().map_or_else(
+                || {
+                    format!(
+                        "No named OpenStreetMap POIs matched this category and radius via {}.",
+                        result.endpoint
+                    )
+                },
+                |warning| {
+                    format!(
+                        "Overpass via {} returned a partial result set: {warning}; no named OpenStreetMap POIs survived filtering.",
+                        result.endpoint
+                    )
+                },
+            );
+            statuses.push(status_as_of(
+                "overpass",
+                SourceState::Empty,
+                0,
+                detail,
+                result.data_as_of,
+            ));
+        }
         Ok(result) => {
             let count = result.places.len();
+            let detail = result.warning.as_deref().map_or_else(
+                || {
+                    format!(
+                        "Named OpenStreetMap POIs returned via {}. data_as_of is the Overpass OSM base snapshot, not a per-place verification time.",
+                        result.endpoint
+                    )
+                },
+                |warning| {
+                    format!(
+                        "Overpass via {} returned a partial result set: {warning}; named OpenStreetMap POIs were salvaged from the usable portion. data_as_of is the OSM base snapshot, not a per-place verification time.",
+                        result.endpoint
+                    )
+                },
+            );
             places.extend(result.places);
             statuses.push(status_as_of(
                 "overpass",
                 SourceState::Success,
                 count,
-                "Named OpenStreetMap POIs returned. data_as_of is the Overpass OSM base snapshot, not a per-place verification time.",
+                detail,
                 result.data_as_of,
             ));
         }
         Err(error) => statuses.push(status("overpass", SourceState::Failed, 0, error)),
+    }
+
+    // ── 百度/高德 POI 富化：与 OSM 结果合并，补充评分/价格/营业时间 ──────────
+    let mut commercial_places: Vec<DiscoveryPlace> = Vec::new();
+    match baidu_result {
+        Ok(bp) if !bp.is_empty() => {
+            let count = bp.len();
+            commercial_places.extend(bp);
+            statuses.push(status(
+                "baidu_map",
+                SourceState::Success,
+                count,
+                "Baidu Map POI search returned commercial data (rating/price/hours).",
+            ));
+        }
+        Ok(_) => {
+            if baidu_ak().is_some() {
+                statuses.push(status("baidu_map", SourceState::Empty, 0, "No Baidu POI results for this query."));
+            } else {
+                statuses.push(status("baidu_map", SourceState::Skipped, 0, "BAIDU_MAP_AK not set."));
+            }
+        }
+        Err(error) => statuses.push(status("baidu_map", SourceState::Failed, 0, error)),
+    }
+    match amap_result {
+        Ok(ap) if !ap.is_empty() => {
+            let count = ap.len();
+            commercial_places.extend(ap);
+            statuses.push(status(
+                "amap",
+                SourceState::Success,
+                count,
+                "Amap POI search returned commercial data (rating/price).",
+            ));
+        }
+        Ok(_) => {
+            if amap_key().is_some() {
+                statuses.push(status("amap", SourceState::Empty, 0, "No Amap POI results for this query."));
+            } else {
+                statuses.push(status("amap", SourceState::Skipped, 0, "AMAP_KEY not set."));
+            }
+        }
+        Err(error) => statuses.push(status("amap", SourceState::Failed, 0, error)),
+    }
+    // Merge: enrich OSM places with commercial data by name proximity, then
+    // append any commercial-only places not found in OSM.
+    if !commercial_places.is_empty() {
+        for cp in &commercial_places {
+            let cp_name = cp.name.to_lowercase();
+            let matched = places.iter_mut().find(|p| {
+                let pn = p.name.to_lowercase();
+                pn == cp_name || pn.contains(&cp_name) || cp_name.contains(&pn)
+            });
+            if let Some(existing) = matched {
+                if existing.rating.is_none() && cp.rating.is_some() {
+                    existing.rating = cp.rating;
+                }
+                if existing.price.is_none() && cp.price.is_some() {
+                    existing.price = cp.price.clone();
+                }
+                if existing.opening_hours.is_none() && cp.opening_hours.is_some() {
+                    existing.opening_hours = cp.opening_hours.clone();
+                }
+                if existing.address.is_none() && cp.address.is_some() {
+                    existing.address = cp.address.clone();
+                }
+                if cp.source_url.is_some() {
+                    existing.source_url = cp.source_url.clone();
+                }
+                existing.source = format!("{} + {}", existing.source, cp.source);
+            } else {
+                places.push(cp.clone());
+            }
+        }
     }
 
     let weather = match weather_result {
@@ -2179,10 +2631,59 @@ mod tests {
     fn food_query_uses_bounded_category_selectors_not_raw_user_ql() {
         let statement = overpass_query("附近有什么好吃的 \" ); out body; //", &center(), 3_000);
         assert!(statement.contains("restaurant|cafe|fast_food"));
+        assert!(statement.contains("bakery|pastry|confectionery|deli|tea|coffee"));
         assert!(!statement.contains("out body"));
         assert!(statement.contains(&format!("[maxsize:{OVERPASS_MAXSIZE_BYTES}]")));
         assert!(statement.ends_with("out center;"));
         assert!(!statement.contains("out center 96"));
+    }
+
+    #[test]
+    fn overpass_empty_mirror_does_not_block_later_places() {
+        fn result(endpoint: &str, places: Vec<DiscoveryPlace>) -> OverpassPlacesResult {
+            OverpassPlacesResult {
+                places,
+                data_as_of: Some("2026-07-14T11:45:15Z".into()),
+                warning: None,
+                endpoint: endpoint.into(),
+            }
+        }
+        let mut empty_result = None;
+        let mut partial_empty_result = None;
+        assert!(overpass_result_or_remember_empty(
+            &mut empty_result,
+            &mut partial_empty_result,
+            result("overpass.osm.ch", Vec::new()),
+        )
+        .is_none());
+        let selected = overpass_result_or_remember_empty(
+            &mut empty_result,
+            &mut partial_empty_result,
+            result(
+                "overpass-api.de",
+                vec![DiscoveryPlace {
+                    id: "osm:node/1".into(),
+                    name: "家味螺蛳粉".into(),
+                    category: Some("amenity:fast_food".into()),
+                    latitude: 31.241,
+                    longitude: 121.432,
+                    distance_m: 238,
+                    source: "openstreetmap".into(),
+                    source_url: None,
+                    address: None,
+                    cuisine: Some("chinese".into()),
+                    opening_hours: None,
+                    rating: None,
+                    price: None,
+                    open_now: None,
+                }],
+            ),
+        )
+        .expect("later populated mirror must win over an earlier clean empty response");
+        assert_eq!(selected.endpoint, "overpass-api.de");
+        assert_eq!(selected.places.len(), 1);
+        assert!(empty_result.is_some());
+        assert!(partial_empty_result.is_none());
     }
 
     #[test]
@@ -2380,16 +2881,45 @@ mod tests {
     }
 
     #[test]
-    fn overpass_remarks_reject_incomplete_candidate_sets() {
+    fn overpass_remarks_preserve_partial_elements_for_fallbacks() {
         let response = OverpassResponse {
             remark: Some("runtime error: Query ran out of memory".into()),
+            osm3s: None,
+            elements: vec![OverpassElement {
+                element_type: "node".into(),
+                id: 44,
+                lat: Some(34.053),
+                lon: Some(-118.244),
+                center: None,
+                tags: HashMap::from([
+                    ("name".into(), "Partial Cafe".into()),
+                    ("amenity".into(), "cafe".into()),
+                ]),
+            }],
+        };
+
+        let completion = complete_overpass_elements(response);
+        assert_eq!(completion.elements.len(), 1);
+        assert_eq!(
+            completion.warning.as_deref(),
+            Some("runtime error: Query ran out of memory")
+        );
+    }
+
+    #[test]
+    fn overpass_remarks_without_elements_are_kept_as_partial_empty() {
+        let response = OverpassResponse {
+            remark: Some("runtime error: Query timed out in \"query\"".into()),
             osm3s: None,
             elements: Vec::new(),
         };
 
-        let error = complete_overpass_elements(response).unwrap_err();
-        assert!(error.contains("did not return a complete result set"));
-        assert!(error.contains("ran out of memory"));
+        let completion = complete_overpass_elements(response);
+        assert!(completion.elements.is_empty());
+        assert_eq!(
+            completion.warning.as_deref(),
+            Some("runtime error: Query timed out in \"query\"")
+        );
     }
 
     #[test]

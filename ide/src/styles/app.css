@@ -2671,6 +2671,82 @@ body.zen-mode .editor {
   animation: atcViewportOpen .2s ease both;
 }
 
+.ld-card {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--atc-text, #1d1d1f);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.ld-section {
+  padding-top: 9px;
+  border-top: 1px solid rgba(128,128,128,.16);
+}
+.ld-section--top {
+  padding-top: 0;
+  border-top: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ld-k {
+  margin-bottom: 4px;
+  color: var(--atc-dim, #86868b);
+  font-size: 11px;
+  font-weight: 650;
+}
+.ld-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--atc-text, #1d1d1f);
+  word-break: break-word;
+}
+.ld-meta,
+.ld-item__meta,
+.ld-item__sub,
+.ld-line,
+.ld-note,
+.ld-empty {
+  color: var(--atc-dim, #86868b);
+}
+.ld-pill,
+.ld-chip,
+.ld-status {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(128,128,128,.11);
+  color: var(--atc-dim, #86868b);
+  font-size: 11px;
+  font-weight: 650;
+}
+.ld-pill { flex: none; white-space: nowrap; }
+.ld-list {
+  margin: 0;
+  padding-left: 19px;
+}
+.ld-item { margin: 6px 0; }
+.ld-item__name { font-weight: 700; color: var(--atc-text, #1d1d1f); }
+.ld-context,
+.ld-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ld-status--success { background: #e6f4ea; color: #188038; }
+.ld-status--empty,
+.ld-status--skipped { background: rgba(128,128,128,.11); color: var(--atc-dim, #86868b); }
+.ld-status--failed { background: #fce8e6; color: #d93025; }
+.ld-note {
+  font-size: 11.5px;
+}
+
 /* Sub-agent: its tool steps render NESTED inside its own viewport. Without a
    nested surface + spacing they glue together and look clipped. Give the
    viewport padding and a subtle inset background, and space the inner cards. */
@@ -4474,6 +4550,60 @@ body.zen-mode .editor {
    overrode the [hidden] attribute — so confirm-only dialogs (e.g. delete) still
    showed an empty text box. Force it hidden when JS sets hidden=true. */
 #ioInputWrap[hidden] { display: none; }
+.ai-provider-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ai-provider-option {
+  display: grid !important;
+  grid-template-columns: 18px 1fr;
+  align-items: start;
+  gap: 10px !important;
+  padding: 12px;
+  border: 1px solid #e0e3e7;
+  border-radius: 12px;
+  background: #fff;
+  color: #202124 !important;
+  cursor: pointer;
+}
+.ai-provider-option input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: #1a73e8;
+}
+.ai-provider-option span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ai-provider-option strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+}
+.ai-provider-option small {
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 400;
+  color: #5f6368;
+}
+.ai-provider-option:has(input:checked) {
+  border-color: #1a73e8;
+  background: #f6f9fe;
+  box-shadow: 0 0 0 1px rgba(26,115,232,.12);
+}
+.ai-provider-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 0 0;
+}
+.ai-provider-fields[hidden] {
+  display: none !important;
+}
 .sheet input {
   font-family: -apple-system, system-ui, sans-serif;
   font-size: 14px;
@@ -4505,6 +4635,9 @@ body.zen-mode .editor {
   .sheet h2 { color: #e8eaed; }
   .sheet__sub { color: #9aa0a6; }
   .sheet label { color: #9aa0a6; }
+  .ai-provider-option { background: #303134; border-color: #3c4043; color: #e8eaed !important; }
+  .ai-provider-option small { color: #9aa0a6; }
+  .ai-provider-option:has(input:checked) { background: #1f2b42; border-color: #8ab4f8; box-shadow: 0 0 0 1px rgba(138,180,248,.18); }
   .sheet input { background: #35363a; border-color: #5f6368; color: #e8eaed; }
   .sheet input:focus { border-color: #8ab4f8; box-shadow: 0 0 0 3px rgba(138,180,248,.2); }
   .sheet__actions { border-color: #3c4043; }
