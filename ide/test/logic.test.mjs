@@ -527,6 +527,9 @@ test("_safeJsonLoose repairs malformed \\u escapes (the 'unexpected end of hex e
   assert.equal(f('{"content":"ok \\u2713"}').content, "ok ✓");
   // an already-escaped \\u (literal backslash) must be left alone:
   assert.equal(f('{"content":"C:\\\\users"}').content, "C:\\users");
+  const partialMonitor = f('{"message":"等端口","checkType":"port","pattern":"5174","timeoutSecs":45');
+  assert.equal(partialMonitor.checkType, "port");
+  assert.equal(partialMonitor.timeoutSecs, 45);
 });
 
 test("_fileToolArgIssue rejects incomplete writes but permits complete writes and deletions", () => {
@@ -557,6 +560,10 @@ test("_normalizeArgKeys accepts common model aliases for tool parameters", () =>
     action: "browser.goto",
     trackingNumber: "YT123",
     topK: 7,
+    checkType: "port",
+    filePattern: "ready",
+    timeoutSecs: 45,
+    msg: "等待服务启动",
   });
 
   assert.equal(args.path, "src/a.js");
@@ -569,6 +576,10 @@ test("_normalizeArgKeys accepts common model aliases for tool parameters", () =>
   assert.equal(args.method, "browser.goto");
   assert.equal(args.tracking_number, "YT123");
   assert.equal(args.max_results, 7);
+  assert.equal(args.check_type, "port");
+  assert.equal(args.file_pattern, "ready");
+  assert.equal(args.timeout, 45);
+  assert.equal(args.message, "等待服务启动");
 });
 
 test("invalid file mutation arguments recover by reading target context once", () => {
@@ -3512,6 +3523,11 @@ test("local engineering profiles drive planning without an extra classifier requ
   const captureProfile = profile("打开网页抓真实接口，看看请求从哪来并重放");
   assert.equal(captureProfile.browserAutomation, true);
   assert.equal(captureProfile.capture, true);
+  const waitProfile = profile("启动 npm run dev，挂后台等端口 ready 后用浏览器验证");
+  assert.equal(waitProfile.longRunningRuntime, true);
+  assert.equal(waitProfile.interactiveWait, true);
+  assert.equal(waitProfile.requiresPlan, true,
+    "long-running interactive execution must require a plan with background wait strategy");
 
   assert.match(quality([], true, "mutate"), /尚未创建计划/);
   assert.match(quality([
@@ -3606,6 +3622,27 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "若超时、无流量、筛选为空、CA 未信任，读取错误日志/输出并切换 background/system 回退" },
     { content: "验证接口响应状态、关键字段和错误路径，汇总可复现步骤与限制" },
   ], true, "execute", captureProfile), "");
+  assert.match(quality([
+    { content: "读取 package.json 确认 dev 脚本和端口约定" },
+    { content: "启动 npm run dev 等服务 ready" },
+    { content: "打开浏览器验证页面" },
+    { content: "汇总输出" },
+  ], true, "execute", waitProfile), /后台持续任务\/等待监听策略/,
+    "interactive service plans must not hide foreground waiting behind run_cmd slogans");
+  assert.equal(quality([
+    { content: "读取 package.json 和 vite.config.js，确认 npm run dev 脚本、端口和工作区根目录" },
+    { content: "用 run_in_terminal 启动 npm run dev 到 IDE 真实终端 tab，避免 run_cmd 前台硬等或中断用户终端" },
+    { content: "用 read_terminal 读取启动日志、localhost URL、退出状态和错误输出" },
+    { content: "用 background_monitor check_type=port pattern=5174 挂后台轮询端口 ready，超时后再检查日志/端口状态" },
+    { content: "browser navigate fresh=true 打开本 run 绑定的 URL，nodes/check 验证主交互" },
+    { content: "汇总验证结果、终端状态、URL、console/network 异常和后续 stop_terminal 标准" },
+  ], true, "execute", waitProfile), "");
+  assert.match(SRC, /\[AGENT_INTERACTIVE_WAIT\]/,
+    "interactive waits must inject a first-turn orchestration reminder");
+  assert.match(SRC, /timeoutSecs:\s*5/,
+    "background URL monitor must pass camelCase timeoutSecs to the Tauri invoke layer");
+  assert.match(SRC, /run_in_terminal\(启动 dev server\/watch\/守护进程\)/,
+    "mid-run tool reminders must keep terminal orchestration visible");
   assert.equal(quality([
     { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
     { content: "核对 AuthSession schema、登录 API contract、调用方参数和旧版本兼容边界" },

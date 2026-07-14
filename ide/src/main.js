@@ -9121,6 +9121,8 @@ function _engineeringTaskProfile(text) {
   const t = String(text || "").trim();
   const browserAutomation = /(?:浏览器自动化|有头|无头|无痕|隐身|隔离浏览器|点击|点一下|输入|填表|登录流程|验证码|端到端|抓包|抓请求|抓接口|真实请求|真实接口|反接口|重放请求|后台抓包|系统抓包|browser|headed|headless|screenshot|viewport|playwright|puppeteer|selenium|click|type|login|captcha|e2e|capture|mitm|proxy|network\s*(?:trace|capture))/i.test(t);
   const capture = /(?:抓包|抓请求|抓接口|真实(?:请求|接口)|接口(?:从哪|来源|地址)|找(?:到)?接口|反接口|重放请求|无痕抓包|隔离抓包|后台抓包|系统抓包|系统代理|小黄鸟|httpcanary|charles|fiddler|capture|mitm|proxy|network\s*(?:trace|capture)|api.*(?:source|trace|real))/i.test(t);
+  const longRunningRuntime = /(?:dev\s*server|development\s*server|npm\s+(?:run\s+)?(?:dev|start|serve|preview)\b|pnpm\s+(?:run\s+)?(?:dev|start|serve|preview)\b|yarn\s+(?:run\s+)?(?:dev|start|serve|preview)\b|bun\s+(?:run\s+)?(?:dev|start|serve)\b|npx\s+(?:vite|next|nuxt)\b|vite\s+(?:--host|dev)?\b|next\s+dev\b|nuxt\s+dev\b|webpack-dev-server|ng\s+serve|nodemon|watch\s*(?:mode)?|rails\s+server|flask\s+run|uvicorn|gunicorn|python\d*\s+-m\s+http\.server|serve\s+-s|后台(?:运行|启动|监听|挂|任务)|挂后台|守护进程|持续(?:运行|任务|服务)|长时间运行|监听(?:端口|服务|日志)?|等(?:端口|服务|启动|ready|就绪|日志|输出)|wait\s+for\s+(?:port|server|service|ready|url|file|output|log))/i.test(t);
+  const interactiveWait = longRunningRuntime || /(?:验证码|扫码|登录授权|二次验证|2fa|mfa|captcha|otp|人工|手动|用户操作|等我|等用户|等一下|等一会|稍等|挂着|盯着|监控|轮询|poll(?:ing)?|后台监听|后台监控|条件满足|自动继续|回调|webhook|文件出现|文件内容匹配|URL\s*可达|端口监听|外部条件|manual\s+(?:step|action|approval|confirm))/i.test(t);
   const uiRaw = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
   const uiDesignSignal = /(?:\bui\b|frontend|front-end|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
   const ui = uiRaw && (!capture || uiDesignSignal);
@@ -9164,14 +9166,17 @@ function _engineeringTaskProfile(text) {
   const projectScope = /(?:\b(?:project|repo|repository|codebase|workspace|multi-file)\b|\ball\s+(?:files?|modules?|components?|tests?|services?|packages?|workspaces?|projects?|repositories|code)\b|\b(?:entire|whole)\s+(?:project|repo|repository|codebase|workspace)\b|项目|工程|仓库|代码库|整个|全部|所有|多个文件|全局)/i.test(t);
   const uiProject = ui && implementation && /(?:官网|网站|网页|页面|落地页|landing|homepage|official\s*site|marketing\s*site|mac\s*风格|google|谷歌|响应式|react|vue|vite|tailwind|前端|组件|配色|视觉|样式|布局)/i.test(t);
   const debugProject = bug && (projectScope || /(?:找\s*(?:bug|问题|隐患)|查找\s*(?:bug|问题|隐患)|排查|定位|诊断|看看.*(?:bug|问题|隐患)|(?:bug|问题|隐患).*还有|这些\s*(?:bug|问题)|所有\s*(?:bug|问题)|潜在\s*(?:bug|问题|隐患)|跑不起来|死循环|卡死|卡住|一直绕圈|修复\s*(?:bug|问题)|fix\s+(?:bugs?|errors?)|debug\s+(?:this|the|project|repo|codebase)|find\s+(?:bugs?|issues?))/i.test(t));
-  const applies = t.length >= 8 && (bug || architecture || implementation || (ui && projectScope));
-  const substantial = applies && (architecture || projectScope || uiProject || debugProject || t.length >= 180 || /(?:完整|整套|从零|端到端|全量|系统性|multi-file)/i.test(t));
+  const orchestration = interactiveWait || longRunningRuntime;
+  const applies = t.length >= 8 && (bug || architecture || implementation || (ui && projectScope) || orchestration);
+  const substantial = applies && (architecture || projectScope || uiProject || debugProject || (orchestration && (implementation || explicitRuntimeAction || browserAutomation || capture)) || t.length >= 180 || /(?:完整|整套|从零|端到端|全量|系统性|multi-file)/i.test(t));
   return {
     applies,
     ui,
     uiProject,
     browserAutomation,
     capture,
+    interactiveWait,
+    longRunningRuntime,
     debugProject,
     bug,
     architecture,
@@ -9272,6 +9277,7 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
   const regressionEvidence = has(/(?:regression|same\s*failing\s*path|same\s*error|re-?run|rerun|replay|focused\s*regression|original\s*failing\s*(?:case|path)|verify\s+(?:the\s+)?fix|回归|同一失败路径|原失败路径|同一报错|复测|重跑|再跑|重新运行|复查原报错|验证修复)/i);
   const impactEvidence = has(/(?:severity|priority|impact|risk|scope|affected|frequency|user\s*visible|recommend|fix\s*suggestion|remediation|优先级|严重|影响|风险|范围|受影响|频率|用户可见|修复建议|处理建议|建议修法|缓解)/i);
   const needsObservationStrategy = !!(profile?.ui || profile?.uiProject || profile?.browserAutomation || profile?.capture);
+  const needsBackgroundWaitStrategy = !!(profile?.interactiveWait || profile?.longRunningRuntime);
   if (!has(/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|\u8c03\u67e5|\u68c0\u67e5|\u5206\u6790|\u590d\u73b0|\u5b9a\u4f4d|\u8ffd\u8e2a|\u9605\u8bfb|\u5ba1\u67e5|\u68b3\u7406|\u6478\u6e05|\u786e\u8ba4|\u76d8\u70b9|\u53d6\u8bc1)/i)) missing.push("调查/理解现状");
   if (effect === "inspect") {
     if (!has(/(?:evidence|validat|cross.?check|corroborat|conclu|finding|report|recommend|summar|source|limit|confidence|\u8bc1\u636e|\u6838\u9a8c|\u4ea4\u53c9\u68c0\u67e5|\u7ed3\u8bba|\u53d1\u73b0|\u62a5\u544a|\u5efa\u8bae|\u6c47\u603b|\u6765\u6e90|\u9650\u5236|\u53ef\u4fe1|\u628a\u63e1)/i)) missing.push("证据核验/结论");
@@ -9332,6 +9338,11 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
     );
     if (!hasBrowserOrScreenshotStrategy) missing.push("浏览器有头/无头观察策略");
     if (!hasCaptureStrategy) missing.push("抓包模式/流量取证策略");
+  }
+  if (needsBackgroundWaitStrategy) {
+    const hasTerminalStrategy = has(/(?:run_in_terminal|read_terminal|list_terminals|stop_terminal|真实终端|终端\s*tab|持续任务|任务终端|终端日志|服务日志|dev\s*server|watch|daemon|守护进程|长时间运行|持续运行|后台任务)/i);
+    const hasMonitorStrategy = has(/(?:background_monitor|后台监控|挂后台|自动继续|轮询|poll|等待条件|条件满足|等端口|端口监听|等\s*URL|URL\s*可达|等文件|文件出现|等命令|命令成功|等抓包|capture|port|url|file|command|manual)/i);
+    if (!(hasTerminalStrategy || hasMonitorStrategy)) missing.push("后台持续任务/等待监听策略");
   }
   return missing.length ? `计划缺少：${missing.join("、")}` : "";
 }
@@ -10039,6 +10050,7 @@ const _AGENT_RECOVERY_TUNING = `
 - Bug 修复必须先建立因果链：复现/读取真实报错、日志、截图、失败命令或用户描述中的具体症状；沿入口、状态、数据契约、异步时序、边界值和调用方定位根因；说明为什么这个补丁能切断故障路径；改完重跑同一失败路径或最接近的聚焦回归。没有复现条件时也要列出可证伪假设和下一步证据，不准凭感觉乱改。
 - 写代码前先确认数据契约、调用方和失败/空值路径；涉及 UI 时先读真实内容源/素材/现有组件，再映射 shadcn/ui、Radix 和 Tailwind token，不能先凭模板瞎拼。
 - 动态数据、URL、跳转、接口字段、爬虫/抓包结果和第三方页面行为一律走真实证据：打开真实页面、读真实网络响应、跑真实脚本或读取已有真实样本；猜出来的链接/字段只能标成假设，不能写进结果或代码当事实。
+- 长时间运行 / 交互等待要按真实执行流处理：dev server、watch、守护进程、后台监听不要用 run_cmd 前台硬等；用 run_in_terminal 启动真实 IDE 终端，read_terminal 看日志和本地 URL，必要时 background_monitor(check_type:"port"/"url"/"file"/"command"/"capture") 挂后台轮询，条件满足会自动恢复继续。timeout 不是任务结束，先检查当前日志/端口/文件/页面状态再决定下一步。
 - 文件写入被 [BLOCKED]/[ERROR] 后，先按工具结果里的 [RECOVERY:...] 做唯一下一步；不要把 edit_file 被挡改成 sed/perl/tee/重定向/run_cmd 脚本写，也不要整文件盲写绕过。
 - 已有文件整文件覆盖前必须 read_file 读当前完整版本；局部 edit_file/multi_edit 可在当前编辑器/附件/已知上下文给出精确 old_string 且工具能唯一命中时直接改，命中失败或不唯一就从真实内容逐字符复制并补上下文；命令失败就读 exit code/stderr 根因，修完再重跑。`;
 function _modelStyleTuning(id) {
@@ -10659,7 +10671,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     { type: "function", function: { name: "list_dir", description: "List directory contents", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path" } }, required: ["path"] } } },
     ...(isAgent ? [
       { type: "function", function: { name: "write_file", description: "Write content to file", parameters: { type: "object", properties: { path: { type: "string", description: "File path" }, content: { type: "string", description: "File content" } }, required: ["path", "content"] } } },
-      { type: "function", function: { name: "run_cmd", description: "Run shell command", parameters: { type: "object", properties: { command: { type: "string", description: "Shell command" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_cmd", description: "Run a short command that exits and returns output. Do not start foreground dev servers/watch/listeners here; use Agent run_in_terminal/read_terminal/background_monitor for persistent interactive work.", parameters: { type: "object", properties: { command: { type: "string", description: "Shell command" } }, required: ["command"] } } },
     ] : []),
   ] : [];
   let _segRendered = 0;
@@ -13912,7 +13924,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       type: "function",
       function: {
         name: "update_plan",
-        description: "创建或更新复杂任务计划；简单一步修改不要套流程。复杂工程写入计划要像老手执行清单：通常 5-8 步，分别写清调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写三句口号。Bug/调试修复必须像老手查案：先复现或读取真实报错/日志/截图/诊断/exit code，把症状、触发条件和期望行为写清；沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链；列出可证伪根因假设，优先用最小证据排除；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。动态数据/URL/接口/抓包/爬虫/第三方页面任务必须列真实证据采集步骤：打开真实页面或真实接口、捕获网络响应/DOM/文件样本、验证链接/字段可访问，再写解析和落库逻辑；不得先猜 URL 规则。只读找 bug 也要列证据、根因假设、影响优先级和修复建议。UI/官网/落地页/从零前端项目至少 6 步：先读 README/package/product wiki/docs/src/data/assets/screenshots 等真实内容源，基于现有数据写文案与区块；页面信息架构/区块文案；优先 shadcn/ui + Radix primitives，把 Button/Card/Dialog/Tabs/Accordion/Progress 等语义组件映射清楚；Tailwind palette/theme.extend/CSS variables 设计令牌（颜色/字体/间距/圆角/阴影）；组件与布局实现；响应式/交互/无障碍状态；真实浏览器桌面+手机验证。复杂只读调查至少覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
+        description: "创建或更新复杂任务计划；简单一步修改不要套流程。复杂工程写入计划要像老手执行清单：通常 5-8 步，分别写清调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写三句口号。Bug/调试修复必须像老手查案：先复现或读取真实报错/日志/截图/诊断/exit code，把症状、触发条件和期望行为写清；沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链；列出可证伪根因假设，优先用最小证据排除；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。动态数据/URL/接口/抓包/爬虫/第三方页面任务必须列真实证据采集步骤：打开真实页面或真实接口、捕获网络响应/DOM/文件样本、验证链接/字段可访问，再写解析和落库逻辑；不得先猜 URL 规则。只读找 bug 也要列证据、根因假设、影响优先级和修复建议。UI/官网/落地页/从零前端项目至少 6 步：先读 README/package/product wiki/docs/src/data/assets/screenshots 等真实内容源，基于现有数据写文案与区块；页面信息架构/区块文案；优先 shadcn/ui + Radix primitives，把 Button/Card/Dialog/Tabs/Accordion/Progress 等语义组件映射清楚；Tailwind palette/theme.extend/CSS variables 设计令牌（颜色/字体/间距/圆角/阴影）；组件与布局实现；响应式/交互/无障碍状态；真实浏览器桌面+手机验证。需要持续进程/交互等待/后台监听时必须写清策略：run_in_terminal 启动真实终端、read_terminal 看日志/URL/退出状态、background_monitor 按 port/url/file/command/capture 自动轮询并恢复继续；不要让 run_cmd 前台硬等。复杂只读调查至少覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
         parameters: {
           type: "object",
           properties: {
@@ -13972,7 +13984,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "multi_edit", description: "对同一个文件做多处精确替换：edits 是一组 {old_string, new_string, replace_all?}，按顺序原子应用（任一处定位失败则整体不写入、报错）。", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "有序的替换列表", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "本轮已确认的精确文件路径；相对路径固定基于本次任务的工作区根" }, content: { type: "string", minLength: 1, description: "要写入的完整非空 UTF-8 文件内容，不能省略或用占位内容" } }, required: ["path", "content"], additionalProperties: false } } },
-      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条命令并返回完整输出（装依赖、跑测试、构建、git 等）。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条会结束的短命令并返回退出码/输出（装依赖、跑测试、构建、git 等）。不要用它前台启动 dev server/watch/监听/REPL 这类持续任务；持续任务必须用 run_in_terminal，随后 read_terminal 看日志，必要时 background_monitor 等端口/URL/文件 ready。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "deploy_site", description: "**一键把做好的网站部署上线**——自动 npm run build + 上传服务器 + **自动分配一个 HTTPS 二级域名 `名字.michaelide.xyz`**（泛解析 + 泛域名证书早已配好，用户完全无需手动配 DNS / 去域名控制台加 A 记录），返回可直接访问分享的网址（形如 https://my-portfolio.michaelide.xyz/）。**用户说「绑定/解析个二级域名、自定义域名、上线分享」时就直接用这个工具——二级域名是全自动的，别再反问用户域名是什么、也别让他去域名后台手动加记录。** 做完官网想让用户真能打开分享时用（idea→设计→建站→上线 闭环最后一步）。", parameters: { type: "object", properties: { name: { type: "string", description: "站点名（短 slug，做 URL 路径，如 mrday / my-portfolio）" } }, required: ["name"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。重构、改名时用。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
@@ -13984,7 +13996,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。注意：write_file 写文件时父目录会自动创建，所以一般只在确实需要空目录时才用。", parameters: { type: "object", properties: { path: { type: "string", description: "要创建的目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
-      { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程、监听服务等）。启动后不要猜：用 read_terminal 读取日志/URL/退出状态；要等 ready 就再用 background_monitor(check_type:\"port\"/\"url\"/\"file\"/\"command\") 挂后台自动轮询。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "**有头/可见的交互式浏览器自动化**：登录、多步表单、点击、上传、验证码前后、E2E/UI 行为验证用它；每步返回截图和节点。静态视觉只看一眼用无头 screenshot；抓真实接口先 capture_start(mode:\"isolated_browser\") 再 browser navigate(fresh:true)。**⚠️读源码/文件一律 read_file，抓纯数据优先 http_request/脚本，不要用浏览器一页页抄。**", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址。省略时若有 dev server 在跑会自动用其 URL" }, fresh: { type: "boolean", description: "navigate 用：true=隔离/无痕式新会话，先关闭旧浏览器并清空本次自动化资料目录；刚写完代码测试、抓包取证、避免旧登录态污染时用 true。复用登录态才用 false" }, mode: { type: "string", enum: ["headed", "isolated"], description: "可选语义提示：headed=有头交互（默认）；isolated=请配合 fresh=true 做隔离会话。真正无头静态渲染请用 screenshot。" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navigate}；先 nodes 拿 node 编号最稳。", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
@@ -14364,6 +14376,10 @@ function _normalizeArgKeys(args) {
   alias("to", "dest", "destination", "target_path", "targetPath", "new_path", "newPath", "output", "output_path", "save_path", "save_to", "out");
   alias("dest", "destination", "output", "output_path", "save_path", "save_to", "out");
   alias("pattern", "glob", "filepattern", "file_pattern", "name_pattern");
+  alias("file_pattern", "filePattern", "file_match", "fileMatch", "content_pattern", "contentPattern", "contains", "match_text", "matchText");
+  alias("check_type", "checkType", "check", "check_kind", "checkKind", "condition", "condition_type", "conditionType");
+  alias("timeout", "timeout_secs", "timeoutSecs", "timeout_seconds", "timeoutSeconds", "wait_seconds", "waitSeconds");
+  alias("message", "msg", "label", "reason", "status_text", "statusText");
   alias("prompt", "description", "instruction", "instructions");
   alias("method", "action", "op", "operation");
   alias("action", "op", "operation");
@@ -14673,12 +14689,12 @@ function _safeJsonLoose(s) {
     const m = t.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
     if (m) { try { out[key] = JSON.parse('"' + m[1] + '"'); } catch { out[key] = m[1]; } }
   };
-  ["path","file","file_path","filename","filePath","command","cmd","content","code","text","query","q","url","old_string","new_string","pattern","dest","name","title","prompt","description","domain","to","from","selector"].forEach(grabStr);
+  ["path","file","file_path","filename","filePath","command","cmd","content","code","text","query","q","url","old_string","new_string","pattern","file_pattern","filePattern","check_type","checkType","message","dest","name","title","prompt","description","domain","to","from","selector"].forEach(grabStr);
   const grabLit = (key) => {
     const m = t.match(new RegExp('"' + key + '"\\s*:\\s*(true|false|-?\\d+(?:\\.\\d+)?)'));
     if (m) out[key] = m[1] === "true" ? true : m[1] === "false" ? false : Number(m[1]);
   };
-  ["replace_all","staged","draft","all","create","width","height","frames","duration_ms","top_k","limit","line","offset","count","number","amount","ms"].forEach(grabLit);
+  ["replace_all","staged","draft","all","create","width","height","frames","duration_ms","top_k","limit","line","offset","count","number","amount","ms","timeout","timeout_secs","timeoutSecs","timeout_seconds","wait_seconds"].forEach(grabLit);
   return Object.keys(out).length ? out : null;
 }
 
@@ -14945,7 +14961,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         // Coerce any non-string header values to strings (Rust expects map<str,str>).
         const _hh = {}; for (const k in _h) { if (_h[k] != null) _hh[k] = String(_h[k]); } _h = _hh;
       } else { _h = null; }
-      return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs };
+      return { type: "http", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs || args.timeoutSecs || args.timeout };
     }
     case "tor_request": {
       let _h = args.headers || null;
@@ -14953,7 +14969,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       if (_h && typeof _h === "object") {
         const _hh = {}; for (const k in _h) { if (_h[k] != null) _hh[k] = String(_h[k]); } _h = _hh;
       } else { _h = null; }
-      return { type: "tor", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs };
+      return { type: "tor", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs || args.timeoutSecs || args.timeout };
     }
     case "academic_search": return { type: "academic_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "package_search": return { type: "package_search", query: String(args.query || ""), ecosystem: String(args.ecosystem || "npm"), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
@@ -15035,7 +15051,21 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "automation": return { type: "automation", method: String(args.method || ""), params: (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {} };
     case "capture_flows": return { type: "capture_flows", filter: String(args.filter || "").toLowerCase(), limit: Number.isFinite(+args.limit) ? +args.limit : 30, includeBody: args.include_body !== false };
     case "capture_stop": return { type: "capture_stop" };
-    case "background_monitor": return { type: "background_monitor", message: String(args.message || "等待中..."), checkType: String(args.check_type || "manual"), pattern: String(args.pattern || ""), filePattern: String(args.file_pattern || ""), timeout: Number.isFinite(+args.timeout) ? +args.timeout : 300 };
+    case "background_monitor": {
+      const timeout = Number.isFinite(+args.timeout) ? +args.timeout
+        : Number.isFinite(+args.timeout_secs) ? +args.timeout_secs
+        : Number.isFinite(+args.timeoutSecs) ? +args.timeoutSecs
+        : Number.isFinite(+args.wait_seconds) ? +args.wait_seconds
+        : 300;
+      return {
+        type: "background_monitor",
+        message: String(args.message || args.msg || "等待中..."),
+        checkType: String(args.check_type || args.checkType || args.check || "manual"),
+        pattern: String(args.pattern || ""),
+        filePattern: String(args.file_pattern || args.filePattern || ""),
+        timeout,
+      };
+    }
     case "capture_replay": {
       let _h = args.headers || null;
       if (typeof _h === "string") { try { _h = JSON.parse(_h); } catch { _h = null; } }
@@ -20216,6 +20246,8 @@ const _TOOL_CATALOG = [
   { name: "capture_flows", desc: "读已抓到的请求（方法/URL/头/请求体/响应体，反接口/找数据来源首选）", kw: ["抓包", "抓到的请求", "看请求", "反接口", "接口从哪来", "flows", "已抓", "数据从哪"] },
   { name: "capture_stop", desc: "停止抓包并关闭系统代理", kw: ["停止抓包", "关抓包", "结束抓包"] },
   { name: "capture_replay", desc: "精确重放一条抓到的请求(原样带真实头/cookie/token/签名，可改参)——逆向/重发利器", kw: ["重发", "重放", "replay", "逆向", "改参", "重放请求", "重发请求", "调接口", "试探接口"] },
+  { name: "run_in_terminal", desc: "在 IDE 真实终端启动持续任务(dev server/watch/守护进程/监听服务)，不中断用户终端，可见、可读、可停", kw: ["dev server", "npm run dev", "pnpm dev", "yarn dev", "watch", "监听", "长时间运行", "持续运行", "后台任务", "守护进程", "服务启动", "启动服务", "终端", "run terminal", "run_in_terminal"] },
+  { name: "read_terminal / list_terminals / stop_terminal", desc: "读取/列出/停止 run_in_terminal 启动的任务终端，看日志、URL、退出状态并验证服务是否还活着", kw: ["读终端", "看日志", "服务日志", "终端输出", "read_terminal", "tail", "logs", "list terminals", "stop terminal", "停止服务", "关闭服务", "端口日志"] },
   { name: "start_demo / stop_demo", desc: "把功能流程录成可播放演示", kw: ["演示", "录屏", "demo", "走一遍", "展示"] },
   { name: "background_monitor", desc: "挂后台等条件满足后自动继续(验证码/登录/等文件/等服务启动/等URL可达/等端口监听)——人弄完自动接着跑", kw: ["等待", "后台", "监控", "验证码", "手动", "人工", "等人", "自动继续", "挂着", "盯着", "monitor", "wait", "captcha", "等完成", "等服务", "等启动", "等部署", "等ready", "轮询", "poll", "端口", "port", "listen"] },
 ];
@@ -20331,6 +20363,7 @@ function _toolReminderBlock() {
     + "· 网页/视觉：browser(测UI/点按钮/抓数据) · screenshot(看渲染) · generate_image(生成配图/头像/logo/UI设计稿)\n"
     + "· 🎨 **UI设计三件套**（做界面/设计/做APP时必用）：style_wardrobe(衣橱·整站风格选择·交互式·用户选完返回tokens) → design_board(设计看板·多方向对比·交互式·用户选方向后返回结果) → preview_choices(功能柜·组件级方案对比·实时预览·用户选完返回结果)\n"
     + "· 数据：db_query(mysql/postgres/sqlite/redis)\n"
+    + "· 持续/交互：run_in_terminal(启动 dev server/watch/守护进程) · read_terminal/list_terminals/stop_terminal(看日志/停服务) · background_monitor(等端口/URL/文件/命令/抓包/人工操作后自动继续)\n"
     + "· 提效：run_worker(**并行**改多文件/**并行**生成衣橱3套风格) · run_subagent(大范围调研) · worktree(best-of-N 隔离工作树·难任务出多候选选最优) · generate_wiki(把代码库/产品自动摸成结构化产品Wiki存盘·做官网前打底) · update_plan · remember · lsp_definition/references";
   const mcp = _mcpCatalogEntries();
   if (mcp.length) s += "\n· 外接(MCP)：" + mcp.slice(0, 8).map((e) => e.name).join(" · ");
@@ -20850,6 +20883,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     messages.push({
       role: "user",
       content: "[AGENT_MODE_TOOL_REQUIRED]\n用户当前选择的是 Agent 模式，本轮问题指向当前文件/项目/真实运行状态。必须先调用真实工具取得证据（read_file/list_dir/search/get_diagnostics/run_cmd/browser/automation 中最直接的一个或几个），再回答或修改；不要只根据聊天记忆、可见片段或猜测收尾。",
+    });
+  }
+  if (run.engineering?.interactiveWait || run.engineering?.longRunningRuntime) {
+    messages.push({
+      role: "user",
+      content: "[AGENT_INTERACTIVE_WAIT]\n本轮含持续进程、后台监听、用户/外部条件等待或服务 ready 验证。先判断该用 run_in_terminal 还是 run_cmd：会长期运行的 dev server/watch/守护进程必须 run_in_terminal，随后 read_terminal 看日志/URL/退出状态；需要等端口、URL、文件、命令、抓包或人工操作时用 background_monitor 挂后台自动轮询，条件满足后继续。不要让前台 run_cmd 硬等到超时，也不要在 monitor 超时后直接放弃——先检查真实状态再继续。",
     });
   }
   function _padText() {
@@ -25516,6 +25555,7 @@ async function _executeToolStep(step, call, root, run) {
       const bmPat = call.pattern || "";
       const bmFilePat = call.filePattern || "";
       const bmTimeout = Math.max(10, Math.min(call.timeout || 300, 600));
+      const bmCwd = root || (_detectOS() === "Windows" ? "." : "/tmp");
       const _bmTypeLabels = { manual: "等用户确认", capture: "监控抓包", file: bmFilePat ? "等文件内容匹配" : "等文件出现", command: "等命令成功", url: "等 URL 可达", port: "等端口监听" };
       res.className = "atc-result atc-result--ok"; res.textContent = `⏳ ${bmMsg}`;
       let _bmIv = null, _bmDone = false, _bmChecks = 0;
@@ -25596,19 +25636,25 @@ async function _executeToolStep(step, call, root, run) {
             } catch {} finally { _bmFileChecking = false; }
           } else if (bmType === "command" && bmPat) {
             try {
-              const r = await backend.taskRunCapture(root || "/tmp", bmPat);
+              const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: 10 });
               if (r && r.code === 0) _bmFinish("done", "命令成功（exit 0）", `[background_monitor 结果] 命令「${bmPat}」返回 exit 0，输出：${(r.stdout || "").slice(0, 500)}。继续执行。`);
             } catch {}
           } else if (bmType === "url" && bmPat) {
             try {
-              const r = await backend.invoke("http_request", { url: bmPat, method: "GET", timeout_secs: 5 });
+              const r = await backend.invoke("http_request", { url: bmPat, method: "GET", timeoutSecs: 5 });
               const status = typeof r === "string" ? (r.match(/^(\d{3})\s/) || [])[1] : (r?.status || r?.statusCode);
               if (status && +status >= 200 && +status < 400) _bmFinish("done", `URL 可达 (${status})`, `[background_monitor 结果] URL「${bmPat}」返回 HTTP ${status}，可达。继续执行。`);
             } catch {}
           } else if (bmType === "port" && bmPat) {
             try {
-              const r = await backend.taskRunCapture(root || "/tmp", `lsof -i :${bmPat.replace(/[^0-9]/g, "")} -sTCP:LISTEN -t 2>/dev/null`);
-              if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\\n")[0]}），继续执行。`);
+              const port = bmPat.replace(/[^0-9]/g, "");
+              if (port) {
+                const cmd = _detectOS() === "Windows"
+                  ? `netstat -ano | findstr /R /C:":${port} .*LISTENING"`
+                  : `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`;
+                const r = await backend.taskRunCapture(bmCwd, cmd, { timeoutSecs: 5 });
+                if (r && r.code === 0 && (r.stdout || "").trim()) _bmFinish("done", `端口 ${bmPat} 已监听`, `[background_monitor 结果] 端口 ${bmPat} 已被监听（PID: ${(r.stdout || "").trim().split("\\n")[0]}），继续执行。`);
+              }
             } catch {}
           }
           if (!_bmDone) _bmIv = setTimeout(_bmPoll, _bmDelay());
