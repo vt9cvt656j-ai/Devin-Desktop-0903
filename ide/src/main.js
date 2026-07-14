@@ -13841,7 +13841,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
-      { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
+      { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。公网 API 不要凭感觉拼 /api、/v1、appapi 路径；先用官方文档/页面源码/抓包/用户给的精确 URL 取证，localhost/dev server/已取证 URL 可直接请求。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
       { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["method", "url"] } } },
       { type: "function", function: { name: "academic_search", description: "**搜索学术论文**（Semantic Scholar，覆盖 arXiv / PubMed / ACL 等）。返回标题、作者、年份、引用量、摘要、链接。用于查最新研究、算法、AI/ML 论文。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 'transformer attention mechanism' 或 'large language model agent'" }, max_results: { type: "integer", description: "返回数量，默认 8，最大 20" } }, required: ["query"] } } },
       { type: "function", function: { name: "package_search", description: "**搜索软件包/库**——查 npm、crates.io、PyPI、HuggingFace、pub.dev(Flutter)、Conda、CocoaPods(iOS)、Hex(Elixir) 的包信息。找库、选型、查版本用这个。", parameters: { type: "object", properties: { query: { type: "string", description: "包名或搜索词，如 'axios' / 'tokio' / 'transformers'" }, ecosystem: { type: "string", description: "生态：npm(默认) / pypi / crates / huggingface / dart / conda / cocoapods / hex。pypi 仅支持精确包名" }, max_results: { type: "integer", description: "返回数量，默认 8" } }, required: ["query"] } } },
@@ -17443,6 +17443,10 @@ function _blockedToolRecoveryInstruction(content, call = null) {
   const target = path || "目标文件";
   const mk = (kind, key, body) => ({ kind, key: `${kind}:${path || "unknown"}`, text: `[RECOVERY:${key}] ${body}` });
 
+  if (/\[BLOCKED_PRECHECK\].*公网 API URL 没有来源证据/i.test(text)) {
+    return mk("http_api_preflight", "EVIDENCE_BEFORE_HTTP",
+      `不要继续换相似 /api、/v1、appapi 路径硬撞。下一步先取证：查官方文档/页面源码/公开接口说明，或用 capture_start 后实际操作目标页面/App，再用 capture_flows 找真实请求；拿到真实 URL、query、header/cookie/签名来源后再 http_request。`);
+  }
   if (/本次模型回复里的\s*read_file\s*才刚确认|模型尚未看到读取结果|退回原始路径写错文件/i.test(text)) {
     return mk("same_batch_read_binding", "WAIT_FOR_READ_RESULT",
       `下一步不要写文件：先读取刚才 read_file 的工具结果，确认真实路径和当前内容；再对真实路径用 edit_file / multi_edit。禁止继续用原始猜测路径或整文件覆盖。`);
@@ -17672,6 +17676,163 @@ function _toolMayProduceExternalEffect(call) {
   if (["download", "download_asset", "genimage", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture"].includes(call.type)) return true;
   if (call.type === "cmd") return _commandProducesExternalEffect(call.command);
   return false;
+}
+
+function _parseHttpUrlForPreflight(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (!/^https?:$/i.test(parsed.protocol)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function _httpHostnameIsLocalOrPrivate(hostname) {
+  const host = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!host) return false;
+  if (host === "localhost" || host.endsWith(".localhost") || host === "host.docker.internal") return true;
+  if (!host.includes(".") && !host.includes(":")) return true; // docker/k8s/dev-service names are not public Internet APIs.
+  if (host === "::1" || host === "0:0:0:0:0:0:0:1" || host === "::") return true;
+  if (/^(?:fc|fd)[0-9a-f]{0,2}:|^fe80:/i.test(host)) return true;
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const parts = m.slice(1).map((x) => Number(x));
+  if (parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
+  const [a, b] = parts;
+  return a === 10
+    || a === 127
+    || a === 0
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 169 && b === 254);
+}
+
+function _isLocalOrPrivateHttpUrl(url) {
+  const parsed = _parseHttpUrlForPreflight(url);
+  return !!parsed && _httpHostnameIsLocalOrPrivate(parsed.hostname);
+}
+
+function _canonicalHttpEvidenceUrl(url, includeQuery = true) {
+  const parsed = _parseHttpUrlForPreflight(url);
+  if (!parsed) return "";
+  parsed.hash = "";
+  if (!includeQuery) parsed.search = "";
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+function _httpEvidenceText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(_httpEvidenceText).filter(Boolean).join("\n");
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.content === "string") return value.content;
+    try { return JSON.stringify(value); } catch { return ""; }
+  }
+  return String(value);
+}
+
+function _httpEvidenceCorpus(run = null, messages = []) {
+  const chunks = [];
+  const add = (value) => {
+    const text = _httpEvidenceText(value).trim();
+    if (text) chunks.push(text);
+  };
+  add(run?._originalText);
+  add(run?._steeringText);
+  if (run?._httpEvidenceUrls) add([...run._httpEvidenceUrls].join("\n"));
+  if (Array.isArray(run?._pendingContextEvidence)) add(run._pendingContextEvidence);
+  for (const m of (Array.isArray(messages) ? messages.slice(-48) : [])) {
+    if (!m || !["user", "tool"].includes(m.role)) continue;
+    add(m.content);
+    if (m._ideMeta) add(m._ideMeta);
+  }
+  return chunks.join("\n").slice(-180000);
+}
+
+function _httpUrlHasEvidence(call, run = null, messages = []) {
+  if (!call || call.type !== "http") return true;
+  const parsed = _parseHttpUrlForPreflight(call.url);
+  if (!parsed) return true;
+  const corpus = _httpEvidenceCorpus(run, messages);
+  if (!corpus) return false;
+  const exactWithQuery = _canonicalHttpEvidenceUrl(parsed.toString(), true);
+  const exactNoQuery = _canonicalHttpEvidenceUrl(parsed.toString(), false);
+  const rawUrl = String(call.url || "").trim().replace(/#.*$/, "").replace(/\/+$/, "");
+  if (exactWithQuery && corpus.includes(exactWithQuery)) return true;
+  if (rawUrl && corpus.includes(rawUrl)) return true;
+  // Official docs / capture output sometimes split URL into host + path instead of
+  // printing the full URL. That is still concrete evidence; a bare host mention is not.
+  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const path = decodeURIComponent(parsed.pathname || "/");
+  if (path && path !== "/" && exactNoQuery) {
+    const escapedPath = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedHost = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(escapedHost, "i").test(corpus) && new RegExp(escapedPath, "i").test(corpus)) return true;
+  }
+  return false;
+}
+
+function _looksLikeGuessedExternalApiUrl(call) {
+  if (!call || call.type !== "http") return false;
+  const parsed = _parseHttpUrlForPreflight(call.url);
+  if (!parsed || _httpHostnameIsLocalOrPrivate(parsed.hostname)) return false;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const path = decodeURIComponent(parsed.pathname || "/").toLowerCase();
+  const search = decodeURIComponent(parsed.search || "").toLowerCase();
+  const knownStableHosts = new Set([
+    "api.github.com",
+    "api.stackexchange.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "crates.io",
+  ]);
+  if (knownStableHosts.has(host)) return false;
+  const hostLooksApi = /(?:^|[.-])(?:api|appapi|webapi|openapi|gateway|graphql|rest)(?:[.-]|$)/i.test(host);
+  const pathLooksApi = /\/(?:api|apis|appapi|webapi|openapi|gateway|graphql|rest|ajax|interface|miniapi|v\d+)(?:\/|$|[_.-])/i.test(path)
+    || /\.(?:json|jsonp)(?:$|[/?#])/i.test(path);
+  const guessedResourcePath = /\/(?:search|list|lists|detail|details|info|goods?|products?|items?|prices?|menus?|stores?|shops?|games?|apps?|nearby|recommend|ranking|rank|feed|timeline|comments?|reviews?)(?:\/|$|[_.-])/i.test(path);
+  const queryLooksApi = /(?:^|[?&])(?:api|endpoint|method|action|app_id|game_id|shop_id|product_id|sku|page|limit)=/i.test(search);
+  return pathLooksApi || queryLooksApi || (hostLooksApi && guessedResourcePath);
+}
+
+function _externalHttpPreflightIssue(call, run = null, messages = []) {
+  if (!call || call.type !== "http" || !call.url) return "";
+  const parsed = _parseHttpUrlForPreflight(call.url);
+  if (!parsed || _httpHostnameIsLocalOrPrivate(parsed.hostname)) return "";
+  if (!_looksLikeGuessedExternalApiUrl(call)) return "";
+  if (_httpUrlHasEvidence(call, run, messages)) return "";
+  const method = String(call.method || "GET").toUpperCase();
+  const host = parsed.hostname;
+  const path = `${parsed.pathname || "/"}${parsed.search || ""}`;
+  return `[BLOCKED_PRECHECK] 这个公网 API URL 没有来源证据，IDE 未发出请求：${method} ${parsed.toString()}。` +
+    `现在不要继续凭感觉拼 ${host}${path} 或换几个相似 /api、/v1 路径硬撞。` +
+    `下一步先取证：① web_search/web_fetch 查官方文档、页面源码或公开接口说明；② 需要反真实 App/网页接口时，用 capture_start → 实际操作目标页面/App → capture_flows 找真实请求；③ 如果用户给了精确 URL，请让该 URL 出现在上下文后再请求。拿到真实 host+path、必要 query/header/cookie/签名来源后，再调用 http_request。`;
+}
+
+function _rememberHttpEvidenceFromTool(run, call, result) {
+  if (!run || !call || !result) return;
+  const content = String(result.content || "");
+  if (/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|DENIED|不可用|未执行)[^\]\n]{0,80}\]/i.test(content)) return;
+  const evidenceTypes = new Set([
+    "web", "websearch", "http", "capture_flows", "capture_replay", "browser",
+    "developer_community_search", "github_search", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  ]);
+  if (!evidenceTypes.has(call.type) && !String(call.type || "").endsWith("_search")) return;
+  run._httpEvidenceUrls = run._httpEvidenceUrls || new Set();
+  if (call.type === "http" && result.ok === true && call.url) {
+    const canonical = _canonicalHttpEvidenceUrl(call.url, true);
+    if (canonical) run._httpEvidenceUrls.add(canonical);
+  }
+  const urls = content.match(/https?:\/\/[^\s)\]"'<>`,]+/g) || [];
+  for (const raw of urls.slice(0, 40)) {
+    const canonical = _canonicalHttpEvidenceUrl(raw.replace(/[.,;:]+$/, ""), true);
+    if (canonical) run._httpEvidenceUrls.add(canonical);
+  }
+  if (run._httpEvidenceUrls.size > 100) {
+    run._httpEvidenceUrls = new Set([...run._httpEvidenceUrls].slice(-80));
+  }
 }
 
 function _externalEvidenceKinds(call, result) {
@@ -20796,6 +20957,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             return r.content;
           }
         }
+        const httpPreflightIssue = _externalHttpPreflightIssue(call, run, messages);
+        if (httpPreflightIssue) {
+          const r = { type: "http", path: call.url || "", content: httpPreflightIssue };
+          it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "预检拦截 · 未请求");
+          if (run) {
+            run._httpPreflightBlocks = (run._httpPreflightBlocks || 0) + 1;
+            if (run._recentSigs) run._recentSigs.push(_sig);
+          }
+          return _toolMsgForModel(call, r);
+        }
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted] 用户已停止任务。" };
         else {
@@ -20813,6 +20986,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (_live()) result = await _exec();
           }
         }
+        _rememberHttpEvidenceFromTool(run, call, result);
         if (result?.evidence?.resultKind === "duplicate") it._skipped = true;
         // Track failed text searches for fuzzy dedup (search + websearch only, NOT find_files)
         if (run && (call.type === "search" || call.type === "websearch")) {

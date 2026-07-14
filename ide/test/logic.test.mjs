@@ -239,6 +239,10 @@ test("blocked tool failures produce concrete recovery instructions", () => {
     recover("[GIT_NEEDS_REPO] 当前工作区「/repo」不是 Git 仓库（没有 .git）。", { type: "git", op: "status" }).text,
     /\[RECOVERY:SELECT_GIT_REPO\][\s\S]*不能猜目录/,
   );
+  assert.match(
+    recover("[BLOCKED_PRECHECK] 这个公网 API URL 没有来源证据，IDE 未发出请求：GET https://appapi.4399.cn/v1/games/list。", { type: "http", url: "https://appapi.4399.cn/v1/games/list" }).text,
+    /\[RECOVERY:EVIDENCE_BEFORE_HTTP\][\s\S]*capture_start[\s\S]*capture_flows/,
+  );
   assert.equal(recover("已修改 src/a.js（+1/-1 行）。", { type: "edit", path: "src/a.js" }), null);
 });
 
@@ -4121,6 +4125,55 @@ test("search_tools keeps fuzzy matching for natural-language capability queries"
   assert.deepEqual(lookup("github", new Map([
     ["github_search", { type: "function", function: { name: "github_search", description: "Search GitHub repositories" } }],
   ]), new Set()).map((tool) => tool.function.name), ["github_search"]);
+});
+
+test("external HTTP preflight blocks guessed public APIs but preserves evidenced and local requests", () => {
+  const parse = load("_parseHttpUrlForPreflight");
+  const localHost = load("_httpHostnameIsLocalOrPrivate");
+  const localUrl = load("_isLocalOrPrivateHttpUrl", {
+    _parseHttpUrlForPreflight: parse,
+    _httpHostnameIsLocalOrPrivate: localHost,
+  });
+  const canonical = load("_canonicalHttpEvidenceUrl", { _parseHttpUrlForPreflight: parse });
+  const evidenceText = load("_httpEvidenceText");
+  const corpus = load("_httpEvidenceCorpus", { _httpEvidenceText: evidenceText });
+  const hasEvidence = load("_httpUrlHasEvidence", {
+    _parseHttpUrlForPreflight: parse,
+    _canonicalHttpEvidenceUrl: canonical,
+    _httpEvidenceCorpus: corpus,
+  });
+  const looksGuessed = load("_looksLikeGuessedExternalApiUrl", {
+    _parseHttpUrlForPreflight: parse,
+    _httpHostnameIsLocalOrPrivate: localHost,
+  });
+  const issue = load("_externalHttpPreflightIssue", {
+    _parseHttpUrlForPreflight: parse,
+    _httpHostnameIsLocalOrPrivate: localHost,
+    _looksLikeGuessedExternalApiUrl: looksGuessed,
+    _httpUrlHasEvidence: hasEvidence,
+  });
+
+  const guessed4399 = { type: "http", method: "GET", url: "https://appapi.4399.cn/v1/games/list" };
+  assert.equal(looksGuessed(guessed4399), true);
+  assert.match(issue(guessed4399, { _originalText: "找一下 4399 的游戏榜单" }, []), /\[BLOCKED_PRECHECK\]/);
+  assert.match(issue(guessed4399, { _originalText: "找一下 4399 的游戏榜单" }, []), /capture_start[\s\S]*capture_flows/);
+
+  assert.equal(localUrl("http://127.0.0.1:3000/api/health"), true);
+  assert.equal(issue({ type: "http", method: "GET", url: "http://127.0.0.1:3000/api/health" }, {}, []), "");
+
+  assert.equal(issue(guessed4399, { _originalText: "直接请求 https://appapi.4399.cn/v1/games/list 看返回" }, []), "",
+    "a user-provided exact URL is evidence, even if it looks API-shaped");
+  assert.equal(issue(guessed4399, {}, [
+    { role: "tool", content: "capture_flows 发现真实请求：GET https://appapi.4399.cn/v1/games/list?from=home" },
+  ]), "", "a captured or fetched exact URL evidence allows the request");
+  assert.equal(issue({ type: "http", method: "GET", url: "https://www.taptap.cn/webapiv2/app-search/v1/by-keyword?kw=test" }, {}, [
+    { role: "tool", content: "官方页面源码里出现 host www.taptap.cn，路径 /webapiv2/app-search/v1/by-keyword，参数 kw 来自搜索框。" },
+  ]), "", "host + path from a tool result is enough evidence even when the full URL is split");
+  assert.equal(issue({ type: "http", method: "GET", url: "https://api.github.com/repos/openai/codex" }, {}, []), "",
+    "well-known stable public APIs should not be blocked just because the host starts with api");
+  assert.match(SRC, /_externalHttpPreflightIssue\(call, run, messages\)/);
+  assert.match(SRC, /预检拦截 · 未请求/);
+  assert.match(SRC, /公网 API 不要凭感觉拼/);
 });
 
 test("dev-server discovery is scoped to the current run and workspace", () => {
