@@ -14240,9 +14240,82 @@ function _normalizeArgKeys(args) {
   return a;
 }
 
-function _applyToolArgDefaults(name, args) {
+function _applyToolArgDefaults(name, args, context = "") {
   const canonical = _canonicalToolName(name) || name;
   const a = _normalizeArgKeys(args && typeof args === "object" && !Array.isArray(args) ? args : {});
+  const rawContext = String(context || "");
+  const firstContextUrl = () => {
+    const match = rawContext.match(/https?:\/\/[^\s)\]"'<>`,，。；；]+/i);
+    return match ? match[0].replace(/[.,;:]+$/, "") : "";
+  };
+  const repoPartsFromUrl = () => {
+    const raw = String(a.url || firstContextUrl() || "").trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw);
+      const host = url.hostname.replace(/^www\./i, "").toLowerCase();
+      const parts = url.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+      if (parts.length < 2) return null;
+      if ((canonical === "github_repo" && host !== "github.com")
+          || (canonical === "gitlab_repo" && host !== "gitlab.com")
+          || (canonical === "gitee_repo" && host !== "gitee.com")
+          || (canonical === "codeberg_repo" && host !== "codeberg.org")) return null;
+      let repoParts = parts;
+      const dash = repoParts.indexOf("-");
+      if (canonical === "gitlab_repo" && dash > 1) repoParts = repoParts.slice(0, dash);
+      const owner = canonical === "gitlab_repo" ? repoParts.slice(0, -1).join("/") : repoParts[0];
+      const repo = canonical === "gitlab_repo" ? repoParts[repoParts.length - 1] : repoParts[1];
+      return owner && repo ? { owner, repo } : null;
+    } catch {
+      return null;
+    }
+  };
+  const contextQuery = () => {
+    const lines = rawContext
+      .replace(/<image\b[\s\S]*?<\/image>/gi, " ")
+      .replace(/```[\s\S]*?```/g, " ")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !/^(?:\[?工具参数|上一轮工具参数|当前工具 schema|IDE 已|现在基于|不要重复|请重新输出|〔执行状态|〔命令没跑通|⚠️ 当前工作区|\[系统[:：]|操作系统:|Shell:)/i.test(line))
+      .filter((line) => !/^\{[\s\S]*\}$/.test(line));
+    const picked = lines.slice(-3).join(" ").replace(/\s+/g, " ").trim();
+    return picked.length > 260 ? picked.slice(0, 260) : picked;
+  };
+  const queryDefaultTools = new Set([
+    "search_tools", "search", "web_search", "knowledge_search", "local_discovery", "shop_catalog",
+    "academic_search", "package_search", "github_search", "cve_search", "wiki_search",
+    "stackoverflow_search", "hackernews_search", "developer_community_search", "dockerhub_search",
+    "pubmed_search", "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
+    "clinical_trials_search", "gitlab_search", "gitee_search", "maven_search", "packagist_search",
+    "rubygems_search", "nuget_search", "homebrew_search", "mdn_search", "cdnjs_search",
+    "devto_search", "reddit_search", "steam_search", "iconify_search", "color_search",
+    "lobsters_search", "juejin_search", "codrops_search", "smashingmag_search",
+    "css_tricks_search", "codepen_search", "dribbble_search", "awwwards_search", "v2ex_search",
+    "segmentfault_search", "github_discussions_search", "producthunt_search", "freecodecamp_search",
+    "github_trending", "infoq_search", "hackernoon_search", "codeberg_search", "bestofjs_search",
+    "sourcegraph_search", "deep_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
+  ]);
+  if (!a.query && queryDefaultTools.has(canonical)) {
+    const q = contextQuery();
+    if (q) a.query = q;
+  }
+  if (canonical === "bundlephobia_search" && !a.package) {
+    const pkg = String(a.query || contextQuery() || "").trim();
+    if (pkg) a.package = pkg;
+  }
+  if ((canonical === "github_repo" || canonical === "gitlab_repo" || canonical === "gitee_repo" || canonical === "codeberg_repo")
+      && (!a.owner || !a.repo)) {
+    const repo = repoPartsFromUrl();
+    if (repo) {
+      if (!a.owner) a.owner = repo.owner;
+      if (!a.repo) a.repo = repo.repo;
+    }
+  }
+  if (!a.url && (canonical === "web_fetch" || canonical === "http_request" || canonical === "tor_request" || canonical === "screenshot")) {
+    const u = firstContextUrl();
+    if (u) a.url = u;
+  }
   if ((canonical === "http_request" || canonical === "tor_request") && !a.method && a.url) {
     // The executor has always defaulted method to GET. Keep validation aligned
     // so a perfectly normal "fetch this URL" call doesn't waste a whole retry.
@@ -14410,7 +14483,7 @@ function _schemaValueIssue(value, schema, path = "参数") {
 // gate. The runtime registry is the source of truth, including deferred and MCP
 // tools; keeping this outside the mapper prevents a valid `{}` from becoming an
 // empty card and only failing after execution starts.
-function _toolArgIssue(name, rawArgs, registry) {
+function _toolArgIssue(name, rawArgs, registry, context = "") {
   const canonical = _canonicalToolName(name) || name;
   const mutationIssue = _mutatingToolArgIssue(canonical, rawArgs);
   if (mutationIssue) return mutationIssue;
@@ -14426,7 +14499,7 @@ function _toolArgIssue(name, rawArgs, registry) {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `${canonical || "工具"} 的参数不是对象`;
   const normalized = (typeof _applyToolArgDefaults === "function")
-    ? _applyToolArgDefaults(canonical, parsed)
+    ? _applyToolArgDefaults(canonical, parsed, context)
     : _normalizeArgKeys({ ...parsed });
   const schema = _toolSchemaFromRegistry(registry, name) || _toolSchemaFromRegistry(registry, canonical);
   const params = schema?.function?.parameters;
@@ -14476,7 +14549,7 @@ function _safeJsonLoose(s) {
   return Object.keys(out).length ? out : null;
 }
 
-function _assembleStreamToolCalls(byIndex, toolRegistry = null) {
+function _assembleStreamToolCalls(byIndex, toolRegistry = null, context = "") {
   return [...byIndex.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([, entry]) => {
@@ -14485,7 +14558,7 @@ function _assembleStreamToolCalls(byIndex, toolRegistry = null) {
       let raw = (entry.args && entry.args.trim()) ? entry.args.trim() : "{}";
       // Mutating file arguments are never loose-repaired after validation says the
       // stream is incomplete. This remains fail-closed even after retries exhaust.
-      if (_toolArgIssue(entry.name, raw, toolRegistry)) return null;
+      if (_toolArgIssue(entry.name, raw, toolRegistry, context)) return null;
       try {
         parsed = JSON.parse(raw);
       } catch {
@@ -14493,7 +14566,7 @@ function _assembleStreamToolCalls(byIndex, toolRegistry = null) {
         raw = JSON.stringify(parsed);
       }
       parsed = (typeof _applyToolArgDefaults === "function")
-        ? _applyToolArgDefaults(entry.name, parsed)
+        ? _applyToolArgDefaults(entry.name, parsed, context)
         : (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {});
       raw = JSON.stringify(parsed);
       return {
@@ -14527,7 +14600,7 @@ function _toolObjOf(o) {
 }
 // Parse tool calls a model wrote as TEXT (no native function call). Returns native-
 // shaped {id,name,argsRaw,parsedArgs}. Only calls resolving to a REAL tool survive.
-function _parseTextToolCalls(text, toolRegistry = null, issues = null, rejected = null) {
+function _parseTextToolCalls(text, toolRegistry = null, issues = null, rejected = null, context = "") {
   if (!text || typeof text !== "string" || text.length > 24000) return [];
   const found = [];
   const add = (raw, strictEnvelope) => {
@@ -14556,14 +14629,14 @@ function _parseTextToolCalls(text, toolRegistry = null, issues = null, rejected 
       : raw?.parameters !== undefined ? raw.parameters
       : raw?.input !== undefined ? raw.input
       : raw?.action_input !== undefined ? raw.action_input : {};
-    const issue = _toolArgIssue(canon, originalArgs, toolRegistry);
+    const issue = _toolArgIssue(canon, originalArgs, toolRegistry, `${context || ""}\n${text || ""}`);
     if (issue) {
       if (Array.isArray(issues)) issues.push(issue);
       if (Array.isArray(rejected)) rejected.push({ name: canon, argsRaw: JSON.stringify(t.args || {}), parsedArgs: t.args || {}, issue });
       return;
     }
     const finalArgs = (typeof _applyToolArgDefaults === "function")
-      ? _applyToolArgDefaults(canon, t.args || {})
+      ? _applyToolArgDefaults(canon, t.args || {}, `${context || ""}\n${text || ""}`)
       : (t.args && typeof t.args === "object" && !Array.isArray(t.args) ? t.args : {});
     found.push({ id: "call_" + Math.random().toString(36).slice(2, 10), name: canon, parsedArgs: finalArgs, argsRaw: JSON.stringify(finalArgs || {}) });
   };
@@ -18468,8 +18541,16 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     }
     let argIssue = "";
     let rejectedToolAttempts = [];
+    const argDefaultContext = [
+      ...messages
+        .filter((m) => m?.role === "user")
+        .map((m) => String(m.content || ""))
+        .filter((content) => !/(?:工具参数校验失败|上一轮工具参数不完整|执行状态·不要从头重查|当前工具 schema|请重新输出这次工具调用)/.test(content))
+        .slice(-3),
+      acc,
+    ].join("\n").slice(-8000);
     for (const [, e] of byIndex) {
-      const issue = e.name ? _toolArgIssue(e.name, e.args || "", toolRegistry || toolSchemas) : "工具调用缺少 name";
+      const issue = e.name ? _toolArgIssue(e.name, e.args || "", toolRegistry || toolSchemas, argDefaultContext) : "工具调用缺少 name";
       if (issue) {
         if (!argIssue) argIssue = issue;
         rejectedToolAttempts.push({ name: e.name, argsRaw: e.args || "", parsedArgs: _safeJsonLoose(e.args || "") || {}, issue });
@@ -18481,7 +18562,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     if (!argIssue && byIndex.size === 0 && acc.trim()) {
       const textIssues = [];
       const textRejected = [];
-      _parseTextToolCalls(acc, toolRegistry || toolSchemas, textIssues, textRejected);
+      _parseTextToolCalls(acc, toolRegistry || toolSchemas, textIssues, textRejected, argDefaultContext);
       if (textIssues.length) {
         argIssue = textIssues[0];
         rejectedToolAttempts = textRejected;
@@ -18492,7 +18573,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // (the old `!produced` check missed this, since reasoning also set produced=true).
     const hasUsable = acc.trim().length > 0 || [...byIndex.values()].some((e) => {
       if (!e.name || !(e.args || "").trim() || e.args.trim() === "{}") return false;
-      if (_toolArgIssue(e.name, e.args, toolRegistry || toolSchemas)) return false;
+      if (_toolArgIssue(e.name, e.args, toolRegistry || toolSchemas, argDefaultContext)) return false;
       try { JSON.parse(e.args); return true; } catch { return false; }
     });
     const stalled = !!turnErr && _isStalledAiError(turnErr);
@@ -18559,13 +18640,21 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
 
   // The assembly helper independently revalidates file mutations. Even if a future
   // retry-loop change regresses, a truncated write still cannot reach execution.
-  let toolCalls = (fatalToolArgIssue || err) ? [] : _assembleStreamToolCalls(byIndex, toolRegistry || toolSchemas);
+  const finalArgDefaultContext = [
+    ...messages
+      .filter((m) => m?.role === "user")
+      .map((m) => String(m.content || ""))
+      .filter((content) => !/(?:工具参数校验失败|上一轮工具参数不完整|执行状态·不要从头重查|当前工具 schema|请重新输出这次工具调用)/.test(content))
+      .slice(-3),
+    acc,
+  ].join("\n").slice(-8000);
+  let toolCalls = (fatalToolArgIssue || err) ? [] : _assembleStreamToolCalls(byIndex, toolRegistry || toolSchemas, finalArgDefaultContext);
   // WEAK-MODEL fallback: the model produced NO native tool call but WROTE one as text
   // (```json {tool,args}```, <tool_call>…</tool_call>, or bare tool-shaped JSON). Parse
   // + execute it, and strip that block from the shown answer. Gated on the name being
   // a REAL tool, so a genuine ```json code example is never misfired.
   if (!toolCalls.length && !err) {
-    const fromText = _parseTextToolCalls(acc, toolRegistry || toolSchemas);
+    const fromText = _parseTextToolCalls(acc, toolRegistry || toolSchemas, null, null, finalArgDefaultContext);
     if (fromText.length) { toolCalls = fromText; acc = _stripParsedToolCalls(acc); }
   }
 

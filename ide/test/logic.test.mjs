@@ -755,6 +755,10 @@ test("runtime tool schemas reject missing required parameters for native and tex
     ["current_time", schema("current_time", {})],
     ["http_request", schema("http_request", { method: { type: "string" }, url: { type: "string" } }, ["method", "url"])],
     ["browser", schema("browser", { action: { type: "string" }, url: { type: "string" } }, ["action"])],
+    ["web_search", schema("web_search", { query: { type: "string" } }, ["query"])],
+    ["github_repo", schema("github_repo", { owner: { type: "string" }, repo: { type: "string" } }, ["owner", "repo"])],
+    ["gitlab_repo", schema("gitlab_repo", { owner: { type: "string" }, repo: { type: "string" } }, ["owner", "repo"])],
+    ["bundlephobia_search", schema("bundlephobia_search", { package: { type: "string" } }, ["package"])],
     ["local_discovery", { type: "function", function: { name: "local_discovery", parameters: {
       type: "object",
       properties: {
@@ -776,8 +780,18 @@ test("runtime tool schemas reject missing required parameters for native and tex
     "http_request executor defaults method=GET, so validation must not force a retry");
   assert.equal(issue("http_request", '{}{"url":"https://example.test/data"}', registry), "",
     "safe read-only tools should repair relay-concatenated JSON before schema validation");
+  assert.equal(issue("http_request", "{}", registry, "请读取 https://example.test/live.json 的真实数据"), "",
+    "safe URL tools should recover an omitted url from the current turn context");
   assert.equal(issue("browser", '{"url":"https://example.test"}', registry), "",
     "browser({url}) should default to navigate instead of retrying for missing action");
+  assert.equal(issue("web_search", "{}", registry, "查 React hydration mismatch 最新踩坑"), "",
+    "safe search tools should recover an omitted query from the current turn context");
+  assert.equal(issue("github_repo", "{}", registry, "看看 https://github.com/vercel/next.js 的源码结构"), "",
+    "repo readers should recover owner/repo from a repository URL in context");
+  assert.equal(issue("gitlab_repo", "{}", registry, "读取 https://gitlab.com/gitlab-org/gitlab/-/tree/master/doc"), "",
+    "GitLab repo readers should keep subgroup owners when recovering owner/repo");
+  assert.equal(issue("bundlephobia_search", '{"query":"lodash"}', registry), "",
+    "bundlephobia should accept the common query alias as package");
   assert.match(issue("local_discovery", "{}", registry), /query/);
   assert.match(issue("local_discovery", '{"query":"coffee"}', registry), /near|latitude/);
   assert.equal(issue("local_discovery", '{"query":"coffee","near":"Pasadena"}', registry), "");
@@ -794,6 +808,9 @@ test("runtime tool schemas reject missing required parameters for native and tex
   const httpCalls = assemble(new Map([[0, { name: "http_request", args: '{}{"url":"https://example.test/data"}' }]]), registry);
   assert.equal(httpCalls.length, 1);
   assert.deepEqual(httpCalls[0].parsedArgs, { url: "https://example.test/data", method: "GET" });
+  const contextHttpCalls = assemble(new Map([[0, { name: "http_request", args: "{}" }]]), registry, "GET https://example.test/context.json");
+  assert.equal(contextHttpCalls.length, 1);
+  assert.deepEqual(contextHttpCalls[0].parsedArgs, { url: "https://example.test/context.json", method: "GET" });
 
   const toolObj = load("_toolObjOf", { _safeJsonLoose: safeJson });
   const parseText = load("_parseTextToolCalls", {
@@ -816,6 +833,13 @@ test("runtime tool schemas reject missing required parameters for native and tex
   const browserTextCalls = parseText('{"name":"browser","args":{"url":"https://example.test"}}', registry);
   assert.equal(browserTextCalls.length, 1);
   assert.deepEqual(browserTextCalls[0].parsedArgs, { url: "https://example.test", action: "navigate" });
+  const searchTextCalls = parseText('{"name":"web_search","args":{}}', registry, [], [], "搜索 快手直播接口 websocket 数据采集");
+  assert.equal(searchTextCalls.length, 1);
+  assert.equal(searchTextCalls[0].parsedArgs.query, "搜索 快手直播接口 websocket 数据采集");
+  const repoTextCalls = parseText('{"name":"github_repo","args":{}}', registry, [], [], "读 https://github.com/openai/codex 仓库");
+  assert.equal(repoTextCalls.length, 1);
+  assert.equal(repoTextCalls[0].parsedArgs.owner, "openai");
+  assert.equal(repoTextCalls[0].parsedArgs.repo, "codex");
   const unknownIssues = [], unknownRejected = [];
   assert.equal(parseText('{"name":"made_up_tool","args":{}}', registry, unknownIssues, unknownRejected).length, 0);
   assert.match(unknownIssues[0], /未知工具/);
