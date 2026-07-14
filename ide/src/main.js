@@ -13837,7 +13837,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程等）。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
-      { type: "function", function: { name: "browser", description: "**仅用于交互式 UI 测试 / 走登录多步表单**（抓网页数据请改用 http_request 或写爬虫脚本，别用它一页页看着抄）。**⚠️读源码 / 看文件内容 / 理解代码（含逆向、看 .html/.js/.json）一律用 read_file，绝不启动浏览器去「看」文件——就几个文件时更别开浏览器，那是浪费。browser / screenshot 只在需要真看「渲染后的视觉效果」或做点击/填表交互时才用。**自主操控一个真实浏览器、并能**看见它**——每个动作都返回：截图(可点元素标了**红色数字编号**) + **可交互元…", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址。省略时若有 dev server 在跑会自动用其 URL" }, fresh: { type: "boolean", description: "navigate 用：true=先关闭旧浏览器、清空会话后再打开（测试刚写的代码用 fresh 避免旧状态污染；走登录多步流程/复用 cookie 不要 fresh）" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navig…", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
+      { type: "function", function: { name: "browser", description: "**有头/可见的交互式浏览器自动化**：登录、多步表单、点击、上传、验证码前后、E2E/UI 行为验证用它；每步返回截图和节点。静态视觉只看一眼用无头 screenshot；抓真实接口先 capture_start(mode:\"isolated_browser\") 再 browser navigate(fresh:true)。**⚠️读源码/文件一律 read_file，抓纯数据优先 http_request/脚本，不要用浏览器一页页抄。**", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "click", "type", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。" }, url: { type: "string", description: "navigate 用：要打开的网址。省略时若有 dev server 在跑会自动用其 URL" }, fresh: { type: "boolean", description: "navigate 用：true=隔离/无痕式新会话，先关闭旧浏览器并清空本次自动化资料目录；刚写完代码测试、抓包取证、避免旧登录态污染时用 true。复用登录态才用 false" }, mode: { type: "string", enum: ["headed", "isolated"], description: "可选语义提示：headed=有头交互（默认）；isolated=请配合 fresh=true 做隔离会话。真正无头静态渲染请用 screenshot。" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, steps: { type: "array", description: "batch 用：要连续执行的步骤数组，每项 {op:click/type/press/scroll/wait/navigate}；先 nodes 拿 node 编号最稳。", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器。" }, text: { type: "string", description: "type 用：要输入的文本；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
@@ -13901,7 +13901,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "xianyu_search", description: "闲鱼/Goofish 二手公开网页搜索。用于查二手挂牌、成色描述、价格区间和捡漏线索；不是官方 API，不证明成交价或仍在售。用户问二手、闲鱼、捡漏、行情时和 zhuanzhuan_search 交叉比价。", parameters: { type: "object", properties: { query: { type: "string", description: "二手商品关键词，如「二手 iPhone 13」「95新 3080 显卡」" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "zhuanzhuan_search", description: "转转二手公开网页搜索。用于查二手挂牌、回收/验机相关行情和价格区间；不是官方 API，不证明成交价或仍在售。查二手行情时和 xianyu_search 一起用。", parameters: { type: "object", properties: { query: { type: "string", description: "二手商品关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
-      { type: "function", function: { name: "capture_start", description: "**启动系统级抓包（真·小黄鸟 / HttpCanary）**——基于 mitmproxy 的 MITM 代理，能抓任意 App / 浏览器的 HTTP/HTTPS 请求（含完整请求头/请求体/响应头/响应体）。启动后用 `capture_flows` 读抓到的请求、定位目标接口，再用 `http_request` 改参重发。**反接口 / 找『数据从哪个接口来』的利器**。首次用可能需要装 mitmproxy + 信任 CA 证书——工具会把要执行的命令返回给你，你转达用户执行即可。", parameters: { type: "object", properties: { port: { type: "integer", description: "代理端口，默认 8080" }, system_proxy: { type: "boolean", description: "是否自动把 macOS 系统代理指向本代理（默认 true → 所有 App 流量都被抓）" } }, required: [] } } },
+      { type: "function", function: { name: "capture_start", description: "**启动抓包（mitmproxy，小黄鸟/HttpCanary 类能力）**。先选模式：mode:\"isolated_browser\"=默认推荐，无痕/隔离抓自动化浏览器，不改系统代理；mode:\"system\"=抓任意 App/全系统流量，会改 macOS 系统代理；mode:\"background\"=后台只监听/手动代理，常配 background_monitor(check_type:\"capture\")。启动后用 capture_flows 找真实请求，再用 capture_replay/http_request 重放。", parameters: { type: "object", properties: { port: { type: "integer", description: "代理端口，默认 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto=IDE 按任务判断；isolated_browser=不改系统代理，browser(fresh=true) 自动走代理；system=改系统代理抓任意 App；background=只启动代理监听，自己/monitor 等流量" }, system_proxy: { type: "boolean", description: "兼容旧参数：true 等同 mode=system；false 等同 mode=isolated_browser/background。不传时按 mode/任务自动判断" } }, required: [] } } },
       { type: "function", function: { name: "automation", description: "桌面自动化 RPC：真实鼠标键盘、CDP 浏览器和录制回放。按状态机用：先确认 URL/窗口/节点/登录态等前置状态，再执行动作，再用 browser.content / browser.eval / screenshot / recorder 结果等验证后置状态；发起点击或输入不等于成功。首次先调 system.init。坐标点击必须先 mouse.move{x,y} 再 mouse.click{button}；不存在 desktop.click/desktop.type。selector 失效要重新读取页面/节点，导航慢要 wait 后核 URL/DOM，登录/验证码/系统权限阻塞时说明具体阻塞并用后台监控接续。method 可选：system.init / mouse.move / mouse.click / mouse.double_click / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list。", parameters: { type: "object", properties: { method: { type: "string", description: "要调用的真实 RPC 方法名，如 browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "该方法的参数对象；以方法描述为准" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**读取已抓到的 HTTP/HTTPS 请求**（结构化：方法/URL/主机/路径/状态/耗时/请求头/请求体/响应头/响应体）。比看截图可靠，是反接口的第一步。用 filter 关键词筛（匹配 host/路径/URL/方法/状态/类型），limit 限条数（默认 30，最新在前）。", parameters: { type: "object", properties: { filter: { type: "string", description: "可选，关键词筛选（模糊匹配 host/路径/URL/方法/状态/content-type）" }, limit: { type: "integer", description: "可选，返回最新的多少条，默认 30" }, include_body: { type: "boolean", description: "可选，是否含请求/响应体（默认 true；只看列表设 false 省 token）" } }, required: [] } } },
       { type: "function", function: { name: "capture_stop", description: "停止抓包并关闭已设置的系统代理。", parameters: { type: "object", properties: {}, required: [] } } },
@@ -14771,7 +14771,13 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "search_game_assets": return { type: "search_game_assets", query: String(args.query || ""), asset_type: String(args.asset_type || "all") };
     case "download_asset": return { type: "download_asset", url: String(args.url || ""), name: String(args.name || "asset"), asset_type: String(args.asset_type || "model") };
     case "download_file": return { type: "download", url: args.url || "", dest: args.dest || args.path || "" };
-    case "capture_start": return { type: "capture_start", port: Number.isFinite(+args.port) ? +args.port : 0, systemProxy: args.system_proxy !== false };
+    case "capture_start": return {
+      type: "capture_start",
+      port: Number.isFinite(+args.port) ? +args.port : 0,
+      mode: String(args.mode || args.capture_mode || "auto"),
+      captureMode: String(args.mode || args.capture_mode || "auto"),
+      systemProxy: Object.prototype.hasOwnProperty.call(args, "system_proxy") ? !!args.system_proxy : undefined,
+    };
     case "automation": return { type: "automation", method: String(args.method || ""), params: (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {} };
     case "capture_flows": return { type: "capture_flows", filter: String(args.filter || "").toLowerCase(), limit: Number.isFinite(+args.limit) ? +args.limit : 30, includeBody: args.include_body !== false };
     case "capture_stop": return { type: "capture_stop" };
@@ -14804,7 +14810,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       // Node id from the `nodes` snapshot → a stable [data-mnode] selector, so the
       // agent acts on the page's structured nodes by number (node=N).
       if (args.node != null && args.node !== "" && Number.isFinite(Number(args.node))) _bsel = `[data-mnode="${Number(args.node)}"]`;
-      return { type: "browser", action: args.action || "screenshot", url: args.url || "", fresh: !!args.fresh, selector: _bsel, text: args.text || "", key: args.key || "", amount: args.amount, ms: args.ms, script: args.script || "", width: Number.isFinite(+args.width) ? +args.width : undefined, height: Number.isFinite(+args.height) ? +args.height : undefined, deviceScaleFactor: Number.isFinite(+args.device_scale_factor) ? +args.device_scale_factor : undefined, mobile: !!args.mobile, steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null), uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))) };
+      return { type: "browser", action: args.action || "screenshot", url: args.url || "", fresh: !!args.fresh || /^(?:isolated|private|incognito)$/i.test(String(args.mode || "")), mode: String(args.mode || "headed"), selector: _bsel, text: args.text || "", key: args.key || "", amount: args.amount, ms: args.ms, script: args.script || "", width: Number.isFinite(+args.width) ? +args.width : undefined, height: Number.isFinite(+args.height) ? +args.height : undefined, deviceScaleFactor: Number.isFinite(+args.device_scale_factor) ? +args.device_scale_factor : undefined, mobile: !!args.mobile, steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null), uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))) };
     }
     case "computer": return { type: "automation", method: "mouse.click", params: {} };
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
@@ -17447,6 +17453,14 @@ function _blockedToolRecoveryInstruction(content, call = null) {
     return mk("http_api_preflight", "EVIDENCE_BEFORE_HTTP",
       `不要继续换相似 /api、/v1、appapi 路径硬撞。下一步先取证：查官方文档/页面源码/公开接口说明，或用 capture_start 后实际操作目标页面/App，再用 capture_flows 找真实请求；拿到真实 URL、query、header/cookie/签名来源后再 http_request。`);
   }
+  if (/\[BLOCKED_PRECHECK\].*需要真实网络请求证据.*还没启动抓包/i.test(text)) {
+    return mk("browser_capture_preflight", "START_CAPTURE_BEFORE_BROWSER",
+      `先启动抓包再产生流量：网页/浏览器默认 capture_start({mode:"isolated_browser"})，然后 browser navigate(fresh:true) 操作页面，最后 capture_flows 读真实请求；任意 App/全系统才用 capture_start({mode:"system"})。`);
+  }
+  if (/\[BLOCKED_PRECHECK\].*单次无头 screenshot.*不能证明流程成功/i.test(text)) {
+    return mk("screenshot_interaction_preflight", "USE_HEADED_BROWSER_FLOW",
+      `这不是静态看图任务。下一步用 browser 有头自动化：navigate(fresh:true) → nodes/check → click/type/assert；如果要找接口，先 capture_start({mode:"isolated_browser"}) 再打开页面。`);
+  }
   if (/本次模型回复里的\s*read_file\s*才刚确认|模型尚未看到读取结果|退回原始路径写错文件/i.test(text)) {
     return mk("same_batch_read_binding", "WAIT_FOR_READ_RESULT",
       `下一步不要写文件：先读取刚才 read_file 的工具结果，确认真实路径和当前内容；再对真实路径用 edit_file / multi_edit。禁止继续用原始猜测路径或整文件覆盖。`);
@@ -17833,6 +17847,74 @@ function _rememberHttpEvidenceFromTool(run, call, result) {
   if (run._httpEvidenceUrls.size > 100) {
     run._httpEvidenceUrls = new Set([...run._httpEvidenceUrls].slice(-80));
   }
+}
+
+function _browserCaptureIntent(text) {
+  const value = String(text || "");
+  const needsCapture = /(?:抓包|抓请求|抓接口|真实(?:请求|接口)|接口(?:从哪|来源|地址)|找(?:到)?接口|反接口|重放请求|capture|mitm|proxy|network\s*(?:trace|capture)|where.*(?:api|request)|api.*(?:source|trace|real))/i.test(value);
+  const needsSystem = /(?:任意\s*app|任意\s*应用|其他\s*(?:app|应用|软件)|桌面软件|原生应用|手机\s*app|全系统|系统级|所有(?:应用|软件|流量)|系统代理|小黄鸟|httpcanary|charles|fiddler|非浏览器|outside\s+browser|all\s+(?:apps|traffic)|system\s*(?:proxy|wide))/i.test(value);
+  const wantsBackground = /(?:后台抓包|后台监听|挂后台|不打开(?:浏览器|窗口)|只监听|manual\s*proxy|background\s*capture|listen\s*only)/i.test(value);
+  const wantsIsolation = /(?:无痕|隐身|隔离|不影响系统|别改系统代理|只抓浏览器|浏览器抓包|网页登录|登录流程|incognito|private|isolated|browser\s*only)/i.test(value);
+  const needsInteraction = /(?:点击|点一下|输入|填表|登录|验证码|cookie|localstorage|session|按钮|下拉|上传|交互|流程|e2e|端到端|click|type|login|form|captcha|upload|interactive)/i.test(value);
+  const staticVisual = /(?:截图|看效果|视觉|布局|样式|响应式|渲染|首屏|配色|screenshot|visual|layout|render|responsive|viewport)/i.test(value);
+  return { needsCapture, needsSystem, wantsBackground, wantsIsolation, needsInteraction, staticVisual };
+}
+
+function _normalizeCaptureModeName(mode) {
+  const raw = String(mode || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!raw) return "auto";
+  if (["system", "system_proxy", "all_apps", "all_traffic", "global"].includes(raw)) return "system";
+  if (["isolated", "isolated_browser", "browser", "browser_only", "incognito", "private", "private_browser", "stealth"].includes(raw)) return "isolated_browser";
+  if (["background", "manual", "listen", "listen_only", "proxy_only"].includes(raw)) return "background";
+  if (["auto", "default"].includes(raw)) return "auto";
+  return raw;
+}
+
+function _resolveCaptureStartMode(call, run = null) {
+  call = call || {};
+  const text = [run?._originalText, run?._steeringText].filter(Boolean).join("\n");
+  const modeSignals = _browserCaptureIntent(text);
+  let mode = _normalizeCaptureModeName(call.captureMode || call.mode);
+  const hasExplicitSystemProxy = typeof call.systemProxy === "boolean";
+  if (hasExplicitSystemProxy && mode === "auto") mode = call.systemProxy ? "system" : "isolated_browser";
+  if (mode === "auto") {
+    if (modeSignals.needsSystem) mode = "system";
+    else if (modeSignals.wantsBackground) mode = "background";
+    else mode = "isolated_browser";
+  }
+  if (!["system", "isolated_browser", "background"].includes(mode)) mode = "isolated_browser";
+  const systemProxy = hasExplicitSystemProxy ? !!call.systemProxy : mode === "system";
+  const label = mode === "system" ? "系统级抓包" : mode === "background" ? "后台抓包" : "无痕/隔离浏览器抓包";
+  const next = mode === "system"
+    ? "现在实际操作目标 App/网页；如果要让自动化浏览器产生流量，也可以 browser navigate(fresh=true) 后再 capture_flows。"
+    : mode === "background"
+      ? "代理只在后台监听，不改系统代理；把目标程序手动指向该代理，或用 background_monitor(check_type:\"capture\") 等待匹配流量。"
+      : "现在用 browser navigate(fresh=true) 打开目标网页；自动化浏览器会走该代理且使用隔离资料目录，不污染系统代理和用户正常浏览。";
+  return { mode, systemProxy, label, next };
+}
+
+function _browserNeedsCapturePreflight(call, run = null, captureRunning = false) {
+  if (!call || call.type !== "browser") return "";
+  const action = String(call.action || "screenshot").toLowerCase();
+  if (!["navigate", "click", "type", "press", "batch"].includes(action)) return "";
+  const text = [run?._originalText, run?._steeringText].filter(Boolean).join("\n");
+  const modeSignals = _browserCaptureIntent(text);
+  if (!modeSignals.needsCapture) return "";
+  if (captureRunning || run?._captureStarted) return "";
+  const resolved = _resolveCaptureStartMode({ mode: modeSignals.needsSystem ? "system" : "isolated_browser" }, run);
+  return `[BLOCKED_PRECHECK] 这轮任务需要真实网络请求证据，但还没启动抓包。` +
+    `先调用 capture_start({mode:"${resolved.mode}"})（${resolved.label}），再用 browser navigate(fresh:true) 或实际操作目标 App，最后 capture_flows 读取真实请求。` +
+    `不要先打开页面再事后猜接口；抓包要在产生流量之前启动。`;
+}
+
+function _screenshotModePreflightIssue(call, run = null) {
+  if (!call || call.type !== "screenshot") return "";
+  const text = [run?._originalText, run?._steeringText].filter(Boolean).join("\n");
+  const modeSignals = _browserCaptureIntent(text);
+  if (!modeSignals.needsInteraction) return "";
+  if (modeSignals.staticVisual && !modeSignals.needsCapture) return "";
+  return `[BLOCKED_PRECHECK] 这轮目标包含登录/点击/填表/验证码/会话等交互，单次无头 screenshot 只能看静态渲染，不能证明流程成功。` +
+    `请改用 browser 有头自动化：browser navigate(fresh:true) → nodes/check → click/type/assert；如果还要找真实接口，先 capture_start({mode:"isolated_browser"}) 再打开页面。`;
 }
 
 function _externalEvidenceKinds(call, result) {
@@ -19690,8 +19772,8 @@ const _TOOL_CATALOG = [
   { name: "generate_texture", desc: "AI生成PBR纹理——文字→贴图(反照率/法线/粗糙/金属)", kw: ["纹理", "贴图", "texture", "材质", "pbr", "法线", "粗糙度", "金属度", "material", "uv", "贴花"] },
   { name: "search_game_assets", desc: "搜索免费游戏资源库(Sketchfab 3D模型/Freesound音效/Poly Haven纹理)", kw: ["搜资源", "找模型", "找音效", "找纹理", "免费素材", "资源库", "asset store", "sketchfab", "freesound", "poly haven"] },
   { name: "download_asset", desc: "下载游戏资源到工作区(模型/音效/纹理/HDRI)", kw: ["下载资源", "download asset", "保存资源", "下载模型", "下载纹理"] },
-  { name: "browser", desc: "**交互式**操控真实浏览器做 UI 测试 / 走登录表单（只在必须看着点时用；抓数据请写脚本、别用它）", kw: ["浏览器", "点按钮", "填表单", "登录流程", "e2e", "端到端", "测网页"] },
-  { name: "screenshot", desc: "截图看渲染效果", kw: ["截图", "看效果", "界面", "ui", "渲染", "样式", "好看", "长什么样", "预览"] },
+  { name: "browser", desc: "有头/可见浏览器自动化：点击、填表、登录、多步流程、E2E；抓接口先 capture_start(isolated_browser)+fresh navigate", kw: ["浏览器", "有头", "可见", "点按钮", "填表单", "登录流程", "e2e", "端到端", "测网页", "无痕", "隔离"] },
+  { name: "screenshot", desc: "无头浏览器截图看静态渲染/响应式/动画胶片；不能证明登录点击等交互流程", kw: ["截图", "无头", "headless", "看效果", "界面", "ui", "渲染", "样式", "好看", "长什么样", "预览"] },
   { name: "generate_image", desc: "AI 生成图片（配图/头像/logo/插画）+ **UI 设计稿/界面原型图**（先出图给用户看再写码）", kw: ["图片", "配图", "头像", "logo", "插画", "图标", "素材", "生图", "image", "banner", "封面", "设计稿", "界面图", "原型", "mockup", "ui设计", "设计图", "出图"] },
   { name: "design_board", desc: "多张设计稿排版展示+交互选择（用户点「选这个方向」后返回选择结果，不需要再问）", kw: ["设计", "排版", "对比", "方案", "方向", "看板", "网格", "展示", "选择", "design", "board", "grid", "variant", "comparison"] },
   { name: "db_query", desc: "查/改数据库（mysql/postgres/sqlite/redis）", kw: ["数据库", "查数据", "表", "sql", "mysql", "postgres", "redis", "记录", "字段", "查询", "db"] },
@@ -19713,7 +19795,7 @@ const _TOOL_CATALOG = [
   { name: "track_shipment", desc: "免密识别有限承运商并返回官方快递核验入口；不伪造实时物流轨迹", kw: ["快递", "物流", "包裹", "单号", "运单", "shipment", "parcel", "tracking", "courier", "delivery"] },
   { name: "read_screen / ui_click", desc: "读取前台原生应用可访问性元素；macOS 可按 ref 操作", kw: ["前台应用", "原生应用", "屏幕元素", "按钮", "输入框", "accessibility", "ax", "read screen", "ui click", "操作软件"] },
   { name: "download_file", desc: "下载文件到工作区", kw: ["下载", "download", "拉取"] },
-  { name: "capture_start", desc: "启动系统级抓包（真·小黄鸟 / mitmproxy MITM 代理，抓任意 App/浏览器的 HTTP/HTTPS）", kw: ["抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
+  { name: "capture_start", desc: "启动抓包：isolated_browser=无痕隔离浏览器抓包；system=全系统/任意App；background=后台监听+monitor", kw: ["抓包", "无痕抓包", "隔离抓包", "后台抓包", "系统抓包", "拦截", "mitm", "小黄鸟", "httpcanary", "charles", "fiddler", "抓请求", "抓接口", "sniff", "代理抓包", "packet"] },
   { name: "automation", desc: "桌面自动化 RPC：真实鼠标键盘 / CDP 浏览器 / 录制回放", kw: ["自动化", "录制", "回放", "重放", "工作流", "rpa", "automation", "recorder", "replay", "鼠标", "键盘", "桌面自动化", "宏", "macro", "自动点击", "自动填表", "模拟操作"] },
   { name: "capture_flows", desc: "读已抓到的请求（方法/URL/头/请求体/响应体，反接口/找数据来源首选）", kw: ["抓包", "抓到的请求", "看请求", "反接口", "接口从哪来", "flows", "已抓", "数据从哪"] },
   { name: "capture_stop", desc: "停止抓包并关闭系统代理", kw: ["停止抓包", "关抓包", "结束抓包"] },
@@ -20956,6 +21038,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
             return r.content;
           }
+        }
+        const screenshotModeIssue = _screenshotModePreflightIssue(call, run);
+        if (screenshotModeIssue) {
+          const r = { type: "screenshot", path: call.url || call.path || "", content: screenshotModeIssue };
+          it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "模式不匹配 · 未截图");
+          if (run && run._recentSigs) run._recentSigs.push(_sig);
+          return _toolMsgForModel(call, r);
+        }
+        const browserCaptureIssue = _browserNeedsCapturePreflight(call, run, _captureRunning);
+        if (browserCaptureIssue) {
+          const r = { type: "browser", path: call.url || call.action || "", content: browserCaptureIssue };
+          it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "先抓包 · 未打开");
+          if (run && run._recentSigs) run._recentSigs.push(_sig);
+          return _toolMsgForModel(call, r);
         }
         const httpPreflightIssue = _externalHttpPreflightIssue(call, run, messages);
         if (httpPreflightIssue) {
@@ -24778,21 +24878,33 @@ async function _executeToolStep(step, call, root, run) {
           return { type: "capture_start", path: "", content: "[需先安装抓包引擎 mitmproxy] 请让用户在终端执行：\n  brew install mitmproxy   （或 pipx install mitmproxy / pip install --user mitmproxy）\n装好后再调用 capture_start。" };
         }
         const port = call.port > 0 ? call.port : 8080;
+        const captureMode = _resolveCaptureStartMode(call, run);
+        call.captureMode = captureMode.mode;
+        call.systemProxy = captureMode.systemProxy;
         _capturePort = port;
         _captureFlows = [];
         await backend.proxyStart(port, _onCaptureFlow);
         _captureRunning = true;
+        if (run) {
+          run._captureStarted = true;
+          run._captureMode = captureMode.mode;
+          run._capturePort = port;
+        }
         let sys = "";
         if (call.systemProxy) {
           try { await backend.proxySetSystemProxy(true, port); sys = `\n已自动把 macOS 系统代理指向 127.0.0.1:${port}（capture_stop 会自动关闭）。`; }
           catch (e) { sys = `\n（自动设系统代理失败：${String(e?.message || e).slice(0,120)}；让用户手动把系统/浏览器代理设为 127.0.0.1:${port}）`; }
+        } else if (captureMode.mode === "isolated_browser") {
+          sys = `\n模式：无痕/隔离浏览器抓包——未修改系统代理；接下来 browser navigate(fresh:true) 会自动走 127.0.0.1:${port}。`;
+        } else {
+          sys = `\n模式：后台抓包——未修改系统代理；目标程序需手动设置代理，或用 background_monitor(check_type:"capture") 等待匹配流量。`;
         }
         const ca = await backend.proxyCaPath().catch(() => null);
         const caLine = ca
           ? `\n抓 HTTPS 需信任 CA 证书（一次即可）——让用户执行：\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${ca}"`
           : `\n首次启动会在 ~/.mitmproxy/ 生成 CA 证书；抓 HTTPS 前需让用户信任它（钥匙串设“始终信任”，或用 sudo security add-trusted-cert）。`;
-        res.className = "atc-result atc-result--ok"; res.textContent = `抓包中 :${port}`;
-        return { type: "capture_start", path: String(port), content: `✅ 抓包已启动，代理 127.0.0.1:${port}。${sys}${caLine}\n\n现在让用户访问目标网页 / 用目标 App，然后调用 capture_flows 读抓到的请求。` };
+        res.className = "atc-result atc-result--ok"; res.textContent = `${captureMode.label} :${port}`;
+        return { type: "capture_start", path: String(port), captureMode: captureMode.mode, content: `✅ ${captureMode.label}已启动，代理 127.0.0.1:${port}。${sys}${caLine}\n\n下一步：${captureMode.next}\n产生流量后调用 capture_flows 读真实请求。` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "启动失败";
         return { type: "capture_start", path: "", content: `[失败] 启动抓包出错: ${String(e?.message || e).slice(0, 200)}` };
@@ -24824,6 +24936,7 @@ async function _executeToolStep(step, call, root, run) {
       try { await backend.proxyStop(); } catch {}
       try { await backend.proxySetSystemProxy(false, _capturePort); } catch {}
       _captureRunning = false;
+      if (run) run._captureStarted = false;
       res.className = "atc-result atc-result--ok"; res.textContent = "已停止";
       return { type: "capture_stop", path: "", content: `已停止抓包并关闭系统代理。共抓到 ${_captureFlows.length} 条（仍可用 capture_flows 回看）。` };
 
@@ -25406,7 +25519,7 @@ async function _executeToolStep(step, call, root, run) {
     } else if (call.type === "browser") {
       const act = call.action || "screenshot";
       const _browserOwner = run?._reqId || "";
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "browser", path: act, content: "[不可用] browser（自主浏览器）只能在 Michael IDE 桌面 App 里用（要驱动本机的无头 Chrome）。网页/预览版没有这个能力。" }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "browser", path: act, content: "[不可用] browser（有头/可见的自主浏览器自动化）只能在 Michael IDE 桌面 App 里用。网页/预览版没有这个能力；静态无头截图请用 screenshot。" }; }
       if (act === "close") {
         if (_browserOwner && _browserAgentOwner && _browserAgentOwner !== _browserOwner) {
           return { type: "browser", path: "close", content: "[BLOCKED] 浏览器已被另一个 Agent run 接管，当前 run 不能关闭它。" };

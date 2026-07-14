@@ -243,6 +243,14 @@ test("blocked tool failures produce concrete recovery instructions", () => {
     recover("[BLOCKED_PRECHECK] 这个公网 API URL 没有来源证据，IDE 未发出请求：GET https://appapi.4399.cn/v1/games/list。", { type: "http", url: "https://appapi.4399.cn/v1/games/list" }).text,
     /\[RECOVERY:EVIDENCE_BEFORE_HTTP\][\s\S]*capture_start[\s\S]*capture_flows/,
   );
+  assert.match(
+    recover("[BLOCKED_PRECHECK] 这轮任务需要真实网络请求证据，但还没启动抓包。", { type: "browser", action: "navigate" }).text,
+    /\[RECOVERY:START_CAPTURE_BEFORE_BROWSER\][\s\S]*isolated_browser[\s\S]*capture_flows/,
+  );
+  assert.match(
+    recover("[BLOCKED_PRECHECK] 这轮目标包含登录/点击/填表/验证码/会话等交互，单次无头 screenshot 只能看静态渲染，不能证明流程成功。", { type: "screenshot", url: "http://localhost:3000" }).text,
+    /\[RECOVERY:USE_HEADED_BROWSER_FLOW\][\s\S]*browser 有头自动化/,
+  );
   assert.equal(recover("已修改 src/a.js（+1/-1 行）。", { type: "edit", path: "src/a.js" }), null);
 });
 
@@ -4174,6 +4182,63 @@ test("external HTTP preflight blocks guessed public APIs but preserves evidenced
   assert.match(SRC, /_externalHttpPreflightIssue\(call, run, messages\)/);
   assert.match(SRC, /预检拦截 · 未请求/);
   assert.match(SRC, /公网 API 不要凭感觉拼/);
+});
+
+test("browser and capture mode preflights choose headed, headless, isolated, system, and background paths", () => {
+  const intent = load("_browserCaptureIntent");
+  const normalizeMode = load("_normalizeCaptureModeName");
+  const resolveMode = load("_resolveCaptureStartMode", {
+    _browserCaptureIntent: intent,
+    _normalizeCaptureModeName: normalizeMode,
+  });
+  const browserCaptureIssue = load("_browserNeedsCapturePreflight", {
+    _browserCaptureIntent: intent,
+    _resolveCaptureStartMode: resolveMode,
+  });
+  const screenshotIssue = load("_screenshotModePreflightIssue", {
+    _browserCaptureIntent: intent,
+  });
+
+  assert.equal(normalizeMode("incognito"), "isolated_browser");
+  assert.equal(normalizeMode("system_proxy"), "system");
+  assert.equal(normalizeMode("listen_only"), "background");
+
+  assert.deepEqual(
+    resolveMode({ mode: "auto" }, { _originalText: "打开网页抓真实接口，看请求从哪来" }),
+    { mode: "isolated_browser", systemProxy: false, label: "无痕/隔离浏览器抓包", next: "现在用 browser navigate(fresh=true) 打开目标网页；自动化浏览器会走该代理且使用隔离资料目录，不污染系统代理和用户正常浏览。" },
+  );
+  assert.equal(resolveMode({ mode: "auto" }, { _originalText: "抓任意 App 的 HTTPS 请求" }).mode, "system");
+  assert.equal(resolveMode({ mode: "background" }, { _originalText: "后台抓包等用户自己操作" }).systemProxy, false);
+  assert.equal(resolveMode({ systemProxy: true }, { _originalText: "抓包" }).mode, "system");
+  assert.equal(resolveMode({ systemProxy: false }, { _originalText: "抓包" }).mode, "isolated_browser");
+
+  assert.match(
+    browserCaptureIssue({ type: "browser", action: "navigate", url: "https://example.test" }, { _originalText: "打开网页抓真实接口，看请求从哪来" }, false),
+    /\[BLOCKED_PRECHECK\][\s\S]*capture_start\(\{mode:"isolated_browser"\}\)/,
+  );
+  assert.equal(
+    browserCaptureIssue({ type: "browser", action: "navigate" }, { _originalText: "打开网页抓真实接口", _captureStarted: true }, false),
+    "",
+    "once capture_start succeeded in this run, browser can produce the traffic",
+  );
+  assert.equal(
+    browserCaptureIssue({ type: "browser", action: "navigate" }, { _originalText: "打开网页抓真实接口" }, true),
+    "",
+    "an already-running capture proxy should also allow browser navigation",
+  );
+  assert.match(
+    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { _originalText: "登录并点击保存按钮，验证完整流程" }),
+    /单次无头 screenshot[\s\S]*browser 有头自动化/,
+  );
+  assert.equal(
+    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { _originalText: "看一下页面响应式截图和布局" }),
+    "",
+    "static visual checks should keep using headless screenshot",
+  );
+  assert.match(SRC, /capture_start\(mode:\\"isolated_browser\\"\)/);
+  assert.match(SRC, /mode: String\(args\.mode \|\| args\.capture_mode \|\| "auto"\)/);
+  assert.match(SRC, /模式：无痕\/隔离浏览器抓包/);
+  assert.match(SRC, /模式：后台抓包/);
 });
 
 test("dev-server discovery is scoped to the current run and workspace", () => {
