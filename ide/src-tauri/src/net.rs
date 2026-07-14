@@ -25,9 +25,14 @@ pub struct HttpResponse {
     ok: bool,
     status_text: String,
     headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect_url: Option<String>,
     body: String,
     truncated: bool,
     content_type: String,
+    body_encoding: String,
 }
 
 /// Block only the SSRF-only targets (link-local / cloud-metadata, multicast,
@@ -70,6 +75,103 @@ fn validate(url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
+fn header_value(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn redirect_target(base: &reqwest::Url, location: Option<&str>) -> Option<String> {
+    let location = location?.trim();
+    if location.is_empty() {
+        return None;
+    }
+    base.join(location).ok().map(|url| url.to_string())
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    for part in content_type.split(';').skip(1) {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("charset") {
+                let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn charset_from_meta(bytes: &[u8]) -> Option<String> {
+    let sample = &bytes[..bytes.len().min(4096)];
+    let lower = String::from_utf8_lossy(sample).to_lowercase();
+    let idx = lower.find("charset")?;
+    let tail = &lower[idx + "charset".len()..];
+    let eq = tail.find('=')?;
+    let mut value = tail[eq + 1..].trim_start();
+    if let Some(stripped) = value.strip_prefix('"').or_else(|| value.strip_prefix('\'')) {
+        value = stripped;
+    }
+    let charset: String = value
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect();
+    if charset.is_empty() {
+        None
+    } else {
+        Some(charset)
+    }
+}
+
+fn is_probably_textual(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    ct.starts_with("text/")
+        || ct.contains("json")
+        || ct.contains("xml")
+        || ct.contains("html")
+        || ct.contains("javascript")
+        || ct.contains("x-www-form-urlencoded")
+}
+
+fn decode_body_text(buf: Vec<u8>, content_type: &str) -> (String, String) {
+    let label = charset_from_content_type(content_type).or_else(|| charset_from_meta(&buf));
+    if let Some(label) = label {
+        if let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+            let (decoded, _, had_errors) = encoding.decode(&buf);
+            let name = if had_errors {
+                format!("{} (lossy)", encoding.name())
+            } else {
+                encoding.name().to_string()
+            };
+            return (decoded.into_owned(), name);
+        }
+    }
+    match String::from_utf8(buf) {
+        Ok(text) => (text, "UTF-8".into()),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            if is_probably_textual(content_type) {
+                (
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                    "UTF-8 (lossy)".into(),
+                )
+            } else {
+                (
+                    format!("[二进制响应，{} 字节，未作为文本返回]", bytes.len()),
+                    "binary".into(),
+                )
+            }
+        }
+    }
+}
+
 /// Call any HTTP API. `method` = GET/POST/PUT/PATCH/DELETE/HEAD. Optional headers
 /// and request body. Returns status + headers + body (text, truncated to 5 MB).
 #[tauri::command]
@@ -92,6 +194,7 @@ pub async fn http_request(
         .build()
         .map_err(|e| e.to_string())?;
 
+    let request_url = parsed.clone();
     let mut req = client
         .request(method, parsed)
         .header(reqwest::header::USER_AGENT, "Michael-IDE-Agent/1.0");
@@ -112,6 +215,8 @@ pub async fn http_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let redirect_location = header_value(resp.headers(), reqwest::header::LOCATION);
+    let redirect_url = redirect_target(&request_url, redirect_location.as_deref());
     let mut hmap = HashMap::new();
     for (k, v) in resp.headers().iter() {
         if let Ok(s) = v.to_str() {
@@ -132,22 +237,19 @@ pub async fn http_request(
         }
         buf.extend_from_slice(&chunk);
     }
-    let body_text = match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => format!(
-            "[二进制响应，{} 字节，未作为文本返回]",
-            e.into_bytes().len()
-        ),
-    };
+    let (body_text, body_encoding) = decode_body_text(buf, &content_type);
 
     Ok(HttpResponse {
         status: status.as_u16(),
         ok: status.is_success(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
         headers: hmap,
+        redirect_location,
+        redirect_url,
         body: body_text,
         truncated,
         content_type,
+        body_encoding,
     })
 }
 
@@ -356,22 +458,19 @@ pub async fn tor_request(
         }
         buf.extend_from_slice(&chunk);
     }
-    let body_text = match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => format!(
-            "[二进制响应，{} 字节，未作为文本返回]",
-            e.into_bytes().len()
-        ),
-    };
+    let (body_text, body_encoding) = decode_body_text(buf, &content_type);
 
     Ok(HttpResponse {
         status: status.as_u16(),
         ok: status.is_success(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
         headers: hmap,
+        redirect_location: None,
+        redirect_url: None,
         body: body_text,
         truncated,
         content_type,
+        body_encoding,
     })
 }
 
@@ -1021,5 +1120,36 @@ mod img_tests {
         // "Man" → "TWFu"
         assert_eq!(b64_decode("TWFu"), Some(b"Man".to_vec()));
         assert_eq!(b64_decode("aGVsbG8="), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn redirect_target_resolves_relative_location() {
+        let base = reqwest::Url::parse("https://www.4399.com/flash/5.htm").unwrap();
+        assert_eq!(
+            redirect_target(&base, Some("/flash/5_1.htm")).as_deref(),
+            Some("https://www.4399.com/flash/5_1.htm")
+        );
+        assert_eq!(
+            redirect_target(&base, Some("https://www.taptap.cn/app/1")).as_deref(),
+            Some("https://www.taptap.cn/app/1")
+        );
+    }
+
+    #[test]
+    fn decode_legacy_chinese_charsets() {
+        let (text, enc) =
+            decode_body_text(vec![0xD6, 0xD0, 0xCE, 0xC4], "text/html; charset=gb2312");
+        assert_eq!(text, "中文");
+        assert!(enc.contains("GB"));
+    }
+
+    #[test]
+    fn decode_charset_from_html_meta() {
+        let mut body = b"<html><head><meta charset=\"gbk\"></head><body>".to_vec();
+        body.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
+        body.extend_from_slice(b"</body></html>");
+        let (text, enc) = decode_body_text(body, "text/html");
+        assert!(text.contains("中文"));
+        assert!(enc.contains("GB"));
     }
 }

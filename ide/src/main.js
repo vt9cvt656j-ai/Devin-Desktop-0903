@@ -17469,6 +17469,15 @@ function _blockedToolRecoveryInstruction(content, call = null) {
     return mk("http_api_preflight", "EVIDENCE_BEFORE_HTTP",
       `不要继续换相似 /api、/v1、appapi 路径硬撞。下一步先取证：查官方文档/页面源码/公开接口说明，或用 capture_start 后实际操作目标页面/App，再用 capture_flows 找真实请求；拿到真实 URL、query、header/cookie/签名来源后再 http_request。`);
   }
+  if (/\[BLOCKED_HTTP_REDIRECT\]/i.test(text)) {
+    const redirected = text.match(/redirect_url:\s*(https?:\/\/[^\s)\]"'<>`,]+)/i)?.[1]
+      || text.match(/Location:\s*(https?:\/\/[^\s)\]"'<>`,]+)/i)?.[1]
+      || "";
+    return mk("http_redirect", "FOLLOW_HTTP_REDIRECT",
+      redirected
+        ? `301/302/303/307/308 是跳转中间态，不是最终数据。下一步只跟随工具返回的 redirect_url：${redirected}；301/302/303 通常改用 GET，307/308 保持原 method/body。跟随后必须核对最终 200/JSON/HTML，别换相似 URL 硬拼。`
+        : `这是跳转中间态但没有可用 Location。下一步先看响应头/cookie/抓包证据，或用 browser/capture 走真实页面流程；不要把 301/302 响应体当最终数据，也不要换相似 URL 硬拼。`);
+  }
   if (/\[BLOCKED_PRECHECK\].*需要真实网络请求证据.*还没启动抓包/i.test(text)) {
     return mk("browser_capture_preflight", "START_CAPTURE_BEFORE_BROWSER",
       `先启动抓包再产生流量：网页/浏览器默认 capture_start({mode:"isolated_browser"})，然后 browser navigate(fresh:true) 操作页面，最后 capture_flows 读真实请求；任意 App/全系统才用 capture_start({mode:"system"})。`);
@@ -17864,7 +17873,8 @@ function _externalHttpPreflightIssue(call, run = null, messages = []) {
 function _rememberHttpEvidenceFromTool(run, call, result) {
   if (!run || !call || !result) return;
   const content = String(result.content || "");
-  if (/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|DENIED|不可用|未执行)[^\]\n]{0,80}\]/i.test(content)) return;
+  const isRedirectEvidence = (call.type === "http" || call.type === "capture_replay") && Number(result.status) >= 300 && Number(result.status) < 400 && !!result.redirectUrl;
+  if (!isRedirectEvidence && /\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|DENIED|不可用|未执行)[^\]\n]{0,80}\]/i.test(content)) return;
   const evidenceTypes = new Set([
     "web", "websearch", "http", "capture_flows", "capture_replay", "browser",
     "developer_community_search", "github_search", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
@@ -17873,6 +17883,10 @@ function _rememberHttpEvidenceFromTool(run, call, result) {
   run._httpEvidenceUrls = run._httpEvidenceUrls || new Set();
   if (call.type === "http" && result.ok === true && call.url) {
     const canonical = _canonicalHttpEvidenceUrl(call.url, true);
+    if (canonical) run._httpEvidenceUrls.add(canonical);
+  }
+  if (isRedirectEvidence) {
+    const canonical = _canonicalHttpEvidenceUrl(result.redirectUrl, true);
     if (canonical) run._httpEvidenceUrls.add(canonical);
   }
   const urls = content.match(/https?:\/\/[^\s)\]"'<>`,]+/g) || [];
@@ -17951,6 +17965,27 @@ function _screenshotModePreflightIssue(call, run = null) {
   if (modeSignals.staticVisual && !modeSignals.needsCapture) return "";
   return `[BLOCKED_PRECHECK] 这轮目标包含登录/点击/填表/验证码/会话等交互，单次无头 screenshot 只能看静态渲染，不能证明流程成功。` +
     `请改用 browser 有头自动化：browser navigate(fresh:true) → nodes/check → click/type/assert；如果还要找真实接口，先 capture_start({mode:"isolated_browser"}) 再打开页面。`;
+}
+
+function _httpRedirectBlock(method, url, response) {
+  const status = Number(response?.status);
+  if (!Number.isFinite(status) || status < 300 || status >= 400) return "";
+  const headers = response?.headers && typeof response.headers === "object" ? response.headers : {};
+  const headerLocation = headers.location || headers.Location || headers.LOCATION || "";
+  const location = String(response?.redirect_location || headerLocation || "").trim();
+  let redirectUrl = String(response?.redirect_url || "").trim();
+  if (!redirectUrl && location) {
+    try { redirectUrl = new URL(location, url).toString(); } catch {}
+  }
+  const target = /^https?:\/\//i.test(redirectUrl) ? redirectUrl : "";
+  const originalMethod = String(method || "GET").toUpperCase();
+  const nextMethod = status === 307 || status === 308 ? originalMethod : "GET";
+  return `[BLOCKED_HTTP_REDIRECT] HTTP ${status} 是重定向中间态，不是最终数据；不要把 301/302 的响应体当内容，也不要继续换相似 URL 硬拼。\n` +
+    `Location: ${location || "(响应头没有 Location)"}\n` +
+    `redirect_url: ${redirectUrl || "(无法解析为绝对 URL)"}\n` +
+    (target
+      ? `下一步：用 ${nextMethod} 请求 redirect_url（${target}），${status === 307 || status === 308 ? "保持原 method/body/关键 headers" : "301/302/303 按浏览器语义通常改 GET，必要 cookie/header 继续带上"}；拿到最终 2xx 后再解析数据。`
+      : `下一步：先检查响应头、Cookie/登录态或用 capture_start + browser 走真实页面流程拿最终 URL。`);
 }
 
 function _captureFlowsEmptyMessage(run = null, filter = "", total = 0, running = false, port = 8080, currentMode = "auto") {
@@ -24858,8 +24893,9 @@ async function _executeToolStep(step, call, root, run) {
         res.textContent = r ? `${r.status} ${r.status_text || ""}`.trim() : "无响应";
         const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
         const bodyPreview = (r && r.body || "").slice(0, 4000);
-        if (vp) vp.innerHTML = `<pre>${_escHtml(`${call.method} ${call.url}\n→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\n${r ? (r.content_type || "") : ""}\n\n${bodyPreview}`)}</pre>`;
-        return { type: "http", path: call.url, ok, status: Number(r?.status), content: `${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        const redirectBlock = _httpRedirectBlock(call.method, call.url, r);
+        if (vp) vp.innerHTML = `<pre>${_escHtml(`${call.method} ${call.url}\n→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\n${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.body_encoding : ""}${redirectBlock ? "\n\n" + redirectBlock : ""}\n\n${bodyPreview}`)}</pre>`;
+        return { type: "http", path: call.url, ok, status: Number(r?.status), redirectUrl: r?.redirect_url || "", content: `${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 240);
         res.className = "atc-result atc-result--err"; res.textContent = "请求失败";
@@ -24876,8 +24912,8 @@ async function _executeToolStep(step, call, root, run) {
         res.textContent = r ? `🧅 ${r.status} ${r.status_text || ""}`.trim() : "无响应";
         const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
         const bodyPreview = (r && r.body || "").slice(0, 4000);
-        if (vp) vp.innerHTML = `<pre>${_escHtml(`🧅 Tor ${call.method} ${call.url}\n→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\n${r ? (r.content_type || "") : ""}\n\n${bodyPreview}`)}</pre>`;
-        return { type: "tor", path: call.url, content: `🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        if (vp) vp.innerHTML = `<pre>${_escHtml(`🧅 Tor ${call.method} ${call.url}\n→ ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\n${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.body_encoding : ""}\n\n${bodyPreview}`)}</pre>`;
+        return { type: "tor", path: call.url, content: `🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = "Tor 请求失败";
@@ -25017,7 +25053,8 @@ async function _executeToolStep(step, call, root, run) {
         const hdrs = r && r.headers ? Object.entries(r.headers).slice(0, 20).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
         res.className = (r && r.ok) ? "atc-result atc-result--ok" : "atc-result atc-result--err";
         res.textContent = r ? `${r.status} ${r.status_text || ""}`.trim() : "无响应";
-        return { type: "capture_replay", path: url, content: `重发 ${method} ${url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
+        const redirectBlock = _httpRedirectBlock(method, url, r);
+        return { type: "capture_replay", path: url, ok: !!(r && r.ok), status: Number(r?.status), redirectUrl: r?.redirect_url || "", content: `重发 ${method} ${url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}${redirectBlock ? `\n${redirectBlock}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "重发失败";
         return { type: "capture_replay", path: url, content: `[失败] 重发出错: ${String(e?.message || e).slice(0, 200)}（内网地址允许，169.254.x.x 被禁）` };

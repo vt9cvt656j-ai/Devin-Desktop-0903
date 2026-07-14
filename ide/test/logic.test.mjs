@@ -244,6 +244,10 @@ test("blocked tool failures produce concrete recovery instructions", () => {
     /\[RECOVERY:EVIDENCE_BEFORE_HTTP\][\s\S]*capture_start[\s\S]*capture_flows/,
   );
   assert.match(
+    recover("[BLOCKED_HTTP_REDIRECT] HTTP 302 是重定向中间态。\nLocation: /next\nredirect_url: https://example.test/next", { type: "http", url: "https://example.test/old" }).text,
+    /\[RECOVERY:FOLLOW_HTTP_REDIRECT\][\s\S]*https:\/\/example\.test\/next[\s\S]*301\/302\/303/,
+  );
+  assert.match(
     recover("[BLOCKED_PRECHECK] 这轮任务需要真实网络请求证据，但还没启动抓包。", { type: "browser", action: "navigate" }).text,
     /\[RECOVERY:START_CAPTURE_BEFORE_BROWSER\][\s\S]*isolated_browser[\s\S]*capture_flows/,
   );
@@ -4188,6 +4192,10 @@ test("external HTTP preflight blocks guessed public APIs but preserves evidenced
     _looksLikeGuessedExternalApiUrl: looksGuessed,
     _httpUrlHasEvidence: hasEvidence,
   });
+  const remember = load("_rememberHttpEvidenceFromTool", {
+    _canonicalHttpEvidenceUrl: canonical,
+  });
+  const redirectBlock = load("_httpRedirectBlock");
 
   const guessed4399 = { type: "http", method: "GET", url: "https://appapi.4399.cn/v1/games/list" };
   assert.equal(looksGuessed(guessed4399), true);
@@ -4207,6 +4215,26 @@ test("external HTTP preflight blocks guessed public APIs but preserves evidenced
   ]), "", "host + path from a tool result is enough evidence even when the full URL is split");
   assert.equal(issue({ type: "http", method: "GET", url: "https://api.github.com/repos/openai/codex" }, {}, []), "",
     "well-known stable public APIs should not be blocked just because the host starts with api");
+  assert.match(
+    redirectBlock("POST", "https://example.test/old", { status: 302, redirect_location: "/new", redirect_url: "https://example.test/new" }),
+    /\[BLOCKED_HTTP_REDIRECT\][\s\S]*redirect_url: https:\/\/example\.test\/new[\s\S]*用 GET 请求/,
+  );
+  assert.match(
+    redirectBlock("GET", "https://example.test/path/old", { status: 301, headers: { location: "../new" } }),
+    /redirect_url: https:\/\/example\.test\/new[\s\S]*用 GET 请求/,
+  );
+  assert.match(
+    redirectBlock("POST", "https://example.test/old", { status: 307, redirect_location: "/new", redirect_url: "https://example.test/new" }),
+    /用 POST 请求[\s\S]*保持原 method\/body/,
+  );
+  const redirectRun = {};
+  remember(redirectRun, { type: "http", url: "https://example.test/old" }, {
+    status: 302,
+    redirectUrl: "https://example.test/new?from=old",
+    content: "[BLOCKED_HTTP_REDIRECT] redirect_url: https://example.test/new?from=old",
+  });
+  assert.ok(redirectRun._httpEvidenceUrls.has("https://example.test/new?from=old"),
+    "redirect_url returned by a 3xx response is real evidence for the next request");
   assert.match(SRC, /_externalHttpPreflightIssue\(call, run, messages\)/);
   assert.match(SRC, /预检拦截 · 未请求/);
   assert.match(SRC, /公网 API 不要凭感觉拼/);

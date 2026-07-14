@@ -599,6 +599,15 @@ fn is_dead_browser(e: &str) -> bool {
         || s.contains("browser process")
 }
 
+fn is_navigation_wait_timeout(e: &str) -> bool {
+    let s = e.to_lowercase();
+    s.contains("event waited for never came")
+        || s.contains("waited for never came")
+        || s.contains("timed out waiting")
+        || s.contains("timeout while waiting")
+        || s.contains("navigation timeout")
+}
+
 /// Open a URL (launches the browser on first use).
 #[tauri::command]
 pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
@@ -625,8 +634,25 @@ pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
     };
     with_tab(move |tab| {
         tab.navigate_to(&url).map_err(|e| e.to_string())?;
-        tab.wait_until_navigated().map_err(|e| e.to_string())?;
-        Ok(None)
+        match tab.wait_until_navigated() {
+            Ok(_) => Ok(None),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_navigation_wait_timeout(&msg) {
+                    // Old / redirected / non-UTF8 pages sometimes never emit the lifecycle event
+                    // headless_chrome waits for, even though Chrome has a usable DOM. Returning a
+                    // snapshot is far better evidence than failing the whole card and making the
+                    // model retry random URLs.
+                    std::thread::sleep(Duration::from_millis(900));
+                    Ok(Some(format!(
+                        "[NAVIGATION_WAIT_TIMEOUT] 页面没有发出完整导航完成事件，已改为读取当前 DOM/截图继续验证；不要把这当成 URL 错误，先看当前 url/title/text/nodes。原始错误: {}",
+                        msg.chars().take(180).collect::<String>()
+                    )))
+                } else {
+                    Err(msg)
+                }
+            }
+        }
     })
     .await
 }
@@ -1092,5 +1118,16 @@ mod tests {
             stringify_eval_result(Some(serde_json::json!({"healthy": true})), None),
             r#"{"healthy":true}"#
         );
+    }
+
+    #[test]
+    fn navigation_wait_timeout_is_recoverable() {
+        assert!(is_navigation_wait_timeout(
+            "The event waited for never came"
+        ));
+        assert!(is_navigation_wait_timeout(
+            "navigation timeout after 30000 ms"
+        ));
+        assert!(!is_navigation_wait_timeout("DNS resolution failed"));
     }
 }
