@@ -11715,6 +11715,14 @@ const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test au
 // Fast fallback used while the model-based intent classifier is still resolving.
 // Project-wide, implementation, and debugging requests must never be squeezed into
 // the short conversational budget.
+function _looksBugFixTask(text) {
+  return /(?:bug|bugs|debug|diagnos|fix|repair|regression|crash|failed|failure|error|exception|traceback|stack trace|broken|not working|doesn't work|报错|错误|异常|失败|崩溃|闪退|修复|修一下|改好|定位|根因|复现|排查|问题|不对|不行|不能用|用不了|不显示|没显示|空白|空的|没内容|卡住|死循环|参数不全)/i.test(String(text || ""));
+}
+
+function _looksUIBuildTask(text) {
+  return /(?:UI|UX|frontend|front-end|page|layout|style|css|tailwind|shadcn|radix|component|responsive|viewport|browser|screenshot|页面|界面|前端|样式|布局|配色|按钮|弹窗|组件|响应式|浏览器|截图|落地页|官网|表单|卡片)/i.test(String(text || ""));
+}
+
 function _looksQuickAsk(text) {
   const t = String(text || "").trim();
   if (!t || t.length > 240) return false;
@@ -11740,7 +11748,12 @@ function _agentMustUseWorkspaceTools(text, root = "", active = "") {
   const activeFile = active || (typeof activePath === "string" ? activePath : "");
   const hasWorkspace = !!(root || activeFile || (Array.isArray(workspaceRoots) && workspaceRoots.length));
   if (!hasWorkspace) return false;
-  if (_looksBugFixTask(t) || _looksUIBuildTask(t)) return true;
+  // Keep this classifier self-contained. It is used before the first agent turn
+  // and is also extracted by tests; depending on separately injected helpers can
+  // turn a routing guard into a runtime crash ("Can't find variable ...").
+  const bugLike = /(?:bug|bugs|debug|diagnos|fix|repair|regression|crash|failed|failure|error|exception|traceback|stack trace|broken|not working|doesn't work|报错|错误|异常|失败|崩溃|闪退|修复|修一下|改好|定位|根因|复现|排查|问题|不对|不行|不能用|用不了|不显示|没显示|空白|空的|没内容|卡住|死循环|参数不全)/i.test(t);
+  const uiLike = /(?:UI|UX|frontend|front-end|page|layout|style|css|tailwind|shadcn|radix|component|responsive|viewport|browser|screenshot|页面|界面|前端|样式|布局|配色|按钮|弹窗|组件|响应式|浏览器|截图|落地页|官网|表单|卡片)/i.test(t);
+  if (bugLike || uiLike) return true;
   if (/(?:当前|这个|这份|这里|打开的|选中的|上面|刚才|该|此).{0,12}(?:文件|代码|项目|目录|数据|JSON|json|页面|组件|接口|字段|链接|URL|url|报错|问题)|(?:current|this|open|selected)\s+(?:file|code|project|repo|folder|json|page|component|api|field|url|error|issue)/i.test(t)) return true;
   if (/(?:项目|工程|代码库|仓库|目录|文件夹|当前文件|这个文件|打开文件|data\/|src\/|package\.json|README|json|\.json|\.js|\.ts|\.tsx|\.vue|\.rs|\.py|接口|字段|链接|URL|url|抓包|爬虫|直播|评论|定位|验证|复现|诊断|报错|bug|Bug|失败|不显示|没更新|没写|空文件|内容为空)/i.test(t)) return true;
   if (activeFile && /^(?:空(?:的)?|没(?:有)?内容|没有抓到|没有写|没写|不对|不行|不显示|为啥|为什么|怎么|咋|啥情况|看看|看下|检查|定位|修|修复|验证|跑一下|真的假的|真的是?|傻|垃圾)/i.test(t)) return true;

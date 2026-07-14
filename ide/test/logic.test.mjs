@@ -3782,8 +3782,6 @@ test("dynamic URLs and third-party fields require real evidence instead of guess
 
 test("Agent mode does not downgrade workspace-scoped short messages into quick chat", () => {
   const mustUseTools = load("_agentMustUseWorkspaceTools", {
-    _looksBugFixTask: () => false,
-    _looksUIBuildTask: () => false,
     activePath: "/repo/data/comments/room.json",
     workspaceRoots: ["/repo"],
   });
@@ -3793,6 +3791,10 @@ test("Agent mode does not downgrade workspace-scoped short messages into quick c
   assert.equal(mustUseTools("你好", "/repo", "/repo/data/comments/room.json"), false);
   assert.match(SRC, /const _mustUseWorkspaceTools = run\.mode === "agent" && _agentMustUseWorkspaceTools\(task, root\)/,
     "agent loop must explicitly classify workspace-scoped short turns");
+  assert.match(SRC, /function _looksBugFixTask\(text\)/,
+    "bug-fix quick detection helper must exist at runtime");
+  assert.match(SRC, /function _looksUIBuildTask\(text\)/,
+    "UI quick detection helper must exist at runtime");
   assert.match(SRC, /!\s*_mustUseWorkspaceTools/,
     "quick detection must be disabled when Agent needs workspace tools");
   assert.match(SRC, /\[AGENT_MODE_TOOL_REQUIRED\]/,
