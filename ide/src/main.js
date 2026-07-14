@@ -14863,10 +14863,17 @@ function _recoverableInvalidToolCalls(attempts, seen = new Set()) {
     const args = _normalizeArgKeys(parsed);
     const path = typeof args.path === "string" ? args.path.trim() : "";
     const issue = String(attempt?.issue || "").trim();
+    // Missing edit anchors can be repaired by reading the target file. Missing
+    // write_file.content cannot: for a new file there is nothing to read, and for
+    // an existing file the model still must supply the complete replacement body.
+    // Auto-reading path-only writes produced a second useless "cannot stat" card
+    // for brand-new files, then the agent stalled at 0/N. So write_file repairs
+    // are instruction-only; never synthesize a read_file for them.
     const fileArgFailure =
-      (canonical === "write_file" && /(?:缺少\s*content|content\s*(?:字段)?(?:缺失|为空)|content.*(?:缺少|为空)|内容为空)/i.test(issue)) ||
-      (canonical === "edit_file" && /(?:old_string|new_string|旧文本|新文本|替换文本)/i.test(issue)) ||
-      (canonical === "multi_edit" && /(?:edits|old_string|new_string|编辑项|为空)/i.test(issue));
+      canonical !== "write_file" && (
+        (canonical === "edit_file" && /(?:old_string|new_string|旧文本|新文本|替换文本)/i.test(issue)) ||
+        (canonical === "multi_edit" && /(?:edits|old_string|new_string|编辑项|为空)/i.test(issue))
+      );
     if (!path || !fileArgFailure) continue;
     const key = `${canonical}:${path}`;
     if (seen.has(key)) continue;
@@ -14935,9 +14942,15 @@ function _invalidToolRepairInstruction(attempts, recoveryCalls = [], registry = 
   const recoveredPaths = [...new Set((Array.isArray(recoveryCalls) ? recoveryCalls : [])
     .map((call) => call?._invalidRepair?.path || call?.parsedArgs?.path)
     .filter(Boolean))];
+  const hasWriteContentIssue = list.some((attempt) => {
+    const canonical = _canonicalToolName(String(attempt?.name || "")) || String(attempt?.name || "");
+    return canonical === "write_file" && /(?:缺少\s*content|content\s*(?:字段)?(?:缺失|为空)|content.*(?:缺少|为空)|内容为空)/i.test(String(attempt?.issue || ""));
+  });
   const recovery = recoveredPaths.length
     ? `IDE 已自动补救读取这些目标文件：${recoveredPaths.join("、")}。下一步基于刚刚 read_file 的真实内容继续：修改已有文件用 edit_file / multi_edit；只有确认是新文件时才用 write_file，并且同一次调用必须带完整非空 content。`
-    : "下一步不要重复同一个残缺工具调用。先补齐缺失参数；如果要修改已有文件，先 read_file 读取当前版本，再用 edit_file / multi_edit；如果要新建文件，write_file 必须一次带完整非空 content。";
+    : (hasWriteContentIssue
+      ? "下一步不要 read_file 这个可能尚不存在的新文件，也不要重复残缺 write_file。直接重新调用 write_file，并在同一次调用里带上精确 path 和完整非空 content；如果其实是在改已有文件，先 read_file 读取当前版本后改用 edit_file / multi_edit。"
+      : "下一步不要重复同一个残缺工具调用。先补齐缺失参数；如果要修改已有文件，先 read_file 读取当前版本，再用 edit_file / multi_edit；如果要新建文件，write_file 必须一次带完整非空 content。");
   const hints = (typeof _toolRepairHints === "function") ? _toolRepairHints(list, registry) : [];
   const schemaLine = hints.length ? `\n当前工具 schema 要求：${hints.join("；")}。字段名必须照这个写，别用空对象、别漏必填字段。` : "";
   return `上一轮工具参数不完整，IDE 已拒绝执行，未产生副作用：\n${bad}${schemaLine}\n${recovery}`;
@@ -17879,7 +17892,7 @@ function _staticToolNames() {
   return __staticToolNames;
 }
 
-async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = null, body, session, ideMode, skillsBlock = "", narrativeSeen = null }) {
+async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = null, body, session, ideMode, skillsBlock = "", narrativeSeen = null, renderRejectedToolAttempts = true }) {
   // Final defensive bound: every provider turn sees one total static+runtime tool window.
   _applyToolPayloadWindow(toolSchemas);
   // `session` owns this turn — interrupt checks read session.streaming, and the
@@ -18174,7 +18187,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   settleReasoning(); // final markdown render + collapse the thinking once the turn settles
   _mergeTrailingThinkCards(body); // fold a run of consecutive think-cards into one (no card pile)
   _removeAllThinking(body);
-  if (fatalToolArgIssue || fatalRejectedToolAttempts.length) {
+  if (renderRejectedToolAttempts && (fatalToolArgIssue || fatalRejectedToolAttempts.length)) {
     _renderRejectedToolAttempts(body, fatalRejectedToolAttempts, fatalToolArgIssue || "工具调用流异常中断");
   }
 
@@ -20286,7 +20299,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         _selfMemMsg = { role: "user", content: _parts.join("\n") };
         messages.push(_selfMemMsg);
       }
-      let turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen });
+      let turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen, renderRejectedToolAttempts: false });
       if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
       // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
       // calls (writing files / running commands). Previously the loop only re-checked _live()

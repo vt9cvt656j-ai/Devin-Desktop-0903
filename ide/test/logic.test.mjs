@@ -566,29 +566,19 @@ test("invalid file mutation arguments recover by reading target context once", (
   });
   const instruction = load("_invalidToolRepairInstruction", {
     _safeJsonLoose: safeJson,
+    _canonicalToolName: (name) => name,
     _normalizeArgKeys: normalizeKeys,
     _toolRepairHints: repairHints,
   });
-  const attempts = [{
+  const writeAttempts = [{
     name: "write_file",
     argsRaw: '{"path":"package.json","content":""}',
     parsedArgs: { path: "package.json", content: "" },
     issue: "write_file 的 content 为空",
   }];
-  const seen = new Set();
-  const calls = recover(attempts, seen);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, "read_file");
-  assert.deepEqual(calls[0].parsedArgs, { path: "package.json" });
-  assert.match(calls[0].argsRaw, /package\.json/);
-  assert.deepEqual(calls[0]._invalidRepair, {
-    name: "write_file",
-    path: "package.json",
-    issue: "write_file 的 content 为空",
-  });
-  assert.equal(recover(attempts, seen).length, 0, "same invalid path should not auto-read forever");
-  assert.equal(recover([{ name: "run_cmd", parsedArgs: {}, argsRaw: "{}", issue: "run_cmd 缺少 command" }], new Set()).length, 0);
-  const registry = [{
+  assert.equal(recover(writeAttempts, new Set()).length, 0,
+    "path-only/empty write_file is not recoverable by reading a possibly-new file");
+  const writeMsg = instruction(writeAttempts, [], [{
     type: "function",
     function: {
       name: "write_file",
@@ -598,10 +588,44 @@ test("invalid file mutation arguments recover by reading target context once", (
         required: ["path", "content"],
       },
     },
+  }]);
+  assert.match(writeMsg, /write_file 必填 path:string, content:string/);
+  assert.match(writeMsg, /不要 read_file 这个可能尚不存在的新文件/);
+  assert.match(writeMsg, /完整非空 content/);
+
+  const attempts = [{
+    name: "edit_file",
+    argsRaw: '{"path":"package.json","new_string":"{}"}',
+    parsedArgs: { path: "package.json", new_string: "{}" },
+    issue: "edit_file 缺少 old_string",
+  }];
+  const seen = new Set();
+  const calls = recover(attempts, seen);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "read_file");
+  assert.deepEqual(calls[0].parsedArgs, { path: "package.json" });
+  assert.match(calls[0].argsRaw, /package\.json/);
+  assert.deepEqual(calls[0]._invalidRepair, {
+    name: "edit_file",
+    path: "package.json",
+    issue: "edit_file 缺少 old_string",
+  });
+  assert.equal(recover(attempts, seen).length, 0, "same invalid path should not auto-read forever");
+  assert.equal(recover([{ name: "run_cmd", parsedArgs: {}, argsRaw: "{}", issue: "run_cmd 缺少 command" }], new Set()).length, 0);
+  const registry = [{
+    type: "function",
+    function: {
+      name: "edit_file",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
   }];
   const msg = instruction(attempts, calls, registry);
   assert.match(msg, /参数不完整/);
-  assert.match(msg, /write_file 必填 path:string, content:string/);
+  assert.match(msg, /edit_file 必填 path:string, old_string:string, new_string:string/);
   assert.match(msg, /已自动补救读取/);
   assert.match(msg, /edit_file \/ multi_edit/);
   assert.match(msg, /完整非空 content/);
@@ -613,6 +637,8 @@ test("invalid file mutation arguments recover by reading target context once", (
     "invalid tool arguments should get a bounded schema-repair retry before loop-level recovery");
   assert.match(SRC, /按 schema 自动修复重试/,
     "retry toast should explain schema repair instead of a brittle fixed 1\/2 counter");
+  assert.match(SRC, /renderRejectedToolAttempts: false/,
+    "agent loop should recover invalid tool arguments before rendering red rejected cards");
 });
 
 test("mutating native and text tool calls fail closed on any non-strict or truncated arguments", () => {
