@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as acorn from "acorn";
 import exifr from "exifr";
+import { stripToolIp } from "../build/strip-tool-ip.mjs";
 import { ConversationMemory, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -478,6 +479,15 @@ test("_buildRepoMap builds a per-file symbol map from the index, query-boosted +
   assert.ok(out.indexOf("src/auth.js") < out.indexOf("src/main.js"), "query-relevant file ranks first");
   // empty index → empty string (graceful before the background index builds):
   assert.equal(load("_buildRepoMap", { _symbolIndex: new Map() })("x", 6000), "");
+});
+
+test("stripToolIp handles Windows CRLF checkouts", () => {
+  const lf = stripToolIp(SRC);
+  const crlf = stripToolIp(SRC.replace(/\n/g, "\r\n"));
+  assert.equal(lf.found, true);
+  assert.equal(crlf.found, true);
+  assert.equal(crlf.changed, lf.changed);
+  assert.match(crlf.code, /\r\n/);
 });
 
 test("_safeJsonLoose repairs malformed \\u escapes (the 'unexpected end of hex escape' bug)", () => {

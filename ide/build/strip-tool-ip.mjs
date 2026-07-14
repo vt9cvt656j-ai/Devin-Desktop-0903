@@ -59,7 +59,8 @@ function blankDescriptionsInLine(line) {
 }
 
 export function stripToolIp(source) {
-  const lines = source.split("\n");
+  const newline = source.includes("\r\n") ? "\r\n" : "\n";
+  const lines = source.split(/\r?\n/);
   const start = lines.findIndex((l) => l.startsWith(FN_MARKER));
   if (start === -1) return { code: source, changed: 0, found: false };
   let end = -1;
@@ -79,5 +80,5 @@ export function stripToolIp(source) {
       lines[i] = next;
     }
   }
-  return { code: lines.join("\n"), changed, found: true };
+  return { code: lines.join(newline), changed, found: true };
 }
