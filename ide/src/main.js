@@ -11728,6 +11728,25 @@ function _looksQuickAsk(text) {
   return isQuestion || tinyAction;
 }
 
+// Agent means "use the workspace/tool substrate", not "answer from vibes". Short,
+// angry, or elliptical messages often refer to the selected file/project ("空的?",
+// "怎么又不行?", "定位失败根因") and previously slipped through the quick-chat
+// budget path. If a real workspace/active file exists and the text points at it,
+// the first agent turn must obtain tool evidence (read/list/search/diagnostics)
+// before wrapping up.
+function _agentMustUseWorkspaceTools(text, root = "", active = "") {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  const activeFile = active || (typeof activePath === "string" ? activePath : "");
+  const hasWorkspace = !!(root || activeFile || (Array.isArray(workspaceRoots) && workspaceRoots.length));
+  if (!hasWorkspace) return false;
+  if (_looksBugFixTask(t) || _looksUIBuildTask(t)) return true;
+  if (/(?:当前|这个|这份|这里|打开的|选中的|上面|刚才|该|此).{0,12}(?:文件|代码|项目|目录|数据|JSON|json|页面|组件|接口|字段|链接|URL|url|报错|问题)|(?:current|this|open|selected)\s+(?:file|code|project|repo|folder|json|page|component|api|field|url|error|issue)/i.test(t)) return true;
+  if (/(?:项目|工程|代码库|仓库|目录|文件夹|当前文件|这个文件|打开文件|data\/|src\/|package\.json|README|json|\.json|\.js|\.ts|\.tsx|\.vue|\.rs|\.py|接口|字段|链接|URL|url|抓包|爬虫|直播|评论|定位|验证|复现|诊断|报错|bug|Bug|失败|不显示|没更新|没写|空文件|内容为空)/i.test(t)) return true;
+  if (activeFile && /^(?:空(?:的)?|没(?:有)?内容|没有抓到|没有写|没写|不对|不行|不显示|为啥|为什么|怎么|咋|啥情况|看看|看下|检查|定位|修|修复|验证|跑一下|真的假的|真的是?|傻|垃圾)/i.test(t)) return true;
+  return false;
+}
+
 // A bare location statement is context, not a request to geocode, browse, or find
 // nearby businesses. Keep this deliberately narrow so real queries such as
 // "我在上海，附近吃什么" still use current structured data.
@@ -20804,7 +20823,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // budget (don't waste tokens on trivia); a "重构 / refactor / 实现整套 / build a
   // full X" gets a larger one (less mid-run scrambling for extensions).
   let budget = _initialBudget(task, run.stack), extensions = 0;
-  const _quick = () => task.trim().length < 80 && !run.engineering?.applies;
+  const _mustUseWorkspaceTools = run.mode === "agent" && _agentMustUseWorkspaceTools(task, root);
+  const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceTools;
   const _pad = { goal: (task || "").slice(0, 200), requirements: run._requirementsChecklist, modified: new Map(), errors: [], findings: [], done: [] };
   // 真·多智能体上下文协议：把这张运行草稿纸挂到 run 上（run 已经会传进每个子智能体/worker）。
   // 于是子智能体开局就读得到「目标＋已读文件＋已改文件＋已知发现」(_sharedCtxDigest)，并把自己
@@ -20813,6 +20833,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
   run.ctx = _pad;
   _hydrateRunContextEvidence(run, root, run._pendingContextEvidence);
+  if (_mustUseWorkspaceTools) {
+    messages.push({
+      role: "user",
+      content: "[AGENT_MODE_TOOL_REQUIRED]\n用户当前选择的是 Agent 模式，本轮问题指向当前文件/项目/真实运行状态。必须先调用真实工具取得证据（read_file/list_dir/search/get_diagnostics/run_cmd/browser/automation 中最直接的一个或几个），再回答或修改；不要只根据聊天记忆、可见片段或猜测收尾。",
+    });
+  }
   function _padText() {
     const includeRequirements = _shouldIncludeRequirementsInPad(run, _pad);
     if (!includeRequirements && !_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length && !_pad.filesRead.size) return "";
@@ -21033,7 +21059,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // should be reading files / searching / planning, not writing prose. Force it.
         if (!_quick() && iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
           toolFirstNudges++;
-          const _nudgeMsg = "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；大任务再 update_plan，然后开始 edit/write/run。不要继续只输出说明文字。";
+          const _nudgeMsg = _mustUseWorkspaceTools
+            ? "这是 Agent 模式，而且用户问题指向当前文件/项目/真实状态。不能只输出说明文字，也不能凭聊天记忆判断。立刻使用真实工具拿证据：目标文件已知就 read_file，当前目录/文件未知就 list_dir/search 定位；涉及报错/空文件/不显示/验证就读取真实文件、诊断或运行结果后再回答。"
+            : "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；大任务再 update_plan，然后开始 edit/write/run。不要继续只输出说明文字。";
           messages.push({ role: "user", content: _nudgeMsg });
           continue;
         }

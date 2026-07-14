@@ -3780,6 +3780,25 @@ test("dynamic URLs and third-party fields require real evidence instead of guess
     "plans must explicitly ban URL-rule guessing before real capture");
 });
 
+test("Agent mode does not downgrade workspace-scoped short messages into quick chat", () => {
+  const mustUseTools = load("_agentMustUseWorkspaceTools", {
+    _looksBugFixTask: () => false,
+    _looksUIBuildTask: () => false,
+    activePath: "/repo/data/comments/room.json",
+    workspaceRoots: ["/repo"],
+  });
+  assert.equal(mustUseTools("空的傻逼吧", "/repo", "/repo/data/comments/room.json"), true);
+  assert.equal(mustUseTools("定位失败根因", "/repo", "/repo/src/main.js"), true);
+  assert.equal(mustUseTools("当前文件为什么没内容？", "/repo", "/repo/data/comments/room.json"), true);
+  assert.equal(mustUseTools("你好", "/repo", "/repo/data/comments/room.json"), false);
+  assert.match(SRC, /const _mustUseWorkspaceTools = run\.mode === "agent" && _agentMustUseWorkspaceTools\(task, root\)/,
+    "agent loop must explicitly classify workspace-scoped short turns");
+  assert.match(SRC, /!\s*_mustUseWorkspaceTools/,
+    "quick detection must be disabled when Agent needs workspace tools");
+  assert.match(SRC, /\[AGENT_MODE_TOOL_REQUIRED\]/,
+    "Agent mode must inject a tool-required instruction before the first model turn");
+});
+
 test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {
   const extract = load("_extractRequirementsChecklist");
   const requiresPlan = load("_runRequiresPlan");
