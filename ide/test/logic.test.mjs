@@ -510,9 +510,45 @@ test("_fileToolArgIssue rejects incomplete writes but permits complete writes an
   assert.equal(issue("edit_file", '{"path":"src/a.js","old_string":"remove me","new_string":""}'), "");
 });
 
+test("_normalizeArgKeys accepts common model aliases for tool parameters", () => {
+  const normalize = load("_normalizeArgKeys");
+  const args = normalize({
+    filePath: "src/a.js",
+    oldString: "before",
+    newString: "after",
+    changes: [{ old_string: "x", new_string: "y" }],
+    plan: [{ content: "inspect", status: "pending" }],
+    sourcePath: "old.js",
+    destination: "new.js",
+    action: "browser.goto",
+    trackingNumber: "YT123",
+    topK: 7,
+  });
+
+  assert.equal(args.path, "src/a.js");
+  assert.equal(args.old_string, "before");
+  assert.equal(args.new_string, "after");
+  assert.deepEqual(args.edits, [{ old_string: "x", new_string: "y" }]);
+  assert.deepEqual(args.steps, [{ content: "inspect", status: "pending" }]);
+  assert.equal(args.from, "old.js");
+  assert.equal(args.to, "new.js");
+  assert.equal(args.method, "browser.goto");
+  assert.equal(args.tracking_number, "YT123");
+  assert.equal(args.max_results, 7);
+});
+
 test("invalid file mutation arguments recover by reading target context once", () => {
   const safeJson = load("_safeJsonLoose");
   const normalizeKeys = load("_normalizeArgKeys");
+  const toolSchemaFromRegistry = load("_toolSchemaFromRegistry", { _canonicalToolName: (name) => name });
+  const schemaHint = load("_toolSchemaRepairHint", {
+    _canonicalToolName: (name) => name,
+    _toolSchemaFromRegistry: toolSchemaFromRegistry,
+  });
+  const repairHints = load("_toolRepairHints", {
+    _canonicalToolName: (name) => name,
+    _toolSchemaRepairHint: schemaHint,
+  });
   const recover = load("_recoverableInvalidToolCalls", {
     _canonicalToolName: (name) => name,
     _safeJsonLoose: safeJson,
@@ -521,6 +557,7 @@ test("invalid file mutation arguments recover by reading target context once", (
   const instruction = load("_invalidToolRepairInstruction", {
     _safeJsonLoose: safeJson,
     _normalizeArgKeys: normalizeKeys,
+    _toolRepairHints: repairHints,
   });
   const attempts = [{
     name: "write_file",
@@ -541,8 +578,20 @@ test("invalid file mutation arguments recover by reading target context once", (
   });
   assert.equal(recover(attempts, seen).length, 0, "same invalid path should not auto-read forever");
   assert.equal(recover([{ name: "run_cmd", parsedArgs: {}, argsRaw: "{}", issue: "run_cmd 缺少 command" }], new Set()).length, 0);
-  const msg = instruction(attempts, calls);
+  const registry = [{
+    type: "function",
+    function: {
+      name: "write_file",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+      },
+    },
+  }];
+  const msg = instruction(attempts, calls, registry);
   assert.match(msg, /参数不完整/);
+  assert.match(msg, /write_file 必填 path:string, content:string/);
   assert.match(msg, /已自动补救读取/);
   assert.match(msg, /edit_file \/ multi_edit/);
   assert.match(msg, /完整非空 content/);
@@ -550,6 +599,10 @@ test("invalid file mutation arguments recover by reading target context once", (
     "agent loop must convert recoverable invalid file tool args into a safe read_file step");
   assert.match(SRC, /turn\._invalidToolRepairInstruction/,
     "agent loop must feed the recovery instruction back after the synthetic read result");
+  assert.match(SRC, /const retryLimit = argIssue \? 3/,
+    "invalid tool arguments should get a bounded schema-repair retry before loop-level recovery");
+  assert.match(SRC, /按 schema 自动修复重试/,
+    "retry toast should explain schema repair instead of a brittle fixed 1\/2 counter");
 });
 
 test("mutating native and text tool calls fail closed on any non-strict or truncated arguments", () => {

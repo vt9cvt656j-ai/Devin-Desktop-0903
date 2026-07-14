@@ -14207,11 +14207,20 @@ function _normalizeArgKeys(args) {
   alias("content", "code", "text", "data", "file_content", "fileContent", "new_content", "newContent", "contents", "body");
   alias("query", "q", "keyword", "keywords", "search_query", "searchQuery", "search_term", "pattern_text");
   alias("url", "uri", "link", "href", "address", "website");
-  alias("old_string", "old", "oldStr", "old_text", "oldText", "search_string", "find", "target");
-  alias("new_string", "new", "newStr", "new_text", "newText", "replace_string", "replacement", "replace_with");
+  alias("old_string", "old", "oldStr", "oldString", "old_text", "oldText", "before", "search_string", "searchString", "find", "target");
+  alias("new_string", "new", "newStr", "newString", "new_text", "newText", "after", "replace_string", "replaceString", "replacement", "replace_with", "replaceWith");
+  alias("edits", "changes", "replacements", "operations", "ops", "patches");
+  alias("steps", "plan", "todos", "tasks", "checklist");
+  alias("from", "source", "src", "old_path", "oldPath", "source_path", "sourcePath");
+  alias("to", "dest", "destination", "target_path", "targetPath", "new_path", "newPath", "output", "output_path", "save_path", "save_to", "out");
   alias("dest", "destination", "output", "output_path", "save_path", "save_to", "out");
   alias("pattern", "glob", "filepattern", "file_pattern", "name_pattern");
   alias("prompt", "description", "instruction", "instructions");
+  alias("method", "action", "op", "operation");
+  alias("action", "op", "operation");
+  alias("question", "q", "prompt", "text");
+  alias("tracking_number", "trackingNumber", "number", "id");
+  alias("max_results", "limit", "count", "top_k", "topK");
   return a;
 }
 
@@ -14874,7 +14883,44 @@ function _recoverableInvalidToolCalls(attempts, seen = new Set()) {
   return calls;
 }
 
-function _invalidToolRepairInstruction(attempts, recoveryCalls = []) {
+function _toolSchemaRepairHint(name, registry = null) {
+  const canonical = _canonicalToolName(name) || name;
+  const schema = _toolSchemaFromRegistry(registry, name) || _toolSchemaFromRegistry(registry, canonical);
+  const params = schema?.function?.parameters;
+  const required = Array.isArray(params?.required) ? params.required : [];
+  if (!canonical || !required.length) return "";
+  const props = params?.properties && typeof params.properties === "object" ? params.properties : {};
+  const field = (key) => {
+    const s = props[key] || {};
+    const type = s.type || (s.properties ? "object" : (s.items ? "array" : "value"));
+    let shape = "";
+    if ((type === "array" || s.items) && Array.isArray(s.items?.required) && s.items.required.length) {
+      shape = `[{${s.items.required.join(", ")}}]`;
+    } else if ((type === "object" || s.properties) && Array.isArray(s.required) && s.required.length) {
+      shape = `{${s.required.join(", ")}}`;
+    }
+    return `${key}${shape}:${type}`;
+  };
+  return `${canonical} 必填 ${required.map(field).join(", ")}`;
+}
+
+function _toolRepairHints(attempts, registry = null) {
+  const list = Array.isArray(attempts) ? attempts : [];
+  const seen = new Set();
+  const hints = [];
+  for (const attempt of list) {
+    const name = String(attempt?.name || "").trim();
+    if (!name) continue;
+    const canonical = _canonicalToolName(name) || name;
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const hint = _toolSchemaRepairHint(canonical, registry);
+    if (hint) hints.push(hint);
+  }
+  return hints;
+}
+
+function _invalidToolRepairInstruction(attempts, recoveryCalls = [], registry = null) {
   const list = Array.isArray(attempts) ? attempts : [];
   const bad = list.map((attempt) => {
     const parsed = attempt?.parsedArgs && typeof attempt.parsedArgs === "object"
@@ -14892,7 +14938,9 @@ function _invalidToolRepairInstruction(attempts, recoveryCalls = []) {
   const recovery = recoveredPaths.length
     ? `IDE 已自动补救读取这些目标文件：${recoveredPaths.join("、")}。下一步基于刚刚 read_file 的真实内容继续：修改已有文件用 edit_file / multi_edit；只有确认是新文件时才用 write_file，并且同一次调用必须带完整非空 content。`
     : "下一步不要重复同一个残缺工具调用。先补齐缺失参数；如果要修改已有文件，先 read_file 读取当前版本，再用 edit_file / multi_edit；如果要新建文件，write_file 必须一次带完整非空 content。";
-  return `上一轮工具参数不完整，IDE 已拒绝执行，未产生副作用：\n${bad}\n${recovery}`;
+  const hints = (typeof _toolRepairHints === "function") ? _toolRepairHints(list, registry) : [];
+  const schemaLine = hints.length ? `\n当前工具 schema 要求：${hints.join("；")}。字段名必须照这个写，别用空对象、别漏必填字段。` : "";
+  return `上一轮工具参数不完整，IDE 已拒绝执行，未产生副作用：\n${bad}${schemaLine}\n${recovery}`;
 }
 
 /** Normalize loosely-shaped plan steps from the model into {content, status}. */
@@ -18074,7 +18122,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // turn and never execute any tool from an errored stream.
     const erroredToolStream = !!turnErr && byIndex.size > 0;
     const retryableTurnErr = turnErr && _isRetryableAiError(turnErr);
-    const retryLimit = argIssue ? 2 : (stalled || erroredToolStream ? 1 : 2);
+    const retryLimit = argIssue ? 3 : (stalled || erroredToolStream ? 1 : 2);
     if ((argIssue || truncated || erroredToolStream || (retryableTurnErr && !hasUsable)) && attempt < retryLimit && _live()) {
       for (const [, e] of byIndex) _removeWritePreview(e); // drop the partial live previews
       byIndex.clear(); acc = ""; reasoningAcc = "";
@@ -18082,7 +18130,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       if (reasoningEl) { reasoningEl.remove(); reasoningEl = null; }
       if (argIssue) {
         if (_argRepairMsg) { const i = messages.indexOf(_argRepairMsg); if (i >= 0) messages.splice(i, 1); }
-        _argRepairMsg = { role: "user", content: `[工具参数校验失败] ${argIssue}。请重新输出这次工具调用，并在同一个调用中一次传全 schema 要求的所有字段；不要先发空对象或残缺参数。` };
+        const repairDetails = _invalidToolRepairInstruction(rejectedToolAttempts, [], toolRegistry || toolSchemas);
+        _argRepairMsg = { role: "user", content: `[工具参数校验失败] ${argIssue}。\n${repairDetails}\n请重新输出这次工具调用，并在同一个调用中一次传全 schema 要求的所有字段；不要先发空对象或残缺参数。` };
         messages.push(_argRepairMsg);
       }
       if (stalled) {
@@ -18091,7 +18140,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         else if (effort === "medium") _turnConfig.reasoningEffort = "low";
         delete _turnConfig.thinkingBudget;
       }
-      showAgentRetryToast(argIssue ? `工具参数不完整，正在自动修复重试… (${attempt + 1}/2)` : (stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`)));
+      showAgentRetryToast(argIssue ? `工具参数不完整，正在按 schema 自动修复重试…（第 ${attempt + 1} 次）` : (stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`)));
       await new Promise((r) => setTimeout(r, stalled ? 250 : 800 * Math.pow(2, attempt)));
       if (!_live()) { err = turnErr; break; }
       continue;
@@ -20256,13 +20305,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             error: null,
             toolCalls: recoveryCalls,
             text: turn.text || "",
-            _invalidToolRepairInstruction: _invalidToolRepairInstruction(attempts, recoveryCalls),
+            _invalidToolRepairInstruction: _invalidToolRepairInstruction(attempts, recoveryCalls, run._toolRegistry),
           };
           clearAgentRetryToast();
         } else if (invalidArgNudges < 4) {
           invalidArgNudges++;
           runHadTrouble = true;
-          messages.push({ role: "user", content: _invalidToolRepairInstruction(attempts, []) + "\n现在继续任务；不要收尾，不要声称已完成。" });
+          messages.push({ role: "user", content: _invalidToolRepairInstruction(attempts, [], run._toolRegistry) + "\n现在继续任务；不要收尾，不要声称已完成。" });
           clearAgentRetryToast();
           continue;
         }
