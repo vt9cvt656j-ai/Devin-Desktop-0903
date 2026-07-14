@@ -722,6 +722,10 @@ test("mutating native and text tool calls fail closed on any non-strict or trunc
 test("runtime tool schemas reject missing required parameters for native and text calls", () => {
   const canonical = (name) => name;
   const normalizeKeys = load("_normalizeArgKeys");
+  const applyDefaults = load("_applyToolArgDefaults", {
+    _canonicalToolName: canonical,
+    _normalizeArgKeys: normalizeKeys,
+  });
   const safeJson = load("_safeJsonLoose");
   const fileIssue = load("_fileToolArgIssue", {
     _canonicalToolName: canonical,
@@ -739,14 +743,18 @@ test("runtime tool schemas reject missing required parameters for native and tex
     _canonicalToolName: canonical,
     _mutatingToolArgIssue: mutationIssue,
     _normalizeArgKeys: normalizeKeys,
+    _applyToolArgDefaults: applyDefaults,
     _toolSchemaFromRegistry: schemaFrom,
     _schemaValueIssue: schemaValueIssue,
+    _safeJsonLoose: safeJson,
   });
   const schema = (name, properties, required = []) => ({ type: "function", function: { name, parameters: { type: "object", properties, required } } });
   const registry = new Map([
     ["visual_compare", schema("visual_compare", { design: { type: "string" }, url: { type: "string" } }, ["design", "url"])],
     ["db_query", schema("db_query", { driver: { type: "string", enum: ["sqlite"] }, url: { type: "string" }, query: { type: "string" } }, ["driver", "url", "query"])],
     ["current_time", schema("current_time", {})],
+    ["http_request", schema("http_request", { method: { type: "string" }, url: { type: "string" } }, ["method", "url"])],
+    ["browser", schema("browser", { action: { type: "string" }, url: { type: "string" } }, ["action"])],
     ["local_discovery", { type: "function", function: { name: "local_discovery", parameters: {
       type: "object",
       properties: {
@@ -764,6 +772,12 @@ test("runtime tool schemas reject missing required parameters for native and tex
   assert.match(issue("db_query", '{"driver":"sqlite"}', registry), /url, query/);
   assert.equal(issue("visual_compare", '{"design":"target.png","url":"http://127.0.0.1:3000"}', registry), "");
   assert.equal(issue("current_time", "{}", registry), "");
+  assert.equal(issue("http_request", '{"url":"https://example.test/data"}', registry), "",
+    "http_request executor defaults method=GET, so validation must not force a retry");
+  assert.equal(issue("http_request", '{}{"url":"https://example.test/data"}', registry), "",
+    "safe read-only tools should repair relay-concatenated JSON before schema validation");
+  assert.equal(issue("browser", '{"url":"https://example.test"}', registry), "",
+    "browser({url}) should default to navigate instead of retrying for missing action");
   assert.match(issue("local_discovery", "{}", registry), /query/);
   assert.match(issue("local_discovery", '{"query":"coffee"}', registry), /near|latitude/);
   assert.equal(issue("local_discovery", '{"query":"coffee","near":"Pasadena"}', registry), "");
@@ -771,8 +785,15 @@ test("runtime tool schemas reject missing required parameters for native and tex
   assert.match(issue("local_discovery", '{"query":"coffee","near":"Pasadena","radius_m":50}', registry), /不能小于 100/);
   assert.match(issue("local_discovery", '{"query":"coffee","latitude":91,"longitude":-118.1}', registry), /不能大于 90/);
 
-  const assemble = load("_assembleStreamToolCalls", { _toolArgIssue: issue, _safeJsonLoose: safeJson });
+  const assemble = load("_assembleStreamToolCalls", {
+    _toolArgIssue: issue,
+    _safeJsonLoose: safeJson,
+    _applyToolArgDefaults: applyDefaults,
+  });
   assert.equal(assemble(new Map([[0, { name: "visual_compare", args: "{}" }]]), registry).length, 0);
+  const httpCalls = assemble(new Map([[0, { name: "http_request", args: '{}{"url":"https://example.test/data"}' }]]), registry);
+  assert.equal(httpCalls.length, 1);
+  assert.deepEqual(httpCalls[0].parsedArgs, { url: "https://example.test/data", method: "GET" });
 
   const toolObj = load("_toolObjOf", { _safeJsonLoose: safeJson });
   const parseText = load("_parseTextToolCalls", {
@@ -783,6 +804,7 @@ test("runtime tool schemas reject missing required parameters for native and tex
     _KNOWN_TOOLS: new Set(),
     _STRICT_MUTATING_TOOL_NAMES: new Set(),
     _safeJsonLoose: safeJson,
+    _applyToolArgDefaults: applyDefaults,
   });
   const issues = [];
   const rejected = [];
@@ -791,10 +813,17 @@ test("runtime tool schemas reject missing required parameters for native and tex
   assert.equal(rejected[0].name, "visual_compare");
   assert.equal(parseText('{"name":"visual_compare","args":{"design":"a.png","url":"http://localhost"}}', registry).length, 1,
     "registry tools must not depend on the incomplete static _KNOWN_TOOLS set");
+  const browserTextCalls = parseText('{"name":"browser","args":{"url":"https://example.test"}}', registry);
+  assert.equal(browserTextCalls.length, 1);
+  assert.deepEqual(browserTextCalls[0].parsedArgs, { url: "https://example.test", action: "navigate" });
   const unknownIssues = [], unknownRejected = [];
   assert.equal(parseText('{"name":"made_up_tool","args":{}}', registry, unknownIssues, unknownRejected).length, 0);
   assert.match(unknownIssues[0], /未知工具/);
   assert.equal(unknownRejected[0].name, "made_up_tool");
+  assert.match(SRC, /name: "http_request"[\s\S]{0,900}required: \["url"\]/,
+    "http_request schema should match the executor's GET default");
+  assert.match(SRC, /name: "tor_request"[\s\S]{0,900}required: \["url"\]/,
+    "tor_request schema should match the executor's GET default");
 });
 
 test("tool cards always have a label and skipped paths settle their spinner", () => {

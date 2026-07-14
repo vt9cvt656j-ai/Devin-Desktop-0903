@@ -13857,8 +13857,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
-      { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。公网 API 不要凭感觉拼 /api、/v1、appapi 路径；先用官方文档/页面源码/抓包/用户给的精确 URL 取证，localhost/dev server/已取证 URL 可直接请求。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["method", "url"] } } },
-      { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["method", "url"] } } },
+      { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。公网 API 不要凭感觉拼 /api、/v1、appapi 路径；先用官方文档/页面源码/抓包/用户给的精确 URL 取证，localhost/dev server/已取证 URL 可直接请求。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE；不传默认 GET" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["url"] } } },
+      { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST；不传默认 GET" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["url"] } } },
       { type: "function", function: { name: "academic_search", description: "**搜索学术论文**（Semantic Scholar，覆盖 arXiv / PubMed / ACL 等）。返回标题、作者、年份、引用量、摘要、链接。用于查最新研究、算法、AI/ML 论文。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 'transformer attention mechanism' 或 'large language model agent'" }, max_results: { type: "integer", description: "返回数量，默认 8，最大 20" } }, required: ["query"] } } },
       { type: "function", function: { name: "package_search", description: "**搜索软件包/库**——查 npm、crates.io、PyPI、HuggingFace、pub.dev(Flutter)、Conda、CocoaPods(iOS)、Hex(Elixir) 的包信息。找库、选型、查版本用这个。", parameters: { type: "object", properties: { query: { type: "string", description: "包名或搜索词，如 'axios' / 'tokio' / 'transformers'" }, ecosystem: { type: "string", description: "生态：npm(默认) / pypi / crates / huggingface / dart / conda / cocoapods / hex。pypi 仅支持精确包名" }, max_results: { type: "integer", description: "返回数量，默认 8" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_search", description: "通过 GitHub API 搜索仓库、代码或 issue，并返回本次响应里的元数据和链接。created_date、updated_date 与 pushed_at 各有不同语义，都不证明最新 release、质量或持续维护；关键实现仍需读源码并在当前项目验证。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，支持 GitHub 语法如 'language:rust stars:>1000' 或 'org:facebook react'" }, search_type: { type: "string", description: "搜索类型：repositories（默认）/ code / issues" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
@@ -14240,6 +14240,24 @@ function _normalizeArgKeys(args) {
   return a;
 }
 
+function _applyToolArgDefaults(name, args) {
+  const canonical = _canonicalToolName(name) || name;
+  const a = _normalizeArgKeys(args && typeof args === "object" && !Array.isArray(args) ? args : {});
+  if ((canonical === "http_request" || canonical === "tor_request") && !a.method && a.url) {
+    // The executor has always defaulted method to GET. Keep validation aligned
+    // so a perfectly normal "fetch this URL" call doesn't waste a whole retry.
+    a.method = "GET";
+  } else if (canonical === "list_dir" && !a.path) {
+    // Listing the workspace root is the safe default and matches the UI affordance.
+    a.path = ".";
+  } else if (canonical === "browser" && !a.action) {
+    // Models often write browser({url}) when they mean "open this page".
+    // If no URL is present this remains a harmless current-page screenshot.
+    a.action = a.url ? "navigate" : "screenshot";
+  }
+  return a;
+}
+
 // JSON Schema guides the model, but providers do not guarantee that a streamed tool
 // call obeys it. Validate the file mutations again before execution so `{}`, a
 // path-only write, or a cut-off content payload is retried instead of becoming an
@@ -14401,10 +14419,15 @@ function _toolArgIssue(name, rawArgs, registry) {
     const raw = rawArgs.trim();
     if (!raw) return `${canonical || "工具"} 没有参数`;
     try { parsed = JSON.parse(raw); }
-    catch { return `${canonical || "工具"} 的参数不是完整严格 JSON`; }
+    catch {
+      parsed = _safeJsonLoose(raw);
+      if (!parsed) return `${canonical || "工具"} 的参数不是完整严格 JSON`;
+    }
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return `${canonical || "工具"} 的参数不是对象`;
-  const normalized = _normalizeArgKeys({ ...parsed });
+  const normalized = (typeof _applyToolArgDefaults === "function")
+    ? _applyToolArgDefaults(canonical, parsed)
+    : _normalizeArgKeys({ ...parsed });
   const schema = _toolSchemaFromRegistry(registry, name) || _toolSchemaFromRegistry(registry, canonical);
   const params = schema?.function?.parameters;
   return params ? _schemaValueIssue(normalized, params, canonical || name || "工具") : "";
@@ -14469,6 +14492,10 @@ function _assembleStreamToolCalls(byIndex, toolRegistry = null) {
         parsed = _safeJsonLoose(entry.args) || {};
         raw = JSON.stringify(parsed);
       }
+      parsed = (typeof _applyToolArgDefaults === "function")
+        ? _applyToolArgDefaults(entry.name, parsed)
+        : (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {});
+      raw = JSON.stringify(parsed);
       return {
         id: entry.id || ("call_" + Math.random().toString(36).slice(2, 10)),
         name: entry.name,
@@ -14535,7 +14562,10 @@ function _parseTextToolCalls(text, toolRegistry = null, issues = null, rejected 
       if (Array.isArray(rejected)) rejected.push({ name: canon, argsRaw: JSON.stringify(t.args || {}), parsedArgs: t.args || {}, issue });
       return;
     }
-    found.push({ id: "call_" + Math.random().toString(36).slice(2, 10), name: canon, parsedArgs: t.args, argsRaw: JSON.stringify(t.args || {}) });
+    const finalArgs = (typeof _applyToolArgDefaults === "function")
+      ? _applyToolArgDefaults(canon, t.args || {})
+      : (t.args && typeof t.args === "object" && !Array.isArray(t.args) ? t.args : {});
+    found.push({ id: "call_" + Math.random().toString(36).slice(2, 10), name: canon, parsedArgs: finalArgs, argsRaw: JSON.stringify(finalArgs || {}) });
   };
   const parseCandidate = (rawText) => {
     let strict = null;
@@ -14589,7 +14619,9 @@ function _finiteNumberArg(value) {
   return Number.isFinite(number) ? number : null;
 }
 function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
-  args = _normalizeArgKeys(args || {});
+  args = (typeof _applyToolArgDefaults === "function")
+    ? _applyToolArgDefaults(name, args || {})
+    : _normalizeArgKeys(args || {});
   for (const k of _STR_ARG_KEYS) {
     const v = args[k];
     if (v != null && typeof v !== "string") args[k] = String(v);
