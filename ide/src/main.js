@@ -418,6 +418,11 @@ async function tauriBackend() {
 // the filesystem/terminal stay mocked, since a browser can't touch local files.
 async function _realAiFetch(config, messages, tools, onEvent) {
   try {
+    const streamStarted = Date.now();
+    const streamMetric = (phase, extra = {}) => {
+      try { onEvent({ kind: "streamMetric", phase, elapsedMs: Date.now() - streamStarted, ...extra }); } catch {}
+    };
+    streamMetric("requestStarted");
     let key = config.apiKey;
     const isGateway = _isGatewayConfig(config);
     if (!key && isGateway) {
@@ -450,6 +455,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       delete payload.stream_options;
       resp = await _post(payload);
     }
+    streamMetric("responseHeaders");
     if (!resp.ok || !resp.body) {
       let t = ""; try { t = await resp.text(); } catch {}
       onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, t) });
@@ -459,9 +465,22 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
+    let rawBytes = 0;
+    let sentFirstChunkMetric = false;
+    let sentFirstProgressMetric = false;
+    const markFirstProgress = () => {
+      if (sentFirstProgressMetric) return;
+      sentFirstProgressMetric = true;
+      streamMetric("firstProgress", { bytes: rawBytes });
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      rawBytes += (value && value.byteLength) || 0;
+      if (!sentFirstChunkMetric) {
+        sentFirstChunkMetric = true;
+        streamMetric("firstChunk", { bytes: rawBytes });
+      }
       buf += dec.decode(value, { stream: true });
       let nl;
       while ((nl = buf.indexOf("\n")) >= 0) {
@@ -469,7 +488,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
         buf = buf.slice(nl + 1);
         if (!line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
-        if (data === "[DONE]") { onEvent({ kind: "done" }); return; }
+        if (data === "[DONE]") { streamMetric("done", { bytes: rawBytes }); onEvent({ kind: "done" }); return; }
         if (!data) continue;
         try {
           const v = JSON.parse(data);
@@ -481,8 +500,8 @@ async function _realAiFetch(config, messages, tools, onEvent) {
           }
           const d = (v.choices && v.choices[0] && v.choices[0].delta) || {};
           const rt = d.reasoning_content || d.reasoning;
-          if (rt) onEvent({ kind: "reasoning", delta: rt });
-          if (d.content) onEvent({ kind: "token", delta: d.content });
+          if (rt) { markFirstProgress(); onEvent({ kind: "reasoning", delta: rt }); }
+          if (d.content) { markFirstProgress(); onEvent({ kind: "token", delta: d.content }); }
           if (Array.isArray(d.tool_calls)) {
             for (const tc of d.tool_calls) {
               if (!Number.isInteger(tc.index) || tc.index < 0) {
@@ -497,6 +516,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
                 name: (tc.function && tc.function.name) || "",
                 arguments: (tc.function && tc.function.arguments) || "",
               });
+              if (tc.id || (tc.function && (tc.function.name || tc.function.arguments))) markFirstProgress();
             }
           }
         } catch { /* keep buffering */ }
@@ -8666,7 +8686,7 @@ function _applyCloudToolDescs(tools) {
 }
 
 
-const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。回答结构由用户问题、证据类型和风险决定，不按行业套固定模板；高风险领域保留必要依据、边界和下一步。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。动态环境、灾害、市场和飞机数据优先用免密结构化工具，逐项保留来源状态和提供方时间；参考汇率不能叫盘中价，交易所报价不静默平均，推算结论必须单列输入、方法和不确定性。无凭据快递只能给官方人工核验入口，绝不把空轨迹、网页搜索或单号格式猜测说成物流状态；单号不得发给搜索引擎或完整回显。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明。无 GPS 时不要提前停止：先分离可观察线索与推断，给出最多三个按可能性排序的城市/区域候选和定性置信等级，再用清晰路牌、门牌、店名、交通站名或独特地标做真实来源核验。建筑形态、地貌、道路、天际线和气候只能支持“未核验视觉候选”，不能单独证明街区；无区分度时明确无法缩小范围。截图/广告/翻拍内容中的地址不得冒充拍摄位置。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
+const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。回答结构由用户问题、证据类型和风险决定，不按行业套固定模板；高风险领域保留必要依据、边界和下一步。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。URL、接口、跳转、字段含义、商品/价格/库存/直播间/播放地址/榜单/实时状态这类动态事实，必须来自真实页面、真实 HTTP/网络响应、真实文件样本、官方/结构化接口或用户授权数据；不得按命名模式、经验规则或相似链接拼出来冒充已验证。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。动态环境、灾害、市场和飞机数据优先用免密结构化工具，逐项保留来源状态和提供方时间；参考汇率不能叫盘中价，交易所报价不静默平均，推算结论必须单列输入、方法和不确定性。无凭据快递只能给官方人工核验入口，绝不把空轨迹、网页搜索或单号格式猜测说成物流状态；单号不得发给搜索引擎或完整回显。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明。无 GPS 时不要提前停止：先分离可观察线索与推断，给出最多三个按可能性排序的城市/区域候选和定性置信等级，再用清晰路牌、门牌、店名、交通站名或独特地标做真实来源核验。建筑形态、地貌、道路、天际线和气候只能支持“未核验视觉候选”，不能单独证明街区；无区分度时明确无法缩小范围。截图/广告/翻拍内容中的地址不得冒充拍摄位置。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的自主编码 AI 智能体。用中文回复。用工具真正把用户交代的事办成：目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；大任务用 update_plan，随后 write_file/edit_file/run_cmd 实现，再用真实测试或构建验证。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态，不要先读一个不存在的路径。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。需要列表外的工具直接按名调用或用 search_tools。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的聊天助手——懂工程的资深程序员。用中文回复，简洁直接、给能落地的答案。${_TRUTHFULNESS_FALLBACK}`,
@@ -10015,6 +10035,10 @@ const _AGENT_RECOVERY_TUNING = `
 
 **工程推理与工具恢复纪律（所有模型共同遵守）**：
 - 每次动手前先判断缺的是事实、路径、接口契约还是验证；缺事实就用最小工具补证据，证据够了立刻实现，不用相似搜索刷存在感。
+- 复杂或不熟的任务先在脑内过三问：①用户真正要的终态是什么；②当前证据缺哪一块会导致写错；③最小可验证下一步是什么。展示给用户的思考必须是“观察 → 判断 → 下一步”的实证链，别写空泛自言自语、别把计划当结果。
+- Bug 修复必须先建立因果链：复现/读取真实报错、日志、截图、失败命令或用户描述中的具体症状；沿入口、状态、数据契约、异步时序、边界值和调用方定位根因；说明为什么这个补丁能切断故障路径；改完重跑同一失败路径或最接近的聚焦回归。没有复现条件时也要列出可证伪假设和下一步证据，不准凭感觉乱改。
+- 写代码前先确认数据契约、调用方和失败/空值路径；涉及 UI 时先读真实内容源/素材/现有组件，再映射 shadcn/ui、Radix 和 Tailwind token，不能先凭模板瞎拼。
+- 动态数据、URL、跳转、接口字段、爬虫/抓包结果和第三方页面行为一律走真实证据：打开真实页面、读真实网络响应、跑真实脚本或读取已有真实样本；猜出来的链接/字段只能标成假设，不能写进结果或代码当事实。
 - 文件写入被 [BLOCKED]/[ERROR] 后，先按工具结果里的 [RECOVERY:...] 做唯一下一步；不要把 edit_file 被挡改成 sed/perl/tee/重定向/run_cmd 脚本写，也不要整文件盲写绕过。
 - 已有文件整文件覆盖前必须 read_file 读当前完整版本；局部 edit_file/multi_edit 可在当前编辑器/附件/已知上下文给出精确 old_string 且工具能唯一命中时直接改，命中失败或不唯一就从真实内容逐字符复制并补上下文；命令失败就读 exit code/stderr 根因，修完再重跑。`;
 function _modelStyleTuning(id) {
@@ -10111,6 +10135,29 @@ function _renderSuggestionChips(sess, items, label) {
   } catch {}
 }
 
+function _fallbackNextActionSuggestions(messages) {
+  const recent = (Array.isArray(messages) ? messages : [])
+    .filter((m) => (m?.role === "user" || m?.role === "assistant") && typeof m.content === "string" && m.content.trim())
+    .slice(-6)
+    .map((m) => m.content)
+    .join("\n")
+    .slice(-6000);
+  const picks = [];
+  const add = (text) => {
+    if (!text || picks.includes(text) || picks.length >= 4) return;
+    picks.push(text);
+  };
+  if (/(?:报错|错误|异常|失败|failed|error|exception|traceback|502|timeout|超时)/i.test(recent)) add("定位失败根因");
+  if (/(?:未验证|尚未验证|没有可自动识别|build|test|lint|typecheck|运行结果|验证)/i.test(recent)) add("补真实验证");
+  if (/(?:改动文件|写入|修改|修复|实现|created|updated|changed|write|edit)/i.test(recent)) add("检查改动影响");
+  if (/(?:UI|页面|前端|样式|布局|按钮|弹窗|渲染|viewport|browser|截图)/i.test(recent)) add("跑浏览器检查");
+  if (/(?:接口|字段|schema|参数|JSON|数据|sourceUrl|roomId|url|API|抓包|302|301)/i.test(recent)) add("核对数据契约");
+  if (/(?:剩余|待确认|pending|in_progress|未完成)/i.test(recent)) add("完成剩余项");
+  add("复查项目状态");
+  add("落地下一处改动");
+  return picks.slice(0, 4);
+}
+
 // The model often OFFERS the user a choice as plain text ("A. … B. … C. …" / "1. … 2. …")
 // instead of calling the ask_user tool → the user has to type back "A". Detect a trailing
 // option list in the final answer and turn it into CLICKABLE chips (utilizing the choice UX
@@ -10200,8 +10247,11 @@ async function _maybeSuggestNext(sess, messages, config) {
     let arr = [];
     try { arr = JSON.parse((String(out).match(/\[[\s\S]*\]/) || [])[0] || "[]"); } catch {}
     arr = arr.filter((x) => typeof x === "string" && x.trim() && x.length <= 24);
+    if (!arr.length) arr = _fallbackNextActionSuggestions(recent);
     _renderSuggestionChips(sess, arr, "接下来 ›");
-  } catch { /* suggestions are best-effort */ }
+  } catch {
+    try { _renderSuggestionChips(sess, _fallbackNextActionSuggestions(messages), "接下来 ›"); } catch {}
+  }
 }
 
 // "引导 / Guide" — steer a RUNNING agent: inject the user's new instruction into the
@@ -10542,8 +10592,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       await _runAgenticLoop({ config, messages, root: _contextRoot, session: sess, mode: effectiveMode, task: text, skillsBlock });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
-      _maybeRenderChoices(sess, messages); // if the answer offered A/B/C… options → clickable chips
-      _maybeSuggestNext(sess, messages, config); // Codex-style: offer 2-4 clickable next steps
+      const postRunMessages = Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages;
+      _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
+      _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
     } catch (e) {
       // Never leave a dead Stop button + silent no-response on an unexpected throw.
       console.error("[agent] run failed:", e);
@@ -10561,6 +10612,47 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   let err = null;
   let raf = 0;
   let lastFlush = 0;
+  let _plainLastProgressAt = Date.now();
+  const _plainStreamDiag = {
+    attemptStartedAt: Date.now(),
+    requestStartedMs: null,
+    responseHeadersMs: null,
+    firstChunkMs: null,
+    firstProgressMs: null,
+    firstRenderMs: null,
+    bytes: 0,
+  };
+  const _plainRecordStreamMetric = (ev) => {
+    if (!ev || ev.kind !== "streamMetric") return;
+    const ms = Number.isFinite(ev.elapsedMs) ? Math.round(ev.elapsedMs) : (Date.now() - _plainStreamDiag.attemptStartedAt);
+    const phase = String(ev.phase || "");
+    if (phase === "requestStarted") _plainStreamDiag.requestStartedMs = ms;
+    else if (phase === "responseHeaders") _plainStreamDiag.responseHeadersMs = ms;
+    else if (phase === "firstChunk") _plainStreamDiag.firstChunkMs = ms;
+    else if (phase === "firstProgress") _plainStreamDiag.firstProgressMs = ms;
+    if (Number.isFinite(ev.bytes)) _plainStreamDiag.bytes = Math.max(_plainStreamDiag.bytes || 0, ev.bytes);
+  };
+  const _plainStreamStageText = () => {
+    const d = _plainStreamDiag;
+    const elapsed = Math.max(0, Math.round((Date.now() - d.attemptStartedAt) / 1000));
+    if (d.firstProgressMs != null) {
+      return d.firstRenderMs == null ? `已收到有效输出 ${d.firstProgressMs}ms，等待渲染` : `已收到有效输出 ${d.firstProgressMs}ms，已渲染`;
+    }
+    if (d.firstChunkMs != null) {
+      const size = d.bytes ? `，已收 ${d.bytes}B` : "";
+      return `已收到上游原始流 ${d.firstChunkMs}ms${size}，但还没有有效 token`;
+    }
+    if (d.responseHeadersMs != null) return `已拿到响应头 ${d.responseHeadersMs}ms，等待首个 SSE chunk`;
+    if (d.requestStartedMs != null) return `请求已发出，等待响应头 ${elapsed}s`;
+    return `准备请求 ${elapsed}s`;
+  };
+  const _plainWaitTimer = setInterval(() => {
+    if (!sess.streaming) return;
+    const idle = Math.round((Date.now() - _plainLastProgressAt) / 1000);
+    if (idle < 8) return;
+    const tEl = body.querySelector(".thinking .thinking__text");
+    if (tEl) tEl.textContent = `等待模型有效输出 ${idle}s（${_plainStreamStageText()}）`;
+  }, 1000);
 
   const _toolSchemas = hasToolAccess ? [
     { type: "function", function: { name: "read_file", description: "Read file content", parameters: { type: "object", properties: { path: { type: "string", description: "File path" } }, required: ["path"] } } },
@@ -10620,7 +10712,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     const _stick = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 48; // at the bottom?
     const raw = String(txt || "");
     tb.dataset.rawText = raw; // saved for collapseThink's final non-streaming pass
-    try { renderMarkdownInto(tb, raw, { streaming: true, highlighter: highlightCode }); }
+    try { renderMarkdownInto(tb, raw, { streaming: true, showCaret: false, highlighter: highlightCode }); }
     catch { tb.textContent = raw; }
     if (_stick) tb.scrollTop = tb.scrollHeight; // auto-follow the newest reasoning
     _chatFollow();
@@ -10718,7 +10810,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         if (!_streamEl) { _streamEl = document.createElement("div"); _streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(_streamEl); }
         if (tail.type === "text") {
           const clean = _cleanAgentText(tail.content);
-          if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true });
+          if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true, showCaret: false });
         } else if (tail.type === "code" && !tail.complete) {
           const lineCount = tail.content.split("\n").length;
           const langDisplay = tail.lang ? langLabel(tail.lang) : 'Code';
@@ -10775,8 +10867,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // current block. (The final, highlighted render still runs once on completion.)
       // Render into a dedicated sub-element so the think-card in body is not wiped.
       if (!body._chatStreamEl) { body._chatStreamEl = document.createElement("div"); body._chatStreamEl.className = "chat-stream-wrap"; body.appendChild(body._chatStreamEl); }
-      renderMarkdownStream(body._chatStreamEl, view, { streaming: true });
+      renderMarkdownStream(body._chatStreamEl, view, { streaming: true, showCaret: false });
       body._lastLen = view.length;
+    }
+    if (view && _plainStreamDiag.firstRenderMs == null) {
+      _plainStreamDiag.firstRenderMs = Date.now() - _plainStreamDiag.attemptStartedAt;
     }
     _chatFollow();
   };
@@ -10818,6 +10913,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // kept firing tool calls after Stop, and the finally then rendered the full answer
       // anyway — i.e. Stop didn't actually stop ("停不掉").
       if (!sess.streaming) return;
+      if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return; }
+      if (ev && (ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall")) {
+        _plainLastProgressAt = Date.now();
+        if (_plainStreamDiag.firstProgressMs == null) _plainStreamDiag.firstProgressMs = Date.now() - _plainStreamDiag.attemptStartedAt;
+      }
       if (ev.kind === "reasoning") { reasoning += ev.delta; setThink(reasoning); }
       else if (ev.kind === "token") {
         const { th, an } = _routeThink(ev.delta);
@@ -10863,6 +10963,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     });
   } catch (e) { if (!err) err = String(e); }
   finally {
+    clearInterval(_plainWaitTimer);
     if (_legacyUsage) _recordUsage(_legacyUsage);
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
@@ -13779,7 +13880,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       type: "function",
       function: {
         name: "update_plan",
-        description: "创建或更新复杂任务计划；简单一步修改不要套流程。复杂工程写入计划要像老手执行清单：通常 5-8 步，分别写清调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写三句口号。Bug/调试修复必须像老手查案：复现或读取真实报错/日志/诊断/exit code；沿调用链/数据流定位根因；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。只读找 bug 也要列证据、根因假设、影响优先级和修复建议。UI/官网/落地页/从零前端项目至少 6 步：先读 README/package/product wiki/docs/src/data/assets/screenshots 等真实内容源，基于现有数据写文案与区块；页面信息架构/区块文案；优先 shadcn/ui + Radix primitives，把 Button/Card/Dialog/Tabs/Accordion/Progress 等语义组件映射清楚；Tailwind palette/theme.extend/CSS variables 设计令牌（颜色/字体/间距/圆角/阴影）；组件与布局实现；响应式/交互/无障碍状态；真实浏览器桌面+手机验证。复杂只读调查至少覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
+        description: "创建或更新复杂任务计划；简单一步修改不要套流程。复杂工程写入计划要像老手执行清单：通常 5-8 步，分别写清调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写三句口号。Bug/调试修复必须像老手查案：先复现或读取真实报错/日志/截图/诊断/exit code，把症状、触发条件和期望行为写清；沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链；列出可证伪根因假设，优先用最小证据排除；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。动态数据/URL/接口/抓包/爬虫/第三方页面任务必须列真实证据采集步骤：打开真实页面或真实接口、捕获网络响应/DOM/文件样本、验证链接/字段可访问，再写解析和落库逻辑；不得先猜 URL 规则。只读找 bug 也要列证据、根因假设、影响优先级和修复建议。UI/官网/落地页/从零前端项目至少 6 步：先读 README/package/product wiki/docs/src/data/assets/screenshots 等真实内容源，基于现有数据写文案与区块；页面信息架构/区块文案；优先 shadcn/ui + Radix primitives，把 Button/Card/Dialog/Tabs/Accordion/Progress 等语义组件映射清楚；Tailwind palette/theme.extend/CSS variables 设计令牌（颜色/字体/间距/圆角/阴影）；组件与布局实现；响应式/交互/无障碍状态；真实浏览器桌面+手机验证。复杂只读调查至少覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
         parameters: {
           type: "object",
           properties: {
@@ -15136,12 +15237,13 @@ function _buildAgentOutcomeSummary(run, opts) {
   const externalEffects = Array.isArray(opts.externalEffects) ? opts.externalEffects.filter(Boolean) : [];
   const finalErr = String(opts.finalErr || "").trim();
   const note = String(opts.finalVerificationNote || "").replace(/[〔〕]/g, "").trim();
+  const noAutoVerify = /本项目没有可自动识别的验证命令/.test(note);
   const incomplete = _agentIncompleteLabel(run?._incompleteReason, !!opts.hitCap);
   const lines = [];
 
   if (finalErr) lines.push(`本轮报错：${finalErr.slice(0, 180)}`);
   else if (incomplete) lines.push(`本轮未完全收尾：${incomplete}`);
-  else lines.push("本轮已完成。");
+  else if (!completed.length && !mutatedFiles.length && !runtimeEffects.length && !externalEffects.length && !opts.didMutate) lines.push("已处理。");
 
   if (completed.length) lines.push(`已完成：${completed.join("；")}`);
   if (mutatedFiles.length) lines.push(`改动文件：${mutatedFiles.join("、")}`);
@@ -15151,13 +15253,14 @@ function _buildAgentOutcomeSummary(run, opts) {
 
   if (opts.didMutate) {
     if (opts.verificationPassed && opts.uiVerificationPassed !== false) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘，但没有额外命令输出。");
+    else if (noAutoVerify && opts.uiVerificationPassed !== false) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
     else lines.push(note ? `验证：未完全通过或未运行（${note}）` : "验证：未完全通过或未运行，不能当成已跑通。");
-  } else if (note) {
+  } else if (note && !noAutoVerify) {
     lines.push(`验证/注意：${note}`);
   }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
-  lines.push("后续继续时会复用本轮证据；如果文件内容变化或上下文已折叠，会重新读取当前版本，不会拿旧内容硬改。");
-  return `### 本轮结果\n\n${lines.map((line) => `- ${line}`).join("\n")}`;
+  if (!lines.length) return "";
+  return lines.map((line) => `- ${line}`).join("\n");
 }
 
 /** Create or update the live plan panel pinned at the top of the agent message. */
@@ -17636,6 +17739,10 @@ function _blockedToolRecoveryInstruction(content, call = null) {
       `不要换搜索乱试或整文件覆盖。下一步用报错给出的最接近真实片段，或重新 ${readStep}，从当前内容逐字符复制 old_string（不要带行号，空白/缩进/标点一致），再用 edit_file / multi_edit 精准重试。`);
   }
   const missingRanges = text.match(/缺少[:：]\s*([^。\n]+)/);
+  if (/尚未完整读取当前版本|没有完整读取.*当前版本|先读取已有文件|read-before-edit|阻止盲改|旧版本覆盖/i.test(text) && call?.type === "write") {
+    return mk("retry_complete_write_existing", "RETRY_COMPLETE_WRITE",
+      `上一条失败的是完整 write_file。新版 IDE 会先读当前磁盘内容生成 diff，再用 CAS + Undo 覆盖写入；下一步直接重新调用 write_file，带上同一个精确 path 和完整非空 content。只有 edit_file / multi_edit 才需要先 read_file。`);
+  }
   if (/尚未完整读取当前版本|没有完整读取.*当前版本|先读取已有文件|read-before-edit|阻止盲改|旧版本覆盖/i.test(text) && missingRanges) {
     return mk("read_before_edit_missing_ranges", "READ_MISSING_RANGES",
       `下一步不要再 edit_file / multi_edit。先补齐当前版本缺失范围：${missingRanges[1].trim()}。最稳妥是按工具提示用 ${readStep} 带 offset=1、limit=总行数完整读取当前文件；拿到完整读取结果后，再基于同一版本做 edit_file / multi_edit。`);
@@ -18249,6 +18356,7 @@ function _tauriSearchInvokeArgs(call) {
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
 const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "termread", "termlist", "search_tools", "current_time", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
+const _MUTATING_FILE_TOOL_TYPES = new Set(["write", "edit", "multiedit", "format"]);
 function _isMergedToolItem(item) {
   return item?.merged != null;
 }
@@ -18355,6 +18463,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   // the turn ends (below), so no content is lost.
   let lastFlush = 0;
   let flushTimer = 0;
+  let _activeStreamDiag = null;
   const doRender = () => {
     flushTimer = 0;
     if (!_live()) return; // stopped — don't render (and don't re-add the caret)
@@ -18368,7 +18477,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     const clean = _cleanAgentText(acc);
     if (clean.trim()) {
       if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
-      renderMarkdownStream(streamEl, clean, { streaming: true });
+      renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false });
+      if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
+        _activeStreamDiag.firstRenderMs = Date.now() - _activeStreamDiag.attemptStartedAt;
+      }
     }
     if (!session || session === _currentSession()) _chatFollow();
   };
@@ -18420,8 +18532,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const _stick = b.scrollHeight - b.scrollTop - b.clientHeight < 48;
       const full = _reasoningPrior ? _reasoningPrior + "\n\n———\n\n" + reasoningAcc : reasoningAcc;
       b.dataset.rawText = full;
-      try { renderMarkdownInto(b, full, { streaming: true, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+      try { renderMarkdownInto(b, full, { streaming: true, showCaret: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
       catch { b.textContent = full; }
+      if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
+        _activeStreamDiag.firstRenderMs = Date.now() - _activeStreamDiag.attemptStartedAt;
+      }
       if (_stick) b.scrollTop = b.scrollHeight;
     }
     if (!session || session === _currentSession()) _chatFollow();
@@ -18437,7 +18552,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     reasoningEl = null;
     reasoningAcc = "";
   };
-  const scheduleReasoning = () => { if (!reasoningTimer) reasoningTimer = setTimeout(renderReasoning, 90); };
+  const scheduleReasoning = () => {
+    if (!reasoningTimer) reasoningTimer = setTimeout(renderReasoning, reasoningEl ? 90 : 0);
+  };
 
   // Retry transient failures (rate limits, 5xx, network blips) with exponential
   // backoff — but only while nothing has streamed yet, so a retry can never
@@ -18449,13 +18566,61 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // the Rust side ends a no-progress stream and this loop retries it once.
     let _lastEvAt = Date.now();
     let _stallEl = null; // 思考卡折叠 + 无进度卡时的兜底停顿行
+    _activeStreamDiag = {
+      attemptStartedAt: Date.now(),
+      requestStartedMs: null,
+      responseHeadersMs: null,
+      firstChunkMs: null,
+      firstProgressMs: null,
+      firstRenderMs: null,
+      doneMs: null,
+      bytes: 0,
+    };
+    const _streamDebugOn = (() => {
+      try {
+        return localStorage.getItem("michael_stream_debug") === "1" || /\bstreamDebug=1\b/.test(location.search || "");
+      } catch { return false; }
+    })();
+    const _recordStreamMetric = (ev) => {
+      if (!_activeStreamDiag || !ev || ev.kind !== "streamMetric") return;
+      const ms = Number.isFinite(ev.elapsedMs) ? Math.round(ev.elapsedMs) : (Date.now() - _activeStreamDiag.attemptStartedAt);
+      const phase = String(ev.phase || "");
+      if (phase === "requestStarted") _activeStreamDiag.requestStartedMs = ms;
+      else if (phase === "responseHeaders") _activeStreamDiag.responseHeadersMs = ms;
+      else if (phase === "firstChunk") _activeStreamDiag.firstChunkMs = ms;
+      else if (phase === "firstProgress") _activeStreamDiag.firstProgressMs = ms;
+      else if (phase === "done") _activeStreamDiag.doneMs = ms;
+      if (Number.isFinite(ev.bytes)) _activeStreamDiag.bytes = Math.max(_activeStreamDiag.bytes || 0, ev.bytes);
+      if (_streamDebugOn && typeof console !== "undefined") {
+        console.info("[Michael IDE stream]", { phase, elapsedMs: ms, bytes: _activeStreamDiag.bytes || 0, attempt });
+      }
+    };
+    const _streamStageText = () => {
+      const d = _activeStreamDiag;
+      if (!d) return "";
+      const elapsed = Math.max(0, Math.round((Date.now() - d.attemptStartedAt) / 1000));
+      if (d.firstProgressMs != null) {
+        return d.firstRenderMs == null
+          ? `已收到有效输出 ${d.firstProgressMs}ms，等待前端渲染`
+          : `已收到有效输出 ${d.firstProgressMs}ms，已渲染 ${d.firstRenderMs}ms`;
+      }
+      if (d.firstChunkMs != null) {
+        const size = d.bytes ? `，已收 ${d.bytes}B` : "";
+        return `已收到上游原始流 ${d.firstChunkMs}ms${size}，但还没有 reasoning/token/tool 参数`;
+      }
+      if (d.responseHeadersMs != null) return `已拿到响应头 ${d.responseHeadersMs}ms，等待首个 SSE chunk`;
+      if (d.requestStartedMs != null) return `请求已发出，等待响应头 ${elapsed}s`;
+      return `准备请求 ${elapsed}s`;
+    };
     const _hb = setInterval(() => {
       if (!_live()) return;
       const idle = Math.round((Date.now() - _lastEvAt) / 1000);
       if (idle < 8) return;
+      const stage = _streamStageText();
+      const suffix = stage ? `（${stage}）` : "";
       const msg = attempt > 0
-        ? `快速重试中，等待有效输出 ${idle}s…`
-        : (idle < 20 ? `等待模型有效输出 ${idle}s；长时间无有效进度会自动快速重试` : `已等待 ${idle}s；仍在等待有效输出，超时后会快速重试`);
+        ? `快速重试中，等待有效输出 ${idle}s…${suffix}`
+        : (idle < 20 ? `等待模型有效输出 ${idle}s；长时间无有效进度会自动快速重试${suffix}` : `已等待 ${idle}s；仍在等待有效输出，超时后会快速重试${suffix}`);
       const tEl = body.querySelector(".thinking .thinking__text");
       const pEl = body.querySelector(".code-card--streaming .code-card__label"); // 工具生成中的进度卡
       if (tEl) tEl.textContent = msg;
@@ -18493,11 +18658,18 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       }
       _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools);
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
+        if (ev && ev.kind === "streamMetric") {
+          _recordStreamMetric(ev);
+          return;
+        }
         const _realProgress = ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall";
         if (_realProgress) {
           clearAgentRetryToast();
           _lastEvAt = Date.now();
           if (_stallEl) { _stallEl.remove(); _stallEl = null; }
+          if (_activeStreamDiag && _activeStreamDiag.firstProgressMs == null) {
+            _activeStreamDiag.firstProgressMs = Date.now() - _activeStreamDiag.attemptStartedAt;
+          }
         }
         // User hit Stop: drop every further streamed event so output halts at once
         // (the backend turn keeps running but we render nothing more, and the loop's
@@ -21096,25 +21268,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       }
 
       for (const it of items) {
-        if (it.call && !_isMergedToolItem(it) && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research") { try { it.step = _createToolStep(it.call); body.appendChild(it.step); } catch (_e) { console.error("[toolstep]", _e); } }
+        if (it.call && !_isMergedToolItem(it) && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research") {
+          try { it.step = _createToolStep(it.call); body.appendChild(it.step); _scroll(); } catch (_e) { console.error("[toolstep]", _e); }
+        }
       }
       // Live staging: drive the relevant panel(s) so the user watches the real work
       // (edit→open file, cmd→terminal, read→reveal). The LAST file op in the batch
-      // wins the editor; cmd always pops the terminal. Mutations await their own
-      // staging read before writing so a late openFile(old) cannot overwrite the
-      // Monaco model after the Agent has already committed new content.
+      // wins the editor; cmd always pops the terminal. Mutations are intentionally
+      // staged lazily inside runOne, right before that mutation executes, so a slow
+      // later openFile(old) cannot finish after an earlier write and reinstall stale
+      // Monaco content. This also avoids "wait for every file before rendering".
       for (const it of items) {
-        if (it.call && !_isMergedToolItem(it) && !it._dupRead && !it._unknown) {
+        if (it.call && !_isMergedToolItem(it) && !it._dupRead && !it._unknown && !_MUTATING_FILE_TOOL_TYPES.has(it.call.type)) {
           it.stagePromise = _stageForTool(it.call, root, session, run);
           it.stageReady = _stageWithDeadline(it.stagePromise);
         }
       }
-      // Every file-stage open starts together. Wait for the whole mutation batch
-      // before the first write; otherwise a slower second openFile(old disk) can
-      // finish after the first write and reinstall stale Monaco content.
-      await Promise.allSettled(items
-        .filter((it) => it.stageReady && ["write", "edit", "multiedit", "format"].includes(it.call?.type))
-        .map((it) => it.stageReady));
       _scroll();
 
       const toolMsgs = new Array(items.length);
@@ -21187,7 +21356,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _settleToolStep(step, r, "重复 · 已跳过");
           return _toolResultToString(call, r);
         }
-        if (it.stageReady && (call.type === "write" || call.type === "edit" || call.type === "multiedit" || call.type === "format")) {
+        if (_MUTATING_FILE_TOOL_TYPES.has(call.type)) {
+          if (!it.stageReady) {
+            it.stagePromise = _stageForTool(call, root, session, run);
+            it.stageReady = _stageWithDeadline(it.stagePromise);
+          }
           try { await it.stageReady; } catch {}
         }
         // EXACT-duplicate guard — the model re-issued the IDENTICAL read-only call it just
@@ -21417,7 +21590,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // corrects behavior without becoming another source of chatter.
       if (run.mode === "agent" && recoveryNudges < 4 && _live()) {
         const recovery = toolMsgs
-          .map((m) => _blockedToolRecoveryInstruction(m.content || "", null))
+          .map((m, idx) => _blockedToolRecoveryInstruction(m.content || "", items[idx]?.call || null))
           .filter(Boolean)[0];
         if (recovery && recovery.key !== run._lastRecoveryKey) {
           run._lastRecoveryKey = recovery.key;
@@ -21960,17 +22133,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       note.textContent = "⚠️ " + _formatAgentFinalError(finalErr);
       body.appendChild(note);
     }
-    if (finalVerificationNote && (!verificationPassed || !uiVerificationPassed)) {
+    const _verificationAlertText = String(finalVerificationNote || "")
+      .replace(/[〔〕]/g, "")
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter((line) => line && !/本项目没有可自动识别的验证命令/.test(line))
+      .join("\n");
+    if (_verificationAlertText && (!verificationPassed || !uiVerificationPassed)) {
       const note = document.createElement("div");
       note.className = "msg__error";
-      note.textContent = "⚠️ " + finalVerificationNote.replace(/[〔〕]/g, "");
+      note.textContent = "⚠️ " + _verificationAlertText;
       body.appendChild(note);
     }
     let _outcomeSummary = "";
+    const _hasFinalNarrative = !!(summaryText && summaryText.trim());
+    const _hasPlanWork = Array.isArray(planSteps) && planSteps.length;
     const _shouldRenderOutcome = run.mode === "agent" && (
-      (run.recording && run.recording.length >= 2)
-      || didMutate || (Array.isArray(planSteps) && planSteps.length)
-      || finalErr || finalVerificationNote || hitCap || _runtimeEffects.size || _externalEffects.size
+      didMutate || finalErr || _verificationAlertText || hitCap || _runtimeEffects.size || _externalEffects.size
+      || (!_hasFinalNarrative && ((run.recording && run.recording.length >= 2) || _hasPlanWork))
     );
     if (_shouldRenderOutcome) {
       _outcomeSummary = _buildAgentOutcomeSummary(run, {
@@ -23329,13 +23509,18 @@ async function _executeToolStep(step, call, root, run) {
       }
       const hasCurrentRead = !existed || !run || _runHasCurrentRead(run, root, old, call.path, fp);
       const preciseLocalEdit = existed && call.type === "edit" && _localEditHasPreciseAnchors(old, call);
-      if (existed && run && !hasCurrentRead && !(call.type === "edit" && preciseLocalEdit)) {
+      const redactedRead = existed && _runReadWasRedacted(run, root, old, call.path, fp);
+      // write_file is a whole-file terminal state. If the model provided complete,
+      // non-empty content, the IDE can safely show a full diff, CAS-write the current
+      // disk snapshot, and keep Undo — no need to dead-end with "先读取已有文件".
+      // Local edit/multi_edit still require current read evidence or precise anchors.
+      const completeWholeWrite = call.type === "write" && typeof call.content === "string" && !!call.content.trim() && !redactedRead;
+      if (existed && run && !hasCurrentRead && !completeWholeWrite && !(call.type === "edit" && preciseLocalEdit)) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 先读取已有文件";
         const coverageHint = _readBeforeEditCoverageHint(run, root, old, call.path, call.path, fp);
         return { type: call.type, path: call.path, content: `[BLOCKED] ${call.path} 已存在，但本次运行没有完整读取它的**当前版本**（可能从未读过，也可能在读取后被用户或另一个任务改过）。IDE 已阻止盲改/旧版本覆盖。${coverageHint}` };
       }
-      const redactedRead = existed && _runReadWasRedacted(run, root, old, call.path, fp);
       if (redactedRead && call.type === "write") {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 含打码密钥，禁止整文件覆盖";
         return { type: "write", path: fp, content: `[BLOCKED] ${call.path} 含密钥或令牌，read_file 提供给模型的是打码副本。为防止把 [REDACTED] 写回磁盘或丢失真实值，IDE 已禁止整文件 write_file 覆盖；请用 edit_file / multi_edit 只改与密钥无关的精确片段，或请用户亲自处理敏感值。` };
@@ -26215,7 +26400,7 @@ async function _agentFollowUp(toolResults, container, session) {
     const tail = ce < segs.length ? segs[segs.length - 1] : null;
     if (tail) {
       if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
-      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true }); }
+      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true, showCaret: false }); }
     }
     _chatFollow();
   };

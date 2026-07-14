@@ -279,7 +279,7 @@ test("tool messages append recovery guidance and agent loop nudges after blocked
   );
   assert.match(message, /\[RECOVERY:READ_CURRENT_FILE\]/);
   assert.match(SRC, /工具刚被保护门\/错误挡住了，别换旁门左道/);
-  assert.match(SRC, /_blockedToolRecoveryInstruction\(m\.content \|\| "", null\)/);
+  assert.match(SRC, /_blockedToolRecoveryInstruction\(m\.content \|\| "", items\[idx\]\?\.call \|\| null\)/);
   assert.match(SRC, /recoveryNudges < 4/);
 });
 
@@ -3727,7 +3727,7 @@ test("agent outcome summary is rendered after plan settlement", () => {
     verificationPassed: true,
     uiVerificationPassed: true,
   });
-  assert.match(text, /^### 本轮结果/);
+  assert.ok(!/^### 本轮结果/m.test(text), "outcome summary should not add a rigid '本轮结果' heading");
   assert.match(text, /已完成：读取真实项目结构；运行测试/);
   assert.match(text, /改动文件：src\/main\.js/);
   assert.match(text, /验证：已通过真实命令\/检查/);
@@ -3735,6 +3735,49 @@ test("agent outcome summary is rendered after plan settlement", () => {
   const summaryIdx = SRC.indexOf("_buildAgentOutcomeSummary(run", settleIdx);
   assert.ok(settleIdx >= 0 && summaryIdx > settleIdx,
     "final outcome card must be appended after the plan is settled, so it appears below the final plan card");
+});
+
+test("agent next-step chips use completed run memory and survive suggestion failures", () => {
+  const fallback = load("_fallbackNextActionSuggestions");
+  const chips = fallback([
+    { role: "user", content: "修复工具参数不全" },
+    { role: "assistant", content: "改动文件：src/main.js\n验证：项目未提供可自动识别的验证命令，未强行瞎跑。\n字段 sourceUrl / roomId 的数据契约还要核对。" },
+  ]);
+  assert.ok(chips.includes("补真实验证"));
+  assert.ok(chips.includes("核对数据契约"));
+  assert.match(SRC, /const postRunMessages = Array\.isArray\(sess\.memory\)[\s\S]{0,260}_maybeSuggestNext\(sess, postRunMessages, config\)/,
+    "Agent completion suggestions must be grounded in the post-run memory, not the pre-run messages");
+});
+
+test("missing auto verification command is not rendered as an error card", () => {
+  assert.match(SRC, /filter\(\(line\) => line && !\/本项目没有可自动识别的验证命令\/\.test\(line\)\)/,
+    "the generic no-auto-verification note should be filtered out of msg__error alerts");
+  assert.match(SRC, /验证：项目未提供可自动识别的验证命令，未强行瞎跑/,
+    "if a mutation happened, no-auto-verification should remain a calm summary note, not a warning");
+});
+
+test("bug fixes require causal reasoning before patching", () => {
+  assert.match(SRC, /Bug 修复必须先建立因果链/,
+    "shared agent discipline must require bug-fix causal reasoning, not blind patching");
+  assert.match(SRC, /复现或读取真实报错\/日志\/截图\/诊断\/exit code/,
+    "bug plans must start from real symptoms or failure evidence");
+  assert.match(SRC, /沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链/,
+    "bug plans must inspect control/data flow and boundary conditions");
+  assert.match(SRC, /可证伪根因假设/,
+    "bug plans must carry falsifiable hypotheses instead of vibes");
+  assert.match(SRC, /重跑同一失败路径或聚焦回归测试/,
+    "bug fixes must verify the same failure path or a focused regression");
+});
+
+test("dynamic URLs and third-party fields require real evidence instead of guessing", () => {
+  assert.match(SRC, /URL、接口、跳转、字段含义、商品\/价格\/库存\/直播间\/播放地址\/榜单\/实时状态这类动态事实，必须来自真实页面、真实 HTTP\/网络响应、真实文件样本、官方\/结构化接口或用户授权数据/,
+    "truthfulness prompt must forbid guessing dynamic facts and URLs");
+  assert.match(SRC, /猜出来的链接\/字段只能标成假设，不能写进结果或代码当事实/,
+    "agent discipline must prevent guessed links or fields from becoming code/results");
+  assert.match(SRC, /动态数据\/URL\/接口\/抓包\/爬虫\/第三方页面任务必须列真实证据采集步骤/,
+    "plans for scraping/API work must include real evidence acquisition");
+  assert.match(SRC, /不得先猜 URL 规则/,
+    "plans must explicitly ban URL-rule guessing before real capture");
 });
 
 test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {

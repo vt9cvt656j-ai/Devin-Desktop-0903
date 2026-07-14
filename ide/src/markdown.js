@@ -661,13 +661,13 @@ function flashCopied(btn, label) {
  * Render markdown `text` into `container` (replacing its contents).
  * @param {HTMLElement} container
  * @param {string} text
- * @param {{ highlighter?: (code:string, lang:string)=>Promise<string>, streaming?: boolean }} [opts]
+ * @param {{ highlighter?: (code:string, lang:string)=>Promise<string>, streaming?: boolean, showCaret?: boolean }} [opts]
  */
 export function renderMarkdownInto(container, text, opts = {}) {
   container.textContent = "";
   const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
   container.appendChild(parseBlocks(lines, opts));
-  if (opts.streaming) {
+  if (opts.streaming && opts.showCaret !== false) {
     const caret = el("span", "md-caret");
     container.appendChild(caret);
   }
@@ -720,5 +720,5 @@ export function renderMarkdownStream(container, text, opts = {}) {
   if (!st.tail) { st.tail = el("div", "md-stream-tail"); container.appendChild(st.tail); }
   st.tail.textContent = "";
   if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts));
-  if (opts.streaming) st.tail.appendChild(el("span", "md-caret"));
+  if (opts.streaming && opts.showCaret !== false) st.tail.appendChild(el("span", "md-caret"));
 }

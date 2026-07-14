@@ -8,22 +8,28 @@ use tauri::ipc::Channel;
 
 const STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 20;
 const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 35;
+const STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
 const STANDARD_STREAM_STALL_TIMEOUT_SECS: u64 = 45;
 const HIGH_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 45;
 const HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
+const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
 const HIGH_STREAM_STALL_TIMEOUT_SECS: u64 = 90;
 const EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 90;
 const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
+const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 25;
 const EXTENDED_STREAM_STALL_TIMEOUT_SECS: u64 = 120;
 
 const RESPONSE_HEADERS_TIMEOUT_ENV: &str = "MICHAEL_AI_RESPONSE_HEADERS_TIMEOUT_SECS";
 const FIRST_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_FIRST_PROGRESS_TIMEOUT_SECS";
+const EMPTY_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_EMPTY_STREAM_TIMEOUT_SECS";
 const STREAM_STALL_TIMEOUT_ENV: &str = "MICHAEL_AI_STREAM_STALL_TIMEOUT_SECS";
 
 const RESPONSE_HEADERS_TIMEOUT_MIN_SECS: u64 = 5;
 const RESPONSE_HEADERS_TIMEOUT_MAX_SECS: u64 = 300;
 const FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 10;
 const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 5;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 120;
 const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
 const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_READ_POLL: Duration = Duration::from_secs(2);
@@ -148,6 +154,16 @@ pub enum AiEvent {
         id: String,
         name: String,
         arguments: String,
+    },
+    /// Internal timing breadcrumbs for diagnosing "not really streaming" reports.
+    /// These are separate from real progress: response headers and raw chunks can
+    /// prove the transport is alive without proving the model has emitted usable
+    /// reasoning/content/tool arguments yet.
+    StreamMetric {
+        phase: String,
+        elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
     },
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
@@ -348,6 +364,7 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
 struct StreamTimeouts {
     response_headers: Duration,
     first_progress: Duration,
+    empty_stream: Duration,
     stall: Duration,
 }
 
@@ -370,18 +387,21 @@ impl StreamTimeouts {
             (
                 EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS,
                 EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_STREAM_STALL_TIMEOUT_SECS,
             )
         } else if effort.eq_ignore_ascii_case("high") {
             (
                 HIGH_RESPONSE_HEADERS_TIMEOUT_SECS,
                 HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 HIGH_STREAM_STALL_TIMEOUT_SECS,
             )
         } else {
             (
                 STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS,
                 STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 STANDARD_STREAM_STALL_TIMEOUT_SECS,
             )
         };
@@ -399,9 +419,15 @@ impl StreamTimeouts {
                 FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS,
                 FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS,
             ),
+            empty_stream: bounded_timeout_from_env(
+                read_env(EMPTY_STREAM_PROGRESS_TIMEOUT_ENV),
+                defaults.2,
+                EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS,
+                EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS,
+            ),
             stall: bounded_timeout_from_env(
                 read_env(STREAM_STALL_TIMEOUT_ENV),
-                defaults.2,
+                defaults.3,
                 STREAM_STALL_TIMEOUT_MIN_SECS,
                 STREAM_STALL_TIMEOUT_MAX_SECS,
             ),
@@ -457,6 +483,7 @@ async fn send_with_response_headers_timeout(
 #[derive(Debug)]
 struct StreamProgressDeadline {
     last_progress: Instant,
+    first_activity: Option<Instant>,
     has_progress: bool,
     timeouts: StreamTimeouts,
 }
@@ -465,8 +492,15 @@ impl StreamProgressDeadline {
     fn new(now: Instant, timeouts: StreamTimeouts) -> Self {
         Self {
             last_progress: now,
+            first_activity: None,
             has_progress: false,
             timeouts,
+        }
+    }
+
+    fn record_activity(&mut self, now: Instant) {
+        if self.first_activity.is_none() {
+            self.first_activity = Some(now);
         }
     }
 
@@ -483,24 +517,29 @@ impl StreamProgressDeadline {
         true
     }
 
-    fn limit(&self) -> Duration {
+    fn limit_and_anchor(&self) -> (Duration, Instant) {
         if self.has_progress {
-            self.timeouts.stall
+            (self.timeouts.stall, self.last_progress)
+        } else if let Some(first_activity) = self.first_activity {
+            (self.timeouts.empty_stream, first_activity)
         } else {
-            self.timeouts.first_progress
+            (self.timeouts.first_progress, self.last_progress)
         }
     }
 
     fn remaining(&self, now: Instant) -> Option<Duration> {
-        let elapsed = now.duration_since(self.last_progress);
-        let limit = self.limit();
+        let (limit, anchor) = self.limit_and_anchor();
+        let elapsed = now.duration_since(anchor);
         (elapsed < limit).then(|| limit - elapsed)
     }
 
     fn error_message(&self) -> String {
-        let seconds = duration_seconds_label(self.limit());
+        let (limit, _) = self.limit_and_anchor();
+        let seconds = duration_seconds_label(limit);
         if self.has_progress {
             format!("模型连续 {seconds} 秒没有继续生成有效内容，已停止本轮，请重试。")
+        } else if self.first_activity.is_some() {
+            format!("上游已开始流式传输，但 {seconds} 秒内没有生成有效内容，已停止本轮，请重试。")
         } else {
             format!("模型在 {seconds} 秒内没有生成有效内容，已停止本轮，请重试。")
         }
@@ -533,6 +572,24 @@ fn streamed_tool_call_index(call: &serde_json::Value) -> Result<u32, String> {
         .as_u64()
         .ok_or_else(|| "streamed tool call is missing its numeric index".to_string())?;
     u32::try_from(raw).map_err(|_| "streamed tool call index is out of range".to_string())
+}
+
+fn elapsed_ms_since(started: Instant) -> u64 {
+    let ms = started.elapsed().as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+fn send_stream_metric(
+    on_event: &Channel<AiEvent>,
+    started: Instant,
+    phase: &str,
+    bytes: Option<u64>,
+) {
+    let _ = on_event.send(AiEvent::StreamMetric {
+        phase: phase.to_string(),
+        elapsed_ms: elapsed_ms_since(started),
+        bytes,
+    });
 }
 
 #[cfg(test)]
@@ -688,11 +745,31 @@ mod stream_timeout_tests {
         (result, captured)
     }
 
+    fn non_metric_kinds(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event["kind"].as_str())
+            .filter(|kind| *kind != "streamMetric")
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn first_event_of_kind<'a>(
+        events: &'a [serde_json::Value],
+        kind: &str,
+    ) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|event| event["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing event kind {kind}"))
+    }
+
     #[test]
     fn default_medium_deadlines_stay_fast_and_bounded() {
         let standard = StreamTimeouts {
             response_headers: Duration::from_secs(20),
             first_progress: Duration::from_secs(35),
+            empty_stream: Duration::from_secs(18),
             stall: Duration::from_secs(45),
         };
         assert_eq!(timeouts(Some("medium"), None), standard);
@@ -707,12 +784,14 @@ mod stream_timeout_tests {
             StreamTimeouts {
                 response_headers: Duration::from_secs(45),
                 first_progress: Duration::from_secs(90),
+                empty_stream: Duration::from_secs(18),
                 stall: Duration::from_secs(90),
             }
         );
         let extended = StreamTimeouts {
             response_headers: Duration::from_secs(90),
             first_progress: Duration::from_secs(180),
+            empty_stream: Duration::from_secs(25),
             stall: Duration::from_secs(120),
         };
         assert_eq!(timeouts(Some("max"), None), extended);
@@ -725,6 +804,7 @@ mod stream_timeout_tests {
         let values = HashMap::from([
             (RESPONSE_HEADERS_TIMEOUT_ENV, "1".to_string()),
             (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "9999".to_string()),
+            (EMPTY_STREAM_PROGRESS_TIMEOUT_ENV, "3".to_string()),
             (STREAM_STALL_TIMEOUT_ENV, "61".to_string()),
         ]);
         let overridden = StreamTimeouts::for_config_with_env(&config(Some("high"), None), |name| {
@@ -735,6 +815,7 @@ mod stream_timeout_tests {
             StreamTimeouts {
                 response_headers: Duration::from_secs(5),
                 first_progress: Duration::from_secs(300),
+                empty_stream: Duration::from_secs(5),
                 stall: Duration::from_secs(61),
             }
         );
@@ -742,6 +823,10 @@ mod stream_timeout_tests {
         let invalid = HashMap::from([
             (RESPONSE_HEADERS_TIMEOUT_ENV, "not-a-number".to_string()),
             (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "".to_string()),
+            (
+                EMPTY_STREAM_PROGRESS_TIMEOUT_ENV,
+                "not-a-number".to_string(),
+            ),
             (STREAM_STALL_TIMEOUT_ENV, "-10".to_string()),
         ]);
         assert_eq!(
@@ -771,6 +856,38 @@ mod stream_timeout_tests {
             Some(Duration::from_secs(1))
         );
         assert_eq!(progress.remaining(started + Duration::from_secs(65)), None);
+    }
+
+    #[test]
+    fn raw_stream_activity_without_real_delta_uses_short_deadline() {
+        let timeouts = timeouts(Some("high"), None);
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+
+        assert_eq!(
+            progress.remaining(started + Duration::from_secs(40)),
+            Some(Duration::from_secs(50)),
+            "before any bytes arrive, high reasoning may still wait for first progress"
+        );
+
+        let first_raw_chunk = started + Duration::from_secs(2);
+        progress.record_activity(first_raw_chunk);
+        assert_eq!(
+            progress.remaining(first_raw_chunk + timeouts.empty_stream - Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "once raw bytes arrive, empty streams must stop quickly instead of using the high first-progress window"
+        );
+        assert_eq!(
+            progress.remaining(first_raw_chunk + timeouts.empty_stream),
+            None
+        );
+
+        progress.record(first_raw_chunk + Duration::from_secs(4));
+        assert_eq!(
+            progress.remaining(first_raw_chunk + Duration::from_secs(4) + timeouts.stall),
+            None,
+            "real progress switches back to the normal stall deadline"
+        );
     }
 
     #[test]
@@ -820,6 +937,7 @@ mod stream_timeout_tests {
         let timeouts = StreamTimeouts {
             response_headers: Duration::from_secs(73),
             first_progress: Duration::from_secs(81),
+            empty_stream: Duration::from_secs(17),
             stall: Duration::from_secs(97),
         };
         assert_eq!(
@@ -832,6 +950,11 @@ mod stream_timeout_tests {
         assert_eq!(
             progress.error_message(),
             "模型在 81 秒内没有生成有效内容，已停止本轮，请重试。"
+        );
+        progress.record_activity(started + Duration::from_secs(1));
+        assert_eq!(
+            progress.error_message(),
+            "上游已开始流式传输，但 17 秒内没有生成有效内容，已停止本轮，请重试。"
         );
         progress.record(started + Duration::from_secs(1));
         assert_eq!(
@@ -922,13 +1045,16 @@ mod stream_timeout_tests {
 
         assert_eq!(error, INCOMPLETE_SSE_STREAM_ERROR);
         let events = events.lock().unwrap();
-        let kinds: Vec<_> = events
-            .iter()
-            .filter_map(|event| event["kind"].as_str())
-            .collect();
+        let kinds = non_metric_kinds(&events);
         assert_eq!(kinds, ["toolCall", "error"]);
-        assert_eq!(events[0]["arguments"], partial_args);
-        assert_eq!(events[1]["message"], INCOMPLETE_SSE_STREAM_ERROR);
+        assert_eq!(
+            first_event_of_kind(&events, "toolCall")["arguments"],
+            partial_args
+        );
+        assert_eq!(
+            first_event_of_kind(&events, "error")["message"],
+            INCOMPLETE_SSE_STREAM_ERROR
+        );
         assert!(!events.iter().any(|event| event["kind"] == "done"));
     }
 
@@ -952,12 +1078,12 @@ mod stream_timeout_tests {
 
         let error = result.unwrap_err();
         assert!(error.contains("malformed SSE JSON"));
-        let kinds = events
-            .iter()
-            .filter_map(|event| event["kind"].as_str())
-            .collect::<Vec<_>>();
+        let kinds = non_metric_kinds(&events);
         assert_eq!(kinds, ["toolCall", "error"]);
-        assert_eq!(events[0]["arguments"], arguments);
+        assert_eq!(
+            first_event_of_kind(&events, "toolCall")["arguments"],
+            arguments
+        );
         assert!(!events.iter().any(|event| event["kind"] == "done"));
     }
 
@@ -971,10 +1097,7 @@ mod stream_timeout_tests {
 
         let error = result.unwrap_err();
         assert!(error.contains("invalid UTF-8 SSE data"));
-        let kinds = events
-            .iter()
-            .filter_map(|event| event["kind"].as_str())
-            .collect::<Vec<_>>();
+        let kinds = non_metric_kinds(&events);
         assert_eq!(kinds, ["error"]);
         assert!(!events.iter().any(|event| event["kind"] == "done"));
     }
@@ -988,6 +1111,8 @@ async fn ai_chat_inner(
 ) -> Result<(), String> {
     let timeouts = StreamTimeouts::for_config(&config);
     let url = chat_completions_url(&config.base_url)?;
+    let stream_started = Instant::now();
+    send_stream_metric(&on_event, stream_started, "requestStarted", None);
     let mut payload = serde_json::json!({
         "model": config.model,
         "stream": true,
@@ -1110,6 +1235,7 @@ async fn ai_chat_inner(
         });
         return Err(message);
     }
+    send_stream_metric(&on_event, stream_started, "responseHeaders", None);
 
     let mut stream = resp.bytes_stream();
     // Accumulate RAW BYTES, not lossily-decoded strings: a multibyte UTF-8 char
@@ -1125,6 +1251,9 @@ async fn ai_chat_inner(
     // delta gets a longer stall window. SSE comments, empty deltas, usage-only
     // chunks and arbitrary response bytes never extend either deadline.
     let mut progress = StreamProgressDeadline::new(Instant::now(), timeouts);
+    let mut raw_stream_bytes: u64 = 0;
+    let mut sent_first_chunk_metric = false;
+    let mut sent_first_progress_metric = false;
     // Cancellation: register a flag keyed by the JS-supplied request_id (if any).
     // The guard removes it on every return path; the loop polls it so Stop aborts.
     let req_id = config.request_id.clone().filter(|s| !s.is_empty());
@@ -1181,6 +1310,17 @@ async fn ai_chat_inner(
                 continue;
             }
         };
+        progress.record_activity(Instant::now());
+        raw_stream_bytes = raw_stream_bytes.saturating_add(chunk.len() as u64);
+        if !sent_first_chunk_metric {
+            sent_first_chunk_metric = true;
+            send_stream_metric(
+                &on_event,
+                stream_started,
+                "firstChunk",
+                Some(raw_stream_bytes),
+            );
+        }
         buf.extend_from_slice(&chunk);
 
         // Server-sent events are newline-delimited `data: {...}` lines.
@@ -1201,6 +1341,7 @@ async fn ai_chat_inner(
             };
             let data = data.trim();
             if data == "[DONE]" {
+                send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
             }
@@ -1257,6 +1398,15 @@ async fn ai_chat_inner(
                 }
             }
             let delta = &v["choices"][0]["delta"];
+            if progress.record_delta(delta, Instant::now()) && !sent_first_progress_metric {
+                sent_first_progress_metric = true;
+                send_stream_metric(
+                    &on_event,
+                    stream_started,
+                    "firstProgress",
+                    Some(raw_stream_bytes),
+                );
+            }
             // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
             if let Some(rt) = delta["reasoning_content"]
                 .as_str()
@@ -1301,7 +1451,6 @@ async fn ai_chat_inner(
                     }
                 }
             }
-            progress.record_delta(delta, Instant::now());
         }
 
         // Continuous heartbeat chunks may prevent the read timeout from firing, so
@@ -1492,7 +1641,10 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
                 }
             }
         }
-        return Err(format!("HTTP {} (反爬拦截，无头浏览器也未能获取内容)", code));
+        return Err(format!(
+            "HTTP {} (反爬拦截，无头浏览器也未能获取内容)",
+            code
+        ));
     }
 
     if !status.is_success() {

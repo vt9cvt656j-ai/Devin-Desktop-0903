@@ -39,8 +39,13 @@ fn percent_encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => { out.push('%'); out.push_str(&format!("{:02X}", b)); }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{:02X}", b));
+            }
         }
     }
     out
@@ -1629,12 +1634,24 @@ async fn fetch_baidu_places(
             continue;
         }
         let loc = r.get("location");
-        let lat = loc.and_then(|l| l.get("lat")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let lng = loc.and_then(|l| l.get("lng")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let lat = loc
+            .and_then(|l| l.get("lat"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let lng = loc
+            .and_then(|l| l.get("lng"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let detail = r.get("detail_info");
-        let rating = detail
-            .and_then(|d| d.get("overall_rating"))
-            .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_f64() } else { s.parse::<f64>().ok() }));
+        let rating = detail.and_then(|d| d.get("overall_rating")).and_then(|v| {
+            v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| {
+                if s.is_empty() {
+                    v.as_f64()
+                } else {
+                    s.parse::<f64>().ok()
+                }
+            })
+        });
         let price_str = detail
             .and_then(|d| d.get("price"))
             .and_then(|v| v.as_str())
@@ -1654,9 +1671,15 @@ async fn fetch_baidu_places(
             .get("telephone")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let comment_num = detail
-            .and_then(|d| d.get("comment_num"))
-            .and_then(|v| v.as_str().or_else(|| v.as_u64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_u64().map(|n| n.to_string()) } else { Some(s.to_string()) }));
+        let comment_num = detail.and_then(|d| d.get("comment_num")).and_then(|v| {
+            v.as_str().or_else(|| v.as_u64().map(|_| "")).and_then(|s| {
+                if s.is_empty() {
+                    v.as_u64().map(|n| n.to_string())
+                } else {
+                    Some(s.to_string())
+                }
+            })
+        });
         let tag = detail
             .and_then(|d| d.get("tag"))
             .and_then(|v| v.as_str())
@@ -1745,10 +1768,7 @@ async fn fetch_amap_places(
         if name.is_empty() {
             continue;
         }
-        let loc_str = p
-            .get("location")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0,0");
+        let loc_str = p.get("location").and_then(|v| v.as_str()).unwrap_or("0,0");
         let mut parts = loc_str.split(',');
         let lng: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let lat: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -2123,8 +2143,14 @@ pub async fn local_discovery(
         "Amap Place",
         fetch_amap_places(&query, &center, radius_m, limit),
     );
-    let (reverse_result, overpass_result, weather_result, wikipedia_result, baidu_result, amap_result) =
-        tokio::join!(reverse, overpass, weather, wikipedia, baidu, amap);
+    let (
+        reverse_result,
+        overpass_result,
+        weather_result,
+        wikipedia_result,
+        baidu_result,
+        amap_result,
+    ) = tokio::join!(reverse, overpass, weather, wikipedia, baidu, amap);
 
     if reverse_needed {
         match reverse_result {
@@ -2229,9 +2255,19 @@ pub async fn local_discovery(
         }
         Ok(_) => {
             if baidu_ak().is_some() {
-                statuses.push(status("baidu_map", SourceState::Empty, 0, "No Baidu POI results for this query."));
+                statuses.push(status(
+                    "baidu_map",
+                    SourceState::Empty,
+                    0,
+                    "No Baidu POI results for this query.",
+                ));
             } else {
-                statuses.push(status("baidu_map", SourceState::Skipped, 0, "BAIDU_MAP_AK not set."));
+                statuses.push(status(
+                    "baidu_map",
+                    SourceState::Skipped,
+                    0,
+                    "BAIDU_MAP_AK not set.",
+                ));
             }
         }
         Err(error) => statuses.push(status("baidu_map", SourceState::Failed, 0, error)),
@@ -2249,7 +2285,12 @@ pub async fn local_discovery(
         }
         Ok(_) => {
             if amap_key().is_some() {
-                statuses.push(status("amap", SourceState::Empty, 0, "No Amap POI results for this query."));
+                statuses.push(status(
+                    "amap",
+                    SourceState::Empty,
+                    0,
+                    "No Amap POI results for this query.",
+                ));
             } else {
                 statuses.push(status("amap", SourceState::Skipped, 0, "AMAP_KEY not set."));
             }
