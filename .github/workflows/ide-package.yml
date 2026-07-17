@@ -3,9 +3,6 @@ name: Package Michael IDE (macOS DMG + Windows EXE/MSI)
 on:
   workflow_dispatch:
   workflow_call:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: write
