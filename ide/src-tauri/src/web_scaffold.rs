@@ -1,6 +1,6 @@
 // Deterministic web scaffold — the v0.dev "curated starter" advantage.
 // Instead of the agent typing a bare `npm create vite`, this lays down a
-// runnable Vite + Vue 3 + Tailwind project whose design-token system, font
+// runnable Vite + Vue 3/React + Tailwind v4 project whose design-token system, font
 // pairing and base component classes are already curated — so every site
 // starts from the same high-quality, non-AI-slop base. The agent then builds
 // pages on top (npm install + npm run dev).
@@ -71,15 +71,11 @@ pub async fn web_scaffold(
         .map_err(|e| format!("创建项目目录失败: {e}"))?;
 
     // Files shared by both stacks
-    put(&dir, "tailwind.config.js", TAILWIND_CONFIG).await?;
-    put(&dir, "postcss.config.js", POSTCSS_CONFIG).await?;
     put(&dir, "src/style.css", STYLE_CSS).await?;
     put(&dir, ".gitignore", GITIGNORE).await?;
     put(&dir, "README.md", &readme(&proj)).await?;
 
     let mut files: Vec<&str> = vec![
-        "tailwind.config.js",
-        "postcss.config.js",
         "src/style.css",
         "README.md",
         ".gitignore",
@@ -120,7 +116,7 @@ pub async fn web_scaffold(
         "framework": if is_react { "react" } else { "vue" },
         "files": files,
         "next": format!("cd {proj} && npm install && npm run dev"),
-        "note": "已铺好 Vite + Tailwind + 设计令牌系统(src/style.css :root) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；组件一律用 var(--...) / Tailwind theme，别写死数值。在此基座上建页面。"
+        "note": "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 风格 OKLCH 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。"
     }))
 }
 
@@ -135,13 +131,12 @@ fn pkg_json(proj: &str, react: bool) -> String {
   "version": "0.1.0",
   "type": "module",
   "scripts": {{ "dev": "vite", "build": "vite build", "preview": "vite preview" }},
-  "dependencies": {{ "react": "^18.3.1", "react-dom": "^18.3.1" }},
+  "dependencies": {{ "react": "^19.2.7", "react-dom": "^19.2.7" }},
   "devDependencies": {{
-    "@vitejs/plugin-react": "^4.3.4",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.17",
-    "vite": "^6.0.7"
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.1.5"
   }}
 }}
 "#
@@ -154,13 +149,12 @@ fn pkg_json(proj: &str, react: bool) -> String {
   "version": "0.1.0",
   "type": "module",
   "scripts": {{ "dev": "vite", "build": "vite build", "preview": "vite preview" }},
-  "dependencies": {{ "vue": "^3.5.13" }},
+  "dependencies": {{ "vue": "^3.5.40" }},
   "devDependencies": {{
-    "@vitejs/plugin-vue": "^5.2.1",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.17",
-    "vite": "^6.0.7"
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.1.5"
   }}
 }}
 "#
@@ -170,88 +164,100 @@ fn pkg_json(proj: &str, react: bool) -> String {
 
 const VITE_CONFIG_VUE: &str = r#"import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   server: { host: '127.0.0.1', port: 3000 },
 })
 "#;
 
 const VITE_CONFIG_REACT: &str = r#"import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: { host: '127.0.0.1', port: 3000 },
 })
 "#;
 
-const POSTCSS_CONFIG: &str = r#"export default {
-  plugins: { tailwindcss: {}, autoprefixer: {} },
-}
-"#;
-
-// Tailwind theme is wired to the CSS-variable tokens in style.css, so Tailwind
-// utilities and raw CSS share one source of truth. Change a token → both update.
-const TAILWIND_CONFIG: &str = r#"/** @type {import('tailwindcss').Config} */
-export default {
-  content: ['./index.html', './src/**/*.{vue,js,jsx,ts,tsx}'],
-  theme: {
-    extend: {
-      colors: {
-        bg: 'var(--bg)', surface: 'var(--surface)', border: 'var(--border)',
-        text: 'var(--text)', muted: 'var(--text-muted)', faint: 'var(--text-faint)',
-        primary: 'var(--primary)', 'primary-hover': 'var(--primary-hover)',
-      },
-      fontFamily: {
-        sans: 'var(--font-sans)', display: 'var(--font-display)', mono: 'var(--font-mono)',
-      },
-      borderRadius: { sm: 'var(--radius-sm)', DEFAULT: 'var(--radius-md)', lg: 'var(--radius-lg)' },
-      boxShadow: { sm: 'var(--shadow-sm)', md: 'var(--shadow-md)' },
-      maxWidth: { prose: '65ch', content: '72rem' },
-    },
-  },
-  plugins: [],
-}
-"#;
-
 // The design system. Fonts default to a real pairing (NOT Inter). All values
 // are tokens — components reference var(--…), never hardcode.
-const STYLE_CSS: &str = r#"@tailwind base;
-@tailwind components;
-@tailwind utilities;
+const STYLE_CSS: &str = r#"@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
 
 :root {
   /* fonts — a real pairing, not the AI-slop Inter default */
-  --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;
-  --font-display: 'Space Grotesk', var(--font-sans);
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans-family: 'Manrope', system-ui, -apple-system, sans-serif;
+  --font-display-family: 'Space Grotesk', var(--font-sans-family);
+  --font-mono-family: 'JetBrains Mono', ui-monospace, monospace;
   /* spacing — 4px grid */
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
-  /* color — light theme, neutral with a slight cool bias */
-  --bg: #ffffff; --surface: #f8fafc; --border: #e5e7eb;
-  --text: #1f2937; --text-muted: #6b7280; --text-faint: #9ca3af;
-  --primary: #4f46e5; --primary-hover: #4338ca; --primary-light: #eef2ff;
-  --success: #16a34a; --warning: #d97706; --danger: #dc2626;
+  /* shadcn-style OKLCH semantic tokens */
+  --bg: oklch(0.99 0.006 255);
+  --surface: oklch(0.97 0.01 255);
+  --border: oklch(0.9 0.018 255);
+  --text: oklch(0.18 0.025 255);
+  --text-muted: oklch(0.48 0.035 255);
+  --text-faint: oklch(0.64 0.03 255);
+  --primary: oklch(0.55 0.22 265);
+  --primary-hover: oklch(0.5 0.24 265);
+  --primary-light: oklch(0.94 0.04 265);
+  --success: oklch(0.62 0.16 145);
+  --warning: oklch(0.72 0.16 70);
+  --danger: oklch(0.58 0.22 28);
   /* radius / shadow / motion */
   --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px; --radius-full: 9999px;
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.06);
   --shadow-md: 0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 6px -2px rgb(0 0 0 / 0.05);
   --duration: 160ms; --ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0b0e14; --surface: #141922; --border: #232a36;
-    --text: #e6e9ef; --text-muted: #9aa4b2; --text-faint: #6b7480;
-    --primary: #818cf8; --primary-hover: #a5b4fc; --primary-light: #1e2333;
-    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
-    --shadow-md: 0 8px 24px -4px rgb(0 0 0 / 0.5);
-  }
+
+.dark {
+  --bg: oklch(0.14 0.025 255);
+  --surface: oklch(0.2 0.026 255);
+  --border: oklch(0.29 0.03 255);
+  --text: oklch(0.96 0.01 255);
+  --text-muted: oklch(0.72 0.025 255);
+  --text-faint: oklch(0.58 0.025 255);
+  --primary: oklch(0.72 0.18 265);
+  --primary-hover: oklch(0.78 0.16 265);
+  --primary-light: oklch(0.25 0.07 265);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 8px 24px -4px rgb(0 0 0 / 0.5);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-muted: var(--text-muted);
+  --color-faint: var(--text-faint);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-light: var(--primary-light);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --font-sans: var(--font-sans-family);
+  --font-display: var(--font-display-family);
+  --font-mono: var(--font-mono-family);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-full: var(--radius-full);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --container-prose: 65ch;
+  --container-content: 72rem;
 }
 
 @layer base {
-  body { background: var(--bg); color: var(--text); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
-  h1, h2, h3 { font-family: var(--font-display); line-height: 1.12; letter-spacing: -0.01em; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-sans-family); -webkit-font-smoothing: antialiased; }
+  h1, h2, h3 { font-family: var(--font-display-family); line-height: 1.12; letter-spacing: -0.01em; }
   p { line-height: 1.6; }
 }
 

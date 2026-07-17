@@ -20,14 +20,14 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-// The bundled registry currently contains 118 tools. Keep a bounded margin for
+// The bundled registry currently contains 129 tools. Keep a bounded margin for
 // additions while allowing the IDE to send its complete static selection.
-const MAX_STATIC_TOOLS_PER_REQUEST: usize = 128;
+const MAX_STATIC_TOOLS_PER_REQUEST: usize = 160;
 // L0 defense: the desktop can aggregate tools from several runtime/MCP services before this
 // request reaches the server. Bound the final array after every merge so one noisy service cannot
 // create an unbounded upstream payload. This limit is the complete compact JSON array, including
 // brackets and commas, measured as serialized UTF-8 bytes.
-const MAX_FINAL_TOOLS_PER_REQUEST: usize = 128;
+const MAX_FINAL_TOOLS_PER_REQUEST: usize = 160;
 const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
 
 fn prompt_path(name: &str) -> PathBuf {
@@ -989,8 +989,12 @@ fn validated_user_timezone(
     Some((timezone, claimed_offset_minutes))
 }
 
+// 天级粒度，绝不能出现时/分：这个块被拼在重建系统提示的最前面（= 整个请求前缀的第 0 字节），
+// OpenAI 系 prompt cache 按前缀逐字节匹配——此前它精确到分钟，agent 长跑每轮都跨分钟，导致
+// 12 万 token 的请求逐轮全量 cache miss（实测整会话命中率 2%）。精确时刻由前端注入在 user
+// 消息尾部的时间块或时间类工具提供，前缀里只保留每天变一次的日期。
 fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chrono::Utc>) -> String {
-    use chrono::{Datelike, Timelike};
+    use chrono::Datelike;
 
     let timezone = headers
         .get("x-ide-timezone")
@@ -1014,13 +1018,11 @@ fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chron
     let absolute_offset = offset_minutes.abs();
 
     format!(
-        "【当前真实时间·用户本地】今天是 {}-{:02}-{:02} {} {:02}:{:02}（{}，UTC{}{:02}:{:02}）。日期、星期和时间差用此时钟计算；它只表示本轮请求时间，不是任何来源的发布时间或更新时间，也不能证明某项内容\"最新\"。最新版本或现状仍需本轮来源核验。",
+        "【当前真实日期·用户本地】今天是 {}-{:02}-{:02} {}（{}，UTC{}{:02}:{:02}）。日期、星期和日期差用此日历计算；需要精确到时分的当前时刻时，以对话中注入的时间信息或时间类工具为准。它只表示本轮请求日期，不是任何来源的发布时间或更新时间，也不能证明某项内容\"最新\"。最新版本或现状仍需本轮来源核验。",
         local.year(),
         local.month(),
         local.day(),
         weekday,
-        local.hour(),
-        local.minute(),
         timezone_label,
         sign,
         absolute_offset / 60,
@@ -1078,6 +1080,9 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
 /// The point is that the deepest design guidance (`ui_design_guide`/`css_concrete_tokens`)
 /// was previously gated behind an `x-ide-ui` header that NOTHING emits — so it never
 /// reached the model. This makes it fire whenever the work is plausibly UI/frontend.
+// 保留备用（运维排查/统计可用）：agent/plan 模式的设计体系已改为无条件常驻，
+// 不再用关键词猜测——关键词表永远列不全（"个人引导页"曾漏网）。
+#[allow(dead_code)]
 fn looks_like_ui_task(q: &str) -> bool {
     let l = q.to_lowercase();
     // ASCII terms (matched against the lowercased query)
@@ -1120,6 +1125,17 @@ fn looks_like_ui_task(q: &str) -> bool {
         "布局",
         "按钮",
         "落地页",
+        "引导页",
+        "介绍页",
+        "宣传页",
+        "展示页",
+        "着陆页",
+        "单页",
+        "个人主页",
+        "个人页",
+        "作品集",
+        "简历页",
+        "博客",
         "官网",
         "主页",
         "首页",
@@ -1633,17 +1649,18 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         }
     }
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
-    let ui_intent = ui_env.as_deref() == Some("always")
-        || (ui_env.as_deref() != Some("0")
-            && (hdr("x-ide-ui").is_some()
-                || user_request
-                    .as_deref()
-                    .map(|request| {
-                        looks_like_ui_task(request) && !looks_like_desktop_automation_task(request)
-                    })
-                    .unwrap_or(false)));
+    // 不做关键词猜测：agent/plan 模式**永远**带设计体系（shadcn/ui + Tailwind 调色板 +
+    // 令牌契约）。关键词表永远列不全——"个人引导页"就曾漏网，导致那一轮设计知识注入为零。
+    // 块开头自带"用户让你设计/做界面时看这份"的适用范围，非 UI 任务模型自会略过；前缀
+    // 缓存已修复（时间块天级化+棘轮压缩），常驻静态块的重复成本≈0 且让前缀更稳定。
+    // MICHAEL_UI_GUIDE=0 仍是运维总开关；其他模式仍可用 x-ide-ui 头显式开启。
+    let ui_intent = ui_env.as_deref() != Some("0")
+        && (mode == "agent"
+            || mode == "plan"
+            || hdr("x-ide-ui").is_some()
+            || ui_env.as_deref() == Some("always"));
     if ui_intent {
-        for name in ["ui_design_flow", "css_concrete_tokens"] {
+        for name in ["ui_design_flow", "shadcn_design_system", "css_concrete_tokens"] {
             let block = read_prompt(name).unwrap_or_default();
             if !block.is_empty() {
                 prompt_blocks.push(name);
@@ -1660,10 +1677,28 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             }
         }
     }
+    // 会话内粘性门控：不只看"最新一条请求"。续跑轮（"继续"）、短追问（"还是不行再修修"）、
+    // 运行中 steering（"换个思路"）都不含工程关键词，只看最后一句会让检查点在最需要深思的
+    // 迭代调试轮集体消失（用户实测"推理时好时坏"的来源之一）。改为有界扫描最近 20 条
+    // user 消息，任一条命中工程信号即视为工程会话——纯闲聊历史没有关键词，原测试语义不变。
     let needs_reasoning_checkpoint = mode == "agent"
-        && user_request.as_deref().is_some_and(|request| {
+        && (user_request.as_deref().is_some_and(|request| {
             looks_like_coding_task(request) || looks_like_engineering_diagnostic(request)
-        });
+        }) || body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|msgs| {
+                msgs.iter()
+                    .rev()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                    .take(20)
+                    .filter_map(user_message_text)
+                    .any(|text| {
+                        let bounded: String = text.chars().take(2000).collect();
+                        looks_like_coding_task(&bounded)
+                            || looks_like_engineering_diagnostic(&bounded)
+                    })
+            }));
     if needs_reasoning_checkpoint {
         prompt_blocks.push("reasoning_checkpoint");
         sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 真实目标和成功终态是什么？② 输入/输出/状态变化/错误路径/调用方这些契约清了吗？③ 这一步要拿到或改变什么证据？④ 哪些边界、并发、空值、权限或版本差异会炸？⑤ 写入前每行代码是否都有来源、有用途、能编译、能被验证？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
@@ -1678,7 +1713,26 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // reference block for a concrete coding task; prompt tier only changes presentation density.
     // Env MICHAEL_AUTO_KNOWLEDGE=0 remains an operational kill switch.
     if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
-        if let Some(block) = auto_knowledge_block(mode, user_request.as_deref()) {
+        // 粘性检索查询：续跑轮（"继续/再改改"）不含工程描述，工程参考块会整轮消失——
+        // 恰恰是迭代实现最需要社区参考的轮次。当前请求不合格时，回退到最近一条合格的
+        // 用户消息作为检索 query（有界扫描，最多 20 条、每条前 2000 字符）。
+        let knowledge_query = user_request
+            .clone()
+            .filter(|q| looks_like_coding_task(q))
+            .or_else(|| {
+                body.get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|msgs| {
+                        msgs.iter()
+                            .rev()
+                            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                            .take(20)
+                            .filter_map(user_message_text)
+                            .map(|t| t.chars().take(2000).collect::<String>())
+                            .find(|t| looks_like_coding_task(t))
+                    })
+            });
+        if let Some(block) = auto_knowledge_block(mode, knowledge_query.as_deref()) {
             sys.push_str("\n\n");
             sys.push_str(&block);
             prompt_blocks.push("auto_knowledge");
@@ -1699,6 +1753,28 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         if !sys.is_empty() {
             msgs.insert(0, serde_json::json!({ "role": "system", "content": sys }));
+        }
+        // 就近推理强化（恢复 dca37cb 移除的能力，但不拆 assistant(tool_calls)+tool 配对）：
+        // 长 run 里检查点被压在几万 token 工具输出上方，模型后半程推理纪律无再锚定
+        // （用户实测"跑时间长就不思考了"）。把一行精简检查点追加到最后一条 user 文本
+        // 消息末尾——纯文本追加绝不破坏消息配对；最后一条不是 user 文本就跳过。
+        if needs_reasoning_checkpoint {
+            if let Some(last) = msgs.last_mut() {
+                let is_user = last.get("role").and_then(|r| r.as_str()) == Some("user");
+                let text = last
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+                if is_user {
+                    if let Some(text) = text {
+                        if !text.contains("⚡推理检查") {
+                            last["content"] = serde_json::json!(format!(
+                                "{text}\n\n（⚡推理检查：动手前快速过一遍——目标终态？契约与边界？这一步要拿到什么证据？哪里会炸？想清楚再动，证据足够就收，不重复展开已排除分支。）"
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
     // 2) inject the requested tool schemas from tools.json (client sends only the NAMES it
@@ -1808,6 +1884,7 @@ const PROMPT_NAMES: &[&str] = &[
     "reviewer",
     "ui_design_guide",
     "ui_design_flow",
+    "shadcn_design_system",
     "css_concrete_tokens",
     // tail (subagent task/system prompts, git guide, small inline utility prompts)
     "subagent_system",
@@ -2505,12 +2582,13 @@ mod tests {
             .filter_map(tool_function_name)
             .collect::<Vec<_>>()
             .join(",");
+        let runtime_count = MAX_FINAL_TOOLS_PER_REQUEST + 20 - bundled.len();
         assert!(
-            bundled.len() + 20 > MAX_FINAL_TOOLS_PER_REQUEST,
+            bundled.len() + runtime_count > MAX_FINAL_TOOLS_PER_REQUEST,
             "fixture must exercise the aggregate count limit"
         );
 
-        let runtime = (0..20)
+        let runtime = (0..runtime_count)
             .map(|index| test_tool(&format!("runtime_{index}"), "runtime MCP schema"))
             .collect::<Vec<_>>();
         let mut headers = HeaderMap::new();
@@ -2527,7 +2605,7 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), MAX_FINAL_TOOLS_PER_REQUEST);
         assert!(serde_json::to_vec(tools).unwrap().len() <= MAX_FINAL_TOOL_SCHEMA_BYTES);
-        for (index, tool) in tools.iter().take(20).enumerate() {
+        for (index, tool) in tools.iter().take(runtime_count).enumerate() {
             assert_eq!(
                 tool_function_name(tool),
                 Some(format!("runtime_{index}").as_str()),
@@ -3064,7 +3142,9 @@ mod tests {
             assert!(system.contains("自动化任务按小状态机执行"), "{model}");
             assert!(system.contains("失败恢复要换策略而不是原样重试"), "{model}");
             assert!(!system.contains("# 十、自动化"), "{model}");
-            assert!(!system.contains("# UI 设计 token 与组件契约"), "{model}");
+            // 新契约：agent 模式设计体系永远在场（不做关键词猜测——"引导页"曾漏网导致
+            // 那一轮设计知识注入为零）。自动化任务也带 UI 块，块头自带适用范围说明。
+            assert!(system.contains("# UI 设计 token 与组件契约"), "{model}");
         }
 
         let mut headers = HeaderMap::new();
@@ -3080,7 +3160,8 @@ mod tests {
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
         assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
-        assert!(!system.contains("# UI 设计 token 与组件契约"));
+        // 新契约：agent 模式设计体系永远在场（详见上方注释）
+        assert!(system.contains("# UI 设计 token 与组件契约"));
     }
 
     #[test]
@@ -3347,10 +3428,11 @@ mod tests {
             .unwrap();
 
         let block = user_local_time_block_at(&headers, utc);
-        assert!(block.contains("2025-12-31 周三 19:30"));
-        assert!(block.contains("America/Los_Angeles，UTC-08:00"));
+        assert!(block.contains("2025-12-31 周三（America/Los_Angeles，UTC-08:00）"));
         assert!(block.contains("不能证明某项内容\"最新\""));
         assert!(block.contains("最新版本或现状仍需本轮来源核验"));
+        // 前缀缓存契约：这个块在系统提示最前面，绝不能包含时/分（否则每分钟全量 cache miss）
+        assert!(!block.contains("19:30"));
     }
 
     #[test]
@@ -3366,8 +3448,7 @@ mod tests {
             .unwrap();
 
         let block = user_local_time_block_at(&headers, utc);
-        assert!(block.contains("2026-01-02 周五 04:30"));
-        assert!(block.contains("Asia/Shanghai，UTC+08:00"));
+        assert!(block.contains("2026-01-02 周五（Asia/Shanghai，UTC+08:00）"));
     }
 
     #[test]
@@ -3379,13 +3460,13 @@ mod tests {
             .single()
             .unwrap();
         let missing = user_local_time_block_at(&HeaderMap::new(), utc);
-        assert!(missing.contains("2026-07-11 周六 12:05（UTC，UTC+00:00）"));
+        assert!(missing.contains("2026-07-11 周六（UTC，UTC+00:00）"));
 
         let mut invalid = HeaderMap::new();
         invalid.insert("x-ide-timezone", "../../UTC".parse().unwrap());
         invalid.insert("x-ide-utc-offset-minutes", "900".parse().unwrap());
         let invalid = user_local_time_block_at(&invalid, utc);
-        assert!(invalid.contains("2026-07-11 周六 12:05（UTC，UTC+00:00）"));
+        assert!(invalid.contains("2026-07-11 周六（UTC，UTC+00:00）"));
     }
 
     #[test]
@@ -3401,19 +3482,18 @@ mod tests {
         fictional.insert("x-ide-timezone", "Mars/Olympus".parse().unwrap());
         fictional.insert("x-ide-utc-offset-minutes", "840".parse().unwrap());
         let fictional = user_local_time_block_at(&fictional, utc);
-        assert!(fictional.contains("2026-07-11 周六 12:05（UTC，UTC+00:00）"));
+        assert!(fictional.contains("2026-07-11 周六（UTC，UTC+00:00）"));
 
         let mut stale_dst = HeaderMap::new();
         stale_dst.insert("x-ide-timezone", "America/Los_Angeles".parse().unwrap());
         stale_dst.insert("x-ide-utc-offset-minutes", "-480".parse().unwrap());
         let stale_dst = user_local_time_block_at(&stale_dst, utc);
-        assert!(stale_dst.contains("2026-07-11 周六 12:05（UTC，UTC+00:00）"));
+        assert!(stale_dst.contains("2026-07-11 周六（UTC，UTC+00:00）"));
 
         let mut current_dst = HeaderMap::new();
         current_dst.insert("x-ide-timezone", "America/Los_Angeles".parse().unwrap());
         current_dst.insert("x-ide-utc-offset-minutes", "-420".parse().unwrap());
         let current_dst = user_local_time_block_at(&current_dst, utc);
-        assert!(current_dst.contains("2026-07-11 周六 05:05"));
         assert!(current_dst.contains("America/Los_Angeles，UTC-07:00"));
     }
 

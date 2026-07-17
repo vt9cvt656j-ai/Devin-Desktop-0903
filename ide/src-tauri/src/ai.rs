@@ -12,11 +12,11 @@ const STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
 const STANDARD_STREAM_STALL_TIMEOUT_SECS: u64 = 45;
 const HIGH_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 45;
 const HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
-const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
+const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
 const HIGH_STREAM_STALL_TIMEOUT_SECS: u64 = 90;
 const EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 90;
 const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
-const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 25;
+const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
 const EXTENDED_STREAM_STALL_TIMEOUT_SECS: u64 = 120;
 
 const RESPONSE_HEADERS_TIMEOUT_ENV: &str = "MICHAEL_AI_RESPONSE_HEADERS_TIMEOUT_SECS";
@@ -29,7 +29,7 @@ const RESPONSE_HEADERS_TIMEOUT_MAX_SECS: u64 = 300;
 const FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 10;
 const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
 const EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 5;
-const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 120;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
 const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_READ_POLL: Duration = Duration::from_secs(2);
@@ -111,6 +111,15 @@ pub struct AiConfig {
     /// when the user picks the "极限/max" tier in the model hover card.
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    /// UI 档位原值（off/low/medium/high/xhigh/max）。前端对每个模型都会带上它（包括那些
+    /// 只发 thinking/thinkingConfig 而不发 reasoning_effort 的家族），本字段只用于本地
+    /// 看门狗分档，绝不写进上游请求体。
+    #[serde(default)]
+    pub thinking_effort: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
+    #[serde(default)]
+    pub thinking_config: Option<serde_json::Value>,
     /// Unique per-run id from the JS side. `cancel_ai(id)` flips a flag the stream
     /// loop polls, so the user's Stop actually aborts the in-flight upstream request
     /// (frees the connection + stops token burn) instead of only muting the UI.
@@ -382,15 +391,37 @@ impl StreamTimeouts {
             .as_deref()
             .unwrap_or_default()
             .trim();
+        // UI 档位原值：Gemini-3/Kimi/GLM 等家族只发 thinking/thinkingConfig 不发
+        // reasoning_effort，此前 serde 直接丢掉 thinkingEffort → 全部掉进 35s/18s 标准窗。
+        let ui_effort = config
+            .thinking_effort
+            .as_deref()
+            .unwrap_or_default()
+            .trim();
+        let thinking_enabled = config
+            .thinking
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str())
+            == Some("enabled")
+            || config.thinking_config.is_some();
         let has_thinking_budget = config.thinking_budget.is_some_and(|budget| budget > 0);
-        let defaults = if has_thinking_budget || effort.eq_ignore_ascii_case("max") {
+        let deep = |value: &str| {
+            value.eq_ignore_ascii_case("max") || value.eq_ignore_ascii_case("xhigh")
+        };
+        // xhigh 与 max 同档：gpt-5.6 系把 xhigh 原样透传，此前它掉进 35s 标准窗——深度思考
+        // 本身就是长时间无输出，窗口太短会被无进度看门狗掐掉再重试，用户设的思考深度形同虚设。
+        let defaults = if has_thinking_budget || deep(effort) || deep(ui_effort) {
             (
                 EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS,
                 EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_STREAM_STALL_TIMEOUT_SECS,
             )
-        } else if effort.eq_ignore_ascii_case("high") {
+        } else if effort.eq_ignore_ascii_case("high")
+            || ui_effort.eq_ignore_ascii_case("high")
+            || thinking_enabled
+        {
             (
                 HIGH_RESPONSE_HEADERS_TIMEOUT_SECS,
                 HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
@@ -605,6 +636,9 @@ mod ide_header_tests {
             temperature: None,
             reasoning_effort: None,
             thinking_budget: None,
+            thinking_effort: None,
+            thinking: None,
+            thinking_config: None,
             request_id: None,
             ide_mode: Some("agent".into()),
             ide_tools: None,
@@ -691,6 +725,9 @@ mod stream_timeout_tests {
             temperature: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
             thinking_budget,
+            thinking_effort: None,
+            thinking: None,
+            thinking_config: None,
             request_id: None,
             ide_mode: None,
             ide_tools: None,
@@ -784,17 +821,22 @@ mod stream_timeout_tests {
             StreamTimeouts {
                 response_headers: Duration::from_secs(45),
                 first_progress: Duration::from_secs(90),
-                empty_stream: Duration::from_secs(18),
+                // empty_stream 必须≈first_progress：网关 15s 心跳/空 role 预热帧一到，
+                // 窗口就从 first_progress 切到 empty_stream——小窗会把深思拦腰掐断
+                empty_stream: Duration::from_secs(90),
                 stall: Duration::from_secs(90),
             }
         );
         let extended = StreamTimeouts {
             response_headers: Duration::from_secs(90),
             first_progress: Duration::from_secs(180),
-            empty_stream: Duration::from_secs(25),
+            empty_stream: Duration::from_secs(180),
             stall: Duration::from_secs(120),
         };
         assert_eq!(timeouts(Some("max"), None), extended);
+        // gpt-5.6 系把 xhigh 原样透传——它必须和 max 同档，否则 XHigh 深思会被 35s 标准窗掐死
+        assert_eq!(timeouts(Some("xhigh"), None), extended);
+        assert_eq!(timeouts(Some("XHigh"), None), extended); // 大小写不敏感
         assert_eq!(timeouts(Some("high"), Some(32_000)), extended);
         assert_eq!(timeouts(Some("medium"), Some(1)), extended);
     }
@@ -1145,6 +1187,12 @@ async fn ai_chat_inner(
             payload["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
         }
     }
+    if let Some(ref thinking) = config.thinking {
+        payload["thinking"] = thinking.clone();
+    }
+    if let Some(ref thinking_config) = config.thinking_config {
+        payload["thinking_config"] = thinking_config.clone();
+    }
 
     // ── Prompt caching for Anthropic / Claude upstreams ─────────────────────
     // Anthropic reuses content marked with a `cache_control` breakpoint and serves
@@ -1214,7 +1262,10 @@ async fn ai_chat_inner(
     // If a strict gateway rejects the request (4xx — most likely the optional
     // `stream_options` it doesn't recognize), drop that field and retry ONCE. So
     // asking for usage stats can never break chat.
-    if resp.status().is_client_error() && payload.get("stream_options").is_some() {
+    if resp.status().is_client_error()
+        && resp.status() != reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        && payload.get("stream_options").is_some()
+    {
         if let Some(o) = payload.as_object_mut() {
             o.remove("stream_options");
         }
@@ -1310,7 +1361,8 @@ async fn ai_chat_inner(
                 continue;
             }
         };
-        progress.record_activity(Instant::now());
+        // 只统计字节；activity 的判定放到 SSE 行解析处——`: ping` 心跳注释和
+        // 空 role 预热帧不能算"开始输出"，否则 first_progress 大窗会被降级成 empty_stream 小窗。
         raw_stream_bytes = raw_stream_bytes.saturating_add(chunk.len() as u64);
         if !sent_first_chunk_metric {
             sent_first_chunk_metric = true;
@@ -1340,6 +1392,7 @@ async fn ai_chat_inner(
                 continue;
             };
             let data = data.trim();
+            progress.record_activity(Instant::now()); // 真正的 data 帧才算上游开始流式输出
             if data == "[DONE]" {
                 send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
                 let _ = on_event.send(AiEvent::Done);

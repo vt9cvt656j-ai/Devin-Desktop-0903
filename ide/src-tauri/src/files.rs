@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
@@ -19,6 +19,9 @@ const SEARCH_MAX_PER_FILE: usize = 50;
 const SEARCH_MAX_SCANNED_FILES: usize = 20_000;
 /// Display lines are truncated to this many characters in search results.
 const SEARCH_MAX_LINE_CHARS: usize = 500;
+const INSPECT_FULL_PARSE_MAX: u64 = 64 * 1024 * 1024;
+const INSPECT_HEX_BYTES: usize = 16 * 1024;
+const INSPECT_STRING_SCAN_BYTES: usize = 1024 * 1024;
 
 /// Directories that are never descended into during search (build output,
 /// vendored deps, VCS metadata). Dot-directories are skipped separately.
@@ -442,6 +445,82 @@ pub fn read_text_file(path: String) -> Result<String, String> {
         .map_err(|_| format!("cannot open '{}': file is not valid UTF-8 text", path))
 }
 
+/// Read the tail of a log-like text file, including common logs under the user's
+/// home directory (npm debug logs, app logs, temp logs). Unlike `read_text_file`,
+/// this does not load the entire file, so a large debug log can still be used as
+/// evidence by the agent without opening it in the editor.
+#[tauri::command]
+pub fn read_log_tail(
+    path: String,
+    lines: Option<usize>,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
+    let path = if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| "cannot expand ~/ because HOME is not set".to_string())?;
+        Path::new(&home).join(rest).to_string_lossy().to_string()
+    } else {
+        path
+    };
+    let resolved = require_inside_workspace(&path)?;
+    let meta =
+        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    if meta.is_dir() {
+        return Err(format!("'{}' is a directory, not a log file.", path));
+    }
+    let name = resolved
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ext = resolved
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let log_like = matches!(ext.as_str(), "log" | "out" | "err")
+        || name.ends_with("-debug.log")
+        || name.contains("debug") && name.ends_with(".txt");
+    if !log_like {
+        return Err("read_log_tail only reads log-like files (.log/.out/.err/debug*.txt)".into());
+    }
+
+    let line_limit = lines.unwrap_or(200).clamp(1, 2000);
+    let byte_limit = max_bytes
+        .unwrap_or(512 * 1024)
+        .clamp(4 * 1024, 2 * 1024 * 1024) as u64;
+    let file_len = meta.len();
+    let start = file_len.saturating_sub(byte_limit);
+    let mut file = std::fs::File::open(&resolved)
+        .map_err(|e| format!("cannot open '{}': {}", path, e))?;
+    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity((file_len - start).min(byte_limit) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    if bytes.iter().take(8000).any(|&b| b == 0) {
+        return Err("cannot read log tail: file appears to be binary".into());
+    }
+    let mut text = String::from_utf8_lossy(&bytes).to_string();
+    if start > 0 {
+        if let Some(idx) = text.find('\n') {
+            text = text[idx + 1..].to_string();
+        }
+    }
+    let mut tail_lines: Vec<&str> = text.lines().rev().take(line_limit).collect();
+    tail_lines.reverse();
+    let mut out = tail_lines.join("\n");
+    if start > 0 {
+        out = format!(
+            "…（日志较大，仅读取最后约 {} KB / {} 行）\n{}",
+            byte_limit / 1024,
+            line_limit,
+            out
+        );
+    }
+    Ok(out)
+}
+
 /// Read any (binary) file as a `data:<mime>;base64,...` URL. Used to render images in the
 /// chat (e.g. `design_board` wardrobe previews) WITHOUT the Tauri asset protocol, whose glob
 /// scope rejects hidden directories like `.wardrobe/` → the `<img>` stays blank. Reusing the
@@ -491,6 +570,670 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
         mime,
         crate::capture::b64(&bytes)
     ))
+}
+
+#[derive(Serialize)]
+pub struct HexRow {
+    offset: u64,
+    hex: String,
+    ascii: String,
+}
+
+#[derive(Serialize)]
+pub struct ArchiveEntryPreview {
+    name: String,
+    size: u64,
+    compressed_size: u64,
+    is_dir: bool,
+}
+
+#[derive(Serialize)]
+pub struct SqlitePreview {
+    page_size: u32,
+    page_count: u32,
+    schema_format: u32,
+    text_encoding: String,
+    tables: Vec<SqliteTablePreview>,
+}
+
+#[derive(Serialize)]
+pub struct SqliteColumnPreview {
+    name: String,
+    decl_type: String,
+    not_null: bool,
+    primary_key: bool,
+}
+
+#[derive(Serialize)]
+pub struct SqliteTablePreview {
+    name: String,
+    table_type: String,
+    row_count: Option<i64>,
+    columns: Vec<SqliteColumnPreview>,
+    sample_rows: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct ImagePreviewInfo {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Serialize)]
+pub struct TrainedDataComponentPreview {
+    type_index: usize,
+    name: String,
+    offset: u64,
+    size: u64,
+    hex_prefix: String,
+    text_preview: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TrainedDataPreview {
+    entry_count: usize,
+    present_count: usize,
+    version: Option<String>,
+    components: Vec<TrainedDataComponentPreview>,
+}
+
+#[derive(Serialize)]
+pub struct FileInspection {
+    path: String,
+    name: String,
+    extension: String,
+    kind: String,
+    mime: String,
+    size: u64,
+    modified_ms: Option<u64>,
+    readonly: bool,
+    sampled: bool,
+    signature: String,
+    summary: Vec<String>,
+    text_preview: Option<String>,
+    hex_rows: Vec<HexRow>,
+    strings: Vec<String>,
+    traineddata: Option<TrainedDataPreview>,
+    archive_entries: Vec<ArchiveEntryPreview>,
+    sqlite: Option<SqlitePreview>,
+    image: Option<ImagePreviewInfo>,
+}
+
+fn file_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
+    let mut bytes = vec![0u8; len];
+    let n = file
+        .read(&mut bytes)
+        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    bytes.truncate(n);
+    Ok(bytes)
+}
+
+fn hex_prefix(bytes: &[u8], len: usize) -> String {
+    bytes
+        .iter()
+        .take(len)
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn build_hex_rows(bytes: &[u8]) -> Vec<HexRow> {
+    let take = bytes.len().min(INSPECT_HEX_BYTES);
+    bytes[..take]
+        .chunks(16)
+        .enumerate()
+        .map(|(idx, chunk)| HexRow {
+            offset: (idx * 16) as u64,
+            hex: chunk
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ascii: chunk
+                .iter()
+                .map(|&b| {
+                    if (0x20..=0x7e).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn clean_preview_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in text.replace('\0', "").chars() {
+        if out.chars().count() >= max_chars {
+            out.push('…');
+            break;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn text_preview(bytes: &[u8]) -> Option<String> {
+    let take = bytes.len().min(64 * 1024);
+    let sample = &bytes[..take];
+    if sample.iter().take(8000).any(|&b| b == 0) {
+        return None;
+    }
+    let text = std::str::from_utf8(sample).ok()?;
+    let cleaned = clean_preview_text(text, 5000);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn printable_preview(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let take = bytes.len().min(4096);
+    let sample = &bytes[..take];
+    let text = std::str::from_utf8(sample).ok()?;
+    let printable = text
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+        .count();
+    let total = text.chars().count().max(1);
+    if printable * 100 / total < 70 {
+        return None;
+    }
+    let cleaned = clean_preview_text(text, 1200);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn extract_ascii_strings(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut run = Vec::new();
+    let scan = &bytes[..bytes.len().min(INSPECT_STRING_SCAN_BYTES)];
+    let flush = |run: &mut Vec<u8>, out: &mut Vec<String>| {
+        if run.len() >= 4 {
+            let text = String::from_utf8_lossy(run).trim().to_string();
+            if !text.is_empty()
+                && out.last().map(|prev| prev != &text).unwrap_or(true)
+                && !out.contains(&text)
+            {
+                out.push(text.chars().take(160).collect());
+            }
+        }
+        run.clear();
+    };
+    for &b in scan {
+        if b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) {
+            run.push(b);
+        } else {
+            flush(&mut run, &mut out);
+            if out.len() >= 120 {
+                return out;
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out.truncate(120);
+    out
+}
+
+fn read_be_u16(bytes: &[u8], start: usize) -> Option<u16> {
+    let slice = bytes.get(start..start + 2)?;
+    Some(u16::from_be_bytes([slice[0], slice[1]]))
+}
+
+fn read_be_u32(bytes: &[u8], start: usize) -> Option<u32> {
+    let slice = bytes.get(start..start + 4)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn quote_sqlite_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, index: usize) -> serde_json::Value {
+    use sqlx::Row;
+    if let Ok(v) = row.try_get::<Option<i64>, _>(index) {
+        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(index) {
+        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<String>, _>(index) {
+        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
+        return v
+            .map(|bytes| {
+                serde_json::json!({
+                    "blob_bytes": bytes.len(),
+                    "preview": hex_prefix(&bytes, 16)
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+    }
+    serde_json::Value::Null
+}
+
+fn inspect_sqlite_tables(path: &Path) -> Vec<SqliteTablePreview> {
+    let path = path.to_path_buf();
+    tauri::async_runtime::block_on(async move {
+        use sqlx::{Column, Connection, Row};
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .create_if_missing(false);
+        let mut conn = match sqlx::SqliteConnection::connect_with(&options).await {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let objects = match sqlx::query(
+            "SELECT name, type FROM sqlite_master \
+             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
+             ORDER BY type, name LIMIT 40",
+        )
+        .fetch_all(&mut conn)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut tables = Vec::new();
+        for object in objects {
+            let name = object.try_get::<String, _>("name").unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let table_type = object
+                .try_get::<String, _>("type")
+                .unwrap_or_else(|_| "table".to_string());
+            let pragma_name = name.replace('\'', "''");
+            let column_rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info('{pragma_name}')")))
+                .fetch_all(&mut conn)
+                .await
+                .unwrap_or_default();
+            let columns = column_rows
+                .into_iter()
+                .map(|row| SqliteColumnPreview {
+                    name: row.try_get::<String, _>("name").unwrap_or_default(),
+                    decl_type: row.try_get::<String, _>("type").unwrap_or_default(),
+                    not_null: row.try_get::<i64, _>("notnull").unwrap_or(0) != 0,
+                    primary_key: row.try_get::<i64, _>("pk").unwrap_or(0) != 0,
+                })
+                .collect::<Vec<_>>();
+            let quoted = quote_sqlite_ident(&name);
+            let row_count = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) AS count FROM {quoted}")))
+                .fetch_one(&mut conn)
+                .await
+                .ok()
+                .and_then(|row| row.try_get::<i64, _>("count").ok());
+            let sample_rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {quoted} LIMIT 20")))
+                .fetch_all(&mut conn)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| {
+                    let mut object = serde_json::Map::new();
+                    for (index, column) in row.columns().iter().enumerate().take(16) {
+                        object.insert(column.name().to_string(), sqlite_value_to_json(&row, index));
+                    }
+                    serde_json::Value::Object(object)
+                })
+                .collect::<Vec<_>>();
+            tables.push(SqliteTablePreview {
+                name,
+                table_type,
+                row_count,
+                columns,
+                sample_rows,
+            });
+        }
+        tables
+    })
+}
+
+fn sqlite_preview(bytes: &[u8], path: &Path) -> Option<SqlitePreview> {
+    if !bytes.starts_with(b"SQLite format 3\0") || bytes.len() < 100 {
+        return None;
+    }
+    let raw_page_size = read_be_u16(bytes, 16)?;
+    let page_size = if raw_page_size == 1 { 65536 } else { raw_page_size as u32 };
+    let page_count = read_be_u32(bytes, 28).unwrap_or(0);
+    let schema_format = read_be_u32(bytes, 44).unwrap_or(0);
+    let encoding = match read_be_u32(bytes, 56).unwrap_or(0) {
+        1 => "UTF-8",
+        2 => "UTF-16le",
+        3 => "UTF-16be",
+        _ => "unknown",
+    }
+    .to_string();
+    Some(SqlitePreview {
+        page_size,
+        page_count,
+        schema_format,
+        text_encoding: encoding,
+        tables: inspect_sqlite_tables(path),
+    })
+}
+
+fn inspect_zip_entries(path: &Path) -> Vec<ArchiveEntryPreview> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let mut zip = match zip::ZipArchive::new(file) {
+        Ok(zip) => zip,
+        Err(_) => return Vec::new(),
+    };
+    let mut entries = Vec::new();
+    for i in 0..zip.len().min(200) {
+        if let Ok(file) = zip.by_index(i) {
+            entries.push(ArchiveEntryPreview {
+                name: file.name().to_string(),
+                size: file.size(),
+                compressed_size: file.compressed_size(),
+                is_dir: file.is_dir(),
+            });
+        }
+    }
+    entries
+}
+
+fn traineddata_component_name(index: usize) -> &'static str {
+    match index {
+        0 => "lang_config",
+        1 => "unicharset",
+        2 => "ambigs",
+        3 => "inttemp",
+        4 => "pffmtable",
+        5 => "normproto",
+        6 => "punc-dawg",
+        7 => "system-dawg",
+        8 => "number-dawg",
+        9 => "freq-dawg",
+        10 => "fixed-length-dawgs",
+        11 => "cube-unicharset",
+        12 => "cube-system-dawg",
+        13 => "shape-table",
+        14 => "bigram-dawg",
+        15 => "unambig-dawg",
+        16 => "params-model",
+        17 => "lstm",
+        18 => "lstm-punc-dawg",
+        19 => "lstm-system-dawg",
+        20 => "lstm-number-dawg",
+        21 => "lstm-unicharset",
+        22 => "lstm-recoder",
+        23 => "version",
+        _ => "unknown",
+    }
+}
+
+fn read_le_i64(bytes: &[u8], start: usize) -> Option<i64> {
+    let slice = bytes.get(start..start + 8)?;
+    Some(i64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+fn inspect_traineddata(bytes: &[u8], file_size: u64) -> Option<TrainedDataPreview> {
+    let count_bytes = bytes.get(0..4)?;
+    let entry_count =
+        u32::from_le_bytes([count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3]])
+            as usize;
+    if entry_count == 0 || entry_count > 128 {
+        return None;
+    }
+    let table_len = 4usize.checked_add(entry_count.checked_mul(8)?)?;
+    if bytes.len() < table_len {
+        return None;
+    }
+    let mut present = Vec::new();
+    for i in 0..entry_count {
+        let offset = read_le_i64(bytes, 4 + i * 8)?;
+        if offset >= table_len as i64 && (offset as u64) < file_size {
+            present.push((i, offset as u64));
+        } else if offset != -1 {
+            return None;
+        }
+    }
+    if present.is_empty() {
+        return None;
+    }
+    let mut by_offset = present.clone();
+    by_offset.sort_by_key(|(_, offset)| *offset);
+    if by_offset.windows(2).any(|w| w[0].1 >= w[1].1) {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for (pos, (type_index, offset)) in by_offset.iter().enumerate() {
+        let next = by_offset
+            .get(pos + 1)
+            .map(|(_, next_offset)| *next_offset)
+            .unwrap_or(file_size);
+        if next <= *offset {
+            continue;
+        }
+        let size = next - *offset;
+        let local = if (*offset as usize) < bytes.len() {
+            let end = ((*offset + size).min(bytes.len() as u64)) as usize;
+            &bytes[*offset as usize..end]
+        } else {
+            &[]
+        };
+        components.push(TrainedDataComponentPreview {
+            type_index: *type_index,
+            name: traineddata_component_name(*type_index).to_string(),
+            offset: *offset,
+            size,
+            hex_prefix: hex_prefix(local, 24),
+            text_preview: printable_preview(local),
+        });
+    }
+    if components.is_empty() {
+        return None;
+    }
+    components.sort_by_key(|component| component.type_index);
+    let version = components
+        .iter()
+        .find(|component| component.type_index == 23)
+        .and_then(|component| component.text_preview.clone());
+    Some(TrainedDataPreview {
+        entry_count,
+        present_count: components.len(),
+        version,
+        components,
+    })
+}
+
+fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, String) {
+    if traineddata || ext == "traineddata" {
+        return (
+            "tesseract_traineddata".into(),
+            "application/x-tesseract-traineddata".into(),
+        );
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return ("image".into(), "image/png".into());
+    }
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        return ("image".into(), "image/jpeg".into());
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return ("image".into(), "image/gif".into());
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return ("image".into(), "image/webp".into());
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return ("pdf".into(), "application/pdf".into());
+    }
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") || bytes.starts_with(b"PK\x07\x08") {
+        return ("archive".into(), "application/zip".into());
+    }
+    if bytes.starts_with(b"SQLite format 3\0") {
+        return ("sqlite_database".into(), "application/vnd.sqlite3".into());
+    }
+    if bytes.starts_with(b"\x7FELF") {
+        return ("executable".into(), "application/x-elf".into());
+    }
+    if bytes.starts_with(b"MZ") {
+        return ("executable".into(), "application/vnd.microsoft.portable-executable".into());
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return ("archive".into(), "application/gzip".into());
+    }
+    if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        return ("archive".into(), "application/x-7z-compressed".into());
+    }
+    if bytes.starts_with(b"Rar!\x1A\x07") {
+        return ("archive".into(), "application/vnd.rar".into());
+    }
+    match ext {
+        "mp3" => ("audio".into(), "audio/mpeg".into()),
+        "wav" => ("audio".into(), "audio/wav".into()),
+        "flac" => ("audio".into(), "audio/flac".into()),
+        "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" => ("video".into(), "video/*".into()),
+        "onnx" | "pt" | "pth" | "bin" | "dat" => ("model_or_binary".into(), "application/octet-stream".into()),
+        "sqlite" | "sqlite3" | "db" | "db3" | "sdb" => {
+            ("sqlite_database".into(), "application/vnd.sqlite3".into())
+        }
+        "duckdb" => ("database_file".into(), "application/x-duckdb".into()),
+        "mdb" | "accdb" => ("database_file".into(), "application/x-msaccess".into()),
+        "dbf" => ("database_file".into(), "application/x-dbf".into()),
+        "ibd" | "frm" | "myd" | "myi" => ("database_file".into(), "application/x-mysql-table".into()),
+        "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt" => {
+            ("archive".into(), "application/zip".into())
+        }
+        _ => {
+            if text_preview(bytes).is_some() {
+                ("text".into(), "text/plain; charset=utf-8".into())
+            } else {
+                ("binary".into(), "application/octet-stream".into())
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspection, String> {
+    let resolved = require_inside_workspace(&path)?;
+    let meta =
+        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    if meta.is_dir() {
+        return Err(format!("'{}' is a directory, not a file.", path));
+    }
+
+    let sample_limit = max_bytes
+        .unwrap_or(INSPECT_STRING_SCAN_BYTES as u64)
+        .clamp(4096, INSPECT_STRING_SCAN_BYTES as u64) as usize;
+    let bytes = read_prefix(&resolved, sample_limit)?;
+    let sampled = meta.len() > bytes.len() as u64 || meta.len() > INSPECT_FULL_PARSE_MAX;
+    let ext = file_extension(&resolved);
+    let traineddata = inspect_traineddata(&bytes, meta.len());
+    let (kind, mime) = detect_kind_and_mime(&ext, &bytes, traineddata.is_some());
+    let archive_entries = if matches!(kind.as_str(), "archive")
+        || matches!(ext.as_str(), "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt")
+    {
+        inspect_zip_entries(&resolved)
+    } else {
+        Vec::new()
+    };
+    let sqlite = sqlite_preview(&bytes, &resolved);
+    let image = if kind == "image" {
+        image::image_dimensions(&resolved)
+            .ok()
+            .map(|(width, height)| ImagePreviewInfo { width, height })
+    } else {
+        None
+    };
+
+    let modified_ms = meta.modified().ok().and_then(|time| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+    });
+    let mut summary = Vec::new();
+    summary.push(format!("类型：{}", kind));
+    summary.push(format!("大小：{} bytes", meta.len()));
+    if sampled {
+        summary.push(format!(
+            "文件超过 {}MB，当前只解析前 {} bytes",
+            INSPECT_FULL_PARSE_MAX / 1024 / 1024,
+            bytes.len()
+        ));
+    }
+    if let Some(info) = &traineddata {
+        summary.push(format!(
+            "Tesseract traineddata：{}/{} 个组件",
+            info.present_count, info.entry_count
+        ));
+        if let Some(version) = &info.version {
+            summary.push(format!("版本：{}", version));
+        }
+    }
+    if !archive_entries.is_empty() {
+        summary.push(format!("压缩包条目：{} 个（最多显示 200 个）", archive_entries.len()));
+    }
+    if let Some(sqlite) = &sqlite {
+        summary.push(format!(
+            "SQLite：{} 页 × {} bytes，编码 {}",
+            sqlite.page_count, sqlite.page_size, sqlite.text_encoding
+        ));
+    }
+    if let Some(image) = &image {
+        summary.push(format!("图片尺寸：{} × {}", image.width, image.height));
+    }
+
+    Ok(FileInspection {
+        path,
+        name: file_name(&resolved),
+        extension: ext,
+        kind,
+        mime,
+        size: meta.len(),
+        modified_ms,
+        readonly: meta.permissions().readonly(),
+        sampled,
+        signature: hex_prefix(&bytes, 32),
+        summary,
+        text_preview: text_preview(&bytes),
+        hex_rows: build_hex_rows(&bytes),
+        strings: extract_ascii_strings(&bytes),
+        traineddata,
+        archive_entries,
+        sqlite,
+        image,
+    })
 }
 
 /// Extract readable TEXT from a document (PDF / Word / Excel / PowerPoint), so the agent

@@ -1,6 +1,6 @@
 彻底摸清这个项目{{FOCUS_EMPH}}，给主智能体一份能直接照着干活的「上手地图」。要又深又广、**多角度并行检索**（search 现在每个命中带上下文 / find_symbol·lsp_definition·lsp_references 找定义和所有调用方 / find_files 按名字 / list_dir 看结构），关键文件用 read_file **读全**，别只看开头就猜。
 
-**关键：list_dir 要逐层深入**——先 list_dir "." 看顶层，然后**并行 list_dir 每个重要子目录**（src/、lib/、app/、pages/…），再对关键的第三层也 list_dir。只看顶层 = 只看封面，不是研究。**读源码，不是只读文档**——README/docs 是参考，真正的架构和逻辑在 .js/.ts/.py/.rs/.go 等源码文件里。
+**关键：list_dir 要逐层深入**——先 list_dir "." 看顶层；如果根目录为空 / 新项目，立刻停止本地 read_file / search / find_files / semantic_search，不要猜 package.json、vite.config、src、README 等不存在路径，直接说明“空项目事实”并给从零搭建建议。只有顶层确实有内容时，才**并行 list_dir 每个重要子目录**（src/、lib/、app/、pages/…），再对关键的第三层也 list_dir。只看顶层 = 只看封面，不是研究。**读源码，不是只读文档**——README/docs 是参考，真正的架构和逻辑在 .js/.ts/.py/.rs/.go 等源码文件里。
 
 要查清：
 1. **技术栈**：语言、框架、关键依赖、数据库、构建/运行方式——从 package.json / Cargo.toml / requirements / go.mod 等配置和真实代码确认，别猜。

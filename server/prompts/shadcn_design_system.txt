@@ -1,0 +1,94 @@
+# shadcn/ui + Tailwind v4 设计体系（真源；照这套设计，别靠生成图猜风格、别靠用户随口一句拍脑袋）
+
+做界面的默认方法是「从一套真实的语义令牌体系出发」，不是先出三张 mockup 让人挑、也不是把用户随口说的形容词直译成一堆硬编码颜色。**先有体系，再有像素。** 已有项目永远先跟随它自己的设计系统（见 css_concrete_tokens）；下面这套用于新项目，或用户明确要按 shadcn/现代体系做时。以 `package.json`、锁文件与当前官方文档为准，不硬记 CLI/主版本号。
+
+## ① 语义令牌是唯一真源（这就是"真正的设计"——不是配一堆散色）
+一切颜色都走语义名，深浅主题用同一组名切不同值。默认基线（shadcn 中性主题，OKLCH；这是**起点**，不是终点）：
+
+```css
+/* src/index.css */
+@import "tailwindcss";
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);            --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);                  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);              --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);          --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);         --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);             --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);            --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);           --input: oklch(0.922 0 0);   --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116); --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392); --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);          --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);    --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);   --sidebar-ring: oklch(0.708 0 0);
+}
+.dark {
+  --background: oklch(0.145 0 0);        --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);             --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);         --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);          --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);        --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);            --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);           --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);         --input: oklch(1 0 0 / 15%);  --ring: oklch(0.556 0 0);
+  --sidebar: oklch(0.205 0 0);          --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376); --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%); --sidebar-ring: oklch(0.556 0 0);
+}
+
+@theme inline {
+  --color-background: var(--background); --color-foreground: var(--foreground);
+  --color-card: var(--card); --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover); --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary); --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary); --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted); --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent); --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border); --color-input: var(--input); --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1); --color-chart-2: var(--chart-2); --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4); --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar); --color-sidebar-foreground: var(--sidebar-foreground);
+  --radius-sm: calc(var(--radius) - 4px); --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius); --radius-xl: calc(var(--radius) + 4px);
+}
+```
+映射后用 `bg-background text-foreground`、`bg-primary text-primary-foreground`、`bg-card border-border`、`text-muted-foreground`、`bg-destructive`、`rounded-lg`、`ring-ring` 等类。**业务里绝不写 `bg-[#4f46e5]`、`text-gray-500` 这种散色**——一律走语义类；组件只引用语义令牌。
+
+## ② 从「基线」到「这个品牌」——设计动作就是改令牌，不是重配一堆色
+把品牌落成体系的三步（这才是设计，不是形容词直译）：
+1. **选 base 中性**（neutral/stone/zinc/slate/gray 决定灰阶的冷暖）——决定整体气质冷/暖/中。
+2. **定 primary + radius + 字体**——这三样承担 90% 的「品牌辨识度」：`--primary` 用品牌主色（OKLCH，同步给 `--primary-foreground` 保证对比），`--radius` 决定锐利(0.35rem)/中性(0.625rem)/圆润(1rem)，标题字体挑一款有性格的展示体拉气质（别默认 Inter）。
+3. **语义色微调**——destructive/成功/警告按品牌，但保持 WCAG AA。其余表面色(card/muted/border)跟着 base 中性走，不逐个乱调。
+一次改这几个令牌，全站自动统一——这就是设计系统的威力。想要多方向让用户拍板时，做 2-3 套**只有 primary/radius/字体不同**的令牌预览（可用 preview_choices 实时渲染），而不是生成三张 AI mockup 图猜。
+
+## ③ 组件目录：用官方 primitive 组合，别自己造平行轮子
+shadcn/ui 提供这些（按需 `npx shadcn@latest add <name>`，只加页面真用到的，禁止全量安装）：
+- 表单：button, input, textarea, label, checkbox, radio-group, select, switch, slider, form(react-hook-form+zod), input-otp, toggle, toggle-group, combobox, calendar, date-picker, field
+- 展示：card, badge, avatar, alert, alert-dialog, skeleton, separator, aspect-ratio, table, data-table, chart(recharts), carousel, empty, kbd, typography
+- 导航：navigation-menu, menubar, dropdown-menu, context-menu, breadcrumb, pagination, tabs, sidebar, command
+- 浮层反馈：dialog, drawer, sheet, popover, hover-card, tooltip, sonner(toast), progress, spinner
+- 布局容器：accordion, collapsible, scroll-area, resizable
+Button 有 variant(default/secondary/outline/ghost/link/destructive) + size(sm/default/lg/icon)；Card 用 Card/CardHeader/CardTitle/CardDescription/CardContent/CardFooter 结构。**有 primitive 就组合它，不另造 Button/Input/Card**；导航/hero/内容区块/图表组合等非标准结构按信息架构自己写清晰业务组件。
+
+## ④ 接线（Vite + React + TS + Tailwind v4；Vue 用 shadcn-vue，别混 React 版）
+- 装：`npm i tailwindcss @tailwindcss/vite`；`vite.config.ts` 加 `tailwindcss()` 插件 + `resolve.alias { "@": path.resolve(__dirname,"./src") }`；`tsconfig` 配 `paths { "@/*": ["./src/*"] }`。
+- CSS 入口 `@import "tailwindcss";` + 上面的 `@custom-variant dark` + 令牌块。
+- 初始化 `npx shadcn@latest init`（生成 components.json、lib/utils.ts 的 `cn()`），加组件 `npx shadcn@latest add button card ...`。
+- `cn()` = `twMerge(clsx(...))`，组件 className 一律走它合并，允许调用方覆盖。
+- **dark mode**：`.dark` 类挂在 `document.documentElement`，用 ThemeProvider(context + localStorage 存 light/dark/system，system 读 `matchMedia('(prefers-color-scheme: dark)')`) 切换；深浅共用同一组语义令牌，组件不写 `dark:` 硬色。
+
+## ⑤ 反 AI 味 + 真实验证（好看且扛得住）
+- 版式有密度层次与节奏（不是均匀堆卡片）；主色克制只用在 primary 动作/选中/链接；间距走 4/8 网格；圆角/阴影/图标全套统一；标题展示体 + 正文中性无衬线，数字 tabular-nums。
+- 图标用 lucide-react（shadcn 生态默认），绝不用 emoji。状态做全：hover/focus-visible/active/disabled/loading/空/错误/选中。
+- 真机验证：起 dev server → `browser navigate fresh=true` → 在 1440×900 和 390×844 两个视口 `browser check` 处理控制台/网络/溢出错误 → 用 click/type/press 跑关键流程再对具体 selector/文本 `assert`。截图只做视觉自检，不替代 check/assert。
+
+一句话：**设计 = 定一套语义令牌（base 中性 + primary + radius + 字体）→ 用官方 primitive 组合 → 令牌驱动深浅主题 → 真机验证。** 生成图/衣橱只在「用户要看几个明显不同方向再拍板」时作可选方向选择器，绝不是默认设计方法，更不能代替真实令牌体系。

@@ -72,7 +72,7 @@ const KNOWN_ADAPTERS: &[(&str, &str, &[&str])] = &[
     ("python", "python3", &["-m", "debugpy.adapter"]),
     ("go", "dlv", &["dap"]),
     ("lldb", "lldb-dap", &[]),
-    ("node", "js-debug-adapter", &[]),
+    ("node", "js-debug-adapter-stdio", &[]),
 ];
 
 fn find_adapter(id: &str) -> Option<(&'static str, &'static [&'static str])> {

@@ -663,21 +663,31 @@ fn click_via_eval(tab: &Tab, selector: &str) -> Result<(), String> {
     let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
         r#"(()=>{{var s={sel_js};
-var el=document.querySelector(s);
-if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
-var fs=document.querySelectorAll('iframe');
-for(var k=0;k<fs.length;k++){{try{{
-  el=fs[k].contentDocument.querySelector(s);
-  if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
-}}catch(e){{}}}}
-return 'no'}})()"#
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function visible(el){{try{{var r=el.getBoundingClientRect(),cs=(el.ownerDocument.defaultView||window).getComputedStyle(el);return r.width>1&&r.height>1&&cs.visibility!=='hidden'&&cs.display!=='none'&&Number(cs.opacity||1)>0.01}}catch(e){{return false}}}}
+function disabled(el){{try{{return !!(el.disabled||el.getAttribute('aria-disabled')==='true'||el.closest('[disabled],[aria-disabled="true"]'))}}catch(e){{return false}}}}
+function brief(el){{try{{if(!el)return'';var t=String(el.innerText||el.textContent||el.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,60);return el.tagName.toLowerCase()+(el.id?'#'+el.id:'')+(t?' "'+t+'"':'')}}catch(e){{return'element'}}}}
+function clickable(el){{try{{var q='a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[onclick],label,summary';return el.matches(q)?el:(el.closest(q)||el)}}catch(e){{return el}}}}
+function point(el){{var doc=el.ownerDocument||document,win=doc.defaultView||window,r=el.getBoundingClientRect(),pts=[[.5,.5],[.25,.5],[.75,.5],[.5,.25],[.5,.75]];for(var i=0;i<pts.length;i++){{var x=Math.max(1,Math.min((win.innerWidth||1)-2,r.left+r.width*pts[i][0])),y=Math.max(1,Math.min((win.innerHeight||1)-2,r.top+r.height*pts[i][1])),top=null;try{{top=doc.elementFromPoint(x,y)}}catch(e){{}}if(top&&(top===el||el.contains(top)))return{{ok:true,x:x,y:y,top:top}};}}return{{ok:false,top:top}}}}
+function ptr(el,name,p,down){{var w=el.ownerDocument.defaultView||window,c={{bubbles:true,cancelable:true,composed:true,view:w,clientX:p.x,clientY:p.y,screenX:p.x,screenY:p.y,button:0,buttons:down?1:0}};try{{if(/^pointer/.test(name)&&typeof PointerEvent!=='undefined'){{var pi=Object.assign({{}},c,{{pointerId:1,pointerType:'mouse',isPrimary:true,pressure:down?0.5:0}});el.dispatchEvent(new PointerEvent(name,pi));return}}}}catch(e){{}}try{{el.dispatchEvent(new MouseEvent(name.replace(/^pointer/,'mouse'),c))}}catch(e){{}}}}
+var raw=find();if(!raw)return'no';
+var el=clickable(raw);if(disabled(el))return'disabled '+brief(el);
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{try{{el.scrollIntoView({{block:'center',inline:'center'}})}}catch(e2){{}}}}
+if(!visible(el))return'not_visible '+brief(el);
+var p=point(el);if(!p.ok)return'covered by '+brief(p.top);
+ptr(el,'pointerover',p,false);ptr(el,'pointermove',p,false);ptr(el,'mouseover',p,false);ptr(el,'mousemove',p,false);ptr(el,'pointerdown',p,true);ptr(el,'mousedown',p,true);
+try{{el.focus({{preventScroll:true}})}}catch(e){{try{{el.focus()}}catch(e2){{}}}}
+ptr(el,'pointerup',p,false);ptr(el,'mouseup',p,false);
+try{{el.click()}}catch(e){{try{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true,composed:true,view:el.ownerDocument.defaultView||window,clientX:p.x,clientY:p.y,button:0}}))}}catch(e2){{return String(e2&&e2.message||e2)}}}}
+return'ok'}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
     let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
-        Err(format!("找不到元素: {selector}"))
+        Err(format!("元素不可点击或未找到: {selector} ({v})"))
     }
 }
 
@@ -687,22 +697,26 @@ fn type_via_eval(tab: &Tab, selector: &str, text: &str) -> Result<(), String> {
     let txt_js = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
         r#"(()=>{{var s={sel_js},t={txt_js};
-function fill(el){{el.scrollIntoView({{block:'center'}});el.focus();el.click();
-  el.value=t;el.dispatchEvent(new Event('input',{{bubbles:true}}));
-  el.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok'}}
-var el=document.querySelector(s);if(el)return fill(el);
-var fs=document.querySelectorAll('iframe');
-for(var k=0;k<fs.length;k++){{try{{
-  el=fs[k].contentDocument.querySelector(s);if(el)return fill(el);
-}}catch(e){{}}}}
-return 'no'}})()"#
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function target(el){{try{{if(el.tagName==='LABEL'&&el.control)return el.control;if(el.matches('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]'))return el;return el.querySelector('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]')||el}}catch(e){{return el}}}}
+function fire(el,name,data){{try{{if(name==='input'&&typeof InputEvent!=='undefined')el.dispatchEvent(new InputEvent('input',{{bubbles:true,cancelable:true,inputType:'insertText',data:data||t}}));else el.dispatchEvent(new Event(name,{{bubbles:true,cancelable:true}}))}}catch(e){{try{{el.dispatchEvent(new Event(name,{{bubbles:true}}))}}catch(e2){{}}}}}}
+function nativeSet(el,val){{if(el.isContentEditable){{try{{el.focus()}}catch(e){{}}el.textContent=val;fire(el,'input',val);fire(el,'change',val);return true}}
+ if(el.tagName==='SELECT'){{var opts=Array.prototype.slice.call(el.options||[]),hit=opts.find(function(o){{return String(o.value)===String(val)}})||opts.find(function(o){{return String(o.textContent||'').trim()===String(val).trim()}});if(hit)val=hit.value;try{{var sd=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(sd&&sd.set)sd.set.call(el,val);else el.value=val}}catch(e){{el.value=val}}fire(el,'input',val);fire(el,'change',val);return true}}
+ if('value'in el){{try{{var proto=Object.getPrototypeOf(el),desc=proto&&Object.getOwnPropertyDescriptor(proto,'value'),base=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,desc2=Object.getOwnPropertyDescriptor(base,'value');(desc&&desc.set?desc:desc2).set.call(el,val)}}catch(e){{el.value=val}}fire(el,'beforeinput',val);fire(el,'input',val);fire(el,'change',val);return true}}return false}}
+var raw=find();if(!raw)return'no';var el=target(raw);
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{try{{el.scrollIntoView({{block:'center',inline:'center'}})}}catch(e2){{}}}}
+try{{el.focus()}}catch(e){{}}try{{el.click()}}catch(e){{}}
+if(!nativeSet(el,t))return'not_editable';
+var actual=el.isContentEditable?String(el.textContent||''):String(el.value||'');
+return actual===String(t)||actual.indexOf(String(t))>=0?'ok':'value_not_applied '+actual.slice(0,80)}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
     let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
-        Err(format!("找不到输入框: {selector}"))
+        Err(format!("输入未生效或未找到: {selector} ({v})"))
     }
 }
 
@@ -710,6 +724,26 @@ return 'no'}})()"#
 #[tauri::command]
 pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        match click_via_eval(tab, &selector) {
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(260));
+                let _ = tab.wait_until_navigated();
+                return Ok(None);
+            }
+            Err(first_err)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(80));
+                if click_via_eval(tab, &selector).is_ok() {
+                    std::thread::sleep(Duration::from_millis(260));
+                    let _ = tab.wait_until_navigated();
+                    return Ok(None);
+                }
+                let _ = first_err;
+            }
+            Err(_) => {}
+        }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
             Err(_)
@@ -746,6 +780,20 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_type(selector: String, text: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        match type_via_eval(tab, &selector, &text) {
+            Ok(_) => return Ok(None),
+            Err(first_err)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(80));
+                if type_via_eval(tab, &selector, &text).is_ok() {
+                    return Ok(None);
+                }
+                let _ = first_err;
+            }
+            Err(_) => {}
+        }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
             Err(_)

@@ -649,14 +649,35 @@ pub async fn package_search(
 }
 
 async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
-    let resp = c
+    let exact = npm_exact_summary(c, q).await.ok().flatten();
+    let resp = match c
         .get("https://registry.npmjs.org/-/v1/search")
         .query(&[("text", q), ("size", &limit.to_string())])
         .send()
         .await
-        .map_err(|e| format!("npm: {e}"))?;
-    let json: Value = resp.json().await.map_err(|e| format!("npm JSON: {e}"))?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if let Some(info) = exact {
+                return Ok(format!("npm packages:\n\n{info}"));
+            }
+            return Err(format!("npm: {e}"));
+        }
+    };
+    let json: Value = match resp.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            if let Some(info) = exact {
+                return Ok(format!("npm packages:\n\n{info}"));
+            }
+            return Err(format!("npm JSON: {e}"));
+        }
+    };
     let mut out = String::from("npm packages:\n\n");
+    if let Some(info) = exact {
+        out.push_str(&info);
+        out.push('\n');
+    }
     if let Some(objs) = json["objects"].as_array() {
         for (i, o) in objs.iter().enumerate() {
             let p = &o["package"];
@@ -671,6 +692,151 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+fn npm_exact_query(q: &str) -> bool {
+    let q = q.trim();
+    !q.is_empty()
+        && q.len() <= 214
+        && !q.chars().any(char::is_whitespace)
+        && q.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '-' | '_' | '.' | '~'))
+}
+
+fn npm_registry_path(name: &str) -> String {
+    let mut out = String::new();
+    for (part_index, part) in name.trim().split('/').filter(|part| !part.is_empty()).enumerate() {
+        if part_index > 0 {
+            out.push_str("%2F");
+        }
+        for byte in part.as_bytes() {
+            match *byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+    }
+    out
+}
+
+fn npm_value_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::Null => "null".to_string(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "?".to_string()),
+    }
+}
+
+fn npm_map_text(value: Option<&Value>, max: usize) -> Option<String> {
+    let obj = value.and_then(Value::as_object)?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (key, value) in obj.iter().take(max) {
+        parts.push(format!("{key}: {}", npm_value_text(value)));
+    }
+    if obj.len() > max {
+        parts.push(format!("… +{} more", obj.len() - max));
+    }
+    Some(parts.join(", "))
+}
+
+fn npm_recent_versions(data: &Value, max: usize) -> Vec<String> {
+    let Some(versions) = data.get("versions").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let time = data.get("time").and_then(Value::as_object);
+    let mut rows: Vec<(String, String)> = versions
+        .keys()
+        .map(|version| {
+            let published = time
+                .and_then(|items| items.get(version))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            (version.clone(), published)
+        })
+        .collect();
+    if time.is_some() {
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    } else {
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+    }
+    rows.into_iter().take(max).map(|row| row.0).collect()
+}
+
+async fn npm_exact_summary(c: &Client, q: &str) -> Result<Option<String>, String> {
+    if !npm_exact_query(q) {
+        return Ok(None);
+    }
+    let url = format!("https://registry.npmjs.org/{}", npm_registry_path(q));
+    let resp = c
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("npm exact: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let data: Value = resp.json().await.map_err(|e| format!("npm exact JSON: {e}"))?;
+    let name = data.get("name").and_then(Value::as_str).unwrap_or(q.trim());
+    let latest = data
+        .get("dist-tags")
+        .and_then(|tags| tags.get("latest"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let latest_manifest = data
+        .get("versions")
+        .and_then(|versions| versions.get(latest));
+    let versions_count = data
+        .get("versions")
+        .and_then(Value::as_object)
+        .map(|versions| versions.len())
+        .unwrap_or(0);
+    let recent = npm_recent_versions(&data, 10);
+    let modified = data
+        .get("time")
+        .and_then(|time| time.get("modified"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut out = format!(
+        "Exact npm registry metadata:\n   Package: {name}@{latest}\n   Modified: {modified}\n   Registry: https://www.npmjs.com/package/{name}\n"
+    );
+    if let Some(tags) = npm_map_text(data.get("dist-tags"), 8) {
+        out.push_str(&format!("   dist-tags: {tags}\n"));
+    }
+    if recent.is_empty() {
+        out.push_str(&format!("   Versions: {versions_count} total\n"));
+    } else {
+        out.push_str(&format!(
+            "   Versions: {versions_count} total; recent: {}\n",
+            recent.join(", ")
+        ));
+    }
+    for (label, value, max) in [
+        ("engines", latest_manifest.and_then(|m| m.get("engines")), 6),
+        ("peerDependencies", latest_manifest.and_then(|m| m.get("peerDependencies")), 8),
+        ("dependencies", latest_manifest.and_then(|m| m.get("dependencies")), 10),
+        (
+            "optionalDependencies",
+            latest_manifest.and_then(|m| m.get("optionalDependencies")),
+            6,
+        ),
+    ] {
+        if let Some(text) = npm_map_text(value, max) {
+            out.push_str(&format!("   {label}: {text}\n"));
+        }
+    }
+    if let Some(deprecated) = latest_manifest
+        .and_then(|m| m.get("deprecated"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("   Deprecated: {}\n", trunc(deprecated, 300)));
+    }
+    Ok(Some(out))
 }
 
 async fn search_pypi(c: &Client, q: &str) -> Result<String, String> {

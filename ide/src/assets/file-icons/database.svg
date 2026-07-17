@@ -1,1 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><path fill="#ffca28" d="M16 24c-5.525 0-10-.9-10-2v4c0 1.1 4.475 2 10 2s10-.9 10-2v-4c0 1.1-4.475 2-10 2m0-8c-5.525 0-10-.9-10-2v4c0 1.1 4.475 2 10 2s10-.9 10-2v-4c0 1.1-4.475 2-10 2m0-12C10.477 4 6 4.895 6 6v4c0 1.1 4.475 2 10 2s10-.9 10-2V6c0-1.105-4.477-2-10-2"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="dbA" x1="6" y1="4" x2="26" y2="28" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34A853"/>
+      <stop offset=".55" stop-color="#1A73E8"/>
+      <stop offset="1" stop-color="#185ABC"/>
+    </linearGradient>
+    <linearGradient id="dbB" x1="8" y1="6" x2="24" y2="12" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E8F0FE"/>
+      <stop offset="1" stop-color="#B7D2FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M6 7.2C6 4.9 10.5 3 16 3s10 1.9 10 4.2v17.6C26 27.1 21.5 29 16 29S6 27.1 6 24.8V7.2Z" fill="url(#dbA)"/>
+  <ellipse cx="16" cy="7.2" rx="10" ry="4.2" fill="url(#dbB)"/>
+  <ellipse cx="16" cy="7.2" rx="7.1" ry="2.15" fill="#1A73E8" opacity=".25"/>
+  <path d="M6 12.9c0 2.3 4.5 4.2 10 4.2s10-1.9 10-4.2M6 18.8c0 2.3 4.5 4.2 10 4.2s10-1.9 10-4.2" stroke="#E8F0FE" stroke-width="1.7" stroke-linecap="round"/>
+  <path d="M10 24.2c1.55.65 3.62 1.04 6 1.04s4.45-.39 6-1.04" stroke="#E8F0FE" stroke-width="1.4" stroke-linecap="round" opacity=".78"/>
+</svg>

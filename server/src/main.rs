@@ -1,6 +1,7 @@
 mod agent_trace;
 mod auth;
 mod codes;
+mod commission;
 mod config;
 mod deploy;
 mod email;
@@ -121,10 +122,26 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/orders/:id/cancel",
             post(pay::admin_cancel_order),
         )
+        .route(
+            "/api/admin/commissions",
+            get(commission::admin_list_commissions).post(commission::admin_create_commission),
+        )
+        .route(
+            "/api/admin/commissions/:id/status",
+            post(commission::admin_update_commission_status),
+        )
+        .route(
+            "/api/admin/commissions/:id",
+            delete(commission::admin_delete_commission),
+        )
         .route("/api/models", get(models::list_for_client))
         .route("/api/ide-key", get(models::ide_key))
         .route("/api/ide-prompts", get(prompts::ide_prompts))
-        .route("/api/models/:id/chat", post(models::chat))
+        .route("/api/i18n/pack", post(models::i18n_pack))
+        .route(
+            "/api/models/:id/chat",
+            post(models::chat).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
         .route(
             "/api/admin/models",
             get(models::admin_list).post(models::admin_create),

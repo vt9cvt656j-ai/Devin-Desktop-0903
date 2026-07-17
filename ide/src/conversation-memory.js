@@ -275,7 +275,7 @@ export class ConversationMemory {
     if (this.recent.length < SUMMARY_BATCH) return;
     const batch = this.recent.splice(0, SUMMARY_BATCH);
     this._notifyMessagesRemoved(batch);
-    const startTurn = this.totalTurns - this.recent.length - batch.length;
+    const startTurn = this.totalTurns - this.recent.length - batch.length + 1;
     const endTurn = startTurn + batch.length - 1;
     this.summaries.push({ range: `turns ${startTurn}-${endTurn}`, text: this._summarizeBatch(batch) });
     if (this.summaries.length > MAX_SUMMARIES) {
@@ -286,21 +286,41 @@ export class ConversationMemory {
   }
 
   _summarizeBatch(batch) {
-    const actions = new Set(), files = new Set(), fixes = [], userReqs = [];
+    const actions = new Set(), files = new Set(), lines = [];
+    const clean = (value, max) => String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, max);
     for (const msg of batch) {
       if (msg.tool_calls) for (const tc of msg.tool_calls) {
         const n = tc.function?.name;
-        if (n) { actions.add(n); if (['write_file','edit_file','read_file'].includes(n)) try { const a = JSON.parse(tc.function.arguments||'{}'); if (a.path) files.add(a.path); } catch {} }
+        if (n) {
+          actions.add(n);
+          if (['write_file','edit_file','read_file'].includes(n)) {
+            try {
+              const a = JSON.parse(tc.function.arguments || '{}');
+              if (a.path) files.add(String(a.path));
+            } catch {}
+          }
+        }
       }
-      if (msg.role === 'user' && msg.content) { const l = String(msg.content).split('\n')[0].slice(0,120); if (l.length > 5) userReqs.push(l); }
-      if (msg.role === 'assistant' && /fixed|resolved|修复|已修复|解决|完成/i.test(msg.content)) { const f = msg.content.split('\n')[0]; if (f.length < 150) fixes.push(f); }
+      const role = msg?.role === 'assistant' ? 'assistant'
+        : msg?.role === 'user' ? 'user'
+        : msg?.role === 'tool' ? 'tool'
+        : 'system';
+      const text = clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
+      if (text) lines.push(`[${role}] ${text}`);
+      const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
+      if (attachments.length) {
+        const kinds = attachments.map((a) => a?.kind || "media").slice(0, 4).join(", ");
+        lines.push(`[attachments] ${attachments.length} item(s): ${kinds}`);
+      }
     }
     const p = [];
-    if (userReqs.length) p.push(`User: ${userReqs.join('; ')}`);
+    if (lines.length) p.push(lines.join('\n'));
     if (actions.size) p.push(`Actions: ${[...actions].join(', ')}`);
     if (files.size) p.push(`Files: ${[...files].join(', ')}`);
-    if (fixes.length) p.push(`Outcomes: ${fixes.join('; ')}`);
-    return p.length ? p.join(' | ') : 'Continued conversation.';
+    return p.length ? p.join('\n') : 'Continued conversation.';
   }
 
   stats() {

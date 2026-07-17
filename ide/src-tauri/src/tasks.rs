@@ -209,7 +209,7 @@ pub struct TaskRunResult {
 const MAX_TASK_OUTPUT: usize = 2 * 1024 * 1024;
 /// Kill a captured command after this long so a server/watch/blocked command
 /// can't hang the caller forever (long but enough for slow builds/installs).
-const TASK_TIMEOUT_SECS: u64 = 300;
+const TASK_TIMEOUT_SECS: u64 = 600;
 
 /// Truncate a UTF-8 string to at most `max` bytes without splitting a code
 /// point. Returns true when truncation happened.
@@ -241,7 +241,7 @@ pub async fn task_run_capture(
 ) -> Result<TaskRunResult, String> {
     // Run the blocking spawn + wait loop on the blocking pool, NOT the Tauri
     // event-loop thread. A sync command here blocks that thread for the command's
-    // whole duration (up to the 300s timeout), freezing the whole IDE — the cause
+    // whole duration (up to the command timeout), freezing the whole IDE — the cause
     // of "调用终端容易卡死一会". spawn_blocking keeps the UI responsive throughout.
     tauri::async_runtime::spawn_blocking(move || task_run_capture_inner(cwd, command, timeout_secs))
         .await

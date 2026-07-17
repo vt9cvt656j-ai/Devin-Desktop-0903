@@ -926,13 +926,16 @@ pub fn git_blame(root: String, rel: String) -> Result<Vec<BlameLine>, String> {
     Ok(result)
 }
 
-/// Pull the current branch from its upstream (`git pull`).
+/// Pull the current branch from its upstream with an explicit merge strategy.
 ///
 /// Returns combined stdout/stderr because git reports progress on stderr even
 /// on success.
 #[tauri::command]
 pub fn git_pull(root: String) -> Result<String, String> {
-    let out = run_git(&root, &["pull"])?;
+    // Newer Git versions refuse a divergent pull unless the user configured a
+    // reconciliation strategy. The IDE's button is explicitly “拉取并合并”, so
+    // pass the strategy every time and disable the merge-message editor.
+    let out = run_git(&root, &["pull", "--no-rebase", "--no-edit"])?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}\n{stderr}").trim().to_string();
@@ -1114,5 +1117,60 @@ mod tests {
         let error = select_push_remote(&["one".into(), "two".into()]).unwrap_err();
         assert!(error.contains("no `origin` remote"));
         assert!(error.contains("one, two"));
+    }
+
+    #[test]
+    fn pull_uses_merge_strategy_without_opening_an_editor() {
+        let temp = TempGitRoot::new();
+        let base = path_string(&temp.0);
+        let source_path = temp.0.join("source");
+        let remote_path = temp.0.join("origin.git");
+        let clone_path = temp.0.join("clone");
+        let source = path_string(&source_path);
+        let remote = path_string(&remote_path);
+        let clone = path_string(&clone_path);
+
+        run_git_checked(&base, &["init", "--bare", &remote]).unwrap();
+        run_git_checked(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        run_git_checked(&base, &["init", &source]).unwrap();
+        run_git_checked(&source, &["checkout", "-b", "main"]).unwrap();
+        configure_identity(&source);
+
+        fs::write(source_path.join("README.md"), "base\n").unwrap();
+        git_stage(source.clone(), "README.md".into()).unwrap();
+        git_commit(source.clone(), "base".into()).unwrap();
+        run_git_checked(&source, &["remote", "add", "origin", &remote]).unwrap();
+        git_push(source.clone()).unwrap();
+
+        git_clone(remote.clone(), clone.clone()).unwrap();
+        configure_identity(&clone);
+
+        fs::write(source_path.join("remote.txt"), "remote\n").unwrap();
+        git_stage(source.clone(), "remote.txt".into()).unwrap();
+        git_commit(source.clone(), "remote change".into()).unwrap();
+        git_push(source.clone()).unwrap();
+
+        fs::write(clone_path.join("local.txt"), "local\n").unwrap();
+        git_stage(clone.clone(), "local.txt".into()).unwrap();
+        git_commit(clone.clone(), "local change".into()).unwrap();
+
+        let out = git_pull(clone.clone()).unwrap();
+        assert!(
+            out.contains("Merge") || out.contains("files changed") || out.contains("file changed"),
+            "unexpected pull output: {out}"
+        );
+        assert_eq!(
+            fs::read_to_string(clone_path.join("remote.txt")).unwrap(),
+            "remote\n"
+        );
+        assert_eq!(
+            fs::read_to_string(clone_path.join("local.txt")).unwrap(),
+            "local\n"
+        );
+        let parents = run_git_checked(&clone, &["show", "-s", "--format=%P", "HEAD"]).unwrap();
+        assert!(
+            parents.split_whitespace().count() >= 2,
+            "pull should create a merge commit for divergent branches, got parents: {parents}"
+        );
     }
 }

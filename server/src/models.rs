@@ -7,6 +7,7 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,8 @@ const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 6;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
 static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static I18N_PACK_CACHE: LazyLock<Mutex<HashMap<String, serde_json::Value>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn chat_upstream_retry_base_delay_ms(attempt: u32) -> u64 {
@@ -272,6 +275,358 @@ fn allowed_ids(m: &Model) -> Vec<String> {
         Some(s) if !s.is_empty() => vec![s.clone()],
         _ => vec![],
     }
+}
+
+#[derive(Deserialize)]
+pub struct I18nPackReq {
+    pub locale: String,
+    pub source_locale: Option<String>,
+    pub entries: HashMap<String, String>,
+}
+
+fn i18n_pack_cache_key(locale: &str, entries: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<_> = entries.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    locale.hash(&mut h);
+    for (k, v) in pairs {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    format!("{}:{:016x}", locale, h.finish())
+}
+
+fn json_object_from_model_text(text: &str) -> Option<serde_json::Value> {
+    let mut s = text.trim();
+    if s.starts_with("```") {
+        if let Some(pos) = s.find('\n') {
+            s = &s[pos + 1..];
+        }
+        if let Some(pos) = s.rfind("```") {
+            s = &s[..pos];
+        }
+    }
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    serde_json::from_str(&s[start..=end]).ok()
+}
+
+fn i18n_pack_payload(
+    model_id: &str,
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> serde_json::Value {
+    json!({
+        "model": model_id,
+        "temperature": 0.1,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a professional software UI localization engine. Return ONLY valid JSON. Translate UI strings accurately and naturally. Preserve placeholders like {name}, {count}, {path}, punctuation that belongs to variables, product names (Michael IDE, Git, MCP, Skills), code identifiers, file paths, shortcuts, and HTML/Markdown markers. Keep keys unchanged. Do not add explanations."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Translate this Michael IDE UI language pack from {} to locale {}. Return JSON exactly as {{\"translations\":{{\"key\":\"translated text\"}}}}. Entries JSON:\n{}",
+                    source_locale,
+                    locale,
+                    serde_json::to_string(entries).unwrap_or_else(|_| "{}".into())
+                )
+            }
+        ]
+    })
+}
+
+fn i18n_out_from_raw(
+    entries: &HashMap<String, String>,
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (k, original) in entries {
+        if let Some(text) = raw.get(k).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.insert(k.clone(), json!(trimmed));
+                continue;
+            }
+        }
+        out.insert(k.clone(), json!(original));
+    }
+    out
+}
+
+fn i18n_pack_body(
+    locale: &str,
+    source_locale: &str,
+    translations: serde_json::Map<String, serde_json::Value>,
+    source: &str,
+) -> serde_json::Value {
+    json!({
+        "locale": locale,
+        "source_locale": source_locale,
+        "translations": translations,
+        "source": source,
+    })
+}
+
+async fn i18n_pack_from_model(
+    m: &Model,
+    model_id: &str,
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let payload = i18n_pack_payload(model_id, source_locale, locale, entries);
+    let url = format!("{}/chat/completions", api_base(&m.base_url));
+    let resp = GW_HTTP
+        .post(url)
+        .header("Authorization", format!("Bearer {}", m.api_key))
+        .json(&payload)
+        .timeout(Duration::from_secs(90))
+        .send()
+        .await
+        .map_err(|e| format!("{} / {} 请求失败: {e}", m.label, model_id))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "{} / {} 上游错误 {}: {}",
+            m.label,
+            model_id,
+            status.as_u16(),
+            safe_upstream_error_excerpt(&text)
+        ));
+    }
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| format!("{} / {} 返回非 JSON", m.label, model_id))?;
+    let content = data
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let parsed = json_object_from_model_text(content)
+        .ok_or_else(|| format!("{} / {} 没有返回可解析语言包 JSON", m.label, model_id))?;
+    let raw = parsed
+        .get("translations")
+        .and_then(|v| v.as_object())
+        .or_else(|| parsed.as_object())
+        .ok_or_else(|| format!("{} / {} 语言包缺少 translations 对象", m.label, model_id))?;
+    Ok(i18n_out_from_raw(entries, raw))
+}
+
+fn google_translate_locale(locale: &str) -> String {
+    match locale.trim().replace('_', "-").as_str() {
+        "zh-CN" | "zh-Hans" => "zh-CN".to_string(),
+        "zh-TW" | "zh-Hant" => "zh-TW".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn google_translate_text(data: &serde_json::Value) -> Option<String> {
+    let parts = data.get(0)?.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        if let Some(text) = part.get(0).and_then(|v| v.as_str()) {
+            out.push_str(text);
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+async fn google_translate_joined(
+    source_locale: &str,
+    locale: &str,
+    joined: &str,
+) -> Result<String, String> {
+    let resp = GW_HTTP
+        .get("https://translate.googleapis.com/translate_a/single")
+        .query(&[
+            ("client", "gtx"),
+            ("sl", source_locale),
+            ("tl", locale),
+            ("dt", "t"),
+            ("q", joined),
+        ])
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await
+        .map_err(|e| format!("公共翻译请求失败: {e}"))?;
+    let status = resp.status();
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("公共翻译返回非 JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("公共翻译错误 {}: {}", status.as_u16(), data));
+    }
+    google_translate_text(&data).ok_or_else(|| "公共翻译没有返回文本".to_string())
+}
+
+async fn google_translate_batch(
+    source_locale: &str,
+    locale: &str,
+    texts: &[String],
+) -> Result<Vec<String>, String> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let marker = "<<<MICHAEL_I18N_SPLIT>>>";
+    let joined = texts.join(&format!("\n{marker}\n"));
+    let translated = google_translate_joined(source_locale, locale, &joined).await?;
+    let parts: Vec<String> = translated
+        .split(marker)
+        .map(|s| s.trim_matches(['\n', '\r']).trim().to_string())
+        .collect();
+    if parts.len() == texts.len() {
+        return Ok(parts);
+    }
+    if texts.len() == 1 {
+        return Ok(vec![translated.trim().to_string()]);
+    }
+
+    let mut one_by_one = Vec::with_capacity(texts.len());
+    for text in texts {
+        let single = google_translate_joined(source_locale, locale, text).await?;
+        let cleaned = single.trim();
+        one_by_one.push(if cleaned.is_empty() {
+            text.clone()
+        } else {
+            cleaned.to_string()
+        });
+    }
+    Ok(one_by_one)
+}
+
+async fn i18n_pack_from_public_translate(
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let tl = google_translate_locale(locale);
+    let mut pairs: Vec<(&String, &String)> = entries.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = serde_json::Map::new();
+    let mut batch_keys: Vec<String> = Vec::new();
+    let mut batch_texts: Vec<String> = Vec::new();
+    let mut batch_len = 0usize;
+    for (key, text) in pairs {
+        let projected = batch_len + text.len() + 32;
+        if !batch_texts.is_empty() && projected > 3200 {
+            let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
+            for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+                out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
+            }
+            batch_texts.clear();
+            batch_len = 0;
+        }
+        batch_keys.push(key.clone());
+        batch_texts.push(text.clone());
+        batch_len += text.len() + 32;
+    }
+    if !batch_texts.is_empty() {
+        let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
+        for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+            out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
+        }
+    }
+
+    Ok(i18n_out_from_raw(entries, &out))
+}
+
+/// POST /api/i18n/pack — generate a UI language pack for any BCP-47 locale.
+///
+/// The IDE ships core packs (zh/en/ja) locally. For every other selected language
+/// it posts the English key-value base here; the server asks an active configured
+/// model to translate it into the requested locale, caches the result in memory,
+/// and returns a plain `{ translations: { key: text } }` object. This gives every
+/// language in the picker a real loading path without bundling hundreds of huge
+/// hand-maintained JSON files into the desktop app.
+pub async fn i18n_pack(
+    State(state): State<AppState>,
+    Json(req): Json<I18nPackReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let locale = req.locale.trim().replace('_', "-");
+    if locale.is_empty() || locale.len() > 32 {
+        return Err(AppError::bad("locale 不能为空"));
+    }
+    let source_locale = req.source_locale.unwrap_or_else(|| "en".to_string());
+    let entries: HashMap<String, String> = req
+        .entries
+        .into_iter()
+        .filter(|(k, v)| {
+            !k.trim().is_empty() && k.len() <= 96 && !v.trim().is_empty() && v.len() <= 900
+        })
+        .take(700)
+        .collect();
+    if entries.is_empty() {
+        return Err(AppError::bad("entries 不能为空"));
+    }
+
+    let cache_key = i18n_pack_cache_key(&locale, &entries);
+    if let Ok(cache) = I18N_PACK_CACHE.lock() {
+        if let Some(v) = cache.get(&cache_key) {
+            return Ok(Json(v.clone()));
+        }
+    }
+
+    let models = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true AND api_key <> '' ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut failures: Vec<String> = Vec::new();
+    for m in &models {
+        let mut ids = allowed_ids(m);
+        if ids.is_empty() {
+            if let Some(id) = &m.model_id {
+                if !id.trim().is_empty() {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            failures.push(format!("{} 未配置 model_id", m.label));
+            continue;
+        }
+        for model_id in ids {
+            match i18n_pack_from_model(m, &model_id, &source_locale, &locale, &entries).await {
+                Ok(out) => {
+                    let body =
+                        i18n_pack_body(&locale, &source_locale, out, "model_generated_cached");
+                    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
+                        cache.insert(cache_key, body.clone());
+                    }
+                    return Ok(Json(body));
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+    }
+
+    let out = i18n_pack_from_public_translate(&source_locale, &locale, &entries)
+        .await
+        .map_err(|e| AppError {
+            status: StatusCode::BAD_GATEWAY,
+            msg: format!(
+                "语言包生成失败；模型线路失败 {} 条，公共翻译也失败: {}",
+                failures.len(),
+                e
+            ),
+        })?;
+    let body = i18n_pack_body(&locale, &source_locale, out, "public_translate_cached");
+    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
+        cache.insert(cache_key, body.clone());
+    }
+    Ok(Json(body))
 }
 
 /// Mask a secret for display: keep the last 4 chars.
@@ -558,6 +913,16 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
     for m in &rows {
         for mid in allowed_ids(m) {
             let name = display_name_for(&m.model_names, &mid);
+            let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
+            let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
+                (model_in, model_out, "model_override")
+            } else if m.input_price > 0.0 || m.output_price > 0.0 {
+                (m.input_price, m.output_price, "backend")
+            } else if let Some((official_in, official_out)) = official_price(&mid) {
+                (official_in, official_out, "catalog")
+            } else {
+                (0.0, 0.0, "unset")
+            };
             list.push(json!({
                 "conn_id": m.id,
                 "group": m.label,
@@ -565,9 +930,13 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "model_id": mid.clone(),
                 "name": name,
                 "price_cents": m.price_cents,
-                // Only the admin blurb is exposed. The operator's billing (input_price/
-                // output_price/rate + markup) is deliberately NOT sent to clients — the
-                // picker shows each model's OFFICIAL list price from a frontend catalog.
+                // Expose the display price the admin configured for the IDE picker.
+                // No api_key/base_url is leaked; just the model's visible input/output
+                // price so the client can show exactly what the backend is using.
+                "input_price": input_price,
+                "output_price": output_price,
+                "price_source": price_source,
+                "rate": m.rate,
                 "description": m.description,
             }));
         }
@@ -1114,6 +1483,60 @@ fn official_price(model_id: &str) -> Option<(f64, f64)> {
         if m.contains("flash") {
             return Some((0.5, 3.0));
         } // gemini 3 flash tier
+    }
+    // ---- Z.ai GLM (official list price, USD/1M, docs.z.ai 2026-07) ----
+    if m.contains("glm") {
+        // 顺序敏感：更具体的变体（airx/air/x/flashx）必须先于裸版本号匹配
+        if m.contains("5.2") || m.contains("5.1") {
+            return Some((1.40, 4.40));
+        }
+        if m.contains("glm-5") || m.contains("glm5") {
+            return Some((1.00, 3.20));
+        }
+        if m.contains("flashx") {
+            return Some((0.07, 0.40));
+        }
+        if m.contains("airx") {
+            return Some((1.10, 4.50));
+        }
+        if m.contains("air") {
+            return Some((0.20, 1.10));
+        }
+        if m.contains("4.5-x") || m.contains("4.5x") {
+            return Some((2.20, 8.90));
+        }
+        if m.contains("4.7") || m.contains("4.6") || m.contains("4.5") {
+            return Some((0.60, 2.20));
+        }
+        return Some((0.60, 2.20)); // 其余 GLM 变体按 4.x 主档兜底
+    }
+    // ---- xAI Grok (official list price, USD/1M, x.ai 2026-07) ----
+    if m.contains("grok") {
+        if m.contains("code-fast") || m.contains("code_fast") {
+            return Some((0.20, 1.50));
+        }
+        if m.contains("4.20") {
+            return Some((2.0, 6.0));
+        }
+        if m.contains("4.5") {
+            return Some((2.0, 6.0));
+        }
+        if m.contains("4.3") {
+            return Some((1.25, 2.50));
+        }
+        if m.contains("4.1") || m.contains("4-fast") || m.contains("fast") {
+            return Some((0.20, 0.50)); // grok-4.1 / grok-4.1-fast / grok-4-fast 量产档
+        }
+        if m.contains("build") {
+            return Some((1.0, 2.0));
+        }
+        if m.contains("3-mini") || m.contains("3 mini") {
+            return Some((0.30, 0.50));
+        }
+        if m.contains("grok-4") || m.contains("grok-3") {
+            return Some((3.0, 15.0)); // grok-4 / grok-3 旗舰旧档
+        }
+        return Some((2.0, 6.0)); // 未知新 Grok 按当前旗舰档兜底
     }
     // ---- OpenAI GPT / DeepSeek / MiniMax (exact ids as the aggregator exposes them) ----
     let p = match m.as_str() {
@@ -2000,8 +2423,23 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
         .or_else(|| {
-            // If client sent thinking but no reasoning_effort, infer effort from presence
-            body.get("thinking").and(Some("high"))
+            // 客户端只发 thinking:{budget_tokens} 不发 reasoning_effort（IDE Claude 族的
+            // 真实形状）时，按预算推档——以前这里一律写死 "high"，用户转盘上的
+            // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
+            // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
+            body.get("thinking").map(|t| {
+                match t
+                    .get("budget_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                {
+                    b if b > 24000 => "max",
+                    b if b > 12000 => "high",
+                    b if b > 4096 => "medium",
+                    b if b > 0 => "low",
+                    _ => "high", // 无预算的裸 thinking 开关（Kimi/GLM 形状）保持旧行为
+                }
+            })
         });
     let thinking = anthropic_thinking(model_str, effort);
     let thinking_on = thinking.is_some();
@@ -3029,6 +3467,19 @@ pub async fn chat_completions(
     if streaming {
         // Pre-compute input token estimate BEFORE the spawn (body is consumed afterwards).
         let est_in_tok = estimate_input_tokens(&body);
+        // 深思考请求（xhigh/max/带 thinking 预算）静默期可超 3 分钟：固定 180s 的上游
+        // 空闲斩会在客户端窗口放宽后成为顶层杀手，这里跟档位一起放宽。
+        let deep_thinking = body
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .map(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"))
+            .unwrap_or(false)
+            || body
+                .get("thinking")
+                .and_then(|t| t.get("budget_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0;
         // Tee the upstream SSE: forward bytes to the client UNCHANGED while
         // accumulating the full stream so a complete response can be cached. Billing is
         // REAL: the trailing include_usage chunk gives true token counts → official price
@@ -3059,7 +3510,9 @@ pub async fn chat_completions(
             // 180s (was 30s): a thinking model pauses to reason / composes a long file write
             // silently → the 30s guard cut the stream mid-tool-call (truncated args → empty
             // write "内容为空"). 180s lets those through while still bounding a real hang.
-            let idle = std::time::Duration::from_secs(180);
+            // 深思考档（xhigh/max/thinking 预算）放宽到 600s——否则客户端 180s 窗和这里打平，
+            // 超 3 分钟的静默深思仍会被网关先掐。
+            let idle = std::time::Duration::from_secs(if deep_thinking { 600 } else { 180 });
             let mut acc: Vec<u8> = Vec::new(); // OpenAI-shape SSE bytes, for the response cache (capped 1MB)
                                                // Bounded tail for OpenAI usage extraction (the include_usage chunk is the LAST event;
                                                // a >1MB response would miss it in the capped acc). Unused on the anthropic path — there
@@ -4683,6 +5136,35 @@ mod billing_tests {
         assert_eq!(official_price("MiniMax-M2.1"), Some((0.15, 0.60)));
         assert_eq!(official_price("MiniMax-M2"), Some((0.10, 0.40)));
         assert_eq!(official_price("some-unknown-model"), None); // → connection fallback, then 0
+    }
+
+    // GLM / Grok 走"透传任意 id"的连接（连接价 0、无按模型覆盖），此前不在目录里 → 一直按
+    // 0 计费。默认定价 = 官方牌价进目录（docs.z.ai / x.ai，2026-07），连接倍率照常乘在上面。
+    #[test]
+    fn official_catalog_covers_glm_and_grok_families() {
+        assert_eq!(official_price("glm-5.2"), Some((1.40, 4.40)));
+        assert_eq!(official_price("GLM-5.1"), Some((1.40, 4.40))); // case-insensitive
+        assert_eq!(official_price("glm-5"), Some((1.00, 3.20)));
+        assert_eq!(official_price("glm-4.7-flashx"), Some((0.07, 0.40)));
+        assert_eq!(official_price("glm-4.7"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-4.6"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-4.5-airx"), Some((1.10, 4.50))); // airx 先于 air
+        assert_eq!(official_price("glm-4.5-air"), Some((0.20, 1.10)));
+        assert_eq!(official_price("glm-4.5-x"), Some((2.20, 8.90)));
+        assert_eq!(official_price("glm-4.5"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-next"), Some((0.60, 2.20))); // 未知变体按 4.x 主档兜底
+
+        assert_eq!(official_price("grok-code-fast-1"), Some((0.20, 1.50)));
+        assert_eq!(official_price("grok-4.20"), Some((2.0, 6.0)));
+        assert_eq!(official_price("grok-4.5"), Some((2.0, 6.0)));
+        assert_eq!(official_price("grok-4.3"), Some((1.25, 2.50)));
+        assert_eq!(official_price("grok-4.1-fast"), Some((0.20, 0.50)));
+        assert_eq!(official_price("grok-4-fast"), Some((0.20, 0.50)));
+        assert_eq!(official_price("grok-build-0.1"), Some((1.0, 2.0)));
+        assert_eq!(official_price("grok-3-mini"), Some((0.30, 0.50)));
+        assert_eq!(official_price("grok-4-0709"), Some((3.0, 15.0)));
+        assert_eq!(official_price("grok-3"), Some((3.0, 15.0)));
+        assert_eq!(official_price("grok-x-new"), Some((2.0, 6.0))); // 未知新 Grok 按旗舰档兜底
     }
 
     // No usage reported → 0 (never guesses token counts).

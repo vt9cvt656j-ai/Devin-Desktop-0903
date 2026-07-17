@@ -353,7 +353,7 @@ def h_exec(b):
     if not cmd.strip():
         return {"error": "空命令"}
     cwd = _within_root(b["cwd"]) if b.get("cwd") else (CFG["root"] or os.getcwd())
-    timeout = min(int(b.get("timeout") or 120), 600)
+    timeout = min(int(b.get("timeout") or 300), 600)
     try:
         r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         return {"stdout": r.stdout[-100_000:], "stderr": r.stderr[-50_000:], "code": r.returncode, "timed_out": False, "cwd": cwd}
