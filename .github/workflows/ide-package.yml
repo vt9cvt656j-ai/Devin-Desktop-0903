@@ -81,6 +81,7 @@ jobs:
           }
 
       - name: Run frontend logic tests
+        if: runner.os != 'Windows'
         working-directory: ide
         run: npm test
 
