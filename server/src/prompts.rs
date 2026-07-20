@@ -338,6 +338,28 @@ fn user_message_text(message: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// True when any of the most recent user messages satisfies `pred`. Classification must be
+/// sticky across a session: continuation turns ("继续") and short follow-ups carry no keywords,
+/// so a latest-message-only check would drop specialization exactly on the iterative turns that
+/// still need it. Bounded to the last 20 user messages, first 2000 chars each — pure chat history
+/// has no engineering/UI signal, so the bound cannot silently reclassify a casual conversation.
+fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> bool {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .rev()
+                .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+                .take(20)
+                .filter_map(user_message_text)
+                .any(|text| {
+                    let bounded: String = text.chars().take(2000).collect();
+                    pred(&bounded)
+                })
+        })
+}
+
 /// Treat nested reserved markers as pasted data rather than a second routing instruction.
 fn truncate_at_embedded_request_marker(request: &str) -> &str {
     let nested_index = [
@@ -1076,13 +1098,9 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
 
 /// Decide whether the user's real request needs the UI specialization. Keep generic engineering
 /// terms out: a false positive adds several prompt blocks and can steer a backend task toward a
-/// frontend stack even though the tool/runtime capabilities themselves remain unchanged.
-/// The point is that the deepest design guidance (`ui_design_guide`/`css_concrete_tokens`)
-/// was previously gated behind an `x-ide-ui` header that NOTHING emits — so it never
-/// reached the model. This makes it fire whenever the work is plausibly UI/frontend.
-// 保留备用（运维排查/统计可用）：agent/plan 模式的设计体系已改为无条件常驻，
-// 不再用关键词猜测——关键词表永远列不全（"个人引导页"曾漏网）。
-#[allow(dead_code)]
+/// frontend stack even though the tool/runtime capabilities themselves remain unchanged. Gates the
+/// design system (shadcn/ui + Tailwind palette + token contract) so only界面/前端/视觉 work pays
+/// for it; combined with a sticky scan of recent user messages so continuation turns keep it.
 fn looks_like_ui_task(q: &str) -> bool {
     let l = q.to_lowercase();
     // ASCII terms (matched against the lowercased query)
@@ -1649,16 +1667,17 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         }
     }
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
-    // 不做关键词猜测：agent/plan 模式**永远**带设计体系（shadcn/ui + Tailwind 调色板 +
-    // 令牌契约）。关键词表永远列不全——"个人引导页"就曾漏网，导致那一轮设计知识注入为零。
-    // 块开头自带"用户让你设计/做界面时看这份"的适用范围，非 UI 任务模型自会略过；前缀
-    // 缓存已修复（时间块天级化+棘轮压缩），常驻静态块的重复成本≈0 且让前缀更稳定。
-    // MICHAEL_UI_GUIDE=0 仍是运维总开关；其他模式仍可用 x-ide-ui 头显式开启。
+    // UI 设计体系（shadcn/ui + Tailwind 调色板 + 令牌契约）是重块，只在这轮真的在做界面/
+    // 前端/视觉时注入。此前它对 agent/plan 无条件常驻，导致修 Rust 后端、跑命令、改算法的
+    // 任务也被整套前端设计宪法污染，既跑偏又白烧上下文，还让非 UI 请求的系统前缀不稳定。
+    // 判定用 looks_like_ui_task，并做会话粘性扫描（续跑轮"继续"不含关键词也不丢）。
+    // x-ide-ui 头或 MICHAEL_UI_GUIDE=always 仍可强制开启；MICHAEL_UI_GUIDE=0 是运维总开关。
     let ui_intent = ui_env.as_deref() != Some("0")
-        && (mode == "agent"
-            || mode == "plan"
-            || hdr("x-ide-ui").is_some()
-            || ui_env.as_deref() == Some("always"));
+        && (hdr("x-ide-ui").is_some()
+            || ui_env.as_deref() == Some("always")
+            || ((mode == "agent" || mode == "plan")
+                && (user_request.as_deref().is_some_and(looks_like_ui_task)
+                    || recent_user_text_any(body, looks_like_ui_task))));
     if ui_intent {
         for name in ["ui_design_flow", "shadcn_design_system", "css_concrete_tokens"] {
             let block = read_prompt(name).unwrap_or_default();
@@ -1750,31 +1769,13 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         );
     }
     let prompt_bytes = sys.len();
+    // 推理检查点只以系统消息形式出现一次（见上，属于稳定前缀）。此前还会把一行检查点
+    // 追加到最后一条 user 消息末尾——每轮都改写 user 正文，破坏消息哈希与上游 prompt
+    // 前缀缓存（长 run 逐轮 cache miss），且与系统侧内容重复强调。去掉双写，纪律交给
+    // 稳定的系统侧检查点承载。
     if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         if !sys.is_empty() {
             msgs.insert(0, serde_json::json!({ "role": "system", "content": sys }));
-        }
-        // 就近推理强化（恢复 dca37cb 移除的能力，但不拆 assistant(tool_calls)+tool 配对）：
-        // 长 run 里检查点被压在几万 token 工具输出上方，模型后半程推理纪律无再锚定
-        // （用户实测"跑时间长就不思考了"）。把一行精简检查点追加到最后一条 user 文本
-        // 消息末尾——纯文本追加绝不破坏消息配对；最后一条不是 user 文本就跳过。
-        if needs_reasoning_checkpoint {
-            if let Some(last) = msgs.last_mut() {
-                let is_user = last.get("role").and_then(|r| r.as_str()) == Some("user");
-                let text = last
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .map(str::to_string);
-                if is_user {
-                    if let Some(text) = text {
-                        if !text.contains("⚡推理检查") {
-                            last["content"] = serde_json::json!(format!(
-                                "{text}\n\n（⚡推理检查：动手前快速过一遍——目标终态？契约与边界？这一步要拿到什么证据？哪里会炸？想清楚再动，证据足够就收，不重复展开已排除分支。）"
-                            ));
-                        }
-                    }
-                }
-            }
         }
     }
     // 2) inject the requested tool schemas from tools.json (client sends only the NAMES it
@@ -3142,9 +3143,9 @@ mod tests {
             assert!(system.contains("自动化任务按小状态机执行"), "{model}");
             assert!(system.contains("失败恢复要换策略而不是原样重试"), "{model}");
             assert!(!system.contains("# 十、自动化"), "{model}");
-            // 新契约：agent 模式设计体系永远在场（不做关键词猜测——"引导页"曾漏网导致
-            // 那一轮设计知识注入为零）。自动化任务也带 UI 块，块头自带适用范围说明。
-            assert!(system.contains("# UI 设计 token 与组件契约"), "{model}");
+            // UI 设计体系改为意图门控：纯桌面自动化任务不含界面/前端/视觉关键词，
+            // 不应再被前端设计宪法污染。
+            assert!(!system.contains("# UI 设计 token 与组件契约"), "{model}");
         }
 
         let mut headers = HeaderMap::new();
@@ -3160,7 +3161,7 @@ mod tests {
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
         assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
-        // 新契约：agent 模式设计体系永远在场（详见上方注释）
+        // 含"网页/网站"命中 UI 意图门控，此路径仍注入设计体系。
         assert!(system.contains("# UI 设计 token 与组件契约"));
     }
 
