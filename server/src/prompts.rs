@@ -20,14 +20,15 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-// The bundled registry currently contains 129 tools. Keep a bounded margin for
-// additions while allowing the IDE to send its complete static selection.
-const MAX_STATIC_TOOLS_PER_REQUEST: usize = 160;
+// The bundled registry currently contains ~159 tools (kept in sync with the client
+// registry `_buildAgentToolSchemas` via ide/build/sync-tools-json.mjs). Keep a bounded
+// margin for additions while allowing the IDE to send its complete static selection.
+const MAX_STATIC_TOOLS_PER_REQUEST: usize = 220;
 // L0 defense: the desktop can aggregate tools from several runtime/MCP services before this
 // request reaches the server. Bound the final array after every merge so one noisy service cannot
 // create an unbounded upstream payload. This limit is the complete compact JSON array, including
 // brackets and commas, measured as serialized UTF-8 bytes.
-const MAX_FINAL_TOOLS_PER_REQUEST: usize = 160;
+const MAX_FINAL_TOOLS_PER_REQUEST: usize = 220;
 const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
 
 fn prompt_path(name: &str) -> PathBuf {
@@ -2040,7 +2041,7 @@ mod tests {
 
     #[test]
     fn truncates_excessive_tool_requests() {
-        let many_tools = (0..160)
+        let many_tools = (0..MAX_STATIC_TOOLS_PER_REQUEST + 40)
             .map(|i| format!("tool_{i}"))
             .collect::<Vec<_>>()
             .join(",");
@@ -2063,6 +2064,89 @@ mod tests {
             tools.len(),
             MAX_STATIC_TOOLS_PER_REQUEST
         );
+    }
+
+    /// Every tool name the agent prompts actively teach (in a `工具名` backtick or a
+    /// `工具名(...)` call form) must exist in tools.json. Otherwise the model is told to
+    /// call a tool the server can never inject a schema for → a wasted, failing turn.
+    /// This is the CI guard the audit asked for: prompts may only reference real tools.
+    /// Keep in sync with the client registry via ide/build/sync-tools-json.mjs.
+    #[test]
+    fn agent_prompts_only_reference_real_tools() {
+        let catalog_text = read_tools_file().expect("tools.json should be readable");
+        let catalog: Vec<serde_json::Value> =
+            serde_json::from_str(&catalog_text).expect("tools.json should be valid JSON");
+        let known: HashSet<String> = catalog
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|n| n.as_str()))
+            .map(str::to_string)
+            .collect();
+
+        // search_tools is the always-in-body meta tool (never a static catalog entry);
+        // these are non-tool snake_case tokens that appear in the prose (rust methods,
+        // css props, npm commands, schema fields) and must not be treated as tool names.
+        const NON_TOOL_TOKENS: &[&str] = &[
+            "search_tools", "map_err", "ok_or", "node_modules", "task_id", "npm_install",
+            "pip_install", "yarn_install", "pnpm_install", "bun_install", "npm_ci",
+            "object_fit", "object_position", "grid_template_columns", "grid_auto_rows",
+            "aspect_ratio", "break_inside", "column_count", "max_width", "margin_left",
+            "text_shadow", "backdrop_blur", "file_pattern", "check_type", "peer_dependencies",
+            "dist_tags", "node_id", "globals_css", "rust_users", "python_discussions",
+            "swift_forums", "kotlin_discussions",
+        ];
+        let ignore: HashSet<&str> = NON_TOOL_TOKENS.iter().copied().collect();
+
+        let looks_like_tool = |token: &str| {
+            token.len() >= 3
+                && token.contains('_')
+                && token.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !token.starts_with('_')
+                && !token.ends_with('_')
+        };
+        let extract = |text: &str| -> HashSet<String> {
+            let bytes = text.as_bytes();
+            let mut names = HashSet::new();
+            // `token` in backticks, or token immediately followed by '('.
+            let mut token = String::new();
+            let flush = |token: &mut String, names: &mut HashSet<String>, delim: char| {
+                if !token.is_empty() {
+                    if (delim == '`' || delim == '(') && looks_like_tool(token) {
+                        names.insert(std::mem::take(token));
+                    } else {
+                        token.clear();
+                    }
+                }
+            };
+            let mut in_tick = false;
+            for &b in bytes {
+                let c = b as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    token.push(c);
+                } else if c == '`' {
+                    if in_tick { flush(&mut token, &mut names, '`'); } else { token.clear(); }
+                    in_tick = !in_tick;
+                } else if c == '(' {
+                    flush(&mut token, &mut names, '(');
+                } else {
+                    token.clear();
+                }
+            }
+            names
+        };
+
+        for prompt in ["agent", "agent_lite"] {
+            let text = read_prompt(prompt).expect("agent prompt should load");
+            let referenced = extract(&text);
+            let phantom: Vec<&String> = referenced
+                .iter()
+                .filter(|name| !ignore.contains(name.as_str()) && !known.contains(name.as_str()))
+                .collect();
+            assert!(
+                phantom.is_empty(),
+                "{prompt}.txt references tools missing from tools.json: {phantom:?}. \
+                 Add them to the catalog (ide/build/sync-tools-json.mjs) or remove the reference."
+            );
+        }
     }
 
     #[test]

@@ -3879,5 +3879,725 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "shop_catalog",
+      "description": "读取店铺官网/商品页公开商品、菜单、价格、库存字段的结构化入口。优先尝试 Shopify 公共 /products.json，再解析页面 schema.org JSON-LD Product/Offer；不登录、不绕验证码/反爬、不抓私有接口、不编造价格/库存/币种。没有官网 URL 时返回需要官网，不把搜索摘要当价格。每条结果带 source_url、retrieved_at、source_statuses 和 limitations。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "用户原始问题或店铺名/商品名。若里面有官网 URL，后端会提取；没有 URL 时不会瞎编价格。"
+          },
+          "url": {
+            "type": "string",
+            "description": "店铺官网或商品页 URL；已从 local_discovery/web_search 找到官网时必须传这个。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "最多返回商品/变体数，默认 12"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "generate_wiki",
+      "description": "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "focus": {
+            "type": "string",
+            "description": "可选，重点深挖的方向（不填=全产品通览）"
+          },
+          "dest": {
+            "type": "string",
+            "description": "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "worktree",
+      "description": "**best-of-N 隔离**：建/列/删 git 工作树，让 2-3 个候选方案在各自独立工作树里并行实现、互不踩主代码（撤销=删工作树）。难/不确定的任务想「出多个候选选最优」时用——文献证明这是提升正确率最有效的一招。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "add",
+              "list",
+              "remove"
+            ],
+            "description": "add=建一个新工作树(返回绝对路径) / list=列出 / remove=删一个(=丢弃该候选)"
+          },
+          "name": {
+            "type": "string",
+            "description": "add 时：候选名（短 slug，如 cand-a）"
+          },
+          "path": {
+            "type": "string",
+            "description": "remove 时：要删的工作树绝对路径"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "semantic_search",
+      "description": "**按语义找代码**——不是 grep 精确匹配，而是按一句自然语言描述「找出做这件事的代码」。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "自然语言描述要找的代码功能（中英文都行；越具体越好）"
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "返回最相关的几个代码块（默认 10，上限 30）"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "deploy_site",
+      "description": "**一键把做好的网站部署上线**——自动 npm run build + 上传服务器 + **自动分配一个 HTTPS 二级域名 `名字.michaelide.xyz`**（泛解析 + 泛域名证书早已配好，用户完全无需手动配 DNS / 去域名控制台加 A 记录），返回可直接访问分享的网址（形如 https://my-portfolio.michaelide.xyz/）。**用户说「绑定/解析个二级域名、自定义域名、上线分享」时就直接用这个工具——二级域名是全自动的，别再反问用户域名是什么、也别让他去域名后台手动加记录。** 做完官网想让用户真能打开分享时用（idea→设计→建站→上线 闭环最后一步）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "站点名（短 slug，做 URL 路径，如 mrday / my-portfolio）"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tor_request",
+      "description": "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "description": "HTTP 方法，如 GET、POST；不传默认 GET"
+          },
+          "url": {
+            "type": "string",
+            "description": "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https"
+          },
+          "headers": {
+            "type": "object",
+            "description": "可选，请求头键值对",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body": {
+            "type": "string",
+            "description": "可选，请求体"
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "description": "可选，超时秒数，默认 60（Tor 较慢），最大 300"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "academic_search",
+      "description": "**搜索学术论文**（Semantic Scholar，覆盖 arXiv / PubMed / ACL 等）。返回标题、作者、年份、引用量、摘要、链接。用于查最新研究、算法、AI/ML 论文。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词，如 'transformer attention mechanism' 或 'large language model agent'"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 8，最大 20"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "cve_search",
+      "description": "**搜索安全漏洞（NVD/CVE 数据库）**——查 CVE 编号、CVSS 评分、漏洞描述。安全审计、依赖检查用这个。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "关键词或 CVE 编号，如 'log4j' / 'CVE-2021-44228' / 'openssl buffer overflow'"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "wiki_search",
+      "description": "**搜索维基百科**——查概念、技术、历史、人物等百科知识，返回搜索结果和首条摘要。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词，如 'RSA encryption' / 'MapReduce'"
+          },
+          "lang": {
+            "type": "string",
+            "description": "语言代码，默认 en。中文用 zh"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 5"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "dockerhub_search",
+      "description": "**搜索 Docker Hub 镜像**——找容器镜像、官方/社区镜像、部署方案。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词，如 'nginx' / 'postgres' / 'node'"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "pubmed_search",
+      "description": "**搜索 PubMed 生物医学文献**——3500万+篇论文，查医学/生物/药学/基因组学研究。比 academic_search 更精准的生物医学专用库。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词，支持 PubMed 高级语法如 'cancer AND immunotherapy' 或 MeSH 术语"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 8"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "arxiv_search",
+      "description": "**直搜 arXiv 预印本**——物理/数学/CS/生物/金融最新论文，含完整摘要和PDF直链。比 academic_search 更快拿到最新未发表研究。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "category": {
+            "type": "string",
+            "description": "可选，限定分类如 cs.AI / cs.LG / math.CO / physics.hep-th / q-bio"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "crossref_search",
+      "description": "**CrossRef 学术元数据**——1.3亿+学术作品的 DOI、引用数、期刊、作者。查某篇论文被引多少次、找某期刊的文章。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词或 DOI"
+          },
+          "search_type": {
+            "type": "string",
+            "description": "搜索类型：works（默认，论文）/ journals / funders"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "openalex_search",
+      "description": "**OpenAlex 开放学术图谱**——2.5亿+学术作品、作者、机构、主题。找某领域热门论文、查作者发表记录、看机构产出。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "entity_type": {
+            "type": "string",
+            "description": "实体类型：works（默认）/ authors / institutions / topics / sources"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "pubchem_search",
+      "description": "**PubChem 化学数据库**——1亿+化合物，查分子式、分子量、结构、药物化学性质。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "化合物名称，如 'aspirin' / 'caffeine' / 'glucose'"
+          },
+          "search_type": {
+            "type": "string",
+            "description": "搜索类型：compound（默认）"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "clinical_trials_search",
+      "description": "**ClinicalTrials.gov 临床试验**——40万+临床研究，查药物/疗法/疫苗的在研试验、状态、阶段。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词，如 'COVID vaccine' / 'breast cancer immunotherapy'"
+          },
+          "status": {
+            "type": "string",
+            "description": "可选，筛选状态：RECRUITING / COMPLETED / ACTIVE_NOT_RECRUITING / NOT_YET_RECRUITING"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "maven_search",
+      "description": "**Maven Central 搜索**——Java/Kotlin/Scala 包，查 groupId:artifactId、版本号。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词，如 'spring-boot' / 'com.google.guava'"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "packagist_search",
+      "description": "**Packagist 搜索**——PHP Composer 包，查 vendor/package、下载量、收藏。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "rubygems_search",
+      "description": "**RubyGems 搜索**——Ruby gem 包，查版本、下载量、项目信息。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "nuget_search",
+      "description": "**NuGet 搜索**——.NET/C# 包，查版本、下载量、作者、验证状态。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索词"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "homebrew_search",
+      "description": "**Homebrew 查询**——macOS 命令行工具/库，直接查 formula 或 cask 详情（名称、版本、依赖、安装命令）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "包名，如 'ffmpeg' / 'node' / 'python'"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "steam_search",
+      "description": "**Steam 游戏搜索**——搜索 Steam 游戏，返回价格/平台/链接。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "游戏名"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "返回数量，默认 10"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "capture_start",
+      "description": "**启动抓包（mitmproxy，小黄鸟/HttpCanary 类能力）**。先选模式：mode:\"isolated_browser\"=默认推荐，无痕/隔离抓自动化浏览器，不改系统代理；mode:\"system\"=抓任意 App/全系统流量，会改 macOS 系统代理；mode:\"background\"=后台只监听/手动代理，常配 background_monitor(check_type:\"capture\")。启动后用 capture_flows 找真实请求，再用 capture_replay/http_request 重放。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "port": {
+            "type": "integer",
+            "description": "代理端口，默认 8080"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "isolated_browser",
+              "system",
+              "background"
+            ],
+            "description": "auto=IDE 按任务判断；isolated_browser=不改系统代理，browser(fresh=true) 自动走代理；system=改系统代理抓任意 App；background=只启动代理监听，自己/monitor 等流量"
+          },
+          "system_proxy": {
+            "type": "boolean",
+            "description": "兼容旧参数：true 等同 mode=system；false 等同 mode=isolated_browser/background。不传时按 mode/任务自动判断"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "automation",
+      "description": "桌面自动化 RPC：真实鼠标键盘、CDP 浏览器和录制回放。按状态机用：先确认 URL/窗口/节点/登录态等前置状态，再执行动作，再用 browser.content / browser.eval / screenshot / recorder 结果等验证后置状态；发起点击或输入不等于成功。首次先调 system.init。坐标点击必须先 mouse.move{x,y} 再 mouse.click{button}；不存在 desktop.click/desktop.type。selector 失效要重新读取页面/节点，导航慢要 wait 后核 URL/DOM，登录/验证码/系统权限阻塞时说明具体阻塞并用后台监控接续。method 可选：system.init / mouse.move / mouse.click / mouse.double_click / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "description": "要调用的真实 RPC 方法名，如 browser.goto / mouse.move / recorder.replay"
+          },
+          "params": {
+            "type": "object",
+            "description": "该方法的参数对象；以方法描述为准"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "capture_flows",
+      "description": "**读取已抓到的 HTTP/HTTPS 请求**（结构化：方法/URL/主机/路径/状态/耗时/请求头/请求体/响应头/响应体）。比看截图可靠，是反接口的第一步。用 filter 关键词筛（匹配 host/路径/URL/方法/状态/类型），limit 限条数（默认 30，最新在前）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "可选，关键词筛选（模糊匹配 host/路径/URL/方法/状态/content-type）"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "可选，返回最新的多少条，默认 30"
+          },
+          "include_body": {
+            "type": "boolean",
+            "description": "可选，是否含请求/响应体（默认 true；只看列表设 false 省 token）"
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "capture_stop",
+      "description": "停止抓包并关闭已设置的系统代理。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "capture_replay",
+      "description": "**精确重放一条抓到的请求**（逆向/调试利器）。按 capture_flows 里的 `id` 取出原始请求，**原样带上抓到的所有请求头（cookie / token / 签名都在里面 → 这是能重放成功的关键）**，可选覆盖 url/method/headers/body 来改参试探。返回真实响应。比手拼 http_request 更可靠——不用重建那一堆头。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "capture_flows 返回里的 id=... 值"
+          },
+          "url": {
+            "type": "string",
+            "description": "可选，覆盖 URL（改 query / 路径试探）"
+          },
+          "method": {
+            "type": "string",
+            "description": "可选，覆盖方法"
+          },
+          "headers": {
+            "type": "object",
+            "description": "可选，覆盖/追加请求头（会合并进抓到的原始头）",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "body": {
+            "type": "string",
+            "description": "可选，覆盖请求体"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "background_monitor",
+      "description": "**碰到需要用户手动操作或等外部条件的步骤时，必须主动调这个工具——先告诉用户该做什么（贴链接/给命令/列步骤），然后立刻挂后台自动等，条件满足后自动恢复继续跑，不需要用户再回来说『好了』**。典型场景：需要验证码→告诉用户去填+monitor检测结果；需要装东西→给安装命令+monitor检测 which xxx 返回0；需要起服务→给启动命令+monitor用port等端口；需要用户在浏览器操作→给链接+monitor用capture/url/file检测操作结果。6 种检查类型，**优先选能自动检测的（port/file/command/url/capture），manual 是最后手段**。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "告诉用户在等什么（会显示在聊天里）"
+          },
+          "check_type": {
+            "type": "string",
+            "enum": [
+              "capture",
+              "file",
+              "manual",
+              "command",
+              "url",
+              "port"
+            ],
+            "description": "manual=等用户点继续, file=等文件出现(有 file_pattern 时等内容匹配), capture=监控抓包匹配 pattern, command=反复跑命令直到 exit 0, url=反复访问 URL 直到 HTTP 200, port=等端口被监听"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "capture: 匹配关键词/正则; file: 文件路径; command: shell 命令; url: 完整 URL; port: 端口号如 3000"
+          },
+          "file_pattern": {
+            "type": "string",
+            "description": "file 类型专用：文件内容匹配（关键词或正则），设置后不只检查文件存在，还检查内容包含该模式"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "超时秒数，默认 300"
+          }
+        },
+        "required": [
+          "message",
+          "check_type"
+        ]
+      }
+    }
   }
 ]
