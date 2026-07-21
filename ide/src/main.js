@@ -6729,6 +6729,7 @@ function _flushChatHistorySync() {
       // happened to have landed; otherwise this clobbered mirror lost everything.
       memory: s.memory ? s.memory.toJSON() : undefined,
       history: s.memory ? undefined : ((s.history || []).slice(-300)),
+      plan: Array.isArray(s._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status })) : undefined,
       created: s.created,
     }));
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, activeIdx: _activeChatIdx }));
@@ -6747,6 +6748,7 @@ async function saveChatHistory() {
       project: s.project || "",
       // Hierarchical memory — serializes recent + summaries + milestones
       memory: s.memory.toJSON(),
+      plan: Array.isArray(s._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status })) : undefined,
       created: s.created,
     }));
     const payload = { sessions: data, activeIdx: _activeChatIdx };
@@ -6813,6 +6815,7 @@ async function restoreChatHistory() {
         // _renderSessionHistory when this tab is first shown, restoring the full
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
+        if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({ content: String(p.content || ""), status: p.status || "pending" }));
         if (sData.memory) {
           session.memory = ConversationMemory.fromJSON(sData.memory);
         } else if (sData.history && typeof sData.history === "object" && !Array.isArray(sData.history) &&
@@ -15037,6 +15040,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // latest plan — so we can nudge the model to finish its plan and to verify its
   // changes before it stops. Bounded so it can never loop forever.
   let didMutate = false, didVerify = false, planSteps = null;
+  // A plan restored from a previous session (app restart) with unfinished steps
+  // carries over into this run, so the agent picks the tasks back up instead of
+  // losing them.
+  if (isAgent && !run._planSteps && Array.isArray(session._planSteps) &&
+      session._planSteps.some((s) => s.status === "pending" || s.status === "in_progress")) {
+    run._planSteps = session._planSteps;
+    planSteps = run._planSteps;
+  }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
   let continueNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
@@ -15099,6 +15110,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 一个已存在、已传遍全场的对象（run）+ 在它上面读写 = 真正的共享上下文，不是空壳交接。
   _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
   run.ctx = _pad;
+  // Carry a restored (pre-restart) plan into the scratchpad so the model sees
+  // which steps were already done and which are still open, and continues them.
+  if (planSteps && planSteps.length) {
+    _pad.done = planSteps.filter((s) => s.status === "completed").map((s) => String(s.content).slice(0, 40));
+    const open = planSteps.filter((s) => s.status === "pending" || s.status === "in_progress").map((s) => String(s.content).slice(0, 60));
+    if (open.length) _pad.findings.push("上次会话遗留的未完成任务计划：" + open.join("；"));
+  }
   function _padText() {
     if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length) return "";
     const parts = [`[运行进度草稿纸——你在长任务第 ${_pad._iter || 0} 步，这张纸帮你记住已做的事]`];
@@ -23922,7 +23940,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
   const items = e.dataTransfer?.items;
-  
+
   // Handle directory drop (Electron only)
   if (items) {
     for (const item of items) {
@@ -23939,7 +23957,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       }
     }
   }
-  
+
   if (!files) return;
   for (const file of files) {
     // Check if it's a file path reference (from Finder/Explorer)
@@ -23951,7 +23969,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       showToast(`文件引用已插入: ${ref}`);
       continue;
     }
-    
+
     if (file.type.startsWith("image/")) {
       const reader = new FileReader();
       reader.onload = () => {
