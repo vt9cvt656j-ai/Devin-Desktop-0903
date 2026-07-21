@@ -2160,17 +2160,21 @@ body.zen-mode .editor {
   border: none;
   box-shadow: none;
   cursor: default;
-  width: 88%;
+  width: 100%;
+  max-width: 100%;
   border-radius: 0;
+  white-space: normal;
 }
 .msg__edit-box { width: 100%; box-sizing: border-box; }
 .composer__box.msg__edit-box:focus-within { border-color: var(--line-strong); box-shadow: var(--shadow-sm); }
 .msg__edit-ta {
-  width: 100%; box-sizing: border-box; resize: none; max-height: 168px;
+  width: 100%; box-sizing: border-box; resize: none;
+  min-height: 0; height: auto; max-height: 168px;
   font-family: var(--font); font-size: 13.5px; line-height: 1.5;
   color: var(--text); background: transparent;
   border: none; padding: 10px 12px 4px; outline: none;
 }
+.msg__edit-box .composer__bar { flex-wrap: nowrap; }
 .msg__edit-ta::placeholder { color: var(--text-dim); }
 /* the toolbar is a clone of the bottom composer's bar — .composer__bar supplies the layout */
 .msg__edit-btn {
