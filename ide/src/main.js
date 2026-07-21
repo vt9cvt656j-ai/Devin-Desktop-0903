@@ -16620,17 +16620,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     // 假流式上游（整段憋完一次喷出）会在流一结束就定稿：先把还没展示的
     // 大段余量按帧播完再定稿，否则最终渲染直接整块闪现。用户点停止或出错时不播。
-    if (!err && sess.streaming && acc.length - _shown > 600) {
+    if (!err && sess.streaming && acc.length - _shown > 600 && !document.hidden) {
       await new Promise((done) => {
         const t0 = Date.now();
         const step = () => {
-          if (!sess.streaming || Date.now() - t0 > 4000) { done(); return; }
+          if (!sess.streaming || document.hidden || Date.now() - t0 > 4000) { done(); return; }
           _shown = _revealStep(_shown, acc.length);
           try { renderStream(acc.slice(0, _shown)); _chatFollow(); } catch { /* keep finishing */ }
-          if (_shown < acc.length) requestAnimationFrame(step);
+          if (_shown < acc.length) setTimeout(step, 16); // setTimeout（非 rAF）：后台窗口 rAF 会被暂停，定稿/存档就悬住了
           else done();
         };
-        requestAnimationFrame(step);
+        step();
       });
     }
     _setStreaming(sess, false);
