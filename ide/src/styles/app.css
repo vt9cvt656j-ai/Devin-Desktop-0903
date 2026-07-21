@@ -2148,6 +2148,25 @@ body.zen-mode .editor {
 .msg.user .msg__body code {
   background: rgba(255, 255, 255, 0.22);
 }
+/* ---- edit & resend (double-click a sent message) ---- */
+.msg.user .msg__body { cursor: pointer; }
+.msg__edit-ta {
+  width: 100%; min-width: 260px; box-sizing: border-box; resize: vertical;
+  font-family: var(--font); font-size: 13.5px; line-height: 1.5;
+  color: #fff; background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.4); border-radius: 8px;
+  padding: 6px 8px; outline: none;
+}
+.msg__edit-ta::placeholder { color: rgba(255, 255, 255, 0.6); }
+.msg__edit-bar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.msg__edit-btn {
+  font-size: 12px; padding: 4px 12px; border-radius: 7px; cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  background: transparent; color: #fff;
+}
+.msg__edit-btn:hover { background: rgba(255, 255, 255, 0.15); }
+.msg__edit-btn--send { background: #fff; color: var(--accent); border-color: #fff; font-weight: 600; }
+.msg__edit-btn--send:hover { background: rgba(255, 255, 255, 0.88); }
 
 /* ---- code card (v3 — matching agent tool cards) ---- */
 .code-card {
