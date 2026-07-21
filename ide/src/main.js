@@ -7100,15 +7100,30 @@ function _beginEditResend(wrap, forSession) {
   ta.className = "msg__edit-ta";
   ta.value = orig;
   ta.rows = Math.min(12, Math.max(2, orig.split("\n").length + 1));
-  const bar = document.createElement("div");
-  bar.className = "msg__edit-bar";
-  const sendBtn = document.createElement("button");
-  sendBtn.className = "msg__edit-btn msg__edit-btn--send";
-  sendBtn.textContent = "重新发送";
+  // 克隆底部 composer 的整条工具栏（Agent/模型/麦克风/⌘↩/发送箭头），视觉完全一致。
+  // 克隆体去掉 id 防止重复；模式/模型/麦克风点击透传给底部真实按钮。
+  const realBar = document.querySelector("#composer .composer__bar");
+  const bar = realBar ? realBar.cloneNode(true) : document.createElement("div");
+  bar.classList.add("msg__edit-bar");
+  bar.querySelectorAll("[id]").forEach((el) => {
+    const realEl = document.getElementById(el.id);
+    const id = el.id;
+    el.removeAttribute("id");
+    if (/PickerBtn$|^voiceBtn$/.test(id) && realEl) {
+      el.addEventListener("click", (ev) => { ev.preventDefault(); realEl.click(); });
+    }
+  });
+  bar.querySelectorAll(".mode-menu, .menu").forEach((el) => el.remove());
+  const sendBtn = bar.querySelector(".send") || document.createElement("button");
+  sendBtn.type = "button";
+  sendBtn.title = "重新发送 (⌘↩)";
   const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
   cancelBtn.className = "msg__edit-btn";
   cancelBtn.textContent = "取消";
-  bar.append(cancelBtn, sendBtn);
+  const hint = bar.querySelector(".composer__hint");
+  if (hint) bar.insertBefore(cancelBtn, hint);
+  else bar.append(cancelBtn, sendBtn);
   // 复用底部 composer 的盒子样式（同一个 class）：与底部输入框完全一致的白底圆角卡片
   const box = document.createElement("div");
   box.className = "composer__box msg__edit-box";
