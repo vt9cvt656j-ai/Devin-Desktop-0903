@@ -12012,6 +12012,7 @@ function _switchChatSession(idx) {
     else chatEl.scrollTop = session.scrollPos || 0;
   }
   _ensureSessionHint(session); // empty tab → show the starter hint inside its container
+  _renderQueueBar(session); // 切回标签时同步排队小卡片
   _drainFollowups(session); // returning to a tab whose run finished while away → send its queued follow-up
   // Switch file explorer to this tab's working directory if it resolves to a
   // real folder. Never pass a tab label like "Mrday.one" to openFolder() as if
@@ -12865,7 +12866,7 @@ function _beginEditResend(wrap, forSession) {
   const ta = document.createElement("textarea");
   ta.className = "msg__edit-ta";
   ta.value = orig;
-  ta.rows = Math.min(12, Math.max(2, orig.split("\n").length + 1));
+  ta.rows = Math.min(12, Math.max(1, orig.split("\n").length));
   // 克隆底部 composer 的整条工具栏（Agent/模型/麦克风/⌘↩/发送箭头），视觉完全一致。
   // 克隆体去掉 id 防止重复；模式/模型/麦克风点击透传给底部真实按钮。
   const realBar = document.querySelector("#composer .composer__bar");
@@ -12883,13 +12884,7 @@ function _beginEditResend(wrap, forSession) {
   const sendBtn = bar.querySelector(".send") || document.createElement("button");
   sendBtn.type = "button";
   sendBtn.title = "重新发送 (⌘↩)";
-  const cancelBtn = document.createElement("button");
-  cancelBtn.type = "button";
-  cancelBtn.className = "msg__edit-btn";
-  cancelBtn.textContent = "取消";
-  const hint = bar.querySelector(".composer__hint");
-  if (hint) bar.insertBefore(cancelBtn, hint);
-  else bar.append(cancelBtn, sendBtn);
+  if (!sendBtn.parentElement) bar.append(sendBtn);
   // 复用底部 composer 的盒子样式（同一个 class）：与底部输入框完全一致的白底圆角卡片
   const box = document.createElement("div");
   box.className = "composer__box msg__edit-box";
@@ -12911,7 +12906,6 @@ function _beginEditResend(wrap, forSession) {
     if (ta.value === orig) cancel();
   };
   document.addEventListener("pointerdown", onOutside, true);
-  cancelBtn.addEventListener("click", cancel);
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); cancel(); }
     else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendBtn.click(); }
@@ -15787,7 +15781,67 @@ function _queueFollowup(sess, text, attachments = []) {
   if (!sess || !t) return;
   (sess._pendingSends = sess._pendingSends || []).push({ text: t, attachments });
   saveChatHistory();
-  showToast("已排队：当前回答完成后自动发送");
+  _renderQueueBar(sess);
+  showToast("已排队：当前回答完成后自动发送，或点「插入」立即并入");
+}
+// 排队消息小卡片：挂在底部输入框上方，超长省略号，末尾「插入」按钮——
+// 点插入把这条立即并入当前任务（agent 跑动中→实时引导；普通对话→阻断当前回答，
+// 结合两次输入重新作答）。不点则维持原排队行为：当前回答完成后自动发送。
+function _renderQueueBar(sess) {
+  try {
+    if (!sess || sess !== _currentSession()) return;
+    const composer = document.getElementById("composer");
+    if (!composer) return;
+    let bar = composer.querySelector(":scope > .queue-bar");
+    const items = Array.isArray(sess._pendingSends) ? sess._pendingSends : [];
+    if (!items.length) { if (bar) bar.remove(); return; }
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "queue-bar";
+      composer.insertBefore(bar, composer.firstChild);
+    }
+    bar.textContent = "";
+    items.forEach((item) => {
+      const t = typeof item === "string" ? item : String(item.text || "");
+      const chip = document.createElement("div");
+      chip.className = "queue-chip";
+      const txt = document.createElement("span");
+      txt.className = "queue-chip__text";
+      txt.textContent = t;
+      txt.title = t;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "queue-chip__insert";
+      btn.textContent = "插入";
+      btn.title = "立即插入：阻断当前回答，结合两次输入继续";
+      btn.addEventListener("click", () => _insertQueuedNow(sess, item));
+      chip.append(txt, btn);
+      bar.append(chip);
+    });
+  } catch {}
+}
+function _insertQueuedNow(sess, item) {
+  try {
+    if (!sess || !Array.isArray(sess._pendingSends)) return;
+    const i = sess._pendingSends.indexOf(item);
+    if (i < 0) return;
+    sess._pendingSends.splice(i, 1);
+    saveChatHistory();
+    _renderQueueBar(sess);
+    const text = typeof item === "string" ? item : item.text;
+    const atts = (typeof item === "string" ? [] : item.attachments) || [];
+    if (sess.streaming && sess._runIsLoop) {
+      // agent 循环运行中 → 实时引导：新指令直接并入当前任务，模型结合两次输入调整方向
+      _steerRunningAgent(sess, text, atts);
+      return;
+    }
+    if (sess.streaming) {
+      // 普通对话流式中 → 阻断当前回答，马上把这条作为新一轮发出（历史里保留第一次输入，模型两者都能看到）
+      _setStreaming(sess, false);
+      if (sess === _currentSession()) _setSendBtnStop(false);
+    }
+    Promise.resolve(sendPrompt(text, atts)).catch(() => {});
+  } catch {}
 }
 async function _drainFollowups(sess) {
   try {
@@ -15807,6 +15861,7 @@ async function _drainFollowups(sess) {
       ? sendPrompt(next, [], config)
       : sendPrompt(next.text, next.attachments || [], config);
     Promise.resolve(sent).catch(() => {});
+    _renderQueueBar(sess);
   } catch {}
   finally { if (sess) sess._followupDrainInFlight = false; }
 }
@@ -15840,7 +15895,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
   // inject it into the live run so the agent adapts mid-task instead of dropping it.
   // (Other tabs still run concurrently — each has its own loop.)
-  { const _rs = _currentSession(); if (_rs?.streaming) { if (_rs._runIsLoop) _steerRunningAgent(_rs, text, attachments); else _queueFollowup(_rs, text, attachments); return; } }
+  { const _rs = _currentSession(); if (_rs?.streaming) { _queueFollowup(_rs, text, attachments); return; } }
   // If all chats were closed, sending starts a fresh one so history has a home.
   if (!_currentSession()) _newChatSession();
   // Bind this whole turn to ONE session, captured now — so even if the user
@@ -41121,10 +41176,9 @@ $("composer").addEventListener("submit", (e) => {
     promptEl.value = "";
     _clearDroppedRefs();
     const _rs = _currentSession();
-    // Agent run → real-time steer (mid-loop). Plain chat → queue as a follow-up turn
-    // (no loop to steer), processed the instant the current reply finishes.
-    if (_rs && _rs._runIsLoop) _steerRunningAgent(_rs, text, attachments);
-    else _queueFollowup(_rs, text, attachments);
+    // 运行中的新消息一律先排队（输入框上方显示小卡片）；用户点「插入」才立即并入当前任务，
+    // 否则当前回答完成后自动依次发送。
+    _queueFollowup(_rs, text, attachments);
     return;
   }
   _clearDroppedRefs();

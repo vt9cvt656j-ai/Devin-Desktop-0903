@@ -4740,7 +4740,7 @@ test("dynamic time and bulky file context stay out of the cached system prefix",
 test("real-time user steering is marked separately from agent continuation nudges", () => {
   assert.match(SRC, /const content = await _attachmentAwareContent\(`\[MICHAEL_USER_STEERING\]\\n\\n\$\{steerText\}`/);
   assert.match(SRC, /const steerAttachments = typeof queued === "string" \? \[\] : \(queued\?\.attachments \|\| \[\]\)/);
-  assert.match(SRC, /_steerRunningAgent\(_rs, text, attachments\)/);
+  assert.match(SRC, /_steerRunningAgent\(sess, text, atts\)/);
 });
 
 test("standard SKILL.md frontmatter is parsed with a stable source identity", () => {
