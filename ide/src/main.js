@@ -15263,16 +15263,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           continue;
         }
         // E — 深度理解门：问「项目是干嘛的 / 介绍项目 / 项目架构」这类全局理解问题时，
-        // 只读了一两个文件就下结论 = 用户抱怨的「了解项目不深入」。逼它把目录、
-        // 入口、核心模块都看完再给完整回答。
+        // 别只看 README/入口就下结论（「了解项目不深入」）。不写死读几个文件——把判断
+        // 交回给模型：对照 repo-map 自查核心模块是否真读过、覆盖够不够，不够就继续读。
         if (deepReadNudges < 1 && run.mode === "agent" &&
             /是干嘛|干什么用|是什么项目|介绍(一下)?(这个|该|本)?项目|了解(一下)?(这个|该|本)?项目|项目.{0,6}(功能|做什么|结构|架构)|what (is|does) this (project|repo)|explain this (project|repo)/i.test(String(task || ""))) {
-          const _readCount = _readFiles ? _readFiles.size : 0;
-          if (_readCount < 5) {
-            deepReadNudges++;
-            messages.push({ role: "user", content: `你才读了 ${_readCount} 个文件就要下结论——不够深入，别只看 README 就答。继续挖：① list_dir 根目录和主要子目录（到第 2-3 层）；② read_file 入口文件、主模块、配置（package.json / 主脚本 / 核心逻辑），至少再读几个关键源文件；③ 把功能、技术栈、架构、数据流都摸清后，再给完整回答。大项目可以直接调 research_project 一次性摸透。` });
-            continue;
-          }
+          deepReadNudges++;
+          const _readList = _readFiles && _readFiles.size ? [..._readFiles].slice(-12).join("、") : "（还没读过任何文件）";
+          messages.push({ role: "user", content: `收尾前自查一遍深度：用户要的是对整个项目的理解。对照上下文里的项目结构图（repo-map）和目录，你目前读过的是：${_readList}。自己判断：入口文件、核心业务模块、关键配置/数据流是不是都真正读过了？README 只是别人写的介绍，不算读懂源码。哪块还没摸清就继续 read_file 把它读透（大项目可调 research_project 一次性摸透）；确认覆盖足够了，就给出完整、有源码依据的回答。` });
+          continue;
         }
         // C — don't stop with unfinished plan steps.
         const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
