@@ -20,6 +20,7 @@ yarn-error.log*
 # Env / secrets
 .env
 .env.*
+.mcp.local.json
 
 # Editor / OS
 .DS_Store

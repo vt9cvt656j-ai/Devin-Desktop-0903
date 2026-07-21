@@ -62,6 +62,7 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     parts.push(format!("{home}/.bun/bin"));
     parts.push(format!("{home}/.deno/bin"));
     parts.push(format!("{home}/.volta/bin"));
+    parts.push(format!("{home}/.michael-ide/npm-global/bin")); // IDE-managed npm tools
     parts.push(format!("{home}/.npm-global/bin")); // common custom `npm config set prefix`
     parts.push("/usr/bin".into());
     parts.push("/bin".into());
@@ -105,6 +106,11 @@ pub fn resolve_command(cmd: &str, workspace: Option<&str>) -> String {
 #[cfg(windows)]
 pub fn augmented_path(workspace: Option<&str>) -> String {
     let cur = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let mut base = Vec::new();
+    if !home.is_empty() {
+        base.push(format!("{home}\\.michael-ide\\npm-global"));
+    }
     match workspace.filter(|w| !w.is_empty()) {
         Some(ws) => {
             let mut parts = vec![format!("{ws}\\node_modules\\.bin")];
@@ -114,12 +120,18 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
                     parts.push(scripts);
                 }
             }
+            parts.extend(base);
             if !cur.is_empty() {
                 parts.push(cur);
             }
             parts.join(";")
         }
-        None => cur,
+        None => {
+            if !cur.is_empty() {
+                base.push(cur);
+            }
+            base.join(";")
+        }
     }
 }
 

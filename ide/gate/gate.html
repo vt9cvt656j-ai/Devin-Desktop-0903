@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Michael IDE · 登录</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1c1e21;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #16181c; color: #e7e9ee; } }
+  .card {
+    width: 360px; max-width: calc(100vw - 32px);
+    background: #fff; border-radius: 16px; padding: 28px 26px 24px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.12);
+  }
+  @media (prefers-color-scheme: dark) { .card { background: #22252b; box-shadow: 0 10px 40px rgba(0,0,0,.5); } }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .brand__logo { width: 30px; height: 30px; border-radius: 8px; background: #2f6bff; color: #fff; font-weight: 800; display: grid; place-items: center; font-size: 17px; }
+  .brand__name { font-size: 18px; font-weight: 700; }
+  .sub { font-size: 13px; opacity: .62; margin: 6px 0 20px; }
+  label { display: block; font-size: 12px; opacity: .7; margin: 12px 0 6px; }
+  input {
+    width: 100%; padding: 11px 12px; font-size: 14px; border-radius: 10px;
+    border: 1px solid rgba(128,128,128,.32); background: transparent; color: inherit; outline: none;
+  }
+  input:focus { border-color: #2f6bff; }
+  button {
+    width: 100%; margin-top: 20px; padding: 12px; font-size: 15px; font-weight: 600;
+    border: 0; border-radius: 10px; background: #2f6bff; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg { min-height: 18px; margin-top: 12px; font-size: 12.5px; text-align: center; }
+  .msg.err { color: #e5484d; }
+  .msg.ok { color: #30a46c; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand"><div class="brand__logo">M</div><div class="brand__name">Michael IDE</div></div>
+    <div class="sub">登录后进入网页版工作台。</div>
+    <form id="f" autocomplete="on">
+      <label for="email">邮箱</label>
+      <input id="email" type="email" required autocomplete="username" placeholder="you@example.com" />
+      <label for="pw">密码</label>
+      <input id="pw" type="password" required autocomplete="current-password" placeholder="••••••••" />
+      <button id="btn" type="submit">登录</button>
+      <div id="msg" class="msg"></div>
+    </form>
+  </div>
+<script>
+(function () {
+  var f = document.getElementById("f"), btn = document.getElementById("btn"), msg = document.getElementById("msg");
+  // Where to go after login (default the app). Only same-origin app paths are allowed
+  // so an attacker can't turn this into an open redirect via ?next=.
+  function nextTarget() {
+    try {
+      var n = new URLSearchParams(location.search).get("next") || "/app/";
+      if (n.charAt(0) === "/" && n.charAt(1) !== "/" && n.indexOf("/app") === 0) return n;
+    } catch (e) {}
+    return "/app/";
+  }
+  function setMsg(t, cls) { msg.textContent = t || ""; msg.className = "msg" + (cls ? " " + cls : ""); }
+  f.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    btn.disabled = true; setMsg("登录中…");
+    try {
+      var r = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: document.getElementById("email").value.trim(), password: document.getElementById("pw").value }),
+      });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok || !j.token) { setMsg(j.error || "邮箱或密码错误", "err"); btn.disabled = false; return; }
+      // The gate cookie nginx checks. Not HttpOnly by necessity (set from JS), but Secure +
+      // SameSite=Strict + short-lived; it only gates static-asset delivery, real API calls
+      // still carry the Bearer token and are authorized server-side per request.
+      document.cookie = "mide_token=" + encodeURIComponent(j.token) + "; Path=/; Secure; SameSite=Strict; Max-Age=" + (7 * 24 * 3600);
+      try { localStorage.setItem("michael_token", j.token); } catch (e) {}
+      setMsg("登录成功，进入中…", "ok");
+      location.replace(nextTarget());
+    } catch (err) {
+      setMsg("网络错误，请重试", "err"); btn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

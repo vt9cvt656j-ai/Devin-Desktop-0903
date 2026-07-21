@@ -12,7 +12,10 @@ use std::time::Duration;
 /// so the captured frames stay clean (refs are still tagged for click-by-index).
 static DRAW_MARKS: AtomicBool = AtomicBool::new(true);
 
-use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
+use headless_chrome::protocol::cdp::{
+    Emulation::SetDeviceMetricsOverride,
+    Page::{AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption},
+};
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +27,136 @@ struct Session {
 // One shared browser session for the agent. A Mutex is fine — the agent drives it
 // one action at a time.
 static BROWSER: LazyLock<Mutex<Option<Session>>> = LazyLock::new(|| Mutex::new(None));
+
+// Installed before any page script runs. The frontend's browser check reads these
+// two arrays, so recording at document creation time preserves boot-time failures
+// that would otherwise be gone by the time the agent asks for a health check.
+// Keep this deliberately narrow: status/error summaries only, never request or
+// response headers/bodies. URLs are stripped of query strings and fragments.
+const PAGE_OBSERVER_SCRIPT: &str = r#"(() => {
+  try {
+    if (window.__MICHAEL_IDE_OBSERVER__) return;
+    Object.defineProperty(window, '__MICHAEL_IDE_OBSERVER__', { value: true });
+    var MAX_EVENTS = 80;
+    var queue = function(name) {
+      var items = Array.isArray(window[name]) ? window[name] : [];
+      window[name] = items;
+      return function(entry) {
+        try {
+          items.push(entry);
+          if (items.length > MAX_EVENTS) items.splice(0, items.length - MAX_EVENTS);
+        } catch (_) {}
+      };
+    };
+    var safeText = function(value) {
+      try {
+        if (value == null) return String(value);
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value).slice(0, 280);
+        if (value instanceof Error) return ((value.name || 'Error') + ': ' + (value.message || '')).slice(0, 280);
+        return Object.prototype.toString.call(value).slice(0, 80);
+      } catch (_) { return '[unavailable]'; }
+    };
+    var safeArgs = function(args) {
+      try { return Array.prototype.map.call(args, safeText).join(' ').slice(0, 280); }
+      catch (_) { return '[unavailable]'; }
+    };
+    var safeUrl = function(value) {
+      try {
+        var parsed = new URL(String(value || ''), location.href);
+        return (parsed.origin + parsed.pathname).slice(0, 240);
+      } catch (_) {
+        return String(value || '').split('#')[0].split('?')[0].slice(0, 240);
+      }
+    };
+    var clock = function() { try { return performance.now(); } catch (_) { return 0; } };
+    var errors = queue('__MERR__');
+    var network = queue('__MNET__');
+
+    try {
+      var originalError = console.error;
+      console.error = function() {
+        errors({ level: 'error', msg: safeArgs(arguments) });
+        return originalError.apply(console, arguments);
+      };
+      var originalWarn = console.warn;
+      console.warn = function() {
+        errors({ level: 'warn', msg: safeArgs(arguments) });
+        return originalWarn.apply(console, arguments);
+      };
+    } catch (_) {}
+    try {
+      window.addEventListener('error', function(event) {
+        errors({
+          level: 'error',
+          msg: safeText((event && (event.message || (event.error && event.error.message))) || 'script error'),
+          src: event && event.filename ? safeUrl(event.filename) + ':' + (event.lineno || '?') : ''
+        });
+      }, true);
+      window.addEventListener('unhandledrejection', function(event) {
+        var reason = event && event.reason;
+        errors({ level: 'error', msg: ('unhandledrejection: ' + safeText(reason && (reason.message || reason))).slice(0, 280) });
+      });
+    } catch (_) {}
+
+    try {
+      if (window.fetch && !window.fetch.__michaelObserverWrapped) {
+        var originalFetch = window.fetch;
+        var observedFetch = function(input, init) {
+          var started = clock();
+          var method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase().slice(0, 12);
+          var url = safeUrl(typeof input === 'string' ? input : (input && input.url));
+          return originalFetch.apply(this, arguments).then(function(response) {
+            if (!response.ok) network({ kind: 'fetch', method: method, url: url, status: response.status, ok: false, ms: Math.round(clock() - started) });
+            return response;
+          }, function(error) {
+            network({ kind: 'fetch', method: method, url: url, status: 0, ok: false, ms: Math.round(clock() - started), error: safeText(error) });
+            throw error;
+          });
+        };
+        Object.defineProperty(observedFetch, '__michaelObserverWrapped', { value: true });
+        window.fetch = observedFetch;
+      }
+    } catch (_) {}
+
+    try {
+      var Xhr = window.XMLHttpRequest;
+      if (Xhr && Xhr.prototype && !Xhr.prototype.__michaelObserverWrapped) {
+        var meta = new WeakMap();
+        var originalOpen = Xhr.prototype.open;
+        var originalSend = Xhr.prototype.send;
+        Xhr.prototype.open = function(method, url) {
+          meta.set(this, { method: String(method || 'GET').toUpperCase().slice(0, 12), url: safeUrl(url) });
+          return originalOpen.apply(this, arguments);
+        };
+        Xhr.prototype.send = function() {
+          var xhr = this;
+          var started = clock();
+          var details = meta.get(xhr) || { method: 'GET', url: '' };
+          var reported = false;
+          xhr.addEventListener('loadend', function() {
+            if (reported) return;
+            reported = true;
+            if (xhr.status === 0 || xhr.status >= 400) network({ kind: 'xhr', method: details.method, url: details.url, status: xhr.status || 0, ok: false, ms: Math.round(clock() - started) });
+          }, { once: true });
+          return originalSend.apply(this, arguments);
+        };
+        Object.defineProperty(Xhr.prototype, '__michaelObserverWrapped', { value: true });
+      }
+    } catch (_) {}
+  } catch (_) {}
+})();"#;
+
+fn configure_new_tab(tab: &Tab) -> Result<(), String> {
+    tab.set_default_timeout(Duration::from_secs(30));
+    tab.call_method(AddScriptToEvaluateOnNewDocument {
+        source: PAGE_OBSERVER_SCRIPT.to_string(),
+        world_name: None,
+        include_command_line_api: None,
+        run_immediately: Some(true),
+    })
+    .map_err(|e| format!("安装页面错误观测器失败: {e}"))?;
+    Ok(())
+}
 
 /// One interactive element on the page, with a stable `ref` the agent uses to
 /// act on it (click/type by number) instead of guessing a CSS selector — the
@@ -225,8 +358,9 @@ fn launch() -> Result<Session, String> {
         }
     };
     let tab = browser.new_tab().map_err(|e| e.to_string())?;
-    // Slow intranet pages need more headroom than the old 15s.
-    tab.set_default_timeout(Duration::from_secs(30));
+    // Slow intranet pages need more headroom than the old 15s. Install the
+    // document observer before this new tab navigates anywhere.
+    configure_new_tab(&tab)?;
     Ok(Session {
         _browser: browser,
         tab,
@@ -249,7 +383,9 @@ fn try_connect_existing() -> Option<Session> {
         };
         match browser.new_tab() {
             Ok(tab) => {
-                tab.set_default_timeout(Duration::from_secs(30));
+                if configure_new_tab(&tab).is_err() {
+                    continue;
+                }
                 tracing::info!("[browser] attached to existing Chrome on port {port}");
                 return Some(Session {
                     _browser: browser,
@@ -463,6 +599,15 @@ fn is_dead_browser(e: &str) -> bool {
         || s.contains("browser process")
 }
 
+fn is_navigation_wait_timeout(e: &str) -> bool {
+    let s = e.to_lowercase();
+    s.contains("event waited for never came")
+        || s.contains("waited for never came")
+        || s.contains("timed out waiting")
+        || s.contains("timeout while waiting")
+        || s.contains("navigation timeout")
+}
+
 /// Open a URL (launches the browser on first use).
 #[tauri::command]
 pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
@@ -489,8 +634,25 @@ pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
     };
     with_tab(move |tab| {
         tab.navigate_to(&url).map_err(|e| e.to_string())?;
-        tab.wait_until_navigated().map_err(|e| e.to_string())?;
-        Ok(None)
+        match tab.wait_until_navigated() {
+            Ok(_) => Ok(None),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_navigation_wait_timeout(&msg) {
+                    // Old / redirected / non-UTF8 pages sometimes never emit the lifecycle event
+                    // headless_chrome waits for, even though Chrome has a usable DOM. Returning a
+                    // snapshot is far better evidence than failing the whole card and making the
+                    // model retry random URLs.
+                    std::thread::sleep(Duration::from_millis(900));
+                    Ok(Some(format!(
+                        "[NAVIGATION_WAIT_TIMEOUT] 页面没有发出完整导航完成事件，已改为读取当前 DOM/截图继续验证；不要把这当成 URL 错误，先看当前 url/title/text/nodes。原始错误: {}",
+                        msg.chars().take(180).collect::<String>()
+                    )))
+                } else {
+                    Err(msg)
+                }
+            }
+        }
     })
     .await
 }
@@ -501,21 +663,31 @@ fn click_via_eval(tab: &Tab, selector: &str) -> Result<(), String> {
     let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
         r#"(()=>{{var s={sel_js};
-var el=document.querySelector(s);
-if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
-var fs=document.querySelectorAll('iframe');
-for(var k=0;k<fs.length;k++){{try{{
-  el=fs[k].contentDocument.querySelector(s);
-  if(el){{el.scrollIntoView({{block:'center'}});el.click();return 'ok'}}
-}}catch(e){{}}}}
-return 'no'}})()"#
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function visible(el){{try{{var r=el.getBoundingClientRect(),cs=(el.ownerDocument.defaultView||window).getComputedStyle(el);return r.width>1&&r.height>1&&cs.visibility!=='hidden'&&cs.display!=='none'&&Number(cs.opacity||1)>0.01}}catch(e){{return false}}}}
+function disabled(el){{try{{return !!(el.disabled||el.getAttribute('aria-disabled')==='true'||el.closest('[disabled],[aria-disabled="true"]'))}}catch(e){{return false}}}}
+function brief(el){{try{{if(!el)return'';var t=String(el.innerText||el.textContent||el.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,60);return el.tagName.toLowerCase()+(el.id?'#'+el.id:'')+(t?' "'+t+'"':'')}}catch(e){{return'element'}}}}
+function clickable(el){{try{{var q='a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[onclick],label,summary';return el.matches(q)?el:(el.closest(q)||el)}}catch(e){{return el}}}}
+function point(el){{var doc=el.ownerDocument||document,win=doc.defaultView||window,r=el.getBoundingClientRect(),pts=[[.5,.5],[.25,.5],[.75,.5],[.5,.25],[.5,.75]];for(var i=0;i<pts.length;i++){{var x=Math.max(1,Math.min((win.innerWidth||1)-2,r.left+r.width*pts[i][0])),y=Math.max(1,Math.min((win.innerHeight||1)-2,r.top+r.height*pts[i][1])),top=null;try{{top=doc.elementFromPoint(x,y)}}catch(e){{}}if(top&&(top===el||el.contains(top)))return{{ok:true,x:x,y:y,top:top}};}}return{{ok:false,top:top}}}}
+function ptr(el,name,p,down){{var w=el.ownerDocument.defaultView||window,c={{bubbles:true,cancelable:true,composed:true,view:w,clientX:p.x,clientY:p.y,screenX:p.x,screenY:p.y,button:0,buttons:down?1:0}};try{{if(/^pointer/.test(name)&&typeof PointerEvent!=='undefined'){{var pi=Object.assign({{}},c,{{pointerId:1,pointerType:'mouse',isPrimary:true,pressure:down?0.5:0}});el.dispatchEvent(new PointerEvent(name,pi));return}}}}catch(e){{}}try{{el.dispatchEvent(new MouseEvent(name.replace(/^pointer/,'mouse'),c))}}catch(e){{}}}}
+var raw=find();if(!raw)return'no';
+var el=clickable(raw);if(disabled(el))return'disabled '+brief(el);
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{try{{el.scrollIntoView({{block:'center',inline:'center'}})}}catch(e2){{}}}}
+if(!visible(el))return'not_visible '+brief(el);
+var p=point(el);if(!p.ok)return'covered by '+brief(p.top);
+ptr(el,'pointerover',p,false);ptr(el,'pointermove',p,false);ptr(el,'mouseover',p,false);ptr(el,'mousemove',p,false);ptr(el,'pointerdown',p,true);ptr(el,'mousedown',p,true);
+try{{el.focus({{preventScroll:true}})}}catch(e){{try{{el.focus()}}catch(e2){{}}}}
+ptr(el,'pointerup',p,false);ptr(el,'mouseup',p,false);
+try{{el.click()}}catch(e){{try{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true,composed:true,view:el.ownerDocument.defaultView||window,clientX:p.x,clientY:p.y,button:0}}))}}catch(e2){{return String(e2&&e2.message||e2)}}}}
+return'ok'}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
     let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
-        Err(format!("找不到元素: {selector}"))
+        Err(format!("元素不可点击或未找到: {selector} ({v})"))
     }
 }
 
@@ -525,22 +697,26 @@ fn type_via_eval(tab: &Tab, selector: &str, text: &str) -> Result<(), String> {
     let txt_js = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
         r#"(()=>{{var s={sel_js},t={txt_js};
-function fill(el){{el.scrollIntoView({{block:'center'}});el.focus();el.click();
-  el.value=t;el.dispatchEvent(new Event('input',{{bubbles:true}}));
-  el.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok'}}
-var el=document.querySelector(s);if(el)return fill(el);
-var fs=document.querySelectorAll('iframe');
-for(var k=0;k<fs.length;k++){{try{{
-  el=fs[k].contentDocument.querySelector(s);if(el)return fill(el);
-}}catch(e){{}}}}
-return 'no'}})()"#
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function target(el){{try{{if(el.tagName==='LABEL'&&el.control)return el.control;if(el.matches('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]'))return el;return el.querySelector('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]')||el}}catch(e){{return el}}}}
+function fire(el,name,data){{try{{if(name==='input'&&typeof InputEvent!=='undefined')el.dispatchEvent(new InputEvent('input',{{bubbles:true,cancelable:true,inputType:'insertText',data:data||t}}));else el.dispatchEvent(new Event(name,{{bubbles:true,cancelable:true}}))}}catch(e){{try{{el.dispatchEvent(new Event(name,{{bubbles:true}}))}}catch(e2){{}}}}}}
+function nativeSet(el,val){{if(el.isContentEditable){{try{{el.focus()}}catch(e){{}}el.textContent=val;fire(el,'input',val);fire(el,'change',val);return true}}
+ if(el.tagName==='SELECT'){{var opts=Array.prototype.slice.call(el.options||[]),hit=opts.find(function(o){{return String(o.value)===String(val)}})||opts.find(function(o){{return String(o.textContent||'').trim()===String(val).trim()}});if(hit)val=hit.value;try{{var sd=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(sd&&sd.set)sd.set.call(el,val);else el.value=val}}catch(e){{el.value=val}}fire(el,'input',val);fire(el,'change',val);return true}}
+ if('value'in el){{try{{var proto=Object.getPrototypeOf(el),desc=proto&&Object.getOwnPropertyDescriptor(proto,'value'),base=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,desc2=Object.getOwnPropertyDescriptor(base,'value');(desc&&desc.set?desc:desc2).set.call(el,val)}}catch(e){{el.value=val}}fire(el,'beforeinput',val);fire(el,'input',val);fire(el,'change',val);return true}}return false}}
+var raw=find();if(!raw)return'no';var el=target(raw);
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{try{{el.scrollIntoView({{block:'center',inline:'center'}})}}catch(e2){{}}}}
+try{{el.focus()}}catch(e){{}}try{{el.click()}}catch(e){{}}
+if(!nativeSet(el,t))return'not_editable';
+var actual=el.isContentEditable?String(el.textContent||''):String(el.value||'');
+return actual===String(t)||actual.indexOf(String(t))>=0?'ok':'value_not_applied '+actual.slice(0,80)}})()"#
     );
     let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
     let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     if v == "ok" {
         Ok(())
     } else {
-        Err(format!("找不到输入框: {selector}"))
+        Err(format!("输入未生效或未找到: {selector} ({v})"))
     }
 }
 
@@ -548,6 +724,26 @@ return 'no'}})()"#
 #[tauri::command]
 pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        match click_via_eval(tab, &selector) {
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(260));
+                let _ = tab.wait_until_navigated();
+                return Ok(None);
+            }
+            Err(first_err)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(80));
+                if click_via_eval(tab, &selector).is_ok() {
+                    std::thread::sleep(Duration::from_millis(260));
+                    let _ = tab.wait_until_navigated();
+                    return Ok(None);
+                }
+                let _ = first_err;
+            }
+            Err(_) => {}
+        }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
             Err(_)
@@ -584,6 +780,20 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_type(selector: String, text: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        match type_via_eval(tab, &selector, &text) {
+            Ok(_) => return Ok(None),
+            Err(first_err)
+                if selector.starts_with("[data-mref=") || selector.starts_with("[data-mnode=") =>
+            {
+                enumerate_elements(tab);
+                std::thread::sleep(Duration::from_millis(80));
+                if type_via_eval(tab, &selector, &text).is_ok() {
+                    return Ok(None);
+                }
+                let _ = first_err;
+            }
+            Err(_) => {}
+        }
         let el = match tab.find_element(&selector) {
             Ok(el) => el,
             Err(_)
@@ -643,16 +853,22 @@ pub async fn browser_press(key: String) -> Result<BrowserState, String> {
     .await
 }
 
+fn stringify_eval_result(value: Option<serde_json::Value>, description: Option<String>) -> String {
+    value
+        .map(|value| match value {
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        })
+        .or(description)
+        .unwrap_or_default()
+}
+
 /// Run JavaScript in the page and return its (stringified) result.
 #[tauri::command]
 pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
         let ro = tab.evaluate(&script, true).map_err(|e| e.to_string())?;
-        let val = ro
-            .value
-            .map(|v| v.to_string())
-            .or(ro.description)
-            .unwrap_or_default();
+        let val = stringify_eval_result(ro.value, ro.description);
         // 8000 chars (~2.7k tokens worst case) so structured tools — network 抓包,
         // inspect 视觉解析, design — can return their full JSON without truncating
         // mid-string (which would hand the model invalid JSON).
@@ -665,6 +881,58 @@ pub async fn browser_eval(script: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_screenshot() -> Result<BrowserState, String> {
     with_tab(move |_tab| Ok(None)).await
+}
+
+fn validate_viewport(
+    width: u32,
+    height: u32,
+    device_scale_factor: Option<f64>,
+    mobile: Option<bool>,
+) -> Result<(u32, u32, f64, bool), String> {
+    if !(240..=7680).contains(&width) || !(240..=7680).contains(&height) {
+        return Err("viewport 宽高必须在 240..=7680 像素之间".into());
+    }
+    let scale = device_scale_factor.unwrap_or(1.0);
+    if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+        return Err("device_scale_factor 必须是 0.5..=4.0 的有限数值".into());
+    }
+    Ok((width, height, scale, mobile.unwrap_or(false)))
+}
+
+/// Override the persistent browser tab's viewport through CDP Emulation. This
+/// changes CSS media-query/layout metrics as well as the following screenshot,
+/// enabling deterministic desktop/mobile checks without launching another browser.
+#[tauri::command]
+pub async fn browser_set_viewport(
+    width: u32,
+    height: u32,
+    device_scale_factor: Option<f64>,
+    mobile: Option<bool>,
+) -> Result<BrowserState, String> {
+    let (width, height, device_scale_factor, mobile) =
+        validate_viewport(width, height, device_scale_factor, mobile)?;
+    with_tab(move |tab| {
+        tab.call_method(SetDeviceMetricsOverride {
+            width,
+            height,
+            device_scale_factor,
+            mobile,
+            scale: None,
+            screen_width: Some(width),
+            screen_height: Some(height),
+            position_x: Some(0),
+            position_y: Some(0),
+            dont_set_visible_size: None,
+            screen_orientation: None,
+            viewport: None,
+            display_feature: None,
+            device_posture: None,
+        })
+        .map_err(|e| format!("设置浏览器 viewport 失败: {e}"))?;
+        std::thread::sleep(Duration::from_millis(150));
+        Ok(None)
+    })
+    .await
 }
 
 /// Scroll the page vertically (positive = down, negative = up), then re-snapshot —
@@ -850,4 +1118,64 @@ pub fn kill_orphaned_browsers() {
                 .output();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_validation_applies_defaults_and_preserves_mobile() {
+        assert_eq!(
+            validate_viewport(390, 844, None, Some(true)).unwrap(),
+            (390, 844, 1.0, true)
+        );
+        assert_eq!(
+            validate_viewport(1440, 900, Some(2.0), None).unwrap(),
+            (1440, 900, 2.0, false)
+        );
+    }
+
+    #[test]
+    fn viewport_validation_rejects_unsafe_metrics() {
+        assert!(validate_viewport(0, 900, None, None).is_err());
+        assert!(validate_viewport(390, 9000, None, None).is_err());
+        assert!(validate_viewport(390, 844, Some(f64::NAN), None).is_err());
+        assert!(validate_viewport(390, 844, Some(4.1), None).is_err());
+    }
+
+    #[test]
+    fn page_observer_is_bounded_and_does_not_capture_payloads() {
+        assert!(PAGE_OBSERVER_SCRIPT.contains("MAX_EVENTS = 80"));
+        assert!(PAGE_OBSERVER_SCRIPT.contains("__MERR__"));
+        assert!(PAGE_OBSERVER_SCRIPT.contains("__MNET__"));
+        assert!(!PAGE_OBSERVER_SCRIPT.contains("reqHeaders"));
+        assert!(!PAGE_OBSERVER_SCRIPT.contains("reqBody"));
+        assert!(!PAGE_OBSERVER_SCRIPT.contains("responseText"));
+        assert!(!PAGE_OBSERVER_SCRIPT.contains("setRequestHeader"));
+    }
+
+    #[test]
+    fn eval_result_does_not_double_encode_json_strings() {
+        let json = r#"{"healthy":true,"errors":[]}"#;
+        assert_eq!(
+            stringify_eval_result(Some(serde_json::Value::String(json.into())), None),
+            json
+        );
+        assert_eq!(
+            stringify_eval_result(Some(serde_json::json!({"healthy": true})), None),
+            r#"{"healthy":true}"#
+        );
+    }
+
+    #[test]
+    fn navigation_wait_timeout_is_recoverable() {
+        assert!(is_navigation_wait_timeout(
+            "The event waited for never came"
+        ));
+        assert!(is_navigation_wait_timeout(
+            "navigation timeout after 30000 ms"
+        ));
+        assert!(!is_navigation_wait_timeout("DNS resolution failed"));
+    }
 }

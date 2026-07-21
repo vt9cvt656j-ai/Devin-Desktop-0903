@@ -1,95 +1,104 @@
-name: Package Michael IDE (Mac + Windows)
+name: Package Michael IDE (macOS DMG + Windows EXE/MSI)
 
-# Builds installable Michael IDE bundles for macOS (universal: Intel + Apple
-# Silicon) and Windows (x64). Run it manually from the Actions tab
-# ("Run workflow"), or push a tag like `ide-v1.0.0` to also publish a GitHub
-# Release with the installers attached.
 on:
   workflow_dispatch:
-  push:
-    tags: ["ide-v*"]
+  workflow_call:
 
 permissions:
   contents: write
 
+concurrency:
+  group: ide-package-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   package:
-    name: Package (${{ matrix.label }})
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            label: macOS universal
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            args: '--target universal-apple-darwin'
-          - os: windows-latest
-            label: Windows x64
-            rust_targets: ""
-            args: ''
-    runs-on: ${{ matrix.os }}
+          # 当前仓库只提交了 automation-server-aarch64-apple-darwin sidecar，
+          # 所以 macOS 先构建 Apple Silicon；要做 Intel/universal，先补
+          # ide/src-tauri/binaries/automation-server-x86_64-apple-darwin。
+          - label: macOS Apple Silicon DMG
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            sidecar_path: ide/src-tauri/binaries/automation-server-aarch64-apple-darwin
+            artifact_name: michael-ide-macos-arm64
+            artifact_paths: |
+              ide/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              ide/target/aarch64-apple-darwin/release/bundle/macos/*.app
+
+          - label: Windows x64 EXE + MSI
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            sidecar_path: ide/src-tauri/binaries/automation-server-x86_64-pc-windows-msvc.exe
+            artifact_name: michael-ide-windows-x64-exe-msi
+            artifact_paths: |
+              ide/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              ide/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ide/src-tauri -> target
-
-      - name: Setup Node
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: ide/package-lock.json
 
-      - name: Install frontend deps
-        working-directory: ide
-        run: npm install
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
-      - name: Build & package
-        id: tauri
-        uses: tauri-apps/tauri-action@v0
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ide/src-tauri -> ide/target
+
+      - name: Install frontend dependencies
+        working-directory: ide
+        run: npm ci
+
+      - name: Verify bundled automation sidecar
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '${{ matrix.sidecar_path }}')) {
+            throw 'Missing required Tauri sidecar: ${{ matrix.sidecar_path }}'
+          }
+
+      - name: Run frontend logic tests
+        if: runner.os != 'Windows'
+        working-directory: ide
+        run: npm test
+
+      - name: Build installable desktop bundle
+        uses: tauri-apps/tauri-action@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Enable signed auto-update: set repo secrets TAURI_SIGNING_PRIVATE_KEY (contents
-          # of ~/.tauri/michael-ide.key) + TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Only used on a
-          # tagged release (below); empty is harmless for manual dispatch dev builds.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           projectPath: ide
-          # Tagged release (push `ide-v*`) → build SIGNED updater artifacts + latest.json so
-          # installed apps auto-update. Manual "Run workflow" → disable updater (dev build,
-          # no signing key needed) — identical to before, so the existing flow can't break.
-          args: ${{ matrix.args }}${{ github.ref_type != 'tag' && ' --config {"bundle":{"createUpdaterArtifacts":false}}' || '' }}
-          # When triggered by an `ide-v*` tag, publish a GitHub Release with the
-          # installers. On a manual run these stay empty, so it just builds and
-          # the bundles are uploaded as workflow artifacts (below).
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('Michael IDE {0}', github.ref_name) || '' }}
-          releaseBody: "Auto-built Michael IDE installers for macOS (universal) and Windows."
-          releaseDraft: false
+          args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json --ci
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: Michael IDE ${{ github.ref_name }}
+          releaseDraft: true
           prerelease: false
 
-      - name: Upload installers as workflow artifacts
+      - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: michael-ide-${{ runner.os }}
-          # Fail loudly if the bundle paths stop matching (the cargo target dir
-          # is ide/target, NOT ide/src-tauri/target — the `ide/**` glob covers
-          # both that and the macOS universal-apple-darwin subdir).
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
           if-no-files-found: error
-          retention-days: 14
-          path: |
-            ide/**/release/bundle/dmg/*.dmg
-            ide/**/release/bundle/macos/*.app
-            ide/**/release/bundle/msi/*.msi
-            ide/**/release/bundle/nsis/*.exe
+          retention-days: 30
+          compression-level: 0

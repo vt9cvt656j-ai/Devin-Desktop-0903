@@ -9,6 +9,7 @@
 //! row cap + connect/query timeouts so a huge table or a hung server can't wedge the UI.
 
 use serde_json::json;
+use std::str::FromStr;
 use std::time::Duration;
 
 const MAX_ROWS: usize = 500;
@@ -83,10 +84,22 @@ async fn sql_query(
 
     match driver {
         "sqlite" => {
-            let mut c = tokio::time::timeout(CONNECT_TIMEOUT, sqlx::SqliteConnection::connect(url))
-                .await
-                .map_err(ct)?
-                .map_err(|e| format!("连接失败: {e}"))?;
+            let options = if url.trim_start().starts_with("sqlite:") {
+                sqlx::sqlite::SqliteConnectOptions::from_str(url)
+                    .map_err(|e| format!("sqlite 连接串无效: {e}"))?
+            } else {
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(url)
+                    .read_only(false)
+                    .create_if_missing(false)
+            };
+            let mut c = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                sqlx::SqliteConnection::connect_with(&options),
+            )
+            .await
+            .map_err(ct)?
+            .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
                     .await

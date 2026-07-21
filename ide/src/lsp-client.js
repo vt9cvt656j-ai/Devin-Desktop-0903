@@ -501,7 +501,7 @@ function clientCapabilities() {
       },
       formatting: { dynamicRegistration: false },
       rename: { dynamicRegistration: false, prepareSupport: false },
-      publishDiagnostics: { relatedInformation: true, versionSupport: false },
+      publishDiagnostics: { relatedInformation: true, versionSupport: true },
       codeAction: {
         dynamicRegistration: false,
         codeActionLiteralSupport: {
@@ -722,7 +722,7 @@ export function createLspManager(options) {
 
   // ---- document lifecycle ----
   function didOpen(path, model) {
-    if (!enabled || !model) return;
+    if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
     const langId = model.getLanguageId();
     if (!isManaged(langId)) return;
     const uri = model.uri.toString();
@@ -735,7 +735,7 @@ export function createLspManager(options) {
   }
 
   function didChange(path, model) {
-    if (!enabled || !model) return;
+    if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
     const langId = model.getLanguageId();
     if (!isManaged(langId)) return;
     const client = clients.get(langId);
@@ -753,7 +753,7 @@ export function createLspManager(options) {
   }
 
   function didSave(path, model) {
-    if (!enabled || !model) return;
+    if (!enabled || !model || typeof model.getLanguageId !== "function" || typeof model.getValue !== "function" || !model.uri) return;
     const langId = model.getLanguageId();
     if (!isManaged(langId)) return;
     const client = clients.get(langId);
@@ -780,6 +780,38 @@ export function createLspManager(options) {
     }
   }
 
+  function modelPath(model) {
+    return String(model?.uri?.fsPath || model?.uri?.path || "");
+  }
+
+  function pathAtOrUnder(path, root) {
+    const p = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const r = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    return !r || p === r || p.startsWith(r + "/");
+  }
+
+  function refreshWorkspace(root = "") {
+    for (const [uri] of changeTimers) flushPendingChange(uri);
+    for (const [langId, client] of clients.entries()) {
+      for (const model of monaco.editor.getModels()) {
+        if (!model || model.getLanguageId?.() !== langId || !pathAtOrUnder(modelPath(model), root)) continue;
+        try { monaco.editor.setModelMarkers(model, "lsp:" + langId, []); } catch {}
+        const uri = model.uri.toString();
+        const docLang = DOC_LANGUAGE_ID[langId] || langId;
+        if (client.initialized) {
+          client.didOpen(uri, docLang, model.getVersionId(), model.getValue());
+          client.didChange(uri, model.getVersionId(), model.getValue());
+          client.didSave(uri, model.getValue());
+        }
+      }
+      try {
+        client._send("workspace/didChangeConfiguration", { settings: client._getLangSettings() });
+        client._send("workspace/didChangeWatchedFiles", { changes: [] });
+      } catch {}
+    }
+    onStatus?.();
+  }
+
   // ---- diagnostics ----
   async function applyDiagnostics(langId, params) {
     if (!params?.uri) return;
@@ -794,6 +826,13 @@ export function createLspManager(options) {
       model = await lazilyCreateModel(uri);
       if (!model) return;
     }
+    if (changeTimers.has(uri)) {
+      flushPendingChange(uri);
+      return;
+    }
+    const incomingVersion = Number(params.version);
+    const currentVersion = Number(model?.getVersionId?.());
+    if (Number.isFinite(incomingVersion) && Number.isFinite(currentVersion) && incomingVersion < currentVersion) return;
     const owner = "lsp:" + langId;
     const markers = (params.diagnostics || []).map((d) => diagnosticToMarker(d));
     monaco.editor.setModelMarkers(model, owner, markers);
@@ -1625,6 +1664,7 @@ export function createLspManager(options) {
     didChange,
     didSave,
     didClose,
+    refreshWorkspace,
     ensureServer,
     async startManual(langId, custom) {
       return ensureServer(langId, custom);

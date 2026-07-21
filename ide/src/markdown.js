@@ -69,6 +69,106 @@ function safeHref(url) {
   return null;
 }
 
+const IMAGE_EXT = /\.(?:avif|bmp|gif|ico|jpe?g|png|webp)(?:[?#].*)?$/i;
+const VIDEO_EXT = /\.(?:m4v|mov|mp4|ogv|webm)(?:[?#].*)?$/i;
+const SAFE_IMAGE_DATA = /^data:image\/(?:avif|bmp|gif|x-icon|vnd\.microsoft\.icon|jpeg|png|webp);base64,/i;
+const SAFE_VIDEO_DATA = /^data:video\/(?:mp4|webm|ogg|quicktime|x-m4v);base64,/i;
+
+function isRestrictedMediaHost(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (hostname === "localhost"
+      || hostname.endsWith(".localhost")
+      || hostname.endsWith(".local")
+      || hostname.endsWith(".internal")
+      || hostname.endsWith(".lan")
+      || hostname.endsWith(".home.arpa")) return true;
+    // Literal IPv6 hosts are never needed for signed CDN media. Rejecting all of
+    // them also covers loopback, ULA, link-local, multicast, and IPv4-mapped forms.
+    if (hostname.includes(":")) return true;
+    const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+    if (!match) return false;
+    const octets = match.slice(1).map(Number);
+    if (octets.some((value) => value < 0 || value > 255)) return true;
+    const [a, b] = octets;
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19))
+      || a >= 224;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Return a media URL only when its source is safe to load inside the chat.
+ * Remote media must use HTTPS; HTTP is limited to Tauri's internal asset host.
+ * Data URLs are restricted to known raster/video MIME
+ * types so HTML, SVG, and arbitrary executable payloads never become media.
+ * Explicit Markdown media may use extensionless HTTPS URLs (for signed/CDN
+ * endpoints); inferred media still requires a recognized file extension.
+ */
+export function safeMediaSrc(url, kind = "image", { explicit = false } = {}) {
+  const u = String(url || "").trim();
+  if (!u || u.startsWith("//")) return null;
+  const expectedExtension = kind === "video" ? VIDEO_EXT : IMAGE_EXT;
+  if (u.startsWith("/") || u.startsWith("./") || u.startsWith("../")) return expectedExtension.test(u) ? u : null;
+  if (/^https:/i.test(u)) {
+    if (isRestrictedMediaHost(u)) return null;
+    return explicit || expectedExtension.test(u) ? u : null;
+  }
+  if (/^blob:/i.test(u) || /^asset:/i.test(u)) return u;
+  if (/^http:\/\/asset\.localhost(?::\d+)?(?:\/|$)/i.test(u)) return u;
+  if (kind === "video" ? SAFE_VIDEO_DATA.test(u) : SAFE_IMAGE_DATA.test(u)) return u;
+  if (/^[\w.-]+\.[a-z]{2,}(?:[/?#].*)?$/i.test(u) && expectedExtension.test(u)) return "https://" + u;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(u) && !/[\\\u0000-\u001f\u007f]/.test(u) && expectedExtension.test(u)) return u;
+  return null;
+}
+
+/** Detect a media link without treating every ordinary URL as an image. */
+export function mediaKindForUrl(url, label = "") {
+  const u = String(url || "").trim();
+  const hint = String(label || "").trim();
+  if (/^data:video\//i.test(u) || VIDEO_EXT.test(u) || /^(?:video|视频)(?:\s*[:：-]|$)/i.test(hint)) return "video";
+  if (/^data:image\//i.test(u) || IMAGE_EXT.test(u) || /^(?:image|img|图片|图像)(?:\s*[:：-]|$)/i.test(hint)) return "image";
+  return null;
+}
+
+function hasExplicitMediaLabel(label) {
+  return /^(?:video|视频|image|img|图片|图像)(?:\s*[:：-]|$)/i.test(String(label || "").trim());
+}
+
+function mediaNode(kind, url, label, { explicit = false } = {}) {
+  const src = safeMediaSrc(url, kind, { explicit });
+  const fallback = `${kind === "video" ? "Video" : "Image"}: ${label || url || "media"}`;
+  if (!src) return txt(fallback);
+  if (kind === "video") {
+    const video = el("video", "md-media md-media--video");
+    video.src = src;
+    video.controls = true;
+    video.preload = "metadata";
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.setAttribute("referrerpolicy", "no-referrer");
+    video.setAttribute("aria-label", label || "Video");
+    video.style.maxWidth = "100%";
+    video.style.display = "block";
+    return video;
+  }
+  const image = el("img", "md-media md-media--image");
+  image.src = src;
+  image.alt = label || "Image";
+  image.loading = "lazy";
+  image.decoding = "async";
+  image.referrerPolicy = "no-referrer";
+  return image;
+}
+
 // Inline token matchers, tried by earliest start index (ties: order below).
 const INLINE = [
   { // inline code `...`
@@ -95,23 +195,18 @@ const INLINE = [
     re: /\*(?=\S)([\s\S]*?\S)\*|(?<![A-Za-z0-9])_(?=\S)([\s\S]*?\S)_(?![A-Za-z0-9])/,
     make: (m) => withChildren(el("em"), m[1] ?? m[2]),
   },
-  { // image ![alt](url) → rendered as a labelled link (no remote fetch surprises)
+  { // image/video embed: ![alt](url); video is detected by extension or a "video:" label
     re: /!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/,
     make: (m) => {
-      const href = safeHref(m[2]);
-      const label = "🖼 " + (m[1] || "image");
-      if (!href) return txt(label);
-      const a = el("a");
-      a.href = href;
-      a.target = "_blank";
-      a.rel = "noreferrer noopener";
-      a.textContent = label;
-      return a;
+      const kind = mediaKindForUrl(m[2], m[1]) || "image";
+      return mediaNode(kind, m[2], m[1], { explicit: true });
     },
   },
   { // link [text](url)
     re: /\[([^\]]+)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/,
     make: (m) => {
+      const kind = mediaKindForUrl(m[2], m[1]);
+      if (kind) return mediaNode(kind, m[2], m[1], { explicit: hasExplicitMediaLabel(m[1]) });
       const href = safeHref(m[2]);
       if (!href) return withChildren(el("span"), m[1]);
       const a = el("a");
@@ -144,6 +239,8 @@ function linkNode(text, url) {
 }
 
 function urlCardNode(url) {
+  const kind = mediaKindForUrl(url);
+  if (kind) return mediaNode(kind, url, "");
   const href = safeHref(url);
   if (!href) return txt(url);
   let domain;
@@ -564,13 +661,13 @@ function flashCopied(btn, label) {
  * Render markdown `text` into `container` (replacing its contents).
  * @param {HTMLElement} container
  * @param {string} text
- * @param {{ highlighter?: (code:string, lang:string)=>Promise<string>, streaming?: boolean }} [opts]
+ * @param {{ highlighter?: (code:string, lang:string)=>Promise<string>, streaming?: boolean, showCaret?: boolean }} [opts]
  */
 export function renderMarkdownInto(container, text, opts = {}) {
   container.textContent = "";
   const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
   container.appendChild(parseBlocks(lines, opts));
-  if (opts.streaming) {
+  if (opts.streaming && opts.showCaret !== false) {
     const caret = el("span", "md-caret");
     container.appendChild(caret);
   }
@@ -623,5 +720,5 @@ export function renderMarkdownStream(container, text, opts = {}) {
   if (!st.tail) { st.tail = el("div", "md-stream-tail"); container.appendChild(st.tail); }
   st.tail.textContent = "";
   if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts));
-  if (opts.streaming) st.tail.appendChild(el("span", "md-caret"));
+  if (opts.streaming && opts.showCaret !== false) st.tail.appendChild(el("span", "md-caret"));
 }
