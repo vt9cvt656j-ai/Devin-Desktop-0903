@@ -1,74 +1,28 @@
-# ⚠️ CSS 设计系统（必须照抄的变量 + 组件模板——写 CSS 前先复制这些 :root 变量，所有样式只用这些变量，禁止写死数值）
+# UI 设计 token 与组件契约（先读项目，再决定怎么落地）
 
-## 第一步：把这组 :root 变量复制到你的 CSS 开头（有现有设计变量就复用现有的，别重复定义）
-```css
-:root {
-  /* 字体——别默认 Inter(满屏 AI 味)；正文挑个中性现代体、标题挑个有性格的展示体，从 Google Fonts 真加载 */
-  --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;      /* 正文：可换 Plus Jakarta Sans / Geist / Instrument Sans 等 */
-  --font-display: 'Space Grotesk', var(--font-sans);                 /* 标题：可换 Fraunces / Sora / Clash Display / Bricolage Grotesque 等 */
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
-  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-base: 1rem;
-  --text-lg: 1.125rem; --text-xl: 1.25rem; --text-2xl: 1.5rem;
-  --leading-tight: 1.15; --leading-normal: 1.55;
-  /* 间距（4px 网格——只用这些值，禁止自己编 px 数） */
-  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
-  --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
-  /* 颜色（浅色主题——禁止写死 hex/rgb，只用变量名） */
-  --bg: #ffffff; --surface: #f9fafb; --border: #e5e7eb;
-  --text: #1f2937; --text-muted: #6b7280; --text-faint: #9ca3af;
-  --primary: #2563eb; --primary-hover: #1d4ed8; --primary-light: #eff6ff;
-  --success: #16a34a; --warning: #d97706; --danger: #dc2626;
-  /* 圆角 */
-  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
-  /* 阴影 */
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
-  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.05);
-  /* 动效 */
-  --duration: 150ms; --ease: cubic-bezier(0.16, 1, 0.3, 1);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f172a; --surface: #1e293b; --border: #334155;
-    --text: #e2e8f0; --text-muted: #94a3b8; --text-faint: #64748b;
-    --primary: #3b82f6; --primary-hover: #60a5fa; --primary-light: #1e3a5f;
-    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.3);
-    --shadow-md: 0 4px 6px rgb(0 0 0 / 0.4);
-  }
-}
-```
+## 1. 已有项目：现有设计系统是唯一真源
+- 先读样式入口、Tailwind 配置、组件目录和主题切换方式，复用已有的颜色、字体、间距、圆角、阴影、层级与动效 token；不要复制另一套 `:root`，不要重命名整套变量，也不要为局部需求迁移技术栈。
+- 已有组件库能满足需求时直接复用。现有 MUI / Ant Design / 自研组件项目不要再混入 shadcn；只有用户明确要求迁移时才单独规划迁移和回归测试。
+- 任何版本相关写法以 `package.json`、锁文件、现有配置和当前官方文档为准，禁止在提示词或实现方案里硬编码 CLI / Tailwind 主版本。
 
-## 第二步：组件照这些模板写（可复制后改细节）
-**按钮：**
-```css
-.btn { display: inline-flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); font-size: var(--text-sm); font-weight: 500; border-radius: var(--radius-md); border: 1px solid transparent; cursor: pointer; transition: background var(--duration) var(--ease), border-color var(--duration) var(--ease), color var(--duration) var(--ease); min-height: 36px; }
-.btn-primary { background: var(--primary); color: #fff; }
-.btn-primary:hover { background: var(--primary-hover); }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-```
-**输入框：**
-```css
-.input { width: 100%; padding: var(--sp-2) var(--sp-3); font-size: var(--text-sm); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); color: var(--text); transition: border-color var(--duration) var(--ease); min-height: 36px; }
-.input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgb(37 99 235 / 0.15); }
-.input::placeholder { color: var(--text-faint); }
-```
-**卡片：**
-```css
-.card { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--sp-6); box-shadow: var(--shadow-sm); }
-.card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); transition: box-shadow var(--duration) var(--ease), transform var(--duration) var(--ease); }
-```
+## 2. 新项目：按框架建立一套语义 token
+- 用户未指定框架的新 UI 项目使用 React + Vite + TypeScript + Tailwind；标准交互按需使用 shadcn/ui **官方组件**。只添加页面实际需要的组件，禁止全量安装、批量生成未引用组件或为了展示组件库塞入无关控件。
+- 用户指定 Vue 时使用 Vue + Vite + TypeScript + Tailwind；需要标准交互组件时按需使用 shadcn-vue，禁止安装 React 版 shadcn/ui。
+- 从当前官方初始化结果取得语义 token 和 Tailwind 接线方式，再按用户选定的品牌方向调整。不要复制固定蓝色、固定 hex/OKLCH 值或通用按钮类；shadcn Button/Input/Card 等已有 primitive 时，直接组合它们，不另造平行的基础组件。
 
-## 绝对禁止（违反任何一条 = 不合格）
-- ❌ **禁止写死颜色**：`color: #333` → ✅ `color: var(--text)`
-- ❌ **禁止写死间距**：`padding: 15px` → ✅ `padding: var(--sp-4)`（用最接近的变量）
-- ❌ **禁止写死圆角**：`border-radius: 5px` → ✅ `border-radius: var(--radius-sm)`
-- ❌ **禁止用 emoji 当图标**：✅ ❌ ⚠️ 这些 → 用 SVG 图标
-- ❌ **禁止只做 default 态**：每个按钮/输入框/链接必须有 hover + focus-visible + disabled 态
-- ❌ **禁止纯黑 #000 文字 / 纯白 #fff 背景**：用 --text / --bg
-- ❌ **禁止 transition: all**：指定具体属性 `transition: background var(--duration) var(--ease)`
-- ❌ **禁止 box-shadow: 0 0 10px black` 这种重阴影**：用 --shadow-sm / --shadow-md
-- ❌ **禁止没有 line-height**：正文 line-height: var(--leading-normal)，标题 var(--leading-tight)
-- ❌ **禁止文字满屏宽**：文本容器加 max-width: 65ch
+## 3. token 至少覆盖这些语义
+- 表面：background、foreground、card、popover、muted、border、input、ring。
+- 动作：primary、primary-foreground、secondary、accent、destructive，以及各自可访问的 hover/focus/disabled 状态。
+- 结构：字体族与字阶、间距尺度、圆角、阴影、z-index、动效时长与缓动；深浅主题使用同一组语义名切换值。
+- 业务组件只引用语义 token 或项目已有的 Tailwind 语义类，不把品牌色、字号、圆角、阴影散落硬编码在组件里。确实需要一次性尺寸时说明它为何不是可复用 token。
 
-## 自查口诀（写完 CSS 对着过一遍）
-颜色用变量、间距用变量、圆角用变量、阴影用变量、所有交互元素有 hover+focus、文字对比度 ≥ 4.5:1、正文 line-height 1.5+、触摸目标 ≥ 44px、布局用 flex/grid 不用 float、transition 指定属性不用 all。
+## 4. 组件边界
+- shadcn/ui 与 shadcn-vue 是标准交互 primitive，不是要求每个区块都套组件库。导航、hero、内容区块、图表组合和领域组件按产品信息架构实现；能复用 primitive 就复用，不匹配就写清晰的业务组件。
+- 不引入第二套基础组件系统，不添加未使用依赖，不建立导出全部组件的 barrel 文件。保持依赖、源码和升级面与真实需求一致。
+- 图标统一复用项目已有图标集或一个成熟图标库；不用 emoji 代替正式图标。交互元素覆盖 hover、focus-visible、active、disabled、loading、空和错误状态，并满足键盘操作、可读标签、对比度与 reduced-motion。
+
+## 5. 真实 UI 验证
+- 启动或复用真实 dev server，用 `browser navigate` 且 `fresh=true` 打开实际 URL。
+- 在 **1440x900（desktop）** 与 **390x844（mobile=true）** 两个视口分别执行 `browser check`，处理控制台错误、网络失败、坏资源、裁切、重叠与横向溢出。
+- 两个视口都要用 `click` / `type` / `press` 完成关键流程，再对具体 selector 或预期文本执行 `assert`；只断言 `body` / `html` 可见不算通过。
+- 最终如实报告 URL、两个视口、交互断言和未验证项；截图只用于视觉检查，不能替代 check 与 assert。
