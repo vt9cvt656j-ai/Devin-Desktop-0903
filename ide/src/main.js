@@ -14036,8 +14036,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, body, session, i
   // Record token usage ONCE per turn: the real report if the provider sent one
   // (last wins, so a per-chunk cumulative usage isn't double-counted), else an
   // estimate so the meter is never blank ("缓存看不到").
-  if (_turnUsage) _recordUsage(_turnUsage);
-  else _recordUsage({ estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) });
+  {
+    const _u = _turnUsage || { estimated: true, prompt_tokens: _estTokens(messages), completion_tokens: _estTokens(acc) };
+    _recordUsage(_u);
+    // Per-turn total for the agent loop's per-run token budget (ch23-style 预算控制).
+    try { if (session) session._lastTurnTokens = (_u.prompt_tokens || 0) + (_u.completion_tokens || 0); } catch {}
+  }
 
   // Claude doesn't brain-freeze-repeat — skip the dedup for it so a false positive can
   // never touch its output. Only the weaker families (which DO repeat) get deduped.
@@ -15181,6 +15185,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         finalErr = turn.error; break;
       }
       _turnFails = 0;
+      // Per-run token 预算控制：用户可在设置里给单次运行设 token 上限
+      // （localStorage "michael-ide.token-budget"，0/未设 = 不限）。超限后不再硬扩步数，
+      // 只给模型留收尾轮，把已做的如实交代——预算烧穿前有序着陆而不是无感烧钱。
+      run._tokens = (run._tokens || 0) + (session._lastTurnTokens || 0);
+      {
+        let _cap = 0; try { _cap = parseInt(localStorage.getItem("michael-ide.token-budget") || "0", 10) || 0; } catch {}
+        if (_cap > 0 && run._tokens > _cap && !run._tokenCapNudged) {
+          run._tokenCapNudged = true;
+          budget = Math.min(budget, iter + 3); // 留 2-3 轮收尾，不再延展
+          messages.push({ role: "user", content: `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
+          showToast(`Token 预算已用完（${Math.round(run._tokens / 1000)}k），智能体收尾中`);
+        }
+      }
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
       if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
 
@@ -15472,6 +15489,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             catch (e) { return { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; }
           };
           result = await _exec();
+          // post_tool_use hook（fire-and-forget，不阻塞主循环）。
+          if (_HOOKED_TOOL_TYPES.has(call.type)) {
+            _fireHooks(root, "post_tool_use", { tool: _hookToolName(call), path: call.path || "", command: call.command || "", ok: !/^\[(ERROR|BLOCKED|DENIED)/.test(String(result && result.content || "")) }).catch(() => {});
+          }
           // Transient network blip on an idempotent tool (web / search / screenshot /
           // image / download) → retry once after a short backoff, so a flaky moment
           // (server not up yet, rate blip) doesn't dead-end the run. Side-effecting
@@ -16017,6 +16038,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (run.mode === "agent" && task) {
       const _outcome = finalErr ? "failed" : (hitCap ? "partial" : "success");
       try { _recordEpisode(run, task, root, _outcome, config); } catch {}
+      // on_run_end hook（fire-and-forget）：工作区可在运行结束时挂通知/清理命令。
+      _fireHooks(root, "on_run_end", { tool: "run_end", outcome: _outcome, task: String(task).slice(0, 200), files: [...(_mutatedFiles || [])].slice(0, 20) }).catch(() => {});
     }
     // Plan mode: one-click handoff to execute the proposed plan in agent mode
     // (Claude Code's plan → execute flow). The plan is already in history, so
@@ -16673,6 +16696,52 @@ function _dbResultToText(o) {
   return `${o.driver} 执行成功：${o.rows_affected ?? 0} 行受影响（${o.elapsed_ms ?? "?"}ms）。`;
 }
 
+// --- Hooks / 事件系统：工作区 `.michael/hooks.json` 可在工具调用前后与运行结束时挂
+// 自定义命令（仿 Claude Code hooks）。支持三个事件：pre_tool_use（非零退出码 ⇒
+// 阻止该次调用）、post_tool_use、on_run_end（后两个 fire-and-forget）。每项形如
+// { "match": "run_cmd|write_file", "command": "sh .michael/check.sh" }，命令收到一个
+// JSON 参数（tool/path/command）。
+let _hooksCache = { root: null, ts: 0, cfg: null };
+async function _loadHooks(root) {
+  if (!root || !inTauri) return null;
+  const now = Date.now();
+  if (_hooksCache.root === root && now - _hooksCache.ts < 15000) return _hooksCache.cfg;
+  let cfg = null;
+  try {
+    const raw = await backend.readTextFile(root.replace(/\/+$/, "") + "/.michael/hooks.json");
+    const j = JSON.parse(raw);
+    if (j && typeof j === "object") cfg = j;
+  } catch { cfg = null; }
+  _hooksCache = { root, ts: now, cfg };
+  return cfg;
+}
+function _hookEntries(cfg, event, toolName) {
+  const list = cfg && Array.isArray(cfg[event]) ? cfg[event] : [];
+  return list.filter((h) => {
+    if (!h || typeof h.command !== "string" || !h.command.trim()) return false;
+    if (!h.match) return true;
+    try { return new RegExp(h.match).test(toolName || ""); } catch { return false; }
+  });
+}
+async function _fireHooks(root, event, payload) {
+  try {
+    const cfg = await _loadHooks(root);
+    if (!cfg) return { blocked: false };
+    for (const h of _hookEntries(cfg, event, payload.tool)) {
+      const arg = "'" + JSON.stringify(payload).replace(/'/g, "'\\''") + "'";
+      const r = await _agentRunInTerminal(root, h.command + " " + arg, null);
+      if (event === "pre_tool_use" && r && r.code !== 0) {
+        return { blocked: true, reason: (r.stderr || r.stdout || "").trim().slice(0, 300) || ("hook 拦截: " + h.command) };
+      }
+    }
+  } catch { /* hooks must never break a run */ }
+  return { blocked: false };
+}
+const _HOOKED_TOOL_TYPES = new Set(["write", "edit", "multiedit", "cmd", "termtask", "delete", "move", "mkdir", "copy"]);
+function _hookToolName(call) {
+  return ({ write: "write_file", edit: "edit_file", multiedit: "multi_edit", cmd: "run_cmd", termtask: "run_cmd", delete: "delete_path", move: "move_path", mkdir: "mkdir", copy: "copy_path" })[call.type] || call.type;
+}
+
 async function _executeToolStep(step, call, root, run) {
   if (run) run._toolStep = (run._toolStep || 0) + 1; // per-run tool-call counter (redundant-read saver)
   const vp = step.querySelector(".atc-viewport");
@@ -16717,6 +16786,15 @@ async function _executeToolStep(step, call, root, run) {
   // Per-operation approval (the "approve" perm). The mode-level read-only block
   // above already stopped explorer/plan/reviewer; this asks the user per call in
   // Agent/Auto when they've opted into approvals (no-op in the default "auto").
+  // 工作区 hooks：pre_tool_use 可否决一次变更类工具调用（非零退出码 ⇒ 阻止）。
+  if (!readOnlyMode && _HOOKED_TOOL_TYPES.has(call.type)) {
+    const hk = await _fireHooks(root, "pre_tool_use", { tool: _hookToolName(call), path: call.path || "", command: call.command || "" });
+    if (hk.blocked) {
+      res.className = "atc-result atc-result--blocked";
+      res.textContent = "⛔ 被工作区 hook 拦截";
+      return { type: call.type, path: call.path, content: `[BLOCKED] 工作区 pre_tool_use hook 拦截了这次操作：${hk.reason}。换一种不触发拦截的做法，或在收尾里如实说明。` };
+    }
+  }
   if (!readOnlyMode && !(await _approveToolCall(call, run))) {
     const what = (call.type === "cmd" || call.type === "termtask") ? "运行这条命令"
       : call.type === "automation" ? "这个自动化操作"
