@@ -2306,7 +2306,16 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         return Some(json!({"type":"enabled","budget_tokens":budget}));
     }
     if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
-        return Some(json!({"type":"adaptive"})); // 4.x+ / Fable / Mythos
+        // 4.x+/Fable/Mythos 一律用显式预算：聚合上游（zyz 等）对 {"type":"adaptive"}
+        // 静默忽略——请求 200 但一个 thinking_delta 都不回，IDE 的思考卡永远是空的；
+        // 换成 enabled+budget_tokens 后实测同一路线能正常回思考流。
+        let budget = match eff {
+            "low" => 4096,
+            "high" => 24000,
+            "max" | "xhigh" => 32000,
+            _ => 12000,
+        };
+        return Some(json!({"type":"enabled","budget_tokens":budget}));
     }
     None
 }
@@ -4746,8 +4755,8 @@ mod billing_tests {
     }
 
     #[test]
-    fn oai_to_anthropic_enables_adaptive_thinking_and_drops_temp() {
-        // Opus 4.x + reasoning_effort → adaptive thinking on; temperature/top_p dropped;
+    fn oai_to_anthropic_enables_thinking_and_drops_temp() {
+        // Opus 4.x + reasoning_effort → explicit-budget thinking on; temperature/top_p dropped;
         // max_tokens gets headroom; the chosen depth is honored via output_config.effort.
         let body = json!({
             "model": "claude-opus-4-8", "max_tokens": 4096, "temperature": 0.7, "top_p": 0.9,
@@ -4755,9 +4764,9 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":24000}));
         assert_eq!(a["output_config"], json!({"effort":"high"}));
-        assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra adaptive-thinking headroom
+        assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra thinking headroom
         assert!(
             a.get("temperature").is_none(),
             "temperature must be dropped when thinking is on"
@@ -4767,13 +4776,13 @@ mod billing_tests {
             "top_p must be dropped when thinking is on"
         );
 
-        // Fable → adaptive too.
+        // Fable → enabled+budget too.
         assert_eq!(
             oai_to_anthropic(
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
             )
             .unwrap()["thinking"],
-            json!({"type":"adaptive"})
+            json!({"type":"enabled","budget_tokens":12000})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking; temp passes through.
@@ -4788,8 +4797,8 @@ mod billing_tests {
 
     #[test]
     fn thinking_normalized_per_model() {
-        // Opus 4.8 with reasoning_effort: client's old budget_tokens is IGNORED,
-        // gateway uses adaptive (Anthropic rejects budget_tokens on 4.7+/Fable/Sonnet5).
+        // Opus 4.8 with reasoning_effort: gateway normalizes to enabled+budget mapped from
+        // the effort dial (aggregator upstreams silently ignore "adaptive").
         let a = oai_to_anthropic(&json!({
             "model": "claude-opus-4-8",
             "reasoning_effort": "max",
@@ -4797,18 +4806,11 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert_eq!(
-            a["thinking"]["type"], "adaptive",
-            "4.8 must use adaptive, not budget_tokens"
-        );
-        assert!(
-            a["thinking"].get("budget_tokens").is_none(),
-            "no budget_tokens for 4.8"
-        );
+        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":32000}));
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
         assert_eq!(a["output_config"]["effort"], "high"); // "max" → "high"
 
-        // Sonnet 5: also adaptive
+        // Sonnet 5: enabled+budget too (high → 24000)
         let s5 = oai_to_anthropic(&json!({
             "model": "claude-sonnet-5",
             "reasoning_effort": "high",
@@ -4816,7 +4818,7 @@ mod billing_tests {
             "messages": []
         }))
         .unwrap();
-        assert_eq!(s5["thinking"]["type"], "adaptive");
+        assert_eq!(s5["thinking"], json!({"type":"enabled","budget_tokens":24000}));
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
         let b = oai_to_anthropic(&json!({
@@ -4844,18 +4846,18 @@ mod billing_tests {
 
     #[test]
     fn anthropic_thinking_gate_by_model() {
-        // effort present → on for capable Claude; mapped to adaptive.
+        // effort present → on for capable Claude; mapped to enabled + explicit budget.
         assert_eq!(
             anthropic_thinking("claude-opus-4-8", Some("medium")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"enabled","budget_tokens":12000}))
         );
         assert_eq!(
             anthropic_thinking("claude-sonnet-4-6", Some("high")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"enabled","budget_tokens":24000}))
         );
         assert_eq!(
             anthropic_thinking("claude-fable-5", Some("low")),
-            Some(json!({"type":"adaptive"}))
+            Some(json!({"type":"enabled","budget_tokens":4096}))
         );
         assert_eq!(
             anthropic_thinking("claude-haiku-4-5-20251001", Some("high")),

@@ -11207,10 +11207,8 @@ function _thinkingPrefFor(id) {
   const prefs = _loadThinkingPrefs();
   const levels = profile.levels || [];
   const saved = prefs[id];
-  if (saved && levels.includes(saved)) {
-    // 支持思考的模型一律保持思考开启：档位可选，但不允许落回「off」。
-    if (saved !== "off" || !profile.configurable) return saved;
-  }
+  // 用户显式选过的档位（含「off」）始终生效；没选过时默认开启思考。
+  if (saved && levels.includes(saved)) return saved;
   const dflt = profile.defaultLevel || "off";
   if (!profile.configurable || dflt !== "off") return dflt;
   if (levels.includes("medium")) return "medium";
