@@ -12896,7 +12896,21 @@ function _beginEditResend(wrap, forSession) {
   box.append(ta, bar);
   body.append(box);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-  const cancel = () => { wrap._editing = false; body.classList.remove("msg__body--editing"); body.textContent = ""; body.append(...origNodes); };
+  const cancel = () => {
+    document.removeEventListener("pointerdown", onOutside, true);
+    wrap._editing = false;
+    body.classList.remove("msg__body--editing");
+    body.textContent = "";
+    body.append(...origNodes);
+  };
+  // 点击编辑卡片外面且内容没改动 → 视为放弃编辑，恢复原消息。
+  // 有改动时不自动取消（防误触丢稿）；透传到底部真实按钮的弹层也不算"外面"。
+  const onOutside = (e) => {
+    const t = e.target;
+    if (t && t.closest && (box.contains(t) || t.closest(".mode-menu, .menu, .modal, dialog"))) return;
+    if (ta.value === orig) cancel();
+  };
+  document.addEventListener("pointerdown", onOutside, true);
   cancelBtn.addEventListener("click", cancel);
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); cancel(); }
@@ -12906,6 +12920,7 @@ function _beginEditResend(wrap, forSession) {
     const next = ta.value.trim();
     if (!next) { showToast("内容不能为空"); return; }
     if (sess.streaming) { showToast("正在运行中，稍后再试"); return; }
+    document.removeEventListener("pointerdown", onOutside, true);
     _truncateFromUserMessage(sess, wrap);
     sendPrompt(next);
   });
