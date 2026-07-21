@@ -15836,20 +15836,30 @@ function _insertQueuedNow(sess, item) {
       return;
     }
     if (sess.streaming) {
-      // 普通对话流式中 → 阻断当前回答，马上把这条作为新一轮发出（历史里保留第一次输入，模型两者都能看到）
+      // 普通对话流式中 → 阻断当前回答，马上把这条作为新一轮发出（历史里保留第一次输入，模型两者都能看到）。
+      // 先占住 drain 单飞标记：被打断那轮的 finally 会触发 _drainFollowups，若队列里还有
+      // 其他排队消息会并发再发一轮——占住标记让它跳过，等本条发完再放行统一排队。
+      sess._followupDrainInFlight = true;
       _setStreaming(sess, false);
       if (sess === _currentSession()) _setSendBtnStop(false);
+      Promise.resolve(sendPrompt(text, atts))
+        .catch(() => {})
+        .finally(() => { sess._followupDrainInFlight = false; _drainFollowups(sess); });
+      return;
     }
     Promise.resolve(sendPrompt(text, atts)).catch(() => {});
   } catch {}
 }
 async function _drainFollowups(sess) {
+  // 单飞标记只由真正拿到它的那次调用释放——早退不能把别人（包括「插入」路径）占着的标记清掉。
+  let acquired = false;
   try {
     if (!sess || sess.streaming) return;
     if (!Array.isArray(sess._pendingSends) || !sess._pendingSends.length) return;
     if (sess !== _currentSession()) return; // only auto-fire into the tab in view; else waits for _switchChatSession
     if (sess._followupDrainInFlight) return;
     sess._followupDrainInFlight = true;
+    acquired = true;
     const next = sess._pendingSends[0];
     const config = await _readyAiConfig();
     // Login/config dialogs can take time. Re-check ownership and queue identity before
@@ -15863,7 +15873,7 @@ async function _drainFollowups(sess) {
     Promise.resolve(sent).catch(() => {});
     _renderQueueBar(sess);
   } catch {}
-  finally { if (sess) sess._followupDrainInFlight = false; }
+  finally { if (sess && acquired) sess._followupDrainInFlight = false; }
 }
 
 async function _readyAiConfig() {
