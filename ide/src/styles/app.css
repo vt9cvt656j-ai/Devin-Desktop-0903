@@ -2152,7 +2152,7 @@ body.zen-mode .editor {
    Editing turns the bubble into a card matching the bottom composer:
    white rounded input box + accent-blue send button. */
 .msg.user .msg__body { cursor: pointer; }
-.msg.user .msg__body:has(.msg__edit-ta) {
+.msg.user .msg__body.msg__body--editing {
   background: var(--panel-solid);
   padding: 8px;
   border: 1px solid var(--line-strong);

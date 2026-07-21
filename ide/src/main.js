@@ -7091,6 +7091,7 @@ function _beginEditResend(wrap, forSession) {
   const body = wrap.querySelector(".msg__body");
   if (!body) return;
   wrap._editing = true;
+  body.classList.add("msg__body--editing");
   const orig = String(wrap._rawText || body.textContent || "");
   // 保留原 DOM 节点（而非序列化 HTML），取消时原样放回——@引用卡片/图片的点击事件不丢
   const origNodes = [...body.childNodes];
@@ -7110,7 +7111,7 @@ function _beginEditResend(wrap, forSession) {
   bar.append(cancelBtn, sendBtn);
   body.append(ta, bar);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-  const cancel = () => { wrap._editing = false; body.textContent = ""; body.append(...origNodes); };
+  const cancel = () => { wrap._editing = false; body.classList.remove("msg__body--editing"); body.textContent = ""; body.append(...origNodes); };
   cancelBtn.addEventListener("click", cancel);
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); cancel(); }
