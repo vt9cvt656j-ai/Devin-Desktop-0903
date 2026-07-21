@@ -16405,7 +16405,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // `_shown` cursor toward acc.length a little each frame — eased so it speeds up
   // when far behind and gently finishes near the end — and only render up to it.
   // Result: text types out smoothly no matter how bursty the stream is.
-  const _revealStep = (cur, total) => Math.min(total, cur + Math.max(2, Math.min(64, Math.ceil((total - cur) * 0.16))));
+  // Adaptive catch-up: step grows with the backlog (no small cap), so a true
+  // token-by-token stream shows instantly while a fake-stream dump (upstream
+  // buffers the whole answer, then bursts it) eases out over ~1s instead of
+  // flashing in as one block.
+  const _revealStep = (cur, total) => Math.min(total, cur + Math.max(24, Math.ceil((total - cur) * 0.18)));
   const renderStream = (view) => {
     _removeAllThinking(body);
 
@@ -16511,13 +16515,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     raf = 0;
     const now = Date.now();
     // Render as fast as tokens arrive (capped only by frame rate); widen the gap
-    // only for very long replies to bound the O(n) markdown re-render cost. NO
-    // artificial per-char "typewriter" pacing — that made the output crawl out one
-    // line at a time and feel stuck.
+    // only for very long replies to bound the O(n) markdown re-render cost. The
+    // `_shown` cursor is a proportional catch-up, not a fixed-speed typewriter:
+    // small backlogs render whole (no crawl), big bursty dumps ease out smoothly.
     const _gap = acc.length > 40000 ? 90 : acc.length > 12000 ? 45 : 16;
     if (now - lastFlush < _gap) { scheduleStream(); return; }
     lastFlush = now;
-    renderStream(acc);
+    _shown = _revealStep(_shown, acc.length);
+    renderStream(acc.slice(0, _shown));
+    if (_shown < acc.length) { scheduleStream(); return; }
     if (sess.streaming) scheduleStream();
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
@@ -16612,6 +16618,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    // 假流式上游（整段憋完一次喷出）会在流一结束就定稿：先把还没展示的
+    // 大段余量按帧播完再定稿，否则最终渲染直接整块闪现。用户点停止或出错时不播。
+    if (!err && sess.streaming && acc.length - _shown > 600) {
+      await new Promise((done) => {
+        const t0 = Date.now();
+        const step = () => {
+          if (!sess.streaming || Date.now() - t0 > 4000) { done(); return; }
+          _shown = _revealStep(_shown, acc.length);
+          try { renderStream(acc.slice(0, _shown)); _chatFollow(); } catch { /* keep finishing */ }
+          if (_shown < acc.length) requestAnimationFrame(step);
+          else done();
+        };
+        requestAnimationFrame(step);
+      });
+    }
     _setStreaming(sess, false);
     sess._runIsLoop = null;
     if (sess === _currentSession()) _setSendBtnStop(false);
