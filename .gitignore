@@ -20,9 +20,13 @@ yarn-error.log*
 # Env / secrets
 .env
 .env.*
+.mcp.local.json
+**/.mcp.local.json
 
 # Editor / OS
 .DS_Store
+__pycache__/
+*.py[cod]
 .idea/
 
 # Ignore personal VS Code state, but keep the shared workspace config below.

@@ -2428,7 +2428,11 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
             // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
             // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
             body.get("thinking").map(|t| {
-                match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
+                match t
+                    .get("budget_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                {
                     b if b > 24000 => "max",
                     b if b > 12000 => "high",
                     b if b > 4096 => "medium",

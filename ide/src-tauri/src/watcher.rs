@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKind};
@@ -57,7 +57,10 @@ pub struct WatcherState {
 
 struct WatcherHandle {
     _debouncer: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
-    watched: HashSet<PathBuf>,
+    // Shared with the debounce callback so paths watched AFTER creation (workspace
+    // switches / added roots) still strip-prefix correctly in is_ignored_path —
+    // a snapshot taken at creation silently mis-filtered late-added roots.
+    watched: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl Default for WatcherState {
@@ -79,8 +82,9 @@ pub fn fs_watch(
     let new_paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
 
     if let Some(handle) = guard.as_mut() {
+        let mut watched = handle.watched.lock().map_err(|e| e.to_string())?;
         for p in &new_paths {
-            if handle.watched.contains(p) {
+            if watched.contains(p) {
                 continue;
             }
             handle
@@ -88,23 +92,27 @@ pub fn fs_watch(
                 .watcher()
                 .watch(p, notify::RecursiveMode::Recursive)
                 .map_err(|e| format!("watch error: {e}"))?;
-            handle.watched.insert(p.clone());
+            watched.insert(p.clone());
         }
         return Ok(());
     }
 
     let app_handle = app.clone();
-    let roots_filter = new_paths.clone();
+    let watched = Arc::new(Mutex::new(HashSet::new()));
+    let roots_filter = Arc::clone(&watched);
     let mut debouncer = new_debouncer(
         Duration::from_millis(300),
         move |res: DebounceEventResult| {
             match res {
                 Ok(events) => {
+                    let roots: Vec<PathBuf> = roots_filter
+                        .lock()
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default();
                     let mut changed: Vec<String> = events
                         .iter()
                         .filter(|e| {
-                            e.kind == DebouncedEventKind::Any
-                                && !is_ignored_path(&e.path, &roots_filter)
+                            e.kind == DebouncedEventKind::Any && !is_ignored_path(&e.path, &roots)
                         })
                         .map(|e| e.path.to_string_lossy().to_string())
                         .collect();
@@ -123,13 +131,15 @@ pub fn fs_watch(
     )
     .map_err(|e| format!("failed to create watcher: {e}"))?;
 
-    let mut watched = HashSet::new();
-    for p in &new_paths {
-        debouncer
-            .watcher()
-            .watch(p, notify::RecursiveMode::Recursive)
-            .map_err(|e| format!("watch error for {}: {e}", p.display()))?;
-        watched.insert(p.clone());
+    {
+        let mut w = watched.lock().map_err(|e| e.to_string())?;
+        for p in &new_paths {
+            debouncer
+                .watcher()
+                .watch(p, notify::RecursiveMode::Recursive)
+                .map_err(|e| format!("watch error for {}: {e}", p.display()))?;
+            w.insert(p.clone());
+        }
     }
 
     *guard = Some(WatcherHandle {
@@ -143,13 +153,17 @@ pub fn fs_watch(
 pub fn fs_unwatch(state: State<WatcherState>, paths: Vec<String>) -> Result<(), String> {
     let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
     if let Some(handle) = guard.as_mut() {
-        for p in paths {
-            let pb = PathBuf::from(&p);
-            if handle.watched.remove(&pb) {
-                let _ = handle._debouncer.watcher().unwatch(&pb);
+        let now_empty = {
+            let mut watched = handle.watched.lock().map_err(|e| e.to_string())?;
+            for p in paths {
+                let pb = PathBuf::from(&p);
+                if watched.remove(&pb) {
+                    let _ = handle._debouncer.watcher().unwatch(&pb);
+                }
             }
-        }
-        if handle.watched.is_empty() {
+            watched.is_empty()
+        };
+        if now_empty {
             *guard = None;
         }
     }

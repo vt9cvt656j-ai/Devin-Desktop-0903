@@ -14,19 +14,31 @@ mod files;
 mod game;
 mod game_assets;
 mod git;
+mod image_location;
 mod knowledge;
+mod local_discovery;
+mod location;
 mod lsp;
 mod marketplace;
 mod mcp;
 mod net;
 mod process_util;
 mod proxy;
+mod public_data;
 mod qr;
+mod shop_catalog;
 mod sysctl;
 mod tasks;
 mod terminal;
 mod watcher;
 mod web_scaffold;
+
+// DevTools remain compiled in for manual use, but the application window must
+// stay focused on startup instead of forcing the inspector open.
+#[cfg(desktop)]
+fn should_open_devtools_on_startup() -> bool {
+    false
+}
 
 /// Reap any backend processes left over from a previous page session. The
 /// frontend calls this once on startup, so a webview reload (common during dev)
@@ -107,9 +119,11 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
-            // Enable devtools in all builds (debug + release)
-            #[cfg(desktop)]
-            {
+            // open_devtools only exists in debug builds or with the opt-in `devtools`
+            // feature — release builds no longer compile the inspector in at all, so a
+            // shipped app can't be opened up to read code / watch authorized requests.
+            #[cfg(all(desktop, any(debug_assertions, feature = "devtools")))]
+            if should_open_devtools_on_startup() {
                 use tauri::Manager;
                 if let Some(w) = app.get_webview_window("main") {
                     w.open_devtools();
@@ -135,8 +149,12 @@ pub fn run() {
             files::register_workspace_root,
             files::read_dir,
             files::read_text_file,
+            files::read_log_tail,
             files::read_file_data_url,
+            files::inspect_file,
             files::write_text_file,
+            files::write_text_file_if_unchanged,
+            files::delete_text_file_if_unchanged,
             files::write_tmp_file,
             files::home_dir,
             files::create_file,
@@ -159,6 +177,7 @@ pub fn run() {
             git::git_unstage_all,
             git::git_commit,
             git::git_push,
+            git::git_clone,
             git::git_branches,
             git::git_checkout,
             git::git_pull,
@@ -189,6 +208,8 @@ pub fn run() {
             proxy::proxy_ca_path,
             proxy::proxy_set_system_proxy,
             qr::decode_qr,
+            image_location::reverse_geocode_coordinates,
+            location::request_current_location,
             db::db_query,
             mcp::mcp_connect,
             mcp::mcp_call,
@@ -204,6 +225,7 @@ pub fn run() {
             browser::browser_upload_file,
             browser::browser_eval,
             browser::browser_screenshot,
+            browser::browser_set_viewport,
             browser::browser_set_marks,
             browser::browser_scroll,
             browser::browser_wait,
@@ -259,10 +281,16 @@ pub fn run() {
             auth::auth_verify_code,
             auth::db_marketplace_list,
             auth::db_marketplace_upsert,
+            accessibility::read_screen,
+            accessibility::ui_click,
             automation::automation_call,
             knowledge::academic_search,
             knowledge::package_search,
             knowledge::github_search,
+            knowledge::github_repo,
+            knowledge::gitlab_repo,
+            knowledge::gitee_repo,
+            knowledge::codeberg_repo,
             knowledge::cve_search,
             knowledge::wiki_search,
             knowledge::stackoverflow_search,
@@ -287,6 +315,9 @@ pub fn run() {
             knowledge::bundlephobia_search,
             knowledge::devto_search,
             knowledge::reddit_search,
+            knowledge::smzdm_search,
+            knowledge::xianyu_search,
+            knowledge::zhuanzhuan_search,
             knowledge::steam_search,
             knowledge::iconify_search,
             knowledge::color_search,
@@ -310,6 +341,13 @@ pub fn run() {
             knowledge::bestofjs_search,
             knowledge::sourcegraph_search,
             knowledge::deep_search,
+            local_discovery::local_discovery,
+            public_data::live_environment,
+            public_data::live_markets,
+            public_data::live_flights,
+            public_data::road_environment,
+            public_data::track_shipment,
+            shop_catalog::shop_catalog,
             game::game_scaffold,
             web_scaffold::web_scaffold,
             game_assets::generate_3d,
@@ -338,4 +376,14 @@ pub fn run() {
                 automation::stop(); // reap the desktop-automation server
             }
         });
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::should_open_devtools_on_startup;
+
+    #[test]
+    fn devtools_stay_closed_on_startup() {
+        assert!(!should_open_devtools_on_startup());
+    }
 }

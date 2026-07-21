@@ -1,14 +1,79 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 type DeepSearchHit = (String, String, String, &'static str);
 type DeepSearchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DeepSearchHit>> + Send>>;
-type CommunitySearchOutput = (&'static str, &'static str, Result<String, String>);
+type CommunityAdapterOutput = (&'static str, &'static str, Result<String, String>);
+type CommunityAdapterFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = CommunityAdapterOutput> + Send>>;
+type CommunitySearchOutput = (&'static str, &'static str, CommunitySearchOutcome);
 type CommunitySearchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = CommunitySearchOutput> + Send>>;
+type CommunitySearchResponse = (&'static str, &'static str, CommunitySearchOutcome, String);
+
+const COMMUNITY_SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
+const GITHUB_TRENDING_EMPTY_NOTICE: &str =
+    "search_status: empty\nNo trending repositories were parsed from the successful GitHub response.\n";
+
+#[derive(Debug)]
+enum CommunitySearchOutcome {
+    Finished(Result<String, String>),
+    TimedOut { after: Duration },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommunitySourceStatus {
+    Success,
+    Empty,
+    RateLimited,
+    Failed,
+    Timeout,
+}
+
+impl CommunitySourceStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Empty => "empty",
+            Self::RateLimited => "rate-limited",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DiscourseSource {
+    key: &'static str,
+    label: &'static str,
+    base_url: &'static str,
+}
+
+const RUST_USERS_DISCOURSE: DiscourseSource = DiscourseSource {
+    key: "rust_users",
+    label: "Rust Users Forum",
+    base_url: "https://users.rust-lang.org",
+};
+const PYTHON_DISCOURSE: DiscourseSource = DiscourseSource {
+    key: "python_discussions",
+    label: "Python Discussions",
+    base_url: "https://discuss.python.org",
+};
+const SWIFT_DISCOURSE: DiscourseSource = DiscourseSource {
+    key: "swift_forums",
+    label: "Swift Forums",
+    base_url: "https://forums.swift.org",
+};
+const KOTLIN_DISCOURSE: DiscourseSource = DiscourseSource {
+    key: "kotlin_discussions",
+    label: "Kotlin Discussions",
+    base_url: "https://discuss.kotlinlang.org",
+};
 
 const DEVELOPER_COMMUNITY_SOURCES: &[(&str, &str)] = &[
     ("github", "GitHub"),
@@ -21,6 +86,10 @@ const DEVELOPER_COMMUNITY_SOURCES: &[(&str, &str)] = &[
     ("juejin", "掘金"),
     ("v2ex", "V2EX"),
     ("segmentfault", "SegmentFault"),
+    ("rust_users", "Rust Users Forum"),
+    ("python_discussions", "Python Discussions"),
+    ("swift_forums", "Swift Forums"),
+    ("kotlin_discussions", "Kotlin Discussions"),
     ("gitlab", "GitLab"),
     ("gitee", "Gitee"),
     ("codeberg", "Codeberg"),
@@ -46,6 +115,14 @@ fn canonical_community_source(source: &str) -> Option<&'static str> {
         "juejin" | "掘金" => Some("juejin"),
         "v2ex" => Some("v2ex"),
         "segmentfault" | "segment_fault" | "思否" => Some("segmentfault"),
+        "rust" | "rust_users" | "rust_discourse" | "rust_forum" | "users_rust" => {
+            Some("rust_users")
+        }
+        "python" | "python_discussions" | "python_discourse" | "python_forum"
+        | "discuss_python" => Some("python_discussions"),
+        "swift" | "swift_discourse" | "swift_forums" | "swift_forum" => Some("swift_forums"),
+        "kotlin" | "kotlin_discourse" | "kotlin_discussions" | "kotlin_forum"
+        | "discuss_kotlin" => Some("kotlin_discussions"),
         "gitlab" => Some("gitlab"),
         "gitee" | "码云" => Some("gitee"),
         "codeberg" => Some("codeberg"),
@@ -111,6 +188,10 @@ fn select_developer_sources(
             "github_discussions",
             "v2ex",
             "segmentfault",
+            "rust_users",
+            "python_discussions",
+            "swift_forums",
+            "kotlin_discussions",
         ],
         "chinese" | "zh" | "cn" => {
             vec!["gitee", "juejin", "v2ex", "segmentfault", "infoq"]
@@ -140,9 +221,12 @@ async fn public_site_search(
     direct_search_url: &str,
 ) -> Result<String, String> {
     let search_query = format!("site:{site} {query}");
-    let hits = ddg_surface(&search_query).await;
+    let hits = ddg_surface_checked(&search_query)
+        .await
+        .map_err(|error| format!("{label} public search: {error}"))?;
+    let retrieved = retrieved_at();
     let mut out = format!(
-        "{label} pages for '{query}' (via public web search, not an official {label} API):\n\n"
+        "{label} pages for '{query}' (via public web search, not an official {label} API):\nretrieved_at: {retrieved}\n\n"
     );
     let mut count = 0usize;
     for (title, url, snippet, _) in hits {
@@ -151,10 +235,11 @@ async fn public_site_search(
         }
         count += 1;
         out.push_str(&format!(
-            "{}. {}\n   {}\n   {}\n\n",
+            "{}. {}\n   {}\n   published_date: unknown\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   {}\n\n",
             count,
             title,
             trunc(&snippet, 180),
+            retrieved,
             url,
         ));
         if count >= max_results as usize {
@@ -163,11 +248,25 @@ async fn public_site_search(
     }
     if count == 0 {
         out.push_str(
-            "No matching page was returned. This can mean no match or that the public search endpoint was unavailable.\n\n",
+            "search_status: empty\nThe public-search response contained no usable matching page. This can mean no match, an index coverage gap, or an unrecognized result layout; it does not prove the site has no matching content.\n\n",
         );
     }
     out.push_str(&format!("Direct search: {direct_search_url}\n"));
     Ok(out)
+}
+
+fn url_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn kclient() -> Result<Client, String> {
@@ -187,6 +286,268 @@ fn trunc(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn retrieved_at() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn unix_time_rfc3339(value: Option<&Value>) -> Option<String> {
+    let seconds = value.and_then(|value| match value {
+        Value::Number(value) => value.as_i64(),
+        Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    })?;
+    DateTime::<Utc>::from_timestamp(seconds, 0)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn value_or_unknown(value: Option<&str>) -> &str {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+}
+
+fn github_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    if suffix.is_empty() {
+        format!("https://api.github.com/repos/{owner}/{repo}")
+    } else {
+        format!("https://api.github.com/repos/{owner}/{repo}/{suffix}")
+    }
+}
+
+fn github_text_value(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn repo_text_value(value: &Value, keys: &[&str]) -> String {
+    for key in keys {
+        if let Some(value) = value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return value.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn github_repo_ref(owner: &str, repo: &str) -> Result<(String, String), String> {
+    let clean_owner = owner.trim().trim_matches('/');
+    let clean_repo = repo.trim().trim_matches('/');
+    if clean_owner.is_empty() || clean_repo.is_empty() {
+        return Err("github_repo 需要 owner 和 repo，例如 owner=vercel repo=next.js".into());
+    }
+    if clean_owner.contains('/') || clean_repo.contains('/') {
+        return Err(
+            "github_repo 的 owner/repo 必须分开传，不要把 owner/repo 写在同一个字段里".into(),
+        );
+    }
+    Ok((clean_owner.to_string(), clean_repo.to_string()))
+}
+
+fn hosted_repo_ref(
+    tool: &str,
+    owner: &str,
+    repo: &str,
+    allow_nested_owner: bool,
+) -> Result<(String, String), String> {
+    let clean_owner = owner.trim().trim_matches('/');
+    let clean_repo = repo.trim().trim_matches('/');
+    if clean_owner.is_empty() || clean_repo.is_empty() {
+        return Err(format!(
+            "{tool} 需要 owner 和 repo，例如 owner=gitlab-org repo=gitlab"
+        ));
+    }
+    if clean_repo.contains('/') || (!allow_nested_owner && clean_owner.contains('/')) {
+        return Err(format!(
+            "{tool} 的 owner/repo 必须分开传；GitLab 子组可写在 owner（如 group/subgroup）"
+        ));
+    }
+    Ok((clean_owner.to_string(), clean_repo.to_string()))
+}
+
+fn provider_date_value(value: Option<(&str, &str)>) -> String {
+    match value {
+        Some((value, field)) if !value.trim().is_empty() => {
+            format!("{} (provider field: {field})", trunc(value.trim(), 80))
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn provider_date_lines(
+    published: Option<(&str, &str)>,
+    created: Option<(&str, &str)>,
+    updated: Option<(&str, &str)>,
+    last_activity: Option<(&str, &str)>,
+    retrieved: &str,
+) -> String {
+    format!(
+        concat!(
+            "   published_date: {}\n",
+            "   created_date: {}\n",
+            "   updated_date: {}\n",
+            "   last_activity_date: {}\n",
+            "   retrieved_at: {}\n",
+        ),
+        provider_date_value(published),
+        provider_date_value(created),
+        provider_date_value(updated),
+        provider_date_value(last_activity),
+        retrieved,
+    )
+}
+
+fn freecodecamp_published_date(hit: &Value) -> Option<(String, &'static str)> {
+    hit.get("publishedAt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| (value.to_string(), "publishedAt"))
+        .or_else(|| {
+            unix_time_rfc3339(hit.get("publishedAtTimestamp"))
+                .map(|value| (value, "publishedAtTimestamp"))
+        })
+}
+
+fn repository_date_lines(
+    provider: &str,
+    item: &Value,
+    last_activity_field: Option<&str>,
+    retrieved: &str,
+) -> String {
+    let created = value_or_unknown(item.get("created_at").and_then(Value::as_str));
+    let updated = value_or_unknown(item.get("updated_at").and_then(Value::as_str));
+    let (last_activity, last_activity_note) = match last_activity_field {
+        Some(field) => (
+            value_or_unknown(item.get(field).and_then(Value::as_str)),
+            format!(" (provider field: {field})"),
+        ),
+        None => (
+            "unknown",
+            format!(" ({provider} repository response did not expose a last-activity field)"),
+        ),
+    };
+    format!(
+        concat!(
+            "   published_date: unknown ({} repository search does not expose a publication date)\n",
+            "   created_date: {} (provider field: created_at)\n",
+            "   updated_date: {} (provider field: updated_at)\n",
+            "   last_activity_date: {}{}\n",
+            "   retrieved_at: {}\n",
+        ),
+        provider,
+        created,
+        updated,
+        last_activity,
+        last_activity_note,
+        retrieved,
+    )
+}
+
+fn community_result_status(outcome: &CommunitySearchOutcome) -> CommunitySourceStatus {
+    match outcome {
+        CommunitySearchOutcome::TimedOut { .. } => CommunitySourceStatus::Timeout,
+        CommunitySearchOutcome::Finished(result) => match result {
+            Err(error) => {
+                let error = error.to_ascii_lowercase();
+                if error.contains("429")
+                    || error.contains("rate limit")
+                    || error.contains("rate-limit")
+                    || error.contains("too many requests")
+                    || error.contains("quota exceeded")
+                {
+                    CommunitySourceStatus::RateLimited
+                } else {
+                    CommunitySourceStatus::Failed
+                }
+            }
+            Ok(content) => {
+                let normalized = content.trim().to_ascii_lowercase();
+                if normalized.is_empty()
+                    || normalized.contains("search_status: empty")
+                    || normalized.starts_with("no ")
+                    || normalized.contains("\nno matching page was returned")
+                    || normalized.contains("\n  no results found")
+                    || normalized.contains("\n  no matching projects")
+                {
+                    CommunitySourceStatus::Empty
+                } else {
+                    CommunitySourceStatus::Success
+                }
+            }
+        },
+    }
+}
+
+async fn community_source_with_timeout(
+    source_key: &'static str,
+    source_label: &'static str,
+    adapter: CommunityAdapterFuture,
+    timeout: Duration,
+) -> CommunitySearchOutput {
+    match tokio::time::timeout(timeout, adapter).await {
+        Ok((key, label, result)) => (key, label, CommunitySearchOutcome::Finished(result)),
+        Err(_) => (
+            source_key,
+            source_label,
+            CommunitySearchOutcome::TimedOut { after: timeout },
+        ),
+    }
+}
+
+fn aggregate_trending_language(query: &str) -> Option<&'static str> {
+    match query.trim().to_ascii_lowercase().as_str() {
+        "c" => Some("c"),
+        "c++" | "cpp" => Some("c++"),
+        "c#" | "csharp" => Some("c#"),
+        "dart" => Some("dart"),
+        "elixir" => Some("elixir"),
+        "go" | "golang" => Some("go"),
+        "haskell" => Some("haskell"),
+        "java" => Some("java"),
+        "javascript" | "js" => Some("javascript"),
+        "julia" => Some("julia"),
+        "kotlin" => Some("kotlin"),
+        "lua" => Some("lua"),
+        "objective-c" | "objective_c" => Some("objective-c"),
+        "php" => Some("php"),
+        "python" | "py" => Some("python"),
+        "r" => Some("r"),
+        "ruby" => Some("ruby"),
+        "rust" => Some("rust"),
+        "scala" => Some("scala"),
+        "shell" | "bash" => Some("shell"),
+        "swift" => Some("swift"),
+        "typescript" | "ts" => Some("typescript"),
+        _ => None,
+    }
+}
+
+fn github_trending_url(language: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse("https://github.com/trending")
+        .map_err(|error| format!("GitHub Trending URL: {error}"))?;
+    let language = language.trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("all") {
+        let language = language.to_ascii_lowercase().replace(' ', "-");
+        url.path_segments_mut()
+            .map_err(|_| "GitHub Trending URL cannot accept path segments".to_string())?
+            .push(&language);
+    }
+    url.query_pairs_mut().append_pair("since", "weekly");
+    Ok(url.into())
 }
 
 // ── Academic papers (Semantic Scholar) ──────────────────────────────
@@ -288,14 +649,35 @@ pub async fn package_search(
 }
 
 async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
-    let resp = c
+    let exact = npm_exact_summary(c, q).await.ok().flatten();
+    let resp = match c
         .get("https://registry.npmjs.org/-/v1/search")
         .query(&[("text", q), ("size", &limit.to_string())])
         .send()
         .await
-        .map_err(|e| format!("npm: {e}"))?;
-    let json: Value = resp.json().await.map_err(|e| format!("npm JSON: {e}"))?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if let Some(info) = exact {
+                return Ok(format!("npm packages:\n\n{info}"));
+            }
+            return Err(format!("npm: {e}"));
+        }
+    };
+    let json: Value = match resp.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            if let Some(info) = exact {
+                return Ok(format!("npm packages:\n\n{info}"));
+            }
+            return Err(format!("npm JSON: {e}"));
+        }
+    };
     let mut out = String::from("npm packages:\n\n");
+    if let Some(info) = exact {
+        out.push_str(&info);
+        out.push('\n');
+    }
     if let Some(objs) = json["objects"].as_array() {
         for (i, o) in objs.iter().enumerate() {
             let p = &o["package"];
@@ -310,6 +692,169 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+fn npm_exact_query(q: &str) -> bool {
+    let q = q.trim();
+    !q.is_empty()
+        && q.len() <= 214
+        && !q.chars().any(char::is_whitespace)
+        && q.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '-' | '_' | '.' | '~'))
+}
+
+fn npm_registry_path(name: &str) -> String {
+    let mut out = String::new();
+    for (part_index, part) in name
+        .trim()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        if part_index > 0 {
+            out.push_str("%2F");
+        }
+        for byte in part.as_bytes() {
+            match *byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(*byte as char)
+                }
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+    }
+    out
+}
+
+fn npm_value_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::Null => "null".to_string(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "?".to_string()),
+    }
+}
+
+fn npm_map_text(value: Option<&Value>, max: usize) -> Option<String> {
+    let obj = value.and_then(Value::as_object)?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (key, value) in obj.iter().take(max) {
+        parts.push(format!("{key}: {}", npm_value_text(value)));
+    }
+    if obj.len() > max {
+        parts.push(format!("… +{} more", obj.len() - max));
+    }
+    Some(parts.join(", "))
+}
+
+fn npm_recent_versions(data: &Value, max: usize) -> Vec<String> {
+    let Some(versions) = data.get("versions").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let time = data.get("time").and_then(Value::as_object);
+    let mut rows: Vec<(String, String)> = versions
+        .keys()
+        .map(|version| {
+            let published = time
+                .and_then(|items| items.get(version))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            (version.clone(), published)
+        })
+        .collect();
+    if time.is_some() {
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    } else {
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+    }
+    rows.into_iter().take(max).map(|row| row.0).collect()
+}
+
+async fn npm_exact_summary(c: &Client, q: &str) -> Result<Option<String>, String> {
+    if !npm_exact_query(q) {
+        return Ok(None);
+    }
+    let url = format!("https://registry.npmjs.org/{}", npm_registry_path(q));
+    let resp = c
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("npm exact: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("npm exact JSON: {e}"))?;
+    let name = data.get("name").and_then(Value::as_str).unwrap_or(q.trim());
+    let latest = data
+        .get("dist-tags")
+        .and_then(|tags| tags.get("latest"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let latest_manifest = data
+        .get("versions")
+        .and_then(|versions| versions.get(latest));
+    let versions_count = data
+        .get("versions")
+        .and_then(Value::as_object)
+        .map(|versions| versions.len())
+        .unwrap_or(0);
+    let recent = npm_recent_versions(&data, 10);
+    let modified = data
+        .get("time")
+        .and_then(|time| time.get("modified"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut out = format!(
+        "Exact npm registry metadata:\n   Package: {name}@{latest}\n   Modified: {modified}\n   Registry: https://www.npmjs.com/package/{name}\n"
+    );
+    if let Some(tags) = npm_map_text(data.get("dist-tags"), 8) {
+        out.push_str(&format!("   dist-tags: {tags}\n"));
+    }
+    if recent.is_empty() {
+        out.push_str(&format!("   Versions: {versions_count} total\n"));
+    } else {
+        out.push_str(&format!(
+            "   Versions: {versions_count} total; recent: {}\n",
+            recent.join(", ")
+        ));
+    }
+    for (label, value, max) in [
+        ("engines", latest_manifest.and_then(|m| m.get("engines")), 6),
+        (
+            "peerDependencies",
+            latest_manifest.and_then(|m| m.get("peerDependencies")),
+            8,
+        ),
+        (
+            "dependencies",
+            latest_manifest.and_then(|m| m.get("dependencies")),
+            10,
+        ),
+        (
+            "optionalDependencies",
+            latest_manifest.and_then(|m| m.get("optionalDependencies")),
+            6,
+        ),
+    ] {
+        if let Some(text) = npm_map_text(value, max) {
+            out.push_str(&format!("   {label}: {text}\n"));
+        }
+    }
+    if let Some(deprecated) = latest_manifest
+        .and_then(|m| m.get("deprecated"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("   Deprecated: {}\n", trunc(deprecated, 300)));
+    }
+    Ok(Some(out))
 }
 
 async fn search_pypi(c: &Client, q: &str) -> Result<String, String> {
@@ -547,6 +1092,59 @@ async fn search_hex(c: &Client, q: &str, limit: u32) -> Result<String, String> {
 
 // ── GitHub search ──────────────────────────────────────────────────
 
+fn format_github_search_item(
+    item: &Value,
+    search_type: &str,
+    index: usize,
+    retrieved: &str,
+) -> String {
+    if search_type == "repositories" {
+        let dates = repository_date_lines("GitHub", item, Some("pushed_at"), retrieved);
+        return format!(
+            "{}. {} ({}★)\n   {}\n   Language: {} | Forks: {}\n{}   {}\n\n",
+            index + 1,
+            item["full_name"].as_str().unwrap_or("?"),
+            item["stargazers_count"].as_u64().unwrap_or(0),
+            item["description"].as_str().unwrap_or(""),
+            item["language"].as_str().unwrap_or("?"),
+            item["forks_count"].as_u64().unwrap_or(0),
+            dates,
+            item["html_url"].as_str().unwrap_or(""),
+        );
+    }
+
+    let (created, updated) = if search_type == "issues" {
+        (
+            value_or_unknown(item.get("created_at").and_then(Value::as_str)),
+            value_or_unknown(item.get("updated_at").and_then(Value::as_str)),
+        )
+    } else {
+        ("unknown", "unknown")
+    };
+    let label = item["full_name"]
+        .as_str()
+        .or(item["name"].as_str())
+        .or(item["title"].as_str())
+        .or(item["path"].as_str())
+        .unwrap_or("?");
+    format!(
+        "{}. {}\n   published_date: unknown (GitHub {search_type} search does not expose a publication date)\n   created_date: {created}{}\n   updated_date: {updated}{}\n   last_activity_date: unknown (GitHub {search_type} search does not expose a last-activity field)\n   retrieved_at: {retrieved}\n   {}\n\n",
+        index + 1,
+        label,
+        if search_type == "issues" {
+            " (provider field: created_at)"
+        } else {
+            ""
+        },
+        if search_type == "issues" {
+            " (provider field: updated_at)"
+        } else {
+            ""
+        },
+        item["html_url"].as_str().unwrap_or(""),
+    )
+}
+
 #[tauri::command]
 pub async fn github_search(
     query: String,
@@ -560,11 +1158,7 @@ pub async fn github_search(
     let url = format!("https://api.github.com/search/{stype}");
     let resp = c
         .get(&url)
-        .query(&[
-            ("q", query.as_str()),
-            ("per_page", &limit.to_string()),
-            ("sort", "stars"),
-        ])
+        .query(&[("q", query.as_str()), ("per_page", &limit.to_string())])
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -577,40 +1171,1189 @@ pub async fn github_search(
 
     let json: Value = resp.json().await.map_err(|e| format!("GitHub JSON: {e}"))?;
     let total = json["total_count"].as_u64().unwrap_or(0);
-    let mut out = format!("GitHub {stype}: {total} results\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("GitHub {stype}: {total} results\nretrieved_at: {retrieved}\n\n");
+    if total == 0 {
+        out.push_str("search_status: empty\n");
+    }
 
     if let Some(items) = json["items"].as_array() {
         for (i, item) in items.iter().enumerate() {
-            if stype == "repositories" {
-                out.push_str(&format!(
-                    "{}. {} ({}★)\n   {}\n   Language: {} | Forks: {} | Updated: {}\n   {}\n\n",
-                    i + 1,
-                    item["full_name"].as_str().unwrap_or("?"),
-                    item["stargazers_count"].as_u64().unwrap_or(0),
-                    item["description"].as_str().unwrap_or(""),
-                    item["language"].as_str().unwrap_or("?"),
-                    item["forks_count"].as_u64().unwrap_or(0),
-                    &item["updated_at"]
-                        .as_str()
-                        .unwrap_or("")
-                        .get(..10)
-                        .unwrap_or(""),
-                    item["html_url"].as_str().unwrap_or(""),
-                ));
-            } else {
-                out.push_str(&format!(
-                    "{}. {}\n   {}\n\n",
-                    i + 1,
-                    item["full_name"]
-                        .as_str()
-                        .or(item["name"].as_str())
-                        .unwrap_or("?"),
-                    item["html_url"].as_str().unwrap_or(""),
-                ));
-            }
+            out.push_str(&format_github_search_item(item, stype, i, &retrieved));
         }
     }
     Ok(out)
+}
+
+fn format_github_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = github_text_value(repo, "full_name");
+    let dates = repository_date_lines("GitHub", repo, Some("pushed_at"), retrieved);
+    format!(
+        concat!(
+            "GitHub repo overview: {}\n",
+            "search_status: success\n",
+            "source: GitHub REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "License: {}\n",
+            "Homepage: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        github_text_value(repo, "language"),
+        repo.get("stargazers_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        repo.get("forks_count").and_then(Value::as_u64).unwrap_or(0),
+        repo.get("open_issues_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        github_text_value(repo, "default_branch"),
+        repo.pointer("/license/spdx_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        github_text_value(repo, "homepage"),
+        github_text_value(repo, "html_url"),
+        dates,
+    )
+}
+
+fn decode_github_base64(value: &str) -> Result<Vec<u8>, String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u8;
+    for byte in value.bytes() {
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\r' | b'\n' | b'\t' | b' ' => continue,
+            _ => return Err("GitHub 文件内容不是合法 base64".into()),
+        };
+        debug_assert_eq!(TABLE[val as usize], byte);
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+        buf &= if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+    }
+    Ok(out)
+}
+
+fn github_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("GITHUB_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(token) => req.header("Authorization", format!("Bearer {token}")),
+        None => req,
+    }
+}
+
+fn gitlab_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let token = std::env::var("GITLAB_TOKEN")
+        .or_else(|_| std::env::var("GITLAB_PERSONAL_ACCESS_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match token {
+        Some(token) => req.header("PRIVATE-TOKEN", token),
+        None => req,
+    }
+}
+
+fn codeberg_auth_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let token = std::env::var("CODEBERG_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match token {
+        Some(token) => req.header("Authorization", format!("token {token}")),
+        None => req,
+    }
+}
+
+fn with_gitee_token(url: String) -> String {
+    let Some(token) = std::env::var("GITEE_ACCESS_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return url;
+    };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}access_token={}", url_query_component(&token))
+}
+
+async fn api_get_json(
+    c: &Client,
+    url: &str,
+    label: &str,
+    decorate: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<Value, String> {
+    let resp = decorate(c.get(url))
+        .send()
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
+    }
+    resp.json().await.map_err(|e| format!("{label} JSON: {e}"))
+}
+
+async fn api_get_text(
+    c: &Client,
+    url: &str,
+    label: &str,
+    decorate: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<String, String> {
+    let resp = decorate(c.get(url))
+        .send()
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
+    }
+    resp.text().await.map_err(|e| format!("{label} text: {e}"))
+}
+
+async fn github_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "GitHub", |req| {
+        github_auth_header(req.header("Accept", "application/vnd.github+json"))
+    })
+    .await
+}
+
+fn repo_reader_action(value: Option<String>) -> String {
+    let action = value.unwrap_or_else(|| "overview".into());
+    match action
+        .trim()
+        .to_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "summary" | "info" | "repo" | "overview" => "overview".into(),
+        "readme" | "read_me" => "readme".into(),
+        "tree" | "list" | "dir" | "directory" | "contents" => "tree".into(),
+        "file" | "read_file" | "content" => "file".into(),
+        "releases" | "release" | "versions" => "releases".into(),
+        "issues" | "issue" => "issues".into(),
+        "pulls" | "pull_requests" | "prs" | "pr" | "merge_requests" | "mrs" | "mr" => {
+            "pulls".into()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn github_repo_action(value: Option<String>) -> String {
+    repo_reader_action(value)
+}
+
+/// Read a real GitHub repository through the GitHub REST API.
+///
+/// This is intentionally separate from `github_search`: search finds candidates; this tool reads
+/// the selected repo's README/tree/file/releases/issues so the model can reason from repository
+/// evidence instead of titles and snippets.
+#[tauri::command]
+pub async fn github_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = github_repo_ref(&owner, &repo)?;
+    let action = github_repo_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let url = github_api_url(&owner, &repo, "");
+            let json = github_get_json(&c, &url).await?;
+            Ok(format_github_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let mut url = github_api_url(&owner, &repo, "readme");
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_github_base64(encoded)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let file_path = json.get("path").and_then(Value::as_str).unwrap_or("README");
+            Ok(format!(
+                "GitHub repo README: {owner}/{repo}/{file_path}\nsearch_status: success\nsource: GitHub REST API /readme\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                github_text_value(&json, "encoding"),
+                bytes.len(),
+                github_text_value(&json, "html_url"),
+                trunc(&text, 60_000),
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut url = github_api_url(
+                &owner,
+                &repo,
+                &format!("contents/{}", url_query_component(&clean_path).replace("%2F", "/")),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            let mut out = format!(
+                "GitHub repo tree: {owner}/{repo}/{}\nsearch_status: success\nsource: GitHub REST API /contents\nretrieved_at: {retrieved}\n\n",
+                if clean_path.is_empty() { "." } else { clean_path.as_str() },
+            );
+            if let Some(items) = json.as_array() {
+                for (i, item) in items.iter().take(limit as usize).enumerate() {
+                    out.push_str(&format!(
+                        "{}. {} {} ({} bytes)\n   path: {}\n   url: {}\n",
+                        i + 1,
+                        item.get("type").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("size").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("path").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                    ));
+                }
+                if items.len() > limit as usize {
+                    out.push_str(&format!(
+                        "\ntruncated: true (showing {limit} of {} entries; pass max_results for more)\n",
+                        items.len()
+                    ));
+                }
+            } else {
+                out.push_str("The requested path is not a directory; use action=file to read it.\n");
+            }
+            Ok(out)
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "github_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let mut url = github_api_url(
+                &owner,
+                &repo,
+                &format!("contents/{}", url_query_component(&clean_path).replace("%2F", "/")),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("?ref={}", url_query_component(branch)));
+            }
+            let json = github_get_json(&c, &url).await?;
+            if json.as_array().is_some() {
+                return Err("github_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_github_base64(encoded)?;
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(format!(
+                "GitHub repo file: {owner}/{repo}/{clean_path}\nsearch_status: success\nsource: GitHub REST API /contents\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nsha: {}\nhtml_url: {}\n\n{}",
+                github_text_value(&json, "encoding"),
+                bytes.len(),
+                github_text_value(&json, "sha"),
+                github_text_value(&json, "html_url"),
+                trunc(&text, 80_000),
+            ))
+        }
+        "releases" => {
+            let url = github_api_url(&owner, &repo, "releases");
+            let json = github_get_json(&c, &format!("{url}?per_page={limit}")).await?;
+            let mut out = format!(
+                "GitHub repo releases: {owner}/{repo}\nsearch_status: success\nsource: GitHub REST API /releases\nretrieved_at: {retrieved}\n\n"
+            );
+            if let Some(items) = json.as_array() {
+                if items.is_empty() {
+                    out.push_str("search_status: empty\nNo releases returned by GitHub.\n");
+                }
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}. {}{}\n   published_date: {}\n   created_date: {}\n   prerelease: {} | draft: {}\n   url: {}\n   notes: {}\n\n",
+                        i + 1,
+                        item.get("tag_name").and_then(Value::as_str).unwrap_or("?"),
+                        item.get("name").and_then(Value::as_str).map(|name| format!(" — {name}")).unwrap_or_default(),
+                        provider_date_value(item.get("published_at").and_then(Value::as_str).map(|v| (v, "published_at"))),
+                        provider_date_value(item.get("created_at").and_then(Value::as_str).map(|v| (v, "created_at"))),
+                        item.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+                        item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                        trunc(item.get("body").and_then(Value::as_str).unwrap_or(""), 1200),
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let url = github_api_url(&owner, &repo, endpoint);
+            let json = github_get_json(&c, &format!("{url}?state=open&per_page={limit}")).await?;
+            let mut out = format!(
+                "GitHub repo {endpoint}: {owner}/{repo}\nsearch_status: success\nsource: GitHub REST API /{endpoint}\nretrieved_at: {retrieved}\nstate: open\n\n"
+            );
+            if let Some(items) = json.as_array() {
+                if items.is_empty() {
+                    out.push_str("search_status: empty\nNo open items returned by GitHub.\n");
+                }
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}. #{} {}\n   created_date: {}\n   updated_date: {}\n   user: {}\n   comments: {}\n   url: {}\n   body: {}\n\n",
+                        i + 1,
+                        item.get("number").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("title").and_then(Value::as_str).unwrap_or("?"),
+                        provider_date_value(item.get("created_at").and_then(Value::as_str).map(|v| (v, "created_at"))),
+                        provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|v| (v, "updated_at"))),
+                        item.pointer("/user/login").and_then(Value::as_str).unwrap_or("unknown"),
+                        item.get("comments").and_then(Value::as_u64).unwrap_or(0),
+                        item.get("html_url").and_then(Value::as_str).unwrap_or(""),
+                        trunc(item.get("body").and_then(Value::as_str).unwrap_or(""), 900),
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        other => Err(format!(
+            "unknown github_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn repo_array_items(json: &Value) -> Option<&Vec<Value>> {
+    json.as_array()
+        .or_else(|| json.get("data").and_then(Value::as_array))
+}
+
+fn repo_item_url(item: &Value) -> String {
+    repo_text_value(item, &["html_url", "web_url", "url", "download_url"])
+}
+
+fn repo_item_number(item: &Value) -> String {
+    item.get("number")
+        .and_then(Value::as_u64)
+        .map(|value| format!("#{value}"))
+        .or_else(|| {
+            item.get("iid")
+                .and_then(Value::as_u64)
+                .map(|value| format!("!{value}"))
+        })
+        .or_else(|| {
+            item.get("number")
+                .and_then(Value::as_str)
+                .map(|value| format!("#{value}"))
+        })
+        .unwrap_or_default()
+}
+
+fn repo_u64_value(item: &Value, keys: &[&str]) -> u64 {
+    for key in keys {
+        if let Some(value) = item.get(*key).and_then(Value::as_u64) {
+            return value;
+        }
+    }
+    0
+}
+
+fn repo_topics(item: &Value) -> String {
+    item.get("topics")
+        .or_else(|| item.get("tag_list"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn format_hosted_repo_tree(
+    provider: &str,
+    repo_name: &str,
+    path: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+    limit: u32,
+) -> String {
+    let shown_path = if path.is_empty() { "." } else { path };
+    let mut out = format!(
+        "{provider} repo tree: {repo_name}/{shown_path}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\n\n",
+    );
+    if let Some(items) = json.as_array() {
+        for (i, item) in items.iter().take(limit as usize).enumerate() {
+            let size = item
+                .get("size")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            out.push_str(&format!(
+                "{}. {} {}\n   path: {}\n   size_bytes: {}\n   sha/id: {}\n   url: {}\n",
+                i + 1,
+                item.get("type").and_then(Value::as_str).unwrap_or("?"),
+                item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                item.get("path").and_then(Value::as_str).unwrap_or("?"),
+                size,
+                repo_text_value(item, &["sha", "id"]),
+                repo_item_url(item),
+            ));
+        }
+        if items.len() > limit as usize {
+            out.push_str(&format!(
+                "\ntruncated: true (showing {limit} of {} entries; pass max_results for more)\n",
+                items.len()
+            ));
+        }
+    } else {
+        out.push_str("The requested path is not a directory; use action=file to read it.\n");
+    }
+    out
+}
+
+fn format_hosted_repo_file(
+    provider: &str,
+    repo_name: &str,
+    path: &str,
+    source: &str,
+    retrieved: &str,
+    encoding: &str,
+    bytes: &[u8],
+    sha: &str,
+    html_url: &str,
+) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    format!(
+        "{provider} repo file: {repo_name}/{path}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\nencoding: {encoding}\nsize_bytes: {}\nsha/id: {sha}\nhtml_url: {html_url}\n\n{}",
+        bytes.len(),
+        trunc(&text, 80_000),
+    )
+}
+
+fn decode_repo_content_base64(provider: &str, encoded: &str) -> Result<Vec<u8>, String> {
+    decode_github_base64(encoded)
+        .map_err(|_| format!("{provider} 文件内容不是合法 base64 或接口未返回 content 字段"))
+}
+
+fn format_hosted_repo_releases(
+    provider: &str,
+    repo_name: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+) -> String {
+    let mut out = format!(
+        "{provider} repo releases: {repo_name}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\n\n"
+    );
+    if let Some(items) = repo_array_items(json) {
+        if items.is_empty() {
+            out.push_str("search_status: empty\nNo releases returned by the provider.\n");
+        }
+        for (i, item) in items.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. {}{}\n   published_date: {}\n   created_date: {}\n   updated_date: {}\n   prerelease: {} | draft: {}\n   url: {}\n   notes: {}\n\n",
+                i + 1,
+                repo_text_value(item, &["tag_name", "tag"]),
+                item.get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| format!(" — {name}"))
+                    .unwrap_or_default(),
+                provider_date_value(item.get("released_at")
+                    .or_else(|| item.get("published_at"))
+                    .and_then(Value::as_str)
+                    .map(|value| (value, if item.get("released_at").is_some() { "released_at" } else { "published_at" }))),
+                provider_date_value(item.get("created_at").and_then(Value::as_str).map(|value| (value, "created_at"))),
+                provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|value| (value, "updated_at"))),
+                item.get("prerelease").and_then(Value::as_bool).unwrap_or(false),
+                item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+                repo_item_url(item),
+                trunc(item.get("description")
+                    .or_else(|| item.get("body"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""), 1200),
+            ));
+        }
+    }
+    out
+}
+
+fn format_hosted_repo_items(
+    provider: &str,
+    repo_name: &str,
+    label: &str,
+    source: &str,
+    retrieved: &str,
+    json: &Value,
+) -> String {
+    let mut out = format!(
+        "{provider} repo {label}: {repo_name}\nsearch_status: success\nsource: {source}\nretrieved_at: {retrieved}\nstate: open\n\n"
+    );
+    if let Some(items) = repo_array_items(json) {
+        if items.is_empty() {
+            out.push_str("search_status: empty\nNo open items returned by the provider.\n");
+        }
+        for (i, item) in items.iter().enumerate() {
+            let number = repo_item_number(item);
+            out.push_str(&format!(
+                "{}. {} {}\n   created_date: {}\n   updated_date: {}\n   user: {}\n   comments: {}\n   url: {}\n   body: {}\n\n",
+                i + 1,
+                number,
+                item.get("title").and_then(Value::as_str).unwrap_or("?"),
+                provider_date_value(item.get("created_at").and_then(Value::as_str).map(|value| (value, "created_at"))),
+                provider_date_value(item.get("updated_at").and_then(Value::as_str).map(|value| (value, "updated_at"))),
+                item.pointer("/author/username")
+                    .or_else(|| item.pointer("/author/name"))
+                    .or_else(|| item.pointer("/user/login"))
+                    .or_else(|| item.pointer("/user/username"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                repo_u64_value(item, &["comments", "comments_count"]),
+                repo_item_url(item),
+                trunc(item.get("description")
+                    .or_else(|| item.get("body"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""), 900),
+            ));
+        }
+    }
+    out
+}
+
+fn format_gitlab_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["path_with_namespace", "name_with_namespace"]);
+    let dates = repository_date_lines("GitLab", repo, Some("last_activity_at"), retrieved);
+    format!(
+        concat!(
+            "GitLab repo overview: {}\n",
+            "search_status: success\n",
+            "source: GitLab REST API /projects/{{urlencoded path}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Topics: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "Visibility: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_topics(repo),
+        repo_u64_value(repo, &["star_count", "stars_count", "stargazers_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["visibility"]),
+        repo_text_value(repo, &["web_url", "html_url"]),
+        dates,
+    )
+}
+
+fn format_gitee_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["full_name", "human_name", "name"]);
+    let dates = repository_date_lines("Gitee", repo, Some("pushed_at"), retrieved);
+    format!(
+        concat!(
+            "Gitee repo overview: {}\n",
+            "search_status: success\n",
+            "source: Gitee REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_text_value(repo, &["language"]),
+        repo_u64_value(repo, &["stargazers_count", "stars_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["html_url", "web_url"]),
+        dates,
+    )
+}
+
+fn format_codeberg_repo_overview(repo: &Value, retrieved: &str) -> String {
+    let full_name = repo_text_value(repo, &["full_name", "name"]);
+    let dates = repository_date_lines("Codeberg", repo, None, retrieved);
+    format!(
+        concat!(
+            "Codeberg repo overview: {}\n",
+            "search_status: success\n",
+            "source: Codeberg/Gitea REST API /repos/{{owner}}/{{repo}}\n",
+            "retrieved_at: {}\n\n",
+            "Description: {}\n",
+            "Language: {}\n",
+            "Stars: {}\n",
+            "Forks: {}\n",
+            "Open issues: {}\n",
+            "Default branch: {}\n",
+            "URL: {}\n",
+            "{}"
+        ),
+        full_name,
+        retrieved,
+        repo.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        repo_text_value(repo, &["language"]),
+        repo_u64_value(repo, &["stars_count", "stargazers_count"]),
+        repo_u64_value(repo, &["forks_count"]),
+        repo_u64_value(repo, &["open_issues_count"]),
+        repo_text_value(repo, &["default_branch"]),
+        repo_text_value(repo, &["html_url", "web_url"]),
+        dates,
+    )
+}
+
+fn gitlab_project_id(owner: &str, repo: &str) -> String {
+    url_query_component(&format!("{owner}/{repo}"))
+}
+
+fn gitlab_project_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let id = gitlab_project_id(owner, repo);
+    if suffix.is_empty() {
+        format!("https://gitlab.com/api/v4/projects/{id}")
+    } else {
+        format!("https://gitlab.com/api/v4/projects/{id}/{suffix}")
+    }
+}
+
+async fn gitlab_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "GitLab", gitlab_auth_header).await
+}
+
+async fn gitlab_read_raw_file(
+    c: &Client,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let url = gitlab_project_url(
+        owner,
+        repo,
+        &format!(
+            "repository/files/{}/raw?ref={}",
+            url_query_component(path),
+            url_query_component(branch),
+        ),
+    );
+    api_get_text(c, &url, "GitLab", gitlab_auth_header).await
+}
+
+/// Read a real GitLab.com public or token-authorized repository.
+#[tauri::command]
+pub async fn gitlab_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("gitlab_repo", &owner, &repo, true)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            Ok(format_gitlab_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let overview = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let mut last_error = String::new();
+            for candidate in ["README.md", "README.rst", "README.txt", "README", "readme.md"] {
+                match gitlab_read_raw_file(&c, &owner, &repo, candidate, branch).await {
+                    Ok(text) => {
+                        return Ok(format!(
+                            "GitLab repo README: {owner}/{repo}/{candidate}\nsearch_status: success\nsource: GitLab REST API /repository/files/raw\nretrieved_at: {retrieved}\nencoding: utf-8/raw\nsize_bytes: {}\nhtml_url: https://gitlab.com/{owner}/{repo}/-/blob/{}/{}\n\n{}",
+                            text.len(),
+                            url_query_component(branch).replace("%2F", "/"),
+                            url_query_component(candidate).replace("%2F", "/"),
+                            trunc(&text, 60_000),
+                        ));
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(format!(
+                "GitLab README not found via common names on branch {branch}: {last_error}"
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut url = gitlab_project_url(
+                &owner,
+                &repo,
+                &format!("repository/tree?per_page={limit}"),
+            );
+            if !branch.is_empty() {
+                url.push_str(&format!("&ref={}", url_query_component(branch)));
+            }
+            if !clean_path.is_empty() {
+                url.push_str(&format!("&path={}", url_query_component(&clean_path)));
+            }
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_tree(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "GitLab REST API /repository/tree",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "gitlab_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let overview = gitlab_get_json(&c, &gitlab_project_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let text = gitlab_read_raw_file(&c, &owner, &repo, &clean_path, branch).await?;
+            Ok(format!(
+                "GitLab repo file: {owner}/{repo}/{clean_path}\nsearch_status: success\nsource: GitLab REST API /repository/files/raw\nretrieved_at: {retrieved}\nencoding: utf-8/raw\nsize_bytes: {}\nsha/id: unknown\nhtml_url: https://gitlab.com/{owner}/{repo}/-/blob/{}/{}\n\n{}",
+                text.len(),
+                url_query_component(branch).replace("%2F", "/"),
+                url_query_component(&clean_path).replace("%2F", "/"),
+                trunc(&text, 80_000),
+            ))
+        }
+        "releases" => {
+            let url = gitlab_project_url(&owner, &repo, &format!("releases?per_page={limit}"));
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_releases(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                "GitLab REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let (endpoint, label) = if action == "pulls" {
+                ("merge_requests", "merge_requests")
+            } else {
+                ("issues", "issues")
+            };
+            let state = if action == "pulls" { "opened" } else { "opened" };
+            let url = gitlab_project_url(
+                &owner,
+                &repo,
+                &format!("{endpoint}?state={state}&per_page={limit}"),
+            );
+            let json = gitlab_get_json(&c, &url).await?;
+            Ok(format_hosted_repo_items(
+                "GitLab",
+                &format!("{owner}/{repo}"),
+                label,
+                &format!("GitLab REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown gitlab_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn gitee_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    let url = if suffix.is_empty() {
+        format!("https://gitee.com/api/v5/repos/{owner}/{repo}")
+    } else {
+        format!("https://gitee.com/api/v5/repos/{owner}/{repo}/{suffix}")
+    };
+    with_gitee_token(url)
+}
+
+async fn gitee_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "Gitee", |req| req).await
+}
+
+fn gitee_ref_query(branch: &str) -> String {
+    if branch.trim().is_empty() {
+        String::new()
+    } else {
+        format!("ref={}", url_query_component(branch.trim()))
+    }
+}
+
+/// Read a real Gitee public or token-authorized repository.
+#[tauri::command]
+pub async fn gitee_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("gitee_repo", &owner, &repo, false)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, "")).await?;
+            Ok(format_gitee_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let ref_query = gitee_ref_query(branch);
+            let suffix = if ref_query.is_empty() {
+                "readme".to_string()
+            } else {
+                format!("readme?{ref_query}")
+            };
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Gitee", encoded)?;
+            let file_path = json.get("path").and_then(Value::as_str).unwrap_or("README");
+            Ok(format!(
+                "Gitee repo README: {owner}/{repo}/{file_path}\nsearch_status: success\nsource: Gitee REST API /readme\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                repo_text_value(&json, &["encoding"]),
+                bytes.len(),
+                repo_text_value(&json, &["html_url"]),
+                trunc(&String::from_utf8_lossy(&bytes), 60_000),
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let encoded_path = url_query_component(&clean_path).replace("%2F", "/");
+            let mut suffix = if clean_path.is_empty() {
+                "contents/".to_string()
+            } else {
+                format!("contents/{encoded_path}")
+            };
+            let ref_query = gitee_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            Ok(format_hosted_repo_tree(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Gitee REST API /contents",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "gitee_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let mut suffix = format!(
+                "contents/{}",
+                url_query_component(&clean_path).replace("%2F", "/")
+            );
+            let ref_query = gitee_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = gitee_get_json(&c, &gitee_api_url(&owner, &repo, &suffix)).await?;
+            if json.as_array().is_some() {
+                return Err("gitee_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Gitee", encoded)?;
+            Ok(format_hosted_repo_file(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Gitee REST API /contents",
+                &retrieved,
+                &repo_text_value(&json, &["encoding"]),
+                &bytes,
+                &repo_text_value(&json, &["sha"]),
+                &repo_text_value(&json, &["html_url"]),
+            ))
+        }
+        "releases" => {
+            let json = gitee_get_json(
+                &c,
+                &gitee_api_url(&owner, &repo, &format!("releases?per_page={limit}")),
+            )
+            .await?;
+            Ok(format_hosted_repo_releases(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                "Gitee REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let json = gitee_get_json(
+                &c,
+                &gitee_api_url(
+                    &owner,
+                    &repo,
+                    &format!("{endpoint}?state=open&per_page={limit}"),
+                ),
+            )
+            .await?;
+            Ok(format_hosted_repo_items(
+                "Gitee",
+                &format!("{owner}/{repo}"),
+                endpoint,
+                &format!("Gitee REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown gitee_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
+}
+
+fn codeberg_api_url(owner: &str, repo: &str, suffix: &str) -> String {
+    let owner = url_query_component(owner);
+    let repo = url_query_component(repo);
+    if suffix.is_empty() {
+        format!("https://codeberg.org/api/v1/repos/{owner}/{repo}")
+    } else {
+        format!("https://codeberg.org/api/v1/repos/{owner}/{repo}/{suffix}")
+    }
+}
+
+async fn codeberg_get_json(c: &Client, url: &str) -> Result<Value, String> {
+    api_get_json(c, url, "Codeberg", codeberg_auth_header).await
+}
+
+fn codeberg_ref_query(branch: &str) -> String {
+    if branch.trim().is_empty() {
+        String::new()
+    } else {
+        format!("ref={}", url_query_component(branch.trim()))
+    }
+}
+
+async fn codeberg_read_content(
+    c: &Client,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    branch: &str,
+) -> Result<Value, String> {
+    let mut suffix = format!("contents/{}", url_query_component(path).replace("%2F", "/"));
+    let ref_query = codeberg_ref_query(branch);
+    if !ref_query.is_empty() {
+        suffix.push('?');
+        suffix.push_str(&ref_query);
+    }
+    codeberg_get_json(c, &codeberg_api_url(owner, repo, &suffix)).await
+}
+
+/// Read a real Codeberg/Gitea public or token-authorized repository.
+#[tauri::command]
+pub async fn codeberg_repo(
+    owner: String,
+    repo: String,
+    action: Option<String>,
+    path: Option<String>,
+    branch: Option<String>,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    let (owner, repo) = hosted_repo_ref("codeberg_repo", &owner, &repo, false)?;
+    let action = repo_reader_action(action);
+    let c = kclient()?;
+    let retrieved = retrieved_at();
+    let limit = max_results.unwrap_or(20).min(100);
+    let branch = branch.unwrap_or_default();
+    let branch = branch.trim();
+
+    match action.as_str() {
+        "overview" => {
+            let json = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, "")).await?;
+            Ok(format_codeberg_repo_overview(&json, &retrieved))
+        }
+        "readme" => {
+            let overview = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, "")).await?;
+            let default_branch = repo_text_value(&overview, &["default_branch"]);
+            let branch = if branch.is_empty() {
+                default_branch.as_str()
+            } else {
+                branch
+            };
+            let mut last_error = String::new();
+            for candidate in ["README.md", "README.rst", "README.txt", "README", "readme.md"] {
+                match codeberg_read_content(&c, &owner, &repo, candidate, branch).await {
+                    Ok(json) => {
+                        let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+                        let bytes = decode_repo_content_base64("Codeberg", encoded)?;
+                        return Ok(format!(
+                            "Codeberg repo README: {owner}/{repo}/{candidate}\nsearch_status: success\nsource: Codeberg/Gitea REST API /contents\nretrieved_at: {retrieved}\nencoding: {}\nsize_bytes: {}\nhtml_url: {}\n\n{}",
+                            repo_text_value(&json, &["encoding"]),
+                            bytes.len(),
+                            repo_text_value(&json, &["html_url"]),
+                            trunc(&String::from_utf8_lossy(&bytes), 60_000),
+                        ));
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(format!(
+                "Codeberg README not found via common names on branch {branch}: {last_error}"
+            ))
+        }
+        "tree" => {
+            let clean_path = path.unwrap_or_default().trim().trim_matches('/').to_string();
+            let mut suffix = if clean_path.is_empty() {
+                "contents/".to_string()
+            } else {
+                format!(
+                    "contents/{}",
+                    url_query_component(&clean_path).replace("%2F", "/")
+                )
+            };
+            let ref_query = codeberg_ref_query(branch);
+            if !ref_query.is_empty() {
+                suffix.push('?');
+                suffix.push_str(&ref_query);
+            }
+            let json = codeberg_get_json(&c, &codeberg_api_url(&owner, &repo, &suffix)).await?;
+            Ok(format_hosted_repo_tree(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Codeberg/Gitea REST API /contents",
+                &retrieved,
+                &json,
+                limit,
+            ))
+        }
+        "file" => {
+            let clean_path = path
+                .map(|p| p.trim().trim_matches('/').to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "codeberg_repo action=file 需要 path，例如 src/main.ts".to_string())?;
+            let json = codeberg_read_content(&c, &owner, &repo, &clean_path, branch).await?;
+            if json.as_array().is_some() {
+                return Err("codeberg_repo action=file 收到目录；请改用 action=tree".into());
+            }
+            let encoded = json.get("content").and_then(Value::as_str).unwrap_or("");
+            let bytes = decode_repo_content_base64("Codeberg", encoded)?;
+            Ok(format_hosted_repo_file(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                &clean_path,
+                "Codeberg/Gitea REST API /contents",
+                &retrieved,
+                &repo_text_value(&json, &["encoding"]),
+                &bytes,
+                &repo_text_value(&json, &["sha"]),
+                &repo_text_value(&json, &["html_url"]),
+            ))
+        }
+        "releases" => {
+            let json = codeberg_get_json(
+                &c,
+                &codeberg_api_url(&owner, &repo, &format!("releases?limit={limit}")),
+            )
+            .await?;
+            Ok(format_hosted_repo_releases(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                "Codeberg/Gitea REST API /releases",
+                &retrieved,
+                &json,
+            ))
+        }
+        "issues" | "pulls" => {
+            let endpoint = if action == "pulls" { "pulls" } else { "issues" };
+            let json = codeberg_get_json(
+                &c,
+                &codeberg_api_url(
+                    &owner,
+                    &repo,
+                    &format!("{endpoint}?state=open&limit={limit}"),
+                ),
+            )
+            .await?;
+            Ok(format_hosted_repo_items(
+                "Codeberg",
+                &format!("{owner}/{repo}"),
+                endpoint,
+                &format!("Codeberg/Gitea REST API /{endpoint}"),
+                &retrieved,
+                &json,
+            ))
+        }
+        other => Err(format!(
+            "unknown codeberg_repo action={other}; allowed: overview, readme, tree, file, releases, issues, pulls"
+        )),
+    }
 }
 
 // ── CVE / NVD vulnerability database ───────────────────────────────
@@ -801,7 +2544,8 @@ pub async fn stackoverflow_search(
     }
 
     let json: Value = resp.json().await.map_err(|e| format!("SO JSON: {e}"))?;
-    let mut out = String::from("Stack Overflow results:\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("Stack Overflow results:\nretrieved_at: {retrieved}\n\n");
 
     if let Some(items) = json["items"].as_array() {
         for (i, item) in items.iter().enumerate() {
@@ -815,9 +2559,15 @@ pub async fn stackoverflow_search(
                 .map(|t| t.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             let link = item["link"].as_str().unwrap_or("");
+            let published = unix_time_rfc3339(item.get("creation_date"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let updated = unix_time_rfc3339(item.get("last_edit_date"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let last_activity = unix_time_rfc3339(item.get("last_activity_date"))
+                .unwrap_or_else(|| "unknown".to_string());
 
             out.push_str(&format!(
-                "{}. {} {}\n   Score: {} | Answers: {} | Views: {} | Tags: [{}]\n   {}\n\n",
+                "{}. {} {}\n   Score: {} | Answers: {} | Views: {} | Tags: [{}]\n   published_date: {}\n   updated_date: {}\n   last_activity_date: {}\n   retrieved_at: {}\n   {}\n\n",
                 i + 1,
                 if answered { "✅" } else { "❓" },
                 title,
@@ -825,11 +2575,15 @@ pub async fn stackoverflow_search(
                 answers,
                 views,
                 tags.join(", "),
+                published,
+                updated,
+                last_activity,
+                retrieved,
                 link,
             ));
         }
         if items.is_empty() {
-            out.push_str("(no results)\n");
+            out.push_str("search_status: empty\n(no results)\n");
         }
     }
     let quota = json["quota_remaining"].as_u64().unwrap_or(0);
@@ -865,9 +2619,17 @@ pub async fn hackernews_search(
         .await
         .map_err(|e| format!("HN: {e}"))?;
 
+    if !resp.status().is_success() {
+        return Err(format!("HN returned {}", resp.status()));
+    }
+
     let json: Value = resp.json().await.map_err(|e| format!("HN JSON: {e}"))?;
     let total = json["nbHits"].as_u64().unwrap_or(0);
-    let mut out = format!("Hacker News: {total} results\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("Hacker News: {total} results\nretrieved_at: {retrieved}\n\n");
+    if total == 0 {
+        out.push_str("search_status: empty\n");
+    }
 
     if let Some(hits) = json["hits"].as_array() {
         for (i, h) in hits.iter().enumerate() {
@@ -875,20 +2637,184 @@ pub async fn hackernews_search(
             let points = h["points"].as_u64().unwrap_or(0);
             let comments = h["num_comments"].as_u64().unwrap_or(0);
             let author = h["author"].as_str().unwrap_or("?");
-            let date = h["created_at"]
-                .as_str()
-                .and_then(|s| s.get(..10))
-                .unwrap_or("?");
+            let published = value_or_unknown(h["created_at"].as_str());
             let url = h["url"].as_str().unwrap_or("");
             let hn_id = h["objectID"].as_str().unwrap_or("");
 
             out.push_str(&format!(
-                "{}. {} ({}pts, {}comments)\n   By: {} | Date: {}\n   {}\n   HN: https://news.ycombinator.com/item?id={}\n\n",
-                i + 1, title, points, comments, author, date, url, hn_id,
+                "{}. {} ({}pts, {}comments)\n   By: {}\n   published_date: {}\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   {}\n   HN: https://news.ycombinator.com/item?id={}\n\n",
+                i + 1, title, points, comments, author, published, retrieved, url, hn_id,
             ));
         }
     }
     Ok(out)
+}
+
+// ── Official language-community Discourse forums ───────────────────
+
+fn parse_discourse_search(
+    payload: &Value,
+    source: DiscourseSource,
+    query: &str,
+    limit: u32,
+    retrieved: &str,
+) -> Result<String, String> {
+    if let Some(error) = payload
+        .pointer("/grouped_search_result/error")
+        .and_then(Value::as_str)
+        .filter(|error| !error.trim().is_empty())
+    {
+        return Err(format!("{} search error: {error}", source.label));
+    }
+
+    let posts = payload
+        .get("posts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{}: response did not contain a posts array", source.label))?;
+    let topics = payload
+        .get("topics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{}: response did not contain a topics array", source.label))?;
+    let topics_by_id: HashMap<u64, &Value> = topics
+        .iter()
+        .filter_map(|topic| {
+            topic
+                .get("id")
+                .and_then(Value::as_u64)
+                .map(|id| (id, topic))
+        })
+        .collect();
+
+    let mut out = format!(
+        "{} official Discourse search for '{query}':\nsource: {}\nretrieved_at: {retrieved}\n\n",
+        source.label, source.key,
+    );
+    if posts.is_empty() {
+        out.push_str("search_status: empty\nNo matching public posts were returned.\n");
+        return Ok(out);
+    }
+
+    for (index, post) in posts.iter().take(limit as usize).enumerate() {
+        let topic_id = post.get("topic_id").and_then(Value::as_u64);
+        let topic = topic_id.and_then(|id| topics_by_id.get(&id).copied());
+        let title = topic
+            .and_then(|topic| topic.get("title").and_then(Value::as_str))
+            .or_else(|| post.get("topic_title").and_then(Value::as_str))
+            .unwrap_or("(title unavailable)");
+        let slug = topic
+            .and_then(|topic| topic.get("slug").and_then(Value::as_str))
+            .unwrap_or("");
+        let post_number = post.get("post_number").and_then(Value::as_u64).unwrap_or(1);
+        let url = match topic_id {
+            Some(id) if !slug.is_empty() => {
+                format!("{}/t/{slug}/{id}/{post_number}", source.base_url)
+            }
+            Some(id) => format!("{}/t/{id}/{post_number}", source.base_url),
+            None => source.base_url.to_string(),
+        };
+        let author = post
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let blurb = strip_html(post.get("blurb").and_then(Value::as_str).unwrap_or(""));
+        let published = value_or_unknown(post.get("created_at").and_then(Value::as_str));
+        let updated = value_or_unknown(post.get("updated_at").and_then(Value::as_str));
+        let last_activity = value_or_unknown(
+            topic.and_then(|topic| topic.get("last_posted_at").and_then(Value::as_str)),
+        );
+        let replies = topic
+            .and_then(|topic| topic.get("reply_count").and_then(Value::as_u64))
+            .or_else(|| {
+                topic
+                    .and_then(|topic| topic.get("posts_count").and_then(Value::as_u64))
+                    .map(|posts| posts.saturating_sub(1))
+            })
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        out.push_str(&format!(
+            "{}. {}\n   author: {} | replies: {}\n   {}\n   published_date: {}\n   updated_date: {}\n   last_activity_date: {}\n   retrieved_at: {}\n   {}\n\n",
+            index + 1,
+            strip_html(title),
+            author,
+            replies,
+            trunc(&blurb, 240),
+            published,
+            updated,
+            last_activity,
+            retrieved,
+            url,
+        ));
+    }
+    Ok(out)
+}
+
+async fn discourse_search(
+    query: String,
+    max_results: Option<u32>,
+    source: DiscourseSource,
+) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(format!(
+            "{} search requires a non-empty query",
+            source.label
+        ));
+    }
+    let client = kclient()?;
+    let response = client
+        .get(format!("{}/search.json", source.base_url))
+        .query(&[("q", query)])
+        .send()
+        .await
+        .map_err(|error| format!("{}: {error}", source.label))?;
+    let status = response.status();
+    if status.as_u16() == 429 {
+        return Err(format!("{} rate limited (HTTP 429)", source.label));
+    }
+    if !status.is_success() {
+        return Err(format!("{} returned HTTP {status}", source.label));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{} JSON: {error}", source.label))?;
+    parse_discourse_search(
+        &payload,
+        source,
+        query,
+        max_results.unwrap_or(10).clamp(1, 20),
+        &retrieved_at(),
+    )
+}
+
+#[tauri::command]
+pub async fn rust_users_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    discourse_search(query, max_results, RUST_USERS_DISCOURSE).await
+}
+
+#[tauri::command]
+pub async fn python_discussions_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    discourse_search(query, max_results, PYTHON_DISCOURSE).await
+}
+
+#[tauri::command]
+pub async fn swift_forums_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    discourse_search(query, max_results, SWIFT_DISCOURSE).await
+}
+
+#[tauri::command]
+pub async fn kotlin_discussions_search(
+    query: String,
+    max_results: Option<u32>,
+) -> Result<String, String> {
+    discourse_search(query, max_results, KOTLIN_DISCOURSE).await
 }
 
 // ── Federated developer-community search ───────────────────────────
@@ -914,8 +2840,13 @@ pub async fn developer_community_search(
     let mut pending: FuturesUnordered<CommunitySearchFuture> = FuturesUnordered::new();
 
     for source in &selected {
+        let source_key = *source;
+        let source_label = DEVELOPER_COMMUNITY_SOURCES
+            .iter()
+            .find_map(|(key, label)| (*key == source_key).then_some(*label))
+            .expect("selected developer source must have a label");
         let q = query.clone();
-        let future: CommunitySearchFuture = match *source {
+        let adapter: CommunityAdapterFuture = match source_key {
             "github" => Box::pin(async move {
                 (
                     "github",
@@ -974,6 +2905,34 @@ pub async fn developer_community_search(
                     segmentfault_search(q, Some(limit)).await,
                 )
             }),
+            "rust_users" => Box::pin(async move {
+                (
+                    "rust_users",
+                    "Rust Users Forum",
+                    rust_users_search(q, Some(limit)).await,
+                )
+            }),
+            "python_discussions" => Box::pin(async move {
+                (
+                    "python_discussions",
+                    "Python Discussions",
+                    python_discussions_search(q, Some(limit)).await,
+                )
+            }),
+            "swift_forums" => Box::pin(async move {
+                (
+                    "swift_forums",
+                    "Swift Forums",
+                    swift_forums_search(q, Some(limit)).await,
+                )
+            }),
+            "kotlin_discussions" => Box::pin(async move {
+                (
+                    "kotlin_discussions",
+                    "Kotlin Discussions",
+                    kotlin_discussions_search(q, Some(limit)).await,
+                )
+            }),
             "gitlab" => {
                 Box::pin(async move { ("gitlab", "GitLab", gitlab_search(q, Some(limit)).await) })
             }
@@ -1002,11 +2961,14 @@ pub async fn developer_community_search(
                 )
             }),
             "github_trending" => Box::pin(async move {
-                (
-                    "github_trending",
-                    "GitHub Trending",
-                    github_trending(q, Some(limit)).await,
-                )
+                let result = match aggregate_trending_language(&q) {
+                    Some(language) => github_trending(language.to_string(), Some(limit)).await,
+                    None => Ok(
+                        "search_status: empty\nGitHub Trending is language discovery, not keyword search. The aggregate skipped it because this query is not a recognized single language; no invalid trending URL was requested."
+                            .to_string(),
+                    ),
+                };
+                ("github_trending", "GitHub Trending", result)
             }),
             "producthunt" => Box::pin(async move {
                 (
@@ -1034,41 +2996,105 @@ pub async fn developer_community_search(
             }),
             _ => continue,
         };
-        pending.push(future);
+        pending.push(Box::pin(community_source_with_timeout(
+            source_key,
+            source_label,
+            adapter,
+            COMMUNITY_SOURCE_TIMEOUT,
+        )));
     }
 
     let mut responses = Vec::with_capacity(selected.len());
     while let Some(response) = pending.next().await {
-        responses.push(response);
+        responses.push((response.0, response.1, response.2, retrieved_at()));
     }
-    responses.sort_by_key(|(key, _, _)| {
+    Ok(format_developer_community_results(
+        &query,
+        &selected,
+        responses,
+        &retrieved_at(),
+    ))
+}
+
+fn format_developer_community_results(
+    query: &str,
+    selected: &[&'static str],
+    mut responses: Vec<CommunitySearchResponse>,
+    aggregate_retrieved_at: &str,
+) -> String {
+    responses.sort_by_key(|(key, _, _, _)| {
         selected
             .iter()
             .position(|selected_key| selected_key == key)
             .unwrap_or(usize::MAX)
     });
 
-    let completed = responses
+    let success = responses
         .iter()
-        .filter(|(_, _, result)| result.is_ok())
+        .filter(|(_, _, result, _)| {
+            community_result_status(result) == CommunitySourceStatus::Success
+        })
         .count();
-    let failed = responses.len().saturating_sub(completed);
+    let empty = responses
+        .iter()
+        .filter(|(_, _, result, _)| community_result_status(result) == CommunitySourceStatus::Empty)
+        .count();
+    let rate_limited = responses
+        .iter()
+        .filter(|(_, _, result, _)| {
+            community_result_status(result) == CommunitySourceStatus::RateLimited
+        })
+        .count();
+    let failed = responses
+        .iter()
+        .filter(|(_, _, result, _)| {
+            community_result_status(result) == CommunitySourceStatus::Failed
+        })
+        .count();
+    let timed_out = responses
+        .iter()
+        .filter(|(_, _, result, _)| {
+            community_result_status(result) == CommunitySourceStatus::Timeout
+        })
+        .count();
+    let completed = success + empty;
+    let failed_requests = failed + rate_limited + timed_out;
     let mut out = format!(
-        "Developer community live search\nQuery: {query}\nRequested sources: {}; completed searches: {completed}; failed requests: {failed}.\n\
-         A completed search may use a source API or a clearly labelled public site search, and may return no matches. It does not make community posts verified facts; inspect original pages and cross-check important claims.\n",
-        responses.len()
+        "Developer community search\nQuery: {query}\nretrieved_at: {aggregate_retrieved_at}\nRequested sources: {}; completed searches: {completed}; failed requests: {failed_requests}.\n\
+         Status counts: success={success}; empty={empty}; rate-limited={rate_limited}; failed={failed}; timeout={timed_out}.\n\
+         The five source statuses are success, empty, rate-limited, failed, and timeout; timeout is reported separately and counts as a failed request. Sources run concurrently with an independent {} ms hard deadline, so source collection is bounded to about 12 seconds plus scheduling and formatting overhead.\n\
+         Per-source retrieved_at is when that adapter finished, failed, or reached the local hard deadline. It is not published_date, created_date, updated_date, or last_activity_date. Missing provider dates remain unknown.\n\
+         This request executed now, but source content may come from provider indexes or caches and is not necessarily current. A successful search may use a source API or a clearly labelled public site search. Community posts are not verified facts; inspect original pages and cross-check important claims.\n",
+        responses.len(),
+        COMMUNITY_SOURCE_TIMEOUT.as_millis(),
     );
 
-    for (_, label, result) in responses {
+    for (_, label, result, source_retrieved_at) in responses {
+        let status = community_result_status(&result);
+        let legacy_status = match status {
+            CommunitySourceStatus::Success | CommunitySourceStatus::Empty => "search completed",
+            CommunitySourceStatus::RateLimited
+            | CommunitySourceStatus::Failed
+            | CommunitySourceStatus::Timeout => "failed",
+        };
+        out.push_str(&format!(
+            "\n## {label} [{legacy_status}; status={}]\nretrieved_at: {source_retrieved_at}\n",
+            status.as_str(),
+        ));
         match result {
-            Ok(content) => out.push_str(&format!(
-                "\n## {label} [search completed]\n{}\n",
-                trunc(&content, 900)
+            CommunitySearchOutcome::Finished(Ok(content)) => {
+                out.push_str(&format!("{}\n", trunc(&content, 1200)))
+            }
+            CommunitySearchOutcome::Finished(Err(error)) => {
+                out.push_str(&format!("{}\n", trunc(&error, 500)))
+            }
+            CommunitySearchOutcome::TimedOut { after } => out.push_str(&format!(
+                "search_status: timeout\ntimeout_ms: {}\nThe source did not finish within its per-source hard deadline; pending work was cancelled.\n",
+                after.as_millis(),
             )),
-            Err(error) => out.push_str(&format!("\n## {label} [failed]\n{}\n", trunc(&error, 500))),
         }
     }
-    Ok(out)
+    out
 }
 
 // ── PubMed (NCBI E-utilities) ─────────────────────────────────────
@@ -1672,12 +3698,23 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
         .query(&[
             ("search", &query),
             ("per_page", &n.to_string()),
-            ("order_by", &"stars_count".to_string()),
+            ("order_by", &"star_count".to_string()),
             ("sort", &"desc".to_string()),
         ])
         .send()
         .await
         .map_err(|e| format!("GitLab: {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("GitLab rate limited (HTTP 429)".into());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "GitLab returned HTTP {status}: {}",
+            trunc(body.trim(), 240)
+        ));
+    }
     let data: Value = resp
         .json()
         .await
@@ -1686,7 +3723,8 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
     if arr.is_empty() {
         return Ok(format!("No GitLab projects found for '{query}'"));
     }
-    let mut out = format!("GitLab projects for '{query}':\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("GitLab projects for '{query}':\nretrieved_at: {retrieved}\n\n");
     for (i, r) in arr.iter().enumerate() {
         let name = r["path_with_namespace"].as_str().unwrap_or("?");
         let desc = r["description"].as_str().unwrap_or("");
@@ -1702,16 +3740,21 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
             })
             .unwrap_or_default();
         let url = r["web_url"].as_str().unwrap_or("");
-        let updated = r["last_activity_at"].as_str().unwrap_or("");
+        let created = value_or_unknown(r["created_at"].as_str());
+        let updated = value_or_unknown(r["updated_at"].as_str());
+        let last_activity = value_or_unknown(r["last_activity_at"].as_str());
         out.push_str(&format!(
-            "{}. {}\n   {}\n   Stars: {} | Forks: {} | Topics: {}\n   Updated: {}\n   {}\n\n",
+            "{}. {}\n   {}\n   Stars: {} | Forks: {} | Topics: {}\n   published_date: unknown (GitLab project search does not expose a publication date)\n   created_date: {}\n   updated_date: {}\n   last_activity_date: {}\n   retrieved_at: {}\n   {}\n\n",
             i + 1,
             name,
             trunc(desc, 150),
             stars,
             forks,
             if lang.is_empty() { "-" } else { &lang },
-            &updated[..updated.len().min(10)],
+            created,
+            updated,
+            last_activity,
+            retrieved,
             url
         ));
     }
@@ -1719,6 +3762,24 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
 }
 
 // ── Gitee ─────────────────────────────────────────────────────────
+
+fn format_gitee_repository_item(item: &Value, index: usize, retrieved: &str) -> String {
+    let name = item["full_name"]
+        .as_str()
+        .unwrap_or(item["name"].as_str().unwrap_or("?"));
+    let dates = repository_date_lines("Gitee", item, Some("pushed_at"), retrieved);
+    format!(
+        "{}. {}\n   {}\n   Stars: {} | Forks: {} | Lang: {}\n{}   {}\n\n",
+        index + 1,
+        name,
+        trunc(item["description"].as_str().unwrap_or(""), 150),
+        item["stargazers_count"].as_u64().unwrap_or(0),
+        item["forks_count"].as_u64().unwrap_or(0),
+        item["language"].as_str().unwrap_or("-"),
+        dates,
+        item["html_url"].as_str().unwrap_or(""),
+    )
+}
 
 #[tauri::command]
 pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<String, String> {
@@ -1735,33 +3796,24 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("Gitee: {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("Gitee rate limited (HTTP 429)".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Gitee returned HTTP {status}"));
+    }
     let data: Value = resp.json().await.map_err(|e| format!("Gitee parse: {e}"))?;
     let arr = data.as_array().ok_or("Gitee: unexpected response")?;
+    let retrieved = retrieved_at();
     if arr.is_empty() {
-        return Ok(format!("No Gitee repos found for '{query}'"));
-    }
-    let mut out = format!("Gitee repos for '{query}':\n\n");
-    for (i, r) in arr.iter().enumerate() {
-        let name = r["full_name"]
-            .as_str()
-            .unwrap_or(r["name"].as_str().unwrap_or("?"));
-        let desc = r["description"].as_str().unwrap_or("");
-        let stars = r["stargazers_count"].as_u64().unwrap_or(0);
-        let forks = r["forks_count"].as_u64().unwrap_or(0);
-        let lang = r["language"].as_str().unwrap_or("-");
-        let url = r["html_url"].as_str().unwrap_or("");
-        let updated = r["updated_at"].as_str().unwrap_or("");
-        out.push_str(&format!(
-            "{}. {}\n   {}\n   Stars: {} | Forks: {} | Lang: {}\n   Updated: {}\n   {}\n\n",
-            i + 1,
-            name,
-            trunc(desc, 150),
-            stars,
-            forks,
-            lang,
-            &updated[..updated.len().min(10)],
-            url
+        return Ok(format!(
+            "Gitee repos for '{query}':\nretrieved_at: {retrieved}\nsearch_status: empty\nNo matching repositories were returned."
         ));
+    }
+    let mut out = format!("Gitee repos for '{query}':\nretrieved_at: {retrieved}\n\n");
+    for (i, r) in arr.iter().enumerate() {
+        out.push_str(&format_gitee_repository_item(r, i, &retrieved));
     }
     Ok(out)
 }
@@ -2177,7 +4229,8 @@ pub async fn reddit_search(
     if posts.is_empty() {
         return Ok(format!("No Reddit posts found for '{query}'"));
     }
-    let mut out = format!("Reddit results for '{query}':\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("Reddit results for '{query}':\nretrieved_at: {retrieved}\n\n");
     for (i, p) in posts.iter().enumerate() {
         let d = &p["data"];
         let title = d["title"].as_str().unwrap_or("?");
@@ -2187,8 +4240,11 @@ pub async fn reddit_search(
         let author = d["author"].as_str().unwrap_or("?");
         let selftext = d["selftext"].as_str().unwrap_or("");
         let permalink = d["permalink"].as_str().unwrap_or("");
+        let published =
+            unix_time_rfc3339(d.get("created_utc")).unwrap_or_else(|| "unknown".to_string());
+        let updated = unix_time_rfc3339(d.get("edited")).unwrap_or_else(|| "unknown".to_string());
         out.push_str(&format!(
-            "{}. [r/{}] {}\n   by u/{} | ⬆️{} | 💬{}\n   {}\n   https://reddit.com{}\n\n",
+            "{}. [r/{}] {}\n   by u/{} | ⬆️{} | 💬{}\n   {}\n   published_date: {}\n   updated_date: {}\n   last_activity_date: unknown\n   retrieved_at: {}\n   https://reddit.com{}\n\n",
             i + 1,
             sub,
             title,
@@ -2196,10 +4252,57 @@ pub async fn reddit_search(
             score,
             comments,
             trunc(selftext, 150),
+            published,
+            updated,
+            retrieved,
             permalink
         ));
     }
     Ok(out)
+}
+
+// ── Deal / second-hand marketplace public searches ───────────────
+
+#[tauri::command]
+pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("smzdm_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://search.smzdm.com/?c=home&s={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "smzdm.com", None, "什么值得买/SMZDM", n, &direct).await
+}
+
+#[tauri::command]
+pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("xianyu_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://www.goofish.com/search?q={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "goofish.com", None, "闲鱼/Goofish", n, &direct).await
+}
+
+#[tauri::command]
+pub async fn zhuanzhuan_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("zhuanzhuan_search requires a non-empty query".into());
+    }
+    let n = max_results.unwrap_or(10).min(20);
+    let direct = format!(
+        "https://www.zhuanzhuan.com/search?keyword={}",
+        url_query_component(q)
+    );
+    public_site_search(q, "zhuanzhuan.com", None, "转转/Zhuanzhuan", n, &direct).await
 }
 
 // ── Steam (game search) ──────────────────────────────────────────
@@ -2381,28 +4484,40 @@ pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<St
         return Err(format!("掘金 returned {}", resp.status()));
     }
     let json: Value = resp.json().await.map_err(|e| format!("掘金 JSON: {e}"))?;
-    let mut out = String::from("掘金 (Juejin) articles:\n\n");
-    if let Some(data) = json["data"].as_array() {
-        for (i, item) in data.iter().take(limit as usize).enumerate() {
-            let rm = &item["result_model"];
-            let info = &rm["article_info"];
-            let author = rm["author_user_info"]["user_name"].as_str().unwrap_or("?");
-            let title = info["title"].as_str().unwrap_or("?");
-            let brief = info["brief_content"].as_str().unwrap_or("");
-            let aid = info["article_id"].as_str().unwrap_or("");
-            let views = info["view_count"].as_u64().unwrap_or(0);
-            let likes = info["digg_count"].as_u64().unwrap_or(0);
-            out.push_str(&format!(
-                "{}. {} (by {})\n   {}\n   Views: {} | Likes: {} | https://juejin.cn/post/{}\n\n",
-                i + 1,
-                title,
-                author,
-                trunc(brief, 200),
-                views,
-                likes,
-                aid,
-            ));
-        }
+    let data = json["data"]
+        .as_array()
+        .ok_or("掘金: response did not contain a data array")?;
+    let retrieved = retrieved_at();
+    let mut out = format!("掘金 (Juejin) articles:\nretrieved_at: {retrieved}\n\n");
+    if data.is_empty() {
+        out.push_str("search_status: empty\nThe endpoint returned no public articles.\n");
+        return Ok(out);
+    }
+    for (i, item) in data.iter().take(limit as usize).enumerate() {
+        let rm = &item["result_model"];
+        let info = &rm["article_info"];
+        let author = rm["author_user_info"]["user_name"].as_str().unwrap_or("?");
+        let title = info["title"].as_str().unwrap_or("?");
+        let brief = info["brief_content"].as_str().unwrap_or("");
+        let aid = info["article_id"].as_str().unwrap_or("");
+        let views = info["view_count"].as_u64().unwrap_or(0);
+        let likes = info["digg_count"].as_u64().unwrap_or(0);
+        let published =
+            unix_time_rfc3339(info.get("ctime")).unwrap_or_else(|| "unknown".to_string());
+        let updated = unix_time_rfc3339(info.get("mtime")).unwrap_or_else(|| "unknown".to_string());
+        out.push_str(&format!(
+            "{}. {} (by {})\n   {}\n   Views: {} | Likes: {}\n   published_date: {}\n   updated_date: {}\n   last_activity_date: unknown\n   retrieved_at: {}\n   https://juejin.cn/post/{}\n\n",
+            i + 1,
+            title,
+            author,
+            trunc(brief, 200),
+            views,
+            likes,
+            published,
+            updated,
+            retrieved,
+            aid,
+        ));
     }
     Ok(out)
 }
@@ -2574,113 +4689,29 @@ pub async fn css_tricks_search(query: String, max_results: Option<u32>) -> Resul
 
 #[tauri::command]
 pub async fn codepen_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
-    let resp = c
-        .get("https://dev.to/api/articles")
-        .query(&[
-            ("per_page", n.to_string()),
-            ("tag", "codepen".into()),
-            ("top", "365".into()),
-        ])
-        .send()
-        .await;
-    let query_lower = query.to_lowercase();
-    let keywords: Vec<&str> = query_lower.split_whitespace().collect();
-    let mut out = format!("CodePen-related articles & pens for '{query}':\n\n");
-    let mut count = 0;
-    if let Ok(r) = resp {
-        if let Ok(items) = r.json::<Vec<Value>>().await {
-            for a in &items {
-                let title = a["title"].as_str().unwrap_or("");
-                let desc = a["description"].as_str().unwrap_or("");
-                let haystack = format!("{} {}", title, desc).to_lowercase();
-                if !keywords.is_empty() && !keywords.iter().any(|k| haystack.contains(k)) {
-                    continue;
-                }
-                count += 1;
-                let url = a["url"].as_str().unwrap_or("");
-                let user = a["user"]["username"].as_str().unwrap_or("?");
-                out.push_str(&format!(
-                    "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count,
-                    title,
-                    user,
-                    trunc(desc, 150),
-                    url,
-                ));
-                if count >= n as usize {
-                    break;
-                }
-            }
-        }
-    }
-    out.push_str(&format!(
-        "Direct CodePen search: https://codepen.io/search/pens?q={}\nTip: use web_search with 'site:codepen.io {}' for more results, then web_fetch any pen URL to study its code.\n",
-        query.replace(' ', "+"), query,
-    ));
-    Ok(out)
+    let direct = format!(
+        "https://codepen.io/search/pens?q={}",
+        query.replace(' ', "+")
+    );
+    public_site_search(&query, "codepen.io", Some("/pen/"), "CodePen", n, &direct).await
 }
 
 // ── Dribbble (professional UI design inspiration) ───────────────────
 
 #[tauri::command]
 pub async fn dribbble_search(query: String, max_results: Option<u32>) -> Result<String, String> {
-    let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
-    let resp = c
-        .get("https://dev.to/api/articles")
-        .query(&[
-            ("per_page", n.to_string()),
-            ("tag", "design".into()),
-            ("top", "365".into()),
-        ])
-        .send()
-        .await;
-    let query_lower = query.to_lowercase();
-    let keywords: Vec<&str> = query_lower.split_whitespace().collect();
-    let mut out = format!("UI design articles & inspiration for '{query}':\n\n");
-    let mut count = 0;
-    if let Ok(r) = resp {
-        if let Ok(items) = r.json::<Vec<Value>>().await {
-            for a in &items {
-                let title = a["title"].as_str().unwrap_or("");
-                let desc = a["description"].as_str().unwrap_or("");
-                let tags = a["tag_list"]
-                    .as_array()
-                    .map(|t| {
-                        t.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                let haystack = format!("{} {} {}", title, desc, tags).to_lowercase();
-                if !keywords.is_empty() && !keywords.iter().any(|k| haystack.contains(k)) {
-                    continue;
-                }
-                count += 1;
-                let url = a["url"].as_str().unwrap_or("");
-                let user = a["user"]["username"].as_str().unwrap_or("?");
-                out.push_str(&format!(
-                    "{}. {} (by @{})\n   {}\n   {}\n\n",
-                    count,
-                    title,
-                    user,
-                    trunc(desc, 150),
-                    url,
-                ));
-                if count >= n as usize {
-                    break;
-                }
-            }
-        }
-    }
-    out.push_str(&format!(
-        "Dribbble search: https://dribbble.com/search/{}\nTip: use web_search with 'site:dribbble.com {}' for Dribbble shots, or 'UI design {}' for broader inspiration.\n",
-        query.replace(' ', "-"), query, query,
-    ));
-    Ok(out)
+    let direct = format!("https://dribbble.com/search/{}", query.replace(' ', "-"));
+    public_site_search(
+        &query,
+        "dribbble.com",
+        Some("/shots/"),
+        "Dribbble",
+        n,
+        &direct,
+    )
+    .await
 }
 
 // ── Awwwards (award-winning website designs) ────────────────────────
@@ -2733,6 +4764,58 @@ pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<
 
 // ── V2EX (Chinese developer community via SOV2EX search) ──────────
 
+fn ascii_search_terms(text: &str) -> HashSet<String> {
+    text.to_ascii_lowercase()
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '+' || character == '#')
+        })
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn v2ex_hit_matches_language_anchor(query: &str, source: &Value) -> bool {
+    const LANGUAGE_GROUPS: &[(&[&str], &[&str])] = &[
+        (&["rust"], &["rust", "cargo", "tokio"]),
+        (
+            &["python"],
+            &["python", "pytest", "django", "flask", "fastapi"],
+        ),
+        (&["swift"], &["swift", "swiftui"]),
+        (&["kotlin"], &["kotlin", "ktor"]),
+        (&["go", "golang"], &["go", "golang", "gopher"]),
+        (&["javascript", "js"], &["javascript", "js", "nodejs"]),
+        (&["typescript", "ts"], &["typescript", "ts"]),
+        (&["java"], &["java", "spring"]),
+        (&["ruby"], &["ruby", "rails"]),
+        (&["php"], &["php", "laravel"]),
+        (&["c#", "csharp"], &["c#", "csharp", "dotnet"]),
+        (&["c++", "cpp"], &["c++", "cpp"]),
+    ];
+    let query_terms = ascii_search_terms(query);
+    let active_groups = LANGUAGE_GROUPS
+        .iter()
+        .filter(|(query_aliases, _)| {
+            query_aliases
+                .iter()
+                .any(|alias| query_terms.contains(*alias))
+        })
+        .collect::<Vec<_>>();
+    if active_groups.is_empty() {
+        return true;
+    }
+
+    let searchable = format!(
+        "{} {}",
+        source.get("title").and_then(Value::as_str).unwrap_or(""),
+        source.get("content").and_then(Value::as_str).unwrap_or("")
+    );
+    let hit_terms = ascii_search_terms(&searchable);
+    active_groups
+        .iter()
+        .any(|(_, hit_aliases)| hit_aliases.iter().any(|alias| hit_terms.contains(*alias)))
+}
+
 #[tauri::command]
 pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
@@ -2747,29 +4830,51 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
         .send()
         .await
         .map_err(|e| format!("V2EX (SOV2EX): {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("V2EX (SOV2EX) rate limited (HTTP 429)".into());
+    }
+    if !status.is_success() {
+        return Err(format!("V2EX (SOV2EX) returned HTTP {status}"));
+    }
     let data: Value = resp.json().await.map_err(|e| format!("V2EX parse: {e}"))?;
     let total = data["total"].as_u64().unwrap_or(0);
     let hits = data["hits"].as_array();
     if total == 0 || hits.is_none() {
         return Ok(format!("No V2EX discussions found for '{query}'"));
     }
-    let mut out = format!("V2EX discussions for '{}' ({} total):\n\n", query, total);
-    for (i, hit) in hits.unwrap().iter().take(n as usize).enumerate() {
+    let retrieved = retrieved_at();
+    let mut out = format!(
+        "V2EX discussions for '{}' ({} total, via SOV2EX third-party index):\nretrieved_at: {retrieved}\n\n",
+        query, total
+    );
+    let relevant_hits = hits
+        .unwrap()
+        .iter()
+        .filter(|hit| v2ex_hit_matches_language_anchor(&query, &hit["_source"]))
+        .take(n as usize)
+        .collect::<Vec<_>>();
+    if relevant_hits.is_empty() {
+        out.push_str("search_status: empty\nThe third-party index returned hits, but none matched the explicit programming-language term in the query.\n");
+        return Ok(out);
+    }
+    for (i, hit) in relevant_hits.into_iter().enumerate() {
         let src = &hit["_source"];
         let id = src["id"].as_u64().unwrap_or(0);
         let title = strip_html(src["title"].as_str().unwrap_or("?"));
         let member = src["member"].as_str().unwrap_or("?");
         let replies = src["replies"].as_u64().unwrap_or(0);
-        let created = src["created"].as_str().unwrap_or("");
+        let created = value_or_unknown(src["created"].as_str());
         let content = src["content"].as_str().unwrap_or("");
         out.push_str(&format!(
-            "{}. {} (by @{}, {} replies)\n   {}\n   {} | https://www.v2ex.com/t/{}\n\n",
+            "{}. {} (by @{}, {} replies)\n   {}\n   published_date: {}\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   https://www.v2ex.com/t/{}\n\n",
             i + 1,
             title,
             member,
             replies,
             trunc(content, 200),
-            &created[..created.len().min(10)],
+            created,
+            retrieved,
             id,
         ));
     }
@@ -2787,10 +4892,17 @@ pub async fn segmentfault_search(
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = c
         .get("https://api.segmentfault.com/search")
-        .query(&[("q", query.as_str()), ("type", "article"), ("page", "1")])
+        .query(&[("q", query.as_str()), ("page", "1")])
         .send()
         .await
         .map_err(|e| format!("SegmentFault: {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("SegmentFault rate limited (HTTP 429)".into());
+    }
+    if !status.is_success() {
+        return Err(format!("SegmentFault returned HTTP {status}"));
+    }
     let data: Value = resp
         .json()
         .await
@@ -2799,8 +4911,22 @@ pub async fn segmentfault_search(
     if rows.is_none() || rows.unwrap().is_empty() {
         return Ok(format!("No SegmentFault results found for '{query}'"));
     }
-    let mut out = format!("SegmentFault (思否) results for '{}':\n\n", query);
-    for (i, row) in rows.unwrap().iter().take(n).enumerate() {
+    let content_rows = rows
+        .unwrap()
+        .iter()
+        .filter(|row| matches!(row["type"].as_str(), Some("question" | "article")))
+        .take(n)
+        .collect::<Vec<_>>();
+    if content_rows.is_empty() {
+        return Ok(format!(
+            "SegmentFault (思否) results for '{query}':\nsearch_status: empty\nThe endpoint returned no public question or article results."
+        ));
+    }
+    let retrieved = retrieved_at();
+    let mut out = format!(
+        "SegmentFault (思否) question and article results for '{query}':\nretrieved_at: {retrieved}\n\n"
+    );
+    for (i, row) in content_rows.into_iter().enumerate() {
         let rtype = row["type"].as_str().unwrap_or("article");
         let title = row["title"].as_str().unwrap_or("?");
         let excerpt = row["excerpt"].as_str().unwrap_or("");
@@ -2812,14 +4938,24 @@ pub async fn segmentfault_search(
         } else {
             "Article"
         };
+        let published = row["createdDate"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| unix_time_rfc3339(row.get("created")))
+            .unwrap_or_else(|| "unknown".to_string());
         out.push_str(&format!(
-            "{}. [{}] {} (by @{}, votes: {})\n   {}\n   https://segmentfault.com{}\n\n",
+            "{}. [{}] {} (by @{}, votes: {})\n   result_type: {}\n   {}\n   published_date: {}\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   https://segmentfault.com{}\n\n",
             i + 1,
             type_label,
             title,
             user,
             votes,
+            rtype,
             trunc(excerpt, 200),
+            published,
+            retrieved,
             path,
         ));
     }
@@ -2888,10 +5024,13 @@ pub async fn freecodecamp_search(
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    ensure_provider_http_success("freeCodeCamp", resp.status())?;
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut out = format!("FreeCodeCamp articles for '{query}':\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("FreeCodeCamp articles for '{query}':\nretrieved_at: {retrieved}\n\n");
+    let mut count = 0usize;
     if let Some(hits) = data["hits"].as_array() {
-        for (i, h) in hits.iter().enumerate() {
+        for (i, h) in hits.iter().take(n as usize).enumerate() {
             let title = h["title"].as_str().unwrap_or("");
             let url = h["url"].as_str().unwrap_or("");
             let author = h["author"]["name"]
@@ -2907,18 +5046,30 @@ pub async fn freecodecamp_search(
             } else {
                 format!(" [{}]", tags.join(", "))
             };
+            let published = freecodecamp_published_date(h);
+            let dates = provider_date_lines(
+                published
+                    .as_ref()
+                    .map(|(value, field)| (value.as_str(), *field)),
+                None,
+                None,
+                None,
+                &retrieved,
+            );
+            count += 1;
             out.push_str(&format!(
-                "{}. {} (by {}){}\n   {}\n\n",
+                "{}. {} (by {}){}\n{}   {}\n\n",
                 i + 1,
                 title,
                 author,
                 tag_str,
+                dates,
                 url
             ));
         }
     }
-    if out.ends_with(":\n\n") {
-        out.push_str("  No results found.\n");
+    if count == 0 {
+        out.push_str("search_status: empty\nNo results found.\n");
     }
     Ok(out)
 }
@@ -2928,14 +5079,7 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
     let c = kclient()?;
     let n = max_results.unwrap_or(15).min(25) as usize;
     let lang = query.trim();
-    let url = if lang.is_empty() || lang == "all" {
-        "https://github.com/trending?since=weekly".to_string()
-    } else {
-        format!(
-            "https://github.com/trending/{}?since=weekly",
-            lang.to_lowercase().replace(' ', "-")
-        )
-    };
+    let url = github_trending_url(lang)?;
     let mut html = String::new();
     let mut last_err = String::from("unknown");
     for attempt in 0..3 {
@@ -2968,8 +5112,9 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
     if html.is_empty() {
         return Err(format!("all retries exhausted: {}", last_err));
     }
+    let retrieved = retrieved_at();
     let mut out = format!(
-        "GitHub Trending repos (weekly, {}):\n\n",
+        "GitHub Trending repos (weekly, {}):\nretrieved_at: {retrieved}\n\n",
         if lang.is_empty() || lang == "all" {
             "all languages"
         } else {
@@ -3076,10 +5221,11 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
         if !desc.is_empty() {
             out.push_str(&format!("   {}\n", desc));
         }
+        out.push_str(&provider_date_lines(None, None, None, None, &retrieved));
         out.push_str(&format!("   https://github.com/{}\n\n", repo));
     }
     if count == 0 {
-        out.push_str("  No trending repos found for this language.\n");
+        out.push_str(GITHUB_TRENDING_EMPTY_NOTICE);
     }
     out.push_str(&format!("Browse: {}\n", url));
     Ok(out)
@@ -3089,7 +5235,7 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
 pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let c = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
-    let html = c
+    let resp = c
         .get("https://www.infoq.com/search.action")
         .query(&[
             ("queryString", query.as_str()),
@@ -3102,11 +5248,11 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
         )
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
         .map_err(|e| e.to_string())?;
-    let mut out = format!("InfoQ articles for '{query}':\n\n");
+    ensure_provider_http_success("InfoQ", resp.status())?;
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+    let retrieved = retrieved_at();
+    let mut out = format!("InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n");
     let mut count = 0;
     // Parse search result links: <a href="/articles/..." or <a href="/news/..."
     let patterns = ["href=\"/articles/", "href=\"/news/"];
@@ -3152,19 +5298,32 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
             };
             count += 1;
             out.push_str(&format!(
-                "{}. {}\n   https://www.infoq.com{}\n\n",
-                count, title, path
+                "{}. {}\n{}   https://www.infoq.com{}\n\n",
+                count,
+                title,
+                provider_date_lines(None, None, None, None, &retrieved),
+                path
             ));
         }
     }
     if count == 0 {
-        out.push_str("  No results found.\n");
+        out.push_str("search_status: empty\nNo results found in the successful InfoQ response.\n");
     }
     out.push_str(&format!(
         "InfoQ search: https://www.infoq.com/search/?q={}\n",
         query.replace(' ', "+"),
     ));
     Ok(out)
+}
+
+fn ensure_provider_http_success(provider: &str, status: reqwest::StatusCode) -> Result<(), String> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Err(format!("{provider} rate-limited (HTTP 429)"))
+    } else if !status.is_success() {
+        Err(format!("{provider} returned HTTP {status}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn html_decode(s: &str) -> String {
@@ -3181,9 +5340,12 @@ fn html_decode(s: &str) -> String {
 pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let n = max_results.unwrap_or(10).min(20);
     let search_query = format!("site:hackernoon.com {query}");
-    let hits = ddg_surface(&search_query).await;
+    let hits = ddg_surface_checked(&search_query)
+        .await
+        .map_err(|error| format!("HackerNoon public search: {error}"))?;
+    let retrieved = retrieved_at();
     let mut out = format!(
-        "HackerNoon pages for '{query}' (via public web search, not a HackerNoon API):\n\n"
+        "HackerNoon pages for '{query}' (via public web search, not a HackerNoon API):\nretrieved_at: {retrieved}\n\n"
     );
     let mut count = 0usize;
     for (title, url, snippet, _) in hits {
@@ -3192,10 +5354,11 @@ pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Resul
         }
         count += 1;
         out.push_str(&format!(
-            "{}. {}\n   {}\n   {}\n\n",
+            "{}. {}\n   {}\n   published_date: unknown\n   updated_date: unknown\n   last_activity_date: unknown\n   retrieved_at: {}\n   {}\n\n",
             count,
             title,
             trunc(&snippet, 180),
+            retrieved,
             url,
         ));
         if count >= n as usize {
@@ -3204,7 +5367,7 @@ pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Resul
     }
     if count == 0 {
         out.push_str(
-            "No matching page was returned. This can mean no match or that the public search endpoint was unavailable.\n\n",
+            "search_status: empty\nThe public-search response contained no usable matching page. This can mean no match, an index coverage gap, or an unrecognized result layout; it does not prove HackerNoon has no matching content.\n\n",
         );
     }
     out.push_str(&format!(
@@ -3212,6 +5375,39 @@ pub async fn hackernoon_search(query: String, max_results: Option<u32>) -> Resul
         query.replace(' ', "+"),
     ));
     Ok(out)
+}
+
+fn format_codeberg_repository_item(item: &Value, index: usize, retrieved: &str) -> String {
+    let name = item["full_name"].as_str().unwrap_or("?");
+    let description = item["description"].as_str().unwrap_or("");
+    let stars = item["stars_count"].as_u64().unwrap_or(0);
+    let language = item["language"].as_str().unwrap_or("");
+    let topics: Vec<&str> = item["topics"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let language_tag = if language.is_empty() {
+        String::new()
+    } else {
+        format!(" [{language}]")
+    };
+    let topic_text = if topics.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", topics.join(", "))
+    };
+    let dates = repository_date_lines("Codeberg", item, None, retrieved);
+    format!(
+        "{}. {} ★{}{}{}\n   {}\n{}   {}\n\n",
+        index + 1,
+        name,
+        stars,
+        language_tag,
+        topic_text,
+        trunc(description, 150),
+        dates,
+        item["html_url"].as_str().unwrap_or(""),
+    )
 }
 
 #[tauri::command]
@@ -3228,43 +5424,23 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("Codeberg rate limited (HTTP 429)".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Codeberg returned HTTP {status}"));
+    }
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut out = format!("Codeberg repos for '{query}':\n\n");
+    let retrieved = retrieved_at();
+    let mut out = format!("Codeberg repos for '{query}':\nretrieved_at: {retrieved}\n\n");
     if let Some(repos) = data["data"].as_array() {
         for (i, r) in repos.iter().enumerate() {
-            let name = r["full_name"].as_str().unwrap_or("?");
-            let desc = r["description"].as_str().unwrap_or("");
-            let stars = r["stars_count"].as_u64().unwrap_or(0);
-            let lang = r["language"].as_str().unwrap_or("");
-            let url = r["html_url"].as_str().unwrap_or("");
-            let topics: Vec<&str> = r["topics"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let lang_tag = if lang.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", lang)
-            };
-            let topic_str = if topics.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", topics.join(", "))
-            };
-            out.push_str(&format!(
-                "{}. {} ★{}{}{}\n   {}\n   {}\n\n",
-                i + 1,
-                name,
-                stars,
-                lang_tag,
-                topic_str,
-                trunc(desc, 150),
-                url,
-            ));
+            out.push_str(&format_codeberg_repository_item(r, i, &retrieved));
         }
     }
-    if out.ends_with(":\n\n") {
-        out.push_str("  No results found.\n");
+    if data["data"].as_array().is_none_or(Vec::is_empty) {
+        out.push_str("search_status: empty\nNo matching repositories were returned.\n");
     }
     out.push_str(&format!(
         "Codeberg search: https://codeberg.org/explore/repos?q={}\n",
@@ -3282,10 +5458,12 @@ pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    ensure_provider_http_success("Best of JS", resp.status())?;
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let retrieved = retrieved_at();
     let query_lower = query.to_lowercase();
     let keywords: Vec<&str> = query_lower.split_whitespace().collect();
-    let mut out = format!("Best of JS projects for '{query}':\n\n");
+    let mut out = format!("Best of JS projects for '{query}':\nretrieved_at: {retrieved}\n\n");
     let mut count = 0;
     if let Some(projects) = data["projects"].as_array() {
         for p in projects {
@@ -3316,19 +5494,36 @@ pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<
             } else {
                 format!(" [{}]", tags.join(", "))
             };
+            let created = p
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let pushed = p
+                .get("pushed_at")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             out.push_str(&format!(
-                "{}. {} ★{}{}\n   {}\n   {}\n\n",
+                "{}. {} ★{}{}\n   {}\n{}   {}\n\n",
                 count,
                 name,
                 stars,
                 tag_str,
                 trunc(desc, 150),
+                provider_date_lines(
+                    None,
+                    created.map(|value| (value, "created_at")),
+                    None,
+                    pushed.map(|value| (value, "pushed_at")),
+                    &retrieved,
+                ),
                 url,
             ));
         }
     }
     if count == 0 {
-        out.push_str("  No matching projects.\n");
+        out.push_str("search_status: empty\nNo matching projects.\n");
     }
     out.push_str(&format!(
         "Best of JS: https://bestofjs.org/projects?query={}\n",
@@ -3354,55 +5549,98 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    ensure_provider_http_success("Sourcegraph", resp.status())?;
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let result_count = data["data"]["search"]["results"]["resultCount"]
-        .as_u64()
-        .unwrap_or(0);
-    let mut out = format!("Sourcegraph code search for '{query}' ({result_count} results):\n\n");
-    let mut count = 0;
-    if let Some(results) = data["data"]["search"]["results"]["results"].as_array() {
-        for r in results {
-            count += 1;
-            let typename = r["__typename"].as_str().unwrap_or("");
-            match typename {
-                "Repository" => {
-                    let name = r["name"].as_str().unwrap_or("?");
-                    let desc = r["description"].as_str().unwrap_or("");
-                    out.push_str(&format!("{}. [REPO] {}\n", count, name));
-                    if !desc.is_empty() {
-                        out.push_str(&format!("   {}\n", trunc(desc, 150)));
-                    }
-                    out.push_str(&format!("   https://sourcegraph.com/{}\n\n", name));
+    let retrieved = retrieved_at();
+    let (result_count, results) = sourcegraph_graphql_results(&data)?;
+    let mut out = format!(
+        "Sourcegraph code search for '{query}' ({result_count} results):\nretrieved_at: {retrieved}\n\n"
+    );
+    let mut count = 0usize;
+    for r in results {
+        if count >= n as usize {
+            break;
+        }
+        let typename = r["__typename"].as_str().unwrap_or("");
+        match typename {
+            "Repository" => {
+                count += 1;
+                let name = r["name"].as_str().unwrap_or("?");
+                let desc = r["description"].as_str().unwrap_or("");
+                out.push_str(&format!("{}. [REPO] {}\n", count, name));
+                if !desc.is_empty() {
+                    out.push_str(&format!("   {}\n", trunc(desc, 150)));
                 }
-                "FileMatch" => {
-                    let repo = r["repository"]["name"].as_str().unwrap_or("?");
-                    let path = r["file"]["path"].as_str().unwrap_or("?");
-                    let preview = r["lineMatches"]
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|m| m["preview"].as_str())
-                        .unwrap_or("");
-                    out.push_str(&format!("{}. {} / {}\n", count, repo, path));
-                    if !preview.is_empty() {
-                        out.push_str(&format!("   {}\n", trunc(preview.trim(), 120)));
-                    }
-                    out.push_str(&format!(
-                        "   https://sourcegraph.com/{}/-/blob/{}\n\n",
-                        repo, path
-                    ));
-                }
-                _ => {}
+                out.push_str(&provider_date_lines(None, None, None, None, &retrieved));
+                out.push_str(&format!("   https://sourcegraph.com/{}\n\n", name));
             }
+            "FileMatch" => {
+                count += 1;
+                let repo = r["repository"]["name"].as_str().unwrap_or("?");
+                let path = r["file"]["path"].as_str().unwrap_or("?");
+                let preview = r["lineMatches"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|m| m["preview"].as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("{}. {} / {}\n", count, repo, path));
+                if !preview.is_empty() {
+                    out.push_str(&format!("   {}\n", trunc(preview.trim(), 120)));
+                }
+                out.push_str(&provider_date_lines(None, None, None, None, &retrieved));
+                out.push_str(&format!(
+                    "   https://sourcegraph.com/{}/-/blob/{}\n\n",
+                    repo, path
+                ));
+            }
+            _ => {}
         }
     }
     if count == 0 {
-        out.push_str("  No results found.\n");
+        out.push_str("search_status: empty\nNo results found.\n");
     }
     out.push_str(&format!(
         "Sourcegraph: https://sourcegraph.com/search?q={}\n",
         query.replace(' ', "+"),
     ));
     Ok(out)
+}
+
+fn sourcegraph_graphql_results(data: &Value) -> Result<(u64, &[Value]), String> {
+    if let Some(errors) = data.get("errors").filter(|errors| !errors.is_null()) {
+        let errors = errors
+            .as_array()
+            .ok_or_else(|| "Sourcegraph GraphQL errors field is malformed".to_string())?;
+        if !errors.is_empty() {
+            let summary = errors
+                .iter()
+                .take(3)
+                .filter_map(|error| error.get("message").and_then(Value::as_str))
+                .map(|message| trunc(message.trim(), 160))
+                .filter(|message| !message.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(if summary.is_empty() {
+                "Sourcegraph GraphQL returned errors without messages".to_string()
+            } else {
+                format!("Sourcegraph GraphQL returned errors: {summary}")
+            });
+        }
+    }
+
+    let results = data
+        .pointer("/data/search/results")
+        .ok_or_else(|| "Sourcegraph GraphQL response missing data.search.results".to_string())?;
+    let result_count = results
+        .get("resultCount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Sourcegraph GraphQL response missing numeric resultCount".to_string())?;
+    let items = results
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| "Sourcegraph GraphQL response missing results array".to_string())?;
+    Ok((result_count, items))
 }
 
 // ── Deep search (surface + Tor + onion engines) ───────────────────
@@ -3419,22 +5657,30 @@ fn tor_client(timeout_secs: u64) -> Result<Client, String> {
         .map_err(|e| format!("Tor client: {e}"))
 }
 
-async fn ddg_surface(q: &str) -> Vec<(String, String, String, &'static str)> {
-    let client = match kclient() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+async fn ddg_surface_checked(
+    q: &str,
+) -> Result<Vec<(String, String, String, &'static str)>, String> {
+    let client = kclient()?;
     let resp = client
         .post("https://html.duckduckgo.com/html/")
         .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .form(&[("q", q), ("kl", "wt-wt")])
         .send()
-        .await;
-    let html = match resp {
-        Ok(r) => r.text().await.unwrap_or_default(),
-        Err(_) => return vec![],
-    };
-    parse_ddg_html(&html, "明网")
+        .await
+        .map_err(|error| format!("DuckDuckGo request: {error}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("DuckDuckGo returned HTTP {status}"));
+    }
+    let html = resp
+        .text()
+        .await
+        .map_err(|error| format!("DuckDuckGo response body: {error}"))?;
+    Ok(parse_ddg_html(&html, "明网"))
+}
+
+async fn ddg_surface(q: &str) -> Vec<(String, String, String, &'static str)> {
+    ddg_surface_checked(q).await.unwrap_or_default()
 }
 
 async fn ddg_onion(q: &str) -> Vec<(String, String, String, &'static str)> {
@@ -3641,12 +5887,14 @@ async fn dork_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
         format!("{q} site:gist.github.com OR site:github.com OR site:gitlab.com"),
         format!("{q} filetype:log OR filetype:sql OR filetype:env OR filetype:json OR filetype:txt"),
     ];
-    let mut out = Vec::new();
-    for d in dorks {
-        let mut r = ddg_query(&d, "定向(dork)").await;
-        out.append(&mut r);
-    }
-    out
+    let (mut paste, mut code, mut files) = tokio::join!(
+        ddg_query(&dorks[0], "定向(dork)"),
+        ddg_query(&dorks[1], "定向(dork)"),
+        ddg_query(&dorks[2], "定向(dork)"),
+    );
+    paste.append(&mut code);
+    paste.append(&mut files);
+    paste
 }
 
 /// Wayback CDX: every archived URL under a domain — including pages DELETED from the
@@ -3785,22 +6033,45 @@ async fn haystak_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
     }
 }
 
+async fn tor_search_layers(q: &str) -> Vec<(String, String, String, &'static str)> {
+    // Fast paths must not wait through a full cold Tor bootstrap. Six seconds
+    // is enough when Tor is already running or nearly ready; ensure_tor starts
+    // the detached process, so a later search can use it if bootstrap is slower.
+    match tokio::time::timeout(Duration::from_secs(6), crate::net::ensure_tor()).await {
+        Ok(Ok(())) => {}
+        _ => return Vec::new(),
+    }
+    let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
+    for source in 0..3 {
+        let query = q.to_string();
+        racing.push(Box::pin(async move {
+            match source {
+                0 => ddg_onion(&query).await,
+                1 => torch_search_layer(&query).await,
+                _ => haystak_layer(&query).await,
+            }
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut results = Vec::new();
+    while let Ok(Some(mut batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
+        results.append(&mut batch);
+    }
+    results
+}
+
 #[tauri::command]
 pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
         return Err("空搜索词".into());
     }
-    // Best-effort: if Tor is down, kick a background start so the .onion layers self-heal
-    // (this run or the next). Non-blocking — the clearnet layers never wait on Tor.
-    tokio::spawn(async {
-        let _ = crate::net::ensure_tor().await;
-    });
     let limit = max_results.unwrap_or(24).min(60);
     let domain = looks_like_domain(q);
 
     let mut racing: FuturesUnordered<DeepSearchFuture> = FuturesUnordered::new();
-    // Keyword layers — always run: surface + dorks (pastes/leaks/files) + 4 dark-web engines.
+    // Keyword layers run concurrently. Tor-backed engines share one readiness
+    // gate so a cold bootstrap cannot hold every public source for 30-40s.
     {
         let q = q.to_string();
         racing.push(Box::pin(async move { ddg_surface(&q).await }));
@@ -3815,15 +6086,7 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
     }
     {
         let q = q.to_string();
-        racing.push(Box::pin(async move { ddg_onion(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { torch_search_layer(&q).await }));
-    }
-    {
-        let q = q.to_string();
-        racing.push(Box::pin(async move { haystak_layer(&q).await }));
+        racing.push(Box::pin(async move { tor_search_layers(&q).await }));
     }
     // Domain/OSINT layers — only when the query is a domain or URL: hidden subdomains + deleted-page archives.
     if let Some(d) = domain.clone() {
@@ -3837,11 +6100,14 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
         }
     }
 
+    let source_tasks = racing.len();
+    let mut completed_tasks = 0usize;
     let mut all: Vec<(String, String, String, &str)> = Vec::new();
     let mut seen_urls = std::collections::HashSet::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
     while let Ok(Some(batch)) = tokio::time::timeout_at(deadline, racing.next()).await {
+        completed_tasks += 1;
         for item in batch {
             let norm = item.1.trim_end_matches('/').to_lowercase();
             if seen_urls.contains(&norm) {
@@ -3854,13 +6120,13 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
 
     if all.is_empty() {
         return Ok(format!(
-            "深层搜索「{q}」未找到结果（Tor 可能未运行：brew services start tor）。"
+            "深层搜索「{q}」未找到结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务。空结果可能表示无匹配、来源拒绝/超时，或 Tor 尚在冷启动。"
         ));
     }
 
     let mut out = format!(
-        "🔍 深层情报搜索「{q}」— {} 条结果（跨明网+定向dork+存档+子域名+暗网多引擎）：\n",
-        all.len().min(limit)
+        "🔍 深层情报搜索「{q}」— {} 条结果；本轮完成 {completed_tasks}/{source_tasks} 个来源任务（明网+定向dork+存档+子域名+暗网多引擎）：\n",
+        all.len().min(limit),
     );
     for (i, (title, url, snippet, source)) in all.iter().take(limit).enumerate() {
         out.push_str(&format!(
@@ -3876,7 +6142,7 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
     }
     out.push_str(
         "\n来源层：明网(DuckDuckGo) + 定向dork(paste/leak/filetype) + 存档(Wayback,含已删除页) + 子域名(crt.sh) + 暗网四引擎(DDG-onion/Ahmia/Torch/Haystak)\n\
-         提示：明网/存档 URL 用 web_fetch 读；.onion URL 用 tor_request 读（Tor 未运行则暗网层为空：brew services start tor）。存档快照能读到原网站已删除的内容。",
+         完成来源任务只表示请求已结束，不等于该层返回了结果；空层可能是无匹配、被拒绝、超时或 Tor 尚未就绪。明网/存档 URL 用 web_fetch 读，.onion URL 用 tor_request 读。",
     );
     Ok(out)
 }
@@ -3884,6 +6150,18 @@ pub async fn deep_search(query: String, max_results: Option<usize>) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marketplace_search_urls_percent_encode_cjk_queries() {
+        assert_eq!(
+            url_query_component("iPhone 16 优惠"),
+            "iPhone%2016%20%E4%BC%98%E6%83%A0"
+        );
+        assert_eq!(
+            url_query_component("二手 3080 显卡"),
+            "%E4%BA%8C%E6%89%8B%203080%20%E6%98%BE%E5%8D%A1"
+        );
+    }
 
     #[test]
     fn developer_source_scopes_are_explicit_and_bounded() {
@@ -3896,6 +6174,10 @@ mod tests {
         let forums = select_developer_sources(Some("forums"), None).unwrap();
         assert!(forums.contains(&"reddit"));
         assert!(forums.contains(&"github_discussions"));
+        assert!(forums.contains(&"rust_users"));
+        assert!(forums.contains(&"python_discussions"));
+        assert!(forums.contains(&"swift_forums"));
+        assert!(forums.contains(&"kotlin_discussions"));
         assert!(!forums.contains(&"gitlab"));
     }
 
@@ -3915,9 +6197,560 @@ mod tests {
         assert!(error.contains("Unsupported developer sources"));
     }
 
+    #[test]
+    fn official_discourse_aliases_resolve_without_duplicates() {
+        let requested = vec![
+            "rust".to_string(),
+            "rust discourse".to_string(),
+            "python".to_string(),
+            "Swift Forums".to_string(),
+            "kotlin_forum".to_string(),
+        ];
+        let selected = select_developer_sources(None, Some(&requested)).unwrap();
+        assert_eq!(
+            selected,
+            vec![
+                "rust_users",
+                "python_discussions",
+                "swift_forums",
+                "kotlin_discussions"
+            ]
+        );
+    }
+
+    #[test]
+    fn github_issue_and_code_fixtures_do_not_turn_creation_into_publication() {
+        let issue = serde_json::json!({
+            "title": "Fix async cancellation",
+            "created_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-02-03T04:05:06Z",
+            "html_url": "https://github.com/example/project/issues/7"
+        });
+        let issue_output = format_github_search_item(&issue, "issues", 0, "2026-07-12T18:00:00Z");
+        assert!(issue_output.contains("published_date: unknown"));
+        assert!(issue_output
+            .contains("created_date: 2026-01-02T03:04:05Z (provider field: created_at)"));
+        assert!(issue_output
+            .contains("updated_date: 2026-02-03T04:05:06Z (provider field: updated_at)"));
+        assert!(issue_output.contains("last_activity_date: unknown"));
+        assert!(!issue_output.contains("published_date: 2026-01-02T03:04:05Z"));
+
+        let code = serde_json::json!({
+            "name": "handler.rs",
+            "path": "src/handler.rs",
+            "html_url": "https://github.com/example/project/blob/main/src/handler.rs"
+        });
+        let code_output = format_github_search_item(&code, "code", 0, "2026-07-12T18:00:00Z");
+        assert!(code_output.contains("published_date: unknown"));
+        assert!(code_output.contains("created_date: unknown"));
+        assert!(code_output.contains("updated_date: unknown"));
+        assert!(code_output.contains("last_activity_date: unknown"));
+    }
+
+    #[test]
+    fn github_repo_helpers_normalize_actions_and_decode_content() {
+        assert_eq!(
+            github_repo_ref("vercel", "next.js").unwrap(),
+            ("vercel".to_string(), "next.js".to_string())
+        );
+        assert!(github_repo_ref("vercel/next.js", "").is_err());
+        assert_eq!(github_repo_action(Some("read-file".into())), "file");
+        assert_eq!(github_repo_action(Some("pull requests".into())), "pulls");
+        assert_eq!(repo_reader_action(Some("merge requests".into())), "pulls");
+        assert_eq!(
+            hosted_repo_ref("gitlab_repo", "group/subgroup", "project", true).unwrap(),
+            ("group/subgroup".to_string(), "project".to_string())
+        );
+        assert!(hosted_repo_ref("gitee_repo", "group/subgroup", "project", false).is_err());
+        assert_eq!(
+            String::from_utf8(decode_github_base64("SGVsbG8sIHJlcG8h\n").unwrap()).unwrap(),
+            "Hello, repo!"
+        );
+    }
+
+    #[test]
+    fn github_repo_overview_keeps_provider_date_semantics() {
+        let repo = serde_json::json!({
+            "full_name": "example/project",
+            "description": "Example project",
+            "language": "Rust",
+            "stargazers_count": 42,
+            "forks_count": 3,
+            "open_issues_count": 7,
+            "default_branch": "main",
+            "license": {"spdx_id": "MIT"},
+            "homepage": "https://example.com",
+            "html_url": "https://github.com/example/project",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2025-02-02T00:00:00Z",
+            "pushed_at": "2026-03-03T00:00:00Z"
+        });
+        let output = format_github_repo_overview(&repo, "2026-07-12T18:00:00Z");
+        assert!(output.contains("GitHub repo overview: example/project"));
+        assert!(output.contains("Stars: 42"));
+        assert!(output.contains("License: MIT"));
+        assert!(output.contains("created_date: 2024-01-01T00:00:00Z (provider field: created_at)"));
+        assert!(output.contains("updated_date: 2025-02-02T00:00:00Z (provider field: updated_at)"));
+        assert!(
+            output.contains("last_activity_date: 2026-03-03T00:00:00Z (provider field: pushed_at)")
+        );
+    }
+
+    #[test]
+    fn hosted_repo_overviews_keep_provider_date_semantics() {
+        let gitlab = serde_json::json!({
+            "path_with_namespace": "gitlab-org/gitlab",
+            "description": "GitLab",
+            "topics": ["ruby", "vue"],
+            "star_count": 10,
+            "forks_count": 2,
+            "open_issues_count": 3,
+            "default_branch": "master",
+            "visibility": "public",
+            "web_url": "https://gitlab.com/gitlab-org/gitlab",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z",
+            "last_activity_at": "2022-01-01T00:00:00Z"
+        });
+        let gitlab_output = format_gitlab_repo_overview(&gitlab, "2026-07-12T18:00:00Z");
+        assert!(gitlab_output.contains("GitLab repo overview: gitlab-org/gitlab"));
+        assert!(gitlab_output.contains(
+            "last_activity_date: 2022-01-01T00:00:00Z (provider field: last_activity_at)"
+        ));
+
+        let gitee = serde_json::json!({
+            "full_name": "oschina/git-osc",
+            "description": "Gitee Feedback",
+            "language": "Ruby",
+            "stargazers_count": 9,
+            "forks_count": 4,
+            "open_issues_count": 5,
+            "default_branch": "master",
+            "html_url": "https://gitee.com/oschina/git-osc",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z",
+            "pushed_at": "2022-01-01T00:00:00Z"
+        });
+        let gitee_output = format_gitee_repo_overview(&gitee, "2026-07-12T18:00:00Z");
+        assert!(gitee_output.contains("Gitee repo overview: oschina/git-osc"));
+        assert!(gitee_output
+            .contains("last_activity_date: 2022-01-01T00:00:00Z (provider field: pushed_at)"));
+
+        let codeberg = serde_json::json!({
+            "full_name": "forgejo/forgejo",
+            "description": "Forgejo",
+            "language": "Go",
+            "stars_count": 11,
+            "forks_count": 6,
+            "open_issues_count": 7,
+            "default_branch": "forgejo",
+            "html_url": "https://codeberg.org/forgejo/forgejo",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2021-01-01T00:00:00Z"
+        });
+        let codeberg_output = format_codeberg_repo_overview(&codeberg, "2026-07-12T18:00:00Z");
+        assert!(codeberg_output.contains("Codeberg repo overview: forgejo/forgejo"));
+        assert!(codeberg_output.contains("last_activity_date: unknown (Codeberg repository response did not expose a last-activity field)"));
+    }
+
+    #[test]
+    fn provider_date_lines_only_use_explicit_fields() {
+        let output = provider_date_lines(
+            Some(("2026-02-20T15:10:00.015Z", "publishedAt")),
+            Some(("2020-03-20", "created_at")),
+            None,
+            Some(("2024-08-09", "pushed_at")),
+            "2026-07-12T18:00:00Z",
+        );
+
+        assert!(output
+            .contains("published_date: 2026-02-20T15:10:00.015Z (provider field: publishedAt)"));
+        assert!(output.contains("created_date: 2020-03-20 (provider field: created_at)"));
+        assert!(output.contains("updated_date: unknown"));
+        assert!(output.contains("last_activity_date: 2024-08-09 (provider field: pushed_at)"));
+        assert!(output.contains("retrieved_at: 2026-07-12T18:00:00Z"));
+        for field in [
+            "published_date:",
+            "created_date:",
+            "updated_date:",
+            "last_activity_date:",
+            "retrieved_at:",
+        ] {
+            assert_eq!(output.matches(field).count(), 1, "{field}: {output}");
+        }
+    }
+
+    #[test]
+    fn freecodecamp_publication_uses_provider_field_and_timestamp_fallback() {
+        let explicit = serde_json::json!({
+            "publishedAt": "2026-02-20T15:10:00.015Z",
+            "publishedAtTimestamp": 1
+        });
+        assert_eq!(
+            freecodecamp_published_date(&explicit),
+            Some(("2026-02-20T15:10:00.015Z".to_string(), "publishedAt"))
+        );
+
+        let timestamp_only = serde_json::json!({ "publishedAtTimestamp": 1_771_600_200 });
+        assert_eq!(
+            freecodecamp_published_date(&timestamp_only),
+            Some(("2026-02-20T15:10:00Z".to_string(), "publishedAtTimestamp"))
+        );
+        assert_eq!(freecodecamp_published_date(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn provider_http_statuses_and_trending_empty_status_are_explicit() {
+        for provider in ["InfoQ", "freeCodeCamp", "Best of JS", "Sourcegraph"] {
+            assert_eq!(
+                ensure_provider_http_success(provider, reqwest::StatusCode::OK),
+                Ok(())
+            );
+
+            let rate_limited =
+                ensure_provider_http_success(provider, reqwest::StatusCode::TOO_MANY_REQUESTS)
+                    .expect_err("HTTP 429 must not be parsed as an empty provider response");
+            assert_eq!(rate_limited, format!("{provider} rate-limited (HTTP 429)"));
+            assert_eq!(
+                community_result_status(&CommunitySearchOutcome::Finished(Err(rate_limited))),
+                CommunitySourceStatus::RateLimited
+            );
+
+            let failed =
+                ensure_provider_http_success(provider, reqwest::StatusCode::SERVICE_UNAVAILABLE)
+                    .expect_err("non-success provider responses must fail");
+            assert_eq!(
+                failed,
+                format!("{provider} returned HTTP 503 Service Unavailable")
+            );
+            assert_eq!(
+                community_result_status(&CommunitySearchOutcome::Finished(Err(failed))),
+                CommunitySourceStatus::Failed
+            );
+        }
+
+        assert!(GITHUB_TRENDING_EMPTY_NOTICE.contains("search_status: empty"));
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Ok(
+                GITHUB_TRENDING_EMPTY_NOTICE.to_string()
+            ))),
+            CommunitySourceStatus::Empty
+        );
+    }
+
+    #[test]
+    fn sourcegraph_graphql_fixture_rejects_errors_and_missing_result_count() {
+        let graphql_error = serde_json::json!({
+            "errors": [{ "message": "query syntax rejected" }],
+            "data": {
+                "search": { "results": { "resultCount": 0, "results": [] } }
+            }
+        });
+        let error = sourcegraph_graphql_results(&graphql_error)
+            .expect_err("GraphQL errors must fail even when HTTP status was successful");
+        assert_eq!(
+            error,
+            "Sourcegraph GraphQL returned errors: query syntax rejected"
+        );
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Err(error))),
+            CommunitySourceStatus::Failed
+        );
+
+        let missing_count = serde_json::json!({
+            "data": { "search": { "results": { "results": [] } } }
+        });
+        let error = sourcegraph_graphql_results(&missing_count)
+            .expect_err("missing resultCount must not become a genuine empty result");
+        assert_eq!(
+            error,
+            "Sourcegraph GraphQL response missing numeric resultCount"
+        );
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Err(error))),
+            CommunitySourceStatus::Failed
+        );
+
+        let genuine_empty = serde_json::json!({
+            "data": {
+                "search": { "results": { "resultCount": 0, "results": [] } }
+            }
+        });
+        let (count, items) = sourcegraph_graphql_results(&genuine_empty).unwrap();
+        assert_eq!(count, 0);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn repository_fixtures_keep_gitee_and_codeberg_dates_distinct() {
+        let gitee = serde_json::json!({
+            "full_name": "example/project",
+            "description": "Example",
+            "stargazers_count": 5,
+            "forks_count": 2,
+            "language": "Rust",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "pushed_at": "2026-01-03T00:00:00Z",
+            "html_url": "https://gitee.com/example/project"
+        });
+        let gitee_output = format_gitee_repository_item(&gitee, 0, "2026-07-12T18:00:00Z");
+        assert!(gitee_output.contains("published_date: unknown"));
+        assert!(gitee_output
+            .contains("created_date: 2024-01-01T00:00:00Z (provider field: created_at)"));
+        assert!(gitee_output
+            .contains("updated_date: 2026-01-02T00:00:00Z (provider field: updated_at)"));
+        assert!(gitee_output
+            .contains("last_activity_date: 2026-01-03T00:00:00Z (provider field: pushed_at)"));
+        assert!(gitee_output.contains("retrieved_at: 2026-07-12T18:00:00Z"));
+
+        let codeberg = serde_json::json!({
+            "full_name": "example/project",
+            "created_at": "2025-02-01T02:24:04+01:00",
+            "updated_at": "2026-03-19T03:46:53+01:00",
+            "html_url": "https://codeberg.org/example/project"
+        });
+        let codeberg_output = format_codeberg_repository_item(&codeberg, 0, "2026-07-12T18:00:00Z");
+        assert!(codeberg_output.contains("published_date: unknown"));
+        assert!(codeberg_output
+            .contains("created_date: 2025-02-01T02:24:04+01:00 (provider field: created_at)"));
+        assert!(codeberg_output
+            .contains("updated_date: 2026-03-19T03:46:53+01:00 (provider field: updated_at)"));
+        assert!(codeberg_output.contains("last_activity_date: unknown"));
+        assert!(codeberg_output.contains("retrieved_at: 2026-07-12T18:00:00Z"));
+    }
+
+    #[test]
+    fn v2ex_language_anchor_filters_obviously_unrelated_hits() {
+        let go_hit = serde_json::json!({
+            "title": "Error handling in Go",
+            "content": "A Go 2 proposal about errors"
+        });
+        let rust_hit = serde_json::json!({
+            "title": "Async error handling in Rust",
+            "content": "Using Tokio and Result"
+        });
+        assert!(!v2ex_hit_matches_language_anchor(
+            "rust async error handling",
+            &go_hit
+        ));
+        assert!(v2ex_hit_matches_language_anchor(
+            "rust async error handling",
+            &rust_hit
+        ));
+        assert!(v2ex_hit_matches_language_anchor(
+            "async error handling",
+            &go_hit
+        ));
+    }
+
+    #[test]
+    fn discourse_fixture_keeps_date_semantics_distinct() {
+        let fixture = serde_json::json!({
+            "posts": [{
+                "id": 11,
+                "username": "alice",
+                "created_at": "2026-05-01T10:00:00.000Z",
+                "blurb": "A real <b>async</b> answer",
+                "post_number": 2,
+                "topic_id": 7
+            }],
+            "topics": [{
+                "id": 7,
+                "title": "Async error handling",
+                "slug": "async-error-handling",
+                "posts_count": 3,
+                "last_posted_at": "2026-06-02T12:30:00.000Z"
+            }],
+            "grouped_search_result": { "error": null }
+        });
+        let output = parse_discourse_search(
+            &fixture,
+            RUST_USERS_DISCOURSE,
+            "async error",
+            5,
+            "2026-07-12T18:00:00Z",
+        )
+        .unwrap();
+
+        assert!(output.contains("published_date: 2026-05-01T10:00:00.000Z"));
+        assert!(output.contains("updated_date: unknown"));
+        assert!(output.contains("last_activity_date: 2026-06-02T12:30:00.000Z"));
+        assert!(output.contains("retrieved_at: 2026-07-12T18:00:00Z"));
+        assert!(output.contains("replies: 2"));
+        assert!(!output.contains("updated_date: 2026-06-02T12:30:00.000Z"));
+        assert!(!output.contains("published_date: 2026-06-02T12:30:00.000Z"));
+    }
+
+    #[test]
+    fn discourse_fixture_preserves_provider_updated_date() {
+        let fixture = serde_json::json!({
+            "posts": [{
+                "username": "bob",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-03T00:00:00Z",
+                "post_number": 1,
+                "topic_id": 9
+            }],
+            "topics": [{
+                "id": 9,
+                "title": "Structured concurrency",
+                "slug": "structured-concurrency",
+                "reply_count": 4,
+                "last_posted_at": "2026-02-01T00:00:00Z"
+            }],
+            "grouped_search_result": { "error": null }
+        });
+        let output = parse_discourse_search(
+            &fixture,
+            SWIFT_DISCOURSE,
+            "concurrency",
+            1,
+            "2026-07-12T18:00:00Z",
+        )
+        .unwrap();
+
+        assert!(output.contains("published_date: 2026-01-01T00:00:00Z"));
+        assert!(output.contains("updated_date: 2026-01-03T00:00:00Z"));
+        assert!(output.contains("last_activity_date: 2026-02-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn discourse_empty_fixture_and_aggregate_statuses_are_explicit() {
+        let fixture = serde_json::json!({
+            "posts": [],
+            "topics": [],
+            "grouped_search_result": { "error": null }
+        });
+        let output = parse_discourse_search(
+            &fixture,
+            PYTHON_DISCOURSE,
+            "no-match",
+            3,
+            "2026-07-12T18:00:00Z",
+        )
+        .unwrap();
+        assert!(output.contains("search_status: empty"));
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Ok(output))),
+            CommunitySourceStatus::Empty
+        );
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Err(
+                "HTTP 429 rate limit".into()
+            ))),
+            CommunitySourceStatus::RateLimited
+        );
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Err("HTTP 503".into()))),
+            CommunitySourceStatus::Failed
+        );
+        assert_eq!(
+            community_result_status(&CommunitySearchOutcome::Finished(Ok(
+                "one real result".into()
+            ))),
+            CommunitySourceStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn community_source_timeout_is_explicit_and_cancels_pending_work() {
+        let adapter: CommunityAdapterFuture = Box::pin(std::future::pending());
+        let outcome =
+            community_source_with_timeout("slow", "Slow source", adapter, Duration::from_millis(5))
+                .await;
+
+        assert_eq!(outcome.0, "slow");
+        assert_eq!(outcome.1, "Slow source");
+        assert_eq!(
+            community_result_status(&outcome.2),
+            CommunitySourceStatus::Timeout
+        );
+        assert!(matches!(
+            outcome.2,
+            CommunitySearchOutcome::TimedOut { after }
+                if after == Duration::from_millis(5)
+        ));
+    }
+
+    #[tokio::test]
+    async fn community_timeout_summary_preserves_fast_results_and_is_bounded() {
+        let fast: CommunityAdapterFuture =
+            Box::pin(async { ("fast", "Fast source", Ok("one verified result".to_string())) });
+        let stalled: CommunityAdapterFuture = Box::pin(std::future::pending());
+        let mut pending: FuturesUnordered<CommunitySearchFuture> = FuturesUnordered::new();
+        pending.push(Box::pin(community_source_with_timeout(
+            "fast",
+            "Fast source",
+            fast,
+            Duration::from_millis(10),
+        )));
+        pending.push(Box::pin(community_source_with_timeout(
+            "stalled",
+            "Stalled source",
+            stalled,
+            Duration::from_millis(10),
+        )));
+
+        let responses = tokio::time::timeout(Duration::from_secs(1), async move {
+            let mut responses = Vec::new();
+            while let Some((key, label, outcome)) = pending.next().await {
+                responses.push((key, label, outcome, "2026-07-12T18:00:00Z".to_string()));
+            }
+            responses
+        })
+        .await
+        .expect("concurrent per-source deadlines must bound the aggregate");
+
+        let output = format_developer_community_results(
+            "test query",
+            &["fast", "stalled"],
+            responses,
+            "2026-07-12T18:00:01Z",
+        );
+        assert!(output.contains("Requested sources: 2; completed searches: 1; failed requests: 1"));
+        assert!(output
+            .contains("Status counts: success=1; empty=0; rate-limited=0; failed=0; timeout=1"));
+        assert!(output.contains(
+            "The five source statuses are success, empty, rate-limited, failed, and timeout"
+        ));
+        assert!(output.contains("independent 12000 ms hard deadline"));
+        assert!(output.contains("## Fast source [search completed; status=success]"));
+        assert!(output.contains("one verified result"));
+        assert!(output.contains("## Stalled source [failed; status=timeout]"));
+        assert!(output.contains("search_status: timeout"));
+        assert!(output.contains("timeout_ms: 10"));
+    }
+
+    #[test]
+    fn aggregate_trending_only_accepts_single_known_languages() {
+        assert_eq!(aggregate_trending_language("Rust"), Some("rust"));
+        assert_eq!(aggregate_trending_language("golang"), Some("go"));
+        assert_eq!(aggregate_trending_language("c#"), Some("c#"));
+        assert_eq!(aggregate_trending_language("rust async errors"), None);
+        assert_eq!(
+            aggregate_trending_language("an-unrecognized-language"),
+            None
+        );
+
+        assert_eq!(
+            github_trending_url("c#").unwrap(),
+            "https://github.com/trending/c%23?since=weekly"
+        );
+        assert_eq!(
+            github_trending_url("c++").unwrap(),
+            "https://github.com/trending/c++?since=weekly"
+        );
+        assert_eq!(
+            github_trending_url("all").unwrap(),
+            "https://github.com/trending?since=weekly"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "calls live third-party developer communities"]
     async fn developer_community_live_smoke_lists_every_supported_source() {
+        let started = std::time::Instant::now();
         let out = developer_community_search(
             "rust async error handling".into(),
             Some("all".into()),
@@ -3927,6 +6760,9 @@ mod tests {
         .await
         .unwrap();
         println!("{out}");
+        let aggregate_header = out.split("\n## ").next().unwrap_or_default();
+        assert!(aggregate_header.contains("\nretrieved_at: "));
+        assert!(aggregate_header.contains("published_date, created_date, updated_date"));
         assert!(out.contains(&format!(
             "Requested sources: {}",
             DEVELOPER_COMMUNITY_SOURCES.len()
@@ -3935,5 +6771,67 @@ mod tests {
             out.matches("\n## ").count(),
             DEVELOPER_COMMUNITY_SOURCES.len()
         );
+        assert!(
+            started.elapsed() < COMMUNITY_SOURCE_TIMEOUT + Duration::from_secs(3),
+            "all-source aggregation exceeded its per-source deadline envelope: {:?}",
+            started.elapsed(),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "calls four live official Discourse developer forums"]
+    async fn official_discourse_live_smoke_has_results_and_truthful_dates() {
+        let sources = [
+            ("rust_users", "Rust Users Forum"),
+            ("python_discussions", "Python Discussions"),
+            ("swift_forums", "Swift Forums"),
+            ("kotlin_discussions", "Kotlin Discussions"),
+        ];
+        let out = developer_community_search(
+            "rust async error handling".into(),
+            None,
+            Some(sources.iter().map(|(key, _)| (*key).to_string()).collect()),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        println!("{out}");
+        assert!(out.starts_with("Developer community search\n"));
+        assert!(!out.starts_with("Developer community live search\n"));
+        assert!(out.contains("source content may come from provider indexes or caches"));
+
+        for (key, label) in sources {
+            let marker = format!("\n## {label} [");
+            let section = out
+                .split(&marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing aggregate section for {label}"))
+                .split("\n## ")
+                .next()
+                .unwrap_or_default();
+            assert!(section.contains("status=success"), "{label}: {section}");
+            assert!(
+                section.contains(&format!("source: {key}")),
+                "{label}: {section}"
+            );
+            for field in ["published_date:", "last_activity_date:", "retrieved_at:"] {
+                assert!(
+                    section.contains(field),
+                    "{label} missing {field}: {section}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "calls live surface, archive, certificate, and Tor search sources"]
+    async fn deep_search_live_smoke_is_bounded_and_reports_coverage() {
+        let started = std::time::Instant::now();
+        let out = deep_search("rust async error handling".into(), Some(5))
+            .await
+            .unwrap();
+        println!("{out}");
+        assert!(out.contains("本轮完成"));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

@@ -351,9 +351,7 @@ fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> boo
             messages
                 .iter()
                 .rev()
-                .filter(|message| {
-                    message.get("role").and_then(|role| role.as_str()) == Some("user")
-                })
+                .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
                 .take(20)
                 .filter_map(user_message_text)
                 .any(|text| {
@@ -1682,11 +1680,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 && (user_request.as_deref().is_some_and(looks_like_ui_task)
                     || recent_user_text_any(body, looks_like_ui_task))));
     if ui_intent {
-        for name in [
-            "ui_design_flow",
-            "shadcn_design_system",
-            "css_concrete_tokens",
-        ] {
+        for name in ["ui_design_flow", "shadcn_design_system", "css_concrete_tokens"] {
             let block = read_prompt(name).unwrap_or_default();
             if !block.is_empty() {
                 prompt_blocks.push(name);
@@ -2092,47 +2086,20 @@ mod tests {
         // these are non-tool snake_case tokens that appear in the prose (rust methods,
         // css props, npm commands, schema fields) and must not be treated as tool names.
         const NON_TOOL_TOKENS: &[&str] = &[
-            "search_tools",
-            "map_err",
-            "ok_or",
-            "node_modules",
-            "task_id",
-            "npm_install",
-            "pip_install",
-            "yarn_install",
-            "pnpm_install",
-            "bun_install",
-            "npm_ci",
-            "object_fit",
-            "object_position",
-            "grid_template_columns",
-            "grid_auto_rows",
-            "aspect_ratio",
-            "break_inside",
-            "column_count",
-            "max_width",
-            "margin_left",
-            "text_shadow",
-            "backdrop_blur",
-            "file_pattern",
-            "check_type",
-            "peer_dependencies",
-            "dist_tags",
-            "node_id",
-            "globals_css",
-            "rust_users",
-            "python_discussions",
-            "swift_forums",
-            "kotlin_discussions",
+            "search_tools", "map_err", "ok_or", "node_modules", "task_id", "npm_install",
+            "pip_install", "yarn_install", "pnpm_install", "bun_install", "npm_ci",
+            "object_fit", "object_position", "grid_template_columns", "grid_auto_rows",
+            "aspect_ratio", "break_inside", "column_count", "max_width", "margin_left",
+            "text_shadow", "backdrop_blur", "file_pattern", "check_type", "peer_dependencies",
+            "dist_tags", "node_id", "globals_css", "rust_users", "python_discussions",
+            "swift_forums", "kotlin_discussions",
         ];
         let ignore: HashSet<&str> = NON_TOOL_TOKENS.iter().copied().collect();
 
         let looks_like_tool = |token: &str| {
             token.len() >= 3
                 && token.contains('_')
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && token.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
                 && !token.starts_with('_')
                 && !token.ends_with('_')
         };
@@ -2156,11 +2123,7 @@ mod tests {
                 if c.is_ascii_alphanumeric() || c == '_' {
                     token.push(c);
                 } else if c == '`' {
-                    if in_tick {
-                        flush(&mut token, &mut names, '`');
-                    } else {
-                        token.clear();
-                    }
+                    if in_tick { flush(&mut token, &mut names, '`'); } else { token.clear(); }
                     in_tick = !in_tick;
                 } else if c == '(' {
                     flush(&mut token, &mut names, '(');

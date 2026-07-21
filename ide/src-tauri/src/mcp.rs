@@ -6,7 +6,7 @@
 //! Requests have timeouts, so a slow or misbehaving server returns an error.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -16,6 +16,71 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
+const MAX_TOOL_PAGES: usize = 100;
+const MAX_TOOLS_PER_SESSION: usize = 256;
+const MAX_TOOL_METADATA_BYTES: usize = 1024 * 1024;
+// A valid tool result may contain the full 8 MiB inline-media budget plus JSON
+// framing/text. Bound transport frames before allocating a String/serde Value.
+const MAX_MCP_STDOUT_FRAME_BYTES: usize = 10 * 1024 * 1024;
+const MAX_MCP_STDERR_FRAME_BYTES: usize = 64 * 1024;
+const MCP_FRAME_ERROR_PREFIX: &str = "__MICHAEL_MCP_FRAME_ERROR__:";
+
+fn discard_through_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(());
+        }
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if output.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+            if output.len().saturating_add(index) > max_bytes {
+                reader.consume(index + 1);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("transport frame exceeds {max_bytes} bytes"),
+                ));
+            }
+            output.extend_from_slice(&available[..index]);
+            reader.consume(index + 1);
+            break;
+        }
+        let chunk_len = available.len();
+        if output.len().saturating_add(chunk_len) > max_bytes {
+            reader.consume(chunk_len);
+            discard_through_newline(reader)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("transport frame exceeds {max_bytes} bytes"),
+            ));
+        }
+        output.extend_from_slice(available);
+        reader.consume(chunk_len);
+    }
+    if output.last() == Some(&b'\r') {
+        output.pop();
+    }
+    String::from_utf8(output)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 struct Session {
     child: Child,
@@ -26,7 +91,7 @@ struct Session {
 }
 
 impl Drop for Session {
-    // Reap the child on ANY removal from the map (disconnect / same-name replace / dead-eviction /
+    // Reap the child on ANY removal from its slot (disconnect / same-name replace / dead-eviction /
     // stop_all), so a wedged or forgotten MCP server never orphans its process + reader thread.
     // Killing the child closes its stdout → the reader thread's `lines()` returns None → it exits.
     fn drop(&mut self) {
@@ -35,20 +100,41 @@ impl Drop for Session {
     }
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> =
+type SessionSlot = Arc<Mutex<Option<Session>>>;
+
+static SESSIONS: LazyLock<Mutex<HashMap<String, SessionSlot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn get_or_create_session_slot(name: &str) -> Result<SessionSlot, String> {
+    let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
+    Ok(Arc::clone(
+        guard
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    ))
+}
+
+fn find_session_slot(name: &str) -> Result<Option<SessionSlot>, String> {
+    let guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
+    Ok(guard.get(name).map(Arc::clone))
+}
 
 /// Kill + reap ALL connected MCP servers. Wired into `cleanup_stale` (webview reload) and the app
 /// Exit handler in lib.rs — same as LSP/DAP/Terminal — so MCP children never survive a reload or a
 /// quit. Drains + drops on a detached thread (each `Session::drop` does kill()+blocking wait()) so a
 /// slow-dying server can't stall the caller.
 pub fn stop_all() {
-    let drained: Vec<Session> = match SESSIONS.lock() {
+    let drained: Vec<SessionSlot> = match SESSIONS.lock() {
         Ok(mut guard) => guard.drain().map(|(_, v)| v).collect(),
         Err(_) => return,
     };
     if !drained.is_empty() {
-        std::thread::spawn(move || drop(drained));
+        std::thread::spawn(move || {
+            for slot in drained {
+                let session = slot.lock().ok().and_then(|mut session| session.take());
+                drop(session);
+            }
+        });
     }
 }
 
@@ -57,6 +143,7 @@ pub struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
+    annotations: Value,
 }
 
 impl Session {
@@ -116,6 +203,9 @@ impl Session {
             }
             match self.rx.recv_timeout(remaining) {
                 Ok(raw) => {
+                    if let Some(message) = raw.strip_prefix(MCP_FRAME_ERROR_PREFIX) {
+                        return Err(message.to_string());
+                    }
                     let v: Value = match serde_json::from_str(&raw) {
                         Ok(v) => v,
                         Err(_) => continue, // not valid JSON (stray output) — ignore
@@ -195,18 +285,26 @@ fn spawn_session(
     let stdout = child.stdout.take().ok_or("无法获取 MCP stdout")?;
     let stderr = child.stderr.take().ok_or("无法获取 MCP stderr")?;
 
-    // Reader thread: every stdout line → channel. Ends when stdout closes.
-    let (tx, rx) = mpsc::channel::<String>();
+    // Reader thread: every bounded stdout frame → channel. A bounded channel also
+    // prevents a notification flood from queueing unbounded Strings while idle.
+    let (tx, rx) = mpsc::sync_channel::<String>(64);
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_MCP_STDOUT_FRAME_BYTES) {
+                Ok(Some(line)) => {
+                    if tx.send(line).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(None) => break,
+                Err(error) => {
+                    let message = format!(
+                        "{MCP_FRAME_ERROR_PREFIX}MCP stdout protocol frame rejected: {error}; service disconnected"
+                    );
+                    let _ = tx.send(message);
+                    break;
+                }
             }
         }
     });
@@ -214,9 +312,13 @@ fn spawn_session(
     let stderr_log = Arc::new(Mutex::new(VecDeque::with_capacity(40)));
     let stderr_sink = Arc::clone(&stderr_log);
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let line = line.chars().take(500).collect::<String>();
+        let mut reader = BufReader::new(stderr);
+        loop {
+            let line = match read_bounded_line(&mut reader, MAX_MCP_STDERR_FRAME_BYTES) {
+                Ok(Some(line)) => line.chars().take(500).collect::<String>(),
+                Ok(None) => break,
+                Err(error) => format!("[oversized/invalid MCP stderr frame omitted: {error}]"),
+            };
             let Ok(mut log) = stderr_sink.lock() else {
                 break;
             };
@@ -247,6 +349,11 @@ pub async fn mcp_connect(
     cwd: Option<String>,
 ) -> Result<Vec<McpTool>, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<McpTool>, String> {
+        // The global map lock is held only long enough to clone this name's slot. Holding the
+        // per-name lock through spawn + handshake serializes connect/call/disconnect for one
+        // service while unrelated MCP services continue independently.
+        let slot = get_or_create_session_slot(&name)?;
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
         let args = args.unwrap_or_default();
         let env = env.unwrap_or_default();
         let cwd = cwd.unwrap_or_default();
@@ -268,9 +375,10 @@ pub async fn mcp_connect(
         // Discover every page. Some MCP servers paginate large tool registries; silently reading
         // only page one makes the missing tools impossible for the model to call.
         let mut tools = Vec::new();
+        let mut tool_metadata_bytes = 0usize;
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
-        for _ in 0..100 {
+        for page_index in 0..MAX_TOOL_PAGES {
             let remaining = connect_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("MCP 连接超时（initialize + tools/list 超过 60s）".into());
@@ -281,20 +389,42 @@ pub async fn mcp_connect(
                 .unwrap_or_else(|| json!({}));
             let timeout = remaining.as_secs().clamp(1, 15);
             let result = session.request("tools/list", params, timeout)?;
-            tools.extend(
-                result
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            let page_tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if tools.len().saturating_add(page_tools.len()) > MAX_TOOLS_PER_SESSION {
+                return Err(format!(
+                    "MCP 工具数量超过安全上限（每个服务最多 {MAX_TOOLS_PER_SESSION} 个）"
+                ));
+            }
+            for tool in &page_tools {
+                let bytes = serde_json::to_vec(tool)
+                    .map_err(|error| format!("MCP 工具定义无法序列化: {error}"))?
+                    .len();
+                tool_metadata_bytes = tool_metadata_bytes.saturating_add(bytes);
+                if tool_metadata_bytes > MAX_TOOL_METADATA_BYTES {
+                    return Err(format!(
+                        "MCP 工具定义超过安全上限（每个服务最多 {MAX_TOOL_METADATA_BYTES} 字节）"
+                    ));
+                }
+            }
+            tools.extend(page_tools);
             let next = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
             match next {
-                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(next) if seen_cursors.insert(next.clone()) => {
+                    if page_index + 1 == MAX_TOOL_PAGES {
+                        return Err(format!(
+                            "MCP 工具分页超过安全上限（每个服务最多 {MAX_TOOL_PAGES} 页）"
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => break,
             }
         }
@@ -319,15 +449,15 @@ pub async fn mcp_connect(
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                annotations: t.get("annotations").cloned().unwrap_or_else(|| json!({})),
             });
         }
 
-        // Replace any prior session of this name (kill the old child).
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        if let Some(mut old) = guard.remove(&name) {
-            let _ = old.child.kill();
-        }
-        guard.insert(name, session);
+        // Keep the stable per-name slot in the map. In particular, disconnect never removes this
+        // slot, so an in-flight call cannot resurrect an older session after a reconnect.
+        let old = active.replace(session);
+        drop(active);
+        drop(old);
         Ok(out)
     })
     .await
@@ -344,8 +474,64 @@ fn append_content(text: &mut String, value: &str) {
     text.push_str(value);
 }
 
+const MAX_INLINE_MCP_MEDIA_BASE64: usize = 5 * 1024 * 1024;
+const MAX_TOTAL_INLINE_MCP_MEDIA_BASE64: usize = 8 * 1024 * 1024;
+
+fn append_media_content(
+    text: &mut String,
+    kind: &str,
+    mime: &str,
+    data: Option<&str>,
+    inline_media_base64: &mut usize,
+) {
+    let safe_mime = mime
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '+' | '.' | '-'));
+    let encoded = data.unwrap_or_default();
+    let valid_media = safe_mime
+        && !encoded.is_empty()
+        && encoded.len() <= MAX_INLINE_MCP_MEDIA_BASE64
+        && matches!(kind, "image" | "audio" | "video");
+    let fits_total_budget = inline_media_base64
+        .checked_add(encoded.len())
+        .is_some_and(|total| total <= MAX_TOTAL_INLINE_MCP_MEDIA_BASE64);
+
+    if valid_media && fits_total_budget {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[MCP_MEDIA ");
+        text.push_str(kind);
+        text.push(' ');
+        text.push_str(mime);
+        text.push_str("]\ndata:");
+        text.push_str(mime);
+        text.push_str(";base64,");
+        text.push_str(encoded);
+        *inline_media_base64 += encoded.len();
+    } else if valid_media {
+        append_content(
+            text,
+            &format!(
+                "[{kind} content omitted: {mime}, {} base64 characters; would exceed the {}-character total inline MCP media budget]",
+                encoded.len(),
+                MAX_TOTAL_INLINE_MCP_MEDIA_BASE64
+            ),
+        );
+    } else {
+        append_content(
+            text,
+            &format!(
+                "[{kind} content: {mime}, {} base64 characters]",
+                encoded.len()
+            ),
+        );
+    }
+}
+
 fn flatten_tool_content(result: &Value) -> String {
     let mut text = String::new();
+    let mut inline_media_base64 = 0;
     if let Some(items) = result.get("content").and_then(Value::as_array) {
         for item in items {
             match item.get("type").and_then(Value::as_str) {
@@ -367,7 +553,18 @@ fn flatten_tool_content(result: &Value) -> String {
                             .get("mimeType")
                             .and_then(Value::as_str)
                             .unwrap_or("application/octet-stream");
-                        append_content(&mut text, &format!("[resource {uri}, {mime}, binary]"));
+                        let kind = mime.split('/').next().unwrap_or("resource");
+                        if matches!(kind, "image" | "audio" | "video") {
+                            append_media_content(
+                                &mut text,
+                                kind,
+                                mime,
+                                resource.get("blob").and_then(Value::as_str),
+                                &mut inline_media_base64,
+                            );
+                        } else {
+                            append_content(&mut text, &format!("[resource {uri}, {mime}, binary]"));
+                        }
                     }
                 }
                 Some("resource_link") => {
@@ -378,16 +575,18 @@ fn flatten_tool_content(result: &Value) -> String {
                         .unwrap_or("resource");
                     append_content(&mut text, &format!("[resource link: {name}] {uri}"));
                 }
-                Some("image") | Some("audio") => {
+                Some("image") | Some("audio") | Some("video") => {
                     let kind = item.get("type").and_then(Value::as_str).unwrap_or("media");
                     let mime = item
                         .get("mimeType")
                         .and_then(Value::as_str)
                         .unwrap_or("application/octet-stream");
-                    let encoded_len = item.get("data").and_then(Value::as_str).map_or(0, str::len);
-                    append_content(
+                    append_media_content(
                         &mut text,
-                        &format!("[{kind} content: {mime}, {encoded_len} base64 characters]"),
+                        kind,
+                        mime,
+                        item.get("data").and_then(Value::as_str),
+                        &mut inline_media_base64,
                     );
                 }
                 Some(other) => append_content(&mut text, &format!("[{other} content]")),
@@ -406,24 +605,29 @@ fn flatten_tool_content(result: &Value) -> String {
 #[tauri::command]
 pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        let session = guard
-            .get_mut(&name)
+        let slot = find_session_slot(&name)?.ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        let session = active
+            .as_mut()
             .ok_or_else(|| format!("MCP 服务「{name}」未连接"))?;
         let req = session.request(
             "tools/call",
             json!({ "name": tool, "arguments": args.unwrap_or(json!({})) }),
             60,
         );
-        // If the call failed AND the server process has actually exited, evict the session so its
-        // child + reader thread are reaped now (Session::drop) instead of lingering forever; a later
-        // reconnect respawns cleanly. A mere slow-tool timeout on a still-alive server is kept.
-        let dead = req.is_err() && matches!(session.child.try_wait(), Ok(Some(_)));
+        // If the process exited or violated the bounded transport protocol, evict
+        // the session so Drop kills/reaps it. A mere timeout keeps a live server.
+        let protocol_violation = req
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.starts_with("MCP stdout protocol frame rejected:"));
+        let dead =
+            req.is_err() && (protocol_violation || matches!(session.child.try_wait(), Ok(Some(_))));
         let result = match req {
             Ok(r) => r,
             Err(e) => {
                 if dead {
-                    guard.remove(&name);
+                    active.take();
                 }
                 return Err(e);
             }
@@ -448,8 +652,11 @@ pub async fn mcp_call(name: String, tool: String, args: Option<Value>) -> Result
 #[tauri::command]
 pub async fn mcp_status(name: String) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
-        let mut guard = SESSIONS.lock().map_err(|_| "MCP state poisoned")?;
-        let dead = match guard.get_mut(&name) {
+        let Some(slot) = find_session_slot(&name)? else {
+            return Ok(false);
+        };
+        let mut active = slot.lock().map_err(|_| "MCP session state poisoned")?;
+        let dead = match active.as_mut() {
             Some(session) => session
                 .child
                 .try_wait()
@@ -458,7 +665,7 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
             None => return Ok(false),
         };
         if dead {
-            guard.remove(&name);
+            active.take();
             return Ok(false);
         }
         Ok(true)
@@ -470,36 +677,123 @@ pub async fn mcp_status(name: String) -> Result<bool, String> {
 /// Disconnect and kill an MCP server session.
 #[tauri::command]
 pub async fn mcp_disconnect(name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(mut guard) = SESSIONS.lock() {
-            if let Some(mut s) = guard.remove(&name) {
-                let _ = s.child.kill();
-            }
-        }
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let Some(slot) = find_session_slot(&name)? else {
+            return Ok(());
+        };
+        let session = slot
+            .lock()
+            .map_err(|_| "MCP session state poisoned")?
+            .take();
+        drop(session);
+        Ok(())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stdio_client_handles_server_requests_pagination_calls_and_disconnect() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn fixture_path() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
-            .join("mcp_fixture.mjs");
-        let session_name = format!("fixture-{}", std::process::id());
-        let tools = mcp_connect(
-            session_name.clone(),
+            .join("mcp_fixture.mjs")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn connect_fixture(
+        session_name: &str,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<Vec<McpTool>, String> {
+        mcp_connect(
+            session_name.to_string(),
             "node".into(),
-            Some(vec![fixture.to_string_lossy().into_owned()]),
-            None,
+            Some(vec![fixture_path()]),
+            env,
             Some(env!("CARGO_MANIFEST_DIR").into()),
         )
         .await
-        .expect("fixture MCP server should connect");
+    }
+
+    #[test]
+    fn media_content_keeps_bounded_data_for_the_ide_renderer() {
+        let image = flatten_tool_content(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}]
+        }));
+        assert!(image.contains("[MCP_MEDIA image image/png]"));
+        assert!(image.contains("data:image/png;base64,iVBORw0KGgo="));
+
+        let video = flatten_tool_content(&json!({
+            "content": [{"type": "resource", "resource": {"uri": "fixture://clip", "mimeType": "video/mp4", "blob": "AAAA"}}]
+        }));
+        assert!(video.contains("[MCP_MEDIA video video/mp4]"));
+    }
+
+    #[test]
+    fn bounded_transport_reader_rejects_oversized_frames_without_allocating_the_tail() {
+        let input = b"123456789\nnext\r\n";
+        let mut reader = std::io::BufReader::with_capacity(3, &input[..]);
+        let error = read_bounded_line(&mut reader, 8).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some("next".into())
+        );
+        assert_eq!(read_bounded_line(&mut reader, 8).unwrap(), None);
+    }
+
+    #[test]
+    fn bounded_transport_reader_accepts_a_frame_at_the_exact_limit() {
+        let input = b"12345678\n";
+        let mut reader = std::io::BufReader::with_capacity(2, &input[..]);
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some("12345678".into())
+        );
+    }
+
+    #[test]
+    fn media_content_enforces_a_total_inline_budget() {
+        let first = "A".repeat(MAX_INLINE_MCP_MEDIA_BASE64);
+        let second = "B".repeat(MAX_TOTAL_INLINE_MCP_MEDIA_BASE64 - MAX_INLINE_MCP_MEDIA_BASE64);
+        let result = flatten_tool_content(&json!({
+            "content": [
+                {"type": "image", "mimeType": "image/png", "data": first},
+                {"type": "audio", "mimeType": "audio/mpeg", "data": second},
+                {"type": "video", "mimeType": "video/mp4", "data": "AAAA"}
+            ]
+        }));
+
+        assert_eq!(result.matches("[MCP_MEDIA ").count(), 2);
+        assert!(result.contains("video content omitted: video/mp4, 4 base64 characters"));
+        assert!(result.contains("total inline MCP media budget"));
+        assert!(!result.contains("data:video/mp4;base64,AAAA"));
+    }
+
+    #[test]
+    fn media_content_keeps_the_per_item_limit() {
+        let oversized = "A".repeat(MAX_INLINE_MCP_MEDIA_BASE64 + 1);
+        let result = flatten_tool_content(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": oversized}]
+        }));
+
+        assert!(!result.contains("[MCP_MEDIA "));
+        assert!(result.contains(&format!(
+            "[image content: image/png, {} base64 characters]",
+            MAX_INLINE_MCP_MEDIA_BASE64 + 1
+        )));
+    }
+
+    #[tokio::test]
+    async fn stdio_client_handles_server_requests_pagination_calls_and_disconnect() {
+        let session_name = format!("fixture-{}", std::process::id());
+        let tools = connect_fixture(&session_name, None)
+            .await
+            .expect("fixture MCP server should connect");
 
         let names = tools
             .iter()
@@ -524,6 +818,108 @@ mod tests {
         assert!(resource.contains("resource body"));
 
         mcp_disconnect(session_name.clone()).await.unwrap();
+        assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_call_does_not_block_a_different_mcp_server() {
+        let suffix = std::process::id();
+        let slow_name = format!("fixture-slow-{suffix}");
+        let fast_name = format!("fixture-fast-{suffix}");
+        let (slow_tools, fast_tools) = tokio::join!(
+            connect_fixture(&slow_name, None),
+            connect_fixture(&fast_name, None)
+        );
+        slow_tools.expect("slow fixture should connect");
+        fast_tools.expect("fast fixture should connect");
+
+        let started_path = std::env::temp_dir().join(format!("mcp-delay-started-{suffix}"));
+        let _ = std::fs::remove_file(&started_path);
+        let started_arg = started_path.to_string_lossy().into_owned();
+        let slow_session = slow_name.clone();
+        let slow_call = tokio::spawn(async move {
+            mcp_call(
+                slow_session,
+                "delay_echo".into(),
+                Some(json!({
+                    "text": "slow",
+                    "delay_ms": 1_500,
+                    "started_path": started_arg,
+                })),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("slow fixture should acknowledge the active request");
+
+        let fast = tokio::time::timeout(
+            Duration::from_millis(800),
+            mcp_call(
+                fast_name.clone(),
+                "echo".into(),
+                Some(json!({"text":"fast"})),
+            ),
+        )
+        .await
+        .expect("a different MCP service must not wait for the slow service")
+        .expect("fast fixture call should succeed");
+        assert_eq!(fast, "fast");
+        assert_eq!(slow_call.await.unwrap().unwrap(), "slow");
+
+        let (slow_disconnect, fast_disconnect) =
+            tokio::join!(mcp_disconnect(slow_name), mcp_disconnect(fast_name));
+        slow_disconnect.unwrap();
+        fast_disconnect.unwrap();
+        let _ = std::fs::remove_file(started_path);
+    }
+
+    #[tokio::test]
+    async fn disconnect_and_reconnect_reuse_the_same_serialization_slot() {
+        let session_name = format!("fixture-reconnect-{}", std::process::id());
+        connect_fixture(&session_name, None).await.unwrap();
+        let before = find_session_slot(&session_name).unwrap().unwrap();
+
+        mcp_disconnect(session_name.clone()).await.unwrap();
+        assert!(!mcp_status(session_name.clone()).await.unwrap());
+        connect_fixture(&session_name, None).await.unwrap();
+
+        let after = find_session_slot(&session_name).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(mcp_status(session_name.clone()).await.unwrap());
+        mcp_disconnect(session_name).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_rejects_an_oversized_registry() {
+        let session_name = format!("fixture-too-many-tools-{}", std::process::id());
+        let env = HashMap::from([(
+            "MCP_FIXTURE_TOOL_COUNT".to_string(),
+            (MAX_TOOLS_PER_SESSION + 1).to_string(),
+        )]);
+        let error = connect_fixture(&session_name, Some(env))
+            .await
+            .expect_err("oversized MCP registries must be rejected");
+        assert!(error.contains("工具数量超过安全上限"), "{error}");
+        assert!(!mcp_status(session_name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_rejects_oversized_schema_metadata() {
+        let session_name = format!("fixture-oversized-schema-{}", std::process::id());
+        let env = HashMap::from([(
+            "MCP_FIXTURE_SCHEMA_BYTES".to_string(),
+            (MAX_TOOL_METADATA_BYTES + 1).to_string(),
+        )]);
+        let error = connect_fixture(&session_name, Some(env))
+            .await
+            .expect_err("oversized MCP schemas must be rejected");
+        assert!(error.contains("工具定义超过安全上限"), "{error}");
         assert!(!mcp_status(session_name).await.unwrap());
     }
 

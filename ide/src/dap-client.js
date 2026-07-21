@@ -283,6 +283,12 @@ export function createDapManager(options) {
       supportsInvalidatedEvent: true,
     });
     if (!session) return false; // could have died
+    if (initBody === null) {
+      pushConsole("stderr", "The initialize request timed out or was rejected by the adapter.\n");
+      showToast("Debug 初始化失败：调试器没有响应");
+      endSession("initialize failed");
+      return false;
+    }
     session.capabilities = initBody || {};
 
     // Kick off launch/attach; the adapter replies with an `initialized` event
@@ -297,6 +303,8 @@ export function createDapManager(options) {
     if (ok === null) {
       pushConsole("stderr", `The ${request} request was rejected by the adapter.\n`);
       showToast(`Debug ${request} failed — check the configuration.`);
+      endSession(`${request} failed`);
+      return false;
     } else {
       showToast(`Debugging started: ${config.name || adapterId}`);
     }

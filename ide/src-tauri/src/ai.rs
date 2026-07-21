@@ -3,14 +3,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
+
+const STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 20;
+const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 35;
+const STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
+const STANDARD_STREAM_STALL_TIMEOUT_SECS: u64 = 45;
+const HIGH_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 45;
+const HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
+const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
+const HIGH_STREAM_STALL_TIMEOUT_SECS: u64 = 90;
+const EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 90;
+const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
+const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
+const EXTENDED_STREAM_STALL_TIMEOUT_SECS: u64 = 120;
+
+const RESPONSE_HEADERS_TIMEOUT_ENV: &str = "MICHAEL_AI_RESPONSE_HEADERS_TIMEOUT_SECS";
+const FIRST_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_FIRST_PROGRESS_TIMEOUT_SECS";
+const EMPTY_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_EMPTY_STREAM_TIMEOUT_SECS";
+const STREAM_STALL_TIMEOUT_ENV: &str = "MICHAEL_AI_STREAM_STALL_TIMEOUT_SECS";
+
+const RESPONSE_HEADERS_TIMEOUT_MIN_SECS: u64 = 5;
+const RESPONSE_HEADERS_TIMEOUT_MAX_SECS: u64 = 300;
+const FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 10;
+const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 5;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
+const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
+const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
+const STREAM_READ_POLL: Duration = Duration::from_secs(2);
+const INCOMPLETE_SSE_STREAM_ERROR: &str = "AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断，已拒绝本轮结果，请重试。";
 
 /// Shared HTTP client. The agentic loop fires many sequential requests; a single
 /// pooled client reuses TCP+TLS connections (keep-alive) instead of doing a fresh
 /// handshake on every turn — the main source of "backend feels laggy" between
 /// turns. No total `.timeout()` is set because chat responses stream open-ended;
-/// only the connect phase is bounded.
+/// connection setup is bounded here and each streaming request separately bounds
+/// the wait for response headers.
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -81,6 +111,15 @@ pub struct AiConfig {
     /// when the user picks the "极限/max" tier in the model hover card.
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    /// UI 档位原值（off/low/medium/high/xhigh/max）。前端对每个模型都会带上它（包括那些
+    /// 只发 thinking/thinkingConfig 而不发 reasoning_effort 的家族），本字段只用于本地
+    /// 看门狗分档，绝不写进上游请求体。
+    #[serde(default)]
+    pub thinking_effort: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
+    #[serde(default)]
+    pub thinking_config: Option<serde_json::Value>,
     /// Unique per-run id from the JS side. `cancel_ai(id)` flips a flag the stream
     /// loop polls, so the user's Stop actually aborts the in-flight upstream request
     /// (frees the connection + stops token burn) instead of only muting the UI.
@@ -96,6 +135,12 @@ pub struct AiConfig {
     pub ide_mode: Option<String>,
     #[serde(default)]
     pub ide_tools: Option<String>,
+    /// User-local wall-clock context. The IANA name is a label; the bounded
+    /// offset is the source of truth for the current instant (including DST).
+    #[serde(default)]
+    pub ide_timezone: Option<String>,
+    #[serde(default)]
+    pub ide_utc_offset_minutes: Option<i16>,
 }
 
 /// Streamed back to the frontend over a Tauri channel as the model responds.
@@ -118,6 +163,16 @@ pub enum AiEvent {
         id: String,
         name: String,
         arguments: String,
+    },
+    /// Internal timing breadcrumbs for diagnosing "not really streaming" reports.
+    /// These are separate from real progress: response headers and raw chunks can
+    /// prove the transport is alive without proving the model has emitted usable
+    /// reasoning/content/tool arguments yet.
+    StreamMetric {
+        phase: String,
+        elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
     },
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
@@ -157,11 +212,7 @@ pub async fn ai_complete(
     messages: Vec<serde_json::Value>,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let base = config.base_url.trim_end_matches('/');
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err("AI base URL must start with http:// or https://".into());
-    }
-    let url = format!("{base}/chat/completions");
+    let url = chat_completions_url(&config.base_url)?;
     let payload = serde_json::json!({
         "model": config.model,
         "stream": false,
@@ -182,7 +233,7 @@ pub async fn ai_complete(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("AI request failed ({status}): {text}"));
+        return Err(format_ai_http_error(status, &text));
     }
 
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -223,6 +274,71 @@ fn mark_cache_breakpoint(msg: &mut serde_json::Value) {
     }
 }
 
+fn ai_error_detail_from_body(body: &str) -> String {
+    let raw = body.trim();
+    if raw.is_empty() {
+        return "empty response body".into();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(s) = v.get("error").and_then(|e| e.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v.get("message").and_then(|m| m.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(s) = v.get("detail").and_then(|m| m.as_str()) {
+            return s.trim().to_string();
+        }
+        if let Some(code) = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .or_else(|| v.get("code"))
+            .and_then(|c| {
+                c.as_str()
+                    .map(str::to_string)
+                    .or_else(|| c.as_i64().map(|n| n.to_string()))
+            })
+        {
+            return format!("error code: {code}");
+        }
+    }
+    raw.to_string()
+}
+
+fn format_ai_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "AI request failed ({status}): {}",
+        ai_error_detail_from_body(body)
+    )
+}
+
+/// Normalize an OpenAI-compatible chat endpoint. Users usually paste a base URL
+/// such as `https://api.openai.com/v1`, but many paste the provider root
+/// (`https://api.openai.com`) or a full `/chat/completions` URL. Accept all three
+/// shapes so BYOK does not fail for a harmless missing `/v1`.
+fn chat_completions_url(base_url: &str) -> Result<String, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err("AI base URL must start with http:// or https://".into());
+    }
+    if base.ends_with("/chat/completions") {
+        return Ok(base.to_string());
+    }
+    let api_base = if base.ends_with("/v1") || base.contains("/v1/") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
+    Ok(format!("{api_base}/chat/completions"))
+}
+
 /// Relay the optional L0 server-side-assembly headers. When the JS side set
 /// `ideMode`/`ideTools` (the default-off anti-reverse path), the gateway reads these
 /// and injects the system prompt + tool schemas itself; when unset, the builder is
@@ -235,7 +351,793 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     if let Some(t) = config.ide_tools.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-tools", t);
     }
+    if let Some(zone) = config.ide_timezone.as_deref().filter(|zone| {
+        !zone.is_empty()
+            && zone.len() <= 64
+            && zone.bytes().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, b'/' | b'_' | b'-' | b'+' | b'.')
+            })
+    }) {
+        rb = rb.header("x-ide-timezone", zone);
+    }
+    if let Some(offset) = config
+        .ide_utc_offset_minutes
+        .filter(|offset| (-840..=840).contains(offset))
+    {
+        rb = rb.header("x-ide-utc-offset-minutes", offset.to_string());
+    }
     rb
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamTimeouts {
+    response_headers: Duration,
+    first_progress: Duration,
+    empty_stream: Duration,
+    stall: Duration,
+}
+
+impl StreamTimeouts {
+    fn for_config(config: &AiConfig) -> Self {
+        Self::for_config_with_env(config, |name| std::env::var(name).ok())
+    }
+
+    fn for_config_with_env<F>(config: &AiConfig, read_env: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let effort = config
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or_default()
+            .trim();
+        // UI 档位原值：Gemini-3/Kimi/GLM 等家族只发 thinking/thinkingConfig 不发
+        // reasoning_effort，此前 serde 直接丢掉 thinkingEffort → 全部掉进 35s/18s 标准窗。
+        let ui_effort = config.thinking_effort.as_deref().unwrap_or_default().trim();
+        let thinking_enabled = config
+            .thinking
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str())
+            == Some("enabled")
+            || config.thinking_config.is_some();
+        let has_thinking_budget = config.thinking_budget.is_some_and(|budget| budget > 0);
+        let deep =
+            |value: &str| value.eq_ignore_ascii_case("max") || value.eq_ignore_ascii_case("xhigh");
+        // xhigh 与 max 同档：gpt-5.6 系把 xhigh 原样透传，此前它掉进 35s 标准窗——深度思考
+        // 本身就是长时间无输出，窗口太短会被无进度看门狗掐掉再重试，用户设的思考深度形同虚设。
+        let defaults = if has_thinking_budget || deep(effort) || deep(ui_effort) {
+            (
+                EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS,
+                EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
+                EXTENDED_STREAM_STALL_TIMEOUT_SECS,
+            )
+        } else if effort.eq_ignore_ascii_case("high")
+            || ui_effort.eq_ignore_ascii_case("high")
+            || thinking_enabled
+        {
+            (
+                HIGH_RESPONSE_HEADERS_TIMEOUT_SECS,
+                HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
+                HIGH_STREAM_STALL_TIMEOUT_SECS,
+            )
+        } else {
+            (
+                STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS,
+                STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
+                STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
+                STANDARD_STREAM_STALL_TIMEOUT_SECS,
+            )
+        };
+
+        Self {
+            response_headers: bounded_timeout_from_env(
+                read_env(RESPONSE_HEADERS_TIMEOUT_ENV),
+                defaults.0,
+                RESPONSE_HEADERS_TIMEOUT_MIN_SECS,
+                RESPONSE_HEADERS_TIMEOUT_MAX_SECS,
+            ),
+            first_progress: bounded_timeout_from_env(
+                read_env(FIRST_STREAM_PROGRESS_TIMEOUT_ENV),
+                defaults.1,
+                FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS,
+                FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS,
+            ),
+            empty_stream: bounded_timeout_from_env(
+                read_env(EMPTY_STREAM_PROGRESS_TIMEOUT_ENV),
+                defaults.2,
+                EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS,
+                EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS,
+            ),
+            stall: bounded_timeout_from_env(
+                read_env(STREAM_STALL_TIMEOUT_ENV),
+                defaults.3,
+                STREAM_STALL_TIMEOUT_MIN_SECS,
+                STREAM_STALL_TIMEOUT_MAX_SECS,
+            ),
+        }
+    }
+}
+
+fn bounded_timeout_from_env(
+    raw: Option<String>,
+    default_secs: u64,
+    min_secs: u64,
+    max_secs: u64,
+) -> Duration {
+    let seconds = raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(min_secs, max_secs))
+        .unwrap_or(default_secs);
+    Duration::from_secs(seconds)
+}
+
+fn duration_seconds_label(duration: Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        return duration.as_secs().to_string();
+    }
+    let seconds = format!("{:.3}", duration.as_secs_f64());
+    seconds
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn response_headers_timeout_error(timeout: Duration) -> String {
+    format!(
+        "AI request timed out waiting for response headers after {} seconds",
+        duration_seconds_label(timeout)
+    )
+}
+
+async fn send_with_response_headers_timeout(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(response_headers_timeout_error(timeout)),
+    }
+}
+
+#[derive(Debug)]
+struct StreamProgressDeadline {
+    last_progress: Instant,
+    first_activity: Option<Instant>,
+    has_progress: bool,
+    timeouts: StreamTimeouts,
+}
+
+impl StreamProgressDeadline {
+    fn new(now: Instant, timeouts: StreamTimeouts) -> Self {
+        Self {
+            last_progress: now,
+            first_activity: None,
+            has_progress: false,
+            timeouts,
+        }
+    }
+
+    fn record_activity(&mut self, now: Instant) {
+        if self.first_activity.is_none() {
+            self.first_activity = Some(now);
+        }
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.last_progress = now;
+        self.has_progress = true;
+    }
+
+    fn record_delta(&mut self, delta: &serde_json::Value, now: Instant) -> bool {
+        if !delta_has_real_progress(delta) {
+            return false;
+        }
+        self.record(now);
+        true
+    }
+
+    fn limit_and_anchor(&self) -> (Duration, Instant) {
+        if self.has_progress {
+            (self.timeouts.stall, self.last_progress)
+        } else if let Some(first_activity) = self.first_activity {
+            (self.timeouts.empty_stream, first_activity)
+        } else {
+            (self.timeouts.first_progress, self.last_progress)
+        }
+    }
+
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        let (limit, anchor) = self.limit_and_anchor();
+        let elapsed = now.duration_since(anchor);
+        (elapsed < limit).then(|| limit - elapsed)
+    }
+
+    fn error_message(&self) -> String {
+        let (limit, _) = self.limit_and_anchor();
+        let seconds = duration_seconds_label(limit);
+        if self.has_progress {
+            format!("模型连续 {seconds} 秒没有继续生成有效内容，已停止本轮，请重试。")
+        } else if self.first_activity.is_some() {
+            format!("上游已开始流式传输，但 {seconds} 秒内没有生成有效内容，已停止本轮，请重试。")
+        } else {
+            format!("模型在 {seconds} 秒内没有生成有效内容，已停止本轮，请重试。")
+        }
+    }
+}
+
+fn delta_has_real_progress(delta: &serde_json::Value) -> bool {
+    delta["reasoning_content"]
+        .as_str()
+        .or_else(|| delta["reasoning"].as_str())
+        .is_some_and(|text| !text.is_empty())
+        || delta["content"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+        || delta["tool_calls"].as_array().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                call["id"].as_str().is_some_and(|value| !value.is_empty())
+                    || call["function"]["name"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                    || call["function"]["arguments"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+            })
+        })
+}
+
+fn streamed_tool_call_index(call: &serde_json::Value) -> Result<u32, String> {
+    let raw = call["index"]
+        .as_u64()
+        .ok_or_else(|| "streamed tool call is missing its numeric index".to_string())?;
+    u32::try_from(raw).map_err(|_| "streamed tool call index is out of range".to_string())
+}
+
+fn elapsed_ms_since(started: Instant) -> u64 {
+    let ms = started.elapsed().as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+fn send_stream_metric(
+    on_event: &Channel<AiEvent>,
+    started: Instant,
+    phase: &str,
+    bytes: Option<u64>,
+) {
+    let _ = on_event.send(AiEvent::StreamMetric {
+        phase: phase.to_string(),
+        elapsed_ms: elapsed_ms_since(started),
+        bytes,
+    });
+}
+
+#[cfg(test)]
+mod ide_header_tests {
+    use super::*;
+
+    fn config() -> AiConfig {
+        AiConfig {
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "test".into(),
+            model: "test-model".into(),
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            thinking_effort: None,
+            thinking: None,
+            thinking_config: None,
+            request_id: None,
+            ide_mode: Some("agent".into()),
+            ide_tools: None,
+            ide_timezone: Some("America/Los_Angeles".into()),
+            ide_utc_offset_minutes: Some(-420),
+        }
+    }
+
+    #[test]
+    fn relays_bounded_user_timezone_headers() {
+        let request = with_ide_headers(
+            reqwest::Client::new().get("https://example.invalid"),
+            &config(),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["x-ide-timezone"], "America/Los_Angeles");
+        assert_eq!(request.headers()["x-ide-utc-offset-minutes"], "-420");
+    }
+
+    #[test]
+    fn drops_invalid_timezone_headers() {
+        let mut cfg = config();
+        cfg.ide_timezone = Some("bad\ntimezone".into());
+        cfg.ide_utc_offset_minutes = Some(900);
+        let request = with_ide_headers(reqwest::Client::new().get("https://example.invalid"), &cfg)
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key("x-ide-timezone"));
+        assert!(!request.headers().contains_key("x-ide-utc-offset-minutes"));
+    }
+
+    #[test]
+    fn normalizes_chat_completion_endpoint_shapes() {
+        assert_eq!(
+            chat_completions_url("https://api.openai.com").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/v1").unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.example/v1/chat/completions").unwrap(),
+            "https://gateway.example/v1/chat/completions"
+        );
+        assert!(chat_completions_url("api.openai.com/v1").is_err());
+    }
+
+    #[test]
+    fn ai_http_error_prefers_gateway_json_error_message() {
+        let message = format_ai_http_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"error":"【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。"}"#,
+        );
+        assert_eq!(
+            message,
+            "AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。"
+        );
+    }
+
+    #[test]
+    fn ai_http_error_keeps_provider_code_when_no_message_exists() {
+        let message = format_ai_http_error(reqwest::StatusCode::BAD_GATEWAY, r#"{"code":502}"#);
+        assert_eq!(
+            message,
+            "AI request failed (502 Bad Gateway): error code: 502"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_timeout_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+
+    fn config(reasoning_effort: Option<&str>, thinking_budget: Option<u32>) -> AiConfig {
+        AiConfig {
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "test".into(),
+            model: "test-model".into(),
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            thinking_budget,
+            thinking_effort: None,
+            thinking: None,
+            thinking_config: None,
+            request_id: None,
+            ide_mode: None,
+            ide_tools: None,
+            ide_timezone: None,
+            ide_utc_offset_minutes: None,
+        }
+    }
+
+    fn timeouts(reasoning_effort: Option<&str>, thinking_budget: Option<u32>) -> StreamTimeouts {
+        StreamTimeouts::for_config_with_env(&config(reasoning_effort, thinking_budget), |_| None)
+    }
+
+    async fn run_raw_sse_body(body: Vec<u8>) -> (Result<(), String>, Vec<serde_json::Value>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            socket.flush().unwrap();
+        });
+
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = events.clone();
+        let channel: Channel<AiEvent> = Channel::new(move |body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<serde_json::Value>().unwrap());
+            Ok(())
+        });
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+        let result = ai_chat_inner(
+            cfg,
+            vec![serde_json::json!({"role": "user", "content": "write it"})],
+            Some(vec![]),
+            channel,
+        )
+        .await;
+        server.join().unwrap();
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    fn non_metric_kinds(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event["kind"].as_str())
+            .filter(|kind| *kind != "streamMetric")
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn first_event_of_kind<'a>(
+        events: &'a [serde_json::Value],
+        kind: &str,
+    ) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|event| event["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing event kind {kind}"))
+    }
+
+    #[test]
+    fn default_medium_deadlines_stay_fast_and_bounded() {
+        let standard = StreamTimeouts {
+            response_headers: Duration::from_secs(20),
+            first_progress: Duration::from_secs(35),
+            empty_stream: Duration::from_secs(18),
+            stall: Duration::from_secs(45),
+        };
+        assert_eq!(timeouts(Some("medium"), None), standard);
+        assert_eq!(timeouts(Some("low"), None), standard);
+        assert_eq!(timeouts(None, None), standard);
+    }
+
+    #[test]
+    fn high_max_and_thinking_budget_get_longer_deadlines() {
+        assert_eq!(
+            timeouts(Some("high"), None),
+            StreamTimeouts {
+                response_headers: Duration::from_secs(45),
+                first_progress: Duration::from_secs(90),
+                // empty_stream 必须≈first_progress：网关 15s 心跳/空 role 预热帧一到，
+                // 窗口就从 first_progress 切到 empty_stream——小窗会把深思拦腰掐断
+                empty_stream: Duration::from_secs(90),
+                stall: Duration::from_secs(90),
+            }
+        );
+        let extended = StreamTimeouts {
+            response_headers: Duration::from_secs(90),
+            first_progress: Duration::from_secs(180),
+            empty_stream: Duration::from_secs(180),
+            stall: Duration::from_secs(120),
+        };
+        assert_eq!(timeouts(Some("max"), None), extended);
+        // gpt-5.6 系把 xhigh 原样透传——它必须和 max 同档，否则 XHigh 深思会被 35s 标准窗掐死
+        assert_eq!(timeouts(Some("xhigh"), None), extended);
+        assert_eq!(timeouts(Some("XHigh"), None), extended); // 大小写不敏感
+        assert_eq!(timeouts(Some("high"), Some(32_000)), extended);
+        assert_eq!(timeouts(Some("medium"), Some(1)), extended);
+    }
+
+    #[test]
+    fn environment_overrides_are_independent_and_clamped() {
+        let values = HashMap::from([
+            (RESPONSE_HEADERS_TIMEOUT_ENV, "1".to_string()),
+            (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "9999".to_string()),
+            (EMPTY_STREAM_PROGRESS_TIMEOUT_ENV, "3".to_string()),
+            (STREAM_STALL_TIMEOUT_ENV, "61".to_string()),
+        ]);
+        let overridden = StreamTimeouts::for_config_with_env(&config(Some("high"), None), |name| {
+            values.get(name).cloned()
+        });
+        assert_eq!(
+            overridden,
+            StreamTimeouts {
+                response_headers: Duration::from_secs(5),
+                first_progress: Duration::from_secs(300),
+                empty_stream: Duration::from_secs(5),
+                stall: Duration::from_secs(61),
+            }
+        );
+
+        let invalid = HashMap::from([
+            (RESPONSE_HEADERS_TIMEOUT_ENV, "not-a-number".to_string()),
+            (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "".to_string()),
+            (
+                EMPTY_STREAM_PROGRESS_TIMEOUT_ENV,
+                "not-a-number".to_string(),
+            ),
+            (STREAM_STALL_TIMEOUT_ENV, "-10".to_string()),
+        ]);
+        assert_eq!(
+            StreamTimeouts::for_config_with_env(&config(Some("medium"), None), |name| {
+                invalid.get(name).cloned()
+            }),
+            timeouts(Some("medium"), None),
+            "invalid overrides must preserve the selected profile defaults"
+        );
+    }
+
+    #[test]
+    fn uses_separate_first_progress_and_stall_deadlines() {
+        let timeouts = timeouts(Some("medium"), None);
+
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+        assert_eq!(
+            progress.remaining(started + Duration::from_secs(34)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(progress.remaining(started + timeouts.first_progress), None);
+
+        progress.record(started + Duration::from_secs(20));
+        assert_eq!(
+            progress.remaining(started + Duration::from_secs(64)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(progress.remaining(started + Duration::from_secs(65)), None);
+    }
+
+    #[test]
+    fn raw_stream_activity_without_real_delta_uses_short_deadline() {
+        let timeouts = timeouts(Some("high"), None);
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+
+        assert_eq!(
+            progress.remaining(started + Duration::from_secs(40)),
+            Some(Duration::from_secs(50)),
+            "before any bytes arrive, high reasoning may still wait for first progress"
+        );
+
+        let first_raw_chunk = started + Duration::from_secs(2);
+        progress.record_activity(first_raw_chunk);
+        assert_eq!(
+            progress.remaining(first_raw_chunk + timeouts.empty_stream - Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "once raw bytes arrive, empty streams must stop quickly instead of using the high first-progress window"
+        );
+        assert_eq!(
+            progress.remaining(first_raw_chunk + timeouts.empty_stream),
+            None
+        );
+
+        progress.record(first_raw_chunk + Duration::from_secs(4));
+        assert_eq!(
+            progress.remaining(first_raw_chunk + Duration::from_secs(4) + timeouts.stall),
+            None,
+            "real progress switches back to the normal stall deadline"
+        );
+    }
+
+    #[test]
+    fn only_non_empty_model_deltas_reset_progress() {
+        let timeouts = timeouts(Some("medium"), None);
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+
+        for non_progress in [
+            serde_json::json!({}),
+            serde_json::json!({"role": "assistant"}),
+            serde_json::json!({"content": ""}),
+            serde_json::json!({"reasoning_content": ""}),
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": ""}}]}),
+        ] {
+            assert!(!progress.record_delta(&non_progress, started + Duration::from_secs(24)));
+        }
+        assert_eq!(
+            progress.remaining(started + timeouts.first_progress),
+            None,
+            "heartbeats, role-only events, and empty deltas must not extend the deadline"
+        );
+
+        for real_progress in [
+            serde_json::json!({"reasoning_content": "thinking"}),
+            serde_json::json!({"content": "token"}),
+            serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}),
+        ] {
+            let mut candidate = StreamProgressDeadline::new(started, timeouts);
+            assert!(candidate.record_delta(&real_progress, started + Duration::from_secs(1)));
+            assert!(candidate.has_progress);
+        }
+    }
+
+    #[test]
+    fn streamed_tool_calls_require_an_explicit_index() {
+        assert_eq!(
+            streamed_tool_call_index(&serde_json::json!({"index": 3})).unwrap(),
+            3
+        );
+        assert!(streamed_tool_call_index(&serde_json::json!({})).is_err());
+        assert!(streamed_tool_call_index(&serde_json::json!({"index": "0"})).is_err());
+    }
+
+    #[test]
+    fn timeout_errors_report_the_configured_duration() {
+        let timeouts = StreamTimeouts {
+            response_headers: Duration::from_secs(73),
+            first_progress: Duration::from_secs(81),
+            empty_stream: Duration::from_secs(17),
+            stall: Duration::from_secs(97),
+        };
+        assert_eq!(
+            response_headers_timeout_error(timeouts.response_headers),
+            "AI request timed out waiting for response headers after 73 seconds"
+        );
+
+        let started = Instant::now();
+        let mut progress = StreamProgressDeadline::new(started, timeouts);
+        assert_eq!(
+            progress.error_message(),
+            "模型在 81 秒内没有生成有效内容，已停止本轮，请重试。"
+        );
+        progress.record_activity(started + Duration::from_secs(1));
+        assert_eq!(
+            progress.error_message(),
+            "上游已开始流式传输，但 17 秒内没有生成有效内容，已停止本轮，请重试。"
+        );
+        progress.record(started + Duration::from_secs(1));
+        assert_eq!(
+            progress.error_message(),
+            "模型连续 97 秒没有继续生成有效内容，已停止本轮，请重试。"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_header_wait_is_bounded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let error = send_with_response_headers_timeout(
+            reqwest::Client::new().get(format!("http://{address}/chat/completions")),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "AI request timed out waiting for response headers after 0.02 seconds"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn clean_eof_without_done_rejects_partial_tool_arguments() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let partial_args = r#"{"path":"src/main.js","content":"partial"#;
+        let data = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_partial",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": partial_args,
+                        }
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {data}\n\n");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        });
+
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = events.clone();
+        let channel: Channel<AiEvent> = Channel::new(move |body| {
+            captured
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<serde_json::Value>().unwrap());
+            Ok(())
+        });
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+
+        let error = ai_chat_inner(
+            cfg,
+            vec![serde_json::json!({"role": "user", "content": "write it"})],
+            Some(vec![]),
+            channel,
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error, INCOMPLETE_SSE_STREAM_ERROR);
+        let events = events.lock().unwrap();
+        let kinds = non_metric_kinds(&events);
+        assert_eq!(kinds, ["toolCall", "error"]);
+        assert_eq!(
+            first_event_of_kind(&events, "toolCall")["arguments"],
+            partial_args
+        );
+        assert_eq!(
+            first_event_of_kind(&events, "error")["message"],
+            INCOMPLETE_SSE_STREAM_ERROR
+        );
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_before_done_rejects_complete_tool_argument_prefix() {
+        let arguments = r#"{"path":"src/main.js","content":"prefix"}"#;
+        let first = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_prefix",
+                        "function": {"name": "write_file", "arguments": arguments}
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {first}\n\ndata: {{malformed\n\ndata: [DONE]\n\n").into_bytes();
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("malformed SSE JSON"));
+        let kinds = non_metric_kinds(&events);
+        assert_eq!(kinds, ["toolCall", "error"]);
+        assert_eq!(
+            first_event_of_kind(&events, "toolCall")["arguments"],
+            arguments
+        );
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_frame_before_done_rejects_the_stream() {
+        let mut body = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        body.push(0xff);
+        body.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+
+        let (result, events) = run_raw_sse_body(body).await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("invalid UTF-8 SSE data"));
+        let kinds = non_metric_kinds(&events);
+        assert_eq!(kinds, ["error"]);
+        assert!(!events.iter().any(|event| event["kind"] == "done"));
+    }
 }
 
 async fn ai_chat_inner(
@@ -244,7 +1146,10 @@ async fn ai_chat_inner(
     tools: Option<Vec<serde_json::Value>>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+    let timeouts = StreamTimeouts::for_config(&config);
+    let url = chat_completions_url(&config.base_url)?;
+    let stream_started = Instant::now();
+    send_stream_metric(&on_event, stream_started, "requestStarted", None);
     let mut payload = serde_json::json!({
         "model": config.model,
         "stream": true,
@@ -276,6 +1181,12 @@ async fn ai_chat_inner(
             // Anthropic-native shape for relays that route via /v1/messages.
             payload["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
         }
+    }
+    if let Some(ref thinking) = config.thinking {
+        payload["thinking"] = thinking.clone();
+    }
+    if let Some(ref thinking_config) = config.thinking_config {
+        payload["thinking_config"] = thinking_config.clone();
     }
 
     // ── Prompt caching for Anthropic / Claude upstreams ─────────────────────
@@ -338,34 +1249,39 @@ async fn ai_chat_inner(
     }
 
     let client = &*HTTP;
-    let mut resp = with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut resp = send_with_response_headers_timeout(
+        with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config).json(&payload),
+        timeouts.response_headers,
+    )
+    .await?;
     // If a strict gateway rejects the request (4xx — most likely the optional
     // `stream_options` it doesn't recognize), drop that field and retry ONCE. So
     // asking for usage stats can never break chat.
-    if resp.status().is_client_error() && payload.get("stream_options").is_some() {
+    if resp.status().is_client_error()
+        && resp.status() != reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        && payload.get("stream_options").is_some()
+    {
         if let Some(o) = payload.as_object_mut() {
             o.remove("stream_options");
         }
-        resp = with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        resp = send_with_response_headers_timeout(
+            with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
+                .json(&payload),
+            timeouts.response_headers,
+        )
+        .await?;
     }
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let message = format!("AI request failed ({status}): {text}");
+        let message = format_ai_http_error(status, &text);
         let _ = on_event.send(AiEvent::Error {
             message: message.clone(),
         });
         return Err(message);
     }
+    send_stream_metric(&on_event, stream_started, "responseHeaders", None);
 
     let mut stream = resp.bytes_stream();
     // Accumulate RAW BYTES, not lossily-decoded strings: a multibyte UTF-8 char
@@ -376,16 +1292,14 @@ async fn ai_chat_inner(
     // UTF-8 sequence, so splitting on the byte and decoding each *complete* line
     // is always valid.
     let mut buf: Vec<u8> = Vec::new();
-    // Stall guard for the hung turn ("半天不走内容"): the upstream sends the response
-    // headers, then stops producing — either fully silent (no bytes) OR dribbling
-    // keepalive/ping bytes with no actual content (which also defeats the gateway's
-    // own idle timeout, since from its side bytes are still flowing). Poll the read
-    // on a short interval and end the turn only when NO real progress
-    // (token/reasoning/tool-call) has happened for STALL_LIMIT — so a slow-but-alive
-    // stream is never killed, but a genuinely stuck one stops instead of hanging.
-    const READ_POLL: std::time::Duration = std::time::Duration::from_secs(10);
-    const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(75);
-    let mut last_progress = std::time::Instant::now();
+    // A transport heartbeat is not model progress. The first non-empty
+    // reasoning/token/tool-call delta must arrive promptly; after that, each real
+    // delta gets a longer stall window. SSE comments, empty deltas, usage-only
+    // chunks and arbitrary response bytes never extend either deadline.
+    let mut progress = StreamProgressDeadline::new(Instant::now(), timeouts);
+    let mut raw_stream_bytes: u64 = 0;
+    let mut sent_first_chunk_metric = false;
+    let mut sent_first_progress_metric = false;
     // Cancellation: register a flag keyed by the JS-supplied request_id (if any).
     // The guard removes it on every return path; the loop polls it so Stop aborts.
     let req_id = config.request_id.clone().filter(|s| !s.is_empty());
@@ -393,31 +1307,48 @@ async fn ai_chat_inner(
     let _cancel_guard = req_id.map(CancelGuard);
     loop {
         // User hit Stop → cancel_ai flipped this flag: end the turn now so the
-        // upstream connection closes and token generation stops (≤READ_POLL latency).
+        // upstream connection closes and token generation stops
+        // (at most STREAM_READ_POLL latency).
         if let Some(f) = &cancel_flag {
             if f.load(Ordering::SeqCst) {
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
             }
         }
-        let chunk = match tokio::time::timeout(READ_POLL, stream.next()).await {
+        let Some(remaining) = progress.remaining(Instant::now()) else {
+            let _ = on_event.send(AiEvent::Error {
+                message: progress.error_message(),
+            });
+            let _ = on_event.send(AiEvent::Done);
+            return Ok(());
+        };
+        let chunk = match tokio::time::timeout(remaining.min(STREAM_READ_POLL), stream.next()).await
+        {
             Ok(Some(Ok(c))) => c,
             // A mid-stream read error means the connection dropped partway (common
             // on cross-border / lossy links — "error decoding response body"). Keep
             // what we've already streamed and end the turn gracefully.
             Ok(Some(Err(_e))) => {
                 let _ = on_event.send(AiEvent::Error {
-                    message: "连接中断（网络波动），已保留生成的部分，请点重试继续。".to_string(),
+                    message: "连接中断（网络波动），已保留生成的部分，正在自动恢复。".to_string(),
                 });
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
             }
-            Ok(None) => break, // stream ended normally
+            Ok(None) => {
+                // OpenAI-compatible SSE is complete only after the explicit [DONE]
+                // sentinel. A clean TCP EOF can still be a proxy/upstream truncation;
+                // treating it as Done would authorize partially streamed tool arguments.
+                let message = INCOMPLETE_SSE_STREAM_ERROR.to_string();
+                let _ = on_event.send(AiEvent::Error {
+                    message: message.clone(),
+                });
+                return Err(message);
+            }
             Err(_elapsed) => {
-                // No bytes this interval — only bail if nothing has progressed at all.
-                if last_progress.elapsed() >= STALL_LIMIT {
+                if progress.remaining(Instant::now()).is_none() {
                     let _ = on_event.send(AiEvent::Error {
-                        message: "模型长时间无响应（连接卡住），已停止本轮，请点重试。".to_string(),
+                        message: progress.error_message(),
                     });
                     let _ = on_event.send(AiEvent::Done);
                     return Ok(());
@@ -425,125 +1356,161 @@ async fn ai_chat_inner(
                 continue;
             }
         };
+        // 只统计字节；activity 的判定放到 SSE 行解析处——`: ping` 心跳注释和
+        // 空 role 预热帧不能算"开始输出"，否则 first_progress 大窗会被降级成 empty_stream 小窗。
+        raw_stream_bytes = raw_stream_bytes.saturating_add(chunk.len() as u64);
+        if !sent_first_chunk_metric {
+            sent_first_chunk_metric = true;
+            send_stream_metric(
+                &on_event,
+                stream_started,
+                "firstChunk",
+                Some(raw_stream_bytes),
+            );
+        }
         buf.extend_from_slice(&chunk);
-        // Any bytes at all (even SSE comments / heartbeats) prove the connection is alive
-        // and the upstream is still processing — reset the stall detector so a long
-        // "thinking" pause doesn't trigger a false timeout as long as heartbeats flow.
-        last_progress = std::time::Instant::now();
 
         // Server-sent events are newline-delimited `data: {...}` lines.
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim();
+            let line = match std::str::from_utf8(&line_bytes) {
+                Ok(line) => line.trim(),
+                Err(error) => {
+                    let message = format!("AI stream contains invalid UTF-8 SSE data: {error}");
+                    let _ = on_event.send(AiEvent::Error {
+                        message: message.clone(),
+                    });
+                    return Err(message);
+                }
+            };
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
             let data = data.trim();
+            progress.record_activity(Instant::now()); // 真正的 data 帧才算上游开始流式输出
             if data == "[DONE]" {
+                send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
                 let _ = on_event.send(AiEvent::Done);
                 return Ok(());
             }
             if data.is_empty() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                // Usage normally rides the FINAL chunk (choices may be empty there).
-                // Cached-prompt tokens are reported differently per provider — take
-                // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
-                // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
-                // style `cache_read_input_tokens`.
-                if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
-                    let completion = usage["completion_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
-                        .unwrap_or(0);
-                    let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
-                    let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                    let cached = usage["prompt_tokens_details"]["cached_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
-                        .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
-                        .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
-                        .or(cache_read)
-                        .unwrap_or(0);
-                    let prompt_raw = usage["prompt_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
-                        .unwrap_or(0);
-                    // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
-                    // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
-                    // so add them — otherwise `cached / prompt` reads as >100%.
-                    let prompt = if cache_read.is_some() {
-                        prompt_raw + cached + cache_creation
-                    } else {
-                        prompt_raw
-                    };
-                    if prompt > 0 || completion > 0 {
-                        let _ = on_event.send(AiEvent::Usage {
-                            prompt_tokens: prompt as u32,
-                            completion_tokens: completion as u32,
-                            cached_tokens: cached as u32,
-                        });
-                    }
+            let v = match serde_json::from_str::<serde_json::Value>(data) {
+                Ok(value) => value,
+                Err(error) => {
+                    let message = format!("AI stream contains malformed SSE JSON: {error}");
+                    let _ = on_event.send(AiEvent::Error {
+                        message: message.clone(),
+                    });
+                    return Err(message);
                 }
-                let delta = &v["choices"][0]["delta"];
-                // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
-                if let Some(rt) = delta["reasoning_content"]
-                    .as_str()
-                    .or_else(|| delta["reasoning"].as_str())
-                {
-                    if !rt.is_empty() {
-                        let _ = on_event.send(AiEvent::Reasoning {
-                            delta: rt.to_string(),
-                        });
-                        last_progress = std::time::Instant::now();
-                    }
+            };
+            // Usage normally rides the FINAL chunk (choices may be empty there).
+            // Cached-prompt tokens are reported differently per provider — take
+            // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
+            // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
+            // style `cache_read_input_tokens`.
+            if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+                let completion = usage["completion_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
+                    .unwrap_or(0);
+                let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
+                let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
+                    .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
+                    .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
+                    .or(cache_read)
+                    .unwrap_or(0);
+                let prompt_raw = usage["prompt_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
+                    .unwrap_or(0);
+                // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
+                // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
+                // so add them — otherwise `cached / prompt` reads as >100%.
+                let prompt = if cache_read.is_some() {
+                    prompt_raw + cached + cache_creation
+                } else {
+                    prompt_raw
+                };
+                if prompt > 0 || completion > 0 {
+                    let _ = on_event.send(AiEvent::Usage {
+                        prompt_tokens: prompt as u32,
+                        completion_tokens: completion as u32,
+                        cached_tokens: cached as u32,
+                    });
                 }
-                if let Some(text) = delta["content"].as_str() {
-                    if !text.is_empty() {
-                        let _ = on_event.send(AiEvent::Token {
-                            delta: text.to_string(),
-                        });
-                        last_progress = std::time::Instant::now();
-                    }
+            }
+            let delta = &v["choices"][0]["delta"];
+            if progress.record_delta(delta, Instant::now()) && !sent_first_progress_metric {
+                sent_first_progress_metric = true;
+                send_stream_metric(
+                    &on_event,
+                    stream_started,
+                    "firstProgress",
+                    Some(raw_stream_bytes),
+                );
+            }
+            // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
+            if let Some(rt) = delta["reasoning_content"]
+                .as_str()
+                .or_else(|| delta["reasoning"].as_str())
+            {
+                if !rt.is_empty() {
+                    let _ = on_event.send(AiEvent::Reasoning {
+                        delta: rt.to_string(),
+                    });
                 }
-                if let Some(tcs) = delta["tool_calls"].as_array() {
-                    for tc in tcs {
-                        let index = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let id = tc["id"].as_str().unwrap_or("").to_string();
-                        let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                        let args = tc["function"]["arguments"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                            let _ = on_event.send(AiEvent::ToolCall {
-                                index,
-                                id,
-                                name,
-                                arguments: args,
-                            });
-                            last_progress = std::time::Instant::now();
+            }
+            if let Some(text) = delta["content"].as_str() {
+                if !text.is_empty() {
+                    let _ = on_event.send(AiEvent::Token {
+                        delta: text.to_string(),
+                    });
+                }
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    let index = match streamed_tool_call_index(tc) {
+                        Ok(index) => index,
+                        Err(message) => {
+                            let _ = on_event.send(AiEvent::Error { message });
+                            let _ = on_event.send(AiEvent::Done);
+                            return Ok(());
                         }
+                    };
+                    let id = tc["id"].as_str().unwrap_or("").to_string();
+                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                    let args = tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                        let _ = on_event.send(AiEvent::ToolCall {
+                            index,
+                            id,
+                            name,
+                            arguments: args,
+                        });
                     }
                 }
             }
         }
 
-        // Bytes may keep flowing (keepalive / ping comments) with no content — if
-        // there has been no real progress for STALL_LIMIT, treat it as a stall too.
-        if last_progress.elapsed() >= STALL_LIMIT {
+        // Continuous heartbeat chunks may prevent the read timeout from firing, so
+        // enforce the same real-progress deadline after every parsed network chunk.
+        if progress.remaining(Instant::now()).is_none() {
             let _ = on_event.send(AiEvent::Error {
-                message: "模型长时间无响应（连接卡住），已停止本轮，请点重试。".to_string(),
+                message: progress.error_message(),
             });
             let _ = on_event.send(AiEvent::Done);
             return Ok(());
         }
     }
-
-    let _ = on_event.send(AiEvent::Done);
-    Ok(())
 }
 
 /// SSRF policy for this single-user, on-device dev IDE. The user explicitly wants
@@ -689,15 +1656,47 @@ pub async fn web_fetch(url: String) -> Result<String, String> {
     let resp = client
         .get(parsed)
         .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,zh-CN;q=0.8")
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Cache-Control", "max-age=0")
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
     let status = resp.status();
+    let code = status.as_u16();
+
+    // Anti-bot wall (403/503/429): fall back to headless Chrome which has a real
+    // TLS fingerprint and runs JS — bypasses Dianping/Meituan/etc. cookie walls.
+    if code == 403 || code == 503 || code == 429 {
+        if let Some(browser) = crate::capture::find_headless_browser() {
+            let url_str = url.trim().to_string();
+            let rendered = tokio::time::timeout(
+                std::time::Duration::from_secs(16),
+                tauri::async_runtime::spawn_blocking(move || render_dom(&browser, &url_str)),
+            )
+            .await;
+            if let Ok(Ok(Some(html))) = rendered {
+                let text = html_to_text(&html);
+                if text.len() > 100 {
+                    return Ok(text.chars().take(24_000).collect());
+                }
+            }
+        }
+        return Err(format!(
+            "HTTP {} (反爬拦截，无头浏览器也未能获取内容)",
+            code
+        ));
+    }
+
     if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+        return Err(format!("HTTP {}", code));
     }
 
     let ct = resp
@@ -794,7 +1793,7 @@ fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// Web search (DuckDuckGo HTML, no API key) so the agent can FIND docs/articles,
+/// Web search (Google, Bing, and DuckDuckGo scraping, no API key) so the agent can FIND docs/articles,
 /// then `web_fetch` the ones it wants. Returns title + real URL + snippet.
 #[tauri::command]
 pub async fn web_search(query: String) -> Result<String, String> {
@@ -824,10 +1823,10 @@ pub async fn web_search(query: String) -> Result<String, String> {
     .unwrap_or_default();
     if results.is_empty() {
         return Ok(format!(
-            "「{q}」这次没搜到结果（搜索引擎临时限流/反爬，或关键词太宽泛）。**别停在这里——主动操控浏览器自己搜**：① 换更具体的英文关键词，多调几次 web_search；② 用 browser navigate 打开 https://www.bing.com/search?q=... 或 https://duckduckgo.com/?q=... 亲自看结果、点进去用 browser/ web_fetch 读全文；③ 直接 web_fetch 你已知的官方文档 / 仓库 README / API 页读原文。至少换 2 个来源交叉验证再下结论。"
+            "「{q}」这次没搜到结果（搜索引擎可能限流、反爬，或当前关键词没有索引结果）。不要原样重发或只换近义词反复搜索：已有明确官方 URL 就直接 web_fetch；只有出现新的具体假设时才换一次真正不同的来源或检索方式。仍无新增证据就停止，并如实说明这次没有检索到可验证结果。"
         ));
     }
-    let mut out = format!("搜索「{q}」的结果（Bing+DuckDuckGo 合并去重）：\n");
+    let mut out = format!("搜索「{q}」的结果（Google+Bing+DuckDuckGo 实际响应合并去重）：\n");
     for (i, (title, url, snippet)) in results.iter().take(12).enumerate() {
         out.push_str(&format!(
             "\n{}. {}\n   {}\n   {}\n",
@@ -842,8 +1841,8 @@ pub async fn web_search(query: String) -> Result<String, String> {
 }
 
 /// Run ALL search engines concurrently, MERGE and deduplicate results.
-/// Bing goes first in merge order (usually better quality, especially for Chinese),
-/// then DuckDuckGo HTML, then DDG Lite. Each engine has its own 8s timeout so the
+/// Google goes first in merge order, followed by Bing, DuckDuckGo HTML, then DDG Lite.
+/// Each engine has its own 8s timeout so the
 /// total wall-clock is max ~8s (all run in parallel).
 async fn ddg_search_multi(q: &str) -> Vec<(String, String, String)> {
     let (google, bing, ddg, lite) = tokio::join!(
