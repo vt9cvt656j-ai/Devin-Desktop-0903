@@ -11205,8 +11205,16 @@ function _isKnownThinkingModel(id) {
 function _thinkingPrefFor(id) {
   const profile = _thinkingProfileFor(id);
   const prefs = _loadThinkingPrefs();
-  if (prefs[id] && (profile.levels || []).includes(prefs[id])) return prefs[id];
-  return profile.defaultLevel || "off";
+  const levels = profile.levels || [];
+  const saved = prefs[id];
+  if (saved && levels.includes(saved)) {
+    // 支持思考的模型一律保持思考开启：档位可选，但不允许落回「off」。
+    if (saved !== "off" || !profile.configurable) return saved;
+  }
+  const dflt = profile.defaultLevel || "off";
+  if (!profile.configurable || dflt !== "off") return dflt;
+  if (levels.includes("medium")) return "medium";
+  return levels.find((l) => l !== "off") || dflt;
 }
 function _setThinkingPref(id, level) {
   const profile = _thinkingProfileFor(id);
