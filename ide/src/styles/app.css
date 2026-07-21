@@ -2148,25 +2148,40 @@ body.zen-mode .editor {
 .msg.user .msg__body code {
   background: rgba(255, 255, 255, 0.22);
 }
-/* ---- edit & resend (double-click a sent message) ---- */
+/* ---- edit & resend (double-click a sent message) ----
+   Editing turns the bubble into a card matching the bottom composer:
+   white rounded input box + accent-blue send button. */
 .msg.user .msg__body { cursor: pointer; }
+.msg.user .msg__body:has(.msg__edit-ta) {
+  background: var(--panel-solid);
+  padding: 8px;
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-sm);
+  cursor: default;
+  width: 88%;
+}
 .msg__edit-ta {
-  width: 100%; min-width: 260px; box-sizing: border-box; resize: vertical;
+  width: 100%; box-sizing: border-box; resize: vertical;
   font-family: var(--font); font-size: 13.5px; line-height: 1.5;
-  color: #fff; background: rgba(255, 255, 255, 0.14);
-  border: 1px solid rgba(255, 255, 255, 0.4); border-radius: 8px;
-  padding: 6px 8px; outline: none;
+  color: var(--text); background: var(--editor-bg);
+  border: 1px solid var(--line-strong); border-radius: 12px;
+  padding: 10px 12px; outline: none;
+  transition: border-color 0.13s ease, box-shadow 0.13s ease;
 }
-.msg__edit-ta::placeholder { color: rgba(255, 255, 255, 0.6); }
-.msg__edit-bar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.msg__edit-ta:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--sel); }
+.msg__edit-ta::placeholder { color: var(--text-dim); }
+.msg__edit-bar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
 .msg__edit-btn {
-  font-size: 12px; padding: 4px 12px; border-radius: 7px; cursor: pointer;
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  background: transparent; color: #fff;
+  font-size: 12px; padding: 5px 14px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-solid); color: var(--text);
+  transition: background 0.13s ease;
 }
-.msg__edit-btn:hover { background: rgba(255, 255, 255, 0.15); }
-.msg__edit-btn--send { background: #fff; color: var(--accent); border-color: #fff; font-weight: 600; }
-.msg__edit-btn--send:hover { background: rgba(255, 255, 255, 0.88); }
+.msg__edit-btn:hover { background: var(--hover); }
+.msg__edit-btn--send {
+  background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
+}
+.msg__edit-btn--send:hover { background: #0a6fe0; }
 
 /* ---- code card (v3 — matching agent tool cards) ---- */
 .code-card {
