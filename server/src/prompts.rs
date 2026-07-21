@@ -2924,11 +2924,9 @@ mod tests {
     #[test]
     fn full_agent_prompt_is_routed_by_task_without_losing_the_core() {
         let full = read_prompt("agent").expect("full agent prompt should load");
-        assert!(full.contains("CodePen 页面候选"));
-        assert!(full.contains("Best of JS 公开数据集"));
-        assert!(full.contains("rust_users"));
-        assert!(full.contains("success/empty/rate-limited/failed/timeout"));
-        assert!(full.contains("`github_trending(query)`"));
+        assert!(full.contains("开发者资源与专业数据源"));
+        assert!(full.contains("`search_tools`"));
+        assert!(full.contains("不把\"发起查询\"写成\"已成功接入\""));
         assert!(full.contains("不做空洞道德审判"));
         assert!(full.contains("授权测试/防御替代方案"));
         assert!(full.contains("不粉饰灰色地带"));
@@ -2950,10 +2948,18 @@ mod tests {
         assert!(!coding.contains("# 十一、UI / 界面"));
         assert_eq!(coding_blocks, vec!["agent_core"]);
         assert!(
-            coding.len() * 20 < full.len() * 13,
-            "routine coding prompt should omit at least 35% of irrelevant bytes: {} vs {}",
+            coding.len() < full.len(),
+            "routing must strip the legacy domain chapters: {} vs {}",
             coding.len(),
             full.len()
+        );
+        // Regression budget: the always-on engineering core must not grow back toward the
+        // old monolith. (The legacy §九/§十/§十一 chapters are now compact pointers whose
+        // detail lives in the intent-gated modules, so the stripped share is smaller.)
+        assert!(
+            coding.len() < 75_000,
+            "agent core grew past its byte budget: {}",
+            coding.len()
         );
 
         let (research, research_blocks) = routed_full_agent_prompt(&full);

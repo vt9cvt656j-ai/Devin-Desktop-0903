@@ -393,11 +393,7 @@ impl StreamTimeouts {
             .trim();
         // UI 档位原值：Gemini-3/Kimi/GLM 等家族只发 thinking/thinkingConfig 不发
         // reasoning_effort，此前 serde 直接丢掉 thinkingEffort → 全部掉进 35s/18s 标准窗。
-        let ui_effort = config
-            .thinking_effort
-            .as_deref()
-            .unwrap_or_default()
-            .trim();
+        let ui_effort = config.thinking_effort.as_deref().unwrap_or_default().trim();
         let thinking_enabled = config
             .thinking
             .as_ref()
@@ -406,9 +402,8 @@ impl StreamTimeouts {
             == Some("enabled")
             || config.thinking_config.is_some();
         let has_thinking_budget = config.thinking_budget.is_some_and(|budget| budget > 0);
-        let deep = |value: &str| {
-            value.eq_ignore_ascii_case("max") || value.eq_ignore_ascii_case("xhigh")
-        };
+        let deep =
+            |value: &str| value.eq_ignore_ascii_case("max") || value.eq_ignore_ascii_case("xhigh");
         // xhigh 与 max 同档：gpt-5.6 系把 xhigh 原样透传，此前它掉进 35s 标准窗——深度思考
         // 本身就是长时间无输出，窗口太短会被无进度看门狗掐掉再重试，用户设的思考深度形同虚设。
         let defaults = if has_thinking_budget || deep(effort) || deep(ui_effort) {

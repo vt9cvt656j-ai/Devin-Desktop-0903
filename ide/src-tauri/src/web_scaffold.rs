@@ -75,11 +75,7 @@ pub async fn web_scaffold(
     put(&dir, ".gitignore", GITIGNORE).await?;
     put(&dir, "README.md", &readme(&proj)).await?;
 
-    let mut files: Vec<&str> = vec![
-        "src/style.css",
-        "README.md",
-        ".gitignore",
-    ];
+    let mut files: Vec<&str> = vec!["src/style.css", "README.md", ".gitignore"];
 
     if is_react {
         put(&dir, "package.json", &pkg_json(&proj, true)).await?;

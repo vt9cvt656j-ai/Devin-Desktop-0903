@@ -705,13 +705,20 @@ fn npm_exact_query(q: &str) -> bool {
 
 fn npm_registry_path(name: &str) -> String {
     let mut out = String::new();
-    for (part_index, part) in name.trim().split('/').filter(|part| !part.is_empty()).enumerate() {
+    for (part_index, part) in name
+        .trim()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
         if part_index > 0 {
             out.push_str("%2F");
         }
         for byte in part.as_bytes() {
             match *byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(*byte as char)
+                }
                 other => out.push_str(&format!("%{other:02X}")),
             }
         }
@@ -781,7 +788,10 @@ async fn npm_exact_summary(c: &Client, q: &str) -> Result<Option<String>, String
     if !resp.status().is_success() {
         return Ok(None);
     }
-    let data: Value = resp.json().await.map_err(|e| format!("npm exact JSON: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("npm exact JSON: {e}"))?;
     let name = data.get("name").and_then(Value::as_str).unwrap_or(q.trim());
     let latest = data
         .get("dist-tags")
@@ -818,8 +828,16 @@ async fn npm_exact_summary(c: &Client, q: &str) -> Result<Option<String>, String
     }
     for (label, value, max) in [
         ("engines", latest_manifest.and_then(|m| m.get("engines")), 6),
-        ("peerDependencies", latest_manifest.and_then(|m| m.get("peerDependencies")), 8),
-        ("dependencies", latest_manifest.and_then(|m| m.get("dependencies")), 10),
+        (
+            "peerDependencies",
+            latest_manifest.and_then(|m| m.get("peerDependencies")),
+            8,
+        ),
+        (
+            "dependencies",
+            latest_manifest.and_then(|m| m.get("dependencies")),
+            10,
+        ),
         (
             "optionalDependencies",
             latest_manifest.and_then(|m| m.get("optionalDependencies")),

@@ -97,9 +97,9 @@ async fn sql_query(
                 CONNECT_TIMEOUT,
                 sqlx::SqliteConnection::connect_with(&options),
             )
-                .await
-                .map_err(ct)?
-                .map_err(|e| format!("连接失败: {e}"))?;
+            .await
+            .map_err(ct)?
+            .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
                 let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
                     .await

@@ -492,9 +492,10 @@ pub fn read_log_tail(
         .clamp(4 * 1024, 2 * 1024 * 1024) as u64;
     let file_len = meta.len();
     let start = file_len.saturating_sub(byte_limit);
-    let mut file = std::fs::File::open(&resolved)
-        .map_err(|e| format!("cannot open '{}': {}", path, e))?;
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut file =
+        std::fs::File::open(&resolved).map_err(|e| format!("cannot open '{}': {}", path, e))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
     let mut bytes = Vec::with_capacity((file_len - start).min(byte_limit) as usize);
     file.read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read '{}': {}", path, e))?;
@@ -674,8 +675,8 @@ fn file_name(path: &Path) -> String {
 }
 
 fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
     let mut bytes = vec![0u8; len];
     let n = file
         .read(&mut bytes)
@@ -821,13 +822,19 @@ fn quote_sqlite_ident(name: &str) -> String {
 fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, index: usize) -> serde_json::Value {
     use sqlx::Row;
     if let Ok(v) = row.try_get::<Option<i64>, _>(index) {
-        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        return v
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(index) {
-        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        return v
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
     }
     if let Ok(v) = row.try_get::<Option<String>, _>(index) {
-        return v.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        return v
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
     }
     if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
         return v
@@ -876,10 +883,12 @@ fn inspect_sqlite_tables(path: &Path) -> Vec<SqliteTablePreview> {
                 .try_get::<String, _>("type")
                 .unwrap_or_else(|_| "table".to_string());
             let pragma_name = name.replace('\'', "''");
-            let column_rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info('{pragma_name}')")))
-                .fetch_all(&mut conn)
-                .await
-                .unwrap_or_default();
+            let column_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA table_info('{pragma_name}')"
+            )))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap_or_default();
             let columns = column_rows
                 .into_iter()
                 .map(|row| SqliteColumnPreview {
@@ -890,24 +899,28 @@ fn inspect_sqlite_tables(path: &Path) -> Vec<SqliteTablePreview> {
                 })
                 .collect::<Vec<_>>();
             let quoted = quote_sqlite_ident(&name);
-            let row_count = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) AS count FROM {quoted}")))
-                .fetch_one(&mut conn)
-                .await
-                .ok()
-                .and_then(|row| row.try_get::<i64, _>("count").ok());
-            let sample_rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {quoted} LIMIT 20")))
-                .fetch_all(&mut conn)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|row| {
-                    let mut object = serde_json::Map::new();
-                    for (index, column) in row.columns().iter().enumerate().take(16) {
-                        object.insert(column.name().to_string(), sqlite_value_to_json(&row, index));
-                    }
-                    serde_json::Value::Object(object)
-                })
-                .collect::<Vec<_>>();
+            let row_count = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) AS count FROM {quoted}"
+            )))
+            .fetch_one(&mut conn)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("count").ok());
+            let sample_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT * FROM {quoted} LIMIT 20"
+            )))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                let mut object = serde_json::Map::new();
+                for (index, column) in row.columns().iter().enumerate().take(16) {
+                    object.insert(column.name().to_string(), sqlite_value_to_json(&row, index));
+                }
+                serde_json::Value::Object(object)
+            })
+            .collect::<Vec<_>>();
             tables.push(SqliteTablePreview {
                 name,
                 table_type,
@@ -925,7 +938,11 @@ fn sqlite_preview(bytes: &[u8], path: &Path) -> Option<SqlitePreview> {
         return None;
     }
     let raw_page_size = read_be_u16(bytes, 16)?;
-    let page_size = if raw_page_size == 1 { 65536 } else { raw_page_size as u32 };
+    let page_size = if raw_page_size == 1 {
+        65536
+    } else {
+        raw_page_size as u32
+    };
     let page_count = read_be_u32(bytes, 28).unwrap_or(0);
     let schema_format = read_be_u32(bytes, 44).unwrap_or(0);
     let encoding = match read_be_u32(bytes, 56).unwrap_or(0) {
@@ -1006,9 +1023,12 @@ fn read_le_i64(bytes: &[u8], start: usize) -> Option<i64> {
 
 fn inspect_traineddata(bytes: &[u8], file_size: u64) -> Option<TrainedDataPreview> {
     let count_bytes = bytes.get(0..4)?;
-    let entry_count =
-        u32::from_le_bytes([count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3]])
-            as usize;
+    let entry_count = u32::from_le_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]) as usize;
     if entry_count == 0 || entry_count > 128 {
         return None;
     }
@@ -1097,7 +1117,10 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
     if bytes.starts_with(b"%PDF-") {
         return ("pdf".into(), "application/pdf".into());
     }
-    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") || bytes.starts_with(b"PK\x07\x08") {
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
         return ("archive".into(), "application/zip".into());
     }
     if bytes.starts_with(b"SQLite format 3\0") {
@@ -1107,7 +1130,10 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
         return ("executable".into(), "application/x-elf".into());
     }
     if bytes.starts_with(b"MZ") {
-        return ("executable".into(), "application/vnd.microsoft.portable-executable".into());
+        return (
+            "executable".into(),
+            "application/vnd.microsoft.portable-executable".into(),
+        );
     }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         return ("archive".into(), "application/gzip".into());
@@ -1123,14 +1149,18 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
         "wav" => ("audio".into(), "audio/wav".into()),
         "flac" => ("audio".into(), "audio/flac".into()),
         "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" => ("video".into(), "video/*".into()),
-        "onnx" | "pt" | "pth" | "bin" | "dat" => ("model_or_binary".into(), "application/octet-stream".into()),
+        "onnx" | "pt" | "pth" | "bin" | "dat" => {
+            ("model_or_binary".into(), "application/octet-stream".into())
+        }
         "sqlite" | "sqlite3" | "db" | "db3" | "sdb" => {
             ("sqlite_database".into(), "application/vnd.sqlite3".into())
         }
         "duckdb" => ("database_file".into(), "application/x-duckdb".into()),
         "mdb" | "accdb" => ("database_file".into(), "application/x-msaccess".into()),
         "dbf" => ("database_file".into(), "application/x-dbf".into()),
-        "ibd" | "frm" | "myd" | "myi" => ("database_file".into(), "application/x-mysql-table".into()),
+        "ibd" | "frm" | "myd" | "myi" => {
+            ("database_file".into(), "application/x-mysql-table".into())
+        }
         "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt" => {
             ("archive".into(), "application/zip".into())
         }
@@ -1162,8 +1192,10 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
     let traineddata = inspect_traineddata(&bytes, meta.len());
     let (kind, mime) = detect_kind_and_mime(&ext, &bytes, traineddata.is_some());
     let archive_entries = if matches!(kind.as_str(), "archive")
-        || matches!(ext.as_str(), "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt")
-    {
+        || matches!(
+            ext.as_str(),
+            "zip" | "jar" | "war" | "apk" | "docx" | "pptx" | "xlsx" | "odt"
+        ) {
         inspect_zip_entries(&resolved)
     } else {
         Vec::new()
@@ -1202,7 +1234,10 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
         }
     }
     if !archive_entries.is_empty() {
-        summary.push(format!("压缩包条目：{} 个（最多显示 200 个）", archive_entries.len()));
+        summary.push(format!(
+            "压缩包条目：{} 个（最多显示 200 个）",
+            archive_entries.len()
+        ));
     }
     if let Some(sqlite) = &sqlite {
         summary.push(format!(

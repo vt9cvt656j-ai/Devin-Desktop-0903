@@ -17287,7 +17287,7 @@ const _mcpToolMap = new Map(); // sanitized full name -> { server, tool }
 const _mcpFailures = new Map();
 const _MCP_AGENT_WAIT_MS = 65_000;
 const _MCP_MAX_SERVERS = 16;
-const _TOOL_PAYLOAD_MAX_TOOLS = 160; // 与网关 MAX_STATIC/FINAL_TOOLS_PER_REQUEST 同步：129 个内置工具 + MCP 余量
+const _TOOL_PAYLOAD_MAX_TOOLS = 128; // 有界工具窗口：核心集 + 按需 bundle + MCP 余量（网关侧上限更高，此处收紧默认负载）
 const _TOOL_PAYLOAD_MAX_SCHEMA_BYTES = 512 * 1024;
 
 function _utf8ByteLength(value) {
@@ -20960,7 +20960,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
 // Regex-based preloading was removed per user directive: "交给模型判断，不要老拿正则".
 const _TOOL_BUNDLES = {
   design:  { tools: ["design_research", "style_wardrobe", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
-  desktop: { tools: ["automation", "system", "decode_qr"] },
+  desktop: { tools: ["automation", "system", "decode_qr", "read_screen", "ui_click", "computer"] },
   browser: { tools: ["browser", "screenshot"] },
   github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"] },
   db:      { tools: ["db_query"] },
@@ -20970,6 +20970,21 @@ const _TOOL_BUNDLES = {
   // knowledge tools are NOT deferred — always in initial tool set for direct access
   remote:  { tools: ["remote"] },
   demo:    { tools: ["start_demo", "stop_demo"] },
+  deploy:  { tools: ["deploy_site"] },
+  // Creative/generation verticals: not part of the coding core. Loaded on demand via
+  // search_tools or a direct by-name call (auto-healed) — the agent prompt's generation
+  // table teaches the names, so a game/creative task mounts them in one step.
+  gen: { tools: [
+    "game_scaffold", "web_scaffold", "generate_3d", "generate_texture", "generate_sound",
+    "generate_music", "generate_voice", "generate_motion", "auto_rig", "search_game_assets",
+    "download_asset",
+  ] },
+  // Realtime/local-life verticals: callable directly by name (auto-loaded); schemas stay
+  // out of the default coding payload.
+  live: { tools: [
+    "local_discovery", "live_environment", "live_flights", "live_markets",
+    "road_environment", "shop_catalog", "track_shipment",
+  ] },
   // Defer the sub-agent spawn tools so they're NOT in the default payload — an eager model
   // can't casually fire one (the "误触/0 步调研 花架势" noise). They stay fully reachable via
   // search_tools or a deliberate by-name call (auto-loaded), which is a real intent signal.
@@ -42427,7 +42442,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
   const items = e.dataTransfer?.items;
-  
+
   // Handle directory drop (Electron only)
   if (items) {
     for (const item of items) {
@@ -42444,7 +42459,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       }
     }
   }
-  
+
   if (!files) return;
   for (const file of files) {
     const isMedia = /^(image|video)\//.test(file.type) || isImageFile(file.name) || isVideoFile(file.name);
@@ -42466,7 +42481,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       showToast(`文件引用已插入: ${ref}`);
       continue;
     }
-    
+
     if (file.size < 100000) {
       const reader = new FileReader();
       reader.onload = () => {
