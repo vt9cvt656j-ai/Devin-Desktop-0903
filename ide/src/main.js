@@ -6816,6 +6816,16 @@ async function restoreChatHistory() {
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
         if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({ content: String(p.content || ""), status: p.status || "pending" }));
+        // 持久化工作流：上次运行留下"活着"的检查点 = 中途被切断（崩溃/强关）。
+        // 挂到 session 上，下一次 agent 运行注入草稿纸接着做（7 天内有效）。
+        try {
+          const _wfRaw = localStorage.getItem("michael-wf-" + (session.id || "s"));
+          if (_wfRaw) {
+            const _wf = JSON.parse(_wfRaw);
+            if (_wf && _wf.active && Date.now() - (_wf.ts || 0) < 7 * 864e5) session._wfInterrupted = _wf;
+            else localStorage.removeItem("michael-wf-" + (session.id || "s"));
+          }
+        } catch {}
         if (sData.memory) {
           session.memory = ConversationMemory.fromJSON(sData.memory);
         } else if (sData.history && typeof sData.history === "object" && !Array.isArray(sData.history) &&
@@ -11646,6 +11656,7 @@ function _buildAgentToolSchemas(includeWrite) {
     { type: "function", function: { name: "current_time", description: "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道「今天几号/星期几/现在几点/距某天还有多久」时调这个，别凭记忆猜——你的训练数据里的时间是过期的。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "ask_user", description: "**当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做**。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } }, recommended: { type: "integer", description: "推荐选项的索引（从 0 开始），该选项会高亮标记为推荐" }, multi_select: { type: "boolean", description: "true=多选模式（勾选框，用户可选多个选项后一起提交）" }, confirm_text: { type: "string", description: "危险操作确认：设置后用户必须在输入框中准确输入此文本才能继续（如 DELETE、确认删除）" } }, required: ["question"] } } },
     { type: "function", function: { name: "run_subagent", description: "**只在「大范围、可并行」的重型调研时才用**（例：同时摸清好几个大模块的全貌、跨几十个文件的架构梳理）。⚠️**小事别派**——找几个文件、读一段逻辑、搞清一个函数/流程这种聚焦小调查，你【直接自己 read_file/search 又快又省】；派子智能体等于双倍烧 token（它读一遍+总结，你再读它总结），还慢。拿不准就自己上，别无脑派。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "debate", description: "**辩论模式——重大技术决策/方案取舍时用**（如选型 A vs B、要不要重构、架构方向）。多个立场并行独立论证，再由裁判综合裁决，避免单视角确认偏差。⚠️只用于真正有争议、答案不唯一的决策；普通问题直接答。", parameters: { type: "object", properties: { question: { type: "string", description: "要辩论的问题/决策，表述清楚备选项" }, perspectives: { type: "array", items: { type: "string" }, description: "可选，自定义 2-4 个立场（默认：支持方/反对方/工程实践方）" }, context: { type: "string", description: "可选，相关背景（项目技术栈、约束、已知信息）" } }, required: ["question"] } } },
     { type: "function", function: { name: "research_project", description: "**深挖整个代码库/项目——一次性把它摸透**。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
     { type: "function", function: { name: "design_research", description: "**做网站/界面前，先把设计方向 + 完整 UI 架构研究规划好**（UI 版的 research_project）。", parameters: { type: "object", properties: { goal: { type: "string", description: "要做的网站/界面是什么（如「Michael IDE 的产品官网」「SaaS 后台 dashboard」「电商首页」）" } }, required: [] } } },
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
@@ -11873,7 +11884,7 @@ function _searchToolsLookup(query, registry, loadedNames) {
 // ============================================================================
 const _KNOWN_TOOLS = new Set([
   "read_file", "list_dir", "search", "find_files", "web_fetch", "web_search", "edit_file",
-  "multi_edit", "write_file", "run_cmd", "update_plan", "run_subagent", "run_worker",
+  "multi_edit", "write_file", "run_cmd", "update_plan", "run_subagent", "run_worker", "debate",
   "remember", "get_diagnostics", "delete_path", "move_path", "copy_path", "create_dir",
   "format_file", "git_status", "git_diff", "git_log", "git_commit", "git_branch", "git_push",
   "git_pull", "git_blame", "git_stash", "git_stash_pop", "git_stash_list", "git_conflicts",
@@ -11897,6 +11908,7 @@ const _TOOL_ALIASES = {
   websearch: "web_search", search_web: "web_search", google: "web_search", searchweb: "web_search", internet_search: "web_search", web_query: "web_search",
   runsubagent: "run_subagent", subagent: "run_subagent",
   runworker: "run_worker",
+  debate: "debate", argue: "debate", debate_decision: "debate",
   updateplan: "update_plan", plan: "update_plan", todo: "update_plan", todowrite: "update_plan", todo_write: "update_plan", set_plan: "update_plan", write_todos: "update_plan",
   getdiagnostics: "get_diagnostics", diagnostics: "get_diagnostics", diag: "get_diagnostics", lint: "get_diagnostics", check_errors: "get_diagnostics", get_errors: "get_diagnostics", problems: "get_diagnostics",
   generateimage: "generate_image", genimage: "generate_image", gen_image: "generate_image", create_image: "generate_image", make_image: "generate_image", draw_image: "generate_image", text_to_image: "generate_image",
@@ -12144,6 +12156,7 @@ function _mapToolCall(name, args) {
     }
     case "update_plan": return { type: "plan", steps: _normPlanSteps(args.steps || args.plan || args.todos) };
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
+    case "debate": return { type: "debate", question: args.question || args.topic || args.q || "", perspectives: args.perspectives || args.stances, context: args.context || "" };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
     case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
     case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || "") };
@@ -13747,7 +13760,7 @@ const _RETRYABLE_TOOL_TYPES = new Set(["web", "websearch", "screenshot", "genima
 // db queries, terminal reads, and multiple generate_image to distinct dests — so a
 // turn that batches many such calls finishes in one round-trip. Side-effecting tools
 // (write/edit/cmd/delete/move/git-write/POST/mutating-SQL) stay strictly sequential.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "termread", "termlist", "search_tools", "current_time"]);
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "debate", "termread", "termlist", "search_tools", "current_time"]);
 function _isReadOnlyParallel(call) {
   if (!call) return false;
   const t = call.type;
@@ -14861,6 +14874,7 @@ function _recLabel(call) {
     case "git": return "git " + (call.op || "");
     case "diag": return "诊断检查";
     case "think": return "思考";
+    case "debate": return "辩论：" + String(call.question || "").slice(0, 40);
     default: return call.type + (p ? " " + p : "");
   }
 }
@@ -15121,6 +15135,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     const open = planSteps.filter((s) => s.status === "pending" || s.status === "in_progress").map((s) => String(s.content).slice(0, 60));
     if (open.length) _pad.findings.push("上次会话遗留的未完成任务计划：" + open.join("；"));
   }
+  // 持久化工作流：上一次运行在中途被切断（崩溃/强关）留下的检查点 → 注入草稿纸，
+  // 智能体接着做而不是从头重做已落盘的部分。
+  if (isAgent && session._wfInterrupted) {
+    const w = session._wfInterrupted; delete session._wfInterrupted;
+    _pad.findings.push(`上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃），当时任务：「${w.task || ""}」${w.files && w.files.length ? "；当时已改好并落盘：" + w.files.join("、") : ""}。接着未完成的部分继续，已落盘的改动别重做。`);
+  }
   function _padText() {
     if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length) return "";
     const parts = [`[运行进度草稿纸——你在长任务第 ${_pad._iter || 0} 步，这张纸帮你记住已做的事]`];
@@ -15197,6 +15217,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           messages.push({ role: "user", content: `[系统：本次运行 token 预算已用完（约 ${Math.round(run._tokens / 1000)}k / 上限 ${Math.round(_cap / 1000)}k）。立即收尾：不再开新任务，把已完成的和未完成的如实总结。]` });
           showToast(`Token 预算已用完（${Math.round(run._tokens / 1000)}k），智能体收尾中`);
         }
+      }
+      // 持久化工作流检查点（Temporal 思路的桌面版）：每轮把运行状态落盘；
+      // 正常结束时清掉，崩溃/强关时它就留着 → 重启后恢复继续（见 restoreChatHistory）。
+      if (isAgent) {
+        try {
+          localStorage.setItem("michael-wf-" + (session.id || "s"), JSON.stringify({
+            active: true, ts: Date.now(), iter: iter + 1,
+            task: String(task || "").slice(0, 300),
+            files: [...(_mutatedFiles || [])].slice(0, 20),
+          }));
+        } catch { /* quota 满也不能影响运行 */ }
       }
       if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
       if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
@@ -16033,6 +16064,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     saveChatHistory(); // CRITICAL: the agent path never persisted — agent chats were lost on reopen. Save now (also captures the rendered transcript snapshot).
     // Offer to export a replayable recording of everything the agent just did.
     if (run.recording && run.recording.length >= 2) { try { _addRecordingExport(body, run, session); } catch {} }
+    // 运行已正常走到终点（含报错结束）→ 清掉工作流检查点，不留假的“中断现场”。
+    try { localStorage.removeItem("michael-wf-" + (session.id || "s")); } catch {}
     // Experiential memory: store this run as an episode + distill a reusable insight
     // (async, best-effort) so the agent learns from it next time (ExpeL/Reflexion).
     if (run.mode === "agent" && task) {
@@ -16406,7 +16439,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "memory" || call.type === "think" || call.type === "debate" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -17560,6 +17593,44 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
         return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}` };
       }
+
+    } else if (call.type === "debate") {
+      // Debate 模式：多视角并行独立论证 → 裁判综合。用于技术选型/方案取舍这种
+      // 没有单一正确答案的决策，避免单模型一言堂的确认偏差。
+      const q = String(call.question || "").trim();
+      if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "缺 question"; return { type: "debate", path: "", content: "[ERROR] debate 需要 question 参数（要辩论的问题/决策）。" }; }
+      const cfg = loadConfig();
+      if (!cfg.baseUrl || !cfg.apiKey) { res.className = "atc-result atc-result--err"; res.textContent = "未配置模型"; return { type: "debate", path: "", content: "[不可用] 未配置模型/密钥，无法发起辩论。自己权衡后给出结论。" }; }
+      const stances = (Array.isArray(call.perspectives) && call.perspectives.length >= 2)
+        ? call.perspectives.slice(0, 4).map((s) => String(s).slice(0, 60))
+        : ["支持方：给出最强支持理由与证据", "反对方：给出最强反对理由与风险", "工程实践方：从维护成本/团队现状/迁移代价出发评估"];
+      const ctxNote = String(call.context || "").slice(0, 4000);
+      res.className = "atc-result"; res.textContent = `辩论中（${stances.length} 方）…`;
+      const _one = async (sys, user, maxTok) => {
+        const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const to = ctrl ? setTimeout(() => ctrl.abort(), 60000) : null;
+        try {
+          const r = await fetch(cfg.baseUrl.replace(/\/+$/, "") + "/v1/chat/completions", {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") },
+            body: JSON.stringify({ model: cfg.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: maxTok, temperature: 0.7, stream: false }),
+            signal: ctrl ? ctrl.signal : undefined,
+          });
+          if (!r.ok) return "";
+          const d = await r.json();
+          return (d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || "";
+        } catch { return ""; } finally { if (to) clearTimeout(to); }
+      };
+      const userMsg = `辩题：${q}` + (ctxNote ? `\n\n背景：${ctxNote}` : "");
+      const args = await Promise.all(stances.map((st) =>
+        _one(`你是辩论中的一方。立场：${st}。只从这个立场出发，给出最有力的 3-5 条论点（具体、可验证、不空泛），每条一两句。中文。`, userMsg, 700)));
+      const transcript = stances.map((st, i) => `【${st}】\n${(args[i] || "（未能取得论点）").trim()}`).join("\n\n");
+      const verdict = await _one(
+        "你是裁判。客观比较各方论点的证据强度，指出哪些论点站得住、哪些站不住，最后给出明确结论与适用条件（什么情况下选 A、什么情况下选 B）。不和稀泥。中文，≤400 字。",
+        userMsg + "\n\n各方论点：\n" + transcript, 800);
+      const out = `【辩论】${q}\n\n${transcript}\n\n【裁决】\n${(verdict || "（裁决失败，请自行综合以上论点）").trim()}`;
+      res.className = "atc-result atc-result--ok"; res.textContent = `${stances.length} 方辩论完成`;
+      if (vp) vp.innerHTML = `<pre>${_escHtml(out.slice(0, 6000))}</pre>`;
+      return { type: "debate", path: "", content: out.slice(0, 12000) };
 
     } else if (call.type === "think") {
       // The "think" tool: a no-op reasoning scratchpad. The thought lives in the
