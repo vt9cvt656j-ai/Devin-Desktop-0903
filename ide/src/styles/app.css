@@ -2172,18 +2172,14 @@ body.zen-mode .editor {
   border: none; padding: 10px 12px 4px; outline: none;
 }
 .msg__edit-ta::placeholder { color: var(--text-dim); }
-.msg__edit-bar { display: flex; gap: 8px; justify-content: flex-end; padding: 4px 8px 8px; }
+/* the toolbar is a clone of the bottom composer's bar — .composer__bar supplies the layout */
 .msg__edit-btn {
-  font-size: 12px; padding: 5px 14px; border-radius: 8px; cursor: pointer;
+  font-size: 12px; padding: 4px 12px; border-radius: 8px; cursor: pointer;
   border: 1px solid var(--line-strong);
   background: var(--panel-solid); color: var(--text);
   transition: background 0.13s ease;
 }
 .msg__edit-btn:hover { background: var(--hover); }
-.msg__edit-btn--send {
-  background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
-}
-.msg__edit-btn--send:hover { filter: brightness(0.94); }
 
 /* ---- code card (v3 — matching agent tool cards) ---- */
 .code-card {
