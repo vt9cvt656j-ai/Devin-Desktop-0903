@@ -9350,3 +9350,24 @@ test("UI re-verification is incremental: full viewport matrix runs once per run"
   assert.match(SRC, /\[UI 复验\][^"]*不要重新 fresh navigate、不要重开浏览器/);
   assert.match(SRC, /这套矩阵\*\*本任务只做这一遍\*\*/);
 });
+
+test("reply stats footer: elapsed formatting + per-model cost + both chat paths append it", () => {
+  const fmt = load("_fmtElapsed");
+  assert.equal(fmt(420), "420ms");
+  assert.equal(fmt(3_400), "3.4s");
+  assert.equal(fmt(42_000), "42s");
+  assert.equal(fmt(95_000), "1m35s");
+  const cost = load("_turnCostCents", {
+    _modelCatalogEntry: (id) => (id === "m1" ? { inPrice: 3, outPrice: 15, flatPrice: 0 } : id === "free" ? { inPrice: 0, outPrice: 0, flatPrice: 0 } : null),
+  });
+  // 1M in @$3 + 1M out @$15 = $18 = 1800 cents
+  assert.equal(cost("m1", 1_000_000, 1_000_000), 1800);
+  assert.equal(cost("free", 1000, 1000), null, "模型未配价格时不显示金额");
+  assert.equal(cost("unknown", 1000, 1000), null);
+  // Both the plain-chat finalizer and the agent-run finalizer must append the footer.
+  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _plainStreamDiag\.attemptStartedAt/);
+  assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - run\._recStart/);
+  // Per-run usage accumulates every turn (even ones the loop skips via continue/break).
+  assert.match(SRC, /session\._runUsage = \{ in: 0, out: 0, est: false \}/);
+  assert.match(SRC, /ru\.in \+= _u\.prompt_tokens \|\| 0; ru\.out \+= _u\.completion_tokens \|\| 0/);
+});

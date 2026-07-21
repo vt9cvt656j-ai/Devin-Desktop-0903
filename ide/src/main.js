@@ -12763,6 +12763,48 @@ function _appendThinkingReturnStatus(body, config, reasoningText = "", usage = n
   } catch {}
 }
 
+// 本次回复统计脚注：耗时 + token + 费用，回复内容最底下一行。
+// 费用按模型目录里的官方单价（USD / 1M tokens）算，再乘统一显示倍率
+// （_MICHAEL_DISP_MULT，与账单弹窗同口径）；模型没配价格时不显示金额。
+function _turnCostCents(model, inTok, outTok) {
+  const entry = _modelCatalogEntry(model);
+  if (!entry) return null;
+  const inP = Number(entry.inPrice) || 0;
+  const outP = Number(entry.outPrice) || 0;
+  const flat = Number(entry.flatPrice) || 0;
+  if (!inP && !outP && !flat) return null;
+  const usd = (inTok / 1e6) * inP + (outTok / 1e6) * outP + flat;
+  return usd * 100;
+}
+function _fmtElapsed(ms) {
+  ms = Math.max(0, Math.round(Number(ms) || 0));
+  if (ms < 1000) return ms + "ms";
+  const s = ms / 1000;
+  if (s < 60) return (s < 10 ? s.toFixed(1) : String(Math.round(s))) + "s";
+  const m = Math.floor(s / 60);
+  return m + "m" + Math.round(s - m * 60) + "s";
+}
+function _appendTurnStatsFooter(body, { elapsedMs = 0, promptTokens = 0, completionTokens = 0, model = "", estimated = false } = {}) {
+  try {
+    if (!body || body.querySelector(":scope > .turn-stats")) return;
+    const inTok = Math.max(0, Math.round(Number(promptTokens) || 0));
+    const outTok = Math.max(0, Math.round(Number(completionTokens) || 0));
+    const cents = (inTok || outTok) ? _turnCostCents(model, inTok, outTok) : null;
+    const bits = [`⏱ ${_fmtElapsed(elapsedMs)}`];
+    if (inTok || outTok) bits.push(`⇅ ${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
+    if (cents != null) {
+      const disp = (cents / 100) * _MICHAEL_DISP_MULT;
+      bits.push(`💰 ${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
+    }
+    const el = document.createElement("div");
+    el.className = "turn-stats";
+    el.textContent = bits.join("  ·  ");
+    el.title = `本次回复统计\n耗时：${_fmtElapsed(elapsedMs)}\ntoken：输入 ${inTok} · 输出 ${outTok}${estimated ? "（估算）" : "（真实 usage）"}` +
+      (cents != null ? `\n费用：${_dispUsd(cents, 4)}` : "\n费用：该模型未配置单价");
+    body.appendChild(el);
+  } catch { /* stats must never break a reply */ }
+}
+
 function _renderTokenMeter() {
   const k = _tokenShort;
   const state = _ctxMeter || {};
@@ -16670,6 +16712,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       body.appendChild(note);
     }
     _appendThinkingReturnStatus(body, config, reasoning, _legacyUsage);
+    _appendTurnStatsFooter(body, {
+      elapsedMs: Date.now() - _plainStreamDiag.attemptStartedAt,
+      promptTokens: _legacyUsage ? (_legacyUsage.prompt_tokens || 0) : _estRequestTokens(messages, []),
+      completionTokens: _legacyUsage ? (_legacyUsage.completion_tokens || 0) : _estTokens(acc),
+      model: config.model,
+      estimated: !_legacyUsage,
+    });
     if (_filesBar) {
       const stopBtn = _filesBar.querySelector(".agent-files-bar__btn--stop");
       if (stopBtn) stopBtn.style.display = "none";
@@ -26798,7 +26847,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     const _u = _turnUsage || { estimated: true, prompt_tokens: _lastRequestEstimateTokens || _estRequestTokens(messages, toolSchemas), completion_tokens: _estTokens(acc) };
     _recordUsage(_u);
     // Per-turn total for the agent loop's per-run token budget (ch23-style 预算控制).
-    try { if (session) session._lastTurnTokens = (_u.prompt_tokens || 0) + (_u.completion_tokens || 0); } catch {}
+    try {
+      if (session) {
+        session._lastTurnTokens = (_u.prompt_tokens || 0) + (_u.completion_tokens || 0);
+        const ru = session._runUsage;
+        if (ru) { ru.in += _u.prompt_tokens || 0; ru.out += _u.completion_tokens || 0; if (_u.estimated) ru.est = true; }
+      }
+    } catch {}
   }
 
   const _cf0 = _cleanAgentText(acc);
@@ -28908,6 +28963,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
   // while _isStreaming() is still false → the Stop click is a dead no-op.
   session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
+  session._runUsage = { in: 0, out: 0, est: false }; // per-run usage for the reply-stats footer
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   const _live = () => !!session.streaming;
@@ -30628,6 +30684,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     const stopBtn = filesBar.querySelector(".agent-files-bar__btn--stop");
     if (stopBtn) stopBtn.style.display = "none";
     _updateFilesBar(filesBar, filesList, trackedFiles);
+    try {
+      const _ru = session._runUsage;
+      _appendTurnStatsFooter(body, {
+        elapsedMs: Date.now() - run._recStart,
+        promptTokens: _ru ? _ru.in : 0,
+        completionTokens: _ru ? _ru.out : 0,
+        model: config.model,
+        estimated: !!(_ru && _ru.est),
+      });
+    } catch {}
     _chatFollow();
   }
 }
