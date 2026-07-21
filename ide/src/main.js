@@ -7092,8 +7092,9 @@ function _beginEditResend(wrap, forSession) {
   if (!body) return;
   wrap._editing = true;
   const orig = String(wrap._rawText || body.textContent || "");
-  const origHtml = body.innerHTML;
-  body.innerHTML = "";
+  // 保留原 DOM 节点（而非序列化 HTML），取消时原样放回——@引用卡片/图片的点击事件不丢
+  const origNodes = [...body.childNodes];
+  origNodes.forEach((n) => n.remove());
   const ta = document.createElement("textarea");
   ta.className = "msg__edit-ta";
   ta.value = orig;
@@ -7109,7 +7110,7 @@ function _beginEditResend(wrap, forSession) {
   bar.append(cancelBtn, sendBtn);
   body.append(ta, bar);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-  const cancel = () => { wrap._editing = false; body.innerHTML = origHtml; };
+  const cancel = () => { wrap._editing = false; body.textContent = ""; body.append(...origNodes); };
   cancelBtn.addEventListener("click", cancel);
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); cancel(); }
@@ -7119,23 +7120,26 @@ function _beginEditResend(wrap, forSession) {
     const next = ta.value.trim();
     if (!next) { showToast("内容不能为空"); return; }
     if (sess.streaming) { showToast("正在运行中，稍后再试"); return; }
-    _truncateFromUserMessage(sess, wrap, orig);
+    _truncateFromUserMessage(sess, wrap);
     sendPrompt(next);
   });
 }
-function _truncateFromUserMessage(sess, wrap, rawText) {
-  // 记忆：从最近往回找这条用户消息，把它和之后的都移除（更早的摘要/上下文不动）
+function _truncateFromUserMessage(sess, wrap) {
+  // 记忆截断按「从末尾数第几条用户消息」定位（不用文本匹配：同文消息/前缀重叠会错位）。
+  // DOM 只会剪掉最旧的节点，所以从末尾往前数，气泡和 recent 里的用户消息是对齐的。
   try {
+    const container = wrap.parentElement;
+    const bubbles = container ? [...container.querySelectorAll(":scope > .msg.user")] : [];
+    const pos = bubbles.indexOf(wrap);
+    const fromEnd = pos >= 0 ? bubbles.length - 1 - pos : 0; // 0 = 最后一条用户消息
     const rec = sess.memory && sess.memory.recent;
     if (Array.isArray(rec)) {
-      const _txt = (m) => {
-        if (typeof m.content === "string") return m.content;
-        if (Array.isArray(m.content)) { const p = m.content.find((x) => x && x.type === "text"); return p ? String(p.text || "") : ""; }
-        return "";
-      };
+      let seen = -1;
       for (let i = rec.length - 1; i >= 0; i--) {
-        const m = rec[i];
-        if (m && m.role === "user" && _txt(m).startsWith(rawText.slice(0, 200))) { rec.splice(i); break; }
+        if (rec[i] && rec[i].role === "user") {
+          seen++;
+          if (seen === fromEnd) { rec.splice(i); break; }
+        }
       }
     }
   } catch {}
@@ -7147,6 +7151,19 @@ function _truncateFromUserMessage(sess, wrap, rawText) {
   } catch {}
   try { saveChatHistory(); } catch {}
 }
+// 事件委托：整个文档监听一次 dblclick，命中任何用户气泡都能进入编辑——不依赖
+// 每个气泡单独绑定（任何渲染路径/任何时期创建的气泡都生效）。
+document.addEventListener("dblclick", (e) => {
+  const t = e.target;
+  if (!t || !t.closest) return;
+  if (t.closest(".msg__edit-ta, .msg__edit-bar")) return; // 已在编辑态
+  const wrap = t.closest(".msg.user");
+  if (!wrap) return;
+  e.preventDefault();
+  let sess = null;
+  try { sess = _chatSessions.find((s) => s && s.container && s.container.contains(wrap)) || null; } catch {}
+  _beginEditResend(wrap, sess || undefined);
+});
 function addMessage(role, text, forSession) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -7182,11 +7199,12 @@ function addMessage(role, text, forSession) {
     wrap.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
     wrap.querySelector(".msg__who span").textContent = _userLabel();
     body = wrap.querySelector(".msg__body");
-    // Double-click a sent message → edit it in place and resend. Everything after
-    // it is discarded and replayed; context BEFORE it (incl. earlier summaries) is kept.
-    wrap._rawText = text || "";
+    // Double-click a sent message → edit it in place and resend (handled by the
+    // DELEGATED document-level dblclick listener — works for every user bubble no
+    // matter which code path rendered it). Everything after it is discarded and
+    // replayed; context BEFORE it (incl. earlier summaries) is kept.
+    wrap._rawText = typeof text === "string" ? text : "";
     wrap.title = "双击可编辑并重新发送";
-    wrap.addEventListener("dblclick", (e) => { e.preventDefault(); _beginEditResend(wrap, session); });
     const cleanText = (text || "").replace(/\n\n\[用户附加了 \d+ 张图片\][\s\S]*$/, "").trim();
     if (cleanText) {
       // Render @-references as clickable cards (rendered HTML → real padded chips, unlike the textarea).
