@@ -15099,6 +15099,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 一个已存在、已传遍全场的对象（run）+ 在它上面读写 = 真正的共享上下文，不是空壳交接。
   _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
   run.ctx = _pad;
+  // ── Nudge manager（上下文工程 Compress：治「提醒消息越堆越多」的 context rot）──
+  // 循环里各种 harness 注入的提醒（verify 报错 / 卡住诊断 / churn 警告 / 工具目录刷新…）
+  // 以前全是永久 user 消息，长任务里能堆几十条：token 白烧、旧提醒和新状态互相打架、
+  // 还稀释真正的用户指令。现在按「类别」管理：同类新提醒**替换**旧的（只留最新一条），
+  // 且离上下文尾部太远的陈旧提醒每轮自动清扫掉。真实用户消息（引导/取消步骤）绝不触碰。
+  const _nudgeReg = new Map(); // category → message object（按身份 splice，不加自定义字段防 API 拒收）
+  const _pushNudge = (cat, content) => {
+    const prev = _nudgeReg.get(cat);
+    if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
+    const m = { role: "user", content };
+    _nudgeReg.set(cat, m);
+    messages.push(m);
+  };
+  const _sweepNudges = () => {
+    for (const [cat, m] of _nudgeReg) {
+      const i = messages.indexOf(m);
+      if (i === -1) { _nudgeReg.delete(cat); continue; }
+      if (messages.length - i > 14) { messages.splice(i, 1); _nudgeReg.delete(cat); } // 距尾>14条 = 早已过时
+    }
+  };
   function _padText() {
     if (!_pad.modified.size && !_pad.errors.length && !_pad.findings.length && !_pad.done.length) return "";
     const parts = [`[运行进度草稿纸——你在长任务第 ${_pad._iter || 0} 步，这张纸帮你记住已做的事]`];
@@ -15114,6 +15134,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     for (let iter = 0; iter < budget; iter++) {
       _pad._iter = iter;
       if (!_live()) break;
+      _sweepNudges(); // 清掉离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
       if (run._planPendingCancel && run._planPendingCancel.length) {
@@ -15155,7 +15176,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_isTransientTurnErr(turn.error) && _turnFails < 3 && _live()) {
           _turnFails++;
           showToast(`网络/服务波动 (${_turnFails}/3)，自动恢复中…`);
-          messages.push({ role: "user", content: `[系统：上一轮模型调用因网络波动失败（${turn.error.slice(0, 80)}），已自动重试。继续你正在做的任务。]` });
+          _pushNudge("transient", `[系统：上一轮模型调用因网络波动失败（${turn.error.slice(0, 80)}），已自动重试。继续你正在做的任务。]`);
           await new Promise((r) => setTimeout(r, 1500 * _turnFails));
           if (!_live()) { finalErr = turn.error; break; }
           continue;
@@ -15192,15 +15213,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // should be reading files / searching / planning, not writing prose. Force it.
         if (!_quick() && iter < 2 && toolFirstNudges < 2 && run.mode === "agent") {
           toolFirstNudges++;
-          const _nudgeMsg = "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。";
-          messages.push({ role: "user", content: _nudgeMsg });
+          _pushNudge("toolFirst", "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。");
           continue;
         }
         // C — don't stop with unfinished plan steps.
         const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
         if (pending && continueNudges < 2) {
           continueNudges++;
-          messages.push({ role: "user", content: "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾，别提前停。" });
+          _pushNudge("continuePlan", "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾，别提前停。");
           continue;
         }
         // A — mutated files but never verified → make verification non-optional. Don't
@@ -15240,10 +15260,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               if (_noProgressVerify >= 2 || verifyRuns >= _AGENT_MAX_VERIFY) {
                 // Genuinely stuck — stop the auto-loop, but DEMAND honesty (no faking "done").
                 didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
-                messages.push({ role: "user", content: `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\`` });
+                _pushNudge("verify", `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\``);
                 continue;
               } else {
-                messages.push({ role: "user", content: `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\`` });
+                _pushNudge("verify", `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\``);
                 continue;
               }
             } else {
@@ -15253,7 +15273,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               if (_planDone) {
                 // Build passed AND plan is complete → fall through to break.
               } else {
-                messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。` });
+                _pushNudge("verify", `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。`);
                 continue;
               }
             }
@@ -15264,7 +15284,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (verifyNudges >= 2) {
               didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
             } else {
-              messages.push({ role: "user", content: "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。" });
+              _pushNudge("verify", "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。");
               continue;
             }
           }
@@ -15276,7 +15296,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // in your summary that THIS step did not succeed, why, and what you'll do.
         if (lastTurnHadFailure && honestyNudges < 1) {
           honestyNudges++;
-          messages.push({ role: "user", content: `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。` });
+          _pushNudge("honesty", `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。`);
           continue;
         }
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
@@ -15572,9 +15592,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run.mode === "agent") {
         const _allContent = toolMsgs.map(m => m.content || "").join("\n");
         if (/用户选择了「.*」风格/.test(_allContent) && !/design_board/.test(_allContent)) {
-          messages.push({ role: "user", content: "✅ 衣橱选完了。**下一步立刻做**：①把 tokens 写进 tailwind.config 或 CSS 变量文件 ②如果 generate_image 可用 → 出 2-3 张布局方向设计稿 → 调 **design_board** 让用户选方向 ③开始搭建时遇到组件选择 → 用 **preview_choices**" });
+          _pushNudge("design", "✅ 衣橱选完了。**下一步立刻做**：①把 tokens 写进 tailwind.config 或 CSS 变量文件 ②如果 generate_image 可用 → 出 2-3 张布局方向设计稿 → 调 **design_board** 让用户选方向 ③开始搭建时遇到组件选择 → 用 **preview_choices**");
         } else if (/用户选择了设计方向/.test(_allContent)) {
-          messages.push({ role: "user", content: "✅ 设计方向选完了。**现在开始写代码**：①用 update_plan 列出实现步骤 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证" });
+          _pushNudge("design", "✅ 设计方向选完了。**现在开始写代码**：①用 update_plan 列出实现步骤 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证");
         }
       }
 
@@ -15637,7 +15657,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (_d.report && _live()) {
             interleaveVerifies++;
             runHadTrouble = true;
-            messages.push({ role: "user", content: "你刚改的文件有报错（编辑器/语言服务的即时诊断），先定位修掉再继续，别带着这些错往下走：\n\n" + _d.report });
+            _pushNudge("diag", "你刚改的文件有报错（编辑器/语言服务的即时诊断），先定位修掉再继续，别带着这些错往下走：\n\n" + _d.report);
           }
           // Track files since last test/check run; trigger auto-verify once enough change.
           for (const p of _edited) {
@@ -15661,7 +15681,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           didVerify = true;
           runHadTrouble = true;
           const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          messages.push({ role: "user", content: `[ERROR — 自动编译检查]\n命令: \`${_projectStack.checkCmd}\`\n刚改过的文件: ${_recentEdits}\n\n错误输出:\n${_c.report}\n\n**反思要求**: 1) 确认是你刚改的哪个文件引入的 2) 用 read_file 读那个文件确认实际内容 3) 修掉编译错再继续。别带着编译错往下写——错误会滚雪球。` });
+          _pushNudge("check", `[ERROR — 自动编译检查]\n命令: \`${_projectStack.checkCmd}\`\n刚改过的文件: ${_recentEdits}\n\n错误输出:\n${_c.report}\n\n**反思要求**: 1) 确认是你刚改的哪个文件引入的 2) 用 read_file 读那个文件确认实际内容 3) 修掉编译错再继续。别带着编译错往下写——错误会滚雪球。`);
         }
       }
 
@@ -15677,7 +15697,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_t.ran && _t.report) {
           runHadTrouble = true;
           const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          messages.push({ role: "user", content: `[ERROR — 自动测试]\n命令: \`${_projectStack.testCmd}\`\n本轮改过的文件: ${_recentEdits}\n\n测试输出:\n${_t.report}\n\n**反思要求**: 1) 判断是你改的代码引入了 bug 还是测试本身需要更新 2) 如果是你的代码问题，read_file 读相关文件，定位具体哪行引入的 3) 修好后考虑测试会不会还有边界情况漏掉` });
+          _pushNudge("test", `[ERROR — 自动测试]\n命令: \`${_projectStack.testCmd}\`\n本轮改过的文件: ${_recentEdits}\n\n测试输出:\n${_t.report}\n\n**反思要求**: 1) 判断是你改的代码引入了 bug 还是测试本身需要更新 2) 如果是你的代码问题，read_file 读相关文件，定位具体哪行引入的 3) 修好后考虑测试会不会还有边界情况漏掉`);
         }
       }
 
@@ -15701,7 +15721,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // doesn't derail the current task.
       if (run.mode === "agent" && iter > 0 && (iter + 1) % 12 === 0 && toolReminders < 3 && _live()) {
         toolReminders++;
-        messages.push({ role: "user", content: _toolReminderBlock() });
+        _pushNudge("toolReminder", _toolReminderBlock());
       }
 
       // Track this turn for the finish/verify gates above.
@@ -15746,7 +15766,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 工具结果里，这里只补一句硬指令，不重复贴。
         if ((t === "run" || t === "termtask" || t === "termread") && it.rawResult
             && /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|\[(失败|ERROR)\]|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || ""))) {
-          messages.push({ role: "user", content: "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_file 打开看细节；服务类的用 read_terminal 看它的运行日志。改完再把它跑一遍，确认真通了才算。" });
+          _pushNudge("cmdFail", "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_file 打开看细节；服务类的用 read_terminal 看它的运行日志。改完再把它跑一遍，确认真通了才算。");
         }
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
@@ -15776,7 +15796,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // exact-match on edit_file already catches many blind edits, this catches the rest).
       if (didEdit && !didInvestigate && !investigateNudged && _live()) {
         investigateNudged = true;
-        messages.push({ role: "user", content: "你还没用 read_file / search 摸过相关代码就动手改了——先确认你**真读懂了改的那段及其上下文 / 调用方**，别凭猜改。必要时 read_file 读全、search 找用法，再继续。" });
+        _pushNudge("investigate", "你还没用 read_file / search 摸过相关代码就动手改了——先确认你**真读懂了改的那段及其上下文 / 调用方**，别凭猜改。必要时 read_file 读全、search 找用法，再继续。");
       }
       // Per-file blind-edit check: if this turn edited files that were NEVER read in
       // this run, it's likely a blind edit based on guessed content. Nudge up to 2×.
@@ -15789,7 +15809,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         if (_blind.length) {
           blindEditNudges++;
-          messages.push({ role: "user", content: `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。` });
+          _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。`);
         }
       }
 
@@ -15799,11 +15819,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run.mode === "agent" && _live() && _implOps === 0 && _readOnlyOps >= 6 && _implNudges < 2) {
         _implNudges++;
         runHadTrouble = true;
-        messages.push({ role: "user", content: `⚠️ 你已经查/读了 ${_readOnlyOps} 次，**一行代码都没写**——这正是用户最不满的"光看不做"。**调查是手段，不是目的；任务的目标是做出能用的东西，不是攒一堆搜索结果。** 现在马上转入实现：\n① **看够了就动手**——基于你已经掌握的，直接 write_file / edit_file 把它做出来，别再追加调查；\n② **看到方法/库/示例就直接用**——别光看，想清楚怎么套进当前任务，立刻用上；\n③ **没搜到的东西，自己从第一性原理设计实现**——"找不到现成的"不是停下的理由，是该你动脑子造一个的信号；\n④ 这一轮**必须有实质产出**（写文件 / 改代码）。如果这确实是个纯查询/解释任务（用户只是想知道答案、不需要写代码），那就**直接给出结论**收尾，别再空转查下去。` });
+        _pushNudge("implLoop", `⚠️ 你已经查/读了 ${_readOnlyOps} 次，**一行代码都没写**——这正是用户最不满的"光看不做"。**调查是手段，不是目的；任务的目标是做出能用的东西，不是攒一堆搜索结果。** 现在马上转入实现：\n① **看够了就动手**——基于你已经掌握的，直接 write_file / edit_file 把它做出来，别再追加调查；\n② **看到方法/库/示例就直接用**——别光看，想清楚怎么套进当前任务，立刻用上；\n③ **没搜到的东西，自己从第一性原理设计实现**——"找不到现成的"不是停下的理由，是该你动脑子造一个的信号；\n④ 这一轮**必须有实质产出**（写文件 / 改代码）。如果这确实是个纯查询/解释任务（用户只是想知道答案、不需要写代码），那就**直接给出结论**收尾，别再空转查下去。`);
       }
       if (_mutatedFiles.size >= 3 && !planSteps && !planNudged && _live()) {
         planNudged = true;
-        messages.push({ role: "user", content: "这已经动了好几个文件、还在扩大——先用 update_plan 把「还要改哪些、要验证哪些」列成分步计划，按计划推进，别散着改、改漏了。" });
+        _pushNudge("planNudge", "这已经动了好几个文件、还在扩大——先用 update_plan 把「还要改哪些、要验证哪些」列成分步计划，按计划推进，别散着改、改漏了。");
       }
       // Pre-Act: on long runs with an existing plan, nudge incremental plan refresh
       // every ~8 iterations so the model re-evaluates remaining steps vs. what it
@@ -15811,7 +15831,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (planSteps && iter > 0 && iter % 8 === 0 && iter <= 40 && _live()) {
         const pending = Array.isArray(planSteps) ? planSteps.filter(s => s.status === "pending" || s.status === "in_progress") : [];
         if (pending.length) {
-          messages.push({ role: "user", content: `你已经执行了 ${iter} 步。用 update_plan 回顾一下：已完成的标 completed，还没做的根据到目前学到的信息调整——有没有发现新的需要改的地方？有没有原来计划的步骤现在不需要了？更新计划再继续。` });
+          _pushNudge("planRefresh", `你已经执行了 ${iter} 步。用 update_plan 回顾一下：已完成的标 completed，还没做的根据到目前学到的信息调整——有没有发现新的需要改的地方？有没有原来计划的步骤现在不需要了？更新计划再继续。`);
         }
       }
 
@@ -15823,7 +15843,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         for (const [p, n] of _editCounts) {
           if (n >= 3 && !_churnNudged.has(p)) {
             _churnNudged.add(p);
-            messages.push({ role: "user", content: `⚠️ 你已经反复改 **${p}** ${n} 次了——这是典型的"写写改改、试错式 churn"，产出往往是重复逻辑 + 命名不一致的烂代码，很垃圾。**立刻停止零敲碎打**，换成"想透再一次写对"：\n① 先 read_file 读 ${p} 的**当前完整内容**（别凭记忆）；\n② 在脑子里（或用 think）**想清它最终正确的样子**——所有需要的逻辑、命名一致、不留重复/死代码、边界都处理好；\n③ 然后用**一次** write_file（整文件重写到正确终态）或**一个** multi_edit（把所有改动一次性原子应用）改对，别再一点点试；\n④ 改完 get_diagnostics / 跑测试验证。\n记住：好代码是**想清楚后一次写对**的，不是反复打补丁磨出来的。` });
+            _pushNudge("churn:" + p, `⚠️ 你已经反复改 **${p}** ${n} 次了——这是典型的"写写改改、试错式 churn"，产出往往是重复逻辑 + 命名不一致的烂代码，很垃圾。**立刻停止零敲碎打**，换成"想透再一次写对"：\n① 先 read_file 读 ${p} 的**当前完整内容**（别凭记忆）；\n② 在脑子里（或用 think）**想清它最终正确的样子**——所有需要的逻辑、命名一致、不留重复/死代码、边界都处理好；\n③ 然后用**一次** write_file（整文件重写到正确终态）或**一个** multi_edit（把所有改动一次性原子应用）改对，别再一点点试；\n④ 改完 get_diagnostics / 跑测试验证。\n记住：好代码是**想清楚后一次写对**的，不是反复打补丁磨出来的。`);
           }
         }
       }
@@ -15874,9 +15894,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (stuckNudges >= 2) {
             // De-subagent'd (refactor 2026-07-05): spawning a "卡点诊断" sub-agent when stuck was more
             // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
-            messages.push({ role: "user", content: "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。" });
+            _pushNudge("stuck", "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。");
           } else {
-            messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。** ④ 如果是**方向/需求本身定不下来**（不是技术卡点），别瞎试——直接 **ask_user 给用户 2-4 个选项**让他拍板，比闷头空转强。" });
+            _pushNudge("stuck", "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试、别把同一个脚本越跑越用力——**退一步先诊断**：① 这几次失败或没进展的**共同原因**到底是什么（具体到哪个假设错了 / 哪个前提不成立）？② 列出最可能的 2-3 个根因。③ 然后**换策略**：换个工具 / 换个角度 / 用 search 重读相关代码与上下文 / 用 web_search 查官方文档或报错 / 重新确认你对问题的理解。**先把方法改对，再动手。** ④ 如果是**方向/需求本身定不下来**（不是技术卡点），别瞎试——直接 **ask_user 给用户 2-4 个选项**让他拍板，比闷头空转强。");
           }
         }
       }
@@ -23922,7 +23942,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
   const items = e.dataTransfer?.items;
-  
+
   // Handle directory drop (Electron only)
   if (items) {
     for (const item of items) {
@@ -23939,7 +23959,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       }
     }
   }
-  
+
   if (!files) return;
   for (const file of files) {
     // Check if it's a file path reference (from Finder/Explorer)
@@ -23951,7 +23971,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       showToast(`文件引用已插入: ${ref}`);
       continue;
     }
-    
+
     if (file.type.startsWith("image/")) {
       const reader = new FileReader();
       reader.onload = () => {
