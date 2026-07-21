@@ -12907,7 +12907,7 @@ function _beginEditResend(wrap, forSession) {
   // 有改动时不自动取消（防误触丢稿）；透传到底部真实按钮的弹层也不算"外面"。
   const onOutside = (e) => {
     const t = e.target;
-    if (t && t.closest && (box.contains(t) || t.closest(".mode-menu, .menu, .modal, dialog"))) return;
+    if (t && t.closest && (box.contains(t) || t.closest(".mode-menu, .menu, .modal, .model-info-card, dialog"))) return;
     if (ta.value === orig) cancel();
   };
   document.addEventListener("pointerdown", onOutside, true);
