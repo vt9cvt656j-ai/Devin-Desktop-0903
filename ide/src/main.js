@@ -7110,7 +7110,7 @@ function _beginEditResend(wrap, forSession) {
     const id = el.id;
     el.removeAttribute("id");
     if (/PickerBtn$|^voiceBtn$/.test(id) && realEl) {
-      el.addEventListener("click", (ev) => { ev.preventDefault(); realEl.click(); });
+      el.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); realEl.click(); });
     }
   });
   bar.querySelectorAll(".mode-menu, .menu").forEach((el) => el.remove());
