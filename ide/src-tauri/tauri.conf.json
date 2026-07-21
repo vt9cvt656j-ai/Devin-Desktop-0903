@@ -10,7 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "macOSPrivateApi": true,
+    "macOSPrivateApi": false,
     "windows": [
       {
         "label": "main",
@@ -25,8 +25,8 @@
       }
     ],
     "security": {
-      "assetProtocol": { "enable": true, "scope": ["**", "/**", "$HOME/**"] },
-      "csp": "default-src 'self'; script-src 'self' blob:; img-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; media-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https:; frame-src 'self' asset: http://asset.localhost; object-src 'self' asset: http://asset.localhost; base-uri 'self'; form-action 'self'"
+      "assetProtocol": { "enable": true, "scope": ["$RESOURCE/**", "$APPDATA/**", "$TEMP/**"] },
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; media-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https:; frame-src 'self' asset: http://asset.localhost; object-src 'self' asset: http://asset.localhost; base-uri 'self'; form-action 'self'"
     }
   },
   "bundle": {
