@@ -118,21 +118,26 @@ pub async fn admin_list_commissions(
         settled_count: 0,
         rejected_count: 0,
     };
-    for row in &rows {
-        summary.total_cents += row.commission_cents;
-        summary.total_count += 1;
-        match row.status.as_str() {
+    let groups = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT status, COALESCE(SUM(commission_cents), 0)::BIGINT, COUNT(*) FROM commissions GROUP BY status",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (status, cents, count) in &groups {
+        summary.total_cents += cents;
+        summary.total_count += count;
+        match status.as_str() {
             "pending" => {
-                summary.pending_cents += row.commission_cents;
-                summary.pending_count += 1;
+                summary.pending_cents += cents;
+                summary.pending_count += count;
             }
             "settled" => {
-                summary.settled_cents += row.commission_cents;
-                summary.settled_count += 1;
+                summary.settled_cents += cents;
+                summary.settled_count += count;
             }
             "rejected" => {
-                summary.rejected_cents += row.commission_cents;
-                summary.rejected_count += 1;
+                summary.rejected_cents += cents;
+                summary.rejected_count += count;
             }
             _ => {}
         }
