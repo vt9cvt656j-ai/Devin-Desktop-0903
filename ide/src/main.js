@@ -7109,7 +7109,11 @@ function _beginEditResend(wrap, forSession) {
   cancelBtn.className = "msg__edit-btn";
   cancelBtn.textContent = "取消";
   bar.append(cancelBtn, sendBtn);
-  body.append(ta, bar);
+  // 复用底部 composer 的盒子样式（同一个 class）：与底部输入框完全一致的白底圆角卡片
+  const box = document.createElement("div");
+  box.className = "composer__box msg__edit-box";
+  box.append(ta, bar);
+  body.append(box);
   try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
   const cancel = () => { wrap._editing = false; body.classList.remove("msg__body--editing"); body.textContent = ""; body.append(...origNodes); };
   cancelBtn.addEventListener("click", cancel);
