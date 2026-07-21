@@ -28787,6 +28787,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 一个已存在、已传遍全场的对象（run）+ 在它上面读写 = 真正的共享上下文，不是空壳交接。
   _pad.filesRead = _readFiles; // 复用主循环的已读集（13274），主/子智能体都往里加
   run.ctx = _pad;
+  // ── Nudge manager（上下文工程 Compress：治「提醒消息越堆越多」的 context rot）──
+  // 循环里各种 harness 注入的提醒（verify 报错 / 卡住诊断 / churn 警告 / 工具目录刷新…）
+  // 以前全是永久 user 消息，长任务里能堆几十条：token 白烧、旧提醒和新状态互相打架、
+  // 还稀释真正的用户指令。现在按「类别」管理：同类新提醒**替换**旧的（只留最新一条），
+  // 且离上下文尾部太远的陈旧提醒每轮自动清扫掉。真实用户消息（引导/取消步骤）绝不触碰。
+  const _nudgeReg = new Map(); // category → message object（按身份 splice，不加自定义字段防 API 拒收）
+  const _pushNudge = (cat, content) => {
+    const prev = _nudgeReg.get(cat);
+    if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
+    const m = { role: "user", content };
+    _nudgeReg.set(cat, m);
+    messages.push(m);
+  };
+  const _sweepNudges = () => {
+    for (const [cat, m] of _nudgeReg) {
+      const i = messages.indexOf(m);
+      if (i === -1) { _nudgeReg.delete(cat); continue; }
+      if (messages.length - i > 14) { messages.splice(i, 1); _nudgeReg.delete(cat); } // 距尾>14条 = 早已过时
+    }
+  };
   _hydrateRunContextEvidence(run, root, run._pendingContextEvidence);
   if (_mustUseWorkspaceTools) {
     messages.push({
@@ -28818,6 +28838,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     for (let iter = 0; iter < budget; iter++) {
       _pad._iter = iter;
       if (!_live()) break;
+      _sweepNudges(); // 清掉离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
       if (run._planPendingCancel && run._planPendingCancel.length) {
@@ -28943,7 +28964,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         } else if (invalidArgNudges < 4) {
           invalidArgNudges++;
           runHadTrouble = true;
-          messages.push({ role: "user", content: _invalidToolRepairInstruction(attempts, [], run._toolRegistry) + "\n现在继续任务；不要收尾，不要声称已完成。" });
+          _pushNudge("toolRepair", _invalidToolRepairInstruction(attempts, [], run._toolRegistry) + "\n现在继续任务；不要收尾，不要声称已完成。");
           clearAgentRetryToast();
           continue;
         }
@@ -28971,9 +28992,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             summaryText += (summaryText ? "\n\n" : "") + _partialText;
             messages.push({ role: "assistant", content: _partialText });
           }
-          messages.push({ role: "user", content: _partialText
+          _pushNudge("transient", _partialText
             ? `[系统：上一轮模型调用因网络波动中断（${_cleanTurnErr.slice(0, 100)}），IDE 已保留上方部分回复并自动重试。请从中断处继续，不要重复已输出内容；如果需要调用工具，重新输出完整工具调用。]`
-            : `[系统：上一轮模型调用因网络波动失败（${_cleanTurnErr.slice(0, 100)}），IDE 已自动重试。继续你正在做的任务。]` });
+            : `[系统：上一轮模型调用因网络波动失败（${_cleanTurnErr.slice(0, 100)}），IDE 已自动重试。继续你正在做的任务。]`);
           await new Promise((r) => setTimeout(r, 1500 * _turnFails));
           if (!_live()) { finalErr = turn.error; break; }
           continue;
@@ -29029,7 +29050,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const _nudgeMsg = _mustUseWorkspaceTools
             ? "这是 Agent 模式，而且用户问题指向当前文件/项目/真实状态。不能只输出说明文字，也不能凭聊天记忆判断。立刻使用真实工具拿证据：目标文件已知就 read_file，当前目录/文件未知就 list_dir/search 定位；涉及报错/空文件/不显示/验证就读取真实文件、诊断或运行结果后再回答。"
             : "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；只读诊断、依赖恢复和验证命令直接做，不要把更新计划当成前置门槛。不要继续只输出说明文字。";
-          messages.push({ role: "user", content: _nudgeMsg });
+          _pushNudge("toolFirst", _nudgeMsg);
           continue;
         }
         if (_missingRequiredEffect && effectNudges < 2) {
@@ -29053,7 +29074,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             "external:external": "成功完成要求的外部副作用",
           };
           const targetInstruction = _missingEffects.map((kind) => labels[kind] || kind).join("；");
-          messages.push({ role: "user", content: `这项请求要求产生真实结果，但仍缺：${targetInstruction}。逐项使用对应工具完成并检查真实退出状态/持续进程/远端返回；编辑文件、echo 文本或其他类别的成功不能替代这些义务。若确实无法执行，收尾必须明确未完成项，不能只说“已经好了”。` });
+          _pushNudge("effect", `这项请求要求产生真实结果，但仍缺：${targetInstruction}。逐项使用对应工具完成并检查真实退出状态/持续进程/远端返回；编辑文件、echo 文本或其他类别的成功不能替代这些义务。若确实无法执行，收尾必须明确未完成项，不能只说“已经好了”。`);
           continue;
         }
         if (_missingRequiredEffect) {
@@ -29066,7 +29087,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           planSteps,
         });
         if (reconciliation && _live()) {
-          messages.push({ role: "user", content: reconciliation });
+          _pushNudge("reconcile", reconciliation);
           continue;
         }
         // A — mutated files but never verified → make verification non-optional. Don't
@@ -29098,10 +29119,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               if (_noProgressVerify >= 2 || verifyRuns >= _AGENT_MAX_VERIFY) {
                 // Genuinely stuck — stop the auto-loop, but DEMAND honesty (no faking "done").
                 didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
-                messages.push({ role: "user", content: `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\`` });
+                _pushNudge("verify", `\`${_vcmd}\` 连着几轮还剩 ${_errs} 处错误、没在减少——别再打补丁瞎改。退一步换个根本思路，把这几个错的**真因**找出来再改；若这一轮确实修不掉，**收尾时如实告诉用户：还剩哪几个错、代码还没完全跑通**，绝不假装"做好了"。最新报错：\n\`\`\`\n${_vout.slice(-2000) || "(无输出)"}\n\`\`\``);
                 continue;
               } else {
-                messages.push({ role: "user", content: `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\`` });
+                _pushNudge("verify", `我替你自动跑了 \`${_vcmd}\`（第 ${verifyRuns} 次），还有 **${_errs} 处错误**没过——逐个定位修掉，我会再自动验一遍，别带着错收工：\n\n\`\`\`\n${_vout.slice(-2500) || "(无输出)"}\n\`\`\``);
                 continue;
               }
               } else {
@@ -29111,7 +29132,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                 if (_planDone) {
                   // Build passed AND plan is complete → fall through to break.
                 } else {
-                  messages.push({ role: "user", content: `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。` });
+                  _pushNudge("verify", `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。`);
                   continue;
                 }
             }
@@ -29122,7 +29143,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (verifyNudges >= 2) {
               didVerify = true; _verifiedAtImplOps = _implOps; _verifyExhausted = true;
             } else {
-              messages.push({ role: "user", content: "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。" });
+              _pushNudge("verify", "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。");
               continue;
             }
           }
@@ -29134,11 +29155,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (browserSchema && !toolSchemas.some((t) => t?.function?.name === "browser")) {
             _applyToolPayloadWindow(toolSchemas, [browserSchema], run._toolCoreNames);
           }
-          messages.push({ role: "user", content: uiVerifyNudges === 1
+          _pushNudge("uiVerify", uiVerifyNudges === 1
             ? (run._uiFullMatrixDone
               ? "[UI 复验] 你刚改了前端文件。像人一样复验：页面 HMR 已热更，**不要重新 fresh navigate、不要重开浏览器、不要重设没动过的视口**——直接在当前页面对你修改的点重跑一次 browser check + 针对该点的 assert（改了布局/断点才需要把另一个视口也验一下）。验完受影响的点就收，别重复全套仪式。"
               : "[UI 验证门禁] 代码校验还不等于页面可用。首次交付前完成一遍完整矩阵：① 首次 browser navigate fresh=true 打开真实 URL（之后本任务内不再 fresh）；② viewport 设 1440x900 后 browser check，修复空白页、控制台/网络、坏资源与横向溢出；③ viewport 设 390x844 mobile=true 后再 check；④ 用 click/type/press 真实操作关键流程，再用带具体 selector 或预期 text 的 assert 确认状态；只断言 body/html 可见不算。这套矩阵**本任务只做这一遍**——之后修补复验只重跑受影响的点。")
-            : "[UI 尚未验证] 你仍没有完成本轮所需的 UI 验证（首次=完整矩阵；已过矩阵=只验受影响的点）。再试一次；若环境确实无法启动，最终必须明确写‘UI 未实际渲染验证’及真实原因，不能声称页面正常或响应式已完成。" });
+            : "[UI 尚未验证] 你仍没有完成本轮所需的 UI 验证（首次=完整矩阵；已过矩阵=只验受影响的点）。再试一次；若环境确实无法启动，最终必须明确写‘UI 未实际渲染验证’及真实原因，不能声称页面正常或响应式已完成。");
           continue;
         }
         // 交付自查·UI 纪律扫描（一次性）：改过的前端标记文件里机械扫 emoji 冒充图标 /
@@ -29164,7 +29185,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               if (_hits.length >= 14) break;
             }
             if (_hits.length) {
-              messages.push({ role: "user", content: `[交付自查·UI 纪律扫描] 你改过的前端文件里扫到 ${_hits.length} 处违规（铁律：图标一律 SVG/lucide、颜色一律语义令牌）：\n${_hits.join("\n")}\n逐处修掉再收尾；确属正文内容里合理的 emoji（不是图标/按钮/状态符号）可保留但要说明。` });
+              _pushNudge("uiDiscipline", `[交付自查·UI 纪律扫描] 你改过的前端文件里扫到 ${_hits.length} 处违规（铁律：图标一律 SVG/lucide、颜色一律语义令牌）：\n${_hits.join("\n")}\n逐处修掉再收尾；确属正文内容里合理的 emoji（不是图标/按钮/状态符号）可保留但要说明。`);
               continue;
             }
           } catch {}
@@ -29176,7 +29197,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // in your summary that THIS step did not succeed, why, and what you'll do.
         if (lastTurnHadFailure && honestyNudges < 1) {
           honestyNudges++;
-          messages.push({ role: "user", content: `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。` });
+          _pushNudge("honesty", `刚才有工具没成功（${lastFailKinds || "[失败]/[ERROR]/[不可用]"}）。绝不能把没做成的当成做成的：要么真的把它解决掉，要么在收尾里**如实**写清这一步没成功、原因是什么、你打算怎么办——不要在总结里声称它成功或假装结果存在。`);
           continue;
         }
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
@@ -29594,7 +29615,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
 
       for (const m of toolMsgs) messages.push(m);
       if (turn._invalidToolRepairInstruction && _live()) {
-        messages.push({ role: "user", content: turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。" });
+        _pushNudge("toolRepair", turn._invalidToolRepairInstruction + "\n现在基于上方真实工具结果继续执行，不要再重复同一个残缺工具调用。");
       }
 
       // If a guard/error fired, don't let the model "creatively" try a different
@@ -29609,7 +29630,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._lastRecoveryKey = recovery.key;
           recoveryNudges++;
           runHadTrouble = true;
-          messages.push({ role: "user", content: `工具刚被保护门/错误挡住了，别换旁门左道、别重复失败调用。下一步只按这条恢复动作执行：\n${recovery.text}` });
+          _pushNudge("recovery", `工具刚被保护门/错误挡住了，别换旁门左道、别重复失败调用。下一步只按这条恢复动作执行：\n${recovery.text}`);
         }
       }
 
@@ -29617,9 +29638,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run.mode === "agent") {
         const _allContent = toolMsgs.map(m => m.content || "").join("\n");
         if (/用户选择了「.*」风格/.test(_allContent) && !/design_board/.test(_allContent)) {
-          messages.push({ role: "user", content: "✅ 衣橱选完了。**下一步立刻做**：①把 tokens 写进 tailwind.config 或 CSS 变量文件 ②如果 generate_image 可用 → 出 2-3 张布局方向设计稿 → 调 **design_board** 让用户选方向 ③开始搭建时遇到组件选择 → 用 **preview_choices**" });
+          _pushNudge("design", "✅ 衣橱选完了。**下一步立刻做**：①把 tokens 写进 tailwind.config 或 CSS 变量文件 ②如果 generate_image 可用 → 出 2-3 张布局方向设计稿 → 调 **design_board** 让用户选方向 ③开始搭建时遇到组件选择 → 用 **preview_choices**");
         } else if (/用户选择了设计方向/.test(_allContent)) {
-          messages.push({ role: "user", content: "✅ 设计方向选完了。**现在开始写代码**：①直接按布局骨架→区块→交互→响应式实现 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证" });
+          _pushNudge("design", "✅ 设计方向选完了。**现在开始写代码**：①直接按布局骨架→区块→交互→响应式实现 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证");
         }
       }
 
@@ -29689,7 +29710,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (_d.report && _live()) {
             interleaveVerifies++;
             runHadTrouble = true;
-            messages.push({ role: "user", content: "你刚改的文件有报错（编辑器/语言服务的即时诊断），先定位修掉再继续，别带着这些错往下走：\n\n" + _d.report });
+            _pushNudge("diag", "你刚改的文件有报错（编辑器/语言服务的即时诊断），先定位修掉再继续，别带着这些错往下走：\n\n" + _d.report);
           }
         }
       }
@@ -29709,7 +29730,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           didVerify = true;
           runHadTrouble = true;
           const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          messages.push({ role: "user", content: `[ERROR — 自动编译检查]\n命令: \`${run.stack.checkCmd}\`\n刚改过的文件: ${_recentEdits}\n\n错误输出:\n${_c.report}\n\n**反思要求**: 1) 确认是你刚改的哪个文件引入的 2) 用 read_file 读那个文件确认实际内容 3) 修掉编译错再继续。别带着编译错往下写——错误会滚雪球。` });
+          _pushNudge("check", `[ERROR — 自动编译检查]\n命令: \`${run.stack.checkCmd}\`\n刚改过的文件: ${_recentEdits}\n\n错误输出:\n${_c.report}\n\n**反思要求**: 1) 确认是你刚改的哪个文件引入的 2) 用 read_file 读那个文件确认实际内容 3) 修掉编译错再继续。别带着编译错往下写——错误会滚雪球。`);
         }
       }
 
@@ -29726,7 +29747,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_t.ran && _t.report) {
           runHadTrouble = true;
           const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          messages.push({ role: "user", content: `[ERROR — 自动测试]\n命令: \`${run.stack.testCmd}\`\n本轮改过的文件: ${_recentEdits}\n\n测试输出:\n${_t.report}\n\n**反思要求**: 1) 判断是你改的代码引入了 bug 还是测试本身需要更新 2) 如果是你的代码问题，read_file 读相关文件，定位具体哪行引入的 3) 修好后考虑测试会不会还有边界情况漏掉` });
+          _pushNudge("test", `[ERROR — 自动测试]\n命令: \`${run.stack.testCmd}\`\n本轮改过的文件: ${_recentEdits}\n\n测试输出:\n${_t.report}\n\n**反思要求**: 1) 判断是你改的代码引入了 bug 还是测试本身需要更新 2) 如果是你的代码问题，read_file 读相关文件，定位具体哪行引入的 3) 修好后考虑测试会不会还有边界情况漏掉`);
         }
       }
 
@@ -29750,7 +29771,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // doesn't derail the current task.
       if (run.mode === "agent" && iter > 0 && (iter + 1) % 12 === 0 && toolReminders < 3 && _live()) {
         toolReminders++;
-        messages.push({ role: "user", content: _toolReminderBlock() });
+        _pushNudge("toolReminder", _toolReminderBlock());
       }
 
       // Track this turn for the finish/verify gates above.
@@ -29835,9 +29856,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             && (_toolFailureMatch(it.rawResult.content || "") || /error TS\d|SyntaxError|TypeError|ReferenceError|Traceback|ModuleNotFound|ImportError|\bpanic|Exception|command not found|cannot find|No such file|编译失败|运行时错误|EADDRINUSE|ECONNREFUSED|\brefused\b|exit(ed)? (code|status)?\s*[1-9]/i.test(String(it.rawResult.content || "")))) {
           const evidence = it.rawResult.commandFailure;
           const paths = evidence?.paths?.length ? evidence.paths.join("、") : "";
-          messages.push({ role: "user", content: paths
+          _pushNudge("cmdFail", paths
             ? `〔命令没跑通·先取证再修〕上一条命令报错了。先 read_file/read_logs 复核这些真实证据：${paths}。这些是失败后的当前磁盘/日志复核，允许重新读取，不要被“别重读”挡住。读完按真实内容定位根因、改对应文件，再重跑同一验证命令；不要原样连续重跑确定性错误。`
-            : "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_logs(path=...) 看尾部；服务类的用 read_logs/read_terminal 看运行日志。改完再把它跑一遍，确认真通了才算。" });
+            : "〔命令没跑通·走实际的〕上一条命令报错了。**照它刚输出的那段真实报错定位根因、直接改对应的文件:行**——别凭记忆猜、别绕去改无关的地方。报错里提到的日志文件 / 路径，直接 read_logs(path=...) 看尾部；服务类的用 read_logs/read_terminal 看运行日志。改完再把它跑一遍，确认真通了才算。");
         }
         // Investigation vs implementation accounting (for the "research forever, never
         // build" loop breaker below).
@@ -29914,7 +29935,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // exact-match on edit_file already catches many blind edits, this catches the rest).
       if (didEdit && !didInvestigate && !investigateNudged && _live()) {
         investigateNudged = true;
-        messages.push({ role: "user", content: "你还没用 read_file / search 摸过相关代码就动手改了——先确认你**真读懂了改的那段及其上下文 / 调用方**，别凭猜改。必要时 read_file 读全、search 找用法，再继续。" });
+        _pushNudge("investigate", "你还没用 read_file / search 摸过相关代码就动手改了——先确认你**真读懂了改的那段及其上下文 / 调用方**，别凭猜改。必要时 read_file 读全、search 找用法，再继续。");
       }
       // Per-file blind-edit check: if this turn edited files that were NEVER read in
       // this run, it's likely a blind edit based on guessed content. Nudge up to 2×.
@@ -29927,7 +29948,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         if (_blind.length) {
           blindEditNudges++;
-          messages.push({ role: "user", content: `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。` });
+          _pushNudge("blindEdit", `你改了 ${_blind.join("、")} 但**这个 run 里从没 read_file 读过它**——old_string 很可能和文件实际内容不匹配。规则：**edit 之前必须先 read_file**。如果刚才的 edit 报错了，先 read_file 读一遍原文、确认实际内容，再重新 edit。`);
         }
       }
 
@@ -29943,11 +29964,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run.mode === "agent" && _live() && _requiredProgressOps === 0 && _novelEvidenceCount >= 6 && _implNudges < 2) {
         _implNudges++;
         runHadTrouble = true;
-        messages.push({ role: "user", content: `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。` });
+        _pushNudge("implLoop", `⚠️ 你已经取得 ${_novelEvidenceCount} 份新的读取/搜索证据，**仍没有实际改动**。调查是手段，不是产出；如果这是修复/实现任务，现在基于已掌握内容直接 write_file / edit_file，别继续追加相似搜索。只有纯查询/解释任务才应直接给结论收尾。`);
       }
       if (_mutatedFiles.size >= 3 && !planSteps && !planNudged && _live()) {
         planNudged = true;
-        messages.push({ role: "user", content: "这已经动了好几个文件、还在扩大——先停一下整合剩余工作：直接列清还要改哪些、要验证哪些，然后继续用 edit/write/run 收敛，别散着改、改漏了。" });
+        _pushNudge("planNudge", "这已经动了好几个文件、还在扩大——先停一下整合剩余工作：直接列清还要改哪些、要验证哪些，然后继续用 edit/write/run 收敛，别散着改、改漏了。");
       }
       // Pre-Act: on long runs with an existing plan, nudge incremental plan refresh
       // every ~8 iterations so the model re-evaluates remaining steps vs. what it
@@ -29955,7 +29976,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (planSteps && iter > 0 && iter % 8 === 0 && iter <= 40 && _live()) {
         const pending = Array.isArray(planSteps) ? planSteps.filter(s => s.status === "pending" || s.status === "in_progress") : [];
         if (pending.length) {
-          messages.push({ role: "user", content: `你已经执行了 ${iter} 步。快速回顾一下已完成和还缺什么，根据真实证据调整下一步；不用为了形式更新计划，直接继续完成剩余改动和验证。` });
+          _pushNudge("planRefresh", `你已经执行了 ${iter} 步。快速回顾一下已完成和还缺什么，根据真实证据调整下一步；不用为了形式更新计划，直接继续完成剩余改动和验证。`);
         }
       }
 
@@ -29966,7 +29987,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         for (const [p, n] of _editCounts) {
           if (n >= 5 && !_churnNudged.has(p)) {
             _churnNudged.add(p);
-            messages.push({ role: "user", content: `你已经成功修改 **${p}** ${n} 次。先停一下并整合剩余工作：直接使用上下文里的当前版本；只有精确源码已经被上下文压缩掉时才重新 read_file。把还需要的修改合并成一个 multi_edit 或一次完整 write_file，然后运行真实诊断/测试确认，不要继续零散追加。` });
+            _pushNudge("churn:" + p, `你已经成功修改 **${p}** ${n} 次。先停一下并整合剩余工作：直接使用上下文里的当前版本；只有精确源码已经被上下文压缩掉时才重新 read_file。把还需要的修改合并成一个 multi_edit 或一次完整 write_file，然后运行真实诊断/测试确认，不要继续零散追加。`);
           }
         }
       }
@@ -30016,9 +30037,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (stuckNudges >= 2) {
             // De-subagent'd (refactor 2026-07-05): spawning a "卡点诊断" sub-agent when stuck was more
             // "子智能体" noise + latency. Just tell the model plainly to stop, rethink, or ask the user.
-            messages.push({ role: "user", content: "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。" });
+            _pushNudge("stuck", "还在原地打转（同样的动作 / 连续失败）。**停**——别再原样重试了。只有两条路：① 退一步写下这几次失败的**共同根因**（哪个假设 / 前提错了），换一条**完全不同**的思路或工具再来；② 如果是需求 / 方向定不下来、或你缺个前提（跑不起来、平台不对、缺信息），别空转——直接 **ask_user** 把卡点和你需要什么一句话问用户。");
           } else {
-            messages.push({ role: "user", content: "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。" });
+            _pushNudge("stuck", "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。");
           }
         }
       }
@@ -42427,7 +42448,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
   const items = e.dataTransfer?.items;
-  
+
   // Handle directory drop (Electron only)
   if (items) {
     for (const item of items) {
@@ -42444,7 +42465,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       }
     }
   }
-  
+
   if (!files) return;
   for (const file of files) {
     const isMedia = /^(image|video)\//.test(file.type) || isImageFile(file.name) || isVideoFile(file.name);
@@ -42466,7 +42487,7 @@ promptEl.parentElement.addEventListener("drop", async (e) => {
       showToast(`文件引用已插入: ${ref}`);
       continue;
     }
-    
+
     if (file.size < 100000) {
       const reader = new FileReader();
       reader.onload = () => {
