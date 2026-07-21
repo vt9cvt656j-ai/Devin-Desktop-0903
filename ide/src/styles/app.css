@@ -6753,6 +6753,17 @@ body.zen-mode .editor {
   border-radius: 9px;
   white-space: pre-wrap;
 }
+.turn-stats {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #8b8fa3;
+  user-select: text;
+}
+[data-theme="dark"] .turn-stats,
+.dark .turn-stats {
+  color: #6b7280;
+}
 .think-return-status {
   margin-top: 8px;
   padding: 6px 9px;
