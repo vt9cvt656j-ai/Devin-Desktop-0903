@@ -5050,27 +5050,35 @@ body.zen-mode .editor {
 .msg__edit-ta::placeholder { color: var(--text-dim); }
 /* the toolbar is a clone of the bottom composer's bar — .composer__bar supplies the layout */
 /* ---- 排队消息小卡片（运行中再发的消息挂在输入框上方） ---- */
-.queue-bar { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
+.queue-bar { display: flex; flex-direction: column; gap: 5px; margin-bottom: 7px; }
 .queue-chip {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px 6px 12px; box-sizing: border-box;
+  padding: 6px 6px 6px 10px; box-sizing: border-box;
   background: var(--editor-bg);
-  border: 1px dashed var(--line-strong);
-  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
   box-shadow: var(--shadow-sm);
+  transition: border-color 0.13s ease, box-shadow 0.13s ease;
+}
+.queue-chip:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--sel); }
+.queue-chip__icon {
+  flex: none; width: 14px; height: 14px; color: var(--accent);
 }
 .queue-chip__text {
   flex: 1; min-width: 0;
-  font-size: 12.5px; line-height: 1.4; color: var(--text-dim);
+  font-size: 12.5px; line-height: 1.45; color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .queue-chip__insert {
-  flex: none; font-size: 12px; padding: 3px 10px; border-radius: 7px; cursor: pointer;
-  border: 1px solid var(--line-strong);
-  background: var(--panel-solid); color: var(--text);
-  transition: background 0.13s ease;
+  flex: none; display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 500; padding: 3px 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid transparent;
+  background: var(--accent); color: #fff;
+  transition: filter 0.13s ease, transform 0.1s ease;
 }
-.queue-chip__insert:hover { background: var(--hover); }
+.queue-chip__insert:hover { filter: brightness(1.08); }
+.queue-chip__insert:active { transform: scale(0.96); }
+.queue-chip__insert .ic { width: 11px; height: 11px; }
 
 /* ---- code card (v3 — matching agent tool cards) ---- */
 .code-card {

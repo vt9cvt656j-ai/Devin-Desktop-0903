@@ -15805,6 +15805,9 @@ function _renderQueueBar(sess) {
       const t = typeof item === "string" ? item : String(item.text || "");
       const chip = document.createElement("div");
       chip.className = "queue-chip";
+      chip.innerHTML =
+        `<svg class="queue-chip__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">` +
+        `<circle cx="8" cy="8" r="6.2"/><path d="M8 4.8V8l2.2 1.6"/></svg>`;
       const txt = document.createElement("span");
       txt.className = "queue-chip__text";
       txt.textContent = t;
@@ -15812,7 +15815,7 @@ function _renderQueueBar(sess) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "queue-chip__insert";
-      btn.textContent = "插入";
+      btn.innerHTML = `<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.5V3.5M4 7l4-3.5L12 7"/></svg><span>插入</span>`;
       btn.title = "立即插入：阻断当前回答，结合两次输入继续";
       btn.addEventListener("click", () => _insertQueuedNow(sess, item));
       chip.append(txt, btn);
