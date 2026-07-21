@@ -14967,6 +14967,35 @@ async function _classifyIntent(task, config) {
     return { kind: j.kind, steps: Math.max(1, Math.min(60, Math.round(steps))), needs_tools: j.needs_tools !== false };
   } catch { return null; }
 }
+// LLM 自省批判器（收尾把关）：不写死规则/阈值/正则——把「答得够不够深、任务真完成没有」
+// 的判断交给一次独立的模型调用。它看到：用户任务、运行草稿纸（读过/改过/发现）、准备给出的
+// 回答草稿，返回 {done, instruction}。不 done 时 instruction 是给智能体的针对性下一步指令。
+// 失败/超时一律放行（fail-open），绝不因为批判器挂了卡死运行。
+async function _wrapUpCritic({ config, task, padText, draft, readList }) {
+  if (!config || !config.baseUrl || !config.apiKey) return null;
+  const sys = '你是一个编码智能体的收尾评审。判断它现在收尾是否合格，只输出严格 JSON：{"done":true|false,"instruction":"<不合格时给它的具体下一步指令，一两句>"}。'
+    + '评审标准：回答/工作要与用户任务的深度和范围匹配——问"项目是干嘛的/架构"这类全局理解题，必须基于真正读过入口和核心模块的源码，只读 README 或一两个文件就下结论=不合格；'
+    + '改代码的任务，声称完成但没验证/没跑检查=不合格；答非所问、明显浅、留着没做完的事=不合格。'
+    + '反之，简单问题简单答完全合格，别为难它、别要求过度工作。拿不准就放行(done=true)。只输出 JSON。';
+  const user = `用户任务：${String(task || "").slice(0, 1200)}\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 2000)}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 3000)}`;
+  try {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+    const res = await fetch(config.baseUrl.replace(/\/+$/, "") + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (config.apiKey || "") },
+      body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 220, temperature: 0, stream: false }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (to) clearTimeout(to);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const j = _safeJsonLoose((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "");
+    if (!j || typeof j.done !== "boolean") return null;
+    return { done: j.done, instruction: String(j.instruction || "").slice(0, 600) };
+  } catch { return null; }
+}
+
 async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // Enable extended thinking for models that support it (Claude / o-series) so the
@@ -15067,7 +15096,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0;
+  let continueNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, deepReadNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -15261,6 +15290,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const _nudgeMsg = "停！你在说废话而不是做事。**立刻调工具**：用 list_dir(\".\") 和 read_file / search 了解项目现状，用 update_plan 列出详细计划（每步写具体技术栈/文件/命令），然后开始动手。别再输出纯文字了——Claude Code / Codex 从不这样，它们上来就调工具。";
           messages.push({ role: "user", content: _nudgeMsg });
           continue;
+        }
+        // E — LLM 自省收尾门：不写规则不写正则——收尾前让一次独立模型调用评审
+        // 「这个回答/这次工作配不配得上用户的任务」（深度、完整度、有没有验证），
+        // 不合格就把它生成的针对性指令喂回去继续干。只评一次，fail-open。
+        if (deepReadNudges < 1 && run.mode === "agent" && !_quick() && _live()) {
+          deepReadNudges++;
+          const _readList = _readFiles && _readFiles.size ? [..._readFiles].slice(-15).map((p) => _normRel(p, root)).join("、") : "";
+          const _crit = await _wrapUpCritic({ config, task, padText: _padText(), draft: turn.text || summaryText, readList: _readList });
+          if (_crit && !_crit.done && _crit.instruction) {
+            messages.push({ role: "user", content: `[收尾评审未通过] ${_crit.instruction}` });
+            continue;
+          }
         }
         // C — don't stop with unfinished plan steps.
         const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
