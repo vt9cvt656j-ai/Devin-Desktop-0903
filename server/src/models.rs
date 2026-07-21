@@ -6,6 +6,10 @@ use axum::Json;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::auth::Claims;
 use crate::error::{ApiResult, AppError};
@@ -19,15 +23,81 @@ use crate::AppState;
 /// to a host pays the handshake. No global timeout: streamed chat responses are
 /// open-ended; only the connect phase is bounded (per-request timeouts are added
 /// for the non-streaming calls that need them).
-static GW_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+static GW_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
+
+const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 6;
+const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
+
+static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static I18N_PACK_CACHE: LazyLock<Mutex<HashMap<String, serde_json::Value>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn chat_upstream_retry_base_delay_ms(attempt: u32) -> u64 {
+    match attempt {
+        0 => 250,
+        1 => 650,
+        2 => 1_300,
+        3 => 2_500,
+        _ => 4_000,
+    }
+}
+
+fn chat_upstream_retry_delay(attempt: u32) -> Duration {
+    let jitter_ms = rand::thread_rng().gen_range(0..=175);
+    Duration::from_millis(chat_upstream_retry_base_delay_ms(attempt) + jitter_ms)
+}
+
+fn route_cooldown_remaining(id: uuid::Uuid, now: Instant) -> Option<Duration> {
+    let mut guard = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock().ok()?;
+    match guard.get(&id).copied() {
+        Some(until) if until > now => Some(until - now),
+        Some(_) => {
+            guard.remove(&id);
+            None
+        }
+        None => None,
+    }
+}
+
+fn mark_route_cooldown(id: uuid::Uuid) {
+    if let Ok(mut guard) = CHAT_UPSTREAM_ROUTE_COOLDOWNS.lock() {
+        guard.insert(id, Instant::now() + CHAT_UPSTREAM_ROUTE_COOLDOWN);
+    }
+}
+
+fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: u16) -> String {
+    if route_count <= 1 {
+        format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
+    } else {
+        format!("（已请求 {attempts} 次 / {route_count} 条同模型线路；最后状态 {last_status}）")
+    }
+}
+
+fn safe_upstream_error_excerpt(low: &str) -> String {
+    let mut text = low
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .replace('\t', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for marker in ["sk-", "sk_live_", "sk-proj-"] {
+        if let Some(pos) = text.find(marker) {
+            let end = (pos + 48).min(text.len());
+            text.replace_range(pos..end, "[redacted-key]");
+        }
+    }
+    text.chars().take(220).collect()
+}
 
 /// Wrap an upstream byte stream with an IDLE timeout: if the provider (zyz et al.)
 /// goes silent mid-response for too long (it occasionally stalls a stream), we
@@ -78,7 +148,7 @@ fn api_base(base: &str) -> String {
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Clone)]
 pub struct Model {
     pub id: uuid::Uuid,
     pub label: String,
@@ -205,6 +275,358 @@ fn allowed_ids(m: &Model) -> Vec<String> {
         Some(s) if !s.is_empty() => vec![s.clone()],
         _ => vec![],
     }
+}
+
+#[derive(Deserialize)]
+pub struct I18nPackReq {
+    pub locale: String,
+    pub source_locale: Option<String>,
+    pub entries: HashMap<String, String>,
+}
+
+fn i18n_pack_cache_key(locale: &str, entries: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<_> = entries.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    locale.hash(&mut h);
+    for (k, v) in pairs {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    }
+    format!("{}:{:016x}", locale, h.finish())
+}
+
+fn json_object_from_model_text(text: &str) -> Option<serde_json::Value> {
+    let mut s = text.trim();
+    if s.starts_with("```") {
+        if let Some(pos) = s.find('\n') {
+            s = &s[pos + 1..];
+        }
+        if let Some(pos) = s.rfind("```") {
+            s = &s[..pos];
+        }
+    }
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    serde_json::from_str(&s[start..=end]).ok()
+}
+
+fn i18n_pack_payload(
+    model_id: &str,
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> serde_json::Value {
+    json!({
+        "model": model_id,
+        "temperature": 0.1,
+        "stream": false,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a professional software UI localization engine. Return ONLY valid JSON. Translate UI strings accurately and naturally. Preserve placeholders like {name}, {count}, {path}, punctuation that belongs to variables, product names (Michael IDE, Git, MCP, Skills), code identifiers, file paths, shortcuts, and HTML/Markdown markers. Keep keys unchanged. Do not add explanations."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Translate this Michael IDE UI language pack from {} to locale {}. Return JSON exactly as {{\"translations\":{{\"key\":\"translated text\"}}}}. Entries JSON:\n{}",
+                    source_locale,
+                    locale,
+                    serde_json::to_string(entries).unwrap_or_else(|_| "{}".into())
+                )
+            }
+        ]
+    })
+}
+
+fn i18n_out_from_raw(
+    entries: &HashMap<String, String>,
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (k, original) in entries {
+        if let Some(text) = raw.get(k).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.insert(k.clone(), json!(trimmed));
+                continue;
+            }
+        }
+        out.insert(k.clone(), json!(original));
+    }
+    out
+}
+
+fn i18n_pack_body(
+    locale: &str,
+    source_locale: &str,
+    translations: serde_json::Map<String, serde_json::Value>,
+    source: &str,
+) -> serde_json::Value {
+    json!({
+        "locale": locale,
+        "source_locale": source_locale,
+        "translations": translations,
+        "source": source,
+    })
+}
+
+async fn i18n_pack_from_model(
+    m: &Model,
+    model_id: &str,
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let payload = i18n_pack_payload(model_id, source_locale, locale, entries);
+    let url = format!("{}/chat/completions", api_base(&m.base_url));
+    let resp = GW_HTTP
+        .post(url)
+        .header("Authorization", format!("Bearer {}", m.api_key))
+        .json(&payload)
+        .timeout(Duration::from_secs(90))
+        .send()
+        .await
+        .map_err(|e| format!("{} / {} 请求失败: {e}", m.label, model_id))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "{} / {} 上游错误 {}: {}",
+            m.label,
+            model_id,
+            status.as_u16(),
+            safe_upstream_error_excerpt(&text)
+        ));
+    }
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| format!("{} / {} 返回非 JSON", m.label, model_id))?;
+    let content = data
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let parsed = json_object_from_model_text(content)
+        .ok_or_else(|| format!("{} / {} 没有返回可解析语言包 JSON", m.label, model_id))?;
+    let raw = parsed
+        .get("translations")
+        .and_then(|v| v.as_object())
+        .or_else(|| parsed.as_object())
+        .ok_or_else(|| format!("{} / {} 语言包缺少 translations 对象", m.label, model_id))?;
+    Ok(i18n_out_from_raw(entries, raw))
+}
+
+fn google_translate_locale(locale: &str) -> String {
+    match locale.trim().replace('_', "-").as_str() {
+        "zh-CN" | "zh-Hans" => "zh-CN".to_string(),
+        "zh-TW" | "zh-Hant" => "zh-TW".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn google_translate_text(data: &serde_json::Value) -> Option<String> {
+    let parts = data.get(0)?.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        if let Some(text) = part.get(0).and_then(|v| v.as_str()) {
+            out.push_str(text);
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+async fn google_translate_joined(
+    source_locale: &str,
+    locale: &str,
+    joined: &str,
+) -> Result<String, String> {
+    let resp = GW_HTTP
+        .get("https://translate.googleapis.com/translate_a/single")
+        .query(&[
+            ("client", "gtx"),
+            ("sl", source_locale),
+            ("tl", locale),
+            ("dt", "t"),
+            ("q", joined),
+        ])
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await
+        .map_err(|e| format!("公共翻译请求失败: {e}"))?;
+    let status = resp.status();
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("公共翻译返回非 JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("公共翻译错误 {}: {}", status.as_u16(), data));
+    }
+    google_translate_text(&data).ok_or_else(|| "公共翻译没有返回文本".to_string())
+}
+
+async fn google_translate_batch(
+    source_locale: &str,
+    locale: &str,
+    texts: &[String],
+) -> Result<Vec<String>, String> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let marker = "<<<MICHAEL_I18N_SPLIT>>>";
+    let joined = texts.join(&format!("\n{marker}\n"));
+    let translated = google_translate_joined(source_locale, locale, &joined).await?;
+    let parts: Vec<String> = translated
+        .split(marker)
+        .map(|s| s.trim_matches(['\n', '\r']).trim().to_string())
+        .collect();
+    if parts.len() == texts.len() {
+        return Ok(parts);
+    }
+    if texts.len() == 1 {
+        return Ok(vec![translated.trim().to_string()]);
+    }
+
+    let mut one_by_one = Vec::with_capacity(texts.len());
+    for text in texts {
+        let single = google_translate_joined(source_locale, locale, text).await?;
+        let cleaned = single.trim();
+        one_by_one.push(if cleaned.is_empty() {
+            text.clone()
+        } else {
+            cleaned.to_string()
+        });
+    }
+    Ok(one_by_one)
+}
+
+async fn i18n_pack_from_public_translate(
+    source_locale: &str,
+    locale: &str,
+    entries: &HashMap<String, String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let tl = google_translate_locale(locale);
+    let mut pairs: Vec<(&String, &String)> = entries.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = serde_json::Map::new();
+    let mut batch_keys: Vec<String> = Vec::new();
+    let mut batch_texts: Vec<String> = Vec::new();
+    let mut batch_len = 0usize;
+    for (key, text) in pairs {
+        let projected = batch_len + text.len() + 32;
+        if !batch_texts.is_empty() && projected > 3200 {
+            let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
+            for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+                out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
+            }
+            batch_texts.clear();
+            batch_len = 0;
+        }
+        batch_keys.push(key.clone());
+        batch_texts.push(text.clone());
+        batch_len += text.len() + 32;
+    }
+    if !batch_texts.is_empty() {
+        let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
+        for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+            out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
+        }
+    }
+
+    Ok(i18n_out_from_raw(entries, &out))
+}
+
+/// POST /api/i18n/pack — generate a UI language pack for any BCP-47 locale.
+///
+/// The IDE ships core packs (zh/en/ja) locally. For every other selected language
+/// it posts the English key-value base here; the server asks an active configured
+/// model to translate it into the requested locale, caches the result in memory,
+/// and returns a plain `{ translations: { key: text } }` object. This gives every
+/// language in the picker a real loading path without bundling hundreds of huge
+/// hand-maintained JSON files into the desktop app.
+pub async fn i18n_pack(
+    State(state): State<AppState>,
+    Json(req): Json<I18nPackReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let locale = req.locale.trim().replace('_', "-");
+    if locale.is_empty() || locale.len() > 32 {
+        return Err(AppError::bad("locale 不能为空"));
+    }
+    let source_locale = req.source_locale.unwrap_or_else(|| "en".to_string());
+    let entries: HashMap<String, String> = req
+        .entries
+        .into_iter()
+        .filter(|(k, v)| {
+            !k.trim().is_empty() && k.len() <= 96 && !v.trim().is_empty() && v.len() <= 900
+        })
+        .take(700)
+        .collect();
+    if entries.is_empty() {
+        return Err(AppError::bad("entries 不能为空"));
+    }
+
+    let cache_key = i18n_pack_cache_key(&locale, &entries);
+    if let Ok(cache) = I18N_PACK_CACHE.lock() {
+        if let Some(v) = cache.get(&cache_key) {
+            return Ok(Json(v.clone()));
+        }
+    }
+
+    let models = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true AND api_key <> '' ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut failures: Vec<String> = Vec::new();
+    for m in &models {
+        let mut ids = allowed_ids(m);
+        if ids.is_empty() {
+            if let Some(id) = &m.model_id {
+                if !id.trim().is_empty() {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            failures.push(format!("{} 未配置 model_id", m.label));
+            continue;
+        }
+        for model_id in ids {
+            match i18n_pack_from_model(m, &model_id, &source_locale, &locale, &entries).await {
+                Ok(out) => {
+                    let body =
+                        i18n_pack_body(&locale, &source_locale, out, "model_generated_cached");
+                    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
+                        cache.insert(cache_key, body.clone());
+                    }
+                    return Ok(Json(body));
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+    }
+
+    let out = i18n_pack_from_public_translate(&source_locale, &locale, &entries)
+        .await
+        .map_err(|e| AppError {
+            status: StatusCode::BAD_GATEWAY,
+            msg: format!(
+                "语言包生成失败；模型线路失败 {} 条，公共翻译也失败: {}",
+                failures.len(),
+                e
+            ),
+        })?;
+    let body = i18n_pack_body(&locale, &source_locale, out, "public_translate_cached");
+    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
+        cache.insert(cache_key, body.clone());
+    }
+    Ok(Json(body))
 }
 
 /// Mask a secret for display: keep the last 4 chars.
@@ -491,6 +913,16 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
     for m in &rows {
         for mid in allowed_ids(m) {
             let name = display_name_for(&m.model_names, &mid);
+            let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
+            let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
+                (model_in, model_out, "model_override")
+            } else if m.input_price > 0.0 || m.output_price > 0.0 {
+                (m.input_price, m.output_price, "backend")
+            } else if let Some((official_in, official_out)) = official_price(&mid) {
+                (official_in, official_out, "catalog")
+            } else {
+                (0.0, 0.0, "unset")
+            };
             list.push(json!({
                 "conn_id": m.id,
                 "group": m.label,
@@ -498,9 +930,13 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "model_id": mid.clone(),
                 "name": name,
                 "price_cents": m.price_cents,
-                // Only the admin blurb is exposed. The operator's billing (input_price/
-                // output_price/rate + markup) is deliberately NOT sent to clients — the
-                // picker shows each model's OFFICIAL list price from a frontend catalog.
+                // Expose the display price the admin configured for the IDE picker.
+                // No api_key/base_url is leaked; just the model's visible input/output
+                // price so the client can show exactly what the backend is using.
+                "input_price": input_price,
+                "output_price": output_price,
+                "price_source": price_source,
+                "rate": m.rate,
                 "description": m.description,
             }));
         }
@@ -1048,6 +1484,60 @@ fn official_price(model_id: &str) -> Option<(f64, f64)> {
             return Some((0.5, 3.0));
         } // gemini 3 flash tier
     }
+    // ---- Z.ai GLM (official list price, USD/1M, docs.z.ai 2026-07) ----
+    if m.contains("glm") {
+        // 顺序敏感：更具体的变体（airx/air/x/flashx）必须先于裸版本号匹配
+        if m.contains("5.2") || m.contains("5.1") {
+            return Some((1.40, 4.40));
+        }
+        if m.contains("glm-5") || m.contains("glm5") {
+            return Some((1.00, 3.20));
+        }
+        if m.contains("flashx") {
+            return Some((0.07, 0.40));
+        }
+        if m.contains("airx") {
+            return Some((1.10, 4.50));
+        }
+        if m.contains("air") {
+            return Some((0.20, 1.10));
+        }
+        if m.contains("4.5-x") || m.contains("4.5x") {
+            return Some((2.20, 8.90));
+        }
+        if m.contains("4.7") || m.contains("4.6") || m.contains("4.5") {
+            return Some((0.60, 2.20));
+        }
+        return Some((0.60, 2.20)); // 其余 GLM 变体按 4.x 主档兜底
+    }
+    // ---- xAI Grok (official list price, USD/1M, x.ai 2026-07) ----
+    if m.contains("grok") {
+        if m.contains("code-fast") || m.contains("code_fast") {
+            return Some((0.20, 1.50));
+        }
+        if m.contains("4.20") {
+            return Some((2.0, 6.0));
+        }
+        if m.contains("4.5") {
+            return Some((2.0, 6.0));
+        }
+        if m.contains("4.3") {
+            return Some((1.25, 2.50));
+        }
+        if m.contains("4.1") || m.contains("4-fast") || m.contains("fast") {
+            return Some((0.20, 0.50)); // grok-4.1 / grok-4.1-fast / grok-4-fast 量产档
+        }
+        if m.contains("build") {
+            return Some((1.0, 2.0));
+        }
+        if m.contains("3-mini") || m.contains("3 mini") {
+            return Some((0.30, 0.50));
+        }
+        if m.contains("grok-4") || m.contains("grok-3") {
+            return Some((3.0, 15.0)); // grok-4 / grok-3 旗舰旧档
+        }
+        return Some((2.0, 6.0)); // 未知新 Grok 按当前旗舰档兜底
+    }
     // ---- OpenAI GPT / DeepSeek / MiniMax (exact ids as the aggregator exposes them) ----
     let p = match m.as_str() {
         "gpt-5.5" => (5.0, 30.0),
@@ -1207,6 +1697,214 @@ fn parse_usage_from_sse(acc: &[u8]) -> Option<serde_json::Value> {
     last
 }
 
+/// Incrementally validates OpenAI-compatible SSE before each upstream chunk is
+/// forwarded. A terminal marker alone is insufficient when an earlier frame was
+/// malformed: that frame may contain the missing suffix of a file-writing tool.
+#[derive(Clone, Debug, Default)]
+struct ToolArgumentRules {
+    required: Vec<String>,
+    min_lengths: std::collections::HashMap<String, usize>,
+}
+
+fn validate_streamed_tool_arguments(
+    provider: &str,
+    name: &str,
+    raw_arguments: &str,
+    rules: Option<&ToolArgumentRules>,
+) -> Result<String, String> {
+    let arguments = if raw_arguments.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        raw_arguments.to_string()
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&arguments).map_err(|error| {
+        format!("{provider} tool call {name:?} produced incomplete arguments JSON: {error}")
+    })?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| format!("{provider} tool call {name:?} arguments must be a JSON object"))?;
+    if let Some(rules) = rules {
+        let missing = rules
+            .required
+            .iter()
+            .filter(|key| !object.contains_key(key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{provider} tool call {name:?} is missing required arguments: {}",
+                missing.join(", ")
+            ));
+        }
+        for (key, min_length) in &rules.min_lengths {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            let text = value.as_str().ok_or_else(|| {
+                format!("{provider} tool call {name:?} argument {key:?} must be a string")
+            })?;
+            if text.chars().count() < *min_length {
+                return Err(format!(
+                    "{provider} tool call {name:?} argument {key:?} is shorter than minLength {min_length}"
+                ));
+            }
+        }
+    }
+    Ok(arguments)
+}
+
+#[derive(Default)]
+struct OpenAiToolStream {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct OpenAiSseValidator {
+    buf: Vec<u8>,
+    done_seen: bool,
+    tool_calls: std::collections::HashMap<(u64, u64), OpenAiToolStream>,
+    tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+}
+
+impl OpenAiSseValidator {
+    fn with_tool_argument_rules(
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    ) -> Self {
+        Self {
+            tool_argument_rules,
+            ..Self::default()
+        }
+    }
+
+    fn record_tool_calls(&mut self, event: &serde_json::Value) -> Result<(), String> {
+        let Some(choices) = event.get("choices").and_then(|value| value.as_array()) else {
+            return Ok(());
+        };
+        for (choice_position, choice) in choices.iter().enumerate() {
+            let choice_index = choice
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(choice_position as u64);
+            let calls = choice
+                .pointer("/delta/tool_calls")
+                .or_else(|| choice.pointer("/message/tool_calls"));
+            let Some(calls) = calls.and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for (call_position, call) in calls.iter().enumerate() {
+                let tool_index = call
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(call_position as u64);
+                let stream = self
+                    .tool_calls
+                    .entry((choice_index, tool_index))
+                    .or_default();
+                let Some(function) = call.get("function") else {
+                    continue;
+                };
+                let function = function
+                    .as_object()
+                    .ok_or_else(|| "OpenAI SSE tool call function must be an object".to_string())?;
+                if let Some(name) = function.get("name") {
+                    let name = name.as_str().ok_or_else(|| {
+                        "OpenAI SSE tool call function.name must be a string".to_string()
+                    })?;
+                    if !name.is_empty() {
+                        stream.name = name.to_string();
+                    }
+                }
+                if let Some(arguments) = function.get("arguments") {
+                    let arguments = arguments.as_str().ok_or_else(|| {
+                        "OpenAI SSE tool call function.arguments must be a string".to_string()
+                    })?;
+                    stream.arguments.push_str(arguments);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tool_calls(&self) -> Result<(), String> {
+        for stream in self.tool_calls.values() {
+            if stream.name.is_empty() {
+                return Err("OpenAI SSE tool call ended without function.name".to_string());
+            }
+            validate_streamed_tool_arguments(
+                "OpenAI",
+                &stream.name,
+                &stream.arguments,
+                self.tool_argument_rules.get(&stream.name),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.buf.extend_from_slice(bytes);
+        while let Some(newline) = self.buf.iter().position(|&byte| byte == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=newline).collect();
+            let line = std::str::from_utf8(&raw)
+                .map_err(|error| format!("OpenAI SSE contains invalid UTF-8: {error}"))?
+                .trim();
+            let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                if self.done_seen {
+                    return Err(
+                        "OpenAI SSE contains more than one terminal data: [DONE]".to_string()
+                    );
+                }
+                // Validate before the caller forwards the chunk containing [DONE]. This
+                // prevents clients from observing a successful terminal event for a
+                // truncated tool call and also keeps that response out of the cache.
+                self.validate_tool_calls()?;
+                self.done_seen = true;
+                continue;
+            }
+            if self.done_seen {
+                return Err("OpenAI SSE contains data after terminal data: [DONE]".to_string());
+            }
+            let event = serde_json::from_str::<serde_json::Value>(payload)
+                .map_err(|error| format!("OpenAI SSE contains malformed JSON: {error}"))?;
+            self.record_tool_calls(&event)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if !self.buf.iter().all(u8::is_ascii_whitespace) {
+            return Err("OpenAI upstream stream ended with an incomplete SSE frame".to_string());
+        }
+        if !self.done_seen {
+            return Err("OpenAI upstream stream ended without terminal data: [DONE]".to_string());
+        }
+        self.validate_tool_calls()
+    }
+}
+
+#[cfg(test)]
+fn validate_openai_sse_eof(bytes: &[u8]) -> Result<(), String> {
+    let mut validator = OpenAiSseValidator::default();
+    validator.push(bytes)?;
+    validator.finish()
+}
+
+#[cfg(test)]
+fn validate_openai_sse_with_rules(
+    bytes: &[u8],
+    rules: std::collections::HashMap<String, ToolArgumentRules>,
+) -> Result<(), String> {
+    let mut validator = OpenAiSseValidator::with_tool_argument_rules(rules);
+    validator.push(bytes)?;
+    validator.finish()
+}
+
 /// Strip ALL `cache_control` before forwarding. PROVEN via per-call fingerprints that
 /// the [tools+system] prefix is byte-IDENTICAL on every call (16+ consecutive calls,
 /// same sys_hash + tools_hash) — yet the relay (zyz) still bills cache CREATION (a 1.25×
@@ -1252,6 +1950,15 @@ fn gw_cache_key(body: &serde_json::Value) -> String {
     0x9e37_79b9_7f4a_7c15u64.hash(&mut h2);
     bytes.hash(&mut h2);
     format!("gwc:{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+fn response_cache_safe(bytes: &[u8]) -> bool {
+    // Tool-call arguments contain the user's full tracking number. The native tool
+    // masks its result, but caching the model response would retain the original
+    // argument in Redis. A false positive only costs one cache miss.
+    !bytes
+        .windows(b"track_shipment".len())
+        .any(|window| window == b"track_shipment")
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
@@ -1605,7 +2312,7 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
 }
 
 /// OpenAI /chat/completions body → Anthropic /v1/messages body.
-fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
+fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, String> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
@@ -1659,12 +2366,30 @@ fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
                                 .pointer("/function/name")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let args = tc
-                                .pointer("/function/arguments")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}");
-                            let input: serde_json::Value =
-                                serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                            let args = tc.pointer("/function/arguments").ok_or_else(|| {
+                                format!(
+                                    "assistant tool call {name:?} (id {id:?}) is missing function.arguments"
+                                )
+                            })?;
+                            let input = match args {
+                                serde_json::Value::String(args) => serde_json::from_str(args)
+                                    .map_err(|err| {
+                                        format!(
+                                            "assistant tool call {name:?} (id {id:?}) has malformed function.arguments JSON: {err}"
+                                        )
+                                    })?,
+                                serde_json::Value::Object(_) => args.clone(),
+                                _ => {
+                                    return Err(format!(
+                                        "assistant tool call {name:?} (id {id:?}) has non-object function.arguments"
+                                    ));
+                                }
+                            };
+                            if !input.is_object() {
+                                return Err(format!(
+                                    "assistant tool call {name:?} (id {id:?}) function.arguments must decode to a JSON object"
+                                ));
+                            }
                             blocks
                                 .push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
                         }
@@ -1698,8 +2423,19 @@ fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
         .or_else(|| {
-            // If client sent thinking but no reasoning_effort, infer effort from presence
-            body.get("thinking").and(Some("high"))
+            // 客户端只发 thinking:{budget_tokens} 不发 reasoning_effort（IDE Claude 族的
+            // 真实形状）时，按预算推档——以前这里一律写死 "high"，用户转盘上的
+            // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
+            // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
+            body.get("thinking").map(|t| {
+                match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
+                    b if b > 24000 => "max",
+                    b if b > 12000 => "high",
+                    b if b > 4096 => "medium",
+                    b if b > 0 => "low",
+                    _ => "high", // 无预算的裸 thinking 开关（Kimi/GLM 形状）保持旧行为
+                }
+            })
         });
     let thinking = anthropic_thinking(model_str, effort);
     let thinking_on = thinking.is_some();
@@ -1799,7 +2535,7 @@ fn oai_to_anthropic(body: &serde_json::Value) -> serde_json::Value {
             out.insert("tool_choice".into(), v);
         }
     }
-    serde_json::Value::Object(out)
+    Ok(serde_json::Value::Object(out))
 }
 
 /// Anthropic usage → an object carrying BOTH Anthropic token names (so compute_cost bills
@@ -1865,15 +2601,65 @@ fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
     })
 }
 
+fn tool_argument_rules(
+    body: &serde_json::Value,
+) -> std::collections::HashMap<String, ToolArgumentRules> {
+    body.get("tools")
+        .and_then(|tools| tools.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.as_str()?.to_string();
+            let required = function
+                .pointer("/parameters/required")
+                .and_then(|required| required.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|key| key.as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            let min_lengths = function
+                .pointer("/parameters/properties")
+                .and_then(|properties| properties.as_object())
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, schema)| {
+                    schema
+                        .get("minLength")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| usize::try_from(value).ok())
+                        .map(|value| (key.clone(), value))
+                })
+                .collect();
+            Some((
+                name,
+                ToolArgumentRules {
+                    required,
+                    min_lengths,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Stateful converter: Anthropic Messages SSE stream → OpenAI chat.completions SSE stream.
 /// Fed raw upstream bytes via `push` (handles chunk-split events); emits ready-to-forward
 /// OpenAI `data:` lines. Accumulates usage for billing. `finish` emits the terminal chunks.
+struct AnthToolStream {
+    tool_index: i64,
+    name: String,
+    arguments: String,
+    stopped: bool,
+}
+
 struct AnthSse {
     buf: Vec<u8>,
     model: String,
     role_sent: bool,
     next_tool_idx: i64,
-    block_tool: std::collections::HashMap<i64, i64>,
+    tool_blocks: std::collections::HashMap<i64, AnthToolStream>,
+    tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    message_stop_seen: bool,
     input_tokens: i64,
     output_tokens: i64,
     cache_read: i64,
@@ -1882,13 +2668,43 @@ struct AnthSse {
     out_bytes: usize, // incremental output byte counter for fallback estimation
 }
 impl AnthSse {
+    #[cfg(test)]
     fn new(model: &str) -> Self {
+        Self::with_tool_argument_rules(model, std::collections::HashMap::new())
+    }
+
+    #[cfg(test)]
+    fn with_required_tool_args(
+        model: &str,
+        required_tool_args: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let rules = required_tool_args
+            .into_iter()
+            .map(|(name, required)| {
+                (
+                    name,
+                    ToolArgumentRules {
+                        required,
+                        min_lengths: std::collections::HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        Self::with_tool_argument_rules(model, rules)
+    }
+
+    fn with_tool_argument_rules(
+        model: &str,
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+    ) -> Self {
         AnthSse {
             buf: Vec::new(),
             model: model.to_string(),
             role_sent: false,
             next_tool_idx: 0,
-            block_tool: std::collections::HashMap::new(),
+            tool_blocks: std::collections::HashMap::new(),
+            tool_argument_rules,
+            message_stop_seen: false,
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -1896,6 +2712,15 @@ impl AnthSse {
             stop_reason: "stop".into(),
             out_bytes: 0,
         }
+    }
+
+    fn validated_tool_arguments(&self, block: &AnthToolStream) -> Result<String, String> {
+        validate_streamed_tool_arguments(
+            "Anthropic",
+            &block.name,
+            &block.arguments,
+            self.tool_argument_rules.get(&block.name),
+        )
     }
     fn chunk(&self, delta: serde_json::Value, finish: Option<&str>) -> Vec<u8> {
         let choice = json!({"index":0,"delta":delta,"finish_reason": match finish { Some(f) => json!(f), None => serde_json::Value::Null }});
@@ -1911,13 +2736,14 @@ impl AnthSse {
             self.role_sent = true;
         }
     }
-    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
         self.buf.extend_from_slice(bytes);
         let mut out: Vec<u8> = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = self.buf.drain(0..=nl).collect();
-            let line = String::from_utf8_lossy(&raw);
-            let line = line.trim();
+            let line = std::str::from_utf8(&raw)
+                .map_err(|err| format!("Anthropic SSE contains invalid UTF-8: {err}"))?
+                .trim();
             let data = match line.strip_prefix("data:") {
                 Some(d) => d.trim(),
                 None => continue,
@@ -1925,10 +2751,8 @@ impl AnthSse {
             if data.is_empty() {
                 continue;
             }
-            let ev: serde_json::Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let ev: serde_json::Value = serde_json::from_str(data)
+                .map_err(|err| format!("invalid Anthropic SSE JSON: {err}"))?;
             match ev.get("type").and_then(|t| t.as_str()) {
                 Some("message_start") => {
                     if let Some(u) = ev.pointer("/message/usage") {
@@ -1946,12 +2770,18 @@ impl AnthSse {
                     self.ensure_role(&mut out);
                 }
                 Some("content_block_start") => {
-                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let idx = ev.get("index").and_then(|v| v.as_i64()).ok_or_else(|| {
+                        "Anthropic content_block_start is missing a numeric index".to_string()
+                    })?;
                     let cb = ev.get("content_block");
                     if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+                        if self.tool_blocks.contains_key(&idx) {
+                            return Err(format!(
+                                "Anthropic tool_use reused content block index {idx}"
+                            ));
+                        }
                         let ti = self.next_tool_idx;
                         self.next_tool_idx += 1;
-                        self.block_tool.insert(idx, ti);
                         let id = cb
                             .and_then(|c| c.get("id"))
                             .and_then(|v| v.as_str())
@@ -1960,12 +2790,37 @@ impl AnthSse {
                             .and_then(|c| c.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
+                        let input = cb
+                            .and_then(|c| c.get("input"))
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let initial_arguments = match input.as_object() {
+                            Some(input) if input.is_empty() => String::new(),
+                            Some(_) => serde_json::to_string(&input).map_err(|err| {
+                                format!(
+                                    "Anthropic tool_use {name:?} contains unserializable input: {err}"
+                                )
+                            })?,
+                            None => {
+                                return Err(format!(
+                                    "Anthropic tool_use {name:?} input must be a JSON object"
+                                ));
+                            }
+                        };
+                        self.tool_blocks.insert(
+                            idx,
+                            AnthToolStream {
+                                tool_index: ti,
+                                name: name.to_string(),
+                                arguments: initial_arguments.clone(),
+                                stopped: false,
+                            },
+                        );
                         self.ensure_role(&mut out);
-                        out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}), None));
+                        out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"id":id,"type":"function","function":{"name":name,"arguments":initial_arguments}}]}), None));
                     }
                 }
                 Some("content_block_delta") => {
-                    let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                     match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
@@ -1983,12 +2838,34 @@ impl AnthSse {
                             }
                         }
                         Some("input_json_delta") => {
-                            if let Some(pj) =
-                                ev.pointer("/delta/partial_json").and_then(|v| v.as_str())
-                            {
-                                let ti = *self.block_tool.get(&idx).unwrap_or(&0);
-                                out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"function":{"arguments": pj}}]}), None));
+                            let idx = ev.get("index").and_then(|v| v.as_i64()).ok_or_else(|| {
+                                "Anthropic input_json_delta is missing a numeric content block index"
+                                    .to_string()
+                            })?;
+                            let pj = ev
+                                .pointer("/delta/partial_json")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Anthropic input_json_delta for index {idx} is missing partial_json"
+                                    )
+                                })?;
+                            let block = self.tool_blocks.get_mut(&idx).ok_or_else(|| {
+                                format!(
+                                    "Anthropic input_json_delta references unknown content block index {idx}"
+                                )
+                            })?;
+                            if block.stopped {
+                                return Err(format!(
+                                    "Anthropic input_json_delta arrived after content_block_stop for index {idx}"
+                                ));
                             }
+                            block.arguments.push_str(pj);
+                            let ti = block.tool_index;
+                            out.extend(self.chunk(
+                                json!({"tool_calls":[{"index":ti,"function":{"arguments": pj}}]}),
+                                None,
+                            ));
                         }
                         _ => {}
                     }
@@ -2019,10 +2896,40 @@ impl AnthSse {
                         }
                     }
                 }
-                _ => {} // ping / content_block_stop / message_stop → emit nothing
+                Some("content_block_stop") => {
+                    if let Some(idx) = ev.get("index").and_then(|v| v.as_i64()) {
+                        if let Some(block) = self.tool_blocks.get(&idx) {
+                            if block.stopped {
+                                return Err(format!(
+                                    "Anthropic content block index {idx} stopped more than once"
+                                ));
+                            }
+                            let arguments = self.validated_tool_arguments(block)?;
+                            let emit_empty_object = block.arguments.trim().is_empty();
+                            let ti = block.tool_index;
+                            if emit_empty_object {
+                                out.extend(self.chunk(json!({"tool_calls":[{"index":ti,"function":{"arguments":arguments}}]}), None));
+                            }
+                        }
+                        if let Some(block) = self.tool_blocks.get_mut(&idx) {
+                            block.stopped = true;
+                        }
+                    }
+                }
+                Some("message_stop") => {
+                    self.message_stop_seen = true;
+                }
+                Some("error") => {
+                    let message = ev
+                        .pointer("/error/message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown Anthropic streaming error");
+                    return Err(format!("Anthropic streaming error: {message}"));
+                }
+                _ => {} // ping / text block stops → emit nothing
             }
         }
-        out
+        Ok(out)
     }
     fn usage(&self) -> serde_json::Value {
         let ot = if self.output_tokens > 0 {
@@ -2041,11 +2948,26 @@ impl AnthSse {
             "total_tokens": self.input_tokens + ot,
         })
     }
-    fn finish(&self) -> Vec<u8> {
+    fn finish(&self) -> Result<Vec<u8>, String> {
+        if !self.buf.iter().all(u8::is_ascii_whitespace) {
+            return Err("Anthropic stream ended with an incomplete SSE frame".to_string());
+        }
+        if !self.message_stop_seen {
+            return Err("Anthropic stream ended before message_stop".to_string());
+        }
+        for block in self.tool_blocks.values() {
+            if !block.stopped {
+                return Err(format!(
+                    "Anthropic stream ended before tool_use {:?} completed",
+                    block.name
+                ));
+            }
+            self.validated_tool_arguments(block)?;
+        }
         let mut out = self.chunk(json!({}), Some(&self.stop_reason));
         out.extend(format!("data: {}\n\n", json!({"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":self.usage()})).into_bytes());
         out.extend_from_slice(b"data: [DONE]\n\n");
-        out
+        Ok(out)
     }
 }
 
@@ -2219,9 +3141,14 @@ pub async fn chat_completions(
     )
     .fetch_all(&state.db)
     .await?;
-    let conn = conns
+    let candidates: Vec<Model> = conns
         .into_iter()
-        .find(|m| allowed_ids(m).contains(&model_id))
+        .filter(|m| allowed_ids(m).contains(&model_id))
+        .collect();
+    let route_count = candidates.len();
+    let primary_conn = candidates
+        .first()
+        .cloned()
         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
 
     // Refill the 5h30m window + reset the weekly counter when due.
@@ -2294,11 +3221,11 @@ pub async fn chat_completions(
             .await
             .ok()
             .flatten();
-        if let Some(bytes) = hit {
+        if let Some(bytes) = hit.filter(|bytes| response_cache_safe(bytes)) {
             bill(
                 &state,
                 uid,
-                conn.id,
+                primary_conn.id,
                 0,
                 use_quota,
                 &BillTokens {
@@ -2346,125 +3273,209 @@ pub async fn chat_completions(
             }
         }
     }
-    // protocol="anthropic" → native /v1/messages with a translated (OpenAI→Anthropic) body;
-    // else the OpenAI-compat /chat/completions passthrough. `upstream_body` is only built for
-    // the anthropic path (the OpenAI path sends `body` unchanged — no extra clone).
-    let anthropic = conn.protocol == "anthropic";
-    let url = if anthropic {
-        format!("{}/messages", api_base(&conn.base_url))
-    } else {
-        format!("{}/chat/completions", api_base(&conn.base_url))
-    };
-    let upstream_body = if anthropic {
-        oai_to_anthropic(&body)
-    } else {
-        serde_json::Value::Null
-    };
+    let tool_argument_rules = tool_argument_rules(&body);
     // Pooled client (warm keep-alive connections) instead of a fresh handshake
     // per request. Streaming stays open-ended; non-streaming gets a sane cap.
     //
     // Upstream providers (zyz et al.) intermittently return 502/503/504/429 or
     // drop a kept-alive connection mid-flight — the user just sees "网关又出问题".
-    // Retry such *transient* failures up to 3 attempts with a short backoff so a
-    // blip is absorbed instead of surfaced. We only retry BEFORE streaming the
-    // body has started (a send error or a bad status line), so no half-streamed
-    // response is ever double-sent, and billing still happens once, after success.
+    // Retry such *transient* failures with bounded exponential backoff so a
+    // short provider flap is absorbed instead of surfaced. We only retry BEFORE
+    // streaming the body has started (a send error or a bad status line), so no
+    // half-streamed response is ever double-sent, and billing still happens once,
+    // after success. Failed routes get a short in-memory cooldown so the next
+    // request prefers another same-model route when the admin has configured one.
     let model_name = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("该模型")
         .to_string();
     // Map an upstream error to a friendly, actionable Chinese message.
-    fn friendly_upstream(status: u16, low: &str) -> &'static str {
+    fn friendly_upstream(status: u16, low: &str) -> String {
         if low.contains("forbidden") || low.contains("未授权") {
             "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
+                .into()
         } else if low.contains("no available") || low.contains("没有可用") {
-            "上游暂无可用账号。请换个模型，或稍后再试。"
+            "上游暂无可用账号。请换个模型，或稍后再试。".into()
         } else if status == 429
             || low.contains("rate")
             || low.contains("frequent")
             || low.contains("过于频繁")
         {
-            "请求过于频繁，请稍后再试。"
+            "请求过于频繁，请稍后再试。".into()
         } else if status == 401 || low.contains("unauthorized") || low.contains("invalid api key") {
-            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。"
+            "上游密钥无效。请在后台「模型系统」更新该连接的 API Key。".into()
+        } else if status == 400 {
+            let detail = safe_upstream_error_excerpt(low);
+            if detail.is_empty() {
+                "上游拒绝了请求（400），但没有返回更细原因。".into()
+            } else {
+                format!("上游拒绝了请求（400）：{detail}")
+            }
         } else {
-            "上游暂时不可用，请换个模型或稍后再试。"
+            "上游暂时不可用，请换个模型或稍后再试。".into()
         }
     }
     // Send with retry — but ONLY retry *transient* failures (502/503/504/429 or a
     // dropped connection). "forbidden / unauthorized / no available account" is
     // PERSISTENT: retrying just makes the user wait ~15s for the same error, so we
     // fail FAST with a friendly message. Billing only happens after a success.
-    let resp = {
+    let (resp, conn) = {
         let mut success = None;
         let mut err_status = 502u16;
         let mut err_low = String::new();
-        for attempt in 0u32..3 {
-            let req0 = GW_HTTP.post(&url);
-            let mut req = if anthropic {
-                req0.header("x-api-key", &conn.api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&upstream_body)
+        let mut selected_conn = None;
+        let mut attempted_sends = 0u32;
+        let now = Instant::now();
+        let mut ordered_candidates: Vec<&Model> = Vec::with_capacity(candidates.len());
+        let mut cooled_candidates: Vec<&Model> = Vec::new();
+        for candidate in &candidates {
+            if route_count > 1 && route_cooldown_remaining(candidate.id, now).is_some() {
+                cooled_candidates.push(candidate);
             } else {
-                req0.header("Authorization", format!("Bearer {}", conn.api_key))
-                    .json(&body)
-            };
-            if !streaming {
-                req = req.timeout(std::time::Duration::from_secs(120));
-            }
-            match req.send().await {
-                Ok(r) if r.status().is_success() => {
-                    success = Some(r);
-                    break;
-                }
-                Ok(r) => {
-                    err_status = r.status().as_u16();
-                    err_low = r.text().await.unwrap_or_default().to_lowercase();
-                    let persistent = err_status == 401
-                        || err_status == 403
-                        || err_low.contains("forbidden")
-                        || err_low.contains("unauthorized")
-                        || err_low.contains("invalid api key")
-                        || err_low.contains("未授权")
-                        || err_low.contains("no available")
-                        || err_low.contains("没有可用");
-                    let transient = matches!(err_status, 502 | 503 | 504 | 429);
-                    if persistent || !transient || attempt == 2 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                // A send error means the request almost certainly never reached the
-                // server (incl. a stale pooled connection) — safe to re-send.
-                Err(e) => {
-                    err_status = 502;
-                    err_low = e.to_string().to_lowercase();
-                    if attempt == 2 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
+                ordered_candidates.push(candidate);
             }
         }
-        match success {
-            Some(r) => r,
-            None => {
+        ordered_candidates.extend(cooled_candidates);
+
+        'routes: for candidate in ordered_candidates {
+            // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
+            // else OpenAI-compat /chat/completions passthrough. Multiple active connections may
+            // expose the same model id; try the next line when the current one is dead instead of
+            // failing the whole IDE request on the first 502.
+            let candidate_anthropic = candidate.protocol == "anthropic";
+            let candidate_url = if candidate_anthropic {
+                format!("{}/messages", api_base(&candidate.base_url))
+            } else {
+                format!("{}/chat/completions", api_base(&candidate.base_url))
+            };
+            let candidate_upstream_body = if candidate_anthropic {
+                match oai_to_anthropic(&body) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        err_status = 400;
+                        err_low =
+                            format!("Anthropic request conversion failed: {err}").to_lowercase();
+                        continue;
+                    }
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            let mut route_attempts = 0u32;
+            let mut route_failed_transient = false;
+            for attempt in 0u32..CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                let req0 = GW_HTTP.post(&candidate_url);
+                let mut req = if candidate_anthropic {
+                    req0.header("x-api-key", &candidate.api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .json(&candidate_upstream_body)
+                } else {
+                    req0.header("Authorization", format!("Bearer {}", candidate.api_key))
+                        .json(&body)
+                };
+                if !streaming {
+                    req = req.timeout(Duration::from_secs(120));
+                }
+                route_attempts += 1;
+                attempted_sends += 1;
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => {
+                        success = Some(r);
+                        selected_conn = Some(candidate.clone());
+                        break 'routes;
+                    }
+                    Ok(r) => {
+                        err_status = r.status().as_u16();
+                        err_low = r.text().await.unwrap_or_default().to_lowercase();
+                        let persistent = err_status == 401
+                            || err_status == 403
+                            || err_low.contains("forbidden")
+                            || err_low.contains("unauthorized")
+                            || err_low.contains("invalid api key")
+                            || err_low.contains("未授权")
+                            || err_low.contains("no available")
+                            || err_low.contains("没有可用");
+                        let transient = matches!(err_status, 502 | 503 | 504 | 429);
+                        if persistent || !transient {
+                            break;
+                        }
+                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                            route_failed_transient = true;
+                            break;
+                        }
+                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                    }
+                    // A send error means the request almost certainly never reached the
+                    // server (incl. a stale pooled connection) — safe to re-send.
+                    Err(e) => {
+                        err_status = 502;
+                        err_low = e.to_string().to_lowercase();
+                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                            route_failed_transient = true;
+                            break;
+                        }
+                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                    }
+                }
+            }
+            if route_failed_transient {
+                mark_route_cooldown(candidate.id);
+                tracing::warn!(
+                    model = %model_name,
+                    provider = %candidate.provider,
+                    label = %candidate.label,
+                    attempts = route_attempts,
+                    status = err_status,
+                    "chat upstream route exhausted transient retries; cooling route"
+                );
+            }
+        }
+        match (success, selected_conn) {
+            (Some(r), Some(c)) => (r, c),
+            (None, _) => {
+                let msg = format!(
+                    "【{model_name}】{}{}",
+                    friendly_upstream(err_status, &err_low),
+                    chat_upstream_attempt_suffix(route_count, attempted_sends, err_status)
+                );
+                if headers.contains_key("x-ide-mode") {
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )
+                        .body(Body::from(msg))
+                        .map_err(|e| AppError::internal(e.to_string()));
+                }
                 return Err(AppError {
                     status: StatusCode::BAD_GATEWAY,
-                    msg: format!(
-                        "【{model_name}】{}",
-                        friendly_upstream(err_status, &err_low)
-                    ),
+                    msg,
                 });
             }
+            _ => unreachable!("success response and selected connection are set together"),
         }
     };
     let status = resp.status();
+    let anthropic = conn.protocol == "anthropic";
 
     if streaming {
         // Pre-compute input token estimate BEFORE the spawn (body is consumed afterwards).
         let est_in_tok = estimate_input_tokens(&body);
+        // 深思考请求（xhigh/max/带 thinking 预算）静默期可超 3 分钟：固定 180s 的上游
+        // 空闲斩会在客户端窗口放宽后成为顶层杀手，这里跟档位一起放宽。
+        let deep_thinking = body
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .map(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"))
+            .unwrap_or(false)
+            || body
+                .get("thinking")
+                .and_then(|t| t.get("budget_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0;
         // Tee the upstream SSE: forward bytes to the client UNCHANGED while
         // accumulating the full stream so a complete response can be cached. Billing is
         // REAL: the trailing include_usage chunk gives true token counts → official price
@@ -2495,18 +3506,32 @@ pub async fn chat_completions(
             // 180s (was 30s): a thinking model pauses to reason / composes a long file write
             // silently → the 30s guard cut the stream mid-tool-call (truncated args → empty
             // write "内容为空"). 180s lets those through while still bounding a real hang.
-            let idle = std::time::Duration::from_secs(180);
+            // 深思考档（xhigh/max/thinking 预算）放宽到 600s——否则客户端 180s 窗和这里打平，
+            // 超 3 分钟的静默深思仍会被网关先掐。
+            let idle = std::time::Duration::from_secs(if deep_thinking { 600 } else { 180 });
             let mut acc: Vec<u8> = Vec::new(); // OpenAI-shape SSE bytes, for the response cache (capped 1MB)
                                                // Bounded tail for OpenAI usage extraction (the include_usage chunk is the LAST event;
                                                // a >1MB response would miss it in the capped acc). Unused on the anthropic path — there
                                                // usage comes from the converter's accumulated counts.
             let mut tail: Vec<u8> = Vec::new();
             let mut complete = false;
+            let mut client_closed = false;
+            let mut stream_failure: Option<String> = None;
             // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
             let mut conv = if anthropic {
-                Some(AnthSse::new(&req_model))
+                Some(AnthSse::with_tool_argument_rules(
+                    &req_model,
+                    tool_argument_rules.clone(),
+                ))
             } else {
                 None
+            };
+            let mut openai_validator = if anthropic {
+                None
+            } else {
+                Some(OpenAiSseValidator::with_tool_argument_rules(
+                    tool_argument_rules,
+                ))
             };
             // SSE heartbeat: Chinese carrier NATs kill TCP connections idle >30-60s.
             // During model "thinking" the upstream is silent → zero bytes flow to the
@@ -2519,8 +3544,22 @@ pub async fn chat_completions(
                     Ok(Some(Ok(chunk))) => {
                         last_data = tokio::time::Instant::now();
                         let fwd: Vec<u8> = match conv.as_mut() {
-                            Some(c) => c.push(chunk.as_ref()),
-                            None => chunk.to_vec(),
+                            Some(c) => match c.push(chunk.as_ref()) {
+                                Ok(fwd) => fwd,
+                                Err(err) => {
+                                    stream_failure = Some(err);
+                                    break;
+                                }
+                            },
+                            None => {
+                                if let Some(validator) = openai_validator.as_mut() {
+                                    if let Err(err) = validator.push(chunk.as_ref()) {
+                                        stream_failure = Some(err);
+                                        break;
+                                    }
+                                }
+                                chunk.to_vec()
+                            }
                         };
                         if !fwd.is_empty() {
                             if acc.len() < 1_000_000 {
@@ -2534,17 +3573,37 @@ pub async fn chat_completions(
                                 }
                             }
                             if tx.send(Ok(axum::body::Bytes::from(fwd))).await.is_err() {
+                                client_closed = true;
                                 break;
                             }
                         }
                     }
                     Ok(None) => {
-                        complete = true;
+                        if conv.is_some() {
+                            // Anthropic completion is validated by AnthSse::finish below.
+                            complete = true;
+                        } else {
+                            match openai_validator
+                                .as_ref()
+                                .expect("OpenAI validator")
+                                .finish()
+                            {
+                                Ok(()) => complete = true,
+                                Err(err) => stream_failure = Some(err),
+                            }
+                        }
                         break;
                     }
-                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Err(err))) => {
+                        stream_failure = Some(format!("upstream stream read failed: {err}"));
+                        break;
+                    }
                     Err(_elapsed) => {
                         if last_data.elapsed() >= idle {
+                            stream_failure = Some(format!(
+                                "upstream stream stalled for {} seconds",
+                                idle.as_secs()
+                            ));
                             break; // real stall — upstream dead for 180s
                         }
                         // Send SSE heartbeat to keep the client connection alive
@@ -2553,6 +3612,7 @@ pub async fn chat_completions(
                             .await
                             .is_err()
                         {
+                            client_closed = true;
                             break;
                         }
                     }
@@ -2565,11 +3625,24 @@ pub async fn chat_completions(
             // from the request body and accumulated response bytes so calls are never silently free.
             let (usage, is_estimated) = if let Some(c) = conv.as_ref() {
                 if complete {
-                    let fin = c.finish();
-                    if acc.len() < 1_000_000 {
-                        acc.extend_from_slice(&fin);
+                    match c.finish() {
+                        Ok(fin) => {
+                            if acc.len() < 1_000_000 {
+                                acc.extend_from_slice(&fin);
+                            }
+                            if tx.send(Ok(axum::body::Bytes::from(fin))).await.is_err() {
+                                client_closed = true;
+                            }
+                        }
+                        Err(err) => {
+                            complete = false;
+                            stream_failure = Some(err);
+                        }
                     }
-                    let _ = tx.send(Ok(axum::body::Bytes::from(fin))).await;
+                } else if stream_failure.is_none() && !client_closed {
+                    stream_failure = Some(
+                        "Anthropic upstream stream ended before protocol completion".to_string(),
+                    );
                 }
                 (c.usage(), false)
             } else {
@@ -2588,6 +3661,18 @@ pub async fn chat_completions(
                     None => (json!({}), false), // truly empty response, bill 0
                 }
             };
+            if let Some(err) = stream_failure.take() {
+                complete = false;
+                if !client_closed {
+                    tracing::warn!(model = %req_model, error = %err, "upstream model stream failed protocol validation");
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            err,
+                        )))
+                        .await;
+                }
+            }
             let cost = resolve_cost(
                 &bmode,
                 percall,
@@ -2603,7 +3688,7 @@ pub async fn chat_completions(
             );
             let tokens = extract_bill_tokens(Some(&usage), &req_model, is_estimated);
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
-            if complete && !acc.is_empty() && acc.len() < 1_000_000 {
+            if complete && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
@@ -2649,7 +3734,7 @@ pub async fn chat_completions(
         fix_tool_call_arguments(&mut data);
         // Cache the successful response for identical future requests.
         if let Ok(bytes) = serde_json::to_vec(&data) {
-            if !bytes.is_empty() && bytes.len() < 1_000_000 {
+            if !bytes.is_empty() && bytes.len() < 1_000_000 && response_cache_safe(&bytes) {
                 let mut rconn = state.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey)
@@ -3225,11 +4310,45 @@ pub async fn image_generations(
 #[cfg(test)]
 mod billing_tests {
     use super::{
-        anthropic_thinking, anthropic_to_oai, compute_cost, is_image_gen_model,
-        model_price_override, oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost,
-        AnthSse,
+        anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
+        chat_upstream_retry_base_delay_ms, compute_cost, is_image_gen_model, model_price_override,
+        oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost, response_cache_safe,
+        tool_argument_rules, validate_openai_sse_eof, validate_openai_sse_with_rules, AnthSse,
+        OpenAiSseValidator,
     };
     use serde_json::json;
+
+    #[test]
+    fn shipment_tool_calls_are_never_response_cached() {
+        assert!(response_cache_safe(
+            br#"data: {\"content\":\"ordinary answer\"}"#
+        ));
+        assert!(!response_cache_safe(
+            br#"data: {\"name\":\"track_shipment\",\"arguments\":\"{\\\"tracking_number\\\":\\\"1Z999AA10123456784\\\"}\"}"#
+        ));
+    }
+
+    #[test]
+    fn chat_gateway_transient_retry_backoff_is_bounded() {
+        assert_eq!(chat_upstream_retry_base_delay_ms(0), 250);
+        assert_eq!(chat_upstream_retry_base_delay_ms(1), 650);
+        assert_eq!(chat_upstream_retry_base_delay_ms(2), 1_300);
+        assert_eq!(chat_upstream_retry_base_delay_ms(3), 2_500);
+        assert_eq!(chat_upstream_retry_base_delay_ms(4), 4_000);
+        assert_eq!(chat_upstream_retry_base_delay_ms(99), 4_000);
+    }
+
+    #[test]
+    fn chat_gateway_error_suffix_reports_single_route_retries() {
+        assert_eq!(
+            chat_upstream_attempt_suffix(1, 6, 502),
+            "（已请求 6 次；当前只有 1 条同模型线路；最后状态 502）"
+        );
+        assert_eq!(
+            chat_upstream_attempt_suffix(3, 12, 504),
+            "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+        );
+    }
 
     // per_call mode bills the flat fee, ignoring token usage entirely.
     #[test]
@@ -3578,7 +4697,7 @@ mod billing_tests {
             ],
             "tools": [{"type": "function", "function": {"name": "read_file", "description": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
         });
-        let a = oai_to_anthropic(&body);
+        let a = oai_to_anthropic(&body).unwrap();
         assert_eq!(a["system"], json!("You are helpful.")); // system hoisted out of messages
         assert_eq!(a["max_tokens"], json!(100)); // haiku (fast tier) → no thinking bump
         assert!(
@@ -3600,6 +4719,29 @@ mod billing_tests {
     }
 
     #[test]
+    fn oai_to_anthropic_rejects_malformed_historical_tool_arguments() {
+        let error = oai_to_anthropic(&json!({
+            "model": "claude-sonnet-5",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_write_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"server/index.js\",\"content\":"
+                    }
+                }]
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("write_file"));
+        assert!(error.contains("call_write_1"));
+        assert!(error.contains("malformed"));
+    }
+
+    #[test]
     fn oai_to_anthropic_enables_adaptive_thinking_and_drops_temp() {
         // Opus 4.x + reasoning_effort → adaptive thinking on; temperature/top_p dropped;
         // max_tokens gets headroom; the chosen depth is honored via output_config.effort.
@@ -3608,7 +4750,7 @@ mod billing_tests {
             "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let a = oai_to_anthropic(&body);
+        let a = oai_to_anthropic(&body).unwrap();
         assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         assert_eq!(a["output_config"], json!({"effort":"high"}));
         assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra adaptive-thinking headroom
@@ -3625,14 +4767,16 @@ mod billing_tests {
         assert_eq!(
             oai_to_anthropic(
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
-            )["thinking"],
+            )
+            .unwrap()["thinking"],
             json!({"type":"adaptive"})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking; temp passes through.
         let off = oai_to_anthropic(&json!({
             "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"messages":[]
-        }));
+        }))
+        .unwrap();
         assert!(off.get("thinking").is_none());
         assert_eq!(off["max_tokens"], json!(4096));
         assert_eq!(off["temperature"], json!(0.5));
@@ -3647,7 +4791,8 @@ mod billing_tests {
             "reasoning_effort": "max",
             "thinking": {"type": "enabled", "budget_tokens": 32000},
             "messages": [{"role": "user", "content": "hi"}]
-        }));
+        }))
+        .unwrap();
         assert_eq!(
             a["thinking"]["type"], "adaptive",
             "4.8 must use adaptive, not budget_tokens"
@@ -3665,7 +4810,8 @@ mod billing_tests {
             "reasoning_effort": "high",
             "thinking": {"type": "enabled", "budget_tokens": 16000},
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert_eq!(s5["thinking"]["type"], "adaptive");
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
@@ -3673,7 +4819,8 @@ mod billing_tests {
             "model": "claude-3-7-sonnet-20250219",
             "reasoning_effort": "high",
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert_eq!(b["thinking"]["type"], "enabled");
         assert!(b["thinking"]["budget_tokens"].as_i64().unwrap() > 0);
         assert!(b["max_tokens"].as_i64().unwrap() >= 32000);
@@ -3683,7 +4830,8 @@ mod billing_tests {
             "model": "claude-haiku-4-5",
             "reasoning_effort": "high",
             "messages": []
-        }));
+        }))
+        .unwrap();
         assert!(
             h.get("thinking").is_none(),
             "haiku should not have thinking"
@@ -3747,13 +4895,21 @@ mod billing_tests {
         // Event shapes copied verbatim from a real zyz streaming response (tool call).
         let mut c = AnthSse::new("claude-opus-4-8");
         let mut out: Vec<u8> = Vec::new();
-        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n"));
-        out.extend(c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
-        out.extend(c.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"get_time\",\"input\":{}}}\n\n"));
-        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\": \\\"As\"}}\n\n"));
-        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ia/Tokyo\\\"}\"}}\n\n"));
-        out.extend(c.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":18,\"input_tokens\":15,\"cache_read_input_tokens\":46}}\n\n"));
-        out.extend(c.finish());
+        out.extend(c.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":46,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n\n").unwrap());
+        out.extend(
+            c.push(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+                .unwrap(),
+        );
+        out.extend(c.push(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"get_time\",\"input\":{}}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\": \\\"As\"}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ia/Tokyo\\\"}\"}}\n\n").unwrap());
+        out.extend(c.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
+        out.extend(c.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":18,\"input_tokens\":15,\"cache_read_input_tokens\":46}}\n\n").unwrap());
+        out.extend(
+            c.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .unwrap(),
+        );
+        out.extend(c.finish().unwrap());
         // Parse the emitted OpenAI SSE back (no key-order assumptions).
         let s = String::from_utf8(out).unwrap();
         let (mut role, mut id, mut name, mut args, mut finish, mut done, mut idx) = (
@@ -3816,6 +4972,141 @@ mod billing_tests {
         assert_eq!(u["cache_read_input_tokens"], 46);
     }
 
+    #[test]
+    fn anth_sse_preserves_non_empty_tool_input_from_block_start() {
+        let required = std::collections::HashMap::from([(
+            "write_file".to_string(),
+            vec!["path".to_string(), "content".to_string()],
+        )]);
+        let mut c = AnthSse::with_required_tool_args("claude-sonnet-5", required);
+        let mut out = c
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"write_1\",\"name\":\"write_file\",\"input\":{\"path\":\"server/index.js\",\"content\":\"module.exports = {};\"}}}\n\n")
+            .unwrap();
+        out.extend(
+            c.push(b"data: {\"type\":\"content_block_stop\",\"index\":2}\n\n")
+                .unwrap(),
+        );
+        out.extend(
+            c.push(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            )
+            .unwrap(),
+        );
+        out.extend(c.push(b"data: {\"type\":\"message_stop\"}\n\n").unwrap());
+        out.extend(c.finish().unwrap());
+
+        let mut arguments = String::new();
+        for line in String::from_utf8(out).unwrap().lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_str(data).unwrap();
+            if let Some(fragment) =
+                event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            {
+                arguments.push_str(fragment);
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(parsed["path"], "server/index.js");
+        assert_eq!(parsed["content"], "module.exports = {};");
+    }
+
+    #[test]
+    fn anth_sse_rejects_unknown_tool_delta_index() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        let error = c
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":7,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n")
+            .unwrap_err();
+        assert!(error.contains("unknown content block index 7"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_clean_eof_without_message_stop() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        c.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+        )
+        .unwrap();
+        c.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+            .unwrap();
+        let error = c.finish().unwrap_err();
+        assert!(error.contains("before message_stop"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_incomplete_or_missing_required_tool_arguments() {
+        let required = std::collections::HashMap::from([(
+            "write_file".to_string(),
+            vec!["path".to_string(), "content".to_string()],
+        )]);
+        let mut incomplete = AnthSse::with_required_tool_args("claude-sonnet-5", required.clone());
+        incomplete
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w1\",\"name\":\"write_file\",\"input\":{}}}\n\n")
+            .unwrap();
+        incomplete
+            .push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"server/index.js\\\"\"}}\n\n")
+            .unwrap();
+        let error = incomplete
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("incomplete arguments JSON"));
+
+        let mut missing = AnthSse::with_required_tool_args("claude-sonnet-5", required);
+        missing
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w2\",\"name\":\"write_file\",\"input\":{}}}\n\n")
+            .unwrap();
+        let error = missing
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("missing required arguments: path, content"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_empty_schema_constrained_tool_arguments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let mut stream =
+            AnthSse::with_tool_argument_rules("claude-sonnet-5", tool_argument_rules(&body));
+        stream
+            .push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"w3\",\"name\":\"write_file\",\"input\":{\"path\":\"src/a.js\",\"content\":\"\"}}}\n\n")
+            .unwrap();
+        let error = stream
+            .push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+            .unwrap_err();
+        assert!(error.contains("argument \"content\" is shorter than minLength 1"));
+    }
+
+    #[test]
+    fn anth_sse_rejects_invalid_utf8_even_when_message_stop_follows() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        let mut bytes = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        let error = c.push(&bytes).unwrap_err();
+
+        assert!(error.contains("invalid UTF-8"));
+        assert!(c.finish().is_err());
+    }
+
     // The official catalog must cover every token model live on the gateway, matched by
     // family so date/`-preview` suffixes still resolve. (Image models → per-image, None here.)
     #[test]
@@ -3841,6 +5132,35 @@ mod billing_tests {
         assert_eq!(official_price("MiniMax-M2.1"), Some((0.15, 0.60)));
         assert_eq!(official_price("MiniMax-M2"), Some((0.10, 0.40)));
         assert_eq!(official_price("some-unknown-model"), None); // → connection fallback, then 0
+    }
+
+    // GLM / Grok 走"透传任意 id"的连接（连接价 0、无按模型覆盖），此前不在目录里 → 一直按
+    // 0 计费。默认定价 = 官方牌价进目录（docs.z.ai / x.ai，2026-07），连接倍率照常乘在上面。
+    #[test]
+    fn official_catalog_covers_glm_and_grok_families() {
+        assert_eq!(official_price("glm-5.2"), Some((1.40, 4.40)));
+        assert_eq!(official_price("GLM-5.1"), Some((1.40, 4.40))); // case-insensitive
+        assert_eq!(official_price("glm-5"), Some((1.00, 3.20)));
+        assert_eq!(official_price("glm-4.7-flashx"), Some((0.07, 0.40)));
+        assert_eq!(official_price("glm-4.7"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-4.6"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-4.5-airx"), Some((1.10, 4.50))); // airx 先于 air
+        assert_eq!(official_price("glm-4.5-air"), Some((0.20, 1.10)));
+        assert_eq!(official_price("glm-4.5-x"), Some((2.20, 8.90)));
+        assert_eq!(official_price("glm-4.5"), Some((0.60, 2.20)));
+        assert_eq!(official_price("glm-next"), Some((0.60, 2.20))); // 未知变体按 4.x 主档兜底
+
+        assert_eq!(official_price("grok-code-fast-1"), Some((0.20, 1.50)));
+        assert_eq!(official_price("grok-4.20"), Some((2.0, 6.0)));
+        assert_eq!(official_price("grok-4.5"), Some((2.0, 6.0)));
+        assert_eq!(official_price("grok-4.3"), Some((1.25, 2.50)));
+        assert_eq!(official_price("grok-4.1-fast"), Some((0.20, 0.50)));
+        assert_eq!(official_price("grok-4-fast"), Some((0.20, 0.50)));
+        assert_eq!(official_price("grok-build-0.1"), Some((1.0, 2.0)));
+        assert_eq!(official_price("grok-3-mini"), Some((0.30, 0.50)));
+        assert_eq!(official_price("grok-4-0709"), Some((3.0, 15.0)));
+        assert_eq!(official_price("grok-3"), Some((3.0, 15.0)));
+        assert_eq!(official_price("grok-x-new"), Some((2.0, 6.0))); // 未知新 Grok 按旗舰档兜底
     }
 
     // No usage reported → 0 (never guesses token counts).
@@ -3966,6 +5286,138 @@ mod billing_tests {
         );
     }
 
+    #[test]
+    fn openai_sse_clean_eof_without_done_is_incomplete() {
+        let partial = b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n";
+        let error = validate_openai_sse_eof(partial).unwrap_err();
+        assert!(error.contains("without terminal data: [DONE]"));
+
+        // A marker mentioned inside JSON content is not an SSE terminal event.
+        let embedded = b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n";
+        assert!(validate_openai_sse_eof(embedded).is_err());
+    }
+
+    #[test]
+    fn openai_sse_done_line_marks_clean_eof_complete() {
+        let complete = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n\
+                         data:[DONE]\r\n\r\n";
+        assert_eq!(validate_openai_sse_eof(complete), Ok(()));
+    }
+
+    #[test]
+    fn openai_sse_rejects_malformed_json_before_done() {
+        let stream = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                       data: {malformed\n\n\
+                       data: [DONE]\n\n";
+
+        let error = validate_openai_sse_eof(stream).unwrap_err();
+
+        assert!(error.contains("malformed JSON"));
+    }
+
+    #[test]
+    fn openai_sse_rejects_incomplete_missing_and_empty_required_tool_arguments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let rules = tool_argument_rules(&body);
+
+        let incomplete = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(incomplete, rules.clone()).unwrap_err();
+        assert!(error.contains("incomplete arguments JSON"));
+
+        let missing = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(missing, rules.clone()).unwrap_err();
+        assert!(error.contains("missing required arguments: content"));
+
+        let empty = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\\\"\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let error = validate_openai_sse_with_rules(empty, rules).unwrap_err();
+        assert!(error.contains("argument \"content\" is shorter than minLength 1"));
+    }
+
+    #[test]
+    fn openai_sse_rejects_terminal_event_before_incomplete_tool_call_can_complete() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let mut validator =
+            OpenAiSseValidator::with_tool_argument_rules(tool_argument_rules(&body));
+        validator
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\\\"content\\\":\"}}]}}]}\n\n")
+            .unwrap();
+
+        // The streaming caller validates a chunk before forwarding it, so this
+        // error keeps [DONE] from reaching the client or being cached as success.
+        let error = validator.push(b"data: [DONE]\n\n").unwrap_err();
+
+        assert!(error.contains("incomplete arguments JSON"));
+        assert!(!validator.done_seen);
+    }
+
+    #[test]
+    fn openai_sse_accumulates_complete_tool_argument_fragments() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "content": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            }]
+        });
+        let stream = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"src/a.js\\\",\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\":\\\"ok\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+
+        assert_eq!(
+            validate_openai_sse_with_rules(stream, tool_argument_rules(&body)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn openai_sse_rejects_invalid_utf8_before_done() {
+        let mut stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
+        stream.push(0xff);
+        stream.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+
+        let error = validate_openai_sse_eof(&stream).unwrap_err();
+
+        assert!(error.contains("invalid UTF-8"));
+    }
+
     // A stream that never reported usage → None → caller bills 0.
     #[test]
     fn sse_no_usage() {
@@ -4078,7 +5530,7 @@ mod estimation_tests {
         let bytes = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world, this is a test response with some content.\"}}\n";
-        c.push(bytes);
+        c.push(bytes).unwrap();
         let u = c.usage();
         assert_eq!(u["input_tokens"], 1000);
         // output_tokens should be estimated from out_bytes since message_delta never arrived

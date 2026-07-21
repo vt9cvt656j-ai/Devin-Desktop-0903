@@ -51,6 +51,7 @@
   .nav-item:hover{background:var(--hover);color:var(--text)}
   .nav-item.active{background:#e8f0fe;color:var(--accent)}
   .nav-item .material-symbols-outlined{font-size:20px}
+  .svg-icon{width:20px;height:20px;display:inline-block;vertical-align:middle;flex:0 0 auto;color:currentColor}
   .sb-foot{border-top:1px solid var(--line);padding:12px 16px}
   .sb-foot .who{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text);margin-bottom:10px;overflow:hidden}
   .sb-foot .who .av{width:30px;height:30px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:500;flex:0 0 30px;text-transform:uppercase}
@@ -66,6 +67,7 @@
   .tab.active{background:var(--bg);color:var(--accent);border-color:var(--line)}
   .tab.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--accent)}
   .tab .material-symbols-outlined{font-size:18px}
+  .tab .svg-icon{width:18px;height:18px}
   .tab .x{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;font-size:16px;line-height:1}
   .tab .x:hover{background:rgba(0,0,0,.1)}
   .content{flex:1;overflow:auto}
@@ -96,6 +98,8 @@
   .tag.role_change{background:#fef7e0;color:#b06000}
   .tag.redeem{background:#e6f4ea;color:var(--green)}
   .tag.grant{background:#f3e8fd;color:#8430ce}
+  .tag.commission_created{background:#e8f0fe;color:var(--accent)}
+  .tag.commission_status{background:#e6f4ea;color:var(--green)}
   .plan-badge{font-size:11px;padding:2px 9px;border-radius:12px;background:#f3e8fd;color:#8430ce;font-weight:500}
   .codeval{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:500}
   .gen-form{display:flex;flex-wrap:wrap;align-items:center;gap:12px}
@@ -135,6 +139,66 @@
   td.email{font-weight:500}
   .role{font-size:11px;padding:2px 9px;border-radius:12px;background:var(--hover);color:var(--dim);font-weight:500}
   .role.admin{background:#e8f0fe;color:var(--accent)}
+  .status-badge{font-size:11px;padding:2px 9px;border-radius:12px;background:var(--hover);color:var(--dim);font-weight:500;white-space:nowrap}
+  .status-badge.pending{background:#fef7e0;color:#b06000}
+  .status-badge.settled{background:#e6f4ea;color:var(--green)}
+  .status-badge.rejected{background:#fce8e6;color:var(--red)}
+  .commission-form{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:12px;align-items:end}
+  .commission-form label{margin:0}
+  .commission-form input,.commission-form select{width:100%;min-width:0}
+  .commission-form .wide{grid-column:span 2}
+  .commission-form .full{grid-column:1/-1}
+  .commission-form .btn{height:40px;border-radius:20px}
+  @media(max-width:980px){.commission-form{grid-template-columns:1fr 1fr}.commission-form .wide{grid-column:span 2}}
+  @media(max-width:620px){.commission-form{grid-template-columns:1fr}.commission-form .wide,.commission-form .full{grid-column:auto}}
+  .skill-page{max-width:1320px}
+  .skill-hero{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;margin-bottom:18px}
+  .skill-titleline{display:flex;align-items:center;gap:14px}
+  .skill-book{width:48px;height:48px;border-radius:18px;background:linear-gradient(135deg,#e8f0fe,#e6f4ea);color:var(--accent);display:grid;place-items:center;box-shadow:inset 0 0 0 1px rgba(26,115,232,.08)}
+  .skill-book .svg-icon{width:28px;height:28px}
+  .skill-metrics{display:grid;grid-template-columns:repeat(4,minmax(112px,1fr));gap:12px;margin-bottom:18px}
+  .skill-metric{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 16px;min-width:0}
+  .skill-metric b{display:block;font-size:24px;font-weight:600;line-height:1.15;font-variant-numeric:tabular-nums}
+  .skill-metric span{display:block;margin-top:4px;color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .skill-toolbar{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:12px;margin-bottom:16px}
+  .skill-toolbar input{width:320px;max-width:100%}
+  .skill-toolbar select{height:40px;border:1px solid var(--line);border-radius:20px;background:var(--surface);color:var(--text);padding:0 14px;font-family:inherit}
+  .skills-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+  .skills-list{display:grid;gap:12px}
+  .skill-user-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 1px 2px rgba(60,64,67,.06)}
+  .skill-user-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#fff,#fbfcff)}
+  .skill-email{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .skill-user-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:5px;color:var(--dim);font-size:12px}
+  .skill-user-meta .pill{background:#f1f3f4;border-radius:999px;padding:3px 9px;color:var(--dim)}
+  .skill-user-score{text-align:right;min-width:92px}
+  .skill-user-score b{display:block;font-size:22px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+  .skill-user-score span{display:block;color:var(--dim);font-size:12px}
+  .skill-card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;padding:14px}
+  .skill-card{border:1px solid #e8eaed;border-radius:16px;padding:13px;background:#fff;min-width:0;transition:box-shadow .15s,transform .15s,border-color .15s}
+  .skill-card:hover{box-shadow:var(--shadow1);transform:translateY(-1px);border-color:#d2e3fc}
+  .skill-card-top{display:flex;gap:10px;align-items:flex-start;min-width:0}
+  .skill-avatar{width:34px;height:34px;border-radius:12px;background:#e8f0fe;color:var(--accent);display:grid;place-items:center;flex:0 0 34px;font-weight:700;overflow:hidden}
+  .skill-avatar img{width:100%;height:100%;object-fit:cover;display:block}
+  .skill-avatar .material-symbols-outlined{font-size:20px}
+  .skill-card-main{min-width:0;flex:1}
+  .skill-name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .skill-desc{margin-top:3px;color:var(--dim);font-size:12px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px}
+  .skill-prompt{margin-top:10px;color:#3c4043;background:#f8fafd;border:1px solid #edf2fb;border-radius:12px;padding:10px;font-size:12px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap}
+  .skill-card-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;color:var(--dim);font-size:11px}
+  .skill-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;background:#e8f0fe;color:var(--accent);font-weight:600}
+  .skill-side{display:grid;gap:12px;position:sticky;top:18px}
+  .skill-side-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:16px;overflow:hidden}
+  .skill-side-card h4{margin:0 0 12px;font-size:13px;color:var(--dim);font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+  .skill-side-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #eef0f2;font-size:13px}
+  .skill-side-row:last-child{border-bottom:0}
+  .skill-side-row b{max-width:190px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .skill-side-row span{color:var(--dim);white-space:nowrap}
+  .skill-quality{display:grid;gap:9px}
+  .skill-quality-line{display:grid;grid-template-columns:74px 1fr auto;gap:9px;align-items:center;font-size:12px;color:var(--dim)}
+  .skill-bar{height:8px;border-radius:999px;background:#eef0f2;overflow:hidden}
+  .skill-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#34a853,#1a73e8)}
+  @media(max-width:1060px){.skills-layout{grid-template-columns:1fr}.skill-side{position:static;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.skill-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:620px){.skill-hero{grid-template-columns:1fr}.skill-metrics{grid-template-columns:1fr}.skill-user-head{grid-template-columns:1fr}.skill-user-score{text-align:left}.skill-card-grid{grid-template-columns:1fr}.skill-toolbar input{width:100%}}
   .muted{color:var(--dim);padding:18px 20px;font-size:14px}
   .t{color:var(--dim)}
   .acts{display:flex;gap:8px}
@@ -186,6 +250,9 @@ const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "michael_admin_token";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let ws = null, statsTimer = null, me = null, usersCache = [];
+let adminSkillsUsers = [];
+let adminSkillPromptCache = new Map();
+const ICON_BOOK = '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5.2 4.25h5.05c1.18 0 2.18.42 3 1.25.82-.83 1.82-1.25 3-1.25h5.05v14.9h-5.05c-1.08 0-2.08.3-3 .9-.92-.6-1.92-.9-3-.9H5.2V4.25Z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><path d="M13.25 5.5v14.55M7.75 8.1h2.75M7.75 11h2.75M16 8.1h2.75M16 11h2.75" stroke="currentColor" stroke-width="1.55" stroke-linecap="round"/></svg>';
 
 /* ---------- module registry ---------- */
 const MODULES = {
@@ -194,10 +261,11 @@ const MODULES = {
   codes:     { title: "激活码系统", icon: "vpn_key",   render: renderCodes,     mount: mountCodes },
   email:     { title: "邮箱通知系统", icon: "mail",    render: renderEmail,     mount: mountEmail },
   pay:       { title: "支付系统",   icon: "payments",  render: renderPay,       mount: mountPay },
+  commission:{ title: "佣金管理",   icon: "price_check", render: renderCommissions, mount: mountCommissions },
   models:    { title: "模型系统",   icon: "smart_toy", render: renderModels,    mount: mountModels },
-  skills:    { title: "技能库",     icon: "auto_awesome", render: renderSkills,  mount: mountSkills },
+  skills:    { title: "技能库",     iconSvg: ICON_BOOK, render: renderSkills,  mount: mountSkills },
 };
-const ORDER = ["dashboard","users","codes","email","pay","models","skills"];
+const ORDER = ["dashboard","users","codes","email","pay","commission","models","skills"];
 let openTabs = [], activeTab = null;
 
 /* ---------- api ---------- */
@@ -255,8 +323,13 @@ function enterApp(user){
   connectWs();
   statsTimer=setInterval(refreshStats,15000);
 }
+function iconHtml(key){
+  const m=MODULES[key]||{};
+  if(m.iconSvg) return m.iconSvg;
+  return `<span class="material-symbols-outlined">${esc(m.icon||"radio_button_unchecked")}</span>`;
+}
 function buildNav(){
-  $("nav").innerHTML = ORDER.map(k=>`<div class="nav-item" data-k="${k}"><span class="material-symbols-outlined">${MODULES[k].icon}</span>${MODULES[k].title}</div>`).join("");
+  $("nav").innerHTML = ORDER.map(k=>`<div class="nav-item" data-k="${k}">${iconHtml(k)}${MODULES[k].title}</div>`).join("");
   $("nav").querySelectorAll(".nav-item").forEach(el=>el.addEventListener("click",()=>openTab(el.dataset.k)));
 }
 function openTab(key){
@@ -272,7 +345,7 @@ function closeTab(key,ev){
   renderTabs(); renderContent();
 }
 function renderTabs(){
-  $("tabbar").innerHTML = openTabs.map(k=>`<div class="tab ${k===activeTab?"active":""}" data-k="${k}"><span class="material-symbols-outlined">${MODULES[k].icon}</span>${MODULES[k].title}<span class="x" data-x="${k}">&times;</span></div>`).join("");
+  $("tabbar").innerHTML = openTabs.map(k=>`<div class="tab ${k===activeTab?"active":""}" data-k="${k}">${iconHtml(k)}${MODULES[k].title}<span class="x" data-x="${k}">&times;</span></div>`).join("");
   $("tabbar").querySelectorAll(".tab").forEach(el=>{
     el.addEventListener("click",()=>{ activeTab=el.dataset.k; renderTabs(); renderContent(); });
     el.querySelector(".x").addEventListener("click",(e)=>closeTab(el.dataset.x,e));
@@ -308,26 +381,178 @@ function mountDashboard(){ refreshStats(); loadRecentEvents(); refreshDashUsers(
 
 /* ---------- module: skills (user Skills library, read-only overview) ---------- */
 function renderSkills(){
-  return `<div class="page">
-    <h3 class="ptitle">技能库</h3><p class="pdesc">用户在 IDE 里创建、同步到账号的 Skills（只读概览）</p>
-    <div class="toolbar"><button class="btn" id="skillReload">刷新</button><span class="count" id="skillCount"></span></div>
-    <div class="box"><div id="skillsTable"><div class="muted">加载中…</div></div></div></div>`;
+  return `<div class="page skill-page">
+    <div class="skill-hero">
+      <div class="skill-titleline">
+        <div class="skill-book">${ICON_BOOK}</div>
+        <div>
+          <h3 class="ptitle">技能库</h3>
+          <p class="pdesc">查看用户在 IDE 创建并同步到账号的 Skills：名称、简介、指令内容、更新时间和使用质量概览</p>
+        </div>
+      </div>
+      <button class="btn b" id="skillReload">刷新数据</button>
+    </div>
+    <div class="skill-metrics">
+      <div class="skill-metric"><b id="skillUsersMetric">—</b><span>有技能的用户</span></div>
+      <div class="skill-metric"><b id="skillTotalMetric">—</b><span>技能总数</span></div>
+      <div class="skill-metric"><b id="skillPromptMetric">—</b><span>指令总字数</span></div>
+      <div class="skill-metric"><b id="skillLatestMetric">—</b><span>最近同步</span></div>
+    </div>
+    <div class="toolbar skill-toolbar">
+      <input id="skillSearch" placeholder="搜索用户、技能名、简介或指令内容…" />
+      <select id="skillSort" aria-label="排序">
+        <option value="updated">按最近同步</option>
+        <option value="count">按技能数量</option>
+        <option value="chars">按指令字数</option>
+        <option value="email">按账号名称</option>
+      </select>
+      <span class="count" id="skillCount"></span>
+    </div>
+    <div class="skills-layout">
+      <div class="skills-list" id="skillsTable"><div class="box"><div class="muted">加载中…</div></div></div>
+      <aside class="skill-side" id="skillsInsight"></aside>
+    </div>
+  </div>`;
 }
-function mountSkills(){ loadAdminSkills(); const b=$("skillReload"); if(b) b.addEventListener("click", loadAdminSkills); }
+function mountSkills(){
+  const b=$("skillReload"); if(b) b.addEventListener("click", loadAdminSkills);
+  const q=$("skillSearch"); if(q) q.addEventListener("input", renderAdminSkills);
+  const s=$("skillSort"); if(s) s.addEventListener("change", renderAdminSkills);
+  loadAdminSkills();
+}
 async function loadAdminSkills(){
   const w=$("skillsTable"); if(!w) return;
   try{
     const r=await api("/api/admin/skills"); const users=r.users||[];
-    if($("skillCount")) $("skillCount").textContent=users.length+" 位用户 · "+users.reduce((n,u)=>n+(u.count||0),0)+" 个技能";
-    if(!users.length){ w.innerHTML='<div class="muted">还没有用户创建技能</div>'; return; }
-    w.innerHTML=users.map(u=>{
-      const chips=(u.skills||[]).map(s=>`<span title="${esc((s.prompt||'').slice(0,400))}" style="display:inline-block;padding:3px 11px;margin:4px 5px 0 0;border-radius:999px;background:rgba(26,115,232,.12);color:#1a73e8;font-size:12px;cursor:help">${esc(s.name||'?')}</span>`).join("");
-      return `<div style="padding:13px 0;border-bottom:1px solid rgba(128,128,128,.15)">
-        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px"><b>${esc(u.email)}</b><span class="muted" style="font-size:12px;white-space:nowrap">${u.count} 个 · ${esc(fmt(u.updated_at))}</span></div>
-        <div style="margin-top:2px">${chips||'<span class="muted">（空）</span>'}</div>
-      </div>`;
+    adminSkillsUsers=users;
+    renderAdminSkills();
+  }catch(e){ w.innerHTML=`<div class="box"><div class="muted">加载失败：${esc(e.message)}</div></div>`; }
+}
+function skillListOf(u){ return Array.isArray(u&&u.skills)?u.skills:[]; }
+function skillPromptOf(s){ return String((s&&s.prompt)||"").trim(); }
+function skillDescOf(s){ return String((s&&s.desc)||"").trim(); }
+function skillNameOf(s){ return String((s&&s.name)||"未命名技能").trim()||"未命名技能"; }
+function skillCharsOf(u){ return skillListOf(u).reduce((n,s)=>n+skillPromptOf(s).length,0); }
+function skillAll(users){
+  return (users||[]).flatMap(u=>skillListOf(u).map((s,i)=>({user:u,skill:s,index:i,prompt:skillPromptOf(s),name:skillNameOf(s),desc:skillDescOf(s)})));
+}
+function shortText(s,n=120){ s=String(s||"").replace(/\s+/g," ").trim(); return s.length>n?s.slice(0,n-1)+"…":s; }
+function compactNum(n){ return Number(n||0).toLocaleString("zh-CN"); }
+function skillIconMarkup(skill){
+  const icon=String((skill&&skill.icon)||"").trim();
+  if(/^data:image\//.test(icon)) return `<img src="${esc(icon)}" alt="" />`;
+  if(icon&&icon.length<=3) return `<span>${esc(icon)}</span>`;
+  const mapped={sparkles:"auto_awesome",code:"code",review:"rate_review",search:"search",bug:"bug_report",doc:"article",test:"science",terminal:"terminal",write:"edit_note",design:"palette"};
+  const material=mapped[icon]||"auto_awesome";
+  return `<span class="material-symbols-outlined">${material}</span>`;
+}
+function renderAdminSkills(){
+  const w=$("skillsTable"); if(!w) return;
+  const q=($("skillSearch")&&$("skillSearch").value||"").trim().toLowerCase();
+  const sort=($("skillSort")&&$("skillSort").value)||"updated";
+  const users=adminSkillsUsers||[];
+  const totalSkills=users.reduce((n,u)=>n+skillListOf(u).length,0);
+  const totalChars=users.reduce((n,u)=>n+skillCharsOf(u),0);
+  const latest=users.map(u=>new Date(u.updated_at).getTime()).filter(Boolean).sort((a,b)=>b-a)[0];
+  if($("skillUsersMetric")) $("skillUsersMetric").textContent=compactNum(users.length);
+  if($("skillTotalMetric")) $("skillTotalMetric").textContent=compactNum(totalSkills);
+  if($("skillPromptMetric")) $("skillPromptMetric").textContent=compactNum(totalChars);
+  if($("skillLatestMetric")) $("skillLatestMetric").textContent=latest?fmt(new Date(latest).toISOString()).slice(5,16):"—";
+
+  let list=users.map(u=>{
+    const skills=skillListOf(u);
+    const matched=q?skills.filter(s=>{
+      const hay=[u.email,skillNameOf(s),skillDescOf(s),skillPromptOf(s)].join(" ").toLowerCase();
+      return hay.includes(q);
+    }):skills;
+    const userHit=q&&String(u.email||"").toLowerCase().includes(q);
+    return {...u,skills:userHit&&!matched.length?skills:matched,_originalCount:skills.length,_chars:skillCharsOf({...u,skills:matched})};
+  }).filter(u=>!q||String(u.email||"").toLowerCase().includes(q)||skillListOf(u).length);
+  list.sort((a,b)=>{
+    if(sort==="count") return skillListOf(b).length-skillListOf(a).length||String(a.email).localeCompare(String(b.email));
+    if(sort==="chars") return (b._chars||0)-(a._chars||0)||String(a.email).localeCompare(String(b.email));
+    if(sort==="email") return String(a.email).localeCompare(String(b.email));
+    return new Date(b.updated_at)-new Date(a.updated_at);
+  });
+  if($("skillCount")) $("skillCount").textContent=`共 ${compactNum(users.length)} 位用户 · ${compactNum(totalSkills)} 个技能`+(q?`，当前匹配 ${compactNum(list.length)} 位用户`:"");
+  renderSkillsInsight(users,list,q);
+  if(!users.length){ w.innerHTML='<div class="box"><div class="muted">还没有用户创建技能</div></div>'; return; }
+  if(!list.length){ w.innerHTML='<div class="box"><div class="muted">没有匹配的用户或技能</div></div>'; return; }
+  adminSkillPromptCache=new Map();
+  w.innerHTML=list.map((u,ui)=>{
+    const skills=skillListOf(u);
+    const charCount=skillCharsOf(u);
+    const cards=skills.map((s,si)=>{
+      const prompt=skillPromptOf(s), desc=skillDescOf(s), name=skillNameOf(s);
+      const key=`${ui}:${si}`;
+      adminSkillPromptCache.set(key,prompt);
+      return `<article class="skill-card" title="${esc(prompt.slice(0,500))}">
+        <div class="skill-card-top">
+          <div class="skill-avatar">${skillIconMarkup(s)}</div>
+          <div class="skill-card-main">
+            <div class="skill-name">${esc(name)}</div>
+            <div class="skill-desc">${esc(desc||shortText(prompt,96)||"未填写简介，建议用户补一句用途说明")}</div>
+          </div>
+        </div>
+        <div class="skill-prompt">${esc(prompt?shortText(prompt,260):"这个技能还没有指令内容，启用后不会产生实际效果。")}</div>
+        <div class="skill-card-foot">
+          <span class="skill-chip">${compactNum(prompt.length)} 字</span>
+          <button class="btn sm skill-copy" data-skill-key="${esc(key)}" ${prompt?"":"disabled"}>复制指令</button>
+        </div>
+      </article>`;
     }).join("");
-  }catch(e){ w.innerHTML=`<div class="muted">加载失败：${esc(e.message)}</div>`; }
+    return `<section class="skill-user-card">
+      <div class="skill-user-head">
+        <div>
+          <div class="skill-email">${esc(u.email)}</div>
+          <div class="skill-user-meta">
+            <span class="pill">${compactNum(skills.length)} / ${compactNum(u._originalCount||skills.length)} 个技能</span>
+            <span>最近同步：${esc(fmt(u.updated_at)||"—")}</span>
+          </div>
+        </div>
+        <div class="skill-user-score"><b>${compactNum(charCount)}</b><span>指令字数</span></div>
+      </div>
+      <div class="skill-card-grid">${cards||'<div class="muted">这个用户没有匹配的技能</div>'}</div>
+    </section>`;
+  }).join("");
+  w.querySelectorAll(".skill-copy").forEach(btn=>btn.addEventListener("click",async()=>{
+    const text=adminSkillPromptCache.get(btn.dataset.skillKey)||"";
+    if(!text) return toast("这个技能没有指令内容");
+    try{ await navigator.clipboard.writeText(text); toast("已复制技能指令"); }
+    catch{ toast("复制失败，请手动选择内容"); }
+  }));
+}
+function renderSkillsInsight(users,filtered,q){
+  const side=$("skillsInsight"); if(!side) return;
+  const all=skillAll(users), total=all.length||1;
+  const withPrompt=all.filter(x=>x.prompt).length;
+  const withDesc=all.filter(x=>x.desc).length;
+  const longPrompt=all.filter(x=>x.prompt.length>=500).length;
+  const pct=(n)=>Math.round(n*100/total);
+  const recent=(users||[]).slice().sort((a,b)=>new Date(b.updated_at)-new Date(a.updated_at)).slice(0,5);
+  const longest=all.slice().sort((a,b)=>b.prompt.length-a.prompt.length).slice(0,5);
+  side.innerHTML=`<div class="skill-side-card">
+      <h4>内容质量</h4>
+      <div class="skill-quality">
+        <div class="skill-quality-line"><span>有指令</span><div class="skill-bar"><i style="width:${pct(withPrompt)}%"></i></div><b>${pct(withPrompt)}%</b></div>
+        <div class="skill-quality-line"><span>有简介</span><div class="skill-bar"><i style="width:${pct(withDesc)}%"></i></div><b>${pct(withDesc)}%</b></div>
+        <div class="skill-quality-line"><span>长指令</span><div class="skill-bar"><i style="width:${pct(longPrompt)}%"></i></div><b>${pct(longPrompt)}%</b></div>
+      </div>
+    </div>
+    <div class="skill-side-card">
+      <h4>${q?"当前筛选":"最近同步"}</h4>
+      ${recent.map(u=>`<div class="skill-side-row"><b>${esc(u.email)}</b><span>${compactNum(skillListOf(u).length)} 个</span></div>`).join("")||'<div class="muted" style="padding:0">暂无数据</div>'}
+    </div>
+    <div class="skill-side-card">
+      <h4>长指令技能</h4>
+      ${longest.map(x=>`<div class="skill-side-row"><b title="${esc(x.name)}">${esc(x.name)}</b><span>${compactNum(x.prompt.length)} 字</span></div>`).join("")||'<div class="muted" style="padding:0">暂无数据</div>'}
+    </div>
+    <div class="skill-side-card">
+      <h4>管理提示</h4>
+      <div class="skill-side-row"><b>空指令技能</b><span>${compactNum(all.filter(x=>!x.prompt).length)} 个</span></div>
+      <div class="skill-side-row"><b>平均长度</b><span>${compactNum(Math.round(all.reduce((n,x)=>n+x.prompt.length,0)/total))} 字</span></div>
+      <div class="skill-side-row"><b>当前显示</b><span>${compactNum((filtered||[]).length)} 位用户</span></div>
+    </div>`;
 }
 async function refreshStats(){
   if(!$("sTotal")) return;
@@ -353,7 +578,7 @@ function addEvent(e){
   if(feed.querySelector(".muted")) feed.innerHTML="";
   const li=document.createElement("li");
   const who=(e.data&&e.data.email)?e.data.email:(e.user_id||"");
-  const label=e.kind==="register"?"注册":e.kind==="login"?"登录":e.kind==="role_change"?"角色变更":e.kind==="redeem"?"兑换":e.kind==="grant"?"开通":e.kind==="notify"?"通知":e.kind==="order_created"?"下单":e.kind==="order_paid"?"支付":e.kind;
+  const label=e.kind==="register"?"注册":e.kind==="login"?"登录":e.kind==="role_change"?"角色变更":e.kind==="redeem"?"兑换":e.kind==="grant"?"开通":e.kind==="notify"?"通知":e.kind==="order_created"?"下单":e.kind==="order_paid"?"支付":e.kind==="commission_created"?"佣金":e.kind==="commission_status"?"佣金状态":e.kind;
   li.innerHTML=`<span class="tag ${esc(e.kind)}">${esc(label)}</span><span>${esc(who)}</span><span class="t">${fmt(e.ts)}</span>`;
   feed.prepend(li);
   while(feed.children.length>60) feed.removeChild(feed.lastChild);
@@ -760,6 +985,170 @@ function renderOrdersTable(){
   w.innerHTML=`<table><thead><tr><th>买家</th><th>内容</th><th>金额</th><th>状态</th><th>方式</th><th>下单时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`;
   w.querySelectorAll("button[data-conf]").forEach(b=>b.addEventListener("click",async()=>{ if(!confirm("确认已收到这笔款？将自动开通套餐/额度。")) return; try{ await api(`/api/admin/orders/${b.dataset.conf}/confirm`,{method:"POST"}); toast("已确认收款并发放"); loadOrders(); }catch(e){ toast(e.message||"操作失败"); } }));
   w.querySelectorAll("button[data-cancel]").forEach(b=>b.addEventListener("click",async()=>{ if(!confirm("取消该订单？")) return; try{ await api(`/api/admin/orders/${b.dataset.cancel}/cancel`,{method:"POST"}); toast("已取消"); loadOrders(); }catch(e){ toast(e.message||"操作失败"); } }));
+}
+
+/* ---------- module: commissions ---------- */
+let commissionsCache=[], commissionSummary=null;
+function renderCommissions(){
+  return `<div class="page">
+    <h3 class="ptitle">佣金管理</h3><p class="pdesc">推广/渠道佣金台账：录入成交、自动计算佣金、审核状态、结算记录和导出对账</p>
+    <div class="stats">
+      <div class="stat"><b id="cmPending">—</b><span>待结算佣金</span></div>
+      <div class="stat"><b id="cmSettled">—</b><span>已结算佣金</span></div>
+      <div class="stat"><b id="cmTotal">—</b><span>累计佣金</span></div>
+      <div class="stat"><b id="cmCount">—</b><span>佣金记录</span></div>
+    </div>
+    <div class="box" style="margin-bottom:20px">
+      <h2>新增佣金记录</h2>
+      <div style="padding:18px 20px">
+        <div class="commission-form">
+          <label>推广员邮箱<input id="cmReferrer" type="email" placeholder="partner@example.com"></label>
+          <label>客户邮箱<input id="cmCustomer" type="email" placeholder="buyer@example.com"></label>
+          <label>成交金额($)<input id="cmAmount" type="number" min="0" step="0.01" value="99"></label>
+          <label>佣金比例(%)<input id="cmRate" type="number" min="0" max="100" step="0.01" value="20"></label>
+          <label>佣金金额($)<input id="cmCommission" type="number" min="0" step="0.01" placeholder="自动计算"></label>
+          <label>来源<select id="cmSource"><option value="manual">手动录入</option><option value="referral">推广返佣</option><option value="channel">渠道合作</option><option value="offline">线下成交</option><option value="adjustment">人工调整</option></select></label>
+          <label class="wide">关联订单ID（可选）<input id="cmOrder" placeholder="UUID，留空也可以"></label>
+          <label class="full">备注<input id="cmNote" placeholder="如：MDO-8 / 月卡成交 / 微信收款截图已核对"></label>
+          <button class="btn b" id="cmAdd">新增佣金</button>
+          <span class="count" id="cmPreview">预计佣金 $19.80</span>
+        </div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <input id="cmSearch" placeholder="搜索推广员 / 客户 / 来源 / 备注…" />
+      <select id="cmFilter"><option value="">全部状态</option><option value="pending">待结算</option><option value="settled">已结算</option><option value="rejected">已驳回</option></select>
+      <button class="btn" id="cmReload">刷新</button>
+      <button class="btn" id="cmExport">导出 CSV</button>
+      <span class="count" id="cmListCount"></span>
+    </div>
+    <div class="box"><div id="commissionsTable"><div class="muted">加载中…</div></div></div>
+  </div>`;
+}
+function mountCommissions(){
+  $("cmReload").addEventListener("click",loadCommissions);
+  $("cmAdd").addEventListener("click",createCommission);
+  $("cmFilter").addEventListener("change",renderCommissionsTable);
+  $("cmSearch").addEventListener("input",renderCommissionsTable);
+  $("cmExport").addEventListener("click",exportCommissionsCsv);
+  ["cmAmount","cmRate"].forEach(id=>$(id).addEventListener("input",updateCommissionPreview));
+  updateCommissionPreview();
+  loadCommissions();
+}
+function centsFromDollars(v){ return Math.round((parseFloat(v)||0)*100); }
+function pctToBps(v){ return Math.round((parseFloat(v)||0)*100); }
+function bpsToPct(v){ return ((v||0)/100).toFixed(2).replace(/\.00$/,""); }
+function commissionStatusBadge(st){
+  const label=st==="settled"?"已结算":st==="rejected"?"已驳回":"待结算";
+  return `<span class="status-badge ${esc(st)}">${label}</span>`;
+}
+function updateCommissionPreview(){
+  const amount=centsFromDollars($("cmAmount")?.value);
+  const rate=pctToBps($("cmRate")?.value);
+  const val=Math.max(0, Math.floor(amount*rate/10000));
+  if($("cmPreview")) $("cmPreview").textContent=`预计佣金 ${usd(val)}`;
+}
+async function loadCommissions(){
+  try{
+    const r=await api("/api/admin/commissions");
+    commissionsCache=r.rows||[];
+    commissionSummary=r.summary||null;
+    renderCommissionStats();
+    renderCommissionsTable();
+  }catch(e){ if($("commissionsTable")) $("commissionsTable").innerHTML=`<div class="muted">加载失败：${esc(e.message)}</div>`; }
+}
+function renderCommissionStats(){
+  const s=commissionSummary||{};
+  if($("cmPending")) $("cmPending").textContent=usd(s.pending_cents||0);
+  if($("cmSettled")) $("cmSettled").textContent=usd(s.settled_cents||0);
+  if($("cmTotal")) $("cmTotal").textContent=usd(s.total_cents||0);
+  if($("cmCount")) $("cmCount").textContent=s.total_count||commissionsCache.length||0;
+}
+function filteredCommissions(){
+  const f=$("cmFilter")?$("cmFilter").value:"";
+  const q=$("cmSearch")?$("cmSearch").value.trim().toLowerCase():"";
+  return commissionsCache.filter(c=>{
+    if(f && c.status!==f) return false;
+    if(!q) return true;
+    return [c.referrer_email,c.customer_email,c.source,c.note,c.order_id,c.status].some(v=>String(v||"").toLowerCase().includes(q));
+  });
+}
+function renderCommissionsTable(){
+  const w=$("commissionsTable"); if(!w) return;
+  const list=filteredCommissions();
+  if($("cmListCount")) $("cmListCount").textContent=`共 ${commissionsCache.length} 条，当前 ${list.length} 条`;
+  if(!list.length){ w.innerHTML='<div class="muted">暂无佣金记录</div>'; return; }
+  const rows=list.map(c=>{
+    const order=c.order_id?`<div class="t" style="font-size:11px">订单 ${esc(String(c.order_id).slice(0,8))}…</div>`:"";
+    const note=c.note?`<div class="t" style="font-size:11px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.note)}">${esc(c.note)}</div>`:"";
+    const actions=c.status==="pending"
+      ? `<button class="btn sm b" data-cmsettle="${c.id}">结算</button><button class="btn sm warn" data-cmreject="${c.id}">驳回</button>`
+      : `<button class="btn sm" data-cmpending="${c.id}">改回待结算</button>`;
+    return `<tr>
+      <td class="email">${esc(c.referrer_email)}</td>
+      <td>${esc(c.customer_email||"—")}${order}</td>
+      <td><span class="tag">${esc(c.source||"manual")}</span>${note}</td>
+      <td class="codeval">${usd(c.amount_cents)}</td>
+      <td class="codeval">${bpsToPct(c.rate_bps)}%</td>
+      <td class="codeval">${usd(c.commission_cents)}</td>
+      <td>${commissionStatusBadge(c.status)}</td>
+      <td class="t">${fmt(c.created_at)}${c.settled_at?`<div class="t" style="font-size:11px">结算 ${fmt(c.settled_at)}</div>`:""}</td>
+      <td><div class="acts">${actions}<button class="btn sm danger" data-cmdel="${c.id}">删除</button></div></td>
+    </tr>`;
+  }).join("");
+  w.innerHTML=`<table><thead><tr><th>推广员</th><th>客户 / 订单</th><th>来源 / 备注</th><th>成交金额</th><th>比例</th><th>佣金</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`;
+  w.querySelectorAll("button[data-cmsettle]").forEach(b=>b.addEventListener("click",()=>updateCommissionStatus(b.dataset.cmsettle,"settled")));
+  w.querySelectorAll("button[data-cmreject]").forEach(b=>b.addEventListener("click",()=>updateCommissionStatus(b.dataset.cmreject,"rejected")));
+  w.querySelectorAll("button[data-cmpending]").forEach(b=>b.addEventListener("click",()=>updateCommissionStatus(b.dataset.cmpending,"pending")));
+  w.querySelectorAll("button[data-cmdel]").forEach(b=>b.addEventListener("click",()=>deleteCommission(b.dataset.cmdel)));
+}
+async function createCommission(){
+  const referrer=$("cmReferrer").value.trim();
+  if(!referrer){ toast("请填写推广员邮箱"); return; }
+  const amount=centsFromDollars($("cmAmount").value), rate=pctToBps($("cmRate").value);
+  const manual=$("cmCommission").value.trim();
+  const body={
+    referrer_email:referrer,
+    customer_email:$("cmCustomer").value.trim()||undefined,
+    source:$("cmSource").value,
+    amount_cents:amount,
+    rate_bps:rate,
+    note:$("cmNote").value.trim()||undefined,
+  };
+  const order=$("cmOrder").value.trim(); if(order) body.order_id=order;
+  if(manual) body.commission_cents=centsFromDollars(manual);
+  const btn=$("cmAdd"); btn.disabled=true; btn.textContent="新增中…";
+  try{
+    await api("/api/admin/commissions",{method:"POST",body:JSON.stringify(body)});
+    toast("佣金记录已新增");
+    ["cmCustomer","cmOrder","cmNote","cmCommission"].forEach(id=>$(id).value="");
+    loadCommissions();
+  }catch(e){ toast(e.message||"新增失败"); }
+  finally{ btn.disabled=false; btn.textContent="新增佣金"; }
+}
+async function updateCommissionStatus(id,status){
+  const label=status==="settled"?"结算":status==="rejected"?"驳回":"改回待结算";
+  const note=(prompt(`${label}备注（可选）：`,"")||"").trim();
+  try{
+    await api(`/api/admin/commissions/${id}/status`,{method:"POST",body:JSON.stringify({status,note})});
+    toast(`已${label}`);
+    loadCommissions();
+  }catch(e){ toast(e.message||"操作失败"); }
+}
+async function deleteCommission(id){
+  if(!confirm("确定删除这条佣金记录？")) return;
+  try{ await api(`/api/admin/commissions/${id}`,{method:"DELETE"}); toast("已删除"); loadCommissions(); }
+  catch(e){ toast(e.message||"删除失败"); }
+}
+function exportCommissionsCsv(){
+  const rows=filteredCommissions();
+  if(!rows.length){ toast("没有可导出的记录"); return; }
+  const csv=[
+    ["推广员","客户","订单ID","来源","成交金额USD","佣金比例%","佣金USD","状态","备注","创建时间","结算时间"],
+    ...rows.map(c=>[c.referrer_email,c.customer_email||"",c.order_id||"",c.source||"",((c.amount_cents||0)/100).toFixed(2),bpsToPct(c.rate_bps),((c.commission_cents||0)/100).toFixed(2),c.status,c.note||"",fmt(c.created_at),fmt(c.settled_at)]),
+  ].map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=`commissions-${new Date().toISOString().slice(0,10)}.csv`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 
 /* ---------- module: models ---------- */
