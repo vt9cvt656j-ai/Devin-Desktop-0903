@@ -7082,6 +7082,71 @@ function _refreshUserLabels() {
     document.querySelectorAll(".msg.user .msg__who span").forEach((el) => { el.textContent = label; });
   } catch {}
 }
+// 双击自己的消息 → 就地编辑 → 重新发送。该消息及其后的对话（气泡+记忆里的 recent）
+// 作废重跑；这之前的全部上下文（包括更早的摘要/里程碑）原样保留。
+function _beginEditResend(wrap, forSession) {
+  const sess = forSession || _currentSession();
+  if (!sess || wrap._editing) return;
+  if (sess.streaming) { showToast("正在运行中，先停止当前回复再编辑重发"); return; }
+  const body = wrap.querySelector(".msg__body");
+  if (!body) return;
+  wrap._editing = true;
+  const orig = String(wrap._rawText || body.textContent || "");
+  const origHtml = body.innerHTML;
+  body.innerHTML = "";
+  const ta = document.createElement("textarea");
+  ta.className = "msg__edit-ta";
+  ta.value = orig;
+  ta.rows = Math.min(12, Math.max(2, orig.split("\n").length + 1));
+  const bar = document.createElement("div");
+  bar.className = "msg__edit-bar";
+  const sendBtn = document.createElement("button");
+  sendBtn.className = "msg__edit-btn msg__edit-btn--send";
+  sendBtn.textContent = "重新发送";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "msg__edit-btn";
+  cancelBtn.textContent = "取消";
+  bar.append(cancelBtn, sendBtn);
+  body.append(ta, bar);
+  try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+  const cancel = () => { wrap._editing = false; body.innerHTML = origHtml; };
+  cancelBtn.addEventListener("click", cancel);
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendBtn.click(); }
+  });
+  sendBtn.addEventListener("click", () => {
+    const next = ta.value.trim();
+    if (!next) { showToast("内容不能为空"); return; }
+    if (sess.streaming) { showToast("正在运行中，稍后再试"); return; }
+    _truncateFromUserMessage(sess, wrap, orig);
+    sendPrompt(next);
+  });
+}
+function _truncateFromUserMessage(sess, wrap, rawText) {
+  // 记忆：从最近往回找这条用户消息，把它和之后的都移除（更早的摘要/上下文不动）
+  try {
+    const rec = sess.memory && sess.memory.recent;
+    if (Array.isArray(rec)) {
+      const _txt = (m) => {
+        if (typeof m.content === "string") return m.content;
+        if (Array.isArray(m.content)) { const p = m.content.find((x) => x && x.type === "text"); return p ? String(p.text || "") : ""; }
+        return "";
+      };
+      for (let i = rec.length - 1; i >= 0; i--) {
+        const m = rec[i];
+        if (m && m.role === "user" && _txt(m).startsWith(rawText.slice(0, 200))) { rec.splice(i); break; }
+      }
+    }
+  } catch {}
+  // 界面：这条气泡和它之后的全部移除
+  try {
+    const doomed = [];
+    for (let n = wrap; n; n = n.nextElementSibling) doomed.push(n);
+    doomed.forEach((el) => el.remove());
+  } catch {}
+  try { saveChatHistory(); } catch {}
+}
 function addMessage(role, text, forSession) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
@@ -7117,6 +7182,11 @@ function addMessage(role, text, forSession) {
     wrap.innerHTML = `<span class="msg__who"><span></span></span><div class="msg__body"></div>`;
     wrap.querySelector(".msg__who span").textContent = _userLabel();
     body = wrap.querySelector(".msg__body");
+    // Double-click a sent message → edit it in place and resend. Everything after
+    // it is discarded and replayed; context BEFORE it (incl. earlier summaries) is kept.
+    wrap._rawText = text || "";
+    wrap.title = "双击可编辑并重新发送";
+    wrap.addEventListener("dblclick", (e) => { e.preventDefault(); _beginEditResend(wrap, session); });
     const cleanText = (text || "").replace(/\n\n\[用户附加了 \d+ 张图片\][\s\S]*$/, "").trim();
     if (cleanText) {
       // Render @-references as clickable cards (rendered HTML → real padded chips, unlike the textarea).
