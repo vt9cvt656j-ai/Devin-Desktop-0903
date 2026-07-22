@@ -326,6 +326,8 @@ const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
 const DESIGN_KNOWLEDGE_MAX_HITS: usize = 3;
 const DESIGN_KNOWLEDGE_MAX_CHARS: usize = 24_000;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 1.0;
+const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
+    "stunning landing page hero animation dark modern website motion gsap";
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -1112,7 +1114,7 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
         return None;
     }
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
-    let hits = crate::knowledge::search_with_cap(
+    let mut hits = crate::knowledge::search_with_cap(
         &query,
         Some(DESIGN_KNOWLEDGE_DOMAIN),
         DESIGN_KNOWLEDGE_MAX_HITS,
@@ -1122,6 +1124,20 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
     .filter(|hit| hit.domain == DESIGN_KNOWLEDGE_DOMAIN && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE)
     .take(DESIGN_KNOWLEDGE_MAX_HITS)
     .collect::<Vec<_>>();
+    // 兜底：界面任务必须永远带蓝本。用户查询没命中任何品类时，退回整库最强的
+    // 网站级成品蓝本（landing/hero/动效方向），绝不让模型裸奔回通用 AI 结构。
+    if hits.is_empty() {
+        hits = crate::knowledge::search_with_cap(
+            DESIGN_KNOWLEDGE_FALLBACK_QUERY,
+            Some(DESIGN_KNOWLEDGE_DOMAIN),
+            DESIGN_KNOWLEDGE_MAX_HITS,
+            DESIGN_KNOWLEDGE_MAX_CHARS,
+        )
+        .into_iter()
+        .filter(|hit| hit.domain == DESIGN_KNOWLEDGE_DOMAIN)
+        .take(DESIGN_KNOWLEDGE_MAX_HITS)
+        .collect::<Vec<_>>();
+    }
     if hits.is_empty() {
         return None;
     }
@@ -1155,7 +1171,7 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
          ① 挑气质最匹配的一个蓝本逐行落地——区块结构/导航形态/hero 构图、精确颜色变量、字号字重、间距尺寸、动效库与时长曲线，全部照蓝本的具体数值执行，不凭印象简化；\n\
          ② **绝不退回通用 AI 落地页结构**（居中大标题+三列卡片+渐变背景那套）：结构、排版节奏、动效都以蓝本为准，蓝本指定用 gsap/motion/自定义 CSS 变量就用它的；实现载体仍用 shadcn/ui 语义组件与 Tailwind（蓝本的颜色/字号/间距数值接进令牌变量，两套是结合不是二选一）；图标一律用 lucide/自绘 SVG，禁止 emoji 当图标；\n\
          ③ 只替换文案、品牌名、业务内容为用户真实产品，视觉与交互规格不打折；需要多个区块而蓝本只覆盖部分时，用 knowledge_search(domain=\"michael-design\") 按区块类型（features/cta/footer/pricing 等）补检索其余区块的蓝本；\n\
-         ④ 与用户的明确要求冲突时以用户为准；若所有蓝本方向都明显不合适，先换关键词再检索一次再决定。\n\n{}",
+         ④ 与用户的明确要求冲突时以用户为准；**品类对不上不是理由**——整库 421 条全是顶级成品网站，蓝本品类和用户业务不同也照抄它的结构骨架、视觉密度、动效水准（只换业务内容），或用 knowledge_search(domain=\"michael-design\") 换关键词（hero/landing/portfolio/dark/animation 等）再捞更合适的；无论如何都不许脱离蓝本自由发挥。\n\n{}",
         sections.join("\n\n———\n\n")
     ))
 }
