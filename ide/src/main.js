@@ -12791,12 +12791,11 @@ function _turnStatsText({ elapsedMs = 0, promptTokens = 0, completionTokens = 0,
   const _svg = (d) => `<svg class="turn-stats__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   const _icClock = _svg('<circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.8v2.9l2 1.2M6.5 1.5h3"/>');
   const _icTokens = _svg('<path d="M5 2.5 2.5 5.5h5L5 2.5zM5 2.5v8"/><path d="M11 13.5l2.5-3h-5l2.5 3zM11 13.5v-8"/>');
-  const _icCost = _svg('<path d="M8 2.5v11M10.6 4.8c-.6-.7-1.5-1.1-2.6-1.1-1.5 0-2.7.9-2.7 2.1 0 2.8 5.4 1.5 5.4 4.3 0 1.2-1.2 2.1-2.7 2.1-1.1 0-2-.4-2.6-1.1"/>');
   const bits = [`${_icClock}${_fmtElapsed(elapsedMs)}`];
   if (inTok || outTok) bits.push(`${_icTokens}${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
   if (cents != null) {
     const disp = (cents / 100) * _MICHAEL_DISP_MULT;
-    bits.push(`${_icCost}${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
+    bits.push(_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4));
   }
   const html = bits.map((b) => `<span class="turn-stats__item">${b}</span>`).join("");
   return { html, inTok, outTok, cents };
