@@ -21089,6 +21089,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "debate", description: "**辩论模式——重大技术决策/方案取舍时用**（如选型 A vs B、要不要重构、架构方向）。多个立场并行独立论证，再由裁判综合裁决，避免单视角确认偏差。⚠️只用于真正有争议、答案不唯一的决策；普通问题直接答。", parameters: { type: "object", properties: { question: { type: "string", description: "要辩论的问题/决策，表述清楚备选项" }, perspectives: { type: "array", items: { type: "string" }, description: "可选，自定义 2-4 个立场（默认：支持方/反对方/工程实践方）" }, context: { type: "string", description: "可选，相关背景（项目技术栈、约束、已知信息）" } }, required: ["question"] } } },
     { type: "function", function: { name: "research_project", description: "仅用于用户明确要求完整代码库上手地图，或多个未知模块确实无法定位入口；目标文件/模块已知时不要调用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
     { type: "function", function: { name: "design_research", description: "仅用于用户明确要求重新设计、比较视觉方向或制定完整 UI 架构蓝图；现有 UI 功能 bug/渲染问题不要调用。", parameters: { type: "object", properties: { goal: { type: "string", description: "要重新设计的网站/界面目标" } }, required: [] } } },
+    { type: "function", function: { name: "learn_design", description: "真正学一套一线产品的设计体系：抓取 styles.refero.design 的 style 页（或任意网页），提取内嵌的完整设计系统数据（色板 hex+每色真实用途/频率、字阶/字体/字距、间距圆角阴影），落盘成 reference/ 下的设计体系文档 + tokens.css，实现时逐条对照。做商用级网站前先调这个学真标杆，绝不凭记忆编配色排版。", parameters: { type: "object", properties: { url: { type: "string", description: "要学的页面 URL（首选 styles.refero.design/style/… 详情页；也可传任意产品站）" }, name: { type: "string", description: "可选，体系名（用于 reference/ 文件名），不传从页面推断" } }, required: ["url"] } } },
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
     { type: "function", function: { name: "run_worker", description: "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。只适合 scope 可清楚切开的多文件任务；worker 必须真实读取、真实改 scope 内文件，并用短命令/诊断验证自己的部分，返回改动文件、证据、验证结果和风险。", parameters: { type: "object", properties: { description: { type: "string", description: "这块子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给 worker 的完整、自包含的任务说明（它看不到当前对话）：要实现什么、改哪些文件、接口 / 约定是什么、需要跑什么短验证命令。" }, scope: { type: "array", items: { type: "string" }, description: "这个 worker 可修改的文件 / 目录列表（相对工作区根，如 [\"src/api/\", \"src/types.ts\"]）。scope 必须互不重叠。" } }, required: ["description", "prompt", "scope"] } } },
     { type: "function", function: { name: "worktree", description: "**best-of-N 隔离**：建/列/删 git 工作树，让 2-3 个候选方案在各自独立工作树里并行实现、互不踩主代码（撤销=删工作树）。难/不确定的任务想「出多个候选选最优」时用——文献证明这是提升正确率最有效的一招。", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add=建一个新工作树(返回绝对路径) / list=列出 / remove=删一个(=丢弃该候选)" }, name: { type: "string", description: "add 时：候选名（短 slug，如 cand-a）" }, path: { type: "string", description: "remove 时：要删的工作树绝对路径" } }, required: ["action"] } } },
@@ -21288,7 +21289,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
 // needs via search_tools or direct-by-name calls (auto-healed at line ~14678).
 // Regex-based preloading was removed per user directive: "交给模型判断，不要老拿正则".
 const _TOOL_BUNDLES = {
-  design:  { tools: ["design_research", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
+  design:  { tools: ["design_research", "learn_design", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
   desktop: { tools: ["automation", "system", "decode_qr"] },
   browser: { tools: ["browser", "screenshot"] },
   github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"] },
@@ -21455,7 +21456,7 @@ const _KNOWN_TOOLS = new Set([
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
   "local_discovery", "live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog", "read_screen", "ui_click",
   "lsp_symbols", "lsp_definition", "lsp_references", "browser",
-  "preview_choices", "visual_explain", "design_research",
+  "preview_choices", "visual_explain", "design_research", "learn_design",
   "background_monitor", "developer_community_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
 ]);
 const _TOOL_ALIASES = {
@@ -21506,6 +21507,7 @@ const _TOOL_ALIASES = {
   app: "system", launch_app: "system", open_app: "system", activate_app: "system", switch_app: "system", app_control: "system", system_control: "system", click_menu: "system", app_menu: "system",
   ask_user: "ask_user", askuser: "ask_user", clarify: "ask_user", ask_question: "ask_user", confirm_intent: "ask_user", ask_choice: "ask_user", request_input: "ask_user",
   research_project: "research_project", explore_codebase: "research_project", explore_project: "research_project", map_project: "research_project", understand_codebase: "research_project", study_project: "research_project", deep_research_codebase: "research_project",
+  learn_design: "learn_design", design_learn: "learn_design", learn_style: "learn_design", study_design: "learn_design", refero: "learn_design",
   design_research: "design_research", research_design: "design_research", ui_research: "design_research", plan_ui: "design_research", design_plan: "design_research", ui_architecture: "design_research", plan_design: "design_research",
   previewchoices: "preview_choices", show_choices: "preview_choices", showchoices: "preview_choices", preview_options: "preview_choices", show_options: "preview_choices", preview_variants: "preview_choices", preview_animation: "preview_choices", preview_effect: "preview_choices", preview_style: "preview_choices", preview_component: "preview_choices", compare_styles: "preview_choices", style_picker: "preview_choices", animation_picker: "preview_choices", pick_style: "preview_choices", choose_style: "preview_choices", show_preview: "preview_choices", live_preview: "preview_choices",
   visualexplain: "visual_explain", explain_visual: "visual_explain", comic_explain: "visual_explain", visual_comic: "visual_explain", explain_concept: "visual_explain", teach_visual: "visual_explain", show_explain: "visual_explain", animated_explain: "visual_explain", explainer: "visual_explain", comic: "visual_explain",
@@ -22164,6 +22166,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
     case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || "") };
     case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || "") };
+    case "learn_design": return { type: "learndesign", path: String(args.url || ""), url: String(args.url || ""), name: String(args.name || "") };
     case "generate_wiki": return { type: "subagent", path: "生成产品Wiki", description: "产品Wiki", prompt: _WIKI_PROMPT(args.focus || ""), _wiki: true, wikiDest: String(args.dest || "PRODUCT_WIKI.md") };
     case "run_worker": return { type: "worker", path: args.description || "worker", description: args.description || "实现子任务", prompt: args.prompt || "", scope: Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : []) };
     case "worktree": return { type: "worktree", action: String(args.action || "list"), name: String(args.name || ""), path: String(args.path || args.dest || "") };
@@ -28256,6 +28259,7 @@ const _TOOL_CATALOG = [
   { name: "run_subagent", desc: "派只读子智能体做大范围调研", kw: ["调研", "梳理", "搞清楚", "怎么实现", "整体", "全貌", "分析一下"] },
   { name: "research_project", desc: "按用户要求生成完整代码库上手地图", kw: ["完整上手地图", "通览整个代码库", "深挖整个项目", "全项目架构地图"] },
   { name: "design_research", desc: "按用户要求研究多个视觉方向并规划完整UI架构", kw: ["重新设计", "视觉方向", "设计蓝图", "完整UI架构", "竞品设计调研"] },
+  { name: "learn_design", desc: "抓 styles.refero.design/任意产品站的完整设计体系（色板用途/字阶/dos·donts）落盘成 reference/ 文档+tokens.css，实现时逐条对照", kw: ["设计体系", "学设计", "refero", "配色参考", "设计系统", "企业站", "商用网站", "真实标杆", "设计令牌"] },
   { name: "update_plan", desc: "列/更新分步计划", kw: ["计划", "步骤", "分步", "规划", "todo", "拆解"] },
   { name: "remember", desc: "记跨会话的项目/全局长期记忆(自动去重清理)", kw: ["记住", "记一下", "经验", "以后", "下次", "约定", "偏好", "我喜欢", "全局", "记住我", "别忘", "用户级"] },
   { name: "ask_user", desc: "意图不明时弹选项按钮+自定义输入问用户", kw: ["不确定", "模糊", "歧义", "问用户", "选择", "确认需求", "哪种", "要不要", "澄清"] },
@@ -28597,6 +28601,103 @@ function _agentDecisionFrameBlock(text, profile = _engineeringTaskProfile(text))
   return lines.join("\n");
 }
 
+// ---- learn_design: turn a live design-system page (Refero Styles or any site) into
+// persisted, structured reference files the agent implements against. Refero pages
+// embed the full extracted design system (per-color usage/frequency, typography,
+// spacing) in Next.js flight data (self.__next_f) — parse it instead of only
+// reading page prose, so the "learning" is real data, not skimmed text. ----
+function _referoFlightBlob(html) {
+  const chunks = [];
+  const re = /self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    try { chunks.push(JSON.parse('"' + m[1] + '"')); } catch { /* skip malformed chunk */ }
+  }
+  return chunks.join("");
+}
+function _extractBalancedJson(text, startIdx) {
+  // startIdx points at '{'; walk to the matching close brace (string-aware).
+  let depth = 0, inStr = false, esc = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return text.slice(startIdx, i + 1); }
+  }
+  return "";
+}
+function _htmlToVisibleText(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
+    .replace(/\s+/g, " ").trim();
+}
+function _learnDesignFromHtml(html, url) {
+  const visible = _htmlToVisibleText(html);
+  const titleM = html.match(/<title>([^<]*)<\/title>/i);
+  let name = ((titleM && titleM[1]) || "").split("|")[0].replace(/design system/i, "").trim();
+  let system = null;
+  const blob = _referoFlightBlob(html);
+  if (blob) {
+    const ri = blob.indexOf('"result":{');
+    if (ri >= 0) {
+      const raw = _extractBalancedJson(blob, ri + '"result":'.length);
+      if (raw) { try { system = JSON.parse(raw); } catch { /* fall back to prose */ } }
+    }
+  }
+  const lines = [];
+  lines.push(`# ${name || "设计体系"} — 学习自 ${url}`);
+  lines.push("");
+  let tokenCount = 0;
+  let css = "";
+  const meta = system && system.meta;
+  if (meta && (meta.url || meta.siteName)) lines.push(`原站：${meta.siteName || ""} ${meta.url || ""}`.trim(), "");
+  const colorTokens = system && system.raw && system.raw.colors && Array.isArray(system.raw.colors.tokens) ? system.raw.colors.tokens : [];
+  if (colorTokens.length) {
+    const toks = colorTokens
+      .filter((t) => t && t.hex)
+      .sort((a, b) => (b.prominence || 0) - (a.prominence || 0))
+      .slice(0, 24);
+    tokenCount = toks.length;
+    lines.push("## 色板（按真实出现频率/权重排序——每个色只用在它的真实用途上）", "", "| Hex | 用途（真实 CSS 属性/语境） | 出现次数 |", "|---|---|---|");
+    const cssVars = [];
+    for (const t of toks) {
+      const uses = Object.keys(t.usageCounts || {}).join("、") || (Array.isArray(t.properties) ? t.properties.join("、") : "");
+      lines.push(`| ${t.hex} | ${uses || "-"} | ${t.frequency || "-"} |`);
+      cssVars.push(`  /* ${uses || "color"} ×${t.frequency || "?"} */\n  --learned-${cssVars.length + 1}: ${t.hex};`);
+    }
+    css = `/* Learned design tokens from ${url}\n   映射到自己项目的语义令牌（--background/--foreground/--primary/--border…）后使用，别直接散落 hex。 */\n:root {\n${cssVars.join("\n")}\n}\n`;
+    lines.push("");
+  }
+  const ds = system && system.designSystem;
+  if (ds) {
+    if (ds.northStar || ds.description) lines.push("## 体系灵魂（northStar）", "", String(ds.northStar || ds.description || ""), "");
+    if (Array.isArray(ds.dos) && ds.dos.length) lines.push("## 必须遵守（dos——逐条照做）", "", ...ds.dos.map((d) => `- ${d}`), "");
+    if (Array.isArray(ds.donts) && ds.donts.length) lines.push("## 绝对禁止（donts——一条都不许犯）", "", ...ds.donts.map((d) => `- ${d}`), "");
+    if (ds.colors) lines.push("## 色彩体系（策展版：色名+用途纪律）", "", "```json", JSON.stringify(ds.colors, null, 2).slice(0, 5000), "```", "");
+    if (ds.typography || ds.typeScale) lines.push("## 字体与字阶（照它的比例和字重策略，别自创）", "", "```json", JSON.stringify({ typography: ds.typography, typeScale: ds.typeScale }, null, 2).slice(0, 5000), "```", "");
+    if (ds.spacing || ds.layout || ds.surfaces || ds.elevationPhilosophy) lines.push("## 间距 / 布局 / 层级哲学", "", "```json", JSON.stringify({ spacing: ds.spacing, layout: ds.layout, surfaces: ds.surfaces, elevation: ds.elevationPhilosophy }, null, 2).slice(0, 5000), "```", "");
+    if (ds.components) lines.push("## 组件形态", "", "```json", JSON.stringify(ds.components, null, 2).slice(0, 5000), "```", "");
+    if (ds.imagery) lines.push("## 图像/素材风格", "", "```json", JSON.stringify(ds.imagery, null, 2).slice(0, 2500), "```", "");
+  } else {
+    const typo = system && system.raw && system.raw.typography;
+    if (typo) lines.push("## 字体与字阶（照它的比例和字重策略，别自创）", "", "```json", JSON.stringify(typo, null, 2).slice(0, 6000), "```", "");
+    const spacing = system && system.raw && (system.raw.spacing || system.raw.layout);
+    if (spacing) lines.push("## 间距 / 布局", "", "```json", JSON.stringify(spacing, null, 2).slice(0, 3000), "```", "");
+  }
+  lines.push("## 页面描述（人类可读的体系说明——色彩纪律/组件形态/氛围从这里学）", "", visible.slice(0, ds ? 4000 : 8000), "");
+  lines.push("## 执行要求", "", "- 把上面的色板转成本项目语义令牌（--background/--foreground/--primary/--border/--muted…），业务代码只用语义名。", "- 字阶/字重/字距按上面的真实比例落 Tailwind theme；标题字体按它的配对思路选，不默认 Inter。", "- 每个颜色只用在它标注的真实用途上（border 色不拿去做文字，标题色不拿去做装饰）。", "- 实现完用 browser 对照验收：层级、密度、留白、边框/阴影纪律是否达到该体系的水准。");
+  return { name, md: lines.join("\n"), css, tokenCount };
+}
+
 function _uiDesignCraftBlock(text, profile = _engineeringTaskProfile(text)) {
   const p = profile || {};
   if (!(p.ui || p.uiProject)) return "";
@@ -28609,7 +28710,7 @@ function _uiDesignCraftBlock(text, profile = _engineeringTaskProfile(text)) {
 - 组件纪律：优先 shadcn/ui + Radix primitives：Button/Card/Badge/Tabs/Accordion/Dialog/Sheet/Popover/Tooltip/Progress/Avatar/Separator/Skeleton；用 cn()/variant 思路统一 size、tone、state，别裸 div 造按钮/弹窗/进度条。
 - 交互状态：每个可点击元素要有 hover/focus-visible/active/disabled/loading；表单要有 empty/error/success；图片/图标失败要有 fallback。
 - 动画纪律（手糊的 keyframes = 一眼假）：优先用成熟方案——React 用 motion/framer-motion（whileHover/whileInView/spring/stagger），Vue 用 @vueuse/motion，非框架页用 Motion One 或 tailwindcss-animate 预设；自写只允许小于几行的 transition。缓动/时长有纪律：微交互 150-250ms ease-out，入场 400-600ms + 轻微位移/透明度，列表用 stagger 逐项入场，交互反馈用 spring；绝不 linear、绝不大幅旋转/弹跳/长时间 keyframes；尊重 prefers-reduced-motion。动画服务于层级和反馈，不是炫技。
-- 参考纪律（禁靠记忆手糊）：商用级页面动手前先学真实标杆——**首选 web_fetch styles.refero.design 的 style 页**（2000+ 一线产品的完整设计系统：色板 hex+每色用途、字阶/字体配对、间距圆角；没链接就 web_search "site:styles.refero.design 品类"），把学到的落成自己的令牌；或 design_research / browser 打开同品类真站抓 design/nodes 看信息架构/密度/节奏；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
+- 参考纪律（禁靠记忆手糊）：商用级页面动手前先学真实标杆——**首选 learn_design(url) 真正学一套**（抓 styles.refero.design 的 style 页内嵌的完整设计系统：色板 hex+每色真实用途/频率、字阶/字体、dos/donts 纪律，落盘 reference/ 文档+tokens.css，实现时逐条对照：dos 照做、donts 不犯；没链接就 web_search "site:styles.refero.design 品类" 挑了再学）；或 design_research / browser 打开同品类真站抓 design/nodes 看信息架构/密度/节奏；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
 - 实现纪律：先复用项目现有组件和样式约定；从零建前端优先 web_scaffold；大段 UI 不要把所有东西塞一个文件，按 section/component/data 拆；Tailwind 类名要围绕 tokens 和组件语义，不堆无法维护的魔法数。
 - 视觉验收：构建通过不等于好看。启动真实 dev server 后，用 browser fresh 打开真实 URL；先 check/nodes，用 batch 连续完成交互，再用 assert/check 证明动作生效；只在最终视觉验收时分别截 1440x900 和 390x844 两张图检查首屏层级、间距、横向溢出、字体截断、console/network。截图丑就继续迭代一轮再收尾。`;
 }
@@ -31077,7 +31178,7 @@ function _toolStepActionLabel(call) {
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
     explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
-    game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", generate_3d: "3D 模型", generate_sound: "音效",
+    game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", learn_design: "学习设计体系", generate_3d: "3D 模型", generate_sound: "音效",
     generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
     generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具",
   };
@@ -33299,6 +33400,42 @@ async function _executeToolStep(step, call, root, run) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "查询失败";
         return { type: call.type, path: call.path || "", content: `[失败] ${command}: ${message}` };
+      }
+
+    } else if (call.type === "learndesign") {
+      const url = (call.url || call.path || "").trim();
+      if (!url || !/^https?:\/\//i.test(url)) { res.className = "atc-result atc-result--err"; res.textContent = "无效 URL"; return { type: "learndesign", path: call.path, content: "[错误] learn_design 需要完整 http/https URL（首选 styles.refero.design/style/… 详情页）。" }; }
+      if (_relativeMutationWithoutRoot("reference/x", root)) {
+        res.className = "atc-result atc-result--err"; res.textContent = "无工作区";
+        return { type: "learndesign", path: call.path, content: "[错误] 没有打开的工作区，无法落盘参考文件。先打开项目文件夹。" };
+      }
+      try {
+        let html = "";
+        if (inTauri) {
+          const r = await backend.invoke("http_request", { method: "GET", url, headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36", Accept: "text/html,application/xhtml+xml" }, body: null, timeoutSecs: 30 });
+          html = String((r && r.body) || "");
+        } else {
+          html = String(await _invokeCapped("web_fetch", { url }, 25000, "抓取设计体系"));
+        }
+        if (!html) throw new Error("页面为空");
+        const learned = _learnDesignFromHtml(html, url);
+        const slug = (call.name || learned.name || "design").toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "design";
+        const mdPath = _resolveRel(`reference/${slug}-design-system.md`, root);
+        await backend.writeTextFile(mdPath, learned.md);
+        let cssNote = "";
+        if (learned.css) {
+          const cssPath = _resolveRel(`reference/${slug}-tokens.css`, root);
+          await backend.writeTextFile(cssPath, learned.css);
+          cssNote = `\n- reference/${slug}-tokens.css（可直接引入/映射到 Tailwind theme 的 :root 令牌起点）`;
+        }
+        _clearRunEmptyRoot(run, root);
+        res.className = "atc-result atc-result--ok"; res.textContent = `${learned.name || slug} · ${learned.tokenCount} 色`;
+        if (vp) vp.innerHTML = `<pre>${_escHtml(learned.md.slice(0, 4000))}</pre>`;
+        return { type: "learndesign", path: `reference/${slug}-design-system.md`, content: `已把「${learned.name || url}」的设计体系学下来并落盘：\n- reference/${slug}-design-system.md（完整色板+每色真实用途/频率、字体/字阶、结构要点）${cssNote}\n\n实现时逐条对照这份体系执行（色彩只用在它标注的用途上、字阶按它的比例、边框/阴影/圆角按它的纪律），把体系转成本项目的语义令牌，不要另编。\n\n${learned.md.slice(0, 6000)}` };
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 200);
+        res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
+        return { type: "learndesign", path: call.path, content: `[失败] learn_design: ${msg}。可改用 web_fetch 读页面正文，或 browser design 抓真站设计系统。` };
       }
 
     } else if (call.type === "web") {

@@ -6837,6 +6837,41 @@ test("plan steps advance from real tool evidence instead of waiting for another 
   assert.deepEqual(run._planSteps.map((step) => step.status), ["completed", "completed", "completed"]);
 });
 
+test("learn_design extracts the embedded Refero design system (palette usage + dos/donts) into reference docs", () => {
+  const _referoFlightBlob = load("_referoFlightBlob");
+  const _extractBalancedJson = load("_extractBalancedJson");
+  const _htmlToVisibleText = load("_htmlToVisibleText");
+  const _learnDesignFromHtml = load("_learnDesignFromHtml", { _referoFlightBlob, _extractBalancedJson, _htmlToVisibleText });
+  const system = {
+    result: {
+      meta: { url: "https://hyperstudio.org", siteName: "Hyperstudio" },
+      raw: { colors: { tokens: [
+        { hex: "#101010", frequency: 12, prominence: 100, usageCounts: { "other/backgroundColor": 12 } },
+        { hex: "#f3f3f3", frequency: 25, prominence: 90, usageCounts: { "heading/color": 12, "body/color": 13 } },
+      ] } },
+      designSystem: {
+        northStar: "Blueprint scratched into obsidian.",
+        dos: ["Use weight 400 for all headings."],
+        donts: ["Never add drop shadows."],
+      },
+    },
+  };
+  const chunk = JSON.stringify("prefix," + JSON.stringify(system).slice(1, -1) + "}").slice(1, -1);
+  const html = `<html><head><title>Hyperstudio design system | Refero Styles</title></head><body>` +
+    `<script>self.__next_f.push([1,"${chunk}"])</script><p>Obsidian page canvas</p></body></html>`;
+  const learned = _learnDesignFromHtml(html, "https://styles.refero.design/style/abc");
+  assert.equal(learned.name, "Hyperstudio");
+  assert.equal(learned.tokenCount, 2);
+  assert.match(learned.md, /#101010.*backgroundColor/, "palette rows must carry real per-color usage");
+  assert.match(learned.md, /必须遵守（dos/, "curated dos must be in the doc");
+  assert.match(learned.md, /Never add drop shadows/, "curated donts must be in the doc");
+  assert.match(learned.md, /Blueprint scratched into obsidian/, "northStar must be in the doc");
+  assert.match(learned.css, /--learned-1: #101010/, "tokens.css must expose the learned palette");
+  // Executor must persist both files into the workspace reference/ dir.
+  assert.match(SRC, /reference\/\$\{slug\}-design-system\.md/, "executor writes the design-system doc");
+  assert.match(SRC, /reference\/\$\{slug\}-tokens\.css/, "executor writes the tokens css");
+});
+
 test("scaffold and asset tools resolve the workspace from the run session, not an undefined variable", () => {
   // Regression: game_scaffold/web_scaffold/generate_* referenced a `sess` variable
   // that doesn't exist in _executeToolStep's scope → ReferenceError

@@ -592,6 +592,29 @@
   {
     "type": "function",
     "function": {
+      "name": "learn_design",
+      "description": "真正学一套一线产品的设计体系：抓取 styles.refero.design 的 style 页（或任意网页），提取内嵌的完整设计系统数据（色板 hex+每色真实用途/频率、字阶/字体/字距、dos/donts 纪律、组件形态），落盘成 reference/ 下的设计体系文档 + tokens.css，实现时逐条对照。做商用级网站前先调这个学真标杆，绝不凭记忆编配色排版。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "要学的页面 URL（首选 styles.refero.design/style/… 详情页；也可传任意产品站）"
+          },
+          "name": {
+            "type": "string",
+            "description": "可选，体系名（用于 reference/ 文件名），不传从页面推断"
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "run_worker",
       "description": "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。worker 能读全工程，但**只能修改你指定的 scope 内的文件**（不能跑命令 / 不能删移 / 不能再派 worker）。**怎么用：把一个大任务拆成几块「文件互不重叠」的子任务，在同一轮里一次性派多个 run_worker（scope 不相交），它们会并行执行**——比你自己一个文件一个文件改快得多，每个 worker 上下文也更聚焦。它们全跑完后，你再统一整合 + 跑构建 / 测试验证。⚠️ 并行 worker 的 scope 必须互不重叠（重叠会被拒）；有先后依赖的活别拆成并行 worker。",
       "parameters": {
