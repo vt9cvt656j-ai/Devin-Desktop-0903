@@ -1125,6 +1125,12 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
+    let hit_summary = hits
+        .iter()
+        .map(|hit| format!("{}#{}({:.1})", hit.topic, hit.section, hit.score))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(hits = %hit_summary, "michael-design blueprint hits");
     let mut sections = Vec::with_capacity(hits.len());
     let mut budget = DESIGN_KNOWLEDGE_MAX_CHARS;
     for (index, hit) in hits.iter().enumerate() {
