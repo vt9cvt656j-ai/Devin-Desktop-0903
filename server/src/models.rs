@@ -2437,11 +2437,7 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
             // low/medium/max 全被压平成 high，max 的 64K 输出余量也永远打不中。
             // 档位边界与 IDE budgets{low:4096, medium:12000, high:24000, max:32000} 对齐。
             body.get("thinking").map(|t| {
-                match t
-                    .get("budget_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                {
+                match t.get("budget_tokens").and_then(|v| v.as_i64()).unwrap_or(0) {
                     b if b > 24000 => "max",
                     b if b > 12000 => "high",
                     b if b > 4096 => "medium",
@@ -2486,15 +2482,10 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
     out.insert("max_tokens".into(), json!(max_tokens));
     if let Some(t) = &thinking {
         out.insert("thinking".into(), t.clone());
-        // Map reasoning_effort → output_config.effort (Anthropic's knob for thinking depth)
-        if let Some(e) = effort {
-            let mapped = match e {
-                "low" => "low",
-                "high" | "max" => "high",
-                _ => "medium",
-            };
-            out.insert("output_config".into(), json!({ "effort": mapped }));
-        }
+        // 不发 output_config.effort：实测聚合上游（zyz）一旦收到 effort 就把思考流
+        // 换成一句 "Compatibility reasoning summary." 摘要，完整原始思考全部丢失；
+        // 只发 thinking.budget_tokens 时上游按原文回思考流。思考深度已由
+        // budget_tokens + max_tokens 下限（见上）控制，effort 不再需要。
     }
     // stream/stop always pass through; temperature/top_p are INCOMPATIBLE with thinking
     // (Anthropic rejects non-default values), so copy them only when thinking is OFF.
@@ -4757,15 +4748,22 @@ mod billing_tests {
     #[test]
     fn oai_to_anthropic_enables_thinking_and_drops_temp() {
         // Opus 4.x + reasoning_effort → explicit-budget thinking on; temperature/top_p dropped;
-        // max_tokens gets headroom; the chosen depth is honored via output_config.effort.
+        // max_tokens gets headroom; output_config.effort must NOT be sent (it collapses the
+        // upstream thinking stream into a one-line summary).
         let body = json!({
             "model": "claude-opus-4-8", "max_tokens": 4096, "temperature": 0.7, "top_p": 0.9,
             "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "hi"}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":24000}));
-        assert_eq!(a["output_config"], json!({"effort":"high"}));
+        assert_eq!(
+            a["thinking"],
+            json!({"type":"enabled","budget_tokens":24000})
+        );
+        assert!(
+            a.get("output_config").is_none(),
+            "output_config.effort must be omitted or upstream returns summarized thinking"
+        );
         assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra thinking headroom
         assert!(
             a.get("temperature").is_none(),
@@ -4806,9 +4804,12 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":32000}));
+        assert_eq!(
+            a["thinking"],
+            json!({"type":"enabled","budget_tokens":32000})
+        );
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
-        assert_eq!(a["output_config"]["effort"], "high"); // "max" → "high"
+        assert!(a.get("output_config").is_none()); // effort knob dropped to keep raw thinking
 
         // Sonnet 5: enabled+budget too (high → 24000)
         let s5 = oai_to_anthropic(&json!({
@@ -4818,7 +4819,10 @@ mod billing_tests {
             "messages": []
         }))
         .unwrap();
-        assert_eq!(s5["thinking"], json!({"type":"enabled","budget_tokens":24000}));
+        assert_eq!(
+            s5["thinking"],
+            json!({"type":"enabled","budget_tokens":24000})
+        );
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
         let b = oai_to_anthropic(&json!({
