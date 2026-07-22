@@ -370,12 +370,6 @@ async function tauriBackend() {
     },
     aiComplete: (config, messages, maxTokens) =>
       core.invoke("ai_complete", { config, messages, maxTokens }),
-    devinCreateSession: (config, prompt, title) =>
-      core.invoke("devin_create_session", { config, prompt, title }),
-    devinSendMessage: (config, sessionId, message) =>
-      core.invoke("devin_send_message", { config, sessionId, message }),
-    devinGetSession: (config, sessionId) =>
-      core.invoke("devin_get_session", { config, sessionId }),
     cancelAi: (requestId) => { try { return core.invoke("cancel_ai", { requestId }); } catch { return Promise.resolve(); } },
     termOpen: async (opts, onEvent) => {
       const channel = new core.Channel();
@@ -10754,10 +10748,6 @@ async function loadBackendModels() {
       });
     }
     MODEL_GROUPS = Object.entries(byGroup).map(([label, models]) => ({ label, models }));
-    MODEL_GROUPS.push({
-      label: "Devin",
-      models: [{ id: "devin", name: "Devin", brand: "devin", meta: "Agent · full session", desc: "对接真实的 Devin 云端会话（需要你自己的 Devin API Key，走官方 API，不经 Michael 网关计费）。", group: "Devin" }],
-    });
     rebuildModelNames();
     await _ensureGatewayModelSelected();
     buildModelMenu();
@@ -16142,121 +16132,7 @@ async function _readyAiConfig() {
   return config;
 }
 
-// ---- Devin session backend（模型选 Devin 时，聊天直连用户自己的 Devin 云端会话）----
-const DEVIN_KEY_STORE = "michael-ide.devin-api-key";
-let _devinSessionId = null;
-let _devinBusy = false;
-let _devinPollTimer = null;
-const _devinSeen = new Set();
-// 只有会话自己回不来的终态才停止轮询；blocked（Devin 在等你回复）继续轮询保持会话活跃。
-const _DEVIN_DONE = new Set(["finished", "expired", "suspended"]);
-
-function _devinConfig() {
-  let key = "";
-  try { key = (localStorage.getItem(DEVIN_KEY_STORE) || "").trim(); } catch {}
-  return { apiKey: key, baseUrl: "" };
-}
-
-function _askDevinKey() {
-  return new Promise((resolve) => {
-    const dlg = $("devinKeyDialog");
-    const input = $("devinKeyInput");
-    if (!dlg || !input) { resolve(""); return; }
-    input.value = _devinConfig().apiKey;
-    const onClose = () => {
-      dlg.removeEventListener("close", onClose);
-      const val = dlg.returnValue === "save" ? input.value.trim() : "";
-      if (val) { try { localStorage.setItem(DEVIN_KEY_STORE, val); } catch {} }
-      resolve(val);
-    };
-    dlg.addEventListener("close", onClose);
-    dlg.showModal();
-  });
-}
-
-function _devinStatusText(s) {
-  const map = {
-    claimed: "Devin 正在工作…", running: "Devin 正在工作…", working: "Devin 正在工作…",
-    blocked: "Devin 在等你的回复。", finished: "Devin 已完成。",
-    expired: "会话已过期。", suspended: "会话已暂停。",
-  };
-  return map[s] || `Devin：${s}`;
-}
-
-function _stopDevinPoller() {
-  if (_devinPollTimer) { clearInterval(_devinPollTimer); _devinPollTimer = null; }
-}
-
-function _renderDevinMessages(msgs, sess) {
-  for (let i = 0; i < msgs.length; i++) {
-    const m = msgs[i];
-    const id = m.event_id || `${m.type}:${m.timestamp}:${i}`;
-    if (_devinSeen.has(id)) continue;
-    _devinSeen.add(id);
-    if (!m.message) continue;
-    // 用户自己的消息本地已渲染；devin_message 是正式回复，其余是过程步骤。
-    if ((m.type || "").endsWith("user_message")) continue;
-    if (m.type === "devin_message") addMessage("assistant", m.message, sess);
-    else addMessage("assistant", `_${m.message}_`, sess);
-  }
-}
-
-function _startDevinPoller(sess, statusBody) {
-  if (_devinPollTimer) return;
-  const tick = async () => {
-    let session;
-    try {
-      session = await backend.devinGetSession(_devinConfig(), _devinSessionId);
-    } catch (e) {
-      if (statusBody) statusBody.textContent = "Devin 会话查询失败：" + String(e && e.message || e).slice(0, 120);
-      _stopDevinPoller();
-      return;
-    }
-    _renderDevinMessages(session.messages || [], sess);
-    const state = session.status_enum || session.status;
-    if (statusBody) statusBody.textContent = _devinStatusText(state);
-    if (_DEVIN_DONE.has(state)) _stopDevinPoller();
-  };
-  tick();
-  _devinPollTimer = setInterval(tick, 3000);
-}
-
-async function sendDevinPrompt(text) {
-  if (_devinBusy) return;
-  let cfg = _devinConfig();
-  if (!cfg.apiKey) {
-    const key = await _askDevinKey();
-    if (!key) { showToast("需要 Devin API Key 才能使用 Devin 模式"); return; }
-    cfg = _devinConfig();
-  }
-  if (!_currentSession()) _newChatSession();
-  const sess = _currentSession();
-  _devinBusy = true;
-  addMessage("user", text, sess);
-  const statusBody = addMessage("assistant", "正在连接 Devin…", sess);
-  try {
-    if (!_devinSessionId) {
-      const ctxParts = [];
-      const root = _knownWorkspaceRoots()[0] || "";
-      if (root) ctxParts.push(`Project folder: ${root}`);
-      const prompt = ctxParts.length ? `${text}\n\n---\nContext from my editor:\n${ctxParts.join("\n\n")}` : text;
-      const ref = await backend.devinCreateSession(cfg, prompt, text.slice(0, 60));
-      _devinSessionId = ref.session_id;
-      _devinSeen.clear();
-    } else {
-      await backend.devinSendMessage(cfg, _devinSessionId, text);
-    }
-    if (statusBody) statusBody.textContent = "Devin 正在工作…";
-    _startDevinPoller(sess, statusBody);
-  } catch (e) {
-    if (statusBody) statusBody.textContent = "Devin 请求失败：" + String(e && e.message || e).slice(0, 200);
-  } finally {
-    _devinBusy = false;
-  }
-}
-
 async function sendPrompt(text, attachments = [], readyConfig = null) {
-  if (!readyConfig && currentModel() === "devin" && backend.devinCreateSession) return sendDevinPrompt(text);
   const config = readyConfig || await _readyAiConfig();
   if (!config) return;
   // If THIS tab is already running, a sent message becomes a real-time STEER ("引导"):
