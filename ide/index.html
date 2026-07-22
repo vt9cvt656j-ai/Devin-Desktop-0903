@@ -1,0 +1,852 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Michael IDE</title>
+  </head>
+  <body>
+    <div class="titlebar" data-tauri-drag-region>
+      <div class="titlebar__lead">
+        <img class="brandmark" src="/logo.png" alt="" aria-hidden="true" />
+      </div>
+      <nav class="titlebar__menu" id="menubar" aria-label="Main menu"></nav>
+      <div class="titlebar__title" id="windowTitle">Michael IDE</div>
+      <div class="titlebar__actions">
+        <button id="openFolderBtn" hidden></button>
+        <button id="saveBtn" hidden></button>
+        <div class="titlebar__action-group titlebar__action-group--run" data-i18n-aria-label="debug.runGroup" aria-label="运行与调试">
+          <button class="tbtn tbtn--icon" id="debugBtn" data-i18n-title="debug.title" data-i18n-aria-label="debug.aria" title="调试 / Debugger (断点、单步、变量)" aria-label="调试">
+            <svg class="ic"><use href="#i-bug" /></svg>
+            <span data-i18n="debug.aria">Debug</span>
+          </button>
+          <button class="tbtn tbtn--icon" id="runBtn" data-i18n-title="menu.runCurrentFile" data-i18n-aria-label="menu.runCurrentFile" title="运行当前文件" aria-label="运行当前文件" disabled>
+            <svg class="ic"><use href="#i-play" /></svg>
+            <span data-i18n="menu.runCurrentFile">Run</span>
+          </button>
+        </div>
+        <div class="titlebar__action-group titlebar__action-group--tools" data-i18n-aria-label="menu.tools" aria-label="工具">
+          <button class="tbtn tbtn--icon tbtn--premium" id="michaelPremiumBtn" data-i18n-title="premiumDb.title" data-i18n-aria-label="premiumDb.title" title="Michael Premium — 数据库工具" aria-label="Michael Premium — 数据库工具">
+            <svg class="ic"><use href="#i-premiumdb" /></svg>
+          </button>
+          <button class="tbtn tbtn--icon" id="terminalBtn" data-i18n-title="terminal.toggle" title="Toggle terminal (⌃`)">
+            <svg class="ic"><use href="#i-terminal" /></svg>
+          </button>
+          <button class="tbtn tbtn--icon" id="extensionsBtn" data-i18n-title="ext.title" title="Extensions" hidden>
+            <svg class="ic"><use href="#i-ext" /></svg>
+          </button>
+          <button class="tbtn tbtn--icon notif-bell" id="notifBellBtn" data-i18n-title="notifications.title" title="Notifications">
+            <svg class="ic"><use href="#i-bell" /></svg>
+            <span class="notif-badge" id="notifBadge" hidden></span>
+          </button>
+          <div class="settings-wrap">
+            <button class="tbtn tbtn--icon" id="settingsBtn" data-i18n-title="feature.settings.title" title="设置">
+              <svg class="ic"><use href="#i-gear" /></svg>
+            </button>
+            <div class="settings-dropdown" id="settingsDropdown" hidden>
+              <button class="settings-dropdown__header" data-action="login">
+                <svg class="settings-dropdown__avatar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <circle cx="12" cy="8" r="4" />
+                  <path d="M4 20c0-3.3 2.7-6 6-6h4c3.3 0 6 2.7 6 6" stroke-linecap="round" />
+                </svg>
+                <div class="settings-dropdown__account">
+                  <div class="settings-dropdown__name" data-i18n="account.notSignedIn">未登录</div>
+                  <div class="settings-dropdown__hint" data-i18n="account.signInHint">点击登录</div>
+                </div>
+              </button>
+              <div class="settings-dropdown__divider"></div>
+              <button class="settings-dropdown__item" data-action="profile" id="profileBtn" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="8" r="3"/><path d="M6 18c0-2.5 2-5 6-5s6 2.5 6 5"/></svg>
+                <span data-i18n="account.profile">个人资料</span>
+              </button>
+              <button class="settings-dropdown__item" data-action="billing" id="billingBtn" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="5" width="20" height="14" rx="2"/>
+                  <path d="M2 10h20"/>
+                  <path d="M6 15h4"/>
+                  <path d="M14 15h4"/>
+                </svg>
+                <span data-i18n="account.billing">账单</span>
+              </button>
+              <div class="settings-dropdown__divider" id="accountActionsDivider" hidden></div>
+              <button class="settings-dropdown__item" data-action="general-settings">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+                <span data-i18n="account.generalSettings">通用设置</span>
+              </button>
+              <button class="settings-dropdown__item" data-action="shortcuts">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="4" width="20" height="16" rx="3"/>
+                  <rect x="5" y="7" width="3" height="3" rx=".5" opacity=".6"/>
+                  <rect x="10" y="7" width="4" height="3" rx=".5" opacity=".6"/>
+                  <rect x="16" y="7" width="3" height="3" rx=".5" opacity=".6"/>
+                  <rect x="5" y="12" width="4" height="3" rx=".5" opacity=".6"/>
+                  <rect x="11" y="12" width="3" height="3" rx=".5" opacity=".6"/>
+                  <rect x="16" y="12" width="3" height="3" rx=".5" opacity=".6"/>
+                  <rect x="7" y="17" width="10" height="2.5" rx=".5" opacity=".4"/>
+                </svg>
+                <span data-i18n="account.shortcuts">快捷键</span>
+              </button>
+              <div class="settings-dropdown__divider" id="logoutDivider" hidden></div>
+              <button class="settings-dropdown__item settings-dropdown__item--danger" data-action="logout" id="logoutBtn" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                <span data-i18n="account.logout">退出登录</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <main class="layout">
+      <!-- Left: file explorer + search -->
+      <aside class="panel explorer" id="explorer">
+        <header class="panel__head">
+          <div class="seg" id="sideTabs" role="tablist">
+            <button class="seg__btn is-active" id="tabExplorer" type="button" role="tab" data-i18n-title="sidebar.explorer" title="文件">
+              <svg class="ic"><use href="#i-files" /></svg><span data-i18n="sidebar.explorer">Explorer</span>
+            </button>
+            <button class="seg__btn" id="tabGit" type="button" role="tab" title="Git">
+              <svg class="ic"><use href="#i-git" /></svg><span data-i18n="sidebar.source">Source</span>
+            </button>
+            <button class="seg__btn" id="tabOutline" type="button" role="tab" data-i18n-title="sidebar.outline" title="大纲">
+              <svg class="ic"><use href="#i-outline" /></svg><span data-i18n="sidebar.outline">大纲</span>
+            </button>
+            <button class="seg__btn" id="tabTest" type="button" role="tab" data-i18n-title="sidebar.tests" title="测试">
+              <svg class="ic"><use href="#i-beaker" /></svg><span data-i18n="sidebar.tests">测试</span>
+            </button>
+          </div>
+        </header>
+
+        <!-- Explorer view -->
+        <div class="side-view" id="viewExplorer">
+          <div class="explorer__bar">
+            <span class="explorer__root" id="rootName" title="" data-i18n="explorer.noFolder">No folder</span>
+            <span class="explorer__tools">
+              <button class="iconbtn" id="newFileBtn" type="button" data-i18n-title="explorer.newFile" title="New File" disabled><svg class="ic"><use href="#i-new-file" /></svg></button>
+              <button class="iconbtn" id="newFolderBtn" type="button" data-i18n-title="explorer.newFolder" title="New Folder" disabled><svg class="ic"><use href="#i-new-folder" /></svg></button>
+              <button class="iconbtn" id="refreshTreeBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh" disabled><svg class="ic"><use href="#i-refresh" /></svg></button>
+            </span>
+          </div>
+          <div class="tree" id="tree">
+            <div class="empty">
+              <svg class="empty__art" viewBox="0 0 120 96"><use href="#art-folder" /></svg>
+              <p data-i18n="explorer.openHint">Open a folder to get started.</p>
+              <button class="btn btn--primary" id="emptyOpenBtn" data-i18n="explorer.openBtn">Open folder…</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Search view -->
+        <div class="side-view" id="viewSearch" hidden>
+          <div class="search-box">
+            <div class="search-input">
+              <svg class="ic"><use href="#i-search" /></svg>
+              <input id="searchInput" type="text" data-i18n-placeholder="search.placeholder" placeholder="Search in folder…" spellcheck="false" autocomplete="off" />
+              <button class="iconbtn search-case" id="searchCaseBtn" type="button" data-i18n-title="search.matchCase" title="Match Case" aria-pressed="false">Aa</button>
+            </div>
+            <div class="search-meta" id="searchMeta"></div>
+          </div>
+          <div class="search-results" id="searchResults"></div>
+        </div>
+
+        <!-- Source Control (Git) view -->
+        <div class="side-view" id="viewGit" hidden>
+          <div class="git-bar">
+            <button class="git-branch" id="gitBranchBtn" type="button" data-i18n-title="git.branchHint" title="Current branch — click to switch" aria-haspopup="true" aria-expanded="false">
+              <svg class="ic"><use href="#i-git" /></svg>
+              <span id="gitBranchName">—</span>
+              <svg class="ic git-branch__caret"><use href="#i-chevron" /></svg>
+            </button>
+            <button class="iconbtn" id="gitPullBtn" type="button" data-i18n-title="git.pull" title="Pull"><svg class="ic"><use href="#i-arrow-down" /></svg></button>
+            <button class="iconbtn" id="gitPushBtn" type="button" data-i18n-title="git.push" title="Push"><svg class="ic"><use href="#i-arrow-up" /></svg></button>
+            <button class="iconbtn" id="gitStashBtn" type="button" data-i18n-title="git.stash" title="Stash changes"><svg class="ic"><use href="#i-archive" /></svg></button>
+            <button class="iconbtn" id="gitRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+            <div class="git-branch-menu" id="gitBranchMenu" hidden></div>
+          </div>
+          <div class="git-commit">
+            <textarea id="gitCommitMsg" class="git-commit__msg" rows="1" data-i18n-placeholder="git.commitPlaceholder" placeholder="Message (commit staged changes)"></textarea>
+            <button class="git-commit__btn" id="gitCommitBtn" type="button" title="Commit staged changes">
+              <svg class="ic"><use href="#i-check" /></svg><span data-i18n="git.commit">Commit</span>
+            </button>
+          </div>
+          <div class="git-list" id="gitList"></div>
+          <div class="git-section-title git-stash-title" style="display:none" id="gitStashTitle">
+            <span data-i18n="git.stashes">Stashes</span>
+            <button class="git-section-act" id="gitStashToggle" type="button" data-i18n-title="git.toggleStashes" title="Toggle stashes">
+              <svg class="ic"><use href="#i-chevron" /></svg>
+            </button>
+          </div>
+          <div class="git-stash-list" id="gitStashList" hidden></div>
+          <div class="git-section-title git-log-title" style="display:none" id="gitLogTitle">
+            <span data-i18n="git.history">History</span>
+            <button class="git-section-act" id="gitLogToggle" type="button" data-i18n-title="git.toggleHistory" title="Toggle history">
+              <svg class="ic"><use href="#i-chevron" /></svg>
+            </button>
+          </div>
+          <div class="git-log" id="gitLog" hidden></div>
+        </div>
+
+        <!-- Outline view -->
+        <div class="side-view" id="viewOutline" hidden>
+          <div class="outline-bar">
+            <span class="outline-title" data-i18n="sidebar.outline">大纲</span>
+            <span class="outline-tools">
+              <button class="iconbtn" id="outlineSortBtn" type="button" title="Sort by position"><svg class="ic"><use href="#i-outline" /></svg></button>
+              <button class="iconbtn" id="outlineRefreshBtn" type="button" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+            </span>
+          </div>
+          <div class="outline-filter">
+            <input id="outlineFilter" type="text" data-i18n-placeholder="outline.filter" placeholder="Filter symbols…" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="outline-tree" id="outlineTree">
+            <div class="empty"><p data-i18n="outline.empty">Open a file to see its outline.</p></div>
+          </div>
+          <div class="outline-timeline" id="outlineTimeline" hidden>
+            <div class="outline-section-title">
+              <svg class="ic"><use href="#i-history" /></svg>
+              <span data-i18n="outline.timeline">时间线</span>
+              <button class="iconbtn" id="timelineToggle" type="button" title="Toggle Timeline">
+                <svg class="ic"><use href="#i-chevron" /></svg>
+              </button>
+            </div>
+            <div class="timeline-list" id="timelineList"></div>
+          </div>
+        </div>
+
+        <!-- Test Explorer view -->
+        <div class="side-view" id="viewTest" hidden>
+          <div class="test-bar">
+            <span class="test-title" data-i18n="sidebar.tests">测试</span>
+            <span class="test-tools">
+              <button class="iconbtn" id="testRunAllBtn" type="button" data-i18n-title="test.runAll" title="Run All Tests"><svg class="ic"><use href="#i-play" /></svg></button>
+              <button class="iconbtn" id="testRefreshBtn" type="button" data-i18n-title="explorer.refresh" title="Refresh"><svg class="ic"><use href="#i-refresh" /></svg></button>
+            </span>
+          </div>
+          <div class="test-tree" id="testTree">
+            <div class="empty"><p data-i18n="test.empty">No tests detected. Open a project with test files.</p></div>
+          </div>
+          <div class="test-output" id="testOutput" hidden></div>
+        </div>
+
+        <!-- Debug view — the 测试 tab turns into this while a debug session is active -->
+        <div class="side-view dbg-side" id="viewDebug" hidden>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title" data-i18n="debug.variables">变量</div>
+            <div class="dbg-side__body" id="dbgSideVars"></div>
+          </div>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title" data-i18n="debug.callStack">调用栈</div>
+            <div class="dbg-side__body" id="dbgSideStack"></div>
+          </div>
+          <div class="dbg-side__sec">
+            <div class="dbg-side__title" data-i18n="debug.breakpoints">断点</div>
+            <div class="dbg-side__body" id="dbgSideBps"></div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="panel-sash panel-sash--left" id="sashLeft"></div>
+
+      <!-- Center: tabs + editor -->
+      <section class="editorwrap">
+        <div class="tabs" id="tabs"></div>
+        <nav class="breadcrumb" id="breadcrumb" hidden aria-label="File path"></nav>
+        <div class="editor-container" id="editorContainer">
+          <div class="editor" id="editor"></div>
+        </div>
+        <div class="diff-view" id="diffView" hidden>
+          <div class="diff-view__head">
+            <span class="diff-view__title">
+              <svg class="ic"><use href="#i-git" /></svg>
+              <span id="diffTitle" data-i18n="diff.title">Diff</span>
+              <span class="diff-view__sub" data-i18n="diff.sub">HEAD ↔ Working Tree</span>
+            </span>
+            <button class="diff-view__close" id="diffClose" type="button" data-i18n-title="diff.close" data-i18n-aria-label="diff.close" title="Close diff" aria-label="Close diff">
+              <svg class="ic"><use href="#i-close" /></svg>
+            </button>
+          </div>
+          <div class="diff-view__body" id="diffBody"></div>
+        </div>
+        <div class="welcome" id="welcome">
+          <h1 data-i18n="welcome.title">Michael IDE</h1>
+          <p data-i18n="welcome.desc">A macOS-style editor with a built-in AI assistant. Open a folder, pick a file, and ask the assistant on the right for help.</p>
+          <div class="welcome__actions">
+            <button class="welcome__btn welcome__btn--primary" id="welcomeOpenBtn" type="button">
+              <svg class="ic" viewBox="0 0 24 24"><path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+              <span data-i18n="explorer.openBtn">打开文件夹</span>
+            </button>
+          </div>
+          <div class="welcome__recent" id="welcomeRecent" hidden>
+            <h3 data-i18n="welcome.recent">最近项目</h3>
+            <ul class="welcome__recent-list" id="recentList"></ul>
+          </div>
+          <div class="welcome__tips">
+            <span class="kbd-tip"><kbd>Ctrl</kbd><kbd>O</kbd> <span data-i18n="explorer.openBtn">打开文件夹</span></span>
+            <span class="kbd-tip"><kbd>Ctrl</kbd><kbd>⇧</kbd><kbd>P</kbd> <span data-i18n="menu.commandPalette">命令面板</span></span>
+            <span class="kbd-tip"><kbd>↩</kbd> <span data-i18n="welcome.tipAsk">询问助手</span></span>
+          </div>
+          <div class="welcome__copyright">© 2026 Digital Bang Intelligence LLC. All rights reserved.</div>
+        </div>
+        <div class="problems-panel" id="problemsPanel" hidden>
+          <div class="problems-panel__head">
+            <span class="problems-panel__title">
+              <svg class="ic" aria-hidden="true"><use href="#i-error" /></svg>
+              <span data-i18n="problems.title">Problems</span>
+              <span class="problems-panel__counts" id="problemsPanelCounts"></span>
+            </span>
+            <button class="problems-panel__close" id="problemsClose" type="button" data-i18n-title="problems.close" title="Close panel" aria-label="Close problems">
+              <svg class="ic"><use href="#i-close" /></svg>
+            </button>
+          </div>
+          <div class="problems-panel__body" id="problemsBody"></div>
+        </div>
+        <div class="terminal-panel" id="terminalPanel" hidden>
+          <div class="terminal-panel__resize" id="terminalResize"></div>
+          <div class="terminal-panel__head">
+            <span class="terminal-panel__lights" aria-hidden="true">
+              <span class="tl tl--close"></span>
+              <span class="tl tl--min"></span>
+              <span class="tl tl--zoom"></span>
+            </span>
+            <div class="term-tabs" id="termTabBar"></div>
+            <div class="terminal-panel__actions">
+              <button class="terminal-panel__action" id="termSplitBtn" type="button" data-i18n-title="terminal.split" title="Split Terminal">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="1.5"/><line x1="8" y1="2" x2="8" y2="14"/></svg>
+              </button>
+              <button class="terminal-panel__action" id="termNewBtn" type="button" data-i18n-title="terminal.new" title="新建终端">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
+              </button>
+              <button class="terminal-panel__action" id="termMaxBtn" type="button" title="Maximize Panel">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
+              </button>
+              <button class="terminal-panel__action" id="terminalClose" type="button" data-i18n-title="terminal.close" data-i18n-aria-label="terminal.close" title="Close Panel (⌃`)" aria-label="Close terminal">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="terminal-panel__body" id="terminalBody"></div>
+        </div>
+        <div class="output-panel" id="outputPanel" hidden>
+          <div class="output-panel__head">
+            <span class="output-panel__title" data-i18n="output.title">输出</span>
+            <select class="output-panel__channel" id="outputChannel">
+              <option value="lsp" data-i18n="output.channel.lsp">语言服务</option>
+              <option value="tasks" data-i18n="output.channel.tasks">任务</option>
+              <option value="extensions" data-i18n="output.channel.extensions">扩展</option>
+            </select>
+            <div class="output-panel__actions">
+              <button class="terminal-panel__action" id="outputClearBtn" type="button" title="Clear Output"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l10 10M13 3l-10 10"/></svg></button>
+              <button class="terminal-panel__action" id="outputCloseBtn" type="button" data-i18n-title="terminal.closeTab" title="Close"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg></button>
+            </div>
+          </div>
+          <pre class="output-panel__body" id="outputBody"></pre>
+        </div>
+      </section>
+
+      <div class="panel-sash panel-sash--right" id="sashRight"></div>
+
+      <!-- Right: AI assistant -->
+      <aside class="panel assistant" id="assistant">
+        <header class="panel__head panel__head--assistant">
+          <span class="assistant__brand">
+            <span class="assistant__avatar assistant__avatar--logo">
+              <img class="assistant-logo" src="/logo.png" alt="" aria-hidden="true" />
+            </span>
+            <span class="assistant__name" data-i18n="assistant.name">Assistant</span>
+            <span id="ipcPeerCount"></span>
+          </span>
+          <span class="assistant__actions">
+            <span class="assistant-capability" id="capabilitiesMenuWrap">
+              <button class="assistant__action assistant__action--capabilities" id="capabilitiesBtn" type="button" data-i18n-title="assistant.capabilities" data-i18n-aria-label="assistant.capabilities.open" title="能力菜单" aria-label="打开 Skills 和 MCP 菜单" aria-haspopup="menu" aria-expanded="false"></button>
+              <span class="assistant-capability__menu" id="capabilitiesMenu" role="menu" hidden>
+                <button class="assistant-capability__item" id="capabilitySkillsItem" type="button" role="menuitem">
+                  <span class="assistant-capability__item-icon"></span>
+                  <span class="assistant-capability__item-main">
+                    <span class="assistant-capability__item-title" data-i18n="assistant.capability.skills">Skills</span>
+                    <span class="assistant-capability__item-sub" data-i18n="assistant.capability.skillsSub">技能</span>
+                  </span>
+                </button>
+                <button class="assistant-capability__item" id="capabilityMcpItem" type="button" role="menuitem">
+                  <span class="assistant-capability__item-icon"></span>
+                  <span class="assistant-capability__item-main">
+                    <span class="assistant-capability__item-title" data-i18n="assistant.capability.mcp">MCP</span>
+                    <span class="assistant-capability__item-sub" data-i18n="assistant.capability.mcpSub">服务</span>
+                  </span>
+                </button>
+              </span>
+            </span>
+          </span>
+        </header>
+        <div id="chatTabBar"></div>
+        <div class="chat" id="chat"></div>
+        <form class="composer" id="composer">
+          <div class="composer__box">
+            <div id="prompt" contenteditable="true" role="textbox" aria-multiline="true" data-i18n-placeholder="assistant.placeholder" data-placeholder="询问关于当前文件的问题…"></div>
+            <div class="composer__bar">
+              <div class="mode-picker" id="modePicker">
+                <button class="mode-picker__btn" id="modePickerBtn" type="button" data-i18n-title="assistant.mode.switch" title="切换 AI 模式">
+                  <svg class="ic mode-picker__icon" id="modeIcon" viewBox="0 0 16 16"><circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/></svg>
+                  <span id="modeLabel" data-i18n="assistant.mode.agent">Agent</span>
+                  <svg class="ic mode-picker__caret" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div class="mode-menu" id="modeMenu" hidden></div>
+              </div>
+              <div class="model-picker" id="modelPicker">
+                <button class="model-picker__btn" id="modelPickerBtn" type="button" data-i18n-title="assistant.switchModel" title="切换模型" aria-haspopup="listbox" aria-expanded="false">
+                  <svg class="ic"><use href="#i-cpu" /></svg>
+                  <span class="model-picker__label" id="modelPickerLabel" data-i18n="assistant.selectModel">选择模型</span>
+                  <svg class="ic model-picker__caret"><use href="#i-caret" /></svg>
+                </button>
+                <div class="menu" id="modelMenu" role="listbox" hidden></div>
+              </div>
+              <span class="cache-ring" id="tokenMeter" role="status" aria-label="上下文缓存 0%" data-tooltip="上下文缓存：0%">
+                <svg class="cache-ring__svg" viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="cache-ring__track" cx="18" cy="18" r="15.5"></circle>
+                  <circle class="cache-ring__progress" cx="18" cy="18" r="15.5" pathLength="100"></circle>
+                </svg>
+                <span class="cache-ring__label">0</span>
+              </span>
+              <button class="voice-btn" id="voiceBtn" type="button" data-i18n-title="voice.input" data-i18n-aria-label="voice.input" title="语音输入" aria-label="语音输入">
+                <svg class="voice-btn__mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 19v3"/></svg>
+                <span class="voice-btn__wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+              </button>
+              <span class="composer__hint">Ctrl↩</span>
+              <button class="send" id="sendBtn" type="submit" data-i18n-title="assistant.send" title="发送">
+                <svg class="ic"><use href="#i-arrow-up" /></svg>
+              </button>
+            </div>
+          </div>
+        </form>
+      </aside>
+    </main>
+
+    <!-- Status bar -->
+    <footer class="statusbar" id="statusbar">
+      <div class="statusbar__left">
+        <button class="statusbar__item statusbar__item--btn" id="paletteBtn" data-i18n-title="menu.commandPalette" title="命令面板">
+          <svg class="ic"><use href="#i-command" /></svg>
+          <span data-i18n="statusbar.commands">Commands</span>
+        </button>
+        <button class="statusbar__item statusbar__item--btn" id="problemsBtn" title="Problems" aria-label="Problems">
+          <span class="statusbar__diag"><svg class="ic"><use href="#i-error" /></svg><span id="problemsErrCount">0</span></span>
+          <span class="statusbar__diag"><svg class="ic"><use href="#i-warn" /></svg><span id="problemsWarnCount">0</span></span>
+        </button>
+      </div>
+      <div class="statusbar__right" id="statusbarRight"></div>
+    </footer>
+
+    <!-- Login dialog -->
+    <dialog class="sheet login-sheet" id="loginDialog">
+      <div class="sheet__body login-body">
+        <button class="login-close" type="button" id="loginCloseBtn">✕</button>
+        <div class="login-logo" id="loginLogo"></div>
+        <h2 class="login-title" data-i18n="login.title">欢迎使用 Michael IDE</h2>
+        <!-- Step 1: email -->
+        <div class="login-step" id="loginStep1">
+          <p class="login-sub" data-i18n="login.subtitle">输入邮箱即可登录，新用户自动创建账号</p>
+          <div class="login-field">
+            <input id="loginEmail" type="email" placeholder="your@email.com" class="login-input" />
+          </div>
+          <button class="login-btn" type="button" id="loginNextBtn" data-i18n="login.next">继续</button>
+          <p class="login-agree"><input type="checkbox" checked /><span data-i18n="login.agreePrefix">我已阅读并同意</span><a href="#" data-i18n="login.terms">服务条款</a><span data-i18n="login.and">和</span><a href="#" data-i18n="login.privacy">隐私政策</a></p>
+        </div>
+        <!-- Step 2: password or code -->
+        <div class="login-step" id="loginStep2" hidden>
+          <p class="login-sub" id="loginStep2Hint"></p>
+          <div class="login-field">
+            <input id="loginPassword" type="password" data-i18n-placeholder="login.passwordPlaceholder" placeholder="输入密码" class="login-input" />
+          </div>
+          <div class="login-field login-otp-field" id="loginCodeField" hidden>
+            <p class="login-otp-hint" data-i18n="login.codeHint">输入发送到邮箱的 6 位验证码</p>
+            <div class="login-otp" id="loginOtp" role="group" aria-label="6 位验证码">
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" autocomplete="one-time-code" aria-label="第 1 位" />
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 2 位" />
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 3 位" />
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 4 位" />
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 5 位" />
+              <input class="login-otp__box" inputmode="numeric" maxlength="1" aria-label="第 6 位" />
+            </div>
+            <input id="loginCode" type="hidden" />
+            <button class="login-link login-resend" type="button" id="loginResendBtn" data-i18n="login.resend">重新发送验证码</button>
+          </div>
+          <button class="login-btn" type="button" id="loginSubmitBtn" data-i18n="login.submit">登录</button>
+          <div class="login-alt">
+            <button class="login-link" type="button" id="loginUseCodeBtn" data-i18n="login.useCode">使用验证码登录</button>
+            <button class="login-link" type="button" id="loginBackBtn" data-i18n="login.back">返回</button>
+          </div>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Settings dialog -->
+    <dialog class="sheet" id="settings">
+      <form method="dialog" class="sheet__body" id="settingsForm">
+        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
+        <h2 data-i18n="settings.title">AI 模型</h2>
+        <p class="sheet__sub" data-i18n="settings.sub">模型请求固定走 Michael 网关，统一账号额度、计费、模型目录和线路容灾；用户无需配置任何第三方供应商。</p>
+        <div class="ai-provider-form ai-provider-form--locked">
+          <div class="ai-provider-option ai-provider-option--locked">
+            <span><strong data-i18n="settings.gatewayTitle">Michael 网关</strong><small data-i18n="settings.gatewayEnabled">已启用：所有 AI 模型请求都会通过你的网关转发。</small></span>
+          </div>
+        </div>
+        <div class="settings-figma">
+          <label class="settings-figma__label" for="figmaTokenInput">Figma 访问令牌 <small>（可选，用于把 Figma 设计转成代码/配色）</small></label>
+          <div class="settings-figma__row">
+            <input id="figmaTokenInput" class="settings-figma__input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="figd_…" />
+            <button type="button" id="figmaTokenTest" class="btn settings-figma__test">测试</button>
+          </div>
+          <div class="settings-figma__hint" id="figmaTokenHint">figma.com → Settings → Security → Personal access tokens（勾 File content 读权限）。只存在本机，供 <code>figma</code> 工具读取你的设计文件。</div>
+        </div>
+        <div class="sheet__actions">
+          <button class="btn" value="cancel" formnovalidate data-i18n="dialog.cancel">取消</button>
+          <button class="btn btn--primary" id="settingsSaveBtn" value="default" data-i18n="settings.gotIt">知道了</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Devin API key dialog -->
+    <dialog class="sheet" id="devinKeyDialog">
+      <form method="dialog" class="sheet__body" id="devinKeyForm">
+        <div class="sheet__icon"><svg viewBox="0 0 24 24"><use href="#i-sparkle" /></svg></div>
+        <h2 data-i18n="devin.title">连接 Devin</h2>
+        <p class="sheet__sub"><span data-i18n="devin.subPrefix">输入你的 Devin API Key（以</span> <code>apk_</code> <span data-i18n="devin.subSuffix">开头），助手将直接对接真实的 Devin 会话。密钥只保存在本地。</span></p>
+        <input id="devinKeyInput" type="password" class="login-input" placeholder="apk_..." autocomplete="off" spellcheck="false" />
+        <div class="sheet__actions">
+          <button class="btn" value="cancel" formnovalidate data-i18n="dialog.cancel">取消</button>
+          <button class="btn btn--primary" value="save" data-i18n="settings.save">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- File-operation dialog (prompt / confirm) -->
+    <dialog class="sheet sheet--io" id="ioDialog">
+      <form method="dialog" class="sheet__body" id="ioForm">
+        <h2 id="ioTitle">Rename</h2>
+        <p class="sheet__sub" id="ioMessage" hidden></p>
+        <label id="ioInputWrap">
+          <input id="ioInput" type="text" spellcheck="false" autocomplete="off" />
+        </label>
+        <div class="sheet__actions">
+          <button class="btn" type="button" id="ioCancel" data-i18n="dialog.cancel">Cancel</button>
+          <button class="btn btn--primary" id="ioOk" value="ok" data-i18n="dialog.ok">OK</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast"></div>
+
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <defs>
+        <linearGradient id="g-logo" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
+        <linearGradient id="g-accent" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
+      </defs>
+
+      <!-- UI glyphs (inherit currentColor) -->
+      <symbol id="i-folder" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+      </symbol>
+      <symbol id="i-folder-open" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5V10H7.7a2 2 0 0 0-1.9 1.37L3 19.5z" opacity=".5" />
+        <path fill="currentColor" d="M6.2 11.5A1.5 1.5 0 0 1 7.62 10.5H22l-2.2 6.6A2 2 0 0 1 17.9 18.5H3.4z" />
+      </symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9 6 6 6-6 6" />
+      </symbol>
+      <symbol id="i-save" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M5 4h11l3 3v13H5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" d="M8 4v5h7V4M9 13h6v7H9z" />
+      </symbol>
+      <symbol id="i-play" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6.1 3.55v16.9c0 .95 1.04 1.53 1.84 1.03l13.35-8.45a1.22 1.22 0 0 0 0-2.06L7.94 2.52A1.22 1.22 0 0 0 6.1 3.55Z" />
+      </symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.4 13.5a7.5 7.5 0 0 0 0-3l1.8-1.4-1.8-3.1-2.1.8a7.5 7.5 0 0 0-2.6-1.5L14.2 2H9.8l-.3 2.3a7.5 7.5 0 0 0-2.6 1.5l-2.1-.8-1.8 3.1L4.6 10.5a7.5 7.5 0 0 0 0 3l-1.8 1.4 1.8 3.1 2.1-.8a7.5 7.5 0 0 0 2.6 1.5l.3 2.3h4.4l.3-2.3a7.5 7.5 0 0 0 2.6-1.5l2.1.8 1.8-3.1z" />
+      </symbol>
+      <symbol id="i-send" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M4.6 3.4 20.5 11.1a1 1 0 0 1 0 1.8L4.6 20.6a1 1 0 0 1-1.42-1.16L5 12.9h6.5a.9.9 0 0 0 0-1.8H5L3.18 4.56A1 1 0 0 1 4.6 3.4" />
+      </symbol>
+      <symbol id="i-arrow-up" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V6m0 0-6 6m6-6 6 6" />
+      </symbol>
+      <symbol id="i-arrow-down" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 5v13m0 0 6-6m-6 6-6-6" />
+      </symbol>
+      <symbol id="i-cpu" viewBox="0 0 24 24">
+        <rect x="7" y="7" width="10" height="10" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <rect x="10" y="10" width="4" height="4" rx="1" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10 4v2m4-2v2m-4 12v2m4-2v2M4 10h2m-2 4h2m12-4h2m-2 4h2" />
+      </symbol>
+      <symbol id="i-brand-openai" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7715-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zm-12.6438 4.135l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
+      </symbol>
+      <symbol id="i-brand-anthropic" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.541Zm-.3712 10.2426 2.2914-5.9456 2.2914 5.9456Z" />
+      </symbol>
+      <symbol id="i-brand-meta" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973a6.624 6.624 0 0 0 .265.86 5.297 5.297 0 0 0 .371.761c.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325c.061.1.121.196.183.3l2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843a3.743 3.743 0 0 0 .81-.973c.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.716-2.93-1.047 0-2.088.467-3.053 1.308-.652.57-1.257 1.29-1.82 2.05-.69-.875-1.335-1.547-1.958-2.056-1.182-.966-2.315-1.303-3.454-1.303zm10.16 2.053c1.147 0 2.188.758 2.992 1.999 1.132 1.748 1.647 4.195 1.647 6.4 0 1.548-.368 2.9-1.839 2.9-.58 0-1.027-.23-1.664-1.004-.496-.601-1.343-1.878-2.832-4.358l-.617-1.028a44.908 44.908 0 0 0-1.255-1.98c.07-.109.141-.224.211-.327 1.12-1.667 2.118-2.602 3.157-2.602zm-10.201.553c1.265 0 2.058.791 2.675 1.446.307.327.737.871 1.234 1.579l-1.02 1.566c-.757 1.163-1.882 3.017-2.837 4.338-1.191 1.649-1.81 1.817-2.486 1.817-.524 0-1.038-.237-1.383-.794-.263-.426-.464-1.13-.464-2.046 0-2.221.63-4.535 1.66-6.088.454-.687.964-1.226 1.533-1.533a2.264 2.264 0 0 1 1.088-.282z" />
+      </symbol>
+      <symbol id="i-brand-deepseek" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 15.5v-3.07c-1.28-.07-2.2-.43-2.89-1.08-.78-.73-1.16-1.82-1.16-3.24 0-1.24.36-2.27 1.08-3.06.73-.8 1.72-1.3 2.97-1.5V4.5l4 3.5-4 3.5V9.57c-.84.15-1.47.48-1.89.98-.42.5-.63 1.14-.63 1.91 0 .86.22 1.5.66 1.92.44.42 1.07.66 1.86.71V15.5z"/>
+      </symbol>
+      <symbol id="i-brand-qwen" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12.951 1.816 16.4 7.79h2.524c.69 0 1.328.368 1.673.966l3.197 5.538a1.93 1.93 0 0 1 0 1.931l-3.197 5.539a1.93 1.93 0 0 1-1.673.966h-2.523l-2.121 3.674a.483.483 0 0 1-.837 0l-3.45-5.974H7.6a1.93 1.93 0 0 1-1.673-.966l-3.197-5.539a1.93 1.93 0 0 1 0-1.931L5.927 6.93A1.93 1.93 0 0 1 7.6 5.964h2.523l2.011-3.484a.483.483 0 0 1 .817-.664zm-.408 2.946L10.96 7.5h2.166zm-.965 1.67H8.084l3.494 6.052zm2.844 0-3.205 5.55 1.298 2.249h6.41zm-7.49.836-1.082 1.874h2.165zm12.136 0-1.083 1.874h2.166zM4.39 9.42l-1.082 1.874h2.165zm15.22 0-1.082 1.875h2.165zm-9.516.51L6.798 15.48h6.41zm5.302.835-3.205 5.55h6.41zm-12.07.529L1.776 13.6 4.39 18.13l1.298-2.249zm15.89 0L18.61 15.88l1.298 2.249 2.614-4.528zm-9.515.51-3.206 5.55h2.616l1.298-2.249zm5.302.836-1.298 2.248h2.595zm-7.49.835-1.082 1.874h2.166zm9.135 1.67-1.082 1.874h2.165l1.082-1.874zm-7.49.835-1.082 1.875h2.166zm2.844 1.67-1.083 1.874h2.166z" />
+      </symbol>
+      <symbol id="i-brand-gemini" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 1.5c.6 5.2 4.8 9.4 10 10-5.2.6-9.4 4.8-10 10-.6-5.2-4.8-9.4-10-10 5.2-.6 9.4-4.8 10-10z" />
+      </symbol>
+      <symbol id="i-brand-minimax" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M4 19V6l8 9 8-9v13" />
+      </symbol>
+      <symbol id="i-brand-glm" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M5.5 5h13L5.5 19h13" />
+      </symbol>
+      <symbol id="i-brand-kimi" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M13.9 2.2c-3.7.8-6.5 4.1-6.5 8 0 4.7 3.8 8.5 8.5 8.5 1.8 0 3.4-.5 4.8-1.5A9.8 9.8 0 0 1 11.9 22C6.4 22 2 17.6 2 12.1 2 6.9 6 2.6 11.1 2.1c1-.1 1.9 0 2.8.1Z" />
+        <path fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" d="M10 7.1v9.8m0-4.8 5.6-5m-4.3 5.1 5.1 4.7" />
+      </symbol>
+      <symbol id="i-brand-grok" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round" d="M5 5.4 19 19M19 5.4 5 19" />
+        <path fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" d="M12 3v3.2M12 17.8V21M3 12h3.2M17.8 12H21" opacity=".72" />
+      </symbol>
+      <symbol id="i-caret" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7" />
+      </symbol>
+      <symbol id="i-sparkle" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 2.2c.34 2.86 1.94 4.46 4.8 4.8-2.86.34-4.46 1.94-4.8 4.8-.34-2.86-1.94-4.46-4.8-4.8 2.86-.34 4.46-1.94 4.8-4.8" />
+        <path fill="currentColor" d="M18.5 13c.2 1.66 1.14 2.6 2.8 2.8-1.66.2-2.6 1.14-2.8 2.8-.2-1.66-1.14-2.6-2.8-2.8 1.66-.2 2.6-1.14 2.8-2.8" opacity=".7" />
+      </symbol>
+      <symbol id="i-close" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
+      </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 5v14M5 12h14" />
+      </symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M5 12h14" />
+      </symbol>
+      <symbol id="i-code" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m9 8-5 4 5 4m6-8 5 4-5 4" />
+      </symbol>
+      <symbol id="i-skills" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
+      </symbol>
+      <symbol id="i-mcp" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M12 22v-5M9 8V2M15 8V2" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M18 8v3a6 6 0 0 1-12 0V8z" />
+      </symbol>
+      <symbol id="i-premiumdb" viewBox="0 0 24 24">
+        <ellipse cx="10.8" cy="5.9" rx="6.9" ry="2.7" fill="none" stroke="currentColor" stroke-width="1.9" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M3.9 5.9v11.4c0 1.5 3.1 2.7 6.9 2.7.63 0 1.24-.03 1.83-.1" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M17.7 5.9v4.2" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M3.9 11.6c0 1.5 3.1 2.7 6.9 2.7.84 0 1.65-.06 2.4-.17" />
+        <path fill="currentColor" stroke="none" d="M17.95 12.1h2.9l1.9 2.4-3.35 4.1-3.35-4.1 1.9-2.4Z" />
+      </symbol>
+      <symbol id="i-bug" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" d="M8.5 7.3h7m-5.9-3.2 1.4 3.2m3.4-3.2L13 7.3M12 7.4v13.4" />
+        <rect x="6.9" y="7.1" width="10.2" height="12.9" rx="5.1" fill="none" stroke="currentColor" stroke-width="1.95" />
+        <path fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" d="M6.9 10.7h-4M17.1 10.7h4M6.9 15.4h-4M17.1 15.4h4M5.1 20.7l2.7-2.6M18.9 20.7l-2.7-2.6" />
+      </symbol>
+      <symbol id="i-braces" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M8.5 4C6.7 4 6.2 5 6.2 6.8v2c0 1.4-.6 2.4-1.9 2.9 1.3.5 1.9 1.5 1.9 2.9v2c0 1.8.5 2.8 2.3 2.8M15.5 4c1.8 0 2.3 1 2.3 2.8v2c0 1.4.6 2.4 1.9 2.9-1.3.5-1.9 1.5-1.9 2.9v2c0 1.8-.5 2.8-2.3 2.8" />
+      </symbol>
+      <symbol id="i-growth" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3.5 16.5 9 11l3.5 3.5L20 7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M15.5 7H20v4.5" />
+      </symbol>
+      <symbol id="i-adaptive" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d="M12 4.5a7.5 7.5 0 0 1 6.65 4.02M19 4.8v4.1h-4.1M12 19.5a7.5 7.5 0 0 1-6.65-4.02M5 19.2v-4.1h4.1" />
+        <path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d="m12 8.25.82 1.92 1.93.83-1.93.83L12 13.75l-.82-1.92L9.25 11l1.93-.83z" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="9" y="9" width="11" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M15 5.5A2.5 2.5 0 0 0 12.5 4H6.5A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 5.5 15" />
+      </symbol>
+      <symbol id="i-ext" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z" />
+      </symbol>
+      <symbol id="i-command" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
+      </symbol>
+      <symbol id="i-logo" viewBox="0 0 64 64">
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g-logo)" />
+        <rect x="4.5" y="4.5" width="55" height="55" rx="15.5" fill="none" stroke="#fff" stroke-opacity=".24" />
+        <path fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" d="M17 45V21l15 15 15-15v24" />
+      </symbol>
+      <symbol id="i-monogram" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M5 18V7l7 7 7-7v11" />
+      </symbol>
+
+      <!-- menu glyphs -->
+      <symbol id="i-undo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H8" />
+      </symbol>
+      <symbol id="i-redo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="m15 14 5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H16" />
+      </symbol>
+      <symbol id="i-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="m20 20-3.7-3.7" />
+      </symbol>
+      <symbol id="i-replace" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3M20 16H8l3-3m-3 3 3 3" />
+      </symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24">
+        <rect x="2.8" y="4.6" width="18.4" height="14.8" rx="3" fill="none" stroke="currentColor" stroke-width="2.05" />
+        <path fill="none" stroke="currentColor" stroke-width="2.05" stroke-linecap="round" stroke-linejoin="round" d="m7.1 9.2 3.25 2.8-3.25 2.8M12.6 15h4.8" />
+      </symbol>
+      <symbol id="i-sidebar-left" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M9 5v14" />
+      </symbol>
+      <symbol id="i-sidebar-right" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+      </symbol>
+      <symbol id="i-book" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
+      </symbol>
+      <symbol id="i-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 11.2v4.6" />
+        <circle cx="12" cy="8" r="1.05" fill="currentColor" />
+      </symbol>
+      <symbol id="i-error" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M9 9l6 6M15 9l-6 6" />
+      </symbol>
+      <symbol id="i-warn" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 3.5 21 19H3z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 9.5v4.2" />
+        <circle cx="12" cy="16.4" r="1.05" fill="currentColor" />
+      </symbol>
+
+      <!-- explorer action glyphs -->
+      <symbol id="i-files" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M9 3h6l4 4v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14 3v5h5M7 7H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h8" opacity=".5" />
+      </symbol>
+      <symbol id="i-new-file" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M13 3v6h6M12 12v6M9 15h6" />
+      </symbol>
+      <symbol id="i-new-folder" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.1c.6 0 1.2.25 1.6.7l1 1.3H18A2 2 0 0 1 20 9v8.5A2.5 2.5 0 0 1 17.5 20h-12A2.5 2.5 0 0 1 3 17.5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M11.5 14h4M13.5 12v4" />
+      </symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M20 6.5v5h-5M4 17.5v-5h5" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19 11.5a7 7 0 0 0-12.3-3.4L4 11.5m0 1a7 7 0 0 0 12.3 3.4L20 12.5" />
+      </symbol>
+      <symbol id="i-rename" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5l3 3M4 20l1-4L16 5a1.8 1.8 0 0 1 2.6 0l.4.4a1.8 1.8 0 0 1 0 2.6L8 19z" />
+      </symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 7h14M10 7V5h4v2M6.5 7l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9L17.5 7M10 11v6M14 11v6" />
+      </symbol>
+      <symbol id="i-git" viewBox="0 0 24 24">
+        <circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="6" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="18" cy="8.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M6 8.4v7.2M18 11v.5a4 4 0 0 1-4 4H8.4" />
+      </symbol>
+      <symbol id="i-archive" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 7.5h16M5.5 7.5V18a1.6 1.6 0 0 0 1.6 1.6h9.8A1.6 1.6 0 0 0 18.5 18V7.5M4.5 4.5h15a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1v-1a1 1 0 0 1 1-1ZM10 11.5h4" />
+      </symbol>
+      <symbol id="i-history" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1M3.5 5v3.5H7M12 7.5V12l3 2" />
+      </symbol>
+
+      <!-- File-type glyphs (tinted via .ic--<type> color) -->
+      <symbol id="i-file" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" />
+      </symbol>
+      <symbol id="i-file-code" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="m10 12-2 2 2 2m4-4 2 2-2 2" />
+      </symbol>
+      <symbol id="i-file-style" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8.5 13h3m1.5 0h2M8.5 16.5h2m1.5 0h3" />
+      </symbol>
+      <symbol id="i-file-data" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11 11.5c-1.3 0-1.3 1.2-1.3 2.5S9.7 16.5 8.4 16.5m4.6-5c1.3 0 1.3 1.2 1.3 2.5s0 2.5 1.3 2.5" />
+      </symbol>
+      <symbol id="i-file-doc" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 12.5h8M8 15.5h5" />
+      </symbol>
+      <symbol id="i-file-image" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <circle cx="10" cy="13" r="1.2" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="m8 18 2.5-2.6 1.6 1.4 2-2.2L17 18z" />
+      </symbol>
+
+      <symbol id="i-outline" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M4 6h16M4 10h12M8 14h10M8 18h8"/>
+      </symbol>
+      <symbol id="i-beaker" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 2h6m-5 0v6.5L4 20a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1l-6-11.5V2"/>
+        <circle cx="10" cy="16" r="1" fill="currentColor"/><circle cx="14" cy="18" r="1" fill="currentColor"/>
+      </symbol>
+      <symbol id="i-remote" viewBox="0 0 24 24">
+        <rect x="3" y="6.2" width="14.2" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.9" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M8.2 20h7.8M10.1 16.2V20M14.1 16.2V20" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M18.6 6.4a4.9 4.9 0 0 1 2.6 2.6M17.9 9.3a2.4 2.4 0 0 1 1.4 1.4" />
+        <circle cx="17.4" cy="12.4" r="1.05" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="i-output" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 10h10M4 14h12M4 18h8"/>
+      </symbol>
+      <symbol id="i-bookmark" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M6 4h12a1 1 0 0 1 1 1v16l-7-4-7 4V5a1 1 0 0 1 1-1z"/>
+      </symbol>
+      <symbol id="i-bell" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/>
+      </symbol>
+      <symbol id="i-split-h" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <line x1="12" y1="3" x2="12" y2="21" stroke="currentColor" stroke-width="1.7"/>
+      </symbol>
+      <symbol id="i-theme-light" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="4" fill="#fffaf0" stroke="#f2c94c" stroke-width="1.2"/>
+        <path d="M6.8 8.2h5.8M6.8 11.6h9.8M6.8 15h6.4" stroke="#8a6d1d" stroke-width="1.35" stroke-linecap="round"/>
+        <circle cx="17" cy="8" r="2.35" fill="#ffd166"/>
+        <path d="M17 4.6v1M17 10.4v1M13.6 8h1M19.4 8h1M14.6 5.6l.7.7M18.7 9.7l.7.7M14.6 10.4l.7-.7M18.7 6.3l.7-.7" stroke="#f59e0b" stroke-width="1" stroke-linecap="round"/>
+      </symbol>
+      <symbol id="i-theme-dark" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="4" fill="#111113" stroke="#3a3a40" stroke-width="1.2"/>
+        <path d="M7 8.2h4.9M7 11.6h8.4M7 15h5.7" stroke="#d6d6d6" stroke-width="1.35" stroke-linecap="round"/>
+        <path d="M17.7 6.1a4.4 4.4 0 1 0 1.4 8.55 5.15 5.15 0 0 1-1.4-8.55z" fill="#4daafc"/>
+        <path d="M18.8 5.1l.35.8.85.08-.65.55.2.84-.72-.45-.72.45.2-.84-.65-.55.85-.08.34-.8z" fill="#bde1ff"/>
+      </symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 2l8 4v5c0 5.5-3.8 10.7-8 12-4.2-1.3-8-6.5-8-12V6l8-4z"/>
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4"/>
+      </symbol>
+
+      <!-- Illustrations -->
+      <symbol id="art-folder" viewBox="0 0 120 96">
+        <path fill="currentColor" opacity=".12" d="M18 26a8 8 0 0 1 8-8h18a8 8 0 0 1 5.6 2.3l4.4 4.4H94a8 8 0 0 1 8 8V42H18z" />
+        <path fill="currentColor" opacity=".22" d="M22 40a7 7 0 0 1 6.8-5.4H100a7 7 0 0 1 6.8 8.6l-7 28A8 8 0 0 1 92 78H22a8 8 0 0 1-8-8V36a7 7 0 0 1 8 4z" />
+        <g transform="translate(78 12)">
+          <path fill="url(#g-accent)" d="M11 0c.4 3.2 2.4 5.2 5.6 5.6-3.2.4-5.2 2.4-5.6 5.6-.4-3.2-2.4-5.2-5.6-5.6C8.6 5.2 10.6 3.2 11 0" />
+        </g>
+      </symbol>
+    </svg>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,104 @@
+name: Package Michael IDE (macOS DMG + Windows EXE/MSI)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ide-package-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  package:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 当前仓库只提交了 automation-server-aarch64-apple-darwin sidecar，
+          # 所以 macOS 先构建 Apple Silicon；要做 Intel/universal，先补
+          # ide/src-tauri/binaries/automation-server-x86_64-apple-darwin。
+          - label: macOS Apple Silicon DMG
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            sidecar_path: ide/src-tauri/binaries/automation-server-aarch64-apple-darwin
+            artifact_name: michael-ide-macos-arm64
+            artifact_paths: |
+              ide/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              ide/target/aarch64-apple-darwin/release/bundle/macos/*.app
+
+          - label: Windows x64 EXE + MSI
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            sidecar_path: ide/src-tauri/binaries/automation-server-x86_64-pc-windows-msvc.exe
+            artifact_name: michael-ide-windows-x64-exe-msi
+            artifact_paths: |
+              ide/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              ide/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ide/src-tauri -> ide/target
+
+      - name: Install frontend dependencies
+        working-directory: ide
+        run: npm ci
+
+      - name: Verify bundled automation sidecar
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '${{ matrix.sidecar_path }}')) {
+            throw 'Missing required Tauri sidecar: ${{ matrix.sidecar_path }}'
+          }
+
+      - name: Run frontend logic tests
+        if: runner.os != 'Windows'
+        working-directory: ide
+        run: npm test
+
+      - name: Build installable desktop bundle
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: ide
+          args: --target ${{ matrix.rust_target }} --config src-tauri/tauri.package.conf.json --ci
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: Michael IDE ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

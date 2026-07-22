@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "Michael-Cursor": {
+      "command": "/usr/local/bin/node",
+      "args": [
+        "/Users/michael/.cursor/kc-mcp/mcp-server.cjs",
+        "--queue-root=/Users/michael/.cursor/kc-mcp-messages"
+      ],
+      "env": {
+        "KC_POLL_TICK_MS": "120000",
+        "KC_QUEUE_ROOT": "/Users/michael/.cursor/kc-mcp-messages"
+      }
+    },
+    "kc-mcp": {
+      "command": "node",
+      "args": [
+        "/Users/michael/.cursor/kc-mcp/mcp-server.cjs",
+        "--queue-root=/Users/michael/.cursor/kc-mcp-messages"
+      ],
+      "env": {
+        "KC_POLL_TICK_MS": "120000"
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+<svg width="132" height="132" viewBox="0 0 132 132" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Secure bridge illustration">
+  <defs>
+    <linearGradient id="hero-mac" x1="20" y1="18" x2="112" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDFDFF"/>
+      <stop offset="1" stop-color="#E9EEF7"/>
+    </linearGradient>
+    <linearGradient id="hero-cloud" x1="74" y1="74" x2="120" y2="118" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6E8DF6"/>
+      <stop offset="1" stop-color="#8A5BF0"/>
+    </linearGradient>
+    <filter id="hero-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#1f2a44" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- local mac window -->
+  <g filter="url(#hero-shadow)">
+    <rect x="14" y="20" width="78" height="58" rx="11" fill="url(#hero-mac)" stroke="#D5DCEA" stroke-width="1.4"/>
+    <circle cx="25" cy="30" r="2.4" fill="#FF5F57"/>
+    <circle cx="33" cy="30" r="2.4" fill="#FEBC2E"/>
+    <circle cx="41" cy="30" r="2.4" fill="#28C840"/>
+    <!-- folder inside -->
+    <path d="M34 45a3 3 0 0 1 3-3h7l3 3.5h12a3 3 0 0 1 3 3V64a3 3 0 0 1-3 3H37a3 3 0 0 1-3-3V45z" fill="#9FB6F2"/>
+    <path d="M34 49h54" stroke="#ffffff" stroke-width="0" />
+  </g>
+
+  <!-- secure link -->
+  <g stroke="#7E5BF0" stroke-width="3.2" stroke-linecap="round" stroke-dasharray="0.1 9">
+    <path d="M74 76 C 92 70, 96 96, 104 100"/>
+  </g>
+
+  <!-- devin cloud node -->
+  <g filter="url(#hero-shadow)">
+    <circle cx="104" cy="100" r="20" fill="url(#hero-cloud)"/>
+    <g stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" fill="none">
+      <path d="M97 100 a7 7 0 0 1 7 -7 h3"/>
+      <path d="M111 100 a7 7 0 0 1 -7 7 h-3"/>
+      <path d="M99.5 100 h9"/>
+    </g>
+  </g>
+
+  <!-- little lock -->
+  <g transform="translate(80 40)">
+    <rect x="0" y="6" width="18" height="14" rx="4" fill="#3B6EF6"/>
+    <path d="M4 6V4a5 5 0 0 1 10 0v2" stroke="#3B6EF6" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+    <circle cx="9" cy="12" r="2.2" fill="#ffffff"/>
+  </g>
+</svg>
