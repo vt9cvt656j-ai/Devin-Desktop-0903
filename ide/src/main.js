@@ -22766,6 +22766,14 @@ function _agentIncompleteLabel(reason, hitCap = false) {
 
 function _buildAgentOutcomeSummary(run, opts) {
   opts = opts || {};
+  // Internal effect-kind tokens ("run"/"install"/"push"…) read like machine flags —
+  // translate them before they reach the user-facing wrap-up.
+  const effectKindLabels = {
+    build: "构建通过", run: "已实际运行", test: "测试通过", install: "依赖已安装", package: "已打包",
+    commit: "已提交", push: "已推送", sync: "已同步远端", pr: "已建 PR", deploy: "已部署",
+    upload: "已上传", download: "已下载", database: "已写数据库", automation: "已执行自动化", external: "已调用外部服务",
+  };
+  const effectKindLabel = (kind) => effectKindLabels[kind] || kind;
   const planSteps = Array.isArray(opts.planSteps) ? opts.planSteps : [];
   const completed = planSteps
     .filter((step) => step?.status === "completed")
@@ -22793,8 +22801,8 @@ function _buildAgentOutcomeSummary(run, opts) {
   if (completed.length) lines.push(`已完成：${completed.join("；")}`);
   if (mutatedFiles.length) lines.push(`改动文件：${mutatedFiles.join("、")}`);
   if (!mutatedFiles.length && opts.didMutate) lines.push("改动文件：本轮有工作区改动，但未拿到明确文件列表");
-  if (runtimeEffects.length) lines.push(`运行结果：${runtimeEffects.join("、")}`);
-  if (externalEffects.length) lines.push(`外部操作：${externalEffects.join("、")}`);
+  if (runtimeEffects.length) lines.push(`运行结果：${runtimeEffects.map(effectKindLabel).join("、")}`);
+  if (externalEffects.length) lines.push(`外部操作：${externalEffects.map(effectKindLabel).join("、")}`);
 
   if (opts.didMutate) {
     if (opts.verificationPassed && opts.uiVerificationPassed !== false) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘，但没有额外命令输出。");
