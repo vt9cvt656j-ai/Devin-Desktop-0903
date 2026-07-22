@@ -3113,7 +3113,9 @@ function extLang(name) {
 }
 
 function syncWelcome() {
-  welcomeEl.hidden = openFiles.size > 0;
+  const show = openFiles.size === 0;
+  if (show && welcomeEl.hidden) loadRecentProjects(); // 回到欢迎页时重拉最近项目，保证列表是最新的
+  welcomeEl.hidden = !show;
 }
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"]);
@@ -6482,6 +6484,38 @@ document.addEventListener("keydown", (e) => {
     if (!_mdPreviewOpen) _renderMdThumb();
   }
 });
+
+// ---- 整体界面缩放（Cmd/Ctrl + = / - / 0）：代码编辑器和所有 UI 一起缩放 ----
+const _UI_ZOOM_KEY = "michael-ide.ui-zoom";
+let _uiZoom = (() => {
+  const v = Number(localStorage.getItem(_UI_ZOOM_KEY));
+  return v >= 0.5 && v <= 2 ? v : 1;
+})();
+async function _applyUiZoom(factor, { toast = true } = {}) {
+  _uiZoom = Math.min(2, Math.max(0.5, Math.round(factor * 100) / 100));
+  try { localStorage.setItem(_UI_ZOOM_KEY, String(_uiZoom)); } catch {}
+  let applied = false;
+  if (inTauri) {
+    try {
+      const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+      await getCurrentWebview().setZoom(_uiZoom);
+      applied = true;
+    } catch { /* 平台不支持 setZoom → 回退 CSS zoom */ }
+  }
+  if (!applied) {
+    document.documentElement.style.zoom = _uiZoom === 1 ? "" : String(_uiZoom);
+    try { monacoEditor?.layout?.(); } catch {}
+  }
+  if (toast) showToast(`界面缩放 ${Math.round(_uiZoom * 100)}%`);
+}
+if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey && !["+", "="].includes(e.key)) return;
+  const k = e.key;
+  if (k === "=" || k === "+") { e.preventDefault(); _applyUiZoom(_uiZoom + 0.1); }
+  else if (k === "-") { e.preventDefault(); _applyUiZoom(_uiZoom - 0.1); }
+  else if (k === "0") { e.preventDefault(); _applyUiZoom(1); }
+}, true);
 
 function updateBreadcrumb(path) {
   const bc = $("breadcrumb");
@@ -12563,6 +12597,7 @@ function _initIPC() {
         }
         break;
       case "workspace_changed":
+        loadRecentProjects(); // 其他窗口切换了项目 → 本窗口欢迎页的最近项目同步刷新
         if (msg.roots && Array.isArray(msg.roots)) {
           for (const r of msg.roots) {
             if (r && !workspaceRoots.includes(r)) {
@@ -37991,6 +38026,18 @@ async function renderAppearanceTool(body) {
   for (const item of APPEARANCE_SETTINGS_ITEMS) {
     sec.appendChild(buildSettingsRow(item, p[item.key], (key, value) => updateEditorPreference(key, value)));
   }
+  // 整体界面缩放（与 Cmd+= / Cmd+- 快捷键共用同一状态）
+  sec.appendChild(buildSettingsRow(
+    {
+      key: "uiZoom",
+      label: "界面缩放",
+      hint: "整体放大/缩小代码和所有界面内容，也可用 ⌘+ / ⌘- / ⌘0 调节",
+      type: "select",
+      options: () => [["0.5", "50%"], ["0.6", "60%"], ["0.7", "70%"], ["0.8", "80%"], ["0.9", "90%"], ["1", "100%"], ["1.1", "110%"], ["1.2", "120%"], ["1.3", "130%"], ["1.5", "150%"], ["1.75", "175%"], ["2", "200%"]],
+    },
+    String(_uiZoom),
+    (_key, value) => _applyUiZoom(Number(value)),
+  ));
   body.appendChild(sec);
 }
 
