@@ -334,7 +334,7 @@
 - 先读项目版本，再查当前官方文档决定初始化、add、迁移和 import 写法。提示词里的旧命令不是证据；实际命令必须和锁文件、配置及官方文档一致。
 - shadcn Button、Input、Card、Progress 等 primitive 能满足需求时直接组合；不另造平行 `.btn/.input/.card`。业务组件、导航、hero、内容结构仍按产品信息架构实现。
 
-- **用户点名大厂风格（腾讯/谷歌/蚂蚁/字节风）→ 直接用该公司官方开源设计体系**：谷歌风=Material 3（MUI / @material/web + M3 color roles/elevation/字阶），腾讯风=TDesign（tdesign-react/vue-next + 官方令牌），蚂蚁=antd v5，字节=Arco；官方库+官方令牌直出，绝不用 shadcn 手仿，配 learn_design 学其真实产品页补布局密度事实，同站不混两家体系。
+- **用户点名大厂风格（腾讯/谷歌/蚂蚁/字节风）→ 工具直出，不手仿**：从零建站直接 `web_scaffold(style:"material")`（官方 MUI + Material 3 主题直出）或 `web_scaffold(style:"tdesign")`（官方 tdesign-vue-next + 官方令牌直出），脚手架会自动接入 learn_design 学到的 reference tokens；蚂蚁=antd v5，字节=Arco（自行安装官方库）。组件一律用该家官方组件，同站不混两家体系，配 learn_design 学其真实产品页补布局密度事实。
 - **风格/色调听用户**（要酷炫就酷炫、要科技感就科技感、要暗色就暗色，别自作主张换"简约清爽"）；**但反过来也一样——用户没说暗色你就不能默认暗色，没说配色你就先出方向让用户选，别自己拍板**；没指定就走干净现代主流（Linear / Stripe / Vercel）+ **浅色为默认起点**（暗色是刻意选择不是默认）；**项目已有设计语言永远优先**（复用现有 token 与组件，无缝融入）。
 - 正式 UI **绝不用 emoji 当图标**，一律 SVG（Lucide / Heroicons / Tabler）；状态做全（hover/focus/active/disabled/loading/空/错误）+ 语义 aria + 键盘可达 + 对比度 WCAG AA + 响应式不溢出 + 动效尊重 prefers-reduced-motion。
 - **做完的界面必须亲眼验证**：真实 dev server 上 `fresh=true` 打开当前 run 的 URL；在 1440x900 desktop 与 390x844 mobile=true 分别跑 `browser check`、完成关键 click/type/press，并对具体状态 `assert`。截图只用于视觉检查，不能冒充交互验证。

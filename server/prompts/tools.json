@@ -3704,7 +3704,7 @@
     "type": "function",
     "function": {
       "name": "web_scaffold",
-      "description": "**一键铺好精选前端基座（对标 v0.dev 的确定性起手式）**——在工作区生成一个可直接跑的 Vite + Vue3(默认)/React + Tailwind 项目，设计令牌系统(src/style.css :root)、字体配对(Space Grotesk 标题 + Manrope 正文，非 Inter)、基础组件(.btn/.card)全部就位。**从零做网站/官网/落地页先用它铺基座**，再在上面建页面——比裸 npm create vite 从零打质量稳得多、每次从统一高质量基座开始。做完 cd 进去 npm install && npm run dev。",
+      "description": "**一键铺好精选前端基座（对标 v0.dev 的确定性起手式）**——在工作区生成一个可直接跑的 Vite 项目：默认 Vue/React + Tailwind v4 + OKLCH 语义令牌 + 字体配对；style 传 material/谷歌 → 直接产出官方 MUI + Material 3 主题（React），传 tdesign/腾讯 → 官方 tdesign-vue-next + 官方令牌（Vue）——大厂风格由工具直出，不靠手仿。若工作区已有 learn_design 学到的 reference/*-tokens.css 会自动接入项目。**从零做网站/官网/落地页先用它铺基座**，做完 cd 进去 npm install && npm run dev。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -3719,6 +3719,14 @@
               "vue",
               "react"
             ]
+          },
+          "style": {
+            "type": "string",
+            "description": "设计体系预设：material/m3/谷歌=官方 MUI+Material 3（强制 React）；tdesign/腾讯=官方 tdesign-vue-next（强制 Vue）；不传=默认令牌基座"
+          },
+          "tokens_css": {
+            "type": "string",
+            "description": "可选，learn_design 产出的 tokens.css 内容，直接接入项目（不传则自动找工作区 reference/*-tokens.css）"
           }
         },
         "required": [

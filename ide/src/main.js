@@ -22295,7 +22295,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "zhuanzhuan_search": return { type: "zhuanzhuan_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "current_time": return { type: "current_time" };
     case "game_scaffold": return { type: "game_scaffold", engine: String(args.engine || "phaser"), name: String(args.name || "my-game") };
-    case "web_scaffold": return { type: "web_scaffold", name: String(args.name || "my-site"), framework: String(args.framework || "vue") };
+    case "web_scaffold": return { type: "web_scaffold", name: String(args.name || "my-site"), framework: String(args.framework || "vue"), style: String(args.style || ""), tokens_css: String(args.tokens_css || "") };
     case "generate_3d": return { type: "generate_3d", prompt: String(args.prompt || ""), name: String(args.name || "model"), style: String(args.style || "realistic") };
     case "generate_sound": return { type: "generate_sound", prompt: String(args.prompt || ""), name: String(args.name || "sound"), duration: Number.isFinite(+args.duration) ? +args.duration : undefined };
     case "generate_music": return { type: "generate_music", prompt: String(args.prompt || ""), name: String(args.name || "bgm"), duration: Number.isFinite(+args.duration) ? +args.duration : undefined };
@@ -28240,7 +28240,7 @@ const _TOOL_CATALOG = [
   { name: "zhuanzhuan_search", desc: "转转——查二手挂牌、回收验机行情，和闲鱼交叉比价", kw: ["转转", "zhuanzhuan", "二手", "回收", "验机", "二手行情", "捡漏", "手机二手", "second hand", "used goods"] },
   { name: "current_time", desc: "获取当前真实日期时间/星期/时区/时间戳", kw: ["时间", "日期", "几号", "星期", "几点", "today", "time", "date", "timestamp", "现在", "当前"] },
   { name: "game_scaffold", desc: "一键生成游戏项目——默认Godot4(3A级Vulkan引擎/全平台导出)+网页引擎Phaser/Three.js/Babylon.js", kw: ["游戏", "game", "phaser", "threejs", "three.js", "babylon", "godot", "gdscript", "2d游戏", "3d游戏", "做游戏", "小游戏", "网页游戏", "游戏引擎", "脚手架", "scaffold", "fps", "射击", "枪战", "3a", "大作", "rpg", "mmorpg"] },
-  { name: "web_scaffold", desc: "一键铺好精选前端基座——Vite+Vue/React+Tailwind+设计令牌系统+字体配对(非Inter)+基础组件，每次从统一高质量起手式开始(对标v0.dev，别裸npm create vite从零打)", kw: ["网站", "建站", "网页", "前端", "脚手架", "scaffold", "vite", "vue", "react", "tailwind", "官网", "落地页", "landing", "website", "frontend", "做网站", "搭网站", "起手式", "模板", "设计系统", "shadcn"] },
+  { name: "web_scaffold", desc: "一键铺好精选前端基座——Vite+Vue/React+Tailwind+设计令牌系统+字体配对(非Inter)+基础组件；style 传 material/tdesign 直出官方 MUI(Material 3)/tdesign-vue-next 大厂体系；自动接入 learn_design 学到的 reference tokens(对标v0.dev，别裸npm create vite从零打)", kw: ["material", "mui", "tdesign", "大厂风格", "网站", "建站", "网页", "前端", "脚手架", "scaffold", "vite", "vue", "react", "tailwind", "官网", "落地页", "landing", "website", "frontend", "做网站", "搭网站", "起手式", "模板", "设计系统", "shadcn"] },
   { name: "generate_3d", desc: "AI生成3D模型(.glb)——文字/图片→网格+纹理(Hunyuan3D/TripoSR/TRELLIS)", kw: ["3d模型", "3d model", "三维", "模型", "mesh", "glb", "fbx", "obj", "建模", "角色模型", "道具模型", "场景模型", "生成模型", "ai建模"] },
   { name: "generate_sound", desc: "AI生成音效(.mp3)——文字描述→游戏音效(爆炸/脚步/枪声/环境音)", kw: ["音效", "sound", "sfx", "爆炸", "脚步声", "枪声", "碰撞", "环境音", "游戏音效", "声音", "音频"] },
   { name: "generate_music", desc: "AI生成背景音乐(.mp3)——文字描述→BGM(ACE-Step/MusicGen)", kw: ["音乐", "bgm", "背景音乐", "配乐", "战斗音乐", "music", "soundtrack", "ost", "旋律", "节奏"] },
@@ -32842,13 +32842,23 @@ async function _executeToolStep(step, call, root, run) {
       const ws = (run && run.session && run.session.project) || root || "";
       if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
       try {
-        const r = await backend.invoke("web_scaffold", { name: call.name || "my-site", workspace: ws, framework: call.framework || "vue" });
+        // Auto-wire the most recent learn_design tokens so the learned reference
+        // system actually feeds the scaffold instead of sitting as a dead doc.
+        let _tok = call.tokens_css || "";
+        if (!_tok) {
+          try {
+            const _refEntries = await backend.readDir(ws + "/reference");
+            const _tokFile = (_refEntries || []).map((e) => e.name || "").filter((n) => n.endsWith("-tokens.css")).sort().pop();
+            if (_tokFile) _tok = await backend.readTextFile(ws + "/reference/" + _tokFile);
+          } catch { /* no reference dir — fine */ }
+        }
+        const r = await backend.invoke("web_scaffold", { name: call.name || "my-site", workspace: ws, framework: call.framework || "vue", style: call.style || "", tokensCss: _tok });
         const _p = (r && r.path) || call.name || "my-site";
         res.className = "atc-result atc-result--ok"; res.textContent = _p;
         if (vp) vp.innerHTML = `<pre>${_escHtml(JSON.stringify(r, null, 2).slice(0, 3000))}</pre>`;
         _clearRunEmptyRoot(run, ws);
         await refreshProjectCaches(ws, "网站脚手架完成");
-        return { type: "web_scaffold", path: _p, content: `已铺好精选前端基座 ${_p}（${(r && r.framework) || "vue"} + Vite + Tailwind + 设计令牌系统 + Space Grotesk/Manrope 字体配对）。下一步：${(r && r.next) || `cd ${_p} && npm install && npm run dev`}。在此基座上建页面：颜色/间距/圆角一律用 :root 设计令牌或 Tailwind theme，别写死数值；标题用 font-display。` };
+        return { type: "web_scaffold", path: _p, content: `已铺好前端基座 ${_p}（${(r && r.framework) || "vue"}，预设 ${(r && r.style) || "tokens"}）。${(r && r.note) || ""}下一步：${(r && r.next) || `cd ${_p} && npm install && npm run dev`}。在此基座上建页面：颜色/间距/圆角一律用设计令牌或主题变量，别写死数值。` };
       } catch (e) {
         res.className = "atc-result atc-result--err"; res.textContent = "脚手架失败";
         return { type: "web_scaffold", path: "", content: `[失败] web_scaffold: ${String(e?.message || e).slice(0, 300)}` };
