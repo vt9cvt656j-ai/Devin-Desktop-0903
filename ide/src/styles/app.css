@@ -6755,10 +6755,25 @@ body.zen-mode .editor {
 }
 .turn-stats {
   margin-top: 8px;
-  font-size: 11px;
-  line-height: 1.4;
+  font-size: 12.5px;
+  line-height: 1.5;
   color: #8b8fa3;
   user-select: text;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.turn-stats__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.turn-stats__icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  opacity: 0.85;
 }
 [data-theme="dark"] .turn-stats,
 .dark .turn-stats {

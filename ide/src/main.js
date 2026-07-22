@@ -12788,13 +12788,18 @@ function _turnStatsText({ elapsedMs = 0, promptTokens = 0, completionTokens = 0,
   const inTok = Math.max(0, Math.round(Number(promptTokens) || 0));
   const outTok = Math.max(0, Math.round(Number(completionTokens) || 0));
   const cents = (inTok || outTok) ? _turnCostCents(model, inTok, outTok) : null;
-  const bits = [`⏱ ${_fmtElapsed(elapsedMs)}`];
-  if (inTok || outTok) bits.push(`⇅ ${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
+  const _svg = (d) => `<svg class="turn-stats__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+  const _icClock = _svg('<circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.8v2.9l2 1.2M6.5 1.5h3"/>');
+  const _icTokens = _svg('<path d="M5 2.5 2.5 5.5h5L5 2.5zM5 2.5v8"/><path d="M11 13.5l2.5-3h-5l2.5 3zM11 13.5v-8"/>');
+  const _icCost = _svg('<path d="M8 2.5v11M10.6 4.8c-.6-.7-1.5-1.1-2.6-1.1-1.5 0-2.7.9-2.7 2.1 0 2.8 5.4 1.5 5.4 4.3 0 1.2-1.2 2.1-2.7 2.1-1.1 0-2-.4-2.6-1.1"/>');
+  const bits = [`${_icClock}${_fmtElapsed(elapsedMs)}`];
+  if (inTok || outTok) bits.push(`${_icTokens}${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
   if (cents != null) {
     const disp = (cents / 100) * _MICHAEL_DISP_MULT;
-    bits.push(`💰 ${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
+    bits.push(`${_icCost}${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
   }
-  return { text: bits.join("  ·  "), inTok, outTok, cents };
+  const html = bits.map((b) => `<span class="turn-stats__item">${b}</span>`).join("");
+  return { html, inTok, outTok, cents };
 }
 // 实时版脚注：回复进行中每秒刷新耗时/token/费用，并始终钉在气泡底部；
 // 结束时 stop() 移除，由 _appendTurnStatsFooter 落空成最终定稿。
@@ -12810,13 +12815,13 @@ function _liveTurnStats(body, { startedAt = Date.now(), model = "", getUsage } =
         body.appendChild(el);
       }
       const u = (typeof getUsage === "function" && getUsage()) || {};
-      el.textContent = _turnStatsText({
+      el.innerHTML = _turnStatsText({
         elapsedMs: Date.now() - startedAt,
         promptTokens: u.in || 0,
         completionTokens: u.out || 0,
         model,
         estimated: u.est !== false,
-      }).text;
+      }).html;
       if (el !== body.lastElementChild) body.appendChild(el); // 新内容追加后保持在最底部
     } catch { /* live stats must never break a reply */ }
   };
@@ -12836,10 +12841,10 @@ function _appendTurnStatsFooter(body, { elapsedMs = 0, promptTokens = 0, complet
     const live = body.querySelector(":scope > .turn-stats--live");
     if (live) live.remove();
     if (body.querySelector(":scope > .turn-stats")) return;
-    const { text, inTok, outTok, cents } = _turnStatsText({ elapsedMs, promptTokens, completionTokens, model, estimated });
+    const { html, inTok, outTok, cents } = _turnStatsText({ elapsedMs, promptTokens, completionTokens, model, estimated });
     const el = document.createElement("div");
     el.className = "turn-stats";
-    el.textContent = text;
+    el.innerHTML = html;
     el.title = `本次回复统计\n耗时：${_fmtElapsed(elapsedMs)}\ntoken：输入 ${inTok} · 输出 ${outTok}${estimated ? "（估算）" : "（真实 usage）"}` +
       (cents != null ? `\n费用：${_dispUsd(cents, 4)}` : "\n费用：该模型未配置单价");
     body.appendChild(el);
@@ -28788,62 +28793,6 @@ function _recLabel(call) {
   }
 }
 
-function _buildRecordingHtml(rec, meta) {
-  const data = JSON.stringify(rec).replace(/</g, "\\u003c");
-  const title = _escHtml(meta.title || "Agent 录制");
-  const sub = _escHtml(`${meta.model || ""} · ${meta.steps} 步 · ${meta.when || ""}`);
-  return "<!doctype html>\n<html lang=\"zh\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    + "<title>" + title + " · Agent 录制回放</title><style>"
-    + "*{box-sizing:border-box}body{margin:0;background:#f8f9fa;color:#1f2937;font:14px/1.55 system-ui,-apple-system,'Segoe UI',sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}"
-    + ".card{width:min(820px,96vw);background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 1px 2px rgba(0,0,0,.06),0 10px 30px rgba(0,0,0,.08);overflow:hidden}"
-    + ".hd{padding:14px 18px;border-bottom:1px solid #eef0f2}.hd b{font-size:15px}.hd .s{color:#6b7280;font-size:12px;margin-top:2px}"
-    + ".steps{list-style:none;margin:0;padding:8px;max-height:64vh;overflow:auto}"
-    + ".step{display:flex;gap:10px;align-items:flex-start;padding:8px 12px;border-radius:9px;transition:background .15s}"
-    + ".step.cur{background:#eaf2fe}.ic{width:18px;height:18px;border-radius:50%;flex:none;margin-top:1px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff}"
-    + ".ok{background:#1e8e3e}.bad{background:#d93025}.t{color:#9ca3af;font-size:11px;font-variant-numeric:tabular-nums;min-width:48px}.lb{flex:1;word-break:break-all}"
-    + ".bar{display:flex;gap:8px;padding:12px 18px;border-top:1px solid #eef0f2}button{padding:7px 16px;border-radius:8px;border:1px solid #e5e7eb;background:#fff;cursor:pointer;font:14px system-ui}button:hover{background:#f3f4f6}.pri{background:#1a73e8;border-color:#1a73e8;color:#fff}.pri:hover{background:#1769d6}"
-    + "</style></head><body><div class=\"card\"><div class=\"hd\"><b>" + title + "</b><div class=\"s\">" + sub + "</div></div>"
-    + "<ul class=\"steps\" id=\"L\"></ul><div class=\"bar\"><button class=\"pri\" id=\"pl\">▶ 回放</button><button id=\"rs\">重置</button></div></div>"
-    + "<script>var R=" + data + ",L=document.getElementById('L'),pl=document.getElementById('pl'),pos=-1,playing=false,tm=0;"
-    + "R.forEach(function(s,i){var li=document.createElement('li');li.className='step';li.id='s'+i;"
-    + "li.innerHTML='<span class=\"ic '+(s.ok?'ok':'bad')+'\">'+(s.ok?'\\u2713':'\\u2717')+'</span><span class=\"t\">'+(s.t/1000).toFixed(1)+'s</span><span class=\"lb\"></span>';"
-    + "li.querySelector('.lb').textContent=s.label;L.appendChild(li);});"
-    + "function hl(n){var o=document.querySelector('.cur');if(o)o.classList.remove('cur');pos=n;var e=document.getElementById('s'+n);if(e){e.classList.add('cur');e.scrollIntoView({block:'nearest'});}}"
-    + "function stop(){playing=false;pl.textContent='\\u25b6 \\u56de\\u653e';if(tm){clearTimeout(tm);tm=0;}}"
-    + "function step(){if(!playing)return;if(pos>=R.length-1){stop();return;}var d=Math.max(250,Math.min(1800,(R[pos+1].t-(pos>=0?R[pos].t:0))));hl(pos+1);tm=setTimeout(step,d);}"
-    + "pl.onclick=function(){if(playing){stop();return;}if(pos>=R.length-1)pos=-1;playing=true;pl.textContent='\\u23f8 \\u6682\\u505c';step();};"
-    + "document.getElementById('rs').onclick=function(){stop();var o=document.querySelector('.cur');if(o)o.classList.remove('cur');pos=-1;};"
-    + "</script></body></html>";
-}
-
-async function _addRecordingExport(container, run, session) {
-  try {
-    const btn = document.createElement("button");
-    btn.style.cssText = "margin:6px 0;font-size:12px;padding:5px 12px;border-radius:7px;border:1px solid var(--border,#e5e7eb);background:var(--panel,#fff);color:inherit;cursor:pointer;opacity:.8";
-    btn.textContent = `⬇ 导出本次录制（${run.recording.length} 步，可回放）`;
-    btn.addEventListener("click", async () => {
-      const root = rootPath || workspaceRoots[0] || "";
-      if (!root) { showToast("未打开工作区，无法保存录制"); return; }
-      const ts = (new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const rel = `.michael-recordings/run-${ts}.html`;
-      const html = _buildRecordingHtml(run.recording, {
-        title: (session && session.name) || "Agent 录制",
-        model: loadConfig().model || "",
-        steps: run.recording.length,
-        when: ts.replace("T", " "),
-      });
-      try {
-        await _commitDiskTextIfUnchanged(root + "/" + rel, null, html);
-        try { reloadDir(parentDir(root + "/" + rel)); } catch {}
-        showToast(`录制已保存：${rel}（双击打开即可回放）`);
-        btn.textContent = `✓ 已导出：${rel}`;
-        btn.disabled = true;
-      } catch (e) { showToast("导出录制失败：" + (e?.message || e)); }
-    });
-    container.appendChild(btn);
-  } catch {}
-}
-
 // Effect routing is local and deterministic. An earlier model-based intent router made
 // a second network request before every Agent turn, adding latency and turning even a
 // simple context message into an unnecessary online query.
@@ -30680,8 +30629,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText }); } catch {} }
     }
     saveChatHistory({ immediate: true }); // CRITICAL: 立即刷盘，别用防抖——任务刚完成用户就 Cmd+Q 时防抖没落盘会丢最后一轮。也捕获渲染后的 transcript 快照。
-    // Offer to export a replayable recording of everything the agent just did.
-    if (run.recording && run.recording.length >= 2) { try { _addRecordingExport(body, run, session); } catch {} }
     // 运行已正常走到终点（含报错结束）→ 清掉工作流检查点，不留假的“中断现场”。
     try { localStorage.removeItem("michael-wf-" + (session.id || "s")); } catch {}
     // Experiential memory: store this run as an episode + distill a reusable insight
