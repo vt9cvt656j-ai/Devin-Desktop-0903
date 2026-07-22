@@ -29842,9 +29842,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
+      // 批量读取聚合：同一批出现 ≥N 个 read 卡时，收进一张可展开的「批量读取」大卡
+      // （占第一个 read 的位置），聊天区不再被一串零散读取卡刷屏。
+      const _stepRenderable = (it) => it.call && !_isMergedToolItem(it) && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research";
+      const _readBatchTotal = items.filter((it) => _stepRenderable(it) && it.call.type === "read").length;
+      const _readGroup = _readBatchTotal >= _READ_BATCH_MIN ? _createReadBatchGroup(_readBatchTotal) : null;
       for (const it of items) {
-        if (it.call && !_isMergedToolItem(it) && it.tc.name !== "update_plan" && it.tc.name !== "run_subagent" && it.tc.name !== "run_worker" && it.tc.name !== "research_project" && it.tc.name !== "design_research") {
-          try { it.step = _createToolStep(it.call); body.appendChild(it.step); _scroll(); } catch (_e) { console.error("[toolstep]", _e); }
+        if (_stepRenderable(it)) {
+          try {
+            it.step = _createToolStep(it.call);
+            if (_readGroup && it.call.type === "read") {
+              if (!_readGroup.parentNode) body.appendChild(_readGroup);
+              _readGroup.querySelector(":scope > .atc-viewport").appendChild(it.step);
+              it._readGroup = _readGroup;
+            } else {
+              body.appendChild(it.step);
+            }
+            _scroll();
+          } catch (_e) { console.error("[toolstep]", _e); }
         }
       }
       // Live staging: drive the relevant panel(s) so the user watches the real work
@@ -30149,6 +30164,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (toolMsgs[index]) return;
           const message = { role: "tool", tool_call_id: it.tc.id, content: await executeScheduledItem(index) };
           if (it.rawResult?.evidence) message._ideMeta = it.rawResult.evidence;
+          if (it._readGroup) _advanceReadBatchGroup(it._readGroup);
           toolMsgs[index] = message;
         },
         _live,
@@ -30159,6 +30175,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id, content: "[interrupted]" };
             _settleToolStep(items[j].step, { content: "[interrupted]" }, "已停止");
           }
+          if (items[j]._readGroup) _settleReadBatchGroup(items[j]._readGroup, "已停止");
         }
         for (const m of toolMsgs) messages.push(m);
         break;
@@ -31294,6 +31311,47 @@ function _settleToolStep(step, result, label = "") {
   if (failed) step?.classList?.add?.("agent-tool-step--rejected");
   if (step?.dataset) step.dataset.toolSettled = "1";
   return true;
+}
+
+// 批量读取聚合卡：同一批响应里出现大量 read_file 时，把零散的读取卡收进一张
+// 可展开的大卡片，聊天里只占一行；头部实时显示 x/N 进度，点开可看每个文件。
+const _READ_BATCH_MIN = 5;
+function _createReadBatchGroup(total) {
+  const card = document.createElement("div");
+  card.className = "agent-tool-step agent-tool-step--readbatch";
+  card._batchTotal = total;
+  card._batchDone = 0;
+  card.innerHTML =
+    `<div class="agent-tool-row">` +
+      `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
+      `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1.75C5 .784 5.784 0 6.75 0h4.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v8.6A1.75 1.75 0 0113.25 14h-.75v-1.5h.75a.25.25 0 00.25-.25V4.06L10.94 1.5H6.75a.25.25 0 00-.25.25V3H5V1.75z"/><path d="M1 4.75C1 3.784 1.784 3 2.75 3h5.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v7.6A1.75 1.75 0 0110.25 16h-7.5A1.75 1.75 0 011 14.25v-9.5zm1.75-.25a.25.25 0 00-.25.25v9.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25V7.06L7.44 4.5H2.75z"/></svg></div>` +
+      `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">批量读取</span><span class="atc-path">${total} 个文件</span></div></div>` +
+      `<span class="atc-result"><span class="atc-spin"></span><span class="atc-batch-count">0/${total}</span></span>` +
+    `</div>` +
+    `<div class="atc-viewport"></div>`;
+  card.querySelector(".agent-tool-row").addEventListener("click", (e) => {
+    if (e.target.closest?.(".atc-viewport")) return;
+    card.classList.toggle("is-open");
+  });
+  return card;
+}
+function _advanceReadBatchGroup(card) {
+  if (!card || card._batchSettled) return;
+  card._batchDone = (card._batchDone || 0) + 1;
+  const el = card.querySelector(":scope > .agent-tool-row .atc-batch-count");
+  if (el) el.textContent = `${card._batchDone}/${card._batchTotal}`;
+  if (card._batchDone >= card._batchTotal) _settleReadBatchGroup(card);
+}
+function _settleReadBatchGroup(card, note) {
+  if (!card || card._batchSettled) return;
+  card._batchSettled = true;
+  const res = card.querySelector(":scope > .agent-tool-row .atc-result");
+  if (!res) return;
+  res.querySelector(".atc-spin")?.remove();
+  res.className = `atc-result ${note ? "atc-result--err" : "atc-result--ok"}`;
+  const el = res.querySelector(".atc-batch-count");
+  if (el) el.textContent = note || `${card._batchTotal} 个文件`;
+  if (card.dataset) card.dataset.toolSettled = "1";
 }
 
 function _setToolStepResolvedPath(step, path) {

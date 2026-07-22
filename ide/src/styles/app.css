@@ -5687,6 +5687,33 @@ body.zen-mode .editor {
 }
 .agent-tool-step--subagent > .atc-viewport > .agent-tool-step { margin-top: 6px; }
 
+/* 批量读取聚合卡：一批 ≥N 个 read 折叠进一张大卡，头部计数，展开看每个文件 */
+.agent-tool-step--readbatch > .agent-tool-row .atc-type-icon { background: #e6f4ea; color: #188038; }
+.agent-tool-step--readbatch > .atc-viewport {
+  padding: 8px;
+  background: rgba(128, 128, 128, 0.06);
+  border-top: 1px solid var(--atc-border);
+  max-height: 420px;
+  overflow-y: auto;
+}
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step {
+  margin: 6px 0 0;
+  border-radius: 7px;
+  box-shadow: none;
+  animation-duration: .18s;
+}
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step:first-child { margin-top: 0; }
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step:hover {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .05);
+  transform: none;
+}
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step .agent-tool-row { padding: 5px 10px; background: transparent; }
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step .atc-type-icon { width: 20px; height: 20px; border-radius: 5px; }
+.agent-tool-step--readbatch > .atc-viewport > .agent-tool-step .atc-type-icon svg { width: 11px; height: 11px; }
+/* 大卡展开时，内层未展开的读取卡自己的详情仍保持收起（.is-open 的后代选择器会误伤） */
+.agent-tool-step--readbatch.is-open > .atc-viewport > .agent-tool-step:not(.is-open) > .atc-viewport { display: none; }
+.atc-batch-count { font-variant-numeric: tabular-nums; }
+
 /* ask_user: a clean, Google-style LIGHT clarification card that matches the IDE's own
    design language (.btn blue #1a73e8 / #e8f0fe hover, --panel-solid / --text / --shadow
    tokens → adapts to light & dark). Subtle card, blue only as accent. */
