@@ -1006,7 +1006,7 @@ body {
 Build a single full-viewport React + TypeScript section (Vite, Tailwind available but styles written via a <style> block) that renders a fixed background video with a pricing-style glass card overlay. The video must play back and forth in a boomerang loop via throttled manual seeking (no native .play()).
 
 Video
-Source URL (exact): 
+Source URL (exact):
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260508_064209_0cb7d815-ff61-4caa-a6d5-bbff145ab272.mp4
 
 <video> attributes: muted, playsInline, crossOrigin="anonymous", preload="auto", src={VIDEO_SRC}, attached ref.
@@ -2300,7 +2300,7 @@ Please write the complete React component (src/App.tsx) and the accompanying CSS
 
 Social media post #2 (on the right)
 
-Please build a React application with Tailwind CSS that recreates a cinematic 600x800px social media post component with VHS and RGB glitch effects. 
+Please build a React application with Tailwind CSS that recreates a cinematic 600x800px social media post component with VHS and RGB glitch effects.
 
 Please use the exact code below for the two main files to recreate my layout perfectly.
 
@@ -2412,7 +2412,7 @@ File 1: src/index.css
 }
 
 .rgb-text-glitch {
-  text-shadow: 
+  text-shadow:
     1px 0 0 rgba(255, 0, 0, 0.5),
     -1px 0 0 rgba(0, 255, 255, 0.5);
   animation: rgb-flicker 3s infinite;
@@ -2441,19 +2441,19 @@ export default function App() {
           className="absolute inset-0 w-full h-full object-cover z-0 opacity-100"
           src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260505_105838_084968f2-4415-42a4-971a-3bec54539549.mp4"
         />
-        
+
         {/* VHS Overlay Elements (On top of everything) */}
         <div className="vhs-scanlines"></div>
         <div className="vhs-noise"></div>
         <div className="vhs-glitch-bar"></div>
-        
+
         {/* Content Area - Middle of the frame */}
         <div className="relative z-10 flex-1 flex flex-col items-center justify-center text-center px-6 -mt-[358px]">
-          
+
           <h1 className="font-serif text-[64px] leading-[0.95] tracking-[-2.46px] max-w-xl text-white animate-fade-rise rgb-text-glitch">
             Focus in a<br/>Distracted World
           </h1>
-          
+
           <p className="font-sans text-[17px] text-white/95 mt-8 leading-relaxed max-w-[480px] animate-fade-rise-delay rgb-text-glitch">
             We're designing tools for deep thinkers, bold creators, and quiet rebels. Amid the chaos, we build digital spaces for sharp focus and inspired work.
           </p>
@@ -2493,7 +2493,7 @@ Please build a React + Tailwind CSS web application that recreates a specific 3:
 
 3. **Background Media**:
    - Add an absolutely positioned, full-cover `<video>` tag behind all content (z-0 index, opacity-100).
-   - Use `autoPlay loop muted playsInline`. 
+   - Use `autoPlay loop muted playsInline`.
    - The source URL must be exactly: `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260505_105838_084968f2-4415-42a4-971a-3bec54539549.mp4`
 
 4. **VHS & RGB Glitch Layers (CSS required)**:

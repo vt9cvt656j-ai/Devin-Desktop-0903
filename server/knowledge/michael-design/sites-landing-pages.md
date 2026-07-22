@@ -3869,7 +3869,7 @@ A fullscreen video background hero with scroll-driven crossfade between two stat
 
 Mobile (flex sm:hidden, mt-6, gap-6, horizontal):
 - "8M+" / "Skin Transformed"
-- "96.4%" / "Visible Renewal"  
+- "96.4%" / "Visible Renewal"
 - "37" / "Patents Granted"
 - Numbers: text-xl font-light. Labels: text-[10px] text-white/50. Dividers: w-[1px] h-8 bg-[#5794E2]/40.
 
@@ -6890,7 +6890,7 @@ A bottom-aligned container with Tailwind classes `absolute inset-x-0 bottom-0 fl
   > *Discover* Living \
  Digital Worlds \
  Vivid, Alive, Endless
-  
+
   Below it a `
 
 ` (weight 400, `13–14px`, `lineHeight 1.6`, `color rgba(255,255,255,0.5)`, `maxWidth 340px`, `marginTop 18px`): "Experience immersive worlds with stories that blur the line between imagination, AI and living reality made for you."
@@ -6919,10 +6919,10 @@ Real worlds."
 ### ArcCardCarousel (the signature component)
 A fanned arc of cards centered on screen. State `active` starts at `floor(total/2)`. Constants (desktop / mobile): `cardW 300/230`, `cardH 420/320`, `stepX 295/170`, `dropY 52/34`, `tilt 8/7`, `containerH 560/460`. Container `position: relative; width: 100%; height: containerH`.
 
-For each card compute signed position `pos` relative to `active` wrapped into `[-half, +half]`; `abs = |pos|`; `isCenter = pos===0`. 
+For each card compute signed position `pos` relative to `active` wrapped into `[-half, +half]`; `abs = |pos|`; `isCenter = pos===0`.
 - **Transform:** `translateX(posstepX) translateY(absdropY + (isCenter ? 30 : 0)) rotate(postilt deg)` — this creates the downward-curving arc with outer cards dropped and rotated. (mobile center bump = 22.)
 - `opacity`: center `1`, else `max(0, 0.6 - (abs-1)0.2)`. `zIndex: 100 - abs`. `pointerEvents: isCenter ? 'auto' : 'none'`. `transition: transform 0.55s cubic-bezier(0.22,1,0.36,1), opacity 0.55s ease`.
-- **Card face:** `borderRadius 28px` (22 mobile). 
+- **Card face:** `borderRadius 28px` (22 mobile).
   - **Center card:** solid `background: rgb(247,251,255)`, `border 1px solid rgba(255,255,255,0.6)`, no backdrop filter, and `boxShadow: '0 8px 24px rgba(0,0,0,0.08), 0 0 50px rgba(255,255,255,0.55), 0 0 90px rgba(255,255,255,0.35)'` (soft dark + layered white glow). Quote text color `#2c2420`.
   - **Inactive cards:** frosted glass — `background: linear-gradient(135deg, rgba(255,255,255,0.42) 0%, rgba(255,255,255,0.24) 100%)`, `backdropFilter: blur(18px) saturate(140%)` (+ `-webkit-`), `border 1px solid rgba(255,255,255,0.28)`, `boxShadow: 'inset 0 1px 1px rgba(255,255,255,0.45)'` (inset highlight only, no drop shadow). Quote text `rgba(255,255,255,0.85)`.
   - Quote `
@@ -7782,7 +7782,7 @@ Right: black pill button "Open Wallet" — bg-black text-white text-base font-me
 2. Hero Section
 Outer: flex-1 px-6 pt-20 pb-6 flex items-end.
 Inner card: relative w-full rounded-2xl overflow-hidden, inline style height: calc(100vh - 96px).
-Background video (autoplay, muted, loop, playsInline, object-cover absolute inset-0 w-full h-full): 
+Background video (autoplay, muted, loop, playsInline, object-cover absolute inset-0 w-full h-full):
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260423_161253_c72b1869-400f-45ed-ac0c-52f68c2ed5bd.mp4
 
 Content overlay: relative z-10 flex flex-col items-start justify-start h-full p-12 pt-36.
@@ -7808,7 +7808,7 @@ Row 1: 2-col grid (grid-cols-1 md:grid-cols-2 gap-12 mb-16 items-start).
 Left: h2 "Meet USD Halo." — text-black text-4xl md:text-5xl font-medium leading-tight mb-8, letterSpacing -0.03em. Below it, black pill "Discover it" button with white arrow circle (same pattern as "Join us" but text-base).
 Right: paragraph "USD Halo is a reward-earning dollar coin that lets your savings grow while remaining tied to the U.S. dollar." — text-black/70 text-2xl md:text-3xl leading-relaxed.
 Row 2 — 4-col card grid (grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4):
-Card 1 (spans 2 cols on lg): rounded-2xl with background image: 
+Card 1 (spans 2 cols on lg): rounded-2xl with background image:
 https://images.higgs.ai/?default=1&output=webp&url=https%3A%2F%2Fd8j0ntlcm91z4.cloudfront.net%2Fuser_38xzZboKViGWJOttwIXH07lWA1P%2Fhf_20260423_164207_f243351d-ed59-48ec-83a0-a5e996bdbe3c.png&w=1280&q=85
 
  backgroundSize: cover; backgroundPosition: center. Inside: p-7 min-h-80 flex flex-col justify-between. Title (top): "Savings that bloom" — text-black text-2xl font-medium leading-snug letterSpacing -0.02em. Body (bottom): "Gain steady returns as your dollar tokens are routed into top-performing DeFi strategies." — text-black/70 text-base max-w-xs.
@@ -7833,7 +7833,7 @@ Left column (md:pr-12 md:pt-2):
 Eyebrow: "USD Halo in Practice" — text-black/60 text-sm mb-2.
 h2 "Use modes" — text-5xl md:text-6xl font-medium leading-none mb-6, ls -0.04em.
 Paragraph: "USD Halo powers a wide range of modes for builders, companies and treasuries wanting safe and rewarding stablecoin integrations plus more" — text-black/60 text-base leading-relaxed max-w-sm.
-Right column: large relative rounded-3xl overflow-hidden min-h-[720px] with background video (autoplay/muted/loop/playsInline, object-cover absolute inset-0): 
+Right column: large relative rounded-3xl overflow-hidden min-h-[720px] with background video (autoplay/muted/loop/playsInline, object-cover absolute inset-0):
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260423_183428_ab5e672a-f608-4dcb-b319-f3e040f02e2d.mp4
 
 Overlay content relative z-10 p-10 md:p-12:
@@ -8641,7 +8641,7 @@ APP STRUCTURE
 
 ```
 src/
-  main.tsx      -> StrictMode, renders 
+  main.tsx      -> StrictMode, renders
   App.tsx       ->  then , no routing
   Hero.tsx      -> Hero section component
   Section2.tsx  -> Second section component
@@ -9958,7 +9958,7 @@ Create a React + Tailwind CSS beauty/skincare brand landing page called "STRETCH
 **Navigation** (absolute positioned below announcement bar at `top-[38px]` mobile / `top-[42px]` desktop, z-30):
 - Left: Logo text "STRETCH" — `text-lg sm:text-xl font-bold tracking-[0.2em] uppercase`
 - Center (hidden on mobile, visible md+): 4 links — "shop", "learn", "journal", "theme" — `text-sm`, with an underline animation on hover (a `<span>` inside that goes from `w-0` to `w-full` on group-hover, `h-[1px] bg-white transition-all duration-300`)
-- Right: 
+- Right:
   - French flag (3 colored divs: `bg-blue-700`, white, `bg-red-600` in a `w-6 h-4` container) + "eur €" text + ChevronDown — hidden on mobile
   - Vertical divider `w-px h-5 bg-white/30 mx-2` — hidden on mobile
   - User icon (hidden below sm), Search icon, ShoppingBag icon (all size 20)
@@ -12140,14 +12140,14 @@ export default function App() {
     <div className="relative w-full flex flex-col bg-[#050505]">
       {/* First Screen */}
       <section className="sticky top-0 z-0 w-full h-[100dvh] overflow-hidden flex flex-col justify-between pointer-events-auto">
-        <SpotlightReveal 
+        <SpotlightReveal
           imageSrc="https://github.com/dsMagnatov/Acreage-landing-assets/blob/main/0098888.jpg?raw=true"
           videoSrc="https://pikaso.cdnpk.net/private/production/4021778466/80a7f7ef-643d-40bc-b533-1e86f159d653-0.mp4?token=exp=1777075200~hmac=91d86c3600a89e923130fce0912dcfb0de81f05f2cde5fc77c30f3e7ae094342"
           isPlaying={isFirstVideoPlaying}
         />
-        
+
         <div className="absolute bottom-0 left-0 w-full h-[75%] z-20" onMouseEnter={() => setIsFirstVideoPlaying(true)} onMouseLeave={() => setIsFirstVideoPlaying(false)} />
-        
+
         <header className="relative z-50 w-full flex justify-center items-start pt-[150px]">
           <svg width="120" viewBox="135.5 361.38 420.32 149.8" fill="white" xmlns="http://www.w3.org/2000/svg">
             <path d="m181.86 511.11c-12.524-0.49755-22.77-3.9244-30.782-10.289-1.529-1.2159-5.1725-4.8616-6.3949-6.3992-3.2489-4.0853-5.4578-8.0611-6.931-12.472-4.5334-13.579-2.2002-31.397 6.6737-50.953 7.5979-16.742 19.322-33.347 39.776-56.344 3.013-3.384 11.986-13.281 12.043-13.281 0.0216 0-0.46749 0.84706-1.083 1.8786-5.3183 8.9082-9.8689 19.401-12.348 28.485-3.9823 14.576-3.502 27.085 1.4068 36.784 3.3862 6.6822 9.1913 12.47 15.719 15.67 11.428 5.5993 28.159 6.0625 48.592 1.3554 1.4068-0.32599 71.116-18.831 154.91-41.123 83.794-22.294 152.36-40.52 152.37-40.505 0.0237 0.0193-194.68 83.333-295.75 126.56-16.007 6.8431-20.287 8.5715-27.812 11.214-19.236 6.7551-36.467 9.9783-50.396 9.4251z"/>
@@ -12167,7 +12167,7 @@ export default function App() {
 
       {/* Second Screen */}
       <section className="relative z-10 w-full h-[100dvh] overflow-hidden bg-black text-white" style={{ boxShadow: '0 -20px 50px rgba(0,0,0,0.5)' }}>
-        <SpotlightReveal 
+        <SpotlightReveal
           imageSrc="https://github.com/dsMagnatov/Acreage-landing-assets/blob/main/02604201313.png?raw=true"
           videoSrc="https://pikaso.cdnpk.net/private/production/4024859125/d070ae9c-55df-47aa-acbe-4ee66337855c-0.mp4?token=exp=1777075200~hmac=4202c1d0ec90137eb6dffa8e0db93ed7569a68b2016165d8b1b567f888869ff5"
           isPlaying={isSecondVideoPlaying}
@@ -14672,7 +14672,7 @@ Uses `@tailwindcss/vite` plugin and `@vitejs/plugin-react`. Path alias `@` resol
 Build a luxury real estate landing page called "ZENITH REALTY" with the exact design, components, and animations described below. Do not include a footer.
 
 **Core Setup:**
-* **Font:** Use Google Font 'Lato' (weights 300, 400, 500, 700, 900). Configure it in tailwind by setting `@theme { --font-lato: "Lato", sans-serif; }` in `index.css` and apply `font-lato` globally. 
+* **Font:** Use Google Font 'Lato' (weights 300, 400, 500, 700, 900). Configure it in tailwind by setting `@theme { --font-lato: "Lato", sans-serif; }` in `index.css` and apply `font-lato` globally.
 * **Global Style:** The main wrapper should use `bg-[#F8F8F8]` and `text-[#141414]`.
 * **Libraries:** Use `lucide-react` for icons, `motion/react` for animations, and `recharts` for charts.
 
@@ -14800,10 +14800,10 @@ const fadeUp = {
 
 const letterBlock = {
   initial: { y: 120, opacity: 0 },
-  animate: { 
-    y: 0, 
-    opacity: 1, 
-    transition: { duration: 1.2, ease: [0.16, 1, 0.3, 1] } 
+  animate: {
+    y: 0,
+    opacity: 1,
+    transition: { duration: 1.2, ease: [0.16, 1, 0.3, 1] }
   }
 };
 ```

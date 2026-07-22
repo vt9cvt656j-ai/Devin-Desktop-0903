@@ -370,7 +370,7 @@ Build a React + Vite + Tailwind CSS landing page for "Axion Studio" - a design a
 
 - LEFT: Dark circle logo (w-9 h-9 sm:w-10 sm:h-10, bg-gray-900, rounded-full) with white text "AX" (10px/11px, font-bold, tracking-tight). Next to it (hidden on mobile, shown md+): nav links "Projects", "Studio", "Journal", "Connect" - 14px, text-gray-900, hover:text-gray-500, transition-colors duration-300, gap-6.
 
-- RIGHT (hidden on mobile, shown md+): 
+- RIGHT (hidden on mobile, shown md+):
   - Text "Taking on projects for Q1 2026" (13px, text-gray-600, hidden below lg)
   - Clock icon (lucide, size 14) + live London time "{HH:MM} in London" (13px, text-gray-600)
   - CTA button: bg-gray-900, text-white, 13px font-medium, rounded-full, pl-5 pr-2 py-2. Text "Book a strategy call" with a HOVER TEXT ROLL animation: the text is duplicated inside a flex-col container with overflow-hidden h-[20px], on group-hover it translates -50% vertically (duration-500, ease cubic-bezier(0.25,0.1,0.25,1)). Arrow icon in a white circle (w-6 h-6) that rotates -45deg on hover (same easing).
@@ -1657,7 +1657,7 @@ CSS Variables (index.css :root):
 --glass-border: rgba(255, 255, 255, 0.25);
 --glass-shadow: 0 4px 30px rgba(0, 0, 0, 0.08);
 --glass-blur: 16px;
-Glassmorphism CSS classes (defined in 
+Glassmorphism CSS classes (defined in
 @layer
  components in index.css):
 

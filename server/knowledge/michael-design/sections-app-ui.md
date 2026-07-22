@@ -2341,7 +2341,7 @@ calculatePrice():
     design: base=399, perPage=100
     development: base=199, perPage=100
     both: base=499, perPage=200
-  
+
   total = max(base, base + (pages - 1) * perPage)
   if needContent: total += pages * 50
   if needSEO: total += pages * 50

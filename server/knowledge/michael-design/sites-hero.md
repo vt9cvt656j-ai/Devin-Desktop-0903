@@ -811,7 +811,7 @@ Build a full-screen hero landing page for a fictional brand called "NeuralKineti
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-display: "Outfit", ui-sans-serif, system-ui, sans-serif;
-  
+
   --color-brand-black: #000000;
   --color-brand-gray: #F5F5F7;
   --color-brand-text-muted: #6E6E73;
@@ -3163,18 +3163,18 @@ Build a full-screen, single-page React + TypeScript + Vite + Tailwind CSS hero s
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>3D Cylinder Carousel</title>
-  
+
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@300;400;500;600;700;800&family=Mr+Dafoe&display=swap" rel="stylesheet">
-  
+
   <!-- Tailwind CSS V4 -->
   <script src="https://unpkg.com/@tailwindcss/browser@4"></script>
-  
+
   <!-- React & ReactDOM -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  
+
   <!-- Babel for JSX and TS parsing -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
@@ -3192,7 +3192,7 @@ Build a full-screen, single-page React + TypeScript + Vite + Tailwind CSS hero s
 /* Custom horizontal scanlines or grids for high-tech background */
 .bg-grid-subtle {
   background-size: 40px 40px;
-  background-image: 
+  background-image:
     linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
     linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
 }
@@ -3217,7 +3217,7 @@ Build a full-screen, single-page React + TypeScript + Vite + Tailwind CSS hero s
   background: rgba(255, 255, 255, 0.25);
 }
 
-    
+
     body {
       margin: 0;
       padding: 0;
@@ -3226,7 +3226,7 @@ Build a full-screen, single-page React + TypeScript + Vite + Tailwind CSS hero s
       overflow: hidden;
       background-color: #000;
     }
-    
+
     #root {
       width: 100%;
       height: 100%;
@@ -3285,7 +3285,7 @@ function App() {
   const cardCount = 5;
   const cardsRefs = useRef<(HTMLDivElement | null)[]>([]);
   const frameId = useRef<number>(0);
-  
+
   // Continuous scroll progress
   const progress = useRef<number>(0);
 
@@ -3338,10 +3338,10 @@ function App() {
 
       // 1. Calculate Card Metrics (shrink cards if height is small to save vertical space)
       let cardW = Math.round(w * 0.16 + 130);
-      
+
       const heightFactor = Math.min(1.0, Math.max(0.65, h / 850));
       cardW = Math.round(cardW * heightFactor);
-      
+
       cardW = Math.min(336, Math.max(150, cardW));
       const cardH = Math.round(cardW / 1.5925); // Standard credit card ratio
 
@@ -3349,11 +3349,11 @@ function App() {
 
       // 2. Calculate Typography Metrics (shrink font sizes aggressively if height or width is small)
       const isMobile = w < 640;
-      
+
       let titleSize = '';
       let sigSize = '';
       let descSize = '';
-      let titleGap = '40px'; 
+      let titleGap = '40px';
       let plVal = '0px';
 
       if (isMobile) {
@@ -3367,7 +3367,7 @@ function App() {
         // Desktop / Tablet style: aligned bottom-left
         // Scale factor depends on width and height to shrink before hitting cards
         const scale = Math.min(1.0, Math.max(0.48, (w * 0.45 + h * 0.55) / 1300));
-        
+
         titleSize = `${Math.max(1.15, 3.5 * scale).toFixed(3)}rem`;
         sigSize = `${Math.max(1.5, 4.5 * scale).toFixed(3)}rem`;
         descSize = `${Math.max(11, 16 * scale).toFixed(1)}px`;
@@ -3392,7 +3392,7 @@ function App() {
   // Compute positions, rotations, and visual rules at 60fps
   const renderLoop = () => {
     // Upward flow speed of continuous transition - decreased speed by more than half for slower, premium, and calmer transitions
-    progress.current += 0.0016; 
+    progress.current += 0.0016;
 
     // Smoothly interpolate current mouse variables towards their target positions (damping/inertia logic)
     mouse.current.x += (mouse.current.targetX - mouse.current.x) * 0.08;
@@ -3405,7 +3405,7 @@ function App() {
     const continuousProgress = progress.current;
     const roundedIndex = Math.round(continuousProgress);
     const diffFromRound = continuousProgress - roundedIndex; // ranges between [-0.5, 0.5]
-    
+
     // Custom non-linear magnetic step logic
     // It creates a gorgeous brief "dwell/pause" at front center before accelerating to the next card
     const easedDiff = Math.sign(diffFromRound) * Math.pow(Math.abs(diffFromRound) * 2, 4.2) / 2;
@@ -3541,45 +3541,45 @@ function App() {
 
   return (
     <div className="absolute inset-0 bg-[#000000] text-white flex items-center justify-center overflow-hidden select-none">
-      
+
       {/* Background full-screen image under the cards component */}
       <div id="full-screen-wave-background" className="absolute inset-0 z-0 pointer-events-none flex items-center justify-center overflow-hidden">
-        <img 
-          src="https://ais-pre-n2veyqxlgp2lg3yian6tqu-115844097173.asia-southeast1.run.app/wave-icon.svg" 
-          alt="Wave Background" 
+        <img
+          src="https://ais-pre-n2veyqxlgp2lg3yian6tqu-115844097173.asia-southeast1.run.app/wave-icon.svg"
+          alt="Wave Background"
           className="w-full h-auto max-h-screen select-none pointer-events-none"
           referrerPolicy="no-referrer"
         />
       </div>
 
       {/* Wavebank Brand Logo at bottom right corner of the screen */}
-      <div 
+      <div
         id="screen-bottom-right-brand"
         className="absolute bottom-5 right-5 sm:bottom-6 sm:right-6 lg:bottom-16 lg:right-16 z-50 hidden sm:flex items-center justify-center opacity-85 hover:opacity-100 transition-opacity duration-300 pointer-events-auto cursor-pointer"
       >
-        <img 
-          src="https://ais-pre-n2veyqxlgp2lg3yian6tqu-115844097173.asia-southeast1.run.app/w.svg" 
-          alt="Brand Logo" 
+        <img
+          src="https://ais-pre-n2veyqxlgp2lg3yian6tqu-115844097173.asia-southeast1.run.app/w.svg"
+          alt="Brand Logo"
           className="h-[40px] w-auto select-none pointer-events-none"
           referrerPolicy="no-referrer"
         />
       </div>
 
       {/* Screen bottom-left Heading & Descriptor Content (Restored to bottom-left with high selectability layering, fluid relative scaling & flawless mobile centering) */}
-      <div 
+      <div
         id="screen-bottom-left-brand-content"
         className="absolute bottom-6 left-1/2 -translate-x-1/2 sm:translate-x-0 sm:bottom-8 sm:left-8 lg:bottom-16 lg:left-16 z-50 flex flex-col items-center text-center sm:items-start sm:text-left w-[92vw] sm:w-auto max-w-[95vw] sm:max-w-xl lg:max-w-[850px] pointer-events-auto select-none"
       >
-        <h1 
+        <h1
           className="font-manrope text-white font-semibold leading-[1.1] tracking-tight"
           style={{ fontSize: fontMetrics.titleFontSize }}
         >
           {/* Indentation for "Get More With" starts on screens sm and up to prevent off-centering on mobile */}
-          <span 
+          <span
             className="inline-flex items-baseline md:translate-y-[1px]"
             style={{ paddingLeft: fontMetrics.pl }}
           >
-            <span 
+            <span
               className="font-signature text-[#00FF88] mr-2.5 leading-[0.8] select-none"
               style={{ fontStyle: 'normal', fontSize: fontMetrics.sigFontSize }}
             >
@@ -3593,11 +3593,11 @@ function App() {
           <span className="inline-block leading-none">Secure, Rewarding</span>
         </h1>
 
-        <div 
+        <div
           className="w-full flex justify-center sm:justify-end"
           style={{ marginTop: fontMetrics.titleGap }}
         >
-          <p 
+          <p
             className="font-manrope text-center sm:text-right text-white/50 leading-relaxed max-w-[85vw] sm:max-w-[280px] md:max-w-[340px] lg:max-w-[420px] tracking-wide font-normal select-none"
             style={{ fontSize: fontMetrics.descFontSize }}
           >
@@ -3612,11 +3612,11 @@ function App() {
       <header className="absolute top-0 left-0 right-0 p-5 sm:p-6 lg:p-16 z-50 flex items-center justify-between pointer-events-none">
         {/* Left side: Custom wavebank SVG Logo */}
         <div className="flex items-center pointer-events-auto cursor-pointer group">
-          <svg 
-            width="182" 
-            height="25" 
-            viewBox="0 0 341 49" 
-            fill="none" 
+          <svg
+            width="182"
+            height="25"
+            viewBox="0 0 341 49"
+            fill="none"
             xmlns="http://www.w3.org/2000/svg"
             className="w-auto h-[25px] sm:h-[28px] transform group-hover:scale-[1.02] active:scale-[0.98] transition-all duration-300"
           >
@@ -3624,16 +3624,16 @@ function App() {
             <path d="M283.745 13.248C288.055 13.248 291.468 14.5067 293.985 17.024C296.545 19.4987 297.825 23.1467 297.825 27.968V47.488H291.681V28.672C291.681 25.3867 290.892 22.912 289.313 21.248C287.735 19.584 285.473 18.752 282.529 18.752C279.201 18.752 276.577 19.7333 274.657 21.696C272.737 23.616 271.777 26.3893 271.777 30.016V47.488H265.633V13.568H271.521V18.688C272.759 16.9387 274.423 15.5947 276.513 14.656C278.647 13.7173 281.057 13.248 283.745 13.248ZM319.82 31.68L312.78 38.208V47.488H306.636V0H312.78V30.464L331.276 13.568H338.7L324.428 27.584L340.108 47.488H332.556L319.82 31.68Z" fill="white"/>
           </svg>
         </div>
- 
+
         {/* Right side: Completely separated action buttons with 0px gap */}
         <div className="flex items-center gap-0 pointer-events-auto">
-          <button 
+          <button
             type="button"
             className="bg-white text-black font-manrope font-semibold px-5 py-2.5 text-xs sm:text-[13px] tracking-wide rounded-full hover:bg-neutral-100 active:scale-[0.97] transition-all duration-200 flex items-center h-9 sm:h-10 cursor-pointer shadow-sm border border-white/5"
           >
             Order Card
           </button>
-          <button 
+          <button
             type="button"
             className="bg-white text-black p-2.5 rounded-full hover:bg-neutral-100 active:scale-[0.97] transition-all duration-200 flex items-center justify-center w-9 h-9 sm:w-10 sm:h-10 cursor-pointer shadow-sm border border-white/5"
             aria-label="Menu"
@@ -3839,7 +3839,7 @@ function App() {
                       <div className="absolute left-0 right-0 top-4 sm:top-5 h-7 sm:h-9 bg-black/85 backdrop-blur-md z-10" />
 
                       {/* Card holder info and details on the bottom-left */}
-                      <div 
+                      <div
                         className="absolute left-4 sm:left-6 bottom-4 sm:bottom-5 z-20 flex flex-col gap-0.5 sm:gap-1 text-left"
                         style={{ fontFamily: '"JetBrains Mono", monospace' }}
                       >
@@ -11372,18 +11372,18 @@ Left panel — "EMBER" cutout effect
 relative w-full lg:w-1/2 min-h-screen lg:h-full flex flex-col pointer-events-auto overflow-hidden border-b lg:border-b-0 lg:border-r border-white/5
 Blur layer: absolute inset-0, backgroundColor: rgba(131, 131, 131, 0.3), backdropFilter: blur(20px) (+ webkit prefix), with maskImage: url(#emberMask) so the EMBER letters cut a clear hole through the blur revealing the video.
 SVG mask def:  with . White rect 100%×100%, then black-fill EMBER text in two responsive variants:
-Mobile: 
-Desktop: 
+Mobile:
+Desktop:
 Text element: x=0 y=115 textLength="100%" lengthAdjust="spacingAndGlyphs", classes font-[900] tracking-tighter, inline fontSize: 130px, fill="black"
 Content stack (z-20, pt-[12vh] lg:pt-[8vh] px-6 md:px-12):
 Spacer matching the EMBER SVG: h-[20vh] lg:h-[25vh]
 Vertical line: flex-grow flex flex-col pt-4 min-h-[100px] containing w-[1px] h-full bg-white/20
 Footer block (pb-12 flex flex-col gap-6 pt-4):
 "ABOUT" eyebrow: text-[10px] font-bold tracking-[0.3em] uppercase text-white/40
-Heading: text-xl md:text-2xl font-normal leading-[1.3] text-white/90 — copy: "We shape striking digital identities through bold contrasts and meaningful motion." 
+Heading: text-xl md:text-2xl font-normal leading-[1.3] text-white/90 — copy: "We shape striking digital identities through bold contrasts and meaningful motion."
  "Our design process transforms the primal into the powerful."
 Bottom row: flex flex-col sm:flex-row justify-between items-start sm:items-end border-t border-white/10 pt-8 w-full gap-8 — three cells:
-"Double Click and" caption + Explore Our Work link with 
+"Double Click and" caption + Explore Our Work link with
 Social links (Instagram, Telegram) — each with a w-1 h-1 bg-white rounded-full opacity-50 bullet
 Address (hidden on mobile): 23 Industrial Lane, Unit 5 / London, UK, E2 8AA
 All small-text uses text-[10px] font-bold uppercase tracking-widest; eyebrows use text-[9px]
@@ -12107,7 +12107,7 @@ Tech Stack: React, Vite, TypeScript, Tailwind CSS, framer-motion, lucide-react (
 
 Build a Hero section for a DeFi dashboard named RIVR showcasing a sleek, glassmorphism aesthetic. Please mimic these exact specifications to ensure a premium UI.
 
-Dependencies: 
+Dependencies:
 - Use `lucide-react` for icons.
 - Use `motion` (imported from `'motion/react'`) for animations.
 
@@ -12146,9 +12146,9 @@ Create a single `<main className="min-h-screen bg-[#f0f0f0]">` instance that ret
 Outer wrapper: `<div className="w-full h-screen flex items-center justify-center p-3 md:p-5 bg-[#f0f0f0]">`.
 Inner container: `<section className="relative w-full max-w-[1536px] h-full rounded-[1.5rem] md:rounded-[3rem] overflow-hidden shadow-none flex flex-col items-center bg-white/10 group">`
 Inside the `<section>`:
-- The Video Background: 
-  A `<video>` element with `autoPlay muted loop playsInline`. 
-  Classes: `absolute inset-0 w-full h-full object-cover object-[65%] lg:object-center z-0`. 
+- The Video Background:
+  A `<video>` element with `autoPlay muted loop playsInline`.
+  Classes: `absolute inset-0 w-full h-full object-cover object-[65%] lg:object-center z-0`.
   Source URL: `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260428_193507_4286c423-2fd9-4efd-92bd-91a939453fc1.mp4` (Must use exactly this URL).
 - The Content Layer:
   A `<div className="relative z-10 w-full h-full flex flex-col items-center">`.
@@ -12164,7 +12164,7 @@ Wrapper: `<nav className="flex items-center justify-between py-6 px-6 md:px-10 w
 - Left Side (hidden spacer for centering): `<div className="flex-1 hidden md:block" />`
 - Center Menu: `<ul className="hidden md:flex items-center gap-8 text-[rgb(45,45,45)] font-normal text-sm">`. Include items: Ecosystem, Economics (hasDropdown), Developers, Governance (hasDropdown). List items need: `cursor-pointer hover:opacity-70 transition-opacity flex items-center gap-1 group`. Append a `ChevronRight` icon (classes: `w-4 h-4 transition-transform group-hover:translate-x-0.5`) if hasDropdown is true.
 - Mobile Logo: `<div className="md:hidden"><span className="font-regular tracking-tighter text-xl text-[rgba(30,50,90,0.9)]">RIVR</span></div>`
-- Right Button: `<div className="flex-1 flex justify-end">` wrapping a `<motion.button>` (whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}). 
+- Right Button: `<div className="flex-1 flex justify-end">` wrapping a `<motion.button>` (whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}).
   Button classes: `flex items-center bg-[rgba(30,50,90,0.8)] text-white rounded-full pl-2 pr-4 md:pr-6 py-1.5 md:py-2 gap-2 md:gap-3 hover:bg-[rgba(30,50,90,1)] transition-colors group`. Inside button: Add an icon wrapper `<div className="bg-white/20 p-1 md:p-1.5 rounded-full flex items-center justify-center">` containing `ArrowUpRight` (w-4 h-4 md:w-5 md:h-5 text-white), and a text node "Book Demo" (`text-xs md:text-sm font-normal`).
 
 5. HeroBadge Component (`src/components/HeroBadge.tsx`)
@@ -12184,7 +12184,7 @@ Classes: `absolute bottom-0 right-0 p-3 pt-5 pl-8 sm:p-4 sm:pt-6 sm:pl-10 md:p-6
 CRITICAL corner masks to include inside this container:
 - Top intersection mask: `<div className="absolute -top-[1.5rem] sm:-top-[2rem] md:-top-[3.5rem] right-0 w-[1.5rem] sm:w-[2rem] md:w-[3.5rem] h-[1.5rem] sm:h-[2rem] md:h-[3.5rem] pointer-events-none"><svg width="100%" height="100%" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M56 56V0C56 30.9279 30.9279 56 0 56H56Z" fill="#f0f0f0"/></svg></div>`
 - Left intersection mask: `<div className="absolute bottom-0 -left-[1.5rem] sm:-left-[2rem] md:-left-[3.5rem] w-[1.5rem] sm:w-[2rem] md:w-[3.5rem] h-[1.5rem] sm:h-[2rem] md:h-[3.5rem] pointer-events-none"><svg width="100%" height="100%" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M56 56H0C30.9279 56 56 30.9279 56 0V56Z" fill="#f0f0f0"/></svg></div>`
-Content: 
+Content:
 - Circle Icon: A div with `bg-[rgba(30,50,90,0.05)] w-10 h-10 md:w-14 md:h-14 rounded-full flex items-center justify-center border border-[rgba(30,50,90,0.1)]` using `ArrowUpRight` (`text-[rgba(30,50,90,0.8)]`).
 - Info column containing title "Documentation" (`text-[16px] md:text-[20px] font-normal text-[rgba(30,50,90,0.95)]`). Below it, a line containing text "Library" and a `ChevronRight` icon wrapped in `<div className="flex items-center gap-1 text-[rgba(30,50,90,0.6)] cursor-pointer hover:text-[rgba(30,50,90,0.8)] transition-colors"><span className="text-[12px] md:text-[15px] font-normal">...`
 
@@ -12289,7 +12289,7 @@ No hamburger menu on mobile -- the nav links and CTA simply hide (hidden md:flex
 - Preview: https://motionsites.ai/assets/hero-shamoni-preview-DfbPWZl9.gif
 - Asset: https://code.mrday.one/design-assets/sites/visuals-by-id/shamoni-hero.gif
 
-Build an immersive, highly interactive, scroll-driven landing page using React, Vite, Tailwind CSS (v4), and `motion/react` (Framer Motion). 
+Build an immersive, highly interactive, scroll-driven landing page using React, Vite, Tailwind CSS (v4), and `motion/react` (Framer Motion).
 
 Please set up the application with the exact files, dependencies, URLs, CSS variables, and mathematical Framer Motion values provided below.
 
@@ -12370,7 +12370,7 @@ CSS
   width: 100%;
   height: 100%;
   object-fit: contain;
-  border-radius: 50%; 
+  border-radius: 50%;
 }
 3. Orbit Images React Component (src/components/OrbitImages.tsx)
 Create this mathematically precise component that maps motion paths over SVG strings using offsetPath and offsetDistance. It accepts Framer Motion MotionValues as overrides to allow the parent App.tsx to infinitely control its radius, spread, item size, and rotation during scroll.
@@ -12460,7 +12460,7 @@ function OrbitItem({ item, index, totalItems, pathValue, itemSizeValue, rotation
   const itemScale = useTransform(() => {
     const rawPos = offsetPercentage.get();
     const strength = scaleStrength ? scaleStrength.get() : 0;
-    
+
     let dist = Math.abs(rawPos - focalPoint);
     if (dist > 50) dist = 100 - dist;
 
@@ -12640,7 +12640,7 @@ const orbitImagesData = [
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
-  
+
   const { scrollYProgress } = useScroll({
     target: containerRef,
     offset: ["start start", "end end"]
@@ -12656,7 +12656,7 @@ export default function App() {
   const yElement = useTransform(scrollYProgress, [0.03, 0.08, 0.15, 0.22, 0.90, 0.98, 1], [20, 0, 0, 20, 20, 0, 0]);
 
   const targetRadius = 650;
-  
+
   const orbitItemSize = useTransform(scrollYProgress, [0.15, 0.25, 0.85, 0.95, 1], [80, 520, 520, 80, 80]);
   const orbitRx = useTransform(scrollYProgress,       [0.15, 0.25, 0.85, 0.95, 1], [330, targetRadius, targetRadius, 330, 330]);
   const orbitRy = useTransform(scrollYProgress,       [0.15, 0.25, 0.85, 0.95, 1], [140, targetRadius, targetRadius, 140, 140]);
@@ -12674,9 +12674,9 @@ export default function App() {
 
      let frameSpeed = 0;
      if (pos > 0.15 && pos < 0.85) {
-        frameSpeed = (scrollDelta * 200); 
+        frameSpeed = (scrollDelta * 200);
      } else {
-        frameSpeed = (delta / 1000) * 2.5; 
+        frameSpeed = (delta / 1000) * 2.5;
      }
 
      orbitProgress.set(orbitProgress.get() + frameSpeed);
@@ -12685,7 +12685,7 @@ export default function App() {
   return (
     <div ref={containerRef} className="relative w-full h-[600vh] bg-black">
       <div className="sticky top-0 w-full h-screen overflow-hidden text-white">
-        
+
         <video autoPlay loop muted playsInline className="absolute inset-0 w-full h-full object-cover z-0">
           <source src="https://stream.mux.com/OD2Ny6q9anbQ9h7Vie3KnqDxFpzHM9sjwfhF029lfd600.m3u8" type="video/mp4" />
         </video>
@@ -12701,7 +12701,7 @@ export default function App() {
           </svg>
         </div>
 
-        <motion.div 
+        <motion.div
           className="absolute z-20 flex items-center justify-center overflow-hidden"
           style={{ clipPath, rotate: -15, width: '150vw', height: '150vh', left: '-25vw', top: '-25vh' }}
         >
@@ -12731,7 +12731,7 @@ export default function App() {
 
         <div className="absolute inset-0 z-[60] pointer-events-none">
             <div className="absolute top-[48%] left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none z-50">
-              <motion.div 
+              <motion.div
                 className="flex flex-col items-center whitespace-nowrap pointer-events-auto"
                 style={{ filter: filterText, opacity: textOpacity, WebkitFontSmoothing: 'antialiased', WebkitBackfaceVisibility: 'hidden', transform: 'translateZ(0)' }}
               >
@@ -12743,7 +12743,7 @@ export default function App() {
               </motion.div>
             </div>
 
-            <motion.div 
+            <motion.div
               className="absolute top-32 right-[calc(6vw+150px)] md:right-[214px] flex flex-col items-start text-left pointer-events-auto cursor-text"
               style={{ y: yElement, filter: filterText, opacity: textOpacity }}
             >
@@ -12753,7 +12753,7 @@ export default function App() {
               </span>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               className="absolute bottom-8 left-8 md:bottom-16 md:left-16 flex flex-col items-start text-black pointer-events-auto cursor-text"
               style={{ y: yElement, filter: filterText, opacity: textOpacity }}
             >
@@ -12762,7 +12762,7 @@ export default function App() {
             </motion.div>
 
             <div className="absolute bottom-16 right-[6vw] md:right-[10vw] flex flex-col items-start z-10 pointer-events-auto">
-              <motion.p 
+              <motion.p
                 className="font-serif text-[16px] uppercase tracking-widest text-black leading-[20px] mb-6 text-left w-[240px] cursor-text"
                 style={{ y: yElement, filter: filterText, opacity: textOpacity }}
               >
@@ -12781,7 +12781,7 @@ export default function App() {
             </div>
         </div>
 
-        <motion.header 
+        <motion.header
           className="fixed top-0 left-0 w-full p-6 md:p-10 flex justify-between items-start z-[100] pointer-events-none"
           style={{ opacity: textOpacity, filter: filterText }}
         >

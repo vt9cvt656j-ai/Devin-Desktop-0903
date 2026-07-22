@@ -1818,17 +1818,17 @@ function anim(visible: boolean, delay: number, opts: { y?: number; x?: number; d
 
 ### Asset URLs (exact, verbatim)
 
-- Hero background video:  
+- Hero background video:
   `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260511_142713_322c5ac5-8a5d-413b-be68-4a0e82014264.mp4`
-- ScentFinder section video (right side / mobile below):  
+- ScentFinder section video (right side / mobile below):
   `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260511_151802_1bbf9a81-a7cb-4be1-b858-f1cd92b62b96.mp4`
-- WildScent section video (left side / mobile below):  
+- WildScent section video (left side / mobile below):
   `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260511_151818_65bb22c5-33ae-4e23-85ea-0a3dd89957c2.mp4`
-- Hero card product image (Eau So Fresh):  
+- Hero card product image (Eau So Fresh):
   `https://images.higgs.ai/?default=1&output=webp&url=https%3A%2F%2Fd8j0ntlcm91z4.cloudfront.net%2Fuser_38xzZboKViGWJOttwIXH07lWA1P%2Fhf_20260511_143221_81001e13-b71c-4a90-b2d7-abf4e2ec08ff.png&w=1280&q=85`
-- ScentFinder product image (Eau So Sweet):  
+- ScentFinder product image (Eau So Sweet):
   `https://images.higgs.ai/?default=1&output=webp&url=https%3A%2F%2Fd8j0ntlcm91z4.cloudfront.net%2Fuser_38xzZboKViGWJOttwIXH07lWA1P%2Fhf_20260511_151640_5b4a7bf8-4eb2-4a49-aa63-17a9bb642b88.png&w=1280&q=85`
-- WildScent product image (Eau So Extra):  
+- WildScent product image (Eau So Extra):
   `https://images.higgs.ai/?default=1&output=webp&url=https%3A%2F%2Fd8j0ntlcm91z4.cloudfront.net%2Fuser_38xzZboKViGWJOttwIXH07lWA1P%2Fhf_20260511_151621_4fba6892-ed21-4c2e-8cb3-0bd2ec2abefa.png&w=1280&q=85`
 
 ### Product data

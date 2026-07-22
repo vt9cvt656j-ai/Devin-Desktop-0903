@@ -3560,7 +3560,7 @@ export default function App() {
   const cardCount = 5;
   const cardsRefs = useRef<(HTMLDivElement | null)[]>([]);
   const frameId = useRef<number>(0);
-  
+
   // Continuous scroll progress
   const progress = useRef<number>(0);
 
@@ -3613,10 +3613,10 @@ export default function App() {
 
       // 1. Calculate Card Metrics (shrink cards if height is small to save vertical space)
       let cardW = Math.round(w * 0.16 + 130);
-      
+
       const heightFactor = Math.min(1.0, Math.max(0.65, h / 850));
       cardW = Math.round(cardW * heightFactor);
-      
+
       cardW = Math.min(336, Math.max(150, cardW));
       const cardH = Math.round(cardW / 1.5925); // Standard credit card ratio
 
@@ -3624,11 +3624,11 @@ export default function App() {
 
       // 2. Calculate Typography Metrics (shrink font sizes aggressively if height or width is small)
       const isMobile = w < 640;
-      
+
       let titleSize = '';
       let sigSize = '';
       let descSize = '';
-      let titleGap = '40px'; 
+      let titleGap = '40px';
       let plVal = '0px';
 
       if (isMobile) {
@@ -3642,7 +3642,7 @@ export default function App() {
         // Desktop / Tablet style: aligned bottom-left
         // Scale factor depends on width and height to shrink before hitting cards
         const scale = Math.min(1.0, Math.max(0.48, (w * 0.45 + h * 0.55) / 1300));
-        
+
         titleSize = `${Math.max(1.15, 3.5 * scale).toFixed(3)}rem`;
         sigSize = `${Math.max(1.5, 4.5 * scale).toFixed(3)}rem`;
         descSize = `${Math.max(11, 16 * scale).toFixed(1)}px`;
@@ -3667,7 +3667,7 @@ export default function App() {
   // Compute positions, rotations, and visual rules at 60fps
   const renderLoop = () => {
     // Upward flow speed of continuous transition - decreased speed by more than half for slower, premium, and calmer transitions
-    progress.current += 0.0016; 
+    progress.current += 0.0016;
 
     // Smoothly interpolate current mouse variables towards their target positions (damping/inertia logic)
     mouse.current.x += (mouse.current.targetX - mouse.current.x) * 0.08;
@@ -3680,7 +3680,7 @@ export default function App() {
     const continuousProgress = progress.current;
     const roundedIndex = Math.round(continuousProgress);
     const diffFromRound = continuousProgress - roundedIndex; // ranges between [-0.5, 0.5]
-    
+
     // Custom non-linear magnetic step logic
     // It creates a gorgeous brief "dwell/pause" at front center before accelerating to the next card
     const easedDiff = Math.sign(diffFromRound) * Math.pow(Math.abs(diffFromRound) * 2, 4.2) / 2;
@@ -3816,7 +3816,7 @@ export default function App() {
 
   return (
     <div className="absolute inset-0 bg-[#000000] text-white flex items-center justify-center overflow-hidden select-none">
-      
+
       {/* 3D perspective camera space */}
       <div
         className="relative w-full h-full flex items-center justify-center pointer-events-none"
@@ -3965,7 +3965,7 @@ export default function App() {
 464:                             />
 465:                           </svg>
 466:                         </div>
-467: 
+467:
 468:                         {/* Double intersecting circle Brand Logo - bottom right corner */}
 469:                         <div className="absolute right-5 sm:right-6 bottom-5 sm:bottom-6 flex -space-x-3 items-center opacity-90">
 470:                           <div className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-white/20 backdrop-blur-[1px] border border-white/10" />
@@ -3975,7 +3975,7 @@ export default function App() {
 474:                     </div>
 475:                   );
 476:                 }
-477: 
+477:
 478:                 // Back face slice
 479:                 if (isBackFace) {
 480:                   const backBorderStyle = "border border-white/15";
@@ -4002,12 +4002,12 @@ export default function App() {
 501:                           className="absolute inset-0 w-full h-full object-cover"
 502:                         />
 503:                       </div>
-504: 
+504:
 505:                       {/* Premium Real Magnetic stripe */}
 506:                       <div className="absolute left-0 right-0 top-4 sm:top-5 h-7 sm:h-9 bg-black/85 backdrop-blur-md z-10" />
-507: 
+507:
 508:                       {/* Card holder info and details on the bottom-left */}
-509:                       <div 
+509:                       <div
 510:                         className="absolute left-4 sm:left-6 bottom-4 sm:bottom-5 z-20 flex flex-col gap-0.5 sm:gap-1 text-left"
 511:                         style={{ fontFamily: '"JetBrains Mono", monospace' }}
 512:                       >
@@ -4025,7 +4025,7 @@ export default function App() {
 524:                     </div>
 525:                   );
 526:                 }
-527: 
+527:
 528:                 return null;
 529:               })}
 530:             </div>
@@ -5130,10 +5130,10 @@ hover:bg-[#0D212C] transition-colors duration-200
 After the centered content block, render the trail images list (still inside the card, not behind `z-10`):
 ```jsx
 {trailImages.map((img) => (
-  
 
 
-    
+
+
 
 
 ))}
@@ -5822,7 +5822,7 @@ No images, no frameworks, no 3D libraries. The entire cube is pure CSS `transfor
 > - `min-w` and `min-h` ensure buttons don't collapse too small on tiny screens.
 >
 > Each button contains one icon from `lucide-react`, in this order top to bottom:
-> 1. `<Mail />` 
+> 1. `<Mail />`
 > 2. `<Twitter />`
 > 3. `<Github />`
 >
@@ -9065,7 +9065,7 @@ Please build a React component that perfectly replicates a specific "Benefits" s
 This column should contain staggered elements wrapped in `motion.div`. Use `initial={{ opacity: 0, y: 20 }}`, `whileInView={{ opacity: 1, y: 0 }}`, `viewport={{ once: true, amount: 0.3 }}` with a `duration: 0.6` and incrementing delays.
 
 1. **Eyebrow Tag:** A flex container with a solid blue dot (`w-2 h-2 rounded-full bg-[#3b82f6]`) and the text "The benefit" (`text-[15px] font-medium tracking-wide`).
-2. **Main Heading:** 
+2. **Main Heading:**
    - Text size: `text-[clamp(1.7rem,5.5vw,4.5rem)] leading-[1.05] tracking-tight font-medium mb-8`.
    - The first line is "Explore [INLINE_IMAGE] our"
    - The inline image must use exactly this URL: `https://res.cloudinary.com/dsdhxhhqh/image/upload/v1777202844/%D0%A1%D0%BA%D1%80%D0%B8%D0%BD%D1%88%D0%BE%D1%82_26-04-2026_134245-removebg-preview_jju5ww.png`. Style it as an inline block: `w-[1.2em] scale-[1.15] h-[0.8em] object-contain rounded-full align-middle mx-[-0.1em] -translate-y-[0.1em]`.
@@ -9074,9 +9074,9 @@ This column should contain staggered elements wrapped in `motion.div`. Use `init
    - First Pill: Contains a `<Soup className="w-[18px] h-[18px] text-gray-700"/>` and text "Eating After the Game".
    - Second Pill: Contains a `<Shirt className="w-[18px] h-[18px] text-gray-700"/>` and text "Game Jersey".
 4. **Accordion/Tabs List:**
-   - Manage state for `activeTab` (defaulting to 'connections'). 
+   - Manage state for `activeTab` (defaulting to 'connections').
    - Create two tabs: "Connections" and "Sport Pacakge" (keep exact spelling).
-   - Wrapper styling for each tab: `rounded-[24px] overflow-hidden transition-all duration-300`. 
+   - Wrapper styling for each tab: `rounded-[24px] overflow-hidden transition-all duration-300`.
    - State styling: If active, apply `bg-white shadow-[0_4px_24px_rgba(0,0,0,0.03)]`. If inactive, apply `hover:bg-black/5 cursor-pointer`.
    - In the tab header (padding `p-7 md:p-8`), map the title (`text-[22px] font-medium`). On the right, include an animated icon toggle. Use framer-motion to cross-fade and rotate between a `<Plus />` and `<Minus />` icon depending on whether the tab is active.
    - Add a smooth expand/collapse `AnimatePresence` revealing content below the header.
@@ -9091,11 +9091,11 @@ Fade this entire side in from the right (`x: 20` to `0`).
 - Flex column, flex-1, `justify-between`.
 - Top section: A flex label `<Target className="w-5 h-5 text-[#ea580c]"/>` with text `EST — 1997` (`font-bold text-[15px] tracking-wide`). Below it, paragraph text: "Smart features designed to move with you — fast, flexible, and built for everyday action." (`max-w-[280px] text-gray-500 text-[18px] leading-[1.6]`).
 - Bottom section: A stacked heading: "Visionary" over "Precision Play" (`text-[clamp(1.7rem,5vw,46px)] leading-[1.1] font-medium tracking-tight mb-8`).
-- Button: 100% width on mobile, `rounded-full bg-black text-white px-7 py-4 flex items-center justify-between text-[15px] font-medium hover:bg-gray-800`. Text "Join Now!" with an `<ArrowRight />` icon. 
+- Button: 100% width on mobile, `rounded-full bg-black text-white px-7 py-4 flex items-center justify-between text-[15px] font-medium hover:bg-gray-800`. Text "Join Now!" with an `<ArrowRight />` icon.
 
 **Right Side of Card (Media and Floating Badges):**
 - Container: `w-full xl:w-[320px] 2xl:w-[410px] h-[360px] md:h-[450px] xl:h-auto rounded-[2.5rem] relative overflow-hidden flex-shrink-0`.
-- **The Video Layer:** Use a `<video>` tag filling exactly the absolute shape (`absolute inset-0 w-full h-full object-cover z-0`). Props: `autoPlay loop muted playsInline`. 
+- **The Video Layer:** Use a `<video>` tag filling exactly the absolute shape (`absolute inset-0 w-full h-full object-cover z-0`). Props: `autoPlay loop muted playsInline`.
   - SRC MUST BE EXACTLY: `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260426_105815_d66e9c4c-a1f8-4011-9ee5-f0cace24e642.mp4`
 - **Top-Right Pill (Absolute Z-10):** Positioned `top-6 right-6 lg:top-8 lg:right-8`. `bg-white text-[#111] px-5 py-2.5 rounded-full flex shadow-md gap-2.5 text-[15px] font-medium`. Contains a `<Gift className="w-5 h-5 text-gray-700" />` and the text "February Sale". Pop this in with framer motion `scale`.
 - **Bottom-Left Card (Absolute Z-10):** Positioned `bottom-6 left-6 lg:bottom-8 lg:left-8`. `bg-white text-[#111] rounded-[28px] overflow-hidden w-[190px] shadow-lg`. Pop this in with `x: -20` to `0`.
@@ -9142,20 +9142,20 @@ Create a React web application using Vite and Tailwind CSS v4 that perfectly rep
 **Data for the 3 Cards:**
 Instantiate three of these cards inside the main grid with the following exact data:
 
-1. **Card 1 ("Hardware"):** 
-   - Icon: `<Monitor />` from lucide-react. 
+1. **Card 1 ("Hardware"):**
+   - Icon: `<Monitor />` from lucide-react.
    - Delay: `0.1`
    - Description: "My entire desktop setup is built for power. It is silent, durable, and holds my focus."
    - Gradient: `linear-gradient(137deg, #FF3D77 0%, #FFB1CE 45%, #FF9D3C 100%)`
 
-2. **Card 2 ("Studio"):** 
-   - Icon: `<Palette />` from lucide-react. 
+2. **Card 2 ("Studio"):**
+   - Icon: `<Palette />` from lucide-react.
    - Delay: `0.2`
    - Description: "Studio is where I define every single pixel. It is the hub for each canvas I deliver."
    - Gradient: `linear-gradient(137deg, #FFFFFF 0%, #7DD3FC 45%, #06B6D4 100%)`
 
-3. **Card 3 ("Motion"):** 
-   - Icon: `<Zap />` from lucide-react. 
+3. **Card 3 ("Motion"):**
+   - Icon: `<Zap />` from lucide-react.
    - Delay: `0.3`
    - Description: "I use Motion to build lively prototypes, bridging the gap between views and code."
    - Gradient: `linear-gradient(137deg, #4361EE 0%, #E0AEFF 45%, #F72585 100%)`
@@ -9598,7 +9598,7 @@ Build a React functional component using Tailwind CSS, `motion/react` for animat
   - **Links Area**: Display 3 columns of links using flex. Layout: `Company` (Founding, Platform, Testify), `Mobile` (Get Apple App, Get Google App), `Contracts` (Private Data, User Consent). Section headers should be uppercase, tracking-widest, text-sm, bold. Link items should be gray-500, font-medium, and hover to `orange-600` with transition.
 - **Footer Content (Bottom Bar):**
   - Add a top border (`border-gray-100`) and use a solid white background (`bg-white`).
-  - Layout: flex, space between, aligning text to the left and social icons to the right. 
+  - Layout: flex, space between, aligning text to the left and social icons to the right.
   - Text: "© 2026 HAUL! All Rights Reserved" (text-sm, gray-500, medium).
   - **Social Icons**: Map through an array of icons imported from `lucide-react`: Facebook, Twitter, Instagram, Linkedin (w-5 h-5). Wrap them in `a` tags shaped as 40x40px circles with `border-gray-100`. On hover, they should turn `bg-orange-500` with white text and an `orange-500` border (transition all duration-300).
 
@@ -9855,7 +9855,7 @@ On top of the video (`z-10`), add a `max-w-7xl` container that holds an upper CT
 
 6. Footer Layout - Top Grid:
 - A 12-column grid (`grid-cols-1 md:grid-cols-12 gap-10 md:gap-12 mb-10`).
-- First column (md:col-span-5): 
+- First column (md:col-span-5):
   - An SVG Logo `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 256 256" fill="currentColor"><path d="M 4.688 136 C 68.373 136 120 187.627 120 251.312 C 120 252.883 119.967 254.445 119.905 256 L 0 256 L 0 136.096 C 1.555 136.034 3.117 136 4.688 136 Z M 251.312 136 C 252.883 136 254.445 136.034 256 136.096 L 256 256 L 136.095 256 C 136.032 254.438 136.001 252.875 136 251.312 C 136 187.627 187.627 136 251.312 136 Z M 119.905 0 C 119.967 1.555 120 3.117 120 4.688 C 120 68.373 68.373 120 4.687 120 C 3.117 120 1.555 119.967 0 119.905 L 0 0 Z M 256 119.905 C 254.445 119.967 252.883 120 251.312 120 C 187.627 120 136 68.373 136 4.687 C 136 3.117 136.033 1.555 136.095 0 L 256 0 Z" /></svg>` along with the text "LUMINA" (text-xl font-medium).
   - A description below it: "Lumina provides premium clarity on global events and cosmic wonders - shared with all for free." (`text-sm leading-relaxed max-w-sm`).
 
@@ -9876,7 +9876,7 @@ Make a 3-column grid containing these lists:
 - Preview: https://motionsites.ai/assets/footer-vize-poster-BRRRDP-A.png
 - Asset: https://code.mrday.one/design-assets/sites/visuals-by-id/vize-footer.png
 
-Build a highly polished, responsive Footer component for a React application using Vite, Tailwind CSS, `lucide-react` for icons, and `motion/react` for animations. 
+Build a highly polished, responsive Footer component for a React application using Vite, Tailwind CSS, `lucide-react` for icons, and `motion/react` for animations.
 
 The design relies on a premium "layered card" aesthetic, precise typography, and a massive background-blended text element utilizing advanced, handcrafted SVG filters.
 
@@ -10050,7 +10050,7 @@ Inside this main layout, add a background `<video>`:
 Overlay a scrollable foreground container (`z-10`, `flex-1`, `px-4`, `overflow-y-auto`). Inside this, add a max-width container (`max-w-5xl mx-auto w-full flex-1 flex flex-col min-h-full`). The page content should go at the top, and the Footer component should be pushed to the bottom using `mt-auto pb-8`.
 
 ### 3. The Reusable `FitnessButton` Component
-Create a `FitnessButton` component that uses `motion.button` from `motion/react`. 
+Create a `FitnessButton` component that uses `motion.button` from `motion/react`.
 - **Props**: `children`, `icon`, `variant` ('primary' or 'secondary'), `className`, `onClick`.
 - **Animations**: `whileHover={{ scale: 1.02, translateY: -1 }}` and `whileTap={{ scale: 0.98 }}`.
 - **Base Classes**: `px-[18px] py-[12px] rounded-lg flex items-center justify-center gap-[10px] text-base font-geist font-normal cursor-pointer transition-all duration-200`.
@@ -10068,7 +10068,7 @@ Inside the container, create a responsive CSS grid (`grid-cols-2 lg:grid-cols-[a
 Populate the grid with the following elements:
 - **Top Left (Icon)**: A `Dumbbell` icon from `lucide-react` (`text-black w-8 h-8`, `strokeWidth={2.5}`).
 - **Top Center (Heading)**: An `h2` with the text "Move, Heal, Bloom" (`text-2xl md:text-3xl font-medium tracking-tight text-black`).
-- **Middle Left (Buttons)**: A flex wrap container (`gap-3`) holding two of our `FitnessButton`s: "Join Today" (primary) and "View Clubs" (secondary). Both need their padding, gap, and text size overridden with `!py-2 !px-5 !gap-2 !text-xs`. 
+- **Middle Left (Buttons)**: A flex wrap container (`gap-3`) holding two of our `FitnessButton`s: "Join Today" (primary) and "View Clubs" (secondary). Both need their padding, gap, and text size overridden with `!py-2 !px-5 !gap-2 !text-xs`.
 - **Right Menus**: Two columns of text links aligned to the bottom (`sm:self-end flex flex-col gap-3`).
   - **Column 1 ("Insights")**: Links for 'Vitality Lab', 'Active Armor', 'Social Circles', and 'Get In Touch'.
   - **Column 2 ("Connect")**: Links for 'Meta Space', 'Pro Network', 'Vlog Stream', and 'Visual Feed'.
@@ -10585,7 +10585,7 @@ body {
 Build a single full-viewport React + TypeScript section (Vite, Tailwind available but styles written via a <style> block) that renders a fixed background video with a pricing-style glass card overlay. The video must play back and forth in a boomerang loop via throttled manual seeking (no native .play()).
 
 Video
-Source URL (exact): 
+Source URL (exact):
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260508_064209_0cb7d815-ff61-4caa-a6d5-bbff145ab272.mp4
 
 <video> attributes: muted, playsInline, crossOrigin="anonymous", preload="auto", src={VIDEO_SRC}, attached ref.
@@ -13465,21 +13465,21 @@ Please build a modern, two-column registration interface called "Aurora Sign Up"
 - Apply base styles to the `body`: `@apply font-sans bg-black text-white antialiased;`.
 
 ### 2. Main Layout (`App.tsx` container)
-- The `<main>` element should have: `flex min-h-screen w-full bg-black selection:bg-white/30 p-2 transition-all duration-500`. 
+- The `<main>` element should have: `flex min-h-screen w-full bg-black selection:bg-white/30 p-2 transition-all duration-500`.
 - On `lg` breakpoints: `lg:h-screen lg:overflow-hidden lg:p-4`.
 - Split this container into a Left Column (Hero) and a Right Column (Form).
 
 ### 3. Left Column (Hero & Background Video)
 - Width on large screens should be exactly `w-[52%]`. It should be hidden on mobile/tablet and only visible `lg:flex`.
 - Styles: `relative flex-col items-center justify-end pb-32 px-12 rounded-3xl overflow-hidden shadow-2xl h-full`.
-- **Background Video**: Add an absolutely positioned `<video>` tag (`inset-0`, `w-full`, `h-full`, `object-cover`). It must have `autoPlay`, `muted`, `loop`, and `playsInline`. 
+- **Background Video**: Add an absolutely positioned `<video>` tag (`inset-0`, `w-full`, `h-full`, `object-cover`). It must have `autoPlay`, `muted`, `loop`, and `playsInline`.
 - **CRITICAL**: The `<source>` MUST be exactly `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260506_081238_406ed0e3-5d83-436e-a512-0bbff7ec5b95.mp4` (`type="video/mp4"`).
 - **CRITICAL**: Do NOT add any dark overlay, gradient, or tint mask over the video. Let it play purely without overlays.
 - **Hero Content Container**: Place content over the video (`z-10 w-full max-w-xs space-y-8`).
 - **Animations**: Use `motion.div` for a staggered reveal. The container should transition `opacity: 0` to `1` with `staggerChildren: 0.15` and `delayChildren: 0.2`. Every child element inside should fade in and slide up (`y: 10` to `y: 0`, duration `0.5`).
 - **Brand/Logo**: A flex row with the `Circle` icon from Lucide (fill-white text-white) and the text "Aurora" (`text-xl font-semibold tracking-tight`).
 - **Heading Block**: "Join Aurora" (`text-4xl font-medium tracking-tight whitespace-nowrap`). Below it, a description: "Follow these 3 quick phases to activate your space." (`text-white/60 text-sm leading-relaxed px-4`).
-- **Steps**: Render a custom `<StepItem>` component three times. 
+- **Steps**: Render a custom `<StepItem>` component three times.
   1: "Register your identity" (active state)
   2: "Configure your studio"
   3: "Finalize your profile"
@@ -13490,7 +13490,7 @@ Please build a modern, two-column registration interface called "Aurora Sign Up"
 - **Header**: "Create New Profile" (`text-3xl font-medium tracking-tight`). Subtitle: "Input your basic details to begin the journey." (`text-white/40 text-sm`).
 - **Social Buttons**: A 2-column grid (`grid grid-cols-2 gap-4`). Render Google (`Chrome` icon) and Github (`Github` icon) using a `<SocialButton>` component.
 - **Divider**: A horizontal line (`border-white/10`) with the text "Or" in the center (`bg-black px-4 text-xs font-medium text-white/40 uppercase tracking-widest`).
-- **Form Layout**: 
+- **Form Layout**:
   - First Name and Last Name in a 2-column grid.
   - Email (full width).
   - Password (full width) with a custom `lucide-react` `Eye` toggle icon in the absolute right of the input, and a tiny helper text "Requires at least 8 symbols."
@@ -14020,7 +14020,7 @@ Please write the complete React component (src/App.tsx) and the accompanying CSS
 
 Social media post #2 (on the right)
 
-Please build a React application with Tailwind CSS that recreates a cinematic 600x800px social media post component with VHS and RGB glitch effects. 
+Please build a React application with Tailwind CSS that recreates a cinematic 600x800px social media post component with VHS and RGB glitch effects.
 
 Please use the exact code below for the two main files to recreate my layout perfectly.
 
@@ -14132,7 +14132,7 @@ File 1: src/index.css
 }
 
 .rgb-text-glitch {
-  text-shadow: 
+  text-shadow:
     1px 0 0 rgba(255, 0, 0, 0.5),
     -1px 0 0 rgba(0, 255, 255, 0.5);
   animation: rgb-flicker 3s infinite;
@@ -14161,19 +14161,19 @@ export default function App() {
           className="absolute inset-0 w-full h-full object-cover z-0 opacity-100"
           src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260505_105838_084968f2-4415-42a4-971a-3bec54539549.mp4"
         />
-        
+
         {/* VHS Overlay Elements (On top of everything) */}
         <div className="vhs-scanlines"></div>
         <div className="vhs-noise"></div>
         <div className="vhs-glitch-bar"></div>
-        
+
         {/* Content Area - Middle of the frame */}
         <div className="relative z-10 flex-1 flex flex-col items-center justify-center text-center px-6 -mt-[358px]">
-          
+
           <h1 className="font-serif text-[64px] leading-[0.95] tracking-[-2.46px] max-w-xl text-white animate-fade-rise rgb-text-glitch">
             Focus in a<br/>Distracted World
           </h1>
-          
+
           <p className="font-sans text-[17px] text-white/95 mt-8 leading-relaxed max-w-[480px] animate-fade-rise-delay rgb-text-glitch">
             We're designing tools for deep thinkers, bold creators, and quiet rebels. Amid the chaos, we build digital spaces for sharp focus and inspired work.
           </p>
@@ -14213,7 +14213,7 @@ Please build a React + Tailwind CSS web application that recreates a specific 3:
 
 3. **Background Media**:
    - Add an absolutely positioned, full-cover `<video>` tag behind all content (z-0 index, opacity-100).
-   - Use `autoPlay loop muted playsInline`. 
+   - Use `autoPlay loop muted playsInline`.
    - The source URL must be exactly: `https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260505_105838_084968f2-4415-42a4-971a-3bec54539549.mp4`
 
 4. **VHS & RGB Glitch Layers (CSS required)**:

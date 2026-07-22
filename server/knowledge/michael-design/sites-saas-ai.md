@@ -2542,7 +2542,7 @@ Create a React + TypeScript component named HeroSection in src/components/HeroSe
 Layout & Background:
 
 A <section> that is 100vh tall, position: relative, overflow: hidden, flex column centered, with background: #000.
-A fullscreen HLS video background using this Mux stream URL: 
+A fullscreen HLS video background using this Mux stream URL:
 https://stream.mux.com/tLkHO1qZoaaQOUeVWo8hEBeGQfySP02EPS02BmnNFyXys.m3u8
 
 The video is <video autoPlay loop muted playsInline> with classes absolute inset-0 w-full h-full object-cover and zIndex: 0. Play it through hls.js: if Hls.isSupported(), create an Hls({ autoStartLoad: true }) instance, loadSource, attachMedia, and play on MANIFEST_PARSED. Else, fall back to native application/vnd.apple.mpegurl support. Clean up the Hls instance on unmount. No overlay over the video — full opacity.
@@ -2568,10 +2568,10 @@ VideoIcon component:
 Outer <span> with classes inline-block align-middle rounded-full overflow-hidden, sized via inline style width/height: clamp(48px, 10vw, ${size}px) (default size=72, but the hero passes size={110} for both icons), flexShrink: 0.
 Inner <video autoPlay loop muted playsInline> with width: 100%, height: 100%, objectFit: cover, display: block. Call videoRef.current.play().catch(() => {}) in a useEffect.
 Two CloudFront MP4 sources:
-VIDEO_HUMAN: 
+VIDEO_HUMAN:
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260424_090051_64ea5059-da6b-492b-a171-aa7ecc767dc3.mp4
 
-VIDEO_AI: 
+VIDEO_AI:
 https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260424_093237_ff0ddc63-c068-4e29-96da-fdd0e40af133.mp4
 
 Subheading (<p>):
@@ -3781,7 +3781,7 @@ calculatePrice():
     design: base=399, perPage=100
     development: base=199, perPage=100
     both: base=499, perPage=200
-  
+
   total = max(base, base + (pages - 1) * perPage)
   if needContent: total += pages * 50
   if needSEO: total += pages * 50

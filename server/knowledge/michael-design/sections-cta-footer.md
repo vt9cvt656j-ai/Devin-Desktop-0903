@@ -1007,10 +1007,10 @@ hover:bg-[#0D212C] transition-colors duration-200
 After the centered content block, render the trail images list (still inside the card, not behind `z-10`):
 ```jsx
 {trailImages.map((img) => (
-  
 
 
-    
+
+
 
 
 ))}
@@ -1697,7 +1697,7 @@ No images, no frameworks, no 3D libraries. The entire cube is pure CSS `transfor
 > - `min-w` and `min-h` ensure buttons don't collapse too small on tiny screens.
 >
 > Each button contains one icon from `lucide-react`, in this order top to bottom:
-> 1. `<Mail />` 
+> 1. `<Mail />`
 > 2. `<Twitter />`
 > 3. `<Github />`
 >
@@ -2185,7 +2185,7 @@ Build a React functional component using Tailwind CSS, `motion/react` for animat
   - **Links Area**: Display 3 columns of links using flex. Layout: `Company` (Founding, Platform, Testify), `Mobile` (Get Apple App, Get Google App), `Contracts` (Private Data, User Consent). Section headers should be uppercase, tracking-widest, text-sm, bold. Link items should be gray-500, font-medium, and hover to `orange-600` with transition.
 - **Footer Content (Bottom Bar):**
   - Add a top border (`border-gray-100`) and use a solid white background (`bg-white`).
-  - Layout: flex, space between, aligning text to the left and social icons to the right. 
+  - Layout: flex, space between, aligning text to the left and social icons to the right.
   - Text: "© 2026 HAUL! All Rights Reserved" (text-sm, gray-500, medium).
   - **Social Icons**: Map through an array of icons imported from `lucide-react`: Facebook, Twitter, Instagram, Linkedin (w-5 h-5). Wrap them in `a` tags shaped as 40x40px circles with `border-gray-100`. On hover, they should turn `bg-orange-500` with white text and an `orange-500` border (transition all duration-300).
 
@@ -2440,7 +2440,7 @@ On top of the video (`z-10`), add a `max-w-7xl` container that holds an upper CT
 
 6. Footer Layout - Top Grid:
 - A 12-column grid (`grid-cols-1 md:grid-cols-12 gap-10 md:gap-12 mb-10`).
-- First column (md:col-span-5): 
+- First column (md:col-span-5):
   - An SVG Logo `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 256 256" fill="currentColor"><path d="M 4.688 136 C 68.373 136 120 187.627 120 251.312 C 120 252.883 119.967 254.445 119.905 256 L 0 256 L 0 136.096 C 1.555 136.034 3.117 136 4.688 136 Z M 251.312 136 C 252.883 136 254.445 136.034 256 136.096 L 256 256 L 136.095 256 C 136.032 254.438 136.001 252.875 136 251.312 C 136 187.627 187.627 136 251.312 136 Z M 119.905 0 C 119.967 1.555 120 3.117 120 4.688 C 120 68.373 68.373 120 4.687 120 C 3.117 120 1.555 119.967 0 119.905 L 0 0 Z M 256 119.905 C 254.445 119.967 252.883 120 251.312 120 C 187.627 120 136 68.373 136 4.687 C 136 3.117 136.033 1.555 136.095 0 L 256 0 Z" /></svg>` along with the text "LUMINA" (text-xl font-medium).
   - A description below it: "Lumina provides premium clarity on global events and cosmic wonders - shared with all for free." (`text-sm leading-relaxed max-w-sm`).
 
@@ -2460,7 +2460,7 @@ Make a 3-column grid containing these lists:
 
 - Asset: https://code.mrday.one/design-assets/sections/visuals-by-id/vize-footer.png
 
-Build a highly polished, responsive Footer component for a React application using Vite, Tailwind CSS, `lucide-react` for icons, and `motion/react` for animations. 
+Build a highly polished, responsive Footer component for a React application using Vite, Tailwind CSS, `lucide-react` for icons, and `motion/react` for animations.
 
 The design relies on a premium "layered card" aesthetic, precise typography, and a massive background-blended text element utilizing advanced, handcrafted SVG filters.
 
@@ -2633,7 +2633,7 @@ Inside this main layout, add a background `<video>`:
 Overlay a scrollable foreground container (`z-10`, `flex-1`, `px-4`, `overflow-y-auto`). Inside this, add a max-width container (`max-w-5xl mx-auto w-full flex-1 flex flex-col min-h-full`). The page content should go at the top, and the Footer component should be pushed to the bottom using `mt-auto pb-8`.
 
 ### 3. The Reusable `FitnessButton` Component
-Create a `FitnessButton` component that uses `motion.button` from `motion/react`. 
+Create a `FitnessButton` component that uses `motion.button` from `motion/react`.
 - **Props**: `children`, `icon`, `variant` ('primary' or 'secondary'), `className`, `onClick`.
 - **Animations**: `whileHover={{ scale: 1.02, translateY: -1 }}` and `whileTap={{ scale: 0.98 }}`.
 - **Base Classes**: `px-[18px] py-[12px] rounded-lg flex items-center justify-center gap-[10px] text-base font-geist font-normal cursor-pointer transition-all duration-200`.
@@ -2651,7 +2651,7 @@ Inside the container, create a responsive CSS grid (`grid-cols-2 lg:grid-cols-[a
 Populate the grid with the following elements:
 - **Top Left (Icon)**: A `Dumbbell` icon from `lucide-react` (`text-black w-8 h-8`, `strokeWidth={2.5}`).
 - **Top Center (Heading)**: An `h2` with the text "Move, Heal, Bloom" (`text-2xl md:text-3xl font-medium tracking-tight text-black`).
-- **Middle Left (Buttons)**: A flex wrap container (`gap-3`) holding two of our `FitnessButton`s: "Join Today" (primary) and "View Clubs" (secondary). Both need their padding, gap, and text size overridden with `!py-2 !px-5 !gap-2 !text-xs`. 
+- **Middle Left (Buttons)**: A flex wrap container (`gap-3`) holding two of our `FitnessButton`s: "Join Today" (primary) and "View Clubs" (secondary). Both need their padding, gap, and text size overridden with `!py-2 !px-5 !gap-2 !text-xs`.
 - **Right Menus**: Two columns of text links aligned to the bottom (`sm:self-end flex flex-col gap-3`).
   - **Column 1 ("Insights")**: Links for 'Vitality Lab', 'Active Armor', 'Social Circles', and 'Get In Touch'.
   - **Column 2 ("Connect")**: Links for 'Meta Space', 'Pro Network', 'Vlog Stream', and 'Visual Feed'.
