@@ -81,7 +81,7 @@ const LANG_ICON = {
   json: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#8A8F98"/><text x="8" y="11.5" text-anchor="middle" font-family="var(--mono,monospace)" font-size="8" font-weight="700" fill="#fff">{}</text>`,
   xml: _badge("#F60", "XML", "#fff", 5),
   yaml: _badge("#CB171E", "Y", "#fff", 8),
-  ini: _badge("#6E7781", "⚙", "#fff", 8),
+  ini: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#6E7781"/><circle cx="8" cy="8" r="4" fill="none" stroke="#fff" stroke-width="1.3" stroke-dasharray="1.6 1.4"/><circle cx="8" cy="8" r="1.6" fill="#fff"/>`,
   markdown: `<rect x="1" y="3" width="14" height="10" rx="2" fill="none" stroke="#57606A" stroke-width="1.3"/><path d="M3.5 10.5v-5l2 2.2 2-2.2v5M11.5 5.5v3.4m0 0L10 7.5m1.5 1.4L13 7.5" fill="none" stroke="#57606A" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>`,
   shell: `<rect x="1" y="2" width="14" height="12" rx="2.5" fill="#2B3137"/><path d="M4 6l2.2 2L4 10" fill="none" stroke="#4AF626" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 10.5h4" stroke="#4AF626" stroke-width="1.4" stroke-linecap="round"/>`,
   sql: `<ellipse cx="8" cy="3.8" rx="5.5" ry="2.3" fill="#336791"/><path d="M2.5 3.8v8.4c0 1.3 2.5 2.3 5.5 2.3s5.5-1 5.5-2.3V3.8c0 1.3-2.5 2.3-5.5 2.3s-5.5-1-5.5-2.3z" fill="#336791" opacity=".75"/>`,
