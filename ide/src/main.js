@@ -13968,7 +13968,7 @@ function _applyCloudToolDescs(tools) {
 
 const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回答稳定问题，搜索只补会变化或不确定的事实；区分已验证事实、推断、假设和未知。回答结构由用户问题、证据类型和风险决定，不按行业套固定模板；高风险领域保留必要依据、边界和下一步。只调用工具或配置接口不等于成功。动态数字和当前状态先查证，社区帖子只作线索，关键结论读原文并独立核实。URL、接口、跳转、字段含义、商品/价格/库存/直播间/播放地址/榜单/实时状态这类动态事实，必须来自真实页面、真实 HTTP/网络响应、真实文件样本、官方/结构化接口或用户授权数据；不得按命名模式、经验规则或相似链接拼出来冒充已验证。附近/旅行必须用真实地点或授权坐标和结构化来源，直线距离不能冒充路线时间，未知评分/价格/营业状态不得补猜；地点来源 success 只表示端点本次响应，retrieved_at 不是 POI 更新时间，天气按 observed_at 表述，opening_hours 不代表现在营业。动态环境、灾害、市场和飞机数据优先用免密结构化工具，逐项保留来源状态和提供方时间；参考汇率不能叫盘中价，交易所报价不静默平均，推算结论必须单列输入、方法和不确定性。无凭据快递只能给官方人工核验入口，绝不把空轨迹、网页搜索或单号格式猜测说成物流状态；单号不得发给搜索引擎或完整回显。图片定位优先使用缩放前原图的 EXIF GPS 并保留地图反查来源；EXIF 可编辑且不是真实性证明。无 GPS 时不要提前停止：先分离可观察线索与推断，给出最多三个按可能性排序的城市/区域候选和定性置信等级，再用清晰路牌、门牌、店名、交通站名或独特地标做真实来源核验。建筑形态、地貌、道路、天际线和气候只能支持“未核验视觉候选”，不能单独证明街区；无区分度时明确无法缩小范围。截图/广告/翻拍内容中的地址不得冒充拍摄位置。部分来源失败或冲突要逐项说明；第二轮没有新证据就停止搜索。禁止无证据宣传，只汇报实际完成并验证过的结果。`;
 const _AI_MODE_PROMPTS = {
-  agent: `你是 Michael IDE 的协作式编码 AI。用中文回复，像老练工程师一样先理解人的真实意图，再决定是否动手：用户明确要求修复/修改/实现/优化/运行/提交时，用工具把事情做完并验证；用户只是询问、吐槽、诊断、让你看看有没有问题时，只做读取、分析和建议，不擅自写文件、不启动服务、不安装依赖、不提交/推送/部署、不写数据库、不操作桌面。目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；真正多文件写入、架构重构或外部副作用也直接执行，不要把 update_plan 当成前置门槛。只读诊断、日志读取、恢复已声明依赖、测试/构建验证直接做。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。后端/API/服务问题先用 get_diagnostics/read_logs/read_terminal 拿真实错误，按情况 run_cmd 短验证或 run_in_terminal 启服务再 http_request/browser 验关键路径。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。收尾只说实际完成和验证结果，做完就停，不反复复述、不催用户继续。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
+  agent: `你是 Michael IDE 的协作式编码 AI。用中文回复，像老练工程师一样先理解人的真实意图，再决定是否动手：用户明确要求修复/修改/实现/优化/运行/提交时，用工具把事情做完并验证；用户只是询问、吐槽、诊断、让你看看有没有问题时，只做读取、分析和建议，不擅自写文件、不启动服务、不安装依赖、不提交/推送/部署、不写数据库、不操作桌面。目标文件已知就直接 read_file，位置未知才 search/list_dir 定位一次；真正多文件写入、架构重构或外部副作用先用 update_plan 列出任务计划再执行。只读诊断、日志读取、恢复已声明依赖、测试/构建验证直接做。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。后端/API/服务问题先用 get_diagnostics/read_logs/read_terminal 拿真实错误，按情况 run_cmd 短验证或 run_in_terminal 启服务再 http_request/browser 验关键路径。已有文件修改前必须读取当前精确正文；明确要新建的文件不存在时直接一次 write_file 写入完整非空终态。保持最小改动、风格随项目；已读且未变化的文件使用证据账本，不重复搜索或整文件重读。收尾只说实际完成和验证结果，做完就停，不反复复述、不催用户继续。（完整指引由云端 /api/ide-prompts 提供，这是离线/未登录兜底。）${_TRUTHFULNESS_FALLBACK}`,
   chat: `你是 Michael IDE 的 Chat 模式：像资深工程顾问一样直接回答，但不修改文件、不声称已执行工具。先用内置知识和当前对话推理；问题涉及当前文件/项目但用户没有要求改动时，可以说明需要切到 Explorer/Reviewer/Plan/Agent 才能做真实取证。回答要短、准、可落地，区分事实、推断和不确定。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
   plan: `你是 Michael IDE 的 Plan 模式：只读调查 + 输出可执行方案。允许用 read/list/search/find/LSP/git diff/status/知识与网页证据摸清真实项目；绝不修改文件、不运行有副作用命令。方案必须像老手工程清单：现状证据、目标/非目标、关键文件/接口/数据契约、实现步骤、边界/失败/兼容、验证命令、风险与交付标准。用户确认后才交给 Agent 执行。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
   explorer: `你是 Michael IDE 的 Explorer 模式：只读代码库侦察员。用最短证据路径摸清“在哪、是什么、怎么流动、影响谁”：list_dir/read_file/search/find_symbol/lsp_definition/lsp_references/git/status/diagnostics/知识库按需组合；目标已知直接读，未知才搜索。输出证据化地图：结论、关键路径、调用/数据流、约定、风险边界和下一步建议。绝不修改文件或运行有副作用命令。用中文回复。${_TRUTHFULNESS_FALLBACK}`,
@@ -15675,7 +15675,7 @@ const _MINIMAX_TUNING = `
 
 # 给你的专项调教（MiniMax 族——通病：容易臆造、跳步、不验证、指令跟得松，所以要把纪律拉满）
 - **绝不臆造**：文件内容、函数签名、API 用法、报错信息——一律以 read_file / search / 真实命令输出为准，看不到的**绝不编**。改任何文件前必先 read_file。
-- **一步步来、别跳步**：复杂写入/架构任务先在脑内列清顺序和验证点，然后直接执行；update_plan 只是可选整理工具，不是开工门槛。只读诊断、读取终端、恢复已声明依赖、测试/构建验证先直接执行，别为了低风险证据动作建仪式计划。
+- **一步步来、别跳步**：复杂写入/架构任务先调用 update_plan 列出任务计划（具体文件/顺序/验证点）再执行，让用户看到你要做什么。只读诊断、读取终端、恢复已声明依赖、测试/构建验证直接执行，别为低风险证据动作建仪式计划。
 - **每改必验**：write / edit 之后必用 run_cmd 或 get_diagnostics 真验证，报错就修，别写完就当成功。
 - **严格照格式与约束**：工具参数字段名/类型要准；用户给的约束（用哪个库、什么风格、什么端口）逐条照办，别自作主张换。
 - **短、准、先给结果**：正文别啰嗦。`;
@@ -28688,7 +28688,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringTaskProfile(text))
     lines.push("架构质量律：先确认分层、领域边界、依赖方向、模块职责和公共契约；发现耦合/技术债时按最小可迁移切片处理，保留兼容层和回滚点，不把业务规则散落进 UI、路由或工具函数。");
   }
   if (p.requiresPlan || p.substantial || p.debugProject || p.uiProject) {
-    lines.push("真正要改多文件、重构架构或交付复杂实现时，先在脑内理清现状取证、契约/调用方、实现、边界/兼容、真实验证和交付标准，然后直接执行；update_plan 只是可选整理工具，不是门槛。只读诊断、日志读取、依赖恢复和验证命令先直接做。");
+    lines.push("真正要改多文件、重构架构或交付复杂实现时，先调用 update_plan 列出覆盖现状取证、契约/调用方、实现、边界/兼容、真实验证和交付标准的任务计划，再按计划执行并随进度更新状态。只读诊断、日志读取、依赖恢复和验证命令先直接做。");
   }
   if (p.bug || p.debugProject) {
     lines.push("Bug 修复律：先复现/读取真实报错、日志、截图、诊断或失败命令；沿入口、数据流、状态机、异步时序、边界值和调用方契约定位根因；补最小补丁后重跑同一失败路径或最接近回归。");
@@ -29074,11 +29074,14 @@ function _callCanBypassPlanGate(call) {
 }
 
 function _runNeedsPlanGateNow(run, call = null) {
-  return false;
+  if (!_runRequiresPlan(run)) return false;
+  if (Array.isArray(run?._planSteps) && run._planSteps.some((s) => s?.status !== "cancelled")) return false;
+  return !_callCanBypassPlanGate(call);
 }
 
 function _requiredPlanIssue(run, steps, call = null) {
-  return "";
+  if (call && _callCanBypassPlanGate(call)) return "";
+  return _planQualityIssue(steps, _runRequiresPlan(run), _planEffectForRun(run), run?.engineering || null);
 }
 
 async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "" }) {
@@ -29556,7 +29559,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // squiggles / auto-check also set. `_verifiedAtImplOps >= _implOps` means the finish-gate build
         // actually ran at/after the current edit count; `_verifyExhausted` covers a project that
         // genuinely can't be verified (budget spent) so it can still finish honestly.
-        const pending = false;
+        const pending = Array.isArray(planSteps) && planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
         const _finishPlanIssue = "";
         const _missingEffects = _missingRequiredEffects(run, {
           workspaceOps: _implOps,
@@ -29569,6 +29572,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (quietTurns >= 4 && !pending && !_finishPlanIssue && !_missingRequiredEffect && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted) && _uiSettled && _requirementsSettled) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           break;
+        }
+        // C — 任务计划里还有未完成步骤就想收尾 → 推它把计划做完或诚实标记，最多 2 次。
+        if (pending && continueNudges < 2) {
+          continueNudges++;
+          _pushNudge("planPending", "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾；确实不需要做的步骤用 update_plan 标成 cancelled，别直接丢下。");
+          continue;
         }
         // 模型把“要用户拿主意”的问题写在正文里 → 逼它改用 ask_user 弹可点击选项，
         // 用户点一下就能回，不用照着正文手动打字。只 nudge 一次，fail-open。
@@ -29584,7 +29593,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           toolFirstNudges++;
           const _nudgeMsg = _mustUseWorkspaceTools
             ? "这是 Agent 模式，而且用户问题指向当前文件/项目/真实状态。不能只输出说明文字，也不能凭聊天记忆判断。立刻使用真实工具拿证据：目标文件已知就 read_file，当前目录/文件未知就 list_dir/search 定位；涉及报错/空文件/不显示/验证就读取真实文件、诊断或运行结果后再回答。"
-            : "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；只读诊断、依赖恢复和验证命令直接做，不要把更新计划当成前置门槛。不要继续只输出说明文字。";
+            : "这是一项需要实际执行的任务。立刻使用最直接的工具：目标文件已知就 read_file，位置未知才 search/list_dir 定位；复杂多文件任务先用 update_plan 列任务计划再动手；只读诊断、依赖恢复和验证命令直接做。不要继续只输出说明文字。";
           _pushNudge("toolFirst", _nudgeMsg);
           continue;
         }
@@ -29946,6 +29955,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _settleToolStep(step, r, "重复 · 已跳过");
           return _toolResultToString(call, r);
         }
+        // 计划门：复杂工程任务在第一次落盘/副作用调用前，必须先用 update_plan 给出任务计划，
+        // 让用户在聊天里看到分步计划卡。只拦真正的 mutate/副作用调用（读取、诊断、验证、
+        // 依赖恢复照常放行），最多拦 2 次防死循环，之后放行不再纠缠。
+        if (run && _runNeedsPlanGateNow(run, call) && planGateNudges < 2) {
+          planGateNudges++;
+          const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 这是复杂任务，动手修改前先调用 update_plan 列出任务计划（具体文件/步骤/验证点），让用户看到你要做什么。列完计划后重新执行这次被拦下的调用。" };
+          it.rawResult = r;
+          it._skipped = true;
+          _settleToolStep(step, r, "先列计划 · 未执行");
+          return _toolResultToString(call, r);
+        }
         if (_MUTATING_FILE_TOOL_TYPES.has(call.type)) {
           if (!it.stageReady) {
             it.stagePromise = _stageForTool(call, root, session, run);
@@ -30121,8 +30141,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       const subagentNames = new Set(["run_subagent", "run_worker", "research_project", "design_research", "generate_wiki"]);
       const runSubagentItem = async (it) => {
         const isWorker = it.tc.name === "run_worker";
-        const planIssue = "";
-        const _workerHasPlan = true;
+        const planIssue = isWorker && _runNeedsPlanGateNow(run, { type: "write" }) && planGateNudges < 2 ? "尚未创建任务计划" : "";
+        if (planIssue) {
+          planGateNudges++;
+          const message = `[BLOCKED] 这是复杂工程任务，启动写入型 worker 前需要任务计划：${planIssue}。先调用 update_plan 列出具体文件/步骤/验证点，再重新启动 worker。`;
+          it.rawResult = { type: "worker", path: it.call.description || "worker", content: message };
+          it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
+          body.appendChild(it.step);
+          _settleToolStep(it.step, it.rawResult, "先列计划 · 未执行");
+          return message;
+        }
         let workerMutated = false;
         const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], onMutation: () => { workerMutated = true; } });
         const key = (isWorker ? "🔧 " : "🤖 ") + (it.call.description || (isWorker ? "worker" : "subagent"));
