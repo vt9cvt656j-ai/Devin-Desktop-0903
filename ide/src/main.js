@@ -16934,9 +16934,9 @@ function _commandRiskKind(command) {
   return "";
 }
 function _commandRiskLabel(kind) {
+  // 只有真正危险的命令才显示警示标签；改工作区/大范围扫描是 Agent 的日常操作，
+  // 满屏黄标只会制造噪音，不展示。
   if (kind === "danger") return "高风险命令";
-  if (kind === "broad-scan") return "大范围扫描";
-  if (kind === "workspace-write") return "会改工作区";
   return "";
 }
 
@@ -16946,7 +16946,7 @@ async function _agentRunInTerminal(root, command, stepEl) {
   if (cmd === "cd" || cmd === "cd ~" || cmd === "cd /") return { code: 0, stdout: "", stderr: "" };
   const riskKind = _commandRiskKind(cmd);
   const riskLabel = _commandRiskLabel(riskKind);
-  if (riskKind && stepEl) {
+  if (riskLabel && stepEl) {
     stepEl.classList.add("agent-term-card--risk");
     const status = stepEl.querySelector(".agent-term-status");
     if (status) {
@@ -16986,8 +16986,8 @@ async function _agentRunInTerminal(root, command, stepEl) {
   }
 
   if (statusEl) {
-    statusEl.className = `agent-term-status ${riskKind ? "agent-term-status--risk" : "agent-term-status--running"}`;
-    statusEl.innerHTML = riskKind
+    statusEl.className = `agent-term-status ${riskLabel ? "agent-term-status--risk" : "agent-term-status--running"}`;
+    statusEl.innerHTML = riskLabel
       ? `<span class="agent-term-spinner"></span> ⚠ ${_escHtml(riskLabel)} · Running`
       : `<span class="agent-term-spinner"></span> Running`;
   }
@@ -28709,6 +28709,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringTaskProfile(text))
   }
   if (p.ui || p.uiProject) {
     lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用项目现有组件优先，新增界面优先 shadcn/ui + Radix 语义组件，Tailwind palette/theme token 统一配色；构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
+    lines.push("参考站扒取律：做网站且有参考对象（用户给了网址/照着某站做/调研选出的同类站）时，默认后台 capture_start+capture_flows 抓接口数据、browser eval 读 DOM 结构、browser design 抓配色/字体/间距/CSS 变量，把结构内容和样式扒下来存成本地 reference 文件，要用哪块直接搬或照着写；扒来的配色落成自己项目的语义 token（theme.extend/CSS 变量/shadcn 变量），绝不篡改 shadcn/ui 组件源码和 Tailwind 本体配置。");
   }
   if (p.websiteDelivery) {
     lines.push("网站生产交付律：网站不是只摆好看页面；必须覆盖真实内容/文案/素材、路由/404/SEO metadata、表单提交/API 错误、加载/空/失败状态、性能基础、无障碍、桌面+手机浏览器验收和主要转化路径。");
@@ -35225,7 +35226,7 @@ async function _executeToolStep(step, call, root, run) {
         `<div class="agent-term-card__header">` +
           `<svg class="agent-term-card__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4l3 4-3 4M8.5 12H13"/></svg>` +
           `<span class="agent-term-card__label">Terminal</span>` +
-          `${commandRisk ? `<span class="agent-term-risk">⚠ ${_escHtml(commandRiskLabel)}</span>` : ""}` +
+          `${commandRiskLabel ? `<span class="agent-term-risk">⚠ ${_escHtml(commandRiskLabel)}</span>` : ""}` +
           `<span class="agent-term-timer"></span>` +
           `<div class="agent-term-status agent-term-status--running"><span class="agent-term-spinner"></span> Running</div>` +
         `</div>` +
