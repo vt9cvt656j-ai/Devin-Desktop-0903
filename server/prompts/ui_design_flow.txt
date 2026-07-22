@@ -2,7 +2,7 @@
 
 用户让你**设计 / 做界面 / 页面 / 产品 UI / 官网**时看这份，配合 `shadcn_design_system`（真实令牌+组件目录+接线）和 `css_concrete_tokens`（令牌契约）一起用。**最高原则：先想清楚做成什么样、定一套语义令牌体系、一次搭对——不是一边写一边疯狂截图试错，更不是先出三张 AI mockup 让人挑。**
 
-**michael-design 蓝本优先但必须会用脑：系统提示若注入了「michael-design 设计蓝本」块，本篇及配套设计体系退居兜底；写代码前先在思考里列出【已采用的 michael-design 来源】（主蓝本、候选蓝本、还需补检索的区块关键词），完整页面必须继续 `knowledge_search(domain="michael-design")` 检索 hero/features/pricing/cta/footer/mobile/dashboard 等缺失区块。用蓝本确定视觉密度、区块骨架、导航/hero 构图、精确颜色值、字号间距、动效库与时长曲线（接进 shadcn/ui 语义令牌 + Tailwind），绝不翻译回通用 AI 落地页结构。但不要机械照搬不匹配的行业文案、品牌名或业务对象，只把视觉工艺和结构水准迁移到用户真实产品。检索 2-4 次足够后马上综合执行，不许无限搜。**
+**michael-design 蓝本优先但必须会用脑：系统提示若注入了「michael-design 设计蓝本」块，本篇及配套设计体系退居兜底；写代码前先在思考里列出【已采用的 michael-design 来源】（主蓝本、候选蓝本、还需补检索的区块关键词），完整页面必须继续 `knowledge_search(domain="michael-design")` 检索当前品类、缺失区块和 `Asset Preview visuals-by-id gif mp4 webp hero media` 等素材关键词。用蓝本确定视觉密度、区块骨架、导航/hero 构图、精确颜色值、字号间距、动效库与时长曲线（接进 shadcn/ui 语义令牌 + Tailwind），并提取蓝本里的 `Asset:`、`Preview:`、视频/GIF/图片 URL、`<video>`、`<img>`、`backgroundImage` 等真实素材放进页面。完整网站至少使用一个来自 michael-design 的真实媒体资产，优先放在 hero 或重要叙事区；同屏不要留灰盒占位。绝不翻译回通用 AI 落地页结构，也不要机械照搬不匹配的行业文案、品牌名或业务对象，只把视觉工艺和结构水准迁移到用户真实产品。检索 2-4 次足够后马上综合执行，不许无限搜。**
 
 **铁律·体系永远在场：写任何网站/页面——不管 React/Vue/Svelte/纯 HTML、不管落地页/官网/工具页/引导页/单文件 demo——设计一律基于 shadcn/ui 语义组件体系 + Tailwind 调色板与 OKLCH 语义令牌。颜色只允许来自语义令牌或 Tailwind 色阶（zinc/slate/blue/emerald…的具体档位），圆角/阴影/间距/字阶全部走令牌；绝不允许随手 hex、随手内联样式、"这次页面小就不用体系了"。框架不支持 shadcn 官方包时按下面第 3 条的映射方案把体系搬过去，而不是放弃体系。**
 
@@ -13,6 +13,8 @@
 
 ## 设计体系优先：读懂产品 → 定令牌 → 组合 primitive → 真机验证
 1. **读懂真实产品（只读真实存在的，绝不猜）**：先 list_dir 一次看目录**真实内容**——**read 只允许用于列目录结果里出现过的路径**，绝不凭习惯猜 package.json / README.md 去读（猜的路径必然 cannot stat，纯浪费步骤），也**绝不跑出当前工作区**去别的目录翻资料。**空目录 / 全新项目 = 没有事实可读，一次 list 确认为空后立即停止一切探索**，直接凭用户描述 + 你的专业判断进入第 2 步定令牌开干；产品事实（名字/卖点/调性）从用户的话里来，不够就在开干后用界面文案自然呈现或一次 ask_user 问关键取舍。目录**有**真实源码/文案时才去读，读完要说得出这个产品 3 条具体、别处不通用的事实（真功能名/真卖点/真品牌调性），抓住产品**自己的**视觉调性。
+   - **先定信息架构，别套模板**：根据品类重排页面结构，不要默认 hero/features/pricing/footer。SaaS 写工作流、集成、安全、用例、定价/FAQ；餐厅/场馆写菜单、空间、预订、活动、评价；作品集/机构写项目、过程、团队、成果；电商/市场写分类、商品、筛选、信任、售后；教育/内容站写课程/栏目、作者、资源、社区；音乐/视频/游戏站写媒体库、预告、玩法/曲目、活动。用户没给足品类时，从产品目标推断最贴近的一类直接搭。
+   - **内容密度是交付标准**：完整首页至少 7 个有区分度的内容区块，局部页面也要把本页核心信息写满。导航、hero、证明点、功能细节、流程、案例/样例、对比或数据、FAQ、footer 链接都写具体文案；禁止只有一句口号、三张卡片、几个空泛卖点。
 2. **定设计令牌体系（这是核心设计动作，取代"猜风格")**：按 `shadcn_design_system` 那套——① 选 base 中性灰阶定冷暖气质；② 定 `--primary` + `--radius` + 标题字体（这三样承担品牌辨识度的 90%，别默认 Inter）；③ 语义色微调并保 WCAG AA。一次改这几个语义令牌，全站自动统一。**颜色一律走语义名，业务里绝不散落 `bg-[#xxxxxx]` / `text-gray-500`。**
    - **已有明确品牌 / 用户已说要什么样** → 直接把它落成一套令牌开干。
    - **需要用户在几个明显不同方向里拍板** → 做 2-3 套**只有 primary/radius/字体不同**的令牌，用 preview_choices 实时渲染让他选（真组件真配色，能动能看）。**别用 generate_image 出三张 mockup 图让人猜**——那是最后不得已、用户明确要"先看张效果图"时才用的可选项，不是定调性的默认方法。
@@ -27,6 +29,6 @@
    从零整站必然是多文件任务：**动手写之前先 update_plan 列清楚要建哪些文件、每步做什么、怎么验证，再按计划写**——别跳过计划直接怼文件被工程门拦住又反复重试。按当前官方文档 `shadcn init` + 按需 `add` 页面真用到的组件，禁止全量安装。**有 Button/Input/Card 等 primitive 就组合它们，不另造平行基础组件**；导航/hero/内容区块/图表组合按信息架构写清晰业务组件。新文件第一次 write 就给完整可运行内容，绝不先写空骨架/TODO。
 4. **验证 = 真实 dev server 上完成关键交互，但有硬上限**：起服务 → **首次** browser navigate(fresh=true) 打开实际 URL，**之后同一 dev server 的所有导航/刷新一律不带 fresh**（反复 fresh 会把浏览器关了又开：窗口闪烁、冷启动几秒、丢页面状态，纯属折磨；只有换站点/登录态污染/开始抓包才重新 fresh）→ browser check 处理控制台/网络/溢出错误 → 用 click/type/press 跑关键流程再对具体 selector/文本 assert。**移动端按项目实际判断，不做仪式**：面向公众的网站/官网/落地页/H5 必须 1440×900 与 390×844 两个视口各验一轮；明确桌面场景（内部后台、桌面工具、用户点名只要桌面版）只验桌面并在收尾说明理由。截图只做视觉自检，不替代 check/assert。**裸 HTML/样式未生效 = 前端没完成**：check 报 no-styles-applied、或截图里是默认衬线字体/无布局纯文本流，绝不允许把这一步打勾、绝不允许"后端可用，前端显示问题后续优化"这种话术收尾——界面就是交付物本体，当场修（Tailwind v4 三件套：vite.config 加 @tailwindcss/vite → CSS 入口 @import "tailwindcss" → main 入口 import 该 CSS；改完重启 dev server 再 check）。**复验上限**：完整双视口矩阵一个任务只做一遍（首次交付前）；修补后只对受影响 selector/视口做最多一次针对性 check/assert/screenshot。若第二次观察没有新增错误，立刻停止并汇总，禁止为了“再看看”重复 browser/screenshot。
 5. **动效有工艺不生硬**：动画一律优先成熟库（React 用 `motion`/framer-motion 的 whileHover/whileInView/spring/stagger，Vue 用 @vueuse/motion，纯 HTML 用 Motion One / tailwindcss-animate 预设），自写只允许几行的 transform/opacity transition；微交互 150-250ms ease-out、入场 400-600ms 轻位移+透明度、列表 stagger 逐项，禁 linear、禁旋转弹跳、禁长 keyframes，尊重 prefers-reduced-motion——生硬的手糊 keyframes 一眼假。
-6. **反 AI 味**：多区块有密度层次与节奏（特性网格 / 数据指标 / 案例 / 对比 / FAQ / footer），非对称有呼吸的版式；主色克制只用在 primary 动作/选中/链接；圆角/阴影/图标全套统一；标题展示体 + 正文中性无衬线、数字 tabular-nums；图标用 lucide 等真实库、绝不 emoji；文案写这个产品**具体的**卖点/场景，别"赋能/一站式/高效"空话。
+6. **反 AI 味**：多区块有密度层次与节奏（品类栏目 / 媒体展示 / 工作流 / 数据指标 / 案例 / 对比 / FAQ / footer），每个站点的信息架构都随业务变化，而不是同一套 hero/features/pricing/footer；非对称有呼吸的版式；主色克制只用在 primary 动作/选中/链接；圆角/阴影/图标全套统一；标题展示体 + 正文中性无衬线、数字 tabular-nums；图标用 lucide 等真实库、绝不 emoji；文案写这个产品**具体的**卖点/场景，别"赋能/一站式/高效"空话；有 michael-design 视频/GIF/图片可用时必须用真实素材丰富页面。
 
 一句话：**判断力度 → 读懂真产品 → 定一套语义令牌体系（base+primary+radius+字体）→ 用官方 primitive 组合 → 真机验证后停。** 生成图 + design_board 只在「用户明确要先看几个方向的效果图再拍板」时作可选方向选择器，绝不代替真实令牌体系，绝不是每次机械摆一遍。

@@ -1,6 +1,6 @@
 # shadcn/ui + Tailwind v4 设计体系（真源；照这套设计，别靠生成图猜风格、别靠用户随口一句拍脑袋）
 
-做界面的默认方法是「从一套真实的语义令牌体系出发」，不是先出三张 mockup 让人挑、也不是把用户随口说的形容词直译成一堆硬编码颜色。**先有体系，再有像素。** 已有项目永远先跟随它自己的设计系统（见 css_concrete_tokens）；下面这套用于新项目，或用户明确要按 shadcn/现代体系做时。以 `package.json`、锁文件与当前官方文档为准，不硬记 CLI/主版本号。系统若注入 michael-design 蓝本，先把蓝本里的结构、密度、尺寸、动效和材质迁移到这套 token/primitive 体系里，再实现。
+做界面的默认方法是「从一套真实的语义令牌体系出发」，不是先出三张 mockup 让人挑、也不是把用户随口说的形容词直译成一堆硬编码颜色。**先有体系，再有像素。** 已有项目永远先跟随它自己的设计系统（见 css_concrete_tokens）；下面这套用于新项目，或用户明确要按 shadcn/现代体系做时。以 `package.json`、锁文件与当前官方文档为准，不硬记 CLI/主版本号。系统若注入 michael-design 蓝本，先把蓝本里的结构、密度、尺寸、动效、真实媒体素材和材质迁移到这套 token/primitive 体系里，再实现。
 
 ## ① 语义令牌是唯一真源（这就是"真正的设计"——不是配一堆散色）
 一切颜色都走语义名，深浅主题用同一组名切不同值。默认基线（shadcn 中性主题，OKLCH；这是**起点**，不是终点）：
@@ -77,7 +77,7 @@ shadcn/ui 提供这些（按需 `npx shadcn@latest add <name>`，只加页面真
 - 导航：navigation-menu, menubar, dropdown-menu, context-menu, breadcrumb, pagination, tabs, sidebar, command
 - 浮层反馈：dialog, drawer, sheet, popover, hover-card, tooltip, sonner(toast), progress, spinner
 - 布局容器：accordion, collapsible, scroll-area, resizable
-Button 有 variant(default/secondary/outline/ghost/link/destructive) + size(sm/default/lg/icon)；Card 用 Card/CardHeader/CardTitle/CardDescription/CardContent/CardFooter 结构。**有 primitive 就组合它，不另造 Button/Input/Card**；但 shadcn/ui 不是“所有东西都套 Card”的装饰库。Card 只用于真实卡片/面板/重复项；hero、全宽 section、沉浸式背景、营销叙事区、产品展示和动画层按 michael-design 的区块结构写业务组件，再把 Button/Tabs/Dialog/Tooltip 等交互 primitive 嵌进去。Tailwind 负责布局、状态和 token 映射，不负责替代设计判断。
+Button 有 variant(default/secondary/outline/ghost/link/destructive) + size(sm/default/lg/icon)；Card 用 Card/CardHeader/CardTitle/CardDescription/CardContent/CardFooter 结构。**有 primitive 就组合它，不另造 Button/Input/Card**；但 shadcn/ui 不是“所有东西都套 Card”的装饰库。Card 只用于真实卡片/面板/重复项；hero、全宽 section、沉浸式背景、营销叙事区、产品展示和动画层按 michael-design 的区块结构写业务组件，再把 Button/Tabs/Dialog/Tooltip 等交互 primitive 嵌进去。Tailwind 负责布局、状态和 token 映射，不负责替代设计判断。完整网站的信息架构必须按业务品类变化，不要把所有站都做成 hero/features/pricing/footer；michael-design 的 `Asset:`/`Preview:`/视频/GIF/图片 URL 要进入真实媒体组件。
 
 ## ④ 接线（Vite + React + TS + Tailwind v4；Vue 用 shadcn-vue，别混 React 版）
 - 装：`npm i tailwindcss @tailwindcss/vite`；`vite.config.ts` 加 `tailwindcss()` 插件 + `resolve.alias { "@": path.resolve(__dirname,"./src") }`；`tsconfig` 配 `paths { "@/*": ["./src/*"] }`。
@@ -87,7 +87,7 @@ Button 有 variant(default/secondary/outline/ghost/link/destructive) + size(sm/d
 - **dark mode**：`.dark` 类挂在 `document.documentElement`，用 ThemeProvider(context + localStorage 存 light/dark/system，system 读 `matchMedia('(prefers-color-scheme: dark)')`) 切换；深浅共用同一组语义令牌，组件不写 `dark:` 硬色。
 
 ## ⑤ 反 AI 味 + 真实验证（好看且扛得住）
-- 版式有密度层次与节奏（不是均匀堆卡片）；主色克制只用在 primary 动作/选中/链接；间距走 4/8 网格；圆角/阴影/图标全套统一；标题展示体 + 正文中性无衬线，数字 tabular-nums。
+- 版式有密度层次与节奏（不是均匀堆卡片）；完整网站至少 7 个有区分度的内容区块，导航/功能细节/案例/样例/FAQ/footer 都有具体文案；主色克制只用在 primary 动作/选中/链接；间距走 4/8 网格；圆角/阴影/图标全套统一；标题展示体 + 正文中性无衬线，数字 tabular-nums。
 - 图标用 lucide-react（shadcn 生态默认），绝不用 emoji。状态做全：hover/focus-visible/active/disabled/loading/空/错误/选中。
 - 真机验证：起 dev server → `browser navigate fresh=true` → 在 1440×900 和 390×844 两个视口 `browser check` 处理控制台/网络/溢出错误 → 用 click/type/press 跑关键流程再对具体 selector/文本 `assert`。截图只做视觉自检，不替代 check/assert。完整矩阵一个任务只跑一次；修补后只针对改动点复验一次，观察无新增信息就停止。
 

@@ -329,11 +329,21 @@ const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 4200;
 const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 14_000;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
-    "premium landing page hero website motion animation polished visual design";
+    "premium website rich content information architecture media asset gif mp4 webp motion";
+const DESIGN_KNOWLEDGE_ASSET_QUERIES: &[&str] = &[
+    "Asset Preview visuals-by-id gif mp4 webp m3u8 hero media motion",
+    "video gif image gallery media showcase background hero asset",
+];
 const DESIGN_KNOWLEDGE_SECTION_QUERIES: &[&str] = &[
+    "Asset Preview visuals-by-id gif mp4 webp landing hero section",
+    "gallery media showcase image video product story section",
     "hero landing page cinematic website visual system",
     "features cards section polished interaction motion",
     "pricing cta footer conversion landing page",
+    "case studies testimonials faq resources editorial content density",
+    "restaurant menu venue booking gallery website information architecture",
+    "marketplace ecommerce product catalog listings checkout website",
+    "education course curriculum lesson resource community website",
     "mobile responsive app ui dashboard component",
     "portfolio agency showcase premium animation",
 ];
@@ -1171,14 +1181,16 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
 
     Some(format!(
         "--- michael-design 设计蓝本（按用户请求自动检索，精炼注入）---\n\
-         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，不是装饰性参考。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充区块和气质。执行规则：\n\
+         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，不是装饰性参考。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充区块和气质；同时必须提取并使用蓝本里的视频/GIF/图片 URL（如 `Asset:`、`Preview:`、`Video URL:`、`<video>`、`<img>`、`backgroundImage`、`.mp4/.gif/.webp/.m3u8`、`visuals-by-id`）。执行规则：\n\
          1. 写代码前必须在思考里列出“已采用的 michael-design 来源”：主蓝本、候选蓝本、还要补检索的区块关键词；没有这一步就不能开始写 UI。\n\
-         2. 完整页面/重设计必须先调用 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，优先查 `hero/features/pricing/cta/footer`、`features cards`、`mobile app`、`dashboard`、`portfolio`、`dark animation`；每次检索都要带具体区块或风格词，最多 2-4 次，命中后马上综合，不许无限搜。\n\
-         3. 先把用户口语需求升格成成品规格：目标用户、页面结构、主视觉、区块顺序、交互动效、真实文案、资源使用和验收点都要明确，不能按一句话糊通用页面。\n\
-         4. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
-         5. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
-         6. 与 `shadcn_design_system`/Tailwind 令牌结合：shadcn/ui 是 Button/Input/Dialog/Tabs 等交互 primitive，不是把所有区块套 Card；Tailwind 是语义 token 和布局工具，不是散写一屏硬编码 class。蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。\n\
-         7. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵；修补后只对改动点做最多一次针对性复验。证据覆盖后必须停止，不许为了“再看看”重复 browser/screenshot。\n\n{}",
+         2. 完整页面/重设计必须先调用 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，优先查 `Asset Preview visuals-by-id gif mp4 webp hero media`、`gallery media showcase image video`、以及当前品类的栏目词；每次检索都要带具体区块或风格词，最多 2-4 次，命中后马上综合，不许无限搜。\n\
+         3. 按品类重构信息架构，不要默认 hero/features/pricing/footer：SaaS 要有工作流、集成、权限、安全、案例、定价/FAQ；餐厅/场馆要有菜单、空间、预订、活动、评价；作品集/机构要有项目、过程、团队、成果；电商/市场要有分类、商品、筛选、信任、售后；教育/内容站要有课程/栏目、作者、资源、社区；音乐/视频/游戏站要有媒体库、预告、玩法/曲目、活动。用户没有指定品类时，先从需求推断最贴近的一类再搭结构。\n\
+         4. 内容密度必须像真实网站：导航、hero、证明点、具体功能/栏目、流程、案例/样例、对比或数据、FAQ、footer 链接都要有真实可读文案；禁止只有口号、三张卡片和空泛“高效/智能/一站式”。完整首页至少 7 个有区分度的内容区块，局部页面也要把本页核心信息写满。\n\
+         5. 至少使用一个真实媒体资产：如果 adopted 蓝本里有 `Asset:`/`Preview:`/视频/GIF/图片 URL，必须把最匹配的一个放进 hero 或重要区块，另用 2 个以上图片/GIF/视频/头像/缩略图丰富内容；若选择 `.m3u8`，要用 hls.js 或换成同蓝本更稳的 `.mp4/.gif/.webp`。浏览器/network 发现 404、跨域或无法播放时，立刻换另一个 michael-design 资产，不用灰盒占位。\n\
+         6. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
+         7. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
+         8. 与 `shadcn_design_system`/Tailwind 令牌结合：shadcn/ui 是 Button/Input/Dialog/Tabs 等交互 primitive，不是把所有区块套 Card；Tailwind 是语义 token 和布局工具，不是散写一屏硬编码 class。蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。\n\
+         9. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵；修补后只对改动点做最多一次针对性复验。证据覆盖后必须停止，不许为了“再看看”重复 browser/screenshot。\n\n{}",
         sections.join("\n\n———\n\n")
     ))
 }
@@ -1187,6 +1199,7 @@ fn design_hits_for_request(query: &str) -> Vec<crate::knowledge::SearchHit> {
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
     push_design_hits_for_query(query, &mut seen, &mut hits);
+    ensure_design_media_hit(&mut seen, &mut hits);
     for supplemental in DESIGN_KNOWLEDGE_SECTION_QUERIES {
         if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
             break;
@@ -1200,6 +1213,7 @@ fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
     push_design_hits_for_query(query, &mut seen, &mut hits);
+    ensure_design_media_hit(&mut seen, &mut hits);
     hits
 }
 
@@ -1208,16 +1222,28 @@ fn push_design_hits_for_query(
     seen: &mut HashSet<String>,
     hits: &mut Vec<crate::knowledge::SearchHit>,
 ) {
+    push_design_hits_for_query_matching(query, seen, hits, |_| true);
+}
+
+fn push_design_hits_for_query_matching(
+    query: &str,
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+    accept: impl Fn(&crate::knowledge::SearchHit) -> bool,
+) {
     for hit in crate::knowledge::search_with_cap(
         query,
         Some(DESIGN_KNOWLEDGE_DOMAIN),
         DESIGN_KNOWLEDGE_SEARCH_POOL,
         DESIGN_KNOWLEDGE_SECTION_CHARS,
     ) {
-        if hit.domain != DESIGN_KNOWLEDGE_DOMAIN || hit.score < DESIGN_KNOWLEDGE_MIN_SCORE {
+        if hit.domain != DESIGN_KNOWLEDGE_DOMAIN
+            || hit.score < DESIGN_KNOWLEDGE_MIN_SCORE
+            || !accept(&hit)
+        {
             continue;
         }
-        let key = format!("{}#{}", hit.topic, hit.section.to_lowercase());
+        let key = design_hit_key(&hit);
         if seen.insert(key) {
             hits.push(hit);
         }
@@ -1225,6 +1251,71 @@ fn push_design_hits_for_query(
             break;
         }
     }
+}
+
+fn ensure_design_media_hit(
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+) {
+    if hits.iter().any(design_hit_has_media_reference) {
+        return;
+    }
+    for query in DESIGN_KNOWLEDGE_ASSET_QUERIES {
+        if let Some(hit) = find_design_media_hit(query, seen) {
+            if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+                hits.pop();
+            }
+            seen.insert(design_hit_key(&hit));
+            hits.push(hit);
+            return;
+        }
+    }
+}
+
+fn find_design_media_hit(
+    query: &str,
+    seen: &HashSet<String>,
+) -> Option<crate::knowledge::SearchHit> {
+    crate::knowledge::search_with_cap(
+        query,
+        Some(DESIGN_KNOWLEDGE_DOMAIN),
+        DESIGN_KNOWLEDGE_SEARCH_POOL,
+        DESIGN_KNOWLEDGE_SECTION_CHARS,
+    )
+    .into_iter()
+    .find(|hit| {
+        hit.domain == DESIGN_KNOWLEDGE_DOMAIN
+            && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE
+            && !seen.contains(&design_hit_key(hit))
+            && design_hit_has_media_reference(hit)
+    })
+}
+
+fn design_hit_key(hit: &crate::knowledge::SearchHit) -> String {
+    format!("{}#{}", hit.topic, hit.section.to_lowercase())
+}
+
+fn design_hit_has_media_reference(hit: &crate::knowledge::SearchHit) -> bool {
+    let text = hit.text.to_lowercase();
+    [
+        "asset:",
+        "preview:",
+        "visuals-by-id",
+        "<video",
+        "<img",
+        "backgroundimage",
+        "video url",
+        ".mp4",
+        ".webm",
+        ".gif",
+        ".webp",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".m3u8",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 /// Decide whether the user's real request needs the UI specialization. Keep generic engineering
@@ -1264,6 +1355,9 @@ fn looks_like_ui_task(q: &str) -> bool {
         "homepage",
         "styling",
         "stylesheet",
+        "media asset",
+        "image asset",
+        "video background",
     ];
     // CJK terms (matched against the raw query)
     const CJK_KW: &[&str] = &[
@@ -1314,6 +1408,8 @@ fn looks_like_ui_task(q: &str) -> bool {
         "视觉",
         "视觉稿",
         "交互动效",
+        "内容密度",
+        "信息架构",
     ];
     let contextual_component = q.contains("组件")
         && [
@@ -1335,12 +1431,44 @@ fn looks_like_ui_task(q: &str) -> bool {
         "好看",
         "漂亮",
         "美观",
+        "内容少",
+        "内容太少",
+        "内容不够",
+        "不够多",
+        "结构一样",
+        "结构都一样",
+        "千篇一律",
+        "模板味",
+        "没用图片",
+        "没用视频",
+        "没用gif",
+        "没用素材",
+        "没用知识库",
     ]
     .iter()
     .any(|term| q.contains(term))
         && [
-            "ui", "前端", "网页", "网站", "页面", "界面", "样式", "布局", "视觉", "设计",
-            "tailwind", "shadcn",
+            "ui",
+            "前端",
+            "网页",
+            "网站",
+            "官网",
+            "页面",
+            "界面",
+            "样式",
+            "布局",
+            "视觉",
+            "设计",
+            "内容",
+            "结构",
+            "图片",
+            "视频",
+            "gif",
+            "素材",
+            "知识库",
+            "michael-design",
+            "tailwind",
+            "shadcn",
         ]
         .iter()
         .any(|context| l.contains(context) || q.contains(context));
@@ -3944,6 +4072,11 @@ mod tests {
             "这个页面写得丑死了，shadcn 和 Tailwind 都没用好"
         ));
         assert!(looks_like_ui_task("官网视觉太廉价，重做得更高级一点"));
+        assert!(looks_like_ui_task("网站内容太少，结构都一样，没用图片视频"));
+        assert!(looks_like_ui_task("官网不用知识库素材，页面结构千篇一律"));
+        assert!(looks_like_ui_task(
+            "landing page 没有 media asset 和 video background"
+        ));
         assert!(!looks_like_ui_task("修复 Rust 服务组件的并发锁错误"));
     }
 
@@ -3970,6 +4103,12 @@ mod tests {
         assert!(system.contains("浏览器验证有上限"));
         assert!(system.contains("完整矩阵一个任务只跑一次"));
         assert!(system.contains("先吃 michael-design，再看外部参考"));
+        assert!(system.contains("提取并使用蓝本里的视频/GIF/图片 URL"));
+        assert!(system.contains("Asset Preview visuals-by-id gif mp4 webp hero media"));
+        assert!(system.contains("按品类重构信息架构"));
+        assert!(system.contains("不要默认 hero/features/pricing/footer"));
+        assert!(system.contains("内容密度必须像真实网站"));
+        assert!(system.contains("至少使用一个真实媒体资产"));
 
         let start = system.find("--- michael-design 设计蓝本").unwrap();
         let tail = &system[start..];
@@ -3986,6 +4125,19 @@ mod tests {
         assert!(
             design_block.matches("【").count() <= DESIGN_KNOWLEDGE_MAX_HITS,
             "design block should include a bounded number of hits"
+        );
+        let injected_hits_text = design_block
+            .find('【')
+            .map(|index| &design_block[index..])
+            .unwrap_or_default();
+        assert!(
+            injected_hits_text.contains("Asset:")
+                || injected_hits_text.contains("Preview:")
+                || injected_hits_text.contains("visuals-by-id")
+                || injected_hits_text.contains(".mp4")
+                || injected_hits_text.contains(".gif")
+                || injected_hits_text.contains(".webp"),
+            "design block should include at least one usable michael-design media reference"
         );
     }
 
@@ -4005,7 +4157,8 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("hero/features/pricing/cta/footer"));
+        assert!(system.contains("Asset Preview visuals-by-id gif mp4 webp hero media"));
+        assert!(system.contains("不要默认 hero/features/pricing/footer"));
     }
 
     #[test]
