@@ -22,10 +22,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 fn normalize_driver(d: &str) -> String {
     match d {
         "mariadb" | "tidb" | "oceanbase" | "doris" | "starrocks" => "mysql".into(),
-        "postgresql" | "cockroach" | "cockroachdb" | "timescale" | "timescaledb"
-        | "supabase" | "neon" | "redshift" | "greenplum" | "yugabyte" | "opengauss" => {
-            "postgres".into()
-        }
+        "postgresql" | "cockroach" | "cockroachdb" | "timescale" | "timescaledb" | "supabase"
+        | "neon" | "redshift" | "greenplum" | "yugabyte" | "opengauss" => "postgres".into(),
         "valkey" | "keydb" | "dragonfly" | "kvrocks" | "garnet" => "redis".into(),
         "mssql" | "sqlserver" | "azuresql" | "sql-server" => "mssql".into(),
         "mongo" | "mongodb" | "documentdb" | "ferretdb" | "cosmosdb" => "mongodb".into(),
@@ -71,7 +69,9 @@ pub async fn db_query(
 // ---- SQL Server (tiberius) ----
 
 fn mssql_config_from_url(url: &str) -> Result<tiberius::Config, String> {
-    let u = url::Url::parse(url).map_err(|e| format!("mssql 连接串无效: {e}（格式 mssql://user:pass@host:1433/database）"))?;
+    let u = url::Url::parse(url).map_err(|e| {
+        format!("mssql 连接串无效: {e}（格式 mssql://user:pass@host:1433/database）")
+    })?;
     let mut cfg = tiberius::Config::new();
     cfg.host(u.host_str().unwrap_or("127.0.0.1"));
     cfg.port(u.port().unwrap_or(1433));
@@ -86,7 +86,9 @@ fn mssql_config_from_url(url: &str) -> Result<tiberius::Config, String> {
     }
     // 默认信任证书（自签证书的内网 SQL Server 是常态）；?encrypt=off 可关加密。
     cfg.trust_cert();
-    if u.query_pairs().any(|(k, v)| k == "encrypt" && (v == "off" || v == "false")) {
+    if u.query_pairs()
+        .any(|(k, v)| k == "encrypt" && (v == "off" || v == "false"))
+    {
         cfg.encryption(tiberius::EncryptionLevel::NotSupported);
     }
     Ok(cfg)
@@ -144,12 +146,16 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
         .map_err(|_| "连接超时（10s）".to_string())?
         .map_err(|e| format!("连接失败: {e}"))?;
     tcp.set_nodelay(true).ok();
-    let mut client = tokio::time::timeout(CONNECT_TIMEOUT, tiberius::Client::connect(cfg, tcp.compat_write()))
-        .await
-        .map_err(|_| "连接超时（10s）".to_string())?
-        .map_err(|e| format!("连接失败: {e}"))?;
+    let mut client = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tiberius::Client::connect(cfg, tcp.compat_write()),
+    )
+    .await
+    .map_err(|_| "连接超时（10s）".to_string())?
+    .map_err(|e| format!("连接失败: {e}"))?;
     let head = q.trim_start().to_lowercase();
-    let is_read = head.starts_with("select") || head.starts_with("with") || head.starts_with("exec sp_help");
+    let is_read =
+        head.starts_with("select") || head.starts_with("with") || head.starts_with("exec sp_help");
     let ms = started.elapsed().as_millis() as u64;
     let _ = ms;
     if is_read {
@@ -186,7 +192,11 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
             .map_err(|_| "执行超时（20s）".to_string())?
             .map_err(|e| format!("执行出错: {e}"))?;
         let n: u64 = res.rows_affected().iter().sum();
-        Ok(affected_json("mssql", n, started.elapsed().as_millis() as u64))
+        Ok(affected_json(
+            "mssql",
+            n,
+            started.elapsed().as_millis() as u64,
+        ))
     }
 }
 
@@ -194,13 +204,11 @@ async fn mssql_query(url: &str, q: &str, cap: usize) -> Result<serde_json::Value
 
 async fn mongo_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
-    let mut opts = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        mongodb::options::ClientOptions::parse(url),
-    )
-    .await
-    .map_err(|_| "mongodb 连接超时（10s）".to_string())?
-    .map_err(|e| format!("mongodb 连接串无效: {e}"))?;
+    let mut opts =
+        tokio::time::timeout(CONNECT_TIMEOUT, mongodb::options::ClientOptions::parse(url))
+            .await
+            .map_err(|_| "mongodb 连接超时（10s）".to_string())?
+            .map_err(|e| format!("mongodb 连接串无效: {e}"))?;
     opts.connect_timeout = Some(CONNECT_TIMEOUT);
     opts.server_selection_timeout = Some(CONNECT_TIMEOUT);
     let client =
@@ -217,7 +225,9 @@ async fn mongo_query(url: &str, q: &str) -> Result<serde_json::Value, String> {
         .map_err(|_| "mongodb 命令超时（20s）".to_string())?
         .map_err(|e| format!("mongodb 出错: {e}"))?;
     let result = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
-    Ok(json!({ "driver": "mongodb", "result": result, "elapsed_ms": started.elapsed().as_millis() as u64 }))
+    Ok(
+        json!({ "driver": "mongodb", "result": result, "elapsed_ms": started.elapsed().as_millis() as u64 }),
+    )
 }
 
 // ---- ClickHouse（HTTP 接口，无额外驱动依赖）----
@@ -228,7 +238,11 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
     let mut u = url::Url::parse(url).map_err(|e| format!("clickhouse 连接串无效: {e}"))?;
     if u.scheme() == "clickhouse" || u.scheme() == "ch" {
         let https = u.port() == Some(8443) || u.port() == Some(443);
-        let mut s = format!("{}://{}", if https { "https" } else { "http" }, u.host_str().unwrap_or("127.0.0.1"));
+        let mut s = format!(
+            "{}://{}",
+            if https { "https" } else { "http" },
+            u.host_str().unwrap_or("127.0.0.1")
+        );
         if let Some(p) = u.port() {
             s.push_str(&format!(":{p}"));
         } else {
@@ -251,8 +265,12 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
     u.set_username("").ok();
     u.set_password(None).ok();
     let head = q.trim_start().to_lowercase();
-    let is_read = head.starts_with("select") || head.starts_with("show") || head.starts_with("with")
-        || head.starts_with("describe") || head.starts_with("desc ") || head.starts_with("exists")
+    let is_read = head.starts_with("select")
+        || head.starts_with("show")
+        || head.starts_with("with")
+        || head.starts_with("describe")
+        || head.starts_with("desc ")
+        || head.starts_with("exists")
         || head.starts_with("explain");
     let body = if is_read && !head.contains(" format ") {
         format!("{} FORMAT JSON", q.trim_end_matches(';').trim_end())
@@ -268,18 +286,32 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
     if !user.is_empty() {
         req = req.basic_auth(&user, pass.as_deref());
     }
-    let resp = req.send().await.map_err(|e| format!("clickhouse 请求失败: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("clickhouse 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("clickhouse 响应读取失败: {e}"))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("clickhouse 响应读取失败: {e}"))?;
     if !status.is_success() {
-        return Err(format!("clickhouse 出错（HTTP {}）: {}", status.as_u16(), text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "clickhouse 出错（HTTP {}）: {}",
+            status.as_u16(),
+            text.chars().take(500).collect::<String>()
+        ));
     }
     if is_read {
-        let parsed: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("clickhouse JSON 解析失败: {e}"))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("clickhouse JSON 解析失败: {e}"))?;
         let columns: Vec<String> = parsed["meta"]
             .as_array()
-            .map(|a| a.iter().map(|m| m["name"].as_str().unwrap_or("").to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|m| m["name"].as_str().unwrap_or("").to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let data = parsed["data"].as_array().cloned().unwrap_or_default();
         let total = data.len();
@@ -297,7 +329,9 @@ async fn clickhouse_query(url: &str, q: &str, cap: usize) -> Result<serde_json::
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
     } else {
-        Ok(json!({ "driver": "clickhouse", "ok": true, "result": text.trim(), "elapsed_ms": started.elapsed().as_millis() as u64 }))
+        Ok(
+            json!({ "driver": "clickhouse", "ok": true, "result": text.trim(), "elapsed_ms": started.elapsed().as_millis() as u64 }),
+        )
     }
 }
 
@@ -330,7 +364,12 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
         }
     };
     let path = if path.is_empty() { "/" } else { path };
-    let full = format!("{}{}{}", base, if path.starts_with('/') { "" } else { "/" }, path);
+    let full = format!(
+        "{}{}{}",
+        base,
+        if path.starts_with('/') { "" } else { "/" },
+        path
+    );
     let mut u = url::Url::parse(&full).map_err(|e| format!("elasticsearch 地址无效: {e}"))?;
     let user = u.username().to_string();
     let pass = u.password().map(|x| x.to_string());
@@ -352,16 +391,30 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
         req = req.basic_auth(&user, pass.as_deref());
     }
     if !body.is_empty() {
-        req = req.header("content-type", "application/json").body(body.to_string());
+        req = req
+            .header("content-type", "application/json")
+            .body(body.to_string());
     }
-    let resp = req.send().await.map_err(|e| format!("elasticsearch 请求失败: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("elasticsearch 请求失败: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("elasticsearch 响应读取失败: {e}"))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("elasticsearch 响应读取失败: {e}"))?;
     let result: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!(text.trim()));
     if !status.is_success() {
-        return Err(format!("elasticsearch 出错（HTTP {}）: {}", status.as_u16(), text.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "elasticsearch 出错（HTTP {}）: {}",
+            status.as_u16(),
+            text.chars().take(500).collect::<String>()
+        ));
     }
-    Ok(json!({ "driver": "elastic", "result": result, "elapsed_ms": started.elapsed().as_millis() as u64 }))
+    Ok(
+        json!({ "driver": "elastic", "result": result, "elapsed_ms": started.elapsed().as_millis() as u64 }),
+    )
 }
 
 async fn sql_query(
