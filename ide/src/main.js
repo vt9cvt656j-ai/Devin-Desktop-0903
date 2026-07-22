@@ -21234,6 +21234,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
     { type: "function", function: { name: "run_worker", description: "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。只适合 scope 可清楚切开的多文件任务；worker 必须真实读取、真实改 scope 内文件，并用短命令/诊断验证自己的部分，返回改动文件、证据、验证结果和风险。", parameters: { type: "object", properties: { description: { type: "string", description: "这块子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给 worker 的完整、自包含的任务说明（它看不到当前对话）：要实现什么、改哪些文件、接口 / 约定是什么、需要跑什么短验证命令。" }, scope: { type: "array", items: { type: "string" }, description: "这个 worker 可修改的文件 / 目录列表（相对工作区根，如 [\"src/api/\", \"src/types.ts\"]）。scope 必须互不重叠。" } }, required: ["description", "prompt", "scope"] } } },
     { type: "function", function: { name: "worktree", description: "**best-of-N 隔离**：建/列/删 git 工作树，让 2-3 个候选方案在各自独立工作树里并行实现、互不踩主代码（撤销=删工作树）。难/不确定的任务想「出多个候选选最优」时用——文献证明这是提升正确率最有效的一招。", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add=建一个新工作树(返回绝对路径) / list=列出 / remove=删一个(=丢弃该候选)" }, name: { type: "string", description: "add 时：候选名（短 slug，如 cand-a）" }, path: { type: "string", description: "remove 时：要删的工作树绝对路径" } }, required: ["action"] } } },
+    { type: "function", function: { name: "recall_conversation", description: "检索**本会话早期被压缩掉的对话原文**（归档记忆）。上下文摘要里提到但细节不详的早期决定/需求/报错，用它按关键词找回原话，别凭摘要猜。", parameters: { type: "object", properties: { query: { type: "string", description: "检索关键词（中英文均可，如文件名、需求原话片段、报错关键字）" }, max_results: { type: "integer", description: "最多返回几条，默认 6" } }, required: ["query"] } } },
     { type: "function", function: { name: "remember", description: "把一条值得**跨会话长期记住**的知识写进记忆知识图谱（自动打标签 + 自动关联旧笔记 + 按任务相关性召回 + 自动清理垃圾——放心多记，图谱会帮你筛）。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一条原子知识（一个概念、简洁、自包含）" }, scope: { type: "string", enum: ["project", "global"], description: "project=只关当前项目（默认）；global=跨所有项目的用户级知识（偏好/身份/通用经验）" } }, required: ["content"] } } },
     { type: "function", function: { name: "get_diagnostics", description: "读取编辑器/LSP 对文件的实时诊断（错误与警告），返回文件:行列、source/code、附近代码、可能原因和修复方向。改完代码用它快速自检；不传 path 则返回所有已打开文件的诊断。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要检查的文件路径；省略则查所有已打开文件" } } } } },
     { type: "function", function: { name: "read_logs", description: "读取最新终端输出或日志文件尾部。用于后端/API/构建失败时直接看错误原因；这是只读证据工具，不会启动新命令。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，要读取的日志文件路径" }, paths: { type: "array", description: "可选，多个日志文件路径", items: { type: "string" } }, name: { type: "string", description: "可选，run_in_terminal 启动的任务名" }, lines: { type: "integer", description: "尾部行数，默认 200" }, include_terminal: { type: "boolean", description: "是否同时附带任务终端输出，默认 true" } } } } },
@@ -21589,7 +21590,7 @@ function _searchToolsLookup(query, registry, loadedNames) {
 const _KNOWN_TOOLS = new Set([
   "read_file", "list_dir", "search", "find_files", "web_fetch", "web_search", "edit_file",
   "multi_edit", "write_file", "run_cmd", "update_plan", "run_subagent", "run_worker", "debate",
-  "remember", "get_diagnostics", "delete_path", "move_path", "copy_path", "create_dir",
+  "remember", "recall_conversation", "get_diagnostics", "delete_path", "move_path", "copy_path", "create_dir",
   "format_file", "git_status", "git_diff", "git_log", "git_commit", "git_branch", "git_push", "git_clone",
   "git_pull", "git_blame", "git_stash", "git_stash_pop", "git_stash_list", "git_conflicts",
   "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply",
@@ -21639,6 +21640,7 @@ const _TOOL_ALIASES = {
   downloadfile: "download_file", download: "download_file", wget: "download_file", fetch_file: "download_file", save_url: "download_file",
   formatfile: "format_file", format: "format_file", prettier: "format_file", format_code: "format_file",
   rememberthis: "remember", memorize: "remember", save_memory: "remember", note: "remember", remember_note: "remember", add_memory: "remember",
+  recall: "recall_conversation", recall_memory: "recall_conversation", search_memory: "recall_conversation", search_conversation: "recall_conversation", search_history: "recall_conversation", conversation_search: "recall_conversation", recall_history: "recall_conversation",
   takescreenshot: "screenshot", take_screenshot: "screenshot", capture: "screenshot", snapshot: "screenshot", screen_shot: "screenshot", capture_screen: "screenshot",
   httprequest: "http_request", http: "http_request", request: "http_request", api_call: "http_request", api_request: "http_request",
   figma_tokens: "figma", figma_design: "figma", figma_inspect: "figma", figma_get: "figma", figma_variables: "figma", figma_image: "figma", figma_export: "figma", figma_to_code: "figma", get_figma: "figma", figma_read: "figma", figma_layout: "figma", figma_theme: "figma", figma_colors: "figma", figjam: "figma",
@@ -22310,6 +22312,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "run_worker": return { type: "worker", path: args.description || "worker", description: args.description || "实现子任务", prompt: args.prompt || "", scope: Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : []) };
     case "worktree": return { type: "worktree", action: String(args.action || "list"), name: String(args.name || ""), path: String(args.path || args.dest || "") };
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
+    case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
     case "delete_path": return { type: "delete", path: args.path || "" };
     case "move_path": return { type: "move", path: args.from || "", to: args.to || "" };
@@ -26532,7 +26535,7 @@ function _tauriSearchInvokeArgs(call) {
 // db queries and terminal reads — so a turn that batches many such calls finishes in
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
-const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "debate", "termread", "termlist", "logs", "search_tools", "current_time", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
+const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "debate", "recall", "termread", "termlist", "logs", "search_tools", "current_time", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
 const _MUTATING_FILE_TOOL_TYPES = new Set(["write", "edit", "multiedit", "format"]);
 function _isMergedToolItem(item) {
   return item?.merged != null;
@@ -28925,6 +28928,7 @@ function _recLabel(call) {
     case "git": return "git " + (call.op || "");
     case "diag": return "诊断检查";
     case "think": return "思考";
+    case "recall": return "回忆检索 “" + (call.query || "") + "”";
     case "debate": return "辩论：" + String(call.question || "").slice(0, 40);
     default: return call.type + (p ? " " + p : "");
   }
@@ -31238,7 +31242,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "roadenvironment" || call.type === "trackshipment" || call.type === "shopcatalog" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "think" || call.type === "debate" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "roadenvironment" || call.type === "trackshipment" || call.type === "shopcatalog" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "debate" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -32968,6 +32972,20 @@ async function _executeToolStep(step, call, root, run) {
         }
         setTimeout(() => { try { (vp.querySelector("._auCustom") || vp.querySelector("._auConfirmInput"))?.focus(); } catch {} }, 0);
       });
+
+    } else if (call.type === "recall") {
+      // Archival-memory retrieval (MemGPT-style): search turns that were compacted
+      // away from the context window, so early details stay reachable.
+      const q = String(call.query || "").trim();
+      if (!q) { res.className = "atc-result atc-result--err"; res.textContent = "空关键词"; return { type: "recall", path: "", content: "[ERROR] 检索关键词为空。" }; }
+      const sess = (run && run.session) || _currentSession();
+      const hits = sess?.memory?.searchArchive ? sess.memory.searchArchive(q, call.limit || 6) : [];
+      res.className = "atc-result atc-result--ok";
+      res.textContent = hits.length + " 条";
+      const content = hits.length
+        ? "归档对话命中 " + hits.length + " 条：\n\n" + hits.map((h) => `[第${h.turn}轮·${h.role}] ${h.text}`).join("\n\n")
+        : "（归档里没有匹配的早期对话；可换关键词再试，或者相关内容本来就不在本会话里）";
+      return { type: "recall", path: q, content };
 
     } else if (call.type === "memory") {
       // Write into the knowledge graph (auto-tagged + auto-linked + auto-pruned). scope
