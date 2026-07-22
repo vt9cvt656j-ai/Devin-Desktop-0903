@@ -28603,11 +28603,13 @@ function _uiDesignCraftBlock(text, profile = _engineeringTaskProfile(text)) {
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
 - 设计先行：先确认真实内容、目标用户、品牌调性、现有素材/截图/数据源；缺方向时用 generate_image 出几张方向稿 + design_board 让用户选，用户已指定风格就直接落地，不要卡着问。
 - 设计系统：先定义 tokens 再写页面。至少覆盖 --background/--foreground/--card/--muted/--primary/--accent/--border/--ring/--radius，并映射到 Tailwind theme/CSS variables；主色只选 1 个色系 + 1 个强调色 + 中性色(zinc/slate/neutral)，禁止到处随机 hex。
-- 配色纪律：浅色避免死白一片，用 subtle gradient / tinted surface / border alpha 分层；深色用 #0f172a/#111827 级别，不用纯黑；按钮和重点信息必须有可读对比，危险/成功/警告色单独 token。
+- 配色纪律：**绝不靠记忆编 hex**——颜色只允许来自语义 token 或 Tailwind 色阶具体档位（bg-zinc-900/text-emerald-600 这类）；要对标某产品的配色就用 browser design 抓它真实变量，不凭印象。浅色避免死白一片，用 subtle gradient / tinted surface / border alpha 分层；深色用 #0f172a/#111827 级别，不用纯黑；按钮和重点信息必须有可读对比，危险/成功/警告色单独 token。
 - 排版纪律：明确 display/heading/body/caption 四级；标题用 font-display 或项目已有字体，正文用 font-sans；使用 text-5xl/4xl/3xl/2xl、leading-tight/relaxed、max-w-prose/measure 控制阅读宽度，禁止整页同字号同字重。
 - 布局纪律：移动优先；container 用 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8；section 用 py-16/24；复杂区块用 grid-cols-12 或 auto-fit card grid；gap-6/8/12，避免挤、平、乱。先信息架构后装饰：Hero → credibility/social proof → feature/use-case → detail/demo → CTA → footer。
 - 组件纪律：优先 shadcn/ui + Radix primitives：Button/Card/Badge/Tabs/Accordion/Dialog/Sheet/Popover/Tooltip/Progress/Avatar/Separator/Skeleton；用 cn()/variant 思路统一 size、tone、state，别裸 div 造按钮/弹窗/进度条。
-- 交互状态：每个可点击元素要有 hover/focus-visible/active/disabled/loading；表单要有 empty/error/success；图片/图标失败要有 fallback；动画短、克制、有目的。
+- 交互状态：每个可点击元素要有 hover/focus-visible/active/disabled/loading；表单要有 empty/error/success；图片/图标失败要有 fallback。
+- 动画纪律（手糊的 keyframes = 一眼假）：优先用成熟方案——React 用 motion/framer-motion（whileHover/whileInView/spring/stagger），Vue 用 @vueuse/motion，非框架页用 Motion One 或 tailwindcss-animate 预设；自写只允许小于几行的 transition。缓动/时长有纪律：微交互 150-250ms ease-out，入场 400-600ms + 轻微位移/透明度，列表用 stagger 逐项入场，交互反馈用 spring；绝不 linear、绝不大幅旋转/弹跳/长时间 keyframes；尊重 prefers-reduced-motion。动画服务于层级和反馈，不是炫技。
+- 参考纪律（禁靠记忆手糊）：商用级页面动手前先看真实标杆——同品类成熟产品的信息架构/密度/节奏（design_research 或 browser 打开真站抓 design/nodes）；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
 - 实现纪律：先复用项目现有组件和样式约定；从零建前端优先 web_scaffold；大段 UI 不要把所有东西塞一个文件，按 section/component/data 拆；Tailwind 类名要围绕 tokens 和组件语义，不堆无法维护的魔法数。
 - 视觉验收：构建通过不等于好看。启动真实 dev server 后，用 browser fresh 打开真实 URL；先 check/nodes，用 batch 连续完成交互，再用 assert/check 证明动作生效；只在最终视觉验收时分别截 1440x900 和 390x844 两张图检查首屏层级、间距、横向溢出、字体截断、console/network。截图丑就继续迭代一轮再收尾。`;
 }
