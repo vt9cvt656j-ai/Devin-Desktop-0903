@@ -5993,7 +5993,8 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "核验 npm run preview 健康输出或产物入口，汇总可运行状态" },
   ], true, "execute"), "", "runtime-only plans require execution evidence, diagnostics, and concrete commands");
   assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
-  assert.match(SRC, /function _runNeedsPlanGateNow\(run, call = null\) \{\s*return false;\s*\}/s);
+  assert.match(SRC, /function _runNeedsPlanGateNow\(run, call = null\) \{\s*if \(!_runRequiresPlan\(run\)\) return false;/s,
+    "complex tasks must plan before the first mutating call so the user sees a task-plan card");
   assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
   assert.match(SRC, /UI\/官网\/落地页\/从零前端项目要覆盖/);
   assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
@@ -6124,7 +6125,8 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
   });
   const requiredPlanIssue = load("_requiredPlanIssue", {
     _planQualityIssue: (steps, required) => required ? "尚未创建计划" : "",
-    _runNeedsPlanGateNow: requiresPlan,
+    _runRequiresPlan: () => true,
+    _callCanBypassPlanGate: bypass,
     _planEffectForRun: () => "mutate",
   });
   const complexRun = { engineering: { requiresPlan: true } };
@@ -6138,10 +6140,14 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
     "node_modules inspection from the screenshot must not be blocked by plan gate");
   assert.equal(requiresPlan(complexRun, { type: "cmd", command: "npm install" }), false,
     "dependency restoration must not be blocked by plan gate");
-  assert.equal(requiredPlanIssue(complexRun, null), "",
-    "a diagnostic-only complex run must not be forced to end by creating a ritual plan");
-  assert.equal(requiredPlanIssue({ ...complexRun, _planGateRequiredSeen: true }, null), "",
-    "even historical plan-gate markers must not force a ritual plan");
+  assert.equal(requiresPlan(complexRun, { type: "write" }), true,
+    "the first mutating call on a complex run without a plan must be gated so a task-plan card appears");
+  assert.equal(requiresPlan({ ...complexRun, _planSteps: [{ content: "改 a.js", status: "pending" }] }, { type: "write" }), false,
+    "once a plan exists the gate must stay out of the way");
+  assert.match(requiredPlanIssue(complexRun, null), /尚未创建计划/,
+    "a plan-required run with no plan must surface the missing plan to the model");
+  assert.equal(requiredPlanIssue(complexRun, null, { type: "diag" }), "",
+    "diagnostic calls bypass the plan quality check");
   assert.match(SRC, /const _finishPlanIssue = ""/);
   assert.doesNotMatch(SRC, /run\._incompleteReason = "required_plan_missing"/);
 });
@@ -8761,12 +8767,9 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.ok(planFirst >= 0 && workerStart > planFirst);
   assert.match(SRC, /workerMutated = false/);
   assert.match(SRC, /onMutation: \(\) => \{ workerMutated = true; \}/);
-  // Worker 启动不再被 update_plan/计划质量卡住；计划只是整理工具。
-  assert.match(SRC, /const planIssue = "";/);
-  assert.match(SRC, /const _workerHasPlan = true;/);
-  assert.doesNotMatch(SRC, /启动写入型 worker 前先用 update_plan 建一份工程清单/);
-  assert.doesNotMatch(SRC, /缺计划 · 未执行/);
-  assert.doesNotMatch(SRC, /if \(planIssue && !_workerHasPlan\) \{/);
+  // 复杂工程任务里，写入型 worker 启动前需要先有任务计划（有界：最多拦 2 次）。
+  assert.match(SRC, /const planIssue = isWorker && _runNeedsPlanGateNow\(run, \{ type: "write" \}\) && planGateNudges < 2/);
+  assert.match(SRC, /先列计划 · 未执行/);
   assert.doesNotMatch(SRC, /run\._planQualityNudged = true;/);
   const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
   assert.match(subagentSrc, /0 步 · 未执行/);
