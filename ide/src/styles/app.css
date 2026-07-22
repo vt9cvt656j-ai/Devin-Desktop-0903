@@ -6764,6 +6764,13 @@ body.zen-mode .editor {
 .dark .turn-stats {
   color: #6b7280;
 }
+.turn-stats--live {
+  animation: turn-stats-pulse 2s ease-in-out infinite;
+}
+@keyframes turn-stats-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
 .think-return-status {
   margin-top: 8px;
   padding: 6px 9px;

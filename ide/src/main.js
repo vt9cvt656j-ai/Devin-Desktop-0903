@@ -12784,21 +12784,62 @@ function _fmtElapsed(ms) {
   const m = Math.floor(s / 60);
   return m + "m" + Math.round(s - m * 60) + "s";
 }
+function _turnStatsText({ elapsedMs = 0, promptTokens = 0, completionTokens = 0, model = "", estimated = false } = {}) {
+  const inTok = Math.max(0, Math.round(Number(promptTokens) || 0));
+  const outTok = Math.max(0, Math.round(Number(completionTokens) || 0));
+  const cents = (inTok || outTok) ? _turnCostCents(model, inTok, outTok) : null;
+  const bits = [`⏱ ${_fmtElapsed(elapsedMs)}`];
+  if (inTok || outTok) bits.push(`⇅ ${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
+  if (cents != null) {
+    const disp = (cents / 100) * _MICHAEL_DISP_MULT;
+    bits.push(`💰 ${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
+  }
+  return { text: bits.join("  ·  "), inTok, outTok, cents };
+}
+// 实时版脚注：回复进行中每秒刷新耗时/token/费用，并始终钉在气泡底部；
+// 结束时 stop() 移除，由 _appendTurnStatsFooter 落空成最终定稿。
+function _liveTurnStats(body, { startedAt = Date.now(), model = "", getUsage } = {}) {
+  let el = null;
+  let timer = 0;
+  const tick = () => {
+    try {
+      if (!body) return;
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "turn-stats turn-stats--live";
+        body.appendChild(el);
+      }
+      const u = (typeof getUsage === "function" && getUsage()) || {};
+      el.textContent = _turnStatsText({
+        elapsedMs: Date.now() - startedAt,
+        promptTokens: u.in || 0,
+        completionTokens: u.out || 0,
+        model,
+        estimated: u.est !== false,
+      }).text;
+      if (el !== body.lastElementChild) body.appendChild(el); // 新内容追加后保持在最底部
+    } catch { /* live stats must never break a reply */ }
+  };
+  tick();
+  timer = setInterval(tick, 1000);
+  return {
+    stop() {
+      if (timer) { clearInterval(timer); timer = 0; }
+      try { if (el) el.remove(); } catch {}
+      el = null;
+    },
+  };
+}
 function _appendTurnStatsFooter(body, { elapsedMs = 0, promptTokens = 0, completionTokens = 0, model = "", estimated = false } = {}) {
   try {
-    if (!body || body.querySelector(":scope > .turn-stats")) return;
-    const inTok = Math.max(0, Math.round(Number(promptTokens) || 0));
-    const outTok = Math.max(0, Math.round(Number(completionTokens) || 0));
-    const cents = (inTok || outTok) ? _turnCostCents(model, inTok, outTok) : null;
-    const bits = [`⏱ ${_fmtElapsed(elapsedMs)}`];
-    if (inTok || outTok) bits.push(`⇅ ${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
-    if (cents != null) {
-      const disp = (cents / 100) * _MICHAEL_DISP_MULT;
-      bits.push(`💰 ${_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4)}`);
-    }
+    if (!body) return;
+    const live = body.querySelector(":scope > .turn-stats--live");
+    if (live) live.remove();
+    if (body.querySelector(":scope > .turn-stats")) return;
+    const { text, inTok, outTok, cents } = _turnStatsText({ elapsedMs, promptTokens, completionTokens, model, estimated });
     const el = document.createElement("div");
     el.className = "turn-stats";
-    el.textContent = bits.join("  ·  ");
+    el.textContent = text;
     el.title = `本次回复统计\n耗时：${_fmtElapsed(elapsedMs)}\ntoken：输入 ${inTok} · 输出 ${outTok}${estimated ? "（估算）" : "（真实 usage）"}` +
       (cents != null ? `\n费用：${_dispUsd(cents, 4)}` : "\n费用：该模型未配置单价");
     body.appendChild(el);
@@ -16581,6 +16622,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _pendingToolCalls = [];
   let _toolArgBuf = {};
   let _legacyUsage = null; // record once (last wins) — avoid double-count per-chunk
+  const _liveStats = _liveTurnStats(body, {
+    startedAt: _plainStreamDiag.attemptStartedAt,
+    model: config.model,
+    getUsage: () => _legacyUsage
+      ? { in: _legacyUsage.prompt_tokens || 0, out: _legacyUsage.completion_tokens || 0, est: false }
+      : { in: 0, out: _estTokens(acc), est: true },
+  });
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
     const requestMessages = _enforceModelRequestBudget(messages, useTools ? _toolSchemas : []);
@@ -16711,6 +16759,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       note.textContent = "⚠️ " + err;
       body.appendChild(note);
     }
+    _liveStats.stop();
     _appendThinkingReturnStatus(body, config, reasoning, _legacyUsage);
     _appendTurnStatsFooter(body, {
       elapsedMs: Date.now() - _plainStreamDiag.attemptStartedAt,
@@ -28970,6 +29019,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
+  const _liveStats = _liveTurnStats(body, {
+    startedAt: run._recStart,
+    model: config.model,
+    getUsage: () => {
+      const ru = session._runUsage;
+      return ru ? { in: ru.in, out: ru.out, est: !!ru.est } : { in: 0, out: 0, est: true };
+    },
+  });
 
   const isAgent = run.mode === "agent";
   // Connect external MCP servers (cached), but HARD-BOUNDED so a wedged/slow
@@ -30685,6 +30742,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (stopBtn) stopBtn.style.display = "none";
     _updateFilesBar(filesBar, filesList, trackedFiles);
     try {
+      _liveStats.stop();
       const _ru = session._runUsage;
       _appendTurnStatsFooter(body, {
         elapsedMs: Date.now() - run._recStart,
