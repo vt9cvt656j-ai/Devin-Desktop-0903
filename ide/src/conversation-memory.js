@@ -12,6 +12,23 @@ const RECENT_WINDOW = 100;
 const MAX_SUMMARIES = 8;
 const SUMMARY_BATCH = 10;
 const PERSISTED_MEDIA_BUDGET = 3_200_000;
+const MAX_ARCHIVE = 400;          // archived (compacted-away) turns kept for recall
+const ARCHIVE_ENTRY_MAX = 1600;   // chars per archived turn
+const MAX_MILESTONES = 60;
+const MERGED_SUMMARY_MAX = 8000;  // merged summary text cap (head+tail keep)
+
+// Tokenizer for archival search: latin words + CJK bigrams (MemGPT-style
+// archival memory needs retrieval that works for Chinese without a segmenter).
+function memSearchTokens(s) {
+  const lower = String(s || '').toLowerCase();
+  const out = new Set();
+  for (const w of lower.match(/[a-z0-9_$./-]{2,}/g) || []) out.add(w);
+  for (const run of lower.match(/[\u3400-\u9fff]+/g) || []) {
+    if (run.length === 1) out.add(run);
+    for (let i = 0; i < run.length - 1; i++) out.add(run.slice(i, i + 2));
+  }
+  return [...out].slice(0, 64);
+}
 
 function serializeLocationEvidence(evidence) {
   if (!evidence || typeof evidence !== 'object') return undefined;
@@ -152,6 +169,10 @@ export class ConversationMemory {
     this.summaries = [];
     this.milestones = [];
     this.fileEvidence = [];
+    // Archival memory (MemGPT/Letta-style): compacted-away turns keep a bounded
+    // text-only record here, searchable via searchArchive() / the recall tool,
+    // so compression no longer means permanent loss of early details.
+    this.archive = [];
     this._onMessagesRemoved = null;
   }
 
@@ -167,13 +188,61 @@ export class ConversationMemory {
   push(msg) {
     this.totalTurns++;
     this.recent.push(msg);
-    if (this.recent.length > RECENT_WINDOW) {
+    // Adaptive compression: by count (long chats of short turns) OR by token
+    // pressure (few turns but huge tool outputs). Threshold sits ABOVE the LLM
+    // auto-compact trigger (~28k in main.js) so the smart compactor gets first
+    // shot; this is the mechanical safety net.
+    if (this.recent.length > RECENT_WINDOW
+        || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000)) {
       this._compressOldestBatch();
     }
   }
 
   markMilestone(event) {
     this.milestones.push({ turn: this.totalTurns, event });
+    if (this.milestones.length > MAX_MILESTONES) {
+      // Keep the earliest few (project framing) + the most recent ones.
+      this.milestones = [...this.milestones.slice(0, 8), ...this.milestones.slice(-(MAX_MILESTONES - 8))];
+    }
+  }
+
+  _archiveBatch(removed, startTurn) {
+    for (let i = 0; i < removed.length; i++) {
+      const msg = removed[i];
+      const role = msg?.role === 'assistant' ? 'assistant' : msg?.role === 'user' ? 'user' : msg?.role === 'tool' ? 'tool' : 'system';
+      let text = typeof msg?.content === 'string' ? msg.content.replace(/\s+/g, ' ').trim() : '';
+      if (msg?.tool_calls?.length) {
+        const names = msg.tool_calls.map((tc) => tc?.function?.name).filter(Boolean).join(', ');
+        if (names) text = (text ? text + ' ' : '') + `[调用工具: ${names}]`;
+      }
+      if (!text) continue;
+      this.archive.push({ turn: startTurn + i, role, text: text.slice(0, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
+    }
+    if (this.archive.length > MAX_ARCHIVE) this.archive.splice(0, this.archive.length - MAX_ARCHIVE);
+  }
+
+  /** Keyword search over archived (compacted-away) turns. Returns newest-biased
+   *  best matches: [{turn, role, text}]. */
+  searchArchive(query, k = 6) {
+    const q = String(query || '').trim().toLowerCase();
+    if (!q || !this.archive.length) return [];
+    const terms = memSearchTokens(q);
+    if (!terms.length) return [];
+    const scored = [];
+    for (let i = 0; i < this.archive.length; i++) {
+      const entry = this.archive[i];
+      const text = entry.text.toLowerCase();
+      let score = 0;
+      for (const t of terms) {
+        let idx = 0, n = 0;
+        while (n < 8 && (idx = text.indexOf(t, idx)) !== -1) { n++; idx += t.length; }
+        score += n * Math.max(1, t.length);
+      }
+      if (text.includes(q)) score += q.length * 4; // exact-phrase bonus
+      if (score > 0) scored.push({ entry, i, score });
+    }
+    scored.sort((a, b) => b.score - a.score || b.i - a.i);
+    return scored.slice(0, Math.max(1, Math.min(20, k))).map((s) => ({ ...s.entry }));
   }
 
   recordFileEvidence(evidence) {
@@ -233,7 +302,10 @@ export class ConversationMemory {
     }
     if (this.summaries.length > 0) {
       const merged = this.summaries.map(s => s.text).join('\n\n');
-      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}` });
+      const recallHint = this.archive.length
+        ? '\n\n（以上是早期对话的压缩摘要；需要某段早期对话的原文细节时，用 recall_conversation 工具按关键词检索归档）'
+        : '';
+      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}${recallHint}` });
     }
     result.push(...this.recent);
     return result;
@@ -253,8 +325,9 @@ export class ConversationMemory {
   compactRecent(count, summaryText) {
     if (count <= 0 || count > this.recent.length) return [];
     const removed = this.recent.splice(0, count);
-    this._notifyMessagesRemoved(removed);
     const startTurn = Math.max(1, this.totalTurns - this.recent.length - removed.length + 1);
+    this._archiveBatch(removed, startTurn);
+    this._notifyMessagesRemoved(removed);
     const endTurn = startTurn + removed.length - 1;
     this.summaries.push({
       range: `turns ${startTurn}–${endTurn}`,
@@ -265,23 +338,34 @@ export class ConversationMemory {
       const b = this.summaries.shift();
       this.summaries.unshift({
         range: `${a.range}, ${b.range}`,
-        text: a.text + '\n' + b.text
+        text: this._mergeSummaryText(a.text, b.text)
       });
     }
     return removed;
   }
 
+  // Merged summaries used to grow without bound (plain concatenation). Cap with a
+  // head+tail keep so the oldest framing and the newest facts both survive.
+  _mergeSummaryText(a, b) {
+    const merged = `${a}\n${b}`;
+    if (merged.length <= MERGED_SUMMARY_MAX) return merged;
+    const head = merged.slice(0, Math.floor(MERGED_SUMMARY_MAX * 0.6));
+    const tail = merged.slice(-Math.floor(MERGED_SUMMARY_MAX * 0.35));
+    return `${head}\n…（更早摘要已折叠，原文可用 recall_conversation 检索）…\n${tail}`;
+  }
+
   _compressOldestBatch() {
     if (this.recent.length < SUMMARY_BATCH) return;
     const batch = this.recent.splice(0, SUMMARY_BATCH);
-    this._notifyMessagesRemoved(batch);
     const startTurn = this.totalTurns - this.recent.length - batch.length + 1;
+    this._archiveBatch(batch, startTurn);
+    this._notifyMessagesRemoved(batch);
     const endTurn = startTurn + batch.length - 1;
     this.summaries.push({ range: `turns ${startTurn}-${endTurn}`, text: this._summarizeBatch(batch) });
     if (this.summaries.length > MAX_SUMMARIES) {
       const a = this.summaries.shift();
       const b = this.summaries.shift();
-      this.summaries.unshift({ range: `${a.range} + ${b.range}`, text: `${a.text}; ${b.text}` });
+      this.summaries.unshift({ range: `${a.range} + ${b.range}`, text: this._mergeSummaryText(a.text, b.text) });
     }
   }
 
@@ -324,7 +408,7 @@ export class ConversationMemory {
   }
 
   stats() {
-    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, recentTokens: this.estimateRecentTokens() };
+    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, archiveCount: this.archive.length, recentTokens: this.estimateRecentTokens() };
   }
 
   toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET) {
@@ -333,7 +417,7 @@ export class ConversationMemory {
     const effectiveBudget = typeof mediaBudget === 'number' || (mediaBudget && typeof mediaBudget === 'object')
       ? mediaBudget
       : PERSISTED_MEDIA_BUDGET;
-    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent, effectiveBudget), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence };
+    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent, effectiveBudget), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence, archive: this.archive };
   }
 
   static fromJSON(obj) {
@@ -344,6 +428,11 @@ export class ConversationMemory {
       mem.summaries = obj.summaries || [];
       mem.milestones = obj.milestones || [];
       mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
+      mem.archive = Array.isArray(obj.archive)
+        ? obj.archive.slice(-MAX_ARCHIVE)
+          .filter((e) => e && typeof e.text === 'string' && e.text)
+          .map((e) => ({ turn: Math.max(0, Number(e.turn) || 0), role: String(e.role || 'assistant'), text: String(e.text).slice(0, ARCHIVE_ENTRY_MAX) }))
+        : [];
     }
     return mem;
   }

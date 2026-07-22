@@ -2321,6 +2321,41 @@ test("conversation file evidence merges coverage, persists, and invalidates by v
   assert.equal(restored.fileEvidenceForRoot("/repo").length, 0);
 });
 
+test("compacted turns land in archival memory and are searchable by keyword", () => {
+  const memory = new ConversationMemory();
+  memory.push({ role: "user", content: "把数据库工作台的图标换成 SVG，并支持 ClickHouse" });
+  memory.push({ role: "assistant", content: "好的，已修改 db.rs 增加 ClickHouse 驱动支持" });
+  memory.push({ role: "user", content: "顺便修一下 welcome page 的刷新问题" });
+  memory.compactRecent(3, "早期需求摘要");
+  assert.equal(memory.archive.length, 3);
+  const hits = memory.searchArchive("ClickHouse 驱动");
+  assert.ok(hits.length >= 1);
+  assert.match(hits[0].text, /ClickHouse/);
+  const cjkHits = memory.searchArchive("刷新问题");
+  assert.ok(cjkHits.length >= 1);
+  assert.match(cjkHits[0].text, /刷新/);
+  assert.equal(memory.searchArchive("毫无关联的词汇xyzq").length, 0);
+  // Archive survives persistence round-trip.
+  const restored = ConversationMemory.fromJSON(memory.toJSON());
+  assert.equal(restored.archive.length, 3);
+  assert.ok(restored.searchArchive("SVG").length >= 1);
+  // Assembled context advertises the recall tool once an archive exists.
+  const summaryMsg = memory.assemble().find((m) => typeof m.content === "string" && m.content.startsWith("[对话上下文摘要]"));
+  assert.match(summaryMsg.content, /recall_conversation/);
+});
+
+test("merged summaries stay bounded instead of growing without limit", () => {
+  const memory = new ConversationMemory();
+  for (let i = 0; i < 12; i++) {
+    memory.summaries.push({ range: `turns ${i}`, text: "长摘要".repeat(1500) });
+  }
+  memory.recent = [{ role: "user", content: "x" }];
+  memory.compactRecent(1, "final");
+  for (const s of memory.summaries) {
+    assert.ok(s.text.length <= 9000, `merged summary too long: ${s.text.length}`);
+  }
+});
+
 test("conversation media persistence keeps images/key frames but drops raw videos", () => {
   const memory = new ConversationMemory();
   memory.push({
