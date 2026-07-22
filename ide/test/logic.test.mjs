@@ -8770,6 +8770,9 @@ test("substantial worker tasks process parent plans first and count only real wr
   // 复杂工程任务里，写入型 worker 启动前需要先有任务计划（有界：最多拦 2 次）。
   assert.match(SRC, /const planIssue = isWorker && _runNeedsPlanGateNow\(run, \{ type: "write" \}\) && planGateNudges < 2/);
   assert.match(SRC, /先列计划 · 未执行/);
+  // 问方向（ask_user）和列计划本身是控制面动作，绝不能被计划门拦下——
+  // 方向没定就被逼着先出计划，正是用户骂过的"不让我选"。
+  assert.match(extractFn("_callCanBypassPlanGate"), /call\.type === "askuser" \|\| call\.type === "plan"/);
   assert.doesNotMatch(SRC, /run\._planQualityNudged = true;/);
   const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
   assert.match(subagentSrc, /0 步 · 未执行/);

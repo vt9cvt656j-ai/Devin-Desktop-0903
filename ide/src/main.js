@@ -29071,6 +29071,10 @@ function _planEffectForRun(run) {
 
 function _callCanBypassPlanGate(call) {
   if (!call) return true;
+  // Asking the user to pick a direction and creating the plan itself are control-plane
+  // actions, not side effects — direction questions must be allowed BEFORE the plan
+  // exists (a plan made before the user picked a direction is wasted work).
+  if (call.type === "askuser" || call.type === "plan") return true;
   if (_isReadOnlyParallel(call)) return true;
   if (call.type === "cmd" || call.type === "termtask") {
     const command = String(call.command || "");
