@@ -35300,7 +35300,7 @@ async function _executeToolStep(step, call, root, run) {
       // pretending the command worked or silently giving up.
       const _permDenied = (result.code !== 0) && /permission denied|operation not permitted|EACCES|EPERM|access is denied|not permitted|需要权限|拒绝访问|权限不足/i.test(output);
       let _content = output ? output.slice(0, 2000) : (result.code === 0 ? "(executed)" : `(exit ${result.code}, 无输出)`);
-      if (commandRisk) {
+      if (commandRiskLabel) {
         _content = `[风险提示] IDE 已允许执行「${commandRiskLabel}」，没有再做危险命令拦截；以下是真实命令结果，请基于 exit code/stdout/stderr 判断下一步。\n` + _content;
       }
       if (result.code !== 0) {
