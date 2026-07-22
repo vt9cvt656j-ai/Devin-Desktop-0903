@@ -17,6 +17,11 @@ pub fn run() {
             files::read_text_file,
             files::write_text_file,
             files::home_dir,
+            files::create_file,
+            files::create_dir,
+            files::rename_path,
+            files::delete_path,
+            files::search_in_project,
             ai::ai_chat,
         ])
         .run(tauri::generate_context!())
