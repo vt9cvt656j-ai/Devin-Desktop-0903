@@ -330,6 +330,13 @@ const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 14_000;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
     "premium landing page hero website motion animation polished visual design";
+const DESIGN_KNOWLEDGE_SECTION_QUERIES: &[&str] = &[
+    "hero landing page cinematic website visual system",
+    "features cards section polished interaction motion",
+    "pricing cta footer conversion landing page",
+    "mobile responsive app ui dashboard component",
+    "portfolio agency showcase premium animation",
+];
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -1117,7 +1124,7 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
         return None;
     }
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
-    let mut hits = design_hits_for_query(&query);
+    let mut hits = design_hits_for_request(&query);
     if hits.is_empty() {
         hits = design_hits_for_query(DESIGN_KNOWLEDGE_FALLBACK_QUERY);
     }
@@ -1164,19 +1171,43 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
 
     Some(format!(
         "--- michael-design 设计蓝本（按用户请求自动检索，精炼注入）---\n\
-         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的入口，不是全部库的替代品。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充气质和区块想法。执行规则：\n\
-         1. 先把用户口语需求升格成成品规格：目标用户、页面结构、主视觉、区块顺序、交互动效、真实文案、资源使用和验收点都要明确，不能按一句话糊通用页面。\n\
-         2. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
-         3. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
-         4. 做完整页面时，当前块只负责定方向；必须继续用 `knowledge_search(domain=\"michael-design\")` 针对缺的区块检索，例如 `hero/features/pricing/cta/footer`、`features cards`、`mobile app`、`dashboard`、`portfolio`、`dark animation`。从全库取材后再组合，别只吃这几段。\n\
-         5. 与 `shadcn_design_system`/Tailwind 令牌结合：蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。最终必须通过真实浏览器验证视觉、交互、响应式和控制台错误；蓝本是设计证据，不是运行证据。\n\n{}",
+         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，不是装饰性参考。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充区块和气质。执行规则：\n\
+         1. 写代码前必须在思考里列出“已采用的 michael-design 来源”：主蓝本、候选蓝本、还要补检索的区块关键词；没有这一步就不能开始写 UI。\n\
+         2. 完整页面/重设计必须先调用 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，优先查 `hero/features/pricing/cta/footer`、`features cards`、`mobile app`、`dashboard`、`portfolio`、`dark animation`；每次检索都要带具体区块或风格词，最多 2-4 次，命中后马上综合，不许无限搜。\n\
+         3. 先把用户口语需求升格成成品规格：目标用户、页面结构、主视觉、区块顺序、交互动效、真实文案、资源使用和验收点都要明确，不能按一句话糊通用页面。\n\
+         4. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
+         5. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
+         6. 与 `shadcn_design_system`/Tailwind 令牌结合：shadcn/ui 是 Button/Input/Dialog/Tabs 等交互 primitive，不是把所有区块套 Card；Tailwind 是语义 token 和布局工具，不是散写一屏硬编码 class。蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。\n\
+         7. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵；修补后只对改动点做最多一次针对性复验。证据覆盖后必须停止，不许为了“再看看”重复 browser/screenshot。\n\n{}",
         sections.join("\n\n———\n\n")
     ))
+}
+
+fn design_hits_for_request(query: &str) -> Vec<crate::knowledge::SearchHit> {
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    push_design_hits_for_query(query, &mut seen, &mut hits);
+    for supplemental in DESIGN_KNOWLEDGE_SECTION_QUERIES {
+        if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+            break;
+        }
+        push_design_hits_for_query(supplemental, &mut seen, &mut hits);
+    }
+    hits
 }
 
 fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
+    push_design_hits_for_query(query, &mut seen, &mut hits);
+    hits
+}
+
+fn push_design_hits_for_query(
+    query: &str,
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+) {
     for hit in crate::knowledge::search_with_cap(
         query,
         Some(DESIGN_KNOWLEDGE_DOMAIN),
@@ -1194,7 +1225,6 @@ fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
             break;
         }
     }
-    hits
 }
 
 /// Decide whether the user's real request needs the UI specialization. Keep generic engineering
@@ -1292,9 +1322,32 @@ fn looks_like_ui_task(q: &str) -> bool {
         ]
         .iter()
         .any(|context| l.contains(context));
+    let ui_quality_complaint = [
+        "丑",
+        "难看",
+        "不好看",
+        "廉价",
+        "土",
+        "ai味",
+        "不高级",
+        "没高级感",
+        "审美",
+        "好看",
+        "漂亮",
+        "美观",
+    ]
+    .iter()
+    .any(|term| q.contains(term))
+        && [
+            "ui", "前端", "网页", "网站", "页面", "界面", "样式", "布局", "视觉", "设计",
+            "tailwind", "shadcn",
+        ]
+        .iter()
+        .any(|context| l.contains(context) || q.contains(context));
     ASCII_KW.iter().any(|k| l.contains(k))
         || CJK_KW.iter().any(|k| q.contains(k))
         || contextual_component
+        || ui_quality_complaint
 }
 
 fn looks_like_research_task(q: &str) -> bool {
@@ -3887,6 +3940,10 @@ mod tests {
             assert!(looks_like_ui_task(request), "missed UI request: {request}");
         }
         assert!(looks_like_ui_task("优化 React 登录组件的样式和布局"));
+        assert!(looks_like_ui_task(
+            "这个页面写得丑死了，shadcn 和 Tailwind 都没用好"
+        ));
+        assert!(looks_like_ui_task("官网视觉太廉价，重做得更高级一点"));
         assert!(!looks_like_ui_task("修复 Rust 服务组件的并发锁错误"));
     }
 
@@ -3908,6 +3965,11 @@ mod tests {
         assert!(system.contains("421 条 michael-design"));
         assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
         assert!(system.contains("精炼注入"));
+        assert!(system.contains("已采用的 michael-design 来源"));
+        assert!(system.contains("shadcn/ui 是 Button/Input/Dialog/Tabs"));
+        assert!(system.contains("浏览器验证有上限"));
+        assert!(system.contains("完整矩阵一个任务只跑一次"));
+        assert!(system.contains("先吃 michael-design，再看外部参考"));
 
         let start = system.find("--- michael-design 设计蓝本").unwrap();
         let tail = &system[start..];

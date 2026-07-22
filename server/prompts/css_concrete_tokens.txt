@@ -9,6 +9,7 @@
 - 用户未指定框架的新 UI 项目使用 React + Vite + TypeScript + Tailwind；标准交互按需使用 shadcn/ui **官方组件**。只添加页面实际需要的组件，禁止全量安装、批量生成未引用组件或为了展示组件库塞入无关控件。
 - 用户指定 Vue 时使用 Vue + Vite + TypeScript + Tailwind；需要标准交互组件时按需使用 shadcn-vue，禁止安装 React 版 shadcn/ui。
 - 从当前官方初始化结果取得语义 token 和 Tailwind 接线方式，再按用户选定的品牌方向调整。不要复制固定蓝色、固定 hex/OKLCH 值或通用按钮类；shadcn Button/Input/Card 等已有 primitive 时，直接组合它们，不另造平行的基础组件。
+- michael-design 蓝本给出的结构、密度、动效和具体尺寸要先转成语义 token、布局 primitive 和业务组件边界，再写 Tailwind class；不要把蓝本当文案参考，也不要把 Tailwind 当随手堆 class 的速记本。
 
 ## 3. token 至少覆盖这些语义
 - 表面：background、foreground、card、popover、muted、border、input、ring。
@@ -18,6 +19,7 @@
 
 ## 4. 组件边界
 - shadcn/ui 与 shadcn-vue 是标准交互 primitive，不是要求每个区块都套组件库。导航、hero、内容区块、图表组合和领域组件按产品信息架构实现；能复用 primitive 就复用，不匹配就写清晰的业务组件。
+- Card 只能用于真正需要卡片语义的重复项、面板或工具框；hero、整页 section、背景层、装饰层不要套 Card。Button/Input/Tabs/Dialog/Tooltip 等交互 primitive 要用官方组件；营销区块、产品展示、时间线、沉浸式 hero 等按蓝本写业务组件。
 - 不引入第二套基础组件系统，不添加未使用依赖，不建立导出全部组件的 barrel 文件。保持依赖、源码和升级面与真实需求一致。
 - 图标统一复用项目已有图标集或一个成熟图标库；不用 emoji 代替正式图标。交互元素覆盖 hover、focus-visible、active、disabled、loading、空和错误状态，并满足键盘操作、可读标签、对比度与 reduced-motion。
 
@@ -25,4 +27,5 @@
 - 启动或复用真实 dev server，用 `browser navigate` 且 `fresh=true` 打开实际 URL。
 - 在 **1440x900（desktop）** 与 **390x844（mobile=true）** 两个视口分别执行 `browser check`，处理控制台错误、网络失败、坏资源、裁切、重叠与横向溢出。
 - 两个视口都要用 `click` / `type` / `press` 完成关键流程，再对具体 selector 或预期文本执行 `assert`；只断言 `body` / `html` 可见不算通过。
+- 完整矩阵一个任务只执行一次；修补后只对受影响 selector/视口做最多一次针对性复验。若同一 URL、同一视口、同一断言第二次没有新增信息，立即停止，不再调用 browser/screenshot。
 - 最终如实报告 URL、两个视口、交互断言和未验证项；截图只用于视觉检查，不能替代 check 与 assert。
