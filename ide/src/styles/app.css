@@ -5121,6 +5121,12 @@ body.zen-mode .editor {
   color: var(--text-dim);
   opacity: .7;
 }
+/* 语言品牌图标：自带品牌配色，不做淡化 */
+.code-card__lang .lang-ic {
+  width: 14px;
+  height: 14px;
+  opacity: 1;
+}
 .code-card__lang span {
   overflow: hidden;
   text-overflow: ellipsis;

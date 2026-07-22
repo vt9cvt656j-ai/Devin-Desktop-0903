@@ -53,6 +53,52 @@ export function langLabel(lang) {
   const k = (lang || "").toLowerCase();
   return LANG_LABEL[k] || (lang ? lang.toUpperCase() : "Text");
 }
+
+// ---- per-language brand icons (inline SVG, brand colors) ----
+// Keyed by the Monaco language id (after alias normalization). Each entry is the
+// inner SVG markup for a 16x16 viewBox; unknown languages fall back to the
+// generic "</>" sprite icon.
+const _badge = (bg, text, fg = "#fff", fs = 6.5) =>
+  `<rect x="1" y="1" width="14" height="14" rx="3" fill="${bg}"/><text x="8" y="11" text-anchor="middle" font-family="-apple-system,'Segoe UI',sans-serif" font-size="${fs}" font-weight="700" fill="${fg}">${text}</text>`;
+const LANG_ICON = {
+  javascript: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#F7DF1E"/><text x="8" y="11.5" text-anchor="middle" font-family="-apple-system,'Segoe UI',sans-serif" font-size="7" font-weight="800" fill="#000">JS</text>`,
+  typescript: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#3178C6"/><text x="8" y="11.5" text-anchor="middle" font-family="-apple-system,'Segoe UI',sans-serif" font-size="7" font-weight="800" fill="#fff">TS</text>`,
+  rust: `<circle cx="8" cy="8" r="6.6" fill="none" stroke="#CE422B" stroke-width="1.5" stroke-dasharray="2.2 1.1"/><circle cx="8" cy="8" r="4.2" fill="#CE422B"/><text x="8" y="10.6" text-anchor="middle" font-family="-apple-system,'Segoe UI',sans-serif" font-size="6.5" font-weight="800" fill="#fff">R</text>`,
+  python: `<path d="M7.9 1.5c-2 0-3.3.9-3.3 2.4v1.6h3.5v.6H3.3c-1.3 0-2 1.2-2 2.9 0 1.6.7 2.9 2 2.9h1.3V9.7c0-1.3 1.1-2.3 2.4-2.3h3c1.1 0 2-.9 2-2V3.9c0-1.5-1.3-2.4-3.1-2.4h-1zm-1 1.3a.7.7 0 1 1 0 1.4.7.7 0 0 1 0-1.4z" fill="#3776AB"/><path d="M8.1 14.5c2 0 3.3-.9 3.3-2.4v-1.6H7.9v-.6h4.8c1.3 0 2-1.2 2-2.9 0-1.6-.7-2.9-2-2.9h-1.3v2.2c0 1.3-1.1 2.3-2.4 2.3H6c-1.1 0-2 .9-2 2v1.5c0 1.5 1.3 2.4 3.1 2.4h1zm1-1.3a.7.7 0 1 1 0-1.4.7.7 0 0 1 0 1.4z" fill="#FFD43B"/>`,
+  go: _badge("#00ADD8", "GO", "#fff", 6.5),
+  java: _badge("#EA2D2E", "J", "#fff", 8),
+  c: _badge("#5C6BC0", "C", "#fff", 8),
+  cpp: _badge("#00599C", "C++", "#fff", 5.5),
+  csharp: _badge("#68217A", "C#", "#fff", 6.5),
+  ruby: `<path d="M8 1.6 13.9 5v6L8 14.4 2.1 11V5L8 1.6z" fill="#CC342D"/><path d="M8 1.6 13.9 5 8 8.2 2.1 5 8 1.6z" fill="#E0574F"/>`,
+  php: _badge("#777BB4", "php", "#fff", 5.5),
+  swift: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#F05138"/><path d="M11.6 10.4c.9-1.7.6-3.7-.6-5.4.9 1 1.3 2.3 1.1 3.5C13.4 9.7 13 11.6 13 11.6s-1-.6-1.9-.5c-.8.7-2 .9-3.2.5-1.6-.6-3-2-3.9-3.6 1 .8 2.2 1.5 3.3 1.8C5.9 8.7 4.8 7.2 4.1 5.9c1.5 1.4 3.1 2.5 4.6 3.2-1-1.2-2-2.7-2.7-4 1.9 1.9 3.9 3.5 5 4.2l.6 1.1z" fill="#fff"/>`,
+  kotlin: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#7F52FF"/><path d="M3.5 3.5h9L8 8l4.5 4.5h-9v-9z" fill="#fff" opacity=".9"/>`,
+  html: `<path d="M2.5 1.5h11l-1 12L8 14.7l-4.5-1.2-1-12z" fill="#E44D26"/><path d="M8 2.6v11l3.6-1L12.5 2.6H8z" fill="#F16529"/><path d="M5 4.5h6l-.15 1.5H6.6l.1 1.5h4l-.4 4-2.3.7-2.3-.7-.15-1.7h1.5l.08.9 1 .3 1-.3.1-1.7H4.8L4.5 4.5z" fill="#fff" opacity=".95"/>`,
+  css: `<path d="M2.5 1.5h11l-1 12L8 14.7l-4.5-1.2-1-12z" fill="#1572B6"/><path d="M8 2.6v11l3.6-1L12.5 2.6H8z" fill="#33A9DC"/><path d="M5 4.5h6l-.15 1.5H6.6l.1 1.5h4l-.4 4-2.3.7-2.3-.7-.15-1.7h1.5l.08.9 1 .3 1-.3.1-1.7H4.8L4.5 4.5z" fill="#fff" opacity=".95"/>`,
+  scss: _badge("#CD6799", "S", "#fff", 8),
+  less: _badge("#1D365D", "{L}", "#fff", 5.5),
+  json: `<rect x="1" y="1" width="14" height="14" rx="3" fill="#8A8F98"/><text x="8" y="11.5" text-anchor="middle" font-family="var(--mono,monospace)" font-size="8" font-weight="700" fill="#fff">{}</text>`,
+  xml: _badge("#F60", "XML", "#fff", 5),
+  yaml: _badge("#CB171E", "Y", "#fff", 8),
+  ini: _badge("#6E7781", "⚙", "#fff", 8),
+  markdown: `<rect x="1" y="3" width="14" height="10" rx="2" fill="none" stroke="#57606A" stroke-width="1.3"/><path d="M3.5 10.5v-5l2 2.2 2-2.2v5M11.5 5.5v3.4m0 0L10 7.5m1.5 1.4L13 7.5" fill="none" stroke="#57606A" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>`,
+  shell: `<rect x="1" y="2" width="14" height="12" rx="2.5" fill="#2B3137"/><path d="M4 6l2.2 2L4 10" fill="none" stroke="#4AF626" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 10.5h4" stroke="#4AF626" stroke-width="1.4" stroke-linecap="round"/>`,
+  sql: `<ellipse cx="8" cy="3.8" rx="5.5" ry="2.3" fill="#336791"/><path d="M2.5 3.8v8.4c0 1.3 2.5 2.3 5.5 2.3s5.5-1 5.5-2.3V3.8c0 1.3-2.5 2.3-5.5 2.3s-5.5-1-5.5-2.3z" fill="#336791" opacity=".75"/>`,
+  dockerfile: `<rect x="1.5" y="7" width="3" height="3" fill="#2496ED"/><rect x="5" y="7" width="3" height="3" fill="#2496ED"/><rect x="8.5" y="7" width="3" height="3" fill="#2496ED"/><rect x="5" y="3.5" width="3" height="3" fill="#2496ED"/><rect x="8.5" y="3.5" width="3" height="3" fill="#2496ED"/><path d="M1 11h13.5c-.5 2-2.5 3.5-6.5 3.5S1.7 13 1 11z" fill="#2496ED"/>`,
+};
+
+/** Return a 16x16 SVG element with the language's brand icon (fallback: sprite "</>"). */
+export function langIcon(lang) {
+  const inner = LANG_ICON[monacoLang(lang)] || (lang && LANG_ICON[String(lang).toLowerCase()]);
+  if (!inner) return icon("i-code");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "ic lang-ic");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = inner;
+  return svg;
+}
 export function monacoLang(lang) {
   return LANG_MONACO[(lang || "").toLowerCase()] || "plaintext";
 }
@@ -590,7 +636,7 @@ function codeCard(code, lang, filename, ctx) {
 
   const head = el("div", "code-card__head");
   const label = el("span", "code-card__lang");
-  label.appendChild(icon(filename ? "i-file-code" : "i-code"));
+  label.appendChild(langIcon(lang));
   const labelText = el("span");
   labelText.textContent = filename || langLabel(lang);
   label.appendChild(labelText);
@@ -719,6 +765,8 @@ export function renderMarkdownStream(container, text, opts = {}) {
   const tailText = text.slice(st.src.length);
   if (!st.tail) { st.tail = el("div", "md-stream-tail"); container.appendChild(st.tail); }
   st.tail.textContent = "";
-  if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts));
+  // The tail block is re-parsed every frame — skip the async highlighter there
+  // (settled blocks above get it once; the final full render recolors everything).
+  if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts.highlighter ? { ...opts, highlighter: undefined } : opts));
   if (opts.streaming && opts.showCaret !== false) st.tail.appendChild(el("span", "md-caret"));
 }

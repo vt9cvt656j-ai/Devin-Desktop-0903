@@ -30,7 +30,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "./styles/app.css";
 import "@xterm/xterm/css/xterm.css";
-import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang } from "./markdown.js";
+import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang, langIcon } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
 import { createExtensionManager } from "./ext/manager.js";
 import { createCommandPalette } from "./ext/palette.js";
@@ -6541,8 +6541,13 @@ async function _applyUiZoom(factor, { toast = true } = {}) {
   }
   if (!applied) {
     document.documentElement.style.zoom = _uiZoom === 1 ? "" : String(_uiZoom);
-    try { monacoEditor?.layout?.(); } catch {}
   }
+  // 缩放后让所有按可视尺寸排版的组件重新布局（Monaco、分屏编辑器、终端、面板）
+  requestAnimationFrame(() => {
+    try { monacoEditor?.layout?.(); } catch {}
+    try { splitState?.editor?.layout?.(); } catch {}
+    try { window.dispatchEvent(new Event("resize")); } catch {}
+  });
   if (toast) showToast(`界面缩放 ${Math.round(_uiZoom * 100)}%`);
 }
 if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
@@ -16654,7 +16659,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         if (!_streamEl) { _streamEl = document.createElement("div"); _streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(_streamEl); }
         if (tail.type === "text") {
           const clean = _cleanAgentText(tail.content);
-          if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true, showCaret: false });
+          if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
         } else if (tail.type === "code" && !tail.complete) {
           const lineCount = tail.content.split("\n").length;
           const langDisplay = tail.lang ? langLabel(tail.lang) : 'Code';
@@ -16669,7 +16674,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
             existingCard.className = "code-card code-card--streaming";
             const head = document.createElement("div");
             head.className = "code-card__head";
-            head.innerHTML = `<span class="code-card__lang"><svg class="ic"><use href="#i-code"/></svg><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="atc-spin"></span><span class="code-card__linecount"></span></span>`;
+            head.innerHTML = `<span class="code-card__lang"><span class="code-card__label"></span></span><span class="code-card__streaming-meta"><span class="atc-spin"></span><span class="code-card__linecount"></span></span>`;
+            head.querySelector(".code-card__lang").prepend(langIcon(tail.lang));
             existingCard.appendChild(head);
             const pre = document.createElement("pre");
             pre.className = "code-card__body";
@@ -16711,7 +16717,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // current block. (The final, highlighted render still runs once on completion.)
       // Render into a dedicated sub-element so the think-card in body is not wiped.
       if (!body._chatStreamEl) { body._chatStreamEl = document.createElement("div"); body._chatStreamEl.className = "chat-stream-wrap"; body.appendChild(body._chatStreamEl); }
-      renderMarkdownStream(body._chatStreamEl, view, { streaming: true, showCaret: false });
+      renderMarkdownStream(body._chatStreamEl, view, { streaming: true, showCaret: false, highlighter: highlightCode });
       body._lastLen = view.length;
     }
     if (view && _plainStreamDiag.firstRenderMs == null) {
