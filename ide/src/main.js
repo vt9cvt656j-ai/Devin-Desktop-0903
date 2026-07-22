@@ -15883,6 +15883,17 @@ function _fallbackNextActionSuggestions(messages) {
 // even when the model forgot the tool). Returns [{label,text,send}] or null. Conservative:
 // only fires on a short contiguous option block AT THE END, gated by a choice cue (so a plain
 // numbered STEP list doesn't become buttons).
+// 模型把“需要用户拿主意”的问题写在正文里（没调 ask_user）时的保守检测：
+// 结尾是问号，且带明确的“要用户决定/选择”措辞。命中后 agent 循环会 nudge 它
+// 改用 ask_user 重新问，用户就能直接点选项而不是手动打字。
+function _looksLikeUserQuestion(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 6000 || /```\s*$/.test(t)) return false;
+  const lastBlock = t.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean).pop() || "";
+  if (!/[？?]\s*$/.test(lastBlock)) return false;
+  return /(?:要不要|需不需要|需要我|要我|是否(?:需要|继续|要)|哪个|哪种|哪条|你(?:想|希望|倾向|选|要)|选哪|怎么选|可以吗|行吗|好吗|继续吗|确认一下|should i|do you (?:want|prefer|need)|which (?:one|option|way)|would you like)/i.test(lastBlock);
+}
+
 function _detectChoiceOptions(text) {
   const t = String(text || "").trim();
   if (!t || t.length > 5000) return null;
@@ -26643,7 +26654,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     const clean = _cleanAgentText(acc);
     if (clean.trim()) {
       if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
-      renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false });
+      renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
       if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
         _activeStreamDiag.firstRenderMs = Date.now() - _activeStreamDiag.attemptStartedAt;
       }
@@ -27039,12 +27050,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   const _cf0 = _cleanAgentText(acc);
   const cleanFinal = _dedupeRunNarrative(_dedupeRepeatedText(_cf0), narrativeSeen);
   if (streamEl) {
-    if (cleanFinal.trim()) renderMarkdownInto(streamEl, cleanFinal, { streaming: false });
+    if (cleanFinal.trim()) renderMarkdownInto(streamEl, cleanFinal, { streaming: false, highlighter: highlightCode });
     else streamEl.remove();
   } else if (cleanFinal.trim()) {
     const el = document.createElement("div");
     el.className = "agent-seg";
-    renderMarkdownInto(el, cleanFinal, { streaming: false });
+    renderMarkdownInto(el, cleanFinal, { streaming: false, highlighter: highlightCode });
     body.appendChild(el);
   }
   _appendThinkingReturnStatus(body, _turnConfig, _reasoningFinal, _turnUsage);
@@ -29001,11 +29012,24 @@ function _requiredEffectContract(run) {
     && (!external.length || hasWorkspaceObject || !!run._steeredWorkspaceRequired);
   if (!workspace && !runtime.length && !external.length && cancelled.size === 0) {
     const fallback = _runEffectTarget({ ...run, engineering });
+    // 纯信息询问（"这个项目干嘛用的"）没有副作用义务——别把它兜底成 external，
+    // 否则收尾被"外部副作用"门反复卡住，模型只能一遍遍辩解、重复复述答案。
+    if (fallback === "external" && _isInformationalQuery(text)) return empty;
     workspace = fallback === "workspace";
     if (fallback === "external") external.push("external");
     if (fallback === "runtime" && !runtime.length) runtime.push("run");
   }
   return { workspace, runtime, external };
+}
+
+// 纯信息询问：用户在"问"而不是"要求做"。只用于副作用兜底判定，带改动动词的任务
+// 在到达兜底前就已按 bug/architecture/mutation 信号归类，不会走到这里。
+function _isInformationalQuery(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  const lastLine = t.split("\n").map((s) => s.trim()).filter(Boolean).pop() || t;
+  return /[？?]\s*$/.test(lastLine)
+    || /(?:是什么|干嘛|干什么|做什么|什么用|啥用|什么意思|怎么回事|介绍(?:一下|下)?|解释(?:一下|下)?|讲讲|说说|梳理(?:一下|下)?|总结(?:一下|下)?|了解(?:一下|下)?|what(?:'s| is| does)\b|explain\b|describe\b|tell me about|overview)/i.test(t);
 }
 
 function _missingRequiredEffects(run, evidence) {
@@ -29193,7 +29217,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, effectNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0;
+  let continueNudges = 0, effectNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0, askUserNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -29541,6 +29565,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (quietTurns >= 4 && !pending && !_finishPlanIssue && !_missingRequiredEffect && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted) && _uiSettled && _requirementsSettled) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           break;
+        }
+        // 模型把“要用户拿主意”的问题写在正文里 → 逼它改用 ask_user 弹可点击选项，
+        // 用户点一下就能回，不用照着正文手动打字。只 nudge 一次，fail-open。
+        if (askUserNudges < 1 && _live() && _looksLikeUserQuestion(turn.text) && !_detectChoiceOptions(turn.text)) {
+          askUserNudges++;
+          _pushNudge("askUser", "你在正文里向用户提问/请他做选择——用户没法点击回答。改用 **ask_user 工具**重新问：question 用一句话，options 给 2-4 个具体候选（合适的话用 recommended 标出推荐项）。不要重复前面已经说过的分析，这一轮只发这一个工具调用。");
+          continue;
         }
         // D — early-turn tool-first nudge: if the model just talks without calling
         // ANY tool in the first ~2 turns, that's the "too dumb" failure pattern — it
@@ -35369,7 +35400,7 @@ async function _agentFollowUp(toolResults, container, session) {
     const tail = ce < segs.length ? segs[segs.length - 1] : null;
     if (tail) {
       if (!_streamE2) { _streamE2 = document.createElement("div"); _streamE2.className = "agent-seg agent-seg--stream"; body.appendChild(_streamE2); }
-      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true, showCaret: false }); }
+      if (tail.type === "text") { const c = _cleanAgentText(tail.content); if (c) renderMarkdownStream(_streamE2, c, { streaming: true, showCaret: false, highlighter: highlightCode }); }
     }
     _chatFollow();
   };
