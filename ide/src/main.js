@@ -3731,7 +3731,7 @@ function _dbUiIconSvg(kind) {
     schema: `<svg viewBox="0 0 24 24"><path d="M12 4 5 8v8l7 4 7-4V8l-7-4Z"/><path d="M5 8l7 4 7-4M12 12v8"/></svg>`,
     info: `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 11v5M12 8h.01"/></svg>`,
     ai: `<svg viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6.6 6.6l2.1 2.1M15.3 15.3l2.1 2.1M17.4 6.6l-2.1 2.1M8.7 15.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg>`,
-    gem: `<svg viewBox="0 0 24 24"><defs><linearGradient id="mpgGemA" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7dd3fc"/><stop offset="1" stop-color="#60a5fa"/></linearGradient><linearGradient id="mpgGemB" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#818cf8"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs><path d="M7 4h10l3.7 5H3.3L7 4Z" fill="url(#mpgGemA)" stroke="none"/><path d="M3.3 9h17.4L12 20.8 3.3 9Z" fill="url(#mpgGemB)" stroke="none"/><path d="M9.7 4h4.6l1.6 5H8.1l1.6-5Z" fill="#bae6fd" fill-opacity=".9" stroke="none"/><path d="M8.1 9h7.8L12 20.8 8.1 9Z" fill="#a5b4fc" fill-opacity=".5" stroke="none"/><path d="M3.3 9h17.4" fill="none" stroke="#fff" stroke-opacity=".65" stroke-width=".9"/></svg>`,
+    gem: `<svg viewBox="0 0 24 24"><defs><linearGradient id="mpgWbA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38bdf8"/><stop offset=".55" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient><linearGradient id="mpgWbB" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e0f2fe"/><stop offset="1" stop-color="#bfdbfe"/></linearGradient></defs><rect x="2.6" y="2.6" width="18.8" height="18.8" rx="5.2" fill="url(#mpgWbA)" stroke="none"/><rect x="2.6" y="2.6" width="18.8" height="18.8" rx="5.2" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="1"/><path d="M6.2 8.3c0-1.35 2.6-2.45 5.8-2.45s5.8 1.1 5.8 2.45v7.4c0 1.35-2.6 2.45-5.8 2.45s-5.8-1.1-5.8-2.45v-7.4Z" fill="#fff" fill-opacity=".14" stroke="none"/><ellipse cx="12" cy="8.3" rx="5.8" ry="2.45" fill="url(#mpgWbB)" stroke="none"/><ellipse cx="12" cy="8.3" rx="3.4" ry="1.35" fill="#60a5fa" fill-opacity=".55" stroke="none"/><path d="M6.2 11.95c1.15 1.05 3.25 1.6 5.8 1.6s4.65-.55 5.8-1.6M6.2 15.6c1.15 1.05 3.25 1.6 5.8 1.6s4.65-.55 5.8-1.6" fill="none" stroke="#fff" stroke-opacity=".75" stroke-width="1.15" stroke-linecap="round"/><circle cx="17.55" cy="16.85" r="3.4" fill="#10b981" stroke="#fff" stroke-width="1.1"/><path d="m15.95 16.9 1.15 1.15 2.1-2.3" fill="none" stroke="#fff" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
     cylinder: `<svg viewBox="0 0 24 24"><defs><linearGradient id="mpgDb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4facfe"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs><path d="M4.8 5.9v12.3c0 1.8 3.22 2.9 7.2 2.9s7.2-1.1 7.2-2.9V5.9" fill="url(#mpgDb)" stroke="none"/><ellipse cx="12" cy="5.9" rx="7.2" ry="2.75" fill="#93d5ff" stroke="none"/><ellipse cx="12" cy="5.9" rx="4.7" ry="1.55" fill="#54aef3" fill-opacity=".75" stroke="none"/><path d="M4.8 10.9c1.35 1.25 4 1.95 7.2 1.95s5.85-.7 7.2-1.95M4.8 15.3c1.35 1.25 4 1.95 7.2 1.95s5.85-.7 7.2-1.95" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="1.25"/><path d="M7.4 9.1v9.1" fill="none" stroke="#fff" stroke-opacity=".32" stroke-width="1.5"/></svg>`,
     struct: `<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 9h16M10 9v11"/></svg>`,
     export: `<svg viewBox="0 0 24 24"><path d="M12 4v10M8.5 10.5 12 14l3.5-3.5"/><path d="M5 16v3h14v-3"/></svg>`,
@@ -3757,6 +3757,38 @@ const _MP_DB_EXT_LABELS = {
   myd: "MySQL MyISAM 数据",
   myi: "MySQL MyISAM 索引",
 };
+
+// 工作台支持的驱动目录：协议兼容库（MariaDB→MySQL、Cockroach/Timescale→PG、Valkey→Redis 等）由后端别名归一化。
+const _MPM_DRIVERS = [
+  ["sqlite", "SQLite"],
+  ["mysql", "MySQL"],
+  ["mariadb", "MariaDB"],
+  ["postgres", "PostgreSQL"],
+  ["mssql", "SQL Server"],
+  ["mongodb", "MongoDB"],
+  ["redis", "Redis"],
+  ["clickhouse", "ClickHouse"],
+  ["elastic", "Elasticsearch"],
+];
+const _MPM_DRIVER_NAMES = Object.fromEntries(_MPM_DRIVERS);
+const _MPM_DRIVER_IDS = _MPM_DRIVERS.map(([id]) => id);
+const _MPM_DRIVER_HINTS = {
+  sqlite: "/绝对路径/data.db（本地 SQLite 文件）",
+  mysql: "mysql://user:password@127.0.0.1:3306/database（TiDB / OceanBase 等兼容）",
+  mariadb: "mysql://user:password@127.0.0.1:3306/database",
+  postgres: "postgres://user:password@127.0.0.1:5432/database（Cockroach / Timescale / Supabase / Neon 等兼容）",
+  mssql: "mssql://user:password@127.0.0.1:1433/database（?encrypt=off 可关加密）",
+  mongodb: "mongodb://user:password@127.0.0.1:27017/database（支持 mongodb+srv://）",
+  redis: "redis://127.0.0.1:6379（有密码：redis://:password@host:6379；Valkey / KeyDB 等兼容）",
+  clickhouse: "clickhouse://user:password@127.0.0.1:8123/database（HTTP 接口）",
+  elastic: "http://user:password@127.0.0.1:9200（Elasticsearch / OpenSearch）",
+};
+function _mpmTestQuery(driver) {
+  if (driver === "redis") return "PING";
+  if (driver === "mongodb") return '{"ping": 1}';
+  if (driver === "elastic") return "GET /";
+  return "SELECT 1";
+}
 
 // 每个打开的数据库标签页有自己的一份 UI 状态，挂在 openFiles 条目上，
 // 这样切标签页/重渲染都不会丢（视图、打开的表、实时数据缓存、SQL 草稿）。
@@ -3881,7 +3913,8 @@ function _mpResultHtml(out) {
         <span>${Number(out.elapsed_ms || 0).toLocaleString()} ms</span>
       </div>`;
   }
-  if (out.driver === "redis") {
+  if (out.result !== undefined) {
+    // redis / mongodb / elasticsearch 等非表格结果：直接渲染 JSON。
     return `<pre class="mp-json">${_escHtml(JSON.stringify(out.result, null, 2))}</pre>`;
   }
   if (out.ok || out.rows_affected !== undefined) {
@@ -4078,12 +4111,11 @@ function _mpQueryViewHtml(info, state, path) {
   // 本地库直接用裸路径：sqlx 的 sqlite: URI 解析会做百分号解码，路径里带 % / ? 会坏。
   const url = state.queryUrl || (sqlite ? path : "");
   const driver = state.queryDriver || "sqlite";
-  const driverNames = { sqlite: "SQLite", mysql: "MySQL", postgres: "PostgreSQL", redis: "Redis" };
   return `
     <div class="mp-query">
       <div class="mp-query__conn">
         <select data-db-driver aria-label="数据库类型">
-          ${["sqlite", "mysql", "postgres", "redis"].map((d) => `<option value="${d}"${driver === d ? " selected" : ""}>${driverNames[d]}</option>`).join("")}
+          ${_MPM_DRIVER_IDS.map((d) => `<option value="${d}"${driver === d ? " selected" : ""}>${_MPM_DRIVER_NAMES[d]}</option>`).join("")}
         </select>
         <input data-db-url value="${_escAttr(url)}" placeholder="数据库连接串，例如 sqlite:///path/to.db 或 mysql://user:pass@host:3306/db" aria-label="数据库连接串" spellcheck="false" />
         <button type="button" class="mp-run" data-mp-action="run-query" title="运行 SQL（⌘↵）">${_dbUiIconSvg("run")}<span>运行</span></button>
@@ -4789,6 +4821,8 @@ const _MPM_DIALECT = {
 };
 
 function _mpmDialect(driver) {
+  // 补全词典按方言家族回落：MariaDB 走 MySQL；MSSQL/ClickHouse 走通用 SQL（sqlite 基础词）。
+  if (driver === "mariadb") return _MPM_DIALECT.mysql;
   return _MPM_DIALECT[driver] || _MPM_DIALECT.sqlite;
 }
 
@@ -5238,15 +5272,22 @@ function _mpmOpenWorkbench(conn, landing = null) {
 // 不同引擎的标识符引用与"设计表"查询。
 function _mpmQuoteIdent(driver, name) {
   const n = String(name || "");
-  if (driver === "mysql") return "`" + n.replaceAll("`", "``") + "`";
+  if (driver === "mysql" || driver === "mariadb" || driver === "clickhouse") return "`" + n.replaceAll("`", "``") + "`";
+  if (driver === "mssql") return `[${n.replaceAll("]", "]]")}]`;
   return `"${n.replaceAll('"', '""')}"`;
 }
-function _mpmSelectQuery(driver, name) {
-  return `SELECT * FROM ${_mpmQuoteIdent(driver, name)} LIMIT 100;`;
+function _mpmSelectQuery(driver, name, lim = 100) {
+  if (driver === "mssql") return `SELECT TOP ${lim} * FROM ${_mpmQuoteIdent(driver, name)};`;
+  if (driver === "mongodb") return `{"find": "${String(name || "").replaceAll('"', '\\"')}", "limit": ${lim}}`;
+  if (driver === "elastic") return `GET /${String(name || "")}/_search?size=${lim}`;
+  return `SELECT * FROM ${_mpmQuoteIdent(driver, name)} LIMIT ${lim};`;
 }
 function _mpmStructQuery(driver, name) {
-  if (driver === "mysql") return `SHOW FULL COLUMNS FROM ${_mpmQuoteIdent(driver, name)};`;
-  if (driver === "postgres") return `SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = '${String(name || "").replaceAll("'", "''")}' ORDER BY ordinal_position;`;
+  if (driver === "mysql" || driver === "mariadb") return `SHOW FULL COLUMNS FROM ${_mpmQuoteIdent(driver, name)};`;
+  if (driver === "postgres" || driver === "mssql") return `SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = '${String(name || "").replaceAll("'", "''")}' ORDER BY ordinal_position;`;
+  if (driver === "clickhouse") return `DESCRIBE TABLE ${_mpmQuoteIdent(driver, name)};`;
+  if (driver === "mongodb") return `{"find": "${String(name || "").replaceAll('"', '\\"')}", "limit": 1}`;
+  if (driver === "elastic") return `GET /${String(name || "")}/_mapping`;
   return `PRAGMA table_info(${_mpmQuoteIdent("sqlite", name)});`;
 }
 
@@ -5288,12 +5329,26 @@ async function _mpmLoadLive(key, force = false) {
     if (conn.driver === "sqlite") {
       const out = await backend.invoke("db_query", { driver: "sqlite", url: conn.url, query: "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: r?.[1] === "view" ? "view" : "table", row_count: null, columns: null }));
-    } else if (conn.driver === "mysql") {
-      const out = await backend.invoke("db_query", { driver: "mysql", url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY TABLE_NAME", limit: 2000 });
+    } else if (conn.driver === "mysql" || conn.driver === "mariadb") {
+      const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY TABLE_NAME", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: String(r?.[1] || "").toUpperCase().includes("VIEW") ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
     } else if (conn.driver === "postgres") {
       const out = await backend.invoke("db_query", { driver: "postgres", url: conn.url, query: "SELECT c.relname, CASE WHEN c.relkind IN ('v','m') THEN 'view' ELSE 'table' END, GREATEST(c.reltuples::bigint, 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m') ORDER BY c.relname", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: r?.[1] === "view" ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
+    } else if (conn.driver === "mssql") {
+      const out = await backend.invoke("db_query", { driver: "mssql", url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_NAME", limit: 2000 });
+      tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: String(r?.[1] || "").toUpperCase().includes("VIEW") ? "view" : "table", row_count: null, columns: null }));
+    } else if (conn.driver === "clickhouse") {
+      const out = await backend.invoke("db_query", { driver: "clickhouse", url: conn.url, query: "SELECT name, if(engine LIKE '%View', 'view', 'table'), total_rows FROM system.tables WHERE database = currentDatabase() ORDER BY name", limit: 2000 });
+      tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: r?.[1] === "view" ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
+    } else if (conn.driver === "mongodb") {
+      const out = await backend.invoke("db_query", { driver: "mongodb", url: conn.url, query: '{"listCollections": 1, "nameOnly": true}', limit: 2000 });
+      const batch = out?.result?.cursor?.firstBatch || [];
+      tables = batch.map((c) => ({ name: c?.name, table_type: String(c?.type || "") === "view" ? "view" : "table", row_count: null, columns: null }));
+    } else if (conn.driver === "elastic") {
+      const out = await backend.invoke("db_query", { driver: "elastic", url: conn.url, query: "GET /_cat/indices?format=json", limit: 2000 });
+      const list = Array.isArray(out?.result) ? out.result : [];
+      tables = list.map((x) => ({ name: x?.index, table_type: "table", row_count: Number(x?.["docs.count"]) || null, columns: null }));
     } else {
       throw new Error(`不支持的连接类型：${conn.driver}`);
     }
@@ -5325,8 +5380,8 @@ async function _mpmLoadFunctions(key, force = false) {
       const out = await backend.invoke("db_query", { driver: "sqlite", url: conn.url, query: "PRAGMA function_list", limit: 2000 });
       const idx = Array.isArray(out?.columns) ? out.columns.indexOf("name") : -1;
       names = (out?.rows || []).map((r) => r?.[idx >= 0 ? idx : 0]).filter(Boolean);
-    } else if (conn.driver === "mysql") {
-      const out = await backend.invoke("db_query", { driver: "mysql", url: conn.url, query: "SHOW FUNCTION STATUS WHERE Db = DATABASE()", limit: 2000 });
+    } else if (conn.driver === "mysql" || conn.driver === "mariadb") {
+      const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: "SHOW FUNCTION STATUS WHERE Db = DATABASE()", limit: 2000 });
       const idx = Array.isArray(out?.columns) ? out.columns.findIndex((c) => String(c).toLowerCase() === "name") : -1;
       names = (out?.rows || []).map((r) => r?.[idx >= 0 ? idx : 1]).filter(Boolean);
     } else if (conn.driver === "postgres") {
@@ -5409,7 +5464,7 @@ async function _mpmLoadTableTab(tab, force = false) {
     const wantRowid = conn.kind === "file" && tab.tableType !== "view";
     const q = wantRowid
       ? `SELECT rowid AS _mprowid_, * FROM ${_mpmQuoteIdent("sqlite", tab.name)} LIMIT ${lim}`
-      : `SELECT * FROM ${_mpmQuoteIdent(conn.driver, tab.name)} LIMIT ${lim}`;
+      : _mpmSelectQuery(conn.driver, tab.name, lim).replace(/;$/, "");
     const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: q, limit: lim });
     if (!out || !Array.isArray(out.columns)) throw new Error("没有返回有效结果");
     let cols = out.columns;
@@ -5521,7 +5576,7 @@ function _mpmNewQueryTab(opts = {}) {
     title: opts.title || `查询 ${id}`,
     driver: opts.driver || conn?.driver || "sqlite",
     url: opts.url ?? (conn?.url || ""),
-    sql: opts.sql || "SELECT 1;",
+    sql: opts.sql || _mpmTestQuery(opts.driver || conn?.driver || "sqlite"),
     resultHtml: "",
   };
   _mpmState.queryTabs.push(tab);
@@ -5585,7 +5640,7 @@ async function _mpmDialogTest() {
   const started = performance.now();
   try {
     if (!inTauri) throw new Error("网页版暂不支持连接数据库");
-    const query = d.driver === "redis" ? "PING" : "SELECT 1";
+    const query = _mpmTestQuery(d.driver);
     await backend.invoke("db_query", { driver: d.driver, url, query, limit: 1 });
     d.testOk = true;
     d.testResult = `连接成功 · ${Math.round(performance.now() - started)} ms`;
@@ -5961,9 +6016,9 @@ function _mpmTreeHtml() {
   }
   parts.push(`<div class="mpm-tree__sect">我的连接</div>`);
   if (!_mpmState.savedConns.length) {
-    parts.push(`<div class="mpm-tree__loading">点功能区的「连接」新建 MySQL / PostgreSQL / Redis / SQLite 连接。</div>`);
+    parts.push(`<div class="mpm-tree__loading">点功能区的「连接」新建 MySQL / PostgreSQL / SQL Server / MongoDB / Redis / ClickHouse / Elasticsearch / SQLite 连接。</div>`);
   } else {
-    const badges = { mysql: "MySQL", postgres: "PG", redis: "Redis", sqlite: "SQLite" };
+    const badges = { mysql: "MySQL", mariadb: "Maria", postgres: "PG", mssql: "MSSQL", mongodb: "Mongo", redis: "Redis", sqlite: "SQLite", clickhouse: "CH", elastic: "ES" };
     for (const c of _mpmState.savedConns) {
       const key = `conn:${c.id}`;
       const active = _mpmState.selected === key;
@@ -6062,12 +6117,11 @@ function _mpmFunctionsHtml(conn) {
 }
 
 function _mpmConsoleHtml(tab) {
-  const driverNames = { sqlite: "SQLite", mysql: "MySQL", postgres: "PostgreSQL", redis: "Redis" };
   return `
     <div class="mpm-console">
       <div class="mp-query__conn">
         <select data-mpm-driver aria-label="数据库类型">
-          ${["sqlite", "mysql", "postgres", "redis"].map((d) => `<option value="${d}"${tab.driver === d ? " selected" : ""}>${driverNames[d]}</option>`).join("")}
+          ${_MPM_DRIVER_IDS.map((d) => `<option value="${d}"${tab.driver === d ? " selected" : ""}>${_MPM_DRIVER_NAMES[d]}</option>`).join("")}
         </select>
         <input data-mpm-url value="${_escAttr(tab.url)}" placeholder="本地 SQLite 填文件路径；远程 mysql://user:pass@host:3306/db" spellcheck="false" aria-label="连接串" />
         <button type="button" class="mp-run" data-mpm-run title="运行（⌘↵）">${_dbUiIconSvg("run")}<span>运行</span></button>
@@ -6139,7 +6193,7 @@ function _mpmInfoHtml() {
     return `
       <div class="mpm-info__obj">
         <span class="mpm-info__icon">${_dbUiIconSvg("cylinder")}</span>
-        <div class="mpm-info__title"><strong>${_escHtml(conn.label)}</strong><em>${_escHtml({ mysql: "MySQL", postgres: "PostgreSQL", redis: "Redis", sqlite: "SQLite" }[conn.driver] || conn.driver)} · ${statusText}</em></div>
+        <div class="mpm-info__title"><strong>${_escHtml(conn.label)}</strong><em>${_escHtml(_MPM_DRIVER_NAMES[conn.driver] || conn.driver)} · ${statusText}</em></div>
       </div>
       <dl class="mpm-info__facts">
         <div><dt>状态</dt><dd>${statusText}</dd></div>
@@ -6162,19 +6216,14 @@ function _mpmInfoHtml() {
 function _mpmDialogHtml() {
   const d = _mpmState.dialog;
   if (!d) return "";
-  const hints = {
-    mysql: "mysql://user:password@127.0.0.1:3306/database",
-    postgres: "postgres://user:password@127.0.0.1:5432/database",
-    redis: "redis://127.0.0.1:6379（有密码：redis://:password@host:6379）",
-    sqlite: "/绝对路径/data.db（本地 SQLite 文件）",
-  };
+  const hints = _MPM_DRIVER_HINTS;
   return `
     <div class="mpm-dialog">
       <div class="mpm-dialog__card" role="dialog" aria-modal="true" aria-label="新建连接">
         <h4>${_dbUiIconSvg("plugC")}<span>新建连接</span></h4>
         <div class="mpm-dialog__row"><label>类型</label>
           <select data-mpm-dlg-driver>
-            ${["mysql", "postgres", "redis", "sqlite"].map((x) => `<option value="${x}"${d.driver === x ? " selected" : ""}>${{ mysql: "MySQL", postgres: "PostgreSQL", redis: "Redis", sqlite: "SQLite" }[x]}</option>`).join("")}
+            ${_MPM_DRIVER_IDS.map((x) => `<option value="${x}"${d.driver === x ? " selected" : ""}>${_MPM_DRIVER_NAMES[x]}</option>`).join("")}
           </select>
         </div>
         <div class="mpm-dialog__row"><label>名称</label><input data-mpm-dlg-name value="${_escAttr(d.name)}" placeholder="可选，例如 生产库" spellcheck="false" /></div>
@@ -21215,7 +21264,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "remote", description: "**连接到另一台机器（服务器/电脑）直接在上面写代码、跑命令——无需 SSH/scp**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["connect", "disconnect", "status"], description: "connect 连接 / disconnect 断开切回本地 / status 看当前连接" }, url: { type: "string", description: "connect 用：远程守护进程地址，如 1.2.3.4:8765 或 http://host:8765" }, token: { type: "string", description: "connect 用：守护进程的 token" }, root: { type: "string", description: "connect 用(可选)：远程项目根目录，如 /home/user/app" } }, required: ["action"] } } },
       { type: "function", function: { name: "generate_image", description: "**按文字描述生成一张图片**（AI 出图），直接存进工作区，**生成的图会回传给你看**。", parameters: { type: "object", properties: { prompt: { type: "string", description: "图像描述——英文更准；精炼但抓细节（1～3 句：主体 + 风格气质 + 关键细节如真实文案/主色 hex/材质光线），动态写别套模板，别堆一长串标签废词。" }, dest: { type: "string", description: "保存路径，相对工作区根，如 assets/hero.png" }, width: { type: "integer", description: "宽（需是 16 的倍数）；默认 2048（超清）" }, height: { type: "integer", description: "高（需是 16 的倍数）；默认 2048（超清）" } }, required: ["prompt", "dest"] } } },
       { type: "function", function: { name: "design_board", description: "**把多张设计稿/图片以专业网格排版展示给用户，等用户点「选这个方向」后把选择结果返回给你**（交互式，类似 Midjourney/Lovable 的多方向选择器）。", parameters: { type: "object", properties: { title: { type: "string", description: "看板标题，如「Landing Page 设计方向」「Dashboard 布局方案」" }, variants: { type: "array", minItems: 2, maxItems: 9, items: { type: "object", properties: { label: { type: "string", description: "方案名，如「极简白」「暗黑科技」「温暖圆润」" }, path: { type: "string", description: "图片路径（之前 generate_image 保存的路径，相对工作区根）" }, description: { type: "string", description: "一句话描述这个方向的特点" } }, required: ["label", "path"] } } }, required: ["variants"] } } },
-      { type: "function", function: { name: "db_query", description: "**直接查 / 操作数据库**——支持 MySQL / PostgreSQL / SQLite（SQL）和 Redis（命令）。", parameters: { type: "object", properties: { driver: { type: "string", enum: ["mysql", "postgres", "sqlite", "redis"], description: "数据库类型" }, url: { type: "string", description: "连接串：mysql://user:pass@host:3306/db、postgres://user:pass@host…" }, query: { type: "string", description: "SQL 语句；或 redis 命令行（如 GET key、KEYS user:*、HGETALL h）" }, limit: { type: "integer", description: "最多返回行数（默认 500，上限 2000）" } }, required: ["driver", "url", "query"] } } },
+      { type: "function", function: { name: "db_query", description: "**直接查 / 操作数据库**——支持 MySQL / MariaDB / PostgreSQL / SQLite / SQL Server / ClickHouse（SQL）、Redis（命令）、MongoDB（JSON 命令）、Elasticsearch / OpenSearch（REST）；兼容库（TiDB、Cockroach、Timescale、Valkey 等）用对应基础驱动。", parameters: { type: "object", properties: { driver: { type: "string", enum: ["mysql", "mariadb", "postgres", "sqlite", "mssql", "mongodb", "redis", "clickhouse", "elastic"], description: "数据库类型" }, url: { type: "string", description: "连接串：mysql://user:pass@host:3306/db、postgres://…、mssql://user:pass@host:1433/db、mongodb://…、clickhouse://host:8123/db、http://host:9200（elastic）" }, query: { type: "string", description: "SQL 语句；redis 命令行（GET key）；mongodb JSON 命令（{\"find\":\"users\",\"limit\":10}）；elastic REST（GET /_cat/indices 或 POST /idx/_search {json}）" }, limit: { type: "integer", description: "最多返回行数（默认 500，上限 2000）" } }, required: ["driver", "url", "query"] } } },
       { type: "function", function: { name: "figma", description: "**把 Figma 设计文件结构化给你用**：读真实布局（层级 / Auto Layout / 尺寸 / 文案 / 填充）+ 配色 token（转成 OKLCH，映射成 shadcn/Tailwind 语义变量，可直接落 globals.css）。用户给 Figma URL 要「照着做 / 还原 / 转成代码 / 提取配色」时用它，别用 browser 一页页抄像素。取色三级兜底：Variables API → 命名样式 → 真实填充聚类。需先在设置里填 Figma 令牌。", parameters: { type: "object", properties: { url: { type: "string", description: "Figma 文件 / 画板 URL（形如 https://www.figma.com/design/<key>/名字?node-id=1-2），或文件 key。要精准解析某个画板：Figma 里右键该 frame → Copy link to selection，URL 会带 node-id。" }, action: { type: "string", enum: ["design", "tokens", "inspect", "image", "variables"], description: "design=主题+布局一次拿全（默认）；tokens=只要 shadcn 配色主题；inspect=只要结构化布局（可配合更大 depth 看更细）；image=把节点渲染成 PNG 参考图；variables=导出原始命名 token" }, node: { type: "string", description: "可选，显式节点 id（覆盖 URL 里的 node-id）；如 123:456" }, depth: { type: "integer", description: "可选，布局解析深度，默认 14；越深越细但越慢、越吃 Figma 限额" } }, required: ["url"] } } },
       { type: "function", function: { name: "background_monitor", description: "**碰到需要用户手动操作或等外部条件的步骤时，必须主动调这个工具——先告诉用户该做什么（贴链接/给命令/列步骤），然后立刻挂后台自动等，条件满足后自动恢复继续跑，不需要用户再回来说『好了』**。典型场景：需要验证码→告诉用户去填+monitor检测结果；需要装东西→给安装命令+monitor检测 which xxx 返回0；需要起服务→给启动命令+monitor用port等端口；需要用户在浏览器操作→给链接+monitor用capture/url/file检测操作结果。6 种检查类型，**优先选能自动检测的（port/file/command/url/capture），manual 是最后手段**。", parameters: { type: "object", properties: { message: { type: "string", description: "告诉用户在等什么（会显示在聊天里）" }, check_type: { type: "string", enum: ["capture", "file", "manual", "command", "url", "port"], description: "manual=等用户点继续, file=等文件出现(有 file_pattern 时等内容匹配), capture=监控抓包匹配 pattern, command=反复跑命令直到 exit 0, url=反复访问 URL 直到 HTTP 200, port=等端口被监听" }, pattern: { type: "string", description: "capture: 匹配关键词/正则; file: 文件路径; command: shell 命令; url: 完整 URL; port: 端口号如 3000" }, file_pattern: { type: "string", description: "file 类型专用：文件内容匹配（关键词或正则），设置后不只检查文件存在，还检查内容包含该模式" }, timeout: { type: "integer", description: "超时秒数，默认 300" } }, required: ["message", "check_type"] } } },
       { type: "function", function: { name: "start_demo", description: "开始把接下来的操作录成一段【功能演示 / 真实录屏】。", parameters: { type: "object", properties: { title: { type: "string", description: "这段演示的标题，如：登录流程演示" } } } } },
@@ -28242,7 +28291,7 @@ const _TOOL_CATALOG = [
   { name: "screenshot", desc: "无头浏览器截图看静态渲染/响应式/动画胶片；不能证明登录点击等交互流程", kw: ["截图", "无头", "headless", "看效果", "界面", "ui", "渲染", "样式", "好看", "长什么样", "预览"] },
   { name: "generate_image", desc: "AI 生成图片（配图/头像/logo/插画）+ **UI 设计稿/界面原型图**（先出图给用户看再写码）", kw: ["图片", "配图", "头像", "logo", "插画", "图标", "素材", "生图", "image", "banner", "封面", "设计稿", "界面图", "原型", "mockup", "ui设计", "设计图", "出图"] },
   { name: "design_board", desc: "多张设计稿排版展示+交互选择（用户点「选这个方向」后返回选择结果，不需要再问）", kw: ["设计", "排版", "对比", "方案", "方向", "看板", "网格", "展示", "选择", "design", "board", "grid", "variant", "comparison"] },
-  { name: "db_query", desc: "查/改数据库（mysql/postgres/sqlite/redis）", kw: ["数据库", "查数据", "表", "sql", "mysql", "postgres", "redis", "记录", "字段", "查询", "db"] },
+  { name: "db_query", desc: "查/改数据库（mysql/postgres/sqlite/mssql/mongodb/redis/clickhouse/elastic）", kw: ["数据库", "查数据", "表", "sql", "mysql", "postgres", "redis", "mongodb", "mssql", "clickhouse", "elasticsearch", "记录", "字段", "查询", "db"] },
   { name: "run_worker", desc: "派多个 worker 并行改多文件", kw: ["多文件", "并行", "批量", "一批", "所有文件", "整个项目", "全部改", "好几个"] },
   { name: "run_subagent", desc: "派只读子智能体做大范围调研", kw: ["调研", "梳理", "搞清楚", "怎么实现", "整体", "全貌", "分析一下"] },
   { name: "research_project", desc: "按用户要求生成完整代码库上手地图", kw: ["完整上手地图", "通览整个代码库", "深挖整个项目", "全项目架构地图"] },
@@ -28499,7 +28548,7 @@ function _toolReminderBlock() {
     + "· 联网：web_search(查文档/解法) · web_fetch(读全文) · http_request(调API)\n"
     + "· 网页/视觉：browser(测UI/点按钮/抓数据) · screenshot(看渲染) · generate_image(生成配图/头像/logo/UI设计稿)\n"
     + "· 🎨 **UI设计三件套**（做界面/设计/做APP时必用）：style_wardrobe(衣橱·整站风格选择·交互式·用户选完返回tokens) → design_board(设计看板·多方向对比·交互式·用户选方向后返回结果) → preview_choices(功能柜·组件级方案对比·实时预览·用户选完返回结果)\n"
-    + "· 数据：db_query(mysql/postgres/sqlite/redis)\n"
+    + "· 数据：db_query(mysql/postgres/sqlite/mssql/mongodb/redis/clickhouse/elastic)\n"
     + "· 容器/部署：用 run_cmd/run_in_terminal 跑 docker/compose/k8s/devcontainer 命令，read_logs/read_terminal/http_request 验证容器日志、端口和健康检查\n"
     + "· 持续/交互：run_in_terminal(启动 dev server/watch/守护进程) · read_logs/read_terminal/list_terminals/stop_terminal(看日志/停服务) · background_monitor(等端口/URL/文件/命令/抓包/人工操作后自动继续)\n"
     + "· 提效：run_worker(**并行**改多文件/**并行**生成衣橱3套风格) · run_subagent(大范围调研) · worktree(best-of-N 隔离工作树·难任务出多候选选最优) · generate_wiki(把代码库/产品自动摸成结构化产品Wiki存盘·做官网前打底) · update_plan · remember · lsp_definition/references";
