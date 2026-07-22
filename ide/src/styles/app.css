@@ -6786,6 +6786,27 @@ body.zen-mode .editor {
   border-radius: 9px;
   white-space: pre-wrap;
 }
+.msg__error--verify > details {
+  margin-top: 6px;
+}
+.msg__error--verify > details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.75;
+  user-select: none;
+}
+.msg__error--verify > details > pre {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  max-height: 220px;
+  overflow: auto;
+  background: rgba(210, 75, 67, 0.06);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .turn-stats {
   margin-top: 8px;
   font-size: 12.5px;

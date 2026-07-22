@@ -22799,9 +22799,14 @@ function _buildAgentOutcomeSummary(run, opts) {
   if (opts.didMutate) {
     if (opts.verificationPassed && opts.uiVerificationPassed !== false) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘，但没有额外命令输出。");
     else if (noAutoVerify && opts.uiVerificationPassed !== false) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
-    else lines.push(note ? `验证：未完全通过或未运行（${note}）` : "验证：未完全通过或未运行，不能当成已跑通。");
+    else {
+      // Only the first line of the note — the full command log already lives in the
+      // (collapsed) alert above; repeating it here doubles the red wall.
+      const noteBrief = note.split("\n")[0].slice(0, 160);
+      lines.push(noteBrief ? `验证：未完全通过或未运行（${noteBrief}）` : "验证：未完全通过或未运行，不能当成已跑通。");
+    }
   } else if (note && !noAutoVerify) {
-    lines.push(`验证/注意：${note}`);
+    lines.push(`验证/注意：${note.split("\n")[0].slice(0, 160)}`);
   }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
@@ -30737,7 +30742,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     uiVerificationPassed = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps;
     if (!uiVerificationPassed) {
-      finalVerificationNote += `${finalVerificationNote ? "\n" : ""}〔UI 未完成 fresh navigate，并在桌面 1440x900 与手机 390x844 **各自**完成真实 browser check、click/type/press 和针对具体状态的 assert；不能声称页面、交互或响应式已验证。〕`;
+      finalVerificationNote += `${finalVerificationNote ? "\n" : ""}〔界面改动还没在真实浏览器里验证过（桌面与手机视口的实际打开、点击和状态检查都没做），显示效果可能与预期不符。〕`;
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
@@ -30779,9 +30784,26 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       .filter((line) => line && !/本项目没有可自动识别的验证命令/.test(line))
       .join("\n");
     if (_verificationAlertText && (!verificationPassed || !uiVerificationPassed)) {
+      // Compact alert: one readable line up front, raw command output collapsed —
+      // a wall of red log text in the transcript is noise, not information.
       const note = document.createElement("div");
-      note.className = "msg__error";
-      note.textContent = "⚠️ " + _verificationAlertText;
+      note.className = "msg__error msg__error--verify";
+      const _alertLines = _verificationAlertText.split("\n");
+      const _alertSummary = (_alertLines[0] || "").slice(0, 160);
+      const _alertDetail = _alertLines.slice(1).join("\n").trim();
+      const _sum = document.createElement("div");
+      _sum.textContent = "⚠️ " + _alertSummary;
+      note.appendChild(_sum);
+      if (_alertDetail) {
+        const _det = document.createElement("details");
+        const _lab = document.createElement("summary");
+        _lab.textContent = "查看详情";
+        const _pre = document.createElement("pre");
+        _pre.textContent = _alertDetail;
+        _det.appendChild(_lab);
+        _det.appendChild(_pre);
+        note.appendChild(_det);
+      }
       body.appendChild(note);
     }
     let _outcomeSummary = "";
@@ -39037,12 +39059,20 @@ async function _interleavedTest(root, testCmd) {
     if (!failed) return { ran: true, ok: true, code, timedOut: false, report: "" };
     // Truncate to first ~40 lines so we don't blow context with a 5000-line test log.
     const lines = out.split("\n");
-    const head = lines.slice(0, 6).join("\n");
-    // Pull the FIRST FAIL block — most useful signal, the rest is noise.
-    const failIdx = lines.findIndex((l) => /FAIL|FAILED|✗|✘|✖|×|Test (suite )?failed|expected/i.test(l));
-    const failBlock = failIdx >= 0 ? lines.slice(failIdx, Math.min(failIdx + 30, lines.length)).join("\n") : "";
-    const tail = lines.slice(-10).join("\n");
-    const report = `${timedOut ? "验证超时" : "验证失败"}：\`${testCmd}\` 退出 ${code}：\n--- 头 ---\n${head}\n${failBlock ? "\n--- 首个失败 ---\n" + failBlock : ""}\n--- 尾 ---\n${tail}`;
+    let detail;
+    if (lines.length <= 16) {
+      // Short output: show it once, whole — head/tail slices of a short log just
+      // repeat the same error lines twice.
+      detail = out;
+    } else {
+      const head = lines.slice(0, 6).join("\n");
+      // Pull the FIRST FAIL block — most useful signal, the rest is noise.
+      const failIdx = lines.findIndex((l) => /FAIL|FAILED|✗|✘|✖|×|Test (suite )?failed|expected/i.test(l));
+      const failBlock = failIdx >= 6 ? lines.slice(failIdx, Math.min(failIdx + 30, lines.length)).join("\n") : "";
+      const tail = lines.slice(-10).join("\n");
+      detail = `${head}${failBlock ? "\n…\n" + failBlock : ""}\n…\n${tail}`;
+    }
+    const report = `${timedOut ? "验证超时" : "验证失败"}：\`${testCmd}\` 退出 ${code}：\n${detail}`;
     return { ran: true, ok: false, code, timedOut, report: report.slice(0, 4000) };
   } catch (e) {
     return { ran: true, ok: false, code: null, timedOut: false, report: `验证运行异常: ${e?.message || e}` };
