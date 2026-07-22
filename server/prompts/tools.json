@@ -2047,11 +2047,11 @@
           },
           "width": {
             "type": "integer",
-            "description": "宽（需是 16 的倍数）；默认 2048（超清）"
+            "description": "宽；不传=auto（由模型定）。gpt-image/dall-e 只支持固定档位，会自动就近取 1024/1536"
           },
           "height": {
             "type": "integer",
-            "description": "高（需是 16 的倍数）；默认 2048（超清）"
+            "description": "高；不传=auto（由模型定）。gpt-image/dall-e 只支持固定档位，会自动就近取 1024/1536"
           }
         },
         "required": [
@@ -2270,85 +2270,6 @@
         "required": [
           "title",
           "variants"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "style_wardrobe",
-      "description": "**衣橱：为用户的项目实时设计 3 套完整页面风格，像选衣服一样挑一套**。\n⚡ **速度关键：用 run_worker 并行生成 3 套**——先确定 3 个设计方向，然后 3 个 worker 同时写 HTML+CSS+tokens，总耗时 = 1 套的时间。\n📏 **质量关键：每套 HTML ≥120 行、CSS ≥60 行**——内容要丰满到缩略图就能看出差异。按项目类型展示对应 UI（邮箱→12+封邮件+侧栏+阅读区；电商→8+商品卡片+筛选；后台→统计卡+图表+表格）。**严禁只放 2 条数据的空壳页面。**\n🔗 **衣橱是 UI 三件套第一环**——衣橱定全局调性 → design_board 定页面布局 → preview_choices 定组件细节。衣橱返回的 tokens 必须贯穿后续所有设计。\n⚠️ 交互式工具——展示后等用户选，选完返回 tokens+CSS+palette，你直接拿结果继续。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "title": {
-            "type": "string",
-            "description": "衣橱标题，如「选一套你喜欢的风格」"
-          },
-          "context": {
-            "type": "string",
-            "description": "项目背景，如「宠物用品电商」「SaaS 数据分析平台」"
-          },
-          "outfits": {
-            "type": "array",
-            "minItems": 2,
-            "maxItems": 6,
-            "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string",
-                  "description": "风格名（要有记忆点：「Notion 简约」「Stripe 专业」而不是「风格1」）"
-                },
-                "html": {
-                  "type": "string",
-                  "description": "**≥120 行的完整页面 HTML**。按项目类型展示对应 UI：邮箱→12+封邮件+侧栏+阅读区；电商→8+商品+筛选；后台→统计卡+图表+表格。用 Unsplash 配真实图片、i.pravatar.cc 配头像。写真实内容，不要 Lorem ipsum。按 ~1000px 宽度布局。"
-                },
-                "css": {
-                  "type": "string",
-                  "description": "**≥60 行完整 CSS**——覆盖字体、配色、间距、布局、hover/active/选中状态。暗色用 #0f172a 不要纯黑。"
-                },
-                "description": {
-                  "type": "string",
-                  "description": "一句话描述调性和适合场景"
-                },
-                "palette": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "description": "4-5 个主色 hex 值"
-                },
-                "tag": {
-                  "type": "string",
-                  "description": "卡片标签如 Minimal / Bold / Dark"
-                },
-                "tagColor": {
-                  "type": "string",
-                  "description": "标签颜色 hex"
-                },
-                "url": {
-                  "type": "string",
-                  "description": "浏览器栏域名"
-                },
-                "tokens": {
-                  "type": "string",
-                  "description": "**≥15 个 CSS 变量的完整设计令牌**：主色+浅深变体+背景+表面+文字+次要文字+危险/成功/警告色+字体+圆角(sm/md/lg)+阴影(sm/md)+间距(xs/sm/md/lg)"
-                }
-              },
-              "required": [
-                "name",
-                "html",
-                "css",
-                "tokens"
-              ]
-            }
-          }
-        },
-        "required": [
-          "title",
-          "outfits"
         ]
       }
     }
@@ -3596,7 +3517,7 @@
         "properties": {
           "design": {
             "type": "string",
-            "description": "目标设计图路径（相对工作区根，如 .wardrobe/s1.png）"
+            "description": "目标设计图路径（相对工作区根，如 assets/design/s1.png）"
           },
           "url": {
             "type": "string",

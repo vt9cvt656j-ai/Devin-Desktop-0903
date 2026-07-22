@@ -91,4 +91,4 @@ Button 有 variant(default/secondary/outline/ghost/link/destructive) + size(sm/d
 - 图标用 lucide-react（shadcn 生态默认），绝不用 emoji。状态做全：hover/focus-visible/active/disabled/loading/空/错误/选中。
 - 真机验证：起 dev server → `browser navigate fresh=true` → 在 1440×900 和 390×844 两个视口 `browser check` 处理控制台/网络/溢出错误 → 用 click/type/press 跑关键流程再对具体 selector/文本 `assert`。截图只做视觉自检，不替代 check/assert。
 
-一句话：**设计 = 定一套语义令牌（base 中性 + primary + radius + 字体）→ 用官方 primitive 组合 → 令牌驱动深浅主题 → 真机验证。** 生成图/衣橱只在「用户要看几个明显不同方向再拍板」时作可选方向选择器，绝不是默认设计方法，更不能代替真实令牌体系。
+一句话：**设计 = 定一套语义令牌（base 中性 + primary + radius + 字体）→ 用官方 primitive 组合 → 令牌驱动深浅主题 → 真机验证。** 生成图/design_board 只在「用户要看几个明显不同方向再拍板」时作可选方向选择器，绝不是默认设计方法，更不能代替真实令牌体系。

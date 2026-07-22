@@ -506,28 +506,26 @@ pub async fn generate_image_chat(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let size_str = match (width, height) {
-        (Some(w), Some(h)) => format!("{w}x{h}"),
-        _ => "2048x2048".to_string(),
-    };
+    let size_str = image_size_for_model(&model, width, height);
 
     // Try THREE endpoints in sequence so this works on real OpenAI AND 中转站:
-    //   1. /v1/responses with image_generation tool (modern Codex GPT Image route)
-    //   2. /v1/images/generations (classic OpenAI images API)
-    //   3. /v1/chat/completions (chat-wrapped image gen)
-    // The first one is the standard for relay stations like LaoZhang/Codex that
-    // wrap gpt-image-2 behind ChatGPT Plus accounts via the Responses API.
+    //   1. /v1/images/generations (standard OpenAI Images API — the image-form request;
+    //      relay gateways like Sub2API document exactly this shape: model/prompt/size)
+    //   2. /v1/responses with image_generation tool (Codex GPT Image route)
+    //   3. /v1/chat/completions (chat-wrapped image gen, last resort)
+    // The Images API goes first: text-input routes (responses/chat) on relay gateways
+    // often degrade to a text answer instead of an image.
     let (bytes, mime): (Vec<u8>, String) =
-        match try_responses_api(&client, b, &api_key, &model, prompt, &size_str).await {
+        match try_images_api(&client, b, &api_key, &model, prompt, &size_str).await {
             Ok(ok) => ok,
             Err(e0) => {
-                match try_images_api(&client, b, &api_key, &model, prompt, &size_str).await {
+                match try_responses_api(&client, b, &api_key, &model, prompt, &size_str).await {
                     Ok(ok) => ok,
                     Err(e1) => match try_chat_image_api(&client, b, &api_key, &model, prompt).await
                     {
                         Ok(ok) => ok,
                         Err(e2) => {
-                            return Err(format!("responses: {e0} ｜images: {e1} ｜chat: {e2}"))
+                            return Err(format!("images: {e0} ｜responses: {e1} ｜chat: {e2}"))
                         }
                     },
                 }
@@ -694,6 +692,29 @@ async fn try_responses_api(
         "responses 响应里没有 image_generation_call 结果。片段：{}",
         text.chars().take(150).collect::<String>()
     ))
+}
+
+/// gpt-image / dall-e only accept a fixed size set — an unsupported size makes the
+/// Images API 400 and the whole call degrade to the flaky text routes. Snap to the
+/// nearest supported size (landscape/portrait/square) instead of passing raw pixels.
+fn image_size_for_model(model: &str, width: Option<u32>, height: Option<u32>) -> String {
+    match (width, height) {
+        (Some(w), Some(h)) => {
+            let m = model.to_lowercase();
+            if m.contains("gpt-image") || m.contains("dall-e") || m.contains("dall_e") {
+                if w > h {
+                    "1536x1024".to_string()
+                } else if h > w {
+                    "1024x1536".to_string()
+                } else {
+                    "1024x1024".to_string()
+                }
+            } else {
+                format!("{w}x{h}")
+            }
+        }
+        _ => "auto".to_string(),
+    }
 }
 
 /// Try /v1/images/generations. Returns (bytes, mime) or an error string.
@@ -1068,6 +1089,31 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 mod img_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn image_size_snaps_to_supported_set_for_gpt_image() {
+        assert_eq!(
+            image_size_for_model("gpt-image-2", Some(2048), Some(2048)),
+            "1024x1024"
+        );
+        assert_eq!(
+            image_size_for_model("gpt-image-2", Some(1920), Some(1080)),
+            "1536x1024"
+        );
+        assert_eq!(
+            image_size_for_model("dall-e-3", Some(800), Some(1200)),
+            "1024x1536"
+        );
+    }
+
+    #[test]
+    fn image_size_passes_through_for_other_models_and_defaults_to_auto() {
+        assert_eq!(
+            image_size_for_model("flux-pro", Some(1920), Some(1080)),
+            "1920x1080"
+        );
+        assert_eq!(image_size_for_model("gpt-image-2", None, None), "auto");
+    }
 
     #[test]
     fn extract_markdown_url() {

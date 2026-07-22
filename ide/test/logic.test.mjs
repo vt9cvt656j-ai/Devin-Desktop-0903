@@ -6373,18 +6373,17 @@ test("front-end build tasks preload design choice tools with browser verificatio
     activePath: "",
     _TOOL_BUNDLES: {
       browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["style_wardrobe", "design_board", "preview_choices", "visual_compare"] },
+      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
       db: { tools: ["db_query"] },
     },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query"]),
+    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _engineeringTaskProfile: () => ({ ui: true, uiProject: true, implementation: true, bug: false }),
-    _buildAgentToolSchemas: () => ["browser", "screenshot", "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
+    _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "做一个官网", []).map((tool) => tool.function.name);
   assert.ok(names.includes("browser"));
   assert.ok(names.includes("screenshot"));
-  assert.ok(names.includes("style_wardrobe"));
   assert.ok(names.includes("design_board"));
   assert.ok(names.includes("preview_choices"));
   assert.ok(names.includes("visual_compare"));
@@ -6399,13 +6398,13 @@ test("database-oriented tasks preload db_query without forcing browser tools", (
     activePath: "",
     _TOOL_BUNDLES: {
       browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["style_wardrobe", "design_board", "preview_choices", "visual_compare"] },
+      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
       db: { tools: ["db_query"] },
     },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query"]),
+    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _engineeringTaskProfile: helpers.profile,
-    _buildAgentToolSchemas: () => ["browser", "screenshot", "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
+    _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "设计数据库 schema 和索引", []).map((tool) => tool.function.name);
   assert.ok(names.includes("db_query"));
@@ -6420,11 +6419,11 @@ test("GitHub PR tasks preload gh tools while local git tools stay core", () => {
     activePath: "",
     _TOOL_BUNDLES: {
       browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["style_wardrobe", "design_board", "preview_choices", "visual_compare"] },
+      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
       db: { tools: ["db_query"] },
       github: { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"] },
     },
-    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"]),
+    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
     _engineeringTaskProfile: helpers.profile,
     _buildAgentToolSchemas: () => ["git_status", "git_diff", "git_log", "git_commit", "git_push", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "read_file"].map(schema),
@@ -6451,7 +6450,7 @@ test("profile-driven tool orchestration covers live IDE, backend, database, and 
     "git_status / git_diff / git_log / git_blame", "git_commit / git_branch / git_push / git_pull",
     "gh_pr_create / gh_pr_view / gh_pr_checks / gh_actions_log", "edit_file / multi_edit", "write_file",
     "browser", "screenshot", "capture_start", "capture_flows", "capture_replay",
-    "package_search", "github_repo", "developer_community_search", "web_scaffold", "style_wardrobe",
+    "package_search", "github_repo", "developer_community_search", "web_scaffold",
     "design_board", "preview_choices",
   ].map((name) => ({ name, desc: `${name} desc`, kw: [] }));
   const priorities = load("_profileToolPriorities", { _TOOL_CATALOG: catalog });
@@ -6634,14 +6633,14 @@ test("profile-based initial tool preload exposes capture, backend API, and packa
     activePath: "",
     _TOOL_BUNDLES: {
       browser: { tools: ["browser", "screenshot"] },
-      design: { tools: ["style_wardrobe", "design_board", "preview_choices", "visual_compare"] },
+      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
       db: { tools: ["db_query"] },
       github: { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"] },
     },
     _DEFERRED_TOOL_NAMES: new Set([
       "browser", "screenshot", "capture_start", "capture_flows", "capture_stop", "capture_replay",
       "http_request", "package_search", "github_repo", "developer_community_search",
-      "style_wardrobe", "design_board", "preview_choices", "visual_compare", "db_query",
+      "design_board", "preview_choices", "visual_compare", "db_query",
       "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
     ]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
@@ -6836,6 +6835,19 @@ test("plan steps advance from real tool evidence instead of waiting for another 
   assert.deepEqual(run._planSteps.map((step) => step.status), ["completed", "completed", "in_progress"]);
   advance(run, { type: "cmd", command: "npm test -- auth" }, { type: "cmd", content: "ok", code: 0 });
   assert.deepEqual(run._planSteps.map((step) => step.status), ["completed", "completed", "completed"]);
+});
+
+test("plan advances live at tool settle time and is not double-advanced at turn end", () => {
+  // Live tracking: the moment each tool result settles, the plan must advance —
+  // not only in the turn-end aggregation pass.
+  assert.match(SRC, /_settleToolStep\(step, result\);\s*\/\/ Live plan tracking[\s\S]{0,300}it\._planAdvanced = true;\s*_advancePlanFromTool\(run, call, result\);/,
+    "settle path must advance the plan immediately after each tool result");
+  // Failed tools must not advance the plan at settle time.
+  assert.match(SRC, /if \(run && it\.tc\.name !== "update_plan" && _toolExecutionSucceeded\(call, result\)\) \{\s*it\._planAdvanced = true;/,
+    "live advancement must be gated on tool success");
+  // Turn-end pass must respect the settle-time advancement instead of advancing again.
+  assert.match(SRC, /it\.tc\.name !== "update_plan" && \(it\._planAdvanced \|\| _advancePlanFromTool\(run, it\.call, it\.rawResult\)\)/,
+    "turn-end pass must not re-advance steps already advanced at settle time");
 });
 
 test("bounded engineering retrieval keeps sources that finish before the deadline", async () => {

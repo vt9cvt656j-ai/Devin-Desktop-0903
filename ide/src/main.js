@@ -6384,7 +6384,7 @@ function _mpmRenderCenterIfOpen() {
 // ---- chat-image lightbox (click to view at full / natural size) ----
 let _imgLightboxEl = null;
 // 生图的 data_url 按绝对路径缓存：design_board 渲染时优先用它（base64 直接显示，跟顶部
-// genimage 预览同一条可靠路径），绕开 Tauri asset 协议——.wardrobe 这类隐藏目录(点开头)
+// genimage 预览同一条可靠路径），绕开 Tauri asset 协议——隐藏目录(点开头)
 // 的 glob scope 常匹配不上 → webview 拒载 → 图空白。容量上限防内存涨。
 const _genImgDataUrls = new Map();
 function _cacheGenImg(absPath, dataUrl) {
@@ -19145,148 +19145,6 @@ function _renderPreviewPicker(variants, title, target) {
   return wrap;
 }
 
-function _renderWardrobe(outfits, title, context) {
-  const uid = "wr" + Math.random().toString(36).slice(2, 8);
-  const el = document.createElement("div");
-  el.className = "wr";
-
-  const hd = document.createElement("div");
-  hd.className = "wr__hd";
-  hd.innerHTML = `<div class="wr__hd-row"><span class="wr__hd-dot"></span><span class="wr__hd-title">${_escHtml(title)}</span>${context ? `<span class="wr__hd-ctx">${_escHtml(context)}</span>` : ""}</div><div class="wr__hd-sub">${outfits.length} 套风格为你定制 · 点一套开工</div>`;
-  el.appendChild(hd);
-
-  const body = document.createElement("div");
-  body.className = "wr__body";
-  const grid = document.createElement("div");
-  grid.className = "wr__grid";
-  if (outfits.length === 2) grid.style.gridTemplateColumns = "repeat(2, 1fr)";
-  if (outfits.length >= 4) grid.style.gridTemplateColumns = "repeat(4, 1fr)";
-
-  const cardData = [];
-
-  outfits.forEach((o, i) => {
-    const card = document.createElement("div");
-    card.className = "wr__card";
-    card.dataset.i = i;
-
-    if (o.tag) {
-      const tag = document.createElement("span");
-      tag.className = "wr__tag";
-      if (o.tagColor) tag.style.color = o.tagColor;
-      tag.textContent = o.tag;
-      card.appendChild(tag);
-    }
-
-    const chrome = document.createElement("div");
-    chrome.className = "wr__chrome";
-    chrome.innerHTML = `<span class="wr__cd wr__cd--r"></span><span class="wr__cd wr__cd--y"></span><span class="wr__cd wr__cd--g"></span><span class="wr__url">${_escHtml(o.url || "yoursite.com")}</span>`;
-    card.appendChild(chrome);
-
-    const vpEl = document.createElement("div");
-    vpEl.className = "wr__vp";
-    const page = document.createElement("div");
-    page.className = "wr__vp-page";
-    const scope = `${uid}_${i}`;
-    // outfit HTML 常含内联 <style>（innerHTML 注入会**全局泄漏**糊到 app）/ <script>（会在 app 上下文执行）
-    // / <html><body> 外壳。先抽出 <style> 一起 scope、删 <script> 和外壳标签——这是"上面奇奇怪怪东西"的根因。
-    let _outHtml = o.html || "";
-    let _inlineCss = "";
-    _outHtml = _outHtml.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (_m, _c) => { _inlineCss += "\n" + (_c || ""); return ""; });
-    _outHtml = _outHtml.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<\/?(?:html|head|body|link|meta|title)[^>]*>/gi, "").replace(/<!doctype[^>]*>/gi, "");
-    let scopedCss = "";
-    const _rawCss = (o.css || "") + _inlineCss;
-    if (_rawCss.trim()) {
-      let inKeyframes = 0;
-      scopedCss = _rawCss.replace(/(^|\})\s*([^{}]*)\{/g, (m, pre, sel) => {
-        if (pre.includes("}")) { if (inKeyframes > 0) inKeyframes--; }
-        const trimmed = sel.trim();
-        if (trimmed.startsWith("@keyframes") || trimmed.startsWith("@media")) { inKeyframes++; return m; }
-        if (inKeyframes > 0) return m;
-        if (!trimmed || trimmed.startsWith("@")) return m;
-        const scoped = trimmed.split(",").map(s => {
-          s = s.trim();
-          if (!s) return s;
-          // :root/html/body 必须映射到 scope 容器本身——否则 ".scope :root" 匹配不到任何元素，
-          // outfit 的 CSS 变量(:root{--x}) 和 body 全局样式全失效 → 按钮/导航/配色全裸="一股ai味"。
-          if (/^(?::root|html|body)$/i.test(s)) return `.${scope}`;
-          return `.${scope} ${s}`;
-        }).join(", ");
-        return `${pre} ${scoped} {`;
-      });
-      // fixed/sticky 会逃出卡片、定位到整个窗口顶部（糊住菜单栏）→ 在 outfit 内降级为 absolute
-      scopedCss = scopedCss.replace(/position\s*:\s*(?:fixed|sticky)/gi, "position: absolute");
-    }
-    if (scopedCss) { const s = document.createElement("style"); s.textContent = scopedCss; page.appendChild(s); }
-    const inner = document.createElement("div");
-    inner.className = scope;
-    // 给 scope 容器一个定位参照点：outfit 里被降级成 absolute 的导航(原 fixed)就贴着这个容器顶部、
-    // 不再飘到页面外造成"顶部重影/导航乱位"。
-    inner.style.position = "relative";
-    inner.innerHTML = _outHtml;
-    page.appendChild(inner);
-    vpEl.appendChild(page);
-
-    const eye = document.createElement("div");
-    eye.className = "wr__vp-eye";
-    eye.innerHTML = '<span><svg viewBox="0 0 16 16" fill="none"><path d="M8 3C3 3 1 8 1 8s2 5 7 5 7-5 7-5-2-5-7-5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/></svg>预览</span>';
-    vpEl.appendChild(eye);
-    card.appendChild(vpEl);
-
-    const info = document.createElement("div");
-    info.className = "wr__info";
-    const name = o.name || `风格 ${i + 1}`;
-    let infoHtml = `<div class="wr__name">${_escHtml(name)}</div>`;
-    if (o.description) infoHtml += `<div class="wr__desc">${_escHtml(o.description)}</div>`;
-    infoHtml += `<div class="wr__row">`;
-    if (Array.isArray(o.palette) && o.palette.length) {
-      infoHtml += `<div class="wr__palette">${o.palette.map(c => `<div class="wr__sw" style="background:${_escAttr(c)}"></div>`).join("")}</div>`;
-    }
-    infoHtml += `<button class="wr__btn" data-i="${i}">预览</button></div>`;
-    info.innerHTML = infoHtml;
-    card.appendChild(info);
-
-    cardData.push({ idx: i, name, desc: o.description || "", url: o.url || "yoursite.com", html: _outHtml, scope, scopedCss, card });
-    grid.appendChild(card);
-  });
-
-  body.appendChild(grid);
-  el.appendChild(body);
-
-  const foot = document.createElement("div");
-  foot.className = "wr__foot";
-  const resetBtn = document.createElement("button");
-  resetBtn.className = "wr__fbtn";
-  resetBtn.textContent = "重选";
-  const skipBtn = document.createElement("button");
-  skipBtn.className = "wr__fbtn";
-  skipBtn.textContent = "跳过";
-  skipBtn.dataset.skip = "1";
-  skipBtn.style.marginLeft = "8px";
-  const tip = document.createElement("span");
-  tip.className = "wr__tip";
-  tip.textContent = "点击预览查看完整页面 \xb7 选一套开工";
-  foot.append(resetBtn, skipBtn, tip);
-  el.appendChild(foot);
-
-  const modal = document.createElement("div");
-  modal.className = "wr-modal";
-  modal.innerHTML = '<div class="wr-modal__side"><div class="wr-modal__side-hd"><h3>预览风格</h3><p>点击左侧切换 \xb7 滚动查看完整页面</p></div><div class="wr-modal__side-list"></div><div class="wr-modal__side-foot"><button class="wr-modal__pick">选这套</button><button class="wr-modal__close">关闭</button></div></div><div class="wr-modal__main"><div class="wr-modal__chrome"><span class="wr__cd wr__cd--r"></span><span class="wr__cd wr__cd--y"></span><span class="wr__cd wr__cd--g"></span><span class="wr-modal__url-bar">—</span></div><div class="wr-modal__viewport"></div></div>';
-
-  const sideList = modal.querySelector(".wr-modal__side-list");
-  cardData.forEach(d => {
-    const item = document.createElement("div");
-    item.className = "wr-modal__side-item";
-    item.dataset.idx = d.idx;
-    item.innerHTML = `<div class="wr-modal__side-thumb"></div><div><div class="wr-modal__side-name">${_escHtml(d.name)}</div><div class="wr-modal__side-desc">${_escHtml(d.desc)}</div></div>`;
-    sideList.appendChild(item);
-  });
-
-  el._wrModal = modal;
-  el._wrCardData = cardData;
-  el._wrResetBtn = resetBtn;
-  return el;
-}
-
 function _renderExplainer(title, summary) {
   const el = document.createElement("div");
   el.className = "ex";
@@ -21260,7 +21118,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "lsp_definition", description: "跳到某个符号的定义。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
     { type: "function", function: { name: "lsp_references", description: "查找一个符号在项目里的所有引用/用法。", parameters: { type: "object", properties: { path: { type: "string", description: "符号出现处的文件" }, line: { type: "integer", description: "该符号所在行号(1 基)" }, symbol: { type: "string", description: "符号名（用来在该行定位列）" } }, required: ["path", "line"] } } },
     { type: "function", function: { name: "screenshot", description: "用无头浏览器渲染一个 http/https 网址并截图，**截图会直接回传给你看**——这是你的“眼睛”。", parameters: { type: "object", properties: { url: { type: "string", description: "要截图的网址，如 http://127.0.0.1:3000" }, width: { type: "integer", description: "视口宽，默认 1280" }, height: { type: "integer", description: "视口高，默认 800" }, frames: { type: "integer", description: "逐帧胶片模式：抓几帧（2-5）拼成一张图看动画过程。看动画/过渡/特效时传 4 左右；看静态布局不用传" }, duration_ms: { type: "integer", description: "逐帧模式：覆盖多长一段动画时间（毫秒，默认 2400）" } }, required: ["url"] } } },
-    { type: "function", function: { name: "visual_compare", description: "把当前 UI 和目标设计图并排展示，便于检查布局、间距、颜色和字体差异并继续迭代。它提供视觉对照，不保证自动达到像素级一致。", parameters: { type: "object", properties: { design: { type: "string", description: "目标设计图路径（相对工作区根，如 .wardrobe/s1.png 或某张逐屏设计图）" }, url: { type: "string", description: "你实现的页面在 dev server 的网址，如 http://127.0.0.1:3000" }, width: { type: "integer", description: "截图视口宽，默认 1440" }, height: { type: "integer", description: "截图视口高，默认 900" } }, required: ["design", "url"] } } },
+    { type: "function", function: { name: "visual_compare", description: "把当前 UI 和目标设计图并排展示，便于检查布局、间距、颜色和字体差异并继续迭代。它提供视觉对照，不保证自动达到像素级一致。", parameters: { type: "object", properties: { design: { type: "string", description: "目标设计图路径（相对工作区根，如 assets/design/s1.png 或某张逐屏设计图）" }, url: { type: "string", description: "你实现的页面在 dev server 的网址，如 http://127.0.0.1:3000" }, width: { type: "integer", description: "截图视口宽，默认 1440" }, height: { type: "integer", description: "截图视口高，默认 900" } }, required: ["design", "url"] } } },
   ];
   if (includeWrite) {
     tools.push(
@@ -21352,7 +21210,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "capture_replay", description: "**精确重放一条抓到的请求**（逆向/调试利器）。按 capture_flows 里的 `id` 取出原始请求，**原样带上抓到的所有请求头（cookie / token / 签名都在里面 → 这是能重放成功的关键）**，可选覆盖 url/method/headers/body 来改参试探。返回真实响应。比手拼 http_request 更可靠——不用重建那一堆头。", parameters: { type: "object", properties: { id: { type: "string", description: "capture_flows 返回里的 id=... 值" }, url: { type: "string", description: "可选，覆盖 URL（改 query / 路径试探）" }, method: { type: "string", description: "可选，覆盖方法" }, headers: { type: "object", description: "可选，覆盖/追加请求头（会合并进抓到的原始头）", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，覆盖请求体" } }, required: ["id"] } } },
       { type: "function", function: { name: "decode_qr", description: "识别图片里的二维码，返回它编码的文本内容（可能多个）。", parameters: { type: "object", properties: { path: { type: "string", description: "二维码图片的文件路径，如 debug.png 或一张截图的路径" }, data_url: { type: "string", description: "可选，base64 图片(data:image/...;base64,...)，没有文件时用" } }, required: [] } } },
       { type: "function", function: { name: "remote", description: "**连接到另一台机器（服务器/电脑）直接在上面写代码、跑命令——无需 SSH/scp**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["connect", "disconnect", "status"], description: "connect 连接 / disconnect 断开切回本地 / status 看当前连接" }, url: { type: "string", description: "connect 用：远程守护进程地址，如 1.2.3.4:8765 或 http://host:8765" }, token: { type: "string", description: "connect 用：守护进程的 token" }, root: { type: "string", description: "connect 用(可选)：远程项目根目录，如 /home/user/app" } }, required: ["action"] } } },
-      { type: "function", function: { name: "generate_image", description: "**按文字描述生成一张图片**（AI 出图），直接存进工作区，**生成的图会回传给你看**。", parameters: { type: "object", properties: { prompt: { type: "string", description: "图像描述——英文更准；精炼但抓细节（1～3 句：主体 + 风格气质 + 关键细节如真实文案/主色 hex/材质光线），动态写别套模板，别堆一长串标签废词。" }, dest: { type: "string", description: "保存路径，相对工作区根，如 assets/hero.png" }, width: { type: "integer", description: "宽（需是 16 的倍数）；默认 2048（超清）" }, height: { type: "integer", description: "高（需是 16 的倍数）；默认 2048（超清）" } }, required: ["prompt", "dest"] } } },
+      { type: "function", function: { name: "generate_image", description: "**按文字描述生成一张图片**（AI 出图），直接存进工作区，**生成的图会回传给你看**。", parameters: { type: "object", properties: { prompt: { type: "string", description: "图像描述——英文更准；精炼但抓细节（1～3 句：主体 + 风格气质 + 关键细节如真实文案/主色 hex/材质光线），动态写别套模板，别堆一长串标签废词。" }, dest: { type: "string", description: "保存路径，相对工作区根，如 assets/hero.png" }, width: { type: "integer", description: "宽；不传=auto（由模型定）。gpt-image/dall-e 只支持固定档位，会自动就近取 1024/1536" }, height: { type: "integer", description: "高；不传=auto（由模型定）。gpt-image/dall-e 只支持固定档位，会自动就近取 1024/1536" } }, required: ["prompt", "dest"] } } },
       { type: "function", function: { name: "design_board", description: "**把多张设计稿/图片以专业网格排版展示给用户，等用户点「选这个方向」后把选择结果返回给你**（交互式，类似 Midjourney/Lovable 的多方向选择器）。", parameters: { type: "object", properties: { title: { type: "string", description: "看板标题，如「Landing Page 设计方向」「Dashboard 布局方案」" }, variants: { type: "array", minItems: 2, maxItems: 9, items: { type: "object", properties: { label: { type: "string", description: "方案名，如「极简白」「暗黑科技」「温暖圆润」" }, path: { type: "string", description: "图片路径（之前 generate_image 保存的路径，相对工作区根）" }, description: { type: "string", description: "一句话描述这个方向的特点" } }, required: ["label", "path"] } } }, required: ["variants"] } } },
       { type: "function", function: { name: "db_query", description: "**直接查 / 操作数据库**——支持 MySQL / MariaDB / PostgreSQL / SQLite / SQL Server / ClickHouse（SQL）、Redis（命令）、MongoDB（JSON 命令）、Elasticsearch / OpenSearch（REST）；兼容库（TiDB、Cockroach、Timescale、Valkey 等）用对应基础驱动。", parameters: { type: "object", properties: { driver: { type: "string", enum: ["mysql", "mariadb", "postgres", "sqlite", "mssql", "mongodb", "redis", "clickhouse", "elastic"], description: "数据库类型" }, url: { type: "string", description: "连接串：mysql://user:pass@host:3306/db、postgres://…、mssql://user:pass@host:1433/db、mongodb://…、clickhouse://host:8123/db、http://host:9200（elastic）" }, query: { type: "string", description: "SQL 语句；redis 命令行（GET key）；mongodb JSON 命令（{\"find\":\"users\",\"limit\":10}）；elastic REST（GET /_cat/indices 或 POST /idx/_search {json}）" }, limit: { type: "integer", description: "最多返回行数（默认 500，上限 2000）" } }, required: ["driver", "url", "query"] } } },
       { type: "function", function: { name: "figma", description: "**把 Figma 设计文件结构化给你用**：读真实布局（层级 / Auto Layout / 尺寸 / 文案 / 填充）+ 配色 token（转成 OKLCH，映射成 shadcn/Tailwind 语义变量，可直接落 globals.css）。用户给 Figma URL 要「照着做 / 还原 / 转成代码 / 提取配色」时用它，别用 browser 一页页抄像素。取色三级兜底：Variables API → 命名样式 → 真实填充聚类。需先在设置里填 Figma 令牌。", parameters: { type: "object", properties: { url: { type: "string", description: "Figma 文件 / 画板 URL（形如 https://www.figma.com/design/<key>/名字?node-id=1-2），或文件 key。要精准解析某个画板：Figma 里右键该 frame → Copy link to selection，URL 会带 node-id。" }, action: { type: "string", enum: ["design", "tokens", "inspect", "image", "variables"], description: "design=主题+布局一次拿全（默认）；tokens=只要 shadcn 配色主题；inspect=只要结构化布局（可配合更大 depth 看更细）；image=把节点渲染成 PNG 参考图；variables=导出原始命名 token" }, node: { type: "string", description: "可选，显式节点 id（覆盖 URL 里的 node-id）；如 123:456" }, depth: { type: "integer", description: "可选，布局解析深度，默认 14；越深越细但越慢、越吃 Figma 限额" } }, required: ["url"] } } },
@@ -21360,7 +21218,6 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "start_demo", description: "开始把接下来的操作录成一段【功能演示 / 真实录屏】。", parameters: { type: "object", properties: { title: { type: "string", description: "这段演示的标题，如：登录流程演示" } } } } },
       { type: "function", function: { name: "stop_demo", description: "结束录制，并把刚录下的步骤【一步一步回放展示给用户】（聊天里直接出现可播放的回放器），同时把这段演示存成一个可双击打开、能播放的 HTML 录屏文件到工作区。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，保存的 HTML 路径（相对工作区根）；默认 .michael-demos/demo-时间戳.html" } } } } },
       { type: "function", function: { name: "preview_choices", description: "**在聊天里给用户展示多个可选方案的实时预览**。", parameters: { type: "object", properties: { title: { type: "string", description: "预览标题，如「选择登录方式」「数据怎么加载更快」" }, target: { type: "string", description: "目标元素/场景描述，如「用户认证」「产品列表缓存策略」" }, variants: { type: "array", minItems: 2, maxItems: 8, items: { type: "object", properties: { name: { type: "string", description: "方案名（用比喻）：「护照法 (JWT)」「酒店房卡法 (Session)」「便利店 (缓存)」" }, html: { type: "string", description: "前端：演示 HTML；后端：用 pv-scene/pv-avatar/pv-bubble/pv-verdict/pv-s…" }, css: { type: "string", description: "前端方案的 CSS（自动 scope）；后端漫画模式通常不需要额外 CSS（内置类已够用）" }, code: { type: "string", description: "用户选了后写进项目的最终代码（React/Vue 组件代码 + Tailwind 类名，不是裸 HTML/CSS）" }, description: { type: "string", description: "一句话说明，用生活比喻：「用户随身带护照，验证超快但丢了麻烦」" } }, required: ["name", "html", "css"] } } }, required: ["title", "variants"] } } },
-      { type: "function", function: { name: "style_wardrobe", description: "**衣橱：为用户的项目实时设计 3 套完整页面风格，像选衣服一样挑一套**。", parameters: { type: "object", properties: { title: { type: "string", description: "衣橱标题，如「选一套你喜欢的风格」" }, context: { type: "string", description: "项目背景，如「宠物用品电商」「SaaS 数据分析平台」" }, outfits: { type: "array", minItems: 2, maxItems: 6, items: { type: "object", properties: { name: { type: "string", description: "风格名（要有记忆点：「Notion 简约」「Stripe 专业」而不是「风格1」）" }, html: { type: "string", description: "**≥120 行的完整页面 HTML**。" }, css: { type: "string", description: "**≥60 行完整 CSS**——覆盖字体、配色、间距、布局、hover/active/选中状态。暗色用 #0f172a 不要纯黑。" }, description: { type: "string", description: "一句话描述调性和适合场景" }, palette: { type: "array", items: { type: "string" }, description: "4-5 个主色 hex 值" }, tag: { type: "string", description: "卡片标签如 Minimal / Bold / Dark" }, tagColor: { type: "string", description: "标签颜色 hex" }, url: { type: "string", description: "浏览器栏域名" }, tokens: { type: "string", description: "**≥15 个 CSS 变量的完整设计令牌**：主色+浅深变体+背景+表面+文字+次要文字+危险/成功/警告色+字体+圆…" } }, required: ["name", "html", "css", "tokens"] } } }, required: ["title", "outfits"] } } },
       { type: "function", function: { name: "visual_explain", description: "**漫画解释器：AI 生成可爱小人漫画来给用户讲解概念**。", parameters: { type: "object", properties: { title: { type: "string", description: "解释主题，如「什么是 JWT 认证」「缓存是怎么加速的」" }, prompt: { type: "string", description: "漫画画面描述（英文更准）：描述 3-4 个面板的内容——每个面板有什么角色、说什么话、做什么动作。" }, summary: { type: "string", description: "一句话中文总结（显示在图片下方）" } }, required: ["title", "prompt"] } } },
     );
     // External MCP tools (from the workspace's .mcp.json) — full-power, so agent
@@ -21431,7 +21288,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
 // needs via search_tools or direct-by-name calls (auto-healed at line ~14678).
 // Regex-based preloading was removed per user directive: "交给模型判断，不要老拿正则".
 const _TOOL_BUNDLES = {
-  design:  { tools: ["design_research", "style_wardrobe", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
+  design:  { tools: ["design_research", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
   desktop: { tools: ["automation", "system", "decode_qr"] },
   browser: { tools: ["browser", "screenshot"] },
   github:  { tools: ["gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply"] },
@@ -21504,7 +21361,7 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = []) {
     seedNames(_TOOL_BUNDLES.browser?.tools);
   }
   if (profile.uiProject || (profile.ui && profile.implementation && !profile.bug)) {
-    seedNames(["style_wardrobe", "design_board", "preview_choices", "visual_compare"]);
+    seedNames(["design_board", "preview_choices", "visual_compare"]);
   }
   if (profile.browserAutomation || profile.capture) {
     seedNames(_TOOL_BUNDLES.browser?.tools);
@@ -21598,7 +21455,7 @@ const _KNOWN_TOOLS = new Set([
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
   "local_discovery", "live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog", "read_screen", "ui_click",
   "lsp_symbols", "lsp_definition", "lsp_references", "browser",
-  "preview_choices", "style_wardrobe", "visual_explain", "design_research",
+  "preview_choices", "visual_explain", "design_research",
   "background_monitor", "developer_community_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
 ]);
 const _TOOL_ALIASES = {
@@ -21651,7 +21508,6 @@ const _TOOL_ALIASES = {
   research_project: "research_project", explore_codebase: "research_project", explore_project: "research_project", map_project: "research_project", understand_codebase: "research_project", study_project: "research_project", deep_research_codebase: "research_project",
   design_research: "design_research", research_design: "design_research", ui_research: "design_research", plan_ui: "design_research", design_plan: "design_research", ui_architecture: "design_research", plan_design: "design_research",
   previewchoices: "preview_choices", show_choices: "preview_choices", showchoices: "preview_choices", preview_options: "preview_choices", show_options: "preview_choices", preview_variants: "preview_choices", preview_animation: "preview_choices", preview_effect: "preview_choices", preview_style: "preview_choices", preview_component: "preview_choices", compare_styles: "preview_choices", style_picker: "preview_choices", animation_picker: "preview_choices", pick_style: "preview_choices", choose_style: "preview_choices", show_preview: "preview_choices", live_preview: "preview_choices",
-  stylewardrobe: "style_wardrobe", wardrobe: "style_wardrobe", ui_wardrobe: "style_wardrobe", page_styles: "style_wardrobe", design_wardrobe: "style_wardrobe", show_designs: "style_wardrobe", pick_design: "style_wardrobe", choose_design: "style_wardrobe", design_picker: "style_wardrobe", ui_picker: "style_wardrobe", page_picker: "style_wardrobe", show_styles: "style_wardrobe",
   visualexplain: "visual_explain", explain_visual: "visual_explain", comic_explain: "visual_explain", visual_comic: "visual_explain", explain_concept: "visual_explain", teach_visual: "visual_explain", show_explain: "visual_explain", animated_explain: "visual_explain", explainer: "visual_explain", comic: "visual_explain",
   // LSP aliases — every model phrases these differently.
   lspsymbols: "lsp_symbols", symbols: "lsp_symbols", get_symbols: "lsp_symbols", outline: "lsp_symbols", list_symbols: "lsp_symbols", file_outline: "lsp_symbols", file_symbols: "lsp_symbols",
@@ -22504,7 +22360,6 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     }
     case "computer": return { type: "automation", method: "mouse.click", params: {} };
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
-    case "style_wardrobe": return { type: "wardrobe", title: args.title || "选一套风格", context: args.context || "", outfits: Array.isArray(args.outfits) ? args.outfits : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
     case "system": {
       let _path = args.path;
@@ -28509,7 +28364,7 @@ function _profileToolPriorities(text, profile = null, k = 8) {
     add("db_query", "read_file", "search", "knowledge_search");
   }
   if (p.ui || p.uiProject) {
-    if (p.uiProject && p.implementation && !p.bug) add("web_scaffold", "style_wardrobe", "design_board", "preview_choices");
+    if (p.uiProject && p.implementation && !p.bug) add("web_scaffold", "design_board", "preview_choices");
     add("browser", "screenshot");
   }
   if (packageVersion) {
@@ -28652,11 +28507,11 @@ function _toolReminderBlock() {
     + "· Git：git_status/git_diff/git_log/git_blame 先看真实改动；git_commit/git_branch/git_push/git_pull/gh_pr_* 做提交、分支、远端和 PR/CI\n"
     + "· 联网：web_search(查文档/解法) · web_fetch(读全文) · http_request(调API)\n"
     + "· 网页/视觉：browser(测UI/点按钮/抓数据) · screenshot(看渲染) · generate_image(生成配图/头像/logo/UI设计稿)\n"
-    + "· 🎨 **UI设计三件套**（做界面/设计/做APP时必用）：style_wardrobe(衣橱·整站风格选择·交互式·用户选完返回tokens) → design_board(设计看板·多方向对比·交互式·用户选方向后返回结果) → preview_choices(功能柜·组件级方案对比·实时预览·用户选完返回结果)\n"
+    + "· 🎨 **UI设计两件套**（做界面/设计/做APP时必用）：design_board(设计看板·多方向对比·交互式·用户选方向后返回结果) → preview_choices(功能柜·组件级方案对比·实时预览·用户选完返回结果)\n"
     + "· 数据：db_query(mysql/postgres/sqlite/mssql/mongodb/redis/clickhouse/elastic)\n"
     + "· 容器/部署：用 run_cmd/run_in_terminal 跑 docker/compose/k8s/devcontainer 命令，read_logs/read_terminal/http_request 验证容器日志、端口和健康检查\n"
     + "· 持续/交互：run_in_terminal(启动 dev server/watch/守护进程) · read_logs/read_terminal/list_terminals/stop_terminal(看日志/停服务) · background_monitor(等端口/URL/文件/命令/抓包/人工操作后自动继续)\n"
-    + "· 提效：run_worker(**并行**改多文件/**并行**生成衣橱3套风格) · run_subagent(大范围调研) · worktree(best-of-N 隔离工作树·难任务出多候选选最优) · generate_wiki(把代码库/产品自动摸成结构化产品Wiki存盘·做官网前打底) · update_plan · remember · lsp_definition/references";
+    + "· 提效：run_worker(**并行**改多文件) · run_subagent(大范围调研) · worktree(best-of-N 隔离工作树·难任务出多候选选最优) · generate_wiki(把代码库/产品自动摸成结构化产品Wiki存盘·做官网前打底) · update_plan · remember · lsp_definition/references";
   const mcp = _mcpCatalogEntries();
   if (mcp.length) s += "\n· 外接(MCP)：" + mcp.slice(0, 8).map((e) => e.name).join(" · ");
   return s;
@@ -28746,7 +28601,7 @@ function _uiDesignCraftBlock(text, profile = _engineeringTaskProfile(text)) {
   const p = profile || {};
   if (!(p.ui || p.uiProject)) return "";
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
-- 设计先行：先确认真实内容、目标用户、品牌调性、现有素材/截图/数据源；缺方向时用 style_wardrobe 给 2-4 套可选风格，用户已指定风格就直接落地，不要卡着问。
+- 设计先行：先确认真实内容、目标用户、品牌调性、现有素材/截图/数据源；缺方向时用 generate_image 出几张方向稿 + design_board 让用户选，用户已指定风格就直接落地，不要卡着问。
 - 设计系统：先定义 tokens 再写页面。至少覆盖 --background/--foreground/--card/--muted/--primary/--accent/--border/--ring/--radius，并映射到 Tailwind theme/CSS variables；主色只选 1 个色系 + 1 个强调色 + 中性色(zinc/slate/neutral)，禁止到处随机 hex。
 - 配色纪律：浅色避免死白一片，用 subtle gradient / tinted surface / border alpha 分层；深色用 #0f172a/#111827 级别，不用纯黑；按钮和重点信息必须有可读对比，危险/成功/警告色单独 token。
 - 排版纪律：明确 display/heading/body/caption 四级；标题用 font-display 或项目已有字体，正文用 font-sans；使用 text-5xl/4xl/3xl/2xl、leading-tight/relaxed、max-w-prose/measure 控制阅读宽度，禁止整页同字号同字重。
@@ -30128,6 +29983,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
         _settleToolStep(step, result);
+        // Live plan tracking: advance the plan the moment each tool settles, so the
+        // plan card follows the run in real time instead of jumping at turn end.
+        if (run && it.tc.name !== "update_plan" && _toolExecutionSucceeded(call, result)) {
+          it._planAdvanced = true;
+          _advancePlanFromTool(run, call, result);
+        }
         if (run) { run._recentSigs = run._recentSigs || []; run._recentSigs.push(_sig); if (run._recentSigs.length > 8) run._recentSigs.shift(); }
         const actualPath = call._resolvedPath || result?.path || call.path || "";
         const key = call.type === "cmd" ? "$ " + (call.command || "").slice(0, 40) : (call.type === "git" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "screenshot") ? "" : _normRel(actualPath, root);
@@ -30248,12 +30109,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
-      // Design pipeline nudge: after wardrobe/design_board results, remind agent of next step
+      // Design pipeline nudge: after design_board results, remind agent of next step
       if (run.mode === "agent") {
         const _allContent = toolMsgs.map(m => m.content || "").join("\n");
-        if (/用户选择了「.*」风格/.test(_allContent) && !/design_board/.test(_allContent)) {
-          _pushNudge("design", "✅ 衣橱选完了。**下一步立刻做**：①把 tokens 写进 tailwind.config 或 CSS 变量文件 ②如果 generate_image 可用 → 出 2-3 张布局方向设计稿 → 调 **design_board** 让用户选方向 ③开始搭建时遇到组件选择 → 用 **preview_choices**");
-        } else if (/用户选择了设计方向/.test(_allContent)) {
+        if (/用户选择了设计方向/.test(_allContent)) {
           _pushNudge("design", "✅ 设计方向选完了。**现在开始写代码**：①直接按布局骨架→区块→交互→响应式实现 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证");
         }
       }
@@ -30405,7 +30264,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const _ok = _toolExecutionSucceeded(it.call, it.rawResult);
         const _workspaceMutated = _ok && (it._wikiMutated || _toolMutatesWorkspace(it.call, it.rawResult));
         if (_ok) {
-          if (it.tc.name !== "update_plan" && _advancePlanFromTool(run, it.call, it.rawResult)) planSteps = run._planSteps;
+          if (it.tc.name !== "update_plan" && (it._planAdvanced || _advancePlanFromTool(run, it.call, it.rawResult))) planSteps = run._planSteps;
           for (const kind of _runtimeEvidenceKinds(it.call, it.rawResult)) _runtimeEffects.add(kind);
           for (const kind of _externalEvidenceKinds(it.call, it.rawResult)) _externalEffects.add(kind);
         }
@@ -31029,10 +30888,10 @@ function _streamWriteContent(entry, key) {
 //  2) the code then types in character-by-character via a requestAnimationFrame
 //     loop that APPENDS only the newly-revealed slice (never re-renders the whole
 //     block) — so even a huge/bursty stream can't freeze the UI.
-// 大工具调用（衣橱/设计看板/方案预览…）的参数可能要生成几百行，期间又不像 write_file 有实时
+// 大工具调用（设计看板/方案预览…）的参数可能要生成几百行，期间又不像 write_file 有实时
 // 代码预览——没任何进度指示就会让界面看着"半天没反应"。给非写文件的（可能大的）工具一个轻量
 // 进度卡：转圈 + "正在生成 X…（N 字符）"，参数流到哪显示到哪；停顿时心跳也会接管更新它。
-const _TOOL_PROGRESS_LABELS = { style_wardrobe: "风格衣橱", design_board: "设计看板", preview_choices: "方案预览", visual_explain: "讲解漫画", generate_image: "生成图片", design_research: "设计调研" };
+const _TOOL_PROGRESS_LABELS = { design_board: "设计看板", preview_choices: "方案预览", visual_explain: "讲解漫画", generate_image: "生成图片", design_research: "设计调研" };
 function _liveToolProgress(entry, container) {
   if (!entry || !entry.name || !container || entry.name === "update_plan") return; // update_plan 有自己的计划 UI
   const args = entry.args || "";
@@ -31214,7 +31073,7 @@ function _toolStepActionLabel(call) {
     demostop: "录制完成", screenshot: "截图", browser: "浏览器", computer: "电脑", system: "系统",
     automation: "自动化", readscreen: "读取屏幕", uiclick: "操作元素", remote: "远程", askuser: "需要你确认", current_time: "当前时间", localdiscovery: "附近发现", liveenvironment: "环境数据", livemarkets: "市场数据", liveflights: "飞机状态", roadenvironment: "道路环境", trackshipment: "快递核验", shopcatalog: "商品价格", db: "数据库",
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
-    wardrobe: "风格选择", explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
+    explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
     game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", generate_3d: "3D 模型", generate_sound: "音效",
     generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
@@ -33521,7 +33380,7 @@ async function _executeToolStep(step, call, root, run) {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "vizcompare", path: "", content: "[不可用] visual_compare 只能在 Michael IDE 桌面 App 里用（要驱动无头 Chrome 截图）。" }; }
       const _vcUrl = (call.url || "").trim();
       const _vcDesignRel = (call.design || "").trim();
-      if (!_vcUrl || !_vcDesignRel) { res.className = "atc-result atc-result--err"; res.textContent = "缺参数"; return { type: "vizcompare", path: "", content: "[ERROR] visual_compare 需要 design（设计图路径，如 .wardrobe/s1.png）和 url（dev server 网址）。" }; }
+      if (!_vcUrl || !_vcDesignRel) { res.className = "atc-result atc-result--err"; res.textContent = "缺参数"; return { type: "vizcompare", path: "", content: "[ERROR] visual_compare 需要 design（设计图路径，如 assets/design/s1.png）和 url（dev server 网址）。" }; }
       const _vcRoot = root || rootPath || workspaceRoots[0] || "";
       const _vcDesignAbs = _vcDesignRel.startsWith("/") ? _vcDesignRel : (_vcRoot ? _vcRoot + "/" + _vcDesignRel : _vcDesignRel);
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 截图并对比设计中…`;
@@ -34609,7 +34468,7 @@ async function _executeToolStep(step, call, root, run) {
           img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;background:var(--bg2,#f3f4f6)";
           const absPath = v.path && v.path.startsWith("/") ? v.path : (giRoot ? giRoot + "/" + v.path : v.path);
           // 图片加载（健壮三级）：① 刚生成时缓存的 data_url（跟顶部 genimage 预览同源、必渲染）；
-          // ② 没缓存就 readFileDataUrl 读文件转 data_url——绕开 Tauri asset 协议（.wardrobe 这类
+          // ② 没缓存就 readFileDataUrl 读文件转 data_url——绕开 Tauri asset 协议（这类
           // 隐藏目录会被 glob scope 拒载 → 图空白）；③ 实在不行才退回 asset 协议。生图可能几十秒、
           // board 可能在文件写完前就渲染 → onerror 每 4s 重试 _loadImg（文件一写好就显示，~40s 兜底）。
           const _loadImg = () => {
@@ -34667,7 +34526,7 @@ async function _executeToolStep(step, call, root, run) {
           return { type: "designboard", content: "用户跳过了设计方向选择，不采用任何方案。继续做其他的，或者问用户想要什么风格。" };
         }
         res.className = "atc-result atc-result--ok"; res.textContent = chosen.label || "已选";
-        return { type: "designboard", content: `✅ 用户选择了设计方向「${chosen.label || "方案"}」${chosen.description ? "（" + chosen.description + "）" : ""}。\n\n📐 设计稿路径：${chosen.path}\n\n⚡ **下一步行动**：\n1. 直接按布局骨架→各区块→交互→响应式实现\n2. 按设计稿的布局+衣橱的设计令牌写真实代码（设计图是参考，不是嵌进去）\n3. 遇到组件有多种方案时 → 用 **preview_choices** 让用户选（配色继承衣橱 tokens）\n4. 代码写完用 **browser** 打开看效果，对照设计稿检查` };
+        return { type: "designboard", content: `✅ 用户选择了设计方向「${chosen.label || "方案"}」${chosen.description ? "（" + chosen.description + "）" : ""}。\n\n📐 设计稿路径：${chosen.path}\n\n⚡ **下一步行动**：\n1. 直接按布局骨架→各区块→交互→响应式实现\n2. 按设计稿的布局+项目的设计令牌写真实代码（设计图是参考，不是嵌进去）\n3. 遇到组件有多种方案时 → 用 **preview_choices** 让用户选（配色继承项目 tokens）\n4. 代码写完用 **browser** 打开看效果，对照设计稿检查` };
       }
       const labels = variants.map((v, i) => `${i+1}. ${v.label || "方案"+(i+1)}`).join("、");
       return { type: "designboard", content: `已展示 ${variants.length} 张设计方案：${labels}。（无预览面板，用户需在聊天里回复选哪个方向。）` };
@@ -34685,7 +34544,7 @@ async function _executeToolStep(step, call, root, run) {
         const out = await backend.invoke("generate_image_chat", { root: giRoot, baseUrl: _imgCfg.baseUrl || MICHAEL_API, apiKey: _imgCfg.apiKey || "", model: _imgModel, prompt: _enrichImagePrompt(call.prompt), dest: call.dest, width: call.width || null, height: call.height || null });
         try { reloadDir(parentDir(call.dest.startsWith("/") ? call.dest : giRoot + "/" + call.dest)); } catch {}
         // 按绝对路径缓存 data_url（与 design_board 的 absPath 同口径）→ design_board 直接拿来渲染，
-        // 不走 asset 协议（.wardrobe 隐藏目录会被 glob scope 拒载）。
+        // 不走 asset 协议（隐藏目录会被 glob scope 拒载）。
         try { if (out && out.data_url) _cacheGenImg(call.dest.startsWith("/") ? call.dest : (giRoot ? giRoot + "/" + call.dest : call.dest), out.data_url); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = "已生成";
         if (vp && out && out.data_url) {
@@ -34810,84 +34669,6 @@ async function _executeToolStep(step, call, root, run) {
       res.className = "atc-result atc-result--ok"; res.textContent = chosen.name;
       const codeBlock = chosen.code || chosen.css || "";
       return { type: "preview", path: call.target || "", content: `用户选择了「${chosen.name}」${chosen.description ? "（" + chosen.description + "）" : ""}。\n\n完整代码（直接写进项目）：\n\`\`\`\n${codeBlock}\n\`\`\`\n\n把上面的代码加到目标 ${call.target || "元素"} 上，不需要再修改。` };
-
-    } else if (call.type === "wardrobe") {
-      if (!call.outfits || !call.outfits.length) { res.className = "atc-result atc-result--err"; res.textContent = "缺 outfits"; return { type: "wardrobe", path: "", content: "[ERROR] style_wardrobe 需要 outfits 数组，至少 2 套风格。" }; }
-      res.className = "atc-result"; res.textContent = `${call.outfits.length} 套风格`;
-      // zyz 中继对超大 tool-call 会缓冲卡死，所以衣橱支持「小文件拼装」：outfit 的 html/css 若以
-      // "file:" 开头就当文件路径读回内容——agent 可先用小块 write_file 把每套写成文件、style_wardrobe
-      // 只传路径（参数极小、不触发缓冲卡死），这里读回来正常渲染。读不到就退回空（不影响其他套）。
-      for (const _o of call.outfits) {
-        for (const _k of ["html", "css"]) {
-          const _v = _o && typeof _o[_k] === "string" ? _o[_k].trim() : "";
-          if (_v.startsWith("file:") || _v.startsWith("@file:")) {
-            const _rel = _v.replace(/^@?file:/, "").trim();
-            try {
-              const _root = (rootPath || (workspaceRoots && workspaceRoots[0]) || "").replace(/\/$/, "");
-              const _fp = _rel.startsWith("/") ? _rel : (_root ? _root + "/" + _rel.replace(/^\.?\//, "") : _rel);
-              _o[_k] = await backend.readTextFile(_fp);
-            } catch { _o[_k] = ""; }
-          }
-        }
-      }
-      const wardrobe = _renderWardrobe(call.outfits, call.title || "选一套风格", call.context || "");
-      if (vp) { vp.innerHTML = ""; vp.appendChild(wardrobe); }
-      const modal = wardrobe._wrModal;
-      if (modal) document.body.appendChild(modal);
-      const cardData = wardrobe._wrCardData || [];
-      step.classList.add("is-open");
-      _chatFollow(run && run.session);
-      const chosen = await new Promise(resolve => {
-        let curPv = null;
-        const mVp = modal && modal.querySelector(".wr-modal__viewport");
-        const mUrl = modal && modal.querySelector(".wr-modal__url-bar");
-        const mPick = modal && modal.querySelector(".wr-modal__pick");
-        const mClose = modal && modal.querySelector(".wr-modal__close");
-        function renderPv(idx) {
-          const d = cardData[idx]; if (!d || !mVp) return;
-          curPv = idx;
-          mVp.innerHTML = "";
-          if (d.scopedCss) { const s = document.createElement("style"); s.textContent = d.scopedCss; mVp.appendChild(s); }
-          const w = document.createElement("div");
-          w.className = d.scope + " wr-modal__page";
-          w.innerHTML = d.html;
-          mVp.appendChild(w);
-          mVp.scrollTop = 0;
-          if (mUrl) mUrl.textContent = d.url;
-          if (modal) modal.querySelectorAll(".wr-modal__side-item").forEach(it => { it.classList.toggle("active", parseInt(it.dataset.idx) === idx); });
-          if (mPick) mPick.textContent = "选 " + d.name;
-        }
-        function openPv(idx) { renderPv(idx); if (modal) { modal.classList.add("open"); document.body.style.overflow = "hidden"; } }
-        function closePv() { if (modal) modal.classList.remove("open"); document.body.style.overflow = ""; }
-        function selectStyle(idx) {
-          wardrobe.querySelectorAll(".wr__card").forEach(c => { c.classList.toggle("pk", parseInt(c.dataset.i) === idx); c.classList.toggle("fd", parseInt(c.dataset.i) !== idx); });
-          wardrobe.querySelectorAll(".wr__btn").forEach(b => { if (parseInt(b.dataset.i) === idx) { b.classList.add("done"); b.textContent = "✓ 已选"; } else { b.classList.remove("done"); b.textContent = "预览"; } });
-          closePv();
-          if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
-          document.removeEventListener("keydown", kh);
-          resolve(call.outfits[idx]);
-        }
-        wardrobe.querySelectorAll(".wr__card").forEach(c => { c.addEventListener("click", () => openPv(parseInt(c.dataset.i))); });
-        wardrobe.querySelectorAll(".wr__btn").forEach(b => { b.addEventListener("click", e => { e.stopPropagation(); openPv(parseInt(b.dataset.i)); }); });
-        if (modal) {
-          modal.querySelectorAll(".wr-modal__side-item").forEach(it => { it.addEventListener("click", () => renderPv(parseInt(it.dataset.idx))); });
-          if (mPick) mPick.addEventListener("click", () => { if (curPv !== null) selectStyle(curPv); });
-          if (mClose) mClose.addEventListener("click", closePv);
-          modal.addEventListener("click", e => { if (e.target === modal) closePv(); });
-        }
-        function kh(e) { if (!modal || !modal.classList.contains("open")) return; if (e.key === "Escape") closePv(); if (e.key === "ArrowRight" && curPv < cardData.length - 1) renderPv(curPv + 1); if (e.key === "ArrowLeft" && curPv > 0) renderPv(curPv - 1); if (e.key === "Enter" && curPv !== null) selectStyle(curPv); }
-        document.addEventListener("keydown", kh);
-        if (wardrobe._wrResetBtn) wardrobe._wrResetBtn.addEventListener("click", () => { wardrobe.querySelectorAll(".wr__card").forEach(c => { c.classList.remove("pk", "fd"); }); wardrobe.querySelectorAll(".wr__btn").forEach(b => { b.classList.remove("done"); b.textContent = "预览"; }); });
-        const skipBtn = wardrobe.querySelector("[data-skip]");
-        if (skipBtn) skipBtn.addEventListener("click", () => { if (modal && modal.parentNode) modal.parentNode.removeChild(modal); document.removeEventListener("keydown", kh); resolve(null); });
-      });
-      if (!chosen) {
-        res.className = "atc-result"; res.textContent = "已跳过";
-        return { type: "wardrobe", path: "", content: "用户跳过了风格选择，继续做其他的。" };
-      }
-      res.className = "atc-result atc-result--ok"; res.textContent = chosen.name;
-      const tokens = chosen.tokens || "";
-      return { type: "wardrobe", path: "", content: `✅ 用户选择了「${chosen.name}」风格${chosen.description ? "（" + chosen.description + "）" : ""}。\n\n${chosen.palette ? "🎨 主色板：" + chosen.palette.join(", ") + "\n\n" : ""}${tokens ? "🔧 设计令牌（后续所有设计必须基于这套变量）：\n\`\`\`css\n" + tokens + "\n\`\`\`\n\n" : ""}📐 完整页面 CSS（参考布局和样式细节）：\n\`\`\`css\n${chosen.css || ""}\n\`\`\`\n\n⚡ **下一步行动**：\n1. 如果有 generate_image 可用 → 基于这套配色出 2-3 个**页面布局方向**的设计稿，用 **design_board** 让用户选方向\n2. 确认项目技术栈（读 package.json）→ 把 tokens 写进 tailwind.config.js 的 theme.extend 或 CSS 变量文件\n3. 用**现代框架**（React/Vue/Next/Nuxt + Tailwind）写组件化代码，**严禁输出裸 HTML/CSS 文件**\n4. 写代码时遇到组件有多种实现 → 用 **preview_choices** 展示选项（配色继承 tokens）\n5. 图标用 lucide-react/@heroicons，图片用 next/image + Unsplash` };
 
     } else if (call.type === "explain") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "explain", path: "", content: "[不可用] visual_explain 只能在桌面 App 里用（需要调生图模型）。请用文字回答。" }; }
