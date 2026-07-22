@@ -9,6 +9,7 @@ mod browser;
 mod capture;
 mod db;
 mod debug;
+mod devin;
 mod extensions;
 mod files;
 mod game;
@@ -193,6 +194,9 @@ pub fn run() {
             git::git_blame,
             ai::ai_chat,
             ai::ai_chat_with_tools,
+            devin::devin_create_session,
+            devin::devin_send_message,
+            devin::devin_get_session,
             ai::ai_complete,
             ai::cancel_ai,
             ai::web_fetch,
