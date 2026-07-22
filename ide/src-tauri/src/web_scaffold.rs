@@ -41,7 +41,10 @@ pub async fn web_scaffold(
     let fw = framework.unwrap_or_default().trim().to_lowercase();
     let preset = style.unwrap_or_default().trim().to_lowercase();
     // Big-tech presets ship the company's official library, not a hand-imitation.
-    let is_material = matches!(preset.as_str(), "material" | "material3" | "m3" | "google" | "谷歌");
+    let is_material = matches!(
+        preset.as_str(),
+        "material" | "material3" | "m3" | "google" | "谷歌"
+    );
     let is_tdesign = matches!(preset.as_str(), "tdesign" | "tencent" | "腾讯");
     // Vue is the default per the house style; react is accepted but currently
     // shares the Vite+Tailwind+token base with a React entry. Material rides its
@@ -51,7 +54,10 @@ pub async fn web_scaffold(
     } else if is_tdesign {
         false
     } else {
-        matches!(fw.as_str(), "react" | "reactjs" | "react.js" | "jsx" | "tsx")
+        matches!(
+            fw.as_str(),
+            "react" | "reactjs" | "react.js" | "jsx" | "tsx"
+        )
     };
 
     let root = PathBuf::from(&workspace);

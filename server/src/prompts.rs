@@ -322,6 +322,10 @@ const AUTO_KNOWLEDGE_MIN_QUERY_CHARS: usize = 12;
 const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
+const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 2;
+const DESIGN_KNOWLEDGE_MAX_CHARS: usize = 14_000;
+const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 1.0;
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -1097,6 +1101,54 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
     ))
 }
 
+/// Build a bounded design-blueprint block from the michael-design corpus for a UI task.
+/// Unlike `auto_knowledge_block` (generic engineering reference), these hits are complete,
+/// production-grade design prompts meant to be adopted as the visual/structural blueprint.
+fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
+    let request = user_request?.trim();
+    if request.is_empty() {
+        return None;
+    }
+    let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
+    let hits = crate::knowledge::search(
+        &query,
+        Some(DESIGN_KNOWLEDGE_DOMAIN),
+        DESIGN_KNOWLEDGE_MAX_HITS,
+    )
+    .into_iter()
+    .filter(|hit| hit.domain == DESIGN_KNOWLEDGE_DOMAIN && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE)
+    .take(DESIGN_KNOWLEDGE_MAX_HITS)
+    .collect::<Vec<_>>();
+    if hits.is_empty() {
+        return None;
+    }
+    let mut sections = Vec::with_capacity(hits.len());
+    let mut budget = DESIGN_KNOWLEDGE_MAX_CHARS;
+    for (index, hit) in hits.iter().enumerate() {
+        if budget < 500 {
+            break;
+        }
+        let text = bounded_chars(&hit.text, budget);
+        budget = budget.saturating_sub(text.chars().count());
+        sections.push(format!(
+            "【设计蓝本 {}｜{}/{}｜相关度 {:.3}】\n{}",
+            index + 1,
+            hit.domain,
+            hit.topic,
+            hit.score,
+            text
+        ));
+    }
+    Some(format!(
+        "--- michael-design 设计蓝本（按用户请求自动检索）---\n\
+         下面是与本次界面任务最相关的完整成品级设计提示词（含技术栈、令牌、布局、动效规范）。\
+         **优先把它作为视觉与结构蓝本执行**：布局节奏、配色气质、字体层级、动效工艺照它的水准来，\
+         文案与业务内容替换成用户的真实产品；与用户的明确要求冲突时以用户为准。\
+         若蓝本方向不合适或想要更多方向，用 knowledge_search(domain=\"michael-design\") 换关键词再检索。\n\n{}",
+        sections.join("\n\n———\n\n")
+    ))
+}
+
 /// Decide whether the user's real request needs the UI specialization. Keep generic engineering
 /// terms out: a false positive adds several prompt blocks and can steer a backend task toward a
 /// frontend stack even though the tool/runtime capabilities themselves remain unchanged. Gates the
@@ -1694,6 +1746,32 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 prompt_blocks.push("ui_design_guide");
                 sys.push_str("\n\n");
                 sys.push_str(&guide);
+            }
+        }
+        // 设计蓝本检索：UI 任务额外注入 michael-design 库里最相关的完整成品级设计提示词，
+        // 作为视觉/结构蓝本（与通用工程参考块相互独立）。粘性回退同 auto_knowledge。
+        if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
+            let design_query = user_request
+                .clone()
+                .filter(|q| looks_like_ui_task(q))
+                .or_else(|| {
+                    body.get("messages")
+                        .and_then(|m| m.as_array())
+                        .and_then(|msgs| {
+                            msgs.iter()
+                                .rev()
+                                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                                .take(20)
+                                .filter_map(user_message_text)
+                                .map(|t| t.chars().take(2000).collect::<String>())
+                                .find(|t| looks_like_ui_task(t))
+                        })
+                });
+            if let Some(block) = design_knowledge_block(design_query.as_deref()) {
+                sys.push_str("\n\n");
+                sys.push_str(&block);
+                prompt_blocks.push("design_knowledge");
+                tracing::info!(mode, "auto-injecting michael-design blueprint");
             }
         }
     }
