@@ -14,16 +14,24 @@ REMOTE_DIR="${REMOTE_DIR:-/opt/michael-ide-deploy/server}"
 REMOTE="${SERVER_USER}@${SERVER_HOST}"
 REMOTE_Q="$(printf '%q' "$REMOTE_DIR")"
 
-SSH_ARGS=(-p "$SERVER_PORT" -o BatchMode=yes)
+SSH_ARGS=(-p "$SERVER_PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3)
 if [[ -n "$SERVER_KEY" ]]; then
   SSH_ARGS+=(-i "$SERVER_KEY")
 fi
 
 ssh_run() {
-  ssh "${SSH_ARGS[@]}" "$REMOTE" "$@"
+  local attempt status
+  for attempt in 1 2 3; do
+    if ssh "${SSH_ARGS[@]}" "$REMOTE" "$@"; then
+      return 0
+    fi
+    status=$?
+    sleep $((attempt * 2))
+  done
+  return "$status"
 }
 
-RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes"
+RSYNC_RSH="ssh -p $(printf '%q' "$SERVER_PORT") -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=3"
 if [[ -n "$SERVER_KEY" ]]; then
   RSYNC_RSH+=" -i $(printf '%q' "$SERVER_KEY")"
 fi
@@ -37,6 +45,7 @@ ssh_run "if test -x $REMOTE_Q/backup.sh; then $REMOTE_Q/backup.sh; fi"
 echo "syncing source (excluding build output and .env)"
 rsync -az --delete-delay -e "$RSYNC_RSH" \
   --exclude target --exclude .env --exclude .git \
+  --exclude .DS_Store \
   --exclude '*.bak' --exclude '*.bak.*' --exclude '*.pre-*' \
   ./ "$REMOTE:$REMOTE_DIR/"
 

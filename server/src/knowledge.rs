@@ -54,11 +54,11 @@ const STOP: &[&str] = &[
 /// Chinese tech terms found, so "玻璃拟态 阴影" → also searches "glassmorphism shadow".
 const CN_EN: &[(&str, &str)] = &[
     // visual / CSS / animation (the user's pain area)
-    ("动画", "animation animate"),
+    ("动画", "animation animate motion transition"),
     ("缓动", "easing ease"),
     ("过渡", "transition"),
     ("关键帧", "keyframes"),
-    ("玻璃拟态", "glassmorphism backdrop blur"),
+    ("玻璃拟态", "glassmorphism frosted glass backdrop blur"),
     ("毛玻璃", "glassmorphism backdrop blur"),
     ("阴影", "shadow box-shadow"),
     ("渐变", "gradient"),
@@ -90,7 +90,7 @@ const CN_EN: &[(&str, &str)] = &[
     // layout / styling
     ("布局", "layout grid flex flexbox"),
     ("响应式", "responsive media query"),
-    ("暗色", "dark mode theme"),
+    ("暗色", "dark theme dark mode"),
     ("主题", "theme"),
     ("字体", "font typography"),
     ("排版", "typography"),
@@ -376,28 +376,33 @@ const CN_EN: &[(&str, &str)] = &[
     ("官网", "landing page website homepage"),
     ("落地页", "landing page hero"),
     ("首页", "homepage landing hero"),
+    ("着陆页", "landing page hero conversion"),
+    ("宣传页", "landing page marketing page"),
+    ("介绍页", "landing page product page"),
+    ("个人主页", "portfolio homepage"),
+    ("作品集", "portfolio agency showcase"),
+    ("博客", "blog content magazine"),
+    ("社区", "community social platform"),
+    ("商城", "ecommerce shop store product"),
+    ("下载站", "download library resources"),
+    ("资源站", "resources library assets download"),
+    ("资源", "resources assets library"),
+    ("下载", "download"),
     ("二手", "secondhand marketplace resale ecommerce"),
-    ("商城", "ecommerce shop store"),
-    ("好看", "beautiful modern premium design"),
-    ("漂亮", "beautiful elegant design"),
+    ("好看", "beautiful modern premium polished design"),
+    ("漂亮", "beautiful elegant polished design"),
     ("精美", "premium polished design"),
     ("现代化", "modern sleek"),
     ("高端", "premium luxury"),
     ("酷炫", "stunning animated interactive"),
+    ("炫酷", "stunning animated interactive"),
     ("科技感", "futuristic tech gradient"),
     ("极简", "minimal clean"),
-    ("炫酷", "stunning animated interactive"),
     ("游戏", "game gaming esports"),
     ("赛博朋克", "cyberpunk neon glitch futuristic"),
     ("霓虹", "neon glow"),
-    ("暗色", "dark theme"),
-    ("资源站", "resources library assets download"),
-    ("下载站", "download library resources"),
-    ("资源", "resources assets library"),
-    ("下载", "download"),
-    ("作品集", "portfolio agency showcase"),
-    ("博客", "blog content magazine"),
-    ("社区", "community social platform"),
+    ("液态玻璃", "liquid glass glassmorphism"),
+    ("动效", "animation motion gsap"),
     ("音乐", "music audio player"),
     ("视频", "video media streaming"),
     ("餐饮", "restaurant food dining"),
@@ -405,10 +410,6 @@ const CN_EN: &[(&str, &str)] = &[
     ("健身", "fitness gym workout"),
     ("教育", "education learning course"),
     ("金融风", "finance fintech banking"),
-    ("液态玻璃", "liquid glass glassmorphism"),
-    ("玻璃拟态", "glassmorphism frosted glass"),
-    ("动效", "animation motion gsap"),
-    ("动画", "animation motion transition"),
     // general tools
     ("工具", "tool utility"),
     ("插件", "plugin extension addon"),
@@ -573,13 +574,13 @@ pub fn get() -> &'static KnowledgeIndex {
 }
 
 /// BM25 search over the corpus. `domain` optionally restricts to one domain.
-/// Each returned section is capped at 2400 chars to protect the agent's context.
+/// Each returned section is capped at 2400 chars so ordinary tool calls cannot flood context.
 pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit> {
     search_with_cap(query, domain, top_k, 2400)
 }
 
-/// BM25 search returning sections capped at `max_section_chars` bytes. Callers that
-/// inject full blueprints (e.g. the michael-design prompt block) pass a larger cap.
+/// BM25 search with a caller-selected per-section cap. Prompt assembly can use a
+/// slightly larger cap for design blueprints while the public tool stays compact.
 pub fn search_with_cap(
     query: &str,
     domain: Option<&str>,

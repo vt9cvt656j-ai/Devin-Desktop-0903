@@ -323,11 +323,13 @@ const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
-const DESIGN_KNOWLEDGE_MAX_HITS: usize = 3;
-const DESIGN_KNOWLEDGE_MAX_CHARS: usize = 24_000;
-const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 1.0;
+const DESIGN_KNOWLEDGE_SEARCH_POOL: usize = 12;
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 5;
+const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 4200;
+const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 14_000;
+const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
-    "stunning landing page hero animation dark modern website motion gsap";
+    "premium landing page hero website motion animation polished visual design";
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -1105,76 +1107,94 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
     ))
 }
 
-/// Build a bounded design-blueprint block from the michael-design corpus for a UI task.
-/// Unlike `auto_knowledge_block` (generic engineering reference), these hits are complete,
-/// production-grade design prompts meant to be adopted as the visual/structural blueprint.
+/// Build a compact design-blueprint block from the michael-design corpus for a UI task.
+/// The block should steer the model toward the library without flooding the prompt: it provides
+/// a primary blueprint plus diverse candidates, then tells the agent to use knowledge_search for
+/// section-specific follow-up retrieval.
 fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
     let request = user_request?.trim();
     if request.is_empty() {
         return None;
     }
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
-    let mut hits = crate::knowledge::search_with_cap(
-        &query,
-        Some(DESIGN_KNOWLEDGE_DOMAIN),
-        DESIGN_KNOWLEDGE_MAX_HITS,
-        DESIGN_KNOWLEDGE_MAX_CHARS,
-    )
-    .into_iter()
-    .filter(|hit| hit.domain == DESIGN_KNOWLEDGE_DOMAIN && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE)
-    .take(DESIGN_KNOWLEDGE_MAX_HITS)
-    .collect::<Vec<_>>();
-    // 兜底：界面任务必须永远带蓝本。用户查询没命中任何品类时，退回整库最强的
-    // 网站级成品蓝本（landing/hero/动效方向），绝不让模型裸奔回通用 AI 结构。
+    let mut hits = design_hits_for_query(&query);
     if hits.is_empty() {
-        hits = crate::knowledge::search_with_cap(
-            DESIGN_KNOWLEDGE_FALLBACK_QUERY,
-            Some(DESIGN_KNOWLEDGE_DOMAIN),
-            DESIGN_KNOWLEDGE_MAX_HITS,
-            DESIGN_KNOWLEDGE_MAX_CHARS,
-        )
-        .into_iter()
-        .filter(|hit| hit.domain == DESIGN_KNOWLEDGE_DOMAIN)
-        .take(DESIGN_KNOWLEDGE_MAX_HITS)
-        .collect::<Vec<_>>();
+        hits = design_hits_for_query(DESIGN_KNOWLEDGE_FALLBACK_QUERY);
     }
     if hits.is_empty() {
         return None;
     }
+
     let hit_summary = hits
         .iter()
         .map(|hit| format!("{}#{}({:.1})", hit.topic, hit.section, hit.score))
         .collect::<Vec<_>>()
         .join(", ");
     tracing::info!(hits = %hit_summary, "michael-design blueprint hits");
+
     let mut sections = Vec::with_capacity(hits.len());
-    let mut budget = DESIGN_KNOWLEDGE_MAX_CHARS;
+    let mut remaining = DESIGN_KNOWLEDGE_TOTAL_CHARS;
     for (index, hit) in hits.iter().enumerate() {
-        if budget < 500 {
+        if remaining < 800 {
             break;
         }
-        let text = bounded_chars(&hit.text, budget);
-        budget = budget.saturating_sub(text.chars().count());
+        let cap = if index == 0 {
+            remaining.min(6200)
+        } else {
+            remaining.min(1800)
+        };
+        let text = bounded_chars(&hit.text, cap);
+        remaining = remaining.saturating_sub(text.chars().count());
+        let label = if index == 0 {
+            "主蓝本"
+        } else {
+            "候选蓝本"
+        };
         sections.push(format!(
-            "【设计蓝本 {}｜{}/{}｜相关度 {:.3}】\n{}",
+            "【{} {}｜{}/{} · {}｜相关度 {:.3}】\n{}",
+            label,
             index + 1,
             hit.domain,
             hit.topic,
+            hit.section,
             hit.score,
             text
         ));
     }
+
     Some(format!(
-        "--- michael-design 设计蓝本（按用户请求自动检索，铁律级）---\n\
-         下面是与本次界面任务最相关的完整成品级设计提示词（含技术栈、令牌、布局、动效规范）。\
-         **铁律：只要蓝本在场，它就是本次界面的权威规格，优先级高于上面任何默认设计流程的通用选择**：\n\
-         ⓪ **先把用户的口语需求自动升格成蓝本级专业规格再动手**：用户只会说一句「帮我做个 XX 网站」，你要先在思考里按蓝本的写法把它扩写成完整设计规格——导航形态、hero 构图、逐个区块的结构与内容、精确颜色变量（HSL/hex 接令牌）、字体字号字重、间距节奏、动效库与时长曲线、图片/视频/SVG 资源的具体用法——扩写以下面检索到的蓝本为模板和水准线，业务内容用用户的；然后照这份升格后的规格执行，绝不按用户的一句话直接糊一个简陋页面；\n\
-         ① 挑气质最匹配的一个蓝本逐行落地——区块结构/导航形态/hero 构图、精确颜色变量、字号字重、间距尺寸、动效库与时长曲线，全部照蓝本的具体数值执行，不凭印象简化；\n\
-         ② **绝不退回通用 AI 落地页结构**（居中大标题+三列卡片+渐变背景那套）：结构、排版节奏、动效都以蓝本为准，蓝本指定用 gsap/motion/自定义 CSS 变量就用它的；实现载体仍用 shadcn/ui 语义组件与 Tailwind（蓝本的颜色/字号/间距数值接进令牌变量，两套是结合不是二选一）；图标一律用 lucide/自绘 SVG，禁止 emoji 当图标；\n\
-         ③ 只替换文案、品牌名、业务内容为用户真实产品，视觉与交互规格不打折；需要多个区块而蓝本只覆盖部分时，用 knowledge_search(domain=\"michael-design\") 按区块类型（features/cta/footer/pricing 等）补检索其余区块的蓝本；\n\
-         ④ 与用户的明确要求冲突时以用户为准；**品类对不上不是理由**——整库 421 条全是顶级成品网站，蓝本品类和用户业务不同也照抄它的结构骨架、视觉密度、动效水准（只换业务内容），或用 knowledge_search(domain=\"michael-design\") 换关键词（hero/landing/portfolio/dark/animation 等）再捞更合适的；无论如何都不许脱离蓝本自由发挥。\n\n{}",
+        "--- michael-design 设计蓝本（按用户请求自动检索，精炼注入）---\n\
+         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的入口，不是全部库的替代品。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充气质和区块想法。执行规则：\n\
+         1. 先把用户口语需求升格成成品规格：目标用户、页面结构、主视觉、区块顺序、交互动效、真实文案、资源使用和验收点都要明确，不能按一句话糊通用页面。\n\
+         2. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
+         3. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
+         4. 做完整页面时，当前块只负责定方向；必须继续用 `knowledge_search(domain=\"michael-design\")` 针对缺的区块检索，例如 `hero/features/pricing/cta/footer`、`features cards`、`mobile app`、`dashboard`、`portfolio`、`dark animation`。从全库取材后再组合，别只吃这几段。\n\
+         5. 与 `shadcn_design_system`/Tailwind 令牌结合：蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。最终必须通过真实浏览器验证视觉、交互、响应式和控制台错误；蓝本是设计证据，不是运行证据。\n\n{}",
         sections.join("\n\n———\n\n")
     ))
+}
+
+fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    for hit in crate::knowledge::search_with_cap(
+        query,
+        Some(DESIGN_KNOWLEDGE_DOMAIN),
+        DESIGN_KNOWLEDGE_SEARCH_POOL,
+        DESIGN_KNOWLEDGE_SECTION_CHARS,
+    ) {
+        if hit.domain != DESIGN_KNOWLEDGE_DOMAIN || hit.score < DESIGN_KNOWLEDGE_MIN_SCORE {
+            continue;
+        }
+        let key = format!("{}#{}", hit.topic, hit.section.to_lowercase());
+        if seen.insert(key) {
+            hits.push(hit);
+        }
+        if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+            break;
+        }
+    }
+    hits
 }
 
 /// Decide whether the user's real request needs the UI specialization. Keep generic engineering
@@ -1780,8 +1800,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 sys.push_str(&guide);
             }
         }
-        // 设计蓝本检索：UI 任务额外注入 michael-design 库里最相关的完整成品级设计提示词，
-        // 作为视觉/结构蓝本（与通用工程参考块相互独立）。粘性回退同 auto_knowledge。
+        // UI work gets a compact michael-design entry point. The full library remains available
+        // through knowledge_search; injecting a few concise blueprints avoids 100KB+ prompt bloat
+        // while still anchoring the model in the operator's curated design corpus.
         if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
             let design_query = user_request
                 .clone()
@@ -1803,7 +1824,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 sys.push_str("\n\n");
                 sys.push_str(&block);
                 prompt_blocks.push("design_knowledge");
-                tracing::info!(mode, "auto-injecting michael-design blueprint");
+                tracing::info!(mode, "auto-injecting compact michael-design blueprint");
             }
         }
     }
@@ -3861,11 +3882,68 @@ mod tests {
             "优化表单布局和按钮样式",
             "修复手机端视觉与交互动效",
             "调整后台管理页面配色",
+            "做一个酷炫高端的官网",
         ] {
             assert!(looks_like_ui_task(request), "missed UI request: {request}");
         }
         assert!(looks_like_ui_task("优化 React 登录组件的样式和布局"));
         assert!(!looks_like_ui_task("修复 Rust 服务组件的并发锁错误"));
+    }
+
+    #[test]
+    fn ui_tasks_inject_compact_michael_design_blueprint() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": "帮我做一个科技感 SaaS 官网 landing page，要 hero、features、pricing 和 footer"
+            }]
+        });
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("--- michael-design 设计蓝本"));
+        assert!(system.contains("421 条 michael-design"));
+        assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
+        assert!(system.contains("精炼注入"));
+
+        let start = system.find("--- michael-design 设计蓝本").unwrap();
+        let tail = &system[start..];
+        let end = tail
+            .find("\n\n⚠️ 强制推理检查点")
+            .or_else(|| tail.find("\n\n--- 平台知识库"))
+            .unwrap_or(tail.len());
+        let design_block = &tail[..end];
+        assert!(
+            design_block.chars().count() <= DESIGN_KNOWLEDGE_TOTAL_CHARS + 4000,
+            "design block should be compact, got {} chars",
+            design_block.chars().count()
+        );
+        assert!(
+            design_block.matches("【").count() <= DESIGN_KNOWLEDGE_MAX_HITS,
+            "design block should include a bounded number of hits"
+        );
+    }
+
+    #[test]
+    fn michael_design_blueprint_is_sticky_across_ui_followups() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "先做一个高端现代的 AI 产品官网首页"},
+                {"role": "assistant", "content": "好的，开始实现。"},
+                {"role": "user", "content": "继续，把底部也做完整"}
+            ]
+        });
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("--- michael-design 设计蓝本"));
+        assert!(system.contains("hero/features/pricing/cta/footer"));
     }
 
     #[test]
