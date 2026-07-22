@@ -5291,6 +5291,41 @@ function _mpmStructQuery(driver, name) {
   return `PRAGMA table_info(${_mpmQuoteIdent("sqlite", name)});`;
 }
 
+// 文档型结果（mongo find / es _search / es _mapping）→ 通用表格。
+function _mpmDocsToGrid(driver, out) {
+  const res = out?.result;
+  if (res === undefined || res === null) return null;
+  let docs = null;
+  if (driver === "mongodb") {
+    const batch = res?.cursor?.firstBatch ?? res?.cursor?.nextBatch;
+    if (Array.isArray(batch)) docs = batch;
+  } else if (driver === "elastic") {
+    const hits = res?.hits?.hits;
+    if (Array.isArray(hits)) {
+      docs = hits.map((h) => ({ _id: h?._id, ...(h?._source && typeof h._source === "object" ? h._source : { _source: h?._source }) }));
+    } else if (res && typeof res === "object" && !Array.isArray(res)) {
+      // _mapping：{idx:{mappings:{properties:{field:{type}}}}} → 字段/类型两列
+      const idx = Object.values(res)[0];
+      const props = idx?.mappings?.properties;
+      if (props && typeof props === "object") {
+        const rows = Object.entries(props).map(([k, v]) => [k, v?.type || (v?.properties ? "object" : ""), v?.properties ? JSON.stringify(Object.keys(v.properties)) : ""]);
+        return { cols: ["field", "type", "children"], rows };
+      }
+    }
+  }
+  if (!docs) {
+    if (Array.isArray(res) && res.every((x) => x && typeof x === "object" && !Array.isArray(x))) docs = res;
+    else return null;
+  }
+  const cols = [];
+  for (const d of docs) for (const k of Object.keys(d || {})) if (!cols.includes(k)) cols.push(k);
+  const rows = docs.map((d) => cols.map((k) => {
+    const v = d?.[k];
+    return v !== null && typeof v === "object" ? JSON.stringify(v) : v === undefined ? null : v;
+  }));
+  return { cols, rows };
+}
+
 // ---- 数据加载 ----
 
 async function _mpmInspect(rel, force = false) {
@@ -5444,8 +5479,9 @@ async function _mpmLoadTableTab(tab, force = false) {
     try {
       if (!inTauri) throw new Error("网页版暂不支持连接数据库");
       const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: _mpmStructQuery(conn.driver, tab.name), limit: 500 });
-      tab.structColumns = Array.isArray(out?.columns) ? out.columns : [];
-      tab.structRows = out?.rows || [];
+      const grid = Array.isArray(out?.columns) ? { cols: out.columns, rows: out.rows || [] } : _mpmDocsToGrid(conn.driver, out);
+      tab.structColumns = grid ? grid.cols : [];
+      tab.structRows = grid ? grid.rows : [];
       tab.status = "ready";
     } catch (error) {
       tab.status = "error";
@@ -5466,9 +5502,10 @@ async function _mpmLoadTableTab(tab, force = false) {
       ? `SELECT rowid AS _mprowid_, * FROM ${_mpmQuoteIdent("sqlite", tab.name)} LIMIT ${lim}`
       : _mpmSelectQuery(conn.driver, tab.name, lim).replace(/;$/, "");
     const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: q, limit: lim });
-    if (!out || !Array.isArray(out.columns)) throw new Error("没有返回有效结果");
-    let cols = out.columns;
-    let rows = out.rows || [];
+    const grid = Array.isArray(out?.columns) ? { cols: out.columns, rows: out.rows || [] } : _mpmDocsToGrid(conn.driver, out);
+    if (!grid) throw new Error("没有返回有效结果");
+    let cols = grid.cols;
+    let rows = grid.rows;
     if (wantRowid && cols[0] === "_mprowid_") {
       tab.rowids = rows.map((r) => r[0]);
       cols = cols.slice(1);
