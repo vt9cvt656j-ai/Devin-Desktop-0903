@@ -323,8 +323,8 @@ const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
-const DESIGN_KNOWLEDGE_MAX_HITS: usize = 2;
-const DESIGN_KNOWLEDGE_MAX_CHARS: usize = 14_000;
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 3;
+const DESIGN_KNOWLEDGE_MAX_CHARS: usize = 24_000;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 1.0;
 
 /// Flatten the textual content of one user message, including multimodal text parts.
@@ -1143,11 +1143,13 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
         ));
     }
     Some(format!(
-        "--- michael-design 设计蓝本（按用户请求自动检索）---\n\
+        "--- michael-design 设计蓝本（按用户请求自动检索，铁律级）---\n\
          下面是与本次界面任务最相关的完整成品级设计提示词（含技术栈、令牌、布局、动效规范）。\
-         **优先把它作为视觉与结构蓝本执行**：布局节奏、配色气质、字体层级、动效工艺照它的水准来，\
-         文案与业务内容替换成用户的真实产品；与用户的明确要求冲突时以用户为准。\
-         若蓝本方向不合适或想要更多方向，用 knowledge_search(domain=\"michael-design\") 换关键词再检索。\n\n{}",
+         **铁律：只要蓝本在场，它就是本次界面的权威规格，优先级高于上面任何默认设计流程的通用选择**：\n\
+         ① 挑气质最匹配的一个蓝本逐行落地——区块结构/导航形态/hero 构图、精确颜色变量、字号字重、间距尺寸、动效库与时长曲线，全部照蓝本的具体数值执行，不凭印象简化；\n\
+         ② **绝不退回通用 AI 落地页结构**（居中大标题+三列卡片+渐变背景那套）：结构、排版节奏、动效都以蓝本为准，蓝本指定用 gsap/motion/自定义 CSS 变量就用它的，不强行换成 shadcn 默认令牌；\n\
+         ③ 只替换文案、品牌名、业务内容为用户真实产品，视觉与交互规格不打折；需要多个区块而蓝本只覆盖部分时，用 knowledge_search(domain=\"michael-design\") 按区块类型（features/cta/footer/pricing 等）补检索其余区块的蓝本；\n\
+         ④ 与用户的明确要求冲突时以用户为准；若所有蓝本方向都明显不合适，先换关键词再检索一次再决定。\n\n{}",
         sections.join("\n\n———\n\n")
     ))
 }
