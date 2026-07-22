@@ -39068,7 +39068,10 @@ async function _interleavedTest(root, testCmd) {
       const head = lines.slice(0, 6).join("\n");
       // Pull the FIRST FAIL block — most useful signal, the rest is noise.
       const failIdx = lines.findIndex((l) => /FAIL|FAILED|✗|✘|✖|×|Test (suite )?failed|expected/i.test(l));
-      const failBlock = failIdx >= 6 ? lines.slice(failIdx, Math.min(failIdx + 30, lines.length)).join("\n") : "";
+      // Start after the head slice when the failure keyword is inside it, so the
+      // diagnostic body that follows still shows without duplicating the head.
+      const failStart = failIdx >= 0 ? Math.max(failIdx, 6) : -1;
+      const failBlock = failStart >= 0 ? lines.slice(failStart, Math.min(failStart + 30, lines.length)).join("\n") : "";
       const tail = lines.slice(-10).join("\n");
       detail = `${head}${failBlock ? "\n…\n" + failBlock : ""}\n…\n${tail}`;
     }
