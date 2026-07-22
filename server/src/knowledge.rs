@@ -393,6 +393,8 @@ const CN_EN: &[(&str, &str)] = &[
     ("暗色", "dark theme"),
     ("资源站", "resources library assets download"),
     ("下载站", "download library resources"),
+    ("资源", "resources assets library"),
+    ("下载", "download"),
     ("作品集", "portfolio agency showcase"),
     ("博客", "blog content magazine"),
     ("社区", "community social platform"),
