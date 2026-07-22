@@ -550,7 +550,19 @@ pub fn get() -> &'static KnowledgeIndex {
 }
 
 /// BM25 search over the corpus. `domain` optionally restricts to one domain.
+/// Each returned section is capped at 2400 chars to protect the agent's context.
 pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit> {
+    search_with_cap(query, domain, top_k, 2400)
+}
+
+/// BM25 search returning sections capped at `max_section_chars` bytes. Callers that
+/// inject full blueprints (e.g. the michael-design prompt block) pass a larger cap.
+pub fn search_with_cap(
+    query: &str,
+    domain: Option<&str>,
+    top_k: usize,
+    max_section_chars: usize,
+) -> Vec<SearchHit> {
     const K1: f64 = 1.5;
     const B: f64 = 0.75;
     let idx = get();
@@ -613,8 +625,8 @@ pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit>
             // Cap each returned section so a few hits don't blow the agent's context.
             // Truncate on a CHAR boundary — byte-slicing mid-UTF-8 (the corpus has →/—
             // and other multibyte chars) panics.
-            let text = if c.text.len() > 2400 {
-                let mut end = 2400;
+            let text = if c.text.len() > max_section_chars {
+                let mut end = max_section_chars;
                 while end > 0 && !c.text.is_char_boundary(end) {
                     end -= 1;
                 }
