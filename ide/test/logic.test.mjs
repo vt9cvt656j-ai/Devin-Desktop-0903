@@ -6837,6 +6837,16 @@ test("plan steps advance from real tool evidence instead of waiting for another 
   assert.deepEqual(run._planSteps.map((step) => step.status), ["completed", "completed", "completed"]);
 });
 
+test("scaffold and asset tools resolve the workspace from the run session, not an undefined variable", () => {
+  // Regression: game_scaffold/web_scaffold/generate_* referenced a `sess` variable
+  // that doesn't exist in _executeToolStep's scope → ReferenceError
+  // ("Can't find variable: sess") the moment the tool ran.
+  assert.doesNotMatch(SRC, /\(sess && sess\.project\)/,
+    "workspace lookup must not reference the undefined `sess` variable");
+  assert.match(SRC, /const ws = \(run && run\.session && run\.session\.project\) \|\| root \|\| "";/,
+    "scaffold tools must resolve the workspace from run.session.project with root fallback");
+});
+
 test("plan advances live at tool settle time and is not double-advanced at turn end", () => {
   // Live tracking: the moment each tool result settles, the plan must advance —
   // not only in the turn-end aggregation pass.

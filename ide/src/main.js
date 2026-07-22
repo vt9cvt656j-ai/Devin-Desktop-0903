@@ -32721,7 +32721,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "game_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "game_scaffold", path: "", content: "[不可用] 游戏脚手架只能在桌面 App 里用。" }; }
-      const ws = (sess && sess.project) || "";
+      const ws = (run && run.session && run.session.project) || root || "";
       if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "game_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
       try {
         const r = await backend.invoke("game_scaffold", { engine: call.engine || "phaser", name: call.name || "my-game", workspace: ws });
@@ -32737,7 +32737,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "web_scaffold") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "web_scaffold", path: "", content: "[不可用] 网站脚手架只能在桌面 App 里用。" }; }
-      const ws = (sess && sess.project) || "";
+      const ws = (run && run.session && run.session.project) || root || "";
       if (!ws) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "web_scaffold", path: "", content: "[错误] 请先打开一个工作区。" }; }
       try {
         const r = await backend.invoke("web_scaffold", { name: call.name || "my-site", workspace: ws, framework: call.framework || "vue" });
@@ -32754,7 +32754,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
-      const _gaWs = (sess && sess.project) || "";
+      const _gaWs = (run && run.session && run.session.project) || root || "";
       if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: "[错误] 请先打开一个工作区。" }; }
       const _gaCfg = loadConfig();
       const _gaLabels = { generate_3d: "3D 模型", generate_sound: "音效", generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画", generate_texture: "纹理" };
@@ -32793,7 +32793,7 @@ async function _executeToolStep(step, call, root, run) {
 
     } else if (call.type === "download_asset") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download_asset", path: "", content: "[不可用]" }; }
-      const _daWs = (sess && sess.project) || "";
+      const _daWs = (run && run.session && run.session.project) || root || "";
       if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: "[错误] 请先打开一个工作区。" }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 下载资源…`;
       try {
