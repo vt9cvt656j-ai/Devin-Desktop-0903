@@ -626,8 +626,17 @@ pub async fn i18n_pack(
                 }
             }
         }
-        ids.sort();
         ids.dedup();
+        // 翻译是纯机械活：按官方单价升序挑模型，没有价格的排最后。此前是字母序，
+        // claude-fable-5（$10/$50）排在 haiku/opus 前面，每个语言包批次都用最贵的
+        // 旗舰翻译 UI 文案，纯烧钱（用户实测账单抓到）。
+        ids.sort_by(|a, b| {
+            let price = |id: &str| official_price(id).map(|(i, o)| i + o).unwrap_or(f64::MAX);
+            price(a)
+                .partial_cmp(&price(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
         if ids.is_empty() {
             failures.push(format!("{} 未配置 model_id", m.label));
             continue;
