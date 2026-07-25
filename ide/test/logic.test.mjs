@@ -5291,6 +5291,7 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
     _activeChatIdx: 0,
     _chatSessionsForLocalStorage: sessionsForStorage,
     _closedChatSessionsForLocalStorage: () => [],
+    _isSecondaryWindow: false, // 主窗口才写共享镜像；新建窗口直接短路（多窗口对话隔离）
   });
   flush();
   const saved = JSON.parse(store["michael-ide.chat-sessions"]);

@@ -3366,18 +3366,15 @@ function activate(path) {
   saveBtn.disabled = !f.dirty;
   if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf || f.isInspection);
   const projectLabel = rootPath ? basename(rootPath) : "";
-  $("windowTitle").textContent = f.name + (projectLabel ? " — " + projectLabel : "") + " — Michael IDE";
+  $("windowTitle") && _setWindowTitle(f.name + (projectLabel ? " — " + projectLabel : "") + " — Michael IDE");
   if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
-    updateBreadcrumb(path);
     renderBreakpointDecorations();
     applyDebugLineDecoration();
     // git gutter + blame shell out to git (slow on macOS: each spawn resolves the login-shell PATH),
     // so on a cold repo they can cost hundreds of ms. Defer them off the open critical path so even a
     // 1-line file paints instantly; they fill in a beat later.
     _idleRun(() => { try { refreshGutter(); } catch {} try { refreshBlame(); } catch {} });
-  } else {
-    updateBreadcrumb(path);
   }
   updateStatusBar();
 }
@@ -4400,8 +4397,8 @@ function _renderDatabaseEditorInspection(path, info, reason = "", error = "") {
 function _renderHexEditorInspection(path, info, reason = "", error = "") {
   if (!_fileInspectionPreviewEl) return;
   _fileInspectionPreviewEl.className = "file-inspector file-inspector--hex";
-  const name = info?.name || basename(path);
-  const kindLabel = _inspectKindLabel(info?.kind);
+  // 顶部工具栏（文件名/路径/元信息/按钮）和蓝色"无法打开"提示条已整体移除（用户反馈
+  // 无用占地方）；文件名已在页签上，直接从十六进制内容开始。reason 保留入参兼容调用方。
   const visibleRows = _hexEditorVisibleRows(info?.hex_rows);
   const shownBytes = _hexEditorByteCount(visibleRows);
   const totalPreviewBytes = _hexEditorByteCount(info?.hex_rows);
@@ -4409,24 +4406,6 @@ function _renderHexEditorInspection(path, info, reason = "", error = "") {
   _fileInspectionPreviewEl.innerHTML = `
     <div class="file-inspector__shell file-inspector__shell--hex">
       <div class="hex-editor">
-        <header class="hex-editor__toolbar">
-          <div class="hex-editor__title">
-            <span class="hex-editor__file" title="${_escAttr(name)}">${_escHtml(name)}</span>
-            <span class="hex-editor__path" title="${_escAttr(path)}">${_escHtml(path)}</span>
-          </div>
-          <div class="hex-editor__meta" aria-label="文件信息">
-            <span>${_escHtml(kindLabel)}</span>
-            <span>${_formatInspectBytes(info?.size)}</span>
-            <span>${_escHtml(info?.mime || "application/octet-stream")}</span>
-            <span>修改：${_formatInspectTime(info?.modified_ms)}</span>
-          </div>
-          <div class="file-inspector__actions hex-editor__actions">
-            <button type="button" data-inspector-action="refresh">重新读取</button>
-            <button type="button" data-inspector-action="copy">复制路径</button>
-            <button type="button" data-inspector-action="reveal">在系统中显示</button>
-          </div>
-        </header>
-        ${reason ? `<div class="hex-editor__notice">文本编辑器打不开：${_escHtml(reason)}；已切换为只读十六进制视图。</div>` : ""}
         ${error ? `<div class="hex-editor__error">读取失败：${_escHtml(error)}</div>` : ""}
         ${_hexEditorRowsHtml(visibleRows)}
         <footer class="hex-editor__status">
@@ -6518,9 +6497,10 @@ function _createMdElements() {
   const savedPct = parseFloat(localStorage.getItem("md_preview_width_pct") || "");
   if (savedPct >= 15 && savedPct <= 85) _mdPreviewEl.style.width = savedPct + "%";
   const header = document.createElement("div");
-  header.className = "md-preview__header";
-  header.innerHTML = `<span class="md-preview__title">Markdown 预览</span>
-    <button class="md-preview__close" title="关闭预览 ${_escAttr(shortcutLabel("mod+."))}">✕</button>`;
+  // 「MARKDOWN PREVIEW」标题栏已整条移除（用户反馈无用还占高度），只保留一个悬浮在
+  // 右上角的关闭钮；关闭快捷键 mod+. 照旧可用。
+  header.className = "md-preview__floatclose";
+  header.innerHTML = `<button class="md-preview__close" title="关闭预览 ${_escAttr(shortcutLabel("mod+."))}">✕</button>`;
   _mdPreviewEl.appendChild(header);
   const body = document.createElement("div");
   body.className = "md-preview__body";
@@ -6662,30 +6642,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "0") { e.preventDefault(); _applyUiZoom(1); }
 }, true);
 
-function updateBreadcrumb(path) {
-  const bc = $("breadcrumb");
-  if (!path) { bc.hidden = true; return; }
-  bc.hidden = false;
-  bc.innerHTML = "";
-  const rel = rootPath ? path.replace(rootPath, "").replace(/^\//, "") : path;
-  const segments = rel.split("/").filter(Boolean);
-  segments.forEach((seg, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "breadcrumb__sep";
-      sep.textContent = "›";
-      bc.appendChild(sep);
-    }
-    const el = document.createElement("span");
-    el.className = "breadcrumb__seg";
-    el.textContent = seg;
-    if (i < segments.length - 1) {
-      const partial = rootPath + "/" + segments.slice(0, i + 1).join("/");
-      el.addEventListener("click", () => revealInTree(partial));
-    }
-    bc.appendChild(el);
-  });
-}
+// 面包屑路径条已整体移除（只显示文件名没信息量还占一行，用户反馈无用）。
 
 function revealInTree(path) {
   const item = document.querySelector(`.tree-item[data-path="${CSS.escape(path)}"]`);
@@ -6755,9 +6712,8 @@ async function closeFile(path, { force = false } = {}) {
       saveBtn.disabled = true;
       if (runBtn) runBtn.disabled = true;
       const idleTitle = rootPath ? basename(rootPath) + " — Michael IDE" : "Michael IDE";
-      $("windowTitle").textContent = idleTitle;
+      _setWindowTitle(idleTitle);
       refreshGutter();
-      updateBreadcrumb(null);
     }
   }
   renderTabs();
@@ -7747,9 +7703,9 @@ function setActiveWorkspaceRoot(path) {
   setExplorerToolsEnabled(Boolean(path));
   const titleFile = activePath ? openFiles.get(activePath)?.name : "";
   const project = path ? basename(path) : "";
-  $("windowTitle").textContent = project
+  _setWindowTitle(project
     ? (titleFile ? titleFile + " — " : "") + project + " — Michael IDE"
-    : "Michael IDE";
+    : "Michael IDE");
 }
 
 async function renderWorkspaceRoots() {
@@ -10706,26 +10662,44 @@ const _DEFAULT_AI_CONFIG = {
 
 async function loadConfigAsync() {
   if (_cfgCache) return _cfgCache;
-  await migrateFromLocalStorage();
-  const store = await getStore();
-  const saved = (await store.get(CFG_KEY)) || {};
-  // Merge saved settings over the defaults so a chosen model (or baseUrl) is kept
-  // across restarts even before an API key is entered — previously an empty
-  // apiKey wiped the whole config back to defaults, losing the user's model.
-  const migrated = { ..._DEFAULT_AI_CONFIG, ...saved, providerMode: AI_PROVIDER_GATEWAY };
-  _cfgCache = _configForStorage(migrated);
   try {
-    await store.set(CFG_KEY, _cfgCache);
-    await store.save();
-  } catch { /* store might not be ready in browser dev mode */ }
-  return _cfgCache;
+    await migrateFromLocalStorage();
+    const store = await getStore();
+    const saved = (await store.get(CFG_KEY)) || {};
+    // Merge saved settings over the defaults so a chosen model (or baseUrl) is kept
+    // across restarts even before an API key is entered — previously an empty
+    // apiKey wiped the whole config back to defaults, losing the user's model.
+    const migrated = { ..._DEFAULT_AI_CONFIG, ...saved, providerMode: AI_PROVIDER_GATEWAY };
+    _cfgCache = _configForStorage(migrated);
+    try {
+      await store.set(CFG_KEY, _cfgCache);
+      await store.save();
+    } catch { /* store might not be ready in browser dev mode */ }
+    try { localStorage.setItem("michael-ide.config-mirror", JSON.stringify(_cfgCache)); } catch {}
+    return _cfgCache;
+  } catch (e) {
+    // 多窗口：两个窗口共享同一个 store 文件，第二窗口读配置可能撞上主窗口的写入报错。
+    // 之前这里直接抛出 → 门禁链路静默失败 → "第二个窗口消息死活发不出去"。
+    // 退回 localStorage 镜像（两窗口同源共享），发送不因存储层抖动而死。
+    console.warn("[config] store read failed, using localStorage mirror:", e);
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem("michael-ide.config-mirror") || "{}"); } catch {}
+    _cfgCache = _configForStorage({ ..._DEFAULT_AI_CONFIG, ...saved, providerMode: AI_PROVIDER_GATEWAY });
+    return _cfgCache;
+  }
 }
 
 async function saveConfig(c) {
   _cfgCache = _configForStorage(c);
-  const store = await getStore();
-  await store.set(CFG_KEY, _cfgCache);
-  await store.save();
+  try { localStorage.setItem("michael-ide.config-mirror", JSON.stringify(_cfgCache)); } catch {}
+  try {
+    const store = await getStore();
+    await store.set(CFG_KEY, _cfgCache);
+    await store.save();
+  } catch (e) {
+    // 多窗口写冲突/存储层抖动：镜像已落盘，不让写失败炸断登录/发送链路。
+    console.warn("[config] store save failed (localStorage mirror kept):", e);
+  }
 }
 function refreshModelBadge() {
   syncModelPicker();
@@ -12662,6 +12636,10 @@ function _closedChatSessionsForLocalStorage(mediaBudget = CHAT_LOCAL_MEDIA_BUDGE
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
 // fallback. It has no HTML snapshot and a strict aggregate media budget.
 function _flushChatHistorySync() {
+  // 新建窗口绝不写共享的聊天镜像：两窗口同源共用同一个 localStorage，之前新窗口每次
+  // 刷新/热更/关闭都把自己的对话覆写进来，主窗口下次回退恢复时就混进对方的内容
+  // ——"多窗口还是会共享对话"的根源。
+  if (_isSecondaryWindow) return;
   try {
     // Keep the exact restore shape, but spend one strict media budget across all
     // sessions instead of granting every tab a fresh multi-megabyte allowance.
@@ -12772,6 +12750,13 @@ function _scrollChatBottom() {
 }
 
 async function restoreChatHistory() {
+  // 新建窗口（?w=sub）：AI 对话区也保持初始化——不恢复主窗口的会话/项目锚点，
+  // 直接开一个全新空白对话（本窗口也不会回写主窗口的聊天存档，见 saveChatHistory）。
+  if (_isSecondaryWindow) {
+    if (_chatSessions.length === 0) _newChatSession();
+    _renderChatTabs();
+    return;
+  }
   try {
     let saved = null;
     if (inTauri) {
@@ -12866,6 +12851,17 @@ const _WINDOW_ID = Date.now().toString(36) + Math.random().toString(36).slice(2,
 let _ipcChannel = null;
 const _ipcPeers = new Map();
 
+// 统一设置窗口标题：同时更新自绘标题栏 DOM 和原生窗口标题。之前只改 DOM，
+// macOS 的 Dock/调度中心/窗口菜单里所有窗口都叫 "Michael IDE"，多窗口无法按项目区分。
+function _setWindowTitle(text) {
+  try { $("windowTitle").textContent = text; } catch {}
+  if (inTauri) {
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => getCurrentWindow().setTitle(text))
+      .catch(() => {});
+  }
+}
+
 function _initIPC() {
   if (typeof BroadcastChannel === "undefined") return;
   _ipcChannel = new BroadcastChannel("michael-ide-ipc");
@@ -12894,6 +12890,7 @@ function _initIPC() {
         break;
       case "workspace_changed":
         loadRecentProjects(); // 其他窗口切换了项目 → 本窗口欢迎页的最近项目同步刷新
+        if (_isSecondaryWindow) break; // 新建窗口是独立空白窗口：不吸附其他窗口的项目
         if (msg.roots && Array.isArray(msg.roots)) {
           for (const r of msg.roots) {
             if (r && !workspaceRoots.includes(r)) {
@@ -12922,6 +12919,7 @@ function _initIPC() {
         }
         break;
       case "workspace_response":
+        if (_isSecondaryWindow) break; // 新建窗口保持初始化状态，自己选要打开的项目
         if (msg.roots && Array.isArray(msg.roots) && !rootPath) {
           for (const r of msg.roots) {
             if (r && !workspaceRoots.includes(r)) {
@@ -18554,6 +18552,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       const note = document.createElement("div");
       note.className = "msg__error";
       note.textContent = "⚠️ " + err;
+      body.appendChild(note);
+    } else if (!acc.trim() && !_pendingToolCalls.length && !reasoning.trim()) {
+      // 上游"干净结束"但零输出（0ms 空回复：网关上游故障/路由冷却时常见）——必须留痕，
+      // 不能是空气泡让用户分不清"坏了"还是"没发出去"。
+      const note = document.createElement("div");
+      note.className = "msg__error";
+      note.textContent = "⚠️ 模型没有返回任何内容（可能是上游波动或该模型线路暂时不可用）。请重发一次，或换个模型再试。";
       body.appendChild(note);
     }
     _liveStats.stop();
@@ -44089,7 +44094,13 @@ function _restoreComposerSubmission(draft) {
 
 async function _dispatchComposerSubmission(draft) {
   let config = null;
-  try { config = await _readyAiConfig(); } catch {}
+  try { config = await _readyAiConfig(); }
+  catch (e) {
+    // 之前这里静默吞掉：门禁/配置/存储任一步抛错，用户体感就是"点了发送没反应"
+    // （多窗口场景尤其高发）。亮出真实原因，别让人猜。
+    console.warn("[chat] readyAiConfig failed:", e);
+    showToast("发送失败：" + String(e?.message || e).slice(0, 120));
+  }
   if (!config) {
     let restored = false;
     try { restored = _restoreComposerSubmission(draft); } catch {}
@@ -44101,7 +44112,10 @@ async function _dispatchComposerSubmission(draft) {
     return false;
   }
   const sent = sendPrompt(String(draft?.text || ""), Array.isArray(draft?.attachments) ? draft.attachments : [], config);
-  Promise.resolve(sent).catch((error) => console.warn("[chat] send failed:", error));
+  Promise.resolve(sent).catch((error) => {
+    console.warn("[chat] send failed:", error);
+    try { showToast("发送失败：" + String(error?.message || error).slice(0, 120)); } catch {}
+  });
   return true;
 }
 
@@ -45922,7 +45936,21 @@ const PROJECT_TEMPLATES = [
   { name: "Flask (Python)", desc: "Python 轻量 Web 服务，适合 API 原型和小型后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install flask && echo 'from flask import Flask\\napp = Flask(__name__)\\n\\n@app.route(\"/\")\\ndef index():\\n    return \"Hello World\"\\n\\nif __name__ == \"__main__\":\\n    app.run(debug=True)' > app.py", icon: "flask" },
   { name: "FastAPI (Python)", desc: "高性能 Python API，适合数据接口和 AI 服务后端", tag: "API", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install fastapi uvicorn && echo 'from fastapi import FastAPI\\napp = FastAPI()\\n\\n@app.get(\"/\")\\ndef root():\\n    return {\"message\": \"Hello World\"}' > main.py", icon: "fastapi" },
   { name: "Express (Node.js)", desc: "Node.js 经典后端框架，适合 REST API 和轻量服务", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install express && echo 'const express = require(\"express\");\\nconst app = express();\\napp.get(\"/\", (req, res) => res.json({ message: \"Hello World\" }));\\napp.listen(3000, () => console.log(\"Server on http://localhost:3000\"));' > index.js", icon: "express" },
-  { name: "Tauri (Rust + React)", desc: "Rust + Web 的桌面应用方案，体积小、性能好", tag: "Desktop", cmd: "npm create tauri-app@latest {{name}} -- --template react --manager npm", icon: "tauri" },
+  { name: "Tauri (Rust + React)", desc: "Rust + Web 的桌面应用方案，体积小、性能好", tag: "Desktop", cmd: "npm create tauri-app@latest {{name}} -- --template react --manager npm --yes", icon: "tauri" },
+  { name: "Vue 3 + TypeScript", desc: "类型安全的 Vue 工程，适合中大型后台和组件库", tag: "TypeScript", cmd: "npm create vite@latest {{name}} -- --template vue-ts && cd {{name}} && npm install", icon: "vue" },
+  { name: "Nuxt 3", desc: "Vue 全栈框架，SSR/SEO/服务端接口一体化", tag: "Full-stack", cmd: "npx nuxi@latest init {{name}} --packageManager npm --gitInit false --template v4", icon: "nuxt" },
+  { name: "Astro", desc: "内容优先的静态站框架，博客/文档/官网首选", tag: "Frontend", cmd: "npm create astro@latest {{name}} -- --template minimal --install --no-git --yes", icon: "astro" },
+  { name: "Angular", desc: "企业级前端框架，全家桶齐全，适合大型团队工程", tag: "Frontend", cmd: "npx -y @angular/cli@latest new {{name}} --defaults --skip-git", icon: "angular" },
+  { name: "Solid (Vite)", desc: "细粒度响应式框架，性能接近原生，API 类 React", tag: "Frontend", cmd: "npm create vite@latest {{name}} -- --template solid-ts && cd {{name}} && npm install", icon: "solid" },
+  { name: "NestJS (Node.js)", desc: "工程化 Node 后端框架，依赖注入/模块化，适合中大型服务", tag: "Backend", cmd: "npx -y @nestjs/cli@latest new {{name}} --package-manager npm --skip-git", icon: "nest" },
+  { name: "Django (Python)", desc: "全功能 Python Web 框架，自带 ORM/后台，适合完整站点", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && python3 -m venv .venv && source .venv/bin/activate && pip install django && django-admin startproject config .", icon: "django" },
+  { name: "Go (net/http)", desc: "Go 标准库 Web 服务，单二进制部署，适合高并发后端", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && go mod init {{name}} && echo 'package main\\n\\nimport (\\n\\t\"fmt\"\\n\\t\"net/http\"\\n)\\n\\nfunc main() {\\n\\thttp.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\\n\\t\\tfmt.Fprintln(w, \"Hello World\")\\n\\t})\\n\\tfmt.Println(\"Server on http://localhost:8080\")\\n\\thttp.ListenAndServe(\":8080\", nil)\\n}' > main.go", icon: "go" },
+  { name: "Rust (Cargo)", desc: "Cargo 二进制项目，CLI、服务、系统工具通用起点", tag: "Backend", cmd: "cargo new {{name}}", icon: "rust" },
+  { name: "Spring Boot (Java)", desc: "Java 企业级后端，自 start.spring.io 拉取官方骨架", tag: "Backend", cmd: "mkdir {{name}} && cd {{name}} && curl -fsSL 'https://start.spring.io/starter.tgz?type=maven-project&language=java&dependencies=web&name={{name}}&artifactId={{name}}' | tar -xz", icon: "spring" },
+  { name: "Electron", desc: "Web 技术写跨平台桌面应用，生态成熟插件多", tag: "Desktop", cmd: "npx -y create-electron-app@latest {{name}}", icon: "electron" },
+  { name: "Expo (React Native)", desc: "React 写 iOS/Android 原生应用，真机预览方便", tag: "Mobile", cmd: "npx -y create-expo-app@latest {{name}}", icon: "react" },
+  { name: "Flutter", desc: "Dart 跨平台应用，一套代码 iOS/Android/桌面（需已装 Flutter SDK）", tag: "Mobile", cmd: "flutter create {{name}}", icon: "flutter" },
+  { name: "Node.js + TypeScript", desc: "TS 服务/工具库通用骨架，tsx 直接跑，零配置上手", tag: "TypeScript", cmd: "mkdir {{name}} && cd {{name}} && npm init -y && npm install -D typescript tsx @types/node && npx tsc --init --target es2022 --module nodenext && mkdir src && echo 'console.log(\"Hello World\");' > src/index.ts", icon: "express" },
   { name: "Vanilla HTML/CSS/JS", desc: "无框架静态页面，适合练习、落地页和简单小工具", tag: "Web", cmd: "mkdir {{name}} && cd {{name}} && echo '<!DOCTYPE html>\\n<html lang=\"en\">\\n<head>\\n<meta charset=\"UTF-8\">\\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\\n<title>{{name}}</title>\\n<link rel=\"stylesheet\" href=\"style.css\">\\n</head>\\n<body>\\n<h1>Hello World</h1>\\n<script src=\"main.js\"></script>\\n</body>\\n</html>' > index.html && echo 'body { font-family: system-ui; max-width: 800px; margin: 0 auto; padding: 20px; }' > style.css && echo 'console.log(\"Hello World\");' > main.js", icon: "vanilla" },
 ];
 
@@ -45945,6 +45973,28 @@ function projectTemplateIcon(kind) {
       return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="8" width="36" height="32" rx="10" fill="#F7DF1E"/><path d="M13 31.4c1.1 1.8 2.6 3.1 5.2 3.1 2.2 0 3.6-1.1 3.6-2.6 0-1.8-1.4-2.4-3.8-3.5l-1.3-.6c-3.8-1.6-6.3-3.7-6.3-8 0-4 3-7 7.8-7 3.4 0 5.8 1.2 7.5 4.2l-4.1 2.6c-.9-1.6-1.9-2.2-3.4-2.2s-2.5 1-2.5 2.2c0 1.6 1 2.2 3.2 3.2l1.3.6c4.4 1.9 6.9 3.8 6.9 8.2 0 4.7-3.7 7.2-8.7 7.2-4.9 0-8-2.3-9.6-5.4l4.2-2.5Z" fill="#202124" transform="scale(.72) translate(7 5)"/><path d="M27.3 33.5c.8 1.4 1.9 2.5 3.9 2.5 1.7 0 2.8-.8 2.8-2 0-1.4-1.1-1.9-3-2.7l-1-.4c-3-1.3-4.9-2.9-4.9-6.2 0-3.1 2.4-5.5 6.1-5.5 2.6 0 4.5.9 5.9 3.3l-3.2 2c-.7-1.2-1.5-1.7-2.7-1.7-1.2 0-2 .8-2 1.7 0 1.2.7 1.7 2.5 2.5l1 .4c3.5 1.5 5.4 3 5.4 6.4 0 3.7-2.9 5.7-6.8 5.7-3.8 0-6.3-1.8-7.5-4.3l3.3-1.9Z" fill="#202124" transform="scale(.72) translate(7 5)"/></svg>`;
     case "tauri":
       return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><rect x="7" y="9" width="34" height="30" rx="10" fill="#E8F0FE"/><circle cx="18" cy="20" r="7" fill="#24C8DB"/><circle cx="30" cy="28" r="7" fill="#FFC131"/><circle cx="18" cy="20" r="2.5" fill="#fff"/><circle cx="30" cy="28" r="2.5" fill="#fff"/><path d="M20.7 26.2a9 9 0 0 0 6.6-4.4" fill="none" stroke="#1A73E8" stroke-width="2.4" stroke-linecap="round"/></svg>`;
+    case "nuxt":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M26.5 38h14.6c.9 0 1.6-1 1.1-1.8L31.4 17.4c-.5-.8-1.7-.8-2.2 0l-3.3 5.7-6.4-11.2c-.5-.8-1.7-.8-2.2 0L5.8 36.2c-.5.8.2 1.8 1.1 1.8h9.2" fill="none" stroke="#00DC82" stroke-width="3" stroke-linejoin="round"/><path d="M26.5 38h14.6L29.3 17.4l-3.4 5.7L26.5 38Z" fill="#00DC82"/></svg>`;
+    case "astro":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 5c.8 0 1.5.5 1.8 1.2l10.6 26.3c.3.8-.1 1.7-.9 2-.8.3-1.7 0-2.1-.8l-2.6-6.2H17.2l-2.6 6.2c-.4.8-1.3 1.1-2.1.8-.8-.3-1.2-1.2-.9-2L22.2 6.2C22.5 5.5 23.2 5 24 5Z" fill="#17191E"/><path d="M18.6 24.5h10.8L24 11.2l-5.4 13.3Z" fill="#fff"/><path d="M16 36.5c2 1.6 5 2.5 8 2.5s6-.9 8-2.5c-.6 3.8-3.9 6.5-8 6.5s-7.4-2.7-8-6.5Z" fill="#FF5D01"/></svg>`;
+    case "angular":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4 5 11l3 25 16 8 16-8 3-25L24 4Z" fill="#DD0031"/><path d="M24 4v40l16-8 3-25L24 4Z" fill="#C3002F"/><path d="M24 10 13 35h4.3l2.2-5.4h9L30.7 35H35L24 10Zm3 16h-6l3-7.2 3 7.2Z" fill="#fff"/></svg>`;
+    case "solid":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M42 14s-11-8-20-6l-.7.2c-1.3.4-2.4 1-3.1 1.9L13 16.6l8.9 1.8 3.5 5 4.4 1c6.8 2.5 12.2-3.6 12.2-3.6L42 14Z" fill="#76B3E1"/><path d="M14 17.5s-8 5.8-6 12.5l.3.9c.5 1.2 1.2 2.2 2.3 2.8L21 39l4-8.5 6-3.5-2-8-15-1.5Z" fill="#518AC8"/><path d="M34 24.5c-3.2-4-9.1-5.4-13.1-3L14 25.6c-2 1.2-2.9 3.4-2.4 5.5.9-1.3 2.5-2.2 4.9-2.2 6.7 0 12.7 3.9 15.3 6.5 3-1.7 4.5-5.5 2.2-10.9Z" fill="#3E63DD"/><path d="M11.6 31.1c.5 2 2 3.7 4.3 4.3l8.5 2.4c4.7 1.3 8-1 9.2-4-2.6-2.6-8.6-6.5-15.3-6.5-3.5 0-5.9 1.8-6.7 3.8Z" fill="#76B3E1"/></svg>`;
+    case "nest":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="20" fill="#EA2845"/><path d="M27.8 12c-.7 0-1.4.2-2 .4 1.3.9 2 2 2.3 3.3.3 1 .2 2 .1 2.8 2.6 2 4.3 5 4.6 8.4.6 5-1.7 9.5-5.5 12.1 6.7-1.7 11.7-7.8 11.7-15 0-6.6-5.1-12-11.2-12Zm-8 3.2c-4.8 2.4-8.1 7.4-8.1 13.1 0 4.6 2.1 8.7 5.4 11.4-1.3-2.6-1.8-5.5-1.2-8.5.7-3.8 3-7 6.1-9-.9-1.6-1.9-4.3-2.2-7Z" fill="#fff" opacity=".9"/></svg>`;
+    case "django":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="6" width="36" height="36" rx="9" fill="#092E20"/><path d="M20 12h5v22c-2.6.5-4.5.7-6.6.7-6.1 0-9.4-2.8-9.4-8.1 0-5.1 3.4-8.4 8.7-8.4.8 0 1.5.1 2.3.3V12Zm0 10.6c-.6-.2-1.1-.3-1.8-.3-2.7 0-4.2 1.6-4.2 4.5 0 2.8 1.5 4.3 4.2 4.3.6 0 1.1 0 1.8-.1v-8.4ZM33 19v11c0 3.8-.3 5.6-1.1 7.2-.8 1.5-1.8 2.5-3.9 3.5l-4.6-2.2c2.1-1 3.2-1.9 3.8-3.2.7-1.4.9-3 .9-7.2V19H33Zm-5-6.8h5v5.1h-5v-5.1Z" fill="#44B78B"/></svg>`;
+    case "go":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><rect x="5" y="12" width="38" height="24" rx="12" fill="#00ADD8"/><circle cx="18" cy="22" r="3.4" fill="#fff"/><circle cx="30" cy="22" r="3.4" fill="#fff"/><circle cx="19" cy="22.6" r="1.4" fill="#111"/><circle cx="31" cy="22.6" r="1.4" fill="#111"/><path d="M22.6 27.5h2.8c.5 0 .8.5.5.9l-1.4 1.7c-.3.3-.8.3-1 0l-1.4-1.7c-.3-.4 0-.9.5-.9Z" fill="#F6D2A2"/></svg>`;
+    case "rust":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="19" fill="#F2A900" opacity=".15"/><path d="M24 7l2.4 3.4 4-1.3.7 4.1 4.1.7-1.3 4L37.3 20l-3.4 2.4.9 4.1-4.1.7-.7 4.1-4-1.3L24 33.4l-2.4 3.4-4-1.3-.7 4.1-4.1-.7.9-4.1L10.7 24 7.3 21.6l3.4-2.4-.9-4.1 4.1-.7.7-4.1 4 1.3L24 7Z" fill="none" stroke="#CE422B" stroke-width="2"/><path d="M17 31V17h7.5c2.8 0 4.7 1.5 4.7 4 0 1.9-1 3.2-2.7 3.8l3.2 6.2h-3.9l-2.7-5.6H20.5V31H17Zm3.5-8.4h3.6c1.2 0 2-.6 2-1.6s-.8-1.6-2-1.6h-3.6v3.2Z" fill="#CE422B"/></svg>`;
+    case "spring":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="19" fill="#6DB33F"/><path d="M33.8 13.4c-.7 1.6-1.5 3-2.5 4.1A13.4 13.4 0 0 0 10.7 27c.2 6.9 5.9 12.4 12.8 12.4 6.6 0 12.1-5 12.9-11.4.6-4.8-.8-9.5-2.6-14.6ZM17.6 33.2a1.7 1.7 0 1 1-.3-2.4c.7.6.9 1.7.3 2.4Zm16-3.6c-2.9 3.9-9.1 2.6-13.1 2.8 0 0-.7 0-1.4.2 0 0 .3-.1.6-.3 2.8-1 4.1-1.2 5.8-2.1 3.2-1.6 6.3-5.2 7-8.9-1.2 3.6-4.9 6.6-8.2 7.9-2.3.8-6.4 1.7-6.4 1.7l-.2-.1c-2.8-1.4-2.9-7.5 2.2-9.5 2.2-.9 4.4-.4 6.8-1 2.6-.6 5.6-2.6 6.8-5.1 1.4 4 3 10.3.1 14.4Z" fill="#fff"/></svg>`;
+    case "electron":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="20" fill="#2B2E3A"/><g fill="none" stroke="#9FEAF9" stroke-width="2"><ellipse cx="24" cy="24" rx="15" ry="6"/><ellipse cx="24" cy="24" rx="15" ry="6" transform="rotate(60 24 24)"/><ellipse cx="24" cy="24" rx="15" ry="6" transform="rotate(120 24 24)"/></g><circle cx="24" cy="24" r="3" fill="#9FEAF9"/></svg>`;
+    case "flutter":
+      return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M27 5 8 24l6 6L41 5H27Z" fill="#44D1FD"/><path d="M27 22 16.8 32.2l6.1 6.1L41 22H27Z" fill="#0468D7"/><path d="m22.9 38.3 4.1 4.7h14l-12-12-6.1 7.3Z" fill="#44D1FD"/></svg>`;
     case "vanilla":
     default:
       return `<svg class="new-project-template-svg" viewBox="0 0 48 48" aria-hidden="true"><path d="M12 5h24l-2.2 31.6L24 43l-9.8-6.4L12 5Z" fill="#E44D26"/><path d="M24 8.5h9l-1.8 25.7L24 39V8.5Z" fill="#F16529"/><path d="M17.2 15.5h13.6l-.3 3.6h-9.4l.3 3.6h8.8l-.9 9.4L24 35.5l-5.2-3.4-.4-5h3.6l.2 2.9 1.8 1.2 1.9-1.2.3-3.8h-8.1l-.9-10.7Z" fill="#fff"/></svg>`;
@@ -45953,6 +46003,12 @@ function projectTemplateIcon(kind) {
 
 async function showNewProjectDialog() {
   document.querySelector(".new-project-overlay")?.remove();
+
+  // 创建位置：记住上次选的父目录；首次默认 ~/Desktop（用户现有项目都在桌面）。
+  let _newProjectParentDir = localStorage.getItem("michael-ide.new-project-dir") || "";
+  if (!_newProjectParentDir) {
+    try { _newProjectParentDir = ((await backend.homeDir()) || "").replace(/\/+$/, "") + "/Desktop"; } catch { _newProjectParentDir = "~"; }
+  }
 
   const overlay = document.createElement("div");
   overlay.className = "new-project-overlay";
@@ -45986,7 +46042,7 @@ async function showNewProjectDialog() {
       <div class="new-project-template-list" role="listbox" aria-label="项目模板"></div>
     </div>
     <div class="new-project-footer">
-      <div class="new-project-hint">提示：双击模板也可以直接创建。</div>
+      <div class="new-project-hint"><button class="new-project-location" type="button" title="更改创建位置">📁 <span class="new-project-location-path"></span> · 更改…</button></div>
       <div class="new-project-actions">
         <button class="new-project-cancel" type="button">取消</button>
         <button class="new-project-create" type="button">创建项目</button>
@@ -45996,9 +46052,33 @@ async function showNewProjectDialog() {
   const nameInput = modal.querySelector(".new-project-name-input");
   const list = modal.querySelector(".new-project-template-list");
   const createBtn = modal.querySelector(".new-project-create");
+  // 位置行：显示当前创建目录，点击可换（记忆到 localStorage）。
+  const locBtn = modal.querySelector(".new-project-location");
+  const locPath = modal.querySelector(".new-project-location-path");
+  const _syncLoc = () => { if (locPath) locPath.textContent = _newProjectParentDir; };
+  _syncLoc();
+  locBtn?.addEventListener("click", async () => {
+    try {
+      const picked = await backend.pickFolder();
+      if (picked && typeof picked === "string") {
+        _newProjectParentDir = picked;
+        try { localStorage.setItem("michael-ide.new-project-dir", picked); } catch {}
+        _syncLoc();
+      }
+    } catch {}
+  });
   let selectedIndex = 0;
   let creating = false;
   const close = () => { overlay.remove(); };
+  // 本弹窗全部改 pointerdown 响应（同侧边栏/设置菜单的修复）：WKWebView 丢 click 时，
+  // 模板卡点了不选中→永远创建默认的 React 模板（"每个框架内容都一样"）。
+  const _npSwallowNextClick = () => {
+    const eat = (e) => { e.stopPropagation(); e.preventDefault(); };
+    document.addEventListener("click", eat, { capture: true, once: true });
+    setTimeout(() => document.removeEventListener("click", eat, { capture: true }), 350);
+  };
+  modal.querySelector(".new-project-close").addEventListener("pointerdown", (e) => { if (e.button === 0) { _npSwallowNextClick(); close(); } });
+  modal.querySelector(".new-project-cancel").addEventListener("pointerdown", (e) => { if (e.button === 0) { _npSwallowNextClick(); close(); } });
   modal.querySelector(".new-project-close").addEventListener("click", close);
   modal.querySelector(".new-project-cancel").addEventListener("click", close);
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
@@ -46018,6 +46098,49 @@ async function showNewProjectDialog() {
     createBtn.disabled = true;
     createBtn.textContent = "创建中…";
     const name = nameInput.value.trim() || "my-project";
+    const parentDirPath = _newProjectParentDir;
+    const projectPath = parentDirPath.replace(/\/+$/, "") + "/" + name;
+    // 创建前校验失败 → 不关弹窗，按钮复位，给出原因，绝不把命令丢进终端碎掉。
+    const _resetCreateBtn = () => { creating = false; createBtn.disabled = false; createBtn.textContent = "创建项目"; };
+    // ① 重名目录：目标已存在就拒绝——旧版不查，脚手架失败后轮询把**残留的旧同名目录**
+    // 当成新项目打开（Flutter 没装失败却"打开了一个 React 项目"就是这么来的）。
+    try {
+      if (await _pathExistsAsDir(projectPath)) {
+        showToast(`⚠️ 目录已存在：${projectPath}，请换个项目名或先删掉旧目录`, { duration: 6000 });
+        _resetCreateBtn();
+        try { nameInput.focus(); nameInput.select(); } catch {}
+        return;
+      }
+    } catch {}
+    // ② 工具链检查：模板依赖的 CLI 没装就明确告知怎么装，不让用户在终端里看
+    // "command not found"自己猜（真实终端登录 shell 里探测，PATH 与实际执行一致）。
+    const _toolHints = {
+      flutter: "安装 Flutter SDK：brew install --cask flutter，或去 flutter.dev 下载",
+      go: "安装 Go：brew install go",
+      cargo: "安装 Rust：curl https://sh.rustup.rs -sSf | sh",
+      python3: "安装 Python：brew install python",
+      npm: "安装 Node.js：brew install node，或去 nodejs.org 下载",
+      curl: "安装 curl：brew install curl",
+    };
+    const _needTools = [];
+    if (/\bflutter\b/.test(tmpl.cmd)) _needTools.push("flutter");
+    if (/\bcargo\b/.test(tmpl.cmd)) _needTools.push("cargo");
+    if (/\bgo mod\b/.test(tmpl.cmd)) _needTools.push("go");
+    if (/\bpython3\b/.test(tmpl.cmd)) _needTools.push("python3");
+    if (/\b(?:npm|npx)\b/.test(tmpl.cmd)) _needTools.push("npm");
+    if (/\bcurl\b/.test(tmpl.cmd)) _needTools.push("curl");
+    if (inTauri && backend.taskRunCapture) {
+      for (const tool of _needTools) {
+        try {
+          const r = await backend.taskRunCapture(parentDirPath, `command -v ${tool}`, { timeoutSecs: 10 });
+          if (!r || r.code !== 0) {
+            showToast(`⚠️ 未检测到 ${tool} 命令，无法创建 ${tmpl.name} 项目。${_toolHints[tool] || "请先安装对应工具链"}`, { duration: 8000 });
+            _resetCreateBtn();
+            return;
+          }
+        } catch { /* 探测通道异常不阻断：交给终端真实执行去暴露 */ }
+      }
+    }
     close();
     await openTerminal();
     const wasOpen = termIsOpen();
@@ -46026,8 +46149,25 @@ async function showNewProjectDialog() {
       await new Promise((r) => setTimeout(r, 1800));
     }
     const cmd = tmpl.cmd.replace(/\{\{name\}\}/g, shellQuote(name));
-    writeToActiveTerminal(`\n${_clearCmd}\n${cmd}\n`);
-    showToast(`正在创建 ${tmpl.name} 项目: ${name}`);
+    writeToActiveTerminal(`\n${_clearCmd}\ncd ${shellQuote(parentDirPath)} && ${cmd}\n`);
+    showToast(`正在创建 ${tmpl.name} 项目：${projectPath}`);
+    // 轮询项目目录出现（脚手架一建目录就打开，不等依赖装完），最多等 5 分钟。
+    const t0 = Date.now();
+    const poll = async () => {
+      if (Date.now() - t0 > 5 * 60 * 1000) return;
+      try {
+        if (await _pathExistsAsDir(projectPath)) {
+          // 无论当前是否开着项目，创建完一律直接打开新项目（用户预期：新建完就进去干活，
+          // 旧版"已开项目时只弹提示"导致第二次新建不跳转）。依赖安装继续在终端跑。
+          await openFolder(projectPath);
+          loadRecentProjects();
+          showToast(`✅ 项目已创建并打开：${name}（依赖安装继续在终端进行）`);
+          return;
+        }
+      } catch {}
+      setTimeout(poll, 2000);
+    };
+    setTimeout(poll, 2000);
   };
 
   for (const tmpl of PROJECT_TEMPLATES) {
@@ -46043,6 +46183,11 @@ async function showNewProjectDialog() {
         <small>${_escHtml(tmpl.desc)}</small>
       </span>
       <span class="new-project-template-tag">${_escHtml(tmpl.tag)}</span>`;
+    row.addEventListener("pointerdown", (e) => { // 一按即选，不依赖易丢的 click
+      if (e.button !== 0) return;
+      selectedIndex = index;
+      syncSelection();
+    });
     row.addEventListener("click", () => {
       selectedIndex = index;
       syncSelection();
@@ -46052,6 +46197,11 @@ async function showNewProjectDialog() {
   }
 
   syncSelection();
+  createBtn.addEventListener("pointerdown", (e) => { // 创建键同样 pointerdown 即达；creating 标记防重复
+    if (e.button !== 0) return;
+    _npSwallowNextClick();
+    createProject();
+  });
   createBtn.addEventListener("click", () => createProject());
   modal.addEventListener("keydown", (e) => {
     if (e.key === "Escape") close();

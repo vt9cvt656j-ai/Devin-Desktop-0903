@@ -3970,7 +3970,16 @@ pub async fn chat_completions(
             };
             let mut route_attempts = 0u32;
             let mut route_failed_transient = false;
-            for attempt in 0u32..CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+            // 已在冷却中的线路只探测 1 次（快速失败 + 快速探活）。以前单线路模型不参与
+            // 冷却分流，上游挂掉后每个请求仍完整跑满 6 次重试（~25s 才吐错）——IDE 端
+            // 体感就是「请求已发出，等待响应头 30s」。冷却窗口内 1 次探测足以发现恢复，
+            // 探测成功后冷却自动解除、回到满重试。
+            let candidate_max_attempts = if route_cooldown_remaining(candidate.id, now).is_some() {
+                1
+            } else {
+                CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE
+            };
+            for attempt in 0u32..candidate_max_attempts {
                 let req0 = GW_HTTP.post(&candidate_url);
                 let mut req = if candidate_anthropic {
                     req0.header("x-api-key", &candidate.api_key)
@@ -4006,7 +4015,7 @@ pub async fn chat_completions(
                         if persistent || !transient {
                             break;
                         }
-                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                        if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;
                         }
@@ -4017,7 +4026,7 @@ pub async fn chat_completions(
                     Err(e) => {
                         err_status = 502;
                         err_low = e.to_string().to_lowercase();
-                        if attempt + 1 >= CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE {
+                        if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;
                         }
