@@ -4411,12 +4411,30 @@ body.zen-mode .editor {
   position: absolute;
   top: 0; right: 0; bottom: 0;
   width: 48%;
-  overflow-y: auto;
+  /* 滚动下放到 __body：面板自己滚会把绝对定位的拖拽手柄随内容一起滚走（滚过一屏
+     后手柄消失，"又无法拖动"），还会裁掉手柄伸出左缘的那半热区。 */
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
   background: var(--editor-bg);
   border-left: 1px solid var(--line);
   z-index: 6;
 }
 .md-preview[hidden] { display: none !important; }
+/* 预览面板左缘拖拽手柄：8px 热区跨在边缘上，hover/拖拽时显色提示可拖 */
+.md-preview__resizer {
+  position: absolute;
+  top: 0; bottom: 0; left: -4px;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 7;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.md-preview__resizer:hover,
+.md-preview__resizer.is-dragging {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
 
 /* thumbnail strip */
 .md-thumb {
@@ -4475,6 +4493,9 @@ body.zen-mode .editor {
 
 /* -- preview body typography -- */
 .md-preview__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto; /* 滚动属于内容区，手柄/头部不随内容滚动 */
   padding: 24px 32px 40px;
   font-size: 15px;
   line-height: 1.7;
@@ -4511,7 +4532,10 @@ body.zen-mode .editor {
   border: 1px solid color-mix(in srgb, var(--accent) 12%, var(--line));
   color: color-mix(in srgb, var(--accent) 50%, var(--text));
 }
-.md-preview__body pre {
+/* 深色终端皮肤只给裸 pre（缩进式代码块）：围栏代码块已由 code-card 渲染（白卡+语言标题栏），
+   旧版这套皮肤打到卡片内部的 pre.code-card__body 上——深色块缩在白卡里四周漏白、
+   与头部错位，且 Monaco 浅色主题的高亮 token 在深底上不可读。 */
+.md-preview__body pre:not(.code-card__body) {
   background: #1e1e2e;
   padding: 16px 20px;
   border-radius: 10px;
@@ -4520,7 +4544,7 @@ body.zen-mode .editor {
   box-shadow: 0 2px 12px rgba(0,0,0,.08), 0 0 0 1px rgba(0,0,0,.06);
   position: relative;
 }
-.md-preview__body pre::before {
+.md-preview__body pre:not(.code-card__body)::before {
   content: "";
   position: absolute;
   top: 10px; left: 14px;
@@ -4529,7 +4553,7 @@ body.zen-mode .editor {
   background: #ff5f57;
   box-shadow: 14px 0 0 #febc2e, 28px 0 0 #28c840;
 }
-.md-preview__body pre code {
+.md-preview__body pre:not(.code-card__body) code {
   background: none;
   padding: 0;
   border: none;
@@ -4538,6 +4562,15 @@ body.zen-mode .editor {
   line-height: 1.6;
   display: block;
   padding-top: 12px;
+}
+/* code-card 内的代码：走标准卡片样式（与聊天面板一致），只修正行内 code 胶囊样式的溢出 */
+.md-preview__body .code-card { margin: 16px 0; }
+.md-preview__body .code-card__body code {
+  background: none;
+  padding: 0;
+  border: none;
+  color: var(--text);
+  font-size: 12.5px;
 }
 .md-preview__body ul, .md-preview__body ol { padding-left: 24px; margin: 8px 0; }
 .md-preview__body li { margin: 4px 0; }

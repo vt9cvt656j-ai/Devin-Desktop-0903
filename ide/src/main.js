@@ -6514,6 +6514,9 @@ function _createMdElements() {
   _mdPreviewEl = document.createElement("div");
   _mdPreviewEl.className = "md-preview";
   _mdPreviewEl.hidden = true;
+  // 恢复上次拖出来的宽度（百分比，随窗口缩放自适应）
+  const savedPct = parseFloat(localStorage.getItem("md_preview_width_pct") || "");
+  if (savedPct >= 15 && savedPct <= 85) _mdPreviewEl.style.width = savedPct + "%";
   const header = document.createElement("div");
   header.className = "md-preview__header";
   header.innerHTML = `<span class="md-preview__title">Markdown 预览</span>
@@ -6522,6 +6525,36 @@ function _createMdElements() {
   const body = document.createElement("div");
   body.className = "md-preview__body";
   _mdPreviewEl.appendChild(body);
+  // 左缘拖拽手柄：预览面板是固定 48% 宽的绝对定位层，之前无任何调宽途径（"无法
+  // 左右调整宽度"）。pointer capture 保证拖出手柄区域、拖进 Monaco/iframe 上也不丢事件。
+  const resizer = document.createElement("div");
+  resizer.className = "md-preview__resizer";
+  _mdPreviewEl.appendChild(resizer);
+  resizer.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    resizer.setPointerCapture(e.pointerId);
+    resizer.classList.add("is-dragging");
+    document.body.style.cursor = "col-resize";
+    const rect = editorContainer.getBoundingClientRect();
+    const onMove = (ev) => {
+      const pct = Math.min(85, Math.max(15, ((rect.right - ev.clientX) / rect.width) * 100));
+      _mdPreviewEl.style.width = pct + "%";
+      try { monacoEditor?.layout(); } catch {}
+    };
+    const onUp = () => {
+      resizer.classList.remove("is-dragging");
+      document.body.style.cursor = "";
+      resizer.removeEventListener("pointermove", onMove);
+      resizer.removeEventListener("pointerup", onUp);
+      resizer.removeEventListener("pointercancel", onUp);
+      const pct = parseFloat(_mdPreviewEl.style.width);
+      if (pct) try { localStorage.setItem("md_preview_width_pct", String(Math.round(pct * 10) / 10)); } catch {}
+    };
+    resizer.addEventListener("pointermove", onMove);
+    resizer.addEventListener("pointerup", onUp);
+    resizer.addEventListener("pointercancel", onUp);
+  });
   editorContainer.appendChild(_mdPreviewEl);
   header.querySelector(".md-preview__close").addEventListener("click", () => _toggleMdPreview(false));
 
@@ -6558,7 +6591,8 @@ function showMarkdownPreview(model) {
   _mdActiveModel = model;
   const body = _mdPreviewEl.querySelector(".md-preview__body");
   function render() {
-    renderMarkdownInto(body, model.getValue());
+    // 传高亮器：预览曾是全局唯一没传 highlighter 的调用点——代码块永远纯白无高亮。
+    renderMarkdownInto(body, model.getValue(), { highlighter: highlightCode });
     if (!_mdPreviewOpen) _renderMdThumb();
   }
   render();
@@ -7183,6 +7217,16 @@ function renderTabs() {
     tabsEl.appendChild(tab);
   }
 }
+
+// 文件页签条：纵向滚轮 → 横向滚动（VS Code 同款）。.tabs 是 overflow-x 容器且隐藏了
+// 滚动条，普通鼠标滚轮只产生 deltaY，不转换就完全滚不动（"上下滚无法左右"）。
+// 触控板横扫（deltaX 为主）保持原生行为不拦截。
+tabsEl.addEventListener("wheel", (e) => {
+  if (tabsEl.scrollWidth <= tabsEl.clientWidth) return; // 没溢出就不拦
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;  // 触控板横扫走原生
+  e.preventDefault();
+  tabsEl.scrollLeft += e.deltaY;
+}, { passive: false });
 
 // ---- file tree ----
 let rootPath = null;
@@ -17701,6 +17745,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // gathering can be interrupted (was: streaming only set later, so an early hang
   // left a dead Stop button + no response).
   _setStreaming(sess, true);
+  // 运行代际（治"停止后发新消息，旧循环复活并行"）：旧 run 的存活判据只有
+  // sess.streaming，新一轮把它置回 true 后，还卡在工具/重试等待里的旧循环下个
+  // 检查点会误判"还活着"继续跑——新旧两条循环同时写同一个会话。每次新回合
+  // 拨一次代际，所有存活判据同时校验代际，旧循环在下个检查点确定性死亡。
+  sess._runGen = (sess._runGen || 0) + 1;
+  const _turnRunGen = sess._runGen;
+  const _turnLive = () => sess.streaming && sess._runGen === _turnRunGen;
   chatEl.querySelector(".chat-empty")?.remove();
 
   let _turnRoot = "";
@@ -17976,7 +18027,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const hasToolAccess = (isAgent && !_agentLightTurn) || isExplorer || isReviewer || isPlan;
 
   // If the user hit Stop during the (bounded) pre-processing above, abort cleanly.
-  if (!sess.streaming) { if (sess === _currentSession()) _setSendBtnStop(false); return; }
+  if (!_turnLive()) { if (sess === _currentSession()) _setSendBtnStop(false); return; }
 
   const _turnEngineering = _turnEngineeringEarly;
   const _needsRealWorkspace = hasToolAccess && !_contextRoot && (
@@ -18070,7 +18121,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     return `准备请求 ${elapsed}s`;
   };
   const _plainWaitTimer = setInterval(() => {
-    if (!sess.streaming) return;
+    if (!_turnLive()) return;
     const idle = Math.round((Date.now() - _plainLastProgressAt) / 1000);
     if (idle < 8) return;
     const tEl = body.querySelector(".thinking .thinking__text");
@@ -18346,7 +18397,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _shown = _revealStep(_shown, acc.length);
     renderStream(acc.slice(0, _shown));
     if (_shown < acc.length) { scheduleStream(); return; }
-    if (sess.streaming) scheduleStream();
+    if (_turnLive()) scheduleStream();
   };
   const scheduleStream = () => { if (!raf) raf = requestAnimationFrame(flushStream); };
   // Bind a cancel id so Stop can actually ABORT the in-flight backend request (stop burning
@@ -18374,8 +18425,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // User hit Stop → drop every further event so output halts AT ONCE (mirrors the agent
       // path's `if (!_live()) return`). Without this the callback kept appending to `acc` and
       // kept firing tool calls after Stop, and the finally then rendered the full answer
-      // anyway — i.e. Stop didn't actually stop ("停不掉").
-      if (!sess.streaming) return;
+      // anyway — i.e. Stop didn't actually stop ("停不掉"). 代际校验防新回合把旧回调救活。
+      if (!_turnLive()) return;
       if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return; }
       if (ev && (ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall")) {
         _plainLastProgressAt = Date.now();
@@ -18456,11 +18507,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     // 假流式上游（整段憋完一次喷出）会在流一结束就定稿：先把还没展示的
     // 大段余量按帧播完再定稿，否则最终渲染直接整块闪现。用户点停止或出错时不播。
-    if (!err && sess.streaming && acc.length - _shown > 600 && !document.hidden) {
+    if (!err && _turnLive() && acc.length - _shown > 600 && !document.hidden) {
       await new Promise((done) => {
         const t0 = Date.now();
         const step = () => {
-          if (!sess.streaming || document.hidden || Date.now() - t0 > 4000) { done(); return; }
+          if (!_turnLive() || document.hidden || Date.now() - t0 > 4000) { done(); return; }
           _shown = _revealStep(_shown, acc.length);
           try { renderStream(acc.slice(0, _shown)); _chatFollow(); } catch { /* keep finishing */ }
           if (_shown < acc.length) setTimeout(step, 16); // setTimeout（非 rAF）：后台窗口 rAF 会被暂停，定稿/存档就悬住了
@@ -28373,9 +28424,11 @@ function _staticToolNames() {
 async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = null, body, session, ideMode, skillsBlock = "", narrativeSeen = null, renderRejectedToolAttempts = true }) {
   // Final defensive bound: every provider turn sees one total static+runtime tool window.
   _applyToolPayloadWindow(toolSchemas);
-  // `session` owns this turn — interrupt checks read session.streaming, and the
-  // auto-scroll only fires when this run's tab is the one on screen.
-  const _live = () => !session || session.streaming;
+  // `session` owns this turn — interrupt checks read session.streaming（+ 运行代际，
+  // 防新回合把已停止的旧 turn 救活）, and the auto-scroll only fires when this
+  // run's tab is the one on screen.
+  const _turnGenSnap = session ? (session._runGen || 0) : 0;
+  const _live = () => !session || (session.streaming && (session._runGen || 0) === _turnGenSnap);
   // Per-turn cancel: each call gets its own requestId so parallel sub-agents register
   // SEPARATE cancel flags in Rust (register_cancel does m.insert → replaces the old
   // entry; shared IDs meant only the LAST sub-agent was cancellable). All active IDs
@@ -29468,7 +29521,8 @@ function _sessionFileEvidenceBlock(session, root, limit = 8) {
 }
 async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], role = "", depth = 1, onMutation = null }) {
   const _sess = run && run.session;
-  const _live = () => !_sess || _sess.streaming;
+  const _subGenSnap = _sess ? (_sess._runGen || 0) : 0; // 代际快照：父 run 被新回合取代后，子代理下个检查点确定性退出
+  const _live = () => !_sess || (_sess.streaming && (_sess._runGen || 0) === _subGenSnap);
   // Worker mode: declared scope → root-relative; the worker may only modify files
   // inside it. Disjoint scopes across concurrent workers = no write conflict.
   const scopeRel = write ? (Array.isArray(scope) ? scope : [scope]).map((s) => _normRel(s, root)).filter(Boolean) : [];
@@ -31153,10 +31207,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
   // while _isStreaming() is still false → the Stop click is a dead no-op.
   session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
+  const _runGenSnap = session._runGen || 0; // 代际快照：旧 run 不能被新回合的 streaming=true 救活
   session._runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
-  const _live = () => !!session.streaming;
+  const _live = () => !!session.streaming && (session._runGen || 0) === (_runGenSnap || 0);
   const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
@@ -43173,17 +43228,35 @@ $("emptyOpenBtn").addEventListener("click", chooseFolder);
 // getElementById only wired the first one and this big button did nothing.
 $("welcomeOpenBtn")?.addEventListener("click", chooseFolder);
 // settings dropdown
+// 齿轮与菜单项全部改在 pointerdown 上响应（同侧边栏页签的修复）：AI 回复期间渲染繁忙，
+// WKWebView 的 click（按下+松开配对）常被吞——账单/通用设置/快捷键点了没反应。
+// pointerdown 一按即达；同一次按压派生的后续 click 用一次性捕获吞掉，防它落到菜单
+// 关闭后暴露的底层元素或 document 关单逻辑上。键盘 Enter/Space（合成 click，detail===0）保留。
 const settingsDropdown = $("settingsDropdown");
+const _swallowNextClick = () => {
+  const eat = (e) => { e.stopPropagation(); e.preventDefault(); };
+  document.addEventListener("click", eat, { capture: true, once: true });
+  setTimeout(() => document.removeEventListener("click", eat, { capture: true }), 350);
+};
+$("settingsBtn").addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  e.stopPropagation();
+  _swallowNextClick();
+  if (settingsDropdown) settingsDropdown.hidden = !settingsDropdown.hidden;
+});
 $("settingsBtn").addEventListener("click", (e) => {
   e.stopPropagation();
-  if (settingsDropdown) settingsDropdown.hidden = !settingsDropdown.hidden;
+  if (e.detail === 0 && settingsDropdown) settingsDropdown.hidden = !settingsDropdown.hidden; // 键盘可达
+});
+// 按在菜单外 → 关单（pointerdown 保证回复期间也能可靠关闭）；click 路径保留为兜底。
+document.addEventListener("pointerdown", (e) => {
+  if (!settingsDropdown || settingsDropdown.hidden) return;
+  if (settingsDropdown.contains(e.target) || $("settingsBtn").contains(e.target)) return;
+  settingsDropdown.hidden = true;
 });
 document.addEventListener("click", () => { if (settingsDropdown) settingsDropdown.hidden = true; });
 if (settingsDropdown) {
-  settingsDropdown.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const item = e.target.closest("[data-action]");
-    if (!item) return;
+  const _dropdownActivate = (item) => {
     settingsDropdown.hidden = true;
     const action = item.dataset.action;
     if (action === "general-settings") openFeaturePanel("settings");
@@ -43199,6 +43272,20 @@ if (settingsDropdown) {
     else if (action === "profile") {
       showProfile();
     }
+  };
+  settingsDropdown.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    const item = e.target.closest("[data-action]");
+    if (!item) return;
+    _swallowNextClick();
+    _dropdownActivate(item);
+  });
+  settingsDropdown.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (e.detail !== 0) return; // 鼠标路径已由 pointerdown 处理
+    const item = e.target.closest("[data-action]");
+    if (item) _dropdownActivate(item);
   });
 }
 $("saveBtn").addEventListener("click", saveActive);
@@ -43486,10 +43573,37 @@ $("loginUseCodeBtn")?.addEventListener("click", async () => {
 });
 
 // ---- explorer tabs / tools / search ----
-$("tabExplorer").addEventListener("click", () => showSide("explorer"));
-$("tabGit").addEventListener("click", () => showSide("git"));
-$("tabOutline").addEventListener("click", () => showSide("outline"));
-$("tabTest").addEventListener("click", () => showSide(_debugSidebarMode ? "debug" : "test"));
+// 页签切换改在 pointerdown 上触发（VS Code 同款）：click 要求 mousedown/mouseup 落在同一
+// 元素，WKWebView 里手抖几像素或碰到拖拽判定就丢事件——用户体感"要点好几下才切换"。
+// pointerdown 一按即切；整条 seg 容器全域命中，按到 2px 缝隙/内边距也吸附到最近页签。
+const _sideTabWhich = (btn) =>
+  btn.id === "tabExplorer" ? "explorer"
+  : btn.id === "tabGit" ? "git"
+  : btn.id === "tabOutline" ? "outline"
+  : (_debugSidebarMode ? "debug" : "test");
+const _sideTabsEl = $("sideTabs");
+_sideTabsEl.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  let btn = e.target && e.target.closest ? e.target.closest(".seg__btn") : null;
+  if (!btn) { // 点在缝隙上 → 命中横向最近的页签
+    let best = null, bestDist = Infinity;
+    for (const b of _sideTabsEl.querySelectorAll(".seg__btn")) {
+      const r = b.getBoundingClientRect();
+      const d = e.clientX < r.left ? r.left - e.clientX : e.clientX > r.right ? e.clientX - r.right : 0;
+      if (d < bestDist) { bestDist = d; best = b; }
+    }
+    btn = best;
+  }
+  if (!btn) return;
+  showSide(_sideTabWhich(btn));
+});
+// 键盘可达性：Enter/Space 触发的合成 click（detail===0）仍然切换；鼠标 click 已由
+// pointerdown 处理过，跳过避免同一次按压双重刷新。
+_sideTabsEl.addEventListener("click", (e) => {
+  const btn = e.target && e.target.closest ? e.target.closest(".seg__btn") : null;
+  if (!btn || e.detail !== 0) return;
+  showSide(_sideTabWhich(btn));
+});
 $("gitRefreshBtn").addEventListener("click", () => { refreshGitStatus().catch((e) => console.warn("[git] refresh failed:", e)); });
 $("gitPullBtn").addEventListener("click", () => gitPull());
 $("gitPushBtn").addEventListener("click", () => gitPush());
@@ -44044,7 +44158,9 @@ function _insertRefAtCursor(rel) {
   document.addEventListener("mousemove", (e) => {
     if (!_rowDragCandidate) return;
     if (!_rowDragging) {
-      if (Math.abs(e.clientX - _rowDragCandidate.sx) + Math.abs(e.clientY - _rowDragCandidate.sy) < 6) return;
+      // 拖拽判定阈值 14px：旧值 6px 太灵敏，鼠标快速点击时手抖几像素就被判成拖拽，
+      // 随后的 click 被全局吞掉——用户体感就是"点了没反应/要点好几次"。
+      if (Math.abs(e.clientX - _rowDragCandidate.sx) + Math.abs(e.clientY - _rowDragCandidate.sy) < 14) return;
       _rowDragging = true;
       document.body.classList.add("tree-dragging");
       document.addEventListener("selectstart", _blockSelect, true);
@@ -44077,7 +44193,8 @@ function _insertRefAtCursor(rel) {
   });
 })();
 // Swallow the click that follows a drag so the dragged file isn't also opened/selected.
-document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
+// 只吞树内的点击：旧版全局吞，拖完文件紧接着点 文件/Git/大纲/测试 页签会被白吞一次。
+document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; if (e.target && e.target.closest && e.target.closest("#tree")) { e.stopPropagation(); e.preventDefault(); } } }, true);
 promptEl.addEventListener("keydown", (e) => {
   // Enter 直接发送；Shift+Enter 换行（⌘/Ctrl+Enter 也照发）。但要避开两种情况：
   //  ① @文件 / 斜杠菜单打开时，Enter 是「选中菜单项」——交给各自的处理器；
@@ -47575,15 +47692,57 @@ async function refreshOutline() {
   }
   const model = monacoEditor.getModel();
   if (!model) return;
+  // monaco.languages.getDocumentSymbols 不是公开 API（0.55 的 editor.api 里不存在），
+  // 旧代码每次必抛 TypeError → 永远渲染 "No symbols found"（"大纲点了没内容"的根因）。
+  // 正路：LSP documentSymbol（本项目已有通道）；LSP 没起来/不支持时回退到内置正则解析，
+  // 保证大纲在任何语言环境下都至少有结果。
+  let symbols = null;
   try {
-    const symbols = await monaco.languages.getDocumentSymbols(model);
-    _outlineSymbols = symbols || [];
-    renderOutlineTree(_outlineSymbols, tree);
-  } catch {
-    tree.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
-  }
+    if (typeof lspManager !== "undefined" && lspManager && lspManager.agentDocumentSymbols) {
+      symbols = await lspManager.agentDocumentSymbols(activePath); // [{name,kind,line,depth}] | null
+    }
+  } catch { symbols = null; }
+  if (!Array.isArray(symbols) || !symbols.length) symbols = _fallbackOutline(model);
+  _outlineSymbols = symbols;
+  renderOutlineTree(_outlineSymbols, tree);
   $("outlineTimeline")?.removeAttribute("hidden");
   refreshTimeline();
+}
+
+// LSP 不可用时的兜底大纲：按语言用正则抽 函数/类/结构 等顶层符号（1-based 行号）。
+function _fallbackOutline(model) {
+  const lang = model.getLanguageId();
+  const text = model.getValue();
+  const out = [];
+  const push = (name, kind, line, depth = 0, detail = "") => out.push({ name, kind, line, depth, detail });
+  const patterns = {
+    javascript: [
+      [/^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/, "function"],
+      [/^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)/, "class"],
+      [/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/, "function"],
+    ],
+    python: [[/^\s*def\s+([A-Za-z_]\w*)/, "function"], [/^\s*class\s+([A-Za-z_]\w*)/, "class"]],
+    rust: [
+      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/, "function"],
+      [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)/, "struct"],
+      [/^\s*impl(?:<[^>]*>)?\s+([A-Za-z_][\w:<>, ]*?)\s*[{]/, "class"],
+    ],
+    go: [[/^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/, "function"], [/^\s*type\s+([A-Za-z_]\w*)/, "struct"]],
+    markdown: [[/^(#{1,6})\s+(.+)$/, "string"]],
+  };
+  const alias = { typescript: "javascript", javascriptreact: "javascript", typescriptreact: "javascript", mdx: "markdown" };
+  const rules = patterns[alias[lang] || lang] || patterns.javascript;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length && out.length < 500; i++) {
+    for (const [re, kind] of rules) {
+      const m = re.exec(lines[i]);
+      if (!m) continue;
+      if (lang === "markdown" || alias[lang] === "markdown") push(m[2].trim(), kind, i + 1, m[1].length - 1);
+      else push(m[1], kind, i + 1);
+      break;
+    }
+  }
+  return out;
 }
 
 function renderOutlineTree(symbols, container) {
@@ -47593,33 +47752,30 @@ function renderOutlineTree(symbols, container) {
     container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
     return;
   }
+  // 扁平列表（LSP agentDocumentSymbols / 兜底解析统一形态）：depth 用缩进表达层级。
   const sorted = [...symbols];
   if (_outlineSortByName) sorted.sort((a, b) => a.name.localeCompare(b.name));
   for (const sym of sorted) {
     if (filter && !sym.name.toLowerCase().includes(filter)) continue;
     const row = document.createElement("div");
     row.className = "outline-row";
+    if (sym.depth) row.style.paddingLeft = `${8 + sym.depth * 14}px`;
     const kindClass = _symbolKindClass(sym.kind);
     row.innerHTML = `<span class="outline-icon outline-icon--${kindClass}"></span><span class="outline-name">${_escHtml(sym.name)}</span><span class="outline-detail">${_escHtml(sym.detail || "")}</span>`;
     row.addEventListener("click", () => {
-      const range = sym.range || sym.selectionRange;
-      if (range) {
-        monacoEditor.revealLineInCenter(range.startLineNumber);
-        monacoEditor.setPosition({ lineNumber: range.startLineNumber, column: range.startColumn });
+      if (sym.line) {
+        monacoEditor.revealLineInCenter(sym.line);
+        monacoEditor.setPosition({ lineNumber: sym.line, column: 1 });
         monacoEditor.focus();
       }
     });
     container.appendChild(row);
-    if (sym.children?.length) {
-      const childContainer = document.createElement("div");
-      childContainer.className = "outline-children";
-      renderOutlineTree(sym.children, childContainer);
-      container.appendChild(childContainer);
-    }
   }
+  if (!container.childElementCount) container.innerHTML = '<div class="empty"><p>No symbols found.</p></div>';
 }
 
 function _symbolKindClass(kind) {
+  if (typeof kind === "string" && kind) return kind.toLowerCase(); // LSP 通道给的已是名字
   const map = { 1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
     7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function",
     13: "variable", 14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array",
@@ -47644,7 +47800,9 @@ $("outlineFilter")?.addEventListener("input", () => {
 });
 
 monacoEditor.onDidChangeModel(() => {
-  if (!$("viewOutline")?.hidden === false) refreshOutline();
+  // 只在大纲可见时刷新。旧写法 `!hidden === false` 运算符优先级写反：隐藏时白烧
+  // 解析、可见时反而不刷——切到大纲页看到的是上个文件的旧结构（"点了没效果"之一）。
+  if ($("viewOutline")?.hidden === false) refreshOutline();
 });
 
 // ---- File Timeline ----
@@ -47733,8 +47891,10 @@ $("outputClearBtn")?.addEventListener("click", () => {
 $("outputCloseBtn")?.addEventListener("click", () => toggleOutputPanel());
 
 // ---- Test Explorer ----
+// .mjs/.cjs 也算测试文件（本仓库自己的测试就是 test/*.test.mjs，旧模式漏掉 → 永远
+// "No test files detected"，测试页签点了像没反应）。
 const _TEST_PATTERNS = [
-  /\.test\.[jt]sx?$/, /\.spec\.[jt]sx?$/, /_test\.go$/, /test_.*\.py$/, /.*_test\.py$/,
+  /\.(test|spec)\.[cm]?[jt]sx?$/, /_test\.go$/, /test_.*\.py$/, /.*_test\.py$/,
   /Test\.java$/, /\.test\.rs$/
 ];
 
@@ -47812,7 +47972,8 @@ async function runTestFile(path, name, rowEl) {
   const root = rootPath || workspaceRoots[0] || "";
   try {
     let cmd;
-    if (/\.(test|spec)\.[jt]sx?$/.test(name)) cmd = `npx vitest run "${path}" 2>&1 || npx jest "${path}" --no-coverage 2>&1`;
+    if (/\.(test|spec)\.[cm]js$/.test(name)) cmd = `node --test "${path}" 2>&1`; // node 内置 test runner（本仓库 *.test.mjs 用的就是它）
+    else if (/\.(test|spec)\.[jt]sx?$/.test(name)) cmd = `npx vitest run "${path}" 2>&1 || npx jest "${path}" --no-coverage 2>&1`;
     else if (/_test\.go$/.test(name)) cmd = `go test -v "${path}" 2>&1`;
     else if (/(^|\/)test_.*\.py$|_test\.py$|test.*\.py$/.test(name)) cmd = `python -m pytest "${path}" -v 2>&1`;
     else if (/\.rs$/.test(name)) cmd = `cargo test 2>&1`;
