@@ -4680,6 +4680,31 @@ body.zen-mode .editor {
 .ai-choice:disabled { cursor: default; opacity: .55; }
 .ai-choice.is-picked:disabled { opacity: 1; }
 .agent-tool-step { overflow: hidden; }
+.agent-activity-log {
+  margin: 6px 0;
+  border: 1px solid var(--border, rgba(128, 128, 128, .28));
+  border-radius: 6px;
+  background: var(--panel, transparent);
+  color: var(--text-dim, #6b7280);
+}
+.agent-activity-log > summary {
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+}
+.agent-activity-log__body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 6px 6px;
+}
+/* 长对话性能（跑着跑着就卡的根因）：视口外的消息行/工具卡用 content-visibility: auto
+   完全跳过布局与绘制——DOM 再长每帧也只为可见部分付渲染成本。contain-intrinsic-size
+   记住/预估高度，滚动条稳定、锚点不跳；流式尾部消息在视口内，渲染不受影响。 */
+.msg { content-visibility: auto; contain-intrinsic-size: auto 160px; }
+.agent-tool-step, .think-card { content-visibility: auto; contain-intrinsic-size: auto 44px; }
 .agent-tool-row { min-width: 0; max-width: 100%; overflow: hidden; }
 .agent-tool-row > * { min-width: 0; }
 /* Inline code (incl. while streaming) wraps instead of forcing the line wider. */
@@ -6815,12 +6840,13 @@ body.zen-mode .editor {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px 14px;
+  gap: 4px 10px;
 }
 .turn-stats__item {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  white-space: nowrap;
 }
 .turn-stats__icon {
   width: 14px;

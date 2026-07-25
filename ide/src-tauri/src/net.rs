@@ -489,6 +489,7 @@ pub async fn generate_image_chat(
     dest: String,
     width: Option<u32>,
     height: Option<u32>,
+    request_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -515,22 +516,47 @@ pub async fn generate_image_chat(
     //   3. /v1/chat/completions (chat-wrapped image gen, last resort)
     // The Images API goes first: text-input routes (responses/chat) on relay gateways
     // often degrade to a text answer instead of an image.
-    let (bytes, mime): (Vec<u8>, String) =
-        match try_images_api(&client, b, &api_key, &model, prompt, &size_str).await {
-            Ok(ok) => ok,
-            Err(e0) => {
-                match try_responses_api(&client, b, &api_key, &model, prompt, &size_str).await {
+    let (bytes, mime): (Vec<u8>, String) = match try_images_api(
+        &client,
+        b,
+        &api_key,
+        &model,
+        prompt,
+        &size_str,
+        request_id.as_deref(),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e0) => {
+            match try_responses_api(
+                &client,
+                b,
+                &api_key,
+                &model,
+                prompt,
+                &size_str,
+                request_id.as_deref(),
+            )
+            .await
+            {
+                Ok(ok) => ok,
+                Err(e1) => match try_chat_image_api(
+                    &client,
+                    b,
+                    &api_key,
+                    &model,
+                    prompt,
+                    request_id.as_deref(),
+                )
+                .await
+                {
                     Ok(ok) => ok,
-                    Err(e1) => match try_chat_image_api(&client, b, &api_key, &model, prompt).await
-                    {
-                        Ok(ok) => ok,
-                        Err(e2) => {
-                            return Err(format!("images: {e0} ｜responses: {e1} ｜chat: {e2}"))
-                        }
-                    },
-                }
+                    Err(e2) => return Err(format!("images: {e0} ｜responses: {e1} ｜chat: {e2}")),
+                },
             }
-        };
+        }
+    };
 
     if bytes.is_empty() {
         return Err("生成结果为空".into());
@@ -566,6 +592,21 @@ pub async fn generate_image_chat(
     )
 }
 
+fn with_ide_request_id(
+    request: reqwest::RequestBuilder,
+    request_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let Some(value) = request_id.filter(|value| {
+        (8..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) else {
+        return request;
+    };
+    request.header("x-ide-request-id", value)
+}
+
 /// Try /v1/responses with the image_generation built-in tool. This is the modern
 /// OpenAI Codex / 中转站 (LaoZhang etc.) route — relay stations wrap gpt-image-2
 /// behind ChatGPT Plus accounts via this endpoint. The mainline `model` field is
@@ -577,6 +618,7 @@ async fn try_responses_api(
     model: &str,
     prompt: &str,
     size: &str,
+    request_id: Option<&str>,
 ) -> Result<(Vec<u8>, String), String> {
     let url = if b.ends_with("/v1") {
         format!("{b}/responses")
@@ -593,9 +635,7 @@ async fn try_responses_api(
             "output_format": "png",
         }],
     });
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key.trim())
+    let resp = with_ide_request_id(client.post(&url).bearer_auth(api_key.trim()), request_id)
         .json(&body)
         .send()
         .await
@@ -725,6 +765,7 @@ async fn try_images_api(
     model: &str,
     prompt: &str,
     size: &str,
+    request_id: Option<&str>,
 ) -> Result<(Vec<u8>, String), String> {
     let url = if b.ends_with("/v1") {
         format!("{b}/images/generations")
@@ -747,9 +788,7 @@ async fn try_images_api(
             .unwrap()
             .insert("output_format".into(), serde_json::json!("png"));
     }
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key.trim())
+    let resp = with_ide_request_id(client.post(&url).bearer_auth(api_key.trim()), request_id)
         .json(&body)
         .send()
         .await
@@ -897,6 +936,7 @@ async fn try_chat_image_api(
     api_key: &str,
     model: &str,
     prompt: &str,
+    request_id: Option<&str>,
 ) -> Result<(Vec<u8>, String), String> {
     let url = if b.ends_with("/v1") {
         format!("{b}/chat/completions")
@@ -909,9 +949,7 @@ async fn try_chat_image_api(
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": 1500,
     });
-    let resp = client
-        .post(&url)
-        .bearer_auth(api_key.trim())
+    let resp = with_ide_request_id(client.post(&url).bearer_auth(api_key.trim()), request_id)
         .json(&body)
         .send()
         .await

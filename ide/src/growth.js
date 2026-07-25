@@ -143,6 +143,10 @@ function load() {
     }
   } catch { /* corrupt / unavailable — fall through to fresh */ }
   if (!state) state = freshState();
+  // "This run" means THIS app launch — the persisted copy carries stale modes from
+  // past sessions, which silenced the tooling signal forever (first-use credit could
+  // never fire again). Reset on load so each launch re-credits feature breadth.
+  state.sessionModes = [];
   return state;
 }
 
@@ -228,7 +232,9 @@ export function signal(type, payload = {}) {
           p.turns += 1;
         }
         const len = payload.len || 0;
-        observe("prompting", len >= 60);          // detailed asks vs one-liners
+        // Sub-15-char turns are acks/continuations ("继续", "好"), not prompting
+        // attempts — scoring them as failures unfairly tanked the mastery estimate.
+        if (len >= 15) observe("prompting", len >= 60); // detailed asks vs one-liners
         if (payload.mode === "plan") { observe("planning", true); turn.engaged = true; }
         if (payload.complex && payload.mode === "agent") observe("planning", true); // 勇于接复杂任务
         if (payload.mode === "chat" || payload.mode === "plan") turn.engaged = true; // thinking, not autopiloting

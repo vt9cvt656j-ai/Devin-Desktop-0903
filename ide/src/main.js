@@ -88,6 +88,14 @@ configureLanguageService();
 
 // ---- backend abstraction (Tauri when available, mock in a plain browser) ----
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+// Tauri can deliver an event after an invoke resolves or a PTY is closed. Its
+// Channel dispatcher calls `onmessage.call(...)`, so replacing a finished
+// callback with null turns an otherwise harmless late event into an app crash.
+// Use a shared sink to release the captured render/terminal state safely.
+const _TAURI_CHANNEL_SINK = () => {};
+function _releaseTauriChannel(channel) {
+  try { if (channel) channel.onmessage = _TAURI_CHANNEL_SINK; } catch {}
+}
 // Secondary editor windows are opened with ?w=sub. They share localStorage with the
 // main window, so they must NOT restore or overwrite the main window's saved
 // session/tabs/chat — they're independent working windows (open another project here).
@@ -353,10 +361,9 @@ async function tauriBackend() {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
       const p = core.invoke("ai_chat", { config, messages, onEvent: channel });
-      // Tauri never frees a Channel's callback on its own, so the onmessage closure (and everything
-      // it captures — the whole streaming render state) would leak once PER MESSAGE. The invoke
-      // resolves when the streamed turn ends, so drop the closure then.
-      const _free = () => { try { channel.onmessage = null; } catch {} };
+      // Tauri keeps Channel callbacks after invoke resolves. Replace this turn's
+      // capture with a sink, rather than null, because a final event may be queued.
+      const _free = () => _releaseTauriChannel(channel);
       p.then(_free, _free);
       return p;
     },
@@ -364,7 +371,7 @@ async function tauriBackend() {
       const channel = new core.Channel();
       channel.onmessage = onEvent;
       const p = core.invoke("ai_chat_with_tools", { config, messages, tools, onEvent: channel });
-      const _free = () => { try { channel.onmessage = null; } catch {} }; // release the per-turn streaming closure (see aiChat)
+      const _free = () => _releaseTauriChannel(channel); // see aiChat
       p.then(_free, _free);
       return p;
     },
@@ -380,9 +387,8 @@ async function tauriBackend() {
         rows: opts.rows,
         onEvent: channel,
       });
-      // Return the channel too: closeTermTab nulls its callback so the captured xterm/entry can be
-      // GC'd. Tauri doesn't free Channel callbacks, so without this every terminal ever opened leaks
-      // its whole xterm instance.
+      // Return the channel too: closeTermTab replaces its callback with a sink so
+      // captured xterm state can be collected without crashing on late PTY output.
       return { id, channel };
     },
     termWrite: (id, data) => core.invoke("term_write", { id, data }),
@@ -424,6 +430,31 @@ async function tauriBackend() {
   };
 }
 
+function _isRetryableAiGatewayStatus(status) {
+  return [500, 502, 503, 504].includes(Number(status));
+}
+
+// A failed HTTP request has not opened an SSE stream, so it is safe to replay.
+// Keep this below the agent loop: retrying after any token/tool delta can duplicate
+// model work or leave a half-written tool call in the transcript.
+async function _postAiWithGatewayRetry(post, body, onRetry = () => {}, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+  const delays = [600, 1200];
+  let lastTransportError = null;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      const response = await post(body);
+      if (!_isRetryableAiGatewayStatus(response?.status) || attempt === delays.length) return response;
+      onRetry({ attempt: attempt + 1, status: response.status });
+    } catch (error) {
+      lastTransportError = error;
+      if (attempt === delays.length) throw error;
+      onRetry({ attempt: attempt + 1, status: 0 });
+    }
+    await sleep(delays[attempt]);
+  }
+  throw lastTransportError || new Error("AI gateway retry failed");
+}
+
 // Real AI over fetch+SSE for the BROWSER build (the desktop app streams via a
 // Tauri Channel instead). Lets the hosted web demo show genuine agent behaviour
 // (streaming, tool calls, live code-writing) against the central gateway — only
@@ -454,6 +485,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     const _h = { "Content-Type": "application/json", Authorization: "Bearer " + (key || "") };
     if (config.ideMode) _h["x-ide-mode"] = String(config.ideMode);
     if (config.ideTools) _h["x-ide-tools"] = String(config.ideTools);
+    if (config.requestId) _h["x-ide-request-id"] = String(config.requestId).slice(0, 128);
     if (config.ideTimezone) _h["x-ide-timezone"] = String(config.ideTimezone).slice(0, 64);
     if (Number.isInteger(config.ideUtcOffsetMinutes)) _h["x-ide-utc-offset-minutes"] = String(config.ideUtcOffsetMinutes);
     const endpoint = _chatCompletionsUrl(config.baseUrl);
@@ -462,7 +494,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       headers: _h,
       body: JSON.stringify(body),
     });
-    let resp = await _post(payload);
+    const _postWithGatewayRetry = (body) => _postAiWithGatewayRetry(
+      _post,
+      body,
+      ({ attempt, status }) => streamMetric("gatewayRetry", { attempt, status }),
+    );
+    let resp = await _postWithGatewayRetry(payload);
     // 413 means some relay/proxy rejected the JSON body before the model saw it.
     // Retrying the same huge body without stream_options is pointless; rebuild a
     // much smaller request-only transcript and try once.
@@ -471,7 +508,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
         payload.messages = _enforceModelRequestBudget(messages, tools || [], _MODEL_REQUEST_EMERGENCY_BODY_BYTE_CAP);
         delete payload.stream_options;
         streamMetric("payloadTooLargeRetry");
-        resp = await _post(payload);
+        resp = await _postWithGatewayRetry(payload);
       } catch (e) {
         onEvent({ kind: "error", message: String((e && e.message) || e) });
         onEvent({ kind: "done" });
@@ -482,7 +519,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     // so requesting usage can't break chat.
     if (!resp.ok && resp.status >= 400 && resp.status < 500 && resp.status !== 413 && payload.stream_options) {
       delete payload.stream_options;
-      resp = await _post(payload);
+      resp = await _postWithGatewayRetry(payload);
     }
     streamMetric("responseHeaders");
     if (!resp.ok || !resp.body) {
@@ -497,6 +534,7 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     let rawBytes = 0;
     let sentFirstChunkMetric = false;
     let sentFirstProgressMetric = false;
+    let lastBytesMetricAt = 0;
     const markFirstProgress = () => {
       if (sentFirstProgressMetric) return;
       sentFirstProgressMetric = true;
@@ -508,7 +546,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       rawBytes += (value && value.byteLength) || 0;
       if (!sentFirstChunkMetric) {
         sentFirstChunkMetric = true;
+        lastBytesMetricAt = Date.now();
         streamMetric("firstChunk", { bytes: rawBytes });
+      } else if (!sentFirstProgressMetric && Date.now() - lastBytesMetricAt >= 3000) {
+        // 首个有效输出前的字节心跳：同 Rust 侧，让停顿提示能区分"连接活着"和"上游断了"。
+        lastBytesMetricAt = Date.now();
+        streamMetric("streaming", { bytes: rawBytes });
       }
       buf += dec.decode(value, { stream: true });
       let nl;
@@ -1357,9 +1400,21 @@ if (chatEl) {
 // background agent run so it DOESN'T yank the scroll of whatever tab the user is
 // currently looking at — a background tab's streaming must not disturb the active
 // tab (a core multi-tab smoothness fix).
+const _CHAT_FOLLOW_DELAY_MS = 48;
+let _chatFollowTimer = 0;
+let _chatFollowSession = null;
 function _chatFollow(forSession) {
   if (forSession && typeof _currentSession === "function" && forSession !== _currentSession()) return;
-  if (_chatPinned && chatEl) chatEl.scrollTop = chatEl.scrollHeight;
+  if (!_chatPinned || !chatEl) return;
+  _chatFollowSession = forSession || (typeof _currentSession === "function" ? _currentSession() : null);
+  if (_chatFollowTimer) return;
+  _chatFollowTimer = setTimeout(() => {
+    _chatFollowTimer = 0;
+    const session = _chatFollowSession;
+    _chatFollowSession = null;
+    if (session && typeof _currentSession === "function" && session !== _currentSession()) return;
+    if (_chatPinned && chatEl) chatEl.scrollTop = chatEl.scrollHeight;
+  }, _CHAT_FOLLOW_DELAY_MS);
 }
 const rootNameEl = $("rootName");
 const saveBtn = $("saveBtn");
@@ -1580,8 +1635,11 @@ async function _translateToEnglish(chineseName, context, existingNames) {
       setTimeout(() => resolve(buf.trim()), 10000);
     });
     if (!result || _CN_CHAR_RE.test(result)) return null;
+    // 模型没照格式回（"I'm ready to translate…"这类客套话）时，剥掉标点后会变成一条
+    // 上百字符的"合法标识符"直接进文件——按句子特征拒收：多词长句/超长一律作废。
+    if (result.split(/\s+/).length > 4 || result.length > 60) return null;
     let name = result.replace(/[^a-zA-Z0-9_]/g, "").replace(/^_+|_+$/g, "");
-    if (!name) return null;
+    if (!name || name.length > 32) return null;
     if (existingNames.has(name)) {
       for (let i = 2; i < 100; i++) {
         const candidate = `${name}_${i}`;
@@ -1680,7 +1738,13 @@ async function _batchTranslate(chineseNames, lang, existingNames) {
       setTimeout(() => resolve(buf.trim()), 20000);
     });
     if (!result) return null;
-    const lines = result.split("\n").map((l) => l.trim().replace(/^\d+[\.\)]\s*/, "").replace(/[^a-zA-Z0-9_]/g, ""));
+    const lines = result.split("\n").map((l) => {
+      const raw = l.trim().replace(/^\d+[\.\)]\s*/, "");
+      // 句子式行（客套话/解释）作废——只认真正的标识符行。
+      if (raw.split(/\s+/).length > 4 || raw.length > 60) return "";
+      const name = raw.replace(/[^a-zA-Z0-9_]/g, "");
+      return name.length > 32 ? "" : name;
+    });
     if (lines.length < chineseNames.length) return null;
 
     const used = new Set(existingNames);
@@ -1703,6 +1767,11 @@ async function _trySmartRename(editor) {
   if (!model) return;
   const lang = model.getLanguageId();
   if (lang === "markdown" || lang === "plaintext") return;
+  // 数据/配置/标记语言没有"标识符重命名"这回事——在 json/yaml 上跑翻译重命名
+  // 曾把模型的客套话塞进 package.json 顶部，整个文件报废。
+  if (["json", "jsonc", "yaml", "toml", "xml", "ini", "csv", "html"].includes(lang)) return;
+  // Agent 正在跑任务时它可能正在写这个 buffer：此时自动重命名等于在别人手里抢键盘。
+  try { if (typeof _chatSessions !== "undefined" && Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) return; } catch {}
 
   const chineseIdents = _findAllChineseIdentifiers(model);
   if (chineseIdents.size === 0) return;
@@ -10458,6 +10527,77 @@ function _isGatewayConfig(config) {
   return true;
 }
 
+function _newIdeRequestId() {
+  return "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+}
+
+const _billableAiTasks = new Map();
+function _billableAiComplete(config, messages, maxTokens) {
+  const requestConfig = { ...(config || {}) };
+  if (!/^[-_A-Za-z0-9]{8,128}$/.test(String(requestConfig.requestId || ""))) {
+    requestConfig.requestId = _newIdeRequestId();
+  }
+  const id = requestConfig.requestId;
+  const task = Promise.resolve().then(() => backend.aiComplete(requestConfig, messages, maxTokens));
+  let active = _billableAiTasks.get(id);
+  if (!active) { active = new Set(); _billableAiTasks.set(id, active); }
+  active.add(task);
+  const cleanup = () => {
+    const current = _billableAiTasks.get(id);
+    if (!current) return;
+    current.delete(task);
+    if (!current.size) _billableAiTasks.delete(id);
+  };
+  task.then(cleanup, cleanup);
+  return task;
+}
+
+async function _awaitBillableAiTasks(requestId) {
+  const id = String(requestId || "");
+  for (;;) {
+    const active = _billableAiTasks.get(id);
+    if (!active || !active.size) return;
+    await Promise.allSettled([...active]);
+  }
+}
+
+async function _fetchGatewaySettlement(config, requestId, attempts = 5) {
+  const id = String(requestId || "");
+  if (!/^[-_A-Za-z0-9]{8,128}$/.test(id)) return null;
+  const token = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token"))
+    || config?.apiKey || config?.gatewayApiKey || "";
+  if (!token) return null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt) await new Promise((resolve) => setTimeout(resolve, 80 * (2 ** (attempt - 1))));
+    try {
+      const response = await fetch(`${_michaelBase()}/api/usage/settlement/${encodeURIComponent(id)}`, {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.status === 404) continue;
+      if (!response.ok) return null;
+      const data = await response.json();
+      const usageReported = data?.usage_reported === true;
+      const costCents = Number(data?.cost_cents);
+      if (!Number.isInteger(costCents) || costCents < 0) return null;
+      return {
+        requestId: id,
+        costCents,
+        usageReported,
+        promptTokens: usageReported && Number.isFinite(Number(data?.prompt_tokens)) ? Math.max(0, Number(data.prompt_tokens)) : null,
+        completionTokens: usageReported && Number.isFinite(Number(data?.completion_tokens)) ? Math.max(0, Number(data.completion_tokens)) : null,
+        cachedTokens: usageReported && Number.isFinite(Number(data?.cached_tokens)) ? Math.max(0, Number(data.cached_tokens)) : null,
+        cacheCreationTokens: usageReported && Number.isFinite(Number(data?.cache_creation_tokens)) ? Math.max(0, Number(data.cache_creation_tokens)) : null,
+        model: String(data?.model || config?.model || ""),
+        attemptCount: Math.max(1, Math.round(Number(data?.attempt_count) || 1)),
+      };
+    } catch { /* bounded polling; a missing settlement remains explicitly unavailable */ }
+  }
+  return null;
+}
+
 function _activeAiProviderMode(config) {
   return AI_PROVIDER_GATEWAY;
 }
@@ -10714,10 +10854,13 @@ function _fallbackModelContextLimit(id = "") {
   if (/gemini/.test(s)) return 1_000_000;
   if (/claude|sonnet|opus|haiku/.test(s)) return 200_000;
   if (/grok|xai/.test(s)) return 256_000;
-  if (/kimi|moonshot|k2/.test(s)) return 128_000;
-  if (/deepseek/.test(s)) return 64_000;
+  if (/kimi|moonshot|k2/.test(s)) return 256_000;
+  if (/deepseek/.test(s)) return 128_000;
   if (/qwen|glm/.test(s)) return 128_000;
-  if (/gpt-5|gpt-4\.1|gpt-4o|o\d/.test(s)) return 128_000;
+  // GPT-5 系（含 codex 变体）官方 400K 输入上下文——此前猜 128K 等于白扔 3/4 窗口，
+  // 棘轮压缩在 57K 就开折，长任务上下文被过早腰斩。
+  if (/gpt-5|codex/.test(s)) return 400_000;
+  if (/gpt-4\.1|gpt-4o|o\d/.test(s)) return 128_000;
   return 128_000;
 }
 
@@ -10879,16 +11022,16 @@ async function michaelAccessGate() {
   return true;
 }
 
-// ── 显示层金额换算 ────────────────────────────────────────────────────────────
-// 用户看到的金额 = 真实金额 × 这个倍数。真实计费/倍率/扣费(服务端)完全不动，只缩小
-// 用户界面上的数字，让用量"看着更抗用"。真 $100 → 显示 $15（即真实 $200 → 显示 $30）。
-// 核心效果：每笔费用从真实 $0.20 显示成 $0.03，用户看着每次调用便宜到可忽略 = 超抗用。
-// 余额、累计消费、每笔扣费、各档额度全部乘同一个倍数 → 界面内部自洽（余额掉多少=显示
-// 的费用、各笔求和=累计消费）。进度条百分比用原始分值算比例、不受影响。官方价参考卡是
-// 厂商真实市场价、保持真实不换算。改这一个常量即可全局调整（0.15 = 真实的 15%）。
-const _MICHAEL_DISP_MULT = 15 / 100; // =0.15：真实 $100 → 显示 $15
-function _dispUsd(cents, digits = 2) {
-  return "$" + (((cents || 0) / 100) * _MICHAEL_DISP_MULT).toFixed(digits);
+// Account storage uses raw provider-billing cents. Michael's user-facing credit
+// denomination is exact: 663 raw cents ($6.63) = $1.00 of visible quota/credits.
+// The route multiplier (for example Claude's 0.8) is already applied server-side
+// before these raw cents are persisted; this function performs only denomination.
+const _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;
+function _creditUsdValue(rawCents) {
+  return (Number(rawCents) || 0) / _MICHAEL_RAW_CENTS_PER_CREDIT_USD;
+}
+function _dispUsd(rawCents, digits = 2) {
+  return "$" + _creditUsdValue(rawCents).toFixed(digits);
 }
 
 // Personal profile: account, avatar, membership badge, hourly/weekly/total quota.
@@ -10907,16 +11050,15 @@ async function _showBillingPanel() {
     if (!r.ok) throw new Error(r.status);
     const d = await r.json();
     const body = dlg.querySelector(".billing-dialog__body");
-    const bal = ((d.credits_cents / 100) * _MICHAEL_DISP_MULT).toFixed(2);
-    const spent = ((d.total_spent_cents / 100) * _MICHAEL_DISP_MULT).toFixed(2);
+    const bal = _dispUsd(d.credits_cents);
+    const spent = _dispUsd(d.total_spent_cents);
     const all = (d.recent || []).map((u) => {
       const date = new Date(u.time).toLocaleString("zh-CN", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
       const model = u.model || "—";
-      const inp = u.prompt_tokens ? (u.prompt_tokens / 1000).toFixed(1) + "k" : "—";
-      const out = u.completion_tokens ? (u.completion_tokens / 1000).toFixed(1) + "k" : "—";
-      const cost = ((u.cost_cents / 100) * _MICHAEL_DISP_MULT).toFixed(3);
-      const est = u.estimated ? ' <span style="opacity:.4">(估)</span>' : "";
-      return "<tr><td>" + date + "</td><td>" + model + "</td><td>" + inp + "</td><td>" + out + "</td><td>$" + cost + est + "</td></tr>";
+      const inp = u.usage_reported ? _tokenShort(u.prompt_tokens || 0) : "未上报";
+      const out = u.usage_reported ? _tokenShort(u.completion_tokens || 0) : "未上报";
+      const cost = _dispUsd(u.cost_cents);
+      return "<tr><td>" + date + "</td><td>" + model + "</td><td>" + inp + "</td><td>" + out + "</td><td>" + cost + "</td></tr>";
     });
     const PER = 10;
     let page = 0;
@@ -10928,7 +11070,7 @@ async function _showBillingPanel() {
         ? '<div class="billing-dialog__pager"><button class="billing-dialog__pager-btn" data-dir="prev"' + (page === 0 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg></button><span class="billing-dialog__pager-info">' + (page + 1) + ' / ' + totalPages + '</span><button class="billing-dialog__pager-btn" data-dir="next"' + (page >= totalPages - 1 ? " disabled" : "") + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 18l6-6-6-6"/></svg></button></div>'
         : "";
       body.innerHTML =
-        '<div class="billing-dialog__balance"><div><div style="margin-bottom:4px">余额</div><strong>$' + bal + '</strong></div><div style="margin-left:auto;text-align:right"><div style="margin-bottom:4px">累计消费</div><span style="font-size:20px;font-weight:500;color:#202124">$' + spent + '</span></div></div>' +
+        '<div class="billing-dialog__balance"><div><div style="margin-bottom:4px">余额</div><strong>' + bal + '</strong></div><div style="margin-left:auto;text-align:right"><div style="margin-bottom:4px">累计消费</div><span style="font-size:20px;font-weight:500;color:#202124">' + spent + '</span></div></div>' +
         '<div class="billing-dialog__table-wrap"><table class="billing-dialog__table"><thead><tr><th>时间</th><th>模型</th><th>输入</th><th>输出</th><th>费用</th></tr></thead><tbody>' +
         (slice || noData) +
         '</tbody></table></div>' + pager;
@@ -10955,7 +11097,7 @@ async function showProfile() {
   _michaelUser = u; // keep the cached profile (used by the badge) in sync with what we show
   try { await loadEditorPrefs(); } catch {}
   const country = selectedCountryInfo();
-  const usd = (c) => _dispUsd(c); // 显示层放大：真实额度 ×倍数，看着更抗用（不动真实计费）
+  const usd = (c) => _dispUsd(c); // 统一额度币值：663 原始美分 = $1.00 用户额度
   const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const planNames = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
   const planTotals = { trial: 5000, basic: 33000, pro: 65000, power: 180000, ultra: 500000 };
@@ -12011,15 +12153,66 @@ const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 // only one tab, never all of them. Capped at _RENDER_LIMIT rendered bubbles so
 // a long thread can't freeze the UI — the FULL history always stays in
 // session.history for the agent's context, only the DOM is trimmed.
-const _RENDER_LIMIT = 80;
-function _renderMsgRange(session, from, to) {
-  const h = session.memory ? session.memory.assemble() : (session.history || []);
+const _RENDER_LIMIT = 56;
+const _RENDER_PAGE = 32;
+const _SNAPSHOT_MAX_CHARS = 360_000;
+const _SNAPSHOT_MAX_MESSAGES = 64;
+const _SNAPSHOT_MAX_TOOL_STEPS = 96;
+function _sessionHistoryEntries(session) {
+  return session?.memory ? session.memory.assemble() : (Array.isArray(session?.history) ? session.history : []);
+}
+function _snapshotIsSafeToRestore(html) {
+  const snapshot = String(html || "");
+  if (!snapshot || snapshot.length > _SNAPSHOT_MAX_CHARS) return false;
+  const messages = (snapshot.match(/\bclass=["'][^"']*\bmsg\b[^"']*["']/g) || []).length;
+  const toolSteps = (snapshot.match(/\bagent-tool-step\b/g) || []).length;
+  return messages <= _SNAPSHOT_MAX_MESSAGES && toolSteps <= _SNAPSHOT_MAX_TOOL_STEPS;
+}
+function _renderMsgRange(session, from, to, options = {}) {
+  const h = _sessionHistoryEntries(session);
   for (let i = from; i < to; i++) {
     const m = h[i];
     if (m && m.content != null) {
-      addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session, m.attachments || []);
+      addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session, m.attachments || [], options);
     }
   }
+}
+function _updateEarlierHistoryControl(session) {
+  const container = session?.container;
+  if (!container) return;
+  const h = _sessionHistoryEntries(session);
+  const fallback = Math.max(0, h.length - _RENDER_LIMIT);
+  const start = Math.max(0, Math.min(h.length, Number.isFinite(session._historyVisibleStart) ? session._historyVisibleStart : fallback));
+  session._historyVisibleStart = start;
+  let more = container.querySelector(":scope > .chat-earlier-note");
+  if (!start) {
+    more?.remove();
+    return;
+  }
+  if (!more) {
+    more = document.createElement("button");
+    more.type = "button";
+    more.className = "chat-earlier-note";
+    more.style.cssText = "display:block;width:max-content;margin:8px auto;padding:5px 12px;border:1px solid var(--border,rgba(128,128,128,.3));border-radius:999px;background:var(--panel,transparent);color:var(--text-dim,#6b7280);font:12px system-ui,sans-serif;cursor:pointer;opacity:.85";
+    more.addEventListener("click", () => {
+      const entries = _sessionHistoryEntries(session);
+      const visibleStart = Math.max(0, Math.min(entries.length, Number(session._historyVisibleStart) || 0));
+      if (!visibleStart) return;
+      const nextStart = Math.max(0, visibleStart - _RENDER_PAGE);
+      const firstMessage = Array.from(container.children).find((node) => node.classList?.contains("msg")) || null;
+      const wasActive = session === _currentSession();
+      const previousTop = wasActive && chatEl ? chatEl.scrollTop : 0;
+      const previousHeight = wasActive && chatEl ? chatEl.scrollHeight : 0;
+      more.disabled = true;
+      _renderMsgRange(session, nextStart, visibleStart, { before: firstMessage, skipPrune: true, skipFollow: true });
+      session._historyVisibleStart = nextStart;
+      _updateEarlierHistoryControl(session);
+      if (wasActive && chatEl) chatEl.scrollTop = previousTop + (chatEl.scrollHeight - previousHeight);
+    });
+    container.prepend(more);
+  }
+  more.disabled = false;
+  more.textContent = `Load ${Math.min(_RENDER_PAGE, start)} earlier (${start} remaining)`;
 }
 function _renderSessionHistory(session) {
   if (!session || session._rendered) return;
@@ -12033,40 +12226,27 @@ function _renderSessionHistory(session) {
     // restart. Rebuild this transcript from persisted messages/key frames instead.
     if (/\b(?:src|poster)\s*=\s*["']blob:/i.test(session._htmlSnapshot)) session._htmlSnapshot = "";
   }
-  if (session._htmlSnapshot) {
+  if (session._htmlSnapshot && _snapshotIsSafeToRestore(session._htmlSnapshot)) {
     try {
       session.container.innerHTML = session._htmlSnapshot;
       // Scrub residue baked into snapshots written by older builds (the "..." filler + stuck
       // carets already sitting in session.json) so reopening a thread shows no ghost.
       _scrubResidue(session.container);
       _rehydrateSnapshotVideoFallbacks(session);
+      const restoredRows = session.container.querySelectorAll(":scope > .msg").length;
+      session._historyVisibleStart = Math.max(0, _sessionHistoryEntries(session).length - restoredRows);
+      _updateEarlierHistoryControl(session);
       session._htmlSnapshot = ""; // consumed; future saves re-snapshot the live DOM
       return;
     } catch { /* fall through to text re-render */ }
   }
-  const h = session.memory ? session.memory.assemble() : (Array.isArray(session.history) ? session.history : []);
+  session._htmlSnapshot = ""; // an oversized or malformed snapshot must not be retried next switch
+  const h = _sessionHistoryEntries(session);
   if (!h.length) return;
   const start = Math.max(0, h.length - _RENDER_LIMIT);
-  if (start > 0) {
-    // Don't render hundreds of markdown bubbles on startup (that's a real freeze
-    // on weak machines) — show the last _RENDER_LIMIT and a button to load the
-    // rest on demand. The FULL history is always in session.history for context.
-    const more = document.createElement("button");
-    more.type = "button";
-    more.className = "chat-earlier-note";
-    more.style.cssText = "display:block;width:max-content;margin:8px auto;padding:5px 12px;border:1px solid var(--border,rgba(128,128,128,.3));border-radius:999px;background:var(--panel,transparent);color:var(--text-dim,#6b7280);font:12px system-ui,sans-serif;cursor:pointer;opacity:.85";
-    more.textContent = `↑ 加载更早的 ${start} 条消息`;
-    more.addEventListener("click", () => {
-      more.disabled = true;
-      // User-initiated full re-render (rare): clear and lay out the whole thread
-      // oldest→newest so nothing is missing and ordering stays correct.
-      while (session.container.firstChild) session.container.removeChild(session.container.firstChild);
-      _renderMsgRange(session, 0, h.length);
-      if (session === _currentSession() && chatEl) chatEl.scrollTop = 0;
-    });
-    session.container.appendChild(more);
-  }
-  _renderMsgRange(session, start, h.length);
+  session._historyVisibleStart = start;
+  _renderMsgRange(session, start, h.length, { skipPrune: true, skipFollow: true });
+  _updateEarlierHistoryControl(session);
 }
 
 // Set / change the working directory for ONE chat tab. Each tab's agent runs in its
@@ -12347,7 +12527,7 @@ function _snapshotTranscript(session) {
     ).forEach(e => e.remove());
     _scrubResidue(clone); // never freeze "..." filler / live carets into the snapshot
     const html = clone.innerHTML || "";
-    if (html.length > 4_000_000) return ""; // too big — fall back to text re-render
+    if (!_snapshotIsSafeToRestore(html)) return ""; // restore only a bounded, responsive transcript
     return html;
   } catch { return ""; }
 }
@@ -12395,6 +12575,7 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false) {
     history: memory ? undefined : serializeMessagesForPersistence((s?.history || []).slice(-300), budget),
     pendingSends: _pendingSendsForStorage(s?._pendingSends || s?.pendingSends, budget),
     plan: Array.isArray(s?._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status })) : undefined,
+    demands: Array.isArray(s?._demandLedger) && s._demandLedger.length ? s._demandLedger.slice(-40) : undefined,
     created: s?.created,
   };
   if (s?.closedAt) out.closedAt = s.closedAt;
@@ -12447,12 +12628,35 @@ function _flushChatHistorySync() {
   } catch { /* quota / disabled — the async path is still the primary */ }
 }
 
-async function _persistChatHistoryOnce() {
+async function _persistChatHistoryOnce(freshSnapshots) {
+  // 性能：_snapshotTranscript = 整棵聊天 DOM 深克隆 + innerHTML 序列化，长对话是主线程上
+  // 几十上百毫秒的大活，而跑任务时每 500ms 就保存一次——这是"跑着跑着就卡"的直接来源之一。
+  // 落盘只是崩溃兜底，不需要 500ms 级新鲜度：普通保存 5s 内复用上次快照，任务收尾/关窗的
+  // immediate 保存仍取全新快照，恢复内容不受影响。
+  const snapshotNow = Date.now();
+  const snapshotOf = (session) => {
+    if (!freshSnapshots && session && session._htmlSnapshot != null
+      && session._htmlSnapshotAt && snapshotNow - session._htmlSnapshotAt < 5000) {
+      return session._htmlSnapshot;
+    }
+    const html = _snapshotTranscript(session);
+    if (session && session._rendered) { session._htmlSnapshot = html; session._htmlSnapshotAt = snapshotNow; }
+    return html;
+  };
   const data = _chatSessions.map(s => _chatSessionDataForStorage(s, undefined, false));
-  const closedData = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
+  // 已关闭会话不会再变：按 id 列表做缓存键，列表没变就复用上次序列化结果——
+  // 以前每次保存都把最多 80 个死会话整套重新序列化，纯烧主线程。
+  const closedList = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
     .filter(_sessionHasRecoverableMemory)
-    .slice(0, 80)
-    .map((session) => _chatSessionDataForStorage(session, undefined, true));
+    .slice(0, 80);
+  const closedKey = closedList.map((s) => s?.id || "").join(",");
+  if (!_persistChatHistoryOnce._closedCache || _persistChatHistoryOnce._closedCache.key !== closedKey) {
+    _persistChatHistoryOnce._closedCache = {
+      key: closedKey,
+      data: closedList.map((session) => _chatSessionDataForStorage(session, undefined, true)),
+    };
+  }
+  const closedData = _persistChatHistoryOnce._closedCache.data;
   const localPayload = {
     sessions: _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx),
     closedSessions: _closedChatSessionsForLocalStorage(),
@@ -12462,7 +12666,7 @@ async function _persistChatHistoryOnce() {
   try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(localPayload)); } catch {}
   if (!inTauri) return;
   const rich = {
-    sessions: data.map((d, i) => ({ ...d, html: _snapshotTranscript(_chatSessions[i]) })),
+    sessions: data.map((d, i) => ({ ...d, html: snapshotOf(_chatSessions[i]) })),
     closedSessions: closedData,
     activeIdx: _activeChatIdx,
   };
@@ -12487,16 +12691,21 @@ function saveChatHistory(options) {
   _chatSavePromise = (async () => {
     try {
       if (!_chatSaveImmediate) {
+        // 跑任务时每个工具步都会标脏：500ms 一次的全量序列化+IPC 落盘在长对话上就是
+        // 周期性卡死源。运行中放宽到 5s（崩溃最多丢 5s 的转录，消息数据本身在内存里），
+        // 空闲/收尾仍然 500ms/立即。
+        const anyStreaming = typeof _chatSessions !== "undefined" && Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming);
         await new Promise((resolve) => {
-          const timer = setTimeout(resolve, 500);
+          const timer = setTimeout(resolve, anyStreaming ? 5000 : 500);
           _chatSaveWake = () => { clearTimeout(timer); resolve(); };
         });
       }
       _chatSaveWake = null;
       do {
         _chatSaveDirty = false;
+        const freshSnapshots = _chatSaveImmediate;
         _chatSaveImmediate = false;
-        await _persistChatHistoryOnce();
+        await _persistChatHistoryOnce(freshSnapshots);
       } while (_chatSaveDirty);
     } catch (e) { console.warn("[chat] save failed:", e); }
     finally {
@@ -12556,6 +12765,7 @@ async function restoreChatHistory() {
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
         if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({ content: String(p.content || ""), status: p.status || "pending" }));
+        if (Array.isArray(sData.demands) && sData.demands.length) session._demandLedger = sData.demands.map((d) => String(d)).filter(Boolean).slice(-40);
         // 持久化工作流：上次运行留下"活着"的检查点 = 中途被切断（崩溃/强关）。
         // 挂到 session 上，下一次 agent 运行注入草稿纸接着做（7 天内有效）。
         try {
@@ -12776,6 +12986,9 @@ function _tokenShort(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "m";
   return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 }
+function _tokenExact(n) {
+  return Math.max(0, Math.round(Number(n) || 0)).toLocaleString("en-US");
+}
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
   const model = String(input.model || cfg.model || cfg.gatewayModel || "").trim();
@@ -12889,19 +13102,6 @@ function _appendThinkingReturnStatus(body, config, reasoningText = "", usage = n
   } catch {}
 }
 
-// 本次回复统计脚注：耗时 + token + 费用，回复内容最底下一行。
-// 费用按模型目录里的官方单价（USD / 1M tokens）算，再乘统一显示倍率
-// （_MICHAEL_DISP_MULT，与账单弹窗同口径）；模型没配价格时不显示金额。
-function _turnCostCents(model, inTok, outTok) {
-  const entry = _modelCatalogEntry(model);
-  if (!entry) return null;
-  const inP = Number(entry.inPrice) || 0;
-  const outP = Number(entry.outPrice) || 0;
-  const flat = Number(entry.flatPrice) || 0;
-  if (!inP && !outP && !flat) return null;
-  const usd = (inTok / 1e6) * inP + (outTok / 1e6) * outP + flat;
-  return usd * 100;
-}
 function _fmtElapsed(ms) {
   ms = Math.max(0, Math.round(Number(ms) || 0));
   if (ms < 1000) return ms + "ms";
@@ -12910,70 +13110,134 @@ function _fmtElapsed(ms) {
   const m = Math.floor(s / 60);
   return m + "m" + Math.round(s - m * 60) + "s";
 }
-function _turnStatsText({ elapsedMs = 0, promptTokens = 0, completionTokens = 0, model = "", estimated = false } = {}) {
-  const inTok = Math.max(0, Math.round(Number(promptTokens) || 0));
-  const outTok = Math.max(0, Math.round(Number(completionTokens) || 0));
-  const cents = (inTok || outTok) ? _turnCostCents(model, inTok, outTok) : null;
+function _turnStatsText({ elapsedMs = 0, settlement = null } = {}) {
   const _svg = (d) => `<svg class="turn-stats__icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   const _icClock = _svg('<circle cx="8" cy="8.5" r="5.5"/><path d="M8 5.8v2.9l2 1.2M6.5 1.5h3"/>');
   const _icTokens = _svg('<path d="M5 2.5 2.5 5.5h5L5 2.5zM5 2.5v8"/><path d="M11 13.5l2.5-3h-5l2.5 3zM11 13.5v-8"/>');
   const bits = [`${_icClock}${_fmtElapsed(elapsedMs)}`];
-  if (inTok || outTok) bits.push(`${_icTokens}${_tokenShort(inTok)} in · ${_tokenShort(outTok)} out${estimated ? "（估算）" : ""}`);
-  if (cents != null) {
-    const disp = (cents / 100) * _MICHAEL_DISP_MULT;
-    bits.push(_dispUsd(cents, disp >= 0.1 ? 2 : disp >= 0.01 ? 3 : 4));
+  if (settlement) {
+    if (settlement.usageReported) {
+      const inTok = Math.max(0, Math.round(Number(settlement.promptTokens) || 0));
+      const outTok = Math.max(0, Math.round(Number(settlement.completionTokens) || 0));
+      bits.push(`${_icTokens}${_tokenShort(inTok)}/${_tokenShort(outTok)}`);
+    } else {
+      bits.push(`${_icTokens}Usage unavailable`);
+    }
+    if (Number.isInteger(settlement.costCents)) bits.push(_dispUsd(settlement.costCents));
   }
   const html = bits.map((b) => `<span class="turn-stats__item">${b}</span>`).join("");
-  return { html, inTok, outTok, cents };
+  return { html };
 }
-// 实时版脚注：回复进行中每秒刷新耗时/token/费用，并始终钉在气泡底部；
-// 结束时 stop() 移除，由 _appendTurnStatsFooter 落空成最终定稿。
-function _liveTurnStats(body, { startedAt = Date.now(), model = "", getUsage } = {}) {
+
+function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false } = {}) {
+  const unreported = Math.max(0, Math.round(Number(settlement?.tokenUnreportedTurns) || 0));
+  const cacheReadTok = Math.max(0, Math.round(Number(settlement?.cachedTokens) || 0));
+  const cacheWriteTok = Math.max(0, Math.round(Number(settlement?.cacheCreationTokens) || 0));
+  const tokenTitle = !settlement ? "Tokens: waiting for the first server settlement"
+    : settlement.usageReported
+      ? `Tokens: input ${_tokenExact(settlement.promptTokens)} · output ${_tokenExact(settlement.completionTokens)} · cache read ${_tokenExact(cacheReadTok)} · cache write ${_tokenExact(cacheWriteTok)} (server-reported usage${unreported ? `; ${_tokenExact(unreported)} calls unreported` : ""})`
+      : "Tokens: provider usage unavailable";
+  const costTitle = settlement && Number.isInteger(settlement.costCents)
+    ? `Credit cost: ${_dispUsd(settlement.costCents)} (663 raw cents = $1.00 credit; includes model, cache, and route pricing)`
+    : "Cost: waiting for server settlement";
+  const settledTitle = live && settlement?.settledTurns
+    ? `\nSettled: ${settlement.settledTurns} model requests; pending requests are not estimated`
+    : "";
+  return `${live ? "Live stats (settled requests only)" : "Reply stats"}\nTime: ${_fmtElapsed(elapsedMs)}\n${tokenTitle}\n${costTitle}${settledTitle}`;
+}
+
+// Token 与金额只读取服务端已落库的 settlement；当前在途请求绝不估算。
+function _liveTurnStats(body, { startedAt = Date.now(), getSettlement } = {}) {
   let el = null;
   let timer = 0;
+  let active = true;
   const tick = () => {
     try {
-      if (!body) return;
+      if (!active || !body) return;
       if (!el) {
         el = document.createElement("div");
         el.className = "turn-stats turn-stats--live";
         body.appendChild(el);
       }
-      const u = (typeof getUsage === "function" && getUsage()) || {};
+      const settlement = typeof getSettlement === "function" ? getSettlement() : null;
+      const elapsedMs = Date.now() - startedAt;
       el.innerHTML = _turnStatsText({
-        elapsedMs: Date.now() - startedAt,
-        promptTokens: u.in || 0,
-        completionTokens: u.out || 0,
-        model,
-        estimated: u.est !== false,
+        elapsedMs,
+        settlement,
       }).html;
+      el.title = _turnStatsTitle({ elapsedMs, settlement, live: true });
       if (el !== body.lastElementChild) body.appendChild(el); // 新内容追加后保持在最底部
     } catch { /* live stats must never break a reply */ }
   };
   tick();
   timer = setInterval(tick, 1000);
   return {
+    refresh: tick,
     stop() {
+      active = false;
       if (timer) { clearInterval(timer); timer = 0; }
       try { if (el) el.remove(); } catch {}
       el = null;
     },
   };
 }
-function _appendTurnStatsFooter(body, { elapsedMs = 0, promptTokens = 0, completionTokens = 0, model = "", estimated = false } = {}) {
+function _appendTurnStatsFooter(body, { elapsedMs = 0, settlement = null } = {}) {
   try {
     if (!body) return;
     const live = body.querySelector(":scope > .turn-stats--live");
     if (live) live.remove();
     if (body.querySelector(":scope > .turn-stats")) return;
-    const { html, inTok, outTok, cents } = _turnStatsText({ elapsedMs, promptTokens, completionTokens, model, estimated });
+    const { html } = _turnStatsText({ elapsedMs, settlement });
     const el = document.createElement("div");
     el.className = "turn-stats";
     el.innerHTML = html;
-    el.title = `本次回复统计\n耗时：${_fmtElapsed(elapsedMs)}\ntoken：输入 ${inTok} · 输出 ${outTok}${estimated ? "（估算）" : "（真实 usage）"}` +
-      (cents != null ? `\n费用：${_dispUsd(cents, 4)}` : "\n费用：该模型未配置单价");
+    el.title = _turnStatsTitle({ elapsedMs, settlement });
     body.appendChild(el);
   } catch { /* stats must never break a reply */ }
+}
+
+function _addRunSettlement(runUsage, settlement) {
+  if (!runUsage) return;
+  const attemptCount = settlement ? Math.max(1, Math.round(Number(settlement.attemptCount) || 1)) : 1;
+  runUsage.turns += attemptCount;
+  if (!settlement) {
+    runUsage.allSettled = false;
+    runUsage.allReported = false;
+    return;
+  }
+  runUsage.settledTurns += attemptCount;
+  runUsage.costCents += settlement.costCents;
+  if (settlement.usageReported) {
+    runUsage.reportedTurns = (Number(runUsage.reportedTurns) || 0) + attemptCount;
+    runUsage.in += settlement.promptTokens || 0;
+    runUsage.out += settlement.completionTokens || 0;
+    runUsage.cacheRead += settlement.cachedTokens || 0;
+    runUsage.cacheCreation += settlement.cacheCreationTokens || 0;
+  } else {
+    runUsage.allReported = false;
+  }
+}
+
+function _liveRunSettlement(runUsage) {
+  if (!runUsage || !runUsage.settledTurns) return null;
+  const settledTurns = Math.max(0, Math.round(Number(runUsage.settledTurns) || 0));
+  const reportedTurns = Math.max(0, Math.min(settledTurns, Math.round(Number(runUsage.reportedTurns) || 0)));
+  return {
+    costCents: runUsage.costCents,
+    usageReported: reportedTurns > 0,
+    promptTokens: reportedTurns ? runUsage.in : null,
+    completionTokens: reportedTurns ? runUsage.out : null,
+    cachedTokens: reportedTurns ? runUsage.cacheRead : null,
+    cacheCreationTokens: reportedTurns ? runUsage.cacheCreation : null,
+    settledTurns,
+    reportedTurns,
+    tokenUnreportedTurns: settledTurns - reportedTurns,
+  };
+}
+
+function _finalRunSettlement(runUsage) {
+  if (!runUsage || !runUsage.allSettled || runUsage.settledTurns !== runUsage.turns || !runUsage.turns) return null;
+  return _liveRunSettlement(runUsage);
 }
 
 function _renderTokenMeter() {
@@ -13178,7 +13442,7 @@ document.addEventListener("dblclick", (e) => {
   try { sess = _chatSessions.find((s) => s && s.container && s.container.contains(wrap)) || null; } catch {}
   _beginEditResend(wrap, sess || undefined);
 });
-function addMessage(role, text, forSession, attachments = []) {
+function addMessage(role, text, forSession, attachments = [], options = {}) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
   let body;
@@ -13235,18 +13499,30 @@ function addMessage(role, text, forSession, attachments = []) {
     }
     _renderMessageAttachments(body, attachments);
   }
-  target.appendChild(wrap);
+  if (options.before && options.before.parentNode === target) target.insertBefore(wrap, options.before);
+  else target.appendChild(wrap);
   // Bound DOM growth on very long sessions: keep at most the most recent N
   // message nodes rendered (the conversation data in `history` is untouched, so
   // nothing is lost — only the oldest off-screen nodes are pruned). The newest
   // (possibly streaming) message is at the end and never pruned.
-  const MSG_CAP = 120; // keep the DOM lean on long sessions (older msgs stay in history/persisted; only off-screen nodes are pruned). Halved from 250 → ~half the DOM memory + faster reflow.
-  const msgs = target.querySelectorAll(":scope > .msg");
-  for (let i = 0; i < msgs.length - MSG_CAP; i++) {
-    _releaseBlobMediaInNode(msgs[i]);
-    msgs[i].remove();
+  const MSG_CAP = _RENDER_LIMIT;
+  if (!options.skipPrune) {
+    const msgs = target.querySelectorAll(":scope > .msg");
+    let removed = 0;
+    for (let i = 0; i < msgs.length - MSG_CAP; i++) {
+      _releaseBlobMediaInNode(msgs[i]);
+      msgs[i].remove();
+      removed++;
+    }
+    if (removed && session) {
+      const entries = _sessionHistoryEntries(session);
+      const fallback = Math.max(0, entries.length - msgs.length);
+      const current = Number.isFinite(session._historyVisibleStart) ? session._historyVisibleStart : fallback;
+      session._historyVisibleStart = Math.min(entries.length, current + removed);
+      _updateEarlierHistoryControl(session);
+    }
   }
-  _chatFollow();
+  if (!options.skipFollow) _chatFollow(session);
   return body;
 }
 
@@ -14214,6 +14490,7 @@ function _runtimeObligationsForTask(text) {
   // do not also ask to start the application. Preserve an independent run/start
   // only when a run verb remains after those phrases are removed.
   const runText = value
+    .replace(/(?:重新\s*)?(?:运行|执行|跑(?:一下)?)\s*(?:(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:tests?|test|build|compile|check|typecheck|type-check|install|package|pack|bundle)|cargo\s+(?:test|build|check)|go\s+(?:test|build)|pytest\b|python\d*\s+-m\s+(?:pytest|unittest))\b/gi, " ")
     .replace(/\b(?:run|start|execute)\s+(?:the\s+)?(?:tests?|testing|build|compile|compilation|type-?check|install(?:ation)?|packag(?:e|ing)|bundle|archive)\b/gi, " ")
     .replace(/\b(?:run|start|execute)\s+(?:pytest|vitest|jest)(?:\s|$)/gi, " ")
     .replace(/\b(?:run|start|execute)\s+(?:npm|pnpm|yarn|bun|cargo|go|pytest|vitest|jest|mvn|gradle|dotnet)\s+(?:run\s+)?(?:tests?|test|build|check|install|package)\b/gi, " ")
@@ -14463,13 +14740,30 @@ function _negatedEffectKindsForTask(text) {
 
 function _engineeringTaskProfile(text) {
   const t = String(text || "").trim();
+  // A supplied URL becomes a hard design reference only for an actual UI build or
+  // redesign. Keep the raw URL here: the evidence gate later compares canonical
+  // host/path values, while preserving the user's original URL for the agent.
+  const referenceWebsiteUrls = [...new Set([...t.matchAll(/\bhttps?:\/\/[^\s<>"'`（）()，。；、]+/gi)]
+    .map((match) => String(match[0] || "").replace(/[!?;:]+$/, "").trim()).filter(Boolean))].slice(0, 6);
+  const referenceWebsiteRequested = /(?:参考(?:站|网站|页面)?|仿(?:照|做)?|按照|依照|照着|跟着|同款|同类|对标|借鉴|复刻|还原|参考对象|参照|像(?:这个|这家|该)?(?:网站|站点|页面)|按(?:这个|这家|该)?(?:网站|站点|页面))/i.test(t);
   const assistantMetaQuestion = /^(?:你|你们|这个\s*(?:AI|ai|模型|助手|agent|智能体)|(?:AI|ai|模型|助手|agent|智能体)).{0,24}(?:能|可以|会|擅长|支持|是).{0,24}(?:做什么|干什么|干嘛|能干啥|什么事|什么事情|哪些事|哪些事情|什么功能|有哪些功能|做哪些|会什么|能力|功能|是谁|叫什么|介绍)/i.test(t);
   const browserAutomation = /(?:浏览器自动化|有头|无头|无痕|隐身|隔离浏览器|点击|点一下|输入|填表|登录流程|验证码|端到端|抓包|抓请求|抓接口|真实请求|真实接口|反接口|重放请求|后台抓包|系统抓包|browser|headed|headless|screenshot|viewport|playwright|puppeteer|selenium|click|type|login|captcha|e2e|capture|mitm|proxy|network\s*(?:trace|capture))/i.test(t);
   const capture = /(?:抓包|抓请求|抓接口|真实(?:请求|接口)|接口(?:从哪|来源|地址)|找(?:到)?接口|反接口|重放请求|无痕抓包|隔离抓包|后台抓包|系统抓包|系统代理|小黄鸟|httpcanary|charles|fiddler|capture|mitm|proxy|network\s*(?:trace|capture)|api.*(?:source|trace|real))/i.test(t);
   const longRunningRuntime = /(?:dev\s*server|development\s*server|npm\s+(?:run\s+)?(?:dev|start|serve|preview)\b|pnpm\s+(?:run\s+)?(?:dev|start|serve|preview)\b|yarn\s+(?:run\s+)?(?:dev|start|serve|preview)\b|bun\s+(?:run\s+)?(?:dev|start|serve)\b|npx\s+(?:vite|next|nuxt)\b|vite\s+(?:--host|dev)?\b|next\s+dev\b|nuxt\s+dev\b|webpack-dev-server|ng\s+serve|nodemon|watch\s*(?:mode)?|rails\s+server|flask\s+run|uvicorn|gunicorn|python\d*\s+-m\s+http\.server|serve\s+-s|后台(?:运行|启动|监听|挂|任务)|挂后台|守护进程|持续(?:运行|任务|服务)|长时间运行|监听(?:端口|服务|日志)?|等(?:端口|服务|启动|ready|就绪|日志|输出)|wait\s+for\s+(?:port|server|service|ready|url|file|output|log))/i.test(t);
   const interactiveWait = longRunningRuntime || /(?:验证码|扫码|登录授权|二次验证|2fa|mfa|captcha|otp|人工|手动|用户操作|等我|等用户|等一下|等一会|稍等|挂着|盯着|监控|轮询|poll(?:ing)?|后台监听|后台监控|条件满足|自动继续|回调|webhook|文件出现|文件内容匹配|URL\s*可达|端口监听|外部条件|manual\s+(?:step|action|approval|confirm))/i.test(t);
-  const uiRaw = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
-  const uiDesignSignal = /(?:\bui\b|frontend|front-end|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
+  // Product nouns such as "二手商品平台" imply a customer-facing product surface even
+  // when the user does not literally type "website". Without this, these requests
+  // were misclassified as generic code work and skipped michael-design entirely.
+  const commerceProductSurface = /(?:二手|闲置|商品|商品交易|交易市场|交易平台|商城|商店|店铺|电商|购物|卖家|买家|集市|marketplace|e-?commerce|storefront|catalog)/i.test(t);
+  const explicitUiSurface = /(?:\bui\b|frontend|front-end|网页|页面|界面|网站|官网|落地页|前端|组件|样式|布局|视觉|按钮|表单|导航栏|配色|字体排版|交互动效|响应式|dashboard|landing|homepage|marketing\s*site|official\s*site|responsive|styling|layout|visual|button|form|navbar|css|tailwind|react|vue|svelte|html)/i.test(t);
+  const backendOnlySurface = /(?:\b(?:backend|server|api|endpoint|route|router|controller|service|webhook|rest|graphql)\b|后端|服务端|接口|路由|数据库|数据表|schema)/i.test(t)
+    && !explicitUiSurface;
+  const webCategoryPattern = /(?:博客|作品集|社区论坛|论坛|社区|内容站|资讯站|新闻站|杂志|课程|课堂|教育|餐厅|饭店|咖啡馆|酒店|民宿|旅游|旅行|房产|房地产|招聘|求职|活动|会议|医疗|诊所|摄影|影像|音乐|艺术|画廊|美术馆|设计工作室|创意工作室|agency|studio|blog|portfolio|forum|community|editorial|magazine|news|course|education|restaurant|hotel|travel|tourism|real[-\s]?estate|job\s*board|recruiting|event|healthcare|clinic|photography|music|artist|gallery)/i;
+  const knowledgeTopicNoise = /(?:知识库|knowledge\s*base|developer\s*community|开发者社区|论坛知识|社区资料|社区踩坑|社区经验)/i.test(t);
+  const categoryProductSurface = !backendOnlySurface && !knowledgeTopicNoise && webCategoryPattern.test(t);
+  const transactionalProduct = commerceProductSurface && /(?:二手|商品|交易|商城|商店|店铺|电商|购物|卖家|买家|marketplace|e-?commerce|storefront)/i.test(t);
+  const uiRaw = explicitUiSurface || commerceProductSurface || categoryProductSurface;
+  const uiDesignSignal = explicitUiSurface || commerceProductSurface || categoryProductSurface;
   const ui = uiRaw && (!capture || uiDesignSignal);
   const bug = /(?:\bbug\b|debug|error|exception|crash|fail(?:ed|ure)?|报错|错误|问题|隐患|死循环|卡死|卡住|空白|不显示|崩溃|跑不起来|不工作|修复|排查)/i.test(t);
   // 关键词正则是轻量兜底——主力判断在基座提示词里（模型自己知道规则）。补齐最常见的中文
@@ -14556,7 +14850,45 @@ function _engineeringTaskProfile(text) {
   const persistence = !uiTableNoise && !uiSaveLabelNoise && /(?:\b(?:persistence|persist(?:ence)?|storage|store|save|cache|session|history|record)\b|落库|持久化|存储|保存|缓存|历史)/i.test(t);
   const databaseArchitecture = !uiTableNoise && (databaseSchema || dataModel || persistence || databaseOps);
   const architecture = architectureQuality || /(?:architecture|architect|refactor|rewrite|migration|codebase|repository|modular|maintainab|scalable|observab|reliab|boundary|verification\s*matrix|模块化|架构|重构|重写|迁移|代码库|工程化|工程级|工业级|企业级|生产级|可维护|可扩展|可观测|高可用|模块边界|变更半径|验证矩阵|测试矩阵|硬编码|技术债|schema|data\s*model|model\s*design|表结构|数据模型|字段设计|关系设计|读写边界|事务|回滚|落库|持久化|存储|缓存)/i.test(t);
-  const uiProject = ui && implementation && /(?:官网|网站|网页|页面|落地页|landing|homepage|official\s*site|marketing\s*site|mac\s*风格|google|谷歌|响应式|react|vue|vite|tailwind|前端|组件|配色|视觉|样式|布局)/i.test(t);
+  const productPlatformCreation = !readOnlyQuestion && implementation && commerceProductSurface;
+  const categoryProductCreation = !readOnlyQuestion && implementation
+    && /(?:写|做|生成|搞|搭建|创建|开发|实现|build|create|make|generate|scaffold)(?:\s*(?:一个|个|一套|一下|下))?[^。？?\n]{0,100}(?:博客|作品集|社区论坛|论坛|社区|内容站|资讯站|新闻站|杂志|课程|课堂|教育|餐厅|饭店|咖啡馆|酒店|民宿|旅游|旅行|房产|房地产|招聘|求职|活动|会议|医疗|诊所|摄影|影像|音乐|艺术|画廊|美术馆|设计工作室|创意工作室|agency|studio|blog|portfolio|forum|community|editorial|magazine|news|course|education|restaurant|hotel|travel|tourism|real[-\s]?estate|job\s*board|recruiting|event|healthcare|clinic|photography|music|artist|gallery)/i.test(t);
+  const uiProject = ui && implementation && !backendOnlySurface && (commerceProductSurface || categoryProductSurface || /(?:官网|网站|网页|页面|落地页|博客|商城|电商|网店|门户|论坛|小程序|站点|工具站|作品集|landing|homepage|blog|shop|store|forum|portfolio|official\s*site|marketing\s*site|mac\s*风格|google|谷歌|响应式|react|vue|vite|tailwind|前端|组件|配色|视觉|样式|布局)/i.test(t));
+  const websiteSurface = commerceProductSurface || categoryProductSurface || /(?:官网|网站|网页|落地页|着陆页|首页|主页|website|web\s*site|landing\s*page|homepage|official\s*site|marketing\s*site)/i.test(t);
+  const localizedUiOnly = /(?:只|仅|就)(?:改|修|优化|调整|替换|处理)[^。？?\n]{0,36}(?:按钮|输入框|表单|弹窗|菜单|图标|一张图|一个区块|某个区块|单个组件)/i.test(t);
+  const fullWebsite = uiProject && websiteSurface && !localizedUiOnly
+    && (objectCreationMutation || productPlatformCreation || categoryProductCreation || websiteDelivery || qualityComplaintMutation
+      || /(?:完整|整站|全站|从零|重做|重新设计|改版|内容(?:太少|不够|补全|丰富)|结构(?:都一样|单一|重构)|信息架构|商用级|生产级|full\s*(?:site|website)|redesign)/i.test(t));
+  const referenceWebsiteRequired = !!(uiProject && referenceWebsiteUrls.length);
+  const mediaDenied = /(?:不要|不使用|禁用|无需|纯文字|text[-\s]?only)[^。？?\n]{0,24}(?:图片|图像|视频|gif|媒体|素材|image|video|media)/i.test(t);
+  const motionDenied = /(?:不要|不使用|禁用|无需|关闭)[^。？?\n]{0,24}(?:动画|动效|motion|animation)/i.test(t);
+  const darkThemeRejected = /(?:不要|别|禁止|避免|拒绝|动不动|总是|老是|又|为什么|怎么还|默认|滥用|不想|不需要|不用)[^。？?\n]{0,30}(?:暗色|深色|黑底|dark|black\s*background)/i.test(t);
+  const gradientThemeRejected = /(?:不要|别|禁止|避免|拒绝|动不动|总是|老是|默认|滥用)[^。？?\n]{0,30}(?:渐变|gradient)/i.test(t);
+  const darkThemeRequested = !darkThemeRejected && /(?:(?:做成|改成|改为|使用|采用|切换到|要|想要|需要)[^。？?\n]{0,12}(?:暗色|深色|黑底|夜间|dark\s*(?:theme|mode|website|ui)?|black\s*background)|(?:暗色|深色)主题|dark\s*(?:theme|mode|website|ui)|make[^.\n]{0,32}\bdark\b|use[^.\n]{0,24}\bdark\b)/i.test(t);
+  const gradientThemeRequested = !gradientThemeRejected && /(?:渐变|gradient)/i.test(t);
+  const monochromeThemeRequested = /(?:纯?黑白|单色(?:设计|配色|网站|界面)?|灰阶(?:设计|配色|网站|界面)?|monochrome|grayscale|black[-\s]and[-\s]white)/i.test(t)
+    && !/(?:不要|别|禁止|避免|拒绝)[^。？?\n]{0,24}(?:黑白|单色|灰阶|monochrome|grayscale)/i.test(t);
+  const existingUiStackSignal = /(?:现有|已有|当前|这个项目|此项目|项目里|代码库|仓库|workspace|repo|原项目|已有技术栈|vue\s*项目|next\s*项目|nuxt\s*项目|astro\s*项目|svelte\s*项目|angular\s*项目)/i.test(t);
+  const nativeHtmlRequested = /(?:原生\s*HTML|纯\s*HTML|vanilla(?:\s*(?:js|javascript|html))?|不用(?:React|框架)|不要(?:React|框架)|无需(?:React|框架)|plain\s*html|static\s*html)/i.test(t);
+  const fromZeroUiProject = uiProject && !localizedUiOnly && !existingUiStackSignal && !nativeHtmlRequested
+    && (objectCreationMutation || productPlatformCreation || categoryProductCreation || /(?:从零|新建|搭建|创建|生成|scaffold|greenfield)/i.test(t));
+  const designKnowledgeRequired = !!uiProject;
+  const richMediaRequired = fullWebsite && !mediaDenied;
+  const motionDesignRequired = !motionDenied && (uiProject
+    || /(?:动画|动效|转场|滚动效果|微交互|motion|animation|transition|scroll[-\s]?driven|parallax)/i.test(t));
+  const advancedMotionRequired = motionDesignRequired && (fullWebsite
+    || /(?:高级动画|高级动效|特效|滚动叙事|视差|磁吸|变形|遮罩|卷轴|scroll[-\s]?driven|parallax|gsap|scrolltrigger|three\.js|webgl|lottie|rive)/i.test(t));
+  const paletteHarmonyRequired = fullWebsite || (uiProject
+    && /(?:配色|颜色|色板|色彩|突兀|不搭|跳色|palette|color|harmony|outlier)/i.test(t));
+  const cardLayoutRequired = fullWebsite || (uiProject
+    && /(?:卡片|网格|末行|孤行|排版|cards?|grid|last\s*row|orphan)/i.test(t));
+  const cardStylingRequired = fullWebsite || (uiProject
+    && /(?:卡片|面板|表面|层级|样式|颜色|质感|cards?|panels?|surface|elevation|style|color)/i.test(t));
+  const semanticIconRequired = fullWebsite || (uiProject
+    && /(?:图标|机器人|语义|icon|robot|pictogram)/i.test(t));
+  const motionChoreographyRequired = advancedMotionRequired;
+  const databaseDecisionRequired = transactionalProduct || fullWebsite || (uiProject
+    && /(?:web\s*app|dashboard|后台|管理端|平台|系统|登录|账户|用户|表单提交|收藏|评论|订单|支付|库存|预约|预订|搜索|筛选|cms)/i.test(t));
   const debugProject = bug && (projectScope || /(?:找\s*(?:bug|问题|隐患)|查找\s*(?:bug|问题|隐患)|排查|定位|诊断|看看.*(?:bug|问题|隐患)|(?:bug|问题|隐患).*还有|这些\s*(?:bug|问题)|所有\s*(?:bug|问题)|潜在\s*(?:bug|问题|隐患)|跑不起来|死循环|卡死|卡住|一直绕圈|修复\s*(?:bug|问题)|fix\s+(?:bugs?|errors?)|debug\s+(?:this|the|project|repo|codebase)|find\s+(?:bugs?|issues?))/i.test(t));
   const orchestration = interactiveWait || longRunningRuntime;
   const industrialProject = engineeringGradeSignal || largeProjectSignal || multiService || productionReadiness || businessLogic || businessRisk || securityRisk || architectureQuality || databaseOps || containerOps || featureCompleteness || websiteDelivery || promptRescue || vagueProjectRequest || maintainabilityUpgrade || qualityFloor || allProjectsEngineering;
@@ -14564,10 +14896,40 @@ function _engineeringTaskProfile(text) {
   const applies = t.length >= 8 && (projectEngineering || bug || architecture || implementation || database || gitSignals.git || backendApi || packageVersion || (ui && projectScope) || orchestration);
   const substantial = applies && (industrialProject || architecture || projectScope || uiProject || debugProject || databaseArchitecture || containerOps || featureCompleteness || websiteDelivery || (database && explicitWorkspaceMutation) || (orchestration && (implementation || explicitRuntimeAction || browserAutomation || capture)) || t.length >= 180 || /(?:完整|整套|从零|端到端|全量|系统性|multi-file)/i.test(t));
   const securityReferenceNeed = securityRisk && /(?:security|vulnerab|xss|csrf|ssrf|sqli|sql\s*injection|injection|rce|secret|token|cookie|cors|rate\s*limit|安全|漏洞|注入|攻击|跨站|请求伪造|远程执行|密钥|令牌|限流)/i.test(t);
+  // Major implementation decisions need current, attributable evidence. Small local
+  // edits and already-localized bug fixes keep the short evidence path instead.
+  const decisionBearingImplementation = !gitSignals.git && !explicitExternalAction && explicitWorkspaceMutation
+    && (substantial || architecture || databaseArchitecture || backendApi || packageVersion
+      || containerOps || fullWebsite || industrialProject);
+  const authoritativeReferencesRequired = applies && decisionBearingImplementation && !debugProject
+    && (substantial || architecture || databaseArchitecture || backendApi || packageVersion
+      || containerOps || fullWebsite || industrialProject);
   return {
     applies,
     ui,
     uiProject,
+    fullWebsite,
+    transactionalProduct,
+    referenceWebsiteUrls,
+    referenceWebsiteRequested,
+    referenceWebsiteRequired,
+    designKnowledgeRequired,
+    categoryProductSurface,
+    fromZeroUiProject,
+    existingUiStackSignal,
+    nativeHtmlRequested,
+    richMediaRequired,
+    motionDesignRequired,
+    advancedMotionRequired,
+    paletteHarmonyRequired,
+    cardLayoutRequired,
+    cardStylingRequired,
+    semanticIconRequired,
+    motionChoreographyRequired,
+    darkThemeRequested,
+    gradientThemeRequested,
+    monochromeThemeRequested,
+    databaseDecisionRequired,
     browserAutomation,
     capture,
     interactiveWait,
@@ -14623,7 +14985,8 @@ function _engineeringTaskProfile(text) {
     externalObligations: _externalObligationsForTask(t),
     substantial,
     requiresPlan: substantial,
-    needsReferences: applies && (largeProjectSignal || multiService || productionReadiness || businessRisk || securityReferenceNeed || databaseOps || containerOps || websiteDelivery || /(?:第三方库|开源库|依赖库|框架|\bapi\b|依赖|安全|算法|协议|官方文档|公开实现|社区方案|开发者社区|技术社区|论坛|知识库|knowledge\s*base|developer\s*communit|github\s*(?:资源|代码|讨论|issues?)|最新|版本|兼容性)/i.test(t)),
+    authoritativeReferencesRequired,
+    needsReferences: authoritativeReferencesRequired || (applies && (largeProjectSignal || multiService || productionReadiness || businessRisk || securityReferenceNeed || databaseOps || containerOps || websiteDelivery || /(?:第三方库|开源库|依赖库|框架|\bapi\b|依赖|安全|算法|协议|官方文档|公开实现|社区方案|开发者社区|技术社区|论坛|知识库|knowledge\s*base|developer\s*communit|github\s*(?:资源|代码|讨论|issues?)|最新|版本|兼容性)/i.test(t))),
   };
 }
 
@@ -14633,13 +14996,15 @@ function _agentBugEvidenceLadderBlock(text, profile = _engineeringTaskProfile(te
   const dbScope = p.database || p.databaseArchitecture || p.dataModel || p.persistence || p.databaseQuery;
   const apiScope = p.backendApi || p.longRunningRuntime || p.interactiveWait;
   return [
-    "Bug/问题诊断必须走证据分层，不要把浏览器当唯一真相：",
+    "Bug/问题诊断必须走证据分层，并按故障域先取真实证据；浏览器自动化只能用于已定位后的关键路径回归，不能当诊断起点：",
+    "0. 先判故障域：网页/Web 问题走终端/服务日志 → browser check 的 console/network/resource/layout 证据 → 源码因果链 → 最后一次 nodes/click/type/assert；桌面/原生 App 问题走 IDE 诊断、终端/崩溃日志、后台/API/DB 证据 → 源码 → 聚焦回归，不能先开浏览器；后端/CLI 问题走 stderr/exit code、health/API、只读 DB 证据 → 源码 → 同一命令回归。",
     "① 文件/编辑器层：先 get_diagnostics，看当前红线、LSP/构建诊断和具体 file:line；诊断疑似缓存时用真实构建/测试交叉验证。",
     "② 运行层：先 list_terminals/read_terminal/read_logs 读取正在跑的终端、URL、stderr/stdout、退出码和日志文件；服务已启动但页面/API异常，终端日志优先级高于截图。",
     `③ API层：${apiScope ? "终端或配置里有 localhost/API 线索时，用 http_request 打健康页/关键接口，记录 status、body 摘要和失败原因；不要只用 browser 看页面。" : "只有发现运行 URL、路由、后端配置或用户明确指向接口时才打 http_request；没有 API 线索要说明未发现。"} `,
     `④ 数据库层：${dbScope ? "先看 ORM/schema/migrations/env/本地 DB 文件，再用 db_query 做只读 schema/关键记录核验；写库必须用户明确要求。" : "如果 IDE 实时状态没有 DATABASE_URL/DB env、schema/migrations 或本地 DB 文件线索，明确写“未发现数据库证据”，不要虚构 DB 根因。"} `,
     "⑤ 代码因果层：证据指向哪一层就读对应源码和调用方（入口→状态/数据流→异步/边界→契约），改最小补丁，不做无关重构。",
-    "⑥ 验证层：修完只重跑同一失败路径或最接近回归；全量测试/浏览器矩阵本轮有意义地跑一遍即可，后续只做针对性复验，别没完没了重复测试。",
+    "⑥ 浏览器层（仅 Web 且日志/服务已确认后）：先 browser check 读取 console、network、资源、溢出和 layout 异常；check 无阻塞错误且补丁已完成，才用 nodes/click/type/press/assert 跑一次受影响的真实交互。截图只服务于明确的视觉问题，不替代 check 或断言。",
+    "⑦ 验证层：修完只重跑同一失败路径或最接近回归；全量测试/浏览器矩阵本轮有意义地跑一遍即可，后续只做针对性复验，别没完没了重复测试。",
     "浏览器自动化失败两次、batch 中断、React/Vue 受控输入失效或节点抓取反复不稳定时，立即退回终端/API/日志/源码证据链，不继续盲点/盲截图。",
   ].join("\n");
 }
@@ -14707,6 +15072,1125 @@ function _runRequiresPlan(run) {
   return !!run.engineering?.requiresPlan;
 }
 
+function _uiPlanHasCategoryArchitecture(value) {
+  const text = String(value || "");
+  if (/(?:信息架构|内容架构|栏目地图|内容结构|页面结构|业务结构|information\s*architecture|content\s*(?:map|architecture)|category-specific)/i.test(text)) return true;
+  if (/(?:七|八|九|十|[7-9]|1\d)\s*(?:个|大)?[^。\n]{0,12}(?:区块|板块|模块|栏目|sections?)/i.test(text)) return true;
+
+  const numbered = new Set();
+  for (const match of text.matchAll(/(?:^|[\s：:；;，,、（(])([1-9]|1[0-9])\s*[.、:：)）]/g)) numbered.add(Number(match[1]));
+  const chineseNumbers = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10 };
+  for (const match of text.matchAll(/(?:^|[\s：:；;，,、（(])(一|二|三|四|五|六|七|八|九|十)\s*[.、:：)）]/g)) numbered.add(chineseNumbers[match[1]]);
+  return [1, 2, 3, 4, 5, 6, 7].every((number) => numbered.has(number));
+}
+
+function _designMotionTechniques(value) {
+  const text = String(value || "");
+  return [
+    ["gsap-scrolltrigger", (source) => /\bgsap\b/i.test(source) && /ScrollTrigger/i.test(source)],
+    ["scroll-scrub-pinning", /(?:\bscrub\b|\bpinning\b|pin\s*:\s*true)/i],
+    ["motion-scroll-transform", (source) => /(?:useScroll|scrollYProgress)/i.test(source) && /useTransform/i.test(source)],
+    ["smooth-scroll", /(?:\bLenis\b|smooth-scroll)/i],
+    ["three-webgl-canvas", /(?:Three\.js|\bthree\b|WebGL|shader)/i],
+    ["lottie-rive", /(?:Lottie|lottie-web|dotlottie|\bRive\b|@rive-app)/i],
+    ["parallax-depth", /(?:parallax|perspective\s*\(|translateZ\s*\()/i],
+    ["mask-clip-reveal", (source) => /(?:clip-path|clipPath|mask-image|maskImage|\bmask\s*:)/i.test(source)
+      && /(?:animate|animation|transition|motion|ScrollTrigger|useScroll|@keyframes)/i.test(source)],
+    ["split-text", /(?:SplitText|split[-\s]?text|staggered?\s+(?:word|letter|character))/i],
+    ["shared-layout-transition", /(?:layoutId|AnimatePresence|\bFLIP\b|shared\s*layout)/i],
+    ["svg-path-morph", /(?:pathLength|strokeDashoffset|morphSVG|svg\s*path\s*morph)/i],
+    ["sticky-card-stack", /(?:sticky[-\s]?(?:stack|card)|position\s*:\s*sticky[\s\S]{0,180}(?:useScroll|ScrollTrigger)|sticky\s+top-\d+[\s\S]{0,180}useTransform)/i],
+    ["horizontal-scroll-story", /(?:horizontal\s*(?:scroll|story)|scrollWidth[\s\S]{0,180}(?:useTransform|translateX)|xPercent[\s\S]{0,100}ScrollTrigger)/i],
+    ["magnetic-pointer", /(?:magnetic|useMotionValue[\s\S]{0,160}(?:pointer|mouse|cursor)|onMouseMove[\s\S]{0,160}useSpring)/i],
+    ["liquid-distortion", /(?:liquid|refraction|displacementMap|feDisplacementMap|distortion\s*shader)/i],
+  ].filter(([, matcher]) => typeof matcher === "function" ? matcher(text) : matcher.test(text)).map(([name]) => name);
+}
+
+function _designLayoutTechniques(value) {
+  const text = String(value || "");
+  return [
+    ["responsive-grid-breakpoints", /(?:grid-cols-1[\s\S]{0,180}(?:sm|md|lg):grid-cols-|breakpoints?.{0,80}(?:column|grid)|mobile.{0,100}(?:column|stack))/i],
+    ["auto-fit-minmax", /(?:auto-fit|auto-fill)[\s\S]{0,80}minmax\s*\(/i],
+    ["bento-spans", /(?:bento|col-span-2|grid-column\s*:\s*span|row-span-2)/i],
+    ["balanced-last-row", /(?:balanced?\s+last\s+row|center(?:ed)?\s+last\s+row|3\s*\+\s*2|4\s*\+\s*3|末行.{0,30}(?:居中|平衡)|孤行)/i],
+    ["masonry-columns", /(?:masonry|column-count|break-inside\s*:\s*avoid)/i],
+    ["media-rail-carousel", /(?:media\s+rail|carousel|overflow-x-auto|scroll-snap-type)/i],
+    ["split-editorial", /(?:split\s+(?:layout|section)|editorial\s+grid|grid-template-columns\s*:\s*(?:1fr\s+1fr|repeat\(12))/i],
+  ].filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
+}
+
+function _uiPaletteHarmonyFindings(value, designEvidence = null) {
+  const text = String(value || "");
+  const findings = [];
+  const accentFamily = "red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose";
+  const sectionTags = text.match(/<section\b[^>]{0,1600}>/gi) || [];
+  const hardCodedSections = [];
+  for (const tag of sectionTags) {
+    const tailwind = tag.match(new RegExp(`\\bbg-(${accentFamily})-(?:50|100|200|300|400|500|600|700|800|900|950)\\b`, "i"))?.[0];
+    const inline = tag.match(/background(?:Color)?\s*:\s*["'`](#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/i)?.[1];
+    if (tailwind || inline) hardCodedSections.push(tailwind || inline);
+  }
+  const literalSectionCss = text.match(/(?:^|[},])\s*section(?:\[[^\]]+\]|[.#:\w-])*\s*\{[^}]{0,500}background(?:-color)?\s*:\s*(?:#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/gim) || [];
+  if (hardCodedSections.length || literalSectionCss.length) {
+    const samples = [...hardCodedSections, ...literalSectionCss.map((item) => item.match(/(?:#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\))/i)?.[0]).filter(Boolean)];
+    findings.push(`局部配色跳变：完整 section 使用了 ${[...new Set(samples)].slice(0, 4).join("/")} 这类硬编码色带；全页区块必须引用 bg-background/bg-muted/bg-secondary/bg-accent 或已声明的 section 语义 token，禁止某一段突然发明新色相`);
+  }
+
+  const directClasses = [...text.matchAll(new RegExp(`\\b(?:bg|text|border|fill|stroke|ring|from|via|to)-(${accentFamily})-(?:50|100|200|300|400|500|600|700|800|900|950)\\b`, "gi"))];
+  const sourceFamilies = new Set(directClasses.map((match) => match[1].toLowerCase()));
+  if (sourceFamilies.size > 2) {
+    findings.push(`强调色族失控：业务组件直接使用了 ${[...sourceFamilies].join("/")} ${sourceFamilies.size} 个 Tailwind 彩色色族；选定一个主强调族和至多一个有明确角色的辅助族，其余收回语义 token`);
+  }
+  const evidenceFamilies = new Set((Array.isArray(designEvidence?.tailwindPaletteTokens) ? designEvidence.tailwindPaletteTokens : [])
+    .map((token) => String(token).toLowerCase().match(new RegExp(`^(${accentFamily})-`))?.[1]).filter(Boolean));
+  if (evidenceFamilies.size && evidenceFamilies.size <= 2) {
+    const unexpected = [...sourceFamilies].filter((family) => !evidenceFamilies.has(family));
+    if (unexpected.length) findings.push(`知识库色板外出现陌生色族：${unexpected.join("/")} 不属于本轮 michael-design 选定的 ${[...evidenceFamilies].join("/")}；除真实 success/warning/destructive 状态外不得用于装饰、图标或整段背景`);
+  }
+  return findings;
+}
+
+function _cardGridLayoutFindings(value) {
+  const text = String(value || "");
+  const findings = [];
+  const collections = [];
+  const declaration = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]+)?=\s*\[/gi;
+  let match;
+  while ((match = declaration.exec(text))) {
+    if (!/(?:cards?|items?|features?|projects?|games?|products?|plans?|testimonials?|members?|entries?|stories?|services?)$/i.test(match[1])) continue;
+    let squareDepth = 1;
+    let braceDepth = 0;
+    let parenDepth = 0;
+    let count = 0;
+    let index = declaration.lastIndex;
+    for (; index < text.length && squareDepth > 0; index++) {
+      const char = text[index];
+      const next = text[index + 1];
+      if (char === "'" || char === '"' || char === "`") {
+        const quote = char;
+        for (index++; index < text.length; index++) {
+          if (text[index] === "\\") index++;
+          else if (text[index] === quote) break;
+        }
+        continue;
+      }
+      if (char === "/" && next === "/") {
+        index = text.indexOf("\n", index + 2);
+        if (index < 0) index = text.length;
+        continue;
+      }
+      if (char === "/" && next === "*") {
+        const end = text.indexOf("*/", index + 2);
+        index = end < 0 ? text.length : end + 1;
+        continue;
+      }
+      if (char === "[" ) squareDepth++;
+      else if (char === "]") squareDepth--;
+      else if (char === "(" ) parenDepth++;
+      else if (char === ")") parenDepth = Math.max(0, parenDepth - 1);
+      else if (char === "{") {
+        if (squareDepth === 1 && braceDepth === 0 && parenDepth === 0) count++;
+        braceDepth++;
+      } else if (char === "}") braceDepth = Math.max(0, braceDepth - 1);
+    }
+    declaration.lastIndex = Math.max(declaration.lastIndex, index);
+    if (count >= 2) collections.push({ name: match[1], count });
+  }
+
+  for (const collection of collections) {
+    const usage = new RegExp(`\\b${collection.name.replace(/[$]/g, "\\$")}\\s*\\.\\s*map\\s*\\(`, "g").exec(text);
+    if (!usage) continue;
+    const prefix = text.slice(Math.max(0, usage.index - 1800), usage.index);
+    const classValues = [...prefix.matchAll(/class(?:Name)?\s*=\s*(?:["']([^"']*)["']|\{`([^`]*)`\})/gi)]
+      .map((classMatch) => classMatch[1] || classMatch[2] || "").filter((classes) => /(?:^|\s)grid(?:\s|$)/.test(classes));
+    const classes = classValues.at(-1) || "";
+    const columns = [...classes.matchAll(/(?:(sm|md|lg|xl|2xl):)?grid-cols-(\d+)/g)]
+      .map((columnMatch) => ({ rank: ["", "sm", "md", "lg", "xl", "2xl"].indexOf(columnMatch[1] || ""), count: Number(columnMatch[2]) }))
+      .sort((a, b) => a.rank - b.rank).at(-1)?.count || 0;
+    if (columns < 2) continue;
+    const remainder = collection.count % columns;
+    const context = text.slice(Math.max(0, usage.index - 1200), Math.min(text.length, usage.index + 1800));
+    const balancesLastRow = /(?:last:(?:col-span|col-start|justify-self)|nth-last-child|\blength\s*-\s*1\b|\bindex\s*(?:===|==)\s*(?:\d+|[^?\n]+\.length\s*-\s*1)|(?:md|lg|xl):col-start-|grid-column\s*:|place-content-center)/i.test(context);
+    if ((collection.count < columns || remainder) && !balancesLastRow) {
+      const detail = collection.count < columns ? `${columns} 列只放 ${collection.count} 张` : `${collection.count} 张按 ${columns} 列会留下 ${remainder} 张孤立末行`;
+      findings.push(`卡片数量与网格不匹配：${collection.name} ${detail}；按实际数量改成等分网格、3+2/4+3 居中末行、主卡跨列或 auto-fit/minmax，不能让最后一张单独掉到左下角`);
+    }
+  }
+  return [...new Set(findings)];
+}
+
+function _semanticIconFindings(value) {
+  const text = String(value || "");
+  const genericUsage = /<\s*(Sparkles|WandSparkles|Wand2|Stars|BadgeSparkles)\b|\bicon\s*:\s*(Sparkles|WandSparkles|Wand2|Stars|BadgeSparkles)\b/gi;
+  const rules = [
+    { label: "AI/智能体", concept: /(?:\bAI\b|artificial\s+intelligence|copilot|assistant|agent|人工智能|智能体|机器人)/i, icon: /\b(?:Bot|Robot|Cpu|CircuitBoard|MessageSquareCode)\b/ },
+    { label: "邮件/订阅", concept: /(?:newsletter|subscribe|subscription|inbox|weekly\s+drop|dispatch|邮件|邮箱|订阅|周报)/i, icon: /\b(?:Mail|Inbox|Newspaper|Rss|Send|MailPlus)\b/ },
+    { label: "自动化/工作流", concept: /(?:automation|workflow|pipeline|自动化|工作流|流程)/i, icon: /\b(?:Workflow|GitBranch|Waypoints|ListChecks)\b/ },
+    { label: "安全/隐私", concept: /(?:security|secure|privacy|permission|安全|隐私|权限)/i, icon: /\b(?:Shield|ShieldCheck|Lock|KeyRound|Fingerprint)\b/ },
+    { label: "分析/数据", concept: /(?:analytics|insight|metric|report|分析|洞察|指标|报表)/i, icon: /\b(?:ChartNoAxesCombined|ChartColumn|ChartLine|Gauge|Activity)\b/ },
+    { label: "社区/成员", concept: /(?:community|member|team|people|社区|成员|团队|用户群)/i, icon: /\b(?:Users|MessagesSquare|UserRoundCheck)\b/ },
+    { label: "游戏/玩法", concept: /(?:game|gaming|player|quest|游戏|玩家|玩法)/i, icon: /\b(?:Gamepad2|Joystick|Trophy|Swords)\b/ },
+  ];
+  const findings = [];
+  let usage;
+  while ((usage = genericUsage.exec(text))) {
+    const iconName = usage[1] || usage[2];
+    const nearby = text.slice(Math.max(0, usage.index - 700), Math.min(text.length, usage.index + 700));
+    const rule = rules.find((candidate) => candidate.concept.test(nearby));
+    if (rule) {
+      findings.push(`图标语义不匹配：${rule.label} 内容使用了通用 ${iconName}；先理解对象/动作/状态，再选对应 Lucide/Iconify 图标（例如 AI→Bot/Robot，订阅→Mail/Inbox），不要用 Sparkles/Wand 作为万能 AI 图标`);
+    }
+  }
+  return [...new Set(findings)];
+}
+
+function _michaelDesignResearchTracks(query, content = "") {
+  // Coverage is evidence about what the knowledge base returned, not what we
+  // asked it to return. Including the query here made every carefully-worded
+  // three-track search certify itself even when the hit body omitted that track.
+  const text = String(content || "");
+  const motionTechniques = _designMotionTechniques(text);
+  return {
+    informationArchitecture: /(?:information\s*architecture|content\s*(?:map|architecture)|user\s*journey|category|section|栏目|信息架构|内容架构|用户旅程|业务品类|页面结构)/i.test(text),
+    colorSystem: /(?:palette|color\s*(?:system|scale|token)|tailwind|semantic\s*(?:color|token)|配色|色板|色阶|颜色令牌|语义色)/i.test(text),
+    responsiveLayout: /(?:responsive|breakpoint|mobile|container|grid|auto-fit|minmax|响应式|断点|移动端|网格|末行)/i.test(text),
+    componentSystem: /(?:shadcn(?:\/ui)?|radix(?:\s*(?:ui|primitives?))?|@radix-ui\/|class-variance-authority|tailwind-variants|\bcva\b|component\s*variants?|组件变体|组件体系|语义组件)/i.test(text),
+    signatureMotion: motionTechniques.length > 0 || /(?:advanced\s*(?:motion|animation)|scroll\s*(?:narrative|story)|动画编排|高级(?:动效|动画)|滚动叙事|视差|遮罩揭示)/i.test(text),
+    responsiveMotion: /(?:prefers-reduced-motion|useReducedMotion|motion-reduce|mobile.{0,80}(?:motion|animation|stagger|duration|distance)|移动端.{0,80}(?:动效|动画|位移|时长|stagger|降级)|reduced[-\s]?motion)/i.test(text),
+    mediaAssets: /(?:\b(?:image|video|gif|media|avatar|portrait)\b|图片|视频|动图|媒体|头像|肖像)/i.test(text),
+    semanticIcons: /(?:lucide|iconify|pictogram|semantic\s*icon|语义图标|图标映射|对象\/动作\/状态)/i.test(text),
+  };
+}
+
+function _michaelDesignCategoryTerms(task) {
+  const text = String(task || "");
+  const rules = [
+    [/(?:小说|网文|阅读|书籍|图书|文学|章节|书架|作家|作者|novel|fiction|reading|books?|library)/i,
+      "editorial library bookshelf reading chapter navigation book discovery author profile"],
+    [/(?:作品集|案例集|设计师|创意工作室|个人网站|简历|portfolio|case\s*study|creative\s*studio|design\s*studio|resume|cv)/i,
+      "portfolio project index case study archive process narrative credits contact"],
+    [/(?:餐厅|饭店|咖啡|奶茶|甜品|烘焙|酒吧|菜单|订座|美食|restaurant|cafe|coffee|bakery|dessert|bistro|menu|bar)/i,
+      "restaurant cafe coffee menu reservation chef story dining atmosphere"],
+    [/(?:社区论坛|论坛|社区|帖子|话题|forum|community|discussion|thread)/i,
+      "community forum topic thread member profile activity feed"],
+    [/(?:课程|课堂|教育|学习|培训|网课|course|education|learning|academy|classroom)/i,
+      "education course curriculum lesson progress instructor enrollment"],
+    [/(?:酒店|民宿|度假村|住宿|旅行|旅游|预订|hotel|resort|lodge|cabin|bnb|hospitality|travel|tourism|booking)/i,
+      "hotel lodge booking stay room amenity availability travel guest review"],
+    [/(?:摄影|影像|画廊|美术馆|艺术家|展览|photography|gallery|museum|artist|exhibition)/i,
+      "photography gallery exhibition artwork fullscreen collection"],
+    [/(?:商城|商店|电商|购物|二手|商品|交易平台|marketplace|e-?commerce|storefront|shop|store|catalog)/i,
+      "ecommerce shop catalog product detail filters checkout cart"],
+    [/(?:招聘|求职|职位|job\s*board|recruiting|careers?)/i,
+      "job board role filters application employer salary"],
+    [/(?:医疗|诊所|医生|口腔|体检|healthcare|clinic|medical|dental)/i,
+      "healthcare clinic practitioner appointment patient trust"],
+    [/(?:健身|瑜伽|运动|私教|fitness|gym|yoga|workout|wellness)/i,
+      "fitness gym yoga workout membership class schedule trainer"],
+    [/(?:美容|理发|美发|美甲|皮肤|beauty|salon|spa|barber)/i,
+      "beauty salon spa barber service booking treatment"],
+    [/(?:宠物|pet|veterinar)/i,
+      "pet care grooming veterinary adoption"],
+    [/(?:花店|鲜花|florist|flower)/i,
+      "florist flower shop bouquet delivery"],
+    [/(?:婚礼|婚庆|wedding)/i,
+      "wedding event planner venue gallery rsvp"],
+    [/(?:律所|律师|法律|law\s*firm|legal|attorney|lawyer)/i,
+      "law firm attorney practice area consultation trust"],
+    [/(?:房产|地产|房源|中介|real\s*estate|property|realtor)/i,
+      "real estate property listing agent search map"],
+    [/(?:汽车|车行|租车|car|automotive|dealership|rental)/i,
+      "car automotive dealership inventory rental booking"],
+    [/(?:装修|家具|室内设计|建筑|interior|furniture|architecture|renovation)/i,
+      "interior furniture architecture project showcase materials"],
+    [/(?:服装|时尚|珠宝|奢侈|fashion|clothing|apparel|jewelry|luxury)/i,
+      "fashion apparel jewelry luxury lookbook collection editorial"],
+    [/(?:音乐|乐队|演出|演唱会|music|band|concert|dj)/i,
+      "music band artist tour dates album concert"],
+    [/(?:会议|峰会|活动策划|发布会|conference|summit|event|meetup)/i,
+      "conference event agenda speakers tickets venue"],
+    [/(?:博客|新闻|杂志|资讯|媒体|blog|news|magazine|editorial|media)/i,
+      "blog magazine editorial article author category feed"],
+    [/(?:公益|慈善|捐赠|教堂|nonprofit|charity|donation|church)/i,
+      "nonprofit charity donation cause impact community church"],
+    [/(?:农场|有机|生鲜|farm|organic|produce)/i,
+      "farm organic produce sustainability delivery"],
+    [/(?:saas|人工智能|\bai\b|智能体|初创|创业公司|科技公司|startup|software|platform|developer\s*tool)/i,
+      "saas ai startup product feature pricing integration dashboard"],
+    [/(?:仪表盘|后台管理|管理系统|dashboard|admin|analytics)/i,
+      "dashboard admin analytics data table chart sidebar"],
+    [/(?:游戏|电竞|game|gaming|esports)/i,
+      "game gaming esports launch trailer character"],
+    [/(?:加密|区块链|nft|crypto|blockchain|web3|defi)/i,
+      "crypto blockchain nft web3 token wallet"],
+    [/(?:金融|银行|保险|支付|理财|fintech|finance|banking|insurance|payment)/i,
+      "fintech banking finance payment card security trust"],
+  ];
+  return rules.filter(([pattern]) => pattern.test(text)).slice(0, 2).map(([, terms]) => terms).join(" ");
+}
+
+function _michaelDesignResearchPlan(task, profile = null) {
+  const p = profile || {};
+  if (!(p.designKnowledgeRequired || p.uiProject)) return [];
+  const subject = String(task || "")
+    .replace(/https?:\/\/[^\s<>"'`（）()，。；、]+/gi, "")
+    .replace(/\s+/g, " ").trim().slice(0, 180) || "当前产品";
+  const categoryTerms = _michaelDesignCategoryTerms(task);
+  const scopedSubject = [subject, categoryTerms].filter(Boolean).join(" ");
+  return [
+    {
+      id: "architecture-color",
+      query: `${scopedSubject} information architecture visual style color palette card layout responsive grid enterprise design system`,
+      purpose: "信息架构、视觉样式、组件体系、Tailwind 配色与响应式网格",
+    },
+    {
+      id: "motion-responsive",
+      query: `${scopedSubject} signature motion choreography scroll animation mobile reduced-motion`,
+      purpose: "标志性动效、分区节奏、移动端降级与参数",
+    },
+    {
+      id: "assets-icons",
+      query: `${scopedSubject} real image video avatar semantic icon media`,
+      purpose: "真实媒体、头像、语义图标与组件质感",
+    },
+  ];
+}
+
+function _michaelDesignResearchGaps(profile, evidence = null) {
+  const p = profile || {};
+  if (!p.designKnowledgeRequired) return [];
+  if (!evidence) return ["michael-design 检索"];
+  const tracks = evidence.researchTracks || {};
+  const required = [
+    ["informationArchitecture", "信息架构/内容密度"],
+    ["colorSystem", "配色/语义 token"],
+    ["responsiveLayout", "响应式布局/断点"],
+    ["componentSystem", "shadcn/ui、Radix 与 Tailwind 组件变体"],
+    ["signatureMotion", "标志性动效/滚动叙事"],
+    ["responsiveMotion", "移动端动效与 reduced-motion"],
+    ["mediaAssets", "图片/视频/GIF/头像素材"],
+    ["semanticIcons", "语义图标映射"],
+  ];
+  const gaps = required.filter(([key]) => !tracks[key]).map(([, label]) => label);
+  const queryRounds = Array.isArray(evidence.researchQueries) ? evidence.researchQueries.length : 0;
+  if (queryRounds < 3) gaps.push("三轨分主题检索（结构配色组件 + 动效响应式 + 媒体图标）");
+  return [...new Set(gaps)];
+}
+
+function _uiVisualRichnessFindings(value, profile = null) {
+  profile = profile || {};
+  const text = String(value || "");
+  const findings = [];
+  const isChromaticColor = (value) => {
+    const raw = String(value || "").trim().toLowerCase();
+    const hex = raw.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i)?.[1];
+    if (hex) {
+      const expanded = hex.length === 3 ? [...hex].map((char) => char + char).join("") : hex;
+      const channels = [0, 2, 4].map((index) => parseInt(expanded.slice(index, index + 2), 16));
+      return Math.max(...channels) - Math.min(...channels) >= 24;
+    }
+    const oklch = raw.match(/oklch\(\s*[\d.]+(?:%\s*)?\s+([\d.]+)/i);
+    if (oklch) return Number(oklch[1]) >= 0.035;
+    const rgb = raw.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+    if (rgb) {
+      const channels = rgb.slice(1, 4).map(Number);
+      return Math.max(...channels) - Math.min(...channels) >= 24;
+    }
+    const hsl = raw.match(/hsla?\([^,\s]+[,\s]+([\d.]+)%/i);
+    return !!hsl && Number(hsl[1]) >= 12;
+  };
+
+  const roleValues = [...text.matchAll(/--(?:color-)?(?:primary|secondary|accent|brand)(?:-\d+)?\s*:\s*([^;}\n]+)/gi)]
+    .map((match) => match[1]);
+  const directAccentFamilies = text.match(/\b(?:bg|text|border|ring|fill|stroke|from|via|to)-(?:red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950)\b/gi) || [];
+  const hasChromaticAccent = roleValues.some(isChromaticColor) || directAccentFamilies.length > 0;
+  if (!profile.monochromeThemeRequested && !hasChromaticAccent) {
+    findings.push("品牌色消失：页面只有中性黑白/灰阶，primary/secondary/accent 没有任何可识别色相；配色统一不等于单色线框，必须从 michael-design/Tailwind 色板保留一个真实品牌强调色");
+  }
+
+  const semanticAccentUses = [...text.matchAll(/\b(bg|text|border|ring|fill|stroke|from|via|to)-(primary|secondary|accent)(?!-foreground)(?:\/[\d.]+)?\b/gi)];
+  const cssAccentUses = [...text.matchAll(/\b(background(?:-color)?|color|border-color|box-shadow)\s*:\s*[^;}\n]{0,120}var\(--(?:color-)?(?:primary|secondary|accent)\)/gi)];
+  const accentKinds = new Set([
+    ...semanticAccentUses.map((match) => match[1].toLowerCase()),
+    ...cssAccentUses.map((match) => match[1].toLowerCase()),
+  ]);
+  if (!profile.monochromeThemeRequested && (semanticAccentUses.length + cssAccentUses.length < 3 || accentKinds.size < 2)) {
+    findings.push("主色利用不足：品牌色不能只定义在 token 里或只出现一次；至少让它承担两类以上真实角色，例如主 CTA、重点卡片/标签底色、选中态、链接/图标、边框或焦点环，并使用同色阶而不是新增色相");
+  }
+
+  const cardBlocks = [];
+  const classAttribute = /<([A-Za-z][\w.]*)\b[^>]{0,700}\bclass(?:Name)?\s*=\s*(?:"([^"]*)"|'([^']*)'|\{([^}]*)\})[^>]*>/gi;
+  let classMatch;
+  while ((classMatch = classAttribute.exec(text))) {
+    const tag = classMatch[1];
+    const classes = classMatch[2] || classMatch[3] || classMatch[4] || "";
+    const namedCard = /(?:Card|card|panel|tile|feature|step|item)/i.test(`${tag} ${classes}`);
+    const shapedCard = /(?:^|\s)rounded(?:-|\s)/i.test(classes)
+      && /(?:^|\s)(?:p[xytrbl]?-[\w[\]./-]+|border(?:-|\s)|bg-(?:card|muted|secondary|accent|primary))/i.test(classes);
+    if (namedCard || shapedCard || /(?:^|\.)article$/i.test(tag)) cardBlocks.push(classes);
+  }
+  const mappedCards = /\.map\s*\(\s*(?:\([^)]*\)|[\w$]+)\s*=>[\s\S]{0,900}<(?:Card|article|motion\.(?:div|article)|div)\b/i.test(text);
+  if (cardBlocks.length >= 3 || mappedCards) {
+    const cardClasses = cardBlocks.join(" ");
+    const treatmentLayers = [
+      /\bbg-(?:card|muted|secondary|accent|primary)(?:\/[\d.]+)?\b/i,
+      /\b(?:shadow-(?!none)|shadow-\[|backdrop-blur|backdrop-saturate|inset-shadow)\b/i,
+      /\b(?:bg-primary\/|bg-accent\/|bg-secondary\/|border-primary|ring-primary|text-primary|from-primary|to-primary)\b/i,
+      /(?:hover:[^\s"']*(?:shadow|translate|scale|border-primary)|whileHover|group-hover:)/i,
+    ].filter((pattern) => pattern.test(cardClasses)).length;
+    if (treatmentLayers < 2) {
+      findings.push("卡片视觉层级不足：重复卡片几乎只有透明/同色背景加细边框，已经退化成线框图；从知识库采用 surface 阶梯，并至少组合背景 tone、柔和 elevation/内高光、品牌色 tint/重点卡、媒体或克制 hover 中的两层，不能所有卡片同一种空框");
+    }
+  }
+  return findings;
+}
+
+function _michaelDesignEvidenceFromResult(call, result) {
+  if (call?.type !== "knowledge" || !_toolExecutionSucceeded(call, result)) return null;
+  const content = String(result?.content || "");
+  const metadata = result?.knowledge && typeof result.knowledge === "object" ? result.knowledge : {};
+  const match = content.match(/检索到\s*(\d+)\s*段/i);
+  const hitCount = Number.isFinite(Number(metadata.hitCount)) ? Number(metadata.hitCount) : Number(match?.[1] || 0);
+  if (hitCount < 1) return null;
+
+  const normalizeDomain = (domain) => String(domain || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  const domains = Array.isArray(metadata.domains) ? metadata.domains.map(normalizeDomain).filter(Boolean) : [];
+  const requestedMichaelDesign = normalizeDomain(call.domain) === "michael-design";
+  const returnedMichaelDesign = domains.includes("michael-design")
+    || /(?:【\d+[^】]*michael-design\/|\[michael-design\])/i.test(content);
+  if (!requestedMichaelDesign && !returnedMichaelDesign) return null;
+  const paletteTokens = [...new Set(content.match(/#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\)|rgba?\([^)]{3,120}\)/gi) || [])].slice(0, 24);
+  const tailwindPaletteTokens = [...new Set((content.match(/\b(?:zinc|slate|neutral|stone|gray|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950)\b/gi) || [])
+    .map((value) => value.toLowerCase()))].slice(0, 24);
+  const mediaUrls = [...new Set(content.match(/https?:\/\/[^\s)'"<>]+\.(?:avif|webp|png|jpe?g|gif|mp4|webm|m3u8)(?:\?[^\s)'"<>]*)?/gi) || [])].slice(0, 24);
+  const sourceSections = [...new Set([...content.matchAll(/【[^】]*michael-design\/[^·｜】]+\s*·\s*([^｜】\n]+)(?:｜[^】]*)?】/gi)]
+    .map((match) => String(match[1] || "").trim()).filter(Boolean))].slice(0, 12);
+  const motionTechniques = _designMotionTechniques(content);
+  const layoutTechniques = _designLayoutTechniques(content);
+  const motionParameters = [...new Set(content.match(/\b\d+(?:\.\d+)?(?:ms|s)\b|cubic-bezier\([^)]{3,100}\)|stagger(?:Children)?\s*[:=]\s*\d+(?:\.\d+)?/gi) || [])].slice(0, 20);
+  const componentTechniques = [
+    ["shadcn/ui", /(?:\bshadcn(?:\/ui)?\b|components\/ui\/)/i],
+    ["Radix primitives", /(?:\bRadix(?:\s*(?:UI|primitives?))?\b|@radix-ui\/)/i],
+    ["class-variance-authority", /(?:class-variance-authority|\bcva\s*\()/i],
+    ["tailwind-variants", /(?:tailwind-variants|\btv\s*\()/i],
+  ].filter(([, pattern]) => pattern.test(content)).map(([name]) => name);
+  const query = String(call.query || "").slice(0, 240);
+  return {
+    query,
+    researchQueries: query ? [query] : [],
+    researchTracks: _michaelDesignResearchTracks(query, content),
+    hitCount,
+    domains: [...new Set(domains)],
+    sourceSections,
+    paletteTokens,
+    tailwindPaletteTokens,
+    mediaUrls,
+    motionTechniques,
+    layoutTechniques,
+    motionParameters,
+    componentTechniques,
+    visualSignals: {
+      typography: /(?:typography|font(?:-family|-size|-weight)?|type\s*scale|字阶|字体|排版)/i.test(content),
+      buttons: /(?:primary|secondary|outline|ghost).{0,40}(?:button|cta)|(?:按钮|主按钮|次按钮)/i.test(content),
+      avatars: /(?:avatar|portrait|headshot|人物肖像|真人头像|头像图片)/i.test(content),
+      motion: /(?:motion|framer|whileInView|stagger|spring|duration|easing|动画|动效|缓动|时长)/i.test(content) || motionTechniques.length > 0,
+      layout: /(?:grid|breakpoint|responsive|mobile|columns?|bento|卡片|网格|断点|响应式)/i.test(content) || layoutTechniques.length > 0,
+      icons: /(?:lucide|iconify|icon|pictogram|图标|语义图形)/i.test(content),
+      components: /(?:shadcn|radix|class-variance-authority|tailwind-variants|组件变体|语义组件)/i.test(content),
+    },
+    at: Date.now(),
+  };
+}
+
+function _mergeMichaelDesignEvidence(previous, next) {
+  if (!previous) return next || null;
+  if (!next) return previous;
+  const queries = [previous.query, next.query].map((value) => String(value || "").trim()).filter(Boolean);
+  const mergeList = (a, b, limit = 24) => [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])].slice(0, limit);
+  const previousSignals = previous.visualSignals || {};
+  const nextSignals = next.visualSignals || {};
+  const previousTracks = previous.researchTracks || {};
+  const nextTracks = next.researchTracks || {};
+  return {
+    query: [...new Set(queries)].join(" | ").slice(0, 480),
+    researchQueries: mergeList(previous.researchQueries || (previous.query ? [previous.query] : []), next.researchQueries || (next.query ? [next.query] : []), 8),
+    researchTracks: {
+      informationArchitecture: !!(previousTracks.informationArchitecture || nextTracks.informationArchitecture),
+      colorSystem: !!(previousTracks.colorSystem || nextTracks.colorSystem),
+      responsiveLayout: !!(previousTracks.responsiveLayout || nextTracks.responsiveLayout),
+      componentSystem: !!(previousTracks.componentSystem || nextTracks.componentSystem),
+      signatureMotion: !!(previousTracks.signatureMotion || nextTracks.signatureMotion),
+      responsiveMotion: !!(previousTracks.responsiveMotion || nextTracks.responsiveMotion),
+      mediaAssets: !!(previousTracks.mediaAssets || nextTracks.mediaAssets),
+      semanticIcons: !!(previousTracks.semanticIcons || nextTracks.semanticIcons),
+    },
+    hitCount: Math.max(Number(previous.hitCount || 0), Number(next.hitCount || 0)),
+    domains: mergeList(previous.domains, next.domains, 12),
+    sourceSections: mergeList(previous.sourceSections, next.sourceSections, 12),
+    paletteTokens: mergeList(previous.paletteTokens, next.paletteTokens),
+    tailwindPaletteTokens: mergeList(previous.tailwindPaletteTokens, next.tailwindPaletteTokens),
+    mediaUrls: mergeList(previous.mediaUrls, next.mediaUrls),
+    motionTechniques: mergeList(previous.motionTechniques, next.motionTechniques),
+    layoutTechniques: mergeList(previous.layoutTechniques, next.layoutTechniques),
+    motionParameters: mergeList(previous.motionParameters, next.motionParameters, 20),
+    componentTechniques: mergeList(previous.componentTechniques, next.componentTechniques, 12),
+    visualSignals: {
+      typography: !!(previousSignals.typography || nextSignals.typography),
+      buttons: !!(previousSignals.buttons || nextSignals.buttons),
+      avatars: !!(previousSignals.avatars || nextSignals.avatars),
+      motion: !!(previousSignals.motion || nextSignals.motion),
+      layout: !!(previousSignals.layout || nextSignals.layout),
+      icons: !!(previousSignals.icons || nextSignals.icons),
+      components: !!(previousSignals.components || nextSignals.components),
+    },
+    at: Math.max(Number(previous.at || 0), Number(next.at || 0), Date.now()),
+  };
+}
+
+function _michaelDesignCompositionRecipe(researchPlan, results = []) {
+  const successful = (Array.isArray(results) ? results : []).filter((item) => item?.evidence && item?.result);
+  const byTrack = (id) => successful.find((item) => item?.plan?.id === id)?.evidence || {};
+  const architecture = byTrack("architecture-color");
+  const motion = byTrack("motion-responsive");
+  const assets = byTrack("assets-icons");
+  const concise = (values, limit, fallback) => {
+    const items = [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || "").trim()).filter(Boolean))];
+    return items.length ? items.slice(0, limit).join("、") : fallback;
+  };
+  const architectureSections = concise(architecture.sourceSections, 3, "未命中，视觉实现前补检索结构/配色轨");
+  const motionSections = concise(motion.sourceSections, 3, "未命中，视觉实现前补检索动效/响应式轨");
+  const assetSections = concise(assets.sourceSections, 3, "未命中，视觉实现前补检索媒体/图标轨");
+  const tokens = concise([...(architecture.paletteTokens || []), ...(architecture.tailwindPaletteTokens || [])], 8, "待从结构轨提取");
+  const components = concise(architecture.componentTechniques, 5, "待从结构轨提取真实 primitive/variant 依据");
+  const layouts = concise(architecture.layoutTechniques, 5, "待从结构轨提取构图与断点");
+  const motionTechniques = concise(motion.motionTechniques, 4, "待从动效轨选择一个完整技术组合");
+  const motionParameters = concise(motion.motionParameters, 6, "待从动效轨提取时长/进度/缓动参数");
+  const media = concise(assets.mediaUrls, 5, "待从媒体轨取得可加载 URL");
+  const plannedTracks = (Array.isArray(researchPlan) ? researchPlan : []).map((item) => item?.id).filter(Boolean);
+  const missingTracks = ["architecture-color", "motion-responsive", "assets-icons"].filter((id) => !plannedTracks.includes(id));
+
+  return `【主动组合蓝本（模型开工默认方案，不等待用户逐项指定）】
+- 主结构蓝本：采用结构/配色轨 section「${architectureSections}」作为页面骨架与视觉系统；具体 token=${tokens}，构图/断点=${layouts}。页面落点：先按当前业务旅程安排导航、首个视觉焦点、核心任务、证据/内容、转化或完成态，禁止翻译回 Hero/Features/Pricing 模板。
+- 兼容动效蓝本：从动效/响应式轨 section「${motionSections}」只选择一套与当前栈兼容的标志性技术组合=${motionTechniques}，沿用参数=${motionParameters}。页面落点：连接主视觉媒体区与至少两个核心业务区块；另设可复用分区 reveal、控件微交互、移动端短位移/取消 pin 或重型 canvas、reduced-motion。
+- 组件与媒体支撑蓝本：结构轨组件依据=${components}；媒体/图标轨 section「${assetSections}」，真实素材=${media}。页面落点：shadcn/Radix primitive 与 variant 承担真实交互，媒体进入主视觉、叙事/样例 rail 和人物内容，语义图标按业务对象/动作/状态映射，不能只放进小卡片或只安装依赖。
+- 合成关系：以“主结构蓝本”为骨架，把“兼容动效蓝本”的时间线绑定到同一批业务 section，再把“组件与媒体支撑蓝本”的 primitive、媒体和图标嵌入这些 section；三者必须在同一设计 token、内容旅程和响应式规则下协同，不能三选一、不能只采用第一轨的配色/圆角/卡片。若某个命中与当前业务或技术栈冲突，计划必须写明弃用原因，并从该轨另选一个命中，不能直接删掉整轨。
+- 开工计划固定格式：主结构蓝本 section + 页面栏目/构图 → 动效蓝本 section + 连接区块/参数/移动降级 → 组件与媒体蓝本 section + primitive/variant/URL/语义图标 → 三轨如何共享 token 与响应式断点。${missingTracks.length ? `当前研究计划缺少 ${missingTracks.join("/")}，必须先补齐。` : "三轨计划已建立，按真实命中完成采用映射后直接实现。"}`;
+}
+
+function _michaelDesignBrief(researchPlan, evidence, results = []) {
+  const list = (value, fallback = "无") => Array.isArray(value) && value.length ? value.join("、") : fallback;
+  const successful = (Array.isArray(results) ? results : []).filter((item) => item?.evidence && item?.result);
+  const trackPatterns = {
+    "architecture-color": /(?:information\s*architecture|content\s*(?:map|density)|user\s*journey|palette|color|tailwind|shadcn|radix|component|variant|typography|spacing|radius|shadow|grid|breakpoint|信息架构|内容密度|用户旅程|配色|色板|色阶|组件|字阶|间距|圆角|阴影|网格|断点)/i,
+    "motion-responsive": /(?:motion|animation|animate|scroll|stagger|spring|scrub|pinning|parallax|mask|clip-path|lottie|rive|three|webgl|duration|easing|reduced-motion|mobile|responsive|动效|动画|滚动|交错|弹簧|视差|遮罩|时长|缓动|移动端|响应式|降级)/i,
+    "assets-icons": /(?:https?:\/\/|image|video|gif|media|avatar|portrait|icon|lucide|iconify|surface|hover|focus|active|图片|视频|动图|媒体|头像|肖像|图标|质感|交互状态)/i,
+  };
+  const evidencePattern = /(?:#[0-9a-f]{3,8}\b|oklch\(|rgba?\(|\b\d+(?:\.\d+)?(?:ms|s)\b|cubic-bezier\(|(?:sm|md|lg|xl|2xl):|https?:\/\/|@[\w-]+\/|use[A-Z]|while[A-Z]|ScrollTrigger|prefers-reduced-motion)/i;
+  const focusedExcerpt = (item) => {
+    const content = String(item?.result?.content || "")
+      .replace(/^📚[^\n]*\n*/u, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (!content) return "";
+    const trackPattern = trackPatterns[item?.plan?.id] || /./;
+    const hitBlocks = content.split(/(?=【\d+[^】]*】)/u).map((value) => value.trim()).filter(Boolean);
+    const blocks = hitBlocks.length > 1 ? hitBlocks : content.split(/\n{2,}/).map((value) => value.trim()).filter(Boolean);
+    const ranked = blocks.map((block, index) => {
+      const paragraphs = block.split(/\n{2,}|(?<=。)\s*(?=[A-Z\u4e00-\u9fff])/u).map((value) => value.trim()).filter(Boolean);
+      const selected = paragraphs.map((paragraph, paragraphIndex) => ({
+        paragraph,
+        paragraphIndex,
+        score: (trackPattern.test(paragraph) ? 4 : 0) + (evidencePattern.test(paragraph) ? 2 : 0) + (/^【\d+/.test(paragraph) ? 1 : 0),
+      })).filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score || a.paragraphIndex - b.paragraphIndex).slice(0, 8)
+        .sort((a, b) => a.paragraphIndex - b.paragraphIndex).map((entry) => entry.paragraph);
+      const excerpt = (selected.length ? selected.join("\n\n") : block).slice(0, 2200);
+      const score = (block.match(new RegExp(trackPattern.source, "gi")) || []).length * 3
+        + (block.match(new RegExp(evidencePattern.source, "gi")) || []).length;
+      return { index, score, excerpt };
+    }).sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 3).sort((a, b) => a.index - b.index);
+    return ranked.map((entry) => entry.excerpt).join("\n\n").slice(0, 3000);
+  };
+  const excerpts = successful.map((item) => {
+    const purpose = String(item?.plan?.purpose || "michael-design 检索");
+    const content = focusedExcerpt(item);
+    return `【${purpose}】\n${content}`;
+  }).join("\n\n---\n\n").slice(0, 9200);
+  const planned = (Array.isArray(researchPlan) ? researchPlan : [])
+    .map((item) => `${item.id}: ${item.purpose}`).join("；");
+  const compositionRecipe = _michaelDesignCompositionRecipe(researchPlan, results);
+  const trackAdoption = (Array.isArray(researchPlan) ? researchPlan : []).map((plan) => {
+    const item = successful.find((candidate) => candidate?.plan?.id === plan.id);
+    const itemEvidence = item?.evidence || {};
+    const facts = plan.id === "architecture-color"
+      ? [...(itemEvidence.sourceSections || []), ...(itemEvidence.paletteTokens || []), ...(itemEvidence.tailwindPaletteTokens || []), ...(itemEvidence.componentTechniques || []), ...(itemEvidence.layoutTechniques || [])]
+      : plan.id === "motion-responsive"
+        ? [...(itemEvidence.sourceSections || []), ...(itemEvidence.motionTechniques || []), ...(itemEvidence.motionParameters || [])]
+        : [...(itemEvidence.sourceSections || []), ...(itemEvidence.mediaUrls || [])];
+    return `- ${plan.id}: ${facts.length ? `已命中 ${facts.slice(0, 12).join("、")}` : "未形成可采用证据，必须补检索，不能由 query 自证"}`;
+  }).join("\n");
+
+  return `[MICHAEL_DESIGN_PRELOADED_BRIEF]
+以下是本轮在模型开始规划前，从服务器 michael-design 知识库真实检索到的设计事实。它是当前 UI/网站任务的主设计来源，不是可选灵感；先按它做信息架构、色彩、媒体、图标、卡片与动效，再结合用户要求和项目约束。不可把没有命中的内容伪造成知识库结论。
+
+检索主题：${planned || "当前 UI 任务"}
+分轨真实覆盖：
+${trackAdoption || "- 无"}
+命中 section：${list(evidence?.sourceSections)}
+可采用颜色/token：${list([...(evidence?.paletteTokens || []), ...(evidence?.tailwindPaletteTokens || [])].slice(0, 16))}
+（⚠️ 上面列的 Hex/OKLCH 只是命中原文的参考定义值——采用前必须先折算成最接近的 Tailwind 族+档（如 #17130d→stone-950），任务计划、方案叙述、业务代码一律只写 Tailwind 族档名或语义 token，绝不出现裸 hex；hex 只允许留在 tokens 定义文件并注明折算来源。配色有品类闸门：只有与本产品品类匹配的命中才能借配色，跨品类命中只借结构/动效/密度；没有品类匹配命中就取 Curated Palette Library 最接近一套并写明。用户未明确要求暗色时根背景必须是浅色中性档。）
+布局/响应式规则：${list(evidence?.layoutTechniques)}
+组件/Tailwind 依据：${list(evidence?.componentTechniques)}
+动效技术：${list(evidence?.motionTechniques)}
+动效参数：${list(evidence?.motionParameters)}
+可用媒体 URL：${list(evidence?.mediaUrls)}
+
+${compositionRecipe}
+
+执行要求：三轨是同时成立的采用契约，不允许只选第一轨的浅色、圆角和卡片后忽略动效/媒体轨。结构配色轨必须逐项写成“来源 section → shadcn/Radix primitive 与 variant → Tailwind semantic token/class → 页面落点”；动效轨必须落实知识库命中的高级技术、至少两处区块触发、桌面/移动参数以及 reduced-motion；媒体图标轨必须落实真实图片/视频/GIF/头像 URL、加载失败态和“业务对象/动作/状态 → 具体图标”。把 Tailwind 族档/语义 token 分配给 canvas、surface、文字层级、CTA/状态（禁止直接分配裸 hex）；只使用同一色彩契约，不在局部添加陌生蓝色/渐变/暗色，未明确要求暗色时根背景保持浅色中性档。按命中的布局规则决定卡片数量、跨列和移动端断点。先在计划中逐轨写明采用与弃用项，再实现；浏览器验收前源码门禁会逐项检查，不接受只在总结里承诺。
+
+原始命中摘录（仅以下内容可当作知识库事实）：
+${excerpts || "本轮 michael-design 没有返回命中；不要编造知识库规则，改为明确记录不可用原因并基于用户约束继续。"}`;
+}
+
+async function _runMichaelDesignPreflight({ run, body = null, isLive = () => true } = {}) {
+  const profile = run?.engineering || {};
+  if (run?.mode !== "agent" || !profile.designKnowledgeRequired || !isLive()) {
+    return { required: false, brief: "", results: [] };
+  }
+
+  const researchPlan = _michaelDesignResearchPlan(run._originalText || "", profile);
+  const results = [];
+  run._michaelDesignPreflight = { status: "running", researchPlan, startedAt: Date.now() };
+
+  for (const plan of researchPlan) {
+    if (!isLive()) break;
+    const call = { type: "knowledge", domain: "michael-design", query: plan.query, topK: 6, _michaelDesignPreflight: true };
+    let step = null;
+    try {
+      if (body?.appendChild) {
+        step = _createToolStep(call);
+        body.appendChild(step);
+      }
+      const result = await _searchKnowledgeBase(call);
+      const evidence = _michaelDesignEvidenceFromResult(call, result);
+      if (evidence) run._michaelDesignEvidence = _mergeMichaelDesignEvidence(run._michaelDesignEvidence, evidence);
+      results.push({ plan, result, evidence });
+
+      if (step) {
+        const viewport = step.querySelector?.(".atc-viewport");
+        if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
+        _settleToolStep(step, result, evidence ? `${evidence.hitCount} 段 · 已注入` : "无可用命中");
+      }
+    } catch (error) {
+      const result = { type: "knowledge", path: plan.query, content: `[失败] michael-design 预取异常: ${String(error?.message || error).slice(0, 180)}` };
+      results.push({ plan, result, evidence: null });
+      if (step) _settleToolStep(step, result, "预取失败");
+    }
+  }
+
+  const evidence = run._michaelDesignEvidence || null;
+  const brief = _michaelDesignBrief(researchPlan, evidence, results);
+  const hitCount = results.filter((item) => item.evidence).length;
+  run._michaelDesignPreflight = {
+    status: hitCount ? "complete" : "unavailable",
+    researchPlan,
+    results: results.map((item) => ({ id: item.plan.id, hitCount: item.evidence?.hitCount || 0, error: !item.evidence })),
+    completedAt: Date.now(),
+  };
+  run._michaelDesignBrief = brief;
+  return { required: true, brief, results, evidence };
+}
+
+function _websiteContentEvidenceFromResult(call, result) {
+  if (!_toolExecutionSucceeded(call, result)) return null;
+  const content = String(result?.content || "").trim();
+  if (content.length < 80) return null;
+  const type = String(call?.type || "");
+  const path = String(call?.path || call?.url || call?.wikiDest || "").trim();
+  const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
+  const source = (kind, value, assumption = false) => ({
+    kind,
+    path: value,
+    assumption,
+    at: Date.now(),
+  });
+
+  if (type === "web" && /^https?:\/\//i.test(String(call?.url || path))) {
+    return { sources: [source("primary-web", String(call?.url || path))] };
+  }
+  if (type === "read" && /(?:^|\/)(?:readme|product[_-]?wiki|product[_-]?(?:brief|facts)|brand[_-]?(?:brief|facts)|docs?|content|copy|data|assets?|public|screenshots?)(?:[./_-]|$)/i.test(normalized)) {
+    return { sources: [source("workspace", normalized)] };
+  }
+  if (type === "subagent" && call?._wiki) {
+    return { sources: [source("product-wiki", String(call?.wikiDest || "PRODUCT_WIKI.md"))] };
+  }
+  if (type === "write" && /(?:^|\/)(?:product|content|brand)[_-]?(?:brief|facts|source)(?:[._-]|$)/i.test(normalized)
+    && /(?:assumption|assumptions|假设|待确认|原创(?:文案|内容)|original\s+(?:copy|content))/i.test(content)) {
+    return { sources: [source("assumption-brief", normalized, true)] };
+  }
+  return null;
+}
+
+function _mergeWebsiteContentEvidence(previous, next) {
+  if (!previous) return next || null;
+  if (!next) return previous;
+  const known = new Set();
+  const sources = [];
+  for (const item of [...(Array.isArray(previous.sources) ? previous.sources : []), ...(Array.isArray(next.sources) ? next.sources : [])]) {
+    const path = String(item?.path || "").trim();
+    const key = `${String(item?.kind || "")}\u0000${path}`;
+    if (!path || known.has(key)) continue;
+    known.add(key);
+    sources.push({ ...item, path });
+    if (sources.length >= 12) break;
+  }
+  return { sources, at: Math.max(Number(previous.at || 0), Number(next.at || 0), Date.now()) };
+}
+
+function _referenceWebsiteUrlKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const protocol = String(parsed.protocol || "").toLowerCase();
+    const host = String(parsed.hostname || "").toLowerCase().replace(/^www\./, "");
+    const pathname = String(parsed.pathname || "/").replace(/\/+$/, "") || "/";
+    return `${protocol}//${host}${pathname}${parsed.search || ""}`;
+  } catch {
+    return raw.replace(/^https?:\/\/www\./i, (prefix) => prefix.replace(/www\./i, ""))
+      .replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function _referenceWebsiteEvidenceFromResult(call, result, profile = null) {
+  const p = profile || {};
+  const expected = (Array.isArray(p.referenceWebsiteUrls) ? p.referenceWebsiteUrls : [])
+    .map(_referenceWebsiteUrlKey).filter(Boolean);
+  if (!p.referenceWebsiteRequired || !expected.length || !_toolExecutionSucceeded(call, result)) return null;
+  const type = String(call?.type || "");
+  if (type !== "web" && type !== "learndesign") return null;
+  const url = String(call?.url || call?.path || "").trim();
+  const key = _referenceWebsiteUrlKey(url);
+  if (!key || !expected.includes(key)) return null;
+  const content = String(result?.content || "").trim();
+  if (content.length < 40) return null;
+  const paletteTokens = [...new Set(content.match(/#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\)|rgba?\([^)]{3,120}\)/gi) || [])].slice(0, 24);
+  const tailwindPaletteTokens = [...new Set((content.match(/\b(?:zinc|slate|neutral|stone|gray|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950)\b/gi) || [])
+    .map((value) => value.toLowerCase()))].slice(0, 24);
+  const structureSignals = [...new Set((content.match(/\b(?:navigation|navbar|hero|catalog|collection|editorial|timeline|story|gallery|dashboard|table|booking|reservation|menu|workflow|integration|case\s*stud(?:y|ies)|community|article|author|filter|cart|checkout|nav|首屏|导航|目录|分类|画廊|时间线|故事|预订|菜单|工作流|案例|社区|文章|作者|筛选|购物车|结账)\b/gi) || [])
+    .map((value) => value.toLowerCase()))].slice(0, 20);
+  const motionSignals = [...new Set((content.match(/\b(?:scroll|parallax|sticky|transition|animation|motion|reveal|stagger|scrolltrigger|视差|滚动|转场|动画|动效|入场)\b/gi) || [])
+    .map((value) => value.toLowerCase()))].slice(0, 16);
+  return {
+    references: [{
+      url,
+      key,
+      methods: [type === "learndesign" ? "learn_design" : "web_fetch"],
+      paletteTokens,
+      tailwindPaletteTokens,
+      structureSignals,
+      motionSignals,
+      at: Date.now(),
+    }],
+    at: Date.now(),
+  };
+}
+
+function _mergeReferenceWebsiteEvidence(previous, next) {
+  if (!previous) return next || null;
+  if (!next) return previous;
+  const mergeList = (a, b, limit = 24) => [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])].slice(0, limit);
+  const references = new Map();
+  for (const item of [...(Array.isArray(previous.references) ? previous.references : []), ...(Array.isArray(next.references) ? next.references : [])]) {
+    const key = String(item?.key || _referenceWebsiteUrlKey(item?.url) || "").trim();
+    if (!key) continue;
+    const prior = references.get(key);
+    references.set(key, prior ? {
+      ...prior,
+      url: prior.url || item.url,
+      methods: mergeList(prior.methods, item.methods, 4),
+      paletteTokens: mergeList(prior.paletteTokens, item.paletteTokens),
+      tailwindPaletteTokens: mergeList(prior.tailwindPaletteTokens, item.tailwindPaletteTokens),
+      structureSignals: mergeList(prior.structureSignals, item.structureSignals, 20),
+      motionSignals: mergeList(prior.motionSignals, item.motionSignals, 16),
+      at: Math.max(Number(prior.at || 0), Number(item.at || 0)),
+    } : { ...item, key });
+  }
+  return {
+    references: [...references.values()].slice(0, 6),
+    at: Math.max(Number(previous.at || 0), Number(next.at || 0), Date.now()),
+  };
+}
+
+function _uiImplementationReadinessIssue(run, steps) {
+  const profile = run?.engineering || {};
+  if (!(profile.uiProject && (profile.fullWebsite || profile.designKnowledgeRequired))) return "";
+  const text = (Array.isArray(steps) ? steps : [])
+    .filter((step) => step?.status !== "cancelled")
+    .map((step) => String(step?.content || ""))
+    .join("\n");
+  const missing = [];
+  if (profile.designKnowledgeRequired && !run?._michaelDesignEvidence) missing.push("成功检索 michael-design 设计蓝本");
+  if (profile.fullWebsite && !(run?._websiteContentEvidence?.sources?.length || 0)) {
+    missing.push("真实产品内容来源（工作区 README/文档/素材、品牌主站 web_fetch、产品 Wiki，或标注假设的原创内容 brief）");
+  }
+  if (profile.referenceWebsiteRequired) {
+    const expectedReferenceKeys = (Array.isArray(profile.referenceWebsiteUrls) ? profile.referenceWebsiteUrls : [])
+      .map(_referenceWebsiteUrlKey).filter(Boolean);
+    const fetchedReferenceKeys = new Set((Array.isArray(run?._referenceWebsiteEvidence?.references) ? run._referenceWebsiteEvidence.references : [])
+      .map((item) => String(item?.key || _referenceWebsiteUrlKey(item?.url) || "")).filter(Boolean));
+    const missingReferences = expectedReferenceKeys.filter((key) => !fetchedReferenceKeys.has(key));
+    if (missingReferences.length) {
+      missing.push(`先读取用户指定参考站（${missingReferences.join("、")}）：调用 web_fetch 或 learn_design，不能凭记忆编配色和布局`);
+    }
+    const referencePlan = /(?:参考站|参考页面|reference\s*(?:site|page)?|https?:\/\/)/i.test(text)
+      && /(?:配色|色板|palette|tokens?|primary|accent|语义令牌)/i.test(text)
+      && /(?:信息架构|栏目|用户旅程|布局|catalog|editorial|dashboard|timeline|booking|结构)/i.test(text)
+      && /(?:适配|转译|取舍|不(?:直接)?复制|不照抄|非克隆|原创边界|adapt)/i.test(text)
+      && /(?:响应式|移动端|motion|动画|动效|滚动)/i.test(text);
+    if (!referencePlan) {
+      missing.push("参考站适配决策：记录参考配色/token、内容与信息架构取舍、非复制边界，以及响应式/动效如何结合 michael-design 转译");
+    }
+  }
+  const designEvidence = run?._michaelDesignEvidence;
+  const designResearchGaps = _michaelDesignResearchGaps(profile, designEvidence);
+  if (designResearchGaps.length) {
+    missing.push(`michael-design 编排检索缺失：${designResearchGaps.join("、")}`);
+  }
+  const evidencePaletteCount = (designEvidence?.paletteTokens?.length || 0) + (designEvidence?.tailwindPaletteTokens?.length || 0);
+  if (profile.fullWebsite && designEvidence && evidencePaletteCount < 3) {
+    missing.push("从 michael-design 检索至少 3 个可落地的 Tailwind 色阶/Hex/OKLCH 令牌");
+  }
+  if (profile.designKnowledgeRequired && designEvidence && !(designEvidence.sourceSections?.length || 0)) missing.push("记录 michael-design 命中的具体 section 名");
+  if (profile.designKnowledgeRequired && designEvidence && !(designEvidence.componentTechniques?.length || 0)) {
+    missing.push("从 michael-design 检索 shadcn/ui、Radix、CVA 或 Tailwind variants 的组件体系依据");
+  }
+  const componentSystemPlan = /(?:来源|source|section|michael-design)/i.test(text)
+    && /(?:shadcn(?:\/ui)?|radix|primitive)/i.test(text)
+    && /(?:variant|变体|default|secondary|outline|ghost)/i.test(text)
+    && /(?:tailwind|semantic\s*(?:token|class)|语义(?:token|令牌|类)|bg-primary|text-primary-foreground)/i.test(text);
+  if (profile.designKnowledgeRequired && !componentSystemPlan) {
+    missing.push("组件落地映射（来源 section → shadcn/Radix primitive/variant → Tailwind semantic token/class → 页面落点）");
+  }
+  if (profile.advancedMotionRequired && designEvidence && !(designEvidence.motionTechniques?.length || 0)) missing.push("从 michael-design 检索一个高级动效/特效方案及参数");
+  if (profile.cardLayoutRequired && designEvidence && !(designEvidence.layoutTechniques?.length || 0)) missing.push("从 michael-design 检索响应式卡片/网格编排与断点方案");
+  if (profile.fullWebsite && !_uiPlanHasCategoryArchitecture(text)) {
+    missing.push("按业务品类定义信息架构与至少 7 个差异化内容区块");
+  }
+  const concretePalette = /(?:#[0-9a-f]{3,8}\b|oklch\(|(?:zinc|slate|neutral|stone|gray|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950))/i.test(text);
+  const colorRoles = /(?:background|foreground|primary|secondary|muted|accent|背景色?|画布|正文色?|标题色?|弱化文字|辅助文字|主色|强调色)/i.test(text);
+  const textColorHierarchy = /(?:标题|正文|辅助|弱化|说明|caption|display|heading|body|muted).{0,100}(?:颜色|对比|color|foreground|contrast|层级)/i.test(text);
+  const buttonColorStates = /(?:主按钮|次按钮|primary\s*(?:button|cta)|secondary\s*(?:button|cta)).{0,140}(?:颜色|前景|对比|hover|focus|active|disabled|foreground|contrast|outline)/i.test(text);
+  if (profile.fullWebsite && !(concretePalette && colorRoles && textColorHierarchy && buttonColorStates)) {
+    missing.push("知识库具体配色、标题/正文/弱化文字层级与主次按钮颜色状态");
+  }
+  const paletteContract = /(?:中性|neutral|base).{0,100}(?:强调|品牌|accent|primary)|(?:强调|品牌|accent|primary).{0,100}(?:中性|neutral|base)/i.test(text)
+    && /(?:禁止|不得|不新增|不允许|突兀|跳色|陌生色|outlier|unapproved).{0,100}(?:颜色|色相|色族|hue|color)|(?:颜色|色相|色族|hue|color).{0,100}(?:禁止|不得|不新增|不允许|outlier|unapproved)/i.test(text);
+  if (profile.paletteHarmonyRequired && !paletteContract) missing.push("全页配色契约（中性族 + 主强调族 + 可选辅助族）及局部禁止新增陌生色相");
+  const paletteApplicationPlan = /(?:primary|accent|主色|强调色|品牌色).{0,180}(?:按钮|CTA|卡片|标签|徽标|链接|图标|选中|焦点|surface|badge|link|icon|active|focus)/i.test(text)
+    && /(?:至少|两个|多处|实际使用|落地|应用|使用).{0,100}(?:primary|accent|主色|强调色|品牌色)|(?:primary|accent|主色|强调色|品牌色).{0,100}(?:至少|两个|多处|实际使用|落地|应用|使用)/i.test(text);
+  if (profile.paletteHarmonyRequired && !paletteApplicationPlan) missing.push("主色的实际落点（CTA、卡片/标签、链接/图标或选中态），不能只定义 token 后全部使用中性灰");
+  const cardCountPlan = /(?:卡片|cards?|tiles?|items?).{0,180}(?:数量|count|2\s*\/\s*3\s*\/\s*4|3\s*\+\s*2|4\s*\+\s*3|末行|余数|last\s*row|auto-fit|minmax)|(?:末行|last\s*row|3\s*\+\s*2|4\s*\+\s*3).{0,120}(?:卡片|cards?|grid|网格)/i.test(text);
+  if (profile.cardLayoutRequired && !cardCountPlan) missing.push("按卡片实际数量决定列数、跨列和末行平衡的响应式网格规则");
+  const cardVisualPlan = /(?:卡片|cards?|panel|tile).{0,180}(?:surface|背景|底色|色调|tone|层级|elevation|阴影|shadow|内高光|inset|变体|variant|重点卡|featured|hover)/i.test(text);
+  if ((profile.cardStylingRequired || profile.fullWebsite) && !cardVisualPlan) missing.push("卡片视觉方案（surface 色阶、elevation/内高光、重点卡或 hover 变体），不能只写 border");
+  const semanticIconPlan = /(?:图标语义|语义图标|icon\s*map|semantic\s*icon|对象\/动作\/状态|概念.{0,40}图标|图标.{0,40}(?:对象|动作|状态))/i.test(text);
+  if (profile.semanticIconRequired && !semanticIconPlan) missing.push("图标语义映射（业务概念 → 具体 Lucide/Iconify 图标，禁止万能 Sparkles/Wand）");
+  const peopleContent = /(?:社区|评价|评论|口碑|作者|成员|用户|玩家|团队|讲师|顾问|客户|community|testimonial|reviewer|author|member|profile|team|customer)/i.test(text);
+  const realAvatarPlan = /(?:真人|真实人物|人物肖像|头像照片|头像图片|portrait|headshot|avatar).{0,100}(?:图片|照片|素材|asset|image|url|Pexels|pravatar|generate_image|本地)/i.test(text)
+    || /(?:Pexels|pravatar|generate_image|本地).{0,100}(?:真人|人物肖像|头像|portrait|headshot|avatar)/i.test(text);
+  if (profile.fullWebsite && peopleContent && !realAvatarPlan) missing.push("人物/社区内容的真实头像图片与加载失败备用素材");
+  if (profile.richMediaRequired && !/(?:图片|图像|视频|gif|媒体|素材|asset|image|video|media|\.mp4|\.webp|\.gif)/i.test(text)) {
+    missing.push("知识库真实图片/视频/GIF 素材落点");
+  }
+  if (profile.motionDesignRequired && !/(?:动画|动效|微交互|滚动|入场|转场|motion|animation|whileInView|stagger|scroll|prefers-reduced-motion|useReducedMotion)/i.test(text)) {
+    missing.push("响应式动效层级与 reduced-motion 降级");
+  }
+  const advancedMotionPlan = /(?:GSAP|ScrollTrigger|scrub|pinning|useScroll|useTransform|parallax|mask|clip|layoutId|Lottie|Rive|Three|WebGL|sticky\s*stack|horizontal\s*scroll)/i.test(text)
+    && /(?:目标区块|跨区块|section|timeline|progress|时间线|滚动进度|触发区间)/i.test(text)
+    && /(?:移动端|mobile|small\s*screen|reduced-motion|useReducedMotion|降级|禁用\s*(?:pin|scrub|3D|canvas))/i.test(text);
+  const reusableSectionReveal = /(?:SectionReveal|RevealSection|MotionSection|ScrollSection|AnimatedSection)/i.test(text);
+  const microinteractionPlan = /(?:微交互|micro-?interaction|whileHover|whileTap|hover|active|focus-visible|磁吸|magnetic)/i.test(text);
+  const mobileMotionParameters = /(?:移动端|mobile|small\s*screen).{0,220}(?:位移|distance|时长|duration|stagger|并发|concurren|pin|scrub|canvas|媒体负担|short|静态|静止|降级)/i.test(text);
+  const reducedMotionPlan = /(?:prefers-reduced-motion|useReducedMotion|motion-reduce|reduced-motion)/i.test(text);
+  const motionSystemPlan = advancedMotionPlan && reusableSectionReveal && microinteractionPlan && mobileMotionParameters && reducedMotionPlan;
+  if (profile.motionChoreographyRequired && !motionSystemPlan) {
+    missing.push("知识库四层动效编排：跨区块标志性滚动叙事、可复用分区揭示、控件微交互、带明确位移/时长/stagger/pin 或 canvas 降级参数的移动端编排及 reduced-motion");
+  }
+  const databaseDecision = /(?:数据库|持久化|数据层|database|persistence|storage).{0,80}(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server)/i.test(text)
+    || /(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server).{0,80}(?:数据库|持久化|数据层|database|persistence|storage)/i.test(text);
+  if (profile.databaseDecisionRequired && !databaseDecision) missing.push("明确数据库决策（不用/本地/服务端）及业务理由");
+  const transactionalDatabasePlan = /(?:服务端数据库|Postgres(?:QL)?|MySQL|Supabase|Firebase|SQLite|servers*(?:database|persistence)|backends*(?:database|persistence))/i.test(text)
+    && /(?:商品|发布|挂牌|库存|卖家|买家|订单|交易|收藏|用户|listing|inventory|seller|buyer|order|transaction|account)/i.test(text);
+  if (profile.transactionalProduct && !transactionalDatabasePlan) {
+    missing.push("交易/商品平台必须采用服务端持久化：明确用户、商品/挂牌、图片、收藏/会话和交易状态的数据模型；除非用户明确只要静态演示，否则不能用 localStorage 或“无后端”代替");
+  }
+  return missing.length ? `UI 实施准备不足：${missing.join("、")}` : "";
+}
+
+function _uiVisualImplementationPath(value) {
+  const path = String(value || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").split(/[?#]/)[0];
+  if (!path) return false;
+  const lower = path.toLowerCase();
+  const name = lower.slice(lower.lastIndexOf("/") + 1);
+  if (/^(?:package\.json|package-lock\.json|pnpm-lock\.ya?ml|yarn\.lock|bun\.lockb?|components\.json|index\.html)$/.test(name)) return false;
+  if (/^(?:tsconfig(?:\.[^.]+)*\.json|vite\.config\.[cm]?[jt]s|tailwind\.config\.[cm]?[jt]s|postcss\.config\.[cm]?[jt]s)$/.test(name)) return false;
+  if (/(?:^|\/)src\/(?:main|index|bootstrap)\.[cm]?[jt]sx?$/.test(lower)) return false;
+  if (/\.(?:css|pcss|scss|sass|less|styl|vue|svelte|astro)$/.test(lower)) return true;
+  if (/\.(?:jsx|tsx)$/.test(lower)) return true;
+  if (/\.(?:html|[cm]?[jt]s)$/.test(lower)) {
+    return /(?:^|\/)(?:app|page|layout|screen|view|shell|theme|styles?|components?|sections?|pages?|views?|layouts?|ui)(?:[./_-]|\/|$)/.test(lower);
+  }
+  return false;
+}
+
+function _uiReadinessAppliesToCall(call) {
+  const type = String(call?.type || "");
+  if (["write", "edit", "multiedit"].includes(type)) return _uiVisualImplementationPath(call.path);
+  if (type !== "worker") return false;
+  const scopes = (Array.isArray(call.scope) ? call.scope : []).map((value) => String(value || "").trim()).filter(Boolean);
+  if (!scopes.length) return true;
+  return scopes.some((value) => {
+    const scope = value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "").toLowerCase();
+    return _uiVisualImplementationPath(scope)
+      || /^(?:\.|src|app|pages?|components?|sections?|views?|layouts?|ui)(?:\/|$)/.test(scope);
+  });
+}
+
+function _uiImplementationReadinessNudge(run, steps, call) {
+  // 已停用：这套开工前检查表（含 knowledge_search 关键词清单）是"AI 架构"硬约束的源头，
+  // 结构/配色/动效质量改由服务端知识库驱动的提示词负责；保留函数壳避免改动全部调用点。
+  return "";
+  // eslint-disable-next-line no-unreachable
+  if (!run || run._uiReadinessNudged || !_uiReadinessAppliesToCall(call)) return "";
+  const issue = _uiImplementationReadinessIssue(run, steps);
+  if (issue) run._uiReadinessNudged = true;
+  if (!issue || !run.engineering?.designKnowledgeRequired) return issue;
+  const researchPlan = _michaelDesignResearchPlan(run._originalText || "", run.engineering)
+    .map((item, index) => `${index + 1}. knowledge_search(domain="michael-design", query="${item.query}") [${item.purpose}]`)
+    .join("\n");
+  return `${issue}\n按以下主题依次检索并写入计划，不要把它们压成一条泛 query：\n${researchPlan}`;
+}
+
+function _uiDeliverySourceFindings(source, profile, designEvidence = null, contentEvidence = null, referenceEvidence = null) {
+  profile = profile || {};
+  const text = String(source || "");
+  if (!(profile.uiProject && (profile.fullWebsite || profile.designKnowledgeRequired))) return [];
+  const findings = [];
+  const resolvedContentEvidence = contentEvidence || profile.contentEvidence;
+  const resolvedReferenceEvidence = referenceEvidence || profile.referenceWebsiteEvidence;
+
+  // 已删：“产品 brief/内容来源”与“michael-design 主编排”硬性要求——普通用户一句话建站永远满足不了，
+  // 属于 AI 检查表官僚主义；内容与知识库运用质量由服务端提示词按真实旅程驱动。
+
+  // Only enforce the default stack for a fresh, complete React site. Existing
+  // workspaces keep their own component library and are never rewritten here.
+  const freshReactWebsite = !!(profile.fromZeroUiProject && profile.fullWebsite
+    && /(?:["']react(?:-dom)?["']\s*:|from\s*["']react["']|\breact-dom\b)/i.test(text));
+  if (freshReactWebsite) {
+    const shadcnImport = /from\s*["'][^"']*(?:components\/ui\/|@\/components\/ui\/)[^"']*["']/i.test(text);
+    const shadcnPrimitive = /(?:class-variance-authority|@radix-ui\/react-|\bSlot\b)/i.test(text);
+    if (!(shadcnImport && shadcnPrimitive)) {
+      findings.push("shadcn/ui 未实际落地：从零 React 整站必须安装并在页面中组合至少一个 components/ui primitive（含 Radix 或 CVA 实现），不能只手写同名 Button/Card 样式");
+    }
+    if (!/from\s*["']lucide-react["']/i.test(text)) {
+      findings.push("SVG 图标库缺失：从零 React 整站必须实际从 lucide-react 导入并使用语义图标；普通按钮、状态和工具栏不能用 emoji");
+    }
+    const emoji = "[\\u{1F000}-\\u{1FAFF}\\u{2600}-\\u{27BF}]";
+    const emojiUsedAsIcon = new RegExp(
+      `(?:<(?:button|a)\\b[^>]*>[\\s\\S]{0,160}?${emoji}|\\b(?:icon|leadingIcon|trailingIcon|startIcon|endIcon|statusIcon|glyph)\\s*[:=]\\s*(?:["'\`{]\\s*)?${emoji}|<span\\b[^>]{0,220}(?:className|class)=["'][^"']*(?:\\bicon\\b|\\bw-\\d+\\b|\\bh-\\d+\\b)[^"']*["'][^>]*>\\s*${emoji})`,
+      "u",
+    );
+    if (emojiUsedAsIcon.test(text)) {
+      findings.push("检测到 emoji 被当作图标：普通交互必须改用 Lucide SVG；只有业务专属 pictogram/插画才创建自定义 SVG 组件");
+    }
+  }
+
+  const expectedReferenceKeys = profile.referenceWebsiteRequired
+    ? (Array.isArray(profile.referenceWebsiteUrls) ? profile.referenceWebsiteUrls : []).map(_referenceWebsiteUrlKey).filter(Boolean)
+    : [];
+  const fetchedReferences = Array.isArray(resolvedReferenceEvidence?.references) ? resolvedReferenceEvidence.references : [];
+  const fetchedReferenceKeys = new Set(fetchedReferences.map((item) => String(item?.key || _referenceWebsiteUrlKey(item?.url) || "")).filter(Boolean));
+  const missingReferenceKeys = expectedReferenceKeys.filter((key) => !fetchedReferenceKeys.has(key));
+  if (missingReferenceKeys.length) {
+    findings.push(`参考站取证缺失：用户指定的 ${missingReferenceKeys.join("、")} 没有成功用 web_fetch 或 learn_design 读取；不能把通用模板当作参考站实现`);
+  }
+
+  const normalizeDesignToken = (value) => String(value || "").toLowerCase().replace(/\s+/g, "").trim();
+  const sourceDesignTokens = new Set([
+    ...(text.match(/#[0-9a-f]{3,8}\b|oklch\([^)]{3,120}\)|rgba?\([^)]{3,120}\)/gi) || []),
+    ...(text.match(/\b(?:zinc|slate|neutral|stone|gray|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200|300|400|500|600|700|800|900|950)\b/gi) || []),
+  ].map(normalizeDesignToken));
+  const knowledgeDesignTokens = new Set([
+    ...(Array.isArray(designEvidence?.paletteTokens) ? designEvidence.paletteTokens : []),
+    ...(Array.isArray(designEvidence?.tailwindPaletteTokens) ? designEvidence.tailwindPaletteTokens : []),
+  ].map(normalizeDesignToken));
+  if (profile.referenceWebsiteRequired && !missingReferenceKeys.length) {
+    const referencePaletteTokens = new Set(fetchedReferences
+      .filter((item) => expectedReferenceKeys.includes(String(item?.key || _referenceWebsiteUrlKey(item?.url) || "")))
+      .flatMap((item) => [...(Array.isArray(item?.paletteTokens) ? item.paletteTokens : []), ...(Array.isArray(item?.tailwindPaletteTokens) ? item.tailwindPaletteTokens : [])])
+      .map(normalizeDesignToken).filter(Boolean));
+    if (referencePaletteTokens.size) {
+      const adoptedReferenceTokens = [...referencePaletteTokens].filter((value) => sourceDesignTokens.has(value));
+      const requiredReferenceTokens = Math.min(2, referencePaletteTokens.size);
+      if (adoptedReferenceTokens.length < requiredReferenceTokens) {
+        findings.push(`参考站配色未转译：源码只采用 ${adoptedReferenceTokens.length} 个用户指定站点取到的色值/色阶；至少映射 ${requiredReferenceTokens} 个到本项目语义 token，并与 michael-design 的层级、可访问性和动效规范一起适配`);
+      }
+    }
+  }
+  // 已删：配色和谐/视觉丰富度/卡片网格/语义图标四套正则检查表——由知识库驱动的提示词负责。
+
+  const concreteBackgrounds = [...text.matchAll(/--(?:color-)?background\s*:\s*(#[0-9a-f]{6,8}\b|oklch\([^)]{3,120}\)|rgba?\([^)]{3,120}\))/gi)].map((match) => match[1]);
+  const background = concreteBackgrounds[0] || text.match(/(?:body|main)\s*\{[^}]{0,300}background(?:-color)?\s*:\s*(#[0-9a-f]{6,8})/i)?.[1] || "";
+  const isDarkColor = (value) => {
+    const raw = String(value || "").trim().toLowerCase();
+    const hex = raw.match(/^#([0-9a-f]{6})/i)?.[1];
+    if (hex) {
+      const channels = [0, 2, 4].map((index) => parseInt(hex.slice(index, index + 2), 16) / 255)
+        .map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+      return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2] < 0.12;
+    }
+    const oklchLightness = Number(raw.match(/^oklch\(\s*([\d.]+)/i)?.[1]);
+    return Number.isFinite(oklchLightness) && oklchLightness < 0.36;
+  };
+  if (!profile.darkThemeRequested && background && isDarkColor(background)) {
+    findings.push(`默认暗色滥用：用户没有明确要求暗色，但根背景使用了 ${background}；改用 michael-design/Tailwind 的浅色或中性实色色板`);
+  }
+  const gradientUses = (text.match(/(?:linear-gradient|radial-gradient|conic-gradient|bg-gradient-(?:to|from)|bg-linear-to-|bg-radial)/gi) || []).length;
+  if (!profile.gradientThemeRequested && gradientUses >= 4) {
+    findings.push(`渐变滥用：用户没有要求渐变，源码却出现 ${gradientUses} 处渐变；保留至多 1-2 处有明确用途的小面积强调，其余改用 Tailwind 实色层级`);
+  }
+
+  // 已删：语义 token 计数、文字层级、按钮状态的正则配额检查。
+
+  const peopleContent = /(?:\bcommunity\b|\btestimonial\b|\breviewer\b|\bauthor\b|\bmember\b|\bprofile\b|\bteam\b|\bcustomer\b|社区|评价|评论|口碑|作者|成员|用户|玩家|团队|讲师|顾问|客户)/i.test(text);
+  const realAvatarImage = /(?:avatar(?:Url|Src)?|portrait|headshot|profileImage|profilePhoto|authorImage|authorPhoto|userImage|userPhoto|memberImage)\s*[:=]\s*["'`](?:https?:\/\/|\/|\.\.?\/|data:image\/|[^"'`]+\.(?:avif|webp|png|jpe?g))/i.test(text)
+    || /<(?:img|AvatarImage)\b[^>]{0,500}(?:avatar|portrait|headshot|profile|author|user|member)[^>]*>/i.test(text);
+  if (peopleContent && !realAvatarImage) {
+    findings.push("真实头像缺失：人物/社区/评价内容仍没有可加载的头像图片；禁止只用首字母、渐变圆或 User 图标代替人物肖像");
+  }
+  if (/onError\s*=\s*\{[^}]{0,500}(?:style\.display\s*=\s*["']none["']|\.remove\s*\()/is.test(text)
+    || /onerror\s*=\s*["'][^"']{0,300}(?:display\s*=\s*["']?none|\.remove\s*\()/i.test(text)) {
+    findings.push("图片失败态错误：资源加载失败时直接隐藏会留下空洞；必须切换到同尺寸本地/知识库备用图片并保留布局");
+  }
+
+  if (/@import\s+(?:url\(\s*)?["']tailwindcss["']\s*\)?\s*;/i.test(text)) {
+    const universalReset = /(?:^|[};])\s*(\*(?:\s*,\s*\*::(?:before|after))*)\s*\{([^{}]*)\}/gim;
+    const baseLayers = [...text.matchAll(/@layer\s+base\s*\{/gi)].map((match) => text.indexOf("{", match.index));
+    let reset;
+    while ((reset = universalReset.exec(text))) {
+      if (!/\b(?:margin|padding)(?:-[a-z-]+)?\s*:/i.test(reset[2])) continue;
+      const resetIndex = reset.index + reset[0].indexOf(reset[1]);
+      const insideBaseLayer = baseLayers.some((openIndex) => {
+        if (openIndex < 0 || openIndex >= resetIndex) return false;
+        let depth = 0;
+        let quote = "";
+        for (let index = openIndex; index < text.length; index++) {
+          const char = text[index];
+          if (quote) {
+            if (char === "\\") index++;
+            else if (char === quote) quote = "";
+            continue;
+          }
+          if (char === '"' || char === "'") { quote = char; continue; }
+          if (char === "/" && text[index + 1] === "*") {
+            const commentEnd = text.indexOf("*/", index + 2);
+            index = commentEnd < 0 ? text.length : commentEnd + 1;
+            continue;
+          }
+          if (char === "{") depth++;
+          else if (char === "}" && --depth === 0) return index > resetIndex;
+        }
+        return false;
+      });
+      if (!insideBaseLayer) {
+        findings.push("Tailwind v4 级联冲突：检测到未置于 @layer base 的全局 * margin/padding 重置；它会覆盖 mx-auto、px-*、py-*、mt-* 等间距和居中工具类。删除该重置并使用 Tailwind Preflight");
+        break;
+      }
+    }
+  }
+
+  // 已删：“至少 7 个区块”配额——结构由真实用户旅程决定，需要什么做什么（与服务端规则一致）。
+
+  // 已删：“至少 3 个媒体/必须有视频”配额。
+
+  // 已删：断点计数配额——响应式质量由浏览器双视口真实验证保障，不靠数 class。
+
+  // 已删：动效层数/技术清单配额——动效方案由知识库命中驱动，不靠正则数层数。
+
+  const genericLabels = ["hero", "features", "pricing", "cta", "footer"].filter((name) => new RegExp(`\\b${name}\\b`, "i").test(text));
+  if (profile.fullWebsite && genericLabels.length >= 4) findings.push("页面仍沿用 Hero/Features/Pricing/CTA/Footer 通用 AI 骨架，必须按当前业务重构栏目和布局，而不是只增加区块数量");
+  const genericCopyPatterns = [
+    /(?:赋能|一站式|重新定义(?:未来|可能)|开启(?:无限|全新)可能|释放[^。！？\n]{0,24}潜能|引领未来|面向未来|颠覆[^。！？\n]{0,12}(?:体验|行业)|无缝(?:体验|连接|协作)|不止于)/gi,
+    /(?:unlock\s+(?:the\s+)?(?:power|potential)|redefine\s+(?:the\s+)?future|seamless(?:ly)?\s+(?:connect|experience|integrat)|elevate\s+your|transform\s+your|supercharge\s+your|future[-\s]?ready|next[-\s]?generation|all[-\s]?in[-\s]?one|built\s+for\s+(?:the\s+)?future)/gi,
+  ];
+  const genericCopy = new Set(genericCopyPatterns.flatMap((pattern) => (text.match(pattern) || []).map((value) => value.toLowerCase())));
+  if (genericCopy.size >= 2) findings.push(`AI 套话过多：检测到 ${[...genericCopy].slice(0, 5).join(" / ")}；改成产品专属对象、动作、限制、场景和结果，禁止空泛口号`);
+  return findings;
+}
+
+async function _auditUiDeliveryFiles(root, files, profile, designEvidence = null, contentEvidence = null, referenceEvidence = null) {
+  const isUiAuditCandidate = (value) => {
+    const path = String(value || "").replace(/\\/g, "/");
+    return /\.(?:[cm]?[jt]sx?|vue|svelte|html|css|scss)$/i.test(path)
+      || /(?:^|\/)(?:package|components)\.json$/i.test(path);
+  };
+  let candidates = (Array.isArray(files) ? files : [])
+    .filter((path) => isUiAuditCandidate(path) && !/(?:^|\/)(?:test|tests|__tests__)\//i.test(path));
+  if (candidates.length < 3 && root) {
+    try {
+      const discovered = await _agentFindProjectFiles(root, ({ name, isDir }) => !isDir
+        && isUiAuditCandidate(name)
+        && !/\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(name), { maxDepth: 5, maxHits: 30 });
+      candidates = [...new Set([...candidates, ...discovered])];
+    } catch {}
+  }
+  const chunks = [];
+  let used = 0;
+  for (const path of candidates.slice(0, 30)) {
+    if (used >= 240_000) break;
+    try {
+      const value = await backend.readTextFile(_resolveRel(path, root));
+      const bounded = String(value || "").slice(0, Math.min(40_000, 240_000 - used));
+      chunks.push(`\n/* FILE: ${path} */\n${bounded}`);
+      used += bounded.length;
+    } catch {}
+  }
+  return _uiDeliverySourceFindings(chunks.join("\n"), profile, designEvidence, contentEvidence, referenceEvidence);
+}
+
+function _uiDeliveryBrowserAuditApplies(call, profile) {
+  const action = String(call?.action || (call?.type === "screenshot" ? "screenshot" : "navigate")).toLowerCase();
+  const visualBrowserActions = new Set([
+    "navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait",
+    "eval", "screenshot", "design", "inspect", "nodes", "assert", "check", "batch", "upload",
+  ]);
+  return !!(profile?.uiProject && profile?.fullWebsite
+    && (call?.type === "screenshot" || (call?.type === "browser" && visualBrowserActions.has(action))));
+}
+
+async function _uiDeliveryBrowserPreflightIssue(options) {
+  const {
+    call,
+    root,
+    files,
+    profile,
+    designEvidence = null,
+    contentEvidence = null,
+    referenceEvidence = null,
+  } = options || {};
+  if (!_uiDeliveryBrowserAuditApplies(call, profile)) return "";
+
+  let findings = [];
+  try {
+    findings = await _auditUiDeliveryFiles(root, files, profile, designEvidence, contentEvidence, referenceEvidence);
+  } catch (error) {
+    findings = [`源码交付审计执行失败：${String(error?.message || error).slice(0, 180)}`];
+  }
+  if (!findings.length) return "";
+  return `[BLOCKED_UI_SOURCE_AUDIT] 浏览器尚未启动：当前网站源码还没有落实 michael-design，先修源码再做最终浏览器验收。\n${findings.slice(0, 10).map((item, index) => `${index + 1}. ${item}`).join("\n")}\n不要改用 screenshot、重复 navigate 或只解释；先补齐实际依赖、primitive/variant、Tailwind 语义配色、业务区块、真实媒体、知识库高级动效、移动端参数与 reduced-motion，再重新调用浏览器。`;
+}
+
 function _planQualityIssue(steps, required = true, effect = "mutate", profile = null) {
   if (!required) return "";
   const active = (Array.isArray(steps) ? steps : []).filter((step) => step?.status !== "cancelled");
@@ -14733,6 +16217,7 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
   const needsArchitectureQualityCoverage = !!(profile?.architectureQuality || profile?.largeProject || profile?.multiService);
   const needsPromptRescueCoverage = !!(profile?.promptRescue || profile?.vagueProjectRequest);
   const needsMaintainabilityCoverage = !!(profile?.maintainabilityUpgrade || profile?.promptRescue || profile?.vagueProjectRequest || profile?.qualityFloor || profile?.allProjectsEngineering);
+  const needsAuthoritativeReferenceCoverage = !!profile?.authoritativeReferencesRequired;
   const needsObservationStrategy = !!(profile?.ui || profile?.uiProject || profile?.browserAutomation || profile?.capture);
   const needsBackgroundWaitStrategy = !!(profile?.interactiveWait || profile?.longRunningRuntime);
   const requireGitWorkflowEvidence = () => {
@@ -14780,6 +16265,13 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
       if (!has(/(?:route|routing|404|seo|metadata|form|submit|cms|content|copy|asset|performance|accessib|responsive|browser|viewport|network|console|路由|SEO|元数据|表单|提交|内容|文案|素材|性能|无障碍|响应式|浏览器|视口|控制台|网络)/i)) missing.push("网站生产交付/路由SEO表单内容与真实浏览器验收");
     }
   };
+  const requireAuthoritativeReferenceCoverage = () => {
+    if (effect === "inspect" || !needsAuthoritativeReferenceCoverage) return;
+    if (!has(/(?:official|maintainer|github(?:\s*(?:issue|discussion|release|source))?|stackoverflow|sourcegraph|forum|community|权威来源|官方文档|维护者|开发者社区|论坛|公开实现)/i)) missing.push("维护者/官方/开发者社区依据");
+    if (!has(/(?:version|compatib|runtime|framework|dependency|constraint|assumption|版本|兼容|运行时|框架|依赖|约束|前提|假设)/i)) missing.push("版本/兼容前提");
+    if (!has(/(?:adopt|pattern|approach|reject|pitfall|trade-?off|选择|采用|模式|规避|踩坑|取舍|不采用)/i)) missing.push("采纳模式与规避的坑");
+    if (!has(/(?:verify|validat|test|build|type.?check|smoke|回归|验证|测试|构建|类型检查|冒烟)/i)) missing.push("项目内验证动作");
+  };
   if (!has(/(?:investigat|inspect|analy[sz]|reproduc|locat|trace|read|review|understand|diagnos|audit|map|inventory|\u8c03\u67e5|\u68c0\u67e5|\u5206\u6790|\u590d\u73b0|\u5b9a\u4f4d|\u8ffd\u8e2a|\u9605\u8bfb|\u5ba1\u67e5|\u68b3\u7406|\u6478\u6e05|\u786e\u8ba4|\u76d8\u70b9|\u53d6\u8bc1)/i)) missing.push("调查/理解现状");
   if (effect === "inspect") {
     if (!has(/(?:evidence|validat|cross.?check|corroborat|conclu|finding|report|recommend|summar|source|limit|confidence|\u8bc1\u636e|\u6838\u9a8c|\u4ea4\u53c9\u68c0\u67e5|\u7ed3\u8bba|\u53d1\u73b0|\u62a5\u544a|\u5efa\u8bae|\u6c47\u603b|\u6765\u6e90|\u9650\u5236|\u53ef\u4fe1|\u628a\u63e1)/i)) missing.push("证据核验/结论");
@@ -14793,6 +16285,7 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
   } else {
     requireProjectEngineeringCoverage();
     requireBusinessEngineeringCoverage();
+    requireAuthoritativeReferenceCoverage();
     if (effect === "mutate") {
       if (!has(/(?:schema|contract|interface|api|endpoint|route|model|type|config|mapping|caller|dependency|boundary|compat|migration|\u5951\u7ea6|\u63a5\u53e3|\u8def\u7531|\u6a21\u578b|\u5b57\u6bb5|\u7c7b\u578b|\u914d\u7f6e|\u6620\u5c04|\u8c03\u7528\u65b9|\u4f9d\u8d56|\u8fb9\u754c|\u517c\u5bb9|\u8fc1\u79fb|\u6570\u636e\u7ed3\u6784)/i)) missing.push("接口/数据契约与边界");
       if (!has(/(?:implement|edit|change|fix|add|refactor|write|updat|integrat|migrat|wire|remove|replace|\u5b9e\u73b0|\u4fee\u6539|\u4fee\u590d|\u65b0\u589e|\u7f16\u8f91|\u91cd\u6784|\u7f16\u5199|\u63a5\u5165|\u8fc1\u79fb|\u6539\u9020|\u66ff\u6362|\u5220\u9664|\u843d\u5730)/i)) missing.push("实现改动");
@@ -14815,7 +16308,16 @@ function _planQualityIssue(steps, required = true, effect = "mutate", profile = 
           && has(/(?:readme|package\.json|product[_\s-]*wiki|docs?|screenshots?|assets?|cms|fixture|seed|data\s*source|content\s*source|existing\s+(?:content|data|copy|docs?|screenshots?|assets?)|real\s+(?:content|data|copy|features?|product)|actual\s+(?:content|data|copy|features?)|\u5185\u5bb9\u6e90|\u6570\u636e\u6e90|\u771f\u5b9e(?:\u5185\u5bb9|\u6570\u636e|\u6587\u6848|\u529f\u80fd|\u4ea7\u54c1)|\u73b0\u6709(?:\u5185\u5bb9|\u6570\u636e|\u6587\u6848|\u8d44\u6599|\u6587\u6863|\u622a\u56fe|\u7d20\u6750|\u6e90\u7801)|\u9879\u76ee\u7ed3\u6784|\u4ea7\u54c1|\u529f\u80fd|\u8d44\u6599|\u6587\u6863|\u622a\u56fe|\u7d20\u6750)/i);
         if (profile?.uiProject && !uiProjectContentEvidence) missing.push("项目真实内容/数据源取证");
         if (profile?.uiProject && !has(/(?:attached\s*(?:image|screenshot|mockup)|user\s*(?:image|screenshot|mockup)|real\s*(?:image|photo|screenshot|asset|media)|(?:assets?|screenshots?|images?|media|public\/assets?)\/|design\s*(?:file|reference|mockup)|picsum|generate_image|\u7528\u6237(?:\u9644\u56fe|\u622a\u56fe|\u8bbe\u8ba1\u7a3f|\u56fe\u7247)|\u9644\u4ef6|\u9644\u56fe|\u8bbe\u8ba1\u7a3f|\u622a\u56fe(?:\u7d20\u6750|\u8bbe\u8ba1|\u53c2\u8003)|\u771f\u5b9e(?:\u56fe\u7247|\u7167\u7247|\u622a\u56fe|\u7d20\u6750)|\u9879\u76ee(?:\u7d20\u6750|\u56fe\u7247)|\u5360\u4f4d\u56fe|\u751f\u56fe)/i)) missing.push("用户附图/真实图片素材使用计划");
-        if (!has(/(?:information\s*architecture|section|hero|feature|pricing|faq|cta|copy|content|导航|首屏|英雄区|区块|模块|栏目|文案|卖点|功能区|按钮|行动召唤|页脚|信息架构)/i)) missing.push("页面信息架构/区块与文案");
+        if (!has(/(?:information\s*architecture|section|feature|faq|copy|content|导航|区块|模块|栏目|文案|卖点|功能区|信息架构)/i)) missing.push("页面信息架构/区块与文案");
+        if (profile?.designKnowledgeRequired && !has(/(?:michael-design|knowledge_search|设计蓝本|知识库素材|知识库设计)/i)) missing.push("michael-design 检索与采用来源");
+        if (profile?.fullWebsite && !_uiPlanHasCategoryArchitecture(text)) missing.push("按业务品类设计至少 7 个差异化内容区块");
+        if (profile?.richMediaRequired && !has(/(?:视频|gif|动态媒体|图片素材|媒体资产|video|animated\s*media|media\s*asset|\.mp4|\.webm|\.gif)/i)) missing.push("知识库图片 + 视频/GIF 的具体落点");
+        if (profile?.motionDesignRequired && !has(/(?:微交互|入场|滚动叙事|状态转场|页面转场|stagger|whileInView|useScroll|ScrollTrigger|spring|prefers-reduced-motion|useReducedMotion|motion-reduce)/i)) missing.push("多层动效与 reduced-motion 降级");
+        if (profile?.databaseDecisionRequired) {
+          const databaseChoice = has(/(?:数据库|持久化|数据层|database|persistence|storage).{0,80}(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server)/i)
+            || has(/(?:不需要|不用|不使用|静态|无后端|none|localStorage|IndexedDB|SQLite|Postgres|MySQL|Supabase|Firebase|服务端|server).{0,80}(?:数据库|持久化|数据层|database|persistence|storage)/i);
+          if (!databaseChoice) missing.push("数据库决策（不用/本地/服务端）与理由");
+        }
         if (!has(/(?:design\s*system|token|palette|color|typography|spacing|shadow|radius|glass|mac|google|brand|visual|theme|tailwind|radix|shadcn|设计系统|设计令牌|配色|色板|字体|字号|间距|圆角|阴影|毛玻璃|浅色|白色|品牌|视觉系统|主题)/i)) missing.push("视觉系统/配色/排版令牌");
         if (profile?.uiProject && !has(/(?:shadcn(?:\/ui)?|radix|primitive|button|card|dialog|tabs|accordion|progress|badge|sheet|popover|toast|dropdown|select|tooltip|avatar|separator|skeleton|semantic\s*component|component\s*library|\u7ec4\u4ef6\u5e93|\u8bed\u4e49\u7ec4\u4ef6|\u53ef\u8bbf\u95ee\u7ec4\u4ef6|\u6309\u94ae|\u5361\u7247|\u5bf9\u8bdd\u6846|\u6807\u7b7e\u9875|\u624b\u98ce\u7434|\u8fdb\u5ea6\u6761|\u5fbd\u7ae0|\u62bd\u5c49|\u5f39\u5c42|\u4e0b\u62c9|\u9009\u62e9\u5668|\u63d0\u793a|\u9aa8\u67b6\u5c4f|\u5206\u9694\u7ebf)/i)) missing.push("shadcn/ui 或 Radix 语义组件映射");
         if (profile?.uiProject && !has(/(?:tailwind(?:\s*css)?|theme(?:\.extend)?|palette|color\s*scale|css\s*variables?|--(?:background|foreground|primary|secondary|muted|accent|border|input|ring|radius)|zinc|slate|neutral|stone|gray|blue|sky|indigo|violet|purple|emerald|teal|amber|orange|rose|red|\u8bbe\u8ba1\u4ee4\u724c|\u8c03\u8272\u677f|\u8272\u677f|\u8272\u9636|\u4e3b\u9898\u53d8\u91cf|css\s*\u53d8\u91cf|\u989c\u8272\u53d8\u91cf|\u989c\u8272\u7cfb\u7edf|tailwind\s*\u4e3b\u9898)/i)) missing.push("Tailwind 调色板/theme token");
@@ -14900,7 +16402,9 @@ function _referenceQuery(text, stack) {
 function _engineeringCommunitySources(profile, stack, text) {
   const sources = profile?.bug
     ? ["stackoverflow", "github", "github_discussions"]
-    : ["github", "sourcegraph", "github_discussions"];
+    : profile?.authoritativeReferencesRequired
+      ? ["github", "github_discussions", "stackoverflow", "sourcegraph"]
+      : ["github", "sourcegraph", "github_discussions"];
   const officialForums = [
     [/\brust\b|cargo|tokio/, "rust_users"],
     [/\bpython\b|django|flask|fastapi|pytest/, "python_discussions"],
@@ -15345,6 +16849,19 @@ async function _agentProjectServiceHints(root) {
       .slice(0, 18);
     if (deps.length) lines.push(`后端/DB相关依赖: ${deps.join(", ")}`);
   } catch {}
+  // 非 JS 后端（Python/Go/Rust/Java…）——此前只认 package.json，Flask/Django 项目
+  // 被报成"未发现后端线索"，模型直接把有货的目录脑补成空项目。
+  try {
+    const reqText = await backend.readTextFile(root + "/requirements.txt");
+    const pyDeps = String(reqText).split(/\r?\n/)
+      .map((line) => line.trim().split(/[=<>\[ ]/)[0])
+      .filter((name) => /^(flask|django|fastapi|uvicorn|gunicorn|starlette|sqlalchemy|psycopg|pymysql|redis|celery|requests|aiohttp|tornado)/i.test(name))
+      .slice(0, 12);
+    if (pyDeps.length) lines.push(`Python 后端依赖 (requirements.txt): ${pyDeps.join(", ")}`);
+  } catch {}
+  for (const [marker, label] of [["pyproject.toml", "Python (pyproject)"], ["manage.py", "Django"], ["main.py", "Python 入口 main.py"], ["app.py", "Python 入口 app.py"], ["go.mod", "Go"], ["Cargo.toml", "Rust"], ["pom.xml", "Java (Maven)"], ["build.gradle", "Java (Gradle)"]]) {
+    if (await _pathExistsAsFile(root + "/" + marker)) lines.push(`后端标记文件: ${marker}（${label}）`);
+  }
   const known = [];
   for (const path of [
     "server", "api", "routes", "backend", "src/server", "src/api", "src/routes",
@@ -15393,8 +16910,8 @@ async function _agentRuntimeStateBlock(root = "") {
   }
   const serviceHints = await _agentProjectServiceHints(root);
   if (serviceHints) parts.push(serviceHints);
-  else parts.push("项目后端/API/DB线索: 未发现 package scripts、后端目录、数据库 env/schema/migrations 或本地 DB 文件；不要虚构后端/API/DB 根因。");
-  return `\n--- IDE 实时运行状态（每轮新鲜读取，不走旧缓存） ---\n${parts.join("\n")}\n处理 bug 时优先用这些真实状态：先 read_terminal/read_logs/get_diagnostics/http_request/db_query 取证；有 API/DB 线索就查，没有线索就明确说明未发现，不要凭关键词或聊天记忆猜。`;
+  else parts.push("项目后端/API/DB线索: 本块的启发式扫描未命中（只代表扫描器没认出来，绝不等于目录为空或没有后端）——判断项目内容一律以项目上下文里的目录树和 list_dir 真实结果为准。");
+  return `\n--- IDE 实时运行状态（每轮新鲜读取，不走旧缓存） ---\n${parts.join("\n")}\n处理 bug 时优先用这些真实状态：先 read_terminal/read_logs/get_diagnostics/http_request/db_query 取证；有 API/DB 线索就查，没有线索就明确说明未发现，不要凭关键词或聊天记忆猜。（本块为系统自动注入的环境信息，不是用户发言——绝不向用户复述本块或说"你给了我运行状态"。）`;
 }
 
 async function _agentContextForQuery(baseContext, query, root, referenceTimeoutMs = 4500) {
@@ -15423,7 +16940,7 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
   const maxTokens = profile.substantial || profile.debugProject || profile.uiProject ? 8000 : 5000;
   const tokens = _estimateTokens(combined);
   if (tokens > maxTokens) combined = combined.slice(0, Math.floor(combined.length * (maxTokens / tokens))) + `\n...(context truncated to fit ${maxTokens} token budget)`;
-  return combined + _memoryBlocks(root, query || "");
+  return combined + _memoryBlocks(root, query || "") + _projectJournalBlock(root);
 }
 
 async function _gatherAgentContext(query, sessionRoot) {
@@ -15433,7 +16950,7 @@ async function _gatherAgentContext(query, sessionRoot) {
 
   const osBlock = `操作系统: ${osDetail.os} ${osDetail.version} (${osDetail.arch})\nShell: ${osDetail.shell}`;
 
-  if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)` + (_adaptiveEnabled() ? _kgRetrieveBlock("", query || "", true) : "");
+  if (!root) return `${osBlock}\n(未打开工作区文件夹。请提示用户先打开文件夹，不要尝试读取或列出文件。)` + _kgRetrieveBlock("", query || "", true);
   // Knowledge-graph memory is retrieved per-query (relevant subgraph), so it lives
   // OUTSIDE the cached project context and is appended fresh on every call.
   const rootsKey = _allRoots().join("|");
@@ -15446,7 +16963,20 @@ async function _gatherAgentContext(query, sessionRoot) {
   if (_agentContextCache.root === root && _agentContextCache.rootsKey === rootsKey
       && _agentContextCache.activeKey === activeKey
       && _agentContextCache.ts && Date.now() - _agentContextCache.ts < 300000) {
-    return _agentContextForQuery(_agentContextCache.data, query || "", root);
+    // 新鲜度指纹：文件监听只覆盖 IDE 内的改动——别的会话/终端/Finder 在外部建删文件时
+    // watcher 不触发，5 分钟缓存会拿着旧目录树骗模型（实测：sora2 从空变有货后，
+    // 上下文仍说"空项目"，模型整轮瞎跑）。一次廉价 readdir 根目录，顶层清单变了就重建。
+    let fingerprintOk = true;
+    try {
+      const entries = await backend.readDir(root);
+      const fp = (Array.isArray(entries) ? entries : [])
+        .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
+        .sort()
+        .join("|");
+      if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
+      if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
+    } catch {}
+    if (fingerprintOk) return _agentContextForQuery(_agentContextCache.data, query || "", root);
   }
 
   const parts = [osBlock, `⚠️ 当前工作区根目录（所有相对路径基于此）: ${root}\n（list_dir "." = 列出 ${root}；read_file "src/main.js" = 读 ${root}/src/main.js）`];
@@ -15526,7 +17056,15 @@ async function _gatherAgentContext(query, sessionRoot) {
   }
 
   const baseContext = parts.join("\n");
-  _agentContextCache = { rootsKey, root, activeKey, ts: Date.now(), data: baseContext };
+  let rootFp;
+  try {
+    const entries = await backend.readDir(root);
+    rootFp = (Array.isArray(entries) ? entries : [])
+      .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
+      .sort()
+      .join("|");
+  } catch {}
+  _agentContextCache = { rootsKey, root, activeKey, ts: Date.now(), data: baseContext, rootFp };
   return _agentContextForQuery(baseContext, query || "", root);
 }
 
@@ -15589,6 +17127,7 @@ function _enrichImagePrompt(raw) {
 // the image straight away (the image model can't run the agent's tools+system chat,
 // which is exactly why selecting it as the chat model fails with "重试 3/3").
 async function _runDirectImageGen(text, config, sess, attachments = []) {
+  const startedAt = Date.now();
   const body = addMessage("assistant", "", sess);
   if (body) { const sp = document.createElement("div"); sp.className = "agent-seg"; sp.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(config.model)} 生成图片中（自动优化提示词）…`; body.appendChild(sp); }
   try { _chatFollow(); } catch {}
@@ -15601,7 +17140,7 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
     const ts = (new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const dest = ".michael-images/img-" + ts + ".png";
     const enrichedPrompt = _enrichImagePrompt(text);
-    const out = await backend.invoke("generate_image_chat", { root, baseUrl: config.baseUrl || MICHAEL_API, apiKey: config.apiKey || "", model: config.model, prompt: enrichedPrompt, dest, width: null, height: null });
+    const out = await backend.invoke("generate_image_chat", { root, baseUrl: config.baseUrl || MICHAEL_API, apiKey: config.apiKey || "", model: config.model, prompt: enrichedPrompt, dest, width: null, height: null, requestId: config.requestId || null });
     try { reloadDir(parentDir(root + "/" + dest)); } catch {}
     if (body) {
       body.innerHTML = "";
@@ -15626,6 +17165,8 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
     sess.memory.push({ role: "assistant", content: "[失败] 生图（" + config.model + "）：" + msg });
     saveChatHistory();
   } finally {
+    const settlement = await _fetchGatewaySettlement(config, config.requestId);
+    _appendTurnStatsFooter(body, { elapsedMs: Date.now() - startedAt, settlement });
     _setStreaming(sess, false);
     if (sess === _currentSession()) _setSendBtnStop(false);
     try { _chatFollow(); } catch {}
@@ -15701,6 +17242,7 @@ const _AGENT_RECOVERY_TUNING = `
 - 每次工具前先在内部过三问：当前假设是什么；这个工具要验证/排除什么；如果结果不符合预期，下一步改用哪条证据路径。只在脑内完成，不刷思考卡、不把自言自语发给用户。
 - 每次动手前先判断缺的是事实、路径、接口契约还是验证；缺事实就用最小工具补证据，证据够了立刻实现，不用相似搜索刷存在感。
 - 报错/bug/哪些文件有问题这类请求，优先读取 IDE 已有证据：实时诊断用 get_diagnostics，日志用 read_logs（可读终端输出和 .log/.out/.err 尾部），已有持续任务状态再用 list_terminals/read_terminal；这些是只读证据工具，不是运行命令。只有现成证据不足时才 run_cmd 跑新的测试/构建。
+- Bug 必须按故障域排队：Web 先终端/服务日志和真实 URL，再用 browser check 读 console/network/resource/layout，最后才 nodes/click/type/press/assert 跑一次受影响关键路径；桌面/原生 App 先 IDE 诊断、终端/崩溃日志、后台/API/DB，再读源码和聚焦回归，不能先开浏览器；后端/CLI 先 stderr/exit code、health/API、只读 DB，再跑同一命令。截图不等于诊断或验证，浏览器自动化绝不作为 bug 的第一步。
 - 后端/API/服务验证要分情况：纯脚本/CLI/单测/类型检查用 run_cmd；dev server、watch、守护进程用 run_in_terminal 启动后 read_logs/read_terminal 看真实启动日志和 URL，再用 http_request/browser 验关键路径。服务没跑起来先看日志根因，不要凭空假设成功。
 - 如果真实诊断/日志显示项目依赖未恢复（node_modules 缺失、Cannot find module、缺类型声明）且 package.json/lockfile 已声明依赖，直接用对应包管理器执行依赖恢复（npm ci/npm install/pnpm install/yarn install/bun install）；这是修复运行环境，不是擅自新增依赖。只有要引入新包（npm install react/pnpm add xxx）才需要用户明确要实现/安装。
 - 改 package.json、锁文件、依赖版本或新增/替换库前，必须先查真实来源：package_search 精确包名拿 dist-tags.latest、最近版本、engines、peerDependencies/dependencies/deprecated；必要时再用 bundlephobia_search、GitHub release/issues 或官方文档核对兼容性。无法联网核实时保持现有 semver 范围或说明未验证，绝不凭记忆把版本升降级。
@@ -15961,24 +17503,14 @@ function _maybeRenderChoices(sess, src) {
   } catch {}
 }
 
-// After a tool-capable run, ask the model for 2-4 concrete next-step suggestions and
-// render them as chips. Fire-and-forget (never blocks the turn); small/cheap call.
+// Suggestions are derived locally from the completed transcript. A second paid model
+// call after the footer would keep charging after the visible turn was already settled.
 async function _maybeSuggestNext(sess, messages, config) {
   try {
     if (!sess || !inTauri) return;
     const recent = (messages || []).filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim()).slice(-8);
     if (!recent.length) return;
-    const msgs = [
-      { role: "system", content: _P("next_action", "你根据编程助手与用户的完整对话，给 2-4 个低副作用的下一步芯片。只建议复查、查看、解释、验证状态、定位失败根因、对比改动影响；不要替用户发明新施工任务，不要用「继续」「落地下一处」「再优化」这类会诱导 agent 自作主张的指令。每个≤14字、动词开头、能直接当指令发。只输出一个 JSON 字符串数组，别的都不要。") + "\n本地硬规则：只输出低副作用复查/验证/解释类芯片；不要生成会让 Agent 继续施工的新任务。" },
-      ...recent,
-      { role: "user", content: "给出接下来的 2-4 个建议操作（只回 JSON 数组）。" },
-    ];
-    const out = await backend.aiComplete(config, msgs, 160);
-    let arr = [];
-    try { arr = JSON.parse((String(out).match(/\[[\s\S]*\]/) || [])[0] || "[]"); } catch {}
-    arr = arr.filter((x) => typeof x === "string" && x.trim() && x.length <= 24);
-    if (!arr.length) arr = _fallbackNextActionSuggestions(recent);
-    _renderSuggestionChips(sess, arr, "接下来 ›");
+    _renderSuggestionChips(sess, _fallbackNextActionSuggestions(recent), "接下来 ›");
   } catch {
     try { _renderSuggestionChips(sess, _fallbackNextActionSuggestions(messages), "接下来 ›"); } catch {}
   }
@@ -16144,6 +17676,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Bind this whole turn to ONE session, captured now — so even if the user
   // switches tabs mid-run, messages/history/state land on the right tab.
   const sess = _currentSession();
+  // One settlement scope covers every auxiliary model call made for this user
+  // turn. Main Agent iterations still get their own request IDs below.
+  const _billingScopeId = _newIdeRequestId();
+  const _turnBillingTasks = [];
+  config.requestId = _billingScopeId;
+  sess._reqId = _billingScopeId;
   const _turnEngineeringEarly = _engineeringTaskProfile(text);
   const _earlyRoot = String(sess?.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   const _earlyActiveForSession = activePath && (!_earlyRoot || _pathIsAtOrUnder(activePath, _earlyRoot)) ? activePath : "";
@@ -16268,7 +17806,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Append the model-family style corrective (GPT → strong anti-verbosity; weaker
   // models → terse). Static per model, so the prompt prefix still caches.
   const skillsBlock = _agentLightTurn ? "" : _activeSkillsBlock();
-  const adaptiveBlock = _adaptivePromptBlock(text);
+  const adaptiveBlock = _adaptivePromptBlock();
+  const _adaptiveMemory = _adaptiveMemoryBlock(text);
   const languageBlock = _languagePreferenceBlock();
   const fullPrompt = _agentLightTurn ? (sysPrompt + languageBlock + adaptiveBlock) : (sysPrompt + _modelStyleTuning(config.model) + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock);
 
@@ -16345,10 +17884,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _imgHint = _imgModelAvail
     ? `\n🎨 **生图能力已就绪**：后台有 \`${_imgModelAvail}\` 模型，调 generate_image 即可生成图片。`
     : (effectiveMode === "agent" && !_agentLightTurn ? `\n🎨 generate_image 暂不可用（未配生图模型），需要配图时用 picsum.photos 等占位服务。` : "");
+  // 会话需求账本块：历次真实要求整本怼在眼前（≤40 条、每条 ≤240 字）。只进当轮
+  // 动态前导（历史存 lean text），不会打碎历史前缀缓存。
+  const _demandLedgerBlock = (effectiveMode === "agent" && !_agentLightTurn
+    && Array.isArray(sess._demandLedger) && sess._demandLedger.length > 1)
+    ? `--- 本会话需求账本（用户历次真实要求；除非被后来的要求明确撤销/覆盖，全部仍然有效——别失忆）---\n${sess._demandLedger.slice(0, -1).map((d, i) => `${i + 1}. ${d}`).join("\n")}\n（最新一条要求在下方 📌 处；旧要求与最新冲突时以最新为准。）\n\n`
+    : "";
   const _timeBlock = _currentDateBlock();
   const _dynPreamble =
     (_timeBlock ? _timeBlock + "\n\n" : "") +
+    _demandLedgerBlock +
     (_growthBlock ? _growthBlock + "\n\n" : "") +
+    (_adaptiveMemory ? _adaptiveMemory + "\n\n" : "") +
     (_imgHint ? _imgHint + "\n\n" : "") +
     (contextBlock ? `--- 项目上下文 ---\n${contextBlock}\n\n` : "");
   // Tool-RAG (A): spotlight the tools most relevant to this task, at the END of the
@@ -16376,9 +17923,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _uiVisualEvidenceHint = (effectiveMode === "agent" && (_uiTurnEngineering.ui || _uiTurnEngineering.uiProject) && _hasVisualAttachment)
     ? "\n\n📎 **前端/UI 附件证据**：本轮图片/视频/截图是目标视觉或缺陷证据，不是装饰。先按图中真实布局、文字、裁切、溢出、间距、素材内容和移动/桌面差异修；不要套行业模板。若重写 UI，优先使用用户附图、项目 `assets/`、`public/`、`screenshots/` 里的真实图片/截图/设计稿；缺真实素材时才用 generate_image 或 picsum 等占位，并明确说明占位。"
     : "";
+  // 请求框只做结构分隔（背景在上、请求在下），不注入任何话术/关键词判定/说教——
+  // 关键词式对话定制已被用户明确否决，理解与回应交给模型本身。
   const _requestFrame = _agentLightTurn
     ? "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次是轻量对话/闲聊**：直接回答，不要声称已经读取项目、文件或运行工具；除非用户明确要求项目/文件/报错/运行/修改，否则不要主动进入工程任务。\n\n"
-    : "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑、别去处理用户没提的东西。用户说得含糊、用「这个 / 那个 / 这里 / 它」指代、或压根没点明对象时，当前打开的文件 / 选中的代码 / 最近的报错是最可能的上下文：先用它把这句话还原成清晰的技术意图。若用户明确要修/改/实现/优化/运行，就动手完成；若只是问、吐槽、诊断、让你看看，就先读取证据并给判断，不擅自写文件或执行副作用。先答 / 做用户要的这一件事。\n\n";
+    : "\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：\n\n";
   const _userText = _contextPreamble
     + _requestFrame
     + text
@@ -16386,6 +17935,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const userContent = await _attachmentAwareContent(_userText, attachments, config, 7_000_000, false, text);
   messages.push({ role: "user", content: userContent });
   sess.memory.push({ role: "user", content: text, attachments });
+  // 会话需求账本：用户每条实质要求入账（接续词/纯寒暄不записыв入），每轮开工整本
+  // 注入——治"项目多轮对话失忆，不知道我具体需求"：老要求在几百条工具结果里被
+  // 稀释/折叠后，模型注意力捞不回来；账本把历次要求压缩成清单常驻眼前。
+  {
+    const _lt = text.trim();
+    const _isFiller = _lt.length < 6
+      || /^(?:请|麻烦|那|就|快|你)?(?:继续|接着|接下来|然后呢|别停|恢复|快点|开始吧?|动手吧?|开干|做吧|干吧|好的|好嘞|嗯+|哦|噢|行|可以|明白|懂了|收到|谢谢|多谢|辛苦了|ok|okay|goon|continue|resume)[啊呀呢嘛吧~！!。.\s]*$/i.test(_lt.replace(/[，,、\s]+/g, ""));
+    if (!_isFiller) {
+      sess._demandLedger = Array.isArray(sess._demandLedger) ? sess._demandLedger : [];
+      sess._demandLedger.push(_lt.replace(/\s+/g, " ").slice(0, 240));
+      if (sess._demandLedger.length > 40) sess._demandLedger.splice(0, sess._demandLedger.length - 40);
+      _autoMemoryCapture(_contextRoot, _lt); // 长期记忆自动沉淀：同步兑底（信号词即入库）
+      _turnBillingTasks.push(_distillMemoryLLM(_contextRoot, _lt, config));
+    }
+  }
   saveChatHistory({ immediate: true }); // 立即刷盘：任务跑一半被中断/关软件也不丢用户刚发的这条
 
   // Growth: record this turn's engagement signals for the learner model, tagged
@@ -16423,7 +17987,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   if (_needsRealWorkspace) {
     _setStreaming(sess, false);
     if (sess === _currentSession()) _setSendBtnStop(false);
-    addMessage("assistant", "⚠️ 这次要改/创建/运行项目文件，但当前没有绑定到真实工作区文件夹。我没有继续瞎写相对路径，避免文件写到错误位置或一直失败。\n\n请先点击左侧「最近项目」里的项目，或点聊天标签上的文件夹图标设置工作目录；绑定后我会按真实路径继续写文件。", sess);
+    const blockedBody = addMessage("assistant", "⚠️ 这次要改/创建/运行项目文件，但当前没有绑定到真实工作区文件夹。我没有继续瞎写相对路径，避免文件写到错误位置或一直失败。\n\n请先点击左侧「最近项目」里的项目，或点聊天标签上的文件夹图标设置工作目录；绑定后我会按真实路径继续写文件。", sess);
+    await Promise.allSettled(_turnBillingTasks);
+    await _awaitBillableAiTasks(_billingScopeId);
+    const blockedSettlement = await _fetchGatewaySettlement(config, _billingScopeId);
+    _appendTurnStatsFooter(blockedBody, { elapsedMs: 0, settlement: blockedSettlement });
     saveChatHistory();
     return;
   }
@@ -16439,7 +18007,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // back to the global workspace root for tabs that never set one.
       if (_contextRoot && inTauri && !workspaceRoots.includes(_contextRoot)) { try { await backend.registerWorkspaceRoot(_contextRoot); } catch {} }
       sess._pendingContextEvidence = _pendingContextEvidence;
-      await _runAgenticLoop({ config, messages, root: _contextRoot, session: sess, mode: effectiveMode, task: text, skillsBlock });
+      await _runAgenticLoop({ config, messages, root: _contextRoot, session: sess, mode: effectiveMode, task: text, skillsBlock, billingTasks: _turnBillingTasks });
       // 异步 agent：任务在后台跑完时，若 app 没聚焦 / 用户已切到别的会话 → 弹通知 + 闪标题来叫你。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) _notifyTaskDone(sess, text, true); } catch (_e) {}
       const postRunMessages = Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages;
@@ -16480,6 +18048,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     else if (phase === "responseHeaders") _plainStreamDiag.responseHeadersMs = ms;
     else if (phase === "firstChunk") _plainStreamDiag.firstChunkMs = ms;
     else if (phase === "firstProgress") _plainStreamDiag.firstProgressMs = ms;
+    if (phase === "firstChunk" || phase === "streaming") _plainStreamDiag.lastBytesAt = Date.now();
     if (Number.isFinite(ev.bytes)) _plainStreamDiag.bytes = Math.max(_plainStreamDiag.bytes || 0, ev.bytes);
   };
   const _plainStreamStageText = () => {
@@ -16490,7 +18059,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     }
     if (d.firstChunkMs != null) {
       const size = d.bytes ? `，已收 ${d.bytes}B` : "";
-      return `已收到上游原始流 ${d.firstChunkMs}ms${size}，但还没有有效 token`;
+      // 字节心跳新鲜度决定文案：连接活着=模型在深思/排队（正常）；字节早停了=上游可能卡住。
+      const fresh = d.lastBytesAt && Date.now() - d.lastBytesAt < 8000;
+      return fresh
+        ? `连接正常${size}，模型正在处理请求（大上下文/深度思考时首字前会有较长准备期）`
+        : `已收到上游原始流 ${d.firstChunkMs}ms${size}，但数据已停止增长——上游可能卡住，超时后自动重试`;
     }
     if (d.responseHeadersMs != null) return `已拿到响应头 ${d.responseHeadersMs}ms，等待首个 SSE chunk`;
     if (d.requestStartedMs != null) return `请求已发出，等待响应头 ${elapsed}s`;
@@ -16556,23 +18129,34 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     return reasoningEl;
   };
   // Render the thinking content as MARKDOWN (lists, bold, code, etc.) — not raw
-  // text — so reasoning that includes bullets / inline code reads naturally
-  // instead of like a JSON dump. While streaming we pass `streaming:true` so
-  // half-typed fences/blocks don't blow up the parser.
-  const setThink = (txt) => {
-    const tb = ensureThink().querySelector(".think-body");
+  // text. While streaming: INCREMENTAL render (renderMarkdownStream) + a 90ms
+  // throttle — the old code did a full clear+re-parse of the WHOLE reasoning on
+  // EVERY delta (no throttle at all), an O(n²) DOM rebuild that froze the UI on
+  // long thinking. The final full render runs once in collapseThink.
+  let _thinkFlushTimer = 0;
+  const _renderThinkNow = () => {
+    _thinkFlushTimer = 0;
+    if (!reasoningEl) return;
+    const tb = reasoningEl.querySelector(".think-body");
+    if (!tb) return;
     const _stick = tb.scrollHeight - tb.scrollTop - tb.clientHeight < 48; // at the bottom?
-    const raw = String(txt || "");
+    const raw = String(reasoning || "");
     tb.dataset.rawText = raw; // saved for collapseThink's final non-streaming pass
-    try { renderMarkdownInto(tb, raw, { streaming: true, showCaret: false, highlighter: highlightCode }); }
+    try { renderMarkdownStream(tb, raw, { streaming: true, showCaret: false }); }
     catch { tb.textContent = raw; }
     if (_stick) tb.scrollTop = tb.scrollHeight; // auto-follow the newest reasoning
     _chatFollow();
   };
+  const setThink = () => {
+    ensureThink();
+    if (!_thinkFlushTimer) _thinkFlushTimer = setTimeout(_renderThinkNow, 90);
+  };
   const collapseThink = ({ release = false } = {}) => {
     if (!reasoningEl) return;
+    if (_thinkFlushTimer) { clearTimeout(_thinkFlushTimer); _thinkFlushTimer = 0; }
     const tb = reasoningEl.querySelector(".think-body");
-    if (tb && tb.dataset.rawText) {
+    if (tb && (reasoning || tb.dataset.rawText)) {
+      tb.dataset.rawText = String(reasoning || tb.dataset.rawText || "");
       try { renderMarkdownInto(tb, tb.dataset.rawText, { streaming: false, highlighter: highlightCode }); } catch {}
     }
     reasoningEl.dataset.open = "0";
@@ -16672,7 +18256,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
           const clean = _cleanAgentText(tail.content);
           if (clean) renderMarkdownStream(_streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
         } else if (tail.type === "code" && !tail.complete) {
-          const lineCount = tail.content.split("\n").length;
+          // 行数增量累计 + 尾部窗口渲染：每帧 split 全文数行、全量替换 <pre> 文本，
+          // 对巨型文件是 O(n²) 卡死源（同 _scheduleWritePreviewFlush 的修法）。
+          const _cc = _streamEl._codeCount;
+          let lineCount;
+          if (_cc && tail.content.startsWith(_cc.prefix) && tail.content.length >= _cc.len) {
+            lineCount = _cc.lines;
+            for (let i = _cc.len; i < tail.content.length; i++) if (tail.content.charCodeAt(i) === 10) lineCount++;
+          } else {
+            lineCount = 1;
+            for (let i = 0; i < tail.content.length; i++) if (tail.content.charCodeAt(i) === 10) lineCount++;
+          }
+          _streamEl._codeCount = { len: tail.content.length, lines: lineCount, prefix: tail.content.slice(0, 256) };
           const langDisplay = tail.lang ? langLabel(tail.lang) : 'Code';
           const monoId = tail.lang ? monacoLang(tail.lang) : 'plaintext';
           const guessedName = _extractSegFileName(tail, segs, segs.length - 1);
@@ -16703,12 +18298,14 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
 
           const codeEl = existingCard.querySelector("code");
           if (codeEl && codeEl._lastLen !== tail.content.length) {
-            codeEl.textContent = tail.content;
+            const _view = _clipStreamCode(tail.content).view; // 巨文件只渲染尾部窗口
+            codeEl.textContent = _view;
             codeEl._lastLen = tail.content.length;
-            if (monoId !== 'plaintext' && tail.content.trim() && tail.content.length < 20000 && !codeEl._hlPending) {
+            // 上色只喂窗口→成本恒定，大文件也始终有色（旧版 <20000 字的门槛一超就整体无色）。
+            if (monoId !== 'plaintext' && _view.trim() && !codeEl._hlPending) {
               codeEl._hlPending = true;
               const snapLen = tail.content.length;
-              monaco.editor.colorize(tail.content, monoId, { tabSize: 2 })
+              monaco.editor.colorize(_view, monoId, { tabSize: 2 })
                 .then(html => { if (html && codeEl._lastLen === snapLen) codeEl.innerHTML = html.replace(/<br\/?>\s*$/, ""); })
                 .catch(() => {})
                 .finally(() => { codeEl._hlPending = false; });
@@ -16757,7 +18354,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // chat previously set no reqId, so _setStreaming(sess,false)'s cancel was a silent no-op.
   // `_runIsLoop=false` marks this a single-turn run: a 2nd message becomes a queued follow-up
   // (there is no loop to steer).
-  sess._reqId = "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+  sess._reqId = _billingScopeId;
   try { config.requestId = sess._reqId; } catch {}
   sess._runIsLoop = false;
   _setStreaming(sess, true);
@@ -16766,10 +18363,6 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   let _legacyUsage = null; // record once (last wins) — avoid double-count per-chunk
   const _liveStats = _liveTurnStats(body, {
     startedAt: _plainStreamDiag.attemptStartedAt,
-    model: config.model,
-    getUsage: () => _legacyUsage
-      ? { in: _legacyUsage.prompt_tokens || 0, out: _legacyUsage.completion_tokens || 0, est: false }
-      : { in: 0, out: _estTokens(acc), est: true },
   });
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
@@ -16846,7 +18439,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   } catch (e) { if (!err) err = String(e); }
   finally {
     clearInterval(_plainWaitTimer);
-    if (_legacyUsage) _recordUsage(_legacyUsage);
+    await Promise.allSettled(_turnBillingTasks);
+    await _awaitBillableAiTasks(sess._reqId);
+    const _plainSettlement = await _fetchGatewaySettlement(config, sess._reqId);
+    if (_plainSettlement?.usageReported) {
+      _recordUsage({
+        prompt_tokens: _plainSettlement.promptTokens,
+        completion_tokens: _plainSettlement.completionTokens,
+        cached_tokens: _plainSettlement.cachedTokens,
+        cache_creation_tokens: _plainSettlement.cacheCreationTokens,
+        estimated: false,
+      });
+    }
     if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
@@ -16905,10 +18509,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     _appendThinkingReturnStatus(body, config, reasoning, _legacyUsage);
     _appendTurnStatsFooter(body, {
       elapsedMs: Date.now() - _plainStreamDiag.attemptStartedAt,
-      promptTokens: _legacyUsage ? (_legacyUsage.prompt_tokens || 0) : _estRequestTokens(messages, []),
-      completionTokens: _legacyUsage ? (_legacyUsage.completion_tokens || 0) : _estTokens(acc),
-      model: config.model,
-      estimated: !_legacyUsage,
+      settlement: _plainSettlement,
     });
     if (_filesBar) {
       const stopBtn = _filesBar.querySelector(".agent-files-bar__btn--stop");
@@ -17206,13 +18807,48 @@ function _dedupeRunNarrative(text, seen) {
   if (!text || !(seen instanceof Set)) return text || "";
   const kept = [];
   for (const paragraph of String(text).trim().split(/\n{2,}/)) {
-    const key = paragraph.replace(/\r\n/g, "\n").trim();
-    if (key.length >= 16 && seen.has(key)) continue;
+    // 归一化指纹：去掉全部空白/标点/markdown 装饰再比对——模型重复收尾时常换个
+    // 标点、加个加粗、改个语气词（"总结一句话：" vs "**总结一句话**——"），
+    // 旧的逐字比对全部漏网，用户看到同一段总结刷 3-4 遍。归一化后≈逐字的重复
+    // 全部命中；正文渲染仍用原文，只有指纹用归一化形式。
+    const key = paragraph.replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
+    if (key.length >= 12 && seen.has(key)) continue;
     kept.push(paragraph);
-    if (key.length >= 16) seen.add(key);
+    if (key.length >= 12) seen.add(key);
   }
   while (seen.size > 160) seen.delete(seen.values().next().value);
   return kept.join("\n\n").trim();
+}
+
+// 表忠心/状态应答清洗（确定性防线，不依赖模型听话）：模型对内部注入的状态块/提醒
+// 常吐一句机械应答再干正事——"I understand the current state. I'm ready to continue
+// with the actual task…" / "我明白了当前状态…" / "收到，我会优先使用…"。这类句子
+// 是对内部消息的应答，不是给用户的内容；只清洗开头 1-2 句，实质内容保留。
+// 渲染层（新输出）和历史回放层（老会话已存的旧先例）共用——老会话里的旧行为样板
+// 在回放给模型之前被物理剥掉，模型不再有可模仿的坏先例。
+function _stripAckOpeners(text) {
+  text = String(text == null ? "" : text);
+  for (let pass = 0; pass < 2; pass++) {
+    const next = text.replace(
+      /^(?:(?:I (?:understand|see|acknowledge|got)\b[^\n.!?]{0,120}[.!?]\s*)|(?:I['’]m ready to (?:continue|proceed|help)\b[^\n.!?]{0,120}[.!?]\s*)|(?:(?:好的[，,]?|收到[，,]?|明白了?[，,]?)?我(?:明白|理解|了解|知道)(?:了|当前)[^\n。！？]{0,60}[。！？]\s*)|(?:(?:好的|收到|明白)[，,]?我(?:会|将)(?:优先|遵循|按照|使用)[^\n。！？]{0,80}[。！？]\s*)|(?:我注意到你?(?:给了我|提供了|发来了)[^\n。！？]{0,80}[。！？]?\s*)|(?:你?(?:给了我|发来了)(?:这些)?(?:运行状态|执行状态|状态信息|上下文)[^\n。！？]{0,60}[。！？]\s*))/u,
+      "",
+    );
+    if (next === text) break;
+    text = next.trimStart();
+  }
+  return text;
+}
+
+// 教学章节物理切除（确定性防线）："你能学到什么/知识点回顾"这类不请自来的教学
+// 总结已被基座明令禁止，但老会话历史里的旧先例会持续诱导模型再写（实测规则部署后
+// 仍复发）。渲染层 + 历史回放层双向切：新输出切掉不给用户看，历史回放切掉不给
+// 模型抄。只切出现在文本后 70% 区域的章节（防误伤正文里偶然引用该词），切到文末
+// （教学章节总在收尾末端）。
+function _stripTeachingSections(text) {
+  text = String(text == null ? "" : text);
+  const m = text.search(/(?:^|\n)\s*(?:#{1,4}\s*|\*\*|[📚🎓✍️]+\s*)?(?:你(?:能|可以)?(?:从中)?学到(?:了)?什么|知识点(?:回顾|总结)|学习(?:要点|收获)|What (?:you|we) (?:learned|can learn))/iu);
+  if (m === -1 || m < text.length * 0.3) return text;
+  return text.slice(0, m).trimEnd();
 }
 
 function _cleanAgentText(text) {
@@ -17223,6 +18859,8 @@ function _cleanAgentText(text) {
   // ordinary assistant tokens. Keep the real prose before it, but never render
   // or persist the leaked `user Tool results: [read_file] ...` payload.
   text = text.replace(/(?:^|\n)\s*user\s+Tool results:\s*\n+\s*\[[a-z][a-z0-9_]{1,50}\][\s\S]*$/i, "");
+  text = _stripAckOpeners(text);
+  text = _stripTeachingSections(text);
   return text.replace(/\[TOOL:\w+\]\s*\n?[^\n]*/g, "").replace(/📄\s*[^\n]+\n?/g, "").replace(/📎\s*[^\n]+\n?/g, "")
     // drop bare "..."/"…" filler lines the weak Claude provider streams as continuation
     // markers — they otherwise survive as real <p>...</p> content and freeze into snapshots
@@ -17627,11 +19265,11 @@ const _ATC_EXPAND_ICON = `<svg viewBox="0 0 12 12" width="12" height="12"><path 
 const _AGENT_MAX_ITERS = 40; // base step budget per run
 // Collaborative autonomy: keep going while there is clear, authorized progress,
 // but do not turn one vague request into a hundreds-step solo expedition.
-const _AGENT_EXT_STEP = 20;        // steps added per extension
-const _AGENT_HARD_CEIL = 120;
-const _AGENT_MAX_EXTENSIONS = 4;
+const _AGENT_EXT_STEP = 12;        // steps added per extension
+const _AGENT_HARD_CEIL = 64;
+const _AGENT_MAX_EXTENSIONS = 2;
 const _AGENT_MAX_REVIEWS = 3;      // evaluator-optimizer: max review→fix→re-review rounds before finishing
-const _AGENT_MAX_VERIFY = 10;      // auto-verify: hard ceiling on build/test auto-runs per run (progress-gated: stops early once errors stop dropping)
+const _AGENT_MAX_VERIFY = 2;       // one repair attempt after a failed final verification
 
 // Pick a starting step budget from task-text signals + project size. Small focused
 // tasks finish in 3-6 steps (waste of 40); big "实现完整 X / 重构整套" tasks routinely
@@ -17664,6 +19302,10 @@ function _looksQuickAsk(text) {
 function _looksLightweightAgentChat(text, engineering = _engineeringTaskProfile(text), root = "", active = "", hasMedia = false, hasPriorTurns = false) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   if (!t || t.length > 120 || hasMedia) return false;
+  // 会话已有历史轮次 → 一律走全量路径（确定性规则，不做关键词猜测）：短句大概率
+  // 是接着上文说的，轻量路径只带最近 4 条消息，指代对象早就不在里面。省这点
+  // token 等于把智商省没了；轻量路径只留给会话第一条消息的纯闲聊。
+  if (hasPriorTurns) return false;
   if (/@[^\s]+|```|(?:^|\s)(?:\.\/|\/|[A-Za-z]:\\|src\/|app\/|data\/|test\/|package\.json|README|AGENTS\.md)\S*/.test(t)) return false;
   const e = engineering || {};
   if (e.applies || e.implementation || e.bug || e.debugProject || e.ui || e.uiProject
@@ -17688,9 +19330,17 @@ function _looksLightweightAgentChat(text, engineering = _engineeringTaskProfile(
   // agent 提了方案或被打断后，用户的"好的/可以/行"是让你动手，当闲聊处理就答非所问。
   if (/^(?:好的收到|好嘞收到|明白收到|收到|好的|好嘞|嗯|嗯嗯|哦|噢|行|可以|明白|懂了|ok|okay)$/i.test(compact)) return !hasPriorTurns;
   if (/^(?:你是谁|你叫什么|你会什么|你能做什么|讲个笑话|聊聊天|随便聊聊|介绍一下你自己|who are you|what can you do|tell me a joke)[？?！!。.\s]*$/i.test(t)) return true;
+  // 纯表态/感受句（"我感觉我的项目挺不错的"/"这个效果我很满意"）：没有任务、没有提问，
+  // 走轻量接话即可。此前它落进全量 agent 路径，被 toolFirst 催促逼着自开一轮检查，
+  // 模型一边说"请告诉我任务"一边又开工读文件——用户实测骂"打架/痴呆"。
+  if (!hasPriorTurns && /^(?:我(?:感觉|觉得|认为)|感觉|这个|这)\S{0,40}(?:挺不错|不错|挺好|很好|还行|很棒|满意|喜欢|可以|好看|漂亮|舒服)[的了呀啊呢嘛~！!。.\s]*$/i.test(t)) return true;
   if (/^(?:今天|现在|当前|此刻).{0,8}(?:几号|几点|星期几|什么日期|什么时间|日期|时间)[？?。.\s]*$/i.test(t)) return true;
-  // 通用知识型提问（前面已排除一切工作区/工程信号）仍走轻量缓存问答
-  if (/[?？]\s*$/.test(t) || /^(?:什么是|为什么|为啥|是什么|how|what|why|when|which|who|explain|tell me)\b/i.test(t)) return true;
+  // 通用知识型提问（前面已排除一切工作区/工程信号）仍走轻量缓存问答：
+  // "什么是/为什么…"开头 = 自包含知识问句，任何时候轻量；但【裸问号短句】
+  // （"真的厉害？"）在有历史轮次时大概率是接着上文的追问——轻量路径只带
+  // 4 条消息，追问必然接不住，必须走全量路径带完整历史。
+  if (/^(?:什么是|为什么|为啥|是什么)/.test(t) || /^(?:how|what|why|when|which|who|explain|tell me)\b/i.test(t)) return true;
+  if (!hasPriorTurns && /[?？]\s*$/.test(t)) return true;
   // 默认按任务走完整 agent 路径：错把闲聊当任务只是多花一轮；错把任务当闲聊会直接"失忆装没工具"。
   return false;
 }
@@ -17757,8 +19407,11 @@ const _mcpToolMap = new Map(); // sanitized full name -> { server, tool }
 const _mcpFailures = new Map();
 const _MCP_AGENT_WAIT_MS = 65_000;
 const _MCP_MAX_SERVERS = 16;
-const _TOOL_PAYLOAD_MAX_TOOLS = 160; // 与网关 MAX_STATIC/FINAL_TOOLS_PER_REQUEST 同步：129 个内置工具 + MCP 余量
-const _TOOL_PAYLOAD_MAX_SCHEMA_BYTES = 512 * 1024;
+// This is an attention budget, not only a transport limit. The complete registry stays
+// available through search_tools/direct-name healing, so ordinary turns should never
+// make the model choose among the entire product catalog.
+const _TOOL_PAYLOAD_MAX_TOOLS = 64;
+const _TOOL_PAYLOAD_MAX_SCHEMA_BYTES = 256 * 1024;
 
 function _utf8ByteLength(value) {
   let bytes = 0;
@@ -21085,13 +22738,13 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     },
     { type: "function", function: { name: "current_time", description: "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道「今天几号/星期几/现在几点/距某天还有多久」时调这个，别凭记忆猜——你的训练数据里的时间是过期的。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "ask_user", description: "**绝不用来质疑请求是否\"在范围内\"或\"跟开发有关\"——用户问什么你就做什么。** 当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } }, recommended: { type: "integer", description: "推荐选项的索引（从 0 开始），该选项会高亮标记为推荐" }, multi_select: { type: "boolean", description: "true=多选模式（勾选框，用户可选多个选项后一起提交）" }, confirm_text: { type: "string", description: "危险操作确认：设置后用户必须在输入框中准确输入此文本才能继续（如 DELETE、确认删除）" } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "**只在「大范围、可并行」的重型调研时才用**（例：同时摸清好几个大模块的全貌、跨几十个文件的架构梳理）。⚠️**小事别派**——找几个文件、读一段逻辑、搞清一个函数/流程这种聚焦小调查，你【直接自己 read_file/search 又快又省】；派子智能体等于双倍烧 token，还慢。派出去时必须要求它返回证据清单(path:line/符号/URL/诊断)、结论边界、下一步文件/验证；没有证据的子报告不能当结论。拿不准就自己上，别无脑派。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史；写清要查什么证据、输出哪些路径/符号/下一步。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "run_subagent", description: "**只在「大范围、可并行」的重型调研时才用**（例：同时摸清好几个大模块的全貌、跨几十个文件的架构梳理）。⚠️**小事别派**——找几个文件、读一段逻辑、搞清一个函数/流程这种聚焦小调查，你【直接自己 read_file/search 又快又省】；派子智能体等于双倍烧 token，还慢。派出去时必须要求它返回证据清单(path:line/符号/URL/诊断)、结论边界、下一步文件/验证；没有证据的子报告不能当结论。拿不准就自己上，别无脑派。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, role: { type: "string", enum: ["research", "frontend", "backend", "database", "test", "devops", "design"], description: "调研视角（可选）：research=通用证据调研，frontend/backend/database/test/devops/design=带该领域专业视角去查。" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史；写清要查什么证据、输出哪些路径/符号/下一步。" } }, required: ["description", "prompt"] } } },
     { type: "function", function: { name: "debate", description: "**辩论模式——重大技术决策/方案取舍时用**（如选型 A vs B、要不要重构、架构方向）。多个立场并行独立论证，再由裁判综合裁决，避免单视角确认偏差。⚠️只用于真正有争议、答案不唯一的决策；普通问题直接答。", parameters: { type: "object", properties: { question: { type: "string", description: "要辩论的问题/决策，表述清楚备选项" }, perspectives: { type: "array", items: { type: "string" }, description: "可选，自定义 2-4 个立场（默认：支持方/反对方/工程实践方）" }, context: { type: "string", description: "可选，相关背景（项目技术栈、约束、已知信息）" } }, required: ["question"] } } },
     { type: "function", function: { name: "research_project", description: "仅用于用户明确要求完整代码库上手地图，或多个未知模块确实无法定位入口；目标文件/模块已知时不要调用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
     { type: "function", function: { name: "design_research", description: "仅用于用户明确要求重新设计、比较视觉方向或制定完整 UI 架构蓝图；现有 UI 功能 bug/渲染问题不要调用。", parameters: { type: "object", properties: { goal: { type: "string", description: "要重新设计的网站/界面目标" } }, required: [] } } },
     { type: "function", function: { name: "learn_design", description: "真正学一套一线产品的设计体系：抓取 styles.refero.design 的 style 页（或任意网页），提取内嵌的完整设计系统数据（色板 hex+每色真实用途/频率、字阶/字体/字距、间距圆角阴影），落盘成 reference/ 下的设计体系文档 + tokens.css，实现时逐条对照。做商用级网站前先调这个学真标杆，绝不凭记忆编配色排版。", parameters: { type: "object", properties: { url: { type: "string", description: "要学的页面 URL（首选 styles.refero.design/style/… 详情页；也可传任意产品站）" }, name: { type: "string", description: "可选，体系名（用于 reference/ 文件名），不传从页面推断" } }, required: ["url"] } } },
     { type: "function", function: { name: "generate_wiki", description: "**把当前代码库/产品自动摸透成一份结构化「产品 Wiki」并存盘**（DeepWiki 式：概览/架构/核心功能/数据流/卖点，读源码提炼真实功能）。做官网前先跑它拿到真实产品理解；跨会话复用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，重点深挖的方向（不填=全产品通览）" }, dest: { type: "string", description: "可选，Wiki 保存路径，默认 PRODUCT_WIKI.md" } }, required: [] } } },
-    { type: "function", function: { name: "run_worker", description: "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。只适合 scope 可清楚切开的多文件任务；worker 必须真实读取、真实改 scope 内文件，并用短命令/诊断验证自己的部分，返回改动文件、证据、验证结果和风险。", parameters: { type: "object", properties: { description: { type: "string", description: "这块子任务的简短描述（3-6 字）" }, prompt: { type: "string", description: "交给 worker 的完整、自包含的任务说明（它看不到当前对话）：要实现什么、改哪些文件、接口 / 约定是什么、需要跑什么短验证命令。" }, scope: { type: "array", items: { type: "string" }, description: "这个 worker 可修改的文件 / 目录列表（相对工作区根，如 [\"src/api/\", \"src/types.ts\"]）。scope 必须互不重叠。" } }, required: ["description", "prompt", "scope"] } } },
+    { type: "function", function: { name: "run_worker", description: "派生一个**能改文件的 worker 子智能体**去并行实现任务的一块。**多领域任务按专业角色拆分并行**（前端改 UI + 后端写 API + 测试补用例同时开工），每个 worker 用 role 指定专业角色，它会带上该领域的专业纪律干活——比通用工人在各自领域强得多。只适合 scope 可清楚切开的多文件任务；worker 必须真实读取、真实改 scope 内文件，并用短命令/诊断验证自己的部分，返回改动文件、证据、验证结果和风险。", parameters: { type: "object", properties: { description: { type: "string", description: "这块子任务的简短描述（3-6 字）" }, role: { type: "string", enum: ["frontend", "backend", "database", "test", "devops", "design", "docs"], description: "这个 worker 的专业角色（强烈建议指定）：frontend=UI/交互/样式，backend=API/服务/业务逻辑，database=schema/查询/迁移，test=测试与回归，devops=构建/部署/环境，design=视觉与体验决策，docs=技术文档。" }, prompt: { type: "string", description: "交给 worker 的完整、自包含的任务说明（它看不到当前对话）：要实现什么、改哪些文件、接口 / 约定是什么、需要跑什么短验证命令。" }, scope: { type: "array", items: { type: "string" }, description: "这个 worker 可修改的文件 / 目录列表（相对工作区根，如 [\"src/api/\", \"src/types.ts\"]）。scope 必须互不重叠。" } }, required: ["description", "prompt", "scope"] } } },
     { type: "function", function: { name: "worktree", description: "**best-of-N 隔离**：建/列/删 git 工作树，让 2-3 个候选方案在各自独立工作树里并行实现、互不踩主代码（撤销=删工作树）。难/不确定的任务想「出多个候选选最优」时用——文献证明这是提升正确率最有效的一招。", parameters: { type: "object", properties: { action: { type: "string", enum: ["add", "list", "remove"], description: "add=建一个新工作树(返回绝对路径) / list=列出 / remove=删一个(=丢弃该候选)" }, name: { type: "string", description: "add 时：候选名（短 slug，如 cand-a）" }, path: { type: "string", description: "remove 时：要删的工作树绝对路径" } }, required: ["action"] } } },
     { type: "function", function: { name: "recall_conversation", description: "检索**本会话早期被压缩掉的对话原文**（归档记忆）。上下文摘要里提到但细节不详的早期决定/需求/报错，用它按关键词找回原话，别凭摘要猜。", parameters: { type: "object", properties: { query: { type: "string", description: "检索关键词（中英文均可，如文件名、需求原话片段、报错关键字）" }, max_results: { type: "integer", description: "最多返回几条，默认 6" } }, required: ["query"] } } },
     { type: "function", function: { name: "remember", description: "把一条值得**跨会话长期记住**的知识写进记忆知识图谱（自动打标签 + 自动关联旧笔记 + 按任务相关性召回 + 自动清理垃圾——放心多记，图谱会帮你筛）。", parameters: { type: "object", properties: { content: { type: "string", description: "要记住的一条原子知识（一个概念、简洁、自包含）" }, scope: { type: "string", enum: ["project", "global"], description: "project=只关当前项目（默认）；global=跨所有项目的用户级知识（偏好/身份/通用经验）" } }, required: ["content"] } } },
@@ -21329,7 +22982,7 @@ const _TOOL_BUNDLES = {
 };
 const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) => b.tools));
 // 常驻的 search_tools 元工具——provider 无关的 Tool-Search：模型描述需求即按需拉取。
-const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具。先用项目证据、记忆、内置 knowledge_search 和稳定知识推理；只有答案存在明确的当前事实缺口时才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。你已经有的专用工具（直接调用，不需要 search_tools 加载）：local_discovery（查周边/附近/POI）、shop_catalog（查店铺官网公开商品/菜单/价格/库存）、live_environment（天气/空气/地震）、live_flights（航班/航空器）、live_markets（参考汇率/加密资产报价）、road_environment（交通/路况）、track_shipment（快递/物流）、knowledge_search（内置知识库）、current_time（当前时间）。确需当前社区/仓库/网页证据时再用 search_tools 加载 developer_community_search、stackoverflow_search、github_search、github_repo、gitlab_repo、gitee_repo、codeberg_repo 或 web_search；要读具体代码仓库的 README/目录/源码/release/issue/PR/MR：GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo，不要停在搜索列表。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；学术/论文加载 academic_search、arxiv_search、openalex_search、crossref_search；游戏价格/平台加载 steam_search；优惠/薅羊毛/返利/比价加载 smzdm_search，二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。拿到社区/GitHub/论坛/优惠平台/专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。用户只提供上下文而没提出查询时不要调用。`;
+const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具。先用项目证据、记忆、内置 knowledge_search 和稳定知识推理；只有答案存在明确的当前事实缺口时才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。专用能力可按名查询并加载：local_discovery（查周边/附近/POI）、shop_catalog（查店铺官网公开商品/菜单/价格/库存）、live_environment（天气/空气/地震）、live_flights（航班/航空器）、live_markets（参考汇率/加密资产报价）、road_environment（交通/路况）、track_shipment（快递/物流）；knowledge_search（内置知识库）和 current_time（当前时间）通常已在核心工具中。确需当前社区/仓库/网页证据时再加载 developer_community_search、stackoverflow_search、github_search、github_repo、gitlab_repo、gitee_repo、codeberg_repo 或 web_search；要读具体代码仓库的 README/目录/源码/release/issue/PR/MR：GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo，不要停在搜索列表。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；游戏价格/平台加载 steam_search；优惠/薅羊毛/返利/比价加载 smzdm_search，二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。拿到社区/GitHub/论坛/优惠平台/专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。用户只提供上下文而没提出查询时不要调用。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
 // 全量注册表 { name → schema }。
 function _buildToolRegistry(includeWrite, mcpTools = []) {
@@ -21340,53 +22993,103 @@ function _buildToolRegistry(includeWrite, mcpTools = []) {
 // Initial tool payload: core set (non-deferred) + search_tools.
 // Deferred tools load on demand: model calls search_tools OR calls them by name
 // directly (auto-healed). No regex preloading — model decides what it needs.
-function _selectInitialTools(includeWrite, taskText, mcpTools = []) {
+function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = includeWrite ? "agent" : "explorer") {
   const all = _buildAgentToolSchemas(includeWrite, mcpTools);
+  const mcpNames = new Set((Array.isArray(mcpTools) ? mcpTools : [])
+    .map((tool) => String(tool?.function?.name || "")).filter(Boolean));
+  // Small, role-safe engineering nucleus. Everything else remains in _toolRegistry and
+  // is selected by the task profile or search_tools. In particular, MCP schemas are
+  // runtime capabilities, never an implicit first-turn bundle.
+  const roleCore = {
+    plan: [
+      "read_file", "list_dir", "search", "find_files", "semantic_search", "knowledge_search",
+      "lsp_symbols", "find_symbol", "lsp_definition", "lsp_references", "update_plan", "ask_user",
+    ],
+    explorer: [
+      "read_file", "list_dir", "search", "find_files", "semantic_search", "knowledge_search",
+      "lsp_symbols", "find_symbol", "lsp_definition", "lsp_references",
+    ],
+    reviewer: [
+      "read_file", "list_dir", "search", "find_files", "semantic_search", "knowledge_search",
+      "lsp_symbols", "find_symbol", "lsp_definition", "lsp_references", "get_diagnostics",
+      "git_status", "git_diff", "git_log", "git_blame", "git_conflicts",
+    ],
+    agent: [
+      "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
+      "current_time", "recall_conversation", "remember", "get_diagnostics", "read_logs",
+      "git_status", "git_diff", "git_log", "git_blame", "read_terminal", "list_terminals",
+      "lsp_symbols", "find_symbol", "semantic_search", "knowledge_search", "lsp_definition",
+      "lsp_references",
+    ],
+  };
+  const role = Object.prototype.hasOwnProperty.call(roleCore, mode) ? mode : (includeWrite ? "agent" : "explorer");
+  const coreNames = new Set(roleCore[role]);
+  if (role === "agent" && includeWrite) {
+    for (const name of [
+      "edit_file", "multi_edit", "write_file", "run_cmd", "create_dir", "copy_path",
+      "format_file", "run_in_terminal", "stop_terminal",
+    ]) coreNames.add(name);
+  }
   // File-extension context: if a .sql file is open, preload db_query (cheap, 1 tool).
-  // If a frontend file is open or the current task is UI work, preload browser+
-  // screenshot; full UI build/design work also gets the lightweight design-choice
-  // tools up front so the model can select style/tokens before writing code.
+  // For implementation work, a frontend file or UI task preloads browser/screenshot;
+  // bug diagnosis deliberately does not. It must collect diagnostics and runtime
+  // evidence before deciding whether browser check and a final key-path regression
+  // are relevant.
   // These are context/profile-based, not a raw regex-on-user-text tool router.
   const ap = (typeof activePath === "string" ? activePath : "");
   const ext = (ap.split(".").pop() || "").toLowerCase();
   const seeded = new Set();
   const profile = _engineeringTaskProfile(taskText);
+  const bugDiagnosis = !!(profile.bug || profile.debugProject);
   const seedNames = (names) => { for (const n of (names || [])) seeded.add(n); };
-  if (/^(sql|prisma)$/.test(ext) || profile.database || profile.databaseArchitecture || profile.persistence) {
+  if (role === "agent" && (/^(sql|prisma)$/.test(ext) || profile.database || profile.databaseArchitecture || profile.persistence)) {
     seedNames(_TOOL_BUNDLES.db?.tools);
   }
-  if ((profile.gitReview || profile.gitReviewMutation) && _TOOL_BUNDLES.github) {
+  if (role === "agent" && (profile.gitReview || profile.gitReviewMutation) && _TOOL_BUNDLES.github) {
     seedNames(_TOOL_BUNDLES.github?.tools);
   }
-  if (/^(vue|jsx|tsx|svelte|html|htm|css|scss|less|astro)$/.test(ext) || profile.ui) {
+  if (role === "agent" && !bugDiagnosis && (/^(vue|jsx|tsx|svelte|html|htm|css|scss|less|astro)$/.test(ext) || profile.ui)) {
     seedNames(_TOOL_BUNDLES.browser?.tools);
   }
-  if (profile.uiProject || (profile.ui && profile.implementation && !profile.bug)) {
+  if (role === "agent" && !bugDiagnosis && (profile.uiProject || (profile.ui && profile.implementation))) {
     seedNames(["design_board", "preview_choices", "visual_compare"]);
   }
-  if (profile.browserAutomation || profile.capture) {
+  if (role === "agent" && !bugDiagnosis && (profile.browserAutomation || profile.capture)) {
     seedNames(_TOOL_BUNDLES.browser?.tools);
   }
-  if (profile.capture) {
+  if (role === "agent" && !bugDiagnosis && profile.capture) {
     seedNames(["capture_start", "capture_flows", "capture_stop", "capture_replay", "http_request"]);
   }
-  if (profile.backendApi) {
+  if (role === "agent" && profile.backendApi) {
     seedNames(["http_request"]);
   }
-  if (profile.bug || profile.debugProject) {
+  if (role === "agent" && (profile.bug || profile.debugProject)) {
     seedNames(["http_request"]);
     if (profile.database || profile.databaseArchitecture || profile.persistence || profile.dataModel || profile.databaseQuery) {
       seedNames(_TOOL_BUNDLES.db?.tools);
     }
   }
-  if (profile.packageVersion) {
+  if (role === "agent" && profile.packageVersion) {
     seedNames(["package_search", "github_repo"]);
   }
-  if (profile.needsReferences && (profile.packageVersion || profile.backendApi || profile.bug || profile.debugProject)) {
+  if (role === "agent" && profile.fullWebsite) {
+    // Product facts and page copy are first-class inputs, not an afterthought once
+    // visual components have already been written.
+    seedNames(["generate_wiki", "web_search", "web_fetch", "knowledge_search"]);
+  }
+  if (role === "agent" && profile.referenceWebsiteRequired) {
+    // The user supplied an exact page to learn from. It must be observable before
+    // visual implementation, so do not leave its fetch/design-system tools hidden.
+    seedNames(["web_fetch", "learn_design", "knowledge_search"]);
+  }
+  if (role === "agent" && profile.needsReferences && (profile.packageVersion || profile.backendApi || profile.bug || profile.debugProject)) {
     seedNames(["developer_community_search", "github_repo"]);
   }
-  const out = all.filter((t) => { const n = t.function && t.function.name; return !_DEFERRED_TOOL_NAMES.has(n) || seeded.has(n); });
-  out.push(_SEARCH_TOOLS_SCHEMA);
+  const out = all.filter((t) => {
+    const n = String(t?.function?.name || "");
+    return !!n && !mcpNames.has(n) && (coreNames.has(n) || seeded.has(n));
+  });
+  if (!out.some((tool) => tool?.function?.name === "search_tools")) out.push(_SEARCH_TOOLS_SCHEMA);
   return out;
 }
 // Identifier-shaped input can be an explicit tool-name request. Exact registered
@@ -22163,12 +23866,12 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "debate": return { type: "debate", question: args.question || args.topic || args.q || "", perspectives: args.perspectives || args.stances, context: args.context || "" };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
-    case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "" };
+    case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "", role: args.role || "" };
     case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || "") };
     case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || "") };
     case "learn_design": return { type: "learndesign", path: String(args.url || ""), url: String(args.url || ""), name: String(args.name || "") };
     case "generate_wiki": return { type: "subagent", path: "生成产品Wiki", description: "产品Wiki", prompt: _WIKI_PROMPT(args.focus || ""), _wiki: true, wikiDest: String(args.dest || "PRODUCT_WIKI.md") };
-    case "run_worker": return { type: "worker", path: args.description || "worker", description: args.description || "实现子任务", prompt: args.prompt || "", scope: Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : []) };
+    case "run_worker": return { type: "worker", path: args.description || "worker", description: args.description || "实现子任务", prompt: args.prompt || "", role: args.role || "", scope: Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : []) };
     case "worktree": return { type: "worktree", action: String(args.action || "list"), name: String(args.name || ""), path: String(args.path || args.dest || "") };
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
     case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
@@ -22619,6 +24322,29 @@ function _agentIncompleteLabel(reason, hitCap = false) {
   const labels = {
     required_mutation_missing: "用户要求的真实副作用还没全部发生",
   };
+  const effectLabels = {
+    workspace: "实际修改工作区文件",
+    "runtime:build": "成功完成编译/构建",
+    "runtime:run": "成功启动或运行目标程序",
+    "runtime:test": "成功运行测试",
+    "runtime:install": "成功安装所需依赖",
+    "runtime:package": "成功生成打包产物",
+    "external:commit": "成功创建 Git 提交",
+    "external:push": "成功推送到远程仓库",
+    "external:sync": "成功完成拉取/合并/克隆",
+    "external:pr": "成功创建或回复 PR",
+    "external:deploy": "成功完成部署/发布",
+    "external:upload": "成功上传目标内容",
+    "external:download": "成功下载目标内容",
+    "external:database": "成功执行数据库写操作",
+    "external:automation": "成功执行要求的桌面自动化",
+    "external:external": "成功完成要求的外部副作用",
+  };
+  const effectPrefix = "required_effect_missing:";
+  if (String(reason || "").startsWith(effectPrefix)) {
+    const missing = String(reason).slice(effectPrefix.length).split(",").filter(Boolean);
+    return `仍缺少：${missing.map((kind) => effectLabels[kind] || kind).join("；")}`;
+  }
   return labels[reason] || (hitCap ? "运行到本轮上限，已停止空转" : "");
 }
 
@@ -23858,17 +25584,95 @@ function _appendMemory(root, note) {
 // whole memory), so it scales and gets smarter as it grows ("越用越强"). Pure
 // localStorage, backward-compatible (migrates the old flat list once). ---
 function _kgKey(root) { return "michael-ide.kg:" + (root || "_global"); }
+// ── 长期记忆·自动沉淀引擎 ────────────────────────────────────────────────────
+// 病根：记忆写入全靠模型自觉调 remember，大多数会话什么都没记——用户反复说的
+// "别用黄色/要商业级"从没被沉淀，下个会话照旧失忆（用户实测骂"记忆垃圾"）。
+// 现在双通道：本函数是同步兑底（命中持久信号词立即入库，零延迟）；异步主力是
+// _distillMemoryLLM：每条实质消息由廉价模型蒸馏——值得跨会话记的改写成中性
+// 一句话入库（不存情绪原话），与旧记忆矛盾的直接覆盖旧条；调用确定性
+// （每条必跑），语义判断全交给模型，不靠关键词猜。
+// 过滤：问句、纯任务指令（帮我修X）、纯情绪、过长任务描述都不入库；入库走
+// _kgInsert 原有去重 + _kgPrune 原有修剪，不会堆垃圾。
+function _autoMemoryCapture(root, text) {
+  try {
+    const t = String(text || "").trim().replace(/\s+/g, " ");
+    if (t.length < 6 || t.length > 300) return;
+    if (/[?？]\s*$/.test(t)) return;
+    const globalSignal = /(?:以后|永远|每次|一律|所有项目|任何项目|从今往后|从现在开始|全部都|都要|都给我|记住|别再|不要再|不许再|下次)/.test(t);
+    const prefSignal = /(?:别用|不要用|不许|禁止|禁用|必须|要用|改用|统一|优先用|默认用|喜欢|讨厌|反感|风格|规范|习惯|标准是|一律)/.test(t);
+    if (!globalSignal && !prefSignal) return;
+    // 一次性任务指令（"帮我修/写/跑…"）没有全局词就不算持久偏好
+    if (!globalSignal && /^(?:帮我|请你?|去|把|将|先)?(?:修|写|做|跑|运行|编译|打包|部署|看看|读|查|测试|启动)/.test(t)) return;
+    const store = globalSignal ? "" : (root || "");
+    const notes = _kgLoad(store);
+    const note = _kgInsert(notes, (globalSignal ? "[用户长期偏好] " : "[项目要求] ") + t);
+    if (note) { _kgPrune(notes); _kgSave(store, notes); }
+  } catch { /* memory capture must never break a send */ }
+}
+
+// 蒸馏通道：单飞行（连发消息丢弃后来者，下一条实质消息自然补上），失败静默。
+let _distillBusy = false;
+async function _distillMemoryLLM(root, text, config) {
+  const t = String(text || "").trim().replace(/\s+/g, " ");
+  if (_distillBusy || t.length < 10 || t.length > 600 || !config) return;
+  _distillBusy = true;
+  try {
+    // 把两个库里与这句话最相关的旧记忆带给模型，它才能判断"这句是不是推翻了旧条"。
+    const q = new Set(_kgTokens(t));
+    const rank = (notes, store) => notes
+      .map((n) => [(n.tags || []).reduce((a, x) => a + (q.has(x) ? 1 : 0), 0), n, store])
+      .sort((a, b) => b[0] - a[0]);
+    const related = [...rank(_kgLoad(root || ""), "p"), ...rank(root ? _kgLoad("") : [], "g")]
+      .filter((x) => x[0] > 0).slice(0, 12);
+    const listed = related.length
+      ? related.map(([, n, s]) => `${s}:${n.id} ${n.content}`).join("\n")
+      : "(无)";
+    const prompt = `用户对 AI 编程助手说了一句话。判断其中有没有值得**跨会话永久记住**的信息（长期偏好、规矩、项目事实、对旧认知的纠正）。一次性任务指令、提问、闲聊、情绪发泄都不算。\n\n用户这句话：${t}\n\n已有记忆（可能被这句话推翻）：\n${listed}\n\n严格输出 JSON（不要任何别的字）：{"add":[{"content":"去除情绪后的中性一句话≤60字","scope":"global或project"}],"remove":["被推翻/取代的已有记忆id(含p:/g:前缀)"]}。scope：跨所有项目都适用的用 global，只关当前项目的用 project。没有可记的就输出 {"add":[],"remove":[]}。宁缺毋滥。`;
+    const out = await Promise.race([
+      _billableAiComplete({ ...config, model: _pickCheapModel(config.model) }, [{ role: "user", content: prompt }], 300),
+      new Promise((r) => setTimeout(() => r(""), 9000)),
+    ]);
+    const obj = _safeJsonLoose(out);
+    if (!obj) return;
+    for (const id of Array.isArray(obj.remove) ? obj.remove.slice(0, 6) : []) {
+      const m = /^([pg]):(.+)$/.exec(String(id).trim());
+      if (m) _kgRemove(m[1] === "g" ? "" : (root || ""), m[2]);
+    }
+    for (const a of Array.isArray(obj.add) ? obj.add.slice(0, 3) : []) {
+      const c = String(a?.content || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      if (c.length < 5) continue;
+      const isGlobal = a.scope === "global" || !root;
+      _kgAddNote(isGlobal ? "" : root, (isGlobal ? "[用户长期偏好] " : "[项目要求] ") + c);
+    }
+  } catch { /* distillation is best-effort — never break a send */ }
+  finally { _distillBusy = false; }
+}
+
+function _kgRemove(root, id) {
+  try {
+    const notes = _kgLoad(root);
+    const i = notes.findIndex((n) => n.id === id);
+    if (i < 0) return false;
+    notes.splice(i, 1);
+    for (const n of notes) if (n.links) n.links = n.links.filter((x) => x !== id);
+    _kgSave(root, notes);
+    _agentContextCache = { root: null, ts: 0, data: "" };
+    return true;
+  } catch { return false; }
+}
+
 const _KG_STOP = new Set("the a an and or to of in on for is are be it this that with you your from as at by we our 的 了 和 是 在 有 我 你 它 这 那 要 把 就 也 都 很 会 能 不 没 与 及 用 个 上 下 里 中".split(/\s+/));
+// CJK 改用滑动 bigram（同 _taskWords 的无分词方案）：整块匹配时"别用黄色"存成
+// 单 token，query"黄色"永远捕不中——bigram 后 别用/用黄/黄色 都是可命中的词。
 function _kgTokens(text) {
   const t = String(text || "").toLowerCase();
   const out = [];
   const seen = new Set();
-  const m = t.match(/[a-z_][a-z0-9_./-]{2,}|[一-龥]{2,5}/g) || [];
-  for (let w of m) {
-    w = w.replace(/[.\-/]+$/, "");
-    if (w.length < 2 || _KG_STOP.has(w) || seen.has(w)) continue;
-    seen.add(w); out.push(w);
-    if (out.length >= 14) break;
+  const push = (w) => { if (w.length >= 2 && !_KG_STOP.has(w) && !seen.has(w) && out.length < 24) { seen.add(w); out.push(w); } };
+  for (let w of t.match(/[a-z_][a-z0-9_./-]{2,}/g) || []) push(w.replace(/[.\-/]+$/, ""));
+  for (const run of t.replace(/[^\u4e00-\u9fa5]+/g, " ").split(/\s+/)) {
+    if (run.length < 2) continue;
+    for (let i = 0; i < run.length - 1; i++) push(run.slice(i, i + 2));
   }
   return out;
 }
@@ -23891,7 +25695,7 @@ function _kgInsert(notes, content) {
     if (shared >= Math.max(3, Math.min(tags.length, (n.tags || []).length) - 1) && Math.abs((n.content || "").length - clean.length) < 40) return n;
   }
   const id = "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-  const note = { id, content: clean, tags, type: _kgClassify(clean), links: [], created: Date.now() };
+  const note = { id, content: clean, tags, type: _kgClassify(clean), links: [], created: Date.now(), v: 2 };
   const scored = [];
   for (const n of notes) {
     const shared = (n.tags || []).filter((x) => tags.includes(x)).length;
@@ -23910,6 +25714,10 @@ function _kgLoad(root) {
   let notes = [];
   try { const raw = localStorage.getItem(_kgKey(root)); if (raw) notes = JSON.parse(raw); } catch { notes = []; }
   if (!Array.isArray(notes)) notes = [];
+  // 一次性迁移：旧笔记的 tags 是整块分词，换 bigram 方案后重算一遍，否则新 query 捕不中旧条。
+  let migrated = false;
+  for (const n of notes) { if (n && n.v !== 2) { n.tags = _kgTokens(n.content); n.v = 2; migrated = true; } }
+  if (migrated) { try { localStorage.setItem(_kgKey(root), JSON.stringify(notes)); } catch {} }
   if (!notes.length) { // one-time migration from the old flat memory list
     try {
       const flat = localStorage.getItem(_memoryKey(root)) || "";
@@ -23968,7 +25776,8 @@ function _kgPrune(notes) {
   if (!Array.isArray(notes) || notes.length <= _KG_CAP) return;
   const now = Date.now();
   const TYPEW = { pitfall: 3, convention: 3, preference: 3, command: 2, architecture: 2, fact: 1 };
-  const score = (n) => (n.links ? n.links.length : 0) * 2 + (TYPEW[n.type] || 1)
+  // 使用强化：常被检索命中的记忆是真在干活的，修剪时优先保留。
+  const score = (n) => (n.links ? n.links.length : 0) * 2 + (TYPEW[n.type] || 1) + Math.min(4, n.uses || 0)
     + Math.max(0, 4 - (now - (n.created || 0)) / 86400000 / 14); // recency fades over ~8 weeks
   const keep = new Set([...notes].sort((a, b) => score(b) - score(a)).slice(0, _KG_CAP).map((n) => n.id));
   for (let i = notes.length - 1; i >= 0; i--) if (!keep.has(notes[i].id)) notes.splice(i, 1);
@@ -24002,12 +25811,28 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   for (const n of [...notes].sort((a, b) => b.created - a.created).slice(0, 3)) {
     if (picked.size < K + 3) picked.set(n.id, n);
   }
+  // 偏好/规矩/坑 无条件保底：这三类是"每次干活都必须遵守"的长期约束——
+  // "别用黄色"和"做个电影网站"的 query 毫无词面交集，按相关性检索永远捞不中，
+  // 结果就是记了也白记（用户实测骂"记忆垃圾"）。最新的这三类各留足名额直接带上。
+  const _mustCarry = notes
+    .filter((n) => n.type === "preference" || n.type === "convention" || n.type === "pitfall")
+    .sort((a, b) => b.created - a.created)
+    .slice(0, 8);
+  for (const n of _mustCarry) {
+    if (picked.size >= MAX) break;
+    if (!picked.has(n.id)) picked.set(n.id, n);
+  }
   for (const n of [...picked.values()]) {
     for (const lid of (n.links || [])) {
       if (picked.size >= MAX) break;
       if (byId[lid] && !picked.has(lid)) picked.set(lid, byId[lid]);
     }
   }
+  // 使用计数：命中即强化（只写 localStorage，避免每轮检索都打文件镜像）。
+  try {
+    for (const n of picked.values()) n.uses = (n.uses || 0) + 1;
+    localStorage.setItem(_kgKey(root), JSON.stringify(notes));
+  } catch {}
   return [...picked.values()];
 }
 function _kgRetrieveBlock(root, query, isGlobal) {
@@ -24023,7 +25848,9 @@ function _kgRetrieveBlock(root, query, isGlobal) {
 // Project memory (current root) + global memory (cross-project, _global store) — both
 // injected every run so the agent always carries the user-level knowledge too.
 function _memoryBlocks(root, query) {
-  return _kgRetrieveBlock(root, query, false) + (_adaptiveEnabled() ? _kgRetrieveBlock("", query, true) : "");
+  // Adaptive controls coaching style, never whether explicitly saved global memory
+  // survives. Durable global preferences must follow the user across projects.
+  return _kgRetrieveBlock(root, query, false) + _kgRetrieveBlock("", query, true);
 }
 
 function _kgText(root) {
@@ -24563,9 +26390,9 @@ function _enforceModelRequestBudget(messages, tools = [], byteCap = _MODEL_REQUE
     // 带 📌 请求边界的消息必须整段保住边界起的正文：头 600+尾 600 的对折会把边界切掉，
     // 网关 latest_user_request 找不到标记就漂移到编排 nudge——推理检查点/知识块/意图门控
     // 全部跟着抖（真实用户请求通常只有几 KB，不是超预算的元凶）。只折叠边界之前的动态前导。
-    if (content.includes("📌 **用户这次的请求")) {
+    if (content.includes("📌 **用户本次请求**：")) {
       const _bm = content.search(/━{8,}\s*\n\s*📌/); // 完整边界 = ━━━ 行 + 📌 行，缺一网关就认不出
-      const _bk = _bm >= 0 ? _bm : content.indexOf("📌 **用户这次的请求");
+      const _bk = _bm >= 0 ? _bm : content.indexOf("📌 **用户本次请求**：");
       if (_bk > 1200) {
         prepared[index] = { ...prepared[index], content: `${content.slice(0, 400)}\n…（较早的动态前导已压缩以满足请求上限）…\n${content.slice(_bk)}` };
         bytes = requestBytes();
@@ -24712,11 +26539,31 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   const toolIdx = [];
   for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdx.push(i);
 
-  // ── Tier 1 (ALWAYS — lossless / reversible) ──────────────────────────────
+  // ── 压缩轮批处理（缓存命中的关键）─────────────────────────────────────────
+  // Anthropic 显式缓存按前缀逐字节匹配：历史中段每改一个字，其后全部 0 命中。
+  // 以前 Tier1 去重/折叠"每轮都做一点"，等于每轮都打碎一次历史缓存——实测新会话
+  // 93818 输入只命中 25318（tools+system），历史大头全价。现在改成【攒够收益才
+  // 压缩一次】：预扫可折叠字节数，不到门槛就本轮零改写（历史逐字节稳定 → 下一轮
+  // 全额命中），到门槛才一次性执行全部折叠（一次性失效，换后续多轮全命中）。
+  const COMPACT_BENEFIT_CHARS = 60_000; // ≈15k tokens，一次失效换回的最小收益
+  let _pendingBenefit = 0;
+  {
+    const KEEP_SCAN = 8;
+    const upTo = toolIdx.length - KEEP_SCAN;
+    for (let k = 0; k < upTo; k++) {
+      const c = messages[toolIdx[k]].content ? String(messages[toolIdx[k]].content) : "";
+      if (c.startsWith("[已折叠较早的")) continue;
+      if (c.length > 490) _pendingBenefit += c.length - 400;
+    }
+  }
+  const doCompact = overHard || _pendingBenefit >= COMPACT_BENEFIT_CHARS;
+  if (run) run._compactedThisTurn = doCompact;
+
+  // ── Tier 1 (compact rounds only — lossless / reversible) ─────────────────
   // Dedup reads only when the later result is proven to cover the earlier
   // range of the same file version. A partial read, error or duplicate stub can
   // never evict the only full-content source.
-  {
+  if (doCompact) {
     const readsByPath = new Map();
     for (const i of toolIdx) {
       const meta = messages[i]?._ideMeta;
@@ -24736,7 +26583,7 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   // Fold refetchable tool results older than the last KEEP to one-line pointers.
   // KEEP 是常量：随总量收缩会让已稳定的折叠边界回溯前移、成片改写历史（cache 杀手）。
   const KEEP = 8;
-  const trimUpTo = toolIdx.length - KEEP;
+  const trimUpTo = doCompact ? toolIdx.length - KEEP : 0;
   for (let k = 0; k < trimUpTo; k++) {
     const i = toolIdx[k];
     const c = messages[i].content ? String(messages[i].content) : "";
@@ -24778,7 +26625,7 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   // Anthropic). Fold it to a one-line pointer, KEEPING the user's actual request
   // (everything from the 📌 marker on). The model can list_dir / read_file to
   // re-fetch any project detail it still needs — Select-on-demand beats re-injecting.
-  if (overSoft && toolIdx.length >= 4) {
+  if (doCompact && overSoft && toolIdx.length >= 4) {
     for (let i = messages.length - 1; i >= 1; i--) {
       const m = messages[i];
       if (m.role !== "user" || typeof m.content !== "string") continue;
@@ -24896,7 +26743,7 @@ async function _compactHistoryIfHuge(config, session) {
 输出一份连贯的压缩摘要。重要内容详细，不重要的一笔带过。中文、分条。`);
   let summary = "";
   try {
-    summary = await backend.aiComplete(config, [
+    summary = await _billableAiComplete(config, [
       { role: "system", content: COMPACT_PROMPT },
       { role: "user", content: transcript },
     ], 2500);
@@ -25618,9 +27465,39 @@ function _isTransientTurnErr(msg) {
   return _isRetryableAiError(unwrapped)
     || /连接中断|连接提前结束|连接卡住|无响应|网络波动|被截断|模型长时间|stream closed before data:\s*\[done\]|incomplete.*sse|response body/i.test(unwrapped);
 }
+// 网络断了就真等它回来（最多 maxMs），而不是固定间隔撞几下就放弃整个任务。
+// 判定宽松：对网关根路径 /health 的探测拿到任何 HTTP 响应（哪怕 404）都算链路已通；
+// fetch 抛错（DNS 失败/断网/拒连）才算仍断着。navigator.onLine=false 时先等系统联网。
+async function _waitForAiRecovery(config, maxMs, live) {
+  const started = Date.now();
+  const base = String(config?.baseUrl || "").replace(/\/+$/, "");
+  const probe = base ? base.replace(/\/v\d+.*$/, "") + "/health" : "";
+  while (Date.now() - started < maxMs) {
+    if (typeof live === "function" && !live()) return false;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+    if (!probe) return true; // 没有可探测目标 → 退回时间退避
+    try {
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), 4000) : null;
+      await fetch(probe, { method: "GET", cache: "no-store", signal: ctrl ? ctrl.signal : undefined });
+      if (timer) clearTimeout(timer);
+      return true;
+    } catch {
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+  return false;
+}
+
 function _formatAgentFinalError(err) {
   const raw = _stripAiRetryPrefix(err);
   if (!raw) return "";
+  if (/连接中断（网络波动）|网络波动|连接提前结束/.test(raw)) {
+    return "网络持续中断，自动重试（含等待链路恢复）已用尽。已生成的内容和文件改动都已保留；网络恢复后发一句「继续」即可从中断处接着跑。";
+  }
   if (_isProviderGatewayStatusError(raw)) {
     const model = raw.match(/【([^】]+)】/)?.[1] || "";
     const status = raw.match(/AI request failed\s*\(([^)]+)\)/i)?.[1] || "502 Bad Gateway";
@@ -25628,7 +27505,7 @@ function _formatAgentFinalError(err) {
     const why = /error\s*code\s*:\s*502/i.test(body)
       ? "上游只返回了 502，没有给出更细原因"
       : body.replace(/^【[^】]+】\s*/, "").slice(0, 180);
-    return `${model ? `当前模型「${model}」` : "当前模型"}线路失败（${status}）：${why || "供应商暂时不可用"}。IDE 已停止继续重复撞同一路；请换一个可用模型/线路，或去后台检查该模型连接。`;
+    return `${model ? `当前模型「${model}」` : "当前模型"}线路失败（${status}）：${why || "供应商暂时不可用"}。IDE 已在未开始输出前自动重试 2 次，当前上游仍不可用；请稍后继续，或换一个可用模型/线路。`;
   }
   return raw;
 }
@@ -26424,16 +28301,20 @@ function _isReadOnlyParallel(call) {
   return false;
 }
 
-async function _runOrderedToolSegments(items, canRunInParallel, execute, isLive = () => true) {
+async function _runOrderedToolSegments(items, segmentKeyOf, execute, isLive = () => true) {
+  // 段键语义：falsy = 硬屏障（串行执行）；相同 truthy 键的**连续**项组成一段并行执行。
+  // 这让"读工具段"与"worker 段"各自并行、互不混段——worker 会改文件，绝不能和
+  // 同轮的读工具并跑，否则读到半成品；不同 worker 之间由 scope 互不重叠守卫保证安全。
   for (let index = 0; index < items.length && isLive();) {
-    if (!canRunInParallel(items[index], index)) {
+    const key = segmentKeyOf(items[index], index);
+    if (!key) {
       await execute(items[index], index);
       index++;
       continue;
     }
     let end = index;
     const segment = [];
-    while (end < items.length && canRunInParallel(items[end], end)) {
+    while (end < items.length && segmentKeyOf(items[end], end) === key) {
       const current = end++;
       segment.push(execute(items[current], current));
     }
@@ -26499,7 +28380,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   // SEPARATE cancel flags in Rust (register_cancel does m.insert → replaces the old
   // entry; shared IDs meant only the LAST sub-agent was cancellable). All active IDs
   // live on session._cancelIds; _setStreaming(false) cancels every one of them.
-  const _turnReqId = "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+  const _turnReqId = _newIdeRequestId();
   const _turnConfig = { ...config, requestId: _turnReqId };
   if (session) { session._cancelIds = session._cancelIds || new Set(); session._cancelIds.add(_turnReqId); }
   let acc = "";
@@ -26573,7 +28454,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     if (b) {
       const _stick = b.scrollHeight - b.scrollTop - b.clientHeight < 48;
       b.dataset.rawText = reasoningAcc;
-      try { renderMarkdownInto(b, reasoningAcc, { streaming: true, showCaret: false, highlighter: typeof highlightCode === "function" ? highlightCode : undefined }); }
+      // 增量流式渲染：旧版每次把整段思考全量 clear+重建 DOM（O(n²)），长思考直接冻住主线程。
+      // 最终完整渲染在 settleReasoning 里做一次。
+      try { renderMarkdownStream(b, reasoningAcc, { streaming: true, showCaret: false }); }
       catch { b.textContent = reasoningAcc; }
       if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
         _activeStreamDiag.firstRenderMs = Date.now() - _activeStreamDiag.attemptStartedAt;
@@ -26637,6 +28520,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       else if (phase === "firstChunk") _activeStreamDiag.firstChunkMs = ms;
       else if (phase === "firstProgress") _activeStreamDiag.firstProgressMs = ms;
       else if (phase === "done") _activeStreamDiag.doneMs = ms;
+      if (phase === "firstChunk" || phase === "streaming") _activeStreamDiag.lastBytesAt = Date.now();
       if (Number.isFinite(ev.bytes)) _activeStreamDiag.bytes = Math.max(_activeStreamDiag.bytes || 0, ev.bytes);
       if (_streamDebugOn && typeof console !== "undefined") {
         console.info("[Michael IDE stream]", { phase, elapsedMs: ms, bytes: _activeStreamDiag.bytes || 0, attempt });
@@ -26653,7 +28537,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       }
       if (d.firstChunkMs != null) {
         const size = d.bytes ? `，已收 ${d.bytes}B` : "";
-        return `已收到上游原始流 ${d.firstChunkMs}ms${size}，但还没有 reasoning/token/tool 参数`;
+        // 字节心跳新鲜度决定文案：连接活着=模型在深思/排队（正常，大上下文 prefill
+        // 阶段不吐任何 token）；字节早停了=上游可能卡住，看门狗会到点重试。
+        const fresh = d.lastBytesAt && Date.now() - d.lastBytesAt < 8000;
+        return fresh
+          ? `连接正常${size}，模型正在处理请求（大上下文/深度思考时首字前会有较长准备期）`
+          : `已收到上游原始流 ${d.firstChunkMs}ms${size}，但数据已停止增长——上游可能卡住，超时后自动重试`;
       }
       if (d.responseHeadersMs != null) return `已拿到响应头 ${d.responseHeadersMs}ms，等待首个 SSE chunk`;
       if (d.requestStartedMs != null) return `请求已发出，等待响应头 ${elapsed}s`;
@@ -26819,9 +28708,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     // that object may only be a valid prefix of the intended write. Retry the whole
     // turn and never execute any tool from an errored stream.
     const erroredToolStream = !!turnErr && byIndex.size > 0;
+    // 干净结束却只有思考、没有正文/工具调用：上游把思考流后面的内容块丢了。以前这种轮
+    // 没有 turnErr 就不重试，被当"正常安静轮"落地——外层 nudge 一句，模型再思考、上游再丢，
+    // 屏幕上堆出"N 张思考卡零动作"。现在按异常轮就地快速重试（本 attempt 的思考卡会被清掉）。
+    const reasoningOnlyTurn = !turnErr && !hasUsable && byIndex.size === 0 && reasoningAcc.trim().length > 0;
     const retryableTurnErr = turnErr && _isRetryableAiError(turnErr);
     const retryLimit = payloadTooLarge ? 1 : (argIssue ? 3 : (stalled || erroredToolStream ? 1 : 2));
-    if ((payloadTooLarge || argIssue || truncated || erroredToolStream || (retryableTurnErr && !hasUsable)) && attempt < retryLimit && _live()) {
+    if ((payloadTooLarge || argIssue || truncated || erroredToolStream || reasoningOnlyTurn || (retryableTurnErr && !hasUsable)) && attempt < retryLimit && _live()) {
       for (const [, e] of byIndex) _removeWritePreview(e); // drop the partial live previews
       byIndex.clear(); acc = ""; reasoningAcc = "";
       if (streamEl) { streamEl.remove(); streamEl = null; }
@@ -26847,9 +28740,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       if (argIssue && attempt === 0) {
         // 静默自愈，不打断体验
       } else {
-        showAgentRetryToast(payloadTooLarge ? "请求体过大，正在压缩历史上下文后自动重试…" : (argIssue ? "正在补齐工具参数后继续…" : (stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`))));
+        showAgentRetryToast(payloadTooLarge ? "请求体过大，正在压缩历史上下文后自动重试…" : (argIssue ? "正在补齐工具参数后继续…" : (reasoningOnlyTurn ? `上游只回了思考、没回正文/工具调用，重试中… (${attempt + 1}/3)` : (stalled ? "首轮无有效进度，正在自动快速重试（仅一次）" : (truncated ? `模型输出被截断，重试中… (${attempt + 1}/3)` : `网络/服务波动，重试中… (${attempt + 1}/3)`)))));
       }
-      await new Promise((r) => setTimeout(r, stalled ? 250 : 800 * Math.pow(2, attempt)));
+      await new Promise((r) => setTimeout(r, (stalled || reasoningOnlyTurn) ? 250 : 800 * Math.pow(2, attempt)));
       if (!_live()) { err = turnErr; break; }
       continue;
     }
@@ -26905,18 +28798,27 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     if (fromText.length) { toolCalls = fromText; acc = _stripParsedToolCalls(acc); }
   }
 
-  // Record token usage ONCE per turn: the real report if the provider sent one
-  // (last wins, so a per-chunk cumulative usage isn't double-counted), else an
-  // estimate so the meter is never blank ("缓存看不到").
+  // The server settlement is the sole billing source. Provider stream usage can
+  // still describe hidden reasoning, but it never drives token/cost totals here.
   {
-    const _u = _turnUsage || { estimated: true, prompt_tokens: _lastRequestEstimateTokens || _estRequestTokens(messages, toolSchemas), completion_tokens: _estTokens(acc) };
-    _recordUsage(_u);
-    // Per-turn total for the agent loop's per-run token budget (ch23-style 预算控制).
+    const settlement = await _fetchGatewaySettlement(_turnConfig, _turnReqId);
+    if (settlement?.usageReported) {
+      _recordUsage({
+        prompt_tokens: settlement.promptTokens,
+        completion_tokens: settlement.completionTokens,
+        cached_tokens: settlement.cachedTokens,
+        cache_creation_tokens: settlement.cacheCreationTokens,
+        estimated: false,
+      });
+    }
     try {
       if (session) {
-        session._lastTurnTokens = (_u.prompt_tokens || 0) + (_u.completion_tokens || 0);
-        const ru = session._runUsage;
-        if (ru) { ru.in += _u.prompt_tokens || 0; ru.out += _u.completion_tokens || 0; if (_u.estimated) ru.est = true; }
+        session._lastTurnTokens = settlement?.usageReported
+          ? (settlement.promptTokens || 0) + (settlement.completionTokens || 0)
+            + (settlement.cachedTokens || 0) + (settlement.cacheCreationTokens || 0)
+          : 0;
+        _addRunSettlement(session._runUsage, settlement);
+        if (session._liveRunStats) session._liveRunStats.refresh();
       }
     } catch {}
   }
@@ -27459,6 +29361,52 @@ function _scopesOverlap(a, b) {
   return a.some((x) => b.some((y) => within(x.replace(/\/+$/, ""), y.replace(/\/+$/, ""))));
 }
 
+// 专业角色纪律块：多角色拆分并行的核心——每个子智能体/worker 按角色带上自己领域的
+// 打法与红线，而不是一套通用工人提示干所有领域的活（通用工人 = 每个领域都平庸）。
+// 块要精炼：只写该领域"怎么干才专业 + 最容易翻车的红线"，通用纪律仍由基座承担。
+const _AGENT_ROLE_BLOCKS = {
+  frontend: `# 你的角色：前端工程师（专注 UI/交互/样式）
+- 设计一律服从系统提示里的「michael-design 设计体系」块；没注入就先 knowledge_search(domain="michael-design") 取品类蓝本再动手。
+- 配色只用 Tailwind 族+档或语义 token（bg-primary 等），业务代码禁裸 hex；未明确要求暗色时根背景浅色中性档。
+- 组件用 shadcn/ui 官方 primitive 组合，不造平行轮子；图标 Lucide/SVG 禁 emoji；状态做全（hover/focus-visible/active/disabled/loading/空/错误）。
+- 动效按知识库分层编排（标志性滚动叙事/分区入场/微交互/移动端降级 + reduced-motion），禁全页统一 fade-up。
+- 响应式必须真做：移动端单列/重排，不溢出不破版。`,
+  backend: `# 你的角色：后端工程师（专注 API/服务/业务逻辑）
+- 先定契约再写码：路由/入参/出参/错误码先想清，保持与现有 API 风格一致。
+- 错误处理完整：入参校验、异常路径返回结构化错误，不吞错误不裸 panic/500。
+- 安全红线：所有外部输入不可信——参数化查询防注入、鉴权/越权检查、不把密钥写死在代码。
+- 性能意识：N+1 查询、无界循环、大对象常驻内存是常见翻车点。
+- 写完用短命令真实验证（启动检查/单测/typecheck），不交没跑过的代码。`,
+  database: `# 你的角色：数据库工程师（专注 schema/查询/迁移）
+- schema 先行：类型精确、约束（NOT NULL/UNIQUE/FK）齐全、索引按真实查询模式建。
+- 迁移必须可回滚且幂等；绝不写破坏性 DDL（DROP/TRUNCATE）除非任务明确要求并二次确认。
+- 查询优化看执行计划说话，不凭感觉加索引；事务边界明确，避免长事务。
+- 敏感数据（密码/token）只存哈希/密文。`,
+  test: `# 你的角色：测试工程师（专注质量与回归）
+- 测行为不测实现：断言公共契约与边界（空值/错误/超大输入/并发），不锁死内部细节。
+- 每个 bug 修复配一个能复现它的测试；测试必须先红后绿才算数。
+- 用项目现有测试框架与风格，不引入第二套；跑完整相关测试套件并报告真实结果。`,
+  devops: `# 你的角色：DevOps 工程师（专注构建/部署/环境）
+- 改构建/CI/容器配置前先读现有配置全貌，最小改动，保持与现有约定一致。
+- 版本号/镜像/依赖以 lockfile 和官方文档为准，不凭记忆写；环境变量集中管理不散落。
+- 每步改动都要有验证命令（build/compose config/lint），跑通才算完成。`,
+  design: `# 你的角色：UI/UX 设计师（专注视觉与体验决策）
+- 一切判断以「michael-design 设计体系」块与知识库品类蓝本为准，不凭个人审美拍脑袋。
+- 产出要可执行：布局构图选型、Tailwind 族档配色映射、字体配对、动效编排方案——落成 token 与组件规格，不是形容词。
+- 反 AI 模板味：结构按真实用户旅程推导，密度靠真实内容，禁套话文案。`,
+  docs: `# 你的角色：技术文档工程师
+- 写给真实读者：先想清楚谁读、读完要能干什么；结构可扫读（标题/列表/示例优先于大段散文）。
+- 所有命令/代码示例必须真实可运行（从项目实际配置抄，不凭记忆编）；术语与项目现有文档一致。`,
+  research: `# 你的角色：调研分析师（专注证据与结论）
+- 结论必须挂证据（path:line/符号/URL/真实输出），事实与推断分开标注。
+- 优先一手来源（源码/官方文档/真实运行结果），社区内容只作线索。
+- 简报格式：结论一句话 → 证据清单 → 边界与未知 → 建议的下一步。`,
+};
+function _agentRoleBlock(role) {
+  const key = String(role || "").trim().toLowerCase();
+  return (_AGENT_ROLE_BLOCKS[key] ? "\n\n" + _AGENT_ROLE_BLOCKS[key] : "");
+}
+
 const _WORKER_SYSTEM = _P("worker_system", `你是能改文件的 worker 子智能体。只能修改指定 scope 内的文件、其余只读，不删移、不再派 worker。先读 scope 内真实文件和必要调用方，再实现交代的那块；写完整能跑的代码、补齐 import、风格随项目。**如果 list_dir 已经确认工作区根目录为空 / 新项目，就停止本地 read/search/find_files/semantic_search，不要猜 package.json、vite.config、src 等旧项目路径；按用户目标和 scope 直接创建需要的文件，或如实回报“空项目事实”。**可以运行会结束的短验证命令（test/build/lint/typecheck/diagnostics），不要启动 dev server/watch/监听/REPL 这类持续任务，也不要用 shell 重定向/sed/tee/cp/mv/rm/脚本 API 绕过文件工具改文件。交付必须包含：改了哪些文件、关键证据/原因、运行过的验证命令和退出码、未验证/风险。用中文。`);
 
 // The baked task for research_project — a thorough, structured codebase-mapping brief the
@@ -27518,7 +29466,7 @@ function _sessionFileEvidenceBlock(session, root, limit = 8) {
   });
   return `〔本会话文件证据账本——复用已知路径与结论，不要重新 search 定位；逐字符修改所需原文若已离开当前上下文，只精读目标文件/范围〕\n${lines.join("\n")}`;
 }
-async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], depth = 1, onMutation = null }) {
+async function _runSubAgent({ config, description, prompt, root, container, run, write = false, scope = [], role = "", depth = 1, onMutation = null }) {
   const _sess = run && run.session;
   const _live = () => !_sess || _sess.streaming;
   // Worker mode: declared scope → root-relative; the worker may only modify files
@@ -27575,13 +29523,34 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
 
   const sysPrompt = (write
     ? _WORKER_SYSTEM + `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`
-    : _SUBAGENT_SYSTEM) + (run?.skillsBlock ?? _activeSkillsBlock());
+    : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _activeSkillsBlock());
   const _childContext = _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
   // Context IN: prepend the shared run-context digest so this child stands on what the main
   // agent already learned/did (真·上下文协议) instead of re-investigating from zero.
   const _shared = _sharedCtxDigest(run && run.ctx);
   const _evidenceLedger = _sessionFileEvidenceBlock(_sess, root, 12);
-  const _handoff = [_shared, _evidenceLedger].filter(Boolean).join("\n\n");
+  // 设计证据交接：frontend/design 角色的 worker 不走 L0，拿不到服务端注入的设计体系/
+  // 蓝图块——把主智能体已预取的 michael-design 证据压缩成交接块塞给它，开工就有弹药；
+  // 没有预取证据时，角色纪律块已要求它自己 knowledge_search 兜底。
+  let _designHandoff = "";
+  if (["frontend", "design"].includes(String(role || "").toLowerCase())) {
+    const ev = run && run._michaelDesignEvidence;
+    if (ev) {
+      const seg = (label, arr, n) => (Array.isArray(arr) && arr.length ? `${label}: ${arr.slice(0, n).join("、")}` : "");
+      const evLines = [
+        seg("命中 section", ev.sourceSections, 6),
+        seg("可采用 Tailwind 色阶", ev.tailwindPaletteTokens, 10),
+        seg("原始色值（须折算成 Tailwind 族+档再用，禁裸 hex）", ev.paletteTokens, 8),
+        seg("动效技术", ev.motionTechniques, 6),
+        seg("动效参数", ev.motionParameters, 6),
+        seg("可用媒体 URL", ev.mediaUrls, 8),
+        seg("布局规则", ev.layoutTechniques, 6),
+        seg("组件依据", ev.componentTechniques, 6),
+      ].filter(Boolean);
+      if (evLines.length) _designHandoff = `【michael-design 设计证据交接（主智能体已检索，直接采用；配色一律折算 Tailwind 族+档/语义 token，叙述与业务代码禁裸 hex）】\n${evLines.join("\n")}`;
+    }
+  }
+  const _handoff = [_shared, _evidenceLedger, _designHandoff].filter(Boolean).join("\n\n");
   const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: (_handoff ? _handoff + "\n\n——————\n\n" : "") + _childContext + "\n\n——————\n\n" + prompt }];
   // Sub-agents now flexibly use the FULL capability-appropriate toolkit (not a crippled subset):
   // read-only agents get EVERY investigation tool — lsp (跳定义/找所有调用方)、get_diagnostics
@@ -27826,7 +29795,7 @@ async function _describeImageForTextModel(dataUrl, hint, baseConfig) {
       { type: "text", text: prompt },
       ...dataUrls.map((url) => ({ type: "image_url", image_url: { url } })),
     ] }];
-    const out = await backend.aiComplete(cfg, msgs, 1300);
+    const out = await _billableAiComplete(cfg, msgs, 1300);
     const text = String(out || "").trim();
     if (text) {
       if (_visionCache.size > 64) _visionCache.clear(); // bound memory
@@ -28058,6 +30027,11 @@ async function _memoryMessagesForModel(memory, config, currentUserText = "", has
     if (!message || typeof message !== "object") continue;
     const clean = { ...message };
     delete clean.attachments;
+    // 旧会话行为消毒：历史里 assistant 的表忠心开场句是模型最强的模仿样板（老会话
+    // "旧行为一直回来"的根因），回放给模型前物理剥掉——新规则才不被历史先例压制。
+    if (message.role === "assistant" && typeof clean.content === "string" && clean.content) {
+      clean.content = _stripTeachingSections(_stripAckOpeners(clean.content));
+    }
     if (activeMediaTurns.has(index) && message.role === "user") {
       clean.content = await _attachmentAwareContent(String(message.content || ""), message.attachments, config, 3_000_000, wantsPriorImageLocation && index === latestImageTurn, "");
     } else if (Array.isArray(message.attachments) && message.attachments.length) {
@@ -28320,6 +30294,23 @@ function _profileToolPriorities(text, profile = null, k = 8) {
   const projectEngineering = !!(p.projectEngineering || p.engineeringGrade || p.allProjectsEngineering || p.industrialProject || p.largeProject || p.multiService || p.productionReadiness || p.businessLogic || p.businessRisk || p.securityRisk || p.architectureQuality || p.databaseOps || p.containerOps || p.featureCompleteness || p.websiteDelivery || p.projectScope || p.architecture);
   const industrialEngineering = !!(p.industrialProject || p.largeProject || p.multiService || p.productionReadiness || p.businessLogic || p.businessRisk || p.securityRisk || p.architectureQuality || p.databaseOps || p.containerOps || p.featureCompleteness || p.websiteDelivery || p.allProjectsEngineering);
   const businessEngineering = !!(p.businessLogic || p.businessRisk || p.securityRisk || p.featureCompleteness || p.websiteDelivery);
+  const bugDiagnosis = !!(p.bug || p.debugProject);
+
+  // Design knowledge is an input to the implementation, not a late-stage polish
+  // tool. Put it ahead of browser/design-board suggestions so the agent learns the
+  // system before it invents a visual direction.
+  if (p.designKnowledgeRequired) add("knowledge_search");
+
+  // A bug's first tools must expose the fault, not simulate user input. Browser
+  // automation remains available through search_tools once logs and browser check
+  // point to a real web regression.
+  if (bugDiagnosis) {
+    add("get_diagnostics", "read_logs / read_terminal / list_terminals / stop_terminal");
+    if (backendApi) add("http_request");
+    if (p.database || p.databaseArchitecture || p.dataModel || p.persistence || p.databaseQuery || /(?:数据库|数据表|\bdb\b|sql|sqlite|postgres|mysql|redis|prisma|drizzle|typeorm|sequelize|knex|supabase|firebase|DATABASE_URL)/i.test(raw)) add("db_query");
+    add("list_dir", "read_file", "semantic_search", "search", "find_files", "lsp_definition / lsp_references");
+    add("run_cmd");
+  }
 
   if (projectEngineering) {
     add("list_dir", "read_file", "semantic_search", "search", "find_files", "lsp_definition / lsp_references", "get_diagnostics");
@@ -28337,8 +30328,15 @@ function _profileToolPriorities(text, profile = null, k = 8) {
     add("semantic_search", "lsp_definition / lsp_references", "search", "read_file", "get_diagnostics", "run_cmd");
     if (backendApi || p.businessRisk || p.securityRisk || p.websiteDelivery) add("http_request");
     if (p.database || p.databaseOps || p.businessLogic || p.businessRisk) add("db_query");
-    if (p.ui || p.websiteDelivery) add("browser", "screenshot");
+    if (!bugDiagnosis && (p.ui || p.websiteDelivery)) add("browser", "screenshot");
     if (p.needsReferences || p.securityRisk || p.databaseOps || p.containerOps) add("knowledge_search", "github_repo", "developer_community_search");
+  }
+
+  if (p.fullWebsite) {
+    add("read_file", "generate_wiki", "web_search", "web_fetch", "knowledge_search");
+  }
+  if (p.referenceWebsiteRequired) {
+    add("web_fetch", "learn_design", "knowledge_search");
   }
 
   if (p.git || p.gitCommit || p.gitPublish || p.gitSync || p.gitReview || p.gitBranching) {
@@ -28346,30 +30344,23 @@ function _profileToolPriorities(text, profile = null, k = 8) {
     if (p.gitCommit || p.gitPublish || p.gitSync || p.gitBranching || p.gitLocalMutation) add("git_commit / git_branch / git_push / git_pull");
     if (p.gitReview || p.gitReviewMutation || p.gitPublish) add("gh_pr_create / gh_pr_view / gh_pr_checks / gh_actions_log");
   }
-  if (p.bug || p.debugProject) {
-    add("get_diagnostics", "read_logs / read_terminal / list_terminals / stop_terminal");
-    if (backendApi) add("http_request");
-    if (p.database || p.databaseArchitecture || p.dataModel || p.persistence || p.databaseQuery || /(?:数据库|数据表|\bdb\b|sql|sqlite|postgres|mysql|redis|prisma|drizzle|typeorm|sequelize|knex|supabase|firebase|DATABASE_URL)/i.test(raw)) add("db_query");
-    add("run_cmd");
-    add("list_dir", "read_file", "semantic_search", "search", "find_files", "lsp_definition / lsp_references");
-  }
-  if (backendApi && !(p.bug || p.debugProject)) {
+  if (backendApi && !bugDiagnosis) {
     add("read_logs / read_terminal / list_terminals / stop_terminal", "http_request");
   }
   if (p.longRunningRuntime || p.interactiveWait) {
     add("run_in_terminal", "read_logs / read_terminal / list_terminals / stop_terminal", "background_monitor");
   }
-  if (p.capture) {
+  if (p.capture && !bugDiagnosis) {
     add("capture_start", "browser", "capture_flows", "capture_replay", "http_request");
-  } else if (p.browserAutomation) {
+  } else if (p.browserAutomation && !bugDiagnosis) {
     add("browser", "screenshot");
   }
   if (p.database || p.databaseArchitecture || p.dataModel || p.persistence || p.databaseQuery) {
     add("db_query", "read_file", "search", "knowledge_search");
   }
   if (p.ui || p.uiProject) {
-    if (p.uiProject && p.implementation && !p.bug) add("web_scaffold", "design_board", "preview_choices");
-    add("browser", "screenshot");
+    if (p.uiProject && p.implementation && !bugDiagnosis) add("web_scaffold", "design_board", "preview_choices");
+    if (!bugDiagnosis) add("browser", "screenshot");
   }
   if (packageVersion) {
     add("package_search", "github_repo", "knowledge_search");
@@ -28458,7 +30449,7 @@ async function _semanticToolRank(text, config) {
     const list = catalog.map((t, i) => `${i + 1}. ${t.name} — ${t.desc}`).join("\n");
     const prompt = `用户的任务：\n${String(text).slice(0, 1200)}\n\n可用工具：\n${list}\n\n仔细想这个任务真正要做哪些事，从上面选出**最该用到的工具**（按相关度排序，最多 7 个）。只输出工具名、用逗号分隔，不要解释、不要编造清单外的名字。`;
     const out = await Promise.race([
-      backend.aiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 100),
+      _billableAiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 100),
       new Promise((res) => setTimeout(() => res(""), 3500)),
     ]);
     const names = String(out || "").split(/[,，\n、]+/).map((s) => s.replace(/^[-*\d.\s)）]+/, "").replace(/[（(].*$/, "").trim()).filter(Boolean);
@@ -28497,7 +30488,10 @@ async function _buildToolHint(text, config) {
   const warrants = mcpCount > 0 || (profileRel.length < 3 && lexical.length < 3);
   let semantic = [];
   if (warrants) { try { semantic = await _semanticToolRank(text, config); } catch { semantic = []; } }
-  const rel = _mergeToolPriorityLists(profileRel, semantic, lexical).slice(0, 8);
+  const merged = _mergeToolPriorityLists(profileRel, semantic, lexical);
+  const rel = (profile.bug || profile.debugProject
+    ? merged.filter((tool) => !/^(?:browser|screenshot|capture_start|capture_flows|capture_replay)$/i.test(String(tool?.name || "").split(" / ")[0]))
+    : merged).slice(0, 8);
   if (!rel || rel.length < 2) return "";
   return "\n\n🔧 **针对这个任务，优先想到这些工具**（全部工具仍可用，这是按任务画像和真实证据需求挑出的，别只盯着读写文件）：\n"
     + rel.map((t) => `- ${t.name}：${t.desc}`).join("\n");
@@ -28580,8 +30574,13 @@ function _agentDecisionFrameBlock(text, profile = _engineeringTaskProfile(text))
     lines.push("Git 律：先确认仓库根，不在错目录 commit/push/pull；只读调查用 git_status/git_diff/git_log/git_blame。提交前先看 status+diff，明确暂存范围和提交信息；分支操作先看当前分支；push/pull 先确认 remote/upstream 和当前分支；PR/CI 用 gh_pr_view/gh_pr_checks/gh_actions_log 读真实状态。修复“commit/push/branch 按钮或页面”是 UI/代码任务，不等于真的执行 Git。");
   }
   if (p.ui || p.uiProject) {
-    lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用项目现有组件优先，新增界面优先 shadcn/ui + Radix 语义组件，Tailwind palette/theme token 统一配色；构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
-    lines.push("参考站扒取律：做网站且有参考对象（用户给了网址/照着某站做/调研选出的同类站）时，默认后台 capture_start+capture_flows 抓接口数据、browser eval 读 DOM 结构、browser design 抓配色/字体/间距/CSS 变量，把结构内容和样式扒下来存成本地 reference 文件，要用哪块直接搬或照着写；扒来的配色落成自己项目的语义 token（theme.extend/CSS 变量/shadcn 变量），绝不篡改 shadcn/ui 组件源码和 Tailwind 本体配置。");
+    lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用户直接给出的链接、文案、名称、业务对象和限制就是第一事实来源，先逐条保留并在计划中落到对应区块，不能用默认品类猜测覆盖它。任何网站/UI 项目在第一次视觉实现前都必须取得 michael-design 三轨证据，把命中的结构、组件体系、素材 URL、动效参数和视觉令牌落进实现。用项目现有组件优先，shadcn/ui + Radix 只承担 Button/Dialog/Tabs/Accordion 等交互 primitive，不把每个区块都套 Card；Tailwind palette/theme token 统一配色，并建立中性族+主强调族+可选辅助族的全页契约，任何 section 不得突然硬编码陌生色相。卡片按真实数量选择 2/3/4 列、跨列和末行平衡；图标先理解对象/动作/状态，再映射 Bot/Mail/Shield/Chart 等具体语义，禁止 Sparkles/Wand 万能代替。构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
+    if (p.designKnowledgeRequired) lines.push("michael-design 主编排律：IDE 首轮前固定完成三条主题检索，不能压成一条泛 query：① 业务信息架构、视觉样式、字阶/间距/圆角/阴影、shadcn/Radix 组件变体、Tailwind 配色和响应式网格；② 标志性滚动/状态动效、移动端参数与 prefers-reduced-motion；③ 真实媒体、头像、语义图标和卡片 surface。优先直接采用已注入证据，只有覆盖缺口才追加 knowledge_search；每条命中都记录来源 section、采用项、弃用项和实际落点，并形成“section → primitive/variant → Tailwind token/class → 页面落点”的映射。动效从知识库选彼此兼容的一组，禁止只写 fade-up 或把所有特效硬堆到一页。");
+    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：默认 React/Vite + Tailwind + shadcn/ui/Radix，并按 section/component/data 拆分；禁止退化成单个通用 index.html。只有用户明确要求原生 HTML，或已有技术栈与 React 不兼容时才例外；已有项目不得为满足本条强制迁移。");
+    if (p.fullWebsite) lines.push("完整网站决策律：先按业务品类推导栏目与用户旅程，至少 7 个差异化内容区块并写满具体文案，禁止默认 Hero/Features/Pricing/CTA/Footer 套路；真实图片、视频或 GIF 必须成为内容的一部分。编码前明确数据库选择：不需要、本地持久化或服务端数据库，写出理由；需要账户、跨设备数据、后台管理、订单/预约/评论等持久业务时不能只做静态假界面，不需要时也不要为了显得复杂硬加数据库。");
+    if (p.fullWebsite) lines.push("网站内容取证律：视觉实现前必须取得并记录一条真实内容证据，优先级为：工作区 README/产品文档/素材与既有文案 → 已知品牌的官方主站用 web_fetch 读正文 → generate_wiki 从当前代码提取真实功能 → 同品类公开资料只用于结构与事实核对。没有可验证产品事实时，先写 PRODUCT_BRIEF.md，明确“原创内容/假设/待确认”，再以这些边界写文案；不把搜索标题、竞品措辞或通用 AI 口号伪装成产品事实。");
+    if (p.motionDesignRequired) lines.push("响应式动效律：至少规划微交互、分区入场、滚动叙事/状态转场三层节奏；高级方案必须写清知识库来源、目标区块、时间线/滚动进度、参数和移动端降级，不能把一个孤立 useScroll 或 clip-path 当全站高级动效。桌面与移动分别调整距离、节奏、并发和触发方式，并实现 prefers-reduced-motion/useReducedMotion。");
+    if (p.referenceWebsiteRequired) lines.push("用户指定参考站律：第一次视觉实现前必须对每个用户 URL 成功执行 web_fetch 或 learn_design；记录到 reference/ 的证据至少包括配色/字阶或间距、内容密度与信息架构、可借鉴的响应式与动效节奏。参考站说明品牌与品类事实，michael-design 决定组件、Tailwind 语义 token、可访问性、动效编排和移动端降级。只转译原则，不复制对方文案、图片、logo、DOM、接口或受版权保护的版式；计划写清采纳项、主动舍弃项和原创边界。若参考站是 catalog/editorial/dashboard/story/booking/community 等，不得退化成 Hero/Features/Pricing/CTA 的默认顺序。");
   }
   if (p.websiteDelivery) {
     lines.push("网站生产交付律：网站不是只摆好看页面；必须覆盖真实内容/文案/素材、路由/404/SEO metadata、表单提交/API 错误、加载/空/失败状态、性能基础、无障碍、桌面+手机浏览器验收和主要转化路径。");
@@ -28594,6 +30593,9 @@ function _agentDecisionFrameBlock(text, profile = _engineeringTaskProfile(text))
   }
   if (p.needsReferences) {
     lines.push("外部知识律：稳定语法/本项目代码直接推理；版本、兼容、第三方 API、安全、最新技术或社区踩坑才查官方文档/源码/开发者社区。社区结果是线索，关键结论读原文并标明日期语义，缺日期保持 unknown。");
+  }
+  if (p.authoritativeReferencesRequired) {
+    lines.push("专业工程取证律：对架构、重构、数据库、依赖/API、容器或完整网站的关键决策，先结合本项目约束读取维护者仓库/官方讨论/Stack Overflow 或语言官方论坛的实际材料；计划中写清来源支持的选择、版本/兼容前提、采纳的模式、规避的已知坑，以及本项目验证命令。没有成功来源时必须如实标为未证实，不能借“全球权威”空口背书。");
   }
   if (!p.requiresPlan && !p.substantial && !p.bug && !p.ui && !p.longRunningRuntime && !p.browserAutomation && !p.capture) {
     lines.push("小任务律：直接用最短证据链完成；能一两个工具搞定就别升级成长流程，完成后给结果和真实验证/未验证边界。");
@@ -28701,19 +30703,37 @@ function _learnDesignFromHtml(html, url) {
 function _uiDesignCraftBlock(text, profile = _engineeringTaskProfile(text)) {
   const p = profile || {};
   if (!(p.ui || p.uiProject)) return "";
+  const referenceRule = p.referenceWebsiteRequired
+    ? "\n- 指定参考站优先：用户给出的 URL 不是装饰性链接。先对每个 URL 调用 `web_fetch` 或 `learn_design`，将读取到的色板/字阶/密度、内容与信息架构、响应式/动效节奏记入 `reference/`；再用 **michael-design** 把它们转译为本项目的语义 token、组件、可访问性和移动端动效参数。计划必须写出采纳项、主动不采纳项、非复制边界；严禁复制原站文案、品牌资产、图片、接口、DOM 或完整版式，也不能无视品类结构而回退成通用 Hero/Features/Pricing/CTA。"
+    : "";
+  const transactionalRule = p.transactionalProduct
+    ? "\n- 交易产品硬约束：二手/商品/商城/交易平台不是静态展示页。默认设计服务端持久化与真实数据边界：用户/会话、商品或挂牌、图片资产、分类/筛选、收藏、卖家与买家、价格/库存、交易状态；先决定 API、schema、鉴权、失败/空状态与图片存储。除非用户明确说“只做静态演示”，禁止用 localStorage、假 JSON 或“无后端”替代这些业务数据。"
+    : "";
+  const greenfieldRule = p.fromZeroUiProject
+    ? "\n- 从零网站技术栈硬约束：默认 React/Vite + Tailwind + shadcn/ui/Radix，按 section/component/data 拆分并真正使用 Button/Dialog/Tabs 等 primitive、variant 和语义 Tailwind 类；禁止再次只生成一个通用 index.html。用户明确要求原生 HTML 或已有项目技术栈不兼容时才例外，已有项目不得强制迁移。"
+    : "";
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
-- 设计先行：先确认真实内容、目标用户、品牌调性、现有素材/截图/数据源；缺方向时用 generate_image 出几张方向稿 + design_board 让用户选，用户已指定风格就直接落地，不要卡着问。
-- 设计系统：先定义 tokens 再写页面。至少覆盖 --background/--foreground/--card/--muted/--primary/--accent/--border/--ring/--radius，并映射到 Tailwind theme/CSS variables；主色只选 1 个色系 + 1 个强调色 + 中性色(zinc/slate/neutral)，禁止到处随机 hex。
-- 配色纪律：**绝不靠记忆编 hex**——颜色只允许来自语义 token 或 Tailwind 色阶具体档位（bg-zinc-900/text-emerald-600 这类）；要对标某产品的配色就用 browser design 抓它真实变量，不凭印象。浅色避免死白一片，用 subtle gradient / tinted surface / border alpha 分层；深色用 #0f172a/#111827 级别，不用纯黑；按钮和重点信息必须有可读对比，危险/成功/警告色单独 token。
-- 排版纪律：明确 display/heading/body/caption 四级；标题用 font-display 或项目已有字体，正文用 font-sans；使用 text-5xl/4xl/3xl/2xl、leading-tight/relaxed、max-w-prose/measure 控制阅读宽度，禁止整页同字号同字重。
-- 布局纪律：移动优先；container 用 mx-auto max-w-7xl px-4 sm:px-6 lg:px-8；section 用 py-16/24；复杂区块用 grid-cols-12 或 auto-fit card grid；gap-6/8/12，避免挤、平、乱。先信息架构后装饰：Hero → credibility/social proof → feature/use-case → detail/demo → CTA → footer。
-- 组件纪律：优先 shadcn/ui + Radix primitives：Button/Card/Badge/Tabs/Accordion/Dialog/Sheet/Popover/Tooltip/Progress/Avatar/Separator/Skeleton；用 cn()/variant 思路统一 size、tone、state，别裸 div 造按钮/弹窗/进度条。
+- 所有网站/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据：信息架构/视觉样式/组件体系/Tailwind token，动效/响应式，媒体/头像/语义图标；仅覆盖有缺口时追加检索。每项实施计划必须写成“来源 section → shadcn/Radix primitive 与 variant → Tailwind semantic token/class → 页面落点”，不能只说“参考知识库”。
+- 企业大厂标准（硬性）：每个网站按上市公司官网水准交付，对照知识库 enterprise-standard 命中逐项自检：完整设计体系（间距/字阶/token/状态/variant）、企业级信息架构（8-12 个差异化区块+完整 footer）、信任信号（真实头像/具体数字/logo 墙/法律层）和交付前 polish 清单；配色必须采用知识库命中蓝本或 Curated Palette Library 的成套色值并记录来源，禁止凭模型印象编色；个人小作品感（四段式页面、单行 footer、首字母头像、散样式按钮）= 不合格。
+${referenceRule}
+${transactionalRule}
+${greenfieldRule}
+- 知识库先行：完整网站/视觉重做第一次写文件前，必须成功调用 \`knowledge_search\`，\`domain\` 明确传 \`michael-design\`。**按三轨编排检索，不许一条大杂烩 query 交差**：① 当前业务品类 + information architecture/content density + palette harmony/Tailwind color scale/card layout；② advanced motion choreography/scroll narrative + responsive mobile motion/prefers-reduced-motion；③ real image/video/GIF/avatar + semantic icon mapping/card surface。每轨从命中结果记录具体 section、采用与弃用原因、参数和落点；至少覆盖信息架构、色彩、响应式布局、标志性动效、移动端降级，完整站再覆盖真实媒体和语义图标。服务器自动注入的蓝本是起点，不替代这次可见检索；证据齐了立刻实现。
+- 产品决策先行：先确认真实内容、目标用户、品牌调性、现有素材/截图/数据源，再判断数据生命周期。明确写入计划：数据库=不需要 / 本地持久化 / 服务端数据库，以及理由；账户、跨设备同步、后台管理、订单/预约/评论/收藏等需要真实持久化与多用户一致性的业务必须设计 API/schema/错误态，纯展示站不要硬加数据库。缺视觉方向时才用 generate_image + design_board，用户已指定就直接落地。
+- 设计系统：先把 michael-design 命中的真实色值按用途映射成 tokens 再写页面。至少覆盖 --background/--foreground/--card/--card-foreground/--muted/--muted-foreground/--primary/--primary-foreground/--secondary/--secondary-foreground/--accent/--border/--ring/--radius，并映射到 Tailwind theme/CSS variables；不是只定义不用，业务组件必须使用 bg-background/text-foreground/text-muted-foreground/bg-primary/text-primary-foreground 等语义类。
+- 配色纪律：**绝不靠记忆编 hex**——优先直接采用 michael-design 命中的 Tailwind 色阶，或把命中 Hex/OKLCH 映射成 Tailwind 语义 token；计划写出“来源 section → 原色值/色阶 → semantic role”，并锁定一套“中性族 + 一个主强调族 + 至多一个有明确用途的辅助族”。**配色统一不等于删除颜色变成黑白线框**：除非用户明确要求单色，primary/accent 必须落到至少两类真实角色（CTA、重点卡/标签、链接/图标、选中态、边框/焦点环），不能只定义 token 后全部使用中性灰。全页区块只用 background/muted/secondary/accent/section-* 语义角色，禁止某个 section、按钮或图标突然写 \`bg-blue-500\`/陌生 hex 跳出一整块不相干颜色；真实 success/warning/destructive 才能使用额外状态色。**暗色只在本轮存在肯定式明确选择（如“做成暗色主题”）时才可用；“为什么又暗色/别再用暗色/不要黑底”等提及暗色的抱怨和否定是禁止，不是授权。**用户未明确要求暗色时默认浅色/中性实色，用户未明确要求渐变时最多只允许 1-2 处小面积功能性强调。主次按钮校验普通/hover/focus-visible/active/disabled 对比。
+- 排版纪律：明确 display/heading/body/caption 四级，同时给标题、正文、辅助/弱化文字分别指定 foreground 角色和对比度；标题用 font-display 或项目已有字体，正文用 font-sans；使用 text-5xl/4xl/3xl/2xl、leading-tight/relaxed、max-w-prose/measure 控制阅读宽度，禁止整页同字号、同字重、同一种灰色。
+- 信息架构纪律：先从业务品类和主要用户旅程推导结构，完整首页至少 7 个内容与布局都不同的区块并写满具体文案。SaaS 看工作流/集成/权限/案例，场馆看菜单/空间/预订/活动，电商看分类/筛选/商品/信任/售后，作品集看项目/过程/团队/成果，内容站看栏目/作者/资源/社区。禁止默认 Hero/Features/Pricing/CTA/Footer，也禁止换文案不换骨架。
+- 布局纪律：移动优先；每个区块按内容选择 full-bleed、split、editorial grid、timeline、sticky story、media rail、dense table/list 等构图，不把所有 section 都做成同宽卡片网格。**先数卡片再定网格**：2 张=2 等分/split；3 张=3 等分；4 张优先 2×2（超宽才 4 列）；5 张用 3+2 居中或主卡跨列；6 张用 3×2；7 张用 4+3 居中或 1 主卡+3×2；动态数量用 auto-fit/minmax，并显式处理末行，禁止 4 张塞 3 列、最后一张孤零零落到左下。手机单列或横向 media rail，平板重新排内容顺序，不只是缩字号。全宽区块内部另设 \`w-full max-w-* mx-auto px-*\`；固定格式元素用 aspect-ratio/minmax/grid tracks 保持稳定。Tailwind v4 禁止未分层全局 reset 覆盖 utilities。
+- 组件纪律：shadcn/ui + Radix primitives 用于 Button/Input/Dialog/Tabs/Accordion/Sheet/Popover/Tooltip/Progress/Avatar/Separator/Skeleton 等真实交互；Button 必须落 default/secondary/outline/ghost 的语义 variant 和明确前景色，不能每个按钮手写一套散色。Card 只用于确实独立、重复、可成组的实体，不把导航、hero、整段页面和每个 section 都包成 Card。**真实重复卡片不能全是透明/同色底加细 border 的线框**：从命中蓝本采用 surface 色阶，并在背景 tone、柔和 elevation/内高光、品牌色 tint/重点卡、媒体、克制 hover 中至少组合两层；暗色卡片必须比画布更亮，产生可见 elevation。用 cn()/variant 统一 size、tone、state，别裸 div 造按钮/弹窗/进度条。
+- 媒体纪律：优先使用 michael-design 命中的真实图片/视频/GIF URL，其次才是项目 assets/public 或生成图。完整网站至少 3 个可加载媒体资源，重要区块至少一个视频或 GIF；只要出现团队、作者、客户、评价、评论、社区、玩家等人物内容，就必须使用可加载的真实头像图片/人物肖像（知识库/Pexels/pravatar/本地生成资产），禁止首字母、渐变圆、灰圆或 User 图标冒充头像。媒体必须有响应式裁切、尺寸约束、alt 和同尺寸备用资源；onError 不得直接 display:none 留空洞。
+- 图标语义：先把每个图标写成“业务概念 → 对象/动作/状态 → 图标名”的映射，再从项目现有库、Lucide 或 iconify_search 选同一风格的具体图标。AI 助手用 Bot/Robot/Cpu，自动化用 Workflow，订阅用 Mail/Inbox，安全用 ShieldCheck/Lock，分析用 Chart/Gauge；Sparkles/Wand/Stars 只在含义真的就是闪光/魔法时使用，禁止当万能 AI/高级感占位。库里没有准确图标时先 iconify_search；只有品牌吉祥物或插画型 pictogram 才用 generate_image 生成统一资产，工具栏与按钮图标不得用位图。
 - 交互状态：每个可点击元素要有 hover/focus-visible/active/disabled/loading；表单要有 empty/error/success；图片/图标失败要有 fallback。
-- 动画纪律（手糊的 keyframes = 一眼假）：优先用成熟方案——React 用 motion/framer-motion（whileHover/whileInView/spring/stagger），Vue 用 @vueuse/motion，非框架页用 Motion One 或 tailwindcss-animate 预设；自写只允许小于几行的 transition。缓动/时长有纪律：微交互 150-250ms ease-out，入场 400-600ms + 轻微位移/透明度，列表用 stagger 逐项入场，交互反馈用 spring；绝不 linear、绝不大幅旋转/弹跳/长时间 keyframes；尊重 prefers-reduced-motion。动画服务于层级和反馈，不是炫技。
+- 动画纪律：知识库检索必须同时覆盖“标志性滚动叙事 + 分区 reveal + 控件/状态微交互 + 响应式/移动端编排”，再按当前内容和性能预算选一组彼此兼容的效果，**不是把知识库所有特效堆到一页**。标志性高级动效层必须采用本轮 michael-design 的完整技术组合（例如 GSAP+ScrollTrigger+scrub/pin，或 Motion useScroll+useTransform），连接 2 个以上业务区块，写清触发区间/时间线、参数和视觉目的；结构层用可复用 SectionReveal/ScrollSection 覆盖多个内容区；交互层为按钮、卡片、tab、表单状态提供克制的 150-250ms hover/focus/press/selected 反馈。移动端必须降低位移，并单独设定 reveal distance、duration、stagger/并发上限，取消 pin/重型 canvas 或改成静态/短距离版本；所有层实现 prefers-reduced-motion/useReducedMotion。
 - 大厂风格直出：用户点名"腾讯/谷歌/蚂蚁/字节那种风格"→ 直接用该公司官方开源设计体系，绝不用 shadcn 手仿——谷歌风=Material 3（MUI 或 @material/web + M3 color roles/五级 elevation/display→label 字阶），腾讯风=TDesign（tdesign-react/tdesign-vue-next + 官方令牌 --td-brand-color:#0052D9），蚂蚁=antd v5 theme token，字节=Arco；官方文档查当前用法，同一个站只用一家体系不混搭。
 - 参考纪律（禁靠记忆手糊）：商用级页面动手前先学真实标杆——**首选 learn_design(url) 真正学一套**（抓 styles.refero.design 的 style 页内嵌的完整设计系统：色板 hex+每色真实用途/频率、字阶/字体、dos/donts 纪律，落盘 reference/ 文档+tokens.css，实现时逐条对照：dos 照做、donts 不犯；没链接就 web_search "site:styles.refero.design 品类" 挑了再学）；或 design_research / browser 打开同品类真站抓 design/nodes 看信息架构/密度/节奏；拿不准的 API/组件用法查当前文档，不凭记忆写过时写法。
 - 实现纪律：先复用项目现有组件和样式约定；从零建前端优先 web_scaffold；大段 UI 不要把所有东西塞一个文件，按 section/component/data 拆；Tailwind 类名要围绕 tokens 和组件语义，不堆无法维护的魔法数。
-- 视觉验收：构建通过不等于好看。启动真实 dev server 后，用 browser fresh 打开真实 URL；先 check/nodes，用 batch 连续完成交互，再用 assert/check 证明动作生效；只在最终视觉验收时分别截 1440x900 和 390x844 两张图检查首屏层级、间距、横向溢出、字体截断、console/network。截图丑就继续迭代一轮再收尾。`;
+- 视觉验收：构建通过不等于好看。启动真实 dev server 后只做一次完整矩阵：browser fresh 打开真实 URL，1440x900 与 390x844 分别 check，batch 完成关键交互并 assert；只在最终视觉验收时各截一张检查层级、内容密度、媒体加载、动画触发、横向溢出和文字截断。修补后只复验改动点一次，证据够了立即停止，不重复 fresh/navigate/screenshot。`;
 }
 
 // ============================================================================
@@ -28783,6 +30803,21 @@ function _episodeHintBlock(task, root) {
   });
   return "\n\n📚 **这个项目里你做过的类似任务（经验参考，以当前实际为准、别生搬）**：\n" + lines.join("\n");
 }
+// 项目日志：新会话失忆的另一半——episodes 只按相似任务检索，"这个项目最近
+// 干到哪了"没人回答。把最近几条 episode 压成时间线注入开工上下文，新会话
+// 第一句就知道项目历史，不用用户重新介绍一遍。
+function _projectJournalBlock(root) {
+  try {
+    const eps = _epLoad(root);
+    if (!eps.length) return "";
+    const lines = eps.slice(-6).map((e) => {
+      const tag = e.outcome === "failed" ? "✗" : e.outcome === "partial" ? "△" : "✓";
+      const files = (e.files || []).slice(0, 3).join(", ");
+      return `- ${String(e.ts || "").slice(0, 10)} ${tag} ${String(e.task || "").slice(0, 60)}${files ? `（改了 ${files}）` : ""}`;
+    });
+    return "\n--- 项目日志（本项目最近干过的活，新会话接着这个状态干）---\n" + lines.join("\n");
+  } catch { return ""; }
+}
 // (Store+reflect) at run end: persist the episode (Storage) and distill a reusable
 // insight (Reflection→Experience; for a FAILED run, a Reflexion "what to avoid").
 async function _recordEpisode(run, task, root, outcome, config) {
@@ -28802,7 +30837,7 @@ async function _recordEpisode(run, task, root, outcome, config) {
     const stepList = steps.map((s) => (s.ok ? "✓ " : "✗ ") + s.label).join("\n").slice(0, 1800);
     const prompt = `这是 AI 编码助手刚完成的一个任务的动作记录。抽取**一条可复用经验**，让下次遇到同类任务更快更对。\n\n任务：${ep.task}\n结果：${outcome === "failed" ? "失败/未完成" : outcome === "partial" ? "部分完成" : "成功"}\n动作序列：\n${stepList}\n\n只输出**一句话**（≤60字）可迁移的经验：${outcome === "failed" ? "这类任务为什么没成/坑在哪 + 下次该怎么做。" : "这类任务在本项目里的有效套路/关键步骤/要注意什么。"}不要复述任务、不要客套。`;
     const out = await Promise.race([
-      backend.aiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 120),
+      _billableAiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 120),
       new Promise((res) => setTimeout(() => res(""), 6000)),
     ]);
     const insight = String(out || "").trim().replace(/^["「『]+|["」』]+$/g, "").slice(0, 160);
@@ -28861,7 +30896,7 @@ async function _maybeInduceWorkflow(currentEp, root, config) {
     const desc = cluster.map((e, i) => `任务${i + 1}：${e.task}\n做法：${e.approach || ""}`).join("\n\n");
     const prompt = `下面是同一类、都成功完成的几个编码任务及其做法。归纳出一个**可复用工作流**。\n\n${desc}\n\n严格输出 JSON（不要任何别的字）：{"name":"简短名称","when":"什么时候用(一句)","steps":["通用步骤1","步骤2"]}。步骤 3–6 条、要通用可迁移、写清用哪些工具。`;
     const out = await Promise.race([
-      backend.aiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 300),
+      _billableAiComplete({ ...config, model: cheap }, [{ role: "user", content: prompt }], 300),
       new Promise((res) => setTimeout(() => res(""), 7000)),
     ]);
     const obj = _safeJsonLoose(out);
@@ -28934,9 +30969,13 @@ async function _wrapUpCritic({ config, task, padText, draft, readList }) {
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
-    const res = await fetch(config.baseUrl.replace(/\/+$/, "") + "/v1/chat/completions", {
+    const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + (config.apiKey || "") },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + (config.apiKey || ""),
+        "x-ide-request-id": String(config.requestId || "").slice(0, 128),
+      },
       body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 220, temperature: 0, stream: false }),
       signal: ctrl ? ctrl.signal : undefined,
     });
@@ -29050,9 +31089,25 @@ function _callCanBypassPlanGate(call) {
   return false;
 }
 
+// 大计划工程识别：按【任务意图】判定，不按文件计数（改几个文件是事后现象，不是
+// 工程属性——修 61 个类型错误碰 5 个文件也是直线修复活，从零建站哪怕先写 1 个文件
+// 也是大工程）。大计划 = 从零/完整交付、整站/多模块/工业级、架构级重构：这种活没有
+// 全貌路线图就开写，用户只能盲等。bug 修复/排查/类型错误清理永远不算大计划。
+function _planGateGrandProject(run) {
+  const e = run?.engineering || {};
+  if (e.explicitReadOnly) return false;
+  if (e.bug || e.debugProject) return false;
+  return !!(e.fullWebsite || e.websiteDelivery || e.industrialProject || e.largeProject
+    || e.multiService || e.featureCompleteness || (e.architecture && e.projectScope));
+}
+
 function _runNeedsPlanGateNow(run, call = null) {
-  if (!_runRequiresPlan(run)) return false;
   if (Array.isArray(run?._planSteps) && run._planSteps.some((s) => s?.status !== "cancelled")) return false;
+  // run_worker 角色拆分并行 = 必然的大工程编排：派工前必须已有工程全貌计划
+  // （模块划分/角色分工/接口契约/验证点），这是编排者五步纪律的第一步。
+  if (call && call.type === "worker") return true;
+  if (!_runRequiresPlan(run)) return false;
+  if (!_planGateGrandProject(run)) return false;
   return !_callCanBypassPlanGate(call);
 }
 
@@ -29061,7 +31116,7 @@ function _requiredPlanIssue(run, steps, call = null) {
   return _planQualityIssue(steps, _runRequiresPlan(run), _planEffectForRun(run), run?.engineering || null);
 }
 
-async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "" }) {
+async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "", billingTasks = [] }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // Apply the real per-model thinking knob selected in the model hover card.
   // This is profile-driven: OpenAI/xAI use reasoning_effort, Claude/Gemini use
@@ -29085,7 +31140,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   run._requirementsChecklist = [...run._originalRequirementsChecklist];
   // 取消支持：每个 run 一个唯一 id，塞进 config（→ Rust AiConfig.request_id）+ 挂到
   // session，这样用户点 Stop 时 _setStreaming(session,false) 能 cancel_ai 掉在飞的请求。
-  run._reqId = "req_" + ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+  run._reqId = /^[-_A-Za-z0-9]{8,128}$/.test(String(config.requestId || ""))
+    ? String(config.requestId)
+    : _newIdeRequestId();
+  run._billingTasks = Array.isArray(billingTasks) ? billingTasks : [];
   session._reqId = run._reqId;
   try { config.requestId = run._reqId; } catch {}
   // 云端提示词：首次（_remotePrompts 为空）必须 await 拿到再发消息，否则模型收不到完整指引；
@@ -29095,7 +31153,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // early hang (e.g. a slow MCP connect) would leave the button showing "Stop"
   // while _isStreaming() is still false → the Stop click is a dead no-op.
   session._runIsLoop = true; // this run has a draining loop → a 2nd message steers it mid-run
-  session._runUsage = { in: 0, out: 0, est: false }; // per-run usage for the reply-stats footer
+  session._runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   const _live = () => !!session.streaming;
@@ -29104,12 +31162,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   body.appendChild(thinkingCard());
   const _liveStats = _liveTurnStats(body, {
     startedAt: run._recStart,
-    model: config.model,
-    getUsage: () => {
-      const ru = session._runUsage;
-      return ru ? { in: ru.in, out: ru.out, est: !!ru.est } : { in: 0, out: 0, est: true };
-    },
+    getSettlement: () => _liveRunSettlement(session._runUsage),
   });
+  session._liveRunStats = _liveStats;
 
   const isAgent = run.mode === "agent";
   // Connect external MCP servers (cached), but HARD-BOUNDED so a wedged/slow
@@ -29139,7 +31194,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Keep the complete registry and MCP routing state on the run. Only the per-turn model payload
   // is windowed; search_tools/direct-by-name can swap an omitted schema into that bounded window.
   run._toolRegistry = _buildToolRegistry(isAgent, run.mcpToolCache);
-  const initialTools = _selectInitialTools(isAgent, run._originalText, run.mcpToolCache);
+  const initialTools = _selectInitialTools(isAgent, run._originalText, run.mcpToolCache, run.mode);
   const desiredCoreNames = new Set(initialTools
     .map((tool) => tool?.function?.name || "")
     .filter((name) => name && !name.startsWith("mcp__")));
@@ -29209,6 +31264,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
+  let _uiDeliveryAuditedAtImplOps = -1, uiDeliveryAuditRuns = 0, uiDeliveryAuditNudges = 0;
   let _uiFreshNavigated = false, _uiActionPassed = false, _uiInteractionPassed = false;
   const _uiPassedViewports = new Set();
   const _uiInteractionViewports = new Set();
@@ -29267,6 +31323,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _pushNudge = (cat, content) => {
     const prev = _nudgeReg.get(cat);
     if (prev) { const i = messages.indexOf(prev); if (i !== -1) messages.splice(i, 1); }
+    // 同轮活跃上限：不同类别的提醒同时挂在尾部（planStale+verify+honesty+…），模型会
+    // 逐条表态——输出又长又自我横跳（用户实测骂"痴呆"）。上限 2 条：超出先清最旧的
+    // 非 steer 类别（steer 是用户实时插话的护送指令，永远最高优先级不清）。
+    while (_nudgeReg.size >= 2) {
+      const oldestCat = [..._nudgeReg.keys()].find((key) => key !== "steer" && key !== cat);
+      if (!oldestCat) break;
+      const oldMsg = _nudgeReg.get(oldestCat);
+      const oi = messages.indexOf(oldMsg);
+      if (oi !== -1) messages.splice(oi, 1);
+      _nudgeReg.delete(oldestCat);
+    }
     const m = { role: "user", content };
     _nudgeReg.set(cat, m);
     messages.push(m);
@@ -29279,6 +31346,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
   };
   _hydrateRunContextEvidence(run, root, run._pendingContextEvidence);
+  // Design work is not allowed to rely on the model volunteering a knowledge_search
+  // call. Fetch the scoped michael-design material before the first planning turn,
+  // preserve structured evidence for gates/audits, and give the model the factual
+  // brief as its immediate working source.
+  const michaelDesignPreflight = await _runMichaelDesignPreflight({ run, body, isLive: _live });
+  if (michaelDesignPreflight.required && michaelDesignPreflight.results.length) didInvestigate = true;
+  if (_live() && michaelDesignPreflight.required) {
+    _pad.findings.push(michaelDesignPreflight.evidence
+      ? `michael-design 已在首轮前预取并注入：${(michaelDesignPreflight.evidence.sourceSections || []).join("、") || "已命中但未返回 section"}`
+      : "michael-design 首轮预取没有可用命中；已明确注入不可用状态，不能伪造其内容。");
+    messages.push({ role: "user", content: michaelDesignPreflight.brief });
+  }
   if (_mustUseWorkspaceTools) {
     messages.push({
       role: "user",
@@ -29370,6 +31449,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               run._cancelledEffectKinds.delete("workspace");
             }
             run._steeringText = `${run._steeringText || ""}\n${steerText}`.trim().slice(-12000);
+            // 插话与正常消息同权：入需求账本 + 长期记忆自动沉淀（此前只有 sendPrompt 入口有）
+            try {
+              const _sl = steerText.trim().replace(/\s+/g, " ");
+              if (_sl.length >= 6 && session) {
+                session._demandLedger = Array.isArray(session._demandLedger) ? session._demandLedger : [];
+                session._demandLedger.push(_sl.slice(0, 240));
+                if (session._demandLedger.length > 40) session._demandLedger.splice(0, session._demandLedger.length - 40);
+              }
+              _autoMemoryCapture(root, _sl);
+              run._billingTasks.push(_distillMemoryLLM(root, _sl, config));
+            } catch {}
             run.engineering = _engineeringTaskProfile(`${run._originalText || ""}\n${run._steeringText}`);
             const afterContract = _requiredEffectContract(run);
             const beforeEffects = new Set([
@@ -29400,6 +31490,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             ? steerAttachments : priorImages;
           const content = await _attachmentAwareContent(`[MICHAEL_USER_STEERING]\n\n${steerText}`, effectiveAttachments, config, 7_000_000, false, steerText);
           messages.push({ role: "user", content });
+          // 插话不是背景噪音：不带这条指令时，模型常沉浸在旧任务收尾语境里，把用户的
+          // 新需求当模糊插话、回旧话题的选项菜单反问（实测："帮我写个宣传网站"被回
+          // "你想让我做什么？1234"）。明确它的优先级和处理方式。
+          _pushNudge("steer", "上一条 [MICHAEL_USER_STEERING] 是用户此刻的最高优先级指令：是新任务/新方向就立刻放下旧任务的收尾流程直接转向执行它；是补充约束就立刻应用到当前任务。正面回应/执行那条本身——绝不拿旧话题的选项菜单反问、不先总结旧任务再兜圈子。");
         }
       }
       // Running self-memory (fixes "改完文件又改一遍"): just before each model turn, remind it —
@@ -29465,13 +31559,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             continue;
           }
         }
-        if (_isTransientTurnErr(turn.error) && _turnFails < 3 && _live()) {
+        if (_isTransientTurnErr(turn.error) && _turnFails < 5 && _live()) {
           _turnFails++;
           const _partialText = String(turn.text || "").trim();
           const _cleanTurnErr = String(turn.error || "")
             .replace(/^\[(?:(?:fast|turn|tool-stream)-retry-exhausted)\]\s*/i, "")
             .trim();
-          showAgentRetryToast(`网络/服务波动 (${_turnFails}/3)，自动恢复中…`);
+          showAgentRetryToast(`网络/服务波动 (${_turnFails}/5)，等待链路恢复后自动继续…`);
           if (_partialText) {
             summaryText += (summaryText ? "\n\n" : "") + _partialText;
             messages.push({ role: "assistant", content: _partialText });
@@ -29480,6 +31574,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             ? `[系统：上一轮模型调用因网络波动中断（${_cleanTurnErr.slice(0, 100)}），IDE 已保留上方部分回复并自动重试。请从中断处继续，不要重复已输出内容；如果需要调用工具，重新输出完整工具调用。]`
             : `[系统：上一轮模型调用因网络波动失败（${_cleanTurnErr.slice(0, 100)}），IDE 已自动重试。继续你正在做的任务。]`);
           await new Promise((r) => setTimeout(r, 1500 * _turnFails));
+          // 真"自动恢复"：探测网关直到链路真的回来（每次最多等 90s），
+          // 而不是固定间隔撞完三下就把整个任务连同未完成计划一起丢下。
+          await _waitForAiRecovery(config, 90_000, _live);
           if (!_live()) { finalErr = turn.error; break; }
           continue;
         }
@@ -29545,7 +31642,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         });
         const _missingRequiredEffect = _missingEffects.length > 0;
         const _uiSettled = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps || uiVerifyNudges >= 2;
-        const _requirementsSettled = true;
+        const _uiDeliveryRequired = !!(run.engineering.fullWebsite && run.engineering.uiProject);
+        const _requirementsSettled = !_uiDeliveryRequired || !didMutate || _uiDeliveryAuditedAtImplOps >= _implOps || uiDeliveryAuditRuns >= 3;
         if (quietTurns >= 4 && !pending && !_finishPlanIssue && !_missingRequiredEffect && (!didMutate || _verifiedAtImplOps >= _implOps || _verifyExhausted) && _uiSettled && _requirementsSettled) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           break;
@@ -29553,7 +31651,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // C — 任务计划里还有未完成步骤就想收尾 → 推它把计划做完或诚实标记，最多 2 次。
         if (pending && continueNudges < 2) {
           continueNudges++;
-          _pushNudge("planPending", "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾；确实不需要做的步骤用 update_plan 标成 cancelled，别直接丢下。");
+          _pushNudge("planPending", "你的任务计划里还有未完成的步骤（pending / in_progress）。继续把它们做完再收尾；确实不需要做的步骤用 update_plan 标成 cancelled，别直接丢下。补收尾时**只说新完成的部分**，前面已经说过的总结/结论一个字都不要重复。");
           continue;
         }
         // 模型把“要用户拿主意”的问题写在正文里 → 逼它改用 ask_user 弹可点击选项，
@@ -29611,7 +31709,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           continue;
         }
         if (_missingRequiredEffect) {
-          run._incompleteReason = "required_mutation_missing";
+          run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
           hitCap = true;
           break;
         }
@@ -29661,11 +31759,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               } else {
                 // Green. Record the op count so a LATER edit re-triggers verification.
                 didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps; _prevVerifyErrs = null; _noProgressVerify = 0;
+                run._diagnosticBlock = "";
                 const _planDone = !Array.isArray(planSteps) || !planSteps.some((s) => s.status === "pending" || s.status === "in_progress");
                 if (_planDone) {
                   // Build passed AND plan is complete → fall through to break.
                 } else {
-                  _pushNudge("verify", `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤。`);
+                  _pushNudge("verify", `已自动验证：\`${_vcmd}\` 通过（无报错）。继续完成剩余步骤；若你已经写过收尾总结，只补一句"验证通过"即可，**不要重写整份总结**。`);
                   continue;
                 }
             }
@@ -29679,6 +31778,34 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _pushNudge("verify", "你改了代码但**还没真跑过一遍**。光读代码、光编译过都不算——**必须把它实际跑起来看结果**：\n· 脚本 / CLI / 爬虫 → run_cmd 直接执行它，看输出对不对、有没有运行时报错。\n· 网站 / 服务 → 后台起服务，再用 http_request / curl 打关键路径，确认 200 且内容对（能的话 browser 打开看一眼）。\n· 能编译 / 测试的顺带 run_cmd 跑 build / test 或 get_diagnostics。\n**编译过 ≠ 跑得起来，亲眼看它跑通了才准收尾。** 极少数确实没法自动跑的才免验，但收尾时**必须如实写明「没实际运行验证过、可能跑不起来」**，绝不许假装做好了。");
               continue;
             }
+          }
+        }
+        if (run._diagnosticBlock && _live()) {
+          _pushNudge("diagBlocking", `[BLOCKING_NEW_DIAGNOSTICS] 新增诊断仍未解除。先修复下面这些错误并重新运行真实构建/测试；只有退出码 0 才能推翻可能过期的 LSP 结果。在此之前不要继续无关功能、不要收尾：\n\n${run._diagnosticBlock}`);
+          continue;
+        }
+        const _needsUiDeliveryAudit = run.engineering.fullWebsite && run.engineering.uiProject && didMutate
+          && _uiDeliveryAuditedAtImplOps < _implOps && uiDeliveryAuditRuns < 3;
+        if (_needsUiDeliveryAudit && _live()) {
+          uiDeliveryAuditRuns++;
+          let findings = [];
+          try { findings = await _auditUiDeliveryFiles(root, [..._mutatedFiles], run.engineering, run._michaelDesignEvidence, run._websiteContentEvidence, run._referenceWebsiteEvidence); }
+          catch (error) { findings = [`源码交付审计执行失败：${String(error?.message || error).slice(0, 180)}`]; }
+          if (!findings.length) {
+            _uiDeliveryAuditedAtImplOps = _implOps;
+            run._uiDeliveryAuditUnresolved = [];
+          } else {
+            run._uiDeliveryAuditUnresolved = findings.slice(0, 8);
+            if (uiDeliveryAuditNudges < 2) {
+              uiDeliveryAuditNudges++;
+              const missingDesignResearch = findings.some((item) => /michael-design 主编排缺失|知识库配色未落地|知识库媒体未落地|知识库动效未落地/.test(String(item || "")));
+              const designResearchRepair = missingDesignResearch
+                ? `\n先执行以下缺失的知识库工具链，再改源码：\n${_michaelDesignResearchPlan(run._originalText || "", run.engineering).map((item, index) => `${index + 1}. knowledge_search(domain="michael-design", query="${item.query}") [${item.purpose}]`).join("\n")}`
+                : "";
+              _pushNudge("uiDeliveryAudit", `[UI 交付源码审计 ${uiDeliveryAuditRuns}/3 未通过]\n${findings.map((item, index) => `${index + 1}. ${item}`).join("\n")}${designResearchRepair}\n直接修复以上真实缺陷（这些是代码里客观可查的问题，不是风格意见）。修完后会再做一次有界源码审计；它不打开浏览器，也不会造成截图循环。`);
+              continue;
+            }
+            if (uiDeliveryAuditRuns >= 3) _uiDeliveryAuditedAtImplOps = _implOps;
           }
         }
         const _needUiVerify = run.engineering.ui && didMutate && _uiVerifiedAtImplOps < _implOps;
@@ -29719,6 +31846,30 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             }
             if (_hits.length) {
               _pushNudge("uiDiscipline", `[交付自查·UI 纪律扫描] 你改过的前端文件里扫到 ${_hits.length} 处违规（铁律：图标一律 SVG/lucide、颜色一律语义令牌）：\n${_hits.join("\n")}\n逐处修掉再收尾；确属正文内容里合理的 emoji（不是图标/按钮/状态符号）可保留但要说明。`);
+              continue;
+            }
+          } catch { /* scan is best-effort */ }
+        }
+        // 交付自查·demo 味扫描（一次性，不限 UI）：商业级交付红线——TODO/"简化处理"/
+        // "实际项目中应…"这类糊弄标记出现在交付代码里 = 模型自己承认没写完。机械扫
+        // 改过的代码文件，把 文件:行号 怼给模型当场补完，不靠肉眼。
+        if (didMutate && !run._demoSmellNudged && _live()) {
+          run._demoSmellNudged = true;
+          try {
+            const _codeFiles = [..._mutatedFiles].filter((p) => /\.(tsx?|jsx?|vue|svelte|py|rs|go|java|rb|php|html)$/i.test(p)).slice(0, 12);
+            const _smellRe = /(?:\/\/|#|\/\*|<!--|""")\s*(?:TODO|FIXME|XXX)\b|简化(?:处理|实现|版本?)|实际(?:项目|生产|部署)(?:中|环境)?(?:应该?|需要|再|时)|这里(?:先)?省略|暂时省略|留待实现|后续(?:再)?(?:完善|补充|实现)|省略(?:了)?(?:错误|异常)处理|for\s+demo|demo\s+(?:only|purposes)|in\s+(?:a\s+)?(?:real|production)\s+(?:app|project|environment)/i;
+            const _demoHits = [];
+            for (const rel of _codeFiles) {
+              let _txt = "";
+              try { _txt = await backend.readTextFile(_resolveRel(rel, root)); } catch { continue; }
+              const _lines = _txt.split("\n");
+              for (let li = 0; li < _lines.length && _demoHits.length < 12; li++) {
+                if (_smellRe.test(_lines[li])) _demoHits.push(`${rel}:${li + 1} ${_lines[li].trim().slice(0, 90)}`);
+              }
+              if (_demoHits.length >= 12) break;
+            }
+            if (_demoHits.length) {
+              _pushNudge("demoSmell", `[交付自查·demo 味扫描] 交付标准是商业级（完全能用），但你改过的代码里扫到 ${_demoHits.length} 处"没写完"的自供状：\n${_demoHits.join("\n")}\nTODO/"简化处理"/"实际项目中应…"出现在交付代码里 = 自己承认糊弄。逐处把真实实现补完（真错误处理/真数据路径/真校验）再收尾；确属用户要求的占位要在收尾里明说。`);
               continue;
             }
           } catch {}
@@ -29895,13 +32046,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             return "· " + s.function.name + (purpose ? " — " + purpose : "");
           });
           const rejectedNote = update.rejected.length
-            ? `\n另找到 ${update.rejected.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`
+            ? `\n另找到 ${update.rejected.length} 个匹配工具，但当前 64 tools / 256 KiB 窗口无法装入，未加载。请缩小查询后重试。`
             : "";
           let content;
           if (lines.length) content = "已加载 " + lines.length + " 个工具，现在可直接调用：\n" + lines.join("\n") + rejectedNote;
           else if (exact?.schema && loaded.has(exact.name)) content = `工具 ${exact.name} 已在当前工具列表中，请直接调用。`;
           else if (exact && !exact.schema) content = `当前注册表没有名为 ${exact.name} 的工具。`;
-          else if (adds.length) content = `找到 ${adds.length} 个匹配工具，但当前 128 tools / 512 KiB 窗口无法装入，未加载。请缩小查询后重试。`;
+          else if (adds.length) content = `找到 ${adds.length} 个匹配工具，但当前 64 tools / 256 KiB 窗口无法装入，未加载。请缩小查询后重试。`;
           else content = "没找到匹配的新工具——这个能力可能已在你现有工具列表里（直接按名调用即可），或换个说法再 search_tools。";
           const r = { type: "search_tools", path: "", content };
           it.rawResult = r;
@@ -29937,10 +32088,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 依赖恢复照常放行），最多拦 2 次防死循环，之后放行不再纠缠。
         if (run && _runNeedsPlanGateNow(run, call) && planGateNudges < 2) {
           planGateNudges++;
-          const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 这是复杂任务，动手修改前先调用 update_plan 列出任务计划（具体文件/步骤/验证点），让用户看到你要做什么。列完计划后重新执行这次被拦下的调用。" };
+          const r = { type: call.type, path: call.path || "", content: call.type === "worker"
+            ? "[BLOCKED] 派 worker 前必须先用 update_plan 列出**工程全貌计划**：模块划分、每个角色（frontend/backend/database/test…）负责哪块、模块间接口契约、每块的验证点。这是编排的第一步——想清全貌再拆分，列完计划重新派发。"
+            : "[BLOCKED] 这是从零/完整交付级的大工程，动手前先用 update_plan 列出全貌路线图（模块/文件/顺序/验证点），让用户看到你要做什么。列完计划后重新执行这次被拦下的调用。" };
           it.rawResult = r;
           it._skipped = true;
           _settleToolStep(step, r, "先列计划 · 未执行");
+          return _toolResultToString(call, r);
+        }
+        const _uiReadinessIssue = _uiImplementationReadinessNudge(run, planSteps, call);
+        if (_uiReadinessIssue) {
+          const r = { type: call.type, path: call.path || "", content: `[BLOCKED_ONCE] ${_uiReadinessIssue}。先完成上面的分主题 michael-design 检索，把每轨命中的 section、Tailwind 色阶/Hex/OKLCH→语义角色、卡片数量/断点方案、真实媒体 URL、高级动效技术和移动端参数写进计划。计划必须锁定中性族+主强调族、禁止局部新增陌生色相，写清卡片末行处理、业务概念→具体图标、跨区块动效编排/移动端降级，以及用户直接提供内容对应的区块和数据库取舍。本轮只提示这一次，后续脚手架和写入不会重复阻塞；最终源码审计仍会检查实际交付。完成后重新执行这次写入。` };
+          it.rawResult = r;
+          it._skipped = true;
+          const readinessLabel = _uiReadinessIssue.includes("成功检索 michael-design")
+            ? "设计检索未完成 · 未执行"
+            : "实施计划未就绪 · 未执行";
+          _settleToolStep(step, r, readinessLabel);
           return _toolResultToString(call, r);
         }
         if (_MUTATING_FILE_TOOL_TYPES.has(call.type)) {
@@ -30020,6 +32184,31 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             return r.content;
           }
         }
+        // 已停用：源码审计绝不阻拦浏览器验证——之前会把 browser 拦成"源码未达标 · 未打开浏览器"，
+        // 与"必须真机验证"互相死锁，任务永远收不了尾。
+        const needsUiSourcePreflight = false;
+        if (needsUiSourcePreflight) {
+          const issue = await _uiDeliveryBrowserPreflightIssue({
+            call,
+            root,
+            files: [..._mutatedFiles],
+            profile: run.engineering,
+            designEvidence: run._michaelDesignEvidence,
+            contentEvidence: run._websiteContentEvidence,
+            referenceEvidence: run._referenceWebsiteEvidence,
+          });
+          if (issue) {
+            run._uiDeliveryAuditUnresolved = issue.split("\n").slice(1, 9).map((line) => line.replace(/^\d+\.\s*/, "")).filter(Boolean);
+            const r = { type: call.type, path: call.url || call.action || call.path || "", content: issue };
+            it.rawResult = r;
+            it._skipped = true;
+            _settleToolStep(step, r, "源码未达标 · 未打开浏览器");
+            if (run._recentSigs) run._recentSigs.push(_sig);
+            return _toolMsgForModel(call, r);
+          }
+          _uiDeliveryAuditedAtImplOps = _implOps;
+          run._uiDeliveryAuditUnresolved = [];
+        }
         const screenshotModeIssue = _screenshotModePreflightIssue(call, run);
         if (screenshotModeIssue) {
           const r = { type: "screenshot", path: call.url || call.path || "", content: screenshotModeIssue };
@@ -30072,7 +32261,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
         }
         _rememberHttpEvidenceFromTool(run, call, result);
-        if (result?.evidence?.resultKind === "duplicate") it._skipped = true;
+          const michaelDesignEvidence = run ? _michaelDesignEvidenceFromResult(call, result) : null;
+          if (michaelDesignEvidence) run._michaelDesignEvidence = _mergeMichaelDesignEvidence(run._michaelDesignEvidence, michaelDesignEvidence);
+          const websiteContentEvidence = run ? _websiteContentEvidenceFromResult(call, result) : null;
+          if (websiteContentEvidence) run._websiteContentEvidence = _mergeWebsiteContentEvidence(run._websiteContentEvidence, websiteContentEvidence);
+          const referenceWebsiteEvidence = run ? _referenceWebsiteEvidenceFromResult(call, result, run.engineering) : null;
+          if (referenceWebsiteEvidence) run._referenceWebsiteEvidence = _mergeReferenceWebsiteEvidence(run._referenceWebsiteEvidence, referenceWebsiteEvidence);
+          if (result?.evidence?.resultKind === "duplicate") it._skipped = true;
         // Track failed text searches for fuzzy dedup (search + websearch only, NOT find_files)
         if (run && (call.type === "search" || call.type === "websearch")) {
           const _c = (result && result.content) || "";
@@ -30134,8 +32329,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _settleToolStep(it.step, it.rawResult, "先列计划 · 未执行");
           return message;
         }
+        const uiReadinessIssue = isWorker
+          ? _uiImplementationReadinessNudge(run, planSteps, { type: "worker", scope: it.call.scope || [] })
+          : "";
+        if (uiReadinessIssue) {
+          const message = `[BLOCKED_ONCE] ${uiReadinessIssue}。写入型 worker 开始视觉实现前，先由主智能体完成 michael-design 检索并更新计划。本轮只提示这一次，之后不会重复拦截；最终源码审计仍会检查实际交付。`;
+          it.rawResult = { type: "worker", path: it.call.description || "worker", content: message };
+          it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
+          body.appendChild(it.step);
+          _settleToolStep(it.step, it.rawResult, uiReadinessIssue.includes("成功检索 michael-design")
+            ? "设计检索未完成 · 未执行"
+            : "实施计划未就绪 · 未执行");
+          return message;
+        }
         let workerMutated = false;
-        const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], onMutation: () => { workerMutated = true; } });
+        it._workerMutationPaths = [];
+        const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], role: it.call.role || "", onMutation: (path) => {
+          workerMutated = true;
+          if (path && !it._workerMutationPaths.includes(path)) it._workerMutationPaths.push(path);
+        } });
         const key = (isWorker ? "🔧 " : "🤖 ") + (it.call.description || (isWorker ? "worker" : "subagent"));
         if (!trackedFiles.has(key)) { trackedFiles.set(key, isWorker ? "worker" : "subagent"); _updateFilesBar(filesBar, filesList, trackedFiles); }
         if (isWorker && workerMutated) it._workerMutated = true;
@@ -30166,11 +32378,45 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       const canRunInReadSegment = (it) => !!it.call && (_isReadOnlyParallel(it.call)
         || ["run_subagent", "research_project", "design_research"].includes(it.tc.name));
 
-      // Preserve model call order. Only a contiguous run of provably read-only calls
-      // may execute together; every mutation/command/worker is a hard barrier.
+      // Capture the exact diagnostics state before the first JS/TS mutation of
+      // each path. This baseline belongs to the whole run, so later edits cannot
+      // dismiss newly introduced errors as pre-existing LSP noise.
+      run._diagnosticBaselineCounts = run._diagnosticBaselineCounts || new Map();
+      run._diagnosticBaselinePaths = run._diagnosticBaselinePaths || new Set();
+      run._diagnosticCheckPaths = run._diagnosticCheckPaths || new Set();
+      const _diagnosticCandidates = [];
+      for (const it of items) {
+        const call = it.call;
+        if (!call || _isMergedToolItem(it)) continue;
+        if (_MUTATING_FILE_TOOL_TYPES.has(call.type) && call.path) _diagnosticCandidates.push(call.path);
+        if (it.tc.name === "run_worker" && Array.isArray(call.scope)) _diagnosticCandidates.push(...call.scope);
+      }
+      const _newBaselinePaths = _diagnosticCandidates.filter((path) => {
+        const ext = (String(path).split(".").pop() || "").toLowerCase();
+        if (!_LINTABLE_EXT.has(ext)) return false;
+        const key = _pathIdentity(_resolveRel(path, root));
+        if (run._diagnosticBaselinePaths.has(key)) return false;
+        run._diagnosticBaselinePaths.add(key);
+        return true;
+      });
+      if (_newBaselinePaths.length && _live()) {
+        const baseline = await _interleavedDiagnostics(_newBaselinePaths, root);
+        for (const [key, count] of baseline.counts) run._diagnosticBaselineCounts.set(key, count);
+      }
+
+      // Preserve model call order. A contiguous run of provably read-only calls runs in
+      // parallel ("read" segment); a contiguous run of run_worker calls ALSO runs in
+      // parallel ("worker" segment — 这才是"并行 worker"的兑现，scope 互不重叠守卫
+      // 已在执行层拒绝重叠；此前 worker 被当硬屏障，同轮派 3 个 worker 实际串行跑，
+      // 白白三倍耗时）。其余每个修改/命令仍是硬屏障。
       await _runOrderedToolSegments(
         items,
-        (it, index) => !toolMsgs[index] && canRunInReadSegment(it),
+        (it, index) => {
+          if (toolMsgs[index] || !it.call) return "";
+          if (canRunInReadSegment(it)) return "read";
+          if (it.call.type === "worker") return "worker";
+          return "";
+        },
         async (it, index) => {
           if (toolMsgs[index]) return;
           const message = { role: "tool", tool_call_id: it.tc.id, content: await executeScheduledItem(index) };
@@ -30221,6 +32467,27 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
 
+      // 计划实时跟进强制器：模型列了计划却闷头干活几十个工具不更新状态（用户盯着 0/N
+      // 干着急），这里按"执行了多少工具但计划状态签名没变"来催。签名 = 各步骤状态串联；
+      // 每积累 8 次工具执行且签名未变就 nudge 一次（每轮最多计一次，全程最多 4 次）。
+      if (run.mode === "agent" && _live()) {
+        const _ps = Array.isArray(run._planSteps) ? run._planSteps : [];
+        if (_ps.length >= 2 && _ps.some((s) => s.status === "pending" || s.status === "in_progress")) {
+          const _sig = _ps.map((s) => s.status).join(",");
+          if (_sig !== run._planSigLast) {
+            run._planSigLast = _sig;
+            run._planSigStaleOps = 0;
+          } else {
+            run._planSigStaleOps = (run._planSigStaleOps || 0) + items.length;
+          }
+          if (run._planSigStaleOps >= 8 && (run._planStaleNudges || 0) < 4) {
+            run._planStaleNudges = (run._planStaleNudges || 0) + 1;
+            run._planSigStaleOps = 0;
+            _pushNudge("planStale", `[计划状态陈旧] 你已经连续执行了多个工具，但任务计划的步骤状态一直没动（用户盯着 ${_ps.filter((s) => s.status === "completed").length}/${_ps.length} 干着急）。立刻调用 update_plan 把真实进度同步上去：正在做的标 in_progress、真做完的标 completed、不做的标 cancelled——然后继续干活。计划是给用户看的实时仪表盘，不是开工仪式。`);
+          }
+        }
+      }
+
       // Honesty: did any tool this turn report failure / unavailable / blocked?
       // The finish gate uses this to stop the model claiming fake success.
       {
@@ -30267,6 +32534,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const actualPath = c._resolvedPath || _resolveRel(c.path, root);
         if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
       }
+      for (const it of items) {
+        for (const path of (it._workerMutationPaths || [])) {
+          const actualPath = _resolveRel(path, root);
+          if (!_successfulEdits.includes(actualPath)) _successfulEdits.push(actualPath);
+        }
+      }
       // Always retain pending paths, even after the bounded diagnostics budget is
       // spent; otherwise later edits silently stop reaching check/test gates.
       for (const p of _successfulEdits) {
@@ -30274,59 +32547,33 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         run._checkPendingPaths = (run._checkPendingPaths || new Set()).add(p);
       }
 
-      // Interleaved verification: the instant this turn changed JS/TS code, run
-      // the built-in worker's diagnostics on the touched files and, if the edit
-      // introduced real errors, inject them NOW so the model self-corrects THIS
-      // run instead of only at the end-of-run gate. Best-effort + zero-noise:
-      // JS/TS only, errors only (module-resolution false positives filtered),
-      // bounded per run; defers everything else to the existing verify gate.
-      if (_live() && interleaveVerifies < 3) {
-        if (_successfulEdits.length) {
-          const _d = await _interleavedDiagnostics(_successfulEdits, root);
-          if (_d.ran) didVerify = true; // we ran diagnostics → don't double-nag at the finish gate
-          if (_d.report && _live()) {
-            interleaveVerifies++;
-            runHadTrouble = true;
-            _pushNudge("diag", "你刚改的文件有报错（编辑器/语言服务的即时诊断），先定位修掉再继续，别带着这些错往下走：\n\n" + _d.report);
-          }
+      // Compare every JS/TS mutation batch against the pre-run baseline. New
+      // errors remain a blocking run invariant until diagnostics are clean or a
+      // real exit-code-0 project check proves the language service was stale.
+      if (_live() && _successfulEdits.length) {
+        for (const path of _successfulEdits) {
+          const ext = (String(path).split(".").pop() || "").toLowerCase();
+          if (_LINTABLE_EXT.has(ext)) run._diagnosticCheckPaths.add(path);
+        }
+        const _d = await _interleavedDiagnostics(
+          [...run._diagnosticCheckPaths],
+          root,
+          run._diagnosticBaselineCounts,
+        );
+        if (_d.report && _live()) {
+          interleaveVerifies++;
+          runHadTrouble = true;
+          verificationPassed = false;
+          run._diagnosticBlock = _d.report;
+          _pushNudge("diag", "[BLOCKING_NEW_DIAGNOSTICS] 你刚才的修改引入了新增错误。先修复并重新验证；这些错误清零前不要继续无关功能，也不能用“LSP 误报 / 应该能过”收尾：\n\n" + _d.report);
+        } else if (_d.ran) {
+          run._diagnosticBlock = "";
         }
       }
 
-      // Auto-CHECK: fast compile/type-check (cargo check / go build / ruff) after every
-      // ≥2 changed files — the cheapest strongest "每行有把握" signal for compiled langs
-      // (JS/TS is already covered by live Monaco diagnostics above). Surfaces a compile
-      // error the SAME turn it's introduced instead of letting it pile up. ≤5 runs/task,
-      // 60s timeout, only the failure injected back.
-      const _checkPending = run._checkPendingPaths || new Set();
-      if (_live() && run.stack?.checkCmd && _checkPending.size >= 2 && (run._autoChecksRan || 0) < 5) {
-        const _c = await _runApprovedVerification(run.stack.root || root, run.stack.checkCmd, run);
-        if (_c.ok) for (const kind of _runtimeCommandKinds(run.stack.checkCmd)) _runtimeEffects.add(kind);
-        run._autoChecksRan = (run._autoChecksRan || 0) + 1;
-        run._checkPendingPaths = new Set();
-        if (_c.ran && _c.report) {
-          didVerify = true;
-          runHadTrouble = true;
-          const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          _pushNudge("check", `[ERROR — 自动编译检查]\n命令: \`${run.stack.checkCmd}\`\n刚改过的文件: ${_recentEdits}\n\n错误输出:\n${_c.report}\n\n**反思要求**: 1) 确认是你刚改的哪个文件引入的 2) 用 read_file 读那个文件确认实际内容 3) 修掉编译错再继续。别带着编译错往下写——错误会滚雪球。`);
-        }
-      }
-
-      // Auto-test: run the project's test command after enough mutations accumulate.
-      // Triggers ≤ 3× per run, only if a test command was detected, only when ≥ 3
-      // distinct files changed since the last test run. Failures inject as ERROR
-      // nudge so the model fixes them same-turn instead of at task end.
-      const _pending = run._testPendingPaths || new Set();
-      if (_live() && run.stack?.testCmd && _pending.size >= 3 && (run._autoTestsRan || 0) < 3) {
-        const _t = await _runApprovedVerification(run.stack.root || root, run.stack.testCmd, run);
-        if (_t.ok) for (const kind of _runtimeCommandKinds(run.stack.testCmd)) _runtimeEffects.add(kind);
-        run._autoTestsRan = (run._autoTestsRan || 0) + 1;
-        run._testPendingPaths = new Set();
-        if (_t.ran && _t.report) {
-          runHadTrouble = true;
-          const _recentEdits = [...(_pad.modified || new Map())].map(([f, d]) => `${f}(${d})`).join(", ") || "（未知）";
-          _pushNudge("test", `[ERROR — 自动测试]\n命令: \`${run.stack.testCmd}\`\n本轮改过的文件: ${_recentEdits}\n\n测试输出:\n${_t.report}\n\n**反思要求**: 1) 判断是你改的代码引入了 bug 还是测试本身需要更新 2) 如果是你的代码问题，read_file 读相关文件，定位具体哪行引入的 3) 修好后考虑测试会不会还有边界情况漏掉`);
-        }
-      }
+      // Keep diagnostics immediate, but defer expensive command verification until
+      // the agent reaches its finish gate. Re-running build/test after every small
+      // batch made long tasks spend most of their time proving the same state.
 
       _trimMessagesIfHuge(messages, run, root, _modelContextLimit(config?.model));
 
@@ -30346,7 +32593,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // tool catalog at the context tail (recency) so advanced tools don't fade out of
       // attention (Lost-in-the-Middle). Bounded + only in agent mode; phrased so it
       // doesn't derail the current task.
-      if (run.mode === "agent" && iter > 0 && (iter + 1) % 12 === 0 && toolReminders < 3 && _live()) {
+      if (run.mode === "agent" && iter > 0 && (iter + 1) % 12 === 0 && toolReminders < 5 && _live()) {
         toolReminders++;
         _pushNudge("toolReminder", _toolReminderBlock());
       }
@@ -30389,6 +32636,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiActionPassed = false;
             _uiInteractionPassed = false;
             _uiInteractionViewports.clear();
+            _uiDeliveryAuditedAtImplOps = -1;
+            run._uiDeliveryAuditUnresolved = [];
             if (_hadVerifiedUi) uiVerifyNudges = 0;
           }
           if (mutationPath && t !== "cmd" && t !== "termtask") {
@@ -30419,6 +32668,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiActionPassed = false;
             _uiInteractionPassed = false;
             _uiInteractionViewports.clear();
+            _uiDeliveryAuditedAtImplOps = -1;
+            run._uiDeliveryAuditUnresolved = [];
             if (_hadVerifiedUi) uiVerifyNudges = 0;
           }
           for (const s of (it.call.scope || [])) _mutatedFiles.add(_normRel(s, root));
@@ -30451,9 +32702,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // Model-initiated verification counts only a complete, known check/test/build
         // command with exit 0. HTTP 2xx proves one endpoint responded, not that the
         // current source compiled or its test suite passed.
-        if (didMutate && verifyNudges > 0 && _ok
+        if (didMutate && _ok
             && t === "cmd" && _looksLikeVerificationCommand(it.call.command)) {
           didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
+          run._diagnosticBlock = "";
         }
         if (t === "browser" && _ok) {
           if (it.rawResult?.browserUrl && !it.rawResult.runOwnedDevUrl) {
@@ -30715,9 +32967,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       verificationPassed = false;
       finalVerificationNote = "〔用户停止任务后未继续执行命令；最后一批改动尚未验证。〕";
     }
-    uiVerificationPassed = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps;
-    if (!uiVerificationPassed) {
+    const _browserUiPassed = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps;
+    const _uiSourceFindings = Array.isArray(run._uiDeliveryAuditUnresolved) ? run._uiDeliveryAuditUnresolved : [];
+    const _uiSourcePassed = !(run.engineering.fullWebsite && didMutate)
+      || (_uiDeliveryAuditedAtImplOps >= _implOps && _uiSourceFindings.length === 0);
+    uiVerificationPassed = _browserUiPassed && _uiSourcePassed;
+    if (!_browserUiPassed) {
       finalVerificationNote += `${finalVerificationNote ? "\n" : ""}〔界面改动还没在真实浏览器里验证过（桌面与手机视口的实际打开、点击和状态检查都没做），显示效果可能与预期不符。〕`;
+    }
+    if (!_uiSourcePassed) {
+      const detail = _uiSourceFindings.length ? _uiSourceFindings.join("；") : "源码交付审计未在最后一批改动后通过";
+      finalVerificationNote += `${finalVerificationNote ? "\n" : ""}〔完整网站交付门未通过：${detail}。不能声称内容、知识库素材、响应式和动画已经完整落地。〕`;
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
@@ -30761,24 +33021,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (_verificationAlertText && (!verificationPassed || !uiVerificationPassed)) {
       // Compact alert: one readable line up front, raw command output collapsed —
       // a wall of red log text in the transcript is noise, not information.
+      // 只留一行人话摘要——原始 build/lint 报错日志墙是给模型修复用的（已经通过
+      // nudge 回灌给它了），大红卡糊用户一脸没有任何价值（用户明确要求不展示）。
       const note = document.createElement("div");
       note.className = "msg__error msg__error--verify";
-      const _alertLines = _verificationAlertText.split("\n");
-      const _alertSummary = (_alertLines[0] || "").slice(0, 160);
-      const _alertDetail = _alertLines.slice(1).join("\n").trim();
-      const _sum = document.createElement("div");
-      _sum.textContent = "⚠️ " + _alertSummary;
-      note.appendChild(_sum);
-      if (_alertDetail) {
-        const _det = document.createElement("details");
-        const _lab = document.createElement("summary");
-        _lab.textContent = "查看详情";
-        const _pre = document.createElement("pre");
-        _pre.textContent = _alertDetail;
-        _det.appendChild(_lab);
-        _det.appendChild(_pre);
-        note.appendChild(_det);
-      }
+      const _alertFirst = (_verificationAlertText.split("\n")[0] || "");
+      const _alertSummary = (_alertFirst.split(/[:：]/)[0] || _alertFirst).slice(0, 80);
+      note.textContent = "⚠️ " + _alertSummary + "（报错详情已回灌给 AI，也可在终端里看）";
       body.appendChild(note);
     }
     let _outcomeSummary = "";
@@ -30835,14 +33084,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     saveChatHistory({ immediate: true }); // CRITICAL: 立即刷盘，别用防抖——任务刚完成用户就 Cmd+Q 时防抖没落盘会丢最后一轮。也捕获渲染后的 transcript 快照。
     // 运行已正常走到终点（含报错结束）→ 清掉工作流检查点，不留假的“中断现场”。
     try { localStorage.removeItem("michael-wf-" + (session.id || "s")); } catch {}
-    // Experiential memory: store this run as an episode + distill a reusable insight
-    // (async, best-effort) so the agent learns from it next time (ExpeL/Reflexion).
+    // Complete paid learning calls before the run settlement is finalized, so no
+    // background request can charge the account after the visible footer lands.
     if (run.mode === "agent" && task) {
       const _outcome = finalErr ? "failed" : (run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed)) ? "partial" : "success");
-      try { _recordEpisode(run, task, root, _outcome, config); } catch {}
+      try { await _recordEpisode(run, task, root, _outcome, config); } catch {}
       // on_run_end hook（fire-and-forget）：工作区可在运行结束时挂通知/清理命令。
       _fireHooks(root, "on_run_end", { tool: "run_end", outcome: _outcome, task: String(task).slice(0, 200), files: [...(_mutatedFiles || [])].slice(0, 20) }).catch(() => {});
     }
+    await Promise.allSettled(run._billingTasks);
     // Plan mode: one-click handoff to execute the proposed plan in agent mode
     // (Claude Code's plan → execute flow). The plan is already in history, so
     // the agent sees it.
@@ -30893,16 +33143,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (stopBtn) stopBtn.style.display = "none";
     _updateFilesBar(filesBar, filesList, trackedFiles);
     try {
-      _liveStats.stop();
       const _ru = session._runUsage;
+      await _awaitBillableAiTasks(run._reqId);
+      const _scopeSettlement = await _fetchGatewaySettlement(config, run._reqId);
+      if (_scopeSettlement) _addRunSettlement(_ru, _scopeSettlement);
+      _liveStats.refresh();
       _appendTurnStatsFooter(body, {
         elapsedMs: Date.now() - run._recStart,
-        promptTokens: _ru ? _ru.in : 0,
-        completionTokens: _ru ? _ru.out : 0,
-        model: config.model,
-        estimated: !!(_ru && _ru.est),
+        settlement: _finalRunSettlement(_ru),
       });
     } catch {}
+    finally {
+      _liveStats.stop();
+      if (session._liveRunStats === _liveStats) session._liveRunStats = null;
+    }
     _chatFollow();
   }
 }
@@ -31066,6 +33320,15 @@ function _liveWritePreview(entry, container) {
 // so a fast/bursty stream never lags far behind. Syntax COLOR is applied on a
 // short debounce (monaco.colorize is async + O(n), so doing it every frame would
 // jank) — the code shows instantly and gains color a beat later.
+// 滑动窗口：巨型文件（几百 KB）流式时，每帧全量替换 <pre> 文本 + 全文数行是 O(n²)，
+// 主线程直接冻死。超过窗口后只渲染尾部 16KB（用户看的本来就是正在打字的尾部），
+// 行数改增量累计；完成后真实工具卡会替换预览，不丢内容。
+const _STREAM_CODE_WIN = 16000;
+function _clipStreamCode(text, upto) {
+  const end = upto == null ? text.length : upto;
+  if (end <= _STREAM_CODE_WIN) return { view: text.slice(0, end), clipped: false };
+  return { view: "…（前面内容已省略，写完后完整显示）\n" + text.slice(end - _STREAM_CODE_WIN, end), clipped: true };
+}
 function _scheduleWritePreviewFlush(entry) {
   if (entry._flushReq) return;
   entry._flushReq = requestAnimationFrame(() => {
@@ -31078,10 +33341,12 @@ function _scheduleWritePreviewFlush(entry) {
     const remaining = target.length - shown;
     const step = Math.min(remaining, Math.max(8, Math.ceil(remaining / 3)));
     entry._shownLen = shown + step;
-    const shownText = target.slice(0, entry._shownLen);
+    // 行数增量累计：只数本帧新露出的切片，不再每帧扫全文。
+    let n = entry._shownLines || 1;
+    for (let i = shown; i < entry._shownLen; i++) if (target.charCodeAt(i) === 10) n++;
+    entry._shownLines = n;
     const codeEl = card.querySelector("code");
-    if (codeEl) codeEl.textContent = shownText; // immediate plain render
-    let n = 1; for (let i = 0; i < shownText.length; i++) if (shownText.charCodeAt(i) === 10) n++;
+    if (codeEl) codeEl.textContent = _clipStreamCode(target, entry._shownLen).view; // O(窗口) 而非 O(n)
     const lc = card.querySelector(".code-card__linecount");
     if (lc) lc.textContent = n + " 行";
     const pre = card.querySelector("pre");
@@ -31103,7 +33368,9 @@ function _scheduleWritePreviewColor(entry) {
     if (!card) return;
     const codeEl = card.querySelector("code");
     if (!codeEl) return;
-    const shownText = (entry._target || "").slice(0, entry._shownLen || 0);
+    // 只给可见窗口上色：输入有界→colorize 成本恒定，巨文件也永远有色且永不卡。
+    const snapLen = entry._shownLen || 0;
+    const shownText = _clipStreamCode(entry._target || "", snapLen).view;
     if (!shownText.trim()) return;
     const fname = (_partialJsonString(entry.args || "", "path") || "").split("/").pop() || "";
     const lang = extLang(fname);
@@ -31112,7 +33379,7 @@ function _scheduleWritePreviewColor(entry) {
     monaco.editor.colorize(shownText, lang, { tabSize: 2 }).then((html) => {
       // Only apply if nothing newer was typed/colorized and the card still exists.
       if (entry.streamCard === card && entry._hlGen === gen && codeEl.isConnected
-          && (entry._target || "").slice(0, entry._shownLen || 0) === shownText) {
+          && (entry._shownLen || 0) === snapLen) {
         codeEl.innerHTML = html;
         if (card.querySelector("pre")) card.querySelector("pre").scrollTop = card.querySelector("pre").scrollHeight;
       }
@@ -31145,7 +33412,7 @@ function _settleWritePreview(entry) {
       entry._target = target;
       entry._shownLen = target.length;
       const codeEl = entry.streamCard.querySelector("code");
-      if (codeEl && target) codeEl.textContent = target;
+      if (codeEl && target) codeEl.textContent = _clipStreamCode(target).view; // 巨文件只定格尾部窗口
       _scheduleWritePreviewColor(entry);
       const spin = entry.streamCard.querySelector(".atc-spin");
       if (spin) spin.remove();
@@ -31328,6 +33595,7 @@ function _settleToolStep(step, result, label = "") {
   const hasSpinner = !!res.querySelector?.(".atc-spin");
   if (!hasSpinner && String(res.textContent || "").trim()) {
     if (step?.dataset) step.dataset.toolSettled = "1";
+    _collapseSettledToolSteps(step);
     return false;
   }
   const content = String(result?.content || "");
@@ -31336,7 +33604,35 @@ function _settleToolStep(step, result, label = "") {
   res.textContent = label || (failed ? "失败" : "完成");
   if (failed) step?.classList?.add?.("agent-tool-step--rejected");
   if (step?.dataset) step.dataset.toolSettled = "1";
+  _collapseSettledToolSteps(step);
   return true;
+}
+
+const _TOOL_ACTIVITY_VISIBLE = 6;
+function _collapseSettledToolSteps(step) {
+  const scope = step?.parentElement;
+  if (!scope?.children || scope.classList?.contains("atc-viewport") || scope.closest?.(".agent-activity-log")) return;
+  const settled = Array.from(scope.children).filter((node) =>
+    node.classList?.contains("agent-tool-step")
+    && node.dataset?.toolSettled === "1"
+    && !node.classList.contains("agent-tool-step--askuser")
+  );
+  let log = scope.querySelector(":scope > .agent-activity-log");
+  if (settled.length > _TOOL_ACTIVITY_VISIBLE) {
+    if (!log) {
+      log = document.createElement("details");
+      log.className = "agent-activity-log";
+      log.innerHTML = '<summary></summary><div class="agent-activity-log__body"></div>';
+      scope.insertBefore(log, settled[0]);
+    }
+    const overflow = settled.slice(0, settled.length - _TOOL_ACTIVITY_VISIBLE);
+    const body = log.querySelector(".agent-activity-log__body");
+    for (const card of overflow) body?.appendChild(card);
+  }
+  if (log) {
+    const count = log.querySelectorAll(".agent-tool-step[data-tool-settled='1']").length;
+    log.querySelector("summary").textContent = `Activity (${count} steps)`;
+  }
 }
 
 // 批量读取聚合卡：同一批响应里出现大量 read_file 时，把零散的读取卡收进一张
@@ -31850,6 +34146,67 @@ function _hookToolName(call) {
   return ({ write: "write_file", edit: "edit_file", multiedit: "multi_edit", cmd: "run_cmd", termtask: "run_cmd", delete: "delete_path", move: "move_path", mkdir: "mkdir", copy: "copy_path" })[call.type] || call.type;
 }
 
+async function _fetchWithTimeout(url, options = {}, timeoutMs = 9000) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, { ...options, ...(controller ? { signal: controller.signal } : {}) });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function _searchKnowledgeBase(call) {
+  if (!call?.query || !String(call.query).trim()) {
+    return { type: "knowledge", path: "", content: "[ERROR] knowledge_search 需要 query。" };
+  }
+  const cfg = loadConfig();
+  const baseUrl = cfg.baseUrl || MICHAEL_API;
+  let apiKey = cfg.apiKey;
+  if (!apiKey) {
+    try {
+      const token = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || "";
+      const response = await _fetchWithTimeout(`${baseUrl}/api/ide-key`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      apiKey = (await response.json())?.api_key || "";
+    } catch {}
+  }
+
+  try {
+    const response = await _fetchWithTimeout(`${baseUrl}/api/knowledge/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey || ""}` },
+      body: JSON.stringify({ query: call.query, domain: call.domain || undefined, top_k: call.topK || 6 }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return { type: "knowledge", path: call.query, content: `[失败] 知识库查询 HTTP ${response.status}: ${text.slice(0, 200)}` };
+    }
+    const data = await response.json();
+    const hits = Array.isArray(data?.results) ? data.results : [];
+    if (!hits.length) {
+      return {
+        type: "knowledge",
+        path: call.query,
+        knowledge: { hitCount: 0, domains: [] },
+        content: `知识库里没有「${call.query}」相关的内容。不要编造知识库结论；记录该主题不可用后，基于用户明确要求与项目证据继续。`,
+      };
+    }
+    const body = hits.map((hit, index) => `【${index + 1}｜${hit.domain}/${hit.topic} · ${hit.section}】\n${hit.text}`).join("\n\n———\n\n");
+    const domains = [...new Set(hits.map((hit) => String(hit?.domain || "").trim()).filter(Boolean))];
+    return {
+      type: "knowledge",
+      path: call.query,
+      knowledge: { hitCount: hits.length, domains },
+      content: `📚 专业知识库「${call.query}」${call.domain ? ` [${call.domain}]` : ""} 检索到 ${hits.length} 段最佳实践，**照这个来做**：${domains.includes("michael-design") ? "\n（配色约束：命中正文里的 Hex/OKLCH 是参考定义值，采用前必须折算成最接近的 Tailwind 族+档；计划/叙述/业务代码禁裸 hex；跨品类命中只借结构/动效不借配色；未明确要求暗色时根背景浅色中性档。）" : ""}\n\n${body}`,
+    };
+  } catch (error) {
+    const message = String(error?.name === "AbortError" ? "请求超时" : (error?.message || error)).slice(0, 200);
+    return { type: "knowledge", path: call.query, content: `[失败] 知识库查询出错: ${message}` };
+  }
+}
+
 async function _executeToolStep(step, call, root, run) {
   if (run) run._toolStep = (run._toolStep || 0) + 1; // per-run tool-call counter (redundant-read saver)
   const vp = step.querySelector(".atc-viewport");
@@ -32173,16 +34530,17 @@ async function _executeToolStep(step, call, root, run) {
         run._dupReadN = run._dupReadN || new Map();
         const _dupN = (run._dupReadN.get(usedPath) || 0) + 1;
         run._dupReadN.set(usedPath, _dupN);
-        // 该重读就让重读：上一轮已完整读过、这一轮要拿逐字原文做精确编辑（_duplicateAuthorized），
-        // 就把真实内容原样回给模型——别只说"已授权"却扣着不给，那样模型拿不到原文只能再读 → 死循环。
-        // 授权重读放行到 2 次（一次准备编辑、偶尔一次复核）；第 3 次起才当死循环硬断。
+        // 授权命中 = 该文件当前版本的原文【必然还在上文里】（压缩折叠时覆盖表会同步
+        // 剔除，folded 的读取不可能走到这）。所以不重灌全文——重灌等于：token 翻倍烧、
+        // 用户看到"读过的又读一遍"的重复卡片（实测挨骂）、模型拿到重复内容后又把叙述
+        // 复述一遍。回指针 + 刷新编辑门绑定即可；授权计数留到 2 次，第 3 次起硬断。
         if (_duplicateAuthorized && _dupN <= 2) {
           res.className = "atc-result atc-result--ok";
-          res.textContent = `已读 · ${total} 行（供精确编辑）`;
-          if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px;border-bottom:1px solid var(--atc-border,#dadce0)">${_escHtml(call.path)} · ${total} 行（当前版本，供 edit_file / multi_edit 用逐字原文）</div><pre style="margin:0;padding:8px 12px;overflow:auto;max-height:360px;font:12px/1.55 var(--atc-mono,ui-monospace);color:var(--atc-text,#202124);white-space:pre;tab-size:2">${_escHtml(txt)}</pre>`;
-          const _header = (start > 0 || _reqEnd < total) ? `（${call.path} 第 ${start + 1}-${Math.min(_reqEnd, total)}/${total} 行 · 当前版本）\n` : `（${call.path} · 当前版本 · ${total} 行）\n`;
+          res.textContent = `已在上下文 · 编辑门已放行`;
+          if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px">${_escHtml(call.path)} · ${total} 行原文已在上文，未重复读取；edit_file / multi_edit 可直接执行。</div>`;
           return {
-            type: "read", path: call.path, content: _header + txt,
+            type: "read", path: call.path,
+            content: `（${call.path} 当前版本共 ${total} 行，**完整原文就在上文这轮对话里**（未折叠）——直接据它做 edit_file / multi_edit，编辑门已放行，不需要重读。想看新的行段就带明确 offset/limit 再读。）`,
             evidence: {
               kind: "read", resultKind: "authorized", canonicalPath: _normRel(usedPath || call.path, root),
               signature: _sig, from: start + 1, to: Math.min(_reqEnd, total), total, complete: start <= 0 && _reqEnd >= total,
@@ -32935,8 +35293,12 @@ async function _executeToolStep(step, call, root, run) {
         const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
         const to = ctrl ? setTimeout(() => ctrl.abort(), 60000) : null;
         try {
-          const r = await fetch(cfg.baseUrl.replace(/\/+$/, "") + "/v1/chat/completions", {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + (cfg.apiKey || "") },
+          const r = await fetch(_chatCompletionsUrl(cfg.baseUrl), {
+            method: "POST", headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + (cfg.apiKey || ""),
+              "x-ide-request-id": String(run?._reqId || "").slice(0, 128),
+            },
             body: JSON.stringify({ model: cfg.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: maxTok, temperature: 0.7, stream: false }),
             signal: ctrl ? ctrl.signal : undefined,
           });
@@ -33915,38 +36277,14 @@ async function _executeToolStep(step, call, root, run) {
       }
 
     } else if (call.type === "knowledge") {
-      if (!call.query || !call.query.trim()) { res.className = "atc-result atc-result--err"; res.textContent = "缺 query"; return { type: "knowledge", path: "", content: "[ERROR] knowledge_search 需要 query。" }; }
-      const _kcfg = loadConfig();
-      const _kbase = _kcfg.baseUrl || MICHAEL_API;
-      let _kkey = _kcfg.apiKey;
-      if (!_kkey) { try { const tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; const r = await fetch(_kbase + "/api/ide-key", { headers: tok ? { Authorization: "Bearer " + tok } : {} }); _kkey = (await r.json()).api_key; } catch {} }
       res.className = "atc-result"; res.textContent = "查知识库…";
-      try {
-        const resp = await fetch(_kbase + "/api/knowledge/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + (_kkey || "") },
-          body: JSON.stringify({ query: call.query, domain: call.domain || undefined, top_k: call.topK || 6 }),
-        });
-        if (!resp.ok) {
-          const t = await resp.text().catch(() => "");
-          res.className = "atc-result atc-result--err"; res.textContent = "失败";
-          return { type: "knowledge", path: call.query, content: `[失败] 知识库查询 HTTP ${resp.status}: ${t.slice(0, 200)}` };
-        }
-        const data = await resp.json();
-        const hits = (data && data.results) || [];
-        if (!hits.length) {
-          res.className = "atc-result"; res.textContent = "无结果";
-          return { type: "knowledge", path: call.query, content: `知识库里没有「${call.query}」相关的内容（覆盖领域：前端/后端API/数据库/安全/UI-UX/DevOps）。换个说法重试，或这块就靠你自己的判断 + 联网查。` };
-        }
-        const body2 = hits.map((h, i) => `【${i + 1}｜${h.domain}/${h.topic} · ${h.section}】\n${h.text}`).join("\n\n———\n\n");
-        res.className = "atc-result atc-result--ok"; res.textContent = `${hits.length} 段`;
-        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(body2.slice(0, 4000))}</pre>`;
-        return { type: "knowledge", path: call.query, content: `📚 专业知识库「${call.query}」${call.domain ? " [" + call.domain + "]" : ""} 检索到 ${hits.length} 段最佳实践，**照这个来做**：\n\n${body2}` };
-      } catch (e) {
-        const msg = String(e?.message || e).slice(0, 200);
-        res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        return { type: "knowledge", path: call.query, content: `[失败] 知识库查询出错: ${msg}` };
-      }
+      const result = await _searchKnowledgeBase(call);
+      const hitCount = Number(result?.knowledge?.hitCount || 0);
+      const failed = /^\[(?:ERROR|失败)\]/.test(String(result?.content || ""));
+      res.className = failed ? "atc-result atc-result--err" : hitCount ? "atc-result atc-result--ok" : "atc-result";
+      res.textContent = failed ? "失败" : hitCount ? `${hitCount} 段` : "无结果";
+      if (vp && hitCount) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(String(result.content || "").slice(0, 4000))}</pre>`;
+      return result;
 
     } else if (call.type === "semsearch") {
       const ssRoot = root || rootPath || workspaceRoots[0] || "";
@@ -34691,7 +37029,7 @@ async function _executeToolStep(step, call, root, run) {
       if (!_imgModel) { res.className = "atc-result atc-result--err"; res.textContent = "无生图模型"; return { type: "genimage", path: call.dest, content: "[失败] 后台模型列表里没有生图模型。请在后台配一个生图模型（如 gpt-image-2）后再用。" }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 用 ${_escHtml(_imgModel)} 生成中…`;
       try {
-        const out = await backend.invoke("generate_image_chat", { root: giRoot, baseUrl: _imgCfg.baseUrl || MICHAEL_API, apiKey: _imgCfg.apiKey || "", model: _imgModel, prompt: _enrichImagePrompt(call.prompt), dest: call.dest, width: call.width || null, height: call.height || null });
+        const out = await backend.invoke("generate_image_chat", { root: giRoot, baseUrl: _imgCfg.baseUrl || MICHAEL_API, apiKey: _imgCfg.apiKey || "", model: _imgModel, prompt: _enrichImagePrompt(call.prompt), dest: call.dest, width: call.width || null, height: call.height || null, requestId: run?._reqId || null });
         try { reloadDir(parentDir(call.dest.startsWith("/") ? call.dest : giRoot + "/" + call.dest)); } catch {}
         // 按绝对路径缓存 data_url（与 design_board 的 absPath 同口径）→ design_board 直接拿来渲染，
         // 不走 asset 协议（隐藏目录会被 glob scope 拒载）。
@@ -34836,7 +37174,7 @@ async function _executeToolStep(step, call, root, run) {
       const _exDest = ".michael-images/explain-" + _exTs + ".png";
       const _exPrompt = _enrichExplainPrompt(call.prompt, call.title);
       try {
-        const out = await backend.invoke("generate_image_chat", { root: _exRoot, baseUrl: _exCfg.baseUrl || MICHAEL_API, apiKey: _exCfg.apiKey || "", model: _exModel, prompt: _exPrompt, dest: _exDest, width: 1536, height: 1024 });
+        const out = await backend.invoke("generate_image_chat", { root: _exRoot, baseUrl: _exCfg.baseUrl || MICHAEL_API, apiKey: _exCfg.apiKey || "", model: _exModel, prompt: _exPrompt, dest: _exDest, width: 1536, height: 1024, requestId: run?._reqId || null });
         try { reloadDir(parentDir(_exDest.startsWith("/") ? _exDest : _exRoot + "/" + _exDest)); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = call.title;
         if (explainer._exBody && out && out.data_url) {
@@ -37697,16 +40035,14 @@ function _adaptiveEnabled() {
   return _loadAdaptiveProfile().enabled !== false;
 }
 
-function _adaptivePromptBlock(query = "") {
+// Static half of the adaptive profile — byte-stable across turns so it can live in
+// the SYSTEM prompt without breaking the upstream prompt-cache prefix. The per-query
+// preference-memory lines moved to _adaptiveMemoryBlock (injected in the per-turn
+// dynamic preamble at the user-message tail, same pattern as growth/context blocks).
+function _adaptivePromptBlock() {
   const profile = _loadAdaptiveProfile();
   if (profile.enabled === false) return "";
-  let preferenceLines = [];
-  try {
-    preferenceLines = _kgRetrieve("", query || "用户 偏好 工作习惯 回答风格", 5, 8)
-      .filter((n) => n?.type === "preference" || /用户|喜欢|偏好|要求|不要|希望|prefer/i.test(n?.content || ""))
-      .map((n) => `- ${n.content}`);
-  } catch {}
-  const memory = preferenceLines.length ? `\n长期偏好记忆：\n${preferenceLines.join("\n").slice(0, 1400)}` : "";
+  const memory = "";
   return `\n\n【自适应用户档案】已开启。你要逐步贴近用户的真实工作方式，但这些只是偏好，不覆盖本轮明确指令；若本轮指令冲突，以用户本轮为准。
 回答风格：${_adaptiveOptionLabel("tone", profile.tone)}。
 细节密度：${_adaptiveOptionLabel("detail", profile.detail)}。
@@ -37718,6 +40054,22 @@ function _adaptivePromptBlock(query = "") {
 - 用户明显不懂技术或概念时，自动降到新手可理解的说法：先说结论和下一步，再补最少必要解释；不要甩术语、不要让用户自己翻文档。
 - 用户纠正你（例如“不是这个”“要中文”“不要改界面”“别打包”）时，把它当成强自适应信号；后续同类任务优先遵守。若是跨项目长期偏好，并且当前模式有 remember 工具，可记为 global 偏好。
 - 只有上下文仍不足以唯一判断时，才问；问题必须给 2-3 个具体候选，不要泛泛问“你想做什么”。${memory}`;
+}
+
+// Per-query preference recall for the adaptive profile — CONTENT VARIES with the
+// query, so it must ride the per-turn dynamic preamble (user-message tail), never
+// the system prompt: one changed byte in the system prefix voids the whole cache.
+function _adaptiveMemoryBlock(query = "") {
+  const profile = _loadAdaptiveProfile();
+  if (profile.enabled === false) return "";
+  let preferenceLines = [];
+  try {
+    preferenceLines = _kgRetrieve("", query || "用户 偏好 工作习惯 回答风格", 5, 8)
+      .filter((n) => n?.type === "preference" || /用户|喜欢|偏好|要求|不要|希望|prefer/i.test(n?.content || ""))
+      .map((n) => `- ${n.content}`);
+  } catch {}
+  if (!preferenceLines.length) return "";
+  return `📎 长期偏好记忆（自适应档案，供本轮参考；与本轮明确指令冲突时以指令为准）：\n${preferenceLines.join("\n").slice(0, 1400)}`;
 }
 
 function renderAdaptiveTool(body) {
@@ -38947,9 +41299,10 @@ const _TS_EXT = new Set(["ts", "tsx", "mts", "cts"]);
 // edits introduced ERRORS — surfaced immediately for self-correction. Side-effect
 // free: open models are read-only (never setValue → never falsely marked dirty);
 // unopened files use a transient model (no listeners) that is disposed after the
-// read. Returns { ran, report } — ran=true when at least one JS/TS file was checked.
-async function _interleavedDiagnostics(editedRelPaths, root = "") {
-  if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "" };
+// read. `baselineCounts` is captured before the first mutation of each file, so
+// pre-existing project errors do not get blamed on the current Agent run.
+async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts = null) {
+  if (!editedRelPaths.length || typeof monaco === "undefined") return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
   const targets = []; // { rel, model, created, isTs }
   for (const rel of editedRelPaths.slice(0, 6)) {
     const ext = (rel.split(".").pop() || "").toLowerCase();
@@ -38967,34 +41320,45 @@ async function _interleavedDiagnostics(editedRelPaths, root = "") {
     }
     targets.push({ rel: _normRel(abs, root), model, created, isTs });
   }
-  if (!targets.length) return { ran: false, report: "" };
+  if (!targets.length) return { ran: false, report: "", counts: new Map(), newErrorCount: 0 };
   // Semantic analysis is async — give the worker a bounded moment to publish.
   await new Promise((r) => setTimeout(r, 900));
   const reports = [];
+  const counts = new Map();
+  let newErrorCount = 0;
   for (const t of targets) {
     let markers = [];
     try { markers = monaco.editor.getModelMarkers({ resource: t.model.uri }); } catch {}
     const errs = markers.filter((m) => m.severity === 8);
-    if (errs.length) {
-      const formatted = formatDiagnosticsForAgent(errs, root, { activePath: t.model?.uri?.fsPath || t.model?.uri?.path || "", max: 12 });
-      reports.push(`【${t.rel}】(${errs.length} 个错误)\n${formatted}`);
+    const fresh = [];
+    for (const marker of errs) {
+      const code = marker.code == null ? "" : (typeof marker.code === "object" ? marker.code.value : marker.code);
+      const identity = `${t.rel}|${code}|${String(marker.message || "").trim()}`;
+      const occurrence = (counts.get(identity) || 0) + 1;
+      counts.set(identity, occurrence);
+      if (!baselineCounts || occurrence > (baselineCounts.get(identity) || 0)) fresh.push(marker);
+    }
+    if (fresh.length) {
+      newErrorCount += fresh.length;
+      const formatted = formatDiagnosticsForAgent(fresh, root, { activePath: t.model?.uri?.fsPath || t.model?.uri?.path || "", max: 12 });
+      reports.push(`【${t.rel}】(${fresh.length} 个新增错误)\n${formatted}`);
     }
   }
   // Dispose only the models WE created — never touch ones the user has open.
   for (const t of targets) { if (t.created) { try { t.model.dispose(); } catch {} } }
-  return { ran: true, report: reports.join("\n\n") };
+  return { ran: true, report: reports.join("\n\n"), counts, newErrorCount };
 }
 
 // Run the project's test command (auto-detected) and return a compact failure
-// report. Bounded to 90s and called only after the agent has mutated several files
-// since the last test run, so we don't burn time + tokens on every tiny edit.
+// report. Bounded to 60s and called from the finish gate, so a run does not spend
+// its time repeating the same command after each small edit batch.
 async function _interleavedTest(root, testCmd) {
   if (!root || !testCmd || !inTauri) return { ran: false, ok: false, code: null, timedOut: false, report: "" };
   try {
     // The timeout is enforced by Rust, which owns and kills the complete process
     // group. A JS Promise.race returned early while cargo/npm kept running for up
     // to five minutes, allowing overlapping verification processes to accumulate.
-    const r = await backend.taskRunCapture(root, testCmd, { timeoutSecs: 90 });
+    const r = await backend.taskRunCapture(root, testCmd, { timeoutSecs: 60 });
     const out = ((r?.stdout || "") + "\n" + (r?.stderr || "")).trim();
     const code = Number.isFinite(Number(r?.code)) ? Number(r.code) : -1;
     const timedOut = !!(r?.timedOut ?? r?.timed_out) || code === -1;
@@ -42000,8 +44364,10 @@ function _closeRemoteSshPanel(panel = _remoteSshPanel) {
   panel.closed = true;
   try { if (panel.fitRaf) cancelAnimationFrame(panel.fitRaf); } catch {}
   try { if (panel.keyHandler) document.removeEventListener("keydown", panel.keyHandler, true); } catch {}
+  const channel = panel.channel;
+  panel.channel = null;
+  _releaseTauriChannel(channel);
   try { if (panel.backendId != null) backend.termClose(panel.backendId); } catch {}
-  try { if (panel.channel) panel.channel.onmessage = () => {}; } catch {}
   try { panel.resizeObserver?.disconnect(); } catch {}
   try { panel.webgl?.dispose(); } catch {}
   try { panel.term?.dispose(); } catch {}
@@ -44373,13 +46739,11 @@ async function _runTaskInNewTerminal(command, label, cwd = "") {
 function closeTermTab(idx) {
   if (idx < 0 || idx >= termTabs.length) return;
   const tab = termTabs[idx];
+  // Detach the captured terminal state before asking the backend to stop the PTY.
+  // The sink keeps Tauri's late-output dispatcher callable during shutdown.
+  _releaseTauriChannel(tab.channel);
+  tab.channel = null;
   if (tab.backendId != null) backend.termClose(tab.backendId);
-  // Release the PTY Channel's callback — it captures this tab's xterm + entry, and Tauri never frees
-  // Channel callbacks, so without this every closed terminal leaks its whole xterm instance.
-  // Release the streaming closure (avoid the xterm leak) WITHOUT nulling onmessage — Tauri's Channel
-  // calls `.onmessage.call()` on late PTY output, and null → "null is not an object" crash on close.
-  // A no-op swallows in-flight messages harmlessly (term_close below stops the PTY anyway).
-  try { if (tab.channel) { tab.channel.onmessage = () => {}; tab.channel = null; } } catch {}
   clearTimeout(_ghostTimer); // drop any pending ghost render that captured this tab
   clearTermGhost(tab);
   try { tab.webgl?.dispose(); } catch {} // release the GPU context (avoid leaking WebGL contexts)
@@ -45998,7 +48362,7 @@ function _openCmdK() {
     ];
     let out;
     try {
-      out = _stripFence(await backend.aiComplete(config, messages, 1024));
+      out = _stripFence(await _billableAiComplete(config, messages, 1024));
     } catch (err) {
       showToast("AI edit failed: " + (err?.message || err));
       _closeCmdK();

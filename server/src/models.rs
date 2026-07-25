@@ -84,9 +84,7 @@ fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: 
 
 fn safe_upstream_error_excerpt(low: &str) -> String {
     let mut text = low
-        .replace('\r', " ")
-        .replace('\n', " ")
-        .replace('\t', " ")
+        .replace(['\r', '\n', '\t'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -265,6 +263,43 @@ fn resolve_cost(
         model_in,
         model_out,
     )
+}
+
+fn usage_is_authoritative(usage: Option<&serde_json::Value>) -> bool {
+    let Some(usage) = usage.filter(|value| value.is_object()) else {
+        return false;
+    };
+    let has_nonnegative = |keys: &[&str]| {
+        keys.iter().any(|key| {
+            usage
+                .get(*key)
+                .and_then(|value| value.as_i64())
+                .is_some_and(|value| value >= 0)
+        })
+    };
+    has_nonnegative(&["prompt_tokens", "input_tokens"])
+        && has_nonnegative(&["completion_tokens", "output_tokens"])
+}
+
+fn valid_ide_request_id(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn ide_request_id(headers: &HeaderMap) -> ApiResult<Option<String>> {
+    let Some(value) = headers.get("x-ide-request-id") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| AppError::bad("x-ide-request-id 无效"))?
+        .trim();
+    if !valid_ide_request_id(value) {
+        return Err(AppError::bad("x-ide-request-id 无效"));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn allowed_ids(m: &Model) -> Vec<String> {
@@ -519,7 +554,7 @@ async fn i18n_pack_from_public_translate(
         let projected = batch_len + text.len() + 32;
         if !batch_texts.is_empty() && projected > 3200 {
             let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
-            for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+            for (k, v) in batch_keys.drain(..).zip(translated) {
                 out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
             }
             batch_texts.clear();
@@ -531,7 +566,7 @@ async fn i18n_pack_from_public_translate(
     }
     if !batch_texts.is_empty() {
         let translated = google_translate_batch(source_locale, &tl, &batch_texts).await?;
-        for (k, v) in batch_keys.drain(..).zip(translated.into_iter()) {
+        for (k, v) in batch_keys.drain(..).zip(translated) {
             out.insert(k, json!(if v.trim().is_empty() { "" } else { v.trim() }));
         }
     }
@@ -666,6 +701,331 @@ pub async fn admin_list(
         })
         .collect();
     Ok(Json(json!(list)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelEstimateReq {
+    pub channel_rate_id: uuid::Uuid,
+    pub connection_id: uuid::Uuid,
+    pub model_id: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub sales_cny: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QuotaEstimateReq {
+    pub channel_rate_id: uuid::Uuid,
+    pub connection_id: uuid::Uuid,
+    pub model_id: String,
+    pub visible_quota_usd: f64,
+    pub sales_cny: f64,
+    pub target_margin_percent: f64,
+}
+
+const USER_QUOTA_RAW_USD_PER_VISIBLE_USD: f64 = 6.63;
+const MAX_ESTIMATE_TOKENS_PER_CALL: i64 = 10_000_000_000;
+const MAX_ESTIMATE_CALLS: i64 = 1_000_000;
+const MAX_ESTIMATE_MONEY: f64 = 1_000_000_000.0;
+
+#[derive(Debug)]
+struct QuotaPackageProjection {
+    quota_raw_usd: f64,
+    provider_usd_capacity: f64,
+    channel_cost_cny: f64,
+    profit_cny: f64,
+    margin_percent: f64,
+    break_even_multiplier: f64,
+    target_multiplier: f64,
+    break_even_sales_cny: f64,
+    target_sales_cny: f64,
+    safe_visible_quota_usd: f64,
+}
+
+fn round_multiplier_up(value: f64) -> f64 {
+    (value * 100.0).ceil() / 100.0
+}
+
+fn project_quota_package(
+    visible_quota_usd: f64,
+    sales_cny: f64,
+    usd_per_cny: f64,
+    multiplier: f64,
+    target_margin_percent: f64,
+) -> QuotaPackageProjection {
+    let quota_raw_usd = visible_quota_usd * USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+    let provider_usd_capacity = quota_raw_usd / multiplier;
+    let channel_cost_cny = provider_usd_capacity / usd_per_cny;
+    let profit_cny = sales_cny - channel_cost_cny;
+    let margin_percent = profit_cny / sales_cny * 100.0;
+    let break_even_multiplier = quota_raw_usd / (sales_cny * usd_per_cny);
+    let target_cost_ratio = 1.0 - target_margin_percent / 100.0;
+    let target_multiplier = break_even_multiplier / target_cost_ratio;
+    let target_sales_cny = channel_cost_cny / target_cost_ratio;
+    let safe_visible_quota_usd = sales_cny * usd_per_cny * target_cost_ratio * multiplier
+        / USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+    QuotaPackageProjection {
+        quota_raw_usd,
+        provider_usd_capacity,
+        channel_cost_cny,
+        profit_cny,
+        margin_percent,
+        break_even_multiplier,
+        target_multiplier,
+        break_even_sales_cny: channel_cost_cny,
+        target_sales_cny,
+        safe_visible_quota_usd,
+    }
+}
+
+/// POST /api/admin/model-estimate - project one model workload using the exact
+/// server-side price priority, cache prices, connection multiplier and rounding.
+pub async fn admin_model_estimate(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<ModelEstimateReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+
+    if !(1..=MAX_ESTIMATE_CALLS).contains(&req.calls) {
+        return Err(AppError::bad("调用次数需在 1 到 1000000 之间"));
+    }
+    for (label, value) in [
+        ("普通输入 Token", req.input_tokens),
+        ("输出 Token", req.output_tokens),
+        ("缓存读取 Token", req.cache_read_tokens),
+        ("缓存写入 Token", req.cache_creation_tokens),
+    ] {
+        if !(0..=MAX_ESTIMATE_TOKENS_PER_CALL).contains(&value) {
+            return Err(AppError::bad(format!(
+                "{label} 需在 0 到 {MAX_ESTIMATE_TOKENS_PER_CALL} 之间"
+            )));
+        }
+    }
+    if req.input_tokens == 0
+        && req.output_tokens == 0
+        && req.cache_read_tokens == 0
+        && req.cache_creation_tokens == 0
+    {
+        return Err(AppError::bad("至少填写一种 Token 数量"));
+    }
+    if req
+        .sales_cny
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(AppError::bad("销售总价必须是有效的非负数"));
+    }
+
+    let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+        .bind(req.connection_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("模型连接不存在"))?;
+    let model_id = req.model_id.trim();
+    if model_id.is_empty() || !allowed_ids(&model).iter().any(|id| id == model_id) {
+        return Err(AppError::bad("该连接没有开放这个模型"));
+    }
+    if is_image_gen_model(model_id) {
+        return Err(AppError::bad("图片模型按张计费，不能使用 Token 推算器"));
+    }
+
+    let (channel_name, usd_per_cny) = sqlx::query_as::<_, (String, f64)>(
+        "SELECT name, usd_per_cny FROM channel_rates WHERE id = $1",
+    )
+    .bind(req.channel_rate_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad("渠道汇率不存在"))?;
+
+    let (model_in, model_out) = model_price_override(&model.model_prices, model_id);
+    let (input_price, output_price, price_source) = if model_in > 0.0 || model_out > 0.0 {
+        (model_in, model_out, "model_override")
+    } else if let Some((input, output)) = official_price(model_id) {
+        (input, output, "official_catalog")
+    } else if model.input_price > 0.0 || model.output_price > 0.0 {
+        (model.input_price, model.output_price, "connection_fallback")
+    } else {
+        return Err(AppError::bad(
+            "该模型没有可用价格，请在连接编辑里填写单模型输入/输出价",
+        ));
+    };
+
+    let cache_read_price = if model.cache_read_price > 0.0 {
+        model.cache_read_price
+    } else {
+        input_price * CACHE_READ_FACTOR
+    };
+    let cache_creation_price = if model.cache_create_price > 0.0 {
+        model.cache_create_price
+    } else {
+        input_price * CACHE_WRITE_FACTOR
+    };
+    let route_rate = model.rate.max(0.0);
+    let provider_usd_per_call = projected_provider_usd(
+        req.input_tokens,
+        req.output_tokens,
+        req.cache_read_tokens,
+        req.cache_creation_tokens,
+        input_price,
+        output_price,
+        cache_read_price,
+        cache_creation_price,
+    );
+    let usage = json!({
+        "input_tokens": req.input_tokens,
+        "output_tokens": req.output_tokens,
+        "cache_read_input_tokens": req.cache_read_tokens,
+        "cache_creation_input_tokens": req.cache_creation_tokens,
+    });
+    let billed_cents_per_call = resolve_cost(
+        &model.billing_mode,
+        model.per_call_cents,
+        Some(&usage),
+        model_id,
+        route_rate,
+        model.input_price,
+        model.output_price,
+        model.cache_read_price,
+        model.cache_create_price,
+        model_in,
+        model_out,
+    );
+    let calls = req.calls as f64;
+    let provider_usd_total = provider_usd_per_call * calls;
+    let channel_cost_cny = provider_usd_total / usd_per_cny;
+    let billed_raw_usd = billed_cents_per_call as f64 / 100.0 * calls;
+    let visible_quota_usd = billed_raw_usd / USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+    let profit_cny = req.sales_cny.map(|sales| sales - channel_cost_cny);
+    let margin_percent = req.sales_cny.and_then(|sales| {
+        if sales > 0.0 {
+            Some((sales - channel_cost_cny) / sales * 100.0)
+        } else {
+            None
+        }
+    });
+
+    Ok(Json(json!({
+        "channel": { "id": req.channel_rate_id, "name": channel_name, "usd_per_cny": usd_per_cny },
+        "connection": { "id": model.id, "label": model.label, "rate": route_rate, "billing_mode": model.billing_mode },
+        "model": { "id": model_id, "name": display_name_for(&model.model_names, model_id) },
+        "calls": req.calls,
+        "tokens_per_call": {
+            "input": req.input_tokens,
+            "output": req.output_tokens,
+            "cache_read": req.cache_read_tokens,
+            "cache_creation": req.cache_creation_tokens,
+        },
+        "prices_per_million": {
+            "input": input_price,
+            "output": output_price,
+            "cache_read": cache_read_price,
+            "cache_creation": cache_creation_price,
+            "source": price_source,
+        },
+        "provider_usd_per_call": provider_usd_per_call,
+        "provider_usd_total": provider_usd_total,
+        "channel_cost_cny": channel_cost_cny,
+        "billed_cents_per_call": billed_cents_per_call,
+        "billed_raw_usd": billed_raw_usd,
+        "visible_quota_usd": visible_quota_usd,
+        "quota_raw_usd_per_visible_usd": USER_QUOTA_RAW_USD_PER_VISIBLE_USD,
+        "sales_cny": req.sales_cny,
+        "profit_cny": profit_cny,
+        "margin_percent": margin_percent,
+        "break_even_cny": channel_cost_cny,
+    })))
+}
+
+/// POST /api/admin/quota-estimate - calculate the worst-case cost when a user
+/// spends an entire visible quota package on a rate-billed model connection.
+pub async fn admin_quota_estimate(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<QuotaEstimateReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    if !req.visible_quota_usd.is_finite()
+        || req.visible_quota_usd <= 0.0
+        || req.visible_quota_usd > MAX_ESTIMATE_MONEY
+    {
+        return Err(AppError::bad("用户套餐额度必须是有效的正数"));
+    }
+    if !req.sales_cny.is_finite() || req.sales_cny <= 0.0 || req.sales_cny > MAX_ESTIMATE_MONEY {
+        return Err(AppError::bad("销售总价必须是有效的正数"));
+    }
+    if !req.target_margin_percent.is_finite() || !(0.0..100.0).contains(&req.target_margin_percent)
+    {
+        return Err(AppError::bad("目标利润率需在 0% 到 100% 之间"));
+    }
+
+    let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+        .bind(req.connection_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad("模型连接不存在"))?;
+    let model_id = req.model_id.trim();
+    if model_id.is_empty() || !allowed_ids(&model).iter().any(|id| id == model_id) {
+        return Err(AppError::bad("该连接没有开放这个模型"));
+    }
+    if model.billing_mode == "per_call" {
+        return Err(AppError::bad("套餐额度模式只支持倍率计费模型"));
+    }
+    let multiplier = model.rate.max(0.0);
+    if multiplier <= 0.0 {
+        return Err(AppError::bad("模型连接倍率必须大于 0"));
+    }
+
+    let (channel_name, usd_per_cny) = sqlx::query_as::<_, (String, f64)>(
+        "SELECT name, usd_per_cny FROM channel_rates WHERE id = $1",
+    )
+    .bind(req.channel_rate_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad("渠道汇率不存在"))?;
+
+    let projection = project_quota_package(
+        req.visible_quota_usd,
+        req.sales_cny,
+        usd_per_cny,
+        multiplier,
+        req.target_margin_percent,
+    );
+    let break_even_multiplier_rounded = round_multiplier_up(projection.break_even_multiplier);
+    let target_multiplier_rounded = round_multiplier_up(projection.target_multiplier);
+    let status = if multiplier + f64::EPSILON < projection.break_even_multiplier {
+        "loss"
+    } else if multiplier + f64::EPSILON < projection.target_multiplier {
+        "below_target"
+    } else {
+        "healthy"
+    };
+
+    Ok(Json(json!({
+        "channel": { "id": req.channel_rate_id, "name": channel_name, "usd_per_cny": usd_per_cny },
+        "connection": { "id": model.id, "label": model.label, "rate": multiplier, "billing_mode": model.billing_mode },
+        "model": { "id": model_id, "name": display_name_for(&model.model_names, model_id) },
+        "visible_quota_usd": req.visible_quota_usd,
+        "quota_raw_usd": projection.quota_raw_usd,
+        "quota_raw_usd_per_visible_usd": USER_QUOTA_RAW_USD_PER_VISIBLE_USD,
+        "provider_usd_capacity": projection.provider_usd_capacity,
+        "channel_cost_cny": projection.channel_cost_cny,
+        "sales_cny": req.sales_cny,
+        "profit_cny": projection.profit_cny,
+        "margin_percent": projection.margin_percent,
+        "break_even_sales_cny": projection.break_even_sales_cny,
+        "target_sales_cny": projection.target_sales_cny,
+        "break_even_multiplier": projection.break_even_multiplier,
+        "break_even_multiplier_rounded": break_even_multiplier_rounded,
+        "target_margin_percent": req.target_margin_percent,
+        "target_multiplier": projection.target_multiplier,
+        "target_multiplier_rounded": target_multiplier_rounded,
+        "safe_visible_quota_usd": projection.safe_visible_quota_usd,
+        "recommended_multiplier": if status == "healthy" { multiplier } else { target_multiplier_rounded },
+        "status": status,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -938,6 +1298,9 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 "price_source": price_source,
                 "rate": m.rate,
                 "description": m.description,
+                // 每模型真实上下文窗口（tokens）：客户端上下文表和棘轮压缩阈值都靠它，
+                // 不下发就只能靠客户端猜（GPT-5 曾被猜成 128K，白扔 3/4 窗口）。
+                "context_window": official_context(&mid),
             }));
         }
     }
@@ -952,9 +1315,11 @@ pub async fn chat(
     State(state): State<AppState>,
     claims: Claims,
     Path(id): Path<uuid::Uuid>,
+    headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    let request_id = ide_request_id(&headers)?;
     let model = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1 AND active = true")
         .bind(id)
         .fetch_optional(&state.db)
@@ -1030,28 +1395,14 @@ pub async fn chat(
     // bill on success: per_call flat fee, or real token usage × official price × 倍率.
     let (model_in, model_out) = model_price_override(&model.model_prices, &chosen);
     let usage_val = data.get("usage");
-    let has_real = usage_val.is_some_and(|u| {
-        u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0) > 0
-            || u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0) > 0
-    });
-    let (effective_usage, is_est) = if has_real {
-        (usage_val.cloned().unwrap_or_else(|| json!({})), false)
-    } else {
-        let est_in = estimate_input_tokens(&body);
-        let resp_str = serde_json::to_string(&data).unwrap_or_default();
-        let est_out = (resp_str.len() as i64) / 4;
-        tracing::warn!(
-            "[billing] legacy chat no usage, estimating: in={} out={} model={}",
-            est_in,
-            est_out,
-            chosen
-        );
-        (estimated_usage(est_in, est_out), true)
-    };
+    let usage_reported = usage_is_authoritative(usage_val);
+    if !usage_reported {
+        tracing::warn!(model = %chosen, "provider omitted authoritative usage; rate billing is zero");
+    }
     let cost = resolve_cost(
         &model.billing_mode,
         model.per_call_cents,
-        Some(&effective_usage),
+        usage_val.filter(|_| usage_reported),
         &chosen,
         model.rate,
         model.input_price,
@@ -1061,7 +1412,12 @@ pub async fn chat(
         model_in,
         model_out,
     );
-    let tokens = extract_bill_tokens(Some(&effective_usage), &chosen, is_est);
+    let mut tokens = extract_bill_tokens(
+        usage_val.filter(|_| usage_reported),
+        &chosen,
+        !usage_reported,
+    );
+    tokens.request_id = request_id;
     bill(&state, uid, model.id, cost, false, &tokens).await;
     Ok(Json(data))
 }
@@ -1094,13 +1450,14 @@ pub async fn user_usage(
         i64,
         i64,
         i64,
+        i64,
         String,
         bool,
         chrono::DateTime<chrono::Utc>,
     );
     let rows: Vec<UsageRow> =
         sqlx::query_as(
-            "SELECT cost_cents, prompt_tokens, completion_tokens, cached_tokens, model_name, estimated, created_at \
+            "SELECT cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, created_at \
              FROM model_usage WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200",
         )
         .bind(uid)
@@ -1109,9 +1466,17 @@ pub async fn user_usage(
     let list: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
+            let reported = !r.6;
             json!({
-                "cost_cents": r.0, "prompt_tokens": r.1, "completion_tokens": r.2,
-                "cached_tokens": r.3, "model": r.4, "estimated": r.5, "time": r.6,
+                "cost_cents": r.0,
+                "prompt_tokens": if reported { Some(r.1) } else { None },
+                "completion_tokens": if reported { Some(r.2) } else { None },
+                "cached_tokens": if reported { Some(r.3) } else { None },
+                "cache_creation_tokens": if reported { Some(r.4) } else { None },
+                "model": r.5,
+                "estimated": r.6,
+                "usage_reported": reported,
+                "time": r.7,
             })
         })
         .collect();
@@ -1131,6 +1496,65 @@ pub async fn user_usage(
         "plan": plan,
         "total_spent_cents": total_spent,
         "recent": list,
+    })))
+}
+
+/// GET /api/usage/settlement/:request_id — the exact row that was charged for
+/// one IDE model request. Token fields are null unless the upstream supplied a
+/// complete authoritative usage object; cost_cents is always the amount that
+/// was actually deducted by the billing transaction.
+pub async fn usage_settlement(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(request_id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !valid_ide_request_id(&request_id) {
+        return Err(AppError::bad("request_id 无效"));
+    }
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+    type SettlementRow = (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        bool,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+    );
+    let row: SettlementRow = sqlx::query_as(
+        "SELECT COALESCE(SUM(cost_cents), 0)::bigint, \
+                COALESCE(SUM(prompt_tokens), 0)::bigint, \
+                COALESCE(SUM(completion_tokens), 0)::bigint, \
+                COALESCE(SUM(cached_tokens), 0)::bigint, \
+                COALESCE(SUM(cache_creation_tokens), 0)::bigint, \
+                COALESCE(bool_and(NOT estimated), false), \
+                MAX(model_name), MAX(created_at), COUNT(*)::bigint \
+         FROM model_usage WHERE user_id = $1 AND request_id = $2",
+    )
+    .bind(uid)
+    .bind(&request_id)
+    .fetch_one(&state.db)
+    .await?;
+    if row.8 == 0 {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            msg: "结算记录尚未生成".into(),
+        });
+    }
+    let reported = row.5;
+    Ok(Json(json!({
+        "request_id": request_id,
+        "cost_cents": row.0,
+        "prompt_tokens": if reported { Some(row.1) } else { None },
+        "completion_tokens": if reported { Some(row.2) } else { None },
+        "cached_tokens": if reported { Some(row.3) } else { None },
+        "cache_creation_tokens": if reported { Some(row.4) } else { None },
+        "model": row.6.unwrap_or_default(),
+        "usage_reported": reported,
+        "time": row.7,
+        "attempt_count": row.8,
     })))
 }
 
@@ -1450,6 +1874,38 @@ fn cost_from_usage(u: &serde_json::Value, rate: f64) -> Option<i64> {
 /// `claude-haiku-4-5-20251001`, `gemini-3.1-pro-preview`). Sources: vendor pricing pages, 2026-07
 /// (Anthropic prices from the claude-api skill; Gemini/GPT/DeepSeek/MiniMax from vendor pages).
 /// Returns (input, output). None → caller falls back to the connection-level price, then 0.
+/// Official context-window sizes (tokens) per model family — the client meters context
+/// usage and triggers ratchet compression against this number, so a wrong guess either
+/// wastes most of the window (guessing 128K for a 400K model) or blows the request.
+/// Keep in sync with provider docs; unknown models fall back client-side.
+fn official_context(model_id: &str) -> Option<i64> {
+    let m = model_id.to_lowercase();
+    if m.contains("claude") {
+        // Claude 4.x/5 家族统一 200K（长上下文 beta 不按默认下发）。
+        return Some(200_000);
+    }
+    if m.contains("gpt-5") || m.contains("codex") {
+        // GPT-5 系（含 codex 变体）官方 400K 输入上下文。
+        return Some(400_000);
+    }
+    if m.contains("gemini") {
+        return Some(1_000_000);
+    }
+    if m.contains("grok") {
+        return Some(256_000);
+    }
+    if m.contains("kimi") || m.contains("moonshot") || m.contains("k2") {
+        return Some(256_000);
+    }
+    if m.contains("deepseek") {
+        return Some(128_000);
+    }
+    if m.contains("glm") || m.contains("qwen") {
+        return Some(128_000);
+    }
+    None
+}
+
 fn official_price(model_id: &str) -> Option<(f64, f64)> {
     let m = model_id.to_lowercase();
     // ---- Anthropic Claude (official list price) ----
@@ -1554,6 +2010,27 @@ fn official_price(model_id: &str) -> Option<(f64, f64)> {
     Some(p)
 }
 
+const CACHE_READ_FACTOR: f64 = 0.1;
+const CACHE_WRITE_FACTOR: f64 = 1.25;
+
+#[allow(clippy::too_many_arguments)]
+fn projected_provider_usd(
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    input_price: f64,
+    output_price: f64,
+    cache_read_price: f64,
+    cache_creation_price: f64,
+) -> f64 {
+    (input_tokens as f64 * input_price
+        + output_tokens as f64 * output_price
+        + cache_read_tokens as f64 * cache_read_price
+        + cache_creation_tokens as f64 * cache_creation_price)
+        / 1_000_000.0
+}
+
 /// REAL billing — actual token usage × the model's REAL (official) price × the
 /// connection's 倍率 (markup multiplier):
 ///   cost_cents = (input_tok·off_in + output_tok·off_out) / 1e6 · 100 · rate
@@ -1574,8 +2051,6 @@ fn compute_cost(
     model_in: f64,
     model_out: f64,
 ) -> i64 {
-    const CACHE_READ_FACTOR: f64 = 0.1;
-    const CACHE_WRITE_FACTOR: f64 = 1.25;
     const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
     let u = match usage {
         Some(u) if u.is_object() => u,
@@ -2088,8 +2563,10 @@ struct BillTokens {
     prompt: i64,
     completion: i64,
     cached: i64,
+    cache_creation: i64,
     model_name: String,
     estimated: bool,
+    request_id: Option<String>,
 }
 
 /// Extract BillTokens from a provider usage JSON (OpenAI or Anthropic shape).
@@ -2127,35 +2604,54 @@ fn extract_bill_tokens(
         prompt: gi(&["prompt_tokens", "input_tokens"]),
         completion: gi(&["completion_tokens", "output_tokens"]),
         cached,
+        cache_creation: gi(&["cache_creation_input_tokens"]),
         model_name: model_name.to_string(),
         estimated,
+        request_id: None,
     }
 }
 
-/// CJK-aware rough token estimate from a serialized JSON body (input side).
-fn estimate_input_tokens(body: &serde_json::Value) -> i64 {
-    let s = serde_json::to_string(body).unwrap_or_default();
-    let mut cjk = 0i64;
-    for c in s.chars() {
-        if ('\u{2E80}'..='\u{9FFF}').contains(&c)
-            || ('\u{AC00}'..='\u{D7A3}').contains(&c)
-            || ('\u{F900}'..='\u{FAFF}').contains(&c)
-            || ('\u{FF00}'..='\u{FFEF}').contains(&c)
-        {
-            cjk += 1;
-        }
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FusedCharge {
+    quota_cents: i64,
+    wallet_cents: i64,
+}
+
+impl FusedCharge {
+    fn total_cents(&self) -> i64 {
+        self.quota_cents.saturating_add(self.wallet_cents)
     }
-    cjk + (s.len() as i64 - cjk) / 4
 }
 
-/// Rough output token estimate from accumulated SSE response bytes.
-fn estimate_output_tokens(response_bytes: usize) -> i64 {
-    (response_bytes as f64 * 0.6 / 4.0).round().max(0.0) as i64
-}
-
-/// Build a synthetic usage JSON from estimates (fallback when provider reports nothing).
-fn estimated_usage(input_tok: i64, output_tok: i64) -> serde_json::Value {
-    json!({ "prompt_tokens": input_tok, "completion_tokens": output_tok, "total_tokens": input_tok + output_tok })
+fn split_fused_charge(
+    requested_cost: i64,
+    use_quota: bool,
+    quota_total: i64,
+    quota_window: i64,
+    quota_weekly_cap: i64,
+    quota_week_used: i64,
+    credits: i64,
+) -> FusedCharge {
+    let requested = requested_cost.max(0);
+    let quota_available = if use_quota {
+        let weekly_available = if quota_weekly_cap > 0 {
+            quota_weekly_cap.saturating_sub(quota_week_used.max(0))
+        } else {
+            requested
+        };
+        requested
+            .min(quota_total.max(0))
+            .min(quota_window.max(0))
+            .min(weekly_available.max(0))
+    } else {
+        0
+    };
+    let quota_cents = requested.min(quota_available);
+    let wallet_cents = requested.saturating_sub(quota_cents).min(credits.max(0));
+    FusedCharge {
+        quota_cents,
+        wallet_cents,
+    }
 }
 
 /// Deduct cost from the user's quota/credits and log the model_usage row with token detail.
@@ -2168,41 +2664,88 @@ async fn bill(
     use_quota: bool,
     tokens: &BillTokens,
 ) {
-    if cost > 0 {
-        if use_quota {
-            let _ = sqlx::query(
-                "UPDATE users SET quota_total_cents = GREATEST(quota_total_cents - $1, 0), \
-                 quota_window_cents = GREATEST(quota_window_cents - $1, 0), \
-                 quota_week_used_cents = quota_week_used_cents + $1 WHERE id = $2",
-            )
-            .bind(cost)
-            .bind(uid)
-            .execute(&state.db)
-            .await;
-        } else {
-            let _ = sqlx::query(
-                "UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2",
-            )
-            .bind(cost)
-            .bind(uid)
-            .execute(&state.db)
-            .await;
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(%error, "failed to begin billing transaction");
+            return;
+        }
+    };
+    let requested_cost = cost.max(0);
+    let charge = if requested_cost == 0 {
+        FusedCharge::default()
+    } else {
+        let balances: Option<(i64, i64, i64, i64, i64)> = match sqlx::query_as(
+            "SELECT quota_total_cents, quota_window_cents, quota_weekly_cap_cents, \
+                    quota_week_used_cents, credits_cents \
+             FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!(%error, "failed to lock balances for billing");
+                return;
+            }
+        };
+        match balances {
+            Some((quota_total, quota_window, quota_weekly_cap, quota_week_used, credits)) => {
+                split_fused_charge(
+                    requested_cost,
+                    use_quota,
+                    quota_total,
+                    quota_window,
+                    quota_weekly_cap,
+                    quota_week_used,
+                    credits,
+                )
+            }
+            None => FusedCharge::default(),
+        }
+    };
+    let actual_cost = charge.total_cents();
+    if actual_cost > 0 {
+        if let Err(error) = sqlx::query(
+            "UPDATE users SET quota_total_cents = quota_total_cents - $1, \
+             quota_window_cents = quota_window_cents - $1, \
+             quota_week_used_cents = quota_week_used_cents + $1, \
+             credits_cents = credits_cents - $2 WHERE id = $3",
+        )
+        .bind(charge.quota_cents)
+        .bind(charge.wallet_cents)
+        .bind(uid)
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!(%error, "failed to deduct fused quota and credits");
+            return;
         }
     }
-    let _ = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, model_name, estimated) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    if let Err(error) = sqlx::query(
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
     )
     .bind(uid)
     .bind(conn_id)
-    .bind(cost)
+    .bind(actual_cost)
     .bind(tokens.prompt)
     .bind(tokens.completion)
     .bind(tokens.cached)
+    .bind(tokens.cache_creation)
     .bind(&tokens.model_name)
     .bind(tokens.estimated)
-    .execute(&state.db)
-    .await;
+    .bind(&tokens.request_id)
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(%error, "failed to insert billing settlement");
+        return;
+    }
+    if let Err(error) = tx.commit().await {
+        tracing::error!(%error, "failed to commit billing transaction");
+    }
 }
 
 // ============ Anthropic protocol bridge (OpenAI ⇄ Anthropic Messages API) ============
@@ -2420,7 +2963,14 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
     }
     out.insert("messages".into(), json!(messages));
     if !system_parts.is_empty() {
-        out.insert("system".into(), json!(system_parts.join("\n\n")));
+        // Prompt caching breakpoint #2: system block. 2026-07 重新实测当前中转
+        // （newapi.ailyyzdk.xyz）：cache_control 第 1 次全额写入、第 2 次全额命中
+        // （11178/11178）——旧线路"只收写费不给命中"的结论已过时；此前剥掉断点导致
+        // 整会话 121 万输入 tokens 缓存命中 0%，全价烧钱。
+        out.insert(
+            "system".into(),
+            json!([{"type":"text","text":system_parts.join("\n\n"),"cache_control":{"type":"ephemeral"}}]),
+        );
     }
     // Extended thinking — ALWAYS use the gateway's model-aware config, never the client's
     // `thinking` field. Newer models (Sonnet 5, Opus 4.7/4.8, Fable 5) REJECT the old
@@ -2487,18 +3037,12 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
         // 只发 thinking.budget_tokens 时上游按原文回思考流。思考深度已由
         // budget_tokens + max_tokens 下限（见上）控制，effort 不再需要。
     }
-    // stream/stop always pass through; temperature/top_p are INCOMPATIBLE with thinking
-    // (Anthropic rejects non-default values), so copy them only when thinking is OFF.
+    // Native Anthropic requests do not forward OpenAI sampling knobs. New Claude
+    // models reject temperature/top_p even when thinking is off, while omitting
+    // them preserves the provider default for every model generation.
     for k in ["stream", "stop"] {
         if let Some(v) = body.get(k) {
             out.insert(k.to_string(), v.clone());
-        }
-    }
-    if !thinking_on {
-        for k in ["temperature", "top_p"] {
-            if let Some(v) = body.get(k) {
-                out.insert(k.to_string(), v.clone());
-            }
         }
     }
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -2522,7 +3066,52 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
             })
             .collect();
         if !atools.is_empty() {
+            let mut atools = atools;
+            // Prompt caching breakpoint #1: last tool. tools 在 Anthropic 请求序列
+            // 最前（tools→system→messages），断点打在末个工具上把整个工具表缓存住。
+            if let Some(last) = atools.last_mut().and_then(|v| v.as_object_mut()) {
+                last.insert("cache_control".into(), json!({"type":"ephemeral"}));
+            }
             out.insert("tools".into(), json!(atools));
+        }
+    }
+    // Prompt caching breakpoint #3: rolling conversation breakpoint. 不打在"最后一条
+    // 消息"上——IDE 的尾部是易变区（运行草稿纸/自提醒/协调 nudge 每轮增删），断点挂
+    // 在那里下一轮永远对不上前缀，实测整段历史 0 命中。打在【最后一条含 tool_result
+    // 的消息】上：工具结果是 append-only 的稳定履历（压缩轮外逐字节不动），下一轮的
+    // 前缀能一路匹配到这里，历史大头以 0.1× 读回。没有工具结果时退回最后一条消息。
+    if let Some(arr) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let anchor = arr
+            .iter()
+            .rposition(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    })
+            })
+            .or_else(|| arr.len().checked_sub(1));
+        if let Some(idx) = anchor {
+            let last_msg = &mut arr[idx];
+            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
+                    // tool_result 的 content 是嵌套结构也允许挂 cache_control（块级均可）。
+                    obj.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                }
+            } else if let Some(text) = last_msg
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(String::from)
+            {
+                if let Some(obj) = last_msg.as_object_mut() {
+                    obj.insert(
+                        "content".into(),
+                        json!([{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]),
+                    );
+                }
+            }
         }
     }
     if let Some(tc) = body.get("tool_choice") {
@@ -2666,10 +3255,11 @@ struct AnthSse {
     message_stop_seen: bool,
     input_tokens: i64,
     output_tokens: i64,
+    input_usage_reported: bool,
+    output_usage_reported: bool,
     cache_read: i64,
     cache_create: i64,
     stop_reason: String,
-    out_bytes: usize, // incremental output byte counter for fallback estimation
 }
 impl AnthSse {
     #[cfg(test)]
@@ -2711,10 +3301,11 @@ impl AnthSse {
             message_stop_seen: false,
             input_tokens: 0,
             output_tokens: 0,
+            input_usage_reported: false,
+            output_usage_reported: false,
             cache_read: 0,
             cache_create: 0,
             stop_reason: "stop".into(),
-            out_bytes: 0,
         }
     }
 
@@ -2760,8 +3351,12 @@ impl AnthSse {
             match ev.get("type").and_then(|t| t.as_str()) {
                 Some("message_start") => {
                     if let Some(u) = ev.pointer("/message/usage") {
-                        self.input_tokens =
-                            u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if let Some(value) = u.get("input_tokens").and_then(|v| v.as_i64()) {
+                            if value >= 0 {
+                                self.input_tokens = value;
+                                self.input_usage_reported = true;
+                            }
+                        }
                         self.cache_read = u
                             .get("cache_read_input_tokens")
                             .and_then(|v| v.as_i64())
@@ -2828,7 +3423,6 @@ impl AnthSse {
                     match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
-                                self.out_bytes += t.len();
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"content": t}), None));
                             }
@@ -2836,7 +3430,6 @@ impl AnthSse {
                         Some("thinking_delta") => {
                             if let Some(t) = ev.pointer("/delta/thinking").and_then(|v| v.as_str())
                             {
-                                self.out_bytes += t.len();
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"reasoning_content": t}), None));
                             }
@@ -2884,11 +3477,15 @@ impl AnthSse {
                         .into();
                     }
                     if let Some(v) = ev.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
-                        self.output_tokens = v;
+                        if v >= 0 {
+                            self.output_tokens = v;
+                            self.output_usage_reported = true;
+                        }
                     }
                     if let Some(v) = ev.pointer("/usage/input_tokens").and_then(|v| v.as_i64()) {
-                        if v > 0 {
+                        if v >= 0 {
                             self.input_tokens = v;
+                            self.input_usage_reported = true;
                         }
                     }
                     if let Some(v) = ev
@@ -2936,21 +3533,15 @@ impl AnthSse {
         Ok(out)
     }
     fn usage(&self) -> serde_json::Value {
-        let ot = if self.output_tokens > 0 {
-            self.output_tokens
-        } else if self.out_bytes > 0 {
-            // Stream broke before message_delta reported output_tokens.
-            // Estimate from the content bytes we DID forward (~4 chars/token).
-            (self.out_bytes as i64 / 4).max(1)
-        } else {
-            0
-        };
         json!({
-            "input_tokens": self.input_tokens, "output_tokens": ot,
+            "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
             "cache_read_input_tokens": self.cache_read, "cache_creation_input_tokens": self.cache_create,
-            "prompt_tokens": self.input_tokens, "completion_tokens": ot,
-            "total_tokens": self.input_tokens + ot,
+            "prompt_tokens": self.input_tokens, "completion_tokens": self.output_tokens,
+            "total_tokens": self.input_tokens + self.output_tokens,
         })
+    }
+    fn usage_is_authoritative(&self) -> bool {
+        self.input_usage_reported && self.output_usage_reported
     }
     fn finish(&self) -> Result<Vec<u8>, String> {
         if !self.buf.iter().all(u8::is_ascii_whitespace) {
@@ -3097,6 +3688,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
+    let request_id = ide_request_id(&headers)?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -3234,6 +3826,7 @@ pub async fn chat_completions(
                 use_quota,
                 &BillTokens {
                     model_name: model_id.clone(),
+                    request_id: request_id.clone(),
                     ..Default::default()
                 },
             )
@@ -3465,8 +4058,6 @@ pub async fn chat_completions(
     let anthropic = conn.protocol == "anthropic";
 
     if streaming {
-        // Pre-compute input token estimate BEFORE the spawn (body is consumed afterwards).
-        let est_in_tok = estimate_input_tokens(&body);
         // 深思考请求（xhigh/max/带 thinking 预算）静默期可超 3 分钟：固定 180s 的上游
         // 空闲斩会在客户端窗口放宽后成为顶层杀手，这里跟档位一起放宽。
         let deep_thinking = body
@@ -3501,6 +4092,7 @@ pub async fn chat_completions(
         let bmode = conn.billing_mode.clone();
         let percall = conn.per_call_cents;
         let req_model = model_id.clone();
+        let request_id_task = request_id.clone();
         let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
         let ckey_task = ckey.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
@@ -3622,12 +4214,10 @@ pub async fn chat_completions(
                     }
                 }
             }
-            // anthropic: flush the terminal OpenAI chunks (finish_reason + usage + [DONE]) and bill
-            // from the converter's accumulated (cache-aware) usage. openai: bill from the trailing
-            // include_usage chunk. per_call mode ignores usage; rate mode → 0 if no usage/prices.
-            // FALLBACK: when the provider reports no usage (stream broke, no trailing chunk), estimate
-            // from the request body and accumulated response bytes so calls are never silently free.
-            let (usage, is_estimated) = if let Some(c) = conv.as_ref() {
+            // Anthropic bills from its native usage events; OpenAI-compatible streams
+            // bill from the trailing include_usage chunk. Missing/incomplete usage is
+            // never guessed: rate billing is zero and the settlement says unreported.
+            let (usage, usage_reported) = if let Some(c) = conv.as_ref() {
                 if complete {
                     match c.finish() {
                         Ok(fin) => {
@@ -3648,23 +4238,16 @@ pub async fn chat_completions(
                         "Anthropic upstream stream ended before protocol completion".to_string(),
                     );
                 }
-                (c.usage(), false)
+                (c.usage(), c.usage_is_authoritative())
             } else {
                 match parse_usage_from_sse(&tail) {
-                    Some(u) => (u, false),
-                    None if !acc.is_empty() => {
-                        let est_out = estimate_output_tokens(acc.len());
-                        tracing::warn!(
-                            "[billing] no usage from provider, estimating: in={} out={} model={}",
-                            est_in_tok,
-                            est_out,
-                            req_model
-                        );
-                        (estimated_usage(est_in_tok, est_out), true)
-                    }
-                    None => (json!({}), false), // truly empty response, bill 0
+                    Some(u) if usage_is_authoritative(Some(&u)) => (u, true),
+                    _ => (json!({}), false),
                 }
             };
+            if !usage_reported {
+                tracing::warn!(model = %req_model, "provider omitted authoritative usage; rate billing is zero");
+            }
             if let Some(err) = stream_failure.take() {
                 complete = false;
                 if !client_closed {
@@ -3680,7 +4263,7 @@ pub async fn chat_completions(
             let cost = resolve_cost(
                 &bmode,
                 percall,
-                Some(&usage),
+                usage_reported.then_some(&usage),
                 &req_model,
                 rate,
                 admin_in,
@@ -3690,7 +4273,12 @@ pub async fn chat_completions(
                 model_in,
                 model_out,
             );
-            let tokens = extract_bill_tokens(Some(&usage), &req_model, is_estimated);
+            let mut tokens = extract_bill_tokens(
+                usage_reported.then_some(&usage),
+                &req_model,
+                !usage_reported,
+            );
+            tokens.request_id = request_id_task;
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
             if complete && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
@@ -3759,39 +4347,21 @@ pub async fn chat_completions(
                 per.clamp(0, 5000),
                 BillTokens {
                     model_name: model_id.clone(),
+                    request_id: request_id.clone(),
                     ..Default::default()
                 },
             )
         } else {
             let usage_val = data.get("usage");
-            let is_est = usage_val.is_none()
-                || usage_val.is_some_and(|u| {
-                    u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0) == 0
-                        && u.get("completion_tokens")
-                            .and_then(|x| x.as_i64())
-                            .unwrap_or(0)
-                            == 0
-                        && u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0) == 0
-                });
-            let effective_usage = if is_est {
-                let est_in = estimate_input_tokens(&body);
-                let resp_str = serde_json::to_string(&data).unwrap_or_default();
-                let est_out = (resp_str.len() as i64) / 4;
-                tracing::warn!(
-                    "[billing] non-stream no usage, estimating: in={} out={} model={}",
-                    est_in,
-                    est_out,
-                    model_id
-                );
-                estimated_usage(est_in, est_out)
-            } else {
-                usage_val.cloned().unwrap_or_else(|| json!({}))
-            };
+            let usage_reported = usage_is_authoritative(usage_val);
+            if !usage_reported {
+                tracing::warn!(model = %model_id, "provider omitted authoritative usage; rate billing is zero");
+            }
             let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
             let cost = resolve_cost(
                 &conn.billing_mode,
                 conn.per_call_cents,
-                Some(&effective_usage),
+                usage_val.filter(|_| usage_reported),
                 &model_id,
                 conn.rate,
                 conn.input_price,
@@ -3801,10 +4371,13 @@ pub async fn chat_completions(
                 model_in,
                 model_out,
             );
-            (
-                cost,
-                extract_bill_tokens(Some(&effective_usage), &model_id, is_est),
-            )
+            let mut tokens = extract_bill_tokens(
+                usage_val.filter(|_| usage_reported),
+                &model_id,
+                !usage_reported,
+            );
+            tokens.request_id = request_id.clone();
+            (cost, tokens)
         };
         bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
         Ok(Json(data).into_response())
@@ -3825,6 +4398,7 @@ pub async fn responses_proxy(
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
+    let request_id = ide_request_id(&headers)?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -4046,16 +4620,20 @@ pub async fn responses_proxy(
                 use_quota,
                 &BillTokens {
                     model_name: model_id.clone(),
+                    estimated: true,
+                    request_id: request_id.clone(),
                     ..Default::default()
                 },
             )
             .await;
         } else {
+            let usage = data.get("usage");
+            let usage_reported = usage_is_authoritative(usage);
             let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
             let cost = resolve_cost(
                 &conn.billing_mode,
                 conn.per_call_cents,
-                data.get("usage"),
+                usage.filter(|_| usage_reported),
                 &model_id,
                 conn.rate,
                 conn.input_price,
@@ -4065,7 +4643,9 @@ pub async fn responses_proxy(
                 model_in,
                 model_out,
             );
-            let tokens = extract_bill_tokens(data.get("usage"), &model_id, false);
+            let mut tokens =
+                extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
+            tokens.request_id = request_id.clone();
             bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
         }
     }
@@ -4080,6 +4660,7 @@ pub async fn image_generations(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
+    let request_id = ide_request_id(&headers)?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -4301,6 +4882,8 @@ pub async fn image_generations(
                 use_quota,
                 &BillTokens {
                     model_name: model_id.clone(),
+                    estimated: true,
+                    request_id: request_id.clone(),
                     ..Default::default()
                 },
             )
@@ -4316,11 +4899,58 @@ mod billing_tests {
     use super::{
         anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, compute_cost, is_image_gen_model, model_price_override,
-        oai_to_anthropic, official_price, parse_usage_from_sse, resolve_cost, response_cache_safe,
-        tool_argument_rules, validate_openai_sse_eof, validate_openai_sse_with_rules, AnthSse,
-        OpenAiSseValidator,
+        oai_to_anthropic, official_price, parse_usage_from_sse, project_quota_package,
+        projected_provider_usd, resolve_cost, response_cache_safe, round_multiplier_up,
+        split_fused_charge, tool_argument_rules, validate_openai_sse_eof,
+        validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
     };
     use serde_json::json;
+
+    #[test]
+    fn fused_charge_spills_from_quota_into_wallet() {
+        assert_eq!(
+            split_fused_charge(23, true, 10, 10, 0, 0, 100),
+            FusedCharge {
+                quota_cents: 10,
+                wallet_cents: 13,
+            }
+        );
+    }
+
+    #[test]
+    fn fused_charge_respects_weekly_quota_cap() {
+        assert_eq!(
+            split_fused_charge(23, true, 100, 100, 20, 15, 100),
+            FusedCharge {
+                quota_cents: 5,
+                wallet_cents: 18,
+            }
+        );
+    }
+
+    #[test]
+    fn fused_charge_uses_wallet_without_eligible_quota() {
+        assert_eq!(
+            split_fused_charge(23, false, 100, 100, 0, 0, 50),
+            FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 23,
+            }
+        );
+    }
+
+    #[test]
+    fn fused_charge_never_exceeds_available_funds() {
+        let charge = split_fused_charge(23, true, 10, 10, 0, 0, 4);
+        assert_eq!(
+            charge,
+            FusedCharge {
+                quota_cents: 10,
+                wallet_cents: 4,
+            }
+        );
+        assert_eq!(charge.total_cents(), 14);
+    }
 
     #[test]
     fn shipment_tool_calls_are_never_response_cached() {
@@ -4520,6 +5150,55 @@ mod billing_tests {
         ); // ×2
     }
 
+    #[test]
+    fn model_estimate_separates_provider_cost_from_user_multiplier() {
+        let usd = projected_provider_usd(
+            100_000, // $0.50 plain input
+            10_000,  // $0.25 output
+            50_000,  // $0.025 cache read
+            20_000,  // $0.125 cache creation
+            5.0, 25.0, 0.5, 6.25,
+        );
+        assert!((usd - 0.9).abs() < f64::EPSILON);
+
+        let usage = json!({
+            "input_tokens": 100_000,
+            "output_tokens": 10_000,
+            "cache_read_input_tokens": 50_000,
+            "cache_creation_input_tokens": 20_000,
+        });
+        assert_eq!(
+            resolve_cost(
+                "rate",
+                0,
+                Some(&usage),
+                "custom-model",
+                0.8,
+                5.0,
+                25.0,
+                0.5,
+                6.25,
+                0.0,
+                0.0,
+            ),
+            72
+        );
+    }
+
+    #[test]
+    fn quota_package_estimate_recommends_break_even_and_target_multipliers() {
+        let projection = project_quota_package(1000.0, 288.0, 10.0, 0.8, 20.0);
+        assert!((projection.quota_raw_usd - 6630.0).abs() < 1e-9);
+        assert!((projection.provider_usd_capacity - 8287.5).abs() < 1e-9);
+        assert!((projection.channel_cost_cny - 828.75).abs() < 1e-9);
+        assert!((projection.profit_cny + 540.75).abs() < 1e-9);
+        assert!((projection.margin_percent + 187.76041666666669).abs() < 1e-9);
+        assert!((projection.break_even_multiplier - 2.3020833333333335).abs() < 1e-9);
+        assert!((projection.target_multiplier - 2.877604166666667).abs() < 1e-9);
+        assert_eq!(round_multiplier_up(projection.break_even_multiplier), 2.31);
+        assert_eq!(round_multiplier_up(projection.target_multiplier), 2.88);
+    }
+
     // gpt-5.5 ($5/$30), 22k+2k, ×1: (110000+60000)/1e6 = $0.17 = 17¢.
     #[test]
     fn gpt55_real_cost() {
@@ -4702,7 +5381,14 @@ mod billing_tests {
             "tools": [{"type": "function", "function": {"name": "read_file", "description": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(a["system"], json!("You are helpful.")); // system hoisted out of messages
+        // system hoisted out of messages, as a block array carrying the cache breakpoint
+        assert_eq!(a["system"][0]["text"], json!("You are helpful."));
+        assert_eq!(a["system"][0]["cache_control"]["type"], json!("ephemeral"));
+        // 3 canonical breakpoints: last tool + system + conversation tail (Anthropic max 4)
+        assert_eq!(a["tools"][0]["cache_control"]["type"], json!("ephemeral"));
+        let tail = a["messages"].as_array().unwrap().last().unwrap().clone();
+        let tail_last_block = tail["content"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(tail_last_block["cache_control"]["type"], json!("ephemeral"));
         assert_eq!(a["max_tokens"], json!(100)); // haiku (fast tier) → no thinking bump
         assert!(
             a.get("thinking").is_none(),
@@ -4783,14 +5469,16 @@ mod billing_tests {
             json!({"type":"enabled","budget_tokens":12000})
         );
 
-        // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking; temp passes through.
+        // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking.
+        // Sampling knobs are still omitted because current Claude models reject them.
         let off = oai_to_anthropic(&json!({
-            "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"messages":[]
+            "model":"claude-opus-4-8","max_tokens":4096,"temperature":0.5,"top_p":0.9,"messages":[]
         }))
         .unwrap();
         assert!(off.get("thinking").is_none());
         assert_eq!(off["max_tokens"], json!(4096));
-        assert_eq!(off["temperature"], json!(0.5));
+        assert!(off.get("temperature").is_none());
+        assert!(off.get("top_p").is_none());
     }
 
     #[test]
@@ -5477,30 +6165,22 @@ mod cache_price_tests {
 }
 
 #[cfg(test)]
-mod estimation_tests {
+mod authoritative_usage_tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn estimate_input_tokens_counts_cjk_and_ascii() {
-        let body = json!({"messages": [{"role": "user", "content": "你好世界 hello"}]});
-        let est = estimate_input_tokens(&body);
-        assert!(est > 10, "should estimate > 10 tokens, got {}", est);
-    }
-
-    #[test]
-    fn estimate_output_tokens_from_sse_bytes() {
-        let est = estimate_output_tokens(4000);
-        assert!(est > 0 && est < 4000, "should be reasonable, got {}", est);
-        assert_eq!(estimate_output_tokens(0), 0);
-    }
-
-    #[test]
-    fn estimated_usage_produces_valid_json() {
-        let u = estimated_usage(1000, 200);
-        assert_eq!(u["prompt_tokens"], 1000);
-        assert_eq!(u["completion_tokens"], 200);
-        assert_eq!(u["total_tokens"], 1200);
+    fn complete_usage_shapes_are_authoritative() {
+        assert!(usage_is_authoritative(Some(
+            &json!({"prompt_tokens": 0, "completion_tokens": 0})
+        )));
+        assert!(usage_is_authoritative(Some(
+            &json!({"input_tokens": 800, "output_tokens": 300})
+        )));
+        assert!(!usage_is_authoritative(Some(
+            &json!({"prompt_tokens": 800})
+        )));
+        assert!(!usage_is_authoritative(None));
     }
 
     #[test]
@@ -5518,11 +6198,13 @@ mod estimation_tests {
     #[test]
     fn extract_bill_tokens_anthropic_shape() {
         let u = json!({"input_tokens": 800, "output_tokens": 300,
-                        "cache_read_input_tokens": 200});
+                        "cache_read_input_tokens": 200,
+                        "cache_creation_input_tokens": 450});
         let bt = extract_bill_tokens(Some(&u), "claude-opus-4-8", false);
         assert_eq!(bt.prompt, 800);
         assert_eq!(bt.completion, 300);
         assert_eq!(bt.cached, 200);
+        assert_eq!(bt.cache_creation, 450);
     }
 
     #[test]
@@ -5530,33 +6212,29 @@ mod estimation_tests {
         let bt = extract_bill_tokens(None, "test", true);
         assert_eq!(bt.prompt, 0);
         assert_eq!(bt.completion, 0);
+        assert_eq!(bt.cache_creation, 0);
         assert!(bt.estimated);
     }
 
     #[test]
-    fn anth_sse_fallback_output_estimation() {
+    fn anth_sse_never_estimates_missing_output_usage() {
         let mut c = AnthSse::new("claude-opus-4-8");
-        // Simulate receiving text deltas without a final message_delta (stream broke)
         let bytes = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000}}}\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello world, this is a test response with some content.\"}}\n";
         c.push(bytes).unwrap();
         let u = c.usage();
         assert_eq!(u["input_tokens"], 1000);
-        // output_tokens should be estimated from out_bytes since message_delta never arrived
-        assert!(
-            u["output_tokens"].as_i64().unwrap_or(0) > 0,
-            "should estimate output from forwarded bytes, got {}",
-            u["output_tokens"]
-        );
+        assert_eq!(u["output_tokens"], 0);
+        assert!(!c.usage_is_authoritative());
     }
 
     #[test]
-    fn fallback_estimation_produces_nonzero_cost() {
-        let est = estimated_usage(50000, 500);
-        // Claude Opus: $5/1M in, $25/1M out, rate=1
-        let cost = compute_cost(
-            Some(&est),
+    fn rate_billing_without_usage_is_zero() {
+        let cost = resolve_cost(
+            "rate",
+            999,
+            None,
             "claude-opus-4-8",
             1.0,
             0.0,
@@ -5566,10 +6244,6 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             0.0,
             0.0,
         );
-        assert!(
-            cost > 0,
-            "estimated usage should produce nonzero cost, got {}",
-            cost
-        );
+        assert_eq!(cost, 0);
     }
 }

@@ -722,16 +722,26 @@ export function renderMarkdownInto(container, text, opts = {}) {
 // The end-offset of the last "settled" markdown block: the position after the
 // last blank line that is NOT inside a code fence. Everything before it is made
 // of complete blocks that won't change as more text streams in.
-function _settledLen(text) {
-  const lines = text.split("\n");
-  let offset = 0, boundary = 0, inFence = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^\s{0,3}(```|~~~)/.test(line)) inFence = !inFence;
-    if (!inFence && line.trim() === "" && i < lines.length - 1) boundary = offset + line.length + 1;
-    offset += line.length + 1;
+// INCREMENTAL: the old version re-split the WHOLE accumulated text every frame
+// (O(n) allocation per frame → O(n²) over a long reply — a main cause of the
+// long-content UI freeze). Scan state lives on the stream state object and each
+// call only walks the NEW complete lines since the last call.
+function _advanceSettledScan(st, text) {
+  let i = st.scanPos || 0;
+  for (;;) {
+    const nl = text.indexOf("\n", i);
+    if (nl === -1) break; // last line still incomplete — scanned once it terminates
+    if (nl > i) {
+      const line = text.slice(i, nl);
+      if (/^\s{0,3}(```|~~~)/.test(line)) st.inFence = !st.inFence;
+      if (!st.inFence && line.trim() === "") st.boundary = nl + 1;
+    } else if (!st.inFence) {
+      st.boundary = nl + 1; // empty complete line
+    }
+    i = nl + 1;
   }
-  return boundary;
+  st.scanPos = i;
+  return st.boundary || 0;
 }
 
 /**
@@ -750,9 +760,9 @@ export function renderMarkdownStream(container, text, opts = {}) {
   let st = container.__mdStream;
   if (!st || !text.startsWith(st.src) || (st.tail && st.tail.parentNode !== container)) {
     container.textContent = "";
-    st = container.__mdStream = { src: "", tail: null };
+    st = container.__mdStream = { src: "", tail: null, scanPos: 0, inFence: false, boundary: 0 };
   }
-  const settled = _settledLen(text);
+  const settled = _advanceSettledScan(st, text);
   if (settled > st.src.length) {
     const chunk = text.slice(st.src.length, settled);
     if (chunk.trim()) {

@@ -28,8 +28,8 @@ const MAX_STATIC_TOOLS_PER_REQUEST: usize = 220;
 // request reaches the server. Bound the final array after every merge so one noisy service cannot
 // create an unbounded upstream payload. This limit is the complete compact JSON array, including
 // brackets and commas, measured as serialized UTF-8 bytes.
-const MAX_FINAL_TOOLS_PER_REQUEST: usize = 220;
-const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
+const MAX_FINAL_TOOLS_PER_REQUEST: usize = 64;
+const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 
 fn prompt_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -100,7 +100,9 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "read_file"
                 | "find_files"
                 | "search"
+                | "semantic_search"
                 | "lsp_symbols"
+                | "find_symbol"
                 | "lsp_definition"
                 | "lsp_references"
                 | "knowledge_search"
@@ -139,6 +141,7 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "read_file"
                 | "find_files"
                 | "search"
+                | "semantic_search"
                 | "lsp_symbols"
                 | "find_symbol"
                 | "lsp_definition"
@@ -276,60 +279,37 @@ fn enforce_final_tool_budget(body: &mut serde_json::Value) -> (usize, usize) {
     (candidate_count, serialized_bytes)
 }
 
-/// Weak / small / fast-tier models follow a long, densely-caveated prompt poorly — they under-use
-/// tools, skip verification, and drown in the ~7K-token `agent` prompt. Serve THEM the tighter,
-/// directive `agent_lite` instead (agent mode only; other modes are already short). Conservative
-/// DENYLIST: anything not matched here keeps the full prompt, so frontier models never regress.
-/// Reasoning models keep the full prompt even if the family name looks small. Env override:
-/// `MICHAEL_LITE_PROMPT=0` disables it entirely, `=all` forces lite for every model.
+/// The compact agent contract is the production default for every model. Frontier models are not
+/// helped by repeating a 100KB rulebook on every tool turn; task-specific research, automation,
+/// design, knowledge and tool schemas are injected separately below. Operators can still set
+/// `MICHAEL_LITE_PROMPT=0` as an immediate rollback to the legacy full prompt.
 fn use_lite_agent_prompt(model: &str) -> bool {
     match std::env::var("MICHAEL_LITE_PROMPT").ok().as_deref() {
         Some("0") => return false,
         Some("all") => return true,
         _ => {}
     }
-    let m = model.to_lowercase();
-    // Reasoning models digest the full prompt fine regardless of tier naming.
-    if m.contains("reasoner") || m.contains("-r1") || m.contains("qwq") || m.contains("think") {
-        return false;
-    }
-    m.contains("deepseek-v")
-        || m.contains("deepseek-chat")
-        || m.contains("minimax")
-        || m.contains("flash")
-        || m.contains("haiku")
-        || m.contains("-mini")
-        || m.contains("-lite")
-        || m.contains("-small")
-        || m.contains("-air")
-        || m.contains("glm-4-flash")
-        || m.contains("qwen-turbo")
-        || m.contains("qwen-plus")
-        || m.contains("ernie")
-        || m.contains("hunyuan-lite")
-        || m.contains("doubao-lite")
-        || m.contains("gpt-4o-mini")
-        || m.contains("gpt-5-mini")
-        || m.contains("o1-mini")
-        || m.contains("o3-mini")
-        || m.contains("o4-mini")
+    let _ = model;
+    true
 }
 
-const USER_REQUEST_MARKER: &str = "📌 **用户这次的请求（请正面、直接回应这一条本身）**：";
+const USER_REQUEST_MARKER: &str = "📌 **用户本次请求**：";
 const USER_STEERING_MARKER: &str = "[MICHAEL_USER_STEERING]";
-const USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑";
+const USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：";
+const LEGACY_USER_REQUEST_MARKER: &str = "📌 **用户这次的请求（请正面、直接回应这一条本身）**：";
+const LEGACY_USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑";
 const AUTO_KNOWLEDGE_MIN_QUERY_CHARS: usize = 12;
 const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
 const DESIGN_KNOWLEDGE_SEARCH_POOL: usize = 12;
-const DESIGN_KNOWLEDGE_MAX_HITS: usize = 5;
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 8;
 const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 4200;
-const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 14_000;
+const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 18_000;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
-    "premium website rich content information architecture media asset gif mp4 webp motion";
+    "premium light solid website Tailwind palette harmony responsive card grid semantic icons rich content media advanced motion choreography";
 const DESIGN_KNOWLEDGE_ASSET_QUERIES: &[&str] = &[
     "Asset Preview visuals-by-id gif mp4 webp m3u8 hero media motion",
     "video gif image gallery media showcase background hero asset",
@@ -337,8 +317,8 @@ const DESIGN_KNOWLEDGE_ASSET_QUERIES: &[&str] = &[
 const DESIGN_KNOWLEDGE_SECTION_QUERIES: &[&str] = &[
     "Asset Preview visuals-by-id gif mp4 webp landing hero section",
     "gallery media showcase image video product story section",
-    "hero landing page cinematic website visual system",
-    "features cards section polished interaction motion",
+    "light solid palette Tailwind color scale editorial website visual system",
+    "features cards item count balanced last row responsive grid breakpoints",
     "pricing cta footer conversion landing page",
     "case studies testimonials faq resources editorial content density",
     "restaurant menu venue booking gallery website information architecture",
@@ -347,6 +327,387 @@ const DESIGN_KNOWLEDGE_SECTION_QUERIES: &[&str] = &[
     "mobile responsive app ui dashboard component",
     "portfolio agency showcase premium animation",
 ];
+const DESIGN_KNOWLEDGE_MOTION_QUERIES: &[&str] = &[
+    "GSAP ScrollTrigger scrub pinning multi section advanced motion choreography responsive fallback",
+    "useScroll useTransform parallax mask clip reveal layoutId sticky stacking animation",
+    "Lottie Rive Three.js WebGL canvas interactive effect website",
+];
+const DESIGN_KNOWLEDGE_LAYOUT_QUERIES: &[&str] = &[
+    "responsive cards grid item count columns breakpoints mobile tablet desktop",
+    "bento grid col-span auto-fit minmax balanced last row card layout",
+];
+const DESIGN_KNOWLEDGE_CARD_QUERIES: &[&str] = &[
+    "card surface elevation shadow tonal container accent tint hover variant visual hierarchy",
+    "card surface contrast tonal hierarchy border inset highlight card variants",
+];
+
+/// One concrete, category-appropriate color contract selected before the model starts designing.
+/// These are compact Tailwind-name translations of the curated michael-design palette library and
+/// its category-palette guidance. Keeping the selection in code makes it deterministic and stops
+/// generic prompt terms such as "premium" or "modern" from collapsing every site into blue/violet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesignColorDirection {
+    id: &'static str,
+    category: &'static str,
+    source: &'static str,
+    blueprint_query: &'static str,
+    background: &'static str,
+    foreground: &'static str,
+    primary: &'static str,
+    support: Option<&'static str>,
+    muted: &'static str,
+    typography: &'static str,
+}
+
+const DESIGN_COLOR_DIRECTIONS: &[DesignColorDirection] = &[
+    DesignColorDirection {
+        id: "cafe-hospitality",
+        category: "cafe / coffee / bakery / restaurant",
+        source: "enterprise-standard#Curated Palette Library — Cafe / coffee / bakery",
+        blueprint_query: "cafe coffee bakery restaurant dining menu warm hospitality editorial food photography",
+        background: "orange-50",
+        foreground: "orange-950",
+        primary: "amber-800",
+        support: Some("orange-700"),
+        muted: "orange-100",
+        typography: "Fraunces display + Inter body",
+    },
+    DesignColorDirection {
+        id: "nature-hospitality",
+        category: "nature stay / travel / hotel / cabin",
+        source: "enterprise-standard#Curated Palette Library — Nature lodge / travel stay",
+        blueprint_query: "nature lodge cabin hotel resort travel booking stay warm forest editorial photography",
+        background: "stone-50",
+        foreground: "stone-800",
+        primary: "amber-700",
+        support: Some("green-800"),
+        muted: "stone-100",
+        typography: "Fraunces display + Inter body",
+    },
+    DesignColorDirection {
+        id: "fintech-investment",
+        category: "finance / fintech / investment / banking",
+        source: "enterprise-standard#Curated Palette Library — Finance / fintech",
+        blueprint_query: "fintech finance investment wealth banking dashboard analytics payments trustworthy light",
+        background: "slate-50",
+        foreground: "slate-900",
+        primary: "blue-700",
+        support: Some("emerald-700"),
+        muted: "slate-100",
+        typography: "Space Grotesk display + Inter body",
+    },
+    DesignColorDirection {
+        id: "health-clinical",
+        category: "health / clinic / medical / healthcare",
+        source: "enterprise-standard#Curated Palette Library — Health / clinic / wellness",
+        blueprint_query: "healthcare medical clinic patient care health portal calm trustworthy light",
+        background: "emerald-50",
+        foreground: "teal-950",
+        primary: "teal-600",
+        support: Some("lime-600"),
+        muted: "emerald-100",
+        typography: "Inria Serif display + Inter body",
+    },
+    DesignColorDirection {
+        id: "wellness-organic",
+        category: "wellness / spa / yoga / beauty / supplements",
+        source: "design-judgment#Category Palette Harmony — spa/wellness",
+        blueprint_query: "wellness spa yoga beauty supplements botanical organic calm product photography",
+        background: "stone-50",
+        foreground: "emerald-950",
+        primary: "emerald-700",
+        support: Some("lime-600"),
+        muted: "stone-100",
+        typography: "DM Sans display + Inter body",
+    },
+    DesignColorDirection {
+        id: "ai-workflow",
+        category: "AI / SaaS / chat / productivity / workflow",
+        source: "enterprise-standard#Curated Palette Library — SaaS / tech / AI / chat",
+        blueprint_query: "AI SaaS workflow automation chat productivity dashboard application light interface",
+        background: "zinc-50",
+        foreground: "zinc-950",
+        primary: "emerald-600",
+        support: Some("blue-600"),
+        muted: "zinc-100",
+        typography: "Space Grotesk display + Inter body",
+    },
+    DesignColorDirection {
+        id: "editorial-portfolio",
+        category: "editorial / magazine / creative portfolio / studio",
+        source: "design-judgment#Category Palette Harmony — Monochrome is a complete design",
+        blueprint_query: "editorial magazine creative portfolio studio art gallery typography photography layout",
+        background: "zinc-50",
+        foreground: "zinc-950",
+        primary: "zinc-900",
+        support: None,
+        muted: "zinc-100",
+        typography: "Playfair Display or Newsreader display + Source Serif 4 body",
+    },
+    DesignColorDirection {
+        id: "luxury-fashion",
+        category: "luxury / jewelry / fashion / premium retail",
+        source: "enterprise-standard#Curated Palette Library — Luxury / jewelry / fashion",
+        blueprint_query: "luxury jewelry fashion premium retail editorial product photography dark refined",
+        background: "stone-950",
+        foreground: "stone-50",
+        primary: "yellow-600",
+        support: Some("stone-500"),
+        muted: "stone-900",
+        typography: "Cormorant Garamond display + Jost body",
+    },
+    DesignColorDirection {
+        id: "education-community",
+        category: "education / kids / course / learning community",
+        source: "enterprise-standard#Curated Palette Library — Education / kids",
+        blueprint_query: "education course learning school kids community playful clear dashboard",
+        background: "amber-50",
+        foreground: "slate-800",
+        primary: "orange-600",
+        support: Some("cyan-600"),
+        muted: "amber-100",
+        typography: "Space Grotesk display + Inter body",
+    },
+    DesignColorDirection {
+        id: "real-estate",
+        category: "real estate / architecture / property",
+        source: "enterprise-standard#Curated Palette Library — Real estate / architecture",
+        blueprint_query: "real estate architecture property homes interior editorial listings premium neutral",
+        background: "stone-50",
+        foreground: "stone-900",
+        primary: "teal-700",
+        support: Some("yellow-700"),
+        muted: "stone-200",
+        typography: "Marcellus display + Inter body",
+    },
+    DesignColorDirection {
+        id: "nonprofit-warm",
+        category: "nonprofit / charity / community impact",
+        source: "enterprise-standard#Curated Palette Library — Nonprofit / charity / animal rescue",
+        blueprint_query: "nonprofit charity community impact donation volunteer warm trustworthy photography",
+        background: "stone-50",
+        foreground: "stone-900",
+        primary: "teal-600",
+        support: Some("rose-500"),
+        muted: "stone-100",
+        typography: "Fraunces display + Inter body",
+    },
+    DesignColorDirection {
+        id: "pet-care",
+        category: "pets / veterinary / animal care",
+        source: "enterprise-standard#Curated Palette Library — Pets / vet",
+        blueprint_query: "pets veterinary animal care clinic adoption service friendly photography",
+        background: "zinc-50",
+        foreground: "zinc-900",
+        primary: "sky-600",
+        support: Some("orange-400"),
+        muted: "zinc-100",
+        typography: "Space Grotesk display + Inter body",
+    },
+    DesignColorDirection {
+        id: "neutral-brand",
+        category: "general product / service website",
+        source: "design-judgment#Category Palette Harmony — Monochrome is a complete design",
+        blueprint_query: "modern product service website light editorial responsive layout visual hierarchy",
+        background: "zinc-50",
+        foreground: "zinc-950",
+        primary: "zinc-900",
+        support: None,
+        muted: "zinc-100",
+        typography: "Space Grotesk display + Inter body",
+    },
+];
+
+fn design_color_direction(query: &str) -> DesignColorDirection {
+    let text = query.to_lowercase();
+    let matches = |keywords: &[&str]| keywords.iter().any(|keyword| text.contains(keyword));
+    let id = if matches(&[
+        "餐厅",
+        "饭店",
+        "咖啡",
+        "咖啡馆",
+        "coffee",
+        "cafe",
+        "bakery",
+        "restaurant",
+        "dining",
+        "food",
+        "餐饮",
+        "烘焙",
+        "甜品",
+    ]) {
+        "cafe-hospitality"
+    } else if matches(&[
+        "民宿",
+        "酒店",
+        "度假",
+        "旅游",
+        "旅行",
+        "旅馆",
+        "hotel",
+        "resort",
+        "travel",
+        "cabin",
+        "lodge",
+        "hospitality",
+    ]) {
+        "nature-hospitality"
+    } else if matches(&[
+        "金融",
+        "银行",
+        "理财",
+        "投资",
+        "支付",
+        "交易",
+        "股票",
+        "fintech",
+        "finance",
+        "banking",
+        "investment",
+        "payment",
+        "trading",
+        "wealth",
+    ]) {
+        "fintech-investment"
+    } else if matches(&[
+        "医疗",
+        "医院",
+        "诊所",
+        "医生",
+        "病人",
+        "患者",
+        "healthcare",
+        "medical",
+        "clinic",
+        "patient",
+        "dental",
+    ]) {
+        "health-clinical"
+    } else if matches(&[
+        "健身",
+        "瑜伽",
+        "美容",
+        "养生",
+        "疗愈",
+        "保健",
+        "补剂",
+        "spa",
+        "wellness",
+        "yoga",
+        "fitness",
+        "beauty",
+        "supplement",
+    ]) {
+        "wellness-organic"
+    } else if matches(&[
+        "作品集",
+        "摄影",
+        "画廊",
+        "杂志",
+        "新闻",
+        "博客",
+        "portfolio",
+        "editorial",
+        "magazine",
+        "gallery",
+        "creative studio",
+        "photography",
+    ]) {
+        "editorial-portfolio"
+    } else if matches(&[
+        "珠宝", "奢侈", "时尚", "服装", "jewelry", "luxury", "fashion", "couture",
+    ]) {
+        "luxury-fashion"
+    } else if matches(&[
+        "教育",
+        "学校",
+        "课程",
+        "学习",
+        "儿童",
+        "培训",
+        "education",
+        "course",
+        "learning",
+        "school",
+        "kids",
+        "edtech",
+    ]) {
+        "education-community"
+    } else if matches(&[
+        "房产",
+        "地产",
+        "建筑",
+        "室内",
+        "real estate",
+        "property",
+        "architecture",
+        "interior",
+    ]) {
+        "real-estate"
+    } else if matches(&[
+        "公益",
+        "慈善",
+        "捐赠",
+        "志愿",
+        "nonprofit",
+        "charity",
+        "donation",
+        "volunteer",
+    ]) {
+        "nonprofit-warm"
+    } else if matches(&["宠物", "兽医", "动物", "pet", "veterinary", "vet", "animal"]) {
+        "pet-care"
+    } else if matches(&[
+        "ai",
+        "人工智能",
+        "智能体",
+        "saas",
+        "软件",
+        "工作流",
+        "协作",
+        "聊天",
+        "chat",
+        "workflow",
+        "productivity",
+        "automation",
+        "dashboard",
+    ]) {
+        "ai-workflow"
+    } else {
+        "neutral-brand"
+    };
+    DESIGN_COLOR_DIRECTIONS
+        .iter()
+        .copied()
+        .find(|direction| direction.id == id)
+        .expect("design color direction catalog must contain every routed id")
+}
+
+fn design_color_direction_block(direction: DesignColorDirection) -> String {
+    let support = direction
+        .support
+        .map(|support| format!("accent / secondary highlight = {support}"))
+        .unwrap_or_else(|| {
+            "accent / secondary highlight = none (keep the page monochrome)".to_string()
+        });
+    format!(
+        "--- michael-design 运行时锁定配色方向（必须执行，不是建议）---\n\
+         品类：{}（route: {}）\n\
+         证据来源：{}。同品类检索优先词：`{}`。\n\
+         定义 token 时采用：background = {}；foreground = {}；primary = {}；{}；muted / card-alt = {}。\n\
+         字体气质：{}。根画布、卡片、CTA、链接、active、focus ring、icon tint 都必须从这 5 个角色派生；除真实状态色外不准另起色相。页面至少 90% 保持 background/foreground/muted 中性色面积。不要因“高级/科技”自行换成 violet/indigo、黑底霓虹或满屏渐变；跨品类命中只能借布局和动效，不能改这套配色。源码先定义语义 token，业务组件只消费 token。",
+        direction.category,
+        direction.id,
+        direction.source,
+        direction.blueprint_query,
+        direction.background,
+        direction.foreground,
+        direction.primary,
+        support,
+        direction.muted,
+        direction.typography,
+    )
+}
 
 /// Flatten the textual content of one user message, including multimodal text parts.
 fn user_message_text(message: &serde_json::Value) -> Option<String> {
@@ -381,10 +742,72 @@ fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> boo
                 })
                 .take(20)
                 .filter_map(user_message_text)
+                .filter_map(|text| extract_real_user_request(&text))
                 .any(|text| {
                     let bounded: String = text.chars().take(2000).collect();
                     pred(&bounded)
                 })
+        })
+}
+
+/// Behavior-based UI intent: if the conversation is already PRODUCING frontend artifacts
+/// (component files, tailwind/vite wiring), it IS a UI task no matter how the user phrased
+/// the request — keyword gates alone let "非关键词建站" slip through and ship unstyled junk.
+/// Only user/assistant messages are scanned (tool results may contain fetched third-party
+/// HTML, which must not count as our own frontend work).
+fn frontend_work_signal(text: &str) -> bool {
+    let l = text.to_lowercase();
+    [
+        ".tsx",
+        ".jsx",
+        ".vue",
+        ".svelte",
+        "vite.config",
+        "tailwind",
+        "shadcn",
+        "classname=",
+        "<!doctype html",
+        "index.html",
+        "npm create vite",
+        "@/components/ui/",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+fn conversation_shows_frontend_work(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages.iter().rev().take(40).any(|message| {
+                let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role != "user" && role != "assistant" {
+                    return false;
+                }
+                let mut text = String::new();
+                match message.get("content") {
+                    Some(serde_json::Value::String(s)) => text.push_str(s),
+                    Some(serde_json::Value::Array(parts)) => {
+                        for part in parts {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                                text.push(' ');
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if role == "user" {
+                    text = extract_real_user_request(&text).unwrap_or_default();
+                }
+                if role == "assistant" {
+                    if let Some(tool_calls) = message.get("tool_calls") {
+                        text.push_str(&tool_calls.to_string());
+                    }
+                }
+                let bounded: String = text.chars().take(6000).collect();
+                frontend_work_signal(&bounded)
+            })
         })
 }
 
@@ -393,6 +816,7 @@ fn truncate_at_embedded_request_marker(request: &str) -> &str {
     let nested_index = [
         format!("\n{USER_STEERING_MARKER}"),
         format!("\n{USER_REQUEST_MARKER}"),
+        format!("\n{LEGACY_USER_REQUEST_MARKER}"),
     ]
     .into_iter()
     .filter_map(|marker| request.find(&marker))
@@ -419,12 +843,21 @@ fn extract_marked_user_request(text: &str) -> Option<String> {
     // The original request follows one canonical IDE context divider and a stable
     // guidance prefix. Requiring exactly one such boundary fails closed if untrusted
     // project/user content copies the entire reserved framing sequence.
-    let mut boundaries = text.match_indices(USER_REQUEST_BOUNDARY_PREFIX);
-    let (boundary_index, _) = boundaries.next()?;
-    if boundaries.next().is_some() {
+    let mut boundaries = [
+        USER_REQUEST_BOUNDARY_PREFIX,
+        LEGACY_USER_REQUEST_BOUNDARY_PREFIX,
+    ]
+    .into_iter()
+    .flat_map(|prefix| {
+        text.match_indices(prefix)
+            .map(move |(index, _)| (index, prefix.len()))
+    })
+    .collect::<Vec<_>>();
+    if boundaries.len() != 1 {
         return None;
     }
-    let marked_tail = &text[boundary_index + USER_REQUEST_BOUNDARY_PREFIX.len()..];
+    let (boundary_index, boundary_len) = boundaries.pop()?;
+    let marked_tail = &text[boundary_index + boundary_len..];
     let (_, request) = marked_tail.split_once("\n\n")?;
     let request = truncate_at_embedded_request_marker(request);
     (!request.is_empty()).then(|| request.to_string())
@@ -443,7 +876,9 @@ fn extract_real_user_request(text: &str) -> Option<String> {
     }
     if text.contains(USER_STEERING_MARKER)
         || text.contains(USER_REQUEST_MARKER)
+        || text.contains(LEGACY_USER_REQUEST_MARKER)
         || text.contains(USER_REQUEST_BOUNDARY_PREFIX)
+        || text.contains(LEGACY_USER_REQUEST_BOUNDARY_PREFIX)
     {
         return None;
     }
@@ -453,6 +888,24 @@ fn extract_real_user_request(text: &str) -> Option<String> {
 /// Prefer the most recent explicitly-marked original request or real-time user steering over
 /// orchestration nudges. Verification and continuation messages also have role=user, so treating
 /// unmarked messages as a new task would make retrieval drift away from the person's request.
+/// 会话内【最早】命中判定的真实用户请求（正向扫描，先剥 📌 包装再判定）——
+/// 用于系统提示内注入块的检索 query：随会话追加逐字节稳定，不打碎前缀缓存。
+fn earliest_user_request_matching(
+    body: &serde_json::Value,
+    pred: fn(&str) -> bool,
+) -> Option<String> {
+    let msgs = body.get("messages")?.as_array()?;
+    msgs.iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .take(40)
+        .filter_map(user_message_text)
+        .filter_map(|text| {
+            extract_marked_user_request(&text).or_else(|| extract_real_user_request(&text))
+        })
+        .map(|t| t.chars().take(2000).collect::<String>())
+        .find(|t| pred(t))
+}
+
 fn latest_user_request(body: &serde_json::Value) -> Option<String> {
     let msgs = body.get("messages")?.as_array()?;
     let mut latest_plain = None;
@@ -1068,7 +1521,7 @@ fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chron
     let absolute_offset = offset_minutes.abs();
 
     format!(
-        "【当前真实日期·用户本地】今天是 {}-{:02}-{:02} {}（{}，UTC{}{:02}:{:02}）。日期、星期和日期差用此日历计算；需要精确到时分的当前时刻时，以对话中注入的时间信息或时间类工具为准。它只表示本轮请求日期，不是任何来源的发布时间或更新时间，也不能证明某项内容\"最新\"。最新版本或现状仍需本轮来源核验。",
+        "【当前真实日期·用户本地】今天是 {}-{:02}-{:02} {}（{}，UTC{}{:02}:{:02}）。日期、星期和日期差用此日历计算；**写进代码/文档/README/版权栏/示例数据里的任何日期与年份也一律以此为准**——训练记忆里的年份是过去，不是今天。需要精确到时分的当前时刻时，以对话中注入的时间信息或时间类工具为准。它只表示本轮请求日期，不是任何来源的发布时间或更新时间，也不能证明某项内容\"最新\"。最新版本或现状仍需本轮来源核验。",
         local.year(),
         local.month(),
         local.day(),
@@ -1133,6 +1586,7 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
     if request.is_empty() {
         return None;
     }
+    let color_direction = design_color_direction(request);
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
     let mut hits = design_hits_for_request(&query);
     if hits.is_empty() {
@@ -1181,48 +1635,110 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
 
     Some(format!(
         "--- michael-design 设计蓝本（按用户请求自动检索，精炼注入）---\n\
-         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，不是装饰性参考。只要这个块在场，它就是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准；候选蓝本用于补充区块和气质；同时必须提取并使用蓝本里的视频/GIF/图片 URL（如 `Asset:`、`Preview:`、`Video URL:`、`<video>`、`<img>`、`backgroundImage`、`.mp4/.gif/.webp/.m3u8`、`visuals-by-id`）。执行规则：\n\
-         1. 写代码前必须在思考里列出“已采用的 michael-design 来源”：主蓝本、候选蓝本、还要补检索的区块关键词；没有这一步就不能开始写 UI。\n\
-         2. 完整页面/重设计必须先调用 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，优先查 `Asset Preview visuals-by-id gif mp4 webp hero media`、`gallery media showcase image video`、以及当前品类的栏目词；每次检索都要带具体区块或风格词，最多 2-4 次，命中后马上综合，不许无限搜。\n\
-         3. 按品类重构信息架构，不要默认 hero/features/pricing/footer：SaaS 要有工作流、集成、权限、安全、案例、定价/FAQ；餐厅/场馆要有菜单、空间、预订、活动、评价；作品集/机构要有项目、过程、团队、成果；电商/市场要有分类、商品、筛选、信任、售后；教育/内容站要有课程/栏目、作者、资源、社区；音乐/视频/游戏站要有媒体库、预告、玩法/曲目、活动。用户没有指定品类时，先从需求推断最贴近的一类再搭结构。\n\
-         4. 内容密度必须像真实网站：导航、hero、证明点、具体功能/栏目、流程、案例/样例、对比或数据、FAQ、footer 链接都要有真实可读文案；禁止只有口号、三张卡片和空泛“高效/智能/一站式”。完整首页至少 7 个有区分度的内容区块，局部页面也要把本页核心信息写满。\n\
-         5. 至少使用一个真实媒体资产：如果 adopted 蓝本里有 `Asset:`/`Preview:`/视频/GIF/图片 URL，必须把最匹配的一个放进 hero 或重要区块，另用 2 个以上图片/GIF/视频/头像/缩略图丰富内容；若选择 `.m3u8`，要用 hls.js 或换成同蓝本更稳的 `.mp4/.gif/.webp`。浏览器/network 发现 404、跨域或无法播放时，立刻换另一个 michael-design 资产，不用灰盒占位。\n\
-         6. 借鉴蓝本的结构、节奏、视觉工艺、颜色/字号/圆角/阴影和动效参数；不要机械照搬不匹配的行业文案、品牌名或业务对象，用户明确要求永远优先。\n\
-         7. 绝不退回通用 AI 落地页结构（居中大标题 + 三列卡片 + 渐变背景那套）。蓝本指定 gsap/motion/自定义 CSS 变量就用对应实现；图标用 lucide 或自绘 SVG，禁止 emoji 当图标。\n\
-         8. 与 `shadcn_design_system`/Tailwind 令牌结合：shadcn/ui 是 Button/Input/Dialog/Tabs 等交互 primitive，不是把所有区块套 Card；Tailwind 是语义 token 和布局工具，不是散写一屏硬编码 class。蓝本给出的具体数值接入语义 token；没有给出的地方才用通用设计体系兜底。\n\
-         9. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵；修补后只对改动点做最多一次针对性复验。证据覆盖后必须停止，不许为了“再看看”重复 browser/screenshot。\n\n{}",
+         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准，候选蓝本补充区块和气质。**怎么设计（配色决策链/布局构图/动效编排/组件覆盖/内容密度/工程/验证）全部按已注入的「michael-design 设计体系」块执行，本块不重复，只列本次必须从命中蓝本里产出什么的运行时证据要求：**\n\
+         1. 写代码前必须在思考里列出“已采用的 michael-design 来源”：主蓝本、候选蓝本、还要补检索的区块关键词；没有这一步不能开始写 UI。完整页面/重设计必须先 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，命中后马上综合，不许无限搜。\n\
+         2. **产品名是生造词/随便起的（Zorvex/sora2 这类）时，先从功能描述推断业务品类（聊天→chat/SaaS、卖货→电商、发布内容→社区/媒体），检索用品类词，绝不拿生造名当 query**；query 同时带当前品类与 `palette harmony color scale`、`card count balanced last row`、`Asset Preview gif mp4 media`、`GSAP ScrollTrigger useScroll motion choreography responsive fallback`。\n\
+         3. 必须提取并使用蓝本里的真实媒体 URL（`Asset:`/`Preview:`/`Video URL:`/`<video>`/`<img>`/`backgroundImage`/`.mp4/.gif/.webp/.m3u8`/`visuals-by-id`）：至少 3 个可加载素材、重要区块至少一个视频或 GIF；`.m3u8` 接 hls.js 或换同蓝本更稳的 `.mp4/.gif/.webp`；坏资源立刻换，不用灰盒占位。\n\
+         4. 编码前明确数据库决策：`不需要 / localStorage或IndexedDB / 服务端数据库` 并说明业务理由；持久业务（账户/同步/后台/订单/预约/评论/收藏）必须设计真实 API/schema/权限/迁移/加载空错状态，不能只画静态假界面。\n\
+         5. 配色必须实际采用品类匹配命中的色值并**全部折算成 Tailwind 族+档**（Hex/OKLCH 先折算，如 #17130d→stone-950），写清“来源 section → Tailwind 族+档 → semantic role”，源码实际使用至少 2 个；**叙述/计划/业务代码禁止裸 hex**（hex 只留在 tokens 定义文件）。跨品类命中只借结构/动效，绝不借配色。\n\
+         6. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵，修补后只对改动点最多一次针对性复验，证据覆盖后必须停止，不许为“再看看”重复 browser/screenshot。\n\n{}\n\n{}",
+        design_color_direction_block(color_direction),
         sections.join("\n\n———\n\n")
     ))
 }
 
+/// 编排骨干保底：不管请求里的产品名多生造、品类命中多稀碎，排列构图库/动效全集/
+/// shadcn 组件覆盖/字体配对这四个"怎么编排"的 section 必须在注入块里——
+/// 配色库不再作为泛化命中占用一个蓝本名额；它已在请求开始时被品类路由锁定。
+/// 生造名网站"样式丑、动画呆"的直接原因就是这些骨干从没被随机命中带进来过。
+fn ensure_design_backbone_hits(
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+) {
+    const BACKBONE: &[(&str, &str)] = &[
+        (
+            "Layout Composition Repertoire arrangement bento zigzag editorial masonry",
+            "layout-composition-repertoire",
+        ),
+        (
+            "Motion Effects Repertoire scroll hover ambient text responsive degradation",
+            "motion-effects-repertoire",
+        ),
+        (
+            "shadcn component coverage primitives Tailwind semantics cva",
+            "shadcn-component-coverage",
+        ),
+        (
+            "Typography Pairings display body combinations brand tone",
+            "typography-pairings",
+        ),
+    ];
+    for (query, slug) in BACKBONE {
+        if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+            return;
+        }
+        let hit = crate::knowledge::search_with_cap(
+            query,
+            Some(DESIGN_KNOWLEDGE_DOMAIN),
+            DESIGN_KNOWLEDGE_SEARCH_POOL,
+            DESIGN_KNOWLEDGE_SECTION_CHARS,
+        )
+        .into_iter()
+        .find(|hit| hit.section.to_lowercase().contains(slug));
+        if let Some(hit) = hit {
+            let key = design_hit_key(&hit);
+            if seen.insert(key) {
+                hits.push(hit);
+            }
+        }
+    }
+}
+
 fn design_hits_for_request(query: &str) -> Vec<crate::knowledge::SearchHit> {
+    design_hits_for_category_query(query, design_color_direction(query))
+}
+
+fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
+    design_hits_for_category_query(query, design_color_direction(query))
+}
+
+fn design_hits_for_category_query(
+    query: &str,
+    color_direction: DesignColorDirection,
+) -> Vec<crate::knowledge::SearchHit> {
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
-    push_design_hits_for_query(query, &mut seen, &mut hits);
-    ensure_design_media_hit(&mut seen, &mut hits);
+    let allow_dark = design_request_explicitly_requests_dark(query);
+    // Search the inferred business category first. A user-facing brand name usually has no
+    // semantic weight in the corpus, while these terms point at the 400+ real site blueprints.
+    let focused_query = format!("{query} {}", color_direction.blueprint_query);
+    push_design_hits_for_query_matching(&focused_query, &mut seen, &mut hits, |hit| {
+        allow_dark || !design_hit_defaults_to_dark(hit)
+    });
+    // Preserve explicit details (for example "split-screen" or "3D") from the user's request
+    // when the category query did not produce three useful blueprints on its own.
+    if hits.len() < 3 {
+        push_design_hits_for_query_matching(query, &mut seen, &mut hits, |hit| {
+            allow_dark || !design_hit_defaults_to_dark(hit)
+        });
+    }
+    // 配额：品类命中只留前 3（主蓝本仍是品类 top1），把坑让给编排骨干——
+    // 否则生造名/泛词请求的杂烩命中会把 8 个位置占满，骨干永远进不来。
+    hits.truncate(3);
+    ensure_design_backbone_hits(&mut seen, &mut hits);
+    ensure_design_motion_hit(&mut seen, &mut hits, allow_dark);
+    ensure_design_media_hit(&mut seen, &mut hits, allow_dark);
+    ensure_design_layout_hit(&mut seen, &mut hits, allow_dark);
+    ensure_design_card_hit(&mut seen, &mut hits, allow_dark);
     for supplemental in DESIGN_KNOWLEDGE_SECTION_QUERIES {
         if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
             break;
         }
-        push_design_hits_for_query(supplemental, &mut seen, &mut hits);
+        push_design_hits_for_query_matching(supplemental, &mut seen, &mut hits, |hit| {
+            allow_dark || !design_hit_defaults_to_dark(hit)
+        });
     }
     hits
-}
-
-fn design_hits_for_query(query: &str) -> Vec<crate::knowledge::SearchHit> {
-    let mut seen = HashSet::new();
-    let mut hits = Vec::new();
-    push_design_hits_for_query(query, &mut seen, &mut hits);
-    ensure_design_media_hit(&mut seen, &mut hits);
-    hits
-}
-
-fn push_design_hits_for_query(
-    query: &str,
-    seen: &mut HashSet<String>,
-    hits: &mut Vec<crate::knowledge::SearchHit>,
-) {
-    push_design_hits_for_query_matching(query, seen, hits, |_| true);
 }
 
 fn push_design_hits_for_query_matching(
@@ -1239,6 +1755,10 @@ fn push_design_hits_for_query_matching(
     ) {
         if hit.domain != DESIGN_KNOWLEDGE_DOMAIN
             || hit.score < DESIGN_KNOWLEDGE_MIN_SCORE
+            // Color is selected by `design_color_direction` before blueprint retrieval. The
+            // generic library is useful evidence for that catalog, but injected here it crowds
+            // out a real category site and gives the model permission to ignore the route.
+            || design_hit_is_generic_palette_library(&hit)
             || !accept(&hit)
         {
             continue;
@@ -1256,14 +1776,19 @@ fn push_design_hits_for_query_matching(
 fn ensure_design_media_hit(
     seen: &mut HashSet<String>,
     hits: &mut Vec<crate::knowledge::SearchHit>,
+    allow_dark: bool,
 ) {
     if hits.iter().any(design_hit_has_media_reference) {
         return;
     }
     for query in DESIGN_KNOWLEDGE_ASSET_QUERIES {
-        if let Some(hit) = find_design_media_hit(query, seen) {
+        if let Some(hit) = find_design_media_hit(query, seen, allow_dark) {
             if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
-                hits.pop();
+                let index = hits
+                    .iter()
+                    .rposition(|existing| !design_hit_has_advanced_motion(existing))
+                    .unwrap_or(hits.len() - 1);
+                hits.remove(index);
             }
             seen.insert(design_hit_key(&hit));
             hits.push(hit);
@@ -1275,6 +1800,7 @@ fn ensure_design_media_hit(
 fn find_design_media_hit(
     query: &str,
     seen: &HashSet<String>,
+    allow_dark: bool,
 ) -> Option<crate::knowledge::SearchHit> {
     crate::knowledge::search_with_cap(
         query,
@@ -1288,11 +1814,310 @@ fn find_design_media_hit(
             && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE
             && !seen.contains(&design_hit_key(hit))
             && design_hit_has_media_reference(hit)
+            && (allow_dark || !design_hit_defaults_to_dark(hit))
     })
+}
+
+fn ensure_design_motion_hit(
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+    allow_dark: bool,
+) {
+    if hits.iter().any(design_hit_has_advanced_motion) {
+        return;
+    }
+    for query in DESIGN_KNOWLEDGE_MOTION_QUERIES {
+        let hit = crate::knowledge::search_with_cap(
+            query,
+            Some(DESIGN_KNOWLEDGE_DOMAIN),
+            DESIGN_KNOWLEDGE_SEARCH_POOL,
+            DESIGN_KNOWLEDGE_SECTION_CHARS,
+        )
+        .into_iter()
+        .find(|hit| {
+            hit.domain == DESIGN_KNOWLEDGE_DOMAIN
+                && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE
+                && !seen.contains(&design_hit_key(hit))
+                && design_hit_has_advanced_motion(hit)
+                && (allow_dark || !design_hit_defaults_to_dark(hit))
+        });
+        if let Some(hit) = hit {
+            if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+                let index = hits
+                    .iter()
+                    .rposition(|existing| !design_hit_has_media_reference(existing))
+                    .unwrap_or(hits.len() - 1);
+                hits.remove(index);
+            }
+            seen.insert(design_hit_key(&hit));
+            hits.push(hit);
+            return;
+        }
+    }
+}
+
+fn ensure_design_layout_hit(
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+    allow_dark: bool,
+) {
+    if hits.iter().any(design_hit_has_responsive_layout) {
+        return;
+    }
+    for query in DESIGN_KNOWLEDGE_LAYOUT_QUERIES {
+        let hit = crate::knowledge::search_with_cap(
+            query,
+            Some(DESIGN_KNOWLEDGE_DOMAIN),
+            DESIGN_KNOWLEDGE_SEARCH_POOL,
+            DESIGN_KNOWLEDGE_SECTION_CHARS,
+        )
+        .into_iter()
+        .find(|hit| {
+            hit.domain == DESIGN_KNOWLEDGE_DOMAIN
+                && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE
+                && !seen.contains(&design_hit_key(hit))
+                && design_hit_has_responsive_layout(hit)
+                && (allow_dark || !design_hit_defaults_to_dark(hit))
+        });
+        if let Some(hit) = hit {
+            if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+                let index = hits
+                    .iter()
+                    .rposition(|existing| {
+                        !design_hit_has_media_reference(existing)
+                            && !design_hit_has_advanced_motion(existing)
+                    })
+                    .unwrap_or(hits.len() - 1);
+                hits.remove(index);
+            }
+            seen.insert(design_hit_key(&hit));
+            hits.push(hit);
+            return;
+        }
+    }
+}
+
+fn ensure_design_card_hit(
+    seen: &mut HashSet<String>,
+    hits: &mut Vec<crate::knowledge::SearchHit>,
+    allow_dark: bool,
+) {
+    if hits.iter().any(design_hit_has_card_styling) {
+        return;
+    }
+    for query in DESIGN_KNOWLEDGE_CARD_QUERIES {
+        let hit = crate::knowledge::search_with_cap(
+            query,
+            Some(DESIGN_KNOWLEDGE_DOMAIN),
+            DESIGN_KNOWLEDGE_SEARCH_POOL,
+            DESIGN_KNOWLEDGE_SECTION_CHARS,
+        )
+        .into_iter()
+        .find(|hit| {
+            hit.domain == DESIGN_KNOWLEDGE_DOMAIN
+                && hit.score >= DESIGN_KNOWLEDGE_MIN_SCORE
+                && !seen.contains(&design_hit_key(hit))
+                && design_hit_has_card_styling(hit)
+                && (allow_dark || !design_hit_defaults_to_dark(hit))
+        });
+        if let Some(hit) = hit {
+            if hits.len() >= DESIGN_KNOWLEDGE_MAX_HITS {
+                let index = hits
+                    .iter()
+                    .rposition(|existing| {
+                        !design_hit_has_media_reference(existing)
+                            && !design_hit_has_advanced_motion(existing)
+                            && !design_hit_has_responsive_layout(existing)
+                    })
+                    .unwrap_or(hits.len() - 1);
+                hits.remove(index);
+            }
+            seen.insert(design_hit_key(&hit));
+            hits.push(hit);
+            return;
+        }
+    }
+}
+
+fn design_request_explicitly_requests_dark(query: &str) -> bool {
+    let text = query.to_lowercase();
+    let rejects_dark = [
+        "不要暗色",
+        "不要深色",
+        "不要黑底",
+        "别用暗色",
+        "别用深色",
+        "别再用暗色",
+        "不想要暗色",
+        "不用暗色",
+        "不需要暗色",
+        "动不动就暗色",
+        "总是用暗色",
+        "老是用暗色",
+        "又给我做暗色",
+        "为什么又暗色",
+        "默认暗色",
+        "avoid dark",
+        "no dark",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    if rejects_dark {
+        return false;
+    }
+    [
+        "做成暗色",
+        "改成暗色",
+        "改为暗色",
+        "使用暗色",
+        "采用暗色",
+        "要暗色",
+        "想要暗色",
+        "需要暗色",
+        "做成深色",
+        "改成深色",
+        "使用深色",
+        "要深色",
+        "想要深色",
+        "暗色主题",
+        "深色主题",
+        "黑底设计",
+        "dark theme",
+        "dark website",
+        "dark ui",
+        "make it dark",
+        "use dark",
+        "black background",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn design_hit_defaults_to_dark(hit: &crate::knowledge::SearchHit) -> bool {
+    // 标题就写着 Dark 的蓝图（如 "Weblex Dark Hero"）不用看正文。
+    if hit.section.to_lowercase().contains("dark") {
+        return true;
+    }
+    let lead = hit
+        .text
+        .to_lowercase()
+        .chars()
+        .take(1800)
+        .collect::<String>();
+    [
+        "dark-themed",
+        "dark theme",
+        "dark ui",
+        "dark interface",
+        "dark background",
+        "black background",
+        "background color: #000",
+        "background: #000",
+        "background:#000",
+        "background-color: #0",
+        "background-color:#0",
+        "bg-black",
+        "bg-zinc-950",
+        "bg-slate-950",
+        "bg-neutral-950",
+        "bg-stone-950",
+        "bg-gray-950",
+        "--background: #0",
+        "--background: #1",
+        "--background:#0",
+        "--background:#1",
+        "--bg: #0",
+        "--bg: #1",
+        "--bg:#0",
+        "--bg:#1",
+    ]
+    .iter()
+    .any(|needle| lead.contains(needle))
+}
+
+fn design_hit_has_advanced_motion(hit: &crate::knowledge::SearchHit) -> bool {
+    let text = hit.text.to_lowercase();
+    let has_gsap_scroll = text.contains("gsap") && text.contains("scrolltrigger");
+    let has_motion_scroll = text.contains("usescroll") && text.contains("usetransform");
+    has_gsap_scroll
+        || has_motion_scroll
+        || [
+            "scrub:",
+            "pinning",
+            "parallax",
+            "clip-path",
+            "mask-image",
+            "layoutid",
+            "lottie",
+            "rive",
+            "three.js",
+            "webgl",
+            "shader",
+            "pathlength",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn design_hit_has_responsive_layout(hit: &crate::knowledge::SearchHit) -> bool {
+    let text = hit.text.to_lowercase();
+    let has_grid = [
+        "grid-cols-",
+        "grid-template-columns",
+        "auto-fit",
+        "auto-fill",
+        "minmax(",
+        "bento",
+        "col-span-",
+        "column-count",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let has_responsive_rule = [
+        "responsive",
+        "breakpoint",
+        "mobile",
+        "tablet",
+        "sm:",
+        "md:",
+        "lg:",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    has_grid && has_responsive_rule
+}
+
+fn design_hit_has_card_styling(hit: &crate::knowledge::SearchHit) -> bool {
+    let text = hit.text.to_lowercase();
+    let has_card = ["card", "panel", "tile", "卡片", "面板", "surface"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    let has_treatment = [
+        "shadow",
+        "elevation",
+        "bg-card",
+        "background",
+        "surface",
+        "border-radius",
+        "rounded-",
+        "backdrop-filter",
+        "inset",
+        "hover:",
+        "hover",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    has_card && has_treatment
 }
 
 fn design_hit_key(hit: &crate::knowledge::SearchHit) -> String {
     format!("{}#{}", hit.topic, hit.section.to_lowercase())
+}
+
+fn design_hit_is_generic_palette_library(hit: &crate::knowledge::SearchHit) -> bool {
+    hit.section
+        .to_lowercase()
+        .contains("curated palette library")
 }
 
 fn design_hit_has_media_reference(hit: &crate::knowledge::SearchHit) -> bool {
@@ -1379,6 +2204,15 @@ fn looks_like_ui_task(q: &str) -> bool {
         "作品集",
         "简历页",
         "博客",
+        "商城",
+        "电商",
+        "网店",
+        "门户",
+        "论坛",
+        "社区网站",
+        "小程序",
+        "站点",
+        "工具站",
         "官网",
         "主页",
         "首页",
@@ -1825,15 +2659,20 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // 1) prepend the execution prompt (mode + optional UI guides) as messages[0].
     // User-growth coaching is injected separately and scoped to final replies so it does
     // not compete with tool selection, autonomy, or verification rules during execution.
-    // Model-tier-adaptive: weak models get the tighter `agent_lite`; everyone else the full prompt.
-    // Compute the weakness flag in its own scope so the `&str` model borrow of `body` is released
+    // Every model gets the compact production contract by default; the full legacy prompt remains
+    // available through MICHAEL_LITE_PROMPT=0 for an immediate operational rollback.
+    // Compute the routing flag in its own scope so the `&str` model borrow of `body` is released
     // before we mutate `body.messages` below. Falls back to the full `agent` prompt if `agent_lite`
     // is missing, so a partial deploy can't leave a weak model prompt-less.
-    let is_weak_model = {
+    let use_compact_agent = {
         let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
         mode == "agent" && use_lite_agent_prompt(model)
     };
-    let prompt_name: &str = if is_weak_model { "agent_lite" } else { mode };
+    let prompt_name: &str = if use_compact_agent {
+        "agent_lite"
+    } else {
+        mode
+    };
     // Snapshot the person's real request before mutating messages. The IDE wraps it in a large
     // dynamic project preamble; retrieval must not search that entire blob.
     let user_request = latest_user_request(body);
@@ -1959,48 +2798,31 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             || ui_env.as_deref() == Some("always")
             || ((mode == "agent" || mode == "plan")
                 && (user_request.as_deref().is_some_and(looks_like_ui_task)
-                    || recent_user_text_any(body, looks_like_ui_task))));
+                    || recent_user_text_any(body, looks_like_ui_task)
+                    // 行为信号：对话已经在写前端文件 = UI 任务，不管用户怎么措辞。
+                    // 一旦触发即对本会话粘性生效，非关键词建站不再漏注设计体系。
+                    || conversation_shows_frontend_work(body))));
     if ui_intent {
-        for name in [
-            "ui_design_flow",
-            "shadcn_design_system",
-            "css_concrete_tokens",
-        ] {
-            let block = read_prompt(name).unwrap_or_default();
-            if !block.is_empty() {
-                prompt_blocks.push(name);
-                sys.push_str("\n\n");
-                sys.push_str(&block);
-            }
-        }
-        if !is_weak_model {
-            let guide = read_prompt("ui_design_guide").unwrap_or_default();
-            if !guide.is_empty() {
-                prompt_blocks.push("ui_design_guide");
-                sys.push_str("\n\n");
-                sys.push_str(&guide);
-            }
+        // 设计规则单一真源：配色/布局/动效/组件/内容/验证全部收敛在 design_system.txt，
+        // 取代此前 ui_design_flow/shadcn_design_system/css_concrete_tokens/ui_design_guide 四个
+        // 互相重复的文件。所有模型档位（含弱模型）注入同一份，消除多处漂移打架。
+        let design_system = read_prompt("design_system").unwrap_or_default();
+        if !design_system.is_empty() {
+            prompt_blocks.push("design_system");
+            sys.push_str("\n\n");
+            sys.push_str(&design_system);
         }
         // UI work gets a compact michael-design entry point. The full library remains available
         // through knowledge_search; injecting a few concise blueprints avoids 100KB+ prompt bloat
         // while still anchoring the model in the operator's curated design corpus.
         if std::env::var("MICHAEL_AUTO_KNOWLEDGE").ok().as_deref() != Some("0") {
-            let design_query = user_request
-                .clone()
-                .filter(|q| looks_like_ui_task(q))
-                .or_else(|| {
-                    body.get("messages")
-                        .and_then(|m| m.as_array())
-                        .and_then(|msgs| {
-                            msgs.iter()
-                                .rev()
-                                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                                .take(20)
-                                .filter_map(user_message_text)
-                                .map(|t| t.chars().take(2000).collect::<String>())
-                                .find(|t| looks_like_ui_task(t))
-                        })
-                });
+            // 前缀缓存纪律：蓝图块在系统提示里，query 必须会话内粘性稳定——取【最早】
+            // 命中 UI 意图的用户消息（没有就取最早的非空用户消息），而不是最新一条。
+            // 之前取最新请求：用户每说一句话命中就变、系统提示就变，整条会话缓存全废。
+            let design_query = earliest_user_request_matching(body, looks_like_ui_task)
+                .or_else(|| earliest_user_request_matching(body, |t| !t.trim().is_empty()))
+                .or_else(|| user_request.clone().filter(|q| !q.trim().is_empty()))
+                .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
             if let Some(block) = design_knowledge_block(design_query.as_deref()) {
                 sys.push_str("\n\n");
                 sys.push_str(&block);
@@ -2048,22 +2870,10 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         // 粘性检索查询：续跑轮（"继续/再改改"）不含工程描述，工程参考块会整轮消失——
         // 恰恰是迭代实现最需要社区参考的轮次。当前请求不合格时，回退到最近一条合格的
         // 用户消息作为检索 query（有界扫描，最多 20 条、每条前 2000 字符）。
-        let knowledge_query = user_request
-            .clone()
-            .filter(|q| looks_like_coding_task(q))
-            .or_else(|| {
-                body.get("messages")
-                    .and_then(|m| m.as_array())
-                    .and_then(|msgs| {
-                        msgs.iter()
-                            .rev()
-                            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                            .take(20)
-                            .filter_map(user_message_text)
-                            .map(|t| t.chars().take(2000).collect::<String>())
-                            .find(|t| looks_like_coding_task(t))
-                    })
-            });
+        // 前缀缓存纪律：这个块在系统提示里，query 取【最早】命中工程信号的真实用户请求
+        // （正向扫描 + 剥 📌 包装），会话内逐字节稳定；取最新一条会让每句追问打碎整条缓存。
+        let knowledge_query = earliest_user_request_matching(body, looks_like_coding_task)
+            .or_else(|| user_request.clone().filter(|q| looks_like_coding_task(q)));
         if let Some(block) = auto_knowledge_block(mode, knowledge_query.as_deref()) {
             sys.push_str("\n\n");
             sys.push_str(&block);
@@ -2196,10 +3006,7 @@ const PROMPT_NAMES: &[&str] = &[
     "plan",
     "explorer",
     "reviewer",
-    "ui_design_guide",
-    "ui_design_flow",
-    "shadcn_design_system",
-    "css_concrete_tokens",
+    "design_system",
     // tail (subagent task/system prompts, git guide, small inline utility prompts)
     "subagent_system",
     "worker_system",
@@ -2275,7 +3082,11 @@ mod tests {
     }
 
     fn wrapped_user_request(context: &str, request: &str) -> String {
-        format!("{context}\n\n{USER_REQUEST_BOUNDARY_PREFIX}。\n\n{request}")
+        format!("{context}\n\n{USER_REQUEST_BOUNDARY_PREFIX}\n\n{request}")
+    }
+
+    fn legacy_wrapped_user_request(context: &str, request: &str) -> String {
+        format!("{context}\n\n{LEGACY_USER_REQUEST_BOUNDARY_PREFIX}。\n\n{request}")
     }
 
     #[test]
@@ -2659,45 +3470,32 @@ mod tests {
     #[test]
     fn truthfulness_policy_rejects_partial_success_claims() {
         let policy = read_prompt("truthfulness").expect("truthfulness prompt should load");
-        assert!(policy.contains("已验证事实"));
-        assert!(policy.contains("不等于“接入成功"));
-        assert!(policy.contains("逐项报告"));
-        assert!(policy.contains("不可信数据"));
-        assert!(policy.contains("绝不执行"));
-        assert!(policy.contains("搜索是取证手段，不是思考的替代品"));
-        assert!(policy.contains("检索轮次不固定"));
-        assert!(policy.contains("一轮没有带来新的独立来源"));
-        assert!(policy.contains("不因为事实难听"));
-        assert!(policy.contains("不评价用户人格、动机或“道德高低”"));
-        assert!(policy.contains("哪一段越界"));
-        assert!(policy.contains("授权测试、防御检测、合规实现或风险降低路径"));
-        assert!(policy.contains("不得提供可直接用于入侵"));
-        assert!(policy.contains("source_statuses[].status == success"));
-        assert!(policy.contains("retrieved_at"));
-        assert!(policy.contains("published_date"));
-        assert!(policy.contains("created_date"));
-        assert!(policy.contains("last_activity_date"));
-        assert!(policy.contains("这些时间不得互相代替"));
-        assert!(policy.contains("当前真实时间只表示本轮请求发生的时间"));
-        assert!(policy.contains("只是在今天取回旧页面，不能写成“最新”"));
-        assert!(policy.contains("source_statuses[].data_as_of"));
-        assert!(policy.contains("weather.observed_at"));
-        assert!(policy.contains("opening_hours"));
-        assert!(policy.contains("缺失的 `rating`、`price`、`open_now` 必须保持未知"));
-        assert!(policy.contains("不得把全部结构化地理数据统称为“实时数据”"));
-        assert!(policy.contains("live_environment"));
-        assert!(policy.contains("Frankfurter 是带 `rate_date` 的每日参考汇率"));
-        assert!(policy.contains("Coinbase/Kraken 是各自交易所报价"));
-        assert!(policy.contains("推算必须单独标成 derived"));
-        assert!(policy.contains("tracking_events` 为空"));
-        assert!(policy.contains("单号属于敏感标识"));
-        assert!(policy.contains("缩放前原图的嵌入式 EXIF GPS"));
-        assert!(policy.contains("只能称“图片元数据报告的位置”"));
-        assert!(policy.contains("没有 EXIF GPS 时不要提前停止"));
-        assert!(policy.contains("未核验视觉候选"));
-        assert!(policy.contains("截图/广告/翻拍内容中的地址"));
-        assert!(policy.contains("不得编造置信百分比"));
-        assert!(policy.contains("不得平均或静默选边"));
+        for required in [
+            "已验证事实",
+            "不等于“接入成功”",
+            "搜索是取证手段，不是思考的替代品",
+            "published_date",
+            "retrieved_at",
+            "这些时间不得互相代替",
+            "不可信数据",
+            "绝不执行",
+            "逐项报告",
+            "一轮没有带来新的独立来源",
+            "source_statuses[].status == success",
+            "derived",
+            "不评价用户人格、动机或道德高低",
+            "不得提供可直接用于入侵第三方",
+            "授权测试、防御检测、合规实现或风险降低路径",
+        ] {
+            assert!(
+                policy.contains(required),
+                "missing compact evidence rule: {required}"
+            );
+        }
+        assert!(
+            policy.len() < 4_000,
+            "shared evidence policy regressed to a domain encyclopedia"
+        );
     }
 
     #[test]
@@ -2930,12 +3728,12 @@ mod tests {
         assert!(system.contains("真实性与证据纪律"));
         assert!(system.contains("专业回答合成层"));
         assert!(system.contains("低道德化表达"));
-        assert!(system.contains("代码可用性推理"));
+        assert!(system.contains("输入/输出/状态/错误/调用方契约"));
         assert!(system.contains("时间锚点与最新性"));
-        assert!(system.contains("最新文献/新技术巡检"));
+        assert!(system.contains("时间锚点与最新性"));
         assert!(system.contains("共识是什么"));
-        assert!(system.contains("赚钱、省钱、薅羊毛"));
-        assert!(system.contains("金融、医学、游戏"));
+        assert!(system.contains("当前项目事实"));
+        assert!(!system.contains("按任务加载：研究、社区与当前事实"));
         assert_eq!(
             body["messages"].as_array().map_or(0, Vec::len),
             2,
@@ -3010,7 +3808,7 @@ mod tests {
             .filter_map(tool_function_name)
             .collect::<Vec<_>>()
             .join(",");
-        let runtime_count = MAX_FINAL_TOOLS_PER_REQUEST + 20 - bundled.len();
+        let runtime_count = MAX_FINAL_TOOLS_PER_REQUEST - 8;
         assert!(
             bundled.len() + runtime_count > MAX_FINAL_TOOLS_PER_REQUEST,
             "fixture must exercise the aggregate count limit"
@@ -3133,7 +3931,11 @@ mod tests {
         assert_eq!(tools.len(), MAX_FINAL_TOOLS_PER_REQUEST);
         assert!(serde_json::to_vec(tools).unwrap().len() <= MAX_FINAL_TOOL_SCHEMA_BYTES);
         assert_eq!(tool_function_name(&tools[0]), Some("runtime_0"));
-        assert_eq!(tool_function_name(&tools[127]), Some("runtime_127"));
+        let last_runtime_name = format!("runtime_{}", MAX_FINAL_TOOLS_PER_REQUEST - 1);
+        assert_eq!(
+            tool_function_name(&tools[MAX_FINAL_TOOLS_PER_REQUEST - 1]),
+            Some(last_runtime_name.as_str())
+        );
     }
 
     #[test]
@@ -3235,6 +4037,29 @@ mod tests {
     }
 
     #[test]
+    fn read_only_role_core_navigation_tools_match_the_desktop_contract() {
+        let plan = requested_static_tools(
+            "plan",
+            "read_file,list_dir,search,find_files,semantic_search,knowledge_search,lsp_symbols,find_symbol,lsp_definition,lsp_references,update_plan,ask_user,write_file,run_cmd",
+        );
+        assert!(plan.contains(&"semantic_search".to_string()));
+        assert!(plan.contains(&"find_symbol".to_string()));
+        assert!(plan.contains(&"update_plan".to_string()));
+        assert!(!plan.contains(&"write_file".to_string()));
+        assert!(!plan.contains(&"run_cmd".to_string()));
+
+        for mode in ["explorer", "reviewer"] {
+            let result =
+                requested_static_tools(mode, "semantic_search,find_symbol,write_file,run_cmd");
+            assert_eq!(
+                result,
+                vec!["semantic_search".to_string(), "find_symbol".to_string()],
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_mode_allows_all_tools() {
         let result = requested_static_tools("agent", "read_file,write_file,run_cmd,git_commit");
         assert_eq!(result.len(), 4, "agent mode should allow all tools");
@@ -3292,9 +4117,11 @@ mod tests {
         assert!(!coding.contains("# 十、自动化"));
         assert!(!coding.contains("# 十一、UI / 界面"));
         assert_eq!(coding_blocks, vec!["agent_core"]);
+        // §十一 已瘦成路由指针（设计细则迁往 design_system.txt 单一真源），可剥离字节变少，
+        // 阈值从 35% 放宽到 25%——路由仍剥离 §九/§十/§十一 的行为不变。
         assert!(
-            coding.len() * 20 < full.len() * 13,
-            "routine coding prompt should omit at least 35% of irrelevant bytes: {} vs {}",
+            coding.len() * 4 < full.len() * 3,
+            "routine coding prompt should omit at least 25% of irrelevant bytes: {} vs {}",
             coding.len(),
             full.len()
         );
@@ -3328,10 +4155,7 @@ mod tests {
                 system.contains("# 按任务加载：研究、社区与当前事实"),
                 "{model}"
             );
-            assert!(
-                system.contains("`published_date` 只表示提供方明确标注的发布时间"),
-                "{model}"
-            );
+            assert!(system.contains("published_date"), "{model}");
             assert!(system.contains("最新性巡检"), "{model}");
             assert!(system.contains("SOTA"), "{model}");
             assert!(system.contains("权威机器字段或可复现命令即可"), "{model}");
@@ -3588,8 +4412,8 @@ mod tests {
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
         assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
-        // 含"网页/网站"命中 UI 意图门控，此路径仍注入设计体系。
-        assert!(system.contains("# UI 设计 token 与组件契约"));
+        // 含"网页/网站"命中 UI 意图门控，此路径仍注入设计体系（单一真源 design_system）。
+        assert!(system.contains("michael-design 设计体系"));
     }
 
     #[test]
@@ -3598,13 +4422,13 @@ mod tests {
         let (routed, _) = routed_full_agent_prompt(&full);
         assert!(!routed.contains("# 十一、UI / 界面"));
 
-        let contract = read_prompt("css_concrete_tokens").unwrap();
-        assert!(contract.contains("已有项目：现有设计系统是唯一真源"));
-        assert!(contract.contains("按需使用 shadcn/ui"));
+        // 设计规则单一真源：design_system.txt 取代旧的 css_concrete_tokens/ui_design_* 四件套。
+        let contract = read_prompt("design_system").unwrap();
+        assert!(contract.contains("配色决策链"));
         assert!(contract.contains("shadcn-vue"));
-        assert!(contract.contains("1440x900"));
-        assert!(contract.contains("390x844"));
-        assert!(!contract.contains("npx shadcn"));
+        assert!(contract.contains("1440×900"));
+        assert!(contract.contains("390×844"));
+        assert!(contract.contains("npx shadcn@latest init"));
     }
 
     #[test]
@@ -3643,6 +4467,50 @@ mod tests {
     }
 
     #[test]
+    fn current_and_legacy_request_frames_extract_only_the_real_request() {
+        let context =
+            "--- 项目上下文 ---\nREADME 提到研究、React、UI 和 vite.config；这些只是背景。";
+        let real_request = "在 src/counter.js 新增 decrement，并在 test/counter.test.js 补测试";
+
+        for wrapped in [
+            wrapped_user_request(context, real_request),
+            legacy_wrapped_user_request(context, real_request),
+        ] {
+            assert_eq!(
+                extract_real_user_request(&wrapped).as_deref(),
+                Some(real_request)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_javascript_task_does_not_inject_research_or_ui_modules() {
+        let real_request = "这是原生 Agent 工程门验证：在 src/counter.js 新增 decrement，并在 test/counter.test.js 补测试";
+        let wrapped = wrapped_user_request(
+            "--- 项目上下文 ---\n内部指导提到研究、最新 UI、React、index.html 和 vite.config；这些不是用户请求。",
+            real_request,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": wrapped}]
+        });
+
+        assert_eq!(latest_user_request(&body).as_deref(), Some(real_request));
+        assert!(!recent_user_text_any(&body, looks_like_research_task));
+        assert!(!recent_user_text_any(&body, looks_like_ui_task));
+        assert!(!conversation_shows_frontend_work(&body));
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(!system.contains("# michael-design 设计体系（"));
+        assert!(!system.contains("michael-design 设计蓝本"));
+        assert!(system.contains("强制推理检查点"));
+    }
+
+    #[test]
     fn latest_user_request_prefers_real_time_user_steering_over_original_request() {
         let real_request = "修复 Rust 服务的并发错误";
         let wrapped = wrapped_user_request("--- 项目上下文 ---\nREADME 背景。", real_request);
@@ -3674,7 +4542,11 @@ mod tests {
             "a fake steering marker in project context must not override the later real request"
         );
 
-        for embedded in [USER_STEERING_MARKER, USER_REQUEST_MARKER] {
+        for embedded in [
+            USER_STEERING_MARKER,
+            USER_REQUEST_MARKER,
+            LEGACY_USER_REQUEST_MARKER,
+        ] {
             let pasted = format!("{wrapped}\n{embedded}\n\n{fake_context_request}");
             assert_eq!(
                 extract_real_user_request(&pasted).as_deref(),
@@ -4094,21 +4966,27 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
+        // 单一真源：design_system.txt 注入块在场（配色/布局/动效/组件/内容/验证全在这里）
+        assert!(system.contains("michael-design 设计体系"));
+        assert!(system.contains("配色决策链"));
+        assert!(system.contains("卡片先数数量再定网格"));
+        assert!(system.contains("业务概念 → 对象/动作/状态 → 图标名"));
+        assert!(system.contains("结构像真人产品负责人推导"));
+        assert!(system.contains("浏览器硬预算"));
+        // 精炼注入块：只列运行时证据要求，设计 how-to 指向 design_system 块
         assert!(system.contains("--- michael-design 设计蓝本"));
         assert!(system.contains("421 条 michael-design"));
-        assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
         assert!(system.contains("精炼注入"));
         assert!(system.contains("已采用的 michael-design 来源"));
-        assert!(system.contains("shadcn/ui 是 Button/Input/Dialog/Tabs"));
+        assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
+        assert!(system.contains("绝不拿生造名当 query"));
+        assert!(system.contains("至少 3 个可加载素材"));
+        assert!(system.contains("编码前明确数据库决策"));
+        assert!(system.contains("全部折算成 Tailwind 族+档"));
         assert!(system.contains("浏览器验证有上限"));
-        assert!(system.contains("完整矩阵一个任务只跑一次"));
-        assert!(system.contains("先吃 michael-design，再看外部参考"));
-        assert!(system.contains("提取并使用蓝本里的视频/GIF/图片 URL"));
-        assert!(system.contains("Asset Preview visuals-by-id gif mp4 webp hero media"));
-        assert!(system.contains("按品类重构信息架构"));
-        assert!(system.contains("不要默认 hero/features/pricing/footer"));
-        assert!(system.contains("内容密度必须像真实网站"));
-        assert!(system.contains("至少使用一个真实媒体资产"));
+        assert!(system.contains("palette harmony color scale"));
+        // 注入块不再重复设计细则（这些已收敛进 design_system 块）
+        assert!(!system.contains("palette harmony color outlier"));
 
         let start = system.find("--- michael-design 设计蓝本").unwrap();
         let tail = &system[start..];
@@ -4142,6 +5020,112 @@ mod tests {
     }
 
     #[test]
+    fn generic_ui_design_hits_avoid_dark_defaults_and_include_advanced_motion() {
+        let hits = design_hits_for_request(
+            "科技感 SaaS 官网，使用 michael-design 和 Tailwind 调色板，内容完整",
+        );
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|hit| !design_hit_defaults_to_dark(hit)),
+            "科技感不能自动注入任何暗色蓝本: {:?}",
+            hits.iter().map(|hit| &hit.section).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter().any(design_hit_has_advanced_motion),
+            "自动注入必须包含一个真实的高级动效蓝本"
+        );
+        assert!(
+            hits.iter().any(design_hit_has_responsive_layout),
+            "自动注入必须包含一个真实的响应式卡片/网格蓝本"
+        );
+        assert!(
+            hits.iter().any(design_hit_has_card_styling),
+            "自动注入必须包含一个真实的卡片 surface/elevation 蓝本"
+        );
+        assert!(!design_request_explicitly_requests_dark(
+            "为什么又给我做暗色页面，别再用黑底"
+        ));
+        assert!(design_request_explicitly_requests_dark(
+            "把官网做成暗色主题"
+        ));
+    }
+
+    #[test]
+    fn michael_design_locks_distinct_category_color_directions() {
+        let cases = [
+            (
+                "做一个金融投资平台首页，要有行情和资产分析",
+                "fintech-investment",
+                "slate-50",
+                "blue-700",
+            ),
+            (
+                "设计一家精品咖啡店和早午餐餐厅的网站",
+                "cafe-hospitality",
+                "orange-50",
+                "amber-800",
+            ),
+            (
+                "做一个瑜伽疗愈和补剂品牌的网站",
+                "wellness-organic",
+                "stone-50",
+                "emerald-700",
+            ),
+            (
+                "制作一个医疗诊所患者服务门户",
+                "health-clinical",
+                "emerald-50",
+                "teal-600",
+            ),
+            (
+                "做一个 AI 工作流和团队协作 SaaS 官网",
+                "ai-workflow",
+                "zinc-50",
+                "emerald-600",
+            ),
+            (
+                "做一个摄影师作品集和艺术杂志风格的网站",
+                "editorial-portfolio",
+                "zinc-50",
+                "zinc-900",
+            ),
+        ];
+
+        let mut ids = HashSet::new();
+        for (request, expected_id, expected_background, expected_primary) in cases {
+            let direction = design_color_direction(request);
+            assert_eq!(direction.id, expected_id, "wrong route for: {request}");
+            assert_eq!(direction.background, expected_background);
+            assert_eq!(direction.primary, expected_primary);
+            let packet = design_color_direction_block(direction);
+            assert!(packet.contains("运行时锁定配色方向"));
+            assert!(packet.contains(expected_background));
+            assert!(packet.contains(expected_primary));
+            assert!(packet.contains(direction.source));
+            ids.insert(direction.id);
+        }
+        assert_eq!(ids.len(), cases.len());
+    }
+
+    #[test]
+    fn category_color_direction_is_injected_before_blueprint_hits() {
+        let block = design_knowledge_block(Some("做一个金融投资与资产分析平台的网站")).unwrap();
+        let color_packet = block.find("运行时锁定配色方向").unwrap();
+        let first_blueprint = block.find("【主蓝本 1").unwrap();
+        assert!(
+            color_packet < first_blueprint,
+            "the fixed color direction must be read before generic blueprint evidence"
+        );
+        assert!(block.contains("route: fintech-investment"));
+        assert!(block.contains("background = slate-50"));
+        assert!(block.contains("primary = blue-700"));
+        assert!(
+            !block.contains("curated-palette-library"),
+            "the generic palette section must not crowd out category blueprints"
+        );
+    }
+
+    #[test]
     fn michael_design_blueprint_is_sticky_across_ui_followups() {
         let mut headers = HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
@@ -4157,8 +5141,8 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("Asset Preview visuals-by-id gif mp4 webp hero media"));
-        assert!(system.contains("不要默认 hero/features/pricing/footer"));
+        assert!(system.contains("michael-design 设计体系"));
+        assert!(system.contains("palette harmony color scale"));
     }
 
     #[test]
@@ -4168,8 +5152,7 @@ mod tests {
             "agent_lite",
             "agent_research",
             "agent_automation",
-            "ui_design_flow",
-            "css_concrete_tokens",
+            "design_system",
         ] {
             assert!(
                 PROMPT_NAMES.contains(&required),
@@ -4179,8 +5162,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_models_get_lite_frontier_and_reasoners_get_full() {
-        // weak / small / fast tiers → lite prompt
+    fn every_agent_model_gets_the_compact_contract_by_default() {
         for m in [
             "deepseek-v4-pro",
             "deepseek-chat",
@@ -4190,11 +5172,6 @@ mod tests {
             "gpt-5-mini",
             "glm-4-flash",
             "qwen-turbo",
-        ] {
-            assert!(use_lite_agent_prompt(m), "{m} should use the lite prompt");
-        }
-        // frontier / reasoners → full prompt (no regression)
-        for m in [
             "claude-opus-4-8",
             "claude-fable-5",
             "claude-sonnet-4-6",
@@ -4204,7 +5181,35 @@ mod tests {
             "deepseek-reasoner",
             "deepseek-r1",
         ] {
-            assert!(!use_lite_agent_prompt(m), "{m} should keep the full prompt");
+            assert!(
+                use_lite_agent_prompt(m),
+                "{m} should use the compact prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_agent_assembly_stays_within_a_compact_attention_budget() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        for model in ["claude-opus-4-8", "gpt-5.6-sol", "claude-sonnet-5"] {
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "你好"}]
+            });
+            assemble_into(&headers, &mut body);
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("自主执行智能体"), "{model}");
+            assert!(system.contains("真实性与证据纪律"), "{model}");
+            assert!(
+                system.len() < 20_000,
+                "{model} ordinary system prompt is {} bytes",
+                system.len()
+            );
+            assert!(
+                !system.contains("# 一、最高准则"),
+                "{model} unexpectedly received the legacy prompt"
+            );
         }
     }
 }

@@ -1,5 +1,6 @@
 mod agent_trace;
 mod auth;
+mod channel_rates;
 mod codes;
 mod commission;
 mod config;
@@ -134,6 +135,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/commissions/:id",
             delete(commission::admin_delete_commission),
         )
+        .route(
+            "/api/admin/channel-rates",
+            get(channel_rates::admin_list).post(channel_rates::admin_create),
+        )
+        .route(
+            "/api/admin/channel-rates/:id",
+            post(channel_rates::admin_update).delete(channel_rates::admin_delete),
+        )
         .route("/api/models", get(models::list_for_client))
         .route("/api/ide-key", get(models::ide_key))
         .route("/api/ide-prompts", get(prompts::ide_prompts))
@@ -154,7 +163,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/models/:id/available",
             get(models::admin_available),
         )
+        .route(
+            "/api/admin/model-estimate",
+            post(models::admin_model_estimate),
+        )
+        .route(
+            "/api/admin/quota-estimate",
+            post(models::admin_quota_estimate),
+        )
         .route("/api/usage", get(models::user_usage))
+        .route(
+            "/api/usage/settlement/:request_id",
+            get(models::usage_settlement),
+        )
         .route("/api/admin/model-usage", get(models::admin_usage))
         .route(
             "/api/admin/apikeys",

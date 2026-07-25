@@ -35,6 +35,7 @@ const INDEX_HTML = readFileSync(join(HERE, "../index.html"), "utf8");
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 const GROWTH_SRC = readFileSync(join(HERE, "../src/growth.js"), "utf8");
 const TAURI_AI = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
+const TAURI_NET = readFileSync(join(HERE, "../src-tauri/src/net.rs"), "utf8");
 const REMOTE_AGENT = readFileSync(join(HERE, "../remote-agent/michael-remote-agent.py"), "utf8");
 const SERVER_MODELS = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
 const SERVER_MAIN = readFileSync(join(HERE, "../../server/src/main.rs"), "utf8");
@@ -78,7 +79,20 @@ function isRegexPos(s, i) {
 function extractFn(name) {
   const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(SRC);
   if (!m) throw new Error(`function ${name} not found in main.js`);
-  let i = SRC.indexOf("{", m.index), depth = 0;
+  // 先跳过参数表再匹配函数体：默认参数可能含 {}（如 `onRetry = () => {}`），
+  // 从参数表里的第一个 { 开始配对会把函数截断在签名中间。
+  let p = SRC.indexOf("(", m.index), pd = 0;
+  for (; p < SRC.length; p++) {
+    const c = SRC[p], d = SRC[p + 1];
+    if (c === "/" && d === "/") { p = SRC.indexOf("\n", p); if (p < 0) p = SRC.length; continue; }
+    if (c === "/" && d === "*") { p = SRC.indexOf("*/", p + 2) + 1; continue; }
+    if (c === "'" || c === '"') { p = skipString(SRC, p, c); continue; }
+    if (c === "`") { p = skipTemplate(SRC, p); continue; }
+    if (c === "/" && isRegexPos(SRC, p)) { p = skipRegex(SRC, p); continue; }
+    if (c === "(") pd++;
+    else if (c === ")") { pd--; if (pd === 0) break; }
+  }
+  let i = SRC.indexOf("{", p), depth = 0;
   for (; i < SRC.length; i++) {
     const c = SRC[i], d = SRC[i + 1];
     if (c === "/" && d === "/") { i = SRC.indexOf("\n", i); if (i < 0) i = SRC.length; continue; }
@@ -1561,17 +1575,26 @@ test("adaptive profile is persisted and injected into model context", () => {
     "Adaptive notes should reuse the global user preference memory store");
   assert.match(SRC, /const count = _saveKgText\("", notes\.value\);/,
     "Saving Adaptive should write back to the global preference knowledge graph");
-  assert.match(SRC, /function _adaptivePromptBlock\(query = ""\) \{[\s\S]{0,1200}【自适应用户档案】已开启/,
-    "Adaptive profile should produce a model-visible instruction block");
+  assert.match(SRC, /function _adaptivePromptBlock\(\) \{[\s\S]{0,1200}【自适应用户档案】已开启/,
+    "Adaptive profile should produce a byte-stable (cache-safe) instruction block");
+  assert.match(SRC, /function _adaptiveMemoryBlock\(query = ""\) \{[\s\S]{0,600}_kgRetrieve\("", query/,
+    "Per-query adaptive preference memory should live in its own dynamic block");
   assert.match(SRC, /用户表达很短、很乱、带情绪[\s\S]{0,260}啊 \/ ？？ \/ 继续 \/ 这个 \/ 不是这个/,
     "Adaptive prompt should teach models to infer intent from vague short user messages");
   assert.match(SRC, /用户明显不懂技术或概念时[\s\S]{0,180}自动降到新手可理解的说法/,
     "Adaptive prompt should adapt explanations for novice users");
   assert.match(SRC, /用户纠正你[\s\S]{0,220}强自适应信号/,
     "Adaptive prompt should treat corrections as learning signals");
-  assert.match(SRC, /function _memoryBlocks\(root, query\) \{[\s\S]{0,180}_adaptiveEnabled\(\) \? _kgRetrieveBlock\("", query, true\) : ""/,
-    "Adaptive switch should gate global user preference injection");
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(text\);[\s\S]{0,120}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
+  const memoryBlocks = load("_memoryBlocks", {
+    _kgRetrieveBlock: (root, _query, global) => global ? "[global]" : `[project:${root}]`,
+  });
+  assert.equal(memoryBlocks("/repo", "website"), "[project:/repo][global]",
+    "saved global user preferences must survive when Adaptive coaching is disabled");
+  assert.match(SRC, /function _memoryBlocks\(root, query\) \{[\s\S]{0,260}_kgRetrieveBlock\("", query, true\)/,
+    "global memory should be injected independently from the Adaptive style switch");
+  assert.doesNotMatch(extractFn("_memoryBlocks"), /_adaptiveEnabled/,
+    "Adaptive only controls coaching behavior, not durable remembered user preferences");
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\)/,
     "Every model send path should receive the Adaptive profile block");
 });
 
@@ -1731,13 +1754,18 @@ test("agent path resolution keeps the run root ahead of the active workspace", (
   assert.equal(resolve("server/db.js", "/work/run"), "/work/run/server/db.js");
   assert.equal(resolve("active/src/main.js", "/work/run"), "/work/active/src/main.js");
   assert.match(extractFn("_interleavedDiagnostics"), /_resolveExisting\(rel, root\)/);
-  assert.match(SRC, /_interleavedDiagnostics\(_successfulEdits, root\)/);
+  assert.match(SRC, /_interleavedDiagnostics\(\s*\[\.\.\.run\._diagnosticCheckPaths\],\s*root,\s*run\._diagnosticBaselineCounts/);
   assert.match(SRC, /function formatDiagnosticsForAgent/);
   assert.match(SRC, /实时诊断（编辑器\/LSP，Agent 必须参考）/);
   assert.match(SRC, /原因: \$\{diagnosticLikelyCause\(marker\)\}/);
   assert.match(SRC, /修法: \$\{diagnosticRepairHint\(marker\)\}/);
   assert.match(extractFn("_interleavedDiagnostics"), /markers\.filter\(\(m\) => m\.severity === 8\)/);
-  assert.match(extractFn("_interleavedDiagnostics"), /formatDiagnosticsForAgent\(errs, root/);
+  assert.match(extractFn("_interleavedDiagnostics"), /formatDiagnosticsForAgent\(fresh, root/);
+  assert.match(extractFn("_interleavedDiagnostics"), /occurrence > \(baselineCounts\.get\(identity\) \|\| 0\)/);
+  assert.match(SRC, /Capture the exact diagnostics state before the first JS\/TS mutation/);
+  assert.match(SRC, /\[BLOCKING_NEW_DIAGNOSTICS\]/);
+  assert.match(SRC, /run\._diagnosticBlock = "";/,
+    "a real exit-code-0 verification must be able to clear stale editor diagnostics");
   assert.doesNotMatch(extractFn("_interleavedDiagnostics"), /_TS_NOISE_CODES|Cannot find module|jsx-runtime/);
 });
 
@@ -2232,7 +2260,7 @@ test("tool cards always have a label and skipped paths settle their spinner", ()
     classList: { add: (name) => classes.add(name) },
     querySelector: (selector) => selector === ".atc-result" ? resultEl : null,
   };
-  const settle = load("_settleToolStep");
+  const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
   assert.equal(settle(step, { content: "[重复读取·已跳过]" }, "重复 · 已跳过"), true);
   assert.equal(textContent, "重复 · 已跳过");
   assert.equal(step.dataset.toolSettled, "1");
@@ -2289,6 +2317,8 @@ test("run narrative dedup removes exact cross-turn repeats for every model famil
 
 test("provider tool-transcript echoes are removed without deleting preceding prose", () => {
   const clean = load("_cleanAgentText", {
+    _stripAckOpeners: load("_stripAckOpeners"),
+    _stripTeachingSections: load("_stripTeachingSections"),
     _transformFileContentTags: (value) => value,
     _stripToolNarration: (value) => value,
   });
@@ -2938,14 +2968,15 @@ test("location requests generate overlapping detail crops without re-reading ori
 
 test("vision bridge caches geolocation analysis separately and sends full image plus crops together", async () => {
   const calls = [];
+  const billableComplete = async (config, messages) => {
+    calls.push({ config, messages });
+    return `analysis-${calls.length}`;
+  };
   const describe = load("_describeImageForTextModel", {
     _pickVisionModel: () => "vision-model-a",
     _cheapHash: (value) => value.slice(-10),
     _visionCache: new Map(),
-    backend: { aiComplete: async (config, messages) => {
-      calls.push({ config, messages });
-      return `analysis-${calls.length}`;
-    } },
+    _billableAiComplete: billableComplete,
   });
   const images = ["data:image/jpeg;base64,FULL", "data:image/jpeg;base64,CROP"];
   assert.equal(await describe(images, "〔图片地理定位〕", { model: "text-only" }), "analysis-1");
@@ -3088,6 +3119,8 @@ test("historical image bytes are sanitized before model use and never fall back 
 test("a location follow-up applies only to the most recent historical media turn", async () => {
   const calls = [];
   const rebuild = load("_memoryMessagesForModel", {
+    _stripAckOpeners: load("_stripAckOpeners"),
+    _stripTeachingSections: load("_stripTeachingSections"),
     _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /定位/.test(String(text)),
     _attachmentAwareContent: async (text, attachments, _config, _budget, forced, intentText) => {
       calls.push({ text, name: attachments[0].name, forced, intentText });
@@ -3111,6 +3144,8 @@ test("a location follow-up applies only to the most recent historical media turn
 test("a current attachment suppresses historical media unless the user explicitly references it", async () => {
   const calls = [];
   const rebuild = load("_memoryMessagesForModel", {
+    _stripAckOpeners: load("_stripAckOpeners"),
+    _stripTeachingSections: load("_stripTeachingSections"),
     _isImageLocationRequest: (text, hasImageContext) => hasImageContext && /哪里|定位/.test(String(text)),
     _attachmentAwareContent: async (text, attachments, _config, _budget, forced) => {
       calls.push({ name: attachments[0].name, forced });
@@ -3257,7 +3292,7 @@ test("every streaming chat path applies the final request budget", () => {
   assert.ok(rawCalls.every((call) => call.includes("_enforceModelRequestBudget") || call.includes("requestMessages")), rawCalls.join("\n"));
 });
 
-test("token meter fallback estimates the actual post-L0 request, not the bloated transcript", () => {
+test("context pressure may be estimated but billing waits for the server settlement", () => {
   const estTokens = load("_estTokens");
   const estRequest = load("_estRequestTokens", { _estTokens: estTokens });
   const fullMessages = [
@@ -3272,7 +3307,10 @@ test("token meter fallback estimates the actual post-L0 request, not the bloated
   assert.match(SRC, /_lastRequestEstimateTokens = _estRequestTokens\(_l0Msgs, _l0Tools\)/);
   assert.match(SRC, /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" \}\)/,
     "估算态的缓存必须是 null（未上报），不能渲染成误导排查的「缓存 0」");
-  assert.match(SRC, /prompt_tokens: _lastRequestEstimateTokens \|\| _estRequestTokens\(messages, toolSchemas\)/);
+  assert.match(SRC, /const settlement = await _fetchGatewaySettlement\(_turnConfig, _turnReqId\)/);
+  assert.match(SRC, /session\._lastTurnTokens = settlement\?\.usageReported/);
+  assert.doesNotMatch(SRC, /prompt_tokens: _lastRequestEstimateTokens \|\| _estRequestTokens\(messages, toolSchemas\)/);
+  assert.doesNotMatch(SRC, /_turnCostCents/);
   assert.doesNotMatch(SRC, /prompt_tokens: _estTokens\(messages\)/);
   assert.match(SRC, /供应商尚未上报真实 usage/);
 });
@@ -4178,7 +4216,7 @@ test("agent auto-recovers transient stream errors after inner turn retries are e
   assert.equal(transient("[tool-args-invalid] write_file truncated"), false);
 });
 
-test("server-exhausted provider gateway failures do not trigger frontend retry storms", () => {
+test("pre-stream provider gateway retries stay bounded and do not trigger agent retry storms", () => {
   const strip = load("_stripAiRetryPrefix");
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
   const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway });
@@ -4196,12 +4234,33 @@ test("server-exhausted provider gateway failures do not trigger frontend retry s
   const friendly502 = "[turn-retry-exhausted] AI request failed (502 Bad Gateway): 【claude-opus-4-6】上游暂时不可用，请换个模型或稍后再试。";
   assert.equal(providerGateway(bare502), true);
   assert.equal(providerGateway(friendly502), true);
-  assert.equal(retryable(bare502), false, "the server gateway already retried upstream 502s");
+  assert.equal(retryable(bare502), false, "pre-stream retries are handled below the agent loop");
   assert.equal(transient(bare502), false, "outer agent loop must not perform another 3x retry cycle");
   assert.match(format(friendly502), /当前模型「claude-opus-4-6」线路失败/);
-  assert.match(format(bare502), /已停止继续重复撞同一路/);
+  assert.match(format(bare502), /自动重试 2 次/);
   assert.match(SRC, /const retryableTurnErr = turnErr && _isRetryableAiError\(turnErr\)/);
-  assert.match(SRC, /IDE 已停止继续重复撞同一路/);
+  assert.match(SRC, /function _postAiWithGatewayRetry/);
+  assert.match(TAURI_AI, /async fn post_chat_with_gateway_retry/);
+  assert.match(TAURI_AI, /PRE_STREAM_GATEWAY_RETRY_DELAYS/);
+});
+
+test("browser gateway retries are bounded to two pre-stream replays", async () => {
+  const retryableStatus = load("_isRetryableAiGatewayStatus");
+  const postWithRetry = load("_postAiWithGatewayRetry", { _isRetryableAiGatewayStatus: retryableStatus });
+  const attempts = [];
+  let calls = 0;
+  const response = await postWithRetry(
+    async () => ({ status: ++calls < 3 ? 502 : 200 }),
+    { model: "test" },
+    (event) => attempts.push(event),
+    async () => {},
+  );
+  assert.equal(response.status, 200);
+  assert.equal(calls, 3);
+  assert.deepEqual(attempts, [{ attempt: 1, status: 502 }, { attempt: 2, status: 502 }]);
+  assert.equal(retryableStatus(401), false);
+  assert.equal(retryableStatus(413), false);
+  assert.equal(retryableStatus(504), true);
 });
 
 test("payload-too-large AI errors shrink the request instead of resending the same body", () => {
@@ -4307,7 +4366,7 @@ test("agent retry toast is scoped and clears when real data resumes", () => {
     "retry toast should disappear as soon as reasoning/token/tool data starts streaming again");
   assert.match(SRC, /body\.querySelectorAll\("\.md-caret"\)[\s\S]{0,140}if \(!err\) clearAgentRetryToast\(\);/,
     "a successful model turn must not leave a stale retry toast visible");
-  assert.match(SRC, /showAgentRetryToast\(`网络\/服务波动 \(\$\{_turnFails\}\/3\)，自动恢复中…`\)/);
+  assert.match(SRC, /showAgentRetryToast\(`网络\/服务波动 \(\$\{_turnFails\}\/5\)，等待链路恢复后自动继续…`\)/);
   assert.match(SRC, /_turnFails = 0;\s*clearAgentRetryToast\(\);/,
     "loop-level recovery toast should be cleared after the next successful turn");
 });
@@ -4752,8 +4811,12 @@ test("active Skills survive L0 prompt stripping and are inherited by child work"
 });
 
 test("dynamic time and bulky file context stay out of the cached system prefix", () => {
-  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(text\);[\s\S]{0,120}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\);/);
+  assert.match(SRC, /const adaptiveBlock = _adaptivePromptBlock\(\);[\s\S]{0,200}const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}const fullPrompt = _agentLightTurn \? \(sysPrompt \+ languageBlock \+ adaptiveBlock\) : \(sysPrompt \+ _modelStyleTuning\(config\.model\) \+ skillsBlock \+ _authContextBlock\(\) \+ languageBlock \+ adaptiveBlock\);/);
   assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_currentDateBlock\(\)/);
+  assert.doesNotMatch(SRC, /const fullPrompt = [^\n;]*_adaptiveMemoryBlock/,
+    "per-query adaptive preference memory must never enter the cached system prefix");
+  assert.match(SRC, /\(_adaptiveMemory \? _adaptiveMemory \+ "\\n\\n" : ""\) \+/,
+    "adaptive preference memory rides the per-turn dynamic preamble instead");
   assert.match(SRC, /const _timeBlock = _currentDateBlock\(\);[\s\S]{0,140}const _dynPreamble =\s*\n\s*\(_timeBlock \? _timeBlock \+ "\\n\\n" : ""\) \+/);
   assert.match(SRC, /const _childContext = _currentDateBlock\(\) \+ `\\n\\n--- 项目上下文 ---\\n` \+ \(await _gatherAgentContext\("", root\)\)/);
   assert.doesNotMatch(SRC, /\+ _currentDateBlock\(\) \+ `\\n\\n--- 项目上下文 ---\\n`/);
@@ -5304,6 +5367,34 @@ test("engineering task profiling gates only substantial code work and detects UI
   assert.equal(profile("把按钮文字改成保存").requiresPlan, false);
   assert.equal(profile("调整按钮和表单的样式布局").ui, true);
   assert.equal(profile("修复手机端视觉和交互动效问题").ui, true);
+  const secondHandMarketplace = profile("帮我写个卖二手商品的平台");
+  assert.equal(secondHandMarketplace.ui, true, "二手商品平台是用户面对的 UI 产品，不是普通空工程");
+  assert.equal(secondHandMarketplace.uiProject, true);
+  assert.equal(secondHandMarketplace.fullWebsite, true);
+  assert.equal(secondHandMarketplace.designKnowledgeRequired, true, "完整交易平台必须在首轮前预取 michael-design");
+  assert.equal(secondHandMarketplace.transactionalProduct, true);
+  assert.equal(secondHandMarketplace.databaseDecisionRequired, true);
+  assert.equal(secondHandMarketplace.richMediaRequired, true);
+  assert.equal(secondHandMarketplace.motionDesignRequired, true);
+  for (const request of ["写一个个人作品集网站", "做一个餐厅预订网站", "创建社区论坛"]) {
+    const site = profile(request);
+    assert.equal(site.uiProject, true, "named website categories must be treated as UI products");
+    assert.equal(site.fullWebsite, true, "named website categories must use the full website path");
+    assert.equal(site.designKnowledgeRequired, true, "named website categories must preload michael-design");
+  }
+  const backendForum = profile("创建社区论坛 API 路由和数据库 schema");
+  assert.equal(backendForum.uiProject, false, "a backend-only forum API must not trigger UI design orchestration");
+  const partialUi = profile("调整已有 React 项目的仪表盘布局");
+  assert.equal(partialUi.uiProject, true);
+  assert.equal(partialUi.designKnowledgeRequired, true, "non-greenfield UI work still uses michael-design");
+  assert.equal(partialUi.fromZeroUiProject, false, "existing projects keep their own stack");
+  const referenceSite = profile("照着 https://www.linear.app/ 做一个完整的项目协作官网，参考它的配色和内容结构");
+  assert.deepEqual(referenceSite.referenceWebsiteUrls, ["https://www.linear.app/"]);
+  assert.equal(referenceSite.referenceWebsiteRequested, true);
+  assert.equal(referenceSite.referenceWebsiteRequired, true);
+  const explicitSite = profile("重做 https://vercel.com/ 的官网页面，补齐响应式布局");
+  assert.equal(explicitSite.referenceWebsiteRequired, true, "an exact site URL in UI implementation is a reference even without the word 参考");
+  assert.equal(explicitSite.designKnowledgeRequired, true, "exact-site adaptation must still be translated through michael-design");
   assert.equal(profile("修复登录按钮不响应").implementation, true);
   assert.equal(profile("看看项目还有什么 bug").debugProject, true,
     "project-wide bug hunts must use the debugging evidence plan gate");
@@ -5311,7 +5402,8 @@ test("engineering task profiling gates only substantial code work and detects UI
   const architecture = profile("重构整个代码库的认证架构，消除硬编码并补齐测试");
   assert.equal(architecture.applies, true);
   assert.equal(architecture.requiresPlan, true);
-  assert.equal(architecture.needsReferences, false, "local architecture work should read the repository before searching communities");
+  assert.equal(architecture.authoritativeReferencesRequired, true);
+  assert.equal(architecture.needsReferences, true, "substantial refactors need repository evidence plus current maintainer/community pitfalls");
   assert.equal(profile("接入最新版支付 API 并确认兼容性").needsReferences, true);
   const dbDesign = profile("设计数据库 schema、表结构和索引，补迁移和回滚");
   assert.equal(dbDesign.database, true);
@@ -5469,7 +5561,7 @@ test("mutation effect routing cannot finish as a successful zero-effect run", ()
   assert.equal(runTarget({ _originalText: "修复代码", engineering: profile("修复代码") }), "workspace",
     "external actions cannot stand in for a clear local edit");
   assert.doesNotMatch(SRC, /run\._incompleteReason = "pending_plan"/);
-  assert.match(SRC, /run\._incompleteReason = "required_mutation_missing"/);
+  assert.match(SRC, /run\._incompleteReason = `required_effect_missing:\$\{_missingEffects\.join\(","\)\}`/);
   assert.match(SRC, /_missingRequiredEffects\(run, \{/);
   assert.match(SRC, /runtimeEffects: _runtimeEffects/);
   assert.match(SRC, /externalEffects: _externalEffects/);
@@ -5525,6 +5617,13 @@ test("compound workspace, runtime, and external obligations are reconciled by ex
   assert.deepEqual(contract(makeRun("修复 commit 按钮样式")), { workspace: true, runtime: [], external: [] });
   assert.deepEqual(contract(makeRun("先不要运行，只编译")), { workspace: false, runtime: ["build"], external: [] });
   assert.deepEqual(contract(makeRun("修改 Prisma schema 和索引，并补 migration")), { workspace: true, runtime: [], external: [] });
+  for (const request of [
+    "在最后一次修改后依次运行 npm run typecheck、npm test、npm run build",
+    "修改完成后重新运行 npm run typecheck、npm test 和 npm run build",
+  ]) {
+    assert.deepEqual(helpers.runtimeObligations(request), ["build", "test"], request);
+    assert.equal(contract(makeRun(request)).runtime.includes("run"), false, request);
+  }
 
   for (const request of [
     "UPDATE users SET active=1",
@@ -5656,12 +5755,15 @@ test("agent completion avoids duplicate outcome summaries and caps automatic con
     "normal agent narratives should not always get a second automatic recap underneath");
   assert.doesNotMatch(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*didMutate \|\| finalErr/s,
     "mutating successfully should not by itself force a duplicate outcome summary");
-  assert.match(SRC, /const _AGENT_HARD_CEIL = 120;/);
-  assert.match(SRC, /const _AGENT_MAX_EXTENSIONS = 4;/);
+  assert.match(SRC, /const _AGENT_HARD_CEIL = 64;/);
+  assert.match(SRC, /const _AGENT_MAX_EXTENSIONS = 2;/);
   assert.match(SRC, /extensions < _AGENT_MAX_EXTENSIONS/);
   assert.match(SRC, /协作边界/);
   assert.match(SRC, /Agent 模式不是无条件全自动/);
-  assert.match(SRC, /本地硬规则：只输出低副作用复查\/验证\/解释类芯片/);
+  const suggestionSource = SRC.slice(SRC.indexOf("async function _maybeSuggestNext"), SRC.indexOf("function _steerRunningAgent"));
+  assert.match(suggestionSource, /_fallbackNextActionSuggestions\(recent\)/);
+  assert.doesNotMatch(suggestionSource, /aiComplete|chat\/completions/,
+    "next-step chips must not start a paid request after the visible run has settled");
 });
 
 test("effect clauses follow the latest explicit directive without erasing other targets", () => {
@@ -5689,7 +5791,8 @@ test("effect clauses follow the latest explicit directive without erasing other 
 
 test("local engineering profiles drive planning without an extra classifier request", () => {
   const requiresPlan = load("_runRequiresPlan");
-  const quality = load("_planQualityIssue");
+  const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
+  const quality = load("_planQualityIssue", { _uiPlanHasCategoryArchitecture: hasCategoryArchitecture });
   const base = { applies: true, substantial: false, requiresPlan: false };
   const profile = engineeringHelpers().profile;
 
@@ -5708,6 +5811,28 @@ test("local engineering profiles drive planning without an extra classifier requ
   const websiteProfile = profile("帮我用谷歌，mac风格，白色浅色写一个 ide 官网");
   assert.equal(websiteProfile.ui, true);
   assert.equal(websiteProfile.uiProject, true);
+  assert.equal(websiteProfile.fullWebsite, true);
+  assert.equal(websiteProfile.designKnowledgeRequired, true);
+  assert.equal(websiteProfile.richMediaRequired, true);
+  assert.equal(websiteProfile.motionDesignRequired, true);
+  assert.equal(websiteProfile.advancedMotionRequired, true);
+  assert.equal(websiteProfile.paletteHarmonyRequired, true);
+  assert.equal(websiteProfile.cardLayoutRequired, true);
+  assert.equal(websiteProfile.cardStylingRequired, true);
+  assert.equal(websiteProfile.semanticIconRequired, true);
+  assert.equal(websiteProfile.motionChoreographyRequired, true);
+  assert.equal(websiteProfile.darkThemeRequested, false);
+  assert.equal(websiteProfile.gradientThemeRequested, false);
+  assert.equal(websiteProfile.monochromeThemeRequested, false);
+  assert.equal(websiteProfile.databaseDecisionRequired, true);
+  const rejectedThemeDefaults = profile("修复官网动不动就暗色、渐变色的问题");
+  assert.equal(rejectedThemeDefaults.darkThemeRequested, false);
+  assert.equal(rejectedThemeDefaults.gradientThemeRequested, false);
+  assert.equal(profile("为什么又给我做暗色页面，别再用黑底").darkThemeRequested, false);
+  const requestedThemes = profile("把官网做成暗色渐变视觉");
+  assert.equal(requestedThemes.darkThemeRequested, true);
+  assert.equal(requestedThemes.gradientThemeRequested, true);
+  assert.equal(profile("做一个纯黑白单色官网").monochromeThemeRequested, true);
   assert.equal(websiteProfile.requiresPlan, true,
     "creating an official-site/landing-page UI is a substantial project even if the prompt is short");
   const captureProfile = profile("打开网页抓真实接口，看看请求从哪来并重放");
@@ -5834,11 +5959,15 @@ test("local engineering profiles drive planning without an extra classifier requ
     "front-end project plans must say how user screenshots or real project images/assets will be used");
   assert.equal(quality([
     { content: "读取 README、package.json、PRODUCT_WIKI.md、src/data、public/assets 和用户附图/现有截图素材，取证 IDE 真实功能、产品文案、真实图片与可用内容源" },
-    { content: "定义官网页面内容契约：导航、Hero、核心功能区、AI 工作流区、CTA、页脚文案与按钮状态" },
+    { content: "调用 knowledge_search domain=michael-design 检索 IDE SaaS 品类的 information architecture、media asset、motion 和 responsive 蓝本；再读取 GitHub maintainer discussion、官方文档与 Stack Overflow，确认 React/Tailwind 版本兼容前提，采用语义 token + 品类信息架构模式并规避通用 Hero/Features 模板坑" },
+    { content: "按 IDE SaaS 业务品类定义至少 7 个差异化内容区块：工作区、AI 工作流、模型与工具、远程开发、调试、团队协作、案例与资源，写满具体文案" },
+    { content: "规划 michael-design 真实图片素材、一个 .mp4 视频和一个 .gif 动态媒体在首屏、工作流和案例区的具体落点与 fallback" },
+    { content: "数据库 = 不需要：本官网读取构建期产品内容，无账户、提交或跨设备持久化业务" },
     { content: "建立 Google+mac 白色浅色视觉系统：Tailwind palette/theme.extend/CSS variables、font-display/body 字体搭配、text-5xl/3xl/base 字阶、leading-tight/relaxed 行高、max-w-prose 阅读宽度、圆角、阴影与浅玻璃 token" },
     { content: "设计 12 列 grid / max-w-7xl container、section py-24、gap-8/12、移动优先布局密度和桌面/手机信息层级" },
     { content: "映射 shadcn/ui + Radix primitives 语义组件：Button、Card、Tabs、Accordion、Progress、Dialog 到页面区块" },
     { content: "搭建 Vite React 入口文件、组件拆分和 src/App.jsx / src/styles.css 布局骨架" },
+    { content: "实现 hover 微交互与 whileInView stagger 分区入场两层动效，并用 useReducedMotion/prefers-reduced-motion 提供静态降级" },
     { content: "实现桌面与移动端响应式断点、hover/focus-visible/active/disabled/loading/empty/error/success 状态、键盘可达、空资源和图标加载失败 fallback" },
     { content: "运行 npm install、npm run build，并记录 stdout/stderr、退出码和 dist 产物" },
     { content: "启动 dev server，用 browser viewport 1440x900 与 390x844 截图验证页面、控制台和网络无异常，汇总验收结果" },
@@ -5882,7 +6011,7 @@ test("local engineering profiles drive planning without an extra classifier requ
   ], true, "mutate", googleScaleProfile), /项目地图\/模块边界|变更半径\/调用方影响|验证矩阵\/CI式检查|生产级发布\/回滚\/可观测性边界/,
     "industrial project plans must be real engineering work, not three slogans");
   assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、workspace/monorepo 配置、src/、server/、test/、CI 和部署配置，确认模块边界、服务入口、脚本和现有约定" },
+    { content: "盘点项目地图：读取 README、package.json、workspace/monorepo 配置、src/、server/、test/、CI 和部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、服务入口、脚本、当前版本兼容前提与现有约定，采用薄切片编排模式并规避跨服务全量重写的坑" },
     { content: "梳理变更半径：用 semantic_search/lsp_references 沿 agent 编排入口、API contract、数据库迁移、缓存/权限/队列调用方和跨服务数据流确认受影响范围" },
     { content: "按薄切片修改 agent 基座能力：项目画像、工具编排、验证门禁、日志/API/DB/Git 实时证据链，并保留旧接口兼容与失败回退" },
     { content: "补生产级边界：发布/回滚路径、feature flag/配置兼容、迁移风险、日志/指标/告警/可观测性和权限失败边界" },
@@ -5896,14 +6025,17 @@ test("local engineering profiles drive planning without an extra classifier requ
   ], true, "mutate", businessIndustrialProfile), /业务域\/角色\/状态机\/业务规则|业务漏洞\/越权\/滥用\/幂等并发|功能完整性\/验收清单|数据库选型\/引擎适配|容器\/Docker\/编排方案|网站生产交付/,
     "business-grade industrial plans must cover domain rules, abuse paths, DB/container/runtime, and complete delivery");
   assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、docker-compose.yml、Dockerfile、src/、server/、db/migrations、public/ 和 CI/部署配置，确认模块边界、服务入口、脚本和容器依赖" },
+    { content: "盘点项目地图：读取 README、package.json、docker-compose.yml、Dockerfile、src/、server/、db/migrations、public/ 和 CI/部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、服务入口、脚本、容器依赖、版本兼容前提，采用分层契约模式并规避跨域硬编码与全量重写的坑" },
+    { content: "调用 knowledge_search domain=michael-design 检索电商业务的信息架构、media asset、motion 与 responsive 蓝本，记录采用的栏目和真实素材 URL" },
     { content: "建立业务域模型：梳理订单/支付/库存/会员/租户角色权限、业务规则、主流程/异常流程、状态机和业务不变量" },
     { content: "梳理变更半径：用 semantic_search/lsp_references 沿 UI、API contract、service、ORM、数据库 schema、队列/缓存调用方和跨服务数据流确认受影响范围" },
     { content: "检查业务漏洞/滥用：越权/IDOR、重复提交/支付、重放、库存超卖、金额篡改、幂等、并发竞态、限流和风控绕过，并补权限回归断言" },
     { content: "重整架构分层：明确领域模型、边界上下文、模块边界、接口边界、依赖方向、职责所有权，保留兼容层和失败回退" },
     { content: "设计数据库选型和引擎适配：Postgres/Redis/搜索/向量数据库按读写模式分层，补事务隔离、唯一约束、索引、迁移/回滚、连接池、备份恢复和 ORM 映射" },
     { content: "完善容器方案：Dockerfile、docker compose、k8s/devcontainer 环境变量、secret、端口、volume、网络、service dependency、healthcheck/readiness、日志和迁移启动顺序" },
+    { content: "按电商用户旅程规划至少 7 个差异化内容区块：分类导航、场景导购、商品比较、编辑精选、会员权益、配送售后、品牌故事与社区内容，并写满真实文案" },
     { content: "补网站生产交付：用户附图/现有截图/真实图片素材、真实内容/文案、视觉系统/配色/排版令牌、shadcn/ui + Radix 组件映射、字体层级/行高/阅读宽度、路由/404/SEO metadata、表单提交/API 错误、加载/空/错误状态、性能基础、无障碍、响应式和浏览器视口验收" },
+    { content: "实现 hover/press 微交互、whileInView stagger 分区入场和滚动进度两层动效，并通过 useReducedMotion/prefers-reduced-motion 降级" },
     { content: "实现薄切片改动并同步 UI/API/DB/后台任务/日志/权限契约，逐项对照需求核对清单，避免丢字段、丢状态、丢功能" },
     { content: "执行验证矩阵：npm test、npm run typecheck、npm run build、integration/e2e/contract/migration/smoke、browser、http_request 和 docker compose smoke，记录 stdout/stderr 与 exit code" },
     { content: "补生产边界：发布/回滚方案、feature flag/配置兼容、迁移风险、日志/指标/告警/可观测性和未覆盖风险，输出验收标准" },
@@ -5915,7 +6047,7 @@ test("local engineering profiles drive planning without an extra classifier requ
   ], true, "mutate", promptRescueProfile), /烂提示词救援\/意图归纳\/默认假设|模糊需求验收清单\/范围边界|可维护\/可升级架构默认值|反硬编码\/复用\/扩展点/,
     "vague or bad prompts must be rescued into assumptions, acceptance criteria, and maintainable defaults");
   assert.equal(quality([
-    { content: "盘点项目地图：读取 README、package.json、src/、server/、test/、CI 和部署配置，确认模块边界、入口、脚本、配置、服务和现有约定" },
+    { content: "盘点项目地图：读取 README、package.json、src/、server/、test/、CI 和部署配置；读取 GitHub maintainer discussions、官方文档和 Stack Overflow，确认模块边界、入口、脚本、配置、服务、版本兼容前提与现有约定，采用可反悔的薄切片方案并规避散落硬编码的坑" },
     { content: "提示词救援：按用户原话做意图归纳和需求整理，列默认假设、默认方案、可反悔选择、范围边界/不做什么，缺关键信息时只做非阻塞澄清" },
     { content: "建立验收标准和需求覆盖 checklist：主流程、边界场景、空状态、加载态、错误态、权限和端到端 smoke，逐项映射到 UI/API/DB/测试" },
     { content: "梳理变更半径：用 semantic_search/lsp_references 沿 API contract、schema、调用方、状态和缓存数据流确认影响范围" },
@@ -5993,8 +6125,10 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "核验 npm run preview 健康输出或产物入口，汇总可运行状态" },
   ], true, "execute"), "", "runtime-only plans require execution evidence, diagnostics, and concrete commands");
   assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
-  assert.match(SRC, /function _runNeedsPlanGateNow\(run, call = null\) \{\s*if \(!_runRequiresPlan\(run\)\) return false;/s,
-    "complex tasks must plan before the first mutating call so the user sees a task-plan card");
+  assert.match(SRC, /function _planGateGrandProject\(run\)/,
+    "计划门必须按任务意图识别大计划工程，而不是机械文件计数");
+  assert.match(SRC, /if \(call && call\.type === "worker"\) return true;/,
+    "run_worker 派工前必须有工程全貌计划");
   assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
   assert.match(SRC, /UI\/官网\/落地页\/从零前端项目要覆盖/);
   assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
@@ -6120,6 +6254,7 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
   assert.equal(gated({ type: "think" }), false);
 
   const requiresPlan = load("_runNeedsPlanGateNow", {
+    _planGateGrandProject: load("_planGateGrandProject"),
     _runRequiresPlan: () => true,
     _callCanBypassPlanGate: bypass,
   });
@@ -6140,8 +6275,16 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
     "node_modules inspection from the screenshot must not be blocked by plan gate");
   assert.equal(requiresPlan(complexRun, { type: "cmd", command: "npm install" }), false,
     "dependency restoration must not be blocked by plan gate");
-  assert.equal(requiresPlan(complexRun, { type: "write" }), true,
-    "the first mutating call on a complex run without a plan must be gated so a task-plan card appears");
+  assert.equal(requiresPlan(complexRun, { type: "write" }), false,
+    "任务只是'复杂'不是大计划工程（如修类型错误）→ 不拦，无论碰几个文件");
+  assert.equal(requiresPlan({ engineering: { requiresPlan: true, bug: true, debugProject: true, fullWebsite: true } }, { type: "write" }), false,
+    "bug 修复/排查永远不算大计划——哪怕其他信号命中也不拦");
+  assert.equal(requiresPlan({ engineering: { requiresPlan: true, fullWebsite: true } }, { type: "write" }), true,
+    "从零/完整建站是大计划工程 → 第一次落盘前必须有全貌路线图");
+  assert.equal(requiresPlan({ engineering: { requiresPlan: true, architecture: true, projectScope: true } }, { type: "write" }), true,
+    "架构级 + 全项目范围的重构是大计划工程 → 必须先列计划");
+  assert.equal(requiresPlan(complexRun, { type: "worker" }), true,
+    "run_worker 按角色拆分并行必然是大工程编排，必须先有工程全貌计划");
   assert.equal(requiresPlan({ ...complexRun, _planSteps: [{ content: "改 a.js", status: "pending" }] }, { type: "write" }), false,
     "once a plan exists the gate must stay out of the way");
   assert.match(requiredPlanIssue(complexRun, null), /尚未创建计划/,
@@ -6354,17 +6497,501 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.equal(craft("修复后端接口", { ui: false }), "");
   const ui = craft("写一个 SaaS 官网，配色排版布局要好看", { ui: true, uiProject: true });
   assert.match(ui, /前端设计工艺要求/);
-  assert.match(ui, /--background\/--foreground\/--card\/--muted\/--primary\/--accent\/--border\/--ring\/--radius/);
-  assert.match(ui, /主色只选 1 个色系 \+ 1 个强调色 \+ 中性色/);
+  assert.match(ui, /--background\/--foreground\/--card\/--card-foreground\/--muted\/--muted-foreground/);
+  assert.match(ui, /--primary\/--primary-foreground\/--secondary\/--secondary-foreground/);
+  assert.match(ui, /来源 section → 原色值\/色阶 → semantic role/);
+  assert.match(ui, /Tailwind 色阶/);
+  assert.match(ui, /用户未明确要求暗色时默认浅色\/中性实色/);
+  assert.match(ui, /用户未明确要求渐变时最多只允许 1-2 处/);
   assert.match(ui, /display\/heading\/body\/caption 四级/);
-  assert.match(ui, /mx-auto max-w-7xl px-4 sm:px-6 lg:px-8/);
+  assert.match(ui, /禁止默认 Hero\/Features\/Pricing\/CTA\/Footer/);
+  assert.match(ui, /knowledge_search/);
+  assert.match(ui, /数据库=不需要 \/ 本地持久化 \/ 服务端数据库/);
+  assert.match(ui, /至少 3 个可加载媒体资源/);
+  assert.match(ui, /真实头像图片/);
+  assert.match(ui, /bg-primary\/text-primary-foreground/);
+  assert.match(ui, /移动端必须降低位移/);
+  assert.match(ui, /标志性高级动效/);
+  assert.match(ui, /中性族 \+ 一个主强调族/);
+  assert.match(ui, /配色统一不等于删除颜色变成黑白线框/);
+  assert.match(ui, /5 张用 3\+2 居中/);
+  assert.match(ui, /真实重复卡片不能全是透明\/同色底加细 border 的线框/);
+  assert.match(ui, /AI 助手用 Bot\/Robot\/Cpu/);
+  assert.match(ui, /连接 2 个以上业务区块/);
   assert.match(ui, /shadcn\/ui \+ Radix primitives/);
+  assert.match(ui, /所有网站\/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据/);
   assert.match(ui, /hover\/focus-visible\/active\/disabled\/loading/);
-  assert.match(ui, /1440x900 和 390x844/);
+  assert.match(ui, /1440x900 (?:和|与) 390x844/);
+  const marketplace = craft("做二手商品交易平台", { ui: true, uiProject: true, transactionalProduct: true });
+  assert.match(marketplace, /交易产品硬约束/);
+  assert.match(marketplace, /禁止用 localStorage、假 JSON 或“无后端”替代/);
+  const greenfield = craft("创建社区论坛", { ui: true, uiProject: true, fromZeroUiProject: true });
+  assert.match(greenfield, /默认 React\/Vite \+ Tailwind \+ shadcn\/ui\/Radix/);
+  assert.match(greenfield, /禁止再次只生成一个通用 index\.html/);
   assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\) \? _uiDesignCraftBlock\(text, _uiTurnEngineering\) : ""/,
     "Agent send path must add the UI craft block to front-end turns");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "UI craft guidance must appear before the tool and experience hints");
+});
+
+test("full website readiness requires michael-design evidence and a real product architecture decision", () => {
+  const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
+  const designGaps = load("_michaelDesignResearchGaps");
+  const readiness = load("_uiImplementationReadinessIssue", {
+    _uiPlanHasCategoryArchitecture: hasCategoryArchitecture,
+    _michaelDesignResearchGaps: designGaps,
+  });
+  const run = {
+    engineering: {
+      uiProject: true,
+      fullWebsite: true,
+      designKnowledgeRequired: true,
+      richMediaRequired: true,
+      motionDesignRequired: true,
+      advancedMotionRequired: true,
+      paletteHarmonyRequired: true,
+      cardLayoutRequired: true,
+      cardStylingRequired: true,
+      semanticIconRequired: true,
+      motionChoreographyRequired: true,
+      databaseDecisionRequired: true,
+    },
+  };
+  const incomplete = [{ content: "写一个 Hero、Features、Pricing 和 Footer，然后构建" }];
+  assert.match(readiness(run, incomplete), /成功检索 michael-design/);
+  assert.match(readiness(run, incomplete), /真实产品内容来源/);
+  run._michaelDesignEvidence = {
+    query: "SaaS information architecture media motion palette",
+    sourceSections: ["Workflow Canvas"],
+    paletteTokens: ["#0D212C", "#F5F2EA", "#FF6B4A"],
+    motionTechniques: ["motion-scroll-transform"],
+    layoutTechniques: ["responsive-grid-breakpoints"],
+    componentTechniques: ["shadcn/ui", "Radix primitives", "class-variance-authority"],
+    researchQueries: ["saas architecture palette", "saas motion responsive", "saas assets icons"],
+    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
+  };
+  run._websiteContentEvidence = { sources: [{ kind: "workspace", path: "README.md" }] };
+  assert.match(readiness(run, incomplete), /至少 7 个差异化内容区块/);
+  assert.match(readiness(run, incomplete), /四层动效编排/);
+  const complete = [
+    { content: "按 SaaS 信息架构规划至少 7 个业务区块并写满具体栏目文案" },
+    { content: "使用 michael-design 的图片、视频 .mp4 与 GIF 媒体资产" },
+    { content: "组件落地映射：来源 Workflow Canvas section → shadcn/ui + Radix Button/Tabs primitives → default/secondary/outline variants → Tailwind bg-primary/text-primary-foreground semantic classes → 导航操作和案例筛选" },
+    { content: "采用 michael-design #0D212C 背景、#F5F2EA 正文、#FF6B4A primary；标题/正文/弱化文字按 foreground 层级区分；主按钮 primary/primary-foreground、重点卡片和标签使用 primary tint，次按钮 outline，并覆盖 hover/focus/active" },
+    { content: "配色契约采用 neutral 中性族 + orange 主强调族，不允许任何 section、图标或按钮新增陌生色相" },
+    { content: "卡片按实际数量编排：2/3/4 张等分，5 张 3+2 居中末行，6 张 3x2，7 张 4+3；动态 cards 使用 auto-fit/minmax；卡片 surface 用 card/muted 色阶、shadow elevation、重点卡 tint 和 hover variant" },
+    { content: "图标语义映射按对象/动作/状态选择：AI→Bot、订阅→Mail、安全→ShieldCheck，禁用万能 Sparkles" },
+    { content: "实现 hover 微交互与 SectionReveal 分区入场；知识库 useScroll + useTransform 连接 workflow/cases 两个 section，按 scroll progress 编排，移动端降级短位移并支持 prefers-reduced-motion" },
+    { content: "数据库 = 不需要：这是无提交与账户的静态展示官网" },
+  ];
+  assert.equal(readiness(run, complete), "");
+  const numberedArchitecture = [
+    { content: "首页内容编排：1. 世界观首屏 2. 战斗演示 3. 角色阵营 4. 武器工坊 5. 玩法循环 6. 媒体画廊 7. 制作人来信 8. 社区活动 9. 预约表单" },
+    ...complete.slice(1),
+    { content: "社区使用 Pexels 真人头像图片 URL，圆形 object-cover，加载失败时换本地备用头像图片" },
+  ];
+  assert.equal(readiness(run, numberedArchitecture), "", "a real numbered 1-9 architecture must not be rejected for omitting the literal phrase '至少 7 个'");
+  assert.equal(hasCategoryArchitecture("1. 首屏 2. 演示 3. 角色 4. 工坊 5. 玩法 6. 媒体"), false);
+  assert.match(SRC, /实施计划未就绪 · 未执行/);
+  assert.match(SRC, /按三轨编排检索/);
+  assert.match(SRC, /michael-design 主编排律/);
+  assert.match(SRC, /run\._michaelDesignEvidence =/);
+});
+
+test("UI readiness checklist nudge is disabled — visual writes are never intercepted", () => {
+  const visualPath = load("_uiVisualImplementationPath");
+  const applies = load("_uiReadinessAppliesToCall", { _uiVisualImplementationPath: visualPath });
+  const nudge = load("_uiImplementationReadinessNudge", { _uiReadinessAppliesToCall: applies });
+  const run = { engineering: { uiProject: true, fullWebsite: true, designKnowledgeRequired: true } };
+  const incompletePlan = [{ content: "搭建网站并实现页面" }];
+  const calls = [
+    { type: "web_scaffold", name: "site" },
+    { type: "write", path: "package.json" },
+    { type: "write", path: "src/App.tsx" },
+    { type: "write", path: "src/styles/theme.css" },
+    { type: "edit", path: "src/components/Hero.tsx" },
+  ];
+  for (const call of calls) assert.equal(nudge(run, incompletePlan, call), "", `${call.type}:${call.path || call.name} must proceed without checklist interception`);
+  assert.equal(run._uiReadinessNudged, undefined, "the disabled nudge must never mark the run");
+  assert.equal(applies({ type: "worker", scope: ["package.json", "vite.config.ts"] }), false);
+  assert.equal(applies({ type: "worker", scope: ["src/components"] }), true);
+  assert.match(SRC, /\[BLOCKED_ONCE\]/);
+  assert.doesNotMatch(SRC, /designReadinessBlocks/);
+});
+
+test("user-supplied reference sites must be learned and deliberately adapted before visual implementation", () => {
+  const key = load("_referenceWebsiteUrlKey");
+  const readiness = load("_uiImplementationReadinessIssue", {
+    _uiPlanHasCategoryArchitecture: load("_uiPlanHasCategoryArchitecture"),
+    _referenceWebsiteUrlKey: key,
+    _michaelDesignResearchGaps: load("_michaelDesignResearchGaps"),
+  });
+  const run = {
+    engineering: {
+      uiProject: true,
+      designKnowledgeRequired: true,
+      referenceWebsiteRequired: true,
+      referenceWebsiteUrls: ["https://www.linear.app/"],
+    },
+    _michaelDesignEvidence: {
+      sourceSections: ["Responsive product narrative"],
+      componentTechniques: ["shadcn/ui", "Radix primitives"],
+      researchQueries: ["product information architecture palette", "product responsive motion", "product media icons"],
+      researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
+    },
+  };
+  assert.match(readiness(run, [{ content: "开始实现页面" }]), /先读取用户指定参考站/);
+  run._referenceWebsiteEvidence = {
+    references: [{ key: "https://linear.app/", url: "https://www.linear.app/", methods: ["learn_design"] }],
+  };
+  assert.match(readiness(run, [{ content: "开始实现页面" }]), /参考站适配决策/);
+  const adapted = [{ content: "参考站 https://www.linear.app/ 的配色 palette token、信息架构与内容栏目作为取舍依据；结合 michael-design 的 Responsive product narrative section 转译为自己的响应式动效和移动端布局，不直接复制原站文案、资产或版式；组件映射为 shadcn/Radix Button primitive 的 default/outline variant 与 Tailwind bg-primary/text-primary-foreground semantic classes，落到导航和筛选操作。" }];
+  assert.equal(readiness(run, adapted), "");
+});
+
+test("successful michael-design hits unlock implementation even when the model omitted the domain argument", () => {
+  const motionTechniques = load("_designMotionTechniques");
+  const researchTracks = load("_michaelDesignResearchTracks", { _designMotionTechniques: motionTechniques });
+  const evidenceFromResult = load("_michaelDesignEvidenceFromResult", {
+    _toolExecutionSucceeded: (_call, result) => !/^\[(?:ERROR|失败|BLOCKED|DENIED)\]/.test(String(result?.content || "")),
+    _designMotionTechniques: motionTechniques,
+    _designLayoutTechniques: load("_designLayoutTechniques"),
+    _michaelDesignResearchTracks: researchTracks,
+  });
+  const call = { type: "knowledge", query: "anime mobile game information architecture", domain: "" };
+  const result = {
+    type: "knowledge",
+    knowledge: { hitCount: 6, domains: ["michael-design"] },
+    content: "专业知识库检索到 6 段最佳实践。【1｜michael-design/sites-saas-ai · Workflow Canvas】Information architecture follows a task-first user journey. Palette: #0D212C background, #F5F2EA foreground, #FF6B4A primary with emerald-500. Use shadcn/ui Radix primitives with class-variance-authority variants. Primary button and secondary button use 180ms hover. Motion uses useScroll + useTransform. Responsive cards use grid-cols-1 md:grid-cols-3. Avatar: https://images.example.com/author.jpg",
+  };
+  const evidence = evidenceFromResult(call, result);
+  assert.equal(evidence?.query, call.query);
+  assert.equal(evidence?.hitCount, 6);
+  assert.deepEqual(evidence?.domains, ["michael-design"]);
+  assert.deepEqual(evidence?.sourceSections, ["Workflow Canvas"]);
+  assert.deepEqual(evidence?.paletteTokens, ["#0D212C", "#F5F2EA", "#FF6B4A"]);
+  assert.deepEqual(evidence?.tailwindPaletteTokens, ["emerald-500"]);
+  assert.deepEqual(evidence?.mediaUrls, ["https://images.example.com/author.jpg"]);
+  assert.deepEqual(evidence?.motionTechniques, ["motion-scroll-transform"]);
+  assert.deepEqual(evidence?.layoutTechniques, ["responsive-grid-breakpoints"]);
+  assert.deepEqual(evidence?.componentTechniques, ["shadcn/ui", "Radix primitives", "class-variance-authority"]);
+  assert.deepEqual(evidence?.motionParameters, ["180ms"]);
+  assert.deepEqual(evidence?.researchQueries, [call.query]);
+  assert.equal(evidence?.researchTracks.informationArchitecture, true);
+  assert.equal(evidence?.researchTracks.colorSystem, true);
+  assert.equal(evidence?.researchTracks.componentSystem, true);
+  assert.equal(evidence?.researchTracks.signatureMotion, true);
+  assert.equal(evidence?.researchTracks.responsiveMotion, false, "responsive layout alone must not be mistaken for mobile motion choreography");
+  assert.equal(evidence?.visualSignals.buttons, true);
+  assert.equal(evidence?.visualSignals.avatars, true);
+  assert.ok(Number.isFinite(evidence?.at), "structured michael-design results are the evidence; the model repeating domain is not required");
+  const queryOnlyCoverage = researchTracks(
+    "information architecture palette responsive shadcn advanced motion mobile reduced-motion image semantic icon",
+    "The knowledge base returned a short note about typography only.",
+  );
+  assert.deepEqual(queryOnlyCoverage, {
+    informationArchitecture: false,
+    colorSystem: false,
+    responsiveLayout: false,
+    componentSystem: false,
+    signatureMotion: false,
+    responsiveMotion: false,
+    mediaAssets: false,
+    semanticIcons: false,
+  }, "search wording must never certify tracks absent from the returned knowledge content");
+  assert.equal(evidenceFromResult(call, { ...result, knowledge: { hitCount: 6, domains: ["ui-ux"] }, content: "普通 UI 知识库检索到 6 段" }), null);
+  assert.equal(evidenceFromResult(call, { ...result, knowledge: { hitCount: 0, domains: [] }, content: "知识库里没有相关内容" }), null);
+  assert.match(SRC, /_michaelDesignEvidenceFromResult\(call, result\)/);
+  assert.match(SRC, /_mergeMichaelDesignEvidence\(run\._michaelDesignEvidence, michaelDesignEvidence\)/);
+});
+
+test("michael-design evidence merges palette and media details across bounded searches", () => {
+  const merge = load("_mergeMichaelDesignEvidence");
+  const merged = merge(
+    { query: "palette", researchQueries: ["palette"], researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true }, hitCount: 4, domains: ["michael-design"], sourceSections: ["Palette A"], paletteTokens: ["#111111", "#eeeeee"], tailwindPaletteTokens: ["zinc-950"], mediaUrls: [], motionTechniques: [], layoutTechniques: ["auto-fit-minmax"], componentTechniques: ["shadcn/ui"], visualSignals: { typography: true, layout: true, components: true }, at: 1 },
+    { query: "avatar motion", researchQueries: ["avatar motion"], researchTracks: { signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true }, hitCount: 3, domains: ["michael-design"], sourceSections: ["Motion B"], paletteTokens: ["#eeeeee", "#e05e36"], tailwindPaletteTokens: ["emerald-500"], mediaUrls: ["https://example.com/avatar.jpg"], motionTechniques: ["gsap-scrolltrigger"], layoutTechniques: ["bento-spans"], componentTechniques: ["Radix primitives"], motionParameters: ["600ms"], visualSignals: { avatars: true, motion: true }, at: 2 },
+  );
+  assert.deepEqual(merged.sourceSections, ["Palette A", "Motion B"]);
+  assert.deepEqual(merged.paletteTokens, ["#111111", "#eeeeee", "#e05e36"]);
+  assert.deepEqual(merged.tailwindPaletteTokens, ["zinc-950", "emerald-500"]);
+  assert.deepEqual(merged.mediaUrls, ["https://example.com/avatar.jpg"]);
+  assert.deepEqual(merged.motionTechniques, ["gsap-scrolltrigger"]);
+  assert.deepEqual(merged.layoutTechniques, ["auto-fit-minmax", "bento-spans"]);
+  assert.deepEqual(merged.componentTechniques, ["shadcn/ui", "Radix primitives"]);
+  assert.deepEqual(merged.motionParameters, ["600ms"]);
+  assert.equal(merged.visualSignals.typography, true);
+  assert.equal(merged.visualSignals.avatars, true);
+  assert.match(merged.query, /palette \| avatar motion/);
+  assert.deepEqual(merged.researchQueries, ["palette", "avatar motion"]);
+  assert.equal(merged.researchTracks.signatureMotion, true);
+  assert.equal(merged.researchTracks.componentSystem, true);
+  assert.equal(merged.visualSignals.components, true);
+  const brief = load("_michaelDesignBrief", {
+    _michaelDesignCompositionRecipe: load("_michaelDesignCompositionRecipe"),
+  })(
+    [{ id: "architecture-color", purpose: "组件体系" }],
+    merged,
+    [],
+  );
+  assert.match(brief, /组件\/Tailwind 依据：shadcn\/ui、Radix primitives/);
+  assert.match(brief, /来源 section → shadcn\/Radix primitive 与 variant → Tailwind semantic token\/class/);
+});
+
+test("michael-design is preloaded from the server before an agent plans UI work", () => {
+  assert.match(SRC, /async function _runMichaelDesignPreflight\(/);
+  assert.match(SRC, /domain: "michael-design", query: plan\.query, topK: 6/);
+  assert.match(SRC, /await _searchKnowledgeBase\(call\)/);
+  assert.match(SRC, /run\._michaelDesignEvidence = _mergeMichaelDesignEvidence/);
+  assert.match(SRC, /run\._michaelDesignBrief = brief/);
+  assert.match(SRC, /await _runMichaelDesignPreflight\(\{ run, body, isLive: _live \}\)/);
+});
+
+test("knowledge retrieval uses the configured server endpoint and returns structured michael-design hits", async () => {
+  const calls = [];
+  const searchKnowledge = load("_searchKnowledgeBase", {
+    loadConfig: () => ({ baseUrl: "https://michael.example", apiKey: "test-key" }),
+    MICHAEL_API: "https://unused.example",
+    _fetchWithTimeout: async (url, options) => {
+      calls.push({ url, options });
+      return {
+        ok: true,
+        json: async () => ({ results: [{ domain: "michael-design", topic: "web", section: "Motion", text: "useScroll 500ms" }] }),
+      };
+    },
+  });
+  const result = await searchKnowledge({ type: "knowledge", domain: "michael-design", query: "responsive motion", topK: 4 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://michael.example/api/knowledge/search");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { query: "responsive motion", domain: "michael-design", top_k: 4 });
+  assert.deepEqual(result.knowledge, { hitCount: 1, domains: ["michael-design"] });
+  assert.match(result.content, /michael-design\/web · Motion/);
+});
+
+test("michael-design research is orchestrated by coverage instead of one generic UI search", () => {
+  const categoryTerms = load("_michaelDesignCategoryTerms");
+  const plan = load("_michaelDesignResearchPlan", { _michaelDesignCategoryTerms: categoryTerms });
+  const gaps = load("_michaelDesignResearchGaps");
+  const profile = {
+    designKnowledgeRequired: true,
+    fullWebsite: true,
+    motionDesignRequired: true,
+    advancedMotionRequired: true,
+    motionChoreographyRequired: true,
+    richMediaRequired: true,
+    semanticIconRequired: true,
+  };
+  const tracks = plan("为摄影工作室做一个内容丰富且响应式的网站", profile);
+  assert.deepEqual(tracks.map((item) => item.id), ["architecture-color", "motion-responsive", "assets-icons"]);
+  assert.match(tracks[0].query, /information architecture visual style color palette card layout responsive grid/);
+  assert.match(tracks[0].query, /photography gallery/, "category terms must survive the slimmed template so BM25 ranks the matching blueprint first");
+  assert.match(tracks[1].query, /signature motion choreography/);
+  assert.match(tracks[1].query, /reduced-motion/);
+  const novelTracks = plan("帮我开发一个小说网站", profile);
+  assert.match(novelTracks[0].query, /editorial library bookshelf reading chapter navigation/,
+    "novel sites need reading-specific retrieval terms instead of a generic commerce blueprint");
+  assert.match(novelTracks[2].query, /author profile/);
+  const partialUiTracks = plan("调整现有仪表盘布局", { uiProject: true, designKnowledgeRequired: true, fullWebsite: false });
+  assert.deepEqual(partialUiTracks.map((item) => item.id), ["architecture-color", "motion-responsive", "assets-icons"],
+    "every real UI project gets the same bounded three-track michael-design preflight");
+  assert.deepEqual(plan("修复后端接口", { uiProject: false, designKnowledgeRequired: false }), []);
+  const shallowEvidence = {
+    researchQueries: ["architecture palette"],
+    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true },
+  };
+  const shallowGaps = gaps(profile, shallowEvidence).join("\n");
+  assert.match(shallowGaps, /标志性动效/);
+  assert.match(shallowGaps, /移动端动效/);
+  assert.match(shallowGaps, /图片\/视频\/GIF/);
+  assert.match(shallowGaps, /语义图标/);
+  assert.match(shallowGaps, /shadcn\/ui、Radix/);
+  assert.match(shallowGaps, /三轨分主题检索/);
+  const completeEvidence = {
+    researchQueries: tracks.map((item) => item.query),
+    researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
+  };
+  assert.deepEqual(gaps(profile, completeEvidence), []);
+});
+
+test("website content evidence accepts actual product sources and rejects bare search results", () => {
+  const evidenceFromResult = load("_websiteContentEvidenceFromResult", {
+    _toolExecutionSucceeded: (_call, result) => !/^\[(?:ERROR|失败|BLOCKED|DENIED)\]/.test(String(result?.content || "")),
+  });
+  const merge = load("_mergeWebsiteContentEvidence");
+  const fetched = evidenceFromResult(
+    { type: "web", url: "https://example.com/about" },
+    { content: "Example's official product history, capabilities, team, customers, and support details are published here." },
+  );
+  assert.deepEqual(fetched?.sources?.map((item) => [item.kind, item.path]), [["primary-web", "https://example.com/about"]]);
+  const workspace = evidenceFromResult(
+    { type: "read", path: "docs/product-overview.md" },
+    { content: "# Product overview\n\nThis document explains the actual workflow, audience, and known limitations in the repository." },
+  );
+  assert.equal(workspace?.sources?.[0]?.kind, "workspace");
+  const wiki = evidenceFromResult(
+    { type: "subagent", _wiki: true, wikiDest: "PRODUCT_WIKI.md" },
+    { content: "# Product Wiki\n\nThe codebase implements account provisioning, project spaces, and audit events." },
+  );
+  assert.equal(wiki?.sources?.[0]?.kind, "product-wiki");
+  const brief = evidenceFromResult(
+    { type: "write", path: "docs/product-brief.md" },
+    { content: "# Original content brief\n\nAssumptions: this is original copy until the client confirms product facts." },
+  );
+  assert.equal(brief?.sources?.[0]?.kind, "assumption-brief");
+  assert.equal(evidenceFromResult({ type: "websearch", query: "best product website" }, { content: "1. A result\n2. Another result\n3. More titles" }), null);
+  const merged = merge(fetched, merge(workspace, wiki));
+  assert.equal(merged.sources.length, 3);
+  assert.match(SRC, /run\._websiteContentEvidence = _mergeWebsiteContentEvidence/);
+});
+
+test("reference website evidence only accepts the exact user URL and preserves palette and architecture signals", () => {
+  const key = load("_referenceWebsiteUrlKey");
+  const evidenceFromResult = load("_referenceWebsiteEvidenceFromResult", {
+    _toolExecutionSucceeded: (_call, result) => !/^\[(?:ERROR|失败|BLOCKED|DENIED)\]/.test(String(result?.content || "")),
+    _referenceWebsiteUrlKey: key,
+  });
+  const merge = load("_mergeReferenceWebsiteEvidence", { _referenceWebsiteUrlKey: key });
+  const profile = { referenceWebsiteRequired: true, referenceWebsiteUrls: ["https://www.linear.app/"] };
+  const fetched = evidenceFromResult(
+    { type: "web", url: "https://linear.app/" },
+    { content: "Linear navigation uses #5E6AD2 with neutral-950 and a dense workflow dashboard, sticky story, scroll reveal and responsive catalog sections." },
+    profile,
+  );
+  assert.deepEqual(fetched?.references?.[0]?.methods, ["web_fetch"]);
+  assert.equal(fetched?.references?.[0]?.key, "https://linear.app/");
+  assert.deepEqual(fetched?.references?.[0]?.paletteTokens, ["#5E6AD2"]);
+  assert.ok(fetched?.references?.[0]?.structureSignals.includes("dashboard"));
+  assert.equal(evidenceFromResult(
+    { type: "web", url: "https://example.com/" },
+    { content: "#123456 unrelated site with a navigation and a very long page body for testing evidence rejection." },
+    profile,
+  ), null);
+  const learned = evidenceFromResult(
+    { type: "learndesign", url: "https://www.linear.app/" },
+    { content: "Learned Linear #5E6AD2, #171717, primary text and editorial timeline responsive motion system." },
+    profile,
+  );
+  const merged = merge(fetched, learned);
+  assert.deepEqual(merged.references[0].methods, ["web_fetch", "learn_design"]);
+  assert.deepEqual(merged.references[0].paletteTokens, ["#5E6AD2", "#171717"]);
+  assert.match(SRC, /run\._referenceWebsiteEvidence = _mergeReferenceWebsiteEvidence/);
+});
+
+test("full website source audit keeps real-defect checks and drops quota checklists", () => {
+  const audit = load("_uiDeliverySourceFindings", {
+    _referenceWebsiteUrlKey: load("_referenceWebsiteUrlKey"),
+  });
+  const profile = { uiProject: true, fullWebsite: true, richMediaRequired: true, motionDesignRequired: true, advancedMotionRequired: true, motionChoreographyRequired: true };
+
+  // 配额检查表已删：稀疏静态模板不再被打回（结构/密度由服务端知识库驱动的提示词负责）
+  const sparse = `<main><section className="hero"><h1>AI</h1></section><section className="features" /></main>`;
+  const sparseFindings = audit(sparse, profile).join("\n");
+  for (const removed of ["内容结构不足", "真实媒体不足", "响应式实现不足", "动画层级不足", "语义配色不足", "文字颜色层级不足", "动画无降级", "高级动效缺失", "真实内容来源缺失", "从零网站技术栈未落地", "知识库组件体系未落地", "动效编排不完整"]) {
+    assert.doesNotMatch(sparseFindings, new RegExp(removed), `${removed} quota checklist must be removed`);
+  }
+
+  const rich = `
+    @import "tailwindcss";
+    @theme {
+      --color-background: #f7f7f5; --color-foreground: #17201c;
+      --color-primary: #c34f32; --color-primary-foreground: #ffffff;
+    }
+    <main className="grid bg-background text-foreground sm:grid-cols-2">
+      <section id="workflow"/><section id="faq"/>
+      <button className="bg-primary text-primary-foreground hover:opacity-90 focus-visible:ring-2 active:scale-95">Start</button>
+    </main>`;
+  assert.deepEqual(audit(rich, profile), []);
+
+  const freshReactProfile = { ...profile, fromZeroUiProject: true };
+  const handRolledReact = `${rich}
+    { "dependencies": { "react": "^19.0.0" } }
+    import React from "react";
+    export function App() { return <button>\u{1F680} Launch</button>; }`;
+  const handRolledFindings = audit(handRolledReact, freshReactProfile).join("\n");
+  assert.match(handRolledFindings, /shadcn\/ui 未实际落地/);
+  assert.match(handRolledFindings, /SVG 图标库缺失/);
+  assert.match(handRolledFindings, /emoji 被当作图标/);
+
+  const shadcnReact = `${rich}
+    { "dependencies": { "react": "^19.0.0", "class-variance-authority": "^0.7.0", "lucide-react": "^0.468.0" } }
+    import { Button } from "@/components/ui/button";
+    import { ArrowRight } from "lucide-react";
+    export function App() { return <Button><ArrowRight /> Start</Button>; }
+    /* FILE: src/components/ui/button.tsx */
+    import { cva } from "class-variance-authority";`;
+  assert.deepEqual(audit(shadcnReact, freshReactProfile), []);
+
+  // 保留的真缺陷检查：默认暗色 / 渐变滥用 / AI 套话 / Tailwind v4 级联 / 头像 / 图片失败态 / 通用骨架
+  const darkByDefault = rich.replace("--color-background: #f7f7f5", "--color-background: #070612");
+  assert.match(audit(darkByDefault, profile).join("\n"), /默认暗色滥用/);
+  assert.doesNotMatch(audit(darkByDefault, { ...profile, darkThemeRequested: true }).join("\n"), /默认暗色滥用/);
+
+  const gradientHeavy = `${rich} .g1{background:linear-gradient(red,blue)} .g2{background:radial-gradient(red,blue)} .g3{background:linear-gradient(red,blue)} .g4{background:conic-gradient(red,blue)}`;
+  assert.match(audit(gradientHeavy, profile).join("\n"), /渐变滥用/);
+  assert.doesNotMatch(audit(gradientHeavy, { ...profile, gradientThemeRequested: true }).join("\n"), /渐变滥用/);
+
+  const aiCopy = `${rich}<p>一站式平台，赋能每一个团队，开启无限可能。</p>`;
+  assert.match(audit(aiCopy, profile).join("\n"), /AI 套话过多/);
+
+  const collapsedTailwind = `${rich}
+    @import "tailwindcss";
+    * { margin: 0; padding: 0; box-sizing: border-box; }`;
+  assert.match(audit(collapsedTailwind, profile).join("\n"), /Tailwind v4 级联冲突/);
+  const layeredTailwind = `${rich}
+    @layer base { * { margin: 0; padding: 0; box-sizing: border-box; } }`;
+  assert.deepEqual(audit(layeredTailwind, profile), []);
+
+  const initialsOnly = `${rich}<section id="community"><span className="rounded-full bg-gradient-to-br">K</span><p>玩家社区成员</p></section>`;
+  assert.match(audit(initialsOnly, profile).join("\n"), /真实头像缺失/);
+  const realAvatar = `${initialsOnly} const members = [{ avatar: "https://images.example.com/player.jpg" }]; <AvatarImage src={members[0].avatar} />`;
+  assert.doesNotMatch(audit(realAvatar, profile).join("\n"), /真实头像缺失/);
+
+  const hiddenBrokenImage = `${rich}<img src="/fallback.jpg" onError={(event) => { event.currentTarget.style.display = "none"; }} />`;
+  assert.match(audit(hiddenBrokenImage, profile).join("\n"), /图片失败态错误/);
+
+  const genericSkeleton = `${rich}<div id="hero"/><div id="features"/><div id="pricing"/><div id="cta"/><div id="footer"/>`;
+  assert.match(audit(genericSkeleton, profile).join("\n"), /通用 AI 骨架/);
+
+  // 用户点名的参考站保护保留
+  const referenceProfile = { ...profile, referenceWebsiteRequired: true, referenceWebsiteUrls: ["https://www.linear.app/"] };
+  assert.match(audit(rich, referenceProfile).join("\n"), /参考站取证缺失/);
+  const referenceEvidence = { references: [{ key: "https://linear.app/", url: "https://www.linear.app/", methods: ["learn_design"], paletteTokens: ["#f7f7f5", "#c34f32"] }] };
+  assert.doesNotMatch(audit(rich, referenceProfile, null, null, referenceEvidence).join("\n"), /参考站(?:取证缺失|配色未转译)/);
+  const mismatchedReferenceEvidence = { references: [{ ...referenceEvidence.references[0], paletteTokens: ["#101827", "#2563eb"] }] };
+  assert.match(audit(rich, referenceProfile, null, null, mismatchedReferenceEvidence).join("\n"), /参考站配色未转译/);
+
+  assert.match(SRC, /UI 交付源码审计/);
+  assert.match(SRC, /uiDeliveryAuditRuns < 3/);
+});
+
+test("full website browser verification is blocked until the source audit passes", async () => {
+  const applies = load("_uiDeliveryBrowserAuditApplies");
+  let auditCalls = 0;
+  const blocked = load("_uiDeliveryBrowserPreflightIssue", {
+    _uiDeliveryBrowserAuditApplies: applies,
+    _auditUiDeliveryFiles: async () => {
+      auditCalls++;
+      return ["高级动效缺失", "shadcn/Tailwind 映射不完整"];
+    },
+  });
+  const profile = { uiProject: true, fullWebsite: true };
+  const issue = await blocked({ call: { type: "browser", action: "navigate" }, root: "/tmp/site", files: [], profile });
+  assert.match(issue, /^\[BLOCKED_UI_SOURCE_AUDIT\]/);
+  assert.match(issue, /高级动效缺失/);
+  assert.match(issue, /shadcn\/Tailwind 映射不完整/);
+  assert.equal(auditCalls, 1);
+  assert.equal(await blocked({ call: { type: "browser", action: "close" }, profile }), "");
+  assert.equal(await blocked({ call: { type: "browser", action: "navigate" }, profile: { uiProject: true, fullWebsite: false } }), "");
+  assert.equal(auditCalls, 1, "non-delivery browser calls must not run the source audit");
+
+  const passed = load("_uiDeliveryBrowserPreflightIssue", {
+    _uiDeliveryBrowserAuditApplies: applies,
+    _auditUiDeliveryFiles: async () => [],
+  });
+  assert.equal(await passed({ call: { type: "browser", action: "check" }, profile }), "");
+  const gateIndex = SRC.indexOf("const needsUiSourcePreflight");
+  const dispatchIndex = SRC.indexOf("let result;", gateIndex);
+  assert.ok(gateIndex > 0 && dispatchIndex > gateIndex,
+    "the michael-design source audit must run before browser dispatch can reach _executeToolStep");
 });
 
 test("front-end build tasks preload design choice tools with browser verification tools", () => {
@@ -6389,6 +7016,60 @@ test("front-end build tasks preload design choice tools with browser verificatio
   assert.ok(names.includes("visual_compare"));
   assert.ok(names.includes("search_tools"));
   assert.ok(!names.includes("db_query"));
+});
+
+test("reference-site UI tasks preload the exact-site learning tools before visual work", () => {
+  const schema = (name) => ({ type: "function", function: { name } });
+  const select = load("_selectInitialTools", {
+    activePath: "",
+    _TOOL_BUNDLES: {
+      browser: { tools: ["browser", "screenshot"] },
+      design: { tools: ["learn_design"] },
+      net: { tools: ["web_fetch"] },
+      db: { tools: ["db_query"] },
+    },
+    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "learn_design", "web_fetch", "db_query"]),
+    _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
+    _engineeringTaskProfile: () => ({ ui: true, uiProject: true, implementation: true, referenceWebsiteRequired: true }),
+    _buildAgentToolSchemas: () => ["browser", "screenshot", "learn_design", "web_fetch", "knowledge_search", "db_query", "read_file"].map(schema),
+  });
+  const names = select(true, "照着 https://linear.app 重做官网", []).map((tool) => tool.function.name);
+  assert.ok(names.includes("web_fetch"));
+  assert.ok(names.includes("learn_design"));
+  assert.ok(names.includes("knowledge_search"));
+});
+
+test("front-end bug tasks keep browser automation deferred until diagnostics and logs are read", () => {
+  const schema = (name) => ({ type: "function", function: { name } });
+  const select = load("_selectInitialTools", {
+    activePath: "src/pages/dashboard.tsx",
+    _TOOL_BUNDLES: {
+      browser: { tools: ["browser", "screenshot"] },
+      design: { tools: ["design_board", "preview_choices", "visual_compare"] },
+      db: { tools: ["db_query"] },
+    },
+    _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
+    _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
+    _engineeringTaskProfile: () => ({
+      bug: true,
+      debugProject: true,
+      ui: true,
+      uiProject: true,
+      implementation: true,
+      browserAutomation: true,
+      capture: true,
+      backendApi: true,
+      database: true,
+    }),
+    _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "http_request", "read_file"].map(schema),
+  });
+  const names = select(true, "网页按钮点不动，先修 bug", []).map((tool) => tool.function.name);
+  assert.ok(names.includes("http_request"));
+  assert.ok(names.includes("db_query"));
+  assert.ok(!names.includes("browser"));
+  assert.ok(!names.includes("screenshot"));
+  assert.ok(!names.includes("design_board"));
+  assert.ok(!names.includes("preview_choices"));
 });
 
 test("database-oriented tasks preload db_query without forcing browser tools", () => {
@@ -6486,6 +7167,8 @@ test("profile-driven tool orchestration covers live IDE, backend, database, and 
   assert.ok(fullStackBug.includes("http_request"), "API evidence should be available for backend bugs");
   assert.ok(fullStackBug.includes("db_query"), "DB evidence should be available when the bug scope includes database clues");
   assert.ok(fullStackBug.includes("read_file"), "code evidence remains part of the same evidence ladder");
+  assert.ok(!fullStackBug.includes("browser"), "browser automation must remain deferred while a bug is being diagnosed");
+  assert.ok(!fullStackBug.includes("screenshot"), "screenshots must not displace diagnostic evidence for a bug");
 
   const db = priorities("设计数据落库和迁移", {
     applies: true,
@@ -6593,6 +7276,10 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
   assert.match(text, /list_terminals\/read_terminal\/read_logs/);
   assert.match(text, /http_request/);
   assert.match(text, /db_query/);
+  assert.match(text, /browser check/);
+  assert.match(text, /网页\/Web 问题走终端\/服务日志/);
+  assert.match(text, /桌面\/原生 App 问题走 IDE 诊断/);
+  assert.match(text, /后端\/CLI 问题走 stderr\/exit code/);
   assert.match(text, /浏览器自动化失败两次/);
   assert.match(text, /针对性复验/);
 
@@ -6624,7 +7311,8 @@ test("tool hint starts from profile priorities before lexical keyword fallback",
   assert.match(hint, /read_logs \/ read_terminal \/ list_terminals \/ stop_terminal/);
   assert.match(hint, /http_request/);
   assert.match(SRC, /const profileRel = _profileToolPriorities\(text, profile, 8\)/);
-  assert.match(SRC, /const rel = _mergeToolPriorityLists\(profileRel, semantic, lexical\)\.slice\(0, 8\)/);
+  assert.match(SRC, /const merged = _mergeToolPriorityLists\(profileRel, semantic, lexical\)/);
+  assert.match(SRC, /profile\.bug \|\| profile\.debugProject/);
 });
 
 test("profile-based initial tool preload exposes capture, backend API, and package tools without regex gates", () => {
@@ -6640,6 +7328,7 @@ test("profile-based initial tool preload exposes capture, backend API, and packa
     _DEFERRED_TOOL_NAMES: new Set([
       "browser", "screenshot", "capture_start", "capture_flows", "capture_stop", "capture_replay",
       "http_request", "package_search", "github_repo", "developer_community_search",
+      "generate_wiki", "web_search", "web_fetch",
       "design_board", "preview_choices", "visual_compare", "db_query",
       "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
     ]),
@@ -6649,11 +7338,13 @@ test("profile-based initial tool preload exposes capture, backend API, and packa
       if (/依赖|版本/.test(text)) return { packageVersion: true };
       if (/数据库/.test(text)) return { bug: true, debugProject: true, backendApi: true, database: true, databaseQuery: true };
       if (/后端|API/.test(text)) return { backendApi: true };
+      if (/网站/.test(text)) return { fullWebsite: true };
       return {};
     },
     _buildAgentToolSchemas: () => [
       "read_file", "browser", "screenshot", "capture_start", "capture_flows", "capture_stop",
       "capture_replay", "http_request", "package_search", "github_repo", "developer_community_search", "db_query",
+      "generate_wiki", "web_search", "web_fetch", "knowledge_search",
     ].map(schema),
   });
 
@@ -6676,6 +7367,12 @@ test("profile-based initial tool preload exposes capture, backend API, and packa
   assert.ok(packageNames.includes("package_search"));
   assert.ok(packageNames.includes("github_repo"));
   assert.ok(packageNames.includes("search_tools"));
+
+  const websiteNames = select(true, "做一个完整网站", []).map((tool) => tool.function.name);
+  assert.ok(websiteNames.includes("generate_wiki"));
+  assert.ok(websiteNames.includes("web_search"));
+  assert.ok(websiteNames.includes("web_fetch"));
+  assert.ok(websiteNames.includes("knowledge_search"));
 });
 
 test("bounded original requirements survive conversational Chinese and reconcile exactly once", () => {
@@ -6928,6 +7625,7 @@ test("slow community references cannot erase stable local engineering context", 
     _bm25Index: { root: "", built: false },
     _estimateTokens: (text) => text.length / 4,
     _memoryBlocks: () => "",
+    _projectJournalBlock: () => "",
   });
 
   const slow = await contextFor(async () => new Promise(() => {}))("ROOT_AND_STACK", "fix api", "/repo", 5);
@@ -7155,13 +7853,38 @@ test("strict verification uses process exit status, including timeout", async ()
   assert.equal(timed.ok, false);
   assert.equal(timed.timedOut, true);
   assert.equal(timed.code, -1);
-  assert.deepEqual(timeoutOptions, { timeoutSecs: 90 });
+  assert.deepEqual(timeoutOptions, { timeoutSecs: 60 });
 
   const snakeCaseTimeout = load("_interleavedTest", {
     inTauri: true,
     backend: { taskRunCapture: async () => ({ code: -1, stdout: "", stderr: "timed out", timed_out: true }) },
   });
   assert.equal((await snakeCaseTimeout("/repo", "build")).timedOut, true);
+});
+
+test("long chat transcripts stay bounded and load earlier messages in pages", () => {
+  assert.match(SRC, /const _RENDER_LIMIT = 56/);
+  assert.match(SRC, /const _RENDER_PAGE = 32/);
+  assert.match(SRC, /function _snapshotIsSafeToRestore\(html\)/);
+  assert.match(SRC, /if \(!_snapshotIsSafeToRestore\(html\)\) return ""/);
+  assert.match(SRC, /Load \$\{Math\.min\(_RENDER_PAGE, start\)\} earlier/);
+  assert.match(SRC, /_renderMsgRange\(session, nextStart, visibleStart, \{ before: firstMessage, skipPrune: true, skipFollow: true \}\)/);
+  assert.doesNotMatch(SRC, /while \(session\.container\.firstChild\)[\s\S]{0,180}_renderMsgRange\(session, 0, h\.length\)/,
+    "opening earlier history must not synchronously rebuild the full transcript");
+  assert.match(SRC, /const _CHAT_FOLLOW_DELAY_MS = 48/);
+  assert.match(SRC, /_chatFollowTimer = setTimeout\(/,
+    "streaming updates should coalesce their layout-affecting scroll write");
+});
+
+test("automatic verification converges instead of repeating per edit batch", () => {
+  assert.match(SRC, /const _AGENT_MAX_VERIFY = 2/);
+  assert.match(SRC, /const _AGENT_HARD_CEIL = 64/);
+  assert.match(SRC, /const _AGENT_MAX_EXTENSIONS = 2/);
+  assert.match(SRC, /timeoutSecs: 60/);
+  assert.doesNotMatch(SRC, /run\.stack\?\.checkCmd && _checkPending\.size >= 2/,
+    "expensive compile checks belong to the finish gate, not each edit batch");
+  assert.doesNotMatch(SRC, /run\.stack\?\.testCmd && _pending\.size >= 3/,
+    "tests must not be repeatedly restarted as a task edits files");
 });
 
 test("automatic verification runs directly without the old permission gate", async () => {
@@ -7228,8 +7951,9 @@ test("external source tools stay real but load on demand", () => {
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "knowledge_search", "local_discovery", "search_tools"]);
+  assert.deepEqual(names, ["read_file", "knowledge_search", "search_tools"]);
   assert.ok(names.includes("knowledge_search"), "the internal knowledge base stays first-turn capable");
+  assert.ok(!names.includes("local_discovery"), "domain tools load only when the task profile requests them");
   assert.ok(!names.includes("web_search"), "public web search requires a concrete evidence gap");
   assert.ok(!names.includes("developer_community_search"), "community search is not a first-turn reflex");
   assert.match(SRC, /resources:\s*\{ tools:/);
@@ -7253,6 +7977,50 @@ test("search_tools exact names cannot fall through to localhost descriptions", (
     "an unavailable compound tool name must not be split into loose fuzzy terms");
   assert.match(SRC, /工具 \$\{exact\.name\} 已在当前工具列表中，请直接调用/);
   assert.match(SRC, /当前注册表没有名为 \$\{exact\.name\} 的工具/);
+});
+
+test("large MCP catalogs stay out of the first turn but remain exactly loadable", () => {
+  const schema = (name, description = "") => ({ type: "function", function: { name, description } });
+  const mcp = Array.from({ length: 36 }, (_, index) => schema(`mcp__server__tool_${index}`, `MCP capability ${index}`));
+  const staticTools = ["read_file", "search", "knowledge_search", "browser"].map((name) => schema(name));
+  const select = load("_selectInitialTools", {
+    activePath: "",
+    _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
+    _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
+    _engineeringTaskProfile: () => ({}),
+    _buildAgentToolSchemas: () => [...staticTools, ...mcp],
+  });
+  const initial = select(true, "inspect this project", mcp, "agent");
+  const initialNames = initial.map((tool) => tool.function.name);
+  assert.deepEqual(initialNames, ["read_file", "search", "knowledge_search", "search_tools"]);
+  assert.equal(initialNames.some((name) => name.startsWith("mcp__")), false);
+
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  const registry = new Map([...staticTools, ...mcp].map((tool) => [tool.function.name, tool]));
+  assert.deepEqual(lookup("mcp__server__tool_35", registry, new Set()), [mcp[35]]);
+});
+
+test("read-only roles receive distinct first-turn tool contracts", () => {
+  const schema = (name) => ({ type: "function", function: { name } });
+  const catalog = [
+    "read_file", "search", "update_plan", "get_diagnostics", "git_diff", "run_cmd", "browser",
+  ].map(schema);
+  const select = load("_selectInitialTools", {
+    activePath: "",
+    _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
+    _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
+    _engineeringTaskProfile: () => ({ ui: true }),
+    _buildAgentToolSchemas: () => catalog,
+  });
+  const namesFor = (mode) => select(false, "inspect the UI", [], mode).map((tool) => tool.function.name);
+  assert.deepEqual(namesFor("plan"), ["read_file", "search", "update_plan", "search_tools"]);
+  assert.deepEqual(namesFor("explorer"), ["read_file", "search", "search_tools"]);
+  assert.deepEqual(namesFor("reviewer"), ["read_file", "search", "get_diagnostics", "git_diff", "search_tools"]);
+  for (const mode of ["plan", "explorer", "reviewer"]) {
+    assert.ok(!namesFor(mode).includes("run_cmd"), `${mode} must remain read-only`);
+    assert.ok(!namesFor(mode).includes("browser"), `${mode} must not inherit Agent UI orchestration`);
+  }
 });
 
 test("search_tools keeps fuzzy matching for natural-language capability queries", () => {
@@ -7797,6 +8565,22 @@ test("Tauri search invokes use camelCase command arguments", () => {
   assert.match(SRC, /backend\.invoke\(call\.type, _args\)/);
 });
 
+test("Tauri Channel cleanup keeps late native events callable", () => {
+  const sink = () => {};
+  const release = load("_releaseTauriChannel", { _TAURI_CHANNEL_SINK: sink });
+  const channel = { onmessage: () => { throw new Error("stale capture"); } };
+  release(channel);
+  assert.equal(channel.onmessage, sink);
+  assert.doesNotThrow(() => channel.onmessage.call(channel, { kind: "late" }));
+  assert.doesNotThrow(() => release(null));
+  assert.doesNotMatch(SRC, /\.onmessage\s*=\s*null/,
+    "Tauri's dispatcher calls onmessage.call for queued events, so callbacks must never be nulled");
+  assert.match(SRC, /const _free = \(\) => _releaseTauriChannel\(channel\);/,
+    "AI stream cleanup must use the same late-event-safe release path");
+  assert.match(SRC, /panel\.channel = null;\s*_releaseTauriChannel\(channel\);[\s\S]{0,180}backend\.termClose/,
+    "SSH cleanup must detach the callback before stopping its PTY");
+});
+
 test("UI verification accepts only the required viewports and real visible assertions", () => {
   const viewport = load("_requiredUiViewportKind");
   assert.equal(viewport({ type: "browser", action: "viewport", width: 1440, height: 900, mobile: false }), "desktop");
@@ -8293,6 +9077,36 @@ test("ordered tool segments preserve mutation barriers while parallelizing only 
     "writable CTEs must not enter a parallel read segment");
   assert.equal(parallel({ type: "db", driver: "redis", query: "GET key" }), true);
   assert.equal(parallel({ type: "db", driver: "redis", query: "SET key value" }), false);
+});
+
+test("adjacent run_worker calls execute as a parallel segment, still barriered from reads", async () => {
+  const schedule = load("_runOrderedToolSegments");
+  const events = [];
+  let activeWorkers = 0;
+  let maxWorkers = 0;
+  const items = [
+    { kind: "read" }, { kind: "read" },
+    { kind: "worker" }, { kind: "worker" }, { kind: "worker" },
+    { kind: "read" },
+  ];
+  await schedule(
+    items,
+    (item) => (item.kind === "read" ? "read" : item.kind === "worker" ? "worker" : ""),
+    async (item, index) => {
+      if (item.kind === "worker") {
+        activeWorkers++;
+        maxWorkers = Math.max(maxWorkers, activeWorkers);
+        await new Promise((resolve) => setImmediate(resolve));
+        events.push(`worker${index}`);
+        activeWorkers--;
+        return;
+      }
+      events.push(`read${index}`);
+    },
+  );
+  assert.equal(maxWorkers, 3, "同轮相邻的 worker 必须真并行（此前被当硬屏障串行跑）");
+  assert.ok(events.indexOf("read1") < events.indexOf("worker2"), "读段先于 worker 段");
+  assert.ok(events.indexOf("worker4") < events.indexOf("read5"), "worker 段完成后才轮到后续读");
 });
 
 test("an edit merged into item zero never gets its own card or staging work", () => {
@@ -8823,7 +9637,8 @@ test("substantial worker tasks process parent plans first and count only real wr
   const workerStart = SRC.indexOf("const report = await _runSubAgent", planFirst);
   assert.ok(planFirst >= 0 && workerStart > planFirst);
   assert.match(SRC, /workerMutated = false/);
-  assert.match(SRC, /onMutation: \(\) => \{ workerMutated = true; \}/);
+  assert.match(SRC, /onMutation: \(path\) => \{\s*workerMutated = true;/);
+  assert.match(SRC, /it\._workerMutationPaths\.push\(path\)/);
   // 复杂工程任务里，写入型 worker 启动前需要先有任务计划（有界：最多拦 2 次）。
   assert.match(SRC, /const planIssue = isWorker && _runNeedsPlanGateNow\(run, \{ type: "write" \}\) && planGateNudges < 2/);
   assert.match(SRC, /先列计划 · 未执行/);
@@ -8951,7 +9766,7 @@ test("MCP read-only annotations survive discovery and mapping", () => {
   assert.match(SRC, /mcpRoot: m\?\.root \|\| ""/);
   assert.match(SRC, /call\.mcpRoot !== root \|\| _mcpLoadedRoot !== root/);
   assert.match(SRC, /function _buildAgentToolSchemas\(includeWrite, mcpTools = \[\]\)/);
-  assert.match(SRC, /_selectInitialTools\(isAgent, run\._originalText, run\.mcpToolCache\)/);
+  assert.match(SRC, /_selectInitialTools\(isAgent, run\._originalText, run\.mcpToolCache, run\.mode\)/);
   assert.doesNotMatch(SRC, /function _buildAgentToolSchemas\([^)]*\)[\s\S]*?if \(_mcpToolCache\.length\) tools\.push/);
 });
 
@@ -9148,11 +9963,15 @@ test("stopped-run continuations route back to the full agent path", () => {
   // 全新会话没有任务可继续：这些词仍算轻量寒暄
   assert.equal(light("继续", {}, "/repo", "", false, false), true);
   assert.equal(light("好的", {}, "/repo", "", false, false), true);
-  // 纯感谢/寒暄/能力问题/通用知识问答：永远轻量（即使有任务上下文）
-  assert.equal(light("谢谢", {}, "/repo", "", false, true), true);
-  assert.equal(light("你好啊", {}, "/repo", "", false, true), true);
-  assert.equal(light("你能做什么？", {}, "/repo", "", false, true), true);
-  assert.equal(light("什么是闭包？", {}, "/repo", "", false, true), true);
+  // 有历史轮次 → 确定性一律全量路径（不做关键词猜测）：寒暄/致谢也走全量，
+  // 多花点 token 换确定不丢上下文；轻量路径只留给会话第一条消息。
+  assert.equal(light("谢谢", {}, "/repo", "", false, true), false);
+  assert.equal(light("你好啊", {}, "/repo", "", false, true), false);
+  assert.equal(light("你能做什么？", {}, "/repo", "", false, true), false);
+  assert.equal(light("什么是闭包？", {}, "/repo", "", false, true), false);
+  // 会话第一条的纯闲聊仍走轻量
+  assert.equal(light("你好啊", {}, "/repo", "", false, false), true);
+  assert.equal(light("你能做什么？", {}, "/repo", "", false, false), true);
   // 陈述式反驳/催促（"现在就是啊"）默认按任务处理，不再落进闲聊
   assert.equal(light("现在就是啊", {}, "/repo", "", false, true), false);
   // caller 必须把"会话是否已有任务上下文"传进分类器
@@ -9449,23 +10268,90 @@ test("UI re-verification is incremental: full viewport matrix runs once per run"
   assert.match(SRC, /这套矩阵\*\*本任务只做这一遍\*\*/);
 });
 
-test("reply stats footer: elapsed formatting + per-model cost + both chat paths append it", () => {
+test("reply stats footer uses exact server settlements on both chat paths", () => {
   const fmt = load("_fmtElapsed");
   assert.equal(fmt(420), "420ms");
   assert.equal(fmt(3_400), "3.4s");
   assert.equal(fmt(42_000), "42s");
   assert.equal(fmt(95_000), "1m35s");
-  const cost = load("_turnCostCents", {
-    _modelCatalogEntry: (id) => (id === "m1" ? { inPrice: 3, outPrice: 15, flatPrice: 0 } : id === "free" ? { inPrice: 0, outPrice: 0, flatPrice: 0 } : null),
+  const creditValue = load("_creditUsdValue", { _MICHAEL_RAW_CENTS_PER_CREDIT_USD: 663 });
+  const usd = load("_dispUsd", { _creditUsdValue: creditValue });
+  assert.equal(creditValue(663), 1, "$6.63 of raw billing is exactly $1.00 of user credit");
+  assert.equal(usd(663), "$1.00");
+  assert.equal(usd(23), "$0.03", "the screenshot's 23 raw cents uses the 6.63:1 denomination");
+  const addSettlement = load("_addRunSettlement");
+  const liveSettlement = load("_liveRunSettlement");
+  const finalSettlement = load("_finalRunSettlement", { _liveRunSettlement: liveSettlement });
+  const runUsage = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
+  assert.equal(liveSettlement(runUsage), null, "running stats start with elapsed time only");
+  addSettlement(runUsage, { costCents: 7, usageReported: true, promptTokens: 1234, completionTokens: 56, cachedTokens: 2000, cacheCreationTokens: 44739 });
+  assert.deepEqual(liveSettlement(runUsage), {
+    costCents: 7,
+    usageReported: true,
+    promptTokens: 1234,
+    completionTokens: 56,
+    cachedTokens: 2000,
+    cacheCreationTokens: 44739,
+    settledTurns: 1,
+    reportedTurns: 1,
+    tokenUnreportedTurns: 0,
   });
-  // 1M in @$3 + 1M out @$15 = $18 = 1800 cents
-  assert.equal(cost("m1", 1_000_000, 1_000_000), 1800);
-  assert.equal(cost("free", 1000, 1000), null, "模型未配价格时不显示金额");
-  assert.equal(cost("unknown", 1000, 1000), null);
+  addSettlement(runUsage, { costCents: 3, usageReported: false, promptTokens: null, completionTokens: null, attemptCount: 2 });
+  const partial = liveSettlement(runUsage);
+  assert.equal(partial.costCents, 10, "live cost accumulates every real server charge");
+  assert.equal(partial.promptTokens, 1234, "reported tokens remain visible without estimating the missing usage");
+  assert.equal(partial.completionTokens, 56);
+  assert.equal(partial.cachedTokens, 2000);
+  assert.equal(partial.cacheCreationTokens, 44739);
+  assert.equal(partial.settledTurns, 3, "server aggregate attempt_count is preserved");
+  assert.equal(partial.tokenUnreportedTurns, 2);
+  assert.deepEqual(finalSettlement(runUsage), partial, "final footer preserves the same settled totals");
+  addSettlement(runUsage, null);
+  assert.equal(finalSettlement(runUsage), null, "final completeness gate still rejects a missing settlement");
+  assert.equal(liveSettlement(runUsage).costCents, 10, "a missing settlement never invents additional cost");
+  const statsFnSource = SRC.slice(SRC.indexOf("function _turnStatsText"), SRC.indexOf("function _turnStatsTitle"));
+  const tokenExact = load("_tokenExact");
+  assert.equal(tokenExact(44739), "44,739", "the detailed tooltip keeps exact settlement counts");
+  const statsText = new Function("_fmtElapsed", "_tokenShort", "_dispUsd", `${statsFnSource}; return _turnStatsText;`)(
+    fmt,
+    (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n),
+    usd,
+  );
+  assert.doesNotMatch(statsText({ elapsedMs: 1200 }).html, /token|\$/i);
+  const liveHtml = statsText({ elapsedMs: 1200, settlement: partial }).html;
+  const liveText = liveHtml.replace(/<[^>]+>/g, "");
+  assert.match(liveHtml, /1\.2k\/56/);
+  assert.doesNotMatch(liveText, /In|Out|Cache|read|write|unreported/i);
+  assert.match(liveHtml, /\$0\.02/);
+  assert.doesNotMatch(liveHtml, /估算/);
+  const statsSource = SRC.slice(SRC.indexOf("function _turnStatsText"), SRC.indexOf("function _liveTurnStats"));
+  assert.match(statsSource, /settlement\.usageReported/);
+  assert.match(statsSource, /Usage unavailable/);
+  assert.match(statsSource, /_dispUsd\(settlement\.costCents\)/);
+  assert.match(statsSource, /663 raw cents = \$1\.00 credit/);
+  assert.match(statsSource, /includes model, cache, and route pricing/);
+  assert.match(SRC, /const _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;/);
+  assert.doesNotMatch(SRC, /credits_cents \/ 100|total_spent_cents \/ 100|cost_cents \/ 100/,
+    "all user-facing balance and usage money must use the shared 6.63:1 denomination");
   // Both the plain-chat finalizer and the agent-run finalizer must append the footer.
   assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - _plainStreamDiag\.attemptStartedAt/);
   assert.match(SRC, /_appendTurnStatsFooter\(body, \{\s*\n\s*elapsedMs: Date\.now\(\) - run\._recStart/);
-  // Per-run usage accumulates every turn (even ones the loop skips via continue/break).
-  assert.match(SRC, /session\._runUsage = \{ in: 0, out: 0, est: false \}/);
-  assert.match(SRC, /ru\.in \+= _u\.prompt_tokens \|\| 0; ru\.out \+= _u\.completion_tokens \|\| 0/);
+  assert.match(SRC, /session\._runUsage = \{ in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0, turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true \}/);
+  assert.match(SRC, /getSettlement: \(\) => _liveRunSettlement\(session\._runUsage\)/);
+  assert.match(SRC, /if \(session\._liveRunStats\) session\._liveRunStats\.refresh\(\)/);
+  assert.match(SRC, /settlement: _finalRunSettlement\(_ru\)/);
+  assert.match(SRC, /await _awaitBillableAiTasks\(run\._reqId\)/);
+  assert.match(SRC, /const _scopeSettlement = await _fetchGatewaySettlement\(config, run\._reqId\)/);
+  assert.match(SRC, /if \(_scopeSettlement\) _addRunSettlement\(_ru, _scopeSettlement\)/);
+  assert.equal((SRC.match(/backend\.aiComplete\(/g) || []).length, 1,
+    "all non-streaming model calls must pass through the one request-ID billing tracker");
+  assert.match(TAURI_AI, /with_ide_headers\(client\.post\(&url\)\.bearer_auth\(&config\.api_key\), &config\)/,
+    "desktop non-streaming completions must relay the settlement request ID");
+  assert.equal((SRC.match(/backend\.invoke\("generate_image_chat", \{[^\n]+requestId:/g) || []).length, 3,
+    "direct and Agent image generation must join the visible turn settlement");
+  assert.match(TAURI_NET, /with_ide_request_id\(client\.post\(&url\)\.bearer_auth\(api_key\.trim\(\)\), request_id\)/,
+    "native image endpoints must relay their settlement request ID");
+  assert.match(SRC, /"x-ide-request-id"/);
+  assert.match(SRC, /\/api\/usage\/settlement\/\$\{encodeURIComponent\(id\)\}/);
+  assert.doesNotMatch(SRC, /_MICHAEL_DISP_MULT/);
 });

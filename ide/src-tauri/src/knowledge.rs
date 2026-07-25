@@ -1637,6 +1637,7 @@ fn format_hosted_repo_tree(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_hosted_repo_file(
     provider: &str,
     repo_name: &str,
@@ -1994,11 +1995,10 @@ pub async fn gitlab_repo(
             } else {
                 ("issues", "issues")
             };
-            let state = if action == "pulls" { "opened" } else { "opened" };
             let url = gitlab_project_url(
                 &owner,
                 &repo,
-                &format!("{endpoint}?state={state}&per_page={limit}"),
+                &format!("{endpoint}?state=opened&per_page={limit}"),
             );
             let json = gitlab_get_json(&c, &url).await?;
             Ok(format_hosted_repo_items(

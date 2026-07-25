@@ -358,7 +358,7 @@ async fn elastic_query(url: &str, q: &str) -> Result<serde_json::Value, String> 
     let (path, body) = if method == "POST" && rest.starts_with('{') {
         ("/_search", rest)
     } else {
-        match rest.find(|c: char| c == '{') {
+        match rest.find('{') {
             Some(i) => (rest[..i].trim(), rest[i..].trim()),
             None => (rest, ""),
         }

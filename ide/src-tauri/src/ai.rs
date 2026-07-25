@@ -34,6 +34,8 @@ const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
 const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_READ_POLL: Duration = Duration::from_secs(2);
 const INCOMPLETE_SSE_STREAM_ERROR: &str = "AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断，已拒绝本轮结果，请重试。";
+const PRE_STREAM_GATEWAY_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(600), Duration::from_millis(1200)];
 
 /// Shared HTTP client. The agentic loop fires many sequential requests; a single
 /// pooled client reuses TCP+TLS connections (keep-alive) instead of doing a fresh
@@ -222,13 +224,14 @@ pub async fn ai_complete(
     });
 
     let client = &*HTTP;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&config.api_key)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let completion_timeout = StreamTimeouts::for_config(&config)
+        .response_headers
+        .max(Duration::from_secs(45));
+    let resp = send_with_response_headers_timeout(
+        with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config).json(&payload),
+        completion_timeout,
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -236,7 +239,10 @@ pub async fn ai_complete(
         return Err(format_ai_http_error(status, &text));
     }
 
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let v: serde_json::Value = tokio::time::timeout(Duration::from_secs(10), resp.json())
+        .await
+        .map_err(|_| "AI completion timed out reading the response body".to_string())?
+        .map_err(|e| e.to_string())?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")
@@ -319,6 +325,16 @@ fn format_ai_http_error(status: reqwest::StatusCode, body: &str) -> String {
     )
 }
 
+fn is_retryable_gateway_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 /// Normalize an OpenAI-compatible chat endpoint. Users usually paste a base URL
 /// such as `https://api.openai.com/v1`, but many paste the provider root
 /// (`https://api.openai.com`) or a full `/chat/completions` URL. Accept all three
@@ -345,6 +361,14 @@ fn chat_completions_url(base_url: &str) -> Result<String, String> {
 /// returned untouched so the request is byte-for-byte identical to before.
 fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::RequestBuilder {
     let mut rb = rb;
+    if let Some(request_id) = config.request_id.as_deref().filter(|value| {
+        (8..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        rb = rb.header("x-ide-request-id", request_id);
+    }
     if let Some(m) = config.ide_mode.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-mode", m);
     }
@@ -367,6 +391,30 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
         rb = rb.header("x-ide-utc-offset-minutes", offset.to_string());
     }
     rb
+}
+
+/// Retries only before an SSE response is accepted. Once the stream is open,
+/// the caller never replays it because a model/tool delta may already exist.
+async fn post_chat_with_gateway_retry(
+    client: &reqwest::Client,
+    url: &str,
+    config: &AiConfig,
+    payload: &serde_json::Value,
+    response_headers_timeout: Duration,
+    retry_delays: &[Duration],
+) -> Result<reqwest::Response, String> {
+    for attempt in 0..=retry_delays.len() {
+        let response = send_with_response_headers_timeout(
+            with_ide_headers(client.post(url).bearer_auth(&config.api_key), config).json(payload),
+            response_headers_timeout,
+        )
+        .await?;
+        if !is_retryable_gateway_status(response.status()) || attempt == retry_delays.len() {
+            return Ok(response);
+        }
+        tokio::time::sleep(retry_delays[attempt]).await;
+    }
+    unreachable!("the retry loop always returns its final HTTP response")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,6 +669,7 @@ fn send_stream_metric(
 #[cfg(test)]
 mod ide_header_tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn config() -> AiConfig {
         AiConfig {
@@ -644,12 +693,12 @@ mod ide_header_tests {
 
     #[test]
     fn relays_bounded_user_timezone_headers() {
-        let request = with_ide_headers(
-            reqwest::Client::new().get("https://example.invalid"),
-            &config(),
-        )
-        .build()
-        .unwrap();
+        let mut cfg = config();
+        cfg.request_id = Some("req_12345678".into());
+        let request = with_ide_headers(reqwest::Client::new().get("https://example.invalid"), &cfg)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["x-ide-request-id"], "req_12345678");
         assert_eq!(request.headers()["x-ide-timezone"], "America/Los_Angeles");
         assert_eq!(request.headers()["x-ide-utc-offset-minutes"], "-420");
     }
@@ -657,6 +706,7 @@ mod ide_header_tests {
     #[test]
     fn drops_invalid_timezone_headers() {
         let mut cfg = config();
+        cfg.request_id = Some("bad\nrequest".into());
         cfg.ide_timezone = Some("bad\ntimezone".into());
         cfg.ide_utc_offset_minutes = Some(900);
         let request = with_ide_headers(reqwest::Client::new().get("https://example.invalid"), &cfg)
@@ -664,6 +714,7 @@ mod ide_header_tests {
             .unwrap();
         assert!(!request.headers().contains_key("x-ide-timezone"));
         assert!(!request.headers().contains_key("x-ide-utc-offset-minutes"));
+        assert!(!request.headers().contains_key("x-ide-request-id"));
     }
 
     #[test]
@@ -702,6 +753,47 @@ mod ide_header_tests {
             message,
             "AI request failed (502 Bad Gateway): error code: 502"
         );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_completion_relays_request_id() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 32 * 1024];
+            let read = socket.read(&mut request).unwrap();
+            tx.send(String::from_utf8_lossy(&request[..read]).to_string())
+                .unwrap();
+            let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        });
+
+        let mut cfg = config();
+        cfg.base_url = format!("http://{address}");
+        cfg.request_id = Some("req_nonstream_123".into());
+        let result = ai_complete(
+            cfg,
+            vec![serde_json::json!({"role": "user", "content": "hello"})],
+            32,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result, "ok");
+        let request = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(request.contains("x-ide-request-id: req_nonstream_123\r\n"));
     }
 }
 
@@ -1023,6 +1115,58 @@ mod stream_timeout_tests {
     }
 
     #[tokio::test]
+    async fn gateway_502_retries_before_an_sse_stream_is_opened() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (count_tx, count_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let statuses = ["502 Bad Gateway", "502 Bad Gateway", "200 OK"];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut served = 0;
+            while served < statuses.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut request = [0_u8; 4096];
+                        let _ = socket.read(&mut request);
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            statuses[served]
+                        );
+                        socket.write_all(response.as_bytes()).unwrap();
+                        socket.flush().unwrap();
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("gateway test listener failed: {error}"),
+                }
+            }
+            count_tx.send(served).unwrap();
+        });
+
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+        let response = post_chat_with_gateway_retry(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1/chat/completions"),
+            &cfg,
+            &serde_json::json!({"model": "test", "stream": true, "messages": []}),
+            Duration::from_secs(1),
+            &[Duration::from_millis(0), Duration::from_millis(0)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(count_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 3);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn clean_eof_without_done_rejects_partial_tool_arguments() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1249,9 +1393,13 @@ async fn ai_chat_inner(
     }
 
     let client = &*HTTP;
-    let mut resp = send_with_response_headers_timeout(
-        with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config).json(&payload),
+    let mut resp = post_chat_with_gateway_retry(
+        client,
+        &url,
+        &config,
+        &payload,
         timeouts.response_headers,
+        &PRE_STREAM_GATEWAY_RETRY_DELAYS,
     )
     .await?;
     // If a strict gateway rejects the request (4xx — most likely the optional
@@ -1264,10 +1412,13 @@ async fn ai_chat_inner(
         if let Some(o) = payload.as_object_mut() {
             o.remove("stream_options");
         }
-        resp = send_with_response_headers_timeout(
-            with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config)
-                .json(&payload),
+        resp = post_chat_with_gateway_retry(
+            client,
+            &url,
+            &config,
+            &payload,
             timeouts.response_headers,
+            &PRE_STREAM_GATEWAY_RETRY_DELAYS,
         )
         .await?;
     }
@@ -1300,6 +1451,9 @@ async fn ai_chat_inner(
     let mut raw_stream_bytes: u64 = 0;
     let mut sent_first_chunk_metric = false;
     let mut sent_first_progress_metric = false;
+    // 首个有效输出前持续上报字节心跳：只发一次 firstChunk 会让前端永远显示首包字节数，
+    // 用户无法区分"上游断了"和"模型还在深思/排队"（prefill 阶段不吐任何 token）。
+    let mut last_bytes_metric_at = Instant::now();
     // Cancellation: register a flag keyed by the JS-supplied request_id (if any).
     // The guard removes it on every return path; the loop polls it so Stop aborts.
     let req_id = config.request_id.clone().filter(|s| !s.is_empty());
@@ -1361,10 +1515,23 @@ async fn ai_chat_inner(
         raw_stream_bytes = raw_stream_bytes.saturating_add(chunk.len() as u64);
         if !sent_first_chunk_metric {
             sent_first_chunk_metric = true;
+            last_bytes_metric_at = Instant::now();
             send_stream_metric(
                 &on_event,
                 stream_started,
                 "firstChunk",
+                Some(raw_stream_bytes),
+            );
+        } else if !sent_first_progress_metric
+            && last_bytes_metric_at.elapsed() >= Duration::from_secs(3)
+        {
+            // 心跳注释/预热帧也是字节：定期把累计字节数送给前端，停顿提示才能说清
+            // "连接活着、模型还没开口"。不影响任何超时判定。
+            last_bytes_metric_at = Instant::now();
+            send_stream_metric(
+                &on_event,
+                stream_started,
+                "streaming",
                 Some(raw_stream_bytes),
             );
         }

@@ -54,11 +54,11 @@ const STOP: &[&str] = &[
 /// Chinese tech terms found, so "玻璃拟态 阴影" → also searches "glassmorphism shadow".
 const CN_EN: &[(&str, &str)] = &[
     // visual / CSS / animation (the user's pain area)
-    ("动画", "animation animate motion transition"),
+    ("动画", "animation animate"),
     ("缓动", "easing ease"),
     ("过渡", "transition"),
     ("关键帧", "keyframes"),
-    ("玻璃拟态", "glassmorphism frosted glass backdrop blur"),
+    ("玻璃拟态", "glassmorphism backdrop blur"),
     ("毛玻璃", "glassmorphism backdrop blur"),
     ("阴影", "shadow box-shadow"),
     ("渐变", "gradient"),
@@ -90,7 +90,7 @@ const CN_EN: &[(&str, &str)] = &[
     // layout / styling
     ("布局", "layout grid flex flexbox"),
     ("响应式", "responsive media query"),
-    ("暗色", "dark theme dark mode"),
+    ("暗色", "dark mode theme"),
     ("主题", "theme"),
     ("字体", "font typography"),
     ("排版", "typography"),
@@ -365,57 +365,108 @@ const CN_EN: &[(&str, &str)] = &[
     ("断点", "breakpoint debug"),
     // mobile / mini-program
     ("微信", "wechat weixin"),
+    ("聊天", "chat messaging conversation"),
+    ("消息", "message messaging inbox"),
+    ("社交", "social community feed"),
+    ("协作", "collaboration workspace productivity saas"),
     ("小程序", "mini program miniapp"),
     ("支付宝", "alipay"),
     ("原生", "native platform"),
     ("混合", "hybrid webview"),
     ("热更新", "hot reload update"),
-    // site building / design library
-    ("网站", "website landing page"),
-    ("网页", "web page website"),
-    ("官网", "landing page website homepage"),
-    ("落地页", "landing page hero"),
-    ("首页", "homepage landing hero"),
-    ("着陆页", "landing page hero conversion"),
-    ("宣传页", "landing page marketing page"),
-    ("介绍页", "landing page product page"),
-    ("个人主页", "portfolio homepage"),
-    ("作品集", "portfolio agency showcase"),
-    ("博客", "blog content magazine"),
-    ("社区", "community social platform"),
-    ("商城", "ecommerce shop store product"),
-    ("下载站", "download library resources"),
-    ("资源站", "resources library assets download"),
-    ("资源", "resources assets library"),
-    ("下载", "download"),
-    ("二手", "secondhand marketplace resale ecommerce"),
-    ("好看", "beautiful modern premium polished design"),
-    ("漂亮", "beautiful elegant polished design"),
-    ("精美", "premium polished design"),
-    ("现代化", "modern sleek"),
-    ("高端", "premium luxury"),
-    ("酷炫", "stunning animated interactive"),
-    ("炫酷", "stunning animated interactive"),
-    ("科技感", "futuristic tech gradient"),
-    ("极简", "minimal clean"),
-    ("游戏", "game gaming esports"),
-    ("赛博朋克", "cyberpunk neon glitch futuristic"),
-    ("霓虹", "neon glow"),
-    ("液态玻璃", "liquid glass glassmorphism"),
-    ("动效", "animation motion gsap"),
-    ("音乐", "music audio player"),
-    ("视频", "video media streaming"),
-    ("餐饮", "restaurant food dining"),
-    ("旅游", "travel tourism booking"),
-    ("健身", "fitness gym workout"),
-    ("教育", "education learning course"),
-    ("金融风", "finance fintech banking"),
     // general tools
     ("工具", "tool utility"),
     ("插件", "plugin extension addon"),
     ("脚手架", "scaffold boilerplate cli"),
     ("模板", "template starter"),
     ("命令行", "cli command line terminal"),
+    // website building / business categories — the michael-design corpus is English;
+    // a Chinese business word MUST map to English category terms or a Chinese "做网站"
+    // query matches nothing (or only random generic blueprints).
+    ("网站", "website site landing page"),
+    ("官网", "website landing page homepage brand"),
+    ("建站", "website landing page"),
+    ("网页", "web page website"),
+    ("主页", "homepage landing"),
+    ("首页", "homepage landing hero"),
+    ("门户", "portal"),
+    ("动效", "motion animation scroll interactive"),
+    ("交互", "interactive interaction"),
+    ("咖啡", "coffee cafe"),
+    ("餐厅", "restaurant dining menu"),
+    ("饭店", "restaurant dining"),
+    ("菜单", "menu"),
+    ("美食", "food dining restaurant"),
+    ("烘焙", "bakery dessert"),
+    ("甜品", "dessert bakery cake"),
+    ("酒吧", "bar lounge cocktail"),
+    ("奶茶", "tea drink cafe"),
+    ("民宿", "lodge cabin bnb booking stay"),
+    ("酒店", "hotel resort booking hospitality"),
+    ("度假", "resort vacation travel"),
+    ("预订", "booking reservation"),
+    ("订座", "reservation booking"),
+    ("旅游", "travel tourism trip"),
+    ("旅行", "travel trip journey"),
+    ("健身", "fitness gym workout"),
+    ("瑜伽", "yoga wellness studio"),
+    ("美容", "beauty salon spa"),
+    ("理发", "barber salon"),
+    ("宠物", "pet"),
+    ("花店", "florist flower shop"),
+    ("婚礼", "wedding event"),
+    ("摄影", "photography portfolio gallery"),
+    ("画廊", "gallery art exhibition"),
+    ("作品集", "portfolio showcase project"),
+    ("工作室", "studio agency creative"),
+    ("设计公司", "design agency studio"),
+    ("律所", "law firm legal attorney"),
+    ("律师", "lawyer attorney legal"),
+    ("房产", "real estate property listing"),
+    ("地产", "real estate property"),
+    ("汽车", "car automotive dealership"),
+    ("装修", "interior renovation design"),
+    ("家具", "furniture interior"),
+    ("服装", "fashion clothing apparel"),
+    ("珠宝", "jewelry luxury"),
+    ("音乐", "music band artist"),
+    ("乐队", "band music concert"),
+    ("活动", "event conference"),
+    ("会议", "conference summit event"),
+    ("展览", "exhibition gallery museum"),
+    ("博客", "blog editorial article"),
+    ("新闻", "news magazine editorial"),
+    ("杂志", "magazine editorial"),
+    ("公益", "nonprofit charity"),
+    ("慈善", "charity nonprofit donation"),
+    ("动物", "animal pet rescue"),
+    ("救助", "rescue shelter charity nonprofit"),
+    ("领养", "adopt adoption rescue shelter"),
+    ("教堂", "church community faith"),
+    ("农场", "farm organic agriculture"),
+    ("科技公司", "tech startup saas"),
+    ("初创", "startup saas"),
+    ("创业公司", "startup saas"),
+    ("人工智能", "ai artificial intelligence"),
+    ("智能体", "ai agent assistant"),
+    ("仪表盘", "dashboard analytics"),
+    ("后台管理", "dashboard admin panel"),
+    ("个人网站", "personal portfolio website"),
+    ("简历", "resume cv personal"),
+    // replication / redesign / asset sourcing (仿站、改版、素材检索)
+    ("仿站", "clone replicate reference website"),
+    ("仿照", "replicate reference imitate"),
+    ("仿一个", "replicate clone reference"),
+    ("复刻", "replicate clone rebuild"),
+    ("参考网站", "reference website"),
+    ("重新设计", "redesign revamp"),
+    ("改版", "redesign revamp refresh"),
+    ("视觉升级", "visual redesign upgrade"),
+    ("素材", "asset image media resource"),
+    ("资源", "asset resource"),
+    ("头像", "avatar portrait photo"),
+    ("图片", "image photo picture"),
+    ("视频", "video media"),
 ];
 
 fn expand_query(q: &str) -> String {
@@ -433,9 +484,17 @@ fn expand_query(q: &str) -> String {
     }
 }
 
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF)
+}
+
 fn tokenize(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    // CJK bigrams: consecutive Chinese chars are indexed as overlapping 2-char
+    // tokens (standard CJK BM25 practice) so Chinese text in the corpus/query is
+    // no longer silently dropped by the ASCII-only tokenizer.
+    let mut cjk_prev: Option<char> = None;
     let push = |cur: &mut String, out: &mut Vec<String>| {
         if cur.len() >= 2 && !STOP.contains(&cur.as_str()) {
             out.push(cur.clone());
@@ -445,8 +504,16 @@ fn tokenize(s: &str) -> Vec<String> {
     for ch in s.chars() {
         if ch.is_ascii_alphanumeric() {
             cur.push(ch.to_ascii_lowercase());
+            cjk_prev = None;
+        } else if is_cjk(ch) {
+            push(&mut cur, &mut out);
+            if let Some(prev) = cjk_prev {
+                out.push(format!("{prev}{ch}"));
+            }
+            cjk_prev = Some(ch);
         } else {
             push(&mut cur, &mut out);
+            cjk_prev = None;
         }
     }
     push(&mut cur, &mut out);
@@ -508,7 +575,20 @@ fn load(dir: &str) -> KnowledgeIndex {
                         .push(topic.clone());
                     for (section, text) in chunk_markdown(&body) {
                         // Index over section title + text (title weighted by repetition).
-                        let toks = tokenize(&format!("{} {} {}", section, section, text));
+                        // Blueprint headers end in a slug like "[sites/coffee-shop-landing]" —
+                        // those slug words ARE the business category, so weight them ×3 on
+                        // top of the ×2 title so a category query beats the generic style
+                        // words (card/grid/tailwind…) that appear in every blueprint.
+                        let slug = section
+                            .rfind('[')
+                            .map(|i| {
+                                section[i + 1..]
+                                    .trim_end_matches(']')
+                                    .replace(['/', '-', '_'], " ")
+                            })
+                            .unwrap_or_default();
+                        let toks =
+                            tokenize(&format!("{section} {section} {slug} {slug} {slug} {text}"));
                         if toks.len() < 3 {
                             continue;
                         }
@@ -574,18 +654,28 @@ pub fn get() -> &'static KnowledgeIndex {
 }
 
 /// BM25 search over the corpus. `domain` optionally restricts to one domain.
-/// Each returned section is capped at 2400 chars so ordinary tool calls cannot flood context.
 pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit> {
-    search_with_cap(query, domain, top_k, 2400)
+    search_inner(query, domain, top_k, None)
 }
 
-/// BM25 search with a caller-selected per-section cap. Prompt assembly can use a
-/// slightly larger cap for design blueprints while the public tool stays compact.
+/// Like `search`, but the caller controls the per-hit text cap (bytes, truncated on a
+/// char boundary) and gets exactly `top_k` hits (clamped to 20) even for michael-design.
+/// The server-side design-knowledge injection needs a wide candidate pool that it filters
+/// itself, with tighter per-section budgets than the interactive `knowledge_search` tool.
 pub fn search_with_cap(
     query: &str,
     domain: Option<&str>,
     top_k: usize,
-    max_section_chars: usize,
+    cap: usize,
+) -> Vec<SearchHit> {
+    search_inner(query, domain, top_k, Some(cap))
+}
+
+fn search_inner(
+    query: &str,
+    domain: Option<&str>,
+    top_k: usize,
+    cap_override: Option<usize>,
 ) -> Vec<SearchHit> {
     const K1: f64 = 1.5;
     const B: f64 = 0.75;
@@ -641,16 +731,28 @@ pub fn search_with_cap(
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // michael-design hits are complete production-grade blueprints (4–11KB each):
+    // truncating them to 2400 bytes cuts off the layout/motion/interaction specs —
+    // exactly the part the agent needs — and there is no follow-up "read more" API.
+    // So for an explicit michael-design search return FEWER hits but each IN FULL;
+    // other domains keep the tight cap (their sections are short best-practice notes).
+    let design_mode = resolved_domain.as_deref() == Some("michael-design");
+    let take = if cap_override.is_some() || !design_mode {
+        top_k.clamp(1, 20)
+    } else {
+        top_k.clamp(1, 3)
+    };
     scored
         .into_iter()
-        .take(top_k.clamp(1, 20))
+        .take(take)
         .map(|(i, score)| {
             let c = &idx.chunks[i];
             // Cap each returned section so a few hits don't blow the agent's context.
             // Truncate on a CHAR boundary — byte-slicing mid-UTF-8 (the corpus has →/—
             // and other multibyte chars) panics.
-            let text = if c.text.len() > max_section_chars {
-                let mut end = max_section_chars;
+            let cap = cap_override.unwrap_or(if design_mode { 12_000 } else { 2400 });
+            let text = if c.text.len() > cap {
+                let mut end = cap;
                 while end > 0 && !c.text.is_char_boundary(end) {
                     end -= 1;
                 }

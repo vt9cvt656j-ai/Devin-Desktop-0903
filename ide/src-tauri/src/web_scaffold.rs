@@ -762,6 +762,24 @@ const features = [
 
 const GITIGNORE: &str = "node_modules\ndist\n.DS_Store\n*.local\n";
 
+fn readme(proj: &str) -> String {
+    format!(
+        r#"# {proj}
+
+Vite + Tailwind starter with a curated design-token system.
+
+```bash
+npm install
+npm run dev      # http://127.0.0.1:3000
+```
+
+- **Design tokens** live in `src/style.css` `:root` — change the theme there, never hardcode values.
+- **Fonts**: Space Grotesk (display) + Manrope (body), loaded in `index.html`.
+- **Base components**: `.btn`, `.btn-primary`, `.btn-ghost`, `.card` (+ Tailwind theme wired to the tokens).
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,22 +856,4 @@ mod tests {
         assert!(learned.contains("--learned-1"));
         std::fs::remove_dir_all(&ws).ok();
     }
-}
-
-fn readme(proj: &str) -> String {
-    format!(
-        r#"# {proj}
-
-Vite + Tailwind starter with a curated design-token system.
-
-```bash
-npm install
-npm run dev      # http://127.0.0.1:3000
-```
-
-- **Design tokens** live in `src/style.css` `:root` — change the theme there, never hardcode values.
-- **Fonts**: Space Grotesk (display) + Manrope (body), loaded in `index.html`.
-- **Base components**: `.btn`, `.btn-primary`, `.btn-ghost`, `.card` (+ Tailwind theme wired to the tokens).
-"#
-    )
 }
