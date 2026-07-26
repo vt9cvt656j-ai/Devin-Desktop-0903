@@ -176,6 +176,12 @@ pub async fn read_screen(ocr: Option<bool>) -> Result<ReadScreenResponse, String
             "OCR text boxes are observations, not actionable AX refs; use their coordinates only through an explicitly approved automation action."
                 .into(),
         );
+        // 明说读的是哪一块。收窄到前台窗口后，"没读到某段文字"往往是因为它在别的窗口
+        // 里，而不是 OCR 失败——不写清楚会让模型反复重试同一个 read_screen。
+        limitations.push(
+            "OCR covers the frontmost window only — never the whole screen. Menu bar, dock, and background windows are excluded, and if the frontmost app has no ordinary window the result is empty rather than a whole-screen capture. Coordinates are global screen points."
+                .into(),
+        );
     }
     if elements.is_empty() {
         limitations.push(
@@ -652,11 +658,50 @@ fn perform_ax_action(
 const VISION_OCR_SWIFT: &str = r#"import Foundation
 import Vision
 import AppKit
-guard let img = CGWindowListCreateImage(CGRect.null, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else {
-    print("[]"); exit(0)
+
+// 只拍**前台窗口**，不拍整屏。整屏 OCR 会把背景里其它 App 的窗口内容一起读出来
+// （聊天、邮件、密码管理器都可能在后面开着），而 AX 路径本来就只读前台 App —— 两条
+// 路径语义必须一致。
+func frontmostWindow() -> (CGWindowID, CGRect)? {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+    let pid = app.processIdentifier
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let infos = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+    // 列表是从前到后排的，第一个命中的就是该 App 最前面那个窗口。
+    for info in infos {
+        guard let owner = info[kCGWindowOwnerPID as String] as? pid_t, owner == pid else { continue }
+        guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+        guard let wid = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+        guard let bd = info[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bd) else { continue }
+        if rect.width < 1 || rect.height < 1 { continue }
+        return (wid, rect)
+    }
+    return nil
 }
+
+// 拿不到前台窗口就**直接返回空**，不退回整屏。
+//
+// 整屏兜底看着稳妥，实际有两处硬伤：① 它悄悄推翻了"只读前台窗口"这个对模型的承诺，
+// 背景窗口内容照样被读走；② 它的坐标根本不是全局屏幕坐标 —— CGRect.null +
+// optionOnScreenOnly 返回的是所有在屏窗口外接框的并集，**含窗口阴影**，实测比屏幕
+// 宽 48pt（最左侧窗口的阴影越过 x=0）。模型照着这个 x/y 去点会静默点偏。
+// 宁可如实返回"没读到"，也不要给一份看着能用、其实点不准又越界的结果。
+guard let (wid, rect) = frontmostWindow(),
+      let img = CGWindowListCreateImage(CGRect.null, [.optionIncludingWindow], wid,
+                                        [.bestResolution, .boundsIgnoreFraming]),
+      rect.width >= 1 else { print("[]"); exit(0) }
+let originX = Double(rect.origin.x)
+let originY = Double(rect.origin.y)
+// 比例按**这个窗口**实测，而不是 NSScreen.main —— 窗口在副屏（缩放可能不同）时
+// main 的 backingScaleFactor 是错的。
+let derivedScale = Double(img.width) / Double(rect.width)
+let sc = (derivedScale > 0.1 && derivedScale < 10.0)
+    ? derivedScale
+    : Double(NSScreen.main?.backingScaleFactor ?? 2.0)
+guard sc > 0 else { print("[]"); exit(0) }
+
 let pw = Double(img.width), ph = Double(img.height)
-let sc = Double(NSScreen.main?.backingScaleFactor ?? 2.0)
 let handler = VNImageRequestHandler(cgImage: img, options: [:])
 let req = VNRecognizeTextRequest()
 req.recognitionLevel = .accurate
@@ -669,8 +714,10 @@ var idx = 0
 for obs in observations {
     guard let top = obs.topCandidates(1).first else { continue }
     let b = obs.boundingBox
-    let x = b.origin.x * pw / sc
-    let y = (1.0 - b.origin.y - b.height) * ph / sc
+    // x/y 始终是**全局屏幕坐标（点）**：窗口内偏移 + 窗口在屏幕上的原点。下游点击
+    // 用的就是全局坐标，这里若返回窗口相对坐标，点击会静默点错地方。
+    let x = originX + b.origin.x * pw / sc
+    let y = originY + (1.0 - b.origin.y - b.height) * ph / sc
     let w = b.width * pw / sc
     let h = b.height * ph / sc
     if w < 3 || h < 3 { continue }
@@ -684,17 +731,101 @@ if let j = try? JSONSerialization.data(withJSONObject: out),
    let s = String(data: j, encoding: .utf8) { print(s) } else { print("[]") }
 "#;
 
+/// 编译产物的文件名。**版本号是强制重编的唯一开关**：缓存命中只看"文件在不在、
+/// 可不可信"，不看内容。改了 `VISION_OCR_SWIFT` 却不改这个名字，老用户跑的永远是
+/// 上一版二进制——改动静默失效，而且没有任何报错。
+///
+/// v2：OCR 从整屏收窄到前台窗口。
+/// v3：去掉整屏兜底 —— 它的坐标不是全局屏幕坐标（含窗口阴影，实测越界 48pt）。
+///
+/// 下面的 `ocr_helper_version_tracks_the_swift_source` 测试把二者钉死，改了源码
+/// 不改版本号就会红。
+const OCR_HELPER_NAME: &str = "vision-ocr-v3";
+
+/// 已被取代、启动时顺手删掉的历史文件名。
+const OCR_HELPER_SUPERSEDED: &[&str] = &["vision-ocr-v2"];
+
+/// v1 的真实残留路径。它当年就放在全局可写的 `/tmp` 下（正是后来搬进 `$HOME` 的原因），
+/// 所以清理必须按绝对路径来 —— 按新目录里的文件名删等于什么都没删。
+///
+/// `remove_file` 不跟随符号链接（删的是链接本身），所以对着 `/tmp` 这种全局可写路径
+/// 调用它不会被预置软链骗去删别处的文件。
+const OCR_HELPER_LEGACY_ABS: &[&str] = &[
+    "/tmp/michael_ide_vision_ocr_v1",
+    "/tmp/michael_ide_vision_ocr_v1.swift",
+];
+
+/// OCR 辅助程序的私有目录：`$HOME/.michael-ide/bin`，权限 0700。
+#[cfg(target_os = "macos")]
+fn ocr_helper_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::PathBuf::from(home).join(".michael-ide").join("bin");
+    std::fs::create_dir_all(&dir).ok()?;
+    // 只有自己能进：即使别人猜到路径也放不进文件。
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    Some(dir)
+}
+
+/// 这个二进制是不是我们自己编出来的、且没被别人动过手脚。
+///
+/// 判据：存在、**不是符号链接**、属主是当前用户、且组/其他人都没有写权限。任何一条不满足
+/// 都当作不可信 —— "存在即信任"正是这条漏洞的核心。
+#[cfg(target_os = "macos")]
+fn ocr_helper_is_trustworthy(bin: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    // symlink_metadata 不跟随软链——用 metadata 的话软链会伪装成正常文件。
+    let Ok(meta) = std::fs::symlink_metadata(bin) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    meta.permissions().mode() & 0o022 == 0
+}
+
 #[cfg(target_os = "macos")]
 pub fn read_ocr_elements() -> Vec<UiElement> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let bin = std::path::PathBuf::from("/tmp/michael_ide_vision_ocr_v1");
+    // 私有目录，不用 /tmp。
+    //
+    // `/tmp` 是全局可写的固定路径：任何本机进程（包括某个依赖的 postinstall 脚本）都能
+    // 预先放一个同名二进制，而这里只判 `exists()` 就直接执行它 —— 于是它继承了 IDE 的
+    // **屏幕录制权限**，能拍到你整个屏幕。同理 `fs::write` 会跟随符号链接，预置一个软链
+    // 就能让我们把内容写到任意可写位置。
+    //
+    // 换成 $HOME 下的 0700 目录后，别的用户进不来；再加执行前校验，同用户下的其它进程
+    // 也没法用预置文件骗我们执行。
+    let Some(dir) = ocr_helper_dir() else {
+        return Vec::new();
+    };
+    let bin = dir.join(OCR_HELPER_NAME);
+    // 清掉历史版本，别在用户目录里留一堆再也不会用的二进制。
+    for stale in OCR_HELPER_SUPERSEDED {
+        let _ = std::fs::remove_file(dir.join(stale));
+        let _ = std::fs::remove_file(dir.join(format!("{stale}.swift")));
+    }
+    for legacy in OCR_HELPER_LEGACY_ABS {
+        let _ = std::fs::remove_file(legacy);
+    }
 
-    if !bin.exists() {
-        let src = "/tmp/michael_ide_vision_ocr_v1.swift";
-        if std::fs::write(src, VISION_OCR_SWIFT).is_err() {
+    if !ocr_helper_is_trustworthy(&bin) {
+        // 存在但不可信（是软链、属主不对、或组/其他人可写）→ 删掉重编，绝不执行。
+        let _ = std::fs::remove_file(&bin);
+        let src_path = dir.join(format!("{OCR_HELPER_NAME}.swift"));
+        let _ = std::fs::remove_file(&src_path);
+        let src = match src_path.to_str() {
+            Some(s) => s.to_string(),
+            None => return Vec::new(),
+        };
+        if std::fs::write(&src, VISION_OCR_SWIFT).is_err() {
             return Vec::new();
         }
         let arch = std::env::consts::ARCH;
@@ -709,7 +840,7 @@ pub fn read_ocr_elements() -> Vec<UiElement> {
                 &target,
                 "-o",
                 bin.to_str().unwrap_or(""),
-                src,
+                &src,
             ])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
@@ -901,5 +1032,84 @@ return JSON.stringify({operated:operated,changed:changed});
         for operation in ["el.value = VAL", "el.focused = true", "el.click()"] {
             assert!(gate < script.find(operation).expect("AX operation should exist"));
         }
+    }
+
+    /// 自己实现 FNV-1a 而不是用 `DefaultHasher`：后者的输出不保证跨 Rust 版本稳定，
+    /// 拿它钉常量会在某次工具链升级后毫无理由地变红。
+    #[cfg(target_os = "macos")]
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    }
+
+    /// 改了 `VISION_OCR_SWIFT` 就必须 bump `OCR_HELPER_NAME` 的版本号。
+    ///
+    /// 为什么值得一个测试：缓存命中只看文件在不在，不看内容。改了源码不改名字，
+    /// 用户机器上那个旧二进制会被一直复用——**没有任何报错**，只是新逻辑永远不生效。
+    /// 这类"静默不生效"是最难在自测里发现的，所以在编译期就钉死。
+    ///
+    /// 红了怎么办：确认 `OCR_HELPER_NAME` 版本号已 +1、旧名字已进
+    /// `OCR_HELPER_SUPERSEDED`，然后把下面两个常量更新成报错里给出的新值。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ocr_helper_version_tracks_the_swift_source() {
+        const EXPECTED_SWIFT_HASH: u64 = 16_520_559_861_853_164_212;
+        const EXPECTED_HELPER_NAME: &str = "vision-ocr-v3";
+
+        let actual = fnv1a(VISION_OCR_SWIFT.as_bytes());
+        assert_eq!(
+            OCR_HELPER_NAME, EXPECTED_HELPER_NAME,
+            "改了 OCR_HELPER_NAME 就要同步这里的 EXPECTED_HELPER_NAME"
+        );
+        assert_eq!(
+            actual, EXPECTED_SWIFT_HASH,
+            "VISION_OCR_SWIFT 变了。必须把 OCR_HELPER_NAME 的版本号 +1、\
+             把旧名字加进 OCR_HELPER_SUPERSEDED，再把 EXPECTED_SWIFT_HASH 改成 {actual}；\
+             否则用户机器上的旧二进制会被继续复用，改动静默失效。"
+        );
+    }
+
+    /// Swift 源码的几个**语义**不变量。哈希只能告诉你"变了"，说不出"变坏了"；
+    /// 这些断言盯的是一旦丢掉就会静默出错的东西。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ocr_swift_stays_scoped_to_the_frontmost_window_in_global_coordinates() {
+        let src = VISION_OCR_SWIFT;
+        assert!(
+            src.contains("frontmostApplication"),
+            "必须按前台 App 挑窗口，否则又变回整屏 OCR（会读到背景窗口内容）"
+        );
+        assert!(
+            src.contains("optionIncludingWindow"),
+            "必须只截目标窗口"
+        );
+        assert!(
+            src.contains("boundsIgnoreFraming"),
+            "少了它截图会带窗口阴影，比例推导和坐标偏移全部偏掉"
+        );
+        // 坐标必须叠回窗口原点。丢了这两个加法，返回的就是窗口相对坐标，
+        // 而下游点击用的是全局坐标——点击会静默点错位置，不报任何错。
+        assert!(
+            src.contains("originX + b.origin.x"),
+            "x 必须叠加窗口原点，保持全局屏幕坐标"
+        );
+        assert!(
+            src.contains("originY + (1.0 - b.origin.y"),
+            "y 必须叠加窗口原点，保持全局屏幕坐标"
+        );
+        // 反过来：**不允许**存在整屏兜底。
+        //
+        // 兜底看着稳妥，实测有两处硬伤：它悄悄推翻了"只读前台窗口"这个对模型的承诺；
+        // 而且 CGRect.null + optionOnScreenOnly 返回的是所有在屏窗口外接框的并集、
+        // 含窗口阴影，比屏幕宽 48pt —— 吐出的 x/y 根本不是全局屏幕坐标，模型照着点
+        // 会静默点偏。拿不到前台窗口就如实返回空。
+        assert!(
+            !src.contains("optionOnScreenOnly, kCGNullWindowID"),
+            "不能退回整屏抓取：它的坐标不是全局屏幕坐标，而且会读到背景窗口"
+        );
     }
 }

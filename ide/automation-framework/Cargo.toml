@@ -62,3 +62,7 @@ required-features = ["system", "browser"]
 name = "automation-server"
 path = "src/bin/automation-server.rs"
 required-features = ["system", "browser"]
+
+# 独立于 ide/ 那个 workspace（它的 members 只有 src-tauri）。没有这一节时 cargo 会认为
+# 本包属于父 workspace 而拒绝构建。
+[workspace]

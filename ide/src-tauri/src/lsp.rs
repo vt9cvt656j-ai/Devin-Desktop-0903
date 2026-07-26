@@ -65,6 +65,15 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub root_uri: String,
+    /// 是否允许使用**工作区提供的**语言服务器二进制（`node_modules/.bin`、`.venv/bin`）。
+    ///
+    /// 用项目自己的 TypeScript / pyright 版本是真实且必要的功能，但它同时意味着：打开
+    /// 一个仓库里的 .ts 文件，就会执行那个仓库自带的可执行文件。所以这条能力跟着工作区
+    /// 信任走 —— 未信任的工作区只用系统安装的语言服务器，功能降级但不执行仓库的东西。
+    ///
+    /// 缺省 `false`：老客户端/未传该字段时按不信任处理（fail closed）。
+    #[serde(default)]
+    pub trust_workspace_binaries: bool,
 }
 
 const KNOWN_SERVERS: &[(&str, &str, &[&str])] = &[
@@ -216,8 +225,15 @@ pub fn lsp_start(
     };
 
     let ws = workspace_dir_from_uri(&config.root_uri);
+    // 未信任的工作区：解析时不把工作区目录算进 PATH，于是仓库自带的
+    // `node_modules/.bin/typescript-language-server` 不会被选中，只会用系统安装的那个。
+    let bin_scope = if config.trust_workspace_binaries {
+        ws.as_deref()
+    } else {
+        None
+    };
     #[cfg(not(windows))]
-    let resolved = process_util::resolve_command(&command, ws.as_deref());
+    let resolved = process_util::resolve_command(&command, bin_scope);
     #[cfg(windows)]
     let resolved = command.clone();
 
@@ -230,7 +246,7 @@ pub fn lsp_start(
             if content.starts_with("#!/usr/bin/env node")
                 || content.starts_with("#!/usr/bin/env -S node")
             {
-                let node = process_util::resolve_command("node", ws.as_deref());
+                let node = process_util::resolve_command("node", bin_scope);
                 (node, vec![resolved.clone()])
             } else {
                 (resolved.clone(), vec![])
@@ -252,7 +268,12 @@ pub fn lsp_start(
     if let Some(ref ws_dir) = ws {
         builder.current_dir(ws_dir);
         #[cfg(not(windows))]
-        builder.env("PATH", process_util::augmented_path(Some(ws_dir)));
+        // 子进程 PATH 同理：未信任时不放工作区目录进去，否则语言服务器自己再去 PATH
+        // 里找工具时又会命中仓库提供的版本。
+        builder.env(
+            "PATH",
+            process_util::augmented_path(config.trust_workspace_binaries.then_some(ws_dir)),
+        );
     } else {
         #[cfg(not(windows))]
         builder.env("PATH", process_util::augmented_path(None));

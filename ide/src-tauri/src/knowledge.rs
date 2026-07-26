@@ -16,6 +16,68 @@ type CommunitySearchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = CommunitySearchOutput> + Send>>;
 type CommunitySearchResponse = (&'static str, &'static str, CommunitySearchOutcome, String);
 
+/// 单个响应体读进内存的上限。
+///
+/// 这个模块会去抓**任意第三方站点**（搜索引擎结果页、论坛、包仓库、用户给的 URL），
+/// 而 `.text()` / `.json()` 是无上限的：远端回多大就分配多大。超时管的是"多久之内没
+/// 数据"，一个持续以正常速率吐数据的巨大响应（或坏掉的、故意的对端）完全不会触发超时，
+/// 只会一路把内存吃干——桌面端就是直接把用户整台机器拖死。
+///
+/// 8 MiB 对这里所有用途都绰绰有余：抓的是搜索结果和包元数据，正常响应在几十 KB 量级。
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 给 `reqwest::Response` 加上带上限的读取。
+///
+/// 刻意做成扩展 trait 而不是 `read_capped(resp)` 这样的自由函数：调用点全是
+/// `c.get(url).send().await.map_err(..)?.json_capped::<T>().await.map_err(..)?` 这种长链，
+/// 方法形式可以原地替换，不用把接收者从链条里拆出来。
+///
+/// 错误类型是 `String` 而非 `reqwest::Error`（`reqwest::Error` 没有公开构造函数，
+/// 造不出"超限"这个错误）。现有 50 个 `map_err` 闭包只用 `{e}` / `to_string()`，
+/// 所以换成 `String` 后全部原样编译。
+trait CappedResponse: Sized {
+    fn text_capped(self) -> impl std::future::Future<Output = Result<String, String>> + Send;
+    fn json_capped<T: serde::de::DeserializeOwned>(
+        self,
+    ) -> impl std::future::Future<Output = Result<T, String>> + Send;
+}
+
+impl CappedResponse for reqwest::Response {
+    async fn text_capped(self) -> Result<String, String> {
+        let bytes = read_capped(self).await?;
+        // 与 reqwest 的 text() 一致：非 UTF-8 字节用替换字符兜底，而不是整个失败。
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn json_capped<T: serde::de::DeserializeOwned>(self) -> Result<T, String> {
+        let bytes = read_capped(self).await?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+}
+
+/// 分块读取响应体，累计超过 `MAX_RESPONSE_BYTES` 就中止。
+///
+/// 先看 `Content-Length` 是省事的快路径，但**不能只看它**：它是对端自报的，可以撒谎，
+/// 也可以在 chunked 编码下压根不存在。真正的保护是下面边读边累加的那道。
+async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(format!(
+                "响应体过大：声明 {len} 字节，上限 {MAX_RESPONSE_BYTES} 字节"
+            ));
+        }
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(format!("响应体超过上限 {MAX_RESPONSE_BYTES} 字节，已中止读取"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 const COMMUNITY_SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
 const GITHUB_TRENDING_EMPTY_NOTICE: &str =
     "search_status: empty\nNo trending repositories were parsed from the successful GitHub response.\n";
@@ -101,6 +163,18 @@ const DEVELOPER_COMMUNITY_SOURCES: &[(&str, &str)] = &[
     ("infoq", "InfoQ"),
     ("hackernoon", "HackerNoon"),
 ];
+
+/// 把字节长度收敛到不超过 `max` 的**字符边界**。
+///
+/// `&s[..n]` 在 n 落到多字节字符中间时会 panic。抓取外部 HTML 时用固定字节数截断非常
+/// 容易踩到这一点：只要页面里有中文/emoji 且恰好跨过那个位置，整个命令就 panic。
+fn clamp_char_boundary(s: &str, max: usize) -> usize {
+    let mut n = max.min(s.len());
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}
 
 fn canonical_community_source(source: &str) -> Option<&'static str> {
     let normalized = source.trim().to_lowercase().replace([' ', '-', '.'], "_");
@@ -575,7 +649,7 @@ pub async fn academic_search(query: String, max_results: Option<u32>) -> Result<
         return Err(format!("Semantic Scholar returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("JSON: {e}"))?;
     let total = json["total"].as_u64().unwrap_or(0);
     let mut out = format!("Found {total} papers (showing top {limit}):\n\n");
 
@@ -664,7 +738,7 @@ async fn search_npm(c: &Client, q: &str, limit: u32) -> Result<String, String> {
             return Err(format!("npm: {e}"));
         }
     };
-    let json: Value = match resp.json().await {
+    let json: Value = match resp.json_capped().await {
         Ok(json) => json,
         Err(e) => {
             if let Some(info) = exact {
@@ -789,7 +863,7 @@ async fn npm_exact_summary(c: &Client, q: &str) -> Result<Option<String>, String
         return Ok(None);
     }
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("npm exact JSON: {e}"))?;
     let name = data.get("name").and_then(Value::as_str).unwrap_or(q.trim());
@@ -869,7 +943,7 @@ async fn search_pypi(c: &Client, q: &str) -> Result<String, String> {
              Try the exact package name, or use web_search to discover Python packages."
         ));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("PyPI JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("PyPI JSON: {e}"))?;
     let info = &json["info"];
     Ok(format!(
         "PyPI package:\n\n{} v{}\n{}\nAuthor: {}\nLicense: {}\nPython: {}\nhttps://pypi.org/project/{}/\n",
@@ -894,7 +968,7 @@ async fn search_crates(c: &Client, q: &str, limit: u32) -> Result<String, String
         .send()
         .await
         .map_err(|e| format!("crates.io: {e}"))?;
-    let json: Value = resp.json().await.map_err(|e| format!("crates JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("crates JSON: {e}"))?;
     let mut out = String::from("crates.io packages:\n\n");
     if let Some(crates) = json["crates"].as_array() {
         for (i, cr) in crates.iter().enumerate() {
@@ -925,7 +999,7 @@ async fn search_hf(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| format!("HuggingFace: {e}"))?;
-    let json: Value = resp.json().await.map_err(|e| format!("HF JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("HF JSON: {e}"))?;
     let mut out = String::from("HuggingFace models:\n\n");
     if let Some(models) = json.as_array() {
         for (i, m) in models.iter().enumerate() {
@@ -955,7 +1029,7 @@ async fn search_pub(c: &Client, q: &str, limit: u32) -> Result<String, String> {
         return Err(format!("pub.dev returned {}", resp.status()));
     }
     let json: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("pub.dev JSON: {e}"))?;
     let mut out = String::from("pub.dev (Dart/Flutter) packages:\n\n");
@@ -967,7 +1041,7 @@ async fn search_pub(c: &Client, q: &str, limit: u32) -> Result<String, String> {
                 .send()
                 .await
             {
-                if let Ok(d) = dr.json::<Value>().await {
+                if let Ok(d) = dr.json_capped::<Value>().await {
                     let ps = &d["latest"]["pubspec"];
                     out.push_str(&format!(
                         "{}. {} v{}\n   {}\n   https://pub.dev/packages/{}\n\n",
@@ -1002,7 +1076,7 @@ async fn search_conda(c: &Client, q: &str, limit: u32) -> Result<String, String>
         return Err(format!("Anaconda returned {}", resp.status()));
     }
     let json: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("Anaconda JSON: {e}"))?;
     let mut out = String::from("Anaconda/Conda packages:\n\n");
@@ -1035,7 +1109,7 @@ async fn search_cocoapods(c: &Client, q: &str, limit: u32) -> Result<String, Str
         return Err(format!("CocoaPods returned {}", resp.status()));
     }
     let json: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("CocoaPods JSON: {e}"))?;
     let mut out = String::from("CocoaPods (iOS/macOS) pods:\n\n");
@@ -1070,7 +1144,7 @@ async fn search_hex(c: &Client, q: &str, limit: u32) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("Hex.pm returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("Hex JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("Hex JSON: {e}"))?;
     let mut out = String::from("Hex.pm (Elixir/Erlang) packages:\n\n");
     if let Some(pkgs) = json.as_array() {
         for (i, p) in pkgs.iter().take(limit as usize).enumerate() {
@@ -1165,11 +1239,11 @@ pub async fn github_search(
         .map_err(|e| format!("GitHub: {e}"))?;
 
     if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!("GitHub error: {body}"));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("GitHub JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("GitHub JSON: {e}"))?;
     let total = json["total_count"].as_u64().unwrap_or(0);
     let retrieved = retrieved_at();
     let mut out = format!("GitHub {stype}: {total} results\nretrieved_at: {retrieved}\n\n");
@@ -1314,10 +1388,10 @@ async fn api_get_json(
         .map_err(|e| format!("{label}: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
     }
-    resp.json().await.map_err(|e| format!("{label} JSON: {e}"))
+    resp.json_capped().await.map_err(|e| format!("{label} JSON: {e}"))
 }
 
 async fn api_get_text(
@@ -1332,10 +1406,10 @@ async fn api_get_text(
         .map_err(|e| format!("{label}: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!("{label} returned {status}: {}", trunc(&body, 800)));
     }
-    resp.text().await.map_err(|e| format!("{label} text: {e}"))
+    resp.text_capped().await.map_err(|e| format!("{label} text: {e}"))
 }
 
 async fn github_get_json(c: &Client, url: &str) -> Result<Value, String> {
@@ -2377,7 +2451,7 @@ pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<Strin
         return Err(format!("NVD returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("NVD JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("NVD JSON: {e}"))?;
     let total = json["totalResults"].as_u64().unwrap_or(0);
     let mut out = format!("NVD CVE: {total} results\n\n");
 
@@ -2452,7 +2526,7 @@ pub async fn wiki_search(
         .await
         .map_err(|e| format!("Wikipedia: {e}"))?;
 
-    let json: Value = resp.json().await.map_err(|e| format!("Wiki JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("Wiki JSON: {e}"))?;
     let total = json["query"]["searchinfo"]["totalhits"]
         .as_u64()
         .unwrap_or(0);
@@ -2495,7 +2569,7 @@ async fn fetch_wiki_extract(c: &Client, base: &str, title: &str) -> Result<Strin
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let json: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
     let pages = &json["query"]["pages"];
     if let Some(obj) = pages.as_object() {
         if let Some((_, page)) = obj.iter().next() {
@@ -2543,7 +2617,7 @@ pub async fn stackoverflow_search(
         return Err(format!("StackOverflow returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("SO JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("SO JSON: {e}"))?;
     let retrieved = retrieved_at();
     let mut out = format!("Stack Overflow results:\nretrieved_at: {retrieved}\n\n");
 
@@ -2623,7 +2697,7 @@ pub async fn hackernews_search(
         return Err(format!("HN returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("HN JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("HN JSON: {e}"))?;
     let total = json["nbHits"].as_u64().unwrap_or(0);
     let retrieved = retrieved_at();
     let mut out = format!("Hacker News: {total} results\nretrieved_at: {retrieved}\n\n");
@@ -2776,7 +2850,7 @@ async fn discourse_search(
         return Err(format!("{} returned HTTP {status}", source.label));
     }
     let payload: Value = response
-        .json()
+        .json_capped()
         .await
         .map_err(|error| format!("{} JSON: {error}", source.label))?;
     parse_discourse_search(
@@ -3118,7 +3192,7 @@ pub async fn pubmed_search(query: String, max_results: Option<u32>) -> Result<St
         .map_err(|e| format!("PubMed search: {e}"))?;
 
     let sj: Value = search_resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("PubMed JSON: {e}"))?;
     let ids: Vec<&str> = sj["esearchresult"]["idlist"]
@@ -3140,7 +3214,7 @@ pub async fn pubmed_search(query: String, max_results: Option<u32>) -> Result<St
         .map_err(|e| format!("PubMed summary: {e}"))?;
 
     let dj: Value = sum_resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("PubMed JSON: {e}"))?;
     let mut out = format!("PubMed: {total} results (showing {}):\n\n", ids.len());
@@ -3230,7 +3304,7 @@ pub async fn arxiv_search(
         .await
         .map_err(|e| format!("arXiv: {e}"))?;
 
-    let xml = resp.text().await.map_err(|e| format!("arXiv text: {e}"))?;
+    let xml = resp.text_capped().await.map_err(|e| format!("arXiv text: {e}"))?;
     let total_str = xml_tag_value(&xml, "opensearch:totalResults");
     let mut out = format!("arXiv: {total_str} results\n\n");
 
@@ -3303,7 +3377,7 @@ pub async fn crossref_search(
     }
 
     let json: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("CrossRef JSON: {e}"))?;
     let total = json["message"]["total-results"].as_u64().unwrap_or(0);
@@ -3391,7 +3465,7 @@ pub async fn openalex_search(
     }
 
     let json: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("OpenAlex JSON: {e}"))?;
     let total = json["meta"]["count"].as_u64().unwrap_or(0);
@@ -3497,7 +3571,7 @@ pub async fn pubchem_search(query: String, search_type: Option<String>) -> Resul
                 .map_err(|e| format!("PubChem autocomplete: {e}"))?;
 
             let auto_json: Value = auto_resp
-                .json()
+                .json_capped()
                 .await
                 .map_err(|e| format!("PubChem JSON: {e}"))?;
             let names: Vec<&str> = auto_json["dictionary_terms"]["compound"]
@@ -3522,7 +3596,7 @@ pub async fn pubchem_search(query: String, search_type: Option<String>) -> Resul
 
             if prop_resp.status().is_success() {
                 let pj: Value = prop_resp
-                    .json()
+                    .json_capped()
                     .await
                     .map_err(|e| format!("PubChem JSON: {e}"))?;
                 if let Some(props) = pj["PropertyTable"]["Properties"].as_array() {
@@ -3584,7 +3658,7 @@ pub async fn clinical_trials_search(
         return Err(format!("ClinicalTrials returned {}", resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| format!("CT JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("CT JSON: {e}"))?;
     let total = json["totalCount"].as_u64().unwrap_or(0);
     let mut out = format!("ClinicalTrials.gov: {total} studies\n\n");
 
@@ -3659,7 +3733,7 @@ pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result
         .await
         .map_err(|e| format!("Docker Hub: {e}"))?;
 
-    let json: Value = resp.json().await.map_err(|e| format!("DH JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("DH JSON: {e}"))?;
     let total = json["count"].as_u64().unwrap_or(0);
     let mut out = format!("Docker Hub: {total} images\n\n");
 
@@ -3709,14 +3783,14 @@ pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<St
         return Err("GitLab rate limited (HTTP 429)".into());
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text_capped().await.unwrap_or_default();
         return Err(format!(
             "GitLab returned HTTP {status}: {}",
             trunc(body.trim(), 240)
         ));
     }
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("GitLab parse: {e}"))?;
     let arr = data.as_array().ok_or("GitLab: unexpected response")?;
@@ -3803,7 +3877,7 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
     if !status.is_success() {
         return Err(format!("Gitee returned HTTP {status}"));
     }
-    let data: Value = resp.json().await.map_err(|e| format!("Gitee parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("Gitee parse: {e}"))?;
     let arr = data.as_array().ok_or("Gitee: unexpected response")?;
     let retrieved = retrieved_at();
     if arr.is_empty() {
@@ -3834,7 +3908,7 @@ pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("Maven: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("Maven parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("Maven parse: {e}"))?;
     let docs = data["response"]["docs"]
         .as_array()
         .ok_or("Maven: no docs")?;
@@ -3879,7 +3953,7 @@ pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result
         .await
         .map_err(|e| format!("Packagist: {e}"))?;
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("Packagist parse: {e}"))?;
     let results = data["results"].as_array().ok_or("Packagist: no results")?;
@@ -3919,7 +3993,7 @@ pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<
         .await
         .map_err(|e| format!("RubyGems: {e}"))?;
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("RubyGems parse: {e}"))?;
     let arr = data.as_array().ok_or("RubyGems: unexpected response")?;
@@ -3958,7 +4032,7 @@ pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("NuGet: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("NuGet parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("NuGet parse: {e}"))?;
     let items = data["data"].as_array().ok_or("NuGet: no data")?;
     if items.is_empty() {
         return Ok(format!("No NuGet packages found for '{query}'"));
@@ -4005,7 +4079,7 @@ pub async fn homebrew_search(query: String) -> Result<String, String> {
     let url = format!("https://formulae.brew.sh/api/formula/{slug}.json");
     if let Ok(r) = client.get(&url).send().await {
         if r.status().is_success() {
-            if let Ok(data) = r.json::<Value>().await {
+            if let Ok(data) = r.json_capped::<Value>().await {
                 let name = data["name"].as_str().unwrap_or("?");
                 let desc = data["desc"].as_str().unwrap_or("");
                 let version = data["versions"]["stable"].as_str().unwrap_or("?");
@@ -4033,7 +4107,7 @@ pub async fn homebrew_search(query: String) -> Result<String, String> {
     let url2 = format!("https://formulae.brew.sh/api/cask/{slug}.json");
     if let Ok(r2) = client.get(&url2).send().await {
         if r2.status().is_success() {
-            if let Ok(data) = r2.json::<Value>().await {
+            if let Ok(data) = r2.json_capped::<Value>().await {
                 let token = data["token"].as_str().unwrap_or("?");
                 let desc = data["desc"].as_str().unwrap_or("");
                 let version = data["version"].as_str().unwrap_or("?");
@@ -4063,7 +4137,7 @@ pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<Strin
         .send()
         .await
         .map_err(|e| format!("MDN: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("MDN parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("MDN parse: {e}"))?;
     let docs = data["documents"].as_array().ok_or("MDN: no documents")?;
     if docs.is_empty() {
         return Ok(format!("No MDN docs found for '{query}'"));
@@ -4102,7 +4176,7 @@ pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("cdnjs: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("cdnjs parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("cdnjs parse: {e}"))?;
     let results = data["results"].as_array().ok_or("cdnjs: no results")?;
     if results.is_empty() {
         return Ok(format!("No cdnjs libraries found for '{query}'"));
@@ -4142,7 +4216,7 @@ pub async fn bundlephobia_search(package: String) -> Result<String, String> {
         ));
     }
     let d: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("Bundlephobia parse: {e}"))?;
     let name = d["name"].as_str().unwrap_or("?");
@@ -4220,7 +4294,7 @@ pub async fn reddit_search(
         return Err(format!("Reddit returned {}", resp.status()));
     }
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("Reddit parse: {e}"))?;
     let posts = data["data"]["children"]
@@ -4317,7 +4391,7 @@ pub async fn steam_search(query: String, max_results: Option<u32>) -> Result<Str
         .send()
         .await
         .map_err(|e| format!("Steam: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("Steam parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("Steam parse: {e}"))?;
     let items = data["items"].as_array().ok_or("Steam: no items")?;
     if items.is_empty() {
         return Ok(format!("No Steam games found for '{query}'"));
@@ -4371,7 +4445,7 @@ pub async fn iconify_search(query: String, max_results: Option<u32>) -> Result<S
         .await
         .map_err(|e| format!("Iconify: {e}"))?;
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("Iconify parse: {e}"))?;
     let icons = data["icons"].as_array().ok_or("Iconify: no icons")?;
@@ -4415,7 +4489,7 @@ pub async fn color_search(query: String, max_results: Option<u32>) -> Result<Str
         .await
         .map_err(|e| format!("ColourLovers: {e}"))?;
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("ColourLovers parse: {e}"))?;
     let palettes = data.as_array().ok_or("ColourLovers: unexpected response")?;
@@ -4483,7 +4557,7 @@ pub async fn juejin_search(query: String, max_results: Option<u32>) -> Result<St
     if !resp.status().is_success() {
         return Err(format!("掘金 returned {}", resp.status()));
     }
-    let json: Value = resp.json().await.map_err(|e| format!("掘金 JSON: {e}"))?;
+    let json: Value = resp.json_capped().await.map_err(|e| format!("掘金 JSON: {e}"))?;
     let data = json["data"]
         .as_array()
         .ok_or("掘金: response did not contain a data array")?;
@@ -4566,7 +4640,7 @@ async fn wp_search(
         .send()
         .await
         .map_err(|e| format!("{label}: {e}"))?;
-    let items: Vec<Value> = resp.json().await.unwrap_or_default();
+    let items: Vec<Value> = resp.json_capped().await.unwrap_or_default();
     if items.is_empty() {
         return Ok(format!("No {label} articles found for '{query}'"));
     }
@@ -4581,7 +4655,7 @@ async fn wp_search(
             i + 1,
             title,
             trunc(&excerpt, 200),
-            &date[..date.len().min(10)],
+            &date[..clamp_char_boundary(date, 10)],
             link,
         ));
     }
@@ -4609,7 +4683,7 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
         .await
         .map_err(|e| format!("SmashingMag RSS: {e}"))?;
     let xml = resp
-        .text()
+        .text_capped()
         .await
         .map_err(|e| format!("SmashingMag RSS: {e}"))?;
     let query_lower = query.to_lowercase();
@@ -4640,7 +4714,7 @@ pub async fn smashingmag_search(query: String, max_results: Option<u32>) -> Resu
             count,
             strip_html(&title),
             trunc(&strip_html(&desc), 200),
-            &date[..date.len().min(16)],
+            &date[..clamp_char_boundary(&date, 16)],
             link,
         ));
     }
@@ -4727,7 +4801,7 @@ pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<
         .send()
         .await
         .map_err(|e| format!("Awwwards: {e}"))?;
-    let html = resp.text().await.map_err(|e| format!("Awwwards: {e}"))?;
+    let html = resp.text_capped().await.map_err(|e| format!("Awwwards: {e}"))?;
     let mut out = format!("Awwwards sites for '{query}':\n\n");
     let mut count = 0;
     let mut pos = 0;
@@ -4740,7 +4814,9 @@ pub async fn awwwards_search(query: String, max_results: Option<u32>) -> Result<
         let end = html[start + 7..]
             .find(['"', '\'', '<', ' ', '?'])
             .unwrap_or(0);
-        let path = &html[start..start + 7 + end.min(200)];
+        // 截断必须落在字符边界上，否则外部页面里的一个中文字符就能让这里 panic。
+        let take = clamp_char_boundary(&html[start + 7..], end.min(200));
+        let path = &html[start..start + 7 + take];
         let slug = path.split('/').rfind(|s| !s.is_empty()).unwrap_or("");
         pos = start + 7 + end;
         if slug.is_empty() || slug == "sites" || slug == "new" || slug.len() < 3 {
@@ -4837,7 +4913,7 @@ pub async fn v2ex_search(query: String, max_results: Option<u32>) -> Result<Stri
     if !status.is_success() {
         return Err(format!("V2EX (SOV2EX) returned HTTP {status}"));
     }
-    let data: Value = resp.json().await.map_err(|e| format!("V2EX parse: {e}"))?;
+    let data: Value = resp.json_capped().await.map_err(|e| format!("V2EX parse: {e}"))?;
     let total = data["total"].as_u64().unwrap_or(0);
     let hits = data["hits"].as_array();
     if total == 0 || hits.is_none() {
@@ -4904,7 +4980,7 @@ pub async fn segmentfault_search(
         return Err(format!("SegmentFault returned HTTP {status}"));
     }
     let data: Value = resp
-        .json()
+        .json_capped()
         .await
         .map_err(|e| format!("SegmentFault parse: {e}"))?;
     let rows = data["data"]["rows"].as_array();
@@ -5025,7 +5101,7 @@ pub async fn freecodecamp_search(
         .await
         .map_err(|e| e.to_string())?;
     ensure_provider_http_success("freeCodeCamp", resp.status())?;
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
     let mut out = format!("FreeCodeCamp articles for '{query}':\nretrieved_at: {retrieved}\n\n");
     let mut count = 0usize;
@@ -5096,7 +5172,7 @@ pub async fn github_trending(query: String, max_results: Option<u32>) -> Result<
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 if status == 200 {
-                    html = resp.text().await.map_err(|e| e.to_string())?;
+                    html = resp.text_capped().await.map_err(|e| e.to_string())?;
                     break;
                 } else if status == 429 && attempt < 2 {
                     last_err = format!("rate limited ({})", status);
@@ -5250,7 +5326,7 @@ pub async fn infoq_search(query: String, max_results: Option<u32>) -> Result<Str
         .await
         .map_err(|e| e.to_string())?;
     ensure_provider_http_success("InfoQ", resp.status())?;
-    let html = resp.text().await.map_err(|e| e.to_string())?;
+    let html = resp.text_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
     let mut out = format!("InfoQ articles for '{query}':\nretrieved_at: {retrieved}\n\n");
     let mut count = 0;
@@ -5431,7 +5507,7 @@ pub async fn codeberg_search(query: String, max_results: Option<u32>) -> Result<
     if !status.is_success() {
         return Err(format!("Codeberg returned HTTP {status}"));
     }
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
     let mut out = format!("Codeberg repos for '{query}':\nretrieved_at: {retrieved}\n\n");
     if let Some(repos) = data["data"].as_array() {
@@ -5459,7 +5535,7 @@ pub async fn bestofjs_search(query: String, max_results: Option<u32>) -> Result<
         .await
         .map_err(|e| e.to_string())?;
     ensure_provider_http_success("Best of JS", resp.status())?;
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
     let query_lower = query.to_lowercase();
     let keywords: Vec<&str> = query_lower.split_whitespace().collect();
@@ -5550,7 +5626,7 @@ pub async fn sourcegraph_search(query: String, max_results: Option<u32>) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     ensure_provider_http_success("Sourcegraph", resp.status())?;
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let data: Value = resp.json_capped().await.map_err(|e| e.to_string())?;
     let retrieved = retrieved_at();
     let (result_count, results) = sourcegraph_graphql_results(&data)?;
     let mut out = format!(
@@ -5673,7 +5749,7 @@ async fn ddg_surface_checked(
         return Err(format!("DuckDuckGo returned HTTP {status}"));
     }
     let html = resp
-        .text()
+        .text_capped()
         .await
         .map_err(|error| format!("DuckDuckGo response body: {error}"))?;
     Ok(parse_ddg_html(&html, "明网"))
@@ -5694,7 +5770,7 @@ async fn ddg_onion(q: &str) -> Vec<(String, String, String, &'static str)> {
         .send()
         .await;
     let html = match resp {
-        Ok(r) => r.text().await.unwrap_or_default(),
+        Ok(r) => r.text_capped().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
     parse_ddg_html(&html, "Tor匿名")
@@ -5707,7 +5783,7 @@ async fn ahmia_search_layer(q: &str) -> Vec<(String, String, String, &'static st
     };
     let url = format!("https://ahmia.fi/search/?q={}", q.replace(' ', "+"));
     let resp = match client.get(&url).send().await {
-        Ok(r) => r.text().await.unwrap_or_default(),
+        Ok(r) => r.text_capped().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
     let mut results = Vec::new();
@@ -5760,7 +5836,7 @@ async fn torch_search_layer(q: &str) -> Vec<(String, String, String, &'static st
         q.replace(' ', "+")
     );
     let resp = match client.get(&url).send().await {
-        Ok(r) => r.text().await.unwrap_or_default(),
+        Ok(r) => r.text_capped().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
     let mut results = Vec::new();
@@ -5874,7 +5950,7 @@ async fn ddg_query(q: &str, label: &'static str) -> Vec<(String, String, String,
         .send()
         .await;
     match resp {
-        Ok(r) => parse_ddg_html(&r.text().await.unwrap_or_default(), label),
+        Ok(r) => parse_ddg_html(&r.text_capped().await.unwrap_or_default(), label),
         Err(_) => vec![],
     }
 }
@@ -5908,7 +5984,7 @@ async fn wayback_layer(domain: &str) -> Vec<(String, String, String, &'static st
         "http://web.archive.org/cdx/search/cdx?url={domain}*&output=json&fl=original,timestamp&collapse=urlkey&limit=50"
     );
     let txt = match client.get(&url).send().await {
-        Ok(r) => r.text().await.unwrap_or_default(),
+        Ok(r) => r.text_capped().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
     let rows: Vec<Vec<String>> = serde_json::from_str(&txt).unwrap_or_default();
@@ -5943,7 +6019,7 @@ async fn crtsh_layer(domain: &str) -> Vec<(String, String, String, &'static str)
         .send()
         .await
     {
-        Ok(r) => r.text().await.unwrap_or_default(),
+        Ok(r) => r.text_capped().await.unwrap_or_default(),
         Err(_) => return vec![],
     };
     let arr: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
@@ -6028,7 +6104,7 @@ async fn haystak_layer(q: &str) -> Vec<(String, String, String, &'static str)> {
         q.replace(' ', "+")
     );
     match client.get(&url).send().await {
-        Ok(r) => extract_onion_links(&r.text().await.unwrap_or_default(), "暗网(Haystak)"),
+        Ok(r) => extract_onion_links(&r.text_capped().await.unwrap_or_default(), "暗网(Haystak)"),
         Err(_) => vec![],
     }
 }
@@ -6833,5 +6909,47 @@ mod tests {
         println!("{out}");
         assert!(out.contains("本轮完成"));
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// 上限保护必须建立在**实际读到的字节**上，不能只信对端自报的 Content-Length。
+    /// 这里用 http::Response 直接造 reqwest::Response，不起网络。
+    fn resp_with_body(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn capped_read_accepts_normal_body() {
+        let r = resp_with_body(b"{\"ok\":true}".to_vec());
+        let v: serde_json::Value = r.json_capped().await.expect("正常大小的响应该成功");
+        assert_eq!(v["ok"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn capped_read_rejects_oversized_body() {
+        let big = vec![b'a'; MAX_RESPONSE_BYTES + 1];
+        let err = resp_with_body(big)
+            .text_capped()
+            .await
+            .expect_err("超过上限的响应必须报错，而不是照单全收");
+        assert!(err.contains("上限"), "错误信息应说明是超限: {err}");
+    }
+
+    #[tokio::test]
+    async fn capped_read_keeps_body_exactly_at_limit() {
+        // 边界：正好等于上限不该被拒（用 > 而不是 >=）。
+        let exact = vec![b'a'; MAX_RESPONSE_BYTES];
+        let out = resp_with_body(exact).text_capped().await.expect("正好等于上限应通过");
+        assert_eq!(out.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn capped_read_survives_invalid_utf8() {
+        // reqwest 的 text() 对非 UTF-8 是用替换字符兜底而不是失败，这里要保持一致，
+        // 否则抓到一个编码怪异的页面就会从"内容乱码"升级成"整个源失败"。
+        let out = resp_with_body(vec![0xff, 0xfe, b'h', b'i'])
+            .text_capped()
+            .await
+            .expect("非 UTF-8 应兜底而不是失败");
+        assert!(out.ends_with("hi"), "有效部分应保留: {out:?}");
     }
 }

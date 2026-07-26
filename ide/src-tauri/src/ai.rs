@@ -3,39 +3,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 
-const STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 20;
+const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 15;
 const STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 35;
 const STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 18;
 const STANDARD_STREAM_STALL_TIMEOUT_SECS: u64 = 45;
-const HIGH_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 45;
-const HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
-const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 90;
+const HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 45;
+const HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 45;
 const HIGH_STREAM_STALL_TIMEOUT_SECS: u64 = 90;
-const EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 90;
-const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
-const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 180;
+const EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
+const EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const EXTENDED_STREAM_STALL_TIMEOUT_SECS: u64 = 120;
 
-const RESPONSE_HEADERS_TIMEOUT_ENV: &str = "MICHAEL_AI_RESPONSE_HEADERS_TIMEOUT_SECS";
 const FIRST_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_FIRST_PROGRESS_TIMEOUT_SECS";
 const EMPTY_STREAM_PROGRESS_TIMEOUT_ENV: &str = "MICHAEL_AI_EMPTY_STREAM_TIMEOUT_SECS";
 const STREAM_STALL_TIMEOUT_ENV: &str = "MICHAEL_AI_STREAM_STALL_TIMEOUT_SECS";
 
-const RESPONSE_HEADERS_TIMEOUT_MIN_SECS: u64 = 5;
-const RESPONSE_HEADERS_TIMEOUT_MAX_SECS: u64 = 300;
 const FIRST_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 10;
-const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
+const FIRST_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 60;
 const EMPTY_STREAM_PROGRESS_TIMEOUT_MIN_SECS: u64 = 5;
-const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 300;
+const EMPTY_STREAM_PROGRESS_TIMEOUT_MAX_SECS: u64 = 60;
 const STREAM_STALL_TIMEOUT_MIN_SECS: u64 = 15;
 const STREAM_STALL_TIMEOUT_MAX_SECS: u64 = 300;
 const STREAM_READ_POLL: Duration = Duration::from_secs(2);
 const INCOMPLETE_SSE_STREAM_ERROR: &str = "AI stream closed before data: [DONE]（连接提前结束）；响应可能被截断，已拒绝本轮结果，请重试。";
 const PRE_STREAM_GATEWAY_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(600), Duration::from_millis(1200)];
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+const CANCELLED_AI_REQUEST: &str = "AI request cancelled";
+const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
 
 /// Shared HTTP client. The agentic loop fires many sequential requests; a single
 /// pooled client reuses TCP+TLS connections (keep-alive) instead of doing a fresh
@@ -175,6 +173,10 @@ pub enum AiEvent {
         elapsed_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
     Done,
     /// Token accounting from the final stream chunk — lets the UI show how much of
@@ -224,9 +226,7 @@ pub async fn ai_complete(
     });
 
     let client = &*HTTP;
-    let completion_timeout = StreamTimeouts::for_config(&config)
-        .response_headers
-        .max(Duration::from_secs(45));
+    let completion_timeout = StreamTimeouts::for_config(&config).response_headers;
     let resp = send_with_response_headers_timeout(
         with_ide_headers(client.post(&url).bearer_auth(&config.api_key), &config).json(&payload),
         completion_timeout,
@@ -262,22 +262,6 @@ pub async fn ai_chat_with_tools(
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     ai_chat_inner(config, messages, Some(tools), on_event).await
-}
-
-/// Tag a message's plain-string `content` with an ephemeral `cache_control`
-/// breakpoint (Anthropic prompt caching). No-op unless `content` is a plain
-/// string, so already-structured (multimodal / tool_result) messages are left
-/// untouched and can never be corrupted.
-fn mark_cache_breakpoint(msg: &mut serde_json::Value) {
-    if let Some(text) = msg
-        .get("content")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-    {
-        msg["content"] = serde_json::json!([
-            { "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }
-        ]);
-    }
 }
 
 fn ai_error_detail_from_body(body: &str) -> String {
@@ -393,6 +377,67 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     rb
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResponseHeadersDeadline {
+    started: Instant,
+    at: Instant,
+    budget: Duration,
+    unix_ms: u64,
+}
+
+impl ResponseHeadersDeadline {
+    fn new(started: Instant, budget: Duration) -> Self {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_add(budget.as_millis())
+            .min(u64::MAX as u128) as u64;
+        Self {
+            started,
+            at: started + budget,
+            budget,
+            unix_ms,
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
+    }
+
+    fn timeout_error(self) -> String {
+        response_headers_timeout_error(self.budget, self.started.elapsed())
+    }
+}
+
+fn with_response_deadline_header(
+    request: reqwest::RequestBuilder,
+    deadline: ResponseHeadersDeadline,
+) -> reqwest::RequestBuilder {
+    request.header(RESPONSE_DEADLINE_HEADER, deadline.unix_ms.to_string())
+}
+
+fn request_was_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+async fn wait_for_gateway_retry(
+    delay: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let retry_at = Instant::now() + delay;
+    loop {
+        if request_was_cancelled(cancel) {
+            return Err(CANCELLED_AI_REQUEST.to_string());
+        }
+        let now = Instant::now();
+        if now >= retry_at {
+            return Ok(());
+        }
+        tokio::time::sleep(CANCEL_POLL.min(retry_at.saturating_duration_since(now))).await;
+    }
+}
+
 /// Retries only before an SSE response is accepted. Once the stream is open,
 /// the caller never replays it because a model/tool delta may already exist.
 async fn post_chat_with_gateway_retry(
@@ -400,21 +445,52 @@ async fn post_chat_with_gateway_retry(
     url: &str,
     config: &AiConfig,
     payload: &serde_json::Value,
-    response_headers_timeout: Duration,
+    per_attempt_timeout: Duration,
     retry_delays: &[Duration],
+    cancel: Option<&AtomicBool>,
+    retry_events: Option<(&Channel<AiEvent>, Instant)>,
 ) -> Result<reqwest::Response, String> {
-    for attempt in 0..=retry_delays.len() {
-        let response = send_with_response_headers_timeout(
-            with_ide_headers(client.post(url).bearer_auth(&config.api_key), config).json(payload),
-            response_headers_timeout,
-        )
-        .await?;
-        if !is_retryable_gateway_status(response.status()) || attempt == retry_delays.len() {
-            return Ok(response);
+    let mut retries = 0_u32;
+    loop {
+        if request_was_cancelled(cancel) {
+            return Err(CANCELLED_AI_REQUEST.to_string());
         }
-        tokio::time::sleep(retry_delays[attempt]).await;
+        let deadline = ResponseHeadersDeadline::new(Instant::now(), per_attempt_timeout);
+        let result = send_with_response_headers_deadline(
+            with_response_deadline_header(
+                with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
+                deadline,
+            )
+            .json(payload),
+            deadline,
+            cancel,
+        )
+        .await;
+        let status = match result {
+            Ok(response) if !is_retryable_gateway_status(response.status()) => {
+                return Ok(response);
+            }
+            Ok(response) => Some(response.status().as_u16()),
+            Err(error) if error == CANCELLED_AI_REQUEST => return Err(error),
+            Err(_) => None,
+        };
+        retries = retries.saturating_add(1);
+        if let Some((on_event, started)) = retry_events {
+            let _ = on_event.send(AiEvent::StreamMetric {
+                phase: "gatewayRetry".to_string(),
+                elapsed_ms: elapsed_ms_since(started),
+                bytes: None,
+                attempt: Some(retries),
+                status,
+            });
+        }
+        let delay = retry_delays
+            .get(retries.saturating_sub(1) as usize)
+            .or_else(|| retry_delays.last())
+            .copied()
+            .unwrap_or(Duration::ZERO);
+        wait_for_gateway_retry(delay, cancel).await?;
     }
-    unreachable!("the retry loop always returns its final HTTP response")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,7 +532,7 @@ impl StreamTimeouts {
         // 本身就是长时间无输出，窗口太短会被无进度看门狗掐掉再重试，用户设的思考深度形同虚设。
         let defaults = if has_thinking_budget || deep(effort) || deep(ui_effort) {
             (
-                EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS,
+                RESPONSE_HEADERS_TIMEOUT_SECS,
                 EXTENDED_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 EXTENDED_STREAM_STALL_TIMEOUT_SECS,
@@ -466,14 +542,14 @@ impl StreamTimeouts {
             || thinking_enabled
         {
             (
-                HIGH_RESPONSE_HEADERS_TIMEOUT_SECS,
+                RESPONSE_HEADERS_TIMEOUT_SECS,
                 HIGH_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 HIGH_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 HIGH_STREAM_STALL_TIMEOUT_SECS,
             )
         } else {
             (
-                STANDARD_RESPONSE_HEADERS_TIMEOUT_SECS,
+                RESPONSE_HEADERS_TIMEOUT_SECS,
                 STANDARD_FIRST_STREAM_PROGRESS_TIMEOUT_SECS,
                 STANDARD_EMPTY_STREAM_PROGRESS_TIMEOUT_SECS,
                 STANDARD_STREAM_STALL_TIMEOUT_SECS,
@@ -481,12 +557,7 @@ impl StreamTimeouts {
         };
 
         Self {
-            response_headers: bounded_timeout_from_env(
-                read_env(RESPONSE_HEADERS_TIMEOUT_ENV),
-                defaults.0,
-                RESPONSE_HEADERS_TIMEOUT_MIN_SECS,
-                RESPONSE_HEADERS_TIMEOUT_MAX_SECS,
-            ),
+            response_headers: Duration::from_secs(defaults.0),
             first_progress: bounded_timeout_from_env(
                 read_env(FIRST_STREAM_PROGRESS_TIMEOUT_ENV),
                 defaults.1,
@@ -536,10 +607,11 @@ fn duration_seconds_label(duration: Duration) -> String {
         .to_string()
 }
 
-fn response_headers_timeout_error(timeout: Duration) -> String {
+fn response_headers_timeout_error(timeout: Duration, elapsed: Duration) -> String {
     format!(
-        "AI request timed out waiting for response headers after {} seconds",
-        duration_seconds_label(timeout)
+        "AI request timed out waiting for response headers after {} seconds (per-attempt {}-second deadline)",
+        duration_seconds_label(elapsed.min(timeout)),
+        duration_seconds_label(timeout),
     )
 }
 
@@ -547,10 +619,31 @@ async fn send_with_response_headers_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
 ) -> Result<reqwest::Response, String> {
-    match tokio::time::timeout(timeout, request.send()).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err(response_headers_timeout_error(timeout)),
+    let deadline = ResponseHeadersDeadline::new(Instant::now(), timeout);
+    send_with_response_headers_deadline(request, deadline, None).await
+}
+
+async fn send_with_response_headers_deadline(
+    request: reqwest::RequestBuilder,
+    deadline: ResponseHeadersDeadline,
+    cancel: Option<&AtomicBool>,
+) -> Result<reqwest::Response, String> {
+    let send = request.send();
+    tokio::pin!(send);
+    loop {
+        if request_was_cancelled(cancel) {
+            return Err(CANCELLED_AI_REQUEST.to_string());
+        }
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(deadline.timeout_error());
+        }
+        match tokio::time::timeout(remaining.min(CANCEL_POLL), &mut send).await {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) if deadline.remaining().is_zero() => return Err(deadline.timeout_error()),
+            Err(_) => continue,
+        }
     }
 }
 
@@ -663,6 +756,8 @@ fn send_stream_metric(
         phase: phase.to_string(),
         elapsed_ms: elapsed_ms_since(started),
         bytes,
+        attempt: None,
+        status: None,
     });
 }
 
@@ -891,7 +986,7 @@ mod stream_timeout_tests {
     #[test]
     fn default_medium_deadlines_stay_fast_and_bounded() {
         let standard = StreamTimeouts {
-            response_headers: Duration::from_secs(20),
+            response_headers: Duration::from_secs(15),
             first_progress: Duration::from_secs(35),
             empty_stream: Duration::from_secs(18),
             stall: Duration::from_secs(45),
@@ -906,18 +1001,16 @@ mod stream_timeout_tests {
         assert_eq!(
             timeouts(Some("high"), None),
             StreamTimeouts {
-                response_headers: Duration::from_secs(45),
-                first_progress: Duration::from_secs(90),
-                // empty_stream 必须≈first_progress：网关 15s 心跳/空 role 预热帧一到，
-                // 窗口就从 first_progress 切到 empty_stream——小窗会把深思拦腰掐断
-                empty_stream: Duration::from_secs(90),
+                response_headers: Duration::from_secs(15),
+                first_progress: Duration::from_secs(45),
+                empty_stream: Duration::from_secs(45),
                 stall: Duration::from_secs(90),
             }
         );
         let extended = StreamTimeouts {
-            response_headers: Duration::from_secs(90),
-            first_progress: Duration::from_secs(180),
-            empty_stream: Duration::from_secs(180),
+            response_headers: Duration::from_secs(15),
+            first_progress: Duration::from_secs(60),
+            empty_stream: Duration::from_secs(60),
             stall: Duration::from_secs(120),
         };
         assert_eq!(timeouts(Some("max"), None), extended);
@@ -931,7 +1024,6 @@ mod stream_timeout_tests {
     #[test]
     fn environment_overrides_are_independent_and_clamped() {
         let values = HashMap::from([
-            (RESPONSE_HEADERS_TIMEOUT_ENV, "1".to_string()),
             (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "9999".to_string()),
             (EMPTY_STREAM_PROGRESS_TIMEOUT_ENV, "3".to_string()),
             (STREAM_STALL_TIMEOUT_ENV, "61".to_string()),
@@ -942,15 +1034,14 @@ mod stream_timeout_tests {
         assert_eq!(
             overridden,
             StreamTimeouts {
-                response_headers: Duration::from_secs(5),
-                first_progress: Duration::from_secs(300),
+                response_headers: Duration::from_secs(15),
+                first_progress: Duration::from_secs(60),
                 empty_stream: Duration::from_secs(5),
                 stall: Duration::from_secs(61),
             }
         );
 
         let invalid = HashMap::from([
-            (RESPONSE_HEADERS_TIMEOUT_ENV, "not-a-number".to_string()),
             (FIRST_STREAM_PROGRESS_TIMEOUT_ENV, "".to_string()),
             (
                 EMPTY_STREAM_PROGRESS_TIMEOUT_ENV,
@@ -995,7 +1086,7 @@ mod stream_timeout_tests {
 
         assert_eq!(
             progress.remaining(started + Duration::from_secs(40)),
-            Some(Duration::from_secs(50)),
+            Some(Duration::from_secs(5)),
             "before any bytes arrive, high reasoning may still wait for first progress"
         );
 
@@ -1070,8 +1161,8 @@ mod stream_timeout_tests {
             stall: Duration::from_secs(97),
         };
         assert_eq!(
-            response_headers_timeout_error(timeouts.response_headers),
-            "AI request timed out waiting for response headers after 73 seconds"
+            response_headers_timeout_error(timeouts.response_headers, Duration::from_secs(73)),
+            "AI request timed out waiting for response headers after 73 seconds (per-attempt 73-second deadline)"
         );
 
         let started = Instant::now();
@@ -1109,19 +1200,26 @@ mod stream_timeout_tests {
         .unwrap_err();
         assert_eq!(
             error,
-            "AI request timed out waiting for response headers after 0.02 seconds"
+            "AI request timed out waiting for response headers after 0.02 seconds (per-attempt 0.02-second deadline)"
         );
         server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn gateway_502_retries_before_an_sse_stream_is_opened() {
+    async fn gateway_502_retries_are_not_capped_before_an_sse_stream_is_opened() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let (count_tx, count_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let statuses = ["502 Bad Gateway", "502 Bad Gateway", "200 OK"];
+            let statuses = [
+                "502 Bad Gateway",
+                "502 Bad Gateway",
+                "502 Bad Gateway",
+                "502 Bad Gateway",
+                "502 Bad Gateway",
+                "200 OK",
+            ];
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut served = 0;
             while served < statuses.len() && Instant::now() < deadline {
@@ -1158,11 +1256,102 @@ mod stream_timeout_tests {
             &serde_json::json!({"model": "test", "stream": true, "messages": []}),
             Duration::from_secs(1),
             &[Duration::from_millis(0), Duration::from_millis(0)],
+            None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(count_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 3);
+        assert_eq!(count_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 6);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_retries_reset_the_per_attempt_response_header_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = first.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("x-ide-response-deadline-ms:"));
+            std::thread::sleep(Duration::from_millis(30));
+            first
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut [0_u8; 4096]);
+            std::thread::sleep(Duration::from_millis(60));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let mut cfg = config(None, None);
+        cfg.base_url = format!("http://{address}");
+        let started = Instant::now();
+        let response = post_chat_with_gateway_retry(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1/chat/completions"),
+            &cfg,
+            &serde_json::json!({"model": "test", "stream": true, "messages": []}),
+            Duration::from_millis(80),
+            &[Duration::from_millis(20), Duration::from_millis(20)],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "the second attempt did not receive its own full deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_response_header_wait() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0_u8; 4096]);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel_task.store(true, Ordering::SeqCst);
+        });
+
+        let cfg = config(None, None);
+        let started = Instant::now();
+        let error = post_chat_with_gateway_retry(
+            &reqwest::Client::new(),
+            &format!("http://{address}/v1/chat/completions"),
+            &cfg,
+            &serde_json::json!({"model": "test", "stream": true, "messages": []}),
+            Duration::from_secs(1),
+            &[],
+            Some(cancel.as_ref()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, CANCELLED_AI_REQUEST);
+        assert!(
+            started.elapsed() < Duration::from_millis(180),
+            "cancel did not interrupt the header wait"
+        );
         server.join().unwrap();
     }
 
@@ -1293,6 +1482,12 @@ async fn ai_chat_inner(
     let timeouts = StreamTimeouts::for_config(&config);
     let url = chat_completions_url(&config.base_url)?;
     let stream_started = Instant::now();
+    // Register cancellation before DNS/connect/header wait. Previously registration
+    // happened only after headers arrived, so Stop could not interrupt the exact hang
+    // this watchdog is meant to bound.
+    let req_id = config.request_id.clone().filter(|s| !s.is_empty());
+    let cancel_flag = req_id.as_deref().map(register_cancel);
+    let _cancel_guard = req_id.map(CancelGuard);
     send_stream_metric(&on_event, stream_started, "requestStarted", None);
     let mut payload = serde_json::json!({
         "model": config.model,
@@ -1333,75 +1528,30 @@ async fn ai_chat_inner(
         payload["thinking_config"] = thinking_config.clone();
     }
 
-    // ── Prompt caching for Anthropic / Claude upstreams ─────────────────────
-    // Anthropic reuses content marked with a `cache_control` breakpoint and serves
-    // the LONGEST matching cached prefix (up to 4 breakpoints). We mark (1) the
-    // system prompt — kept byte-stable in main.js so it caches across every turn —
-    // and (2) a ROLLING TAIL breakpoint on the last up-to-2 plain-string messages
-    // (ANY role — crucially incl. tool results, where a long agentic turn's history
-    // piles up AFTER the last user message and would otherwise re-bill every step).
-    //
-    // Gated on the MODEL name (the gateway routes by model — base_url is always the
-    // gateway, so the old base_url check never fired). Only PLAIN-STRING content is
-    // reshaped, so tool/multimodal messages — and any non-Anthropic upstream — are
-    // left byte-for-byte untouched and can't break. DeepSeek / OpenAI / Kimi cache
-    // the stable prefix automatically, so they need no markup at all.
-    // ⚠️ DISABLED on the current relay (zyz / "AWS渠道"): sending cache_control there
-    // triggers cache CREATION (a 1.25× write premium) on the ~34K fixed prefix on
-    // EVERY call but NEVER returns a cache READ — so each call cost ~25% MORE than no
-    // caching at all (observed: one streaming call billed $0.65, ≈ 34.1K × $15/M × 1.25).
-    // Re-enable ONLY against an upstream that actually SERVES cache reads (Anthropic /
-    // Bedrock direct, or a caching-aware proxy like LiteLLM) — flip the flag to true.
-    const ENABLE_PROMPT_CACHE: bool = false;
-    let model_lc = config.model.to_ascii_lowercase();
-    if ENABLE_PROMPT_CACHE
-        && (config.base_url.contains("anthropic")
-            || model_lc.contains("claude")
-            || model_lc.contains("anthropic"))
-    {
-        if let Some(arr) = payload["messages"].as_array_mut() {
-            // (1) System prompt — byte-stable across turns, caches once.
-            if let Some(first) = arr
-                .iter_mut()
-                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            {
-                mark_cache_breakpoint(first);
-            }
-            // (2) Rolling tail: walk from the end, mark the last up-to-2 messages
-            // that carry plain-string, NON-EMPTY content (any role). Anthropic
-            // serves the longest matching cached prefix, so marking the tail turns
-            // the whole prior conversation — including the accumulated tool history
-            // — into a cache hit next turn. `mark_cache_breakpoint` reshapes only
-            // plain strings, so multimodal (screenshot) and empty-content messages
-            // are skipped and can never be corrupted. ≤3 breakpoints total (budget 4).
-            let mut marked = 0;
-            for m in arr.iter_mut().rev() {
-                if marked >= 2 {
-                    break;
-                }
-                let has_text = m
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false);
-                if has_text {
-                    mark_cache_breakpoint(m);
-                    marked += 1;
-                }
-            }
-        }
-    }
+    // Prompt-cache breakpoints are route capabilities. The Michael gateway adds them only after
+    // selecting a native Anthropic connection; the desktop does not guess from model names or
+    // mutate the stable prefix.
 
     let client = &*HTTP;
-    let mut resp = post_chat_with_gateway_retry(
+    let resp_result = post_chat_with_gateway_retry(
         client,
         &url,
         &config,
         &payload,
         timeouts.response_headers,
         &PRE_STREAM_GATEWAY_RETRY_DELAYS,
+        cancel_flag.as_deref(),
+        Some((&on_event, stream_started)),
     )
-    .await?;
+    .await;
+    let mut resp = match resp_result {
+        Ok(response) => response,
+        Err(error) if error == CANCELLED_AI_REQUEST => {
+            let _ = on_event.send(AiEvent::Done);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     // If a strict gateway rejects the request (4xx — most likely the optional
     // `stream_options` it doesn't recognize), drop that field and retry ONCE. So
     // asking for usage stats can never break chat.
@@ -1412,15 +1562,25 @@ async fn ai_chat_inner(
         if let Some(o) = payload.as_object_mut() {
             o.remove("stream_options");
         }
-        resp = post_chat_with_gateway_retry(
+        let retry_result = post_chat_with_gateway_retry(
             client,
             &url,
             &config,
             &payload,
             timeouts.response_headers,
             &PRE_STREAM_GATEWAY_RETRY_DELAYS,
+            cancel_flag.as_deref(),
+            Some((&on_event, stream_started)),
         )
-        .await?;
+        .await;
+        resp = match retry_result {
+            Ok(response) => response,
+            Err(error) if error == CANCELLED_AI_REQUEST => {
+                let _ = on_event.send(AiEvent::Done);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
     }
 
     if !resp.status().is_success() {
@@ -1454,11 +1614,6 @@ async fn ai_chat_inner(
     // 首个有效输出前持续上报字节心跳：只发一次 firstChunk 会让前端永远显示首包字节数，
     // 用户无法区分"上游断了"和"模型还在深思/排队"（prefill 阶段不吐任何 token）。
     let mut last_bytes_metric_at = Instant::now();
-    // Cancellation: register a flag keyed by the JS-supplied request_id (if any).
-    // The guard removes it on every return path; the loop polls it so Stop aborts.
-    let req_id = config.request_id.clone().filter(|s| !s.is_empty());
-    let cancel_flag = req_id.as_deref().map(register_cancel);
-    let _cancel_guard = req_id.map(CancelGuard);
     loop {
         // User hit Stop → cancel_ai flipped this flag: end the turn now so the
         // upstream connection closes and token generation stops
@@ -1537,10 +1692,15 @@ async fn ai_chat_inner(
         }
         buf.extend_from_slice(&chunk);
 
-        // Server-sent events are newline-delimited `data: {...}` lines.
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = match std::str::from_utf8(&line_bytes) {
+        // Server-sent events are newline-delimited `data: {...}` lines. Scan with a
+        // cursor and compact once per network chunk; draining the Vec for every SSE
+        // line repeatedly shifted the remaining bytes when providers emitted a burst.
+        let mut consumed = 0usize;
+        while let Some(relative_pos) = buf[consumed..].iter().position(|&b| b == b'\n') {
+            let line_end = consumed + relative_pos;
+            let line_bytes = &buf[consumed..=line_end];
+            consumed = line_end + 1;
+            let line = match std::str::from_utf8(line_bytes) {
                 Ok(line) => line.trim(),
                 Err(error) => {
                     let message = format!("AI stream contains invalid UTF-8 SSE data: {error}");
@@ -1666,6 +1826,9 @@ async fn ai_chat_inner(
                     }
                 }
             }
+        }
+        if consumed > 0 {
+            buf.drain(..consumed);
         }
 
         // Continuous heartbeat chunks may prevent the read timeout from firing, so

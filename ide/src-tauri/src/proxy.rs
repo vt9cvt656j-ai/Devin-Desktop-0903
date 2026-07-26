@@ -77,6 +77,82 @@ def error(flow):
     _dump(flow)
 "#;
 
+/// 我们改动系统代理之前的原始状态。
+///
+/// 改了却不记，就没法还原 —— 而 `Running::drop`（进程被杀 / 应用退出 / 崩溃）此前只杀
+/// mitmdump，系统代理仍然指着一个已经死掉的 127.0.0.1:<port>：**整机断网**，用户还得
+/// 自己去系统设置里翻出来关掉。
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct SystemProxyBackup {
+    service: String,
+    http_on: bool,
+    http_server: String,
+    http_port: String,
+    https_on: bool,
+    https_server: String,
+    https_port: String,
+}
+
+#[cfg(target_os = "macos")]
+static SYSTEM_PROXY_BACKUP: std::sync::Mutex<Option<SystemProxyBackup>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn networksetup(args: &[&str]) -> Result<String, String> {
+    let out = crate::process_util::command("networksetup")
+        .args(args)
+        .output()
+        .map_err(|e| format!("networksetup 失败: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// 解析 `networksetup -getwebproxy <svc>` 的输出。
+#[cfg(target_os = "macos")]
+fn parse_proxy_readout(text: &str) -> (bool, String, String) {
+    let field = |key: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim_start_matches(':').trim().to_string())
+            .unwrap_or_default()
+    };
+    (
+        field("Enabled").eq_ignore_ascii_case("yes"),
+        field("Server"),
+        field("Port"),
+    )
+}
+
+/// 把系统代理恢复成我们改动之前的样子。没有备份（不是我们开的）就什么都不做。
+#[cfg(target_os = "macos")]
+fn restore_system_proxy() {
+    let backup = match SYSTEM_PROXY_BACKUP.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => None,
+    };
+    let Some(b) = backup else { return };
+    let svc = b.service.as_str();
+    if b.http_on && !b.http_server.is_empty() {
+        let _ = networksetup(&["-setwebproxy", svc, &b.http_server, &b.http_port]);
+        let _ = networksetup(&["-setwebproxystate", svc, "on"]);
+    } else {
+        let _ = networksetup(&["-setwebproxystate", svc, "off"]);
+    }
+    if b.https_on && !b.https_server.is_empty() {
+        let _ = networksetup(&["-setsecurewebproxy", svc, &b.https_server, &b.https_port]);
+        let _ = networksetup(&["-setsecurewebproxystate", svc, "on"]);
+    } else {
+        let _ = networksetup(&["-setsecurewebproxystate", svc, "off"]);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn restore_system_proxy() {}
+
 struct Running {
     child: Child,
     port: u16,
@@ -87,6 +163,9 @@ impl Drop for Running {
         let _ = self.child.kill();
         let _ = self.child.wait();
         set_active_port(None); // capture stopped → browser stops routing through it
+        // 代理进程没了，系统代理就必须跟着还原 —— 否则整机流量继续指向一个死端口。
+        // 这里覆盖所有退出路径：正常停止、应用退出、以及 panic 时的栈展开。
+        restore_system_proxy();
     }
 }
 
@@ -245,13 +324,30 @@ pub fn proxy_set_system_proxy(enable: bool, port: u16) -> Result<(), String> {
         };
         let p = port.to_string();
         if enable {
+            // 先记下原状态再改。只在第一次开启时记，避免重复开启把我们自己写的值当成
+            // "用户原本的设置"存下来。
+            if let Ok(mut g) = SYSTEM_PROXY_BACKUP.lock() {
+                if g.is_none() {
+                    let http = networksetup(&["-getwebproxy", &svc]).unwrap_or_default();
+                    let https = networksetup(&["-getsecurewebproxy", &svc]).unwrap_or_default();
+                    let (h_on, h_srv, h_port) = parse_proxy_readout(&http);
+                    let (s_on, s_srv, s_port) = parse_proxy_readout(&https);
+                    *g = Some(SystemProxyBackup {
+                        service: svc.clone(),
+                        http_on: h_on, http_server: h_srv, http_port: h_port,
+                        https_on: s_on, https_server: s_srv, https_port: s_port,
+                    });
+                }
+            }
             run(&["-setwebproxy", &svc, "127.0.0.1", &p])?;
             run(&["-setsecurewebproxy", &svc, "127.0.0.1", &p])?;
             run(&["-setwebproxystate", &svc, "on"])?;
             run(&["-setsecurewebproxystate", &svc, "on"])?;
         } else {
-            run(&["-setwebproxystate", &svc, "off"])?;
-            run(&["-setsecurewebproxystate", &svc, "off"])?;
+            // 还原用户原本的设置，而不是一律关掉 —— 他可能本来就配着公司代理。
+            restore_system_proxy();
+            run(&["-setwebproxystate", &svc, "off"]).ok();
+            run(&["-setsecurewebproxystate", &svc, "off"]).ok();
         }
         Ok(())
     }
@@ -305,6 +401,38 @@ fn macos_primary_service() -> Result<String, String> {
 
 pub fn stop_all(state: &ProxyState) {
     if let Ok(mut g) = state.inner.lock() {
-        *g = None;
+        *g = None; // Running::drop 会顺带还原系统代理
+    }
+    // 即使当时没有在跑的 Running（比如只开了系统代理没起 mitmdump），也要还原。
+    restore_system_proxy();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod proxy_backup_tests {
+    use super::*;
+
+    /// 解析对了才能还原对。`networksetup -getwebproxy` 的输出是固定的四行键值。
+    #[test]
+    fn parses_an_enabled_proxy_readout() {
+        let out = "Enabled: Yes\nServer: proxy.corp.example\nPort: 8080\nAuthenticated Proxy Enabled: 0\n";
+        assert_eq!(
+            parse_proxy_readout(out),
+            (true, "proxy.corp.example".to_string(), "8080".to_string())
+        );
+    }
+
+    /// 用户本来没开代理：还原时应该是"关掉"，而不是拿空 server 去 set。
+    #[test]
+    fn parses_a_disabled_proxy_readout() {
+        let out = "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n";
+        let (on, server, _) = parse_proxy_readout(out);
+        assert!(!on);
+        assert!(server.is_empty());
+    }
+
+    #[test]
+    fn missing_fields_do_not_panic() {
+        assert_eq!(parse_proxy_readout(""), (false, String::new(), String::new()));
+        assert_eq!(parse_proxy_readout("garbage"), (false, String::new(), String::new()));
     }
 }

@@ -55,6 +55,7 @@
     "macos-fps": {},
     "updater": {
       "endpoints": [
+        "https://code.mrday.one/api/ide/update",
         "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5QjAyOUI0QUYxRTA1RjkKUldUNUJSNnZ0Q213bWNhMkRoYVdWaTZRMVFub2YweFcvNHNmQzhTUVhrZVJUWVNHWkxPMlB1eUQK",

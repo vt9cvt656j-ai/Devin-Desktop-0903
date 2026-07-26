@@ -46,15 +46,28 @@ fn should_open_devtools_on_startup() -> bool {
 /// cause of "the IDE gets slower and freezes after running a while".
 #[tauri::command]
 fn cleanup_stale(
+    app: tauri::AppHandle,
     term: tauri::State<terminal::TerminalState>,
     lsp: tauri::State<lsp::LspManager>,
     dap: tauri::State<debug::DebugManager>,
 ) {
+    // 这里收的是**进程级**的孤儿：终端、语言服务器、调试子进程都不记录自己属于哪个窗口。
+    // 单窗口 reload 后收尸是对的；但只要还有第二个窗口开着，收尸就会把它正在用的终端、
+    // LSP、调试会话一并杀掉。前端已有守卫，这里再兜一层：多窗口时直接不做。
+    if tauri::Manager::webview_windows(&app).len() > 1 {
+        tracing_ignore_multiwindow();
+        return;
+    }
     term.reset_all();
     lsp.stop_all();
     dap.stop_all();
     mcp::stop_all();
     browser::close_all();
+}
+
+/// 多窗口时跳过 cleanup_stale 的说明位（保持函数体简单，便于将来换成真正的日志）。
+fn tracing_ignore_multiwindow() {
+    eprintln!("[cleanup_stale] 检测到多个窗口，跳过进程回收以免杀掉其它窗口正在用的会话");
 }
 
 /// Entry point shared by the binary and (potentially) mobile targets.

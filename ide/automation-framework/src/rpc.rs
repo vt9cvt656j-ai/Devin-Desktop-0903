@@ -36,16 +36,36 @@ pub struct RpcError {
 pub struct RpcServer {
     agent: Arc<Mutex<Agent>>,
     port: u16,
+    /// 与父进程共享的一次性密钥（`MICHAEL_AUTOMATION_TOKEN`）。
+    ///
+    /// None 表示未配置：此时保持旧行为（方便单独跑 sidecar 调试），但浏览器来源的请求
+    /// 依然一律拒绝。
+    token: Option<String>,
+}
+
+/// 常量时间比较，避免用响应时间逐字节试出 token。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl RpcServer {
     /// 创建新的 RPC 服务器
     pub fn new(port: u16) -> Result<Self> {
         let agent = Agent::new()?;
-        
+
         Ok(Self {
             agent: Arc::new(Mutex::new(agent)),
             port,
+            token: std::env::var("MICHAEL_AUTOMATION_TOKEN")
+                .ok()
+                .filter(|t| !t.trim().is_empty()),
         })
     }
     
@@ -338,14 +358,28 @@ impl RpcServer {
         let mut parts = line.split_whitespace();
         let http_method = parts.next().unwrap_or("").to_string();
         let path = parts.next().unwrap_or("").to_string();
-        // 读到空行为止，抓 Content-Length
+        // 读到空行为止，抓 Content-Length + 鉴权/来源判定所需的头
         let mut content_len = 0usize;
+        let mut token: Option<String> = None;
+        let mut browser_origin = false;
         loop {
             let mut h = String::new();
             let n = reader.read_line(&mut h)?;
             if n == 0 || h == "\r\n" || h == "\n" { break; }
-            if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+            let low = h.to_ascii_lowercase();
+            if let Some(v) = low.strip_prefix("content-length:") {
                 content_len = v.trim().parse().unwrap_or(0);
+            }
+            if let Some(v) = low.strip_prefix("x-automation-token:") {
+                token = Some(v.trim().to_string());
+            }
+            // 浏览器一定会带上这些头之一；本地父进程（reqwest）一个都不带。
+            if low.starts_with("origin:")
+                || low.starts_with("referer:")
+                || low.starts_with("sec-fetch-site:")
+                || low.starts_with("sec-fetch-mode:")
+            {
+                browser_origin = true;
             }
         }
         let body = if content_len > 0 {
@@ -353,6 +387,42 @@ impl RpcServer {
             reader.read_exact(&mut buf)?;
             buf
         } else { Vec::new() };
+
+        // ── 鉴权 ──────────────────────────────────────────────────────────────
+        //
+        // 这个服务能合成**真实的鼠标键盘事件**（mouse.click / keyboard.type /
+        // keyboard.combo），也就是说能打开终端敲任意命令。它监听 127.0.0.1 上一个固定
+        // 端口、随签名安装包分发，且此前对每个响应都回 `Access-Control-Allow-Origin: *`。
+        //
+        // 后果：用户只要用过一次桌面自动化，之后在**普通浏览器里打开的任意网页**（包括
+        // 第三方广告 iframe）就能 fetch 到这里 —— `text/plain` 属于 CORS 安全列表内容
+        // 类型、不触发预检，请求直达，零用户交互拿到本机代码执行。
+        //
+        // 两道闸：
+        // 1. 共享密钥走**自定义请求头**。自定义头会强制浏览器发 CORS 预检，而我们不响应
+        //    OPTIONS —— 于是浏览器永远发不出这个头，网页被物理挡在门外；本地父进程
+        //    （reqwest）不受影响。
+        // 2. 只要出现任何浏览器指纹头（Origin / Referer / Sec-Fetch-*）就直接拒绝。
+        //
+        // ACAO 头也一并删掉：它此前额外解锁了「读回响应」的能力（browser.content 等），
+        // 让攻击从盲写升级成可读写。注意只删 ACAO 不能修掉 RCE —— 写侧根本不需要读响应。
+        let authed = match (&self.token, &token) {
+            (Some(expected), Some(got)) => constant_time_eq(expected.as_bytes(), got.as_bytes()),
+            // 没配 token 时保持旧行为（本地开发直接跑 sidecar），但依然拒绝浏览器来源。
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if !authed || browser_origin {
+            let body = b"{\"error\":\"unauthorized\"}";
+            let header = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes())?;
+            stream.write_all(body)?;
+            stream.flush()?;
+            return Ok(());
+        }
 
         let resp_body: Vec<u8> = if path == "/health" {
             b"ok".to_vec()
@@ -369,7 +439,7 @@ impl RpcServer {
         };
 
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             resp_body.len()
         );
         stream.write_all(header.as_bytes())?;

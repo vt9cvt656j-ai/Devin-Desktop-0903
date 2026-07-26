@@ -59,13 +59,29 @@ async fn health_ok() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // 健康检查也带 token：它同时是「这个端口上的服务是不是**我们自己刚起的那个**」的
+    // 判据。此前只要有任何进程在 3037 上回 200，ensure_server 就认它 —— 本机任意程序
+    // 抢先占住这个固定端口即可冒充 sidecar，把后续所有自动化调用（含键鼠合成的参数）
+    // 全部截走。冒充者不知道这个一次性 token，健康检查会失败。
     client
         .get(format!("http://127.0.0.1:{PORT}/health"))
+        .header("x-automation-token", AUTOMATION_TOKEN.as_str())
         .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
 }
+
+/// 与本次进程的 automation-server 共享的一次性密钥。
+///
+/// sidecar 能合成**真实的鼠标键盘事件**，也就是能打开终端敲任意命令；它监听固定端口
+/// 127.0.0.1:3037 且随签名安装包分发。没有这道闸时，用户只要用过一次桌面自动化，
+/// 之后在浏览器里打开的**任意网页**都能 fetch 到它、零交互拿到本机代码执行。
+///
+/// 用**自定义请求头**携带是关键：自定义头会强制浏览器发 CORS 预检，而 sidecar 不响应
+/// OPTIONS —— 网页因此永远发不出这个头，被物理挡在门外；本进程不受影响。
+static AUTOMATION_TOKEN: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
 
 /// 确保服务在跑：健康就直接用；否则 spawn 一个、等它就绪（最多 ~4s）。
 async fn ensure_server() -> Result<(), String> {
@@ -89,6 +105,7 @@ async fn ensure_server() -> Result<(), String> {
             })?;
             let child = crate::process_util::command(bin.to_string_lossy().as_ref())
                 .arg(PORT.to_string())
+                .env("MICHAEL_AUTOMATION_TOKEN", AUTOMATION_TOKEN.as_str())
                 .env("PATH", crate::process_util::augmented_path(None))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -127,6 +144,7 @@ pub async fn automation_call(
     });
     let resp = client
         .post(format!("http://127.0.0.1:{PORT}/rpc"))
+        .header("x-automation-token", AUTOMATION_TOKEN.as_str())
         .json(&body)
         .send()
         .await

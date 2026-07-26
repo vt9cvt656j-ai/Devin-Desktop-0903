@@ -366,6 +366,21 @@ fn task_run_capture_inner(
     let err_bytes = rx_e
         .recv_timeout(std::time::Duration::from_secs(2))
         .unwrap_or_default();
+
+    // 收尾：把整个进程组清干净。
+    //
+    // 之前只有超时分支会 terminate_task_tree。但包装 shell **正常退出**并不代表它启动的
+    // 东西也退出了：`npm run dev &`、`nohup ... &` 这类命令会让 shell 立刻返回 0，而孙
+    // 进程留在进程组里永久活着——没有任何人再持有它的句柄，也就永远不会被回收。同时它
+    // 继承了 stdout/stderr 管道写端，导致上面那两个 reader 线程被永久钉在 read() 上
+    // （`recv_timeout` 只是让我们别等它，线程本身并没有结束）。
+    //
+    // run_cmd 的语义就是「一次性命令 + 真实退出码」，跑完还活着的东西按定义就是泄漏；
+    // 需要常驻服务的场景有专门的 run_in_terminal（它有自己的终端页签和生命周期）。
+    // 已经拿到退出码和输出之后再清理，所以不影响任何正常命令的结果。
+    if !timed_out {
+        terminate_task_tree(&mut child);
+    }
     let mut stdout = String::from_utf8_lossy(&out_bytes).into_owned();
     let mut stderr = String::from_utf8_lossy(&err_bytes).into_owned();
     let mut truncated = truncate_on_boundary(&mut stdout, MAX_TASK_OUTPUT)

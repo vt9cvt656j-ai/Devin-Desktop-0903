@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -45,7 +45,11 @@ impl Drop for Term {
 
 #[derive(Default)]
 pub struct TerminalState {
-    inner: Mutex<Inner>,
+    // Arc 是为了让 PTY reader 线程也能拿到表：shell 自行退出时（用户敲 exit、服务被
+    // Ctrl-C、进程崩了）由它把条目摘掉，从而触发 Term::drop 回收子进程和 PTY fd。
+    // 在此之前只有 term_close / reset_all 会移除条目，也就是说**用户不手动关闭那个
+    // 页签，僵尸进程和 fd 就一直挂着**。
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl TerminalState {
@@ -163,6 +167,7 @@ pub fn term_open(
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
+    let terms_for_reader = state.inner.clone();
     let id = {
         let mut inner = state.inner.lock().map_err(|_| "terminal state poisoned")?;
         let id = inner.next_id;
@@ -255,6 +260,11 @@ pub fn term_open(
             });
         }
         let _ = on_event.send(TermEvent::Exit);
+        // shell 已经结束：摘掉条目，让 Term::drop 回收子进程（避免僵尸）和 PTY 主端 fd。
+        // 前端收到 Exit 只是把页签标成"已退出"，Rust 侧的资源必须在这里自己释放。
+        if let Ok(mut inner) = terms_for_reader.lock() {
+            drop(inner.terms.remove(&id));
+        }
     });
 
     Ok(id)

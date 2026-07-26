@@ -43,13 +43,17 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
     // (git-credential-osxkeychain). Every other subprocess (lsp/dap/capture) already does this;
     // run_git was the one git-critical caller spawning bare "git" → commit/push "传不过去" on
     // Macs where git lives only under Homebrew.
-    let git = crate::process_util::resolve_command("git", Some(root));
+    // 用 system 解析：git 是 IDE 自己的基础设施，不能被仓库里的 node_modules/.bin/git
+    // 顶掉（那等于打开一个文件夹就执行它带的程序）。项目自带工具链的解析不走这条路。
+    let git = crate::process_util::resolve_system_command("git");
     let mut command = crate::process_util::command(&git);
     command
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("PATH", crate::process_util::augmented_path(Some(root)))
+        // 子进程的 PATH 同样不含工作区目录：git 会去 PATH 里找 credential helper、
+        // ssh、以及 core.pager 之类，仓库不该有机会替换掉其中任何一个。
+        .env("PATH", crate::process_util::augmented_path(None))
         // Never block waiting for an interactive credential prompt — fail fast
         // instead. This keeps network commands like `git push` from hanging
         // indefinitely on an auth prompt when no credential helper is set.
@@ -69,6 +73,55 @@ fn run_git(root: &str, args: &[&str]) -> Result<std::process::Output, String> {
 }
 
 /// Map a porcelain status code to a friendly label.
+/// 还原 git 的引号路径（`core.quotepath` 或路径含特殊字符时出现）。
+///
+/// 形如 `"a\tb\344\270\255.txt"`：外层双引号 + C 风格转义 + 非 ASCII 字节的八进制。
+/// 非引号形式原样返回。
+fn unquote_git_path(raw: &str) -> String {
+    if !(raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2) {
+        return raw.to_string();
+    }
+    let body = &raw[1..raw.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'a' => { out.push(0x07); i += 1; }
+            b'b' => { out.push(0x08); i += 1; }
+            b'f' => { out.push(0x0c); i += 1; }
+            b'n' => { out.push(b'\n'); i += 1; }
+            b'r' => { out.push(b'\r'); i += 1; }
+            b't' => { out.push(b'\t'); i += 1; }
+            b'v' => { out.push(0x0b); i += 1; }
+            b'"' => { out.push(b'"'); i += 1; }
+            b'\\' => { out.push(b'\\'); i += 1; }
+            b'0'..=b'7' => {
+                // 三位八进制，逐字节还原后整体按 UTF-8 解释。
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
+                    v = v * 8 + u32::from(bytes[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push((v & 0xff) as u8);
+            }
+            other => { out.push(other); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn label_for(code: &str) -> &'static str {
     let bytes = code.as_bytes();
     if code == "??" {
@@ -132,7 +185,10 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
         }
     };
 
-    let status_out = run_git(&root, &["status", "--porcelain=v1"])?;
+    // `core.quotepath=false` 让 git 直接输出 UTF-8 路径，而不是 `"\344\270\255..."`
+    // 这种八进制转义形式。含引号/反斜杠/控制字符的路径仍会被引号包起来，由下面的
+    // unquote_git_path 兜底。
+    let status_out = run_git(&root, &["-c", "core.quotepath=false", "status", "--porcelain=v1"])?;
     if !status_out.status.success() {
         let err = String::from_utf8_lossy(&status_out.stderr)
             .trim()
@@ -158,6 +214,10 @@ pub fn git_status(root: String) -> Result<GitStatus, String> {
         if let Some(idx) = rel.find(" -> ") {
             rel = rel[idx + 4..].to_string();
         }
+        // git 会把含特殊字符的路径用引号包起来并做 C 风格转义。不解开的话拼出来的绝对
+        // 路径根本不存在 → 下面的 `!abs.exists()` 判成"已删除"，而且前端拿这个带引号的
+        // 路径去暂存/看 diff 也一律失败。
+        rel = unquote_git_path(&rel);
         let bytes = code.as_bytes();
         let staged = bytes[0] != b' ' && bytes[0] != b'?';
         let abs = root_path.join(&rel);
@@ -1172,5 +1232,32 @@ mod tests {
             parents.split_whitespace().count() >= 2,
             "pull should create a merge commit for divergent branches, got parents: {parents}"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_path_tests {
+    use super::*;
+
+    /// git 对含非 ASCII 的路径会输出 `"\344\270\255文.txt"` 这种形式。不解开的话拼出来
+    /// 的绝对路径不存在 → 被判成"已删除"，而且暂存/看 diff 一律失败。
+    #[test]
+    fn octal_escaped_utf8_paths_round_trip() {
+        assert_eq!(unquote_git_path("\"\\344\\270\\255\\346\\226\\207.txt\""), "中文.txt");
+        assert_eq!(unquote_git_path("\"src/\\344\\270\\255.rs\""), "src/中.rs");
+    }
+
+    #[test]
+    fn c_style_escapes_are_decoded() {
+        assert_eq!(unquote_git_path("\"a\\tb.txt\""), "a\tb.txt");
+        assert_eq!(unquote_git_path("\"back\\\\slash\""), "back\\slash");
+    }
+
+    /// 绝大多数路径不带引号，必须原样返回——包括含空格的（git 不会为空格加引号）。
+    #[test]
+    fn unquoted_paths_are_untouched() {
+        assert_eq!(unquote_git_path("src/main.rs"), "src/main.rs");
+        assert_eq!(unquote_git_path("my file.txt"), "my file.txt");
+        assert_eq!(unquote_git_path(""), "");
     }
 }

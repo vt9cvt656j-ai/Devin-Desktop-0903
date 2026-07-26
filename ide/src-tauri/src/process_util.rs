@@ -82,6 +82,24 @@ pub fn augmented_path(workspace: Option<&str>) -> String {
     all
 }
 
+/// 解析一个**由 IDE 自己发起**的系统工具（git、node 之类），**不**把工作区目录算进来。
+///
+/// `augmented_path` 把 `{workspace}/node_modules/.bin` 放在最前面，这对项目自带的工具链
+/// （项目自己的 eslint / TypeScript 版本）是正确且必要的行为。但它同时意味着：仓库里放一个
+/// 可执行文件叫 `git`，IDE 一打开这个文件夹去查 git 状态，跑的就是攻击者的程序。
+///
+/// 区别在于「谁要求跑这个命令」：项目工具链是用户选的项目在提供，而 git 是 IDE 自己要用的
+/// 基础设施——后者绝不能被仓库内容覆盖。
+#[cfg(not(windows))]
+pub fn resolve_system_command(cmd: &str) -> String {
+    resolve_command(cmd, None)
+}
+
+#[cfg(windows)]
+pub fn resolve_system_command(cmd: &str) -> String {
+    resolve_command(cmd, None)
+}
+
 /// Resolve a command name to its full path using the augmented PATH.
 /// Rust's `Command::new` only searches the *current* process PATH, which is
 /// minimal when a Tauri app is launched from macOS Finder. This function

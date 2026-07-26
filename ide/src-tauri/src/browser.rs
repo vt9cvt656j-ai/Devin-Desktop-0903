@@ -241,11 +241,20 @@ fn launch() -> Result<Session, String> {
         extra.push(format!("--proxy-server=127.0.0.1:{port}").into());
     }
     let extra_ref: Vec<&std::ffi::OsStr> = extra.iter().map(|s| s.as_os_str()).collect();
-    // Use the user's REAL Chrome profile when Chrome is NOT running — this gives the
-    // agent their actual cookies, logins, saved passwords, and extensions (the #1 user
-    // request: "用我真实浏览器"). When Chrome IS running we can't share the locked profile,
-    // so fall back to our own persistent profile at ~/.michael-ide/browser-profile.
-    let profile_dir = if !is_chrome_running() {
+    // 真实 Chrome profile = 用户的全部 cookie、登录态、保存的密码和扩展。要不要把它交给
+    // 自动化，必须是一个**显式选择**。
+    //
+    // 之前的判据是「Chrome 此刻没在跑」—— 一个偶发状态。同一句话让 AI 去访问某个网站，
+    // 你的浏览器开着就是隔离 profile，关着就是把全部登录态交出去，用户完全无从预期；
+    // 而恶意网页只要能让自动化访问它，就能顺着这份登录态操作你已登录的任何站点。
+    //
+    // 现在改成显式开关 `MICHAEL_BROWSER_USE_REAL_PROFILE=1`。能力完整保留，只是要你自己
+    // 点头；不设时一律用 ~/.michael-ide/browser-profile 这份独立 profile。
+    let use_real_profile = std::env::var("MICHAEL_BROWSER_USE_REAL_PROFILE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // Chrome 在跑时它的 profile 是锁着的，共享不了——即使显式开了也只能退回独立 profile。
+    let profile_dir = if use_real_profile && !is_chrome_running() {
         #[cfg(target_os = "macos")]
         {
             std::env::var_os("HOME")
@@ -414,9 +423,22 @@ fn get_cdp_ws_url(port: u16) -> Option<String> {
     let text = std::str::from_utf8(&buf).ok()?;
     let body = text.split("\r\n\r\n").nth(1)?;
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    json.get("webSocketDebuggerUrl")?
-        .as_str()
-        .map(|s| s.to_string())
+    // **重建**地址，而不是照用返回值里的那个。
+    //
+    // 我们只是"探到 127.0.0.1:<port> 上有个 /json/version 能回 JSON"就连过去，而回什么
+    // 完全由那个进程说了算 —— 本机任意程序（含被装上的恶意 npm 包）抢先占住 9222-9229
+    // 里的一个端口，就能把 webSocketDebuggerUrl 指向别处，从而接管全部浏览器自动化：
+    // 看到你访问的每个页面、每次输入。
+    //
+    // 真实 Chrome/Edge 返回的就是 ws://127.0.0.1:<同一端口>/devtools/browser/<uuid>，
+    // 所以只取 path 重新拼是无损的。
+    let raw = json.get("webSocketDebuggerUrl")?.as_str()?;
+    let after_scheme = raw.strip_prefix("ws://").or_else(|| raw.strip_prefix("wss://"))?;
+    let path = after_scheme.find('/').map(|i| &after_scheme[i..])?;
+    if !path.starts_with("/devtools/") {
+        return None;
+    }
+    Some(format!("ws://127.0.0.1:{port}{path}"))
 }
 
 /// Enumerate the visible, in-viewport interactive elements: tag each with a

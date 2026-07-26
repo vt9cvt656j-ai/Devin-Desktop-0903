@@ -70,3 +70,8 @@ default = []
 macos-private-api = ["tauri/macos-private-api"]
 custom-protocol = ["tauri/custom-protocol"]
 devtools = ["tauri/devtools"]
+
+[dev-dependencies]
+# 仅测试用：直接构造 reqwest::Response（reqwest 实现了 From<http::Response<T>>），
+# 这样 read_capped 的上限逻辑可以不起网络就测到。
+http = "1"

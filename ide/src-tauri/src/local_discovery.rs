@@ -1611,10 +1611,13 @@ async fn fetch_baidu_places(
         .timeout(SOURCE_TIMEOUT)
         .send()
         .await
-        .map_err(|e| format!("baidu: {e}"))?
+        // reqwest 的错误 Display **会带上完整 URL**，而这些请求把 API Key 拼在 query 里 ——
+        // 一次失败就把 Key 原样写进错误串，随后进 AI 上下文、发往网关、落进日志。
+        // `without_url()` 是本仓库其它模块（public_data.rs / shop_catalog.rs）已经在用的写法。
+        .map_err(|e| format!("baidu: {}", e.without_url()))?
         .json()
         .await
-        .map_err(|e| format!("baidu json: {e}"))?;
+        .map_err(|e| format!("baidu json: {}", e.without_url()))?;
     if resp.get("status").and_then(|v| v.as_i64()) != Some(0) {
         let msg = resp
             .get("message")
@@ -1746,10 +1749,10 @@ async fn fetch_amap_places(
         .timeout(SOURCE_TIMEOUT)
         .send()
         .await
-        .map_err(|e| format!("amap: {e}"))?
+        .map_err(|e| format!("amap: {}", e.without_url()))?
         .json()
         .await
-        .map_err(|e| format!("amap json: {e}"))?;
+        .map_err(|e| format!("amap json: {}", e.without_url()))?;
     if resp.get("status").and_then(|v| v.as_str()) != Some("1") {
         let msg = resp
             .get("info")
