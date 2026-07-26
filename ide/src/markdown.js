@@ -774,9 +774,61 @@ export function renderMarkdownStream(container, text, opts = {}) {
   }
   const tailText = text.slice(st.src.length);
   if (!st.tail) { st.tail = el("div", "md-stream-tail"); container.appendChild(st.tail); }
+
+  // Nothing new to show. The plain-chat flush loop re-schedules itself on a timer
+  // whether or not tokens arrived, so without this roughly half the frames rebuilt
+  // an identical tail.
+  if (tailText === st.lastTail) return;
+  st.lastTail = tailText;
+
+  // Fast path: the tail is one still-open code fence.
+  //
+  // `_advanceSettledScan` only accepts a blank line *outside* a fence as a block
+  // boundary, so while the model is writing a code block the boundary is frozen and
+  // the tail keeps growing — for a 40KB file write, every frame cleared the tail and
+  // re-parsed all 40KB, then re-laid out a `<pre>` thousands of lines tall. Appending
+  // just the new characters to the existing `<code>` keeps per-frame cost proportional
+  // to what actually arrived. The fence closes → the normal path takes over and the
+  // final full render re-parses and highlights everything, so output is unchanged.
+  const open = _openFenceTail(tailText);
+  if (open && st.fenceCard && st.fenceInfo === open.info && open.body.startsWith(st.fenceBody)) {
+    if (open.body.length > st.fenceBody.length) {
+      st.fenceCodeEl.appendChild(document.createTextNode(open.body.slice(st.fenceBody.length)));
+      st.fenceBody = open.body;
+    }
+    return;
+  }
+  st.fenceCard = st.fenceCodeEl = null;
+  st.fenceInfo = st.fenceBody = "";
+
   st.tail.textContent = "";
   // The tail block is re-parsed every frame — skip the async highlighter there
   // (settled blocks above get it once; the final full render recolors everything).
   if (tailText.trim()) st.tail.appendChild(parseBlocks(tailText.split("\n"), opts.highlighter ? { ...opts, highlighter: undefined } : opts));
   if (opts.streaming && opts.showCaret !== false) st.tail.appendChild(el("span", "md-caret"));
+
+  // Remember the freshly built card so the next frames can append into it.
+  if (open) {
+    const card = st.tail.querySelector(".code-card");
+    const codeEl = card && card.querySelector("pre.code-card__body > code");
+    if (codeEl) {
+      st.fenceCard = card;
+      st.fenceCodeEl = codeEl;
+      st.fenceInfo = open.info;
+      st.fenceBody = open.body;
+    }
+  }
+}
+
+/// If `tailText` is exactly one unterminated code fence, describe it: the info string
+/// (fence characters + language) and the body accumulated so far. Null otherwise —
+/// any prose before the fence means the tail still needs normal block parsing.
+function _openFenceTail(tailText) {
+  const m = /^\s{0,3}(```+|~~~+)([^\n]*)\n?/.exec(tailText);
+  if (!m) return null;
+  const rest = tailText.slice(m[0].length);
+  const fence = m[1][0];
+  // A closing fence anywhere means this is a complete block, not a growing one.
+  if (new RegExp("^\\s{0,3}" + fence + "{3,}\\s*$", "m").test(rest)) return null;
+  return { info: m[1] + m[2].trim(), body: rest };
 }

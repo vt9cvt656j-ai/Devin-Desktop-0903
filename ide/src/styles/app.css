@@ -6466,6 +6466,15 @@ body.zen-mode .editor {
 .code-card--streaming .code-card__body {
   max-height: 300px; overflow-y: auto;
 }
+
+/* Same treatment for a code block that is still streaming inside the markdown tail.
+   Until the closing fence arrives the tail keeps growing, and an unbounded <pre> that
+   is thousands of lines tall has to be re-laid out on every frame of the stream. The
+   viewport-sized window keeps that cost flat; once streaming ends the tail is removed
+   and the settled card renders at full height as before. */
+.md-stream-tail .code-card__body {
+  max-height: 300px; overflow-y: auto;
+}
 .code-card__streaming-meta {
   display: flex; align-items: center; gap: 6px;
   font-family: var(--mono, 'SF Mono', monospace);
@@ -7890,6 +7899,23 @@ body.zen-mode .editor {
   transform: translateX(-50%) translateY(0);
 }
 
+/* 卡片入场动画：思考卡/工具卡/正文段落插入时淡入+上滑 160ms——一个突发里同时
+   解析出多张卡时不再同帧硬砰出来（"卡片无缘无故出来一堆"），成批出现也有秩序感。
+   只在插入时跑一次，不影响流式重渲染；与 content-visibility 兼容。 */
+@keyframes seg-slide-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.msg__body .think-card,
+.msg__body .agent-tool-step,
+.msg__body .agent-seg,
+.msg__body .agent-term-card {
+  animation: seg-slide-in 0.16s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg__body .think-card, .msg__body .agent-tool-step, .msg__body .agent-seg, .msg__body .agent-term-card { animation: none; }
+}
+
 /* ---- notification cards (bottom-right) ---- */
 .notif-stack {
   position: fixed; bottom: 32px; right: 16px;
@@ -8834,6 +8860,259 @@ body.zen-mode .editor {
   color: #80868b;
   font-size: 12px;
   text-align: center;
+}
+
+/* ---- Signed desktop update dialog ---- */
+.ide-update-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(32, 33, 36, .34);
+  backdrop-filter: blur(9px);
+  animation: ctp-fade .16s ease both;
+}
+.ide-update {
+  position: relative;
+  width: min(480px, calc(100vw - 32px));
+  max-height: min(660px, calc(100vh - 40px));
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 24px;
+  border: 1px solid #dadce0;
+  border-radius: 8px;
+  background: #fff;
+  color: #202124;
+  box-shadow: 0 20px 58px rgba(32, 33, 36, .25);
+  font-family: "Google Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.ide-update__close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #5f6368;
+  cursor: pointer;
+}
+.ide-update__close:hover { background: #f1f3f4; color: #202124; }
+.ide-update__close:disabled { opacity: .4; cursor: default; }
+.ide-update__header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 150px;
+  padding: 4px 34px 0;
+  text-align: center;
+}
+.ide-update__visual {
+  position: relative;
+  width: 94px;
+  height: 88px;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+.ide-update__app-icon {
+  position: absolute;
+  top: 8px;
+  left: 11px;
+  width: 72px;
+  height: 72px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid #e3e7ea;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(32, 33, 36, .16), 0 1px 2px rgba(32, 33, 36, .12);
+}
+.ide-update__app-icon img { width: 68px; height: 68px; display: block; object-fit: cover; }
+.ide-update__new-ribbon {
+  position: absolute;
+  z-index: 2;
+  top: 3px;
+  right: -2px;
+  min-width: 40px;
+  padding: 4px 6px 3px;
+  border: 2px solid #fff;
+  border-radius: 5px;
+  background: #d93025;
+  color: #fff;
+  box-shadow: 0 5px 12px rgba(217, 48, 37, .28);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0;
+  text-align: center;
+  transform: rotate(14deg);
+}
+.ide-update__heading { width: 100%; min-width: 0; text-align: center; }
+.ide-update__header h2 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+.ide-update__header p {
+  margin: 4px 0 0;
+  color: #5f6368;
+  font-size: 13px;
+}
+.ide-update__versions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-top: 22px;
+  padding: 14px 0;
+  border-top: 1px solid #e8eaed;
+  border-bottom: 1px solid #e8eaed;
+}
+.ide-update__versions > span {
+  min-width: 0;
+  color: #5f6368;
+  font-size: 11.5px;
+}
+.ide-update__versions > span:last-child { text-align: right; }
+.ide-update__versions strong {
+  display: block;
+  margin-top: 4px;
+  color: #202124;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.ide-update__versions > .ic { width: 18px; height: 18px; color: #9aa0a6; }
+.ide-update__notes { min-height: 0; margin-top: 18px; }
+.ide-update__notes h3 { margin: 0 0 8px; font-size: 13px; letter-spacing: 0; }
+.ide-update__notes p {
+  max-height: clamp(112px, 22vh, 190px);
+  margin: 0;
+  padding-right: 8px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #bdc1c6 transparent;
+  color: #3c4043;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ide-update__notes p::-webkit-scrollbar { width: 6px; }
+.ide-update__notes p::-webkit-scrollbar-thumb { border-radius: 6px; background: #bdc1c6; }
+.ide-update__notice {
+  margin: 16px 0 0;
+  color: #5f6368;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.ide-update__progress {
+  height: 7px;
+  margin-top: 16px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #e8eaed;
+}
+.ide-update__progress-bar {
+  position: relative;
+  width: 0;
+  height: 100%;
+  overflow: hidden;
+  border-radius: inherit;
+  background: #22a06b;
+  transition: width .2s ease;
+}
+.ide-update__progress-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 44%;
+  background: rgba(255, 255, 255, .45);
+  transform: translateX(-160%) skewX(-18deg);
+  animation: ide-update-sheen 1.3s ease-in-out infinite;
+}
+.ide-update__progress-bar.is-indeterminate { animation: ide-update-indeterminate 1.1s ease-in-out infinite alternate; }
+.ide-update-overlay.is-progressing .ide-update__app-icon { animation: ide-update-logo-progress 1.15s ease-in-out infinite; }
+@keyframes ide-update-logo-progress { 50% { transform: translateY(2px) scale(.98); } }
+@keyframes ide-update-sheen { 65%, 100% { transform: translateX(300%) skewX(-18deg); } }
+@keyframes ide-update-indeterminate {
+  from { width: 18%; transform: translateX(0); }
+  to { width: 52%; transform: translateX(92%); }
+}
+.ide-update__status {
+  min-height: 18px;
+  margin-top: 7px;
+  color: #5f6368;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.ide-update__status.is-error { color: #b3261e; }
+.ide-update__actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+.ide-update__install { min-width: 146px; min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+.ide-update__install .ic { width: 17px; height: 17px; }
+[data-theme="dark"] .ide-update,
+.dark .ide-update {
+  border-color: #3c4043;
+  background: #202124;
+  color: #f1f3f4;
+  box-shadow: 0 20px 58px rgba(0, 0, 0, .48);
+}
+[data-theme="dark"] .ide-update__close,
+.dark .ide-update__close,
+[data-theme="dark"] .ide-update__header p,
+.dark .ide-update__header p,
+[data-theme="dark"] .ide-update__versions > span,
+.dark .ide-update__versions > span,
+[data-theme="dark"] .ide-update__notice,
+.dark .ide-update__notice,
+[data-theme="dark"] .ide-update__status,
+.dark .ide-update__status { color: #bdc1c6; }
+[data-theme="dark"] .ide-update__close:hover,
+.dark .ide-update__close:hover { background: #303134; color: #f1f3f4; }
+[data-theme="dark"] .ide-update__versions,
+.dark .ide-update__versions { border-color: #3c4043; }
+[data-theme="dark"] .ide-update__versions strong,
+.dark .ide-update__versions strong,
+[data-theme="dark"] .ide-update__notes p,
+.dark .ide-update__notes p { color: #e8eaed; }
+[data-theme="dark"] .ide-update__app-icon,
+.dark .ide-update__app-icon { border-color: #3c4043; background: #292a2d; box-shadow: 0 8px 20px rgba(0, 0, 0, .35); }
+[data-theme="dark"] .ide-update__progress,
+.dark .ide-update__progress { background: #3c4043; }
+[data-theme="dark"] .ide-update__notes p,
+.dark .ide-update__notes p { scrollbar-color: #5f6368 transparent; }
+[data-theme="dark"] .ide-update__notes p::-webkit-scrollbar-thumb,
+.dark .ide-update__notes p::-webkit-scrollbar-thumb { background: #5f6368; }
+[data-theme="dark"] .ide-update__status.is-error,
+.dark .ide-update__status.is-error { color: #f28b82; }
+@media (max-width: 520px) {
+  .ide-update-overlay { padding: 10px; }
+  .ide-update { width: 100%; padding: 20px; }
+  .ide-update__header { gap: 8px; min-height: 138px; padding: 0 32px; }
+  .ide-update__visual { width: 86px; height: 82px; transform: scale(.9); }
+  .ide-update__versions { grid-template-columns: 1fr; }
+  .ide-update__versions > .ic { transform: rotate(90deg); justify-self: center; }
+  .ide-update__versions > span:last-child { text-align: left; }
+  .ide-update__notes p { max-height: 148px; }
+  .ide-update__install { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ide-update__app-icon,
+  .ide-update__progress-bar::after,
+  .ide-update-btn__logo { animation: none !important; }
 }
 
 /* ---- Remote connection dialog ---- */
@@ -11486,6 +11765,42 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
   font-size: 9px; font-weight: 700; line-height: 14px; text-align: center;
   color: #fff; background: #ff3b30; border-radius: 7px;
 }
+.ide-update-btn { position: relative; isolation: isolate; }
+.ide-update-btn.is-available {
+  background: color-mix(in srgb, #1a73e8 10%, transparent) !important;
+}
+.ide-update-btn__brand {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  display: block;
+}
+.ide-update-btn__logo {
+  width: 23px;
+  height: 23px;
+  display: block;
+  border-radius: 6px;
+  object-fit: cover;
+  box-shadow: 0 1px 3px rgba(32, 33, 36, .2);
+}
+.ide-update-btn.is-installing .ide-update-btn__logo { animation: ide-update-logo-progress .85s ease-in-out infinite; }
+.ide-update-btn__new {
+  position: absolute;
+  top: -5px;
+  right: -7px;
+  min-width: 20px;
+  padding: 2px 3px;
+  border: 1.5px solid var(--panel);
+  border-radius: 3px;
+  background: #d93025;
+  color: #fff;
+  font-size: 5.5px;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0;
+  text-align: center;
+  transform: rotate(16deg);
+}
 .notif-center {
   position: fixed; top: 40px; right: 12px; width: 320px; max-height: 400px;
   background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
@@ -12776,6 +13091,16 @@ select.settings-input { cursor: pointer; padding-right: 8px; }
   display: flex; align-items: center; justify-content: center;
   background: #fff; overflow: hidden; position: relative;
   cursor: pointer; perspective: 600px;
+}
+
+/* 方案预览渲染在沙箱 iframe 里（模型产出的原始 HTML/CSS 不进主文档）。stage 是 flex
+   居中容器，iframe 需要显式撑开才能占满，否则会塌成默认的 300x150。 */
+.pv-picker__frame {
+  width: 100%;
+  min-height: 56px;
+  align-self: stretch;
+  border: 0;
+  background: transparent;
 }
 .pv-picker__stage:hover { background: #f1f3f4; }
 .pv-demo-box {

@@ -98,6 +98,24 @@ const EN = {
   "debug.callStack": "Call Stack",
   "debug.breakpoints": "Breakpoints",
   "notifications.title": "Notifications",
+  "updates.check": "Check for Updates…",
+  "updates.title": "Michael IDE Update",
+  "updates.available": "Version v{version} is ready",
+  "updates.currentVersion": "Current version",
+  "updates.newVersion": "New version",
+  "updates.releaseNotes": "What's new",
+  "updates.noNotes": "This release includes improvements and bug fixes.",
+  "updates.downloadRestart": "Download and Restart",
+  "updates.downloading": "Downloading update…",
+  "updates.installing": "Installing update…",
+  "updates.saving": "Saving your work…",
+  "updates.upToDate": "Michael IDE is up to date",
+  "updates.failed": "Update check failed: {error}",
+  "updates.installFailed": "Update installation failed: {error}",
+  "updates.saveFailed": "Some edited files could not be saved. The update was cancelled.",
+  "updates.close": "Close update dialog",
+  "updates.restartNotice": "The signed update will be installed, then Michael IDE will restart.",
+  "updates.desktopOnly": "Update checks are available in the Michael IDE desktop app.",
   "voice.input": "Voice input",
 
   "problems.title": "Problems",
@@ -636,6 +654,24 @@ const ZH_CN = {
   "debug.callStack": "调用栈",
   "debug.breakpoints": "断点",
   "notifications.title": "通知",
+  "updates.check": "检查更新…",
+  "updates.title": "Michael IDE 更新",
+  "updates.available": "v{version} 新版本已准备好",
+  "updates.currentVersion": "当前版本",
+  "updates.newVersion": "新版本",
+  "updates.releaseNotes": "更新内容",
+  "updates.noNotes": "此版本包含体验改进和错误修复。",
+  "updates.downloadRestart": "下载并重启",
+  "updates.downloading": "正在下载更新…",
+  "updates.installing": "正在安装更新…",
+  "updates.saving": "正在保存你的工作…",
+  "updates.upToDate": "Michael IDE 已是最新版本",
+  "updates.failed": "检查更新失败：{error}",
+  "updates.installFailed": "安装更新失败：{error}",
+  "updates.saveFailed": "部分编辑文件无法保存，已取消更新。",
+  "updates.close": "关闭更新窗口",
+  "updates.restartNotice": "签名更新包安装完成后，Michael IDE 会自动重启。",
+  "updates.desktopOnly": "更新检查仅适用于 Michael IDE 桌面版。",
   "voice.input": "语音输入",
   "problems.title": "问题",
   "problems.empty": "未检测到任何问题。",
@@ -1446,6 +1482,15 @@ const adhocI18nCaches = new Map();
 const adhocTextSources = new WeakMap();
 const adhocAttrSources = new WeakMap();
 const ADHOC_I18N_CACHE_VERSION = "v5";
+const ADHOC_I18N_CACHE_MAX_ENTRIES = 4000;
+// Hard fuse: without it a single cache-miss loop turned into ~340k requests/day
+// against /api/i18n/pack (2026-07-25 production incident).
+const ADHOC_I18N_MAX_REQUESTS_PER_SESSION = 300;
+const adhocI18nPending = new Set();
+let adhocI18nFailures = 0;
+let adhocI18nBackoffUntil = 0;
+let adhocI18nRequestCount = 0;
+let adhocI18nDisabled = false;
 
 const AUTO_I18N_SKIP_SELECTOR = [
   "script",
@@ -1497,6 +1542,19 @@ function apiBase() {
     return (saved || (tauri ? "https://code.mrday.one" : window.location.origin)).replace(/\/+$/, "");
   } catch {
     return "";
+  }
+}
+
+// /api/i18n/pack drives a real model call with the platform's own upstream key, so
+// the gateway requires a credential on it. Without a login token the dynamic pack
+// simply isn't available — the app still has zh/en/ja built in, so that degrades to
+// the bundled dictionaries instead of failing visibly.
+function authHeaders() {
+  try {
+    const tok = localStorage.getItem("michael_token") || "";
+    return tok ? { Authorization: "Bearer " + tok } : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1596,9 +1654,11 @@ async function ensureLocalePack(locale) {
   const p = (async () => {
     const root = apiBase();
     if (!root) return false;
+    const auth = authHeaders();
+    if (!auth) return false;
     const r = await fetch(root + "/api/i18n/pack", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...auth },
       body: JSON.stringify({ locale: tag, source_locale: "auto", entries }),
     });
     if (!r.ok) throw new Error("i18n pack failed: " + r.status);
@@ -1670,9 +1730,32 @@ function keyForExistingUiText(text) {
   return buildTextAliasCache().get(normalizeUiText(text));
 }
 
+// `closest()` against AUTO_I18N_SKIP_SELECTOR is 40 selectors tested up the whole
+// ancestor chain. That is far too expensive to run per text node per frame, so the
+// answer is memoised per element. A WeakMap keyed on the element lets the entry die
+// with the node, and the result can't go stale in practice: an element's ancestry
+// (and therefore whether it sits inside `.chat` / `.monaco-editor` / …) doesn't
+// change without the element being re-created.
+const skipDecisionCache = new WeakMap();
+
+/// Is this element itself one of the skip containers? Used by the tree walkers to
+/// prune an entire subtree in ONE test instead of re-deciding for every descendant.
+function isAutoI18nSkipRoot(el) {
+  if (!el || el.nodeType !== 1) return false;
+  try { return el.matches(AUTO_I18N_SKIP_SELECTOR); } catch { return true; }
+}
+
 function shouldSkipAutoI18n(el) {
   if (!el || el.nodeType !== 1) return true;
-  try { return !!el.closest(AUTO_I18N_SKIP_SELECTOR); } catch { return true; }
+  const cached = skipDecisionCache.get(el);
+  if (cached !== undefined) return cached;
+  let skip;
+  try { skip = !!el.closest(AUTO_I18N_SKIP_SELECTOR); } catch { skip = true; }
+  // Only memoise a connected element. A detached node has no ancestors yet, so
+  // `closest()` says "not in a skip region" — caching that would let it stay
+  // translatable after it gets appended into `.chat` or the editor.
+  if (el.isConnected) skipDecisionCache.set(el, skip);
+  return skip;
 }
 
 function looksLikeUserPathOrCode(text) {
@@ -1694,6 +1777,26 @@ function looseUiTextEligible(text) {
   if (!/[\p{L}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(s)) return false;
   if (looksLikeUserPathOrCode(s)) return false;
   return true;
+}
+
+// Text whose script already matches the target locale must never reach the
+// server: the "translation" comes back identical (e.g. Chinese UI text under
+// zh-CN), identity results used to be uncacheable, and the same strings were
+// re-requested on every DOM mutation — the 2026-07-25 request storm.
+function textAlreadyInLocale(text, locale) {
+  const base = coerceSupportedLocale(locale).split("-")[0];
+  const letters = normalizeUiText(text).match(/\p{L}/gu) || [];
+  if (!letters.length) return true;
+  const ratio = (re) => letters.filter((ch) => re.test(ch)).length / letters.length;
+  if (base === "zh") return ratio(/\p{Script=Han}/u) >= 0.5;
+  if (base === "ja") return ratio(/[\p{Script=Hiragana}\p{Script=Katakana}]/u) > 0 || ratio(/\p{Script=Han}/u) >= 0.7;
+  if (base === "ko") return ratio(/\p{Script=Hangul}/u) >= 0.5;
+  if (base === "ru") return ratio(/\p{Script=Cyrillic}/u) >= 0.5;
+  // App-authored dynamic strings are zh or en, so under en a latin-only string
+  // is already English. Other latin locales (de/es/pt) can't be told apart
+  // locally; they rely on identity results being cached after one request.
+  if (base === "en") return ratio(/[A-Za-z]/) >= 0.9;
+  return false;
 }
 
 function adhocCacheKey(locale) {
@@ -1718,66 +1821,99 @@ function saveAdhocCache(locale) {
   if (!isSupportedLocale(locale)) return;
   const tag = coerceSupportedLocale(locale);
   const cache = getAdhocCache(tag);
+  const keys = Object.keys(cache);
+  if (keys.length > ADHOC_I18N_CACHE_MAX_ENTRIES) {
+    for (const k of keys.slice(0, keys.length - ADHOC_I18N_CACHE_MAX_ENTRIES)) delete cache[k];
+  }
   try { localStorage.setItem(adhocCacheKey(tag), JSON.stringify(cache)); } catch {}
 }
 
+function adhocPendingKey(tag, text) {
+  return `${tag} ${text}`;
+}
+
+function scheduleAdhocFlush(delay) {
+  if (adhocI18nTimer) return;
+  adhocI18nTimer = setTimeout(() => {
+    adhocI18nTimer = null;
+    flushAdhocI18nQueue();
+  }, delay);
+}
+
 function queueAdhocText(locale, source) {
+  if (adhocI18nDisabled) return;
   if (!isSupportedLocale(locale)) return;
   const tag = coerceSupportedLocale(locale);
   const text = normalizeUiText(source);
   if (!looseUiTextEligible(text)) return;
+  if (textAlreadyInLocale(text, tag)) return;
   const cache = getAdhocCache(tag);
   if (cache[text]) return;
+  if (adhocI18nPending.has(adhocPendingKey(tag, text))) return;
   if (!adhocI18nQueues.has(tag)) adhocI18nQueues.set(tag, new Map());
   adhocI18nQueues.get(tag).set(text, text);
-  if (!adhocI18nTimer) {
-    adhocI18nTimer = setTimeout(() => {
-      adhocI18nTimer = null;
-      flushAdhocI18nQueue();
-    }, 180);
-  }
+  scheduleAdhocFlush(600);
 }
 
 async function flushAdhocI18nQueue() {
   if (adhocI18nInFlight) return;
+  const wait = adhocI18nBackoffUntil - Date.now();
+  if (wait > 0) { scheduleAdhocFlush(wait); return; }
   const root = apiBase();
   if (!root) return;
   if (!isSupportedLocale(currentLocale)) return;
   const tag = coerceSupportedLocale(currentLocale);
   const queue = adhocI18nQueues.get(tag);
   if (!queue || !queue.size) return;
+  if (adhocI18nRequestCount >= ADHOC_I18N_MAX_REQUESTS_PER_SESSION) {
+    adhocI18nDisabled = true;
+    adhocI18nQueues.clear();
+    console.warn("[i18n] loose UI translation disabled for this session (request budget exhausted)");
+    return;
+  }
+  const auth = authHeaders();
+  if (!auth) {
+    adhocI18nDisabled = true;
+    adhocI18nQueues.clear();
+    return;
+  }
   adhocI18nInFlight = true;
+  adhocI18nRequestCount += 1;
   const items = [...queue.keys()].slice(0, 80);
-  for (const item of items) queue.delete(item);
+  for (const item of items) {
+    queue.delete(item);
+    adhocI18nPending.add(adhocPendingKey(tag, item));
+  }
   try {
     const entries = {};
     items.forEach((text, index) => { entries[`ui_${index}`] = text; });
     const r = await fetch(root + "/api/i18n/pack", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...auth },
       body: JSON.stringify({ locale: tag, source_locale: "auto", entries }),
     });
-    if (r.ok) {
-      const data = await r.json();
-      const out = data && data.translations && typeof data.translations === "object" ? data.translations : {};
-      const cache = getAdhocCache(tag);
-      items.forEach((text, index) => {
-        const translated = String(out[`ui_${index}`] || "").trim();
-        if (translated && translated !== text) cache[text] = translated;
-      });
-      saveAdhocCache(tag);
-      if (coerceSupportedLocale(currentLocale) === tag) applyToDOM();
-    }
+    if (!r.ok) throw new Error("i18n pack failed: " + r.status);
+    const data = await r.json();
+    const out = data && data.translations && typeof data.translations === "object" ? data.translations : {};
+    const cache = getAdhocCache(tag);
+    items.forEach((text, index) => {
+      const translated = String(out[`ui_${index}`] || "").trim();
+      // Identity and missing results are cached too — otherwise text already in
+      // the target language is re-requested on every DOM mutation, forever.
+      cache[text] = translated || text;
+    });
+    saveAdhocCache(tag);
+    adhocI18nFailures = 0;
+    if (coerceSupportedLocale(currentLocale) === tag) applyToDOM();
   } catch (e) {
     console.warn("[i18n] loose UI translation failed:", tag, e);
+    adhocI18nFailures += 1;
+    adhocI18nBackoffUntil = Date.now() + Math.min(30000 * 2 ** (adhocI18nFailures - 1), 600000);
+    for (const item of items) queue.set(item, item);
   } finally {
+    for (const item of items) adhocI18nPending.delete(adhocPendingKey(tag, item));
     adhocI18nInFlight = false;
-    if (queue.size) {
-      adhocI18nTimer = setTimeout(() => {
-        adhocI18nTimer = null;
-        flushAdhocI18nQueue();
-      }, 220);
-    }
+    if (queue.size) scheduleAdhocFlush(Math.max(1500, adhocI18nBackoffUntil - Date.now()));
   }
 }
 
@@ -1856,67 +1992,117 @@ function localizeLooseAttribute(el, attr) {
   if (normalizeUiText(translated) !== normalizeUiText(trimmed)) el.setAttribute(attr, translated);
 }
 
-function localizeExactText(root) {
-  if (typeof document === "undefined") return;
-  const container = root && root.nodeType ? root : document;
-  const filter = globalThis.NodeFilter || document.defaultView?.NodeFilter;
-  if (!filter) return;
-  const walker = document.createTreeWalker(container, filter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent || shouldSkipAutoI18n(parent)) return filter.FILTER_REJECT;
-      const text = node.nodeValue || "";
-      if (!text.trim()) return filter.FILTER_REJECT;
-      return filter.FILTER_ACCEPT;
-    },
-  });
-  const nodes = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode);
-  for (const node of nodes) localizeExactTextNode(node);
+// Collect the translatable text nodes under `container`, pruning skip regions.
+//
+// Walking with SHOW_TEXT alone cannot prune: text nodes have no children, so
+// FILTER_REJECT behaves exactly like FILTER_SKIP and every text node inside the chat
+// log still gets visited and tested. Adding SHOW_ELEMENT makes FILTER_REJECT on a
+// skip container (`.chat`, `.monaco-editor`, `.xterm`, …) drop that whole subtree in a
+// single `matches()` call — which is the difference between "cost grows with the
+// conversation" and "cost grows with the chrome around it".
+const LOOSE_ATTR_SELECTOR = "[title], [aria-label], [placeholder], [data-placeholder]";
+const LOOSE_ATTRS = ["title", "aria-label", "placeholder", "data-placeholder"];
 
-  for (const el of container.querySelectorAll?.("[title], [aria-label], [placeholder], [data-placeholder]") || []) {
-    if (shouldSkipAutoI18n(el)) continue;
-    for (const attr of ["title", "aria-label", "placeholder", "data-placeholder"]) {
-      if (!el.hasAttribute(attr)) continue;
-      const raw = el.getAttribute(attr);
-      const key = keyForExistingUiText(raw);
-      if (!key) continue;
-      const next = t(key);
-      if (next && normalizeUiText(next) !== normalizeUiText(raw)) el.setAttribute(attr, next);
-    }
-  }
+/// Matching elements inside `container`, **plus the container itself** when it matches.
+///
+/// `querySelectorAll` returns descendants only. That was invisible while the container
+/// was always `document`, but the observer now hands us the very element whose
+/// attribute changed — whose own `title` would then never be translated.
+function elementsWithin(container, selector) {
+  const found = container.querySelectorAll?.(selector);
+  const descendants = found ? Array.from(found) : [];
+  if (container.nodeType === 1 && container.matches?.(selector)) return [container, ...descendants];
+  return descendants;
 }
 
-function localizeLooseText(root) {
-  if (typeof document === "undefined") return;
-  const container = root && root.nodeType ? root : document;
-  const filter = globalThis.NodeFilter || document.defaultView?.NodeFilter;
-  if (!filter) return;
-  const walker = document.createTreeWalker(container, filter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent || shouldSkipAutoI18n(parent)) return filter.FILTER_REJECT;
-      const text = node.nodeValue || "";
-      if (!text.trim()) return filter.FILTER_REJECT;
-      return filter.FILTER_ACCEPT;
+function collectAutoI18nTextNodes(container, filter) {
+  const walker = document.createTreeWalker(
+    container,
+    filter.SHOW_TEXT | filter.SHOW_ELEMENT,
+    {
+      acceptNode(node) {
+        if (node.nodeType === 1) {
+          return isAutoI18nSkipRoot(node) ? filter.FILTER_REJECT : filter.FILTER_SKIP;
+        }
+        return (node.nodeValue || "").trim() ? filter.FILTER_ACCEPT : filter.FILTER_REJECT;
+      },
     },
-  });
+  );
   const nodes = [];
   while (walker.nextNode()) nodes.push(walker.currentNode);
-  for (const node of nodes) localizeLooseTextNode(node);
-  for (const el of container.querySelectorAll?.("[title], [aria-label], [placeholder], [data-placeholder]") || []) {
-    for (const attr of ["title", "aria-label", "placeholder", "data-placeholder"]) {
+  return nodes;
+}
+
+// One pass over a container: walk the tree ONCE, then run both the exact-key and the
+// loose-text localizers over the same node list, and sweep the attributes once.
+//
+// These used to be two independent functions, each building its own TreeWalker and its
+// own node array over the identical tree with an identical filter — double the walking
+// and double the 40-selector `matches()` calls, every frame, for results that were the
+// same both times.
+function localizeTextIn(root) {
+  if (typeof document === "undefined") return;
+  const container = root && root.nodeType ? root : document;
+  if (container.nodeType === 1 && shouldSkipAutoI18n(container)) return;
+  const filter = globalThis.NodeFilter || document.defaultView?.NodeFilter;
+  if (!filter) return;
+
+  for (const node of collectAutoI18nTextNodes(container, filter)) {
+    // Exact key matches win; loose translation only handles what has no key.
+    localizeExactTextNode(node);
+    localizeLooseTextNode(node);
+  }
+
+  for (const el of elementsWithin(container, LOOSE_ATTR_SELECTOR)) {
+    if (shouldSkipAutoI18n(el)) continue;
+    for (const attr of LOOSE_ATTRS) {
+      if (el.hasAttribute(attr)) {
+        const raw = el.getAttribute(attr);
+        const key = keyForExistingUiText(raw);
+        if (key) {
+          const next = t(key);
+          if (next && normalizeUiText(next) !== normalizeUiText(raw)) el.setAttribute(attr, next);
+          continue; // exact key handled it
+        }
+      }
       localizeLooseAttribute(el, attr);
     }
   }
 }
 
-function scheduleAutoI18n() {
+// Subtrees that changed since the last pass, and therefore the only places worth
+// re-scanning. Empty set with a scheduled frame means "rescan everything" (used by an
+// explicit locale switch).
+let pendingAutoI18nRoots = new Set();
+let pendingAutoI18nFullPass = false;
+
+function scheduleAutoI18n(root) {
+  // Streaming output mutates the chat DOM continuously. Re-scanning the WHOLE document
+  // on each of those frames is what made long conversations lock up the machine: two
+  // tree walks plus five document-wide querySelectorAll per frame, with cost
+  // proportional to the entire transcript. Only the subtree that actually changed
+  // needs another look.
+  if (root && root.nodeType === 1 && !shouldSkipAutoI18n(root)) {
+    // Cap the queue: past a handful of roots a single pass over their common ancestor
+    // is cheaper than many overlapping walks.
+    if (pendingAutoI18nRoots.size < 32) pendingAutoI18nRoots.add(root);
+    else pendingAutoI18nFullPass = true;
+  } else if (!root) {
+    pendingAutoI18nFullPass = true;
+  }
   if (applyingLocale || localeObserverPending || typeof requestAnimationFrame !== "function") return;
   localeObserverPending = true;
   requestAnimationFrame(() => {
     localeObserverPending = false;
-    applyToDOM();
+    const roots = pendingAutoI18nRoots;
+    const full = pendingAutoI18nFullPass;
+    pendingAutoI18nRoots = new Set();
+    pendingAutoI18nFullPass = false;
+    if (full || !roots.size) { applyToDOM(); return; }
+    for (const el of roots) {
+      // A node can be detached between the mutation and this frame.
+      if (el.isConnected) applyToDOM(el);
+    }
   });
 }
 
@@ -1925,8 +2111,19 @@ function installLocaleObserver() {
   localeObserver = new MutationObserver((mutations) => {
     if (applyingLocale) return;
     for (const m of mutations) {
-      if (m.type === "childList" && m.addedNodes.length) { scheduleAutoI18n(); return; }
-      if (m.type === "attributes") { scheduleAutoI18n(); return; }
+      // Ignore anything inside a skip region outright — chat messages, the editor and
+      // the terminal are never auto-translated, so their mutations must not even cost
+      // us a scheduled frame. This is the bulk of the traffic while streaming.
+      const target = m.target && m.target.nodeType === 1
+        ? m.target
+        : m.target && m.target.parentElement;
+      if (!target || shouldSkipAutoI18n(target)) continue;
+      if (m.type === "attributes") { scheduleAutoI18n(target); continue; }
+      if (m.type !== "childList" || !m.addedNodes.length) continue;
+      for (const added of m.addedNodes) {
+        if (added.nodeType === 1) scheduleAutoI18n(added);
+        else if (added.nodeType === 3) scheduleAutoI18n(target);
+      }
     }
   });
   localeObserver.observe(document.body || document.documentElement, {
@@ -1937,33 +2134,39 @@ function installLocaleObserver() {
   });
 }
 
+const I18N_MARKER_SELECTOR =
+  "[data-i18n],[data-i18n-placeholder],[data-i18n-title],[data-i18n-aria-label]";
+
+/// Apply the explicit `data-i18n*` markers on one element.
+function applyI18nMarkers(el) {
+  const key = el.getAttribute("data-i18n");
+  if (key) el.textContent = t(key);
+  const phKey = el.getAttribute("data-i18n-placeholder");
+  if (phKey) {
+    const text = t(phKey);
+    el.placeholder = text;
+    if (el.hasAttribute("data-placeholder")) el.setAttribute("data-placeholder", text);
+  }
+  const titleKey = el.getAttribute("data-i18n-title");
+  if (titleKey) el.title = t(titleKey);
+  const ariaKey = el.getAttribute("data-i18n-aria-label");
+  if (ariaKey) el.setAttribute("aria-label", t(ariaKey));
+}
+
 export function applyToDOM(root) {
   if (typeof document === "undefined") return;
   const container = root && root.nodeType ? root : document;
   applyingLocale = true;
   try {
-  for (const el of container.querySelectorAll("[data-i18n]")) {
-    const key = el.getAttribute("data-i18n");
-    if (key) el.textContent = t(key);
-  }
-  for (const el of container.querySelectorAll("[data-i18n-placeholder]")) {
-    const key = el.getAttribute("data-i18n-placeholder");
-    if (key) {
-      const text = t(key);
-      el.placeholder = text;
-      if (el.hasAttribute("data-placeholder")) el.setAttribute("data-placeholder", text);
+    // One combined query instead of four separate document-wide sweeps, and the
+    // container itself is included: `querySelectorAll` only returns descendants, so a
+    // freshly inserted element carrying its own `data-i18n` was previously skipped
+    // whenever a subtree (rather than the document) was passed in.
+    if (container.nodeType === 1 && container.matches?.(I18N_MARKER_SELECTOR)) {
+      applyI18nMarkers(container);
     }
-  }
-  for (const el of container.querySelectorAll("[data-i18n-title]")) {
-    const key = el.getAttribute("data-i18n-title");
-    if (key) el.title = t(key);
-  }
-  for (const el of container.querySelectorAll("[data-i18n-aria-label]")) {
-    const key = el.getAttribute("data-i18n-aria-label");
-    if (key) el.setAttribute("aria-label", t(key));
-  }
-  localizeExactText(container);
-  localizeLooseText(container);
+    for (const el of container.querySelectorAll(I18N_MARKER_SELECTOR)) applyI18nMarkers(el);
+    localizeTextIn(container);
   } finally {
     applyingLocale = false;
   }

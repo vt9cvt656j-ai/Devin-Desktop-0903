@@ -171,6 +171,10 @@ class LspClient {
       command: custom?.command || "",
       args: custom?.args || [],
       rootUri: this.manager.primaryRootUri() || "",
+      // 只有已信任的工作区才允许用它自带的语言服务器二进制（node_modules/.bin、
+      // .venv/bin）。用项目自己的 TypeScript 版本是真实功能，但它同时意味着"打开一个
+      // 仓库的 .ts 文件 = 执行那个仓库带的可执行文件"。未信任时降级到系统安装的服务器。
+      trustWorkspaceBinaries: this.manager.isWorkspaceTrusted() === true,
     };
     try {
       await this.manager.backend.lspStart(config, (ev) => this._onEvent(ev));
@@ -573,11 +577,37 @@ export function createLspManager(options) {
     showNotification = null,
     onLog = null,
     onStatus = null,
+    // 当前工作区是否已信任。决定语言服务器能否使用**仓库自带**的二进制
+    // （node_modules/.bin、.venv/bin）。缺省不信任 —— fail closed。
+    isWorkspaceTrusted = () => false,
   } = options;
 
   const clients = new Map(); // monaco lang id -> LspClient
   const changeTimers = new Map(); // uri -> { timer, langId, modelUri }
-  const lazyModels = new Set(); // uris of models we created for cross-file diagnostics
+  // URIs of models we created purely for cross-file diagnostics (the file is not open
+  // in the editor). Insertion-ordered, so the oldest is the first key.
+  const lazyModels = new Set();
+  /// 这些 model 最多留几个。
+  ///
+  /// 之前只有「size > 150 就不再创建」这一道闸——它挡住的是新增，**已有的 150 个从不
+  /// dispose**。每个 model 都带全文、行结构和 tokenization 缓存，JS/TS 还会因
+  /// setEagerModelSync 整份进 TypeScript worker 参与全量语义分析。
+  const LAZY_MODEL_CAP = 150;
+
+  /// 丢弃最旧的、当前没有被任何编辑器使用的惰性 model。
+  ///
+  /// `isAttachedToEditor()` 是关键：用户后来手动打开了这个文件时，Monaco 复用的就是
+  /// 同一个 model，这时候 dispose 会直接把他正在看的编辑器搞坏。
+  function evictLazyModels() {
+    for (const uri of [...lazyModels]) {
+      if (lazyModels.size <= LAZY_MODEL_CAP) break;
+      lazyModels.delete(uri);
+      try {
+        const m = monaco.editor.getModel(monaco.Uri.parse(uri));
+        if (m && !m.isAttachedToEditor?.()) m.dispose();
+      } catch { /* 已经没了就算了 */ }
+    }
+  }
   let executeCommandRegistered = false;
 
   const manager = {
@@ -822,7 +852,6 @@ export function createLspManager(options) {
       // the Problems panel. Capped to avoid model explosion on huge outputs.
       const diags = params.diagnostics || [];
       if (!diags.length) return;
-      if (lazyModels.size > 150) return;
       model = await lazilyCreateModel(uri);
       if (!model) return;
     }
@@ -876,6 +905,7 @@ export function createLspManager(options) {
       if (!model) {
         model = monaco.editor.createModel(content ?? "", undefined, parsed);
         lazyModels.add(uri);
+        evictLazyModels();
       }
       return model;
     } catch {
@@ -1659,6 +1689,8 @@ export function createLspManager(options) {
 
   // ---- public surface ----
   return {
+    // 供 LspClient._startInner 判断能否使用仓库自带的语言服务器二进制。
+    isWorkspaceTrusted,
     registerProviders,
     didOpen,
     didChange,
