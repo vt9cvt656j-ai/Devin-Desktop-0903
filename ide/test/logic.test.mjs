@@ -8916,6 +8916,8 @@ test("write_file streams replace once then append every received Monaco delta", 
   const previews = new Map([[preview.path, preview]]);
   const positions = [];
   const flush = load("_flushLiveEditorWritePreview", {
+    // 诊断埋点在测试里是无操作：它只写文件，不参与流式语义。
+    _wpDiag: () => {},
     _liveEditorWritePreviews: previews,
     openFiles: new Map([[preview.path, file]]),
     activePath: preview.path,
@@ -11422,5 +11424,40 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
     (SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length, 3,
     "定义 + 本地压缩 + 裁剪，三处都要有；漏掉任一处都会让模型收到错位的上下文",
   );
+});
+
+test("edit_file 的实时预览只替换锚点区间，且锚点不唯一时拒绝动编辑器", () => {
+  const anchor = load("_editPreviewAnchor", { _streamWriteContent: load("_streamWriteContent") });
+  const mk = (text) => ({ getValue: () => text });
+
+  // old_string 还在流（done=false）时不能定位：它只是个前缀，会命中错的地方。
+  const streaming = { args: '{"path":"a.js","old_string":"const a', _sc: null };
+  assert.equal(anchor(streaming, mk("const a = 1;\nconst ab = 2;")), null,
+    "old_string 未收完就定位 = 拿前缀去匹配");
+
+  // 唯一命中：给出前后文，供刷新器只替换中间那段。
+  const done = { args: '{"path":"a.js","old_string":"const a = 1;","new_string":"const a = 9;"}' };
+  const a1 = anchor(done, mk("head\nconst a = 1;\ntail"));
+  assert.ok(a1, "唯一命中时应给出锚点");
+  assert.equal(a1.before, "head\n");
+  assert.equal(a1.after, "\ntail");
+
+  // 命中 0 次：模型看的不是这个版本 —— 不预览。
+  const missing = { args: '{"path":"a.js","old_string":"not here","new_string":"x"}' };
+  assert.equal(anchor(missing, mk("head\ntail")), null);
+
+  // 命中多次：不知道要改哪一处 —— 不预览。动了就是给用户造一个假的中间态。
+  const dup = { args: '{"path":"a.js","old_string":"x = 1","new_string":"x = 2"}' };
+  assert.equal(anchor(dup, mk("x = 1\nx = 1")), null, "不唯一必须拒绝");
+
+  // 刷新器对 edit_file 必须拼 before + new_string + after，而不是把 new_string
+  // 当整份文件写进去（那会把文件其余部分全部抹掉）。
+  assert.match(
+    SRC,
+    /if \(entry\.name === "edit_file"\) \{[\s\S]{0,400}?target = anchor\.before \+ target \+ anchor\.after;/,
+    "edit_file 只能替换锚点区间",
+  );
+  // 编辑器预览必须对 write_file 和 edit_file 都开启。
+  assert.match(SRC, /const previewable = entry\?\.name === "write_file" \|\| entry\?\.name === "edit_file";/);
 });
 

@@ -1474,6 +1474,85 @@ const tabsEl = $("tabs");
 const editorEl = $("editor");
 const welcomeEl = $("welcome");
 const chatEl = $("chat");
+
+// ── 内存探针（仅诊断，默认不跑）─────────────────────────────────────────────
+//
+// 为什么需要它：实测 webview 进程涨到 1094MB，而打开的文件只有几 KB —— 也就是内存
+// 被应用自己的 JS/DOM 留住了。但"是 JS 堆还是 DOM/图片"这两个方向的修法完全不同，
+// 靠读代码猜是浪费时间。这里把真实数字打出来，让排查从猜变成量。
+//
+// 开：localStorage.setItem("mide_memprobe","1") 后重载；关：removeItem。
+// 每 15 秒一行，前缀 [MEMPROBE] 便于从终端输出里 grep。
+const _MEMPROBE_FILE = "/tmp/michael-ide-memprobe.log";
+function _memProbeStart() {
+  // dev 下自动开；生产要显式 localStorage.setItem("mide_memprobe","1")。
+  let on = false;
+  try { on = !!(import.meta && import.meta.env && import.meta.env.DEV); } catch {}
+  try { if (localStorage.getItem("mide_memprobe") === "1") on = true; } catch {}
+  try { if (localStorage.getItem("mide_memprobe") === "0") on = false; } catch {}
+  if (!on) return;
+  const mb = (n) => Math.round((Number(n) || 0) / 1048576);
+  let last = 0;
+  // 除了 console，同时**落文件**：console 打在启动 tauri dev 的那个终端里，
+  // 谁启动的实例就只有谁能看到。落文件才能让排查方直接读到数字。
+  const sink = async (line) => {
+    try {
+      const prev = await backend.readTextFile(_MEMPROBE_FILE).catch(() => "");
+      const kept = String(prev || "").split("\n").slice(-400).join("\n");
+      await backend.writeTextFile(_MEMPROBE_FILE, kept + line + "\n");
+    } catch {}
+  };
+  setInterval(() => {
+    try {
+      // performance.memory 是 Chrome 独有的，WKWebView 里恒为 undefined —— 第一版探针
+      // 因此只打出 heap=0MB，等于白测。改测 WebKit 里真正能拿到、而且量级足够大的东西。
+      const nodes = document.querySelectorAll("*").length;
+      // canvas 是首要怀疑：xterm 和 Monaco 小地图都用它，视网膜下一块 3456x2054 就是
+      // 28MB，而这部分内存**不体现在节点数里** —— 正好解释"节点才 2900 个却占 1.3GB"。
+      let canvasCount = 0, canvasBytes = 0, canvasMax = "";
+      for (const c of document.querySelectorAll("canvas")) {
+        const w = c.width | 0, h = c.height | 0;
+        const b = w * h * 4;
+        canvasCount++; canvasBytes += b;
+        if (b >= canvasBytes / Math.max(1, canvasCount)) canvasMax = `${w}x${h}`;
+      }
+      // Monaco 模型：关标签页没 dispose 的话会一直留着，且带完整分词状态。
+      let models = 0, modelChars = 0;
+      try {
+        const ms = (window.monaco?.editor?.getModels?.() || []);
+        models = ms.length;
+        for (const mo of ms) modelChars += (mo.getValueLength?.() ?? 0);
+      } catch {}
+      // blob: URL 泄漏（图片/附件 createObjectURL 后没 revoke）。
+      const blobs = document.querySelectorAll('[src^="blob:"],[href^="blob:"]').length;
+      const chatNodes = chatEl ? chatEl.querySelectorAll("*").length : 0;
+      // base64 图片是单项体积最大的东西：一张截图 0.5–5MB，留在 DOM 里就一直占着。
+      const imgs = document.querySelectorAll('img[src^="data:"]').length;
+      let imgBytes = 0;
+      for (const el of document.querySelectorAll('img[src^="data:"]')) imgBytes += (el.getAttribute("src") || "").length;
+      const sess = (typeof _currentSession === "function") ? _currentSession() : null;
+      const msgs = sess?.memory?.recent?.length ?? (Array.isArray(sess?.history) ? sess.history.length : 0);
+      // 会话里消息文本的总字节：能区分"消息本身很大"和"DOM 结构很多"。
+      let msgBytes = 0;
+      try {
+        const arr = sess?.memory?.recent || sess?.history || [];
+        for (const x of arr) msgBytes += JSON.stringify(x || "").length;
+      } catch {}
+      const delta = canvasBytes - last; last = canvasBytes;
+      const line = `[MEMPROBE] ${new Date().toTimeString().slice(0, 8)} ` +
+        `canvas=${canvasCount}/${mb(canvasBytes)}MB(+${mb(delta)},max ${canvasMax || "-"}) ` +
+        `models=${models}/${Math.round(modelChars / 1024)}KB blobs=${blobs} ` +
+        `nodes=${nodes} chatNodes=${chatNodes} ` +
+        `dataImgs=${imgs}/${mb(imgBytes)}MB msgs=${msgs}/${mb(msgBytes)}MB`;
+      console.log(line);
+      sink(line);
+    } catch (e) {
+      console.log("[MEMPROBE] failed:", String(e && e.message || e));
+    }
+  }, 15000);
+}
+try { _memProbeStart(); } catch {}
+
 // Delegated toggle for the reasoning ("思考过程") cards: ONE listener on the persistent chat
 // container handles every .think-card — live ones AND ones restored from an HTML snapshot (whose
 // per-element click listeners are LOST on innerHTML restore, so a restored card wouldn't expand).
@@ -34051,17 +34130,38 @@ function _installLiveEditorWritePreview(entry, path, file, options = {}) {
   return preview;
 }
 
+/// edit_file 的预览锚点：old_string 完整解码、且在当前模型里**唯一命中**时才给出。
+///
+/// 唯一命中是硬条件。命中 0 次说明模型看的不是这个版本，命中多次说明我们不知道它要
+/// 改哪一处 —— 两种情况下动编辑器内容都是在给用户制造一个假的中间态。宁可不预览。
+function _editPreviewAnchor(entry, model) {
+    if (!entry || !model || typeof model.getValue !== "function") return null;
+    const oldStr = _streamWriteContent(entry, "old_string");
+    // 必须已经收完：还在流的 old_string 是前缀，拿它去定位会命中错的地方。
+    if (!oldStr || !entry._sc || entry._sc.key !== "old_string" || !entry._sc.done) return null;
+    const text = model.getValue();
+    const first = text.indexOf(oldStr);
+    if (first < 0) return null;
+    if (text.indexOf(oldStr, first + 1) >= 0) return null;   // 不唯一
+    return { start: first, end: first + oldStr.length, before: text.slice(0, first), after: text.slice(first + oldStr.length) };
+}
+
 function _ensureLiveEditorWritePreview(entry, root) {
-  if (!entry || entry.name !== "write_file" || entry._editorPreviewOutcome === "rollback") return null;
+  const previewable = entry?.name === "write_file" || entry?.name === "edit_file";
+  if (!entry || !previewable || entry._editorPreviewOutcome === "rollback") return null;
   if (entry._editorPreview || entry._editorPreviewPromise) return entry._editorPreview || entry._editorPreviewPromise;
   const rawPath = _streamWritePath(entry);
-  if (rawPath == null) return null;
+  if (rawPath == null) { _wpDiag("ensure:bail no-path", entry); return null; }
   const path = _liveEditorPreviewPath(rawPath, root);
-  if (!path) return null;
+  if (!path) { _wpDiag("ensure:bail bad-path", entry, `raw=${rawPath}`); return null; }
 
   const opened = openFiles.get(path);
   if (opened) {
-    if (!opened.model || opened.dirty || opened.isImage || opened.isVideo || opened.isPdf || opened.isInspection) return null;
+    if (!opened.model || opened.dirty || opened.isImage || opened.isVideo || opened.isPdf || opened.isInspection) {
+      _wpDiag("ensure:bail open-unusable", entry,
+        `model=${!!opened.model} dirty=${!!opened.dirty} img=${!!opened.isImage} insp=${!!opened.isInspection}`);
+      return null;
+    }
     return _installLiveEditorWritePreview(entry, path, opened, { existed: true, createdTab: false });
   }
 
@@ -34112,14 +34212,60 @@ function _ensureLiveEditorWritePreview(entry, root) {
   return entry._editorPreviewPromise;
 }
 
+const _WPDIAG_FILE = "/tmp/michael-ide-writepreview.log";
+let _wpDiagLast = "";
+/// 写入预览诊断：只在 dev 下记录，且只在**状态变化**时写一行，避免每帧一条。
+///
+/// 为什么需要它：静态读代码时这条链上每一道守卫看起来都是对的（脏标记有
+/// _programmaticModelUpdates 抑制、rAF 里确实调了 _flushLiveEditorWritePreview），
+/// 但实际编辑器里就是不出内容。再猜下去只是浪费时间 —— 让它自己报是哪一步断的。
+function _wpDiag(stage, entry, extra = "") {
+  try {
+    let on = false;
+    try { on = !!(import.meta && import.meta.env && import.meta.env.DEV); } catch {}
+    try { if (localStorage.getItem("mide_wpdiag") === "0") on = false; } catch {}
+    if (!on) return;
+    const pv = entry?._editorPreview;
+    const line = `${new Date().toTimeString().slice(0, 8)} ${stage}`
+      + ` name=${entry?.name || "-"} args=${(entry?.args || "").length}`
+      + ` target=${(entry?._target || "").length}`
+      + ` preview=${pv ? "yes" : (entry?._editorPreviewPromise ? "pending" : "no")}`
+      + ` shown=${pv ? (pv.shownContent == null ? "null" : pv.shownContent.length) : "-"}`
+      + (extra ? ` ${extra}` : "");
+    if (line.slice(9) === _wpDiagLast) return;   // 去掉时间戳后相同就不重复写
+    _wpDiagLast = line.slice(9);
+    backend.readTextFile(_WPDIAG_FILE).catch(() => "").then((prev) => {
+      const kept = String(prev || "").split("\n").slice(-300).join("\n");
+      return backend.writeTextFile(_WPDIAG_FILE, kept + line + "\n");
+    }).catch(() => {});
+  } catch {}
+}
+
 function _flushLiveEditorWritePreview(entry, followTail = false) {
   const preview = entry?._editorPreview;
-  if (!preview || preview.userChanged || preview.committed || preview.rolledBack) return false;
-  if (_liveEditorWritePreviews.get(preview.path) !== preview) return false;
+  if (!preview) { _wpDiag("flush:bail no-preview", entry); return false; }
+  if (preview.userChanged || preview.committed || preview.rolledBack) {
+    _wpDiag("flush:bail settled", entry,
+      `userChanged=${preview.userChanged} committed=${preview.committed} rolledBack=${preview.rolledBack}`);
+    return false;
+  }
+  if (_liveEditorWritePreviews.get(preview.path) !== preview) { _wpDiag("flush:bail superseded", entry); return false; }
   const file = openFiles.get(preview.path);
-  if (file !== preview.file || file?.model !== preview.model || file?.dirty) return false;
-  const target = String(entry._target || "");
+  if (file !== preview.file || file?.model !== preview.model || file?.dirty) {
+    _wpDiag("flush:bail file-mismatch", entry,
+      `sameFile=${file === preview.file} sameModel=${file?.model === preview.model} dirty=${!!file?.dirty}`);
+    return false;
+  }
+  let target = String(entry._target || "");
+  // edit_file 推进的不是"整份文件"，而是"把 old_string 那一段换成正在流的 new_string"。
+  // 直接把 new_string 当整份内容写进模型会把文件其余部分全部抹掉。
+  if (entry.name === "edit_file") {
+    const anchor = preview.editAnchor || (preview.editAnchor = _editPreviewAnchor(entry, preview.model));
+    if (!anchor) { _wpDiag("flush:bail no-anchor", entry); return false; }
+    target = anchor.before + target + anchor.after;
+  }
   if (preview.shownContent === target) return false;
+  _wpDiag("flush:write", entry, `to=${target.length}`);
 
   const current = preview.model.getValue();
   const canAppend = preview.shownContent != null
@@ -34320,12 +34466,25 @@ function _liveWritePreview(entry, container, root = "") {
   //    Never touch the DOM straight from this (very frequent) delta callback.
   const key = entry.name === "write_file" ? "content" : "new_string";
   entry._target = _streamWriteContent(entry, key) || "";
+  // edit_file 的参数顺序是 old_string 在前：它流完之前 new_string 根本还没出现，
+  // 于是卡片正文长时间**全空**（实测 args=7665 时 target 仍是 0），用户看到的就是
+  // "改文件完全没有实时输出"。这段时间要如实说在干什么，而不是留一片空白。
+  if (!entry._target && entry.name !== "write_file") {
+    const locating = _streamWriteContent(entry, "old_string");
+    if (locating) {
+      const label = entry.streamCard?.querySelector(".code-card__label");
+      const want = "正在定位要替换的片段…";
+      if (label && label.textContent !== want && !label.textContent.startsWith("正在写 ")) {
+        label.textContent = want;
+      }
+    }
+  }
   // Fallback: if the incremental decode found nothing yet but the args are already
   // a complete JSON object, pull the value out directly (robust to odd streaming).
   if (!entry._target) {
     try { const p = JSON.parse(entry.args || ""); const v = p && p[key]; if (v) entry._target = String(v); } catch {}
   }
-  if (entry.name === "write_file") _ensureLiveEditorWritePreview(entry, root);
+  if (entry.name === "write_file" || entry.name === "edit_file") _ensureLiveEditorWritePreview(entry, root);
   _scheduleWritePreviewFlush(entry);
 }
 
