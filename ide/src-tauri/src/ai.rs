@@ -135,6 +135,21 @@ pub struct AiConfig {
     pub ide_mode: Option<String>,
     #[serde(default)]
     pub ide_tools: Option<String>,
+    /// michael-compression 的档位（"1m"/"2m"/"5m"），由 /api/me 下发、客户端原样回传。
+    ///
+    /// 这个字段此前**不存在**：JS 侧设了 `config.michaelCompression`，serde 默认忽略
+    /// 未知字段，于是被静默丢弃 —— 桌面版永远发不出档位头。而客户端因为从 /api/me
+    /// 看到了档位，已经关掉了自己的本地压缩和棘轮裁剪。净效果是三处压缩全不生效，
+    /// 原始历史每轮整份上传，长会话必然撞穿模型窗口。
+    #[serde(default)]
+    pub michael_compression: Option<String>,
+    /// 上一轮网关签发的前缀引用，本轮原样回发。
+    ///
+    /// 这条腿决定 2m/5m 能不能真的达到：有它，线路体积正比于**新增内容**；没有它，
+    /// 客户端每轮都得上传完整历史，被 `_MODEL_REQUEST_BODY_BYTE_CAP`（3.5MB，约
+    /// 875k token）卡死，5M 档在物理上不可达。
+    #[serde(default)]
+    pub mc_prefix: Option<String>,
     /// User-local wall-clock context. The IANA name is a label; the bounded
     /// offset is the source of truth for the current instant (including DST).
     #[serde(default)]
@@ -163,6 +178,11 @@ pub enum AiEvent {
         id: String,
         name: String,
         arguments: String,
+    },
+    /// 网关本轮签发的 michael-compression 前缀引用。前端存下来，下一轮通过
+    /// `config.mcPrefix` 回发，从而只上传新增消息。
+    CompressionPrefix {
+        token: String,
     },
     /// Internal timing breadcrumbs for diagnosing "not really streaming" reports.
     /// These are separate from real progress: response headers and raw chunks can
@@ -358,6 +378,16 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }
     if let Some(t) = config.ide_tools.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-tools", t);
+    }
+    // 只放行已知档位。网关侧还会按会员套餐再钳一次，这里的白名单是防止把任意字符串
+    // 当档位发出去。
+    if let Some(tier) = config
+        .michael_compression
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| matches!(*s, "1m" | "2m" | "5m"))
+    {
+        rb = rb.header("x-michael-compression", tier);
     }
     if let Some(zone) = config.ide_timezone.as_deref().filter(|zone| {
         !zone.is_empty()
@@ -781,6 +811,8 @@ mod ide_header_tests {
             request_id: None,
             ide_mode: Some("agent".into()),
             ide_tools: None,
+            michael_compression: None,
+            mc_prefix: None,
             ide_timezone: Some("America/Los_Angeles".into()),
             ide_utc_offset_minutes: Some(-420),
         }
@@ -913,6 +945,8 @@ mod stream_timeout_tests {
             request_id: None,
             ide_mode: None,
             ide_tools: None,
+            michael_compression: None,
+            mc_prefix: None,
             ide_timezone: None,
             ide_utc_offset_minutes: None,
         }
@@ -1504,6 +1538,16 @@ async fn ai_chat_inner(
     if let Some(temp) = config.temperature {
         payload["temperature"] = serde_json::json!(temp);
     }
+    // 回发上一轮的前缀引用。网关据此从 Redis 取回历史摘要，客户端就只需要上传新增
+    // 消息 —— 这是 2m/5m 档能真正达到的唯一途径。
+    if let Some(tok) = config
+        .mc_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 200)
+    {
+        payload["mc_prefix"] = serde_json::json!(tok);
+    }
     if let Some(ref t) = tools {
         if !t.is_empty() {
             payload["tools"] = serde_json::json!(t);
@@ -1593,6 +1637,20 @@ async fn ai_chat_inner(
         return Err(message);
     }
     send_stream_metric(&on_event, stream_started, "responseHeaders", None);
+
+    // 网关本轮签发的前缀引用。必须在消费 body 之前把响应头读出来。前端存下来，下一轮
+    // 通过 config.mcPrefix 回发 —— 没有这一步，网关每轮签的令牌都进了垃圾桶，客户端
+    // 只能整份上传历史。
+    if let Some(tok) = resp
+        .headers()
+        .get("x-michael-compression-prefix")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 200)
+        .map(str::to_string)
+    {
+        let _ = on_event.send(AiEvent::CompressionPrefix { token: tok });
+    }
 
     let mut stream = resp.bytes_stream();
     // Accumulate RAW BYTES, not lossily-decoded strings: a multibyte UTF-8 char

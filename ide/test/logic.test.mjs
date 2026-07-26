@@ -11379,3 +11379,37 @@ test("model-authored markup and third-party text stay untrusted", () => {
   assert.match(SRC, /!\(call\.headers && k in call\.headers\)/,
     "模型显式给出的头不剥，跨站调试仍然可用");
 });
+
+test("michael-compression 的档位与前缀在客户端两端都真的接上了", () => {
+  // 桌面版此前**发不出**档位头：AiConfig 没有对应字段，serde 默认忽略未知字段，
+  // 于是 JS 设的 michaelCompression 被静默丢弃。而客户端因为从 /api/me 看到了档位，
+  // 已经关掉了本地压缩和棘轮裁剪 —— 三处压缩全不生效，长会话必然撞穿模型窗口。
+  const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
+  assert.match(ai, /pub michael_compression: Option<String>/,
+    "AiConfig 必须有 michael_compression 字段，否则桌面版发不出档位头");
+  assert.match(ai, /rb\.header\("x-michael-compression", tier\)/,
+    "with_ide_headers 必须真的发出这个头");
+  assert.match(ai, /matches!\(\*s, "1m" \| "2m" \| "5m"\)/,
+    "只放行已知档位，不把任意字符串当档位发出去");
+
+  // 前缀往返是 2m/5m 能不能真达到的关键：没有它，客户端每轮都要整份上传历史，
+  // 被 3.5MB 字节上限卡在约 875k token。
+  assert.match(ai, /pub mc_prefix: Option<String>/, "必须能接收上一轮的前缀");
+  assert.match(ai, /payload\["mc_prefix"\]/, "必须把前缀发给网关");
+  assert.match(ai, /x-michael-compression-prefix/, "必须读取网关回传的前缀头");
+  assert.match(ai, /CompressionPrefix \{/, "必须把前缀交给前端");
+
+  // JS 侧：收得下、发得出、并且在本地改写历史后作废。
+  assert.match(SRC, /ev\.kind === "compressionPrefix"/, "JS 必须处理这个事件");
+  assert.equal(
+    (SRC.match(/ev\.kind === "compressionPrefix"/g) || []).length, 2,
+    "普通对话和 agent 两条路径都要接，只接一条等于 agent 模式下前缀永远丢失",
+  );
+  assert.match(SRC, /_turnConfig\.mcPrefix = _mcPrev/, "下一轮必须回发");
+  assert.match(SRC, /_mcPrefixInvalidate\(\)/, "本地改写历史后必须作废前缀");
+  assert.equal(
+    (SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length, 3,
+    "定义 + 本地压缩 + 裁剪，三处都要有；漏掉任一处都会让模型收到错位的上下文",
+  );
+});
+

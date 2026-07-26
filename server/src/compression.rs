@@ -424,9 +424,6 @@ pub const SUMMARY_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// 单次请求最多现算多少个新摘要。
 ///
-/// 正常续写每轮最多新增一两段。一次要算几十段只可能是首次导入一份超长历史——那种情况
-/// 让它分几轮逐步压完，也好过让单个请求卡在几十次串行 LLM 调用上。
-pub const MAX_FRESH_SEGMENTS_PER_REQUEST: usize = 4;
 
 /// 从 Redis 取一个段的摘要。
 pub async fn cached_summary(
@@ -457,6 +454,49 @@ pub async fn store_summary(redis: &mut redis::aio::ConnectionManager, key: &str,
 ///
 /// 摘要以一条 `system` 消息注入，并明确告诉模型这是被压缩过的早期上下文——否则模型可能
 /// 把摘要当成用户刚说的话。
+/// 摘要注入用的 system 文本。`None` 表示没有摘要要注入。
+///
+/// 单独抽出来是为了让调用方能自己拼装消息数组：`Msg` 是**规划用**的有损类型
+/// （只有 role/text/tokens），拿它重建线路消息会把 `tool_calls`、`tool_call_id`、
+/// `name`、图片块全部丢掉 —— agent 模式发的正是这些，上游会直接拒收。
+/// 真正上线路的必须是原始 JSON 消息对象。
+pub fn summary_system_text(summaries: &[String]) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let joined = summaries
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("【早期片段 {}】\n{}", i + 1, s.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(format!(
+        "以下是本次对话**较早部分**的压缩记录（由 michael-compression 生成，非用户新发言）。\
+         请把它当作已经发生过的事实来延续任务；如果其中的信息与后面的原文冲突，以原文为准。\n\n{joined}"
+    ))
+}
+
+/// 组装后的预计 token 数：摘要占位 + 逐字尾部的真实 token。
+///
+/// 有了它才能在压缩完成后**校验结果真的塞得进窗口**。此前没有任何环节做这件事：
+/// 撞到单轮新算上限就 break，剩下的段留在原文里，于是第一轮压缩仍然发出一个远超
+/// 窗口的请求 —— 而客户端因为看到档位已经关掉了自己的裁剪，没有任何兜底。
+pub fn projected_tokens_for(msgs: &[Msg], verbatim_from: usize, summary_count: usize) -> usize {
+    let tail: usize = msgs
+        .get(verbatim_from..)
+        .map(|s| s.iter().map(|m| m.tokens).sum())
+        .unwrap_or(0);
+    summary_count * SEGMENT_SUMMARY_TOKENS + tail
+}
+
+/// 送给上游的 token 预算（留出安全边际）。
+pub fn window_budget(native_window: usize) -> usize {
+    ((native_window as f64) * WINDOW_SAFETY) as usize
+}
+
+/// 仅测试使用：生产路径改走 `summary_system_text` + 原始 JSON 拼接
+/// （见 models.rs 的 `compression_write_back`），因为 `Msg` 会丢掉 tool_calls。
+#[cfg(test)]
 pub fn assemble(msgs: &[Msg], plan: &Plan, summaries: &[String]) -> Vec<Msg> {
     // 判据是「有没有摘要要注入」，不是「这一轮压了几段」。前缀续传时这一轮可能一段都
     // 没压，但手上仍握着上几轮的摘要——按 plan.compress 判会把它们整个丢掉，模型就
@@ -464,20 +504,10 @@ pub fn assemble(msgs: &[Msg], plan: &Plan, summaries: &[String]) -> Vec<Msg> {
     if summaries.is_empty() {
         return msgs.to_vec();
     }
-    let mut out = Vec::with_capacity(summaries.len() + msgs.len() - plan.verbatim_from + 1);
-    let joined = summaries
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("【早期片段 {}】\n{}", i + 1, s.trim()))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    out.push(Msg::new(
-        "system",
-        format!(
-            "以下是本次对话**较早部分**的压缩记录（由 michael-compression 生成，非用户新发言）。\
-             请把它当作已经发生过的事实来延续任务；如果其中的信息与后面的原文冲突，以原文为准。\n\n{joined}"
-        ),
-    ));
+    let mut out = Vec::with_capacity(msgs.len() - plan.verbatim_from + 1);
+    if let Some(text) = summary_system_text(summaries) {
+        out.push(Msg::new("system", text));
+    }
     out.extend_from_slice(&msgs[plan.verbatim_from..]);
     out
 }

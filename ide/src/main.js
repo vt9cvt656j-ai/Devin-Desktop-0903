@@ -11094,6 +11094,46 @@ let _michaelUser = null;
 /// 网关为当前账号开通的 michael-compression 档位（"1m"/"2m"/"5m"），没有则 null。
 ///
 /// 由 /api/me 下发，网关按会员套餐算好，客户端不自己推断——套餐规则只应该有一处真相。
+/// 网关上一轮签发的 michael-compression 前缀引用，按会话保存。
+///
+/// 有它，客户端下一轮只需要上传**新增消息**，网关从 Redis 取回历史摘要；没有它，
+/// 每轮都得整份上传，被 _MODEL_REQUEST_BODY_BYTE_CAP（3.5MB，约 875k token）卡死 ——
+/// 2m/5m 两档在物理上不可达。
+const _mcPrefixBySession = new Map();
+
+function _mcPrefixKey() {
+  // 按当前会话隔离：不同对话的前缀绝不能互相串用（网关侧还会校验 uid 和覆盖长度，
+  // 但客户端就不该把它发错地方）。
+  try {
+    const sess = typeof _currentSession === "function" ? _currentSession() : null;
+    return String(sess?.id || sess?.sessionId || "default");
+  } catch {
+    return "default";
+  }
+}
+
+function _mcPrefixGet() {
+  return _mcPrefixBySession.get(_mcPrefixKey()) || null;
+}
+
+function _mcPrefixSet(token) {
+  const key = _mcPrefixKey();
+  const t = String(token || "").trim();
+  if (!t || t.length > 200) return;
+  _mcPrefixBySession.set(key, t);
+  // 有界：会话可以很多，这个 Map 不能无限长。
+  if (_mcPrefixBySession.size > 64) {
+    const oldest = _mcPrefixBySession.keys().next().value;
+    if (oldest !== undefined) _mcPrefixBySession.delete(oldest);
+  }
+}
+
+/// 历史被本地改写过（压缩/裁剪/删除消息）之后必须作废：前缀记录的是"前 N 条已被
+/// 摘要覆盖"，历史一变这个 N 就对不上，继续发会让模型收到错位的上下文。
+function _mcPrefixInvalidate() {
+  _mcPrefixBySession.delete(_mcPrefixKey());
+}
+
 function _compressionTier() {
   const t = _michaelUser?.michael_compression?.tier;
   return typeof t === "string" && t ? t : null;
@@ -18675,6 +18715,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // anyway — i.e. Stop didn't actually stop ("停不掉"). 代际校验防新回合把旧回调救活。
       if (!_turnLive()) return;
       if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return; }
+      if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token); return; }
       if (ev && (ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall")) {
         _plainLastProgressAt = Date.now();
         if (_plainStreamDiag.firstProgressMs == null) _plainStreamDiag.firstProgressMs = Date.now() - _plainStreamDiag.attemptStartedAt;
@@ -26892,6 +26933,8 @@ function _smartCompress(text, budget) {
 }
 
 function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 0) {
+  // 同上：裁剪掉消息之后，前缀覆盖的条数不再对应真实历史。
+  try { _mcPrefixInvalidate(); } catch {}
   // ── RATCHET compression（棘轮式，只进不摆）──────────────────────────────────
   // 仍然每轮运行，但所有决策都是「单向、一次定形」：一条消息一旦折叠/截断，形态不再变化；
   // 折叠水位线只随新工具结果单调前移。以前 KEEP 随总量在 10/8/6 间跳、Tier2 cap 在
@@ -27116,6 +27159,9 @@ function _squeezeMessagesForContext(messages) {
  * "keep last N" fallback. The summary alone is the context for the next turn.
  */
 async function _compactHistoryIfHuge(config, session) {
+  // 本地一旦改写历史，网关那个"前 N 条已被摘要覆盖"的前缀就对不上了 —— 继续回发会
+  // 让模型收到错位的上下文。宁可下一轮整份重传一次。
+  _mcPrefixInvalidate();
   // 网关开了 michael-compression 就整个跳过：本地再压一次不但重复付费，还会改写历史
   // 前缀、让网关的分段缓存全部失效。
   if (_gatewayHandlesCompression()) return;
@@ -29140,7 +29186,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       _turnConfig.ideTimezone = _turnTime.timeZone;
       // 带上档位，网关会按会员套餐钳位后回传实际生效值。
       const _mcTier = _compressionTier();
-      if (_mcTier) _turnConfig.michaelCompression = _mcTier;
+      if (_mcTier) {
+        _turnConfig.michaelCompression = _mcTier;
+        const _mcPrev = _mcPrefixGet();
+        if (_mcPrev) _turnConfig.mcPrefix = _mcPrev;
+      }
       _turnConfig.ideUtcOffsetMinutes = _turnTime.utcOffsetMinutes;
       delete _turnConfig.ideMode; delete _turnConfig.ideTools;
       if (ideMode && _l0On(_turnConfig)) {
@@ -29158,6 +29208,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       _lastRequestEstimateTokens = _estRequestTokens(_l0Msgs, _l0Tools);
       _setContextMeter({ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" });
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
+        if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token); return; }
         if (ev && ev.kind === "streamMetric") {
           _recordStreamMetric(ev);
           return;

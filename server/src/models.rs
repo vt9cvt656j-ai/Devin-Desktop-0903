@@ -4214,12 +4214,22 @@ pub async fn chat_completions(
     // michael-compression：严格 opt-in。没有请求档位时这里直接返回，body 一个字节都不动，
     // 现有流量的行为与这个特性上线前完全一致。
     let mut compression_applied: Option<crate::compression::Tier> = None;
+    // 签发的前缀令牌必须回传给客户端，否则续传这条腿是断的：网关每轮都签一个新令牌
+    // 写进 Redis，客户端从不回发，于是 Redis 只写不读，而客户端每轮都得上传完整历史
+    // —— 2m/5m 两档在物理上根本达不到。
+    let mut compression_prefix: Option<String> = None;
     // 总开关默认关闭（MICHAEL_COMPRESSION_ENABLED）。发布前审查在这条链路上确认了多处
     // 会破坏线上请求的缺陷，最严重的是 compression_write_back 把每条消息重写成
     // {role, content} —— tool_calls / tool_call_id 全部丢失，而 agent 模式发的正是
     // 这些，上游会直接拒收。开关打开前必须先修完；关着时 body 一个字节都不动。
     if state.cfg.compression_enabled {
-        if let Some(requested) = compression_tier_from(&headers, &body) {
+        let requested_tier = compression_tier_from(&headers, &body);
+        // 无条件先清掉我们自己的协议字段。上一版只在 compression_write_back 里清，而
+        // 那个函数在每一条提前返回的路径上都不执行 —— 包括最常见的"没超窗口、不压缩"。
+        // 于是用 body 字段开启压缩的请求，每次不压缩时都把 michael_compression 原样
+        // 透传给了上游供应商。
+        compression_strip_protocol_fields(&mut body);
+        if let Some(requested) = requested_tier {
             // 档位是付费能力：按会员套餐钳位。超出权限时下调而不是拒绝，用户仍然拿到他
             // 买到的那一档，而不是在长对话跑到一半时被打断。
             let allowed = crate::compression::max_tier_for_plan(&plan, plan_active, credits);
@@ -4231,7 +4241,8 @@ pub async fn chat_completions(
                             "michael-compression: 请求档位超出套餐权限，已下调"
                         );
                     }
-                    apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
+                    compression_prefix =
+                        apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
                     compression_applied = Some(tier);
                 }
                 None => {
@@ -4972,6 +4983,9 @@ pub async fn chat_completions(
         // 用户会以为自己拿到了 5M。
         if let Some(tier) = compression_applied {
             builder = builder.header("x-michael-compression-applied", tier.as_str());
+            if let Some(tok) = compression_prefix.as_deref() {
+                builder = builder.header("x-michael-compression-prefix", tok);
+            }
         }
         let out = builder
             .body(Body::from_stream(body_stream))
@@ -5056,6 +5070,11 @@ pub async fn chat_completions(
         };
         bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
         let mut resp = Json(data).into_response();
+        if let Some(tok) = compression_prefix.as_deref() {
+            if let Ok(v) = axum::http::HeaderValue::from_str(tok) {
+                resp.headers_mut().insert("x-michael-compression-prefix", v);
+            }
+        }
         if let Some(tier) = compression_applied {
             if let Ok(v) = axum::http::HeaderValue::from_str(tier.as_str()) {
                 resp.headers_mut().insert("x-michael-compression-applied", v);
@@ -7077,9 +7096,13 @@ mod michael_compression_wiring_tests {
         assert!(compression_tier_from(&HeaderMap::new(), &bad).is_none());
     }
 
-    /// 只统计文本，且顺序/角色必须原样保留——规划完全建立在这个序列上。
+    /// 顺序/角色原样保留，且**开头的 system 被钉住不参与压缩**。
+    ///
+    /// 服务端组装的 L0 系统提示词就在 messages[0]，而逐字尾部是从末尾往前取的 ——
+    /// 不钉住的话压缩一触发它必然落进被压前缀，整套行为准则被一段 600 token 的
+    /// 摘要替换掉。
     #[test]
-    fn messages_are_read_in_order_with_roles() {
+    fn messages_are_read_in_order_with_leading_system_pinned() {
         let body = serde_json::json!({
             "messages": [
                 { "role": "system", "content": "规则" },
@@ -7087,19 +7110,111 @@ mod michael_compression_wiring_tests {
                 { "role": "assistant", "content": [{ "type": "text", "text": "回答" }] },
             ]
         });
-        let msgs = compression_msgs_from(&body);
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[1].text, "问题");
+        let (pinned, msgs) = compression_plan_input(&body);
+        assert_eq!(pinned, 1, "开头的 system 必须被钉住");
+        assert_eq!(msgs.len(), 2, "可压缩部分不含被钉住的 system");
+        assert_eq!(msgs[0].text, "问题");
         // 多模态内容按其文本部分参与规划。
-        assert_eq!(msgs[2].text, "回答");
+        assert_eq!(msgs[1].text, "回答");
         assert!(msgs.iter().all(|m| m.tokens > 0));
+    }
+
+    /// tool_calls 里的负载必须计入体积。
+    ///
+    /// agent 模式下 write_file / multi_edit 的**整个文件内容都在
+    /// tool_calls[].function.arguments 里**，而 content 是 null。只数 content 的话
+    /// 最大的那些消息全被估成 0 token，规划器认为"没超窗口"什么都不压 —— 压缩在最
+    /// 需要它的场景下恰好不工作。
+    #[test]
+    fn tool_call_payloads_count_toward_size() {
+        let big = "x".repeat(4000);
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "改文件" },
+                { "role": "assistant", "content": serde_json::Value::Null, "tool_calls": [
+                    { "id": "c1", "type": "function", "function": { "name": "write_file", "arguments": big } }
+                ]},
+            ]
+        });
+        let (_, msgs) = compression_plan_input(&body);
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            msgs[1].tokens > 500,
+            "带 tool_calls 的消息不能被估成 0 token，实测 {}",
+            msgs[1].tokens
+        );
+    }
+
+    /// 全是 system 时不能把一切都钉住，否则永远压不动。
+    #[test]
+    fn all_system_messages_still_leave_something_compressible() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "a" },
+                { "role": "system", "content": "b" },
+            ]
+        });
+        let (pinned, msgs) = compression_plan_input(&body);
+        assert_eq!(pinned, 1);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    /// 写回必须**无损**：tool_calls / tool_call_id / name 全部原样保留。
+    ///
+    /// 这是压缩之前不能上线的头号原因。上一版拿 Msg 重建 `{role, content}`，写回之后
+    /// 数组里会出现没有 tool_call_id 的 `{"role":"tool"}` 消息，上游直接拒收 ——
+    /// 也就是 agent 模式一压缩就整个坏掉。
+    #[test]
+    fn write_back_preserves_tool_call_structure() {
+        let mut body = serde_json::json!({
+            "michael_compression": "5m",
+            "messages": [
+                { "role": "system", "content": "系统提示词" },
+                { "role": "user", "content": "老消息" },
+                { "role": "assistant", "content": serde_json::Value::Null, "tool_calls": [
+                    { "id": "call_1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": "文件内容" },
+                { "role": "user", "content": "新问题" },
+            ]
+        });
+        // 压掉前两条（索引相对 pinned 之后：0=老消息, 1=assistant），逐字从 2 起。
+        compression_write_back(&mut body, 1, 2, &["早期摘要".to_string()]);
+        let arr = body["messages"].as_array().expect("messages 必须还在");
+
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "系统提示词", "钉住的系统提示词必须原样保留");
+        assert_eq!(arr[1]["role"], "system");
+        assert!(
+            arr[1]["content"].as_str().unwrap().contains("早期摘要"),
+            "摘要作为一条新的 system 注入"
+        );
+        // 逐字尾部必须是**原始对象**，结构字段一个不少。
+        assert_eq!(arr[2]["role"], "tool");
+        assert_eq!(arr[2]["tool_call_id"], "call_1", "tool_call_id 不能丢");
+        assert_eq!(arr[2]["name"], "read_file", "name 不能丢");
+        assert_eq!(arr[3]["content"], "新问题");
+        assert_eq!(arr.len(), 4);
+    }
+
+    /// 协议字段绝不能透传给上游 —— 包括**不压缩**的那些路径。
+    #[test]
+    fn protocol_fields_are_stripped_even_without_compressing() {
+        let mut body = serde_json::json!({
+            "michael_compression": "2m",
+            "mc_prefix": "tok",
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        compression_strip_protocol_fields(&mut body);
+        assert!(body.get("michael_compression").is_none());
+        assert!(body.get("mc_prefix").is_none());
+        assert!(body.get("messages").is_some(), "只清协议字段，不动 messages");
     }
 
     #[test]
     fn missing_messages_is_not_a_panic() {
-        assert!(compression_msgs_from(&serde_json::json!({})).is_empty());
-        assert!(compression_msgs_from(&serde_json::json!({ "messages": "nope" })).is_empty());
+        assert!(compression_plan_input(&serde_json::json!({})).1.is_empty());
+        assert!(compression_plan_input(&serde_json::json!({ "messages": "nope" })).1.is_empty());
     }
 }
 
@@ -7309,18 +7424,62 @@ fn compression_tier_from(
 ///
 /// 只取纯文本内容：带图片等多模态块的消息按其文本部分参与规划，压缩时也只压文本，
 /// 非文本部分永远落在逐字尾部或原样保留（我们从不重写消息本身，只决定压不压）。
-fn compression_msgs_from(body: &serde_json::Value) -> Vec<crate::compression::Msg> {
-    body.get("messages")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|m| {
-                    let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                    crate::compression::Msg::new(role, oai_content_text(m.get("content")))
-                })
-                .collect()
+/// 规划用的消息视图。
+///
+/// 返回 `(pinned, msgs)`：`pinned` 是开头那一串**必须逐字保留**的 system 消息条数，
+/// `msgs` 是其后可参与压缩的部分（索引从 0 起，与 `pinned` 无关）。
+///
+/// 为什么要把开头的 system 钉住：`prompts::assemble_into` 会把服务端组装的 L0 系统
+/// 提示词放在 messages[0]，而 `plan()` 的逐字尾部是**从末尾往前**取的 —— 压缩一旦
+/// 触发，verbatim_from 必然 >= 1，系统提示词就落进被压前缀，被最便宜的模型写的约
+/// 600 token 摘要替换掉。整套行为准则就这么没了。
+fn compression_plan_input(body: &serde_json::Value) -> (usize, Vec<crate::compression::Msg>) {
+    let Some(arr) = body.get("messages").and_then(|v| v.as_array()) else {
+        return (0, Vec::new());
+    };
+    let role_of = |m: &serde_json::Value| {
+        m.get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user")
+            .to_string()
+    };
+    let pinned = arr
+        .iter()
+        .take_while(|m| role_of(m) == "system")
+        .count()
+        // 全是 system 的极端情况下别把一切都钉住，否则永远压不动。
+        .min(arr.len().saturating_sub(1));
+
+    let msgs = arr[pinned..]
+        .iter()
+        .map(|m| {
+            crate::compression::Msg::new(role_of(m), compression_countable_text(m))
         })
-        .unwrap_or_default()
+        .collect();
+    (pinned, msgs)
+}
+
+/// 规划时用来估算体积的文本。
+///
+/// 必须把 `tool_calls[].function.arguments` 也算进去：agent 模式下
+/// write_file / multi_edit 的**整个文件内容都在 arguments 里**，而 `content` 是 null。
+/// 只数 content 的话，最大的那些消息全被估成 0 token，规划器于是认为"没超窗口"、
+/// 什么都不压 —— 压缩在最需要它的场景下恰好不工作。
+fn compression_countable_text(m: &serde_json::Value) -> String {
+    let mut out = oai_content_text(m.get("content"));
+    if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        for c in calls {
+            if let Some(name) = c.pointer("/function/name").and_then(|v| v.as_str()) {
+                out.push('\n');
+                out.push_str(name);
+            }
+            if let Some(args) = c.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                out.push('\n');
+                out.push_str(args);
+            }
+        }
+    }
+    out
 }
 
 /// 挑一个用来做压缩的便宜模型：按官方单价升序取第一个可用连接。
@@ -7451,14 +7610,45 @@ async fn compression_take_prefix(
     ))
 }
 
-/// 把组装好的消息序列写回 body，并清掉我们自己的协议字段（绝不能透传给上游）。
-fn compression_write_back(body: &mut serde_json::Value, assembled: &[crate::compression::Msg]) {
-    if let Some(arr) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-        *arr = assembled
-            .iter()
-            .map(|m| json!({ "role": m.role, "content": m.text }))
-            .collect();
+/// 把压缩结果写回 body。
+///
+/// 只做**拼接**，不重建消息：钉住的 system 原样保留 → 摘要作为一条新的 system 注入
+/// → 逐字尾部直接克隆**原始 JSON 对象**。
+///
+/// 上一版是拿 `Msg` 重建 `{role, content}`，把 `tool_calls`、`tool_call_id`、`name`、
+/// 图片块全部丢掉。而 agent 模式发的正是这些：write_back 之后数组里会出现
+/// `{"role":"tool","content":"..."}` 这种没有 tool_call_id 的消息，上游直接拒收。
+/// `Msg` 只能用来规划，绝不能用来生成线路内容。
+///
+/// `verbatim_from` 是**相对于 pinned 之后那段**的索引，与 `compression_plan_input`
+/// 的返回值口径一致。
+fn compression_write_back(
+    body: &mut serde_json::Value,
+    pinned: usize,
+    verbatim_from: usize,
+    summaries: &[String],
+) {
+    let Some(arr) = body.get("messages").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len() + 1);
+    out.extend(arr.iter().take(pinned).cloned());
+    if let Some(text) = crate::compression::summary_system_text(summaries) {
+        out.push(json!({ "role": "system", "content": text }));
     }
+    let tail_start = pinned.saturating_add(verbatim_from).min(arr.len());
+    out.extend(arr[tail_start..].iter().cloned());
+    if let Some(slot) = body.get_mut("messages") {
+        *slot = serde_json::Value::Array(out);
+    }
+}
+
+/// 清掉我们自己的协议字段。**必须在任何 early return 之前调用**。
+///
+/// 上一版只在 `compression_write_back` 里清，而那个函数在每一条提前返回的路径上都
+/// 不会被执行 —— 包括最常见的"没超窗口、不压缩"。于是用 body 字段开启压缩的请求，
+/// 每一次不压缩时都把 `michael_compression` 原样透传给了上游供应商。
+fn compression_strip_protocol_fields(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("michael_compression");
         obj.remove("mc_prefix");
@@ -7501,6 +7691,17 @@ async fn compression_issue_prefix(
 /// 全程 best-effort：任何一步失败都保持 body 原样（这一轮上下文短一点，但聊天照常可用）。
 ///
 /// 返回本轮签发的新前缀引用（若有），供响应头回传给客户端做下一轮续传。
+/// 压缩阶段的总时间预算。
+///
+/// 压缩发生在上游聊天调用**之前**，而客户端等响应头只等 15s。上一版是每段 120s 超时、
+/// 最多 4 段**串行** —— 冷缓存下光压缩就可能吃掉 8 分钟，客户端早就放弃并重试，而每次
+/// 重试都会再开一轮同样的压缩。所以这里必须有硬预算，并且段与段之间**并发**跑。
+const COMPRESSION_TIME_BUDGET: Duration = Duration::from_secs(8);
+/// 单段摘要的超时。并发跑，所以这个值决定的是整体延迟而不是它们的和。
+const COMPRESSION_SEGMENT_TIMEOUT: Duration = Duration::from_secs(6);
+/// 一轮最多并发压多少段。太多会把便宜模型的限流打满，反而更慢。
+const COMPRESSION_MAX_CONCURRENCY: usize = 6;
+
 async fn apply_michael_compression(
     state: &AppState,
     body: &mut serde_json::Value,
@@ -7509,22 +7710,34 @@ async fn apply_michael_compression(
     uid: uuid::Uuid,
 ) -> Option<String> {
     use crate::compression as mc;
+    use futures_util::stream::{FuturesUnordered, StreamExt};
 
-    // 前缀续传：客户端只发了未覆盖的消息，历史摘要从 Redis 取回。这条路径让线路体积
-    // 正比于新增内容而不是对话总长——5M 档能跑起来全靠它。
+    let started = std::time::Instant::now();
+
+    // 前缀续传：客户端只发了未覆盖的消息，历史摘要从 Redis 取回。
     let (carried_summaries, carried_keys, carried_msgs, carried_raw) =
         match compression_take_prefix(state, body, uid).await {
             Some((sums, keys, n, raw)) => (sums, keys, n, raw),
             None => (Vec::new(), Vec::new(), 0, 0),
         };
 
-    let msgs = compression_msgs_from(body);
+    // 前缀一旦被取用，客户端手上就只有"未覆盖"的那截消息了。此后任何一条返回路径都
+    // **必须**把摘要拼回去，否则请求会带着一段被静默截断的对话发往上游 —— 而且照常
+    // 计费。这个闭包就是那条唯一的退出通道。
+    let (pinned, msgs) = compression_plan_input(body);
+    let bail = |body: &mut serde_json::Value| -> Option<String> {
+        if !carried_summaries.is_empty() {
+            compression_write_back(body, pinned, 0, &carried_summaries);
+        }
+        None
+    };
+
     if msgs.is_empty() {
-        return None;
+        return bail(body);
     }
 
     let native = official_context(model_id).unwrap_or(128_000).max(1) as usize;
-    // 已取回的摘要要占掉一部分窗口，规划新内容时先扣掉，否则拼起来仍会超窗。
+    let budget = mc::window_budget(native);
     let carried_budget = carried_summaries.len() * mc::SEGMENT_SUMMARY_TOKENS;
     let planning_window = native.saturating_sub(carried_budget).max(native / 4);
     let plan = mc::plan(&msgs, planning_window, mc::VERBATIM_TAIL_TOKENS, mc::SEGMENT_TOKENS);
@@ -7537,93 +7750,136 @@ async fn apply_michael_compression(
         );
     }
 
-    // 没有新段要压。带了前缀就必须把摘要拼回去——否则这一轮历史凭空消失。
     if plan.compress.is_empty() {
+        // 没有新段要压。带了前缀就必须把摘要拼回去，否则这一轮历史凭空消失。
         if carried_summaries.is_empty() {
-            return None; // 没超窗口，一分钱不花
+            return None; // 没超窗口，一分钱不花，body 未被改动
         }
-        let carry_only = mc::Plan {
-            compress: Vec::new(),
-            verbatim_from: 0,
-            projected_tokens: plan.projected_tokens,
-            raw_tokens: plan.raw_tokens,
-        };
-        compression_write_back(body, &mc::assemble(&msgs, &carry_only, &carried_summaries));
-        // 前缀没有变长，沿用客户端手上那个引用即可（不签发新的，省一次 Redis 写）。
-        return None;
+        compression_write_back(body, pinned, 0, &carried_summaries);
+        return None; // 前缀没变长，沿用客户端手上那个引用
     }
 
     let Some((conn, compressor)) = compression_pick_compressor(state).await else {
         tracing::warn!("michael-compression: 没有可用的压缩模型，本轮不压缩");
-        return None;
+        return bail(body);
     };
 
     let mut redis = state.redis.clone();
     let mut summaries: Vec<String> = carried_summaries.clone();
     let mut new_keys: Vec<String> = Vec::with_capacity(plan.compress.len());
-    let mut fresh = 0usize;
     let mut cached = 0usize;
 
-    for seg in &plan.compress {
+    // 第一遍只查缓存：命中的段不花钱、不占时间预算，这正是"压缩缓存"省钱的地方。
+    let mut pending: Vec<(usize, String, String)> = Vec::new();
+    for (idx, seg) in plan.compress.iter().enumerate() {
         let text = mc::segment_text(&msgs, seg);
         let key = mc::segment_cache_key(&text, &compressor, mc::SEGMENT_SUMMARY_TOKENS);
-        if let Some(hit) = mc::cached_summary(&mut redis, &key).await {
-            cached += 1;
-            summaries.push(hit);
-            new_keys.push(key);
-            continue;
-        }
-        if fresh >= mc::MAX_FRESH_SEGMENTS_PER_REQUEST {
-            // 超过本轮预算：剩下的段这次不压，留在原文里，下一轮继续补。宁可这轮上下文
-            // 长一点，也不要让一个请求卡在几十次串行压缩上。
-            tracing::info!(
-                tier = tier.as_str(),
-                "michael-compression: 达到单轮新算上限，剩余段留待后续轮次"
-            );
-            break;
-        }
-        match compression_summarize(&conn, &compressor, &text).await {
-            Some(call) => {
-                mc::store_summary(&mut redis, &key, &call.summary).await;
-                fresh += 1;
-                // 压缩是真实的上游消耗，必须记账。缓存命中的段不计费——那正是这套设计
-                // 省下来的钱，也是「压缩缓存」这个名字的意义。
-                bill_compression_call(state, uid, &conn, &compressor, call.usage.as_ref()).await;
-                summaries.push(call.summary);
+        match mc::cached_summary(&mut redis, &key).await {
+            Some(hit) => {
+                cached += 1;
+                summaries.push(hit);
                 new_keys.push(key);
             }
-            None => {
-                tracing::warn!("michael-compression: 段压缩失败，本轮降级为不压缩");
-                return None;
-            }
+            None => pending.push((idx, key, text)),
         }
     }
 
-    // 实际压掉的消息数可能少于计划（撞到单轮上限时会提前 break），逐字部分要按实际来。
+    // 缓存命中必须是**前缀连续**的：段摘要按顺序拼成历史，中间缺一段就等于历史错位。
+    // 第一个未命中的段之后，剩下的都得现算（即使它们各自碰巧有缓存）。
+    let first_miss = pending.first().map(|(i, _, _)| *i).unwrap_or(plan.compress.len());
+    summaries.truncate(carried_summaries.len() + first_miss);
+    new_keys.truncate(first_miss);
+
+    let mut fresh = 0usize;
+    let mut budget_exhausted = false;
+    for chunk in pending.chunks(COMPRESSION_MAX_CONCURRENCY) {
+        if started.elapsed() >= COMPRESSION_TIME_BUDGET {
+            budget_exhausted = true;
+            break;
+        }
+        // **并发**跑一批。串行是上一版最致命的性能问题。
+        let mut jobs: FuturesUnordered<_> = chunk
+            .iter()
+            .map(|(idx, key, text)| {
+                let conn = conn.clone();
+                let compressor = compressor.clone();
+                let key = key.clone();
+                let text = text.clone();
+                let idx = *idx;
+                async move {
+                    let out = tokio::time::timeout(
+                        COMPRESSION_SEGMENT_TIMEOUT,
+                        compression_summarize(&conn, &compressor, &text),
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                    (idx, key, out)
+                }
+            })
+            .collect();
+
+        let mut done: Vec<(usize, String, CompressionCall)> = Vec::new();
+        while let Some((idx, key, out)) = jobs.next().await {
+            match out {
+                Some(call) => done.push((idx, key, call)),
+                None => {
+                    tracing::warn!("michael-compression: 段压缩失败或超时，后续段不再尝试");
+                    budget_exhausted = true;
+                }
+            }
+        }
+        // 仍要按段序拼接：并发完成顺序是乱的。
+        done.sort_by_key(|(idx, _, _)| *idx);
+        for (_, key, call) in done {
+            mc::store_summary(&mut redis, &key, &call.summary).await;
+            fresh += 1;
+            bill_compression_call(state, uid, &conn, &compressor, call.usage.as_ref()).await;
+            summaries.push(call.summary);
+            new_keys.push(key);
+        }
+        if budget_exhausted {
+            break;
+        }
+    }
+
     let actually_compressed = new_keys.len();
+    if actually_compressed == 0 {
+        tracing::warn!("michael-compression: 一段都没压成，本轮降级为不压缩");
+        return bail(body);
+    }
     let verbatim_from = plan
         .compress
         .get(actually_compressed.saturating_sub(1))
         .map(|s| s.end)
         .unwrap_or(0);
-    let effective = mc::Plan {
-        compress: plan.compress[..actually_compressed].to_vec(),
-        verbatim_from,
-        projected_tokens: plan.projected_tokens,
-        raw_tokens: plan.raw_tokens,
-    };
 
-    compression_write_back(body, &mc::assemble(&msgs, &effective, &summaries));
+    // **校验结果真的塞得进窗口。** 此前没有任何环节做这件事：撞到上限就 break、剩下的
+    // 段留在原文里，于是第一轮压缩照样发出一个远超窗口的请求 —— 而客户端因为看到档位
+    // 已经关掉了自己的裁剪，没有兜底。
+    let projected = carried_budget + mc::projected_tokens_for(&msgs, verbatim_from, new_keys.len());
+    if projected > budget {
+        tracing::warn!(
+            model = %model_id, tier = tier.as_str(), projected, budget,
+            elapsed_ms = started.elapsed().as_millis(), budget_exhausted,
+            "michael-compression: 压缩后仍超窗口，本轮降级为不压缩（请让客户端自行裁剪）"
+        );
+        return bail(body);
+    }
+
+    compression_write_back(body, pinned, verbatim_from, &summaries);
 
     let mut all_keys = carried_keys;
     all_keys.extend(new_keys);
-    let covered = carried_msgs + effective.verbatim_from;
+    let covered = carried_msgs + verbatim_from;
     let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw).await;
 
     tracing::info!(
         %uid, model = %model_id, tier = tier.as_str(), compressor = %compressor,
         carried_msgs, carried_raw, raw_tokens = plan.raw_tokens, total_raw,
+        pinned, verbatim_from, projected, budget,
         segments_cached = cached, segments_fresh = fresh,
+        elapsed_ms = started.elapsed().as_millis(),
         issued_prefix = issued.is_some(),
         "michael-compression applied"
     );
@@ -7664,7 +7920,12 @@ async fn bill_compression_call(
         !reported,
     );
     tokens.request_id = None;
-    // use_quota=false：压缩走余额而不是会员的时段额度，否则用户会觉得"我什么都没做
-    // 时段额度就少了一截"。
-    bill(state, uid, conn.id, cost, false, &tokens).await;
+    // use_quota=true：压缩是**套餐内含的能力**（档位就是按套餐分的），所以走会员的
+    // 时段额度，而不是钱包余额。
+    //
+    // 上一版是 false，理由是"别让用户觉得什么都没做额度就少了"。但那会把纯订阅、
+    // 零余额的用户扣成负数 —— 他被自己套餐包含的功能扣出了债。压缩省下来的输入
+    // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
+    // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
+    bill(state, uid, conn.id, cost, true, &tokens).await;
 }
