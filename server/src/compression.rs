@@ -773,4 +773,28 @@ mod tests {
         let fresh = keys2.len() - reused;
         assert!(fresh <= 2, "第二轮不该产生 {fresh} 个新段");
     }
+
+    /// 套餐**过期**后按余额兜底，不再按套餐名给档位。
+    ///
+    /// 这是一个真实踩到的场景：账号 plan='ultra'、余额 17127 分，但 plan_expires_at
+    /// 已经过去 34 小时。用户看到自己是 ultra 会员，以为该有 5M；实际 plan_active
+    /// 为假，只能靠余额兜底拿到 1M。档位不对时先看到期时间，不要先怀疑代码。
+    #[test]
+    fn expired_plan_falls_back_to_credits_not_plan_name() {
+        assert_eq!(
+            max_tier_for_plan("ultra", false, 17_127),
+            Some(Tier::M1),
+            "套餐过期 + 有余额 → 1M（不是 5M）"
+        );
+        assert_eq!(
+            max_tier_for_plan("ultra", false, 0),
+            None,
+            "套餐过期 + 无余额 → 没有压缩能力"
+        );
+        assert_eq!(
+            max_tier_for_plan("ultra", true, 0),
+            Some(Tier::M5),
+            "套餐有效时 5M 与余额无关 —— 它是套餐内含的能力"
+        );
+    }
 }

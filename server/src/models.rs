@@ -7485,23 +7485,37 @@ fn compression_countable_text(m: &serde_json::Value) -> String {
 /// 挑一个用来做压缩的便宜模型：按官方单价升序取第一个可用连接。
 ///
 /// 压缩是机械活，用旗舰模型压是纯烧钱——这正是客户端 `_pickCheapModel` 曾经犯的错。
-async fn compression_pick_compressor(state: &AppState) -> Option<(Model, String)> {
-    let models = sqlx::query_as::<_, Model>(
+async fn compression_pick_compressors(state: &AppState) -> Vec<(Model, String)> {
+    let Ok(models) = sqlx::query_as::<_, Model>(
         "SELECT * FROM models WHERE active = true AND api_key <> '' ORDER BY sort, created_at",
     )
     .fetch_all(&state.db)
     .await
-    .ok()?;
-    let mut best: Option<(f64, Model, String)> = None;
+    else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(f64, Model, String)> = Vec::new();
     for m in models {
         for id in allowed_ids(&m) {
             let price = official_price(&id).map(|(i, o)| i + o).unwrap_or(f64::MAX);
-            if best.as_ref().is_none_or(|(p, _, _)| price < *p) {
-                best = Some((price, m.clone(), id));
-            }
+            ranked.push((price, m.clone(), id));
         }
     }
-    best.map(|(_, m, id)| (m, id))
+    ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // **每个上游连接只留最便宜的那一个模型**，然后按价格排出候选序列。
+    //
+    // 为什么要跨连接备选：实测踩到过一次 —— 最便宜的模型正好在一条挂掉的上游线路上，
+    // 于是每一段摘要都在同一毫秒被拒绝，压缩整体降级为不压缩，而原始的 1.2MB 历史
+    // 直接发给了目标模型并把它打成 504。压缩不能被单一供应商绑死。
+    //
+    // 同一连接内只留一个候选：同一条线路挂了，换它自己的另一个模型也是白搭。
+    let mut seen_conn = std::collections::HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|(_, m, _)| seen_conn.insert(m.id))
+        .map(|(_, m, id)| (m, id))
+        .collect()
 }
 
 /// 压一个段。失败返回 None —— 调用方降级为「这段不压」，绝不让压缩失败拖垮聊天。
@@ -7759,8 +7773,29 @@ async fn apply_michael_compression(
         return None; // 前缀没变长，沿用客户端手上那个引用
     }
 
-    let Some((conn, compressor)) = compression_pick_compressor(state).await else {
+    let candidates = compression_pick_compressors(state).await;
+    if candidates.is_empty() {
         tracing::warn!("michael-compression: 没有可用的压缩模型，本轮不压缩");
+        return bail(body);
+    }
+    // 用一段短文本探一下最便宜的那条线路还活着没有。探测本身的花费可以忽略（几十
+    // token），换来的是不会让整轮压缩全军覆没。
+    let mut chosen: Option<(Model, String)> = None;
+    for (conn, id) in &candidates {
+        if compression_summarize(conn, id, "ok").await.is_some() {
+            chosen = Some((conn.clone(), id.clone()));
+            break;
+        }
+        tracing::warn!(
+            compressor = %id, base_url = %conn.base_url,
+            "michael-compression: 压缩模型探测失败，换下一个候选"
+        );
+    }
+    let Some((conn, compressor)) = chosen else {
+        tracing::warn!(
+            candidates = candidates.len(),
+            "michael-compression: 所有候选压缩模型都不可用，本轮不压缩"
+        );
         return bail(body);
     };
 
@@ -7824,7 +7859,11 @@ async fn apply_michael_compression(
             match out {
                 Some(call) => done.push((idx, key, call)),
                 None => {
-                    tracing::warn!("michael-compression: 段压缩失败或超时，后续段不再尝试");
+                    tracing::warn!(
+                        compressor = %compressor, base_url = %conn.base_url,
+                        timeout_s = COMPRESSION_SEGMENT_TIMEOUT.as_secs(),
+                        "michael-compression: 段压缩失败或超时，后续段不再尝试"
+                    );
                     budget_exhausted = true;
                 }
             }
@@ -7845,7 +7884,10 @@ async fn apply_michael_compression(
 
     let actually_compressed = new_keys.len();
     if actually_compressed == 0 {
-        tracing::warn!("michael-compression: 一段都没压成，本轮降级为不压缩");
+        tracing::warn!(
+            compressor = %compressor, base_url = %conn.base_url,
+            "michael-compression: 一段都没压成，本轮降级为不压缩"
+        );
         return bail(body);
     }
     let verbatim_from = plan
