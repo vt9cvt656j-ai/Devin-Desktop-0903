@@ -183,6 +183,11 @@ pub enum AiEvent {
     /// `config.mcPrefix` 回发，从而只上传新增消息。
     CompressionPrefix {
         token: String,
+        /// 开头 system 块**之后**已被摘要覆盖的消息条数。
+        ///
+        /// 少了这个数客户端就不知道该省略前几条，只能整份重传 —— 既撞 3.5MB 字节上限
+        /// （5M 档因此不可达），又会让早期内容同时以摘要和原文出现、上下文重复膨胀。
+        covered: usize,
     },
     /// Internal timing breadcrumbs for diagnosing "not really streaming" reports.
     /// These are separate from real progress: response headers and raw chunks can
@@ -1649,7 +1654,20 @@ async fn ai_chat_inner(
         .filter(|s| !s.is_empty() && s.len() <= 200)
         .map(str::to_string)
     {
-        let _ = on_event.send(AiEvent::CompressionPrefix { token: tok });
+        // 覆盖条数缺失或解析失败时按 0 处理：宁可这一轮整份重传，也不能凭一个错的
+        // 条数去裁历史 —— 裁错了模型收到的是错位的上下文，而且不会有任何报错。
+        let covered = resp
+            .headers()
+            .get("x-michael-compression-covered")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if covered > 0 {
+            let _ = on_event.send(AiEvent::CompressionPrefix {
+                token: tok,
+                covered,
+            });
+        }
     }
 
     let mut stream = resp.bytes_stream();

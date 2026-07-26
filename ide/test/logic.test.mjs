@@ -11405,7 +11405,18 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
     (SRC.match(/ev\.kind === "compressionPrefix"/g) || []).length, 2,
     "普通对话和 agent 两条路径都要接，只接一条等于 agent 模式下前缀永远丢失",
   );
-  assert.match(SRC, /_turnConfig\.mcPrefix = _mcPrev/, "下一轮必须回发");
+  // 回发由 _applyCompressionPrefix 统一负责：它同时裁掉已覆盖的消息并挂上令牌，
+  // 两件事必须一起做 —— 只挂令牌不裁消息会让早期内容同时以摘要和原文出现。
+  assert.match(SRC, /turnConfig\.mcPrefix = rec\.token/, "下一轮必须回发令牌");
+  assert.match(SRC, /messages\.slice\(0, pinned\)\.concat\(messages\.slice\(need\)\)/,
+    "必须按网关报的 covered 裁掉已覆盖的消息");
+  assert.equal(
+    (SRC.match(/_applyCompressionPrefix\(/g) || []).length, 3,
+    "定义 + agent 路径 + 普通对话路径；漏掉任一条路径那条路径就只能整份重传",
+  );
+  // 前置条件必须严格：服务端只挡得住"少裁"，多裁等于静默丢历史。
+  assert.match(SRC, /messages\.length <= need \|\| messages\.length < rec\.sentLength/,
+    "历史变短或被本地改写过时不能使用前缀");
   assert.match(SRC, /_mcPrefixInvalidate\(\)/, "本地改写历史后必须作废前缀");
   assert.equal(
     (SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length, 3,

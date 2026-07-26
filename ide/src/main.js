@@ -11116,16 +11116,38 @@ function _mcPrefixGet() {
   return _mcPrefixBySession.get(_mcPrefixKey()) || null;
 }
 
-function _mcPrefixSet(token) {
+function _mcPrefixSet(token, covered, sentLength) {
   const key = _mcPrefixKey();
   const t = String(token || "").trim();
-  if (!t || t.length > 200) return;
-  _mcPrefixBySession.set(key, t);
+  const c = Number(covered) || 0;
+  const n = Number(sentLength) || 0;
+  // covered 缺失就不存：宁可下一轮整份重传，也不能凭一个错的条数去裁历史 ——
+  // 裁错了模型收到的是**错位**的上下文，而且不会有任何报错。
+  if (!t || t.length > 200 || c <= 0 || n <= 0) return;
+  _mcPrefixBySession.set(key, { token: t, covered: c, sentLength: n });
   // 有界：会话可以很多，这个 Map 不能无限长。
   if (_mcPrefixBySession.size > 64) {
     const oldest = _mcPrefixBySession.keys().next().value;
     if (oldest !== undefined) _mcPrefixBySession.delete(oldest);
   }
+}
+
+/// 按上一轮网关报的覆盖条数裁掉已被摘要覆盖的消息，并把令牌挂到本轮 config 上。
+///
+/// 返回实际要发的消息数组。任何一项不成立就原样返回、不带令牌 —— 服务端那道"客户端
+/// 没省略就忽略前缀"的防线只挡得住少裁，**挡不住多裁**（多裁等于静默丢历史），所以
+/// 这里的前置条件必须严格。
+function _applyCompressionPrefix(messages, turnConfig) {
+  const rec = _mcPrefixGet();
+  if (!rec || !Array.isArray(messages)) return messages;
+  // 开头连续的 system 是网关钉住不压的那一段，必须原样保留。
+  let pinned = 0;
+  while (pinned < messages.length && messages[pinned] && messages[pinned].role === "system") pinned++;
+  const need = pinned + rec.covered;
+  // 历史只能增长。变短或被本地改写过（compact/trim 会调 _mcPrefixInvalidate）就不能用。
+  if (messages.length <= need || messages.length < rec.sentLength) return messages;
+  turnConfig.mcPrefix = rec.token;
+  return messages.slice(0, pinned).concat(messages.slice(need));
 }
 
 /// 历史被本地改写过（压缩/裁剪/删除消息）之后必须作废：前缀记录的是"前 N 条已被
@@ -18704,7 +18726,13 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       delete requestConfig.ideTools;
       providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock);
     }
+    const _mcTierPlain = _compressionTier();
+    if (_mcTierPlain) {
+      requestConfig.michaelCompression = _mcTierPlain;
+      providerMessages = _applyCompressionPrefix(providerMessages, requestConfig);
+    }
     const requestMessages = _enforceModelRequestBudget(providerMessages, providerTools);
+    const _mcSentLenPlain = requestMessages.length;
     const chatFn = useTools
       ? (cb) => backend.aiChatWithTools(requestConfig, requestMessages, providerTools, cb)
       : (cb) => backend.aiChat(requestConfig, requestMessages, cb);
@@ -18715,7 +18743,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // anyway — i.e. Stop didn't actually stop ("停不掉"). 代际校验防新回合把旧回调救活。
       if (!_turnLive()) return;
       if (ev && ev.kind === "streamMetric") { _plainRecordStreamMetric(ev); return; }
-      if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token); return; }
+      if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSentLenPlain); return; }
       if (ev && (ev.kind === "reasoning" || ev.kind === "token" || ev.kind === "toolCall")) {
         _plainLastProgressAt = Date.now();
         if (_plainStreamDiag.firstProgressMs == null) _plainStreamDiag.firstProgressMs = Date.now() - _plainStreamDiag.attemptStartedAt;
@@ -29186,11 +29214,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       _turnConfig.ideTimezone = _turnTime.timeZone;
       // 带上档位，网关会按会员套餐钳位后回传实际生效值。
       const _mcTier = _compressionTier();
-      if (_mcTier) {
-        _turnConfig.michaelCompression = _mcTier;
-        const _mcPrev = _mcPrefixGet();
-        if (_mcPrev) _turnConfig.mcPrefix = _mcPrev;
-      }
+      if (_mcTier) _turnConfig.michaelCompression = _mcTier;
       _turnConfig.ideUtcOffsetMinutes = _turnTime.utcOffsetMinutes;
       delete _turnConfig.ideMode; delete _turnConfig.ideTools;
       if (ideMode && _l0On(_turnConfig)) {
@@ -29204,11 +29228,13 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _l0Tools = _keep;
         _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock);
       }
+      if (_mcTier) _l0Msgs = _applyCompressionPrefix(_l0Msgs, _turnConfig);
       _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools, _requestByteCap);
+      const _mcSentLen = _l0Msgs.length;
       _lastRequestEstimateTokens = _estRequestTokens(_l0Msgs, _l0Tools);
       _setContextMeter({ promptTokens: _lastRequestEstimateTokens, completionTokens: 0, cachedTokens: null, estimated: true, source: "prepared" });
       await backend.aiChatWithTools(_turnConfig, _l0Msgs, _l0Tools, (ev) => {
-        if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token); return; }
+        if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSentLen); return; }
         if (ev && ev.kind === "streamMetric") {
           _recordStreamMetric(ev);
           return;

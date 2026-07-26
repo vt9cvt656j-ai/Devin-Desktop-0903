@@ -4217,7 +4217,7 @@ pub async fn chat_completions(
     // 签发的前缀令牌必须回传给客户端，否则续传这条腿是断的：网关每轮都签一个新令牌
     // 写进 Redis，客户端从不回发，于是 Redis 只写不读，而客户端每轮都得上传完整历史
     // —— 2m/5m 两档在物理上根本达不到。
-    let mut compression_prefix: Option<String> = None;
+    let mut compression_prefix: Option<(String, usize)> = None;
     // 总开关默认关闭（MICHAEL_COMPRESSION_ENABLED）。发布前审查在这条链路上确认了多处
     // 会破坏线上请求的缺陷，最严重的是 compression_write_back 把每条消息重写成
     // {role, content} —— tool_calls / tool_call_id 全部丢失，而 agent 模式发的正是
@@ -4312,11 +4312,24 @@ pub async fn chat_completions(
             } else {
                 "application/json"
             };
-            return Response::builder()
+            // 缓存命中也必须回传压缩头。压缩在这之前就已经跑过、前缀也签发了，
+            // 但这条返回路径原来只带 x-gateway-cache —— 客户端于是拿不到令牌，
+            // 下一轮只能整份重传，续传链在"恰好命中缓存"的那一轮被悄悄打断。
+            let mut cache_builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(axum::http::header::CONTENT_TYPE, ct)
                 .header("x-gateway-cache", "hit")
-                .header("cache-control", "no-cache")
+                .header("cache-control", "no-cache");
+            if let Some(tier) = compression_applied {
+                cache_builder =
+                    cache_builder.header("x-michael-compression-applied", tier.as_str());
+            }
+            if let Some((tok, covered)) = compression_prefix.as_ref() {
+                cache_builder = cache_builder
+                    .header("x-michael-compression-prefix", tok.as_str())
+                    .header("x-michael-compression-covered", covered.to_string());
+            }
+            return cache_builder
                 .body(Body::from(bytes))
                 .map_err(|e| AppError::internal(e.to_string()));
         }
@@ -4983,8 +4996,12 @@ pub async fn chat_completions(
         // 用户会以为自己拿到了 5M。
         if let Some(tier) = compression_applied {
             builder = builder.header("x-michael-compression-applied", tier.as_str());
-            if let Some(tok) = compression_prefix.as_deref() {
-                builder = builder.header("x-michael-compression-prefix", tok);
+            if let Some((tok, covered)) = compression_prefix.as_ref() {
+                builder = builder.header("x-michael-compression-prefix", tok.as_str());
+                // 覆盖条数必须一起回传，否则客户端不知道该省略前几条：整份上传既撞
+                // 3.5MB 字节上限（5M 档因此不可达），又会让早期内容同时以摘要和原文
+                // 出现、上下文重复膨胀。口径是"开头 system 块之后的第 N 条起"。
+                builder = builder.header("x-michael-compression-covered", covered.to_string());
             }
         }
         let out = builder
@@ -5070,9 +5087,12 @@ pub async fn chat_completions(
         };
         bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
         let mut resp = Json(data).into_response();
-        if let Some(tok) = compression_prefix.as_deref() {
+        if let Some((tok, covered)) = compression_prefix.as_ref() {
             if let Ok(v) = axum::http::HeaderValue::from_str(tok) {
                 resp.headers_mut().insert("x-michael-compression-prefix", v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&covered.to_string()) {
+                resp.headers_mut().insert("x-michael-compression-covered", v);
             }
         }
         if let Some(tier) = compression_applied {
@@ -7733,13 +7753,13 @@ async fn apply_michael_compression(
     model_id: &str,
     tier: crate::compression::Tier,
     uid: uuid::Uuid,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     use crate::compression as mc;
 
     let started = std::time::Instant::now();
 
     // 前缀续传：客户端只发了未覆盖的消息，历史摘要从 Redis 取回。
-    let (carried_summaries, carried_keys, carried_msgs, carried_raw) =
+    let (mut carried_summaries, mut carried_keys, mut carried_msgs, mut carried_raw) =
         match compression_take_prefix(state, body, uid).await {
             Some((sums, keys, n, raw)) => (sums, keys, n, raw),
             None => (Vec::new(), Vec::new(), 0, 0),
@@ -7749,15 +7769,17 @@ async fn apply_michael_compression(
     // **必须**把摘要拼回去，否则请求会带着一段被静默截断的对话发往上游 —— 而且照常
     // 计费。这个闭包就是那条唯一的退出通道。
     let (pinned, msgs) = compression_plan_input(body);
-    let bail = |body: &mut serde_json::Value| -> Option<String> {
-        if !carried_summaries.is_empty() {
-            compression_write_back(body, pinned, 0, &carried_summaries);
+    // 摘要用参数传入而不是闭包捕获：捕获会一直持着不可变借用，下面那道"忽略前缀"的
+    // 防线就没法清空它了。
+    let bail = |body: &mut serde_json::Value, carried: &[String]| -> Option<(String, usize)> {
+        if !carried.is_empty() {
+            compression_write_back(body, pinned, 0, carried);
         }
         None
     };
 
     if msgs.is_empty() {
-        return bail(body);
+        return bail(body, &carried_summaries);
     }
 
     let native = official_context(model_id).unwrap_or(128_000).max(1) as usize;
@@ -7765,6 +7787,26 @@ async fn apply_michael_compression(
     let carried_budget = carried_summaries.len() * mc::SEGMENT_SUMMARY_TOKENS;
     let planning_window = native.saturating_sub(carried_budget).max(native / 4);
     let plan = mc::plan(&msgs, planning_window, mc::VERBATIM_TAIL_TOKENS, mc::SEGMENT_TOKENS);
+
+    // 防线：客户端带了前缀却**没有**省略已覆盖的消息（旧版客户端、或它自己算错了）。
+    //
+    // 这种情况下早期内容会同时以摘要和原文出现：carried 那批摘要拼在前面，而同样的
+    // 消息又被重新分段、命中同样的缓存键、产出同样的摘要拼第二遍。上下文凭空膨胀，
+    // 而且模型会看到重复的历史。
+    //
+    // 判据：前缀自己记着它覆盖了多少原始 token。如果客户端这次发来的量已经追平甚至
+    // 超过那个数，说明它把历史整份又发了一遍 —— 此时**丢掉前缀**、按完整历史重新压，
+    // 结果一定正确（只是这一轮没省到流量）。宁可不省，也不能给模型重复的上下文。
+    if carried_raw > 0 && plan.raw_tokens >= carried_raw {
+        tracing::warn!(
+            %uid, carried_raw, sent_raw = plan.raw_tokens, carried_msgs,
+            "michael-compression: 客户端带了前缀但没省略已覆盖的消息，本轮忽略前缀（避免上下文重复）"
+        );
+        carried_summaries.clear();
+        carried_keys.clear();
+        carried_msgs = 0;
+        carried_raw = 0;
+    }
 
     let total_raw = carried_raw + plan.raw_tokens;
     if total_raw > tier.max_input_tokens() {
@@ -7827,7 +7869,7 @@ async fn apply_michael_compression(
             pending = pending.len(),
             "michael-compression: 缓存尚未预热，本轮不压缩（后台正在生成摘要）"
         );
-        return bail(body);
+        return bail(body, &carried_summaries);
     }
     let verbatim_from = plan
         .compress
@@ -7845,7 +7887,7 @@ async fn apply_michael_compression(
             elapsed_ms = started.elapsed().as_millis(),
             "michael-compression: 压缩后仍超窗口，本轮降级为不压缩（请让客户端自行裁剪）"
         );
-        return bail(body);
+        return bail(body, &carried_summaries);
     }
 
     compression_write_back(body, pinned, verbatim_from, &summaries);
@@ -7853,7 +7895,9 @@ async fn apply_michael_compression(
     let mut all_keys = carried_keys;
     all_keys.extend(new_keys);
     let covered = carried_msgs + verbatim_from;
-    let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw).await;
+    let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw)
+        .await
+        .map(|tok| (tok, covered));
 
     tracing::info!(
         %uid, model = %model_id, tier = tier.as_str(),
