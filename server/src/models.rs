@@ -190,6 +190,14 @@ const I18N_PACK_BUDGET_PER_WINDOW: usize = 40;
 static I18N_PACK_BUDGET: LazyLock<Mutex<HashMap<uuid::Uuid, Vec<Instant>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 匿名调用共用的预算身份。
+///
+/// 已发布的客户端（0.3.15）调这个接口不带任何凭据，硬拒绝会让它们整个界面翻译失效。
+/// 但这条路会花运营方的上游余额，所以匿名额度是**全局共享的一小份**，而不是每人一份
+/// —— 攻击者拿不到比这更多的量，正常用户的 UI 文案又只需要很少几次就能把缓存捂热。
+const I18N_PACK_ANON_IDENTITY: uuid::Uuid = uuid::Uuid::nil();
+const I18N_PACK_ANON_PER_WINDOW: usize = 30;
+
 fn i18n_pack_charge_budget(user_id: uuid::Uuid) -> Result<(), AppError> {
     let Ok(mut budget) = I18N_PACK_BUDGET.lock() else {
         return Ok(());
@@ -199,8 +207,13 @@ fn i18n_pack_charge_budget(user_id: uuid::Uuid) -> Result<(), AppError> {
         hits.retain(|at| now.duration_since(*at) < I18N_PACK_BUDGET_WINDOW);
         !hits.is_empty()
     });
+    let cap = if user_id == I18N_PACK_ANON_IDENTITY {
+        I18N_PACK_ANON_PER_WINDOW
+    } else {
+        I18N_PACK_BUDGET_PER_WINDOW
+    };
     let hits = budget.entry(user_id).or_default();
-    if hits.len() >= I18N_PACK_BUDGET_PER_WINDOW {
+    if hits.len() >= cap {
         return Err(AppError {
             status: StatusCode::TOO_MANY_REQUESTS,
             msg: "语言包生成过于频繁，请稍后再试".into(),
@@ -798,11 +811,8 @@ pub async fn i18n_pack(
     }
     // 缓存没命中，且没有凭据 —— 到此为止。这一步之后才是花运营方钱的地方，
     // 而"任何人都能烧运营方的上游余额"正是加鉴权要堵的洞。
-    let Some(user_id) = user_id else {
-        return Err(AppError::unauthorized(
-            "缺少 API Key：未登录时只能读取已缓存的翻译包",
-        ));
-    };
+    // 匿名走全局共享的小额预算（已发布客户端不带凭据，硬拒绝就是界面翻译全废）。
+    let user_id = user_id.unwrap_or(I18N_PACK_ANON_IDENTITY);
 
     // A cache miss is what costs money, so budget the misses per user. Legitimate
     // use is a handful of packs per locale; the 2026-07-25 incident was a single
