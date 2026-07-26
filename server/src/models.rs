@@ -7705,16 +7705,22 @@ async fn compression_issue_prefix(
 /// 全程 best-effort：任何一步失败都保持 body 原样（这一轮上下文短一点，但聊天照常可用）。
 ///
 /// 返回本轮签发的新前缀引用（若有），供响应头回传给客户端做下一轮续传。
-/// 压缩阶段的总时间预算。
+/// 内联路径**只查缓存**，绝不在请求链路上现算摘要。
 ///
-/// 压缩发生在上游聊天调用**之前**，而客户端等响应头只等 15s。上一版是每段 120s 超时、
-/// 最多 4 段**串行** —— 冷缓存下光压缩就可能吃掉 8 分钟，客户端早就放弃并重试，而每次
-/// 重试都会再开一轮同样的压缩。所以这里必须有硬预算，并且段与段之间**并发**跑。
-const COMPRESSION_TIME_BUDGET: Duration = Duration::from_secs(8);
-/// 单段摘要的超时。并发跑，所以这个值决定的是整体延迟而不是它们的和。
-const COMPRESSION_SEGMENT_TIMEOUT: Duration = Duration::from_secs(6);
-/// 一轮最多并发压多少段。太多会把便宜模型的限流打满，反而更慢。
-const COMPRESSION_MAX_CONCURRENCY: usize = 6;
+/// 这是实测逼出来的结论，不是保守设计。同一个 20k 段在同一家供应商上：一次 5.1s、
+/// 一次 39s、一次 7.0s；另一家在 6KB 和 20KB 上返回瞬时 503，却在 61KB 上成功 ——
+/// 也就是延迟和成功率都不可预测。而客户端等响应头只等 15s。任何"在请求里现算"的
+/// 预算都是错的：设小了段全失败并降级为不压缩（原始历史直接怼给目标模型，反而把
+/// 本来可能成功的请求变成必然 504），设大了客户端先放弃、重试，每次重试再触发一轮
+/// 同样的压缩。
+///
+/// 所以：请求里只用已经算好的摘要（Redis 查询，毫秒级、延迟确定）；缺的段交给**后台**
+/// 预热，下一轮就能命中。代价是第一次长对话那一轮不压缩，换来的是延迟可预测。
+const COMPRESSION_WARM_SEGMENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// 后台预热一轮最多现算多少段。不设上限会让一次超长对话把便宜模型的限流打满。
+const COMPRESSION_WARM_MAX_SEGMENTS: usize = 8;
+/// 段摘要缓存的命名空间。刻意与具体压缩模型无关（见调用点注释）。
+const COMPRESSION_CACHE_NAMESPACE: &str = "mc-any-v1";
 
 async fn apply_michael_compression(
     state: &AppState,
@@ -7724,7 +7730,6 @@ async fn apply_michael_compression(
     uid: uuid::Uuid,
 ) -> Option<String> {
     use crate::compression as mc;
-    use futures_util::stream::{FuturesUnordered, StreamExt};
 
     let started = std::time::Instant::now();
 
@@ -7773,120 +7778,49 @@ async fn apply_michael_compression(
         return None; // 前缀没变长，沿用客户端手上那个引用
     }
 
-    let candidates = compression_pick_compressors(state).await;
-    if candidates.is_empty() {
-        tracing::warn!("michael-compression: 没有可用的压缩模型，本轮不压缩");
-        return bail(body);
-    }
-    // 用一段短文本探一下最便宜的那条线路还活着没有。探测本身的花费可以忽略（几十
-    // token），换来的是不会让整轮压缩全军覆没。
-    let mut chosen: Option<(Model, String)> = None;
-    for (conn, id) in &candidates {
-        if compression_summarize(conn, id, "ok").await.is_some() {
-            chosen = Some((conn.clone(), id.clone()));
-            break;
-        }
-        tracing::warn!(
-            compressor = %id, base_url = %conn.base_url,
-            "michael-compression: 压缩模型探测失败，换下一个候选"
-        );
-    }
-    let Some((conn, compressor)) = chosen else {
-        tracing::warn!(
-            candidates = candidates.len(),
-            "michael-compression: 所有候选压缩模型都不可用，本轮不压缩"
-        );
-        return bail(body);
-    };
-
     let mut redis = state.redis.clone();
     let mut summaries: Vec<String> = carried_summaries.clone();
     let mut new_keys: Vec<String> = Vec::with_capacity(plan.compress.len());
     let mut cached = 0usize;
+    let mut pending: Vec<(String, String)> = Vec::new();
 
-    // 第一遍只查缓存：命中的段不花钱、不占时间预算，这正是"压缩缓存"省钱的地方。
-    let mut pending: Vec<(usize, String, String)> = Vec::new();
-    for (idx, seg) in plan.compress.iter().enumerate() {
+    // 只查缓存。命中的段不花钱、延迟确定；没命中的交给后台预热。
+    //
+    // 缓存命中必须是**前缀连续**的：段摘要按顺序拼成历史，中间缺一段就等于历史错位。
+    // 所以第一个未命中之后就停止采用（即使后面的段碰巧有缓存），但仍然把它们都记进
+    // pending 交给后台，下一轮才能连成一片。
+    let mut broke = false;
+    for seg in plan.compress.iter() {
         let text = mc::segment_text(&msgs, seg);
-        let key = mc::segment_cache_key(&text, &compressor, mc::SEGMENT_SUMMARY_TOKENS);
+        // 缓存键**不绑定压缩模型**：后台预热会在供应商之间备选，算这一段的可能不是
+        // 内联时会挑中的那家。键一旦绑定模型，内联查询就永远错过后台刚写好的结果，
+        // 缓存被切成碎片、每轮都当冷启动。摘要是文本的语义产物，不是模型的产物。
+        let key = mc::segment_cache_key(&text, COMPRESSION_CACHE_NAMESPACE, mc::SEGMENT_SUMMARY_TOKENS);
         match mc::cached_summary(&mut redis, &key).await {
-            Some(hit) => {
+            Some(hit) if !broke => {
                 cached += 1;
                 summaries.push(hit);
                 new_keys.push(key);
             }
-            None => pending.push((idx, key, text)),
+            Some(_) => {}
+            None => {
+                broke = true;
+                pending.push((key, text));
+            }
         }
     }
 
-    // 缓存命中必须是**前缀连续**的：段摘要按顺序拼成历史，中间缺一段就等于历史错位。
-    // 第一个未命中的段之后，剩下的都得现算（即使它们各自碰巧有缓存）。
-    let first_miss = pending.first().map(|(i, _, _)| *i).unwrap_or(plan.compress.len());
-    summaries.truncate(carried_summaries.len() + first_miss);
-    new_keys.truncate(first_miss);
-
-    let mut fresh = 0usize;
-    let mut budget_exhausted = false;
-    for chunk in pending.chunks(COMPRESSION_MAX_CONCURRENCY) {
-        if started.elapsed() >= COMPRESSION_TIME_BUDGET {
-            budget_exhausted = true;
-            break;
-        }
-        // **并发**跑一批。串行是上一版最致命的性能问题。
-        let mut jobs: FuturesUnordered<_> = chunk
-            .iter()
-            .map(|(idx, key, text)| {
-                let conn = conn.clone();
-                let compressor = compressor.clone();
-                let key = key.clone();
-                let text = text.clone();
-                let idx = *idx;
-                async move {
-                    let out = tokio::time::timeout(
-                        COMPRESSION_SEGMENT_TIMEOUT,
-                        compression_summarize(&conn, &compressor, &text),
-                    )
-                    .await
-                    .ok()
-                    .flatten();
-                    (idx, key, out)
-                }
-            })
-            .collect();
-
-        let mut done: Vec<(usize, String, CompressionCall)> = Vec::new();
-        while let Some((idx, key, out)) = jobs.next().await {
-            match out {
-                Some(call) => done.push((idx, key, call)),
-                None => {
-                    tracing::warn!(
-                        compressor = %compressor, base_url = %conn.base_url,
-                        timeout_s = COMPRESSION_SEGMENT_TIMEOUT.as_secs(),
-                        "michael-compression: 段压缩失败或超时，后续段不再尝试"
-                    );
-                    budget_exhausted = true;
-                }
-            }
-        }
-        // 仍要按段序拼接：并发完成顺序是乱的。
-        done.sort_by_key(|(idx, _, _)| *idx);
-        for (_, key, call) in done {
-            mc::store_summary(&mut redis, &key, &call.summary).await;
-            fresh += 1;
-            bill_compression_call(state, uid, &conn, &compressor, call.usage.as_ref()).await;
-            summaries.push(call.summary);
-            new_keys.push(key);
-        }
-        if budget_exhausted {
-            break;
-        }
+    // 缺的段不在请求链路上现算，交给后台预热；本轮就用手上已有的缓存。
+    if !pending.is_empty() {
+        compression_spawn_warm(state, uid, pending.clone());
     }
 
     let actually_compressed = new_keys.len();
     if actually_compressed == 0 {
-        tracing::warn!(
-            compressor = %compressor, base_url = %conn.base_url,
-            "michael-compression: 一段都没压成，本轮降级为不压缩"
+        // 缓存里一段都没有：本轮不压缩，后台已经在算了，下一轮就能命中。
+        tracing::info!(
+            pending = pending.len(),
+            "michael-compression: 缓存尚未预热，本轮不压缩（后台正在生成摘要）"
         );
         return bail(body);
     }
@@ -7903,7 +7837,7 @@ async fn apply_michael_compression(
     if projected > budget {
         tracing::warn!(
             model = %model_id, tier = tier.as_str(), projected, budget,
-            elapsed_ms = started.elapsed().as_millis(), budget_exhausted,
+            elapsed_ms = started.elapsed().as_millis(),
             "michael-compression: 压缩后仍超窗口，本轮降级为不压缩（请让客户端自行裁剪）"
         );
         return bail(body);
@@ -7917,15 +7851,73 @@ async fn apply_michael_compression(
     let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw).await;
 
     tracing::info!(
-        %uid, model = %model_id, tier = tier.as_str(), compressor = %compressor,
+        %uid, model = %model_id, tier = tier.as_str(),
         carried_msgs, carried_raw, raw_tokens = plan.raw_tokens, total_raw,
         pinned, verbatim_from, projected, budget,
-        segments_cached = cached, segments_fresh = fresh,
+        segments_cached = cached, segments_pending = pending.len(),
         elapsed_ms = started.elapsed().as_millis(),
         issued_prefix = issued.is_some(),
         "michael-compression applied"
     );
     issued
+}
+
+/// 后台预热：把缺的段算出来写进缓存，下一轮请求就能命中。
+///
+/// 为什么必须在后台：实测同一个 20k 段在同一家供应商上一次 5.1s、一次 39s、一次 7.0s，
+/// 另一家在 6KB 和 20KB 上返回瞬时 503 却在 61KB 上成功 —— 延迟和成功率都不可预测，
+/// 而客户端等响应头只等 15s。放在请求链路里，无论预算设多少都是错的。
+///
+/// 这里可以从容：90s 单段超时、跨供应商逐个重试。代价只是"第一次长对话那一轮不压缩"。
+fn compression_spawn_warm(state: &AppState, uid: uuid::Uuid, pending: Vec<(String, String)>) {
+    use crate::compression as mc;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let candidates = compression_pick_compressors(&state).await;
+        if candidates.is_empty() {
+            tracing::warn!("michael-compression: 后台预热没有可用的压缩模型");
+            return;
+        }
+        let mut redis = state.redis.clone();
+        let (mut warmed, mut failed) = (0usize, 0usize);
+        // 顺序跑：后台没有延迟压力，而顺序对便宜模型的限流最友好。
+        for (key, text) in pending.into_iter().take(COMPRESSION_WARM_MAX_SEGMENTS) {
+            // 另一个并发的预热任务可能已经算好了这一段。
+            if mc::cached_summary(&mut redis, &key).await.is_some() {
+                continue;
+            }
+            let mut ok = false;
+            for (conn, id) in &candidates {
+                match tokio::time::timeout(
+                    COMPRESSION_WARM_SEGMENT_TIMEOUT,
+                    compression_summarize(conn, id, &text),
+                )
+                .await
+                {
+                    Ok(Some(call)) => {
+                        mc::store_summary(&mut redis, &key, &call.summary).await;
+                        bill_compression_call(&state, uid, conn, id, call.usage.as_ref()).await;
+                        warmed += 1;
+                        ok = true;
+                        break;
+                    }
+                    other => {
+                        tracing::warn!(
+                            compressor = %id, base_url = %conn.base_url,
+                            timed_out = other.is_err(),
+                            "michael-compression: 预热段失败，换下一个供应商"
+                        );
+                    }
+                }
+            }
+            if !ok {
+                failed += 1;
+                // 一段都压不出来说明所有供应商此刻都不行，后面的段也别白试了。
+                break;
+            }
+        }
+        tracing::info!(%uid, warmed, failed, "michael-compression: 后台预热结束");
+    });
 }
 
 /// 给一次段压缩记账，走和聊天完全相同的 `bill()` 路径。
