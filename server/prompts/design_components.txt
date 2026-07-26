@@ -1,0 +1,8 @@
+# michael-design 组件层：令牌、primitive、图标与排版
+
+- `:root` 定义 background/foreground/card/popover/primary/secondary/muted/accent/destructive/border/input/ring/radius，`@theme inline` 映射 `--color-*` 和 `--radius-*`，`.dark` 覆盖同名 token。一次确定 base 中性、primary、radius 与标题字体；业务组件只使用语义类，不写散色。
+- 有官方 primitive 就组合，不另造平行 Button/Input/Card。按需覆盖表单 button/input/textarea/label/checkbox/radio/select/switch/form/combobox/calendar，展示 card/badge/avatar/alert/skeleton/table/chart/carousel，导航 menu/breadcrumb/pagination/tabs/sidebar/command，浮层 dialog/drawer/sheet/popover/tooltip/sonner，以及 accordion/collapsible/scroll-area/resizable。禁止全量安装。
+- Button 的 default/secondary/outline/ghost/link/destructive 都要有 hover、focus-visible、active、disabled；同一要求适用于真实可交互控件。
+- 图标先做“业务概念 → 对象/动作/状态 → 图标名”映射，再从项目图标库、Lucide 或 iconify_search 选统一风格。AI 用 Bot/Robot/Cpu，自动化用 Workflow，订阅用 Mail/Inbox，安全用 ShieldCheck/Lock，分析用 Chart/Gauge，游戏用 Gamepad2。Sparkles/Wand 只表示真实闪光或魔法；按钮和工具栏不用位图、emoji 或临时手写 SVG。
+- 正文使用高可读无衬线与 system-ui 兜底，标题选择有辨识度的展示体，如 Fraunces、Space Grotesk、Sora 或 Instrument Serif，避免整页默认 Inter。真实加载字体；字号按 12/14/16/20/24/30/36 建立阶梯，正文行高约 1.5、行宽不超过 70 字，数字使用 tabular-nums。
+- 需要给用户比较方向时，只做 2-3 套 primary/radius/字体不同的令牌预览，不生成多张无依据 AI mockup 猜风格。

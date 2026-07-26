@@ -164,6 +164,20 @@ fn assign_subdomain(account: &str, name: &str, target: &std::path::Path) -> Opti
         .collect();
     let base = base.trim_matches('-');
     let base = if base.is_empty() { "site" } else { base };
+    // Subdomains are first-come-first-served, so infrastructure-looking labels must
+    // not be claimable: the wildcard cert covers them all, which would let any user
+    // stand up a fully-valid-HTTPS `www`/`login`/`api` host under the product's own
+    // domain and phish its users. Reserved labels fall through to the `-<tag>` form.
+    const RESERVED_LABELS: &[&str] = &[
+        "www", "api", "app", "admin", "auth", "login", "signin", "signup", "account",
+        "accounts", "billing", "pay", "payment", "checkout", "mail", "email", "smtp",
+        "imap", "ns", "ns1", "ns2", "dns", "mx", "cdn", "static", "assets", "code",
+        "gate", "dashboard", "console", "status", "docs", "help", "support", "blog",
+        "shop", "store", "download", "downloads", "update", "updates", "test",
+        "staging", "dev", "internal", "vpn", "ssh", "git", "ftp", "localhost",
+        "michael", "michaelide", "_hosts",
+    ];
+    let base_is_reserved = RESERVED_LABELS.contains(&base);
     let hosts = PathBuf::from(SITES_ROOT).join("_hosts");
     let _ = std::fs::create_dir_all(&hosts);
     let _ = std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o755)); // nginx 可遍历
@@ -173,7 +187,12 @@ fn assign_subdomain(account: &str, name: &str, target: &std::path::Path) -> Opti
         .filter(|c| c.is_ascii_alphanumeric())
         .take(6)
         .collect();
-    for cand in [base.to_string(), format!("{base}-{tag}")] {
+    let candidates: Vec<String> = if base_is_reserved {
+        vec![format!("{base}-{tag}")]
+    } else {
+        vec![base.to_string(), format!("{base}-{tag}")]
+    };
+    for cand in candidates {
         let link = hosts.join(&cand);
         match std::fs::read_link(&link) {
             Ok(existing) if existing.as_path() == target => {
@@ -223,24 +242,52 @@ pub async fn deploy_site(
         name = "site".to_string();
     }
     let target = PathBuf::from(SITES_ROOT).join(&acct).join(&name);
-    // 只清这个站自己的旧内容（不碰别的账号/别的站）
-    let _ = std::fs::remove_dir_all(&target);
-    std::fs::create_dir_all(&target).map_err(|e| AppError::internal(format!("建目录失败: {e}")))?;
 
-    // 4) 安全解压
+    // 4) 安全解压到暂存目录，全部校验通过后才原子替换线上目录。
+    //
+    // 之前是先 remove_dir_all(&target) 再解压：任何一个坏包（截断的 tar.gz、空包、
+    // 上传中断）都会先把已上线的站点整个删掉再返回错误，站点就永久 404 了。
+    // 现在失败路径完全不碰线上内容。
+    let staging = PathBuf::from(SITES_ROOT)
+        .join(".staging")
+        .join(format!("{acct}-{name}-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| AppError::internal(format!("建目录失败: {e}")))?;
+    // 任何提前返回都不能把暂存目录留在磁盘上。
+    let cleanup = |e: AppError| {
+        let _ = std::fs::remove_dir_all(&staging);
+        e
+    };
+
+    // 解压上限。压缩包本身受 max_mb 限制，但压缩比不受限：30MB 的 gzip 可以解出
+    // 几十 GB 把宿主磁盘写满（宿主 / 只有 97G，且这个目录是 bind mount）。
+    const MAX_UNPACKED_BYTES: u64 = 200 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 5000;
+
     let gz = flate2::read::GzDecoder::new(&body[..]);
     let mut ar = tar::Archive::new(gz);
     ar.set_preserve_permissions(false);
     ar.set_preserve_mtime(false);
     let entries = ar
         .entries()
-        .map_err(|e| AppError::forbidden(format!("不是有效的 tar.gz: {e}")))?;
+        .map_err(|e| cleanup(AppError::forbidden(format!("不是有效的 tar.gz: {e}"))))?;
     let mut count = 0usize;
+    let mut seen = 0usize;
+    let mut unpacked_bytes: u64 = 0;
     for entry in entries {
-        let mut e = entry.map_err(|e| AppError::forbidden(format!("tar 读取错: {e}")))?;
+        let mut e = entry.map_err(|e| cleanup(AppError::forbidden(format!("tar 读取错: {e}"))))?;
+        // 每个条目都计数，不只是文件。原来只在写文件时 count += 1，所以一个只含
+        // 目录条目的 tar 永远撞不到上限，可以先把 inode 耗光再报"包里没有可部署的文件"。
+        seen += 1;
+        if seen > MAX_ENTRIES {
+            return Err(cleanup(AppError::forbidden(format!(
+                "条目过多（>{MAX_ENTRIES}）——精简项目后再传。"
+            ))));
+        }
         let path = e
             .path()
-            .map_err(|_| AppError::forbidden("tar 内路径无效"))?
+            .map_err(|_| cleanup(AppError::forbidden("tar 内路径无效")))?
             .into_owned();
         // 防路径穿越：拒绝 ../ / 绝对路径 / 盘符前缀
         if path.components().any(|c| {
@@ -256,46 +303,84 @@ pub async fn deploy_site(
         if !(et.is_file() || et.is_dir()) {
             continue;
         }
-        let dest = target.join(&path);
-        // 再保险：解出的目标必须仍在账号目录内
-        if !dest.starts_with(&target) {
+        let dest = staging.join(&path);
+        // 再保险：解出的目标必须仍在暂存目录内
+        if !dest.starts_with(&staging) {
             continue;
         }
         if et.is_dir() {
             let _ = std::fs::create_dir_all(&dest);
             continue;
         }
+        // tar 头里声明的大小就是 unpack 实际会读的字节数，所以解压前先累加判断，
+        // 炸弹在写盘之前就被拦住。
+        unpacked_bytes = unpacked_bytes.saturating_add(e.header().size().unwrap_or(0));
+        if unpacked_bytes > MAX_UNPACKED_BYTES {
+            return Err(cleanup(AppError::forbidden(format!(
+                "解压后体积过大（超过 {}MB）——精简项目后再传。",
+                MAX_UNPACKED_BYTES / (1024 * 1024)
+            ))));
+        }
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         e.unpack(&dest)
-            .map_err(|e| AppError::internal(format!("解压失败: {e}")))?;
+            .map_err(|e| cleanup(AppError::internal(format!("解压失败: {e}"))))?;
         count += 1;
-        if count > 5000 {
-            return Err(AppError::forbidden("文件数过多（>5000）——精简项目后再传。"));
-        }
     }
     if count == 0 {
-        return Err(AppError::forbidden(
+        return Err(cleanup(AppError::forbidden(
             "包里没有可部署的文件（tar.gz 为空？）。",
-        ));
+        )));
     }
 
     // 让 nginx(www-data) 能读：容器 umask 可能把目录/文件建成 owner-only → 递归设世界可读
     // (目录 0755 可遍历、文件 0644 可读)。也把账号父目录设 0755，否则 nginx 进不去。
-    let _ = chmod_readable(&target);
+    let _ = chmod_readable(&staging);
+
+    // 校验都过了，现在才动线上目录：先把旧内容挪走，再把暂存目录 rename 进去。
+    // 两个 rename 之间的窗口是微秒级，且失败也留得下旧内容可查。
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| cleanup(AppError::internal(format!("建目录失败: {e}"))))?;
+    }
+    // Sibling path built explicitly rather than via `with_extension`, which *replaces*
+    // an extension: that only happens to be safe because `slug` currently strips dots,
+    // and a future loosening of `slug` shouldn't quietly turn this into a collision.
+    let retired = PathBuf::from(SITES_ROOT)
+        .join(&acct)
+        .join(format!(".retiring-{name}-{}", uuid::Uuid::new_v4()));
+    let had_old = target.exists();
+    if had_old {
+        std::fs::rename(&target, &retired)
+            .map_err(|e| cleanup(AppError::internal(format!("替换旧站点失败: {e}"))))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &target) {
+        // 换入失败就把旧站点放回去，绝不让用户的站点凭空消失。
+        if had_old {
+            let _ = std::fs::rename(&retired, &target);
+        }
+        return Err(cleanup(AppError::internal(format!("发布失败: {e}"))));
+    }
+    let _ = std::fs::remove_dir_all(&retired);
     if let Some(parent) = target.parent() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
     }
 
-    // 优先返回漂亮的二级域名（配置了 DEPLOY_SITE_DOMAIN 时自动分配 + 软链），否则回退 /s/ 路径。
-    let path_url = format!("https://code.mrday.one/s/{acct}/{name}/");
-    let url = assign_subdomain(&acct, &name, &target).unwrap_or_else(|| path_url.clone());
+    // 用户站点只能从独立 origin 提供服务：这里托管的是用户上传的任意 HTML/JS，
+    // 一旦和网关/管理后台同源（原来回退到 https://code.mrday.one/s/...），
+    // 站点里的脚本就能读走同源下的 localStorage 里的 admin JWT、以及网页版门禁
+    // 故意设成非 HttpOnly 的 mide_token cookie → 完全接管。所以没有可用的独立
+    // 子域名时宁可让部署失败，也不回退到同源路径。
+    let url = assign_subdomain(&acct, &name, &target).ok_or_else(|| {
+        AppError::internal(
+            "站点发布失败：未配置 DEPLOY_SITE_DOMAIN（用户站点必须独立域名，不能与网关同源）。",
+        )
+    })?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "url": url,
-        "path_url": path_url,
         "files": count,
         "account": acct,
         "name": name,

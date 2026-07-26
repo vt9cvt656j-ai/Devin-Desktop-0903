@@ -1,0 +1,6 @@
+# michael-design 验证层：真实浏览器硬预算与停止条件
+
+- 首次交付前完成一次真实矩阵：启动项目实际 dev server；首次 `browser navigate` 使用 `fresh=true`，本任务后续不再 fresh；在 1440x900 与 390x844（mobile=true）分别运行 browser check，处理 console、network、样式与溢出错误；再用 click/type/press 跑主流程并对具体 selector、文本、URL 或状态 assert。截图只用于视觉自检，不能替代行为验证。
+- 完整矩阵全程不超过 15 次 browser 调用。修补后只对受影响 selector 和视口做至多一次针对性 check/assert；只有改了布局或断点才连带另一视口。连续两次观察没有新增错误时立即停止，不为“再看看”重复截图。
+- 截图后一次检查：对齐、间距节奏、排版层级、配色与对比、视觉焦点、留白、圆角/阴影/按钮/图标一致性、状态完整、细节质感和整体观感。只修可命名的问题，并与已采用的 michael-design 蓝本及当前产品视觉语言对照。
+- UI 未真实渲染、样式未加载、交互未断言、console/network 有未解释失败、文本裁切或控件重叠时不能声称完成；未覆盖的设备、状态或外部依赖必须明确报告。

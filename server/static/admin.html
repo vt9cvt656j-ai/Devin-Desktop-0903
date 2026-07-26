@@ -237,6 +237,53 @@
   .skill-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#34a853,#1a73e8)}
   @media(max-width:1060px){.skills-layout{grid-template-columns:1fr}.skill-side{position:static;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.skill-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:620px){.skill-hero{grid-template-columns:1fr}.skill-metrics{grid-template-columns:1fr}.skill-user-head{grid-template-columns:1fr}.skill-user-score{text-align:left}.skill-card-grid{grid-template-columns:1fr}.skill-toolbar input{width:100%}}
+  .release-page{max-width:1320px}
+  .release-control{background:var(--surface);border:1px solid var(--line);border-radius:12px;margin-bottom:20px;overflow:hidden}
+  .release-connection{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:15px 18px;border-bottom:1px solid var(--line);background:#fafbfc}
+  .release-connection-main{display:flex;align-items:center;gap:10px;min-width:0}
+  .release-connection-main .conn-dot{width:10px;height:10px;border-radius:50%;background:var(--amber);flex:0 0 10px}
+  .release-connection.connected .conn-dot{background:var(--green)}
+  .release-connection.failed .conn-dot{background:var(--red)}
+  .release-connection-main b{font-size:14px;font-weight:600}
+  .release-connection-main span{display:block;color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .release-links{display:flex;gap:14px;white-space:nowrap;font-size:13px}
+  .release-links a{display:inline-flex;align-items:center;gap:4px}
+  .release-links .material-symbols-outlined{font-size:16px}
+  .release-form{display:grid;grid-template-columns:minmax(220px,1fr) auto auto auto;gap:12px;align-items:end;padding:18px}
+  .release-form label{margin:0}
+  .release-form input{height:42px;padding:9px 12px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .release-form .btn{height:42px;white-space:nowrap}
+  .release-note{grid-column:1/-1;color:var(--dim);font-size:12px;display:flex;align-items:flex-start;gap:7px}
+  .release-note .material-symbols-outlined{font-size:17px;margin-top:1px}
+  .release-not-configured{margin:0 18px 18px;padding:12px 14px;border:1px solid #f4c98f;border-radius:8px;background:#fef7e0;color:#7a4300;line-height:1.6}
+  .release-not-configured code{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+  .release-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(340px,.75fr);gap:20px;align-items:start}
+  .release-table-wrap{overflow:auto;max-height:570px}
+  .release-table{min-width:720px}
+  .release-table td{vertical-align:top}
+  .release-title{display:block;font-weight:600;color:var(--text);max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .release-sub{display:block;color:var(--dim);font-size:12px;margin-top:3px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .release-status{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;background:var(--hover);color:var(--dim);font-size:11px;font-weight:600;white-space:nowrap}
+  .release-status.running{background:#e8f0fe;color:var(--accent)}
+  .release-status.success{background:#e6f4ea;color:var(--green)}
+  .release-status.failure,.release-status.cancelled{background:#fce8e6;color:var(--red)}
+  .release-status.draft{background:#fef7e0;color:#9a5a00}
+  .release-status .status-spinner{width:9px;height:9px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:release-spin .8s linear infinite}
+  @keyframes release-spin{to{transform:rotate(360deg)}}
+  .release-assets{display:flex;gap:5px;flex-wrap:wrap;max-width:280px}
+  .release-asset{display:inline-block;padding:2px 7px;border-radius:5px;background:#f1f3f4;color:var(--dim);font-size:11px;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .release-list{display:grid}
+  .release-item{display:grid;grid-template-columns:minmax(105px,.45fr) minmax(0,1fr) auto;gap:12px;align-items:start;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .release-item:last-child{border-bottom:0}
+  .release-item:hover{background:var(--hover)}
+  .release-item .release-assets{margin-top:7px}
+  .release-item-action{padding-top:1px;white-space:nowrap}
+  .release-empty{padding:34px 20px;text-align:center;color:var(--dim)}
+  .release-empty .material-symbols-outlined{display:block;font-size:34px;color:#9aa0a6;margin-bottom:8px}
+  .release-loading{opacity:.55;pointer-events:none}
+  @media(max-width:1060px){.release-grid{grid-template-columns:1fr}}
+  @media(max-width:720px){.release-connection{align-items:flex-start;flex-direction:column}.release-links{flex-wrap:wrap}.release-form{grid-template-columns:repeat(3,1fr)}.release-form label{grid-column:1/-1}.release-form .btn{width:100%}}
+  @media(max-width:520px){.release-form{grid-template-columns:1fr}.release-form label,.release-note{grid-column:auto}.release-links{gap:10px}.release-item{grid-template-columns:1fr auto}.release-item-state{grid-column:1/-1;grid-row:2}.release-item-action{grid-column:2;grid-row:1}}
   .muted{color:var(--dim);padding:18px 20px;font-size:14px}
   .t{color:var(--dim)}
   .acts{display:flex;gap:8px}
@@ -287,9 +334,11 @@
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "michael_admin_token";
 let token = localStorage.getItem(TOKEN_KEY) || "";
-let ws = null, statsTimer = null, me = null, usersCache = [];
+let ws = null, statsTimer = null, ideReleaseTimer = null, me = null, usersCache = [];
 let adminSkillsUsers = [];
 let adminSkillPromptCache = new Map();
+let ideReleaseState = null;
+let ideReleaseActionBusy = false;
 const ICON_BOOK = '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5.2 4.25h5.05c1.18 0 2.18.42 3 1.25.82-.83 1.82-1.25 3-1.25h5.05v14.9h-5.05c-1.08 0-2.08.3-3 .9-.92-.6-1.92-.9-3-.9H5.2V4.25Z" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><path d="M13.25 5.5v14.55M7.75 8.1h2.75M7.75 11h2.75M16 8.1h2.75M16 11h2.75" stroke="currentColor" stroke-width="1.55" stroke-linecap="round"/></svg>';
 
 /* ---------- module registry ---------- */
@@ -302,8 +351,9 @@ const MODULES = {
   commission:{ title: "佣金管理",   icon: "price_check", render: renderCommissions, mount: mountCommissions },
   models:    { title: "模型系统",   icon: "smart_toy", render: renderModels,    mount: mountModels },
   skills:    { title: "技能库",     iconSvg: ICON_BOOK, render: renderSkills,  mount: mountSkills },
+  releases:  { title: "IDE 更新",   icon: "system_update", render: renderIdeReleases, mount: mountIdeReleases },
 };
-const ORDER = ["dashboard","users","codes","email","pay","commission","models","skills"];
+const ORDER = ["dashboard","users","codes","email","pay","commission","models","skills","releases"];
 let openTabs = [], activeTab = null;
 
 /* ---------- api ---------- */
@@ -345,6 +395,7 @@ function logout(){
   token=""; localStorage.removeItem(TOKEN_KEY);
   if(ws){ try{ws.close();}catch{} ws=null; }
   if(statsTimer){ clearInterval(statsTimer); statsTimer=null; }
+  if(ideReleaseTimer){ clearInterval(ideReleaseTimer); ideReleaseTimer=null; }
   openTabs=[]; activeTab=null;
   show("login");
 }
@@ -391,6 +442,7 @@ function renderTabs(){
   $("nav").querySelectorAll(".nav-item").forEach(el=>el.classList.toggle("active",el.dataset.k===activeTab));
 }
 function renderContent(){
+  if(ideReleaseTimer){ clearInterval(ideReleaseTimer); ideReleaseTimer=null; }
   const c=$("content");
   if(!activeTab){ c.innerHTML='<div class="page"><div class="ph"><span class="material-symbols-outlined">tab</span><h4>没有打开的标签页</h4><p>点击左侧菜单打开一个模块</p></div></div>'; return; }
   const m=MODULES[activeTab];
@@ -1761,12 +1813,201 @@ function openModelEdit(m){
   });
 }
 
+/* ---------- module: IDE releases ---------- */
+function renderIdeReleases(){
+  return `<div class="page release-page">
+    <h3 class="ptitle">IDE 更新</h3><p class="pdesc">从总后台触发 GitHub Actions 签名构建，并在校验安装包后发布更新。</p>
+    <section class="release-control" id="releaseControl">
+      <div class="release-connection" id="releaseConnection">
+        <div class="release-connection-main"><span class="conn-dot"></span><div><b id="releaseConnectionTitle">正在连接 GitHub</b><span id="releaseConnectionMeta">读取仓库与工作流状态…</span></div></div>
+        <div class="release-links" id="releaseLinks"></div>
+      </div>
+      <div class="release-form">
+        <label>发布版本 tag<input id="releaseTag" type="text" placeholder="v0.3.16" autocomplete="off" spellcheck="false" /></label>
+        <button class="btn b" id="releaseDispatch" disabled><span class="material-symbols-outlined">rocket_launch</span> 开始构建</button>
+        <button class="btn" id="releasePublish" disabled><span class="material-symbols-outlined">publish</span> 发布 Draft</button>
+        <button class="btn" id="releaseRefresh"><span class="material-symbols-outlined">refresh</span> 刷新状态</button>
+        <div class="release-note"><span class="material-symbols-outlined">verified_user</span><span>只接受已经存在的 <b>vX.Y.Z</b> tag。发布前，服务端会验证版本、签名、HTTPS 下载地址以及 macOS 和 Windows 安装包。</span></div>
+      </div>
+      <div class="release-not-configured hidden" id="releaseNotConfigured"></div>
+    </section>
+    <div class="release-grid">
+      <section class="box"><h2><span class="material-symbols-outlined">manufacturing</span> Actions 构建</h2><div class="release-table-wrap" id="releaseRuns"><div class="release-empty">加载中…</div></div></section>
+      <section class="box"><h2><span class="material-symbols-outlined">deployed_code</span> GitHub Releases</h2><div class="release-table-wrap" id="releaseRows"><div class="release-empty">加载中…</div></div></section>
+    </div>
+  </div>`;
+}
+
+function mountIdeReleases(){
+  $("releaseRefresh").addEventListener("click",()=>loadIdeReleases(true));
+  $("releaseDispatch").addEventListener("click",dispatchIdeRelease);
+  $("releasePublish").addEventListener("click",()=>publishIdeRelease($("releaseTag").value.trim()));
+  $("releaseTag").addEventListener("keydown",e=>{ if(e.key==="Enter") dispatchIdeRelease(); });
+  $("releaseRuns").addEventListener("click",e=>{
+    const button=e.target.closest("button[data-release-cancel]");
+    if(button) cancelIdeReleaseRun(button.dataset.releaseCancel);
+  });
+  $("releaseRows").addEventListener("click",e=>{
+    const button=e.target.closest("button[data-release-publish]");
+    if(button) publishIdeRelease(button.dataset.releasePublish);
+  });
+  loadIdeReleases(false);
+  ideReleaseTimer=setInterval(()=>{ if(activeTab==="releases") loadIdeReleases(false); },10000);
+}
+
+function safeGithubUrl(value){
+  try{
+    const url=new URL(value);
+    return url.protocol==="https:"&&url.hostname==="github.com"?url.href:"";
+  }catch{return "";}
+}
+
+function releaseExternalLink(url,label){
+  const safe=safeGithubUrl(url);
+  return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(label)} <span class="material-symbols-outlined">open_in_new</span></a>`:"";
+}
+
+function releaseRunStatus(run){
+  if(run.status!=="completed") return {key:"running",label:run.status==="queued"?"等待中":"构建中",spin:true};
+  const labels={success:"成功",failure:"失败",cancelled:"已取消",timed_out:"超时",action_required:"需处理",skipped:"已跳过",neutral:"已结束",stale:"已失效"};
+  return {key:run.conclusion||"completed",label:labels[run.conclusion]||"已结束",spin:false};
+}
+
+function formatAssetSize(bytes){
+  const value=Number(bytes)||0;
+  if(value<1024) return `${value} B`;
+  if(value<1024*1024) return `${(value/1024).toFixed(1)} KB`;
+  return `${(value/1024/1024).toFixed(1)} MB`;
+}
+
+function renderIdeReleaseRuns(runs){
+  const host=$("releaseRuns"); if(!host) return;
+  if(!runs.length){ host.innerHTML='<div class="release-empty"><span class="material-symbols-outlined">history</span>还没有工作流记录</div>'; return; }
+  host.innerHTML=`<table class="release-table"><thead><tr><th>构建</th><th>状态</th><th>开始时间</th><th>操作</th></tr></thead><tbody>${runs.map(run=>{
+    const status=releaseRunStatus(run);
+    const url=safeGithubUrl(run.html_url);
+    const title=run.head_branch||run.display_title||run.name||`#${run.id}`;
+    const canCancel=run.status!=="completed";
+    return `<tr><td>${url?`<a class="release-title" href="${esc(url)}" target="_blank" rel="noopener">${esc(title)}</a>`:`<span class="release-title">${esc(title)}</span>`}<span class="release-sub">#${esc(run.id)} · 尝试 ${esc(run.run_attempt||1)}${run.head_sha?` · ${esc(String(run.head_sha).slice(0,7))}`:""}</span></td><td><span class="release-status ${esc(status.key)}">${status.spin?'<i class="status-spinner"></i>':""}${esc(status.label)}</span></td><td class="t">${esc(fmt(run.created_at)||"—")}</td><td>${canCancel?`<button class="btn sm danger" data-release-cancel="${esc(run.id)}">取消</button>`:(url?`<a class="btn sm" href="${esc(url)}" target="_blank" rel="noopener">日志</a>`:"")}</td></tr>`;
+  }).join("")}</tbody></table>`;
+}
+
+function renderIdeReleaseRows(releases){
+  const host=$("releaseRows"); if(!host) return;
+  if(!releases.length){ host.innerHTML='<div class="release-empty"><span class="material-symbols-outlined">deployed_code</span>还没有 Release</div>'; return; }
+  host.innerHTML=`<div class="release-list">${releases.map(release=>{
+    const url=safeGithubUrl(release.html_url);
+    const assets=Array.isArray(release.assets)?release.assets:[];
+    const assetHtml=assets.length?assets.map(asset=>`<span class="release-asset" title="${esc(asset.name)} · ${esc(formatAssetSize(asset.size))}">${esc(asset.name)}</span>`).join(""):'<span class="release-sub">尚无构建文件</span>';
+    return `<div class="release-item"><div>${url?`<a class="release-title" href="${esc(url)}" target="_blank" rel="noopener">${esc(release.tag_name||release.name||"未命名")}</a>`:`<span class="release-title">${esc(release.tag_name||release.name||"未命名")}</span>`}<span class="release-sub">${esc(fmt(release.published_at||release.created_at)||"—")}</span></div><div class="release-item-state"><span class="release-status ${release.draft?"draft":"success"}">${release.draft?"Draft":"已发布"}</span><div class="release-assets">${assetHtml}</div></div><div class="release-item-action">${release.draft?`<button class="btn sm b" data-release-publish="${esc(release.tag_name||"")}">校验并发布</button>`:(url?`<a class="btn sm" href="${esc(url)}" target="_blank" rel="noopener">查看</a>`:"")}</div></div>`;
+  }).join("")}</div>`;
+}
+
+function setIdeReleaseBusy(busy){
+  ideReleaseActionBusy=busy;
+  const control=$("releaseControl"); if(control) control.classList.toggle("release-loading",busy);
+  ["releaseDispatch","releasePublish","releaseRefresh"].forEach(id=>{ const el=$(id); if(el) el.disabled=busy||(id!=="releaseRefresh"&&!ideReleaseState?.configured); });
+}
+
+async function loadIdeReleases(manual){
+  if(activeTab!=="releases") return;
+  const refresh=$("releaseRefresh");
+  if(manual&&refresh){ refresh.disabled=true; refresh.innerHTML='<span class="material-symbols-outlined">progress_activity</span> 刷新中'; }
+  try{
+    const data=await api("/api/admin/ide-releases");
+    if(activeTab!=="releases") return;
+    ideReleaseState=data;
+    const connection=$("releaseConnection");
+    connection.classList.toggle("connected",!!data.connected);
+    connection.classList.remove("failed");
+    $("releaseConnectionTitle").textContent=data.connected?"GitHub 已连接":data.configured?"GitHub 连接不可用":"尚未配置 GitHub";
+    $("releaseConnectionMeta").textContent=`${data.repo||"未设置仓库"} · ${data.workflow||"未设置工作流"}`;
+    $("releaseLinks").innerHTML=releaseExternalLink(data.actions_url,"Actions")+releaseExternalLink(data.releases_url,"Releases");
+    const notice=$("releaseNotConfigured");
+    notice.classList.toggle("hidden",!!data.configured);
+    notice.innerHTML=data.configured?"":"请在服务器环境变量中配置 <code>IDE_RELEASE_GITHUB_TOKEN</code>，然后重启服务。Token 不会传到浏览器。";
+    $("releaseDispatch").disabled=!data.configured;
+    $("releasePublish").disabled=!data.configured;
+    renderIdeReleaseRuns(Array.isArray(data.runs)?data.runs:[]);
+    renderIdeReleaseRows(Array.isArray(data.releases)?data.releases:[]);
+    if(manual) toast("GitHub 状态已刷新");
+  }catch(e){
+    if(activeTab!=="releases") return;
+    ideReleaseState=null;
+    const connection=$("releaseConnection");
+    connection.classList.remove("connected"); connection.classList.add("failed");
+    $("releaseConnectionTitle").textContent="GitHub 连接失败";
+    $("releaseConnectionMeta").textContent=e.message||"无法读取发布状态";
+    $("releaseDispatch").disabled=true;
+    $("releasePublish").disabled=true;
+    if(manual) toast(e.message||"刷新失败");
+  }finally{
+    if(refresh){ refresh.disabled=false; refresh.innerHTML='<span class="material-symbols-outlined">refresh</span> 刷新状态'; }
+  }
+}
+
+function checkedReleaseTag(){
+  const input=$("releaseTag");
+  const tag=(input?.value||"").trim();
+  if(!/^v\d+\.\d+\.\d+$/.test(tag)){
+    toast("请输入 vX.Y.Z 格式的 tag");
+    input?.focus();
+    return "";
+  }
+  return tag;
+}
+
+async function dispatchIdeRelease(){
+  if(ideReleaseActionBusy) return;
+  const tag=checkedReleaseTag(); if(!tag) return;
+  setIdeReleaseBusy(true);
+  try{
+    await api("/api/admin/ide-releases/dispatch",{method:"POST",body:JSON.stringify({tag})});
+    toast(`${tag} 构建已提交`);
+    await loadIdeReleases(false);
+    setTimeout(()=>loadIdeReleases(false),2500);
+  }catch(e){ toast(e.message||"提交构建失败"); }
+  finally{ setIdeReleaseBusy(false); }
+}
+
+async function cancelIdeReleaseRun(runId){
+  if(ideReleaseActionBusy) return;
+  if(!runId||!confirm(`取消 Actions 构建 #${runId}？`)) return;
+  setIdeReleaseBusy(true);
+  try{
+    await api(`/api/admin/ide-releases/runs/${encodeURIComponent(runId)}/cancel`,{method:"POST",body:"{}"});
+    toast(`构建 #${runId} 已请求取消`);
+    await loadIdeReleases(false);
+  }catch(e){ toast(e.message||"取消失败"); }
+  finally{ setIdeReleaseBusy(false); }
+}
+
+async function publishIdeRelease(requestedTag){
+  if(ideReleaseActionBusy) return;
+  if(requestedTag&&$("releaseTag")) $("releaseTag").value=requestedTag;
+  const tag=checkedReleaseTag(); if(!tag) return;
+  if(!confirm(`确认发布 ${tag}？\n\n服务端将先校验 latest.json、签名和两个平台安装包。发布后，Michael IDE 用户就能检测到这个版本。`)) return;
+  setIdeReleaseBusy(true);
+  try{
+    const result=await api("/api/admin/ide-releases/publish",{method:"POST",body:JSON.stringify({tag})});
+    toast(result.already_published?`${tag} 已经发布`:`${tag} 已发布`);
+    await loadIdeReleases(false);
+  }catch(e){ toast(e.message||"发布失败"); }
+  finally{ setIdeReleaseBusy(false); }
+}
+
 /* ---------- websocket (global) ---------- */
 function connectWs(){
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
+  // The feed is admin-only. A browser can't set an Authorization header on a
+  // WebSocket, so authenticate with the first frame instead of the URL (a token in
+  // the query string would end up in nginx's access log).
+  ws.onopen=()=>{ try{ ws.send(JSON.stringify({type:"auth",token})); }catch{} };
   ws.onmessage=(ev)=>{
     let e; try{e=JSON.parse(ev.data);}catch{return;}
+    if(e.type==="auth_ok") return;
+    if(e.type==="auth_error"){ toast(e.error||"实时事件流鉴权失败"); return; }
     addEvent(e); refreshStats();
     if(e.kind==="register") refreshDashUsers();
     // Live-patch the user table when ANY user is modified (grant / set_credits /
@@ -1777,6 +2018,7 @@ function connectWs(){
       else { loadUsers(); }
     }
     if(e.kind==="user_deleted"&&activeTab==="users") loadUsers();
+    if(e.kind&&e.kind.startsWith("ide_release_")&&activeTab==="releases") loadIdeReleases(false);
   };
   ws.onclose=()=>{ if(token) setTimeout(connectWs,3000); };
 }

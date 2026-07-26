@@ -1,0 +1,26 @@
+# michael-design 核心：品类、配色、布局
+
+做界面、网站或产品 UI 时，先从 michael-design 知识库选择与真实品类匹配的蓝本，再映射 Tailwind 调色板与语义令牌，最后按真人旅程组织页面。已有项目优先复用当前组件、token、素材和视觉语言；从零项目才建立新体系。
+
+## 意图与品类
+
+- 产品名是生造词时，从功能描述推断业务品类，用品类词检索，绝不拿生造名当 query。
+- 从零整站或重设计走完整设计流程；已有项目加一块、改样式或做单组件，只读相关栈并无缝融入，不摆无关方案选择器、不重建脚手架。
+
+## 配色决策链
+
+1. `knowledge_search(domain="michael-design")` 命中本品类蓝图或配色时成套采用，并记录具体来源 section。
+2. 未命中品类时，取 enterprise-standard 的 Curated Palette Library 最接近的一套。
+3. 仍无直接蓝本时，按 design-judgment 的 Category Palette Harmony 从 Tailwind 调色板推导；绝不凭模型记忆编色。
+
+- 跨品类蓝本只借布局、动效或组件，不能借配色。命中的是 Hex/OKLCH 时，先折算为最接近的 Tailwind 族+档，再映射为 background/foreground/card/muted/primary/secondary/accent/section-* 语义 token；业务代码只消费 token，裸 hex 只允许留在 token 定义并注明来源。
+- 锁定 1 个中性族、1 个主强调族、至多 1 个职责明确的辅助族。页面至少 90% 面积使用中性色，强调色只用于主 CTA、链接、选中态、焦点环和少数重点；section 以白和最浅中性交替，每个 section 至多一种装饰手段，层级先靠字号、字重和留白。
+- 用户未明确要求暗色时默认浅色中性背景；明确暗色时按 michael-design `Dark Theme Execution Standard` 执行。未明确要求渐变时，只允许 1-2 处小面积功能强调。禁默认蓝紫、黑底霓虹、满屏彩色底、渐变字和发光；红黄绿只表示真实错误、警告和成功。
+- 克制不等于黑白线框。除非用户明确单色，primary/accent 必须真实落在至少两类角色；卡片用 surface 色阶、elevation/内高光、重点 tint、媒体或 hover 中至少两层建立质感，暗色卡片必须比画布更亮。
+
+## 布局与构图
+
+- 结构像真人产品负责人推导：先回答访客是谁、带什么问题来、看到什么才会信任并行动。一个问题对应一个区块，说不出用户为什么需要的区块就删；不设最少区块数，也不机械套 hero/features/pricing/footer。
+- 卡片先数数量再定网格：2=2 等分，3=3 等分，4=2x2，5=3+2 居中或主卡跨列，6=3x2，7=4+3 居中或 1 主卡+3x2；动态数量用 auto-fit/minmax 并显式处理末行，手机改为单列或横向 rail。
+- 从 composition-repertoire 选择 bento、zigzag、editorial、masonry、snap rail、sticky story、timeline、full-bleed、table 或 overlap；相邻区块避免同构图，Card 只用于真实卡片/面板/重复项。
+- 使用 8px 网格与清晰分组，section 常用 `py-24 md:py-32`，正文 `max-w-2xl` 或 `max-w-prose`。full-bleed 与受限宽内容交替、文图方向交替，禁止整页从头到尾居中一柱。

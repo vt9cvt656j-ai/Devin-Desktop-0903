@@ -9,7 +9,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Claims;
 use crate::error::{ApiResult, AppError};
@@ -33,13 +33,179 @@ static GW_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
-const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 6;
+/// Chat streams use HTTP/1.1 deliberately. Some aggregator/CDN combinations leave an
+/// individual HTTP/2 stream stuck before response headers while the shared connection
+/// remains established. Reusing that connection makes every retry hit the same poisoned
+/// transport. HTTP/1.1 isolates in-flight requests; cancelling a header-stalled request
+/// drops that connection, and the retry below can open a genuinely fresh one.
+fn build_chat_http_client(pool_idle_per_host: usize) -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(pool_idle_per_host)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+static GW_CHAT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_chat_http_client(8));
+
+const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 2;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// What the IDE waits for response headers before it gives up. Reasoning effort
+/// never changes this transport-health deadline; deeper thinking gets extra time
+/// only after the HTTP response has opened.
+/// Only read by the test that enforces the coupling — the value's job is to make the
+/// client's deadline visible here so nobody widens the gateway budget past it.
+#[cfg_attr(not(test), allow(dead_code))]
+const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+/// This supplier does not flush HTTP headers until its first SSE event, so response-header
+/// latency includes model prefill. Production measurements put small chat near 2.3-3.9s and a
+/// normal Agent/tool request at 5.5s. Use request-aware ceilings instead of treating 4s as a
+/// transport failure and cancelling healthy Agent turns.
+const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(5);
+const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(8);
+const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(10);
+const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
+const ROUTE_BUDGET: Duration = Duration::from_secs(12);
+const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_millis(750);
+const FAST_HEADER_RETRY_DELAY: Duration = Duration::from_millis(120);
+const RESPONSE_DEADLINE_HEADER: &str = "x-ide-response-deadline-ms";
+
+/// Total time the gateway may spend hunting for a working upstream route before it
+/// must answer the client.
+///
+/// This has to stay comfortably under the client's own header timeout. When it
+/// didn't, the client gave up first and fast-retried, and each retry opened a fresh
+/// gateway request with its own set of upstream calls — a multiplying storm of
+/// `/v1/messages` requests rather than one failure the user could read.
+fn route_budget_for(_deep_thinking: bool) -> Duration {
+    ROUTE_BUDGET
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn route_budget_with_client_deadline(
+    deep_thinking: bool,
+    client_deadline_ms: Option<u64>,
+    now_ms: u64,
+) -> Duration {
+    let fallback = route_budget_for(deep_thinking);
+    let Some(deadline_ms) = client_deadline_ms else {
+        return fallback;
+    };
+    let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+    fallback.min(remaining.saturating_sub(CLIENT_DEADLINE_MARGIN))
+}
+
+fn route_budget_for_headers(headers: &HeaderMap, deep_thinking: bool) -> Duration {
+    let client_deadline_ms = headers
+        .get(RESPONSE_DEADLINE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    route_budget_with_client_deadline(deep_thinking, client_deadline_ms, unix_time_ms())
+}
+
+fn max_header_wait_for_request(deep_thinking: bool, agentic: bool) -> Duration {
+    if deep_thinking {
+        DEEP_MAX_HEADER_WAIT
+    } else if agentic {
+        AGENT_MAX_HEADER_WAIT
+    } else {
+        STANDARD_MAX_HEADER_WAIT
+    }
+}
+
+async fn wait_for_upstream_retry(delay: Duration, deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() || delay >= remaining {
+        return false;
+    }
+    tokio::time::sleep(delay).await;
+    true
+}
 
 static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static I18N_PACK_CACHE: LazyLock<Mutex<HashMap<String, serde_json::Value>>> =
+/// The i18n pack cache is bounded because each entry holds a full ~630KB response
+/// body and the key is a hash of (locale, entries) — a caller who varies one
+/// character misses every time, so an unbounded map OOMs the gateway before the
+/// upstream bill even becomes the bigger problem.
+const I18N_PACK_CACHE_MAX_ENTRIES: usize = 64;
+const I18N_PACK_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+static I18N_PACK_CACHE: LazyLock<Mutex<HashMap<String, (Instant, serde_json::Value)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Insert into the pack cache, evicting expired entries first and then the oldest
+/// ones until the map is back under its cap.
+fn i18n_pack_cache_put(key: String, body: serde_json::Value) {
+    let Ok(mut cache) = I18N_PACK_CACHE.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    cache.retain(|_, (at, _)| now.duration_since(*at) < I18N_PACK_CACHE_TTL);
+    while cache.len() >= I18N_PACK_CACHE_MAX_ENTRIES {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+    cache.insert(key, (now, body));
+}
+
+/// Read a still-fresh cached pack.
+fn i18n_pack_cache_get(key: &str) -> Option<serde_json::Value> {
+    let cache = I18N_PACK_CACHE.lock().ok()?;
+    let (at, body) = cache.get(key)?;
+    if Instant::now().duration_since(*at) >= I18N_PACK_CACHE_TTL {
+        return None;
+    }
+    Some(body.clone())
+}
+
+/// Per-user budget on cache-missing i18n pack generations. Sliding window, in
+/// memory — this is an abuse fuse, not accounting, so it does not need to survive
+/// a restart. A real UI needs a few packs per language; anything approaching this
+/// ceiling is a loop or an attack.
+const I18N_PACK_BUDGET_WINDOW: Duration = Duration::from_secs(60 * 60);
+const I18N_PACK_BUDGET_PER_WINDOW: usize = 40;
+static I18N_PACK_BUDGET: LazyLock<Mutex<HashMap<uuid::Uuid, Vec<Instant>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn i18n_pack_charge_budget(user_id: uuid::Uuid) -> Result<(), AppError> {
+    let Ok(mut budget) = I18N_PACK_BUDGET.lock() else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    budget.retain(|_, hits| {
+        hits.retain(|at| now.duration_since(*at) < I18N_PACK_BUDGET_WINDOW);
+        !hits.is_empty()
+    });
+    let hits = budget.entry(user_id).or_default();
+    if hits.len() >= I18N_PACK_BUDGET_PER_WINDOW {
+        return Err(AppError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            msg: "语言包生成过于频繁，请稍后再试".into(),
+        });
+    }
+    hits.push(now);
+    Ok(())
+}
 
 fn chat_upstream_retry_base_delay_ms(attempt: u32) -> u64 {
     match attempt {
@@ -201,6 +367,11 @@ fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f6
         ),
         None => (0.0, 0.0),
     }
+}
+
+fn route_supports_prompt_cache(model: &Model) -> bool {
+    model.protocol == "anthropic"
+        && std::env::var("MICHAEL_PROMPT_CACHE").ok().as_deref() != Some("0")
 }
 
 /// True for any image-GENERATION model (bills PER-IMAGE, not per-token) across vendors:
@@ -584,8 +755,14 @@ async fn i18n_pack_from_public_translate(
 /// hand-maintained JSON files into the desktop app.
 pub async fn i18n_pack(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<I18nPackReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // This endpoint spends real money: it drives a configured upstream model with
+    // the platform's own api_key. It used to be the one paid route in the gateway
+    // that required no credential at all, so anyone could burn the operator's
+    // upstream balance anonymously and unattributably.
+    let user_id = auth_any_user(&state, &headers).await?;
     let locale = req.locale.trim().replace('_', "-");
     if locale.is_empty() || locale.len() > 32 {
         return Err(AppError::bad("locale 不能为空"));
@@ -604,11 +781,14 @@ pub async fn i18n_pack(
     }
 
     let cache_key = i18n_pack_cache_key(&locale, &entries);
-    if let Ok(cache) = I18N_PACK_CACHE.lock() {
-        if let Some(v) = cache.get(&cache_key) {
-            return Ok(Json(v.clone()));
-        }
+    if let Some(v) = i18n_pack_cache_get(&cache_key) {
+        return Ok(Json(v));
     }
+
+    // A cache miss is what costs money, so budget the misses per user. Legitimate
+    // use is a handful of packs per locale; the 2026-07-25 incident was a single
+    // client cache-miss loop that produced ~340k requests in a day.
+    i18n_pack_charge_budget(user_id)?;
 
     let models = sqlx::query_as::<_, Model>(
         "SELECT * FROM models WHERE active = true AND api_key <> '' ORDER BY sort, created_at",
@@ -646,9 +826,7 @@ pub async fn i18n_pack(
                 Ok(out) => {
                     let body =
                         i18n_pack_body(&locale, &source_locale, out, "model_generated_cached");
-                    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
-                        cache.insert(cache_key, body.clone());
-                    }
+                    i18n_pack_cache_put(cache_key, body.clone());
                     return Ok(Json(body));
                 }
                 Err(e) => failures.push(e),
@@ -667,9 +845,7 @@ pub async fn i18n_pack(
             ),
         })?;
     let body = i18n_pack_body(&locale, &source_locale, out, "public_translate_cached");
-    if let Ok(mut cache) = I18N_PACK_CACHE.lock() {
-        cache.insert(cache_key, body.clone());
-    }
+    i18n_pack_cache_put(cache_key, body.clone());
     Ok(Json(body))
 }
 
@@ -2132,9 +2308,19 @@ fn compute_cost(
         + write_tok * write_price
         + completion * off_out)
         / 1_000_000.0;
-    let cents = (usd * 100.0 * rate.max(0.0))
-        .round()
-        .clamp(0.0, COST_CEILING_CENTS) as i64;
+    let uncapped = (usd * 100.0 * rate.max(0.0)).round();
+    let cents = uncapped.clamp(0.0, COST_CEILING_CENTS) as i64;
+    // The ceiling is a backstop, not a policy — if it ever fires, both the charge AND
+    // the model_usage row understate what the upstream actually cost, so reconciliation
+    // would silently come up short. Make that loud instead of invisible.
+    if uncapped > COST_CEILING_CENTS {
+        tracing::error!(
+            model = %model_id,
+            computed_cents = uncapped as i64,
+            capped_to = cents,
+            "single-call cost exceeded the ceiling; charge and usage record both understate true upstream cost"
+        );
+    }
     // Detailed breakdown so we can trace "why was this call charged X" — appears
     // in `docker logs server-backend-1` at INFO level.
     tracing::info!(
@@ -2524,6 +2710,129 @@ pub(crate) async fn auth_any_user(
     }
 }
 
+/// How many unsettled upstream calls one user may have in flight at once.
+/// Generous enough for the IDE agent's parallel tool calls, small enough that the
+/// worst-case overdraft is bounded instead of open-ended.
+const MAX_INFLIGHT_PER_USER: i64 = 8;
+/// Backstop TTL on the in-flight counter, in case a process dies without releasing.
+const INFLIGHT_TTL_SECS: u64 = 15 * 60;
+
+/// RAII counter for a user's unsettled upstream calls. Held across the upstream
+/// request; decrements on drop so every exit path (error, early return, panic)
+/// releases it.
+pub(crate) struct InFlightGuard {
+    redis: redis::aio::ConnectionManager,
+    key: String,
+}
+
+impl InFlightGuard {
+    async fn acquire(state: &AppState, uid: uuid::Uuid) -> Result<Self, AppError> {
+        let key = format!("inflight:{uid}");
+        let mut redis = state.redis.clone();
+        let n: i64 = redis::cmd("INCR")
+            .arg(&key)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(0);
+        // A Redis hiccup returns 0 here; fail open rather than locking every user out
+        // of a working gateway over a cache blip.
+        if n > 0 {
+            let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(INFLIGHT_TTL_SECS)
+                .query_async(&mut redis)
+                .await;
+        }
+        if n > MAX_INFLIGHT_PER_USER {
+            let _: Result<(), redis::RedisError> =
+                redis::cmd("DECR").arg(&key).query_async(&mut redis).await;
+            return Err(AppError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                msg: "并发请求过多，请稍后再试".into(),
+            });
+        }
+        Ok(Self { redis, key })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut redis = self.redis.clone();
+        let key = std::mem::take(&mut self.key);
+        tokio::spawn(async move {
+            let _: Result<(), redis::RedisError> =
+                redis::cmd("DECR").arg(&key).query_async(&mut redis).await;
+        });
+    }
+}
+
+/// Resolve a caller AND require that they actually have something to spend, for
+/// endpoints that consume a paid third-party service (Tripo3D / ElevenLabs / HF …).
+///
+/// `auth_any_user` alone only proves "some registered account", which let any free
+/// signup burn the operator's third-party balance without limit. This adds the same
+/// access gate `/v1/chat/completions` uses. It does not price the call — per-endpoint
+/// pricing is still a product decision — it only ensures the caller is a paying user
+/// and that abuse has a ceiling.
+pub(crate) async fn require_paid_access(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<uuid::Uuid, AppError> {
+    let uid = auth_any_user(state, headers).await?;
+    let (plan, plan_exp, q_total, q_window, credits): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, credits_cents \
+         FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_one(&state.db)
+    .await?;
+    let plan_active = plan != "none" && plan_exp.is_none_or(|e| e > chrono::Utc::now());
+    let quota_ok = plan_active && q_total > 0 && q_window > 0;
+    if !quota_ok && credits <= 0 {
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: "该功能需要有效会员或额度".into(),
+        });
+    }
+    asset_gen_charge_budget(uid)?;
+    Ok(uid)
+}
+
+/// Per-user ceiling on asset generations. These calls are slow and expensive
+/// upstream (and `generate_music` spawns a local MusicGen subprocess with no
+/// concurrency limit), so cap them even for paying users until real per-call
+/// billing exists.
+const ASSET_GEN_WINDOW: Duration = Duration::from_secs(60 * 60);
+const ASSET_GEN_PER_WINDOW: usize = 60;
+static ASSET_GEN_BUDGET: LazyLock<Mutex<HashMap<uuid::Uuid, Vec<Instant>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn asset_gen_charge_budget(user_id: uuid::Uuid) -> Result<(), AppError> {
+    let Ok(mut budget) = ASSET_GEN_BUDGET.lock() else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    budget.retain(|_, hits| {
+        hits.retain(|at| now.duration_since(*at) < ASSET_GEN_WINDOW);
+        !hits.is_empty()
+    });
+    let hits = budget.entry(user_id).or_default();
+    if hits.len() >= ASSET_GEN_PER_WINDOW {
+        return Err(AppError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            msg: "资源生成过于频繁，请稍后再试".into(),
+        });
+    }
+    hits.push(now);
+    Ok(())
+}
+
 /// POST /api/knowledge/search — agentic-RAG retrieval over the curated domain
 /// knowledge corpus. Body: { query, domain?, top_k? }. Free (no billing); auth
 /// only to prevent open abuse. Returns the most relevant best-practice sections.
@@ -2639,7 +2948,6 @@ fn split_fused_charge(
     quota_window: i64,
     quota_weekly_cap: i64,
     quota_week_used: i64,
-    credits: i64,
 ) -> FusedCharge {
     let requested = requested_cost.max(0);
     let quota_available = if use_quota {
@@ -2656,7 +2964,18 @@ fn split_fused_charge(
         0
     };
     let quota_cents = requested.min(quota_available);
-    let wallet_cents = requested.saturating_sub(quota_cents).min(credits.max(0));
+    // Whatever quota can't cover lands on the wallet **in full**, even past the
+    // available balance — `credits_cents` is allowed to go negative.
+    //
+    // This used to be clamped with `.min(credits.max(0))`, which meant a user who
+    // overshot their balance simply didn't pay the difference: the access gate only
+    // checks that the balance is positive, and settlement happens after the upstream
+    // call, so every overshoot was silently written off while the operator still paid
+    // upstream. Recording it as debt costs the user nothing they didn't spend, makes
+    // `model_usage.cost_cents` equal the real cost, and lets the existing
+    // `credits <= 0` gate refuse the next request until they top up (a top-up nets
+    // against the debt). The in-flight cap bounds how much can accrue at once.
+    let wallet_cents = requested.saturating_sub(quota_cents);
     FusedCharge {
         quota_cents,
         wallet_cents,
@@ -2700,7 +3019,7 @@ async fn bill(
             }
         };
         match balances {
-            Some((quota_total, quota_window, quota_weekly_cap, quota_week_used, credits)) => {
+            Some((quota_total, quota_window, quota_weekly_cap, quota_week_used, _credits)) => {
                 split_fused_charge(
                     requested_cost,
                     use_quota,
@@ -2708,7 +3027,6 @@ async fn bill(
                     quota_window,
                     quota_weekly_cap,
                     quota_week_used,
-                    credits,
                 )
             }
             None => FusedCharge::default(),
@@ -2873,8 +3191,16 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
 }
 
 /// OpenAI /chat/completions body → Anthropic /v1/messages body.
+#[cfg(test)]
 fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut system_parts: Vec<String> = Vec::new();
+    oai_to_anthropic_with_cache(body, true)
+}
+
+fn oai_to_anthropic_with_cache(
+    body: &serde_json::Value,
+    prompt_cache: bool,
+) -> Result<serde_json::Value, String> {
+    let mut system_parts: Vec<serde_json::Value> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
@@ -2882,7 +3208,16 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
                 "system" => {
                     let s = oai_content_text(m.get("content"));
                     if !s.is_empty() {
-                        system_parts.push(s);
+                        let mut block = serde_json::Map::new();
+                        block.insert("type".into(), json!("text"));
+                        block.insert("text".into(), json!(s));
+                        // The gateway-injected Prompt Graph message is first. Cache it separately
+                        // from later dynamic Skill/system messages so those can change without
+                        // invalidating the stable production prefix.
+                        if prompt_cache && system_parts.is_empty() {
+                            block.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                        }
+                        system_parts.push(serde_json::Value::Object(block));
                     }
                 }
                 "tool" => {
@@ -2972,14 +3307,7 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
     }
     out.insert("messages".into(), json!(messages));
     if !system_parts.is_empty() {
-        // Prompt caching breakpoint #2: system block. 2026-07 重新实测当前中转
-        // （newapi.ailyyzdk.xyz）：cache_control 第 1 次全额写入、第 2 次全额命中
-        // （11178/11178）——旧线路"只收写费不给命中"的结论已过时；此前剥掉断点导致
-        // 整会话 121 万输入 tokens 缓存命中 0%，全价烧钱。
-        out.insert(
-            "system".into(),
-            json!([{"type":"text","text":system_parts.join("\n\n"),"cache_control":{"type":"ephemeral"}}]),
-        );
+        out.insert("system".into(), json!(system_parts));
     }
     // Extended thinking — ALWAYS use the gateway's model-aware config, never the client's
     // `thinking` field. Newer models (Sonnet 5, Opus 4.7/4.8, Fable 5) REJECT the old
@@ -3078,8 +3406,10 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
             let mut atools = atools;
             // Prompt caching breakpoint #1: last tool. tools 在 Anthropic 请求序列
             // 最前（tools→system→messages），断点打在末个工具上把整个工具表缓存住。
-            if let Some(last) = atools.last_mut().and_then(|v| v.as_object_mut()) {
-                last.insert("cache_control".into(), json!({"type":"ephemeral"}));
+            if prompt_cache {
+                if let Some(last) = atools.last_mut().and_then(|v| v.as_object_mut()) {
+                    last.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                }
             }
             out.insert("tools".into(), json!(atools));
         }
@@ -3089,36 +3419,38 @@ fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, Strin
     // 在那里下一轮永远对不上前缀，实测整段历史 0 命中。打在【最后一条含 tool_result
     // 的消息】上：工具结果是 append-only 的稳定履历（压缩轮外逐字节不动），下一轮的
     // 前缀能一路匹配到这里，历史大头以 0.1× 读回。没有工具结果时退回最后一条消息。
-    if let Some(arr) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        let anchor = arr
-            .iter()
-            .rposition(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_array())
-                    .is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                    })
-            })
-            .or_else(|| arr.len().checked_sub(1));
-        if let Some(idx) = anchor {
-            let last_msg = &mut arr[idx];
-            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
-                    // tool_result 的 content 是嵌套结构也允许挂 cache_control（块级均可）。
-                    obj.insert("cache_control".into(), json!({"type":"ephemeral"}));
-                }
-            } else if let Some(text) = last_msg
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(String::from)
-            {
-                if let Some(obj) = last_msg.as_object_mut() {
-                    obj.insert(
+    if prompt_cache {
+        if let Some(arr) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            let anchor = arr
+                .iter()
+                .rposition(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|b| {
+                                b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            })
+                        })
+                })
+                .or_else(|| arr.len().checked_sub(1));
+            if let Some(idx) = anchor {
+                let last_msg = &mut arr[idx];
+                if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
+                        // tool_result 的 content 是嵌套结构也允许挂 cache_control（块级均可）。
+                        obj.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                    }
+                } else if let Some(text) = last_msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(String::from)
+                {
+                    if let Some(obj) = last_msg.as_object_mut() {
+                        obj.insert(
                         "content".into(),
                         json!([{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]),
                     );
+                    }
                 }
             }
         }
@@ -3340,6 +3672,43 @@ impl AnthSse {
             self.role_sent = true;
         }
     }
+    /// Record any token counts this event carries, from either `usage` or
+    /// `message.usage`, regardless of the event's `type`.
+    ///
+    /// Counts only ever increase: a relay that reports a running `output_tokens` on
+    /// several events must not have its final (largest) figure replaced by an earlier
+    /// partial one, and cache figures behave the same way. Nothing is inferred — a
+    /// field that never arrives leaves its `*_usage_reported` flag false, so billing
+    /// still refuses to charge for tokens the provider never confirmed.
+    fn harvest_usage(&mut self, ev: &serde_json::Value) {
+        for pointer in ["/usage", "/message/usage"] {
+            let Some(u) = ev.pointer(pointer) else {
+                continue;
+            };
+            if !u.is_object() {
+                continue;
+            }
+            let read = |key: &str| u.get(key).and_then(|v| v.as_i64()).filter(|v| *v >= 0);
+            if let Some(v) = read("input_tokens") {
+                if v >= self.input_tokens {
+                    self.input_tokens = v;
+                }
+                self.input_usage_reported = true;
+            }
+            if let Some(v) = read("output_tokens") {
+                if v >= self.output_tokens {
+                    self.output_tokens = v;
+                }
+                self.output_usage_reported = true;
+            }
+            if let Some(v) = read("cache_read_input_tokens") {
+                self.cache_read = self.cache_read.max(v);
+            }
+            if let Some(v) = read("cache_creation_input_tokens") {
+                self.cache_create = self.cache_create.max(v);
+            }
+        }
+    }
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
         self.buf.extend_from_slice(bytes);
         let mut out: Vec<u8> = Vec::new();
@@ -3357,24 +3726,25 @@ impl AnthSse {
             }
             let ev: serde_json::Value = serde_json::from_str(data)
                 .map_err(|err| format!("invalid Anthropic SSE JSON: {err}"))?;
+            // Harvest usage from WHEREVER it appears, before the per-type handling.
+            //
+            // Anthropic's own spec carries final token counts in `message_delta`, and
+            // that is all this parser used to read (plus input from `message_start`).
+            // Relays in front of the real API don't all follow that: some attach the
+            // final `usage` to `message_stop`, some to a top-level `usage` on another
+            // event. When it landed anywhere else, `output_usage_reported` stayed false,
+            // `usage_is_authoritative()` returned false, and `compute_cost` billed the
+            // call as **zero** — production was logging "provider omitted authoritative
+            // usage" for ~18% of Claude calls, opus-5 included.
+            //
+            // This only records numbers the provider actually sent (never estimates),
+            // and only ever moves a count upward, so an early partial figure can't
+            // overwrite a larger final one.
+            self.harvest_usage(&ev);
             match ev.get("type").and_then(|t| t.as_str()) {
+                // Token counts are handled by `harvest_usage` above for every event
+                // type; the per-type arms below only deal with content and control flow.
                 Some("message_start") => {
-                    if let Some(u) = ev.pointer("/message/usage") {
-                        if let Some(value) = u.get("input_tokens").and_then(|v| v.as_i64()) {
-                            if value >= 0 {
-                                self.input_tokens = value;
-                                self.input_usage_reported = true;
-                            }
-                        }
-                        self.cache_read = u
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        self.cache_create = u
-                            .get("cache_creation_input_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                    }
                     self.ensure_role(&mut out);
                 }
                 Some("content_block_start") => {
@@ -3485,26 +3855,6 @@ impl AnthSse {
                         }
                         .into();
                     }
-                    if let Some(v) = ev.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
-                        if v >= 0 {
-                            self.output_tokens = v;
-                            self.output_usage_reported = true;
-                        }
-                    }
-                    if let Some(v) = ev.pointer("/usage/input_tokens").and_then(|v| v.as_i64()) {
-                        if v >= 0 {
-                            self.input_tokens = v;
-                            self.input_usage_reported = true;
-                        }
-                    }
-                    if let Some(v) = ev
-                        .pointer("/usage/cache_read_input_tokens")
-                        .and_then(|v| v.as_i64())
-                    {
-                        if v > 0 {
-                            self.cache_read = v;
-                        }
-                    }
                 }
                 Some("content_block_stop") => {
                     if let Some(idx) = ev.get("index").and_then(|v| v.as_i64()) {
@@ -3603,6 +3953,9 @@ pub async fn audio_transcriptions(
         None => crate::auth::user_from_jwt(&state.cfg, &token)
             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
     };
+    // Transcription burns a paid third-party key. Identity alone is not enough —
+    // require the same access the chat route does, and cap the per-user rate.
+    require_paid_access(&state, &headers).await?;
 
     if state.cfg.transcribe_api_key.is_empty() {
         return Err(AppError::bad("转写服务未配置"));
@@ -3727,14 +4080,14 @@ pub async fn chat_completions(
     if !body.is_object() {
         return Err(AppError::bad("请求体需为 JSON 对象"));
     }
-    // Strip cache_control: fingerprints proved the prefix is byte-stable yet this relay
-    // still bills cache WRITES (1.25×) almost every call → it's a pure premium here.
-    // Flat 1× is cheaper. (Real fix = a reliable-caching upstream; see fn doc.)
+    // Never trust desktop/provider-agnostic cache markers. Strip them before route selection;
+    // native Anthropic routes add gateway-owned breakpoints after the actual connection is known.
     strip_cache_control(&mut body);
     // L0 server-side assembly: when the IDE opts in (x-ide-mode header), inject the system
     // prompt + requested tool schemas from the registry HERE, so the client ships neither.
     // No header → no-op (existing behavior untouched).
-    crate::prompts::assemble_into(&headers, &mut body);
+    crate::prompts::assemble_into(&headers, &mut body)
+        .map_err(|err| AppError::internal(format!("IDE prompt graph unavailable: {err}")))?;
     let model_id = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -3797,18 +4150,67 @@ pub async fn chat_completions(
         });
     }
 
+    // The gate above only proves the balance is positive, not that it covers this
+    // call, and settlement happens after the upstream responds. Serially that lets a
+    // user overspend by exactly one request per top-up (the next request is refused);
+    // concurrently there was nothing bounding how many unsettled requests could pass
+    // the same positive-balance check at once, so N parallel calls multiplied the
+    // overdraft by N. This caps unsettled in-flight requests per user, which closes
+    // the amplification without changing how anything is priced.
+    //
+    // Redis-backed so the cap holds across gateway instances. The guard releases on
+    // drop — including the early-return and panic paths — and the key carries a TTL so
+    // a hard crash can't strand a user at their limit.
+    let inflight_guard = InFlightGuard::acquire(&state, uid).await?;
+
+    // michael-compression：严格 opt-in。没有请求档位时这里直接返回，body 一个字节都不动，
+    // 现有流量的行为与这个特性上线前完全一致。
+    let mut compression_applied: Option<crate::compression::Tier> = None;
+    if let Some(requested) = compression_tier_from(&headers, &body) {
+        // 档位是付费能力：按会员套餐钳位。超出权限时下调而不是拒绝，用户仍然拿到他
+        // 买到的那一档，而不是在长对话跑到一半时被打断。
+        let allowed = crate::compression::max_tier_for_plan(&plan, plan_active, credits);
+        match crate::compression::clamp_tier(requested, allowed) {
+            Some(tier) => {
+                if tier != requested {
+                    tracing::info!(
+                        %uid, plan = %plan, requested = requested.as_str(), granted = tier.as_str(),
+                        "michael-compression: 请求档位超出套餐权限，已下调"
+                    );
+                }
+                apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
+                compression_applied = Some(tier);
+            }
+            None => {
+                tracing::info!(
+                    %uid, plan = %plan,
+                    "michael-compression: 当前套餐不含该能力，本轮不压缩"
+                );
+            }
+        }
+    }
+
     let streaming = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // Ensure the upstream emits a final usage chunk so streaming billing can read
-    // real (cache-discounted) tokens instead of falling back to a flat fee. Only add
-    // it when the client didn't set stream_options itself (the IDE already does; this
-    // covers third-party OpenAI-compatible clients of this gateway).
+    // Force the upstream to emit a final usage chunk so streaming billing reads real
+    // (cache-discounted) tokens. This MUST overwrite whatever the client sent: with
+    // `entry().or_insert_with()` a caller could pass
+    // `"stream_options":{"include_usage":false}`, the upstream would never emit usage,
+    // `parse_usage_from_sse` returned None and `compute_cost` billed 0 — unlimited free
+    // flagship inference for anyone holding a valid key.
     if streaming {
         if let Some(obj) = body.as_object_mut() {
-            obj.entry("stream_options")
-                .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+            let opts = obj
+                .entry("stream_options")
+                .or_insert_with(|| serde_json::json!({}));
+            if !opts.is_object() {
+                *opts = serde_json::json!({});
+            }
+            if let Some(opts) = opts.as_object_mut() {
+                opts.insert("include_usage".into(), serde_json::Value::Bool(true));
+            }
         }
     }
     // ── Gateway response cache ────────────────────────────────────────────────
@@ -3922,6 +4324,28 @@ pub async fn chat_completions(
             "上游暂时不可用，请换个模型或稍后再试。".into()
         }
     }
+    // 深思考只放宽响应头之后的首个有效 token / stream idle 窗口。响应头代表线路健康，
+    // 在它出现前，普通与深思请求共用同一个短 transport deadline。
+    let deep_thinking = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"))
+        .unwrap_or(false)
+        || body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0;
+    let agentic_request = headers
+        .get("x-ide-mode")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|mode| mode != "chat")
+        || body
+            .get("tools")
+            .and_then(|tools| tools.as_array())
+            .is_some_and(|tools| !tools.is_empty());
+    let max_header_wait = max_header_wait_for_request(deep_thinking, agentic_request);
     // Send with retry — but ONLY retry *transient* failures (502/503/504/429 or a
     // dropped connection). "forbidden / unauthorized / no available account" is
     // PERSISTENT: retrying just makes the user wait ~15s for the same error, so we
@@ -3933,6 +4357,30 @@ pub async fn chat_completions(
         let mut selected_conn = None;
         let mut attempted_sends = 0u32;
         let now = Instant::now();
+        // Total budget for finding a working upstream route, and a per-attempt ceiling
+        // on the header wait.
+        //
+        // Two things went wrong without these. (1) `GW_HTTP` sets only a
+        // `connect_timeout`, and the streaming path deliberately skips `.timeout()`
+        // (reqwest would apply it to the whole body and cut long answers off), so once
+        // the TCP connect succeeded `req.send()` waited for response headers
+        // *indefinitely* — a provider that accepts the connection and then stalls hung
+        // the gateway forever. (2) Even when attempts did fail, 6 tries plus backoff
+        // could burn 40s+ before the client heard anything.
+        //
+        // Either way the IDE hit its own header timeout (20s, 45s for deep thinking),
+        // gave up, and fast-retried — which starts a *fresh* gateway request and a
+        // fresh set of upstream calls while the abandoned ones are still open upstream.
+        // That is the "extra /v1/messages calls keep coming" storm. The gateway must
+        // therefore always answer before the client's deadline, even if that means
+        // abandoning retries.
+        //
+        // A healthy upstream sends headers in well under a second even when the first
+        // token is far away (that wait is bounded separately by the client's
+        // first-progress timeout), so a header wait this long means a broken route, not
+        // a thinking model.
+        let route_budget = route_budget_for_headers(&headers, deep_thinking);
+        let route_deadline = now + route_budget;
         let mut ordered_candidates: Vec<&Model> = Vec::with_capacity(candidates.len());
         let mut cooled_candidates: Vec<&Model> = Vec::new();
         for candidate in &candidates {
@@ -3956,7 +4404,7 @@ pub async fn chat_completions(
                 format!("{}/chat/completions", api_base(&candidate.base_url))
             };
             let candidate_upstream_body = if candidate_anthropic {
-                match oai_to_anthropic(&body) {
+                match oai_to_anthropic_with_cache(&body, route_supports_prompt_cache(candidate)) {
                     Ok(v) => v,
                     Err(err) => {
                         err_status = 400;
@@ -3970,17 +4418,35 @@ pub async fn chat_completions(
             };
             let mut route_attempts = 0u32;
             let mut route_failed_transient = false;
-            // 已在冷却中的线路只探测 1 次（快速失败 + 快速探活）。以前单线路模型不参与
-            // 冷却分流，上游挂掉后每个请求仍完整跑满 6 次重试（~25s 才吐错）——IDE 端
-            // 体感就是「请求已发出，等待响应头 30s」。冷却窗口内 1 次探测足以发现恢复，
-            // 探测成功后冷却自动解除、回到满重试。
-            let candidate_max_attempts = if route_cooldown_remaining(candidate.id, now).is_some() {
+            // With several equivalent routes, probe each route once before spending time on a
+            // duplicate attempt. With the single Claude route currently configured, permit one
+            // fast retry on a fresh HTTP/1.1 connection even while the route is cooling.
+            let candidate_max_attempts = if route_count > 1 {
                 1
             } else {
                 CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE
             };
             for attempt in 0u32..candidate_max_attempts {
-                let req0 = GW_HTTP.post(&candidate_url);
+                // Out of budget: stop probing and let the caller report the last error,
+                // so the client gets a real response instead of timing out and retrying.
+                let remaining = route_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        model = %model_id,
+                        attempted_sends,
+                        budget_secs = route_budget.as_secs(),
+                        "upstream route budget exhausted; answering the client instead of retrying further"
+                    );
+                    break 'routes;
+                }
+                // The first attempt uses the warm HTTP/1.1 pool. Every retry owns a client with
+                // no idle pool, guaranteeing it cannot reuse the connection that just stalled.
+                let chat_client = if attempt == 0 {
+                    GW_CHAT_HTTP.clone()
+                } else {
+                    build_chat_http_client(0)
+                };
+                let req0 = chat_client.post(&candidate_url);
                 let mut req = if candidate_anthropic {
                     req0.header("x-api-key", &candidate.api_key)
                         .header("anthropic-version", "2023-06-01")
@@ -3994,7 +4460,69 @@ pub async fn chat_completions(
                 }
                 route_attempts += 1;
                 attempted_sends += 1;
-                match req.send().await {
+                // `tokio::time::timeout` around `send()` bounds only the header phase —
+                // `send()` resolves as soon as the status line and headers arrive, so the
+                // response body/stream that follows is untouched. That is the piece
+                // reqwest's own `.timeout()` cannot express for a streaming response.
+                let header_wait = remaining.min(max_header_wait);
+                let send_started = Instant::now();
+                let sent = match tokio::time::timeout(header_wait, req.send()).await {
+                    Ok(result) => {
+                        let header_ms = send_started.elapsed().as_millis();
+                        match &result {
+                            Ok(response) => tracing::info!(
+                                model = %model_id,
+                                route_id = %candidate.id,
+                                attempt = attempt + 1,
+                                fresh_connection = attempt > 0,
+                                upstream_status = response.status().as_u16(),
+                                upstream_header_ms = header_ms,
+                                "upstream response headers received"
+                            ),
+                            Err(error) => tracing::warn!(
+                                model = %model_id,
+                                route_id = %candidate.id,
+                                attempt = attempt + 1,
+                                fresh_connection = attempt > 0,
+                                upstream_header_ms = header_ms,
+                                error = %error,
+                                "upstream request failed before response headers"
+                            ),
+                        }
+                        result
+                    }
+                    Err(_) => {
+                        // Dropping the future cancels the request, which is what stops
+                        // abandoned calls from piling up at the provider.
+                        err_status = 504;
+                        err_low = format!(
+                            "upstream sent no response headers within {}s",
+                            header_wait.as_secs()
+                        );
+                        tracing::warn!(
+                            model = %model_id,
+                            url = %candidate_url,
+                            attempt = attempt + 1,
+                            waited_secs = header_wait.as_secs(),
+                            "upstream stalled before response headers"
+                        );
+                        route_failed_transient = true;
+                        if attempt + 1 >= candidate_max_attempts {
+                            break;
+                        }
+                        if !wait_for_upstream_retry(FAST_HEADER_RETRY_DELAY, route_deadline).await {
+                            break 'routes;
+                        }
+                        tracing::info!(
+                            model = %model_id,
+                            route_id = %candidate.id,
+                            next_attempt = attempt + 2,
+                            "retrying header-stalled route on a fresh connection"
+                        );
+                        continue;
+                    }
+                };
+                match sent {
                     Ok(r) if r.status().is_success() => {
                         success = Some(r);
                         selected_conn = Some(candidate.clone());
@@ -4002,7 +4530,28 @@ pub async fn chat_completions(
                     }
                     Ok(r) => {
                         err_status = r.status().as_u16();
-                        err_low = r.text().await.unwrap_or_default().to_lowercase();
+                        let error_body_wait = route_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(MAX_ERROR_BODY_WAIT);
+                        if error_body_wait.is_zero() {
+                            route_failed_transient = true;
+                            break;
+                        }
+                        err_low = match tokio::time::timeout(error_body_wait, r.text()).await {
+                            Ok(Ok(text)) => text.to_lowercase(),
+                            Ok(Err(error)) => error.to_string().to_lowercase(),
+                            Err(_) => {
+                                err_status = 504;
+                                route_failed_transient = true;
+                                tracing::warn!(
+                                    model = %model_id,
+                                    url = %candidate_url,
+                                    waited_ms = error_body_wait.as_millis(),
+                                    "upstream error response body stalled; cancelling route"
+                                );
+                                break;
+                            }
+                        };
                         let persistent = err_status == 401
                             || err_status == 403
                             || err_low.contains("forbidden")
@@ -4019,7 +4568,14 @@ pub async fn chat_completions(
                             route_failed_transient = true;
                             break;
                         }
-                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                        if !wait_for_upstream_retry(
+                            chat_upstream_retry_delay(attempt),
+                            route_deadline,
+                        )
+                        .await
+                        {
+                            break 'routes;
+                        }
                     }
                     // A send error means the request almost certainly never reached the
                     // server (incl. a stale pooled connection) — safe to re-send.
@@ -4030,7 +4586,14 @@ pub async fn chat_completions(
                             route_failed_transient = true;
                             break;
                         }
-                        tokio::time::sleep(chat_upstream_retry_delay(attempt)).await;
+                        if !wait_for_upstream_retry(
+                            chat_upstream_retry_delay(attempt),
+                            route_deadline,
+                        )
+                        .await
+                        {
+                            break 'routes;
+                        }
                     }
                 }
             }
@@ -4077,18 +4640,8 @@ pub async fn chat_completions(
 
     if streaming {
         // 深思考请求（xhigh/max/带 thinking 预算）静默期可超 3 分钟：固定 180s 的上游
-        // 空闲斩会在客户端窗口放宽后成为顶层杀手，这里跟档位一起放宽。
-        let deep_thinking = body
-            .get("reasoning_effort")
-            .and_then(|v| v.as_str())
-            .map(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"))
-            .unwrap_or(false)
-            || body
-                .get("thinking")
-                .and_then(|t| t.get("budget_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                > 0;
+        // 空闲斩会在客户端窗口放宽后成为顶层杀手，这里跟档位一起放宽。`deep_thinking`
+        // 在路由预算处已算好（见上方），这里直接复用。
         // Tee the upstream SSE: forward bytes to the client UNCHANGED while
         // accumulating the full stream so a complete response can be cached. Billing is
         // REAL: the trailing include_usage chunk gives true token counts → official price
@@ -4113,8 +4666,16 @@ pub async fn chat_completions(
         let request_id_task = request_id.clone();
         let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
         let ckey_task = ckey.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+        // Absorb short provider bursts without making the billing/cache pump stop reading the
+        // upstream while Hyper or nginx drains a handful of tiny SSE frames.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(256);
+        // Move the in-flight guard into the pump task: the handler returns as soon as
+        // the response head is ready, but the request is not settled until this task
+        // finishes billing. Dropping the guard at handler return would have left the
+        // whole streaming window — the case that actually matters — uncounted.
+        let inflight = inflight_guard;
         tokio::spawn(async move {
+            let _inflight = inflight;
             use futures_util::StreamExt;
             let mut upstream = Box::pin(resp.bytes_stream());
             // 180s (was 30s): a thinking model pauses to reason / composes a long file write
@@ -4153,10 +4714,40 @@ pub async fn chat_completions(
             // every 15s of upstream silence. SSE comments are ignored by compliant parsers.
             let hb_interval = std::time::Duration::from_secs(15);
             let mut last_data = tokio::time::Instant::now();
+            let response_opened_at = tokio::time::Instant::now();
+            let mut first_upstream_chunk = true;
+            // When the client hangs up we keep draining the upstream instead of
+            // bailing out. The upstream keeps generating (and keeps charging the
+            // operator) either way, and the token counts only arrive in the FINAL
+            // usage event — abandoning the stream early meant `parse_usage_from_sse`
+            // found nothing, `compute_cost` billed 0, and disconnecting mid-stream
+            // was a free-inference button. Draining bounded by DRAIN_AFTER_CLOSE and
+            // by the existing idle-stall check.
+            const DRAIN_AFTER_CLOSE: std::time::Duration = std::time::Duration::from_secs(120);
+            let mut closed_at: Option<tokio::time::Instant> = None;
             loop {
+                if let Some(at) = closed_at {
+                    if at.elapsed() >= DRAIN_AFTER_CLOSE {
+                        tracing::warn!(
+                            model = %req_model,
+                            "client gone; usage frame did not arrive within drain window — billing what was measured"
+                        );
+                        break;
+                    }
+                }
                 match tokio::time::timeout(hb_interval, upstream.next()).await {
                     Ok(Some(Ok(chunk))) => {
                         last_data = tokio::time::Instant::now();
+                        if first_upstream_chunk {
+                            first_upstream_chunk = false;
+                            tracing::info!(
+                                model = %req_model,
+                                request_id = request_id_task.as_deref().unwrap_or(""),
+                                first_upstream_chunk_ms = response_opened_at.elapsed().as_millis(),
+                                chunk_bytes = chunk.len(),
+                                "first upstream stream chunk received"
+                            );
+                        }
                         let fwd: Vec<u8> = match conv.as_mut() {
                             Some(c) => match c.push(chunk.as_ref()) {
                                 Ok(fwd) => fwd,
@@ -4186,9 +4777,11 @@ pub async fn chat_completions(
                                     tail.drain(0..cut);
                                 }
                             }
-                            if tx.send(Ok(axum::body::Bytes::from(fwd))).await.is_err() {
+                            if !client_closed
+                                && tx.send(Ok(axum::body::Bytes::from(fwd))).await.is_err()
+                            {
                                 client_closed = true;
-                                break;
+                                closed_at = Some(tokio::time::Instant::now());
                             }
                         }
                     }
@@ -4221,13 +4814,14 @@ pub async fn chat_completions(
                             break; // real stall — upstream dead for 180s
                         }
                         // Send SSE heartbeat to keep the client connection alive
-                        if tx
-                            .send(Ok(axum::body::Bytes::from_static(b": ping\n\n")))
-                            .await
-                            .is_err()
+                        if !client_closed
+                            && tx
+                                .send(Ok(axum::body::Bytes::from_static(b": ping\n\n")))
+                                .await
+                                .is_err()
                         {
                             client_closed = true;
-                            break;
+                            closed_at = Some(tokio::time::Instant::now());
                         }
                     }
                 }
@@ -4242,7 +4836,9 @@ pub async fn chat_completions(
                             if acc.len() < 1_000_000 {
                                 acc.extend_from_slice(&fin);
                             }
-                            if tx.send(Ok(axum::body::Bytes::from(fin))).await.is_err() {
+                            if !client_closed
+                                && tx.send(Ok(axum::body::Bytes::from(fin))).await.is_err()
+                            {
                                 client_closed = true;
                             }
                         }
@@ -4313,10 +4909,17 @@ pub async fn chat_completions(
         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
-        let out = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
             .header(axum::http::header::CONTENT_TYPE, ct)
             .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no");
+        // 让调用方知道**实际生效**的档位——套餐不够时请求会被静默下调，不回传的话
+        // 用户会以为自己拿到了 5M。
+        if let Some(tier) = compression_applied {
+            builder = builder.header("x-michael-compression-applied", tier.as_str());
+        }
+        let out = builder
             .body(Body::from_stream(body_stream))
             .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(out)
@@ -4398,7 +5001,13 @@ pub async fn chat_completions(
             (cost, tokens)
         };
         bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
-        Ok(Json(data).into_response())
+        let mut resp = Json(data).into_response();
+        if let Some(tier) = compression_applied {
+            if let Ok(v) = axum::http::HeaderValue::from_str(tier.as_str()) {
+                resp.headers_mut().insert("x-michael-compression-applied", v);
+            }
+        }
+        Ok(resp)
     }
 }
 
@@ -4927,7 +5536,7 @@ mod billing_tests {
     #[test]
     fn fused_charge_spills_from_quota_into_wallet() {
         assert_eq!(
-            split_fused_charge(23, true, 10, 10, 0, 0, 100),
+            split_fused_charge(23, true, 10, 10, 0, 0),
             FusedCharge {
                 quota_cents: 10,
                 wallet_cents: 13,
@@ -4938,7 +5547,7 @@ mod billing_tests {
     #[test]
     fn fused_charge_respects_weekly_quota_cap() {
         assert_eq!(
-            split_fused_charge(23, true, 100, 100, 20, 15, 100),
+            split_fused_charge(23, true, 100, 100, 20, 15),
             FusedCharge {
                 quota_cents: 5,
                 wallet_cents: 18,
@@ -4949,7 +5558,7 @@ mod billing_tests {
     #[test]
     fn fused_charge_uses_wallet_without_eligible_quota() {
         assert_eq!(
-            split_fused_charge(23, false, 100, 100, 0, 0, 50),
+            split_fused_charge(23, false, 100, 100, 0, 0),
             FusedCharge {
                 quota_cents: 0,
                 wallet_cents: 23,
@@ -4958,16 +5567,43 @@ mod billing_tests {
     }
 
     #[test]
-    fn fused_charge_never_exceeds_available_funds() {
-        let charge = split_fused_charge(23, true, 10, 10, 0, 0, 4);
+    /// Overspend is recorded as debt, not written off.
+    ///
+    /// This test previously asserted the opposite — that the wallet portion was
+    /// clamped to the available balance (23 requested, 4 available → charge 14 and
+    /// forgive 9). That clamp was the bug: the access gate only checks that the
+    /// balance is positive and settlement happens after the upstream call, so every
+    /// overshoot was silently free while the operator still paid upstream. The full
+    /// cost is now charged, `credits_cents` may go negative, and the existing
+    /// `credits <= 0` gate refuses the next request until the user tops up.
+    fn fused_charge_records_overspend_as_debt() {
+        let charge = split_fused_charge(23, true, 10, 10, 0, 0);
         assert_eq!(
             charge,
             FusedCharge {
                 quota_cents: 10,
-                wallet_cents: 4,
+                wallet_cents: 13,
             }
         );
-        assert_eq!(charge.total_cents(), 14);
+        assert_eq!(
+            charge.total_cents(),
+            23,
+            "the settled amount must equal the true cost so model_usage can be reconciled"
+        );
+    }
+
+    #[test]
+    /// A user with no funds at all still gets charged the real amount, so the debt is
+    /// visible and the next request is refused.
+    fn fused_charge_bills_full_cost_with_empty_wallet() {
+        let charge = split_fused_charge(500, false, 0, 0, 0, 0);
+        assert_eq!(
+            charge,
+            FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 500,
+            }
+        );
     }
 
     #[test]
@@ -6264,4 +6900,672 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
         );
         assert_eq!(cost, 0);
     }
+}
+
+#[cfg(test)]
+mod anth_usage_harvest_tests {
+    use super::*;
+
+    /// Relays that attach the final `usage` to `message_stop` instead of
+    /// `message_delta` used to be billed as ZERO: only `message_delta` was inspected,
+    /// so `output_usage_reported` stayed false and `compute_cost` returned 0.
+    /// Production was logging "provider omitted authoritative usage" for ~18% of
+    /// Claude calls, opus-5 among them.
+    #[test]
+    fn usage_on_message_stop_is_authoritative() {
+        let mut c = AnthSse::new("claude-opus-5");
+        c.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1200}}}\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\ndata: {\"type\":\"content_block_stop\",\"index\":0}\ndata: {\"type\":\"message_stop\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":340}}\n",
+        )
+        .expect("stream parses");
+        let u = c.usage();
+        assert_eq!(u["input_tokens"], 1200);
+        assert_eq!(u["output_tokens"], 340);
+        assert!(
+            c.usage_is_authoritative(),
+            "usage reported on message_stop must count as authoritative"
+        );
+    }
+
+    /// A running counter must not be walked backwards by a later smaller figure.
+    #[test]
+    fn running_output_counts_only_move_upward() {
+        let mut c = AnthSse::new("claude-sonnet-5");
+        c.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":500}}\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n",
+        )
+        .expect("stream parses");
+        assert_eq!(c.usage()["output_tokens"], 500);
+    }
+
+    /// Harvesting must never invent numbers: a stream that reports no output tokens at
+    /// all stays non-authoritative, so billing still refuses to charge for it.
+    #[test]
+    fn missing_output_usage_is_still_not_authoritative() {
+        let mut c = AnthSse::new("claude-opus-5");
+        c.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":90}}}\ndata: {\"type\":\"message_stop\"}\n",
+        )
+        .expect("stream parses");
+        assert!(!c.usage_is_authoritative());
+        assert_eq!(c.usage()["output_tokens"], 0);
+    }
+}
+
+#[cfg(test)]
+mod michael_compression_wiring_tests {
+    use super::*;
+
+    /// 档位必须两种写法都能进来，且**不给就是不启用**——这是这个特性对现有流量零影响的
+    /// 全部保证。
+    #[test]
+    fn tier_is_opt_in_from_header_or_body() {
+        let empty = serde_json::json!({});
+        assert!(compression_tier_from(&HeaderMap::new(), &empty).is_none());
+
+        let mut h = HeaderMap::new();
+        h.insert("x-michael-compression", "2m".parse().unwrap());
+        assert_eq!(
+            compression_tier_from(&h, &empty),
+            Some(crate::compression::Tier::M2)
+        );
+
+        let body = serde_json::json!({ "michael_compression": "5m" });
+        assert_eq!(
+            compression_tier_from(&HeaderMap::new(), &body),
+            Some(crate::compression::Tier::M5)
+        );
+        // 无法识别的值当作没请求，而不是报错打断聊天。
+        let bad = serde_json::json!({ "michael_compression": "9m" });
+        assert!(compression_tier_from(&HeaderMap::new(), &bad).is_none());
+    }
+
+    /// 只统计文本，且顺序/角色必须原样保留——规划完全建立在这个序列上。
+    #[test]
+    fn messages_are_read_in_order_with_roles() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "user", "content": "问题" },
+                { "role": "assistant", "content": [{ "type": "text", "text": "回答" }] },
+            ]
+        });
+        let msgs = compression_msgs_from(&body);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].text, "问题");
+        // 多模态内容按其文本部分参与规划。
+        assert_eq!(msgs[2].text, "回答");
+        assert!(msgs.iter().all(|m| m.tokens > 0));
+    }
+
+    #[test]
+    fn missing_messages_is_not_a_panic() {
+        assert!(compression_msgs_from(&serde_json::json!({})).is_empty());
+        assert!(compression_msgs_from(&serde_json::json!({ "messages": "nope" })).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod upstream_timeout_tests {
+    use super::*;
+
+    /// The gateway must answer before the IDE stops waiting.
+    ///
+    /// When it didn't, the IDE hit its response-header timeout, fast-retried, and
+    /// every retry opened a fresh gateway request with its own set of upstream calls —
+    /// the user saw "已等待 47s；仍在等待有效输出" while `/v1/messages` requests kept
+    /// piling up at the provider. Keep a real margin so a slow answer still beats the
+    /// client's deadline.
+    #[test]
+    fn route_budget_fits_inside_the_client_header_timeout() {
+        for deep in [false, true] {
+            let budget = route_budget_for(deep);
+            assert!(
+                budget < CLIENT_HEADER_TIMEOUT,
+                "route budget {:?} must be under the client's {:?} header timeout (deep={deep})",
+                budget,
+                CLIENT_HEADER_TIMEOUT
+            );
+            assert!(
+                CLIENT_HEADER_TIMEOUT - budget >= Duration::from_secs(2),
+                "leave >=2s of margin; budget {:?} vs client {:?} (deep={deep})",
+                budget,
+                CLIENT_HEADER_TIMEOUT
+            );
+        }
+    }
+
+    /// Thinking effort must never widen a broken transport's response-header window.
+    #[test]
+    fn deep_thinking_uses_the_same_transport_budget() {
+        assert_eq!(route_budget_for(true), route_budget_for(false));
+    }
+
+    /// A single stalled route must not be allowed to consume a whole budget on its own
+    /// when the budget is the smaller of the two.
+    #[test]
+    fn per_attempt_header_wait_is_request_aware_and_capped() {
+        assert_eq!(
+            max_header_wait_for_request(false, false),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            max_header_wait_for_request(false, true),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            max_header_wait_for_request(true, true),
+            Duration::from_secs(10)
+        );
+        assert!(DEEP_MAX_HEADER_WAIT < ROUTE_BUDGET);
+    }
+
+    #[test]
+    fn absolute_client_deadline_caps_every_gateway_retry() {
+        let now_ms = 1_000_000;
+        assert_eq!(
+            route_budget_with_client_deadline(false, Some(now_ms + 4_000), now_ms),
+            Duration::from_millis(3_250),
+        );
+        assert_eq!(
+            route_budget_with_client_deadline(true, Some(now_ms - 1), now_ms),
+            Duration::ZERO,
+            "an already-expired desktop request must not open an upstream call"
+        );
+        assert_eq!(
+            route_budget_with_client_deadline(false, None, now_ms),
+            ROUTE_BUDGET,
+            "older/BYOK clients use the bounded gateway fallback"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A client must not be able to suppress the usage frame. Before the fix the
+    /// gateway used `entry().or_insert_with()`, so `include_usage: false` survived,
+    /// the upstream never reported usage, and `compute_cost` billed 0 — unlimited
+    /// free inference for anyone with a valid key.
+    fn apply_stream_options(body: &mut serde_json::Value) {
+        if let Some(obj) = body.as_object_mut() {
+            let opts = obj
+                .entry("stream_options")
+                .or_insert_with(|| serde_json::json!({}));
+            if !opts.is_object() {
+                *opts = serde_json::json!({});
+            }
+            if let Some(opts) = opts.as_object_mut() {
+                opts.insert("include_usage".into(), serde_json::Value::Bool(true));
+            }
+        }
+    }
+
+    #[test]
+    fn client_cannot_disable_include_usage() {
+        let mut body = json!({"stream": true, "stream_options": {"include_usage": false}});
+        apply_stream_options(&mut body);
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    }
+
+    #[test]
+    fn empty_or_bogus_stream_options_still_get_include_usage() {
+        for given in [json!({}), json!("nope"), json!(7), json!(null)] {
+            let mut body = json!({ "stream": true, "stream_options": given });
+            apply_stream_options(&mut body);
+            assert_eq!(body["stream_options"]["include_usage"], json!(true));
+        }
+    }
+
+    #[test]
+    fn unrelated_stream_options_keys_survive() {
+        let mut body = json!({"stream": true, "stream_options": {"foo": "bar"}});
+        apply_stream_options(&mut body);
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+        assert_eq!(body["stream_options"]["foo"], json!("bar"));
+    }
+
+    /// The pack cache holds ~630KB per entry and its key is a hash of the request, so
+    /// a caller varying one character misses every time. Unbounded, that OOMs the
+    /// gateway before the upstream bill even becomes the bigger problem.
+    #[test]
+    fn i18n_pack_cache_is_bounded() {
+        for i in 0..(I18N_PACK_CACHE_MAX_ENTRIES * 3) {
+            i18n_pack_cache_put(format!("k{i}"), json!({ "n": i }));
+        }
+        let len = I18N_PACK_CACHE.lock().expect("cache").len();
+        assert!(
+            len <= I18N_PACK_CACHE_MAX_ENTRIES,
+            "cache grew to {len}, cap is {I18N_PACK_CACHE_MAX_ENTRIES}"
+        );
+    }
+
+    #[test]
+    fn i18n_pack_cache_round_trips_a_fresh_entry() {
+        i18n_pack_cache_put("fresh-key".into(), json!({ "ok": true }));
+        assert_eq!(
+            i18n_pack_cache_get("fresh-key"),
+            Some(json!({ "ok": true }))
+        );
+        assert_eq!(i18n_pack_cache_get("never-inserted"), None);
+    }
+
+    /// Cache misses are what cost money, so they are budgeted per user.
+    #[test]
+    fn i18n_pack_budget_stops_a_runaway_caller() {
+        let uid = uuid::Uuid::new_v4();
+        for _ in 0..I18N_PACK_BUDGET_PER_WINDOW {
+            assert!(i18n_pack_charge_budget(uid).is_ok());
+        }
+        let err = i18n_pack_charge_budget(uid).expect_err("budget must stop the caller");
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        // Budgets are per user, so one runaway client can't lock everyone else out.
+        assert!(i18n_pack_charge_budget(uuid::Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn asset_generation_budget_is_per_user() {
+        let uid = uuid::Uuid::new_v4();
+        for _ in 0..ASSET_GEN_PER_WINDOW {
+            assert!(asset_gen_charge_budget(uid).is_ok());
+        }
+        assert_eq!(
+            asset_gen_charge_budget(uid)
+                .expect_err("budget must stop the caller")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(asset_gen_charge_budget(uuid::Uuid::new_v4()).is_ok());
+    }
+}
+
+// ============ michael-compression 接线层 ============
+//
+// 纯规划与缓存键逻辑在 `crate::compression`（无 I/O、可单测）；这里只负责它够不到的
+// 东西：读请求、查 Redis、挑压缩模型、打上游、把结果写回 body。
+
+/// 从请求里解析 michael-compression 档位。
+///
+/// 支持两种写法：请求头 `x-michael-compression: 2m`，或 body 里的 `michael_compression`
+/// 字段（给不方便加头的 OpenAI 兼容客户端）。都没有就返回 None —— **不启用**。
+fn compression_tier_from(
+    headers: &HeaderMap,
+    body: &serde_json::Value,
+) -> Option<crate::compression::Tier> {
+    if let Some(raw) = headers
+        .get("x-michael-compression")
+        .and_then(|v| v.to_str().ok())
+    {
+        return crate::compression::Tier::parse(raw);
+    }
+    body.get("michael_compression")
+        .and_then(|v| v.as_str())
+        .and_then(crate::compression::Tier::parse)
+}
+
+/// 把 OpenAI 形状的 messages 读成压缩层用的结构。
+///
+/// 只取纯文本内容：带图片等多模态块的消息按其文本部分参与规划，压缩时也只压文本，
+/// 非文本部分永远落在逐字尾部或原样保留（我们从不重写消息本身，只决定压不压）。
+fn compression_msgs_from(body: &serde_json::Value) -> Vec<crate::compression::Msg> {
+    body.get("messages")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                    crate::compression::Msg::new(role, oai_content_text(m.get("content")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 挑一个用来做压缩的便宜模型：按官方单价升序取第一个可用连接。
+///
+/// 压缩是机械活，用旗舰模型压是纯烧钱——这正是客户端 `_pickCheapModel` 曾经犯的错。
+async fn compression_pick_compressor(state: &AppState) -> Option<(Model, String)> {
+    let models = sqlx::query_as::<_, Model>(
+        "SELECT * FROM models WHERE active = true AND api_key <> '' ORDER BY sort, created_at",
+    )
+    .fetch_all(&state.db)
+    .await
+    .ok()?;
+    let mut best: Option<(f64, Model, String)> = None;
+    for m in models {
+        for id in allowed_ids(&m) {
+            let price = official_price(&id).map(|(i, o)| i + o).unwrap_or(f64::MAX);
+            if best.as_ref().is_none_or(|(p, _, _)| price < *p) {
+                best = Some((price, m.clone(), id));
+            }
+        }
+    }
+    best.map(|(_, m, id)| (m, id))
+}
+
+/// 压一个段。失败返回 None —— 调用方降级为「这段不压」，绝不让压缩失败拖垮聊天。
+/// 一次段压缩的结果：摘要正文 + 上游报告的 usage（用于计费）。
+struct CompressionCall {
+    summary: String,
+    usage: Option<serde_json::Value>,
+}
+
+async fn compression_summarize(
+    conn: &Model,
+    model_id: &str,
+    text: &str,
+) -> Option<CompressionCall> {
+    let payload = json!({
+        "model": model_id,
+        "temperature": 0.1,
+        "max_tokens": crate::compression::SEGMENT_SUMMARY_TOKENS,
+        "messages": [
+            { "role": "system", "content": crate::compression::segment_compress_prompt(crate::compression::SEGMENT_SUMMARY_TOKENS) },
+            { "role": "user", "content": text },
+        ],
+    });
+    let resp = GW_HTTP
+        .post(format!("{}/chat/completions", api_base(&conn.base_url)))
+        .header("Authorization", format!("Bearer {}", conn.api_key))
+        .json(&payload)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let out = data
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if out.is_empty() {
+        return None;
+    }
+    Some(CompressionCall {
+        summary: out,
+        usage: data.get("usage").cloned(),
+    })
+}
+
+/// 取出并校验请求带来的前缀引用。
+///
+/// 返回 (摘要, 段键, 覆盖的消息数, 覆盖部分的原始 token 数)。任何一步不成立（引用不存在、不属于该用户、
+/// 有段已过期）都返回 None —— 调用方据此让客户端重发完整历史。**宁可多传一次，也不能
+/// 静默丢掉一段历史**：那会让模型莫名其妙地失忆。
+async fn compression_take_prefix(
+    state: &AppState,
+    body: &mut serde_json::Value,
+    uid: uuid::Uuid,
+) -> Option<(Vec<String>, Vec<String>, usize, usize)> {
+    use crate::compression as mc;
+
+    let token = body
+        .get("mc_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    // 这是我们自己的协议字段，绝不能透传给上游。
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("mc_prefix");
+    }
+
+    let mut redis = state.redis.clone();
+    let raw: Option<String> = redis::cmd("GET")
+        .arg(mc::prefix_redis_key(&token))
+        .query_async(&mut redis)
+        .await
+        .ok()
+        .flatten();
+    let record: mc::PrefixRecord = serde_json::from_str(&raw?).ok()?;
+
+    if !mc::prefix_belongs_to(&record, &uid.to_string()) {
+        tracing::warn!(%uid, "michael-compression: 前缀引用不属于该用户，已拒绝");
+        return None;
+    }
+
+    let mut summaries = Vec::with_capacity(record.segment_keys.len());
+    for key in &record.segment_keys {
+        match mc::cached_summary(&mut redis, key).await {
+            Some(sum) => summaries.push(sum),
+            None => {
+                // 有段被淘汰了。拼一个缺口出来等于让模型失忆，所以整体作废、要求重发。
+                tracing::info!(
+                    %uid,
+                    "michael-compression: 前缀中有段已过期，要求客户端重发完整历史"
+                );
+                return None;
+            }
+        }
+    }
+    // 段键也一并返回：续传时它们要原样接在本轮新签发的键前面，前缀才是连续的。
+    Some((
+        summaries,
+        record.segment_keys,
+        record.covered_msgs,
+        record.raw_tokens,
+    ))
+}
+
+/// 把组装好的消息序列写回 body，并清掉我们自己的协议字段（绝不能透传给上游）。
+fn compression_write_back(body: &mut serde_json::Value, assembled: &[crate::compression::Msg]) {
+    if let Some(arr) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        *arr = assembled
+            .iter()
+            .map(|m| json!({ "role": m.role, "content": m.text }))
+            .collect();
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("michael_compression");
+        obj.remove("mc_prefix");
+    }
+}
+
+/// 签发一个前缀引用，供客户端下一轮续传。
+async fn compression_issue_prefix(
+    state: &AppState,
+    uid: uuid::Uuid,
+    segment_keys: Vec<String>,
+    covered_msgs: usize,
+    raw_tokens: usize,
+) -> Option<String> {
+    use crate::compression as mc;
+    if segment_keys.is_empty() {
+        return None;
+    }
+    let record = mc::PrefixRecord {
+        uid: uid.to_string(),
+        segment_keys,
+        covered_msgs,
+        raw_tokens,
+    };
+    let token = mc::new_prefix_token();
+    let payload = serde_json::to_string(&record).ok()?;
+    let mut redis = state.redis.clone();
+    let ok: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg(mc::prefix_redis_key(&token))
+        .arg(payload)
+        .arg("EX")
+        .arg(mc::PREFIX_TTL_SECS)
+        .query_async(&mut redis)
+        .await;
+    ok.ok().map(|_| token)
+}
+
+/// 就地把 body.messages 换成压缩后的序列。
+///
+/// 全程 best-effort：任何一步失败都保持 body 原样（这一轮上下文短一点，但聊天照常可用）。
+///
+/// 返回本轮签发的新前缀引用（若有），供响应头回传给客户端做下一轮续传。
+async fn apply_michael_compression(
+    state: &AppState,
+    body: &mut serde_json::Value,
+    model_id: &str,
+    tier: crate::compression::Tier,
+    uid: uuid::Uuid,
+) -> Option<String> {
+    use crate::compression as mc;
+
+    // 前缀续传：客户端只发了未覆盖的消息，历史摘要从 Redis 取回。这条路径让线路体积
+    // 正比于新增内容而不是对话总长——5M 档能跑起来全靠它。
+    let (carried_summaries, carried_keys, carried_msgs, carried_raw) =
+        match compression_take_prefix(state, body, uid).await {
+            Some((sums, keys, n, raw)) => (sums, keys, n, raw),
+            None => (Vec::new(), Vec::new(), 0, 0),
+        };
+
+    let msgs = compression_msgs_from(body);
+    if msgs.is_empty() {
+        return None;
+    }
+
+    let native = official_context(model_id).unwrap_or(128_000).max(1) as usize;
+    // 已取回的摘要要占掉一部分窗口，规划新内容时先扣掉，否则拼起来仍会超窗。
+    let carried_budget = carried_summaries.len() * mc::SEGMENT_SUMMARY_TOKENS;
+    let planning_window = native.saturating_sub(carried_budget).max(native / 4);
+    let plan = mc::plan(&msgs, planning_window, mc::VERBATIM_TAIL_TOKENS, mc::SEGMENT_TOKENS);
+
+    let total_raw = carried_raw + plan.raw_tokens;
+    if total_raw > tier.max_input_tokens() {
+        tracing::warn!(
+            model = %model_id, tier = tier.as_str(), total_raw,
+            "michael-compression: 累计输入超出档位上限（尾部逐字保留不受影响）"
+        );
+    }
+
+    // 没有新段要压。带了前缀就必须把摘要拼回去——否则这一轮历史凭空消失。
+    if plan.compress.is_empty() {
+        if carried_summaries.is_empty() {
+            return None; // 没超窗口，一分钱不花
+        }
+        let carry_only = mc::Plan {
+            compress: Vec::new(),
+            verbatim_from: 0,
+            projected_tokens: plan.projected_tokens,
+            raw_tokens: plan.raw_tokens,
+        };
+        compression_write_back(body, &mc::assemble(&msgs, &carry_only, &carried_summaries));
+        // 前缀没有变长，沿用客户端手上那个引用即可（不签发新的，省一次 Redis 写）。
+        return None;
+    }
+
+    let Some((conn, compressor)) = compression_pick_compressor(state).await else {
+        tracing::warn!("michael-compression: 没有可用的压缩模型，本轮不压缩");
+        return None;
+    };
+
+    let mut redis = state.redis.clone();
+    let mut summaries: Vec<String> = carried_summaries.clone();
+    let mut new_keys: Vec<String> = Vec::with_capacity(plan.compress.len());
+    let mut fresh = 0usize;
+    let mut cached = 0usize;
+
+    for seg in &plan.compress {
+        let text = mc::segment_text(&msgs, seg);
+        let key = mc::segment_cache_key(&text, &compressor, mc::SEGMENT_SUMMARY_TOKENS);
+        if let Some(hit) = mc::cached_summary(&mut redis, &key).await {
+            cached += 1;
+            summaries.push(hit);
+            new_keys.push(key);
+            continue;
+        }
+        if fresh >= mc::MAX_FRESH_SEGMENTS_PER_REQUEST {
+            // 超过本轮预算：剩下的段这次不压，留在原文里，下一轮继续补。宁可这轮上下文
+            // 长一点，也不要让一个请求卡在几十次串行压缩上。
+            tracing::info!(
+                tier = tier.as_str(),
+                "michael-compression: 达到单轮新算上限，剩余段留待后续轮次"
+            );
+            break;
+        }
+        match compression_summarize(&conn, &compressor, &text).await {
+            Some(call) => {
+                mc::store_summary(&mut redis, &key, &call.summary).await;
+                fresh += 1;
+                // 压缩是真实的上游消耗，必须记账。缓存命中的段不计费——那正是这套设计
+                // 省下来的钱，也是「压缩缓存」这个名字的意义。
+                bill_compression_call(state, uid, &conn, &compressor, call.usage.as_ref()).await;
+                summaries.push(call.summary);
+                new_keys.push(key);
+            }
+            None => {
+                tracing::warn!("michael-compression: 段压缩失败，本轮降级为不压缩");
+                return None;
+            }
+        }
+    }
+
+    // 实际压掉的消息数可能少于计划（撞到单轮上限时会提前 break），逐字部分要按实际来。
+    let actually_compressed = new_keys.len();
+    let verbatim_from = plan
+        .compress
+        .get(actually_compressed.saturating_sub(1))
+        .map(|s| s.end)
+        .unwrap_or(0);
+    let effective = mc::Plan {
+        compress: plan.compress[..actually_compressed].to_vec(),
+        verbatim_from,
+        projected_tokens: plan.projected_tokens,
+        raw_tokens: plan.raw_tokens,
+    };
+
+    compression_write_back(body, &mc::assemble(&msgs, &effective, &summaries));
+
+    let mut all_keys = carried_keys;
+    all_keys.extend(new_keys);
+    let covered = carried_msgs + effective.verbatim_from;
+    let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw).await;
+
+    tracing::info!(
+        %uid, model = %model_id, tier = tier.as_str(), compressor = %compressor,
+        carried_msgs, carried_raw, raw_tokens = plan.raw_tokens, total_raw,
+        segments_cached = cached, segments_fresh = fresh,
+        issued_prefix = issued.is_some(),
+        "michael-compression applied"
+    );
+    issued
+}
+
+/// 给一次段压缩记账，走和聊天完全相同的 `bill()` 路径。
+///
+/// 压缩调用花的是运营方的上游余额，如果不记账，`model_usage` 就对不上真实支出——
+/// 这正是审计在 `/api/i18n/pack` 上查到的问题（匿名、不计费、不可归因），不能在新特性
+/// 上重犯。用量拿不到时按 0 计，但**仍然写一行 model_usage**，保证调用可归因。
+async fn bill_compression_call(
+    state: &AppState,
+    uid: uuid::Uuid,
+    conn: &Model,
+    compressor_model: &str,
+    usage: Option<&serde_json::Value>,
+) {
+    let reported = usage_is_authoritative(usage);
+    let (model_in, model_out) = model_price_override(&conn.model_prices, compressor_model);
+    let cost = resolve_cost(
+        &conn.billing_mode,
+        conn.per_call_cents,
+        usage.filter(|_| reported),
+        compressor_model,
+        conn.rate,
+        conn.input_price,
+        conn.output_price,
+        conn.cache_read_price,
+        conn.cache_create_price,
+        model_in,
+        model_out,
+    );
+    let mut tokens = extract_bill_tokens(
+        usage.filter(|_| reported),
+        // 在用量表里单独标记，便于把压缩成本和聊天成本分开对账。
+        &format!("michael-compression/{compressor_model}"),
+        !reported,
+    );
+    tokens.request_id = None;
+    // use_quota=false：压缩走余额而不是会员的时段额度，否则用户会觉得"我什么都没做
+    // 时段额度就少了一截"。
+    bill(state, uid, conn.id, cost, false, &tokens).await;
 }

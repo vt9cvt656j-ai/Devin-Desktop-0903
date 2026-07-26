@@ -496,7 +496,7 @@ pub async fn generate_3d(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     if prompt.is_empty() {
         return Err(AppError::bad("缺少 prompt"));
@@ -645,7 +645,7 @@ pub async fn generate_sound(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     if prompt.is_empty() {
         return Err(AppError::bad("缺少 prompt"));
@@ -697,7 +697,7 @@ pub async fn generate_music(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     if prompt.is_empty() {
         return Err(AppError::bad("缺少 prompt"));
@@ -744,7 +744,7 @@ pub async fn generate_voice(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let text = body
         .get("text")
         .and_then(|v| v.as_str())
@@ -842,7 +842,7 @@ pub async fn auto_rig(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     // Tripo rigging needs an existing task_id from a previous 3D generation
     let original_task_id = body.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if original_task_id.is_empty() {
@@ -883,7 +883,7 @@ pub async fn generate_motion(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let original_task_id = body.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if original_task_id.is_empty() {
         return Err(AppError::bad(
@@ -928,7 +928,7 @@ pub async fn generate_texture(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, AppError> {
-    crate::models::auth_any_user(&state, &headers).await?;
+    crate::models::require_paid_access(&state, &headers).await?;
     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     if prompt.is_empty() {
         return Err(AppError::bad("缺少 prompt"));

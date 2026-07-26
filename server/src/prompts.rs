@@ -16,6 +16,7 @@ use crate::auth::Claims;
 use crate::error::ApiResult;
 use axum::http::HeaderMap;
 use axum::Json;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -31,6 +32,35 @@ const MAX_STATIC_TOOLS_PER_REQUEST: usize = 220;
 const MAX_FINAL_TOOLS_PER_REQUEST: usize = 64;
 const MAX_FINAL_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Debug, Deserialize)]
+struct PromptGraph {
+    version: u32,
+    modes: HashMap<String, Vec<String>>,
+    agent: AgentPromptGraph,
+    design: DesignPromptGraph,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AgentPromptGraph {
+    base: Vec<String>,
+    engineering: Vec<String>,
+    research: Vec<String>,
+    automation: Vec<String>,
+    git: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DesignPromptGraph {
+    base: Vec<String>,
+    implementation: Vec<String>,
+    scaffold: Vec<String>,
+    content: Vec<String>,
+    data: Vec<String>,
+    review: Vec<String>,
+    verification: Vec<String>,
+    motion: Vec<String>,
+}
+
 fn prompt_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("prompts")
@@ -41,6 +71,42 @@ fn tools_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("prompts")
         .join("tools.json")
+}
+
+fn prompt_graph_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("prompts")
+        .join("prompt_graph.json")
+}
+
+fn read_prompt_graph_file() -> Result<String, String> {
+    let path = prompt_graph_path();
+    std::fs::read_to_string(&path).map_err(|err| {
+        tracing::warn!(path = %path.display(), %err, "failed to load prompts/prompt_graph.json");
+        format!("prompt_graph.json load failed: {err}")
+    })
+}
+
+fn read_prompt_graph() -> Result<PromptGraph, String> {
+    let text = read_prompt_graph_file()?;
+    let graph: PromptGraph = serde_json::from_str(&text).map_err(|err| {
+        tracing::warn!(%err, "failed to parse prompts/prompt_graph.json");
+        format!("prompt_graph.json parse failed: {err}")
+    })?;
+    let required_modes = ["chat", "plan", "explorer", "reviewer"];
+    if graph.version != 2
+        || graph.agent.base.is_empty()
+        || graph.design.base.is_empty()
+        || required_modes.iter().any(|mode| {
+            graph
+                .modes
+                .get(*mode)
+                .is_none_or(|modules| modules.is_empty())
+        })
+    {
+        return Err("unsupported or incomplete prompt graph".to_string());
+    }
+    Ok(graph)
 }
 
 fn read_tools_file() -> Result<String, String> {
@@ -62,6 +128,28 @@ fn read_prompt(name: &str) -> Result<String, String> {
         tracing::warn!(prompt = name, path = %path.display(), %err, "failed to load prompt file");
         format!("prompt {name} load failed: {err}")
     })
+}
+
+fn append_prompt_modules(
+    names: &[String],
+    sys: &mut String,
+    blocks: &mut Vec<String>,
+) -> Result<(), String> {
+    for name in names {
+        if blocks.iter().any(|loaded| loaded == name) {
+            continue;
+        }
+        let text = read_prompt(name)?;
+        if text.trim().is_empty() {
+            return Err(format!("prompt graph module {name} is empty"));
+        }
+        if !sys.is_empty() {
+            sys.push_str("\n\n");
+        }
+        sys.push_str(&text);
+        blocks.push(name.clone());
+    }
+    Ok(())
 }
 
 fn allowed_static_tool(mode: &str, name: &str) -> bool {
@@ -279,20 +367,6 @@ fn enforce_final_tool_budget(body: &mut serde_json::Value) -> (usize, usize) {
     (candidate_count, serialized_bytes)
 }
 
-/// The compact agent contract is the production default for every model. Frontier models are not
-/// helped by repeating a 100KB rulebook on every tool turn; task-specific research, automation,
-/// design, knowledge and tool schemas are injected separately below. Operators can still set
-/// `MICHAEL_LITE_PROMPT=0` as an immediate rollback to the legacy full prompt.
-fn use_lite_agent_prompt(model: &str) -> bool {
-    match std::env::var("MICHAEL_LITE_PROMPT").ok().as_deref() {
-        Some("0") => return false,
-        Some("all") => return true,
-        _ => {}
-    }
-    let _ = model;
-    true
-}
-
 const USER_REQUEST_MARKER: &str = "📌 **用户本次请求**：";
 const USER_STEERING_MARKER: &str = "[MICHAEL_USER_STEERING]";
 const USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：";
@@ -304,9 +378,8 @@ const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
 const DESIGN_KNOWLEDGE_SEARCH_POOL: usize = 12;
-const DESIGN_KNOWLEDGE_MAX_HITS: usize = 8;
-const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 4200;
-const DESIGN_KNOWLEDGE_TOTAL_CHARS: usize = 18_000;
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 5;
+const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 3200;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
     "premium light solid website Tailwind palette harmony responsive card grid semantic icons rich content media advanced motion choreography";
@@ -340,6 +413,42 @@ const DESIGN_KNOWLEDGE_CARD_QUERIES: &[&str] = &[
     "card surface elevation shadow tonal container accent tint hover variant visual hierarchy",
     "card surface contrast tonal hierarchy border inset highlight card variants",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesignKnowledgeScope {
+    Focused,
+    Full,
+}
+
+impl DesignKnowledgeScope {
+    fn max_hits(self) -> usize {
+        match self {
+            Self::Focused => 2,
+            Self::Full => DESIGN_KNOWLEDGE_MAX_HITS,
+        }
+    }
+
+    fn total_chars(self) -> usize {
+        match self {
+            Self::Focused => 2_800,
+            Self::Full => 8_000,
+        }
+    }
+
+    fn primary_chars(self) -> usize {
+        match self {
+            Self::Focused => 2_200,
+            Self::Full => 4_200,
+        }
+    }
+
+    fn secondary_chars(self) -> usize {
+        match self {
+            Self::Focused => 800,
+            Self::Full => 1_200,
+        }
+    }
+}
 
 /// One concrete, category-appropriate color contract selected before the model starts designing.
 /// These are compact Tailwind-name translations of the curated michael-design palette library and
@@ -750,6 +859,89 @@ fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> boo
         })
 }
 
+/// Only an explicit continuation may inherit specialization from older turns. A substantive new
+/// request starts a new routing decision even when the previous task happened to need a large
+/// module such as research. This keeps follow-up turns useful without making task routing sticky
+/// for the rest of the conversation.
+fn explicitly_continues_previous_request(q: &str) -> bool {
+    let normalized = q
+        .trim()
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：'
+                )
+        })
+        .to_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "继续"
+            | "继续做"
+            | "继续处理"
+            | "继续完成"
+            | "继续修"
+            | "继续修改"
+            | "继续优化"
+            | "继续检查"
+            | "接着"
+            | "接着做"
+            | "接着处理"
+            | "往下做"
+            | "往下继续"
+            | "按刚才的继续"
+            | "照刚才的继续"
+            | "重试"
+            | "再试一次"
+            | "continue"
+            | "continue working"
+            | "keep going"
+            | "go on"
+            | "proceed"
+            | "resume"
+            | "retry"
+            | "try again"
+    ) {
+        return true;
+    }
+    [
+        "继续",
+        "接着",
+        "往下做",
+        "往下继续",
+        "按刚才的继续",
+        "照刚才的继续",
+        "continue",
+        "continue working",
+        "keep going",
+        "go on",
+        "proceed",
+        "resume",
+        "retry",
+        "try again",
+    ]
+    .iter()
+    .any(|prefix| {
+        normalized.strip_prefix(prefix).is_some_and(|tail| {
+            tail.chars().next().is_some_and(|c| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：'
+                    )
+            })
+        })
+    })
+}
+
+fn current_or_continuation_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> bool {
+    let Some(current) = latest_user_request(body) else {
+        return false;
+    };
+    pred(&current)
+        || (explicitly_continues_previous_request(&current) && recent_user_text_any(body, pred))
+}
+
 /// Behavior-based UI intent: if the conversation is already PRODUCING frontend artifacts
 /// (component files, tailwind/vite wiring), it IS a UI task no matter how the user phrased
 /// the request — keyword gates alone let "非关键词建站" slip through and ship unstyled junk.
@@ -924,6 +1116,45 @@ fn latest_user_request(body: &serde_json::Value) -> Option<String> {
         }
     }
     latest_plain
+}
+
+/// Put request-specific runtime context immediately before the latest real user content. Keeping
+/// it out of the system message preserves the byte-stable Prompt Graph prefix across turns.
+fn prepend_runtime_context_to_latest_user(
+    body: &mut serde_json::Value,
+    runtime_context: &str,
+) -> bool {
+    let context = runtime_context.trim();
+    if context.is_empty() {
+        return false;
+    }
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+    else {
+        return false;
+    };
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    match content {
+        serde_json::Value::String(text) => {
+            *text = format!("{context}\n\n{text}");
+            true
+        }
+        serde_json::Value::Array(parts) => {
+            parts.insert(0, serde_json::json!({ "type": "text", "text": context }));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A location statement supplies conversation context; it is not permission to geocode, browse,
@@ -1581,7 +1812,10 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
 /// The block should steer the model toward the library without flooding the prompt: it provides
 /// a primary blueprint plus diverse candidates, then tells the agent to use knowledge_search for
 /// section-specific follow-up retrieval.
-fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
+fn design_knowledge_block(
+    user_request: Option<&str>,
+    scope: DesignKnowledgeScope,
+) -> Option<String> {
     let request = user_request?.trim();
     if request.is_empty() {
         return None;
@@ -1603,16 +1837,16 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
         .join(", ");
     tracing::info!(hits = %hit_summary, "michael-design blueprint hits");
 
-    let mut sections = Vec::with_capacity(hits.len());
-    let mut remaining = DESIGN_KNOWLEDGE_TOTAL_CHARS;
-    for (index, hit) in hits.iter().enumerate() {
-        if remaining < 800 {
+    let mut sections = Vec::with_capacity(scope.max_hits());
+    let mut remaining = scope.total_chars();
+    for (index, hit) in hits.iter().take(scope.max_hits()).enumerate() {
+        if remaining < 500 {
             break;
         }
         let cap = if index == 0 {
-            remaining.min(6200)
+            remaining.min(scope.primary_chars())
         } else {
-            remaining.min(1800)
+            remaining.min(scope.secondary_chars())
         };
         let text = bounded_chars(&hit.text, cap);
         remaining = remaining.saturating_sub(text.chars().count());
@@ -1633,15 +1867,19 @@ fn design_knowledge_block(user_request: Option<&str>) -> Option<String> {
         ));
     }
 
+    let scope_instruction = match scope {
+        DesignKnowledgeScope::Focused => {
+            "这是聚焦 UI 修改/评审包：只把主蓝本和一个最相关候选用于当前组件或页面，不得借机扩大重做范围。缺少特定区块证据时再按名调用 knowledge_search，命中后立即综合。"
+        }
+        DesignKnowledgeScope::Full => {
+            "这是完整页面/整站包：先用主蓝本确定视觉密度、布局骨架与品牌气质，再用候选补齐区块。写代码前列出采用的 michael-design 来源，并最多补做一次 knowledge_search(domain=\"michael-design\") 查缺失区块；命中后立即综合，不无限检索。"
+        }
+    };
+
     Some(format!(
-        "--- michael-design 设计蓝本（按用户请求自动检索，精炼注入）---\n\
-         这是 421 条 michael-design 成品级网站/应用/区块 prompt 的工作入口，是本次 UI 的主要设计证据：先用“主蓝本”确定视觉密度、布局骨架、导航/hero 构图、字体/间距/动效水准，候选蓝本补充区块和气质。**怎么设计（配色决策链/布局构图/动效编排/组件覆盖/内容密度/工程/验证）全部按已注入的「michael-design 设计体系」块执行，本块不重复，只列本次必须从命中蓝本里产出什么的运行时证据要求：**\n\
-         1. 写代码前必须在思考里列出“已采用的 michael-design 来源”：主蓝本、候选蓝本、还要补检索的区块关键词；没有这一步不能开始写 UI。完整页面/重设计必须先 `knowledge_search(domain=\"michael-design\")` 补齐缺失区块，命中后马上综合，不许无限搜。\n\
-         2. **产品名是生造词/随便起的（Zorvex/sora2 这类）时，先从功能描述推断业务品类（聊天→chat/SaaS、卖货→电商、发布内容→社区/媒体），检索用品类词，绝不拿生造名当 query**；query 同时带当前品类与 `palette harmony color scale`、`card count balanced last row`、`Asset Preview gif mp4 media`、`GSAP ScrollTrigger useScroll motion choreography responsive fallback`。\n\
-         3. 必须提取并使用蓝本里的真实媒体 URL（`Asset:`/`Preview:`/`Video URL:`/`<video>`/`<img>`/`backgroundImage`/`.mp4/.gif/.webp/.m3u8`/`visuals-by-id`）：至少 3 个可加载素材、重要区块至少一个视频或 GIF；`.m3u8` 接 hls.js 或换同蓝本更稳的 `.mp4/.gif/.webp`；坏资源立刻换，不用灰盒占位。\n\
-         4. 编码前明确数据库决策：`不需要 / localStorage或IndexedDB / 服务端数据库` 并说明业务理由；持久业务（账户/同步/后台/订单/预约/评论/收藏）必须设计真实 API/schema/权限/迁移/加载空错状态，不能只画静态假界面。\n\
-         5. 配色必须实际采用品类匹配命中的色值并**全部折算成 Tailwind 族+档**（Hex/OKLCH 先折算，如 #17130d→stone-950），写清“来源 section → Tailwind 族+档 → semantic role”，源码实际使用至少 2 个；**叙述/计划/业务代码禁止裸 hex**（hex 只留在 tokens 定义文件）。跨品类命中只借结构/动效，绝不借配色。\n\
-         6. 浏览器验证有上限：首次交付前只做一次完整 desktop/mobile 矩阵，修补后只对改动点最多一次针对性复验，证据覆盖后必须停止，不许为“再看看”重复 browser/screenshot。\n\n{}\n\n{}",
+        "--- michael-design 设计蓝本（421 条成品级 UI 知识按需检索）---\n\
+         {scope_instruction}\n\
+         产品名是生造词时先从功能描述推断品类，用品类词检索，绝不拿生造名当 query。配色只采用同品类来源并折算为 Tailwind 族+档与 semantic role；跨品类命中只能借结构、组件和动效。具体组件、媒体、数据、动效、工程与验证要求由本轮已加载的独立模块负责，本块不重复。\n\n{}\n\n{}",
         design_color_direction_block(color_direction),
         sections.join("\n\n———\n\n")
     ))
@@ -2312,7 +2550,47 @@ fn looks_like_ui_task(q: &str) -> bool {
         || ui_quality_complaint
 }
 
+fn explicitly_asks_for_research(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "research",
+        "look up",
+        "search for",
+        "find sources",
+        "find evidence",
+        "latest",
+        "current price",
+        "current version",
+        "state of the art",
+        "compare current",
+        "调研",
+        "研究",
+        "帮我查",
+        "查一下",
+        "查找",
+        "搜索",
+        "找资料",
+        "找证据",
+        "最新",
+        "现在价格",
+        "当前价格",
+        "当前版本",
+        "现状",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 fn looks_like_research_task(q: &str) -> bool {
+    // Product-category nouns describe what a UI is for; they are not automatically a request for
+    // current facts. Without this gate, "做一个金融/医疗/餐厅网站" paid the entire research prompt
+    // tax even though the user only asked for implementation.
+    if looks_like_ui_task(q)
+        && looks_like_ui_implementation_task(q)
+        && !explicitly_asks_for_research(q)
+    {
+        return false;
+    }
     let lower = q.to_lowercase();
     const ASCII: &[&str] = &[
         "research",
@@ -2592,39 +2870,225 @@ fn looks_like_desktop_automation_task(q: &str) -> bool {
     ASCII.iter().any(|term| lower.contains(term)) || CJK.iter().any(|term| q.contains(term))
 }
 
-/// Keep the proven full prompt as the source of truth, but assemble only its stable engineering
-/// core. Research, automation, and UI use compact shared blocks
-/// assembled below for every model tier. Their legacy monolithic chapters are deliberately omitted.
-fn routed_full_agent_prompt(full: &str) -> (String, Vec<&'static str>) {
-    let Some(domain_start) = full.find("\n# 九、") else {
-        return (full.to_string(), vec!["agent_full_fallback"]);
-    };
-    let Some(automation_start_rel) = full[domain_start..].find("\n# 十、") else {
-        return (full.to_string(), vec!["agent_full_fallback"]);
-    };
-    let automation_start = domain_start + automation_start_rel;
-    let Some(ui_start_rel) = full[automation_start..].find("\n# 十一、") else {
-        return (full.to_string(), vec!["agent_full_fallback"]);
-    };
-    let ui_start = automation_start + ui_start_rel;
-    let Some(tail_start_rel) = full[ui_start..].find("\n# 十二、") else {
-        return (full.to_string(), vec!["agent_full_fallback"]);
-    };
-    let tail_start = ui_start + tail_start_rel;
-
-    let mut out = String::with_capacity(full.len());
-    let blocks = vec!["agent_core"];
-    out.push_str(&full[..domain_start]);
-    out.push_str(&full[tail_start..]);
-    (out, blocks)
+fn looks_like_git_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "git ",
+        "github",
+        "pull request",
+        "merge request",
+        "commit",
+        "push",
+        "rebase",
+        "cherry-pick",
+        "branch",
+        "stash",
+        "提交",
+        "推送",
+        "分支",
+        "合并请求",
+        "拉取请求",
+        "变基",
+        "暂存",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
 }
 
-fn routed_agent_core(prompt_name: &str, loaded: &str) -> (String, Vec<&'static str>) {
-    match prompt_name {
-        "agent" => routed_full_agent_prompt(loaded),
-        "agent_lite" => (loaded.to_string(), vec!["agent_lite_core"]),
-        _ => (loaded.to_string(), vec!["agent_full_fallback"]),
-    }
+fn looks_like_ui_implementation_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "build",
+        "create",
+        "implement",
+        "make a",
+        "redesign",
+        "restyle",
+        "fix the ui",
+        "add a page",
+        "add a component",
+        "code the",
+        "做一个",
+        "做个",
+        "制作",
+        "设计一个",
+        "设计一家",
+        "创建",
+        "实现",
+        "搭建",
+        "开发",
+        "重做",
+        "重设计",
+        "改界面",
+        "改页面",
+        "改样式",
+        "美化",
+        "修界面",
+        "修页面",
+        "加页面",
+        "加组件",
+        "写页面",
+        "写组件",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn looks_like_ui_review_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "review the ui",
+        "review the design",
+        "design review",
+        "ui audit",
+        "ux audit",
+        "critique",
+        "evaluate the design",
+        "what looks wrong",
+        "审查界面",
+        "审查设计",
+        "评审界面",
+        "评审设计",
+        "设计审计",
+        "分析界面",
+        "评价界面",
+        "哪里不好看",
+        "哪里丑",
+        "有什么建议",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn looks_like_motion_design_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    [
+        "animation",
+        "animated",
+        "motion",
+        "scrolltrigger",
+        "parallax",
+        "scroll story",
+        "scroll-driven",
+        "three.js",
+        "threejs",
+        "webgl",
+        "3d website",
+        "immersive",
+        "动效",
+        "动画",
+        "滚动叙事",
+        "视差",
+        "沉浸式",
+        "三维网站",
+        "3d网站",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn looks_like_full_ui_build(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    looks_like_ui_implementation_task(q)
+        && [
+            "website",
+            "web app",
+            "landing page",
+            "homepage",
+            "dashboard",
+            "full site",
+            "entire site",
+            "整站",
+            "网站",
+            "官网",
+            "落地页",
+            "首页",
+            "仪表盘",
+            "完整页面",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn looks_like_new_ui_scaffold_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    looks_like_full_ui_build(q)
+        || [
+            "from scratch",
+            "new project",
+            "scaffold",
+            "start a new",
+            "从零",
+            "新项目",
+            "新建项目",
+            "搭脚手架",
+            "初始化前端",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn looks_like_ui_content_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    looks_like_full_ui_build(q)
+        || [
+            "content",
+            "copywriting",
+            "media",
+            "image",
+            "photo",
+            "video",
+            "avatar",
+            "gallery",
+            "hero",
+            "文案",
+            "内容",
+            "素材",
+            "图片",
+            "照片",
+            "视频",
+            "头像",
+            "画廊",
+            "作品集",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn looks_like_ui_data_task(q: &str) -> bool {
+    let lower = q.to_lowercase();
+    looks_like_full_ui_build(q)
+        || [
+            "database",
+            "api",
+            "account",
+            "login",
+            "dashboard",
+            "checkout",
+            "order",
+            "booking",
+            "reservation",
+            "comment",
+            "favorite",
+            "inventory",
+            "payment",
+            "数据库",
+            "接口",
+            "账户",
+            "登录",
+            "仪表盘",
+            "后台",
+            "订单",
+            "预约",
+            "预订",
+            "评论",
+            "收藏",
+            "库存",
+            "支付",
+            "表单提交",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
 }
 
 /// Server-side assembly (L0 — "airtight"): if the IDE asks for it via headers, inject the
@@ -2636,14 +3100,14 @@ fn routed_agent_core(prompt_name: &str, loaded: &str) -> (String, Vec<&'static s
 ///   x-ide-mode:  agent | chat | plan | explorer | reviewer  → prepend that mode's system prompt
 ///   x-ide-ui:    (present) → also append the UI flow + guide
 ///   x-ide-tools: comma-separated tool names → inject those tools' schemas from tools.json
-pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
+pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Result<(), String> {
     let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
     let mode = match hdr("x-ide-mode") {
         Some(m) if !m.is_empty() => m,
-        _ => return, // not opted in → leave the request exactly as the client sent it
+        _ => return Ok(()), // not opted in → leave the request exactly as the client sent it
     };
     if !body.is_object() {
-        return;
+        return Ok(());
     }
     let requested_tool_count = hdr("x-ide-tools")
         .map(|names| {
@@ -2655,24 +3119,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 .len()
         })
         .unwrap_or(0);
-    let mut prompt_blocks: Vec<&str> = Vec::new();
-    // 1) prepend the execution prompt (mode + optional UI guides) as messages[0].
-    // User-growth coaching is injected separately and scoped to final replies so it does
-    // not compete with tool selection, autonomy, or verification rules during execution.
-    // Every model gets the compact production contract by default; the full legacy prompt remains
-    // available through MICHAEL_LITE_PROMPT=0 for an immediate operational rollback.
-    // Compute the routing flag in its own scope so the `&str` model borrow of `body` is released
-    // before we mutate `body.messages` below. Falls back to the full `agent` prompt if `agent_lite`
-    // is missing, so a partial deploy can't leave a weak model prompt-less.
-    let use_compact_agent = {
-        let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
-        mode == "agent" && use_lite_agent_prompt(model)
-    };
-    let prompt_name: &str = if use_compact_agent {
-        "agent_lite"
-    } else {
-        mode
-    };
+    let mut prompt_blocks: Vec<String> = Vec::new();
+    // Prompt Graph is the only production source. A missing graph/module is a deploy error and
+    // must fail the request instead of silently restoring a stale monolithic prompt.
     // Snapshot the person's real request before mutating messages. The IDE wraps it in a large
     // dynamic project preamble; retrieval must not search that entire blob.
     let user_request = latest_user_request(body);
@@ -2685,8 +3134,11 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         body.as_object_mut().map(|object| object.remove("tools"));
     }
     if context_only {
-        let mut sys = user_local_time_block_at(headers, chrono::Utc::now());
-        sys.push_str("\n\n你是 Michael IDE 助手。用户这句话只是在提供位置上下文，没有提出查询或执行请求。简短确认已理解；不要扩展成附近搜索、地理编码、联网查询、工具查找、文件操作或其他任务。不要声称已经永久记住；只说明可在当前对话中作为后续问题的上下文。");
+        let sys = "你是 Michael IDE 助手。用户这句话只是在提供位置上下文，没有提出查询或执行请求。简短确认已理解；不要扩展成附近搜索、地理编码、联网查询、工具查找、文件操作或其他任务。不要声称已经永久记住；只说明可在当前对话中作为后续问题的上下文。".to_string();
+        prepend_runtime_context_to_latest_user(
+            body,
+            &user_local_time_block_at(headers, chrono::Utc::now()),
+        );
         let prompt_bytes = sys.len();
         if let Some(msgs) = body
             .get_mut("messages")
@@ -2720,97 +3172,113 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
             tool_schema_bytes: 0,
             request_json_bytes,
         });
-        return;
+        return Ok(());
     }
-    let loaded_prompt = read_prompt(prompt_name)
-        .or_else(|_| {
-            if prompt_name != mode {
-                read_prompt(mode)
-            } else {
-                Err(String::new())
-            }
-        })
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                mode,
-                prompt_name,
-                "failed to load mode prompt, degrading to empty"
-            );
-            String::new()
-        });
-    let (mut sys, routed_blocks) = if mode == "agent" && !loaded_prompt.is_empty() {
-        routed_agent_core(prompt_name, &loaded_prompt)
+    let graph = read_prompt_graph()?;
+    let mut sys = String::new();
+    if mode == "agent" {
+        append_prompt_modules(&graph.agent.base, &mut sys, &mut prompt_blocks)?;
     } else {
-        (loaded_prompt, vec![prompt_name])
-    };
-    if !sys.is_empty() {
-        prompt_blocks.extend(routed_blocks);
+        let modules = graph
+            .modes
+            .get(mode)
+            .ok_or_else(|| format!("unsupported IDE prompt mode: {mode}"))?;
+        append_prompt_modules(modules, &mut sys, &mut prompt_blocks)?;
     }
-    // One shared evidence policy covers every IDE mode. Keeping it separate from
-    // tone/personality prompts prevents model-specific style tuning from turning
-    // guesses or partial integrations into confident product claims.
-    let truthfulness = read_prompt("truthfulness").unwrap_or_default();
-    if !truthfulness.is_empty() {
-        prompt_blocks.push("truthfulness");
-        sys.push_str("\n\n");
-        sys.push_str(&truthfulness);
-    }
-    let answer_quality = read_prompt("answer_quality").unwrap_or_default();
-    if !answer_quality.is_empty() {
-        prompt_blocks.push("answer_quality");
-        sys.push_str("\n\n");
-        sys.push_str(&answer_quality);
-    }
-    // Specialized modules are intent-gated. Loading research, automation, and UI
-    // instructions for every request biases ordinary questions toward unrelated tools.
-    let research_intent = mode == "agent"
-        && user_request
-            .as_deref()
-            .is_some_and(looks_like_research_task);
-    if research_intent {
-        let research = read_prompt("agent_research").unwrap_or_default();
-        if !research.is_empty() {
-            prompt_blocks.push("agent_research");
-            sys.push_str("\n\n");
-            sys.push_str(&research);
-        }
-    }
+
+    // A substantive new request is classified on its own. Only an explicit continuation such as
+    // "继续" inherits specialization from the bounded history; otherwise an old research/UI/Git
+    // task would keep taxing and steering every later request in the same conversation.
+    let engineering_intent = mode == "agent"
+        && (current_or_continuation_user_text_any(body, looks_like_coding_task)
+            || current_or_continuation_user_text_any(body, looks_like_engineering_diagnostic)
+            || conversation_shows_frontend_work(body));
+    let research_intent =
+        mode == "agent" && current_or_continuation_user_text_any(body, looks_like_research_task);
     let automation_intent = mode == "agent"
-        && user_request
-            .as_deref()
-            .is_some_and(looks_like_desktop_automation_task);
-    if automation_intent {
-        let automation = read_prompt("agent_automation").unwrap_or_default();
-        if !automation.is_empty() {
-            prompt_blocks.push("agent_automation");
-            sys.push_str("\n\n");
-            sys.push_str(&automation);
+        && current_or_continuation_user_text_any(body, looks_like_desktop_automation_task);
+    let git_intent =
+        mode == "agent" && current_or_continuation_user_text_any(body, looks_like_git_task);
+
+    if mode == "agent" {
+        if engineering_intent {
+            append_prompt_modules(&graph.agent.engineering, &mut sys, &mut prompt_blocks)?;
+        }
+        if research_intent {
+            append_prompt_modules(&graph.agent.research, &mut sys, &mut prompt_blocks)?;
+        }
+        if automation_intent {
+            append_prompt_modules(&graph.agent.automation, &mut sys, &mut prompt_blocks)?;
+        }
+        if git_intent {
+            append_prompt_modules(&graph.agent.git, &mut sys, &mut prompt_blocks)?;
         }
     }
+
     let ui_env = std::env::var("MICHAEL_UI_GUIDE").ok();
     // UI 设计体系（shadcn/ui + Tailwind 调色板 + 令牌契约）是重块，只在这轮真的在做界面/
     // 前端/视觉时注入。此前它对 agent/plan 无条件常驻，导致修 Rust 后端、跑命令、改算法的
     // 任务也被整套前端设计宪法污染，既跑偏又白烧上下文，还让非 UI 请求的系统前缀不稳定。
     // 判定用 looks_like_ui_task，并做会话粘性扫描（续跑轮"继续"不含关键词也不丢）。
     // x-ide-ui 头或 MICHAEL_UI_GUIDE=always 仍可强制开启；MICHAEL_UI_GUIDE=0 是运维总开关。
+    let explicit_design_work = mode == "plan"
+        || conversation_shows_frontend_work(body)
+        || current_or_continuation_user_text_any(body, looks_like_ui_implementation_task)
+        || current_or_continuation_user_text_any(body, looks_like_ui_review_task)
+        || current_or_continuation_user_text_any(body, looks_like_motion_design_task);
     let ui_intent = ui_env.as_deref() != Some("0")
         && (hdr("x-ide-ui").is_some()
             || ui_env.as_deref() == Some("always")
             || ((mode == "agent" || mode == "plan")
                 && (user_request.as_deref().is_some_and(looks_like_ui_task)
-                    || recent_user_text_any(body, looks_like_ui_task)
+                    || current_or_continuation_user_text_any(body, looks_like_ui_task)
                     // 行为信号：对话已经在写前端文件 = UI 任务，不管用户怎么措辞。
                     // 一旦触发即对本会话粘性生效，非关键词建站不再漏注设计体系。
-                    || conversation_shows_frontend_work(body))));
+                    || conversation_shows_frontend_work(body))
+                // "打开网站登录/填表"是自动化，不是让模型设计网站。以前只因含“网站”二字
+                // 就注入 30KB+ 设计上下文，是生产日志里最大的可避免误路由。
+                && (!automation_intent || explicit_design_work)));
     if ui_intent {
-        // 设计规则单一真源：配色/布局/动效/组件/内容/验证全部收敛在 design_system.txt，
-        // 取代此前 ui_design_flow/shadcn_design_system/css_concrete_tokens/ui_design_guide 四个
-        // 互相重复的文件。所有模型档位（含弱模型）注入同一份，消除多处漂移打架。
-        let design_system = read_prompt("design_system").unwrap_or_default();
-        if !design_system.is_empty() {
-            prompt_blocks.push("design_system");
-            sys.push_str("\n\n");
-            sys.push_str(&design_system);
+        let frontend_work = conversation_shows_frontend_work(body);
+        let design_review_intent =
+            current_or_continuation_user_text_any(body, looks_like_ui_review_task);
+        let design_implementation_intent = mode == "plan"
+            || frontend_work
+            || current_or_continuation_user_text_any(body, looks_like_ui_implementation_task)
+            || !design_review_intent;
+        let design_full_build_intent =
+            current_or_continuation_user_text_any(body, looks_like_full_ui_build);
+        let design_scaffold_intent =
+            current_or_continuation_user_text_any(body, looks_like_new_ui_scaffold_task);
+        let design_content_intent =
+            current_or_continuation_user_text_any(body, looks_like_ui_content_task);
+        let design_data_intent =
+            current_or_continuation_user_text_any(body, looks_like_ui_data_task);
+        let design_motion_intent =
+            current_or_continuation_user_text_any(body, looks_like_motion_design_task)
+                || design_full_build_intent;
+
+        append_prompt_modules(&graph.design.base, &mut sys, &mut prompt_blocks)?;
+        if design_implementation_intent {
+            append_prompt_modules(&graph.design.implementation, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_scaffold_intent {
+            append_prompt_modules(&graph.design.scaffold, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_content_intent {
+            append_prompt_modules(&graph.design.content, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_data_intent {
+            append_prompt_modules(&graph.design.data, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_review_intent {
+            append_prompt_modules(&graph.design.review, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_motion_intent {
+            append_prompt_modules(&graph.design.motion, &mut sys, &mut prompt_blocks)?;
+        }
+        if design_implementation_intent {
+            append_prompt_modules(&graph.design.verification, &mut sys, &mut prompt_blocks)?;
         }
         // UI work gets a compact michael-design entry point. The full library remains available
         // through knowledge_search; injecting a few concise blueprints avoids 100KB+ prompt bloat
@@ -2823,10 +3291,15 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
                 .or_else(|| earliest_user_request_matching(body, |t| !t.trim().is_empty()))
                 .or_else(|| user_request.clone().filter(|q| !q.trim().is_empty()))
                 .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
-            if let Some(block) = design_knowledge_block(design_query.as_deref()) {
+            let knowledge_scope = if design_full_build_intent {
+                DesignKnowledgeScope::Full
+            } else {
+                DesignKnowledgeScope::Focused
+            };
+            if let Some(block) = design_knowledge_block(design_query.as_deref(), knowledge_scope) {
                 sys.push_str("\n\n");
                 sys.push_str(&block);
-                prompt_blocks.push("design_knowledge");
+                prompt_blocks.push("design_knowledge".to_string());
                 tracing::info!(mode, "auto-injecting compact michael-design blueprint");
             }
         }
@@ -2835,34 +3308,18 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     // 运行中 steering（"换个思路"）都不含工程关键词，只看最后一句会让检查点在最需要深思的
     // 迭代调试轮集体消失（用户实测"推理时好时坏"的来源之一）。改为有界扫描最近 20 条
     // user 消息，任一条命中工程信号即视为工程会话——纯闲聊历史没有关键词，原测试语义不变。
-    let needs_reasoning_checkpoint = mode == "agent"
-        && (user_request.as_deref().is_some_and(|request| {
-            looks_like_coding_task(request) || looks_like_engineering_diagnostic(request)
-        }) || body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|msgs| {
-                msgs.iter()
-                    .rev()
-                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                    .take(20)
-                    .filter_map(user_message_text)
-                    .any(|text| {
-                        let bounded: String = text.chars().take(2000).collect();
-                        looks_like_coding_task(&bounded)
-                            || looks_like_engineering_diagnostic(&bounded)
-                    })
-            }));
-    if needs_reasoning_checkpoint {
-        prompt_blocks.push("reasoning_checkpoint");
+    if engineering_intent {
+        prompt_blocks.push("reasoning_checkpoint".to_string());
         sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 真实目标和成功终态是什么？② 输入/输出/状态变化/错误路径/调用方这些契约清了吗？③ 这一步要拿到或改变什么证据？④ 哪些边界、并发、空值、权限或版本差异会炸？⑤ 写入前每行代码是否都有来源、有用途、能编译、能被验证？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
     }
-    if let Some(growth) = hdr("x-ide-growth").map(str::trim).filter(|g| !g.is_empty()) {
-        prompt_blocks.push("growth_final_only");
-        sys.push_str(&format!(
-            "\n\n--- 因人而教（只作用于最终收尾总结）---\n{growth}\n\n执行任务、选择工具、修改代码、验证结果时忽略本段；只在最终回复里用它调整解释深度。"
-        ));
-    }
+    let growth_context = hdr("x-ide-growth")
+        .map(str::trim)
+        .filter(|growth| !growth.is_empty())
+        .map(|growth| {
+            format!(
+                "--- 因人而教（只作用于最终收尾总结）---\n{growth}\n\n执行任务、选择工具、修改代码、验证结果时忽略本段；只在最终回复里用它调整解释深度。"
+            )
+        });
     // Model-independent engineering retrieval. Every agent model gets the same bounded
     // reference block for a concrete coding task; prompt tier only changes presentation density.
     // Env MICHAEL_AUTO_KNOWLEDGE=0 remains an operational kill switch.
@@ -2877,20 +3334,17 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         if let Some(block) = auto_knowledge_block(mode, knowledge_query.as_deref()) {
             sys.push_str("\n\n");
             sys.push_str(&block);
-            prompt_blocks.push("auto_knowledge");
+            prompt_blocks.push("auto_knowledge".to_string());
             tracing::info!(mode, "auto-injecting bounded engineering knowledge");
         }
     }
-    // Parse the browser-provided IANA zone with chrono-tz and let its rules perform
-    // the DST-aware conversion. The browser offset is only a same-instant consistency
-    // check; invalid, stale, or mismatched context falls back to UTC.
-    if !sys.is_empty() {
-        sys = format!(
-            "{}\n\n{}",
-            user_local_time_block_at(headers, chrono::Utc::now()),
-            sys
-        );
+    // Runtime date and adaptive coaching change independently of the Prompt Graph. Put them in
+    // the latest user turn so the system prefix remains byte-stable and cacheable.
+    let mut runtime_context = vec![user_local_time_block_at(headers, chrono::Utc::now())];
+    if let Some(growth) = growth_context {
+        runtime_context.push(growth);
     }
+    prepend_runtime_context_to_latest_user(body, &runtime_context.join("\n\n"));
     let prompt_bytes = sys.len();
     // 推理检查点只以系统消息形式出现一次（见上，属于稳定前缀）。此前还会把一行检查点
     // 追加到最后一条 user 消息末尾——每轮都改写 user 正文，破坏消息哈希与上游 prompt
@@ -2982,7 +3436,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
     record_agent_trace(AgentTraceInput {
         mode: mode.to_string(),
         context_only,
-        prompt_blocks: prompt_blocks.into_iter().map(str::to_string).collect(),
+        prompt_blocks,
         requested_tool_count,
         injected_tool_count: final_tool_count,
         missing_tool_count: requested_tool_count.saturating_sub(final_tool_count),
@@ -2991,13 +3445,14 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
         tool_schema_bytes,
         request_json_bytes,
     });
+    Ok(())
 }
 
 /// Static prompt blobs migrated out of the client. Order is fixed so the version
 /// hash is stable for identical content.
 const PROMPT_NAMES: &[&str] = &[
-    "agent",
-    "agent_lite",
+    "agent_core",
+    "agent_engineering",
     "agent_research",
     "agent_automation",
     "truthfulness",
@@ -3006,7 +3461,15 @@ const PROMPT_NAMES: &[&str] = &[
     "plan",
     "explorer",
     "reviewer",
-    "design_system",
+    "design_core",
+    "design_implementation",
+    "design_components",
+    "design_scaffold",
+    "design_content",
+    "design_data",
+    "design_engineering",
+    "design_motion",
+    "design_verification",
     // tail (subagent task/system prompts, git guide, small inline utility prompts)
     "subagent_system",
     "worker_system",
@@ -3049,6 +3512,14 @@ pub async fn ide_prompts(
             map.insert((*name).to_string(), serde_json::Value::String(text));
         }
     }
+    let graph_text = read_prompt_graph_file().unwrap_or_default();
+    graph_text.hash(&mut hasher);
+    if full {
+        map.insert(
+            "prompt_graph".to_string(),
+            serde_json::Value::String(graph_text),
+        );
+    }
     let version = format!("{:x}", hasher.finish());
     // Admin also gets the tool schemas (the ~37KB of tool + parameter descriptions) so the
     // library stays inspectable/debuggable without shelling into the server. Falls back to
@@ -3069,6 +3540,10 @@ pub async fn ide_prompts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
+        super::assemble_into(headers, body).expect("prompt graph assembly should succeed");
+    }
 
     fn test_tool(name: &str, description: &str) -> serde_json::Value {
         serde_json::json!({
@@ -3092,8 +3567,8 @@ mod tests {
     #[test]
     fn bundled_prompts_are_not_empty() {
         for name in [
-            "agent",
-            "agent_lite",
+            "agent_core",
+            "agent_engineering",
             "agent_research",
             "agent_automation",
             "truthfulness",
@@ -3102,11 +3577,93 @@ mod tests {
             "plan",
             "explorer",
             "reviewer",
+            "design_core",
+            "design_implementation",
+            "design_components",
+            "design_scaffold",
+            "design_content",
+            "design_data",
+            "design_engineering",
+            "design_motion",
+            "design_verification",
         ] {
             let result = read_prompt(name);
             assert!(result.is_ok(), "prompt {name} should load successfully");
             assert!(!result.unwrap().trim().is_empty(), "prompt {name} is empty");
         }
+    }
+
+    #[test]
+    fn prompt_graph_is_valid_and_every_module_is_versioned() {
+        let graph = read_prompt_graph().expect("prompt graph should load");
+        assert_eq!(graph.version, 2);
+        for mode in ["chat", "plan", "explorer", "reviewer"] {
+            assert!(
+                graph
+                    .modes
+                    .get(mode)
+                    .is_some_and(|modules| !modules.is_empty()),
+                "production mode is missing from prompt graph: {mode}"
+            );
+        }
+        let mut groups = vec![
+            &graph.agent.base,
+            &graph.agent.engineering,
+            &graph.agent.research,
+            &graph.agent.automation,
+            &graph.agent.git,
+            &graph.design.base,
+            &graph.design.implementation,
+            &graph.design.scaffold,
+            &graph.design.content,
+            &graph.design.data,
+            &graph.design.review,
+            &graph.design.verification,
+            &graph.design.motion,
+        ];
+        groups.extend(graph.modes.values());
+        for name in groups.into_iter().flatten() {
+            assert!(
+                PROMPT_NAMES.contains(&name.as_str()),
+                "graph module is missing from version catalog: {name}"
+            );
+            let text = read_prompt(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert!(!text.trim().is_empty(), "graph module is empty: {name}");
+        }
+    }
+
+    #[test]
+    fn stable_system_prefix_ignores_time_zone_and_growth_context() {
+        let make = |timezone: &str, offset: &str, growth: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert("x-ide-timezone", timezone.parse().unwrap());
+            headers.insert("x-ide-utc-offset-minutes", offset.parse().unwrap());
+            headers.insert("x-ide-growth", growth.parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "你好"}]
+            });
+            assemble_into(&headers, &mut body);
+            body
+        };
+
+        let concise = make("America/Los_Angeles", "-420", "summarize concisely");
+        let detailed = make("Asia/Shanghai", "480", "explain in depth");
+        assert_eq!(
+            concise["messages"][0]["content"], detailed["messages"][0]["content"],
+            "dynamic per-turn context must not invalidate the stable system prefix"
+        );
+        let concise_user = concise["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let detailed_user = detailed["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(concise_user.contains("America/Los_Angeles"));
+        assert!(concise_user.contains("summarize concisely"));
+        assert!(detailed_user.contains("Asia/Shanghai"));
+        assert!(detailed_user.contains("explain in depth"));
     }
 
     #[test]
@@ -3235,6 +3792,7 @@ mod tests {
             "check_type",
             "peer_dependencies",
             "dist_tags",
+            "opening_hours",
             "node_id",
             "globals_css",
             "rust_users",
@@ -3288,7 +3846,23 @@ mod tests {
             names
         };
 
-        for prompt in ["agent", "agent_lite"] {
+        for prompt in [
+            "agent",
+            "agent_lite",
+            "agent_core",
+            "agent_engineering",
+            "agent_research",
+            "agent_automation",
+            "design_core",
+            "design_implementation",
+            "design_components",
+            "design_scaffold",
+            "design_content",
+            "design_data",
+            "design_engineering",
+            "design_motion",
+            "design_verification",
+        ] {
             let text = read_prompt(prompt).expect("agent prompt should load");
             let referenced = extract(&text);
             let phantom: Vec<&String> = referenced
@@ -4066,75 +4640,46 @@ mod tests {
     }
 
     #[test]
-    fn lite_agent_prompt_exists_and_is_tighter() {
-        let full = read_prompt("agent").expect("agent prompt should load");
-        let lite = read_prompt("agent_lite").expect("agent_lite prompt should load");
-        assert!(!lite.trim().is_empty(), "agent_lite must not be empty");
-        assert!(
-            lite.len() < full.len(),
-            "agent_lite ({}) should be tighter than the full agent prompt ({})",
-            lite.len(),
-            full.len()
-        );
-        assert!(!lite.contains("# UI 组件库栈"));
-        assert!(!lite.contains("联网研究协议"));
-        assert!(lite.contains("UI / 研究 / 自动化专项由系统按用户真实请求动态注入"));
-        assert!(lite.contains("先建契约表 + 每行可用性检查"));
-        assert!(lite.contains("输入/输出/状态变化/错误路径/调用方/依赖 API/验证命令"));
-        assert!(lite.contains("不道德审判"));
-        assert!(lite.contains("授权复现实验、防御检测、加固或风险评估"));
-        assert!(!lite.contains("不设内容禁区"));
-        let (routed_lite, lite_blocks) = routed_agent_core("agent_lite", &lite);
-        assert_eq!(routed_lite, lite);
-        assert_eq!(lite_blocks, vec!["agent_lite_core"]);
+    fn legacy_monoliths_are_not_production_prompt_modules() {
+        for legacy in ["agent", "agent_lite", "design_system"] {
+            assert!(
+                !PROMPT_NAMES.contains(&legacy),
+                "legacy prompt must not be versioned or served in production: {legacy}"
+            );
+        }
+        let graph = read_prompt_graph().expect("prompt graph should load");
+        let serialized = serde_json::to_string(&graph.modes).unwrap();
+        assert!(!serialized.contains("agent_lite"));
+        assert!(!serialized.contains("design_system"));
     }
 
     #[test]
-    fn full_agent_prompt_is_routed_by_task_without_losing_the_core() {
-        let full = read_prompt("agent").expect("full agent prompt should load");
-        assert!(full.contains("CodePen 页面候选"));
-        assert!(full.contains("Best of JS 公开数据集"));
-        assert!(full.contains("rust_users"));
-        assert!(full.contains("success/empty/rate-limited/failed/timeout"));
-        assert!(full.contains("`github_trending(query)`"));
-        assert!(full.contains("不做空洞道德审判"));
-        assert!(full.contains("授权测试/防御替代方案"));
-        assert!(full.contains("不粉饰灰色地带"));
-        assert!(full.contains("授权复现实验、防御检测、日志排查、加固方案或风险评估"));
-        assert!(!full.contains("`github_trending(language)`"));
-        assert!(!full.contains("真实可运行的 UI 组件"));
-        assert!(!full.contains("JS 生态里最好的框架"));
-        assert!(!full.contains("不设内容禁区"));
-        assert!(!full.contains("不设禁区"));
-        let (coding, coding_blocks) = routed_full_agent_prompt(&full);
-        assert!(coding.contains("# 一、最高准则"));
-        assert!(coding.contains("# 四、写代码的纪律"));
-        assert!(coding.contains("先建契约表，再写代码"));
-        assert!(coding.contains("每行可用性检查"));
-        assert!(coding.contains("导入是否真实存在且被使用"));
-        assert!(coding.contains("# 十二、纪律"));
-        assert!(!coding.contains("# 九、领域任务"));
-        assert!(!coding.contains("# 十、自动化"));
-        assert!(!coding.contains("# 十一、UI / 界面"));
-        assert_eq!(coding_blocks, vec!["agent_core"]);
-        // §十一 已瘦成路由指针（设计细则迁往 design_system.txt 单一真源），可剥离字节变少，
-        // 阈值从 35% 放宽到 25%——路由仍剥离 §九/§十/§十一 的行为不变。
-        assert!(
-            coding.len() * 4 < full.len() * 3,
-            "routine coding prompt should omit at least 25% of irrelevant bytes: {} vs {}",
-            coding.len(),
-            full.len()
+    fn agent_graph_has_a_small_stable_base_and_explicit_specializations() {
+        let graph = read_prompt_graph().expect("prompt graph should load");
+        assert_eq!(
+            graph.agent.base,
+            vec!["agent_core", "truthfulness", "answer_quality"]
         );
+        assert_eq!(graph.agent.engineering, vec!["agent_engineering"]);
+        assert_eq!(graph.agent.research, vec!["agent_research"]);
+        assert_eq!(graph.agent.automation, vec!["agent_automation"]);
+        assert_eq!(graph.agent.git, vec!["git_guide"]);
 
-        let (research, research_blocks) = routed_full_agent_prompt(&full);
-        assert!(!research.contains("# 九、领域任务"));
-        assert_eq!(research_blocks, vec!["agent_core"]);
-        assert!(!research.contains("# 十、自动化"));
+        let core = read_prompt("agent_core").unwrap();
+        assert!(core.contains("自主执行智能体"));
+        assert!(core.contains("工具按需选择"));
+        assert!(!core.contains("# michael-design 核心"));
+        assert!(!core.contains("# 按任务加载：工程实现、调试与验证"));
 
-        let (automation, automation_blocks) = routed_full_agent_prompt(&full);
-        assert!(!automation.contains("# 十、自动化"));
-        assert_eq!(automation_blocks, vec!["agent_core"]);
-        assert!(!automation.contains("# 九、领域任务"));
+        let mut sys = String::new();
+        let mut blocks = Vec::new();
+        let error = append_prompt_modules(
+            &["module_that_does_not_exist".to_string()],
+            &mut sys,
+            &mut blocks,
+        )
+        .expect_err("a missing graph module must fail closed");
+        assert!(error.contains("module_that_does_not_exist"));
     }
 
     #[test]
@@ -4298,6 +4843,54 @@ mod tests {
                 "missed technical community research: {research_request}"
             );
         }
+
+        for ui_build in [
+            "做一个金融投资与资产分析平台的网站",
+            "制作一个医疗诊所患者服务门户",
+            "设计一家精品咖啡和早午餐餐厅的网站",
+            "build a travel portfolio website with a booking form",
+        ] {
+            assert!(
+                !looks_like_research_task(ui_build),
+                "UI product category must not masquerade as research: {ui_build}"
+            );
+        }
+    }
+
+    #[test]
+    fn substantive_new_request_does_not_inherit_old_research_specialization() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "请研究 Claude Code 源码为什么回答很快"},
+                {"role": "assistant", "content": "我会先检查架构。"},
+                {"role": "user", "content": "看看我的项目内容"}
+            ]
+        });
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
+    }
+
+    #[test]
+    fn explicit_continuation_inherits_research_specialization() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "请研究 Claude Code 源码为什么回答很快"},
+                {"role": "assistant", "content": "我会先检查架构。"},
+                {"role": "user", "content": "继续"}
+            ]
+        });
+
+        assemble_into(&headers, &mut body);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
     }
 
     #[test]
@@ -4412,23 +5005,35 @@ mod tests {
         let system = browser_action["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：浏览器与桌面自动化"));
         assert!(system.contains("不要把“点击了/输入了/发起了请求”当成功"));
-        // 含"网页/网站"命中 UI 意图门控，此路径仍注入设计体系（单一真源 design_system）。
-        assert!(system.contains("michael-design 设计体系"));
+        assert!(
+            !system.contains("michael-design 核心"),
+            "logging into a website is automation, not a UI design task"
+        );
     }
 
     #[test]
-    fn shared_ui_contract_replaces_the_legacy_full_ui_chapter() {
-        let full = read_prompt("agent").unwrap();
-        let (routed, _) = routed_full_agent_prompt(&full);
-        assert!(!routed.contains("# 十一、UI / 界面"));
+    fn ui_contract_is_split_across_graph_routed_michael_design_modules() {
+        let graph = read_prompt_graph().expect("prompt graph should load");
+        assert_eq!(graph.design.base, vec!["design_core"]);
+        assert_eq!(
+            graph.design.implementation,
+            vec![
+                "design_implementation",
+                "design_components",
+                "design_engineering"
+            ]
+        );
+        assert_eq!(graph.design.verification, vec!["design_verification"]);
 
-        // 设计规则单一真源：design_system.txt 取代旧的 css_concrete_tokens/ui_design_* 四件套。
-        let contract = read_prompt("design_system").unwrap();
-        assert!(contract.contains("配色决策链"));
-        assert!(contract.contains("shadcn-vue"));
-        assert!(contract.contains("1440×900"));
-        assert!(contract.contains("390×844"));
-        assert!(contract.contains("npx shadcn@latest init"));
+        let core = read_prompt("design_core").unwrap();
+        let components = read_prompt("design_components").unwrap();
+        let verification = read_prompt("design_verification").unwrap();
+        assert!(core.contains("配色决策链"));
+        assert!(core.contains("michael-design"));
+        assert!(components.contains("Lucide"));
+        assert!(components.contains("语义类"));
+        assert!(verification.contains("1440x900"));
+        assert!(verification.contains("390x844"));
     }
 
     #[test]
@@ -4680,14 +5285,21 @@ mod tests {
         assert!(system.contains("平台知识库·与真实用户请求相关"));
         assert!(system.contains("不能证明当前 API 或社区现状"));
         assert!(system.contains("强制推理检查点"));
-        assert!(system.contains("因人而教"));
+        assert!(!system.contains("因人而教"));
+        let latest_user = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .expect("latest user message should remain present");
+        assert!(latest_user.contains("因人而教"));
         assert_eq!(
             messages
                 .iter()
                 .filter(|message| message["role"] == "system")
                 .count(),
             1,
-            "all orchestration content belongs in the leading system message"
+            "stable orchestration content belongs in one leading system message"
         );
         let assistant_index = messages
             .iter()
@@ -4966,27 +5578,22 @@ mod tests {
 
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
-        // 单一真源：design_system.txt 注入块在场（配色/布局/动效/组件/内容/验证全在这里）
-        assert!(system.contains("michael-design 设计体系"));
+        // 完整建站会把精炼职责模块组合回来；legacy design_system.txt 仍保留作语义真源。
+        assert!(system.contains("# michael-design 核心"));
         assert!(system.contains("配色决策链"));
         assert!(system.contains("卡片先数数量再定网格"));
         assert!(system.contains("业务概念 → 对象/动作/状态 → 图标名"));
         assert!(system.contains("结构像真人产品负责人推导"));
         assert!(system.contains("浏览器硬预算"));
-        // 精炼注入块：只列运行时证据要求，设计 how-to 指向 design_system 块
         assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("421 条 michael-design"));
-        assert!(system.contains("精炼注入"));
-        assert!(system.contains("已采用的 michael-design 来源"));
+        assert!(system.contains("421 条成品级 UI 知识"));
+        assert!(system.contains("完整页面/整站包"));
+        assert!(system.contains("列出采用的 michael-design 来源"));
         assert!(system.contains("knowledge_search(domain=\"michael-design\")"));
         assert!(system.contains("绝不拿生造名当 query"));
-        assert!(system.contains("至少 3 个可加载素材"));
-        assert!(system.contains("编码前明确数据库决策"));
-        assert!(system.contains("全部折算成 Tailwind 族+档"));
-        assert!(system.contains("浏览器验证有上限"));
-        assert!(system.contains("palette harmony color scale"));
-        // 注入块不再重复设计细则（这些已收敛进 design_system 块）
-        assert!(!system.contains("palette harmony color outlier"));
+        assert!(system.contains("至少落地 3 个可加载素材"));
+        assert!(system.contains("编码前明确数据策略"));
+        assert!(system.contains("Tailwind 族+档"));
 
         let start = system.find("--- michael-design 设计蓝本").unwrap();
         let tail = &system[start..];
@@ -4996,12 +5603,12 @@ mod tests {
             .unwrap_or(tail.len());
         let design_block = &tail[..end];
         assert!(
-            design_block.chars().count() <= DESIGN_KNOWLEDGE_TOTAL_CHARS + 4000,
+            design_block.chars().count() <= DesignKnowledgeScope::Full.total_chars() + 4000,
             "design block should be compact, got {} chars",
             design_block.chars().count()
         );
         assert!(
-            design_block.matches("【").count() <= DESIGN_KNOWLEDGE_MAX_HITS,
+            design_block.matches("【").count() <= DesignKnowledgeScope::Full.max_hits(),
             "design block should include a bounded number of hits"
         );
         let injected_hits_text = design_block
@@ -5109,7 +5716,11 @@ mod tests {
 
     #[test]
     fn category_color_direction_is_injected_before_blueprint_hits() {
-        let block = design_knowledge_block(Some("做一个金融投资与资产分析平台的网站")).unwrap();
+        let block = design_knowledge_block(
+            Some("做一个金融投资与资产分析平台的网站"),
+            DesignKnowledgeScope::Full,
+        )
+        .unwrap();
         let color_packet = block.find("运行时锁定配色方向").unwrap();
         let first_blueprint = block.find("【主蓝本 1").unwrap();
         assert!(
@@ -5141,18 +5752,26 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("--- michael-design 设计蓝本"));
-        assert!(system.contains("michael-design 设计体系"));
-        assert!(system.contains("palette harmony color scale"));
+        assert!(system.contains("# michael-design 核心"));
+        assert!(system.contains("完整页面/整站包"));
     }
 
     #[test]
     fn prompt_catalog_versions_every_routed_prompt_block() {
         for required in [
-            "agent",
-            "agent_lite",
+            "agent_core",
+            "agent_engineering",
             "agent_research",
             "agent_automation",
-            "design_system",
+            "design_core",
+            "design_implementation",
+            "design_components",
+            "design_scaffold",
+            "design_content",
+            "design_data",
+            "design_engineering",
+            "design_motion",
+            "design_verification",
         ] {
             assert!(
                 PROMPT_NAMES.contains(&required),
@@ -5162,7 +5781,8 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_model_gets_the_compact_contract_by_default() {
+    fn every_agent_model_gets_the_same_graph_assembled_base() {
+        let mut expected = None;
         for m in [
             "deepseek-v4-pro",
             "deepseek-chat",
@@ -5181,10 +5801,23 @@ mod tests {
             "deepseek-reasoner",
             "deepseek-r1",
         ] {
-            assert!(
-                use_lite_agent_prompt(m),
-                "{m} should use the compact prompt"
-            );
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", "agent".parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": m,
+                "messages": [{"role": "user", "content": "你好"}]
+            });
+            assemble_into(&headers, &mut body);
+            let system = body["messages"][0]["content"].as_str().unwrap().to_string();
+            assert!(system.contains("自主执行智能体"), "{m}");
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &system, expected,
+                    "model-specific legacy prompt route for {m}"
+                );
+            } else {
+                expected = Some(system);
+            }
         }
     }
 
@@ -5202,13 +5835,193 @@ mod tests {
             assert!(system.contains("自主执行智能体"), "{model}");
             assert!(system.contains("真实性与证据纪律"), "{model}");
             assert!(
-                system.len() < 20_000,
+                system.len() < 9_000,
                 "{model} ordinary system prompt is {} bytes",
                 system.len()
             );
+            assert!(!system.contains("按任务加载：工程实现、调试与验证"));
             assert!(
                 !system.contains("# 一、最高准则"),
                 "{model} unexpectedly received the legacy prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_graph_routes_design_stages_and_avoids_automation_spillover() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+
+        let mut automation = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "打开网站帮我登录，填写并提交表单"}]
+        });
+        assemble_into(&headers, &mut automation);
+        let automation_system = automation["messages"][0]["content"].as_str().unwrap();
+        assert!(automation_system.contains("按任务加载：浏览器与桌面自动化"));
+        assert!(!automation_system.contains("# michael-design 核心"));
+        assert!(
+            automation_system.len() < 15_000,
+            "automation prompt should not pay the UI tax: {} bytes",
+            automation_system.len()
+        );
+
+        let mut review = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "审查这个网站界面哪里丑，只给分析和建议，不要修改"}]
+        });
+        assemble_into(&headers, &mut review);
+        let review_system = review["messages"][0]["content"].as_str().unwrap();
+        assert!(review_system.contains("# michael-design 核心"));
+        assert!(review_system.contains("# michael-design 验证层"));
+        assert!(!review_system.contains("# michael-design 实现入口"));
+        assert!(!review_system.contains("# michael-design 内容与真实媒体层"));
+        assert!(!review_system.contains("# michael-design 动效层"));
+
+        let mut focused_change = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "把现有页面的按钮间距和 hover 样式调整好"}]
+        });
+        assemble_into(&headers, &mut focused_change);
+        let focused_system = focused_change["messages"][0]["content"].as_str().unwrap();
+        for marker in [
+            "# michael-design 核心",
+            "# michael-design 实现入口",
+            "# michael-design 组件层",
+            "# michael-design UI 工程层",
+            "# michael-design 验证层",
+        ] {
+            assert!(
+                focused_system.contains(marker),
+                "missing focused module: {marker}"
+            );
+        }
+        for omitted in [
+            "# michael-design 脚手架层",
+            "# michael-design 内容与真实媒体层",
+            "# michael-design 数据与业务状态层",
+            "# michael-design 动效层",
+        ] {
+            assert!(
+                !focused_system.contains(omitted),
+                "focused UI edit should not load: {omitted}"
+            );
+        }
+        assert!(focused_system.contains("聚焦 UI 修改/评审包"));
+        assert!(
+            focused_system.len() < 28_000,
+            "focused UI prompt should remain compact: {} bytes",
+            focused_system.len()
+        );
+
+        let mut full_build = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "帮我做一个科技感 SaaS 官网 landing page，要 hero、features、pricing 和 footer"}]
+        });
+        assemble_into(&headers, &mut full_build);
+        let build_system = full_build["messages"][0]["content"].as_str().unwrap();
+        for marker in [
+            "# michael-design 核心",
+            "# michael-design 实现入口",
+            "# michael-design 组件层",
+            "# michael-design 脚手架层",
+            "# michael-design 内容与真实媒体层",
+            "# michael-design 数据与业务状态层",
+            "# michael-design UI 工程层",
+            "# michael-design 验证层",
+            "# michael-design 动效层",
+        ] {
+            assert!(
+                build_system.contains(marker),
+                "missing routed module: {marker}"
+            );
+        }
+        assert!(build_system.contains("完整页面/整站包"));
+        assert!(
+            !build_system.contains("# 按任务加载：研究、社区与当前事实"),
+            "a product category inside a UI build must not load the research module"
+        );
+        assert!(
+            build_system.len() < 38_000,
+            "full UI prompt should remain bounded: {} bytes",
+            build_system.len()
+        );
+
+        let routed_design_bytes = [
+            "design_core",
+            "design_implementation",
+            "design_components",
+            "design_scaffold",
+            "design_content",
+            "design_data",
+            "design_engineering",
+            "design_motion",
+            "design_verification",
+        ]
+        .iter()
+        .map(|name| read_prompt(name).unwrap().len())
+        .sum::<usize>();
+        let legacy_design_bytes = read_prompt("design_system").unwrap().len();
+        assert!(
+            routed_design_bytes * 20 < legacy_design_bytes * 17,
+            "the complete split design contract should be at least 15% smaller: {routed_design_bytes} vs {legacy_design_bytes}"
+        );
+    }
+
+    #[test]
+    fn split_design_modules_preserve_the_legacy_strength_contract() {
+        let legacy = read_prompt("design_system").unwrap();
+        assert!(
+            legacy.len() > 14_000,
+            "legacy rollback source was unexpectedly changed"
+        );
+        for marker in [
+            "配色决策链",
+            "卡片先数数量再定网格",
+            "动效形成四层系统",
+            "组件覆盖",
+            "内容与真实媒体",
+            "浏览器硬预算",
+        ] {
+            assert!(
+                legacy.contains(marker),
+                "legacy design source lost: {marker}"
+            );
+        }
+
+        let runtime = [
+            "design_core",
+            "design_implementation",
+            "design_components",
+            "design_scaffold",
+            "design_content",
+            "design_data",
+            "design_engineering",
+            "design_motion",
+            "design_verification",
+        ]
+        .iter()
+        .map(|name| read_prompt(name).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+        for marker in [
+            "配色决策链",
+            "Dark Theme Execution Standard",
+            "每个 section 至多一种装饰手段",
+            "卡片先数数量再定网格",
+            "业务概念 → 对象/动作/状态 → 图标名",
+            "twMerge(clsx(...))",
+            "至少落地 3 个可加载素材",
+            "1792x1024",
+            "编码前明确数据策略",
+            "GSAP + ScrollTrigger",
+            "4.5:1",
+            "不超过 15 次 browser 调用",
+            "连续两次观察没有新增错误",
+        ] {
+            assert!(
+                runtime.contains(marker),
+                "split runtime contract lost: {marker}"
             );
         }
     }

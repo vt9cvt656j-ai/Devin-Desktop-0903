@@ -3,6 +3,7 @@ mod auth;
 mod channel_rates;
 mod codes;
 mod commission;
+mod compression;
 mod config;
 mod deploy;
 mod email;
@@ -15,6 +16,7 @@ mod procedural_3d;
 mod prompts;
 mod realtime;
 mod skills;
+mod update;
 
 use std::sync::Arc;
 
@@ -32,6 +34,7 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager, // multiplexed conn for normal commands
     pub redis_client: redis::Client,          // for pub/sub (needs its own connection)
     pub cfg: Arc<config::Config>,
+    pub update_http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -63,6 +66,11 @@ async fn main() -> anyhow::Result<()> {
         redis,
         redis_client,
         cfg: Arc::new(cfg),
+        update_http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(12))
+            .user_agent("Michael-IDE-Update-Service/1")
+            .build()?,
     };
 
     let app = Router::new()
@@ -146,6 +154,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/models", get(models::list_for_client))
         .route("/api/ide-key", get(models::ide_key))
         .route("/api/ide-prompts", get(prompts::ide_prompts))
+        .route("/api/ide/update", get(update::latest))
+        .route("/api/admin/ide-releases", get(update::admin_release_status))
+        .route(
+            "/api/admin/ide-releases/dispatch",
+            post(update::admin_dispatch_release),
+        )
+        .route(
+            "/api/admin/ide-releases/publish",
+            post(update::admin_publish_release),
+        )
+        .route(
+            "/api/admin/ide-releases/runs/:run_id/cancel",
+            post(update::admin_cancel_release_run),
+        )
         .route("/api/i18n/pack", post(models::i18n_pack))
         .route(
             "/api/models/:id/chat",

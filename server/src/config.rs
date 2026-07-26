@@ -22,6 +22,10 @@ pub struct Config {
     pub transcribe_api_key: String,
     pub transcribe_url: String,
     pub transcribe_model: String,
+    pub ide_update_manifest_url: String,
+    pub ide_release_github_token: String,
+    pub ide_release_github_repo: String,
+    pub ide_release_github_workflow: String,
 }
 
 impl Config {
@@ -49,6 +53,20 @@ impl Config {
                 "https://api.groq.com/openai/v1/audio/transcriptions",
             ),
             transcribe_model: opt("TRANSCRIBE_MODEL", "whisper-large-v3"),
+            ide_update_manifest_url: opt(
+                "IDE_UPDATE_MANIFEST_URL",
+                "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json",
+            ),
+            ide_release_github_token: std::env::var("IDE_RELEASE_GITHUB_TOKEN")
+                .unwrap_or_default(),
+            ide_release_github_repo: opt(
+                "IDE_RELEASE_GITHUB_REPO",
+                "fendoushaonian/Devin-Desktop",
+            ),
+            ide_release_github_workflow: opt(
+                "IDE_RELEASE_GITHUB_WORKFLOW",
+                "ide-package.yml",
+            ),
         })
     }
 

@@ -62,7 +62,46 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// How long a freshly upgraded socket may stay silent before we hang up on it.
+/// The feed carries every user's email plus order/grant/commission amounts, so an
+/// unauthenticated socket must never reach `stream_feed`.
+const WS_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Authenticate a WebSocket from its first frame: `{"type":"auth","token":"<jwt>"}`.
+///
+/// The browser cannot set an Authorization header on a WebSocket, and putting the
+/// token in the query string would write it into nginx's access log, so the token
+/// travels in the first message instead. Returns true only for an admin JWT.
+async fn ws_authenticate(socket: &mut WebSocket, state: &AppState) -> bool {
+    let first = match tokio::time::timeout(WS_AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        _ => return false,
+    };
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(&first) else {
+        return false;
+    };
+    if frame.get("type").and_then(|v| v.as_str()) != Some("auth") {
+        return false;
+    }
+    let Some(token) = frame.get("token").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    crate::auth::claims_from_jwt(&state.cfg, token).is_some_and(|c| c.role == "admin")
+}
+
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    if !ws_authenticate(&mut socket, &state).await {
+        let _ = socket
+            .send(Message::Text(
+                json!({ "type": "auth_error", "error": "需要管理员权限" }).to_string(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return;
+    }
+    let _ = socket
+        .send(Message::Text(json!({ "type": "auth_ok" }).to_string()))
+        .await;
     bump_online(&state, 1).await;
     let result = stream_feed(&mut socket, &state).await;
     if let Err(e) = result {

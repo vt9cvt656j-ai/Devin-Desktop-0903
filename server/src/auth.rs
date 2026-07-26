@@ -65,7 +65,25 @@ impl FromRequestParts<AppState> for Claims {
             &Validation::default(),
         )
         .map_err(|_| AppError::unauthorized("无效或已过期的令牌"))?;
-        Ok(data.claims)
+        let mut claims = data.claims;
+
+        // The token is trusted for IDENTITY but never for PRIVILEGE.
+        //
+        // All 13 admin gates test `claims.role != "admin"`, and role was whatever was
+        // baked into the JWT at login. With a 30-day TTL and no revocation that meant
+        // demoting or even deleting an admin left their existing token fully
+        // privileged for up to a month — and since the admin endpoints can re-grant
+        // the role, one surviving token could take it back permanently. Re-reading
+        // role from the row on every request makes demotion and deletion effective
+        // immediately; a missing row (deleted user) now fails closed.
+        let uid = uuid::Uuid::parse_str(&claims.sub)
+            .map_err(|_| AppError::unauthorized("令牌主体无效"))?;
+        let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&state.db)
+            .await?;
+        claims.role = role.ok_or_else(|| AppError::unauthorized("账号不存在或已注销"))?;
+        Ok(claims)
     }
 }
 
@@ -93,6 +111,20 @@ pub fn user_from_jwt(cfg: &Config, token: &str) -> Option<uuid::Uuid> {
     )
     .ok()?;
     uuid::Uuid::parse_str(&data.claims.sub).ok()
+}
+
+/// Decode and validate a login JWT into its claims. For contexts that cannot use
+/// the `Claims` extractor because there is no request to extract from — notably the
+/// WebSocket feed, where the browser cannot send an Authorization header and the
+/// token arrives in the first frame instead.
+pub fn claims_from_jwt(cfg: &Config, token: &str) -> Option<Claims> {
+    decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .ok()
+    .map(|data| data.claims)
 }
 
 /// Lightweight email format check ("合规").
@@ -147,37 +179,47 @@ async fn store_code(state: &AppState, email: &str, code: &str) -> ApiResult<()> 
     Ok(())
 }
 
+/// Increment a counter inside a **fixed** window: the key is created together with
+/// its TTL in one atomic `SET NX EX`, and later increments leave that TTL alone, so
+/// the window expires a fixed time after the first hit no matter how many follow.
+async fn bump_fixed_window(
+    conn: &mut redis::aio::ConnectionManager,
+    key: &str,
+    ttl_secs: u64,
+) -> ApiResult<i64> {
+    let _: Option<String> = redis::cmd("SET")
+        .arg(key)
+        .arg(0i64)
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_secs)
+        .query_async(conn)
+        .await?;
+    Ok(redis::cmd("INCR").arg(key).query_async::<i64>(conn).await?)
+}
+
 async fn take_code(state: &AppState, email: &str, code: &str) -> ApiResult<bool> {
     let mut conn = state.redis.clone();
     let key = code_key(email);
     // Brute-force guard: count guesses within the code's TTL window. Past the cap,
     // BURN the code so even a later correct guess can't pass — the user must request
     // a fresh one (which resets the counter via store_code).
+    // Both counters are created with their TTL in one atomic `SET NX EX` and then
+    // only INCR'd, because INCR leaves an existing TTL alone.
+    //
+    // Calling EXPIRE on every attempt (the previous approach) made the window slide
+    // forward with each guess, so the counter never actually expired while an attacker
+    // kept poking: 20 wrong guesses put the hourly counter over the cap, and one
+    // request per hour after that held it there — permanently blocking registration
+    // and code-login for that address, from an anonymous caller. Creating the key with
+    // its TTL up front also avoids the TTL-less-key risk that motivated EXPIRE-always.
     // (a) Per-code budget: reset when a fresh code is sent (store_code DELs it).
     let tries_key = attempts_key(email);
-    let tries: i64 = redis::cmd("INCR")
-        .arg(&tries_key)
-        .query_async(&mut conn)
-        .await?;
-    // EXPIRE every call (idempotent): setting it only on tries==1 risks a crash
-    // between INCR and EXPIRE leaving a TTL-less key that locks the user out forever.
-    let _: () = redis::cmd("EXPIRE")
-        .arg(&tries_key)
-        .arg(state.cfg.code_ttl_secs)
-        .query_async(&mut conn)
-        .await?;
+    let tries = bump_fixed_window(&mut conn, &tries_key, state.cfg.code_ttl_secs).await?;
     // (b) Hourly budget across the whole email, NOT reset by resends — caps total
     // guesses so an attacker can't keep requesting fresh codes to refill (a)'s 5.
-    let hour_key = format!("code_tries_h:{}", email.trim().to_lowercase());
-    let hourly: i64 = redis::cmd("INCR")
-        .arg(&hour_key)
-        .query_async(&mut conn)
-        .await?;
-    let _: () = redis::cmd("EXPIRE")
-        .arg(&hour_key)
-        .arg(3600i64)
-        .query_async(&mut conn)
-        .await?;
+    let hour_key = format!("code_tries_h:{}", normalize_email(email));
+    let hourly = bump_fixed_window(&mut conn, &hour_key, 3600).await?;
     if tries > MAX_CODE_ATTEMPTS || hourly > HOURLY_ATTEMPT_CAP {
         let _: () = redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
         return Err(AppError::bad("验证码尝试次数过多，请稍后重新获取验证码"));
@@ -232,13 +274,27 @@ fn gen_code() -> String {
     format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
 }
 
+/// The single canonical form of an email address. Everything that keys off an email
+/// — Redis code/attempt/cooldown keys, user lookup, the stored row — must agree, or
+/// the mismatch itself becomes the bug: codes were already stored lowercased while
+/// lookup and INSERT used the raw string, so `Alice@x.com` missed the existing
+/// `alice@x.com` row, passed the "already registered" check, and inserted a second
+/// account for one mailbox (users.email's UNIQUE index is case-sensitive).
+pub fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Look a user up case-insensitively. Matching on `lower(email)` rather than the
+/// normalized string keeps mixed-case rows created before normalization loginable.
+/// `LIMIT 1` (oldest first) because such rows may already collide pairwise, and a
+/// bare `fetch_optional` would error out instead of resolving to the original account.
 async fn find_user(state: &AppState, email: &str) -> ApiResult<Option<User>> {
-    Ok(
-        sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
-            .bind(email)
-            .fetch_optional(&state.db)
-            .await?,
+    Ok(sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE lower(email) = $1 ORDER BY created_at LIMIT 1",
     )
+    .bind(normalize_email(email))
+    .fetch_optional(&state.db)
+    .await?)
 }
 
 // ---- request/response payloads ---------------------------------------------
@@ -278,19 +334,30 @@ pub async fn check_email(
     ))
 }
 
+/// Per-address daily send ceiling. A 30s cooldown alone still allows 2880 mails a
+/// day at one victim's inbox.
+const CODE_SENDS_PER_EMAIL_PER_DAY: i64 = 12;
+/// Ceiling on how many distinct sends one caller IP can trigger per hour. The
+/// gateway has no rate-limit middleware at all, so without this a single host can
+/// walk an address list and burn the whole email quota (which also gets the sending
+/// domain blacklisted — damage that outlives the attack).
+const CODE_SENDS_PER_IP_PER_HOUR: i64 = 20;
+
 pub async fn send_code(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<EmailReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !valid_email(&req.email) {
         return Err(AppError::bad("邮箱格式不正确"));
     }
+    let email = normalize_email(&req.email);
+    let mut conn = state.redis.clone();
     // Cooldown: one code per 30s per email. Without it an attacker could spam fresh
     // codes to reset the attempt cap (and bomb the inbox / our email quota).
     {
-        let mut conn = state.redis.clone();
         let ok: Option<String> = redis::cmd("SET")
-            .arg(format!("code_cd:{}", req.email.trim().to_lowercase()))
+            .arg(format!("code_cd:{email}"))
             .arg("1")
             .arg("NX")
             .arg("EX")
@@ -300,6 +367,27 @@ pub async fn send_code(
         if ok.is_none() {
             return Err(AppError::bad("验证码发送过于频繁，请 30 秒后再试"));
         }
+    }
+    // Daily ceiling per address — protects the victim's inbox.
+    let per_email =
+        bump_fixed_window(&mut conn, &format!("code_send_d:{email}"), 24 * 3600).await?;
+    if per_email > CODE_SENDS_PER_EMAIL_PER_DAY {
+        return Err(AppError::bad("该邮箱今日验证码发送次数已达上限，请明天再试"));
+    }
+    // Hourly ceiling per caller — protects the email quota and sender reputation.
+    // nginx restores the real client IP (conf.d/cloudflare-realip.conf), so
+    // X-Forwarded-For's last hop is meaningful here; absent it we fall back to a
+    // shared bucket rather than skipping the check.
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next_back())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let per_ip = bump_fixed_window(&mut conn, &format!("code_send_ip:{ip}"), 3600).await?;
+    if per_ip > CODE_SENDS_PER_IP_PER_HOUR {
+        return Err(AppError::bad("请求过于频繁，请稍后再试"));
     }
     let code = gen_code();
     store_code(&state, &req.email, &code).await?;
@@ -326,10 +414,12 @@ pub async fn register(
         return Err(AppError::bad("该邮箱已注册，请直接登录"));
     }
     let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)?;
+    // Store the canonical form so the UNIQUE index actually enforces one account per
+    // mailbox from here on.
     let user = sqlx::query_as::<_, User>(
         "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *",
     )
-    .bind(&req.email)
+    .bind(normalize_email(&req.email))
     .bind(&hash)
     .fetch_one(&state.db)
     .await?;
@@ -397,7 +487,7 @@ pub async fn verify_code(
     Ok(Json(json!({ "token": token, "user": user })))
 }
 
-pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<User>> {
+pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
     let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
     // Apply the 5h30m window refill + weekly reset so the profile shows current quota.
     let _ = sqlx::query(
@@ -416,7 +506,24 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::unauthorized("用户不存在"))?;
-    Ok(Json(user))
+
+    // 附带 michael-compression 的可用档位，客户端据此决定「本地要不要自己压」。
+    // 这是**加字段**，老客户端会忽略它，不会破坏现有消费方（nginx 的 auth_request
+    // 只看状态码）。
+    let plan_active =
+        user.plan != "none" && user.plan_expires_at.is_none_or(|e| e > chrono::Utc::now());
+    let tier = crate::compression::max_tier_for_plan(&user.plan, plan_active, user.credits_cents);
+    let mut body = serde_json::to_value(&user).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "michael_compression".into(),
+            match tier {
+                Some(t) => json!({ "tier": t.as_str(), "max_input_tokens": t.max_input_tokens() }),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    Ok(Json(body))
 }
 
 pub async fn admin_users(
@@ -486,4 +593,34 @@ pub async fn delete_user(
         return Err(AppError::bad("用户不存在"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod privilege_source_tests {
+    /// Guard rail, not a behavioural test: the `Claims` extractor must keep reading
+    /// `role` from the database instead of trusting the JWT claim.
+    ///
+    /// All 13 admin gates are `claims.role != "admin"`. When role came from the token,
+    /// a 30-day JWT kept working after its owner was demoted or deleted, and because
+    /// the admin endpoints can re-grant the role, one surviving token could take it
+    /// back for good. There is no integration harness for the extractor here, so this
+    /// asserts on the source: if someone "optimizes away" the lookup to save a query,
+    /// this fails and explains why it exists.
+    #[test]
+    fn claims_extractor_resolves_role_from_the_database() {
+        let src = include_str!("auth.rs");
+        let extractor = src
+            .split("impl FromRequestParts<AppState> for Claims")
+            .nth(1)
+            .expect("Claims extractor impl");
+        let extractor = &extractor[..extractor.find("\nfn issue_token").unwrap_or(extractor.len())];
+        assert!(
+            extractor.contains("SELECT role FROM users WHERE id = $1"),
+            "the extractor must re-read role from the users row, never trust the JWT claim"
+        );
+        assert!(
+            extractor.contains("账号不存在或已注销"),
+            "a deleted user's surviving token must fail closed"
+        );
+    }
 }

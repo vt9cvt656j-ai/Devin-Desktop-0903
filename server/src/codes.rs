@@ -164,6 +164,19 @@ pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
     }
 }
 
+/// Ordering of the built-in plans, so a grant never silently downgrades a user who
+/// still holds a better plan. Unknown/absent plans rank 0.
+pub(crate) fn plan_rank(plan: &str) -> i32 {
+    match plan {
+        "trial" => 1,
+        "basic" => 2,
+        "pro" => 3,
+        "power" => 4,
+        "ultra" => 5,
+        _ => 0,
+    }
+}
+
 pub(crate) async fn apply_plan(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     uid: uuid::Uuid,
@@ -172,20 +185,62 @@ pub(crate) async fn apply_plan(
 ) -> ApiResult<()> {
     if let Some((total, window, weekly, spec_days)) = plan_spec(plan) {
         let dur = if days > 0 { days } else { spec_days };
-        // Grant: extend expiry, (re)allocate the quota pools, start fresh windows.
+        // Read the current state under a row lock: the new pools are derived from the
+        // old ones, and two concurrent redeems must not both compute from the same base.
+        let (cur_plan, cur_total, cur_window_cap, cur_window, cur_weekly): (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT plan, quota_total_cents, quota_window_cap_cents, quota_window_cents, \
+             quota_weekly_cap_cents FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        // Quota is a balance, not a setting: grants ADD. Overwriting meant redeeming a
+        // cheap code on top of an expensive plan destroyed the paid remainder (ultra
+        // with $4000 left + a $50 trial code = $50), and stacking two of the same plan
+        // only ever delivered one plan's worth.
+        let new_total = cur_total.max(0).saturating_add(total);
+        // Caps are entitlements: keep the better one rather than the newest one.
+        let new_window_cap = cur_window_cap.max(window);
+        // Don't shrink what's left in the live window; top it up toward the new cap.
+        let new_window = cur_window.max(window.min(new_total)).min(new_window_cap);
+        // 0 means "no weekly cap", so it wins over any finite cap.
+        let new_weekly = if cur_weekly == 0 || weekly == 0 {
+            0
+        } else {
+            cur_weekly.max(weekly)
+        };
+        let new_plan = if plan_rank(plan) >= plan_rank(&cur_plan) {
+            plan.to_string()
+        } else {
+            cur_plan
+        };
+
+        // Note what is deliberately NOT reset here: quota_week_used_cents and the
+        // window/week reset timestamps. Zeroing them on every grant let a user clear a
+        // spent weekly cap (or refresh the 5.5h window) by redeeming any cheap code.
+        // The access gate already rolls both windows over when their deadline passes.
         sqlx::query(
             "UPDATE users SET plan = $1, \
              plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + ($2 * interval '1 day'), \
-             quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = LEAST($4, $3), \
-             quota_window_reset_at = now() + interval '5 hours 30 minutes', \
-             quota_weekly_cap_cents = $5, quota_week_used_cents = 0, quota_week_reset_at = now() + interval '7 days', \
-             updated_at = now() WHERE id = $6",
+             quota_total_cents = $3, quota_window_cap_cents = $4, quota_window_cents = $5, \
+             quota_window_reset_at = COALESCE(quota_window_reset_at, now() + interval '5 hours 30 minutes'), \
+             quota_weekly_cap_cents = $6, \
+             quota_week_reset_at = COALESCE(quota_week_reset_at, now() + interval '7 days'), \
+             updated_at = now() WHERE id = $7",
         )
-        .bind(plan)
+        .bind(&new_plan)
         .bind(dur)
-        .bind(total)
-        .bind(window)
-        .bind(weekly)
+        .bind(new_total)
+        .bind(new_window_cap)
+        .bind(new_window)
+        .bind(new_weekly)
         .bind(uid)
         .execute(&mut **tx)
         .await?;
