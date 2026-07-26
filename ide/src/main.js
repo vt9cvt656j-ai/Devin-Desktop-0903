@@ -13282,7 +13282,13 @@ function _tokenExact(n) {
 function _contextMeterSnapshot(input = {}) {
   const cfg = (() => { try { return loadConfig(); } catch { return {}; } })();
   const model = String(input.model || cfg.model || cfg.gatewayModel || "").trim();
-  const limit = Math.max(1, Number(input.limit) || _modelContextLimit(model));
+  // 用 _effectiveContextLimit 而不是 _modelContextLimit：开了 michael-compression
+  // 的账号，实际能塞进去的上下文是档位上限（1M/2M/5M），不是模型原生窗口。
+  //
+  // 之前这里读的是原生窗口，于是 5M 用户的仪表**永远显示 200.0k** —— 不是压缩没生效，
+  // 是这块显示压根不看档位。这个数是用户判断"档位到底有没有开"的唯一可见信号，读错
+  // 等于把一个正常工作的功能显示成没工作。
+  const limit = Math.max(1, Number(input.limit) || _effectiveContextLimit(model));
   const prompt = Math.max(0, Math.round(Number(input.promptTokens ?? input.prompt_tokens ?? input.prompt ?? 0) || 0));
   const completion = Math.max(0, Math.round(Number(input.completionTokens ?? input.completion_tokens ?? input.completion ?? 0) || 0));
   // null 穿透 = 上游没报缓存字段（≠ 真 0），仪表按"未上报"渲染
