@@ -90,6 +90,46 @@ const currentNames = new Set(current.map((t) => t?.function?.name).filter(Boolea
 const missing = [...registryByName.keys()].filter((name) => !currentNames.has(name));
 const onlyInCatalog = [...currentNames].filter((name) => !registryByName.has(name));
 
+// 光比工具**名**是不够的。
+//
+// 网关是按名字注入 schema 的：名字对上、参数却对不上，模型就会照客户端的定义去传参，
+// 而网关拿着一份旧 schema 去校验/转发 —— 表现是那个工具一用就报错或参数被丢掉。历史上
+// 已经踩过一次（线上 109 工具 vs 客户端 137，43 个工具一旦用就无 schema）。
+//
+// 只比**参数名集合**和 **required 集合**：描述文字本来就以目录为准（构建期还会被
+// strip-tool-ip 清空），拿它做判据只会制造噪音。
+const currentByName = new Map();
+for (const tool of current) {
+  const name = tool?.function?.name;
+  if (name) currentByName.set(name, tool);
+}
+
+const paramShape = (tool) => {
+  const params = tool?.function?.parameters || {};
+  const props = Object.keys(params.properties || {}).sort();
+  const required = [...(Array.isArray(params.required) ? params.required : [])].sort();
+  return { props, required };
+};
+
+const drifted = [];
+for (const [name, regTool] of registryByName) {
+  const cur = currentByName.get(name);
+  if (!cur) continue; // 缺失的由 missing 那条管
+  const a = paramShape(regTool);
+  const b = paramShape(cur);
+  const diffs = [];
+  // 方向是**单向**的：注册表有而目录没有的参数 = 真漂移（模型会发一个网关不认识的
+  // 参数，被丢掉或直接报错）。反过来目录比注册表多是**正常的**——目录刻意暴露了更多
+  // 动作/参数（browser 就是 51 vs 24），把它当漂移然后"修掉"等于把目录削成客户端的
+  // 子集，那是数据丢失，不是同步。
+  const added = a.props.filter((k) => !b.props.includes(k));
+  if (added.length) diffs.push(`+${added.join("/")}`);
+  if (a.required.join(",") !== b.required.join(",")) {
+    diffs.push(`required: [${b.required.join(",")}] → [${a.required.join(",")}]`);
+  }
+  if (diffs.length) drifted.push(`${name} (${diffs.join("; ")})`);
+}
+
 const merged = current.concat(missing.map((name) => registryByName.get(name)));
 
 const check = process.argv.includes("--check");
@@ -98,12 +138,54 @@ console.log(`tools.json (before):   ${current.length}`);
 console.log(`missing (to append):   ${missing.length}${missing.length ? "  -> " + missing.join(", ") : ""}`);
 console.log(`only in tools.json:    ${onlyInCatalog.length}${onlyInCatalog.length ? "  -> " + onlyInCatalog.join(", ") : ""}`);
 console.log(`tools.json (after):    ${merged.length}`);
+console.log(`schema drift:          ${drifted.length}${drifted.length ? "\n  - " + drifted.join("\n  - ") : ""}`);
 
 if (check) {
-  if (missing.length) { console.error("tools.json is missing client-registry tools; run without --check to sync."); process.exit(1); }
+  let bad = false;
+  if (missing.length) {
+    console.error("tools.json is missing client-registry tools; run without --check to sync.");
+    bad = true;
+  }
+  if (drifted.length) {
+    console.error(`${drifted.length} tool(s) have drifted parameter schemas; run without --check to sync.`);
+    bad = true;
+  }
+  if (bad) process.exit(1);
   console.log("in sync");
   process.exit(0);
 }
 
-writeFileSync(TOOLS_JSON, JSON.stringify(merged, null, 2) + "\n", "utf8");
+// 修复漂移时**只补参数，不碰任何描述文字**。
+//
+// 上一版是整条 `return reg` 替换，结果把目录里更丰富的描述（browser 那条讲了 Shadow
+// DOM / iframe 穿透）换成了客户端注册表里那条短的——测试当场抓到。描述以目录为准，
+// 这在上面判据里就写着；修复路径也必须守同一条规矩，否则判据写了等于没写。
+const driftedNames = new Set(drifted.map((d) => d.slice(0, d.indexOf(" ("))));
+const synced = merged.map((tool) => {
+  const name = tool?.function?.name;
+  if (!name || !driftedNames.has(name)) return tool;
+  const reg = registryByName.get(name);
+  if (!reg) return tool;
+  const regParams = reg.function?.parameters || {};
+  const fn = tool.function;
+  const params = fn.parameters || (fn.parameters = { type: "object", properties: {} });
+  params.properties = params.properties || {};
+  // 只补目录里没有的参数；两边都有的保留目录版本（它的描述更细）。
+  for (const [key, def] of Object.entries(regParams.properties || {})) {
+    if (!(key in params.properties)) params.properties[key] = def;
+  }
+  // required 必须听注册表的：客户端真正会发什么由它决定，目录多要一个参数就会
+  // 把合法调用判成非法。
+  if (Array.isArray(regParams.required)) params.required = regParams.required;
+  return tool;
+});
+
+// 保持文件原有的排版风格。这个文件在仓库里是**单行压缩 JSON**；无脑 pretty-print 会
+// 产生四千多行的 diff，把真正的 schema 修改整个淹没掉（也让 review 变得没意义）。
+const wasMinified = !readFileSync(TOOLS_JSON, "utf8").slice(0, 4096).includes("\n");
+writeFileSync(
+  TOOLS_JSON,
+  wasMinified ? JSON.stringify(synced) : JSON.stringify(synced, null, 2) + "\n",
+  "utf8",
+);
 console.log(`wrote ${TOOLS_JSON}`);
