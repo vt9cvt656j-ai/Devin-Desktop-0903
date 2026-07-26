@@ -1,1 +1,0 @@
-import{A as e,F as t,I as n,L as r,M as i,N as a,O as o,P as s,R as c,j as l,k as u}from"./vendor-CmXlEl_3.js";export{o as Channel,u as PluginListener,e as Resource,l as SERIALIZE_TO_IPC_FN,i as addPluginListener,a as checkPermissions,s as convertFileSrc,t as invoke,n as isTauri,r as requestPermissions,c as transformCallback};
