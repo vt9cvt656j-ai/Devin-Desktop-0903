@@ -9,6 +9,13 @@ pub struct Config {
     pub jwt_secret: String,
     pub bind_addr: String,
     pub db_max_connections: u32,
+    /// michael-compression 总开关，**默认关闭**。
+    ///
+    /// 关着的时候：不做任何压缩，`/api/me` 也把 michael_compression 报成 null。
+    /// 两件事必须由同一个开关控制 —— 客户端一旦从 /api/me 看到档位，就会**关掉
+    /// 自己的本地压缩**（认为网关接管了）。只报档位却不真压，等于两边都不压，
+    /// 长对话直接撞穿模型原生窗口。
+    pub compression_enabled: bool,
     pub code_ttl_secs: u64,
     pub jwt_ttl_secs: i64,
     pub smtp_user: String,
@@ -36,6 +43,11 @@ impl Config {
             jwt_secret: req("JWT_SECRET")?,
             bind_addr: opt("BIND_ADDR", "0.0.0.0:8080"),
             db_max_connections: opt("DB_MAX_CONNECTIONS", "20").parse().unwrap_or(20),
+            // 显式写 1/true 才开。缺省缺失都按关处理（fail-closed）。
+            compression_enabled: matches!(
+                opt("MICHAEL_COMPRESSION_ENABLED", "0").trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
             code_ttl_secs: opt("CODE_TTL_SECS", "600").parse().unwrap_or(600),
             jwt_ttl_secs: opt("JWT_TTL_SECS", "2592000").parse().unwrap_or(2_592_000), // 30d
             smtp_user: std::env::var("QQ_SMTP_USER").unwrap_or_default(),

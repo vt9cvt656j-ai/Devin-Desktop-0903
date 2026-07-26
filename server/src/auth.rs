@@ -512,7 +512,14 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
     // 只看状态码）。
     let plan_active =
         user.plan != "none" && user.plan_expires_at.is_none_or(|e| e > chrono::Utc::now());
-    let tier = crate::compression::max_tier_for_plan(&user.plan, plan_active, user.credits_cents);
+    // 关着的时候必须报 null，不能只是"不压缩"。客户端一旦从这里看到档位，就会
+    // **关掉自己的本地压缩**（认为网关接管了）—— 只报档位却不真压，等于两边都不压，
+    // 长对话直接撞穿模型原生窗口。报档位和真压缩必须由同一个开关控制。
+    let tier = if state.cfg.compression_enabled {
+        crate::compression::max_tier_for_plan(&user.plan, plan_active, user.credits_cents)
+    } else {
+        None
+    };
     let mut body = serde_json::to_value(&user).unwrap_or_else(|_| json!({}));
     if let Some(obj) = body.as_object_mut() {
         obj.insert(

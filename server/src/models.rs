@@ -4166,26 +4166,32 @@ pub async fn chat_completions(
     // michael-compression：严格 opt-in。没有请求档位时这里直接返回，body 一个字节都不动，
     // 现有流量的行为与这个特性上线前完全一致。
     let mut compression_applied: Option<crate::compression::Tier> = None;
-    if let Some(requested) = compression_tier_from(&headers, &body) {
-        // 档位是付费能力：按会员套餐钳位。超出权限时下调而不是拒绝，用户仍然拿到他
-        // 买到的那一档，而不是在长对话跑到一半时被打断。
-        let allowed = crate::compression::max_tier_for_plan(&plan, plan_active, credits);
-        match crate::compression::clamp_tier(requested, allowed) {
-            Some(tier) => {
-                if tier != requested {
+    // 总开关默认关闭（MICHAEL_COMPRESSION_ENABLED）。发布前审查在这条链路上确认了多处
+    // 会破坏线上请求的缺陷，最严重的是 compression_write_back 把每条消息重写成
+    // {role, content} —— tool_calls / tool_call_id 全部丢失，而 agent 模式发的正是
+    // 这些，上游会直接拒收。开关打开前必须先修完；关着时 body 一个字节都不动。
+    if state.cfg.compression_enabled {
+        if let Some(requested) = compression_tier_from(&headers, &body) {
+            // 档位是付费能力：按会员套餐钳位。超出权限时下调而不是拒绝，用户仍然拿到他
+            // 买到的那一档，而不是在长对话跑到一半时被打断。
+            let allowed = crate::compression::max_tier_for_plan(&plan, plan_active, credits);
+            match crate::compression::clamp_tier(requested, allowed) {
+                Some(tier) => {
+                    if tier != requested {
+                        tracing::info!(
+                            %uid, plan = %plan, requested = requested.as_str(), granted = tier.as_str(),
+                            "michael-compression: 请求档位超出套餐权限，已下调"
+                        );
+                    }
+                    apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
+                    compression_applied = Some(tier);
+                }
+                None => {
                     tracing::info!(
-                        %uid, plan = %plan, requested = requested.as_str(), granted = tier.as_str(),
-                        "michael-compression: 请求档位超出套餐权限，已下调"
+                        %uid, plan = %plan,
+                        "michael-compression: 当前套餐不含该能力，本轮不压缩"
                     );
                 }
-                apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
-                compression_applied = Some(tier);
-            }
-            None => {
-                tracing::info!(
-                    %uid, plan = %plan,
-                    "michael-compression: 当前套餐不含该能力，本轮不压缩"
-                );
             }
         }
     }
