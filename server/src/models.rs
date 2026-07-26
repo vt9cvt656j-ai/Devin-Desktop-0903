@@ -7717,8 +7717,13 @@ async fn compression_issue_prefix(
 /// 所以：请求里只用已经算好的摘要（Redis 查询，毫秒级、延迟确定）；缺的段交给**后台**
 /// 预热，下一轮就能命中。代价是第一次长对话那一轮不压缩，换来的是延迟可预测。
 const COMPRESSION_WARM_SEGMENT_TIMEOUT: Duration = Duration::from_secs(90);
-/// 后台预热一轮最多现算多少段。不设上限会让一次超长对话把便宜模型的限流打满。
-const COMPRESSION_WARM_MAX_SEGMENTS: usize = 8;
+/// 后台预热一轮最多现算多少段。
+///
+/// 8 太小：实测一个 400k token 的对话有 17 段，一轮只预热 8 段的话要三轮才能压到窗口
+/// 以内 —— 这三轮里每一轮都在降级为不压缩，也就是"5M 档看着开了却一直不生效"。
+/// 后台没有延迟压力，上限的唯一意义是别把便宜模型的限流打满，所以给到能一轮覆盖
+/// 常见长对话的量级。真正的兜底是"一段都压不出来就整体放弃"那条。
+const COMPRESSION_WARM_MAX_SEGMENTS: usize = 24;
 /// 段摘要缓存的命名空间。刻意与具体压缩模型无关（见调用点注释）。
 const COMPRESSION_CACHE_NAMESPACE: &str = "mc-any-v1";
 
