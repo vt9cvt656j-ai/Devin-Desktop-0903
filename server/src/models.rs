@@ -66,7 +66,10 @@ const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// latency includes model prefill. Production measurements put small chat near 2.3-3.9s and a
 /// normal Agent/tool request at 5.5s. Use request-aware ceilings instead of treating 4s as a
 /// transport failure and cancelling healthy Agent turns.
-const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(5);
+/// 5s 太紧：实测小聊天最慢就到 3.9s，只剩 1.1s 余量，一次比平常慢一点的 prefill 就
+/// 会被当成传输故障掐掉。7s 给到约 1.8 倍余量，而总时长仍由 ROUTE_BUDGET(12s) 兜住，
+/// 所以"动不动等 47s"那个问题不会因此回来。
+const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(7);
 const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(8);
 const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(10);
 const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
@@ -762,7 +765,16 @@ pub async fn i18n_pack(
     // the platform's own api_key. It used to be the one paid route in the gateway
     // that required no credential at all, so anyone could burn the operator's
     // upstream balance anonymously and unattributably.
-    let user_id = auth_any_user(&state, &headers).await?;
+    // 鉴权是**软**的：花钱的是缓存未命中那条路，所以未鉴权的请求允许读缓存、但绝不
+    // 允许触发上游调用。
+    //
+    // 硬拒绝会打断所有**已发布**的客户端：0.3.15 调这个接口时不带任何 Authorization，
+    // 一上线就是整个界面翻译失效。而它们要的几乎都是同一批 UI 文案，任何一个已登录
+    // 客户端都会把缓存捂热，所以读缓存这条路对它们基本总是命中。
+    let user_id = match auth_any_user(&state, &headers).await {
+        Ok(id) => Some(id),
+        Err(_) => None,
+    };
     let locale = req.locale.trim().replace('_', "-");
     if locale.is_empty() || locale.len() > 32 {
         return Err(AppError::bad("locale 不能为空"));
@@ -784,6 +796,13 @@ pub async fn i18n_pack(
     if let Some(v) = i18n_pack_cache_get(&cache_key) {
         return Ok(Json(v));
     }
+    // 缓存没命中，且没有凭据 —— 到此为止。这一步之后才是花运营方钱的地方，
+    // 而"任何人都能烧运营方的上游余额"正是加鉴权要堵的洞。
+    let Some(user_id) = user_id else {
+        return Err(AppError::unauthorized(
+            "缺少 API Key：未登录时只能读取已缓存的翻译包",
+        ));
+    };
 
     // A cache miss is what costs money, so budget the misses per user. Legitimate
     // use is a handful of packs per locale; the 2026-07-25 incident was a single
@@ -2948,6 +2967,7 @@ fn split_fused_charge(
     quota_window: i64,
     quota_weekly_cap: i64,
     quota_week_used: i64,
+    credits: i64,
 ) -> FusedCharge {
     let requested = requested_cost.max(0);
     let quota_available = if use_quota {
@@ -2975,7 +2995,24 @@ fn split_fused_charge(
     // `model_usage.cost_cents` equal the real cost, and lets the existing
     // `credits <= 0` gate refuse the next request until they top up (a top-up nets
     // against the debt). The in-flight cap bounds how much can accrue at once.
-    let wallet_cents = requested.saturating_sub(quota_cents);
+    let overflow = requested.saturating_sub(quota_cents);
+    // 超出配额的部分怎么落，取决于这是**谁**的超支：
+    //
+    // · 按量付费（use_quota=false，或套餐配额本来就是 0）：全额记为债务，允许 credits
+    //   为负。此前这里被 `.min(credits.max(0))` 钳住，等于用户超支的那部分直接免单
+    //   —— 门禁只看余额是否为正、结算又发生在上游调用之后，所以每一次超支都被静默
+    //   写掉，而运营方照付上游。记成债务不会多收他没花的钱，还能让 `credits <= 0`
+    //   的门禁挡住下一次请求，充值时自动净额抵扣。
+    //
+    // · 纯订阅（本轮确实动用了套餐配额）：**不制造钱包债务**。固定价套餐的用户每个
+    //   配额窗口末尾都会有一次请求超出剩余配额，全额落到钱包的话，他每个窗口都在
+    //   为套餐内的正常使用累积负债 —— 那是他买套餐时就付过的钱。这一小段由运营方
+    //   吸收，且天然被"单次请求"的规模限制住。
+    let wallet_cents = if use_quota && quota_cents > 0 {
+        overflow.min(credits.max(0))
+    } else {
+        overflow
+    };
     FusedCharge {
         quota_cents,
         wallet_cents,
@@ -3019,7 +3056,7 @@ async fn bill(
             }
         };
         match balances {
-            Some((quota_total, quota_window, quota_weekly_cap, quota_week_used, _credits)) => {
+            Some((quota_total, quota_window, quota_weekly_cap, quota_week_used, credits)) => {
                 split_fused_charge(
                     requested_cost,
                     use_quota,
@@ -3027,6 +3064,7 @@ async fn bill(
                     quota_window,
                     quota_weekly_cap,
                     quota_week_used,
+                    credits,
                 )
             }
             None => FusedCharge::default(),
@@ -5542,7 +5580,7 @@ mod billing_tests {
     #[test]
     fn fused_charge_spills_from_quota_into_wallet() {
         assert_eq!(
-            split_fused_charge(23, true, 10, 10, 0, 0),
+            split_fused_charge(23, true, 10, 10, 0, 0, 100),
             FusedCharge {
                 quota_cents: 10,
                 wallet_cents: 13,
@@ -5553,7 +5591,7 @@ mod billing_tests {
     #[test]
     fn fused_charge_respects_weekly_quota_cap() {
         assert_eq!(
-            split_fused_charge(23, true, 100, 100, 20, 15),
+            split_fused_charge(23, true, 100, 100, 20, 15, 100),
             FusedCharge {
                 quota_cents: 5,
                 wallet_cents: 18,
@@ -5561,10 +5599,52 @@ mod billing_tests {
         );
     }
 
+    /// 纯订阅用户不得因为**套餐内的正常使用**背上钱包债务。
+    ///
+    /// 固定价套餐每个配额窗口末尾必然有一次请求超出剩余配额。若把这部分全额落到钱包，
+    /// 一个从没充过值的订阅用户就会每个窗口都累积一次负债 —— 而那是他买套餐时已经
+    /// 付过的钱。这一小段由运营方吸收，规模天然被"单次请求"限制住。
+    #[test]
+    fn subscription_quota_overshoot_does_not_create_wallet_debt() {
+        let charge = split_fused_charge(23, true, 10, 10, 0, 0, 0);
+        assert_eq!(
+            charge,
+            FusedCharge {
+                quota_cents: 10,
+                wallet_cents: 0,
+            },
+            "零余额的订阅用户，超出配额的部分不该变成负债"
+        );
+
+        // 有余额时照常从钱包扣，但只扣到余额为止，同样不制造负债。
+        let partial = split_fused_charge(23, true, 10, 10, 0, 0, 5);
+        assert_eq!(
+            partial,
+            FusedCharge {
+                quota_cents: 10,
+                wallet_cents: 5,
+            }
+        );
+    }
+
+    /// 反过来：按量付费用户超支仍然全额记债，不能免单。
+    #[test]
+    fn pay_as_you_go_overspend_still_becomes_debt() {
+        let charge = split_fused_charge(500, false, 0, 0, 0, 0, 20);
+        assert_eq!(
+            charge,
+            FusedCharge {
+                quota_cents: 0,
+                wallet_cents: 500,
+            },
+            "没动用套餐配额时，超出余额的部分必须记为债务，否则每次超支都被静默免单"
+        );
+    }
+
     #[test]
     fn fused_charge_uses_wallet_without_eligible_quota() {
         assert_eq!(
-            split_fused_charge(23, false, 100, 100, 0, 0),
+            split_fused_charge(23, false, 100, 100, 0, 0, 0),
             FusedCharge {
                 quota_cents: 0,
                 wallet_cents: 23,
@@ -5583,12 +5663,13 @@ mod billing_tests {
     /// cost is now charged, `credits_cents` may go negative, and the existing
     /// `credits <= 0` gate refuses the next request until the user tops up.
     fn fused_charge_records_overspend_as_debt() {
-        let charge = split_fused_charge(23, true, 10, 10, 0, 0);
+        // 按量付费（本轮没动用任何套餐配额）：全额记债，允许 credits 变负。
+        let charge = split_fused_charge(23, false, 0, 0, 0, 0, 4);
         assert_eq!(
             charge,
             FusedCharge {
-                quota_cents: 10,
-                wallet_cents: 13,
+                quota_cents: 0,
+                wallet_cents: 23,
             }
         );
         assert_eq!(
@@ -5602,7 +5683,7 @@ mod billing_tests {
     /// A user with no funds at all still gets charged the real amount, so the debt is
     /// visible and the next request is refused.
     fn fused_charge_bills_full_cost_with_empty_wallet() {
-        let charge = split_fused_charge(500, false, 0, 0, 0, 0);
+        let charge = split_fused_charge(500, false, 0, 0, 0, 0, 0);
         assert_eq!(
             charge,
             FusedCharge {
@@ -7052,9 +7133,11 @@ mod upstream_timeout_tests {
     /// when the budget is the smaller of the two.
     #[test]
     fn per_attempt_header_wait_is_request_aware_and_capped() {
+        // 7s 而不是 5s：实测小聊天最慢 3.9s，5s 只剩 1.1s 余量，一次偏慢的 prefill
+        // 就会被当成传输故障掐掉。总时长仍由 ROUTE_BUDGET 兜住。
         assert_eq!(
             max_header_wait_for_request(false, false),
-            Duration::from_secs(5)
+            Duration::from_secs(7)
         );
         assert_eq!(
             max_header_wait_for_request(false, true),
