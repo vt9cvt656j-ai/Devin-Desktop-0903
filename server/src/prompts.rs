@@ -3304,14 +3304,16 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
             }
         }
     }
-    // 会话内粘性门控：不只看"最新一条请求"。续跑轮（"继续"）、短追问（"还是不行再修修"）、
-    // 运行中 steering（"换个思路"）都不含工程关键词，只看最后一句会让检查点在最需要深思的
-    // 迭代调试轮集体消失（用户实测"推理时好时坏"的来源之一）。改为有界扫描最近 20 条
-    // user 消息，任一条命中工程信号即视为工程会话——纯闲聊历史没有关键词，原测试语义不变。
-    if engineering_intent {
-        prompt_blocks.push("reasoning_checkpoint".to_string());
-        sys.push_str("\n\n⚠️ 强制推理检查点：下一步前先在脑子里快速过一遍——① 真实目标和成功终态是什么？② 输入/输出/状态变化/错误路径/调用方这些契约清了吗？③ 这一步要拿到或改变什么证据？④ 哪些边界、并发、空值、权限或版本差异会炸？⑤ 写入前每行代码是否都有来源、有用途、能编译、能被验证？除非是显而易见的一步操作（读明确指定的文件、改一行明确的代码），否则先想清楚再动手。只做一次与风险相称的检查，确定最小验证路径后执行；证据足够就停止，不重复展开已排除分支。");
-    }
+    // 推理纪律已移入 prompts/reasoning.txt，并挂在 agent.base 上 —— 也就是**每个 agent
+    // 请求都注入**，不再靠"扫最近 20 条 user 消息命中工程关键词"来决定。
+    //
+    // 关键词门控是这里原本的做法，它有两个改不动的毛病：续跑轮（"继续"）、短追问
+    // （"还是不行再修修"）、运行中 steering（"换个思路"）都不含工程关键词，于是检查点
+    // 在最需要深思的迭代调试轮集体消失（用户实测"推理时好时坏"的来源）；而扩大关键词表
+    // 只是把漏判换成误判。推理纪律对任何请求都成立，本来就不该由关键词决定有没有。
+    //
+    // 原文是一段硬编码的五问清单。清单能被形式化地"过完"而什么都没想，而且与
+    // agent_core 里"不要为了显得周全而堆清单"直接冲突；新块讲的是会改变结论的动作。
     let growth_context = hdr("x-ide-growth")
         .map(str::trim)
         .filter(|growth| !growth.is_empty())
@@ -3452,6 +3454,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
 /// hash is stable for identical content.
 const PROMPT_NAMES: &[&str] = &[
     "agent_core",
+    "reasoning",
     "agent_engineering",
     "agent_research",
     "agent_automation",
@@ -4658,7 +4661,7 @@ mod tests {
         let graph = read_prompt_graph().expect("prompt graph should load");
         assert_eq!(
             graph.agent.base,
-            vec!["agent_core", "truthfulness", "answer_quality"]
+            vec!["agent_core", "reasoning", "truthfulness", "answer_quality"]
         );
         assert_eq!(graph.agent.engineering, vec!["agent_engineering"]);
         assert_eq!(graph.agent.research, vec!["agent_research"]);
@@ -5112,7 +5115,7 @@ mod tests {
         assert!(!system.contains("# 按任务加载：研究、社区与当前事实"));
         assert!(!system.contains("# michael-design 设计体系（"));
         assert!(!system.contains("michael-design 设计蓝本"));
-        assert!(system.contains("强制推理检查点"));
+        assert!(system.contains("# 推理纪律"));
     }
 
     #[test]
@@ -5284,7 +5287,7 @@ mod tests {
         let system = messages[0]["content"].as_str().unwrap();
         assert!(system.contains("平台知识库·与真实用户请求相关"));
         assert!(system.contains("不能证明当前 API 或社区现状"));
-        assert!(system.contains("强制推理检查点"));
+        assert!(system.contains("# 推理纪律"));
         assert!(!system.contains("因人而教"));
         let latest_user = messages
             .iter()
@@ -5409,71 +5412,78 @@ mod tests {
         assert!(current_dst.contains("America/Los_Angeles，UTC-07:00"));
     }
 
+    /// 推理纪律在 agent 基座上**恒定注入**，不由关键词决定。
+    ///
+    /// 上一版是硬编码的五问清单，靠"扫最近 20 条 user 消息命中工程信号"才注入。那条
+    /// 门控有改不动的毛病：续跑轮（"继续"）、短追问（"还是不行再修修"）、运行中 steering
+    /// （"换个思路"）都不含工程关键词，于是检查点在最需要深思的迭代调试轮集体消失 ——
+    /// 这就是用户实测"推理时好时坏"的来源。扩大关键词表只是把漏判换成误判。
+    ///
+    /// 推理纪律对任何请求都成立，本来就不该由关键词决定有没有。
     #[test]
-    fn reasoning_checkpoint_requires_agent_coding_request_not_history_length() {
+    fn reasoning_discipline_is_unconditional_in_agent_mode() {
         let mut agent_headers = HeaderMap::new();
         agent_headers.insert("x-ide-mode", "agent".parse().unwrap());
-        let mut first_turn = serde_json::json!({
-            "model": "gpt-5.5",
-            "messages": [{
-                "role": "user",
-                "content": "请重构整个 Rust 后端认证架构，修复并发错误并补充集成测试"
-            }]
-        });
-        assemble_into(&agent_headers, &mut first_turn);
-        assert!(first_turn["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("⚠️ 强制推理检查点"));
-        assert!(first_turn["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("证据足够就停止"));
-        assert!(first_turn["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("每行代码是否都有来源、有用途、能编译、能被验证"));
 
-        let mut diagnostic = serde_json::json!({
-            "model": "gpt-5.5",
-            "messages": [{"role": "user", "content": "这个 Rust 服务为什么死锁"}]
-        });
-        assemble_into(&agent_headers, &mut diagnostic);
-        let diagnostic_system = diagnostic["messages"][0]["content"].as_str().unwrap();
-        assert!(diagnostic_system.contains("⚠️ 强制推理检查点"));
-        assert!(!diagnostic_system.contains("平台知识库·与真实用户请求相关"));
+        // 工程请求、诊断请求、以及**完全不含工程关键词**的闲聊，都必须有。
+        for content in [
+            "请重构整个 Rust 后端认证架构，修复并发错误并补充集成测试",
+            "这个 Rust 服务为什么死锁",
+            "继续",
+            "还是不行，再修修",
+            "请聊聊你最喜欢的电影和音乐，不需要做任何项目",
+        ] {
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "messages": [{ "role": "user", "content": content }]
+            });
+            assemble_into(&agent_headers, &mut body);
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("# 推理纪律"), "缺推理纪律: {content}");
+            // 关键内容：可证伪、版本记忆会过期、报错先看字面。
+            assert!(system.contains("证明自己错了"), "{content}");
+            // 可证伪是这一块的核心，也是它唯一不与其它块重复的内容。
+            // 「版本记忆会过期」「报错先看字面」按审查建议归并到了 agent_engineering
+            // （那边有 lock 文件、本地类型定义这些可执行细节），此处不再重复断言。
+            assert!(system.contains("最便宜的能推翻假设的观察"), "{content}");
+        }
 
+        // 长闲聊历史同样不该改变结论（原门控在这里会漏判）。
+        let mut long_chat = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": (0..12).map(|index| serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": "普通聊天"
+            })).collect::<Vec<_>>()
+        });
+        assemble_into(&agent_headers, &mut long_chat);
+        assert!(long_chat["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# 推理纪律"));
+
+        // 但它属于 agent 基座：plan 等只读模式走 modes.*，不注入。
+        for mode in ["plan", "chat", "explorer", "reviewer"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", mode.parse().unwrap());
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "请实现 Rust 后端认证模块并补测试"}]
+            });
+            assemble_into(&headers, &mut body);
+            assert!(
+                !body["messages"][0]["content"].as_str().unwrap().contains("# 推理纪律"),
+                "{mode} 模式不该注入 agent 基座"
+            );
+        }
+
+        // 工程诊断判据本身仍然要能用（其它地方还在用它做专项注入）。
         for ordinary_question in [
             "how can I trust this website",
             "how should I react to this issue in my life",
         ] {
             assert!(!looks_like_engineering_diagnostic(ordinary_question));
         }
-
-        let mut long_chat = serde_json::json!({
-            "model": "gpt-5.5",
-            "messages": (0..12).map(|index| serde_json::json!({
-                "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": if index == 10 { "请聊聊你最喜欢的电影和音乐，不需要做任何项目" } else { "普通聊天" }
-            })).collect::<Vec<_>>()
-        });
-        assemble_into(&agent_headers, &mut long_chat);
-        assert!(!long_chat["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("⚠️ 强制推理检查点"));
-
-        let mut plan_headers = HeaderMap::new();
-        plan_headers.insert("x-ide-mode", "plan".parse().unwrap());
-        let mut plan = serde_json::json!({
-            "model": "gpt-5.5",
-            "messages": [{"role": "user", "content": "请实现 Rust 后端认证模块并补测试"}]
-        });
-        assemble_into(&plan_headers, &mut plan);
-        assert!(!plan["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("⚠️ 强制推理检查点"));
     }
 
     #[test]
@@ -5507,7 +5517,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("⚠️ 强制推理检查点"), "{request}");
+            assert!(system.contains("# 推理纪律"), "{request}");
             assert!(
                 !system.contains("平台知识库·与真实用户请求相关"),
                 "{request}"
@@ -5529,7 +5539,7 @@ mod tests {
             });
             assemble_into(&headers, &mut body);
             let system = body["messages"][0]["content"].as_str().unwrap();
-            assert!(system.contains("⚠️ 强制推理检查点"), "{request}");
+            assert!(system.contains("# 推理纪律"), "{request}");
             assert!(!system.contains("平台知识库·与真实用户请求相关"));
         }
 

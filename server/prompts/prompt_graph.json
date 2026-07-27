@@ -7,7 +7,7 @@
     "reviewer": ["reviewer", "truthfulness", "answer_quality"]
   },
   "agent": {
-    "base": ["agent_core", "truthfulness", "answer_quality"],
+    "base": ["agent_core", "reasoning", "truthfulness", "answer_quality"],
     "engineering": ["agent_engineering"],
     "research": ["agent_research"],
     "automation": ["agent_automation"],

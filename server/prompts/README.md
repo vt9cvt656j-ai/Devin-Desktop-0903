@@ -7,7 +7,7 @@ monolithic prompt.
 ## Runtime layers
 
 - Chat/plan/explorer/reviewer: declared explicitly under `modes`
-- Base: `agent_core.txt`, `truthfulness.txt`, `answer_quality.txt`
+- Base: `agent_core.txt`, `reasoning.txt`, `truthfulness.txt`, `answer_quality.txt`
 - Engineering: `agent_engineering.txt`
 - Research: `agent_research.txt`
 - Browser/desktop automation: `agent_automation.txt`
