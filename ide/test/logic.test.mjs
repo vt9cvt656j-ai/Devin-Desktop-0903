@@ -11461,3 +11461,33 @@ test("edit_file 的实时预览只替换锚点区间，且锚点不唯一时拒�
   assert.match(SRC, /const previewable = entry\?\.name === "write_file" \|\| entry\?\.name === "edit_file";/);
 });
 
+test("增量解码按 key 分槽：交替读两个字段不会互相重置", () => {
+  const swc = load("_streamWriteContent");
+  // edit_file 的同一次增量回调里既要读 new_string（正文）又要读 old_string（锚点）。
+  // 共用一个状态槽的话两者互相重置：内容永远累积不起来，而且每个 delta 都从头重扫，
+  // 退化成 O(n²) —— 表现就是"改文件完全没有实时输出"，且长文件会卡死。
+  const full = '{"path":"a.js","old_string":"AAAA","new_string":"BBBB"}';
+  const entry = { args: "" };
+  let lastNew = "", lastOld = "";
+  for (const ch of full) {
+    entry.args += ch;
+    lastNew = swc(entry, "new_string") ?? lastNew;
+    lastOld = swc(entry, "old_string", "_scOld") ?? lastOld;   // 交替调用
+  }
+  assert.equal(lastOld, "AAAA", "old_string 必须完整累积");
+  assert.equal(lastNew, "BBBB", "new_string 不能被 old_string 的调用重置");
+  assert.equal(entry._sc.key, "new_string", "主槽位仍归 new_string");
+  assert.equal(entry._scOld.key, "old_string", "锚点用独立槽位");
+
+  // 单调性：主槽位的输出只增不减（重置会让它变短或清空）。
+  const mono = { args: "" };
+  let prev = "";
+  for (const ch of '{"content":"0123456789"}') {
+    mono.args += ch;
+    const cur = swc(mono, "content") ?? "";
+    assert.ok(cur.startsWith(prev), `内容必须单调增长: ${JSON.stringify(prev)} -> ${JSON.stringify(cur)}`);
+    prev = cur;
+  }
+  assert.equal(prev, "0123456789");
+});
+

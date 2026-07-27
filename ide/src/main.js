@@ -34045,10 +34045,14 @@ function _streamWritePath(entry) {
 // the entry). The old code re-decoded the whole `content` value from scratch on
 // every streamed delta — O(n²), and the prime cause of the UI freezing on a big
 // file write. This is O(total) amortized.
-function _streamWriteContent(entry, key) {
+function _streamWriteContent(entry, key, slot = "_sc") {
   const buf = entry.args || "";
-  let st = entry._sc;
-  if (!st || st.key !== key) st = entry._sc = { key, start: -1, pos: 0, out: "", done: false };
+  let st = entry[slot];
+  // 状态必须**按 key 分槽**。原来共用 `entry._sc` 一个槽位，只要换一个 key 调用就把它
+  // 整个重置 —— edit_file 同一次增量回调里既要读 new_string（正文）又要读 old_string
+  // （定位锚点），两者互相重置，结果是内容永远累积不起来、而且每个 delta 都从头重扫，
+  // 退化成 O(n²)。`_streamWritePath` 也读 `_sc` 判断内容是否流完，一并被搞乱。
+  if (!st || st.key !== key) st = entry[slot] = { key, start: -1, pos: 0, out: "", done: false };
   if (st.done) return st.out;
   if (st.start < 0) {
     // Tolerate whitespace around the colon (`"content": "`) and only lock on once
@@ -34136,9 +34140,9 @@ function _installLiveEditorWritePreview(entry, path, file, options = {}) {
 /// 改哪一处 —— 两种情况下动编辑器内容都是在给用户制造一个假的中间态。宁可不预览。
 function _editPreviewAnchor(entry, model) {
     if (!entry || !model || typeof model.getValue !== "function") return null;
-    const oldStr = _streamWriteContent(entry, "old_string");
+    const oldStr = _streamWriteContent(entry, "old_string", "_scOld");
     // 必须已经收完：还在流的 old_string 是前缀，拿它去定位会命中错的地方。
-    if (!oldStr || !entry._sc || entry._sc.key !== "old_string" || !entry._sc.done) return null;
+    if (!oldStr || !entry._scOld?.done) return null;
     const text = model.getValue();
     const first = text.indexOf(oldStr);
     if (first < 0) return null;
@@ -34470,7 +34474,7 @@ function _liveWritePreview(entry, container, root = "") {
   // 于是卡片正文长时间**全空**（实测 args=7665 时 target 仍是 0），用户看到的就是
   // "改文件完全没有实时输出"。这段时间要如实说在干什么，而不是留一片空白。
   if (!entry._target && entry.name !== "write_file") {
-    const locating = _streamWriteContent(entry, "old_string");
+    const locating = _streamWriteContent(entry, "old_string", "_scOld");
     if (locating) {
       const label = entry.streamCard?.querySelector(".code-card__label");
       const want = "正在定位要替换的片段…";
