@@ -11499,3 +11499,24 @@ test("增量解码按 key 分槽：交替读两个字段不会互相重置", () 
   assert.equal(prev, "0123456789");
 });
 
+test("验证器不可用（退出 127）不能被当成验证失败", () => {
+  // 实测：项目里有 requirements.txt，收尾门禁就选了 `ruff check . && pytest`，
+  // 而这台机器没装 → 退出 127 → 报告写成「验证失败: … 退出 127」。看起来像代码坏了，
+  // 实际只是命令不存在；更糟的是门禁据此判定"未验证"，本来能继续修的一轮被结束。
+  assert.match(
+    SRC,
+    /if \(code === 127 \|\| code === 126\) \{[\s\S]{0,600}?ran: false,[\s\S]{0,400}?unavailable: true,/,
+    "126/127 必须归为 ran:false + unavailable，而不是 ok:false 的验证失败",
+  );
+  assert.match(SRC, /验证器不可用：/, "报告措辞必须和真实的验证失败区分开");
+  // 收尾门禁要分别措辞，否则模型会把"没装工具"当成代码错误去追。
+  assert.match(SRC, /\} else if \(_finalVr\.unavailable\) \{/);
+
+  // 源头：不能只因为存在 requirements.txt 就断定 ruff/pytest 可用。
+  assert.doesNotMatch(SRC, /return "ruff check \. && pytest"/,
+    "不得无条件返回未经存在性检查的 ruff/pytest");
+  assert.match(SRC, /python3 -m compileall -q \./,
+    "两者都没有时要退回一定存在的语法编译检查，而不是给一条跑不了的命令");
+  assert.match(SRC, /\.venv\/bin/, "优先用项目自带的虚拟环境");
+});
+

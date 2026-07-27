@@ -1484,6 +1484,20 @@ const chatEl = $("chat");
 // 开：localStorage.setItem("mide_memprobe","1") 后重载；关：removeItem。
 // 每 15 秒一行，前缀 [MEMPROBE] 便于从终端输出里 grep。
 const _MEMPROBE_FILE = "/tmp/michael-ide-memprobe.log";
+// 抓资源加载失败的**真实 URL**。Safari 的 "Importing a module script failed" 不带 URL，
+// 而 window 的 error 事件（捕获阶段）能拿到失败的 script/module 地址。
+try {
+  window.addEventListener("error", (ev) => {
+    const url = ev?.target?.src || ev?.target?.href || "";
+    if (!url) return;
+    try {
+      backend.readTextFile("/tmp/michael-ide-memprobe.log").catch(() => "").then((prev) =>
+        backend.writeTextFile("/tmp/michael-ide-memprobe.log",
+          String(prev || "") + `[MEMPROBE] resourceFail ${String(url).slice(0, 200)}\n`)).catch(() => {});
+    } catch {}
+  }, true);
+} catch {}
+
 function _memProbeStart() {
   // dev 下自动开；生产要显式 localStorage.setItem("mide_memprobe","1")。
   let on = false;
@@ -1519,12 +1533,49 @@ function _memProbeStart() {
       // Monaco 模型：关标签页没 dispose 的话会一直留着，且带完整分词状态。
       let models = 0, modelChars = 0;
       try {
-        const ms = (window.monaco?.editor?.getModels?.() || []);
+        const ms = (monaco?.editor?.getModels?.() || []);
         models = ms.length;
         for (const mo of ms) modelChars += (mo.getValueLength?.() ?? 0);
       } catch {}
       // blob: URL 泄漏（图片/附件 createObjectURL 后没 revoke）。
       const blobs = document.querySelectorAll('[src^="blob:"],[href^="blob:"]').length;
+      // 语法高亮排查：注册的语言数 + 每个打开模型的语言 id。高亮全丢时先看这两个数：
+      // 语言数只剩个位数 = monaco 桶导入没完成；语言 id 是 plaintext = 检测环节断了。
+      let langInfo = "";
+      try {
+        // monaco 是模块 import，不挂在 window 上 —— 上一版探针读 window.monaco 得到
+        // langs=0，那是测量错误不是证据。这里用模块作用域内的绑定。
+        const langs = (monaco?.languages?.getLanguages?.() || []).length;
+        const ids = (monaco?.editor?.getModels?.() || []).map((m) => m.getLanguageId?.() || "?");
+        langInfo = ` langs=${langs} modelLangs=[${ids.slice(0, 6).join(",")}]`;
+      } catch (e) { langInfo = " langs=ERR:" + String(e?.message || e).slice(0, 60); }
+      // 一次性自检：分词器和主题各自是否在工作。三种病的表现完全不同 ——
+      //   tok=0        语法没加载（onLanguage 的动态 import 失败）
+      //   tok>0 col=0  分词正常但主题没给颜色
+      //   两者都正常   说明是 CSS/渲染层，去看 .mtk* 规则有没有被覆盖
+      if (true) {
+        // tokenize 走**编辑器同一条**分词路径；colorize 另有一条。两者分开报告，
+        // 否则会把"colorize 坏了"误当成"编辑器高亮坏了"。
+        try {
+          const rows = monaco.editor.tokenize("def f(x):\n    return 'a'", "python") || [];
+          const types = rows.flat().map((t) => t.type).filter((t) => t && t !== "");
+          sink(`[MEMPROBE] tokenize n=${types.length} uniq=[${[...new Set(types)].slice(0, 5).join("|")}]`);
+        } catch (e) { sink("[MEMPROBE] tokenize ERR " + String(e?.message || e).slice(0, 90)); }
+        monaco.editor.colorize("def f(x):\n    return 'a'", "python", { tabSize: 2 })
+          .then((html) => {
+            const classes = [...String(html).matchAll(/class="([^"]*mtk[^"]*)"/g)].map((m) => m[1]);
+            sink(`[MEMPROBE] colorize mtkSpans=${classes.length} uniq=[${[...new Set(classes)].slice(0, 5).join(",")}]`);
+          })
+          .catch((e) => sink("[MEMPROBE] colorize ERR " + String(e?.message || e).slice(0, 80)));
+        // 直接复现 monaco 的懒加载，把**真实 URL 和错误**打出来 ——
+        // "Importing a module script failed" 是 Safari 的通用文案，不指向原因。
+        const probeUrl = new URL("../node_modules/monaco-editor/esm/vs/basic-languages/python/python.js", import.meta.url).href;
+        import(/* @vite-ignore */ probeUrl)
+          .then((m) => sink(`[MEMPROBE] langImport OK keys=${Object.keys(m || {}).slice(0, 3).join(",")} url=${probeUrl}`))
+          .catch((e) => sink(`[MEMPROBE] langImport FAIL ${String(e?.message || e).slice(0, 90)} url=${probeUrl}`));
+        fetch(probeUrl).then((r) => sink(`[MEMPROBE] langFetch http=${r.status} type=${r.headers.get("content-type")}`))
+          .catch((e) => sink("[MEMPROBE] langFetch ERR " + String(e?.message || e).slice(0, 60)));
+      }
       const chatNodes = chatEl ? chatEl.querySelectorAll("*").length : 0;
       // base64 图片是单项体积最大的东西：一张截图 0.5–5MB，留在 DOM 里就一直占着。
       const imgs = document.querySelectorAll('img[src^="data:"]').length;
@@ -1543,7 +1594,7 @@ function _memProbeStart() {
         `canvas=${canvasCount}/${mb(canvasBytes)}MB(+${mb(delta)},max ${canvasMax || "-"}) ` +
         `models=${models}/${Math.round(modelChars / 1024)}KB blobs=${blobs} ` +
         `nodes=${nodes} chatNodes=${chatNodes} ` +
-        `dataImgs=${imgs}/${mb(imgBytes)}MB msgs=${msgs}/${mb(msgBytes)}MB`;
+        `dataImgs=${imgs}/${mb(imgBytes)}MB msgs=${msgs}/${mb(msgBytes)}MB` + langInfo;
       console.log(line);
       sink(line);
     } catch (e) {
@@ -30470,7 +30521,25 @@ async function _detectVerifyCmd(root, stack = null) {
       return "npx --no-install eslint .";
     }
   } catch {}
-  if (await has("pyproject.toml") || await has("requirements.txt")) return "ruff check . && pytest";
+  // Python：不能只因为存在 requirements.txt 就断定 ruff/pytest 可用 —— 实测退出 127
+  // （command not found），报告写成"验证失败"，看着像代码坏了，实际只是没装。
+  //
+  // 优先用项目自己的虚拟环境（venv 里有就一定能跑），其次才看系统里有没有；两者都没有
+  // 就退回**一定存在**的语法编译检查 —— 它至少能抓语法错和 import 时错误，比给一条跑
+  // 不了的命令强得多。
+  if (await has("pyproject.toml") || await has("requirements.txt") || await has("setup.py")) {
+    for (const venv of [".venv/bin", "venv/bin", ".venv/Scripts", "venv/Scripts"]) {
+      if (await has(`${venv}/python`) || await has(`${venv}/python.exe`)) {
+        const py = `${venv}/python`;
+        const parts = [];
+        if (await has(`${venv}/ruff`)) parts.push(`${venv}/ruff check .`);
+        if (await has(`${venv}/pytest`)) parts.push(`${venv}/pytest -q`);
+        if (parts.length) return parts.join(" && ");
+        return `${py} -m compileall -q .`;
+      }
+    }
+    return "python3 -m compileall -q .";
+  }
   return null;
 }
 
@@ -33755,6 +33824,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_finalVr.ok) {
           _verifiedAtImplOps = _implOps;
           finalVerificationNote = `〔结束前自动验证通过：${_finalCmd}〕`;
+        } else if (_finalVr.unavailable) {
+          // 验证器不存在 ≠ 代码有问题。措辞必须区分，否则模型（和用户）会把它当成
+          // 代码错误去追，而正确动作是换一条本项目真能跑的命令。
+          finalVerificationNote = `〔${_finalVr.report}〕`;
         } else {
           finalVerificationNote = `〔结束前自动验证未通过：${_finalVr.report || `exit ${_finalVr.code ?? "?"}`}〕`;
         }
@@ -34224,6 +34297,7 @@ function _ensureLiveEditorWritePreview(entry, root) {
 
 const _WPDIAG_FILE = "/tmp/michael-ide-writepreview.log";
 let _wpDiagLast = "";
+let _memProbeSelfTested = false;
 /// 写入预览诊断：只在 dev 下记录，且只在**状态变化**时写一行，避免每帧一条。
 ///
 /// 为什么需要它：静态读代码时这条链上每一道守卫看起来都是对的（脏标记有
@@ -43003,6 +43077,21 @@ async function _interleavedTest(root, testCmd) {
     const timedOut = !!(r?.timedOut ?? r?.timed_out) || code === -1;
     const failed = timedOut || code !== 0;
     if (!failed) return { ran: true, ok: true, code, timedOut: false, report: "" };
+    // 退出码 126/127 = **验证器本身不存在或不可执行**（command not found / not
+    // executable），它对用户代码没有任何断言。把它当"验证失败"是假阴性：报告会说
+    // 「验证失败: ruff check . && pytest 退出 127」，看起来像代码有问题，而实际只是
+    // 这台机器没装 ruff/pytest。更糟的是收尾门禁据此判定"未验证"，于是本来能继续修的
+    // 一轮被直接结束。改为 ran:false —— 与"这个项目识别不出验证命令"同一语义。
+    if (code === 127 || code === 126) {
+      return {
+        ran: false,
+        ok: false,
+        code,
+        timedOut: false,
+        unavailable: true,
+        report: `验证器不可用：\`${testCmd}\` 退出 ${code}（命令不存在或不可执行）。这不代表代码有问题；装上工具或改用本项目实际可运行的命令再验。`,
+      };
+    }
     // Truncate to first ~40 lines so we don't blow context with a 5000-line test log.
     const lines = out.split("\n");
     let detail;
