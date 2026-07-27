@@ -23585,7 +23585,7 @@ const _TOOL_BUNDLES = {
 };
 const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) => b.tools));
 // 常驻的 search_tools 元工具——provider 无关的 Tool-Search：模型描述需求即按需拉取。
-const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具。先用项目证据、记忆、内置 knowledge_search 和稳定知识推理；只有答案存在明确的当前事实缺口时才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。专用能力可按名查询并加载：local_discovery（查周边/附近/POI）、shop_catalog（查店铺官网公开商品/菜单/价格/库存）、live_environment（天气/空气/地震）、live_flights（航班/航空器）、live_markets（参考汇率/加密资产报价）、road_environment（交通/路况）、track_shipment（快递/物流）；knowledge_search（内置知识库）和 current_time（当前时间）通常已在核心工具中。确需当前社区/仓库/网页证据时再加载 developer_community_search、stackoverflow_search、github_search、github_repo、gitlab_repo、gitee_repo、codeberg_repo 或 web_search；要读具体代码仓库的 README/目录/源码/release/issue/PR/MR：GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo，不要停在搜索列表。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；游戏价格/平台加载 steam_search；优惠/薅羊毛/返利/比价加载 smzdm_search，二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。拿到社区/GitHub/论坛/优惠平台/专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。用户只提供上下文而没提出查询时不要调用。`;
+const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具，**工程与桌面能力同样从这里加载**：终端/进程（list_terminals、read_terminal、run_cmd 变体）、浏览器自动化（browser、screenshot、capture_*）、数据库（db_query）、Git 全套、LSP/诊断、设计与预览（design_board、preview_choices、visual_compare）、自动化与桌面（read_screen、ui_click、automation）——当前列表没有某个工具不代表能力不存在，先按名或按用途查一次。先用项目证据、记忆、内置 knowledge_search 和稳定知识推理；只有答案存在明确的当前事实缺口时才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。专用能力可按名查询并加载：local_discovery（查周边/附近/POI）、shop_catalog（查店铺官网公开商品/菜单/价格/库存）、live_environment（天气/空气/地震）、live_flights（航班/航空器）、live_markets（参考汇率/加密资产报价）、road_environment（交通/路况）、track_shipment（快递/物流）；knowledge_search（内置知识库）和 current_time（当前时间）通常已在核心工具中。确需当前社区/仓库/网页证据时再加载 developer_community_search、stackoverflow_search、github_search、github_repo、gitlab_repo、gitee_repo、codeberg_repo 或 web_search；要读具体代码仓库的 README/目录/源码/release/issue/PR/MR：GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo，不要停在搜索列表。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；游戏价格/平台加载 steam_search；优惠/薅羊毛/返利/比价加载 smzdm_search，二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。拿到社区/GitHub/论坛/优惠平台/专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。用户只提供上下文而没提出查询时不要调用。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
 // 全量注册表 { name → schema }。
 function _buildToolRegistry(includeWrite, mcpTools = []) {
@@ -23608,7 +23608,13 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     reviewer: [
       "read_file", "search", "find_files", "get_diagnostics", "git_diff",
     ],
-    agent: ["read_file", "list_dir", "search", "find_files", "update_plan"],
+    // 写入三件套必须在第 1 轮就位。这里自称 mirrors Claude Code's ToolSearch shape，
+    // 但 Claude Code 的核心工具**恰恰包含** Edit/Write/Bash —— 被懒加载的是 MCP 和
+    // 专项工具，不是"编辑文件"这种 agent 的主职。实测后果：模型第 1 轮拿不到写工具、
+    // search_tools 的说明书又只宣传外部信息源，于是它认定自己没有写入能力，反过来
+    // 要求用户"把 edit_file / write_file / run_cmd 暴露给我"。
+    agent: ["read_file", "list_dir", "search", "find_files", "update_plan",
+            "write_file", "edit_file", "multi_edit", "run_cmd"],
   };
   const role = Object.prototype.hasOwnProperty.call(roleCore, mode) ? mode : (includeWrite ? "agent" : "explorer");
   const coreNames = new Set(roleCore[role]);

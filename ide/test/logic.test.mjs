@@ -8213,10 +8213,15 @@ test("plain Agent turns keep project diagnostics, mutation, terminal, and Git sc
     _buildAgentToolSchemas: () => catalog,
   });
   const names = select(true, "你好，先聊聊", [], "agent").map((tool) => tool.function.name);
+  // 写入三件套在第 1 轮就位 —— 这是**有意的契约变更**。此前 write/edit/run_cmd 也走
+  // 懒加载，而 search_tools 的说明书只宣传外部信息源，实测后果是模型认定自己没有
+  // 写入能力，反过来要求用户"把 edit_file / write_file 暴露给我"。参照的 Claude Code
+  // 本身就把 Edit/Write/Bash 放核心：懒加载的该是 MCP 和专项工具，不是 agent 的主职。
   assert.deepEqual(names, [
-    "read_file", "list_dir", "search", "find_files", "update_plan", "search_tools",
+    "read_file", "list_dir", "search", "find_files", "update_plan",
+    "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
-  for (const deferred of ["get_diagnostics", "edit_file", "run_cmd", "git_status", "read_terminal"]) {
+  for (const deferred of ["get_diagnostics", "git_status", "read_terminal", "run_in_terminal"]) {
     assert.ok(!names.includes(deferred), `${deferred} should not tax a plain Agent turn`);
   }
 });
@@ -8242,10 +8247,13 @@ test("engineering Agent turns keep evidence and mutation schemas on demand", () 
     _buildAgentToolSchemas: () => catalog,
   });
   const names = select(true, "修复认证逻辑并补测试", [], "agent").map((tool) => tool.function.name);
-  assert.deepEqual(names, ["read_file", "list_dir", "search", "find_files", "update_plan", "search_tools"]);
+  // "修复认证逻辑并补测试"是明确的写任务，写入三件套必须在第 1 轮就位（见上一个测试的注释）。
+  assert.deepEqual(names, [
+    "read_file", "list_dir", "search", "find_files", "update_plan",
+    "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
+  ]);
   for (const deferred of [
-    "semantic_search", "get_diagnostics", "lsp_definition", "edit_file", "multi_edit",
-    "write_file", "run_cmd", "git_status", "git_diff",
+    "semantic_search", "get_diagnostics", "lsp_definition", "git_status", "git_diff",
   ]) {
     assert.ok(!names.includes(deferred), `engineering turn should load ${deferred} only when requested`);
   }
