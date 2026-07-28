@@ -72,6 +72,39 @@ Backups are written atomically to `/var/backups/michael-ide`, verified with
 `pg_restore --list`, checksummed, and retained for 14 days by default. A separate
 off-host snapshot should still be configured for disaster recovery.
 
+## Effective-context evaluation
+
+`scripts/context-eval.mjs` measures the 1M/2M/5M compression tiers with exact
+needles near 5%, 50%, and 95% plus facts that require multi-hop recall. It uploads
+history incrementally below the 12 MiB request limit and follows the gateway's
+prefix contract. The default is a no-cost dry run:
+
+```bash
+node scripts/context-eval.mjs --tier 1m
+```
+
+Paid requests require a dedicated evaluation account key and an explicit flag:
+
+```bash
+MICHAEL_EVAL_API_KEY=... node scripts/context-eval.mjs --tier 1m --execute
+```
+
+For the PostgreSQL recovery check, also set `MICHAEL_EVAL_SSH_TARGET`,
+`MICHAEL_EVAL_SSH_KEY`, and `MICHAEL_EVAL_COMPOSE_DIR`, then add
+`--verify-pg-recovery`. That mode reads the evaluation prefix record from
+PostgreSQL, deletes only its related Redis prefix/summary/archive/search keys,
+and performs recall through the same prefix. Secrets and raw prefix tokens are
+never written to the report.
+
+Use the same `--run-id` for sequential 2M and 5M runs. Their fixture prefix is
+byte-stable, so the 5M run reuses the 2M segment cache and only compresses newly
+added history. This lowers evaluation cost while testing the production cache
+contract.
+
+These are effective-context tests, not a claim that compression gives a model a
+native full-attention 1M/2M/5M window. A pass proves durable storage, retrieval,
+and end-model recall for the tested facts and workload.
+
 ## Make yourself an admin
 
 After registering once:

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,60 @@ enum CachedUpdate {
 static MANIFEST_CACHE: LazyLock<RwLock<Option<CachedManifest>>> =
     LazyLock::new(|| RwLock::new(None));
 static MANIFEST_FETCH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+// tag → (fetched_at, 资产名 → GitHub asset id)。私有仓库的安装包必须由网关带 token
+// 代下载，这里缓存 release 的资产清单，公开下载路由不用每个请求都打 GitHub API。
+const ASSET_MAP_TTL: Duration = Duration::from_secs(600);
+static ASSET_MAP_CACHE: LazyLock<RwLock<HashMap<String, (Instant, HashMap<String, u64>)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 公开下载路由的路径段白名单：GitHub tag/资产名只含字母数字与 . _ -（空格上传时已被
+/// GitHub 转成点）。拒绝一切越界字符，杜绝路径拼接歧义。
+fn safe_release_path_segment(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && !value.starts_with('.')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// 私有仓库的 GitHub 资产 URL 匿名不可下载：把清单里的安装包地址重写到网关代理路由。
+/// 签名内容内嵌在清单 signature 字段里，无需重写。
+fn rewrite_manifest_urls(state: &AppState, manifest: &mut Value, tag: &str) {
+    let base = state.cfg.ide_update_public_base.trim_end_matches('/').to_owned();
+    let Some(platforms) = manifest.get_mut("platforms").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for entry in platforms.values_mut() {
+        let Some(item) = entry.as_object_mut() else { continue };
+        let Some(url) = item.get("url").and_then(Value::as_str) else { continue };
+        let Some(file) = url.rsplit('/').next() else { continue };
+        if !safe_release_path_segment(file, 160) {
+            continue;
+        }
+        let proxied = format!("{base}/api/ide/update/download/{tag}/{file}");
+        item.insert("url".to_owned(), Value::String(proxied));
+    }
+}
+
+fn release_asset_map(release: &Value) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for asset in release
+        .get("assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(name), Some(id)) = (
+            asset.get("name").and_then(Value::as_str),
+            asset.get("id").and_then(Value::as_u64),
+        ) {
+            map.insert(name.to_owned(), id);
+        }
+    }
+    map
+}
 
 fn manifest_response(body: Vec<u8>, stale: bool) -> Response {
     let cache_control = if stale {
@@ -610,6 +665,12 @@ pub async fn latest(State(state): State<AppState>) -> Response {
         return cached_response(cached, false);
     }
 
+    // 配了 GitHub token 就走 API 取清单（私有仓库匿名 404 → 之前永远 204"无更新"）。
+    // 未配 token 的公开仓库保持原匿名直拉路径不变。
+    if !state.cfg.ide_release_github_token.trim().is_empty() {
+        return latest_via_github_api(&state).await;
+    }
+
     let response = match state
         .update_http
         .get(&state.cfg.ide_update_manifest_url)
@@ -689,6 +750,186 @@ pub async fn latest(State(state): State<AppState>) -> Response {
         fetched_at: Instant::now(),
     });
     manifest_response(body, false)
+}
+
+/// 私有仓库路径：带 token 从 GitHub API 取最新已发布 Release 的 latest.json，
+/// 登记资产清单供代理下载，并把安装包 URL 重写到网关。缓存/兜底语义与匿名路径一致。
+async fn latest_via_github_api(state: &AppState) -> Response {
+    let base = match github_api_base(state) {
+        Ok(base) => base,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let response = match github_request(
+        state,
+        state.update_http.get(format!("{base}/releases/latest")),
+    )
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "IDE update latest release fetch failed");
+            return cached_manifest(false)
+                .await
+                .map(|cached| cached_response(cached, true))
+                .unwrap_or_else(|| StatusCode::BAD_GATEWAY.into_response());
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        *MANIFEST_CACHE.write().await = Some(CachedManifest {
+            result: CachedUpdate::NoUpdate,
+            fetched_at: Instant::now(),
+        });
+        return no_update_response(false);
+    }
+    if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "IDE update latest release rejected");
+        return cached_manifest(false)
+            .await
+            .map(|cached| cached_response(cached, true))
+            .unwrap_or_else(|| StatusCode::BAD_GATEWAY.into_response());
+    }
+    let release: Value = match response.json().await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "IDE update latest release was not valid JSON");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let tag = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if !safe_release_path_segment(&tag, 64) {
+        tracing::warn!(%tag, "IDE update release tag unsafe for proxy path");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    // 旧流水线的 Release 没有 latest.json：这不是故障，是「没有可推送的更新」。
+    // 缓存 NoUpdate → 客户端看到"已是最新"，而不是每次手动检查都报 502。
+    let has_manifest_asset = release_asset_map(&release).contains_key("latest.json");
+    if !has_manifest_asset {
+        *MANIFEST_CACHE.write().await = Some(CachedManifest {
+            result: CachedUpdate::NoUpdate,
+            fetched_at: Instant::now(),
+        });
+        return no_update_response(false);
+    }
+    let mut manifest = match download_release_manifest(state, &base, &release).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error.msg, "IDE update manifest download failed");
+            return cached_manifest(false)
+                .await
+                .map(|cached| cached_response(cached, true))
+                .unwrap_or_else(|| StatusCode::BAD_GATEWAY.into_response());
+        }
+    };
+    if let Err(error) = validate_manifest(&manifest) {
+        tracing::warn!(%error, "IDE update manifest failed validation");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    ASSET_MAP_CACHE
+        .write()
+        .await
+        .insert(tag.clone(), (Instant::now(), release_asset_map(&release)));
+    rewrite_manifest_urls(state, &mut manifest, &tag);
+    let body = match serde_json::to_vec(&manifest) {
+        Ok(body) => body,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    *MANIFEST_CACHE.write().await = Some(CachedManifest {
+        result: CachedUpdate::Manifest(body.clone()),
+        fetched_at: Instant::now(),
+    });
+    manifest_response(body, false)
+}
+
+/// 公开的更新包代理：私有仓库的 Release 资产匿名拿不到，网关带 token 流式转发。
+/// 只暴露「已发布（非草稿）Release 的真实资产」，路径段严格白名单，token 绝不外泄
+///（reqwest 跨域名重定向到 S3 时自动剥掉 Authorization）。
+pub async fn download_asset(
+    State(state): State<AppState>,
+    Path((tag, file)): Path<(String, String)>,
+) -> Response {
+    if state.cfg.ide_release_github_token.trim().is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !safe_release_path_segment(&tag, 64) || !safe_release_path_segment(&file, 160) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let base = match github_api_base(&state) {
+        Ok(base) => base,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let mut asset_id = None;
+    if let Some((fetched_at, map)) = ASSET_MAP_CACHE.read().await.get(&tag) {
+        if fetched_at.elapsed() < ASSET_MAP_TTL {
+            asset_id = map.get(&file).copied();
+        }
+    }
+    if asset_id.is_none() {
+        let release = match github_json(
+            "读取 Release",
+            github_request(
+                &state,
+                state.update_http.get(format!("{base}/releases/tags/{tag}")),
+            ),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        // 草稿 Release 不通过公开代理暴露（发布流转正之前不可下载）。
+        if release.get("draft").and_then(Value::as_bool) == Some(true) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let map = release_asset_map(&release);
+        asset_id = map.get(&file).copied();
+        ASSET_MAP_CACHE
+            .write()
+            .await
+            .insert(tag.clone(), (Instant::now(), map));
+    }
+    let Some(asset_id) = asset_id else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let response = match github_request(
+        &state,
+        state
+            .update_http
+            .get(format!("{base}/releases/assets/{asset_id}")),
+    )
+    .header("Accept", "application/octet-stream")
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "IDE update asset fetch failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "IDE update asset upstream rejected");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "public, max-age=86400, immutable")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file}\""),
+        );
+    if let Some(length) = response.content_length() {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    builder
+        .body(axum::body::Body::from_stream(response.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[cfg(test)]

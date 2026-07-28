@@ -135,6 +135,16 @@ pub struct AiConfig {
     pub ide_mode: Option<String>,
     #[serde(default)]
     pub ide_tools: Option<String>,
+    /// Versioned semantic routing decisions produced by the IDE's model-backed engineering
+    /// classifier. The gateway uses these flags to select Prompt Graph modules without parsing
+    /// the user's prose a second time.
+    #[serde(default)]
+    pub ide_semantic_profile: Option<String>,
+    /// ISO 3166-1 alpha-2 region code (lowercase) resolved by the IDE from the user's real
+    /// IP egress (Cloudflare trace) with timezone fallback. The gateway uses it to inject
+    /// region-appropriate package mirror guidance (e.g. npmmirror for mainland China).
+    #[serde(default)]
+    pub ide_region: Option<String>,
     /// michael-compression 的档位（"1m"/"2m"/"5m"），由 /api/me 下发、客户端原样回传。
     ///
     /// 这个字段此前**不存在**：JS 侧设了 `config.michaelCompression`，serde 默认忽略
@@ -150,6 +160,9 @@ pub struct AiConfig {
     /// 875k token）卡死，5M 档在物理上不可达。
     #[serde(default)]
     pub mc_prefix: Option<String>,
+    /// 与 mc_prefix 一起回发的覆盖条数，服务端用它校验客户端裁剪口径。
+    #[serde(default)]
+    pub mc_prefix_covered: Option<usize>,
     /// User-local wall-clock context. The IANA name is a label; the bounded
     /// offset is the source of truth for the current instant (including DST).
     #[serde(default)]
@@ -383,6 +396,22 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }
     if let Some(t) = config.ide_tools.as_deref().filter(|s| !s.is_empty()) {
         rb = rb.header("x-ide-tools", t);
+    }
+    if let Some(profile) = config.ide_semantic_profile.as_deref().filter(|profile| {
+        profile.starts_with("2.5:")
+            && profile.len() <= 1024
+            && profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b':' | b',' | b'_')
+            })
+    }) {
+        rb = rb.header("x-ide-semantic-profile", profile);
+    }
+    if let Some(region) = config.ide_region.as_deref().filter(|region| {
+        (2..=8).contains(&region.len()) && region.bytes().all(|byte| byte.is_ascii_lowercase())
+    }) {
+        rb = rb.header("x-ide-region", region);
     }
     // 只放行已知档位。网关侧还会按会员套餐再钳一次，这里的白名单是防止把任意字符串
     // 当档位发出去。
@@ -816,8 +845,10 @@ mod ide_header_tests {
             request_id: None,
             ide_mode: Some("agent".into()),
             ide_tools: None,
+            ide_semantic_profile: Some("2.5:engineering,design,existing_project".into()),
             michael_compression: None,
             mc_prefix: None,
+            mc_prefix_covered: None,
             ide_timezone: Some("America/Los_Angeles".into()),
             ide_utc_offset_minutes: Some(-420),
         }
@@ -831,6 +862,10 @@ mod ide_header_tests {
             .build()
             .unwrap();
         assert_eq!(request.headers()["x-ide-request-id"], "req_12345678");
+        assert_eq!(
+            request.headers()["x-ide-semantic-profile"],
+            "2.5:engineering,design,existing_project"
+        );
         assert_eq!(request.headers()["x-ide-timezone"], "America/Los_Angeles");
         assert_eq!(request.headers()["x-ide-utc-offset-minutes"], "-420");
     }
@@ -950,8 +985,10 @@ mod stream_timeout_tests {
             request_id: None,
             ide_mode: None,
             ide_tools: None,
+            ide_semantic_profile: None,
             michael_compression: None,
             mc_prefix: None,
+            mc_prefix_covered: None,
             ide_timezone: None,
             ide_utc_offset_minutes: None,
         }
@@ -1326,9 +1363,7 @@ mod stream_timeout_tests {
             let _ = second.read(&mut [0_u8; 4096]);
             std::thread::sleep(Duration::from_millis(60));
             second
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .unwrap();
         });
 
@@ -1552,6 +1587,9 @@ async fn ai_chat_inner(
         .filter(|s| !s.is_empty() && s.len() <= 200)
     {
         payload["mc_prefix"] = serde_json::json!(tok);
+        if let Some(covered) = config.mc_prefix_covered.filter(|covered| *covered > 0) {
+            payload["mc_prefix_covered"] = serde_json::json!(covered);
+        }
     }
     if let Some(ref t) = tools {
         if !t.is_empty() {
@@ -1606,6 +1644,7 @@ async fn ai_chat_inner(
     // asking for usage stats can never break chat.
     if resp.status().is_client_error()
         && resp.status() != reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        && resp.status() != reqwest::StatusCode::CONFLICT
         && payload.get("stream_options").is_some()
     {
         if let Some(o) = payload.as_object_mut() {

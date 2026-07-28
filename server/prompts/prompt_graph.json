@@ -9,6 +9,7 @@
   "agent": {
     "base": ["agent_core", "reasoning", "truthfulness", "answer_quality"],
     "engineering": ["agent_engineering"],
+    "collaboration": ["agent_collaboration"],
     "research": ["agent_research"],
     "automation": ["agent_automation"],
     "git": ["git_guide"]

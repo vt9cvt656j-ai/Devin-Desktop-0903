@@ -328,6 +328,64 @@ impl RpcServer {
                 }
                 Ok(serde_json::json!({ "status": "ok", "replayed": done }))
             }
+
+            // ── 窗口/屏幕：平台层早就有（enumerate/activate/screen_info），此前一直没暴露给 RPC，
+            //    AI 桌面自动化最需要的"激活目标应用再操作"因此做不了。补齐。 ──
+            #[cfg(feature = "system")]
+            "window.list" => {
+                drop(agent);
+                let ctrl = crate::platform::get_window_controller();
+                let wins = ctrl.enumerate_windows()?;
+                let list: Vec<serde_json::Value> = wins.iter().map(|w| serde_json::json!({
+                    "title": w.title, "process": w.process_name,
+                    "x": w.x, "y": w.y, "width": w.width, "height": w.height,
+                    "visible": w.is_visible, "minimized": w.is_minimized,
+                })).collect();
+                Ok(serde_json::json!({ "windows": list }))
+            }
+            #[cfg(feature = "system")]
+            "window.activate" => {
+                let title = params.get("title").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
+                drop(agent);
+                crate::platform::get_window_controller().activate_window(title)?;
+                Ok(serde_json::json!({ "status": "ok" }))
+            }
+            #[cfg(feature = "system")]
+            "window.minimize" => {
+                let title = params.get("title").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'title' parameter")))?;
+                drop(agent);
+                crate::platform::get_window_controller().minimize_window(title)?;
+                Ok(serde_json::json!({ "status": "ok" }))
+            }
+            #[cfg(feature = "system")]
+            "screen.info" => {
+                drop(agent);
+                let info = crate::platform::get_window_controller().get_screen_info()?;
+                Ok(serde_json::json!({ "width": info.width, "height": info.height, "scale_factor": info.scale_factor }))
+            }
+
+            // ── 剪贴板：agent.rs 早就实现（clipboard_get/set、quick_paste 粘贴长文本比逐键快百倍），补暴露。 ──
+            #[cfg(feature = "system")]
+            "clipboard.get" => {
+                let text = agent.clipboard_get_text()?;
+                Ok(serde_json::json!({ "text": text }))
+            }
+            #[cfg(feature = "system")]
+            "clipboard.set" => {
+                let text = params.get("text").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
+                agent.clipboard_set_text(text)?;
+                Ok(serde_json::json!({ "status": "ok" }))
+            }
+            #[cfg(feature = "system")]
+            "keyboard.paste" => {
+                let text = params.get("text").and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'text' parameter")))?;
+                agent.quick_paste(text)?;
+                Ok(serde_json::json!({ "status": "ok" }))
+            }
             _ => Err(Error::Other(anyhow::anyhow!("Unknown method: {}", method))),
         }
     }

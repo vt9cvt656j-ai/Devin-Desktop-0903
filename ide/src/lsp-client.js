@@ -614,6 +614,9 @@ export function createLspManager(options) {
     backend,
     onLog,
     onStatus,
+    // LspClient._startInner 里用 this.manager.isWorkspaceTrusted() 决定
+    // trustWorkspaceBinaries——必须挂在这个内部 manager 上，不能只挂公开返回面。
+    isWorkspaceTrusted,
     workspaceRoots,
     primaryRootUri,
     applyDiagnostics,

@@ -15,8 +15,9 @@ import assert from "node:assert/strict";
 import * as acorn from "acorn";
 import exifr from "exifr";
 import { stripToolIp } from "../build/strip-tool-ip.mjs";
-import { ConversationMemory, serializeMessagesForPersistence } from "../src/conversation-memory.js";
+import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
+import { compactToolExampleArgs, compactToolGuide } from "../src/tool-guides.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
@@ -38,6 +39,8 @@ const TAURI_AI = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
 const TAURI_NET = readFileSync(join(HERE, "../src-tauri/src/net.rs"), "utf8");
 const REMOTE_AGENT = readFileSync(join(HERE, "../remote-agent/michael-remote-agent.py"), "utf8");
 const SERVER_MODELS = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
+const SERVER_COMPRESSION = readFileSync(join(HERE, "../../server/src/compression.rs"), "utf8");
+const SERVER_CONTEXT_MIGRATION = readFileSync(join(HERE, "../../server/migrations/0023_context_archives.sql"), "utf8");
 const SERVER_MAIN = readFileSync(join(HERE, "../../server/src/main.rs"), "utf8");
 const SERVER_TOOLS = readFileSync(join(HERE, "../../server/prompts/tools.json"), "utf8");
 const SERVER_PROMPT_AGENT = readFileSync(join(HERE, "../../server/prompts/agent.txt"), "utf8");
@@ -47,6 +50,7 @@ const SERVER_PROMPT_SUBAGENT = readFileSync(join(HERE, "../../server/prompts/sub
 const SERVER_PROMPT_WORKER = readFileSync(join(HERE, "../../server/prompts/worker_system.txt"), "utf8");
 const SERVER_PROMPT_RESEARCH = readFileSync(join(HERE, "../../server/prompts/research_prompt.txt"), "utf8");
 const SERVER_PROMPT_DESIGN = readFileSync(join(HERE, "../../server/prompts/design_research_prompt.txt"), "utf8");
+const SERVER_PROMPT_REASONING = readFileSync(join(HERE, "../../server/prompts/reasoning.txt"), "utf8");
 const TAURI_CONFIG = JSON.parse(readFileSync(join(HERE, "../src-tauri/tauri.conf.json"), "utf8"));
 const TAURI_PACKAGE_CONFIG = JSON.parse(readFileSync(join(HERE, "../src-tauri/tauri.package.conf.json"), "utf8"));
 const RELEASE_WORKFLOW = readFileSync(join(HERE, "../../.github/workflows/ide-package.yml"), "utf8");
@@ -144,35 +148,6 @@ const NORM_REL = load("_normRel", { _normalizeFsPath: NORMALIZE_PATH, _pathIdent
 const BASENAME = load("basename");
 const RUNTIME_OBLIGATION_ORDER = ["build", "run", "test", "install", "package"];
 const EXTERNAL_OBLIGATION_ORDER = ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"];
-
-function engineeringHelpers() {
-  const negatedEffectKinds = load("_negatedEffectKindsForTask");
-  const directDatabaseMutation = load("_looksLikeDirectDatabaseMutation");
-  const gitSignals = load("_gitTaskSignals", {
-    _negatedEffectKindsForTask: negatedEffectKinds,
-    _externalObligationsForTask: (text) => externalObligations(text),
-  });
-  const runtimeCommandKinds = load("_runtimeCommandKinds", { _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER });
-  const runtimeObligations = load("_runtimeObligationsForTask", {
-    _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
-    _runtimeCommandKinds: runtimeCommandKinds,
-    _negatedEffectKindsForTask: negatedEffectKinds,
-  });
-  const externalObligations = load("_externalObligationsForTask", {
-    _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
-    _negatedEffectKindsForTask: negatedEffectKinds,
-    _looksLikeDirectDatabaseMutation: directDatabaseMutation,
-  });
-  const explicitExternal = load("_explicitExternalEffectRequested", { _externalObligationsForTask: externalObligations });
-  const profile = load("_engineeringTaskProfile", {
-    _runtimeObligationsForTask: runtimeObligations,
-    _externalObligationsForTask: externalObligations,
-    _explicitExternalEffectRequested: explicitExternal,
-    _looksLikeDirectDatabaseMutation: directDatabaseMutation,
-    _gitTaskSignals: gitSignals,
-  });
-  return { negatedEffectKinds, directDatabaseMutation, gitSignals, runtimeCommandKinds, runtimeObligations, externalObligations, explicitExternal, profile };
-}
 
 // ---- tests ---------------------------------------------------------------------------
 test("main stylesheet is loaded through the JS entry so Vite dev does not serve CSS as a JS module to a link tag", () => {
@@ -525,7 +500,7 @@ test("disposed Monaco models are ignored by deferred symbol refresh", () => {
 });
 
 test("session restore builds saved tabs before one final activation", () => {
-  assert.match(SRC, /openFile\(t\.path, t\.name, false\)/);
+  assert.match(SRC, /openFile\(t\.path, t\.name, false, restoreOptions\)/);
   assert.match(SRC, /if \(session\.activePath && openFiles\.has\(session\.activePath\)\) \{\s*activate\(session\.activePath\)/);
   assert.doesNotMatch(SRC, /for \(const t of session\.tabs\)[\s\S]{0,160}openFile\(t\.path, t\.name\)(?!,)/);
 });
@@ -918,7 +893,7 @@ test("multi-root explorer has safe root selection, collapse, and remove-workspac
   const activeTree = extractFn("renderTreeActive");
   assert.match(activeTree, /workspace-root__row\[data-path\]/,
     "the active workspace root should remain visibly selected even when no file is open");
-  assert.match(SRC, /rootNameEl\.textContent = t\("explorer\.folderCount", \{ count: workspaceRoots\.length, name: basename\(path\) \}\)/,
+  assert.match(SRC, /rootNameEl\.textContent = t\("explorer\.folderCount", \{ count: workspaceRoots\.length, name: basename\(rootPath\) \}\)/,
     "the explorer header should show which root toolbar actions target");
 
   assert.ok((I18N.match(/"ctx\.removeWorkspaceFolder":/g) || []).length >= 2,
@@ -1046,6 +1021,7 @@ test("file tree delete is single-shot, dedupes nested selections, and locks whil
 
 test("empty workspaces stop local file probing but still allow external search", async () => {
   const runEmptyRoots = load("_runEmptyRoots");
+  const normalizeReadToolPath = load("_normalizeReadToolPath");
   const markRunRootEmpty = load("_markRunRootEmpty", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: PATH_IDENTITY,
@@ -1058,6 +1034,7 @@ test("empty workspaces stop local file probing but still allow external search",
   });
   const emptyRootSkipMessage = load("_emptyRootSkipMessage", {
     _normalizeFsPath: NORMALIZE_PATH,
+    _normalizeReadToolPath: normalizeReadToolPath,
     _pathIdentity: PATH_IDENTITY,
     _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
   });
@@ -1080,6 +1057,12 @@ test("empty workspaces stop local file probing but still allow external search",
   assert.match(emptyRootSkipMessage(run, "/repo", { type: "read", path: "package.json" }), /\[SKIPPED_EMPTY_WORKSPACE\]/);
   assert.match(emptyRootSkipMessage(run, "/repo", { type: "read", path: "/repo/src/App.tsx" }), /\[SKIPPED_EMPTY_WORKSPACE\]/);
   assert.equal(emptyRootSkipMessage(run, "/repo", { type: "read", path: "/tmp/outside.txt" }), "");
+  assert.equal(normalizeReadToolPath("cat /tmp/svc.log"), "/tmp/svc.log");
+  assert.equal(normalizeReadToolPath("cat '/tmp/service log.txt'"), "/tmp/service log.txt");
+  assert.equal(normalizeReadToolPath("cat -n /tmp/svc.log"), "cat -n /tmp/svc.log");
+  assert.equal(normalizeReadToolPath("cat /tmp/svc.log | tail"), "cat /tmp/svc.log | tail");
+  assert.equal(emptyRootSkipMessage(run, "/repo", { type: "read", path: "cat /tmp/svc.log" }), "",
+    "a shell-shaped absolute read path must not be misclassified as a workspace-relative probe");
   assert.equal(emptyRootSkipMessage(run, "/repo", { type: "read", path: "." }), "");
 
   clearRunEmptyRoot(run, "/repo/src/App.tsx");
@@ -1274,6 +1257,28 @@ test("selected model label is dynamic and not overwritten by i18n", () => {
   assert.equal(label.textContent, "选择模型");
   assert.equal(label.getAttribute("data-i18n"), "assistant.selectModel",
     "empty model state should still localize the placeholder");
+});
+
+test("opened workspace state cannot fall back to the no-folder welcome or stale tabs", () => {
+  const rootLabel = extractFn("_syncWorkspaceRootLabel");
+  assert.match(rootLabel, /rootNameEl\.removeAttribute\("data-i18n"\)/,
+    "a real workspace name must not keep the static no-folder translation marker");
+  assert.match(rootLabel, /rootNameEl\.textContent = basename\(rootPath\)/);
+
+  const welcome = extractFn("syncWelcome");
+  assert.match(welcome, /const root = rootPath \|\| workspaceRoots\[0\] \|\| ""/);
+  assert.match(welcome, /entryCount === 0[\s\S]*这个文件夹现在是空的/,
+    "an opened empty folder should render an empty-workspace state");
+  assert.match(welcome, /primaryLabel\.textContent = "新建文件"/);
+  assert.match(SRC, /welcomeOpenBtn"\)\?\.addEventListener\("click", \(\) => \{[\s\S]{0,180}newEntry\(root, false\)/,
+    "the opened-workspace welcome action should create a file instead of reopening the folder picker");
+
+  const openFile = extractFn("openFile");
+  assert.match(openFile, /options\.silentMissing && _isMissingFileError\(e\)[\s\S]{0,80}options\.missing = true/);
+  const restore = extractFn("restoreSession");
+  assert.match(restore, /openFile\(t\.path, t\.name, false, restoreOptions\)/);
+  assert.match(restore, /if \(skippedMissingTabs\) scheduleSaveSession\(\)/,
+    "missing restored tabs should be removed from the next persisted session");
 });
 
 test("view menu labels say open or close based on panel state", () => {
@@ -1625,6 +1630,45 @@ test("settings never advertise an approval gate that does not exist", () => {
     "Mode dropdown should only switch modes; execution toggles belong in Settings");
 });
 
+test("editing a sent message opens its mode and model menus reliably", () => {
+  const handlers = {};
+  const button = { addEventListener(type, listener) { handlers[type] = listener; } };
+  let opens = 0;
+  const wire = load("_wireInlineEditMenuTrigger");
+  wire(button, () => { opens++; });
+
+  const event = (extra = {}) => ({
+    button: 0, detail: 1,
+    preventDefault() {}, stopPropagation() {},
+    ...extra,
+  });
+  handlers.pointerdown(event());
+  assert.equal(opens, 1, "primary pointerdown should open immediately in WKWebView");
+  handlers.click(event());
+  assert.equal(opens, 1, "the click generated by that pointerdown must not toggle the menu closed");
+  handlers.click(event({ detail: 0 }));
+  assert.equal(opens, 2, "keyboard Enter/Space click should remain accessible");
+  handlers.pointerdown(event({ button: 2 }));
+  assert.equal(opens, 2, "secondary pointer buttons must not open the picker");
+
+  const edit = extractFn("_beginEditResend");
+  assert.match(edit, /_wireInlineEditMenuTrigger\(editModeBtn, \(\) => openModeMenuFor\(editModePicker\)\)/,
+    "the cloned edit toolbar must wire its mode picker directly");
+  assert.match(edit, /_wireInlineEditMenuTrigger\(editModelBtn, \(\) => openModelMenuFor\(editModelPicker\)\)/,
+    "the cloned edit toolbar must wire its model picker directly");
+
+  const modelMenu = extractFn("openModelMenuFor");
+  const modeMenu = extractFn("openModeMenuFor");
+  assert.match(modelMenu, /document\.body\.appendChild\(modelMenu\)/,
+    "the edit model menu must escape the chat scroll container");
+  assert.match(modeMenu, /document\.body\.appendChild\(menu\)/,
+    "the edit mode menu must escape the chat scroll container");
+  assert.match(SRC, /!modelMenu\.contains\(e\.target\)[\s\S]{0,180}!modelPicker\.contains\(e\.target\)/,
+    "clicking inside the body-mounted model menu must not be treated as an outside click");
+  assert.match(modeMenu, /!menu\.contains\(e\.target\)/,
+    "clicking inside the body-mounted mode menu must not dismiss it before its item handles the click");
+});
+
 test("Advanced Tools settings exposes the supported IDE language preference", () => {
   assert.deepEqual(GLOBAL_LANGUAGE_TAGS, ["zh-CN", "en", "ja", "ko", "de", "es", "pt", "ru"]);
   assert.equal(normalizeLocaleTag("zh_cn"), "zh-CN");
@@ -1654,8 +1698,8 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
     "built-in English, Simplified Chinese, and Japanese dictionaries should be treated as first-party");
   assert.match(I18N, /const I18N_PACK_CACHE_VERSION = "v3";/,
     "language pack cache version should be bumped when fixing bad locale-pack caches");
-  assert.match(I18N, /const ADHOC_I18N_CACHE_VERSION = "v5";/,
-    "loose UI translation cache should be bumped when fixing bad locale caches");
+  assert.match(I18N, /const ADHOC_I18N_CACHE_VERSION = "v6";/,
+    "loose UI translation cache should be bumped when fixing bad locale caches (v6 discards hallucinated model-id renames)");
   assert.match(I18N, /function missingLocaleEntries\(locale\)[\s\S]{0,420}Object\.entries\(EN\)[\s\S]{0,240}missing\[key\] = value/,
     "first-party language packs should request only missing keys");
   assert.match(I18N, /translations\[tag\] = overwrite[\s\S]{0,180}\? \{ \.\.\.EN, \.\.\.existing, \.\.\.dict \}[\s\S]{0,80}: \{ \.\.\.dict, \.\.\.existing \};/,
@@ -1674,14 +1718,14 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
     "Settings must synchronize the active i18n locale before rendering translated labels");
   assert.match(SRC, /if \(key === "locale"\) \{[\s\S]{0,80}await setLocale\(value\);[\s\S]{0,160}renderFeaturePanel\(\);[\s\S]{0,80}return;/,
     "language changes should wait for the selected locale to be ready before repainting Advanced Tools");
-  assert.match(I18N, /for \(const tag of \["zh-CN", "ja", "ko", "de", "es", "pt", "ru"\]\)[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v1[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v2[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v3[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v4/,
+  assert.match(I18N, /for \(const tag of \["zh-CN", "ja", "ko", "de", "es", "pt", "ru"\]\)[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v1[\s\S]{0,260}michael-ide\.i18n-pack\.\$\{tag\}\.v2[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v3[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v4[\s\S]{0,260}michael-ide\.i18n-adhoc\.\$\{tag\}\.v5/,
     "startup should remove locale caches known to contain stale or wrong translations");
   assert.match(LOCALES_SRC, /export const GLOBAL_LANGUAGE_TAGS = Object\.freeze/);
   assert.match(SRC, /function _languagePreferenceBlock\(\) \{[\s\S]{0,620}全局语言与区域偏好[\s\S]{0,360}最终回答都使用该语言/,
     "AI requests should receive the global language and country preference");
   assert.match(SRC, /const languageBlock = _languagePreferenceBlock\(\);[\s\S]{0,220}sysPrompt \+ languageBlock \+ adaptiveBlock/,
     "lightweight chat must also follow the language preference");
-  assert.match(SRC, /language:\s*_preferredLanguageCode\(\)/,
+  assert.match(SRC, /language:\s*args\.language \? String\(args\.language\) : _preferredLanguageCode\(\)/,
     "local discovery defaults should follow the selected language");
 });
 
@@ -2245,7 +2289,7 @@ test("invalid file mutation arguments recover by reading target context once", (
     "agent loop must convert recoverable invalid file tool args into a safe read_file step");
   assert.match(SRC, /turn\._invalidToolRepairInstruction/,
     "agent loop must feed the recovery instruction back after the synthetic read result");
-  assert.match(SRC, /const retryLimit = payloadTooLarge \? 1 : \(argIssue \? 3/,
+  assert.match(SRC, /const retryLimit = prefixInvalid \? 1 : \(payloadTooLarge \? 1 : \(argIssue \? 3/,
     "invalid tool arguments should get a bounded schema-repair retry before loop-level recovery");
   assert.match(SRC, /argIssue && attempt === 0/,
     "first schema-repair attempt should self-heal silently instead of flashing an alarming toast");
@@ -2573,6 +2617,98 @@ test("compacted turns land in archival memory and are searchable by keyword", ()
   assert.match(summaryMsg.content, /recall_conversation/);
 });
 
+test("explicit corrections create an authoritative append-only conversation overlay", () => {
+  assert.deepEqual(extractExplicitCorrection("不是蓝色，是绿色"), {
+    incorrect: "蓝色", corrected: "绿色", explicitReplacement: true,
+  });
+  assert.deepEqual(extractExplicitCorrection("不要圆角，改用直角"), {
+    incorrect: "圆角", corrected: "直角", explicitReplacement: true,
+  });
+  assert.equal(extractExplicitCorrection("还是太慢了，赶紧修"), null,
+    "a complaint without a replacement fact must not poison memory");
+
+  const memory = new ConversationMemory();
+  memory.push({ role: "assistant", content: "下载按钮必须使用蓝色，旧实现就是这样。" });
+  const first = memory.recordUserCorrection("不是蓝色，是绿色");
+  assert.ok(first?.id);
+  memory.push({ role: "user", content: "不是蓝色，是绿色" });
+  const prefix = memory.prefixMessages()[0];
+  assert.equal(prefix.role, "system");
+  assert.match(prefix.content, /纠错记忆·最高优先级/);
+  assert.match(prefix.content, /已作废：蓝色/);
+  assert.match(prefix.content, /当前有效：绿色/);
+
+  const second = memory.recordCorrection({
+    kind: "user", incorrect: "绿色", corrected: "红色", supersedes: first.id, confidence: 1,
+  });
+  const active = memory.activeCorrections();
+  assert.equal(active.length, 1);
+  assert.equal(active[0].id, second.id);
+  assert.equal(memory.corrections.length, 2, "revising a correction must preserve the earlier audit record");
+
+  memory.compactRecent(2, "早期颜色讨论");
+  const recall = memory.searchArchive("蓝色", 6);
+  assert.equal(recall[0].correction, true, "the current correction must precede matching raw history");
+  assert.ok(recall.some((item) => item.superseded && /仅供审计/.test(item.text)),
+    "matching raw history remains available but must be marked obsolete");
+
+  const restored = ConversationMemory.fromJSON(memory.toJSON());
+  assert.equal(restored.corrections.length, 2);
+  assert.equal(restored.activeCorrections()[0].corrected, "红色");
+  assert.match(restored.assemble()[0].content, /当前有效：红色/);
+
+  const independent = new ConversationMemory();
+  independent.recordCorrection({ incorrect: "用户不要暗色", corrected: "界面使用浅色" });
+  independent.recordCorrection({ incorrect: "用户不要圆角", corrected: "卡片使用直角" });
+  assert.equal(independent.activeCorrections().length, 2,
+    "shared wording alone must not merge unrelated correction topics");
+});
+
+test("conversation correction memory stays bounded without touching raw turns", () => {
+  const memory = new ConversationMemory();
+  memory.push({ role: "assistant", content: "raw history must stay" });
+  for (let index = 0; index < 220; index++) {
+    memory.recordCorrection({
+      kind: "memory",
+      incorrect: `old-fact-${index}`,
+      corrected: `new-fact-${index}`,
+      confidence: 0.9,
+    });
+  }
+  assert.equal(memory.corrections.length, 160);
+  assert.equal(memory.recent[0].content, "raw history must stay");
+  assert.ok(memory.prefixMessages()[0].content.length < 18000,
+    "only a small active correction window should enter the prompt");
+});
+
+test("conversation memory slices large histories without assembling a full copy", () => {
+  const memory = new ConversationMemory();
+  memory.markMilestone("project opened");
+  memory.summaries.push({ range: "turns 1-2", text: "older context" });
+  for (let index = 0; index < 8; index++) {
+    memory.push({ role: index % 2 ? "assistant" : "user", content: `message-${index}` });
+  }
+
+  assert.equal(memory.assembledLength(), 10);
+  assert.match(memory.assembledAt(0).content, /project opened/);
+  assert.match(memory.assembledAt(1).content, /older context/);
+  assert.deepEqual(
+    memory.assembledSlice(7, 10).map((message) => message.content),
+    ["message-5", "message-6", "message-7"],
+  );
+  assert.equal(memory.estimateRecentChars(), 8 * "message-0".length);
+
+  memory.compactRecent(3, "compact");
+  assert.equal(memory.estimateRecentChars(), 5 * "message-0".length);
+  assert.deepEqual(
+    memory.toJSON(undefined, { recentLimit: 3 }).recent.map((message) => message.content),
+    ["message-5", "message-6", "message-7"],
+  );
+  assert.deepEqual(memory.toJSON(undefined, { recentLimit: 0 }).recent, []);
+  const restored = ConversationMemory.fromJSON(memory.toJSON());
+  assert.equal(restored.estimateRecentChars(), 5 * "message-0".length);
+});
+
 test("merged summaries stay bounded instead of growing without limit", () => {
   const memory = new ConversationMemory();
   for (let i = 0; i < 12; i++) {
@@ -2678,6 +2814,22 @@ test("conversation media persistence records an explicit placeholder when its bu
   assert.match(SRC, /placeholder\.className = "msg__attachment-omitted"/);
 });
 
+test("local recovery serialization has a strict text budget and preserves newest head and tail", () => {
+  const textBudget = { remaining: 120_000, perValue: 80_000 };
+  const saved = serializeMessagesForPersistence([
+    { role: "tool", content: "A".repeat(500_000) },
+    { role: "assistant", content: `BEGIN-${"B".repeat(500_000)}-END` },
+  ], 0, { textBudget });
+  const total = saved.reduce((sum, message) => sum + message.content.length, 0);
+  assert.ok(total <= 120_000);
+  assert.equal(textBudget.remaining, 0);
+  assert.match(saved[1].content, /^BEGIN-/);
+  assert.match(saved[1].content, /-END$/);
+  assert.match(saved[1].content, /local recovery mirror truncated/);
+  assert.ok(saved[1].content.length > saved[0].content.length,
+    "the newest turn gets recovery priority before older tool dumps");
+});
+
 test("localStorage chat mirror shares one strict media budget across every session", () => {
   const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
   const sessionDataForStorage = load("_chatSessionDataForStorage", {
@@ -2688,6 +2840,9 @@ test("localStorage chat mirror shares one strict media budget across every sessi
   });
   const sessionsForStorage = load("_chatSessionsForLocalStorage", {
     CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    CHAT_LOCAL_RECENT_LIMIT: 96,
+    CHAT_LOCAL_TEXT_BUDGET: 1_800_000,
+    CHAT_LOCAL_TEXT_PER_VALUE: 240_000,
     _chatSessionDataForStorage: sessionDataForStorage,
   });
   const olderMedia = "data:image/png;base64," + "A".repeat(80);
@@ -2748,6 +2903,8 @@ test("session picker shows true memory stats and searches historical summaries",
       summaries: [{ range: "turns 1-120", text: "老需求：会话记忆不能丢，要继续理解用户偏好" }],
       milestones: [{ event: "用户要求浅色 Google 风格" }],
       fileEvidence: [{ path: "src/main.js", digest: "session picker implementation" }],
+      corrections: [{ id: "old-correction" }, { id: "current-correction" }],
+      activeCorrections: () => [{ id: "current-correction" }],
       assemble() {
         return [
           { role: "assistant", content: "[对话上下文摘要]\n老需求：会话记忆不能丢，要继续理解用户偏好" },
@@ -2763,8 +2920,9 @@ test("session picker shows true memory stats and searches historical summaries",
     summaryCount: 1,
     milestoneCount: 1,
     fileEvidenceCount: 1,
+    correctionCount: 1,
   });
-  assert.equal(label(st), "145 轮 · 近期 1 条 · 历史摘要 1 段 · 关键节点 1 个 · 文件证据 1 个");
+  assert.equal(label(st), "145 轮 · 近期 1 条 · 历史摘要 1 段 · 关键节点 1 个 · 文件证据 1 个 · 有效纠正 1 条");
   assert.match(searchText(session), /会话记忆不能丢/);
   assert.match(searchText(session), /浅色 google 风格/i);
   assert.equal(preview(session), "最新回答：已经修好弹窗");
@@ -2790,6 +2948,7 @@ test("closed chat tabs stay in the session library and can be restored", () => {
       summaryCount: Array.isArray(session?.memory?.summaries) ? session.memory.summaries.length : 0,
       milestoneCount: 0,
       fileEvidenceCount: 0,
+      correctionCount: 0,
     },
   });
   assert.equal(hasRecoverable({ memory: { totalTurns: 0, recent: [] } }), false);
@@ -2826,6 +2985,8 @@ test("closed chat tabs stay in the session library and can be restored", () => {
 test("memory center uses Michael-owned labels and hides competitor implementation details", () => {
   const model = load("_memoryChoiceModel", {
     _kgLoad: (root) => root ? [{ content: "project rule" }] : [{ content: "global pref" }, { content: "global style" }],
+    _kgSupersededIds: () => new Set(),
+    _kgActiveCorrections: (root) => root ? [{ id: "project-correction" }] : [],
     _sessionMemoryStats: () => ({ totalTurns: 42, recentCount: 8, summaryCount: 2, milestoneCount: 1, fileEvidenceCount: 3 }),
     _sessionMemoryLabel: () => "42 轮 · 近期 8 条 · 历史摘要 2 段",
   });
@@ -2834,6 +2995,7 @@ test("memory center uses Michael-owned labels and hides competitor implementatio
   assert.match(cards[0].title, /当前会话记忆/);
   assert.match(cards[0].badge, /42 轮/);
   assert.match(cards[1].source, /Michael 项目知识图谱/);
+  assert.match(cards[1].badge, /1 次纠正/);
   assert.match(cards[1].inject, /当前项目/);
   assert.match(cards[2].source, /Michael 用户偏好记忆/);
   assert.match(cards[2].inject, /所有项目/);
@@ -2871,7 +3033,7 @@ test("blob video snapshots fall back to durable key-frame rendering", () => {
   assert.match(SRC, /const liveVideos = Array\.from\(c\.querySelectorAll\("video"\)\)/);
   assert.match(SRC, /clonedVideo\.replaceWith\(image\)/);
   assert.match(SRC, /if \(\/\\b\(\?:src\|poster\).*blob:/);
-  assert.match(SRC, /_releaseBlobMediaInNode\(msgs\[i\]\)/);
+  assert.match(SRC, /_releaseBlobMediaInNode\(message\)/);
   assert.match(SRC, /_bindSessionMemoryCleanup\(session\)/);
 });
 
@@ -2910,22 +3072,24 @@ test("rich snapshot videos rebind only by stable attachment id", () => {
 });
 
 test("an immediate chat save wakes the debounce and close waits for disk persistence", async () => {
-  let persisted = 0;
+  const persisted = [];
   const save = load("saveChatHistory", {
     _isSecondaryWindow: false,
+    _chatSessions: [],
     _chatSaveDirty: false,
     _chatSaveImmediate: false,
     _chatSaveWake: null,
     _chatSavePending: false,
     _chatSavePromise: Promise.resolve(),
-    _persistChatHistoryOnce: async () => { persisted++; },
+    _persistChatHistoryOnce: async (...args) => { persisted.push(args); },
   });
   const started = Date.now();
   const debounced = save();
   const immediate = save({ immediate: true });
   assert.equal(immediate, debounced);
   await immediate;
-  assert.equal(persisted, 1);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0][1], false, "an idle save must write the full disk checkpoint");
   assert.ok(Date.now() - started < 300, "immediate save must not wait for the 500ms debounce");
   assert.match(SRC, /await Promise\.all\(\[saveChatHistory\(\{ immediate: true \}\), saveSession\(\)\]\)/);
   const closeStart = SRC.indexOf("currentWindow.onCloseRequested");
@@ -2934,6 +3098,28 @@ test("an immediate chat save wakes the debounce and close waits for disk persist
   const destroy = SRC.indexOf("currentWindow.destroy()", closeStart);
   assert.ok(closeStart >= 0 && prevent > closeStart && savePos > prevent && destroy > savePos,
     "official close handler must prevent destruction, await persistence, then destroy");
+});
+
+test("streaming chat persistence stays lightweight until streaming stops", async () => {
+  const session = { streaming: true };
+  const persisted = [];
+  const save = load("saveChatHistory", {
+    _isSecondaryWindow: false,
+    _chatSessions: [session],
+    _chatSaveDirty: false,
+    _chatSaveImmediate: false,
+    _chatSaveWake: null,
+    _chatSavePending: false,
+    _chatSavePromise: Promise.resolve(),
+    _persistChatHistoryOnce: async (...args) => { persisted.push(args); },
+  });
+  await save({ immediate: true });
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0][1], true, "streaming must never serialize the full transcript");
+  assert.match(extractFn("_persistChatHistoryOnce"), /if \(!inTauri \|\| lightweightOnly\) return;/);
+  assert.match(extractFn("_persistChatHistoryOnce"), /await _waitForChatPersistenceIdle\(\);/);
+  assert.match(extractFn("_setStreaming"), /wasStreaming && !on[\s\S]*saveChatHistory\(\{ immediate: true \}\)/,
+    "the complete checkpoint must be scheduled exactly when streaming ends");
 });
 
 test("Tauri composer drops turn media paths into real attachments", async () => {
@@ -3561,7 +3747,7 @@ test("pending follow-ups persist with the shared bounded media serializer", () =
   assert.equal(saved[0].attachments[0].dataUrl, undefined);
   assert.deepEqual(saved[0].attachments[0].frames, ["data:image/jpeg;base64,F1"]);
   assert.equal(saved[1].attachments[0].dataUrl, "data:image/png;base64,I2");
-  assert.match(SRC, /pendingSends: _pendingSendsForStorage\(s\?\._pendingSends \|\| s\?\.pendingSends, budget\)/);
+  assert.match(SRC, /pendingSends: _pendingSendsForStorage\(s\?\._pendingSends \|\| s\?\.pendingSends, budget, options\.textBudget\)/);
   assert.match(SRC, /session\._pendingSends = _pendingSendsForStorage\(sData\.pendingSends\)/);
 });
 
@@ -4374,6 +4560,8 @@ test("read ranges deduplicate only exact source still available in the current r
 test("message compaction invalidates exact read coverage before allowing a refetch", () => {
   let synced = 0;
   const trim = load("_trimMessagesIfHuge", {
+    _gatewayHandlesCompression: () => false,
+    _mcPrefixInvalidate: () => {},
     _msgSize: (message) => String(message?.content || "").length,
     _estTokens: (msgs) => Math.round(msgs.reduce((n, m) => n + String(m?.content || "").length, 0) / 4),
     _readEvidenceCovers: () => false,
@@ -4499,8 +4687,8 @@ test("browser gateway retries remain cancellable while attempts accumulate", asy
   assert.match(SRC, /x-ide-response-deadline-ms/);
   assert.match(SRC, /activeAttemptController\?\.abort\(\)/,
     "the browser fetch must actively cancel the abandoned provider request");
-  assert.match(SRC, /失败会持续重试，点停止可终止/,
-    "the UI must explain that the 15-second window is per attempt, not a whole-turn limit");
+  assert.match(SRC, /正在自动换连接重试（已等 \$\{idle\}s）——任务和已有进度都在，不会丢/,
+    "the UI must explain retries keep progress — human wording, not protocol jargon");
 });
 
 test("payload-too-large AI errors shrink the request instead of resending the same body", () => {
@@ -4637,7 +4825,10 @@ test("_modelSeesImages defaults TRUE (send real image) except known text-only mo
 });
 
 test("Kimi and Grok models use dedicated brand icons", () => {
-  const brandOf = load("brandOf");
+  const brandOf = load("brandOf", {
+    _CUSTOM_MODEL_PREFIX: "custom:",
+    _customModelById: () => null,
+  });
   assert.deepEqual(brandOf("kimi-k2.6"), { sym: "i-brand-kimi", cls: "brand--kimi" });
   assert.deepEqual(brandOf("moonshot-v1-128k"), { sym: "i-brand-kimi", cls: "brand--kimi" });
   assert.deepEqual(brandOf("grok-4.5"), { sym: "i-brand-grok", cls: "brand--grok" });
@@ -4744,93 +4935,31 @@ test("model card shows backend input output pricing as model price", () => {
   assert.match(SERVER_MODELS, /"price_source": price_source/);
 });
 
-test("enabled thinking renders a return-status note only when upstream gives real proof", () => {
-  const label = load("_thinkingRequestLabel", {
-    _THINK_LABELS: { off: "关闭", low: "低", medium: "中", high: "高", max: "极限" },
-  });
-  const reasoningTokens = load("_reasoningTokensFromUsage");
-  const appended = [];
-  const appendStatus = load("_appendThinkingReturnStatus", {
-    _thinkingRequestLabel: label,
-    _reasoningTokensFromUsage: reasoningTokens,
-    _lastReasoningTok: 0,
-    document: {
-      createElement: () => ({ className: "", textContent: "" }),
-    },
-  });
-  const body = {
-    querySelector: () => null,
-    appendChild: (el) => appended.push(el),
-  };
-  assert.equal(label({ thinkingEffort: "high" }), "高");
-  assert.equal(label({ thinkingEffort: "max" }), "极限");
-  assert.equal(label({ thinkingConfig: { thinkingLevel: "minimal" } }), "minimal");
-  assert.equal(label({ thinking: { type: "enabled" } }), "开启");
-  assert.equal(reasoningTokens({ completion_tokens_details: { reasoning_tokens: 128 } }), 128);
-  appendStatus(body, { thinkingEffort: "max" }, "", {});
-  assert.equal(appended.length, 0, "hidden upstream reasoning should not render a false missing-reasoning warning");
-  appendStatus(body, { thinkingEffort: "max" }, "", { completion_tokens_details: { reasoning_tokens: 42 } });
-  assert.equal(appended.length, 1);
-  assert.equal(appended[0].className, "think-return-status is-ok");
-  assert.match(appended[0].textContent, /思考深度：极限 · 上游上报推理 token 42/);
-  assert.match(SRC, /function _appendThinkingReturnStatus\(body, config, reasoningText = "", usage = null\)/);
-  assert.match(SRC, /if \(!reasoningLen && !rt\) return;/,
-    "hidden-thinking providers must not produce a scary 'upstream did not return thinking' warning");
-  assert.match(SRC, /_appendThinkingReturnStatus\(body, config, reasoning, _legacyUsage\)/,
-    "plain-chat completion should report whether the upstream returned thinking");
-  assert.match(SRC, /_appendThinkingReturnStatus\(body, _turnConfig, _reasoningFinal, _turnUsage\)/,
-    "agent completion should report whether the upstream returned thinking");
-  assert.doesNotMatch(SRC, /上游未回传 reasoning_content/);
+test("the per-turn 🧠 thinking return-status chip is fully removed (user: don't show it)", () => {
+  assert.doesNotMatch(SRC, /_appendThinkingReturnStatus/,
+    "the 🧠 思考深度 chip must not come back — reasoning visibility lives in the think-card + context meter tooltip only");
+  assert.doesNotMatch(SRC, /think-return-status/);
+  assert.doesNotMatch(SRC, /已收到上游推理正文/);
 });
 
-test("_looksQuickAsk excludes project/multi-file scope (so it isn't crippled to a tiny budget)", () => {
-  const f = load("_looksQuickAsk", { _looksUIBuildTask: () => false, _looksBugFixTask: () => false });
-  // trivial conversational asks are still 'quick':
-  assert.equal(f("什么是闭包？"), true);
-  assert.equal(f("这个函数是什么意思"), true);
-  // but anything project/codebase-scoped must NOT be quick — it needs real exploration:
-  assert.equal(f("看一下我的项目"), false);
-  assert.equal(f("帮我看看这几个文件"), false);
-  assert.equal(f("分析一下整个代码库"), false);
-  assert.equal(f("梳理一下这个工程的架构"), false);
-});
-
-test("Agent greetings use a lightweight cached turn instead of loading project context and tools", () => {
+test("Agent lightweight routing consumes the semantic verdict instead of user-message keywords", () => {
   const mustUseWorkspace = load("_agentMustUseWorkspaceTools");
-  const realProfile = engineeringHelpers().profile;
-  const light = load("_looksLightweightAgentChat", {
-    _engineeringTaskProfile: () => ({}),
-    _agentMustUseWorkspaceTools: mustUseWorkspace,
-  });
-  const realLight = load("_looksLightweightAgentChat", {
-    _engineeringTaskProfile: realProfile,
-    _agentMustUseWorkspaceTools: mustUseWorkspace,
-  });
-  assert.equal(light("你好啊", {}, "/repo", "/repo/data/comments/a.jsonl", false), true);
-  assert.equal(light("谢谢，收到", {}, "/repo", "/repo/src/main.js", false), true);
-  assert.equal(light("你都能做什么事情？", {}, "/repo", "/repo/data/comments/a.jsonl", false), true);
-  assert.equal(realProfile("你都能做什么事情？").applies, false);
-  assert.equal(realProfile("你都能做什么事情？").implementation, false);
-  assert.equal(realLight("你都能做什么事情？", realProfile("你都能做什么事情？"), "/repo", "/repo/data/comments/a.jsonl", false), true);
-  assert.equal(light("你有什么功能？", {}, "/repo", "/repo/data/comments/a.jsonl", false), true);
-  assert.equal(light("什么是闭包？", {}, "/repo", "/repo/src/main.js", false), true);
-  assert.equal(light("现在几点？", {}, "/repo", "", false), true);
-  assert.equal(light("你好啊", {}, "/repo", "", true), false, "media turns may need vision/project evidence");
-  assert.equal(light("看看当前文件", {}, "/repo", "/repo/src/main.js", false), false);
-  assert.equal(light("这个函数是什么意思？", {}, "/repo", "/repo/src/main.js", false), false);
-  assert.equal(light("分析一下当前文件", {}, "/repo", "/repo/src/main.js", false), false);
-  assert.equal(light("修复 bug", { applies: true, bug: true }, "/repo", "", false), false);
-  assert.equal(light("把 package.json 里的版本改一下", { applies: true, implementation: true }, "/repo", "", false), false);
+  assert.equal(mustUseWorkspace({ workspaceAction: "none" }, "/repo", "/repo/src/main.js"), false);
+  assert.equal(mustUseWorkspace({ workspaceAction: "inspect" }, "/repo", ""), true);
+  assert.equal(mustUseWorkspace({ workspaceAction: "modify" }, "/repo", ""), true);
 
-  assert.match(SRC, /const _agentLightTurn = effectiveMode === "agent"[\s\S]{0,260}_looksLightweightAgentChat\(text, _turnEngineeringEarly, _earlyRoot, _earlyActiveForSession, attachments\.length > 0, _sessHasPriorWork\)/);
-  assert.match(SRC, /&& !_agentLightTurn\) \{[\s\S]{0,500}_agentContextSnapshotForTurn\(text, _curRoot\)/);
-  assert.doesNotMatch(extractFn("sendPrompt"), /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
+  const sendSource = extractFn("sendPrompt");
+  assert.match(sendSource, /let _agentLightTurn = false;/);
+  assert.match(sendSource, /_turnEngineeringResolved\.intentSemantic\?\.action === "answer"[\s\S]{0,260}_turnEngineeringResolved\.workspaceAction === "none"/);
+  assert.match(sendSource, /_turnEngineeringResolved\.runtimeObligations \|\| \[\]/);
+  assert.match(sendSource, /_turnEngineeringResolved\.externalObligations \|\| \[\]/);
+  assert.doesNotMatch(SRC, /function _looksQuickAsk\(/);
+  assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
+  assert.match(SRC, /&& !_agentLightTurn\) \{[\s\S]{0,500}_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved\)/);
+  assert.doesNotMatch(sendSource, /await\s+(?:Promise\.race\(\[)?_gatherAgentContext/,
     "the first-token path must not await a cold workspace scan");
   assert.match(SRC, /if \(_activeForSession && !_agentLightTurn\)/);
   assert.match(SRC, /const hasToolAccess = \(isAgent && !_agentLightTurn\) \|\| isExplorer \|\| isReviewer \|\| isPlan/);
-  assert.match(SRC, /用户这次是轻量对话\/闲聊/);
-  assert.match(SRC, /ask_user 被拒绝：用户只是轻量对话\/能力问题/);
-  assert.match(SRC, /不要弹任务选择，也不要脑补项目操作/);
 });
 
 test("Auto mode is removed and stale sessions fall back to Agent", () => {
@@ -4854,7 +4983,7 @@ test("Auto mode is removed and stale sessions fall back to Agent", () => {
 });
 
 test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating rules", () => {
-  const block = load("_modeRuntimeGuidanceBlock", { _engineeringTaskProfile: () => ({}) });
+  const block = load("_modeRuntimeGuidanceBlock");
   assert.match(block("chat", "你好", {}), /Chat 模式纪律[\s\S]*不假装读过项目或运行过工具/);
   assert.match(block("plan", "做一个前端方案", { ui: true }), /Plan 模式纪律[\s\S]*shadcn\/ui \+ Radix/);
   assert.match(block("explorer", "梳理项目", {}), /Explorer 模式纪律[\s\S]*find_symbol\/lsp_definition\/lsp_references/);
@@ -4869,10 +4998,11 @@ test("Plan Explorer Reviewer and Chat receive upgraded mode-specific operating r
   assert.match(SRC, /reviewer: `你是 Michael IDE 的 Reviewer 模式：只读代码审查员/);
 });
 
-test("Agent lightweight chat builds a genuinely small request body", () => {
-  const lightAt = SRC.indexOf('const _agentLightTurn = effectiveMode === "agent"');
-  const compactAt = SRC.indexOf("_compactHistoryIfHuge(config, sess)", lightAt);
-  assert.ok(lightAt > 0 && compactAt > lightAt, "lightweight routing must be decided before expensive history compaction");
+test("semantic lightweight chat builds a genuinely small request body", () => {
+  const sendSource = extractFn("sendPrompt");
+  const resolveAt = sendSource.indexOf("const _turnIntentVerdict = await _aiIntentPromise");
+  const compactAt = sendSource.indexOf("_compactHistoryIfHuge(config, sess)", resolveAt);
+  assert.ok(resolveAt > 0 && compactAt > resolveAt, "semantic routing must resolve before expensive history compaction");
   assert.match(SRC, /if \(!_agentLightTurn\) \{[\s\S]{0,260}_compactHistoryIfHuge\(config, sess\)/,
     "lightweight turns must skip LLM history compaction");
   assert.match(SRC, /if \(!_agentLightTurn\) _scheduleWorkspaceAgentWarmup\(_curRoot\)/,
@@ -4900,23 +5030,32 @@ test("Agent lightweight chat builds a genuinely small request body", () => {
   assert.ok(!out.some((m) => /```|\[TOOL:/.test(m.content)), "tool/code-heavy history is stripped");
 });
 
-test("bare address statements are context while location questions stay actionable", () => {
-  const isContextOnly = load("_isContextOnlyLocationStatement");
-  for (const statement of [
-    "我目前在上海胶州路282号",
-    "我现在在静安区胶州路282号",
-    "我的地址是北京市朝阳区建国路88号",
-    "I'm at 282 Jiaozhou Road, Shanghai",
-  ]) assert.equal(isContextOnly(statement), true, statement);
+test("location context is governed by the semantic verdict instead of address keywords", () => {
+  const isContextOnly = load("_hasContextOnlyLocationIntent");
+  assert.equal(isContextOnly({ intentSemantic: { locationIntent: "context_only" } }), true);
+  assert.equal(isContextOnly({ intentSemantic: { locationIntent: "query" } }), false);
+  assert.equal(isContextOnly({ intentSemantic: { locationIntent: "remember" } }), false);
+  assert.equal(isContextOnly({}), false);
+  assert.match(SRC, /locationIntent=none\/context_only\/query\/remember/);
+  assert.match(SRC, /_hasContextOnlyLocationIntent\(run\.engineering\)/);
+  assert.doesNotMatch(SRC, /function _isContextOnlyLocationStatement/);
+});
 
-  for (const query of [
-    "我目前在上海胶州路282号，附近有什么好吃的？",
-    "我在上海，帮我查天气",
-    "我的地址是胶州路282号，记住这个地址",
-    "上海胶州路282号在哪里？",
-  ]) assert.equal(isContextOnly(query), false, query);
-
-  assert.match(SRC, /用户这轮只提供了位置上下文，没有提出查询/);
+test("web search remains the selected tool instead of locally rewriting location-like text", () => {
+  const mapCall = load("_mapToolCall", {
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["web_search"]),
+    _canonicalToolName: () => "",
+  });
+  const query = "上海胶州路282号附近有什么好吃的，天气如何";
+  assert.deepEqual(mapCall("web_search", { query }, new Map()), {
+    type: "websearch", path: query, query,
+  });
+  const mapSource = extractFn("_mapToolCall");
+  const webSearchCase = mapSource.match(/case "web_search":([\s\S]*?)case "read_screen":/)?.[1] || "";
+  assert.doesNotMatch(webSearchCase, /_wsLoc|_wsAdr|_wsWx|localdiscovery/,
+    "specialist location/weather tools are selected by semantic orchestration, not local keyword interception");
 });
 
 test("developer community search is wired through schema, normalization, execution, and truthful fallback", () => {
@@ -4961,20 +5100,18 @@ test("GitHub repo reader is a real built-in tool, not only an MCP preset", () =>
   assert.match(SRC, /if \(call\?\.action\) args\.action = call\.action/);
   assert.match(SRC, /"github_search", "github_repo",\s*"gitlab_repo", "gitee_repo", "codeberg_repo", "cve_search"/);
   assert.match(SRC, /要读具体代码仓库的 README\/目录\/源码\/release\/issue\/PR\/MR/);
-  assert.match(SRC, /读取指定 GitHub 仓库 README\/目录\/源码\/release\/issue\/PR/);
 });
 
 test("Git and GitHub PR tools are integrated across catalog, aliases, and execution mapping", () => {
-  assert.match(SRC, /git_status \/ git_diff \/ git_log \/ git_blame/);
-  assert.match(SRC, /git_commit \/ git_branch \/ git_push \/ git_pull/);
-  assert.match(SRC, /gh_pr_create \/ gh_pr_view \/ gh_pr_checks \/ gh_actions_log/);
   assert.match(SRC, /\"gh_pr_create\", \"gh_pr_view\", \"gh_pr_checks\", \"gh_actions_log\", \"gh_pr_review_comments\", \"gh_pr_reply\"/);
   assert.match(SRC, /ghprchecks:\s*"gh_pr_checks"/);
   assert.match(SRC, /ghactionslog:\s*"gh_actions_log"/);
   assert.match(SRC, /case "gh_pr_view": return \{ type: "gh", op: "pr_view"/);
   assert.match(SRC, /case "gh_pr_checks": return \{ type: "gh", op: "pr_checks"/);
   assert.match(SRC, /case "gh_actions_log": return \{ type: "gh", op: "actions_log"/);
-  assert.match(SRC, /Git：git_status\/git_diff\/git_log\/git_blame/);
+  assert.match(SRC, /name: "git_status"/);
+  assert.match(extractFn("_semanticToolOrchestrator"), /完整工具目录/,
+    "Git and PR tools should be discovered from the live registry, not a static reminder string");
 });
 
 test("GitLab, Gitee, and Codeberg repo readers are real built-in tools", () => {
@@ -5000,8 +5137,6 @@ test("deal and second-hand marketplace search tools are fully wired", () => {
   assert.match(SRC, /"smzdm_search", "xianyu_search", "zhuanzhuan_search"/,
     "marketplace search results should auto-deep-read top pages");
 
-  const exactQuery = load("_searchToolsExactQuery");
-  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
   const schema = (name, description) => ({ type: "function", function: { name, description } });
   const smzdm = schema("smzdm_search", "查当前优惠 好价 券 返利 薅羊毛");
   const xianyu = schema("xianyu_search", "查闲鱼 二手 挂牌 成色 捡漏 价格区间");
@@ -5011,8 +5146,11 @@ test("deal and second-hand marketplace search tools are fully wired", () => {
     ["xianyu_search", xianyu],
     ["zhuanzhuan_search", zhuanzhuan],
   ]);
-  assert.deepEqual(lookup("薅羊毛 iPhone 优惠", registry, new Set()).map((tool) => tool.function.name), ["smzdm_search"]);
-  assert.ok(lookup("闲鱼二手捡漏", registry, new Set()).map((tool) => tool.function.name).includes("xianyu_search"));
+  const exactQuery = load("_searchToolsExactQuery");
+  const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
+  assert.deepEqual(lookup("smzdm_search", registry, new Set()).map((tool) => tool.function.name), ["smzdm_search"]);
+  assert.deepEqual(lookup("薅羊毛 iPhone 优惠", registry, new Set()), [],
+    "自然语言工具搜索不再用关键词打分，交给语义调度器");
 });
 
 test("active Skills survive L0 prompt stripping and are inherited by child work", () => {
@@ -5269,7 +5407,7 @@ test("total tool payload keeps a bounded core and swaps requested MCP schemas fr
   ]);
   const exactQuery = load("_searchToolsExactQuery");
   const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery })(
-    "requested deployment",
+    "mcp__server__requested",
     registry,
     new Set(initial.tools.map((tool) => tool.function.name)),
   );
@@ -5512,6 +5650,9 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
   });
   const sessionsForStorage = load("_chatSessionsForLocalStorage", {
     CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    CHAT_LOCAL_RECENT_LIMIT: 96,
+    CHAT_LOCAL_TEXT_BUDGET: 1_800_000,
+    CHAT_LOCAL_TEXT_PER_VALUE: 240_000,
     _chatSessionDataForStorage: sessionDataForStorage,
   });
   const flush = load("_flushChatHistorySync", {
@@ -5519,6 +5660,8 @@ test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory ob
     localStorage,
     CHAT_STORE_KEY: "michael-ide.chat-sessions",
     CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    CHAT_LOCAL_TEXT_BUDGET: 1_800_000,
+    CHAT_LOCAL_TEXT_PER_VALUE: 240_000,
     _activeChatIdx: 0,
     _chatSessionsForLocalStorage: sessionsForStorage,
     _closedChatSessionsForLocalStorage: () => [],
@@ -5592,394 +5735,745 @@ test("_disposeChatSession cancels streams and releases closed tab resources", ()
   assert.equal(session._htmlSnapshot, "");
 });
 
-test("engineering task profiling gates only substantial code work and detects UI/bug work", () => {
-  const { runtimeObligations, externalObligations, gitSignals, profile } = engineeringHelpers();
-  assert.equal(profile("把按钮文字改成保存").engineeringGrade, true,
-    "small project edits still get engineering-grade evidence, just not a ritual plan");
-  assert.equal(profile("把按钮文字改成保存").requiresPlan, false);
-  assert.equal(profile("调整按钮和表单的样式布局").ui, true);
-  assert.equal(profile("修复手机端视觉和交互动效问题").ui, true);
-  const secondHandMarketplace = profile("帮我写个卖二手商品的平台");
-  assert.equal(secondHandMarketplace.ui, true, "二手商品平台是用户面对的 UI 产品，不是普通空工程");
-  assert.equal(secondHandMarketplace.uiProject, true);
-  assert.equal(secondHandMarketplace.fullWebsite, true);
-  assert.equal(secondHandMarketplace.designKnowledgeRequired, true, "完整交易平台必须在首轮前预取 michael-design");
-  assert.equal(secondHandMarketplace.transactionalProduct, true);
-  assert.equal(secondHandMarketplace.databaseDecisionRequired, true);
-  assert.equal(secondHandMarketplace.richMediaRequired, true);
-  assert.equal(secondHandMarketplace.motionDesignRequired, true);
-  for (const request of ["写一个个人作品集网站", "做一个餐厅预订网站", "创建社区论坛"]) {
-    const site = profile(request);
-    assert.equal(site.uiProject, true, "named website categories must be treated as UI products");
-    assert.equal(site.fullWebsite, true, "named website categories must use the full website path");
-    assert.equal(site.designKnowledgeRequired, true, "named website categories must preload michael-design");
-  }
-  const backendForum = profile("创建社区论坛 API 路由和数据库 schema");
-  assert.equal(backendForum.uiProject, false, "a backend-only forum API must not trigger UI design orchestration");
-  const partialUi = profile("调整已有 React 项目的仪表盘布局");
-  assert.equal(partialUi.uiProject, true);
-  assert.equal(partialUi.designKnowledgeRequired, true, "non-greenfield UI work still uses michael-design");
-  assert.equal(partialUi.fromZeroUiProject, false, "existing projects keep their own stack");
-  const referenceSite = profile("照着 https://www.linear.app/ 做一个完整的项目协作官网，参考它的配色和内容结构");
-  assert.deepEqual(referenceSite.referenceWebsiteUrls, ["https://www.linear.app/"]);
-  assert.equal(referenceSite.referenceWebsiteRequested, true);
-  assert.equal(referenceSite.referenceWebsiteRequired, true);
-  const explicitSite = profile("重做 https://vercel.com/ 的官网页面，补齐响应式布局");
-  assert.equal(explicitSite.referenceWebsiteRequired, true, "an exact site URL in UI implementation is a reference even without the word 参考");
-  assert.equal(explicitSite.designKnowledgeRequired, true, "exact-site adaptation must still be translated through michael-design");
-  assert.equal(profile("修复登录按钮不响应").implementation, true);
-  assert.equal(profile("看看项目还有什么 bug").debugProject, true,
-    "project-wide bug hunts must use the debugging evidence plan gate");
-  assert.equal(profile("解决这些 bug，跑不起来还有死循环").debugProject, true);
-  const architecture = profile("重构整个代码库的认证架构，消除硬编码并补齐测试");
-  assert.equal(architecture.applies, true);
-  assert.equal(architecture.requiresPlan, true);
-  assert.equal(architecture.authoritativeReferencesRequired, true);
-  assert.equal(architecture.needsReferences, true, "substantial refactors need repository evidence plus current maintainer/community pitfalls");
-  assert.equal(profile("接入最新版支付 API 并确认兼容性").needsReferences, true);
-  const dbDesign = profile("设计数据库 schema、表结构和索引，补迁移和回滚");
-  assert.equal(dbDesign.database, true);
-  assert.equal(dbDesign.dataModel, true);
-  assert.equal(dbDesign.databaseArchitecture, true);
-  assert.equal(dbDesign.requiresPlan, true);
-  assert.equal(profile("查数据库里重复用户").database, true);
-  assert.equal(profile("查数据库里重复用户").databaseQuery, true);
-  assert.equal(profile("查数据库里重复用户").databaseArchitecture, false);
-  assert.equal(profile("把 table component 做得好看点").database, false);
-  assert.equal(profile("实现评论功能，数据要落库并保留历史").persistence, true);
-  const gitStatus = profile("查看 git status 和 diff，看看有哪些改动");
-  assert.equal(gitStatus.git, true);
-  assert.equal(gitStatus.gitReadOnly, true);
-  assert.equal(gitStatus.explicitReadOnly, true);
-  assert.equal(gitStatus.explicitMutation, false);
-  assert.equal(gitStatus.gitLocalMutation, false);
-  const gitCommitPush = profile("提交当前修改并 push 到 GitHub");
-  assert.equal(gitCommitPush.git, true);
-  assert.equal(gitCommitPush.gitCommit, true);
-  assert.equal(gitCommitPush.gitPublish, true);
-  assert.equal(gitCommitPush.explicitExternalAction, true);
-  assert.equal(gitCommitPush.explicitMutation, true);
-  assert.deepEqual(externalObligations("提交当前修改并 push 到 GitHub"), ["commit", "push"]);
-  const branchProfile = profile("创建分支 feature/login-fix");
-  assert.equal(branchProfile.git, true);
-  assert.equal(branchProfile.gitBranching, true);
-  assert.equal(branchProfile.gitLocalMutation, true);
-  assert.equal(branchProfile.explicitMutation, true);
-  const prProfile = profile("创建 PR 并查看 GitHub Actions CI 状态");
-  assert.equal(prProfile.git, true);
-  assert.equal(prProfile.gitReview, true);
-  assert.equal(prProfile.gitReviewMutation, true);
-  assert.deepEqual(externalObligations("创建 PR 并查看 GitHub Actions CI 状态"), ["pr"]);
-  assert.equal(profile("修复 commit 按钮样式").git, false);
-  assert.equal(profile("修复 push 图标和 branch 下拉菜单").git, false);
-  assert.deepEqual(externalObligations("修复 commit 按钮样式"), []);
-  assert.deepEqual(externalObligations("修复 push 图标和 branch 下拉菜单"), []);
-  assert.equal(gitSignals("查看 git log 和 blame").gitHistory, true);
-  assert.equal(gitSignals("修复 commit 按钮样式").git, false);
-  const uiBug = profile("修复 React 页面在手机端空白和横向溢出的 bug");
-  assert.equal(uiBug.ui, true);
-  assert.equal(uiBug.bug, true);
-  assert.equal(profile("修复登录按钮不响应").explicitMutation, true);
-  assert.equal(profile("这个架构怎么优化？").explicitMutation, false,
-    "advice questions must remain eligible for inspect even though they contain 优化");
-  assert.equal(profile("先看看原因，然后修复登录 bug").explicitMutation, true,
-    "an investigative preface must not let the classifier downgrade the requested fix");
-  assert.equal(profile("请分析调用链，并重构认证模块").explicitMutation, true);
-  assert.equal(profile("要不要重构认证模块？").explicitMutation, false);
-  assert.equal(profile("先调查原因后修复登录 bug").explicitMutation, true);
-  assert.equal(profile("Can you fix the login callback?").explicitMutation, true,
-    "English request prefixes must keep their real whitespace semantics");
-  assert.equal(profile("Please review the login callback and explain the risk").explicitReadOnly, true);
-  assert.equal(profile("请给出认证架构的重构建议").explicitReadOnly, true);
-  assert.equal(profile("Fix a small Promise.all callback").requiresPlan, false,
-    "the method name Promise.all and callback text must not imply whole-project scope");
-  assert.equal(profile("Explain how Promise.all schedules this callback").projectScope, false);
-  assert.equal(profile("Update strategy?").explicitMutation, false,
-    "an action-looking advisory phrase is not an imperative mutation");
-  assert.equal(profile("重构认证模块要注意什么？").explicitMutation, false);
-  assert.equal(profile("更新后的接口有什么变化？").explicitMutation, false);
-  assert.equal(profile("修复这个 bug 有什么建议？").explicitMutation, false);
-  assert.equal(profile("请重构认证模块").explicitMutation, true);
-  assert.equal(profile("增强代码推理然后接入开发者社区论坛知识库").needsReferences, true,
-    "an explicit community/knowledge request must enable bounded external references");
-  assert.deepEqual(runtimeObligations("先不要运行，只编译"), ["build"]);
-  assert.deepEqual(externalObligations("不要部署，只修代码"), []);
-  assert.deepEqual(externalObligations("不用 push，只提交"), ["commit"]);
-  assert.equal(profile("请给我重构建议并解释风险").explicitReadOnly, true);
-  assert.equal(profile("Please explain how to fix auth and update docs").explicitMutation, false);
-  assert.equal(profile("优化方案有哪些？").explicitMutation, false);
-  assert.equal(profile("重构思路").explicitReadOnly, true);
-  assert.equal(profile("修复建议系统的 bug").explicitMutation, true);
-  assert.equal(profile("新增分析页面").explicitMutation, true);
-  assert.equal(profile("实现代码审查功能").explicitMutation, true);
-  assert.equal(profile("Fix the review page").explicitMutation, true);
-  assert.equal(profile("请按照这个重构方案修改认证模块").explicitMutation, true);
-  assert.equal(profile("根据上述优化建议更新代码").explicitMutation, true);
-  assert.equal(profile("采用这个重构思路修复 bug").explicitMutation, true);
-  assert.equal(profile("修复这个 bug 有什么建议？").debugProject, false,
-    "read-only advice about a bug must not be upgraded into a project-wide fix");
-  assert.deepEqual(runtimeObligations("重构建议"), [], "重构建议 must not contain a synthetic 构建 obligation");
-  assert.deepEqual(externalObligations("修复部署按钮"), []);
-  assert.deepEqual(externalObligations("修复部署流程和部署配置"), []);
-  assert.deepEqual(externalObligations("新增发布说明并修改上传接口和下载功能"), []);
-  assert.deepEqual(runtimeObligations("不需要编译和运行"), []);
-  assert.deepEqual(externalObligations("不用 commit 和 push"), []);
-  assert.deepEqual(externalObligations("不要部署或推送"), []);
-  assert.deepEqual(runtimeObligations("不要运行测试"), []);
-  assert.deepEqual(runtimeObligations("don't run tests"), []);
-  assert.deepEqual(runtimeObligations("不要启动构建"), []);
+function aiIntentNormalizeDeps(dims, intentText, intentList) {
+  return {
+    _AI_INTENT_DIMENSIONS: dims,
+    _AI_INTENT_RELATIONS: new Set(["new", "continue", "correct", "replace", "clarify"]),
+    _AI_PROJECT_STATES: new Set(["none", "existing", "greenfield", "unknown"]),
+    _AI_DELIVERY_SURFACES: new Set(["answer", "code", "ui_component", "website", "web_app", "backend", "data", "cli", "desktop", "automation", "mixed"]),
+    _AI_CHANGE_SCOPES: new Set(["none", "local", "module", "project", "system"]),
+    _AI_ARCHITECTURE_MODES: new Set(["none", "follow_existing", "extend_existing", "design_new", "refactor_existing"]),
+    _AI_DATA_STRATEGIES: new Set(["not_applicable", "none", "local", "server", "inspect_existing", "undecided"]),
+    _AI_RESEARCH_MODES: new Set(["none", "official", "community", "official_and_community"]),
+    _AI_DESIGN_MODES: new Set(["none", "michael_design_2_5_existing", "michael_design_2_5_greenfield"]),
+    _AI_WORKSPACE_ACTIONS: new Set(["none", "inspect", "modify"]),
+    _AI_CAPTURE_MODES: new Set(["none", "isolated_browser", "system", "background"]),
+    _AI_BROWSER_GOALS: new Set(["none", "static", "interactive", "network_capture"]),
+    _AI_ORCHESTRATION_MODES: new Set(["solo", "staged_roles", "parallel_roles"]),
+    _AI_AGENT_ROLES: new Set(["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"]),
+    _RUNTIME_OBLIGATION_ORDER: ["build", "run", "test", "install", "package"],
+    _EXTERNAL_OBLIGATION_ORDER: ["commit", "push", "sync", "pr", "deploy", "upload", "download", "database", "automation", "external"],
+    _aiIntentEnum: load("_aiIntentEnum"),
+    _aiIntentText: intentText,
+    _aiIntentList: intentList,
+  };
+}
 
-  const commandObligations = new Map([
-    ["npm test", ["test"]],
-    ["cargo test", ["test"]],
-    ["npm run dev", ["run"]],
-    ["npm run check", ["build"]],
-    ["cargo check", ["build"]],
-    ["python -m unittest", ["test"]],
-    ["npm ci", ["install"]],
-    ["pnpm i", ["install"]],
-    ["gradlew.bat test", ["test"]],
-    [".\\gradlew.bat test", ["test"]],
-    ["mvn test", ["test"]],
-    ["dotnet test", ["test"]],
-    ["跑一下", ["run"]],
-    ["跑测试", ["test"]],
-    ["跑一下测试", ["test"]],
-    ["run pytest", ["test"]],
-    ["execute vitest", ["test"]],
-  ]);
-  for (const [request, expected] of commandObligations) {
-    assert.deepEqual(runtimeObligations(request), expected, request);
-    assert.equal(profile(request).explicitMutation, true, `${request} must not wait on a classifier to become executable`);
-  }
-  for (const request of ["让我的项目跑起来", "把项目跑通", "启动起来这个服务"]) {
-    assert.equal(profile(request).explicitRuntimeAction, true, `${request} must be treated as explicit runtime authorization`);
-    assert.deepEqual(runtimeObligations(request), ["run"], `${request} should require a run obligation`);
-  }
+test("AI intent judgment is session-aware, semantic, and never falls back to keyword regex", () => {
+  const aiIntentSrc = extractFn("_aiIntentProfile");
+  assert.doesNotMatch(aiIntentSrc, /_pickCheapModel/, "意图判定用用户选择的模型，不降级廉价模型");
+  assert.match(aiIntentSrc, /_billableAiComplete\(config, /, "直接用用户 config 里的模型发起判定");
+  assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
+  assert.match(aiIntentSrc, /setTimeout\(\(\) => r\(""\), 8000\)/, "超时预算 8s，绝不阻断发送");
+  assert.match(aiIntentSrc, /_safeJsonLoose/);
+  assert.match(aiIntentSrc, /需要数据库但用户没说出“数据库”也必须识别/, "数据策略必须从产品行为推理，不能等关键词");
+  assert.match(aiIntentSrc, /禁止通过关键词表、正则/);
+  assert.doesNotMatch(aiIntentSrc, /t\.length < 8/, "有会话上下文的短句不能再被字符数门槛跳过");
+  assert.match(aiIntentSrc, /priorTask、recentTurns、lastRun、unfinishedPlan/, "短句指代必须读取同会话状态");
+  assert.match(aiIntentSrc, /goal=.*action=.*target=.*constraints=.*successCriteria/s,
+    "判定结果必须包含目标、动作、对象、约束和成功条件");
+  // 意图型信号全部归 AI：小白救援/项目范围/生产级等维度不许退回关键词判定。
+  assert.match(SRC, /"projectScope", "uiProject", "debugProject", "productionReadiness", "largeProject",\s*\n\s*"multiService", "promptRescue", "vagueProjectRequest", "maintainabilityUpgrade",/,
+    "全部 24 个意图维度都必须由 AI 判定");
+  assert.match(aiIntentSrc, /现有项目时先 inspect 并 follow_existing\/extend_existing/);
+  assert.match(aiIntentSrc, /michael_design_2_5_existing/);
+  assert.match(aiIntentSrc, /orchestrationMode=solo\/staged_roles\/parallel_roles/);
+  assert.match(aiIntentSrc, /不得把架构歧义直接交给写入 worker/);
+
+  const dims = ["database", "databaseOps", "dataModel", "persistence", "needsReferences",
+    "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
+    "containerOps", "featureCompleteness", "websiteDelivery", "ui", "bug", "implementation"];
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const base = {
+    applies: true, database: true, databaseOps: true, dataModel: false, persistence: false,
+    databaseArchitecture: true, databaseQuery: false, architecture: false, architectureQuality: false,
+    industrialProject: true, projectEngineering: true, engineeringGrade: true,
+    substantial: true, requiresPlan: true, needsReferences: true, authoritativeReferencesRequired: false,
+    largeProject: false, multiService: false, productionReadiness: false, allProjectsEngineering: false,
+    promptRescue: false, vagueProjectRequest: false, maintainabilityUpgrade: false, qualityFloor: false,
+    businessLogic: false, businessRisk: false, securityRisk: false, containerOps: false,
+    featureCompleteness: false, websiteDelivery: false, ui: false, uiProject: false, bug: false,
+    implementation: true, projectScope: false, git: false, backendApi: false, packageVersion: false,
+    interactiveWait: false, longRunningRuntime: false, debugProject: false, explicitWorkspaceMutation: true,
+    explicitRuntimeAction: false, browserAutomation: false, capture: false, longTask: false,
+  };
+  // AI 否决正则误报：句子里带“缓存”这种词但意图与数据库无关 → 数据库律不再注入。
+  const vetoed = merge(base, { database: false, databaseOps: false, dataModel: false, persistence: false, implementation: true }, "改个按钮颜色，顺带提了一嘴缓存这个词");
+  assert.equal(vetoed.database, false);
+  assert.equal(vetoed.databaseOps, false);
+  assert.equal(vetoed.databaseArchitecture, false, "派生字段必须随覆盖后的维度重算");
+  assert.equal(vetoed.intentSource, "ai");
+  // AI 补上正则漏报：没说“数据库”三个字但意图明确 → 数据库深度思考不缺席。
+  const boosted = merge(
+    { ...base, database: false, databaseOps: false, databaseArchitecture: false, substantial: false, requiresPlan: false, needsReferences: false, industrialProject: false, projectEngineering: false, engineeringGrade: false },
+    {
+      database: true, databaseOps: true, implementation: true,
+      engineering: {
+        projectState: "existing", deliverySurface: "backend", changeScope: "module",
+        architectureMode: "extend_existing", dataStrategy: "server",
+        researchMode: "official_and_community", designMode: "none", workspaceAction: "modify",
+        runtimeActions: ["test"], externalActions: [], researchTopics: ["事务与索引"], rationale: [],
+      },
+    },
+    "帮我把订单存取那块弄得可靠一点");
+  assert.equal(boosted.database, true);
+  assert.equal(boosted.databaseArchitecture, true);
+  assert.equal(boosted.needsReferences, true, "databaseOps 意图必须带出社区/权威参考");
+  assert.equal(boosted.requiresPlan, true);
+  const existingSite = merge(
+    { ...base, database: false, databaseOps: false, databaseArchitecture: false, ui: false, uiProject: false },
+    {
+      ui: true, implementation: true, projectScope: true, richMediaRequired: true,
+      engineering: {
+        projectState: "existing", deliverySurface: "website", changeScope: "module",
+        architectureMode: "extend_existing", dataStrategy: "inspect_existing",
+        researchMode: "official_and_community", designMode: "michael_design_2_5_existing",
+        workspaceAction: "modify", runtimeActions: ["test"], externalActions: [],
+        researchTopics: ["现有组件约束"], rationale: ["工作区已有网站"],
+      },
+    },
+    "按现有产品继续完善",
+  );
+  assert.equal(existingSite.existingWebsite, true);
+  assert.equal(existingSite.designKnowledgeRequired, true);
+  assert.equal(existingSite.fromZeroUiProject, false);
+  const semanticProfile = load("_ideSemanticProfile")(existingSite);
+  assert.match(semanticProfile, /^2\.5:/);
+  assert.match(semanticProfile, /existing_website/);
+  assert.match(semanticProfile, /design_implementation/);
+  assert.match(semanticProfile, /design_data/);
+  assert.doesNotMatch(semanticProfile, /design_scaffold/);
+  // 没有会话状态时，判定失败仍不拿正则结果冒充 AI 结果。
+  const fallback = merge(base, null, "任意文本");
+  assert.equal(fallback.database, false, "判定不在就是没意图，不许拿正则值充数");
+  assert.equal(fallback.databaseOps, false);
+  assert.equal(fallback.intentSource, "none");
+  // 已有同会话确认目标时，超时保留目标和维度，不能让“继续”瞬间失忆。
+  const inherited = merge(base, null, "继续", {
+    semantic: { goal: "修复登录偶发卡死", action: "debug", target: "登录请求" },
+    dimensions: { bug: true, implementation: true, projectScope: true },
+  });
+  assert.equal(inherited.bug, true);
+  assert.equal(inherited.implementation, true);
+  assert.equal(inherited.applies, true, "短句继承后也必须走完整工程路径");
+  assert.equal(inherited.intentSemantic.goal, "修复登录偶发卡死");
+  assert.equal(inherited.intentSource, "session-inherited");
+  const mergeSrc = extractFn("_mergeAiIntentProfile");
+  assert.doesNotMatch(mergeSrc, /"regex"/, "合并器里不允许存在正则回退分支");
+  assert.doesNotMatch(extractFn("_engineeringProfileWithAiIntent"), /"regex"/,
+    "下游入口也不允许标记/返回正则判定结果");
+  assert.doesNotMatch(extractFn("_engineeringProfileWithAiIntent"), /_engineeringTaskProfile/,
+    "生产语义入口不能先跑旧关键词画像再覆盖");
+
+  const evidenceOnly = load("_semanticEngineeringEvidence");
+  assert.deepEqual(
+    evidenceOnly("修数据库和 UI，参考 https://example.com/product?tab=design"),
+    { referenceWebsiteUrls: ["https://example.com/product?tab=design"] },
+    "本地起始画像只能抽取精确事实，不能解释数据库/UI 意图",
+  );
+
+  // 发送管线接线：所有 Agent 输入先走同一语义路径，预取/single-flight 消除重复等待。
+  assert.match(SRC, /const _turnEngineeringEarly = _semanticEngineeringEvidence\(text\);/,
+    "正常发送必须从非意图事实壳开始");
+  assert.doesNotMatch(SRC, /const _turnEngineeringEarly = _engineeringTaskProfile\(text\);/,
+    "正常发送不能回到关键词画像");
+  assert.match(SRC, /const _turnIntentContext = _aiIntentContextForTurn\(sess, text,/);
+  assert.match(SRC, /_aiIntentProfile\(text, config, sess, _turnIntentContext\)/);
+  assert.match(SRC, /_turnEngineeringResolved = _mergeAiIntentProfile\(_turnEngineeringEarly, _turnIntentVerdict, text, sess\._intentState\);/);
+  assert.match(SRC, /_commitAiIntentState\(sess, _turnIntentVerdict, text, _turnIntentContext\)/);
+  assert.match(SRC, /const _uiTurnEngineering = _turnEngineeringResolved;/);
+  assert.match(SRC, /const _turnEngineering = _turnEngineeringResolved;/);
+  assert.match(SRC, /run\.engineering = _engineeringProfileWithAiIntent\(task, session\);/);
+  assert.match(SRC, /const profile = profileOverride \|\| _engineeringProfileWithAiIntent\(query\);/);
+  assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved\)/,
+    "首轮项目上下文必须消费本轮已解析语义画像，不能重新做无会话判定");
+  assert.match(SRC, /const _steerVerdict = await _steerIntentTask;[\s\S]*_mergeAiIntentProfile\([\s\S]*_semanticEngineeringEvidence/,
+    "实时引导必须等语义决策生效后再选择下一轮架构/工具路径");
+  assert.doesNotMatch(SRC, /const steerProfile = _engineeringTaskProfile\(steerText\)/,
+    "实时引导不能用关键词抢先扩张副作用义务");
 });
 
-test("mutation effect routing cannot finish as a successful zero-effect run", () => {
-  const { runtimeObligations, externalObligations, explicitExternal, profile } = engineeringHelpers();
+test("classifier outages remain uncertain and never invoke a lexical intent fallback", () => {
+  const semanticHeader = load("_ideSemanticProfile");
+  const headerFor = load("_semanticProfileHeaderFor", { _ideSemanticProfile: semanticHeader });
+
+  assert.equal(headerFor(null, "帮我写个爬虫SaaS产品的官网宣传网站"), "2.5:");
+  assert.equal(headerFor({ intentSource: "none" }, "修数据库、部署并推送"), "2.5:");
+  const resolved = {
+    intentSource: "ai",
+    applies: true,
+    ui: true,
+    uiProject: true,
+    fullWebsite: true,
+    workspaceAction: "modify",
+    designMode: "michael_design_2_5_greenfield",
+    motionDesignRequired: true,
+  };
+  assert.equal(headerFor(resolved, "wording is irrelevant"), semanticHeader(resolved));
+  assert.doesNotMatch(SRC, /function _localSemanticFallbackProfile\(/);
+  assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
+  assert.match(SRC, /classifier is[\s\S]{0,100}unavailable[\s\S]{0,140}empty profile/i);
+  assert.match(SRC, /config\.ideSemanticProfile = _semanticProfileHeaderFor\(_turnEngineeringResolved, text\);/);
+});
+
+test("planning gates consume structured semantic fields and do not infer intent after a classifier outage", () => {
+  const requiresPlan = load("_runRequiresPlan");
+  assert.equal(requiresPlan({ engineering: { intentSource: "none" } }), false);
+  assert.equal(requiresPlan({ engineering: { requiresPlan: true } }), true);
+  assert.equal(requiresPlan({ engineering: { explicitReadOnly: true, projectScope: true } }), true);
+  assert.equal(requiresPlan({ engineering: { explicitReadOnly: true, projectScope: false } }), false);
+
+  assert.doesNotMatch(SRC, /run\.engineering\?\.intentSource === "none"[\s\S]{0,240}_engineeringTaskProfile/);
+  assert.match(SRC, /整体规划先行律：任务规划的优先级高于其他一切动作/);
+  assert.match(SRC, /一次性列出完整、顺序正确、覆盖全部交付的计划/);
+  assert.match(SRC, /项目结构（真实文件系统快照）：\*\*空目录\*\*/);
+  assert.match(SRC, /标明空目录就直接规划、不列目录不探文件/);
+  assert.match(SRC, /不需要的步骤标 cancelled（写明原因），新发现的工作补成新步骤/);
+});
+
+test("设计工艺块 token 瘦身：服务端设计层在场时只留锚点，缺席时全量兑底", () => {
+  const block = load("_uiDesignCraftBlock", {
+    _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
+    _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+  });
+  const p = { ui: true, uiProject: true, referenceWebsiteRequired: true, transactionalProduct: false, fromZeroUiProject: true };
+  const full = block("帮我写官网", p);
+  const lean = block("帮我写官网", p, { serverDesignLayersActive: true });
+  assert.ok(full.length > 4000, "兑底模式必须保留完整工艺块（零回退）");
+  assert.ok(lean.length < 900, "服务端设计层在场时本地只留锚点，省下每轮全价 ~4K token");
+  assert.match(lean, /【设计执行】/);
+  assert.match(lean, /指定参考站优先/, "客户端独有细则（参考站）瘦身模式也要保留");
+  assert.doesNotMatch(lean, /先数卡片再定网格/, "重叠内容不再本地重复");
+  assert.match(SRC, /serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile/,
+    "瘦身条件必须是 L0 开启且旗标头已送达");
+});
+
+test("计划质量判定：AI 语义评审主判，正则记分卡只做 fail-open 兑底", () => {
+  // 用户红线：语义判断不得用关键词/正则硬猜——记分卡会误杀“意思到位用词不同”的好
+  // 计划、放行堆满魔法词的空计划。主判改为 _aiPlanReview（看意思、fail-open），
+  // 记分卡仅在 AI 不可用时兑底（零回退纪律）。
+  assert.match(SRC, /async function _aiPlanReview\(/);
+  assert.match(SRC, /评审看意思不看用词/);
+  assert.match(SRC, /run\._planReviewSig !== _planSig/, "同一份计划只评一次，计划变更后重评");
+  assert.match(SRC, /\[PLAN_REVIEW\] 计划评审发现缺口/);
+  // 同步路径不再挂记分卡结论：PLAN_NEEDS_WORK 只剩 AI 不可用时的兑底分支。
+  assert.doesNotMatch(SRC, /const planIssue = _requiredPlanIssue\(run, planSteps\);/,
+    "update_plan 的同步结果不得再由正则记分卡直接审判");
+  assert.match(SRC, /review === null[\s\S]{0,200}_requiredPlanIssue\(run, _reviewSteps\)/,
+    "AI 不可用时必须回退记分卡，不得裸奔");
+});
+
+test("正则字面量免疫：编辑工具损坏形态禁止出现，惯犯站点必须用 \\u000a 写法", () => {
+  // 实证：同函数里 \\u000a 写法的正则整个会话零损坏，\\n 写法的 4 处每次编辑必被
+  // 外部编辑工具打断成真换行——行为诡异且 node --check 照样过（“改着改着就暴乱”的
+  // 典型病根之一）。现已全部改写为字节等价的 \\u000a 免疫形态。
+  assert.doesNotMatch(SRC, /\[\^\n/,
+    "字符类里出现真换行 = 编辑工具损坏又发生了，立即修复");
+  assert.ok((SRC.match(/\[\^\\u000a/g) || []).length >= 5,
+    "惯犯站点必须保持 \\u000a 免疫写法");
+  assert.match(SRC, /const writePattern = \/\\\[TOOL:write_file\\\]\\s\*\\u000a\?/,
+    "writePattern 必须用 \\u000a 写法");
+});
+
+test("压缩档位扩大历史容量但不放大每轮项目上下文注入", () => {
+  const scale = load("_contextBudgetScale", {
+    _effectiveContextLimit: () => 5_000_000,
+    _lastGoodAiConfig: { model: "claude-sonnet-4-6" },
+  });
+  assert.equal(scale(), 1, "5M 用于保留更长历史，不把每轮注入放大 8 倍");
+  const native = load("_contextBudgetScale", {
+    _effectiveContextLimit: () => 200_000,
+    _lastGoodAiConfig: { model: "x" },
+  });
+  assert.equal(native(), 1, "原生 200K 窗口保持旧预算不变");
+  const million = load("_contextBudgetScale", {
+    _effectiveContextLimit: () => 1_000_000,
+    _lastGoodAiConfig: { model: "x" },
+  });
+  assert.equal(million(), 1, "1M 同样不自动灌入额外项目文本");
+
+  // 注入层仍统一读取倍率，但倍率固定为 1，避免大档位反而加速 token 消耗。
+  assert.match(SRC, /maxTokens = Math\.round\(\(profile\.substantial \|\| profile\.debugProject \|\| profile\.uiProject \? 8000 : 5000\) \* _ctxScale\)/);
+  assert.match(SRC, /_buildRepoMap\(query, Math\.round\(3000 \* Math\.min\(4, _ctxScale\)\), root\)/);
+  assert.match(SRC, /_treeScale > 1 \? 640 : 180/);
+});
+
+test("自动改错字只服务用户亲手打字，绝不碰 agent 流式预览缓冲", () => {
+  // 旧版对预览缓冲全文开修：把流到一半的 ...inputs 掩成 ..inputs（点号写错真凶）、
+  // pushEditOperations 置脏预览 tab（幽灵脏之源）、每次流式暴发后全文扫描烧主线程。
+  const model = {};
+  const suppressed = load("_autoFixSuppressed", {
+    _programmaticModelUpdates: { has: (m) => m === model },
+    _liveEditorWritePreviews: new Map(),
+  });
+  assert.equal(suppressed(model), true, "程序化更新中的模型直接不排程");
+  assert.equal(suppressed(null), true);
+
+  const pvModel = {};
+  const previews = new Map([["/repo/a.tsx", { model: pvModel, userChanged: false, rolledBack: false, committed: false }]]);
+  const gate2 = load("_autoFixSuppressed", {
+    _programmaticModelUpdates: { has: () => false },
+    _liveEditorWritePreviews: previews,
+  });
+  assert.equal(gate2(pvModel), true, "agent 预览活跃且用户没碰过 → 改错字器禁止插手");
+  previews.get("/repo/a.tsx").userChanged = true;
+  assert.equal(gate2(pvModel), false, "用户接管后恢复正常改错字");
+  assert.equal(gate2({}), false, "普通用户缓冲不受影响");
+
+  // 三个入口（两个监听 + 执行函数）都必须接线抢制门。
+  assert.ok((SRC.match(/_autoFixSuppressed\(/g) || []).length >= 4,
+    "onDidChangeModelContent/onDidChangeMarkers/_runAutoCorrections 都要接线");
+});
+
+test("断流续写抢救：被掩断的写入内容喂回重试轮，禁止从零重写", () => {
+  // 上游把 write_file 参数流掊断时，已流出内容在增量解码缓存里——重试前必须交还
+  // 模型照抄续写，否则模型从零重想重写（实测“写着写着重头再来”）。
+  const turn = extractFn("_agentModelTurn");
+  assert.match(turn, /if \(truncated \|\| erroredToolStream\) \{[\s\S]{0,900}\[断流续写\]/,
+    "截断/错误流重试前必须把半截内容交还模型");
+  assert.match(turn, /逐字照抄/, "必须命令照抄已生成部分而非重新设计");
+  assert.match(turn, /if \(parses\) continue;/, "只抢救被掩断的那个调用，参数完整的不重复投喂");
+  assert.match(turn, /if \(_salvageMsg\) \{ const i = messages\.indexOf\(_salvageMsg\); if \(i >= 0\) messages\.splice\(i, 1\); \}/,
+    "抢救消息是轮内修复上下文，收尾必须从持久历史里移除");
+  assert.match(SRC, /请重新输出这次工具调用\|断流续写/,
+    "抢救消息的大段代码不得污染参数默认值推断上下文");
+});
+
+test("IP 地区探测只做安装源路由：真实IP优先、时区兑底、缓存防抖", () => {
+  const regionFromTz = (tz) => load("_regionFromTimezone", {
+    Intl: { DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: tz }) }) },
+  })();
+  assert.equal(regionFromTz("Asia/Shanghai"), "cn");
+  assert.equal(regionFromTz("Asia/Urumqi"), "cn");
+  assert.equal(regionFromTz("America/Los_Angeles"), "", "非中国时区不得猜地区");
+  assert.equal(regionFromTz("Asia/Tokyo"), "");
+
+  // 探测源是真实 IP 出口（Cloudflare trace），失败才回退时区；结果 24h 缓存。
+  assert.match(SRC, /cloudflare\.com\/cdn-cgi\/trace/);
+  assert.match(SRC, /24 \* 3600e3/);
+  // 两条发送链路（agent 主循环 + 普通聊天）都带地区；Rust 侧转发为 x-ide-region。
+  assert.equal((SRC.match(/ideRegion = _ideRegionCode\(\)/g) || []).length, 2);
+  assert.match(SRC, /if \(config\.ideRegion\) _h\["x-ide-region"\]/);
+});
+
+test("semantic orchestration chooses the minimum role topology and lazy collaboration tools", () => {
+  const dims = ["implementation", "projectScope", "securityRisk"];
+  const intentText = load("_aiIntentText");
+  const intentList = load("_aiIntentList", { _aiIntentText: intentText });
+  const normalize = load("_normalizeAiIntentVerdict", aiIntentNormalizeDeps(dims, intentText, intentList));
+  const verdict = normalize({
+    semantic: {
+      goal: "升级认证与权限系统", action: "modify", target: "认证模块",
+      continuation: "new", confidence: 0.94, constraints: [], successCriteria: [], ambiguities: [],
+    },
+    engineering: {
+      projectState: "existing", deliverySurface: "mixed", changeScope: "project",
+      architectureMode: "refactor_existing", dataStrategy: "inspect_existing",
+      researchMode: "official_and_community", designMode: "none", workspaceAction: "modify",
+      orchestrationMode: "staged_roles",
+      roleNeeds: ["architect", "security", "backend", "unknown", "architect"],
+      coordinationRisks: ["鉴权契约尚未稳定", "共享类型由单一角色所有"],
+      runtimeActions: ["test"], externalActions: [], researchTopics: [], rationale: [],
+    },
+    dimensions: { implementation: true, projectScope: true, securityRisk: true },
+  }, { workspaceEvidence: { hasWorkspace: true, snapshotReady: true, topLevel: ["src"] } });
+  assert.equal(verdict.engineering.orchestrationMode, "staged_roles");
+  assert.deepEqual(verdict.engineering.roleNeeds, ["architect", "security", "backend"]);
+  assert.deepEqual(verdict.engineering.coordinationRisks, ["鉴权契约尚未稳定", "共享类型由单一角色所有"]);
+
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const profile = merge({ referenceWebsiteUrls: [] }, verdict, "升级认证与权限系统");
+  assert.equal(profile.orchestrationMode, "staged_roles");
+  assert.deepEqual(profile.roleNeeds, ["architect", "security", "backend"]);
+  assert.match(load("_ideSemanticProfile")(profile), /collaboration,collaboration_staged/);
+
+  const contract = load("_agentIntentExecutionBlock")(profile);
+  assert.match(contract, /分阶段多角色：先收敛契约，再实施/);
+  assert.match(contract, /必要角色: architect、安全|必要角色: architect、security、backend/);
+  assert.match(contract, /契约未定前禁止派写入 worker/);
+
+  const emptyRoles = normalize({
+    engineering: { orchestrationMode: "parallel_roles", roleNeeds: ["not-a-role"] },
+  });
+  assert.equal(emptyRoles.engineering.orchestrationMode, "solo", "invalid/empty role sets must fail closed to solo");
+  assert.deepEqual(emptyRoles.engineering.coordinationRisks, []);
+  const unresolvedParallel = normalize({
+    engineering: {
+      orchestrationMode: "parallel_roles", roleNeeds: ["architect", "backend"],
+      coordinationRisks: ["接口边界待定"],
+    },
+  });
+  assert.equal(unresolvedParallel.engineering.orchestrationMode, "staged_roles",
+    "decision roles in a parallel proposal must force contract-first staging");
+  const oneRoleParallel = normalize({
+    engineering: { orchestrationMode: "parallel_roles", roleNeeds: ["frontend"] },
+  });
+  assert.equal(oneRoleParallel.engineering.orchestrationMode, "solo",
+    "one specialist is not a multi-role topology");
+
+  assert.match(SRC, /architect: `# 你的角色：架构师/);
+  assert.match(SRC, /product: `# 你的角色：产品工程师/);
+  assert.match(SRC, /security: `# 你的角色：安全工程师/);
+  assert.match(SRC, /enum: \["architect", "product", "research", "frontend", "backend", "database", "security"/,
+    "read-only subagents must expose all semantic specialist roles");
+  assert.match(SRC, /enum: \["frontend", "backend", "database", "security", "test", "devops", "design", "docs"\]/,
+    "workers may apply a settled security fix but may not own unresolved architecture/product decisions");
+  const cloudTools = JSON.parse(SERVER_TOOLS);
+  const cloudRoles = (name) => cloudTools.find((tool) => tool?.function?.name === name)
+    ?.function?.parameters?.properties?.role?.enum;
+  assert.deepEqual(cloudRoles("run_subagent"),
+    ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"],
+    "the lazy server schema must expose the same read-only specialist roles");
+  assert.deepEqual(cloudRoles("run_worker"),
+    ["frontend", "backend", "database", "security", "test", "devops", "design", "docs"],
+    "the lazy server worker schema must expose the settled implementation roles");
+  const cloudDescription = (name) => cloudTools.find((tool) => tool?.function?.name === name)?.function?.description || "";
+  assert.match(cloudDescription("run_subagent"), /staged_roles.*只读角色/,
+    "the lazy read-only schema must explain contract-first collaboration");
+  assert.match(cloudDescription("run_worker"), /parallel_roles.*scope 必须互不重叠/,
+    "the lazy worker schema must explain real parallel ownership boundaries");
+});
+
+test("intent context is bounded and isolated by session plus context fingerprint", () => {
+  const intentText = load("_aiIntentText");
+  const intentList = load("_aiIntentList", { _aiIntentText: intentText });
+  const contextForTurn = load("_aiIntentContextForTurn", { _aiIntentText: intentText, _aiIntentList: intentList });
+  const fingerprint = load("_aiIntentContextFingerprint");
+  const cacheKey = load("_aiIntentCacheKey");
+  const session = {
+    id: "chat-a",
+    project: "/repo-a",
+    memory: { recent: [
+      { role: "user", content: "修复登录页偶发卡死" },
+      { role: "assistant", content: "定位到请求取消状态没有复位" },
+      { role: "tool", content: "x".repeat(20_000) },
+    ] },
+    _demandLedger: ["不要改现有视觉", "修完要跑登录回归"],
+    _intentState: { lastUserText: "修复登录页偶发卡死", semantic: {
+      goal: "登录不再卡死", action: "debug", target: "登录请求", constraints: ["不改视觉"], successCriteria: ["登录回归通过"],
+    } },
+    _lastRunState: { outcome: "partial", task: "修登录", result: "复现成功但尚未修复", incompleteReason: "root cause pending" },
+    _planSteps: [{ content: "修复取消状态", status: "in_progress" }, { content: "已读取文件", status: "completed" }],
+  };
+  const context = contextForTurn(session, "还是不行", { root: "/repo-a", activePath: "/repo-a/src/login.ts" });
+  assert.equal(context.currentMessage, "还是不行");
+  assert.equal(context.priorTask.goal, "登录不再卡死");
+  assert.deepEqual(context.unfinishedPlan, ["修复取消状态"]);
+  assert.equal(context.recentTurns.length, 2, "工具原始结果不进入意图快照");
+  assert.ok(JSON.stringify(context).length < 6000, "意图上下文必须严格有界");
+  const fp = fingerprint(context);
+  assert.notEqual(cacheKey("继续", "chat-a", fp), cacheKey("继续", "chat-b", fp), "相同短句不能跨会话复用判定");
+  assert.notEqual(cacheKey("继续", "chat-a", fp), cacheKey("继续", "chat-a", fingerprint({ ...context, activeFile: "/repo-a/src/app.ts" })),
+    "同会话上下文变化后也不能复用旧判定");
+
+  const dims = ["bug", "implementation", "projectScope"];
+  const normalize = load("_normalizeAiIntentVerdict", aiIntentNormalizeDeps(dims, intentText, intentList));
+  const correction = normalize({
+    semantic: { action: "debug", continuation: "correct", confidence: 0.91, ambiguities: [] },
+    dimensions: { bug: true, implementation: true, projectScope: true },
+  }, context);
+  assert.equal(correction.semantic.goal, "登录不再卡死", "短纠正省略目标时要继承已解析目标");
+  assert.equal(correction.semantic.target, "登录请求", "短纠正省略对象时要解析回上一轮对象");
+  assert.equal(correction.semantic.continuation, "correct");
+  assert.equal(normalize({}, context), null, "an empty classifier response must not become a default route");
+  assert.match(extractFn("_chatSessionDataForStorage"), /intentState:[\s\S]*lastRun:/,
+    "会话重启后仍要保留已确认目标和上轮结果");
+  assert.match(extractFn("restoreChatHistory"), /sData\.intentState[\s\S]*sData\.lastRun/);
+  assert.match(extractFn("_truncateFromUserMessage"), /sess\._intentState = null; sess\._lastRunState = null/,
+    "编辑重发必须作废被截断未来轮次的语义状态");
+});
+
+test("a novice's vague sentence flows through the real chain into professional database discipline", async () => {
+  // 端到端（仅 mock 网络层）：小白一句大白话 → AI 意图判定（真实解析/缓存/合并代码）
+  // → 决策框注入数据库律/工业律；小改动则全程不出现数据库排场。
+  const dims = ["database", "databaseOps", "dataModel", "persistence", "needsReferences",
+    "businessLogic", "businessRisk", "securityRisk", "architectureQuality",
+    "containerOps", "featureCompleteness", "websiteDelivery", "ui", "bug", "implementation"];
+  const asked = [];
+  const intentText = load("_aiIntentText");
+  const intentList = load("_aiIntentList", { _aiIntentText: intentText });
+  const contextFingerprint = load("_aiIntentContextFingerprint");
+  const normalizeVerdict = load("_normalizeAiIntentVerdict", aiIntentNormalizeDeps(dims, intentText, intentList));
+  const aiIntent = load("_aiIntentProfile", {
+    inTauri: true,
+    _AI_INTENT_DIMENSIONS: dims,
+    _aiIntentCache: new Map(),
+    _aiIntentInflight: new Map(),
+    _aiIntentCacheKey: load("_aiIntentCacheKey"),
+    _aiIntentContextFingerprint: contextFingerprint,
+    _normalizeAiIntentVerdict: normalizeVerdict,
+    _safeJsonLoose: load("_safeJsonLoose"),
+    _billableAiComplete: async (config, messages) => {
+      asked.push({ model: config.model, prompt: messages[0].content });
+      // 真实模型作风：带 code fence 的 JSON 也必须能解
+      return '```json\n{"semantic":{"goal":"交付可用的记账产品","action":"create","target":"记账应用","constraints":["沿用当前项目"],"successCriteria":["能新增并查询账目"],"continuation":"new","confidence":0.94,"ambiguities":[]},"engineering":{"projectState":"existing","deliverySurface":"web_app","changeScope":"project","architectureMode":"extend_existing","dataStrategy":"server","researchMode":"official_and_community","designMode":"michael_design_2_5_existing","workspaceAction":"modify","runtimeActions":["test"],"externalActions":[],"researchTopics":["账目事务与索引"],"rationale":["账目需跨会话查询"]},"dimensions":{"database":true,"databaseOps":true,"dataModel":true,"persistence":true,"needsReferences":true,"businessLogic":true,"featureCompleteness":true,"ui":true,"uiProject":true,"implementation":true,"projectScope":true}}\n```';
+    },
+  });
+  const context = (message, id = "chat-ledger") => ({ sessionId: id, currentMessage: message, priorTask: null, recentTurns: [] });
+  const verdict = await aiIntent("我想搞个能记账的小东西", { model: "claude-opus-4" }, null, context("我想搞个能记账的小东西"));
+  assert.equal(asked[0].model, "claude-opus-4", "判意图用的就是用户选的模型");
+  // single-flight：同文本并发（预取+发送撞车）只许发一次网络请求、计费一次
+  const [a, b] = await Promise.all([
+    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
+    aiIntent("帮我把那个订单系统搞完整点", { model: "claude-opus-4" }, null, context("帮我把那个订单系统搞完整点")),
+  ]);
+  assert.deepEqual(a, b);
+  assert.equal(asked.length, 2, "两条不同文本共 2 次请求；同文本并发必须被 single-flight 合并");
+  // 输入期投机预取：打字停顿就提前判，发送时零等待
+  assert.match(SRC, /speculative prefetch/, "输入期预取机制必须存在");
+  assert.match(SRC, /_aiIntentProfile\(text, _lastGoodAiConfig, session, context\)\.catch\(/, "预取复用同一会话上下文和上次真实 config");
+  assert.doesNotMatch(SRC, /function _lexicalRank\(/,
+    "tool selection must not be routed through a lexical scoring fallback");
+  assert.match(asked[0].prompt, /我想搞个能记账的小东西/);
+  assert.equal(verdict.database, true);
+  assert.equal(verdict.databaseOps, true);
+  assert.equal(verdict.semantic.goal, "交付可用的记账产品");
+
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const merged = merge({}, verdict, "我想搞个能记账的小东西");
+  assert.equal(merged.intentSource, "ai");
+  assert.equal(merged.database, true);
+  assert.equal(merged.databaseArchitecture, true);
+  assert.equal(merged.requiresPlan, true, "模糊的小项目请求也要走完整工程路径");
+
+  const frame = load("_agentDecisionFrameBlock", {
+    _engineeringProfileWithAiIntent: () => merged,
+    _agentBugEvidenceLadderBlock: () => "",
+    _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
+  });
+  const laws = frame("我想搞个能记账的小东西");
+  assert.match(laws, /本轮意图执行契约/);
+  assert.match(laws, /目标: 交付可用的记账产品/);
+  assert.match(laws, /数据库律/);
+  assert.match(laws, /数据库工业律/);
+  assert.match(laws, /事务隔离、唯一约束、索引、连接池/);
+
+  // 反例：小改动的意图只有 UI，不许拉出数据库排场。
+  const buttonVerdict = {};
+  for (const dim of dims) buttonVerdict[dim] = dim === "ui" || dim === "implementation";
+  const buttonMerged = merge({}, buttonVerdict, "帮我把这个按钮弄成蓝色的");
+  const buttonLaws = frame("帮我把这个按钮弄成蓝色的", buttonMerged);
+  assert.doesNotMatch(buttonLaws, /数据库律/);
+  assert.doesNotMatch(buttonLaws, /数据库工业律/);
+});
+
+test("automation-era laws: install cleanup desktop gates fire only on AI intent", () => {
+  // 全自动化三律：装到能用为止 / 只删可再生之物 / 先确认窗口再动手；
+  // 门控同样只认 AI 意图维度（envSetup/cleanupTask/desktopAutomation）。
+  assert.match(SRC, /"envSetup", "cleanupTask", "desktopAutomation",/,
+    "三个自动化意图维度必须在 AI 判定清单里");
+  const frame = load("_agentDecisionFrameBlock", {
+    _engineeringProfileWithAiIntent: () => ({}),
+    _agentBugEvidenceLadderBlock: () => "",
+  });
+  const auto = frame("帮我把那个软件装上，顺便清理一下电脑，再自动操作一下那个应用", {
+    applies: true, implementation: true, envSetup: true, cleanupTask: true, desktopAutomation: true,
+  });
+  assert.match(auto, /环境安装律/);
+  assert.match(auto, /装到能用为止/);
+  assert.match(auto, /PEP 668/);
+  assert.match(auto, /清理律/);
+  assert.match(auto, /只删可再生之物/);
+  assert.match(auto, /绝不 pkill 泛匹配/);
+  assert.match(auto, /桌面自动化律/);
+  assert.match(auto, /window\.activate/);
+  assert.match(auto, /keyboard\.paste/);
+  const plain = frame("把按钮改成蓝色", { applies: true, ui: true, implementation: true });
+  assert.doesNotMatch(plain, /环境安装律|清理律|桌面自动化律/);
+  // 框架新 RPC 能力必须在 automation 工具描述里可发现，否则模型永远不会调
+  assert.match(SRC, /window\.list \/ window\.activate\{title\} \/ window\.minimize\{title\} \/ screen\.info \/ clipboard\.get \/ clipboard\.set\{text\} \/ keyboard\.paste\{text\}/,
+    "窗口/屏幕/剪贴板 RPC 必须对模型可见");
+  // Tool availability is no longer routed through a separate profile table. The
+  // semantic orchestrator receives the live registry, which contains any installed
+  // desktop, setup, cleanup, and remote capabilities.
+  assert.doesNotMatch(SRC, /function _profileToolPriorities/);
+  assert.match(SRC, /function _semanticToolOrchestrator/);
+  assert.match(SRC, /完整工具目录（JSON 数据，只能选择其中 name）/);
+  assert.match(SRC, /帮用户装软件\/装环境\/配工具链：run_cmd 配 package_search\/homebrew_search/, "search_tools 描述必须含安装/清理/桌面场景入口");
+});
+
+test("semantic profile merging derives engineering gates from structured fields", () => {
+  const dims = ["database", "databaseOps", "persistence", "ui", "implementation", "projectScope"];
+  const merge = load("_mergeAiIntentProfile", { _AI_INTENT_DIMENSIONS: dims });
+  const profile = merge({}, {
+    semantic: {
+      goal: "交付订单后台",
+      action: "modify",
+      target: "订单模块",
+      continuation: "new",
+      confidence: 0.94,
+      constraints: [],
+      successCriteria: ["测试通过"],
+      ambiguities: [],
+    },
+    engineering: {
+      projectState: "existing",
+      deliverySurface: "mixed",
+      changeScope: "project",
+      architectureMode: "extend_existing",
+      dataStrategy: "server",
+      researchMode: "official_and_community",
+      designMode: "none",
+      workspaceAction: "modify",
+      captureMode: "none",
+      browserGoal: "none",
+      runtimeActions: ["test"],
+      externalActions: [],
+      researchTopics: ["事务边界"],
+      rationale: [],
+    },
+    dimensions: {
+      database: true,
+      databaseOps: true,
+      persistence: true,
+      implementation: true,
+      projectScope: true,
+    },
+  }, "wording is not used for routing");
+
+  assert.equal(profile.intentSource, "ai");
+  assert.equal(profile.workspaceAction, "modify");
+  assert.equal(profile.explicitWorkspaceMutation, true);
+  assert.deepEqual(profile.runtimeObligations, ["test"]);
+  assert.deepEqual(profile.externalObligations, []);
+  assert.equal(profile.databaseArchitecture, true);
+  assert.equal(profile.requiresPlan, true);
+  assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
+  assert.doesNotMatch(SRC, /function _runtimeObligationsForTask\(/);
+  assert.doesNotMatch(SRC, /function _externalObligationsForTask\(/);
+});
+
+test("mutation effect routing consumes only the structured semantic contract", () => {
   const required = load("_runRequiredEffect");
   const target = load("_effectTargetForTask");
-  const runTarget = load("_runEffectTarget", {
-    _effectTargetForTask: target,
-    _engineeringTaskProfile: profile,
-    _runtimeObligationsForTask: runtimeObligations,
-    _externalObligationsForTask: externalObligations,
-    _explicitExternalEffectRequested: explicitExternal,
-  });
+  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
   const contract = load("_requiredEffectContract", {
     _runRequiredEffect: required,
-    _engineeringTaskProfile: profile,
-    _runtimeObligationsForTask: runtimeObligations,
-    _externalObligationsForTask: externalObligations,
     _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
     _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
     _runEffectTarget: runTarget,
   });
   const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
+
   assert.equal(required({ mode: "agent", engineering: { applies: true } }), "mutate");
   assert.equal(required({ mode: "agent", engineering: { explicitMutation: true } }), "mutate");
-  assert.equal(required({ mode: "agent", engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect",
-    "advisory optimization questions stay read-only");
-  assert.equal(target("修复登录按钮不响应", { bug: true }), "workspace");
-  assert.equal(target("把最新版推送到 GitHub", { implementation: true }), "external");
-  assert.equal(target("编译运行一下", { implementation: false }), "runtime");
-  assert.equal(target("设计数据库 schema 和索引", profile("设计数据库 schema 和索引")), "workspace");
-  assert.equal(target("查数据库里重复用户", profile("查数据库里重复用户")), "external");
-  assert.equal(target("查看 git status 和 diff", profile("查看 git status 和 diff")), "external");
-  assert.equal(target("修复 commit 按钮样式", profile("修复 commit 按钮样式")), "workspace");
-  assert.equal(runTarget({ _originalText: "修复代码", engineering: profile("修复代码") }), "workspace",
-    "external actions cannot stand in for a clear local edit");
+  assert.equal(required({ mode: "agent", engineering: { implementation: true, explicitMutation: false, applies: true } }), "inspect");
+  assert.equal(target("push deploy words are ignored", { workspaceAction: "modify" }), "workspace");
+  assert.equal(target("edit words are ignored", { runtimeObligations: ["build"] }), "runtime");
+  assert.equal(target("build words are ignored", { externalObligations: ["push"] }), "external");
+  assert.equal(target("修复并部署", {}), "none");
+
+  const run = {
+    mode: "agent",
+    engineering: {
+      explicitMutation: true,
+      explicitWorkspaceMutation: true,
+      workspaceAction: "modify",
+      runtimeObligations: ["build", "test"],
+      externalObligations: ["push"],
+    },
+  };
+  assert.deepEqual(contract(run), { workspace: true, runtime: ["build", "test"], external: ["push"] });
+  assert.deepEqual(missing(run, {
+    workspaceOps: 1,
+    runtimeEffects: ["build"],
+    externalEffects: ["commit"],
+  }), ["runtime:test", "external:push"]);
+  assert.deepEqual(missing(run, {
+    workspaceOps: 1,
+    runtimeEffects: ["build", "test"],
+    externalEffects: ["push"],
+  }), []);
+
+  assert.doesNotMatch(SRC, /function _runtimeObligationsForTask\(/);
+  assert.doesNotMatch(SRC, /function _externalObligationsForTask\(/);
+  assert.doesNotMatch(SRC, /function _negatedEffectKindsForTask\(/);
   assert.doesNotMatch(SRC, /run\._incompleteReason = "pending_plan"/);
   assert.match(SRC, /run\._incompleteReason = `required_effect_missing:\$\{_missingEffects\.join\(","\)\}`/);
-  assert.match(SRC, /_missingRequiredEffects\(run, \{/);
-  assert.match(SRC, /runtimeEffects: _runtimeEffects/);
-  assert.match(SRC, /externalEffects: _externalEffects/);
-  assert.match(SRC, /s\.content \|\| s\.title \|\| s\.description \|\| "step"/);
-  assert.match(SRC, /run\._incompleteReason \|\| hitCap/);
 });
 
-test("compound workspace, runtime, and external obligations are reconciled by exact evidence type", () => {
-  const helpers = engineeringHelpers();
+test("compound obligations and later cancellations reconcile by exact structured effect type", () => {
   const required = load("_runRequiredEffect");
   const target = load("_effectTargetForTask");
-  const runTarget = load("_runEffectTarget", {
-    _effectTargetForTask: target,
-    _engineeringTaskProfile: helpers.profile,
-    _runtimeObligationsForTask: helpers.runtimeObligations,
-    _externalObligationsForTask: helpers.externalObligations,
-  });
+  const runTarget = load("_runEffectTarget", { _effectTargetForTask: target });
   const contract = load("_requiredEffectContract", {
     _runRequiredEffect: required,
-    _engineeringTaskProfile: helpers.profile,
-    _runtimeObligationsForTask: helpers.runtimeObligations,
-    _externalObligationsForTask: helpers.externalObligations,
     _RUNTIME_OBLIGATION_ORDER: RUNTIME_OBLIGATION_ORDER,
     _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER,
     _runEffectTarget: runTarget,
   });
   const missing = load("_missingRequiredEffects", { _requiredEffectContract: contract });
-  const makeRun = (text) => ({ mode: "agent", _originalText: text, engineering: helpers.profile(text) });
+  const makeRun = (engineering, cancelled = []) => ({
+    mode: "agent",
+    engineering: { explicitMutation: true, ...engineering },
+    _cancelledEffectKinds: new Set(cancelled),
+  });
 
-  const runtimeRun = makeRun("编译运行一下");
-  assert.deepEqual(contract(runtimeRun), { workspace: false, runtime: ["build", "run"], external: [] });
-  assert.deepEqual(missing(runtimeRun, { runtimeEffects: ["build"] }), ["runtime:run"]);
-  assert.deepEqual(missing(runtimeRun, { workspaceOps: 3, runtimeEffects: ["test"] }), ["runtime:build", "runtime:run"],
-    "edits and tests cannot impersonate build+run obligations");
-
-  const pushRun = makeRun("把项目更新到 GitHub");
-  assert.deepEqual(contract(pushRun).external, ["push"]);
-  assert.deepEqual(missing(pushRun, { externalEffects: ["commit", "external"] }), ["external:push"],
-    "a local commit cannot impersonate a requested push");
-
-  const compound = makeRun("修复登录代码，然后编译运行并推送到 GitHub");
-  assert.deepEqual(contract(compound), { workspace: true, runtime: ["build", "run"], external: ["push"] });
+  const compound = makeRun({
+    explicitWorkspaceMutation: true,
+    workspaceAction: "modify",
+    runtimeObligations: ["build", "run"],
+    externalObligations: ["commit", "push"],
+  });
+  assert.deepEqual(contract(compound), {
+    workspace: true,
+    runtime: ["build", "run"],
+    external: ["commit", "push"],
+  });
   assert.deepEqual(missing(compound, {
     workspaceOps: 1,
     runtimeEffects: ["build", "run"],
-    externalEffects: ["push", "external"],
+    externalEffects: ["commit", "push"],
   }), []);
 
-  assert.deepEqual(contract(makeRun("不要部署，只修代码")), { workspace: true, runtime: [], external: [] });
-  assert.deepEqual(contract(makeRun("不用 push，只提交")), { workspace: false, runtime: [], external: ["commit"] });
-  assert.deepEqual(contract(makeRun("提交当前修改并 push 到 GitHub")), { workspace: false, runtime: [], external: ["commit", "push"] });
-  assert.deepEqual(contract(makeRun("创建 PR 并查看 GitHub Actions CI 状态")), { workspace: false, runtime: [], external: ["pr"] });
-  assert.deepEqual(contract(makeRun("修复 commit 按钮样式")), { workspace: true, runtime: [], external: [] });
-  assert.deepEqual(contract(makeRun("先不要运行，只编译")), { workspace: false, runtime: ["build"], external: [] });
-  assert.deepEqual(contract(makeRun("修改 Prisma schema 和索引，并补 migration")), { workspace: true, runtime: [], external: [] });
-  for (const request of [
-    "在最后一次修改后依次运行 npm run typecheck、npm test、npm run build",
-    "修改完成后重新运行 npm run typecheck、npm test 和 npm run build",
-  ]) {
-    assert.deepEqual(helpers.runtimeObligations(request), ["build", "test"], request);
-    assert.equal(contract(makeRun(request)).runtime.includes("run"), false, request);
-  }
-
-  for (const request of [
-    "UPDATE users SET active=1",
-    "执行 DELETE FROM users WHERE id=7",
-    "please INSERT INTO audit_log(message) VALUES ('ok')",
-    "以下 SQL：CREATE TABLE jobs (id integer)",
-  ]) {
-    const rawDatabaseRun = makeRun(request);
-    assert.equal(rawDatabaseRun.engineering.explicitWorkspaceMutation, false, request);
-    assert.deepEqual(contract(rawDatabaseRun), { workspace: false, runtime: [], external: ["database"] }, request);
-  }
-  for (const request of [
-    "update docs",
-    "Please update config and set timeout to 30",
-    "update the auth module and set the default",
-    "update config set timeout = 30",
-    "DELETE local file",
-    "delete from array",
-    "create component",
-    "Create table component for users",
-    "Create table component (React + Tailwind)",
-    "/* TODO */ Create table component (React + Tailwind)",
-    "Create table grid (sortable columns);",
-    "create view component",
-    "create view component as select menu",
-    "drop support for Node 18",
-  ]) {
-    assert.equal(helpers.directDatabaseMutation(request), false, request);
-  }
-  for (const request of [
-    "-- cleanup\nDROP TABLE users CASCADE;",
-    "DROP TABLE users CASCADE",
-    "/* cleanup */ TRUNCATE TABLE users RESTART IDENTITY;",
-    "CREATE TABLE users (id integer)",
-    "CREATE TABLE users AS (SELECT * FROM old_users);",
-    "UPDATE pages SET body = '<button>save</button>' WHERE id = 1",
-  ]) {
-    assert.equal(helpers.directDatabaseMutation(request), true, request);
-  }
+  const narrowed = makeRun({
+    explicitWorkspaceMutation: true,
+    workspaceAction: "modify",
+    runtimeObligations: ["build", "run"],
+    externalObligations: ["commit", "push", "deploy"],
+  }, ["runtime:run", "external:push", "external:deploy"]);
+  assert.deepEqual(contract(narrowed), {
+    workspace: true,
+    runtime: ["build"],
+    external: ["commit"],
+  });
+  assert.deepEqual(missing(narrowed, { workspaceOps: 1, runtimeEffects: ["build"] }), ["external:commit"]);
+  assert.deepEqual(contract(makeRun({ externalObligations: ["database"] })), {
+    workspace: false,
+    runtime: [],
+    external: ["database"],
+  });
 });
 
-test("agent side-effect intent gate is disabled; execution relies on evidence and file safety", () => {
-  const helpers = engineeringHelpers();
-  const userIntentText = load("_agentUserIntentText");
-  const readOnlyCommand = load("_looksLikeReadOnlyCommand");
-  const dependencyRestoreCommand = load("_isDependencyRestoreCommand", {
-    _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
-    _simpleShellWords: load("_simpleShellWords"),
-    _isDependencyRestoreSegment: load("_isDependencyRestoreSegment", { _simpleShellWords: load("_simpleShellWords") }),
-    _isDependencyRestoreOutputPipeSegment: load("_isDependencyRestoreOutputPipeSegment"),
-    _looksLikeReadOnlyCommand: readOnlyCommand,
-  });
-  const allowsWorkspace = load("_agentAllowsWorkspaceMutation", {
-    _agentUserIntentText: userIntentText,
-    _negatedEffectKindsForTask: helpers.negatedEffectKinds,
-    _engineeringTaskProfile: helpers.profile,
-  });
-  const allowsRuntime = load("_agentAllowsRuntimeKind", {
-    _agentUserIntentText: userIntentText,
-    _negatedEffectKindsForTask: helpers.negatedEffectKinds,
-    _engineeringTaskProfile: helpers.profile,
-  });
-  const allowsExternal = load("_agentAllowsExternalKind", {
-    _agentUserIntentText: userIntentText,
-    _negatedEffectKindsForTask: helpers.negatedEffectKinds,
-    _engineeringTaskProfile: helpers.profile,
-  });
-  const issue = load("_agentSideEffectIntentIssue", {
-    _agentUserIntentText: userIntentText,
-    _engineeringTaskProfile: helpers.profile,
-    _negatedEffectKindsForTask: helpers.negatedEffectKinds,
-    _toolMutatesWorkspace: (call) => ["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format"].includes(call?.type),
-    _toolMayProduceExternalEffect: (call) => ["git", "db", "automation", "uiclick", "download", "mcp"].includes(call?.type),
-    _isReadOnlyParallel: (call) => ["diag", "logs", "termread", "termlist", "think", "read", "list", "search", "find", "lsp"].includes(call?.type),
-    _looksLikeReadOnlyCommand: readOnlyCommand,
-    _looksLikeVerificationCommand: (cmd) => /(?:test|build|typecheck|node --check)/.test(String(cmd || "")),
-    _isDependencyRestoreCommand: dependencyRestoreCommand,
-    _agentAllowsDependencyRestore: load("_agentAllowsDependencyRestore", {
-      _agentUserIntentText: userIntentText,
-      _negatedEffectKindsForTask: helpers.negatedEffectKinds,
-      _engineeringTaskProfile: helpers.profile,
-    }),
-    _runtimeCommandKinds: helpers.runtimeCommandKinds,
-    _externalCommandKinds: load("_externalCommandKinds", { _EXTERNAL_OBLIGATION_ORDER: EXTERNAL_OBLIGATION_ORDER }),
-    _dbCallMayMutate: (call) => /^(?:update|insert|delete|alter|drop)\b/i.test(String(call?.query || "")),
-    _GIT_MUTATING_OPS: new Set(["clone", "commit", "push", "pull", "stash", "stash_pop"]),
-    _agentAllowsWorkspaceMutation: allowsWorkspace,
-    _agentAllowsRuntimeKind: allowsRuntime,
-    _agentAllowsExternalKind: allowsExternal,
-  });
-  const run = (text) => ({ mode: "agent", _originalText: text, engineering: helpers.profile(text) });
+test("agent side-effect intent gate is disabled while structured obligations remain queryable", () => {
+  const issue = load("_agentSideEffectIntentIssue");
+  const allowsWorkspace = load("_agentAllowsWorkspaceMutation");
+  const allowsRuntime = load("_agentAllowsRuntimeKind");
+  const allowsExternal = load("_agentAllowsExternalKind");
 
-  assert.equal(issue({ type: "write", path: "src/App.tsx" }, run("我的项目有什么 bug 呢？")), "");
-  assert.equal(issue({ type: "write", path: "src/App.tsx" }, run("修复项目里的 bug")), "");
-  assert.equal(issue({ type: "edit", path: "src/main.js" }, run("把 agent 模式处理好，不要太放肆")), "");
-  assert.equal(issue({ type: "termtask", command: "npm run dev" }, run("看看页面哪里有问题")), "");
-  assert.equal(issue({ type: "cmd", command: "npm test" }, run("看看项目有没有 bug")), "",
-    "diagnostic build/test commands are still allowed as evidence");
-  assert.equal(issue({ type: "cmd", command: "cd /Users/michael/Desktop/中转站" }, run("我的项目跑不起来")), "",
-    "cd to a project directory is a harmless shell navigation step");
-  assert.equal(issue({ type: "termtask", command: "npm run dev" }, run("让我的项目跑起来")), "",
-    "explicit run-up requests must authorize starting the dev server");
-  assert.equal(issue({ type: "cmd", command: "cd github-community && npm install" }, run("让我的项目跑起来")), "",
-    "explicit run-up requests must allow restoring already-declared dependencies from the project directory");
-  assert.equal(issue({ type: "cmd", command: "npm install" }, run("我的项目跑不起来，诊断里都是找不到模块，node_modules 没装")), "",
-    "restoring already-declared npm dependencies is correct environment repair");
-  assert.equal(issue({ type: "termtask", command: "npm install 2>&1 | tail -20" }, run("我的项目跑不起来，缺依赖")), "",
-    "restoring declared dependencies through a readable terminal task is also correct environment repair");
-  assert.equal(issue({ type: "cmd", command: "npm ci" }, run("我的项目跑不起来，缺依赖")), "",
-    "lockfile-based npm ci is allowed for dependency restoration");
-  assert.equal(issue({ type: "cmd", command: "npm install react" }, run("我的项目跑不起来，缺依赖")), "",
-    "install/add commands are no longer blocked by intent keyword checks");
-  assert.equal(issue({ type: "diag" }, run("我的哪些文件有 bug 呢？")), "",
-    "reading IDE diagnostics must never be blocked as a side effect");
-  assert.equal(issue({ type: "logs", path: "/tmp/app.log" }, run("看看后端为什么报错")), "",
-    "reading log tails must never be blocked as a side effect");
-  assert.equal(issue({ type: "termlist" }, run("我的哪些文件有 bug 呢？")), "",
-    "listing existing terminals must never be blocked as a side effect");
-  assert.equal(issue({ type: "termread", name: "" }, run("我的哪些文件有 bug 呢？")), "",
-    "reading existing terminal output must never be blocked as a side effect");
-  assert.equal(issue({ type: "think", content: "假设→证据→分支" }, run("我的哪些文件有 bug 呢？")), "",
-    "private reasoning scratchpad stays read-only");
-  assert.equal(issue({ type: "git", op: "push" }, run("修复项目里的 bug")), "");
-  assert.equal(issue({ type: "git", op: "push" }, run("修复项目里的 bug，然后推送到 GitHub")), "");
+  const unknown = { mode: "agent", engineering: {} };
+  for (const call of [
+    { type: "write", path: "src/App.tsx" },
+    { type: "cmd", command: "npm install react" },
+    { type: "git", op: "push" },
+    { type: "db", query: "UPDATE users SET active=1" },
+    { type: "automation", method: "click" },
+  ]) assert.equal(issue(call, unknown), "");
+
+  const structured = {
+    mode: "agent",
+    engineering: {
+      explicitWorkspaceMutation: true,
+      runtimeObligations: ["build", "test"],
+      externalObligations: ["push"],
+    },
+  };
+  assert.equal(allowsWorkspace(structured), true);
+  assert.equal(allowsRuntime(structured, "build"), true);
+  assert.equal(allowsRuntime(structured, "run"), false);
+  assert.equal(allowsExternal(structured, "push"), true);
+  assert.equal(allowsExternal(structured, "deploy"), false);
+  assert.doesNotMatch(extractFn("_agentSideEffectIntentIssue"), /RegExp|\.test\(/);
 });
 
 test("agent completion avoids duplicate outcome summaries and caps automatic continuation", () => {
@@ -5987,137 +6481,146 @@ test("agent completion avoids duplicate outcome summaries and caps automatic con
     "normal agent narratives should not always get a second automatic recap underneath");
   assert.doesNotMatch(SRC, /const _shouldRenderOutcome = run\.mode === "agent" && \(\s*didMutate \|\| finalErr/s,
     "mutating successfully should not by itself force a duplicate outcome summary");
-  assert.match(SRC, /const _AGENT_HARD_CEIL = 64;/);
-  assert.match(SRC, /const _AGENT_MAX_EXTENSIONS = 2;/);
-  assert.match(SRC, /extensions < _AGENT_MAX_EXTENSIONS/);
+  // 步数预算已整体拆除（用户决策）：结束由 AI 自主判定，不设任何步数天花板/延展审批；
+  // 唯一剩余的 cap 来源是用户自设的 token 预算钳位。
+  assert.match(SRC, /let budget = Infinity;/);
+  assert.doesNotMatch(SRC, /function _initialBudget/,
+    "步数起步预算函数必须随机制一起拆除，不留死代码");
+  assert.doesNotMatch(SRC, /_AGENT_HARD_CEIL|_AGENT_MAX_EXTENSIONS|_AGENT_EXT_STEP/,
+    "步数硬顶/延展常量必须全部拆除");
   assert.match(SRC, /协作边界/);
   assert.match(SRC, /Agent 模式不是无条件全自动/);
   const suggestionSource = SRC.slice(SRC.indexOf("async function _maybeSuggestNext"), SRC.indexOf("function _steerRunningAgent"));
-  assert.match(suggestionSource, /_fallbackNextActionSuggestions\(recent\)/);
+  assert.match(suggestionSource, /_runStateNextActionSuggestions\(sess\)/);
   assert.doesNotMatch(suggestionSource, /aiComplete|chat\/completions/,
     "next-step chips must not start a paid request after the visible run has settled");
 });
 
-test("effect clauses follow the latest explicit directive without erasing other targets", () => {
-  const { runtimeObligations, externalObligations } = engineeringHelpers();
-
-  assert.deepEqual(externalObligations("update table component styling"), []);
-  assert.deepEqual(externalObligations("update the database table"), ["database"]);
-  assert.deepEqual(externalObligations("不要 push 到旧 remote，push 到 origin"), ["push"]);
-  assert.deepEqual(externalObligations("不要部署旧服务，但是部署新服务"), ["deploy"]);
-  assert.deepEqual(externalObligations("不要解释部署原理，直接部署"), ["deploy"]);
-  assert.deepEqual(runtimeObligations("不要测试旧模块，只测试新模块"), ["test"]);
-  assert.deepEqual(runtimeObligations("不要运行旧版本，运行新版本"), ["run"]);
-
-  assert.deepEqual(externalObligations("push 到 origin，然后取消 push"), []);
-  assert.deepEqual(externalObligations("不要部署，随后部署，最后取消部署"), []);
-  assert.deepEqual(runtimeObligations("测试，然后不要测试"), []);
-  assert.deepEqual(runtimeObligations("不需要编译和运行"), []);
-  assert.deepEqual(runtimeObligations("不要运行测试"), []);
-
-  assert.deepEqual(externalObligations("部署新服务，但不要部署旧服务"), ["deploy"]);
-  assert.deepEqual(externalObligations("push to origin, don't push to the old remote"), ["push"]);
-  assert.deepEqual(externalObligations("部署旧服务，但不要部署旧服务"), []);
-  assert.deepEqual(externalObligations("部署，然后不要部署"), []);
-});
-
-test("local engineering profiles drive planning without an extra classifier request", () => {
+test("structured semantic profiles drive planning without lexical classification", () => {
   const requiresPlan = load("_runRequiresPlan");
   const hasCategoryArchitecture = load("_uiPlanHasCategoryArchitecture");
   const quality = load("_planQualityIssue", { _uiPlanHasCategoryArchitecture: hasCategoryArchitecture });
   const base = { applies: true, substantial: false, requiresPlan: false };
-  const profile = engineeringHelpers().profile;
 
-  const project = { ...base, substantial: true, requiresPlan: true };
-  assert.equal(requiresPlan({ engineering: project }), true);
+  assert.equal(requiresPlan({ engineering: { ...base, substantial: true, requiresPlan: true } }), true);
   assert.equal(requiresPlan({ engineering: base }), false);
-  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: false } }), true,
-    "complex read-only investigations need an evidence-oriented plan");
-  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true, explicitMutation: true } }), true);
-  assert.equal(requiresPlan({ engineering: { ...base, explicitReadOnly: true, projectScope: false, longTask: false } }), false,
-    "simple advice must not receive a ritual plan gate");
-  assert.doesNotMatch(SRC, /function _classifyIntent|_intentReady\s*=\s*_classifyIntent|_shouldAwaitIntent|_engineeringProfileWithIntent|(?:^|[^\w])_intent\s*[=:]/,
-    "every agent turn must not spend a second network request on intent classification");
+  assert.equal(requiresPlan({ engineering: { ...base, requiresPlan: true } }), true);
+  assert.equal(requiresPlan({ engineering: { ...base, explicitReadOnly: true, projectScope: false, longTask: false } }), false);
+  assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
   assert.deepEqual(collectIdentifiers(SRC, "intent"), [],
-    "main.js must not contain a free/bare `intent` identifier; Safari reports that as `Can't find variable: intent`");
-  const websiteProfile = profile("帮我用谷歌，mac风格，白色浅色写一个 ide 官网");
-  assert.equal(websiteProfile.ui, true);
-  assert.equal(websiteProfile.uiProject, true);
-  assert.equal(websiteProfile.fullWebsite, true);
-  assert.equal(websiteProfile.designKnowledgeRequired, true);
-  assert.equal(websiteProfile.richMediaRequired, true);
-  assert.equal(websiteProfile.motionDesignRequired, true);
-  assert.equal(websiteProfile.advancedMotionRequired, true);
-  assert.equal(websiteProfile.paletteHarmonyRequired, true);
-  assert.equal(websiteProfile.cardLayoutRequired, true);
-  assert.equal(websiteProfile.cardStylingRequired, true);
-  assert.equal(websiteProfile.semanticIconRequired, true);
-  assert.equal(websiteProfile.motionChoreographyRequired, true);
-  assert.equal(websiteProfile.darkThemeRequested, false);
-  assert.equal(websiteProfile.gradientThemeRequested, false);
-  assert.equal(websiteProfile.monochromeThemeRequested, false);
-  assert.equal(websiteProfile.databaseDecisionRequired, true);
-  const rejectedThemeDefaults = profile("修复官网动不动就暗色、渐变色的问题");
-  assert.equal(rejectedThemeDefaults.darkThemeRequested, false);
-  assert.equal(rejectedThemeDefaults.gradientThemeRequested, false);
-  assert.equal(profile("为什么又给我做暗色页面，别再用黑底").darkThemeRequested, false);
-  const requestedThemes = profile("把官网做成暗色渐变视觉");
-  assert.equal(requestedThemes.darkThemeRequested, true);
-  assert.equal(requestedThemes.gradientThemeRequested, true);
-  assert.equal(profile("做一个纯黑白单色官网").monochromeThemeRequested, true);
-  assert.equal(websiteProfile.requiresPlan, true,
-    "creating an official-site/landing-page UI is a substantial project even if the prompt is short");
-  const captureProfile = profile("打开网页抓真实接口，看看请求从哪来并重放");
-  assert.equal(captureProfile.browserAutomation, true);
-  assert.equal(captureProfile.capture, true);
-  const waitProfile = profile("启动 npm run dev，挂后台等端口 ready 后用浏览器验证");
-  assert.equal(waitProfile.longRunningRuntime, true);
-  assert.equal(waitProfile.interactiveWait, true);
-  assert.equal(waitProfile.requiresPlan, true,
-    "long-running interactive execution must require a plan with background wait strategy");
-  const allProjectProfile = profile("所有项目都要工程级别，agent 基座处理任何代码库都要先看项目地图、模块边界、变更半径和验证矩阵");
-  assert.equal(allProjectProfile.engineeringGrade, true);
-  assert.equal(allProjectProfile.projectEngineering, true);
-  assert.equal(allProjectProfile.allProjectsEngineering, true);
-  assert.equal(allProjectProfile.industrialProject, true);
-  assert.equal(allProjectProfile.requiresPlan, true,
-    "all-project engineering policy is a substantial base change, not a casual chat");
-  const googleScaleProfile = profile("我的智能体可以做谷歌那种大项目嘛，不能的话弄成工业级别，支持 monorepo 多服务、CI/CD、发布回滚、日志指标告警");
-  assert.equal(googleScaleProfile.explicitMutation, true);
-  assert.equal(googleScaleProfile.engineeringGrade, true);
-  assert.equal(googleScaleProfile.industrialProject, true);
-  assert.equal(googleScaleProfile.largeProject, true);
-  assert.equal(googleScaleProfile.multiService, true);
-  assert.equal(googleScaleProfile.productionReadiness, true);
-  assert.equal(googleScaleProfile.requiresPlan, true);
-  assert.equal(googleScaleProfile.needsReferences, true);
-  const businessIndustrialProfile = profile("不够厉害，业务逻辑、业务漏洞、架构那些很垃圾，包括不会用各种数据库，不会利用各种容器，写的功能老是丢这个丢那个，写的网站那些也一样");
-  assert.equal(businessIndustrialProfile.explicitMutation, true);
-  assert.equal(businessIndustrialProfile.businessLogic, true);
-  assert.equal(businessIndustrialProfile.businessRisk, true);
-  assert.equal(businessIndustrialProfile.securityRisk, true);
-  assert.equal(businessIndustrialProfile.architectureQuality, true);
-  assert.equal(businessIndustrialProfile.databaseOps, true);
-  assert.equal(businessIndustrialProfile.containerOps, true);
-  assert.equal(businessIndustrialProfile.featureCompleteness, true);
-  assert.equal(businessIndustrialProfile.websiteDelivery, true);
-  assert.equal(businessIndustrialProfile.requiresPlan, true);
-  assert.equal(businessIndustrialProfile.needsReferences, true);
-  const promptRescueProfile = profile("很多人不会描述，提示词垃圾导致好多内容触发不了；给别人写任何项目都要好维护好升级，不要写成垃圾");
-  assert.equal(promptRescueProfile.explicitMutation, true);
-  assert.equal(promptRescueProfile.promptRescue, true);
-  assert.equal(promptRescueProfile.maintainabilityUpgrade, true);
-  assert.equal(promptRescueProfile.qualityFloor, true);
-  assert.equal(promptRescueProfile.requiresPlan, true);
-  const vagueBuildProfile = profile("帮我做个管理系统，你自己看着办");
-  assert.equal(vagueBuildProfile.vagueProjectRequest, true);
-  assert.equal(vagueBuildProfile.promptRescue, true);
-  assert.equal(vagueBuildProfile.requiresPlan, true);
-  const tinyProjectProfile = profile("把按钮文案改一下");
-  assert.equal(tinyProjectProfile.engineeringGrade, true);
-  assert.equal(tinyProjectProfile.requiresPlan, false,
-    "all project work should be engineering-grade, but tiny edits must not be forced into a ritual plan");
+    "main.js must not contain a free/bare intent identifier");
 
+  const websiteProfile = {
+    applies: true,
+    explicitMutation: true,
+    explicitWorkspaceMutation: true,
+    workspaceAction: "modify",
+    requiresPlan: true,
+    ui: true,
+    uiProject: true,
+    fullWebsite: true,
+    fromZeroUiProject: true,
+    designKnowledgeRequired: true,
+    richMediaRequired: true,
+    motionDesignRequired: true,
+    advancedMotionRequired: true,
+    paletteHarmonyRequired: true,
+    cardLayoutRequired: true,
+    cardStylingRequired: true,
+    semanticIconRequired: true,
+    motionChoreographyRequired: true,
+    databaseDecisionRequired: true,
+    needsReferences: true,
+  };
+  const captureProfile = {
+    applies: true,
+    explicitMutation: true,
+    requiresPlan: true,
+    browserAutomation: true,
+    capture: true,
+    captureMode: "isolated_browser",
+    browserGoal: "network_capture",
+  };
+  const waitProfile = {
+    applies: true,
+    explicitMutation: true,
+    explicitRuntimeAction: true,
+    runtimeObligations: ["run"],
+    longRunningRuntime: true,
+    interactiveWait: true,
+    requiresPlan: true,
+  };
+  const googleScaleProfile = {
+    applies: true,
+    explicitMutation: true,
+    projectEngineering: true,
+    engineeringGrade: true,
+    industrialProject: true,
+    largeProject: true,
+    multiService: true,
+    productionReadiness: true,
+    requiresPlan: true,
+    needsReferences: true,
+  };
+  const businessIndustrialProfile = {
+    applies: true,
+    explicitMutation: true,
+    projectEngineering: true,
+    engineeringGrade: true,
+    industrialProject: true,
+    businessLogic: true,
+    businessRisk: true,
+    securityRisk: true,
+    architectureQuality: true,
+    database: true,
+    databaseOps: true,
+    containerOps: true,
+    featureCompleteness: true,
+    websiteDelivery: true,
+    ui: true,
+    requiresPlan: true,
+    needsReferences: true,
+  };
+  const promptRescueProfile = {
+    applies: true,
+    explicitMutation: true,
+    projectEngineering: true,
+    industrialProject: true,
+    promptRescue: true,
+    vagueProjectRequest: true,
+    maintainabilityUpgrade: true,
+    qualityFloor: true,
+    requiresPlan: true,
+  };
+  const bugFixProfile = {
+    applies: true,
+    explicitMutation: true,
+    explicitWorkspaceMutation: true,
+    workspaceAction: "modify",
+    bug: true,
+    debugProject: true,
+    requiresPlan: true,
+  };
+  const gitWorkflowProfile = {
+    applies: true,
+    explicitMutation: true,
+    git: true,
+    gitCommit: true,
+    gitPublish: true,
+    gitReview: true,
+    externalObligations: ["commit", "push", "pr"],
+    requiresPlan: true,
+  };
+  const bugHuntProfile = {
+    applies: true,
+    explicitReadOnly: true,
+    projectScope: true,
+    bug: true,
+    debugProject: true,
+    requiresPlan: true,
+  };
+
+  assert.match(quality([], true, "mutate"), /尚未创建计划/);
   assert.match(quality([], true, "mutate"), /尚未创建计划/);
   assert.match(quality([
     { content: "读取认证模块并定位调用链" },
@@ -6134,10 +6637,6 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "修改 src/auth.ts 做最小修复，补 null/timeout/fallback 失败路径，运行 npm test -- auth && npm run typecheck 记录 exit code 0，并更新 README 验收标准" },
   ], true, "mutate"), "",
     "a short but complete two-step plan must pass; quality is coverage/evidence, not a fixed step count");
-  const bugFixProfile = profile("解决这些登录 bug，跑不起来还有死循环");
-  assert.equal(bugFixProfile.bug, true);
-  assert.equal(bugFixProfile.debugProject, true);
-  assert.equal(bugFixProfile.requiresPlan, true);
   assert.match(quality([
     { content: "读取登录模块并看看代码" },
     { content: "修改登录逻辑" },
@@ -6289,10 +6788,6 @@ test("local engineering profiles drive planning without an extra classifier requ
     { content: "执行验证矩阵：npm test、npm run typecheck、npm run build、integration/e2e/smoke，记录 stdout/stderr 和 exit code" },
     { content: "补生产边界：发布/回滚、配置兼容、日志/指标/告警、可观测性和未覆盖风险，输出交付说明" },
   ], true, "mutate", promptRescueProfile), "");
-  const gitWorkflowProfile = profile("提交当前修改并 push 到 GitHub，然后创建 PR 看 CI");
-  assert.equal(gitWorkflowProfile.git, true);
-  assert.equal(gitWorkflowProfile.gitPublish, true);
-  assert.equal(gitWorkflowProfile.gitReview, true);
   assert.match(quality([
     { content: "查看当前仓库改动" },
     { content: "提交并推送" },
@@ -6313,8 +6808,8 @@ test("local engineering profiles drive planning without an extra classifier requ
   assert.match(SRC, /项目地图\/模块边界、变更半径\/调用方影响、验证矩阵\/CI式检查/);
   assert.match(SRC, /timeoutSecs:\s*5/,
     "background URL monitor must pass camelCase timeoutSecs to the Tauri invoke layer");
-  assert.match(SRC, /run_in_terminal\(启动 dev server\/watch\/守护进程\)/,
-    "mid-run tool reminders must keep terminal orchestration visible");
+  assert.match(extractFn("_toolReminderBlock"), /工具窗口会随用户目标、新证据与 MCP 发现动态更换/,
+    "mid-run reminders must preserve dynamic orchestration instead of freezing a static tool list");
   assert.equal(quality([
     { content: "读取 src/auth/state.ts 和 src/auth/login.ts，复现登录状态错乱并梳理调用链" },
     { content: "核对 AuthSession schema、登录 API contract、调用方参数和旧版本兼容边界" },
@@ -6326,8 +6821,6 @@ test("local engineering profiles drive planning without an extra classifier requ
   assert.match(quality([
     { content: "读取认证模块并梳理真实调用链" },
   ], true, "inspect"), /证据核验\/结论|结论边界\/不确定性|具体证据来源\/文件\/命令/);
-  const bugHuntProfile = profile("看看项目还有什么 bug");
-  assert.equal(bugHuntProfile.debugProject, true);
   assert.match(quality([
     { content: "读取 src/main.js 看看有没有问题" },
     { content: "整理发现并总结" },
@@ -6386,6 +6879,12 @@ test("server prompts preserve prompt rescue and maintainability baselines", () =
   assert.match(SERVER_PROMPT_PLAN, /用户描述模糊、提示词很差/, "Plan mode must normalize vague prompts instead of pushing the problem back to the user");
   assert.match(SERVER_PROMPT_PLAN, /维护与升级底线/, "Plan mode must include maintainability and upgrade coverage");
   assert.match(SERVER_PROMPT_PLAN, /清晰目录\/模块边界、集中配置\/env、类型\/schema\/API 契约/, "Plan mode must specify concrete engineering defaults");
+  assert.match(SERVER_PROMPT_REASONING, /目标、动作、对象、约束、成功条件/,
+    "reasoning must reconstruct the task contract before acting");
+  assert.match(SERVER_PROMPT_REASONING, /延续、纠正、替换还是澄清/,
+    "reasoning must resolve short follow-ups against the prior task");
+  assert.match(SERVER_PROMPT_REASONING, /已证实事实、待验证假设、用户硬约束/,
+    "reasoning must keep facts, hypotheses, and constraints separate");
 });
 
 test("plan completion needs evidence, but plan gates no longer block side-effect tools", () => {
@@ -6563,22 +7062,36 @@ test("agent outcome summary is rendered after plan settlement", () => {
 });
 
 test("agent next-step chips use completed run memory and survive suggestion failures", () => {
-  const fallback = load("_fallbackNextActionSuggestions");
-  const chips = fallback([
-    { role: "user", content: "修复工具参数不全" },
-    { role: "assistant", content: "改动文件：src/main.js\n验证：项目未提供可自动识别的验证命令，未强行瞎跑。\n字段 sourceUrl / roomId 的数据契约还要核对。" },
-  ]);
-  assert.ok(chips.includes("查看验证状态"));
-  assert.ok(chips.includes("核对数据契约"));
+  const gen = load("_runStateNextActionSuggestions");
+  const now = Date.now();
+  // 未完成轮 + 剩余计划步骤 → 精确的“继续”建议（来自真实运行状态，不是关键词堆）
+  const chips = gen({
+    _lastRunState: { outcome: "partial", task: "修复工具参数不全", result: "", incompleteReason: "iteration_limit", mutated: true, updatedAt: now },
+    _planSteps: [{ content: "核对 sourceUrl 数据契约", status: "pending" }, { content: "已完成项", status: "completed" }],
+  });
+  assert.ok(chips.some((c) => c.label === "继续完成剩余部分"));
+  assert.ok(chips.some((c) => c.label.startsWith("继续：核对 sourceUrl")));
+  // 失败轮 → 排查根因；成功且改了文件 → 验证/复查
+  assert.ok(gen({ _lastRunState: { outcome: "failed", task: "x", mutated: false, updatedAt: now } }).some((c) => c.label === "排查失败根因"));
+  assert.ok(gen({ _lastRunState: { outcome: "success", task: "x", mutated: true, updatedAt: now } }).some((c) => c.label === "实际运行验证改动"));
+  // 纯问答/问候轮（没动文件、没计划、没失败）不出建议；陈旧状态也不出
+  assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "打招呼", mutated: false, updatedAt: now } }), []);
+  assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "x", mutated: true, updatedAt: now - 10 * 60_000 } }), []);
+  assert.deepEqual(gen({}), []);
   assert.match(SRC, /const postRunMessages = Array\.isArray\(sess\.memory\)[\s\S]{0,260}_maybeSuggestNext\(sess, postRunMessages, config\)/,
     "Agent completion suggestions must be grounded in the post-run memory, not the pre-run messages");
 });
 
 test("missing auto verification command is not rendered as an error card", () => {
-  assert.match(SRC, /filter\(\(line\) => line && !\/本项目没有可自动识别的验证命令\/\.test\(line\)\)/,
-    "the generic no-auto-verification note should be filtered out of msg__error alerts");
+  assert.match(SRC, /filter\(\(line\) => line && !\/本项目没有可自动识别的验证命令\|\^验证器不可用\|\^验证未完成\|\^实际运行结果尚未完成语义核验\/\.test\(line\)\)/,
+    "no-auto-verification / verifier-unavailable / semantic-review notes must all be filtered out of msg__error alerts");
   assert.match(SRC, /验证：项目未提供可自动识别的验证命令，未强行瞎跑/,
     "if a mutation happened, no-auto-verification should remain a calm summary note, not a warning");
+  // 验证器缺失（127）的收尾总结也必须是平静措辞，不许写成"未完全通过或未运行"。
+  assert.match(SRC, /const verifierUnavailable = \/\^验证器不可用\|\^验证未完成\/m\.test\(note\)/,
+    "outcome summary must classify verifier-unavailable notes separately");
+  assert.match(SRC, /验证：本机没有可运行的自动验证器/,
+    "verifier-unavailable must produce a calm, non-code-blaming summary line");
 });
 
 test("bug fixes require causal reasoning before patching", () => {
@@ -6605,29 +7118,21 @@ test("dynamic URLs and third-party fields require real evidence instead of guess
     "plans must explicitly ban URL-rule guessing before real capture");
 });
 
-test("Agent mode does not downgrade workspace-scoped short messages into quick chat", () => {
-  const mustUseTools = load("_agentMustUseWorkspaceTools", {
-    activePath: "/repo/data/comments/room.json",
-    workspaceRoots: ["/repo"],
-  });
-  assert.equal(mustUseTools("空的傻逼吧", "/repo", "/repo/data/comments/room.json"), true);
-  assert.equal(mustUseTools("定位失败根因", "/repo", "/repo/src/main.js"), true);
-  assert.equal(mustUseTools("当前文件为什么没内容？", "/repo", "/repo/data/comments/room.json"), true);
-  assert.equal(mustUseTools("你好", "/repo", "/repo/data/comments/room.json"), false);
-  assert.match(SRC, /const _mustUseWorkspaceTools = run\.mode === "agent" && _agentMustUseWorkspaceTools\(task, root\)/,
-    "agent loop must explicitly classify workspace-scoped short turns");
-  assert.match(SRC, /function _looksBugFixTask\(text\)/,
-    "bug-fix quick detection helper must exist at runtime");
-  assert.match(SRC, /function _looksUIBuildTask\(text\)/,
-    "UI quick detection helper must exist at runtime");
-  assert.match(SRC, /!\s*_mustUseWorkspaceTools/,
-    "quick detection must be disabled when Agent needs workspace tools");
+test("Agent mode requires workspace tools from semantic scope fields", () => {
+  const mustUseTools = load("_agentMustUseWorkspaceTools");
+  assert.equal(mustUseTools({ workspaceAction: "inspect" }, "/repo", "/repo/data/comments/room.json"), true);
+  assert.equal(mustUseTools({ workspaceAction: "modify" }, "/repo", "/repo/src/main.js"), true);
+  assert.equal(mustUseTools({ workspaceAction: "none" }, "/repo", "/repo/src/main.js"), false);
+  assert.match(SRC, /const _mustUseWorkspaceTools = run\.mode === "agent" && _agentMustUseWorkspaceTools\(run\.engineering, root\)/,
+    "agent loop must pass the structured engineering profile");
+  assert.doesNotMatch(SRC, /function _looksBugFixTask\(text\)/);
+  assert.doesNotMatch(SRC, /function _looksUIBuildTask\(text\)/);
   assert.match(SRC, /\[AGENT_MODE_TOOL_REQUIRED\]/,
     "Agent mode must inject a tool-required instruction before the first model turn");
 });
 
 test("Agent decision frame gives task-specific old-hand operating rules", () => {
-  const frame = load("_agentDecisionFrameBlock", { _engineeringTaskProfile: () => ({}) });
+  const frame = load("_agentDecisionFrameBlock");
   const complex = frame("修复 UI 卡死 bug，设计数据库 schema 和索引，启动 dev server，抓包看真实接口，然后用浏览器验证", {
     requiresPlan: true,
     substantial: true,
@@ -6725,7 +7230,10 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
 });
 
 test("UI design craft guidance is injected only for front-end work", () => {
-  const craft = load("_uiDesignCraftBlock", { _engineeringTaskProfile: () => ({ ui: false }) });
+  const craft = load("_uiDesignCraftBlock", {
+    _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
+    _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+  });
   assert.equal(craft("修复后端接口", { ui: false }), "");
   const ui = craft("写一个 SaaS 官网，配色排版布局要好看", { ui: true, uiProject: true });
   assert.match(ui, /前端设计工艺要求/);
@@ -6760,7 +7268,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   const greenfield = craft("创建社区论坛", { ui: true, uiProject: true, fromZeroUiProject: true });
   assert.match(greenfield, /默认 React\/Vite \+ Tailwind \+ shadcn\/ui\/Radix/);
   assert.match(greenfield, /禁止再次只生成一个通用 index\.html/);
-  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\) \? _uiDesignCraftBlock\(text, _uiTurnEngineering\) : ""/,
+  assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
   assert.match(SRC, /_dynPreamble \+ _atContext \+ _modeFrame \+ _decisionFrame \+ _uiDesignCraft \+ _toolHint \+ _expHint/,
     "UI craft guidance must appear before the tool and experience hints");
@@ -6803,7 +7311,7 @@ test("full website readiness requires michael-design evidence and a real product
     researchTracks: { informationArchitecture: true, colorSystem: true, responsiveLayout: true, componentSystem: true, signatureMotion: true, responsiveMotion: true, mediaAssets: true, semanticIcons: true },
   };
   run._websiteContentEvidence = { sources: [{ kind: "workspace", path: "README.md" }] };
-  assert.match(readiness(run, incomplete), /至少 7 个差异化内容区块/);
+  assert.match(readiness(run, incomplete), /按业务品类推导信息架构与差异化内容区块/);
   assert.match(readiness(run, incomplete), /四层动效编排/);
   const complete = [
     { content: "按 SaaS 信息架构规划至少 7 个业务区块并写满具体栏目文案" },
@@ -6879,6 +7387,15 @@ test("user-supplied reference sites must be learned and deliberately adapted bef
   assert.match(readiness(run, [{ content: "开始实现页面" }]), /参考站适配决策/);
   const adapted = [{ content: "参考站 https://www.linear.app/ 的配色 palette token、信息架构与内容栏目作为取舍依据；结合 michael-design 的 Responsive product narrative section 转译为自己的响应式动效和移动端布局，不直接复制原站文案、资产或版式；组件映射为 shadcn/Radix Button primitive 的 default/outline variant 与 Tailwind bg-primary/text-primary-foreground semantic classes，落到导航和筛选操作。" }];
   assert.equal(readiness(run, adapted), "");
+});
+
+test("michael-design prefetch starts only from a resolved structured design profile", () => {
+  const preflight = extractFn("_runMichaelDesignPreflight");
+  assert.match(preflight, /!profile\.designKnowledgeRequired/);
+  assert.doesNotMatch(preflight, /_engineeringTaskProfile|keyword|关键词/);
+  assert.match(SRC, /_lateProfile\.intentSource !== "none"/);
+  assert.match(SRC, /_lateProfile\.designKnowledgeRequired && !run\._michaelDesignEvidence/);
+  assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
 });
 
 test("successful michael-design hits unlock implementation even when the model omitted the domain argument", () => {
@@ -7237,7 +7754,6 @@ test("front-end build tasks defer design and browser schemas until tool search",
     },
     _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({ ui: true, uiProject: true, implementation: true, bug: false }),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "做一个官网", []).map((tool) => tool.function.name);
@@ -7259,7 +7775,6 @@ test("reference-site UI tasks keep learning and fetch schemas lazy", () => {
     },
     _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "learn_design", "web_fetch", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({ ui: true, uiProject: true, implementation: true, referenceWebsiteRequired: true }),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "learn_design", "web_fetch", "knowledge_search", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "照着 https://linear.app 重做官网", []).map((tool) => tool.function.name);
@@ -7280,17 +7795,6 @@ test("front-end bug tasks keep browser automation deferred until diagnostics and
     },
     _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({
-      bug: true,
-      debugProject: true,
-      ui: true,
-      uiProject: true,
-      implementation: true,
-      browserAutomation: true,
-      capture: true,
-      backendApi: true,
-      database: true,
-    }),
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "http_request", "read_file"].map(schema),
   });
   const names = select(true, "网页按钮点不动，先修 bug", []).map((tool) => tool.function.name);
@@ -7302,7 +7806,6 @@ test("front-end bug tasks keep browser automation deferred until diagnostics and
 
 test("database-oriented tasks defer database and browser schemas", () => {
   const schema = (name) => ({ type: "function", function: { name } });
-  const helpers = engineeringHelpers();
   const select = load("_selectInitialTools", {
     activePath: "",
     _TOOL_BUNDLES: {
@@ -7312,7 +7815,6 @@ test("database-oriented tasks defer database and browser schemas", () => {
     },
     _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: helpers.profile,
     _buildAgentToolSchemas: () => ["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "read_file"].map(schema),
   });
   const names = select(true, "设计数据库 schema 和索引", []).map((tool) => tool.function.name);
@@ -7323,7 +7825,6 @@ test("database-oriented tasks defer database and browser schemas", () => {
 
 test("Git and GitHub PR schemas remain lazy for both remote and local requests", () => {
   const schema = (name) => ({ type: "function", function: { name } });
-  const helpers = engineeringHelpers();
   const select = load("_selectInitialTools", {
     activePath: "",
     _TOOL_BUNDLES: {
@@ -7334,7 +7835,6 @@ test("Git and GitHub PR schemas remain lazy for both remote and local requests",
     },
     _DEFERRED_TOOL_NAMES: new Set(["browser", "screenshot", "design_board", "preview_choices", "visual_compare", "db_query", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log"]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: helpers.profile,
     _buildAgentToolSchemas: () => ["git_status", "git_diff", "git_log", "git_commit", "git_push", "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "read_file"].map(schema),
   });
   const prNames = select(true, "创建 PR 并查看 GitHub Actions CI 状态", []).map((tool) => tool.function.name);
@@ -7350,145 +7850,14 @@ test("Git and GitHub PR schemas remain lazy for both remote and local requests",
   assert.ok(!localNames.includes("gh_pr_create"));
 });
 
-test("profile-driven tool orchestration covers live IDE, backend, database, and git evidence", () => {
-  const catalog = [
-    "read_file", "list_dir", "semantic_search", "search", "find_files", "knowledge_search",
-    "lsp_definition / lsp_references", "get_diagnostics", "read_logs / read_terminal / list_terminals / stop_terminal",
-    "http_request", "run_cmd", "run_in_terminal", "background_monitor", "db_query",
-    "git_status / git_diff / git_log / git_blame", "git_commit / git_branch / git_push / git_pull",
-    "gh_pr_create / gh_pr_view / gh_pr_checks / gh_actions_log", "edit_file / multi_edit", "write_file",
-    "browser", "screenshot", "capture_start", "capture_flows", "capture_replay",
-    "package_search", "github_repo", "developer_community_search", "web_scaffold",
-    "design_board", "preview_choices",
-  ].map((name) => ({ name, desc: `${name} desc`, kw: [] }));
-  const priorities = load("_profileToolPriorities", { _TOOL_CATALOG: catalog });
-
-  const backend = priorities("后端起了但看不到，帮我定位 API/日志/终端问题", {
-    applies: true,
-    bug: true,
-    debugProject: true,
-    backendApi: true,
-    longRunningRuntime: true,
-    interactiveWait: true,
-    implementation: true,
-  }, 12).map((tool) => tool.name);
-  assert.ok(backend.includes("get_diagnostics"));
-  assert.ok(backend.includes("read_logs / read_terminal / list_terminals / stop_terminal"));
-  assert.ok(backend.includes("http_request"));
-  assert.ok(backend.includes("run_in_terminal"));
-  assert.ok(backend.includes("background_monitor"));
-
-  const fullStackBug = priorities("网站 bug：浏览器点击失败，后端 API 和数据库也可能有问题", {
-    applies: true,
-    bug: true,
-    debugProject: true,
-    backendApi: true,
-    database: true,
-    databaseQuery: true,
-    implementation: true,
-  }, 12).map((tool) => tool.name);
-  assert.ok(fullStackBug.indexOf("get_diagnostics") < fullStackBug.indexOf("run_cmd"),
-    "bug diagnosis must collect IDE diagnostics before generic command verification");
-  assert.ok(fullStackBug.indexOf("read_logs / read_terminal / list_terminals / stop_terminal") < fullStackBug.indexOf("run_cmd"),
-    "bug diagnosis must read terminal/log evidence before generic tests");
-  assert.ok(fullStackBug.includes("http_request"), "API evidence should be available for backend bugs");
-  assert.ok(fullStackBug.includes("db_query"), "DB evidence should be available when the bug scope includes database clues");
-  assert.ok(fullStackBug.includes("read_file"), "code evidence remains part of the same evidence ladder");
-  assert.ok(!fullStackBug.includes("browser"), "browser automation must remain deferred while a bug is being diagnosed");
-  assert.ok(!fullStackBug.includes("screenshot"), "screenshots must not displace diagnostic evidence for a bug");
-
-  const db = priorities("设计数据落库和迁移", {
-    applies: true,
-    database: true,
-    databaseArchitecture: true,
-    persistence: true,
-    implementation: true,
-  }, 10).map((tool) => tool.name);
-  assert.ok(db.includes("db_query"));
-  assert.ok(db.includes("knowledge_search"));
-  assert.ok(db.includes("edit_file / multi_edit"));
-
-  const git = priorities("提交当前修改并 push 到 GitHub", {
-    applies: true,
-    git: true,
-    gitCommit: true,
-    gitPublish: true,
-    implementation: true,
-  }, 10).map((tool) => tool.name);
-  assert.ok(git.includes("git_status / git_diff / git_log / git_blame"));
-  assert.ok(git.includes("git_commit / git_branch / git_push / git_pull"));
-  assert.ok(git.includes("gh_pr_create / gh_pr_view / gh_pr_checks / gh_actions_log"));
-
-  const industrial = priorities("把 agent 基座升级到工业级大项目模式，覆盖 monorepo 多服务、后端 API、依赖版本和 CI/CD 发布回滚", {
-    applies: true,
-    implementation: true,
-    projectEngineering: true,
-    engineeringGrade: true,
-    industrialProject: true,
-    largeProject: true,
-    multiService: true,
-    productionReadiness: true,
-    backendApi: true,
-    packageVersion: true,
-    needsReferences: true,
-  }, 14).map((tool) => tool.name);
-  assert.ok(industrial.includes("list_dir"), "industrial mode starts by mapping the real project, not guessing");
-  assert.ok(industrial.includes("semantic_search"));
-  assert.ok(industrial.includes("lsp_definition / lsp_references"));
-  assert.ok(industrial.includes("get_diagnostics"));
-  assert.ok(industrial.includes("git_status / git_diff / git_log / git_blame"));
-  assert.ok(industrial.includes("read_logs / read_terminal / list_terminals / stop_terminal"));
-  assert.ok(industrial.includes("http_request"));
-  assert.ok(industrial.includes("run_cmd"));
-  assert.ok(industrial.includes("package_search"));
-  assert.ok(industrial.includes("knowledge_search"));
-
-  const businessOps = priorities("修业务逻辑漏洞、数据库选型和容器部署，网站功能不能再丢", {
-    applies: true,
-    implementation: true,
-    projectEngineering: true,
-    engineeringGrade: true,
-    industrialProject: true,
-    businessLogic: true,
-    businessRisk: true,
-    securityRisk: true,
-    database: true,
-    databaseOps: true,
-    containerOps: true,
-    featureCompleteness: true,
-    websiteDelivery: true,
-    backendApi: true,
-    ui: true,
-    needsReferences: true,
-  }, 18).map((tool) => tool.name);
-  assert.ok(businessOps.includes("semantic_search"), "business fixes need codebase-wide business/caller discovery");
-  assert.ok(businessOps.includes("lsp_definition / lsp_references"));
-  assert.ok(businessOps.includes("http_request"), "business/API vulnerabilities need real API evidence");
-  assert.ok(businessOps.includes("db_query"), "DB-backed business rules need DB evidence");
-  assert.ok(businessOps.includes("browser"), "website delivery needs browser verification");
-  assert.ok(businessOps.includes("run_in_terminal"), "containerized runtime checks need terminal orchestration");
-  assert.ok(businessOps.includes("read_logs / read_terminal / list_terminals / stop_terminal"));
-  assert.ok(businessOps.includes("knowledge_search"), "DB/container/security compatibility needs references when requested");
-  const rescueOps = priorities("用户不会描述，提示词垃圾也要做出好维护好升级的项目", {
-    applies: true,
-    implementation: true,
-    projectEngineering: true,
-    engineeringGrade: true,
-    industrialProject: true,
-    promptRescue: true,
-    vagueProjectRequest: true,
-    maintainabilityUpgrade: true,
-    qualityFloor: true,
-  }, 12).map((tool) => tool.name);
-  assert.ok(rescueOps.includes("list_dir"));
-  assert.ok(rescueOps.includes("read_file"));
-  assert.ok(rescueOps.includes("semantic_search"));
-  assert.ok(rescueOps.includes("lsp_definition / lsp_references"));
-  assert.ok(rescueOps.includes("run_cmd"));
-  assert.match(SRC, /Profile-driven tool orchestration/);
-  assert.match(SRC, /Legacy lexical fallback/);
+test("production tool routing has no stale profile priority table", () => {
+  assert.doesNotMatch(SRC, /const _TOOL_CATALOG/);
+  assert.doesNotMatch(SRC, /function _profileToolPriorities/);
+  assert.doesNotMatch(SRC, /function _mergeToolPriorityLists/);
+  assert.doesNotMatch(SRC, /function _mcpCatalogEntries/);
+  assert.match(SRC, /function _semanticToolOrchestrator/);
+  assert.match(SRC, /完整工具目录（JSON 数据，只能选择其中 name）/);
 });
-
 test("bug evidence ladder forces terminal API DB file evidence before browser loops", () => {
   const ladder = load("_agentBugEvidenceLadderBlock");
   const text = ladder("修 bug：后端 API 数据库和浏览器都可能有问题", {
@@ -7511,7 +7880,7 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
   assert.match(text, /针对性复验/);
 
   const frame = load("_agentDecisionFrameBlock", {
-    _engineeringTaskProfile: () => ({ bug: true, debugProject: true, backendApi: true, database: true }),
+    _engineeringProfileWithAiIntent: () => ({ bug: true, debugProject: true, backendApi: true, database: true }),
     _agentBugEvidenceLadderBlock: ladder,
   });
   const frameText = frame("一堆 bug，浏览器自动化绕圈，后端 API 数据库也要看");
@@ -7519,33 +7888,27 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
   assert.match(frameText, /终端\/API\/日志\/源码证据链/);
 });
 
-test("tool hint starts from profile priorities before lexical keyword fallback", async () => {
-  const merge = load("_mergeToolPriorityLists");
-  const build = load("_buildToolHint", {
-    _engineeringTaskProfile: () => ({ applies: true, bug: true, backendApi: true }),
-    _profileToolPriorities: () => [
-      { name: "get_diagnostics", desc: "实时诊断" },
-      { name: "read_logs / read_terminal / list_terminals / stop_terminal", desc: "终端日志" },
-      { name: "http_request", desc: "API 请求" },
-    ],
-    _lexicalRank: () => [],
-    _mergeToolPriorityLists: merge,
-  });
-  // Synchronous now: the tool spotlight no longer makes a model call.
-  const hint = build("跑起来了但看不到哪里错");
-  assert.match(hint, /任务画像和真实证据需求/);
-  assert.match(hint, /get_diagnostics/);
-  assert.match(hint, /read_logs \/ read_terminal \/ list_terminals \/ stop_terminal/);
-  assert.match(hint, /http_request/);
-  assert.match(SRC, /const profileRel = _profileToolPriorities\(text, profile, 8\)/);
-  assert.match(SRC, /const merged = _mergeToolPriorityLists\(profileRel, lexical\)/);
-  // The per-turn LLM tool re-ranker is gone: `_lexicalRank` already covers the catalog
-  // AND MCP tools for free, so a model round-trip per turn bought only a reordering.
-  assert.doesNotMatch(SRC, /_semanticToolRank/,
-    "the per-turn LLM tool re-ranker must stay removed");
-  assert.match(SRC, /function _buildToolHint\(text\) \{/,
-    "_buildToolHint must stay synchronous so it cannot regain a model call");
-  assert.match(SRC, /profile\.bug \|\| profile\.debugProject/);
+test("tool hints stay capability-neutral while the semantic orchestrator controls live schemas", () => {
+  const build = load("_buildToolHint");
+  const hint = build("跑起来了但看不到哪里错", { applies: true, bug: true, backendApi: true });
+  assert.match(hint, /动态工具编排/);
+  assert.doesNotMatch(hint, /get_diagnostics|http_request|capture_start/,
+    "prompt hint must not hard-code a second tool routing table");
+  assert.doesNotMatch(extractFn("_buildToolHint"), /_profileToolPriorities|filter\(|\.bug/);
+  const loop = extractFn("_runAgenticLoop");
+  assert.doesNotMatch(loop, /await _routeAgentTools\("initial", "", task\)/,
+    "the first agent turn must not wait for an extra routing-model request");
+  assert.match(loop, /await _routeAgentTools\("steering", "", _steerSemanticText\)/,
+    "mid-run user intent changes must reroute tools immediately");
+  assert.match(loop, /await _routeAgentTools\("after_tools", routingEvidence\)/,
+    "every novel tool-result batch must create another semantic routing checkpoint");
+  assert.doesNotMatch(loop, /_routeAgentTools\(\s*"mcp_discovered"/,
+    "background MCP discovery must not add a planner round trip or mutate the first tool payload");
+  assert.match(loop, /_routeAgentTools\(\s*"unknown_tool"/,
+    "unknown tool recovery must ask the semantic orchestrator instead of guessing a name");
+  assert.doesNotMatch(loop, /const candidates = \[\][\s\S]{0,900}bad\.includes\(n\)/,
+    "unknown tools must not be recovered through string similarity scoring");
+  assert.match(extractFn("_semanticToolOrchestrator"), /\u4e0d要用关键词、正则/);
 });
 
 test("task profiles do not expand the minimal first-turn tool schema payload", () => {
@@ -7566,14 +7929,6 @@ test("task profiles do not expand the minimal first-turn tool schema payload", (
       "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
     ]),
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: (text) => {
-      if (/抓包/.test(text)) return { capture: true, browserAutomation: true };
-      if (/依赖|版本/.test(text)) return { packageVersion: true };
-      if (/数据库/.test(text)) return { bug: true, debugProject: true, backendApi: true, database: true, databaseQuery: true };
-      if (/后端|API/.test(text)) return { backendApi: true };
-      if (/网站/.test(text)) return { fullWebsite: true };
-      return {};
-    },
     _buildAgentToolSchemas: () => [
       "read_file", "browser", "screenshot", "capture_start", "capture_flows", "capture_stop",
       "capture_replay", "http_request", "package_search", "github_repo", "developer_community_search", "db_query",
@@ -7657,24 +8012,22 @@ test("requirements enter the running pad only for complex work or real progress"
   assert.equal(include({ engineering: { requiresPlan: true, explicitMutation: true } }, { ...emptyPad(), requirements: [] }), false);
 });
 
-test("live steering appends bounded requirements but pure cancellation does not", () => {
+test("live steering preserves bounded requirements and leaves cancellation semantics to the model", () => {
   const extract = load("_extractRequirementsChecklist");
   const merge = load("_mergeRequirementsChecklist", { _extractRequirementsChecklist: extract });
-  const cancellationOnly = load("_isCancellationOnlySteering");
   const original = ["保留 limit 默认值 20", "不要改界面"];
   let requirements = [...original];
   const steer = (text) => {
-    if (!cancellationOnly(text)) requirements = merge(requirements, text, 12, 2000, original);
+    requirements = merge(requirements, text, 12, 2000, original);
   };
 
   steer("同时把 timeout 参数传到执行层然后补空值测试");
   assert.ok(requirements.some((item) => item.includes("timeout 参数")));
   assert.ok(requirements.some((item) => item.includes("空值测试")));
-  const beforeStop = [...requirements];
   steer("停止");
-  assert.deepEqual(requirements, beforeStop);
-  assert.equal(cancellationOnly("取消"), true);
-  assert.equal(cancellationOnly("停止，但是改为只读检查"), false);
+  assert.ok(requirements.some((item) => item.includes("停止")),
+    "steering text is preserved for the semantic resolver; cancellation is not guessed locally");
+  assert.doesNotMatch(SRC, /function _isCancellationOnlySteering\(/);
 
   for (let index = 0; index < 20; index++) {
     steer(`新增参数 ${index} ${"x".repeat(220)}`);
@@ -7829,7 +8182,7 @@ test("bounded engineering retrieval keeps sources that finish before the deadlin
   assert.match(render(results[2], 2), /来源 3超时/);
   assert.match(SRC, /Array\.from\(\{ length: jobs\.length \}/);
   const queryContext = extractFn("_agentContextForQuery");
-  assert.match(queryContext, /_buildRetrievedCodeContext\(query, root, 4, false\)/,
+  assert.match(queryContext, /_buildRetrievedCodeContext\(query, root, _ctxScale >= 4 \? 10 : 4, false\)/,
     "the first-token path may consume a ready index but must not build a cold one");
   assert.match(queryContext, /_idleRun\(\(\) => \{[\s\S]{0,180}_buildEngineeringReferenceContext\(query, root, stack, profile, referenceTimeoutMs\)/,
     "community references must run in the background lane");
@@ -7845,7 +8198,8 @@ test("slow community references cannot erase stable local engineering context", 
   let externalCalls = 0;
   const contextFor = (external) => load("_agentContextForQuery", {
     _buildRepoMap: () => "REPO_MAP",
-    _engineeringTaskProfile: () => ({ applies: true, ui: false, needsReferences: true }),
+    _contextBudgetScale: () => 1,
+    _engineeringProfileWithAiIntent: () => ({ applies: true, ui: false, needsReferences: true }),
     _projectStacks: new Map([["/repo", { lang: "Rust" }]]),
     _buildRetrievedCodeContext: async () => "LOCAL_SOURCE",
     _buildEngineeringReferenceContext: async (...args) => { externalCalls++; return external(...args); },
@@ -7881,7 +8235,6 @@ test("fast community summaries survive when optional page deep-reading is slow",
   const contextBlock = load("_engineeringReferenceContextBlock");
   const build = load("_buildEngineeringReferenceContext", {
     inTauri: true,
-    _engineeringTaskProfile: () => ({ needsReferences: true }),
     _referenceQuery: () => "rust async cancellation",
     _engineeringReferenceCache: new Map(),
     _engineeringCommunitySources: () => ["rust_users"],
@@ -7910,7 +8263,6 @@ test("one slow forum cannot hide another community source that already returned"
   const cache = new Map();
   const build = load("_buildEngineeringReferenceContext", {
     inTauri: true,
-    _engineeringTaskProfile: () => ({ needsReferences: true }),
     _referenceQuery: () => "login state bug",
     _engineeringReferenceCache: cache,
     _engineeringCommunitySources: () => ["github", "rust_users"],
@@ -7942,7 +8294,6 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
   let invokes = 0;
   const build = load("_buildEngineeringReferenceContext", {
     inTauri: true,
-    _engineeringTaskProfile: () => ({ needsReferences: true }),
     _referenceQuery: () => "rust cache evidence",
     _engineeringReferenceCache: cache,
     _engineeringCommunitySources: () => ["github"],
@@ -7971,7 +8322,6 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
   const failedCache = new Map();
   const failedBuild = load("_buildEngineeringReferenceContext", {
     inTauri: true,
-    _engineeringTaskProfile: () => ({ needsReferences: true }),
     _referenceQuery: () => "always failed",
     _engineeringReferenceCache: failedCache,
     _engineeringCommunitySources: () => ["reddit"],
@@ -7991,7 +8341,6 @@ test("engineering reference cache reports hits, preserves provider retrieval tim
   const timedOutCache = new Map();
   const timedOutBuild = load("_buildEngineeringReferenceContext", {
     inTauri: true,
-    _engineeringTaskProfile: () => ({ needsReferences: true }),
     _referenceQuery: () => "all sources time out",
     _engineeringReferenceCache: timedOutCache,
     _engineeringCommunitySources: () => ["github", "rust_users"],
@@ -8017,8 +8366,8 @@ test("automatic engineering references add only stack-relevant official forums",
   assert.deepEqual(sources({ bug: false }, { framework: "Vite + React", lang: "JS/TS" }, "rendering"),
     ["github", "sourcegraph", "github_discussions"]);
   assert.deepEqual(sources({ bug: true }, { lang: "Rust + Python" }, "Swift Kotlin bridge"),
-    ["stackoverflow", "github", "github_discussions", "swift_forums", "kotlin_discussions"],
-    "the user's current query wins the two bounded official-forum slots over background stack signals");
+    ["stackoverflow", "github", "github_discussions", "rust_users", "python_discussions"],
+    "forum routing must use inspected stack facts, not keywords in the user's prose");
 });
 
 test("stack extraction honors the declared package manager and project scripts", () => {
@@ -8098,15 +8447,29 @@ test("strict verification uses process exit status, including timeout", async ()
   assert.equal((await snakeCaseTimeout("/repo", "build")).timedOut, true);
 });
 
-test("long chat transcripts stay bounded and load earlier messages in pages", () => {
+test("long chat transcripts stay bounded while paging both directions", () => {
   assert.match(SRC, /const _RENDER_LIMIT = 56/);
   assert.match(SRC, /const _RENDER_PAGE = 32/);
   assert.match(SRC, /function _snapshotIsSafeToRestore\(html\)/);
   assert.match(SRC, /if \(!_snapshotIsSafeToRestore\(html\)\) return ""/);
-  assert.match(SRC, /Load \$\{Math\.min\(_RENDER_PAGE, start\)\} earlier/);
-  assert.match(SRC, /_renderMsgRange\(session, nextStart, visibleStart, \{ before: firstMessage, skipPrune: true, skipFollow: true \}\)/);
+  assert.match(SRC, /更早的 \$\{Math\.min\(_RENDER_PAGE, start\)\} 条/);
+  assert.match(SRC, /更新的 \$\{Math\.min\(_RENDER_PAGE, length - end\)\} 条/);
+  assert.match(SRC, /_renderMsgRange\(session, nextStart, start, \{ before: anchor, skipPrune: true, skipFollow: true \}\)/);
+  assert.match(SRC, /_trimRenderedHistoryWindow\(session, "end"\)/);
+  assert.match(SRC, /_trimRenderedHistoryWindow\(session, "start"\)/);
+  assert.match(extractFn("_renderMsgRange"), /_sessionHistorySlice\(session, from, to\)/,
+    "paging must slice only the requested page instead of copying a multi-million-token transcript");
+  assert.doesNotMatch(extractFn("_renderMsgRange"), /_sessionHistoryEntries|\.assemble\(/);
+  assert.match(extractFn("_snapshotTranscript"), /\.chat-history-page/,
+    "paging controls are transient and must not be restored as stale transcript content");
+  assert.match(extractFn("_queueHistoryAutoPage"), /chatEl\.scrollTop <= _HISTORY_AUTO_PAGE_EDGE_PX/);
+  assert.match(extractFn("_queueHistoryAutoPage"), /distanceFromBottom <= _HISTORY_AUTO_PAGE_EDGE_PX/);
+  assert.match(SRC, /chatEl\.addEventListener\("scroll", \(\) => \{[\s\S]{0,240}_queueHistoryAutoPage\(\)/,
+    "normal scrolling must automatically page the bounded transcript in both directions");
   assert.doesNotMatch(SRC, /while \(session\.container\.firstChild\)[\s\S]{0,180}_renderMsgRange\(session, 0, h\.length\)/,
     "opening earlier history must not synchronously rebuild the full transcript");
+  assert.match(SRC, /const CHAT_LOCAL_RECENT_LIMIT = 96/,
+    "the synchronous emergency mirror must remain bounded even when full context is huge");
   assert.match(SRC, /const _CHAT_FOLLOW_DELAY_MS = 48/);
   assert.match(SRC, /_chatFollowTimer = setTimeout\(/,
     "streaming updates should coalesce their layout-affecting scroll write");
@@ -8114,8 +8477,6 @@ test("long chat transcripts stay bounded and load earlier messages in pages", ()
 
 test("automatic verification converges instead of repeating per edit batch", () => {
   assert.match(SRC, /const _AGENT_MAX_VERIFY = 2/);
-  assert.match(SRC, /const _AGENT_HARD_CEIL = 64/);
-  assert.match(SRC, /const _AGENT_MAX_EXTENSIONS = 2/);
   assert.match(SRC, /timeoutSecs: 60/);
   assert.doesNotMatch(SRC, /run\.stack\?\.checkCmd && _checkPending\.size >= 2/,
     "expensive compile checks belong to the finish gate, not each edit batch");
@@ -8143,7 +8504,8 @@ test("automatic verification runs directly without the old permission gate", asy
 
 test("auto-detected verification never downloads an unpinned eslint or tsc", async () => {
   const verifyFor = async (files) => {
-    const f = load("_detectVerifyCmd", {
+    // 测的是检测逻辑本身；存在性探测层（_filterVerifyCmdSteps）有自己的行为测试。
+    const f = load("_detectVerifyCmdRaw", {
       _projectStacks: new Map(),
       _verificationCommandsForStack: load("_verificationCommandsForStack"),
       backend: { readTextFile: async (path) => {
@@ -8183,7 +8545,6 @@ test("external source tools stay real but load on demand", () => {
     activePath: "",
     _TOOL_BUNDLES: bundles,
     _DEFERRED_TOOL_NAMES: deferred,
-    _engineeringTaskProfile: () => ({ ui: false }),
     _SEARCH_TOOLS_SCHEMA: searchSchema,
   });
   const names = select(true, "fix this project").map((tool) => tool.function.name);
@@ -8209,7 +8570,6 @@ test("plain Agent turns keep project diagnostics, mutation, terminal, and Git sc
     activePath: "",
     _TOOL_BUNDLES: { browser: { tools: [] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({}),
     _buildAgentToolSchemas: () => catalog,
   });
   const names = select(true, "你好，先聊聊", [], "agent").map((tool) => tool.function.name);
@@ -8221,6 +8581,7 @@ test("plain Agent turns keep project diagnostics, mutation, terminal, and Git sc
     "read_file", "list_dir", "search", "find_files", "update_plan",
     "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
+  assert.equal(names.length, 10, "the default Agent schema payload must stay at ten tools");
   for (const deferred of ["get_diagnostics", "git_status", "read_terminal", "run_in_terminal"]) {
     assert.ok(!names.includes(deferred), `${deferred} should not tax a plain Agent turn`);
   }
@@ -8239,15 +8600,10 @@ test("engineering Agent turns keep evidence and mutation schemas on demand", () 
     activePath: "src/auth.ts",
     _TOOL_BUNDLES: { browser: { tools: [] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({
-      applies: true,
-      implementation: true,
-      explicitWorkspaceMutation: true,
-    }),
     _buildAgentToolSchemas: () => catalog,
   });
   const names = select(true, "修复认证逻辑并补测试", [], "agent").map((tool) => tool.function.name);
-  // "修复认证逻辑并补测试"是明确的写任务，写入三件套必须在第 1 轮就位（见上一个测试的注释）。
+  // 写任务首轮仍可直接改代码；批量编辑和验证能力按证据阶段再加载。
   assert.deepEqual(names, [
     "read_file", "list_dir", "search", "find_files", "update_plan",
     "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
@@ -8276,7 +8632,8 @@ test("search_tools exact names cannot fall through to localhost descriptions", (
   assert.deepEqual(lookup("LOCAL_DISCOVERY", registry, new Set()), [localDiscovery]);
   assert.deepEqual(lookup("local_discovery", new Map([["http_request", httpRequest]]), new Set()), [],
     "an unavailable compound tool name must not be split into loose fuzzy terms");
-  assert.match(SRC, /工具 \$\{exact\.name\} 已在当前工具列表中，请直接调用/);
+  assert.match(SRC, /工具已加载：\\n· \$\{compactToolGuide\(exact\.schema\)\}/,
+    "已加载工具的精确查询也必须返回压缩调用范式");
   assert.match(SRC, /当前注册表没有名为 \$\{exact\.name\} 的工具/);
 });
 
@@ -8288,7 +8645,6 @@ test("large MCP catalogs stay out of the first turn but remain exactly loadable"
     activePath: "",
     _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({}),
     _buildAgentToolSchemas: () => [...staticTools, ...mcp],
   });
   const initial = select(true, "inspect this project", mcp, "agent");
@@ -8311,7 +8667,6 @@ test("read-only roles receive distinct first-turn tool contracts", () => {
     activePath: "",
     _TOOL_BUNDLES: { browser: { tools: ["browser"] }, db: { tools: [] }, github: { tools: [] } },
     _SEARCH_TOOLS_SCHEMA: schema("search_tools"),
-    _engineeringTaskProfile: () => ({ ui: true }),
     _buildAgentToolSchemas: () => catalog,
   });
   const namesFor = (mode) => select(false, "inspect the UI", [], mode).map((tool) => tool.function.name);
@@ -8324,7 +8679,7 @@ test("read-only roles receive distinct first-turn tool contracts", () => {
   }
 });
 
-test("search_tools keeps fuzzy matching for natural-language capability queries", () => {
+test("natural-language capability queries are routed by the semantic tool orchestrator, not keyword scoring", async () => {
   const exactQuery = load("_searchToolsExactQuery");
   const lookup = load("_searchToolsLookup", { _searchToolsExactQuery: exactQuery });
   const localDiscovery = { type: "function", function: { name: "local_discovery", description: "Find nearby public places" } };
@@ -8334,13 +8689,48 @@ test("search_tools keeps fuzzy matching for natural-language capability queries"
     ["http_request", httpRequest],
   ]);
 
-  assert.deepEqual(lookup("find nearby public places", registry, new Set()), [localDiscovery]);
-  assert.deepEqual(lookup("github", new Map([
-    ["github_search", { type: "function", function: { name: "github_search", description: "Search GitHub repositories" } }],
-  ]), new Set()).map((tool) => tool.function.name), ["github_search"]);
+  assert.deepEqual(lookup("find nearby public places", registry, new Set()), []);
+  const catalog = load("_criticToolCatalog");
+  const requested = load("_criticRequestedToolSchemas");
+  const fullRegistry = new Map(Array.from({ length: 300 }, (_, index) => {
+    const name = `mcp__all__tool_${index}`;
+    return [name, { type: "function", function: { name, description: `Capability ${index}`, parameters: { type: "object", properties: {} } } }];
+  }));
+  assert.equal(catalog(fullRegistry).length, 300,
+    "the semantic planner must receive every currently registered tool, including a large MCP catalog");
+  let request = null;
+  const route = load("_semanticToolOrchestrator", {
+    _criticToolCatalog: catalog,
+    _criticRequestedToolSchemas: requested,
+    _pickCheapModel: (id) => `cheap:${id}`,
+    _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
+    _safeJsonLoose: JSON.parse,
+    fetch: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        tools: ["local_discovery", "not_registered"],
+        instruction: "Use the local structured-data tool for the requested nearby-place evidence.",
+      }) } }] }) };
+    },
+  });
+  const decision = await route({
+    config: { baseUrl: "https://gateway.example", apiKey: "test", model: "test" },
+    task: "Find nearby public places for this address.",
+    profile: { applies: true },
+    phase: "initial",
+    progress: "",
+    evidence: "",
+    toolRegistry: registry,
+  });
+  assert.match(request.messages[0].content, /local_discovery/);
+  assert.equal(request.model, "cheap:test", "semantic routing should use the cheapest configured gateway model");
+  assert.equal(request.max_tokens, 320, "tool routing should keep its JSON decision budget bounded");
+  assert.deepEqual(decision.tools, ["local_discovery"], "only names present in the complete registry may be scheduled");
+  assert.doesNotMatch(extractFn("_searchToolsLookup"), /score|includes\(t\)|_TOOL_CATALOG/,
+    "local capability lookup must not retain a keyword or description scorer");
 });
 
-test("external HTTP preflight blocks guessed public APIs but preserves evidenced and local requests", () => {
+test("HTTP execution no longer blocks model-selected public URLs with guessed-API heuristics", () => {
   const parse = load("_parseHttpUrlForPreflight");
   const localHost = load("_httpHostnameIsLocalOrPrivate");
   const localUrl = load("_isLocalOrPrivateHttpUrl", {
@@ -8348,53 +8738,17 @@ test("external HTTP preflight blocks guessed public APIs but preserves evidenced
     _httpHostnameIsLocalOrPrivate: localHost,
   });
   const canonical = load("_canonicalHttpEvidenceUrl", { _parseHttpUrlForPreflight: parse });
-  const evidenceText = load("_httpEvidenceText");
-  const corpus = load("_httpEvidenceCorpus", { _httpEvidenceText: evidenceText });
-  const hasEvidence = load("_httpUrlHasEvidence", {
-    _parseHttpUrlForPreflight: parse,
-    _canonicalHttpEvidenceUrl: canonical,
-    _httpEvidenceCorpus: corpus,
-  });
-  const looksGuessed = load("_looksLikeGuessedExternalApiUrl", {
-    _parseHttpUrlForPreflight: parse,
-    _httpHostnameIsLocalOrPrivate: localHost,
-  });
-  const issue = load("_externalHttpPreflightIssue", {
-    _parseHttpUrlForPreflight: parse,
-    _httpHostnameIsLocalOrPrivate: localHost,
-    _looksLikeGuessedExternalApiUrl: looksGuessed,
-    _httpUrlHasEvidence: hasEvidence,
-  });
-  const remember = load("_rememberHttpEvidenceFromTool", {
-    _canonicalHttpEvidenceUrl: canonical,
-  });
+  const remember = load("_rememberHttpEvidenceFromTool", { _canonicalHttpEvidenceUrl: canonical });
   const redirectBlock = load("_httpRedirectBlock");
 
-  const guessed4399 = { type: "http", method: "GET", url: "https://appapi.4399.cn/v1/games/list" };
-  assert.equal(looksGuessed(guessed4399), true);
-  assert.match(issue(guessed4399, { _originalText: "找一下 4399 的游戏榜单" }, []), /\[BLOCKED_PRECHECK\]/);
-  assert.match(issue(guessed4399, { _originalText: "找一下 4399 的游戏榜单" }, []), /capture_start[\s\S]*capture_flows/);
-
   assert.equal(localUrl("http://127.0.0.1:3000/api/health"), true);
-  assert.equal(issue({ type: "http", method: "GET", url: "http://127.0.0.1:3000/api/health" }, {}, []), "");
+  assert.equal(localUrl("https://api.example.test/v1/data"), false);
+  assert.equal(canonical("https://example.test/path/?q=1#section", true), "https://example.test/path/?q=1");
+  assert.equal(canonical("https://example.test/path/?q=1#section", false), "https://example.test/path");
 
-  assert.equal(issue(guessed4399, { _originalText: "直接请求 https://appapi.4399.cn/v1/games/list 看返回" }, []), "",
-    "a user-provided exact URL is evidence, even if it looks API-shaped");
-  assert.equal(issue(guessed4399, {}, [
-    { role: "tool", content: "capture_flows 发现真实请求：GET https://appapi.4399.cn/v1/games/list?from=home" },
-  ]), "", "a captured or fetched exact URL evidence allows the request");
-  assert.equal(issue({ type: "http", method: "GET", url: "https://www.taptap.cn/webapiv2/app-search/v1/by-keyword?kw=test" }, {}, [
-    { role: "tool", content: "官方页面源码里出现 host www.taptap.cn，路径 /webapiv2/app-search/v1/by-keyword，参数 kw 来自搜索框。" },
-  ]), "", "host + path from a tool result is enough evidence even when the full URL is split");
-  assert.equal(issue({ type: "http", method: "GET", url: "https://api.github.com/repos/openai/codex" }, {}, []), "",
-    "well-known stable public APIs should not be blocked just because the host starts with api");
   assert.match(
     redirectBlock("POST", "https://example.test/old", { status: 302, redirect_location: "/new", redirect_url: "https://example.test/new" }),
     /\[BLOCKED_HTTP_REDIRECT\][\s\S]*redirect_url: https:\/\/example\.test\/new[\s\S]*用 GET 请求/,
-  );
-  assert.match(
-    redirectBlock("GET", "https://example.test/path/old", { status: 301, headers: { location: "../new" } }),
-    /redirect_url: https:\/\/example\.test\/new[\s\S]*用 GET 请求/,
   );
   assert.match(
     redirectBlock("POST", "https://example.test/old", { status: 307, redirect_location: "/new", redirect_url: "https://example.test/new" }),
@@ -8406,27 +8760,23 @@ test("external HTTP preflight blocks guessed public APIs but preserves evidenced
     redirectUrl: "https://example.test/new?from=old",
     content: "[BLOCKED_HTTP_REDIRECT] redirect_url: https://example.test/new?from=old",
   });
-  assert.ok(redirectRun._httpEvidenceUrls.has("https://example.test/new?from=old"),
-    "redirect_url returned by a 3xx response is real evidence for the next request");
-  assert.match(SRC, /_externalHttpPreflightIssue\(call, run, messages\)/);
-  assert.match(SRC, /预检拦截 · 未请求/);
-  assert.match(SRC, /公网 API 不要凭感觉拼/);
+  assert.ok(redirectRun._httpEvidenceUrls.has("https://example.test/new?from=old"));
+
+  assert.doesNotMatch(SRC, /function _looksLikeGuessedExternalApiUrl\(/);
+  assert.doesNotMatch(SRC, /function _externalHttpPreflightIssue\(/);
+  assert.doesNotMatch(SRC, /_externalHttpPreflightIssue\(call, run, messages\)/);
+  assert.doesNotMatch(SRC, /预检拦截 · 未请求/);
 });
 
 test("browser and capture mode preflights choose headed, headless, isolated, system, and background paths", () => {
-  const intent = load("_browserCaptureIntent");
   const normalizeMode = load("_normalizeCaptureModeName");
   const resolveMode = load("_resolveCaptureStartMode", {
-    _browserCaptureIntent: intent,
     _normalizeCaptureModeName: normalizeMode,
   });
   const browserCaptureIssue = load("_browserNeedsCapturePreflight", {
-    _browserCaptureIntent: intent,
     _resolveCaptureStartMode: resolveMode,
   });
-  const screenshotIssue = load("_screenshotModePreflightIssue", {
-    _browserCaptureIntent: intent,
-  });
+  const screenshotIssue = load("_screenshotModePreflightIssue");
   const emptyCaptureInfo = load("_captureFlowsEmptyInfo", {
     _normalizeCaptureModeName: normalizeMode,
   });
@@ -8438,34 +8788,41 @@ test("browser and capture mode preflights choose headed, headless, isolated, sys
   assert.equal(normalizeMode("listen_only"), "background");
 
   assert.deepEqual(
-    resolveMode({ mode: "auto" }, { _originalText: "打开网页抓真实接口，看请求从哪来" }),
+    resolveMode({ mode: "auto" }, { engineering: { captureMode: "isolated_browser" } }),
     { mode: "isolated_browser", systemProxy: false, label: "无痕/隔离浏览器抓包", next: "现在用 browser navigate(fresh=true) 打开目标网页；自动化浏览器会走该代理且使用隔离资料目录，不污染系统代理和用户正常浏览。" },
   );
-  assert.equal(resolveMode({ mode: "auto" }, { _originalText: "抓任意 App 的 HTTPS 请求" }).mode, "system");
-  assert.equal(resolveMode({ mode: "background" }, { _originalText: "后台抓包等用户自己操作" }).systemProxy, false);
-  assert.equal(resolveMode({ systemProxy: true }, { _originalText: "抓包" }).mode, "system");
-  assert.equal(resolveMode({ systemProxy: false }, { _originalText: "抓包" }).mode, "isolated_browser");
+  assert.equal(resolveMode({ mode: "auto" }, { engineering: { captureMode: "system" } }).mode, "system");
+  assert.equal(resolveMode({ mode: "background" }, { engineering: {} }).systemProxy, false);
+  assert.equal(resolveMode({ systemProxy: true }, { engineering: {} }).mode, "system");
+  assert.equal(resolveMode({ systemProxy: false }, { engineering: {} }).mode, "isolated_browser");
 
   assert.match(
-    browserCaptureIssue({ type: "browser", action: "navigate", url: "https://example.test" }, { _originalText: "打开网页抓真实接口，看请求从哪来" }, false),
+    browserCaptureIssue({ type: "browser", action: "navigate", url: "https://example.test" }, {
+      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
+    }, false),
     /\[BLOCKED_PRECHECK\][\s\S]*capture_start\(\{mode:"isolated_browser"\}\)/,
   );
   assert.equal(
-    browserCaptureIssue({ type: "browser", action: "navigate" }, { _originalText: "打开网页抓真实接口", _captureStarted: true }, false),
+    browserCaptureIssue({ type: "browser", action: "navigate" }, {
+      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
+      _captureStarted: true,
+    }, false),
     "",
     "once capture_start succeeded in this run, browser can produce the traffic",
   );
   assert.equal(
-    browserCaptureIssue({ type: "browser", action: "navigate" }, { _originalText: "打开网页抓真实接口" }, true),
+    browserCaptureIssue({ type: "browser", action: "navigate" }, {
+      engineering: { capture: true, captureMode: "isolated_browser", browserGoal: "network_capture" },
+    }, true),
     "",
     "an already-running capture proxy should also allow browser navigation",
   );
   assert.match(
-    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { _originalText: "登录并点击保存按钮，验证完整流程" }),
+    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { engineering: { browserGoal: "interactive" } }),
     /单次无头 screenshot[\s\S]*browser 有头自动化/,
   );
   assert.equal(
-    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { _originalText: "看一下页面响应式截图和布局" }),
+    screenshotIssue({ type: "screenshot", url: "http://localhost:3000" }, { engineering: { browserGoal: "static" } }),
     "",
     "static visual checks should keep using headless screenshot",
   );
@@ -8655,6 +9012,10 @@ test("typed runtime and external evidence stays separate from workspace mutation
     _toolExecutionSucceeded: succeeded,
     _runtimeCommandKinds: runtimeKinds,
   });
+  const executionEvidence = load("_executionEvidenceFromTool");
+  const needsSemanticReview = load("_runtimeNeedsSemanticReview", {
+    _executionEvidenceFromTool: executionEvidence,
+  });
   const sqlWithoutLeadingTrivia = load("_sqlWithoutLeadingTrivia");
   const sqlMutates = load("_sqlExplicitlyMutates", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
   const sqlMayMutate = load("_sqlMayMutate", { _sqlWithoutLeadingTrivia: sqlWithoutLeadingTrivia });
@@ -8703,6 +9064,23 @@ test("typed runtime and external evidence stays separate from workspace mutation
   assert.deepEqual(runtimeKinds("npm ci"), ["install"]);
   assert.deepEqual(runtimeKinds("npm i"), ["install"]);
   assert.deepEqual(runtimeKinds("cd /repo && npm install"), ["install"]);
+  const crawlerResult = {
+    code: 0,
+    running: false,
+    completed: true,
+    stdout: "remote request returned status 400\nlocal output directory created",
+    stderr: "",
+  };
+  const crawlerEvidence = executionEvidence(
+    { type: "cmd", command: ".venv/bin/python3 crawler.py" },
+    crawlerResult,
+    "/repo",
+  );
+  assert.equal(crawlerEvidence.exitCode, 0);
+  assert.equal(crawlerEvidence.completed, true);
+  assert.equal(crawlerEvidence.cwd, "/repo");
+  assert.equal(crawlerEvidence.stdout, crawlerResult.stdout, "原始业务输出必须完整进入语义评审");
+  assert.equal(needsSemanticReview({ type: "cmd", command: ".venv/bin/python3 crawler.py" }, crawlerResult), true);
   assert.deepEqual(runtimeKinds("npm run package"), ["package"]);
   assert.deepEqual(runtimeKinds("node --version"), []);
   assert.deepEqual(runtimeKinds("test -d node_modules && echo ok"), []);
@@ -8857,7 +9235,7 @@ test("stream deadlines trigger exactly the fast-retry path", () => {
   const providerGateway = load("_isProviderGatewayStatusError", { _stripAiRetryPrefix: strip });
   const retryable = load("_isRetryableAiError", { _isProviderGatewayStatusError: providerGateway, _stripAiRetryPrefix: strip, _isRateLimitedAiError: load("_isRateLimitedAiError", { _stripAiRetryPrefix: strip }) });
   assert.equal(retryable("模型在 35 秒内没有生成有效内容"), true);
-  assert.match(SRC, /const retryLimit = payloadTooLarge \? 1 : \(argIssue \? 3 : \(stalled \? 0/,
+  assert.match(SRC, /const retryLimit = prefixInvalid \? 1 : \(payloadTooLarge \? 1 : \(argIssue \? 3 : \(stalled \? 0/,
     "a completed transport watchdog must not be replayed by the outer Agent loop");
   assert.match(TAURI_AI, /const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 15;/);
   assert.doesNotMatch(TAURI_AI, /HIGH_RESPONSE_HEADERS_TIMEOUT_SECS|EXTENDED_RESPONSE_HEADERS_TIMEOUT_SECS/,
@@ -9633,6 +10011,11 @@ test("ordered tool segments preserve mutation barriers while parallelizing only 
   assert.ok(events.indexOf("command") < events.indexOf("read4:new"));
   assert.equal(maxReads, 2, "adjacent reads still execute in parallel");
 
+  // 现实校准波：同批的 list 自成 "recon" 段先落地，随后读取才并行——外部清空目录时
+  // 同批脏读被空根标记短路，不再并发撞 cannot stat。
+  assert.match(SRC, /it\.call\.type === "list" \? "recon" : "read"/,
+    "同批 list 必须先于读取落地");
+
   const parallel = load("_isReadOnlyParallel", {
     _READ_ONLY_TYPES: new Set(["read"]),
     _dbCallMayMutate: (call) => String(call?.driver || "").toLowerCase() === "redis"
@@ -9698,12 +10081,20 @@ test("disk writes update clean open models, preserve dirty buffers, and are wire
   const file = { model, name: "a.js", dirty: false, diskContent: "old\n", externalConflict: false };
   const openFiles = new Map([["/repo/a.js", file]]);
   const saved = [];
+  // 冲突门真实接线：幽灵脏标记（预览活跃且用户没碰过）不算冲突，用户真改过才算。
+  const previews = new Map();
+  const conflictGate = load("_openFileWriteConflict", {
+    _coherentFilePath: COHERENT_PATH,
+    openFiles,
+    _liveEditorWritePreviews: previews,
+  });
   const apply = load("_applyDiskContentToOpenFile", {
     _coherentFilePath: COHERENT_PATH,
     _openingFiles: new Map(),
     openFiles,
     activePath: "",
     monacoEditor: {},
+    _openFileWriteConflict: conflictGate,
     _programmaticModelUpdates: new WeakSet(),
     _setModelValueProgrammatically: load("_setModelValueProgrammatically", { _programmaticModelUpdates: new WeakSet() }),
     lspManager: {
@@ -9725,6 +10116,21 @@ test("disk writes update clean open models, preserve dirty buffers, and are wire
   assert.equal(value, "user typing\n");
   assert.equal(setCalls, 1, "dirty user content must never be replaced");
   assert.equal(file.externalConflict, true);
+
+  // 幽灵脏：agent 预览活跃且用户没碰过（userChanged=false）→ 不算冲突，磁盘内容
+  // 照常同步并标记已保存，不再死锁后续读写。
+  file.externalConflict = false;
+  previews.set("/repo/a.js", { file, userChanged: false });
+  assert.deepEqual(apply("/repo/a.js", "agent2\n"), { state: "updated" });
+  assert.equal(value, "agent2\n");
+  assert.equal(file.dirty, false, "写盘成功后缓冲必须回到已保存状态");
+  // 用户真改过（userChanged=true）→ 仍是硬冲突。
+  file.dirty = true;
+  value = "user typing 2\n";
+  previews.set("/repo/a.js", { file, userChanged: true });
+  assert.deepEqual(apply("/repo/a.js", "external2\n"), { state: "conflict" });
+  assert.equal(value, "user typing 2\n");
+  previews.clear();
 
   const execute = extractFn("_executeToolStep");
   assert.ok((execute.match(/_applyDiskContentToOpenFile\(fp, newContent\)/g) || []).length >= 2,
@@ -10255,7 +10661,7 @@ test("plain-text assistant questions are a hard agent wait boundary", () => {
   const boundary = loop.indexOf("if (_agentTurnMustWaitForUser(turn))");
   const pendingGate = loop.indexOf("if (pending && continueNudges < 2)");
   const toolFirstGate = loop.indexOf("if (!_quick() && iter < 2 && toolFirstNudges < 2");
-  const criticGate = loop.indexOf("if (deepReadNudges < 1");
+  const criticGate = loop.indexOf("if (_needCritic && run.mode === \"agent\"");
   assert.ok(boundary >= 0 && boundary < pendingGate && boundary < toolFirstGate && boundary < criticGate,
     "the question boundary must run before every automatic continuation gate");
   assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,220}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
@@ -10356,7 +10762,12 @@ test("MCP read-only annotations survive discovery and mapping", () => {
   assert.doesNotMatch(SRC, /perm !== "approve"[^\n]*call\.mcpReadOnly/);
   assert.match(SRC, /readOnlyMode && \([^\n]*call\.type === "mcp"/);
   assert.match(SRC, /const _workspaceMutated = _ok && \(it\._wikiMutated \|\| _toolMutatesWorkspace\(it\.call, it\.rawResult\)\)/);
-  assert.match(SRC, /for \(const kind of _runtimeEvidenceKinds\(it\.call, it\.rawResult\)\) _runtimeEffects\.add\(kind\)/);
+  assert.match(SRC, /for \(const kind of _runtimeEvidenceKinds\(it\.call, it\.rawResult\)\) \{\s*_runtimeEffects\.add\(kind\)/,
+    "runtime 证据记账必须保留");
+  // test/build 的退出状态有确定契约；任意脚本 run 只记录执行，不能直接升级成业务成功。
+  assert.match(SRC, /if \(kind === "test" \|\| kind === "build"\) \{\s*didVerify = true;\s*_verifiedAtImplOps = _implOps;\s*verificationPassed = true;/);
+  assert.match(SRC, /else if \(kind === "run"\) \{\s*didVerify = true;/);
+  assert.doesNotMatch(SRC, /if \(kind === "run" \|\| kind === "test" \|\| kind === "build"\)/);
   assert.match(SRC, /for \(const kind of _externalEvidenceKinds\(it\.call, it\.rawResult\)\) _externalEffects\.add\(kind\)/);
   assert.match(SRC, /worker 不能调用可写 MCP/);
   assert.match(SRC, /执行 MCP 工具/);
@@ -10551,30 +10962,37 @@ test("thinking cards: duration is honest and trailing piles merge", () => {
   assert.equal(b3.children.length, 2);
 });
 
-test("stopped-run continuations route back to the full agent path", () => {
-  const light = load("_looksLightweightAgentChat", {
-    _engineeringTaskProfile: () => ({}),
-    _agentMustUseWorkspaceTools: () => false,
+test("stopped-run continuations are resolved from bounded prior-task semantic context", () => {
+  const intentText = load("_aiIntentText");
+  const intentList = load("_aiIntentList", { _aiIntentText: intentText });
+  const contextForTurn = load("_aiIntentContextForTurn", {
+    _aiIntentText: intentText,
+    _aiIntentList: intentList,
   });
-  // 有任务上下文：继续/催促/确认 都是"接着干活"，绝不能走无工具的轻量闲聊
-  for (const msg of ["继续", "继续啊", "接着做", "接下来", "开始吧", "动手", "别停", "快点", "怎么还不动", "continue", "go on", "好的", "行", "可以", "收到"])
-    assert.equal(light(msg, {}, "/repo", "", false, true), false, `"${msg}" 应走完整 agent 路径`);
-  // 全新会话没有任务可继续：这些词仍算轻量寒暄
-  assert.equal(light("继续", {}, "/repo", "", false, false), true);
-  assert.equal(light("好的", {}, "/repo", "", false, false), true);
-  // 有历史轮次 → 确定性一律全量路径（不做关键词猜测）：寒暄/致谢也走全量，
-  // 多花点 token 换确定不丢上下文；轻量路径只留给会话第一条消息。
-  assert.equal(light("谢谢", {}, "/repo", "", false, true), false);
-  assert.equal(light("你好啊", {}, "/repo", "", false, true), false);
-  assert.equal(light("你能做什么？", {}, "/repo", "", false, true), false);
-  assert.equal(light("什么是闭包？", {}, "/repo", "", false, true), false);
-  // 会话第一条的纯闲聊仍走轻量
-  assert.equal(light("你好啊", {}, "/repo", "", false, false), true);
-  assert.equal(light("你能做什么？", {}, "/repo", "", false, false), true);
-  // 陈述式反驳/催促（"现在就是啊"）默认按任务处理，不再落进闲聊
-  assert.equal(light("现在就是啊", {}, "/repo", "", false, true), false);
-  // caller 必须把"会话是否已有任务上下文"传进分类器
-  assert.match(SRC, /const _sessHasPriorWork = \(\(sess\?\.history\?\.length \|\| 0\) > 0\)/);
+  const context = contextForTurn({
+    id: "chat-resume",
+    project: "/repo",
+    memory: { recent: [] },
+    _intentState: {
+      lastUserText: "修复登录回调",
+      semantic: { goal: "修复登录回调", action: "debug", target: "登录模块" },
+    },
+    _lastRunState: {
+      outcome: "partial",
+      task: "修复登录回调",
+      result: "已定位但未修改",
+      incompleteReason: "stopped",
+    },
+    _planSteps: [{ content: "修改回调状态", status: "in_progress" }],
+  }, "继续", { root: "/repo", activePath: "/repo/src/login.ts" });
+
+  assert.equal(context.currentMessage, "继续");
+  assert.equal(context.priorTask.goal, "修复登录回调");
+  assert.equal(context.lastRun.outcome, "partial");
+  assert.deepEqual(context.unfinishedPlan, ["修改回调状态"]);
+  assert.match(extractFn("_aiIntentProfile"), /priorTask、recentTurns、lastRun、unfinishedPlan/);
+  assert.doesNotMatch(SRC, /function _looksLightweightAgentChat\(/);
+  assert.doesNotMatch(extractFn("sendPrompt"), /_looksLightweightAgentChat\(/);
 });
 
 test("context overflow errors are recognized and squeezed instead of killing the run", () => {
@@ -10980,11 +11398,13 @@ test("background LLM chores are bounded to at most one call per run", () => {
   assert.match(recordBody, /if \(cluster\) _saveInducedWorkflow\(parsed\.workflow/,
     "the workflow must come out of that same response, not a second call");
 
-  // 3. Memory distillation is gated on the message plausibly containing something to
-  //    remember, instead of firing on every substantive message.
+  // 3. Memory correction is folded into that run-end call instead of starting a
+  //    competing per-message request during foreground generation.
   assert.match(SRC, /function _worthDistilling\(t\)/);
-  assert.match(SRC, /if \(!_worthDistilling\(t\)\) return;/,
-    "distillation must skip messages with no memory or correction signal");
+  assert.doesNotMatch(SRC, /function _distillMemoryLLM/,
+    "standalone per-message memory model calls must not come back");
+  assert.match(recordBody, /memoryTexts\.some\(\(value\) => _worthDistilling\(value\)\)/,
+    "the shared run-end reflection should emit memory only for durable signals");
 
   // 4. Whether a chore runs must never depend on model pricing — that made the feature
   //    set vary silently with the catalog. _pickCheapModel always returns something
@@ -10999,6 +11419,78 @@ test("background LLM chores are bounded to at most one call per run", () => {
     "_pickCheapModel should rank by the catalog's input+output price");
   assert.doesNotMatch(SRC, /function _pickCheapModel\(currentId = ""\) \{\s*return currentId \|\| "";\s*\}/,
     "_pickCheapModel must not regress to a pass-through stub");
+});
+
+test("memory correction is immediate, append-only, and outside foreground generation", () => {
+  const send = extractFn("sendPrompt");
+  assert.match(send, /sess\.memory\?\.recordUserCorrection\?\.\(text\)/,
+    "an explicit correction must be recorded locally before model history is assembled");
+  assert.ok(send.indexOf("recordUserCorrection") < send.indexOf("_memoryMessagesForModel"));
+  assert.doesNotMatch(send, /_distillMemoryLLM\(/,
+    "foreground sends must not start a competing memory model call");
+  assert.equal((SRC.match(/_distillMemoryLLM\(/g) || []).length, 0,
+    "standalone memory model calls should be removed entirely");
+
+  const episode = extractFn("_recordEpisode");
+  assert.equal((episode.match(/_billableAiComplete\(/g) || []).length, 1,
+    "reflection, workflow learning, and implicit memory correction must share one run-end call");
+  assert.match(episode, /"memory":\[\{\"action\":\"correct\"/);
+  assert.match(episode, /_applyMemoryReflectionOutput/);
+  assert.match(episode, /outcome !== "success"[\s\S]*kind: "reflection"/,
+    "a failed or partial run should store a bounded next-time correction instead of only logging failure");
+
+  assert.match(SRC, /function _kgRecordCorrection\(root, input = \{\}\)/);
+  assert.match(SRC, /function _kgSupersede\(root, incorrectId, corrected, source = ""\)/);
+  assert.doesNotMatch(SRC, /function _kgRemove\(/,
+    "automatic correction must never delete the original durable memory node");
+  assert.match(extractFn("_kgRetrieve"), /allNotes[\s\S]*filter\(\(item\) => !superseded\.has\(item\.id\)\)/,
+    "retrieval should hide superseded nodes while retaining the complete raw list");
+  assert.match(extractFn("_kgRetrieve"), /JSON\.stringify\(allNotes\)/,
+    "usage-count persistence must not accidentally overwrite storage with only active nodes");
+
+  const runEnd = SRC.indexOf("try { await _recordEpisode(run, task, root, _runOutcome, config, session); }");
+  const streamingEnd = SRC.lastIndexOf("_setStreaming(session, false)", runEnd);
+  const assistantPersist = SRC.lastIndexOf("session.memory.push({ role: \"assistant\"", runEnd);
+  assert.ok(streamingEnd >= 0 && assistantPersist >= 0 && streamingEnd < assistantPersist && assistantPersist < runEnd,
+    "run-end reflection must start only after live output ended and the visible assistant response was persisted");
+});
+
+test("durable memory correction chains hide stale facts without deleting audit data", () => {
+  const chain = [
+    { id: "c1", created: 1, incorrectId: "old", incorrect: "use blue", correctedId: "middle", corrected: "use green" },
+    { id: "c2", created: 2, incorrectId: "middle", incorrect: "use green", correctedId: "latest", corrected: "use red" },
+  ];
+  const activeCorrections = load("_kgActiveCorrections", { _kgCorrectionLoad: () => chain });
+  assert.deepEqual(activeCorrections("/repo").map((item) => item.id), ["c2"],
+    "only the newest edge in a revised correction chain should be authoritative");
+
+  const rawNotes = [
+    { id: "old", content: "use blue", tags: ["blue"], type: "preference", created: 1, links: [] },
+    { id: "latest", content: "use red", tags: ["red"], type: "preference", created: 3, links: [] },
+  ];
+  let persisted = "";
+  const retrieve = load("_kgRetrieve", {
+    _kgSupersededIds: () => new Set(["old"]),
+    _kgLoad: () => rawNotes,
+    _kgTokens: () => ["red"],
+    _kgKey: () => "kg",
+    localStorage: { setItem: (_key, value) => { persisted = value; } },
+  });
+  assert.deepEqual(retrieve("/repo", "red").map((item) => item.id), ["latest"]);
+  assert.deepEqual(JSON.parse(persisted).map((item) => item.id), ["old", "latest"],
+    "retrieval usage updates must persist the untouched raw note set");
+
+  let ledgerInput = null;
+  const supersede = load("_kgSupersede", {
+    _kgLoad: () => rawNotes,
+    _kgAddNoteRecord: () => rawNotes[1],
+    _kgRecordCorrection: (_root, input) => { ledgerInput = input; return input; },
+  });
+  const before = rawNotes.length;
+  supersede("/repo", "old", "use red", "user correction");
+  assert.equal(rawNotes.length, before, "superseding must never splice the original node");
+  assert.equal(ledgerInput.incorrectId, "old");
+  assert.equal(ledgerInput.correctedId, "latest");
 });
 
 test("auto-i18n rescans only what changed, so long chats cannot freeze the UI", () => {
@@ -11083,6 +11575,56 @@ test("auto-i18n walks the tree once per pass, not once per localizer", () => {
     `the tree must be collected exactly once per pass (found ${collectCalls.length})`);
 });
 
+test("a returning account restores its verified 5M capability before startup profile fetch", () => {
+  const normalize = load("_normalizeMichaelCompressionCapability");
+  assert.deepEqual(normalize({ tier: "5M", max_input_tokens: 123 }), {
+    tier: "5m",
+    max_input_tokens: 5_000_000,
+  });
+  assert.deepEqual(normalize({ tier: "2m" }), { tier: "2m", max_input_tokens: 2_000_000 });
+  assert.equal(normalize({ tier: "9m", max_input_tokens: 9_000_000 }), null,
+    "a local snapshot cannot invent a server-unsupported tier");
+
+  const credentialTag = load("_compressionCredentialTag");
+  const token = "secret-login-token";
+  const tag = credentialTag(token);
+  assert.ok(tag && !tag.includes(token), "the startup snapshot must not persist token bytes");
+  assert.notEqual(tag, credentialTag("another-login-token"));
+
+  const values = new Map([
+    ["michael_token", token],
+    ["michael-compression-capability-v1", JSON.stringify({
+      credentialTag: tag,
+      capability: { tier: "5m", max_input_tokens: 5_000_000 },
+      planExpiresAt: null,
+      verifiedAt: Date.now(),
+    })],
+  ]);
+  const localStorage = { getItem: (key) => values.get(key) || null };
+  const restore = load("_loadMichaelCompressionCapability", {
+    localStorage,
+    _compressionCredentialTag: credentialTag,
+    _normalizeMichaelCompressionCapability: normalize,
+    _MC_CAPABILITY_STORE_KEY: "michael-compression-capability-v1",
+    _MC_CAPABILITY_MAX_AGE_MS: 7 * 24 * 60 * 60 * 1000,
+  });
+  assert.deepEqual(restore(), { tier: "5m", max_input_tokens: 5_000_000 });
+
+  values.set("michael_token", "another-login-token");
+  assert.equal(restore(), null, "a different account must never inherit the prior account's 5M tier");
+
+  assert.match(SRC, /const _bootCompressionCapability = _loadMichaelCompressionCapability\(\)/);
+  assert.match(SRC, /let _michaelUser = _bootCompressionCapability[\s\S]{0,120}michael_compression: _bootCompressionCapability/);
+  const setProfile = extractFn("_setMichaelUserProfile");
+  assert.match(setProfile, /_persistMichaelCompressionCapability\(_michaelUser\)/,
+    "every verified /api/me response must replace the startup snapshot");
+  assert.match(setProfile, /_refreshContextMeterFromDraft\(\{ force: true \}\)/,
+    "the visible 200K meter must be recalculated as soon as 5M arrives");
+  assert.match(extractFn("restoreMichaelSession"), /_setMichaelUserProfile\(u\)/);
+  assert.match(extractFn("michaelAccessGate"), /_setMichaelUserProfile\(u\)/,
+    "the actual request tier must still come from a fresh server check before sending");
+});
+
 test("gateway compression makes the local LLM compaction stand down", () => {
   // 两层同时开不只是重复付费：本地压缩把一大段历史**替换**成一条摘要，消息前缀因此
   // 改变，网关按内容哈希缓存的分段全部失效 —— "压缩缓存"退化成"每轮重压"，这套设计的
@@ -11091,14 +11633,15 @@ test("gateway compression makes the local LLM compaction stand down", () => {
     "本地 LLM 压缩必须在网关接管时整个跳过");
 
   // 档位只有一处真相：网关按套餐算好、经 /api/me 下发，客户端不自己推断。
-  assert.match(SRC, /function _compressionTier\(\)[\s\S]{0,200}_michaelUser\?\.michael_compression\?\.tier/);
+  assert.match(extractFn("_compressionTier"), /_normalizeMichaelCompressionCapability\(_michaelUser\?\.michael_compression\)/);
   assert.match(SRC, /_h\["x-michael-compression"\] = String\(config\.michaelCompression\)/,
     "请求必须带上档位头，网关才知道要不要压");
 
-  // 棘轮式机械裁剪要**保留**：它是确定性的、一条消息定形后不再变化，前缀依然稳定，
-  // 而且先削掉的冗余越多，网关需要花钱压缩的内容越少 —— 两者互补，不是二选一。
-  assert.match(SRC, /function _trimMessagesIfHuge\(/,
-    "棘轮裁剪不能因为网关有压缩就删掉");
+  // 同一份 transcript 不能在网关前缀生效后继续被本地机械改写，否则 covered 立即错位。
+  assert.match(SRC, /function _trimMessagesIfHuge\([\s\S]{0,260}if \(_gatewayHandlesCompression\(\)\) return;/,
+    "网关接管时 Agent transcript 的本地裁剪必须停下");
+  assert.match(SRC, /function _compactHistoryIfNeeded\([\s\S]{0,300}if \(_gatewayHandlesCompression\(\)\) return;/,
+    "跨轮历史也不能再被 16K 本地阈值提前改写");
   assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,420}_gatewayHandlesCompression\(\) && tierMax \? Math\.max\(native, tierMax\) : native/,
     "网关接管时本地按档位上限裁剪，而不是模型原生窗口");
   const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(config\?\.model\)\)/g) || [];
@@ -11106,6 +11649,10 @@ test("gateway compression makes the local LLM compaction stand down", () => {
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
   assert.doesNotMatch(SRC, /_trimMessagesIfHuge\(messages, \w+, root, _modelContextLimit\(/,
     "不能再有调用点直接用模型原生窗口");
+  const memory = new ConversationMemory();
+  memory.setExternalCompression(true);
+  for (let index = 0; index < 110; index++) memory.push({ role: "user", content: `raw-${index}` });
+  assert.equal(memory.recent.length, 110, "外部压缩开启时不得机械删除原始轮次");
 });
 
 test("agent-created resources are reaped instead of accumulating forever", () => {
@@ -11405,7 +11952,10 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
   // 前缀往返是 2m/5m 能不能真达到的关键：没有它，客户端每轮都要整份上传历史，
   // 被 3.5MB 字节上限卡在约 875k token。
   assert.match(ai, /pub mc_prefix: Option<String>/, "必须能接收上一轮的前缀");
+  assert.match(ai, /pub mc_prefix_covered: Option<usize>/, "覆盖条数必须与前缀一起回发");
   assert.match(ai, /payload\["mc_prefix"\]/, "必须把前缀发给网关");
+  assert.match(ai, /payload\["mc_prefix_covered"\]/, "桌面端必须把覆盖条数写进请求体");
+  assert.match(SRC, /payload\.mc_prefix = String\(config\.mcPrefix\)/, "浏览器端也必须回发前缀");
   assert.match(ai, /x-michael-compression-prefix/, "必须读取网关回传的前缀头");
   assert.match(ai, /CompressionPrefix \{/, "必须把前缀交给前端");
 
@@ -11418,20 +11968,85 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
   // 回发由 _applyCompressionPrefix 统一负责：它同时裁掉已覆盖的消息并挂上令牌，
   // 两件事必须一起做 —— 只挂令牌不裁消息会让早期内容同时以摘要和原文出现。
   assert.match(SRC, /turnConfig\.mcPrefix = rec\.token/, "下一轮必须回发令牌");
+  assert.match(SRC, /turnConfig\.mcPrefixCovered = rec\.covered/, "下一轮必须回发覆盖条数");
   assert.match(SRC, /messages\.slice\(0, pinned\)\.concat\(messages\.slice\(need\)\)/,
     "必须按网关报的 covered 裁掉已覆盖的消息");
   assert.equal(
     (SRC.match(/_applyCompressionPrefix\(/g) || []).length, 3,
     "定义 + agent 路径 + 普通对话路径；漏掉任一条路径那条路径就只能整份重传",
   );
-  // 前置条件必须严格：服务端只挡得住"少裁"，多裁等于静默丢历史。
-  assert.match(SRC, /messages\.length <= need \|\| messages\.length < rec\.sentLength/,
-    "历史变短或被本地改写过时不能使用前缀");
-  assert.match(SRC, /_mcPrefixInvalidate\(\)/, "本地改写历史后必须作废前缀");
-  assert.equal(
-    (SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length, 3,
-    "定义 + 本地压缩 + 裁剪，三处都要有；漏掉任一处都会让模型收到错位的上下文",
+  // 前置条件必须严格：服务端只挡得住"少裁"，多裁等于静默丢历史。长度相同也可能是
+  // Agent 顶层回合重建后的另一组消息，所以必须核对已覆盖边界的内容指纹。
+  assert.match(SRC, /messages\.length >= rec\.sourceLength/,
+    "历史变短时不能使用前缀");
+  assert.match(SRC, /_mcMessageFingerprint\(messages\[need - 1\]\) === rec\.boundarySig/,
+    "不能只看消息条数，必须确认被裁边界仍是同一条消息");
+  const fingerprint = load("_mcMessageFingerprint");
+  let invalidated = false;
+  const baseMessages = [
+    { role: "system", content: "stable" },
+    { role: "user", content: "old-1" },
+    { role: "assistant", content: "old-2" },
+  ];
+  const applyPrefix = load("_applyCompressionPrefix", {
+    _mcPrefixGet: () => ({
+      token: "mcp_0123456789abcdef0123456789abcdef",
+      covered: 2,
+      sourceLength: 3,
+      firstSig: fingerprint(baseMessages[1]),
+      boundarySig: fingerprint(baseMessages[2]),
+    }),
+    _mcMessageFingerprint: fingerprint,
+    _mcPrefixInvalidate: () => { invalidated = true; },
+  });
+  const config = {};
+  const messages = [
+    ...baseMessages,
+    { role: "user", content: "tail" },
+    { role: "assistant", content: "new" },
+  ];
+  assert.deepEqual(applyPrefix(messages, config), [messages[0], messages[3], messages[4]]);
+  assert.deepEqual(config, { mcPrefix: "mcp_0123456789abcdef0123456789abcdef", mcPrefixCovered: 2 });
+  const changed = messages.map((message) => ({ ...message }));
+  changed[2].content = "another transcript with the same length";
+  assert.deepEqual(applyPrefix(changed, {}), changed, "同条数但边界内容改变时必须发完整历史");
+  assert.equal(invalidated, true, "边界不匹配后应删除持久化前缀，不能每轮重复探测");
+  assert.match(
+    SERVER_MODELS,
+    /apply_michael_compression\([\s\S]{0,220}\.await\?;[\s\S]{0,520}compression_strip_protocol_fields\(&mut body\)/,
+    "服务端必须先消费 mc_prefix，再删除 Michael 私有协议字段",
   );
+  assert.match(SERVER_MODELS, /obj\.remove\("mc_prefix_covered"\)/,
+    "覆盖条数也不能透传给上游供应商");
+  assert.match(SERVER_MODELS, /StatusCode::SERVICE_UNAVAILABLE[\s\S]{0,260}michael-compression warming/,
+    "冷缓存超窗时必须等待预热，不能把原文降级直发上游");
+  assert.match(SERVER_MODELS, /StatusCode::CONFLICT[\s\S]{0,180}\[mc-prefix-invalid\]/,
+    "Redis 前缀失效必须明确返回可识别的 409，不能带着残缺尾部继续请求");
+  assert.match(SERVER_CONTEXT_MIGRATION, /CREATE TABLE IF NOT EXISTS michael_context_archives/,
+    "无损历史不能只放 Redis，必须有 PostgreSQL 持久原文表");
+  assert.match(SERVER_CONTEXT_MIGRATION, /CREATE TABLE IF NOT EXISTS michael_context_prefixes/,
+    "前缀令牌本身也必须持久化，否则 Redis 重启后 5M 会话无法恢复");
+  assert.match(SERVER_COMPRESSION, /pub raw_segment_keys: Vec<String>/,
+    "每个摘要段必须绑定一份无损原文归档，摘要不能成为唯一事实来源");
+  assert.match(SERVER_COMPRESSION, /pub fn retrieval_system_text/,
+    "相关旧代码、路径、数字和错误必须以逐字证据回注模型窗口");
+  assert.match(SERVER_COMPRESSION, /redis::cmd\("MGET"\)/,
+    "5M 热路径必须批量读取 Redis，不能按几百个段逐个往返");
+  assert.match(SERVER_MODELS, /compression_load_raw_archive[\s\S]{0,900}michael_context_archives/,
+    "Redis 淘汰后必须从 PostgreSQL 恢复无损原文，而不是要求超大历史整包重传");
+  assert.match(SERVER_MODELS, /compression_retrieve_history\(/,
+    "普通前缀复用和新增压缩段都必须经过精确历史检索");
+  assert.match(SRC, /_isCompressionPrefixInvalidError\(err\)[\s\S]{0,360}_mcPrefixInvalidate\(\)/,
+    "普通聊天必须清掉失效前缀并自动恢复完整历史");
+  assert.match(SRC, /const prefixInvalid = [^\n]*_isCompressionPrefixInvalidError\(turnErr\)/,
+    "Agent 也必须识别前缀失效而不是当普通网络错误重发旧令牌");
+  assert.match(SRC, /_MC_PREFIX_STORE_KEY[\s\S]{0,1800}_mcPrefixPersist\(\)/,
+    "前缀必须随会话持久化，否则重启 IDE 后 2M\/5M 会退回全量上传");
+  assert.match(ai, /resp\.status\(\) != reqwest::StatusCode::CONFLICT/,
+    "桌面传输层不能把同一个失效前缀先机械重发一次");
+  assert.match(SRC, /_mcPrefixInvalidate\(\)/, "本地改写历史后必须作废前缀");
+  assert.ok((SRC.match(/_mcPrefixInvalidate\(\)/g) || []).length >= 5,
+    "定义、历史改写、边界校验和两条 409 恢复路径都必须作废旧前缀");
 });
 
 test("edit_file 的实时预览只替换锚点区间，且锚点不唯一时拒绝动编辑器", () => {
@@ -11518,5 +12133,341 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
   assert.match(SRC, /python3 -m compileall -q \./,
     "两者都没有时要退回一定存在的语法编译检查，而不是给一条跑不了的命令");
   assert.match(SRC, /\.venv\/bin/, "优先用项目自带的虚拟环境");
+
+  // 栈提示里"猜"的 Python 默认命令不得绕过存在性探测直接进验证管线——
+  // 实测就是这条旁路让收尾门禁跑出了 `ruff check . && pytest` 退出 127。
+  assert.match(SRC, /out\.guessedCmds\.push\("pytest"\)/, "pytest 默认值必须标记为猜测");
+  assert.match(SRC, /out\.guessedCmds\.push\("ruff check \."\)/, "ruff 默认值必须标记为猜测");
+  assert.match(SRC, /const guessed = new Set\(\(stack\.guessedCmds \|\| \[\]\)/,
+    "_verificationCommandsForStack 必须过滤猜测命令，落回存在性探测分支");
+
+  // 中途自动验证：unavailable/超预算（ran:false）不能走失败分支逼模型修"不存在的错"。
+  assert.match(SRC, /if \(!_vr\.ran && !_vr\.ok\) \{[\s\S]{0,900}?\} else if \(!_vr\.ok\) \{/,
+    "验证器不可用必须在失败分支之前单独处理");
+
+  // 纯文档改动（README 等）不重新武装验证门禁："代码验完 → 补写 README →
+  // 收尾又弹验证器红卡"就是这个漏洞造成的。
+  assert.match(SRC, /const _docOnlyMutation = \/\\\.\(md\|markdown\|rst\|adoc\)\$\/i\.test\(mutationPath\)/,
+    "必须识别纯文档改动");
+  assert.match(SRC, /if \(!_docOnlyMutation\) \{[\s\S]{0,80}?verificationPassed = false;[\s\S]{0,40}?_implOps\+\+;/,
+    "只有非文档改动才重新武装验证门禁");
 });
 
+test("验证命令先做存在性探测，缺失步骤被剔除而不是跑到 127", async () => {
+  // 机制层：两个门禁调用点（中途 + 收尾）都必须经过存在性过滤，不给跑不动的命令。
+  assert.match(SRC, /return _filterVerifyCmdSteps\(root, await _detectVerifyCmdRaw\(root, stack\)\)/,
+    "_detectVerifyCmd 必须包一层存在性过滤");
+
+  const filter = load("_filterVerifyCmdSteps", {
+    inTauri: true,
+    _probeBinsAvailable: async (_root, bins) => new Map(bins.map((b) => [b, b !== "ruff"])),
+  });
+  assert.equal(await filter("/p", "ruff check . && pytest -q"), "pytest -q", "缺失的步骤必须被剔除");
+  const allMissing = load("_filterVerifyCmdSteps", {
+    inTauri: true,
+    _probeBinsAvailable: async (_root, bins) => new Map(bins.map((b) => [b, false])),
+  });
+  assert.equal(await allMissing("/p", "ruff check ."), null, "全缺 → null，与识别不出验证命令同义，收尾不弹红卡");
+  const unknown = load("_filterVerifyCmdSteps", {
+    inTauri: true,
+    _probeBinsAvailable: async () => null,
+  });
+  assert.equal(await unknown("/p", "cargo check && cargo test"), "cargo check && cargo test",
+    "探测不可用必须 fail-open 原样放行，靠 127 兑底归类兜底");
+
+  // 探测脚本解析：BIN_OK/BIN_NO 回声、奇形 token 不探、脚本没跑起来 → null。
+  const probe = load("_probeBinsAvailable", {
+    _binProbeCache: new Map(),
+    _BIN_PROBE_TTL: 180000,
+    backend: { taskRunCapture: async () => ({ stdout: "BIN_OK:pytest\nBIN_NO:ruff\n", stderr: "" }) },
+  });
+  const avail = await probe("/p", ["pytest", "ruff", "$(x)"]);
+  assert.equal(avail.get("pytest"), true);
+  assert.equal(avail.get("ruff"), false);
+  assert.equal(avail.get("$(x)"), true, "奇形首词不探测、fail open，绝不拼进 shell");
+  const noEcho = load("_probeBinsAvailable", {
+    _binProbeCache: new Map(),
+    _BIN_PROBE_TTL: 180000,
+    backend: { taskRunCapture: async () => ({ stdout: "zsh: parse error", stderr: "" }) },
+  });
+  assert.equal(await noEcho("/p", ["pytest"]), null, "探测脚本没执行成功 → 未知，交给上层 fail-open");
+
+  // 装完工具必须立即让探测缓存失效；127 类失败要给定向恢复链而不是笼统建议。
+  assert.match(SRC, /_binProbeCache\.clear\(\)/, "安装类命令成功后必须清探测缓存");
+  assert.match(SRC, /命令\/可执行文件不存在（环境问题，不是代码错误）/,
+    "command not found 必须给定向取证链，杀掉连猜拼法变体的循环");
+  assert.match(SRC, /命令也是事实，先证实再敲/, "共享工程纪律必须包含命令存在性先验证（单条正向规则，不堆禁令）");
+});
+
+test("terminal evidence preserves structured status and the final log state within a bounded model payload", () => {
+  const stripAnsi = load("_stripAnsi");
+  const bound = load("_headTailModelText");
+  assert.equal(bound("must not leak when no budget remains", 0), "");
+  const executionForModel = load("_executionToolResultForModel", {
+    _stripAnsi: stripAnsi,
+    _headTailModelText: bound,
+  });
+  const stdout = `boot sequence\n${"middle-log\n".repeat(900)}FINAL_RESULT artifact_count=0`;
+  const stderr = `diagnostic start\n${"detail\n".repeat(700)}FINAL STDERR: requested artifact was not created`;
+  const rendered = executionForModel(
+    { type: "cmd", command: "node crawler.js" },
+    {
+      type: "cmd", command: "node crawler.js", cwd: "/repo", exitCode: 1,
+      running: false, completed: true, stdout, stderr,
+    },
+    "The IDE observed a completed command and retained the raw streams.",
+  );
+  assert.match(rendered, /"exitCode":1/);
+  assert.match(rendered, /"running":false/);
+  assert.match(rendered, /"completed":true/);
+  assert.match(rendered, /boot sequence/);
+  assert.match(rendered, /FINAL_RESULT artifact_count=0/,
+    "the stdout tail must survive instead of being replaced by a prefix-only slice");
+  assert.match(rendered, /FINAL STDERR: requested artifact was not created/,
+    "stderr must be a distinct authoritative stream and retain its final state");
+
+  const modelMessage = load("_toolMsgForModel", {
+    _toolResultToString: () => rendered,
+    _headTailModelText: bound,
+  })({ type: "cmd" }, { type: "cmd" });
+  assert.ok(modelMessage.length <= 8000);
+  assert.match(modelMessage, /FINAL STDERR: requested artifact was not created/,
+    "the final tool-message cap must preserve the evidence tail too");
+});
+
+test("项目入口退出 0 保留原始证据并进入语义验收，不直接记业务成功", () => {
+  const VERIFY = load("_looksLikeVerificationCommand");
+  const execLike = load("_looksLikeProjectExecutionCommand", { _looksLikeVerificationCommand: VERIFY });
+  // 这项旧分类仍供只读/副作用路由复用，但不能再直接给 verificationPassed 学分。
+  assert.equal(execLike("python video_crawler.py"), true);
+  assert.equal(execLike("python3 -m video_crawler"), true);
+  assert.equal(execLike('python -c "import video_crawler"'), true, "import 自检一行流算验证");
+  assert.equal(execLike(".venv/bin/pytest -q"), true, "项目虚拟环境内工具算验证");
+  assert.equal(execLike("node_modules/.bin/vitest run"), true);
+  assert.equal(execLike("uv run pytest"), true);
+  assert.equal(execLike("cargo run -- --check-only"), true);
+  assert.equal(execLike("make test"), true);
+  assert.equal(execLike("node server.js && npm test"), true, "混合管线：每段都是证据形态才算");
+  // 非执行证据不得冒充验证：只读命令、装包、shell 元字符拼接一律不算。
+  assert.equal(execLike("ls -la"), false);
+  assert.equal(execLike("cat video_crawler.py"), false);
+  assert.equal(execLike("pip install ruff"), false);
+  assert.equal(execLike("python -m pip install requests"), false, "装包不是验证");
+  assert.equal(execLike('python -c "print(1)"'), false, "不碰项目代码的一行流不算");
+  assert.equal(execLike("python x.py; rm -rf /"), false, "shell 元字符直接拒绝");
+  assert.doesNotMatch(SRC, /_looksLikeVerificationCommand\(it\.call\.command\) \|\| _looksLikeProjectExecutionCommand\(it\.call\.command\)/,
+    "任意项目入口退出 0 不能直接记成验证通过");
+  assert.match(SRC, /t === "cmd" && _looksLikeVerificationCommand\(it\.call\.command\)/,
+    "只有确定性 check\/test\/build 命令可直接记验证学分");
+  const semanticGate = extractFn("_runtimeNeedsSemanticReview");
+  assert.match(semanticGate, /_executionEvidenceFromTool\(call, result, ""\)/);
+  assert.doesNotMatch(semanticGate, /_runtimeCommandKinds|RegExp|\.test\(/,
+    "语义验收不能靠命令名或输出关键词分类");
+  const critic = extractFn("_wrapUpCritic");
+  assert.match(critic, /executionEvidence/);
+  assert.match(critic, /exitCode=0 只表示进程正常退出，不证明业务目标完成/);
+  assert.match(critic, /typeof j\.verified !== "boolean"/);
+  assert.match(SRC, /run\._incompleteReason = "semantic_runtime_review_missing"/,
+    "语义核验缺失时必须以未完成状态收尾");
+});
+
+test("语义收尾评审可按真实证据动态调度已注册的抓包链路", async () => {
+  const catalog = load("_criticToolCatalog");
+  const requested = load("_criticRequestedToolSchemas");
+  const byteLength = load("_utf8ByteLength");
+  const window = load("_toolPayloadWindow", { _utf8ByteLength: byteLength });
+  const applyWindow = load("_applyToolPayloadWindow", { _toolPayloadWindow: window });
+  const schema = (name, description = name) => ({ type: "function", function: { name, description, parameters: { type: "object", properties: {} } } });
+  const runCmd = schema("run_cmd");
+  const searchTools = schema("search_tools");
+  const captureStart = schema("capture_start", "Start isolated browser capture for real request evidence.");
+  const browser = schema("browser", "Drive the visible browser through login and a real page flow.");
+  const flows = schema("capture_flows", "Read captured requests, headers, and responses.");
+  const monitor = schema("background_monitor", "Wait for a user login or other observable condition.");
+  const registry = new Map([
+    ["run_cmd", runCmd], ["search_tools", searchTools], ["capture_start", captureStart],
+    ["browser", browser], ["capture_flows", flows], ["background_monitor", monitor],
+  ]);
+
+  assert.deepEqual(catalog(registry).map((entry) => entry.name), [...registry.keys()],
+    "评审获得的是当前注册工具目录，不是关键词规则表");
+  const picked = requested(["capture_start", "browser", "capture_flows", "background_monitor", "not_registered"], registry);
+  assert.deepEqual(picked.map((entry) => entry.function.name), ["capture_start", "browser", "capture_flows", "background_monitor"],
+    "只接受评审从注册目录原样选出的工具");
+  const payload = [runCmd, searchTools];
+  const admitted = applyWindow(payload, picked, new Set(["run_cmd", "search_tools"]), 64, 256 * 1024);
+  assert.deepEqual(admitted.admitted, ["capture_start", "browser", "capture_flows", "background_monitor"]);
+  assert.ok(payload.some((entry) => entry.function.name === "capture_start"), "评审要的抓包 schema 必须被装入下一轮模型窗口");
+
+  let reviewRequest = null;
+  const critic = load("_wrapUpCritic", {
+    _executionEvidenceReviewBlock: () => "run_cmd: exitCode=0; stdout=the remote request did not produce the requested artifact",
+    _criticToolCatalog: catalog,
+    _criticRequestedToolSchemas: requested,
+    _pickCheapModel: (id) => `cheap:${id}`,
+    _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
+    _safeJsonLoose: JSON.parse,
+    fetch: async (_url, options) => {
+      reviewRequest = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        done: false,
+        verified: false,
+        instruction: "Start isolated capture, drive the login flow, then inspect the captured request before retrying.",
+        tools: ["capture_start", "browser", "capture_flows", "background_monitor", "not_registered"],
+      }) } }] }) };
+    },
+  });
+  const verdict = await critic({
+    config: { baseUrl: "https://gateway.example", apiKey: "test", model: "test" },
+    task: "Run the crawler and verify it actually retrieved the authenticated data.",
+    padText: "The program ended, but its requested data was not confirmed.",
+    draft: "Please copy a Cookie from DevTools.",
+    readList: "crawler.js",
+    executionEvidence: [],
+    toolRegistry: registry,
+  });
+  assert.match(reviewRequest.messages[0].content, /capture_start/,
+    "评审必须看到可用工具目录，才能为当前证据分配能力");
+  assert.equal(reviewRequest.model, "cheap:test", "wrap-up review should use a cheap gateway model");
+  assert.equal(reviewRequest.max_tokens, 360, "wrap-up review should keep its JSON decision budget bounded");
+  assert.deepEqual(verdict.tools, ["capture_start", "browser", "capture_flows", "background_monitor"],
+    "评审的未注册工具不得进入调度结果");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_criticRequestedToolSchemas\(_crit\?\.tools, run\._toolRegistry\)/,
+    "收尾评审选出的工具必须接入主循环");
+  assert.match(loop, /_applyToolPayloadWindow\(toolSchemas, _criticRequestedSchemas, run\._toolCoreNames\)/,
+    "调度结果必须立即装入当前工具窗口，不会只写成给用户的建议");
+});
+
+test("收尾验收契约开局告知，与收尾门禁同源而非突袭", () => {
+  // Anthropic effective-harnesses 模式：完成标准开局交给模型自主奔着做。
+  // 契约块必须从门禁同源字段（runtimeObligations/externalObligations/research/UI）合成，
+  // 不得另建一套会漂移的判定。
+  assert.match(SRC, /收尾验收契约（harness 收尾时会逐项核对真实证据/,
+    "验收契约必须在决策帧里开局告知");
+  assert.match(SRC, /for \(const kind of p\.runtimeObligations \|\| \[\]\) _finishChecks\.push/,
+    "契约的运行义务必须直接读门禁同源的 runtimeObligations");
+  assert.match(SRC, /for \(const kind of p\.externalObligations \|\| \[\]\) _finishChecks\.push/,
+    "契约的外部义务必须直接读门禁同源的 externalObligations");
+  assert.match(SRC, /if \(p\.needsOfficialResearch\) _finishChecks\.push/,
+    "契约的研究证据项必须直接读门禁同源的 needsOfficialResearch");
+  // 行为验证：有义务 → 契约列出；纯问答无 applies → 不注入契约块。
+  const frame = load("_agentDecisionFrameBlock", {
+    _engineeringProfileWithAiIntent: (t) => ({}),
+    _agentIntentExecutionBlock: () => "",
+    _agentBugEvidenceLadderBlock: () => "",
+  });
+  const withObligations = frame("x", {
+    applies: true, runtimeObligations: ["run", "test"], externalObligations: ["deploy"],
+    needsOfficialResearch: true, needsCommunityResearch: false,
+  });
+  assert.match(withObligations, /收尾验收契约/);
+  assert.match(withObligations, /目标程序真实跑起来/);
+  assert.match(withObligations, /测试真实跑过/);
+  assert.match(withObligations, /部署\/发布完成/);
+  assert.match(withObligations, /官方\/维护方真实证据/);
+  const pureChat = frame("你好", { applies: false });
+  assert.doesNotMatch(pureChat, /收尾验收契约/, "纯问答不注入验收契约，不制造仪式负担");
+});
+
+test("multi-role capabilities remain dynamically discoverable without a static priority table", () => {
+  assert.doesNotMatch(SRC, /function _profileToolPriorities/);
+  assert.match(SRC, /完整工具目录（JSON 数据，只能选择其中 name）/);
+  assert.match(SRC, /不要因为保守而把大工程写成 solo/, "semantic topology guidance must remain explicit");
+  assert.match(SRC, /这是建议不是禁令：任务展开后发现真需要分角色\/并行，可自主升级编排/,
+    "a solo recommendation must not hide dynamically available collaboration tools");
+});
+test("外部研究结束门禁只接受真实、非空的官方与社区证据", () => {
+  const officialTools = new Set([
+    "package_search", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo",
+  ]);
+  const communityTools = new Set([
+    "developer_community_search", "stackoverflow_search", "github_discussions_search",
+    "reddit_search", "v2ex_search", "juejin_search",
+  ]);
+  const officialHosts = new Set(["github.com", "developer.mozilla.org", "react.dev"]);
+  const officialUrl = load("_isOfficialResearchUrl", { _OFFICIAL_RESEARCH_HOSTS: officialHosts, URL });
+  const hasEvidence = load("_researchResultHasEvidence");
+  const category = load("_researchEvidenceCategory", {
+    _researchResultHasEvidence: hasEvidence,
+    _OFFICIAL_RESEARCH_EVIDENCE_TOOLS: officialTools,
+    _COMMUNITY_RESEARCH_EVIDENCE_TOOLS: communityTools,
+    _isOfficialResearchUrl: officialUrl,
+  });
+  const missing = load("_missingResearchEvidence");
+
+  assert.equal(category("search_tools", { query: "package_search" }, { content: "已加载 package_search" }), "",
+    "加载 schema 不是外部研究证据");
+  assert.equal(category("github_search", { query: "react" }, { content: "1. react - GitHub search title and URL" }), "",
+    "搜索结果标题不能代替维护者正文");
+  assert.equal(category("package_search", { query: "react" }, { content: "npm packages:\n\n1. react v19.1.0\n   UI library\n   https://www.npmjs.com/package/react" }), "official");
+  assert.equal(category("github_repo", { owner: "facebook", repo: "react" }, { content: "React repository README\nRelease: 19.1.0\nMaintainer notes and source tree." }), "official");
+  assert.equal(category("web_fetch", { url: "https://react.dev/reference/react" }, { content: "Official React API reference with current supported behavior and examples." }), "official");
+  assert.equal(category("web_fetch", { url: "https://example.com/react" }, { content: "A long third-party article that is not a verified official source." }), "",
+    "任意网页正文不能冒充官方来源");
+
+  const communityOk = "Developer community search\nStatus counts: success=3; empty=2; rate-limited=1; failed=0; timeout=0.\n## Stack Overflow [search completed; status=success]\nA concrete discussion result.";
+  const communityEmpty = "Developer community search\nStatus counts: success=0; empty=4; rate-limited=1; failed=1; timeout=0.";
+  assert.equal(category("developer_community_search", { query: "React architecture" }, { content: communityOk }), "community");
+  assert.equal(category("developer_community_search", { query: "missing" }, { content: communityEmpty }), "",
+    "聚合器全部为空/失败/限流时不能算社区证据");
+  assert.equal(category("stackoverflow_search", { query: "missing" }, { content: "Stack Overflow results:\nsearch_status: empty\n(no results)" }), "");
+  assert.equal(category("reddit_search", { query: "x" }, { content: "[失败] reddit_search: 429 rate limited" }), "");
+
+  assert.deepEqual(missing({ needsOfficialResearch: false, needsCommunityResearch: false }, { official: new Set(), community: new Set() }), [],
+    "researchMode=none 的普通任务不能被联网门禁拖慢");
+  assert.deepEqual(missing({ needsOfficialResearch: true, needsCommunityResearch: true }, { official: new Set(["package_search"]), community: new Set() }), ["community"]);
+  assert.deepEqual(missing({ needsOfficialResearch: true, needsCommunityResearch: true }, { official: new Set(["github_repo"]), community: new Set(["developer_community_search"]) }), []);
+});
+
+test("外部研究证据门禁接入静默收尾且重试有界", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _researchEvidence = \{ official: new Set\(\), community: new Set\(\) \}/,
+    "每个 run 必须有独立证据账本");
+  assert.match(loop, /const _missingResearch = _missingResearchEvidence\(run\.engineering, _researchEvidence\)/,
+    "静默收尾必须读取语义研究要求和真实证据");
+  assert.match(loop, /quietTurns >= _quietExitAt[\s\S]{0,320}!_missingResearch\.length/,
+    "早退路径也不能绕过证据门");
+  assert.match(loop, /_missingResearch\.length && researchNudges < 2/,
+    "研究补救最多两轮，不能无限循环");
+  assert.match(loop, /research_evidence_missing:\$\{_missingResearch\.join\(","\)\}/,
+    "重试耗尽后必须显式标记未取得证据");
+  assert.match(loop, /_researchEvidenceCategory\(it\.tc\.name, it\.call, it\.rawResult\)/,
+    "证据必须来自实际完成的工具结果");
+  assert.match(loop, /_applyToolPayloadWindow\(toolSchemas, requestedSchemas, run\._toolCoreNames\)/,
+    "研究工具 schema 只在门禁需要时延迟装入当前窗口");
+  assert.match(loop, /const _finalMissingResearch = _missingResearchEvidence/,
+    "步数上限和异常收尾也不能绕过研究证据门");
+});
+
+test("每个注册工具都有按需加载的压缩场景与最小调用例子", () => {
+  const registered = JSON.parse(SERVER_TOOLS);
+  assert.ok(registered.length >= 160, "覆盖测试必须读取完整服务端工具注册表");
+  for (const schema of registered) {
+    const name = schema.function.name;
+    const guide = compactToolGuide(schema);
+    const args = compactToolExampleArgs(schema);
+    const parameters = schema.function.parameters || {};
+    const expected = new Set(parameters.required || []);
+    const conditional = [...(parameters.anyOf || []), ...(parameters.oneOf || [])]
+      .find((branch) => Array.isArray(branch?.required));
+    for (const key of conditional?.required || []) expected.add(key);
+
+    assert.match(guide, new RegExp(`^${name}｜场景:.+｜例:${name}\\(`), `${name} 必须有场景和调用例子`);
+    assert.ok(guide.length <= 180, `${name} 的延迟指南必须保持 token 紧凑`);
+    assert.ok(guide.endsWith(")"), `${name} 的 JSON 调用例子不能被截断`);
+    for (const key of expected) assert.ok(Object.prototype.hasOwnProperty.call(args, key), `${name} 示例必须含必填参数 ${key}`);
+  }
+});
+
+test("Tool Search 只在命中时回传压缩调用指南，不把全量手册塞进稳定前缀", () => {
+  const search = extractFn("_runAgenticLoop");
+  const directory = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1] || "";
+  assert.match(search, /loadedAdds\.map\(\(schema\) => "· " \+ compactToolGuide\(schema\)\)/,
+    "命中的工具才带场景与示例");
+  assert.match(search, /工具已加载：\\n· \$\{compactToolGuide\(exact\.schema\)\}/,
+    "已加载工具被再次查询时也要回传调用范式");
+  assert.doesNotMatch(directory, /例:\s*\w+\(\{/, "稳定 search_tools 描述不能内嵌全量调用样例");
+  assert.match(SRC, /import \{ compactToolGuide \} from "\.\/tool-guides\.js"/,
+    "工具手册必须独立于庞大的主编排模块");
+});

@@ -260,11 +260,6 @@ export function signal(type, payload = {}) {
         turn.reviewed += 1; turn.engaged = true;
         state.stats.undos += 1;
         break;
-      case "revert-run":
-        observe("reviewing", true);
-        turn.engaged = true;
-        state.stats.reverts += 1;
-        break;
       case "run-complete":
         // An agent run that edited files: did it verify its own work (tests /
         // build / diagnostics) or ship unverified? The beneficial-usage signal.

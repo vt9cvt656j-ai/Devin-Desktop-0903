@@ -155,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ide-key", get(models::ide_key))
         .route("/api/ide-prompts", get(prompts::ide_prompts))
         .route("/api/ide/update", get(update::latest))
+        .route(
+            "/api/ide/update/download/:tag/:file",
+            get(update::download_asset),
+        )
         .route("/api/admin/ide-releases", get(update::admin_release_status))
         .route(
             "/api/admin/ide-releases/dispatch",

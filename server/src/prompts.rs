@@ -44,6 +44,7 @@ struct PromptGraph {
 struct AgentPromptGraph {
     base: Vec<String>,
     engineering: Vec<String>,
+    collaboration: Vec<String>,
     research: Vec<String>,
     automation: Vec<String>,
     git: Vec<String>,
@@ -372,13 +373,14 @@ const USER_STEERING_MARKER: &str = "[MICHAEL_USER_STEERING]";
 const USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户本次请求**：";
 const LEGACY_USER_REQUEST_MARKER: &str = "📌 **用户这次的请求（请正面、直接回应这一条本身）**：";
 const LEGACY_USER_REQUEST_BOUNDARY_PREFIX: &str = "━━━━━━━━━━━━━━━━━━━━━━━━\n📌 **用户这次的请求（请正面、直接回应这一条本身）**：上面的项目上下文只是背景参考，别被它带跑";
+#[cfg(test)]
 const AUTO_KNOWLEDGE_MIN_QUERY_CHARS: usize = 12;
 const AUTO_KNOWLEDGE_MAX_QUERY_CHARS: usize = 1200;
 const AUTO_KNOWLEDGE_MAX_HITS: usize = 2;
 const AUTO_KNOWLEDGE_MIN_SCORE: f64 = 3.0;
 const DESIGN_KNOWLEDGE_DOMAIN: &str = "michael-design";
 const DESIGN_KNOWLEDGE_SEARCH_POOL: usize = 12;
-const DESIGN_KNOWLEDGE_MAX_HITS: usize = 5;
+const DESIGN_KNOWLEDGE_MAX_HITS: usize = 8;
 const DESIGN_KNOWLEDGE_SECTION_CHARS: usize = 3200;
 const DESIGN_KNOWLEDGE_MIN_SCORE: f64 = 2.0;
 const DESIGN_KNOWLEDGE_FALLBACK_QUERY: &str =
@@ -431,21 +433,23 @@ impl DesignKnowledgeScope {
     fn total_chars(self) -> usize {
         match self {
             Self::Focused => 2_800,
-            Self::Full => 8_000,
+            // 8 条/18K 是被验证过的完整注入口径（品类前3 + 骨干四件套 + 动效/媒体/
+            // 布局/卡片保底）；曾被压缩特性顺手砍到 8K，骨干挤不进=设计输出全面退化。
+            Self::Full => 18_000,
         }
     }
 
     fn primary_chars(self) -> usize {
         match self {
             Self::Focused => 2_200,
-            Self::Full => 4_200,
+            Self::Full => 6_200,
         }
     }
 
     fn secondary_chars(self) -> usize {
         match self {
             Self::Focused => 800,
-            Self::Full => 1_200,
+            Self::Full => 1_800,
         }
     }
 }
@@ -839,6 +843,7 @@ fn user_message_text(message: &serde_json::Value) -> Option<String> {
 /// so a latest-message-only check would drop specialization exactly on the iterative turns that
 /// still need it. Bounded to the last 20 user messages, first 2000 chars each — pure chat history
 /// has no engineering/UI signal, so the bound cannot silently reclassify a casual conversation.
+#[cfg(test)]
 fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> bool {
     body.get("messages")
         .and_then(|messages| messages.as_array())
@@ -863,6 +868,7 @@ fn recent_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> boo
 /// request starts a new routing decision even when the previous task happened to need a large
 /// module such as research. This keeps follow-up turns useful without making task routing sticky
 /// for the rest of the conversation.
+#[cfg(test)]
 fn explicitly_continues_previous_request(q: &str) -> bool {
     let normalized = q
         .trim()
@@ -934,6 +940,7 @@ fn explicitly_continues_previous_request(q: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn current_or_continuation_user_text_any(body: &serde_json::Value, pred: fn(&str) -> bool) -> bool {
     let Some(current) = latest_user_request(body) else {
         return false;
@@ -947,6 +954,7 @@ fn current_or_continuation_user_text_any(body: &serde_json::Value, pred: fn(&str
 /// the request — keyword gates alone let "非关键词建站" slip through and ship unstyled junk.
 /// Only user/assistant messages are scanned (tool results may contain fetched third-party
 /// HTML, which must not count as our own frontend work).
+#[cfg(test)]
 fn frontend_work_signal(text: &str) -> bool {
     let l = text.to_lowercase();
     [
@@ -967,6 +975,7 @@ fn frontend_work_signal(text: &str) -> bool {
     .any(|k| l.contains(k))
 }
 
+#[cfg(test)]
 fn conversation_shows_frontend_work(body: &serde_json::Value) -> bool {
     body.get("messages")
         .and_then(|messages| messages.as_array())
@@ -1080,24 +1089,6 @@ fn extract_real_user_request(text: &str) -> Option<String> {
 /// Prefer the most recent explicitly-marked original request or real-time user steering over
 /// orchestration nudges. Verification and continuation messages also have role=user, so treating
 /// unmarked messages as a new task would make retrieval drift away from the person's request.
-/// 会话内【最早】命中判定的真实用户请求（正向扫描，先剥 📌 包装再判定）——
-/// 用于系统提示内注入块的检索 query：随会话追加逐字节稳定，不打碎前缀缓存。
-fn earliest_user_request_matching(
-    body: &serde_json::Value,
-    pred: fn(&str) -> bool,
-) -> Option<String> {
-    let msgs = body.get("messages")?.as_array()?;
-    msgs.iter()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        .take(40)
-        .filter_map(user_message_text)
-        .filter_map(|text| {
-            extract_marked_user_request(&text).or_else(|| extract_real_user_request(&text))
-        })
-        .map(|t| t.chars().take(2000).collect::<String>())
-        .find(|t| pred(t))
-}
-
 fn latest_user_request(body: &serde_json::Value) -> Option<String> {
     let msgs = body.get("messages")?.as_array()?;
     let mut latest_plain = None;
@@ -1314,6 +1305,7 @@ fn is_context_only_location_statement(query: &str) -> bool {
 /// Keep automatic retrieval limited to concrete engineering work. This intentionally requires
 /// both an action and a code/project object: long casual questions and generic discussion do not
 /// receive an unrelated best-practice dump.
+#[cfg(test)]
 fn looks_like_coding_task(query: &str) -> bool {
     if query.chars().count() < AUTO_KNOWLEDGE_MIN_QUERY_CHARS {
         return false;
@@ -1426,6 +1418,7 @@ fn looks_like_coding_task(query: &str) -> bool {
 
 /// Read-only engineering questions still benefit from one bounded reasoning checkpoint, but they
 /// must not trigger automatic knowledge injection or be reclassified as implementation work.
+#[cfg(test)]
 fn looks_like_engineering_diagnostic(query: &str) -> bool {
     if query.chars().count() < AUTO_KNOWLEDGE_MIN_QUERY_CHARS {
         return false;
@@ -1544,6 +1537,7 @@ fn looks_like_engineering_diagnostic(query: &str) -> bool {
 /// Distinguish an implementation command from advice phrased with an implementation verb, such as
 /// "How should I optimize this component?". An explicit command still receives bounded knowledge
 /// even when it also asks for an explanation of the failure.
+#[cfg(test)]
 fn has_explicit_mutation_directive(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
     let mut normalized = lower.as_str();
@@ -1769,6 +1763,7 @@ fn bounded_chars(text: &str, max_chars: usize) -> String {
 }
 
 /// Build one bounded, model-independent knowledge block for a concrete agent coding task.
+#[cfg(test)]
 fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String> {
     if mode != "agent" {
         return None;
@@ -1777,6 +1772,22 @@ fn auto_knowledge_block(mode: &str, user_request: Option<&str>) -> Option<String
     if !looks_like_coding_task(request)
         || (looks_like_engineering_diagnostic(request) && !has_explicit_mutation_directive(request))
     {
+        return None;
+    }
+    auto_knowledge_block_for_semantic_task(mode, Some(request))
+}
+
+/// Same bounded retrieval, but intent has already been decided by the IDE semantic profile.
+/// The request text is only the retrieval query; it must not be classified again here.
+fn auto_knowledge_block_for_semantic_task(
+    mode: &str,
+    user_request: Option<&str>,
+) -> Option<String> {
+    if mode != "agent" {
+        return None;
+    }
+    let request = user_request?.trim();
+    if request.is_empty() {
         return None;
     }
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
@@ -1947,7 +1958,17 @@ fn design_hits_for_category_query(
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
     let allow_dark = design_request_explicitly_requests_dark(query);
-    // Search the inferred business category first. A user-facing brand name usually has no
+    // 品类已锁定时先用纯品类词检索：用户原话里的"产品/宣传/网站"这类高频词会在 BM25
+    // 里淹没品类信号（实测"爬虫SaaS官网"的主蓝本全是电商/代理公司），纯品类 query
+    // 才能把同品类蓝本（如 sites-saas-ai）顶到主蓝本位。留 2 个坑，后面的混合 query
+    // 再补用户原话里的显式细节。
+    if color_direction.id != "neutral-brand" {
+        push_design_hits_for_query_matching(color_direction.blueprint_query, &mut seen, &mut hits, |hit| {
+            allow_dark || !design_hit_defaults_to_dark(hit)
+        });
+        hits.truncate(2);
+    }
+    // Search the inferred business category next. A user-facing brand name usually has no
     // semantic weight in the corpus, while these terms point at the 400+ real site blueprints.
     let focused_query = format!("{query} {}", color_direction.blueprint_query);
     push_design_hits_for_query_matching(&focused_query, &mut seen, &mut hits, |hit| {
@@ -2386,6 +2407,7 @@ fn design_hit_has_media_reference(hit: &crate::knowledge::SearchHit) -> bool {
 /// frontend stack even though the tool/runtime capabilities themselves remain unchanged. Gates the
 /// design system (shadcn/ui + Tailwind palette + token contract) so only界面/前端/视觉 work pays
 /// for it; combined with a sticky scan of recent user messages so continuation turns keep it.
+#[cfg(test)]
 fn looks_like_ui_task(q: &str) -> bool {
     let l = q.to_lowercase();
     // ASCII terms (matched against the lowercased query)
@@ -2550,6 +2572,7 @@ fn looks_like_ui_task(q: &str) -> bool {
         || ui_quality_complaint
 }
 
+#[cfg(test)]
 fn explicitly_asks_for_research(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -2581,6 +2604,7 @@ fn explicitly_asks_for_research(q: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_research_task(q: &str) -> bool {
     // Product-category nouns describe what a UI is for; they are not automatically a request for
     // current facts. Without this gate, "做一个金融/医疗/餐厅网站" paid the entire research prompt
@@ -2822,6 +2846,7 @@ fn looks_like_research_task(q: &str) -> bool {
         || CJK.iter().any(|term| q.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_desktop_automation_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     const ASCII: &[&str] = &[
@@ -2870,6 +2895,7 @@ fn looks_like_desktop_automation_task(q: &str) -> bool {
     ASCII.iter().any(|term| lower.contains(term)) || CJK.iter().any(|term| q.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_git_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -2895,6 +2921,7 @@ fn looks_like_git_task(q: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_ui_implementation_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -2934,6 +2961,7 @@ fn looks_like_ui_implementation_task(q: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_ui_review_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -2960,6 +2988,7 @@ fn looks_like_ui_review_task(q: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_motion_design_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     [
@@ -2987,6 +3016,7 @@ fn looks_like_motion_design_task(q: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_full_ui_build(q: &str) -> bool {
     let lower = q.to_lowercase();
     looks_like_ui_implementation_task(q)
@@ -3010,6 +3040,7 @@ fn looks_like_full_ui_build(q: &str) -> bool {
         .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_new_ui_scaffold_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     looks_like_full_ui_build(q)
@@ -3028,6 +3059,7 @@ fn looks_like_new_ui_scaffold_task(q: &str) -> bool {
         .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_ui_content_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     looks_like_full_ui_build(q)
@@ -3055,6 +3087,7 @@ fn looks_like_ui_content_task(q: &str) -> bool {
         .any(|term| lower.contains(term))
 }
 
+#[cfg(test)]
 fn looks_like_ui_data_task(q: &str) -> bool {
     let lower = q.to_lowercase();
     looks_like_full_ui_build(q)
@@ -3091,6 +3124,72 @@ fn looks_like_ui_data_task(q: &str) -> bool {
         .any(|term| lower.contains(term))
 }
 
+const IDE_SEMANTIC_PROFILE_FLAGS: &[&str] = &[
+    "engineering",
+    "research",
+    "official",
+    "community",
+    "automation",
+    "git",
+    "collaboration",
+    "collaboration_staged",
+    "collaboration_parallel",
+    "design",
+    "design_implementation",
+    "design_scaffold",
+    "design_content",
+    "design_data",
+    "design_review",
+    "design_motion",
+    "design_verification",
+    "design_knowledge_full",
+    "existing_project",
+    "existing_website",
+];
+
+/// Parse the short, model-decided routing protocol sent by the new IDE. Missing/invalid profiles
+/// deliberately produce no specialization: production routing never falls back to prose keyword
+/// scans, so the client and gateway cannot disagree about the same turn.
+/// IDE 上报的用户网络出口地区（ISO 3166-1 alpha-2 小写；客户端由真实 IP 出口定位、
+/// 时区兜底、24h 缓存）。只用于安装源指引注入，非法值一律当不存在。
+fn ide_region(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("x-ide-region")?.to_str().ok()?.trim();
+    if !(2..=8).contains(&raw.len()) || !raw.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// 中国大陆网络环境的安装源指引：优先地区镜像提速，没有对应镜像或镜像失败/缺版本时
+/// 回退官方默认源。只影响下载来源，绝不改依赖版本与锁文件语义。
+const REGION_MIRROR_BLOCK_CN: &str = "【安装源·按用户网络地区】用户当前网络出口在中国大陆：安装/下载依赖与工具时优先用国内镜像提速——npm/pnpm/yarn 用 npmmirror（--registry=https://registry.npmmirror.com，或临时环境变量，别持久改用户全局配置）；pip 用清华 TUNA（-i https://pypi.tuna.tsinghua.edu.cn/simple）；cargo 可用 RsProxy；Go 用 GOPROXY=https://goproxy.cn,direct；大文件/模型/安装脚本同理优先国内可达源。该包管理器没有可靠镜像、镜像失败或缺目标版本时，直接回退官方默认源，不反复重试镜像。只改下载来源，不改依赖版本、锁文件和项目配置文件；用户明确指定过源时以用户为准。";
+
+fn ide_semantic_profile(headers: &HeaderMap) -> Option<HashSet<String>> {
+    let raw = headers
+        .get("x-ide-semantic-profile")?
+        .to_str()
+        .ok()?
+        .trim();
+    if !raw.starts_with("2.5:")
+        || raw.len() > 1024
+        || !raw.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b':' | b',' | b'_')
+        })
+    {
+        return None;
+    }
+    let allowed = IDE_SEMANTIC_PROFILE_FLAGS.iter().copied().collect::<HashSet<_>>();
+    Some(
+        raw[4..]
+            .split(',')
+            .filter(|flag| allowed.contains(*flag))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Server-side assembly (L0 — "airtight"): if the IDE asks for it via headers, inject the
 /// system prompt + the requested tool schemas HERE, just before forwarding upstream — so the
 /// client never ships the prompts or the tool definitions (the real anti-reverse-engineering
@@ -3109,6 +3208,8 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     if !body.is_object() {
         return Ok(());
     }
+    let semantic_profile = ide_semantic_profile(headers).unwrap_or_default();
+    let semantic = |flag: &str| semantic_profile.contains(flag);
     let requested_tool_count = hdr("x-ide-tools")
         .map(|names| {
             names
@@ -3186,23 +3287,20 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         append_prompt_modules(modules, &mut sys, &mut prompt_blocks)?;
     }
 
-    // A substantive new request is classified on its own. Only an explicit continuation such as
-    // "继续" inherits specialization from the bounded history; otherwise an old research/UI/Git
-    // task would keep taxing and steering every later request in the same conversation.
-    let engineering_intent = mode == "agent"
-        && (current_or_continuation_user_text_any(body, looks_like_coding_task)
-            || current_or_continuation_user_text_any(body, looks_like_engineering_diagnostic)
-            || conversation_shows_frontend_work(body));
-    let research_intent =
-        mode == "agent" && current_or_continuation_user_text_any(body, looks_like_research_task);
-    let automation_intent = mode == "agent"
-        && current_or_continuation_user_text_any(body, looks_like_desktop_automation_task);
-    let git_intent =
-        mode == "agent" && current_or_continuation_user_text_any(body, looks_like_git_task);
+    // The IDE has already resolved intent from conversation + workspace evidence. User text below
+    // is reserved for retrieval queries and never reclassified into Prompt Graph modules.
+    let engineering_intent = mode == "agent" && semantic("engineering");
+    let collaboration_intent = mode == "agent" && semantic("collaboration");
+    let research_intent = mode == "agent" && semantic("research");
+    let automation_intent = mode == "agent" && semantic("automation");
+    let git_intent = mode == "agent" && semantic("git");
 
     if mode == "agent" {
         if engineering_intent {
             append_prompt_modules(&graph.agent.engineering, &mut sys, &mut prompt_blocks)?;
+        }
+        if collaboration_intent {
+            append_prompt_modules(&graph.agent.collaboration, &mut sys, &mut prompt_blocks)?;
         }
         if research_intent {
             append_prompt_modules(&graph.agent.research, &mut sys, &mut prompt_blocks)?;
@@ -3219,44 +3317,18 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // UI 设计体系（shadcn/ui + Tailwind 调色板 + 令牌契约）是重块，只在这轮真的在做界面/
     // 前端/视觉时注入。此前它对 agent/plan 无条件常驻，导致修 Rust 后端、跑命令、改算法的
     // 任务也被整套前端设计宪法污染，既跑偏又白烧上下文，还让非 UI 请求的系统前缀不稳定。
-    // 判定用 looks_like_ui_task，并做会话粘性扫描（续跑轮"继续"不含关键词也不丢）。
-    // x-ide-ui 头或 MICHAEL_UI_GUIDE=always 仍可强制开启；MICHAEL_UI_GUIDE=0 是运维总开关。
-    let explicit_design_work = mode == "plan"
-        || conversation_shows_frontend_work(body)
-        || current_or_continuation_user_text_any(body, looks_like_ui_implementation_task)
-        || current_or_continuation_user_text_any(body, looks_like_ui_review_task)
-        || current_or_continuation_user_text_any(body, looks_like_motion_design_task);
+    // The semantic design flag works for greenfield and existing sites. `always`/`0` remain
+    // operational overrides; there is no legacy prose or x-ide-ui classification path.
     let ui_intent = ui_env.as_deref() != Some("0")
-        && (hdr("x-ide-ui").is_some()
-            || ui_env.as_deref() == Some("always")
-            || ((mode == "agent" || mode == "plan")
-                && (user_request.as_deref().is_some_and(looks_like_ui_task)
-                    || current_or_continuation_user_text_any(body, looks_like_ui_task)
-                    // 行为信号：对话已经在写前端文件 = UI 任务，不管用户怎么措辞。
-                    // 一旦触发即对本会话粘性生效，非关键词建站不再漏注设计体系。
-                    || conversation_shows_frontend_work(body))
-                // "打开网站登录/填表"是自动化，不是让模型设计网站。以前只因含“网站”二字
-                // 就注入 30KB+ 设计上下文，是生产日志里最大的可避免误路由。
-                && (!automation_intent || explicit_design_work)));
+        && (ui_env.as_deref() == Some("always")
+            || ((mode == "agent" || mode == "plan") && semantic("design")));
     if ui_intent {
-        let frontend_work = conversation_shows_frontend_work(body);
-        let design_review_intent =
-            current_or_continuation_user_text_any(body, looks_like_ui_review_task);
-        let design_implementation_intent = mode == "plan"
-            || frontend_work
-            || current_or_continuation_user_text_any(body, looks_like_ui_implementation_task)
-            || !design_review_intent;
-        let design_full_build_intent =
-            current_or_continuation_user_text_any(body, looks_like_full_ui_build);
-        let design_scaffold_intent =
-            current_or_continuation_user_text_any(body, looks_like_new_ui_scaffold_task);
-        let design_content_intent =
-            current_or_continuation_user_text_any(body, looks_like_ui_content_task);
-        let design_data_intent =
-            current_or_continuation_user_text_any(body, looks_like_ui_data_task);
-        let design_motion_intent =
-            current_or_continuation_user_text_any(body, looks_like_motion_design_task)
-                || design_full_build_intent;
+        let design_review_intent = semantic("design_review");
+        let design_implementation_intent = semantic("design_implementation");
+        let design_scaffold_intent = semantic("design_scaffold");
+        let design_content_intent = semantic("design_content");
+        let design_data_intent = semantic("design_data");
+        let design_motion_intent = semantic("design_motion");
 
         append_prompt_modules(&graph.design.base, &mut sys, &mut prompt_blocks)?;
         if design_implementation_intent {
@@ -3277,7 +3349,7 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         if design_motion_intent {
             append_prompt_modules(&graph.design.motion, &mut sys, &mut prompt_blocks)?;
         }
-        if design_implementation_intent {
+        if semantic("design_verification") {
             append_prompt_modules(&graph.design.verification, &mut sys, &mut prompt_blocks)?;
         }
         // UI work gets a compact michael-design entry point. The full library remains available
@@ -3287,11 +3359,9 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
             // 前缀缓存纪律：蓝图块在系统提示里，query 必须会话内粘性稳定——取【最早】
             // 命中 UI 意图的用户消息（没有就取最早的非空用户消息），而不是最新一条。
             // 之前取最新请求：用户每说一句话命中就变、系统提示就变，整条会话缓存全废。
-            let design_query = earliest_user_request_matching(body, looks_like_ui_task)
-                .or_else(|| earliest_user_request_matching(body, |t| !t.trim().is_empty()))
-                .or_else(|| user_request.clone().filter(|q| !q.trim().is_empty()))
+            let design_query = user_request.clone().filter(|q| !q.trim().is_empty())
                 .or_else(|| Some(DESIGN_KNOWLEDGE_FALLBACK_QUERY.to_string()));
-            let knowledge_scope = if design_full_build_intent {
+            let knowledge_scope = if semantic("design_knowledge_full") {
                 DesignKnowledgeScope::Full
             } else {
                 DesignKnowledgeScope::Focused
@@ -3331,18 +3401,26 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         // 用户消息作为检索 query（有界扫描，最多 20 条、每条前 2000 字符）。
         // 前缀缓存纪律：这个块在系统提示里，query 取【最早】命中工程信号的真实用户请求
         // （正向扫描 + 剥 📌 包装），会话内逐字节稳定；取最新一条会让每句追问打碎整条缓存。
-        let knowledge_query = earliest_user_request_matching(body, looks_like_coding_task)
-            .or_else(|| user_request.clone().filter(|q| looks_like_coding_task(q)));
-        if let Some(block) = auto_knowledge_block(mode, knowledge_query.as_deref()) {
-            sys.push_str("\n\n");
-            sys.push_str(&block);
-            prompt_blocks.push("auto_knowledge".to_string());
-            tracing::info!(mode, "auto-injecting bounded engineering knowledge");
+        let knowledge_query = user_request.clone().filter(|query| !query.trim().is_empty());
+        if engineering_intent && research_intent {
+            if let Some(block) =
+                auto_knowledge_block_for_semantic_task(mode, knowledge_query.as_deref())
+            {
+                sys.push_str("\n\n");
+                sys.push_str(&block);
+                prompt_blocks.push("auto_knowledge".to_string());
+                tracing::info!(mode, "auto-injecting bounded engineering knowledge");
+            }
         }
     }
     // Runtime date and adaptive coaching change independently of the Prompt Graph. Put them in
     // the latest user turn so the system prefix remains byte-stable and cacheable.
     let mut runtime_context = vec![user_local_time_block_at(headers, chrono::Utc::now())];
+    // 安装源指引只在 agent 模式注入（chat/explorer 不装包）；地区 24h 恒定，随日期块走
+    // 最新 user 消息通道，不碰系统前缀缓存。
+    if mode == "agent" && ide_region(headers).as_deref() == Some("cn") {
+        runtime_context.push(REGION_MIRROR_BLOCK_CN.to_string());
+    }
     if let Some(growth) = growth_context {
         runtime_context.push(growth);
     }
@@ -3456,6 +3534,7 @@ const PROMPT_NAMES: &[&str] = &[
     "agent_core",
     "reasoning",
     "agent_engineering",
+    "agent_collaboration",
     "agent_research",
     "agent_automation",
     "truthfulness",
@@ -3545,7 +3624,94 @@ mod tests {
     use super::*;
 
     fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) {
-        super::assemble_into(headers, body).expect("prompt graph assembly should succeed");
+        let mut routed = headers.clone();
+        // Legacy unit fixtures predate the 2.5 wire protocol. Give those fixtures the same
+        // decisions their old assertions describe without putting a prose fallback back into
+        // production. New semantic-routing tests set the header explicitly.
+        if routed.get("x-ide-semantic-profile").is_none()
+            && routed.get("x-ide-mode").is_some()
+        {
+            let mode = routed
+                .get("x-ide-mode")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let engineering = mode == "agent"
+                && (current_or_continuation_user_text_any(body, looks_like_coding_task)
+                    || current_or_continuation_user_text_any(
+                        body,
+                        looks_like_engineering_diagnostic,
+                    )
+                    || conversation_shows_frontend_work(body));
+            let research = mode == "agent"
+                && current_or_continuation_user_text_any(body, looks_like_research_task);
+            let automation = mode == "agent"
+                && current_or_continuation_user_text_any(
+                    body,
+                    looks_like_desktop_automation_task,
+                );
+            let git = mode == "agent"
+                && current_or_continuation_user_text_any(body, looks_like_git_task);
+            let explicit_design = mode == "plan"
+                || current_or_continuation_user_text_any(
+                    body,
+                    looks_like_ui_implementation_task,
+                )
+                || current_or_continuation_user_text_any(body, looks_like_ui_review_task)
+                || current_or_continuation_user_text_any(body, looks_like_motion_design_task);
+            let design = (mode == "agent" || mode == "plan")
+                && (routed.get("x-ide-ui").is_some()
+                    || ((current_or_continuation_user_text_any(body, looks_like_ui_task)
+                        || conversation_shows_frontend_work(body))
+                        && (!automation || explicit_design)));
+            let mut flags: Vec<String> = Vec::new();
+            let mut add = |flag: &str, enabled: bool| {
+                if enabled {
+                    flags.push(flag.to_string());
+                }
+            };
+            add("engineering", engineering);
+            add("research", research);
+            add("official", research);
+            add("community", research);
+            add("automation", automation);
+            add("git", git);
+            add("design", design);
+            if design {
+                let review = current_or_continuation_user_text_any(body, looks_like_ui_review_task);
+                let implementation = mode == "plan"
+                    || conversation_shows_frontend_work(body)
+                    || current_or_continuation_user_text_any(
+                        body,
+                        looks_like_ui_implementation_task,
+                    )
+                    || !review;
+                let full = current_or_continuation_user_text_any(body, looks_like_full_ui_build);
+                add("design_implementation", implementation);
+                add("design_review", review);
+                add(
+                    "design_scaffold",
+                    current_or_continuation_user_text_any(body, looks_like_new_ui_scaffold_task),
+                );
+                add(
+                    "design_content",
+                    current_or_continuation_user_text_any(body, looks_like_ui_content_task),
+                );
+                add(
+                    "design_data",
+                    current_or_continuation_user_text_any(body, looks_like_ui_data_task),
+                );
+                add(
+                    "design_motion",
+                    current_or_continuation_user_text_any(body, looks_like_motion_design_task)
+                        || full,
+                );
+                add("design_verification", implementation);
+                add("design_knowledge_full", full);
+            }
+            let profile = format!("2.5:{}", flags.join(","));
+            routed.insert("x-ide-semantic-profile", profile.parse().unwrap());
+        }
+        super::assemble_into(&routed, body).expect("prompt graph assembly should succeed");
     }
 
     fn test_tool(name: &str, description: &str) -> serde_json::Value {
@@ -3572,6 +3738,7 @@ mod tests {
         for name in [
             "agent_core",
             "agent_engineering",
+            "agent_collaboration",
             "agent_research",
             "agent_automation",
             "truthfulness",
@@ -3612,6 +3779,7 @@ mod tests {
         let mut groups = vec![
             &graph.agent.base,
             &graph.agent.engineering,
+            &graph.agent.collaboration,
             &graph.agent.research,
             &graph.agent.automation,
             &graph.agent.git,
@@ -4664,6 +4832,7 @@ mod tests {
             vec!["agent_core", "reasoning", "truthfulness", "answer_quality"]
         );
         assert_eq!(graph.agent.engineering, vec!["agent_engineering"]);
+        assert_eq!(graph.agent.collaboration, vec!["agent_collaboration"]);
         assert_eq!(graph.agent.research, vec!["agent_research"]);
         assert_eq!(graph.agent.automation, vec!["agent_automation"]);
         assert_eq!(graph.agent.git, vec!["git_guide"]);
@@ -4894,6 +5063,42 @@ mod tests {
         assemble_into(&headers, &mut body);
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
+    }
+
+    #[test]
+    fn semantic_profile_is_the_only_production_specialization_router() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-mode", "agent".parse().unwrap());
+        let mut without_profile = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "创建网站并研究数据库架构"}]
+        });
+        super::assemble_into(&headers, &mut without_profile).unwrap();
+        let base_only = without_profile["messages"][0]["content"].as_str().unwrap();
+        assert!(!base_only.contains("# michael-design 核心"));
+        assert!(!base_only.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(!base_only.contains("# 按任务加载：多角色协作"));
+
+        headers.insert(
+            "x-ide-semantic-profile",
+            "2.5:engineering,collaboration,collaboration_staged,research,official,community,design,design_implementation,design_data,design_verification,existing_project,existing_website"
+                .parse()
+                .unwrap(),
+        );
+        let mut routed = serde_json::json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "就按我刚才说的处理"}]
+        });
+        super::assemble_into(&headers, &mut routed).unwrap();
+        let system = routed["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("# 按任务加载：工程实现"));
+        assert!(system.contains("# 按任务加载：多角色协作"));
+        assert!(system.contains("# 按任务加载：研究、社区与当前事实"));
+        assert!(system.contains("# michael-design 核心"));
+        assert!(system.contains("# michael-design 实现入口"));
+        assert!(system.contains("# michael-design 数据与业务状态层"));
+        assert!(system.contains("# michael-design 验证层"));
+        assert!(!system.contains("# michael-design 脚手架层"));
     }
 
     #[test]
@@ -5223,6 +5428,10 @@ mod tests {
         for model in ["gpt-5-mini", "gpt-5.5", "provider/new-coder-2027"] {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert("x-ide-mode", "agent".parse().unwrap());
+            headers.insert(
+                "x-ide-semantic-profile",
+                "2.5:engineering,research,community".parse().unwrap(),
+            );
             let mut body = serde_json::json!({
                 "model": model,
                 "messages": [{"role": "user", "content": wrapped}]
@@ -5263,6 +5472,10 @@ mod tests {
             wrapped_user_request("--- 项目上下文 ---\nREADME 里的动态内容。", real_request);
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-semantic-profile",
+            "2.5:engineering,research,community".parse().unwrap(),
+        );
         headers.insert("x-ide-growth", "summarize concisely".parse().unwrap());
         let mut body = serde_json::json!({
             "model": "gpt-5.5",
@@ -5424,6 +5637,7 @@ mod tests {
     fn reasoning_discipline_is_unconditional_in_agent_mode() {
         let mut agent_headers = HeaderMap::new();
         agent_headers.insert("x-ide-mode", "agent".parse().unwrap());
+        agent_headers.insert("x-ide-semantic-profile", "2.5:".parse().unwrap());
 
         // 工程请求、诊断请求、以及**完全不含工程关键词**的闲聊，都必须有。
         for content in [
@@ -5441,7 +5655,7 @@ mod tests {
             let system = body["messages"][0]["content"].as_str().unwrap();
             assert!(system.contains("# 推理纪律"), "缺推理纪律: {content}");
             // 关键内容：可证伪、版本记忆会过期、报错先看字面。
-            assert!(system.contains("证明自己错了"), "{content}");
+            assert!(system.contains("证明当前理解或根因假设是错的"), "{content}");
             // 可证伪是这一块的核心，也是它唯一不与其它块重复的内容。
             // 「版本记忆会过期」「报错先看字面」按审查建议归并到了 agent_engineering
             // （那边有 lock 文件、本地类型定义这些可执行细节），此处不再重复断言。
@@ -5490,6 +5704,10 @@ mod tests {
     fn read_only_engineering_advice_and_review_reason_without_auto_knowledge() {
         let mut headers = HeaderMap::new();
         headers.insert("x-ide-mode", "agent".parse().unwrap());
+        headers.insert(
+            "x-ide-semantic-profile",
+            "2.5:engineering".parse().unwrap(),
+        );
 
         for request in [
             "这个 Rust 架构怎么优化？",
@@ -5665,6 +5883,44 @@ mod tests {
         assert!(design_request_explicitly_requests_dark(
             "把官网做成暗色主题"
         ));
+    }
+
+    #[test]
+    fn region_mirror_guidance_targets_cn_agent_requests_only() {
+        let assemble = |mode: &str, region: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", mode.parse().unwrap());
+            if let Some(region) = region {
+                headers.insert("x-ide-region", region.parse().unwrap());
+            }
+            let mut body = serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "帮我初始化一个 React 项目并安装依赖"}]
+            });
+            assemble_into(&headers, &mut body);
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "user")
+                .next_back()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // 中国大陆 + agent → 注入镜像指引（含官方源回退与"不改锁文件"约束）。
+        let cn = assemble("agent", Some("cn"));
+        assert!(cn.contains("安装源·按用户网络地区"));
+        assert!(cn.contains("registry.npmmirror.com"));
+        assert!(cn.contains("回退官方默认源"));
+        // 其他地区 / 未上报 / 非法值 / 非 agent 模式 → 一个字都不注入。
+        assert!(!assemble("agent", Some("us")).contains("安装源"));
+        assert!(!assemble("agent", None).contains("安装源"));
+        assert!(!assemble("agent", Some("CN")).contains("安装源"), "非小写地区码必须按缺失处理");
+        assert!(!assemble("chat", Some("cn")).contains("安装源"));
+        // 注入走最新 user 消息通道，系统前缀保持字节稳定（前缀缓存纪律）。
+        assert!(!read_prompt("agent_core").unwrap().contains("安装源·按用户网络地区"));
     }
 
     #[test]
@@ -5952,7 +6208,7 @@ mod tests {
             "a product category inside a UI build must not load the research module"
         );
         assert!(
-            build_system.len() < 38_000,
+            build_system.len() < 56_000,
             "full UI prompt should remain bounded: {} bytes",
             build_system.len()
         );

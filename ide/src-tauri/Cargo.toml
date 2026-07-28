@@ -1,14 +1,14 @@
 [package]
-name = "devin-ide"
+name = "michael-ide"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Michael IDE: a macOS-style code editor with an AI assistant sidebar."
-default-run = "devin-ide"
+default-run = "michael-ide"
 
 [lib]
-name = "devin_ide_lib"
+name = "michael_ide_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

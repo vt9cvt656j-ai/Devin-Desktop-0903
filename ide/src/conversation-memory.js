@@ -16,6 +16,9 @@ const MAX_ARCHIVE = 400;          // archived (compacted-away) turns kept for re
 const ARCHIVE_ENTRY_MAX = 1600;   // chars per archived turn
 const MAX_MILESTONES = 60;
 const MERGED_SUMMARY_MAX = 8000;  // merged summary text cap (head+tail keep)
+const MAX_CORRECTIONS = 160;
+const CORRECTION_TEXT_MAX = 420;
+const CORRECTION_PREFIX_MAX = 8;
 
 // Tokenizer for archival search: latin words + CJK bigrams (MemGPT-style
 // archival memory needs retrieval that works for Chinese without a segmenter).
@@ -28,6 +31,40 @@ function memSearchTokens(s) {
     for (let i = 0; i < run.length - 1; i++) out.add(run.slice(i, i + 2));
   }
   return [...out].slice(0, 64);
+}
+
+function cleanCorrectionText(value, max = CORRECTION_TEXT_MAX) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/**
+ * Extract only high-confidence, explicit replacements. General complaints such
+ * as "still slow" deliberately do not create a factual correction.
+ */
+export function extractExplicitCorrection(value) {
+  const text = cleanCorrectionText(value, 1200);
+  if (text.length < 4) return null;
+  const patterns = [
+    /(?:不是|并非)\s*([^，,。；;]{1,180})\s*(?:，|,|；|;)\s*(?:而是|是|应该是|应为|正确的是|改成)\s*([^。；;]{1,260})/i,
+    /(?:不是|并非)\s*([^，。；;]{1,180})\s*(?:，|,|；|;)?\s*(?:而是|应该是|应为|正确的是|改成)\s*([^。；;]{1,260})/i,
+    /(?:不要|别用|不该用)\s*([^，。；;]{1,180})\s*(?:，|,|；|;)\s*(?:要用|改用|请用|应该用|用)\s*([^。；;]{1,260})/i,
+    /([^，。；;]{2,180})\s*(?:不对|错了|是错的)\s*(?:，|,|；|;)?\s*(?:正确的是|应该是|应为|改成)\s*([^。；;]{1,260})/i,
+    /\bnot\s+(.{1,180}?),\s*(?:but|use|it is|should be)\s+(.{1,260})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const incorrect = cleanCorrectionText(match[1], 240);
+    const corrected = cleanCorrectionText(match[2], 360);
+    if (incorrect.length >= 2 && corrected.length >= 2 && incorrect.toLowerCase() !== corrected.toLowerCase()) {
+      return { incorrect, corrected, explicitReplacement: true };
+    }
+  }
+  const general = /^(?:不对|错了|你搞错了|你理解错了|不是这样|我的意思是|纠正一下|更正一下|no[,，:]?|that's wrong[,，:]?)\s*/i;
+  if (!general.test(text)) return null;
+  const corrected = cleanCorrectionText(text.replace(general, ''), 500);
+  if (corrected.length < 4) return null;
+  return { incorrect: '', corrected, explicitReplacement: false };
 }
 
 function serializeLocationEvidence(evidence) {
@@ -140,7 +177,68 @@ function serializeAttachment(attachment, budget) {
   return out;
 }
 
-export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTED_MEDIA_BUDGET) {
+const LOCAL_TEXT_TRUNCATION_MARKER = '\n...[local recovery mirror truncated; full history remains on disk]...\n';
+
+function serializeTextWithBudget(value, textBudget) {
+  if (typeof value !== 'string' || !textBudget || typeof textBudget !== 'object') return value;
+  textBudget.remaining = Math.max(0, Number(textBudget.remaining) || 0);
+  const perValue = Math.max(0, Number(textBudget.perValue) || textBudget.remaining);
+  const keep = Math.min(value.length, textBudget.remaining, perValue);
+  if (value.length <= keep) {
+    textBudget.remaining -= value.length;
+    return value;
+  }
+  if (keep <= 0) return '';
+  let result;
+  if (keep <= LOCAL_TEXT_TRUNCATION_MARKER.length + 32) {
+    result = value.slice(-keep);
+  } else {
+    const available = keep - LOCAL_TEXT_TRUNCATION_MARKER.length;
+    const head = Math.ceil(available * 0.55);
+    result = value.slice(0, head) + LOCAL_TEXT_TRUNCATION_MARKER + value.slice(-(available - head));
+  }
+  textBudget.remaining -= result.length;
+  return result;
+}
+
+function serializeMessageText(message, textBudget) {
+  if (!message || typeof message !== 'object' || !textBudget) return message;
+  if (typeof message.content === 'string') {
+    message.content = serializeTextWithBudget(message.content, textBudget);
+  } else if (Array.isArray(message.content)) {
+    const content = new Array(message.content.length);
+    for (let index = message.content.length - 1; index >= 0; index--) {
+      const raw = message.content[index];
+      if (!raw || typeof raw !== 'object') { content[index] = raw; continue; }
+      const part = { ...raw };
+      if (typeof part.text === 'string') part.text = serializeTextWithBudget(part.text, textBudget);
+      if (part.image_url && typeof part.image_url === 'object' && typeof part.image_url.url === 'string') {
+        part.image_url = { ...part.image_url, url: serializeTextWithBudget(part.image_url.url, textBudget) };
+      }
+      content[index] = part;
+    }
+    message.content = content;
+  }
+  if (Array.isArray(message.tool_calls)) {
+    const calls = new Array(message.tool_calls.length);
+    for (let index = message.tool_calls.length - 1; index >= 0; index--) {
+      const raw = message.tool_calls[index];
+      if (!raw || typeof raw !== 'object') { calls[index] = raw; continue; }
+      const call = { ...raw };
+      if (call.function && typeof call.function === 'object') {
+        call.function = { ...call.function };
+        if (typeof call.function.arguments === 'string') {
+          call.function.arguments = serializeTextWithBudget(call.function.arguments, textBudget);
+        }
+      }
+      calls[index] = call;
+    }
+    message.tool_calls = calls;
+  }
+  return message;
+}
+
+export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTED_MEDIA_BUDGET, options = {}) {
   const list = Array.isArray(messages) ? messages : [];
   // Callers serializing several queues or sessions may pass one shared budget
   // object so the aggregate media payload stays bounded.
@@ -151,7 +249,8 @@ export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTE
   const out = new Array(list.length);
   // Spend the bounded media budget on the newest turns first.
   for (let i = list.length - 1; i >= 0; i--) {
-    const message = list[i] && typeof list[i] === 'object' ? { ...list[i] } : list[i];
+    let message = list[i] && typeof list[i] === 'object' ? { ...list[i] } : list[i];
+    message = serializeMessageText(message, options?.textBudget);
     if (message && Array.isArray(message.attachments)) {
       message.attachments = message.attachments
         .map((attachment) => serializeAttachment(attachment, budget))
@@ -173,7 +272,16 @@ export class ConversationMemory {
     // text-only record here, searchable via searchArchive() / the recall tool,
     // so compression no longer means permanent loss of early details.
     this.archive = [];
+    // Append-only overlay. Raw conversation/archive entries remain untouched;
+    // newer correction records supersede older beliefs during retrieval.
+    this.corrections = [];
     this._onMessagesRemoved = null;
+    this._externalCompression = false;
+    this._recentChars = 0;
+  }
+
+  setExternalCompression(enabled) {
+    this._externalCompression = !!enabled;
   }
 
   setRemovalHandler(handler) {
@@ -188,12 +296,13 @@ export class ConversationMemory {
   push(msg) {
     this.totalTurns++;
     this.recent.push(msg);
+    this._recentChars += ConversationMemory._messageChars(msg);
     // Adaptive compression: by count (long chats of short turns) OR by token
     // pressure (few turns but huge tool outputs). Threshold sits ABOVE the LLM
     // auto-compact trigger (~28k in main.js) so the smart compactor gets first
     // shot; this is the mechanical safety net.
-    if (this.recent.length > RECENT_WINDOW
-        || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000)) {
+    if (!this._externalCompression && (this.recent.length > RECENT_WINDOW
+        || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000))) {
       this._compressOldestBatch();
     }
   }
@@ -221,13 +330,121 @@ export class ConversationMemory {
     if (this.archive.length > MAX_ARCHIVE) this.archive.splice(0, this.archive.length - MAX_ARCHIVE);
   }
 
+  _activeCorrections(query = '', k = CORRECTION_PREFIX_MAX) {
+    if (!this.corrections.length) return [];
+    const superseded = new Set(this.corrections.map((item) => item?.supersedes).filter(Boolean));
+    const active = this.corrections.filter((item) => item && item.id && !superseded.has(item.id));
+    const q = cleanCorrectionText(query, 800).toLowerCase();
+    const terms = memSearchTokens(q);
+    const scored = active.map((item, index) => {
+      const haystack = `${item.incorrect || ''} ${item.corrected || ''} ${(item.topicTerms || []).join(' ')}`.toLowerCase();
+      let score = q && haystack.includes(q) ? Math.max(12, q.length * 3) : 0;
+      for (const term of terms) if (haystack.includes(term)) score += Math.max(1, term.length);
+      return { item, index, score };
+    });
+    const selected = q ? scored.filter((row) => row.score > 0) : scored;
+    selected.sort((a, b) => b.score - a.score || b.item.createdAt - a.item.createdAt || b.index - a.index);
+    return selected.slice(0, Math.max(1, Math.min(20, Number(k) || CORRECTION_PREFIX_MAX))).map((row) => ({ ...row.item }));
+  }
+
+  activeCorrections(query = '', k = CORRECTION_PREFIX_MAX) {
+    return this._activeCorrections(query, k);
+  }
+
+  recordCorrection(input = {}) {
+    const incorrect = cleanCorrectionText(input.incorrect);
+    const corrected = cleanCorrectionText(input.corrected);
+    if (corrected.length < 2 || (incorrect && incorrect.toLowerCase() === corrected.toLowerCase())) return null;
+    const requestedSupersedes = cleanCorrectionText(input.supersedes, 160);
+    const priorRecord = requestedSupersedes
+      ? this.corrections.find((item) => item?.id === requestedSupersedes)
+      : null;
+    const aliases = [...new Set([
+      ...(Array.isArray(input.aliases) ? input.aliases : []),
+      ...(Array.isArray(priorRecord?.aliases) ? priorRecord.aliases : []),
+      priorRecord?.incorrect,
+    ].map((value) => cleanCorrectionText(value, 240)).filter(Boolean))].slice(0, 12);
+    const topicTerms = memSearchTokens(`${aliases.join(' ')} ${incorrect} ${corrected}`).slice(0, 32);
+    const active = this._activeCorrections(`${incorrect} ${corrected}`, 8);
+    const duplicate = active.find((item) => item.corrected.toLowerCase() === corrected.toLowerCase()
+      && (!incorrect || item.incorrect.toLowerCase() === incorrect.toLowerCase()));
+    if (duplicate) return duplicate;
+    let supersedes = requestedSupersedes;
+    if (!supersedes && active.length) {
+      const candidate = active.find((item) => {
+        const priorValue = cleanCorrectionText(item.corrected, 420).toLowerCase();
+        const nextOldValue = incorrect.toLowerCase();
+        return priorValue.length >= 2 && nextOldValue.length >= 2
+          && (priorValue.includes(nextOldValue) || nextOldValue.includes(priorValue));
+      });
+      if (candidate) supersedes = candidate.id;
+    }
+    const sourceTurns = [...new Set((Array.isArray(input.sourceTurns) ? input.sourceTurns : [])
+      .map((turn) => Math.max(0, Math.trunc(Number(turn) || 0))).filter(Boolean))].slice(0, 8);
+    const record = {
+      id: `cor_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      createdAt: Math.max(1, Number(input.createdAt) || Date.now()),
+      kind: ['user', 'reflection', 'memory'].includes(input.kind) ? input.kind : 'memory',
+      incorrect,
+      corrected,
+      aliases,
+      topicTerms,
+      sourceTurns,
+      confidence: Math.max(0, Math.min(1, Number(input.confidence) || 0.8)),
+      supersedes: supersedes || '',
+    };
+    this.corrections.push(record);
+    if (this.corrections.length > MAX_CORRECTIONS) this.corrections.splice(0, this.corrections.length - MAX_CORRECTIONS);
+    return { ...record };
+  }
+
+  recordUserCorrection(value) {
+    const parsed = extractExplicitCorrection(value);
+    if (!parsed) return null;
+    let previousAssistant = null;
+    let previousTurn = 0;
+    for (let index = this.recent.length - 1; index >= 0; index--) {
+      const message = this.recent[index];
+      if (message?.role !== 'assistant' || typeof message.content !== 'string' || !message.content.trim()) continue;
+      previousAssistant = message.content;
+      previousTurn = Math.max(1, this.totalTurns - (this.recent.length - 1 - index));
+      break;
+    }
+    let incorrect = parsed.incorrect;
+    if (!incorrect && previousAssistant) incorrect = cleanCorrectionText(previousAssistant, 420);
+    if (!incorrect) return null;
+    return this.recordCorrection({
+      kind: 'user',
+      incorrect,
+      corrected: parsed.corrected,
+      sourceTurns: [previousTurn, this.totalTurns + 1],
+      confidence: parsed.explicitReplacement ? 1 : 0.92,
+    });
+  }
+
+  _correctionForArchiveText(text) {
+    const value = cleanCorrectionText(text, ARCHIVE_ENTRY_MAX).toLowerCase();
+    if (!value) return null;
+    return this._activeCorrections('', 20).find((item) => {
+      return [item.incorrect, ...(item.aliases || [])].some((entry) => String(entry || '').length >= 2
+        && value.includes(String(entry).toLowerCase()));
+    }) || null;
+  }
+
   /** Keyword search over archived (compacted-away) turns. Returns newest-biased
    *  best matches: [{turn, role, text}]. */
   searchArchive(query, k = 6) {
     const q = String(query || '').trim().toLowerCase();
-    if (!q || !this.archive.length) return [];
+    if (!q) return [];
     const terms = memSearchTokens(q);
     if (!terms.length) return [];
+    const limit = Math.max(1, Math.min(20, Number(k) || 6));
+    const correctionHits = this._activeCorrections(q, limit).map((item) => ({
+      turn: item.sourceTurns?.[item.sourceTurns.length - 1] || 0,
+      role: 'system',
+      text: `[纠错记忆·当前有效] ${item.incorrect ? `旧说法「${item.incorrect}」已作废；` : ''}应以「${item.corrected}」为准。`,
+      correction: true,
+    }));
     const scored = [];
     for (let i = 0; i < this.archive.length; i++) {
       const entry = this.archive[i];
@@ -242,7 +459,13 @@ export class ConversationMemory {
       if (score > 0) scored.push({ entry, i, score });
     }
     scored.sort((a, b) => b.score - a.score || b.i - a.i);
-    return scored.slice(0, Math.max(1, Math.min(20, k))).map((s) => ({ ...s.entry }));
+    const archiveHits = scored.map((s) => {
+      const correction = this._correctionForArchiveText(s.entry.text);
+      return correction
+        ? { ...s.entry, text: `[已过时·仅供审计] ${s.entry.text}（当前纠正：${correction.corrected}）`, superseded: true }
+        : { ...s.entry };
+    });
+    return [...correctionHits, ...archiveHits].slice(0, limit);
   }
 
   recordFileEvidence(evidence) {
@@ -293,7 +516,21 @@ export class ConversationMemory {
   }
 
   assemble() {
+    return this.assembledSlice(0, this.assembledLength());
+  }
+
+  prefixMessages() {
     const result = [];
+    const corrections = this._activeCorrections('', CORRECTION_PREFIX_MAX);
+    if (corrections.length > 0) {
+      const text = corrections.map((item) => item.kind === 'reflection'
+        ? `- 避免重复：${item.incorrect}\n  后续做法：${item.corrected}`
+        : `- 已作废：${item.incorrect}${item.aliases?.length ? `（此前相关旧说法：${item.aliases.join('、')}）` : ''}\n  当前有效：${item.corrected}`).join('\n');
+      result.push({
+        role: 'system',
+        content: `[纠错记忆·最高优先级]\n以下是对早期内容的追加纠正。原始历史仅供审计，不得继续把“已作废”内容当成事实或要求；若多条纠正冲突，以列表中更靠前的最新条目为准。\n${text}`,
+      });
+    }
     if (this.milestones.length > 0) {
       const text = this.milestones
         .map(m => `[Turn ${m.turn}] ${m.event}`)
@@ -307,8 +544,58 @@ export class ConversationMemory {
         : '';
       result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}${recallHint}` });
     }
-    result.push(...this.recent);
     return result;
+  }
+
+  assembledLength() {
+    return this.prefixMessages().length + this.recent.length;
+  }
+
+  assembledAt(index) {
+    const i = Math.trunc(Number(index) || 0);
+    if (i < 0) return undefined;
+    const prefixLength = this.prefixMessages().length;
+    if (i >= prefixLength) return this.recent[i - prefixLength];
+    return this.prefixMessages()[i];
+  }
+
+  assembledSlice(from = 0, to = this.assembledLength()) {
+    const length = this.assembledLength();
+    const start = Math.max(0, Math.min(length, Math.trunc(Number(from) || 0)));
+    const end = Math.max(start, Math.min(length, Math.trunc(Number(to) || 0)));
+    if (start === end) return [];
+    const prefixLength = this.prefixMessages().length;
+    const result = [];
+    if (start < prefixLength) {
+      const prefix = this.prefixMessages();
+      for (let index = start; index < Math.min(end, prefixLength); index++) result.push(prefix[index]);
+    }
+    const recentStart = Math.max(0, start - prefixLength);
+    const recentEnd = Math.max(0, end - prefixLength);
+    if (recentEnd > recentStart) result.push(...this.recent.slice(recentStart, recentEnd));
+    return result;
+  }
+
+  static _messageChars(message) {
+    if (!message || typeof message !== 'object') return String(message || '').length;
+    let total = typeof message.content === 'string' ? message.content.length : 0;
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) total += String(part?.text || part?.image_url?.url || '').length;
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) total += String(call?.function?.arguments || '').length;
+    }
+    if (Array.isArray(message.attachments)) {
+      for (const attachment of message.attachments) {
+        total += String(attachment?.dataUrl || '').length;
+        for (const frame of Array.isArray(attachment?.frames) ? attachment.frames : []) total += String(frame || '').length;
+      }
+    }
+    return total;
+  }
+
+  estimateRecentChars() {
+    return Math.max(0, this._recentChars);
   }
 
   estimateRecentTokens() {
@@ -325,6 +612,8 @@ export class ConversationMemory {
   compactRecent(count, summaryText) {
     if (count <= 0 || count > this.recent.length) return [];
     const removed = this.recent.splice(0, count);
+    for (const message of removed) this._recentChars -= ConversationMemory._messageChars(message);
+    this._recentChars = Math.max(0, this._recentChars);
     const startTurn = Math.max(1, this.totalTurns - this.recent.length - removed.length + 1);
     this._archiveBatch(removed, startTurn);
     this._notifyMessagesRemoved(removed);
@@ -357,6 +646,8 @@ export class ConversationMemory {
   _compressOldestBatch() {
     if (this.recent.length < SUMMARY_BATCH) return;
     const batch = this.recent.splice(0, SUMMARY_BATCH);
+    for (const message of batch) this._recentChars -= ConversationMemory._messageChars(message);
+    this._recentChars = Math.max(0, this._recentChars);
     const startTurn = this.totalTurns - this.recent.length - batch.length + 1;
     this._archiveBatch(batch, startTurn);
     this._notifyMessagesRemoved(batch);
@@ -408,16 +699,20 @@ export class ConversationMemory {
   }
 
   stats() {
-    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, archiveCount: this.archive.length, recentTokens: this.estimateRecentTokens() };
+    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, archiveCount: this.archive.length, correctionCount: this._activeCorrections('', MAX_CORRECTIONS).length, recentTokens: this.estimateRecentTokens() };
   }
 
-  toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET) {
+  toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET, options = {}) {
     // JSON.stringify calls toJSON with a string property key. Treat only an
     // explicit number/shared-budget object as the serializer override.
     const effectiveBudget = typeof mediaBudget === 'number' || (mediaBudget && typeof mediaBudget === 'object')
       ? mediaBudget
       : PERSISTED_MEDIA_BUDGET;
-    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(this.recent, effectiveBudget), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence, archive: this.archive };
+    const limit = Number.isFinite(options?.recentLimit)
+      ? Math.max(0, Math.trunc(options.recentLimit))
+      : this.recent.length;
+    const recent = limit === 0 ? [] : limit < this.recent.length ? this.recent.slice(-limit) : this.recent;
+    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(recent, effectiveBudget, { textBudget: options?.textBudget }), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence, archive: this.archive, corrections: this.corrections };
   }
 
   static fromJSON(obj) {
@@ -425,6 +720,7 @@ export class ConversationMemory {
     if (obj) {
       mem.totalTurns = obj.totalTurns || 0;
       mem.recent = Array.isArray(obj.recent) ? obj.recent : [];
+      mem._recentChars = mem.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
       mem.summaries = obj.summaries || [];
       mem.milestones = obj.milestones || [];
       mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
@@ -432,6 +728,22 @@ export class ConversationMemory {
         ? obj.archive.slice(-MAX_ARCHIVE)
           .filter((e) => e && typeof e.text === 'string' && e.text)
           .map((e) => ({ turn: Math.max(0, Number(e.turn) || 0), role: String(e.role || 'assistant'), text: String(e.text).slice(0, ARCHIVE_ENTRY_MAX) }))
+        : [];
+      mem.corrections = Array.isArray(obj.corrections)
+        ? obj.corrections.slice(-MAX_CORRECTIONS).map((item) => ({
+          id: cleanCorrectionText(item?.id, 160),
+          createdAt: Math.max(1, Number(item?.createdAt) || Date.now()),
+          kind: ['user', 'reflection', 'memory'].includes(item?.kind) ? item.kind : 'memory',
+          incorrect: cleanCorrectionText(item?.incorrect),
+          corrected: cleanCorrectionText(item?.corrected),
+          aliases: [...new Set((Array.isArray(item?.aliases) ? item.aliases : [])
+            .map((value) => cleanCorrectionText(value, 240)).filter(Boolean))].slice(0, 12),
+          topicTerms: memSearchTokens(`${(item?.aliases || []).join(' ')} ${item?.incorrect || ''} ${item?.corrected || ''}`).slice(0, 32),
+          sourceTurns: [...new Set((Array.isArray(item?.sourceTurns) ? item.sourceTurns : [])
+            .map((turn) => Math.max(0, Math.trunc(Number(turn) || 0))).filter(Boolean))].slice(0, 8),
+          confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0.8)),
+          supersedes: cleanCorrectionText(item?.supersedes, 160),
+        })).filter((item) => item.id && item.corrected)
         : [];
     }
     return mem;

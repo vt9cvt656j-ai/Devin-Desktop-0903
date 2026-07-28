@@ -72,6 +72,11 @@ const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(7);
 const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(8);
 const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(10);
+/// 对冲式首次等待：zyz 类中转的【第一条连接】经常拒 headers，换新连接后立刻就通
+///（实测每次白等 7-8s，用户体感"卡半天→唰一下全出来"）。首次尝试只等 4s 就果断
+/// 换连接；重试给满额，健康但慢的供应商由第二次兜底，不会误杀。仅在同路线还有
+/// 重试机会时启用（多路线单尝试场景不压缩，避免慢供应商被连环跳过）。
+const FIRST_ATTEMPT_HEADER_WAIT: Duration = Duration::from_secs(4);
 const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
 const ROUTE_BUDGET: Duration = Duration::from_secs(12);
 const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_millis(750);
@@ -138,6 +143,14 @@ async fn wait_for_upstream_retry(delay: Duration, deadline: Instant) -> bool {
 }
 
 static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// 中转丢块自愈：jgy 等聚合中转在深思考超过 ~7.5K token 后会丢掉后面的 text/tool_use
+// 块并谎报 end_turn（对照实验：budget 6000 → thinking+text+tool_use 正常；budget 24000
+// → 只回 thinking 就 end_turn；官方 API 绝不会思考完直接收尾）。检出签名后该线路记
+// 30 分钟"思考钳位"，期间 budget_tokens 压到实测安全值；健康线路不受影响，到期自动解除。
+const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
+static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The i18n pack cache is bounded because each entry holds a full ~630KB response
 /// body and the key is a hash of (locale, entries) — a caller who varies one
@@ -256,6 +269,45 @@ fn mark_route_cooldown(id: uuid::Uuid) {
     }
 }
 
+fn thinking_clip_active(id: uuid::Uuid) -> bool {
+    let Ok(mut guard) = THINKING_CLIP_ROUTES.lock() else {
+        return false;
+    };
+    match guard.get(&id).copied() {
+        Some(until) if until > Instant::now() => true,
+        Some(_) => {
+            guard.remove(&id);
+            false
+        }
+        None => false,
+    }
+}
+
+fn mark_thinking_clip(id: uuid::Uuid) {
+    if let Ok(mut guard) = THINKING_CLIP_ROUTES.lock() {
+        guard.insert(id, Instant::now() + THINKING_CLIP_COOLDOWN);
+    }
+}
+
+/// 钳位期内把已转换好的 Anthropic 请求体思考预算压到安全值。只降不升；
+/// 没有 thinking 或预算本就不超时不动。返回是否真的钳了。
+fn clip_thinking_budget(upstream_body: &mut serde_json::Value) -> bool {
+    let Some(budget) = upstream_body
+        .pointer("/thinking/budget_tokens")
+        .and_then(|v| v.as_i64())
+    else {
+        return false;
+    };
+    if budget <= THINKING_CLIP_SAFE_BUDGET {
+        return false;
+    }
+    if let Some(thinking) = upstream_body.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+        thinking.insert("budget_tokens".into(), json!(THINKING_CLIP_SAFE_BUDGET));
+        return true;
+    }
+    false
+}
+
 fn chat_upstream_attempt_suffix(route_count: usize, attempts: u32, last_status: u16) -> String {
     if route_count <= 1 {
         format!("（已请求 {attempts} 次；当前只有 1 条同模型线路；最后状态 {last_status}）")
@@ -277,6 +329,32 @@ fn safe_upstream_error_excerpt(low: &str) -> String {
         }
     }
     text.chars().take(220).collect()
+}
+
+fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
+    let access_failure = matches!(status, 401 | 403)
+        || low.contains("forbidden")
+        || low.contains("unauthorized")
+        || low.contains("invalid api key")
+        || low.contains("invalid_api_key")
+        || low.contains("permission denied")
+        || low.contains("access denied")
+        || low.contains("insufficient_balance")
+        || low.contains("insufficient account balance")
+        || low.contains("未授权")
+        || low.contains("no available")
+        || low.contains("没有可用");
+    if access_failure {
+        StatusCode::FAILED_DEPENDENCY
+    } else {
+        match status {
+            429 => StatusCode::TOO_MANY_REQUESTS,
+            502 => StatusCode::BAD_GATEWAY,
+            503 => StatusCode::SERVICE_UNAVAILABLE,
+            504 => StatusCode::GATEWAY_TIMEOUT,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    }
 }
 
 /// Wrap an upstream byte stream with an IDLE timeout: if the provider (zyz et al.)
@@ -784,10 +862,7 @@ pub async fn i18n_pack(
     // 硬拒绝会打断所有**已发布**的客户端：0.3.15 调这个接口时不带任何 Authorization，
     // 一上线就是整个界面翻译失效。而它们要的几乎都是同一批 UI 文案，任何一个已登录
     // 客户端都会把缓存捂热，所以读缓存这条路对它们基本总是命中。
-    let user_id = match auth_any_user(&state, &headers).await {
-        Ok(id) => Some(id),
-        Err(_) => None,
-    };
+    let user_id = auth_any_user(&state, &headers).await.ok();
     let locale = req.locale.trim().replace('_', "-");
     if locale.is_empty() || locale.len() > 32 {
         return Err(AppError::bad("locale 不能为空"));
@@ -3642,6 +3717,9 @@ struct AnthSse {
     tool_blocks: std::collections::HashMap<i64, AnthToolStream>,
     tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
     message_stop_seen: bool,
+    // 中转丢块签名追踪：只见 thinking、不见任何 text/tool_use 就 end_turn。
+    saw_thinking_block: bool,
+    saw_answer_block: bool,
     input_tokens: i64,
     output_tokens: i64,
     input_usage_reported: bool,
@@ -3688,6 +3766,8 @@ impl AnthSse {
             tool_blocks: std::collections::HashMap::new(),
             tool_argument_rules,
             message_stop_seen: false,
+            saw_thinking_block: false,
+            saw_answer_block: false,
             input_tokens: 0,
             output_tokens: 0,
             input_usage_reported: false,
@@ -3696,6 +3776,12 @@ impl AnthSse {
             cache_create: 0,
             stop_reason: "stop".into(),
         }
+    }
+
+    /// 故障签名：完整收流却只有思考、没有任何 text/tool_use 块，且 stop_reason 是
+    /// end_turn（映射后为 "stop"）。官方 API 不会这样收尾——这是中转深思考超限丢块。
+    fn thinking_only_end_turn(&self) -> bool {
+        self.saw_thinking_block && !self.saw_answer_block && self.stop_reason == "stop"
     }
 
     fn validated_tool_arguments(&self, block: &AnthToolStream) -> Result<String, String> {
@@ -3800,6 +3886,11 @@ impl AnthSse {
                         "Anthropic content_block_start is missing a numeric index".to_string()
                     })?;
                     let cb = ev.get("content_block");
+                    match cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) {
+                        Some("thinking") | Some("redacted_thinking") => self.saw_thinking_block = true,
+                        Some("text") | Some("tool_use") => self.saw_answer_block = true,
+                        _ => {}
+                    }
                     if cb.and_then(|c| c.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
                         if self.tool_blocks.contains_key(&idx) {
                             return Err(format!(
@@ -3850,6 +3941,7 @@ impl AnthSse {
                     match ev.pointer("/delta/type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
+                                self.saw_answer_block = true;
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"content": t}), None));
                             }
@@ -3857,6 +3949,7 @@ impl AnthSse {
                         Some("thinking_delta") => {
                             if let Some(t) = ev.pointer("/delta/thinking").and_then(|v| v.as_str())
                             {
+                                self.saw_thinking_block = true;
                                 self.ensure_role(&mut out);
                                 out.extend(self.chunk(json!({"reasoning_content": t}), None));
                             }
@@ -4224,11 +4317,6 @@ pub async fn chat_completions(
     // 这些，上游会直接拒收。开关打开前必须先修完；关着时 body 一个字节都不动。
     if state.cfg.compression_enabled {
         let requested_tier = compression_tier_from(&headers, &body);
-        // 无条件先清掉我们自己的协议字段。上一版只在 compression_write_back 里清，而
-        // 那个函数在每一条提前返回的路径上都不执行 —— 包括最常见的"没超窗口、不压缩"。
-        // 于是用 body 字段开启压缩的请求，每次不压缩时都把 michael_compression 原样
-        // 透传给了上游供应商。
-        compression_strip_protocol_fields(&mut body);
         if let Some(requested) = requested_tier {
             // 档位是付费能力：按会员套餐钳位。超出权限时下调而不是拒绝，用户仍然拿到他
             // 买到的那一档，而不是在长对话跑到一半时被打断。
@@ -4241,8 +4329,10 @@ pub async fn chat_completions(
                             "michael-compression: 请求档位超出套餐权限，已下调"
                         );
                     }
+                    // `mc_prefix` 必须由 apply 先读取。旧顺序在调用 apply 之前就把它删了，
+                    // 导致服务端永远拿不到客户端回传的前缀，Redis 只写不读。
                     compression_prefix =
-                        apply_michael_compression(&state, &mut body, &model_id, tier, uid).await;
+                        apply_michael_compression(&state, &mut body, &model_id, tier, uid).await?;
                     compression_applied = Some(tier);
                 }
                 None => {
@@ -4253,6 +4343,9 @@ pub async fn chat_completions(
                 }
             }
         }
+        // 所有 Michael 私有协议字段都必须在任何上游请求之前移除；放在 apply 之后，既能
+        // 让压缩层读取前缀，又不会把字段泄漏给供应商。
+        compression_strip_protocol_fields(&mut body);
     }
 
     let streaming = body
@@ -4378,7 +4471,9 @@ pub async fn chat_completions(
         .to_string();
     // Map an upstream error to a friendly, actionable Chinese message.
     fn friendly_upstream(status: u16, low: &str) -> String {
-        if low.contains("forbidden") || low.contains("未授权") {
+        if low.contains("insufficient_balance") || low.contains("insufficient account balance") {
+            "上游供应商账户余额不足。请在后台为该模型线路充值，或切换到其他可用线路。".into()
+        } else if low.contains("forbidden") || low.contains("未授权") {
             "上游暂不可用（供应商未授权 / 账户异常）。请换个模型，或联系模型供应商开通 / 续费。"
                 .into()
         } else if low.contains("no available") || low.contains("没有可用") {
@@ -4481,7 +4576,7 @@ pub async fn chat_completions(
             } else {
                 format!("{}/chat/completions", api_base(&candidate.base_url))
             };
-            let candidate_upstream_body = if candidate_anthropic {
+            let mut candidate_upstream_body = if candidate_anthropic {
                 match oai_to_anthropic_with_cache(&body, route_supports_prompt_cache(candidate)) {
                     Ok(v) => v,
                     Err(err) => {
@@ -4494,6 +4589,17 @@ pub async fn chat_completions(
             } else {
                 serde_json::Value::Null
             };
+            // 该线路正处于"深思考丢块"钳位期：把思考预算压到实测安全值再发。
+            if candidate_anthropic
+                && thinking_clip_active(candidate.id)
+                && clip_thinking_budget(&mut candidate_upstream_body)
+            {
+                tracing::info!(
+                    route_id = %candidate.id,
+                    clipped_budget = THINKING_CLIP_SAFE_BUDGET,
+                    "route recently dropped post-thinking blocks; thinking budget clipped for this request"
+                );
+            }
             let mut route_attempts = 0u32;
             let mut route_failed_transient = false;
             // With several equivalent routes, probe each route once before spending time on a
@@ -4542,7 +4648,11 @@ pub async fn chat_completions(
                 // `send()` resolves as soon as the status line and headers arrive, so the
                 // response body/stream that follows is untouched. That is the piece
                 // reqwest's own `.timeout()` cannot express for a streaming response.
-                let header_wait = remaining.min(max_header_wait);
+                let header_wait = if attempt == 0 && candidate_max_attempts > 1 {
+                    remaining.min(max_header_wait).min(FIRST_ATTEMPT_HEADER_WAIT)
+                } else {
+                    remaining.min(max_header_wait)
+                };
                 let send_started = Instant::now();
                 let sent = match tokio::time::timeout(header_wait, req.send()).await {
                     Ok(result) => {
@@ -4690,6 +4800,16 @@ pub async fn chat_completions(
         match (success, selected_conn) {
             (Some(r), Some(c)) => (r, c),
             (None, _) => {
+                let downstream_status = upstream_failure_status(err_status, &err_low);
+                tracing::warn!(
+                    model = %model_name,
+                    upstream_status = err_status,
+                    downstream_status = downstream_status.as_u16(),
+                    error_excerpt = %safe_upstream_error_excerpt(&err_low),
+                    attempted_sends,
+                    route_count,
+                    "returning classified upstream failure"
+                );
                 let msg = format!(
                     "【{model_name}】{}{}",
                     friendly_upstream(err_status, &err_low),
@@ -4697,7 +4817,7 @@ pub async fn chat_completions(
                 );
                 if headers.contains_key("x-ide-mode") {
                     return Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
+                        .status(downstream_status)
                         .header(
                             axum::http::header::CONTENT_TYPE,
                             "text/plain; charset=utf-8",
@@ -4706,7 +4826,7 @@ pub async fn chat_completions(
                         .map_err(|e| AppError::internal(e.to_string()));
                 }
                 return Err(AppError {
-                    status: StatusCode::BAD_GATEWAY,
+                    status: downstream_status,
                     msg,
                 });
             }
@@ -4742,6 +4862,13 @@ pub async fn chat_completions(
         let percall = conn.per_call_cents;
         let req_model = model_id.clone();
         let request_id_task = request_id.clone();
+        // 思考钳位探测：只对"开了思考的 Anthropic 原生请求"检测丢块签名。
+        let thinking_clip_probe = anthropic
+            && (body.get("thinking").is_some()
+                || body
+                    .get("reasoning_effort")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|e| !e.is_empty() && e != "off"));
         let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
         let ckey_task = ckey.clone();
         // Absorb short provider bursts without making the billing/cache pump stop reading the
@@ -4940,8 +5067,35 @@ pub async fn chat_completions(
             if !usage_reported {
                 tracing::warn!(model = %req_model, "provider omitted authoritative usage; rate billing is zero");
             }
+            // 中转丢块自愈：完整收流但只有思考、没有任何正文/工具块——按线路记 30 分钟
+            // 思考钳位。客户端对 reasoning-only 轮有 250ms 快速重试，下一发立即走钳位请求。
+            let relay_dropped_blocks = complete
+                && thinking_clip_probe
+                && conv.as_ref().is_some_and(|c| c.thinking_only_end_turn());
+            if relay_dropped_blocks {
+                mark_thinking_clip(cid);
+                tracing::warn!(
+                    model = %req_model,
+                    route_id = %cid,
+                    "upstream returned thinking-only end_turn (relay dropped post-thinking blocks); clipping this route's thinking budget for 30 minutes"
+                );
+            }
             if let Some(err) = stream_failure.take() {
                 complete = false;
+                // 第二个丢块签名：思考开启时上游把工具参数流掐断（incomplete arguments
+                // JSON / 流中断在 tool_use 中途）。同样按线路记思考钳位——IDE 的整轮
+                // 重试会立刻换成低思考预算的请求，而不是原样重掷再被掐一次。
+                if thinking_clip_probe
+                    && (err.contains("produced incomplete arguments JSON")
+                        || err.contains("ended before protocol completion"))
+                {
+                    mark_thinking_clip(cid);
+                    tracing::warn!(
+                        model = %req_model,
+                        route_id = %cid,
+                        "upstream cut a tool-argument stream mid-flight with thinking on; clipping this route's thinking budget for 30 minutes"
+                    );
+                }
                 if !client_closed {
                     tracing::warn!(model = %req_model, error = %err, "upstream model stream failed protocol validation");
                     let _ = tx
@@ -4972,7 +5126,9 @@ pub async fn chat_completions(
             );
             tokens.request_id = request_id_task;
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
-            if complete && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
+            // 中转丢块的坏流（只有思考）绝不缓存：客户端的快速重试请求体逐字节相同，
+            // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
+            if complete && !relay_dropped_blocks && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
                 let _: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
@@ -5092,12 +5248,14 @@ pub async fn chat_completions(
                 resp.headers_mut().insert("x-michael-compression-prefix", v);
             }
             if let Ok(v) = axum::http::HeaderValue::from_str(&covered.to_string()) {
-                resp.headers_mut().insert("x-michael-compression-covered", v);
+                resp.headers_mut()
+                    .insert("x-michael-compression-covered", v);
             }
         }
         if let Some(tier) = compression_applied {
             if let Ok(v) = axum::http::HeaderValue::from_str(tier.as_str()) {
-                resp.headers_mut().insert("x-michael-compression-applied", v);
+                resp.headers_mut()
+                    .insert("x-michael-compression-applied", v);
             }
         }
         Ok(resp)
@@ -5618,12 +5776,16 @@ pub async fn image_generations(
 mod billing_tests {
     use super::{
         anthropic_thinking, anthropic_to_oai, chat_upstream_attempt_suffix,
-        chat_upstream_retry_base_delay_ms, compute_cost, is_image_gen_model, model_price_override,
-        oai_to_anthropic, official_price, parse_usage_from_sse, project_quota_package,
-        projected_provider_usd, resolve_cost, response_cache_safe, round_multiplier_up,
-        split_fused_charge, tool_argument_rules, validate_openai_sse_eof,
+        chat_upstream_retry_base_delay_ms, clip_thinking_budget, compute_cost, is_image_gen_model,
+        mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
+        parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
+        response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
+        tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
         validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
+        THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET,
     };
+    use std::time::{Duration as ClipDuration, Instant as ClipInstant};
+    use axum::http::StatusCode;
     use serde_json::json;
 
     #[test]
@@ -5771,6 +5933,46 @@ mod billing_tests {
         assert_eq!(
             chat_upstream_attempt_suffix(3, 12, 504),
             "（已请求 12 次 / 3 条同模型线路；最后状态 504）"
+        );
+    }
+
+    #[test]
+    fn chat_gateway_maps_permanent_upstream_access_failures_to_failed_dependency() {
+        assert_eq!(
+            upstream_failure_status(401, "invalid api key"),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(
+            upstream_failure_status(403, "provider rejected this model"),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(
+            upstream_failure_status(500, "no available provider account"),
+            StatusCode::FAILED_DEPENDENCY
+        );
+        assert_eq!(
+            upstream_failure_status(402, "insufficient_balance"),
+            StatusCode::FAILED_DEPENDENCY
+        );
+    }
+
+    #[test]
+    fn chat_gateway_preserves_retryable_upstream_statuses() {
+        assert_eq!(
+            upstream_failure_status(429, "rate limited"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            upstream_failure_status(502, "bad gateway"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            upstream_failure_status(503, "service unavailable"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            upstream_failure_status(504, "header timeout"),
+            StatusCode::GATEWAY_TIMEOUT
         );
     }
 
@@ -6376,6 +6578,68 @@ mod billing_tests {
         assert_eq!(o["usage"]["input_tokens"], 10); // Anthropic name (compute_cost reads this)
         assert_eq!(o["usage"]["prompt_tokens"], 10); // OpenAI name (clients read this)
         assert_eq!(o["usage"]["cache_read_input_tokens"], 3);
+    }
+
+    #[test]
+    fn thinking_only_end_turn_signature_is_detected_and_healthy_streams_pass() {
+        // 中转丢块签名：只回 thinking 就 end_turn → 命中。
+        let mut c = AnthSse::new("claude-opus-4-6");
+        let _ = c.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"planning...\"}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7553}}\n\n").unwrap();
+        let _ = c.push(b"data: {\"type\":\"message_stop\"}\n\n").unwrap();
+        assert!(c.thinking_only_end_turn(), "thinking-only end_turn must be flagged as a relay drop");
+
+        // 健康流：thinking 后跟 text/tool_use → 不命中。
+        let mut healthy = AnthSse::new("claude-opus-4-6");
+        let _ = healthy.push(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n").unwrap();
+        let _ = healthy.push(b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap();
+        let _ = healthy.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n").unwrap();
+        assert!(!healthy.thinking_only_end_turn());
+
+        // 工具收尾（stop_reason=tool_use）永不误报。
+        let mut tooled = AnthSse::new("claude-opus-4-6");
+        let _ = tooled.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"x\"}}\n\n").unwrap();
+        let _ = tooled.push(b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"write_file\",\"input\":{}}}\n\n").unwrap();
+        let _ = tooled.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n").unwrap();
+        assert!(!tooled.thinking_only_end_turn());
+
+        // 无思考的普通回答（end_turn）不命中——签名要求见过思考块。
+        let mut plain = AnthSse::new("claude-opus-4-6");
+        let _ = plain.push(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n").unwrap();
+        let _ = plain.push(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n").unwrap();
+        assert!(!plain.thinking_only_end_turn());
+    }
+
+    #[test]
+    fn clip_thinking_budget_only_lowers_oversized_budgets() {
+        // 超限预算 → 钳到安全值。
+        let mut big = json!({"model":"claude-opus-4-6","thinking":{"type":"enabled","budget_tokens":24000},"max_tokens":40000});
+        assert!(clip_thinking_budget(&mut big));
+        assert_eq!(big.pointer("/thinking/budget_tokens"), Some(&json!(THINKING_CLIP_SAFE_BUDGET)));
+        // 本就安全的预算不动。
+        let mut small = json!({"thinking":{"type":"enabled","budget_tokens":4096}});
+        assert!(!clip_thinking_budget(&mut small));
+        assert_eq!(small.pointer("/thinking/budget_tokens"), Some(&json!(4096)));
+        // 没开思考不动。
+        let mut off = json!({"model":"claude-opus-4-6","max_tokens":8192});
+        assert!(!clip_thinking_budget(&mut off));
+        assert!(off.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_clip_route_marking_expires_and_isolates_routes() {
+        let bad = uuid::Uuid::new_v4();
+        let good = uuid::Uuid::new_v4();
+        assert!(!thinking_clip_active(bad));
+        mark_thinking_clip(bad);
+        assert!(thinking_clip_active(bad), "marked route must be clipped");
+        assert!(!thinking_clip_active(good), "healthy routes must not be affected");
+        if let Ok(mut guard) = THINKING_CLIP_ROUTES.lock() {
+            guard.insert(bad, ClipInstant::now() - ClipDuration::from_secs(1));
+        }
+        assert!(!thinking_clip_active(bad), "expired clip must auto-release");
     }
 
     #[test]
@@ -7139,6 +7403,28 @@ mod michael_compression_wiring_tests {
         assert!(msgs.iter().all(|m| m.tokens > 0));
     }
 
+    #[test]
+    fn nontext_content_is_never_silently_summarized() {
+        let text = serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "only text" }]
+        });
+        let image = serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "inspect this" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AA==" } }
+            ]
+        });
+        let unknown = serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "future_media", "data": "opaque" }]
+        });
+        assert!(!compression_message_has_nontext_content(&text));
+        assert!(compression_message_has_nontext_content(&image));
+        assert!(compression_message_has_nontext_content(&unknown));
+    }
+
     /// tool_calls 里的负载必须计入体积。
     ///
     /// agent 模式下 write_file / multi_edit 的**整个文件内容都在
@@ -7199,11 +7485,14 @@ mod michael_compression_wiring_tests {
             ]
         });
         // 压掉前两条（索引相对 pinned 之后：0=老消息, 1=assistant），逐字从 2 起。
-        compression_write_back(&mut body, 1, 2, &["早期摘要".to_string()]);
+        compression_write_back(&mut body, 1, 2, &["早期摘要".to_string()], None);
         let arr = body["messages"].as_array().expect("messages 必须还在");
 
         assert_eq!(arr[0]["role"], "system");
-        assert_eq!(arr[0]["content"], "系统提示词", "钉住的系统提示词必须原样保留");
+        assert_eq!(
+            arr[0]["content"], "系统提示词",
+            "钉住的系统提示词必须原样保留"
+        );
         assert_eq!(arr[1]["role"], "system");
         assert!(
             arr[1]["content"].as_str().unwrap().contains("早期摘要"),
@@ -7217,6 +7506,100 @@ mod michael_compression_wiring_tests {
         assert_eq!(arr.len(), 4);
     }
 
+    #[test]
+    fn exact_history_is_injected_between_summary_and_recent_tail() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "user", "content": "旧问题" },
+                { "role": "assistant", "content": "旧回答" },
+                { "role": "user", "content": "当前问题" }
+            ]
+        });
+        let evidence = "<history-evidence>src/auth.rs:42 JWT_TTL=3600</history-evidence>";
+        compression_write_back(
+            &mut body,
+            1,
+            2,
+            &["认证模块曾修改".to_string()],
+            Some(evidence),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "规则");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("认证模块曾修改"));
+        assert_eq!(messages[2]["content"], evidence);
+        assert_eq!(messages[3]["content"], "当前问题");
+    }
+
+    #[test]
+    fn fixed_overhead_counts_pinned_prompts_and_tool_schemas() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "x".repeat(4000) },
+                { "role": "user", "content": "hi" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "y".repeat(4000),
+                    "parameters": {"type":"object"}
+                }
+            }]
+        });
+        let overhead = compression_fixed_overhead_tokens(&body, 1);
+        assert!(overhead > 3_500, "固定开销不能只留一个常量余量: {overhead}");
+    }
+
+    #[test]
+    fn retrieval_query_never_drops_the_latest_user_request() {
+        let marker = "LATEST_USER_INVOICE_771923";
+        let messages = vec![
+            crate::compression::Msg::new("user", marker),
+            crate::compression::Msg::new("assistant", "x".repeat(30_000)),
+            crate::compression::Msg::new("tool", "y".repeat(30_000)),
+            crate::compression::Msg::new("assistant", "z".repeat(30_000)),
+        ];
+        let query = compression_retrieval_query(&messages);
+        assert!(query.contains(marker));
+        assert!(query.chars().count() <= 16_001);
+    }
+
+    #[test]
+    fn archive_segment_keeps_original_json_and_searchable_tool_arguments() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_archive",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"src/archive.rs\",\"content\":\"const LIMIT: u32 = 5000000;\"}"
+                    }
+                }]}
+            ]
+        });
+        let (pinned, msgs) = compression_plan_input(&body);
+        let segment = crate::compression::Segment {
+            start: 0,
+            end: 1,
+            tokens: msgs[0].tokens,
+        };
+        let (_, archive, index) =
+            compression_archive_segment(&body, pinned, &msgs, &segment).expect("archive");
+        assert_eq!(
+            archive.messages[0].original["tool_calls"][0]["id"],
+            "call_archive"
+        );
+        assert!(archive.messages[0].text.contains("src/archive.rs"));
+        assert!(index.terms.iter().any(|term| term == "5000000"));
+    }
+
     /// 协议字段绝不能透传给上游 —— 包括**不压缩**的那些路径。
     #[test]
     fn protocol_fields_are_stripped_even_without_compressing() {
@@ -7228,13 +7611,20 @@ mod michael_compression_wiring_tests {
         compression_strip_protocol_fields(&mut body);
         assert!(body.get("michael_compression").is_none());
         assert!(body.get("mc_prefix").is_none());
-        assert!(body.get("messages").is_some(), "只清协议字段，不动 messages");
+        assert!(
+            body.get("messages").is_some(),
+            "只清协议字段，不动 messages"
+        );
     }
 
     #[test]
     fn missing_messages_is_not_a_panic() {
         assert!(compression_plan_input(&serde_json::json!({})).1.is_empty());
-        assert!(compression_plan_input(&serde_json::json!({ "messages": "nope" })).1.is_empty());
+        assert!(
+            compression_plan_input(&serde_json::json!({ "messages": "nope" }))
+                .1
+                .is_empty()
+        );
     }
 }
 
@@ -7442,8 +7832,9 @@ fn compression_tier_from(
 
 /// 把 OpenAI 形状的 messages 读成压缩层用的结构。
 ///
-/// 只取纯文本内容：带图片等多模态块的消息按其文本部分参与规划，压缩时也只压文本，
-/// 非文本部分永远落在逐字尾部或原样保留（我们从不重写消息本身，只决定压不压）。
+/// 只取纯文本内容：带图片等多模态块的消息按其文本部分参与规划。真正落入压缩区之前，
+/// `compression_message_has_nontext_content` 会 fail-closed；否则整条原消息被摘要替换时，
+/// 图片会悄悄消失，而 PrefixRecord 下一轮又会让客户端省略原消息，造成永久数据丢失。
 /// 规划用的消息视图。
 ///
 /// 返回 `(pinned, msgs)`：`pinned` 是开头那一串**必须逐字保留**的 system 消息条数，
@@ -7472,9 +7863,7 @@ fn compression_plan_input(body: &serde_json::Value) -> (usize, Vec<crate::compre
 
     let msgs = arr[pinned..]
         .iter()
-        .map(|m| {
-            crate::compression::Msg::new(role_of(m), compression_countable_text(m))
-        })
+        .map(|m| crate::compression::Msg::new(role_of(m), compression_countable_text(m)))
         .collect();
     (pinned, msgs)
 }
@@ -7500,6 +7889,23 @@ fn compression_countable_text(m: &serde_json::Value) -> String {
         }
     }
     out
+}
+
+/// 消息是否含不能被纯文本摘要忠实保存的内容块。
+///
+/// OpenAI/Anthropic 兼容线路会出现 `image_url`、`input_image`、音频或文件块。这里只放行
+/// 明确的文本块；未知类型同样拒绝，避免供应商新增一种媒体类型后被我们静默吞掉。
+fn compression_message_has_nontext_content(m: &serde_json::Value) -> bool {
+    m.get("content")
+        .and_then(|content| content.as_array())
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                !matches!(
+                    part.get("type").and_then(|value| value.as_str()),
+                    Some("text" | "input_text")
+                )
+            })
+        })
 }
 
 /// 挑一个用来做压缩的便宜模型：按官方单价升序取第一个可用连接。
@@ -7586,62 +7992,164 @@ async fn compression_summarize(
     })
 }
 
+#[derive(Default)]
+struct CompressionPrefixContext {
+    summaries: Vec<String>,
+    summary_keys: Vec<String>,
+    raw_keys: Vec<String>,
+    search_indexes: Vec<crate::compression::SegmentSearchIndex>,
+    covered_msgs: usize,
+    raw_tokens: usize,
+}
+
+fn compression_prefix_invalid_error() -> AppError {
+    AppError {
+        status: StatusCode::CONFLICT,
+        msg: "[mc-prefix-invalid] michael-compression 前缀已失效，请清除前缀并用完整历史重试"
+            .into(),
+    }
+}
+
 /// 取出并校验请求带来的前缀引用。
 ///
-/// 返回 (摘要, 段键, 覆盖的消息数, 覆盖部分的原始 token 数)。任何一步不成立（引用不存在、不属于该用户、
-/// 有段已过期）都返回 None —— 调用方据此让客户端重发完整历史。**宁可多传一次，也不能
-/// 静默丢掉一段历史**：那会让模型莫名其妙地失忆。
+/// 返回 (摘要, 段键, 覆盖的消息数, 覆盖部分的原始 token 数)。没有引用返回 `Ok(None)`；
+/// 请求明确带了引用但它不存在、越权、口径不匹配或有段过期时返回带机器标记的 409。
+/// 客户端据此清掉本地引用并用完整 transcript 自动重试。**宁可多传一次，也不能静默丢掉
+/// 一段历史**：那会让模型在请求正常计费的同时莫名其妙地失忆。
 async fn compression_take_prefix(
     state: &AppState,
     body: &mut serde_json::Value,
     uid: uuid::Uuid,
-) -> Option<(Vec<String>, Vec<String>, usize, usize)> {
+) -> Result<Option<CompressionPrefixContext>, AppError> {
     use crate::compression as mc;
 
     let token = body
         .get("mc_prefix")
         .and_then(|v| v.as_str())
-        .map(str::to_string)?;
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let claimed_covered = body
+        .get("mc_prefix_covered")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
     // 这是我们自己的协议字段，绝不能透传给上游。
     if let Some(obj) = body.as_object_mut() {
         obj.remove("mc_prefix");
+        obj.remove("mc_prefix_covered");
     }
 
+    let invalid = compression_prefix_invalid_error;
+    let claimed_covered = claimed_covered
+        .filter(|covered| *covered > 0)
+        .ok_or_else(invalid)?;
+
     let mut redis = state.redis.clone();
-    let raw: Option<String> = redis::cmd("GET")
+    let cached: Option<String> = redis::cmd("GET")
         .arg(mc::prefix_redis_key(&token))
         .query_async(&mut redis)
         .await
         .ok()
         .flatten();
-    let record: mc::PrefixRecord = serde_json::from_str(&raw?).ok()?;
+    let raw = match cached {
+        Some(raw) => raw,
+        None => {
+            let record_json = sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT record
+                 FROM michael_context_prefixes
+                 WHERE token = $1 AND user_id = $2 AND expires_at > now()",
+            )
+            .bind(&token)
+            .bind(uid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|error| AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                msg: format!("michael-compression: 读取持久上下文前缀失败: {error}"),
+            })?
+            .ok_or_else(invalid)?;
+            let raw = serde_json::to_string(&record_json).map_err(|_| invalid())?;
+            let _: Result<(), redis::RedisError> = redis::cmd("SET")
+                .arg(mc::prefix_redis_key(&token))
+                .arg(&raw)
+                .arg("EX")
+                .arg(mc::PREFIX_TTL_SECS)
+                .query_async(&mut redis)
+                .await;
+            raw
+        }
+    };
+    let record: mc::PrefixRecord = serde_json::from_str(&raw).map_err(|_| invalid())?;
 
     if !mc::prefix_belongs_to(&record, &uid.to_string()) {
         tracing::warn!(%uid, "michael-compression: 前缀引用不属于该用户，已拒绝");
-        return None;
+        return Err(invalid());
+    }
+    if claimed_covered != record.covered_msgs {
+        tracing::warn!(
+            %uid,
+            claimed_covered,
+            record_covered = record.covered_msgs,
+            "michael-compression: 客户端前缀覆盖条数不匹配，已拒绝该引用"
+        );
+        return Err(invalid());
     }
 
-    let mut summaries = Vec::with_capacity(record.segment_keys.len());
-    for key in &record.segment_keys {
-        match mc::cached_summary(&mut redis, key).await {
-            Some(sum) => summaries.push(sum),
-            None => {
-                // 有段被淘汰了。拼一个缺口出来等于让模型失忆，所以整体作废、要求重发。
-                tracing::info!(
-                    %uid,
-                    "michael-compression: 前缀中有段已过期，要求客户端重发完整历史"
-                );
-                return None;
-            }
-        }
+    if record.raw_segment_keys.len() != record.segment_keys.len()
+        || record.raw_segment_keys.is_empty()
+    {
+        tracing::info!(
+            %uid,
+            summaries = record.segment_keys.len(),
+            raw_archives = record.raw_segment_keys.len(),
+            "michael-compression: 旧版或不完整前缀缺少无损原文归档，要求客户端重建"
+        );
+        return Err(invalid());
     }
-    // 段键也一并返回：续传时它们要原样接在本轮新签发的键前面，前缀才是连续的。
-    Some((
+
+    let (summaries, search_indexes) = compression_load_prefix_segments(
+        state,
+        uid,
+        &record.segment_keys,
+        &record.raw_segment_keys,
+    )
+    .await
+    .ok_or_else(|| {
+        tracing::info!(
+            %uid,
+            "michael-compression: 持久上下文段不存在或已损坏，要求客户端重发完整历史"
+        );
+        invalid()
+    })?;
+    // 活跃会话滑动续期。前缀和组成它的摘要必须一起续，否则其中任一先过期都会形成一个
+    // 看似有效、实际有缺口的引用。EXPIRE 失败不影响本轮已经读到的完整数据。
+    mc::renew_context_cache(
+        &mut redis,
+        &token,
+        &record.segment_keys,
+        &record.raw_segment_keys,
+    )
+    .await;
+    let _ = sqlx::query(
+        "UPDATE michael_context_prefixes
+         SET expires_at = now() + interval '90 days', updated_at = now()
+         WHERE token = $1 AND user_id = $2",
+    )
+    .bind(&token)
+    .bind(uid)
+    .execute(&state.db)
+    .await;
+    Ok(Some(CompressionPrefixContext {
         summaries,
-        record.segment_keys,
-        record.covered_msgs,
-        record.raw_tokens,
-    ))
+        summary_keys: record.segment_keys,
+        raw_keys: record.raw_segment_keys,
+        search_indexes,
+        covered_msgs: record.covered_msgs,
+        raw_tokens: record.raw_tokens,
+    }))
 }
 
 /// 把压缩结果写回 body。
@@ -7661,6 +8169,7 @@ fn compression_write_back(
     pinned: usize,
     verbatim_from: usize,
     summaries: &[String],
+    retrieved_history: Option<&str>,
 ) {
     let Some(arr) = body.get("messages").and_then(|v| v.as_array()) else {
         return;
@@ -7668,6 +8177,9 @@ fn compression_write_back(
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len() + 1);
     out.extend(arr.iter().take(pinned).cloned());
     if let Some(text) = crate::compression::summary_system_text(summaries) {
+        out.push(json!({ "role": "system", "content": text }));
+    }
+    if let Some(text) = retrieved_history.filter(|text| !text.trim().is_empty()) {
         out.push(json!({ "role": "system", "content": text }));
     }
     let tail_start = pinned.saturating_add(verbatim_from).min(arr.len());
@@ -7686,6 +8198,7 @@ fn compression_strip_protocol_fields(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("michael_compression");
         obj.remove("mc_prefix");
+        obj.remove("mc_prefix_covered");
     }
 }
 
@@ -7694,30 +8207,428 @@ async fn compression_issue_prefix(
     state: &AppState,
     uid: uuid::Uuid,
     segment_keys: Vec<String>,
+    raw_segment_keys: Vec<String>,
     covered_msgs: usize,
     raw_tokens: usize,
 ) -> Option<String> {
     use crate::compression as mc;
-    if segment_keys.is_empty() {
+    if segment_keys.is_empty() || segment_keys.len() != raw_segment_keys.len() {
         return None;
     }
     let record = mc::PrefixRecord {
         uid: uid.to_string(),
         segment_keys,
+        raw_segment_keys,
         covered_msgs,
         raw_tokens,
     };
     let token = mc::new_prefix_token();
+    let record_json = serde_json::to_value(&record).ok()?;
     let payload = serde_json::to_string(&record).ok()?;
+    let stored = sqlx::query(
+        "INSERT INTO michael_context_prefixes (token, user_id, record, expires_at)
+         VALUES ($1, $2, $3, now() + interval '90 days')",
+    )
+    .bind(&token)
+    .bind(uid)
+    .bind(record_json)
+    .execute(&state.db)
+    .await
+    .ok()?;
+    if stored.rows_affected() != 1 {
+        return None;
+    }
     let mut redis = state.redis.clone();
-    let ok: Result<(), redis::RedisError> = redis::cmd("SET")
+    let _: Result<(), redis::RedisError> = redis::cmd("SET")
         .arg(mc::prefix_redis_key(&token))
         .arg(payload)
         .arg("EX")
         .arg(mc::PREFIX_TTL_SECS)
         .query_async(&mut redis)
         .await;
-    ok.ok().map(|_| token)
+    // Opportunistic bounded cleanup keeps abandoned per-turn handles from accumulating forever.
+    let _ = sqlx::query(
+        "DELETE FROM michael_context_prefixes
+         WHERE token IN (
+             SELECT token FROM michael_context_prefixes
+             WHERE expires_at <= now()
+             ORDER BY expires_at
+             LIMIT 500
+         )",
+    )
+    .execute(&state.db)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM michael_context_archives
+         WHERE (user_id, archive_key) IN (
+             SELECT user_id, archive_key FROM michael_context_archives
+             WHERE last_accessed_at <= now() - interval '90 days'
+             ORDER BY last_accessed_at
+             LIMIT 500
+         )",
+    )
+    .execute(&state.db)
+    .await;
+    Some(token)
+}
+
+fn compression_fixed_overhead_tokens(body: &serde_json::Value, pinned: usize) -> usize {
+    let pinned_tokens = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .take(pinned)
+                .map(|message| {
+                    crate::compression::estimate_tokens(&compression_countable_text(message))
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let tools_tokens = body
+        .get("tools")
+        .and_then(|tools| serde_json::to_string(tools).ok())
+        .map(|tools| crate::compression::estimate_tokens(&tools))
+        .unwrap_or(0);
+    // Roles, JSON framing and provider-specific wrappers still consume tokens. The main window
+    // safety factor is the broad guard; this fixed reserve prevents a large tool catalog from
+    // stealing the exact-retrieval slot unnoticed.
+    pinned_tokens
+        .saturating_add(tools_tokens)
+        .saturating_add(2_048)
+}
+
+fn compression_retrieval_query(msgs: &[crate::compression::Msg]) -> String {
+    let mut context_parts = Vec::new();
+    let latest_user_index = msgs.iter().rposition(|message| message.role == "user");
+    let recent_from = msgs.len().saturating_sub(4);
+    for (index, message) in msgs.iter().enumerate().skip(recent_from) {
+        if message.role != "system" && Some(index) != latest_user_index {
+            context_parts.push(message.text.as_str());
+        }
+    }
+    let latest_user = latest_user_index
+        .map(|index| msgs[index].text.as_str())
+        .unwrap_or("");
+    let latest_user_tail = latest_user
+        .chars()
+        .rev()
+        .take(12_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let context_tail = context_parts
+        .join("\n")
+        .chars()
+        .rev()
+        .take(4_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    if context_tail.is_empty() {
+        latest_user_tail
+    } else if latest_user_tail.is_empty() {
+        context_tail
+    } else {
+        format!("{latest_user_tail}\n{context_tail}")
+    }
+}
+
+fn compression_archive_segment(
+    body: &serde_json::Value,
+    pinned: usize,
+    msgs: &[crate::compression::Msg],
+    segment: &crate::compression::Segment,
+) -> Option<(
+    String,
+    crate::compression::RawSegmentArchive,
+    crate::compression::SegmentSearchIndex,
+)> {
+    use crate::compression as mc;
+    let original = body
+        .get("messages")?
+        .as_array()?
+        .get(pinned + segment.start..pinned + segment.end)?
+        .to_vec();
+    let planned = msgs.get(segment.start..segment.end)?;
+    if original.len() != planned.len() || original.is_empty() {
+        return None;
+    }
+    let messages = original
+        .iter()
+        .cloned()
+        .zip(planned.iter())
+        .map(|(original, message)| mc::ArchivedMessage {
+            role: message.role.clone(),
+            text: message.text.clone(),
+            tokens: message.tokens,
+            original,
+        })
+        .collect::<Vec<_>>();
+    let archive = mc::RawSegmentArchive {
+        version: mc::RawSegmentArchive::VERSION,
+        messages,
+    };
+    let index = mc::build_search_index(&archive.messages);
+    let key = mc::raw_segment_cache_key(&original);
+    Some((key, archive, index))
+}
+
+async fn compression_persist_archives(
+    state: &AppState,
+    uid: uuid::Uuid,
+    archives: &[(
+        String,
+        crate::compression::RawSegmentArchive,
+        crate::compression::SegmentSearchIndex,
+    )],
+    summaries: &[String],
+) -> bool {
+    use crate::compression as mc;
+    if archives.is_empty() {
+        return true;
+    }
+    if archives.len() != summaries.len() {
+        return false;
+    }
+    let mut rows = Vec::with_capacity(archives.len());
+    for ((key, archive, index), summary) in archives.iter().zip(summaries) {
+        let Some(payload) = mc::encode_raw_archive(archive) else {
+            return false;
+        };
+        let Ok(search_index) = serde_json::to_value(index) else {
+            return false;
+        };
+        let raw_tokens = archive
+            .messages
+            .iter()
+            .map(|message| message.tokens)
+            .sum::<usize>()
+            .min(i64::MAX as usize) as i64;
+        rows.push((
+            key.clone(),
+            payload,
+            search_index,
+            summary.clone(),
+            raw_tokens,
+        ));
+    }
+
+    let Ok(mut tx) = state.db.begin().await else {
+        return false;
+    };
+    for (key, payload, search_index, summary, raw_tokens) in &rows {
+        let result = sqlx::query(
+            "INSERT INTO michael_context_archives
+                (user_id, archive_key, payload, search_index, summary, raw_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (user_id, archive_key) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                search_index = EXCLUDED.search_index,
+                summary = EXCLUDED.summary,
+                raw_tokens = EXCLUDED.raw_tokens,
+                last_accessed_at = now()",
+        )
+        .bind(uid)
+        .bind(key)
+        .bind(payload)
+        .bind(search_index)
+        .bind(summary)
+        .bind(raw_tokens)
+        .execute(&mut *tx)
+        .await;
+        if result.is_err() {
+            let _ = tx.rollback().await;
+            return false;
+        }
+    }
+    if tx.commit().await.is_err() {
+        return false;
+    }
+
+    // PostgreSQL is the source of truth. Redis is a best-effort hot cache, so a cache write
+    // failure must not make a durable archive unusable or prevent prefix issuance.
+    let mut redis = state.redis.clone();
+    for (key, archive, index) in archives {
+        let _ = mc::store_raw_archive(&mut redis, key, archive, index).await;
+    }
+    true
+}
+
+async fn compression_load_prefix_segments(
+    state: &AppState,
+    uid: uuid::Uuid,
+    summary_keys: &[String],
+    raw_keys: &[String],
+) -> Option<(Vec<String>, Vec<crate::compression::SegmentSearchIndex>)> {
+    use crate::compression as mc;
+    if summary_keys.len() != raw_keys.len() {
+        return None;
+    }
+    let mut redis = state.redis.clone();
+    let mut summaries = mc::cached_summaries(&mut redis, summary_keys).await;
+    let mut indexes = mc::cached_search_indexes(&mut redis, raw_keys).await;
+    let mut missing = Vec::new();
+    for (position, raw_key) in raw_keys.iter().enumerate() {
+        if summaries[position].is_none() || indexes[position].is_none() {
+            missing.push(raw_key.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        let rows = sqlx::query_as::<_, (String, serde_json::Value, String)>(
+            "SELECT archive_key, search_index, summary
+             FROM michael_context_archives
+             WHERE user_id = $1 AND archive_key = ANY($2)",
+        )
+        .bind(uid)
+        .bind(&missing)
+        .fetch_all(&state.db)
+        .await
+        .ok()?;
+        let from_db = rows
+            .into_iter()
+            .map(|(key, index, summary)| (key, (index, summary)))
+            .collect::<HashMap<_, _>>();
+        for (position, raw_key) in raw_keys.iter().enumerate() {
+            if summaries[position].is_some() && indexes[position].is_some() {
+                continue;
+            }
+            let (value, summary) = from_db.get(raw_key)?;
+            if summaries[position].is_none() {
+                mc::store_summary(&mut redis, &summary_keys[position], summary).await;
+                summaries[position] = Some(summary.clone());
+            }
+            if indexes[position].is_none() {
+                let index: mc::SegmentSearchIndex = serde_json::from_value(value.clone()).ok()?;
+                if !index.is_valid() {
+                    return None;
+                }
+                mc::store_search_index(&mut redis, raw_key, &index).await;
+                indexes[position] = Some(index);
+            }
+        }
+    }
+
+    let _ = sqlx::query(
+        "UPDATE michael_context_archives
+         SET last_accessed_at = now()
+         WHERE user_id = $1 AND archive_key = ANY($2)",
+    )
+    .bind(uid)
+    .bind(raw_keys)
+    .execute(&state.db)
+    .await;
+    Some((
+        summaries.into_iter().collect::<Option<Vec<_>>>()?,
+        indexes.into_iter().collect::<Option<Vec<_>>>()?,
+    ))
+}
+
+async fn compression_load_raw_archive(
+    state: &AppState,
+    uid: uuid::Uuid,
+    raw_key: &str,
+) -> Option<crate::compression::RawSegmentArchive> {
+    use crate::compression as mc;
+    let mut redis = state.redis.clone();
+    if let Some(archive) = mc::cached_raw_archive(&mut redis, raw_key).await {
+        return Some(archive);
+    }
+    let (payload, search_index) = sqlx::query_as::<_, (Vec<u8>, serde_json::Value)>(
+        "SELECT payload, search_index
+         FROM michael_context_archives
+         WHERE user_id = $1 AND archive_key = $2",
+    )
+    .bind(uid)
+    .bind(raw_key)
+    .fetch_optional(&state.db)
+    .await
+    .ok()??;
+    let archive = mc::decode_raw_archive(&payload)?;
+    let index: mc::SegmentSearchIndex = serde_json::from_value(search_index).ok()?;
+    if !index.is_valid() {
+        return None;
+    }
+    let _ = mc::store_raw_archive(&mut redis, raw_key, &archive, &index).await;
+    let _ = sqlx::query(
+        "UPDATE michael_context_archives
+         SET last_accessed_at = now()
+         WHERE user_id = $1 AND archive_key = $2",
+    )
+    .bind(uid)
+    .bind(raw_key)
+    .execute(&state.db)
+    .await;
+    Some(archive)
+}
+
+struct RetrievedCompressionHistory {
+    text: Option<String>,
+    tokens: usize,
+    segment_count: usize,
+    excerpt_count: usize,
+}
+
+struct CompressionRetrievalRequest<'a> {
+    query: &'a str,
+    summaries: &'a [String],
+    indexes: &'a [crate::compression::SegmentSearchIndex],
+    raw_keys: &'a [String],
+    in_memory: &'a HashMap<usize, crate::compression::RawSegmentArchive>,
+    budget_tokens: usize,
+}
+
+async fn compression_retrieve_history(
+    state: &AppState,
+    uid: uuid::Uuid,
+    request: CompressionRetrievalRequest<'_>,
+) -> Result<RetrievedCompressionHistory, AppError> {
+    use crate::compression as mc;
+    if request.query.trim().is_empty()
+        || request.budget_tokens < 256
+        || request.summaries.len() != request.indexes.len()
+        || request.summaries.len() != request.raw_keys.len()
+    {
+        return Ok(RetrievedCompressionHistory {
+            text: None,
+            tokens: 0,
+            segment_count: 0,
+            excerpt_count: 0,
+        });
+    }
+    let selected =
+        mc::rank_retrieval_segments(request.query, request.summaries, request.indexes, 6);
+    if selected.is_empty() {
+        return Ok(RetrievedCompressionHistory {
+            text: None,
+            tokens: 0,
+            segment_count: 0,
+            excerpt_count: 0,
+        });
+    }
+    let mut archives = Vec::with_capacity(selected.len());
+    for index in selected {
+        let archive = match request.in_memory.get(&index) {
+            Some(archive) => archive.clone(),
+            None => compression_load_raw_archive(state, uid, &request.raw_keys[index])
+                .await
+                .ok_or_else(compression_prefix_invalid_error)?,
+        };
+        archives.push((index, archive));
+    }
+    let excerpts = mc::select_retrieval_excerpts(request.query, &archives, request.budget_tokens);
+    let text = mc::retrieval_system_text(&excerpts);
+    let tokens = text.as_deref().map(mc::estimate_tokens).unwrap_or_default();
+    Ok(RetrievedCompressionHistory {
+        text,
+        tokens,
+        segment_count: archives.len(),
+        excerpt_count: excerpts.len(),
+    })
 }
 
 /// 就地把 body.messages 换成压缩后的序列。
@@ -7737,15 +8648,19 @@ async fn compression_issue_prefix(
 /// 所以：请求里只用已经算好的摘要（Redis 查询，毫秒级、延迟确定）；缺的段交给**后台**
 /// 预热，下一轮就能命中。代价是第一次长对话那一轮不压缩，换来的是延迟可预测。
 const COMPRESSION_WARM_SEGMENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// 同时预热的段数。并发过小会让 5M 冷启动等待数分钟；过大又会瞬间打满便宜线路限流。
+const COMPRESSION_WARM_CONCURRENCY: usize = 6;
 /// 后台预热一轮最多现算多少段。
 ///
 /// 8 太小：实测一个 400k token 的对话有 17 段，一轮只预热 8 段的话要三轮才能压到窗口
 /// 以内 —— 这三轮里每一轮都在降级为不压缩，也就是"5M 档看着开了却一直不生效"。
 /// 后台没有延迟压力，上限的唯一意义是别把便宜模型的限流打满，所以给到能一轮覆盖
 /// 常见长对话的量级。真正的兜底是"一段都压不出来就整体放弃"那条。
-const COMPRESSION_WARM_MAX_SEGMENTS: usize = 24;
+const COMPRESSION_WARM_MAX_SEGMENTS: usize = 128;
 /// 段摘要缓存的命名空间。刻意与具体压缩模型无关（见调用点注释）。
 const COMPRESSION_CACHE_NAMESPACE: &str = "mc-any-v1";
+/// 还没撞窗口也提前准备摘要/前缀。这样 1M 原生窗口的模型不会等请求体逼近 3.5MB 才启动。
+const COMPRESSION_PREFIX_TRIGGER_MAX_TOKENS: usize = 400_000;
 
 async fn apply_michael_compression(
     state: &AppState,
@@ -7753,83 +8668,148 @@ async fn apply_michael_compression(
     model_id: &str,
     tier: crate::compression::Tier,
     uid: uuid::Uuid,
-) -> Option<(String, usize)> {
+) -> Result<Option<(String, usize)>, AppError> {
     use crate::compression as mc;
 
     let started = std::time::Instant::now();
 
     // 前缀续传：客户端只发了未覆盖的消息，历史摘要从 Redis 取回。
-    let (mut carried_summaries, mut carried_keys, mut carried_msgs, mut carried_raw) =
-        match compression_take_prefix(state, body, uid).await {
-            Some((sums, keys, n, raw)) => (sums, keys, n, raw),
-            None => (Vec::new(), Vec::new(), 0, 0),
-        };
+    let carried = compression_take_prefix(state, body, uid)
+        .await?
+        .unwrap_or_default();
 
     // 前缀一旦被取用，客户端手上就只有"未覆盖"的那截消息了。此后任何一条返回路径都
     // **必须**把摘要拼回去，否则请求会带着一段被静默截断的对话发往上游 —— 而且照常
     // 计费。这个闭包就是那条唯一的退出通道。
     let (pinned, msgs) = compression_plan_input(body);
-    // 摘要用参数传入而不是闭包捕获：捕获会一直持着不可变借用，下面那道"忽略前缀"的
-    // 防线就没法清空它了。
-    let bail = |body: &mut serde_json::Value, carried: &[String]| -> Option<(String, usize)> {
-        if !carried.is_empty() {
-            compression_write_back(body, pinned, 0, carried);
-        }
-        None
-    };
-
     if msgs.is_empty() {
-        return bail(body, &carried_summaries);
+        if !carried.summaries.is_empty() {
+            compression_write_back(body, pinned, 0, &carried.summaries, None);
+        }
+        return Ok(None);
     }
 
     let native = official_context(model_id).unwrap_or(128_000).max(1) as usize;
-    let budget = mc::window_budget(native);
-    let carried_budget = carried_summaries.len() * mc::SEGMENT_SUMMARY_TOKENS;
-    let planning_window = native.saturating_sub(carried_budget).max(native / 4);
-    let plan = mc::plan(&msgs, planning_window, mc::VERBATIM_TAIL_TOKENS, mc::SEGMENT_TOKENS);
+    let window_budget = mc::window_budget(native);
+    let fixed_overhead = compression_fixed_overhead_tokens(body, pinned);
+    let budget = window_budget.saturating_sub(fixed_overhead);
+    if budget <= mc::VERBATIM_TAIL_TOKENS + mc::RETRIEVAL_BUDGET_MIN_TOKENS {
+        return Err(AppError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            msg: "michael-compression: 系统提示词和工具 schema 已占满目标模型窗口".into(),
+        });
+    }
+    let retrieval_reserve = mc::retrieval_budget(native).min(budget / 3);
+    let carried_budget = mc::actual_summary_tokens(&carried.summaries);
+    let remaining_budget = budget.saturating_sub(carried_budget);
+    let segment_tokens = mc::segment_tokens_for_budget(tier, budget, retrieval_reserve);
+    let mut plan = mc::plan_to_budget(
+        &msgs,
+        remaining_budget,
+        mc::VERBATIM_TAIL_TOKENS,
+        segment_tokens,
+    );
 
-    // 防线：客户端带了前缀却**没有**省略已覆盖的消息（旧版客户端、或它自己算错了）。
-    //
-    // 这种情况下早期内容会同时以摘要和原文出现：carried 那批摘要拼在前面，而同样的
-    // 消息又被重新分段、命中同样的缓存键、产出同样的摘要拼第二遍。上下文凭空膨胀，
-    // 而且模型会看到重复的历史。
-    //
-    // 判据：前缀自己记着它覆盖了多少原始 token。如果客户端这次发来的量已经追平甚至
-    // 超过那个数，说明它把历史整份又发了一遍 —— 此时**丢掉前缀**、按完整历史重新压，
-    // 结果一定正确（只是这一轮没省到流量）。宁可不省，也不能给模型重复的上下文。
-    if carried_raw > 0 && plan.raw_tokens >= carried_raw {
-        tracing::warn!(
-            %uid, carried_raw, sent_raw = plan.raw_tokens, carried_msgs,
-            "michael-compression: 客户端带了前缀但没省略已覆盖的消息，本轮忽略前缀（避免上下文重复）"
-        );
-        carried_summaries.clear();
-        carried_keys.clear();
-        carried_msgs = 0;
-        carried_raw = 0;
+    // 提前切出旧段：即使原文暂时还塞得进窗口，也要在请求体逼近 3.5MB 前完成预热并签发
+    // 前缀。普通增长型会话因此不会在跨过原生窗口的那一轮突然冷启动。
+    let prefix_trigger = ((budget * 2) / 3)
+        .min(COMPRESSION_PREFIX_TRIGGER_MAX_TOKENS)
+        .max(mc::VERBATIM_TAIL_TOKENS + segment_tokens);
+    if carried.summaries.is_empty() && plan.compress.is_empty() && plan.raw_tokens >= prefix_trigger
+    {
+        plan = mc::plan_for_prefix(&msgs, mc::VERBATIM_TAIL_TOKENS, segment_tokens);
     }
 
-    let total_raw = carried_raw + plan.raw_tokens;
+    // 压缩器目前只读文本。一旦把含图片/音频的整条原消息换成文本摘要，下一轮前缀续传
+    // 又会让客户端彻底省略它，媒体就永久丢了。先明确拒绝，不能以“请求成功”为代价失忆。
+    let compress_through = plan.compress.last().map(|segment| segment.end).unwrap_or(0);
+    if compress_through > 0
+        && body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .skip(pinned)
+                    .take(compress_through)
+                    .any(compression_message_has_nontext_content)
+            })
+    {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            msg: "[mc-nontext-history] michael-compression 暂不能压缩包含图片、音频或文件块的早期消息；请保留该媒体在近期原文或开启新会话"
+                .into(),
+        });
+    }
+
+    let total_raw = carried.raw_tokens + plan.raw_tokens;
     if total_raw > tier.max_input_tokens() {
-        tracing::warn!(
-            model = %model_id, tier = tier.as_str(), total_raw,
-            "michael-compression: 累计输入超出档位上限（尾部逐字保留不受影响）"
-        );
+        return Err(AppError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            msg: format!(
+                "michael-compression: {} 档最多接受 {} token，当前累计约 {} token",
+                tier.as_str(),
+                tier.max_input_tokens(),
+                total_raw
+            ),
+        });
     }
 
     if plan.compress.is_empty() {
         // 没有新段要压。带了前缀就必须把摘要拼回去，否则这一轮历史凭空消失。
-        if carried_summaries.is_empty() {
-            return None; // 没超窗口，一分钱不花，body 未被改动
+        if carried.summaries.is_empty() {
+            return Ok(None); // 没超窗口，一分钱不花，body 未被改动
         }
-        compression_write_back(body, pinned, 0, &carried_summaries);
-        return None; // 前缀没变长，沿用客户端手上那个引用
+        let base_projected = carried_budget + plan.raw_tokens;
+        if base_projected > budget {
+            return Err(AppError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                msg:
+                    "michael-compression: 最新单条消息超过目标模型可用窗口，无法通过压缩旧历史解决"
+                        .into(),
+            });
+        }
+        let query = compression_retrieval_query(&msgs);
+        let retrieved = compression_retrieve_history(
+            state,
+            uid,
+            CompressionRetrievalRequest {
+                query: &query,
+                summaries: &carried.summaries,
+                indexes: &carried.search_indexes,
+                raw_keys: &carried.raw_keys,
+                in_memory: &HashMap::new(),
+                budget_tokens: retrieval_reserve.min(budget.saturating_sub(base_projected)),
+            },
+        )
+        .await?;
+        compression_write_back(
+            body,
+            pinned,
+            0,
+            &carried.summaries,
+            retrieved.text.as_deref(),
+        );
+        tracing::info!(
+            %uid,
+            model = %model_id,
+            tier = tier.as_str(),
+            fixed_overhead,
+            base_projected,
+            retrieval_tokens = retrieved.tokens,
+            retrieval_segments = retrieved.segment_count,
+            retrieval_excerpts = retrieved.excerpt_count,
+            "michael-compression reused prefix with exact-history retrieval"
+        );
+        return Ok(None); // 前缀没变长，沿用客户端手上那个引用
     }
 
     let mut redis = state.redis.clone();
-    let mut summaries: Vec<String> = carried_summaries.clone();
+    let mut summaries: Vec<String> = carried.summaries.clone();
     let mut new_keys: Vec<String> = Vec::with_capacity(plan.compress.len());
     let mut cached = 0usize;
     let mut pending: Vec<(String, String)> = Vec::new();
+    let mut planned_archives = Vec::with_capacity(plan.compress.len());
 
     // 只查缓存。命中的段不花钱、延迟确定；没命中的交给后台预热。
     //
@@ -7839,10 +8819,20 @@ async fn apply_michael_compression(
     let mut broke = false;
     for seg in plan.compress.iter() {
         let text = mc::segment_text(&msgs, seg);
+        let archive =
+            compression_archive_segment(body, pinned, &msgs, seg).ok_or_else(|| AppError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "michael-compression: 无法建立无损历史归档".into(),
+            })?;
+        planned_archives.push(archive);
         // 缓存键**不绑定压缩模型**：后台预热会在供应商之间备选，算这一段的可能不是
         // 内联时会挑中的那家。键一旦绑定模型，内联查询就永远错过后台刚写好的结果，
         // 缓存被切成碎片、每轮都当冷启动。摘要是文本的语义产物，不是模型的产物。
-        let key = mc::segment_cache_key(&text, COMPRESSION_CACHE_NAMESPACE, mc::SEGMENT_SUMMARY_TOKENS);
+        let key = mc::segment_cache_key(
+            &text,
+            COMPRESSION_CACHE_NAMESPACE,
+            mc::SEGMENT_SUMMARY_TOKENS,
+        );
         match mc::cached_summary(&mut redis, &key).await {
             Some(hit) if !broke => {
                 cached += 1;
@@ -7864,12 +8854,43 @@ async fn apply_michael_compression(
 
     let actually_compressed = new_keys.len();
     if actually_compressed == 0 {
-        // 缓存里一段都没有：本轮不压缩，后台已经在算了，下一轮就能命中。
-        tracing::info!(
-            pending = pending.len(),
-            "michael-compression: 缓存尚未预热，本轮不压缩（后台正在生成摘要）"
-        );
-        return bail(body, &carried_summaries);
+        let raw_projected = carried_budget + plan.raw_tokens;
+        if raw_projected <= budget {
+            // 提前预热阶段：原文仍安全，当前请求不必等待后台摘要。
+            if !carried.summaries.is_empty() {
+                let query = compression_retrieval_query(&msgs);
+                let retrieved = compression_retrieve_history(
+                    state,
+                    uid,
+                    CompressionRetrievalRequest {
+                        query: &query,
+                        summaries: &carried.summaries,
+                        indexes: &carried.search_indexes,
+                        raw_keys: &carried.raw_keys,
+                        in_memory: &HashMap::new(),
+                        budget_tokens: retrieval_reserve.min(budget.saturating_sub(raw_projected)),
+                    },
+                )
+                .await?;
+                compression_write_back(
+                    body,
+                    pinned,
+                    0,
+                    &carried.summaries,
+                    retrieved.text.as_deref(),
+                );
+            }
+            return Ok(None);
+        }
+        // 真正超窗时绝不能再把原文直接送上游。503 会被桌面端现有的、可取消的预流
+        // 无限重试接住；每次重试只查 Redis，后台完成后立即进入正常模型请求。
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: format!(
+                "michael-compression warming: 正在准备 {} 个上下文段，请保持本轮运行",
+                pending.len()
+            ),
+        });
     }
     let verbatim_from = plan
         .compress
@@ -7877,38 +8898,119 @@ async fn apply_michael_compression(
         .map(|s| s.end)
         .unwrap_or(0);
 
+    // 摘要命中只代表“可以压缩”，不代表“可以丢掉原文”。在签发覆盖前缀之前，先把每个
+    // 被覆盖段的完整 JSON、逐字文本和检索索引持久化。任何一个 SET 失败都不签发新前缀；
+    // 客户端下轮仍会从旧边界重发这段，数据不会静默消失。
+    let accepted_archives = planned_archives
+        .into_iter()
+        .take(actually_compressed)
+        .collect::<Vec<_>>();
+    let mut new_raw_keys = Vec::with_capacity(accepted_archives.len());
+    let mut new_indexes = Vec::with_capacity(accepted_archives.len());
+    let mut in_memory_archives = HashMap::new();
+    let carried_count = carried.raw_keys.len();
+    let new_summaries = &summaries[carried.summaries.len()..];
+    let raw_storage_complete =
+        compression_persist_archives(state, uid, &accepted_archives, new_summaries).await;
+    for (offset, (raw_key, archive, index)) in accepted_archives.into_iter().enumerate() {
+        in_memory_archives.insert(carried_count + offset, archive);
+        new_raw_keys.push(raw_key);
+        new_indexes.push(index);
+    }
+
+    let mut all_raw_keys = carried.raw_keys.clone();
+    all_raw_keys.extend(new_raw_keys);
+    let mut all_indexes = carried.search_indexes.clone();
+    all_indexes.extend(new_indexes);
+
     // **校验结果真的塞得进窗口。** 此前没有任何环节做这件事：撞到上限就 break、剩下的
     // 段留在原文里，于是第一轮压缩照样发出一个远超窗口的请求 —— 而客户端因为看到档位
     // 已经关掉了自己的裁剪，没有兜底。
-    let projected = carried_budget + mc::projected_tokens_for(&msgs, verbatim_from, new_keys.len());
-    if projected > budget {
+    let tail_tokens: usize = msgs[verbatim_from..]
+        .iter()
+        .map(|message| message.tokens)
+        .sum();
+    let base_projected = mc::actual_summary_tokens(&summaries).saturating_add(tail_tokens);
+    if base_projected > budget {
         tracing::warn!(
-            model = %model_id, tier = tier.as_str(), projected, budget,
+            model = %model_id, tier = tier.as_str(), base_projected, budget,
             elapsed_ms = started.elapsed().as_millis(),
-            "michael-compression: 压缩后仍超窗口，本轮降级为不压缩（请让客户端自行裁剪）"
+            "michael-compression: 连续缓存段尚不足以装入窗口，等待后台预热"
         );
-        return bail(body, &carried_summaries);
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: format!(
+                "michael-compression warming: 已有 {} 段，仍在准备后续 {} 段",
+                actually_compressed,
+                pending.len()
+            ),
+        });
     }
 
-    compression_write_back(body, pinned, verbatim_from, &summaries);
+    let query = compression_retrieval_query(&msgs);
+    let retrieved = compression_retrieve_history(
+        state,
+        uid,
+        CompressionRetrievalRequest {
+            query: &query,
+            summaries: &summaries,
+            indexes: &all_indexes,
+            raw_keys: &all_raw_keys,
+            in_memory: &in_memory_archives,
+            budget_tokens: retrieval_reserve.min(budget.saturating_sub(base_projected)),
+        },
+    )
+    .await?;
+    let projected = base_projected.saturating_add(retrieved.tokens);
+    if projected > budget {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: "michael-compression warming: 精确历史回注仍在重新规划窗口".into(),
+        });
+    }
 
-    let mut all_keys = carried_keys;
+    compression_write_back(
+        body,
+        pinned,
+        verbatim_from,
+        &summaries,
+        retrieved.text.as_deref(),
+    );
+
+    let mut all_keys = carried.summary_keys.clone();
     all_keys.extend(new_keys);
-    let covered = carried_msgs + verbatim_from;
-    let issued = compression_issue_prefix(state, uid, all_keys, covered, total_raw)
-        .await
-        .map(|tok| (tok, covered));
+    let covered = carried.covered_msgs + verbatim_from;
+    // PrefixRecord.raw_tokens 的口径是“已覆盖部分”，不能把仍在逐字尾部、下一轮还会重发的
+    // token 记进去，否则每轮都会重复累计同一段尾部。
+    let newly_covered_raw: usize = msgs[..verbatim_from].iter().map(|m| m.tokens).sum();
+    let covered_raw = carried.raw_tokens + newly_covered_raw;
+    let issued = if raw_storage_complete {
+        compression_issue_prefix(state, uid, all_keys, all_raw_keys, covered, covered_raw)
+            .await
+            .map(|tok| (tok, covered))
+    } else {
+        tracing::warn!(
+            %uid,
+            "michael-compression: 无损原文归档写入不完整，本轮不签发扩展前缀"
+        );
+        None
+    };
 
     tracing::info!(
         %uid, model = %model_id, tier = tier.as_str(),
-        carried_msgs, carried_raw, raw_tokens = plan.raw_tokens, total_raw,
-        pinned, verbatim_from, projected, budget,
+        carried_msgs = carried.covered_msgs, carried_raw = carried.raw_tokens,
+        raw_tokens = plan.raw_tokens, total_raw,
+        pinned, fixed_overhead, verbatim_from, base_projected, projected, budget,
+        retrieval_tokens = retrieved.tokens,
+        retrieval_segments = retrieved.segment_count,
+        retrieval_excerpts = retrieved.excerpt_count,
         segments_cached = cached, segments_pending = pending.len(),
+        raw_storage_complete,
         elapsed_ms = started.elapsed().as_millis(),
         issued_prefix = issued.is_some(),
         "michael-compression applied"
     );
-    issued
+    Ok(issued)
 }
 
 /// 后台预热：把缺的段算出来写进缓存，下一轮请求就能命中。
@@ -7918,53 +9020,142 @@ async fn apply_michael_compression(
 /// 而客户端等响应头只等 15s。放在请求链路里，无论预算设多少都是错的。
 ///
 /// 这里可以从容：90s 单段超时、跨供应商逐个重试。代价只是"第一次长对话那一轮不压缩"。
-fn compression_spawn_warm(state: &AppState, uid: uuid::Uuid, pending: Vec<(String, String)>) {
+async fn compression_warm_one(
+    state: AppState,
+    uid: uuid::Uuid,
+    candidates: std::sync::Arc<Vec<(Model, String)>>,
+    key: String,
+    text: String,
+) -> (usize, usize) {
     use crate::compression as mc;
+    let mut redis = state.redis.clone();
+    if mc::cached_summary(&mut redis, &key).await.is_some() {
+        return (0, 0);
+    }
+
+    // Redis 分布式单飞：多个 IDE 重试或多个网关实例同时看到同一个冷段时，只有一个任务
+    // 真正调用压缩模型，其余等待缓存出现，避免重复扣费和供应商限流风暴。
+    let lock_key = format!("mc:warm:{}", key.trim_start_matches("mc:"));
+    let lock_token = uuid::Uuid::new_v4().simple().to_string();
+    // 一段会依次尝试多个供应商；锁必须覆盖“候选数 × 单供应商超时”的最坏路径，固定
+    // 300 秒在候选较多时会中途过期，另一个重试任务随即重复压缩并重复扣费。
+    let lock_ttl = COMPRESSION_WARM_SEGMENT_TIMEOUT
+        .as_secs()
+        .saturating_mul(candidates.len().max(1) as u64)
+        .saturating_add(60)
+        .clamp(300, 7_200);
+    let acquired: Option<String> = redis::cmd("SET")
+        .arg(&lock_key)
+        .arg(&lock_token)
+        .arg("NX")
+        .arg("EX")
+        .arg(lock_ttl)
+        .query_async(&mut redis)
+        .await
+        .ok()
+        .flatten();
+    if acquired.is_none() {
+        return (0, 0);
+    }
+
+    let mut ok = false;
+    for (conn, id) in candidates.iter() {
+        match tokio::time::timeout(
+            COMPRESSION_WARM_SEGMENT_TIMEOUT,
+            compression_summarize(conn, id, &text),
+        )
+        .await
+        {
+            Ok(Some(call)) => {
+                mc::store_summary(&mut redis, &key, &call.summary).await;
+                bill_compression_call(&state, uid, conn, id, call.usage.as_ref()).await;
+                ok = true;
+                break;
+            }
+            other => {
+                tracing::warn!(
+                    compressor = %id, base_url = %conn.base_url,
+                    timed_out = other.is_err(),
+                    "michael-compression: 预热段失败，换下一个供应商"
+                );
+            }
+        }
+    }
+
+    // 只释放自己持有的锁；TTL 到期后若另一个任务已接管，不能误删对方的新锁。
+    let _: Result<i32, redis::RedisError> = redis::cmd("EVAL")
+        .arg("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end")
+        .arg(1)
+        .arg(&lock_key)
+        .arg(&lock_token)
+        .query_async(&mut redis)
+        .await;
+
+    if ok {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
+}
+
+fn compression_spawn_warm(state: &AppState, uid: uuid::Uuid, pending: Vec<(String, String)>) {
+    use futures_util::StreamExt;
+    let Some(first_key) = pending.first().map(|(key, _)| key.clone()) else {
+        return;
+    };
     let state = state.clone();
     tokio::spawn(async move {
+        // 同一个连续缺口只允许一个批任务。IDE 在预热期间会每 1.2s 重试一次；没有这层锁，
+        // 每次重试都会重新查模型目录并创建 100 多个子任务，即使段锁最终挡住了真实调用。
+        let batch_lock_key = format!("mc:warm-batch:{}", first_key.trim_start_matches("mc:"));
+        let batch_lock_token = uuid::Uuid::new_v4().simple().to_string();
+        let mut lock_redis = state.redis.clone();
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(&batch_lock_key)
+            .arg(&batch_lock_token)
+            .arg("NX")
+            .arg("EX")
+            .arg(1_800u64)
+            .query_async(&mut lock_redis)
+            .await
+            .ok()
+            .flatten();
+        if acquired.is_none() {
+            return;
+        }
         let candidates = compression_pick_compressors(&state).await;
         if candidates.is_empty() {
             tracing::warn!("michael-compression: 后台预热没有可用的压缩模型");
+            let _: Result<i32, redis::RedisError> = redis::cmd("EVAL")
+                .arg("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end")
+                .arg(1)
+                .arg(&batch_lock_key)
+                .arg(&batch_lock_token)
+                .query_async(&mut lock_redis)
+                .await;
             return;
         }
-        let mut redis = state.redis.clone();
-        let (mut warmed, mut failed) = (0usize, 0usize);
-        // 顺序跑：后台没有延迟压力，而顺序对便宜模型的限流最友好。
-        for (key, text) in pending.into_iter().take(COMPRESSION_WARM_MAX_SEGMENTS) {
-            // 另一个并发的预热任务可能已经算好了这一段。
-            if mc::cached_summary(&mut redis, &key).await.is_some() {
-                continue;
-            }
-            let mut ok = false;
-            for (conn, id) in &candidates {
-                match tokio::time::timeout(
-                    COMPRESSION_WARM_SEGMENT_TIMEOUT,
-                    compression_summarize(conn, id, &text),
-                )
-                .await
-                {
-                    Ok(Some(call)) => {
-                        mc::store_summary(&mut redis, &key, &call.summary).await;
-                        bill_compression_call(&state, uid, conn, id, call.usage.as_ref()).await;
-                        warmed += 1;
-                        ok = true;
-                        break;
-                    }
-                    other => {
-                        tracing::warn!(
-                            compressor = %id, base_url = %conn.base_url,
-                            timed_out = other.is_err(),
-                            "michael-compression: 预热段失败，换下一个供应商"
-                        );
-                    }
-                }
-            }
-            if !ok {
-                failed += 1;
-                // 一段都压不出来说明所有供应商此刻都不行，后面的段也别白试了。
-                break;
-            }
-        }
+        let candidates = std::sync::Arc::new(candidates);
+        let results = futures_util::stream::iter(
+            pending
+                .into_iter()
+                .take(COMPRESSION_WARM_MAX_SEGMENTS)
+                .map(|(key, text)| {
+                    compression_warm_one(state.clone(), uid, candidates.clone(), key, text)
+                }),
+        )
+        .buffer_unordered(COMPRESSION_WARM_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        let warmed: usize = results.iter().map(|(w, _)| *w).sum();
+        let failed: usize = results.iter().map(|(_, f)| *f).sum();
+        let _: Result<i32, redis::RedisError> = redis::cmd("EVAL")
+            .arg("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end")
+            .arg(1)
+            .arg(&batch_lock_key)
+            .arg(&batch_lock_token)
+            .query_async(&mut lock_redis)
+            .await;
         tracing::info!(%uid, warmed, failed, "michael-compression: 后台预热结束");
     });
 }

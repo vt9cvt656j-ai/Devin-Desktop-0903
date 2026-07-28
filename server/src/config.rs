@@ -30,6 +30,7 @@ pub struct Config {
     pub transcribe_url: String,
     pub transcribe_model: String,
     pub ide_update_manifest_url: String,
+    pub ide_update_public_base: String,
     pub ide_release_github_token: String,
     pub ide_release_github_repo: String,
     pub ide_release_github_workflow: String,
@@ -69,6 +70,8 @@ impl Config {
                 "IDE_UPDATE_MANIFEST_URL",
                 "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json",
             ),
+            // 私有仓库的安装包由网关代下载；清单里的下载地址重写到这个公网基址。
+            ide_update_public_base: opt("IDE_UPDATE_PUBLIC_BASE", "https://code.mrday.one"),
             ide_release_github_token: std::env::var("IDE_RELEASE_GITHUB_TOKEN")
                 .unwrap_or_default(),
             ide_release_github_repo: opt(

@@ -283,6 +283,7 @@ const EN = {
   "model.thinking.reason.minimax": "MiniMax currently has no reliable public reasoning_effort/thinking budget tiers; IDE will not send fake parameters.",
   "model.thinking.reason.unknown": "Unknown models have no public adjustable reasoning parameter; IDE will not send fake reasoning_effort.",
   "model.account": "Account & credits",
+  "model.custom": "Custom models",
 
   "feature.title": "Advanced Settings",
   "feature.tabsLabel": "Advanced Settings tabs",
@@ -835,6 +836,7 @@ const ZH_CN = {
   "model.thinking.reason.minimax": "MiniMax 当前没有可靠公开的 reasoning_effort/thinking budget 档位；IDE 不发送假参数。",
   "model.thinking.reason.unknown": "未知模型没有公开可调思考参数；IDE 不发送假 reasoning_effort。",
   "model.account": "账号与额度",
+  "model.custom": "自定义模型",
   "feature.title": "高级设置",
   "feature.tabsLabel": "高级设置标签页",
   "feature.close": "关闭",
@@ -1260,6 +1262,7 @@ const JA = {
   "model.thinking.reason.minimax": "MiniMax は現在、信頼できる公開 reasoning_effort / thinking budget 段階を提供していないため、IDE は偽のパラメータを送信しません。",
   "model.thinking.reason.unknown": "不明なモデルには公開された調整可能な思考パラメータがないため、IDE は偽の reasoning_effort を送信しません。",
   "model.account": "アカウントとクレジット",
+  "model.custom": "カスタムモデル",
   "feature.title": "詳細設定",
   "feature.tabsLabel": "詳細設定のタブ",
   "feature.close": "閉じる",
@@ -1481,7 +1484,9 @@ const adhocI18nQueues = new Map();
 const adhocI18nCaches = new Map();
 const adhocTextSources = new WeakMap();
 const adhocAttrSources = new WeakMap();
-const ADHOC_I18N_CACHE_VERSION = "v5";
+// v6: v5 caches were poisoned — the ad-hoc translator hallucinated on model ids
+// ("claude-opus-5" → "claude-sonnet-5"), so bump the version to discard them.
+const ADHOC_I18N_CACHE_VERSION = "v6";
 const ADHOC_I18N_CACHE_MAX_ENTRIES = 4000;
 // Hard fuse: without it a single cache-miss loop turned into ~340k requests/day
 // against /api/i18n/pack (2026-07-25 production incident).
@@ -1525,6 +1530,11 @@ const AUTO_I18N_SKIP_SELECTOR = [
   ".diff-view__body",
   ".statusbar__right",
   ".ref-chip",
+  // Model picker + hover card: model names are PRODUCT IDENTIFIERS, not UI copy.
+  // Sending them to the AI translator produced hallucinated renames (opus→sonnet).
+  ".model-picker",
+  "#modelMenu",
+  ".model-info-card",
   ".chat",
   "#chat",
   ".markdown-body",
@@ -1767,6 +1777,9 @@ function looksLikeUserPathOrCode(text) {
   if (/^[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}$/.test(s)) return true;
   if (/^[#.]?[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*){1,}$/.test(s)) return true;
   if (/^[A-Z0-9_./:-]{8,}$/.test(s) && /[._/:\\-]/.test(s)) return true;
+  // Hyphen/dot slugs like model ids (claude-opus-5, gpt-5.4-mini, grok-4.5) are
+  // identifiers, not sentences — translating them invites hallucinated renames.
+  if (/^[A-Za-z][\w.]*(?:-[\w.]+)+$/.test(s) && !/\s/.test(s)) return true;
   return false;
 }
 
@@ -2184,6 +2197,7 @@ export function initLocale() {
       localStorage.removeItem(`michael-ide.i18n-pack.${tag}.v2`);
       localStorage.removeItem(`michael-ide.i18n-adhoc.${tag}.v3`);
       localStorage.removeItem(`michael-ide.i18n-adhoc.${tag}.v4`);
+      localStorage.removeItem(`michael-ide.i18n-adhoc.${tag}.v5`); // poisoned: hallucinated model-id "translations"
     }
   } catch {}
   try { document.documentElement.lang = currentLocale; } catch {}
