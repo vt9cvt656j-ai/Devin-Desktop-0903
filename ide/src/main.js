@@ -1724,7 +1724,7 @@ const monacoEditor = monaco.editor.create(editorEl, {
   inlineSuggest: { enabled: true, mode: "subwordSmart" },
   fontSize: 13,
   fontFamily: "SF Mono, ui-monospace, Menlo, monospace",
-  minimap: { enabled: true, maxColumn: 80, renderCharacters: false, scale: 1, showSlider: "mouseover" },
+  minimap: { enabled: true, maxColumn: 80, renderCharacters: false, scale: 1 },
   scrollBeyondLastLine: false,
   renderWhitespace: "selection",
   glyphMargin: true,
@@ -51214,6 +51214,17 @@ if (inTauri) {
       _cachedHomeDir = home;
       backend.registerWorkspaceRoot(home).catch(() => {});
     }
+  }).catch(() => {});
+
+  // macOS fullscreen hides the traffic lights; mirror that state onto <body> so
+  // the titlebar can drop the 84px reserved for them (logo + menus slide left).
+  import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+    const currentWindow = getCurrentWindow();
+    const _syncFullscreen = () => currentWindow.isFullscreen()
+      .then(fs => document.body.classList.toggle("is-fullscreen", !!fs))
+      .catch(() => {});
+    _syncFullscreen();
+    currentWindow.onResized(() => _syncFullscreen()).catch(() => {});
   }).catch(() => {});
 }
 
