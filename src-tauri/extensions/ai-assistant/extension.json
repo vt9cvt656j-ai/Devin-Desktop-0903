@@ -1,0 +1,18 @@
+{
+  "id": "michael.ai-assistant",
+  "name": "AI Code Assistant",
+  "version": "1.0.0",
+  "description": "AI-powered code explanation, refactoring, and bug detection. Supports OpenAI, Claude, and local models.",
+  "author": "Michael IDE",
+  "main": "index.js",
+  "permissions": ["editor", "network"],
+  "contributes": {
+    "commands": [
+      { "id": "ai.explain", "title": "AI: Explain Selected Code" },
+      { "id": "ai.refactor", "title": "AI: Refactor Selected Code" },
+      { "id": "ai.findBugs", "title": "AI: Find Bugs in File" },
+      { "id": "ai.generateTests", "title": "AI: Generate Unit Tests" },
+      { "id": "ai.addComments", "title": "AI: Add Documentation Comments" }
+    ]
+  }
+}

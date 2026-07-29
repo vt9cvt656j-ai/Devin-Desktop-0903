@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Michael IDE",
+  "version": "0.3.16",
+  "identifier": "ai.devin.ide",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5174 --strictPort",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Michael IDE",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "assetProtocol": { "enable": true, "scope": ["$RESOURCE/**", "$APPDATA/**", "$TEMP/**"] },
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; media-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https:; frame-src 'self' asset: http://asset.localhost; object-src 'self' asset: http://asset.localhost; base-uri 'self'; form-action 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/automation-server"
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "copyright": "Copyright (c) 2026 weiligon",
+    "shortDescription": "A macOS-style code editor with an AI assistant sidebar.",
+    "longDescription": "Michael IDE is a native-feeling code editor built on Tauri and Monaco, with a managed AI gateway and an autonomous coding assistant."
+  },
+  "plugins": {
+    "macos-fps": {},
+    "updater": {
+      "endpoints": [
+        "https://code.mrday.one/api/ide/update",
+        "https://github.com/fendoushaonian/Devin-Desktop/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5QjAyOUI0QUYxRTA1RjkKUldUNUJSNnZ0Q213bWNhMkRoYVdWaTZRMVFub2YweFcvNHNmQzhTUVhrZVJUWVNHWkxPMlB1eUQK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

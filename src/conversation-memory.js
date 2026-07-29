@@ -1,0 +1,915 @@
+/**
+ * Hierarchical conversation memory with LLM-powered intelligent compression.
+ * The LLM decides what's important based on CONTENT, not position — a key
+ * decision from message #3 stays while a verbose tool dump from #48 gets
+ * condensed. No fixed "keep last N" window.
+ *
+ * Structure: summaries (compressed context) + recent (new messages since
+ * last compaction). LLM compaction is driven by main.js.
+ */
+
+const RECENT_WINDOW = 100;
+const MAX_SUMMARIES = 8;
+const SUMMARY_BATCH = 10;
+const PERSISTED_MEDIA_BUDGET = 3_200_000;
+const MAX_ARCHIVE = 400;          // archived (compacted-away) turns kept for recall
+const ARCHIVE_ENTRY_MAX = 1600;   // chars per archived turn
+const MAX_MILESTONES = 60;
+const MERGED_SUMMARY_MAX = 8000;  // merged summary text cap (head+tail keep)
+const MAX_CORRECTIONS = 160;
+const CORRECTION_TEXT_MAX = 420;
+const CORRECTION_PREFIX_MAX = 8;
+
+// Tokenizer for archival search: latin words + CJK bigrams (MemGPT-style
+// archival memory needs retrieval that works for Chinese without a segmenter).
+function memSearchTokens(s) {
+  const lower = String(s || '').toLowerCase();
+  const out = new Set();
+  for (const w of lower.match(/[a-z0-9_$./-]{2,}/g) || []) out.add(w);
+  for (const run of lower.match(/[\u3400-\u9fff]+/g) || []) {
+    if (run.length === 1) out.add(run);
+    for (let i = 0; i < run.length - 1; i++) out.add(run.slice(i, i + 2));
+  }
+  return [...out].slice(0, 64);
+}
+
+function cleanCorrectionText(value, max = CORRECTION_TEXT_MAX) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/**
+ * Extract only high-confidence, explicit replacements. General complaints such
+ * as "still slow" deliberately do not create a factual correction.
+ */
+export function extractExplicitCorrection(value) {
+  const text = cleanCorrectionText(value, 1200);
+  if (text.length < 4) return null;
+  const patterns = [
+    /(?:不是|并非)\s*([^，,。；;]{1,180})\s*(?:，|,|；|;)\s*(?:而是|是|应该是|应为|正确的是|改成)\s*([^。；;]{1,260})/i,
+    /(?:不是|并非)\s*([^，。；;]{1,180})\s*(?:，|,|；|;)?\s*(?:而是|应该是|应为|正确的是|改成)\s*([^。；;]{1,260})/i,
+    /(?:不要|别用|不该用)\s*([^，。；;]{1,180})\s*(?:，|,|；|;)\s*(?:要用|改用|请用|应该用|用)\s*([^。；;]{1,260})/i,
+    /([^，。；;]{2,180})\s*(?:不对|错了|是错的)\s*(?:，|,|；|;)?\s*(?:正确的是|应该是|应为|改成)\s*([^。；;]{1,260})/i,
+    /\bnot\s+(.{1,180}?),\s*(?:but|use|it is|should be)\s+(.{1,260})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const incorrect = cleanCorrectionText(match[1], 240);
+    const corrected = cleanCorrectionText(match[2], 360);
+    if (incorrect.length >= 2 && corrected.length >= 2 && incorrect.toLowerCase() !== corrected.toLowerCase()) {
+      return { incorrect, corrected, explicitReplacement: true };
+    }
+  }
+  const general = /^(?:不对|错了|你搞错了|你理解错了|不是这样|我的意思是|纠正一下|更正一下|no[,，:]?|that's wrong[,，:]?)\s*/i;
+  if (!general.test(text)) return null;
+  const corrected = cleanCorrectionText(text.replace(general, ''), 500);
+  if (corrected.length < 4) return null;
+  return { incorrect: '', corrected, explicitReplacement: false };
+}
+
+function serializeLocationEvidence(evidence) {
+  if (!evidence || typeof evidence !== 'object') return undefined;
+  const latitude = evidence.latitude;
+  const longitude = evidence.longitude;
+  const hasCoordinates = typeof latitude === 'number' && Number.isFinite(latitude) && latitude >= -90 && latitude <= 90
+    && typeof longitude === 'number' && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180;
+  const statuses = new Set([
+    'embedded_location_absent',
+    'embedded_location_unreadable',
+    'embedded_gps',
+    'embedded_gps_resolved',
+    'embedded_gps_unresolved',
+    'embedded_gps_reverse_failed',
+  ]);
+  const status = statuses.has(evidence.status) ? evidence.status : (hasCoordinates ? 'embedded_gps' : 'embedded_location_absent');
+  const cleanText = (value, max = 500) => typeof value === 'string' ? value.slice(0, max) : null;
+  const candidate = (value) => {
+    if (!value || typeof value !== 'object') return null;
+    const out = {};
+    for (const key of ['source', 'label', 'house_number', 'road', 'neighborhood', 'suburb', 'city_district', 'city', 'state', 'country', 'country_code']) {
+      const text = cleanText(value[key]);
+      if (text) out[key] = text;
+    }
+    const lat = value.latitude, lon = value.longitude;
+    if (typeof lat === 'number' && Number.isFinite(lat) && lat >= -90 && lat <= 90) out.latitude = lat;
+    if (typeof lon === 'number' && Number.isFinite(lon) && lon >= -180 && lon <= 180) out.longitude = lon;
+    return Object.keys(out).length ? out : null;
+  };
+  const out = {
+    status,
+    coordinateSource: hasCoordinates ? 'embedded_exif_gps' : null,
+    metadataAuthenticity: 'not_verified',
+  };
+  if (['source_file_changed', 'missing_source_fingerprint'].includes(evidence.invalidatedReason)) {
+    out.invalidatedReason = evidence.invalidatedReason;
+  }
+  if (hasCoordinates) {
+    out.latitude = latitude;
+    out.longitude = longitude;
+    const accuracy = evidence.reportedAccuracyM;
+    out.reportedAccuracyM = typeof accuracy === 'number' && Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null;
+  }
+  out.reverseGeocoding = (Array.isArray(evidence.reverseGeocoding) ? evidence.reverseGeocoding : [])
+    .slice(0, 4).map(candidate).filter(Boolean);
+  out.sourceStatuses = (Array.isArray(evidence.sourceStatuses) ? evidence.sourceStatuses : [])
+    .slice(0, 4).map((value) => ({
+      source: cleanText(value?.source, 120) || 'unknown',
+      status: cleanText(value?.status, 40) || 'unknown',
+      detail: cleanText(value?.detail, 500) || '',
+    }));
+  out.retrievedAt = typeof evidence.retrievedAt === 'number' && Number.isFinite(evidence.retrievedAt) ? evidence.retrievedAt : null;
+  out.limitations = (Array.isArray(evidence.limitations) ? evidence.limitations : [])
+    .slice(0, 10).map((value) => cleanText(value, 600)).filter(Boolean);
+  return out;
+}
+
+// Keep enough recent visual context to survive a restart without letting base64
+// media overflow localStorage. Raw videos are never persisted; their compressed
+// key frames (or a stable local path) are the durable representation.
+function serializeAttachment(attachment, budget) {
+  if (!attachment || typeof attachment !== 'object') return null;
+  const kind = attachment.kind === 'video' ? 'video' : 'image';
+  let budgetOmitted = 0;
+  const out = {
+    id: String(attachment.id || '').slice(0, 160),
+    kind,
+    mime: String(attachment.mime || attachment.type || (kind === 'video' ? 'video/mp4' : 'image/png')).slice(0, 120),
+    name: String(attachment.name || (kind === 'video' ? 'video' : 'image')).slice(0, 240),
+    path: String(attachment.path || '').slice(0, 2048),
+    sourceFingerprint: typeof attachment.sourceFingerprint === 'string'
+      ? attachment.sourceFingerprint.slice(0, 120) : '',
+    visionText: String(attachment.visionText || '').slice(0, 6000),
+    locationVisionText: String(attachment.locationVisionText || '').slice(0, 6000),
+    modelMediaSanitized: attachment.modelMediaSanitized === true
+      ? true
+      : attachment.modelMediaSanitized === false ? false : undefined,
+    mediaSourceChanged: attachment.mediaSourceChanged === true,
+    locationEvidence: serializeLocationEvidence(attachment.locationEvidence),
+    frames: [],
+  };
+  const keepDataUrl = (value, prefix) => {
+    const data = typeof value === 'string' && value.startsWith(prefix) ? value : '';
+    if (!data) return '';
+    if (data.length > budget.remaining) {
+      budgetOmitted++;
+      return '';
+    }
+    budget.remaining -= data.length;
+    return data;
+  };
+  if (kind === 'image') {
+    const dataUrl = keepDataUrl(attachment.dataUrl, 'data:image/');
+    if (dataUrl) out.dataUrl = dataUrl;
+  }
+  for (const frame of Array.isArray(attachment.frames) ? attachment.frames.slice(0, 4) : []) {
+    const data = keepDataUrl(frame, 'data:image/');
+    if (data) out.frames.push(data);
+  }
+  const priorOmitted = !!attachment.omitted;
+  const hasDurableMedia = !!(out.path || out.dataUrl || out.frames.length);
+  if (budgetOmitted || priorOmitted || !hasDurableMedia) {
+    out.omitted = true;
+    out.omittedReason = budgetOmitted
+      ? 'persistence_media_budget'
+      : String(attachment.omittedReason || (kind === 'video' ? 'raw_video_not_persisted' : 'media_unavailable')).slice(0, 120);
+    out.omittedCount = Math.max(1, Number(attachment.omittedCount) || 0, budgetOmitted);
+  }
+  return out;
+}
+
+const LOCAL_TEXT_TRUNCATION_MARKER = '\n...[local recovery mirror truncated; full history remains on disk]...\n';
+
+function serializeTextWithBudget(value, textBudget) {
+  if (typeof value !== 'string' || !textBudget || typeof textBudget !== 'object') return value;
+  textBudget.remaining = Math.max(0, Number(textBudget.remaining) || 0);
+  const perValue = Math.max(0, Number(textBudget.perValue) || textBudget.remaining);
+  const keep = Math.min(value.length, textBudget.remaining, perValue);
+  if (value.length <= keep) {
+    textBudget.remaining -= value.length;
+    return value;
+  }
+  if (keep <= 0) return '';
+  let result;
+  if (keep <= LOCAL_TEXT_TRUNCATION_MARKER.length + 32) {
+    result = value.slice(-keep);
+  } else {
+    const available = keep - LOCAL_TEXT_TRUNCATION_MARKER.length;
+    const head = Math.ceil(available * 0.55);
+    result = value.slice(0, head) + LOCAL_TEXT_TRUNCATION_MARKER + value.slice(-(available - head));
+  }
+  textBudget.remaining -= result.length;
+  return result;
+}
+
+function serializeMessageText(message, textBudget) {
+  if (!message || typeof message !== 'object' || !textBudget) return message;
+  if (typeof message.content === 'string') {
+    message.content = serializeTextWithBudget(message.content, textBudget);
+  } else if (Array.isArray(message.content)) {
+    const content = new Array(message.content.length);
+    for (let index = message.content.length - 1; index >= 0; index--) {
+      const raw = message.content[index];
+      if (!raw || typeof raw !== 'object') { content[index] = raw; continue; }
+      const part = { ...raw };
+      if (typeof part.text === 'string') part.text = serializeTextWithBudget(part.text, textBudget);
+      if (part.image_url && typeof part.image_url === 'object' && typeof part.image_url.url === 'string') {
+        part.image_url = { ...part.image_url, url: serializeTextWithBudget(part.image_url.url, textBudget) };
+      }
+      content[index] = part;
+    }
+    message.content = content;
+  }
+  if (Array.isArray(message.tool_calls)) {
+    const calls = new Array(message.tool_calls.length);
+    for (let index = message.tool_calls.length - 1; index >= 0; index--) {
+      const raw = message.tool_calls[index];
+      if (!raw || typeof raw !== 'object') { calls[index] = raw; continue; }
+      const call = { ...raw };
+      if (call.function && typeof call.function === 'object') {
+        call.function = { ...call.function };
+        if (typeof call.function.arguments === 'string') {
+          call.function.arguments = serializeTextWithBudget(call.function.arguments, textBudget);
+        }
+      }
+      calls[index] = call;
+    }
+    message.tool_calls = calls;
+  }
+  return message;
+}
+
+export function serializeMessagesForPersistence(messages, mediaBudget = PERSISTED_MEDIA_BUDGET, options = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  // Callers serializing several queues or sessions may pass one shared budget
+  // object so the aggregate media payload stays bounded.
+  const budget = mediaBudget && typeof mediaBudget === 'object'
+    ? mediaBudget
+    : { remaining: Math.max(0, Number(mediaBudget) || 0) };
+  budget.remaining = Math.max(0, Number(budget.remaining) || 0);
+  const out = new Array(list.length);
+  // Spend the bounded media budget on the newest turns first.
+  for (let i = list.length - 1; i >= 0; i--) {
+    let message = list[i] && typeof list[i] === 'object' ? { ...list[i] } : list[i];
+    message = serializeMessageText(message, options?.textBudget);
+    if (message && Array.isArray(message.attachments)) {
+      message.attachments = message.attachments
+        .map((attachment) => serializeAttachment(attachment, budget))
+        .filter(Boolean);
+    }
+    out[i] = message;
+  }
+  return out;
+}
+
+export class ConversationMemory {
+  constructor() {
+    this.totalTurns = 0;
+    this.recent = [];
+    this.summaries = [];
+    this.milestones = [];
+    this.fileEvidence = [];
+    // The prompt-facing memory below is intentionally compacted. Keep a separate
+    // append-only transcript for durable chat recovery so saving tokens can never
+    // discard what the user or agent actually said.
+    this.transcript = [];
+    // `transcript` may be only the in-process tail after a restart. Its first
+    // item still has a stable, absolute journal sequence so a new append can
+    // never overwrite the beginning of a long SQLite transcript.
+    this.transcriptOffset = 0;
+    // Archival memory (MemGPT/Letta-style): compacted-away turns keep a bounded
+    // text-only record here, searchable via searchArchive() / the recall tool,
+    // so compression no longer means permanent loss of early details.
+    this.archive = [];
+    // Append-only overlay. Raw conversation/archive entries remain untouched;
+    // newer correction records supersede older beliefs during retrieval.
+    this.corrections = [];
+    this._onMessagesRemoved = null;
+    this._onTranscriptMutation = null;
+    this._externalCompression = false;
+    this._recentChars = 0;
+  }
+
+  setExternalCompression(enabled) {
+    this._externalCompression = !!enabled;
+  }
+
+  setRemovalHandler(handler) {
+    this._onMessagesRemoved = typeof handler === 'function' ? handler : null;
+  }
+
+  setTranscriptMutationHandler(handler) {
+    this._onTranscriptMutation = typeof handler === 'function' ? handler : null;
+  }
+
+  _notifyTranscriptMutation(mutation) {
+    if (!this._onTranscriptMutation) return;
+    try { this._onTranscriptMutation(mutation); } catch {}
+  }
+
+  _notifyMessagesRemoved(messages) {
+    if (!messages?.length || !this._onMessagesRemoved) return;
+    try { this._onMessagesRemoved(messages); } catch {}
+  }
+
+  push(msg) {
+    const sequence = this.transcriptOffset + this.transcript.length;
+    this.totalTurns++;
+    this.transcript.push(msg);
+    this.totalTurns = Math.max(this.totalTurns, sequence + 1);
+    this._notifyTranscriptMutation({ kind: 'append', sequence, message: msg });
+    this.recent.push(msg);
+    this._recentChars += ConversationMemory._messageChars(msg);
+    // Adaptive compression: by count (long chats of short turns) OR by token
+    // pressure (few turns but huge tool outputs). Threshold sits ABOVE the LLM
+    // auto-compact trigger (~28k in main.js) so the smart compactor gets first
+    // shot; this is the mechanical safety net.
+    if (!this._externalCompression && (this.recent.length > RECENT_WINDOW
+        || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000))) {
+      this._compressOldestBatch();
+    }
+  }
+
+  // Display/recovery deliberately reads this durable record, whereas assemble()
+  // remains the bounded, prompt-facing view. Falling back to `recent` keeps
+  // snapshots created by older app versions readable.
+  transcriptEntries() {
+    return this.transcript.length || this.transcriptOffset > 0 ? this.transcript : this.recent;
+  }
+
+  transcriptLength() {
+    return this.transcriptOffset + this.transcriptEntries().length;
+  }
+
+  transcriptSlice(from = 0, to = this.transcriptLength()) {
+    const entries = this.transcriptEntries();
+    const length = this.transcriptLength();
+    const start = Math.max(0, Math.min(length, Math.trunc(Number(from) || 0)));
+    const end = Math.max(start, Math.min(length, Math.trunc(Number(to) || 0)));
+    const localStart = Math.max(0, start - this.transcriptOffset);
+    const localEnd = Math.max(localStart, Math.min(entries.length, end - this.transcriptOffset));
+    return entries.slice(localStart, localEnd);
+  }
+
+  // SQLite restores the compact prompt projection first, then supplies the exact
+  // transcript only when this tab is opened. Hydration must not emit a journal
+  // mutation: these records already exist durably and re-appending would create
+  // duplicate work on every restart.
+  replaceTranscript(messages) {
+    this.transcript = Array.isArray(messages) ? messages.slice() : [];
+    this.transcriptOffset = 0;
+    this.totalTurns = this.transcript.length;
+    if (!this.recent.length && this.transcript.length) {
+      this.recent = this.transcript.slice(-RECENT_WINDOW);
+      this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    }
+    return this.transcript.length;
+  }
+
+  // Editing/resending a historical user turn invalidates every later turn. Keep
+  // the exact retained transcript, then rebuild the compact prompt projection
+  // so stale summaries or archive entries cannot steer the next model call.
+  truncateTranscript(index) {
+    const cut = Math.max(0, Math.min(this.transcriptLength(), Math.trunc(Number(index) || 0)));
+    const localCut = Math.max(0, Math.min(this.transcript.length, cut - this.transcriptOffset));
+    const removed = this.transcript.slice(localCut);
+    if (cut <= this.transcriptOffset) {
+      this.transcript = [];
+      this.transcriptOffset = cut;
+    } else {
+      this.transcript = this.transcript.slice(0, localCut);
+    }
+    this.totalTurns = cut;
+    this.recent = this.transcript.slice();
+    this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    this.summaries = [];
+    this.archive = [];
+    this.milestones = this.milestones.filter((item) => Number(item?.turn) <= this.totalTurns);
+    this.fileEvidence = [];
+    this.corrections = this.corrections.filter((item) => {
+      const sourceTurns = Array.isArray(item?.sourceTurns) ? item.sourceTurns : [];
+      return sourceTurns.every((turn) => Number(turn) <= this.totalTurns);
+    });
+    while (this.recent.length > RECENT_WINDOW) this._compressOldestBatch();
+    this._notifyMessagesRemoved(removed);
+    this._notifyTranscriptMutation({ kind: 'truncate', length: cut });
+    return removed;
+  }
+
+  // The durable journal is authoritative after startup. Keep only a bounded
+  // prompt projection in memory, but advance the absolute append sequence to
+  // its real length before accepting another user turn.
+  setExternalTranscriptLength(length) {
+    const total = Math.max(0, Math.trunc(Number(length) || 0));
+    if (!this.transcript.length) this.transcriptOffset = total;
+    this.totalTurns = Math.max(total, this.transcriptOffset + this.transcript.length);
+    return this.totalTurns;
+  }
+
+  // Used after a historical edit. These messages are deliberately not inserted
+  // into `transcript`: they already exist in SQLite and must not be re-appended.
+  replacePromptTail(messages, totalTurns = this.totalTurns) {
+    this.recent = Array.isArray(messages) ? messages.slice(-RECENT_WINDOW) : [];
+    this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    this.summaries = [];
+    this.archive = [];
+    this.fileEvidence = [];
+    this.totalTurns = Math.max(0, Math.trunc(Number(totalTurns) || 0));
+    return this.recent.length;
+  }
+
+  markMilestone(event) {
+    this.milestones.push({ turn: this.totalTurns, event });
+    if (this.milestones.length > MAX_MILESTONES) {
+      // Keep the earliest few (project framing) + the most recent ones.
+      this.milestones = [...this.milestones.slice(0, 8), ...this.milestones.slice(-(MAX_MILESTONES - 8))];
+    }
+  }
+
+  _archiveBatch(removed, startTurn) {
+    for (let i = 0; i < removed.length; i++) {
+      const msg = removed[i];
+      const role = msg?.role === 'assistant' ? 'assistant' : msg?.role === 'user' ? 'user' : msg?.role === 'tool' ? 'tool' : 'system';
+      let text = typeof msg?.content === 'string' ? msg.content.replace(/\s+/g, ' ').trim() : '';
+      if (msg?.tool_calls?.length) {
+        const names = msg.tool_calls.map((tc) => tc?.function?.name).filter(Boolean).join(', ');
+        if (names) text = (text ? text + ' ' : '') + `[调用工具: ${names}]`;
+      }
+      if (!text) continue;
+      this.archive.push({ turn: startTurn + i, role, text: text.slice(0, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
+    }
+    if (this.archive.length > MAX_ARCHIVE) this.archive.splice(0, this.archive.length - MAX_ARCHIVE);
+  }
+
+  _activeCorrections(query = '', k = CORRECTION_PREFIX_MAX) {
+    if (!this.corrections.length) return [];
+    const superseded = new Set(this.corrections.map((item) => item?.supersedes).filter(Boolean));
+    const active = this.corrections.filter((item) => item && item.id && !superseded.has(item.id));
+    const q = cleanCorrectionText(query, 800).toLowerCase();
+    const terms = memSearchTokens(q);
+    const scored = active.map((item, index) => {
+      const haystack = `${item.incorrect || ''} ${item.corrected || ''} ${(item.topicTerms || []).join(' ')}`.toLowerCase();
+      let score = q && haystack.includes(q) ? Math.max(12, q.length * 3) : 0;
+      for (const term of terms) if (haystack.includes(term)) score += Math.max(1, term.length);
+      return { item, index, score };
+    });
+    const selected = q ? scored.filter((row) => row.score > 0) : scored;
+    selected.sort((a, b) => b.score - a.score || b.item.createdAt - a.item.createdAt || b.index - a.index);
+    return selected.slice(0, Math.max(1, Math.min(20, Number(k) || CORRECTION_PREFIX_MAX))).map((row) => ({ ...row.item }));
+  }
+
+  activeCorrections(query = '', k = CORRECTION_PREFIX_MAX) {
+    return this._activeCorrections(query, k);
+  }
+
+  recordCorrection(input = {}) {
+    const incorrect = cleanCorrectionText(input.incorrect);
+    const corrected = cleanCorrectionText(input.corrected);
+    if (corrected.length < 2 || (incorrect && incorrect.toLowerCase() === corrected.toLowerCase())) return null;
+    const requestedSupersedes = cleanCorrectionText(input.supersedes, 160);
+    const priorRecord = requestedSupersedes
+      ? this.corrections.find((item) => item?.id === requestedSupersedes)
+      : null;
+    const aliases = [...new Set([
+      ...(Array.isArray(input.aliases) ? input.aliases : []),
+      ...(Array.isArray(priorRecord?.aliases) ? priorRecord.aliases : []),
+      priorRecord?.incorrect,
+    ].map((value) => cleanCorrectionText(value, 240)).filter(Boolean))].slice(0, 12);
+    const topicTerms = memSearchTokens(`${aliases.join(' ')} ${incorrect} ${corrected}`).slice(0, 32);
+    const active = this._activeCorrections(`${incorrect} ${corrected}`, 8);
+    const duplicate = active.find((item) => item.corrected.toLowerCase() === corrected.toLowerCase()
+      && (!incorrect || item.incorrect.toLowerCase() === incorrect.toLowerCase()));
+    if (duplicate) return duplicate;
+    let supersedes = requestedSupersedes;
+    if (!supersedes && active.length) {
+      const candidate = active.find((item) => {
+        const priorValue = cleanCorrectionText(item.corrected, 420).toLowerCase();
+        const nextOldValue = incorrect.toLowerCase();
+        return priorValue.length >= 2 && nextOldValue.length >= 2
+          && (priorValue.includes(nextOldValue) || nextOldValue.includes(priorValue));
+      });
+      if (candidate) supersedes = candidate.id;
+    }
+    const sourceTurns = [...new Set((Array.isArray(input.sourceTurns) ? input.sourceTurns : [])
+      .map((turn) => Math.max(0, Math.trunc(Number(turn) || 0))).filter(Boolean))].slice(0, 8);
+    const record = {
+      id: `cor_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      createdAt: Math.max(1, Number(input.createdAt) || Date.now()),
+      kind: ['user', 'reflection', 'memory'].includes(input.kind) ? input.kind : 'memory',
+      incorrect,
+      corrected,
+      aliases,
+      topicTerms,
+      sourceTurns,
+      confidence: Math.max(0, Math.min(1, Number(input.confidence) || 0.8)),
+      supersedes: supersedes || '',
+    };
+    this.corrections.push(record);
+    if (this.corrections.length > MAX_CORRECTIONS) this.corrections.splice(0, this.corrections.length - MAX_CORRECTIONS);
+    return { ...record };
+  }
+
+  recordUserCorrection(value) {
+    const parsed = extractExplicitCorrection(value);
+    if (!parsed) return null;
+    let previousAssistant = null;
+    let previousTurn = 0;
+    for (let index = this.recent.length - 1; index >= 0; index--) {
+      const message = this.recent[index];
+      if (message?.role !== 'assistant' || typeof message.content !== 'string' || !message.content.trim()) continue;
+      previousAssistant = message.content;
+      previousTurn = Math.max(1, this.totalTurns - (this.recent.length - 1 - index));
+      break;
+    }
+    let incorrect = parsed.incorrect;
+    if (!incorrect && previousAssistant) incorrect = cleanCorrectionText(previousAssistant, 420);
+    if (!incorrect) return null;
+    return this.recordCorrection({
+      kind: 'user',
+      incorrect,
+      corrected: parsed.corrected,
+      sourceTurns: [previousTurn, this.totalTurns + 1],
+      confidence: parsed.explicitReplacement ? 1 : 0.92,
+    });
+  }
+
+  _correctionForArchiveText(text) {
+    const value = cleanCorrectionText(text, ARCHIVE_ENTRY_MAX).toLowerCase();
+    if (!value) return null;
+    return this._activeCorrections('', 20).find((item) => {
+      return [item.incorrect, ...(item.aliases || [])].some((entry) => String(entry || '').length >= 2
+        && value.includes(String(entry).toLowerCase()));
+    }) || null;
+  }
+
+  /** Keyword search over archived (compacted-away) turns. Returns newest-biased
+   *  best matches: [{turn, role, text}]. */
+  searchArchive(query, k = 6) {
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) return [];
+    const terms = memSearchTokens(q);
+    if (!terms.length) return [];
+    const limit = Math.max(1, Math.min(20, Number(k) || 6));
+    const correctionHits = this._activeCorrections(q, limit).map((item) => ({
+      turn: item.sourceTurns?.[item.sourceTurns.length - 1] || 0,
+      role: 'system',
+      text: `[纠错记忆·当前有效] ${item.incorrect ? `旧说法「${item.incorrect}」已作废；` : ''}应以「${item.corrected}」为准。`,
+      correction: true,
+    }));
+    const scored = [];
+    for (let i = 0; i < this.archive.length; i++) {
+      const entry = this.archive[i];
+      const text = entry.text.toLowerCase();
+      let score = 0;
+      for (const t of terms) {
+        let idx = 0, n = 0;
+        while (n < 8 && (idx = text.indexOf(t, idx)) !== -1) { n++; idx += t.length; }
+        score += n * Math.max(1, t.length);
+      }
+      if (text.includes(q)) score += q.length * 4; // exact-phrase bonus
+      if (score > 0) scored.push({ entry, i, score });
+    }
+    scored.sort((a, b) => b.score - a.score || b.i - a.i);
+    const archiveHits = scored.map((s) => {
+      const correction = this._correctionForArchiveText(s.entry.text);
+      return correction
+        ? { ...s.entry, text: `[已过时·仅供审计] ${s.entry.text}（当前纠正：${correction.corrected}）`, superseded: true }
+        : { ...s.entry };
+    });
+    return [...correctionHits, ...archiveHits].slice(0, limit);
+  }
+
+  recordFileEvidence(evidence) {
+    if (!evidence || !evidence.root || !evidence.path || !evidence.signature) return;
+    const next = {
+      root: String(evidence.root),
+      path: String(evidence.path),
+      signature: String(evidence.signature),
+      total: Math.max(0, Number(evidence.total) || 0),
+      ranges: Array.isArray(evidence.ranges) ? evidence.ranges : [[evidence.from, evidence.to]],
+      digest: String(evidence.digest || "").slice(0, 700),
+      redacted: !!evidence.redacted,
+      updatedAt: Number(evidence.updatedAt) || Date.now(),
+    };
+    next.ranges = next.ranges
+      .map((range) => [Math.max(1, Number(range?.[0]) || 1), Math.max(0, Number(range?.[1]) || 0)])
+      .filter((range) => range[1] >= range[0])
+      .sort((a, b) => a[0] - b[0]);
+    const index = this.fileEvidence.findIndex((item) => item.root === next.root && item.path === next.path);
+    const current = index >= 0 ? this.fileEvidence[index] : null;
+    if (current && current.signature === next.signature) {
+      next.ranges.push(...(Array.isArray(current.ranges) ? current.ranges : []));
+      if (!next.digest) next.digest = current.digest || "";
+      next.redacted = next.redacted || !!current.redacted;
+    }
+    next.ranges.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const range of next.ranges) {
+      const last = merged[merged.length - 1];
+      if (last && range[0] <= last[1] + 1) last[1] = Math.max(last[1], range[1]);
+      else merged.push([...range]);
+    }
+    next.ranges = merged;
+    next.complete = next.total > 0 && next.ranges.length === 1 && next.ranges[0][0] === 1 && next.ranges[0][1] >= next.total;
+    if (index >= 0) this.fileEvidence.splice(index, 1);
+    this.fileEvidence.push(next);
+    if (this.fileEvidence.length > 80) this.fileEvidence.splice(0, this.fileEvidence.length - 80);
+  }
+
+  invalidateFileEvidence(root, path) {
+    const r = String(root || ""), p = String(path || "");
+    this.fileEvidence = this.fileEvidence.filter((item) => !(item.root === r && item.path === p));
+  }
+
+  fileEvidenceForRoot(root) {
+    const r = String(root || "");
+    return this.fileEvidence.filter((item) => item.root === r).map((item) => ({ ...item, ranges: (item.ranges || []).map((range) => [...range]) }));
+  }
+
+  assemble() {
+    return this.assembledSlice(0, this.assembledLength());
+  }
+
+  prefixMessages() {
+    const result = [];
+    const corrections = this._activeCorrections('', CORRECTION_PREFIX_MAX);
+    if (corrections.length > 0) {
+      const text = corrections.map((item) => item.kind === 'reflection'
+        ? `- 避免重复：${item.incorrect}\n  后续做法：${item.corrected}`
+        : `- 已作废：${item.incorrect}${item.aliases?.length ? `（此前相关旧说法：${item.aliases.join('、')}）` : ''}\n  当前有效：${item.corrected}`).join('\n');
+      result.push({
+        role: 'system',
+        content: `[纠错记忆·最高优先级]\n以下是对早期内容的追加纠正。原始历史仅供审计，不得继续把“已作废”内容当成事实或要求；若多条纠正冲突，以列表中更靠前的最新条目为准。\n${text}`,
+      });
+    }
+    if (this.milestones.length > 0) {
+      const text = this.milestones
+        .map(m => `[Turn ${m.turn}] ${m.event}`)
+        .join('\n');
+      result.push({ role: 'system', content: `📌 Key milestones from earlier:\n${text}` });
+    }
+    if (this.summaries.length > 0) {
+      const merged = this.summaries.map(s => s.text).join('\n\n');
+      const recallHint = this.archive.length
+        ? '\n\n（以上是早期对话的压缩摘要；需要某段早期对话的原文细节时，用 recall_conversation 工具按关键词检索归档）'
+        : '';
+      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}${recallHint}` });
+    }
+    return result;
+  }
+
+  assembledLength() {
+    return this.prefixMessages().length + this.recent.length;
+  }
+
+  assembledAt(index) {
+    const i = Math.trunc(Number(index) || 0);
+    if (i < 0) return undefined;
+    const prefixLength = this.prefixMessages().length;
+    if (i >= prefixLength) return this.recent[i - prefixLength];
+    return this.prefixMessages()[i];
+  }
+
+  assembledSlice(from = 0, to = this.assembledLength()) {
+    const length = this.assembledLength();
+    const start = Math.max(0, Math.min(length, Math.trunc(Number(from) || 0)));
+    const end = Math.max(start, Math.min(length, Math.trunc(Number(to) || 0)));
+    if (start === end) return [];
+    const prefixLength = this.prefixMessages().length;
+    const result = [];
+    if (start < prefixLength) {
+      const prefix = this.prefixMessages();
+      for (let index = start; index < Math.min(end, prefixLength); index++) result.push(prefix[index]);
+    }
+    const recentStart = Math.max(0, start - prefixLength);
+    const recentEnd = Math.max(0, end - prefixLength);
+    if (recentEnd > recentStart) result.push(...this.recent.slice(recentStart, recentEnd));
+    return result;
+  }
+
+  static _messageChars(message) {
+    if (!message || typeof message !== 'object') return String(message || '').length;
+    let total = typeof message.content === 'string' ? message.content.length : 0;
+    if (Array.isArray(message.content)) {
+      for (const part of message.content) total += String(part?.text || part?.image_url?.url || '').length;
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) total += String(call?.function?.arguments || '').length;
+    }
+    if (Array.isArray(message.attachments)) {
+      for (const attachment of message.attachments) {
+        total += String(attachment?.dataUrl || '').length;
+        for (const frame of Array.isArray(attachment?.frames) ? attachment.frames : []) total += String(frame || '').length;
+      }
+    }
+    return total;
+  }
+
+  estimateRecentChars() {
+    return Math.max(0, this._recentChars);
+  }
+
+  estimateRecentTokens() {
+    let t = 0;
+    for (const m of this.recent) {
+      const c = typeof m.content === 'string' ? m.content : '';
+      for (let i = 0; i < c.length; i++) t += c.charCodeAt(i) > 0x2E7F ? 1 : 0.25;
+    }
+    return Math.ceil(t);
+  }
+
+  /** Replace `count` oldest messages in recent with an LLM-generated summary.
+   *  count can equal recent.length (compress everything). */
+  compactRecent(count, summaryText) {
+    if (count <= 0 || count > this.recent.length) return [];
+    const removed = this.recent.splice(0, count);
+    for (const message of removed) this._recentChars -= ConversationMemory._messageChars(message);
+    this._recentChars = Math.max(0, this._recentChars);
+    const startTurn = Math.max(1, this.totalTurns - this.recent.length - removed.length + 1);
+    this._archiveBatch(removed, startTurn);
+    this._notifyMessagesRemoved(removed);
+    const endTurn = startTurn + removed.length - 1;
+    this.summaries.push({
+      range: `turns ${startTurn}–${endTurn}`,
+      text: summaryText
+    });
+    while (this.summaries.length > MAX_SUMMARIES) {
+      const a = this.summaries.shift();
+      const b = this.summaries.shift();
+      this.summaries.unshift({
+        range: `${a.range}, ${b.range}`,
+        text: this._mergeSummaryText(a.text, b.text)
+      });
+    }
+    return removed;
+  }
+
+  // Merged summaries used to grow without bound (plain concatenation). Cap with a
+  // head+tail keep so the oldest framing and the newest facts both survive.
+  _mergeSummaryText(a, b) {
+    const merged = `${a}\n${b}`;
+    if (merged.length <= MERGED_SUMMARY_MAX) return merged;
+    const head = merged.slice(0, Math.floor(MERGED_SUMMARY_MAX * 0.6));
+    const tail = merged.slice(-Math.floor(MERGED_SUMMARY_MAX * 0.35));
+    return `${head}\n…（更早摘要已折叠，原文可用 recall_conversation 检索）…\n${tail}`;
+  }
+
+  _compressOldestBatch() {
+    if (this.recent.length < SUMMARY_BATCH) return;
+    const batch = this.recent.splice(0, SUMMARY_BATCH);
+    for (const message of batch) this._recentChars -= ConversationMemory._messageChars(message);
+    this._recentChars = Math.max(0, this._recentChars);
+    const startTurn = this.totalTurns - this.recent.length - batch.length + 1;
+    this._archiveBatch(batch, startTurn);
+    this._notifyMessagesRemoved(batch);
+    const endTurn = startTurn + batch.length - 1;
+    this.summaries.push({ range: `turns ${startTurn}-${endTurn}`, text: this._summarizeBatch(batch) });
+    if (this.summaries.length > MAX_SUMMARIES) {
+      const a = this.summaries.shift();
+      const b = this.summaries.shift();
+      this.summaries.unshift({ range: `${a.range} + ${b.range}`, text: this._mergeSummaryText(a.text, b.text) });
+    }
+  }
+
+  _summarizeBatch(batch) {
+    const actions = new Set(), files = new Set(), lines = [];
+    const clean = (value, max) => String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, max);
+    for (const msg of batch) {
+      if (msg.tool_calls) for (const tc of msg.tool_calls) {
+        const n = tc.function?.name;
+        if (n) {
+          actions.add(n);
+          if (['write_file','edit_file','read_file'].includes(n)) {
+            try {
+              const a = JSON.parse(tc.function.arguments || '{}');
+              if (a.path) files.add(String(a.path));
+            } catch {}
+          }
+        }
+      }
+      const role = msg?.role === 'assistant' ? 'assistant'
+        : msg?.role === 'user' ? 'user'
+        : msg?.role === 'tool' ? 'tool'
+        : 'system';
+      const text = clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
+      if (text) lines.push(`[${role}] ${text}`);
+      const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
+      if (attachments.length) {
+        const kinds = attachments.map((a) => a?.kind || "media").slice(0, 4).join(", ");
+        lines.push(`[attachments] ${attachments.length} item(s): ${kinds}`);
+      }
+    }
+    const p = [];
+    if (lines.length) p.push(lines.join('\n'));
+    if (actions.size) p.push(`Actions: ${[...actions].join(', ')}`);
+    if (files.size) p.push(`Files: ${[...files].join(', ')}`);
+    return p.length ? p.join('\n') : 'Continued conversation.';
+  }
+
+  stats() {
+    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, archiveCount: this.archive.length, correctionCount: this._activeCorrections('', MAX_CORRECTIONS).length, recentTokens: this.estimateRecentTokens() };
+  }
+
+  toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET, options = {}) {
+    // JSON.stringify calls toJSON with a string property key. Treat only an
+    // explicit number/shared-budget object as the serializer override.
+    const effectiveBudget = typeof mediaBudget === 'number' || (mediaBudget && typeof mediaBudget === 'object')
+      ? mediaBudget
+      : PERSISTED_MEDIA_BUDGET;
+    const limit = Number.isFinite(options?.recentLimit)
+      ? Math.max(0, Math.trunc(options.recentLimit))
+      : this.recent.length;
+    const recent = limit === 0 ? [] : limit < this.recent.length ? this.recent.slice(-limit) : this.recent;
+    const transcriptLimit = Number.isFinite(options?.transcriptLimit)
+      ? Math.max(0, Math.trunc(options.transcriptLimit))
+      : this.transcript.length;
+    const transcript = transcriptLimit === 0
+      ? []
+      : transcriptLimit < this.transcript.length
+        ? this.transcript.slice(-transcriptLimit)
+        : this.transcript;
+    const serializedTranscriptOffset = this.transcriptOffset + Math.max(0, this.transcript.length - transcript.length);
+    return {
+      totalTurns: this.totalTurns,
+      recent: serializeMessagesForPersistence(recent, effectiveBudget, { textBudget: options?.textBudget }),
+      // This is deliberately independent from `recent` and `archive`: those two
+      // serve bounded model context and retrieval, while transcript is the exact
+      // local record used to restore a conversation after a restart.
+      transcript: serializeMessagesForPersistence(transcript, effectiveBudget, { textBudget: options?.textBudget }),
+      transcriptOffset: serializedTranscriptOffset || undefined,
+      transcriptCheckpoint: options?.externalizeTranscript ? this.transcriptLength() : undefined,
+      summaries: this.summaries,
+      milestones: this.milestones,
+      fileEvidence: this.fileEvidence,
+      archive: this.archive,
+      corrections: this.corrections,
+    };
+  }
+
+  static fromJSON(obj) {
+    const mem = new ConversationMemory();
+    if (obj) {
+      mem.totalTurns = obj.totalTurns || 0;
+      mem.recent = Array.isArray(obj.recent) ? obj.recent : [];
+      mem.transcript = Array.isArray(obj.transcript) ? obj.transcript : [];
+      const checkpoint = Number.isFinite(obj.transcriptCheckpoint)
+        ? Math.max(0, Math.trunc(obj.transcriptCheckpoint)) : null;
+      mem.transcriptOffset = Number.isFinite(obj.transcriptOffset)
+        ? Math.max(0, Math.trunc(obj.transcriptOffset)) : 0;
+      // SQLite checkpoints externalize the entire exact transcript. Do not
+      // synthesize one from `recent`: that would give old messages sequence 0
+      // and let the next append overwrite stored history.
+      if (checkpoint !== null && mem.transcript.length === 0) {
+        mem.transcriptOffset = checkpoint;
+      }
+      mem._recentChars = mem.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+      mem.summaries = obj.summaries || [];
+      mem.milestones = obj.milestones || [];
+      mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
+      mem.archive = Array.isArray(obj.archive)
+        ? obj.archive.slice(-MAX_ARCHIVE)
+          .filter((e) => e && typeof e.text === 'string' && e.text)
+          .map((e) => ({ turn: Math.max(0, Number(e.turn) || 0), role: String(e.role || 'assistant'), text: String(e.text).slice(0, ARCHIVE_ENTRY_MAX) }))
+        : [];
+      // Older session.json files only had compacted recent/archive memories.
+      // Recover the best available display history once, then all future saves
+      // persist the canonical transcript without another lossy conversion.
+      if (!mem.transcript.length && checkpoint === null) {
+        const legacyArchive = mem.archive.map((entry) => ({
+          role: entry.role,
+          content: entry.text,
+        }));
+        mem.transcript = legacyArchive.concat(mem.recent);
+      }
+      if (checkpoint !== null && mem.transcript.length && checkpoint <= mem.transcriptOffset + mem.transcript.length) {
+        const localCheckpoint = Math.max(0, Math.min(mem.transcript.length, checkpoint - mem.transcriptOffset));
+        const tail = mem.transcript.slice(localCheckpoint);
+        if (tail.length) {
+          mem.recent.push(...tail);
+          for (const message of tail) mem._recentChars += ConversationMemory._messageChars(message);
+          while (mem.recent.length > RECENT_WINDOW) mem._compressOldestBatch();
+        }
+      }
+      mem.totalTurns = Math.max(mem.totalTurns, mem.transcriptOffset + mem.transcript.length, mem.recent.length);
+      mem.corrections = Array.isArray(obj.corrections)
+        ? obj.corrections.slice(-MAX_CORRECTIONS).map((item) => ({
+          id: cleanCorrectionText(item?.id, 160),
+          createdAt: Math.max(1, Number(item?.createdAt) || Date.now()),
+          kind: ['user', 'reflection', 'memory'].includes(item?.kind) ? item.kind : 'memory',
+          incorrect: cleanCorrectionText(item?.incorrect),
+          corrected: cleanCorrectionText(item?.corrected),
+          aliases: [...new Set((Array.isArray(item?.aliases) ? item.aliases : [])
+            .map((value) => cleanCorrectionText(value, 240)).filter(Boolean))].slice(0, 12),
+          topicTerms: memSearchTokens(`${(item?.aliases || []).join(' ')} ${item?.incorrect || ''} ${item?.corrected || ''}`).slice(0, 32),
+          sourceTurns: [...new Set((Array.isArray(item?.sourceTurns) ? item.sourceTurns : [])
+            .map((turn) => Math.max(0, Math.trunc(Number(turn) || 0))).filter(Boolean))].slice(0, 8),
+          confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0.8)),
+          supersedes: cleanCorrectionText(item?.supersedes, 160),
+        })).filter((item) => item.id && item.corrected)
+        : [];
+    }
+    return mem;
+  }
+}
