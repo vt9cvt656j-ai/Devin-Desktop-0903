@@ -34090,6 +34090,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // ten-tool nucleus handles ordinary code work immediately; search_tools is the
   // explicit semantic escape hatch for specialists. After real evidence arrives,
   // the same orchestrator expands or replaces the bounded window for the next turn.
+  // 首轮**异步并行**编排（不 await，首 token 零延迟）：首个模型请求照发，语义编排器
+  // 同时拿完整 161+ 目录按任务语义选能力；第一批工具结果回来时专用 schema 已就位、
+  // nudge 已告知。此前只有 after_tools/steering 检查点：首轮需要专用能力（数据库/浏览器/
+  // 桌面/实时数据…）的任务得等第一批结果或靠模型自觉 search_tools，弱意愿下直接用
+  // run_cmd 硬凑（实测痛点"全部工具不会灵活调用"）。判断权全在语义编排器（用户模型），
+  // 不是关键词路由；纯问答/局部修改它自会返回 tools=[]。
+  if (isAgent && run.engineering?.applies) {
+    void _routeAgentTools("initial", "任务刚启动，尚无工具结果；按任务语义预判首批需要的专用能力（没有就返回空）。").catch(() => {});
+  }
   // MCP discovery stays background-only. It may update the complete registry, but it must not
   // start another planner or mutate the first provider payload. An explicit search_tools request
   // waits briefly for discovery and then admits only the MCP schemas selected for that stage.
