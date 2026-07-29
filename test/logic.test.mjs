@@ -17,7 +17,7 @@ import exifr from "exifr";
 import { stripToolIp } from "../build/strip-tool-ip.mjs";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
-import { compactToolExampleArgs, compactToolGuide } from "../src/tool-guides.js";
+import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine } from "../src/tool-guides.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
@@ -8737,11 +8737,12 @@ test("plain Agent turns keep project diagnostics, mutation, terminal, and Git sc
   // 懒加载，而 search_tools 的说明书只宣传外部信息源，实测后果是模型认定自己没有
   // 写入能力，反过来要求用户"把 edit_file / write_file 暴露给我"。参照的 Claude Code
   // 本身就把 Edit/Write/Bash 放核心：懒加载的该是 MCP 和专项工具，不是 agent 的主职。
+  // ask_user 同理回归核心（P0）：懒加载下模型首轮没有提问工具，遇模糊需求只能瞎猜。
   assert.deepEqual(names, [
-    "read_file", "list_dir", "search", "find_files", "update_plan",
+    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
     "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
-  assert.equal(names.length, 10, "the default Agent schema payload must stay at ten tools");
+  assert.equal(names.length, 11, "the default Agent schema payload must stay at eleven tools");
   for (const deferred of ["get_diagnostics", "git_status", "read_terminal", "run_in_terminal"]) {
     assert.ok(!names.includes(deferred), `${deferred} should not tax a plain Agent turn`);
   }
@@ -8765,7 +8766,7 @@ test("engineering Agent turns keep evidence and mutation schemas on demand", () 
   const names = select(true, "修复认证逻辑并补测试", [], "agent").map((tool) => tool.function.name);
   // 写任务首轮仍可直接改代码；批量编辑和验证能力按证据阶段再加载。
   assert.deepEqual(names, [
-    "read_file", "list_dir", "search", "find_files", "update_plan",
+    "read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
     "edit_file", "multi_edit", "write_file", "run_cmd", "search_tools",
   ]);
   for (const deferred of [
@@ -8865,6 +8866,8 @@ test("natural-language capability queries are routed by the semantic tool orches
     _pickCheapModel: (id) => `cheap:${id}`,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
+    enrichedCatalogLine,
+    recommendToolsForIntent: load("recommendToolsForIntent"),
     fetch: async (_url, options) => {
       request = JSON.parse(options.body);
       return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
@@ -12483,6 +12486,7 @@ test("语义收尾评审可按真实证据动态调度已注册的抓包链路",
     _pickCheapModel: (id) => `cheap:${id}`,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
+    enrichedCatalogLine,
     fetch: async (_url, options) => {
       reviewRequest = JSON.parse(options.body);
       return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
@@ -12644,6 +12648,6 @@ test("Tool Search 只在命中时回传压缩调用指南，不把全量手册�
   assert.match(search, /工具已加载：\\n· \$\{compactToolGuide\(exact\.schema\)\}/,
     "已加载工具被再次查询时也要回传调用范式");
   assert.doesNotMatch(directory, /例:\s*\w+\(\{/, "稳定 search_tools 描述不能内嵌全量调用样例");
-  assert.match(SRC, /import \{ compactToolGuide \} from "\.\/tool-guides\.js"/,
+  assert.match(SRC, /import \{ compactToolGuide, enrichedCatalogLine \} from "\.\/tool-guides\.js"/,
     "工具手册必须独立于庞大的主编排模块");
 });
