@@ -1346,21 +1346,28 @@ export function createLspManager(options) {
     });
 
     // ---- Folding Range Provider ----
+    // 无答案时必须返回 null 而不是 []：注册了 provider 后，[] 是「确定没有可折叠
+    // 区域」的正式答复，会顶掉 Monaco 的缩进折叠兜底——LSP 没起来/不支持
+    // foldingRange 的语言从此一个折叠箭头都没有；null 才会回退到缩进折叠。
     monaco.languages.registerFoldingRangeProvider(MANAGED_LANGS, {
       async provideFoldingRanges(model) {
         const client = clientForModel(model);
-        if (!client || !client.supports("foldingRange")) return [];
-        const result = await client.request("textDocument/foldingRange", {
-          textDocument: { uri: model.uri.toString() },
-        });
-        if (!Array.isArray(result)) return [];
-        return result.map((fr) => ({
-          start: fr.startLine + 1,
-          end: fr.endLine + 1,
-          kind: fr.kind === "comment" ? monaco.languages.FoldingRangeKind.Comment
-            : fr.kind === "imports" ? monaco.languages.FoldingRangeKind.Imports
-            : monaco.languages.FoldingRangeKind.Region,
-        }));
+        if (!client || !client.supports("foldingRange")) return null;
+        try {
+          const result = await client.request("textDocument/foldingRange", {
+            textDocument: { uri: model.uri.toString() },
+          });
+          if (!Array.isArray(result)) return null;
+          return result.map((fr) => ({
+            start: fr.startLine + 1,
+            end: fr.endLine + 1,
+            kind: fr.kind === "comment" ? monaco.languages.FoldingRangeKind.Comment
+              : fr.kind === "imports" ? monaco.languages.FoldingRangeKind.Imports
+              : monaco.languages.FoldingRangeKind.Region,
+          }));
+        } catch {
+          return null; // LSP 请求失败（崩溃/超时）同样回退缩进折叠，不能让折叠整个消失
+        }
       },
     });
 

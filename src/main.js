@@ -1754,6 +1754,8 @@ const monacoEditor = monaco.editor.create(editorEl, {
   gotoLocation: { multiple: "peek", multipleDefinitions: "peek", multipleDeclarations: "peek", multipleImplementations: "peek", multipleTypeDefinitions: "peek", multipleReferences: "peek" },
   colorDecorators: true,
   folding: true, // 启用代码折叠
+  showFoldingControls: "always", // 折叠箭头常显：默认 mouseover 要悬停才出现，用户会以为没有这功能
+  foldingHighlight: true,
 });
 
 let _imeComposing = false;
@@ -2794,6 +2796,7 @@ function openSplitEditor(filePath) {
     bracketPairColorization: { enabled: true },
     guides: { indentation: true },
     folding: true, // 启用代码折叠
+    showFoldingControls: "always",
   });
 
   // One AbortController for the whole split session — the #editor mousedown and the window drag
@@ -3096,7 +3099,12 @@ async function saveEditorPrefs() {
 function applyModelOptions() {
   const p = effectivePrefs();
   const tabSize = Math.max(1, Math.min(8, Number(p.tabSize) || 4));
-  monacoEditor.getModel()?.updateOptions({ tabSize, insertSpaces: true });
+  const m = monacoEditor.getModel();
+  if (!m) return;
+  // 尊重文件自己的缩进：从内容探测宽度与空格/Tab。此前这里对每个模型硬塞
+  // tabSize:4 + insertSpaces:true——2 空格的项目全部显示/插入 4，Makefile、Go
+  // 这类 Tab 缩进文件还会被强塞空格。设置里的 tabSize 只作探测不出时的默认值。
+  m.detectIndentation(true, tabSize);
 }
 
 function applyEditorPrefs() {
@@ -32052,6 +32060,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const execRun = write ? { ...run, mode: "agent", _isWorker: true, _scope: scopeRel } : run;
 
   let report = "";
+  const _writesDone = []; // 编排核对账本：本 worker 实际写盘的文件（工具执行事实，不是模型自述）
   const narrativeSeen = new Set();
   let toolCount = 0;
   const SUB_MAX = write ? 18 : 12;
@@ -32105,8 +32114,11 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         // Context OUT: fold this child's reads/edits into the shared run-context so siblings +
         // the main agent see them (siblings/parent skip re-reading; mutations surface in the
         // main scratchpad automatically since it renders run.ctx).
+        const _ok = _toolExecutionSucceeded(call, result);
+        if (_ok && write && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path) {
+          _writesDone.push(_normRel(call.path, root) || String(call.path));
+        }
         if (run && run.ctx) {
-          const _ok = _toolExecutionSucceeded(call, result);
           if (_ok && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path && run.ctx.modified) {
             run.ctx.modified.set(String(call.path).split("/").pop(), write ? "worker改" : "改");
             if (write && typeof onMutation === "function") onMutation(call.path);
@@ -32142,8 +32154,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       : "（子智能体未做任何调查=没干活。别再派子智能体，直接自己 read_file/search 查你要的）";
   }
 
+  // 编排核对腿（五步纪律④「返回后抽查」的机制化）：worker 简报是模型自述，可能虚报
+  // “已完成”；把实际写盘清单以系统口径钉进简报，主智能体比对自述与事实后再采信/重派。
+  if (write) {
+    const wrote = [...new Set(_writesDone)];
+    report = (report || "") + (wrote.length
+      ? `\n\n【系统核对·非 worker 自述】实际写盘 ${wrote.length} 个文件：${wrote.join("、")}。抽查关键产出并跑验证后再采信简报。`
+      : `\n\n【系统核对·非 worker 自述】该 worker 全程未写盘任何文件——若简报声称已完成改动即为虚报，不要采信；这块改为自己实现或重派。`);
+  }
   res.className = "atc-result atc-result--ok";
-  res.textContent = `${toolCount} 步${write ? "（worker）" : "调研"}`;
+  res.textContent = `${toolCount} 步${write ? (_writesDone.length ? "（worker）" : "（worker·未写盘）") : "调研"}`;
   card.classList.remove("is-open");
   _chatFollow();
   // Context OUT: fold this child's report into the shared findings so it integrates into the
