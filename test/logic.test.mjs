@@ -7481,7 +7481,10 @@ test("full website readiness requires michael-design evidence and a real product
     { content: "社区使用 Pexels 真人头像图片 URL，圆形 object-cover，加载失败时换本地备用头像图片" },
   ];
   assert.equal(readiness(run, numberedArchitecture), "", "a real numbered 1-9 architecture must not be rejected for omitting the literal phrase '至少 7 个'");
-  assert.equal(hasCategoryArchitecture("1. 首屏 2. 演示 3. 角色 4. 工坊 5. 玩法 6. 媒体"), false);
+  assert.equal(hasCategoryArchitecture("1. 首屏 2. 演示 3. 角色 4. 工坊 5. 玩法 6. 媒体"), true,
+    "a deliberate 6-section enumeration is a real architecture decision — section-count quotas (旧 1–7 配额) are banned; 差异化质量归 AI 语义评审");
+  assert.equal(hasCategoryArchitecture("写一个 Hero、Features、Pricing 和 Footer，然后构建"), false,
+    "a template blurb with neither IA vocabulary nor an enumerated structure still lacks the architecture decision");
   assert.match(SRC, /实施计划未就绪 · 未执行/);
   assert.match(SRC, /按三轨编排检索/);
   assert.match(SRC, /michael-design 主编排律/);
@@ -10831,8 +10834,8 @@ test("plain-text assistant questions are a hard agent wait boundary", () => {
   assert.ok(boundary >= 0 && boundary < pendingGate && boundary < toolFirstGate && boundary < criticGate,
     "the question boundary must run before every automatic continuation gate");
   assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,220}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
-  assert.match(loop, /if \(!awaitingUserReply && didMutate && \(!verificationPassed/,
-    "post-loop verification must not execute while waiting for the user");
+  assert.match(loop, /if \(!awaitingUserReply && !finalErr && !run\._incompleteReason\)/,
+    "post-loop honest accounting must not execute while waiting for the user");
   assert.doesNotMatch(loop, /_pushNudge\("askUser"/,
     "a visible question must never trigger another model turn asking it to re-ask");
 });
@@ -12290,8 +12293,10 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
     "126/127 必须归为 ran:false + unavailable，而不是 ok:false 的验证失败",
   );
   assert.match(SRC, /验证器不可用：/, "报告措辞必须和真实的验证失败区分开");
-  // 收尾门禁要分别措辞，否则模型会把"没装工具"当成代码错误去追。
-  assert.match(SRC, /\} else if \(_finalVr\.unavailable\) \{/);
+  // 收尾强制验证器（_finalVr）已整体拆除、验证权归 AI；unavailable 语义由 ran:false 分类
+  // 与收尾平静措辞承担，旧变量不得残留。
+  assert.doesNotMatch(SRC, /_finalVr/);
+  assert.match(SRC, /验证：本机没有可运行的自动验证器/);
 
   // 源头：不能只因为存在 requirements.txt 就断定 ruff/pytest 可用。
   assert.doesNotMatch(SRC, /return "ruff check \. && pytest"/,
@@ -12307,16 +12312,17 @@ test("验证器不可用（退出 127）不能被当成验证失败", () => {
   assert.match(SRC, /const guessed = new Set\(\(stack\.guessedCmds \|\| \[\]\)/,
     "_verificationCommandsForStack 必须过滤猜测命令，落回存在性探测分支");
 
-  // 中途自动验证：unavailable/超预算（ran:false）不能走失败分支逼模型修"不存在的错"。
-  assert.match(SRC, /if \(!_vr\.ran && !_vr\.ok\) \{[\s\S]{0,900}?\} else if \(!_vr\.ok\) \{/,
-    "验证器不可用必须在失败分支之前单独处理");
+  // 中途强制自动验证的消费分支已随“AI 自主验证”拆除；127/超时 → ran:false 的分类语义
+  // 仍由 _interleavedTest 承担（本文件另有行为测试锁定），主循环不得再强制代跑。
+  assert.match(SRC, /主循环不再强制代跑验证命令/,
+    "强制验证拆除的架构决策必须在主循环留有显式记录，防止无意识回加");
 
   // 纯文档改动（README 等）不重新武装验证门禁："代码验完 → 补写 README →
   // 收尾又弹验证器红卡"就是这个漏洞造成的。
   assert.match(SRC, /const _docOnlyMutation = \/\\\.\(md\|markdown\|rst\|adoc\)\$\/i\.test\(mutationPath\)/,
     "必须识别纯文档改动");
-  assert.match(SRC, /if \(!_docOnlyMutation\) \{[\s\S]{0,80}?verificationPassed = false;[\s\S]{0,40}?_implOps\+\+;/,
-    "只有非文档改动才重新武装验证门禁");
+  assert.match(SRC, /if \(!_docOnlyMutation\) \{[\s\S]{0,220}?_implOps\+\+;/,
+    "只有非文档改动才重新武装收尾门禁（_implOps 记账）；强制 verificationPassed=false 已随验证门拆除");
 });
 
 test("验证命令先做存在性探测，缺失步骤被剔除而不是跑到 127", async () => {

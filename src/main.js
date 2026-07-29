@@ -15986,7 +15986,10 @@ function _fallbackConversationSummary(messages) {
     const content = String(message?.content || "").trim();
     if (!content) continue;
     if (message.role === "user") userRequests.push(content.replace(/\s+/g, " ").slice(0, 220));
-    else if (/修复|完成|改动|未完成|报错|验证|failed|fixed/i.test(content)) outcomes.push(content.replace(/\s+/g, " ").slice(0, 260));
+    // 助手侧按角色+时序保留（事实筛选）；旧版用 /修复|完成|…/ 关键词猜“结果句”，
+    // 不带这些词的关键结论整段丢失、带这些词的寒暄反而入选——语义筛选不归关键词。
+    // 末尾 slice(-8) 已限幅，时序越近越可能是有效结论。
+    else if (message.role === "assistant") outcomes.push(content.replace(/\s+/g, " ").slice(0, 260));
   }
   const parts = [];
   if (userRequests.length) parts.push(`用户请求: ${userRequests.slice(-8).join("；")}`);
@@ -16689,14 +16692,18 @@ function _runRequiresPlan(run) {
 
 function _uiPlanHasCategoryArchitecture(value) {
   const text = String(value || "");
+  // 事实检查一：计划明确讨论了信息架构/内容结构。
   if (/(?:信息架构|内容架构|栏目地图|内容结构|页面结构|业务结构|information\s*architecture|content\s*(?:map|architecture)|category-specific)/i.test(text)) return true;
-  if (/(?:七|八|九|十|[7-9]|1\d)\s*(?:个|大)?[^。\n]{0,12}(?:区块|板块|模块|栏目|sections?)/i.test(text)) return true;
 
+  // 事实检查二：计划给出了成型的编号区块结构（1→3 连续编号 = 存在一份刻意的枚举）。
+  // 旧版要求编号凑满 1–7，外加一条「≥ 7 个区块」措辞即过——都是区块数量配额残留：
+  // 真实旅程推导出的 5–6 区块架构反而被打回，与提示语「结构由真实用户旅程决定，
+  // 不是模板配额」自相矛盾。区块内容是否差异化、是否贴品类，归 AI 语义评审，不归数数。
   const numbered = new Set();
   for (const match of text.matchAll(/(?:^|[\s：:；;，,、（(])([1-9]|1[0-9])\s*[.、:：)）]/g)) numbered.add(Number(match[1]));
   const chineseNumbers = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10 };
   for (const match of text.matchAll(/(?:^|[\s：:；;，,、（(])(一|二|三|四|五|六|七|八|九|十)\s*[.、:：)）]/g)) numbered.add(chineseNumbers[match[1]]);
-  return [1, 2, 3, 4, 5, 6, 7].every((number) => numbered.has(number));
+  return [1, 2, 3].every((number) => numbered.has(number));
 }
 
 function _designMotionTechniques(value) {
@@ -19882,7 +19889,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     growth.signal("message-sent", {
       mode: effectiveMode,
       len: text.length,
-      complex: text.length > 280,
+      // “复杂任务”由语义裁决定，不由字数定：旧版 text.length > 280 把长唠叨当复杂、
+      // 把短句大工程（如“重构整个后端”）当简单。裁决不可用时为 false（诚实的不知道），
+      // 只少记一次成长信号，不会错记。
+      complex: !!(_turnEngineeringResolved?.substantial || _turnEngineeringResolved?.requiresPlan),
       usedAt: _mentioned.length > 0,
       project: _gRoot,
       projectName: _gRoot ? _gRoot.split("/").pop() : "",
@@ -26409,6 +26419,10 @@ function _buildAgentOutcomeSummary(run, opts) {
     // AI 自主控制：只在 AI 真的主动跑了验证并通过时如实陈述一句。
     // 不再因为“没验证”就往总结里塞“未通过/未运行/交付门未通过”这类像“没干完”的门禁结论。
     if (opts.verificationPassed) lines.push(opts.didVerify ? "验证：已通过真实命令/检查。" : "验证：改动已落盘。");
+    // 环境事实的平静措辞（曾被重构误删成死变量）：验证器缺失/无可识别命令对代码
+    // 零断言，不是失败，不能写成像代码有问题的措辞。
+    else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
+    else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
   }
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
@@ -34312,8 +34326,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 纯问答 run（本轮没改过任何文件）安静 2 轮即收——4 轮是给“被催收尾的改动型 run”
         // 留的；信息型问题多陪 2 轮只会多两张换个说法的复读卡（实测“一直重复讲话”）。
         const _quietExitAt = didMutate ? 4 : 2;
-        if (quietTurns >= _quietExitAt && !pending) {
+        // 静默收尾也要过证据/义务门：补救 nudge 还有额度就不早退（放行给下方门禁催办）；
+        // 额度耗尽仍缺的项以未完成状态入账——诚实记账，不无声放行“假成功”。
+        // （这条写入腿曾在“验证改为 AI 自主判断”重构中被连带误删：标签映射与渲染腿都在，
+        // _incompleteReason 却只剩读没有写，收尾永远显示成功。）
+        if (quietTurns >= _quietExitAt && !pending
+          && (!_missingResearch.length || researchNudges >= 2)
+          && (!_missingRequiredEffect || effectNudges >= 2)) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
+          if (_missingRequiredEffect && !run._incompleteReason) run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
+          if (_missingResearch.length && !run._incompleteReason) run._incompleteReason = `research_evidence_missing:${_missingResearch.join(",")}`;
           break;
         }
         // C — 任务计划里还有未完成步骤就想收尾 → 推它把计划做完或诚实标记，最多 2 次。
@@ -34427,6 +34449,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _pushNudge("semanticReview", `[真实结果仍未核验] ${_semanticReviewInstruction}`);
             continue;
           }
+          // 补救额度耗尽仍未通过语义核验 → 未完成入账，收尾如实标注（写入腿曾被重构误删）。
+          if (!run._incompleteReason) run._incompleteReason = "semantic_runtime_review_missing";
         }
         if (_missingRequiredEffect && effectNudges < 2) {
           effectNudges++;
@@ -35710,6 +35734,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
     planSteps = _settleRunPlan(run);
+    // 门禁写入腿（诚实记账）：cap/异常等没走静默收尾的出口也不能绕过义务与证据门——
+    // 有界补救耗尽后仍缺的项以未完成状态入账；等待用户回复的轮次不算未完成。
+    if (!awaitingUserReply && !finalErr && !run._incompleteReason) {
+      const _missingEffects = _missingRequiredEffects(run, {
+        workspaceOps: _implOps,
+        runtimeEffects: _runtimeEffects,
+        externalEffects: _externalEffects,
+      });
+      if (_missingEffects.length) run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
+      const _finalMissingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
+      if (!run._incompleteReason && _finalMissingResearch.length) run._incompleteReason = `research_evidence_missing:${_finalMissingResearch.join(",")}`;
+    }
     // AI 自主控制：不再在收尾时强制跑验证命令、强制写 verificationPassed=false、
     // 或拼接“未验证/未核验/交付门未通过”之类的门禁措辞。验证与否、何时
     // 收尾，完全交给 AI 在正常工具调用中自己决定（主循环内的语义评审仍会
