@@ -1833,7 +1833,7 @@ test("adaptive profile is persisted and injected into model context", () => {
   });
   assert.equal(memoryBlocks("/repo", "website"), "[project:/repo][global]",
     "saved global user preferences must survive when Adaptive coaching is disabled");
-  assert.match(SRC, /function _memoryBlocks\(root, query\) \{[\s\S]{0,260}_kgRetrieveBlock\("", query, true\)/,
+  assert.match(SRC, /function _memoryBlocks\(root, query, contextSizeState = \{\}\) \{[\s\S]{0,420}_kgRetrieveBlock\("", query, true\)/,
     "global memory should be injected independently from the Adaptive style switch");
   assert.doesNotMatch(extractFn("_memoryBlocks"), /_adaptiveEnabled/,
     "Adaptive only controls coaching behavior, not durable remembered user preferences");
@@ -8346,7 +8346,8 @@ test("bounded engineering retrieval keeps sources that finish before the deadlin
   assert.doesNotMatch(queryContext, /await _buildEngineeringReferenceContext/);
   assert.doesNotMatch(extractFn("_gatherAgentContext"), /queryKey/,
     "changing only the user wording must not rebuild the stable tree and key-file snapshot");
-  assert.match(extractFn("_gatherAgentContext"), /return _agentContextForQuery\(_agentContextCache\.data, query \|\| "", root\)/);
+  assert.match(extractFn("_gatherAgentContext"), /return _agentContextForQuery\(_agentContextCache\.data, query \|\| "", root, undefined, undefined, _agentContextCache\.sizeState \|\| \{\}\)/,
+    "缓存命中路径必须透传重建时存下的 sizeState（isEmpty/isDrasticallyShrunk）");
 });
 
 test("slow community references cannot erase stable local engineering context", async () => {
@@ -8865,6 +8866,7 @@ test("natural-language capability queries are routed by the semantic tool orches
   assert.equal(catalog(fullRegistry).length, 300,
     "the semantic planner must receive every currently registered tool, including a large MCP catalog");
   let request = null;
+  const scenarioSignature = load("_buildScenarioSignature");
   const route = load("_semanticToolOrchestrator", {
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
@@ -8873,6 +8875,8 @@ test("natural-language capability queries are routed by the semantic tool orches
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
     recommendToolsForIntent: load("recommendToolsForIntent"),
+    _buildScenarioSignature: scenarioSignature,
+    _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
     fetch: async (_url, options) => {
       request = JSON.parse(options.body);
       return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
@@ -10818,6 +10822,27 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.match(extractFn("_executeToolStep"), /_commandRiskKind\(call\.command\)/,
     "risky shell commands should be tagged and run, not pre-blocked");
   assert.match(extractFn("_executeToolStep"), /mutated: false, content: `\$\{rel\} 已是规范格式，无改动/);
+});
+
+test("first-turn ask_user is fact-gated advice, never a physical block", () => {
+  const validate = load("validateToolCall", { _KNOWN_TOOLS: new Set(["ask_user", "read_file"]) });
+  // 空目录/未打开工作区：无代码可调研，首轮问清需求方向是正确首步 → 直接放行、不附建议。
+  const empty = validate("ask_user", { turnIndex: 0, isEmptyWorkspace: true });
+  assert.equal(empty.allowed, true);
+  assert.ok(!empty.advice, "empty workspace first-turn ask must carry no nag");
+  // 工作区非空：仍放行（绝不物理拦截），只附软建议，判断权留给模型。
+  const nonEmpty = validate("ask_user", { turnIndex: 0, isEmptyWorkspace: false });
+  assert.equal(nonEmpty.allowed, true, "non-empty workspace must not hard-block first-turn ask_user");
+  assert.match(String(nonEmpty.advice || ""), /拍板/);
+  // 硬禁不得回潮：首轮禁问的拦截文案与 inference_only 降级必须从源码消失。
+  assert.doesNotMatch(SRC, /首轮对话禁用 ask_user|首轮禁问 · 未执行|inference_only/);
+  // 调用点必须把空目录起步事实（_emptyRootAtStart）/未打开工作区事实透传进 context。
+  assert.match(SRC, /isEmptyWorkspace: !!\(run\._emptyRootAtStart \|\| !root\)/);
+  // 软建议随本次工具结果带回，而不是替代执行。
+  assert.match(SRC, /if \(it\._auAdvice\) \{ _resultMsg \+= it\._auAdvice; it\._auAdvice = ""; \}/);
+  // 白名单检查保持原样：未知工具仍被拦。
+  const unknown = validate("made_up_tool", { turnIndex: 3 });
+  assert.equal(unknown.allowed, false);
 });
 
 test("plain-text assistant questions are a hard agent wait boundary", () => {

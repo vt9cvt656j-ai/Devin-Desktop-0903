@@ -154,6 +154,51 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium'
   },
   
+  // 性能分析类工具（新增）
+  performance_profile: {
+    category: 'performance_analysis',
+    use_cases: ['前端性能检测', '页面加载慢问题排查', 'CPU 内存监控'],
+    triggers: ['页面响应慢', '性能卡顿', '需要性能基准', '定位渲染瓶颈'],
+    example_call: "performance_profile(url='http://localhost:5174', metrics='both', timeoutSeconds=30)",
+    priority: 'high'
+  },
+  
+  // 规范解析类工具 (新增)
+  openapi_parser: {
+    category: 'specification_parsing',
+    use_cases: ['API 端点清单提取', 'Swagger 规范审查', '生成 curl 示例模板'],
+    triggers: ['需要查看可用 API', 'OpenAPI/Swagger 文档', '接口对接开发'],
+    example_call: "openapi_parser(url='./openapi.json', outputFormat='list')",
+    priority: 'medium'
+  },
+  
+  // 测试骨架生成类工具 (新增)
+  generate_test_cases: {
+    category: 'code_quality',
+    use_cases: ['写完功能要补测试', '为导出函数/类生成测试骨架', '补齐正常/边界/错误用例框架'],
+    triggers: ['需要补单元测试', '新功能缺测试覆盖', '生成测试文件模板'],
+    example_call: "generate_test_cases(path='src/utils.js', framework='auto')",
+    priority: 'medium'
+  },
+  
+  // 容器编排执行类工具 (新增)
+  docker_compose_up: {
+    category: 'execution',
+    use_cases: ['启动多服务/微服务本地环境', '拉起 Compose 服务栈', '容器启动失败自愈提示'],
+    triggers: ['项目含 docker-compose.yml', '需要本地依赖服务 (数据库/缓存)', '启动容器服务栈'],
+    example_call: "docker_compose_up(path='docker-compose.yml', detach=true)",
+    priority: 'medium'
+  },
+    
+  // 实时新闻聚合类工具 (新增)
+  realtime_news_feed: {
+    category: 'information_gathering',
+    use_cases: ['了解技术近期动态', '版本发布跟踪', '社区评价收集', '技术风向调研'],
+    triggers: ['想了解某技术的最新讨论', '关注版本发布动态', '收集社区反馈'],
+    example_call: "realtime_news_feed(topic='Rust 1.80', sources='all', maxResults=15)",
+    priority: 'high'
+  },
+    
   // 代码生成与修改
   edit_file: {
     category: 'code_editing',
