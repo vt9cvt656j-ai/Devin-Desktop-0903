@@ -603,6 +603,26 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       onEvent({ kind: "done" });
       return;
     }
+    
+    // Web build 同样需要解析网关签发的压缩前缀引用（桌面端在 ai.rs 解析；web 在此解析）。
+    // 没有这一步，网关每轮签的令牌都进了垃圾桶，客户端只能整份上传历史被 3.5MB 卡死。
+    try {
+      const prefix = resp.headers.get("x-michael-compression-prefix");
+      const coveredStr = resp.headers.get("x-michael-compression-covered");
+      const covered = Number(coveredStr || "0") || 0;
+      if (prefix && typeof prefix === "string") {
+        const trimmedPrefix = prefix.trim();
+        if (trimmedPrefix.length >= 16 && trimmedPrefix.length <= 200
+            && /^[a-f0-9]+$/i.test(trimmedPrefix) && covered > 0) {
+          // 覆盖条数缺失或解析失败时按 0 处理：宁可这一轮整份重传，也不能凭一个错的
+          // 条数去裁历史 —— 裁错了模型收到的是错位的上下文，而且不会有任何报错。
+          onEvent({ kind: "compressionPrefix", token: trimmedPrefix, covered });
+        }
+      }
+    } catch (e) {
+      /* Header read is best-effort; lack of prefix only means we skip the optimization this turn */
+    }
+
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -11656,15 +11676,16 @@ function _effectiveContextLimit(modelId) {
   return _gatewayHandlesCompression() && tierMax ? Math.max(native, tierMax) : native;
 }
 
-// 上下文注入预算随真实窗口伸缩：Ultra 5M 档位若仍按 200K 时代的固定预算注入
-//（repo map 3000 字符/检索 4 条/目录树 180 行/关键文件 1200 字），等于花钱买了大窗口
-// 却只喂 8K token（实测用户痛点“5M 没利用起来”）。倍率 = 有效窗口/200K，封顶 8：
-// 窗口大≠无限灌，信噪比和成本还要守；前缀稳定区块不变，缓存仍然全额命中。
+// 上下文注入预算随档位适度伸缩，封顶 2 倍。档位（1M/2M/5M）的真正价值是**历史容量**：
+// 网关压缩让长任务的工具结果/对话全部留住，这才是"5M 用起来"的主体。每轮重发的
+// 通用底料（目录树/关键文件/repo map）若按 8x 灰，单次发送注入冲到 40K-64K token，
+// 直接烧穿计费（实测用户痛点"扣费太快"）且信号密度下降；2x 已覆盖比 200K 时代
+// 更宽的定位信息，更深的内容由模型按需 read_file/search 精准拉取（不降智：按需取证
+// 比盲灌更准）。前缀稳定区块不变，缓存仍然全额命中。
 function _contextBudgetScale() {
-  // Larger tiers retain more history through gateway compression. They should not
-  // multiply the active repository/context injection on every request: that raises
-  // cost, lowers signal density, and destabilizes provider prompt-cache prefixes.
-  return 1;
+  const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
+  if (!tierMax) return 1;
+  return Math.min(2, Math.max(1, tierMax / 200_000));
 }
 
 
@@ -12274,7 +12295,7 @@ function _thinkingProfileFor(id) {
         kind: "reasoning_effort",
         configurable: true,
         levels: ["off", "low", "medium", "high"],
-        defaultLevel: "medium",
+        defaultLevel: "high",
         effortMap: { off: "none", low: "low", medium: "medium", high: "high" },
         hint: t("model.thinking.reason.grok43"),
       };
@@ -12284,7 +12305,7 @@ function _thinkingProfileFor(id) {
         kind: "reasoning_effort",
         configurable: true,
         levels: ["low", "medium", "high"],
-        defaultLevel: "medium",
+        defaultLevel: "high",
         hint: t("model.thinking.reason.grokReasoning"),
       };
     }
@@ -12299,7 +12320,7 @@ function _thinkingProfileFor(id) {
         kind: "reasoning_effort",
         configurable: true,
         levels: ["off", "low", "medium", "high", "xhigh", "max"],
-        defaultLevel: "medium",
+        defaultLevel: "high",
         effortMap: { off: "none", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
         hint: t("model.thinking.reason.gpt56"),
       };
@@ -12308,7 +12329,7 @@ function _thinkingProfileFor(id) {
       kind: "reasoning_effort",
       configurable: true,
       levels: ["off", "low", "medium", "high"],
-      defaultLevel: "medium",
+      defaultLevel: "high",
       effortMap: { off: "none", low: "low", medium: "medium", high: "high" },
       hint: t("model.thinking.reason.openai"),
     };
@@ -12322,7 +12343,8 @@ function _thinkingProfileFor(id) {
       kind: "thinking_budget",
       configurable: true,
       levels: ["off", "low", "medium", "high", "max"],
-      defaultLevel: "medium",
+      // 默认 high：用户没选过档位时不拿 medium 偷深度；显式选择永远优先。
+      defaultLevel: "high",
       budgets: { low: 4096, medium: 12000, high: 24000, max: 32000 },
       hint: t("model.thinking.reason.claude"),
     };
@@ -12336,7 +12358,7 @@ function _thinkingProfileFor(id) {
         kind: "thinking_level",
         configurable: true,
         levels: /flash/.test(s) ? ["minimal", "low", "medium", "high"] : ["low", "medium", "high"],
-        defaultLevel: /flash/.test(s) ? "medium" : "high",
+        defaultLevel: "high",
         levelMap: { minimal: "minimal", low: "low", medium: "medium", high: "high" },
         hint: t("model.thinking.reason.gemini3"),
       };
@@ -12348,8 +12370,8 @@ function _thinkingProfileFor(id) {
         configurable: true,
         levels: _isFlash ? ["off", "low", "medium", "high", "max"] : ["low", "medium", "high", "max"],
         // Pro 官方默认是动态思考（常远超 4096）——默认 medium=4096 等于反手给它加低帽偷深度；
-        // Pro 的 max 上限也是 32768 而不是 Flash 的 24576。
-        defaultLevel: _isFlash ? "medium" : "high",
+        // Pro 的 max 上限也是 32768 而不是 Flash 的 24576。Flash 同样默认 high 不偷深度。
+        defaultLevel: "high",
         budgets: _isFlash
           ? { off: 0, low: 1024, medium: 4096, high: 8192, max: 24576 }
           : { off: 0, low: 2048, medium: 8192, high: 16384, max: 32768 },
@@ -12408,6 +12430,8 @@ function _thinkingPrefFor(id) {
   if (saved && levels.includes(saved)) return saved;
   const dflt = profile.defaultLevel || "off";
   if (!profile.configurable || dflt !== "off") return dflt;
+  // 无默认档时优先最深可用档：推理/思考能力不默认缩水（用户显式选择永远优先）。
+  if (levels.includes("high")) return "high";
   if (levels.includes("medium")) return "medium";
   return levels.find((l) => l !== "off") || dflt;
 }
@@ -12421,7 +12445,7 @@ function _setThinkingPref(id, level) {
 // Apply a model's chosen thinking effort to a config object for outgoing API
 // calls. Unsupported models strip all thinking fields; supported models emit the
 // provider-appropriate field shape.
-function _applyThinkingToConfig(cfg) {
+function _applyThinkingToConfig(cfg, opts = {}) {
   const out = { ...cfg };
   delete out.reasoningEffort;
   delete out.thinkingBudget;
@@ -12430,7 +12454,20 @@ function _applyThinkingToConfig(cfg) {
   delete out.thinkingEffort;
   const model = cfg.model || "";
   const profile = _thinkingProfileFor(model);
-  const pref = _thinkingPrefFor(model);
+  let pref = _thinkingPrefFor(model);
+  // Agent 工具循环的自适应钳位：默认 high（如 Claude 24K 预算）会让 opus 把整个项目
+  // 在思考里闷头写完（4 分钟+不动手，实测）——工具型任务的推理本该外化到工具
+  // 循环逐轮展开，单轮思考 medium 足够且总智力不降（多轮叠加）。只钳**默认值**：
+  // 用户在模型卡显式选过的档位（含 high/max）在任何模式下都原样生效；纯聊天
+  // 单轮问答仍默认 high。
+  if (opts.agentTurn && pref === "high" && (profile.levels || []).includes("medium")) {
+    let explicit = false;
+    try {
+      const saved = _loadThinkingPrefs()[model];
+      explicit = !!(saved && (profile.levels || []).includes(saved));
+    } catch {}
+    if (!explicit) pref = "medium";
+  }
   out.thinkingEffort = pref || "off";
   if (!profile.configurable || !pref) return out;
 
@@ -13088,6 +13125,53 @@ async function _flushTranscriptJournal() {
     .map((session) => session?._transcriptJournalPromise)
     .filter(Boolean);
   if (pending.length) await Promise.all(pending);
+}
+
+// ── 流式草稿检查点 ────────────────────────────────────────────────────────────────
+// AI 正在流式生成的内容只存在于内存/DOM，回合结束才 push 进 memory 落 SQLite。
+// dev 模式改源码触发 webview 重载/App 重启（或真崩溃/强退）时，整段生成中的输出
+// 会无声消失。这里以 ~2s 节流把生成中的正文+思考写入 localStorage 单槽草稿；
+// 回合正常收尾即清除；启动恢复时若发现残留草稿，查重后补成一条带标注的
+// assistant 消息落账——最坏只丢最后 ~2 秒的输出。
+const _STREAM_DRAFT_KEY = "michael-stream-draft-v1";
+function _streamDraftSave(session, text, reasoning) {
+  if (_isSecondaryWindow || !session?.id || !String(text || "").trim()) return;
+  const now = Date.now();
+  // 节流戳挂在 session 上：多标签页并发流式时，模块级全局戳会让两个会话互相卡对方的节流。
+  if (now - (Number(session._draftSaveAt) || 0) < 2000) return;
+  session._draftSaveAt = now;
+  try {
+    localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify({
+      sessionId: session.id,
+      text: String(text || "").slice(0, 400_000),
+      reasoning: String(reasoning || "").slice(0, 20_000),
+      updatedAt: now,
+    }));
+  } catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
+}
+function _streamDraftClear(session = null) {
+  if (session) session._draftSaveAt = 0;
+  try {
+    // 只清自己会话的草稿：单槽设计下，A 会话收尾无条件 removeItem 会把 B 会话
+    // 正在流式的草稿一并抹掉（多标签并发时 B 崩溃就丢保险）。无 session 时保持旧行为。
+    if (session?.id) {
+      const raw = localStorage.getItem(_STREAM_DRAFT_KEY);
+      if (raw && JSON.parse(raw)?.sessionId !== session.id) return;
+    }
+    localStorage.removeItem(_STREAM_DRAFT_KEY);
+  } catch {}
+}
+function _streamDraftTake() {
+  try {
+    const raw = localStorage.getItem(_STREAM_DRAFT_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(_STREAM_DRAFT_KEY);
+    const draft = JSON.parse(raw);
+    if (!draft || typeof draft.sessionId !== "string" || !String(draft.text || "").trim()) return null;
+    // 陈年草稿（>7 天）不值得再补进历史，丢弃。
+    if (Date.now() - (Number(draft.updatedAt) || 0) > 7 * 864e5) return null;
+    return draft;
+  } catch { return null; }
 }
 
 async function _ensureSessionTranscript(session) {
@@ -14265,6 +14349,26 @@ async function restoreChatHistory() {
         session._restored = true; // first time each restored tab is shown → jump to newest message
         _chatSessions.push(session);
       }
+      // 中断草稿恢复：上次进程死在流式中途（dev 重载/崩溃/强退），流到一半的回复
+      // 从未进过持久历史。查重后把残留草稿补成一条带标注的 assistant 消息落账，
+      // 用户不再遇到"写着写着重启就全没了"。
+      try {
+        const _draft = _streamDraftTake();
+        if (_draft) {
+          const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
+          const _probe = String(_draft.text || "").trim().slice(0, 120);
+          const _tail = _draftSession?.memory?.recent?.slice(-6) || [];
+          const _already = !_probe || _tail.some((m) => typeof m?.content === "string" && m.content.includes(_probe));
+          if (_draftSession && !_already) {
+            _draftSession.memory.push({
+              role: "assistant",
+              content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n${_draft.text}`,
+            });
+            _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
+            saveChatHistory({ immediate: true });
+          }
+        }
+      } catch (e) { console.warn("[chat] stream draft recovery failed:", e); }
       // _switchChatSession lazily renders the active tab's history into its
       // container (and every other tab renders the first time you click it).
       if (_chatSessions.length) {
@@ -18106,6 +18210,20 @@ function _engineeringReferenceContextBlock(body, cacheHit, cacheStoredAt) {
   return `\n--- 自动工程参考（${cacheHit ? "缓存命中" : "有界外部检索"}） ---\n${cacheNote}\n${String(body || "")}`;
 }
 
+// 同步读取已预热的工程参考缓存（零 IO、零 await）：首答关键路径只允许消费现成结果，
+// 绝不在这里发起外部检索（守卫测试锁死）。与 _buildEngineeringReferenceContext 共用
+// 同一套 cacheKey 推导，保证后台预热的成果下一轮能被这里命中。
+function _engineeringReferenceCachedBlock(text, stack, profile) {
+  try {
+    const query = _referenceQuery(text, stack);
+    if (!query) return "";
+    const cacheKey = `${profile?.ui ? "ui" : profile?.bug ? "bug" : "code"}|${query.toLowerCase()}`;
+    const cached = _engineeringReferenceCache.get(cacheKey);
+    if (!cached || Date.now() - cached.ts >= 15 * 60 * 1000) return "";
+    return _engineeringReferenceContextBlock(cached.body || cached.text || "", true, cached.storedAt);
+  } catch { return ""; }
+}
+
 async function _buildEngineeringReferenceContext(text, root, stack, profile = _engineeringProfileWithAiIntent(text), referenceBudgetMs = 4000) {
   const communityRequested = profile?.needsCommunityResearch === true
     || (typeof profile?.needsCommunityResearch !== "boolean" && profile?.needsReferences);
@@ -18582,7 +18700,13 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
     parts.push(`\n--- 所有模型共用的工程约束（由 IDE 编排层执行） ---\n1. 目标文件已知就直接读取；位置未知才搜索一次定位。改已有文件前必须读取真实源码和相关调用方。\n2. 多文件/架构任务先列可验证计划，复用项目现有模式；不得散落硬编码路径、密钥、颜色、端口或业务规则。\n3. 修改后必须按本项目真实脚本完成编译/类型检查与测试；命令非零、超时或未运行都不算通过。${profile.bug || profile.debugProject ? "\n4. Bug/调试任务必须先拿证据：复现或读取真实报错/日志/诊断，再沿调用链定位根因；修复用最小补丁并同步调用方，最后重跑同一失败路径或聚焦回归，不能靠猜或只跑泛泛构建。" : ""}${profile.ui ? "\n5. UI 任务构建通过后还必须用 browser 在桌面和移动视口验证真实页面、错误、资源、溢出与关键交互。" : ""}`);
     if (localRefs) parts.push(localRefs);
     if (profile.needsReferences) {
-      _idleRun(() => {
+      // 预取成果必须被消费：**同步**读缓存，命中即注入本轮（零 await、首 token 零延迟，
+      // 守住"不阻塞首答"的既有守卫测试）；未命中则后台预热、下轮命中。旧版
+      // fire-and-forget 把查回来的 GitHub/社区参考整个扔掉（死链路），模型从没
+      // 见过任何预取参考。未命中场景由取证门（首次写入前强制取证）兑底。
+      const refBlock = _engineeringReferenceCachedBlock(query, stack, profile);
+      if (refBlock) parts.push(refBlock);
+      else _idleRun(() => {
         _buildEngineeringReferenceContext(query, root, stack, profile, referenceTimeoutMs).catch(() => {});
       });
     }
@@ -20240,6 +20364,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   try {
     const useTools = hasToolAccess && _toolSchemas.length > 0 && backend.aiChatWithTools;
     let _plainPrefixRecoveryUsed = false;
+    let _plainReasoningRetryUsed = false;
     for (;;) {
       const requestConfig = { ...config };
       let providerMessages = messages;
@@ -20254,13 +20379,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock);
       }
       const _mcTierPlain = requestConfig.customModelId ? null : _compressionTier();
-      if (_mcTierPlain) {
+      if (_mcTierPlain && !requestConfig.customModelId) {
         requestConfig.michaelCompression = _mcTierPlain;
         delete requestConfig.mcPrefix;
         delete requestConfig.mcPrefixCovered;
       }
       const _mcSourceMessagesPlain = providerMessages;
-      if (_mcTierPlain) providerMessages = _applyCompressionPrefix(providerMessages, requestConfig);
+      if (_mcTierPlain && !requestConfig.customModelId) {
+        providerMessages = _applyCompressionPrefix(providerMessages, requestConfig);
+      }
       const requestMessages = _enforceModelRequestBudget(providerMessages, providerTools);
       const chatFn = useTools
         ? (cb) => backend.aiChatWithTools(requestConfig, requestMessages, providerTools, cb)
@@ -20287,6 +20414,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
           if (reasoningEl) collapseThink({ release: true });
           acc += an;
           scheduleStream();
+          _streamDraftSave(sess, acc, reasoning);
         }
       }
       else if (ev.kind === "toolCall") {
@@ -20349,6 +20477,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         if (status) status.textContent = "上下文索引已更新，正在从完整历史恢复…";
         continue;
       }
+      // 干净结束却只有思考、没有正文/工具调用：上游把思考后的内容块丢了（zyz 类中转
+      // 常见）。Agent 路径早有同款守卫，普通聊天路径一直缺——表现为"思考卡收起后
+      // 一声不吵"（实测用户痛点"一直思考不说话"）。就地快速重试一次。
+      if (!err && !acc.trim() && !_pendingToolCalls.length && reasoning.trim()
+        && !_plainReasoningRetryUsed && _turnLive()) {
+        _plainReasoningRetryUsed = true;
+        reasoning = "";
+        _removeAllThinking(body);
+        _plainStreamDiag.retryCount += 1;
+        _plainStreamDiag.responseHeadersMs = null;
+        _plainStreamDiag.headerAttemptStartedAt = Date.now();
+        try { showAgentRetryToast?.("上游只回了思考、没回正文，自动重试中…"); } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
       break;
     }
   } catch (e) { if (!err) err = String(e); }
@@ -20399,6 +20542,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         if (!err && _cc) { sess.memory.push({ role: "assistant", content: _cc }); saveChatHistory({ immediate: true }); _maybeRenderChoices(sess, _cc); }
       }
     }
+    _streamDraftClear(sess); // 回合已落账/已渲染，草稿使命结束（只清本会话的槽，不误伤并发会话）
     if (err) {
       const note = document.createElement("div");
       note.className = "msg__error";
@@ -20410,6 +20554,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       const note = document.createElement("div");
       note.className = "msg__error";
       note.textContent = "⚠️ 模型没有返回任何内容（可能是上游波动或该模型线路暂时不可用）。请重发一次，或换个模型再试。";
+      body.appendChild(note);
+    } else if (!acc.trim() && !_pendingToolCalls.length && reasoning.trim()) {
+      // 重试过一次仍只有思考没有正文：诚实留痕，不让用户对着收起的思考卡猜。
+      const note = document.createElement("div");
+      note.className = "msg__error";
+      note.textContent = "⚠️ 模型只输出了思考过程，正文被上游丢弃（已自动重试一次仍如此）。请重发或换个模型/线路再试。";
       body.appendChild(note);
     }
     _liveStats.stop();
@@ -28997,7 +29147,12 @@ async function _compactHistoryIfHuge(config, session) {
   let covered = 0;
   while (covered < snapshot.length && covered < mem.recent.length
     && mem.recent[covered] === snapshot[covered]) covered++;
-  if (covered < 2) return; // 历史已经被别的路径改写过，这份摘要不再对得上，放弃
+  // 业界共识（OpenHands keep_first+尾部原文 / Cline 保留近半）：最近几条交换必须
+  // 原文保留——刚发生的指令/结果被摘要糊掉是最直接的降智点（模型对"刚说过的话"
+  // 失忆）。只压尾部 6 条之前的部分；摘要里重复覆盖尾部内容无害。
+  const KEEP_TAIL = 6;
+  covered = Math.min(covered, Math.max(0, snapshot.length - KEEP_TAIL));
+  if (covered < 2) return; // 历史已经被别的路径改写过/可压部分太少，这份摘要不再对得上，放弃
   mem.compactRecent(covered, summary.trim());
   try { saveChatHistory(); } catch {}
   try { showToast("已智能压缩对话上下文"); } catch {}
@@ -31049,6 +31204,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
           if (reasoningAcc.trim()) renderReasoning();
           if (reasoningEl) settleReasoning(); // answer started → 无条件收卡打点（用户手动收起也不能拖到轮末才结算时长）
           acc += ev.delta; schedule();
+          if (meterScope === "main") _streamDraftSave(session, acc, reasoningAcc);
         }
         else if (ev.kind === "toolCall") {
           produced = true;
@@ -32341,7 +32497,9 @@ function _pickVisionModel(currentId = "") {
   const candidates = MODEL_GROUPS.flatMap((g) => g.models || [])
     .filter((m) => m?.id && m.id !== currentId && knownVision.test(m.id) && !_isImageModel(m.id));
   candidates.sort((a, b) => {
-    const cheap = (m) => /mini|flash|haiku|nano|lite/i.test(m.id) ? -1000 : 0;
+    // 视觉桥干的是 OCR/地理定位级转写，转写质量直接决定下游文本模型的判断。
+    // 用户约定不降级廉价模型：mini/flash 系退后，旗舰视觉模型优先，同级按价格。
+    const cheap = (m) => /mini|flash|haiku|nano|lite/i.test(m.id) ? 1000 : 0;
     return (cheap(a) + (Number(a.inPrice) || 0)) - (cheap(b) + (Number(b.inPrice) || 0));
   });
   return candidates[0]?.id || null;
@@ -32803,7 +32961,7 @@ function _agentIntentExecutionBlock(profile) {
       staged_roles: "分阶段多角色：先收敛契约，再实施",
       parallel_roles: "并行多角色：按互不重叠 scope 同时实施",
     }[engineering.orchestrationMode] || "单智能体直接完成";
-    lines.push(`协作模式: ${orchestrationLabel}${engineering.orchestrationMode === "solo" ? "（这是建议不是禁令：任务展开后发现真需要分角色/并行，可自主升级编排）" : ""}`);
+    lines.push(`协作模式: ${orchestrationLabel}${engineering.orchestrationMode === "solo" ? "（这是建议不是禁令：任务展开后发现真需要分角色/并行，直接按名调用 run_subagent（只读调研）/run_worker（分 scope 写入）即可自主升级，schema 未装载会自动装载）" : ""}`);
     if (engineering.roleNeeds?.length) lines.push(`必要角色: ${engineering.roleNeeds.join("、")}`);
     if (engineering.coordinationRisks?.length) lines.push(`协作风险: ${engineering.coordinationRisks.join("；")}`);
     if (engineering.orchestrationMode === "staged_roles") {
@@ -32912,7 +33070,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     lines.push("浏览器/抓包律：登录、点击、填表、E2E 用有头 browser；先 check/nodes，连续动作必须用 batch，一次跑完后用 assert/check 验证，别每步 screenshot；截图只做最终视觉验收或定位肉眼排版问题。找真实网页接口先 capture_start(mode:\"isolated_browser\") → browser navigate(fresh:true) → 真实操作 → capture_flows。任意桌面 App 才用 system，手动代理/后台监听用 background。301/302 先看 Location/cookie/最终 URL，不乱拼。");
   }
   if (p.needsReferences) {
-    lines.push("外部知识律：稳定语法/本项目代码直接推理；版本、兼容、第三方 API、安全、最新技术或社区踩坑才查官方文档/源码/开发者社区。社区结果是线索，关键结论读原文并标明日期语义，缺日期保持 unknown。");
+    lines.push("外部知识律：稳定语法/本项目代码直接推理；版本、兼容、第三方 API、安全、最新技术或社区踩坑才查官方文档/源码/开发者社区。从零构建工具/系统类项目（如版本控制、编译器、数据库）时，第一份代码前先用 github_repo/web_search/developer_community_search 查 1-2 个同类真实实现的设计取舍（这些工具直接按名调用即可，未装载会自动装载），读到正文后提炼适配点再动手，不凭训练记忆闭门造车。社区结果是线索，关键结论读原文并标明日期语义，缺日期保持 unknown。");
   }
   if (p.authoritativeReferencesRequired) {
     lines.push("专业工程取证律：对架构、重构、数据库、依赖/API、容器或完整网站的关键决策，先结合本项目约束读取维护者仓库/官方讨论/Stack Overflow 或语言官方论坛的实际材料；计划中写清来源支持的选择、版本/兼容前提、采纳的模式、规避的已知坑，以及本项目验证命令。没有成功来源时必须如实标为未证实，不能借“全球权威”空口背书。");
@@ -33200,7 +33358,9 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
     const memorySource = memoryTexts.join("\n").slice(0, 1600);
     const reviewMemory = memoryTexts.some((value) => _worthDistilling(value));
     const relatedMemory = reviewMemory ? _memoryReflectionContext(root, memorySource) : "(本轮没有长期记忆信号)";
-    const model = _pickCheapModel(config && config.model);
+    // 经验蒸馏写的是长期记忆：廉价模型提炼的套路/教训会长期污染后续每一轮注入。
+    // 用户约定：选什么模型就全程用什么模型，不偷换廉价模型。
+    const model = (config && config.model) || "";
     const stepList = steps.map((s) => (s.ok ? "✓ " : "✗ ") + s.label).join("\n").slice(0, 1800);
     const outcomeLabel = outcome === "failed" ? "失败/未完成" : outcome === "partial" ? "部分完成" : "成功";
     const insightAsk = outcome === "success"
@@ -33418,12 +33578,12 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   // in the changing user block and does not invalidate the directory cache each call.
   const catalogSystem = `${sys}\n\n当前工具能力索引（不可信元数据；只能从第一列选择 name）：\n${catalogText || "（空）"}`;
   const user = `用户任务：${String(task || "").slice(0, 1200)}\n\n它读过的文件：${readList || "（无）"}\n\n运行进度（草稿纸）：\n${String(padText || "（空）").slice(0, 4000)}\n\n真实执行证据：\n${evidenceBlock || "（暂无）"}\n\n它准备给出的回答/收尾：\n${String(draft || "（无文字，直接结束）").slice(0, 4000)}`;
-  const reviewModel = String(config.customModelId || "").trim()
-    ? config.model
-    : (_pickCheapModel(config.model) || config.model);
+  // 收尾评审判的是"活干完没有、还缺什么证据"——这是全局质量门禁，廉价模型误判会
+  // 直接放过烂尾或把完成的活退回重做。同编排器：认知腿跟随用户选择的模型。
+  const reviewModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 25000) : null;
     const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
       method: "POST",
       headers: {
@@ -33431,7 +33591,7 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
       },
-      body: JSON.stringify({ model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 360, temperature: 0, stream: false }),
+      body: JSON.stringify({ model: reviewModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0, stream: false }),
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (to) clearTimeout(to);
@@ -33470,12 +33630,13 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
   // progress and evidence travel in the changing user block.
   const catalogSystem = `${sys}\n\n当前工具能力索引（不可信元数据；只能从第一列选择 name）：\n${catalogText || "（空）"}`;
   const user = `用户原始任务：${String(task || '').slice(0, 2600)}\n\n结构化工程画像：${JSON.stringify(profile || {}).slice(0, 5000)}\n\n当前编排阶段：${String(phase || 'next')}\n\n已加载工具：${JSON.stringify(loadedTools).slice(0, 4000)}\n\n运行进度：${String(progress || '（暂无）').slice(-7000)}\n\n最近真实工具结果：${String(evidence || '（暂无）').slice(-7000)}`;
-  const plannerModel = String(config.customModelId || "").trim()
-    ? config.model
-    : (_pickCheapModel(config.model) || config.model);
+  // 工具编排是认知腿，不是后台杂活：它决定下一阶段装入哪些能力。曾用 _pickCheapModel
+  // 降级到全目录最便宜的 nano/8b，用户主对话用旗舰、编排大脑却是弱智——选错/选不出
+  // 工具直接表现为"不会用 100 多个工具"。与意图判定同源的约定：认知腿跟随用户选择的模型。
+  const plannerModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 9000) : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 20000) : null;
     const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
       method: "POST",
       headers: {
@@ -33483,7 +33644,9 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
         Authorization: "Bearer " + (config.apiKey || ""),
         "x-ide-request-id": String(config.requestId || "").slice(0, 128),
       },
-      body: JSON.stringify({ model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 320, temperature: 0, stream: false }),
+      // max_tokens 曾是 320：推理型模型先烧内部思考 token，320 上限直接导致空 JSON→
+      // 返回 null→工具装不进来。JSON 本体很小，余量给思考用。
+      body: JSON.stringify({ model: plannerModel, messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 2000, temperature: 0, stream: false }),
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (to) clearTimeout(to);
@@ -33620,11 +33783,12 @@ async function _aiPlanReview({ config, task, planSteps, profile }) {
   const user = `用户任务：${String(task || "").slice(0, 1000)}\n\n任务类型要求重点覆盖：${dims.length ? dims.join("；") : "（无特殊维度，按通用工程完整性判断）"}\n\n计划步骤：\n${(Array.isArray(planSteps) ? planSteps : []).filter((s) => s?.status !== "cancelled").map((s, i) => `${i + 1}. ${String(s?.content || "").slice(0, 200)}`).join("\n").slice(0, 3200)}`;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 10000) : null;
+    const to = ctrl ? setTimeout(() => ctrl.abort(), 15000) : null;
     const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + (config.apiKey || ""), "x-ide-request-id": String(config.requestId || "").slice(0, 128) },
-      body: JSON.stringify({ model: _pickCheapModel(config.model), messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 220, temperature: 0, stream: false }),
+      // 计划评审同样是认知腿：用用户模型，max_tokens 留够推理型模型的思考余量。
+      body: JSON.stringify({ model: config.model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], max_tokens: 1200, temperature: 0, stream: false }),
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (to) clearTimeout(to);
@@ -33646,8 +33810,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // Apply the real per-model thinking knob selected in the model hover card.
   // This is profile-driven: OpenAI/xAI use reasoning_effort, Claude/Gemini use
   // budget/level fields, Kimi uses thinking.type, and unsupported models get no
-  // fake thinking parameter at all.
-  const config = _applyThinkingToConfig(_rawConfig);
+  // fake thinking parameter at all. agentTurn 钳默认档到 medium（显式选择不受影响）：
+  // 工具循环的推理逐轮外化，单轮巨额思考预算只会让模型在脑内闷写不动手。
+  const config = _applyThinkingToConfig(_rawConfig, { agentTurn: true });
   // Bind this whole run to ONE session + a private per-run context, so multiple
   // tabs can run agents concurrently without crossing state. `run.mode` and
   // `run.checkpoint` are captured NOW so a later tab/mode switch can't block this
@@ -33765,7 +33930,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, effectNudges = 0, researchNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0;
+  let continueNudges = 0, effectNudges = 0, researchNudges = 0, researchGateNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -33871,7 +34036,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   const _toolRoutingState = { runs: 0, signatures: new Set(), history: [] };
   run._toolRoutingState = _toolRoutingState;
   const _routeAgentTools = async (phase, evidence = "", taskDelta = "") => {
-    if (!isAgent || !_live() || _toolRoutingState.runs >= 8) return null;
+    // 配额 24：after_tools 检查点每个工具批次都触发，旧上限 8 在长任务前 8 批就烧光，
+    // 之后工具窗口整个冻结——后期阶段（验证/部署/修复）永远拿不到新能力。签名去重
+    // 已经拦住重复请求，配额只防失控，不该成为编排的实际天花板。
+    if (!isAgent || !_live() || _toolRoutingState.runs >= 24) return null;
     const loadedBefore = new Set(toolSchemas.map((schema) => String(schema?.function?.name || "")).filter(Boolean));
     const routeTask = [run._originalText, run._steeringText, taskDelta].filter(Boolean).join("\n").slice(-12000);
     const signature = JSON.stringify({
@@ -34395,7 +34563,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           draft: String(turn.text || summaryText || "").slice(-1600),
         });
         const _needCritic = _semanticPending || (deepReadNudges < 1 && run.mode === "agent" && !_quick());
-        if (_needCritic && run.mode === "agent" && !_quick() && _live() && _criticSignature !== _criticEvidenceSignature && _semanticReviewRuns < 4) {
+        if (_needCritic && run.mode === "agent" && !_quick() && _live() && _criticSignature !== _criticEvidenceSignature && _semanticReviewRuns < 6) {
           if (!_semanticPending) deepReadNudges++;
           _criticEvidenceSignature = _criticSignature;
           _semanticReviewRuns++;
@@ -34862,6 +35030,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           it._skipped = true;
           _settleToolStep(step, r, "先列计划 · 未执行");
           return _toolResultToString(call, r);
+        }
+        // 取证告知（不拦截）：工程语义要求外部参考的任务，首次写入时若还没取证，
+        // 当场装载研究工具 schema + 强提醒一次，但写入**照常执行**——拦截式打回白烧
+        // 一轮且被动（用户明确否决）；开局契约已前置告知义务，收尾门禁仍会逐项核对，
+        // 三层告知替代硬拦。
+        if (run && researchGateNudges < 1 && !_callCanBypassPlanGate(call)) {
+          const _preWriteResearchMissing = _missingResearchEvidence(run.engineering, _researchEvidence);
+          if (_preWriteResearchMissing.length) {
+            researchGateNudges++;
+            const gateNames = [];
+            if (_preWriteResearchMissing.includes("official")) gateNames.push("package_search", "github_repo");
+            if (_preWriteResearchMissing.includes("community")) gateNames.push("developer_community_search", "web_search");
+            const gateSchemas = gateNames.map((name) => run._toolRegistry?.get(name)).filter(Boolean);
+            if (gateSchemas.length) _applyToolPayloadWindow(toolSchemas, gateSchemas, run._toolCoreNames);
+            const gateTopics = Array.isArray(run.engineering?.researchTopics) && run.engineering.researchTopics.length
+              ? run.engineering.researchTopics.join("；")
+              : (run.engineering?.semanticGoal || run._originalText || "").slice(0, 300);
+            _pushNudge("researchFirst", `[取证提醒·不拦截] 这次工程语义要求${_preWriteResearchMissing.map((k) => ({ official: "官方/维护方", community: "开发者社区/同类现有实现" }[k])).join("和")}真实参考，你还没取证就开始写了。${gateNames.length ? `所需工具已装载（${gateNames.join("、")}），` : ""}尽快穿插取证：查同类项目真实实现与设计取舍（聚焦：${gateTopics}），读到仓库/帖子正文后把适配点落进实现；收尾验收会逐项核对外部证据，到时才补等于白写。`);
+          }
         }
         const _uiReadinessIssue = _uiImplementationReadinessNudge(run, planSteps, call);
         if (_uiReadinessIssue) {
@@ -35846,6 +36033,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     } catch {
       if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText }); } catch {} }
     }
+    _streamDraftClear(session); // 本次运行已持久化收尾，流式草稿不再需要（只清本会话的槽）
     const _runOutcome = awaitingUserReply ? "awaiting_user" : finalErr ? "failed"
       : (run._incompleteReason || hitCap || (didMutate && (!verificationPassed || !uiVerificationPassed))) ? "partial" : "success";
     session._lastRunState = {

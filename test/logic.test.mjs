@@ -6094,24 +6094,26 @@ test("正则字面量免疫：编辑工具损坏形态禁止出现，惯犯站�
     "writePattern 必须用 \\u000a 写法");
 });
 
-test("压缩档位扩大历史容量但不放大每轮项目上下文注入", () => {
-  const scale = load("_contextBudgetScale", {
-    _effectiveContextLimit: () => 5_000_000,
-    _lastGoodAiConfig: { model: "claude-sonnet-4-6" },
+test("压缩档位注入预算适度伸缩，封顶 2 倍守住计费", () => {
+  // 档位的主体价值是历史容量（网关压缩留住长历史）；每轮重发的通用底料按 8x 灰
+  // 曾把单次发送注入烧到 40K-64K token（用户痛点"扣费太快"）。封顶 2x：比 200K
+  // 时代更宽的定位信息 + 模型按需 read_file/search 取深内容，不降智不烧钱。
+  const five = load("_contextBudgetScale", {
+    _michaelUser: { michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } },
   });
-  assert.equal(scale(), 1, "5M 用于保留更长历史，不把每轮注入放大 8 倍");
-  const native = load("_contextBudgetScale", {
-    _effectiveContextLimit: () => 200_000,
-    _lastGoodAiConfig: { model: "x" },
+  assert.equal(five(), 2, "5M 档位注入预算封顶 2 倍，不随窗口线性烧钱");
+  const two = load("_contextBudgetScale", {
+    _michaelUser: { michael_compression: { tier: "2m", max_input_tokens: 2_000_000 } },
   });
-  assert.equal(native(), 1, "原生 200K 窗口保持旧预算不变");
-  const million = load("_contextBudgetScale", {
-    _effectiveContextLimit: () => 1_000_000,
-    _lastGoodAiConfig: { model: "x" },
+  assert.equal(two(), 2, "2M 同样封顶 2 倍");
+  const one = load("_contextBudgetScale", {
+    _michaelUser: { michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } },
   });
-  assert.equal(million(), 1, "1M 同样不自动灌入额外项目文本");
+  assert.equal(one(), 2, "1M 档位同样 2 倍封顶");
+  const none = load("_contextBudgetScale", { _michaelUser: null });
+  assert.equal(none(), 1, "无档位（未登录/无套餐）保持旧预算不变");
 
-  // 注入层仍统一读取倍率，但倍率固定为 1，避免大档位反而加速 token 消耗。
+  // 注入层仍统一读取倍率，各自带硬顶，大档位不致无上限灌入。
   assert.match(SRC, /maxTokens = Math\.round\(\(profile\.substantial \|\| profile\.debugProject \|\| profile\.uiProject \? 8000 : 5000\) \* _ctxScale\)/);
   assert.match(SRC, /_buildRepoMap\(query, Math\.round\(3000 \* Math\.min\(4, _ctxScale\)\), root\)/);
   assert.match(SRC, /_treeScale > 1 \? 640 : 180/);
@@ -8357,6 +8359,8 @@ test("slow community references cannot erase stable local engineering context", 
     _projectStacks: new Map([["/repo", { lang: "Rust" }]]),
     _buildRetrievedCodeContext: async () => "LOCAL_SOURCE",
     _buildEngineeringReferenceContext: async (...args) => { externalCalls++; return external(...args); },
+    // 同步缓存读器：命中时直接注入预热成果，未命中返回空——不构成外部调用。
+    _engineeringReferenceCachedBlock: () => "",
     _promiseOrFallbackWithin: within,
     _idleRun: (callback) => scheduled.push(callback),
     _bm25Index: { root: "", built: false },
@@ -8879,8 +8883,8 @@ test("natural-language capability queries are routed by the semantic tool orches
     toolRegistry: registry,
   });
   assert.match(request.messages[0].content, /local_discovery/);
-  assert.equal(request.model, "cheap:test", "semantic routing should use the cheapest configured gateway model");
-  assert.equal(request.max_tokens, 320, "tool routing should keep its JSON decision budget bounded");
+  assert.equal(request.model, "test", "工具编排是认知腿：必须用用户选择的模型，不得降级廉价模型");
+  assert.equal(request.max_tokens, 2000, "编排 JSON 本体很小，但预算要留够推理型模型的思考余量");
   assert.deepEqual(decision.tools, ["local_discovery"], "only names present in the complete registry may be scheduled");
   assert.doesNotMatch(extractFn("_searchToolsLookup"), /score|includes\(t\)|_TOOL_CATALOG/,
     "local capability lookup must not retain a keyword or description scorer");
@@ -12500,8 +12504,8 @@ test("语义收尾评审可按真实证据动态调度已注册的抓包链路",
   });
   assert.match(reviewRequest.messages[0].content, /capture_start/,
     "评审必须看到可用工具目录，才能为当前证据分配能力");
-  assert.equal(reviewRequest.model, "cheap:test", "wrap-up review should use a cheap gateway model");
-  assert.equal(reviewRequest.max_tokens, 360, "wrap-up review should keep its JSON decision budget bounded");
+  assert.equal(reviewRequest.model, "test", "收尾评审是质量门禁认知腿：必须用用户选择的模型，不得降级廉价模型");
+  assert.equal(reviewRequest.max_tokens, 2000, "评审预算要留够推理型模型的思考余量");
   assert.deepEqual(verdict.tools, ["capture_start", "browser", "capture_flows", "background_monitor"],
     "评审的未注册工具不得进入调度结果");
   const loop = extractFn("_runAgenticLoop");
@@ -12546,7 +12550,7 @@ test("multi-role capabilities remain dynamically discoverable without a static p
   assert.doesNotMatch(SRC, /function _profileToolPriorities/);
   assert.match(SRC, /完整工具目录（JSON 数据，只能选择其中 name）/);
   assert.match(SRC, /不要因为保守而把大工程写成 solo/, "semantic topology guidance must remain explicit");
-  assert.match(SRC, /这是建议不是禁令：任务展开后发现真需要分角色\/并行，可自主升级编排/,
+  assert.match(SRC, /这是建议不是禁令：任务展开后发现真需要分角色\/并行，直接按名调用 run_subagent（只读调研）\/run_worker（分 scope 写入）即可自主升级/,
     "a solo recommendation must not hide dynamically available collaboration tools");
 });
 test("外部研究结束门禁只接受真实、非空的官方与社区证据", () => {
