@@ -6002,7 +6002,8 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(SRC, /_commitAiIntentState\(sess, _turnIntentVerdict, text, _turnIntentContext\)/);
   assert.match(SRC, /const _uiTurnEngineering = _turnEngineeringResolved;/);
   assert.match(SRC, /const _turnEngineering = _turnEngineeringResolved;/);
-  assert.match(SRC, /run\.engineering = _engineeringProfileWithAiIntent\(task, session\);/);
+    assert.match(SRC, /const _engineeringProfile = _engineeringProfileWithAiIntent\(task, session\);[\s\S]*?run\.engineering = _engineeringProfile;/,
+      "run.engineering 必须来自会话感知的语义画像（提前计算供思考钳位复用，同一次判定不重复调用）");
   assert.match(SRC, /const profile = profileOverride \|\| _engineeringProfileWithAiIntent\(query\);/);
   assert.match(SRC, /_agentContextSnapshotForTurn\(text, _curRoot, _turnEngineeringResolved\)/,
     "首轮项目上下文必须消费本轮已解析语义画像，不能重新做无会话判定");
@@ -8621,10 +8622,14 @@ test("long chat transcripts stay bounded while paging both directions", () => {
   assert.doesNotMatch(extractFn("_renderMsgRange"), /_sessionHistoryEntries|\.assemble\(/);
   assert.match(extractFn("_snapshotTranscript"), /\.chat-history-page/,
     "paging controls are transient and must not be restored as stale transcript content");
+  // scroll handler 使用 rAF 合帧 + userScrolledAway 状态，去抖强制重排
   assert.match(extractFn("_queueHistoryAutoPage"), /chatEl\.scrollTop <= _HISTORY_AUTO_PAGE_EDGE_PX/);
   assert.match(extractFn("_queueHistoryAutoPage"), /distanceFromBottom <= _HISTORY_AUTO_PAGE_EDGE_PX/);
-  assert.match(SRC, /chatEl\.addEventListener\("scroll", \(\) => \{[\s\S]{0,240}_queueHistoryAutoPage\(\)/,
-    "normal scrolling must automatically page the bounded transcript in both directions");
+  // 验证存在 rAF 合帧机制
+  assert.match(SRC, /_chatScrollRAF\s*=\s*requestAnimationFrame/,
+    "scroll handler must use rAF coalescing to avoid forced synchronous reflow");
+  assert.match(SRC, /_userScrolledAway\s*=\s*false/,
+    "must track user scroll position to disable auto-follow when reading");
   assert.doesNotMatch(SRC, /while \(session\.container\.firstChild\)[\s\S]{0,180}_renderMsgRange\(session, 0, h\.length\)/,
     "opening earlier history must not synchronously rebuild the full transcript");
   assert.match(SRC, /const CHAT_LOCAL_RECENT_LIMIT = 96/,
@@ -8887,7 +8892,7 @@ test("natural-language capability queries are routed by the semantic tool orches
   });
   assert.match(request.messages[0].content, /local_discovery/);
   assert.equal(request.model, "test", "工具编排是认知腿：必须用用户选择的模型，不得降级廉价模型");
-  assert.equal(request.max_tokens, 2000, "编排 JSON 本体很小，但预算要留够推理型模型的思考余量");
+  assert.equal(request.max_tokens, 3000, "复杂任务深度思考需求，给推理型模型留足思考余量");
   assert.deepEqual(decision.tools, ["local_discovery"], "only names present in the complete registry may be scheduled");
   assert.doesNotMatch(extractFn("_searchToolsLookup"), /score|includes\(t\)|_TOOL_CATALOG/,
     "local capability lookup must not retain a keyword or description scorer");
@@ -12643,11 +12648,11 @@ test("每个注册工具都有按需加载的压缩场景与最小调用例子",
 test("Tool Search 只在命中时回传压缩调用指南，不把全量手册塞进稳定前缀", () => {
   const search = extractFn("_runAgenticLoop");
   const directory = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1] || "";
-  assert.match(search, /loadedAdds\.map\(\(schema\) => "· " \+ compactToolGuide\(schema\)\)/,
-    "命中的工具才带场景与示例");
+  assert.match(search, /loadedAdds\.map\(\(schema\) => "· " \+ compactToolGuide\(schema\) \+ _toolMetaGuideSuffix\(schema\?\.function\?\.name\)\)/,
+    "命中的工具才带场景与示例（P1 #5：额外追加推荐场景/触发条件元数据）");
   assert.match(search, /工具已加载：\\n· \$\{compactToolGuide\(exact\.schema\)\}/,
     "已加载工具被再次查询时也要回传调用范式");
   assert.doesNotMatch(directory, /例:\s*\w+\(\{/, "稳定 search_tools 描述不能内嵌全量调用样例");
-  assert.match(SRC, /import \{ compactToolGuide, enrichedCatalogLine \} from "\.\/tool-guides\.js"/,
+  assert.match(SRC, /import \{ compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, TOOL_METADATA \} from "\.\/tool-guides\.js"/,
     "工具手册必须独立于庞大的主编排模块");
 });
