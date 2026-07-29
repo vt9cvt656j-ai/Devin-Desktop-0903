@@ -118,11 +118,11 @@ impl TaskExecutor {
         let mut data = HashMap::new();
         data.insert("url".to_string(), serde_json::json!(url));
 
-        // 提取每个选择器的内容
+        // 提取每个选择器的内容（选择器经 JSON 编码后嵌入，含引号/反斜杠的选择器不会撞坏脚本）
         for selector in selectors {
             let script = format!(
-                "Array.from(document.querySelectorAll('{}')).map(el => el.textContent.trim()).join(' | ')",
-                selector
+                "Array.from(document.querySelectorAll({})).map(el => el.textContent.trim()).join(' | ')",
+                serde_json::json!(selector)
             );
             if let Ok(result) = self.agent.browser_eval(&script) {
                 data.insert(selector.to_string(), result);
@@ -188,12 +188,14 @@ impl TaskExecutor {
     /// # 返回
     /// 执行结果
     pub fn open_and_type(&mut self, app_name: &str, content: &str) -> Result<TaskResult> {
-        // 使用系统命令打开应用
-        let open_cmd = format!("open -a '{}'", app_name);
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&open_cmd)
-            .output()?;
+        // 直接传参给 open，不经过 shell：app_name 含引号/分号时不会被当成命令执行
+        let status = std::process::Command::new("open")
+            .arg("-a")
+            .arg(app_name)
+            .status()?;
+        if !status.success() {
+            return Ok(TaskResult::error(format!("打开应用 {} 失败", app_name)));
+        }
 
         std::thread::sleep(Duration::from_millis(2000));
 
@@ -217,13 +219,16 @@ impl TaskExecutor {
         std::thread::sleep(Duration::from_millis(100));
 
         let screenshot_path = format!("region_{}_{}_{}_{}.png", x, y, width, height);
-        
-        // 使用系统截图工具
-        let cmd = format!("screencapture -R {},{},{},{} {}", x, y, width, height, screenshot_path);
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()?;
+
+        // 直接调 screencapture，参数各自独立传递，不经过 shell 拼接
+        let status = std::process::Command::new("screencapture")
+            .arg("-R")
+            .arg(format!("{},{},{},{}", x, y, width, height))
+            .arg(&screenshot_path)
+            .status()?;
+        if !status.success() {
+            return Ok(TaskResult::error("区域截图失败（screencapture 退出码非 0）"));
+        }
 
         Ok(TaskResult::success("区域截图完成")
             .with_screenshot(screenshot_path))
@@ -240,6 +245,10 @@ impl TaskExecutor {
     /// # 返回
     /// 变化记录
     pub fn monitor_web_changes(&mut self, url: &str, selector: &str, interval_secs: u64, duration_secs: u64) -> Result<TaskResult> {
+        // interval 为 0 会除零 panic，直接拒绝
+        if interval_secs == 0 {
+            return Ok(TaskResult::error("interval_secs 必须大于 0"));
+        }
         self.agent.browser_start(false)?;
         self.agent.browser_goto(url)?;
 
@@ -248,11 +257,11 @@ impl TaskExecutor {
         let iterations = duration_secs / interval_secs;
 
         for i in 0..iterations {
-            std::thread::sleep(Duration::from_millis(interval_secs * 1000));
+            std::thread::sleep(Duration::from_secs(interval_secs));
 
             let script = format!(
-                "document.querySelector('{}')?.textContent?.trim() || ''",
-                selector
+                "document.querySelector({})?.textContent?.trim() || ''",
+                serde_json::json!(selector)
             );
             
             if let Ok(content) = self.agent.browser_eval(&script) {
@@ -293,8 +302,8 @@ impl TaskExecutor {
             std::thread::sleep(Duration::from_millis(2000));
 
             let script = format!(
-                "Array.from(document.querySelectorAll('{}')).map(el => el.textContent.trim()).join(' | ')",
-                data_selector
+                "Array.from(document.querySelectorAll({})).map(el => el.textContent.trim()).join(' | ')",
+                serde_json::json!(data_selector)
             );
 
             if let Ok(data) = self.agent.browser_eval(&script) {

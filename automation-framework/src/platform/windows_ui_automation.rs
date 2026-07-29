@@ -103,6 +103,7 @@ impl DesktopElementControl for WindowsUIAutomation {
                     .as_bool();
                 
                 let handle = elem.as_raw() as isize;
+                elem.AddRef(); // 句柄要存进 DesktopElement，elem 本体马上 drop（Release）；不补引用计数就是悬垂指针
                 
                 Ok(Some(DesktopElement {
                     name,
@@ -175,10 +176,10 @@ impl DesktopElementControl for WindowsUIAutomation {
                         .unwrap_or(true)
                         .as_bool();
                     
-                let handle = elem.as_raw() as isize;
-                unsafe { elem.AddRef(); } // 增加引用计数，防止提前释放
-                
-                results.push(DesktopElement {
+                    let handle = elem.as_raw() as isize;
+                    elem.AddRef(); // 增加引用计数，防止提前释放
+
+                    results.push(DesktopElement {
                         name,
                         element_type: element_type.to_string(),
                         x: rect.left,

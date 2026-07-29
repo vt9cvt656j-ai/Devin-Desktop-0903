@@ -56,7 +56,7 @@ required-features = ["system"]
 
 [[example]]
 name = "http_server_demo"
-required-features = ["system", "browser"]
+required-features = ["server", "system", "browser"]
 
 [[bin]]
 name = "automation-server"
