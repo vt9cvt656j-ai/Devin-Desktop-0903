@@ -19081,6 +19081,8 @@ function _modelFamilyOf(id) {
   if (/deepseek/.test(s)) return "deepseek";
   if (/minimax|abab/.test(s)) return "minimax";
   if (/gemini/.test(s)) return "gemini";
+  if (/grok|xai/.test(s)) return "grok";
+  if (/kimi|moonshot|glm|zhipu|qwen|qwq/.test(s)) return "kimi-glm-qwen";
   return "other";
 }
 const _GPT_STYLE = `
@@ -19121,6 +19123,25 @@ const _TERSE_STYLE = `
 
 # 输出风格：短、准、直击要害
 先给结论/动作再给理由；禁止开场白和复述用户问题；只答被问的那个点，别发散；能短就短、能列表别长段；干活少说多做、别全程旁白；不重复、不凑字、不把说过的再总结一遍。改前读真代码、改后验证，别臆造。`;
+const _GEMINI_TUNING = `
+
+# 给你的专项调教（Gemini 族——你简洁扎实，但通病：爱整文件重写、出错后道歉循环、没验证就宣布成功）
+- **小改动用 edit_file/multi_edit 精准替换**，不要把整个文件重写一遍（重写会覆盖你没读过的部分）；改前必 read_file 取真实原文。
+- **出错不道歉不重复同一动作**：失败一次就换证据路径（读报错原文/读文件/换工具），绝不 "I apologize" 后原样重试。
+- **说"完成/修好"前必须有真实验证证据**（run_cmd 退出码/get_diagnostics/浏览器检查）；没验证就如实说"已修改、待验证"。
+- **工具参数按 schema 精确字段名**（path/old_string/new_string/content），JSON 严格闭合，不自创字段。`;
+const _GROK_TUNING = `
+
+# 给你的专项调教（Grok 族——你敢下结论，但通病：过度自信、少验证、偶尔跑题）
+- **结论必须挂证据**：每个判断跟着来源（文件:行/命令输出/诊断）；没证据的判断明说是假设，不冒充事实。
+- **改完必验**：write/edit 后 run_cmd 或 get_diagnostics 真跑一遍；退出码 0 之前不说"搞定"。
+- **正文只干当前任务**，不跑题不抽机灵。`;
+const _KGQ_TUNING = `
+
+# 给你的专项调教（你这一族通病：长任务中途松劲早收尾、说做了没做、工具参数字段漂移）
+- **做完≠说完**：每一步"已完成"都要对应真实工具结果；没执行的不许写成过去时。
+- **长任务别中途松劲**：计划里的步骤逐个做完或明确标 cancelled，不许安静弃坑。
+- **工具参数字段名照 schema 精确写**（path/old_string/content…），不自创字段、不把调用混进正文。`;
 const _CLAUDE_TUNING = `\n\n⚡ **写入纪律（必须与项目事实一致）**：
 ① 新文件第一次 write_file 就写入完整、非空、可运行/可解析的终态；不要先建空骨架、TODO 或半截文件再多轮补齐，也不要套固定行数限制。
 ② 内容确实很大时按项目职责拆成多个边界清楚、各自完整的模块文件；已有文件优先用一次 edit_file / multi_edit 应用已经确定的小范围改动，不重写无关内容。
@@ -19158,8 +19179,10 @@ function _modelStyleTuning(id) {
     case "deepseek": base = _DEEPSEEK_TUNING; break;        // over-deliberates, format drift
     case "minimax": base = _MINIMAX_TUNING; break;          // hallucinates, skips steps/verify
     case "claude": base = _CLAUDE_TUNING; break;            // concise, evidence-led, complete writes
-    case "gemini": base = ""; break;                       // already concise + grounded
-    default: base = _TERSE_STYLE;                           // kimi / glm / qwen / other
+    case "gemini": base = _GEMINI_TUNING; break;            // full-file rewrites, apology loops, unverified success
+    case "grok": base = _GROK_TUNING; break;                // overconfident, under-verified
+    case "kimi-glm-qwen": base = _KGQ_TUNING; break;        // early wrap-up, claims-without-doing, arg drift
+    default: base = _TERSE_STYLE;                           // unknown families
   }
   return base + _AGENT_RECOVERY_TUNING;
 }
