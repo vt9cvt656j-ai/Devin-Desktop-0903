@@ -27800,37 +27800,104 @@ function _roadLocationAccuracyWarning(locationInput) {
 // .env / key file / hardcoded token can't leak off-machine. The user still sees the
 // real file in their IDE (only the model-facing copy is redacted). Conservative —
 // only well-known token shapes + secret-NAMED assignments, so normal code is untouched.
-function _redactSecrets(text) {
+function _redactSecrets(text, opts) {
   if (!text || text.length < 8 || typeof text !== "string") return text;
+  // 编号模式（任务 #44）：opts.map 传入 run 级映射（run._redactionMap）时，每个占位符带
+  // run 级唯一序号（如 [REDACTED_PRIVATE_KEY#3]、sk-abc…[REDACTED#7]），并把「序号 →
+  // { 原文片段, 打码渲染 }」记入映射，供 _restoreRedactedPlaceholders 按 ID 整块精确还原
+  // （跨行私钥块可编辑、双密钥同形不歧义的根基）。只在「读文件返回给模型」的路径传 map；
+  // 其余调用点（日志尾部/搜索片段/展示脱敏）不传，输出与历史格式逐字一致。
+  // 同一原文片段复用同一序号，重复读取编号不漂移。
+  const map = opts && opts.map instanceof Map ? opts.map : null;
+  const _mk = (orig, render) => {
+    // 前一条规则的打码产物被后一条再命中（如密钥赋值行的值先被 token 规则打码）时
+    // orig 已含占位符 → 不编号、退回旧格式，避免映射里存进占位符套占位符的脏原文。
+    if (!map || orig.includes("[REDACTED")) return render("");
+    const id = _redactionId(map, orig);
+    if (!id) return render(""); // 超上限 → 不编号（走逐行还原回退路径）
+    const red = render("#" + id);
+    map.set(id, { orig, red });
+    return red;
+  };
   let t = text;
   try {
-    t = t.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]");
-    t = t.replace(/\b(sk-ant-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b/g, (m) => m.slice(0, 6) + "…[REDACTED]");
-    t = t.replace(/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{4,}/g, "eyJ…[REDACTED_JWT]");
+    t = t.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, (m) => _mk(m, (n) => `[REDACTED_PRIVATE_KEY${n}]`));
+    t = t.replace(/\b(sk-ant-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b/g, (m) => _mk(m, (n) => m.slice(0, 6) + `…[REDACTED${n}]`));
+    t = t.replace(/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{4,}/g, (m) => _mk(m, (n) => `eyJ…[REDACTED_JWT${n}]`));
     // 任何以 KEY / SECRET / TOKEN / PASSWORD / PASSWD 结尾的标识符，不只是含 "api"
     // 的那几个 —— `STRIPE_KEY=`、`SENTRY_TOKEN=`、`DB_PASSWORD=` 此前全都漏网。
-    t = t.replace(/((?:[A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|key)|database[_-]?url|conn(?:ection)?[_-]?string)["']?\s*[:=]\s*["']?)([^\s"'`,;]{6,})/gi, (m, k, v) => k + v.slice(0, 2) + "…[REDACTED]");
+    t = t.replace(/((?:[A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|key)|database[_-]?url|conn(?:ection)?[_-]?string)["']?\s*[:=]\s*["']?)([^\s"'`,;]{6,})/gi, (m, k, v) => k + _mk(v, (n) => v.slice(0, 2) + `…[REDACTED${n}]`));
     // .netrc / .authinfo 是空格分隔而不是 = 分隔，上面那条匹配不到。
-    t = t.replace(/\b(password|account)\s+(\S{4,})/gi, (m, k, v) => `${k} ${v.slice(0, 2)}…[REDACTED]`);
+    t = t.replace(/\b(password|account)\s+(\S{4,})/gi, (m, k, v) => `${k} ${_mk(v, (n) => v.slice(0, 2) + `…[REDACTED${n}]`)}`);
     // Stripe / Twilio / SendGrid / npm 等常见服务的固定前缀。
-    t = t.replace(/\b((?:sk|rk)_live_[A-Za-z0-9]{10,}|SG\.[A-Za-z0-9_-]{16,}|AC[0-9a-f]{30,}|npm_[A-Za-z0-9]{30,}|dop_v1_[a-f0-9]{32,}|shpat_[a-f0-9]{20,})\b/g, (m) => m.slice(0, 6) + "…[REDACTED]");
+    t = t.replace(/\b((?:sk|rk)_live_[A-Za-z0-9]{10,}|SG\.[A-Za-z0-9_-]{16,}|AC[0-9a-f]{30,}|npm_[A-Za-z0-9]{30,}|dop_v1_[a-f0-9]{32,}|shpat_[a-f0-9]{20,})\b/g, (m) => _mk(m, (n) => m.slice(0, 6) + `…[REDACTED${n}]`));
     // `https://user:password@host` 形式的 URL 凭据。
-    t = t.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+):([^\s:@/]{3,})@/gi, (m, head) => `${head}:…[REDACTED]@`);
+    t = t.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+):([^\s:@/]{3,})@/gi, (m, head, pw) => `${head}:${_mk(pw, (n) => `…[REDACTED${n}]`)}@`);
   } catch { return text; }
   return t;
 }
-// 打码占位符写回还原：模型只见过打码副本，它的 edit/write 参数里的 [REDACTED*] 行在
-// 真实磁盘上对应原文行。用磁盘原文逐行重打码建立「打码行→原文行」映射，把参数里的
-// 打码行换回真实原文后再落盘——模型照常基于打码版编辑，磁盘上是完整真实版。
-// 还原不了（跨行私钥块、两个密钥打码后同形）返回 null，由调用方拒绝——安全底线：
+// run 级打码序号分配（任务 #44）：同一原文片段复用同一序号——同一文件重复读取、
+// 多个文件含同一密钥时，模型上下文里同一密钥只有一个名字，编号不漂移；新片段递增；
+// 超过 200 条上限返回 0 表示不编号（防映射膨胀，未编号占位符照旧走逐行还原回退）。
+function _redactionId(map, orig) {
+  for (const [id, ent] of map) { if (ent && ent.orig === orig) return id; }
+  if (map.size >= 200) return 0;
+  return map.size + 1;
+}
+// run 级「占位符序号 → 原文片段」映射：挂在 run 上，run 结束随对象自然回收；
+// 无 run（普通聊天等路径）返回 null → _redactSecrets 走不编号的旧格式。
+function _runRedactionMap(run) {
+  if (!run) return null;
+  run._redactionMap = run._redactionMap || new Map();
+  return run._redactionMap;
+}
+// 任务 #44③：跨行私钥块的「块内部分编辑」检测。old_string（占位符还原后）若与磁盘
+// 原文中某个私钥块相交、却没有完整覆盖它 → 属于打码块内部的部分编辑：模型看不见块内
+// 真实内容，部分替换等于盲改密钥，调用方必须明确拒绝。整块覆盖（由完整占位符还原而来）
+// 或与块无交集则放行。indexOf 逐次扫描判区间，\u000d\u000a 免疫。
+function _editHitsRedactedBlockInterior(originalContent, oldStr) {
+  const orig = String(originalContent ?? "");
+  const needle = String(oldStr ?? "");
+  if (!needle || !orig.includes("-----BEGIN ")) return false;
+  const blocks = [];
+  const re = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+  let m;
+  while ((m = re.exec(orig)) !== null) blocks.push([m.index, m.index + m[0].length]);
+  if (!blocks.length) return false;
+  let s = orig.indexOf(needle);
+  while (s !== -1) {
+    const e = s + needle.length;
+    // 与块相交但没有整块覆盖 → 命中块内部
+    for (const [bs, be] of blocks) { if (s < be && e > bs && !(s <= bs && e >= be)) return true; }
+    s = orig.indexOf(needle, s + 1);
+  }
+  return false;
+}
+// 打码占位符写回还原：模型只见过打码副本，它的 edit/write 参数里的 [REDACTED*] 在
+// 真实磁盘上对应原文。两级还原：① 编号占位符（[REDACTED_PRIVATE_KEY#3] 这类，任务 #44）
+// 按 run._redactionMap 里的「打码渲染 → 原文片段」整段 splice——支持跨行私钥块整块替换、
+// 占位符出现在写入内容任何位置、双密钥同形也各自精确还原；原文片段必须逐字存在于当前
+// 磁盘原文（防止把 A 文件读到的密钥经写回扩散进 B 文件）。② 剩余未编号占位符走旧的
+// 逐行映射：用磁盘原文逐行重打码建「打码行→原文行」映射换回原文（兼容旧路径）。
+// 还原不了（无映射的编号残留、未编号多密钥同形）返回 null，由调用方拒绝——安全底线：
 // 占位符字面量绝不落进真实文件，真实密钥也不因此进模型上下文（结果文本仍走
 // _toolResultToString 单一脱敏出口）。注意不用 $ 锚点，\u000d\u000a 免疫。
-function _restoreRedactedPlaceholders(originalContent, text) {
-  const s = String(text ?? "");
+function _restoreRedactedPlaceholders(originalContent, text, redactionMap) {
+  let s = String(text ?? "");
   if (!/\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(s)) return s; // 没占位符 → 原样放行
+  const origContent = String(originalContent ?? "");
+  if (redactionMap instanceof Map && /REDACTED[A-Z_]*#\d+/.test(s)) {
+    for (const ent of redactionMap.values()) {
+      if (!ent || !ent.red || !s.includes(ent.red)) continue;
+      if (!origContent.includes(ent.orig)) continue; // 原文片段不在本文件 → 留给下方回退判 null
+      s = s.split(ent.red).join(ent.orig);
+    }
+    // 还有编号占位符残留（映射丢失/被篡改/跨文件搬运）→ 交给下方逐行回退：
+    // 编号形态不可能命中未编号的逐行映射，除非该行逐字存在于原文，否则判 null 拒绝。
+  }
   const map = new Map();
-  const origLines = new Set(String(originalContent ?? "").split("\n"));
-  for (const line of String(originalContent ?? "").split("\n")) {
+  const origLines = new Set(origContent.split("\n"));
+  for (const line of origContent.split("\n")) {
     const red = _redactSecrets(line);
     if (red === line) continue;
     // 两个不同密钥打码后同形 → 无法唯一还原，标记冲突
@@ -39930,7 +39997,9 @@ async function _executeToolStep(step, call, root, run) {
       const header = (start > 0 || shownTo < total) ? `（${call.path} 第 ${shownFrom}-${shownTo}/${total} 行）\n` : "";
       // Redact credential values from the MODEL-facing copy only (the IDE card above
       // already rendered the real content for the user). Prevents secrets leaking off-machine.
-      const _safeBody = _redactSecrets(body);
+      // 任务 #44：这里是唯一启用编号打码的出口——占位符带 run 级唯一序号并记入
+      // run._redactionMap，写回时按 ID 整块精确还原（跨行私钥块可编辑、同形密钥不歧义）。
+      const _safeBody = _redactSecrets(body, { map: _runRedactionMap(run) });
       _recordRunRedactedRead(run, root, _sig, _safeBody !== body, call.path, usedPath);
       const _redNote = _safeBody !== body ? "\n（注：本文件含疑似密钥/令牌，已对你打码——需要真实值时让用户直接提供，别把密钥写进代码或外发。）" : "";
       const _readPath = (usedPath && usedPath !== call.path) ? `${call.path} (${usedPath})` : call.path;
@@ -40070,7 +40139,7 @@ async function _executeToolStep(step, call, root, run) {
         // 打码写回还原（安全底线①）：write_file 是整文件覆盖，模型基于打码副本重写，
         // content 里可能残留 [REDACTED*] 占位符行。落盘前用磁盘原文逐行换回真实原文，
         // 绝不让占位符字面量覆盖真实密钥；还原不出唯一原文就拒绝整文件覆盖。
-        const _restored = _restoreRedactedPlaceholders(old, newContent);
+        const _restored = _restoreRedactedPlaceholders(old, newContent, run && run._redactionMap);
         if (_restored == null) {
           res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 打码区无法唯一还原";
           return { type: "write", path: fp, content: `[BLOCKED] ${call.path} 含密钥/令牌，read_file 给模型的是打码副本；这次整文件 write_file 里的 [REDACTED] 无法唯一还原回真实内容，为防止占位符覆盖真实密钥，IDE 未写盘。请改用 edit_file / multi_edit 只改与密钥无关的精确片段，或请用户亲自处理敏感值。` };
@@ -40111,14 +40180,21 @@ async function _executeToolStep(step, call, root, run) {
         // 覆盖真实密钥。匹配/落盘前先用磁盘原文把占位符行换回真实原文；还原不出唯一原文
         // （多个密钥同形、私钥跨多行）就拒绝，不做危险的近似替换。
         if (redactedRead && /REDACTED/i.test(oldStr + (call.newString || ""))) {
-          const _rOld = _restoreRedactedPlaceholders(old, oldStr);
-          const _rNew = _restoreRedactedPlaceholders(old, call.newString || "");
+          const _rOld = _restoreRedactedPlaceholders(old, oldStr, run && run._redactionMap);
+          const _rNew = _restoreRedactedPlaceholders(old, call.newString || "", run && run._redactionMap);
           if (_rOld == null || _rNew == null) {
             res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 打码区无法唯一还原";
-            return { type: "edit", path: call.path, content: `[BLOCKED] ${call.path} 的 old_string/new_string 落在打码占位符上，且无法把 [REDACTED] 唯一还原回真实内容（可能多个密钥同形或私钥跨多行）。请把编辑限定在与密钥无关的片段，或请用户亲自处理敏感值。` };
+            return { type: "edit", path: call.path, content: `[BLOCKED] ${call.path} 的 old_string/new_string 落在打码占位符上，且无法把 [REDACTED] 唯一还原回真实内容（占位符与本文件对不上：可能来自旧上下文/别的文件，或编号被改动）。请重新 read_file 本文件拿到当前打码副本再改，或把编辑限定在与密钥无关的片段。` };
           }
           oldStr = _rOld;
           call.newString = _rNew;
+        }
+        // 任务 #44③：old_string 命中打码密钥块内部（在原文块内但不是完整块）→ 明确拒绝，
+        // 不做危险近似——模型看不见块内真实内容，部分替换等于盲改密钥。整块操作不受影响：
+        // 整块删除（old_string 用完整占位符）、替换为新真实密钥（合法轮换）照常放行。
+        if (redactedRead && _editHitsRedactedBlockInterior(old, oldStr)) {
+          res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 密钥块不可部分编辑";
+          return { type: "edit", path: call.path, content: `[密钥块不可部分编辑] ${call.path} 的 old_string 命中了打码密钥块的内部片段——该区域对你是打码的，部分替换等于盲改密钥，IDE 未写盘。可行操作：①整块保留（把编辑限定在密钥块以外的部分）②整块删除（old_string 用完整占位符，如 [REDACTED_PRIVATE_KEY#N]）③替换为新密钥（old_string 用完整占位符、new_string 直接写新的真实密钥值）。` };
         }
         let occ = old.split(oldStr).length - 1;
         // 缩进容错命中时要给替换文本补回被剥掉的公共缩进，所以这里持一个可变副本。
@@ -40320,14 +40396,20 @@ async function _executeToolStep(step, call, root, run) {
         // 打码写回还原（安全底线①）：同 edit_file——占位符行在匹配/落盘前用磁盘
         // （演变中的 content）原文换回真实原文；还原不出唯一原文就拒绝，整体不写。
         if (redactedRead && /REDACTED/i.test(oldStr + newStr)) {
-          const _rOld = _restoreRedactedPlaceholders(content, oldStr);
-          const _rNew = _restoreRedactedPlaceholders(content, newStr);
+          const _rOld = _restoreRedactedPlaceholders(content, oldStr, run && run._redactionMap);
+          const _rNew = _restoreRedactedPlaceholders(content, newStr, run && run._redactionMap);
           if (_rOld == null || _rNew == null) {
             res.className = "atc-result atc-result--blocked"; res.textContent = `⛔ 第 ${k + 1} 处打码区无法唯一还原`;
-            return { type: "multiedit", path: call.path, content: `[BLOCKED] 第 ${k + 1} 处 edit 落在打码占位符上且无法把 [REDACTED] 唯一还原回真实内容（多密钥同形或私钥跨多行），为防占位符覆盖真实密钥，整体未写入。请把编辑限定在与密钥无关的片段。` };
+            return { type: "multiedit", path: call.path, content: `[BLOCKED] 第 ${k + 1} 处 edit 落在打码占位符上且无法把 [REDACTED] 唯一还原回真实内容（占位符与本文件对不上：可能来自旧上下文/别的文件，或编号被改动），为防占位符覆盖真实密钥，整体未写入。请重新 read_file 本文件拿到当前打码副本再改。` };
           }
           oldStr = _rOld;
           newStr = _rNew;
+        }
+        // 任务 #44③：同 edit_file——old_string 命中打码密钥块内部（非完整块）→ 整体拒绝，
+        // 不做危险近似；整块删除/替换为新密钥（完整占位符还原而来）照常放行。
+        if (redactedRead && _editHitsRedactedBlockInterior(content, oldStr)) {
+          res.className = "atc-result atc-result--blocked"; res.textContent = `⛔ 第 ${k + 1} 处命中密钥块内部`;
+          return { type: "multiedit", path: call.path, content: `[密钥块不可部分编辑] 第 ${k + 1} 处 old_string 命中了打码密钥块的内部片段，部分替换等于盲改密钥，整体未写入。可行操作：①整块保留（编辑密钥块以外的部分）②整块删除（old_string 用完整占位符）③替换为新密钥（old_string 用完整占位符、new_string 直接写新的真实密钥值）。` };
         }
         let occ = content.split(oldStr).length - 1;
         if (occ === 0) {

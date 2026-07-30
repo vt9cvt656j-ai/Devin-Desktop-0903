@@ -10374,8 +10374,8 @@ test("redacted reads remain marked for their exact content version", () => {
   // 占位符行还原成磁盘真实原文；还原不出唯一原文才拒绝。断言这条新的安全路径存在。
   assert.match(extractFn("_executeToolStep"), /call\.type === "write" && redactedRead && \/REDACTED\/i\.test\(newContent/,
     "write_file with redacted content must restore placeholders from real disk content before writing");
-  assert.match(extractFn("_executeToolStep"), /const _restored = _restoreRedactedPlaceholders\(old, newContent\)/,
-    "whole-file write restore must run against the real on-disk content");
+  assert.match(extractFn("_executeToolStep"), /const _restored = _restoreRedactedPlaceholders\(old, newContent, run && run\._redactionMap\)/,
+    "whole-file write restore must run against the real on-disk content with the run redaction map");
 });
 
 test("redacted placeholders are written back to real content, never landing literally on disk (task #39)", () => {
@@ -10419,16 +10419,111 @@ test("redacted files stay editable: edit/multi_edit no longer hard-block, they r
   // edit_file：匹配前先还原 old_string / new_string 上的占位符。
   assert.match(fn, /redactedRead && \/REDACTED\/i\.test\(oldStr \+ \(call\.newString \|\| ""\)\)/,
     "edit_file must restore placeholders in old/new string when the read was redacted");
-  assert.match(fn, /const _rOld = _restoreRedactedPlaceholders\(old, oldStr\)/,
-    "edit_file restore must run against the real on-disk `old`");
+  assert.match(fn, /const _rOld = _restoreRedactedPlaceholders\(old, oldStr, run && run\._redactionMap\)/,
+    "edit_file restore must run against the real on-disk `old` with the run redaction map");
   // multi_edit：逐条 edit 在演变中的 content 上还原。
   assert.match(fn, /redactedRead && \/REDACTED\/i\.test\(oldStr \+ newStr\)/,
     "multi_edit must restore placeholders per edit when the read was redacted");
-  assert.match(fn, /const _rOld = _restoreRedactedPlaceholders\(content, oldStr\)/,
-    "multi_edit restore must run against the evolving content");
+  assert.match(fn, /const _rOld = _restoreRedactedPlaceholders\(content, oldStr, run && run\._redactionMap\)/,
+    "multi_edit restore must run against the evolving content with the run redaction map");
   // 旧的“一刀切禁止编辑打码文件”硬拦已移除。
   assert.doesNotMatch(SRC, /不能编辑打码占位符/,
     "the blanket 'cannot edit redacted placeholder' block must be gone");
+});
+
+test("编号打码占位符：同形双密钥唯一化、PEM 块整块还原、零落盘、旧格式回退（任务 #44）", () => {
+  const redactionId = load("_redactionId");
+  const redact = load("_redactSecrets", { _redactionId: redactionId });
+  const restore = load("_restoreRedactedPlaceholders", { _redactSecrets: redact });
+
+  // ① 两个打码后同形的密钥（同前缀同长度、同一行形态）——旧逐行映射判冲突拒绝，
+  // 编号后各自唯一还原。
+  const twoKeyDisk = 'const POOL = [\n  "sk-11111111111111111111x1",\n  "sk-11111111111111111111x2",\n];\n';
+  const rmap = new Map();
+  const seen = redact(twoKeyDisk, { map: rmap });
+  assert.match(seen, /sk-111…\[REDACTED#1\]/, "first secret gets #1");
+  assert.match(seen, /sk-111…\[REDACTED#2\]/, "same-form second secret gets a distinct #2");
+  assert.doesNotMatch(seen, /x1|x2/, "real key tails must not leak into the model copy");
+  // 同一文件重复读取 → 基于内容复用同一编号，不漂移、映射不膨胀。
+  assert.equal(redact(twoKeyDisk, { map: rmap }), seen, "re-reading the same content must reuse the same ids");
+  assert.equal(rmap.size, 2);
+  // 模型基于打码副本交换两个密钥的顺序 → 每个编号占位符还原回各自的真实密钥。
+  const swapped = 'const POOL = [\n  "sk-111…[REDACTED#2]",\n  "sk-111…[REDACTED#1]",\n];\n';
+  const restored = restore(twoKeyDisk, swapped, rmap);
+  assert.equal(restored, 'const POOL = [\n  "sk-11111111111111111111x2",\n  "sk-11111111111111111111x1",\n];\n',
+    "each numbered placeholder must restore to its own real secret");
+  // ④ 编号占位符零落盘：还原结果不残留任何占位符形态。
+  assert.doesNotMatch(restored, /REDACTED/);
+  // 无映射/映射丢失时编号占位符不可还原 → null 拒绝，绝不猜。
+  assert.equal(restore(twoKeyDisk, swapped), null, "numbered placeholders without a run map must be rejected, never guessed");
+  assert.equal(restore(twoKeyDisk, swapped, new Map()), null, "an empty/lost map must also reject");
+
+  // ② 跨行 PEM 私钥块：整块打码成一个编号占位符，写回时整块 splice 还原。
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\nqqSjAgEAAoIBAQ\n-----END PRIVATE KEY-----";
+  const pemDisk = `# server config\n${pem}\nport: 8080\n`;
+  const pmap = new Map();
+  const pemSeen = redact(pemDisk, { map: pmap });
+  assert.match(pemSeen, /\[REDACTED_PRIVATE_KEY#1\]/, "multi-line PEM block collapses to one numbered placeholder");
+  assert.doesNotMatch(pemSeen, /MIIEvQ/, "PEM body must not leak into the model copy");
+  const pemRestored = restore(pemDisk, pemSeen.replace("port: 8080", "port: 9090"), pmap);
+  assert.ok(pemRestored.includes(pem), "the whole multi-line PEM block must be restored verbatim");
+  assert.match(pemRestored, /port: 9090/, "the model's real edit must survive the restore");
+  assert.doesNotMatch(pemRestored, /REDACTED/, "no placeholder may land on disk");
+  // 占位符出现在写入内容的新位置（模型移动了块）→ 照样整块还原。
+  assert.equal(restore(pemDisk, "port: 9090\n[REDACTED_PRIVATE_KEY#1]\n", pmap), `port: 9090\n${pem}\n`);
+  // 跨文件搬运：原文片段不在目标文件 → 拒绝（密钥不经写回扩散进别的文件）。
+  assert.equal(restore("unrelated file\n", "[REDACTED_PRIVATE_KEY#1]\n", pmap), null);
+
+  // ⑤ 旧格式回退兼容：未编号占位符（不传 map 打码的旧上下文）在带 map 的新入口里
+  // 照旧走逐行映射成功还原。
+  const oneKeyDisk = 'const OPENAI_API_KEY = "sk-abcdefghijklmnopqrstuvwxyz0123";\nexport {};\n';
+  const legacySeen = redact(oneKeyDisk); // 不带编号的旧格式
+  assert.doesNotMatch(legacySeen, /#\d+\]/, "unnumbered mode must not emit ids");
+  const legacyRestored = restore(oneKeyDisk, legacySeen.replace("export {};", "export { x };"), new Map());
+  assert.match(legacyRestored, /sk-abcdefghijklmnopqrstuvwxyz0123/, "legacy line-based restore still works when a map argument is present");
+  assert.doesNotMatch(legacyRestored, /REDACTED/);
+
+  // 上限防膨胀：映射满 200 条后新片段退回不编号旧格式，映射不再增长。
+  const full = new Map(Array.from({ length: 200 }, (_, i) => [i + 1, { orig: `o${i}`, red: `r${i}` }]));
+  const capped = redact('T = "sk-33333333333333333333y9";\n', { map: full });
+  assert.match(capped, /sk-333…\[REDACTED\]/, "over-cap secrets fall back to the unnumbered legacy form");
+  assert.equal(full.size, 200, "the map must not grow past its cap");
+});
+
+test("打码密钥块内部的部分编辑被明确拒绝，编号打码只在读文件出口启用（任务 #44）", () => {
+  const hits = load("_editHitsRedactedBlockInterior");
+  const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG\nqqSjAgEAAoIBAQ\n-----END PRIVATE KEY-----";
+  const disk = `# cfg\n${pem}\nport: 8080\n`;
+  // 块内部片段（不完整块）→ 命中拒绝：头/尾单行、块中间一行、跨块边界的片段。
+  assert.equal(hits(disk, "-----END PRIVATE KEY-----"), true);
+  assert.equal(hits(disk, "MIIEvQIBADANBgkqhkiG"), true);
+  assert.equal(hits(disk, "qqSjAgEAAoIBAQ\n-----END PRIVATE KEY-----\nport: 8080"), true,
+    "a span leaking out of the block but not covering its head is still a partial edit");
+  // 完整块（含上下文）或块外编辑 → 放行。
+  assert.equal(hits(disk, pem), false, "the exact whole block (a restored full placeholder) is allowed");
+  assert.equal(hits(disk, `# cfg\n${pem}\nport: 8080`), false, "a span fully containing the block is allowed");
+  assert.equal(hits(disk, "port: 8080"), false);
+  assert.equal(hits(disk, "not-in-file"), false);
+  assert.equal(hits("no blocks here\n", "anything"), false);
+
+  // 接入点：edit_file / multi_edit 都在占位符还原后、匹配前做块内命中检查，
+  // 提示文案给出三条可行操作（保留/删除/轮换）。
+  const fn = extractFn("_executeToolStep");
+  assert.match(fn, /redactedRead && _editHitsRedactedBlockInterior\(old, oldStr\)/,
+    "edit_file must gate block-interior partial edits");
+  assert.match(fn, /redactedRead && _editHitsRedactedBlockInterior\(content, oldStr\)/,
+    "multi_edit must gate against the evolving content");
+  assert.match(SRC, /\[密钥块不可部分编辑\]/);
+  assert.match(SRC, /①整块保留/);
+  assert.match(SRC, /②整块删除/);
+  assert.match(SRC, /③替换为新密钥/);
+
+  // 编号开关的启用范围：只有「读文件返回给模型」这一个 _redactSecrets 调用点传 map，
+  // 日志/搜索片段/展示脱敏等其余调用点保持旧格式不变。
+  assert.match(fn, /_redactSecrets\(body, \{ map: _runRedactionMap\(run\) \}\)/,
+    "the read_file model copy is the numbered-redaction outlet");
+  assert.equal((SRC.match(/_redactSecrets\([^)]*\{ map:/g) || []).length, 1,
+    "numbered mode must not spread to display/log call sites");
 });
 
 test("probeLoop nudge preloads the tools it names before pushing (task #39 B)", () => {
@@ -12482,8 +12577,9 @@ test("secrets are redacted at the single exit, not per-tool", () => {
 });
 
 test("secret redaction covers the credential formats that actually appear", () => {
-  const m = SRC.match(/function _redactSecrets\(text\)[\s\S]*?\n\}/);
+  const m = SRC.match(/function _redactSecrets\(text, opts\)[\s\S]*?\n\}/);
   assert.ok(m, "找得到 _redactSecrets");
+  // 不传 opts.map → 不编号旧格式，_redactionId 不会被触及，无需注入。
   const redact = new Function("return " + m[0])();
   const leaks = [
     "STRIPE_KEY=sk_live_abcdefghij1234567890",      // 任意 *_KEY，不只含 api 的
