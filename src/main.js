@@ -37231,7 +37231,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       runtimeEffects: [..._runtimeEffects],
       externalEffects: [..._externalEffects],
       planStepsStatus: { total: planSteps?.length || 0, completed: planSteps?.filter(s => s.status === "completed").length || 0, pending: planSteps?.filter(s => s.status === "pending" || s.status === "in_progress").length || 0 },
-      hadDiagnostics: !!_prevVerifyErrs || !!_LSPDiagnostics,
+      hadDiagnostics: !!_prevVerifyErrs, // 修复: 原引用了不存在的 _LSPDiagnostics 导致运行时 ReferenceError
       updatedAt: Date.now(),
     };
     saveChatHistory({ immediate: true }); // CRITICAL: 立即刷盘，别用防抖——任务刚完成用户就 Cmd+Q 时防抖没落盘会丢最后一轮。也捕获渲染后的 transcript 快照。
