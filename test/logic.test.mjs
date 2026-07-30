@@ -14531,3 +14531,100 @@ test("#51-5 role 传递落盘：execRun._subRole 两条路径 + research/securit
   assert.match(sub, /for \(const t of \["web_search", "web_fetch"\]\) if \(!_allow\.includes\(t\)\) _allow\.push\(t\);/,
     "research/security 角色必须幂等确保网络工具在 _allow");
 });
+
+// ---- 任务 #53：子智能体嵌套派发（子再派子）·五条硬安全边界 ----------
+
+test("#53-1 深度控制：_subDepth 递进落盘 execRun + 深度 ≥2 白名单物理剔除派发三件套", () => {
+  const sub = extractFn("_runSubAgent");
+  // 深度递进：主 run 无 _subDepth 视为 0，子体 = 父 + 1，且落盘 execRun 供孙子体再算
+  assert.match(sub, /const _parentDepth = \(run && Number\.isInteger\(run\._subDepth\)\) \? run\._subDepth : 0;/);
+  assert.match(sub, /const _childDepth = _parentDepth \+ 1;/);
+  assert.match(sub, /execRun\._subDepth = _childDepth;/, "深度必须挂上 execRun，孙子体才算得出自己是第几层");
+  // 深度门：只有 <2 才把派发三件套推进 _allow / _execTypes（schema 级 + 执行级双门禁）
+  assert.match(sub, /const _canNest = _childDepth < 2;/);
+  assert.match(sub, /if \(_canNest\) for \(const t of \["run_subagent", "run_worker", "await_subagent"\]\) if \(!_allow\.includes\(t\)\) _allow\.push\(t\);/);
+  assert.match(sub, /if \(_canNest\) for \(const t of \["subagent", "worker", "awaitsubagent"\]\) if \(!_execTypes\.includes\(t\)\) _execTypes\.push\(t\);/);
+  // 基础白名单里绝不带派发工具——派发能力只能经 _canNest 门进入，深度 ≥2 因此物理拿不到
+  const toolsM = sub.match(/const _READ_TOOLS = \[([^\]]+)\]/);
+  assert.ok(toolsM && !toolsM[1].includes('"run_subagent"') && !toolsM[1].includes('"run_worker"') && !toolsM[1].includes('"await_subagent"'),
+    "_READ_TOOLS 不得含派发工具");
+  const typesM = sub.match(/const _READ_TYPES = \[([^\]]+)\]/);
+  assert.ok(typesM && !typesM[1].includes('"subagent"') && !typesM[1].includes('"worker"') && !typesM[1].includes('"awaitsubagent"'),
+    "_READ_TYPES 不得含派发类型");
+  // 行为复算（与源码同一门逻辑）：深度 1 可派，深度 2 白名单无三件套 → 第三层无法再派
+  const buildAllow = (childDepth) => {
+    const _allow = ["read_file", "run_cmd"];
+    if (childDepth < 2) for (const t of ["run_subagent", "run_worker", "await_subagent"]) if (!_allow.includes(t)) _allow.push(t);
+    return _allow;
+  };
+  assert.ok(buildAllow(1).includes("run_subagent") && buildAllow(1).includes("run_worker"), "深度 1 可再派一层");
+  const d2 = buildAllow(2);
+  for (const t of ["run_subagent", "run_worker", "await_subagent"]) assert.ok(!d2.includes(t), `深度 2 白名单必须无 ${t}`);
+});
+
+test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上限，不因层级翻倍", () => {
+  const sub = extractFn("_runSubAgent");
+  // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器
+  assert.match(sub, /const _nestReport = await _runSubAgent\(\{ config, [^\n]*run: execRun/,
+    "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
+  assert.match(sub, /const willStart = \+\+_sess\._subAgentsActive;/);
+  assert.match(sub, /if \(willStart > MAX_SUBAGENTS_PARALLEL\)/);
+  // 全函数只有一处递增一处递减——嵌套没有第二套计数器，预算不因层级翻倍
+  assert.equal((sub.match(/\+\+_sess\._subAgentsActive/g) || []).length, 1, "只允许一处递增");
+  assert.equal((sub.match(/_sess\._subAgentsActive--/g) || []).length, 1, "只允许一处递减（finally 里）");
+  assert.doesNotMatch(sub, /MAX_SUBAGENTS_PARALLEL \* /, "上限不得按层级乘倍放大");
+});
+
+test("#53-3 只读继承 + scope 收敛：嵌套强制只读，scope 必须是父 scope 子集，越界拒绝不泄漏", () => {
+  const sub = extractFn("_runSubAgent");
+  // 父已是子体（深度 ≥1）时：子集校验通过后仍强制只读——不继承 worker 写权限
+  assert.match(sub, /if \(_parentDepth >= 1 && write\) \{/);
+  assert.match(sub, /write = false; scope = \[\];/, "嵌套一律收敛为只读集");
+  // 子集校验与 _scopesOverlap 同一套 within 前缀语义（含尾部 /+ 归一）
+  assert.match(sub, /const _within = \(x, y\) => x === y \|\| x\.startsWith\(y \+ "\/"\);/);
+  assert.match(sub, /嵌套 worker 的 scope（/, "越界必须有明确拒绝文案");
+  // 拒绝必须发生在并发计数器与超时器启动之前——被拒的嵌套不得泄漏计数/定时器
+  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("++_sess._subAgentsActive"), "scope 拒绝在计数器之前");
+  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("const timeoutId = setTimeout"), "scope 拒绝在超时器之前");
+  // 行为复算：同一 within 谓词下的子集判定（含 CRLF 注入样本——归一后不得误判为子集）
+  const within = (x, y) => x === y || x.startsWith(y + "/");
+  const isSubset = (req, parent) => !req.some((s) => !parent.some((p) => within(s.replace(/\/+$/, ""), String(p).replace(/\/+$/, ""))));
+  assert.ok(isSubset(["src/api/auth.ts"], ["src/api/"]), "目录下文件 = 子集");
+  assert.ok(isSubset(["src/api"], ["src/api"]), "同一路径 = 子集");
+  assert.ok(!isSubset(["src/other/"], ["src/api/"]), "平行目录不是子集");
+  assert.ok(!isSubset(["src"], ["src/api"]), "父目录包彻子 scope = 扩张，必须拒");
+  assert.ok(!isSubset(["src/api\u000d\u000a../secret"], ["src/api"]), "CRLF 拼接样本不得被判为子集");
+});
+
+test("#53-4 超时预算继承：嵌套超时 = min(5min, 父剩余)，deadline 落盘 execRun", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /const _parentRemainMs = \(run && Number\.isFinite\(run\._subDeadline\)\) \? \(run\._subDeadline - Date\.now\(\)\) : SUBAGENT_TIMEOUT_MS;/);
+  assert.match(sub, /const _subTimeoutMs = Math\.max\(1000, Math\.min\(SUBAGENT_TIMEOUT_MS, _parentRemainMs\)\);/);
+  assert.match(sub, /execRun\._subDeadline = _subDeadlineAt;/, "deadline 必须挂上 execRun 供孙子体继承");
+  assert.match(sub, /\}, _subTimeoutMs\);/, "超时器必须用继承后的预算");
+  assert.doesNotMatch(sub, /\}, SUBAGENT_TIMEOUT_MS\);/, "超时器不得再用固定 5min");
+  // 行为复算（与源码同一公式）：父剩 2min → 子最多 2min；无父 deadline → 默认 5min；父耗尽 → 钳 1s 下限
+  const FIVE = 5 * 60 * 1000;
+  const calc = (deadline, now) => Math.max(1000, Math.min(FIVE, Number.isFinite(deadline) ? deadline - now : FIVE));
+  const now = 1_000_000;
+  assert.equal(calc(now + 120000, now), 120000, "父剩 2min → 子超时 2min，不能突破父预算");
+  assert.equal(calc(undefined, now), FIVE, "主 run 直派（无父 deadline）→ 默认 5min");
+  assert.equal(calc(now + 10 * 60 * 1000, now), FIVE, "父剩余比 5min 还多也钳回 5min 上限");
+  assert.equal(calc(now - 1, now), 1000, "父预算耗尽 → 钳 1s 下限防负值");
+});
+
+test("#53-5 结果链路：嵌套报告只进父子体消息流/简报，不直通主 run 的 _subAgentJobs 台账", () => {
+  const sub = extractFn("_runSubAgent");
+  // 嵌套分支存在且同步拿报告、报告推进本子体自己的 messages（父汇总时自然带上）
+  const nestIdx = sub.indexOf('if (call.type === "subagent" || call.type === "worker") {');
+  assert.ok(nestIdx > 0, "嵌套派发分支必须存在");
+  const nestBranch = sub.slice(nestIdx, sub.indexOf("const step = _createToolStep(call);", nestIdx));
+  assert.match(nestBranch, /messages\.push\(\{ role: "tool", tool_call_id: tc\.id, content: String\(_nestReport \|\| ""\)\.slice\(0, 8000\) \}\)/,
+    "嵌套报告回到父子体消息流");
+  assert.doesNotMatch(nestBranch, /_subAgentJobs\.set/, "嵌套分支不建 job 台账——主 run 看不到孙子作业");
+  // execRun 拿自己的空台账：嵌套 await_subagent 消化不了父级/主 run 的在途作业，层级隔离
+  assert.match(sub, /execRun\._subAgentJobs = new Map\(\);/);
+  assert.match(sub, /execRun\._subAgentJobSeq = 0;/);
+  // 父子体收尾仍把自己的简报（含嵌套结果）折进 findings——既有机制承接，不另建链路
+  assert.match(sub, /run\.ctx\.findings\.push/);
+});

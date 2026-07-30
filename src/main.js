@@ -33213,14 +33213,35 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _subGenSnap = _sess ? (_sess._runGen || 0) : 0; // 代际快照：父 run 被新回合取代后，子代理下个检查点确定性退出
   const _live = () => !_sess || (_sess.streaming && (_sess._runGen || 0) === _subGenSnap);
   
+  // === 嵌套派发硬边界①（#53）：深度控制。主 run 无 _subDepth 视为 0，其子体 depth=1，孙子体 =2；
+  // 深度 ≥2 的子体白名单强制剔除派发工具（见下方 _canNest），物理上第三层无法再派，根除无限递归。
+  const _parentDepth = (run && Number.isInteger(run._subDepth)) ? run._subDepth : 0;
+  const _childDepth = _parentDepth + 1;
+  // 嵌套派发硬边界③（#53）：只读继承 + scope 收敛。父已是子体（深度 ≥1）时，本次派发强制只读——
+  // 不继承 worker 写权限；嵌套声明的 scope 必须是父 scope 的子集（与 _scopesOverlap 同一套
+  // within 前缀语义），越界直接拒绝，不给嵌套扩张可改范围的机会。放在计数器/超时器之前，拒绝不泄漏。
+  if (_parentDepth >= 1 && write) {
+    const _parentScope = Array.isArray(run && run._scope) ? run._scope : [];
+    const _reqScope = (Array.isArray(scope) ? scope : [scope]).map((s) => _normRel(s, root)).filter(Boolean);
+    const _within = (x, y) => x === y || x.startsWith(y + "/");
+    if (_parentScope.length && _reqScope.some((s) => !_parentScope.some((p) => _within(s.replace(/\/+$/, ""), String(p).replace(/\/+$/, ""))))) {
+      return `[BLOCKED] 嵌套 worker 的 scope（${_reqScope.join(", ")}）必须是父 scope（${_parentScope.join(", ")}）的子集——嵌套派发不能扩张可改范围。收敛 scope 后重派，或把这块交回父级自己改。`;
+    }
+    write = false; scope = [];
+  }
   // === Timeout protection: bounded runtime (5 min default), graceful termination with partial results ===
   const SUBAGENT_TIMEOUT_MS = 5 * 60 * 1000;
+  // 嵌套派发硬边界④（#53）：超时预算继承——嵌套子体超时 = min(默认 5min, 父剩余时间)；父的
+  // deadline 在父启动时挂上其 execRun._subDeadline，孙子体不能突破父预算，下限 1s 防负值/零窗口。
+  const _parentRemainMs = (run && Number.isFinite(run._subDeadline)) ? (run._subDeadline - Date.now()) : SUBAGENT_TIMEOUT_MS;
+  const _subTimeoutMs = Math.max(1000, Math.min(SUBAGENT_TIMEOUT_MS, _parentRemainMs));
+  const _subDeadlineAt = Date.now() + _subTimeoutMs;
   const timeoutId = setTimeout(() => {
     if (_sess && _sess._cancelIds) _sess._cancelIds.set("subagent_timeout", true);
     res.className = "atc-result atc-result--timeout";
     res.textContent = "⏱ [超时终止·已保留部分结果]";
     if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
-  }, SUBAGENT_TIMEOUT_MS);
+  }, _subTimeoutMs);
   
   // === Concurrent subagent limit: max 2 parallel, queue the rest ===
   // Reuse session's subagent counter for isolation
@@ -33350,8 +33371,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // research child is genuinely thorough, not stuck on read_file+grep. Workers additionally get
   // scoped writes PLUS run_cmd + diagnostics, so they can BUILD *and VERIFY* their own piece.
   // Safety invariants kept: read-only agents get NO mutating type (truly can't change anything);
-  // workers' file writes stay scope-boxed; git-write and spawning further sub-agents stay OFF
-  // (no runaway recursion); everything still gated by the run's perm (approval) setting.
+  // workers' file writes stay scope-boxed; git-write stays OFF; nested dispatch is depth-gated
+  //（#53：深度 <2 才可再派一层，深度 ≥2 物理剔除派发工具，无限递归依旧结构性不可能）;
+  // everything still gated by the run's perm (approval) setting.
   // `browser` **不在**只读白名单里。它带 eval / upload / autofill / click —— 一个能在
   // 任意页面执行 JS 并上传本地文件的工具，不管怎么包装都不是"只读"，而且它本身就是一条
   // 完整的本机文件外泄通道（读文件 → upload 到攻击者的站点）。
@@ -33373,12 +33395,20 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   if (["research", "security"].includes(String(role || "").toLowerCase())) {
     for (const t of ["web_search", "web_fetch"]) if (!_allow.includes(t)) _allow.push(t);
   }
+  // 嵌套派发硬边界①②（#53）：深度 <2 的子体可再派一层——run_subagent/run_worker/await_subagent
+  // 进白名单；嵌套启动仍走 _runSubAgent 里同一个 _sess._subAgentsActive 计数与
+  // MAX_SUBAGENTS_PARALLEL(2) 排队逻辑，并发预算全会话共享、不因层级翻倍。
+  // 深度 ≥2（孙子体）强制剔除这三件——schema 不装载、模型看不见，物理上第三层无法再派。
+  const _canNest = _childDepth < 2;
+  if (_canNest) for (const t of ["run_subagent", "run_worker", "await_subagent"]) if (!_allow.includes(t)) _allow.push(t);
   // Build the full schema then filter by name — so a tool gated behind if(includeWrite) at build
   // time (e.g. browser) is still visible to a read-only child that's allowed it.
   const toolSchemas = _buildAgentToolSchemas(true).filter((t) => _allow.includes(t.function.name));
   const _execTypes = write
     ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
     : [..._READ_TYPES, "cmd"]; // P0.2: 允许只读模式执行 cmd
+  // #53：与 _allow 同步——深度 <2 放行派发三类型；深度 ≥2 不进列表，执行层门禁二次兜底
+  if (_canNest) for (const t of ["subagent", "worker", "awaitsubagent"]) if (!_execTypes.includes(t)) _execTypes.push(t);
   // Worker run context: inherit session + checkpoint (so edits are in the parent's
   // revert-all) + the user's approval setting, but tag it a worker with its scope so
   // _executeToolStep enforces the boundary.
@@ -33387,6 +33417,13 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const execRun = write
     ? { ...run, mode: "agent", _isWorker: true, _scope: scopeRel, _subRole: role }
     : { ...run, _subRole: role };
+  // #53 嵌套派发：深度与 deadline 挂上 execRun——孙子体据此算白名单与剩余预算（硬边界①④）；
+  // 作业台账换成本子体自己的空账本（硬边界⑤）：嵌套作业不直通主 run 的 _subAgentJobs，
+  // 主 run 看不到孙子作业，嵌套 await_subagent 也消化不了父级/主 run 的在途作业。
+  execRun._subDepth = _childDepth;
+  execRun._subDeadline = _subDeadlineAt;
+  execRun._subAgentJobs = new Map();
+  execRun._subAgentJobSeq = 0;
 
   let report = "";
   const _writesDone = []; // 编排核对账本：本 worker 实际写盘的文件（工具执行事实，不是模型自述）
@@ -33412,8 +33449,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         const call = _mapToolCall(tc.name, tc.parsedArgs, run?.mcpToolMap);
         if (call && tc._liveWritePreview) call._liveWritePreview = tc._liveWritePreview;
         // Tool allowlist: read-only sub-agents may ONLY read/search; workers also get
-        // write/edit/multiedit (scope-enforced in _executeToolStep). Neither can spawn
-        // a sub-agent/worker (not on the list) → recursion is structurally impossible.
+        // write/edit/multiedit (scope-enforced in _executeToolStep). Nested dispatch is
+        // depth-gated（#53）: 深度 <2 的子体可再派一层（上方 _canNest 放行），深度 ≥2 的
+        // 孙子体派发类型不在列表 → 第三层结构性无法再派。
         // P1.4(#51): git 是单 type 多 op，type 级放行后必须按 op 二次把关——
         // 只读四件套（status/diff/log/blame）放行，commit/push/clone 等写 op 一律拒绝。
         const _gitOpBlocked = !!call && call.type === "git" && !_GIT_READ_OPS.includes(call.op);
@@ -33436,6 +33474,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
             console.error("[subagent-toolstep]", error);
           }
           messages.push({ role: "tool", tool_call_id: tc.id, content: rejectedContent });
+          continue;
+        }
+        // 嵌套派发执行（#53）：深度 1 的子体再派一层。同步等待拿报告——嵌套结果只进本子体的
+        // 消息流与简报（硬边界⑤：父汇总时自然带上，不建 job 台账，主 run 的 _subAgentJobs
+        // 看不到孙子作业）；嵌套卡片直接渲染在本子体视口里，层级一目了然。write/scope 由
+        // _runSubAgent 顶部的硬边界③强制收敛（孙子体一律只读），超时由硬边界④取 min 继承。
+        if (call.type === "subagent" || call.type === "worker") {
+          toolCount++;
+          const _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
+          messages.push({ role: "tool", tool_call_id: tc.id, content: String(_nestReport || "").slice(0, 8000) });
           continue;
         }
         const step = _createToolStep(call);
