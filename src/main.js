@@ -16818,7 +16818,17 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
   if (inflight) return inflight; // 预取已在路上：发送直接搭车，零额外延迟零重复计费
   // 用户选什么模型就用什么模型判意图，不降级廉价模型。
   const prompt = `你是 Michael IDE 的语义工程决策器。根据当前消息、同一会话状态和真实工作区证据，还原用户要交付的终态，并决定完成它所需的工程路径。严格输出一个 JSON 对象，除 JSON 外不要任何文字。禁止通过关键词表、正则或“提到某个词就开启某功能”的方式分类；必须从目标、业务行为、项目事实、风险和验收结果推理。
-语义字段：goal=用户最终要达到的结果；action=answer/inspect/modify/create/run/debug/review/plan/operate/cancel 之一；target=这次动作针对的对象；locationIntent=none/context_only/query/remember（仅提供位置上下文、明确要查询位置相关信息、或要求记住位置）；constraints=不能违反的要求；successCriteria=用户会据此判断完成的可观察结果；continuation=new/continue/correct/replace/clarify；confidence=0到1；ambiguities=仍会实质改变结果且无法从上下文消除的歧义。
+语义字段：goal=用户最终要达到的结果；action=answer/inspect/modify/create/run/debug/review/plan/operate/cancel 之一；target=这次动作针对的对象；locationIntent=none/context_only/query/remember（请注意区分）：
+- 'context_only': 用户【只】提供了项目/文件位置，【无】查询或动作意图
+  示例：'这个项目怎么样？' → 只是要求审视位置，没有明确要改什么
+- 'query': 用户提供了位置【且】有明确查询/分析意图
+  示例：'在项目里怎么实现绕过检测？' → 提供了位置 (项目) + 查询 (怎么实现) → query
+- 'none': 用户【无】位置上下文，只是抽象问题
+  示例：'什么是绕过检测的常见方法？' → 无位置上下文
+- 'remember': 用户明确要求记住某个位置信息
+  示例：'记住这个项目的结构' → remember
+关键规则：位置 + 查询 ≠ 仅位置！两者同时存在时必须标 'query'，不能标 'context_only'
+;constraints=不能违反的要求；successCriteria=用户会据此判断完成的可观察结果；continuation=new/continue/correct/replace/clarify；confidence=0 到 1；ambiguities=仍会实质改变结果且无法从上下文消除的歧义。
 规则：短句不能孤立理解。“继续/这个/还是不行/不对/按刚才的”必须结合 priorTask、recentTurns、lastRun、unfinishedPlan 和附件解析指代；correct 表示纠正旧理解，replace 表示换目标，continue 表示沿用已确认目标。最新用户消息优先，旧要求冲突时只保留最新约束。不要把助手上一轮的建议误当成用户授权。
 工程字段（全部必填）：projectState=none/existing/greenfield/unknown；deliverySurface=answer/code/ui_component/website/web_app/backend/data/cli/desktop/automation/mixed；changeScope=none/local/module/project/system；architectureMode=none/follow_existing/extend_existing/design_new/refactor_existing；dataStrategy=not_applicable/none/local/server/inspect_existing/undecided；researchMode=none/official/community/official_and_community；designMode=none/michael_design_2_5_existing/michael_design_2_5_greenfield；workspaceAction=none/inspect/modify；captureMode=none/isolated_browser/system/background；browserGoal=none/static/interactive/network_capture；orchestrationMode=solo/staged_roles/parallel_roles；roleNeeds 只能从 architect/product/research/frontend/backend/database/security/test/devops/design/docs 选择且只列真正需要的角色；coordinationRisks 记录跨角色契约、共享文件、顺序依赖或集成风险；runtimeActions 和 externalActions 只列实际需要的动作；researchTopics 列需要核验的具体技术主题；rationale 用短句记录决定依据。
 工程决策律：
@@ -20611,7 +20621,17 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     while (s) {
       if (!_thinkIn) {
         const i = s.indexOf("<think>");
-        if (i === -1) { const k = _partialOpen(s, "<think>"); an += s.slice(0, s.length - k); _thinkHold = s.slice(s.length - k); break; }
+        if (i === -1) { 
+          const k = _partialOpen(s, "<think>"); 
+          // 只有当尾部不足以构成标签开头时才加入答案
+          if (k === 0 || !s.slice(-k).startsWith("<")) {
+            an += s;
+          } else {
+            an += s.slice(0, s.length - k); 
+            _thinkHold = s.slice(s.length - k);
+          }
+          break; 
+        }
         an += s.slice(0, i); s = s.slice(i + 7); _thinkIn = true;
       } else {
         const i = s.indexOf("</think>");
@@ -20620,6 +20640,15 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       }
     }
     return { th, an };
+  };
+  // 在流结束时检查是否还有悬空的<think>标签未闭合
+  const _flushUnfinishedThink = () => {
+    // 如果_thinkHold 中有未闭合的标签（如"<think"或"<"），将其作为思考内容
+    if (_thinkHold && _thinkHold.includes("<")) {
+      reasoning += _thinkHold;
+      if (reasoningEl) setThink();
+      _thinkHold = "";
+    }
   };
   const ensureThink = () => {
     if (reasoningEl) return reasoningEl;
@@ -20922,6 +20951,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       // 一声不吵"（实测用户痛点"一直思考不说话"）。就地快速重试一次。
       if (!err && !acc.trim() && !_pendingToolCalls.length && reasoning.trim()
         && !_plainReasoningRetryUsed && _turnLive()) {
+        // 在重试前，先确保所有悬空的思考标签都被正确处理
+        _flushUnfinishedThink();
         _plainReasoningRetryUsed = true;
         reasoning = "";
         _removeAllThinking(body);
@@ -20949,7 +20980,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         estimated: false,
       }, { session: sess });
     }
-    if (_thinkHold) { if (_thinkIn) { reasoning += _thinkHold; setThink(reasoning); } else { acc += _thinkHold; } _thinkHold = ""; }
+    // 确保所有悬空的<think>标签都流入思考卡而非答案
+    _flushUnfinishedThink();
+    if (_thinkHold) { 
+      // 双重保险：如果_thinkHold 仍有内容，优先推给思考卡
+      if (_thinkIn || _thinkHold.includes("<")) { 
+        reasoning += _thinkHold; 
+        setThink(reasoning); 
+      } else { 
+        acc += _thinkHold; 
+      } 
+      _thinkHold = ""; 
+    }
     collapseThink();
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     _setStreaming(sess, false);
@@ -36800,10 +36842,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         const currentUserText = [run?._originalText, run?._steeringText].filter(Boolean).join("\n");
         if (call.type !== "memory" && _hasContextOnlyLocationIntent(run.engineering)) {
-          const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 用户这轮只提供了位置上下文，没有提出查询。不要联网、不要查附近、不要自行扩展任务；简短确认已理解该位置，然后等待用户的具体问题。" };
-          it.rawResult = r;
-          _settleToolStep(step, r, "仅记录上下文 · 未查询");
-          return r.content;
+          // 二次确认：检测用户是否有明确的查询意图（即使意图模型判错）
+          const queryKeywords = ["怎么", "如何", "实现", "修复", "改", "调试", "分析", "检查", "验证", "测试", "什么", "为什么", "哪儿", "哪里"];
+          const hasQueryIntent = queryKeywords.some(kw => currentUserText.includes(kw));
+          
+          if (hasQueryIntent) {
+            // 虽然意图判定说"context_only"，但用户明确有查询词 → 放行，纠正意图
+            run.engineering.intentSemantic.locationIntent = "query";
+          } else {
+            // 真正是仅提供位置 → 正常拦截
+            const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 用户这轮只提供了位置上下文，没有提出查询。不要联网、不要查附近、不要自行扩展任务；简短确认已理解该位置，然后等待用户的具体问题。" };
+            it.rawResult = r;
+            _settleToolStep(step, r, "仅记录上下文 · 未查询");
+            return r.content;
+          }
         }
         // search_tools — 元工具：把命中的延迟工具 schema 换入有界窗口。不走 _executeToolStep。
         if (call && call.type === "search_tools") {
