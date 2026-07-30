@@ -26334,7 +26334,14 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "think": return { type: "think", content: args.thought || args.thoughts || "" };
     case "debate": return { type: "debate", question: args.question || args.topic || args.q || "", perspectives: args.perspectives || args.stances, context: args.context || "" };
     case "ask_user": return { type: "askuser", question: args.question || args.q || args.prompt || args.text || "", options: Array.isArray(args.options) ? args.options : (Array.isArray(args.choices) ? args.choices : (Array.isArray(args.buttons) ? args.buttons : [])), recommended: Number.isFinite(+args.recommended) ? +args.recommended : -1, multiSelect: !!args.multi_select, confirmText: String(args.confirm_text || "") };
-    case "run_subagent": return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || "", role: args.role || "" };
+    case "run_subagent": {
+      // P1 多任务并发：容错解析 tasks 数组（每项 {role, task} 或纯字符串），
+      // 单任务/无 tasks 时保持原 prompt 路径不变。
+      const _tasks = Array.isArray(args.tasks)
+        ? args.tasks.map((t) => (typeof t === "string" ? { task: t, role: "" } : { task: String(t?.task || t?.prompt || ""), role: String(t?.role || "") })).filter((t) => t.task.trim())
+        : null;
+      return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || (_tasks && _tasks[0] ? _tasks[0].task : ""), role: args.role || "", tasks: _tasks && _tasks.length ? _tasks : undefined };
+    }
     case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || "") };
     case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || "") };
     case "learn_design": return { type: "learndesign", path: String(args.url || ""), url: String(args.url || ""), name: String(args.name || "") };
@@ -32863,9 +32870,35 @@ function _sharedCtxDigest(ctx) {
   if (ctx.done && ctx.done.length) p.push(`· 主智能体已完成：${ctx.done.slice(-8).join(" → ")}`);
   if (ctx.modified && ctx.modified.size) p.push(`· 已改的文件：${[...ctx.modified].map(([f, d]) => `${f}(${d})`).join("、")}`);
   if (ctx.filesRead && ctx.filesRead.size) p.push(`· 已读过（不必重读，除非你要改它）：${[...ctx.filesRead].slice(-40).join("、")}`);
+  // P0.1 关键片段：主 run 已读文件的内容摘要（由 _subAgentFileSnippets 从读取缓存提取，
+  // 每文件 ≤1500 字、总量 ≤8K）——只传文件名不传内容正是子智能体重复劳动的主因。
+  if (ctx.fileSnippets && ctx.fileSnippets.size) {
+    const snippets = [...ctx.fileSnippets].map(([path, snippet]) => `── ${path} ──\n${snippet}`).join("\n");
+    p.push(`· 已读文件关键片段（直接引用，不必重读）：\n${snippets}`);
+  }
   if (ctx.findings && ctx.findings.length) p.push(`· 已知关键发现：${ctx.findings.slice(-8).join("；")}`);
   if (ctx.errors && ctx.errors.length) p.push(`· 当前未解决的错误：${ctx.errors.slice(-3).join("；")}`);
   return p.length ? `【主智能体已经掌握的上下文——直接接着用，别从零重查】\n${p.join("\n")}` : "";
+}
+// P0.1 已读文件内容摘要：从主 run 的读取缓存（_agentReadCache）里把 ctx.filesRead 命中的
+// 文件内容压成每文件 ≤1500 字的摘要（头尾+错误行优先，复用 _clipPreservingErrors），
+// 总量硬上限 8K——token 经济：宁可少带几个文件，不把子智能体请求撑爆。
+function _subAgentFileSnippets(ctx, root, perFileMax = 1500, totalMax = 8000) {
+  const out = new Map();
+  if (!ctx || !ctx.filesRead || !ctx.filesRead.size) return out;
+  let total = 0;
+  // 最近读的排前面（离当前任务最近、相关性最高）
+  for (const rel of [...ctx.filesRead].slice(-12).reverse()) {
+    if (total >= totalMax || out.size >= 8) break;
+    const abs = root ? _resolveRel(rel, root) : rel;
+    const text = _agentReadCache.get(abs) ?? _agentReadCache.get(rel);
+    if (typeof text !== "string" || !text.trim()) continue;
+    const clip = _clipPreservingErrors(text, Math.min(perFileMax, totalMax - total));
+    if (!clip) continue;
+    out.set(rel, clip);
+    total += clip.length;
+  }
+  return out;
 }
 function _sessionFileEvidenceBlock(session, root, limit = 8) {
   const memory = session?.memory;
@@ -32979,7 +33012,18 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _childContext = _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
   // Context IN: prepend the shared run-context digest so this child stands on what the main
   // agent already learned/did (真·上下文协议) instead of re-investigating from zero.
-  const _shared = _sharedCtxDigest(run && run.ctx);
+  // P0.1：先把主 run 已读文件的内容摘要装进 ctx.fileSnippets（每文件 ≤1500 字、总量 ≤8K），
+  // 再生成摘要——子智能体拿到的不再只是文件名清单，而是可直接引用的内容。
+  const _ctxWithSnippets = run && run.ctx
+    ? { ...run.ctx, fileSnippets: _subAgentFileSnippets(run.ctx, root) }
+    : (run && run.ctx);
+  const _shared = _sharedCtxDigest(_ctxWithSnippets);
+  // P0.1 任务书增强：验收契约 + 上轮思考结论 + 工具成败账本摘要，全部复用既有函数
+  //（_acceptanceContractBlock / _thinkLedgerBlockText / _toolLedgerStats），零新发明。
+  const _contractHandoff = _acceptanceContractBlock(run?._requirementsChecklist);
+  const _thinkHandoff = _thinkLedgerBlockText(_sess?._thinkLedger).trim();
+  const _ledgerStats = run?._toolLedger?.entries?.length ? _toolLedgerStats(run._toolLedger.entries) : "";
+  const _ledgerHandoff = _ledgerStats ? `【主 run 工具成败账本（避开已知失败路径，复用已验证工具）】\n${String(_ledgerStats).slice(0, 600)}` : "";
   const _evidenceLedger = _sessionFileEvidenceBlock(_sess, root, 12);
   // 设计证据交接：frontend/design 角色的 worker 不走 L0，拿不到服务端注入的设计体系/
   // 蓝图块——把主智能体已预取的 michael-design 证据压缩成交接块塞给它，开工就有弹药；
@@ -33002,7 +33046,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       if (evLines.length) _designHandoff = `【michael-design 设计证据交接（主智能体已检索，直接采用；配色一律折算 Tailwind 族+档/语义 token，叙述与业务代码禁裸 hex）】\n${evLines.join("\n")}`;
     }
   }
-  const _handoff = [_shared, _evidenceLedger, _designHandoff].filter(Boolean).join("\n\n");
+  const _handoff = [_shared, _contractHandoff, _thinkHandoff, _ledgerHandoff, _evidenceLedger, _designHandoff].filter(Boolean).join("\n\n");
   const messages = [{ role: "system", content: sysPrompt }, { role: "user", content: (_handoff ? _handoff + "\n\n——————\n\n" : "") + _childContext + "\n\n——————\n\n" + prompt }];
   // Sub-agents now flexibly use the FULL capability-appropriate toolkit (not a crippled subset):
   // read-only agents get EVERY investigation tool — lsp (跳定义/找所有调用方)、get_diagnostics
@@ -33020,15 +33064,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 定义不一致的结果；对齐到更严的那个。
   const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "web_fetch", "web_search", "screenshot", "road_environment", "shop_catalog"];
   const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "roadenvironment", "shopcatalog"];
+  // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
   const _allow = write
     ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
-    : _READ_TOOLS;
+    : [..._READ_TOOLS, "run_cmd"]; // P0.2: 子智能体可运行纯探索命令
   // Build the full schema then filter by name — so a tool gated behind if(includeWrite) at build
   // time (e.g. browser) is still visible to a read-only child that's allowed it.
   const toolSchemas = _buildAgentToolSchemas(true).filter((t) => _allow.includes(t.function.name));
   const _execTypes = write
     ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
-    : _READ_TYPES;
+    : [..._READ_TYPES, "cmd"]; // P0.2: 允许只读模式执行 cmd
   // Worker run context: inherit session + checkpoint (so edits are in the parent's
   // revert-all) + the user's approval setting, but tag it a worker with its scope so
   // _executeToolStep enforces the boundary. Read-only sub-agents reuse `run` as-is.
@@ -33084,7 +33129,41 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         toolCount++;
         let result;
         if (!_live()) result = { type: call.type, path: call.path, content: "[interrupted]" };
-        else { try { result = await _executeToolStep(step, call, root, execRun); } catch (e) { result = { type: call.type, path: call.path, content: `[ERROR] ${e?.message || e}` }; } }
+        else {
+          // P0.2: 只读 subagent 的 run_cmd 命令白名单检查：纯探索 + 只读验证类，写盘类一律拦截
+          if (!write && call.type === "cmd") {
+            const safeCmd = _subAgentCmdAllowed(call.command, root || "");
+            if (!safeCmd) {
+              result = { type: "cmd", path: "", content: `[BLOCKED] 只读子智能体只能运行纯探索（ls/cat/grep/find 等）或只读验证类（node --check/tsc --noEmit/测试/lint）命令，禁止写盘/修改类命令。你的命令：${String(call.command).slice(0, 120)}\n[P0.2-SafeCmdFilter]` };
+              _settleToolStep(step, result, "已拒绝");
+              messages.push({ role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) });
+              continue;
+            }
+          }
+          try {
+            // P0.2: 子智能体的 cmd 附 60s 超时上限（不影响主循环的命令执行），
+            // 超时即返回带 failDigest 的失败结果，不让单条命令吃掉子智能体的 5min 总预算。
+            if (call.type === "cmd") {
+              let _cmdTimer = null;
+              const _cmdTimeout = new Promise((resolve) => {
+                _cmdTimer = setTimeout(() => resolve({ type: "cmd", path: call.command, content: `[ERROR] 子智能体命令超过 60s 上限，已放弃等待。\n[failDigest:timeout-60s:${String(call.command).slice(0, 80)}]` }), 60 * 1000);
+              });
+              result = await Promise.race([_executeToolStep(step, call, root, execRun), _cmdTimeout]);
+              if (_cmdTimer) clearTimeout(_cmdTimer);
+              // 失败结果补 failDigest：关键报错行经 _clipPreservingErrors 压缩后回传，不被截断吞掉
+              if (result && /^\[ERROR\]/.test(String(result.content || "")) && !/\[failDigest:/.test(String(result.content || ""))) {
+                result.content += `\n[failDigest:${_clipPreservingErrors(String(result.content), 300).replace(/\s+/g, " ").slice(0, 200)}]`;
+              }
+            } else {
+              result = await _executeToolStep(step, call, root, execRun);
+            }
+          }
+          catch (e) {
+            // P0.2: 异常也带 failDigest 回传，让主智能体能看到子智能体失败的关键信息
+            const errorMsg = String(e?.message || e);
+            result = { type: call.type, path: call.path, content: `[ERROR] ${errorMsg}\n[failDigest:${(call.command || "").slice(0, 80)}]`, failureInfo: { command: call.command, error: errorMsg } };
+          }
+        }
         _settleCallLiveWritePreview(call, result);
         _settleToolStep(step, result);
         const toolMessage = { role: "tool", tool_call_id: tc.id, content: _toolMsgForModel(call, result) };
@@ -33152,8 +33231,8 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // main agent's ongoing context (via its scratchpad) and later/sibling children can read it —
   // instead of surviving only as the one ≤8000-char tool-result that gets compacted away.
   if (run && run.ctx && Array.isArray(run.ctx.findings) && report && report.trim()) {
-    run.ctx.findings.push(`【${write ? "worker" : "子"}:${String(description || "").slice(0, 24)}】${report.replace(/\s+/g, " ").slice(0, 400)}`);
-    if (run.ctx.findings.length > 40) run.ctx.findings.splice(0, run.ctx.findings.length - 40);
+    run.ctx.findings.push(`【${write ? "worker" : "子"}:${String(description || "").slice(0, 24)}】${_clipPreservingErrors(report.replace(/\s+/g, " "), 1200)}`);
+    if (run.ctx.findings.length > 60) run.ctx.findings.splice(0, run.ctx.findings.length - 60); // P0.1: 从 40 扩大到 60
   }
   return report || (write ? "（worker 未产出简报）" : "（子智能体未产出简报）");
 }
@@ -36713,6 +36792,29 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         let workerMutated = false;
         it._workerMutationPaths = [];
+        // P1 多子智能体并发：run_subagent 传入 tasks 数组（每项 {role, task}）时并行派发；
+        // worker / wiki / 单任务仍走下方原路径。并发度受 _runSubAgent 内部的
+        // MAX_SUBAGENTS_PARALLEL(2) 约束，各自独立卡片渲染，全部落定后合并 findings。
+        const _multiTasks = !isWorker && it.tc.name === "run_subagent" && Array.isArray(it.call.tasks) && it.call.tasks.length > 1
+          ? it.call.tasks.filter((t) => t && (typeof t === "string" ? t.trim() : String(t.task || "").trim())).slice(0, 4)
+          : null;
+        if (_multiTasks && _multiTasks.length > 1) {
+          const results = await Promise.allSettled(_multiTasks.map((task, idx) => _runSubAgent({
+            config,
+            description: `${it.call.description || "调研"}[${idx + 1}/${_multiTasks.length}]`,
+            prompt: typeof task === "string" ? task : String(task.task || ""),
+            root, container: body, run, write: false, scope: [],
+            role: (task && task.role) || it.call.role || "",
+          }).then((report) => ({ idx, report }))));
+          const parts = ["=== 多子智能体并发报告 ==="];
+          for (const [idx, r] of results.entries()) {
+            if (r.status === "fulfilled") parts.push(`【任务 ${r.value.idx + 1}/${_multiTasks.length}】\n${r.value.report}`);
+            else parts.push(`【任务 ${idx + 1}/${_multiTasks.length}】⚠️ 失败：${String(r.reason?.message || r.reason).slice(0, 200)}`);
+          }
+          const merged = parts.join("\n\n---\n\n").slice(0, 12000);
+          it.rawResult = { type: "subagent", path: it.call.description || "", content: merged };
+          return merged;
+        }
         const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], role: it.call.role || "", onMutation: (path) => {
           workerMutated = true;
           if (run) run._fsMutTick = (run._fsMutTick || 0) + 1; // worker 写盘也算工作区改动 tick
@@ -38863,6 +38965,23 @@ function _isPureExploreCommand(command, workspaceRoot) {
   const segments = raw.split(/\s*(?:&&|\|\||;|\|)\s*/).map((part) => part.trim()).filter(Boolean);
   if (!segments.length) return false;
   return segments.every((segment) => /^(?:find|ls|tree|du|rg|grep|fd|stat|file|wc|cat|head|tail|which)\b/.test(segment));
+}
+// P0.2 只读子智能体命令白名单：纯探索（直接复用 _isPureExploreCommand 的判定）之外，
+// 再放行只读验证类命令（node --check / tsc --noEmit / 测试 / lint）；重定向、写盘类
+// 词汇（tee/rm/mv/install/push 等）一律拒绝——子智能体有限执行权的硬边界。
+function _subAgentCmdAllowed(command, workspaceRoot) {
+  const raw = String(command || "").trim();
+  if (!raw) return false;
+  if (_isPureExploreCommand(raw, workspaceRoot)) return true;
+  // 重定向/反引号/子命令/多行 → 可能落盘或复合语义，拒绝
+  if (/[><`\u000d\u000a]|\$\(/.test(raw)) return false;
+  // 写盘/发布类词汇出现在任何位置都拒绝（比 _isPureExploreCommand 更严：多 git push/publish/deploy）
+  if (/\b(?:tee|rm|mv|cp|ln|chmod|chown|dd|install|touch|mkdir|xargs|push|publish|deploy|init|create|clone)\b/i.test(raw)) return false;
+  // 每个串联/管道段都必须是只读验证类命令，任何一段拿不准就拒绝（fail-closed）
+  const segments = raw.split(/\s*(?:&&|\|\||;|\|)\s*/).map((segment) => segment.trim()).filter(Boolean);
+  if (!segments.length) return false;
+  const verifyRe = /^(?:node\s+(?:--check|--test)\b|npx\s+(?:--no-install\s+)?tsc\b[^;]*--noEmit|tsc\b[^;]*--noEmit|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|typecheck|type-check|check)\b|cargo\s+(?:check|test)\b|go\s+(?:vet|test)\b|python3?\s+-m\s+(?:py_compile|pytest)\b|pytest\b|eslint\b|ruff\s+check\b)/;
+  return segments.every((segment) => verifyRe.test(segment));
 }
 function _emptyExploreSkipMessage(run, root, call) {
   if (!run || run._emptyRootAtStart !== true || run._didMutate) return "";

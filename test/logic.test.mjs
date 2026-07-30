@@ -13700,3 +13700,107 @@ test("SubAgent concurrency limit: max 2 parallel with queue", () => {
   release1();
   release2();
 });
+
+// ---- 任务 #43：子智能体重构 P0/P1（上下文增强 + 有限执行权 + 多任务并发） ----------
+
+test("P0.1：_subAgentFileSnippets 把已读文件的真实内容喂给子智能体，而不是只传文件名", () => {
+  const hasErr = load("_hasErrorLine");
+  const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: hasErr });
+  const cache = new Map([["/repo/src/auth.ts", "line1\nError: token expired at auth.ts:42\nline3"]]);
+  const f = load("_subAgentFileSnippets", {
+    _resolveRel: (rel, root) => root + "/" + rel,
+    _agentReadCache: cache,
+    _clipPreservingErrors: clip,
+  });
+  // 命中缓存的文件装进摘要；未命中的（已离开缓存）静默跳过
+  const out = f({ filesRead: new Set(["src/auth.ts", "src/missing.ts"]) }, "/repo");
+  assert.equal(out.size, 1);
+  assert.match(out.get("src/auth.ts"), /token expired/);
+  assert.equal(f(null, "/repo").size, 0, "无 ctx → 空 Map");
+  assert.equal(f({ filesRead: new Set() }, "/repo").size, 0);
+  // 单文件 ≤1500 字预算：大文件被裁，且错误行豁免保留
+  cache.set("/repo/src/big.ts", "noise line padding\n".repeat(600) + "Error: boom at big.ts:9\n" + "noise line padding\n".repeat(600));
+  const out2 = f({ filesRead: new Set(["src/big.ts"]) }, "/repo");
+  assert.ok(out2.get("src/big.ts").length <= 1500 + 200, "单文件摘要不得超预算");
+  assert.match(out2.get("src/big.ts"), /Error: boom at big\.ts:9/, "错误行必须豁免截断");
+  // 总量硬上限 8K：多个大文件加起来不得撞破
+  const many = new Set();
+  for (let i = 0; i < 10; i++) { cache.set(`/repo/f${i}.ts`, "y".repeat(3000)); many.add(`f${i}.ts`); }
+  const out3 = f({ filesRead: many }, "/repo");
+  let total = 0; for (const [, s] of out3) total += s.length;
+  assert.ok(total <= 8000 + 200, "总量硬上限 8K（token 经济）");
+  // _sharedCtxDigest 把摘要渲染进交接块；无 fileSnippets 时行为不变（既有测试已盖）
+  const digest = load("_sharedCtxDigest");
+  const s = digest({ goal: "g", fileSnippets: new Map([["src/auth.ts", "Error: token expired"]]) });
+  assert.match(s, /已读文件关键片段/);
+  assert.match(s, /token expired/);
+  // 接线事实：_runSubAgent 真的把摘要装进 ctx，且交接块全部复用既有函数
+  assert.ok(SRC.includes("_subAgentFileSnippets(run.ctx, root)"), "交接前必须装入文件摘要");
+  assert.ok(SRC.includes("_acceptanceContractBlock(run?._requirementsChecklist)"), "验收契约随任务书下发");
+  assert.ok(SRC.includes("_thinkLedgerBlockText(_sess?._thinkLedger)"), "思考台账结论随任务书下发");
+  assert.ok(SRC.includes("_toolLedgerStats(run._toolLedger.entries)"), "工具成败账本摘要随任务书下发");
+  // 结果回传升级：findings 截断 400→1200 且走错误豁免出口，窗口 40→60
+  assert.ok(SRC.includes('_clipPreservingErrors(report.replace(/\\s+/g, " "), 1200)'), "findings 回传走错误豁免截断且放宽到 1200");
+  assert.doesNotMatch(SRC, /run\.ctx\.findings\.push\([^\n]{0,160}\.slice\(0, 400\)/, "旧的 400 字纯截断必须下线");
+});
+
+test("P0.2：_subAgentCmdAllowed 放行探索/验证类命令，拦截一切写盘类命令", () => {
+  const NORM = (p) => String(p || "").replace(/\\/g, "/");
+  const isPure = load("_isPureExploreCommand", { _normalizeFsPath: NORM, _pathIsAtOrUnder: (p, root) => !!root && (p === root || p.startsWith(root + "/")) });
+  const f = load("_subAgentCmdAllowed", { _isPureExploreCommand: isPure });
+  // 纯探索：直接复用 #28 的判定
+  assert.equal(f("ls -la", "/repo"), true);
+  assert.equal(f("grep -rn TODO src | head -20", "/repo"), true);
+  // 只读验证类：node --check / --test、tsc --noEmit、测试/lint
+  assert.equal(f("node --check src/main.js", "/repo"), true);
+  assert.equal(f("node --test test/logic.test.mjs", "/repo"), true);
+  assert.equal(f("npx tsc --noEmit", "/repo"), true);
+  assert.equal(f("tsc -p . --noEmit", "/repo"), true);
+  assert.equal(f("npm test", "/repo"), true);
+  assert.equal(f("pnpm run lint", "/repo"), true);
+  assert.equal(f("cargo check", "/repo"), true);
+  assert.equal(f("pytest -q", "/repo"), true);
+  // 写盘/发布类：一律拦截
+  assert.equal(f("ls > files.txt", "/repo"), false, "重定向落盘");
+  assert.equal(f("echo hi | tee out.txt", "/repo"), false);
+  assert.equal(f("rm -rf dist", "/repo"), false);
+  assert.equal(f("mv a.js b.js", "/repo"), false);
+  assert.equal(f("npm install lodash", "/repo"), false);
+  assert.equal(f("git push origin main", "/repo"), false);
+  assert.equal(f("node --test a.mjs && rm -rf tmp", "/repo"), false, "任一段写盘 → 整条拒绝");
+  assert.equal(f("node server.js", "/repo"), false, "任意脚本执行不是验证，fail-closed");
+  assert.equal(f("", "/repo"), false);
+  // \u000d\u000a 免疫：CRLF 拼接注入拒绝
+  assert.equal(f("node --check a.js\u000d\u000arm -rf /", "/repo"), false, "CRLF 注入必须拒绝");
+  // 接线事实：_runSubAgent 里的拦截点、只读模式 cmd 授权、60s 超时与 failDigest
+  const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
+  assert.match(subagentSrc, /_subAgentCmdAllowed\(call\.command, root \|\| ""\)/, "白名单检查必须在执行前");
+  assert.match(subagentSrc, /P0\.2-SafeCmdFilter/);
+  assert.match(subagentSrc, /\[\.\.\._READ_TOOLS, "run_cmd"\]/, "只读子智能体工具集含 run_cmd");
+  assert.match(subagentSrc, /\[\.\.\._READ_TYPES, "cmd"\]/, "只读执行类型含 cmd");
+  assert.match(subagentSrc, /timeout-60s/, "子智能体命令 60s 超时上限");
+  assert.match(subagentSrc, /\[failDigest:/, "失败结果带 failDigest 回传");
+});
+
+test("P1：run_subagent 多任务并发——tasks 数组解析 + Promise.allSettled 合并，单任务原路径不变", () => {
+  // _mapToolCall 容错解析 tasks（字符串 / {role, task} / {prompt} 都收）
+  const mapSrc = extractFn("_mapToolCall");
+  assert.match(mapSrc, /case "run_subagent": \{/);
+  assert.match(mapSrc, /Array\.isArray\(args\.tasks\)/);
+  assert.match(mapSrc, /tasks: _tasks && _tasks\.length \? _tasks : undefined/);
+  // 并发实现：Promise.allSettled + 合并报告；只对 run_subagent 多任务生效（worker/wiki 不受影响）
+  const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
+  assert.match(loopSrc, /!isWorker && it\.tc\.name === "run_subagent" && Array\.isArray\(it\.call\.tasks\)/);
+  assert.match(loopSrc, /Promise\.allSettled/);
+  assert.match(loopSrc, /多子智能体并发报告/);
+  assert.match(loopSrc, /⚠️ 失败：/, "失败任务也要出现在合并报告里，不能静默丢失");
+  // 单任务/worker/wiki 原路径完整保留（#43 返工前的回归点，钉死）
+  assert.match(loopSrc, /const report = await _runSubAgent/);
+  assert.match(loopSrc, /it\.call\._wiki/, "generate_wiki 存盘逻辑不得丢");
+  assert.match(loopSrc, /if \(isWorker && workerMutated\) it\._workerMutated = true;/, "worker 写盘标记不得丢");
+});
+
+test("P1：run_subagent 归在可并行段，主智能体同批只读工具不被子智能体阻塞", () => {
+  assert.match(SRC, /canRunInReadSegment = \(it\) => !!it\.call && \(_isReadOnlyParallel\(it\.call\)\s*\|\| \["run_subagent", "research_project", "design_research"\]\.includes\(it\.tc\.name\)\)/,
+    "run_subagent 必须留在可并行段，与只读工具同批并发");
+});

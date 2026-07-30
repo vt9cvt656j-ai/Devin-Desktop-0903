@@ -19,10 +19,10 @@ const TOOL_METADATA = Object.freeze({
   },
   web_search: {
     category: 'research',
-    use_cases: ['官方文档查找', '错误信息搜索', '技术教程查询'],
-    triggers: ['需要了解外部知识', '遇到报错', '查找官方文档'],
+    use_cases: ['官方文档查找', '错误信息搜索', '技术教程查询', '联网查最新信息'],
+    triggers: ['需要了解外部知识', '遇到报错', '查找官方文档', '用户要求联网/上网搜索', '需要时效性/最新信息'],
     example_call: "web_search(query='Vite official migration guide')",
-    priority: 'medium'
+    priority: 'high'
   },
   
   // 调试诊断类工具
