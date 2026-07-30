@@ -14180,3 +14180,183 @@ test("P2.1-取消传播：run 结束时 running 作业标 cancelled+consumed，�
   assert.match(snip, /_subGenSnap/);
   assert.match(snip, /_cancelIds/);
 });
+
+// ---- #47 四大主线程热点根治（RAFGAP 取证实锤） --------------------------------
+
+test("#47-1 持久化分片缓存：会话内容没变零重复序列化，预算水位单调安全", () => {
+  const cache = new Map();
+  const fingerprint = load("_sessionPersistFingerprint");
+  let serializations = 0;
+  const cachedMirror = load("_cachedSessionMirrorJson", {
+    _persistSessionCache: cache,
+    _sessionPersistFingerprint: fingerprint,
+    _chatSessionDataForStorage: (s, budget, _includeHtml, options) => {
+      serializations++;
+      budget.remaining -= 10;
+      options.textBudget.remaining -= 100;
+      return { id: s.id, turns: s.memory.totalTurns };
+    },
+  });
+  const session = {
+    id: "s1", streaming: false,
+    memory: { totalTurns: 3, recent: [{ role: "user", content: "hi" }], _recentChars: 2 },
+  };
+  const b1 = { remaining: 1000 }, t1 = { remaining: 5000 };
+  const j1 = cachedMirror(session, b1, { textBudget: t1 });
+  assert.equal(serializations, 1);
+  assert.equal(b1.remaining, 990);
+  assert.equal(t1.remaining, 4900);
+  const b2 = { remaining: 1000 }, t2 = { remaining: 5000 };
+  const j2 = cachedMirror(session, b2, { textBudget: t2 });
+  assert.equal(serializations, 1, "内容没变必须复用上次的 JSON 片段（O(n²) 死亡螺旋根源）");
+  assert.equal(j2, j1);
+  assert.equal(b2.remaining, 990, "命中后必须按上次消耗量扣减共享预算（顺序敏感）");
+  assert.equal(t2.remaining, 4900);
+  // 预算余量低于上次进入水位 → 不复用（复用产物可能超出更紧预算，单调不成立）
+  const b3 = { remaining: 500 }, t3 = { remaining: 5000 };
+  cachedMirror(session, b3, { textBudget: t3 });
+  assert.equal(serializations, 2, "更紧的媒体预算必须重新序列化");
+  // 内容变化（新消息）→ 指纹变 → 重新序列化
+  session.memory.totalTurns = 4;
+  session.memory.recent.push({ role: "assistant", content: "yo" });
+  session.memory._recentChars = 4;
+  const b4 = { remaining: 1000 }, t4 = { remaining: 5000 };
+  cachedMirror(session, b4, { textBudget: t4 });
+  assert.equal(serializations, 3, "新增消息必须失效缓存");
+  // 流式中的会话绕过缓存（内容逐 token 变化，缓不住也不该缓）
+  session.streaming = true;
+  const b5 = { remaining: 1000 }, t5 = { remaining: 5000 };
+  cachedMirror(session, b5, { textBudget: t5 });
+  cachedMirror(session, { remaining: 1000 }, { textBudget: { remaining: 5000 } });
+  assert.equal(serializations, 5, "streaming 会话每次都全量序列化，不写缓存");
+  // 已关闭/消失的会话从缓存清理，不泄漏
+  const prune = load("_prunePersistSessionCache", { _persistSessionCache: cache });
+  prune(new Set(["other"]));
+  assert.equal(cache.size, 0, "不在活跃/已关列表里的会话缓存必须被清理");
+});
+
+test("#47-2 kg 知识图谱 memoize：raw 没变零重复 parse，写路径统一刷新/失效", () => {
+  const store = {};
+  const localStorageStub = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = v; },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const kgCache = new Map();
+  const kgKey = load("_kgKey");
+  const realParse = JSON.parse.bind(JSON);
+  let parses = 0;
+  const countingJSON = { parse: (raw) => { parses++; return realParse(raw); }, stringify: JSON.stringify.bind(JSON) };
+  const cacheStore = load("_kgCacheStore", { _kgLoadCache: kgCache, _kgKey: kgKey, localStorage: localStorageStub });
+  const cacheDrop = load("_kgCacheDrop", { _kgLoadCache: kgCache, _kgKey: kgKey });
+  const kgLoad = load("_kgLoad", {
+    _kgLoadCache: kgCache, _kgKey: kgKey, localStorage: localStorageStub, JSON: countingJSON,
+    _perfPhase: () => {}, _kgTokens: () => ["t"], _memoryKey: () => "flat", _kgInsert: () => {},
+    _kgCacheStore: cacheStore,
+  });
+  store[kgKey("/repo")] = JSON.stringify([{ id: "a", content: "note", tags: ["t"], type: "fact", links: [], created: 1, v: 2 }]);
+  const first = kgLoad("/repo");
+  assert.equal(parses, 1);
+  const second = kgLoad("/repo");
+  assert.equal(parses, 1, "localStorage 内容没变必须零重复 parse（RAFGAP 8次/30s 实锤）");
+  assert.equal(second, first, "必须返回同一数组引用（_kgRetrieve 原地改 uses 再写回）");
+  // _kgRetrieve 式直写：setItem 后 _kgCacheStore 刷新 → 下次仍命中
+  first[0].uses = 1;
+  store[kgKey("/repo")] = JSON.stringify(first);
+  cacheStore("/repo", first);
+  assert.equal(kgLoad("/repo"), first);
+  assert.equal(parses, 1, "uses 写回后缓存必须同步，否则检索热点永远 miss");
+  // 外部 raw 变化（另一窗口写入）→ 重新 parse，缓存不与存储漂移
+  store[kgKey("/repo")] = JSON.stringify([{ id: "b", content: "newer", tags: ["t"], type: "fact", links: [], created: 2, v: 2 }]);
+  assert.equal(kgLoad("/repo")[0].id, "b");
+  assert.equal(parses, 2, "raw 漂移必须失效 memo");
+  cacheDrop("/repo");
+  kgLoad("/repo");
+  assert.equal(parses, 3, "显式 drop 后必须重新 parse");
+  // _kgSave 落盘后同一引用进缓存 → 下次 load 零 parse
+  const save = load("_kgSave", {
+    _perfPhase: () => {}, localStorage: localStorageStub, _kgKey: kgKey,
+    _kgCacheStore: cacheStore, _kgCacheDrop: cacheDrop, _kgStoreSave: () => {},
+  });
+  const savedNotes = [{ id: "c", content: "saved", tags: ["t"], type: "fact", links: [], created: 3, v: 2 }];
+  save("/repo", savedNotes);
+  assert.equal(kgLoad("/repo"), savedNotes, "_kgSave 必须把同一引用刷进缓存");
+  assert.equal(parses, 3);
+  // 源码事实：每个直写 localStorage 的路径都统一刷新/失效缓存
+  assert.match(extractFn("_kgRetrieve"), /_kgCacheStore\(root, allNotes\)/,
+    "检索 uses 写回后必须刷新缓存");
+  assert.match(extractFn("_kgSyncFromStore"), /_kgCacheDrop\(root\)/,
+    "文件镜像回写 localStorage 后必须失效缓存");
+  assert.match(extractFn("_clearKgMemory"), /_kgCacheDrop\(root\)/,
+    "清除记忆必须带走缓存");
+});
+
+test("#47-3 BM25 索引构建分片让路 + 工作区切换时中断安全", () => {
+  assert.match(SRC, /const _BM25_SLICE_BUDGET_MS = 50/);
+  const build = extractFn("buildBM25Index");
+  assert.match(build, /_bm25Index\.built = false;/,
+    "重建期间不能把半成品索引标成可用");
+  assert.match(build, /await yieldToMainThread\(\);/,
+    "chunk 循环每片必须检查预算并让路（此前主线程连续占用 34-80s）");
+  assert.match(build, /setTimeout\(resolve, 0\)/);
+  assert.match(build, /if \(abandoned\) return;/,
+    "_walkSourceFiles 吞 onFile 异常，中断只能靠标志位早退，不能 throw");
+  assert.match(build, /activeRoot !== root\) abandoned = true/,
+    "让路期间工作区切换了就放弃构建");
+  const abandonExit = build.indexOf("build abandoned");
+  const markBuilt = build.indexOf("_bm25Index.built = true");
+  assert.ok(abandonExit > 0 && markBuilt > abandonExit,
+    "放弃分支必须在 built=true 之前 return，废弃索引永不标可用");
+});
+
+test("#47-4 退出 flush 仍同步全量，周期保存才分片+缓存", () => {
+  const flush = extractFn("_flushChatHistorySync");
+  assert.doesNotMatch(flush, /\basync\b|\bawait\b/,
+    "beforeunload/pagehide 的 flush 必须保持同步（#34 优雅关闭：数据安全 > 性能）");
+  assert.match(flush, /_chatSessionsForLocalStorage\(_chatSessions, _activeChatIdx, budget, textBudget\)/,
+    "退出 flush 仍走全量序列化，不走分片缓存");
+  assert.match(flush, /_closedChatSessionsForLocalStorage\(budget, textBudget\)/);
+  assert.match(flush, /JSON\.stringify\(\{ sessions: data, closedSessions, activeIdx: _activeChatIdx \}\)/);
+  const persist = extractFn("_persistChatHistoryOnce");
+  assert.match(SRC, /const _PERSIST_SLICE_BUDGET_MS = 50/);
+  assert.match(persist, /_cachedSessionMirrorJson\(/,
+    "周期镜像必须复用按会话分片的序列化产物");
+  assert.match(persist, /_cachedSessionCheckpointData\(/,
+    "checkpoint 循环同样走分片缓存");
+  assert.match(persist, /await yieldIfOverBudget\(\);/,
+    "单次保存同步工作量超 50ms 必须切片让路");
+  assert.match(persist, /_prunePersistSessionCache\(/,
+    "消失会话的缓存必须清理，防泄漏");
+  assert.match(persist, /_chatSessions\.slice\(\)/,
+    "让路期间会话数组可变，必须按快照循环");
+});
+
+test("#47-5 恢复懒渲染：同步只渲最近 30 条，其余 idle 补渲，快照超限先拒后克隆", () => {
+  assert.match(SRC, /const _RENDER_SYNC_LIMIT = 30/);
+  assert.match(SRC, /const _RENDER_SLICE_BUDGET_MS = 50/);
+  const renderHistory = extractFn("_renderSessionHistory");
+  assert.match(renderHistory, /historyLength - _RENDER_SYNC_LIMIT/,
+    "恢复首屏只同步渲染最近窗口（25-44s 冻结实锤）");
+  assert.match(renderHistory, /_scheduleHistoryBackfill\(session, start, syncStart\)/);
+  const range = extractFn("_renderMsgRange");
+  assert.match(range, /_RENDER_SLICE_BUDGET_MS/,
+    "历史渲染循环必须分片让路");
+  assert.match(range, /session\._disposed \|\| !session\.container/,
+    "让路后会话被释放必须中断，不往死 DOM 里渲");
+  const backfill = extractFn("_scheduleHistoryBackfill");
+  assert.match(backfill, /requestIdleCallback/);
+  assert.match(backfill, /_historyVisibleStart !== syncStart\) return/,
+    "用户已翻页就放弃补渲，分页按钮接管，不重复渲染");
+  assert.match(backfill, /_preserveHistoryAnchor\(anchor, previousTop, session\)/,
+    "补渲后保持滚动位置不跳");
+  assert.match(extractFn("restoreChatHistory"), /restoreSliceStart/,
+    "逐会话 fromJSON 循环也必须分片让路");
+  // 快照体积预检：超限先拒，不先克隆几 MB 再丢
+  const snap = extractFn("_snapshotTranscript");
+  const precheck = snap.indexOf("_SNAPSHOT_MAX_MESSAGES) return");
+  const cloneAt = snap.indexOf("cloneNode");
+  assert.ok(precheck > 0 && cloneAt > precheck,
+    "超限快照必须在 cloneNode 之前拒绝，避免白序列化几 MB");
+  assert.match(snap, /\(c\.textContent \|\| ""\)\.length > _SNAPSHOT_MAX_CHARS\) return ""/);
+});
+

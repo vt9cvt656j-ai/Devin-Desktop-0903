@@ -13439,6 +13439,8 @@ const _ICON_MCP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 // session.history for the agent's context, only the DOM is trimmed.
 const _RENDER_LIMIT = 56;
 const _RENDER_PAGE = 32;
+const _RENDER_SYNC_LIMIT = 30; // 恢复时只同步渲染最近这么多条，其余窗口 idle 补渲
+const _RENDER_SLICE_BUDGET_MS = 50; // 历史渲染每片最多占用主线程 50ms
 const _HISTORY_CACHE_LIMIT = 384;
 const _LARGE_TRANSCRIPT_PAGE_BYTES = 64 * 1024;
 const _SNAPSHOT_MAX_CHARS = 360_000;
@@ -13516,7 +13518,15 @@ function _snapshotIsSafeToRestore(html) {
 }
 async function _renderMsgRange(session, from, to, options = {}) {
   const page = await _sessionHistorySlice(session, from, to);
+  // RAFGAP 实锤：恢复大会话时逐条 markdown/高亮渲染一口气跑完 = 25-44s 冻结。
+  // 每片 ≤50ms 就让出主线程；让路期间会话被关闭/释放则直接中断（中断安全）。
+  let sliceStart = Date.now();
   for (let index = 0; index < page.length; index++) {
+    if (Date.now() - sliceStart >= _RENDER_SLICE_BUDGET_MS) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      sliceStart = Date.now();
+      if (session._disposed || !session.container) return;
+    }
     const m = page[index];
     if (m && m.content != null) {
       const body = addMessage(m.role === "assistant" ? "assistant" : "user", m.content, session, m.attachments || [], {
@@ -13761,11 +13771,38 @@ async function _renderSessionHistory(session) {
   const historyLength = _sessionHistoryLength(session);
   if (!historyLength) return;
   const start = Math.max(0, historyLength - _RENDER_LIMIT);
-  session._historyVisibleStart = start;
+  // 恢复只同步渲染最近 _RENDER_SYNC_LIMIT 条，窗口里更早的部分交给 idle 补渲——
+  // 首屏不再被整窗 56 条大消息的渲染卡死（restoreChatHistory 冻结实锤）。
+  const syncStart = Math.max(start, historyLength - _RENDER_SYNC_LIMIT);
+  session._historyVisibleStart = syncStart;
   session._historyVisibleEnd = historyLength;
   session._historyAtLatest = true;
-  await _renderMsgRange(session, start, historyLength, { skipPrune: true, skipFollow: true });
+  await _renderMsgRange(session, syncStart, historyLength, { skipPrune: true, skipFollow: true });
   _updateHistoryControls(session);
+  if (syncStart > start) _scheduleHistoryBackfill(session, start, syncStart);
+}
+
+// 把恢复窗口里更早的消息在空闲时补渲到 DOM 顶部。用户已翻页/窗口已变就放弃，
+// 分页按钮（_updateHistoryControls）接管剩余部分，不会丢消息。
+function _scheduleHistoryBackfill(session, start, syncStart) {
+  const idle = typeof requestIdleCallback === "function"
+    ? (fn) => requestIdleCallback(fn, { timeout: 2000 })
+    : (fn) => setTimeout(fn, 200);
+  idle(async () => {
+    try {
+      if (session._disposed || !session.container || session._historyAtLatest === false) return;
+      if (session._historyVisibleStart !== syncStart) return; // 用户已手动翻页 → 分页按钮已接管
+      const anchor = session.container.querySelector(":scope > .msg");
+      if (!anchor) return;
+      let previousTop = NaN;
+      try { previousTop = anchor.getBoundingClientRect?.().top; } catch {}
+      // 先收窄窗口起点再渲染：让路期间的翻页点击从新起点算，不会重复渲染同一段。
+      session._historyVisibleStart = start;
+      await _renderMsgRange(session, start, syncStart, { before: anchor, skipPrune: true, skipFollow: true });
+      _updateHistoryControls(session);
+      _preserveHistoryAnchor(anchor, previousTop, session);
+    } catch {}
+  });
 }
 
 // Set / change the working directory for ONE chat tab. Each tab's agent runs in its
@@ -14012,6 +14049,11 @@ function _snapshotTranscript(session) {
     // Only snapshot what's actually been rendered; an un-viewed restored tab keeps
     // whatever snapshot it was loaded with (see restoreChatHistory).
     if (!c || !session._rendered) return session?._htmlSnapshot || "";
+    // 体积预检：超限的快照最后一定被 _snapshotIsSafeToRestore 丢弃，先花几百毫秒
+    // 克隆节点 + 序列化几 MB 再丢是纯浪费。textContent 长度是 innerHTML 的下界，
+    // 超限直接截断不存——恢复路径对无快照会话走持久历史重建（_renderSessionHistory）。
+    if (c.querySelectorAll(":scope > .msg").length > _SNAPSHOT_MAX_MESSAGES) return "";
+    if ((c.textContent || "").length > _SNAPSHOT_MAX_CHARS) return "";
     const clone = c.cloneNode(true);
     // Never persist process-local object URLs, but keep every other rich card.
     // The cloned/live video lists have the same DOM order, so the live node can
@@ -14210,6 +14252,7 @@ function _closedChatSessionsForLocalStorage(mediaBudget = CHAT_LOCAL_MEDIA_BUDGE
 // (webview reload / HMR / crash / the dev watcher killing the process). localStorage
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
 // fallback. It has no HTML snapshot and a strict aggregate media budget.
+// 注意：这条退出路径必须保持同步全量（数据安全 > 性能），不走下面的分片/缓存。
 function _flushChatHistorySync() {
   // 新建窗口绝不写共享的聊天镜像：两窗口同源共用同一个 localStorage，之前新窗口每次
   // 刷新/热更/关闭都把自己的对话覆写进来，主窗口下次回退恢复时就混进对方的内容
@@ -14223,20 +14266,144 @@ function _flushChatHistorySync() {
     const data = _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx, budget, textBudget);
     const closedSessions = _closedChatSessionsForLocalStorage(budget, textBudget);
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, closedSessions, activeIdx: _activeChatIdx }));
-  } catch { /* quota / disabled — the async path is still the primary */ }
+  } catch { /* quota / disabled — the debounced background path is still the primary */ }
+}
+
+// ---- 增量持久化缓存（RAFGAP 实锤：persistChatHistory 0.9s→2s→5s→24s→58.8s 递增）----
+// 此前每次保存都对所有会话全量 serializeMessagesForPersistence + JSON.stringify，
+// 单次成本随会话规模增长、保存又周期性触发 → O(n²) 死亡螺旋。会话内容没变时
+// 直接复用上次的序列化产物；media/text 预算跨会话共享且顺序敏感，复用条件是
+// 「指纹相同 + 当前预算余量 ≥ 上次序列化时的进入水位」——复用的字节是在更紧
+// 预算下合法截断的，单调安全；命中后按上次消耗量扣减预算。
+const _PERSIST_SLICE_BUDGET_MS = 50; // 单次保存的同步工作量硬上限，超预算就让路
+const _persistSessionCache = new Map(); // session.id → { mirror, ckpt }
+// O(1) 内容指纹：只读各账本长度 + 尾部标记，不碰消息正文。cap 内原地更新的
+// 账本（fileEvidence/milestones/archive）靠尾部 updatedAt/turn 捕捉变化。
+function _sessionPersistFingerprint(s) {
+  try {
+    const m = s?.memory || {};
+    const recent = Array.isArray(m.recent) ? m.recent : [];
+    const last = recent[recent.length - 1] || {};
+    const summaries = Array.isArray(m.summaries) ? m.summaries : [];
+    const milestones = Array.isArray(m.milestones) ? m.milestones : [];
+    const lastMilestone = milestones[milestones.length - 1] || {};
+    const evidence = Array.isArray(m.fileEvidence) ? m.fileEvidence : [];
+    const lastEvidence = evidence[evidence.length - 1] || {};
+    const archive = Array.isArray(m.archive) ? m.archive : [];
+    const lastArchive = archive[archive.length - 1] || {};
+    const corrections = Array.isArray(m.corrections) ? m.corrections : [];
+    const lastCorrection = corrections[corrections.length - 1] || {};
+    const history = Array.isArray(s?.history) ? s.history : [];
+    const pending = Array.isArray(s?._pendingSends) ? s._pendingSends : [];
+    const lastPending = pending[pending.length - 1] || {};
+    const demands = Array.isArray(s?._demandLedger) ? s._demandLedger : [];
+    const thinks = Array.isArray(s?._thinkLedger) ? s._thinkLedger : [];
+    return [
+      s?.name, s?.mode, s?.model, s?.project, s?._anchorRoot, s?.closedAt,
+      Number(m.totalTurns) || 0, recent.length, Number(m._recentChars) || 0,
+      Array.isArray(m.transcript) ? m.transcript.length : 0, Number(m.transcriptOffset) || 0,
+      summaries.length, (summaries[summaries.length - 1] || {}).range || "",
+      milestones.length, `${lastMilestone.turn ?? ""}:${String(lastMilestone.event || "").length}`,
+      evidence.length, `${lastEvidence.path || ""}:${lastEvidence.updatedAt ?? ""}:${String(lastEvidence.digest || "").length}`,
+      archive.length, lastArchive.turn ?? "",
+      corrections.length, lastCorrection.id || "",
+      history.length, pending.length, String(lastPending.text || "").length,
+      Array.isArray(s?._planSteps) ? s._planSteps.map((p) => p?.status).join(",") : "",
+      demands.length, thinks.length, (thinks[thinks.length - 1] || {}).turn ?? "",
+      String(last.role || "") + ":" + (typeof last.content === "string" ? last.content.length : 0),
+      JSON.stringify(s?._intentState ?? null), JSON.stringify(s?._lastRunState ?? null),
+    ].join("\u0001");
+  } catch { return null; }
+}
+function _cachedSessionMirrorJson(session, budget, options) {
+  const text = options.textBudget;
+  const fp = session?.id && !session?.streaming ? _sessionPersistFingerprint(session) : null;
+  if (fp) {
+    const hit = _persistSessionCache.get(session.id)?.mirror;
+    if (hit && hit.fp === fp && budget.remaining >= hit.mediaIn && text.remaining >= hit.textIn) {
+      budget.remaining = Math.max(0, budget.remaining - hit.mediaSpent);
+      text.remaining = Math.max(0, text.remaining - hit.textSpent);
+      return hit.json;
+    }
+  }
+  const mediaIn = budget.remaining;
+  const textIn = text.remaining;
+  const json = JSON.stringify(_chatSessionDataForStorage(session, budget, false, options));
+  if (fp) {
+    const entry = _persistSessionCache.get(session.id) || {};
+    entry.mirror = { fp, mediaIn, textIn, mediaSpent: mediaIn - budget.remaining, textSpent: textIn - text.remaining, json };
+    _persistSessionCache.set(session.id, entry);
+  }
+  return json;
+}
+function _cachedSessionCheckpointData(session, budget, options) {
+  const text = options.textBudget;
+  const fp = session?.id && !session?.streaming ? _sessionPersistFingerprint(session) : null;
+  if (fp) {
+    const hit = _persistSessionCache.get(session.id)?.ckpt;
+    if (hit && hit.fp === fp && budget.remaining >= hit.mediaIn && text.remaining >= hit.textIn) {
+      budget.remaining = Math.max(0, budget.remaining - hit.mediaSpent);
+      text.remaining = Math.max(0, text.remaining - hit.textSpent);
+      return hit.data;
+    }
+  }
+  const mediaIn = budget.remaining;
+  const textIn = text.remaining;
+  const data = _chatSessionDataForStorage(session, budget, false, options);
+  if (fp) {
+    const entry = _persistSessionCache.get(session.id) || {};
+    entry.ckpt = { fp, mediaIn, textIn, mediaSpent: mediaIn - budget.remaining, textSpent: textIn - text.remaining, data };
+    _persistSessionCache.set(session.id, entry);
+  }
+  return data;
+}
+function _prunePersistSessionCache(liveIds) {
+  for (const id of [..._persistSessionCache.keys()]) if (!liveIds.has(id)) _persistSessionCache.delete(id);
 }
 
 async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) {
   try { _perfPhase("persistChatHistory"); } catch {}
   const localMediaBudget = { remaining: CHAT_LOCAL_MEDIA_BUDGET };
   const localTextBudget = { remaining: CHAT_LOCAL_TEXT_BUDGET, perValue: CHAT_LOCAL_TEXT_PER_VALUE };
-  const localPayload = {
-    sessions: _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx, localMediaBudget, localTextBudget),
-    closedSessions: _closedChatSessionsForLocalStorage(localMediaBudget, localTextBudget),
-    activeIdx: _activeChatIdx,
+  const localOptions = {
+    recentLimit: CHAT_LOCAL_RECENT_LIMIT,
+    transcriptLimit: CHAT_LOCAL_RECENT_LIMIT,
+    textBudget: localTextBudget,
   };
+  // 让路期间会话数组可能被增删：按快照循环，产物按快照顺序拼接。
+  const sessionsSnapshot = _chatSessions.slice();
+  const activeIdxSnapshot = _activeChatIdx;
+  const closedSnapshot = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
+    .filter(_sessionHasRecoverableMemory)
+    .slice(0, 80);
+  _prunePersistSessionCache(new Set([...sessionsSnapshot, ...closedSnapshot].map((s) => s?.id).filter(Boolean)));
+  let sliceStart = Date.now();
+  const yieldIfOverBudget = async () => {
+    if (Date.now() - sliceStart < _PERSIST_SLICE_BUDGET_MS) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    sliceStart = Date.now();
+  };
+  // Preserve the active tab first, then the newest remaining tabs — 与
+  // _flushChatHistorySync 的共享预算消费顺序一致，恢复优先级不变。
+  const order = sessionsSnapshot.map((_, index) => index).sort((a, b) => {
+    if (a === activeIdxSnapshot) return -1;
+    if (b === activeIdxSnapshot) return 1;
+    return (Number(sessionsSnapshot[b]?.created) || 0) - (Number(sessionsSnapshot[a]?.created) || 0);
+  });
+  const mirrorParts = new Array(sessionsSnapshot.length);
+  for (const index of order) {
+    await yieldIfOverBudget();
+    mirrorParts[index] = _cachedSessionMirrorJson(sessionsSnapshot[index], localMediaBudget, localOptions);
+  }
+  const closedParts = [];
+  for (const session of closedSnapshot) {
+    await yieldIfOverBudget();
+    closedParts.push(_cachedSessionMirrorJson(session, localMediaBudget, localOptions));
+  }
   // The bounded local mirror stays recoverable even when the disk store fails.
-  try { localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(localPayload)); } catch {}
+  // 手工拼接顶层 JSON：会话片段已是合法 JSON 字符串，命中缓存时零重复 stringify。
+  const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedParts.join(",")}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
+  try { localStorage.setItem(CHAT_STORE_KEY, localJson); } catch {}
 
   // The hot path is an append-only, per-session transcript journal. Awaiting it
   // here makes a submitted user turn durable without serializing the full chat.
@@ -14259,10 +14426,12 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
     recentLimit: 96,
     textBudget: checkpointTextBudget,
   };
-  const data = _chatSessions.map((session) => _chatSessionDataForStorage(session, checkpointMediaBudget, false, checkpointOptions));
-  const closedList = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
-    .filter(_sessionHasRecoverableMemory)
-    .slice(0, 80);
+  const data = [];
+  for (const session of sessionsSnapshot) {
+    await yieldIfOverBudget();
+    data.push(_cachedSessionCheckpointData(session, checkpointMediaBudget, checkpointOptions));
+  }
+  const closedList = closedSnapshot;
   const closedKey = closedList.map((s) => s?.id || "").join(",");
   if (!_persistChatHistoryOnce._closedCache || _persistChatHistoryOnce._closedCache.key !== closedKey) {
     _persistChatHistoryOnce._closedCache = {
@@ -14287,10 +14456,19 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
 
   // The old plugin store is now a failure-only escape hatch. Do its expensive
   // full serialization only after SQLite is unavailable, never on the normal
-  // streaming path.
+  // streaming path. 这条无预算全量序列化正是递增卡顿的最可疑主因，同样分片让路。
   await _waitForChatPersistenceIdle();
-  const fullData = _chatSessions.map((session) => _chatSessionDataForStorage(session, undefined, false));
-  const fullClosedData = closedList.map((session) => _chatSessionDataForStorage(session, undefined, false));
+  sliceStart = Date.now();
+  const fullData = [];
+  for (const session of sessionsSnapshot) {
+    await yieldIfOverBudget();
+    fullData.push(_chatSessionDataForStorage(session, undefined, false));
+  }
+  const fullClosedData = [];
+  for (const session of closedList) {
+    await yieldIfOverBudget();
+    fullClosedData.push(_chatSessionDataForStorage(session, undefined, false));
+  }
   const rich = {
     sessions: fullData,
     closedSessions: fullClosedData,
@@ -14397,7 +14575,13 @@ async function restoreChatHistory() {
         .filter(_sessionHasRecoverableMemory)
         .slice(0, 80);
       const usedNames = new Set();
+      let restoreSliceStart = Date.now();
       for (const sData of (Array.isArray(saved.sessions) ? saved.sessions : [])) {
+        // 大存档逐会话 fromJSON 也是同步长任务：每 50ms 让路一次，恢复期间 UI 可响应。
+        if (Date.now() - restoreSliceStart >= _RENDER_SLICE_BUDGET_MS) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          restoreSliceStart = Date.now();
+        }
         // Heal any duplicate names left by the old length-based scheme: a
         // collision (or empty name) gets a fresh monotonic "Chat N".
         const nm = sData.name && !usedNames.has(sData.name) ? sData.name : undefined;
@@ -28579,10 +28763,25 @@ function _kgInsert(notes, content) {
   notes.push(note);
   return note;
 }
+// _kgLoad memoize：每轮注入要检索两次（项目+全局），此前每次都全量 JSON.parse
+// localStorage —— RAFGAP 实锤 30 秒内 8 次、单次最长 4.7s。缓存 key→{raw, notes}，
+// raw 与存储一致时直接复用同一数组引用（_kgRetrieve 会原地改 uses 再写回，所以
+// 写路径统一经 _kgCacheStore/_kgCacheDrop 刷新，缓存永不与存储漂移）。
+const _kgLoadCache = new Map();
+function _kgCacheStore(root, notes) {
+  try { _kgLoadCache.set(_kgKey(root), { raw: localStorage.getItem(_kgKey(root)), notes }); } catch {}
+}
+function _kgCacheDrop(root) {
+  try { _kgLoadCache.delete(_kgKey(root)); } catch {}
+}
 function _kgLoad(root) {
+  let raw = null;
+  try { raw = localStorage.getItem(_kgKey(root)); } catch {}
+  const cached = _kgLoadCache.get(_kgKey(root));
+  if (cached && cached.raw === raw && Array.isArray(cached.notes)) return cached.notes; // 内容没变 → 零重复 parse
   try { _perfPhase("_kgLoad:JSON.parse"); } catch {}
   let notes = [];
-  try { const raw = localStorage.getItem(_kgKey(root)); if (raw) notes = JSON.parse(raw); } catch { notes = []; }
+  try { if (raw) notes = JSON.parse(raw); } catch { notes = []; }
   if (!Array.isArray(notes)) notes = [];
   // 一次性迁移：旧笔记的 tags 是整块分词，换 bigram 方案后重算一遍，否则新 query 捕不中旧条。
   let migrated = false;
@@ -28596,6 +28795,7 @@ function _kgLoad(root) {
       if (notes.length) localStorage.setItem(_kgKey(root), JSON.stringify(notes));
     } catch {}
   }
+  _kgCacheStore(root, notes);
   return notes;
 }
 function _kgSave(root, notes) {
@@ -28603,7 +28803,8 @@ function _kgSave(root, notes) {
   if (notes.length > 240) notes = notes.slice(-240); // generous cap (retrieval is filtered)
   try {
     localStorage.setItem(_kgKey(root), JSON.stringify(notes));
-  } catch (e) { console.warn("[memory] localStorage write failed (real-file mirror still runs):", e); }
+    _kgCacheStore(root, notes);
+  } catch (e) { _kgCacheDrop(root); console.warn("[memory] localStorage write failed (real-file mirror still runs):", e); }
   _kgStoreSave(root, notes); // durable real-file mirror (async) — the authoritative copy
 }
 
@@ -28802,6 +29003,7 @@ async function _kgSyncFromStore(root) {
     if (Array.isArray(fileNotes) && fileNotes.length) {
       if (local.length < fileNotes.length) {
         try { localStorage.setItem(_kgKey(root), JSON.stringify(fileNotes)); } catch {}
+        _kgCacheDrop(root); // 文件镜像可能是老格式，下次 _kgLoad 重新 parse + 迁移
         _agentContextCache = { root: null, ts: 0, data: "" };
       } else if (local.length > fileNotes.length) {
         await _kgStoreSave(root, local);
@@ -28885,6 +29087,7 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   try {
     for (const n of picked.values()) n.uses = (n.uses || 0) + 1;
     localStorage.setItem(_kgKey(root), JSON.stringify(allNotes));
+    _kgCacheStore(root, allNotes); // uses 写回后同步缓存，否则热点路径每次都缓存失效
   } catch {}
   return [...picked.values()];
 }
@@ -28942,6 +29145,7 @@ function _saveKgText(root, text) {
 
 function _clearKgMemory(root) {
   try { localStorage.removeItem(_kgKey(root)); localStorage.removeItem(_kgCorrectionKey(root)); localStorage.removeItem(_memoryKey(root)); } catch {}
+  _kgCacheDrop(root);
   _kgStoreClear(root);
   _agentContextCache = { root: null, ts: 0, data: "" };
 }
@@ -30503,6 +30707,7 @@ const _bm25Index = {
 const _BM25_K1 = 1.5;
 const _BM25_B = 0.75;
 const _BM25_CHUNK_LINES = 80;
+const _BM25_SLICE_BUDGET_MS = 50; // 每片最多占用主线程 50ms，超预算就让路
 // Stopword list — natural-language fillers + extremely common control/keyword
 // tokens. We KEEP "get"/"set" since they're discriminative in code queries
 // (e.g. "getUser*" methods); BM25's IDF naturally down-weights common terms.
@@ -30531,19 +30736,35 @@ async function buildBM25Index(root) {
   if (_bm25Index.root === root && _bm25Index.built) return;
   try { _perfPhase("buildBM25Index"); } catch {}
   _bm25Index.building = true;
+  _bm25Index.built = false;
   _bm25Index.root = root;
   _bm25Index.chunks = [];
   _bm25Index.df.clear();
   _bm25Index.totalLen = 0;
   const t0 = Date.now();
   let chunkId = 0;
+  // RAFGAP 实锤：逐文件 split/tokenize/df 统计全程不让路，主线程连续占用 34-80s。
+  // 每片 ≤_BM25_SLICE_BUDGET_MS 就 await setTimeout(0) 让出主线程；让路期间工作区
+  // 切换了就放弃（abandoned）—— _walkSourceFiles 吞 onFile 异常，不能靠 throw 中断。
+  let sliceStart = Date.now();
+  let abandoned = false;
+  const yieldToMainThread = async () => {
+    if (Date.now() - sliceStart < _BM25_SLICE_BUDGET_MS) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    sliceStart = Date.now();
+    const activeRoot = typeof rootPath !== "undefined" && rootPath ? rootPath : root;
+    if (activeRoot !== root) abandoned = true;
+  };
   try {
     await _walkSourceFiles(root, async (path, ext) => {
+      if (abandoned) return;
       let text; try { text = await backend.readTextFile(path); } catch { return; }
       if (!text || text.length > _SYMBOL_INDEX_MAX_BYTES) return;
       const rel = path.startsWith(root) ? path.slice(root.length + 1) : path;
       const lines = text.split("\n");
       for (let i = 0; i < lines.length; i += _BM25_CHUNK_LINES) {
+        await yieldToMainThread();
+        if (abandoned) return;
         const slice = lines.slice(i, i + _BM25_CHUNK_LINES);
         const snippet = slice.join("\n");
         if (!snippet.trim()) continue;
@@ -30557,6 +30778,10 @@ async function buildBM25Index(root) {
         _bm25Index.chunks.push({ id: chunkId++, path: rel, start: i + 1, end: Math.min(i + slice.length, lines.length), snippet: snippet.slice(0, 600), termFreq: tf, len });
       }
     }, _SYMBOL_INDEX_MAX_FILES);
+    if (abandoned) {
+      console.log(`[bm25] build abandoned after workspace switch (${Date.now() - t0}ms)`);
+      return;
+    }
     _bm25Index.avgLen = _bm25Index.chunks.length ? _bm25Index.totalLen / _bm25Index.chunks.length : 0;
     _bm25Index.built = true;
     // Query-specific retrieval reads the completed index outside the stable
