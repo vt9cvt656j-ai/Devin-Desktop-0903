@@ -14471,3 +14471,63 @@ test("#47-5 恢复懒渲染：同步只渲最近 30 条，其余 idle 补渲，�
   assert.match(snap, /\(c\.textContent \|\| ""\)\.length > _SNAPSHOT_MAX_CHARS\) return ""/);
 });
 
+
+test("#51-1 九个专用工具 description 含「何时用」引导段", () => {
+  const schemas = extractFn("_buildAgentToolSchemas");
+  for (const tool of ["find_symbol", "lsp_references", "lsp_definition", "semantic_search", "git_blame", "git_log", "db_query", "developer_community_search", "performance_profile"]) {
+    const m = schemas.match(new RegExp(`name: "${tool}", description: "([^"]+)"`));
+    assert.ok(m, `${tool} 的 schema 定义必须存在`);
+    assert.match(m[1], /【何时用】/, `${tool} 的 description 必须含「何时用」段`);
+  }
+});
+
+test("#51-2 _buildToolHint 决策地图：静态字节稳定 + 八项场景映射齐全", () => {
+  const hint = extractFn("_buildToolHint");
+  assert.match(hint, /场景→工具直觉/);
+  for (const pair of ["查符号定义→find_symbol", "查谁调用→lsp_references", "陌生库初探→semantic_search", "git_blame\\/git_log", "db_query 直连", "developer_community_search", "页面卡顿→performance_profile", "已知工具名未装载→search_tools"]) {
+    assert.match(hint, new RegExp(pair), `决策地图必须含映射：${pair}`);
+  }
+  // 缓存纪律：return 的文本必须是纯字面量拼接，零模板插值——任何动态内容都会击穿 prompt cache
+  const body = hint.slice(hint.indexOf("return"));
+  assert.doesNotMatch(body, /\$\{/, "_buildToolHint 返回值必须字节稳定（无 ${} 插值）");
+});
+
+test("#51-3 装载 nudge 结构化：工具名带微用途括号（use_cases 首条截 14 字）", () => {
+  assert.match(SRC, /const _nudgeToolLabel = \(name\) => \{/);
+  assert.match(SRC, /TOOL_METADATA\[name\]\?\.use_cases/);
+  assert.match(SRC, /String\(uc\[0\]\)\.slice\(0, 14\)/, "微用途必须截 ≤14 字");
+  assert.match(SRC, /available\.map\(_nudgeToolLabel\)\.join\("、"\)/, "availability 必须走结构化标签");
+  // 无元数据的工具只列名（brief 为空时回退裸名）
+  assert.match(SRC, /return brief \? `\$\{name\}（\$\{brief\}）` : name;/);
+  // 元数据真源核验：db_query 的 use_cases 首条截断后确实是可读微用途
+  assert.ok(Array.isArray(TOOL_METADATA.db_query?.use_cases) && TOOL_METADATA.db_query.use_cases.length > 0);
+});
+
+test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op 级把关", () => {
+  const sub = extractFn("_runSubAgent");
+  const toolsM = sub.match(/const _READ_TOOLS = \[([^\]]+)\]/);
+  assert.ok(toolsM, "_READ_TOOLS 定义必须存在");
+  for (const t of ["web_search", "web_fetch", "git_status", "git_diff", "git_log", "git_blame"]) {
+    assert.ok(toolsM[1].includes(`"${t}"`), `_READ_TOOLS 必须含 ${t}`);
+  }
+  const typesM = sub.match(/const _READ_TYPES = \[([^\]]+)\]/);
+  assert.ok(typesM && typesM[1].includes('"websearch"') && typesM[1].includes('"git"'),
+    "_READ_TYPES 必须含 websearch 与 git");
+  // git 单 type 多 op：type 级放行必须配 op 级二次把关，否则 commit/push 会漏进只读子智能体
+  assert.match(sub, /const _GIT_READ_OPS = \["status", "diff", "log", "blame"\]/);
+  assert.match(sub, /call\.type === "git" && !_GIT_READ_OPS\.includes\(call\.op\)/,
+    "必须有 op 级把关表达式");
+  assert.match(sub, /_gitOpBlocked\)/, "op 把关必须接进拒绝门禁条件");
+  assert.match(sub, /git 只读操作（status\/diff\/log\/blame）/, "拒绝文案必须说清允许的 op 范围");
+});
+
+test("#51-5 role 传递落盘：execRun._subRole 两条路径 + research/security 网络工具兜底", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /\{ \.\.\.run, mode: "agent", _isWorker: true, _scope: scopeRel, _subRole: role \}/,
+    "worker 路径必须保留 role");
+  assert.match(sub, /: \{ \.\.\.run, _subRole: role \};/,
+    "只读路径必须浅拷贝并保留 role（不裸复用 run，防并行作业互踩）");
+  assert.match(sub, /\["research", "security"\]\.includes\(String\(role \|\| ""\)\.toLowerCase\(\)\)/);
+  assert.match(sub, /for \(const t of \["web_search", "web_fetch"\]\) if \(!_allow\.includes\(t\)\) _allow\.push\(t\);/,
+    "research/security 角色必须幂等确保网络工具在 _allow");
+});
