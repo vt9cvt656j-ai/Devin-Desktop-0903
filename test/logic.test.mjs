@@ -14223,6 +14223,75 @@ test("P2.1-取消传播：run 结束时 running 作业标 cancelled+consumed，�
   assert.match(snip, /_cancelIds/);
 });
 
+// ---- #49 子智能体傻等根治（事实反馈零拦截）+ 卡片文案清理 + 三机器人图标 ----------
+
+test("#49-1 傻等事实检测：派发后零其他工具就 await → 结果前置事实；干过活/存量作业不触发", async () => {
+  const start = SRC.indexOf('call.type === "awaitsubagent"');
+  const bodyStart = SRC.indexOf("{", start) + 1;
+  const end = SRC.indexOf('} else if (call.type === "openapi_parser")', start);
+  const body = SRC.slice(bodyStart, end);
+  const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: load("_hasErrorLine") });
+  const exec = new Function("call", "run", "res", "_clipPreservingErrors", `return (async () => { ${body} })();`);
+  const mkJob = () => {
+    const j = { id: 1, desc: "调研A", status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null, dispatchLedgerLen: 1 };
+    j.promise = new Promise((resolve) => setTimeout(() => { j.status = "done"; j.result = "报告"; resolve(j.result); }, 10));
+    return j;
+  };
+  // 1) 派发以来账本新增只有 run_subagent/await_subagent 自身 → 傻等，结果开头附事实（不拦截等待）
+  const idle = mkJob();
+  const runIdle = { _subAgentJobs: new Map([[1, idle]]), _toolLedger: { entries: [{ tool: "read_file" }, { tool: "run_subagent" }, { tool: "await_subagent" }], turnIndex: 0 } };
+  const r1 = await exec({ type: "awaitsubagent", job: "all" }, runIdle, {}, clip);
+  assert.match(r1.content, /^\[事实\] 派发后未做任何其他工作就开始等待 = 同步阻塞/);
+  assert.match(r1.content, /单个聚焦调研直接自己读；派了后台作业就先推进其他步骤/);
+  assert.match(r1.content, /\[job#1 完成·调研A\] 报告/, "事实只前置，等待照常执行取回结果");
+  assert.equal(idle.consumed, true);
+  // 2) 派发后干过别的活（read_file）→ 不触发
+  const busy = mkJob();
+  const runBusy = { _subAgentJobs: new Map([[1, busy]]), _toolLedger: { entries: [{ tool: "run_subagent" }, { tool: "read_file" }], turnIndex: 0 } };
+  const r2 = await exec({ type: "awaitsubagent", job: "all" }, runBusy, {}, clip);
+  assert.doesNotMatch(r2.content, /\[事实\]/, "派发后干过活不得误报");
+  // 3) 无 dispatchLedgerLen 的存量作业（#45 旧结构）不误报；无 _toolLedger 的 run 安全穿过
+  const legacy = mkJob(); delete legacy.dispatchLedgerLen;
+  const r3 = await exec({ type: "awaitsubagent", job: "all" }, { _subAgentJobs: new Map([[1, legacy]]) }, {}, clip);
+  assert.doesNotMatch(r3.content, /\[事实\]/, "存量作业/无账本不误报");
+  // 4) 派发路径必须落盘傻等检测锚点；#45 作业结构钉死字段不回退
+  const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
+  assert.match(loopSrc, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\) \? run\._toolLedger\.entries\.length : 0/);
+  assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
+});
+
+test("#49-2 启动文本强化：不要立即 await 提示 + 元数据反例，#45 既有文案不回退", () => {
+  const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
+  assert.match(loopSrc, /⚠️ 不要立即 await——先推进计划里的其他步骤/);
+  assert.match(loopSrc, /说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）/);
+  assert.match(loopSrc, /结果就绪后会自动送达，也可用 await_subagent 显式等待/, "#45 既有文案不回退");
+  // 元数据反例：tool-guides 的 run_subagent use_cases 补单文件调查不要派
+  const guides = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
+  assert.match(guides, /'单个聚焦文件调查不要派——主智能体直接读更快'/);
+});
+
+test("#49-3 卡片文案+三机器人图标：all/空不显示 all 且用 _SVG_TRIO_BOTS，具体号显示 job#N 保持原图标", () => {
+  const cardSrc = SRC.slice(SRC.indexOf("function _createToolStep(call)"), SRC.indexOf("function _settleToolStep"));
+  // 动作标签仍是「等待子智能体」；job 判定：all/空 → 路径文本置空（不显示 "all" 噪音），具体号 → job#N
+  assert.match(SRC, /awaitsubagent: "等待子智能体"/);
+  assert.ok(cardSrc.includes('const _isAwaitSub = (call.type || "") === "awaitsubagent";'), "卡片层判定不得抢先命中执行器分支的 indexOf 锚点");
+  assert.ok(cardSrc.includes('const _awaitJobRaw = _isAwaitSub ? String(call.job || call.path || "").trim() : "";'));
+  assert.ok(cardSrc.includes('const _awaitAll = _isAwaitSub && (!_awaitJobRaw || _awaitJobRaw.toLowerCase() === "all");'));
+  assert.ok(cardSrc.includes('? (_awaitAll ? "" : "job#" + _awaitJobRaw.replace(/^job#?/i, ""))'), "all → 空标签；具体号 → job#N");
+  // 非可点击：job 号不是文件路径，不得渲染成可点击路径
+  assert.ok(cardSrc.includes('call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold"'));
+  // 三机器人图标：存在、currentColor 继承主题色、三个圆角方头+天线；仅定义+all 路径两处出现
+  const defStart = SRC.indexOf("const _SVG_TRIO_BOTS");
+  assert.ok(defStart > 0, "_SVG_TRIO_BOTS 必须存在");
+  const def = SRC.slice(defStart, SRC.indexOf(";", defStart));
+  assert.match(def, /viewBox="0 0 24 24"/);
+  assert.match(def, /stroke="currentColor"/, "描边必须继承主题色");
+  assert.equal((def.match(/<rect /g) || []).length, 3, "三个圆角方头");
+  assert.equal((def.match(/<path d="M[\d.]+ [\d.]+V[\d.]+"\/>/g) || []).length, 3, "三根天线");
+  assert.equal(SRC.split("_SVG_TRIO_BOTS").length - 1, 2, "仅定义与 all 路径两处使用，不泄漏到其他卡片");
+  assert.ok(cardSrc.includes('${_awaitAll ? _SVG_TRIO_BOTS : (typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read))}'), "仅 _awaitAll（等待全部）路径用三机器人，单个 job#N 保持原图标");
+});
+
 // ---- #47 四大主线程热点根治（RAFGAP 取证实锤） --------------------------------
 
 test("#47-1 持久化分片缓存：会话内容没变零重复序列化，预算水位单调安全", () => {

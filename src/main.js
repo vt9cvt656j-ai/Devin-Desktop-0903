@@ -37158,7 +37158,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
           const jobId = run._subAgentJobSeq;
           const desc = String(it.call.description || "调研").slice(0, 40);
-          const job = { id: jobId, desc, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null };
+          // #49 傻等检测锚点：记录派发时账本长度，await_subagent 用它判断"派发以来干没干别的活"
+          const job = { id: jobId, desc, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null, dispatchLedgerLen: run._toolLedger && Array.isArray(run._toolLedger.entries) ? run._toolLedger.entries.length : 0 };
           run._subAgentJobs.set(jobId, job);
           const _jobSess = run && run.session;
           const _jobGenSnap = _jobSess ? (_jobSess._runGen || 0) : 0; // 与 _subGenSnap 同一代际语义：Stop/换轮后落定视为取消
@@ -37179,7 +37180,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             else job.status = "failed";
             return job.result;
           });
-          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。`;
+          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。⚠️ 不要立即 await——先推进计划里的其他步骤；若当前确实没有其他事可做，说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）。`;
           it.rawResult = { type: "subagent", path: it.call.description || "", content: message };
           return message;
         }
@@ -38924,10 +38925,19 @@ function _toolStepActionLabel(call) {
   return raw ? raw.replace(/_/g, " ") : "工具";
 }
 
+// #49 三机器人图标：专用于 await_subagent 等待全部子智能体（job=all/空）的卡片。
+// 中间一个略大居前，左右两个略小错后；圆角方头+两眼+天线，stroke 用 currentColor 继承主题色。
+const _SVG_TRIO_BOTS = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.6" y="10.4" width="5.6" height="5.4" rx="1.4"/><path d="M4.4 10.4V9"/><circle cx="4.4" cy="8.3" r=".6"/><circle cx="3.5" cy="12.9" r=".5" fill="currentColor" stroke="none"/><circle cx="5.3" cy="12.9" r=".5" fill="currentColor" stroke="none"/><rect x="16.8" y="10.4" width="5.6" height="5.4" rx="1.4"/><path d="M19.6 10.4V9"/><circle cx="19.6" cy="8.3" r=".6"/><circle cx="18.7" cy="12.9" r=".5" fill="currentColor" stroke="none"/><circle cx="20.5" cy="12.9" r=".5" fill="currentColor" stroke="none"/><rect x="8.4" y="8.8" width="7.2" height="7.6" rx="1.8"/><path d="M12 8.8V7"/><circle cx="12" cy="6.3" r=".7"/><circle cx="10.6" cy="12" r=".6" fill="currentColor" stroke="none"/><circle cx="13.4" cy="12" r=".6" fill="currentColor" stroke="none"/></svg>`;
+
 function _createToolStep(call) {
   call = call || {};
   const _isRepoReader = ["github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"].includes(call.type);
   const _isKSearch = call.type.endsWith("_search") || call.type === "github_trending" || _isRepoReader;
+  // #49 await_subagent 卡片：job 为 all/空 = 等待全部（不显示 "all" 噪音，图标用三机器人）；具体号显示 job#N，图标保持现状。
+  //（提成 _isAwaitSub 是故意的：测试靠 awaitsubagent 全等比较的首次出现定位执行器分支，这里不能抢先命中）
+  const _isAwaitSub = (call.type || "") === "awaitsubagent";
+  const _awaitJobRaw = _isAwaitSub ? String(call.job || call.path || "").trim() : "";
+  const _awaitAll = _isAwaitSub && (!_awaitJobRaw || _awaitJobRaw.toLowerCase() === "all");
   const pathDisplay = String((call.type === "git"
     ? ((call.op || "") + (call.op === "diff" && call.path ? " " + call.path : "") + (call.op === "branch" && call.branch ? " " + call.branch : ""))
     : call.type === "lsp"
@@ -38946,6 +38956,8 @@ function _createToolStep(call) {
     ? `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}`
     : call.type === "current_time"
     ? ""
+    : _isAwaitSub
+    ? (_awaitAll ? "" : "job#" + _awaitJobRaw.replace(/^job#?/i, ""))
     : call.type === "game_scaffold"
     ? ((call.engine || "phaser") + " · " + (call.name || "my-game"))
     : call.type === "generate_3d" ? (call.prompt || "").slice(0, 40)
@@ -39021,7 +39033,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "roadenvironment" || call.type === "trackshipment" || call.type === "shopcatalog" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "debate" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "livemarkets" || call.type === "liveflights" || call.type === "roadenvironment" || call.type === "trackshipment" || call.type === "shopcatalog" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "debate" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -39029,7 +39041,7 @@ function _createToolStep(call) {
   step.innerHTML =
     `<div class="agent-tool-row">` +
     `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
-    `<div class="atc-type-icon">${typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read)}</div>` +
+    `<div class="atc-type-icon">${_awaitAll ? _SVG_TRIO_BOTS : (typeIcons[call.type] || (_isKSearch ? typeIcons._ksearch : typeIcons.read))}</div>` +
     `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${actionLabel}</span>${pathHtml}</div></div>` +
     `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
     `<div class="atc-viewport"></div>`;
@@ -43276,6 +43288,14 @@ ${bodyPreview}`)}</pre>`;
         res.className = "atc-result atc-result--ok"; res.textContent = "台账摘要";
         return { type: "awaitsubagent", path: _want, content: `[作业台账现状] ${_all.map(_statusLine).join("；")}${_want !== "all" ? `（未找到 job#${_want}）` : "（无运行中作业）"}` };
       }
+      // #49 傻等事实检测（机制层事实反馈，零拦截）：所有被等待的 running 作业，若派发以来
+      // 账本新增条目里除 run_subagent/await_subagent 自身外零其他工具调用，说明派发后没干
+      // 任何别的活就直接开始等 = 把异步用成了同步阻塞。等待照常执行，只在结果文本开头附
+      // 事实，判断权留给模型（无 dispatchLedgerLen 的存量作业不误报）。
+      const _ledgerEntries = run && run._toolLedger && Array.isArray(run._toolLedger.entries) ? run._toolLedger.entries : [];
+      const _runningWaits = _targets.filter((j) => j.status === "running");
+      const _idleWait = _runningWaits.length > 0 && _runningWaits.every((j) => Number.isInteger(j.dispatchLedgerLen)
+        && !_ledgerEntries.slice(j.dispatchLedgerLen).some((e) => e && e.tool && e.tool !== "run_subagent" && e.tool !== "await_subagent"));
       // 剩余超时窗口：按最早启动的作业算 5min+30s 宽限期，下限 5s 防零等待；
       // 护栏定时器落定后必须 clearTimeout，不给事件循环留 5min 悬挂句柄
       const _waitMs = Math.max(5000, Math.min(..._targets.map((j) => j.startedAt + 5 * 60 * 1000 + 30000 - Date.now())));
@@ -43294,7 +43314,9 @@ ${bodyPreview}`)}</pre>`;
         _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _budget))}`);
       }
       res.className = "atc-result atc-result--ok"; res.textContent = `${_targets.length} 个作业落定`;
-      return { type: "awaitsubagent", path: _want, content: _parts.join("\n").slice(0, 3200) };
+      // #49 傻等事实前置：不拦截等待本身，只把事实摆在结果最前面
+      const _factHead = _idleWait ? "[事实] 派发后未做任何其他工作就开始等待 = 同步阻塞，异步失去意义。下次: 单个聚焦调研直接自己读；派了后台作业就先推进其他步骤，结果会自动送达。\n" : "";
+      return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 3200) };
 
     } else if (call.type === "openapi_parser") {
       // OpenAPI/Swagger 规范解析器：支持本地文件和公网 URL

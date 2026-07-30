@@ -182,7 +182,7 @@ const TOOL_METADATA = Object.freeze({
   },
   run_subagent: {
     category: 'orchestration',
-    use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据'],
+    use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据', '单个聚焦文件调查不要派——主智能体直接读更快'],
     triggers: ['根因未明需要并行取证', '调研可后台跑不阻塞主任务', '需要独立视角审查/调研'],
     example_call: "run_subagent(description='Audit auth', prompt='Inspect auth and return file:line evidence.', role='research')",
     priority: 'medium'
