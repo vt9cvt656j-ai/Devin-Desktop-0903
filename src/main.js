@@ -35651,6 +35651,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let budget = Infinity;
   const _mustUseWorkspaceTools = run.mode === "agent" && _agentMustUseWorkspaceTools(run.engineering, root);
   // 空项目行动门禁：构建型需求判据（执行时现读 run.engineering，迟到裁决补射后自动生效）。
+  // #56 职责收窄：本判据只服务「空目录快动手」门（emptyBuildAct 行动催促 / emptyBuildFinish 收尾拦截），
+  // 判据保持宽（implementation 也算构建型）——空目录下连小实现都该快动手，防「只思考不写代码」回归。
+  // 它不再兼任规划/拆分/子智能体的开关：那些触发只看计划步骤/领域/模块数的事实（_splitGateNudgeMessage /
+  // _inferOrchestrationFromPlan / _shouldDispatchSubagent），与空目录、从零（fromZeroUiProject）字段彻底解耦。
   const _emptyBuildIntent = () => !!(run.engineering && (run.engineering.substantial || run.engineering.projectScope
     || run.engineering.fromZeroUiProject || run.engineering.uiProject || run.engineering.fullWebsite || run.engineering.implementation));
   run._emptyBuildNudges = 0;        // 行动催促次数（整 run 上限 2，防死循环）
@@ -36012,6 +36016,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (isAgent && _live()) {
         const _splitMsg = _splitGateNudgeMessage(run);
         if (_splitMsg) _pushNudge("splitGate", _splitMsg);
+        else {
+          // #56 多角色/并行引导（一次性）：拆分门事实已给过、模型仍零派发且待做步骤跨 ≥2 领域
+          // 可独立 → 升级为极简 tasks 多派示例（与拆分门不同轮，不重复轰炸；单领域小任务静默）。
+          const _orchMsg = _inferOrchestrationFromPlan(run);
+          if (_orchMsg) _pushNudge("parallelGuide", _orchMsg);
+        }
       }
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
@@ -37212,6 +37222,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             ? "设计检索未完成 · 未执行"
             : "实施计划未就绪 · 未执行");
           return message;
+        }
+        // #56 单点派发前置判断（一次性，不硬拦）：事实先行——未启动作业、不烧 _parallelDispatches
+        // 账本（被拦的不算真派发）；模型仍坚持则第二次调用照常派发，#49 傻等检测事后兜底。
+        // 只管 run_subagent：worker/wiki/research_project/design_research 不受影响。
+        const dispatchIssue = !isWorker && !it.call._wiki && !it.call.wait && it.tc.name === "run_subagent"
+          ? _shouldDispatchSubagent(run, it.call) : "";
+        if (dispatchIssue) {
+          it.rawResult = { type: "subagent", path: it.call.description || "", content: dispatchIssue };
+          it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
+          body.appendChild(it.step);
+          _settleToolStep(it.step, it.rawResult, "单点任务 · 未派发");
+          return dispatchIssue;
         }
         // 并行派发事实账本（供拆分门与收尾自省记账读取）：只记 worker/子智能体真派发，被拦截的不算。
         if (isWorker || it.tc.name === "run_subagent") run._parallelDispatches = (run._parallelDispatches || 0) + 1;
@@ -39540,6 +39562,27 @@ function _probeLoopNudgeMessage(run, batch) {
   return `[根因检查点] 你已连续 ${win.length} 个回合只做探测、无实质进展。探测清单: ${list}。停止逐个试错: ①先用 1-2 句写出当前故障最可能的根因假设 ②说明最小验证/修复动作再执行 ③若涉及安装/下载/网络类故障,考虑先 web_search 查该报错的已知解法 (如镜像源/环境变量),而不是继续翻本地文件。`;
 }
 
+// ── 计划涉及模块计数（纯事实采集，#56 规模启发）：从计划步骤文本里出现的文件/目录路径
+//    归并出「改动跨几个模块」——monorepo 的 packages/x、src/components 与 src/api、server 与
+//    web 都是不同模块；文件名段（带扩展名）不算目录，URL 先剥除。不读 substantial/projectScope/
+//    fromZeroUiProject 等 AI 规模评级字段：现有大项目「加功能」被 AI 判成 changeScope=module 时，
+//    多模块改动的事实仍由计划路径直接成立——拆分/规划触发与项目新旧解耦。
+function _countExistingModules(steps) {
+  const generic = new Set(["src", "source", "packages", "apps", "modules", "lib", "libs"]);
+  const modules = new Set();
+  for (const step of (Array.isArray(steps) ? steps : [])) {
+    const text = String(step?.content || step?.title || step || "").replace(/\bhttps?:\/\/\S+/gi, " ");
+    for (const match of text.matchAll(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+/g)) {
+      const segments = match[0].replace(/^\.+\//, "").split("/").filter(Boolean);
+      if (segments.length >= 2 && /\.[A-Za-z0-9]{1,8}$/.test(segments[segments.length - 1])) segments.pop(); // 文件名段不算目录
+      if (!segments.length) continue;
+      const head = segments[0].toLowerCase();
+      modules.add(generic.has(head) && segments.length >= 2 ? head + "/" + segments[1].toLowerCase() : head);
+    }
+  }
+  return modules.size;
+}
+
 // ── 计划步骤领域归类（纯事实罗列，不做决策）：拆分并行门用它把步骤文本按专业领域
 //    归档（frontend/backend/database/test/devops/docs/design），供模型判断 scope 能否清晰
 //    切分。关键词只作事实归档底座，拆不拆的语义判断权留给模型（AI 主判原则）。
@@ -39557,26 +39600,31 @@ function _planStepDomain(step) {
 }
 
 // ── 拆分并行门（一次性事实注入）：全任务类型（大项目/小项目/改 bug/改内容）的计划落地后
-//    （非取消步骤 ≥3 且 跨 ≥2 具名领域 或 investigate+implement 共存——调研可后台化的事实），
+//    （非取消步骤 ≥3 且 跨 ≥2 具名领域 或 investigate+implement 共存——调研可后台化的事实；
+//    #56 规模启发：改动跨 ≥2 模块的计划即使只有 2 步/单领域也触发——现有项目「加功能/重构」
+//    的拆分权由路径事实成立，不再间接 gated 在 substantial/projectScope/fromZero 等 AI 评级上），
 //    把步骤的领域分布与并行能力列成事实清单。机制层三原则：只采事实、诚实罗列、判断权留给
-//    模型——不拦截不堆禁令。单领域纯实现计划静默且不烧一次性额度（多角色触发规范红线）。
-//    大任务（≥5 步跨 ≥2 域）出完整清单；小任务出精简版并如实说明 run_worker 对小任务是负
-//    收益。调试任务不再排除，但同轮 bug 取证门事实已成熟时让行（内容不重叠：bugEvidence 讲
-//    取证并行，这里讲计划步骤并行），下轮再出。触发后置 run._splitGateNudged，每 run 一次。
+//    模型——不拦截不堆禁令。单领域纯实现且不跨模块的计划静默且不烧一次性额度（多角色触发
+//    规范红线）。大任务（≥5 步跨 ≥2 域）出完整清单；小任务出精简版并如实说明 run_worker 对
+//    小任务是负收益。调试任务不再排除，但同轮 bug 取证门事实已成熟时让行（内容不重叠：
+//    bugEvidence 讲取证并行，这里讲计划步骤并行），下轮再出。触发后置 run._splitGateNudged，每 run 一次。
 function _splitGateNudgeMessage(run) {
   if (!run || run._splitGateNudged) return "";
   if ((run._parallelDispatches || 0) > 0) return ""; // 已在并行推进 → 不需要提示
   if (run._subAgentJobs instanceof Map && run._subAgentJobs.size) return "";
   const steps = (Array.isArray(run._planSteps) ? run._planSteps : []).filter((s) => s?.status !== "cancelled");
-  if (steps.length < 3) return "";
+  // #56 规模启发：跨模块数来自计划路径事实（_countExistingModules），触发条件不读任何
+  // AI 规模评级/项目新旧/空目录字段——2 步小计划改多模块同样有拆分事实基础。
+  const moduleCount = _countExistingModules(steps);
+  if (steps.length < 3 && (steps.length < 2 || moduleCount < 2)) return "";
   const kinds = steps.map((s) => _planStepActionKind(s));
   const domains = steps.map((s) => _planStepDomain(s));
   const dist = {};
   for (const d of domains) dist[d || "未归类"] = (dist[d || "未归类"] || 0) + 1;
   const namedDomains = Object.keys(dist).filter((d) => d !== "未归类").length;
   const investigable = kinds.includes("investigate") && kinds.includes("implement");
-  // 静默保底：单领域纯实现计划——拆分没有事实基础，不打扰也不烧额度（后续计划变跨域仍可触发）。
-  if (namedDomains < 2 && !investigable) return "";
+  // 静默保底：单领域纯实现且不跨模块——拆分没有事实基础，不打扰也不烧额度（后续计划变跨域仍可触发）。
+  if (namedDomains < 2 && !investigable && moduleCount < 2) return "";
   // 让行：调试任务且同轮 bug 取证门事实已成熟（根因未明账本 ≥2 次失败）且其尚未触发 →
   // 本轮由 bugEvidence 出（不同键不同内容），这里不烧额度，下轮再出。
   const p = run.engineering || {};
@@ -39592,7 +39640,9 @@ function _splitGateNudgeMessage(run) {
     const invIdx = kinds.indexOf("investigate");
     const invPart = invIdx >= 0
       ? `步骤${invIdx + 1}(调研)可 run_subagent 后台跑不阻塞，你同时推进实现；`
-      : `计划跨域(${distText})，调研/取证类动作可 run_subagent 后台跑不阻塞；`;
+      : (namedDomains >= 2
+        ? `计划跨域(${distText})，调研/取证类动作可 run_subagent 后台跑不阻塞；`
+        : `改动跨 ${moduleCount} 个模块（计划路径事实），互不重叠部分可 run_subagent 后台调研不阻塞；`);
     return `[并行机会] ${invPart}await_subagent 汇合。小任务拆写入反而慢，run_worker 不建议——你判断。`;
   }
   // 相邻 implement 步骤域不同 → 列为“可能独立”（事实罗列，依赖关系由模型自己判）。
@@ -39603,7 +39653,48 @@ function _splitGateNudgeMessage(run) {
       indep.push(`步骤${i + 1}(${domains[i]})↔步骤${i + 2}(${domains[i + 1]})`);
     }
   }
-  return `[并行机会·事实清单] 计划 ${steps.length} 步，领域分布: ${distText}。${indep.length ? `可能独立（相邻实现步跨域）: ${indep.slice(0, 4).join("；")}。` : ""}独立模块可 run_worker 并行实现（写入，scope 隔离）；调研可 run_subagent 后台跑不阻塞；await_subagent 汇合。跨领域且 scope 清晰才值得拆，单领域小任务直接自己做更快——你判断。`;
+  return `[并行机会·事实清单] 计划 ${steps.length} 步，领域分布: ${distText}。${moduleCount >= 2 ? `改动跨 ${moduleCount} 个模块。` : ""}${indep.length ? `可能独立（相邻实现步跨域）: ${indep.slice(0, 4).join("；")}。` : ""}独立模块可 run_worker 并行实现（写入，scope 隔离）；调研可 run_subagent 后台跑不阻塞；await_subagent 汇合。跨领域且 scope 清晰才值得拆，单领域小任务直接自己做更快——你判断。`;
+}
+
+// ── 多角色/并行引导（一次性升级提示，#56）：拆分门事实清单已给过、模型仍零派发，且待做
+//    步骤跨 ≥2 具名领域、均为可独立的调研/实现步 → 给一条极简 tasks 多派示例，把「怎么并行」
+//    的理解成本降到复制即可（大项目拆多个子智能体异步并行提速的引导）。单领域小任务静默
+//    （多角色触发规范红线：跨领域且 scope 清晰才拆）。与拆分门不同轮出现（splitGate 同轮有
+//    消息时调用方让行），不重复轰炸；派不派、拆不拆的判断权仍留给模型。
+function _inferOrchestrationFromPlan(run) {
+  if (!run || run._parallelGuideNudged) return "";
+  if (!run._splitGateNudged) return ""; // 事实清单先行，本引导只做升级不抢跑
+  if ((run._parallelDispatches || 0) > 0) return ""; // 已在并行推进 → 不需要引导
+  if (run._subAgentJobs instanceof Map && run._subAgentJobs.size) return "";
+  const open = (Array.isArray(run._planSteps) ? run._planSteps : [])
+    .filter((s) => s && (s.status === "pending" || s.status === "in_progress"));
+  if (open.length < 2) return ""; // 待做不足 2 步 → 没有并行标的
+  const roleByDomain = { "前端": "frontend", "后端": "backend", "数据库": "database", "测试": "test", "部署": "devops", "文档": "docs", "设计": "design" };
+  const indepDomains = [];
+  for (const step of open) {
+    const kind = _planStepActionKind(step);
+    if (kind !== "investigate" && kind !== "implement") continue; // verify/execute 步不可拆派
+    const domain = _planStepDomain(step);
+    if (domain && !indepDomains.includes(domain)) indepDomains.push(domain);
+  }
+  if (indepDomains.length < 2) return ""; // 单领域 → 静默，不烧一次性额度
+  run._parallelGuideNudged = true;
+  const [a, b] = indepDomains;
+  return `[并行引导] 待做步骤跨 ${indepDomains.length} 个领域(${indepDomains.join("、")})且可独立——串行等多久，并行就省多久（约 ${indepDomains.length} 倍）。极简多派: run_subagent(tasks=[{role:"${roleByDomain[a] || "research"}",task:"<${a}调研>"},{role:"${roleByDomain[b] || "research"}",task:"<${b}调研>"}]) 一次派多个异步跑，你继续推进其余步骤，await_subagent 汇合；独立写入模块用 run_worker(scope 隔离)。拆不拆你判断。`;
+}
+
+// ── 单点派发前置判断（一次性事实，不硬拦，#56）：run_subagent 单任务派发前先看事实——
+//    不是 tasks 多派、且计划里没有 ≥2 个待做步骤（派完后主智能体无事可干只能干等）→ 第一次
+//    先把成本事实还给模型、不启动作业；模型看完事实仍要派（再次调用）则照常执行（判断留权，
+//    不硬拦）。与 #49 傻等检测协同：这里事前提示、#49 事后兜底，一前一后各一次不重复轰炸。
+function _shouldDispatchSubagent(run, call) {
+  if (!run || run._singleDispatchNudged) return "";
+  if (Array.isArray(call?.tasks) && call.tasks.length > 1) return ""; // tasks 多派 = 真并发，放行
+  const open = (Array.isArray(run._planSteps) ? run._planSteps : [])
+    .filter((s) => s && (s.status === "pending" || s.status === "in_progress"));
+  if (open.length >= 2) return ""; // 派发后还有其他步骤可推进 = 有真并行空间，放行
+  run._singleDispatchNudged = true;
+  return "[派发判断] 这是单点聚焦任务（计划里没有其他可同时推进的步骤），主智能体直接读/查更快，不必派子智能体（派子体=额外进程开销+串行等待）。确需独立视角或可并行大范围调研时才派——确认要派就再次调用，届时照常执行。";
 }
 
 // ── bug 修复异步取证门（一次性事实注入）：调试类任务写入前已有 ≥2 次失败/未找到类探测

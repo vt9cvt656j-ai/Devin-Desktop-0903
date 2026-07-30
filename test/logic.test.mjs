@@ -1310,6 +1310,7 @@ test("split gate: relaxed to all task types, adaptive text, one-shot (#46/#48)",
   const splitGate = load("_splitGateNudgeMessage", {
     _planStepActionKind: planStepActionKind,
     _planStepDomain: planStepDomain,
+    _countExistingModules: load("_countExistingModules"),
   });
 
   // 领域归类是纯事实罗列（域词归档，不做决策）
@@ -14686,4 +14687,164 @@ test("#53-5 结果链路：嵌套报告只进父子体消息流/简报，不直�
   assert.match(sub, /execRun\._subAgentJobSeq = 0;/);
   // 父子体收尾仍把自己的简报（含嵌套结果）折进 findings——既有机制承接，不另建链路
   assert.match(sub, /run\.ctx\.findings\.push/);
+});
+
+test("#56-1 拆分门规模启发：现有项目改多模块照常触发，与 fromZero/substantial 解耦", () => {
+  const countModules = load("_countExistingModules");
+  // 模块计数是纯路径事实：文件名段 pop 掉、generic 容器取两段、URL 剥除
+  assert.equal(countModules([{ content: "修改 src/components/Cart.vue 与 src/api/order.js" }]), 2, "src 下两个子目录 = 2 个模块");
+  assert.equal(countModules([{ content: "改 server/routes/pay.js" }, { content: "改 web/pages/checkout.tsx" }]), 2, "server 与 web = 2 个模块");
+  assert.equal(countModules([{ content: "改 src/utils/a.js 和 src/utils/b.js" }]), 1, "同目录多文件 = 1 个模块");
+  assert.equal(countModules([{ content: "参考 https://a.com/b/c 的文档" }]), 0, "URL 不算路径");
+  assert.equal(countModules([{ content: "梳理需求与技术选型" }]), 0, "无路径 = 0");
+  assert.equal(countModules([]), 0);
+
+  const splitGate = load("_splitGateNudgeMessage", {
+    _planStepActionKind: load("_planStepActionKind"),
+    _planStepDomain: load("_planStepDomain"),
+    _countExistingModules: countModules,
+  });
+  // 现有项目「加功能」：AI 把 changeScope 判成 module → substantial=false，旧逻辑 2 步计划直接静默；
+  // 现在跨 2 个模块的路径事实独立成立触发条件——拆分权与项目新旧/AI 规模评级解耦。
+  const existingRun = {
+    engineering: { substantial: false, projectScope: false, fromZeroUiProject: false, changeScope: "module" },
+    _planSteps: [
+      { content: "修改 server/routes/order.js 增加拆单接口", status: "pending" },
+      { content: "修改 web/pages/checkout.tsx 接入新接口", status: "pending" },
+    ],
+  };
+  const msg = splitGate(existingRun);
+  assert.match(msg, /^\[并行机会\]/, "现有项目 2 步跨 2 模块必须触发（旧逻辑 <3 步一刀切静默）");
+  assert.match(msg, /跨 2 个模块/);
+  assert.match(msg, /计划路径事实/, "触发依据是路径事实而非 AI 评级");
+  assert.match(msg, /你判断/, "判断权仍留给模型");
+  assert.equal(existingRun._splitGateNudged, true);
+  assert.equal(splitGate(existingRun), "", "一次性");
+  // 单模块 2 步小改动仍静默（拆分没有事实基础，不打扰）
+  const monoModule = { _planSteps: [
+    { content: "修改 src/utils/date.js 时区处理", status: "pending" },
+    { content: "修改 src/utils/format.js 千分位", status: "pending" },
+  ] };
+  assert.equal(splitGate(monoModule), "");
+  assert.ok(!monoModule._splitGateNudged, "静默不烧一次性额度");
+  // 大项目多模块：完整清单里带模块事实
+  const bigRun = { _planSteps: [
+    { content: "实现 web/pages 商品列表页面组件", status: "pending" },
+    { content: "实现 server/routes 订单接口与鉴权中间件", status: "pending" },
+    { content: "创建 db/migrations 订单表结构与迁移脚本", status: "pending" },
+    { content: "编写 tests/e2e 端到端回归测试", status: "pending" },
+    { content: "部署 Docker 并配置流水线", status: "pending" },
+  ] };
+  const bigMsg = splitGate(bigRun);
+  assert.match(bigMsg, /并行机会·事实清单/);
+  assert.match(bigMsg, /改动跨 4 个模块/);
+  // 解耦源码自查：拆分门与模块计数的函数体不读任何项目新旧/规模评级/空目录字段
+  for (const fnName of ["_splitGateNudgeMessage", "_countExistingModules"]) {
+    const src = extractFn(fnName);
+    for (const field of ["fromZeroUiProject", "substantial", "projectScope", "_emptyRootAtStart", "greenfield", "changeScope", "uiProject"]) {
+      assert.ok(!src.includes(field), `${fnName} 不得读 ${field}`);
+    }
+  }
+});
+
+test("#56-2 单点派发前置判断：一次性事实提示不硬拦，与 #49 傻等检测一前一后协同", () => {
+  const shouldDispatch = load("_shouldDispatchSubagent");
+  // ① 无计划（单点聚焦任务）→ 返回派发成本事实，一次性
+  const run = {};
+  const msg = shouldDispatch(run, { description: "调查配置文件" });
+  assert.match(msg, /^\[派发判断\]/);
+  assert.match(msg, /直接读\/查更快/);
+  assert.match(msg, /额外进程开销/, "成本事实必须如实罗列");
+  assert.match(msg, /再次调用/, "不硬拦：模型坚持可再次调用");
+  assert.equal(run._singleDispatchNudged, true);
+  assert.equal(shouldDispatch(run, { description: "调查配置文件" }), "", "第二次调用放行 = 判断权留给模型");
+  // ② tasks 多派 = 真并发 → 直接放行，不烧额度
+  const multiRun = {};
+  assert.equal(shouldDispatch(multiRun, { tasks: [{ task: "a" }, { task: "b" }] }), "");
+  assert.ok(!multiRun._singleDispatchNudged, "放行不烧一次性额度");
+  // ③ 计划里还有 ≥2 个待做步骤（派发后主智能体有事可干 = 真并行空间）→ 放行
+  const busyRun = { _planSteps: [
+    { content: "实现前端页面", status: "pending" },
+    { content: "实现后端接口", status: "in_progress" },
+    { content: "已完成的准备工作", status: "completed" },
+  ] };
+  assert.equal(shouldDispatch(busyRun, { description: "调研鉴权方案" }), "");
+  assert.ok(!busyRun._singleDispatchNudged);
+  // ④ 只剩 1 个待做步骤 → 派完只能干等，属单点，提示
+  const soloRun = { _planSteps: [
+    { content: "调查报错根因", status: "pending" },
+    { content: "已完成", status: "completed" },
+  ] };
+  assert.match(shouldDispatch(soloRun, {}), /派发判断/);
+  // 接线自查：只管 run_subagent；前置判断在并行账本记账与异步派发之前（被拦的不算真派发）
+  assert.match(SRC, /const dispatchIssue = !isWorker && !it\.call\._wiki && !it\.call\.wait && it\.tc\.name === "run_subagent"/);
+  const gateAt = SRC.indexOf('? _shouldDispatchSubagent(run, it.call) : ""');
+  const ledgerAt = SRC.indexOf('if (isWorker || it.tc.name === "run_subagent") run._parallelDispatches');
+  const spawnAt = SRC.indexOf('const _asyncSpawnNames = new Set(["run_subagent"');
+  assert.ok(gateAt > 0 && ledgerAt > 0 && spawnAt > 0);
+  assert.ok(gateAt < ledgerAt && ledgerAt < spawnAt, "前置判断必须在 _parallelDispatches 记账与异步派发之前");
+  assert.match(SRC, /_settleToolStep\(it\.step, it\.rawResult, "单点任务 · 未派发"\)/);
+  // #49 傻等事后兜底原样保留（事前提示 + 事后兜底各一次，不重复轰炸）
+  assert.match(SRC, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\)/);
+  assert.match(SRC, /⚠️ 不要立即 await/);
+});
+
+test("#56-3 多角色/并行引导：拆分门后跨域零派发 → tasks 多派示例，单领域静默", () => {
+  const inferOrch = load("_inferOrchestrationFromPlan", {
+    _planStepActionKind: load("_planStepActionKind"),
+    _planStepDomain: load("_planStepDomain"),
+  });
+  const crossSteps = [
+    { content: "调查商品页面组件渲染瓶颈", status: "pending" },
+    { content: "实现订单接口限流中间件", status: "pending" },
+  ];
+  // ① 不抢跑：拆分门事实清单未给过 → 静默（本引导只做升级）
+  const early = { _planSteps: crossSteps };
+  assert.equal(inferOrch(early), "");
+  assert.ok(!early._parallelGuideNudged);
+  // ② 拆分门已给过 + 零派发 + 待做跨 2 域可独立 → 极简 tasks 多派示例
+  const run = { _splitGateNudged: true, _planSteps: crossSteps };
+  const msg = inferOrch(run);
+  assert.match(msg, /^\[并行引导\]/);
+  assert.match(msg, /前端、后端/);
+  assert.match(msg, /run_subagent\(tasks=\[\{role:"frontend"/, "角色映射到 frontend");
+  assert.match(msg, /role:"backend"/, "角色映射到 backend");
+  assert.match(msg, /await_subagent 汇合/);
+  assert.match(msg, /run_worker\(scope 隔离\)/, "独立写入模块的并行路径也点到");
+  assert.match(msg, /你判断/, "拆不拆判断权留给模型");
+  assert.equal(run._parallelGuideNudged, true);
+  assert.equal(inferOrch(run), "", "严格一次性");
+  // ③ 已有派发/后台作业 → 静默（已在并行推进）
+  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: crossSteps, _parallelDispatches: 1 }), "");
+  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: crossSteps, _subAgentJobs: new Map([[1, {}]]) }), "");
+  // ④ 单领域 → 静默不烧额度（多角色触发规范红线：跨领域且 scope 清晰才拆）
+  const mono = { _splitGateNudged: true, _planSteps: [
+    { content: "实现登录页面组件", status: "pending" },
+    { content: "实现商品页面布局", status: "pending" },
+  ] };
+  assert.equal(inferOrch(mono), "");
+  assert.ok(!mono._parallelGuideNudged, "静默不烧一次性额度");
+  // ⑤ 待做不足 2 步 → 没有并行标的，静默
+  assert.equal(inferOrch({ _splitGateNudged: true, _planSteps: [crossSteps[0], { content: "已完成", status: "completed" }] }), "");
+  // 接线自查：挂在 splitGate 的 else 分支（不同轮出现，不重复轰炸），专用 nudge 键
+  assert.match(SRC, /if \(_splitMsg\) _pushNudge\("splitGate", _splitMsg\);\s*else \{/);
+  assert.match(SRC, /_pushNudge\("parallelGuide", _orchMsg\)/);
+});
+
+test("#56-4 解耦不回归：#18 空目录快动手门原样保留，新触发不读空目录/从零字段", () => {
+  // ① _emptyBuildIntent 判据原样保持宽（implementation 也算构建型）——空目录小实现也要快动手，
+  //    防「只思考不写代码」回归；它只服务空目录门，不再兼任规划/拆分/子智能体开关
+  assert.match(SRC, /const _emptyBuildIntent = \(\) => !!\(run\.engineering && \(run\.engineering\.substantial \|\| run\.engineering\.projectScope\s*\|\| run\.engineering\.fromZeroUiProject \|\| run\.engineering\.uiProject \|\| run\.engineering\.fullWebsite \|\| run\.engineering\.implementation\)\);/);
+  // ② 三个空目录门仍以 _emptyRootAtStart 为前提（只管空目录，不外溢到现有项目）
+  assert.match(SRC, /run\._emptyRootAtStart && !didMutate && _implOps === 0 && _emptyBuildIntent\(\)\s*&& \(\(run\._emptyBuildNudges === 0 && iter >= 2\) \|\| \(run\._emptyBuildNudges === 1 && iter >= 5\)\)/);
+  assert.match(SRC, /_pushNudge\("emptyBuildAct"/);
+  assert.match(SRC, /_pushNudge\("emptyBuildFinish", "\[收尾拦截\]/);
+  assert.match(SRC, /_pushNudge\("emptyHistoryFact"/);
+  // ③ 四个新/改编排函数体不读任何空目录/从零/AI 规模评级字段——触发与项目新旧彻底解耦
+  for (const fnName of ["_countExistingModules", "_splitGateNudgeMessage", "_inferOrchestrationFromPlan", "_shouldDispatchSubagent"]) {
+    const src = extractFn(fnName);
+    for (const field of ["_emptyRootAtStart", "fromZeroUiProject", "substantial", "projectScope", "greenfield", "changeScope", "uiProject"]) {
+      assert.ok(!src.includes(field), `${fnName} 不得读 ${field}`);
+    }
+  }
 });
