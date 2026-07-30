@@ -172,6 +172,15 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium'
   },
   
+  // 子智能体编排类工具 (P2.1 异步作业)
+  await_subagent: {
+    category: 'orchestration',
+    use_cases: ['等待后台子智能体作业落定并取回报告', '下一步依赖调研结论时显式同步', '查看作业台账现状'],
+    triggers: ['run_subagent 后台派发后需要结果', '收尾前还有作业在跑', '拦截提示结果未消化'],
+    example_call: "await_subagent(job='all')",
+    priority: 'medium'
+  },
+  
   // 测试骨架生成类工具 (新增)
   generate_test_cases: {
     category: 'code_quality',
@@ -244,6 +253,7 @@ const TOOL_EXAMPLES = Object.freeze({
   // models learn to offer clickable choices (lower answer friction) instead of open questions.
   ask_user: { question: "Which deployment target should be used?", options: ["Vercel", "Docker self-host", "Static export"], recommended: 0 },
   run_subagent: { description: "Audit auth", prompt: "Inspect auth and return file:line evidence.", role: "security" },
+  await_subagent: { job: "all" },
   run_worker: { description: "Build API", prompt: "Implement the verified API contract.", scope: ["src/api"], role: "backend" },
   research_project: { focus: "authentication and data flow" },
   design_research: { goal: "existing SaaS dashboard settings page" },

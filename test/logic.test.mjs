@@ -13900,3 +13900,158 @@ test("P1：run_subagent 归在可并行段，主智能体同批只读工具不�
   assert.match(SRC, /canRunInReadSegment = \(it\) => !!it\.call && \(_isReadOnlyParallel\(it\.call\)\s*\|\| \["run_subagent", "research_project", "design_research"\]\.includes\(it\.tc\.name\)\)/,
     "run_subagent 必须留在可并行段，与只读工具同批并发");
 });
+
+// ---- 任务 #45：P2.1 异步子智能体作业架构（后台派发 + 结果自动汇入） ----------
+
+test("P2.1-注册：await_subagent 全链路注册 + run_subagent wait 参数语义", () => {
+  // schema：await_subagent 存在，run_subagent 带 wait 布尔参数（默认 false=后台作业）
+  assert.match(SRC, /name: "await_subagent"/);
+  assert.match(SRC, /wait: \{ type: "boolean"/, "run_subagent schema 必须带 wait 布尔参数");
+  // _KNOWN_TOOLS / 弱模型别名 / 延迟簇（与 run_subagent 同簇按需加载）
+  assert.ok(SRC.includes('"await_subagent",\n]);'), "_KNOWN_TOOLS 必须收录 await_subagent");
+  assert.match(SRC, /awaitsubagent: "await_subagent", wait_subagent: "await_subagent"/);
+  assert.match(SRC, /subagent: \{ tools: \["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent"\] \}/);
+  // _mapToolCall 行为：wait 默认 false，显式 true 透传；await_subagent job 默认 all
+  const mapCall = load("_mapToolCall", {
+    _normalizeArgKeys: (a) => a,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["run_subagent", "await_subagent"]),
+    _canonicalToolName: () => "",
+    _mcpToolMap: new Map(),
+  });
+  assert.equal(mapCall("run_subagent", { description: "d", prompt: "p" }).wait, false, "默认异步（P2 的意义）");
+  assert.equal(mapCall("run_subagent", { description: "d", prompt: "p", wait: true }).wait, true, "显式 wait=true 回到同步等待");
+  const aw = mapCall("await_subagent", {});
+  assert.equal(aw.type, "awaitsubagent");
+  assert.equal(aw.job, "all", "job 默认 all");
+  assert.equal(mapCall("await_subagent", { job: "3" }).job, "3");
+});
+
+test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记录；wait/worker/wiki 保持同步", () => {
+  const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
+  // 异步条件：worker（写盘记账依赖同步）、wiki（存盘）、显式 wait=true 豁免，其余默认后台
+  assert.match(loopSrc, /!isWorker && !it\.call\._wiki && !it\.call\.wait && _asyncSpawnNames\.has\(it\.tc\.name\)/);
+  assert.match(loopSrc, /new Set\(\["run_subagent", "research_project", "design_research"\]\)/);
+  // 作业台账挂 run（不用模块级全局），字段齐全
+  assert.match(loopSrc, /run\._subAgentJobs = new Map\(\)/);
+  assert.match(loopSrc, /run\._subAgentJobSeq = \(run\._subAgentJobSeq \|\| 0\) \+ 1/);
+  assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
+  // 启动后不 await：promise 挂进作业记录，工具结果立即返回
+  assert.match(loopSrc, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
+  assert.match(loopSrc, /结果就绪后会自动送达，也可用 await_subagent 显式等待/);
+  // promise.then 落四态：done/failed/timeout/cancelled（cancelled 同时标 consumed 防幽灵拦截）
+  assert.match(loopSrc, /job\.status = "done"/);
+  assert.match(loopSrc, /job\.status = "failed"/);
+  assert.match(loopSrc, /job\.status = "timeout"/);
+  assert.match(loopSrc, /job\.status = "cancelled"; job\.consumed = true;/);
+  // 代际快照与 _subGenSnap 同语义：Stop/换轮后落定视为取消
+  assert.match(loopSrc, /_jobSess\.streaming && \(_jobSess\._runGen \|\| 0\) === _jobGenSnap/);
+  // #43 多任务并发提为 _spawnMulti 后同步/异步两路复用（既有钉死正则仍在本 slice 内）
+  assert.match(loopSrc, /const _spawnMulti = async \(\)/);
+  assert.match(loopSrc, /const merged = await _spawnMulti\(\)/);
+});
+
+test("P2.1-结果自动交付：落定作业合并注入一条 nudge，consumed 去重不重复送达", () => {
+  const start = SRC.indexOf("// === P2.1 结果自动交付");
+  const end = SRC.indexOf("// ── 空项目行动门禁①");
+  assert.ok(start > 0 && end > start, "自动交付 gate 必须在 _sweepNudges 与空项目门禁之间（每轮迭代开头）");
+  const gateSrc = SRC.slice(start, end);
+  assert.ok(SRC.lastIndexOf("_sweepNudges();", start) > start - 800, "gate 紧跟 _sweepNudges 之后");
+  const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: load("_hasErrorLine") });
+  const gate = new Function("run", "_pushNudge", "_clipPreservingErrors", gateSrc);
+  const pushes = [];
+  const run = { _subAgentJobs: new Map([
+    [1, { id: 1, desc: "调研A", status: "done", result: "A 报告结论", consumed: false }],
+    [2, { id: 2, desc: "调研B", status: "failed", result: "[ERROR] boom at x.js:3", consumed: false }],
+    [3, { id: 3, desc: "还在跑", status: "running", result: "", consumed: false }],
+  ]) };
+  gate(run, (cat, msg) => pushes.push([cat, msg]), clip);
+  assert.equal(pushes.length, 1, "多个完成的合并成一条 nudge");
+  assert.equal(pushes[0][0], "subagentResult");
+  assert.match(pushes[0][1], /\[子智能体 job#1 完成·调研A\] A 报告结论/);
+  assert.match(pushes[0][1], /job#2 失败·调研B/);
+  assert.match(pushes[0][1], /\[ERROR\] boom at x\.js:3/, "错误行豁免截断，不被吞");
+  assert.doesNotMatch(pushes[0][1], /job#3/, "running 作业不提前交付");
+  assert.equal(run._subAgentJobs.get(1).consumed, true);
+  assert.equal(run._subAgentJobs.get(2).consumed, true);
+  // 第二次扫描：已 consumed → 不再注入（去重）
+  gate(run, (cat, msg) => pushes.push([cat, msg]), clip);
+  assert.equal(pushes.length, 1, "consumed 去重：同一结果不得重复送达");
+  // token 经济：单条注入总量 ~3K 字上限
+  assert.match(gateSrc, /slice\(0, 3200\)/);
+});
+
+test("P2.1-await_subagent：等待作业落定取回结果；无作业/无运行中返回台账摘要", async () => {
+  const start = SRC.indexOf('call.type === "awaitsubagent"');
+  assert.ok(start > 0, "awaitsubagent 执行分支必须存在");
+  const bodyStart = SRC.indexOf("{", start) + 1;
+  const end = SRC.indexOf('} else if (call.type === "openapi_parser")', start);
+  assert.ok(end > bodyStart, "分支必须紧邻 openapi_parser 之前");
+  const body = SRC.slice(bodyStart, end);
+  const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: load("_hasErrorLine") });
+  const exec = new Function("call", "run", "res", "_clipPreservingErrors", `return (async () => { ${body} })();`);
+  const res = {};
+  // 1) 无台账 → 无作业提示
+  const r1 = await exec({ type: "awaitsubagent", job: "all" }, {}, res, clip);
+  assert.match(r1.content, /\[无子智能体作业\]/);
+  // 2) 等待运行中作业：promise 落定后取回结果并标 consumed
+  const job = { id: 1, desc: "调研A", status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null };
+  job.promise = new Promise((resolve) => setTimeout(() => { job.status = "done"; job.result = "深度报告内容"; resolve(job.result); }, 10));
+  const run = { _subAgentJobs: new Map([[1, job]]) };
+  const r2 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip);
+  assert.match(r2.content, /\[job#1 完成·调研A\] 深度报告内容/);
+  assert.equal(job.consumed, true, "取回后标 consumed，自动交付不再重复送");
+  // 3) 无运行中作业 → 台账现状摘要
+  const r3 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip);
+  assert.match(r3.content, /\[作业台账现状\]/);
+  assert.match(r3.content, /job#1·调研A·done·已消化/);
+  // 4) 指定作业号：已落定的直接取回；不存在的报未找到
+  job.consumed = false;
+  const r4 = await exec({ type: "awaitsubagent", job: "1" }, run, res, clip);
+  assert.match(r4.content, /\[job#1 完成·调研A\]/);
+  const r5 = await exec({ type: "awaitsubagent", job: "9" }, run, res, clip);
+  assert.match(r5.content, /未找到 job#9/);
+  // 5) 等待受剩余 5min 总超时保护（Promise.race 外层护栏）
+  assert.match(body, /5 \* 60 \* 1000/);
+  assert.match(body, /Promise\.race/);
+});
+
+test("P2.1-收尾门禁：作业未完成/未消化想收尾 → 拦一次，第二次放行", () => {
+  const start = SRC.indexOf("// === P2.1 收尾门禁");
+  const end = SRC.indexOf("// Anti-pile / anti-runaway", start);
+  assert.ok(start > 0 && end > start, "收尾门禁必须在无工具调用收尾区、Anti-pile 之前");
+  const gateSrc = SRC.slice(start, end);
+  // 一次性拦截：run 级标志 + continue（emptyBuildFinish 同款模式），第二次自然放行
+  assert.match(gateSrc, /!run\._subAgentFinishIntercepted/);
+  assert.match(gateSrc, /run\._subAgentFinishIntercepted = true/);
+  assert.match(gateSrc, /continue;/);
+  // 拦截条件：running 或结果未 consumed
+  assert.match(gateSrc, /j\.status === "running" \|\| !j\.consumed/);
+  assert.match(gateSrc, /_pushNudge\("subagentFinish"/);
+  assert.match(gateSrc, /\[收尾拦截\] 还有子智能体作业未完成\/结果未消化/);
+  assert.match(gateSrc, /用 await_subagent 等待结果，或明确说明放弃原因再收尾/);
+  // 位置事实：在 emptyBuildFinish 拦截之后的同一无工具调用分支内
+  const emptyGate = SRC.indexOf('_pushNudge("emptyBuildFinish"');
+  assert.ok(emptyGate > 0 && emptyGate < start, "与 emptyBuildFinish 同区串联，拦截顺序稳定");
+});
+
+test("P2.1-取消传播：run 结束时 running 作业标 cancelled+consumed，已落定不受影响", () => {
+  const start = SRC.indexOf("// === P2.1 取消传播");
+  const end = SRC.indexOf("// 门禁写入腿（诚实记账）", start);
+  assert.ok(start > 0 && end > start, "取消传播必须在 finally 收尾区、门禁写入腿之前");
+  const snip = SRC.slice(start, end);
+  const sweep = new Function("run", snip);
+  const run = { _subAgentJobs: new Map([
+    [1, { id: 1, status: "running", consumed: false }],
+    [2, { id: 2, status: "done", consumed: false }],
+  ]) };
+  sweep(run);
+  assert.equal(run._subAgentJobs.get(1).status, "cancelled");
+  assert.equal(run._subAgentJobs.get(1).consumed, true, "cancelled 作业标 consumed 防幽灵拦截");
+  assert.equal(run._subAgentJobs.get(2).status, "done", "已落定作业不动");
+  assert.equal(run._subAgentJobs.get(2).consumed, false, "未消化的落定结果不被篡改（run 已结束）");
+  sweep({}); // 无台账的 run 安全穿过
+  // 注释事实：复用 _subGenSnap 代际退出与 _setStreaming(false) 的 _cancelIds 取消，不另起通道
+  assert.match(snip, /_subGenSnap/);
+  assert.match(snip, /_cancelIds/);
+});

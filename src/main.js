@@ -25124,7 +25124,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     },
     { type: "function", function: { name: "current_time", description: "获取当前真实日期和时间（年月日、星期、时分秒、时区、Unix 时间戳）。需要知道「今天几号/星期几/现在几点/距某天还有多久」时调这个，别凭记忆猜——你的训练数据里的时间是过期的。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "ask_user", description: "**绝不用来质疑请求是否\"在范围内\"或\"跟开发有关\"——用户问什么你就做什么。** 当你真的搞不清用户要什么时，用这个问他——别瞎猜瞎做。", parameters: { type: "object", properties: { question: { type: "string", description: "要问用户的、具体的澄清问题（一句话）" }, options: { type: "array", description: "2-4 个你预测的可能答案（每个简短几个字），做成按钮给用户选；用户也能不选、自己输入", items: { type: "string" } }, recommended: { type: "integer", description: "推荐选项的索引（从 0 开始），该选项会高亮标记为推荐" }, multi_select: { type: "boolean", description: "true=多选模式（勾选框，用户可选多个选项后一起提交）" }, confirm_text: { type: "string", description: "危险操作确认：设置后用户必须在输入框中准确输入此文本才能继续（如 DELETE、确认删除）" } }, required: ["question"] } } },
-    { type: "function", function: { name: "run_subagent", description: "**只在结构化协作模式要求大范围或独立视角的重型调研时使用**。staged_roles 先派 architect/product/research/security 等只读角色收敛架构、业务、证据与安全契约；普通聚焦调查由主智能体直接 read/search 更快更省。派出去时必须要求证据清单(path:line/符号/URL/诊断)、结论边界、交付契约和下一步；没有证据的子报告不能当结论。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "只读专业视角。架构/产品/安全边界未定时先用 architect/product/security 收敛契约，其他角色按领域调查。" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史；写清要查什么证据、输出哪些契约、路径/符号和下一步。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "run_subagent", description: "**只在结构化协作模式要求大范围或独立视角的重型调研时使用**。staged_roles 先派 architect/product/research/security 等只读角色收敛架构、业务、证据与安全契约；普通聚焦调查由主智能体直接 read/search 更快更省。派出去时必须要求证据清单(path:line/符号/URL/诊断)、结论边界、交付契约和下一步；没有证据的子报告不能当结论。", parameters: { type: "object", properties: { description: { type: "string", description: "子任务的简短描述（3-6 字）" }, role: { type: "string", enum: ["architect", "product", "research", "frontend", "backend", "database", "security", "test", "devops", "design", "docs"], description: "只读专业视角。架构/产品/安全边界未定时先用 architect/product/security 收敛契约，其他角色按领域调查。" }, prompt: { type: "string", description: "交给子智能体的完整任务说明，必须自包含——它看不到当前对话历史；写清要查什么证据、输出哪些契约、路径/符号和下一步。" }, wait: { type: "boolean", description: "true=同步等待子智能体完成并直接返回完整报告（旧行为）；默认 false=后台作业模式：立即返回 job 号，主流程继续推进，结果就绪后自动送达，也可用 await_subagent 显式等待。" } }, required: ["description", "prompt"] } } },
+    { type: "function", function: { name: "await_subagent", description: "等待后台子智能体作业落定并取回结果。run_subagent 默认异步派发（立即返回 job 号，主流程继续）；需要在下一步之前拿到某个/全部作业的报告时调这个。无运行中作业时返回作业台账现状摘要。", parameters: { type: "object", properties: { job: { type: "string", description: "作业号(如 3)或 all，默认 all" } }, required: [] } } },
     { type: "function", function: { name: "debate", description: "**辩论模式——重大技术决策/方案取舍时用**（如选型 A vs B、要不要重构、架构方向）。多个立场并行独立论证，再由裁判综合裁决，避免单视角确认偏差。⚠️只用于真正有争议、答案不唯一的决策；普通问题直接答。", parameters: { type: "object", properties: { question: { type: "string", description: "要辩论的问题/决策，表述清楚备选项" }, perspectives: { type: "array", items: { type: "string" }, description: "可选，自定义 2-4 个立场（默认：支持方/反对方/工程实践方）" }, context: { type: "string", description: "可选，相关背景（项目技术栈、约束、已知信息）" } }, required: ["question"] } } },
     { type: "function", function: { name: "research_project", description: "仅用于用户明确要求完整代码库上手地图，或多个未知模块确实无法定位入口；目标文件/模块已知时不要调用。", parameters: { type: "object", properties: { focus: { type: "string", description: "可选，要重点深挖的方向（如「认证流程」「数据层」「构建部署」）；不填=全项目通览" } }, required: [] } } },
     { type: "function", function: { name: "design_research", description: "仅用于用户明确要求重新设计、比较视觉方向或制定完整 UI 架构蓝图；现有 UI 功能 bug/渲染问题不要调用。", parameters: { type: "object", properties: { goal: { type: "string", description: "要重新设计的网站/界面目标" } }, required: [] } } },
@@ -25345,7 +25346,7 @@ const _TOOL_BUNDLES = {
   // Defer the sub-agent spawn tools so they're NOT in the default payload — an eager model
   // can't casually fire one (the "误触/0 步调研 花架势" noise). They stay fully reachable via
   // search_tools or a deliberate by-name call (auto-loaded), which is a real intent signal.
-  subagent: { tools: ["run_subagent", "run_worker", "research_project", "generate_wiki"] },
+  subagent: { tools: ["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent"] },
   // External retrieval is deliberately absent from the first-turn payload. Project
   // evidence, memory, built-in knowledge_search, and model reasoning should answer
   // first; public web/community tools load only for a concrete current-fact gap.
@@ -25559,6 +25560,7 @@ const _KNOWN_TOOLS = new Set([
   "preview_choices", "visual_explain", "design_research", "learn_design",
   "background_monitor", "developer_community_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
   "performance_profile", "openapi_parser", "generate_test_cases", "docker_compose_up", "realtime_news_feed",
+  "await_subagent",
 ]);
 
 // ===== Growth Feedback Loop Helper =====
@@ -25667,6 +25669,7 @@ const _TOOL_ALIASES = {
   readscreen: "read_screen", inspect_screen: "read_screen", accessibility_tree: "read_screen",
   uiclick: "ui_click", ax_click: "ui_click", accessibility_click: "ui_click",
   runsubagent: "run_subagent", subagent: "run_subagent",
+  awaitsubagent: "await_subagent", wait_subagent: "await_subagent", waitsubagent: "await_subagent",
   runworker: "run_worker",
   debate: "debate", argue: "debate", debate_decision: "debate",
   updateplan: "update_plan", plan: "update_plan", todo: "update_plan", todowrite: "update_plan", todo_write: "update_plan", set_plan: "update_plan", write_todos: "update_plan",
@@ -26340,10 +26343,11 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       const _tasks = Array.isArray(args.tasks)
         ? args.tasks.map((t) => (typeof t === "string" ? { task: t, role: "" } : { task: String(t?.task || t?.prompt || ""), role: String(t?.role || "") })).filter((t) => t.task.trim())
         : null;
-      return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || (_tasks && _tasks[0] ? _tasks[0].task : ""), role: args.role || "", tasks: _tasks && _tasks.length ? _tasks : undefined };
+      return { type: "subagent", path: args.description || "调研", description: args.description || "调研子任务", prompt: args.prompt || (_tasks && _tasks[0] ? _tasks[0].task : ""), role: args.role || "", tasks: _tasks && _tasks.length ? _tasks : undefined, wait: !!args.wait };
     }
-    case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || "") };
-    case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || "") };
+    case "await_subagent": return { type: "awaitsubagent", path: String(args.job || "all"), job: String(args.job || "all") };
+    case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || ""), wait: !!args.wait };
+    case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || ""), wait: !!args.wait };
     case "learn_design": return { type: "learndesign", path: String(args.url || ""), url: String(args.url || ""), name: String(args.name || "") };
     case "generate_wiki": return { type: "subagent", path: "生成产品Wiki", description: "产品Wiki", prompt: _WIKI_PROMPT(args.focus || ""), _wiki: true, wikiDest: String(args.dest || "PRODUCT_WIKI.md") };
     case "run_worker": return { type: "worker", path: args.description || "worker", description: args.description || "实现子任务", prompt: args.prompt || "", role: args.role || "", scope: Array.isArray(args.scope) ? args.scope : (args.scope ? [args.scope] : []) };
@@ -35654,6 +35658,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
       }
       _sweepNudges(); // 清掉离上下文尾部太远的陈旧 harness 提醒（真实用户消息不受影响）
+      // === P2.1 结果自动交付：后台子智能体作业落定后，下一轮迭代开头把报告注入模型 ===
+      // 多个完成的合并成一条 nudge；单条注入总量 ~3K 字，每作业复用 #43 的
+      // _clipPreservingErrors 1200 字+错误行豁免出口。cancelled 作业在取消传播处已标 consumed。
+      if (run._subAgentJobs instanceof Map) {
+        const _settledJobs = [...run._subAgentJobs.values()].filter((j) => !j.consumed && (j.status === "done" || j.status === "failed" || j.status === "timeout"));
+        if (_settledJobs.length) {
+          const _jobBudget = Math.max(300, Math.floor(3000 / _settledJobs.length));
+          const _jobParts = [];
+          for (const j of _settledJobs) {
+            j.consumed = true;
+            const _jobTag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时(部分结果)" : "失败");
+            _jobParts.push(`[子智能体 job#${j.id} ${_jobTag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _jobBudget))}`);
+          }
+          _pushNudge("subagentResult", _jobParts.join("\n").slice(0, 3200));
+        }
+      }
       // ── 空项目行动门禁①（行动催促）：空目录起步的构建任务，思考/环境探测都保留，
       //    但想了 ≥2 个回合还零写操作 → 催它立刻开建。第 1 次在第 2 回合、第 2 次隔 3 回合
       //    再催，整个 run 上限 2 次（计数挂 run 上），防死循环。
@@ -35963,6 +35983,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           run._emptyBuildIntercepted = true;
           _pushNudge("emptyBuildFinish", "[收尾拦截] 这是构建任务但还没有创建任何文件，不能就此结束；立即用 write_file/脚手架产出实际代码。若确有阻塞，明确说出阻塞原因。");
           continue;
+        }
+        // === P2.1 收尾门禁：还有后台子智能体作业在跑/结果未消化就想收尾 → 拦一次 ===
+        // 只拦 1 次（防死循环），第二次放行，交给既有诚实收尾约束让模型说明放弃原因。
+        if (run._subAgentJobs instanceof Map && !run._subAgentFinishIntercepted) {
+          const _openJobs = [...run._subAgentJobs.values()].filter((j) => j.status === "running" || !j.consumed);
+          if (_openJobs.length) {
+            run._subAgentFinishIntercepted = true;
+            const _openIds = _openJobs.map((j) => `job#${j.id}·${j.status === "running" ? "运行中" : "结果未读"}`).join("、");
+            _pushNudge("subagentFinish", `[收尾拦截] 还有子智能体作业未完成/结果未消化 (${_openIds})。用 await_subagent 等待结果，或明确说明放弃原因再收尾。`);
+            continue;
+          }
         }
         // Anti-pile / anti-runaway: once the model keeps going quiet AFTER being nudged to finish
         // (it's re-confirming "done" without acting), stop firing more finish-gates — extra ones
@@ -36865,7 +36896,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const _multiTasks = !isWorker && it.tc.name === "run_subagent" && Array.isArray(it.call.tasks) && it.call.tasks.length > 1
           ? it.call.tasks.filter((t) => t && (typeof t === "string" ? t.trim() : String(t.task || "").trim())).slice(0, 4)
           : null;
-        if (_multiTasks && _multiTasks.length > 1) {
+        // 多任务并发派发+合并，提成局部函数供同步/异步两路复用（卡片渲染与 #42 节流不变）
+        const _spawnMulti = async () => {
           const results = await Promise.allSettled(_multiTasks.map((task, idx) => _runSubAgent({
             config,
             description: `${it.call.description || "调研"}[${idx + 1}/${_multiTasks.length}]`,
@@ -36878,7 +36910,44 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             if (r.status === "fulfilled") parts.push(`【任务 ${r.value.idx + 1}/${_multiTasks.length}】\n${r.value.report}`);
             else parts.push(`【任务 ${idx + 1}/${_multiTasks.length}】⚠️ 失败：${String(r.reason?.message || r.reason).slice(0, 200)}`);
           }
-          const merged = parts.join("\n\n---\n\n").slice(0, 12000);
+          return parts.join("\n\n---\n\n").slice(0, 12000);
+        };
+        // === P2.1 异步作业模式：只读调研型子智能体默认后台派发，主流程不阻塞 ===
+        // worker/wiki 因写盘记账（_workerMutated/_wikiMutated 在批次后被读取）依赖同步返回，
+        // 保持旧路径；模型显式传 wait=true 也回到同步等待。作业台账挂 run，不用模块级全局。
+        const _asyncSpawnNames = new Set(["run_subagent", "research_project", "design_research"]);
+        if (!isWorker && !it.call._wiki && !it.call.wait && _asyncSpawnNames.has(it.tc.name)) {
+          if (!(run._subAgentJobs instanceof Map)) run._subAgentJobs = new Map();
+          run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
+          const jobId = run._subAgentJobSeq;
+          const desc = String(it.call.description || "调研").slice(0, 40);
+          const job = { id: jobId, desc, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null };
+          run._subAgentJobs.set(jobId, job);
+          const _jobSess = run && run.session;
+          const _jobGenSnap = _jobSess ? (_jobSess._runGen || 0) : 0; // 与 _subGenSnap 同一代际语义：Stop/换轮后落定视为取消
+          const _jobLive = () => !_jobSess || (_jobSess.streaming && (_jobSess._runGen || 0) === _jobGenSnap);
+          job.promise = (_multiTasks && _multiTasks.length > 1
+            ? _spawnMulti()
+            : _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: false, scope: [], role: it.call.role || "" })
+          ).then((report) => {
+            job.result = String(report || "").slice(0, 12000);
+            if (!_jobLive()) { job.status = "cancelled"; job.consumed = true; }
+            else if (Date.now() - job.startedAt >= 5 * 60 * 1000) job.status = "timeout"; // 与 SUBAGENT_TIMEOUT_MS 同窗口：超时终止后带回的是部分结果
+            else if (/^\[ERROR\]/.test(job.result)) job.status = "failed";
+            else job.status = "done";
+            return job.result;
+          }).catch((error) => {
+            job.result = `[ERROR] 子智能体作业异常：${String(error?.message || error).slice(0, 300)}`;
+            if (!_jobLive()) { job.status = "cancelled"; job.consumed = true; }
+            else job.status = "failed";
+            return job.result;
+          });
+          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。`;
+          it.rawResult = { type: "subagent", path: it.call.description || "", content: message };
+          return message;
+        }
+        if (_multiTasks && _multiTasks.length > 1) {
+          const merged = await _spawnMulti();
           it.rawResult = { type: "subagent", path: it.call.description || "", content: merged };
           return merged;
         }
@@ -37567,6 +37636,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
     planSteps = _settleRunPlan(run);
+    // === P2.1 取消传播：run 结束（Stop/换轮/异常/正常收尾）时，仍在跑的后台作业标 cancelled ===
+    // 子智能体本体由 _subGenSnap 代际快照在下个检查点自行退出，Rust 侧请求由下方
+    // _setStreaming(false) 遍历 session._cancelIds 取消；这里只做台账诚实记账，防幽灵作业。
+    if (run._subAgentJobs instanceof Map) {
+      for (const j of run._subAgentJobs.values()) {
+        if (j.status === "running") { j.status = "cancelled"; j.consumed = true; }
+      }
+    }
     // 门禁写入腿（诚实记账）：cap/异常等没走静默收尾的出口也不能绕过义务与证据门——
     // 有界补救耗尽后仍缺的项以未完成状态入账；等待用户回复的轮次不算未完成。
     if (!awaitingUserReply && !finalErr && !run._incompleteReason) {
@@ -38595,6 +38672,7 @@ function _toolStepActionLabel(call) {
     qr: "识别二维码", genimage: "生成图片", vizcompare: "视觉对比", designboard: "设计看板", preview: "方案预览",
     explain: "视觉解释", capture_start: "开始抓包", capture_flows: "读取抓包",
     capture_stop: "停止抓包", capture_replay: "重放请求", background_monitor: "后台监控", worktree: "工作树",
+    awaitsubagent: "等待子智能体",
     game_scaffold: "游戏脚手架", web_scaffold: "网站脚手架", learn_design: "学习设计体系", generate_3d: "3D 模型", generate_sound: "音效",
     generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
     generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具",
@@ -42845,6 +42923,46 @@ ${bodyPreview}`)}</pre>`;
         res.className = "atc-result atc-result--err"; res.textContent = "分析失败";
         return { type: "performance_profile", path: call.url, content: `[失败] performance_profile 出错：${msg}（可能是页面加载超时、网络问题或浏览器自动化不可用）` };
       }
+
+    } else if (call.type === "awaitsubagent") {
+      // === P2.1 await_subagent：等待后台子智能体作业落定并取回结果 ===
+      // Promise 已挂在 run._subAgentJobs 台账；等待受剩余的 5min 总超时保护
+      //（每个作业内部本就有 SUBAGENT_TIMEOUT_MS 兜底，这里再加外层护栏防挂死）。
+      const _jobs = run && run._subAgentJobs instanceof Map ? run._subAgentJobs : null;
+      if (!_jobs || !_jobs.size) {
+        res.className = "atc-result atc-result--ok"; res.textContent = "无作业";
+        return { type: "awaitsubagent", path: call.job || "all", content: "[无子智能体作业] 本轮没有派发过后台子智能体；直接继续当前任务。" };
+      }
+      const _want = String(call.job || "all").trim().toLowerCase();
+      const _all = [..._jobs.values()];
+      const _targets = _want === "all" || !_want
+        ? _all.filter((j) => j.status === "running")
+        : _all.filter((j) => String(j.id) === _want.replace(/^job#?/, ""));
+      const _statusLine = (j) => `job#${j.id}·${j.desc}·${j.status}${j.consumed ? "·已消化" : ""}`;
+      if (!_targets.length) {
+        // 无运行中作业（或指定作业号不存在）→ 返回台账现状摘要，已落定未消化的交给自动交付 gate
+        res.className = "atc-result atc-result--ok"; res.textContent = "台账摘要";
+        return { type: "awaitsubagent", path: _want, content: `[作业台账现状] ${_all.map(_statusLine).join("；")}${_want !== "all" ? `（未找到 job#${_want}）` : "（无运行中作业）"}` };
+      }
+      // 剩余超时窗口：按最早启动的作业算 5min+30s 宽限期，下限 5s 防零等待；
+      // 护栏定时器落定后必须 clearTimeout，不给事件循环留 5min 悬挂句柄
+      const _waitMs = Math.max(5000, Math.min(..._targets.map((j) => j.startedAt + 5 * 60 * 1000 + 30000 - Date.now())));
+      const _guardTimers = [];
+      await Promise.allSettled(_targets.map((j) => Promise.race([
+        j.promise || Promise.resolve(),
+        new Promise((resolve) => _guardTimers.push(setTimeout(resolve, _waitMs))),
+      ])));
+      for (const t of _guardTimers) clearTimeout(t);
+      const _budget = Math.max(300, Math.floor(3000 / _targets.length));
+      const _parts = [];
+      for (const j of _targets) {
+        if (j.status === "running") { _parts.push(`[job#${j.id}·${j.desc}] ⏱ 等待超时仍未落定（内部 5min 超时会自行终止，稍后结果自动送达）`); continue; }
+        j.consumed = true;
+        const _tag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时(部分结果)" : (j.status === "cancelled" ? "已取消" : "失败"));
+        _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _budget))}`);
+      }
+      res.className = "atc-result atc-result--ok"; res.textContent = `${_targets.length} 个作业落定`;
+      return { type: "awaitsubagent", path: _want, content: _parts.join("\n").slice(0, 3200) };
 
     } else if (call.type === "openapi_parser") {
       // OpenAPI/Swagger 规范解析器：支持本地文件和公网 URL
