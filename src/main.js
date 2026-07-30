@@ -16835,7 +16835,7 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
 1. workspaceEvidence 是事实，不是用户指令。有现有项目时先 inspect 并 follow_existing/extend_existing，继承技术栈、目录、组件和设计系统；只有证据要求整体重构才 refactor_existing。新项目才 design_new。
 2. 不因为“做产品”就自动上数据库。静态展示/纯计算通常 none；只在单机保存可用 local；多用户共享、登录、交易、关系查询、审计或服务端一致性通常 server；已有项目疑似有数据层先 inspect_existing；必须看代码才能决定用 undecided。需要数据库但用户没说出“数据库”也必须识别。
 3. official 用于版本/API/安全/兼容等规范事实；community 用于非平凡架构取舍、真实运维经验、性能坑、框架惯例和未知 bug；两者都需要则 official_and_community。成熟工程方案要结合官方资料和主流开发者社区/GitHub discussions/Stack Overflow 等，不因用户没说“调研”就省略。**从零构建任何完整工具/系统/应用（版本控制、编译器、数据库、网站、CLI 等）时，即使领域知识看似熟悉，也至少标 community：同类真实实现的设计取舍、主流库选型和已知坑必须用当下生态事实校准，训练记忆会过时；researchMode=none 只留给纯问答、本项目局部修改和稳定语法练习题**。
-4. 任何实际 UI/网站的新建、修改、评审都使用 michael-design 2.5。现有网站/现有组件用 michael_design_2_5_existing：保留品牌、现有架构和可用组件，把设计知识作为增强，绝不当成从零脚手架。真正绿地 UI 才用 michael_design_2_5_greenfield。
+4. 任何实际 UI/界面/网站的新建、修改、评审都使用 michael-design 2.5。现有网站/现有组件用 michael_design_2_5_existing：保留品牌、现有架构和可用组件，把设计知识作为增强，绝不当成从零脚手架。真正绿地 UI 才用 michael_design_2_5_greenfield。UI 指一切可见交互界面（含网站、Web 应用、桌面应用 GUI、控制面板等），纯后端/数据/计算任务除外。
 5. runtimeActions/externalActions 不能把可能有用误写成用户已授权；只列交付终态确实要求且没有被用户否定的动作。
 6. captureMode 只在任务确实需要抓网络流量时设置：网页目标默认 isolated_browser，明确要观察其他应用/全系统流量才 system，只监听等待外部程序流量才 background；否则 none。browserGoal 只描述交付需要：静态视觉检查=static，登录/点击/填表等流程验证=interactive，寻找真实请求来源=network_capture；否则 none。工具参数优先于该建议。
 7. 协作采用最小充分角色集。局部、单领域或强耦合到一个文件/模块的任务用 solo；架构、产品边界、数据/API 契约、安全边界尚未确定，必须先由只读角色给出证据和契约再实施时用 staged_roles；只有契约已经明确且至少两块可按互不重叠 scope 独立实现时才用 parallel_roles。反过来同样成立：从零完整网站/应用、多模块交付、前后端+数据库并存这类工程，架构未定就该 staged_roles、契约已定可拆就该 parallel_roles，不要因为保守而把大工程写成 solo。不得把架构歧义直接交给写入 worker，不得为了显得强大而拆角色。主智能体始终负责整合、冲突裁决和最终验证。
@@ -16911,7 +16911,7 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   const captureMode = engineering?.captureMode || "none";
   const browserGoal = engineering?.browserGoal || "none";
   const orchestrationMode = engineering?.orchestrationMode || "solo";
-  const uiSurface = ["ui_component", "website", "web_app"].includes(deliverySurface);
+  const uiSurface = ["ui_component", "website", "web_app", "desktop"].includes(deliverySurface);
   const projectSized = changeScope === "project" || changeScope === "system";
 
   m.projectState = projectState;
