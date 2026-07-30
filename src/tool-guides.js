@@ -172,11 +172,25 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium'
   },
   
-  // 子智能体编排类工具 (P2.1 异步作业)
+  // 子智能体编排类工具 (P2.1 异步作业 + #46 拆分并行)
+  run_worker: {
+    category: 'orchestration',
+    use_cases: ['大项目多模块并行实现', '独立 scope 同时开发', '把已明确契约的模块交给写入型 worker'],
+    triggers: ['计划里有互不依赖的实现步骤', '多模块可按目录清晰切分 scope', '需要并行写入加速大工程'],
+    example_call: "run_worker(description='Build API', prompt='Implement the verified API contract.', scope=['src/api'], role='backend')",
+    priority: 'medium'
+  },
+  run_subagent: {
+    category: 'orchestration',
+    use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据'],
+    triggers: ['根因未明需要并行取证', '调研可后台跑不阻塞主任务', '需要独立视角审查/调研'],
+    example_call: "run_subagent(description='Audit auth', prompt='Inspect auth and return file:line evidence.', role='research')",
+    priority: 'medium'
+  },
   await_subagent: {
     category: 'orchestration',
     use_cases: ['等待后台子智能体作业落定并取回报告', '下一步依赖调研结论时显式同步', '查看作业台账现状'],
-    triggers: ['run_subagent 后台派发后需要结果', '收尾前还有作业在跑', '拦截提示结果未消化'],
+    triggers: ['run_subagent 后台派发后需要结果', '汇合后台作业结果', '收尾前还有作业在跑', '拦截提示结果未消化'],
     example_call: "await_subagent(job='all')",
     priority: 'medium'
   },

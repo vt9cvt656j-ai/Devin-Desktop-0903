@@ -17,7 +17,7 @@ import exifr from "exifr";
 import { stripToolIp } from "../build/strip-tool-ip.mjs";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "../src/conversation-memory.js";
 import { GLOBAL_LANGUAGE_TAGS, buildLanguageOptions, coerceSupportedLocale, isSupportedLocale, localeLanguageCode, normalizeLocaleTag } from "../src/locales.js";
-import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine } from "../src/tool-guides.js";
+import { compactToolExampleArgs, compactToolGuide, enrichedCatalogLine, TOOL_METADATA } from "../src/tool-guides.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
@@ -1243,6 +1243,131 @@ test("probe-loop detection: blind guess-and-check probing triggers a root-cause 
   assert.match(SRC, /_pushNudge\("probeLoop", _probeMsg\)/);
   assert.match(SRC, /mutTick: \(run\._fsMutTick \|\| 0\) \+ _implOps/,
     "zero-mutation fact must come from the real mutation ticks");
+});
+
+test("big-task split gate: factual domain distribution, cross-domain only, one-shot (#46)", () => {
+  const planStepActionKind = load("_planStepActionKind");
+  const planStepDomain = load("_planStepDomain");
+  const splitGate = load("_splitGateNudgeMessage", {
+    _planStepActionKind: planStepActionKind,
+    _planStepDomain: planStepDomain,
+  });
+
+  // 领域归类是纯事实罗列（域词归档，不做决策）
+  assert.equal(planStepDomain({ content: "实现商品列表页面组件" }), "前端");
+  assert.equal(planStepDomain({ content: "实现订单接口与鉴权中间件" }), "后端");
+  assert.equal(planStepDomain({ content: "创建订单表结构与迁移脚本" }), "数据库");
+  assert.equal(planStepDomain({ content: "编写端到端回归测试" }), "测试");
+  assert.equal(planStepDomain({ content: "部署到 Docker 并配置流水线" }), "部署");
+  assert.equal(planStepDomain({ content: "梳理需求与技术选型" }), "", "无域词的步骤不硬归类");
+
+  const crossPlan = [
+    { content: "梳理需求与技术选型", status: "completed" },
+    { content: "实现商品列表页面组件", status: "pending" },
+    { content: "实现订单接口与鉴权中间件", status: "pending" },
+    { content: "创建订单表结构与迁移脚本", status: "pending" },
+    { content: "编写端到端回归测试", status: "pending" },
+    { content: "部署到 Docker 并配置流水线", status: "pending" },
+  ];
+  const bigProfile = { substantial: true, projectScope: true };
+
+  // ① 构建型大工程 + ≥5 步跨域计划 + 零并行派发 → 触发一次，只给事实和能力清单
+  const run = { engineering: bigProfile, _planSteps: crossPlan };
+  const msg = splitGate(run);
+  assert.match(msg, /并行机会·事实清单/);
+  assert.match(msg, /计划 6 步/);
+  assert.match(msg, /前端×1/);
+  assert.match(msg, /后端×1/);
+  assert.match(msg, /步骤2\(前端\)↔步骤3\(后端\)/, "相邻实现步跨域列为可能独立");
+  assert.match(msg, /run_worker/);
+  assert.match(msg, /run_subagent/);
+  assert.match(msg, /await_subagent/);
+  assert.match(msg, /你判断/, "判断权留给模型，不做硬拦截");
+  assert.ok(msg.length <= 400, `nudge 文本需精炼，实际 ${msg.length} 字`);
+  assert.equal(run._splitGateNudged, true);
+  assert.equal(splitGate(run), "", "严格一次性，不重复催");
+
+  // ② 单领域计划（全前端）→ 不触发（多角色触发规范：单领域禁止为形式热闹派工）
+  const monoPlan = ["登录页面组件", "商品页面布局", "购物车组件", "结算页面样式", "首页响应式布局"]
+    .map((piece) => ({ content: "实现" + piece, status: "pending" }));
+  const monoRun = { engineering: bigProfile, _planSteps: monoPlan };
+  assert.equal(splitGate(monoRun), "");
+  assert.ok(!monoRun._splitGateNudged, "静默路径不能烧掉一次性额度，计划后续变跨域时还能触发");
+
+  // ③ 非构建型大工程 / 调试任务（归 bug 取证门管）→ 不触发
+  assert.equal(splitGate({ engineering: { substantial: true }, _planSteps: crossPlan }), "");
+  assert.equal(splitGate({ engineering: { substantial: true, projectScope: true, debugProject: true }, _planSteps: crossPlan }), "");
+
+  // ④ 计划不足 5 步 → 不触发（计划未建立/太小）
+  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan.slice(0, 4) }), "");
+
+  // ⑤ 已有 worker/后台作业派发记录 → 不触发（已在并行推进）
+  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _parallelDispatches: 1 }), "");
+  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _subAgentJobs: new Map([[1, { id: 1 }]]) }), "");
+
+  // 接线自查：门挂在主循环、专用 nudge 键；只有真派发才记并行账本（被拦截的不算）
+  assert.match(SRC, /_pushNudge\("splitGate", _splitMsg\)/);
+  assert.match(SRC, /if \(isWorker \|\| it\.tc\.name === "run_subagent"\) run\._parallelDispatches = \(run\._parallelDispatches \|\| 0\) \+ 1;/);
+});
+
+test("bug-fix async evidence gate: fires once on unresolved root cause, yields to probeLoop (#46)", () => {
+  const bugGate = load("_bugEvidenceGateNudgeMessage");
+
+  // ① debugProject + 写入前 ≥2 次失败/未找到类探测（事实复用 probeLoop 批次账本）→ 触发一次
+  const run = { engineering: { debugProject: true }, _probeBatchLog: [{ fails: 1 }, { fails: 1 }] };
+  const msg = bugGate(run, { hasWrite: false });
+  assert.match(msg, /取证并行·不拦截/);
+  assert.match(msg, /2 次失败\/未找到/, "账本事实进文案");
+  assert.match(msg, /run_subagent/);
+  assert.match(msg, /research/);
+  assert.match(msg, /自动送达/);
+  assert.match(msg, /由你判断/, "判断权留给模型");
+  assert.ok(msg.length <= 400, `nudge 文本需精炼，实际 ${msg.length} 字`);
+  assert.equal(run._bugEvidenceGateNudged, true);
+  assert.equal(bugGate(run, { hasWrite: false }), "", "严格一次性");
+
+  // ② 已有写操作 → 根因至少部分明确，不提示也不烧一次性额度
+  const writeRun = { engineering: { bug: true }, _probeBatchLog: [{ fails: 2 }] };
+  assert.equal(bugGate(writeRun, { hasWrite: true }), "");
+  assert.ok(!writeRun._bugEvidenceGateNudged);
+
+  // ③ 非调试类 profile / 失败证据不足 → 不触发
+  assert.equal(bugGate({ engineering: { projectScope: true }, _probeBatchLog: [{ fails: 3 }] }, { hasWrite: false }), "");
+  assert.equal(bugGate({ engineering: { debugProject: true }, _probeBatchLog: [{ fails: 1 }] }, { hasWrite: false }), "");
+
+  // 接线自查：与 probeLoop 不同键；probeLoop 触发的批次让行（else 分支）；stuck 让行在外层共用
+  assert.match(SRC, /_pushNudge\("probeLoop", _probeMsg\);\n\s*\} else \{/,
+    "bug evidence gate must only run when probeLoop did not fire this batch");
+  assert.match(SRC, /_pushNudge\("bugEvidence", _bugMsg\)/);
+  assert.match(SRC, /hasWrite: didMutate \|\| _implOps > 0/, "write fact must come from the real mutation ledger");
+});
+
+test("orchestrator metadata: parallel split/evidence tooling is selectable (#46)", () => {
+  assert.ok(TOOL_METADATA.run_worker, "run_worker needs catalog metadata");
+  assert.ok(TOOL_METADATA.run_worker.use_cases.includes("大项目多模块并行实现"));
+  assert.ok(TOOL_METADATA.run_worker.use_cases.includes("独立 scope 同时开发"));
+  assert.ok(TOOL_METADATA.run_subagent.use_cases.includes("bug 深度取证并行"));
+  assert.ok(TOOL_METADATA.run_subagent.use_cases.includes("后台调研不阻塞主线"));
+  assert.ok(TOOL_METADATA.await_subagent.triggers.includes("汇合后台作业结果"));
+  for (const name of ["run_worker", "run_subagent", "await_subagent"]) {
+    assert.equal(TOOL_METADATA[name].category, "orchestration");
+    const line = enrichedCatalogLine({ name, description: "test", inputs: [] });
+    assert.match(line, /【场景】/, `${name} 需要进入语义编排器的增强 catalog`);
+    assert.match(line, /【触发器】/);
+  }
+});
+
+test("wrap-up honesty ledger: solo execution fact goes to critic material only (#46)", () => {
+  const soloFact = load("_soloExecutionFactLine");
+  // 拆分门提示过 + 全程零 worker/后台作业 → 一行事实
+  assert.equal(soloFact({ _splitGateNudged: true }), "[事实] 本任务全程单线程执行，拆分建议未采纳。");
+  // 没提示过 / 实际派发过 → 不记
+  assert.equal(soloFact({}), "");
+  assert.equal(soloFact({ _splitGateNudged: true, _parallelDispatches: 2 }), "");
+  assert.equal(soloFact({ _splitGateNudged: true, _subAgentJobs: new Map([[1, {}]]) }), "");
+  // 接线自查：事实行只拼进收尾评审的草稿纸材料（_wrapUpCritic 输入），不进用户可见输出、不拦截
+  assert.match(SRC, /const _soloFact = _soloExecutionFactLine\(run\);/);
+  assert.match(SRC, /const _critPadText = _padText\(\) \+ \(_soloFact \? "\\n" \+ _soloFact : ""\);/);
 });
 
 test("slow install/download commands get a factual duration note (no interception)", () => {

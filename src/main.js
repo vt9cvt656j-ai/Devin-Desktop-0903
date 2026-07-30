@@ -35690,6 +35690,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         run._historyInvalidatedNote = true;
         _pushNudge("emptyHistoryFact", "⚠️ 磁盘实况: 当前目录为空 (0 文件)。历史对话中提到的任何文件/框架/搭建成果在磁盘上均**不存在**——历史信息已作废，以磁盘为准，直接重新开建，不要'确认当前状态'。");
       }
+      // ── 大任务拆分并行门（一次性事实注入）：构建型大工程 + 计划已建立（≥5 步、跨 ≥2 领域）
+      //    + 本 run 尚无 worker/后台作业派发 → 注入步骤领域分布与并行能力事实清单。
+      //    只罗列事实和能力，拆不拆由模型判断——不拦截、不复催（run._splitGateNudged）。
+      if (isAgent && _live()) {
+        const _splitMsg = _splitGateNudgeMessage(run);
+        if (_splitMsg) _pushNudge("splitGate", _splitMsg);
+      }
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
       if (run._planPendingCancel && run._planPendingCancel.length) {
@@ -36097,7 +36104,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (!_semanticPending) deepReadNudges++;
           _criticEvidenceSignature = _criticSignature;
           _semanticReviewRuns++;
-          const _critPadText = _padText();
+          // 诚实收尾记账（不拦截）：拆分门提示过但全程零并行派发 → 事实行只进评审自省材料。
+          const _soloFact = _soloExecutionFactLine(run);
+          const _critPadText = _padText() + (_soloFact ? "\n" + _soloFact : "");
           const _crit = await _wrapUpCritic({
             config,
             task,
@@ -36888,6 +36897,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             : "实施计划未就绪 · 未执行");
           return message;
         }
+        // 并行派发事实账本（供拆分门与收尾自省记账读取）：只记 worker/子智能体真派发，被拦截的不算。
+        if (isWorker || it.tc.name === "run_subagent") run._parallelDispatches = (run._parallelDispatches || 0) + 1;
         let workerMutated = false;
         it._workerMutationPaths = [];
         // P1 多子智能体并发：run_subagent 传入 tasks 数组（每项 {role, task}）时并行派发；
@@ -37626,6 +37637,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const _probeNudgeSchemas = ["web_search", "web_fetch"].map((name) => run._toolRegistry?.get(name)).filter(Boolean);
           if (_probeNudgeSchemas.length) _applyToolPayloadWindow(toolSchemas, _probeNudgeSchemas, run._toolCoreNames);
           _pushNudge("probeLoop", _probeMsg);
+        } else {
+          // ── bug 取证并行门（一次性）：probeLoop 未触发的批次才检查（同类干预不叠加；
+          //    同批 stuck 提醒已在外层 !_stuckNudgedNow 让行）。事实复用探测批次账本。
+          const _bugMsg = _bugEvidenceGateNudgeMessage(run, { hasWrite: didMutate || _implOps > 0 });
+          if (_bugMsg) _pushNudge("bugEvidence", _bugMsg);
         }
       }
 
@@ -39194,6 +39210,79 @@ function _probeLoopNudgeMessage(run, batch) {
   const list = win.flatMap((b) => Array.isArray(b.entries) ? b.entries : []).slice(-12)
     .map((e) => `${e.tool}${e.argsSummary ? " " + e.argsSummary : ""} ${e.ok ? "✓" : "✗"}`).join("；");
   return `[根因检查点] 你已连续 ${win.length} 个回合只做探测、无实质进展。探测清单: ${list}。停止逐个试错: ①先用 1-2 句写出当前故障最可能的根因假设 ②说明最小验证/修复动作再执行 ③若涉及安装/下载/网络类故障,考虑先 web_search 查该报错的已知解法 (如镜像源/环境变量),而不是继续翻本地文件。`;
+}
+
+// ── 计划步骤领域归类（纯事实罗列，不做决策）：拆分并行门用它把步骤文本按专业领域
+//    归档（frontend/backend/database/test/devops/docs/design），供模型判断 scope 能否清晰
+//    切分。关键词只作事实归档底座，拆不拆的语义判断权留给模型（AI 主判原则）。
+function _planStepDomain(step) {
+  const text = String(step?.content || step?.title || step || "");
+  if (!text) return "";
+  if (/(?:数据库|表结构|建表|迁移|索引|存储层|sql|schema|migration|\bdb\b|\borm\b|redis|mongo|postgres|sqlite)/i.test(text)) return "数据库";
+  if (/(?:测试|单测|用例|回归|断言|覆盖率|test|\be2e\b|\bspec\b|coverage)/i.test(text)) return "测试";
+  if (/(?:部署|上线|发布|容器|流水线|运维|deploy|docker|k8s|kubernetes|pipeline|nginx|devops|\bci\b)/i.test(text)) return "部署";
+  if (/(?:文档|说明书|readme|changelog|\bdocs?\b|wiki)/i.test(text)) return "文档";
+  if (/(?:设计稿|视觉方案|配色|原型|design system|figma)/i.test(text)) return "设计";
+  if (/(?:前端|页面|组件|界面|样式|布局|视图|交互|响应式|动效|\bui\b|\bcss\b|tailwind|react|vue|svelte|\bhtml\b|frontend|component|\bpage\b|layout)/i.test(text)) return "前端";
+  if (/(?:后端|服务端|接口|路由|中间件|鉴权|会话|\bapi\b|backend|server|endpoint|controller|middleware|\bauth\b|websocket)/i.test(text)) return "后端";
+  return "";
+}
+
+// ── 大任务拆分并行门（一次性事实注入）：构建型大工程的计划落地后，把步骤的领域分布与
+//    可能独立的实现步骤列成事实清单 + 并行能力一句话。机制层三原则：只采事实、诚实罗列、
+//    判断权留给模型——不拦截不堆禁令。单领域计划不打扰（多角色触发规范：仅当任务横跨多个
+//    专业领域且 scope 能清晰切分时才值得拆）。触发后置 run._splitGateNudged，每 run 一次。
+function _splitGateNudgeMessage(run) {
+  if (!run || run._splitGateNudged) return "";
+  const p = run.engineering || {};
+  // 构建型大工程事实：substantial + 项目级评估字段组合；调试任务归 bug 取证门管。
+  const bigBuild = !!(p.substantial && !p.debugProject
+    && (p.projectScope || p.largeProject || p.multiService || p.industrialProject || p.fullWebsite));
+  if (!bigBuild) return "";
+  if ((run._parallelDispatches || 0) > 0) return ""; // 已在并行推进 → 不需要提示
+  if (run._subAgentJobs instanceof Map && run._subAgentJobs.size) return "";
+  const steps = (Array.isArray(run._planSteps) ? run._planSteps : []).filter((s) => s?.status !== "cancelled");
+  if (steps.length < 5) return "";
+  const kinds = steps.map((s) => _planStepActionKind(s));
+  const domains = steps.map((s) => _planStepDomain(s));
+  const dist = {};
+  for (const d of domains) dist[d || "未归类"] = (dist[d || "未归类"] || 0) + 1;
+  if (Object.keys(dist).filter((d) => d !== "未归类").length < 2) return ""; // 单领域计划：拆分没有事实基础
+  const distText = Object.entries(dist).map(([d, n]) => `${d}×${n}`).join("、");
+  // 相邻 implement 步骤域不同 → 列为“可能独立”（事实罗列，依赖关系由模型自己判）。
+  const indep = [];
+  for (let i = 0; i + 1 < steps.length; i++) {
+    if (kinds[i] === "implement" && kinds[i + 1] === "implement"
+        && domains[i] && domains[i + 1] && domains[i] !== domains[i + 1]) {
+      indep.push(`步骤${i + 1}(${domains[i]})↔步骤${i + 2}(${domains[i + 1]})`);
+    }
+  }
+  run._splitGateNudged = true;
+  return `[并行机会·事实清单] 计划 ${steps.length} 步，领域分布: ${distText}。${indep.length ? `可能独立（相邻实现步跨域）: ${indep.slice(0, 4).join("；")}。` : ""}独立模块可 run_worker 并行实现（写入，scope 隔离）；调研可 run_subagent 后台跑不阻塞；await_subagent 汇合。跨领域且 scope 清晰才值得拆，单领域小任务直接自己做更快——你判断。`;
+}
+
+// ── bug 修复异步取证门（一次性事实注入）：调试类任务写入前已有 ≥2 次失败/未找到类探测
+//    （根因未明的事实，复用 probeLoop 的批次账本，不另起账）→ 提示取证可用后台子智能体
+//    并行推进。与 probeLoop 不同键；同批已有 stuck/probeLoop 干预时由调用方让行。
+function _bugEvidenceGateNudgeMessage(run, facts) {
+  if (!run || run._bugEvidenceGateNudged) return "";
+  if (facts && facts.hasWrite) return ""; // 已开写 → 根因至少部分明确，不再提示
+  const p = run.engineering || {};
+  if (!(p.debugProject || p.bug)) return "";
+  const log = Array.isArray(run._probeBatchLog) ? run._probeBatchLog : [];
+  const fails = log.reduce((n, b) => n + (Number(b?.fails) || 0), 0);
+  if (fails < 2) return "";
+  run._bugEvidenceGateNudged = true;
+  return `[取证并行·不拦截] 根因还没定位（写入前已 ${fails} 次失败/未找到类探测）。取证可并行: 用 run_subagent（后台）派 research 角色收集 [日志/复现路径/关联调用方] 证据，你同时推进已明确的部分；结果就绪会自动送达，需要同步时 await_subagent 汇合。拆不拆由你判断。`;
+}
+
+// ── 诚实收尾记账（不拦截）：拆分门提示过但全程零 worker/后台作业 → 返回一行事实供
+//    收尾评审自省；只进评审材料，不进用户可见输出、不拦截收尾。
+function _soloExecutionFactLine(run) {
+  if (!run || !run._splitGateNudged) return "";
+  if ((run._parallelDispatches || 0) > 0) return "";
+  if (run._subAgentJobs instanceof Map && run._subAgentJobs.size) return "";
+  return "[事实] 本任务全程单线程执行，拆分建议未采纳。";
 }
 
 // ── 长耗时安装/下载命令附注（纯事实提示，不拦截不改结果）：实测 electron postinstall 拉
