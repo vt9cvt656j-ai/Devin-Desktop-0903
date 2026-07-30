@@ -21108,6 +21108,14 @@ async function _agentRunInTerminal(root, command, stepEl) {
     // "read_terminal 没找到终端" the user hit. Detect it (backgrounded dev server with no log
     // redirect) and steer the agent to run_in_terminal (a readable, stoppable IDE terminal).
     const bgDevServerNoLog = backgrounded && _srvRe.test(cmd) && !/>\s*\S/.test(cmd);
+    // `timeout 30 npm run dev` 这类用法：timeout 给命令加了个"到点必杀"的上限，
+    // 让它看起来"有界会返回"，但对 dev server 而言 timeout 到点只会把它杀掉——
+    // 拿不到真实就绪状态，也用不上 run_in_terminal 的自动 ready 检测（_detectTerminalReady
+    // 只对 run_in_terminal 生效），验证形同虚设。剥掉 timeout 前缀取内层命令，用与 #9
+    // 同一套 _looksLikeServiceCommand 判服务型（不重造判定）；timeout 包住 test/build/curl/
+    // sleep 等非服务命令不命中，不误伤。
+    const _innerAfterTimeout = _stripTimeoutWrapper(cmd);
+    const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand(_innerAfterTimeout);
     // Fast-path reading a file: `cat` (Unix) or `type` (Windows) → read directly.
     const isCatCmd = /^\s*cat\s/.test(cmd) || (_win && /^\s*type\s/.test(cmd));
 
@@ -21120,6 +21128,12 @@ async function _agentRunInTerminal(root, command, stepEl) {
       } catch {
         result = await backend.taskRunCapture(captureRoot, cmd, { timeoutSecs }).catch(e => ({ code: 1, stdout: "", stderr: String(e?.message || e) }));
       }
+    } else if (timeoutWrappedService) {
+      // 与下方“前台长命令”门同级的事实型拦截：不执行，把工具选择的事实告诉模型。
+      // 既有 isLongRunning 门虽也能因子串命中 `npm run dev` 而拦住，但它给的是“不会返回”
+      // 的通用文案——这对 timeout 包装的命令是假的（timeout 会让它返回），也没点出
+      // timeout 特有的坑，所以在它之前先给一个事实准确、贴合 timeout 场景的引导。
+      result = { code: 1, stdout: "", stderr: `[工具选择] 你用 timeout 包住了 dev server（\`${_innerAfterTimeout}\`）——它只会在到点后被杀掉、拿不到真实就绪状态，也用不上自动 ready 检测。启动 dev server 请用 run_in_terminal（后台常驻，自动检测 Listening/ready 信号后继续），验证页面用 browser。` };
     } else if (isLongRunning) {
       // Foreground server/watch never returns — but instead of just refusing,
       // teach the model to background it so it CAN start & test a dev server.
@@ -53978,6 +53992,29 @@ function _looksLikeServiceCommand(command) {
   const cmd = String(command || "");
   if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build)\b/i.test(cmd)) return false;
   return /\b(?:dev|serve|start|preview|run)\b/.test(cmd);
+}
+
+// 剥掉 `timeout`/`gtimeout` 包装，取出被它包住的内层命令。GNU timeout 形如
+// `timeout [选项] <时长> <内层命令>`，选项可能带独立取值（-k 5 / -s TERM）或
+// 等号形式（--kill-after=5 / --signal=TERM），也有无值开关（--preserve-status）。
+// 用按空白分词的方式解析（天然对 \r\n 免疫，无需在正则里处理换行）：命中 timeout
+// 前缀、且时长位是合法数字（可带 s/m/h/d 后缀）时，返回内层命令字符串；否则返回
+// ""（不是 timeout 包装、或不成形，一律不剥离，避免误伤）。
+function _stripTimeoutWrapper(command) {
+  const toks = String(command || "").trim().split(/\s+/);
+  if (!toks.length || !/^g?timeout$/i.test(toks[0])) return "";
+  let i = 1;
+  // 跳过 timeout 自身的选项；-k / -s / --kill-after / --signal 的独立取值形式
+  // 会多占一个 token（下一个 token 是它的取值），要一并跳过。
+  while (i < toks.length && /^-/.test(toks[i])) {
+    const opt = toks[i];
+    i++;
+    if (/^(?:-k|-s|--kill-after|--signal)$/i.test(opt) && i < toks.length) i++;
+  }
+  // 时长位必须是合法数字，否则视为不成形的 timeout，不剥离
+  if (i >= toks.length || !/^\d+(?:\.\d+)?[smhd]?$/i.test(toks[i])) return "";
+  i++;
+  return toks.slice(i).join(" ").trim();
 }
 
 function _runOwnedDevServerUrl(run) {

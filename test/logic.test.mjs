@@ -1156,6 +1156,65 @@ test("empty-root explore short-circuit: first probe passes, repeats and shell sc
   assert.equal(emptyExploreSkipMessage(normalRun, "/repo", { type: "cmd", command: "ls -la" }), "");
 });
 
+// #54 工具选择：timeout 包住的 dev server 走 run_cmd 时被识别并引导到 run_in_terminal。
+// 根因：agent 用 `timeout 30 npm run dev` 验证 dev server——timeout 到点杀进程拿不到
+// 真实就绪状态，且 #9 的自动 ready 检测只对 run_in_terminal 生效，验证形同虚设。
+test("#54 timeout-wrapped dev server is stripped, recognized as a service, and steered to run_in_terminal", () => {
+  const stripTimeout = load("_stripTimeoutWrapper");
+  const looksLikeService = load("_looksLikeServiceCommand");
+  // 最终触发谓词：跟 run_cmd 分支里一致（剥出内层命令 && 内层是服务型）。
+  const timeoutWrappedService = (cmd) => {
+    const inner = stripTimeout(cmd);
+    return !!inner && looksLikeService(inner);
+  };
+
+  // ---- _stripTimeoutWrapper：剥离各种 timeout 形式，取出内层命令 ----
+  assert.equal(stripTimeout("timeout 30 npm run dev"), "npm run dev");
+  assert.equal(stripTimeout("gtimeout 20 pnpm dev"), "pnpm dev");
+  assert.equal(stripTimeout("timeout 5s npm run dev"), "npm run dev", "时长可带 s/m/h/d 后缀");
+  assert.equal(stripTimeout("timeout -k 5 20 pnpm dev"), "pnpm dev", "-k 带独立取值，要多吃一个 token");
+  assert.equal(stripTimeout("gtimeout -s TERM 30 npm run dev"), "npm run dev", "-s 带独立取值");
+  assert.equal(stripTimeout("timeout --preserve-status 30 npm run dev"), "npm run dev", "无值开关");
+  assert.equal(stripTimeout("timeout --kill-after=5 30 npm run dev"), "npm run dev", "等号形式不额外吃 token");
+  // 非 timeout 包装 / 不成形 → 不剥离（返回 ""）
+  assert.equal(stripTimeout("npm run dev"), "", "裸命令不是 timeout 包装");
+  assert.equal(stripTimeout("echo timeout 30 npm run dev"), "", "timeout 不在首位不算包装");
+  assert.equal(stripTimeout("timeout npm run dev"), "", "缺时长位→不成形，不剥离");
+
+  // ---- 触发矩阵：timeout 包住服务型命令才触发 ----
+  assert.equal(timeoutWrappedService("timeout 30 npm run dev"), true);
+  assert.equal(timeoutWrappedService("gtimeout -k 5 20 pnpm dev"), true);
+  // 不误伤：timeout 包住 test/build/curl/sleep 等非服务命令
+  assert.equal(timeoutWrappedService("timeout 30 npm test"), false, "test 不是服务型");
+  assert.equal(timeoutWrappedService("timeout 30 npm run build"), false, "build 不是服务型");
+  assert.equal(timeoutWrappedService("timeout 5 sleep 1"), false, "sleep 不是服务型");
+  assert.equal(timeoutWrappedService("timeout 10 curl http://localhost:3000"), false, "curl 不是服务型");
+  // 裸 npm run dev（无 timeout）不走新分支，交给既有长命令门
+  assert.equal(timeoutWrappedService("npm run dev"), false, "裸命令不归新分支，由既有 isLongRunning 门拦");
+
+  // ---- 无回归：裸 npm run dev 仍被既有 _srvRe 长命令门拦住 ----
+  // 直接从 source 取出真实的 _srvRe 字面量（它是 run_cmd 分支内的局部 const，无法 load）
+  const srvReM = SRC.match(/const _srvRe = (\/.*?\/i);/);
+  assert.ok(srvReM, "main.js 中应保留 _srvRe 长命令判定正则");
+  const srvRe = eval(srvReM[1]);
+  const isLongRunning = (cmd) => {
+    const backgrounded = /\bnohup\b/i.test(cmd) || /\s&(\s|$)/.test(cmd) || (/\bstart\b/i.test(cmd) && /\s\/b\b/i.test(cmd));
+    return !backgrounded && srvRe.test(cmd);
+  };
+  assert.equal(isLongRunning("npm run dev"), true, "裸 npm run dev 仍被既有长命令门拦（无回归）");
+  assert.equal(isLongRunning("timeout 30 npm test"), false, "timeout 包 test 不被长命令门误拦");
+
+  // ---- source 结构：新分支接入 run_cmd、位于 isLongRunning 之前、复用 #9 判定 ----
+  const idxTimeout = SRC.indexOf("} else if (timeoutWrappedService) {");
+  const idxLong = SRC.indexOf("} else if (isLongRunning) {");
+  assert.ok(idxTimeout > 0, "run_cmd 分支应接入 timeoutWrappedService");
+  assert.ok(idxLong > 0, "isLongRunning 分支应保留");
+  assert.ok(idxTimeout < idxLong, "timeoutWrappedService 分支必须在 isLongRunning 之前，否则被它遮蔽");
+  assert.match(SRC, /const timeoutWrappedService = !!_innerAfterTimeout && _looksLikeServiceCommand\(_innerAfterTimeout\);/,
+    "必须复用 #9 的 _looksLikeServiceCommand，不重造判定");
+  assert.match(SRC, /\[工具选择\][^"]*run_in_terminal/, "引导文案必须指向 run_in_terminal");
+});
+
 test("probe-loop detection: blind guess-and-check probing triggers a root-cause checkpoint", () => {
   const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
   const isPureExploreCommand = load("_isPureExploreCommand", {
