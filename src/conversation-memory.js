@@ -795,6 +795,15 @@ export class ConversationMemory {
         : 'system';
       const text = clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
       if (text) lines.push(`[${role}] ${text}`);
+      // 思考结论优先保留：助手消息尾部的〔推理摘要〕段被上面的 520 字截断裁掉时，
+      // 补一条独立结论行（≤400 字），跨压缩边界仍能"接着想"而不是重新推导
+      //（与 main.js 的 _thinkLedger 同一条治理线）。
+      if (role === 'assistant' && typeof msg?.content === 'string') {
+        const reasoningAt = msg.content.indexOf('〔推理摘要〕');
+        if (reasoningAt >= 0 && !text.includes('〔推理摘要〕')) {
+          lines.push(`[assistant·推理结论] ${clean(msg.content.slice(reasoningAt), 400)}`);
+        }
+      }
       const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
       if (attachments.length) {
         const kinds = attachments.map((a) => a?.kind || "media").slice(0, 4).join(", ");

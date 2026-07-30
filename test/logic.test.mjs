@@ -3857,7 +3857,10 @@ test("model request budget drops older media before the current visual turn", ()
 });
 
 test("model request budget bounds a 13 MiB historical tool call without breaking its result pair", () => {
-  const enforce = load("_enforceModelRequestBudget");
+  const headTailForBudget = load("_headTailModelText");
+  const hasErrorLineForBudget = load("_hasErrorLine");
+  const clipForBudget = load("_clipPreservingErrors", { _headTailModelText: headTailForBudget, _hasErrorLine: hasErrorLineForBudget });
+  const enforce = load("_enforceModelRequestBudget", { _hasErrorLine: hasErrorLineForBudget, _clipPreservingErrors: clipForBudget });
   const originalArguments = JSON.stringify({ path: "src/generated.js", content: "A".repeat(13 * 1024 * 1024) });
   const originalEditArguments = JSON.stringify({
     path: "src/existing.js",
@@ -9443,7 +9446,12 @@ test("typed runtime and external evidence stays separate from workspace mutation
     _toolExecutionSucceeded: succeeded,
     _runtimeCommandKinds: runtimeKinds,
   });
-  const executionEvidence = load("_executionEvidenceFromTool");
+  const executionEvidence = load("_executionEvidenceFromTool", {
+    _clipPreservingErrors: load("_clipPreservingErrors", {
+      _headTailModelText: load("_headTailModelText"),
+      _hasErrorLine: load("_hasErrorLine"),
+    }),
+  });
   const needsSemanticReview = load("_runtimeNeedsSemanticReview", {
     _executionEvidenceFromTool: executionEvidence,
   });
@@ -12787,9 +12795,11 @@ test("terminal evidence preserves structured status and the final log state with
   const stripAnsi = load("_stripAnsi");
   const bound = load("_headTailModelText");
   assert.equal(bound("must not leak when no budget remains", 0), "");
+  const clip = load("_clipPreservingErrors", { _headTailModelText: bound, _hasErrorLine: load("_hasErrorLine") });
   const executionForModel = load("_executionToolResultForModel", {
     _stripAnsi: stripAnsi,
     _headTailModelText: bound,
+    _clipPreservingErrors: clip,
   });
   const stdout = `boot sequence\n${"middle-log\n".repeat(900)}FINAL_RESULT artifact_count=0`;
   const stderr = `diagnostic start\n${"detail\n".repeat(700)}FINAL STDERR: requested artifact was not created`;
@@ -12813,6 +12823,7 @@ test("terminal evidence preserves structured status and the final log state with
   const modelMessage = load("_toolMsgForModel", {
     _toolResultToString: () => rendered,
     _headTailModelText: bound,
+    _clipPreservingErrors: clip,
   })({ type: "cmd" }, { type: "cmd" });
   assert.ok(modelMessage.length <= 8000);
   assert.match(modelMessage, /FINAL STDERR: requested artifact was not created/,
@@ -13326,4 +13337,203 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   assert.ok(SRC.includes("const _draft = await _streamDraftTake()"), "恢复路径必须 await 双通道草稿");
   assert.ok(SRC.includes("此回复在生成途中因软件重启被打断，以下为已生成的部分）\\n\\n${_draft.text}") || /以下为已生成的部分）[\s\S]{0,40}_draft\.text/.test(SRC),
     "中断恢复必须把草稿全文（_draft.text 不截断）补进历史");
+});
+
+// ---- 深度思考质量修复（方案 A+B+E） ----------------------------------------------
+
+test("方案B/E：_clipPreservingErrors 裁剪时豁免保留被裁中段的错误关键行", () => {
+  const headTail = load("_headTailModelText");
+  const hasErr = load("_hasErrorLine");
+  const clip = load("_clipPreservingErrors", { _headTailModelText: headTail, _hasErrorLine: hasErr });
+  // 预算内放得下 → 原样返回，零行为变化
+  assert.equal(clip("short output", 1000), "short output");
+  assert.equal(clip("", 1000), "");
+  assert.equal(clip("must not leak", 0), "");
+  // 错误行埋在巨量噪声的正中间（对折必裁区）→ 必须连同前后各 1 行上下文被追回
+  const noise = "compiling module step\n".repeat(400);
+  const errLine = "Error: ENOENT: no such file or directory, open '/repo/src/missing.js'";
+  const middleErr = noise + "unique context before\n" + errLine + "\nunique context after\n" + noise;
+  const clipped = clip(middleErr, 2000);
+  assert.ok(clipped.includes(errLine), "被裁中段的错误关键行必须豁免保留");
+  assert.ok(clipped.includes("unique context before") && clipped.includes("unique context after"),
+    "错误行前后各 1 行上下文一起保留");
+  assert.ok(clipped.includes("截断豁免"), "追回内容要标明来自被省略的中段");
+  assert.ok(clipped.length <= 2000 + 200, "豁免块不得反过来撑爆预算");
+  // 错误行本来就在尾部存活 → 不重复追回，不出现豁免块
+  const tailErr = noise + errLine;
+  const clipped2 = clip(tailErr, 3000);
+  assert.ok(clipped2.includes(errLine));
+  assert.ok(!clipped2.includes("截断豁免"), "头/尾里已存活的错误行不得重复追回");
+  // 豁免总量硬上限：满屏都是错误行时从尾部优先，不超 2KB 且不超预算一半
+  const allErrors = Array.from({ length: 500 }, (_, i) => `Error: E${100 + (i % 900)} step ${i} failed`).join("\n");
+  const clipped3 = clip(allErrors, 4000);
+  assert.ok(clipped3.length <= 4000 + 200);
+  assert.ok(clipped3.includes("step 499"), "靠后的错误离最终状态最近，必须优先保留");
+  // 两处复用同一个 helper，不写两套（方案 E 的收尾件）
+  assert.ok(SRC.includes("stdout: _clipPreservingErrors(output, 12000)"), "执行证据 12KB 截断必须走错误豁免出口");
+  assert.ok(SRC.includes("stderr: _clipPreservingErrors(error, 12000)"));
+  assert.match(SRC, /content: _clipPreservingErrors\(content, 1300\)/, "长消息对折必须走错误豁免出口");
+  assert.doesNotMatch(SRC, /stdout: output\.slice\(-12000\)/, "旧的纯尾截写法必须下线");
+});
+
+test("方案B：最新一条带报错的工具结果豁免对折，旧的普通长输出照常折叠", () => {
+  const headTail = load("_headTailModelText");
+  const hasErr = load("_hasErrorLine");
+  const clip = load("_clipPreservingErrors", { _headTailModelText: headTail, _hasErrorLine: hasErr });
+  const enforce = load("_enforceModelRequestBudget", { _hasErrorLine: hasErr, _clipPreservingErrors: clip });
+  const oldNoise = "historic tool output line\n".repeat(320);
+  const errBody = "$ npm run build\n" + "bundling assets step\n".repeat(110)
+    + "Error: EACCES: permission denied, open '/repo/dist/app.js'\n    at Object.openSync (node:fs:601:3)";
+  const longPreamble = "requirement detail line\n".repeat(210) + "tail of the preamble";
+  const messages = [
+    { role: "system", content: "keep protocol" },
+    { role: "user", content: "build it" },
+    { role: "tool", tool_call_id: "t1", content: oldNoise },
+    { role: "tool", tool_call_id: "t2", content: errBody },
+    { role: "user", content: longPreamble },
+    { role: "user", content: "why did it fail?" },
+  ];
+  const prepared = enforce(messages, [], 7000);
+  assert.equal(prepared[3].content, errBody,
+    "模型即将思考的最新报错必须全量在场，不得二次裁剪/对折");
+  assert.ok(prepared[2].content.length < oldNoise.length, "旧的普通长输出照常折叠，豁免总量不失控");
+  assert.ok(prepared[4].content.length < longPreamble.length, "非报错的长消息不享受豁免");
+  assert.equal(messages[3].content, errBody, "请求副本裁剪不得污染会话内存");
+});
+
+test("方案A：思考结论提取规则——取收尾决策句、兜底末段、空轮不入账", () => {
+  const extract = load("_extractThinkingConclusion");
+  // 空/极短思考轮不入账
+  assert.equal(extract(""), "");
+  assert.equal(extract("想了一下，没什么好说的。"), "");
+  // 收尾段落里含决策词的句子被提取，前面的探索噪声不进摘要
+  const think = [
+    "先看看项目结构，逐个读取入口文件，确认消息组装链路在哪里。" + "中间排查过程很长。".repeat(20),
+    "对比了三种实现路径，各有取舍，还看了一些无关的工具代码。",
+    "根因是消息在对折时把报错行裁掉了。因此决定新增统一裁剪出口。最终方案是错误行豁免保留且预算封顶。",
+  ].join("\n\n");
+  const conclusion = extract(think);
+  assert.ok(conclusion.includes("因此决定新增统一裁剪出口"), "决策性语句必须进摘要");
+  assert.ok(conclusion.includes("根因是消息在对折时把报错行裁掉了"), "根因句必须进摘要");
+  assert.ok(!conclusion.includes("先看看项目结构"), "探索噪声不进摘要");
+  assert.ok(conclusion.length <= 400, "提取上限 400 字（token 经济）");
+  // 无决策词 → 兜底取末段
+  const plain = "前面在梳理代码结构，看了很多文件。".repeat(4) + "\n\n" + "末段描述了当前的实现状态与下一步计划。";
+  assert.ok(extract(plain).includes("末段描述了当前的实现状态"), "无决策词时兜底取末段");
+  // 超长决策段落也被封顶到 400
+  const huge = "因此决定采用分层缓存方案处理这个问题。".repeat(60);
+  assert.ok(extract(huge).length <= 400);
+});
+
+test("方案A：_thinkLedger FIFO 上限 6 条，注入块格式与 400 字硬约束", () => {
+  const push = load("_thinkLedgerPush");
+  const blockText = load("_thinkLedgerBlockText");
+  // FIFO：第 7/8 条入账时最旧的被淘汰
+  const sess = {};
+  for (let i = 1; i <= 8; i++) push(sess, `结论 ${i}：采用方案 ${i}`, i);
+  assert.equal(sess._thinkLedger.length, 6);
+  assert.equal(sess._thinkLedger[0].summary, "结论 3：采用方案 3");
+  assert.equal(sess._thinkLedger[5].summary, "结论 8：采用方案 8");
+  assert.equal(sess._thinkLedger[5].turn, 8);
+  // 每条 ≤400 字；空摘要不入账
+  push(sess, "长".repeat(900), 9);
+  assert.equal(sess._thinkLedger[5].summary.length, 400);
+  push(sess, "   ", 10);
+  assert.equal(sess._thinkLedger.length, 6);
+  // 注入格式：固定前缀 + 编号清单；空账本不注入
+  assert.equal(blockText([]), "");
+  assert.equal(blockText(null), "");
+  const block = blockText([{ turn: 1, summary: "结论A" }, { turn: 2, summary: "结论B" }]);
+  assert.ok(block.startsWith("【上轮思考结论（参考，勿重新推导已定结论"), "注入块前缀必须明确告知接着想而不是重想");
+  assert.match(block, /1\. 结论A\n2\. 结论B/);
+  // 每轮注入总量硬约束 ≤400 字：长条目时只保最新，旧的放弃（不滥注）
+  const big = [1, 2, 3].map((i) => ({ turn: i, summary: `第${i}条`.padEnd(400, "长") }));
+  const bigBlock = blockText(big);
+  assert.ok(bigBlock.includes("第3条"), "最新一条永远在场");
+  assert.ok(!bigBlock.includes("第1条") && !bigBlock.includes("第2条"), "装不下的旧结论放弃，总量不超 400 字");
+  // 接线自查：动态前导注入、运行收尾入账、跨重启持久化三段都在
+  assert.match(SRC, /_demandLedgerBlock \+\n\s*_thinkLedgerBlock \+/, "思考结论块必须进当轮动态前导（不碰历史前缀缓存）");
+  assert.ok(SRC.includes("_thinkLedgerPush(session, _extractThinkingConclusion(reasoningAll)"),
+    "agent 运行收尾必须把本轮思考结论沉淀进账本");
+  assert.ok(SRC.includes("sData.thinks") && /thinks: Array\.isArray\(session\?\._thinkLedger\)/.test(SRC),
+    "思考结论账本必须跨重启存活（同 _demandLedger 通道）");
+});
+
+test("方案A：会话压缩时〔推理摘要〕结论行优先保留，不被 520 字截断后丢弃", () => {
+  const mem = new ConversationMemory();
+  const longBody = "实现叙述与改动清单。".repeat(120);
+  const record = `${longBody}\n\n〔推理摘要〕根因是对折裁掉了报错行，因此决定统一裁剪出口。`;
+  const summary = mem._summarizeBatch([
+    { role: "user", content: "修复深度思考质量" },
+    { role: "assistant", content: record },
+  ]);
+  assert.ok(summary.includes("[assistant·推理结论]"), "被截断裁掉的推理摘要段必须补独立结论行");
+  assert.ok(summary.includes("根因是对折裁掉了报错行"), "结论内容跨压缩边界存活");
+  // 推理摘要已在 520 字窗口内 → 不重复补行
+  const shortRecord = `简短叙述。\n\n〔推理摘要〕结论已在窗口内。`;
+  const summary2 = mem._summarizeBatch([{ role: "assistant", content: shortRecord }]);
+  assert.ok(!summary2.includes("[assistant·推理结论]"), "窗口内已存活的摘要不重复补行");
+});
+
+test("方案C：验收契约块——格式、500 字硬上限、空清单不注入、超量保留靠前条目", () => {
+  const block = load("_acceptanceContractBlock");
+  assert.equal(block([]), "");
+  assert.equal(block(null), "");
+  assert.equal(block(["  ", ""]), "", "全空白条目不产出空契约");
+  const out = block(["实现登录接口", "补聚焦测试"]);
+  assert.ok(out.startsWith("【本任务验收契约（思考与收尾都对照此清单）】"), "契约块固定前缀：思考与收尾共用同一张清单");
+  assert.match(out, /1\. 实现登录接口\n2\. 补聚焦测试/);
+  assert.ok(out.includes("未满足的条目不得声称完成"), "尾注必须把自检义务说死");
+  assert.ok(out.length <= 500);
+  // 10 条 ×230+ 字（需求抽取每条上限 240）→ 超预算：保留靠前条目，总量仍 ≤500
+  const big = Array.from({ length: 10 }, (_, i) => `需求${i + 1}：` + "细".repeat(230));
+  const bigOut = block(big);
+  assert.ok(bigOut.length <= 500, "契约块 500 字硬上限（token 经济）");
+  assert.ok(bigOut.includes("需求1"), "靠前条目优先保留");
+  assert.ok(!bigOut.includes("需求3"), "装不下的靠后条目放弃，不挤爆预算");
+  // \r\n 免疫：CRLF 输入不把回车带进契约
+  assert.ok(!block(["第一条\r\n带回车"]).includes("\r"));
+  // 接线自查：run 开工一次性注入（run 标记防重复）+ 收尾评审对照（已有需求数据时不重复注入）
+  assert.match(SRC, /if \(isAgent && !run\._acceptanceContractInjected && !_quick\(\)\)/,
+    "契约每 run 只注一次，轻量任务不注");
+  assert.match(SRC, /run\._acceptanceContractInjected = true;\s*\n\s*messages\.push\(\{ role: "user", content: _ORCH_NOTE \+ _contractBlock \}\)/,
+    "契约进本 run 消息流（编排信封），不动 system 静态前缀");
+  assert.match(SRC, /contract: _critPadText\.includes\("原始需求清单"\) \? "" : _acceptanceContractBlock\(run\._requirementsChecklist\)/,
+    "收尾评审拿同一份契约对照；草稿纸已带需求清单时不重复注入");
+  assert.match(extractFn("_wrapUpCritic"), /contract = ""/, "评审函数契约参数默认空，旧调用不受影响");
+});
+
+test("方案D：布尔思考开关模型诚实两态——能力表驱动，不渲染 low/medium/high 假档位", () => {
+  const profileFor = load("_thinkingProfileFor", {
+    _isImageModel: () => false,
+    t: (key) => key,
+  });
+  // GLM-4.5+/5.x：kimi-toggle 布尔开关 + booleanToggle 能力位 + 只有开/关两档
+  const glm = profileFor("glm-5");
+  assert.equal(glm.kind, "kimi-toggle");
+  assert.equal(glm.booleanToggle, true, "能力表必须声明布尔开关事实");
+  assert.deepEqual(glm.levels, ["off", "high"], "不得暴露 low/medium/high 伪档位");
+  assert.equal(glm.labels.high, "model.thinking.level.enabled", "开态按钮显示「开启」而不是「高」");
+  assert.equal(glm.hint, "model.thinking.reason.glmToggleHint", "说明文案如实：仅开/关，深度档位不生效");
+  // Kimi K2.5/K2.6 同为布尔开关
+  const kimi = profileFor("kimi-k2.5");
+  assert.equal(kimi.booleanToggle, true);
+  assert.deepEqual(kimi.levels, ["off", "high"]);
+  // 真档位模型（Claude/GPT/Gemini）保持现状，不被误伤
+  const claude = profileFor("claude-sonnet-5");
+  assert.ok(!claude.booleanToggle);
+  assert.deepEqual(claude.levels, ["off", "low", "medium", "high", "max"]);
+  const gpt = profileFor("gpt-5.6");
+  assert.ok(!gpt.booleanToggle && gpt.levels.includes("medium"));
+  const gemini = profileFor("gemini-3-pro");
+  assert.ok(!gemini.booleanToggle && gemini.levels.includes("medium"));
+  // 渲染层由能力位驱动（不散落模型名）：标题换「思考（仅开/关）」，非 off 档 tip 用能力说明
+  assert.match(SRC, /const _boolToggle = !!profile\.booleanToggle \|\| profile\.kind === "kimi-toggle";/);
+  assert.match(SRC, /t\(_boolToggle \? "model\.thinkingToggle" : "model\.thinkingDepth"\)/,
+    "布尔模型的选择器标题不得写「思考深度」");
+  assert.match(SRC, /_boolToggle && lvl !== "off" \? \(profile\.hint \|\| t\("model\.thinking\.level\.enabled"\)\) : _thinkTip\(lvl\)/,
+    "布尔模型不给「深度推理」档位话术 tip");
+  // i18n 双语文案就位（en + zh）
+  assert.equal((I18N.match(/"model\.thinking\.reason\.glmToggleHint"/g) || []).length, 2);
+  assert.equal((I18N.match(/"model\.thinkingToggle"/g) || []).length, 2);
 });
