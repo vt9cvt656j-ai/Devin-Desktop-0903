@@ -1121,7 +1121,7 @@ pub fn kill_orphaned_browsers() {
                     .output();
             }
             if !pids.is_empty() {
-                eprintln!(
+                crate::elog!(
                     "[browser] killed {} orphaned Chrome process(es)",
                     pids.len()
                 );

@@ -5935,6 +5935,13 @@ body.zen-mode .editor {
   color: var(--text-dim); font-size: 11.5px; text-align: center;
 }
 .agent-plan__page, .agent-plan__page-spacer { width: 26px; height: 24px; }
+/* 折叠行整行是一个真 <button>（展开/收起切换）：重置原生按钮外观，保留 fold 的网格布局 */
+button.agent-plan__fold--toggle {
+  width: 100%; margin: 0; border: 0; background: transparent;
+  font: inherit; color: var(--text-dim); cursor: pointer; text-align: center;
+}
+button.agent-plan__fold--toggle:hover { color: var(--text); background: rgba(128, 128, 128, 0.07); }
+button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outline-offset: -2px; border-radius: 6px; }
 .agent-plan__page {
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: 6px; background: transparent; color: var(--text-dim); cursor: pointer;

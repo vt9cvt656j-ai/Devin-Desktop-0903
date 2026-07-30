@@ -1093,10 +1093,184 @@ test("empty workspaces stop local file probing but still allow external search",
   const executeSource = extractFn("_executeToolStep");
   assert.match(executeSource, /await _refreshEmptyRootBeforeSkip\(run, root\)/,
     "tool execution must re-check the real directory before blocking reads as empty");
+  assert.match(executeSource, /_emptyRootSkipMessage\(run, root, call\) \|\| _emptyExploreSkipMessage\(run, root, call\)/,
+    "the empty-root gate must also cover the list/cmd explore short-circuit (cmd used to bypass it entirely)");
   assert.match(executeSource, /_clearRunEmptyRoot\(run, ws\);[\s\S]{0,120}refreshProjectCaches\(ws, "网站脚手架完成"\)/,
     "web scaffold should invalidate stale empty-root state before continuing");
   assert.match(executeSource, /_workspaceChangedByCommand[\s\S]{0,120}_clearRunEmptyRoot\(run, root \|\| rootPath\)/,
     "successful workspace-mutating commands should invalidate stale empty-root state");
+});
+
+test("empty-root explore short-circuit: first probe passes, repeats and shell scans are skipped", () => {
+  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const isPureExploreCommand = load("_isPureExploreCommand", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+  });
+  // 纯探索命令识别：宁可漏拦不可误拦
+  assert.equal(isPureExploreCommand("find . -not -path '*/node_modules/*' -type f", "/repo"), true);
+  assert.equal(isPureExploreCommand("ls -la", "/repo"), true);
+  assert.equal(isPureExploreCommand("find . -type f | wc -l", "/repo"), true);
+  assert.equal(isPureExploreCommand("tree -L 2 && du -sh .", "/repo"), true);
+  assert.equal(isPureExploreCommand("npm create vite@latest .", "/repo"), false,
+    "scaffold commands must NEVER be short-circuited");
+  assert.equal(isPureExploreCommand("git init", "/repo"), false);
+  assert.equal(isPureExploreCommand("find . -type f -delete", "/repo"), false, "find -delete writes");
+  assert.equal(isPureExploreCommand("find . -name x -exec rm {} +", "/repo"), false);
+  assert.equal(isPureExploreCommand("ls > files.txt", "/repo"), false, "redirection writes");
+  assert.equal(isPureExploreCommand("mkdir src", "/repo"), false);
+  assert.equal(isPureExploreCommand("find /etc -name hosts", "/repo"), false,
+    "absolute paths outside the workspace are not covered by the empty-root fact");
+  assert.equal(isPureExploreCommand("ls ~/Desktop", "/repo"), false);
+  assert.equal(isPureExploreCommand("grep -r TODO /repo/src", "/repo"), true,
+    "absolute paths inside the empty workspace stay covered");
+
+  const emptyExploreSkipMessage = load("_emptyExploreSkipMessage", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIdentity: PATH_IDENTITY,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+    _isPureExploreCommand: isPureExploreCommand,
+  });
+  const run = { _emptyRootAtStart: true, _emptyWorkspaceRoots: new Set(["/repo"]), _emptyExploreCount: 0 };
+  // 第 1 次 list 放行（真实执行取证），第 2 次起短路
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "list", path: "" }), "");
+  assert.match(emptyExploreSkipMessage(run, "/repo", { type: "list", path: "." }), /空目录·已确认/);
+  // 探索型 shell 命令同样短路（截图实证的 cmd 绕路封堵）
+  assert.match(emptyExploreSkipMessage(run, "/repo", { type: "cmd", command: "find . -not -path '*/node_modules/*' -type f" }), /空目录·已确认/);
+  // 脚手架/写入命令绝不拦
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "cmd", command: "npm create vite@latest ." }), "");
+  // 写类型工具不归这里管
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "write", path: "index.html" }), "");
+  // 列工作区外的目录不拦
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "list", path: "/tmp" }), "");
+  // 解除条件①：本 run 已有写操作（run._didMutate 事实）立即停止短路
+  run._didMutate = true;
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "list", path: "." }), "");
+  run._didMutate = false;
+  // 解除条件②：空根登记被清（write → _clearRunEmptyRoot / 磁盘重探非空）后停止短路
+  run._emptyWorkspaceRoots.clear();
+  assert.equal(emptyExploreSkipMessage(run, "/repo", { type: "list", path: "." }), "");
+  // 非空目录起步的正常项目完全不受影响（没有 _emptyRootAtStart 门）
+  const normalRun = { _emptyWorkspaceRoots: new Set(["/repo"]), _emptyExploreCount: 5 };
+  assert.equal(emptyExploreSkipMessage(normalRun, "/repo", { type: "list", path: "." }), "");
+  assert.equal(emptyExploreSkipMessage(normalRun, "/repo", { type: "cmd", command: "ls -la" }), "");
+});
+
+test("probe-loop detection: blind guess-and-check probing triggers a root-cause checkpoint", () => {
+  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const isPureExploreCommand = load("_isPureExploreCommand", {
+    _normalizeFsPath: NORMALIZE_PATH,
+    _pathIsAtOrUnder: pathIsAtOrUnder,
+  });
+  // #28 词表补充：cat/head/tail/which 也是纯读探测
+  assert.equal(isPureExploreCommand("cat node_modules/electron/path.txt", "/repo"), true);
+  assert.equal(isPureExploreCommand("head -n 20 package.json", "/repo"), true);
+  assert.equal(isPureExploreCommand("tail -n 50 npm-debug.log", "/repo"), true);
+  assert.equal(isPureExploreCommand("which electron", "/repo"), true);
+  assert.equal(isPureExploreCommand("cat a.txt > b.txt", "/repo"), false, "redirection still writes");
+
+  const isProbeToolCall = load("_isProbeToolCall", { _isPureExploreCommand: isPureExploreCommand });
+  assert.equal(isProbeToolCall({ type: "read", path: "a.js" }, "/repo"), true);
+  assert.equal(isProbeToolCall({ type: "list", path: "." }, "/repo"), true);
+  assert.equal(isProbeToolCall({ type: "cmd", command: "ls node_modules/electron" }, "/repo"), true);
+  assert.equal(isProbeToolCall({ type: "cmd", command: "node install.js" }, "/repo"), false, "running scripts is not probing");
+  assert.equal(isProbeToolCall({ type: "write", path: "a.js" }, "/repo"), false);
+  assert.equal(isProbeToolCall({ type: "websearch", query: "electron mirror" }, "/repo"), false,
+    "web_search is the encouraged way out, never counted as spinning");
+
+  const probeLoopNudgeMessage = load("_probeLoopNudgeMessage");
+  const mkBatch = (over = {}) => ({
+    calls: 2, allProbe: true, mutTick: 0, fails: 0,
+    entries: [
+      { tool: "run_cmd", argsSummary: "ls node_modules/electron/path.txt", ok: false },
+      { tool: "read_file", argsSummary: "package.json", ok: true },
+    ],
+    ...over,
+  });
+
+  // ① 4 个连续探测批次 + 零 mutation + 窗口内 ≥2 次失败 → 触发
+  const run = {};
+  assert.equal(probeLoopNudgeMessage(run, mkBatch({ fails: 1 })), "");
+  assert.equal(probeLoopNudgeMessage(run, mkBatch({ fails: 1 })), "");
+  assert.equal(probeLoopNudgeMessage(run, mkBatch()), "");
+  const msg = probeLoopNudgeMessage(run, mkBatch());
+  assert.match(msg, /根因检查点/);
+  assert.match(msg, /连续 4 个回合只做探测/);
+  assert.match(msg, /ls node_modules\/electron\/path\.txt ✗/, "事实清单带 工具+参数摘要+✓\/✗");
+  assert.match(msg, /package\.json ✓/);
+  assert.match(msg, /根因假设/);
+  assert.match(msg, /web_search/, "安装\/下载\/网络类故障引向先查已知解法");
+  assert.equal(run._probeLoopNudges, 1);
+  // 触发后清窗：紧跟的下一批不会立即复触发
+  assert.equal(probeLoopNudgeMessage(run, mkBatch({ fails: 2 })), "");
+
+  // ② 期间有 mutation（mutTick 变化）→ 不触发
+  const mutRun = {};
+  assert.equal(probeLoopNudgeMessage(mutRun, mkBatch({ fails: 1, mutTick: 0 })), "");
+  assert.equal(probeLoopNudgeMessage(mutRun, mkBatch({ fails: 1, mutTick: 0 })), "");
+  assert.equal(probeLoopNudgeMessage(mutRun, mkBatch({ fails: 1, mutTick: 1 })), "");
+  assert.equal(probeLoopNudgeMessage(mutRun, mkBatch({ fails: 1, mutTick: 1 })), "",
+    "a mutation inside the window means real progress, no nudge");
+
+  // ③ 非探测批次（写/改/构建）打断连续性 → 窗口重计
+  const brokenRun = {};
+  assert.equal(probeLoopNudgeMessage(brokenRun, mkBatch({ fails: 2 })), "");
+  assert.equal(probeLoopNudgeMessage(brokenRun, mkBatch({ fails: 2 })), "");
+  assert.equal(probeLoopNudgeMessage(brokenRun, mkBatch({ allProbe: false })), "");
+  assert.equal(probeLoopNudgeMessage(brokenRun, mkBatch({ fails: 2 })), "");
+  assert.equal(probeLoopNudgeMessage(brokenRun, mkBatch({ fails: 2 })), "", "window restarted after a non-probe batch");
+
+  // ④ 失败不够（<2）→ 正常的纯阅读式探索不打扰
+  const healthyRun = {};
+  for (let i = 0; i < 6; i++) assert.equal(probeLoopNudgeMessage(healthyRun, mkBatch({ fails: 0 })), "");
+  assert.equal(healthyRun._probeLoopNudges || 0, 0);
+
+  // ⑤ 每 run 上限 2 次
+  const cappedRun = {};
+  const fire = () => {
+    let out = "";
+    for (let i = 0; i < 4; i++) out = probeLoopNudgeMessage(cappedRun, mkBatch({ fails: 1 }));
+    return out;
+  };
+  assert.match(fire(), /根因检查点/);
+  assert.match(fire(), /根因检查点/);
+  assert.equal(fire(), "", "capped at 2 nudges per run");
+  assert.equal(cappedRun._probeLoopNudges, 2);
+
+  // 接线自查：主循环按批次记账、同批 stuck 让行、nudge key 专用不与既有门禁撞车
+  assert.match(SRC, /if \(items\.length && !_stuckNudgedNow && _live\(\)\)/,
+    "probe-loop check must yield when the stuck gate already fired this batch");
+  assert.match(SRC, /_pushNudge\("probeLoop", _probeMsg\)/);
+  assert.match(SRC, /mutTick: \(run\._fsMutTick \|\| 0\) \+ _implOps/,
+    "zero-mutation fact must come from the real mutation ticks");
+});
+
+test("slow install/download commands get a factual duration note (no interception)", () => {
+  const slowNote = load("_slowInstallCmdNote");
+  // 截图实证场景：node install.js 挂 173s
+  const note = slowNote("node install.js", 173000);
+  assert.match(note, /耗时异常 \(173s\)/);
+  assert.match(note, /镜像源/);
+  assert.match(note, /web_search/);
+  assert.match(slowNote("npm install electron", 61000), /耗时异常 \(61s\)/);
+  assert.match(slowNote("pnpm add playwright --save-dev", 90000), /镜像源/);
+  assert.match(slowNote("curl -LO https://github.com/x/releases/download/v1/tool.tar.gz", 999000), /镜像源|代理/, "download-like keyword");
+  // 60s 以内不打扰
+  assert.equal(slowNote("npm install", 30000), "");
+  assert.equal(slowNote("npm install", 60000), "", "boundary: exactly 60s stays silent");
+  // 非安装类慢命令（测试/构建）不打扰
+  assert.equal(slowNote("node --test test/logic.test.mjs", 120000), "");
+  assert.equal(slowNote("npm run build", 300000), "");
+  assert.equal(slowNote("", 999000), "");
+
+  // 接线自查：cmd 执行路径真实计时并把附注追加到返回模型的结果文本
+  const executeSource = extractFn("_executeToolStep");
+  assert.match(executeSource, /const _cmdStartedAt = Date\.now\(\)/,
+    "cmd execution must capture a real start timestamp");
+  assert.match(executeSource, /_slowInstallCmdNote\(call\.command, Date\.now\(\) - _cmdStartedAt\)/,
+    "the factual note must use the real elapsed duration incl. auto-retry");
+  assert.match(executeSource, /if \(_slowNote\) _content \+= _slowNote/,
+    "the note is appended to the result text, never replacing it");
 });
 
 test("remote prompt bundles carry the empty-workspace stop rule", () => {
@@ -4400,6 +4574,7 @@ test("local discovery executor wires permission, coordinates, and address failur
     _approveToolCall: async () => true,
     _agentSideEffectIntentIssue: () => "",
     _emptyRootSkipMessage: () => "",
+    _emptyExploreSkipMessage: () => "",
     _normalizeLocalDiscoveryLocation: normalizeLocation,
     _requestCurrentCoordinates: requestLocation,
     _currentLocationFailurePresentation: presentation,
@@ -4520,6 +4695,7 @@ test("road executor visibly distinguishes delayed data and coarse current locati
     _approveToolCall: async () => true,
     _agentSideEffectIntentIssue: () => "",
     _emptyRootSkipMessage: () => "",
+    _emptyExploreSkipMessage: () => "",
     _isCurrentLocationRequest: isCurrent,
     _requestCurrentCoordinates: async () => ({
       status: "success", latitude: 49.89, longitude: -97.14, accuracyM: 2500,
@@ -7188,6 +7364,56 @@ test("large plans reveal progressively and never render more than six rows at on
     "the inline card must not map the complete plan into DOM rows");
 });
 
+test("plan fold expands via delegated toggle and the expanded state survives re-renders", () => {
+  const visibleWindow = load("_planVisibleWindow", {
+    _PLAN_MAX_RENDERED_STEPS: 6,
+    _planCurrentStepIndex: load("_planCurrentStepIndex"),
+  });
+  const steps = Array.from({ length: 10 }, (_, i) => ({
+    content: `step-${i + 1}`,
+    status: i === 0 ? "in_progress" : "pending",
+  }));
+
+  // 展开态：整单渲染，折叠计数归零
+  const run = { _planVisibleCount: 6, _planExpanded: true };
+  let view = visibleWindow(run, steps);
+  assert.equal(view.rows.length, 10);
+  assert.equal(view.before + view.after, 0);
+  assert.equal(view.expanded, true);
+  assert.equal(view.collapsible, true);
+
+  // 重渲染存活：agent 推进计划后（reveal 计数被改、步骤状态翻新）再次渲染仍是整单
+  run._planVisibleCount = 1;
+  const advanced = steps.map((s, i) => ({ ...s, status: i < 7 ? "completed" : s.status }));
+  view = visibleWindow(run, advanced);
+  assert.equal(view.rows.length, 10, "expanded view must survive streaming re-renders");
+
+  // 状态镜像在 session 上：换了 run 对象（如下一轮 agent 循环重建）也不丢
+  view = visibleWindow({ session: { _planExpanded: true } }, advanced);
+  assert.equal(view.rows.length, 10, "expanded state mirrored on the session must survive a rebuilt run");
+
+  // 收起：回到 ≤6 行紧凑窗口（折叠策略本身保留）
+  view = visibleWindow({ _planVisibleCount: 6, _planExpanded: false }, advanced);
+  assert.ok(view.rows.length <= 6);
+
+  // 控件结构：折叠态出「点击展开」按钮；展开态出「点击收起」；不足一窗时展开态无控件
+  const controls = load("_planWindowControlsHtml");
+  assert.match(controls({ before: 0, after: 4, expanded: false, collapsible: true, total: 10 }), /data-plan-expand="1"/);
+  assert.match(controls({ before: 0, after: 0, expanded: true, collapsible: true, total: 10 }), /data-plan-expand="0"/);
+  assert.equal(controls({ before: 0, after: 0, expanded: true, collapsible: false, total: 5 }), "",
+    "a fully visible plan must not offer a collapse control");
+
+  // 绑定方案：展开/收起必须走 document 级全局委托（同 think-card），不做逐元素绑定——
+  // 否则流式 innerHTML 重建/HTML 快照恢复后按钮点击无反应（本 bug 根因）
+  assert.match(SRC, /closest\("\.agent-plan__fold--toggle"\)/);
+  assert.doesNotMatch(extractFn("_bindPlanWindow"), /data-plan-expand|agent-plan__fold/,
+    "the fold toggle must not rely on per-element listeners");
+  assert.doesNotMatch(SRC, /_planWindowStart|_movePlanWindow|data-plan-window/,
+    "old paging arrows are gone \u2014 the fold row is a single expand/collapse toggle");
+  // agent 推进计划的重渲染路径不得清掉用户点开的展开态
+  assert.doesNotMatch(extractFn("_advancePlanFromTool"), /_planExpanded\s*=/);
+});
+
 test("agent outcome summary is rendered after plan settlement", () => {
   const summary = load("_buildAgentOutcomeSummary", {
     _agentIncompleteLabel: load("_agentIncompleteLabel"),
@@ -7217,16 +7443,42 @@ test("agent outcome summary is rendered after plan settlement", () => {
 test("agent next-step chips use completed run memory and survive suggestion failures", () => {
   const gen = load("_runStateNextActionSuggestions");
   const now = Date.now();
-  // 未完成轮 + 剩余计划步骤 → 精确的“继续”建议（来自真实运行状态，不是关键词堆）
-  const chips = gen({
-    _lastRunState: { outcome: "partial", task: "修复工具参数不全", result: "", incompleteReason: "iteration_limit", mutated: true, updatedAt: now },
-    _planSteps: [{ content: "核对 sourceUrl 数据契约", status: "pending" }, { content: "已完成项", status: "completed" }],
+  // **新版最多 3 个精确预测**:基于 failureCategory/mutatedFileTypes/runtimeEffects 等证据
+  // 场景 1:失败且有 failureCategory → 针对性修复建议
+  assert.ok(gen({ 
+    _lastRunState: { outcome: "failed", task: "x", mutated: false, updatedAt: now, failureCategory: "permission", lastError: "Permission denied" } 
+  }).some((c) => c.label === "修复permission类失败"));
+  // 场景 2:部分完成 → 显示已修改文件类型和数量
+  assert.ok(gen({ 
+    _lastRunState: { 
+      outcome: "partial", task: "修复工具参数不全", result: "", incompleteReason: "iteration_limit", 
+      mutatedFileCount: 3, mutatedFileTypes: new Set(["src", "config"]), updatedAt: now 
+    } 
+  }).some((c) => c.label === "继续完成剩余部分"));
+  // 场景 3:成功且有运行效果 → 提示验证
+  assert.ok(gen({ 
+    _lastRunState: { 
+      outcome: "success", task: "x", mutated: true, runtimeEffects: ["npm test", "build"], 
+      updatedAt: now 
+    } 
+  }).some((c) => c.label === "运行验证改动"));
+  // 场景 4:有计划 pending → 提示继续执行
+  assert.ok(gen({ 
+    _lastRunState: { 
+      outcome: "partial", planStepsStatus: { total: 5, completed: 2, pending: 3 }, 
+      updatedAt: now 
+    } 
+  }).some((c) => c.label.startsWith("继续执行计划")));
+  // 去重 + 切片至 3 个 (最多 3 个)
+  const allChips = gen({ 
+    _lastRunState: { 
+      outcome: "failed", failureCategory: "network", lastError: "timeout",
+      mutatedFileCount: 2, mutatedFileTypes: new Set(["src"]), runtimeEffects: [],
+      planStepsStatus: { total: 3, completed: 1, pending: 2 },
+      updatedAt: now 
+    } 
   });
-  assert.ok(chips.some((c) => c.label === "继续完成剩余部分"));
-  assert.ok(chips.some((c) => c.label.startsWith("继续：核对 sourceUrl")));
-  // 失败轮 → 排查根因；成功且改了文件 → 验证/复查
-  assert.ok(gen({ _lastRunState: { outcome: "failed", task: "x", mutated: false, updatedAt: now } }).some((c) => c.label === "排查失败根因"));
-  assert.ok(gen({ _lastRunState: { outcome: "success", task: "x", mutated: true, updatedAt: now } }).some((c) => c.label === "实际运行验证改动"));
+  assert.ok(allChips.length <= 3, `应最多 3 个：${allChips.map(c => c.label).join(",")}`);
   // 纯问答/问候轮（没动文件、没计划、没失败）不出建议；陈旧状态也不出
   assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "打招呼", mutated: false, updatedAt: now } }), []);
   assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "x", mutated: true, updatedAt: now - 10 * 60_000 } }), []);
@@ -8237,6 +8489,8 @@ test("plan steps advance from real tool evidence instead of waiting for another 
     },
     _isDependencyRestoreCommand: (command) => /npm install|pnpm install|yarn install|bun install/i.test(String(command || "")),
     _looksLikeWorkspaceMutationCommand: (command) => /npm install|write_file|edit_file|delete_path/i.test(String(command || "")),
+    // 新依赖（假完成门禁）：cmd 分支现在先问"是不是脚手架命令"才给 implement 证据。
+    _looksLikeScaffoldCommand: (command) => /npm create|npx create-/i.test(String(command || "")),
     _looksLikeVerificationCommand: (command) => /npm test|npm run build|npm run typecheck|npm run lint/i.test(String(command || "")),
     _externalEvidenceKinds: () => [],
   });
@@ -9489,6 +9743,7 @@ test("write_file streams replace once then append every received Monaco delta", 
   const flush = load("_flushLiveEditorWritePreview", {
     // 诊断埋点在测试里是无操作：它只写文件，不参与流式语义。
     _wpDiag: () => {},
+    _perfPhase: () => {},
     _liveEditorWritePreviews: previews,
     openFiles: new Map([[preview.path, file]]),
     activePath: preview.path,
@@ -9509,6 +9764,55 @@ test("write_file streams replace once then append every received Monaco delta", 
   assert.equal(replacements, 1, "the old file should be replaced only for the first streamed snapshot");
   assert.deepEqual(appended, ["\nconst b = 2;"], "later chunks should append instead of resetting the whole model");
   assert.ok(positions.length >= 2, "the visible editor should follow the streamed tail");
+});
+
+test("streaming Monaco buffer sync is throttled while the chat card still paints every frame", () => {
+  // 真凶回归：流式写入期间对已打开 Monaco model 的同步若逐帧做，每次 getValue 全文
+  // 比对 + applyEdits + TS worker 镜像随文件增长变贵，总代价 O(n²) —— 大文件直接无响应。
+  const src = extractFn("_scheduleWritePreviewFlush");
+  assert.match(src, /_STREAM_EDITOR_SYNC_MS/,
+    "编辑器缓冲区同步必须走节流常量，逐帧同步是大文件无响应的 O(n²) 真凶");
+  assert.match(SRC, /const _STREAM_EDITOR_SYNC_MS = 500;/,
+    "节流间隔必须 ≥500ms");
+  assert.match(extractFn("_settleWritePreview"), /_flushLiveEditorWritePreview\(entry, true\)/,
+    "流结束定格必须无条件做一次完整同步，节流不能丢最后一段");
+  assert.match(extractFn("_flushLiveEditorWritePreview"), /_perfPhase\(`streamWriteEditorSync n=/,
+    "同步路径必须打 _perfPhase 相位标记，纳入哨兵取证");
+
+  let now = 1000;
+  let raf = null;
+  const flushes = [];
+  const schedule = load("_scheduleWritePreviewFlush", {
+    requestAnimationFrame: (cb) => { raf = cb; return 1; },
+    Date: { now: () => now },
+    _clipStreamCode: load("_clipStreamCode", { _STREAM_CODE_WIN: 16000 }),
+    _STREAM_EDITOR_SYNC_MS: 500,
+    _flushLiveEditorWritePreview: () => { flushes.push(now); return true; },
+    _scheduleWritePreviewColor: () => {},
+  });
+  const entry = { streamCard: { querySelector: () => null }, _target: "a" };
+  const frame = () => { const cb = raf; raf = null; cb(); };
+  schedule(entry); frame();                                    // 首帧：立即同步一次
+  now = 1016; entry._target += "b"; schedule(entry); frame();  // 16ms 后：节流跳过
+  now = 1032; entry._target += "c"; schedule(entry); frame();  // 仍跳过
+  now = 1600; entry._target += "d"; schedule(entry); frame();  // ≥500ms：再同步
+  assert.deepEqual(flushes, [1000, 1600],
+    "Monaco 同步必须 ≥500ms 一次；首次不等待，中途逐帧调用被合并");
+});
+
+test("perf sentinel self-identifies its version and covers WebKit via rAF gap sampling", () => {
+  // 哨兵版本自证：取证时必须能一眼确认运行页面装的是哪版取证代码。
+  assert.match(SRC, /SENTINEL v3 loaded \$\{new Date\(\)\.toISOString\(\)\}/,
+    "哨兵初始化必须向 perf 日志追加版本戳");
+  // longtask 是 Chromium 专属，macOS WKWebView 不支持 —— 必须有 rAF 间隙采样双轨。
+  const probeStart = SRC.indexOf("const _rafGapProbe");
+  assert.ok(probeStart > 0, "必须存在 rAF 间隙采样探针（longtask 的 WebKit 替代轨）");
+  const probe = SRC.slice(probeStart, probeStart + 1800);
+  assert.match(probe, /RAFGAP \$\{gap\}ms lastPhase=/, "RAFGAP 行必须带最近一次相位名");
+  assert.match(probe, /gap > 500/, "间隙阈值必须 >500ms");
+  assert.match(probe, /document\.hidden/, "必须复用 hidden 判据过滤页面隐藏导致的 rAF 暂停误报");
+  assert.match(probe, /drift/, "必须复用时钟漂移判据过滤系统睡眠误报");
+  assert.match(probe, /requestAnimationFrame\(_rafGapProbe\)/, "探针必须是持续自调度的空转循环");
 });
 
 test("cancelled write previews restore existing editors and remove temporary new-file tabs", async () => {
@@ -10162,12 +10466,82 @@ test("same-response reads and fuzzy bindings cannot authorize mutations before t
   assert.equal(bound(run, "/repo", "wrong/a.js"), "", "a fuzzy path learned this response cannot drive delete/move yet");
   assert.equal(freshBinding(run, "/repo", "wrong/a.js"), "/repo/packages/a.js",
     "the mutation guard must still see the fresh binding instead of falling back to the wrong requested path");
-  assert.match(extractFn("_executeToolStep"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,800}已阻止退回原始路径写错文件/);
+  assert.match(extractFn("_executeToolStep"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,1600}已阻止退回原始路径写错文件/);
+  // 新文件豁免：拦截必须以「目标在磁盘上真实存在」为前提，全新创建不能被同批绑定拦死。
+  assert.match(extractFn("_executeToolStep"),
+    /const sameBatchTargetExists = !!sameBatchBinding\s*&& \(\(await _pathExistsAsFile\(sameBatchTargetAbs\)\) \|\| \(await _pathExistsAsDir\(sameBatchTargetAbs\)\)\);\s*if \(sameBatchBinding && sameBatchTargetExists\)/,
+    "写入门禁只拦磁盘上已存在的目标，新文件创建必须放行");
 
   run._toolBatch = 2;
   assert.equal(hasCurrentRead(run, "/repo", content, "a.js"), true);
   assert.equal(bound(run, "/repo", "wrong/a.js"), "/repo/packages/a.js");
   assert.equal(freshBinding(run, "/repo", "wrong/a.js"), "");
+});
+
+test("写入门禁条件矩阵：陈旧批号绑定过期放行，同批真实绑定仍拦，上一批绑定不拦", () => {
+  const bind = load("_bindRunFilePath", { _normRel: NORM_REL, _coherentFilePath: COHERENT_PATH });
+  const freshBinding = load("_sameBatchRunFilePathBinding", { _normRel: NORM_REL });
+  const run = { _toolBatch: 1 };
+
+  // 同批刚学到的绑定（批号 == 当前批）：写入门禁必须看得到 → 已存在文件维持拦截。
+  bind(run, "/repo", "src/db.js", "/repo/packages/api/db.js");
+  assert.equal(freshBinding(run, "/repo", "src/db.js"), "/repo/packages/api/db.js");
+
+  // 有界等待（方案 B）：绑定批号领先当前批号超过 2 批 = 批号计数器被重置过的残留表，
+  // 按过期放行——否则全新 run 里每一批写入都会被它拦死（截图里的成批零落盘）。
+  bind(run, "/repo", "tsconfig.json", "/repo/tsconfig.json", 9);
+  assert.equal(freshBinding(run, "/repo", "tsconfig.json"), "", "批号计数器重置后的陈旧绑定必须过期放行");
+  // 临界：领先不足 3 批仍算同批（保守侧，不误放正常同批绑定）。
+  bind(run, "/repo", "vite.config.ts", "/repo/vite.config.ts", 3);
+  assert.equal(freshBinding(run, "/repo", "vite.config.ts"), "/repo/vite.config.ts");
+
+  // 上一批完成的绑定（批号 < 当前批）：模型已看到读取结果，不再等待。
+  run._toolBatch = 2;
+  assert.equal(freshBinding(run, "/repo", "src/db.js"), "");
+});
+
+test("hard_blocked/authorized 读取在覆盖重放里等价于读取完成，写入门禁不再死等", () => {
+  const signature = load("_contentSignature");
+  const recordRange = load("_recordRunReadRange", { _normRel: NORM_REL });
+  const hasCurrentRead = load("_runHasCurrentRead", { _normRel: NORM_REL, _contentSignature: signature });
+  const sync = load("_syncRunReadCoverageFromMessages", {
+    _recordRunReadRange: recordRange,
+    _resolveRel: (path, root) => NORMALIZE_PATH(root + "/" + path),
+  });
+  const content = "a\nb\nc\n"; // 3 行
+  const sig = signature(content);
+  const run = { ctx: { filesRead: new Set() }, _toolBatch: 3 };
+  sync(run, "/repo", [
+    // 重复读硬拦截存根：to 是请求区间末行，可越过文件末尾（这里 5 > 3）。
+    { role: "tool", _ideMeta: { kind: "read", resultKind: "hard_blocked", canonicalPath: "src/app.js", signature: sig, from: 1, to: 5, total: 3, complete: false } },
+    { role: "tool", _ideMeta: { kind: "read", resultKind: "authorized", canonicalPath: "src/other.js", signature: sig, from: 1, to: 3, total: 3, complete: true } },
+    // 失败/未知结果仍不计入覆盖。
+    { role: "tool", _ideMeta: { kind: "read", resultKind: "error", canonicalPath: "src/broken.js", signature: sig, from: 1, to: 3, total: 3 } },
+  ]);
+  assert.equal(run.ctx.filesRead.has("src/app.js"), true, "hard_blocked 语义是原文已在上文，重放后覆盖不能丢");
+  assert.equal(run.ctx.filesRead.has("src/other.js"), true);
+  assert.equal(run.ctx.filesRead.has("src/broken.js"), false);
+  assert.equal(run._readSeen.get("/repo/src/app.js"), 3, "hard_blocked 的 to 要钳到 total");
+  // 下一批里这份覆盖就能授权写入（死锁断开）；同批内仍不能。
+  assert.equal(hasCurrentRead(run, "/repo", content, "src/app.js"), false);
+  run._toolBatch = 4;
+  assert.equal(hasCurrentRead(run, "/repo", content, "src/app.js"), true);
+});
+
+test("重复读硬拦截返回前刷新路径绑定，写入门禁不再等一个不会再来的读取结果", () => {
+  // 结构断言：hard_blocked 返回前必须绑定路径，且批号沿用覆盖完成时的批号（上一轮
+  // 读完的写入即刻放行；本批才读完的仍算同批读写）。
+  assert.match(extractFn("_executeToolStep"),
+    /const _hbState = _readCoverageStateFor\(run, root, _sig, total, call\.path, usedPath\);\s*_bindRunFilePath\(run, root, call\.path, usedPath \|\| call\.path, _hbState\?\.completedBatch \|\| 0\);\s*return \{\s*type: "read", path: call\.path, content: _hardBlockMsg/,
+    "hard_blocked 返回前必须用覆盖完成批号刷新绑定");
+  // 行为断言：用覆盖完成批号（上一批）绑定不会被写入门禁看成同批等待。
+  const bind = load("_bindRunFilePath", { _normRel: NORM_REL, _coherentFilePath: COHERENT_PATH });
+  const freshBinding = load("_sameBatchRunFilePathBinding", { _normRel: NORM_REL });
+  const run = { _toolBatch: 5 };
+  bind(run, "/repo", "src/app.js", "/repo/src/app.js", 4); // 覆盖在第 4 批完成
+  assert.equal(freshBinding(run, "/repo", "src/app.js"), "", "上一轮读完的 hard_blocked 后写入必须放行");
+  bind(run, "/repo", "src/live.js", "/repo/src/live.js", 5); // 本批才读完
+  assert.equal(freshBinding(run, "/repo", "src/live.js"), "/repo/src/live.js", "本批才读完的仍算同批读写、维持等待");
 });
 
 test("ordered tool segments preserve mutation barriers while parallelizing only adjacent reads", async () => {
@@ -12680,4 +13054,199 @@ test("Tool Search 只在命中时回传压缩调用指南，不把全量手册�
   assert.doesNotMatch(directory, /例:\s*\w+\(\{/, "稳定 search_tools 描述不能内嵌全量调用样例");
   assert.match(SRC, /import \{ compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, TOOL_METADATA \} from "\.\/tool-guides\.js"/,
     "工具手册必须独立于庞大的主编排模块");
+});
+
+test("工具失败原因自动分类：常见错误文本落进正确类别", () => {
+  const classify = load("_classifyToolFailure");
+  assert.equal(classify("ENOENT: no such file or directory, open '/tmp/x'"), "not_found");
+  assert.equal(classify("文件不存在：/a/b/c.txt"), "not_found");
+  assert.equal(classify("EACCES: permission denied"), "permission");
+  assert.equal(classify("request timed out after 20000ms"), "timeout");
+  assert.equal(classify("invalid arguments: 'path' is required"), "invalid_input");
+  assert.equal(classify("fetch failed: ECONNREFUSED 127.0.0.1:5173"), "network");
+  assert.equal(classify("something exploded in an unusual way"), "other");
+  assert.equal(classify(""), "other", "空文本不能抛异常，归入 other");
+});
+
+test("弱模型判定：激活参数标识优先，大模型不被关键字包含误伤", () => {
+  const isWeak = load("_isWeakModel");
+  // MoE 激活参数标识：总参 35b 但激活仅 3b → 弱（用户本地模型实例）
+  assert.equal(isWeak("qwen3.6-35b-a3b"), true);
+  assert.equal(isWeak("gpt-4o-mini"), true);
+  assert.equal(isWeak("gemini-2.0-flash"), true);
+  assert.equal(isWeak("qwen2.5-7b-instruct"), true);
+  assert.equal(isWeak("llama-3.2-1.5b"), true);
+  // 大模型不误伤
+  assert.equal(isWeak("claude-opus"), false);
+  assert.equal(isWeak("deepseek-v3"), false);
+  assert.equal(isWeak("llama-3-70b"), false);
+  assert.equal(isWeak("qwen2.5-72b-instruct"), false);
+  assert.equal(isWeak("qwen2.5-32b"), false);
+  // 子串不误中：minimax 含 mini、airoboros 含 air，都不是轻量命名
+  assert.equal(isWeak("minimax-abab6.5"), false);
+  assert.equal(isWeak(""), false);
+});
+
+test("编排合理性检查：收敛不 reject，notes 把事实留给主模型权衡", () => {
+  const classify = load("_classifyToolFailure");
+  const validate = load("_validateToolOrchestration", { _classifyToolFailure: classify });
+  const reg = { get: (n) => (n.startsWith("ghost_") ? undefined : { function: { name: n } }) };
+  // 工具过多 → 截断到 12，附 note，不报错
+  const many = Array.from({ length: 20 }, (_, i) => `tool_${i}`);
+  const r1 = validate(many, reg, {});
+  assert.equal(r1.tools.length, 12);
+  assert.ok(r1.notes.some((n) => n.includes("收敛")), "截断必须在 notes 里诚实记账");
+  // 幻觉工具名被静默过滤
+  const r2 = validate(["ghost_tool", "read_file"], reg, {});
+  assert.deepEqual(r2.tools, ["read_file"]);
+  // 同类堆叠：搜索类 >3 → 保留前 3
+  const r3 = validate(["github_search", "web_search", "knowledge_search", "stackoverflow_search", "write_file"], reg, {});
+  assert.equal(r3.tools.filter((n) => /search/i.test(n)).length, 3);
+  assert.ok(r3.tools.includes("write_file"), "非同类工具不能被误杀");
+  // 构建型任务全查询类 → 只提示不拦截（判断权留模型）
+  const r4 = validate(["read_file", "list_dir", "grep_search"], reg, { substantial: true });
+  assert.equal(r4.tools.length, 3, "不硬 reject 整个编排");
+  assert.ok(r4.notes.some((n) => n.includes("实现类")), "缺实现类工具必须提示");
+  // 带实现类工具的构建型任务不误报
+  const r5 = validate(["read_file", "write_file"], reg, { implementation: true });
+  assert.ok(!r5.notes.some((n) => n.includes("实现类")));
+});
+
+test("工具失败记账与弱模型收敛接入编排链路", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_toolExpRecord\(run\.engineering, rec\.tool, ok, rec\.reason\)/,
+    "跨会话经验必须把失败原因文本传进去分类记账");
+  assert.match(loop, /raw\.slice\(0, 200\)/, "失败细节从 70 字放宽到 200 字");
+  assert.match(loop, /_validateToolOrchestration\(decision\.tools, run\._toolRegistry, run\.engineering\)/,
+    "编排结果装载 schema 前必须先过硬性合理性检查");
+  assert.match(loop, /_isWeakModel\(config\?\.model\)/, "弱模型才收敛工具窗口，强模型保持现状");
+  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\)/,
+    "弱模型超额时只装载前 8 个，其余留给 search_tools");
+  assert.match(loop, /编排收敛提示/, "收敛 notes 必须拼进编排 nudge 告知主模型");
+  const stats = extractFn("_toolLedgerStats");
+  assert.match(stats, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
+  const retrieve = extractFn("_toolExpRetrieve");
+  assert.match(retrieve, /catAdvice/, "跨会话经验必须把失败类别转成行动建议");
+});
+
+test("失败命令重跑短路：无改动重跑被拦截、改动后放行、成功清账、FIFO 上限 20", () => {
+  const norm = load("_normalizeCmdForRetry");
+  const digest = load("_cmdFailureDigest");
+  const record = load("_recordCmdFailure", { _normalizeCmdForRetry: norm, _cmdFailureDigest: digest, _FAILED_CMD_LOG_MAX: 20 });
+  const clear = load("_clearCmdFailure", { _normalizeCmdForRetry: norm });
+  const shortCircuit = load("_repeatedFailedCmdShortCircuit", { _normalizeCmdForRetry: norm });
+
+  const run = {};
+  record(run, "npm  install", 1, "npm ERR! code E404\nnpm ERR! 404 Not Found - GET https://registry.npmjs.org/epub-parser-pro\n一些无关噪音");
+  // 空白归一化后同一条命令 → 拦截，且必须把上次失败的 exit code 和关键报错行喂回
+  const msg = shortCircuit(run, "npm install");
+  assert.match(msg, /重复失败命令·已拦截/);
+  assert.match(msg, /exit 1/);
+  assert.match(msg, /E404/, "失败关键行必须进拦截文案，模型才能看到根因");
+  // 第 3 次无改动重发依然拦截（账本条目不因拦截而删除）
+  assert.match(shortCircuit(run, "npm install"), /重复失败命令·已拦截/);
+  // 期间有工作区改动（_fsMutTick 增长，如模型改了 package.json）→ 放行真实重跑
+  run._fsMutTick = (run._fsMutTick || 0) + 1;
+  assert.equal(shortCircuit(run, "npm install"), "");
+  // 放行后再次失败 → 以新 tick 重新记账，之后无改动重发仍被拦
+  record(run, "npm install", 1, "npm ERR! 404 Not Found");
+  assert.match(shortCircuit(run, "npm install"), /已拦截/);
+  // 命令成功 → 清账，同命令不再被拦
+  clear(run, "npm install");
+  assert.equal(shortCircuit(run, "npm install"), "");
+
+  // failDigest：优先关键行、总长 ≤300；没有关键行时取末尾几行兜底
+  record(run, "long-out", 2, "x".repeat(500) + " error " + "y".repeat(500));
+  assert.ok(run._failedCmdLog.every((entry) => entry.failDigest.length <= 300));
+  assert.equal(digest("第一行普通输出\n最后的真实原因"), "第一行普通输出\n最后的真实原因");
+  assert.match(digest("noise\nnpm ERR! code E404\nnoise2"), /E404/);
+
+  // FIFO 上限 20：最老的条目被挤出后不再拦截，新条目仍拦
+  const fifo = {};
+  for (let i = 0; i < 25; i++) record(fifo, `cmd-${i}`, 2, "fatal: boom");
+  assert.equal(fifo._failedCmdLog.length, 20);
+  assert.equal(shortCircuit(fifo, "cmd-0"), "");
+  assert.match(shortCircuit(fifo, "cmd-24"), /已拦截/);
+});
+
+test("失败命令短路已接入 cmd 执行分支：执行前拦截、失败记账/成功清账、改动 tick 三处落账", () => {
+  // 执行前：先查账本再进终端（物理拦截，不是提示词劝阻）
+  assert.match(SRC, /const _repeatFailMsg = _repeatedFailedCmdShortCircuit\(run, call\.command\);\s*if \(_repeatFailMsg\) \{[\s\S]{0,200}return \{ type: "cmd", path: call\.command, content: _repeatFailMsg \};/,
+    "cmd 执行分支必须在 _agentRunInTerminal 之前做失败账本短路");
+  // 执行后：真实退出码决定记账/清账（放在瞬时失败自动重试之后，记的是最终结果）
+  assert.match(SRC, /if \(result\.code !== 0\) _recordCmdFailure\(run, call\.command, result\.code, output\);\s*else _clearCmdFailure\(run, call\.command\);/,
+    "失败记账/成功清账必须落在真实执行结果上");
+  // "期间有无改动"事实：runOne settle、流式即写、worker onMutation 三条改动路径都要 +1
+  assert.ok((SRC.match(/run\._fsMutTick = \(run\._fsMutTick \|\| 0\) \+ 1/g) || []).length >= 3,
+    "改动 tick 必须覆盖 runOne/流式即写/worker 三条改动路径");
+  // 拦截文案本身是失败形态（[…失败…] 括号内），不会被当成功证据推进计划
+  const toolFailureMatch = load("_toolFailureMatch");
+  assert.ok(toolFailureMatch("[重复失败命令·已拦截] 这条命令刚失败过 (exit 1)"),
+    "拦截结果必须被 _toolExecutionSucceeded 判为失败，不能推进计划或算执行证据");
+});
+
+test("计划假完成门禁：install/mkdir 只算 execute 证据，implement 步骤不再被顺手打勾", () => {
+  const scaffoldCmd = load("_looksLikeScaffoldCommand");
+  assert.equal(scaffoldCmd("npm create vite@latest my-app -- --template vue"), true);
+  assert.equal(scaffoldCmd("npx create-react-app novel-reader"), true);
+  assert.equal(scaffoldCmd("cargo new reader"), true);
+  assert.equal(scaffoldCmd("npm install"), false, "装依赖不是脚手架");
+  assert.equal(scaffoldCmd("mkdir -p src/pages"), false, "建目录不是脚手架");
+
+  const kindsFor = load("_planEvidenceKindsForTool", {
+    _toolExecutionSucceeded: (call, result) => call.type !== "cmd" || Number(result?.code) === 0,
+    _WORKSPACE_MUTATING_TYPES: new Set(["write", "edit", "multiedit", "format", "delete", "move", "mkdir", "copy", "game_scaffold", "web_scaffold"]),
+    _runtimeCommandKinds: () => [],
+    _isDependencyRestoreCommand: (command) => /^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci)\b/i.test(String(command || "")),
+    _looksLikeWorkspaceMutationCommand: (command) => /^mkdir\b|^chmod\b/i.test(String(command || "")),
+    _looksLikeScaffoldCommand: scaffoldCmd,
+    _looksLikeVerificationCommand: (command) => /^npm test\b/i.test(String(command || "")),
+    _externalEvidenceKinds: () => [],
+  });
+  // 环境操作类命令：只算 execute，绝不算 implement
+  assert.deepEqual(kindsFor({ type: "cmd", command: "npm install" }, { code: 0, content: "ok" }), ["execute"]);
+  assert.deepEqual(kindsFor({ type: "cmd", command: "mkdir -p src/pages" }, { code: 0, content: "ok" }), ["execute"]);
+  // 真脚手架命令仍是 implement 证据
+  assert.ok(kindsFor({ type: "cmd", command: "npm create vite@latest app" }, { code: 0, content: "ok" }).includes("implement"));
+  // 写入类工具仍是 implement 证据
+  assert.deepEqual(kindsFor({ type: "write", path: "src/pages/Shelf.vue" }, { content: "ok" }), ["implement"]);
+
+  const planActionKind = load("_planStepActionKind");
+  const advance = load("_advancePlanFromTool", {
+    _planPrimeCurrentStep: load("_planPrimeCurrentStep"),
+    _planEvidenceKindsForTool: kindsFor,
+    _planStepMatchesEvidence: load("_planStepMatchesEvidence", { _planStepActionKind: planActionKind }),
+    _renderPlan: (_container, steps, _existingEl, run) => { run._planSteps = steps; },
+    _syncPlanChip: (run, steps) => { run._planSteps = steps; },
+  });
+  const run = {
+    _planSteps: [
+      { content: "实现书架页面", status: "in_progress" },
+      { content: "实现阅读器核心", status: "pending" },
+      { content: "运行 npm test 验证", status: "pending" },
+    ],
+    _planEl: { parentNode: {} },
+    _toolStep: 7,
+    session: {},
+  };
+  // 用户实证场景：npm install / mkdir 成功、read 成功，"实现书架页面"都不能被打勾
+  advance(run, { type: "cmd", command: "npm install" }, { type: "cmd", code: 0, content: "ok" });
+  assert.equal(run._planSteps[0].status, "in_progress", "npm install 不能推进 implement 步骤");
+  advance(run, { type: "cmd", command: "mkdir -p src" }, { type: "cmd", code: 0, content: "ok" });
+  assert.equal(run._planSteps[0].status, "in_progress", "mkdir 不能推进 implement 步骤");
+  advance(run, { type: "read", path: "package.json" }, { type: "read", content: "ok" });
+  assert.equal(run._planSteps[0].status, "in_progress", "investigate 证据不能推进 implement 步骤");
+  // verify 步骤同理：investigate/execute 证据都推不动（只有 verify 证据行）
+  advance(run, { type: "cmd", command: "echo hi" }, { type: "cmd", code: 0, content: "hi" });
+  assert.equal(run._planSteps[0].status, "in_progress", "execute 证据不能推进 implement 步骤");
+  // 真实写入才推进，且步骤上留下 advancedBy 事实账（工具 + 第几次工具调用）
+  advance(run, { type: "write", path: "src/pages/Shelf.vue" }, { type: "write", content: "ok" });
+  assert.equal(run._planSteps[0].status, "completed");
+  assert.deepEqual(run._planSteps[0].advancedBy, { tool: "write", iter: 7 },
+    "被自动推进的步骤必须记下是哪个工具在第几次调用时打的勾");
+  assert.equal(run._planSteps[1].status, "in_progress");
+  // update_plan 的手动标记路径不走 _advancePlanFromTool（模型判断权保留）：
+  // 两处调用点都显式排除 update_plan
+  assert.ok((SRC.match(/it\.tc\.name !== "update_plan"/g) || []).length >= 2,
+    "自动推进必须排除 update_plan，手动标记仍由模型说了算");
 });

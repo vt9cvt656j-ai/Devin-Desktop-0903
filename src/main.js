@@ -13085,6 +13085,7 @@ function _conversationSessionMetadata(session) {
     anchorRoot: session?._anchorRoot || undefined,
     plan: Array.isArray(session?._planSteps) && session._planSteps.length
       ? session._planSteps.map((step) => ({ content: step.content, status: step.status })) : undefined,
+    planExpanded: session?._planExpanded ? 1 : undefined, // 计划卡展开态跨重启存活
     demands: Array.isArray(session?._demandLedger) && session._demandLedger.length
       ? session._demandLedger.slice(-40) : undefined,
     intentState: session?._intentState && typeof session._intentState === "object" ? session._intentState : undefined,
@@ -13727,6 +13728,7 @@ async function _openNewWindow() {
 }
 
 async function _switchChatSession(idx) {
+  try { _perfPhase("_switchChatSession"); } catch {}
   if (idx === _activeChatIdx || idx < 0 || idx >= _chatSessions.length) return;
   if (_activeChatIdx >= 0 && _chatSessions[_activeChatIdx]) {
     _chatSessions[_activeChatIdx].container.hidden = true;
@@ -14270,6 +14272,7 @@ function _scrollChatBottom() {
 }
 
 async function restoreChatHistory() {
+  try { _perfPhase("restoreChatHistory"); } catch {}
   // 新建窗口（?w=sub）：AI 对话区也保持初始化——不恢复主窗口的会话/项目锚点，
   // 直接开一个全新空白对话（本窗口也不会回写主窗口的聊天存档，见 saveChatHistory）。
   if (_isSecondaryWindow) {
@@ -14326,6 +14329,7 @@ async function restoreChatHistory() {
         // visual instead of re-rendering plain text.
         if (typeof sData.html === "string" && sData.html) session._htmlSnapshot = sData.html;
         if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({ content: String(p.content || ""), status: p.status || "pending" }));
+        if (sData.planExpanded) session._planExpanded = true; // 计划卡展开态跨重启存活
         if (Array.isArray(sData.demands) && sData.demands.length) session._demandLedger = sData.demands.map((d) => String(d)).filter(Boolean).slice(-40);
         // 持久化工作流：上次运行留下"活着"的检查点 = 中途被切断（崩溃/强关）。
         // 挂到 session 上，下一次 agent 运行注入草稿纸接着做（7 天内有效）。
@@ -14883,6 +14887,7 @@ function _renderTokenMeter() {
 }
 
 async function highlightCode(code, lang) {
+  try { _perfPhase("highlightCode"); } catch {}
   // monaco.editor.colorize tokenizes on the main thread — a very large block can
   // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
   // once. Skip highlighting oversized blocks (plain text reads fine).
@@ -19438,32 +19443,62 @@ function _renderSuggestionChips(sess, items, label) {
 }
 
 // 「接下来」建议只从本轮**真实运行状态**推导：结局（失败/未完成）、剩余计划步骤、是否
-// 改了文件。旧版是对最近聊天文本的关键词正则桶——问候轮也会被历史里的“报错/验证/UI”
+// 改了文件。旧版是对最近聊天文本的关键词正则桶——问候轮也会被历史里的“报错/验证/UI"
 // 字样命中，刷出一排不相干的按钮。纯问答/闲聊轮（没动文件、没计划、没失败）不出建议。
+// **改为最多 3 个精确预测**:基于 failureCategory/mutatedFileTypes/runtimeEffects 等证据
 function _runStateNextActionSuggestions(sess) {
   const run = sess?._lastRunState;
-  // 只信“刚结束的这一轮”：恢复的旧会话里的陈旧状态不该冒出来指挥新对话。
+  // 只信"刚结束的这一轮":恢复的旧会话里的陈旧状态不该冒出来指挥新对话。
   if (!run || !run.updatedAt || Date.now() - run.updatedAt > 5 * 60_000) return [];
   const picks = [];
   const task = String(run.task || "").slice(0, 60);
-  if (run.outcome === "failed") {
-    picks.push({ label: "排查失败根因", send: `刚才「${task}」失败了。带着真实报错/日志定位根因并修复，已确认过的部分别从头重查。` });
+
+  // 场景 1:失败→根据 failureCategory 给出针对性建议
+  if (run.outcome === "failed" && run.failureCategory) {
+    const map = {
+      permission: "检查权限或凭证",
+      network: "检查网络或服务",
+      timeout: "优化或增加超时",
+      invalid_input: "修正输入格式",
+      other: "查看详细错误日志"
+    };
+    const desc = map[run.failureCategory] || "查看详细错误日志";
+    picks.push({ 
+      label: `修复${run.failureCategory}类失败`, 
+      send: `根据${run.failureCategory}类失败:${desc}\n\n相关错误:\n${run.lastError || "[无具体错误信息]"}` 
+    });
   }
+
+  // 场景 2:部分完成→基于 mutatedFileTypes/incompleteReason 精确描述
   if (run.outcome === "partial") {
-    picks.push({ label: "继续完成剩余部分", send: `继续完成刚才没做完的部分${run.incompleteReason ? `（中断原因：${run.incompleteReason}）` : ""}，从中断处接着做。` });
+    const types = [...(run.mutatedFileTypes || [])].join("+");
+    const incomplete = run.incompleteReason || "";
+    picks.push({ 
+      label: `继续完成剩余部分`, 
+      send: `本轮已完成${types ? types + "文件" : "部分"}的修改 (${run.mutatedFileCount || 0}个)，但因${incomplete || "未知原因"}未完成。请继续：${String(run.result || "").slice(0, 200)}...` 
+    });
   }
-  const pending = (Array.isArray(sess._planSteps) ? sess._planSteps : [])
-    .filter((s) => s && (s.status === "pending" || s.status === "in_progress"))
-    .map((s) => String(s.content || "").trim()).filter(Boolean);
-  for (const step of pending.slice(0, 2)) {
-    picks.push({ label: `继续：${step.slice(0, 22)}${step.length > 22 ? "…" : ""}`, send: `继续执行计划步骤：${step}` });
+
+  // 场景 3:成功且有运行效果→提示验证
+  if (run.outcome === "success" && run.runtimeEffects && run.runtimeEffects.length) {
+    const effects = [...run.runtimeEffects].join(", ");
+    picks.push({ 
+      label: "运行验证改动", 
+      send: `已成功运行${effects},但建议立即测试验证改动:\n- npm test / pytest / go test -race\n- 构建命令:npm run build / cargo build\n- 查看最新结果:${String(run.result || "").slice(0, 200)}...` 
+    });
   }
-  if (run.outcome === "success" && run.mutated) {
-    picks.push({ label: "实际运行验证改动", send: "把刚才的改动实际运行/测试一遍，贴出真实结果；有问题就修。" });
-    picks.push({ label: "复查改动影响面", send: "复查刚才改动涉及的调用方与相关逻辑，确认没引入回归。" });
+
+  // 场景 4:有计划 pending 步骤→继续下一步
+  if (run.planStepsStatus && run.planStepsStatus.pending > 0) {
+    picks.push({ 
+      label: `继续执行计划 (${run.planStepsStatus.pending}步)`, 
+      send: `按计划还有${run.planStepsStatus.pending}个步骤待完成 (已完${run.planStepsStatus.completed}/${run.planStepsStatus.total})。继续下一步。` 
+    });
   }
+
+  // 去重 + 切片至 3 个
   const seen = new Set();
-  return picks.filter((p) => !seen.has(p.label) && seen.add(p.label)).slice(0, 4);
+  return picks.filter(p => !seen.has(p.label) && seen.add(p.label)).slice(0, 3);
 }
 
 // Suggestions are derived locally from the completed run's real state. A second paid model
@@ -20108,6 +20143,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   // Growth: record this turn's engagement signals for the learner model, tagged
   // with the project so skill practice accumulates across projects (越战越勇).
   {
+    try { _perfPhase("growth:message-sent"); } catch {}
     const _gRoot = (_contextRoot || "").replace(/\/$/, "");
     growth.signal("message-sent", {
       mode: effectiveMode,
@@ -21805,6 +21841,7 @@ function _forgetMcpServer(root, name) {
 }
 
 async function _ensureMcpTools(rootOverride = "") {
+  try { _perfPhase("_ensureMcpTools"); } catch {}
   if (!inTauri) return { connected: 0, tools: 0, failed: [] };
   const root = String(rootOverride || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
 
@@ -21940,6 +21977,7 @@ async function _ensureMcpTools(rootOverride = "") {
       }
     }));
 
+    try { _perfPhase("mcpDiscoveryDone"); } catch {}
     _mcpToolCache.sort((a, b) => (
       a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0
     ));
@@ -26578,21 +26616,22 @@ function _planCurrentStepIndex(steps) {
 function _planVisibleWindow(run, steps) {
   const list = Array.isArray(steps) ? steps : [];
   const total = list.length;
-  if (!total) return { start: 0, end: 0, before: 0, after: 0, rows: [] };
+  if (!total) return { start: 0, end: 0, before: 0, after: 0, rows: [], expanded: false, collapsible: false, total: 0 };
+  const collapsible = total > _PLAN_MAX_RENDERED_STEPS;
+  // 用户点过「展开」：整单渲染。展开态挂在 run 上并镜像到 session，agent 流式更新
+  // 触发的每次重渲染读到的都是同一份状态，视图不会被打回折叠态。
+  if (run && (run._planExpanded || (run.session && run.session._planExpanded))) {
+    return { start: 0, end: total, before: 0, after: 0, rows: list.slice(), expanded: true, collapsible, total };
+  }
   const max = Math.min(total, _PLAN_MAX_RENDERED_STEPS);
   const revealed = Math.max(1, Math.min(max, Number(run?._planVisibleCount) || 1));
-  let start;
-  if (Number.isInteger(run?._planWindowStart)) {
-    start = Math.max(0, Math.min(total - 1, run._planWindowStart));
-  } else {
-    const current = _planCurrentStepIndex(list);
-    // Before the initial six rows have appeared, grow from the beginning. Once
-    // execution moves beyond that window, keep the current step visible without
-    // pre-rendering the rest of a potentially very large plan.
-    start = current < revealed ? 0 : Math.max(0, current - max + 1);
-  }
-  const end = Math.min(total, start + (Number.isInteger(run?._planWindowStart) ? max : (start ? max : revealed)));
-  return { start, end, before: start, after: total - end, rows: list.slice(start, end) };
+  const current = _planCurrentStepIndex(list);
+  // Before the initial six rows have appeared, grow from the beginning. Once
+  // execution moves beyond that window, keep the current step visible without
+  // pre-rendering the rest of a potentially very large plan.
+  const start = current < revealed ? 0 : Math.max(0, current - max + 1);
+  const end = Math.min(total, start + (start ? max : revealed));
+  return { start, end, before: start, after: total - end, rows: list.slice(start, end), expanded: false, collapsible, total };
 }
 
 function _clearPlanReveal(run) {
@@ -26606,7 +26645,8 @@ function _schedulePlanReveal(run) {
   const target = Math.min(run._planSteps.length, _PLAN_MAX_RENDERED_STEPS);
   const visible = Math.max(1, Math.min(target, Number(run._planVisibleCount) || 1));
   run._planVisibleCount = visible;
-  if (visible >= target || Number.isInteger(run._planWindowStart)) return;
+  // 展开态整单已可见，渐进 reveal 没有意义
+  if (visible >= target || run._planExpanded || (run.session && run.session._planExpanded)) return;
   run._planRevealTimer = setTimeout(() => {
     run._planRevealTimer = null;
     if (!Array.isArray(run._planSteps) || !run._planSteps.length) return;
@@ -26616,18 +26656,40 @@ function _schedulePlanReveal(run) {
   }, _PLAN_REVEAL_INTERVAL_MS);
 }
 
-function _movePlanWindow(run, direction) {
-  if (!run || !Array.isArray(run._planSteps) || !run._planSteps.length) return;
-  const view = _planVisibleWindow(run, run._planSteps);
-  const maxStart = Math.max(0, run._planSteps.length - _PLAN_MAX_RENDERED_STEPS);
-  const nextStart = Math.max(0, Math.min(maxStart, view.start + (direction * _PLAN_MAX_RENDERED_STEPS)));
-  if (nextStart === view.start) return;
-  _clearPlanReveal(run);
-  run._planVisibleCount = Math.min(_PLAN_MAX_RENDERED_STEPS, run._planSteps.length);
-  run._planWindowStart = nextStart;
-  if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, run._planSteps, run._planEl, run);
-  else _syncPlanChip(run, run._planSteps);
+// 折叠行的「展开/收起」切换：状态写到 run 并镜像到 session，随后立即重渲染。
+// 快照恢复的历史计划卡没有 run 对象 → 用会话级计划兜底重建一个轻量 run。
+function _togglePlanExpanded(foldEl) {
+  const host = foldEl.closest(".agent-plan, .plan-chip__panel");
+  if (!host) return;
+  const wantExpand = foldEl.dataset.planExpand === "1";
+  let run = host._planRun;
+  if (!run) {
+    const session = typeof _currentSession === "function" ? _currentSession() : null;
+    if (!session || !Array.isArray(session._planSteps) || !session._planSteps.length) return;
+    run = { session, _planSteps: session._planSteps };
+    host._planRun = run;
+  }
+  run._planExpanded = wantExpand;
+  if (run.session) run.session._planExpanded = wantExpand;
+  const steps = Array.isArray(run._planSteps) ? run._planSteps : [];
+  if (wantExpand) _clearPlanReveal(run);
+  // 收起时直接回满窗紧凑视图，不重启 110ms 渐进 reveal（否则收起会闪回 1 行）
+  else run._planVisibleCount = Math.min(steps.length || 1, _PLAN_MAX_RENDERED_STEPS);
+  if (host.classList.contains("plan-chip__panel")) {
+    _renderPlanChipPanel(host, run);
+    if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
+  } else if (host.parentNode) {
+    _renderPlan(host.parentNode, steps, host, run);
+  }
 }
+// 计划卡「展开/收起」必须全局委托（同 think-card 的教训）：卡片在 agent 流式更新时
+// 频繁 innerHTML 重建、切会话后又整体从 HTML 快照恢复，逐元素监听必然丢失——
+// 委托到 document 一处，任何时刻点击都有响应（聊天内联卡和计划条面板都能命中）。
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  const fold = t && t.closest ? t.closest(".agent-plan__fold--toggle") : null;
+  if (fold) _togglePlanExpanded(fold);
+});
 
 function _planStepActionKind(step) {
   const text = String(step?.content || step?.title || step?.description || step || "").toLowerCase();
@@ -26655,7 +26717,12 @@ function _planEvidenceKindsForTool(call, result) {
   if (t === "cmd" || t === "termtask") {
     const command = String(call.command || "");
     const runtimeKinds = _runtimeCommandKinds(command, t === "termtask");
-    if (_isDependencyRestoreCommand(command) || _looksLikeWorkspaceMutationCommand(command) || runtimeKinds.includes("install")) kinds.add("implement");
+    // 假完成门禁收紧：装依赖 / mkdir / chmod 这类命令只是环境操作，不是"实现了
+    // 某个功能"的交付物——一律记 execute，不再把 implement 步骤顺手打勾（实证：
+    // npm install / mkdir 曾把"实现书架页面"推成 completed，磁盘上零业务代码）。
+    // 只有真正铺出项目代码的脚手架命令才算 implement 证据。
+    if (_looksLikeScaffoldCommand(command)) kinds.add("implement");
+    else if (_isDependencyRestoreCommand(command) || _looksLikeWorkspaceMutationCommand(command) || runtimeKinds.includes("install")) kinds.add("execute");
     if (_looksLikeVerificationCommand(command) || runtimeKinds.some((kind) => ["build", "test", "package"].includes(kind))) kinds.add("verify");
     if (runtimeKinds.includes("run")) kinds.add("execute");
     if (!kinds.size) kinds.add("execute");
@@ -26692,11 +26759,11 @@ function _advancePlanFromTool(run, call, result) {
     }
     return changed;
   }
-  steps = steps.map((step, i) => i === idx ? { ...step, status: "completed" } : step);
+  // 事实记账：这个勾是哪个工具在本 run 第几次工具调用时推进的（供追责/调试，不进 UI）。
+  const advancedBy = { tool: String(call?.type || ""), iter: Number(run?._toolStep) || 0 };
+  steps = steps.map((step, i) => i === idx ? { ...step, status: "completed", advancedBy } : step);
   steps = _planPrimeCurrentStep(steps);
-  // If the user paged through folded steps, return to the live execution window
-  // as soon as real tool evidence advances the plan.
-  run._planWindowStart = null;
+  // 注意：这里不碰 run._planExpanded —— 用户点开的展开态必须在计划推进的重渲染中存活。
   run._planSteps = steps;
   if (run._planEl?.parentNode) _renderPlan(run._planEl.parentNode, steps, run._planEl, run);
   else _syncPlanChip(run, steps);
@@ -26902,19 +26969,23 @@ function _planRowHtml(s, i) {
   return `<li class="${rowCls}" data-idx="${i}">${_planStepIcon(s.status)}<span class="agent-plan__txt">${_escHtml(s.content)}</span>${tag}</li>`;
 }
 
+// 折叠行整行是一个真 <button>（键盘可达）：点击展开全部步骤；展开态下变成「收起」。
+// 点击响应不在这里绑——走 document 级全局委托（见 _togglePlanExpanded 旁的监听），
+// 流式重渲染/快照恢复都杀不死它。
 function _planWindowControlsHtml(view) {
+  const chevron = (dir) => `<span class="agent-plan__page" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13"><path d="${dir === "up" ? "M4 10l4-4 4 4" : "M4 6l4 4 4-4"}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>`;
+  if (view?.expanded) {
+    if (!view.collapsible) return "";
+    return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="0" aria-label="收起计划步骤" title="收起为紧凑视图"><span class="agent-plan__page-spacer"></span><span>已展开全部 ${view.total} 项 · 点击收起</span>${chevron("up")}</button>`;
+  }
   const hidden = (view?.before || 0) + (view?.after || 0);
   if (!hidden) return "";
-  const prev = view.before
-    ? `<button type="button" class="agent-plan__page" data-plan-window="-1" aria-label="查看前面的计划步骤" title="查看前面的计划步骤"><svg viewBox="0 0 16 16" width="13" height="13"><path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`
-    : `<span class="agent-plan__page-spacer"></span>`;
-  const next = view.after
-    ? `<button type="button" class="agent-plan__page" data-plan-window="1" aria-label="查看后面的计划步骤" title="查看后面的计划步骤"><svg viewBox="0 0 16 16" width="13" height="13"><path d="m6 3.5 4.5 4.5L6 12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>`
-    : `<span class="agent-plan__page-spacer"></span>`;
-  return `<div class="agent-plan__fold">${prev}<span>其余 ${hidden} 项已折叠</span>${next}</div>`;
+  return `<button type="button" class="agent-plan__fold agent-plan__fold--toggle" data-plan-expand="1" aria-label="展开全部计划步骤" title="展开全部计划步骤"><span class="agent-plan__page-spacer"></span><span>其余 ${hidden} 项已折叠 · 点击展开</span>${chevron("down")}</button>`;
 }
 
 function _bindPlanWindow(container, steps, run) {
+  // 折叠行的展开/收起不在这里绑（全局委托），只留一个 run 反向引用供委托处理器取用。
+  container._planRun = run || container._planRun || null;
   container.querySelectorAll(".agent-plan__row--actionable").forEach((row) => {
     row.addEventListener("click", () => {
       const s = steps[+row.dataset.idx];
@@ -26926,9 +26997,6 @@ function _bindPlanWindow(container, steps, run) {
       const s = steps[+row.dataset.idx];
       if (s) _restorePlanStep(run, s.content);
     });
-  });
-  container.querySelectorAll("[data-plan-window]").forEach((button) => {
-    button.addEventListener("click", () => _movePlanWindow(run, Number(button.dataset.planWindow) || 0));
   });
 }
 // Cancel a plan step by its content — records it, re-renders the inline card (which also
@@ -28018,6 +28086,62 @@ function _consumeFailureReviewRead(run, root, ...paths) {
   return "";
 }
 
+// ── 失败命令重跑短路（机制层）─────────────────────────────────────────────────
+// 与重复读硬拦截同哲学：模型对着一条刚失败的命令一字不差原样重跑（实证：npm install
+// E404 后完全不读失败输出，直接再跑一次、再次 E404），机制层物理拦截 + 把上次失败的
+// 关键报错行强制喂回模型，而不是靠提示词求它"先看失败原因"。
+// "期间有无改动"的事实来自 run._fsMutTick：任何成功的工作区改动（写/编辑/删除/
+// 改文件命令/worker 写盘）都会 +1（记账点：runOne settle、流式即写、worker onMutation
+// 三处）。失败后改过文件（可能已修根因）→ 放行真实重跑；无任何改动的第 2、3、N 次
+// 重发一律短路（账本条目不因拦截而删除）；命令成功后清账。账本 FIFO 上限 20 条。
+const _FAILED_CMD_LOG_MAX = 20;
+
+function _normalizeCmdForRetry(command) {
+  return String(command || "").trim().replace(/\s+/g, " ");
+}
+
+// 从失败输出提取关键报错行（总长 ≤300 字）：优先取命中 error/E404/not found/ENOENT
+// 等关键词的前几行；一行都没命中就取末尾几行兜底（很多 CLI 把真实原因印在最后）。
+function _cmdFailureDigest(output) {
+  const lines = String(output || "").split(/\u000d?\u000a/).map((line) => line.trim()).filter(Boolean);
+  let picked = lines.filter((line) => /error|E\d{3}|not found|ENOENT|EACCES|fatal|panic|exception/i.test(line)).slice(0, 4);
+  if (!picked.length) picked = lines.slice(-3);
+  return picked.join("\u000a").slice(0, 300);
+}
+
+function _recordCmdFailure(run, command, exitCode, output) {
+  if (!run) return;
+  const normCmd = _normalizeCmdForRetry(command);
+  if (!normCmd) return;
+  run._failedCmdLog = run._failedCmdLog || [];
+  const entry = {
+    normCmd,
+    exitCode: Number.isFinite(Number(exitCode)) ? Number(exitCode) : null,
+    failDigest: _cmdFailureDigest(output),
+    implOpsAt: run._fsMutTick || 0,
+  };
+  const at = run._failedCmdLog.findIndex((item) => item && item.normCmd === normCmd);
+  if (at >= 0) run._failedCmdLog[at] = entry;
+  else run._failedCmdLog.push(entry);
+  if (run._failedCmdLog.length > _FAILED_CMD_LOG_MAX) run._failedCmdLog.shift();
+}
+
+function _clearCmdFailure(run, command) {
+  if (!run || !Array.isArray(run._failedCmdLog) || !run._failedCmdLog.length) return;
+  const normCmd = _normalizeCmdForRetry(command);
+  run._failedCmdLog = run._failedCmdLog.filter((item) => item && item.normCmd !== normCmd);
+}
+
+// 命令执行前的短路判定：返回拦截文案（非空 ⇒ 不执行），或 "" 放行。
+// 只有"同一条命令（空白归一化后一致）刚失败过 && 期间 _fsMutTick 没动过"才拦。
+function _repeatedFailedCmdShortCircuit(run, command) {
+  if (!run || !Array.isArray(run._failedCmdLog) || !run._failedCmdLog.length) return "";
+  const normCmd = _normalizeCmdForRetry(command);
+  const entry = run._failedCmdLog.find((item) => item && item.normCmd === normCmd);
+  if (!entry || entry.implOpsAt !== (run._fsMutTick || 0)) return "";
+  return `[重复失败命令·已拦截] 这条命令刚失败过 (exit ${entry.exitCode})，失败原因未处理前重跑必然再失败。上次失败关键信息:\n${entry.failDigest || "(上次失败没有可提取的关键输出行)"}\n先根据上面的报错修复根因 (如检查 package.json 的依赖名)，再重试。`;
+}
+
 // A file just got created / changed / deleted / moved → drop the run's per-file read
 // progress so a re-read starts FRESH (from the top of the new content) instead of
 // auto-advancing past the change, and so a deleted/renamed path isn't reported "已读".
@@ -28228,6 +28352,7 @@ function _kgInsert(notes, content) {
   return note;
 }
 function _kgLoad(root) {
+  try { _perfPhase("_kgLoad:JSON.parse"); } catch {}
   let notes = [];
   try { const raw = localStorage.getItem(_kgKey(root)); if (raw) notes = JSON.parse(raw); } catch { notes = []; }
   if (!Array.isArray(notes)) notes = [];
@@ -28246,6 +28371,7 @@ function _kgLoad(root) {
   return notes;
 }
 function _kgSave(root, notes) {
+  try { _perfPhase("_kgSave:stringify"); } catch {}
   if (notes.length > 240) notes = notes.slice(-240); // generous cap (retrieval is filtered)
   try {
     localStorage.setItem(_kgKey(root), JSON.stringify(notes));
@@ -28492,6 +28618,7 @@ function _kgAddNote(root, content) {
 // their 1-hop neighbours (the connected subgraph), plus a few most-recent notes so
 // general knowledge isn't missed. Returns the chosen note objects.
 function _kgRetrieve(root, query, K = 6, MAX = 13) {
+  try { _perfPhase("_kgRetrieve"); } catch {}
   const superseded = _kgSupersededIds(root);
   const allNotes = _kgLoad(root);
   const notes = allNotes.filter((item) => !superseded.has(item.id));
@@ -29948,6 +30075,7 @@ async function _walkSourceFiles(root, onFile, limit) {
 async function buildSymbolIndex(root) {
   if (!root || _symbolIndexBuilding) return;
   if (_symbolIndexRoot === root && _symbolIndexBuilt) return;
+  try { _perfPhase("buildSymbolIndex"); } catch {}
   _symbolIndexBuilding = true;
   _symbolIndexRoot = root;
   _symbolIndex.clear();
@@ -30059,6 +30187,7 @@ function _tokenize(text) {
 async function buildBM25Index(root) {
   if (!root || _bm25Index.building) return;
   if (_bm25Index.root === root && _bm25Index.built) return;
+  try { _perfPhase("buildBM25Index"); } catch {}
   _bm25Index.building = true;
   _bm25Index.root = root;
   _bm25Index.chunks = [];
@@ -30126,6 +30255,7 @@ function bm25Search(query, topK) {
 // Schedule the index build shortly after the workspace settles (Tauri commands
 // fire while UI is still booting; we don't want to compete with first render).
 function scheduleSymbolIndex() {
+  try { _perfPhase("scheduleSymbolIndex"); } catch {}
   if (_symbolIndexTimer) clearTimeout(_symbolIndexTimer);
   _symbolIndexTimer = setTimeout(() => {
     const r = rootPath || workspaceRoots[0];
@@ -30658,6 +30788,14 @@ function _looksLikeWorkspaceMutationCommand(command) {
   if (!raw || _looksLikeReadOnlyCommand(raw) || _looksLikeVerificationCommand(raw)) return false;
   if (_looksLikeShellFileRewrite(raw)) return true;
   return /^(?:(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|uninstall|update|upgrade)\b|cargo\s+(?:add|rm|remove|update|fmt\b(?![^\n]*--check))|(?:npx\s+)?(?:prettier|eslint)\b[^\n]*(?:--write|--fix)\b|(?:git\s+(?:apply|reset|clean|checkout|restore)|patch\s+-p\d*)\b|(?:mkdir|chmod|chown|ln)\b)/i.test(raw);
+}
+// 脚手架命令识别（计划推进专用）：只有"真正铺出一片项目代码"的命令才算 implement
+// 证据。npm install / mkdir / chmod 这类命令改了磁盘但没写任何业务代码，不配把
+// "实现 XX 页面"这种步骤顺手打勾（实证：空目录小说项目 5/6 打勾、磁盘零业务代码）。
+function _looksLikeScaffoldCommand(command) {
+  const raw = String(command || "").trim();
+  if (!raw) return false;
+  return /^(?:(?:npm|pnpm|yarn|bun)\s+(?:create|init)\b|(?:npx|bunx|pnpm\s+dlx|yarn\s+dlx)\s+(?:-y\s+|--yes\s+|--no-install\s+)*(?:create-[\w@./-]+|degit\b|nuxi\b|shadcn(?:-vue)?\b)|cargo\s+(?:new|init)\b|django-admin\s+startproject\b|rails\s+new\b|flutter\s+create\b|dotnet\s+new\b|vue\s+create\b|ng\s+(?:new|generate|g)\b|composer\s+create-project\b)/i.test(raw);
 }
 function _mcpMutationHint(call, requireWorkspacePath = false) {
   if (!call || call.type !== "mcp" || call.mcpReadOnly) return false;
@@ -32014,6 +32152,10 @@ function _sameBatchRunFilePathBinding(run, root, requested) {
   const key = _normRel(requested, root);
   if (!key || !run?._filePathBindings || !run._toolBatch) return "";
   const boundBatch = run._filePathBindingBatch?.get(key) || 0;
+  // 有界等待：正常流程里同批绑定的批号只会等于当前批号（本批读取刚写入）。绑定批号
+  // 领先当前批号超过 2 批，说明批号计数器被重置过（换了一段 run 循环还残留旧绑定表），
+  // 这种陈旧绑定按过期放行——否则「等待读取结果」会把之后每一批写入都拦死。
+  if (boundBatch > run._toolBatch + 2) return "";
   return boundBatch >= run._toolBatch ? (run._filePathBindings.get(key) || "") : "";
 }
 function _recordRunRead(run, root, ...paths) {
@@ -32212,11 +32354,17 @@ function _syncRunReadCoverageFromMessages(run, root, messages) {
   }
   for (const message of messages || []) {
     const meta = message?._ideMeta;
-    if (message?.role !== "tool" || meta?.kind !== "read" || meta.resultKind !== "content"
+    // 除 content 外也认 hard_blocked / authorized：两者只在「该签名的完整原文已在上文」
+    // 时才会发出，语义等价于读取完成。此前只认 content，压缩重放后覆盖被清空，写入门
+    // 禁等读取、重复读又被硬拦截 → 两道门互相等成死锁。
+    const readLikeResult = meta?.resultKind === "content" || meta?.resultKind === "hard_blocked" || meta?.resultKind === "authorized";
+    if (message?.role !== "tool" || meta?.kind !== "read" || !readLikeResult
         || meta.contextAvailable === false || !meta.canonicalPath || !meta.signature) continue;
     _recordRunReadRange(run, root, Number(meta.from), Number(meta.to), Number(meta.total), meta.signature, meta.canonicalPath);
     const absolute = _resolveRel(meta.canonicalPath, root);
-    run._readSeen.set(absolute, Math.max(run._readSeen.get(absolute) || 0, Number(meta.to) || 0));
+    // hard_blocked 的 to 是请求区间末行，可能越过文件末尾 → 钳到 total 再记。
+    const seenTo = meta.resultKind === "hard_blocked" ? Math.min(Number(meta.to) || 0, Number(meta.total) || 0) : (Number(meta.to) || 0);
+    run._readSeen.set(absolute, Math.max(run._readSeen.get(absolute) || 0, seenTo));
     run._readSig.set(absolute, meta.signature);
   }
 }
@@ -34079,7 +34227,20 @@ function validateToolCall(toolName, context = {}) {
   return { allowed: true };
 }
 
-// 工具成功率聚合：按工具统计成功/失败次数，最近失败原因，返回紧凑文本行
+// 工具失败原因自动分类：从工具结果/错误文本粗分类别。纯事实采集（简单包含匹配，
+// 不做语义判断），供账本/跨会话经验带出"为什么失败"而不只是"失败了几次"。
+function _classifyToolFailure(resultText) {
+  const t = String(resultText || "").toLowerCase();
+  if (!t) return "other";
+  if (/not found|no such file|enoent|404|does not exist|missing file|不存在|找不到/.test(t)) return "not_found";
+  if (/permission|eacces|eperm|access denied|denied|forbidden|403|权限/.test(t)) return "permission";
+  if (/timeout|timed out|etimedout|aborted|abortcontroller|超时/.test(t)) return "timeout";
+  if (/invalid|bad request|400|malformed|required parameter|missing parameter|unexpected token|参数错误|schema/.test(t)) return "invalid_input";
+  if (/econnrefused|econnreset|enotfound|network|fetch failed|dns|socket hang|502|503|连接失败|网络/.test(t)) return "network";
+  return "other";
+}
+
+// 工具成功率聚合：按工具统计成功/失败次数、失败类别分布、最近失败原因，返回紧凑文本行
 // 用于注入编排器（当前会话账本）
 function _toolLedgerStats(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return "";
@@ -34087,16 +34248,26 @@ function _toolLedgerStats(entries) {
   for (const e of entries) {
     const k = e.tool;
     if (!k) continue;
-    if (!agg.has(k)) agg.set(k, { okCount: 0, failCount: 0, lastFailReason: "" });
+    if (!agg.has(k)) agg.set(k, { okCount: 0, failCount: 0, lastFailReason: "", failCats: new Map() });
     const v = agg.get(k);
     if (e.ok) v.okCount++;
-    else { v.failCount++; if (e.reason) v.lastFailReason = String(e.reason).slice(0, 60); }
+    else {
+      v.failCount++;
+      if (e.reason) v.lastFailReason = String(e.reason).slice(0, 60);
+      // 失败类别分布：账本行体现 permission×2 这类事实，帮编排器学到失败教训
+      const cat = _classifyToolFailure(e.reason || "");
+      v.failCats.set(cat, (v.failCats.get(cat) || 0) + 1);
+    }
   }
   const lines = [];
   for (const [tool, data] of agg) {
     const total = data.okCount + data.failCount;
     if (total === 0) continue;
-    const f = data.failCount > 0 && data.lastFailReason ? ` (最近失败：${data.lastFailReason})` : "";
+    let f = "";
+    if (data.failCount > 0) {
+      const cats = [...data.failCats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}×${n}`).join(",");
+      f = ` (${cats}${data.lastFailReason ? `；最近失败：${data.lastFailReason}` : ""})`;
+    }
     lines.push(`${tool}: ${data.okCount}✓/${data.failCount}✗${f}`);
   }
   lines.sort((a, b) => {
@@ -34125,11 +34296,17 @@ function _buildScenarioSignature(profile) {
   return sigs.join("_").slice(0, 180);
 }
 
-// 跨会话经验存储（localStorage）：写入一条记录
-function _toolExpRecord(profileKeys, toolName, ok) {
+// 跨会话经验存储（localStorage）：写入一条记录。失败时附带自动分类的 failCategory
+// 和原始细节 failDetail（放宽到 200 字：截太短经常砍掉真正的错误原因）。
+function _toolExpRecord(profileKeys, toolName, ok, failDetail = "") {
+  try { _perfPhase("_toolExpRecord:localStorage"); } catch {}
   try {
     const sig = _buildScenarioSignature(profileKeys);
     const rec = { sig, tool: toolName, ok, ts: Date.now() };
+    if (!ok) {
+      rec.failCategory = _classifyToolFailure(failDetail);
+      rec.failDetail = String(failDetail || "").slice(0, 200);
+    }
     const key = "michael-ide.tool-experience";
     let arr;
     try { arr = JSON.parse(localStorage.getItem(key) || "[]") || []; } catch { return; }
@@ -34141,6 +34318,7 @@ function _toolExpRecord(profileKeys, toolName, ok) {
 
 // 跨会话经验检索：用 sig 检索同类历史记录，聚合成经验文本（最多 8 条）
 function _toolExpRetrieve(profileKeys, limit = 8) {
+  try { _perfPhase("_toolExpRetrieve:localStorage"); } catch {}
   try {
     const sig = _buildScenarioSignature(profileKeys);
     const key = "michael-ide.tool-experience";
@@ -34162,24 +34340,97 @@ function _toolExpRetrieve(profileKeys, limit = 8) {
       const tail = items.slice(-3);
       if (tail.every((x) => !x.ok)) warnings.add(k.split("|")[0]);
     }
-    // 按工具名聚合：总调用、成功、失败、警告标记
+    // 按工具名聚合：总调用、成功、失败、失败类别分布、警告标记
     const summary = new Map();
     for (const e of matchings) {
-      if (!summary.has(e.tool)) summary.set(e.tool, { ok: 0, fail: 0, warned: warnings.has(e.tool) });
+      if (!summary.has(e.tool)) summary.set(e.tool, { ok: 0, fail: 0, warned: warnings.has(e.tool), cats: new Map() });
       const s = summary.get(e.tool);
       if (e.ok) s.ok++;
-      else s.fail++;
+      else {
+        s.fail++;
+        const cat = e.failCategory || _classifyToolFailure(e.failDetail || "");
+        s.cats.set(cat, (s.cats.get(cat) || 0) + 1);
+      }
     }
+    // 失败类别 → 行动建议映射（事实+建议，不禁止；判断权在编排模型）
+    const catAdvice = {
+      not_found: "建议先确认文件/资源存在",
+      permission: "建议先确认路径/权限",
+      timeout: "建议缩小范围或改后台执行",
+      invalid_input: "建议先核对参数格式",
+      network: "建议先确认网络/服务可达",
+    };
     const lines = [];
     for (const [tool, data] of summary) {
       const warn = data.warned ? " ⚠️ 该工具在此类场景近期屡次失败，除非有新证据否则考虑替代方案" : "";
-      lines.push(`${tool}: ${data.ok}✓/${data.fail}✗${warn}`);
+      let catText = "";
+      if (data.fail > 0 && data.cats.size) {
+        const top = [...data.cats.entries()].sort((a, b) => b[1] - a[1])[0];
+        catText = `（在此类场景 ${top[0]} 失败 ${top[1]} 次${catAdvice[top[0]] ? ` → ${catAdvice[top[0]]}` : ""}）`;
+      }
+      lines.push(`${tool}: ${data.ok}✓/${data.fail}✗${catText}${warn}`);
       if (lines.length >= limit) break;
     }
     return lines.join("\n");
   } catch {
     return "";
   }
+}
+
+// 编排结果硬性合理性检查（机制层收敛，不硬 reject——判断权留给模型）：
+// 1) 工具数 >15 → 截断保留前 12（编排器输出按相关度排序，前部最相关）；
+// 2) 同类工具堆叠（搜索类 / 读取列举类各 >3）→ 去重保留最相关的 3 个；
+// 3) 构建型任务但选出的全是查询/读取类、零实现类 → 只提示不拦截。
+// notes 追加进给主模型的编排 nudge，让它知情后自行权衡。
+function _validateToolOrchestration(tools, toolRegistry, profile) {
+  const notes = [];
+  let list = Array.isArray(tools) ? tools.map((t) => String(t || "").trim()).filter(Boolean) : [];
+  // 静默过滤注册表里不存在的名字（编排模型可能幻觉工具名；后续 schema 映射本就会丢）
+  if (toolRegistry && typeof toolRegistry.get === "function") {
+    list = list.filter((name) => !!toolRegistry.get(name));
+  }
+  // 数量收敛：一次装太多工具，弱模型注意力直接被打散
+  if (list.length > 15) {
+    list = list.slice(0, 12);
+    notes.push("工具过多易分心，已收敛到 12 个；其余可用 search_tools 按需请求");
+  }
+  // 同类堆叠收敛：同一类能力选一堆只会互相抢注意力
+  const _capKind = (kindRe, label) => {
+    const hits = list.filter((name) => kindRe.test(name));
+    if (hits.length > 3) {
+      const keep = new Set(hits.slice(0, 3));
+      list = list.filter((name) => !kindRe.test(name) || keep.has(name));
+      notes.push(`${label}类工具选了 ${hits.length} 个，已保留最相关的 3 个（${hits.slice(0, 3).join("、")}）`);
+    }
+  };
+  _capKind(/search/i, "搜索");
+  _capKind(/^(read|list|get)_/i, "读取/列举");
+  // 构建型任务缺实现类工具：只把事实说给主模型，不替它硬塞工具
+  const buildType = !!(profile && (profile.substantial || profile.uiProject || profile.fromZeroUiProject || profile.implementation || profile.projectScope));
+  if (buildType && list.length) {
+    const mutRe = /write|edit|create|apply|patch|replace|delete|move|rename|mkdir|run|cmd|terminal|exec|install|git|automation/i;
+    if (!list.some((name) => mutRe.test(name))) {
+      notes.push("本任务是构建/实现型，但当前选择全是查询/读取类，缺少实现类工具（写文件/执行命令等）——如确需落地改动请用 search_tools 补充相应能力");
+    }
+  }
+  return { tools: list, notes };
+}
+
+// 弱模型判定（纯名称事实，不发请求）：用于工具窗口收敛。MoE 激活参数标识（aNb）
+// 优先于总参：qwen3.6-35b-a3b 总参 35b 但激活仅 3b → 弱。普通参数量标识用数值范围
+// 判断（≤8b 才算弱），避免 70b/72b/32b 被关键字包含误伤。
+function _isWeakModel(modelId) {
+  const id = String(modelId || "").toLowerCase();
+  if (!id) return false;
+  // 轻量命名系标识（词边界：避免 minimax/airoboros 这类子串误中）
+  if (/(?:^|[^a-z])(mini|nano|air|flash|small|lite|tiny)(?![a-z])/.test(id)) return true;
+  // MoE 激活参数标识优先：a3b/a8b 等激活量才是真实认知宽度
+  const act = id.match(/(?:^|[^a-z0-9])a(\d+(?:\.\d+)?)b(?![a-z0-9])/);
+  if (act) return parseFloat(act[1]) <= 8;
+  // 普通参数量标识：最小一档 ≤8b 判弱（llama-3-70b/qwen2.5-32b 不误伤）
+  const sizes = [...id.matchAll(/(?:^|[^a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])/g)].map((m) => parseFloat(m[1]));
+  if (sizes.length) return Math.min(...sizes) <= 8;
+  return false;
 }
 
 // 语义工具调度器：首轮、用户改意图、每批真实工具结果之后都可以调用。它看到完整的
@@ -34505,6 +34756,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     run.mcpToolCache = [];
     _startRunMcpDiscovery(run, run.mcpRoot);
   }
+  // 会话历史规模快照（历史幻觉压制用）：在 harness 注入任何附加消息前统计。>2 说明带着
+  // 旧对话进场——旧对话里「已搭好 Electron+React 框架」之类的叙述会压过磁盘实况（实测
+  // 弱模型直接把历史当现状复述）。
+  if (isAgent) run._historyMsgCount = (Array.isArray(messages) ? messages : []).filter((m) => m && (m.role === "user" || m.role === "assistant")).length;
   // 空工作区前置登记：模型开场直接猜 read_file package.json/src/main.tsx（不先 list_dir）时，
   // _emptyRootSkipMessage 因为空根从未登记而不拦 → 撞真实 cannot stat 错误卡（实测：旧对话/
   // 旧项目残影让它乱探已删除的文件）。运行一启动就后台探一次根目录，空的立刻登记；
@@ -34584,6 +34839,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
+  // UI verification phase machine: 'idle' | 'running' | 'completed'. Prevent reset-on-mutation loops by only clearing nudges on first entry into running.
+  let _uiVerifyPhase = "idle", _uiVerifyTotal = 0;
   let _uiDeliveryAuditedAtImplOps = -1, uiDeliveryAuditRuns = 0, uiDeliveryAuditNudges = 0;
   let _uiFreshNavigated = false, _uiActionPassed = false, _uiInteractionPassed = false;
   const _uiPassedViewports = new Set();
@@ -34630,6 +34887,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     || run.engineering.fromZeroUiProject || run.engineering.uiProject || run.engineering.fullWebsite || run.engineering.implementation));
   run._emptyBuildNudges = 0;        // 行动催促次数（整 run 上限 2，防死循环）
   run._emptyBuildIntercepted = false; // 收尾拦截只拦 1 次，第二次放行走既有诚实收尾约束
+  run._emptyExploreCount = 0;       // 空目录探索计数：第 1 次 list/纯探索命令放行取证，第 2 次起机制层短路（_emptyExploreSkipMessage）
   const _quick = () => task.trim().length < 80 && !run.engineering?.applies && !_mustUseWorkspaceTools;
   const _pad = { goal: (task || "").slice(0, 200), requirements: run._requirementsChecklist, modified: new Map(), errors: [], findings: [], done: [] };
   // 真·多智能体上下文协议：把这张运行草稿纸挂到 run 上（run 已经会传进每个子智能体/worker）。
@@ -34705,15 +34963,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       reason: (() => {
         if (!ok && it.rawResult?.content) {
           const raw = String(it.rawResult.content);
-          return raw.slice(0, 70);
+          // 200 字：旧上限 70 经常把真正的错误原因截掉，失败分类/经验沉淀都缺料
+          return raw.slice(0, 200);
         }
         return "";
       })(),
     };
     run._toolLedger.entries.push(rec);
     if (run._toolLedger.entries.length > 400) run._toolLedger.entries.shift();
-    // 跨会话经验记录：从 run.engineering 提取签名写入 localStorage（用于下一次编排器检索）
-    try { _toolExpRecord(run.engineering, rec.tool, ok); } catch {}
+    // 跨会话经验记录：从 run.engineering 提取签名写入 localStorage（用于下一次编排器检索）；
+    // 失败时把原因文本一并传入，供分类记账（failCategory/failDetail）
+    try { _toolExpRecord(run.engineering, rec.tool, ok, rec.reason); } catch {}
   };
   const _routeAgentTools = async (phase, evidence = "", taskDelta = "") => {
     // 配额 24：after_tools 检查点每个工具批次都触发，旧上限 8 在长任务前 8 批就烧光，
@@ -34748,7 +35008,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     if (!decision) return null;
     // 工具规划思考链可视化已关闭：不再渲染独立的🧠工具规划卡片，消除冗余思考和 UI 噪音。
     // 保留 decision 数据供后续工具调度使用，但去掉 thought 字段的强制输出
-    const requestedSchemas = _criticRequestedToolSchemas(decision.tools, run._toolRegistry, 10);
+    // 编排结果先过硬性合理性检查：收敛列表（不 reject），notes 拼进下方 nudge 让主模型知情
+    const orchCheck = _validateToolOrchestration(decision.tools, run._toolRegistry, run.engineering);
+    let routeToolNames = orchCheck.tools;
+    // 弱模型工具窗口收敛：注意力预算有限，>10 个只装载前 8 个，其余留给 search_tools
+    // 按需动态装载；强模型不受此限制
+    if (routeToolNames.length > 10 && _isWeakModel(config?.model)) {
+      routeToolNames = routeToolNames.slice(0, 8);
+      orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
+    }
+    const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
     const update = requestedSchemas.length
       ? _applyToolPayloadWindow(toolSchemas, requestedSchemas, run._toolCoreNames)
       : null;
@@ -34762,12 +35031,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       thought: decision.thought || "",
     });
     if (_toolRoutingState.history.length > 8) _toolRoutingState.history.shift();
-    if (available.length || decision.instruction) {
+    if (available.length || decision.instruction || orchCheck.notes.length) {
       const availability = available.length
         ? `当前阶段可直接调用：${available.join("、")}${newlyLoaded.length ? `（新装载 ${newlyLoaded.join("、")}）` : ""}。`
         : "当前阶段不需要增加新工具。";
       const reasonText = decision.reason ? `\n选择依据：${decision.reason}` : "";
-      _pushNudge("dynamicToolRoute", `[动态工具编排·${String(phase || "next")}] ${availability}${reasonText}${decision.instruction ? `\n执行顺序：${decision.instruction}` : ""}\n直接执行所需工具，不要向用户讲解内部工具装载过程。`);
+      // 合理性检查的 notes 随编排指令一起送达：事实告知，判断权留给主模型
+      const notesText = orchCheck.notes.length ? `\n编排收敛提示：${orchCheck.notes.join("；")}。` : "";
+      _pushNudge("dynamicToolRoute", `[动态工具编排·${String(phase || "next")}] ${availability}${reasonText}${decision.instruction ? `\n执行顺序：${decision.instruction}` : ""}${notesText}\n直接执行所需工具，不要向用户讲解内部工具装载过程。`);
     }
     return { decision, update, available, newlyLoaded };
   };
@@ -34885,6 +35156,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           && ((run._emptyBuildNudges === 0 && iter >= 2) || (run._emptyBuildNudges === 1 && iter >= 5))) {
         run._emptyBuildNudges++;
         _pushNudge("emptyBuildAct", "[行动门禁] 环境和方案已经想得够多了，现在立即开始 write_file 创建第一批文件；剩余的设计决策边写边定，不要再输出纯思考。");
+      }
+      // ── 空项目历史幻觉压制（一次性事实注入）：空目录起步 + 会话里带着旧对话（历史消息 >2）
+      //    时注入磁盘硬事实——实测弱模型会声称「我看了项目历史，之前已经搭建了框架」而磁盘上
+      //    根本不存在（历史叙述压过磁盘实况）。每 run 只注入一次，写入开始后不再需要。
+      if (isAgent && run._emptyRootAtStart && !run._historyInvalidatedNote && !didMutate && _implOps === 0
+          && (run._historyMsgCount || 0) > 2) {
+        run._historyInvalidatedNote = true;
+        _pushNudge("emptyHistoryFact", "⚠️ 磁盘实况: 当前目录为空 (0 文件)。历史对话中提到的任何文件/框架/搭建成果在磁盘上均**不存在**——历史信息已作废，以磁盘为准，直接重新开建，不要'确认当前状态'。");
       }
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
@@ -35197,7 +35476,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         });
         const _missingRequiredEffect = _missingEffects.length > 0;
         const _missingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
-        const _uiSettled = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps || uiVerifyNudges >= 2 || (run._uiVerifyTotal || 0) >= 4;
+        const _uiSettled = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps || uiVerifyNudges >= 2 || (_uiVerifyTotal || 0) >= 4;
+        // Browser operation dedup ledger: track recent actions to prevent repeated same operations
+        if (!run._browserOpLog) run._browserOpLog = [];
         const _uiDeliveryRequired = !!(run.engineering.fullWebsite && run.engineering.uiProject);
         const _requirementsSettled = !_uiDeliveryRequired || !didMutate || _uiDeliveryAuditedAtImplOps >= _implOps || uiDeliveryAuditRuns >= 3;
         const _semanticRuntimeSettled = _semanticRuntimeAtImplOps < 0
@@ -35402,16 +35683,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
         }
         const _needUiVerify = run.engineering.ui && didMutate && _uiVerifiedAtImplOps < _implOps;
-        // 全 run 总预算：每次改动都会把 uiVerifyNudges 清零重启循环（改一下→催验→验出小问题
-        // →再改→清零→再催），网站任务“自动验证停不下来”就是它。全 run 共 4 次封顶，
-        // 超了不再催验直接放行收尾，未验部分由诚实收尾约束如实说明。
-        run._uiVerifyTotal = run._uiVerifyTotal || 0;
-        if (_needUiVerify && _live() && uiVerifyNudges < 2 && run._uiVerifyTotal < 4) {
-          uiVerifyNudges++;
-          run._uiVerifyTotal++;
+        // Full run budget: limit total nudges across all mutations, not reset each time.
+        if (_needUiVerify && _live()) {
+          // On first entry into verification from idle/completed, clear nudge counter for fresh round
+          if ((_uiVerifyPhase === "idle" || _uiVerifyPhase === "completed") && uiVerifyNudges >= 2) {
+            uiVerifyNudges = 0;
+            _uiVerifyPhase = "running";
+          }
+          // During running phase, do NOT clear on mutations – accumulate nudges until verification succeeds
           const browserSchema = run._toolRegistry?.get("browser");
           if (browserSchema && !toolSchemas.some((t) => t?.function?.name === "browser")) {
             _applyToolPayloadWindow(toolSchemas, [browserSchema], run._toolCoreNames);
+          }
+          // Increment counters when pushing a nudge
+          uiVerifyNudges++;
+          _uiVerifyTotal++;
+          // If nudge count hit limit, set phase to completed so next mutation clears nudges
+          if (uiVerifyNudges >= 2 || _uiVerifyTotal >= 4) {
+            _uiVerifyPhase = "completed";
           }
           const _nudgeContent = uiVerifyNudges === 1
             ? (run._uiFullMatrixDone
@@ -35627,6 +35916,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             it.step = er.step;
             it.rawResult = er.result;
             if (run && _toolExecutionSucceeded(er.call, er.result)) {
+              // 流式即写的成功写盘也要计入改动 tick（失败命令重跑短路的"期间有无改动"事实）。
+              if (_toolMutatesWorkspace(er.call, er.result)) run._fsMutTick = (run._fsMutTick || 0) + 1;
               it._planAdvanced = true;
               _advancePlanFromTool(run, er.call, er.result);
             }
@@ -35964,6 +36255,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (result && typeof result === "object") result.verification = true;
         }
         it.rawResult = result; // keep the raw result so the loop can pick up e.g. screenshot images
+        // 工作区改动事实 tick：任何成功的改动类工具（含改文件命令）都 +1，供失败命令
+        // 重跑短路判定"失败后是否改过东西"。在 settle 时就记，保证同一批里
+        // "先改 package.json 再重跑 npm install"能立即放行。
+        if (run && _toolMutatesWorkspace(call, result) && _toolExecutionSucceeded(call, result)) {
+          run._fsMutTick = (run._fsMutTick || 0) + 1;
+        }
         const executionEvidence = _executionEvidenceFromTool(call, result, root);
         if (run && executionEvidence) {
           run._executionEvidence.push({ ...executionEvidence, implementationVersion: _implOps });
@@ -36056,6 +36353,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         it._workerMutationPaths = [];
         const report = await _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: isWorker, scope: it.call.scope || [], role: it.call.role || "", onMutation: (path) => {
           workerMutated = true;
+          if (run) run._fsMutTick = (run._fsMutTick || 0) + 1; // worker 写盘也算工作区改动 tick
           if (path && !it._workerMutationPaths.includes(path)) it._workerMutationPaths.push(path);
         } });
         if (isWorker && workerMutated) it._workerMutated = true;
@@ -36374,11 +36672,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           for (const kind of _externalEvidenceKinds(it.call, it.rawResult)) _externalEffects.add(kind);
         }
         if (_workspaceMutated) {
+          // Clear browser operation dedup ledger on mutation so post-mutation checks are legitimate
+          if (run._browserOpLog) run._browserOpLog = [];
           const mutationPath = it._wikiPath || it.call._resolvedPath || it.call.path || it.call.dest || it.call.to || "";
           _invalidateSessionReadEvidence(run, root,
             mutationPath,
             it.call.from, it.call.to, it.call.dest);
           didMutate = true;
+          run._didMutate = true; // 挂 run 上的「本 run 已有写操作」事实，供机制层（空目录探索短路等）直接判定
           // 纯文档改动（README/CHANGELOG/LICENSE…）不可能破坏代码 → 不重新武装验证门禁。
           // 否则"代码已验证完 → 收尾补写 README → 门禁又跑一轮自动验证"，用户看到的就是
           // 干完活还弹"验证器不可用"红卡。注意 requirements.txt / *.json 等会影响运行的
@@ -36396,8 +36697,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _semanticReviewInstruction = "";
             if (run.engineering.ui) {
               const _hadVerifiedUi = _uiVerifiedAtImplOps >= 0;
-              // 只清"验证凭证"，不清浏览器现实状态：改文件不会关浏览器也不会变视口——
-              // HMR 已热更，逼模型每次改动都重新 fresh 导航+重设视口 = 没完没了重开浏览器。
+              // Only clear "verification credentials", not browser runtime state: editing files doesn't close browser or change viewport—
+              // HMR already hot-reloads, forcing model to fresh navigate+re-set viewport each time = endless browser restart loops.
               _uiPassedViewports.clear();
               _uiVerifiedAtImplOps = -1;
               _uiActionPassed = false;
@@ -36405,7 +36706,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               _uiInteractionViewports.clear();
               _uiDeliveryAuditedAtImplOps = -1;
               run._uiDeliveryAuditUnresolved = [];
-              if (_hadVerifiedUi) uiVerifyNudges = 0;
+              // Reset nudge counter and phase on verified completion → next mutation re-arms
+              if (_hadVerifiedUi) {
+                uiVerifyNudges = 0;
+                _uiVerifyPhase = "idle";
+              }
             }
           }
           if (mutationPath && t !== "cmd" && t !== "termtask") {
@@ -36423,6 +36728,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         if (t === "worker" && it._workerMutated) {
           didMutate = true;
+          run._didMutate = true; // 同上：worker 的写操作也算本 run 已有写操作
           // 验证门已拆，不再写 verificationPassed=false。
           _implOps++;
           for (const kind of ["build", "test", "run", "package"]) _runtimeEffects.delete(kind);
@@ -36432,8 +36738,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _semanticReviewInstruction = "";
           if (run.engineering.ui) {
             const _hadVerifiedUi = _uiVerifiedAtImplOps >= 0;
-            // 只清"验证凭证"，不清浏览器现实状态：改文件不会关浏览器也不会变视口——
-            // HMR 已热更，逼模型每次改动都重新 fresh 导航+重设视口 = 没完没了重开浏览器。
+            // Only clear "verification credentials", not browser runtime state: editing files doesn't close browser or change viewport—
+            // HMR already hot-reloads, forcing model to fresh navigate+re-set viewport each time = endless browser restart loops.
             _uiPassedViewports.clear();
             _uiVerifiedAtImplOps = -1;
             _uiActionPassed = false;
@@ -36441,7 +36747,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _uiInteractionViewports.clear();
             _uiDeliveryAuditedAtImplOps = -1;
             run._uiDeliveryAuditUnresolved = [];
-            if (_hadVerifiedUi) uiVerifyNudges = 0;
+            // Reset nudge counter and phase on verified completion → next mutation re-arms
+            if (_hadVerifiedUi) {
+              uiVerifyNudges = 0;
+              _uiVerifyPhase = "idle";
+            }
           }
           for (const s of (it.call.scope || [])) _mutatedFiles.add(_normRel(s, root));
         }
@@ -36512,11 +36822,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               && _uiInteractionViewports.has("desktop") && _uiInteractionViewports.has("mobile")) {
             run._uiFullMatrixDone = true;
             _uiVerifiedAtImplOps = _implOps;
+            _uiVerifyPhase = "completed";
           } else if (run._uiFullMatrixDone && _uiFreshNavigated
               && _uiPassedViewports.size > 0 && _uiInteractionViewports.size > 0) {
-            // 复验像人一样：全套双视口矩阵本 run 已过一遍，修补后的复验只需在受影响的
-            // 视口重跑 healthy check + 交互断言——改哪验哪，不重复全套仪式。
+            // Re-verify like a human: full dual-viewport matrix already done this run, repair-only re-check needs healthy check + interaction assertions on affected viewports only — verify what you changed, don't repeat full ceremony.
             _uiVerifiedAtImplOps = _implOps;
+            _uiVerifyPhase = "completed";
           }
         }
         if (it.tc.name === "update_plan") {
@@ -36646,6 +36957,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         _callLog.push({ sig, failed, dupRead });
       }
       if (_callLog.length > 12) _callLog.splice(0, _callLog.length - 12);
+      let _stuckNudgedNow = false; // 同批已触发 stuck 提醒时，探测循环检测让行，不叠加同类干预
       {
         const win = _callLog.slice(-8);
         const counts = {};
@@ -36667,6 +36979,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if ((maxFailRepeat >= 3 || fails >= 4 || maxRepeat >= 6 || dupReads >= 2) && stuckNudges < 2 && _live()) {
           stuckNudges++;
           runHadTrouble = true;
+          _stuckNudgedNow = true;
           const _stuckSig = win.map((e) => e.sig).join("; ").slice(0, 400);
           _callLog.length = 0; // fresh window after intervening
           if (stuckNudges >= 2) {
@@ -36676,6 +36989,39 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           } else {
             _pushNudge("stuck", "你在**重复同样的动作 / 连续失败**，看起来卡住了。别再原样重试。先找这些失败共同依赖的错误假设，然后换一种真正不同的策略：目标文件已知就直接使用已有读取证据或精读具体范围；只有位置未知才换工具定位一次；外部 API 不确定才查官方文档。方向确实无法从现有证据确定时再 ask_user。");
           }
+        }
+      }
+
+      // ── 探测循环检测（根因检查点）：连续 4 批只有读/列/搜/纯探索命令、期间零改动、
+      //    ≥2 次失败/未找到 → 模型在不推根因地逐个乱猜。上面的 stuck-nudge 认不出这种
+      //    "每次都换目标、大多成功返回"的空转（签名各不相同、失败数不够），这里按批次
+      //    事实补检；同批已触发 stuck 提醒时跳过，不叠加同类干预。
+      if (items.length && !_stuckNudgedNow && _live()) {
+        const _probeFailRe = /not found|no such|不存在|未找到|ENOENT/i;
+        const _probeEntries = [];
+        let _allProbe = true;
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          if (!it.call || _isMergedToolItem(it)) continue;
+          if (!_isProbeToolCall(it.call, root)) _allProbe = false;
+          const _text = String((toolMsgs[i] && toolMsgs[i].content) || it.rawResult?.content || "");
+          const _ok = _toolExecutionSucceeded(it.call, it.rawResult) && !_probeFailRe.test(_text.slice(0, 2000));
+          _probeEntries.push({
+            tool: String(it.tc?.name || it.call?._toolName || it.call?.type || ""),
+            argsSummary: it.call.type === "cmd" ? String(it.call.command || "").slice(0, 40) : String(it.call.path || "").slice(0, 40),
+            ok: _ok,
+          });
+        }
+        const _probeMsg = _probeLoopNudgeMessage(run, {
+          calls: _probeEntries.length,
+          allProbe: _probeEntries.length > 0 && _allProbe,
+          mutTick: (run._fsMutTick || 0) + _implOps, // 任一成功的工作区改动都会推进
+          fails: _probeEntries.filter((e) => !e.ok).length,
+          entries: _probeEntries,
+        });
+        if (_probeMsg) {
+          runHadTrouble = true;
+          _pushNudge("probeLoop", _probeMsg);
         }
       }
 
@@ -36807,6 +37153,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       result: String(_outcomeSummary || summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
       mutated: !!didMutate, // 「接下来」建议据此区分干活轮和纯问答轮
+      toolStats: _toolLedgerStats(run._toolLedger?.entries || []),
+      failureCategory: lastTurnHadFailure ? (() => { const lastFailed = (run._toolLedger?.entries || []).reverse().find(e => !e.ok); return lastFailed ? _classifyToolFailure(lastFailed.reason || "") : ""; })() : "",
+      lastError: finalErr ? String(finalErr).slice(0, 300) : "",
+      mutatedFileCount: _mutatedFiles.size,
+      mutatedFileTypes: [..._mutatedFiles].reduce((acc, p) => { if (/\.(tsx?|jsx?|py|rs|go|java)$/.test(p)) acc.add("src"); else if (/\.test\.|\.spec\./.test(p)) acc.add("test"); else if (/\.(json|yaml|toml|lock)$/.test(p)) acc.add("config"); return acc; }, new Set()),
+      runtimeEffects: [..._runtimeEffects],
+      externalEffects: [..._externalEffects],
+      planStepsStatus: { total: planSteps?.length || 0, completed: planSteps?.filter(s => s.status === "completed").length || 0, pending: planSteps?.filter(s => s.status === "pending" || s.status === "in_progress").length || 0 },
+      hadDiagnostics: !!_prevVerifyErrs || !!_LSPDiagnostics,
       updatedAt: Date.now(),
     };
     saveChatHistory({ immediate: true }); // CRITICAL: 立即刷盘，别用防抖——任务刚完成用户就 Cmd+Q 时防抖没落盘会丢最后一轮。也捕获渲染后的 transcript 快照。
@@ -36846,7 +37201,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     }
     // Growth: an edit-bearing run that verified its own work (tests/build/diag)
     // vs shipped unverified — the beneficial-usage signal that counters deskilling.
-    if (didMutate) growth.signal("run-complete", { verified: didVerify && verificationPassed && uiVerificationPassed });
+    if (didMutate) {
+      try { _perfPhase("growth:run-complete"); } catch {}
+      growth.signal("run-complete", { verified: didVerify && verificationPassed && uiVerificationPassed });
+    }
     saveChatHistory();
     try {
       const _ru = session._runUsage;
@@ -37153,23 +37511,119 @@ try { window.__midePerfPhase = _perfPhase; } catch {}
   let _devOn = false;
   try { _devOn = !!(import.meta && import.meta.env && import.meta.env.DEV); } catch {}
   if (_devOn) {
+    // 日志追加：STALL/SLEEP/LONGTASK 共用同一条落盘通道（读旧尾部 + 追加，保留最后 400 行）。
+    const _perfLogAppend = (text) => {
+      backend.readTextFile(_PERF_LOG_FILE).catch(() => "").then((prev) => {
+        const kept = String(prev || "").split("\n").slice(-400).join("\n");
+        return backend.writeTextFile(_PERF_LOG_FILE, kept + text + "\n");
+      }).catch(() => {});
+    };
+    // 哨兵版本自证：页面每次加载先落一行版本戳——取证时一眼确认运行页面装的是
+    // 哪版取证代码，免得对着旧哨兵的日志分析新机制的盲区。
+    _perfLogAppend(`SENTINEL v3 loaded ${new Date().toISOString()}`);
+    // === 睡眠过滤：区分“真冻结”与“系统睡眠”，否则合盖几分钟会被误记成 STALL 污染日志 ===
+    // 主判据（时钟漂移）：performance.now() 基于单调时钟，macOS 系统睡眠期间暂停；
+    // Date.now() 是墙钟，照走。真冻结只是事件循环被堵，两个时钟都在走，恢复后两者
+    // 的增量一致（drift≈0）；睡眠恢复后墙钟增量远大于单调钟增量（drift≈睡眠时长）。
+    // 基线每次心跳都刷新，所以 drift 永远只衡量本次 gap 窗口内的差值。
+    // 辅助判据（页面隐藏）：记录 visibilitychange 的最后隐藏/恢复时刻；gap 期间页面
+    // 处于 hidden，或 gap 恰好横跨 hidden→visible 转换，同样按睡眠处理。
+    let _lastHiddenAt = 0;
+    let _lastVisibleAt = 0;
+    try {
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) _lastHiddenAt = Date.now(); else _lastVisibleAt = Date.now();
+      });
+    } catch {}
     let _lastBeat = Date.now();
+    let _lastBeatPerf = performance.now();
     setInterval(() => {
       const now = Date.now();
+      const perfNow = performance.now();
       const gap = now - _lastBeat;
+      const perfGap = perfNow - _lastBeatPerf;
       _lastBeat = now;
+      _lastBeatPerf = perfNow;
       if (gap < 1600) return; // 500ms 节拍 + 容忍正常抖动
       try {
+        // 睡眠判定：gap 超 60s 才考虑（真冻结极少超过 1 分钟，而合盖动辄几分钟），
+        // 命中时钟漂移或页面隐藏任一判据即记 SLEEP。
+        const drift = gap - perfGap;
+        const winStart = now - gap;
+        const hiddenInGap = document.hidden
+          || (_lastHiddenAt >= winStart - 1000 && _lastHiddenAt <= now)
+          || (_lastVisibleAt >= winStart && _lastHiddenAt > 0 && _lastHiddenAt <= _lastVisibleAt);
+        if (gap > 60000 && (drift > gap * 0.5 || hiddenInGap)) {
+          _perfLogAppend(`${new Date().toTimeString().slice(0, 8)} SLEEP ${gap}ms (非冻结 drift=${Math.round(drift)}ms hidden=${hiddenInGap ? 1 : 0})`);
+          return;
+        }
         const inWindow = _perfPhases.filter((p) => p.t >= now - gap - 200).map((p) => `${p.name}@-${now - p.t}ms`);
         let dom = -1; try { dom = document.getElementsByTagName("*").length; } catch {}
         let heap = ""; try { const m = performance.memory; if (m) heap = ` heap=${Math.round(m.usedJSHeapSize / 1048576)}MB`; } catch {}
         const line = `${new Date().toTimeString().slice(0, 8)} STALL ${gap}ms dom=${dom}${heap} phases=[${inWindow.join(" | ") || "（冻结窗口内无相位标记——热点在未标记代码或 GC）"}]`;
-        backend.readTextFile(_PERF_LOG_FILE).catch(() => "").then((prev) => {
-          const kept = String(prev || "").split("\n").slice(-400).join("\n");
-          return backend.writeTextFile(_PERF_LOG_FILE, kept + line + "\n");
-        }).catch(() => {});
+        _perfLogAppend(line);
       } catch {}
     }, 500);
+    // === longtask 观察器：心跳只能报“冻了多久”，longtask 能把 >500ms 的长任务逐个报出来，
+    // 连同 attribution（能取到时）一起落盘。注册整体 try/catch：WKWebView 可能不支持
+    // longtask，不支持就静默跳过，只 console.warn 一次。
+    try {
+      if (typeof PerformanceObserver === "undefined"
+          || !(PerformanceObserver.supportedEntryTypes || []).includes("longtask")) {
+        console.warn("[perf] 此 webview 不支持 longtask 观察器，已跳过（STALL 心跳仍在）");
+      } else {
+        const obs = new PerformanceObserver((list) => {
+          try {
+            const lines = [];
+            for (const entry of list.getEntries()) {
+              if (!(entry.duration > 500)) continue; // 短长任务（50-500ms）不落盘，避免刷爆日志
+              let attr = "unknown";
+              try {
+                const a = entry.attribution && entry.attribution[0];
+                if (a) attr = `${a.name || "unknown"}/${a.containerType || "?"}`;
+              } catch {}
+              lines.push(`${new Date().toTimeString().slice(0, 8)} LONGTASK ${Math.round(entry.duration)}ms attr=${attr}`);
+            }
+            if (lines.length) _perfLogAppend(lines.join("\n"));
+          } catch {}
+        });
+        obs.observe({ entryTypes: ["longtask"] });
+      }
+    } catch (e) {
+      console.warn("[perf] longtask 观察器注册失败，已跳过:", e?.message || e);
+    }
+    // === rAF 间隙采样（longtask 的 WebKit 替代轨）：PerformanceObserver('longtask') 是
+    // Chromium 专属，macOS WKWebView 上面那段永远走 console.warn 跳过——长任务逐条
+    // 取证在本机是盲区。空转 rAF 循环每帧只记两个时间戳（O(1)，不碰 DOM），相邻
+    // 两帧间隔 >500ms 即主线程被长任务堵住，连同最近一次相位落盘。rAF 在页面隐藏时
+    // 会被 WebKit 直接暂停（所以空转循环不阻止 webview 节能），恢复可见后的第一个
+    // 大间隔属于节能/睡眠而非冻结——复用 STALL 同款 hidden/时钟漂移判据过滤误报。
+    // 仅在 DEV（哨兵启用）时运行，与整个哨兵块同生命周期。
+    {
+      let _rafWall = 0;
+      let _rafPerf = 0;
+      const _rafGapProbe = () => {
+        const now = Date.now();
+        const perfNow = performance.now();
+        if (_rafWall) {
+          const gap = now - _rafWall;
+          const drift = gap - (perfNow - _rafPerf);
+          const winStart = now - gap;
+          const hiddenInGap = document.hidden
+            || (_lastHiddenAt >= winStart - 1000 && _lastHiddenAt <= now)
+            || (_lastVisibleAt >= winStart && _lastHiddenAt > 0 && _lastHiddenAt <= _lastVisibleAt);
+          // 真冻结两个时钟同步走（drift≈0）；睡眠时单调钟暂停（drift≈睡眠时长）。
+          if (gap > 500 && !hiddenInGap && !(gap > 5000 && drift > gap * 0.5)) {
+            const last = _perfPhases[_perfPhases.length - 1];
+            _perfLogAppend(`${new Date().toTimeString().slice(0, 8)} RAFGAP ${gap}ms lastPhase=${last ? `${last.name}@-${now - last.t}ms` : "none"}`);
+          }
+        }
+        _rafWall = now;
+        _rafPerf = perfNow;
+        requestAnimationFrame(_rafGapProbe);
+      };
+      try { requestAnimationFrame(_rafGapProbe); } catch { /* 无 rAF 环境（测试）静默跳过 */ }
+    }
   }
 }
 
@@ -37220,6 +37674,8 @@ function _flushLiveEditorWritePreview(entry, followTail = false) {
   }
   if (preview.shownContent === target) return false;
   _wpDiag("flush:write", entry, `to=${target.length}`);
+  // 哨兵取证：卡死窗口内若正在做编辑器同步，STALL/RAFGAP 的相位直接点名这里。
+  _perfPhase(`streamWriteEditorSync n=${target.length}`);
 
   const current = preview.model.getValue();
   const canAppend = preview.shownContent != null
@@ -37457,6 +37913,13 @@ function _liveWritePreview(entry, container, root = "") {
 // 主线程直接冻死。超过窗口后只渲染尾部 16KB（用户看的本来就是正在打字的尾部），
 // 行数改增量累计；完成后真实工具卡会替换预览，不丢内容。
 const _STREAM_CODE_WIN = 16000;
+// 打开缓冲区同步节流间隔：聊天卡尾窗渲染是 O(窗口)，可以逐帧做；但 Monaco model 同步
+// 每次都要 getValue 全文比对 + applyEdits + TS worker 镜像 + 视口跟随，成本随已流内容
+// 线性上涨，逐帧做等于 O(n²) —— "AI 写大文件时整个应用无响应"的真凶（哨兵实测 00:36
+// 三连卡 3.3s/11.4s/20.5s，相位全空即热点在此前未标记的这条路径）。降到 ≥500ms 一次；
+// 最终一致由 _settleWritePreview 的定格 flush 与落盘后 _applyDiskContentToOpenFile 的
+// 全量快照兜底，节流丢不了最后一段。
+const _STREAM_EDITOR_SYNC_MS = 500;
 function _clipStreamCode(text, upto) {
   const end = upto == null ? text.length : upto;
   if (end <= _STREAM_CODE_WIN) return { view: text.slice(0, end), clipped: false };
@@ -37482,7 +37945,13 @@ function _scheduleWritePreviewFlush(entry) {
     if (lc) lc.textContent = n + " 行";
     const pre = card.querySelector("pre");
     if (pre) pre.scrollTop = pre.scrollHeight;
-    _flushLiveEditorWritePreview(entry);
+    // 已打开 Monaco 缓冲区的同步走节流：节流只降低调用频率，不改护栏语义——
+    // userChanged/committed/superseded 等检查仍在 _flushLiveEditorWritePreview 内部
+    // 每次生效，用户一打字照样立即接管。首次同步不等待，保住"看着它写"的即时感。
+    const nowTs = Date.now();
+    if (!entry._edSyncAt || nowTs - entry._edSyncAt >= _STREAM_EDITOR_SYNC_MS) {
+      if (_flushLiveEditorWritePreview(entry)) entry._edSyncAt = nowTs;
+    }
     _scheduleWritePreviewColor(entry); // colorize on a debounce
   });
 }
@@ -37711,6 +38180,7 @@ function _createToolStep(call) {
     const opened = step.classList.toggle("is-open");
     // Growth: opening an edit's diff to inspect it is a "reviewing AI output" signal.
     if (opened && (call.type === "write" || call.type === "edit" || call.type === "multiedit")) {
+      try { _perfPhase("growth:review-diff"); } catch {}
       growth.signal("review-diff", { ctype: call.type });
     }
   });
@@ -37992,6 +38462,117 @@ async function _refreshEmptyRootBeforeSkip(run, root) {
     }
   } catch {}
   return false;
+}
+
+// ── 空目录探索短路（机制层物理拦截）：实测空目录里弱模型 list 到 0 文件后还会再 list、
+//    再用终端 find 全盘扫描——list 与 cmd 不在 _emptyRootSkipMessage 的拦截类型里，cmd 路径
+//    完全绕过了空目录拦截。这里补上：空目录起步（run._emptyRootAtStart）且本 run 尚无任何
+//    写操作时，第 1 次探索（list_dir / 纯探索 shell 命令）放行取证，第 2 次起直接短路返回
+//    硬事实，不真实执行。解除条件与既有机制一致：write 成功 → _clearRunEmptyRoot 清登记、
+//    每次拦截前 _refreshEmptyRootBeforeSkip 重探磁盘（cmd/mkdir 落盘也会解除）、
+//    run._didMutate 兜底。非空目录起步的正常项目完全走不进这里。
+// 只认「明显纯探索」的命令，拿不准一律放行真实执行（宁可漏拦不可误拦：npm create/git init
+// 等脚手架命令绝不能拦）。
+function _isPureExploreCommand(command, workspaceRoot) {
+  const raw = String(command || "").trim();
+  if (!raw) return false;
+  // 重定向/反引号/子命令/多行 → 可能落盘或复合语义，放行
+  if (/[><`\u000d\u000a]|\$\(/.test(raw)) return false;
+  // 写入类词汇出现在任何位置都放行（find 的 -delete/-exec 也是写）
+  if (/\b(?:tee|mkdir|touch|cp|mv|rm|ln|chmod|chown|xargs|dd|install|init|create|clone)\b/i.test(raw)) return false;
+  if (/(?:^|\s)-(?:delete|exec|execdir|ok|okdir)\b/.test(raw)) return false;
+  // 出现工作区外的绝对路径 / ~ 路径参数 → 不归空目录事实管，放行
+  for (const rawToken of raw.split(/\s+/)) {
+    const token = rawToken.replace(/^["']+|["']+$/g, "");
+    if (token.startsWith("~")) return false;
+    if (token.startsWith("/") || /^[A-Za-z]:[\\/]/.test(token)) {
+      if (!_pathIsAtOrUnder(_normalizeFsPath(token), workspaceRoot)) return false;
+    }
+  }
+  // 每个串联/管道段的词首命令都必须是纯探索命令，任何一段拿不准就放行
+  // （cat/head/tail/which 也是纯读探测——探测循环检测同样复用本词表）
+  const segments = raw.split(/\s*(?:&&|\|\||;|\|)\s*/).map((part) => part.trim()).filter(Boolean);
+  if (!segments.length) return false;
+  return segments.every((segment) => /^(?:find|ls|tree|du|rg|grep|fd|stat|file|wc|cat|head|tail|which)\b/.test(segment));
+}
+function _emptyExploreSkipMessage(run, root, call) {
+  if (!run || run._emptyRootAtStart !== true || run._didMutate) return "";
+  const roots = run._emptyWorkspaceRoots;
+  if (!(roots instanceof Set) || !roots.size || !root) return "";
+  const current = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
+  if (!current) return "";
+  const emptyRoot = [...roots].find((known) => _pathIdentity(known) === _pathIdentity(current));
+  if (!emptyRoot) return "";
+  const type = String(call?.type || "");
+  if (type === "list") {
+    // 列的目标在空根之外（别的绝对路径）不归这里管
+    const listPath = String(call?.path || "").trim().replace(/\\/g, "/");
+    if (listPath && (listPath.startsWith("/") || /^[A-Za-z]:\//.test(listPath))) {
+      const normalized = _normalizeFsPath(listPath);
+      if (!(_pathIsAtOrUnder(normalized, emptyRoot) || _pathIsAtOrUnder(emptyRoot, normalized))) return "";
+    }
+  } else if (type === "cmd") {
+    if (!_isPureExploreCommand(call?.command, emptyRoot)) return "";
+  } else {
+    return "";
+  }
+  // 第 1 次探索放行（真实执行，模型亲眼取证 0 文件），第 2 次起短路返回硬事实
+  if ((run._emptyExploreCount || 0) >= 1) {
+    return "[空目录·已确认] 当前工作区 0 个文件（第 1 次列目录已确认）。不要再探索——结果必然为空。立即按用户需求 write_file/脚手架开建。";
+  }
+  run._emptyExploreCount = (run._emptyExploreCount || 0) + 1;
+  return "";
+}
+
+// ── 探测循环检测（根因检查点）：治「不思考、乱猜试错」。实测 electron path.txt 缺失场景：
+//    模型不推理根因，连续 ls path.txt→列目录→cat package.json→手动跑 node install.js，
+//    烧 12 分钟——而根因（postinstall 下载二进制被墙→设 ELECTRON_MIRROR 重装）一步可推。
+//    既有 stuck-nudge 只认「同签名重复失败≥3 / 总失败≥4 / 同签名重复≥6 / 重读≥2」，这类
+//    每次都换目标、大多"成功返回"却零实质进展的探测流水签名各不相同，永远不触发。
+// 探测类工具调用判定：读/列/搜/找/诊断/符号/日志类 + 纯探索 shell 命令。
+// web_search/web_fetch 故意不算——查外部解法正是我们鼓励的出路，不能被算进空转。
+function _isProbeToolCall(call, workspaceRoot) {
+  if (!call) return false;
+  const type = String(call.type || "");
+  if (["read", "list", "search", "find", "diag", "findsymbol", "semsearch", "logs", "termread", "termlist"].includes(type)) return true;
+  if (type === "cmd" || type === "termtask") return _isPureExploreCommand(call.command, workspaceRoot);
+  return false;
+}
+// 每个工具批次记账一次（batch = {calls, allProbe, mutTick, fails, entries}）。纯事实判定，
+// 全部条件满足才返回 nudge 文案，否则返回 ""：
+//   ① 最近 4 个连续批次全是探测类调用（出现任何写/改/构建批次即窗口作废重计）
+//   ② 期间零 mutation（mutTick 未变化）
+//   ③ 窗口内 ≥2 次失败或"未找到/不存在"类结果
+// 事实清单来自批次账本，判断权留给模型——只强制它先写根因假设，不指定必须做什么。
+function _probeLoopNudgeMessage(run, batch) {
+  if (!run || !batch || !(batch.calls > 0)) return "";
+  const log = run._probeBatchLog = Array.isArray(run._probeBatchLog) ? run._probeBatchLog : [];
+  if (!batch.allProbe) { log.length = 0; return ""; } // 有实质动作 → 连续性中断
+  log.push(batch);
+  if (log.length > 8) log.shift();
+  if ((run._probeLoopNudges || 0) >= 2) return ""; // 每 run 上限 2 次
+  if (log.length < 4) return "";
+  const win = log.slice(-4);
+  if (win.some((b) => b.mutTick !== win[0].mutTick)) return ""; // 期间有改动 → 不是空转
+  const fails = win.reduce((n, b) => n + (Number(b.fails) || 0), 0);
+  if (fails < 2) return "";
+  run._probeLoopNudges = (run._probeLoopNudges || 0) + 1;
+  log.length = 0; // 触发后清窗，避免下一批立即复触发
+  const list = win.flatMap((b) => Array.isArray(b.entries) ? b.entries : []).slice(-12)
+    .map((e) => `${e.tool}${e.argsSummary ? " " + e.argsSummary : ""} ${e.ok ? "✓" : "✗"}`).join("；");
+  return `[根因检查点] 你已连续 ${win.length} 个回合只做探测、无实质进展。探测清单: ${list}。停止逐个试错: ①先用 1-2 句写出当前故障最可能的根因假设 ②说明最小验证/修复动作再执行 ③若涉及安装/下载/网络类故障,考虑先 web_search 查该报错的已知解法 (如镜像源/环境变量),而不是继续翻本地文件。`;
+}
+
+// ── 长耗时安装/下载命令附注（纯事实提示，不拦截不改结果）：实测 electron postinstall 拉
+//    GitHub 二进制被墙时 node install.js 挂 173s+，模型只看输出猜不到"慢"本身就是关键线索。
+//    命令实跑 >60s 且是安装/下载类特征 → 返回一行事实附注供追加到结果文本；
+//    非安装类慢命令（测试/构建/长跑服务）不打扰。
+function _slowInstallCmdNote(command, elapsedMs) {
+  const secs = Math.round((Number(elapsedMs) || 0) / 1000);
+  if (secs <= 60) return "";
+  const raw = String(command || "");
+  if (!/\b(?:install|postinstall|download)\b|\b(?:npm|pnpm|yarn|bun|pip3?|pipx|uv|cargo|brew|gem|composer)\s+(?:i|ci|add)\b/i.test(raw)) return "";
+  return `\nℹ️ 该命令耗时异常 (${secs}s)。若涉及从境外源下载 (GitHub/官方 registry)，国内网络常见受阻——考虑镜像源/代理方案，可 web_search 该工具的国内镜像用法。`;
 }
 
 // Resolve a path that should already EXIST (edit / read target): the first
@@ -38485,7 +39066,13 @@ async function _executeToolStep(step, call, root, run) {
     const sameBatchDestinationBinding = destination ? _sameBatchRunFilePathBinding(run, root, destination) : "";
     const sameBatchBinding = sameBatchSourceBinding || sameBatchDestinationBinding;
     const sameBatchRequest = sameBatchSourceBinding ? source : destination;
-    if (sameBatchBinding) {
+    // 新文件豁免：这道门只保护「磁盘上已存在」的目标——本意是防模糊匹配纠正路径后
+    // 退回原始路径改错既有文件。目标不存在时是全新创建，没有可写错的旧内容；误绑或
+    // 陈旧绑定曾把全新项目里成批新文件写入全部拦死、零落盘。
+    const sameBatchTargetAbs = sameBatchBinding ? _resolveRel(sameBatchRequest, root) : "";
+    const sameBatchTargetExists = !!sameBatchBinding
+      && ((await _pathExistsAsFile(sameBatchTargetAbs)) || (await _pathExistsAsDir(sameBatchTargetAbs)));
+    if (sameBatchBinding && sameBatchTargetExists) {
       res.className = "atc-result atc-result--blocked";
       res.textContent = "⛔ 等待读取结果后再修改";
       return { type: call.type, path: sameBatchRequest, content: `[BLOCKED] 本次模型回复里的 read_file 才刚确认「${sameBatchRequest}」实际对应 ${sameBatchBinding}。模型尚未看到读取结果，IDE 已阻止退回原始路径写错文件；请在下一次回复基于真实路径和内容再修改。` };
@@ -38505,9 +39092,9 @@ async function _executeToolStep(step, call, root, run) {
   void planGatedCall;
   void planIssue;
 
-  let _emptySkip = _emptyRootSkipMessage(run, root, call);
+  let _emptySkip = _emptyRootSkipMessage(run, root, call) || _emptyExploreSkipMessage(run, root, call);
   if (_emptySkip && await _refreshEmptyRootBeforeSkip(run, root)) {
-    _emptySkip = _emptyRootSkipMessage(run, root, call);
+    _emptySkip = _emptyRootSkipMessage(run, root, call) || _emptyExploreSkipMessage(run, root, call);
   }
   if (_emptySkip) {
     res.className = "atc-result atc-result--blocked";
@@ -38746,9 +39333,9 @@ async function _executeToolStep(step, call, root, run) {
         run._dupReadN.set(usedPath, _dupN);
         // 授权命中 = 该文件当前版本的原文【必然还在上文里】（压缩折叠时覆盖表会同步
         // 剔除，folded 的读取不可能走到这）。所以不重灌全文——重灌等于：token 翻倍烧、
-        // 用户看到"读过的又读一遍"的重复卡片（实测挨骂）、模型拿到重复内容后又把叙述
+        // 用户看到“读过的又读一遍”的重复卡片（实测挨骂）、模型拿到重复内容后又把叙述
         // 复述一遍。回指针 + 刷新编辑门绑定即可；授权计数留到 2 次，第 3 次起硬断。
-        if (_duplicateAuthorized && _dupN <= 2) {
+        if (_duplicateAuthorized && _dupN === 1) {
           res.className = "atc-result atc-result--ok";
           res.textContent = `已在上下文 · 编辑门已放行`;
           if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px">${_escHtml(call.path)} · ${total} 行原文已在上文，未重复读取；edit_file / multi_edit 可直接执行。</div>`;
@@ -38763,16 +39350,18 @@ async function _executeToolStep(step, call, root, run) {
         }
         res.className = "atc-result atc-result--err";
         res.textContent = _dupN >= 3 ? `死循环 · 第 ${_dupN} 次重读` : `别重读 · ${total} 行`;
-        if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px;border-bottom:1px solid var(--atc-border,#dadce0)">${_escHtml(call.path)} · ${total} 行（刚读过、内容没变，不重复喂给 AI，给你完整留档）</div><pre style="margin:0;padding:8px 12px;overflow:auto;max-height:360px;font:12px/1.55 var(--atc-mono,ui-monospace);color:var(--atc-text,#202124);white-space:pre;tab-size:2">${_escHtml(txt)}</pre>`;
-        const _msg = _dupN >= 2
-          ? `[停止·重复读取] 这是你第 ${_dupN} 次重复读 ${call.path} 的同一版本同一范围——当前内容没变，而且这段仍在本轮上下文里。**这一次不要继续读同样范围**，先基于已有内容做出具体改动 / 换工具推进 / 如实报告卡点。注意：如果文件稍后真的变化、上下文被折叠、或写入前门禁要求当前版本，重新 read_file 读取最新内容是允许且必要的。`
-          : (_seen >= total
-            ? `[别重读] ${call.path} 全 ${total} 行刚刚已完整读取，当前同版本内容仍在本轮上下文里，没有"剩余部分"。${_duplicateAuthorized ? "IDE 已确认这份同版本完整读取可用于下一步 edit_file / multi_edit。" : ""}现在直接基于它继续做；若之后文件内容变化、上下文被压缩掉、或写入前需要核对当前版本，再重新 read_file。`
-            : `[别重读] ${call.path} 这段（到第 ${_seen} 行）刚读过且没变。要读新内容请用 offset=${_seen + 1} 接着读；否则先基于已有内容推进。若文件变化或上下文折叠，再重新读取当前版本。`);
+        if (vp) vp.innerHTML = `<div style="padding:6px 12px;color:var(--atc-dim,#5f6368);font-size:11px;border-bottom:1px solid var(--atc-border,#dadce0)">${_escHtml(call.path)} · ${total} 行（刚读过、内容没变，不重复喂给 AI，给你完整留档）</div><pre style="margin:0;padding:8px 12px;overflow:auto;max-height:360px;font:12px/1.55 var(--atc-mono,ui-monospace);color:var(--atc-text,#202124);white-space:pre;tab-size:2">[${_dupN === 1 ? '别重读' : '死循环·第'+_dupN+' 次'}] ${_escHtml(call.path)} 未变化</pre>`;
+        const _hardBlockMsg = `[停止·重复读取] ${call.path} 内容未变 (已读过 ${_dupN - 1} 次)。完整内容已在上文，直接引用，不要再读。若确认文件已变化需重读，请注明具体行号范围。`
+        // 硬拦截语义 = 内容未变、完整原文已在上文，等价于读取完成。同样要刷新路径绑定，
+        // 否则「等待读取结果后再修改」的写入门禁会等一个永远不会再来的读取结果（两道门
+        // 互相拦成死锁）。绑定批号沿用覆盖完成时的批号：上一轮就读完的，写入即刻放行；
+        // 本批才读完的仍算同批读写、维持等待（模型确实还没看到内容）。
+        const _hbState = _readCoverageStateFor(run, root, _sig, total, call.path, usedPath);
+        _bindRunFilePath(run, root, call.path, usedPath || call.path, _hbState?.completedBatch || 0);
         return {
-          type: "read", path: call.path, content: _msg,
+          type: "read", path: call.path, content: _hardBlockMsg,
           evidence: {
-            kind: "read", resultKind: "duplicate", canonicalPath: _normRel(usedPath || call.path, root),
+            kind: "read", resultKind: "hard_blocked", canonicalPath: _normRel(usedPath || call.path, root),
             signature: _sig, from: start + 1, to: _reqEnd, total, complete: false,
           },
         };
@@ -39110,6 +39699,7 @@ async function _executeToolStep(step, call, root, run) {
         return { type: call.type, path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
       }
 
+      try { _perfPhase("growth:edit-applied"); } catch {}
       growth.signal("edit-applied", { ctype: "write" });
       growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
@@ -39123,6 +39713,7 @@ async function _executeToolStep(step, call, root, run) {
       if (undoBtn) {
         undoBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
+          try { _perfPhase("growth:undo-edit"); } catch {}
           growth.signal("undo-edit", { ctype: "write" });
           try {
             if (_openFileWriteConflict(fp)) throw new Error("编辑器有未保存内容，已阻止撤销");
@@ -39263,6 +39854,7 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = writeErr.slice(0, 80);
         return { type: "multiedit", path: call.path, content: `[ERROR] 写入 ${call.path} 失败: ${writeErr}` };
       }
+      try { _perfPhase("growth:edit-applied"); } catch {}
       growth.signal("edit-applied", { ctype: "multiedit" });
       growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
@@ -41759,6 +42351,21 @@ ${bodyPreview}`)}</pre>`;
       let _bsel = call.selector || "";
       if (call.node != null && Number.isFinite(+call.node)) _bsel = `[data-mnode="${Math.floor(+call.node)}"]`;
       else if (call.index != null && Number.isFinite(+call.index)) _bsel = `[data-mref="${Math.floor(+call.index)}"]`;
+      
+      // Browser action dedup check: skip repeated identical operations within same turn
+      const _isDeduppableAction = ["screenshot", "check", "assert", "inspect", "nodes", "cookies", "storage"].includes(act);
+      if (_isDeduppableAction && run._browserOpLog && run._browserOpLog.length >= 2) {
+        try {
+          const _urlOrigin = (run._browserState?.lastUrl || run._browserState?.url || "");
+          const _resultHash = state ? _contentSignature(JSON.stringify(state)) : "none";
+          const _opKey = act + "|" + _bsel + "|" + _urlOrigin + "|" + _resultHash;
+          const _recentReps = run._browserOpLog.slice(-8).filter((e) => e.op === _opKey).length;
+          if (_recentReps >= 2) {
+            const res = { type: "browser", path: act, content: `[已执行过·结果未变] ${act} on "${_bsel}" at ${_urlOrigin} produced same result 2+ times in a row — stopping repeats to save tokens.` };
+            return res;
+          }
+        } catch {}
+      }
       let state;
       try {
         if (act === "navigate") {
@@ -42019,8 +42626,20 @@ ${bodyPreview}`)}</pre>`;
           ? `\n（表单类任务下一步先看 autofill 返回的 invalid/missing；缺字段就补字段后再 submit，不要只看截图猜。）`
           : `\n（截图里每个可点元素都标了**红色数字**；优先用 index=该数字 来 click / type，定位最准、不用猜选择器；连续多步请用 batch，不要每一步 screenshot。登录/注册/搜索表单优先用 autofill 一次填完并看 invalid/missing。）`;
       const runOwnedDevUrl = !!state._runOwnedDevUrl || _isRunOwnedDevUrl(run, state.url || "");
+      // Log browser operation for dedup - **必须移到 return 前**，这是唯一 push 点
+      try {
+        if (run._browserOpLog) {
+          const _urlOrigin = state ? new URL(state.url || "").origin : "";
+          const _resultHash = state && state.result ? _contentSignature(JSON.stringify(state)) : _contentSignature(state?.screenshot || "") || "none";
+          run._browserOpLog.push({
+            op: act + "|" + (_bsel || ""),
+            urlOrigin: _urlOrigin,
+            resultHash: _resultHash,
+            iter: run._toolStep || 0
+          });
+        }
+      } catch {}
       return { type: "browser", path: act, image: state.screenshot, browserResult: state.result, browserUrl: state.url || "", runOwnedDevUrl, content };
-
     } else if (call.type === "system") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "system", path: call.op, content: "[不可用] system（系统控制）只能在 Michael IDE 桌面 App 里用。" }; }
       const sop = call.op || "frontmost";
@@ -42052,6 +42671,15 @@ ${bodyPreview}`)}</pre>`;
         res.className = "atc-result atc-result--err"; res.textContent = "空命令";
         return { type: "cmd", path: "", content: "[ERROR] run_cmd 需要 command 参数。例如 {\"command\": \"ls -la\"} 或 {\"command\": \"npm install\"}。" };
       }
+      // 失败命令重跑短路（机制层，与重复读硬拦截同哲学）：同一条命令刚失败过、
+      // 且期间没有任何工作区改动 → 物理拦截不执行，把上次失败的关键报错行直接
+      // 喂回模型；改过文件（可能已修根因）才放行真实重跑。
+      const _repeatFailMsg = _repeatedFailedCmdShortCircuit(run, call.command);
+      if (_repeatFailMsg) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "⛔ 重复失败命令已拦截";
+        return { type: "cmd", path: call.command, content: _repeatFailMsg };
+      }
       _clearAgentReadCache(); // a command may have changed files on disk
       const commandRisk = _commandRiskKind(call.command);
       const commandRiskLabel = _commandRiskLabel(commandRisk);
@@ -42074,6 +42702,7 @@ ${bodyPreview}`)}</pre>`;
           `<button class="agent-term-copy" title="Copy output">Copy</button>` +
         `</div>`;
 
+      const _cmdStartedAt = Date.now(); // 长耗时安装/下载附注的耗时事实（含自动重试）
       const result = await _agentRunInTerminal(root, call.command, step);
       let commandDiagnostics = null;
 
@@ -42106,6 +42735,10 @@ ${bodyPreview}`)}</pre>`;
           output = result.stdout.trim();
         }
       }
+      // 失败命令账本记账：非零退出记录 normCmd/exit/关键报错行/当前改动 tick，
+      // 成功则清掉同名条目——下次同命令在"无改动"窗口内重发会被机制层短路。
+      if (result.code !== 0) _recordCmdFailure(run, call.command, result.code, output);
+      else _clearCmdFailure(run, call.command);
 
       if (output && outEl) {
         outEl.textContent = output.slice(0, 5000);
@@ -42163,6 +42796,10 @@ ${bodyPreview}`)}</pre>`;
       }
       // "No such file" but the file exists under a whitespace-variant name → name the real one.
       try { const _miss = await _missingFileHint(call.command, output, root); if (_miss) _content += _miss; } catch {}
+      // 长耗时安装/下载命令附注（纯事实，不改变命令结果本身）：>60s 的安装类命令多半
+      // 是境外源下载受阻，把"慢"这个关键线索明确告知模型，引向镜像源/代理方向。
+      const _slowNote = _slowInstallCmdNote(call.command, Date.now() - _cmdStartedAt);
+      if (_slowNote) _content += _slowNote;
       return {
         type: "cmd",
         path: call.command,
@@ -52390,6 +53027,7 @@ buildMenubar();
 applyPlatformShortcutLabels();
 
 onLocaleChange(() => {
+  try { _perfPhase("applyI18n"); } catch {}
   buildMenubar();
   applyToDOM();
   _syncWorkspaceRootLabel();
