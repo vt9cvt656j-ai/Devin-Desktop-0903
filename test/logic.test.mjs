@@ -3342,7 +3342,8 @@ test("an immediate chat save wakes the debounce and close waits for disk persist
   assert.equal(persisted.length, 1);
   assert.equal(persisted[0][1], false, "an idle save must write the full disk checkpoint");
   assert.ok(Date.now() - started < 300, "immediate save must not wait for the 500ms debounce");
-  assert.match(SRC, /await Promise\.all\(\[saveChatHistory\(\{ immediate: true \}\), saveSession\(\)\]\)/);
+  // 关窗/更新重启两条退出路径都要等齐：完整存档 + 会话 + 流式草稿磁盘镜像
+  assert.match(SRC, /await Promise\.all\(\[saveChatHistory\(\{ immediate: true \}\), saveSession\(\), _streamDraftPersistDurable\(/);
   const closeStart = SRC.indexOf("currentWindow.onCloseRequested");
   const prevent = SRC.indexOf("event.preventDefault()", closeStart);
   const savePos = SRC.indexOf("saveChatHistory({ immediate: true })", closeStart);
@@ -13249,4 +13250,80 @@ test("计划假完成门禁：install/mkdir 只算 execute 证据，implement �
   // 两处调用点都显式排除 update_plan
   assert.ok((SRC.match(/it\.tc\.name !== "update_plan"/g) || []).length >= 2,
     "自动推进必须排除 update_plan，手动标记仍由模型说了算");
+});
+
+test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步写全量草稿", () => {
+  const KEY = "michael-stream-draft-v1";
+  const mkLS = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
+  const ls = mkLS();
+  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls });
+  const sess = { id: "s1", streaming: true };
+  draftSave(sess, "第一段", "思考1");
+  draftSave(sess, "第一段+节流窗口内的后续内容", "思考2");
+  // 平时节奏不变：2s 节流内第二次不落 localStorage，但最新全量内容必须留在内存 stash
+  assert.equal(JSON.parse(ls.getItem(KEY)).text, "第一段", "节流窗口内不重复写 localStorage（性能优化不推翻）");
+  assert.equal(sess._streamDraftLatest.text, "第一段+节流窗口内的后续内容", "节流丢掉的尾部必须常驻内存，供退出 flush 补写");
+
+  // 退出/隐藏同步 flush：绕过节流，把内存里的最新全量草稿同步写进 localStorage
+  const flushSync = load("_streamDraftFlushSync", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, _chatSessions: [sess] });
+  const flushed = flushSync();
+  assert.equal(flushed.text, "第一段+节流窗口内的后续内容");
+  assert.equal(JSON.parse(ls.getItem(KEY)).text, "第一段+节流窗口内的后续内容", "退出 flush 必须落盘当前完整累计内容，不是增量");
+
+  // 回合正常收尾（clear 清 stash）后，退出 flush 不再把已落账内容复活成假草稿
+  const draftClear = load("_streamDraftClear", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false, loadStore: undefined });
+  draftClear(sess);
+  assert.equal(sess._streamDraftLatest, null, "收尾必须清掉内存 stash");
+  assert.equal(ls.getItem(KEY), null);
+  assert.equal(flushSync(), null, "无残留草稿时退出 flush 不写任何东西");
+
+  // 流式两条路径存的都是完整累计 acc（非增量），且退出事件三件套都已注册
+  assert.ok(SRC.includes("_streamDraftSave(sess, acc, reasoning)"), "普通对话路径必须保存完整累计 acc");
+  assert.ok(SRC.includes("_streamDraftSave(session, acc, reasoningAcc)"), "agent 路径必须保存完整累计 acc");
+  assert.ok(SRC.includes('window.addEventListener("pagehide", () => _flushExitStateSync())'),
+    "WKWebView 下 beforeunload 不可靠，pagehide 必须注册退出 flush");
+  assert.ok(SRC.includes('window.addEventListener("beforeunload", () => { _flushExitStateSync(); saveSession(); })'),
+    "beforeunload 必须走同一个退出 flush");
+  const visBlock = SRC.slice(SRC.indexOf("function _flushExitStateSync"), SRC.indexOf("currentWindow.onCloseRequested"));
+  assert.ok(visBlock.includes('document.visibilityState !== "hidden"') && visBlock.includes("s?.streaming"),
+    "visibilitychange(hidden) 只在存在流式会话时 flush，不打扰平时 5s 防抖节奏");
+  // 优雅关闭/更新重启路径：草稿还要镜像进磁盘 store（localStorage 强杀时未必来得及落盘）
+  const closeBlock = SRC.slice(SRC.indexOf("currentWindow.onCloseRequested"), SRC.indexOf("restoreSession().then"));
+  assert.ok(closeBlock.includes("_streamDraftFlushSync()") && closeBlock.includes("_streamDraftPersistDurable"),
+    "CloseRequested 必须先同步 flush 草稿再等磁盘镜像落完才 destroy");
+  assert.ok(SRC.includes("await _streamDraftPersistDurable(_streamDraftFlushSync());"),
+    "IDE 更新 relaunch 前必须把最新全量草稿落完磁盘");
+});
+
+test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", async () => {
+  const KEY = "michael-stream-draft-v1";
+  const mkLS = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
+  const mkStore = (initial) => {
+    const m = new Map(Object.entries(initial || {}));
+    const calls = { saved: 0 };
+    return { store: { get: async (k) => (m.has(k) ? m.get(k) : null), set: async (k, v) => m.set(k, v), delete: async (k) => m.delete(k), save: async () => { calls.saved++; } }, m, calls };
+  };
+  const now = Date.now();
+  // 强杀场景：localStorage 停在早期版本（WKWebView 异步落盘没追上），磁盘镜像更新更全 → 用镜像
+  const ls = mkLS();
+  ls.setItem(KEY, JSON.stringify({ sessionId: "s1", text: "早期的一小截", updatedAt: now - 60_000 }));
+  const { store, m, calls } = mkStore({ [KEY]: { sessionId: "s1", text: "接近完整的全量内容", updatedAt: now - 1000 } });
+  const take = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: true, loadStore: async () => store });
+  const picked = await take();
+  assert.equal(picked.text, "接近完整的全量内容", "必须优先恢复较新的磁盘镜像");
+  assert.equal(ls.getItem(KEY), null, "localStorage 槽消费后清除");
+  assert.equal(m.has(KEY), false, "磁盘镜像消费后清除，不能下次重启再复活");
+  assert.ok(calls.saved >= 1, "磁盘删除必须 save 落盘");
+
+  // 反向：localStorage 更新（正常退出同步 flush 过）→ 用本地
+  const ls2 = mkLS();
+  ls2.setItem(KEY, JSON.stringify({ sessionId: "s1", text: "退出前同步 flush 的完整内容", updatedAt: now - 500 }));
+  const second = mkStore({ [KEY]: { sessionId: "s1", text: "旧的磁盘镜像", updatedAt: now - 30_000 } });
+  const take2 = load("_streamDraftTake", { _STREAM_DRAFT_KEY: KEY, localStorage: ls2, inTauri: true, loadStore: async () => second.store });
+  assert.equal((await take2()).text, "退出前同步 flush 的完整内容");
+
+  // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
+  assert.ok(SRC.includes("const _draft = await _streamDraftTake()"), "恢复路径必须 await 双通道草稿");
+  assert.ok(SRC.includes("此回复在生成途中因软件重启被打断，以下为已生成的部分）\\n\\n${_draft.text}") || /以下为已生成的部分）[\s\S]{0,40}_draft\.text/.test(SRC),
+    "中断恢复必须把草稿全文（_draft.text 不截断）补进历史");
 });

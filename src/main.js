@@ -13147,6 +13147,9 @@ async function _flushTranscriptJournal() {
 const _STREAM_DRAFT_KEY = "michael-stream-draft-v1";
 function _streamDraftSave(session, text, reasoning) {
   if (_isSecondaryWindow || !session?.id || !String(text || "").trim()) return;
+  // 退出同步 flush 的数据源：节流窗口内被丢掉的尾部也常驻内存（字符串引用，零拷贝），
+  // pagehide/关窗/更新重启时由 _streamDraftFlushSync 一次性全量补写。
+  session._streamDraftLatest = { text: String(text || ""), reasoning: String(reasoning || "") };
   const now = Date.now();
   // 节流戳挂在 session 上：多标签页并发流式时，模块级全局戳会让两个会话互相卡对方的节流。
   if (now - (Number(session._draftSaveAt) || 0) < 2000) return;
@@ -13160,8 +13163,45 @@ function _streamDraftSave(session, text, reasoning) {
     }));
   } catch { /* 配额满等场景只是少个保险，不影响正常链路 */ }
 }
+// 退出/隐藏时的同步兜底：把节流窗口内攒着的最新全量草稿立刻写进 localStorage（同步完成、
+// 绕过 2s 节流），正在流式的回复不再受"最后一次节流写入停在几秒前"的限制。平时的
+// 2s 节流与 5s 防抖保存节奏都不变，这里只在卸载/隐藏路径多补一笔。返回写下的草稿
+// （或 null），供磁盘镜像复用同一份数据。
+function _streamDraftFlushSync() {
+  if (_isSecondaryWindow) return null;
+  try {
+    // 只挑仍在流式的会话——回合正常收尾时 _streamDraftClear 已把 _streamDraftLatest 清空。
+    const sess = (Array.isArray(_chatSessions) ? _chatSessions : [])
+      .find((s) => s && s.streaming && s._streamDraftLatest && String(s._streamDraftLatest.text || "").trim());
+    if (!sess?.id) return null;
+    const draft = {
+      sessionId: sess.id,
+      text: String(sess._streamDraftLatest.text || "").slice(0, 400_000),
+      reasoning: String(sess._streamDraftLatest.reasoning || "").slice(0, 20_000),
+      updatedAt: Date.now(),
+    };
+    localStorage.setItem(_STREAM_DRAFT_KEY, JSON.stringify(draft));
+    sess._draftSaveAt = draft.updatedAt;
+    return draft;
+  } catch { return null; }
+}
+// localStorage 在 WKWebView 里由浏览器引擎异步落盘，进程被强杀/relaunch 时最近的覆写
+// 可能没写进磁盘（用户实证：恢复出的草稿停在很早的版本，正文几乎全丢）。在"还有机会
+// 跑异步代码"的退出路径（CloseRequested、更新重启、窗口隐藏）把草稿同时镜像进 Tauri
+// store（session.json，与聊天存档同一安全落盘路径）；恢复时两边都读、取较新者——
+// 沿用会话本地优先架构的双写防损坏模式。
+async function _streamDraftPersistDurable(draft = null) {
+  if (!inTauri || _isSecondaryWindow) return;
+  try {
+    if (!draft) { try { draft = JSON.parse(localStorage.getItem(_STREAM_DRAFT_KEY) || "null"); } catch { draft = null; } }
+    if (!draft || typeof draft.sessionId !== "string" || !String(draft.text || "").trim()) return;
+    const store = await loadStore("session.json");
+    await store.set(_STREAM_DRAFT_KEY, draft);
+    await store.save();
+  } catch { /* 磁盘镜像只是保险，失败不影响 localStorage 主链路 */ }
+}
 function _streamDraftClear(session = null) {
-  if (session) session._draftSaveAt = 0;
+  if (session) { session._draftSaveAt = 0; session._streamDraftLatest = null; }
   try {
     // 只清自己会话的草稿：单槽设计下，A 会话收尾无条件 removeItem 会把 B 会话
     // 正在流式的草稿一并抹掉（多标签并发时 B 崩溃就丢保险）。无 session 时保持旧行为。
@@ -13171,18 +13211,48 @@ function _streamDraftClear(session = null) {
     }
     localStorage.removeItem(_STREAM_DRAFT_KEY);
   } catch {}
+  // 磁盘镜像同步清掉，防止陈旧草稿在下次重启时"复活"成假中断消息。没有镜像就不碰盘。
+  if (inTauri && !_isSecondaryWindow) void (async () => {
+    try {
+      const store = await loadStore("session.json");
+      const mirrored = await store.get(_STREAM_DRAFT_KEY);
+      if (!mirrored) return;
+      if (session?.id && mirrored.sessionId !== session.id) return;
+      await store.delete(_STREAM_DRAFT_KEY);
+      await store.save();
+    } catch {}
+  })();
 }
-function _streamDraftTake() {
+async function _streamDraftTake() {
+  const _parseDraft = (value) => {
+    try {
+      const draft = typeof value === "string" ? JSON.parse(value) : value;
+      if (!draft || typeof draft.sessionId !== "string" || !String(draft.text || "").trim()) return null;
+      // 陈年草稿（>7 天）不值得再补进历史，丢弃。
+      if (Date.now() - (Number(draft.updatedAt) || 0) > 7 * 864e5) return null;
+      return draft;
+    } catch { return null; }
+  };
+  let local = null;
   try {
-    const raw = localStorage.getItem(_STREAM_DRAFT_KEY);
-    if (!raw) return null;
+    local = _parseDraft(localStorage.getItem(_STREAM_DRAFT_KEY));
     localStorage.removeItem(_STREAM_DRAFT_KEY);
-    const draft = JSON.parse(raw);
-    if (!draft || typeof draft.sessionId !== "string" || !String(draft.text || "").trim()) return null;
-    // 陈年草稿（>7 天）不值得再补进历史，丢弃。
-    if (Date.now() - (Number(draft.updatedAt) || 0) > 7 * 864e5) return null;
-    return draft;
-  } catch { return null; }
+  } catch {}
+  let mirrored = null;
+  if (inTauri) {
+    try {
+      const store = await loadStore("session.json");
+      const raw = await store.get(_STREAM_DRAFT_KEY);
+      if (raw != null) {
+        mirrored = _parseDraft(raw);
+        await store.delete(_STREAM_DRAFT_KEY);
+        await store.save();
+      }
+    } catch {}
+  }
+  // 双通道各取一份，谁新用谁：强杀后 localStorage 可能停在旧版本而磁盘镜像更全，反之亦然。
+  if (local && mirrored) return (Number(mirrored.updatedAt) || 0) > (Number(local.updatedAt) || 0) ? mirrored : local;
+  return local || mirrored;
 }
 
 async function _ensureSessionTranscript(session) {
@@ -14367,7 +14437,7 @@ async function restoreChatHistory() {
       // 从未进过持久历史。查重后把残留草稿补成一条带标注的 assistant 消息落账，
       // 用户不再遇到"写着写着重启就全没了"。
       try {
-        const _draft = _streamDraftTake();
+        const _draft = await _streamDraftTake();
         if (_draft) {
           const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
           const _probe = String(_draft.text || "").trim().slice(0, 120);
@@ -43897,10 +43967,11 @@ async function _saveBeforeIdeUpdate() {
     await saveActive(path);
     if (openFiles.get(path)?.dirty) return false;
   }
+  const _updateDraft = _streamDraftFlushSync();
   _flushChatHistorySync();
   _flushDirtyBuffersSync();
   _flushSessionSync();
-  await Promise.all([saveChatHistory({ immediate: true }), saveSession()]);
+  await Promise.all([saveChatHistory({ immediate: true }), saveSession(), _streamDraftPersistDurable(_updateDraft)]);
   return true;
 }
 
@@ -43940,6 +44011,9 @@ async function _downloadAndInstallIdeUpdate() {
     _flushChatHistorySync();
     _flushDirtyBuffersSync();
     _flushSessionSync();
+    // 下载期间流式可能还在继续：relaunch 是进程级替换，localStorage 未必来得及落盘，
+    // 最新全量草稿走磁盘 store 同一安全路径落死后再重启。
+    await _streamDraftPersistDurable(_streamDraftFlushSync());
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch();
   } catch (error) {
@@ -53729,16 +53803,39 @@ if (inTauri) {
   }).catch(() => {});
 }
 
-window.addEventListener("beforeunload", () => { _flushChatHistorySync(); _flushDirtyBuffersSync(); _flushSessionSync(); saveSession(); });
+// 退出前同步 flush：正在流式的回复只活在内存/DOM 与节流草稿里，任何卸载路径都先把最新
+// 全量草稿同步写掉再走常规镜像。WKWebView 下 beforeunload 不总是触发（Tauri destroy
+// 直接拆 webview），pagehide 更可靠；visibilitychange(hidden) 则在"隐藏后被强杀"前多留
+// 一个落盘点。三者幂等，重复触发无害；平时的 5s 防抖保存节奏不变。
+function _flushExitStateSync() {
+  const draft = _streamDraftFlushSync();
+  _flushChatHistorySync(); _flushDirtyBuffersSync(); _flushSessionSync();
+  // 存在流式会话时再补一手异步兜底：进程若还活着（隐藏/被 CloseRequested 拦下的路径），
+  // 草稿镜像进磁盘 store + 唤醒 immediate 保存；真正的卸载里它们跑不完也无妨，
+  // 上面的同步 localStorage 写已经落了。
+  if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s?.streaming)) {
+    void _streamDraftPersistDurable(draft);
+    void saveChatHistory({ immediate: true });
+  }
+}
+window.addEventListener("beforeunload", () => { _flushExitStateSync(); saveSession(); });
+window.addEventListener("pagehide", () => _flushExitStateSync());
+document.addEventListener("visibilitychange", () => {
+  // 隐藏 = 之后随时可能被强杀。只在存在流式会话时才 flush，不打扰平时的保存节奏。
+  if (document.visibilityState !== "hidden") return;
+  if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s?.streaming)) _flushExitStateSync();
+});
 if (inTauri) {
   import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
     const currentWindow = getCurrentWindow();
     currentWindow.onCloseRequested(async (event) => {
       event.preventDefault();
+      const _exitDraft = _streamDraftFlushSync();
       _flushChatHistorySync(); _flushDirtyBuffersSync(); _flushSessionSync();
       // Wake any debounced chat save and wait for the current in-flight write plus
-      // its trailing snapshot before destroying the WebView.
-      await Promise.all([saveChatHistory({ immediate: true }), saveSession()]);
+      // its trailing snapshot before destroying the WebView.流式草稿也赶在 destroy 前
+      // 镜像进磁盘 store：localStorage 在窗口销毁/进程退出时未必来得及落盘。
+      await Promise.all([saveChatHistory({ immediate: true }), saveSession(), _streamDraftPersistDurable(_exitDraft)]);
       await currentWindow.destroy();
     });
   }).catch(() => {});
