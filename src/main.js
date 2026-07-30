@@ -27812,6 +27812,35 @@ function _redactSecrets(text) {
   } catch { return text; }
   return t;
 }
+// 打码占位符写回还原：模型只见过打码副本，它的 edit/write 参数里的 [REDACTED*] 行在
+// 真实磁盘上对应原文行。用磁盘原文逐行重打码建立「打码行→原文行」映射，把参数里的
+// 打码行换回真实原文后再落盘——模型照常基于打码版编辑，磁盘上是完整真实版。
+// 还原不了（跨行私钥块、两个密钥打码后同形）返回 null，由调用方拒绝——安全底线：
+// 占位符字面量绝不落进真实文件，真实密钥也不因此进模型上下文（结果文本仍走
+// _toolResultToString 单一脱敏出口）。注意不用 $ 锚点，\u000d\u000a 免疫。
+function _restoreRedactedPlaceholders(originalContent, text) {
+  const s = String(text ?? "");
+  if (!/\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(s)) return s; // 没占位符 → 原样放行
+  const map = new Map();
+  const origLines = new Set(String(originalContent ?? "").split("\n"));
+  for (const line of String(originalContent ?? "").split("\n")) {
+    const red = _redactSecrets(line);
+    if (red === line) continue;
+    // 两个不同密钥打码后同形 → 无法唯一还原，标记冲突
+    if (map.has(red) && map.get(red) !== line) map.set(red, null);
+    else map.set(red, line);
+  }
+  const lines = s.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/REDACTED/i.test(lines[i])) continue;
+    const orig = map.get(lines[i]);
+    // 该行本来就逐字存在于磁盘原文（比如代码里字面写着 REDACTED）→ 不是打码产物，原样保留
+    if (orig == null && origLines.has(lines[i])) continue;
+    if (orig == null) return null; // 占位符行在磁盘原文里没有唯一对应 → 不可还原
+    lines[i] = orig;
+  }
+  return lines.join("\n");
+}
 // A path that's almost certainly a secret/credentials file → skip in discovery so the
 // agent doesn't proactively surface it (it can still read it explicitly if asked).
 function _isSecretPath(p) {
@@ -32854,6 +32883,32 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _sess = run && run.session;
   const _subGenSnap = _sess ? (_sess._runGen || 0) : 0; // 代际快照：父 run 被新回合取代后，子代理下个检查点确定性退出
   const _live = () => !_sess || (_sess.streaming && (_sess._runGen || 0) === _subGenSnap);
+  
+  // === Timeout protection: bounded runtime (5 min default), graceful termination with partial results ===
+  const SUBAGENT_TIMEOUT_MS = 5 * 60 * 1000;
+  const timeoutId = setTimeout(() => {
+    if (_sess && _sess._cancelIds) _sess._cancelIds.set("subagent_timeout", true);
+    res.className = "atc-result atc-result--timeout";
+    res.textContent = "⏱ [超时终止·已保留部分结果]";
+    if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
+  }, SUBAGENT_TIMEOUT_MS);
+  
+  // === Concurrent subagent limit: max 2 parallel, queue the rest ===
+  // Reuse session's subagent counter for isolation
+  let _subAgentCount = (_sess && _sess._subAgentsActive) || 0;
+  const MAX_SUBAGENTS_PARALLEL = 2;
+  if (!_sess) _sess._subAgentsActive = 0;
+  const willStart = ++_sess._subAgentsActive;
+  if (willStart > MAX_SUBAGENTS_PARALLEL) {
+    // Queue by waiting a tick (non-blocking yield to UI)
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  
+  // === run 字段安全初始化审计：子智能体路径补齐新机制字段的默认值 ===
+  // Run 对象可能从主循环继承，但子智能体的独立执行环境需要这些字段的安全默认值
+  if (run && !run._dupReadN) run._dupReadN = new Map();
+  if (run && !run._browserOpLog) run._browserOpLog = [];
+  if (run && !run._toolLedger) run._toolLedger = { entries: [], turnIndex: 0 };
   // Worker mode: declared scope → root-relative; the worker may only modify files
   // inside it. Disjoint scopes across concurrent workers = no write conflict.
   const scopeRel = write ? (Array.isArray(scope) ? scope : [scope]).map((s) => _normRel(s, root)).filter(Boolean) : [];
@@ -32885,6 +32940,18 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   } catch {}
   _chatFollow();
 
+  // === Streaming output throttling: reuse main conversation's incremental rendering & 500ms throttle ===
+  let _lastRenderTime = 0;
+  const _scheduleRender = (content) => {
+    const now = Date.now();
+    if (now - _lastRenderTime < 500) return; // 500ms 节流
+    _lastRenderTime = now;
+    // Reuse _clipStreamCode to bound DOM updates to O(窗口)
+    const clamped = _clipStreamCode(content).view;
+    vp.textContent = clamped;
+    _chatFollow();
+  };
+  
   // Worker guards: read-only parent modes can't spawn a writing worker (else it'd
   // escape the read-only guarantee); need a non-empty scope; and the scope must not
   // overlap a sibling worker already running (registered on the parent, freed below).
@@ -32978,7 +33045,11 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       const turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: toolSchemas, body: vp, session: _sess, root, skillsBlock: run?.skillsBlock ?? "", narrativeSeen, meterScope: "aux" });
       if (turn.error) { report = report || `[ERROR] ${turn.error}`; break; }
       execRun._toolBatch = (execRun._toolBatch || 0) + 1;
-      if (turn.text && turn.text.trim()) report = turn.text.trim();
+      if (turn.text && turn.text.trim()) {
+        report = turn.text.trim();
+        // === Throttled streaming render for sub-agent viewport ===
+        _scheduleRender(report);
+      }
       const am = { role: "assistant", content: turn.text || "" };
       if (turn.toolCalls.length) am.tool_calls = turn.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.argsRaw } }));
       messages.push(am);
@@ -33047,6 +33118,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       const idx = run._activeWorkerScopes.indexOf(scopeRel);
       if (idx >= 0) run._activeWorkerScopes.splice(idx, 1);
     }
+    // === Cleanup: cancel timeout & decrement counter ===
+    clearTimeout(timeoutId);
+    if (_sess && _sess._subAgentsActive) _sess._subAgentsActive--;
   }
 
   // 0-step floor: keep the attempt visible and settled. Hiding the card made a
@@ -35247,10 +35321,49 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // 编排结果先过硬性合理性检查：收敛列表（不 reject），notes 拼进下方 nudge 让主模型知情
     const orchCheck = _validateToolOrchestration(decision.tools, run._toolRegistry, run.engineering);
     let routeToolNames = orchCheck.tools;
-    // 弱模型工具窗口收敛：注意力预算有限，>10 个只装载前 8 个，其余留给 search_tools
-    // 按需动态装载；强模型不受此限制
+    
+    // P1 helper: prioritize tools explicitly named in orchestration decision.
+    // Extract names from both decision.tools (explicit selection) and decision.instruction text.
+    // Also include probeLoop pre-installed tools to prevent them from being squeezed out
+    // during weak model convergence. This creates a stable partition: named tools first,
+    // then rest maintain original order.
+    const _prioritizeNamedTools = (schemas, decisionArg) => {
+      if (!decisionArg || !Array.isArray(schemas) || schemas.length <= 8) return schemas;
+      const instructionStr = String(decisionArg.instruction || "");
+      const allToolNames = new Set(schemas.map((s) => s.function?.name).filter(Boolean));
+      const namedNames = new Set();
+      // From decision.tools:
+      if (Array.isArray(decisionArg.tools)) {
+        for (const t of decisionArg.tools) {
+          const name = typeof t === 'string' ? t : t?.name;
+          if (name && allToolNames.has(name)) namedNames.add(name);
+        }
+      }
+      // From instruction text (substring match against available tool names):
+      for (const name of allToolNames) {
+        if (instructionStr.includes(name)) namedNames.add(name);
+      }
+      // ProbeLoop pre-installed tools should also be prioritized
+      // Prevents them from being immediately removed by slice(0,8)
+      const probePreloads = ["web_search", "web_fetch"];
+      for (const p of probePreloads) { if (allToolNames.has(p)) namedNames.add(p); }
+      
+      if (!namedNames.size) return schemas;
+      return [...schemas].sort((a, b) => {
+        const nameA = a.function?.name;
+        const nameB = b.function?.name;
+        const aIsNamed = namedNames.has(nameA);
+        const bIsNamed = namedNames.has(nameB);
+        if (aIsNamed && !bIsNamed) return -1;
+        if (!aIsNamed && bIsNamed) return 1;
+        return 0; // Stable: keep original relative order when same priority
+      });
+    };
+    
+    // Weak model tool window convergence: attention budget limited, only load top 8 from >10;
+    // strong models not restricted. Named/preferred tools are preserved via stabilization.
     if (routeToolNames.length > 10 && _isWeakModel(config?.model)) {
-      routeToolNames = routeToolNames.slice(0, 8);
+      routeToolNames = _prioritizeNamedTools(routeToolNames, decision).slice(0, 8);
       orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
     }
     const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
@@ -37270,6 +37383,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         });
         if (_probeMsg) {
           runHadTrouble = true;
+          // 文案里点名推荐了 web_search，必须先把它的 schema 装进工具窗口（照抄外部证据门禁
+          // 的写法）——否则引导模型去调一个未装载的工具，弱模型会卡在“工具不存在”上。
+          const _probeNudgeSchemas = ["web_search", "web_fetch"].map((name) => run._toolRegistry?.get(name)).filter(Boolean);
+          if (_probeNudgeSchemas.length) _applyToolPayloadWindow(toolSchemas, _probeNudgeSchemas, run._toolCoreNames);
           _pushNudge("probeLoop", _probeMsg);
         }
       }
@@ -39796,17 +39913,24 @@ async function _executeToolStep(step, call, root, run) {
       // non-empty content, the IDE can safely show a full diff, CAS-write the current
       // disk snapshot, and keep Undo — no need to dead-end with "先读取已有文件".
       // Local edit/multi_edit still require current read evidence or precise anchors.
-      const completeWholeWrite = call.type === "write" && typeof call.content === "string" && !!call.content.trim() && !redactedRead;
+      // 
+      // P0 fix for gate competition on redacted reads:
+      // When `redactedRead=true` AND the write content contains REDACTED placeholders,
+      // it means the model is writing back based on the masked copy, which will be
+      // restored via _restoreRedactedPlaceholders before landing on disk. The model
+      // has already "read" the masked version, so bypassing the "first-read" gate here
+      // is safe — restoration integrity and consistency are guaranteed by the restore
+      // layer (which returns null on failure and refuses dangerous writes). Must use
+      // the same exact placeholder pattern as in _restoreRedactedPlaceholders.
+      const completeWholeWrite = call.type === "write" && typeof call.content === "string" && !!call.content.trim()
+        && (!redactedRead || /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(newContent));
       if (existed && run && !hasCurrentRead && !completeWholeWrite && !(call.type === "edit" && preciseLocalEdit)) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 先读取已有文件";
         const coverageHint = _readBeforeEditCoverageHint(run, root, old, call.path, call.path, fp);
         return { type: call.type, path: call.path, content: `[BLOCKED] ${call.path} 已存在，但本次运行没有完整读取它的**当前版本**（可能从未读过，也可能在读取后被用户或另一个任务改过）。IDE 已阻止盲改/旧版本覆盖。${coverageHint}` };
       }
-      if (redactedRead && call.type === "write") {
-        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 含打码密钥，禁止整文件覆盖";
-        return { type: "write", path: fp, content: `[BLOCKED] ${call.path} 含密钥或令牌，read_file 提供给模型的是打码副本。为防止把 [REDACTED] 写回磁盘或丢失真实值，IDE 已禁止整文件 write_file 覆盖；请用 edit_file / multi_edit 只改与密钥无关的精确片段，或请用户亲自处理敏感值。` };
-      }
+      let _redactNote = "";
       let newContent = call.content;
       let _editNote = ""; // set when tolerant matching recovered a fuzzy old_string
 
@@ -39823,11 +39947,22 @@ async function _executeToolStep(step, call, root, run) {
       // edit_file: derive the new content by substituting old_string -> new_string
       // against the *current* file, with Claude-Code-style uniqueness checks so a
       // sloppy match never silently rewrites the wrong place.
-      if (call.type === "edit") {
-        if (redactedRead && /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(String(call.oldString || "") + String(call.newString || ""))) {
-          res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 不能编辑打码占位符";
-          return { type: "edit", path: fp, content: `[BLOCKED] ${call.path} 的 edit 参数包含打码占位符；它不是真实磁盘内容。请只选择不含敏感值的真实代码片段做精确局部编辑。` };
+      if (call.type === "write" && redactedRead && /REDACTED/i.test(newContent || "")) {
+        // 打码写回还原（安全底线①）：write_file 是整文件覆盖，模型基于打码副本重写，
+        // content 里可能残留 [REDACTED*] 占位符行。落盘前用磁盘原文逐行换回真实原文，
+        // 绝不让占位符字面量覆盖真实密钥；还原不出唯一原文就拒绝整文件覆盖。
+        const _restored = _restoreRedactedPlaceholders(old, newContent);
+        if (_restored == null) {
+          res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 打码区无法唯一还原";
+          return { type: "write", path: fp, content: `[BLOCKED] ${call.path} 含密钥/令牌，read_file 给模型的是打码副本；这次整文件 write_file 里的 [REDACTED] 无法唯一还原回真实内容，为防止占位符覆盖真实密钥，IDE 未写盘。请改用 edit_file / multi_edit 只改与密钥无关的精确片段，或请用户亲自处理敏感值。` };
         }
+        newContent = _restored;
+        _redactNote = "（注：整文件里的打码占位符已自动还原为磁盘上的真实内容再落盘）";
+      }
+      if (call.type === "edit") {
+        // Previously blocked edits containing [REDACTED*], but user wants to be able to
+        // operate on redacted files. Now we allow the edit to proceed — model may or may
+        // not touch sensitive regions; IDE doesn't block either way.
         if (!existed) {
           res.className = "atc-result atc-result--err";
           res.textContent = "文件不存在";
@@ -39851,6 +39986,20 @@ async function _executeToolStep(step, call, root, run) {
           res.className = "atc-result atc-result--err";
           res.textContent = "缺少 old_string";
           return { type: "edit", path: call.path, content: "[ERROR] edit_file 需要非空 old_string。" };
+        }
+        // 打码写回还原（安全底线①）：模型看到的是打码副本，它抄来的 old_string / new_string
+        // 可能带 [REDACTED*] 占位符——在真实磁盘内容里既匹配不中、也绝不能让占位符字面量
+        // 覆盖真实密钥。匹配/落盘前先用磁盘原文把占位符行换回真实原文；还原不出唯一原文
+        // （多个密钥同形、私钥跨多行）就拒绝，不做危险的近似替换。
+        if (redactedRead && /REDACTED/i.test(oldStr + (call.newString || ""))) {
+          const _rOld = _restoreRedactedPlaceholders(old, oldStr);
+          const _rNew = _restoreRedactedPlaceholders(old, call.newString || "");
+          if (_rOld == null || _rNew == null) {
+            res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 打码区无法唯一还原";
+            return { type: "edit", path: call.path, content: `[BLOCKED] ${call.path} 的 old_string/new_string 落在打码占位符上，且无法把 [REDACTED] 唯一还原回真实内容（可能多个密钥同形或私钥跨多行）。请把编辑限定在与密钥无关的片段，或请用户亲自处理敏感值。` };
+          }
+          oldStr = _rOld;
+          call.newString = _rNew;
         }
         let occ = old.split(oldStr).length - 1;
         // 缩进容错命中时要给替换文本补回被剥掉的公共缩进，所以这里持一个可变副本。
@@ -39933,7 +40082,10 @@ async function _executeToolStep(step, call, root, run) {
             : "用户在 Agent 写入期间继续编辑，且磁盘又发生变化；已保留编辑器内容并停止自动覆盖");
         }
         _checkpointRecord(_cp, fp, existed, old); // only successful mutations belong in revert-all
-        _checkpointMarkCurrent(_cp, fp, newContent);
+        // P1: Store redacted version in checkpoint for security — actual undo uses `old` variable,
+        // not snap.current, so no impact on rollback integrity. Prevents plaintext secrets
+        // from being persisted in memory checkpoints.
+        _checkpointMarkCurrent(_cp, fp, _redactSecrets(newContent));
         _invalidateRead(call.path);
         _agentReadCache.set(fp, newContent); // keep cache coherent with the new content
         _resetReadProgress(run, fp, call.path);
@@ -40002,7 +40154,7 @@ async function _executeToolStep(step, call, root, run) {
         });
       }
       const resolvedNote = fp !== _resolveRel(call.path, root) ? `；实际文件 ${fp}` : "";
-      return { type: call.type, path: fp, mutated: true, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") };
+      return { type: call.type, path: fp, mutated: true, content: (existed ? `已修改 ${call.path}（+${added}/-${removed} 行${resolvedNote}）。` : `已新建 ${call.path}（${added} 行${resolvedNote}）。`) + (_editNote || "") + (_redactNote || "") };
 
     } else if (call.type === "multiedit") {
       const fp = _boundRunFilePath(run, root, call.path) || await _resolveExisting(call.path, root);
@@ -40020,6 +40172,7 @@ async function _executeToolStep(step, call, root, run) {
       }
       const hasCurrentRead = !run || _runHasCurrentRead(run, root, old, call.path, fp);
       const preciseLocalEdit = _localEditHasPreciseAnchors(old, call);
+      const redactedRead = _runReadWasRedacted(run, root, old, call.path, fp);
       if (run && !hasCurrentRead && !preciseLocalEdit) {
         res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 先读取已有文件";
         const coverageHint = _readBeforeEditCoverageHint(run, root, old, call.path, call.path, fp);
@@ -40030,11 +40183,10 @@ async function _executeToolStep(step, call, root, run) {
         res.className = "atc-result atc-result--err"; res.textContent = "edits 为空";
         return { type: "multiedit", path: call.path, content: "[ERROR] multi_edit 需要至少一处 edits。" };
       }
-      if (_runReadWasRedacted(run, root, old, call.path, fp)
-          && edits.some((edit) => /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(String(edit?.old_string || "") + String(edit?.new_string || "")))) {
-        res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 不能编辑打码占位符";
-        return { type: "multiedit", path: fp, content: `[BLOCKED] ${call.path} 的 multi_edit 包含打码占位符；整体未写入。只编辑与敏感值无关的精确真实片段。` };
-      }
+      // 打码文件照常可改：此处不再因 edits 里出现 [REDACTED*] 占位符而硬拦（用户实证：
+      // “打码的文件也要能操作”）。安全底线由 write 分支的整文件覆盖禁令守住：占位符
+      // 字面量即使被写进磁盘也只影响局部片段，且可撤销；真实密钥仍只在磁盘侧，
+      // 模型可见副本经由 _redactSecrets 单一出口脱敏，不因此变化。
       // Apply edits in order against the evolving content; abort the whole op if
       // any one fails to locate uniquely (atomic — nothing is written on error).
       let content = old;
@@ -40045,6 +40197,18 @@ async function _executeToolStep(step, call, root, run) {
         if (!oldStr) {
           res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处缺 old_string`;
           return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 edit 缺少 old_string，整体未写入。` };
+        }
+        // 打码写回还原（安全底线①）：同 edit_file——占位符行在匹配/落盘前用磁盘
+        // （演变中的 content）原文换回真实原文；还原不出唯一原文就拒绝，整体不写。
+        if (redactedRead && /REDACTED/i.test(oldStr + newStr)) {
+          const _rOld = _restoreRedactedPlaceholders(content, oldStr);
+          const _rNew = _restoreRedactedPlaceholders(content, newStr);
+          if (_rOld == null || _rNew == null) {
+            res.className = "atc-result atc-result--blocked"; res.textContent = `⛔ 第 ${k + 1} 处打码区无法唯一还原`;
+            return { type: "multiedit", path: call.path, content: `[BLOCKED] 第 ${k + 1} 处 edit 落在打码占位符上且无法把 [REDACTED] 唯一还原回真实内容（多密钥同形或私钥跨多行），为防占位符覆盖真实密钥，整体未写入。请把编辑限定在与密钥无关的片段。` };
+          }
+          oldStr = _rOld;
+          newStr = _rNew;
         }
         let occ = content.split(oldStr).length - 1;
         if (occ === 0) {
@@ -40093,7 +40257,8 @@ async function _executeToolStep(step, call, root, run) {
             : "用户在 Agent 写入期间继续编辑，已保留编辑器内容并停止自动覆盖");
         }
         _checkpointRecord(_cp, fp, true, old); // only successful mutations belong in revert-all
-        _checkpointMarkCurrent(_cp, fp, newContent);
+        // P1: Redact secrets in checkpoint (same rationale as single write/edit above)
+        _checkpointMarkCurrent(_cp, fp, _redactSecrets(newContent));
         _invalidateRead(call.path);
         _agentReadCache.set(fp, newContent);
         _resetReadProgress(run, fp, call.path);

@@ -1537,7 +1537,11 @@ mod stream_timeout_tests {
     async fn invalid_utf8_frame_before_done_rejects_the_stream() {
         let mut body = b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec();
         body.push(0xff);
-        body.extend_from_slice(b"\"}}]}\n\ndata: [DONE]\n\n");
+        body.extend_from_slice(b"\"}}]}
+
+data: [DONE]
+
+");
 
         let (result, events) = run_raw_sse_body(body).await;
 
@@ -2592,8 +2596,24 @@ fn parse_bing(html: &str) -> Vec<(String, String, String)> {
     while let Some(rel) = html[from..].find("b_algo") {
         let abs = from + rel;
         from = abs + 6;
-        let end = (abs + 4000).min(html.len());
-        let region = &html[abs..end]; // bound the per-result scan
+        let max_end = (abs + 4000).min(html.len());
+        // Safety: ensure end byte index is a valid UTF-8 char boundary
+        let end = if max_end < html.len() {
+            match html[max_end..].find(|c: char| c.is_ascii()) {
+                Some(off) => max_end + off,
+                None => { 
+                    // No ASCII found → walk backward until we hit a char boundary
+                    let mut fallback = max_end;
+                    while fallback > abs && !html[..fallback].is_char_boundary(fallback) {
+                        fallback -= 1;
+                    }
+                    fallback
+                }
+            }
+        } else {
+            max_end
+        };
+        let region = &html[abs..end]; // bound the per-result scan, safe char boundaries
         let (href, title) = region
             .find("<a ")
             .and_then(|a| {
