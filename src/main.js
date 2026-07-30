@@ -35915,8 +35915,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         run._historyInvalidatedNote = true;
         _pushNudge("emptyHistoryFact", "⚠️ 磁盘实况: 当前目录为空 (0 文件)。历史对话中提到的任何文件/框架/搭建成果在磁盘上均**不存在**——历史信息已作废，以磁盘为准，直接重新开建，不要'确认当前状态'。");
       }
-      // ── 大任务拆分并行门（一次性事实注入）：构建型大工程 + 计划已建立（≥5 步、跨 ≥2 领域）
-      //    + 本 run 尚无 worker/后台作业派发 → 注入步骤领域分布与并行能力事实清单。
+      // ── 拆分并行门（一次性事实注入）：全任务类型。计划已建立（非取消 ≥3 步且跨 ≥2 领域
+      //    或 调研+实现步共存）+ 本 run 尚无 worker/后台作业派发 → 注入并行机会事实（大任务
+      //    完整清单/小任务精简版，触发矩阵与 bugEvidence 让行都在函数内按事实判定）。
       //    只罗列事实和能力，拆不拆由模型判断——不拦截、不复催（run._splitGateNudged）。
       if (isAgent && _live()) {
         const _splitMsg = _splitGateNudgeMessage(run);
@@ -39453,27 +39454,45 @@ function _planStepDomain(step) {
   return "";
 }
 
-// ── 大任务拆分并行门（一次性事实注入）：构建型大工程的计划落地后，把步骤的领域分布与
-//    可能独立的实现步骤列成事实清单 + 并行能力一句话。机制层三原则：只采事实、诚实罗列、
-//    判断权留给模型——不拦截不堆禁令。单领域计划不打扰（多角色触发规范：仅当任务横跨多个
-//    专业领域且 scope 能清晰切分时才值得拆）。触发后置 run._splitGateNudged，每 run 一次。
+// ── 拆分并行门（一次性事实注入）：全任务类型（大项目/小项目/改 bug/改内容）的计划落地后
+//    （非取消步骤 ≥3 且 跨 ≥2 具名领域 或 investigate+implement 共存——调研可后台化的事实），
+//    把步骤的领域分布与并行能力列成事实清单。机制层三原则：只采事实、诚实罗列、判断权留给
+//    模型——不拦截不堆禁令。单领域纯实现计划静默且不烧一次性额度（多角色触发规范红线）。
+//    大任务（≥5 步跨 ≥2 域）出完整清单；小任务出精简版并如实说明 run_worker 对小任务是负
+//    收益。调试任务不再排除，但同轮 bug 取证门事实已成熟时让行（内容不重叠：bugEvidence 讲
+//    取证并行，这里讲计划步骤并行），下轮再出。触发后置 run._splitGateNudged，每 run 一次。
 function _splitGateNudgeMessage(run) {
   if (!run || run._splitGateNudged) return "";
-  const p = run.engineering || {};
-  // 构建型大工程事实：substantial + 项目级评估字段组合；调试任务归 bug 取证门管。
-  const bigBuild = !!(p.substantial && !p.debugProject
-    && (p.projectScope || p.largeProject || p.multiService || p.industrialProject || p.fullWebsite));
-  if (!bigBuild) return "";
   if ((run._parallelDispatches || 0) > 0) return ""; // 已在并行推进 → 不需要提示
   if (run._subAgentJobs instanceof Map && run._subAgentJobs.size) return "";
   const steps = (Array.isArray(run._planSteps) ? run._planSteps : []).filter((s) => s?.status !== "cancelled");
-  if (steps.length < 5) return "";
+  if (steps.length < 3) return "";
   const kinds = steps.map((s) => _planStepActionKind(s));
   const domains = steps.map((s) => _planStepDomain(s));
   const dist = {};
   for (const d of domains) dist[d || "未归类"] = (dist[d || "未归类"] || 0) + 1;
-  if (Object.keys(dist).filter((d) => d !== "未归类").length < 2) return ""; // 单领域计划：拆分没有事实基础
+  const namedDomains = Object.keys(dist).filter((d) => d !== "未归类").length;
+  const investigable = kinds.includes("investigate") && kinds.includes("implement");
+  // 静默保底：单领域纯实现计划——拆分没有事实基础，不打扰也不烧额度（后续计划变跨域仍可触发）。
+  if (namedDomains < 2 && !investigable) return "";
+  // 让行：调试任务且同轮 bug 取证门事实已成熟（根因未明账本 ≥2 次失败）且其尚未触发 →
+  // 本轮由 bugEvidence 出（不同键不同内容），这里不烧额度，下轮再出。
+  const p = run.engineering || {};
+  if ((p.debugProject || p.bug) && !run._bugEvidenceGateNudged) {
+    const _bugFails = (Array.isArray(run._probeBatchLog) ? run._probeBatchLog : [])
+      .reduce((n, b) => n + (Number(b?.fails) || 0), 0);
+    if (_bugFails >= 2) return "";
+  }
   const distText = Object.entries(dist).map(([d, n]) => `${d}×${n}`).join("、");
+  run._splitGateNudged = true;
+  // 小任务（<5 步，或跨域不足）→ 精简版：只点出可后台化的事实 + run_worker 负收益的事实。
+  if (steps.length < 5 || namedDomains < 2) {
+    const invIdx = kinds.indexOf("investigate");
+    const invPart = invIdx >= 0
+      ? `步骤${invIdx + 1}(调研)可 run_subagent 后台跑不阻塞，你同时推进实现；`
+      : `计划跨域(${distText})，调研/取证类动作可 run_subagent 后台跑不阻塞；`;
+    return `[并行机会] ${invPart}await_subagent 汇合。小任务拆写入反而慢，run_worker 不建议——你判断。`;
+  }
   // 相邻 implement 步骤域不同 → 列为“可能独立”（事实罗列，依赖关系由模型自己判）。
   const indep = [];
   for (let i = 0; i + 1 < steps.length; i++) {
@@ -39482,7 +39501,6 @@ function _splitGateNudgeMessage(run) {
       indep.push(`步骤${i + 1}(${domains[i]})↔步骤${i + 2}(${domains[i + 1]})`);
     }
   }
-  run._splitGateNudged = true;
   return `[并行机会·事实清单] 计划 ${steps.length} 步，领域分布: ${distText}。${indep.length ? `可能独立（相邻实现步跨域）: ${indep.slice(0, 4).join("；")}。` : ""}独立模块可 run_worker 并行实现（写入，scope 隔离）；调研可 run_subagent 后台跑不阻塞；await_subagent 汇合。跨领域且 scope 清晰才值得拆，单领域小任务直接自己做更快——你判断。`;
 }
 

@@ -1245,7 +1245,7 @@ test("probe-loop detection: blind guess-and-check probing triggers a root-cause 
     "zero-mutation fact must come from the real mutation ticks");
 });
 
-test("big-task split gate: factual domain distribution, cross-domain only, one-shot (#46)", () => {
+test("split gate: relaxed to all task types, adaptive text, one-shot (#46/#48)", () => {
   const planStepActionKind = load("_planStepActionKind");
   const planStepDomain = load("_planStepDomain");
   const splitGate = load("_splitGateNudgeMessage", {
@@ -1271,7 +1271,7 @@ test("big-task split gate: factual domain distribution, cross-domain only, one-s
   ];
   const bigProfile = { substantial: true, projectScope: true };
 
-  // ① 构建型大工程 + ≥5 步跨域计划 + 零并行派发 → 触发一次，只给事实和能力清单
+  // ① 大任务（≥5 步跨 ≥2 域）+ 零并行派发 → 触发一次，完整事实与能力清单
   const run = { engineering: bigProfile, _planSteps: crossPlan };
   const msg = splitGate(run);
   assert.match(msg, /并行机会·事实清单/);
@@ -1287,21 +1287,63 @@ test("big-task split gate: factual domain distribution, cross-domain only, one-s
   assert.equal(run._splitGateNudged, true);
   assert.equal(splitGate(run), "", "严格一次性，不重复催");
 
-  // ② 单领域计划（全前端）→ 不触发（多角色触发规范：单领域禁止为形式热闹派工）
+  // ② 静默保底：单领域纯实现计划（全前端、无调研步）→ 不触发（多角色规范红线）
   const monoPlan = ["登录页面组件", "商品页面布局", "购物车组件", "结算页面样式", "首页响应式布局"]
     .map((piece) => ({ content: "实现" + piece, status: "pending" }));
   const monoRun = { engineering: bigProfile, _planSteps: monoPlan };
   assert.equal(splitGate(monoRun), "");
   assert.ok(!monoRun._splitGateNudged, "静默路径不能烧掉一次性额度，计划后续变跨域时还能触发");
 
-  // ③ 非构建型大工程 / 调试任务（归 bug 取证门管）→ 不触发
-  assert.equal(splitGate({ engineering: { substantial: true }, _planSteps: crossPlan }), "");
-  assert.equal(splitGate({ engineering: { substantial: true, projectScope: true, debugProject: true }, _planSteps: crossPlan }), "");
+  // ③ 硬门槛已拆：无大工程字段甚至无 engineering profile，跨域计划照样触发（全任务类型）
+  assert.match(splitGate({ engineering: { substantial: true }, _planSteps: crossPlan }), /并行机会/);
+  assert.match(splitGate({ _planSteps: crossPlan }), /并行机会/, "改内容类无 profile 任务也适用");
 
-  // ④ 计划不足 5 步 → 不触发（计划未建立/太小）
-  assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan.slice(0, 4) }), "");
+  // ④ 小任务：3 步跨域 → 精简版（≤120 字），如实说明 run_worker 对小任务负收益
+  const smallCross = {
+    _planSteps: [
+      { content: "实现商品列表页面组件", status: "pending" },
+      { content: "实现订单接口与鉴权中间件", status: "pending" },
+      { content: "编写端到端回归测试", status: "pending" },
+    ],
+  };
+  const smallMsg = splitGate(smallCross);
+  assert.match(smallMsg, /^\[并行机会\]/);
+  assert.match(smallMsg, /run_subagent/);
+  assert.match(smallMsg, /await_subagent/);
+  assert.match(smallMsg, /run_worker 不建议/, "小任务拆写入负收益的事实必须说明");
+  assert.match(smallMsg, /你判断/);
+  assert.ok(smallMsg.length <= 120, `精简版需 ≤120 字，实际 ${smallMsg.length} 字`);
+  assert.equal(smallCross._splitGateNudged, true);
 
-  // ⑤ 已有 worker/后台作业派发记录 → 不触发（已在并行推进）
+  // ⑤ investigate+implement 共存（单域也算：调研可后台化的事实）→ 精简版点名调研步
+  const bugPlan = {
+    engineering: { debugProject: true },
+    _planSteps: [
+      { content: "调查报错根因与调用链", status: "pending" },
+      { content: "修复商品页面组件报错", status: "pending" },
+      { content: "验证修复效果", status: "pending" },
+    ],
+  };
+  const bugMsg = splitGate(bugPlan);
+  assert.match(bugMsg, /步骤1\(调研\)/, "点名可后台化的调研步；debugProject 不再被排除");
+  assert.ok(bugMsg.length <= 120, `精简版需 ≤120 字，实际 ${bugMsg.length} 字`);
+
+  // ⑥ bugEvidence 让行：调试任务且取证门事实已成熟（账本 ≥2 次失败、尚未触发）→
+  //    本轮静默且不烧额度；bugEvidence 触发后下轮再出
+  const yieldRun = {
+    engineering: { debugProject: true },
+    _planSteps: bugPlan._planSteps,
+    _probeBatchLog: [{ fails: 1 }, { fails: 1 }],
+  };
+  assert.equal(splitGate(yieldRun), "", "同轮让行给 bugEvidence");
+  assert.ok(!yieldRun._splitGateNudged, "让行不烧一次性额度");
+  yieldRun._bugEvidenceGateNudged = true; // 取证门已出 → 下轮拆分门正常出
+  assert.match(splitGate(yieldRun), /并行机会/);
+
+  // ⑦ 计划不足 3 步 → 不触发（计划未建立/太小）
+  assert.equal(splitGate({ _planSteps: crossPlan.slice(0, 2) }), "");
+
+  // ⑧ 已有 worker/后台作业派发记录 → 不触发（已在并行推进）
   assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _parallelDispatches: 1 }), "");
   assert.equal(splitGate({ engineering: bigProfile, _planSteps: crossPlan, _subAgentJobs: new Map([[1, { id: 1 }]]) }), "");
 
