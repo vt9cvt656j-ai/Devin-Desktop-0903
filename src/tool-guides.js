@@ -250,12 +250,13 @@ const TOOL_METADATA = Object.freeze({
   },
   
   // Web 服务与 API
-  http_request: {
+  web_fetch: {
     category: 'networking',
-    use_cases: ['API 健康检查', '接口测试', '外部服务调用'],
-    triggers: ['需要调用 API', '验证服务状态', '后端交互'],
-    example_call: "http_request(method='GET', url='https://api.example.com/health')",
-    priority: 'medium'
+    use_cases: ['网页内容读取', '在线文档抓取', 'API 响应查看'],
+    triggers: ['需要读取网页正文', '查看在线文档内容', 'web_search 找到链接后需要读内容'],
+    example_call: "web_fetch(url='https://vite.dev/guide/')",
+    priority: 'high',
+    usage_note: '【何时用】抓取公网网页正文——读 web_search 找到的页面、在线文档、API 参考、报错信息等。【vs 替代】搜索用 web_search；调 API 发请求用 http_request。【何时不用】不需要读网页正文时；代码库内搜索用 search。'
   },
   
   // 性能分析类工具（新增）
@@ -520,7 +521,7 @@ const TOOL_METADATA = Object.freeze({
   semantic_search: { category: 'search', use_cases: ['语义代码搜索', '按意图找代码'], triggers: ['不知道精确关键词', '按功能描述找代码'], example_call: "semantic_search(query='where auth tokens are validated', top_k=8)", priority: 'high', usage_note: '【何时用】按语义/意图搜索代码（不需要精确关键词）。【vs 替代】精确匹配用 search；文件发现用 find_files。' },
   knowledge_search: { category: 'search', use_cases: ['项目知识库检索', '设计规范查询'], triggers: ['查找项目规范', '检索已知知识'], example_call: "knowledge_search(query='dashboard color scheme', domain='michael-design')", priority: 'high', usage_note: '【何时用】从项目知识库中检索已知信息。【vs 替代】代码搜索用 search；联网搜索用 web_search。' },
   find_symbol: { category: 'search', use_cases: ['跨文件符号查找'], triggers: ['找函数/类定义', '追踪符号引用'], example_call: "find_symbol(name='createSession')", priority: 'high', usage_note: '【何时用】查找函数/类/变量的定义和引用。【vs 替代】文本搜索用 search；语义搜索用 semantic_search。' },
-  http_request: { category: 'networking', use_cases: ['HTTP API 调用', '服务健康检查'], triggers: ['调用外部 API', '验证服务状态'], example_call: "http_request(method='GET', url='https://api.example.com/health')", priority: 'medium', usage_note: '【何时用】发送 HTTP 请求测试 API。【vs 替代】网页内容读取用 web_fetch。' },
+  http_request: { category: 'networking', use_cases: ['HTTP API 调用', '服务健康检查', '外部服务交互'], triggers: ['调用外部 API', '验证服务状态', '发 POST/PUT 请求', '需要自定义 headers/body'], example_call: "http_request(method='GET', url='https://api.example.com/health')", priority: 'high', usage_note: '【何时用】调用任意 HTTP API——这是你用各种网上工具/在线服务的关键能力。公网 API 不要凭感觉拼路径，先用官方文档/页面源码/抓包/用户给的精确 URL 取证；localhost/dev server/已取证 URL 可直接请求。【vs 替代】只读网页正文用 web_fetch（更简单）；搜索用 web_search。【何时不用】只是读网页正文不需要自定义请求时，用 web_fetch。' },
   download_file: { category: 'networking', use_cases: ['文件下载'], triggers: ['下载资源文件', '获取远程文件'], example_call: "download_file(url='https://example.com/file.zip', dest='./downloads/file.zip')", priority: 'medium', usage_note: '【何时用】从 URL 下载文件到本地。【vs 替代】游戏资产用 download_asset。' },
   tor_request: { category: 'networking', use_cases: ['Tor 匿名网络请求'], triggers: ['需要匿名访问', '.onion 站点'], example_call: "tor_request(method='GET', url='http://example.onion/')", priority: 'low', usage_note: '【何时用】通过 Tor 网络访问 .onion 站点或匿名请求。桌面专用。' },
   performance_profile: { category: 'diagnostics', use_cases: ['前端性能分析', '页面加载检测'], triggers: ['页面加载慢', '性能瓶颈定位'], example_call: "performance_profile(url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】分析前端页面性能（仅 localhost）。【vs 替代】后端性能用 profiler。' },

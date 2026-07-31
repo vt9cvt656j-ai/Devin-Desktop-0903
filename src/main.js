@@ -31220,7 +31220,7 @@ function _toolFailureKey(call) {
 // ── 结果缓存统一框架 ── 只读工具 5 分钟 TTL，相同参数不重复执行
 const _toolResultCache = new Map();
 const _CACHEABLE_TOOL_TYPES = new Set([
-  "read", "list", "search", "findfiles", "web", "websearch", "webfetch",
+  "read", "list", "search", "findfiles", "web", "websearch", "webfetch", "http",
   "gitstatus", "gitdiff", "gitlog", "gitblame", "gitstashlist", "gitconflicts",
   "lspsymbols", "findsymbol", "knowledgesearch", "lspdefinition", "lspreferences",
   "getdiagnostics", "readlogs", "readterminal", "listterminals",
@@ -31291,7 +31291,7 @@ const _toolCategoryMap = {
   dbquery: "db", dbmigrate: "db", backupdatabase: "db",
   run_cmd: "execution", runterminal: "execution", runintterminal: "execution",
   readterminal: "execution", listterminals: "execution", stopterminal: "execution",
-  httpprequest: "network", httprequest: "network", download: "network", downloadfile: "network",
+  httprequest: "network", http: "network", download: "network", downloadfile: "network",
   computer: "desktop", system: "desktop",
   runsubagent: "orchestration", runworker: "orchestration", awaitsubagent: "orchestration",
   askuser: "interaction", updateplan: "interaction",
@@ -42353,7 +42353,7 @@ async function _executeToolStepInner(step, call, root, run) {
           const retryNote = e?.retryInfo ? `（${e.retryInfo}）` : "";
           res.className = "atc-result atc-result--err";
           res.textContent = msg.slice(0, 80);
-          return { type: "web", path: call.path, content: `[ERROR] 抓取失败: ${msg}${retryNote}` };
+          return { type: "web", path: call.path, content: `[ERROR] 网页抓取失败: ${msg}${retryNote}。检查 URL 是否正确、网络是否畅通；如果是内网地址请确认 VPN/代理已连接。` };
         }
       }
       const chars = text.length;
@@ -42374,7 +42374,7 @@ async function _executeToolStepInner(step, call, root, run) {
           const msg = String(e?.message || e).slice(0, 160);
           res.className = "atc-result atc-result--err";
           res.textContent = msg.slice(0, 80);
-          return { type: "websearch", path: call.path, content: `[ERROR] 搜索失败: ${msg}` };
+          return { type: "websearch", path: call.path, content: `[ERROR] 联网搜索失败: ${msg}。检查搜索词是否合理、网络是否畅通；换个关键词试试。` };
         }
       }
       const hits = (text.match(/^\s*\d+\.\s/gm) || []).length;
@@ -43196,7 +43196,7 @@ ${bodyPreview}`)}</pre>`;
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = `${_labels[call.type] || call.type} 失败`;
-        return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}` };
+        return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}。检查查询参数、网络连接或稍后重试。` };
       }
 
     } else if (call.type === "automation") {
@@ -44834,7 +44834,7 @@ ${bodyPreview}`)}</pre>`;
 // 所有工具调用都经过这里，让 162 个工具自动受益于缓存和失败记忆。
 async function _executeToolStep(step, call, root, run) {
   // ── 结果缓存统一框架：命中则直接返回，不重复执行 ──
-  const _isCacheable = _CACHEABLE_TOOL_TYPES.has(call?.type);
+  const _isCacheable = _CACHEABLE_TOOL_TYPES.has(call?.type) && !(call?.type === "http" && String(call?.method || "GET").toUpperCase() !== "GET");
   const _cKey = _isCacheable ? _toolCacheKey(call) : null;
   if (_cKey && _toolResultCache.has(_cKey)) {
     const _cEntry = _toolResultCache.get(_cKey);

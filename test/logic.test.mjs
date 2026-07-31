@@ -16082,3 +16082,60 @@ test("模糊搜索去重：源码使用 _levenshtein 而非 includes", () => {
   assert.doesNotMatch(SRC, /_qN\.includes\(entry\.query\)\s*\|\|\s*entry\.query\.includes\(_qN\)/,
     "旧 includes 子串匹配逻辑必须被移除");
 });
+
+// ── #88 联网工具重构验证 ──────────────────────────────────────────────
+
+test("#88: _CACHEABLE_TOOL_TYPES 包含 http（GET-only 缓存）", () => {
+  // http 在缓存集合里，但只有 GET 请求才实际缓存
+  assert.match(SRC, /"http"/, "_CACHEABLE_TOOL_TYPES 必须包含 http 类型");
+  // GET-only 守卫：_executeToolStep 里检查 method 非 GET 时跳过缓存
+  assert.match(SRC, /call\?\.type\s*===\s*"http".*method.*!==\s*"GET"/,
+    "http 缓存必须有 GET-only 守卫，POST/PUT 不应缓存");
+});
+
+test("#88: _toolCategoryMap 无 httpprequest 拼写错误", () => {
+  assert.doesNotMatch(SRC, /httpprequest/,
+    "_toolCategoryMap 不应有 httpprequest 拼写错误（应为 httprequest）");
+  // http 内部类型必须在 network 分类里
+  assert.match(SRC, /http:\s*"network"/,
+    "_toolCategoryMap 必须把 http 内部类型映射到 network");
+});
+
+test("#88: web_fetch 和 http_request 在 TOOL_METADATA 有 usage_note", () => {
+  const wfMeta = TOOL_METADATA.web_fetch;
+  assert.ok(wfMeta, "web_fetch 必须在 TOOL_METADATA 中有条目");
+  assert.ok(wfMeta.usage_note, "web_fetch 必须有 usage_note");
+  assert.match(wfMeta.usage_note, /何时用/, "usage_note 必须包含'何时用'指引");
+
+  const hrMeta = TOOL_METADATA.http_request;
+  assert.ok(hrMeta, "http_request 必须在 TOOL_METADATA 中有条目");
+  assert.ok(hrMeta.usage_note, "http_request 必须有 usage_note");
+  assert.match(hrMeta.usage_note, /何时用/, "usage_note 必须包含'何时用'指引");
+});
+
+test("#88: web_fetch/web_search 错误消息友好化", () => {
+  // web_fetch 错误消息包含排查建议
+  assert.match(SRC, /网页抓取失败.*检查 URL/,
+    "web_fetch 错误消息必须包含友好排查建议");
+  // web_search 错误消息包含排查建议
+  assert.match(SRC, /联网搜索失败.*检查搜索词/,
+    "web_search 错误消息必须包含友好排查建议");
+});
+
+test("#88: deferred search 工具错误消息友好化", () => {
+  // 通用 deferred search 错误消息包含排查建议
+  assert.match(SRC, /检查查询参数、网络连接或稍后重试/,
+    "deferred search 工具错误消息必须包含通用排查建议");
+});
+
+test("#88: 联网工具失败记忆和结果缓存框架已覆盖", () => {
+  // 失败记忆统一框架在 _executeToolStep 里，所有工具自动受益
+  assert.match(SRC, /_executeToolStep[\s\S]*_toolFailureKey/,
+    "_executeToolStep 必须使用 _toolFailureKey 做失败记忆");
+  // 结果缓存统一框架在 _executeToolStep 里
+  assert.match(SRC, /_CACHEABLE_TOOL_TYPES\.has[\s\S]*_toolResultCache/,
+    "_executeToolStep 必须使用 _CACHEABLE_TOOL_TYPES 和 _toolResultCache");
+  // 所有 deferred search 工具都在缓存集合里
+  assert.match(SRC, /"academic_search"[\s\S]*"package_search"[\s\S]*"github_search"/,
+    "_CACHEABLE_TOOL_TYPES 必须包含 deferred search 工具");
+});
