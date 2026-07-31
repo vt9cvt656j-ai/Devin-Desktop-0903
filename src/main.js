@@ -17049,7 +17049,10 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   m.existingUiStackSignal = !!(m.uiProject && projectState === "existing");
   // michael-design 2.5 is valid for existing sites too. The mode controls whether it augments
   // the current system or supplies a greenfield foundation; it never rewrites the corpus itself.
-  if (m.ui && workspaceAction !== "none" && designMode === "none") {
+  // Item 4: 只要是 UI 项目就触发 design 知识（不再要求 workspaceAction !== "none"）——
+  // “帮我写个 0代码平台”这类明确的建站意图，意图判定可能返回 workspaceAction=none
+  // （尚未开始动手），但 design 知识应该从一开始就装载，而不是等到动手写文件时才触发。
+  if (m.ui && designMode === "none") {
     designMode = m.fromZeroUiProject ? "michael_design_2_5_greenfield" : "michael_design_2_5_existing";
   }
   m.designMode = designMode;
@@ -38257,6 +38260,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
             _pad.modified.set(actualPath.split("/").pop(), _desc);
+            // Item 1: write 成功后清除同路径的 read_file 失败 toast（新文件先 read 再 write 场景）
+            if (run?._readFailSteps?.has(mutationPath)) {
+              try { run._readFailSteps.get(mutationPath)?.remove?.(); } catch {}
+              run._readFailSteps.delete(mutationPath);
+            }
           }
           // Churn detector: count successful write/edit ops per file. Repeated edits
           // to the SAME file = the "写写改改重复" anti-pattern → step-back nudge below.
@@ -41086,27 +41094,41 @@ async function _executeToolStepInner(step, call, root, run) {
           if (fuzzyMatches.length > 1) {
             helpHint = `\n全部工作区里有 ${fuzzyMatches.length} 个匹配文件，IDE 不会猜是哪一个；请用下面的真实完整路径重读：\n${fuzzyMatches.slice(0, 10).map((item) => item.path).join("\n")}`;
           } else if (root) {
-            try {
-              const parentDir = candidates[0].split("/").slice(0, -1).join("/") || root;
-              let siblings = null;
-              try { siblings = await backend.readDir(parentDir); } catch {}
-              // 父目录本身也不存在（Agent 编造了整个目录结构）→ 回退到项目根目录，
-              // 把真实顶层结构甩给模型——让它看到“根目录只有 5 个文件，
-              // 根本没有 packages/ 目录”而不是一块说“找不到”。
-              if (!siblings && parentDir !== root) {
-                try { siblings = await backend.readDir(root); } catch {}
-                if (siblings) {
-                  const names = siblings.slice(0, 20).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
-                  helpHint = `\n你给的路径里的父目录 ${parentDir.replace(root, ".")} 根本不存在！项目根目录 ${root} 里实际有: ${names}\n——这个项目的目录结构和你想象的不一样。先 list_dir 看实际结构，再决定要创建什么目录/文件。`;
+            // Item 3: node_modules 路径失败时自动按 basename 搜索真实位置
+            const _isNodeMod = rawPath.includes("node_modules");
+            if (_isNodeMod) {
+              try {
+                const _base = String(rawPath).split(/[\\/]/).pop();
+                if (_base && _base.length > 2) {
+                  const _found = [];
+                  for (const r of _allRoots()) { try { (await _agentFindFiles(r, _base)).files?.forEach((f) => _found.push(r + "/" + f)); } catch {} }
+                  if (_found.length) helpHint = `\nnode_modules 内路径经常变（版本号/目录结构不同）。找到同名文件的真实路径：\n${_found.slice(0, 8).join("\n")}\n——用上面的完整路径重读。`;
+                  else helpHint = `\nnode_modules 内找不到 ${_base}。可能还没装依赖（先跑 npm/pnpm install）或包名不对。`;
                 }
-              } else if (siblings) {
-                const names = siblings.slice(0, 12).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
-                if (names) helpHint = `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`;
-              }
-            } catch {}
+              } catch {}
+            } else {
+              try {
+                const parentDir = candidates[0].split("/").slice(0, -1).join("/") || root;
+                let siblings = null;
+                try { siblings = await backend.readDir(parentDir); } catch {}
+                if (!siblings && parentDir !== root) {
+                  try { siblings = await backend.readDir(root); } catch {}
+                  if (siblings) {
+                    const names = siblings.slice(0, 20).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
+                    helpHint = `\n你给的路径里的父目录 ${parentDir.replace(root, ".")} 根本不存在！项目根目录 ${root} 里实际有: ${names}\n——这个项目的目录结构和你想象的不一样。先 list_dir 看实际结构，再决定要创建什么目录/文件。`;
+                  }
+                } else if (siblings) {
+                  const names = siblings.slice(0, 12).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
+                  if (names) helpHint = `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`;
+                }
+              } catch {}
+            }
           }
           res.className = "atc-result atc-result--err";
           res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l6 6M10 4l-6 6"/></svg> ${_escHtml(readError || "not found")}`;
+          // Item 1: 记录该失败的 step DOM 和路径，以便 write_file 成功后自动清除
+          // （Agent 对新文件先 read 再 write 时，成功后红色 toast 自动消失）。
+          if (run) { (run._readFailSteps ||= new Map()).set(fp, step); }
           step.classList.add("agent-tool-step--rejected");
           vp.innerHTML = `<div style="padding:8px 12px;color:var(--atc-dim,#636c76);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
           const code = fuzzyMatches.length > 1 ? "AMBIGUOUS_PATH" : "ERROR";
@@ -41783,11 +41805,19 @@ async function _executeToolStepInner(step, call, root, run) {
         }
         if (occ === 0) {
           res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处未找到`;
-          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 找不到（可能被前面的替换改动了，请按应用后的内容重新定位；注意逐字符一致、别带行号）。整体未写入。` };
+          // Item 2: 附上最接近的真实片段，让模型一次修正而非反复盲试
+          const closest = _closestLines(content, oldStr);
+          const hint = closest
+            ? `\n\n文件里最接近的真实内容：\n\`\`\`\n${closest}\n\`\`\`\n——请照着它逐字符复制 old_string（注意空白/缩进/标点）再重试。`
+            : `\n请先 read_file 读取当前内容，再从结果里逐字符复制 old_string。`;
+          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 找不到（可能被前面的替换改动了，或空白/缩进不一致）。整体未写入。${hint}` };
         }
         if (occ > 1 && !edits[k].replace_all) {
           res.className = "atc-result atc-result--err"; res.textContent = `第 ${k + 1} 处不唯一(${occ})`;
-          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 出现 ${occ} 次（不唯一）。加更多上下文或设 replace_all=true。整体未写入。` };
+          // Item 2: 附上匹配位置的行号，让模型知道要多带哪几行上下文才能唯一
+          const locs = _occurrenceLines(content, oldStr);
+          const where = locs.length ? `（出现在第 ${locs.join("、")} 行附近）` : "";
+          return { type: "multiedit", path: call.path, content: `[ERROR] 第 ${k + 1} 处 old_string 出现 ${occ} 次（不唯一）${where}。加更多上下文让它唯一定位，或设 replace_all=true 一次全改。整体未写入。` };
         }
         content = edits[k].replace_all ? content.split(oldStr).join(newStr) : content.replace(oldStr, () => newStr);
       }
@@ -46318,18 +46348,15 @@ function _showInstallProgress(cmd, name) {
     } catch { /* keep polling */ }
   }, 2500);
 
-  // At 5 min, switch to a NON-alarming "still installing" state instead of removing the bar — a
-  // `go install` / `npm i -g` downloading many modules easily runs past 90s, and the old bar vanished
-  // mid-install with "未完成", leaving the user unsure. Keep polling (checkDone) so a late completion
-  // still flips it to ✓; a 12-min backstop finally clears it.
+  // Item 5: 缩短超时——90s 显示“较慢”，3min 放弃（原来 5min/12min，用户以为卡住了）
   giveUp = setTimeout(() => {
     if (settled) return;
     clearInterval(tick);
     bar.style.width = "96%"; bar.style.background = "#ffcc00";
     card.querySelector(".notif-card__title").textContent = `${name} 安装中（较慢）…`;
     card.querySelector(".notif-card__msg").textContent = "在终端看下载进度；装好后重开文件即生效";
-    setTimeout(() => finish(false, `${name} 安装超时`, "在终端确认是否装好；找不到 go/npm 等就先装好对应语言环境，或手动重跑安装命令"), 420000);
-  }, 300000);
+    setTimeout(() => finish(false, `${name} 安装超时`, "在终端确认是否装好；找不到 go/npm 等就先装好对应语言环境，或手动重跑安装命令"), 90000);
+  }, 90000);
 }
 
 // ---- auto-detect missing tools ----
