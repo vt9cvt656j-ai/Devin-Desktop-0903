@@ -32790,6 +32790,42 @@ function _recordRunRead(run, root, ...paths) {
     if (key) reads.add(key);
   }
 }
+// === ANTI-HALLUCINATION PROTOCOL-C：证据分级（单份 .md 不作项目权威）===
+// 痛点：满是文件的项目里，模型只读了一份 `逆向分析报告.md` 就把它当项目事实下结论，
+// 没核对真实源码，也没考虑这份 md 可能过期或是用户随手记。
+// 这是【事实门控 + 判断留权】，不是关键词路由、更不是硬禁令：只在“本轮读过的文件全是
+// 文档类、一份真实源码都没读，而草稿正要对项目是什么/怎么实现下结论”时返回一次性软提示。
+// 读过任何源码/配置 → hasSource/hasConfig 为真，本门自然不再触发（结论已有权威证据支撑）。
+// 纯函数、无副作用，供 test/logic.test.mjs 抽取直测。
+function _evidenceGradingHint(readPaths, draftText) {
+  const paths = Array.isArray(readPaths) ? readPaths : [...(readPaths || [])];
+  if (!paths.length) return ""; // 本轮没读任何文件：非本机制场景（靠既有账本或纯讨论），不误伤
+  // 只按扩展名/文件名判定文件类型——不跨行匹配，天然免疫 \u000d\u000a 换行注入。
+  const _ext = (p) => { const s = String(p || "").toLowerCase().split(/[?#]/)[0]; const dot = s.lastIndexOf("."); return dot > s.lastIndexOf("/") ? s.slice(dot + 1) : ""; };
+  const _base = (p) => (String(p || "").toLowerCase().split(/[?#]/)[0].split("/").pop() || "");
+  const DOC_EXT = new Set(["md", "markdown", "mdx", "txt", "rst", "adoc", "org"]);
+  const SOURCE_EXT = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "java", "kt", "kts", "rb", "php", "c", "cc", "cpp", "h", "hpp", "cs", "swift", "scala", "m", "mm", "vue", "svelte", "sh", "bash", "zsh", "sql"]);
+  const CONFIG_EXT = new Set(["json", "toml", "yaml", "yml", "lock", "gradle", "xml", "ini", "cfg", "conf", "env", "properties"]);
+  let sawDoc = false, sawSource = false, sawConfig = false;
+  for (const p of paths) {
+    const ext = _ext(p), base = _base(p);
+    if (SOURCE_EXT.has(ext)) { sawSource = true; continue; }
+    if (CONFIG_EXT.has(ext) || base === "dockerfile" || base === "makefile") { sawConfig = true; continue; }
+    if (DOC_EXT.has(ext) || base === "readme" || base === "license" || base === "changelog" || base === "authors") { sawDoc = true; continue; }
+    // 未知/无后缀（脚本、二进制等）保守当作可能是源码 → 不触发，宁可漏放不误伤纯代码任务。
+    sawSource = true;
+  }
+  // 事实门：读过真实源码或配置 → 结论有权威证据，解除（不提示）。
+  if (sawSource || sawConfig) return "";
+  // 事实门：本轮读的全是文档，且至少读了一份文档。
+  if (!sawDoc) return "";
+  // 情景门：草稿正要下的是不是“项目是什么/怎么实现”类结论？软信号，仅作触发闸不作硬拦截。
+  const draft = String(draftText || "");
+  if (!draft.trim()) return "";
+  const CONCLUSION = /(这个?项目|本项目|该项目|整个项目|项目的?(是|用|采用|基于|使用|架构|实现|技术栈|框架|结构|功能)|技术栈|架构(设计|上|是|采用|基于)|采用了|基于.{0,8}(框架|构建|开发|实现)|the project|tech stack|built (with|on|using)|implemented (in|with|using)|architecture)/i;
+  if (!CONCLUSION.test(draft)) return "";
+  return "⚠️ 证据分级：本轮仅读了文档（.md 可能过期或是随手记），未核对真实源码。下\u201c项目/实现\u201d类结论前请先读相关源文件（read_file/find_symbol/semantic_search）核实；暂将此结论视为低置信、待核验。源码 > 配置 > 文档 > 笔记。";
+}
 function _contentSignature(text) {
   const value = String(text || "");
   const lines = value.endsWith("\n") ? value.slice(0, -1).split("\n").length : value.split("\n").length;
@@ -36332,6 +36368,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (!turn.toolCalls.length) {
         quietTurns++;
         if (!_live()) break;
+        // ── ANTI-HALLUCINATION Protocol-C 证据分级：本轮只读了文档就想对“项目/实现”下结论 → 一次性软提示。
+        //    事实门控 + 判断留权：走既有 _pushNudge（user block，不碰 system 前缀），run 级布尔防复发，
+        //    只提醒不物理拦截；读过源码后 _evidenceGradingHint 自然返回空，本门不再触发。
+        if (isAgent && run.mode === "agent" && !run._evidenceGradingNudged) {
+          const _evGradeHint = _evidenceGradingHint([..._readFiles], turn.text || summaryText);
+          if (_evGradeHint) {
+            run._evidenceGradingNudged = true;
+            _pushNudge("evidenceGrading", _evGradeHint);
+            continue;
+          }
+        }
         // ── 空项目行动门禁②（收尾拦截）：构建任务 + 空目录起步 + 全 run 零写操作就想收尾
         //    → 拦一次逼它产出实际文件；只拦 1 次，第二次放行（防死循环），届时由既有的
         //    诚实收尾约束让模型说明未完成原因。

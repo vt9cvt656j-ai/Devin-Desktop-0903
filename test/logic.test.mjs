@@ -14848,3 +14848,53 @@ test("#56-4 解耦不回归：#18 空目录快动手门原样保留，新触发�
     }
   }
 });
+
+// ==================== ANTI-HALLUCINATION Protocol-C：证据分级 ====================
+// 痛点：满是文件的项目里，模型只读一份 `逆向分析报告.md` 就当项目事实下结论，没核对真实源码。
+// _evidenceGradingHint 是纯函数事实门：本轮只读文档 + 草稿正下“项目/实现”结论 → 返回一次性软提示。
+const EVIDENCE_GRADING_HINT = load("_evidenceGradingHint");
+
+test("#71-C 证据分级：仅读文档且下项目结论 → 触发软提示", () => {
+  const hint = EVIDENCE_GRADING_HINT(["逆向分析报告.md"], "这个项目采用 Rust + Tauri 架构实现桌面 IDE。");
+  assert.match(hint, /证据分级/);
+  assert.match(hint, /源码 > 配置 > 文档 > 笔记/);
+  // README + 多份 md 仍是纯文档证据 → 照样触发
+  assert.ok(EVIDENCE_GRADING_HINT(["README.md", "docs/架构.md", "notes.txt"], "该项目的技术栈是 Vue3。"));
+});
+
+test("#71-C 证据分级：读过真实源码 → 解除，不触发", () => {
+  // 读了源码：即便同时读了 md、草稿仍在下项目结论 → 有权威证据，解除
+  assert.equal(EVIDENCE_GRADING_HINT(["逆向分析报告.md", "src/main.js"], "这个项目用 React 实现。"), "");
+  // 读了配置（package.json/Cargo.toml）也算权威证据 → 解除
+  assert.equal(EVIDENCE_GRADING_HINT(["README.md", "package.json"], "项目的框架是 Express。"), "");
+  assert.equal(EVIDENCE_GRADING_HINT(["docs/x.md", "Cargo.toml"], "该项目基于 Tauri 构建。"), "");
+  // 各类源码扩展名都视为已核实源码
+  for (const src of ["a.ts", "b.py", "c.rs", "d.go", "e.java", "f.vue"]) {
+    assert.equal(EVIDENCE_GRADING_HINT(["readme.md", src], "这个项目怎么实现的：见源码。"), "", `${src} 应视为源码`);
+  }
+});
+
+test("#71-C 证据分级：纯代码/非结论/无读取场景 → 不误伤", () => {
+  // 非“项目结论”场景：只读文档但草稿是普通汇报 → 不触发
+  assert.equal(EVIDENCE_GRADING_HINT(["CHANGELOG.md"], "我已经修好了这个 bug 并跑通测试。"), "");
+  assert.equal(EVIDENCE_GRADING_HINT(["notes.md"], "好的，收到，我这就开始。"), "");
+  // 本轮什么都没读（靠既有账本/纯讨论）→ 不误伤
+  assert.equal(EVIDENCE_GRADING_HINT([], "这个项目用 Go 写的。"), "");
+  // 纯代码任务：读的是源码不是文档 → 不触发
+  assert.equal(EVIDENCE_GRADING_HINT(["src/app.tsx", "src/util.ts"], "这个项目采用 React 架构。"), "");
+  // 空草稿 → 不触发
+  assert.equal(EVIDENCE_GRADING_HINT(["a.md"], ""), "");
+  // 未知/无后缀文件保守当源码 → 不触发（宁可漏放不误伤）
+  assert.equal(EVIDENCE_GRADING_HINT(["Makefile"], "项目采用 make 构建。"), "");
+});
+
+test("#71-C 证据分级：接线自查——run 级布尔一次性 + 走 _pushNudge user block", () => {
+  // 触发条件：agent 模式 + 未提示过；命中即置一次性布尔并 _pushNudge，防复发
+  assert.match(SRC, /if \(isAgent && run\.mode === "agent" && !run\._evidenceGradingNudged\) \{/);
+  assert.match(SRC, /_evidenceGradingHint\(\[\.\.\._readFiles\], turn\.text \|\| summaryText\)/);
+  assert.match(SRC, /run\._evidenceGradingNudged = true;/);
+  assert.match(SRC, /_pushNudge\("evidenceGrading", _evGradeHint\)/);
+  // 不碰 system 静态前缀：提示只经 _pushNudge（user 消息通道）注入
+  const fnSrc = extractFn("_evidenceGradingHint");
+  assert.ok(!/_AI_MODE_PROMPTS|systemPrompt|system:/.test(fnSrc), "证据分级不得触碰 system 前缀");
+});
