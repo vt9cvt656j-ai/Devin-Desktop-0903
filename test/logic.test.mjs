@@ -16249,3 +16249,70 @@ test("#92: list_dir 向后兼容——depth=1 默认行为不受影响", () => {
   assert.match(SRC, /Math\.max\(0,\s*Math\.min\(10/,
     "depth 必须限制在 0-10 范围");
 });
+
+// ==================== #95: 批量接入 15 工具到失败记忆框架 ====================
+
+test("#95: 失败记忆 wrapper 正则覆盖 system 工具的 [系统控制失败] 模式", () => {
+  const wrapperSrc = extractFn("_executeToolStep");
+  // 正则必须包含 系统控制失败 —— 这是 system 工具 catch 块的返回格式
+  assert.match(wrapperSrc, /系统控制失败/, "wrapper 失败检测正则必须覆盖 [系统控制失败] 模式");
+  // 验证正则实际能匹配
+  const regexMatch = wrapperSrc.match(/\\\[\(([^)]+)\)/);
+  assert.ok(regexMatch, "应能提取正则alternation组");
+  const alts = regexMatch[1];
+  assert.ok(alts.includes("系统控制失败"), "alternation 必须含 系统控制失败");
+});
+
+test("#95: 15 个工具的 catch 块返回内容可被失败记忆框架检测", () => {
+  // location 工具 (5 个)
+  const locationTools = ["localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment"];
+  // design 工具 (3 个)
+  const designTools = ["learndesign", "designboard", "designresearch"];
+  // 桌面自动化 (4 个)
+  const desktopTools = ["readscreen", "uiclick", "system", "automation"];
+  // 其他 (3 个)
+  const otherTools = ["tor", "realtime_news_feed", "debate"];
+  const allTools = [...locationTools, ...designTools, ...desktopTools, ...otherTools];
+  // design_research 走子智能体路径(type:"subagent")，不在 _executeToolStepInner 中直接处理
+  const directTools = allTools.filter(t => t !== "designresearch");
+  for (const tool of directTools) {
+    const pattern = new RegExp(`call\\.type\\s*===\\s*"${tool}"`);
+    assert.match(SRC, pattern, `工具 ${tool} 必须在 _executeToolStepInner 中有处理分支`);
+  }
+  // design_research 通过 deferred 映射为 type:"subagent"，失败由 wrapper 通用 [ERROR] 检测覆盖
+  assert.match(SRC, /"design_research".*"subagent"/s, "design_research 走子智能体路径");
+  // wrapper 正则能检测所有这些工具的失败返回
+  const wrapperSrc = extractFn("_executeToolStep");
+  // 所有工具的 catch 块返回 [失败] / [ERROR] / [系统控制失败] 格式
+  // wrapper 正则已覆盖这些模式：失败|ERROR|系统控制失败
+  assert.match(wrapperSrc, /失败.*ERROR.*系统控制失败/, "wrapper 正则必须覆盖 失败/ERROR/系统控制失败 三种模式");
+  // 验证关键工具的 catch 块返回格式可被 wrapper 检测
+  // system 工具返回 [系统控制失败] —— 这是本次修复新增的模式
+  assert.match(SRC, /call\.type === "system"[\s\S]{0,3000}\[系统控制失败\]/,
+    "system catch 块返回 [系统控制失败]");
+  // readscreen / uiclick / automation / tor 返回 [失败]
+  for (const tool of ["readscreen", "uiclick", "automation", "tor"]) {
+    assert.match(SRC, new RegExp(`call\\.type === "${tool}"[\\s\\S]{0,3000}\\[失败\\]`),
+      `${tool} catch 块返回 [失败]`);
+  }
+  // localdiscovery / learndesign 返回 [失败]（handler 较长，给更多距离）
+  assert.match(SRC, /call\.type === "localdiscovery"[\s\S]{0,10000}\[失败\] local_discovery/,
+    "localdiscovery catch 块返回 [失败]");
+  assert.match(SRC, /call\.type === "learndesign"[\s\S]{0,10000}\[失败\] learn_design/,
+    "learndesign catch 块返回 [失败]");
+  // live* 工具共用 catch 块，返回 [失败]
+  assert.match(SRC, /liveenvironment[\s\S]{0,10000}livemarkets[\s\S]{0,10000}liveflights[\s\S]{0,10000}roadenvironment[\s\S]{0,10000}\[失败\]/,
+    "live*/road 共用 catch 块返回 [失败]");
+});
+
+test("#95: 失败记忆框架零新增依赖——仅改动 wrapper 正则", () => {
+  // 确认 _recordToolFailure / _resetToolFailure / _getToolFailureCount 函数定义未变
+  assert.match(SRC, /function _recordToolFailure\(toolType\)/, "_recordToolFailure 定义必须存在");
+  assert.match(SRC, /function _resetToolFailure\(toolType\)/, "_resetToolFailure 定义必须存在");
+  assert.match(SRC, /function _getToolFailureCount\(toolType\)/, "_getToolFailureCount 定义必须存在");
+  // _toolFailureKey 仍按 git/gh/db 分 op，其他工具用 call.type
+  assert.match(SRC, /function _toolFailureKey\(call\)/, "_toolFailureKey 定义必须存在");
+  // 确认 wrapper 中 _fmRecorded 防双重计数机制仍在
+  const wrapperSrc = extractFn("_executeToolStep");
+  assert.match(wrapperSrc, /_fmRecorded/, "wrapper 必须检查 _fmRecorded 防双重计数");
+});

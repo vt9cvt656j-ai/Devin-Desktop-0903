@@ -42155,9 +42155,10 @@ async function _executeToolStepInner(step, call, root, run) {
         if (vp) step.classList.add("is-open");
         return { type: "readscreen", path: output?.source || "", content: `read_screen 真实结果：\n${structured}` };
       } catch (error) {
+        const _cnt = _recordToolFailure("readscreen");
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "读取失败";
-        return { type: "readscreen", path: "", content: `[失败] read_screen: ${message}` };
+        return { type: "readscreen", path: "", content: `[失败] read_screen: ${message}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "uiclick") {
@@ -42174,9 +42175,10 @@ async function _executeToolStepInner(step, call, root, run) {
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 4000))}</pre>`;
         return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}` };
       } catch (error) {
+        const _cnt = _recordToolFailure("uiclick");
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "操作失败";
-        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}` };
+        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "localdiscovery") {
@@ -42382,9 +42384,10 @@ async function _executeToolStepInner(step, call, root, run) {
           : `${evidenceNote}\n\n结构化数据：\n${structured}`;
         return { type: call.type, path: call.path || "", content: modelContent };
       } catch (error) {
+        const _cnt = _recordToolFailure(call.type);
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "查询失败";
-        return { type: call.type, path: call.path || "", content: `[失败] ${command}: ${message}` };
+        return { type: call.type, path: call.path || "", content: `[失败] ${command}: ${message}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "learndesign") {
@@ -42418,9 +42421,10 @@ async function _executeToolStepInner(step, call, root, run) {
         if (vp) vp.innerHTML = `<pre>${_escHtml(learned.md.slice(0, 4000))}</pre>`;
         return { type: "learndesign", path: `reference/${slug}-design-system.md`, content: `已把「${learned.name || url}」的设计体系学下来并落盘：\n- reference/${slug}-design-system.md（完整色板+每色真实用途/频率、字体/字阶、结构要点）${cssNote}\n\n实现时逐条对照这份体系执行（色彩只用在它标注的用途上、字阶按它的比例、边框/阴影/圆角按它的纪律），把体系转成本项目的语义令牌，不要另编。\n\n${learned.md.slice(0, 6000)}` };
       } catch (e) {
+        const _cnt = _recordToolFailure("learndesign");
         const msg = String(e?.message || e).slice(0, 200);
         res.className = "atc-result atc-result--err"; res.textContent = msg.slice(0, 80);
-        return { type: "learndesign", path: call.path, content: `[失败] learn_design: ${msg}。可改用 web_fetch 读页面正文，或 browser design 抓真站设计系统。` };
+        return { type: "learndesign", path: call.path, content: `[失败] learn_design: ${msg}。可改用 web_fetch 读页面正文，或 browser design 抓真站设计系统。（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "web") {
@@ -43236,9 +43240,10 @@ ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? "\nencoding: " + r.bo
 ${bodyPreview}`)}</pre>`;
         return { type: "tor", path: call.url, content: `🧅 Tor ${call.method} ${call.url}\n状态: ${r ? r.status : "?"} ${r ? (r.status_text || "") : ""}${r && r.truncated ? "（响应体已截断到 5MB）" : ""}\nContent-Type: ${r ? (r.content_type || "") : ""}${r && r.body_encoding ? `\nBody-Encoding: ${r.body_encoding}` : ""}\n响应头:\n${hdrs}\n\n响应体:\n${r ? (r.body || "(空)") : "(无响应)"}`.slice(0, 8000) };
       } catch (e) {
+        const _cnt = _recordToolFailure("tor");
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = "Tor 请求失败";
-        return { type: "tor", path: call.url, content: `[失败] tor_request 出错: ${msg}` };
+        return { type: "tor", path: call.url, content: `[失败] tor_request 出错: ${msg}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "figma") {
@@ -43293,10 +43298,11 @@ ${bodyPreview}`)}</pre>`;
         const _out = r == null ? "(ok)" : typeof r === "string" ? r : JSON.stringify(r);
         return { type: "automation", path: _m, content: `✅ ${_m} → ${_out}`.slice(0, 4000) };
       } catch (e) {
+        const _cnt = _recordToolFailure("automation");
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         const _msg = String(e?.message || e);
         const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
-        return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}` };
+        return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
     } else if (call.type === "capture_start") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "capture_start", path: "", content: "[不可用] 抓包只能在桌面 App 里用。" }; }
@@ -44477,9 +44483,10 @@ ${bodyPreview}`)}</pre>`;
         else if (sop === "menu_items") hint = "\n挑你要的项，用 system menu path:[...] 直接触发。";
         return { type: "system", path: sop, content: `系统 [${sop}] →\n${txt}${hint}` };
       } catch (e) {
+        const _cnt = _recordToolFailure("system");
         const m = String(e?.message || e);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${/仅支持/.test(m) ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）" : "若反复失败：macOS 去 系统设置→隐私与安全性→辅助功能 勾选 Michael IDE 后重启；Windows 确认目标软件暴露了 UI Automation（部分 Electron/自绘界面不暴露，改用 computer 节点）。"}` };
+        return { type: "system", path: sop, content: `[系统控制失败] ${m}。${/仅支持/.test(m) ? "（仅该 Linux 平台暂不支持系统控制，改用 computer 坐标点）" : "若反复失败：macOS 去 系统设置→隐私与安全性→辅助功能 勾选 Michael IDE 后重启；Windows 确认目标软件暴露了 UI Automation（部分 Electron/自绘界面不暴露，改用 computer 节点）。"}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "cmd") {
@@ -44948,7 +44955,7 @@ async function _executeToolStep(step, call, root, run) {
 
   // ── 失败记忆统一框架：根据结果内容自动记录 ──
   const _content = String(result?.content || "");
-  const _isFailure = /\[(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted|WARN|参数错误)\]/i.test(_content)
+  const _isFailure = /\[(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted|WARN|参数错误|系统控制失败)\]/i.test(_content)
     || /\*\*批量自动化结果\*\*/.test(_content) && /[✗×]/.test(_content);
   if (_isFailure) {
     if (!result?._fmRecorded) _recordToolFailure(_fmKey);
