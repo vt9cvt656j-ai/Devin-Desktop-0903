@@ -36460,19 +36460,78 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         run._historyInvalidatedNote = true;
         _pushNudge("emptyHistoryFact", "⚠️ 磁盘实况: 当前目录为空 (0 文件)。历史对话中提到的任何文件/框架/搭建成果在磁盘上均**不存在**——历史信息已作废，以磁盘为准，直接重新开建，不要'确认当前状态'。");
       }
-      // ── 拆分并行门（一次性事实注入）：全任务类型。计划已建立（非取消 ≥3 步且跨 ≥2 领域
-      //    或 调研+实现步共存）+ 本 run 尚无 worker/后台作业派发 → 注入并行机会事实（大任务
-      //    完整清单/小任务精简版，触发矩阵与 bugEvidence 让行都在函数内按事实判定）。
-      //    只罗列事实和能力，拆不拆由模型判断——不拦截、不复催（run._splitGateNudged）。
-      if (isAgent && _live()) {
-        const _splitMsg = _splitGateNudgeMessage(run);
-        if (_splitMsg) _pushNudge("splitGate", _splitMsg);
-        else {
-          // #56 多角色/并行引导（一次性）：拆分门事实已给过、模型仍零派发且待做步骤跨 ≥2 领域
-          // 可独立 → 升级为极简 tasks 多派示例（与拆分门不同轮，不重复轰炸；单领域小任务静默）。
-          const _orchMsg = _inferOrchestrationFromPlan(run);
-          if (_orchMsg) _pushNudge("parallelGuide", _orchMsg);
+      // ── 自动并行派发（Supervisor 模式，参照 Claude Code Agent Teams）：计划跨 ≥ 2 领域且
+      //    非 debug 任务时，IDE 直接拆分派发，不等模型自觉。拆分条件严格——只拆
+      //    真正独立的步骤（域不同 + 都是 implement/investigate），有依赖的保留串行。
+      if (isAgent && _live() && !run._autoDispatchDone
+          && !(run.engineering?.bug || run.engineering?.debugProject)
+          && (run._parallelDispatches || 0) === 0
+          && !(run._subAgentJobs instanceof Map && run._subAgentJobs.size)) {
+        const _adSteps = (Array.isArray(run._planSteps) ? run._planSteps : []).filter((s) => s?.status !== "cancelled");
+        const _adKinds = _adSteps.map((s) => _planStepActionKind(s));
+        const _adDomains = _adSteps.map((s) => _planStepDomain(s));
+        const _adDist = {};
+        for (const d of _adDomains) _adDist[d || "未归类"] = (_adDist[d || "未归类"] || 0) + 1;
+        const _adNamedDomains = Object.keys(_adDist).filter((d) => d !== "未归类");
+        // 条件：≥ 3 步 + 跨 ≥ 2 具名领域 + 有 ≥ 2 个独立的 implement/investigate 步
+        const _adIndepSteps = [];
+        for (let i = 0; i < _adSteps.length; i++) {
+          if ((_adKinds[i] === "implement" || _adKinds[i] === "investigate") && _adDomains[i]) {
+            _adIndepSteps.push({ step: _adSteps[i], domain: _adDomains[i], kind: _adKinds[i], index: i });
+          }
         }
+        // 去重域（同域只派一个）
+        const _adByDomain = new Map();
+        for (const s of _adIndepSteps) { if (!_adByDomain.has(s.domain)) _adByDomain.set(s.domain, s); }
+        if (_adSteps.length >= 3 && _adNamedDomains.length >= 2 && _adByDomain.size >= 2) {
+          run._autoDispatchDone = true;
+          run._splitGateNudged = true;
+          // 派发：每个独立域一个子智能体（最多 4 个并行）
+          const _adRoleMap = { "前端": "frontend", "后端": "backend", "数据库": "database", "测试": "test", "部署": "devops", "设计": "design", "文档": "docs", "安全": "security" };
+          const _adAgents = [..._adByDomain.entries()].slice(0, 4).map(([domain, s]) => ({
+            role: _adRoleMap[domain] || (s.kind === "investigate" ? "research" : "frontend"),
+            focus: String(s.step.content || "").slice(0, 200),
+          }));
+          const _adTask = `用户任务：${String(run._originalText || "").slice(0, 300)}\n计划概览：${_adSteps.map((s, i) => `${i + 1}. ${String(s.content || "").slice(0, 60)}`).join("; ")}`;
+          // 异步派发（不阻塞主循环），结果通过 SharedStore + await_subagent 汇合
+          if (!(run._subAgentJobs instanceof Map)) run._subAgentJobs = new Map();
+          for (const spec of _adAgents) {
+            run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
+            const jobId = run._subAgentJobSeq;
+            const desc = `${spec.role}·${String(spec.focus).slice(0, 16)}`;
+            const job = { id: jobId, desc, status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null };
+            run._subAgentJobs.set(jobId, job);
+            run._parallelDispatches = (run._parallelDispatches || 0) + 1;
+            job.promise = _runSubAgent({
+              config,
+              description: desc,
+              prompt: `${_adTask}\n\n【你的专属分工（${spec.role} 视角）】${spec.focus}`,
+              root, container: body, run,
+              write: spec.role !== "research" && spec.role !== "security" && spec.role !== "architect",
+              scope: [], role: spec.role,
+            }).then((report) => {
+              job.result = String(report || "").slice(0, 12000);
+              job.status = /^\[ERROR\]/.test(job.result) ? "failed" : "done";
+              return job.result;
+            }).catch((error) => {
+              job.result = `[ERROR] 子智能体异常：${String(error?.message || error).slice(0, 300)}`;
+              job.status = "failed";
+              return job.result;
+            });
+          }
+          const domainList = _adAgents.map((a) => `${a.role}(…${String(a.focus).slice(0, 20)})`).join("、");
+          _pushNudge("autoDispatch", `[Supervisor 自动派发] 计划跨 ${_adNamedDomains.length} 个领域，IDE 已自动并行派发 ${_adAgents.length} 个子智能体：${domainList}。你继续推进主线任务，子智能体完成后结果会自动送达；也可用 await_subagent 显式汇合。`);
+        } else {
+          // 不满足自动派发条件 → 回退到原来的事实清单 nudge（保留兼容）
+          const _splitMsg = _splitGateNudgeMessage(run);
+          if (_splitMsg) _pushNudge("splitGate", _splitMsg);
+          else {
+            const _orchMsg = _inferOrchestrationFromPlan(run);
+            if (_orchMsg) _pushNudge("parallelGuide", _orchMsg);
+          }
+        }
+      } else if (isAgent && _live()) {
+        // 已派发/debug任务/已完成 → 不重复触发
       }
       // The user clicked ✕ on plan step(s) since the last turn → tell the model now,
       // so it drops them immediately instead of waiting for its own update_plan.
