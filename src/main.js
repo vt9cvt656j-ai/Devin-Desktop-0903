@@ -25807,8 +25807,7 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
       "read_file", "search", "find_files", "get_diagnostics", "git_diff",
     ],
     agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-            "write_file", "edit_file", "multi_edit", "run_cmd",
-            "web_search", "web_fetch", "github_search", "http_request", "developer_community_search"],
+            "write_file", "edit_file", "multi_edit", "run_cmd"],
   };
   
   // Get base tools from role or default
@@ -36300,8 +36299,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 桌面/实时数据…）的任务得等第一批结果或靠模型自觉 search_tools，弱意愿下直接用
   // run_cmd 硬凑（实测痛点"全部工具不会灵活调用"）。判断权全在语义编排器（用户模型），
   // 不是关键词路由；纯问答/局部修改它自会返回 tools=[]。
+  // 首轮工具编排同步等待（最多 3s）：之前用 void 异步并行导致“模型首轮发请求时
+  // 联网工具还没装载”——模型看不到 web_search/github_search 就不会调用。
+  // 现在同步等结果（带 3s 超时保护），编排器装载的工具首轮就在 schema 里。
   if (isAgent && run.engineering?.applies) {
-    void _routeAgentTools("initial", "任务刚启动，尚无工具结果；按任务语义预判首批需要的专用能力（没有就返回空）。").catch(() => {});
+    try {
+      await Promise.race([
+        _routeAgentTools("initial", "任务刚启动，尚无工具结果；按任务语义预判首批需要的专用能力（没有就返回空）。"),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]);
+    } catch {}
   }
   // MCP discovery stays background-only. It may update the complete registry, but it must not
   // start another planner or mutate the first provider payload. An explicit search_tools request
