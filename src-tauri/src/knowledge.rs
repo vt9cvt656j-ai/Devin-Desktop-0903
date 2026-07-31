@@ -2851,10 +2851,7 @@ async fn discourse_search(
 ) -> Result<String, String> {
     let query = query.trim();
     if query.is_empty() {
-        return Err(format!(
-            "{} search requires a non-empty query",
-            source.label
-        ));
+        return Err(format!("{} 搜索词不能为空，请输入具体内容", source.label));
     }
     let client = kclient()?;
     let response = client
@@ -2939,7 +2936,7 @@ pub async fn developer_community_search(
 ) -> Result<String, String> {
     let query = query.trim().to_string();
     if query.is_empty() {
-        return Err("developer_community_search requires a non-empty query".into());
+        return Err("搜索词不能为空，请输入具体内容".into());
     }
 
     let selected = select_developer_sources(scope.as_deref(), sources.as_deref())?;
@@ -4416,7 +4413,7 @@ pub async fn reddit_search(
 pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("smzdm_search requires a non-empty query".into());
+        return Err("搜索词不能为空，请输入具体内容".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
@@ -4430,7 +4427,7 @@ pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<Str
 pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("xianyu_search requires a non-empty query".into());
+        return Err("搜索词不能为空，请输入具体内容".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
@@ -4444,7 +4441,7 @@ pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<St
 pub async fn zhuanzhuan_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("zhuanzhuan_search requires a non-empty query".into());
+        return Err("搜索词不能为空，请输入具体内容".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
