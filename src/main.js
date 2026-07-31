@@ -14571,6 +14571,12 @@ async function restoreChatHistory() {
     }
 
     if (saved && (Array.isArray(saved.sessions) || Array.isArray(saved.closedSessions))) {
+      // 取证维度：消息总量进相位名，判断恢复卡顿是否存在特定消息数阈值。
+      try {
+        const _msgCount = (Array.isArray(saved.sessions) ? saved.sessions : [])
+          .reduce((n, s) => n + (Array.isArray(s?.memory?.recent) ? s.memory.recent.length : Array.isArray(s?.history) ? s.history.length : 0), 0);
+        _perfPhase(`restoreChatHistory msgCount=${_msgCount}`);
+      } catch {}
       _closedChatSessions = (Array.isArray(saved.closedSessions) ? saved.closedSessions : [])
         .filter(_sessionHasRecoverableMemory)
         .slice(0, 80);
@@ -15159,7 +15165,8 @@ function _renderTokenMeter() {
 }
 
 async function highlightCode(code, lang) {
-  try { _perfPhase("highlightCode"); } catch {}
+  // 取证维度：块长/行数进相位名，冻结时能直接看出是哪种量级的块在 tokenize。
+  try { _perfPhase(`highlightCode len=${code ? code.length : 0} lines=${code ? code.split("\n").length : 0}`); } catch {}
   // monaco.editor.colorize tokenizes on the main thread — a very large block can
   // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
   // once. Skip highlighting oversized blocks (plain text reads fine).
@@ -20809,8 +20816,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
     // Paint every byte already received. The old proportional typewriter kept most
     // of a provider burst hidden and added up to four seconds after the network had
     // already finished. Incremental markdown rendering keeps this frame-bounded.
-    const _gap = acc.length > 40000 ? 45 : acc.length > 12000 ? 30 : 16;
-    if (now - lastFlush < _gap) { scheduleStream(); return; }
+    // ≥90ms 节流：每次刷新都要全量跑 _parseStreamSegments/_cleanAgentText（O(n) 全文扫描），
+    // 旧的 16ms 步调在长回复下是 O(n²) 冻结主因之一；90/120ms（≈11/8fps）仍保留逐步渲染
+    // 观感。未到间隔时用 setTimeout 等到点再排 rAF，不再每帧空转 rAF 忙等。
+    const _gap = acc.length > 150000 ? 120 : 90;
+    if (now - lastFlush < _gap) { raf = setTimeout(() => { raf = requestAnimationFrame(flushStream); }, _gap - (now - lastFlush)); return; }
     lastFlush = now;
     _shown = acc.length;
     renderStream(acc);
@@ -20993,7 +21003,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       _thinkHold = ""; 
     }
     collapseThink();
-    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    if (raf) { cancelAnimationFrame(raf); clearTimeout(raf); raf = 0; } // raf 可能持有节流的 setTimeout id，两种都取消，防残留定时器在终渲染后重建流式内容
     _setStreaming(sess, false);
     sess._runIsLoop = null;
     if (sess === _currentSession()) _setSendBtnStop(false);
@@ -32090,9 +32100,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   };
   const schedule = () => {
     if (flushTimer) return;
-    // 帧间隔随累计正文自适应放宽（同 plain-chat flushStream 的 _gap）：doRender 每帧要对
-    // 全量 acc 跑 _cleanAgentText 的多趟全文正则，固定 16ms 在超长回复下会吃满主线程。
-    const gap = acc.length > 150000 ? 90 : acc.length > 40000 ? 45 : 16;
+    // ≥90ms 节流（同 plain-chat flushStream）：doRender 每次要对全量 acc 跑 _cleanAgentText 的
+    // 多趟全文正则，旧的 16ms 步调在超长回复下会吃满主线程；90/120ms 仍保留逐步渲染观感。
+    const gap = acc.length > 150000 ? 120 : 90;
     const wait = Math.max(0, gap - (Date.now() - lastFlush));
     flushTimer = setTimeout(() => requestAnimationFrame(doRender), wait);
   };
@@ -44660,7 +44670,8 @@ async function _agentFollowUp(toolResults, container, session) {
   };
   const _ffSchedule = () => {
     if (_ffTimer) return;
-    _ffTimer = setTimeout(() => requestAnimationFrame(_ffRender), Math.max(0, 16 - (Date.now() - _ffLast)));
+    // ≥90ms 节流（同主流式路径）：每次刷新都全量跑 _parseStreamSegments/_cleanAgentText。
+    _ffTimer = setTimeout(() => requestAnimationFrame(_ffRender), Math.max(0, 90 - (Date.now() - _ffLast)));
   };
   try {
     await backend.aiChat(config, _enforceModelRequestBudget(messages), (ev) => {

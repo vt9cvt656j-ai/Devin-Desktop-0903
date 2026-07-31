@@ -756,20 +756,44 @@ function _advanceSettledScan(st, text) {
  * @param {object} [opts]
  */
 export function renderMarkdownStream(container, text, opts = {}) {
+  // 取证埋点：冻结哨兵按相位归因——流式渲染此前没有独立相位，长任务全被记在
+  // agentModelTurn:assemble 名下。经 main.js 挂的 window 桥取用，模块保持零依赖。
+  try { globalThis.__midePerfPhase?.("renderMarkdownStream len=" + String(text == null ? "" : text).length); } catch {}
+  try { _renderMarkdownStreamCore(container, text, opts); }
+  finally { try { globalThis.__midePerfPhase?.("renderMarkdownStream:done"); } catch {} }
+}
+
+function _renderMarkdownStreamCore(container, text, opts = {}) {
   text = String(text ?? "").replace(/\r\n?/g, "\n");
   let st = container.__mdStream;
-  if (!st || !text.startsWith(st.src) || (st.tail && st.tail.parentNode !== container)) {
+  if (st && st.tail && st.tail.parentNode !== container) st = null; // container touched externally → full reset
+  if (st && !text.startsWith(st.src)) {
+    // Committed text changed under us — main.js's _cleanAgentText strips narration /
+    // filler lines only once they COMPLETE, so its output is not append-only. The old
+    // code answered every such divergence with container.textContent = "" plus a full
+    // re-parse AND re-highlight of every settled block; on long tool-narrated replies
+    // this fired over and over — the remaining O(n²) rebuild behind the streaming
+    // freeze. Roll back to the last committed chunk that still matches instead.
+    if (!_rollbackStreamChunks(st, text)) st = null;
+  }
+  if (!st) {
     container.textContent = "";
-    st = container.__mdStream = { src: "", tail: null, scanPos: 0, inFence: false, boundary: 0 };
+    st = container.__mdStream = { src: "", tail: null, scanPos: 0, inFence: false, boundary: 0, chunks: [] };
   }
   const settled = _advanceSettledScan(st, text);
   if (settled > st.src.length) {
     const chunk = text.slice(st.src.length, settled);
+    // Record the top-level nodes each committed chunk produced, so a later divergence
+    // can remove just the invalidated chunks (fragment children spill into the
+    // container on insert — snapshot them before that).
+    let nodes = [];
     if (chunk.trim()) {
       const node = parseBlocks(chunk.split("\n"), opts);
+      nodes = Array.from(node.childNodes);
       if (st.tail) container.insertBefore(node, st.tail);
       else container.appendChild(node);
     }
+    st.chunks.push({ end: settled, nodes });
     st.src = text.slice(0, settled);
   }
   const tailText = text.slice(st.src.length);
@@ -818,6 +842,34 @@ export function renderMarkdownStream(container, text, opts = {}) {
       st.fenceBody = open.body;
     }
   }
+}
+
+// Undo committed chunks past the point where `text` diverges from what was rendered:
+// keep every chunk that ends inside the common prefix, drop only the DOM of the rest,
+// and rewind the settled scan to that boundary (a blank line outside a fence, so
+// inFence is false there by construction). Returns false when not even the first
+// chunk survives — the caller then falls back to a full reset.
+function _rollbackStreamChunks(st, text) {
+  const chunks = st.chunks || [];
+  const max = Math.min(st.src.length, text.length);
+  let p = 0;
+  while (p < max && st.src.charCodeAt(p) === text.charCodeAt(p)) p++;
+  let keep = 0;
+  while (keep < chunks.length && chunks[keep].end <= p) keep++;
+  if (!keep) return false;
+  for (let i = keep; i < chunks.length; i++) {
+    for (const n of chunks[i].nodes) { if (n.parentNode) n.parentNode.removeChild(n); }
+  }
+  chunks.length = keep;
+  const end = chunks[keep - 1].end;
+  st.src = st.src.slice(0, end);
+  st.scanPos = end;
+  st.boundary = end;
+  st.inFence = false;
+  st.lastTail = undefined; // the tail must rebuild against the new text
+  st.fenceCard = st.fenceCodeEl = null;
+  st.fenceInfo = st.fenceBody = "";
+  return true;
 }
 
 /// If `tailText` is exactly one unterminated code fence, describe it: the info string

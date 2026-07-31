@@ -9936,8 +9936,8 @@ test("visible streams paint all received bytes without proportional catch-up", (
     "live write previews must reveal the complete decoded snapshot");
   assert.doesNotMatch(writePreview, /Math\.ceil\(remaining \/ 3\)|remaining \* 0\./,
     "write previews must not restore proportional typewriter lag");
-  assert.match(followUp, /Math\.max\(0, 16 - \(Date\.now\(\) - _ffLast\)\)/,
-    "tool follow-up replies should render at frame cadence");
+  assert.match(followUp, /Math\.max\(0, 90 - \(Date\.now\(\) - _ffLast\)\)/,
+    "tool follow-up replies render on the throttled streaming cadence (≥90ms, 同主流式路径)");
 });
 
 test("streaming write paths activate only after the complete JSON string arrives", () => {
@@ -12547,6 +12547,96 @@ test("streaming markdown appends into an open code fence instead of rebuilding i
   const CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
   assert.match(CSS, /\.md-stream-tail \.code-card__body \{\s*max-height: 300px; overflow-y: auto;\s*\}/,
     "a streaming tail code block needs a viewport-sized window while it grows");
+});
+
+test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚受影响块", async () => {
+  // renderMarkdownStream 需要比 markdown-media 更完整的 DOM：insertBefore/removeChild/
+  // fragment 展开/parentNode 记账 —— 节点身份断言依赖真实的移动语义，本地小 shim 提供。
+  class _N {
+    constructor(tag) { this.tagName = (tag || "").toUpperCase(); this.childNodes = []; this.parentNode = null; this.attributes = new Map(); this.style = {}; this.className = ""; this._text = ""; this.dataset = {}; }
+    _adopt(node) { if (node.tagName === "#FRAGMENT") { const kids = [...node.childNodes]; for (const k of kids) k.parentNode = null; node.childNodes = []; return kids; } if (node.parentNode) node.parentNode.removeChild(node); return [node]; }
+    appendChild(node) { for (const k of this._adopt(node)) { this.childNodes.push(k); k.parentNode = this; } return node; }
+    insertBefore(node, ref) { const kids = this._adopt(node); let i = ref ? this.childNodes.indexOf(ref) : -1; if (i < 0) i = this.childNodes.length; this.childNodes.splice(i, 0, ...kids); for (const k of kids) k.parentNode = this; return node; }
+    removeChild(node) { const i = this.childNodes.indexOf(node); if (i >= 0) { this.childNodes.splice(i, 1); node.parentNode = null; } return node; }
+    remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+    setAttribute(n, v) { this.attributes.set(n, String(v)); }
+    getAttribute(n) { return this.attributes.get(n) ?? null; }
+    addEventListener() {}
+    querySelector() { return null; }
+    set textContent(v) { this._text = String(v ?? ""); this.childNodes = []; }
+    get textContent() { return this._text + this.childNodes.map((c) => c.textContent || "").join(""); }
+  }
+  class _T extends _N { constructor(v) { super(); this._text = String(v); } }
+  const prevDoc = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => new _N(tag),
+    createElementNS: (_ns, tag) => new _N(tag),
+    createDocumentFragment: () => new _N("#fragment"),
+    createTextNode: (v) => new _T(v),
+  };
+  try {
+    const { renderMarkdownStream, renderMarkdownInto } = await import("../src/markdown.js");
+    const box = new _N("div");
+    const o = { streaming: true, showCaret: false };
+
+    // 1) 多次追加：settle 掉的前缀块只解析一次，节点身份不变（不重建整棵树）。
+    renderMarkdownStream(box, "Para one stays.\n\n", o);
+    const p1 = box.childNodes[0];
+    assert.ok(p1 && p1.tagName === "P", "首段落盘为段落节点");
+    renderMarkdownStream(box, "Para one stays.\n\nPara two grows", o);
+    assert.equal(box.childNodes[0], p1, "追加尾巴不得重建已 settle 的前缀块");
+    assert.match(box.textContent, /Para two grows/, "未闭合尾块也要逐步可见（不是流末一次性）");
+    renderMarkdownStream(box, "Para one stays.\n\nPara two grows longer\n\nPara three\n\n", o);
+    assert.equal(box.childNodes[0], p1, "后续块 settle 时前缀节点仍保持原对象");
+
+    // 2) divergence（模拟 _cleanAgentText 事后剥掉中段叙述行）：只回滚受影响的块，
+    //    不再整树清空重建重高亮（旧行为是流式 O(n²) 卡死的残余主因）。
+    renderMarkdownStream(box, "Para one stays.\n\nCHANGED tail after strip", o);
+    assert.equal(box.childNodes[0], p1, "分叉点之前的块必须原地保留，不全量重建");
+    assert.equal(p1.parentNode, box, "保留块仍挂在容器上");
+    assert.doesNotMatch(box.textContent, /Para two|Para three/, "失效块的 DOM 必须被移除");
+    assert.match(box.textContent, /CHANGED tail after strip/, "分叉后的新内容照常渲染");
+
+    // 3) settle 终渲染：完整重渲染一次，内容完整、无流式残留。
+    renderMarkdownInto(box, "Para one stays.\n\nFinal body.\n\n```js\nconst x = 1;\n```\n", {});
+    assert.match(box.textContent, /Para one stays\./);
+    assert.match(box.textContent, /Final body\./);
+    assert.match(box.textContent, /const x = 1;/, "终渲染代码块内容完整");
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document;
+    else globalThis.document = prevDoc;
+  }
+});
+
+test("流式聊天渲染 O(n²) 根治：≥90ms 节流 + 分叉回滚 + 取证埋点落盘", () => {
+  const MD = readFileSync(join(HERE, "../src/markdown.js"), "utf8");
+  // 分叉不再答复以整树重建：回滚到最后一个仍匹配的已提交块。
+  assert.match(MD, /if \(!_rollbackStreamChunks\(st, text\)\) st = null;/,
+    "divergence 必须先尝试块级回滚，全量重置只剩兑底");
+  assert.match(MD, /st\.chunks\.push\(\{ end: settled, nodes \}\);/,
+    "每个已 settle 块必须记账自己的顶层节点，回滚才能外科式移除");
+  // 取证埋点：流式渲染有独立相位（入口/出口），不再全记在 agentModelTurn:assemble 名下。
+  assert.match(MD, /__midePerfPhase\?\.\("renderMarkdownStream len=" \+ String\(text == null \? "" : text\)\.length\)/,
+    "renderMarkdownStream 入口必须打相位标记");
+  assert.match(MD, /__midePerfPhase\?\.\("renderMarkdownStream:done"\)/,
+    "renderMarkdownStream 出口必须打相位标记");
+  // 节流：两条流式路径都改为 ≥90ms 才重绘一次，而不是每帧/每 chunk。
+  assert.match(SRC, /const _gap = acc\.length > 150000 \? 120 : 90;/,
+    "plain-chat 流式重绘必须 ≥90ms 节流");
+  assert.match(SRC, /const gap = acc\.length > 150000 \? 120 : 90;/,
+    "agent 流式重绘必须 ≥90ms 节流");
+  assert.match(SRC, /cancelAnimationFrame\(raf\); clearTimeout\(raf\); raf = 0;/,
+    "节流改用 setTimeout 后，收尾必须两种 id 都取消，防残留定时器在终渲染后重建流式内容");
+  // settle 时的完整终渲染保留：两条路径都在流结束后用 renderMarkdownInto 全量重渲染一次。
+  assert.match(SRC, /renderMarkdownInto\(streamEl, cleanFinal, \{ streaming: false, highlighter: highlightCode \}\)/,
+    "agent 路径流结束必须做一次完整终渲染");
+  assert.match(SRC, /renderMarkdownInto\(body\._chatStreamEl, _cc, \{ highlighter: highlightCode \}\)/,
+    "plain-chat 路径流结束必须做一次完整终渲染");
+  // 取证维度：highlightCode 带块量级、restoreChatHistory 带消息数。
+  assert.match(SRC, /highlightCode len=\$\{code \? code\.length : 0\} lines=\$\{code \? code\.split\("\\n"\)\.length : 0\}/,
+    "highlightCode 相位必须带块长/行数");
+  assert.match(SRC, /restoreChatHistory msgCount=\$\{_msgCount\}/,
+    "restoreChatHistory 相位必须带消息总量");
 });
 
 test("auto-i18n walks the tree once per pass, not once per localizer", () => {
