@@ -41088,9 +41088,21 @@ async function _executeToolStepInner(step, call, root, run) {
           } else if (root) {
             try {
               const parentDir = candidates[0].split("/").slice(0, -1).join("/") || root;
-              const siblings = await backend.readDir(parentDir);
-              const names = siblings.slice(0, 12).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
-              if (names) helpHint = `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`;
+              let siblings = null;
+              try { siblings = await backend.readDir(parentDir); } catch {}
+              // 父目录本身也不存在（Agent 编造了整个目录结构）→ 回退到项目根目录，
+              // 把真实顶层结构甩给模型——让它看到“根目录只有 5 个文件，
+              // 根本没有 packages/ 目录”而不是一块说“找不到”。
+              if (!siblings && parentDir !== root) {
+                try { siblings = await backend.readDir(root); } catch {}
+                if (siblings) {
+                  const names = siblings.slice(0, 20).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
+                  helpHint = `\n你给的路径里的父目录 ${parentDir.replace(root, ".")} 根本不存在！项目根目录 ${root} 里实际有: ${names}\n——这个项目的目录结构和你想象的不一样。先 list_dir 看实际结构，再决定要创建什么目录/文件。`;
+                }
+              } else if (siblings) {
+                const names = siblings.slice(0, 12).map(e => (e.is_dir ? e.name + "/" : e.name)).join(", ");
+                if (names) helpHint = `\n${parentDir} 里实际有: ${names}\n（别再猜路径——用 find_files 按名字搜，或 list_dir 看目录，确认真实路径再读）`;
+              }
             } catch {}
           }
           res.className = "atc-result atc-result--err";
