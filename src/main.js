@@ -26733,15 +26733,15 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "current_time": return { type: "current_time" };
     case "game_scaffold": return { type: "game_scaffold", engine: String(args.engine || "phaser"), name: String(args.name || "my-game") };
     case "web_scaffold": return { type: "web_scaffold", name: String(args.name || "my-site"), framework: String(args.framework || "vue"), style: String(args.style || ""), tokens_css: String(args.tokens_css || "") };
-    case "generate_3d": return { type: "generate_3d", prompt: String(args.prompt || ""), name: String(args.name || "model"), style: String(args.style || "realistic") };
-    case "generate_sound": return { type: "generate_sound", prompt: String(args.prompt || ""), name: String(args.name || "sound"), duration: Number.isFinite(+args.duration) ? +args.duration : undefined };
-    case "generate_music": return { type: "generate_music", prompt: String(args.prompt || ""), name: String(args.name || "bgm"), duration: Number.isFinite(+args.duration) ? +args.duration : undefined };
-    case "generate_voice": return { type: "generate_voice", text: String(args.text || ""), name: String(args.name || "voice"), voice: args.voice ? String(args.voice) : undefined };
-    case "auto_rig": return { type: "auto_rig", model_path: String(args.model_path || ""), name: String(args.name || "rigged") };
-    case "generate_motion": return { type: "generate_motion", prompt: String(args.prompt || ""), name: String(args.name || "anim"), duration: Number.isFinite(+args.duration) ? +args.duration : undefined };
-    case "generate_texture": return { type: "generate_texture", prompt: String(args.prompt || ""), name: String(args.name || "texture"), resolution: Number.isFinite(+args.resolution) ? +args.resolution : undefined };
-    case "search_game_assets": return { type: "search_game_assets", query: String(args.query || ""), asset_type: String(args.asset_type || "all") };
-    case "download_asset": return { type: "download_asset", url: String(args.url || ""), name: String(args.name || "asset"), asset_type: String(args.asset_type || "model") };
+    case "generate_3d": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_3d", _error: "prompt 不能为空" }; return { type: "generate_3d", prompt: _p, name: String(args.name || "model").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "model", style: String(args.style || "realistic") }; }
+    case "generate_sound": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_sound", _error: "prompt 不能为空" }; const _dur = Number.isFinite(+args.duration) ? Math.max(0.5, Math.min(+args.duration, 300)) : undefined; return { type: "generate_sound", prompt: _p, name: String(args.name || "sound").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "sound", duration: _dur }; }
+    case "generate_music": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_music", _error: "prompt 不能为空" }; const _dur = Number.isFinite(+args.duration) ? Math.max(1, Math.min(+args.duration, 600)) : undefined; return { type: "generate_music", prompt: _p, name: String(args.name || "bgm").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "bgm", duration: _dur }; }
+    case "generate_voice": { const _t = String(args.text || "").trim(); if (!_t) return { type: "generate_voice", _error: "text 不能为空" }; return { type: "generate_voice", text: _t.slice(0, 5000), name: String(args.name || "voice").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "voice", voice: args.voice ? String(args.voice).slice(0, 32) : undefined }; }
+    case "auto_rig": { const _mp = String(args.model_path || "").trim(); if (!_mp) return { type: "auto_rig", _error: "model_path 不能为空" }; return { type: "auto_rig", model_path: _mp, name: String(args.name || "rigged").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "rigged" }; }
+    case "generate_motion": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_motion", _error: "prompt 不能为空" }; const _dur = Number.isFinite(+args.duration) ? Math.max(0.5, Math.min(+args.duration, 120)) : undefined; return { type: "generate_motion", prompt: _p, name: String(args.name || "anim").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "anim", duration: _dur }; }
+    case "generate_texture": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_texture", _error: "prompt 不能为空" }; const _res = Number.isFinite(+args.resolution) ? Math.max(64, Math.min(+args.resolution, 8192)) : undefined; return { type: "generate_texture", prompt: _p, name: String(args.name || "texture").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "texture", resolution: _res }; }
+    case "search_game_assets": { const _q = String(args.query || "").trim(); if (!_q) return { type: "search_game_assets", _error: "query 不能为空" }; const _at = String(args.asset_type || "all"); const _valid = ["all","model","texture","sound","music","motion","animation","image","script","prefab"]; return { type: "search_game_assets", query: _q.slice(0, 200), asset_type: _valid.includes(_at) ? _at : "all" }; }
+    case "download_asset": { const _u = String(args.url || "").trim(); if (!_u || !/^https?:\/\//i.test(_u)) return { type: "download_asset", _error: "url 必须是 http/https URL" }; return { type: "download_asset", url: _u.slice(0, 2000), name: String(args.name || "asset").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 128) || "asset", asset_type: String(args.asset_type || "model") }; }
     case "download_file": return { type: "download", url: args.url || "", dest: args.dest || args.path || "" };
     case "capture_start": return {
       type: "capture_start",
@@ -26798,7 +26798,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       if (args.node != null && args.node !== "" && Number.isFinite(Number(args.node))) _bsel = `[data-mnode="${Number(args.node)}"]`;
       return { type: "browser", action: args.action || "screenshot", url: args.url || "", fresh: !!args.fresh || /^(?:isolated|private|incognito)$/i.test(String(args.mode || "")), mode: String(args.mode || "headed"), selector: _bsel, text: args.text || "", key: args.key || "", amount: args.amount, ms: args.ms, script: args.script || "", width: Number.isFinite(+args.width) ? +args.width : undefined, height: Number.isFinite(+args.height) ? +args.height : undefined, deviceScaleFactor: Number.isFinite(+args.device_scale_factor) ? +args.device_scale_factor : undefined, mobile: !!args.mobile, steps: Array.isArray(args.steps) ? args.steps : (Array.isArray(args.actions) ? args.actions : null), uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))) };
     }
-    case "computer": return { type: "automation", method: "mouse.click", params: {} };
+    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = ["mouse.click","mouse.double_click","mouse.move","mouse.drag","mouse.scroll","keyboard.type","keyboard.press","keyboard.combo","keyboard.paste","screen.info","clipboard.get","clipboard.set","window.list","window.activate","window.minimize"]; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "screen.info", params: { _warning: "不支持的 method: " + _m + "，已降级为 screen.info" } }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
     case "system": {
@@ -31145,6 +31145,15 @@ const _WORKSPACE_MUTATING_TYPES = new Set([
   "game_scaffold", "web_scaffold", "download", "download_asset", "genimage", "generate_3d", "generate_sound",
   "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture",
 ]);
+// 简易失败记忆：记录每个工具的连续失败次数。3 次后返回提示让模型检查输入。
+const _toolFailureCounts = new Map();
+function _recordToolFailure(toolType) {
+  const count = (_toolFailureCounts.get(toolType) || 0) + 1;
+  _toolFailureCounts.set(toolType, count);
+  return count;
+}
+function _resetToolFailure(toolType) { _toolFailureCounts.delete(toolType); }
+function _getToolFailureCount(toolType) { return _toolFailureCounts.get(toolType) || 0; }
 function _toolFailureMatch(content) {
   const text = String(content || "");
   return text.match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i)
@@ -41520,11 +41529,14 @@ async function _executeToolStep(step, call, root, run) {
       }
 
     } else if (call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture") {
+      if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: call.type, path: "", content: `[参数错误] ${call.type}: ${call._error}` }; }
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _gaWs = (run && run.session && run.session.project) || root || "";
       if (!_gaWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: call.type, path: "", content: "[错误] 请先打开一个工作区。" }; }
       const _gaCfg = loadConfig();
       const _gaLabels = { generate_3d: "3D 模型", generate_sound: "音效", generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画", generate_texture: "纹理" };
+      const _gaFailCount = _getToolFailureCount(call.type);
+      if (_gaFailCount >= 3) { res.className = "atc-result atc-result--err"; res.textContent = `已失败 ${_gaFailCount} 次`; return { type: call.type, path: "", content: `[失败] ${call.type} 已连续失败 ${_gaFailCount} 次，请检查输入参数和外部服务配置后再重试。` }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 生成${_gaLabels[call.type] || "资产"}中…`;
       try {
         const _gaArgs = { base_url: _gaCfg.baseUrl || MICHAEL_API, api_key: _gaCfg.apiKey || "", workspace: _gaWs };
@@ -41536,42 +41548,55 @@ async function _executeToolStep(step, call, root, run) {
         else if (call.type === "generate_motion") Object.assign(_gaArgs, { prompt: call.prompt, name: call.name || "anim", duration: call.duration });
         else if (call.type === "generate_texture") Object.assign(_gaArgs, { prompt: call.prompt, name: call.name || "texture", resolution: call.resolution });
         const _gaOut = await backend.invoke(call.type, _gaArgs);
+        _resetToolFailure(call.type);
         res.className = "atc-result atc-result--ok"; res.textContent = `已生成 ${_gaLabels[call.type]}`;
         scheduleProjectCacheRefresh(_gaWs, "资源生成完成");
         const _gaPath = (_gaOut && _gaOut.path) || "";
         return { type: call.type, path: _gaPath, content: `已生成${_gaLabels[call.type]}并保存到 ${_gaPath}（${_gaOut && _gaOut.bytes ? _gaOut.bytes : "?"}字节）。` };
       } catch (e) {
+        const _cnt = _recordToolFailure(call.type);
         res.className = "atc-result atc-result--err"; res.textContent = `${_gaLabels[call.type]}生成失败`;
-        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}` };
+        const _hint = _cnt >= 2 ? `（已失败 ${_cnt} 次，请检查参数和外部服务）` : "";
+        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}${_hint}` };
       }
 
     } else if (call.type === "search_game_assets") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "search_game_assets", path: "", content: "[不可用]" }; }
+      if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: "search_game_assets", path: "", content: `[参数错误] search_game_assets: ${call._error}` }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "search_game_assets", path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _saCfg = loadConfig();
+      const _saFailCount = _getToolFailureCount("search_game_assets");
+      if (_saFailCount >= 3) { res.className = "atc-result atc-result--err"; res.textContent = `已失败 ${_saFailCount} 次`; return { type: "search_game_assets", path: "", content: `[失败] search_game_assets 已连续失败 ${_saFailCount} 次，请检查查询词和网络连接。` }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 搜索游戏资源…`;
       try {
         const _saOut = await backend.invoke("search_game_assets", { base_url: _saCfg.baseUrl || MICHAEL_API, api_key: _saCfg.apiKey || "", query: call.query || "", asset_type: call.asset_type });
+        _resetToolFailure("search_game_assets");
         res.className = "atc-result atc-result--ok"; res.textContent = "搜索完成";
         return { type: "search_game_assets", path: "", content: JSON.stringify(_saOut).slice(0, 8000) };
       } catch (e) {
+        const _cnt = _recordToolFailure("search_game_assets");
         res.className = "atc-result atc-result--err"; res.textContent = "搜索失败";
-        return { type: "search_game_assets", path: "", content: `[失败] search_game_assets: ${String(e?.message || e).slice(0, 300)}` };
+        return { type: "search_game_assets", path: "", content: `[失败] search_game_assets: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）` };
       }
 
     } else if (call.type === "download_asset") {
-      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download_asset", path: "", content: "[不可用]" }; }
+      if (call._error) { res.className = "atc-result atc-result--err"; res.textContent = "参数错误"; return { type: "download_asset", path: "", content: `[参数错误] download_asset: ${call._error}` }; }
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "download_asset", path: "", content: "[不可用] 只能在桌面 App 里用。" }; }
       const _daWs = (run && run.session && run.session.project) || root || "";
       if (!_daWs) { res.className = "atc-result atc-result--err"; res.textContent = "无工作区"; return { type: "download_asset", path: "", content: "[错误] 请先打开一个工作区。" }; }
+      const _daFailCount = _getToolFailureCount("download_asset");
+      if (_daFailCount >= 3) { res.className = "atc-result atc-result--err"; res.textContent = `已失败 ${_daFailCount} 次`; return { type: "download_asset", path: "", content: `[失败] download_asset 已连续失败 ${_daFailCount} 次，请检查 URL 是否可访问。` }; }
       res.className = "atc-result"; res.innerHTML = `<span class="atc-spin"></span> 下载资源…`;
       try {
         const _daOut = await backend.invoke("download_asset", { workspace: _daWs, url: call.url || "", name: call.name || "asset", asset_type: call.asset_type });
+        _resetToolFailure("download_asset");
         res.className = "atc-result atc-result--ok"; res.textContent = "已下载";
         scheduleProjectCacheRefresh(_daWs, "资源下载完成");
         const _daPath = (_daOut && _daOut.path) || "";
         return { type: "download_asset", path: _daPath, content: `已下载资源到 ${_daPath}（${_daOut && _daOut.bytes ? _daOut.bytes : "?"}字节）。` };
       } catch (e) {
+        const _cnt = _recordToolFailure("download_asset");
         res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
-        return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}` };
+        return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）` };
       }
 
     } else if (call.type === "debate") {

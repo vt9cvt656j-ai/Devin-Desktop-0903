@@ -243,6 +243,90 @@ const TOOL_METADATA = Object.freeze({
     triggers: ['需要执行程序', '运行命令', '验证构建'],
     example_call: "run_cmd(command='npm test')",
     priority: 'high'
+  },
+
+  // 桌面自动化
+  computer: {
+    category: 'desktop_automation',
+    use_cases: ['鼠标点击/移动/拖拽', '键盘输入/快捷键', '屏幕信息查询', '窗口管理', '剪贴板操作'],
+    triggers: ['需要操控桌面应用', '模拟鼠标键盘', '查看屏幕信息', '操作非浏览器窗口'],
+    example_call: "computer(method='mouse.click', params={x: 100, y: 200})",
+    priority: 'medium',
+    usage_note: '【何时用】需要操控桌面应用的鼠标键盘时。【vs 替代】浏览器内操作用 browser；系统菜单/应用跳转用 system。【何时不用】纯浏览器内交互请用 browser。'
+  },
+
+  // 游戏资产生成类
+  generate_3d: {
+    category: 'game_asset_generation',
+    use_cases: ['生成 3D 模型/网格', '游戏道具建模', '场景资产创建'],
+    triggers: ['需要 3D 模型', '游戏开发需要资产', '创建 3D 对象'],
+    example_call: "generate_3d(prompt='Low-poly sci-fi crate', name='sci-fi-crate')",
+    priority: 'medium',
+    usage_note: '【何时用】游戏/3D 项目需要模型资产时。【vs 替代】2D 图片用 generate_image。【何时不用】需要 2D 图片/纹理时不要用这个。需要外部生成服务支持，未配置时会返回错误。'
+  },
+  generate_sound: {
+    category: 'game_asset_generation',
+    use_cases: ['生成音效/声效', 'UI 反馈音', '环境音效创建'],
+    triggers: ['需要音效', '游戏声音效果', '短音频片段'],
+    example_call: "generate_sound(prompt='Short metallic UI confirmation', name='confirm')",
+    priority: 'medium',
+    usage_note: '【何时用】需要短音效（0.5-300 秒）时。【vs 替代】长音乐/背景音乐用 generate_music。【何时不用】需要背景音乐/旋律时用 generate_music。需要外部生成服务支持。'
+  },
+  generate_music: {
+    category: 'game_asset_generation',
+    use_cases: ['生成背景音乐', '游戏 BGM', '循环音乐片段'],
+    triggers: ['需要背景音乐', '游戏音乐', '循环旋律'],
+    example_call: "generate_music(prompt='Looping calm strategy-game theme', name='strategy-loop')",
+    priority: 'medium',
+    usage_note: '【何时用】需要背景音乐/旋律（1-600 秒）时。【vs 替代】短音效/点击声用 generate_sound。【何时不用】需要短促音效时用 generate_sound。需要外部生成服务支持。'
+  },
+  generate_voice: {
+    category: 'game_asset_generation',
+    use_cases: ['生成语音旁白', 'NPC 对话语音', '文本转语音'],
+    triggers: ['需要语音', '文字转语音', '角色对白音频'],
+    example_call: "generate_voice(text='Mission complete.', name='mission-complete')",
+    priority: 'medium',
+    usage_note: '【何时用】需要把文字转成语音时。【vs 替代】纯音效用 generate_sound。【何时不用】不需要说话内容时用 sound/music。需要外部生成服务支持。'
+  },
+  auto_rig: {
+    category: 'game_asset_generation',
+    use_cases: ['为 3D 模型添加骨骼', '角色绑定', '模型动画准备'],
+    triggers: ['需要给模型加骨骼', '角色绑定', '准备动画'],
+    example_call: "auto_rig(model_path='assets/character.glb', name='hero-rig')",
+    priority: 'low',
+    usage_note: '【何时用】已有 3D 模型需要添加骨骼绑定时。【vs 替代】不需要骨骼就用 generate_3d。【何时不用】模型不需要动画时。需要外部服务支持。'
+  },
+  generate_motion: {
+    category: 'game_asset_generation',
+    use_cases: ['生成动画/动作', '角色动作', '运动循环'],
+    triggers: ['需要动画', '角色动作', '运动效果'],
+    example_call: "generate_motion(prompt='Natural walk cycle', name='walk')",
+    priority: 'medium',
+    usage_note: '【何时用】需要为已绑定骨骼的角色生成动画时。【vs 替代】没有骨骼先 auto_rig；静态模型用 generate_3d。【何时不用】不需要动画时。需要外部服务支持。'
+  },
+  generate_texture: {
+    category: 'game_asset_generation',
+    use_cases: ['生成纹理贴图', '材质贴图', '表面纹理'],
+    triggers: ['需要纹理', '材质贴图', '表面效果'],
+    example_call: "generate_texture(prompt='Seamless worn steel', name='worn-steel')",
+    priority: 'medium',
+    usage_note: '【何时用】需要 3D 模型的纹理/材质贴图时。【vs 替代】2D 图片用 generate_image。【何时不用】不需要纹理贴图时。分辨率 64-8192。需要外部服务支持。'
+  },
+  search_game_assets: {
+    category: 'game_asset_generation',
+    use_cases: ['搜索免费游戏资产', '查找 CC0 模型/纹理/音效', '游戏开发资源发现'],
+    triggers: ['需要游戏资产', '找免费模型/贴图/音效', '资源搜索'],
+    example_call: "search_game_assets(query='CC0 low-poly spaceship')",
+    priority: 'medium',
+    usage_note: '【何时用】需要搜索现成的游戏资产（模型/纹理/音效/动画等）。【vs 替代】找不到合适的再用 generate_* 生成。【何时不用】已有明确生成目标时直接用 generate_*。需要外部服务支持。'
+  },
+  download_asset: {
+    category: 'game_asset_generation',
+    use_cases: ['下载游戏资产到工作区', '获取远程模型/纹理文件', '资产导入'],
+    triggers: ['需要下载资产', '获取远程文件', '导入模型/贴图'],
+    example_call: "download_asset(url='https://example.com/asset.glb', name='spaceship.glb')",
+    priority: 'medium',
+    usage_note: '【何时用】从已知 URL 下载游戏资产文件。【vs 替代】不知道去哪找先用 search_game_assets；普通文件下载用 download_file。【何时不用】非资产类文件下载用 download_file。需要有效 http/https URL。'
   }
 });
 

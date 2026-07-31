@@ -15465,5 +15465,228 @@ test("find_files 重写: 无匹配时返回 (无匹配文件) 而非错误", asy
   });
   const r = await findFiles("/work", "*.xyz");
   assert.equal(r.count, 0);
-  assert.equal(r.text, "(无匹配文件)");
+  assert.equal(r.text, "(\u65e0\u5339\u914d\u6587\u4ef6)");
+});
+
+// ==========================================================================
+// P0 \u91cd\u5199 10 \u4e2a\u5de5\u5177\uff1a\u8f93\u5165\u9a8c\u8bc1 + \u5931\u8d25\u8bb0\u5fc6 + TOOL_METADATA
+// ==========================================================================
+
+// \u8f85\u52a9\uff1a\u52a0\u8f7d _mapToolCall \u7528\u4e8e\u6d4b\u8bd5\u5de5\u5177\u53c2\u6570\u5f52\u4e00\u5316
+function _loadMapToolCall(extraTools = []) {
+  return load("_mapToolCall", {
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set([
+      "computer", "generate_3d", "generate_sound", "generate_music",
+      "generate_voice", "auto_rig", "generate_motion", "generate_texture",
+      "search_game_assets", "download_asset", ...extraTools,
+    ]),
+    _canonicalToolName: () => "",
+    _mcpToolMap: new Map(),
+  });
+}
+
+test("computer: \u6b63\u5e38\u4f20 method + params\uff0c\u4e0d\u518d\u786c\u7f16\u7801\u4e3a mouse.click", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("computer", { method: "mouse.click", params: { x: 100, y: 200 } }, new Map());
+  assert.equal(r.type, "automation");
+  assert.equal(r.method, "mouse.click");
+  assert.deepEqual(r.params, { x: 100, y: 200 });
+});
+
+test("computer: \u7a7a\u53c2\u6570\u964d\u7ea7\u4e3a screen.info \u800c\u975e\u786c\u7f16\u7801 mouse.click", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("computer", {}, new Map());
+  assert.equal(r.type, "automation");
+  assert.equal(r.method, "screen.info");
+});
+
+test("computer: \u4e0d\u652f\u6301\u7684 method \u964d\u7ea7\u4e3a screen.info \u5e76\u9644 warning", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("computer", { method: "bogus.action" }, new Map());
+  assert.equal(r.method, "screen.info");
+  assert.ok(r.params._warning, "should carry a warning about unsupported method");
+});
+
+test("generate_3d: \u6b63\u5e38 prompt \u901a\u8fc7\uff0cname \u88ab\u6e05\u6d17", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_3d", { prompt: "Low-poly crate", name: "my crate!" }, new Map());
+  assert.equal(r.type, "generate_3d");
+  assert.equal(r.prompt, "Low-poly crate");
+  assert.equal(r.name, "mycrate");
+  assert.ok(!r._error);
+});
+
+test("generate_3d: \u7a7a prompt \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_3d", { prompt: "" }, new Map());
+  assert.ok(r._error, "should have _error for empty prompt");
+  assert.match(r._error, /prompt/);
+});
+
+test("generate_sound: duration \u88ab\u9650\u5236\u5728 0.5-300 \u8303\u56f4", () => {
+  const mapCall = _loadMapToolCall();
+  const r1 = mapCall("generate_sound", { prompt: "click", duration: 0.1 }, new Map());
+  assert.equal(r1.duration, 0.5);
+  const r2 = mapCall("generate_sound", { prompt: "click", duration: 999 }, new Map());
+  assert.equal(r2.duration, 300);
+});
+
+test("generate_sound: \u7a7a prompt \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_sound", { prompt: "  " }, new Map());
+  assert.ok(r._error);
+});
+
+test("generate_music: duration \u88ab\u9650\u5236\u5728 1-600 \u8303\u56f4", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_music", { prompt: "calm theme", duration: 1000 }, new Map());
+  assert.equal(r.duration, 600);
+});
+
+test("generate_music: \u7a7a prompt \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_music", {}, new Map());
+  assert.ok(r._error);
+});
+
+test("generate_voice: \u6b63\u5e38 text \u901a\u8fc7\uff0c\u8d85\u957f\u88ab\u622a\u65ad", () => {
+  const mapCall = _loadMapToolCall();
+  const longText = "a".repeat(6000);
+  const r = mapCall("generate_voice", { text: longText }, new Map());
+  assert.ok(!r._error);
+  assert.ok(r.text.length <= 5000);
+});
+
+test("generate_voice: \u7a7a text \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_voice", { text: "" }, new Map());
+  assert.ok(r._error);
+  assert.match(r._error, /text/);
+});
+
+test("auto_rig: \u7a7a model_path \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("auto_rig", { model_path: "" }, new Map());
+  assert.ok(r._error);
+  assert.match(r._error, /model_path/);
+});
+
+test("auto_rig: \u6b63\u5e38 model_path \u901a\u8fc7", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("auto_rig", { model_path: "assets/hero.glb" }, new Map());
+  assert.equal(r.model_path, "assets/hero.glb");
+  assert.ok(!r._error);
+});
+
+test("generate_motion: duration \u88ab\u9650\u5236\u5728 0.5-120 \u8303\u56f4", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_motion", { prompt: "walk", duration: 200 }, new Map());
+  assert.equal(r.duration, 120);
+});
+
+test("generate_motion: \u7a7a prompt \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_motion", { prompt: "" }, new Map());
+  assert.ok(r._error);
+});
+
+test("generate_texture: resolution \u88ab\u9650\u5236\u5728 64-8192 \u8303\u56f4", () => {
+  const mapCall = _loadMapToolCall();
+  const r1 = mapCall("generate_texture", { prompt: "steel", resolution: 10 }, new Map());
+  assert.equal(r1.resolution, 64);
+  const r2 = mapCall("generate_texture", { prompt: "steel", resolution: 99999 }, new Map());
+  assert.equal(r2.resolution, 8192);
+});
+
+test("generate_texture: \u7a7a prompt \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("generate_texture", {}, new Map());
+  assert.ok(r._error);
+});
+
+test("search_game_assets: \u7a7a query \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("search_game_assets", { query: "" }, new Map());
+  assert.ok(r._error);
+  assert.match(r._error, /query/);
+});
+
+test("search_game_assets: \u975e\u6cd5 asset_type \u964d\u7ea7\u4e3a all", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("search_game_assets", { query: "spaceship", asset_type: "invalid_type" }, new Map());
+  assert.equal(r.asset_type, "all");
+  assert.ok(!r._error);
+});
+
+test("search_game_assets: \u5408\u6cd5 asset_type \u4fdd\u6301", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("search_game_assets", { query: "texture", asset_type: "texture" }, new Map());
+  assert.equal(r.asset_type, "texture");
+});
+
+test("download_asset: \u975e http URL \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("download_asset", { url: "ftp://bad.url/asset" }, new Map());
+  assert.ok(r._error);
+  assert.match(r._error, /http/);
+});
+
+test("download_asset: \u7a7a url \u8fd4\u56de _error", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("download_asset", { url: "" }, new Map());
+  assert.ok(r._error);
+});
+
+test("download_asset: \u6b63\u5e38 http URL \u901a\u8fc7", () => {
+  const mapCall = _loadMapToolCall();
+  const r = mapCall("download_asset", { url: "https://example.com/asset.glb", name: "ship" }, new Map());
+  assert.equal(r.url, "https://example.com/asset.glb");
+  assert.equal(r.name, "ship");
+  assert.ok(!r._error);
+});
+
+test("TOOL_METADATA: 10 \u4e2a\u5de5\u5177\u5168\u90e8\u6709\u5143\u6570\u636e\u6761\u76ee", () => {
+  const required = ["computer", "generate_3d", "generate_sound", "generate_music",
+    "generate_voice", "auto_rig", "generate_motion", "generate_texture",
+    "search_game_assets", "download_asset"];
+  for (const name of required) {
+    assert.ok(TOOL_METADATA[name], `TOOL_METADATA should have entry for ${name}`);
+    assert.ok(Array.isArray(TOOL_METADATA[name].use_cases) && TOOL_METADATA[name].use_cases.length > 0,
+      `${name} should have use_cases`);
+    assert.ok(Array.isArray(TOOL_METADATA[name].triggers) && TOOL_METADATA[name].triggers.length > 0,
+      `${name} should have triggers`);
+    assert.ok(TOOL_METADATA[name].example_call, `${name} should have example_call`);
+    assert.ok(TOOL_METADATA[name].priority, `${name} should have priority`);
+  }
+});
+
+test("TOOL_METADATA: \u542b\u300c\u4f55\u65f6\u7528\u300d\u63cf\u8ff0", () => {
+  const tools = ["computer", "generate_3d", "generate_sound", "generate_music",
+    "generate_voice", "auto_rig", "generate_motion", "generate_texture",
+    "search_game_assets", "download_asset"];
+  for (const name of tools) {
+    assert.ok(TOOL_METADATA[name].usage_note, `${name} should have usage_note with \u300c\u4f55\u65f6\u7528\u300d`);
+    assert.match(TOOL_METADATA[name].usage_note, /\u3010\u4f55\u65f6\u7528\u3011/, `${name} usage_note should contain \u3010\u4f55\u65f6\u7528\u3011`);
+  }
+});
+
+test("\u5931\u8d25\u8bb0\u5fc6: _toolFailureCounts \u5df2\u6ce8\u518c\u5e76\u88ab\u6267\u884c\u5904\u7406\u5668\u4f7f\u7528", () => {
+  // \u68c0\u67e5\u6e90\u7801\u4e2d\u5931\u8d25\u8bb0\u5fc6\u51fd\u6570\u5b58\u5728\u4e14\u88ab\u8c03\u7528
+  assert.match(SRC, /const _toolFailureCounts = new Map\(\)/, "should define _toolFailureCounts Map");
+  assert.match(SRC, /function _recordToolFailure\(/, "should define _recordToolFailure");
+  assert.match(SRC, /function _resetToolFailure\(/, "should define _resetToolFailure");
+  assert.match(SRC, /function _getToolFailureCount\(/, "should define _getToolFailureCount");
+  // \u6267\u884c\u5904\u7406\u5668\u96c6\u6210\u4e86\u5931\u8d25\u8bb0\u5fc6
+  assert.match(SRC, /_getToolFailureCount\(call\.type\)/, "generate handler should check failure count");
+  assert.match(SRC, /_recordToolFailure\(call\.type\)/, "generate handler should record failures");
+  assert.match(SRC, /_resetToolFailure\(call\.type\)/, "generate handler should reset on success");
+});
+
+test("\u8f93\u5165\u9a8c\u8bc1: \u6267\u884c\u5904\u7406\u5668\u68c0\u67e5 _error \u5b57\u6bb5", () => {
+  // \u786e\u4fdd\u6267\u884c\u5904\u7406\u5668\u5728\u8c03\u7528 backend.invoke \u4e4b\u524d\u68c0\u67e5 _error
+  assert.match(SRC, /if \(call\._error\).*generate_3d/s, "generate handler should check _error");
+  assert.match(SRC, /if \(call\._error\).*search_game_assets/s, "search_game_assets handler should check _error");
+  assert.match(SRC, /if \(call\._error\).*download_asset/s, "download_asset handler should check _error");
 });
