@@ -14298,6 +14298,15 @@ function _sessionPersistFingerprint(s) {
     const lastPending = pending[pending.length - 1] || {};
     const demands = Array.isArray(s?._demandLedger) ? s._demandLedger : [];
     const thinks = Array.isArray(s?._thinkLedger) ? s._thinkLedger : [];
+    // RAFGAP 实锤：JSON.stringify(_intentState/_lastRunState) 每次指纹重跑，大对象可达数十 KB。
+    // 缓存挂在 session 上——同引用→同序列化结果，避免重复分配。内联在指纹函数内，
+    // 测试的 load() 提取函数体时无外部依赖。
+    const _intentJson = s?._intentState != null
+      ? (s._intentJsonRef === s._intentState ? s._intentJson : (s._intentJson = JSON.stringify(s._intentState), s._intentJsonRef = s._intentState, s._intentJson))
+      : "null";
+    const _lastRunJson = s?._lastRunState != null
+      ? (s._lastRunJsonRef === s._lastRunState ? s._lastRunJson : (s._lastRunJson = JSON.stringify(s._lastRunState), s._lastRunJsonRef = s._lastRunState, s._lastRunJson))
+      : "null";
     return [
       s?.name, s?.mode, s?.model, s?.project, s?._anchorRoot, s?.closedAt,
       Number(m.totalTurns) || 0, recent.length, Number(m._recentChars) || 0,
@@ -14311,7 +14320,7 @@ function _sessionPersistFingerprint(s) {
       Array.isArray(s?._planSteps) ? s._planSteps.map((p) => p?.status).join(",") : "",
       demands.length, thinks.length, (thinks[thinks.length - 1] || {}).turn ?? "",
       String(last.role || "") + ":" + (typeof last.content === "string" ? last.content.length : 0),
-      JSON.stringify(s?._intentState ?? null), JSON.stringify(s?._lastRunState ?? null),
+      _intentJson, _lastRunJson,
     ].join("\u0001");
   } catch { return null; }
 }
@@ -14402,8 +14411,14 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
   }
   // The bounded local mirror stays recoverable even when the disk store fails.
   // 手工拼接顶层 JSON：会话片段已是合法 JSON 字符串，命中缓存时零重复 stringify。
-  const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedParts.join(",")}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
-  try { localStorage.setItem(CHAT_STORE_KEY, localJson); } catch {}
+  // RAFGAP 实锤：流式期间 localStorage.setItem 同步写 MB 级 JSON 阻塞主线程 1-4s。
+  // lightweightOnly=true（流式中）时跳过——转录日志已保证持久性，localStorage 只是
+  // Tauri 不可用时的兑底，流结束后下次非流式保存会补上。
+  if (!lightweightOnly) {
+    const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedParts.join(",")}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
+    try { _perfPhase(`localStorage:setItem len=${localJson.length}`); } catch {}
+    try { localStorage.setItem(CHAT_STORE_KEY, localJson); } catch {}
+  }
 
   // The hot path is an append-only, per-session transcript journal. Awaiting it
   // here makes a submitted user turn durable without serializing the full chat.
@@ -15164,6 +15179,11 @@ function _renderTokenMeter() {
   }
 }
 
+// RAFGAP 实锤：monaco.editor.colorize 主线程 tokenize，多个代码块同时高亮
+// 累积阻塞 10-34s。并发限流 2 路 + 流式期间跳过（最终渲染统一补色）。
+let _highlightActive = 0;
+const _highlightQueue = [];
+const _HIGHLIGHT_MAX_CONCURRENT = 2;
 async function highlightCode(code, lang) {
   // 取证维度：块长/行数进相位名，冻结时能直接看出是哪种量级的块在 tokenize。
   try { _perfPhase(`highlightCode len=${code ? code.length : 0} lines=${code ? code.split("\n").length : 0}`); } catch {}
@@ -15171,11 +15191,21 @@ async function highlightCode(code, lang) {
   // freeze the UI for hundreds of ms, and a code-heavy reply triggers many at
   // once. Skip highlighting oversized blocks (plain text reads fine).
   if (!code || code.length > 20000 || code.split("\n").length > 600) return null;
+  // 流式期间跳过：最终渲染统一补色，避免流式期间多个 colorize 叠加阻塞主线程。
+  if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) return null;
+  // 并发限流：超过 2 路排队，让出主线程。
+  if (_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT) {
+    await new Promise((resolve) => _highlightQueue.push(resolve));
+  }
+  _highlightActive++;
   try {
     let html = await monaco.editor.colorize(code, lang, { tabSize: 2 });
     return html.replace(/<br\/?>\s*$/, "");
   } catch {
     return null;
+  } finally {
+    _highlightActive--;
+    if (_highlightQueue.length) { const next = _highlightQueue.shift(); next(); }
   }
 }
 
@@ -21383,8 +21413,16 @@ function _stripTeachingSections(text) {
   return text.slice(0, m).trimEnd();
 }
 
+// RAFGAP/STALL 实锤：_cleanAgentText 在流式 doRender 每 90ms 对全量 acc 跑 6+ 趟全文
+// 正则（_transformFileContentTags → _stripToolNarration → 多趟 replace），150KB 回复
+// 每帧分配 ~1MB 临时字符串 → GC 压力爆表 → STALL 15s 无相位标记。缓存到上次输入
+// 相同直接返回——acc 只在有新 token 时才变，多数帧命中缓存。
+// 缓存挂在函数自身属性上——测试的 load() 提取函数体时也能工作。
 function _cleanAgentText(text) {
   text = String(text == null ? "" : text);
+  if (text === _cleanAgentText._cacheIn) return _cleanAgentText._cacheOut;
+  try { _perfPhase(`_cleanAgentText len=${text.length}`); } catch {}
+  const input = text;
   text = _transformFileContentTags(text);
   text = _stripToolNarration(text);
   // Some upstream bridges occasionally echo their internal tool transcript as
@@ -21393,11 +21431,14 @@ function _cleanAgentText(text) {
   text = text.replace(/(?:^|\n)\s*user\s+Tool results:\s*\n+\s*\[[a-z][a-z0-9_]{1,50}\][\s\S]*$/i, "");
   text = _stripAckOpeners(text);
   text = _stripTeachingSections(text);
-  return text.replace(/\[TOOL:\w+\]\s*\u000a?[^\u000a]*/g, "").replace(/📄\s*[^\u000a]+\u000a?/g, "").replace(/📎\s*[^\u000a]+\u000a?/g, "")
+  text = text.replace(/\[TOOL:\w+\]\s*\u000a?[^\u000a]*/g, "").replace(/📄\s*[^\u000a]+\u000a?/g, "").replace(/📎\s*[^\u000a]+\u000a?/g, "")
     // drop bare "..."/"…" filler lines the weak Claude provider streams as continuation
     // markers — they otherwise survive as real <p>...</p> content and freeze into snapshots
     .replace(/(^|\n)[ \t]*(?:\.{2,}|…|。{2,})+[ \t]*(?=\n|$)/g, "$1")
     .replace(/\n{3,}/g, "\n\n").trim();
+  _cleanAgentText._cacheIn = input;
+  _cleanAgentText._cacheOut = text;
+  return text;
 }
 
 function _parseStreamSegments(text) {
@@ -30773,7 +30814,7 @@ const _bm25Index = {
 const _BM25_K1 = 1.5;
 const _BM25_B = 0.75;
 const _BM25_CHUNK_LINES = 80;
-const _BM25_SLICE_BUDGET_MS = 50; // 每片最多占用主线程 50ms，超预算就让路
+const _BM25_SLICE_BUDGET_MS = 20; // 每片最多占用主线程 20ms，超预算就让路（原 50ms 在流式期间仍造成 56s 累积阻塞）
 // Stopword list — natural-language fillers + extremely common control/keyword
 // tokens. We KEEP "get"/"set" since they're discriminative in code queries
 // (e.g. "getUser*" methods); BM25's IDF naturally down-weights common terms.
@@ -30820,6 +30861,12 @@ async function buildBM25Index(root) {
     sliceStart = Date.now();
     const activeRoot = typeof rootPath !== "undefined" && rootPath ? rootPath : root;
     if (activeRoot !== root) abandoned = true;
+    // RAFGAP 实锤：流式期间索引构建与渲染/持久化竞争主线程，累积阻塞 56s。
+    // 流式跑起来时额外让路——每个 yield 点再等一帧，把主线程彻底让给渲染。
+    if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) {
+      await new Promise((resolve) => setTimeout(resolve, 16));
+      sliceStart = Date.now();
+    }
   };
   try {
     await _walkSourceFiles(root, async (path, ext) => {
@@ -30887,16 +30934,24 @@ function bm25Search(query, topK) {
 
 // Schedule the index build shortly after the workspace settles (Tauri commands
 // fire while UI is still booting; we don't want to compete with first render).
+// RAFGAP 实锤：buildBM25Index 在流式期间启动会不 50ms 让路仍占主线程 56s。
+// 流式期间推迟到流结束后再调度——索引晚几秒不影响功能，但能消除流式卡死。
 function scheduleSymbolIndex() {
   try { _perfPhase("scheduleSymbolIndex"); } catch {}
   if (_symbolIndexTimer) clearTimeout(_symbolIndexTimer);
+  const anyStreaming = Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming);
   _symbolIndexTimer = setTimeout(() => {
+    // 流式仍在跑→再等 5s；不递归爆栈，setTimeout 本身是尾调用。
+    if (Array.isArray(_chatSessions) && _chatSessions.some((s) => s && s.streaming)) {
+      scheduleSymbolIndex();
+      return;
+    }
     const r = rootPath || workspaceRoots[0];
     if (r) {
       buildSymbolIndex(r);
       buildBM25Index(r);
     }
-  }, 3500);
+  }, anyStreaming ? 5000 : 3500);
 }
 
 async function _tsWorkerSymbols(fp) {
@@ -37262,9 +37317,27 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           }
         }
         // Fuzzy failed-search dedup: if a recent text search returned "无匹配" and the
-        // model tries an almost-identical query (case/substring variation), skip it.
+        // model tries an almost-identical query (edit distance < 3 or exact match), skip it.
         // ONLY for text-search tools (search, websearch). NOT find_files — glob patterns
         // like "*.js" are structurally different; stripping metacharacters poisons the pool.
+        // Tightened: substring `includes` was too loose (e.g. "api" blocked "api.cursor.sh").
+        // Now uses Levenshtein distance < 3 so only genuinely similar queries are deduped.
+        function _levenshtein(a, b) {
+          const la = a.length, lb = b.length;
+          if (la === 0) return lb;
+          if (lb === 0) return la;
+          let prev = Array.from({ length: lb + 1 }, (_, j) => j);
+          let curr = new Array(lb + 1);
+          for (let i = 1; i <= la; i++) {
+            curr[0] = i;
+            for (let j = 1; j <= lb; j++) {
+              const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+              curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+            }
+            [prev, curr] = [curr, prev];
+          }
+          return prev[lb];
+        }
         if (run && _live() && (call.type === "search" || call.type === "websearch")) {
           run._failedSearchQ = run._failedSearchQ || [];
           const _qRaw = call.query || "";
@@ -37274,7 +37347,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           const _caseSensitive = !!call.caseSensitive;
           if (_qN.length >= 2) {
             const _hit = run._failedSearchQ.find((entry) => entry.scope === _scope && entry.mode === _mode && entry.caseSensitive === _caseSensitive
-              && (_qN === entry.query || _qN.includes(entry.query) || entry.query.includes(_qN)));
+              && (_qN === entry.query || _levenshtein(_qN, entry.query) < 3));
             if (_hit) {
               const r = { type: call.type, path: call.path || "", content: `搜索 "${_qRaw}"：无匹配。（你之前在同一范围搜 "${_hit.query}" 也没结果——同类词反复搜不会有新结果。目标文件已知就直接 read_file；位置未知才换完全不同的定位方式。）` };
               it.rawResult = r;

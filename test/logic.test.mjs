@@ -14553,7 +14553,7 @@ test("#47-2 kg 知识图谱 memoize：raw 没变零重复 parse，写路径统�
 });
 
 test("#47-3 BM25 索引构建分片让路 + 工作区切换时中断安全", () => {
-  assert.match(SRC, /const _BM25_SLICE_BUDGET_MS = 50/);
+  assert.match(SRC, /const _BM25_SLICE_BUDGET_MS = 20/);
   const build = extractFn("buildBM25Index");
   assert.match(build, /_bm25Index\.built = false;/,
     "重建期间不能把半成品索引标成可用");
@@ -15967,4 +15967,118 @@ test("P2 generate_test_cases 输出不含 TODO 注释", () => {
   const fnSrc = extractFn("_generateTestSkeleton");
   assert.doesNotMatch(fnSrc, /TODO:/, "生成的测试骨架不应含 TODO: 注释");
   assert.doesNotMatch(fnSrc, /FIXME:/, "生成的测试骨架不应含 FIXME: 注释");
+});
+
+// ---- #89 卡死热点修复取证 ----
+
+test("#89-1 _cleanAgentText 缓存：同输入直接返回，避免重复正则", () => {
+  const clean = load("_cleanAgentText", {
+    _stripAckOpeners: load("_stripAckOpeners"),
+    _stripTeachingSections: load("_stripTeachingSections"),
+    _transformFileContentTags: (value) => value,
+    _stripToolNarration: (value) => value,
+    _perfPhase: () => {},
+  });
+  const input = "hello world\n\nsecond paragraph";
+  const r1 = clean(input);
+  const r2 = clean(input);
+  assert.equal(r1, r2, "同输入必须返回相同结果");
+  assert.equal(r1, "hello world\n\nsecond paragraph");
+  assert.equal(clean._cacheIn, input, "缓存必须记住最后一次输入");
+  assert.equal(clean._cacheOut, r1, "缓存必须记住最后一次输出");
+});
+
+test("#89-2 highlightCode 流式期间跳过 + 并发限流", () => {
+  assert.match(SRC, /if \(Array\.isArray\(_chatSessions\) && _chatSessions\.some\(\(s\) => s && s\.streaming\)\) return null;/,
+    "流式期间必须跳过 highlightCode");
+  assert.match(SRC, /_HIGHLIGHT_MAX_CONCURRENT/,
+    "必须有并发限流常量");
+  assert.match(SRC, /if \(_highlightActive >= _HIGHLIGHT_MAX_CONCURRENT\)/,
+    "超过并发上限必须排队");
+});
+
+test("#89-3 scheduleSymbolIndex 流式期间延迟启动", () => {
+  const fnSrc = extractFn("scheduleSymbolIndex");
+  assert.match(fnSrc, /_chatSessions\.some\(\(s\) => s && s\.streaming\)/,
+    "必须检测流式状态");
+  assert.match(fnSrc, /anyStreaming \? 5000 : 3500/,
+    "流式期间必须延长调度延迟");
+});
+
+test("#89-4 persistChatHistory 流式期间跳过 localStorage 同步写", () => {
+  const fnSrc = extractFn("_persistChatHistoryOnce");
+  assert.match(fnSrc, /if \(!lightweightOnly\)/,
+    "流式期间 (lightweightOnly=true) 必须跳过 localStorage.setItem");
+  assert.match(fnSrc, /localStorage:setItem len=/,
+    "必须有 localStorage 写入的取证相位");
+});
+
+test("#89-5 _sessionPersistFingerprint JSON.stringify 缓存", () => {
+  const fnSrc = extractFn("_sessionPersistFingerprint");
+  assert.match(fnSrc, /_intentJson/,
+    "必须缓存 _intentState 的 JSON 序列化");
+  assert.match(fnSrc, /_lastRunJson/,
+    "必须缓存 _lastRunState 的 JSON 序列化");
+  assert.match(fnSrc, /_intentJsonRef === s\._intentState/,
+    "同引用必须复用缓存的 JSON");
+});
+
+test("#89-6 buildBM25Index 流式期间额外让路", () => {
+  const build = extractFn("buildBM25Index");
+  assert.match(build, /_chatSessions\.some\(\(s\) => s && s\.streaming\)/,
+    "BM25 构建必须在 yield 点检测流式状态");
+  assert.match(build, /setTimeout\(resolve, 16\)/,
+    "流式期间必须额外让路一帧");
+});
+
+test("#89-7 _cleanAgentText 取证相位埋点", () => {
+  const fnSrc = extractFn("_cleanAgentText");
+  assert.match(fnSrc, /_perfPhase\(`_cleanAgentText len=/,
+    "_cleanAgentText 必须有长度取证相位");
+});
+
+// ── 模糊搜索去重：编辑距离 < 3 才去重，子串包含不再拦截 ──────────────────────
+test("模糊搜索去重：_levenshtein 函数正确计算编辑距离", () => {
+  const fnSrc = extractFn("_levenshtein");
+  // 用 eval 构造一个可调用版本（函数在 main.js 内部，无法直接调用）
+  const _levenshtein = new Function("return " + fnSrc)();
+  assert.equal(_levenshtein("api", "api"), 0, "完全相同编辑距离为 0");
+  assert.equal(_levenshtein("api", "apii"), 1, "差 1 字符编辑距离为 1");
+  assert.equal(_levenshtein("api", "ap"), 1, "少 1 字符编辑距离为 1");
+  assert.equal(_levenshtein("abc", "xyz"), 3, "完全不同 3 字符编辑距离为 3");
+  assert.equal(_levenshtein("", "abc"), 3, "空串到 abc 距离为 3");
+});
+
+test("模糊搜索去重：短词不拦长词（api 不拦 api.cursor.sh）", () => {
+  const fnSrc = extractFn("_levenshtein");
+  const _levenshtein = new Function("return " + fnSrc)();
+  // 旧逻辑：_qN.includes(entry.query) → "api cursor sh".includes("api") === true → 误拦
+  // 新逻辑：编辑距离 >= 3 → 不拦
+  const dist = _levenshtein("api cursor sh", "api");
+  assert.ok(dist >= 3, `"api cursor sh" vs "api" 编辑距离应 >= 3，实际 ${dist}`);
+});
+
+test("模糊搜索去重：完全相同查询才去重（编辑距离 0）", () => {
+  const fnSrc = extractFn("_levenshtein");
+  const _levenshtein = new Function("return " + fnSrc)();
+  assert.equal(_levenshtein("searchterm", "searchterm"), 0, "完全相同编辑距离为 0，应去重");
+  assert.ok(_levenshtein("searchterm", "searchterx") < 3, "差 1 字符编辑距离 < 3，应去重");
+});
+
+test("模糊搜索去重：编辑距离 < 3 才去重（>= 3 不拦）", () => {
+  const fnSrc = extractFn("_levenshtein");
+  const _levenshtein = new Function("return " + fnSrc)();
+  // 编辑距离 2 → 应去重
+  assert.ok(_levenshtein("config", "confgi") < 3, "config vs confgi 编辑距离 < 3，应去重");
+  // 编辑距离 >= 3 → 不应去重
+  assert.ok(_levenshtein("api", "server") >= 3, "api vs server 编辑距离 >= 3，不应去重");
+  assert.ok(_levenshtein("auth", "database") >= 3, "auth vs database 编辑距离 >= 3，不应去重");
+});
+
+test("模糊搜索去重：源码使用 _levenshtein 而非 includes", () => {
+  // 确认旧逻辑的 includes 已被替换为 _levenshtein
+  assert.match(SRC, /_levenshtein\(_qN,\s*entry\.query\)\s*<\s*3/,
+    "去重条件必须使用 _levenshtein < 3，不能用 includes 子串匹配");
+  assert.doesNotMatch(SRC, /_qN\.includes\(entry\.query\)\s*\|\|\s*entry\.query\.includes\(_qN\)/,
+    "旧 includes 子串匹配逻辑必须被移除");
 });
