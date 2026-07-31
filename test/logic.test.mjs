@@ -16139,3 +16139,113 @@ test("#88: 联网工具失败记忆和结果缓存框架已覆盖", () => {
   assert.match(SRC, /"academic_search"[\s\S]*"package_search"[\s\S]*"github_search"/,
     "_CACHEABLE_TOOL_TYPES 必须包含 deferred search 工具");
 });
+
+// ==================== #92 跨目录感知增强 ====================
+
+test("#92: list_dir tool schema 包含 depth 参数", () => {
+  // agent 工具 schema (中文描述版)
+  assert.match(SRC, /name:\s*"list_dir"[\s\S]*?depth:\s*\{[^}]*type:\s*"integer"/,
+    "list_dir schema 必须包含 depth 整数参数");
+  // 英文 schema (inline tools)
+  assert.match(SRC, /name:\s*"list_dir"[\s\S]*?Recursion depth/,
+    "英文 list_dir schema 必须描述 depth 为递归深度");
+  // 中文 schema 描述 0=无限
+  assert.match(SRC, /0\s*=\s*无限递归/,
+    "depth 参数描述必须说明 0=无限递归");
+});
+
+test("#92: list_dir 返回工作区相对路径而非仅文件名", () => {
+  // _entryRel 函数存在，用 _normRel 计算相对路径
+  assert.match(SRC, /_entryRel[\s\S]*?_normRel/,
+    "list_dir handler 必须有 _entryRel 用 _normRel 计算相对路径");
+  // listing 使用 _entryRel 而非 e.name
+  assert.match(SRC, /_annot\(_entryRel\(e\)/,
+    "listing 必须用 _entryRel(e) 而非 e.name");
+  // _annot 函数接收 relPath 而非 name
+  assert.match(SRC, /_annot\s*=\s*\(relPath,\s*isDir\)/,
+    "_annot 参数必须改为 relPath");
+});
+
+test("#92: list_dir depth 参数解析与传递", () => {
+  // 工具调用解析传递 depth
+  assert.match(SRC, /case\s+"list_dir".*depth:\s*args\.depth/,
+    "_parseAgentToolCall 必须传递 depth");
+  // inline tool 解析也传递 depth
+  assert.match(SRC, /toolName\s*===\s*"list_dir".*depth:\s*parsed\.depth/,
+    "inline tool 解析必须传递 depth");
+  // handler 里读取 call.depth
+  assert.match(SRC, /Number\(call\.depth\)/,
+    "handler 必须读取 call.depth");
+});
+
+test("#92: list_dir depth>1 递归遍历实现", () => {
+  // 递归 _listWalk 函数存在
+  assert.match(SRC, /_listWalk\s*=\s*async\s*\(dir,\s*depth,\s*prefix\)/,
+    "必须有 _listWalk 递归函数");
+  // depth=0 表示无限递归
+  assert.match(SRC, /maxListDepth\s*=\s*_depth\s*===\s*0\s*\?\s*Infinity/,
+    "depth=0 必须映射为 Infinity");
+  // 行数上限保护
+  assert.match(SRC, /maxListLines\s*=\s*500/,
+    "递归列表必须有 500 行上限");
+  // 跳过隐藏文件和跳过目录
+  assert.match(SRC, /_AGENT_CONTEXT_SKIP_DIRS\.has\(name\)/,
+    "递归遍历必须跳过忽略目录");
+});
+
+test("#92: _workspaceTreeSnapshot 深度自适应（移除硬上限 5）", () => {
+  // 旧代码: Math.max(1, Math.min(5, ...))
+  // 新代码: Math.max(1, ...) 不再有 Math.min(5, ...)
+  const snapshotMatch = SRC.match(/_workspaceTreeSnapshot[\s\S]*?const maxDepth\s*=\s*([^;]+);/);
+  assert.ok(snapshotMatch, "必须找到 _workspaceTreeSnapshot 的 maxDepth 定义");
+  assert.ok(!snapshotMatch[1].includes("Math.min(5"),
+    "maxDepth 不能再有 Math.min(5, ...) 硬上限");
+  // visited 计数器 + maxLines 预算仍然存在作为安全网
+  assert.match(SRC, /visited\s*>=\s*maxLines/,
+    "visited 计数器 + maxLines 预算兜底必须保留");
+});
+
+test("#92: 缓存指纹增强——包含一级子目录文件数", () => {
+  // 指纹构建遍历一级子目录
+  assert.match(SRC, /_enhFp/,
+    "必须有增强指纹函数 _enhFp");
+  // 子目录文件计数拼入指纹
+  assert.match(SRC, /\$\{dn\}:\$\{sub\.length\}/,
+    "指纹必须包含子目录文件计数 (dn:count 格式)");
+  // 三处指纹构建都增强（缓存命中路径、重建路径、每轮核对路径）
+  const enhFpCount = (SRC.match(/_enhFp[23]?\s*=\s*\(ents\)/g) || []).length;
+  assert.ok(enhFpCount >= 3, `增强指纹函数至少出现 3 处，实际 ${enhFpCount} 处`);
+  // 跳过忽略目录
+  assert.match(SRC, /_AGENT_CONTEXT_SKIP_DIRS\.has\(dn\)/,
+    "指纹增强必须跳过忽略目录");
+});
+
+test("#92: _agentDirEntryIsDir 兼容多种 entry 格式", () => {
+  const fn = load("_agentDirEntryIsDir");
+  assert.equal(fn({ is_dir: true }), true, "is_dir=true");
+  assert.equal(fn({ isDir: true }), true, "isDir=true");
+  assert.equal(fn({ kind: "dir" }), true, "kind=dir");
+  assert.equal(fn({ type: "dir" }), true, "type=dir");
+  assert.equal(fn({ is_dir: false }), false, "is_dir=false");
+  assert.equal(fn({ name: "file.txt" }), false, "普通文件");
+});
+
+test("#92: _agentDirEntryName 正确提取名称", () => {
+  const fn = load("_agentDirEntryName", { basename });
+  assert.equal(fn({ name: "hello.txt" }), "hello.txt", "直接 name");
+  assert.equal(fn({ name: "  spaced  " }), "spaced", "trim 空白");
+  assert.equal(fn({ path: "/a/b/c.rs" }), "c.rs", "从 path 提取 basename");
+  assert.equal(fn({}), "", "空 entry 返回空串");
+});
+
+test("#92: list_dir 向后兼容——depth=1 默认行为不受影响", () => {
+  // depth 默认值为 1
+  assert.match(SRC, /Number\(call\.depth\)\s*\|\|\s*1/,
+    "depth 默认值必须为 1");
+  // depth=1 走非递归分支
+  assert.match(SRC, /if\s*\(_depth\s*!==\s*1\)/,
+    "必须按 depth 是否为 1 区分分支");
+  // depth 范围限制 0-10
+  assert.match(SRC, /Math\.max\(0,\s*Math\.min\(10/,
+    "depth 必须限制在 0-10 范围");
+});

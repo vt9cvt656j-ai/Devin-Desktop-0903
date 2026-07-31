@@ -18917,7 +18917,9 @@ async function _workspaceTreeSnapshot(root, options = {}) {
   root = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
   if (!root) return "";
   const maxLines = Math.max(20, Math.min(800, Number(options.maxLines) || 160));
-  const maxDepth = Math.max(1, Math.min(5, Number(options.maxDepth) || 3));
+  // 自适应深度：小项目递归到底，大项目保持浅层但绝不硬限 5
+  // visited 计数器 + maxLines 预算兜底，不会因深度大而爆
+  const maxDepth = Math.max(1, Number(options.maxDepth) || 3);
   // 并行 DFS：旧版逐目录串行 await readDir，几百个目录 = 几百次串行 IPC 往返，
   // 每轮发送前的真实卡点。子目录并发遍历，共享计数器超预算短路，输出顺序不变。
   let visited = 0;
@@ -19165,10 +19167,23 @@ async function _gatherAgentContext(query, sessionRoot) {
         fingerprintOk = false;
       }
       // 继续原来的文件名指纹验证
-      const fp = (Array.isArray(entries) ? entries : [])
-        .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
-        .sort()
-        .join("|");
+      // 增强指纹：顶层文件名 + 一级子目录名+文件数，深层变化也触发刷新
+      const _enhFp = (ents) => {
+        const arr = (Array.isArray(ents) ? ents : []);
+        const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
+        // 追加一级子目录文件计数，让深层增删也能被感知
+        for (const e of arr) {
+          if (!_agentDirEntryIsDir(e)) continue;
+          const dn = _agentDirEntryName(e);
+          if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
+          try {
+            const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
+            if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
+          } catch {}
+        }
+        return parts.join("|");
+      };
+      const fp = _enhFp(entries);
       if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
       if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
       // 记录规模信息供下次对比
@@ -19287,10 +19302,21 @@ async function _gatherAgentContext(query, sessionRoot) {
   let rootFp;
   try {
     const entries = await backend.readDir(root);
-    rootFp = (Array.isArray(entries) ? entries : [])
-      .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
-      .sort()
-      .join("|");
+    const _enhFp2 = (ents) => {
+      const arr = (Array.isArray(ents) ? ents : []);
+      const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
+      for (const e of arr) {
+        if (!_agentDirEntryIsDir(e)) continue;
+        const dn = _agentDirEntryName(e);
+        if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
+        try {
+          const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
+          if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
+        } catch {}
+      }
+      return parts.join("|");
+    };
+    rootFp = _enhFp2(entries);
   } catch {}
   // 重建时把规模状态存进缓存，命中路径读取并透传给 _agentContextForQuery 第 6 参
   const _sizeState = { isEmpty: _emptyRootTop, isDrasticallyShrunk: !!_sizeDeltaWarning };
@@ -19317,10 +19343,21 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null) 
     let fingerprintOk = true;
     try {
       freshEntries = await backend.readDir(root);
-      const fp = (Array.isArray(freshEntries) ? freshEntries : [])
-        .map((e) => (e?.name || "") + (e?.isDirectory || e?.is_dir ? "/" : ""))
-        .sort()
-        .join("|");
+      const _enhFp3 = (ents) => {
+        const arr = (Array.isArray(ents) ? ents : []);
+        const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
+        for (const e of arr) {
+          if (!_agentDirEntryIsDir(e)) continue;
+          const dn = _agentDirEntryName(e);
+          if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
+          try {
+            const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
+            if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
+          } catch {}
+        }
+        return parts.join("|");
+      };
+      const fp = _enhFp3(freshEntries);
       if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
       if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
     } catch {}
@@ -20633,7 +20670,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _toolSchemas = hasToolAccess ? [
     { type: "function", function: { name: "read_file", description: "Read file content", parameters: { type: "object", properties: { path: { type: "string", description: "File path only, for example src/main.js or /tmp/app.log; do not prefix it with cat or sed" } }, required: ["path"] } } },
     { type: "function", function: { name: "read_logs", description: "Read recent terminal/app log output or the tail of a log file. This is read-only evidence for debugging errors.", parameters: { type: "object", properties: { path: { type: "string", description: "Optional log file path" }, paths: { type: "array", items: { type: "string" } }, name: { type: "string", description: "Optional run_in_terminal task name" }, lines: { type: "integer", description: "Tail line count" }, include_terminal: { type: "boolean" } } } } },
-    { type: "function", function: { name: "list_dir", description: "List directory contents", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path" } }, required: ["path"] } } },
+    { type: "function", function: { name: "list_dir", description: "List directory contents", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path" }, depth: { type: "integer", description: "Recursion depth (default 1, 0 = unlimited)" } }, required: ["path"] } } },
     ...(isAgent ? [
       { type: "function", function: { name: "write_file", description: "Write content to file", parameters: { type: "object", properties: { path: { type: "string", description: "File path" }, content: { type: "string", description: "File content" } }, required: ["path", "content"] } } },
       { type: "function", function: { name: "run_cmd", description: "Run a short command that exits and returns output. Do not start foreground dev servers/watch/listeners here; use Agent run_in_terminal/read_logs/read_terminal/background_monitor for persistent interactive work.", parameters: { type: "object", properties: { command: { type: "string", description: "Shell command" } }, required: ["command"] } } },
@@ -20942,7 +20979,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
             const toolName = entry.name;
             let call;
             if (toolName === "read_file") call = { type: "read", path: parsed.path };
-            else if (toolName === "list_dir") call = { type: "list", path: parsed.path };
+            else if (toolName === "list_dir") call = { type: "list", path: parsed.path, depth: parsed.depth };
             else if (toolName === "run_cmd") call = { type: "cmd", command: parsed.command };
             else if (toolName === "write_file") call = { type: "write", path: parsed.path, content: parsed.content };
             if (call) {
@@ -25372,7 +25409,7 @@ async function _figRun(call) {
 function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   const tools = [
     { type: "function", function: { name: "read_file", description: "读取文件内容。", parameters: { type: "object", properties: { path: { type: "string", description: "只传相对工作区根目录的路径或绝对路径，例如 src/main.js 或 /tmp/app.log；不要添加 cat、sed 等命令" }, offset: { type: "integer", description: "起始行号(1 基)，默认 1" }, limit: { type: "integer", description: "读取行数。**默认一次读完整个文件（不用传）——绝不要为了小文件自己传个小 limit 去分段读，几百行的文件一次就该全读进来，分段是浪费还容易漏**。只有几千行的超大文件才需要分段。" } }, required: ["path"] } } },
-    { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" } }, required: ["path"] } } },
+    { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" }, depth: { type: "integer", description: "递归深度，默认 1（只列当前层），0 = 无限递归到底" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "位置未知时在文件或目录中定位文本；命中后读取目标文件确认完整上下文。目标文件已知时直接 read_file，不要先 search。默认 literal；只有明确需要模式匹配才用 regex。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本或正则表达式" }, path: { type: "string", description: "可选，限定单个文件或子目录（如 src/auth.ts 或 src/）" }, mode: { type: "string", enum: ["literal", "regex"], description: "匹配模式，默认 literal" }, case_sensitive: { type: "boolean", description: "是否区分大小写，默认 false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
     { type: "function", function: { name: "web_search", description: "⚠️ **最后手段**——只在以下专用工具都不适用时才用 web_search。**必须优先用专用工具**：查周边/附近→local_discovery；查店铺官网商品/菜单/价格/库存公开结构化数据→shop_catalog；查天气/空气→live_environment；查航班→live_flights；查汇率/币价/加密资产→live_markets；查交通/堵车→road_environment；查快递→track_shipment；查技术问题/报错→stackoverflow_search；查npm/pip包→package_search；查GitHub仓库/release/issues→github_search；查最新论文/SOTA/学术→academic_search/arxiv_search/openalex_search/crossref_search；查医学/药物/临床试验→pubmed_search/pubchem_search/clinical_trials_search；查百科概念→wiki_search；查漏洞→cve_search；查游戏价格/平台→steam_search；查优惠/二手→smzdm_search/xianyu_search/zhuanzhuan_search；查开发者社区/论坛真实踩坑→developer_community_search。以上场景**绝不准优先用 web_search**。web_search 仅用于：找不到对应专用工具的通用互联网信息检索。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
@@ -26600,7 +26637,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
   switch (name) {
     case "search_tools": return { type: "search_tools", query: args.query || args.q || args.description || "" };
     case "read_file": return { type: "read", path: args.path || "", offset: args.offset, limit: args.limit };
-    case "list_dir": return { type: "list", path: args.path || "" };
+    case "list_dir": return { type: "list", path: args.path || "", depth: args.depth };
     case "search": return { type: "search", path: args.query || "", query: args.query || "", searchPath: args.path || "", mode: args.mode === "regex" ? "regex" : "literal", caseSensitive: !!args.case_sensitive };
     case "find_files": return { type: "find", path: args.pattern || "", pattern: args.pattern || "" };
     case "web_fetch": return { type: "web", path: args.url || "", url: args.url || "" };
@@ -41079,23 +41116,69 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       // Reveal INVISIBLE leading/trailing/tab whitespace in a name (the file tree hides
       // it, which makes paths silently fail). Flag it so the model uses the real name.
-      const _annot = (name, isDir) => {
-        const disp = name + (isDir ? "/" : "");
-        if (/^\s|\s$|\t/.test(name)) {
-          const vis = name.replace(/ /g, "␣").replace(/\t/g, "⇥") + (isDir ? "/" : "");
+      const _annot = (relPath, isDir) => {
+        const disp = relPath + (isDir ? "/" : "");
+        const baseName = relPath.split("/").pop() || relPath;
+        if (/^\s|\s$|\t/.test(baseName)) {
+          const vis = baseName.replace(/ /g, "␣").replace(/\t/g, "⇥") + (isDir ? "/" : "");
           return `${disp}    ⚠️[名字含看不见的空白，真实是「${vis}」——引用时用真实名并整体加引号]`;
         }
         return disp;
       };
-      const _dirsE = entries.filter(e => e.is_dir).sort((a, b) => a.name.localeCompare(b.name));
-      const _filesE = entries.filter(e => !e.is_dir).sort((a, b) => a.name.localeCompare(b.name));
-      const listing = [..._dirsE.map(e => _annot(e.name, true)), ..._filesE.map(e => _annot(e.name, false))].join("\n");
+      // 返回工作区相对路径（不再只返回文件名），AI 可直接用这些路径操作文件
+      const _entryRel = (e) => {
+        const abs = _normalizeFsPath(String(e?.path || `${fp}/${e?.name || ""}`)).replace(/\/+$/, "");
+        return _normRel(abs, root) || e?.name || "";
+      };
+      const _depth = Math.max(0, Math.min(10, Number(call.depth) || 1));
+      const _dirsE = entries.filter(e => _agentDirEntryIsDir(e)).sort((a, b) => _agentDirEntryName(a).localeCompare(_agentDirEntryName(b)));
+      const _filesE = entries.filter(e => !_agentDirEntryIsDir(e)).sort((a, b) => _agentDirEntryName(a).localeCompare(_agentDirEntryName(b)));
+      let listing;
+      if (_depth !== 1) {
+        // 递归模式：depth=0 无限递归，depth>1 指定层数
+        const maxListDepth = _depth === 0 ? Infinity : _depth;
+        const listLines = [];
+        const maxListLines = 500;
+        const _listWalk = async (dir, depth, prefix) => {
+          if (listLines.length >= maxListLines) return;
+          let subEntries = [];
+          try { subEntries = await backend.readDir(dir); } catch { return; }
+          subEntries = (Array.isArray(subEntries) ? subEntries : [])
+            .filter((entry) => {
+              const name = _agentDirEntryName(entry);
+              if (!name || name === "." || name === "..") return false;
+              if (_agentDirEntryIsDir(entry) && _AGENT_CONTEXT_SKIP_DIRS.has(name)) return false;
+              if (name.startsWith(".")) return false;
+              return true;
+            })
+            .sort((a, b) => {
+              const ad = _agentDirEntryIsDir(a) ? 0 : 1;
+              const bd = _agentDirEntryIsDir(b) ? 0 : 1;
+              if (ad !== bd) return ad - bd;
+              return _agentDirEntryName(a).localeCompare(_agentDirEntryName(b), "en");
+            });
+          for (const entry of subEntries) {
+            if (listLines.length >= maxListLines) break;
+            const name = _agentDirEntryName(entry);
+            const isDir = _agentDirEntryIsDir(entry);
+            const abs = _normalizeFsPath(String(entry?.path || `${dir}/${name}`)).replace(/\/+$/, "");
+            const rel = _normRel(abs, root) || name;
+            listLines.push(_annot(prefix + rel, isDir));
+            if (isDir && depth < maxListDepth) await _listWalk(abs, depth + 1, prefix + "  ");
+          }
+        };
+        await _listWalk(fp, 1, "");
+        listing = listLines.join("\n");
+      } else {
+        // depth=1：向后兼容，只列当前层但改用相对路径
+        listing = [..._dirsE.map(e => _annot(_entryRel(e), true)), ..._filesE.map(e => _annot(_entryRel(e), false))].join("\n");
+      }
       _markRunRootEmpty(run, root, fp, entries);
       // #79 list_dir 成功 → 模型已看到真实目录结构，重置失败路径计数
       if (run && run._failedPathAttempts) run._failedPathAttempts.clear();
       res.className = "atc-result atc-result--info";
-      res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件</span>`;
-      vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(e.name, true)), _filesE.map((e) => _annot(e.name, false)));
+      res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件${_depth !== 1 ? ` · depth=${_depth || "∞"}` : ""}</span>`;
+      vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(_entryRel(e), true)), _filesE.map((e) => _annot(_entryRel(e), false)));
       const _listPath = fp !== call.path ? `${call.path} (${fp})` : call.path;
       return { type: "list", path: _listPath, content: listing || "(空目录——没有任何文件或子文件夹。这是新/空项目，直接基于用户描述开始工作，不要猜测文件名去 read_file。)" };
 
