@@ -629,7 +629,7 @@ fn github_trending_url(language: &str) -> Result<String, String> {
 #[tauri::command]
 pub async fn academic_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
@@ -707,7 +707,7 @@ pub async fn package_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
@@ -1232,7 +1232,7 @@ pub async fn github_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
@@ -2444,7 +2444,7 @@ pub async fn codeberg_repo(
 #[tauri::command]
 pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
@@ -2520,7 +2520,7 @@ pub async fn wiki_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(5).min(10);
@@ -2607,7 +2607,7 @@ pub async fn stackoverflow_search(
     tag: Option<String>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
@@ -2694,7 +2694,7 @@ pub async fn hackernews_search(
     sort: Option<String>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
@@ -2851,7 +2851,7 @@ async fn discourse_search(
 ) -> Result<String, String> {
     let query = query.trim();
     if query.is_empty() {
-        return Err(format!("{} 搜索词不能为空，请输入具体内容", source.label));
+        return Err(format!("{} 搜索词不能为空，请输入关键词", source.label));
     }
     let client = kclient()?;
     let response = client
@@ -2883,7 +2883,7 @@ async fn discourse_search(
 #[tauri::command]
 pub async fn rust_users_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, RUST_USERS_DISCOURSE).await
 }
@@ -2894,7 +2894,7 @@ pub async fn python_discussions_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, PYTHON_DISCOURSE).await
 }
@@ -2905,7 +2905,7 @@ pub async fn swift_forums_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, SWIFT_DISCOURSE).await
 }
@@ -2916,7 +2916,7 @@ pub async fn kotlin_discussions_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     discourse_search(query, max_results, KOTLIN_DISCOURSE).await
 }
@@ -2936,7 +2936,7 @@ pub async fn developer_community_search(
 ) -> Result<String, String> {
     let query = query.trim().to_string();
     if query.is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
 
     let selected = select_developer_sources(scope.as_deref(), sources.as_deref())?;
@@ -3206,7 +3206,7 @@ fn format_developer_community_results(
 #[tauri::command]
 pub async fn pubmed_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
@@ -3316,7 +3316,7 @@ pub async fn arxiv_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
@@ -3389,7 +3389,7 @@ pub async fn crossref_search(
     max_results: Option<u32>,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
@@ -3596,7 +3596,7 @@ pub async fn openalex_search(
 #[tauri::command]
 pub async fn pubchem_search(query: String, search_type: Option<String>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let stype = search_type.as_deref().unwrap_or("compound");
@@ -3766,7 +3766,7 @@ pub async fn clinical_trials_search(
 #[tauri::command]
 pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(25);
@@ -3811,7 +3811,7 @@ pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result
 #[tauri::command]
 pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -3906,7 +3906,7 @@ fn format_gitee_repository_item(item: &Value, index: usize, retrieved: &str) -> 
 #[tauri::command]
 pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -3948,7 +3948,7 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
 #[tauri::command]
 pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -3999,7 +3999,7 @@ pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<Str
 #[tauri::command]
 pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -4042,7 +4042,7 @@ pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result
 #[tauri::command]
 pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
@@ -4085,7 +4085,7 @@ pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<
 #[tauri::command]
 pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -4136,7 +4136,7 @@ pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<Str
 #[tauri::command]
 pub async fn homebrew_search(query: String) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let slug = query.to_lowercase().replace(' ', "-");
@@ -4196,7 +4196,7 @@ pub async fn homebrew_search(query: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -4234,7 +4234,7 @@ pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<Strin
 #[tauri::command]
 pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     if query.trim().is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词".into());
     }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
@@ -4413,7 +4413,7 @@ pub async fn reddit_search(
 pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
@@ -4427,7 +4427,7 @@ pub async fn smzdm_search(query: String, max_results: Option<u32>) -> Result<Str
 pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
@@ -4441,7 +4441,7 @@ pub async fn xianyu_search(query: String, max_results: Option<u32>) -> Result<St
 pub async fn zhuanzhuan_search(query: String, max_results: Option<u32>) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("搜索词不能为空，请输入具体内容".into());
+        return Err("搜索词不能为空，请输入关键词，请输入关键词进行搜索".into());
     }
     let n = max_results.unwrap_or(10).min(20);
     let direct = format!(
