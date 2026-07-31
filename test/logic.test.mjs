@@ -15696,12 +15696,12 @@ test("\u8f93\u5165\u9a8c\u8bc1: \u6267\u884c\u5904\u7406\u5668\u68c0\u67e5 _erro
 test("#85 失败记忆统一框架: 包装器对所有工具自动记录失败", () => {
   // 包装器 _executeToolStep 必须包含失败记忆拦截逻辑
   const wrapperSrc = extractFn("_executeToolStep");
-  assert.match(wrapperSrc, /_getToolFailureCount\(call\?\.type\)/, "包装器必须检查失败计数");
+  assert.match(wrapperSrc, /_getToolFailureCount\(_fmKey\)/, "包装器必须检查失败计数（用 _fmKey）");
   assert.match(wrapperSrc, /_fmCount >= 3/, "连续失败 ≥3 次必须拦截");
   assert.match(wrapperSrc, /\[失败记忆\]/, "拦截必须返回明确提示");
-  // 包装器必须根据结果内容自动记录失败
-  assert.match(wrapperSrc, /_recordToolFailure\(call\?\.type\)/, "包装器必须自动记录失败");
-  assert.match(wrapperSrc, /_resetToolFailure\(call\?\.type\)/, "成功时必须重置计数");
+  // 包装器必须根据结果内容自动记录失败（P1 重构：用 _fmKey 替代 call?.type）
+  assert.match(wrapperSrc, /_recordToolFailure\(_fmKey\)/, "包装器必须自动记录失败（用 _fmKey）");
+  assert.match(wrapperSrc, /_resetToolFailure\(_fmKey\)/, "成功时必须重置计数（用 _fmKey）");
   // _fmRecorded 标记防止游戏资产工具双重计数
   assert.match(wrapperSrc, /_fmRecorded/, "必须支持 _fmRecorded 防双重计数");
   // 源里游戏资产工具的 catch 块带 _fmRecorded 标记
@@ -15792,4 +15792,110 @@ test("#85 Schema Description 标准化: 高频工具含 usage_note", () => {
   }
   // usage_note 必须包含三段式格式
   assert.match(guideSrc, /usage_note: '【何时用】.*【vs 替代】.*【何时不用】/, "usage_note 必须包含三段式：何时用/vs替代/何时不用");
+});
+
+// ── P1 工具重构聚焦测试 ──
+
+test("P1 _toolFailureKey: git/gh 按 op 分开计数", () => {
+  const fn = load("_toolFailureKey");
+  // git 不同 op 必须有不同失败键
+  assert.equal(fn({ type: "git", op: "push" }), "git:push", "git push 失败键必须是 git:push");
+  assert.equal(fn({ type: "git", op: "status" }), "git:status", "git status 失败键必须是 git:status");
+  assert.equal(fn({ type: "git", op: "commit" }), "git:commit", "git commit 失败键必须是 git:commit");
+  // gh 不同 op 也分开
+  assert.equal(fn({ type: "gh", op: "pr_create" }), "gh:pr_create", "gh pr_create 失败键必须是 gh:pr_create");
+  assert.equal(fn({ type: "gh", op: "pr_view" }), "gh:pr_view", "gh pr_view 失败键必须是 gh:pr_view");
+  // 非 git/gh 工具保持原样
+  assert.equal(fn({ type: "read" }), "read", "read 工具失败键必须是 read");
+  assert.equal(fn({ type: "web_search" }), "web_search", "web_search 失败键必须是 web_search");
+  // db 按 op 分开
+  assert.equal(fn({ type: "db", op: "query" }), "db:query", "db query 失败键必须是 db:query");
+  // 无 op 的 git/gh 回退到 type
+  assert.equal(fn({ type: "git" }), "git", "git 无 op 时回退到 git");
+  // null/undefined 安全
+  assert.equal(fn(null), "", "null call 必须返回空字符串");
+  assert.equal(fn({}), "", "空 call 必须返回空字符串");
+});
+
+test("P1 _toolCacheKey: 包含 op 参数以区分 git/gh 操作", () => {
+  const fn = load("_toolCacheKey");
+  // git 不同 op 必须产生不同缓存键
+  const kPush = fn({ type: "git", op: "push" });
+  const kStatus = fn({ type: "git", op: "status" });
+  assert.notEqual(kPush, kStatus, "git push 和 git status 必须产生不同缓存键");
+  // 相同 git op + 相同参数 = 相同键
+  const k1 = fn({ type: "git", op: "status" });
+  const k2 = fn({ type: "git", op: "status" });
+  assert.equal(k1, k2, "相同 git op 必须产生相同缓存键");
+  // 非 git 工具不受影响
+  const k3 = fn({ type: "read", path: "src/main.js" });
+  const k4 = fn({ type: "read", path: "src/main.js" });
+  assert.equal(k3, k4, "read 工具相同参数必须产生相同缓存键");
+});
+
+test("P1 deferred 搜索工具全部纳入结果缓存", () => {
+  // _CACHEABLE_TOOL_TYPES 必须包含所有主要 deferred 搜索工具
+  const deferredTools = [
+    "academic_search", "package_search", "github_search", "github_repo",
+    "gitlab_search", "gitee_search", "codeberg_search", "cve_search",
+    "wiki_search", "stackoverflow_search", "hackernews_search",
+    "developer_community_search", "dockerhub_search", "pubmed_search",
+    "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
+    "clinical_trials_search", "maven_search", "packagist_search",
+    "rubygems_search", "nuget_search", "homebrew_search", "mdn_search",
+    "cdnjs_search", "bundlephobia_search", "devto_search", "reddit_search",
+    "smzdm_search", "xianyu_search", "zhuanzhuan_search", "steam_search",
+    "iconify_search", "color_search", "lobsters_search", "juejin_search",
+    "codrops_search", "smashingmag_search", "css_tricks_search",
+    "codepen_search", "dribbble_search", "awwwards_search", "v2ex_search",
+    "segmentfault_search", "github_discussions_search", "producthunt_search",
+    "freecodecamp_search", "github_trending", "infoq_search",
+    "hackernoon_search", "bestofjs_search", "sourcegraph_search",
+    "deep_search", "realtime_news_feed",
+  ];
+  for (const tool of deferredTools) {
+    const pattern = new RegExp(`"${tool}"`);
+    assert.match(SRC, pattern, `${tool} 必须纳入 _CACHEABLE_TOOL_TYPES`);
+  }
+});
+
+test("P1 失败记忆框架使用 _toolFailureKey 而非 call?.type", () => {
+  const wrapperSrc = extractFn("_executeToolStep");
+  // 必须使用 _toolFailureKey 获取失败键
+  assert.match(wrapperSrc, /const _fmKey = _toolFailureKey\(call\)/, "必须用 _toolFailureKey 生成失败键");
+  assert.match(wrapperSrc, /_getToolFailureCount\(_fmKey\)/, "必须用 _fmKey 查询失败计数");
+  assert.match(wrapperSrc, /_recordToolFailure\(_fmKey\)/, "必须用 _fmKey 记录失败");
+  assert.match(wrapperSrc, /_resetToolFailure\(_fmKey\)/, "必须用 _fmKey 重置失败");
+  // 不能直接用 call?.type 作为失败键
+  assert.doesNotMatch(wrapperSrc, /_getToolFailureCount\(call\?\.type\)/, "不得直接用 call?.type 查询失败计数");
+});
+
+test("P1 TOOL_METADATA: deferred 搜索工具批量含 usage_note", () => {
+  const guideSrc = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
+  const deferredTools = [
+    "academic_search", "stackoverflow_search", "hackernews_search",
+    "developer_community_search", "arxiv_search", "mdn_search",
+    "juejin_search", "reddit_search", "github_trending",
+    "sourcegraph_search", "deep_search", "realtime_news_feed",
+    "smzdm_search", "xianyu_search",
+  ];
+  for (const tool of deferredTools) {
+    const pattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
+    assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
+  }
+});
+
+test("P1 Git/DB 工具 TOOL_METADATA 含 usage_note", () => {
+  const guideSrc = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
+  const tools = [
+    "git_status", "git_diff", "git_log", "git_blame", "git_push", "git_pull", "git_stash",
+    "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
+    "gh_pr_review_comments", "gh_pr_reply",
+    "db_query", "db_migrate", "backup_database",
+    "multi_edit", "semantic_search", "knowledge_search", "find_symbol",
+  ];
+  for (const tool of tools) {
+    const pattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
+    assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
+  }
 });

@@ -31154,6 +31154,13 @@ function _recordToolFailure(toolType) {
 }
 function _resetToolFailure(toolType) { _toolFailureCounts.delete(toolType); }
 function _getToolFailureCount(toolType) { return _toolFailureCounts.get(toolType) || 0; }
+// P1 工具重构：细粒度失败记忆键——git/gh 按 op 分开计数，避免 git push 失败连坐 git status
+function _toolFailureKey(call) {
+  const t = call?.type || "";
+  const op = call?.op || "";
+  if ((t === "git" || t === "gh" || t === "db") && op) return `${t}:${op}`;
+  return t;
+}
 
 // ── 结果缓存统一框架 ── 只读工具 5 分钟 TTL，相同参数不重复执行
 const _toolResultCache = new Map();
@@ -31164,6 +31171,22 @@ const _CACHEABLE_TOOL_TYPES = new Set([
   "getdiagnostics", "readlogs", "readterminal", "listterminals",
   "ghprview", "ghprchecks", "ghprreviewcomments", "ghactionslog",
   "currenttime", "readscreen",
+  // P1 重构：所有 deferred 搜索工具纳入 5 分钟结果缓存
+  "academic_search", "package_search", "github_search", "github_repo",
+  "gitlab_repo", "gitee_repo", "codeberg_repo", "cve_search", "wiki_search",
+  "stackoverflow_search", "hackernews_search", "developer_community_search",
+  "dockerhub_search", "pubmed_search", "arxiv_search", "crossref_search",
+  "openalex_search", "pubchem_search", "clinical_trials_search", "gitlab_search",
+  "gitee_search", "maven_search", "packagist_search", "rubygems_search",
+  "nuget_search", "homebrew_search", "mdn_search", "cdnjs_search",
+  "bundlephobia_search", "devto_search", "reddit_search", "smzdm_search",
+  "xianyu_search", "zhuanzhuan_search", "steam_search", "iconify_search",
+  "color_search", "lobsters_search", "juejin_search", "codrops_search",
+  "smashingmag_search", "css_tricks_search", "codepen_search", "dribbble_search",
+  "awwwards_search", "v2ex_search", "segmentfault_search", "github_discussions_search",
+  "producthunt_search", "freecodecamp_search", "github_trending", "infoq_search",
+  "hackernoon_search", "codeberg_search", "bestofjs_search", "sourcegraph_search",
+  "deep_search", "realtime_news_feed",
 ]);
 const _TOOL_CACHE_TTL = 5 * 60 * 1000;
 function _toolCacheKey(call) {
@@ -31190,6 +31213,7 @@ function _toolCacheKey(call) {
   if (call.character != null) parts.push(String(call.character));
   if (call.id != null) parts.push(String(call.id));
   if (call.ocr != null) parts.push(String(call.ocr));
+  if (call.op != null) parts.push(String(call.op));
   if (call.ref != null) parts.push(String(call.ref));
   return parts.join("\x1f");
 }
@@ -44752,13 +44776,15 @@ async function _executeToolStep(step, call, root, run) {
   }
 
   // ── 失败记忆统一框架：连续失败 ≥3 次自动拦截 ──
-  const _fmCount = _getToolFailureCount(call?.type);
+  // P1 重构：用 _toolFailureKey 实现 git/gh 按 op 分开计数
+  const _fmKey = _toolFailureKey(call);
+  const _fmCount = _getToolFailureCount(_fmKey);
   if (_fmCount >= 3) {
     const _fv = step.querySelector(".atc-viewport");
     const _fr = step.querySelector(".atc-result");
-    if (_fv) _fv.textContent = call?.type;
+    if (_fv) _fv.textContent = _fmKey || call?.type || "unknown";
     if (_fr) { _fr.className = "atc-result atc-result--err"; _fr.textContent = `已失败 ${_fmCount} 次`; }
-    return { type: call?.type || "unknown", path: call?.path || "", content: `[失败记忆] ${call?.type || "工具"} 已连续失败 ${_fmCount} 次，请检查输入参数或换用其他工具。`, _fmBlocked: true };
+    return { type: call?.type || "unknown", path: call?.path || "", content: `[失败记忆] ${_fmKey || "工具"} 已连续失败 ${_fmCount} 次，请检查输入参数或换用其他工具。`, _fmBlocked: true };
   }
 
   // 调用实际工具执行
@@ -44769,9 +44795,9 @@ async function _executeToolStep(step, call, root, run) {
   const _isFailure = /\[(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted|WARN|参数错误)\]/i.test(_content)
     || /\*\*批量自动化结果\*\*/.test(_content) && /[✗×]/.test(_content);
   if (_isFailure) {
-    if (!result?._fmRecorded) _recordToolFailure(call?.type);
+    if (!result?._fmRecorded) _recordToolFailure(_fmKey);
   } else if (result && !_isFailure) {
-    _resetToolFailure(call?.type);
+    _resetToolFailure(_fmKey);
   }
 
   // ── 结果缓存统一框架：只读工具成功结果存入缓存 ──
