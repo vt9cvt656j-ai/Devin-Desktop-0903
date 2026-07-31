@@ -25807,7 +25807,8 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
       "read_file", "search", "find_files", "get_diagnostics", "git_diff",
     ],
     agent: ["read_file", "list_dir", "search", "find_files", "update_plan", "ask_user",
-            "write_file", "edit_file", "multi_edit", "run_cmd"],
+            "write_file", "edit_file", "multi_edit", "run_cmd",
+            "web_search", "web_fetch", "github_search", "http_request", "developer_community_search"],
   };
   
   // Get base tools from role or default
