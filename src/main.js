@@ -1579,6 +1579,36 @@ try {
   }
 } catch {}
 
+// 内存压力自动减负：监测 WebView DOM 膨胀（历史卡死根因是 1.3GB），超过阈值时主动
+// 释放不可见的 heavy 资源（已完成工具卡的大 viewport、后台终端 canvas），
+// 避免系统 MemoryPressure 把整个 UI 冻住。每 30s 一次，轻量。
+setInterval(() => {
+  try {
+    const nodes = document.querySelectorAll("*").length;
+    if (nodes < 12000) return;
+    const settled = document.querySelectorAll(".agent-tool-step:not(.is-running) .atc-viewport");
+    let freed = 0;
+    for (const vp of settled) {
+      if (vp._gcStub || !vp.innerHTML || vp.innerHTML.length < 2000) continue;
+      const step = vp.closest(".agent-tool-step");
+      if (step && step.parentElement) {
+        const siblings = step.parentElement.querySelectorAll(".agent-tool-step");
+        const idx = Array.prototype.indexOf.call(siblings, step);
+        if (idx >= 0 && siblings.length - idx <= 20) continue;
+      }
+      vp._gcOriginal = vp.innerHTML;
+      vp._gcStub = true;
+      const len = vp.innerHTML.length;
+      vp.innerHTML = `<div style="padding:6px 10px;color:var(--atc-dim,#636c76);font-size:11px;cursor:pointer" onclick="this.parentElement.innerHTML=this.parentElement._gcOriginal;this.parentElement._gcStub=false">… 内容已折叠以释放内存（${Math.round(len/1024)}KB）——点击展开</div>`;
+      freed++;
+    }
+    document.querySelectorAll(".terminal-panel__instance[hidden] canvas").forEach((c) => {
+      try { const ctx = c.getContext("2d"); if (ctx) ctx.clearRect(0, 0, c.width, c.height); c.width = 1; c.height = 1; freed++; } catch {}
+    });
+    if (freed) console.log(`[MemGC] freed ${freed} heavy elements (nodes was ${nodes})`);
+  } catch {}
+}, 30000);
+
 function _memProbeStart() {
   // 只有显式 localStorage.setItem("mide_memprobe","1") 才开——之前 dev 自动开，
   // 而日常运行环境就是 tauri dev，等于探针永远全速跑：每 15s 全 DOM 扫描×2、
