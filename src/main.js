@@ -17004,9 +17004,15 @@ function _mergeAiIntentProfile(base, intents, text, priorState = null) {
   const verdict = intents && typeof intents === "object" && Object.keys(intents).length ? intents : null;
   const inherited = !verdict && priorState && typeof priorState === "object" ? priorState : null;
   const inheritedDimensions = inherited?.dimensions && typeof inherited.dimensions === "object" ? inherited.dimensions : {};
-  const engineering = verdict?.engineering && typeof verdict.engineering === "object"
+  // 意图判定超时/失败且无继承时，不能让 applies=false 把所有高级能力灰掉。
+  // 保守回退：至少设 implementation=true 让编排器能跑、联网工具能装载。
+  // （正常判定返回时会覆盖此回退，不影响。）
+  let engineering = verdict?.engineering && typeof verdict.engineering === "object"
     ? verdict.engineering
     : inherited?.engineering && typeof inherited.engineering === "object" ? inherited.engineering : null;
+  if (!engineering && !verdict && !inherited && base._isAgentMode) {
+    engineering = { projectState: "unknown", workspaceAction: "modify", deliverySurface: "code" };
+  }
   const m = { ...base };
   for (const dim of _AI_INTENT_DIMENSIONS) {
     m[dim] = verdict ? verdict[dim] === true : inheritedDimensions[dim] === true;
@@ -20279,6 +20285,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
   const _earlyRoot = String(sess?.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   const _earlyActiveForSession = activePath && (!_earlyRoot || _pathIsAtOrUnder(activePath, _earlyRoot)) ? activePath : "";
   const effectiveMode = _normalizeAiMode(_currentAiMode);
+  _turnEngineeringEarly._isAgentMode = (effectiveMode === "agent");
   _currentAiMode = effectiveMode;
   sess.mode = effectiveMode;
   // Agent routing is finalized from the semantic decision below. Starting on the full path is the
