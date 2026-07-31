@@ -628,6 +628,9 @@ fn github_trending_url(language: &str) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn academic_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
 
@@ -703,6 +706,9 @@ pub async fn package_search(
     ecosystem: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
     let eco = ecosystem.as_deref().unwrap_or("npm");
@@ -1225,6 +1231,9 @@ pub async fn github_search(
     search_type: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
     let stype = search_type.as_deref().unwrap_or("repositories");
@@ -2434,6 +2443,9 @@ pub async fn codeberg_repo(
 
 #[tauri::command]
 pub async fn cve_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
 
@@ -2507,6 +2519,9 @@ pub async fn wiki_search(
     lang: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(5).min(10);
     let l = lang.as_deref().unwrap_or("en");
@@ -2591,6 +2606,9 @@ pub async fn stackoverflow_search(
     max_results: Option<u32>,
     tag: Option<String>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
 
@@ -2675,6 +2693,9 @@ pub async fn hackernews_search(
     max_results: Option<u32>,
     sort: Option<String>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
     let endpoint = match sort.as_deref() {
@@ -2864,6 +2885,9 @@ async fn discourse_search(
 
 #[tauri::command]
 pub async fn rust_users_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     discourse_search(query, max_results, RUST_USERS_DISCOURSE).await
 }
 
@@ -2872,6 +2896,9 @@ pub async fn python_discussions_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     discourse_search(query, max_results, PYTHON_DISCOURSE).await
 }
 
@@ -2880,6 +2907,9 @@ pub async fn swift_forums_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     discourse_search(query, max_results, SWIFT_DISCOURSE).await
 }
 
@@ -2888,6 +2918,9 @@ pub async fn kotlin_discussions_search(
     query: String,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     discourse_search(query, max_results, KOTLIN_DISCOURSE).await
 }
 
@@ -3175,6 +3208,9 @@ fn format_developer_community_results(
 
 #[tauri::command]
 pub async fn pubmed_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(8).min(20);
 
@@ -3282,6 +3318,9 @@ pub async fn arxiv_search(
     category: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(30);
 
@@ -3352,6 +3391,9 @@ pub async fn crossref_search(
     search_type: Option<String>,
     max_results: Option<u32>,
 ) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(20);
     let stype = search_type.as_deref().unwrap_or("works");
@@ -3556,6 +3598,9 @@ pub async fn openalex_search(
 
 #[tauri::command]
 pub async fn pubchem_search(query: String, search_type: Option<String>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let stype = search_type.as_deref().unwrap_or("compound");
 
@@ -3723,6 +3768,9 @@ pub async fn clinical_trials_search(
 
 #[tauri::command]
 pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let c = kclient()?;
     let limit = max_results.unwrap_or(10).min(25);
 
@@ -3765,6 +3813,9 @@ pub async fn dockerhub_search(query: String, max_results: Option<u32>) -> Result
 
 #[tauri::command]
 pub async fn gitlab_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -3857,6 +3908,9 @@ fn format_gitee_repository_item(item: &Value, index: usize, retrieved: &str) -> 
 
 #[tauri::command]
 pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -3896,6 +3950,9 @@ pub async fn gitee_search(query: String, max_results: Option<u32>) -> Result<Str
 
 #[tauri::command]
 pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -3944,6 +4001,9 @@ pub async fn maven_search(query: String, max_results: Option<u32>) -> Result<Str
 
 #[tauri::command]
 pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -3984,6 +4044,9 @@ pub async fn packagist_search(query: String, max_results: Option<u32>) -> Result
 
 #[tauri::command]
 pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20) as usize;
     let resp = client
@@ -4024,6 +4087,9 @@ pub async fn rubygems_search(query: String, max_results: Option<u32>) -> Result<
 
 #[tauri::command]
 pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -4072,6 +4138,9 @@ pub async fn nuget_search(query: String, max_results: Option<u32>) -> Result<Str
 
 #[tauri::command]
 pub async fn homebrew_search(query: String) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let slug = query.to_lowercase().replace(' ', "-");
 
@@ -4129,6 +4198,9 @@ pub async fn homebrew_search(query: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client
@@ -4164,6 +4236,9 @@ pub async fn mdn_search(query: String, max_results: Option<u32>) -> Result<Strin
 
 #[tauri::command]
 pub async fn cdnjs_search(query: String, max_results: Option<u32>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("搜索词不能为空，请输入具体内容".into());
+    }
     let client = kclient()?;
     let n = max_results.unwrap_or(10).min(20);
     let resp = client

@@ -441,6 +441,24 @@ fn friendly_read_error(path: &str, e: &std::io::Error) -> String {
     }
 }
 
+fn friendly_write_error(op: &str, path: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{}失败：路径不存在：{}（请先用 list_dir 确认父目录存在）",
+            op, path
+        ),
+        std::io::ErrorKind::PermissionDenied => format!("{}失败：没有写入权限：{}", op, path),
+        std::io::ErrorKind::AlreadyExists => format!("{}失败：目标已存在：{}", op, path),
+        std::io::ErrorKind::IsADirectory => format!("{}失败：{} 是目录", op, path),
+        std::io::ErrorKind::NotADirectory => format!(
+            "{}失败：路径中间有一段不是目录：{}",
+            op, path
+        ),
+        std::io::ErrorKind::DirectoryNotEmpty => format!("{}失败：目录不为空：{}", op, path),
+        kind => format!("{}失败：{}（{}）", op, path, kind),
+    }
+}
+
 /// Read a UTF-8 text file. Rejects directories, oversized and binary files so
 /// the editor never tries to render garbage.
 #[tauri::command]
@@ -1493,7 +1511,7 @@ pub fn create_dir(path: String) -> Result<(), String> {
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
-    std::fs::create_dir_all(p).map_err(|e| e.to_string())
+    std::fs::create_dir_all(p).map_err(|e| friendly_write_error("创建目录", &path, &e))
 }
 
 /// Rename or move a file/folder. Errors if the destination already exists.
@@ -1507,9 +1525,9 @@ pub fn rename_path(from: String, to: String) -> Result<(), String> {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = to_p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
     }
-    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+    std::fs::rename(&from, &to).map_err(|e| friendly_write_error("重命名", &from, &e))
 }
 
 fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -1543,15 +1561,15 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = to_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
     }
-    let meta = std::fs::symlink_metadata(from_p).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(from_p).map_err(|e| friendly_write_error("读取源文件", &from, &e))?;
     if meta.is_dir() {
-        copy_dir_recursive(from_p, &to_path).map_err(|e| e.to_string())
+        copy_dir_recursive(from_p, &to_path).map_err(|e| friendly_write_error("复制目录", &from, &e))
     } else {
         std::fs::copy(from_p, &to_path)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_write_error("复制文件", &from, &e))
     }
 }
 
@@ -1561,11 +1579,11 @@ pub fn delete_path(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     require_inside_workspace(&path)?;
     let p = Path::new(&path);
-    let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(p).map_err(|e| friendly_write_error("删除", &path, &e))?;
     if meta.is_dir() {
-        std::fs::remove_dir_all(p).map_err(|e| e.to_string())
+        std::fs::remove_dir_all(p).map_err(|e| friendly_write_error("删除目录", &path, &e))
     } else {
-        std::fs::remove_file(p).map_err(|e| e.to_string())
+        std::fs::remove_file(p).map_err(|e| friendly_write_error("删除文件", &path, &e))
     }
 }
 
