@@ -40443,6 +40443,26 @@ async function _executeToolStep(step, call, root, run) {
     return { type: call.type, path: call.path || call.pattern || call.query || "", content: _emptySkip };
   }
 
+  // ── #79 读/搜失败路径渐进式门控 ── 模型反复猜不存在的路径时，渐进升级拦截：
+  // 1st fail = 正常错误; 2nd = 附加提示; 3rd+ = 物理拦截，必须先 list_dir。
+  if (run && (call.type === "read" || call.type === "find")) {
+    const _fpKey = call.type === "read" ? (call.path || "").trim() : (call.pattern || call.path || "").trim();
+    if (_fpKey) {
+      run._failedPathAttempts = run._failedPathAttempts || new Map();
+      const _fpN = run._failedPathAttempts.get(_fpKey) || 0;
+      if (_fpN >= 3) {
+        res.className = "atc-result atc-result--blocked";
+        res.textContent = "⛔ 路径已多次不存在";
+        return { type: call.type, path: call.path || call.pattern || "", content: `[BLOCKED] 路径「${_fpKey}」你已尝试读取/搜索 ${_fpN} 次均不存在。必须先用 list_dir 确认真实目录结构，不要再猜路径。` };
+      }
+      if (_fpN >= 2) {
+        res.className = "atc-result atc-result--err";
+        res.textContent = "⚠️ 路径已多次不存在";
+        return { type: call.type, path: call.path || call.pattern || "", content: `[WARN] 路径「${_fpKey}」你已搜索过 ${_fpN} 次且不存在，不要重复猜测。请先 list_dir 确认真实目录结构后再用正确路径。` };
+      }
+    }
+  }
+
   // Agent tool calls no longer go through a per-operation permission prompt.
   // Only mode boundaries and file-integrity checks above can stop execution.
 
@@ -40609,6 +40629,12 @@ async function _executeToolStep(step, call, root, run) {
           if (!run._pathNotFoundGuided) {
             pathGuidance = "\n\n⚠️ 读不到文件时请先用 list_dir / find_files 确认真实路径，注意不要臆造子目录或把中文文件名翻译成英文。";
             run._pathNotFoundGuided = true;
+          }
+          // #79 递增失败计数：让渐进式门控在后续重试时升级拦截
+          if (run) {
+            run._failedPathAttempts = run._failedPathAttempts || new Map();
+            const _fpKey = rawPath.trim();
+            run._failedPathAttempts.set(_fpKey, (run._failedPathAttempts.get(_fpKey) || 0) + 1);
           }
           return { type: "read", path: call.path, content: `[${code}] 找不到唯一文件: ${rawPath}（工作区根: ${root || "(无)"}）。${helpHint}${pathGuidance}` };
         }
@@ -40851,6 +40877,8 @@ async function _executeToolStep(step, call, root, run) {
       const _filesE = entries.filter(e => !e.is_dir).sort((a, b) => a.name.localeCompare(b.name));
       const listing = [..._dirsE.map(e => _annot(e.name, true)), ..._filesE.map(e => _annot(e.name, false))].join("\n");
       _markRunRootEmpty(run, root, fp, entries);
+      // #79 list_dir 成功 → 模型已看到真实目录结构，重置失败路径计数
+      if (run && run._failedPathAttempts) run._failedPathAttempts.clear();
       res.className = "atc-result atc-result--info";
       res.innerHTML = `<span class="atc-result__t">${_dirsE.length} 个文件夹 · ${_filesE.length} 个文件</span>`;
       vp.innerHTML = _lsRowsHtml(_dirsE.map((e) => _annot(e.name, true)), _filesE.map((e) => _annot(e.name, false)));
@@ -41374,6 +41402,14 @@ async function _executeToolStep(step, call, root, run) {
       res.className = r.count ? "atc-result atc-result--ok" : "atc-result atc-result--err";
       res.textContent = r.count ? `${r.count} 个文件` : "无匹配";
       vp.innerHTML = `<pre>${_escHtml(r.text)}</pre>`;
+      // #79 find_files 无匹配时递增失败计数，与 read_file 共享渐进式门控
+      if (!r.count && run) {
+        const _fpKey = (call.pattern || call.path || "").trim();
+        if (_fpKey) {
+          run._failedPathAttempts = run._failedPathAttempts || new Map();
+          run._failedPathAttempts.set(_fpKey, (run._failedPathAttempts.get(_fpKey) || 0) + 1);
+        }
+      }
       return { type: "find", path: call.path, content: `find_files "${call.pattern || call.path}":\n${r.text}` };
 
     } else if (call.type === "diag") {

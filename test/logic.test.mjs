@@ -15134,3 +15134,94 @@ test("#77 结构就绪提示：接线自查——run 级布尔一次性 + 走 _p
   // 阈值常量存在且可配置
   assert.match(SRC, /_STRUCTURE_READINESS_FILE_THRESHOLD\s*=\s*\d+/);
 });
+
+// ── #79 读/搜失败路径渐进式门控 ──────────────────────────────────────────
+test("#79 门控代码存在于 src/main.js", () => {
+  // 前置门控：read / find 入口检查 _failedPathAttempts
+  assert.match(SRC, /_failedPathAttempts/, "_failedPathAttempts Map 必须存在");
+  assert.match(SRC, /#79 读\/搜失败路径渐进式门控/, "门控注释标记必须存在");
+  // 递增：read NotFound 路径
+  assert.match(SRC, /#79 递增失败计数/, "read NotFound 递增注释必须存在");
+  // 递增：find_files 无匹配路径
+  assert.match(SRC, /#79 find_files 无匹配时递增/, "find_files 递增注释必须存在");
+  // 重置：list_dir 成功
+  assert.match(SRC, /#79 list_dir 成功.*重置失败路径/, "list_dir 重置注释必须存在");
+  // 渐进式阈值：>=3 BLOCKED, >=2 WARN
+  assert.match(SRC, /_fpN >= 3[\s\S]{0,200}BLOCKED/, "3次+必须物理拦截");
+  assert.match(SRC, /_fpN >= 2[\s\S]{0,200}WARN/, "2次必须附加警告");
+});
+
+test("#79 渐进式门控：第 1 次失败正常返回（不拦截）", () => {
+  // 模拟 run + Map 行为，验证 1st fail 后计数为 1，门控不触发
+  const run = { _failedPathAttempts: new Map() };
+  const path = "src/nonexistent.js";
+  // 第 1 次失败：递增
+  run._failedPathAttempts.set(path, (run._failedPathAttempts.get(path) || 0) + 1);
+  assert.equal(run._failedPathAttempts.get(path), 1);
+  // 门控检查：n=1 < 2，不拦截
+  const n = run._failedPathAttempts.get(path) || 0;
+  assert.ok(n < 2, "第 1 次失败不应触发门控");
+});
+
+test("#79 渐进式门控：第 2 次失败附加提示（WARN）", () => {
+  const run = { _failedPathAttempts: new Map() };
+  const path = "src/nonexistent.js";
+  // 模拟 2 次失败
+  run._failedPathAttempts.set(path, (run._failedPathAttempts.get(path) || 0) + 1);
+  run._failedPathAttempts.set(path, (run._failedPathAttempts.get(path) || 0) + 1);
+  assert.equal(run._failedPathAttempts.get(path), 2);
+  // 门控检查：n=2 >= 2 且 < 3 → WARN
+  const n = run._failedPathAttempts.get(path) || 0;
+  assert.ok(n >= 2 && n < 3, "第 2 次失败应触发 WARN 级门控");
+});
+
+test("#79 渐进式门控：第 3 次+物理拦截（BLOCKED）", () => {
+  const run = { _failedPathAttempts: new Map() };
+  const path = "src/nonexistent.js";
+  // 模拟 3 次失败
+  for (let i = 0; i < 3; i++) {
+    run._failedPathAttempts.set(path, (run._failedPathAttempts.get(path) || 0) + 1);
+  }
+  assert.equal(run._failedPathAttempts.get(path), 3);
+  // 门控检查：n=3 >= 3 → BLOCKED
+  const n = run._failedPathAttempts.get(path) || 0;
+  assert.ok(n >= 3, "第 3 次失败应触发 BLOCKED 级门控");
+});
+
+test("#79 不同路径独立计数", () => {
+  const run = { _failedPathAttempts: new Map() };
+  // 路径 A 失败 3 次 → BLOCKED
+  for (let i = 0; i < 3; i++) {
+    run._failedPathAttempts.set("a.js", (run._failedPathAttempts.get("a.js") || 0) + 1);
+  }
+  // 路径 B 失败 1 次 → 不拦截
+  run._failedPathAttempts.set("b.js", (run._failedPathAttempts.get("b.js") || 0) + 1);
+  assert.equal(run._failedPathAttempts.get("a.js"), 3);
+  assert.equal(run._failedPathAttempts.get("b.js"), 1);
+  // A 被拦截但 B 不被拦截
+  assert.ok((run._failedPathAttempts.get("a.js") || 0) >= 3, "路径 A 应被拦截");
+  assert.ok((run._failedPathAttempts.get("b.js") || 0) < 2, "路径 B 不应被拦截");
+});
+
+test("#79 list_dir 成功后重置失败路径计数", () => {
+  const run = { _failedPathAttempts: new Map() };
+  // 累积一些失败路径
+  run._failedPathAttempts.set("src/foo.js", 2);
+  run._failedPathAttempts.set("src/bar.ts", 1);
+  assert.equal(run._failedPathAttempts.size, 2);
+  // list_dir 成功 → 清空
+  run._failedPathAttempts.clear();
+  assert.equal(run._failedPathAttempts.size, 0);
+  // 之前的路径不再被拦截
+  assert.equal(run._failedPathAttempts.get("src/foo.js"), undefined);
+});
+
+test("#79 门控不碰 system 静态前缀", () => {
+  // 确认门控代码在 _executeToolStep 内部，不在 system prompt 区域
+  const gateIdx = SRC.indexOf("#79 读/搜失败路径渐进式门控");
+  const execIdx = SRC.indexOf("async function _executeToolStep(");
+  assert.ok(gateIdx > execIdx, "门控代码必须在 _executeToolStep 内部");
+  // 确认门控不注入 system prompt
+  const sysPromptIdx = SRC.indexOf("_AI_MODE_PROMPTS");
+  assert.ok(gateIdx > sysPromptIdx || sysPromptIdx === -1, "门控不应在 system prompt 区域");
+});
