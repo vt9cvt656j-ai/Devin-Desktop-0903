@@ -649,6 +649,16 @@ export function createLspManager(options) {
       client.shutdown();
       clients.delete(langId);
     }
+    // Drop any debounced didChange still queued for this language: firing it after
+    // the server died would push a document version to a dead client (and, once a
+    // fresh server starts, arrive out of order before its didOpen). refreshWorkspace
+    // re-syncs full document state on reconnect, so nothing is lost by cancelling.
+    for (const [uri, entry] of changeTimers) {
+      if (entry.langId === langId) {
+        clearTimeout(entry.timer);
+        changeTimers.delete(uri);
+      }
+    }
     // Clear any markers owned by this server.
     for (const m of monaco.editor.getModels()) {
       monaco.editor.setModelMarkers(m, "lsp:" + langId, []);

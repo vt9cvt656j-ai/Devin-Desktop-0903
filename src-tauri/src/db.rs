@@ -428,11 +428,11 @@ async fn sql_query(
     // which is most real tables. Concrete rows fetch fine; we then decode each cell
     // best-effort and tolerate the odd exotic type per-cell instead of failing the query.
     use sqlx::Connection;
-    // The query future here genuinely requires a `'static` SQL string (sqlx's query borrow escapes
-    // through the boxed/timeout'd future — a reborrow fails to compile), so we leak the statement.
-    // Agent DB queries are few and short → this is a negligible, bounded cost, and far simpler than
-    // threading lifetimes through three concrete backends. (Verified: reborrow → E0521.)
-    let q: &'static str = Box::leak(q.to_owned().into_boxed_str());
+    // Zero-leak dynamic SQL: sqlx 0.9's `query()` only takes `&'static str` directly, but
+    // provides `AssertSqlSafe<String>` as the official escape hatch for runtime-built SQL
+    // (which agent queries inherently are). Owned String per call — freed when the future
+    // completes. Replaces the old Box::leak that leaked every statement permanently.
+    let sql = || sqlx::AssertSqlSafe(q.to_owned());
     let head = q.trim_start().to_lowercase();
     let is_read = head.starts_with("select")
         || head.starts_with("with")
@@ -472,13 +472,13 @@ async fn sql_query(
             .map_err(ct)?
             .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "sqlite", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
+                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;
@@ -493,13 +493,13 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "mysql", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
+                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;
@@ -514,13 +514,13 @@ async fn sql_query(
                 .map_err(ct)?
                 .map_err(|e| format!("连接失败: {e}"))?;
             let out = if is_read {
-                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).fetch_all(&mut c))
+                let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).fetch_all(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("查询出错: {e}"))?;
                 Ok(rows_to_json(&rows, "postgres", cap, ms(started)))
             } else {
-                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(q).execute(&mut c))
+                let res = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(sql()).execute(&mut c))
                     .await
                     .map_err(qt)?
                     .map_err(|e| format!("执行出错: {e}"))?;

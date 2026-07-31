@@ -90,7 +90,10 @@ function matchGcc(text) {
 function matchEslint(text) {
   const out = [];
   let file = null;
-  const fileRe = /^(?:\/|\.{0,2}\/|[A-Za-z]:[\\/]).+/;
+  // Accept unix absolute (/x), dotted relative with either separator (./x ../x .\x ..\x)
+  // and Windows drive-absolute (C:\x, C:/x) — the old `\.{0,2}\/` missed `.\` style
+  // paths, silently dropping every ESLint diagnostic on Windows.
+  const fileRe = /^(?:\/|\.{0,2}[\\/]|[A-Za-z]:[\\/]).+/;
   const rowRe = /^\s+(\d+):(\d+)\s+(error|warning)\s+(.*?)(?:\s{2,}([\w./-]+))?\s*$/;
   for (const line of lines(text)) {
     const r = rowRe.exec(line);

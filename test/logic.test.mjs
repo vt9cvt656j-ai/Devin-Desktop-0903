@@ -7381,8 +7381,8 @@ test("structured semantic profiles drive planning without lexical classification
   assert.equal(quality([], false, "mutate"), "", "small tasks do not get a ritual plan gate");
   assert.match(SRC, /function _planGateGrandProject\(run\)/,
     "计划门必须按任务意图识别大计划工程，而不是机械文件计数");
-  assert.match(SRC, /if \(call && call\.type === "worker"\) return true;/,
-    "run_worker 派工前必须有工程全貌计划");
+  assert.doesNotMatch(SRC, /if \(call && call\.type === "worker"\) return true;/,
+    "派 worker 不再无条件要计划：小型并行任务走意图判定，大工程由 _planGateGrandProject 拦");
   assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
   assert.match(SRC, /UI\/官网\/落地页\/从零前端项目要覆盖/);
   assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
@@ -7543,8 +7543,10 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
     "从零/完整建站是大计划工程 → 第一次落盘前必须有全貌路线图");
   assert.equal(requiresPlan({ engineering: { requiresPlan: true, architecture: true, projectScope: true } }, { type: "write" }), true,
     "架构级 + 全项目范围的重构是大计划工程 → 必须先列计划");
-  assert.equal(requiresPlan(complexRun, { type: "worker" }), true,
-    "run_worker 按角色拆分并行必然是大工程编排，必须先有工程全貌计划");
+  assert.equal(requiresPlan(complexRun, { type: "worker" }), false,
+    "派 worker 只是并行手段不等于大工程——小型并行任务（非大计划意图）不强制列计划");
+  assert.equal(requiresPlan({ engineering: { requiresPlan: true, fullWebsite: true } }, { type: "worker" }), true,
+    "大工程意图下派 worker 仍须先有工程全貌计划（worker 不在豁免名单里）");
   assert.equal(requiresPlan({ ...complexRun, _planSteps: [{ content: "改 a.js", status: "pending" }] }, { type: "write" }), false,
     "once a plan exists the gate must stay out of the way");
   assert.match(requiredPlanIssue(complexRun, null), /尚未创建计划/,
@@ -9120,9 +9122,8 @@ test("long chat transcripts stay bounded while paging both directions", () => {
     "opening earlier history must not synchronously rebuild the full transcript");
   assert.match(SRC, /const CHAT_LOCAL_RECENT_LIMIT = 96/,
     "the synchronous emergency mirror must remain bounded even when full context is huge");
-  assert.match(SRC, /const _CHAT_FOLLOW_DELAY_MS = 48/);
-  assert.match(SRC, /_chatFollowTimer = setTimeout\(/,
-    "streaming updates should coalesce their layout-affecting scroll write");
+  assert.match(SRC, /_chatFollowRAF = requestAnimationFrame\(/,
+    "streaming updates should coalesce their layout-affecting scroll write via rAF");
 });
 
 test("automatic verification converges instead of repeating per edit batch", () => {
@@ -10880,8 +10881,12 @@ test("same-response reads and fuzzy bindings cannot authorize mutations before t
   assert.match(extractFn("_executeToolStepInner"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,1600}已阻止退回原始路径写错文件/);
   // 新文件豁免：拦截必须以「目标在磁盘上真实存在」为前提，全新创建不能被同批绑定拦死。
   assert.match(extractFn("_executeToolStepInner"),
-    /const sameBatchTargetExists = !!sameBatchBinding\s*&& \(\(await _pathExistsAsFile\(sameBatchTargetAbs\)\) \|\| \(await _pathExistsAsDir\(sameBatchTargetAbs\)\)\);\s*if \(sameBatchBinding && sameBatchTargetExists\)/,
+    /const sameBatchTargetExists = !!sameBatchBinding\s*&& \(\(await _pathExistsAsFile\(sameBatchTargetAbs\)\) \|\| \(await _pathExistsAsDir\(sameBatchTargetAbs\)\)\)/,
     "写入门禁只拦磁盘上已存在的目标，新文件创建必须放行");
+  // 仅在真发生模糊路径纠正时才拦：同一回复里 read+edit 同一文件（精确路径）不能被误拦。
+  assert.match(extractFn("_executeToolStepInner"),
+    /if \(sameBatchBinding && sameBatchTargetExists && _wasFuzzyCorrected\)/,
+    "读取门只在真发生模糊路径纠正时才拦，精确 read+edit 同文件必须放行");
 
   run._toolBatch = 2;
   assert.equal(hasCurrentRead(run, "/repo", content, "a.js"), true);
@@ -13760,7 +13765,7 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
   const KEY = "michael-stream-draft-v1";
   const mkLS = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
   const ls = mkLS();
-  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls });
+  const draftSave = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false });
   const sess = { id: "s1", streaming: true };
   draftSave(sess, "第一段", "思考1");
   draftSave(sess, "第一段+节流窗口内的后续内容", "思考2");
@@ -13783,7 +13788,15 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
 
   // 流式两条路径存的都是完整累计 acc（非增量），且退出事件三件套都已注册
   assert.ok(SRC.includes("_streamDraftSave(sess, acc, reasoning)"), "普通对话路径必须保存完整累计 acc");
-  assert.ok(SRC.includes("_streamDraftSave(session, acc, reasoningAcc)"), "agent 路径必须保存完整累计 acc");
+  // agent 路径：草稿 = 本 run 已完成轮次叙述前缀 + 当前轮完整 acc（中途硬重启恢复整段 run）
+  assert.ok(SRC.includes("session._streamRunPrefix ? session._streamRunPrefix") && SRC.includes("+ acc, reasoningAcc)"),
+    "agent 路径必须保存 run 累积叙述前缀 + 完整 acc");
+  assert.ok(SRC.includes("session._streamRunPrefix = summaryText;"),
+    "run 循环每轮前必须把已完成叙述写入 _streamRunPrefix，供草稿恢复整段 run");
+  // 运行中周期性把草稿镜像进磁盘 store：localStorage 在 WKWebView 异步落盘，硬杀/dev 重启会丢
+  const draftSaveSrc = extractFn("_streamDraftSave");
+  assert.ok(draftSaveSrc.includes("_draftDurableAt") && draftSaveSrc.includes("_streamDraftPersistDurable(draft)"),
+    "运行中必须周期性把草稿镜像进磁盘 store，硬重启才能恢复在途回复");
   assert.ok(SRC.includes('window.addEventListener("pagehide", () => _flushExitStateSync())'),
     "WKWebView 下 beforeunload 不可靠，pagehide 必须注册退出 flush");
   assert.ok(SRC.includes('window.addEventListener("beforeunload", () => { _flushExitStateSync(); saveSession(); })'),
@@ -14214,7 +14227,7 @@ test("P1：run_subagent 多任务并发——tasks 数组解析 + Promise.allSet
 });
 
 test("P1：run_subagent 归在可并行段，主智能体同批只读工具不被子智能体阻塞", () => {
-  assert.match(SRC, /canRunInReadSegment = \(it\) => !!it\.call && \(_isReadOnlyParallel\(it\.call\)\s*\|\| \["run_subagent", "research_project", "design_research"\]\.includes\(it\.tc\.name\)\)/,
+  assert.match(SRC, /canRunInReadSegment = \(it\) => !!it\.call && \(_isReadOnlyParallel\(it\.call\)\s*\|\| \["run_subagent", "research_project", "design_research", "spawn_multiple_agents"\]\.includes\(it\.tc\.name\)\)/,
     "run_subagent 必须留在可并行段，与只读工具同批并发");
 });
 
@@ -14227,7 +14240,7 @@ test("P2.1-注册：await_subagent 全链路注册 + run_subagent wait 参数语
   // _KNOWN_TOOLS / 弱模型别名 / 延迟簇（与 run_subagent 同簇按需加载）
   assert.ok(SRC.includes('"await_subagent",\n]);'), "_KNOWN_TOOLS 必须收录 await_subagent");
   assert.match(SRC, /awaitsubagent: "await_subagent", wait_subagent: "await_subagent"/);
-  assert.match(SRC, /subagent: \{ tools: \["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent"\] \}/);
+  assert.match(SRC, /subagent: \{ tools: \["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent", "spawn_multiple_agents"\] \}/);
   // _mapToolCall 行为：wait 默认 false，显式 true 透传；await_subagent job 默认 all
   const mapCall = load("_mapToolCall", {
     _normalizeArgKeys: (a) => a,
@@ -15810,6 +15823,24 @@ test("P1 _toolFailureKey: git/gh 按 op 分开计数", () => {
   assert.equal(fn({ type: "web_search" }), "web_search", "web_search 失败键必须是 web_search");
   // db 按 op 分开
   assert.equal(fn({ type: "db", op: "query" }), "db:query", "db query 失败键必须是 db:query");
+  // 文件变更类按「类型+路径」分开计数：一个文件写失败不得连坐封死其他文件的写入
+  assert.equal(fn({ type: "write", path: "packages/a/types.ts" }), "write:packages/a/types.ts");
+  assert.equal(fn({ type: "write", path: "packages/b/base.ts" }), "write:packages/b/base.ts");
+  assert.notEqual(
+    fn({ type: "write", path: "packages/a/types.ts" }),
+    fn({ type: "write", path: "packages/b/base.ts" }),
+    "不同文件的写入失败键必须不同——否则成批新建文件时一个失败会连坐封死全部写入");
+  assert.equal(fn({ type: "edit", path: "src/x.ts" }), "edit:src/x.ts");
+  assert.equal(fn({ type: "multiedit", path: "src/x.ts" }), "multiedit:src/x.ts");
+  assert.equal(fn({ type: "move", to: "src/y.ts" }), "move:src/y.ts", "move 用目标路径 to 作键");
+  assert.equal(fn({ type: "write" }), "write", "无路径时回退到 type");
+  // 命令按具体命令分开计数：一条命令失败不得连坐封死其它命令（否则终端整体用不了）
+  assert.equal(fn({ type: "cmd", command: "pnpm dev" }), "cmd:pnpm dev");
+  assert.notEqual(
+    fn({ type: "cmd", command: "pnpm dev" }),
+    fn({ type: "cmd", command: "ls" }),
+    "不同命令的失败键必须不同——否则一条命令失败会把整个终端封死");
+  assert.equal(fn({ type: "cmd", command: "  pnpm   dev  " }), "cmd:pnpm dev", "命令键归一化空白");
   // 无 op 的 git/gh 回退到 type
   assert.equal(fn({ type: "git" }), "git", "git 无 op 时回退到 git");
   // null/undefined 安全
@@ -15868,6 +15899,18 @@ test("P1 失败记忆框架使用 _toolFailureKey 而非 call?.type", () => {
   assert.match(wrapperSrc, /_resetToolFailure\(_fmKey\)/, "必须用 _fmKey 重置失败");
   // 不能直接用 call?.type 作为失败键
   assert.doesNotMatch(wrapperSrc, /_getToolFailureCount\(call\?\.type\)/, "不得直接用 call?.type 查询失败计数");
+});
+
+test("失败记忆：文件变更类的策略/瞬时拦截不计入 3 次硬封锁（防成批新建文件零落盘）", () => {
+  const wrapperSrc = extractFn("_executeToolStep");
+  // 文件变更类的 [BLOCKED]/[CONFLICT]/[interrupted] 是可恢复状态，必须从失败累计中排除
+  assert.match(wrapperSrc, /_isRecoverableMutBlock/,
+    "必须区分文件变更类的可恢复拦截，不能把 BLOCKED/CONFLICT/interrupted 当作硬失败累计");
+  assert.match(wrapperSrc, /if \(_isFailure && !_isRecoverableMutBlock\)/,
+    "只有非可恢复的真实失败才能累计进 3 次硬封锁");
+  // 只排除文件变更类（写/改/删/移/建目录/拷贝/格式化），其他工具的 BLOCKED 不受影响
+  assert.match(wrapperSrc, /\["write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format"\]\.includes\(call\.type\)/,
+    "可恢复拦截豁免仅限文件变更类工具");
 });
 
 test("P1 TOOL_METADATA: deferred 搜索工具批量含 usage_note", () => {

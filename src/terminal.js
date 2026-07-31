@@ -156,7 +156,9 @@ async function createTermTab() {
         backend.termWrite(entry.backendId, " clear\n");
       }
     };
-    setTimeout(finishInit, 1500);
+    // Track the timer on the entry so closeTermTab can cancel it — firing after
+    // dispose would call term.reset()/write() on a disposed Terminal.
+    entry._initTimer = setTimeout(() => { entry._initTimer = null; finishInit(); }, 1500);
   } catch (err) {
     term.write("\r\n\x1b[31mFailed to start terminal: " + (err?.message || err) + "\x1b[0m\r\n");
   } finally {
@@ -167,6 +169,8 @@ async function createTermTab() {
 function closeTermTab(idx) {
   if (idx < 0 || idx >= termTabs.length) return;
   const tab = termTabs[idx];
+  // Cancel the pending finishInit timer: firing after dispose() would touch a dead Terminal.
+  if (tab._initTimer) { clearTimeout(tab._initTimer); tab._initTimer = null; }
   if (tab.backendId != null) backend.termClose(tab.backendId);
   tab.term.dispose();
   termResizeObserver.unobserve(tab.container);

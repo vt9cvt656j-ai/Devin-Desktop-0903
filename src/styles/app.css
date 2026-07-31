@@ -129,9 +129,11 @@ img.ic {
   -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-bottom: 1px solid var(--line);
 }
-/* macOS native overlay: keep clear of the traffic-light buttons */
+/* macOS native overlay: keep clear of the traffic-light buttons.
+   红绿灯是原生控件不随 setZoom/CSS zoom 缩放，留位用 --ui-zoom 反向补偿：
+   缩小时菜单不压红绿灯，放大时菜单左移填充多余空白。 */
 body.is-tauri.is-mac .titlebar {
-  padding-left: 84px;
+  padding-left: calc(84px / var(--ui-zoom, 1));
 }
 /* Fullscreen hides the traffic lights, so slide the logo + menus back left —
    but keep a touch more breathing room than the plain 12px edge padding. */
@@ -4654,6 +4656,11 @@ body.zen-mode .editor {
   flex-direction: column;
   gap: 16px;
   user-select: text;
+  /* 流式流畅滚动：关掉浏览器默认的滚动锦定——流式每 ~90ms 重渲 markdown 段落会变
+     高，默认 overflow-anchor:auto 会为“保持锚点可见”反复回拉 scrollTop，造成向上滑看内容时被
+     拽回、钉底时与自动跟随打架。改为我们自己控制滚动（_chatFollow rAF 合帧）。 */
+  overflow-anchor: none;
+  overscroll-behavior: contain;
 }
 /* Keep every chat element within the panel width so nothing overflows and gets
    clipped on the right: containers can shrink (min-width:0), long inline code /
@@ -4735,7 +4742,8 @@ body.zen-mode .editor {
    关键：估值必须接近中位数，避免首滚抖动和锚定跳跃。 */
 .msg { content-visibility: auto; contain-intrinsic-size: auto 420px; }
 .agent-tool-step, .think-card { content-visibility: auto; contain-intrinsic-size: auto 300px; }
-/* 流式中的消息及其容器禁用 content-visibility，避免高度持续变化与滚动锚定打架 */
+/* 流式中的消息仍保持 content-visibility: auto（视口内本就正常渲染），但把估高提到 800px：
+   流式高度持续增长，估值偏小会在用户上滑时与滚动锚定打架、滚动条跳动 */
 .msg.is-streaming, .chat-session-container.is-streaming > .msg { content-visibility: auto; contain-intrinsic-size: auto 800px; }
 .agent-tool-row { min-width: 0; max-width: 100%; overflow: hidden; }
 .agent-tool-row > * { min-width: 0; }
