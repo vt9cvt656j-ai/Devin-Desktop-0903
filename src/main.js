@@ -36212,6 +36212,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     // 编排结果先过硬性合理性检查：收敛列表（不 reject），notes 拼进下方 nudge 让主模型知情
     const orchCheck = _validateToolOrchestration(decision.tools, run._toolRegistry, run.engineering);
     let routeToolNames = orchCheck.tools;
+    // 强制注入：当意图判定认为需要多角色协作时，确保子智能体工具在列表里——
+    // 不依赖编排器自觉返回它们（弱模型常不返回不熟悉的工具名）。
+    if (run.engineering?.orchestrationMode === "staged_roles" || run.engineering?.orchestrationMode === "parallel_roles") {
+      for (const t of ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"]) {
+        if (!routeToolNames.includes(t)) routeToolNames.push(t);
+      }
+    }
     
     // P1 helper: prioritize tools explicitly named in orchestration decision.
     // Extract names from both decision.tools (explicit selection) and decision.instruction text.
