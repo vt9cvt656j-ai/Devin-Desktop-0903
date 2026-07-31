@@ -25391,7 +25391,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "git_diff", description: "查看改动的 git diff（统一 diff 文本）。", parameters: { type: "object", properties: { path: { type: "string", description: "可选，只看这个文件的 diff" }, staged: { type: "boolean", description: "为 true 看已暂存的改动" } } } } },
     { type: "function", function: { name: "git_log", description: "查看最近的提交历史（短哈希、作者、时间、信息、所属分支/标签）。【何时用】查模块最近改了什么、找回归引入点、看 git_blame 命中提交的背景时用。", parameters: { type: "object", properties: { count: { type: "integer", description: "返回多少条，默认 20" } } } } },
     { type: "function", function: { name: "git_blame", description: "查看某文件每一行最后是被哪个提交、谁、何时改的（git blame）。排查「这行为什么是这样 / 什么时候引入的」很有用。【何时用】看到奇怪写法先查这行何时/被谁引入，再 git_log 看该提交 message——别凭空猜原因。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径（相对工作区根或绝对）" } }, required: ["path"] } } },
-    { type: "function", function: { name: "git_stash_list", description: "列出 git stash 堆栈里现有的暂存条目。", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "git_stash_list", description: "列出 git stash 堆栈里现有的暂存条目。【何时用】切分支前 stash 了改动、现在想找回或查看有哪些暂存时。【vs 替代】恢复最近暂存用 git_stash_pop。", parameters: { type: "object", properties: {} } } },
     { type: "function", function: { name: "git_conflicts", description: "列出当前有合并冲突（未解决）的文件。合并 / 变基 / 拉取后用它确认还剩哪些冲突要处理。", parameters: { type: "object", properties: {} } } },
     // ---- GitHub / CI / PR — wraps `gh` CLI -------------------------------
     { type: "function", function: { name: "gh_pr_create", description: "在当前 git 仓库**新开一个 GitHub Pull Request**（用 `gh pr create`）。", parameters: { type: "object", properties: { title: { type: "string", description: "PR 标题（动词开头，简洁一句）" }, body: { type: "string", description: "PR 描述，Markdown。建议含 ## Summary 和 ## Test plan" }, base: { type: "string", description: "目标分支，默认 main/master" }, draft: { type: "boolean", description: "true=草稿 PR" } }, required: ["title", "body"] } } },
@@ -25400,9 +25400,9 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "gh_actions_log", description: "读取一次 GitHub Actions 运行的**完整日志**——CI 挂了不知道为啥时调它。", parameters: { type: "object", properties: { run_id: { type: "string", description: "Actions run id；省略则取最近一次失败 run" }, job: { type: "string", description: "可选，只看某个 job 名" } } } } },
     { type: "function", function: { name: "gh_pr_review_comments", description: "拉取一个 PR 的 review 评论列表（含 reviewer 名、文件:行、评论原文）。回复前先读评论原文。", parameters: { type: "object", properties: { number: { type: "integer", description: "PR 编号" } }, required: ["number"] } } },
     { type: "function", function: { name: "gh_pr_reply", description: "在一个 PR 上发表回复评论（普通 issue 评论，不是行级 review）。", parameters: { type: "object", properties: { number: { type: "integer", description: "PR 编号" }, body: { type: "string", description: "评论内容，Markdown" } }, required: ["number", "body"] } } },
-    { type: "function", function: { name: "read_terminal", description: "读取一个由 run_in_terminal 启动的持续任务终端的**最新输出**和运行状态（运行中 / 已退出）。", parameters: { type: "object", properties: { name: { type: "string", description: "终端 / 任务名（run_in_terminal 起的 name）；省略则取最近一个" } } } } },
-    { type: "function", function: { name: "list_terminals", description: "列出当前所有由 run_in_terminal 启动的任务终端及其状态（运行中 / 已退出）。", parameters: { type: "object", properties: {} } } },
-    { type: "function", function: { name: "lsp_symbols", description: "列出一个文件的代码结构大纲——靠语言服务(LSP / Monaco TS)解析出函数/类/方法/变量等符号及其行号。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径" } }, required: ["path"] } } },
+    { type: "function", function: { name: "read_terminal", description: "读取一个由 run_in_terminal 启动的持续任务终端的**最新输出**和运行状态（运行中 / 已退出）。【何时用】启动 dev server / watch 等持续任务后，需要看日志输出、确认是否 ready、检查退出状态时。【vs 替代】一次性命令用 run_cmd 直接拿结果；看历史日志用 read_logs。【何时不用】命令还没跑完想看实时流时用 background_monitor 等条件。", parameters: { type: "object", properties: { name: { type: "string", description: "终端 / 任务名（run_in_terminal 起的 name）；省略则取最近一个" } } } } },
+    { type: "function", function: { name: "list_terminals", description: "列出当前所有由 run_in_terminal 启动的任务终端及其状态（运行中 / 已退出）。【何时用】不确定有哪些后台任务在跑、需要查看各任务状态时。【vs 替代】已知终端名直接 read_terminal 拿输出。", parameters: { type: "object", properties: {} } } },
+    { type: "function", function: { name: "lsp_symbols", description: "列出一个文件的代码结构大纲——靠语言服务(LSP / Monaco TS)解析出函数/类/方法/变量等符号及其行号。【何时用】快速了解一个文件有哪些导出/函数/类、定位符号大致位置时。【vs 替代】精确找符号定义用 find_symbol；看符号被谁调用用 lsp_references。【何时不用】已经知道要找什么符号时直接用 find_symbol 更快。", parameters: { type: "object", properties: { path: { type: "string", description: "文件路径" } }, required: ["path"] } } },
     { type: "function", function: { name: "find_symbol", description: "**跨全工程查符号**——按名字找一个函数 / 类 / 接口 / 类型 / 常量在项目里的所有定义位置（文件:行）。【何时用】要找某符号的定义位置时——比 grep 全文快且准；查它被谁调用则用 lsp_references。", parameters: { type: "object", properties: { name: { type: "string", description: "符号名（精确匹配；不区分大小写）" }, kind: { type: "string", description: "可选，按符号类型过滤：function / class / interface / type / enum / cons…" }, limit: { type: "integer", description: "最多返回多少个结果（默认 20）" } }, required: ["name"] } } },
     { type: "function", function: { name: "semantic_search", description: "**按语义找代码**——不是 grep 精确匹配，而是按一句自然语言描述「找出做这件事的代码」。【何时用】初探陌生代码库、或只能描述功能说不出关键词时首选——比逐个 read/grep 猜关键词快得多。", parameters: { type: "object", properties: { query: { type: "string", description: "自然语言描述要找的代码功能（中英文都行；越具体越好）" }, top_k: { type: "integer", description: "返回最相关的几个代码块（默认 10，上限 30）" } }, required: ["query"] } } },
     { type: "function", function: { name: "knowledge_search", description: "**查平台内置的「专业知识库」**——各专业领域（前端 React/Next、后端 API 设计、数据库 schema/…", parameters: { type: "object", properties: { query: { type: "string", description: "你要做的事 / 想确认的最佳实践（中英文都行），如「数据库索引怎么建」「jwt vs session 怎么选」「NSIS…" }, domain: { type: "string", description: "可选，限定领域：web-frontend / backend-api / database / security / u…" }, top_k: { type: "integer", description: "返回几段（默认 6，上限 20）" } }, required: ["query"] } } },
@@ -25418,22 +25418,22 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "本轮已确认的精确文件路径；相对路径固定基于本次任务的工作区根" }, content: { type: "string", minLength: 1, description: "要写入的完整非空 UTF-8 文件内容，不能省略或用占位内容" } }, required: ["path", "content"], additionalProperties: false } } },
       { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条会结束的短命令并返回退出码/输出（装依赖、跑测试、构建、git 等）。不要用它前台启动 dev server/watch/监听/REPL 这类持续任务；持续任务必须用 run_in_terminal，随后 read_logs/read_terminal 看日志，必要时 background_monitor 等端口/URL/文件 ready。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
       { type: "function", function: { name: "deploy_site", description: "**一键把做好的网站部署上线**——自动 npm run build + 上传服务器 + **自动分配一个 HTTPS 二级域名 `名字.michaelide.xyz`**（泛解析 + 泛域名证书早已配好，用户完全无需手动配 DNS / 去域名控制台加 A 记录），返回可直接访问分享的网址（形如 https://my-portfolio.michaelide.xyz/）。**用户说「绑定/解析个二级域名、自定义域名、上线分享」时就直接用这个工具——二级域名是全自动的，别再反问用户域名是什么、也别让他去域名后台手动加记录。** 做完官网想让用户真能打开分享时用（idea→设计→建站→上线 闭环最后一步）。", parameters: { type: "object", properties: { name: { type: "string", description: "站点名（短 slug，做 URL 路径，如 mrday / my-portfolio）" } }, required: ["name"] } } },
-      { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。用于清理、重构。务必只删确实该删的，删前最好先确认路径存在。", parameters: { type: "object", properties: { path: { type: "string", description: "要删除的文件或目录路径" } }, required: ["path"] } } },
-      { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。重构、改名时用。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
+      { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。【何时用】清理废弃文件、重构移除旧模块时。【vs 替代】改名/移动用 move_path。【注意】务必确认路径存在且确实该删；不可逆操作。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要删除的文件或目录路径" } }, required: ["path"] } } },
+      { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。【何时用】重构改名、调整目录结构时。【vs 替代】保留原件用 copy_path。【注意】目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", minLength: 1, description: "源路径" }, to: { type: "string", minLength: 1, description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "git_commit", description: "提交改动。默认先把所有改动加入暂存区(相当于 git add -A)再提交；传 all=false 则只提交已暂存的。", parameters: { type: "object", properties: { message: { type: "string", description: "提交信息" }, all: { type: "boolean", description: "是否先暂存全部改动，默认 true" } }, required: ["message"] } } },
       { type: "function", function: { name: "git_branch", description: "分支操作：不传 name 则列出所有分支并标出当前分支；传 name 切换到该分支，create=true 时新建并切换。", parameters: { type: "object", properties: { name: { type: "string", description: "要切换/新建的分支名；省略则列出分支" }, create: { type: "boolean", description: "为 true 时新建分支再切换" } } } } },
       { type: "function", function: { name: "git_push", description: "把当前分支推送到已配置 upstream；首次推送自动选择 origin 或唯一远端并建立 tracking。无凭据时快速失败而非卡住。涉及对外发布，只在用户要求时使用。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_clone", description: "用本机真实 Git 把仓库克隆到一个尚不存在的绝对目录。只支持完整 http(s)/ssh/git/file URL、受限 SCP 风格 SSH 地址或已有的绝对本地路径；不会弹交互式凭据提示。", parameters: { type: "object", properties: { source: { type: "string", description: "仓库 URL、SSH 地址或绝对本地仓库路径" }, target: { type: "string", description: "要创建的绝对目标目录；该路径必须尚不存在" } }, required: ["source", "target"] } } },
       { type: "function", function: { name: "git_pull", description: "从远程拉取并合并当前分支。", parameters: { type: "object", properties: {} } } },
-      { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。注意：write_file 写文件时父目录会自动创建，所以一般只在确实需要空目录时才用。", parameters: { type: "object", properties: { path: { type: "string", description: "要创建的目录路径" } }, required: ["path"] } } },
-      { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。用于按模板搭脚手架、备份。目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", description: "源路径" }, to: { type: "string", description: "目标路径" } }, required: ["from", "to"] } } },
-      { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。", parameters: { type: "object", properties: { path: { type: "string", description: "要格式化的文件" } }, required: ["path"] } } },
+      { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。【何时用】确实需要创建空目录时。【vs 替代】write_file 写文件时父目录会自动创建，所以一般不需要手动建。【何时不用】如果接下来要往目录里写文件，直接 write_file 即可，不必先 create_dir。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要创建的目录路径" } }, required: ["path"] } } },
+      { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。【何时用】按模板搭脚手架、备份文件时。【vs 替代】改名/移动用 move_path。【注意】目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", minLength: 1, description: "源路径" }, to: { type: "string", minLength: 1, description: "目标路径" } }, required: ["from", "to"] } } },
+      { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。【何时用】改完代码想统一格式风格时。【vs 替代】局部格式调整直接 edit_file。【注意】仅支持有 LSP 的语言（TS/JS 等）。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要格式化的文件" } }, required: ["path"] } } },
       { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程、监听服务等）。启动后不要猜：用 read_logs/read_terminal 读取日志/URL/退出状态；要等 ready 就再用 background_monitor(check_type:\"port\"/\"url\"/\"file\"/\"command\") 挂后台自动轮询。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "**有头/可见且 sticky 复用的交互式浏览器自动化**：登录、多步表单、点击、上传、验证码前后、E2E/UI 行为验证用它。默认流程：navigate(fresh=true) → check → nodes → batch 连续点击/输入/等待 → assert/check 验证；复杂页面优先 batch，它会用真实 pointer/mouse 事件、hover、drag/slide/swipe、wheel、遮挡检测、React/Vue 原生 value setter、动作后 DOM/URL settle，不要慢吞吞每步截图。只有最终视觉验收或肉眼排版问题才 screenshot。抓真实接口先 capture_start(mode:\"isolated_browser\") 再 browser navigate(fresh:true)。**⚠️读源码/文件一律 read_file，抓纯数据优先 http_request/脚本，不要用浏览器一页页抄。**", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。连续/复杂操作优先用 batch；表单登录优先 autofill；screenshot 只用于最终视觉验收/排版肉眼检查。测手机端用 viewport 切换视口（width/height/mobile），不要给 screenshot 传宽高。" }, url: { type: "string", description: "navigate 用：要打开的网址。省略时若有 dev server 在跑会自动用其 URL" }, width: { type: "integer", description: "viewport 用：视口宽 px（如桌面 1440、手机 390）" }, height: { type: "integer", description: "viewport 用：视口高 px（如桌面 900、手机 844）" }, mobile: { type: "boolean", description: "viewport 用：true=移动端模拟（触摸/UA/DPR）" }, device_scale_factor: { type: "number", description: "viewport 用：设备像素比，手机常用 2-3" }, fresh: { type: "boolean", description: "navigate 用：true=隔离语义；同任务同源会自动保留并复用当前浏览器，不会动不动关窗口。" }, mode: { type: "string", enum: ["headed", "isolated"], description: "可选语义提示：headed=有头交互（默认）；isolated=请配合 fresh=true 做隔离会话。真正无头静态渲染请用 screenshot。" }, force: { type: "boolean", description: "close 用：只有 force:true 才真正关闭浏览器；默认 close 只是释放占用并保持 sticky 复用。" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, fields: { type: "object", description: "autofill/fill 用：语义字段表，如 {\"email\":\"a@b.com\",\"password\":\"secret\",\"username\":\"michael\"}，会按 label/placeholder/name/autocomplete 匹配并返回 invalid/missing。" }, submit: { type: "boolean", description: "autofill 用：填完后是否尝试提交表单" }, submitText: { type: "string", description: "autofill 提交按钮文字，如 登录/保存/Continue" }, steps: { type: "array", description: "batch 用：连续执行步骤数组，每项 {op,node/index/selector/target/role,text/value/option,key,amount,dx,dy,x,y,toX,toY,percent,duration,checked,ms}。op 支持 click/tap、hover、type/fill/input、select/choose、toggle/check/uncheck、drag、slide(滑块，percent/value)、swipe、wheel、press、scroll、wait。先 nodes 拿 node 编号最稳；也可 target:\"保存\" 按可访问名称/文字语义定位。batch 会一次执行多步、检测遮挡、等待变化并返回失败原因。只有 navigate/upload 这类换页/文件操作才拆开。", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器；支持 :has-text()/text= 的解析。" }, target: { type: "string", description: "click/type/wait 用(语义备选)：目标可见文字、aria-label、placeholder、label、name，例如 保存、Email、搜索。" }, role: { type: "string", description: "click/type/wait 用(语义备选)：目标角色提示，如 button/textbox/link/tab/slider/switch/checkbox。" }, text: { type: "string", description: "type 用：要输入的文本；click/wait 可作为目标文字；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll/wheel 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector/target 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
-      { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
+      { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。【何时用】后台任务不再需要、或端口冲突需要杀掉旧进程时。【vs 替代】只是看输出用 read_terminal。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
       { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。公网 API 不要凭感觉拼 /api、/v1、appapi 路径；先用官方文档/页面源码/抓包/用户给的精确 URL 取证，localhost/dev server/已取证 URL 可直接请求。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE；不传默认 GET" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["url"] } } },
       { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST；不传默认 GET" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["url"] } } },
       { type: "function", function: { name: "academic_search", description: "**搜索学术论文**（Semantic Scholar，覆盖 arXiv / PubMed / ACL 等）。返回标题、作者、年份、引用量、摘要、链接。用于查最新研究、算法、AI/ML 论文。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 'transformer attention mechanism' 或 'large language model agent'" }, max_results: { type: "integer", description: "返回数量，默认 8，最大 20" } }, required: ["query"] } } },
@@ -26605,11 +26605,11 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "remember": return { type: "memory", path: (args.scope === "global" ? "全局记忆" : "项目记忆"), content: args.content || "", scope: args.scope === "global" ? "global" : "project" };
     case "recall_conversation": return { type: "recall", query: args.query || args.q || args.keyword || "", limit: Number.isFinite(+args.max_results) ? Math.max(1, Math.min(20, +args.max_results)) : 6 };
     case "get_diagnostics": return { type: "diag", path: args.path || "" };
-    case "delete_path": return { type: "delete", path: args.path || "" };
-    case "move_path": return { type: "move", path: args.from || "", to: args.to || "" };
+    case "delete_path": { const _p = String(args.path || "").trim(); if (!_p) return { type: "delete", _error: "path 不能为空" }; return { type: "delete", path: _p }; }
+    case "move_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "move", _error: "from 不能为空" }; if (!_t) return { type: "move", _error: "to 不能为空" }; return { type: "move", path: _f, to: _t }; }
     case "git_status": return { type: "git", op: "status" };
     case "git_diff": return { type: "git", op: "diff", path: args.path || "", staged: !!args.staged };
-    case "git_log": return { type: "git", op: "log", count: args.count };
+    case "git_log": { const _c = Number.isFinite(+args.count) ? Math.max(1, Math.min(100, +args.count)) : 20; return { type: "git", op: "log", count: _c }; }
     case "git_commit": return { type: "git", op: "commit", message: args.message || "", all: args.all !== false };
     case "git_branch": return { type: "git", op: "branch", branch: args.name || "", create: !!args.create };
     case "git_push": return { type: "git", op: "push" };
@@ -26781,12 +26781,12 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "db_query": return { type: "db", driver: (args.driver || "").trim(), url: args.url || "", query: args.query || args.sql || args.command || "", limit: args.limit };
     case "screenshot": return { type: "screenshot", url: args.url || "", width: args.width, height: args.height, frames: Number.isFinite(+args.frames) ? Math.min(Math.max(+args.frames, 2), 5) : 0, durationMs: Number.isFinite(+args.duration_ms) ? +args.duration_ms : undefined };
     case "visual_compare": return { type: "vizcompare", design: args.design || args.design_path || args.target || args.image || "", url: args.url || "", width: args.width, height: args.height };
-    case "lsp_symbols": return { type: "lsp", op: "symbols", path: args.path || "" };
+    case "lsp_symbols": { const _p = String(args.path || "").trim(); if (!_p) return { type: "lsp", op: "symbols", _error: "path 不能为空" }; return { type: "lsp", op: "symbols", path: _p }; }
     case "lsp_definition": return { type: "lsp", op: "definition", path: args.path || "", line: args.line, symbol: args.symbol || "" };
     case "lsp_references": return { type: "lsp", op: "references", path: args.path || "", line: args.line, symbol: args.symbol || "" };
-    case "create_dir": return { type: "mkdir", path: args.path || "" };
-    case "copy_path": return { type: "copy", path: args.from || "", to: args.to || "" };
-    case "format_file": return { type: "format", path: args.path || "" };
+    case "create_dir": { const _p = String(args.path || "").trim(); if (!_p) return { type: "mkdir", _error: "path 不能为空" }; return { type: "mkdir", path: _p }; }
+    case "copy_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "copy", _error: "from 不能为空" }; if (!_t) return { type: "copy", _error: "to 不能为空" }; return { type: "copy", path: _f, to: _t }; }
+    case "format_file": { const _p = String(args.path || "").trim(); if (!_p) return { type: "format", _error: "path 不能为空" }; return { type: "format", path: _p }; }
     case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
     case "browser": {
       // Prefer the element ref (Set-of-Mark index) → a precise [data-mref] selector,
@@ -56688,8 +56688,8 @@ function _generateTestSkeleton(targets, framework, sourcePath) {
     testPath = isPy ? sourcePath.replace('.py', '_test.py') : `${dirName}/test_${baseName}.py`;
     lang = 'python';
     
-    testCode = '# Generated test file - Please review and fill in assertions\n\n';
-    testCode += '# TODO: Import actual functions/classes from the source file\n';
+    testCode = '# Generated test file — review and fill in assertions\n\n';
+    testCode += '# Import actual functions/classes from the source file:\n';
     testCode += `# from ${isPy ? '' : '../'}${baseName.replace('.py', '')} import *\n\n`;
     
     for (const target of targets) {
@@ -56697,43 +56697,43 @@ function _generateTestSkeleton(targets, framework, sourcePath) {
       if (target.kind === 'class') {
         testCode += `\nclass Test${target.name}:\n`;  
         testCode += `    """Test suite for ${target.name}"""\n`;
-        testCode += `    \n    # TODO: Implement setup methods if needed\n`;
+        testCode += `    \n    # Add setup methods if needed:\n`;
         testCode += `    # def setup_method(self, method):\n`;
         testCode += `    #     pass\n\n`;
-        testCode += `    # TODO: Write test cases below\n`;
+        testCode += `    # Write test cases below\n`;
         testCode += `    def test_${target.name}_normal_input(self):\n`;
         testCode += `        """Test case 1: Normal input"""\n`;
-        testCode += `        # TODO: Add normal test data and assertions\n`;
+        testCode += `        # Add normal test data and assertions\n`;
         testCode += `        # result = ${target.name}(normal_data)\n`;
         testCode += `        # assert result == expected\n`;
         testCode += `\n`;
         testCode += `    def test_${target.name}_boundary_input(self):\n`;
         testCode += `        """Test case 2: Boundary conditions"""\n`;
-        testCode += `        # TODO: Add boundary test data and assertions\n`;
+        testCode += `        # Add boundary test data and assertions\n`;
         testCode += `        # result = ${target.name}(boundary_data)\n`;
         testCode += `        # assert result == expected\n`;
         testCode += `\n`;
         testCode += `    def test_${target.name}_error_handling(self):\n`;
         testCode += `        """Test case 3: Error handling"""\n`;
-        testCode += `        # TODO: Add invalid input that should raise exceptions\n`;
+        testCode += `        # Add invalid input that should raise exceptions\n`;
         testCode += `        # with pytest.raises(SomeException):\n`;
         testCode += `        #     ${target.name}(invalid_data)\n`;
       } else {
         testCode += `\ndef test_${target.name}_normal_input():\n`;
         testCode += `    """Test case 1: Normal input"""\n`;
-        testCode += `    # TODO: Add normal test data and assertions\n`;
+        testCode += `    # Add normal test data and assertions\n`;
         testCode += `    # result = ${target.name}(normal_data)\n`;
         testCode += `    # assert result == expected\n`;
         testCode += `\n`;
         testCode += `def test_${target.name}_boundary_input():\n`;
         testCode += `    """Test case 2: Boundary conditions"""\n`;
-        testCode += `    # TODO: Add boundary test data and assertions\n`;
+        testCode += `    # Add boundary test data and assertions\n`;
         testCode += `    # result = ${target.name}(boundary_data)\n`;
         testCode += `    # assert result == expected\n`;
         testCode += `\n`;
         testCode += `def test_${target.name}_error_handling():\n`;
         testCode += `    """Test case 3: Error handling"""\n`;
-        testCode += `    # TODO: Add invalid input that should raise exceptions\n`;
+        testCode += `    # Add invalid input that should raise exceptions\n`;
         testCode += `    # with pytest.raises(SomeException):\n`;
         testCode += `    #     ${target.name}(invalid_data)\n`;
       }
@@ -56747,8 +56747,8 @@ function _generateTestSkeleton(targets, framework, sourcePath) {
     testPath = `${testDir}/${testName}.${sourcePath.split('.').pop()}`;
     lang = 'javascript';
     
-    testCode = `// Generated test file - Please review and fill in assertions\n\n`;
-    testCode += `// TODO: Import actual functions/constants/classes from the source file\n`;
+    testCode = `// Generated test file — review and fill in assertions\n\n`;
+    testCode += `// Import actual functions/constants/classes from the source file:\n`;
     testCode += `// const { ${targets.map(t => t.name).join(', ')} } = require('${isJs ? '../' : ''}${baseName.replace(/\.(js|ts|jsx|tsx)$/, '')}')\n\n`;
     
     for (const target of targets) {
@@ -56763,25 +56763,25 @@ function _generateTestSkeleton(targets, framework, sourcePath) {
         testCode += `  describe('${target.name} instance', () => {\n`;
         testCode += `    let instance;\n`;
         testCode += `    \n    beforeEach(() => {\n`;
-        testCode += `      // TODO: Create instance\n`;
+        testCode += `      // Create instance:\n`;
         testCode += `      // instance = new ${target.name}();\n`;
         testCode += `    });\n\n`;
       }
       
       testCode += `    it('should handle normal input correctly', () => {\n`;
-      testCode += `      // TODO: Add normal test data and assertions\n`;
+      testCode += `      // Add normal test data and assertions\n`;
       testCode += `      // const result = ${target.name}(normalData);\n`;
       testCode += `      // expect(result).toBe(expectedValue);\n`;
       testCode += `    });\n\n`;
       
       testCode += `    it('should handle boundary conditions properly', () => {\n`;
-      testCode += `      // TODO: Add boundary condition test data and assertions\n`;
+      testCode += `      // Add boundary condition test data and assertions\n`;
       testCode += `      // const result = ${target.name}(boundaryData);\n`;
       testCode += `      // expect(result).toBe(expectedValue);\n`;
       testCode += `    });\n\n`;
       
       testCode += `    it('should handle errors and edge cases appropriately', () => {\n`;
-      testCode += `      // TODO: Add error case testing with appropriate exceptions/assertions\n`;
+      testCode += `      // Add error case testing with appropriate exceptions/assertions\n`;
       testCode += `      // expect(() => ${target.name}(invalidData)).toThrow(Error);\n`;
       testCode += `    });\n\n`;
       

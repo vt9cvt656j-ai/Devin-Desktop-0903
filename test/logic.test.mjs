@@ -15899,3 +15899,72 @@ test("P1 Git/DB 工具 TOOL_METADATA 含 usage_note", () => {
     assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
   }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// P2 优化：Schema Description 标准化 + 边界条件 + TODO 清理
+// ════════════════════════════════════════════════════════════════════
+
+test("P2 剩余工具 Schema Description 含【何时用】", () => {
+  // 检查 main.js 中剩余工具的 schema description 已标准化
+  const tools = [
+    "read_terminal", "list_terminals", "stop_terminal",
+    "lsp_symbols", "git_stash_list",
+    "delete_path", "move_path", "copy_path", "create_dir", "format_file",
+  ];
+  for (const tool of tools) {
+    const pattern = new RegExp(`name:\\s*"${tool}"[\\s\\S]*?description:\\s*"[^"]*【何时用】`);
+    assert.match(SRC, pattern, `${tool} 的 schema description 必须含【何时用】`);
+  }
+});
+
+test("P2 TOOL_METADATA: 新增工具含 usage_note", () => {
+  const guideSrc = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
+  const tools = [
+    "read_terminal", "list_terminals", "stop_terminal",
+    "lsp_symbols", "lsp_definition", "lsp_references",
+    "recall_conversation", "remember",
+    "delete_path", "move_path", "copy_path", "create_dir", "format_file",
+  ];
+  for (const tool of tools) {
+    const pattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
+    assert.match(guideSrc, pattern, `${tool} 必须有 usage_note`);
+  }
+});
+
+test("P2 边界条件：delete_path/move_path/copy_path 空路径返回 _error", () => {
+  const mapSrc = extractFn("_mapToolCall");
+  // delete_path 空路径检查
+  assert.match(mapSrc, /case "delete_path":\s*\{[\s\S]*?_error.*path 不能为空/,
+    "delete_path 必须检查空 path");
+  // move_path 空 from/to 检查
+  assert.match(mapSrc, /case "move_path":\s*\{[\s\S]*?_error.*from 不能为空/,
+    "move_path 必须检查空 from");
+  assert.match(mapSrc, /case "move_path":\s*\{[\s\S]*?_error.*to 不能为空/,
+    "move_path 必须检查空 to");
+  // copy_path 空 from/to 检查
+  assert.match(mapSrc, /case "copy_path":\s*\{[\s\S]*?_error.*from 不能为空/,
+    "copy_path 必须检查空 from");
+  // create_dir 空路径检查
+  assert.match(mapSrc, /case "create_dir":\s*\{[\s\S]*?_error.*path 不能为空/,
+    "create_dir 必须检查空 path");
+  // format_file 空路径检查
+  assert.match(mapSrc, /case "format_file":\s*\{[\s\S]*?_error.*path 不能为空/,
+    "format_file 必须检查空 path");
+  // lsp_symbols 空路径检查
+  assert.match(mapSrc, /case "lsp_symbols":\s*\{[\s\S]*?_error.*path 不能为空/,
+    "lsp_symbols 必须检查空 path");
+});
+
+test("P2 边界条件：git_log count 钳位 1-100", () => {
+  const mapSrc = extractFn("_mapToolCall");
+  // git_log count 必须钳位
+  assert.match(mapSrc, /case "git_log":\s*\{[\s\S]*?Math\.max\(1,\s*Math\.min\(100/,
+    "git_log count 必须钳位到 [1, 100]");
+});
+
+test("P2 generate_test_cases 输出不含 TODO 注释", () => {
+  // 检查 generate_test_cases 生成的测试代码不含 TODO/FIXME
+  const fnSrc = extractFn("_generateTestSkeleton");
+  assert.doesNotMatch(fnSrc, /TODO:/, "生成的测试骨架不应含 TODO: 注释");
+  assert.doesNotMatch(fnSrc, /FIXME:/, "生成的测试骨架不应含 FIXME: 注释");
+});

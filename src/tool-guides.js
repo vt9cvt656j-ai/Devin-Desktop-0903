@@ -42,12 +42,109 @@ const TOOL_METADATA = Object.freeze({
     priority: 'high',
     usage_note: '【何时用】在代码库内搜索关键词、函数名、错误信息时。【vs 替代】联网搜索用 web_search；文件发现用 find_files。【何时不用】需要外部知识时用 web_search。'
   },
-  read_logs: {
-    category: 'diagnostics',
-    use_cases: ['查看应用日志', '排查生产环境 bug', '监控异常模式'],
-    triggers: ['日志文件存在', '需要追溯历史行为', '系统异常'],
-    example_call: "read_logs(path='logs/app.log', lines=200)",
-    priority: 'medium'
+  read_terminal: {
+    category: 'execution',
+    use_cases: ['查看 dev server 启动日志', '确认后台任务状态', '检查退出码/报错'],
+    triggers: ['启动了持续任务后需要看输出', '服务是否 ready', '进程是否退出'],
+    example_call: "read_terminal(name='dev-server')",
+    priority: 'high',
+    usage_note: '【何时用】启动 dev server/watch 等持续任务后看日志。【vs 替代】一次性命令用 run_cmd；看历史文件用 read_logs。'
+  },
+  list_terminals: {
+    category: 'execution',
+    use_cases: ['查看当前后台任务列表', '确认哪些终端在跑'],
+    triggers: ['不确定有哪些后台任务', '需要查看任务状态'],
+    example_call: "list_terminals()",
+    priority: 'medium',
+    usage_note: '【何时用】不确定有哪些后台任务在跑时。【vs 替代】已知终端名直接 read_terminal。'
+  },
+  stop_terminal: {
+    category: 'execution',
+    use_cases: ['停止不再需要的后台任务', '释放端口冲突'],
+    triggers: ['后台任务不再需要', '端口冲突需要杀旧进程'],
+    example_call: "stop_terminal(name='old-server')",
+    priority: 'medium',
+    usage_note: '【何时用】后台任务不再需要或端口冲突时。【vs 替代】只是看输出用 read_terminal。'
+  },
+  lsp_symbols: {
+    category: 'search',
+    use_cases: ['快速了解文件结构', '定位函数/类大致位置'],
+    triggers: ['打开陌生文件需要概览', '找导出/函数/类'],
+    example_call: "lsp_symbols(path='src/main.ts')",
+    priority: 'medium',
+    usage_note: '【何时用】快速了解文件结构大纲。【vs 替代】精确找符号用 find_symbol；查引用用 lsp_references。'
+  },
+  lsp_definition: {
+    category: 'search',
+    use_cases: ['跳到符号定义处', '读代码时跳进实现'],
+    triggers: ['需要看符号的实现', '读代码碰到陌生符号'],
+    example_call: "lsp_definition(path='src/main.ts', line=42, symbol='createSession')",
+    priority: 'medium',
+    usage_note: '【何时用】读代码需要跳到符号定义处。【vs 替代】不知位置先 find_symbol；查引用用 lsp_references。'
+  },
+  lsp_references: {
+    category: 'search',
+    use_cases: ['查看函数被谁调用', '评估改动影响面'],
+    triggers: ['重构前需要看影响范围', '想知道谁在用这个函数'],
+    example_call: "lsp_references(path='src/main.ts', line=42, symbol='createSession')",
+    priority: 'medium',
+    usage_note: '【何时用】看函数/变量被谁调用、评估改动影响面。【vs 替代】文本搜索用 search。'
+  },
+  recall_conversation: {
+    category: 'interaction',
+    use_cases: ['找回早期被压缩的对话原文', '恢复被遗忘的决定'],
+    triggers: ['上下文摘要提到但细节不详', '早期决定/报错需要原话'],
+    example_call: "recall_conversation(query='database decision')",
+    priority: 'medium',
+    usage_note: '【何时用】找回本会话早期被压缩掉的对话原文。【vs 替代】跨会话知识用 remember/知识库。'
+  },
+  remember: {
+    category: 'interaction',
+    use_cases: ['跨会话记住项目偏好', '沉淀通用经验'],
+    triggers: ['发现值得长期记住的知识', '用户明确要求记住'],
+    example_call: "remember(content='Use pnpm for this workspace')",
+    priority: 'medium',
+    usage_note: '【何时用】把值得跨会话记住的知识写入记忆图谱。【vs 替代】当前会话内的事用 recall_conversation。'
+  },
+  delete_path: {
+    category: 'file_io',
+    use_cases: ['清理废弃文件', '重构移除旧模块'],
+    triggers: ['需要删除文件/目录', '清理旧代码'],
+    example_call: "delete_path(path='dist/stale.js')",
+    priority: 'medium',
+    usage_note: '【何时用】清理废弃文件/目录。【vs 替代】移动/改名用 move_path。不可逆操作。'
+  },
+  move_path: {
+    category: 'file_io',
+    use_cases: ['文件/目录改名', '调整目录结构'],
+    triggers: ['重构需要移动文件', '目录结构调整'],
+    example_call: "move_path(from='src/old.ts', to='src/new.ts')",
+    priority: 'medium',
+    usage_note: '【何时用】移动或重命名文件/目录。【vs 替代】保留原件用 copy_path。'
+  },
+  copy_path: {
+    category: 'file_io',
+    use_cases: ['按模板搭脚手架', '备份文件'],
+    triggers: ['需要复制文件', '备份后修改'],
+    example_call: "copy_path(from='config.example.json', to='config.json')",
+    priority: 'medium',
+    usage_note: '【何时用】复制文件或目录。【vs 替代】移动/改名用 move_path。'
+  },
+  create_dir: {
+    category: 'file_io',
+    use_cases: ['创建空目录'],
+    triggers: ['需要创建目录结构'],
+    example_call: "create_dir(path='src/features/auth')",
+    priority: 'low',
+    usage_note: '【何时用】确实需要创建空目录。【注意】write_file 会自动创建父目录，一般不需要手动建。'
+  },
+  format_file: {
+    category: 'code_editing',
+    use_cases: ['统一代码格式', '格式化整个文件'],
+    triggers: ['改完代码想统一格式', '代码风格不一致'],
+    example_call: "format_file(path='src/app.ts')",
+    priority: 'low',
+    usage_note: '【何时用】改完代码想统一格式风格时。【vs 替代】局部调整直接 edit_file。仅支持有 LSP 的语言。'
   },
   
   // 性能分析类工具
