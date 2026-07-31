@@ -30978,29 +30978,47 @@ async function _agentFindFiles(root, pattern) {
   if (!pat) return { count: 0, text: "[ERROR] 空 pattern。" };
   let rx;
   try { rx = _globToRegExp(pat); } catch { return { count: 0, text: "[ERROR] 无效 pattern。" }; }
-  const IGNORED = new Set([".git", "node_modules", "target", "dist", "build", ".next", ".venv", "__pycache__", ".cache", "vendor"]);
+  // 排除集合：只跳过真正的构建/依赖目录，不过激过滤 dotfiles
+  const IGNORED = new Set([
+    "node_modules", ".git", "__pycache__", ".next", "dist", "build",
+    "target", ".venv", "venv", "vendor", ".download-venv",
+    ".cache", ".turbo", ".vite", "coverage", ".nuxt", ".svelte-kit",
+    ".idea", ".vscode",
+  ]);
   const out = [];
+  const errors = [];
   const MAX = 200, MAX_SCAN = 8000;
   let scanned = 0;
   const stack = [{ dir: root, rel: "" }];
   while (stack.length && out.length < MAX && scanned < MAX_SCAN) {
     const { dir, rel } = stack.pop();
     let entries = [];
-    try { entries = await backend.readDir(dir); } catch { continue; }
+    try { entries = await backend.readDir(dir); } catch (err) {
+      errors.push(`[ERROR] 无法读取目录 ${rel || root}: ${err?.message || err}`);
+      continue;
+    }
     for (const e of entries) {
       if (out.length >= MAX) break;
       scanned++;
-      const name = e.name;
-      if (!name || name.startsWith(".")) continue;
-      const childRel = rel ? rel + "/" + name : name;
-      if (e.is_dir) {
-        if (!IGNORED.has(name)) stack.push({ dir: dir + "/" + name, rel: childRel });
-      } else if (rx.test(childRel)) {
-        out.push(childRel);
+      const name = _agentDirEntryName(e);
+      if (!name || name === "." || name === "..") continue;
+      const isDir = _agentDirEntryIsDir(e);
+      // 目录：用 IGNORED 集合排除构建/依赖目录
+      if (isDir) {
+        if (!IGNORED.has(name)) {
+          const childRel = rel ? rel + "/" + name : name;
+          const childAbs = e.path ? String(e.path) : dir + "/" + name;
+          stack.push({ dir: childAbs, rel: childRel });
+        }
+        continue;
       }
+      // 文件：glob 匹配（dotfiles 不再被过滤）
+      const childRel = rel ? rel + "/" + name : name;
+      if (rx.test(childRel)) out.push(childRel);
     }
   }
   out.sort();
+  if (errors.length) out.push("", ...errors);
   const text = out.length ? out.join("\n") + (out.length >= MAX ? "\n…(更多结果已截断)" : "") : "(无匹配文件)";
   return { count: out.length, text, files: out };
 }

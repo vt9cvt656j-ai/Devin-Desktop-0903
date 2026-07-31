@@ -9,7 +9,7 @@
 // Run:  node --test   (from ide/, or `npm test`)
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as acorn from "acorn";
@@ -15224,4 +15224,246 @@ test("#79 门控不碰 system 静态前缀", () => {
   // 确认门控不注入 system prompt
   const sysPromptIdx = SRC.indexOf("_AI_MODE_PROMPTS");
   assert.ok(gateIdx > sysPromptIdx || sysPromptIdx === -1, "门控不应在 system prompt 区域");
+});
+
+// ==================== find_files 重写验证：三重缺陷修复 ====================
+
+const _GLOB_TO_RX = load("_globToRegExp");
+const _DIR_ENTRY_NAME = load("_agentDirEntryName", { basename });
+const _DIR_ENTRY_IS_DIR = load("_agentDirEntryIsDir");
+
+test("_globToRegExp: *.yml 匹配各层级的 .yml 文件", () => {
+  const rx = _GLOB_TO_RX("*.yml");
+  assert.ok(rx.test("config.yml"));
+  assert.ok(rx.test("src/config.yml"));
+  assert.ok(rx.test("a/b/c.yml"));
+  assert.ok(!rx.test("config.yaml"));
+  assert.ok(!rx.test("config.txt"));
+});
+
+test("_globToRegExp: *.config.* 匹配多段扩展名", () => {
+  const rx = _GLOB_TO_RX("*.config.*");
+  assert.ok(rx.test("vite.config.js"));
+  assert.ok(rx.test("src/webpack.config.ts"));
+  assert.ok(!rx.test("config.js"));
+});
+
+test("_globToRegExp: README* 匹配 README 开头文件", () => {
+  const rx = _GLOB_TO_RX("README*");
+  assert.ok(rx.test("README.md"));
+  assert.ok(rx.test("README"));
+  assert.ok(rx.test("docs/README.txt"));
+  // flag i 所以大小写不敏感
+  assert.ok(rx.test("readme_lower.md"));
+});
+
+test("_globToRegExp: 纯文本子串匹配", () => {
+  const rx = _GLOB_TO_RX("main");
+  assert.ok(rx.test("main.js"));
+  assert.ok(rx.test("src/main.ts"));
+  assert.ok(!rx.test("index.html"));
+});
+
+test("_agentDirEntryIsDir: 兼容 is_dir/isDir/kind/type 四种字段", () => {
+  assert.ok(_DIR_ENTRY_IS_DIR({ is_dir: true }));
+  assert.ok(_DIR_ENTRY_IS_DIR({ isDir: true }));
+  assert.ok(_DIR_ENTRY_IS_DIR({ kind: "dir" }));
+  assert.ok(_DIR_ENTRY_IS_DIR({ type: "dir" }));
+  assert.ok(!_DIR_ENTRY_IS_DIR({ is_dir: false }));
+  assert.ok(!_DIR_ENTRY_IS_DIR({}));
+  assert.ok(!_DIR_ENTRY_IS_DIR(null));
+});
+
+test("_agentDirEntryName: 兼容 name/path 字段", () => {
+  assert.equal(_DIR_ENTRY_NAME({ name: "foo.txt" }), "foo.txt");
+  assert.equal(_DIR_ENTRY_NAME({ path: "/a/b/bar.ts" }), "bar.ts");
+  assert.equal(_DIR_ENTRY_NAME({ name: "  x.js  " }), "x.js");
+});
+
+test("find_files 重写: dotfiles 不被过滤（.env/.eslintrc/.gitignore）", async () => {
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: ".env", is_dir: false },
+        { name: ".eslintrc.json", is_dir: false },
+        { name: ".gitignore", is_dir: false },
+        { name: "index.js", is_dir: false },
+        { name: "src", is_dir: true },
+      ];
+      return [];
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*");
+  // 应该能找到 dotfiles（不再被 startsWith(".") 过滤）
+  assert.ok(r.files.some(f => f === ".env"), ".env 应被找到");
+  assert.ok(r.files.some(f => f === ".eslintrc.json"), ".eslintrc.json 应被找到");
+  assert.ok(r.files.some(f => f === ".gitignore"), ".gitignore 应被找到");
+  assert.ok(r.files.some(f => f === "index.js"), "index.js 应被找到");
+});
+
+test("find_files 重写: 隐藏目录（.github/.claude）被遍历", async () => {
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: ".github", is_dir: true },
+        { name: ".claude", is_dir: true },
+        { name: "src", is_dir: true },
+        { name: "README.md", is_dir: false },
+      ];
+      if (dir === "/work/.github") return [
+        { name: "workflows.yml", is_dir: false },
+      ];
+      if (dir === "/work/.claude") return [
+        { name: "settings.json", is_dir: false },
+      ];
+      if (dir === "/work/src") return [
+        { name: "main.js", is_dir: false },
+      ];
+      return [];
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  // 搜 *.yml 应能找到 .github/ 下的文件
+  const rYml = await findFiles("/work", "*.yml");
+  assert.ok(rYml.files.some(f => f.includes("workflows.yml")), ".github/workflows.yml 应被找到");
+
+  // 搜 *.json 应能找到 .claude/ 下的文件
+  const rJson = await findFiles("/work", "*.json");
+  assert.ok(rJson.files.some(f => f.includes("settings.json")), ".claude/settings.json 应被找到");
+});
+
+test("find_files 重写: readDir 失败返回错误信息而非静默跳过", async () => {
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: "src", is_dir: true },
+      ];
+      throw new Error("权限不足");
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*.js");
+  // 错误信息应出现在结果中
+  assert.ok(r.text.includes("[ERROR]"), "应包含错误标记");
+  assert.ok(r.text.includes("权限不足"), "应包含具体错误信息");
+});
+
+test("find_files 重写: IGNORED 目录被跳过（node_modules/.git/__pycache__ 等）", async () => {
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: "node_modules", is_dir: true },
+        { name: ".git", is_dir: true },
+        { name: "__pycache__", is_dir: true },
+        { name: ".download-venv", is_dir: true },
+        { name: "src", is_dir: true },
+      ];
+      if (dir === "/work/node_modules") return [{ name: "pkg.js", is_dir: false }];
+      if (dir === "/work/.git") return [{ name: "HEAD", is_dir: false }];
+      if (dir === "/work/src") return [{ name: "app.js", is_dir: false }];
+      return [];
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*.js");
+  // 只应找到 src/app.js，不应进入 node_modules
+  assert.ok(r.files.some(f => f === "src/app.js"), "src/app.js 应被找到");
+  assert.ok(!r.files.some(f => f.includes("pkg.js")), "node_modules/pkg.js 不应被找到");
+  assert.ok(!r.files.some(f => f.includes("HEAD")), ".git/HEAD 不应被找到");
+});
+
+test("find_files 重写: 用 _agentDirEntryIsDir 兼容 isDir 字段（remote 模式）", async () => {
+  // 模拟 remote daemon 返回 isDir 而非 is_dir
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: "src", isDir: true },
+        { name: "index.js", isDir: false },
+      ];
+      if (dir === "/work/src") return [
+        { name: "main.js", isDir: false },
+      ];
+      return [];
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*.js");
+  assert.ok(r.files.some(f => f === "src/main.js"), "remote 模式下子目录文件应被找到");
+  assert.ok(r.files.some(f => f === "index.js"), "根目录文件应被找到");
+});
+
+test("find_files 重写: entry.path 优先用于路径拼接", async () => {
+  const mockBackend = {
+    async readDir(dir) {
+      if (dir === "/work") return [
+        { name: "sub", is_dir: true, path: "/work/sub" },
+      ];
+      if (dir === "/work/sub") return [
+        { name: "file.txt", is_dir: false, path: "/work/sub/file.txt" },
+      ];
+      return [];
+    },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*.txt");
+  assert.ok(r.files.includes("sub/file.txt"), "应使用 entry.path 正确拼接");
+});
+
+test("find_files 重写: 空 pattern / 无工作区 返回错误", async () => {
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: { async readDir() { return []; } },
+  });
+  const r1 = await findFiles("", "*.js");
+  assert.ok(r1.text.includes("未打开工作区"));
+  const r2 = await findFiles("/work", "");
+  assert.ok(r2.text.includes("空 pattern"));
+});
+
+test("find_files 重写: 无匹配时返回 (无匹配文件) 而非错误", async () => {
+  const mockBackend = {
+    async readDir() { return [{ name: "a.js", is_dir: false }]; },
+  };
+  const findFiles = load("_agentFindFiles", {
+    _globToRegExp: _GLOB_TO_RX,
+    _agentDirEntryName: _DIR_ENTRY_NAME,
+    _agentDirEntryIsDir: _DIR_ENTRY_IS_DIR,
+    backend: mockBackend,
+  });
+  const r = await findFiles("/work", "*.xyz");
+  assert.equal(r.count, 0);
+  assert.equal(r.text, "(无匹配文件)");
 });
