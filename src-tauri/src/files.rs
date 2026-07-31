@@ -421,13 +421,32 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+/// Translate a raw IO error into a friendly, actionable message instead of
+/// leaking `os error N` straight to the UI (see PATH_RESOLUTION_DIAGNOSIS.md).
+fn friendly_read_error(path: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "文件不存在：{}（请先用 list_dir/find_files 确认真实路径，注意不要臆造子目录或把文件名翻译成英文）",
+            path
+        ),
+        std::io::ErrorKind::PermissionDenied => format!("没有读取权限：{}", path),
+        std::io::ErrorKind::IsADirectory => {
+            format!("{} 是目录不是文件，请用 read_dir 查看其内容", path)
+        }
+        std::io::ErrorKind::NotADirectory => format!(
+            "路径中间有一段不是目录：{}（可能把某个文件当成了目录）",
+            path
+        ),
+        kind => format!("读取失败：{}（{}）", path, kind),
+    }
+}
+
 /// Read a UTF-8 text file. Rejects directories, oversized and binary files so
 /// the editor never tries to render garbage.
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
     let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!(
             "'{}' is a directory, not a file. Use read_dir to list its contents.",
@@ -437,7 +456,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
     }
-    let bytes = std::fs::read(&resolved).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let bytes = std::fs::read(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot open a binary file in the editor".into());
     }
@@ -464,8 +483,7 @@ pub fn read_log_tail(
         path
     };
     let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a log file.", path));
     }
@@ -493,12 +511,12 @@ pub fn read_log_tail(
     let file_len = meta.len();
     let start = file_len.saturating_sub(byte_limit);
     let mut file =
-        std::fs::File::open(&resolved).map_err(|e| format!("cannot open '{}': {}", path, e))?;
+        std::fs::File::open(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::with_capacity((file_len - start).min(byte_limit) as usize);
     file.read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read '{}': {}", path, e))?;
+        .map_err(|e| friendly_read_error(&path, &e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot read log tail: file appears to be binary".into());
     }
@@ -554,7 +572,7 @@ fn data_url_mime(path: &Path) -> &'static str {
 #[tauri::command]
 pub fn read_file_data_url(path: String) -> Result<String, String> {
     require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a file.", path));
     }
@@ -564,7 +582,7 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
             meta.len()
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let bytes = std::fs::read(&path).map_err(|e| friendly_read_error(&path, &e))?;
     let mime = data_url_mime(std::path::Path::new(&path));
     Ok(format!(
         "data:{};base64,{}",
@@ -675,12 +693,12 @@ fn file_name(path: &Path) -> String {
 }
 
 fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| friendly_read_error(&path.display().to_string(), &e))?;
     let mut bytes = vec![0u8; len];
     let n = file
         .read(&mut bytes)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+        .map_err(|e| friendly_read_error(&path.display().to_string(), &e))?;
     bytes.truncate(n);
     Ok(bytes)
 }
@@ -1177,8 +1195,7 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
 #[tauri::command]
 pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspection, String> {
     let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a file.", path));
     }
@@ -1278,7 +1295,7 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
 #[tauri::command]
 pub fn read_document(path: String) -> Result<String, String> {
     require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory", path));
     }
