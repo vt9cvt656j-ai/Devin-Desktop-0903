@@ -15079,3 +15079,58 @@ test("#76 lightweight guidance: one-shot per run, appended to error content", ()
     "should include the guidance text");
   assert.match(SRC, /run\._pathNotFoundGuided = true/, "should set the flag after first trigger");
 });
+
+// ==================== ANTI-HALLUCINATION Protocol-C 变体：结论前须先摸清项目结构 ====================
+// 痛点：AI 只读了 3 个文件就敢输出完整项目总结，没先 list_dir 摸清真实结构。
+// _structureReadinessHint 是纯函数事实门：没 list_dir/find_files + 读文件少 + 正下项目结论 → 一次性软提示。
+const STRUCTURE_READINESS_HINT = load("_structureReadinessHint", { _STRUCTURE_READINESS_FILE_THRESHOLD: 5 });
+
+test("#77 结构就绪提示：未 list_dir 就下项目结论 → 触发", () => {
+  // 只读了 3 个文件、没 list_dir/find_files → 触发软提示
+  const hint = STRUCTURE_READINESS_HINT(["逆向分析报告.md", "README.md", "app_web_entry.py"], "这个项目是干嘛的：一个基于 Tauri 的桌面 IDE。", false);
+  assert.match(hint, /摸清项目结构/);
+  assert.match(hint, /list_dir.*find_files/);
+  // 只读了 1 个文件也算少 → 触发
+  assert.ok(STRUCTURE_READINESS_HINT(["README.md"], "这个项目的技术栈是 React。", false));
+  // 0 个文件但下项目结论 → 也触发（没读任何东西就敢总结）
+  assert.ok(STRUCTURE_READINESS_HINT([], "本项目采用微服务架构。", false));
+});
+
+test("#77 结构就绪提示：已调用 list_dir/find_files → 解除", () => {
+  // 调用过 list_dir → 即便只读了少量文件也不触发
+  assert.equal(STRUCTURE_READINESS_HINT(["README.md"], "这个项目用 React 实现。", true), "");
+  // hasListedDirs=true 直接解除
+  assert.equal(STRUCTURE_READINESS_HINT([], "本项目概述如下。", true), "");
+});
+
+test("#77 结构就绪提示：已读文件数 ≥ 阈值 → 解除", () => {
+  // 读了 5 个文件（达到阈值）→ 即便没 list_dir 也不触发
+  const fiveFiles = ["a.md", "b.md", "c.md", "d.md", "e.md"];
+  assert.equal(STRUCTURE_READINESS_HINT(fiveFiles, "这个项目用 Vue 实现。", false), "");
+  // 超过阈值也解除
+  const manyFiles = ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md"];
+  assert.equal(STRUCTURE_READINESS_HINT(manyFiles, "本项目概述。", false), "");
+});
+
+test("#77 结构就绪提示：非结论场景 → 不误伤", () => {
+  // 普通汇报/修 bug → 不是项目结论，不触发
+  assert.equal(STRUCTURE_READINESS_HINT(["src/main.js"], "我已经修好了这个 bug。", false), "");
+  assert.equal(STRUCTURE_READINESS_HINT(["notes.md"], "好的，收到，我这就开始。", false), "");
+  // 空草稿 → 不触发
+  assert.equal(STRUCTURE_READINESS_HINT(["a.md"], "", false), "");
+  // 纯代码讨论，不涉及项目总结
+  assert.equal(STRUCTURE_READINESS_HINT(["util.ts"], "这个函数的时间复杂度是 O(n)。", false), "");
+});
+
+test("#77 结构就绪提示：接线自查——run 级布尔一次性 + 走 _pushNudge user block", () => {
+  // 触发条件：agent 模式 + 未提示过；命中即置一次性布尔并 _pushNudge，防复发
+  assert.match(SRC, /if \(isAgent && run\.mode === "agent" && !run\._structureReadinessNudged\)/);
+  assert.match(SRC, /_structureReadinessHint\(\[\.\.\._readFiles\], turn\.text \|\| summaryText, _hasListedDirs\)/);
+  assert.match(SRC, /run\._structureReadinessNudged = true/);
+  assert.match(SRC, /_pushNudge\("structureReadiness", _srHint\)/);
+  // 不碰 system 静态前缀：提示只经 _pushNudge（user 消息通道）注入
+  const fnSrc = extractFn("_structureReadinessHint");
+  assert.ok(!/_AI_MODE_PROMPTS|systemPrompt|system:/.test(fnSrc), "结构就绪提示不得触碰 system 前缀");
+  // 阈值常量存在且可配置
+  assert.match(SRC, /_STRUCTURE_READINESS_FILE_THRESHOLD\s*=\s*\d+/);
+});

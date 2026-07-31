@@ -32836,6 +32836,23 @@ function _evidenceGradingHint(readPaths, draftText) {
   if (!CONCLUSION.test(draft)) return "";
   return "⚠️ 证据分级：本轮仅读了文档（.md 可能过期或是随手记），未核对真实源码。下\u201c项目/实现\u201d类结论前请先读相关源文件（read_file/find_symbol/semantic_search）核实；暂将此结论视为低置信、待核验。源码 > 配置 > 文档 > 笔记。";
 }
+// === ANTI-HALLUCINATION Protocol-C 变体：结论前须先摸清项目结构 ===
+// 痛点：AI 被问"这个项目是干嘛的"，只读了 3 个文件就敢输出完整项目总结，没先 list_dir 摸清真实结构。
+// 与 _evidenceGradingHint 互补：证据分级拦"单 md 当权威"，本机制拦"未摸清结构就总结"。
+// 事实门控 + 判断留权：没 list_dir/find_files 且读文件少 + 正下项目结论 → 一次性软提示。
+// 调用过 list_dir/find_files 后自然解除；已读文件数 ≥ 阈值也解除；非结论场景不误伤。
+// 纯函数、无副作用，供 test/logic.test.mjs 抽取直测。
+const _STRUCTURE_READINESS_FILE_THRESHOLD = 5;
+function _structureReadinessHint(readPaths, draftText, hasListedDirs) {
+  if (hasListedDirs) return "";
+  const paths = Array.isArray(readPaths) ? readPaths : [...(readPaths || [])];
+  if (paths.length >= _STRUCTURE_READINESS_FILE_THRESHOLD) return "";
+  const draft = String(draftText || "");
+  if (!draft.trim()) return "";
+  const CONCLUSION = /(这个?项目|本项目|该项目|整个项目|项目的?(是|用|采用|基于|使用|架构|实现|技术栈|框架|结构|功能|干嘛|做什么)|overview|summary|总结|项目概览|项目总结|the project|project overview|what.*project|tech stack|built (with|on|using))/i;
+  if (!CONCLUSION.test(draft)) return "";
+  return "\u26a0\ufe0f 你还没摸清项目结构就敢下结论。请先用 list_dir / find_files 了解真实目录与文件，再基于事实总结。";
+}
 function _contentSignature(text) {
   const value = String(text || "");
   const lines = value.endsWith("\n") ? value.slice(0, -1).split("\n").length : value.split("\n").length;
@@ -36386,6 +36403,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (_evGradeHint) {
             run._evidenceGradingNudged = true;
             _pushNudge("evidenceGrading", _evGradeHint);
+            continue;
+          }
+        }
+        // ── ANTI-HALLUCINATION Protocol-C 变体：结论前须先摸清项目结构。
+        //    没调用 list_dir/find_files + 读文件少 + 正下项目结论 → 一次性软提示。
+        //    与 #71 证据分级并列，互不干扰；走同一 _pushNudge 通道，run 级布尔防复发。
+        if (isAgent && run.mode === "agent" && !run._structureReadinessNudged) {
+          const _hasListedDirs = Array.isArray(run._toolLedger?.entries) && run._toolLedger.entries.some((e) => e.tool === "list_dir" || e.tool === "find_files");
+          const _srHint = _structureReadinessHint([..._readFiles], turn.text || summaryText, _hasListedDirs);
+          if (_srHint) {
+            run._structureReadinessNudged = true;
+            _pushNudge("structureReadiness", _srHint);
             continue;
           }
         }
