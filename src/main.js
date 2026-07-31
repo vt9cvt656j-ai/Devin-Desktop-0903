@@ -39849,6 +39849,69 @@ async function _fuzzyFileCandidates(rel, preferredRoot = "") {
   return matches;
 }
 
+// Cross-directory basename fallback: when _fuzzyFileCandidates finds nothing
+// (e.g. model translated Chinese filename to English or vice-versa), search
+// the whole workspace for files sharing the same extension and at least one
+// word/token from the original basename.  Returns scored candidates (top 5).
+async function _crossDirBasenameFallback(basename, root) {
+  if (!basename || !root) return [];
+  const base = basename.split(/[\/\\]/).pop() || "";
+  if (!base || base.length <= 1) return [];
+  const dotIdx = base.lastIndexOf(".");
+  const nameNoExt = dotIdx > 0 ? base.slice(0, dotIdx) : base;
+  const ext = dotIdx > 0 ? base.slice(dotIdx) : "";
+  const keys = nameNoExt
+    .split(/[_\-\s.]+/)
+    .map((k) => k.toLowerCase())
+    .filter((k) => k.length >= 2);
+  if (!keys.length && !ext) return [];
+  const results = [];
+  const seen = new Set();
+  for (const r of _allRoots(root)) {
+    let files = [];
+    try { files = (await _agentFindFiles(r, ext || "*")).files || []; } catch {}
+    for (const file of files) {
+      if (seen.has(file)) continue;
+      seen.add(file);
+      const fBase = file.split(/[\/\\]/).pop() || "";
+      if (fBase === base) continue;
+      const fDot = fBase.lastIndexOf(".");
+      const fName = fDot > 0 ? fBase.slice(0, fDot).toLowerCase() : fBase.toLowerCase();
+      const fKeys = fName.split(/[_\-\s.]+/).filter((k) => k.length >= 2);
+      let score = 0;
+      // Tier 1: token overlap (split by _/-/space/.)
+      for (const k of keys) {
+        for (const fk of fKeys) {
+          if (fk === k) { score += 100; break; }
+          if (fk.includes(k) || k.includes(fk)) { score += 50; break; }
+        }
+      }
+      // Tier 2: full filename (no ext) contains search key as substring
+      if (score === 0) {
+        for (const k of keys) {
+          if (k.length >= 3 && fName.includes(k)) { score += 30; break; }
+        }
+      }
+      if (score === 0) {
+        // Character-bigram overlap as last-resort fuzzy signal
+        const bigrams = new Set();
+        for (let i = 0; i < fName.length - 1; i++) bigrams.add(fName.slice(i, i + 2));
+        let overlap = 0;
+        for (let i = 0; i < nameNoExt.length - 1; i++) {
+          if (bigrams.has(nameNoExt.slice(i, i + 2).toLowerCase())) overlap++;
+        }
+        if (overlap >= 3) score = overlap * 5;
+      }
+      if (score > 0) {
+        const fullPath = _coherentFilePath(r + "/" + file);
+        results.push({ path: fullPath, rel: _normalizeFsPath(file), score });
+      }
+    }
+  }
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, 5);
+}
+
 async function _resolveExisting(rel, preferredRoot = "") {
   if (!rel) return rel;
   const exact = [];
@@ -40457,7 +40520,7 @@ async function _executeToolStep(step, call, root, run) {
         // Search every workspace first and only recover when the global result is
         // unique. Picking the first root is exactly how a db.js from project A used
         // to be read and then written while the user meant project B.
-        const base = (absoluteRequested || readError) ? "" : rawPath.split(/[\\/]/).pop();
+        const base = (absoluteRequested || (readError && !_isMissingFileError(readError))) ? "" : rawPath.split(/[\\/]/).pop();
         const fuzzyMatches = [];
         const addMatch = (path, rel = path) => {
           path = _coherentFilePath(path);
@@ -40478,6 +40541,12 @@ async function _executeToolStep(step, call, root, run) {
             } catch {}
           }
           for (const match of await _fuzzyFileCandidates(rawPath, root)) addMatch(match.path, match.rel);
+          // Cross-directory basename fallback: when _fuzzyFileCandidates found nothing
+          // (e.g. model translated Chinese→English or put file in wrong subdir), search
+          // whole workspace for files sharing extension + word tokens from the basename.
+          if (fuzzyMatches.length !== 1 && base) {
+            for (const m of await _crossDirBasenameFallback(base, root)) addMatch(m.path, m.rel);
+          }
         }
         if (fuzzyMatches.length === 1) {
           try {
@@ -40505,7 +40574,14 @@ async function _executeToolStep(step, call, root, run) {
           step.classList.add("agent-tool-step--rejected");
           vp.innerHTML = `<div style="padding:8px 12px;color:var(--atc-dim,#636c76);font-size:12px">Tried: ${candidates.map(p => _escHtml(p)).join(", ")}</div>`;
           const code = fuzzyMatches.length > 1 ? "AMBIGUOUS_PATH" : "ERROR";
-          return { type: "read", path: call.path, content: `[${code}] 找不到唯一文件: ${rawPath}（工作区根: ${root || "(无)"}）。${helpHint}` };
+          // Lightweight guidance: one-shot per run, nudges model to use list_dir/find_files
+          // instead of guessing paths.  Judgment left to the model (no hard blocking).
+          let pathGuidance = "";
+          if (!run._pathNotFoundGuided) {
+            pathGuidance = "\n\n⚠️ 读不到文件时请先用 list_dir / find_files 确认真实路径，注意不要臆造子目录或把中文文件名翻译成英文。";
+            run._pathNotFoundGuided = true;
+          }
+          return { type: "read", path: call.path, content: `[${code}] 找不到唯一文件: ${rawPath}（工作区根: ${root || "(无)"}）。${helpHint}${pathGuidance}` };
         }
       }
       // Redundant-read saver: re-reading (in full) a file already read a few steps

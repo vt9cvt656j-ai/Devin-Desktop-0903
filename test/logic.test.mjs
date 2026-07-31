@@ -14988,3 +14988,94 @@ test("#71-C 证据分级：接线自查——run 级布尔一次性 + 走 _pushN
   const fnSrc = extractFn("_evidenceGradingHint");
   assert.ok(!/_AI_MODE_PROMPTS|systemPrompt|system:/.test(fnSrc), "证据分级不得触碰 system 前缀");
 });
+
+// ── #76 跨目录 basename 兜底 + 轻量引导 ──────────────────────────────
+
+test("#76 _crossDirBasenameFallback: finds files sharing tokens + extension", async () => {
+  const fn = load("_crossDirBasenameFallback", {
+    _allRoots: () => ["/work"],
+    _agentFindFiles: async (_root, ext) => {
+      if (ext === ".md") return { files: ["analysis_report_final.md", "other.md", "docs/final_report.md"] };
+      return { files: [] };
+    },
+    _coherentFilePath: COHERENT_PATH,
+    _normalizeFsPath: NORMALIZE_PATH,
+  });
+  // "report.md" → keys ["report"], ext ".md"
+  // "analysis_report_final.md" → fKeys ["analysis", "report", "final"] → shares "report" → score 100
+  // "docs/final_report.md" → fBase "final_report.md" → fKeys ["final", "report"] → shares "report" → score 100
+  const results = await fn("report.md", "/work");
+  assert.ok(results.length === 2, `should find 2 candidates, got ${results.length}`);
+  // Both share exact token "report" → score ≥ 100
+  for (const r of results) {
+    assert.ok(r.score >= 100, `${r.rel} should score ≥ 100 (token match), got ${r.score}`);
+  }
+});
+
+test("#76 _crossDirBasenameFallback: truncates to top 5 candidates", async () => {
+  const manyFiles = Array.from({ length: 10 }, (_, i) => `file_${i}.js`);
+  const fn = load("_crossDirBasenameFallback", {
+    _allRoots: () => ["/work"],
+    _agentFindFiles: async () => ({ files: manyFiles }),
+    _coherentFilePath: COHERENT_PATH,
+    _normalizeFsPath: NORMALIZE_PATH,
+  });
+  // "file_old.js" → keys ["file", "old"], ext ".js"
+  // All "file_N.js" share token "file" → 10 matches, but truncated to 5
+  const results = await fn("file_old.js", "/work");
+  assert.ok(results.length <= 5, "should return at most 5 candidates");
+  assert.ok(results.length > 0, "should return some candidates");
+});
+
+test("#76 _crossDirBasenameFallback: returns empty when nothing matches", async () => {
+  const fn = load("_crossDirBasenameFallback", {
+    _allRoots: () => ["/work"],
+    _agentFindFiles: async () => ({ files: ["completely_different.txt"] }),
+    _coherentFilePath: COHERENT_PATH,
+    _normalizeFsPath: NORMALIZE_PATH,
+  });
+  // "report.md" → ext ".md", but workspace only has ".txt" files → no match
+  const results = await fn("report.md", "/work");
+  assert.equal(results.length, 0, "different extension → no candidates");
+});
+
+test("#76 _crossDirBasenameFallback: excludes the exact basename itself", async () => {
+  const fn = load("_crossDirBasenameFallback", {
+    _allRoots: () => ["/work"],
+    _agentFindFiles: async () => ({ files: ["report.md", "other/report_v2.md"] }),
+    _coherentFilePath: COHERENT_PATH,
+    _normalizeFsPath: NORMALIZE_PATH,
+  });
+  const results = await fn("report.md", "/work");
+  // "report.md" (exact basename) should be excluded
+  const exactHit = results.find((r) => r.rel === "report.md");
+  assert.equal(exactHit, undefined, "exact basename must be excluded (it's the one that already failed)");
+  // "other/report_v2.md" shares token "report" → should be found
+  const similar = results.find((r) => r.rel === "other/report_v2.md");
+  assert.ok(similar, "similar basename should be found");
+});
+
+test("#76 guard: _isMissingFileError returns true for cannot stat / NotFound errors", () => {
+  const fn = load("_isMissingFileError");
+  assert.ok(fn("cannot stat '/path/file.md': No such file or directory (os error 2)"));
+  assert.ok(fn("文件不存在: '/path/file.md'"));
+  assert.ok(fn("ENOENT: no such file or directory"));
+  assert.ok(!fn("too large: file exceeds 5 MB"), "non-NotFound errors must NOT match");
+  assert.ok(!fn("Permission denied"), "permission errors must NOT match");
+});
+
+test("#76 guard: fuzzy recovery triggers for NotFound but not for 'too large'", () => {
+  // Verify the guard condition in source: readError only blocks fuzzy recovery
+  // when it's NOT a missing-file error.
+  assert.match(SRC, /\(absoluteRequested \|\| \(readError && !_isMissingFileError\(readError\)\)\)/,
+    "guard should allow fuzzy recovery when readError is a missing-file error");
+});
+
+test("#76 lightweight guidance: one-shot per run, appended to error content", () => {
+  // Verify the guidance is in the return content and uses a run-level flag
+  assert.match(SRC, /run\._pathNotFoundGuided/,
+    "should use run-level one-shot flag for guidance");
+  assert.match(SRC, /⚠️ 读不到文件时请先用 list_dir \/ find_files 确认真实路径/,
+    "should include the guidance text");
+  assert.match(SRC, /run\._pathNotFoundGuided = true/, "should set the flag after first trigger");
+});
