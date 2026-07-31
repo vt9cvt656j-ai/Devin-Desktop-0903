@@ -32151,6 +32151,12 @@ function _runtimeNeedsSemanticReview(call, result) {
   return _executionEvidenceFromTool(call, result, "") !== null;
 }
 
+// Source-code file extensions for the pre-delivery verification gate: editing one of
+// these carries an implicit "prove it at least parses/builds" obligation. Docs, config
+// and data files (md/json/yaml/txt/…) are intentionally excluded so trivial content
+// edits are never held hostage to a build.
+const _CODE_FILE_RE = /\.(?:js|jsx|ts|tsx|mjs|cjs|vue|svelte|astro|py|rs|go|java|kt|kts|c|h|cc|cpp|hpp|cs|rb|php|swift|m|mm|scala|sh|bash|zsh|sql|lua|dart|ex|exs|elm|clj|hs)$/i;
+
 function _executionEvidenceFromTool(call, result, root) {
   if (!call || !result) return null;
   const type = String(call.type || "");
@@ -35985,7 +35991,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     planSteps = run._planSteps;
   }
   const _shotMsgs = []; // screenshot image messages currently in context (kept lean)
-  let continueNudges = 0, effectNudges = 0, researchNudges = 0, researchGateNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0;
+  let continueNudges = 0, effectNudges = 0, researchNudges = 0, researchGateNudges = 0, planGateNudges = 0, verifyNudges = 0, honestyNudges = 0, toolReminders = 0, toolFirstNudges = 0, recoveryNudges = 0, invalidArgNudges = 0, deepReadNudges = 0, codeVerifyNudges = 0;
   // More "Claude Code way" discipline: did this run investigate (read/search) before
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
@@ -36760,6 +36766,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           externalEffects: _externalEffects,
         });
         const _missingRequiredEffect = _missingEffects.length > 0;
+        // 交付前自验证门：改了源码却整轮零验证证据（没跑构建/类型检查/测试/运行，
+        // 也没跑诊断）= “交付即报错”的直接根因。这里只管“完全没验证过”；有正式运行时
+        // 义务（_missingRequiredEffect）或已有诊断阻断（_diagnosticBlock）时交给那两道门，不重复催。
+        const _mutatedCode = didMutate && [..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)));
+        const _hasVerifyEvidence = verificationPassed || didVerify || _verifiedAtImplOps >= 0
+          || (Array.isArray(run._executionEvidence) && run._executionEvidence.some((e) => {
+            const cmd = String((e && e.command) || "");
+            if (!cmd) return false;
+            if (e.verification === true) return true;
+            if (_looksLikeVerificationCommand(cmd)) return true;
+            return _runtimeCommandKinds(cmd, false).some((k) => ["build", "test", "run", "package"].includes(k));
+          }));
+        const _codeDeliveredUnverified = run.mode === "agent" && _mutatedCode && !_hasVerifyEvidence
+          && !run._diagnosticBlock && !_missingRequiredEffect;
         const _missingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
         const _uiSettled = !run.engineering.ui || !didMutate || _uiVerifiedAtImplOps >= _implOps || uiVerifyNudges >= 2 || (_uiVerifyTotal || 0) >= 4;
         // Browser operation dedup ledger: track recent actions to prevent repeated same operations
@@ -36779,10 +36799,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // _incompleteReason 却只剩读没有写，收尾永远显示成功。）
         if (quietTurns >= _quietExitAt && !pending
           && (!_missingResearch.length || researchNudges >= 2)
-          && (!_missingRequiredEffect || effectNudges >= 2)) {
+          && (!_missingRequiredEffect || effectNudges >= 2)
+          && (!_codeDeliveredUnverified || codeVerifyNudges >= 3)) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           if (_missingRequiredEffect && !run._incompleteReason) run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
           if (_missingResearch.length && !run._incompleteReason) run._incompleteReason = `research_evidence_missing:${_missingResearch.join(",")}`;
+          if (_codeDeliveredUnverified && !run._incompleteReason) run._incompleteReason = "code_delivered_unverified";
           break;
         }
         // C — 任务计划里还有未完成步骤就想收尾 → 推它把计划做完或诚实标记，最多 2 次。
@@ -36926,6 +36948,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           };
           const targetInstruction = _missingEffects.map((kind) => labels[kind] || kind).join("；");
           _pushNudge("effect", `这项请求要求产生真实结果，但仍缺：${targetInstruction}。逐项使用对应工具完成并检查真实退出状态/持续进程/远端返回；编辑文件、echo 文本或其他类别的成功不能替代这些义务。若确实无法执行，收尾必须明确未完成项，不能只说“已经好了”。`);
+          continue;
+        }
+        // 交付前自验证门：改了源码却零验证证据 → 要求先实际运行验证再收尾（最多 3 轮，
+        // 之后如实记未完成）。这是“交付即报错/跑不起来”的机制层根治：不靠提示词唠叨，
+        // 靠“没验证证据就不放行收尾”的硬事实门。get_diagnostics/构建/测试/运行任一都算。
+        if (_codeDeliveredUnverified && codeVerifyNudges < 3 && _live()) {
+          codeVerifyNudges++;
+          _pushNudge("codeVerify", "你改了源码但这一轮没有任何验证证据（没跑构建/类型检查/测试/运行，也没读诊断）。交付前必须先实际验证：能编译的项目跑构建或类型检查，有相关测试就跑测试，起服务的就启动并核对，至少用 get_diagnostics 或读构建输出确认无报错——按真实退出状态和输出判断，别只凭“看起来对”就说完成。发现问题先修掉再验证一次。");
           continue;
         }
         const reconciliation = _takeRequirementsReconciliation(run, {

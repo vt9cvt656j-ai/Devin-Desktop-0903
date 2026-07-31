@@ -7745,6 +7745,19 @@ test("bug fixes require causal reasoning before patching", () => {
     "bug fixes must verify the same failure path or a focused regression");
 });
 
+test("code delivery without build/test evidence is blocked until verified", () => {
+  assert.match(SRC, /const _CODE_FILE_RE = /,
+    "must define source-code extension regex to distinguish code from docs");
+  assert.match(SRC, /_codeDeliveredUnverified/,
+    "the pre-delivery verification gate variable must exist");
+  assert.match(SRC, /codeVerifyNudges < 3/,
+    "the code-verify nudge must be bounded (max 3 rounds)");
+  assert.match(SRC, /run\._incompleteReason = "code_delivered_unverified"/,
+    "exhausted code-verify budget must honestly record incomplete reason");
+  assert.match(SRC, /你改了源码但这一轮没有任何验证证据/,
+    "nudge message must clearly explain why delivery is blocked");
+});
+
 test("dynamic URLs and third-party fields require real evidence instead of guessing", () => {
   assert.match(SRC, /URL、接口、跳转、字段含义、商品\/价格\/库存\/直播间\/播放地址\/榜单\/实时状态这类动态事实，必须来自真实页面、真实 HTTP\/网络响应、真实文件样本、官方\/结构化接口或用户授权数据/,
     "truthfulness prompt must forbid guessing dynamic facts and URLs");
