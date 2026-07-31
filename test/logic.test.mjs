@@ -1090,7 +1090,7 @@ test("empty workspaces stop local file probing but still allow external search",
   assert.equal(await refreshEmptyRootBeforeSkip(stillEmptyRun, "/repo"), false);
   assert.equal(stillEmptyRun._emptyWorkspaceRoots.has("/repo"), true);
 
-  const executeSource = extractFn("_executeToolStep");
+  const executeSource = extractFn("_executeToolStepInner");
   assert.match(executeSource, /await _refreshEmptyRootBeforeSkip\(run, root\)/,
     "tool execution must re-check the real directory before blocking reads as empty");
   assert.match(executeSource, /_emptyRootSkipMessage\(run, root, call\) \|\| _emptyExploreSkipMessage\(run, root, call\)/,
@@ -1491,7 +1491,7 @@ test("slow install/download commands get a factual duration note (no interceptio
   assert.equal(slowNote("", 999000), "");
 
   // 接线自查：cmd 执行路径真实计时并把附注追加到返回模型的结果文本
-  const executeSource = extractFn("_executeToolStep");
+  const executeSource = extractFn("_executeToolStepInner");
   assert.match(executeSource, /const _cmdStartedAt = Date\.now\(\)/,
     "cmd execution must capture a real start timestamp");
   assert.match(executeSource, /_slowInstallCmdNote\(call\.command, Date\.now\(\) - _cmdStartedAt\)/,
@@ -4796,7 +4796,7 @@ test("local discovery executor wires permission, coordinates, and address failur
       },
     };
   };
-  const makeExecutor = ({ requestLocation, invoke }) => load("_executeToolStep", {
+  const makeExecutor = ({ requestLocation, invoke }) => load("_executeToolStepInner", {
     _currentAiMode: "agent",
     _runCheckpoint: new Map(),
     _HOOKED_TOOL_TYPES: new Set(),
@@ -4917,7 +4917,7 @@ test("road executor visibly distinguishes delayed data and coarse current locati
       : selector === ".atc-result" ? result : selector === ".agent-tool-row" ? {} : null,
   };
   let invokeArgs;
-  const execute = load("_executeToolStep", {
+  const execute = load("_executeToolStepInner", {
     _currentAiMode: "agent",
     _runCheckpoint: new Map(),
     _HOOKED_TOOL_TYPES: new Set(),
@@ -5038,7 +5038,7 @@ test("read ranges deduplicate only exact source still available in the current r
     "the persisted digest is memory, not proof that exact source is still in the model context");
   run._readCoverage.clear();
   assert.deepEqual(known(run, "/repo", "v1", 100, "src/a.js"), []);
-  const executor = extractFn("_executeToolStep");
+  const executor = extractFn("_executeToolStepInner");
   assert.match(executor, /const limit = _explicitLimit \? Math\.floor\(call\.limit\)/,
     "offset=1 with an explicit limit must stay a bounded slice");
   assert.match(executor, /_readRangeCovered\(_knownRanges, start \+ 1, _reqEnd\)/,
@@ -9868,7 +9868,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
     "an MCP tool name is an approval hint, not proof that the local workspace changed");
   assert.equal(mutates({ type: "mcp", server: "filesystem", tool: "write_file", args: { path: "src/a.js" } }, { workspaceMutated: true }), true);
   assert.equal(mutates({ type: "mcp", tool: "read_file", mcpReadOnly: true, args: { path: "src/a.js" } }, {}), false);
-  assert.match(extractFn("_executeToolStep"), /\[ERROR\] 命令在 IDE 终端.*启动后很快退出/,
+  assert.match(extractFn("_executeToolStepInner"), /\[ERROR\] 命令在 IDE 终端.*启动后很快退出/,
     "an exited persistent terminal must not satisfy a runtime task");
 });
 
@@ -10187,7 +10187,7 @@ test("atomic write handoff keeps the final streamed Monaco snapshot without a se
   assert.equal(file.diskContent, value);
   assert.deepEqual(lsp, [["change", preview.path], ["save", preview.path]],
     "the language server receives one final snapshot and save after streaming settles");
-  assert.match(extractFn("_executeToolStep"), /liveWritePreview\.existed !== existed[\s\S]{0,120}liveWritePreview\.originalContent !== old/,
+  assert.match(extractFn("_executeToolStepInner"), /liveWritePreview\.existed !== existed[\s\S]{0,120}liveWritePreview\.originalContent !== old/,
     "a disk change during generation must reject the write instead of adopting the newer version as an overwrite base");
 });
 
@@ -10581,7 +10581,7 @@ test("read-before-edit requires contiguous coverage of the current complete file
     "default read continuation must use contiguous coverage, not the largest sampled line");
   assert.doesNotMatch(SRC, /const _seen = [\s\S]{0,120}Math\.max\(\s*\(run && run\._readSeen/,
     "targeted tail reads must not make the next default read skip earlier gaps");
-  assert.match(extractFn("_executeToolStep"), /coverageTo = lastNl > 0 \? shownTo : start/,
+  assert.match(extractFn("_executeToolStepInner"), /coverageTo = lastNl > 0 \? shownTo : start/,
     "a character-capped partial giant line must not count as a fully-read line");
 });
 
@@ -10599,9 +10599,9 @@ test("redacted reads remain marked for their exact content version", () => {
   assert.equal(wasRedacted(run, "/repo", cleanVersion, "src/a.js"), false);
   // 写回还原（任务 #39）：write_file 不再对打码内容一刀切硬拦，而是落盘前把
   // 占位符行还原成磁盘真实原文；还原不出唯一原文才拒绝。断言这条新的安全路径存在。
-  assert.match(extractFn("_executeToolStep"), /call\.type === "write" && redactedRead && \/REDACTED\/i\.test\(newContent/,
+  assert.match(extractFn("_executeToolStepInner"), /call\.type === "write" && redactedRead && \/REDACTED\/i\.test\(newContent/,
     "write_file with redacted content must restore placeholders from real disk content before writing");
-  assert.match(extractFn("_executeToolStep"), /const _restored = _restoreRedactedPlaceholders\(old, newContent, run && run\._redactionMap\)/,
+  assert.match(extractFn("_executeToolStepInner"), /const _restored = _restoreRedactedPlaceholders\(old, newContent, run && run\._redactionMap\)/,
     "whole-file write restore must run against the real on-disk content with the run redaction map");
 });
 
@@ -10642,7 +10642,7 @@ test("redacted placeholders are written back to real content, never landing lite
 });
 
 test("redacted files stay editable: edit/multi_edit no longer hard-block, they restore (task #39)", () => {
-  const fn = extractFn("_executeToolStep");
+  const fn = extractFn("_executeToolStepInner");
   // edit_file：匹配前先还原 old_string / new_string 上的占位符。
   assert.match(fn, /redactedRead && \/REDACTED\/i\.test\(oldStr \+ \(call\.newString \|\| ""\)\)/,
     "edit_file must restore placeholders in old/new string when the read was redacted");
@@ -10735,7 +10735,7 @@ test("打码密钥块内部的部分编辑被明确拒绝，编号打码只在�
 
   // 接入点：edit_file / multi_edit 都在占位符还原后、匹配前做块内命中检查，
   // 提示文案给出三条可行操作（保留/删除/轮换）。
-  const fn = extractFn("_executeToolStep");
+  const fn = extractFn("_executeToolStepInner");
   assert.match(fn, /redactedRead && _editHitsRedactedBlockInterior\(old, oldStr\)/,
     "edit_file must gate block-interior partial edits");
   assert.match(fn, /redactedRead && _editHitsRedactedBlockInterior\(content, oldStr\)/,
@@ -10811,7 +10811,7 @@ test("precise local edit anchors can safely bypass whole-file read gate", () => 
       { old_string: "  color: blue;", new_string: "  color: white;" },
     ],
   }), false);
-  assert.match(extractFn("_executeToolStep"), /_localEditHasPreciseAnchors\(old, call\)/);
+  assert.match(extractFn("_executeToolStepInner"), /_localEditHasPreciseAnchors\(old, call\)/);
 });
 
 test("mutation paths reject relative traversal and unbound external targets", () => {
@@ -10877,9 +10877,9 @@ test("same-response reads and fuzzy bindings cannot authorize mutations before t
   assert.equal(bound(run, "/repo", "wrong/a.js"), "", "a fuzzy path learned this response cannot drive delete/move yet");
   assert.equal(freshBinding(run, "/repo", "wrong/a.js"), "/repo/packages/a.js",
     "the mutation guard must still see the fresh binding instead of falling back to the wrong requested path");
-  assert.match(extractFn("_executeToolStep"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,1600}已阻止退回原始路径写错文件/);
+  assert.match(extractFn("_executeToolStepInner"), /const sameBatchSourceBinding = _sameBatchRunFilePathBinding[\s\S]{0,1600}已阻止退回原始路径写错文件/);
   // 新文件豁免：拦截必须以「目标在磁盘上真实存在」为前提，全新创建不能被同批绑定拦死。
-  assert.match(extractFn("_executeToolStep"),
+  assert.match(extractFn("_executeToolStepInner"),
     /const sameBatchTargetExists = !!sameBatchBinding\s*&& \(\(await _pathExistsAsFile\(sameBatchTargetAbs\)\) \|\| \(await _pathExistsAsDir\(sameBatchTargetAbs\)\)\);\s*if \(sameBatchBinding && sameBatchTargetExists\)/,
     "写入门禁只拦磁盘上已存在的目标，新文件创建必须放行");
 
@@ -10942,7 +10942,7 @@ test("hard_blocked/authorized 读取在覆盖重放里等价于读取完成，�
 test("重复读硬拦截返回前刷新路径绑定，写入门禁不再等一个不会再来的读取结果", () => {
   // 结构断言：hard_blocked 返回前必须绑定路径，且批号沿用覆盖完成时的批号（上一轮
   // 读完的写入即刻放行；本批才读完的仍算同批读写）。
-  assert.match(extractFn("_executeToolStep"),
+  assert.match(extractFn("_executeToolStepInner"),
     /const _hbState = _readCoverageStateFor\(run, root, _sig, total, call\.path, usedPath\);\s*_bindRunFilePath\(run, root, call\.path, usedPath \|\| call\.path, _hbState\?\.completedBatch \|\| 0\);\s*return \{\s*type: "read", path: call\.path, content: _hardBlockMsg/,
     "hard_blocked 返回前必须用覆盖完成批号刷新绑定");
   // 行为断言：用覆盖完成批号（上一批）绑定不会被写入门禁看成同批等待。
@@ -11102,7 +11102,7 @@ test("disk writes update clean open models, preserve dirty buffers, and are wire
   assert.equal(value, "user typing 2\n");
   previews.clear();
 
-  const execute = extractFn("_executeToolStep");
+  const execute = extractFn("_executeToolStepInner");
   assert.ok((execute.match(/_applyDiskContentToOpenFile\(fp, newContent\)/g) || []).length >= 2,
     "both write/edit and multi_edit paths must synchronize Monaco after disk CAS succeeds");
 });
@@ -11203,7 +11203,7 @@ test("dependency and LSP cache refreshes clear stale generated diagnostics", () 
   assert.match(extractFn("_scheduleTermRefresh"), /scheduleProjectCacheRefresh\(rootPath, "终端依赖\/构建变化"\)/);
   assert.match(extractFn("refreshProjectCaches"), /_clearJsTsJsonMarkersForRoot\(targetRoot\)/);
   assert.match(extractFn("refreshProjectCaches"), /_refreshLspDocumentsForRoot\(targetRoot\)/);
-  assert.match(extractFn("_executeToolStep"), /await refreshProjectCaches\(root \|\| rootPath, "诊断缓存自检"\)/,
+  assert.match(extractFn("_executeToolStepInner"), /await refreshProjectCaches\(root \|\| rootPath, "诊断缓存自检"\)/,
     "get_diagnostics should refresh stale dependency-resolution diagnostics before reporting to the agent");
 });
 
@@ -11521,7 +11521,7 @@ test("all non-editor direct source writes use CAS and synchronize Monaco", () =>
   assert.match(extractFn("_directTextEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
   assert.match(extractFn("_directStyleEdit"), /_commitDiskTextIfUnchanged\(file, content,/);
   assert.match(SRC, /writeFile: async \(path, content\)[\s\S]{0,500}_commitDiskTextIfUnchanged\(path, expected, content\)/);
-  assert.match(extractFn("_executeToolStep"), /_applyDiskContentToOpenFile\(fp, old\);[\s\S]{0,180}agentFormat/,
+  assert.match(extractFn("_executeToolStepInner"), /_applyDiskContentToOpenFile\(fp, old\);[\s\S]{0,180}agentFormat/,
     "formatting must refresh a stale project model from its disk baseline first");
 });
 
@@ -11563,7 +11563,7 @@ test("remote search uses the active backend and preserves native file-match shap
     ],
   });
   assert.match(SRC, /backend\.searchInProject = \(root, query, cs, mode = "literal"\)[\s\S]{0,320}_groupRemoteSearchHits/);
-  assert.match(extractFn("_executeToolStep"), /fileMatches = await backend\.searchInProject\(searchRoot, q, !!call\.caseSensitive, call\.mode \|\| "literal"\)/,
+  assert.match(extractFn("_executeToolStepInner"), /fileMatches = await backend\.searchInProject\(searchRoot, q, !!call\.caseSensitive, call\.mode \|\| "literal"\)/,
     "Agent search must route to the remote daemon when a remote workspace is active");
 });
 
@@ -11601,12 +11601,12 @@ test("substantial worker tasks process parent plans first and count only real wr
     "child agents must receive the session evidence ledger instead of re-searching from scratch");
   assert.match(SRC, /输出必须像老手简报/);
   assert.match(SRC, /可以运行会结束的短验证命令/);
-  assert.doesNotMatch(extractFn("_executeToolStep"), /worker 的 run_cmd 只允许测试\/构建\/只读诊断/);
-  assert.doesNotMatch(extractFn("_executeToolStep"), /worker 子智能体不能运行命令/);
-  assert.match(extractFn("_executeToolStep"), /Only mode boundaries and file-integrity checks above can stop execution/);
-  assert.match(extractFn("_executeToolStep"), /_commandRiskKind\(call\.command\)/,
+  assert.doesNotMatch(extractFn("_executeToolStepInner"), /worker 的 run_cmd 只允许测试\/构建\/只读诊断/);
+  assert.doesNotMatch(extractFn("_executeToolStepInner"), /worker 子智能体不能运行命令/);
+  assert.match(extractFn("_executeToolStepInner"), /Only mode boundaries and file-integrity checks above can stop execution/);
+  assert.match(extractFn("_executeToolStepInner"), /_commandRiskKind\(call\.command\)/,
     "risky shell commands should be tagged and run, not pre-blocked");
-  assert.match(extractFn("_executeToolStep"), /mutated: false, content: `\$\{rel\} 已是规范格式，无改动/);
+  assert.match(extractFn("_executeToolStepInner"), /mutated: false, content: `\$\{rel\} 已是规范格式，无改动/);
 });
 
 test("first-turn ask_user is fact-gated advice, never a physical block", () => {
@@ -11668,7 +11668,7 @@ test("dangerous shell commands are allowed with visible risk status, not fronten
   assert.match(extractFn("_agentRunInTerminal"), /agent-term-card--risk/);
   assert.match(extractFn("_agentRunInTerminal"), /agent-term-status--risk/);
   assert.doesNotMatch(extractFn("_agentRunInTerminal"), /Blocked:/);
-  assert.doesNotMatch(extractFn("_executeToolStep"), /请使用文件工具修改/);
+  assert.doesNotMatch(extractFn("_executeToolStepInner"), /请使用文件工具修改/);
   assert.match(SRC, /IDE 已允许执行「\$\{commandRiskLabel\}」/);
   assert.match(APP_CSS, /\.agent-term-risk\s*\{/);
   assert.match(APP_CSS, /\.agent-term-status--risk\s*\{/);
@@ -15219,7 +15219,7 @@ test("#79 list_dir 成功后重置失败路径计数", () => {
 test("#79 门控不碰 system 静态前缀", () => {
   // 确认门控代码在 _executeToolStep 内部，不在 system prompt 区域
   const gateIdx = SRC.indexOf("#79 读/搜失败路径渐进式门控");
-  const execIdx = SRC.indexOf("async function _executeToolStep(");
+  const execIdx = SRC.indexOf("async function _executeToolStepInner(");
   assert.ok(gateIdx > execIdx, "门控代码必须在 _executeToolStep 内部");
   // 确认门控不注入 system prompt
   const sysPromptIdx = SRC.indexOf("_AI_MODE_PROMPTS");
@@ -15689,4 +15689,107 @@ test("\u8f93\u5165\u9a8c\u8bc1: \u6267\u884c\u5904\u7406\u5668\u68c0\u67e5 _erro
   assert.match(SRC, /if \(call\._error\).*generate_3d/s, "generate handler should check _error");
   assert.match(SRC, /if \(call\._error\).*search_game_assets/s, "search_game_assets handler should check _error");
   assert.match(SRC, /if \(call\._error\).*download_asset/s, "download_asset handler should check _error");
+});
+
+// ==================== #85 四框架统一测试 ====================
+
+test("#85 失败记忆统一框架: 包装器对所有工具自动记录失败", () => {
+  // 包装器 _executeToolStep 必须包含失败记忆拦截逻辑
+  const wrapperSrc = extractFn("_executeToolStep");
+  assert.match(wrapperSrc, /_getToolFailureCount\(call\?\.type\)/, "包装器必须检查失败计数");
+  assert.match(wrapperSrc, /_fmCount >= 3/, "连续失败 ≥3 次必须拦截");
+  assert.match(wrapperSrc, /\[失败记忆\]/, "拦截必须返回明确提示");
+  // 包装器必须根据结果内容自动记录失败
+  assert.match(wrapperSrc, /_recordToolFailure\(call\?\.type\)/, "包装器必须自动记录失败");
+  assert.match(wrapperSrc, /_resetToolFailure\(call\?\.type\)/, "成功时必须重置计数");
+  // _fmRecorded 标记防止游戏资产工具双重计数
+  assert.match(wrapperSrc, /_fmRecorded/, "必须支持 _fmRecorded 防双重计数");
+  // 源里游戏资产工具的 catch 块带 _fmRecorded 标记
+  assert.match(SRC, /_fmRecorded: true/, "游戏资产工具 catch 块必须标记 _fmRecorded");
+});
+
+test("#85 失败记忆统一框架: 异常出口也自动记录", () => {
+  // _executeToolStepInner 的 catch 块抛出异常时，包装器也能捕获并记录
+  const wrapperSrc = extractFn("_executeToolStep");
+  assert.match(wrapperSrc, /await _executeToolStepInner\(step, call, root, run\)/, "包装器必须调用内部函数");
+  // 失败检测正则覆盖主要失败模式
+  assert.match(wrapperSrc, /\\\[.*失败.*ERROR.*BLOCKED/, "失败检测必须覆盖多种失败模式");
+});
+
+test("#85 结果缓存统一框架: 只读工具缓存命中与过期", () => {
+  const wrapperSrc = extractFn("_executeToolStep");
+  // 缓存基础设施
+  assert.match(SRC, /const _toolResultCache = new Map\(\)/, "必须定义 _toolResultCache Map");
+  assert.match(SRC, /const _TOOL_CACHE_TTL = 5 \* 60 \* 1000/, "TTL 必须为 5 分钟");
+  assert.match(SRC, /const _CACHEABLE_TOOL_TYPES = new Set\(/, "必须定义可缓存工具集");
+  // 缓存检查
+  assert.match(wrapperSrc, /_CACHEABLE_TOOL_TYPES\.has\(call\?\.type\)/, "必须检查工具是否可缓存");
+  assert.match(wrapperSrc, /_toolCacheKey\(call\)/, "必须生成缓存键");
+  assert.match(wrapperSrc, /_toolResultCache\.has\(_cKey\)/, "必须检查缓存命中");
+  assert.match(wrapperSrc, /Date\.now\(\) - _cEntry\.ts < _TOOL_CACHE_TTL/, "必须检查 TTL 过期");
+  // 缓存存储
+  assert.match(wrapperSrc, /_toolResultCache\.set\(_cKey, \{ result, ts: Date\.now\(\) \}\)/, "成功时必须存入缓存");
+  // 缓存容量上限
+  assert.match(wrapperSrc, /_toolResultCache\.size > 200/, "必须有缓存容量上限");
+  // 写操作缓存失效
+  assert.match(wrapperSrc, /call\?\.type === "write"[\s\S]*_toolResultCache\.delete/, "写操作必须失效相关缓存");
+  // 可缓存工具集包含核心只读工具
+  assert.match(SRC, /"read".*"list".*"search"/, "缓存集必须包含 read/list/search");
+  assert.match(SRC, /"web".*"websearch".*"webfetch"/, "缓存集必须包含 web 搜索工具");
+  assert.match(SRC, /"gitstatus".*"gitdiff".*"gitlog"/, "缓存集必须包含 git 只读工具");
+});
+
+test("#85 结果缓存: _toolCacheKey 覆盖关键参数", () => {
+  const keyFn = load("_toolCacheKey");
+  const k1 = keyFn({ type: "read", path: "src/main.js" });
+  const k2 = keyFn({ type: "read", path: "src/other.js" });
+  const k3 = keyFn({ type: "read", path: "src/main.js" });
+  assert.notEqual(k1, k2, "不同路径必须产生不同缓存键");
+  assert.equal(k1, k3, "相同参数必须产生相同缓存键");
+  // query 参数
+  const k4 = keyFn({ type: "search", query: "foo", path: "src" });
+  const k5 = keyFn({ type: "search", query: "bar", path: "src" });
+  assert.notEqual(k4, k5, "不同 query 必须产生不同缓存键");
+});
+
+test("#85 Tool Ledger 分类增强: _recordToolCall 包含 category/failCategory/retryCount", () => {
+  // _recordToolCall 必须包含新字段
+  assert.match(SRC, /category: _toolCategoryMap\[_rcToolName\]/, "ledger 记录必须包含 category");
+  assert.match(SRC, /failCategory: !ok \? _classifyToolFailure/, "失败时必须包含 failCategory");
+  assert.match(SRC, /retryCount: !ok \? _getToolFailureCount\(_rcToolName\)/, "失败时必须包含 retryCount");
+  // _toolCategoryMap 必须存在且覆盖主要工具类别
+  assert.match(SRC, /const _toolCategoryMap = \{/, "必须定义 _toolCategoryMap");
+  assert.match(SRC, /read: "file"[\s\S]*write: "file"/s, "文件工具必须分类为 file");
+  assert.match(SRC, /search: "search"[\s\S]*web: "search"/s, "搜索工具必须分类为 search");
+  assert.match(SRC, /gitstatus: "git"[\s\S]*gitcommit: "git"/s, "Git 工具必须分类为 git");
+  assert.match(SRC, /browser: "browser"[\s\S]*screenshot: "browser"/s, "浏览器工具必须分类为 browser");
+  assert.match(SRC, /dbquery: "db"/, "数据库工具必须分类为 db");
+});
+
+test("#85 Tool Ledger 分类增强: _toolLedgerStats 输出类别汇总", () => {
+  const statsFn = load("_toolLedgerStats", { _classifyToolFailure: load("_classifyToolFailure") });
+  const entries = [
+    { tool: "read_file", category: "file", ok: true },
+    { tool: "search", category: "search", ok: true },
+    { tool: "search", category: "search", ok: false, reason: "not found", failCategory: "not_found" },
+    { tool: "web_search", category: "search", ok: false, reason: "timeout", failCategory: "timeout" },
+    { tool: "git_commit", category: "git", ok: true },
+  ];
+  const stats = statsFn(entries);
+  assert.match(stats, /search\u7c7b\u522b:.*1\u2713\/2\u2717/, "必须输出 search 类别汇总");
+  assert.match(stats, /read_file\[file\]/, "工具行必须包含类别标签");
+  assert.match(stats, /not_found/, "必须显示失败类别");
+});
+
+test("#85 Schema Description 标准化: 高频工具含 usage_note", () => {
+  const guideSrc = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
+  // 检查高频工具都有 usage_note 且格式正确
+  const highFreqTools = ["read_file", "write_file", "edit_file", "search", "web_search", "run_cmd", "list_dir", "db_query", "git_commit", "git_branch"];
+  for (const tool of highFreqTools) {
+    // 检查工具定义块中包含 usage_note
+    const toolPattern = new RegExp(`${tool}:[\\s\\S]*?usage_note:\\s*'`);
+    assert.match(guideSrc, toolPattern, `${tool} 必须有 usage_note`);
+  }
+  // usage_note 必须包含三段式格式
+  assert.match(guideSrc, /usage_note: '【何时用】.*【vs 替代】.*【何时不用】/, "usage_note 必须包含三段式：何时用/vs替代/何时不用");
 });

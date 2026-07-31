@@ -22,7 +22,8 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['官方文档查找', '错误信息搜索', '技术教程查询', '联网查最新信息'],
     triggers: ['需要了解外部知识', '遇到报错', '查找官方文档', '用户要求联网/上网搜索', '需要时效性/最新信息'],
     example_call: "web_search(query='Vite official migration guide')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】需要查找最新信息、官方文档、错误解决方案时。【vs 替代】代码库内搜索用 search；知识库用 knowledge_search。【何时不用】已有代码内答案时不要联网搜索。'
   },
   
   // 调试诊断类工具
@@ -38,7 +39,8 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['错误码搜索', '日志关键词查找', '代码模式匹配'],
     triggers: ['遇到报错', '需要定位问题', '搜索错误信息'],
     example_call: "search(query='TypeError.*line 42', path='src')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】在代码库内搜索关键词、函数名、错误信息时。【vs 替代】联网搜索用 web_search；文件发现用 find_files。【何时不用】需要外部知识时用 web_search。'
   },
   read_logs: {
     category: 'diagnostics',
@@ -61,7 +63,8 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['数据库结构检查', '慢查询分析', '数据验证'],
     triggers: ['数据库操作', '数据结构变更', '需要 inspect schema', '查询慢'],
     example_call: "db_query(driver='sqlite', query='EXPLAIN SELECT * FROM users')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】查询数据库结构、执行 SQL、分析慢查询时。【vs 替代】数据库迁移用 db_migrate。【何时不用】需要修改表结构时用 db_migrate。'
   },
   
   // UI 自动化类工具
@@ -119,14 +122,16 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['功能分支创建', '隔离实验代码', 'PR 准备'],
     triggers: ['开始新功能', '需要隔离改动', '准备提交代码'],
     example_call: "git_branch(action='create', name='feature/session-fix')",
-    priority: 'medium'
+    priority: 'medium',
+    usage_note: '【何时用】开始新功能需要隔离代码时。【vs 替代】查看状态用 git_status；提交用 git_commit。【何时不用】小修改可以直接在 main 上提交。'
   },
   git_commit: {
     category: 'version_control',
     use_cases: ['阶段性保存', '代码归档', 'PR 前提'],
     triggers: ['完成一个小阶段', '需要保存当前状态', '准备推送'],
     example_call: "git_commit(message='Fix session expiry issue')",
-    priority: 'medium'
+    priority: 'medium',
+    usage_note: '【何时用】完成一个小阶段需要保存进度时。【vs 替代】创建分支用 git_branch；推送用 git_push。【何时不用】还没完成一个完整阶段时不要急于提交。'
   },
   
   // 文件系统操作
@@ -135,14 +140,16 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['代码阅读', '配置检查', '文档理解'],
     triggers: ['需要理解代码', '查看配置文件', '阅读文档'],
     example_call: "read_file(path='src/main.js')",
-    priority: 'critical'
+    priority: 'critical',
+    usage_note: '【何时用】需要读取文件内容理解代码/配置时。【vs 替代】目录结构用 list_dir；搜索内容用 search。【何时不用】只需知道目录结构时用 list_dir。'
   },
   list_dir: {
     category: 'file_io',
     use_cases: ['项目结构探索', '文件发现', '目录遍历'],
     triggers: ['陌生项目', '需要找文件', '了解目录结构'],
     example_call: "list_dir(path='src')",
-    priority: 'critical'
+    priority: 'critical',
+    usage_note: '【何时用】探索项目结构、发现文件位置时。【vs 替代】读文件内容用 read_file；按模式找文件用 find_files。【何时不用】已知路径直接 read_file。'
   },
   
   // Web 服务与 API
@@ -228,21 +235,24 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['小范围修改', '重构代码', '修复 bug'],
     triggers: ['已知修改位置', '替换特定代码块', '精确修改'],
     example_call: "edit_file(path='src/app.ts', old_string='const ready = false;', new_string='const ready = true;')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】精确修改已知位置的代码时。【vs 替代】新建文件用 write_file；多处修改用 multi_edit。【何时不用】文件不存在时用 write_file。'
   },
   write_file: {
     category: 'code_editing',
     use_cases: ['创建新文件', '生成配置', '写入测试结果'],
     triggers: ['新建文件', '生成代码', '保存输出'],
     example_call: "write_file(path='src/new-feature.ts', content='export const x = 1;')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】创建新文件或完全重写现有文件时。【vs 替代】小范围修改用 edit_file。【何时不用】只改几行时用 edit_file 更安全。'
   },
   run_cmd: {
     category: 'execution',
     use_cases: ['运行测试', '构建项目', '执行脚本'],
     triggers: ['需要执行程序', '运行命令', '验证构建'],
     example_call: "run_cmd(command='npm test')",
-    priority: 'high'
+    priority: 'high',
+    usage_note: '【何时用】运行测试、构建、安装依赖等一次性命令时。【vs 替代】长时间运行的服务用 run_in_terminal。【何时不用】需要持续运行的进程用 run_in_terminal。'
   },
 
   // 桌面自动化

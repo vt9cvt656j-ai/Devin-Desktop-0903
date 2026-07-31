@@ -31154,6 +31154,75 @@ function _recordToolFailure(toolType) {
 }
 function _resetToolFailure(toolType) { _toolFailureCounts.delete(toolType); }
 function _getToolFailureCount(toolType) { return _toolFailureCounts.get(toolType) || 0; }
+
+// ── 结果缓存统一框架 ── 只读工具 5 分钟 TTL，相同参数不重复执行
+const _toolResultCache = new Map();
+const _CACHEABLE_TOOL_TYPES = new Set([
+  "read", "list", "search", "findfiles", "web", "websearch", "webfetch",
+  "gitstatus", "gitdiff", "gitlog", "gitblame", "gitstashlist", "gitconflicts",
+  "lspsymbols", "findsymbol", "knowledgesearch", "lspdefinition", "lspreferences",
+  "getdiagnostics", "readlogs", "readterminal", "listterminals",
+  "ghprview", "ghprchecks", "ghprreviewcomments", "ghactionslog",
+  "currenttime", "readscreen",
+]);
+const _TOOL_CACHE_TTL = 5 * 60 * 1000;
+function _toolCacheKey(call) {
+  const t = call.type || "";
+  const parts = [t];
+  if (call.path != null) parts.push(String(call.path));
+  if (call.pattern != null) parts.push(String(call.pattern));
+  if (call.query != null) parts.push(String(call.query));
+  if (call.url != null) parts.push(String(call.url));
+  if (call.command != null) parts.push(String(call.command));
+  if (call.staged != null) parts.push(String(call.staged));
+  if (call.max_count != null) parts.push(String(call.max_count));
+  if (call.lines != null) parts.push(String(call.lines));
+  if (call.name != null) parts.push(String(call.name));
+  if (call.action != null) parts.push(String(call.action));
+  if (call.number != null) parts.push(String(call.number));
+  if (call.run_id != null) parts.push(String(call.run_id));
+  if (call.domain != null) parts.push(String(call.domain));
+  if (call.scope != null) parts.push(String(call.scope));
+  if (call.search_type != null) parts.push(String(call.search_type));
+  if (call.owner != null) parts.push(String(call.owner));
+  if (call.repo != null) parts.push(String(call.repo));
+  if (call.line != null) parts.push(String(call.line));
+  if (call.character != null) parts.push(String(call.character));
+  if (call.id != null) parts.push(String(call.id));
+  if (call.ocr != null) parts.push(String(call.ocr));
+  if (call.ref != null) parts.push(String(call.ref));
+  return parts.join("\x1f");
+}
+
+// ── Tool Ledger 分类映射 ── 让编排器能按类别统计失败
+const _toolCategoryMap = {
+  read: "file", list: "file", write: "file", edit: "file", multiedit: "file",
+  delete: "file", move: "file", mkdir: "file", copy: "file", format: "file",
+  findfiles: "file", readlogs: "file",
+  search: "search", findfiles: "search", web: "search", websearch: "search",
+  webfetch: "search", knowledgesearch: "search", semanticsearch: "search",
+  githubsearch: "search", developercommunitysearch: "search",
+  gitstatus: "git", gitdiff: "git", gitlog: "git", gitblame: "git",
+  gitcommit: "git", gitbranch: "git", gitpush: "git", gitpull: "git",
+  gitclone: "git", gitstash: "git", gitstashpop: "git", gitstashlist: "git",
+  gitconflicts: "git", ghprcreate: "git", ghprview: "git", ghprchecks: "git",
+  ghprreviewcomments: "git", ghprreply: "git", ghprreview: "git", ghactionslog: "git",
+  browser: "browser", screenshot: "browser", browserlaunch: "browser",
+  readscreen: "browser",
+  dbquery: "db", dbmigrate: "db", backupdatabase: "db",
+  run_cmd: "execution", runterminal: "execution", runintterminal: "execution",
+  readterminal: "execution", listterminals: "execution", stopterminal: "execution",
+  httpprequest: "network", httprequest: "network", download: "network", downloadfile: "network",
+  computer: "desktop", system: "desktop",
+  runsubagent: "orchestration", runworker: "orchestration", awaitsubagent: "orchestration",
+  askuser: "interaction", updateplan: "interaction",
+  genimage: "generation", generateimage: "generation",
+  generate3d: "generation", generatesound: "generation", generatemusic: "generation",
+  generatevoice: "generation", generatemotion: "generation", generatetexture: "generation",
+  autorig: "generation",
+  lspsymbols: "lsp", findsymbol: "lsp", lspdefinition: "lsp",
+  lspreferences: "lsp", getdiagnostics: "lsp",
+};
 function _toolFailureMatch(content) {
   const text = String(content || "");
   return text.match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i)
@@ -35145,18 +35214,29 @@ function _classifyToolFailure(resultText) {
 function _toolLedgerStats(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return "";
   const agg = new Map();
+  const catAgg = new Map(); // 按类别聚合：搜索工具失败了 5 次
   for (const e of entries) {
     const k = e.tool;
     if (!k) continue;
-    if (!agg.has(k)) agg.set(k, { okCount: 0, failCount: 0, lastFailReason: "", failCats: new Map() });
+    if (!agg.has(k)) agg.set(k, { okCount: 0, failCount: 0, lastFailReason: "", failCats: new Map(), category: e.category || "other" });
     const v = agg.get(k);
     if (e.ok) v.okCount++;
     else {
       v.failCount++;
       if (e.reason) v.lastFailReason = String(e.reason).slice(0, 60);
-      // 失败类别分布：账本行体现 permission×2 这类事实，帮编排器学到失败教训
-      const cat = _classifyToolFailure(e.reason || "");
+      // 失败类别分布：优先用预计算的 failCategory，兆底用 _classifyToolFailure
+      const cat = e.failCategory || _classifyToolFailure(e.reason || "");
       v.failCats.set(cat, (v.failCats.get(cat) || 0) + 1);
+      // 类别聚合
+      const toolCat = e.category || "other";
+      if (!catAgg.has(toolCat)) catAgg.set(toolCat, { ok: 0, fail: 0 });
+      catAgg.get(toolCat).fail++;
+    }
+    // 类别聚合（成功）
+    if (e.ok) {
+      const toolCat = e.category || "other";
+      if (!catAgg.has(toolCat)) catAgg.set(toolCat, { ok: 0, fail: 0 });
+      catAgg.get(toolCat).ok++;
     }
   }
   const lines = [];
@@ -35165,17 +35245,23 @@ function _toolLedgerStats(entries) {
     if (total === 0) continue;
     let f = "";
     if (data.failCount > 0) {
-      const cats = [...data.failCats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}×${n}`).join(",");
-      f = ` (${cats}${data.lastFailReason ? `；最近失败：${data.lastFailReason}` : ""})`;
+      const cats = [...data.failCats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}\u00d7${n}`).join(",");
+      f = ` (${cats}${data.lastFailReason ? `\uff1b最近失败：${data.lastFailReason}` : ""})`;
     }
-    lines.push(`${tool}: ${data.okCount}✓/${data.failCount}✗${f}`);
+    lines.push(`${tool}[${data.category}]: ${data.okCount}\u2713/${data.failCount}\u2717${f}`);
+  }
+  // 类别汇总行：让编排器能看到“搜索工具失败了 5 次”
+  const catLines = [];
+  for (const [cat, data] of catAgg) {
+    if (data.fail > 0) catLines.push(`${cat}\u7c7b\u522b: ${data.ok}\u2713/${data.fail}\u2717`);
   }
   lines.sort((a, b) => {
-    const ta = Number(a.match(/\d+✓/)?.[0].slice(0,-1)) || 0;
-    const tb = Number(b.match(/\d+✓/)?.[0].slice(0,-1)) || 0;
+    const ta = Number(a.match(/\d+\u2713/)?.[0].slice(0,-1)) || 0;
+    const tb = Number(b.match(/\d+\u2713/)?.[0].slice(0,-1)) || 0;
     return tb - ta;
   });
-  return lines.slice(0, 20).join("\n");
+  const header = catLines.length ? `\u3010\u7c7b\u522b\u6c47\u603b\u3011${catLines.join(" | ")}\n` : "";
+  return header + lines.slice(0, 20).join("\n");
 }
 
 // 场景签名提取：从 engineering profile 提取稳定关键字段，拼接短字符串
@@ -35835,9 +35921,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     run._toolLedger = { entries: [], turnIndex: 0 };
   }
   const _recordToolCall = (it, ok) => {
+    const _rcToolName = String(it.tc?.name || it.call?._toolName || it.call?.type || "");
     const rec = {
       turn: run._toolLedger.turnIndex,
-      tool: String(it.tc?.name || it.call?._toolName || it.call?.type || ""),
+      tool: _rcToolName,
+      category: _toolCategoryMap[_rcToolName] || _toolCategoryMap[it.call?.type] || "other",
       args: JSON.stringify(it.tc?.parsedArgs || {}),
       argsSummary: (() => {
         const args = it.tc?.parsedArgs || {};
@@ -35854,6 +35942,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         return "";
       })(),
+      failCategory: !ok ? _classifyToolFailure(it.rawResult?.content || "") : undefined,
+      retryCount: !ok ? _getToolFailureCount(_rcToolName) : 0,
     };
     run._toolLedger.entries.push(rec);
     if (run._toolLedger.entries.length > 400) run._toolLedger.entries.shift();
@@ -40367,7 +40457,7 @@ async function _searchKnowledgeBase(call) {
   }
 }
 
-async function _executeToolStep(step, call, root, run) {
+async function _executeToolStepInner(step, call, root, run) {
   if (run) run._toolStep = (run._toolStep || 0) + 1; // per-run tool-call counter (redundant-read saver)
   if (call?.type === "read" && typeof call.path === "string") {
     call.path = _normalizeReadToolPath(call.path);
@@ -41557,7 +41647,7 @@ async function _executeToolStep(step, call, root, run) {
         const _cnt = _recordToolFailure(call.type);
         res.className = "atc-result atc-result--err"; res.textContent = `${_gaLabels[call.type]}生成失败`;
         const _hint = _cnt >= 2 ? `（已失败 ${_cnt} 次，请检查参数和外部服务）` : "";
-        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}${_hint}` };
+        return { type: call.type, path: "", content: `[失败] ${call.type}: ${String(e?.message || e).slice(0, 400)}${_hint}`, _fmRecorded: true };
       }
 
     } else if (call.type === "search_game_assets") {
@@ -41575,7 +41665,7 @@ async function _executeToolStep(step, call, root, run) {
       } catch (e) {
         const _cnt = _recordToolFailure("search_game_assets");
         res.className = "atc-result atc-result--err"; res.textContent = "搜索失败";
-        return { type: "search_game_assets", path: "", content: `[失败] search_game_assets: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）` };
+        return { type: "search_game_assets", path: "", content: `[失败] search_game_assets: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "download_asset") {
@@ -41596,7 +41686,7 @@ async function _executeToolStep(step, call, root, run) {
       } catch (e) {
         const _cnt = _recordToolFailure("download_asset");
         res.className = "atc-result atc-result--err"; res.textContent = "下载失败";
-        return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）` };
+        return { type: "download_asset", path: "", content: `[失败] download_asset: ${String(e?.message || e).slice(0, 300)}（已失败 ${_cnt} 次）`, _fmRecorded: true };
       }
 
     } else if (call.type === "debate") {
@@ -44641,6 +44731,68 @@ ${bodyPreview}`)}</pre>`;
   // Fell through all branches: unknown call.type. Surface this so the model gets
   // feedback (silent null leaves the loop guessing).
   return { type: call.type || "unknown", path: call.path || "", content: `[ERROR] 未识别的工具类型：${call.type || "(空)"}。检查工具名拼写，或者这个工具在当前模式 / 平台不可用。` };
+}
+
+// ── _executeToolStep 统一包装器：缓存 + 失败记忆 + 写操作缓存失效 ──
+// 所有工具调用都经过这里，让 162 个工具自动受益于缓存和失败记忆。
+async function _executeToolStep(step, call, root, run) {
+  // ── 结果缓存统一框架：命中则直接返回，不重复执行 ──
+  const _isCacheable = _CACHEABLE_TOOL_TYPES.has(call?.type);
+  const _cKey = _isCacheable ? _toolCacheKey(call) : null;
+  if (_cKey && _toolResultCache.has(_cKey)) {
+    const _cEntry = _toolResultCache.get(_cKey);
+    if (Date.now() - _cEntry.ts < _TOOL_CACHE_TTL) {
+      const _cv = step.querySelector(".atc-viewport");
+      const _cr = step.querySelector(".atc-result");
+      if (_cv) _cv.textContent = "(cached)";
+      if (_cr) { _cr.className = "atc-result atc-result--ok"; _cr.textContent = "缓存命中"; }
+      return { ..._cEntry.result, _cached: true };
+    }
+    _toolResultCache.delete(_cKey);
+  }
+
+  // ── 失败记忆统一框架：连续失败 ≥3 次自动拦截 ──
+  const _fmCount = _getToolFailureCount(call?.type);
+  if (_fmCount >= 3) {
+    const _fv = step.querySelector(".atc-viewport");
+    const _fr = step.querySelector(".atc-result");
+    if (_fv) _fv.textContent = call?.type;
+    if (_fr) { _fr.className = "atc-result atc-result--err"; _fr.textContent = `已失败 ${_fmCount} 次`; }
+    return { type: call?.type || "unknown", path: call?.path || "", content: `[失败记忆] ${call?.type || "工具"} 已连续失败 ${_fmCount} 次，请检查输入参数或换用其他工具。`, _fmBlocked: true };
+  }
+
+  // 调用实际工具执行
+  const result = await _executeToolStepInner(step, call, root, run);
+
+  // ── 失败记忆统一框架：根据结果内容自动记录 ──
+  const _content = String(result?.content || "");
+  const _isFailure = /\[(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted|WARN|参数错误)\]/i.test(_content)
+    || /\*\*批量自动化结果\*\*/.test(_content) && /[✗×]/.test(_content);
+  if (_isFailure) {
+    if (!result?._fmRecorded) _recordToolFailure(call?.type);
+  } else if (result && !_isFailure) {
+    _resetToolFailure(call?.type);
+  }
+
+  // ── 结果缓存统一框架：只读工具成功结果存入缓存 ──
+  if (_isCacheable && _cKey && !_isFailure) {
+    _toolResultCache.set(_cKey, { result, ts: Date.now() });
+    // 缓存容量上限 200 条，LRU 淘汰
+    if (_toolResultCache.size > 200) {
+      const oldest = _toolResultCache.keys().next().value;
+      _toolResultCache.delete(oldest);
+    }
+  }
+
+  // ── 写操作工具失效相关缓存 ──
+  if (call?.type === "write" || call?.type === "edit" || call?.type === "multiedit" || call?.type === "delete" || call?.type === "move") {
+    const _invPath = call.path || "";
+    for (const [k] of _toolResultCache) {
+      if (k.includes(_invPath)) { _toolResultCache.delete(k); break; }
+    }
+  }
+
+  return result;
 }
 
 // ===== File & DB Retry Helpers =====
