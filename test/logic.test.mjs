@@ -15969,7 +15969,9 @@ test("P1 Git/DB 工具 TOOL_METADATA 含 usage_note", () => {
     "git_status", "git_diff", "git_log", "git_blame", "git_push", "git_pull", "git_stash",
     "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log",
     "gh_pr_review_comments", "gh_pr_reply",
-    "db_query", "db_migrate", "backup_database",
+    // db_migrate / backup_database removed: no such tools in the server registry
+    // (prompts/tools.json), so their metadata could never be reached.
+    "db_query",
     "multi_edit", "semantic_search", "knowledge_search", "find_symbol",
   ];
   for (const tool of tools) {

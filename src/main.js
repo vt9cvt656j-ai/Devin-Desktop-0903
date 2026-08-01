@@ -35375,19 +35375,19 @@ function recommendToolsForIntent(intentText, context = {}) {
     },
     debugging: {
       keywords: ['报错', 'error', 'exception', 'bug', 'fix', 'crash', '异常', '失败'],
-      tools: ['debugger', 'search(error_code)', 'run_cmd(test_command)', 'read_file(log_file)', 'get_diagnostics']
+      tools: ['search(error_code)', 'run_cmd(test_command)', 'read_file(log_file)', 'get_diagnostics']
     },
     performance: {
       keywords: ['慢', '性能', 'slow', 'latency', 'timeout', '卡顿', '响应时间'],
-      tools: ['db_query(explain_plan)', 'browser_navigate(performance_test)', 'run_cmd(benchmark)', 'read_logs(app_error.log)']
+      tools: ['db_query(explain_plan)', 'browser(performance_test)', 'run_cmd(benchmark)', 'read_logs(app_error.log)']
     },
     ui_implementation: {
       keywords: ['界面', 'UI', '页面', 'frontend', 'view', 'component', '设计'],
-      tools: ['browser_launch(headful)', 'screenshot(current_view)', 'generate_design_tokens', 'read_file(css_files)']
+      tools: ['browser(headful)', 'screenshot(current_view)', 'design_board', 'read_file(css_files)']
     },
     data_operations: {
       keywords: ['数据库', 'table', 'schema', 'data', 'migrate', 'query', '表结构'],
-      tools: ['db_query(inspect_schema)', 'db_migrate', 'read_file(migrations/)', 'backup_database']
+      tools: ['db_query(inspect_schema)', 'read_file(migrations/)']
     }
   };
   
