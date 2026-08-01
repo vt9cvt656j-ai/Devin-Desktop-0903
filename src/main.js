@@ -667,9 +667,33 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     const progressStartedAt = Date.now();
     let firstDataAt = null;
     let lastProgressAt = progressStartedAt;
+    let lastByteAt = progressStartedAt;
     let hasProgress = false;
+    // Liveness vs. productivity are different questions, and conflating them was killing
+    // healthy streams.
+    //
+    // The gateway sends an SSE heartbeat (`: ping\n\n`) every 15s while the upstream is
+    // silent, precisely so the connection survives Chinese carrier NATs. But a heartbeat
+    // is an SSE *comment*: no `data:` payload, so it never reaches markFirstProgress().
+    // The stall deadline therefore ignored it, and a model that went quiet for 45s while
+    // composing a big write_file argument (or just thinking) was aborted by the CLIENT as
+    // "网络波动" — even though bytes were arriving the whole time.
+    //
+    // Worse, 45s is stricter than the gateway's own 180s idle guard, so the client gave up
+    // first and the server never got to make the call. Now:
+    //   • bytes (incl. heartbeats) prove the connection is alive → LIVENESS_MS
+    //   • content stalls fall back to a backstop set ABOVE the gateway's idle guard, so the
+    //     server decides when a stream is truly dead and the client stops second-guessing it.
+    const LIVENESS_MS = 60_000;          // 4 missed 15s heartbeats ⇒ connection really is gone
+    const CONTENT_BACKSTOP_MS = 200_000; // > the gateway's 180s idle guard
     const progressDeadline = () => {
-      if (hasProgress) return { at: lastProgressAt + streamTimeouts.stallMs, phase: "stall", limitMs: streamTimeouts.stallMs };
+      if (hasProgress) {
+        const heartbeatAlive = Date.now() - lastByteAt < LIVENESS_MS;
+        const limitMs = heartbeatAlive
+          ? Math.max(streamTimeouts.stallMs, CONTENT_BACKSTOP_MS)
+          : streamTimeouts.stallMs;
+        return { at: lastProgressAt + limitMs, phase: "stall", limitMs };
+      }
       if (firstDataAt != null) return { at: firstDataAt + streamTimeouts.emptyStreamMs, phase: "empty", limitMs: streamTimeouts.emptyStreamMs };
       return { at: progressStartedAt + streamTimeouts.firstProgressMs, phase: "first", limitMs: streamTimeouts.firstProgressMs };
     };
@@ -709,6 +733,9 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     for (;;) {
       const { done, value } = await readWithProgressDeadline();
       if (done) break;
+      // Any bytes — including the gateway's `: ping` heartbeats — prove the connection is
+      // still up, which is what LIVENESS_MS in progressDeadline() keys off.
+      if (value && value.byteLength) lastByteAt = Date.now();
       rawBytes += (value && value.byteLength) || 0;
       if (!sentFirstChunkMetric) {
         sentFirstChunkMetric = true;
