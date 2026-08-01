@@ -7884,8 +7884,30 @@ test("UI design craft guidance is injected only for front-end work", () => {
   const craft = load("_uiDesignCraftBlock", {
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+    _uiStructuralSignal: () => false,
   });
   assert.equal(craft("修复后端接口", { ui: false }), "");
+  // 触发链去单点：分类器漏判 UI，但结构事实（在场的是前端源文件）→ 注入 michael-design 可达性提醒
+  const reach = load("_uiDesignCraftBlock", {
+    _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
+    _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+    _uiStructuralSignal: () => true,
+  })("改一下这个组件", { ui: false });
+  assert.match(reach, /UI 可达性提醒/);
+  assert.match(reach, /knowledge_search/);
+  // 分类器判定不在（intentSource=none，超时/失败）→ 也让 michael-design 可达（此时对是否 UI 无判据）
+  const blind = load("_uiDesignCraftBlock", {
+    _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
+    _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+    _uiStructuralSignal: () => false,
+  })("做个东西", { ui: false, intentSource: "none" });
+  assert.match(blind, /UI 可达性提醒/);
+  // 分类器明确判为非 UI（有裁决、无结构信号）→ 不提醒，尊重裁决
+  assert.equal(load("_uiDesignCraftBlock", {
+    _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
+    _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
+    _uiStructuralSignal: () => false,
+  })("修复后端接口", { ui: false, intentSource: "ai" }), "");
   const ui = craft("写一个 SaaS 官网，配色排版布局要好看", { ui: true, uiProject: true });
   assert.match(ui, /前端设计工艺要求/);
   assert.match(ui, /--background\/--foreground\/--card\/--card-foreground\/--muted\/--muted-foreground/);

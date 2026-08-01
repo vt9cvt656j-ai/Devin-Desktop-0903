@@ -7938,7 +7938,7 @@ function updateLspStatusBar() {
     if (starting.length) parts.push(`(${starting.join(",")} starting…)`);
     setStatusBarItem(
       "lsp",
-      { text: `LSP: ${parts.join(" ")}`, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}\nClick for logs` },
+      { text: `LSP: ${parts.join(" ")}`, order: 10, tooltip: `Active: ${ready.join(", ") || "none"}\nStarting: ${starting.join(", ") || "none"}\nClick for logs` },
       () => openFeaturePanel("lsp"),
     );
   } else {
@@ -27469,10 +27469,15 @@ function _buildAgentOutcomeSummary(run, opts) {
   // "验证：未完全通过或未运行"这种像代码有问题的措辞。
   const verifierUnavailable = /^验证器不可用|^验证未完成/m.test(note);
   const incomplete = _agentIncompleteLabel(run?._incompleteReason || run?._capReason, !!opts.hitCap);
+  // 收尾一致性修复：语义运行核验未完成 + 真实命令/检查已通过 = 不是"未完成/失败"，
+  // 而是"语法/命令已验、运行时行为待你对照目标再确认"。若两条同时以"本轮未完全收尾"
+  // 抬头 + "验证：已通过"并列出现，就会自打脸——此情形改为末尾一句软提醒，不写失败抬头。
+  const _semanticReviewOnly = run?._incompleteReason === "semantic_runtime_review_missing" && !run?._capReason;
+  const _softSemanticCaveat = _semanticReviewOnly && !!opts.verificationPassed;
   const lines = [];
 
   if (finalErr) lines.push(`本轮报错：${finalErr.slice(0, 180)}`);
-  else if (incomplete) lines.push(`本轮未完全收尾：${incomplete}`);
+  else if (incomplete && !_softSemanticCaveat) lines.push(`本轮未完全收尾：${incomplete}`);
   else if (!completed.length && !mutatedFiles.length && !runtimeEffects.length && !externalEffects.length && !opts.didMutate) lines.push("已处理。");
 
   if (completed.length) lines.push(`已完成：${completed.join("；")}`);
@@ -27496,6 +27501,7 @@ function _buildAgentOutcomeSummary(run, opts) {
     else if (verifierUnavailable) lines.push("验证：本机没有可运行的自动验证器（命令不存在/退出 127），对代码零断言；装上工具后可再验。");
     else if (noAutoVerify) lines.push("验证：项目未提供可自动识别的验证命令，未强行瞎跑。");
   }
+  if (_softSemanticCaveat) lines.push("运行时行为的语义核验未完全完成——语法/命令检查已通过，建议对照你的目标再确认一次实际效果。");
   if (pending.length) lines.push(`剩余/待确认：${pending.join("；")}`);
   if (!lines.length) return "";
   return lines.map((line) => `- ${line}`).join("\n");
@@ -32289,6 +32295,10 @@ function _tauriSearchInvokeArgs(call) {
 // one round-trip. Every workspace-writing tool, including asset generation, stays
 // strictly sequential even when two calls happen to name different destinations.
 const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "websearch", "lsp", "screenshot", "diag", "think", "debate", "recall", "termread", "termlist", "logs", "search_tools", "current_time", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo"]);
+// context_only 守卫只针对“联网/查附近/外部扩展”类工具（见下文 _hasContextOnlyLocationIntent 使用处）：
+// 用户只给位置没提问时，别让智能体自行联网/查周边；但绝不拦截位置内的核心文件/终端动作
+// （cd/run_cmd/write_file/edit/list/read…）——否则意图分类一旦把“写个官网”误判成 context_only，终端就“用不了了”。
+const _CONTEXT_ONLY_GUARDED_TYPES = new Set(["web", "websearch", "localdiscovery", "liveenvironment", "livemarkets", "liveflights", "roadenvironment", "trackshipment", "shopcatalog"]);
 const _MUTATING_FILE_TOOL_TYPES = new Set(["write", "edit", "multiedit", "format"]);
 function _isMergedToolItem(item) {
   return item?.merged != null;
@@ -34912,15 +34922,38 @@ function _uiDesignTransactionalRule(p) {
     ? "\n- 交易产品硬约束：二手/商品/商城/交易平台不是静态展示页。默认设计服务端持久化与真实数据边界：用户/会话、商品或挂牌、图片资产、分类/筛选、收藏、卖家与买家、价格/库存、交易状态；先决定 API、schema、鉴权、失败/空状态与图片存储。除非用户明确说“只做静态演示”，禁止用 localStorage、假 JSON 或“无后端”替代这些业务数据。"
     : "";
 }
+// 触发链去单点（能力可达与裁决解耦）：michael-design 以前 100% 挂在意图分类器判定的
+// ui/uiProject 上——分类器失败/超时/误判就整个设计链无声熔灭。这里用**结构事实**
+// （当前打开/@提及的文件是前端源码）而非关键词来兼底：不是词句匹配，是真实在场的
+// 文件类型。裁决（到底是不是 UI 活）仍归模型；我们只保证设计知识“可达”而不是静默消失。
+const _UI_SOURCE_EXT = /\.(tsx|jsx|vue|svelte|astro|html?|css|scss|sass|less)$/i;
+function _uiStructuralSignal(text) {
+  try {
+    if (typeof activePath === "string" && _UI_SOURCE_EXT.test(activePath)) return true;
+    for (const m of String(text || "").matchAll(/(?:^|\s)@([^\s]+)/g)) {
+      if (_UI_SOURCE_EXT.test(m[1])) return true;
+    }
+  } catch {}
+  return false;
+}
 function _uiDesignCraftBlock(text, profile = null, opts = {}) {
   const p = profile || {};
-  if (!(p.ui || p.uiProject)) return "";
+  if (!(p.ui || p.uiProject)) {
+    // 触发链去单点（能力可达与裁决解耦）：分类器没标 UI 时，两种情形仍让 michael-design 可达——
+    // ① 结构事实：当前/待改文件是前端源码；② 分类器判定不在（intentSource=none，超时/失败，
+    // 我们对是否 UI 毫无判据）。分类器明确判为非 UI（有裁决且 ui=false 且无结构信号）时不提醒，
+    // 尊重裁决、不刷噪音。裁决仍归模型；纯后端可忽略。不强推完整设计律（避免误伤后端）。
+    if (_uiStructuralSignal(text) || p.intentSource === "none") {
+      return "\n\n🎨 **UI 可达性提醒**：本轮未能确认是否 UI 任务（意图分类缺失，或当前涉及前端源码文件 .tsx/.vue/.css/.html 等）。如果这轮确实要写/改可见界面或网页，先成功调用 `knowledge_search(domain=\"michael-design\")` 按信息架构/配色/组件/动效取真实设计证据再动手，别凭记忆糊 UI；纯后端/数据/构建任务可忽略本提醒。";
+    }
+    return "";
+  }
   // token 优化（不降智）：本块 ≈4K token 每次发送全价，而内容与服务端 L0 的
   // michael-design 各层（design_system/components/content/motion，走缓存 0.1 倍价）高度
   // 重叠。L0 开启且语义旗标头已送达（服务端必然装配设计层）时只留锚点与客户端
   // 独有细则；裁决缺席或第三方直连（没人注入）时仍全量兑底——零回退：宁重复不缺席。
   if (opts.serverDesignLayersActive) {
-    return "\n\n【设计执行】严格按系统提示词中 michael-design 各层（信息架构/配色/组件/布局/动效/媒体/验收）执行，那是本项目设计纪律的唯一完整版本；本地不再重复。"
+    return "\n\n【设计执行】严格按系统提示词中 michael-design 各层（信息架构/配色/组件/布局/动效/媒体/验收）执行，那是本项目设计纪律的唯一完整版本；本地不再重复。**兜底：若系统提示词里并未出现这些设计层（网关注入缺失），必须先成功调用 `knowledge_search(domain=\"michael-design\")` 取设计证据再写，绝不凭记忆糊 UI。**"
       + _uiDesignReferenceRule(p) + _uiDesignTransactionalRule(p);
   }
   const referenceRule = _uiDesignReferenceRule(p);
@@ -37377,21 +37410,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           return r.content;
         }
         const currentUserText = [run?._originalText, run?._steeringText].filter(Boolean).join("\n");
-        if (call.type !== "memory" && _hasContextOnlyLocationIntent(run.engineering)) {
-          // 二次确认：检测用户是否有明确的查询意图（即使意图模型判错）
-          const queryKeywords = ["怎么", "如何", "实现", "修复", "改", "调试", "分析", "检查", "验证", "测试", "什么", "为什么", "哪儿", "哪里"];
-          const hasQueryIntent = queryKeywords.some(kw => currentUserText.includes(kw));
-          
-          if (hasQueryIntent) {
-            // 虽然意图判定说"context_only"，但用户明确有查询词 → 放行，纠正意图
-            run.engineering.intentSemantic.locationIntent = "query";
-          } else {
-            // 真正是仅提供位置 → 正常拦截
-            const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 用户这轮只提供了位置上下文，没有提出查询。不要联网、不要查附近、不要自行扩展任务；简短确认已理解该位置，然后等待用户的具体问题。" };
-            it.rawResult = r;
-            _settleToolStep(step, r, "仅记录上下文 · 未查询");
-            return r.content;
-          }
+        // context_only 的本意（见下方 BLOCKED 文案）是“用户只给了位置、没提问题 → 别联网/查附近/
+        // 自行扩展”。它绝不该拦截智能体在该位置内的核心动作（cd/run_cmd/write_file/edit/list/read…）——
+        // 否则意图分类一旦把“写个官网”这类建站请求误判成 context_only，智能体的 cd/npm 就全被降级成
+        // “仅记录上下文”，终端就“用不了了”。故：① 只对联网/查附近类扩展工具生效；② 分类器已识别
+        // 动作意图（create/modify/run/debug/operate…）或本轮已有写操作时，说明这不是“仅位置”，整门不触发。
+        const _coSem = run.engineering?.intentSemantic || {};
+        const _coWantsAction = ["create", "modify", "run", "debug", "operate", "review", "plan"].includes(String(_coSem.action || ""));
+        const _coGuardedTool = _CONTEXT_ONLY_GUARDED_TYPES.has(call.type);
+        if (call.type !== "memory" && _coGuardedTool && !_coWantsAction && !run._didMutate && _hasContextOnlyLocationIntent(run.engineering)) {
+          // 纯 AI 主判 + 结构事实：分类器已将 locationIntent 判为 context_only、action 非动作类，且这是联网/
+          // 查附近扩展工具、本轮还没写入 → 拦截扩展（别联网/查附近/自行扩展）。已按“AI主判独占、
+          // 禁加关键词语义分支”移除了原来的疑问词列表二次猜测；是否放行完全由分类器的结构化
+          // action/locationIntent 裁决——上面 !_coWantsAction + locationIntent=context_only 已代表分类器认定用户无动作/查询意图。
+          const r = { type: call.type, path: call.path || "", content: "[BLOCKED] 用户这轮只提供了位置上下文，没有提出查询。不要联网、不要查附近、不要自行扩展任务；简短确认已理解该位置，然后等待用户的具体问题。" };
+          it.rawResult = r;
+          _settleToolStep(step, r, "仅记录上下文 · 未查询");
+          return r.content;
         }
         // search_tools — 元工具：把命中的延迟工具 schema 换入有界窗口。不走 _executeToolStep。
         if (call && call.type === "search_tools") {
@@ -55340,17 +55375,12 @@ function updateStatusBar() {
     setStatusBarItem("_eol", { text: eol, tooltip: "Select End of Line", order: 60 });
   }
 
-  const lspItems = lspManager?.status() || [];
-  const running = lspItems.filter((s) => s.running);
-  if (running.length) {
-    setStatusBarItem("_lsp", {
-      text: `LSP: ${running.map((s) => s.lang).join(", ")}`,
-      tooltip: "Language Servers",
-      order: 10,
-    });
-  } else {
-    removeStatusBarItem("_lsp");
-  }
+  // LSP badge is owned SOLELY by updateLspStatusBar() (key "lsp"), which distinguishes
+  // ready vs starting servers and opens the LSP log on click. A second item under a
+  // DIFFERENT key ("_lsp") here rendered a duplicate "LSP: …" badge — setStatusBarItem
+  // dedups per key, so "lsp" and "_lsp" both survived (two "LSP: yaml" on screen).
+  // Delegate to the canonical renderer so the badge also refreshes on model/cursor change.
+  updateLspStatusBar();
 }
 
 let _statusBarRAF = 0;

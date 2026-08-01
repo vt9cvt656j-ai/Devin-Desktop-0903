@@ -8,14 +8,7 @@ const TOOL_METADATA = Object.freeze({
     triggers: ['陌生代码库', '技术选型', '需要参考实现', '遇到问题先搜社区'],
     example_call: "github_search(query='react hooks best practices', search_type='repositories')",
     priority: 'high',
-    usage_note: '🛡️ GitHub 先验纪律要求：遇到陌生技术栈时，优先调用此工具而非盲目实现'
-  },
-  developer_community_search: {
-    category: 'research',
-    use_cases: ['技术优缺点讨论', '踩坑经验分享', '方案评估'],
-    triggers: ['陌生技术栈', '性能问题', '需要社区经验', '评估技术方案'],
-    example_call: "developer_community_search(query='Vite monorepo migration issues', scope='all')",
-    priority: 'high'
+    usage_note: '🛡️ GitHub 先验纪律要求：遇到陌生技术栈时，优先调用此工具而非盲目实现。【vs 替代】读某个已知仓库的真实内容用 github_repo；查包版本/兼容性用 package_search；本地代码库内搜索用 search。'
   },
   web_search: {
     category: 'research',
@@ -25,15 +18,8 @@ const TOOL_METADATA = Object.freeze({
     priority: 'high',
     usage_note: '【何时用】需要查找最新信息、官方文档、错误解决方案时。【vs 替代】代码库内搜索用 search；知识库用 knowledge_search。【何时不用】已有代码内答案时不要联网搜索。'
   },
-  
+
   // 调试诊断类工具
-  debugger: {
-    category: 'diagnostics',
-    use_cases: ['断点调试', '变量追踪', '调用栈分析'],
-    triggers: ['运行时错误', '逻辑 bug', '需要追踪执行流'],
-    example_call: "debugger(error_log='Uncaught TypeError at line 42')",
-    priority: 'high'
-  },
   search: {
     category: 'diagnostics',
     use_cases: ['错误码搜索', '日志关键词查找', '代码模式匹配'],
@@ -146,56 +132,7 @@ const TOOL_METADATA = Object.freeze({
     priority: 'low',
     usage_note: '【何时用】改完代码想统一格式风格时。【vs 替代】局部调整直接 edit_file。仅支持有 LSP 的语言。'
   },
-  
-  // 性能分析类工具
-  profiler: {
-    category: 'analysis',
-    use_cases: ['接口响应时间分析', 'CPU/内存瓶颈定位', '性能优化验证'],
-    triggers: ['响应慢', '性能卡顿', '超时问题', '需要性能基准'],
-    example_call: "profiler(endpoint='/api/users')",
-    priority: 'high'
-  },
-  db_query: {
-    category: 'data_layer',
-    use_cases: ['数据库结构检查', '慢查询分析', '数据验证'],
-    triggers: ['数据库操作', '数据结构变更', '需要 inspect schema', '查询慢'],
-    example_call: "db_query(driver='sqlite', query='EXPLAIN SELECT * FROM users')",
-    priority: 'high',
-    usage_note: '【何时用】查询数据库结构、执行 SQL、分析慢查询时。【vs 替代】数据库迁移用 db_migrate。【何时不用】需要修改表结构时用 db_migrate。'
-  },
-  
-  // UI 自动化类工具
-  browser_launch: {
-    category: 'ui_automation',
-    use_cases: ['前端交互测试', 'UI 状态验证', '页面截图'],
-    triggers: ['前端界面', '用户交互', '需要验证视觉效果'],
-    example_call: "browser(action='navigate', url='http://localhost:5174', fresh=true)",
-    priority: 'medium'
-  },
-  screenshot: {
-    category: 'ui_automation',
-    use_cases: ['界面快照', '视觉回归测试', 'UI 状态记录'],
-    triggers: ['需要保存界面状态', '验证渲染结果', '对比 UI 变化'],
-    example_call: "screenshot(url='http://localhost:5174', width=1440, height=900)",
-    priority: 'low'
-  },
-  
-  // 数据库操作类工具
-  db_migrate: {
-    category: 'data_layer',
-    use_cases: ['数据迁移', '表结构变更', 'Schema 更新'],
-    triggers: ['需要修改数据库结构', '数据格式转换', '版本升级'],
-    example_call: "db_migrate(script='./migrations/20240101_add_users.sql')",
-    priority: 'high'
-  },
-  backup_database: {
-    category: 'data_layer',
-    use_cases: ['变更前备份', '数据恢复准备', '安全操作前置'],
-    triggers: ['重大变更前', '数据迁移前', '危险操作前'],
-    example_call: "backup_database(source='app.db', dest='./backups/app.backup')",
-    priority: 'high'
-  },
-  
+
   // 开发辅助工具
   ask_user: {
     category: 'interaction',
@@ -210,9 +147,10 @@ const TOOL_METADATA = Object.freeze({
     use_cases: ['任务拆解', '进度跟踪', '里程碑设置'],
     triggers: ['复杂任务', '多步骤工作', '需要记录进度'],
     example_call: "update_plan(steps=[{content: 'Implement auth', status: 'in_progress'}])",
-    priority: 'medium'
+    priority: 'medium',
+    usage_note: '【何时用】多文件/跨模块/多步骤任务开工时列出完整路线并随真实证据推进状态。【vs 替代】只读诊断/看日志/恢复依赖/跑验证不要套计划。【何时不用】简单一步修改不建计划。'
   },
-  
+
   // Git 相关工具
   git_branch: {
     category: 'version_control',
@@ -230,7 +168,7 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium',
     usage_note: '【何时用】完成一个小阶段需要保存进度时。【vs 替代】创建分支用 git_branch；推送用 git_push。【何时不用】还没完成一个完整阶段时不要急于提交。'
   },
-  
+
   // 文件系统操作
   read_file: {
     category: 'file_io',
@@ -248,7 +186,7 @@ const TOOL_METADATA = Object.freeze({
     priority: 'critical',
     usage_note: '【何时用】探索项目结构、发现文件位置时。【vs 替代】读文件内容用 read_file；按模式找文件用 find_files。【何时不用】已知路径直接 read_file。'
   },
-  
+
   // Web 服务与 API
   web_fetch: {
     category: 'networking',
@@ -258,75 +196,7 @@ const TOOL_METADATA = Object.freeze({
     priority: 'high',
     usage_note: '【何时用】抓取公网网页正文——读 web_search 找到的页面、在线文档、API 参考、报错信息等。【vs 替代】搜索用 web_search；调 API 发请求用 http_request。【何时不用】不需要读网页正文时；代码库内搜索用 search。'
   },
-  
-  // 性能分析类工具（新增）
-  performance_profile: {
-    category: 'performance_analysis',
-    use_cases: ['前端性能检测', '页面加载慢问题排查', 'CPU 内存监控'],
-    triggers: ['页面响应慢', '性能卡顿', '需要性能基准', '定位渲染瓶颈'],
-    example_call: "performance_profile(url='http://localhost:5174', metrics='both', timeoutSeconds=30)",
-    priority: 'high'
-  },
-  
-  // 规范解析类工具 (新增)
-  openapi_parser: {
-    category: 'specification_parsing',
-    use_cases: ['API 端点清单提取', 'Swagger 规范审查', '生成 curl 示例模板'],
-    triggers: ['需要查看可用 API', 'OpenAPI/Swagger 文档', '接口对接开发'],
-    example_call: "openapi_parser(url='./openapi.json', outputFormat='list')",
-    priority: 'medium'
-  },
-  
-  // 子智能体编排类工具 (P2.1 异步作业 + #46 拆分并行)
-  run_worker: {
-    category: 'orchestration',
-    use_cases: ['大项目多模块并行实现', '独立 scope 同时开发', '把已明确契约的模块交给写入型 worker'],
-    triggers: ['计划里有互不依赖的实现步骤', '多模块可按目录清晰切分 scope', '需要并行写入加速大工程'],
-    example_call: "run_worker(description='Build API', prompt='Implement the verified API contract.', scope=['src/api'], role='backend')",
-    priority: 'medium'
-  },
-  run_subagent: {
-    category: 'orchestration',
-    use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据', '单个聚焦文件调查不要派——主智能体直接读更快'],
-    triggers: ['根因未明需要并行取证', '调研可后台跑不阻塞主任务', '需要独立视角审查/调研'],
-    example_call: "run_subagent(description='Audit auth', prompt='Inspect auth and return file:line evidence.', role='research')",
-    priority: 'medium'
-  },
-  await_subagent: {
-    category: 'orchestration',
-    use_cases: ['等待后台子智能体作业落定并取回报告', '下一步依赖调研结论时显式同步', '查看作业台账现状'],
-    triggers: ['run_subagent 后台派发后需要结果', '汇合后台作业结果', '收尾前还有作业在跑', '拦截提示结果未消化'],
-    example_call: "await_subagent(job='all')",
-    priority: 'medium'
-  },
-  
-  // 测试骨架生成类工具 (新增)
-  generate_test_cases: {
-    category: 'code_quality',
-    use_cases: ['写完功能要补测试', '为导出函数/类生成测试骨架', '补齐正常/边界/错误用例框架'],
-    triggers: ['需要补单元测试', '新功能缺测试覆盖', '生成测试文件模板'],
-    example_call: "generate_test_cases(path='src/utils.js', framework='auto')",
-    priority: 'medium'
-  },
-  
-  // 容器编排执行类工具 (新增)
-  docker_compose_up: {
-    category: 'execution',
-    use_cases: ['启动多服务/微服务本地环境', '拉起 Compose 服务栈', '容器启动失败自愈提示'],
-    triggers: ['项目含 docker-compose.yml', '需要本地依赖服务 (数据库/缓存)', '启动容器服务栈'],
-    example_call: "docker_compose_up(path='docker-compose.yml', detach=true)",
-    priority: 'medium'
-  },
-    
-  // 实时新闻聚合类工具 (新增)
-  realtime_news_feed: {
-    category: 'information_gathering',
-    use_cases: ['了解技术近期动态', '版本发布跟踪', '社区评价收集', '技术风向调研'],
-    triggers: ['想了解某技术的最新讨论', '关注版本发布动态', '收集社区反馈'],
-    example_call: "realtime_news_feed(topic='Rust 1.80', sources='all', maxResults=15)",
-    priority: 'high'
-  },
-    
+
   // 代码生成与修改
   edit_file: {
     category: 'code_editing',
@@ -351,16 +221,6 @@ const TOOL_METADATA = Object.freeze({
     example_call: "run_cmd(command='npm test')",
     priority: 'high',
     usage_note: '【何时用】运行测试、构建、安装依赖等一次性命令时。【vs 替代】长时间运行的服务用 run_in_terminal。【何时不用】需要持续运行的进程用 run_in_terminal。'
-  },
-
-  // 桌面自动化
-  computer: {
-    category: 'desktop_automation',
-    use_cases: ['鼠标点击/移动/拖拽', '键盘输入/快捷键', '屏幕信息查询', '窗口管理', '剪贴板操作'],
-    triggers: ['需要操控桌面应用', '模拟鼠标键盘', '查看屏幕信息', '操作非浏览器窗口'],
-    example_call: "computer(method='mouse.click', params={x: 100, y: 200})",
-    priority: 'medium',
-    usage_note: '【何时用】需要操控桌面应用的鼠标键盘时。【vs 替代】浏览器内操作用 browser；系统菜单/应用跳转用 system。【何时不用】纯浏览器内交互请用 browser。'
   },
 
   // 游戏资产生成类
@@ -452,7 +312,6 @@ const TOOL_METADATA = Object.freeze({
   },
   gitlab_search: { category: 'research', use_cases: ['GitLab 项目搜索'], triggers: ['需要 GitLab 代码'], example_call: "gitlab_search(query='CI pipeline config')", priority: 'medium', usage_note: '【何时用】搜索 GitLab 上的公开项目/代码。【vs 替代】GitHub 用 github_search。' },
   gitee_search: { category: 'research', use_cases: ['Gitee 项目搜索'], triggers: ['需要国内开源项目'], example_call: "gitee_search(query='Vue 组件库')", priority: 'medium', usage_note: '【何时用】搜索 Gitee 上的国内开源项目。【vs 替代】国际项目用 github_search。' },
-  codeberg_search: { category: 'research', use_cases: ['Codeberg 项目搜索'], triggers: ['需要自由软件项目'], example_call: "codeberg_search(query='federated wiki')", priority: 'low', usage_note: '【何时用】搜索 Codeberg 上的自由/开源项目。【vs 替代】主流项目用 github_search。' },
   cve_search: { category: 'research', use_cases: ['安全漏洞查询', 'CVE 编号查找'], triggers: ['安全审计', '依赖漏洞检查'], example_call: "cve_search(query='Node.js HTTP2 vulnerability')", priority: 'high', usage_note: '【何时用】查询已知安全漏洞/CVE 编号时。【vs 替代】通用搜索用 web_search。【何时不用】非安全相关调研。' },
   wiki_search: { category: 'research', use_cases: ['维基百科知识检索'], triggers: ['需要概念解释', '查找百科信息'], example_call: "wiki_search(query='CAP theorem')", priority: 'low', usage_note: '【何时用】查找百科知识/概念解释时。【vs 替代】技术文档用 web_search。' },
   stackoverflow_search: { category: 'research', use_cases: ['StackOverflow 问答搜索'], triggers: ['遇到编程问题', '查找解决方案'], example_call: "stackoverflow_search(query='TypeScript generic constraint')", priority: 'high', usage_note: '【何时用】搜索 StackOverflow 上的编程问答。【vs 替代】多源聚合用 developer_community_search。' },
@@ -493,7 +352,7 @@ const TOOL_METADATA = Object.freeze({
   github_trending: { category: 'research', use_cases: ['GitHub 趋势项目浏览'], triggers: ['了解热门项目', '技术趋势'], example_call: "github_trending()", priority: 'medium', usage_note: '【何时用】浏览 GitHub 当前热门项目/仓库。【vs 替代】特定搜索用 github_search。' },
   infoq_search: { category: 'research', use_cases: ['InfoQ 技术文章搜索'], triggers: ['企业级技术', '架构设计'], example_call: "infoq_search(query='microservices patterns')", priority: 'low', usage_note: '【何时用】搜索 InfoQ 企业级技术文章。' },
   hackernoon_search: { category: 'research', use_cases: ['HackerNoon 技术博客搜索'], triggers: ['技术博文'], example_call: "hackernoon_search(query='WebAssembly future')", priority: 'low', usage_note: '【何时用】搜索 HackerNoon 技术博客。【vs 替代】多源聚合用 developer_community_search。' },
-  codeberg_search: { category: 'research', use_cases: ['Codeberg 项目搜索'], triggers: ['自由软件项目'], example_call: "codeberg_search(query='privacy browser')", priority: 'low', usage_note: '【何时用】搜索 Codeberg 上的自由软件项目。' },
+  codeberg_search: { category: 'research', use_cases: ['Codeberg 项目搜索', '自由/开源项目发现'], triggers: ['需要自由软件项目', '非主流开源'], example_call: "codeberg_search(query='privacy browser')", priority: 'low', usage_note: '【何时用】搜索 Codeberg 上的自由/开源项目。【vs 替代】主流项目用 github_search；读某仓库真实内容用 codeberg_repo。' },
   bestofjs_search: { category: 'research', use_cases: ['Best of JS 项目排名搜索'], triggers: ['前端框架排名', 'JS 库对比'], example_call: "bestofjs_search(query='state management')", priority: 'low', usage_note: '【何时用】搜索 Best of JS 上的前端项目排名。' },
   sourcegraph_search: { category: 'research', use_cases: ['Sourcegraph 跨仓库代码搜索'], triggers: ['大规模代码搜索', '跨项目引用'], example_call: "sourcegraph_search(query='useEffect cleanup')", priority: 'medium', usage_note: '【何时用】跨多个仓库搜索代码模式/引用。【vs 替代】单仓库用 search。' },
   deep_search: { category: 'research', use_cases: ['深层递归搜索'], triggers: ['需要多步调研', '复杂问题'], example_call: "deep_search(query='best auth strategy for SPA')", priority: 'medium', usage_note: '【何时用】需要多步递归搜索的复杂调研。【vs 替代】简单搜索用 web_search。' },
@@ -526,20 +385,20 @@ const TOOL_METADATA = Object.freeze({
   tor_request: { category: 'networking', use_cases: ['Tor 匿名网络请求'], triggers: ['需要匿名访问', '.onion 站点'], example_call: "tor_request(method='GET', url='http://example.onion/')", priority: 'low', usage_note: '【何时用】通过 Tor 网络访问 .onion 站点或匿名请求。桌面专用。' },
   performance_profile: { category: 'diagnostics', use_cases: ['前端性能分析', '页面加载检测'], triggers: ['页面加载慢', '性能瓶颈定位'], example_call: "performance_profile(url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】分析前端页面性能（仅 localhost）。【vs 替代】后端性能用 profiler。' },
   openapi_parser: { category: 'specification_parsing', use_cases: ['OpenAPI 规范解析', 'API 端点提取'], triggers: ['查看可用 API', '接口文档解析'], example_call: "openapi_parser(url='./openapi.json', outputFormat='list')", priority: 'medium', usage_note: '【何时用】解析 OpenAPI/Swagger 规范提取端点列表。' },
-  generate_test_cases: { category: 'code_quality', use_cases: ['测试用例生成', '测试骨架创建'], triggers: ['需要补测试', '生成测试模板'], example_call: "generate_test_cases(path='src/utils.js')", priority: 'medium', usage_note: '【何时用】为函数/类生成测试用例骨架。' },
-  docker_compose_up: { category: 'execution', use_cases: ['多服务容器启动'], triggers: ['需要启动依赖服务', '本地开发环境'], example_call: "docker_compose_up(path='docker-compose.yml')", priority: 'medium', usage_note: '【何时用】用 docker-compose 启动多服务环境。' },
+  generate_test_cases: { category: 'code_quality', use_cases: ['写完功能补测试', '为导出函数/类生成测试骨架', '补齐正常/边界/错误用例框架'], triggers: ['需要补单元测试', '新功能缺测试覆盖', '生成测试文件模板'], example_call: "generate_test_cases(path='src/utils.js')", priority: 'medium', usage_note: '【何时用】为函数/类生成测试用例骨架（正常/边界/错误）。【vs 替代】真正跑测试用 run_cmd。【何时不用】已有测试只需补断言时直接 edit_file。' },
+  docker_compose_up: { category: 'execution', use_cases: ['多服务/微服务本地环境', '拉起 Compose 服务栈'], triggers: ['项目含 docker-compose.yml', '需要本地依赖服务(数据库/缓存)'], example_call: "docker_compose_up(path='docker-compose.yml')", priority: 'medium', usage_note: '【何时用】用 docker-compose 启动多服务栈。【vs 替代】单个持续进程用 run_in_terminal；一次性命令用 run_cmd。' },
   run_worker: { category: 'orchestration', use_cases: ['大项目多模块并行实现', '独立 scope 同时开发', '把已删除的模块交给写入型 worker'], triggers: ['计划里有互不依赖的实现步骤', '多模块可按目录清晰切分 scope', '需要并行写入加速大工程'], example_call: "run_worker(description='Build API', prompt='Implement the verified API contract.', scope=['src/api'], role='backend')", priority: 'medium', usage_note: '【何时用】把互不依赖的模块交给 worker 并行实现。【vs 替代】调研用 run_subagent。' },
   run_subagent: { category: 'orchestration', use_cases: ['bug 深度取证并行', '后台调研不阻塞主线', '收集日志/复现路径/关联调用方证据', '单个聚焦文件调查不要派——主智能体直接读更快'], triggers: ['根因未明需要并行取证', '调研可后台跑不阻塞主任务', '需要独立视角审查/调研'], example_call: "run_subagent(description='Audit auth', prompt='Inspect auth and return file:line evidence.', role='research')", priority: 'medium', usage_note: '【何时用】派发后台调研/独立审查任务。【vs 替代】并行写入用 run_worker。' },
   await_subagent: { category: 'orchestration', use_cases: ['等待后台子智能体作业落定并取回报告', '下一步依赖调研结论时显式同步', '查看作业台账现状'], triggers: ['run_subagent 后台派发后需要结果', '汇合后台作业结果', '收尾前还有作业在跑', '拦截提示结果未消化'], example_call: "await_subagent(job='all')", priority: 'medium', usage_note: '【何时用】等待并取回子智能体/worker 的作业结果。' },
   debate: { category: 'orchestration', use_cases: ['多视角论证', '技术方案对比'], triggers: ['需要多角度分析', '技术选型对比'], example_call: "debate(question='REST vs GraphQL', perspectives=['security', 'performance'])", priority: 'medium', usage_note: '【何时用】需要多视角论证复杂技术决策。' },
   generate_image: { category: 'generation', use_cases: ['图片生成'], triggers: ['需要生成图片', 'UI 素材'], example_call: "generate_image(prompt='Clean product backdrop', dest='assets/hero.png')", priority: 'medium', usage_note: '【何时用】生成图片。桌面专用。' },
   figma: { category: 'creative', use_cases: ['Figma 设计稿读取'], triggers: ['需要读取 Figma 设计', '设计稿对接'], example_call: "figma(url='https://figma.com/file/KEY/Design')", priority: 'high', usage_note: '【何时用】读取 Figma 设计稿内容。桌面/网页双端支持。' },
-  screenshot: { category: 'ui_automation', use_cases: ['网页截图', '视觉快照'], triggers: ['保存界面状态', '视觉对比'], example_call: "screenshot(url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】对网页截图保存视觉状态。' },
-  computer: { category: 'desktop_automation', use_cases: ['桌面鼠标/键盘操作', '窗口管理'], triggers: ['操控桌面应用', '模拟用户操作'], example_call: "computer(method='mouse.click', params={x:100,y:200})", priority: 'medium', usage_note: '【何时用】操控桌面应用的鼠标键盘。桌面专用。【vs 替代】浏览器内用 browser。' },
+  screenshot: { category: 'ui_automation', use_cases: ['网页截图/视觉快照', 'UI 状态记录', '视觉回归'], triggers: ['保存界面视觉状态', '验证渲染结果', '对比 UI 变化'], example_call: "screenshot(url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】渲染网址并截图保存视觉状态/做最终视觉验收。【vs 替代】需要交互（登录/点击/表单/E2E）用 browser；和设计稿并排对比用 visual_compare。【何时不用】需要多步操作时不要用截图。' },
+  computer: { category: 'desktop_automation', use_cases: ['桌面鼠标/键盘操作', '窗口管理', '剪贴板操作'], triggers: ['操控桌面应用', '模拟用户操作', '操作非浏览器窗口'], example_call: "computer(method='mouse.click', params={x:100,y:200})", priority: 'medium', usage_note: '【何时用】操控桌面应用的鼠标键盘/窗口。桌面专用。【vs 替代】浏览器内操作用 browser；系统菜单/应用跳转用 system。【何时不用】纯浏览器内交互用 browser。' },
   system: { category: 'desktop_automation', use_cases: ['系统信息查询', '窗口管理'], triggers: ['获取系统信息', '管理窗口'], example_call: "system(action='frontmost')", priority: 'low', usage_note: '【何时用】查询系统信息/管理窗口。桌面专用。' },
   read_screen: { category: 'desktop_automation', use_cases: ['屏幕内容读取', 'OCR'], triggers: ['需要读取屏幕信息'], example_call: "read_screen(ocr=false)", priority: 'low', usage_note: '【何时用】读取当前屏幕内容。桌面专用。' },
   ui_click: { category: 'desktop_automation', use_cases: ['UI 元素点击'], triggers: ['需要点击界面元素'], example_call: "ui_click(ref=12, action='press')", priority: 'low', usage_note: '【何时用】点击 UI 元素。桌面专用。' },
-  visual_compare: { category: 'ui_automation', use_cases: ['设计稿与实现对比'], triggers: ['视觉回归', '设计还原检查'], example_call: "visual_compare(design='assets/design.png', url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】对比设计稿与实际实现的视觉差异。' },
+  visual_compare: { category: 'ui_automation', use_cases: ['设计稿与实现对比'], triggers: ['视觉回归', '设计还原检查'], example_call: "visual_compare(design='assets/design.png', url='http://localhost:5174')", priority: 'medium', usage_note: '【何时用】把实现页面与目标设计稿并排对比视觉差异（布局/间距/颜色/字体）。【vs 替代】只看当前效果不需设计稿用 screenshot；需要交互操作用 browser。' },
   design_board: { category: 'creative', use_cases: ['多方案视觉对比板'], triggers: ['设计方案展示', 'A/B 视觉对比'], example_call: "design_board(variants=[{label:'A', path:'a.png'}])", priority: 'low', usage_note: '【何时用】创建多方案视觉对比板。' },
   preview_choices: { category: 'interaction', use_cases: ['可视化选项展示'], triggers: ['需要用户做视觉选择'], example_call: "preview_choices(title='Choose layout', variants=[{name:'A', html:'<i>A</i>'}])", priority: 'low', usage_note: '【何时用】以可视化方式展示选项让用户选择。' },
   visual_explain: { category: 'creative', use_cases: ['可视化解释技术概念'], triggers: ['需要用图解释流程', '架构可视化'], example_call: "visual_explain(title='Auth flow', prompt='Login -> Token -> API')", priority: 'low', usage_note: '【何时用】用可视化方式解释技术概念/流程。' },
@@ -569,6 +428,26 @@ const TOOL_METADATA = Object.freeze({
   remote: { category: 'networking', use_cases: ['远程连接管理'], triggers: ['管理远程连接'], example_call: "remote(action='status')", priority: 'low', usage_note: '【何时用】管理远程 SSH/网关连接状态。' },
   start_demo: { category: 'utility', use_cases: ['启动演示模式'], triggers: ['展示功能'], example_call: "start_demo()", priority: 'low', usage_note: '【何时用】启动演示模式展示功能。' },
   stop_demo: { category: 'utility', use_cases: ['停止演示模式'], triggers: ['结束演示'], example_call: "stop_demo()", priority: 'low', usage_note: '【何时用】停止演示模式。' },
+
+  // ── P2 补全：机械差分发现的 16 个「有 schema 但缺 TOOL_METADATA」的高价值工具 ──
+  // 缺元数据 = 语义编排器 catalog 里没有【场景/触发器】关联认知 → 该工具被 under-select（工具漏斗/盲搜根因）。
+  // 全部对齐 Claude Code 的「何时用 / vs 替代 / 何时不用」三段式，只补 client 侧元数据（L0 不剥、不碰主模型 prompt cache 前缀）。
+  browser: { category: 'ui_automation', use_cases: ['登录/多步表单', '点击/输入/上传', 'E2E/UI 行为验证', '抓真实接口前置'], triggers: ['需要真实浏览器交互', '验证前端行为', '登录后才可见的页面'], example_call: "browser(action='navigate', url='http://127.0.0.1:5174', fresh=true)", priority: 'high', usage_note: '【何时用】需要真实浏览器交互（登录、多步表单、点击、E2E/UI 行为验证）时；默认流程 navigate→check→nodes→batch→assert。【vs 替代】只看静态布局/最终视觉验收用 screenshot；抓纯数据用 http_request；读源码用 read_file。【何时不用】读文件或抓纯数据时，绝不用浏览器一页页抄。' },
+  package_search: { category: 'research', use_cases: ['查包版本与兼容性', 'latest/engines/peerDependencies 核实', '选依赖版本'], triggers: ['改 package.json/锁文件', '选版本或处理 peer 冲突', '引入新库前'], example_call: "package_search(query='axios', ecosystem='npm')", priority: 'high', usage_note: '【何时用】改 package.json/锁文件/依赖版本前，用它核实 latest、版本历史、engines、peerDependencies，别凭记忆猜版本。【vs 替代】读仓库源码用 github_repo；查打包体积用 bundlephobia_search。【何时不用】不涉及依赖版本时。' },
+  get_diagnostics: { category: 'diagnostics', use_cases: ['改完代码自检', 'LSP 实时错误/警告', '定位报错行列'], triggers: ['写完/改完代码', '排查编译或类型错误', '报错但不知具体位置'], example_call: "get_diagnostics(path='src/main.ts')", priority: 'high', usage_note: '【何时用】改完代码快速自检，或排查报错时读 LSP 实时诊断（文件:行列+原因+修复方向）；这是只读证据，不运行命令。【vs 替代】运行期日志用 read_logs；跑测试/构建用 run_cmd。【何时不用】非代码文件没有诊断。' },
+  read_logs: { category: 'diagnostics', use_cases: ['读终端/日志尾部', '后端/构建失败取证', '看 .log/.out/.err'], triggers: ['后端/API/构建报错', '需要真实错误原因', '持续任务输出'], example_call: "read_logs(name='dev-server', lines=200)", priority: 'high', usage_note: '【何时用】后端/API/构建失败时，读终端最新输出或日志文件尾部（只读证据，不启动新命令）。【vs 替代】编辑器实时诊断用 get_diagnostics；看持续任务运行状态用 read_terminal。【何时不用】需要跑新命令取证时用 run_cmd。' },
+  run_in_terminal: { category: 'execution', use_cases: ['启动 dev server/watch', '后台守护进程/监听'], triggers: ['需要持续运行的进程', 'npm run dev / 监听服务'], example_call: "run_in_terminal(command='npm run dev', name='dev')", priority: 'high', usage_note: '【何时用】启动 dev server/watch/守护进程等持续任务；启动后用 read_logs/read_terminal 看日志与 URL，等 ready 用 background_monitor。【vs 替代】会结束的一次性命令用 run_cmd。【何时不用】一次性命令绝不用它前台硬等。' },
+  find_files: { category: 'search', use_cases: ['按文件名/glob 找文件', '定位入口/配置文件'], triggers: ['知道文件名但不知路径', '需要按模式列文件'], example_call: "find_files(pattern='src/**/*.ts')", priority: 'high', usage_note: '【何时用】按文件名或 glob 模式找文件。【vs 替代】按内容找用 search；按符号定义找用 find_symbol；只能描述功能说不出关键词用 semantic_search。【何时不用】已知精确路径时直接 read_file。' },
+  spawn_multiple_agents: { category: 'orchestration', use_cases: ['多视角并行调研', '大任务分角色取证'], triggers: ['大任务需要 2-5 个视角并行', '独立领域可同时调查'], example_call: "spawn_multiple_agents(task='审计架构与安全', agents=[{role:'architect', focus:'模块边界'}])", priority: 'medium', usage_note: '【何时用】大任务需要多视角并行调研（2-5 个只读角色各自取证，结果自动汇合）。【vs 替代】单个聚焦调查主智能体直接读更快；写入型并行用 run_worker；单角色调研用 run_subagent。【何时不用】单一聚焦调查不要用。' },
+  search_tools: { category: 'orchestration', use_cases: ['按需装载未显示的工具', '用能力描述找工具'], triggers: ['需要的工具不在当前窗口', '知道能力说不出精确名'], example_call: "search_tools(query='数据库查询')", priority: 'medium', usage_note: '【何时用】需要某能力但当前窗口未显示该工具时，用自然语言能力描述或精确工具名请求装载。【vs 替代】已装载的工具直接调用即可。' },
+  git_clone: { category: 'version_control', use_cases: ['克隆远程仓库到本地'], triggers: ['需要拉取一个远程仓库'], example_call: "git_clone(source='https://github.com/owner/repo.git', target='/abs/repo')", priority: 'medium', usage_note: '【何时用】把远程仓库克隆到一个尚不存在的绝对目录。【注意】目标路径必须尚不存在；不会弹交互式凭据。' },
+  git_conflicts: { category: 'version_control', use_cases: ['列出未解决的合并冲突文件'], triggers: ['合并/变基/拉取后'], example_call: "git_conflicts()", priority: 'medium', usage_note: '【何时用】合并/变基/拉取后确认还剩哪些冲突文件要处理。【vs 替代】看整体改动状态用 git_status。' },
+  git_stash_list: { category: 'version_control', use_cases: ['查看 stash 堆栈条目'], triggers: ['想找回或查看已暂存改动'], example_call: "git_stash_list()", priority: 'low', usage_note: '【何时用】列出 git stash 堆栈里现有的暂存条目。【vs 替代】恢复最近暂存用 git_stash_pop；暂存当前改动用 git_stash。' },
+  git_stash_pop: { category: 'version_control', use_cases: ['取回并应用暂存改动'], triggers: ['切分支后想恢复暂存'], example_call: "git_stash_pop()", priority: 'low', usage_note: '【何时用】从 stash 堆栈取回并应用最近（或指定 index）的暂存改动。【vs 替代】查看有哪些暂存用 git_stash_list。' },
+  github_repo: { category: 'research', use_cases: ['读 GitHub 仓库真实内容', 'readme/tree/file/releases/issues'], triggers: ['要看开源项目结构/源码/发布', '需要真实内容而非搜索标题'], example_call: "github_repo(owner='vitejs', repo='vite', action='readme')", priority: 'medium', usage_note: '【何时用】直接读某 GitHub 仓库的真实内容（overview/readme/tree/file/releases/issues/pulls）。【vs 替代】搜仓库/代码用 github_search；查包版本用 package_search。【何时不用】只需搜索标题列表时。' },
+  gitlab_repo: { category: 'research', use_cases: ['读 GitLab 仓库真实内容'], triggers: ['要看 GitLab 项目内容/MR'], example_call: "gitlab_repo(owner='gitlab-org', repo='gitlab', action='readme')", priority: 'low', usage_note: '【何时用】直接读 GitLab.com 仓库真实内容（pulls=merge requests）。【vs 替代】GitHub 仓库用 github_repo。' },
+  gitee_repo: { category: 'research', use_cases: ['读 Gitee 仓库真实内容'], triggers: ['要看国内 Gitee 项目内容'], example_call: "gitee_repo(owner='oschina', repo='git-osc', action='readme')", priority: 'low', usage_note: '【何时用】直接读 Gitee（码云）仓库真实内容。【vs 替代】GitHub 仓库用 github_repo；搜索国内项目用 gitee_search。' },
+  codeberg_repo: { category: 'research', use_cases: ['读 Codeberg/Gitea 仓库真实内容'], triggers: ['要看 Codeberg 项目内容'], example_call: "codeberg_repo(owner='forgejo', repo='forgejo', action='readme')", priority: 'low', usage_note: '【何时用】直接读 Codeberg/Gitea 仓库真实内容。【vs 替代】GitHub 仓库用 github_repo。' },
 });
 
 // Compact, lazy tool documentation. These guides are emitted only when Tool Search
