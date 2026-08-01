@@ -16396,3 +16396,42 @@ test("#95: 失败记忆框架零新增依赖——仅改动 wrapper 正则", () 
   const wrapperSrc = extractFn("_executeToolStep");
   assert.match(wrapperSrc, /_fmRecorded/, "wrapper 必须检查 _fmRecorded 防双重计数");
 });
+
+// ── write_file/edit_file 流式参数解析节流（"写内容时 IDE 卡死"的根因）─────────
+// 旧门槛只有 args.endsWith("}")。散文里成立，但这里流的是源代码，代码里到处是 `}`，
+// 于是大量 delta 都会命中，对越滚越大的缓冲区全量 JSON.parse → O(n²)。
+test("流式参数解析：代码内容频繁以 } 结尾时必须被节流", () => {
+  const INTERVAL = 250;
+  // 复刻 _mayAttemptArgsParse 的判定逻辑（纯函数，便于在 node 下验证行为）。
+  function mayAttempt(entry, now) {
+    const args = entry.args || "";
+    if (!args.trimEnd().endsWith("}")) return false;
+    if (entry._argsParseAt && now - entry._argsParseAt < INTERVAL) return false;
+    entry._argsParseAt = now;
+    return true;
+  }
+  const entry = { args: "" };
+  let attempts = 0;
+  // 模拟流式写入一个 JS 文件：每个 delta 都以 `}` 收尾（真实代码的常见形态）。
+  let t = 1_000_000;
+  for (let i = 0; i < 400; i++) {
+    entry.args += `function f${i}(){ return ${i}; }`;
+    t += 5; // 每 5ms 一个 delta
+    if (mayAttempt(entry, t)) attempts++;
+  }
+  // 400 个 delta、总跨度 2000ms：不节流会是 400 次全量 parse；节流后应 ≤ 10 次。
+  assert.ok(attempts <= 10, `parse 尝试次数应被节流，实际 ${attempts}`);
+  assert.ok(attempts >= 1, "至少要尝试一次，否则文件名/预览永远出不来");
+});
+
+test("流式参数解析：不以 } 结尾时不尝试 parse", () => {
+  const entry = { args: '{"path":"a.js","content":"const x = 1' };
+  function mayAttempt(e, now) {
+    const args = e.args || "";
+    if (!args.trimEnd().endsWith("}")) return false;
+    if (e._argsParseAt && now - e._argsParseAt < 250) return false;
+    e._argsParseAt = now;
+    return true;
+  }
+  assert.equal(mayAttempt(entry, Date.now()), false);
+});

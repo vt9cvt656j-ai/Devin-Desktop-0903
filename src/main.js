@@ -39143,6 +39143,33 @@ function _editPreviewAnchor(entry, model) {
     return { start: first, end: first + oldStr.length, before: text.slice(0, first), after: text.slice(first + oldStr.length) };
 }
 
+/**
+ * May we spend a full JSON.parse on this tool call's partially-streamed arguments?
+ *
+ * The old guard was `args.endsWith("}")`, on the theory that a partial JSON object would
+ * not end in a closing brace. That is true for prose — and false for exactly the payload
+ * that matters here. write_file/edit_file stream SOURCE CODE, and code is full of `}`, so
+ * a large fraction of deltas ended on one. Each of those ran JSON.parse over the whole
+ * accumulated buffer, failed (still truncated), and threw the work away: O(n) per delta,
+ * O(n²) over the file. That is the "IDE freezes while writing content" stall — and it got
+ * worse the bigger the file, which is why it looked like a hang rather than slowness.
+ *
+ * Keep the cheap structural check, but also rate-limit attempts so the cost is bounded no
+ * matter what the content looks like. A parse that is up to ATTEMPT_INTERVAL_MS late only
+ * delays a filename label or a preview target by one frame or two.
+ */
+const _ARGS_PARSE_INTERVAL_MS = 250;
+function _mayAttemptArgsParse(entry) {
+  if (!entry) return false;
+  const args = entry.args || "";
+  if (!args.trimEnd().endsWith("}")) return false;
+  const now = Date.now();
+  // Always allow the first attempt, then at most one per interval.
+  if (entry._argsParseAt && now - entry._argsParseAt < _ARGS_PARSE_INTERVAL_MS) return false;
+  entry._argsParseAt = now;
+  return true;
+}
+
 function _ensureLiveEditorWritePreview(entry, root) {
   const previewable = entry?.name === "write_file" || entry?.name === "edit_file";
   if (!entry || !previewable || entry._editorPreviewOutcome === "rollback") return null;
@@ -39589,7 +39616,7 @@ function _liveWritePreview(entry, container, root = "") {
   //    `content` field BEFORE `path`, where the regex can't see path until the end).
   {
     let fname = (_streamWritePath(entry) || "").split(/[\\/]/).pop();
-    if (!fname && (entry.args || "").trimEnd().endsWith("}")) {
+    if (!fname && _mayAttemptArgsParse(entry)) {
       // 只有可能完整的 JSON 才尝试 parse：对半截参数每 delta 全量 JSON.parse 是 O(n²)。
       try { const p = JSON.parse(entry.args || ""); if (p && p.path) fname = String(p.path).split("/").pop(); } catch {}
     }
@@ -39619,7 +39646,7 @@ function _liveWritePreview(entry, container, root = "") {
   }
   // Fallback: if the incremental decode found nothing yet but the args are already
   // a complete JSON object, pull the value out directly (robust to odd streaming).
-  if (!entry._target && (entry.args || "").trimEnd().endsWith("}")) {
+  if (!entry._target && _mayAttemptArgsParse(entry)) {
     // 同上：edit_file 在 new_string 出现前 _target 一直为空，若不设门槛，这个兜底会对
     // 越滚越大的 old_string 缓冲区每 delta 全量 JSON.parse——O(n²) 卡顿源。
     try { const p = JSON.parse(entry.args || ""); const v = p && p[key]; if (v) entry._target = String(v); } catch {}
