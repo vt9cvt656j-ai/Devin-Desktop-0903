@@ -4036,7 +4036,19 @@ function showPdfPreview(path) {
     editorContainer.appendChild(_pdfPreviewEl);
   }
   const src = inTauri ? backend.assetUrl(path) : path;
-  _pdfPreviewEl.innerHTML = `<iframe src="${src}#toolbar=1" style="width:100%;height:100%;border:0;background:#fff" title="PDF"></iframe>`;
+  // Build the iframe as a DOM node instead of interpolating the path into an HTML
+  // string. The sibling image preview already escapes with _escAttr; this one did not,
+  // so a filename containing a double quote broke out of the src attribute — e.g.
+  //   evil" onload="…" x.pdf
+  // In the desktop app convertFileSrc percent-encodes and hid the problem, but the
+  // browser build passes the raw path through. Setting .src as a property cannot inject
+  // an attribute at all, so this holds regardless of which branch produced `src`.
+  _pdfPreviewEl.textContent = "";
+  const frame = document.createElement("iframe");
+  frame.src = `${src}#toolbar=1`;
+  frame.title = "PDF";
+  frame.style.cssText = "width:100%;height:100%;border:0;background:#fff";
+  _pdfPreviewEl.appendChild(frame);
   _pdfPreviewEl.hidden = false;
 }
 function hidePdfPreview() {
