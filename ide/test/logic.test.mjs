@@ -16891,10 +16891,15 @@ test("verification credit expires when files change under it", () => {
   assert.ok(!/_hasVerifyEvidence = verificationPassed \|\| didVerify \|\| _verifiedAtImplOps >= 0/.test(loop),
     "the monotonic form must not come back");
 
-  // the stamp that was written and never read is now read
-  assert.match(loop, /Number\(e && e\.implementationVersion\) < _implOps/,
-    "stale evidence records must be rejected by their edit stamp");
+  // The stamp that was written and never read is now read. The staleness check moved
+  // out of the loop into the named _evidenceCertifies (so it can be tested as a pure
+  // predicate rather than by matching source text); the loop must still delegate to it,
+  // and must still write the stamp when it records evidence.
+  assert.match(loop, /_executionEvidence\.some\(\(e\) => _evidenceCertifies\(e, _implOps\)\)/,
+    "the gate must delegate per-record certification to _evidenceCertifies");
   assert.match(loop, /implementationVersion: _implOps/, "…and still written when evidence is recorded");
+  assert.match(SRC, /function _evidenceCertifies\(e, implOps\)[\s\S]*?implementationVersion\) < implOps/,
+    "stale evidence records must still be rejected by their edit stamp");
 
   // both mutation handlers expire it, matching their sibling resets
   assert.equal((loop.match(/_verifiedAtImplOps = -1;/g) || []).length, 2,
@@ -17060,4 +17065,123 @@ test("the per-delta segment parse is marked, memoised and throttled", () => {
     "the per-delta call must be throttled — the memo always misses on a growing accumulator");
   assert.match(SRC, /segs = renderStream\._segs;/,
     "between parses the last segment list must be reused, not recomputed");
+});
+
+// ---------------------------------------------------------------------------
+// Read-before-write gate: a whole-file write is not a bypass.
+//
+// write_file to an existing file used to be exempt from the read gate whenever the
+// content was a non-empty string ("completeWholeWrite"), on the theory that a full
+// diff plus Undo made it safe. Undo-ability is not correctness — content written from
+// the model's prior drops whatever it never read. Worse, the recovery text for a
+// blocked edit_file told the model that "only edit_file / multi_edit need read_file",
+// so the gate actively routed blind rewrites through write_file.
+// ---------------------------------------------------------------------------
+test("_writeGateBypass: whole-file write to an existing file is NOT a bypass", () => {
+  const gate = load("_writeGateBypass");
+  // The exact shape the old completeWholeWrite disjunct waved through.
+  assert.equal(
+    gate({ type: "write", content: "export const x = 1;\n" }, { redactedRead: false }),
+    false,
+    "a complete, non-empty whole-file write must still require read evidence",
+  );
+  assert.equal(gate({ type: "write", content: "   " }, {}), false);
+  assert.equal(gate({ type: "write", content: "" }, {}), false);
+});
+
+test("_writeGateBypass: redacted write-back keeps its exemption", () => {
+  const gate = load("_writeGateBypass");
+  // The model read a MASKED current version, so it does hold current-version evidence.
+  assert.equal(
+    gate({ type: "write", content: "key = [REDACTED_API_KEY]\n" }, { redactedRead: true }),
+    true,
+  );
+  assert.equal(gate({ type: "write", content: "key = REDACTED\n" }, { redactedRead: true }), true);
+  // Redacted read, but the write carries no placeholder → not a write-back, no exemption.
+  assert.equal(
+    gate({ type: "write", content: "key = hunter2\n" }, { redactedRead: true }),
+    false,
+    "a redacted read does not license writing content with no placeholders",
+  );
+  // Placeholder present but nothing was redacted → the flag is what licenses this.
+  assert.equal(
+    gate({ type: "write", content: "key = [REDACTED]\n" }, { redactedRead: false }),
+    false,
+  );
+});
+
+test("_writeGateBypass: precise local edit anchors remain a bypass", () => {
+  const gate = load("_writeGateBypass");
+  assert.equal(gate({ type: "edit" }, { preciseLocalEdit: true }), true);
+  assert.equal(gate({ type: "edit" }, { preciseLocalEdit: false }), false);
+  // multi_edit has never had an escape and must not gain one here.
+  assert.equal(gate({ type: "multiedit" }, { preciseLocalEdit: true }), false);
+});
+
+test("_writeGateBypass: tolerates malformed calls without throwing", () => {
+  const gate = load("_writeGateBypass");
+  assert.equal(gate(null), false);
+  assert.equal(gate(undefined), false);
+  assert.equal(gate("write"), false);
+  assert.equal(gate({ type: "write" }), false, "missing content is not a bypass");
+  assert.equal(gate({ type: "write", content: 42 }, { redactedRead: true }), false);
+});
+
+// ---------------------------------------------------------------------------
+// A failing build is not verification.
+//
+// _hasVerifyEvidence had three routes to true (an explicit `verification` stamp,
+// _looksLikeVerificationCommand, and _runtimeCommandKinds) and all three matched on the
+// COMMAND'S SHAPE with no reference to its exit status. `npm run build` exiting non-zero
+// therefore certified the very code it had just proven broken. Exit status now rides on
+// the evidence record as `ok`, and the predicate rejects `ok === false` before any
+// shape test runs.
+// ---------------------------------------------------------------------------
+const _verifyEvidenceAccepts = (evidence, implOps = 1) => {
+  const certifies = load("_evidenceCertifies", {
+    _looksLikeVerificationCommand: (c) =>
+      /\b(npm|pnpm|yarn|cargo|go|make)\b.*\b(build|test|check)\b/.test(c),
+    _runtimeCommandKinds: (c) => (/\b(build|test|run|package)\b/.test(c) ? ["build"] : []),
+  });
+  return evidence.some((e) => certifies(e, implOps));
+};
+
+test("verify gate: a FAILING build does not count as verification", () => {
+  const failing = [{ command: "npm run build", implementationVersion: 2, ok: false }];
+  assert.equal(_verifyEvidenceAccepts(failing, 2), false);
+  // Even with the explicit stamp present, a red exit must lose.
+  const stampedButRed = [
+    { command: "npm run build", implementationVersion: 2, ok: false, verification: true },
+  ];
+  assert.equal(_verifyEvidenceAccepts(stampedButRed, 2), false,
+    "ok===false must be checked before the verification stamp");
+});
+
+test("verify gate: a GREEN build still counts", () => {
+  assert.equal(
+    _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 2, ok: true }], 2),
+    true,
+  );
+  assert.equal(
+    _verifyEvidenceAccepts(
+      [{ command: "cargo test", implementationVersion: 2, ok: true, verification: true }], 2),
+    true,
+  );
+});
+
+test("verify gate: evidence without `ok` is not retroactively voided", () => {
+  // Records predating the ok stamp carry undefined; they must keep their old meaning
+  // rather than silently invalidating a run's accumulated evidence.
+  assert.equal(
+    _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 2 }], 2),
+    true,
+  );
+});
+
+test("verify gate: stale evidence still loses to a newer edit", () => {
+  // The implementationVersion rule must keep working alongside the ok rule.
+  assert.equal(
+    _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 1, ok: true }], 5),
+    false,
+  );
 });
