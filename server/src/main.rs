@@ -15,6 +15,7 @@ mod pay;
 mod procedural_3d;
 mod prompts;
 mod realtime;
+mod repo_sync;
 mod skills;
 mod update;
 
