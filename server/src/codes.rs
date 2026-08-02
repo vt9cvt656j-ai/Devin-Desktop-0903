@@ -152,14 +152,25 @@ pub async fn admin_delete(
 
 // ---------- apply a grant to a user (shared by redeem + admin grant) ----------
 /// Per-plan quota spec: (total_cents, window_cap_cents, weekly_cap_cents, duration_days).
-/// Amounts are USD cents; window_cap 0 = window disabled, weekly cap is primary (P0 quota fix).
+/// Amounts are USD cents; weekly 0 = unlimited.
+///
+/// window_cap must stay NON-ZERO on every plan. It is not a "disable the window" switch:
+/// the refill sets `quota_window_cents = LEAST(quota_window_cap_cents, quota_total_cents)`,
+/// so a cap of 0 refills the window balance to 0, and the serve gate requires
+/// `q_window > 0` (models.rs, `quota_ok`). A zero cap therefore does not widen the limit —
+/// it locks the plan out permanently, and the user is shown "本时段额度已用完，请等待刷新"
+/// for a refresh that can never raise the balance above zero.
+///
+/// Moving to a weekly-primary scheme is a real design change, not a retuning: it needs
+/// `quota_ok` and the four refill sites to treat a 0 cap as "unlimited window" first.
+/// See `plan_spec_window_cap_is_never_zero` below.
 pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
     match plan {
-        "trial" => Some((5_000, 0, 500, 1)), // $50 total, $5/week cap, 1 day, ¥8.8
-        "basic" => Some((33_000, 0, 5_000, 30)), // $330 total, $50/week cap, 30 days, ¥88
-        "pro" => Some((65_000, 0, 10_000, 30)), // $650 total, $100/week cap, 30 days, ¥188
-        "power" => Some((180_000, 0, 30_000, 30)), // $1800 total, $300/week cap, 30 days, ¥488
-        "ultra" => Some((500_000, 0, 80_000, 30)), // $5000 total, $800/week cap, 30 days
+        "trial" => Some((5_000, 5_000, 0, 1)), // $50 total, $50/5.5h, 1 day, ¥8.8
+        "basic" => Some((33_000, 3_000, 0, 30)), // $330 total, $30/5.5h, 30 days, ¥88
+        "pro" => Some((65_000, 6_000, 0, 30)), // $650 total, $60/5.5h, 30 days, ¥188
+        "power" => Some((180_000, 15_000, 0, 30)), // $1800 total, $150/5.5h, 30 days, ¥488
+        "ultra" => Some((500_000, 30_000, 0, 30)), // $5000 total, $300/5.5h, 30 days
         _ => None,
     }
 }
@@ -523,4 +534,66 @@ pub async fn admin_cancel_plan(
     )
     .await;
     Ok(Json(json!({ "ok": true, "user": summary })))
+}
+
+#[cfg(test)]
+mod plan_spec_tests {
+    use super::{plan_spec, PLANS};
+
+    /// A zero window_cap is a lockout, not a wider limit.
+    ///
+    /// The refill is `quota_window_cents = LEAST(quota_window_cap_cents, quota_total_cents)`
+    /// (auth.rs + three sites in models.rs) and the serve gate is
+    /// `plan_active && q_total > 0 && q_window > 0 && ...`. With a cap of 0 the window
+    /// refills to 0, `quota_ok` is false forever, and every member on that plan is refused
+    /// with "本时段额度已用完，请等待刷新（每 5.5 小时）" — a refresh that can never help.
+    ///
+    /// This landed once already, on all five plans at once, and would have taken down
+    /// every paying account on deploy. The invariant is cheap to assert, so assert it.
+    #[test]
+    fn plan_spec_window_cap_is_never_zero() {
+        for plan in PLANS {
+            let (total, window_cap, _weekly, days) =
+                plan_spec(plan).unwrap_or_else(|| panic!("{plan} must have a spec"));
+            assert!(
+                window_cap > 0,
+                "{plan}: window_cap must be > 0 — a 0 cap refills the window to \
+                 LEAST(0, total) = 0 and permanently locks the plan out, it does NOT \
+                 disable the window. Rework quota_ok before trying weekly-primary quotas."
+            );
+            assert!(total > 0, "{plan}: total must be > 0");
+            assert!(days > 0, "{plan}: duration must be > 0 days");
+        }
+    }
+
+    /// The window is a per-5.5h slice of the total, so a cap above the total is a
+    /// typo — LEAST() would silently clamp it and the advertised figure would be fiction.
+    #[test]
+    fn plan_spec_window_cap_never_exceeds_total() {
+        for plan in PLANS {
+            let (total, window_cap, _weekly, _days) = plan_spec(plan).unwrap();
+            assert!(
+                window_cap <= total,
+                "{plan}: window_cap {window_cap} exceeds total {total}; LEAST() would clamp it"
+            );
+        }
+    }
+
+    /// Grants must never silently downgrade: rank and price must move together.
+    #[test]
+    fn plan_spec_totals_increase_with_rank() {
+        let mut prev = 0i64;
+        for plan in PLANS {
+            let (total, ..) = plan_spec(plan).unwrap();
+            assert!(total > prev, "{plan}: total {total} must exceed previous {prev}");
+            prev = total;
+        }
+    }
+
+    #[test]
+    fn plan_spec_rejects_unknown_plans() {
+        assert!(plan_spec("none").is_none());
+        assert!(plan_spec("").is_none());
+        assert!(plan_spec("PRO").is_none(), "plan matching is case-sensitive");
+    }
 }
