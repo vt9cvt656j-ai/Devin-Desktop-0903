@@ -649,6 +649,16 @@ export function createLspManager(options) {
       client.shutdown();
       clients.delete(langId);
     }
+    // Drop any debounced didChange still queued for this language: firing it after
+    // the server died would push a document version to a dead client (and, once a
+    // fresh server starts, arrive out of order before its didOpen). refreshWorkspace
+    // re-syncs full document state on reconnect, so nothing is lost by cancelling.
+    for (const [uri, entry] of changeTimers) {
+      if (entry.langId === langId) {
+        clearTimeout(entry.timer);
+        changeTimers.delete(uri);
+      }
+    }
     // Clear any markers owned by this server.
     for (const m of monaco.editor.getModels()) {
       monaco.editor.setModelMarkers(m, "lsp:" + langId, []);
@@ -689,8 +699,12 @@ export function createLspManager(options) {
     clients.set(langId, client);
     try {
       await client.start(custom);
+      // No success toast. A language server starting is routine background plumbing the user
+      // did not ask for and cannot act on, and it fires again for every language a project
+      // touches. The status bar already shows which servers are live ("LSP: python, shell"),
+      // which is the same information without interrupting. Failures below still toast —
+      // those the user can act on.
       onStatus?.();
-      showToast(`Language server started: ${langId}`);
       return client;
     } catch (e) {
       clients.delete(langId);
@@ -1346,21 +1360,28 @@ export function createLspManager(options) {
     });
 
     // ---- Folding Range Provider ----
+    // 无答案时必须返回 null 而不是 []：注册了 provider 后，[] 是「确定没有可折叠
+    // 区域」的正式答复，会顶掉 Monaco 的缩进折叠兜底——LSP 没起来/不支持
+    // foldingRange 的语言从此一个折叠箭头都没有；null 才会回退到缩进折叠。
     monaco.languages.registerFoldingRangeProvider(MANAGED_LANGS, {
       async provideFoldingRanges(model) {
         const client = clientForModel(model);
-        if (!client || !client.supports("foldingRange")) return [];
-        const result = await client.request("textDocument/foldingRange", {
-          textDocument: { uri: model.uri.toString() },
-        });
-        if (!Array.isArray(result)) return [];
-        return result.map((fr) => ({
-          start: fr.startLine + 1,
-          end: fr.endLine + 1,
-          kind: fr.kind === "comment" ? monaco.languages.FoldingRangeKind.Comment
-            : fr.kind === "imports" ? monaco.languages.FoldingRangeKind.Imports
-            : monaco.languages.FoldingRangeKind.Region,
-        }));
+        if (!client || !client.supports("foldingRange")) return null;
+        try {
+          const result = await client.request("textDocument/foldingRange", {
+            textDocument: { uri: model.uri.toString() },
+          });
+          if (!Array.isArray(result)) return null;
+          return result.map((fr) => ({
+            start: fr.startLine + 1,
+            end: fr.endLine + 1,
+            kind: fr.kind === "comment" ? monaco.languages.FoldingRangeKind.Comment
+              : fr.kind === "imports" ? monaco.languages.FoldingRangeKind.Imports
+              : monaco.languages.FoldingRangeKind.Region,
+          }));
+        } catch {
+          return null; // LSP 请求失败（崩溃/超时）同样回退缩进折叠，不能让折叠整个消失
+        }
       },
     });
 

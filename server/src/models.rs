@@ -123,6 +123,40 @@ fn route_budget_for_headers(headers: &HeaderMap, deep_thinking: bool) -> Duratio
     route_budget_with_client_deadline(deep_thinking, client_deadline_ms, unix_time_ms())
 }
 
+/// Does this request ask the model to think before answering?
+///
+/// Thinking moves work into prefill, and this supplier withholds HTTP headers until its
+/// first SSE event, so a thinking request legitimately takes longer to produce headers
+/// than a plain one. That is what the deep budget (10s headers / 600s idle) exists for.
+///
+/// All three wire shapes have to be recognised, because they are not interchangeable
+/// across models and the gateway emits different ones for different families:
+///   * `reasoning_effort: max|xhigh`   — OpenAI-shaped request, deepest dials
+///   * `thinking.budget_tokens > 0`    — Claude 3.7 / 4.6 explicit-budget form
+///   * `thinking.type: adaptive`       — Claude 4.7+ / 5 / Fable / Mythos (NO budget field)
+///
+/// Missing the adaptive arm is a silent downgrade, not a visible error: the request keeps
+/// working, just against a budget sized for a non-thinking turn, and fails as a 504 under
+/// load. Keep this in sync with `anthropic_thinking`.
+fn request_is_deep_thinking(body: &serde_json::Value) -> bool {
+    let effort_is_deep = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"));
+    let explicit_budget = body
+        .get("thinking")
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        > 0;
+    let thinking_on = body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t == "adaptive" || t == "enabled");
+    effort_is_deep || explicit_budget || thinking_on
+}
+
 fn max_header_wait_for_request(deep_thinking: bool, agentic: bool) -> Duration {
     if deep_thinking {
         DEEP_MAX_HEADER_WAIT
@@ -352,6 +386,15 @@ fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
             502 => StatusCode::BAD_GATEWAY,
             503 => StatusCode::SERVICE_UNAVAILABLE,
             504 => StatusCode::GATEWAY_TIMEOUT,
+            // A request-shape rejection is PERMANENT: the body is wrong, and resending
+            // the identical body — here or from the IDE — can only fail again. The old
+            // `_ => BAD_GATEWAY` catch-all dressed these up as transient 502s, so the
+            // client's own retry loop re-sent them, which is how a single malformed
+            // `thinking` block turned into a route-killing storm and a frozen IDE.
+            // Pass the real status through so nobody retries it.
+            400 => StatusCode::BAD_REQUEST,
+            413 => StatusCode::PAYLOAD_TOO_LARGE,
+            422 => StatusCode::UNPROCESSABLE_ENTITY,
             _ => StatusCode::BAD_GATEWAY,
         }
     }
@@ -434,6 +477,10 @@ pub struct Model {
     pub billing_mode: String,
     /// Flat fee per call in cents, used only when billing_mode = "per_call".
     pub per_call_cents: i64,
+    /// Same fee at micro-USD resolution (1 cent = 10 000). Whole cents floored a $0.0055 fee
+    /// to 1 cent, which the admin form then redisplayed as "0.010" — the value appearing to
+    /// revert. Free-model billing reads this; paid billing still rounds to cents.
+    pub per_call_micro_usd: i64,
     /// Friendly display-name overrides: { raw_model_id → label shown in the IDE }.
     /// The IDE still sends the raw id upstream; this only renames the picker entry.
     pub model_names: serde_json::Value,
@@ -442,6 +489,11 @@ pub struct Model {
     /// that model; empty → fall back to official, then the connection-level input/output
     /// price. Lets the admin price each enabled model individually. (倍率 still applies on top.)
     pub model_prices: serde_json::Value,
+    /// Per-model billing override, same shape as `model_prices`:
+    ///   { "<model_id>": { "mode": "rate"|"per_call"|"free", "per_call_cents": N } }
+    /// A `models` row is a CONNECTION holding many `enabled_models`, so billing_mode /
+    /// per_call_cents alone could only switch a whole channel. This overrides per model.
+    pub model_billing: serde_json::Value,
     /// Upstream wire protocol: "anthropic" (native /v1/messages) or "openai" (/chat/completions
     /// compat). When "anthropic", the gateway translates the OpenAI request/response ⇄ Anthropic.
     pub protocol: String,
@@ -461,6 +513,64 @@ fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f6
         ),
         None => (0.0, 0.0),
     }
+}
+
+/// Effective billing for ONE model id on a connection: the per-model override when present,
+/// else the connection's own mode. Returns (mode, per_call_cents, is_free).
+///
+/// "free" is a billing TARGET, not a price: a free model still costs whatever its mode says
+/// (flat per-call, or real token cost), it is just deducted from the daily free-points pool
+/// instead of quota/wallet. That keeps one cost path — no second pricing engine to drift.
+fn effective_billing(model: &Model, model_id: &str) -> (String, i64, bool) {
+    let (m, c, f, _micro) = effective_billing_micro(model, model_id);
+    (m, c, f)
+}
+
+/// As `effective_billing`, plus the per-call fee in micro-USD when the override carries one.
+/// Whole `per_call_cents` cannot express a sub-cent fee, so free models read this instead.
+fn effective_billing_micro(model: &Model, model_id: &str) -> (String, i64, bool, i64) {
+    let micro = model
+        .model_billing
+        .get(model_id)
+        .and_then(|v| v.get("per_call_micro_usd"))
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .unwrap_or(0);
+    let (m, c, f) = effective_billing_inner(model, model_id);
+    // Fall back to the whole-cent fee so an override written before micro support still bills.
+    let micro = if micro > 0 {
+        micro
+    } else if model.per_call_micro_usd > 0 {
+        model.per_call_micro_usd
+    } else {
+        c.max(0) * MICRO_USD_PER_CENT
+    };
+    (m, c, f, micro)
+}
+
+fn effective_billing_inner(model: &Model, model_id: &str) -> (String, i64, bool) {
+    let ov = model.model_billing.get(model_id);
+    let mode = ov
+        .and_then(|v| v.get("mode"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s == "rate" || s == "per_call" || s == "free")
+        .unwrap_or_else(|| model.billing_mode.clone());
+    let per_call = ov
+        .and_then(|v| v.get("per_call_cents"))
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n >= 0)
+        .unwrap_or(model.per_call_cents);
+    let is_free = mode == "free";
+    // A free model priced per call still needs a flat fee; free + per_call_cents 0 means
+    // "costs nothing", which is legitimate (fully free) — the points pool simply is not
+    // touched. Map free → per_call only when a fee was actually configured.
+    let cost_mode = if is_free {
+        if per_call > 0 { "per_call".to_string() } else { "rate".to_string() }
+    } else {
+        mode
+    };
+    (cost_mode, per_call, is_free)
 }
 
 fn route_supports_prompt_cache(model: &Model) -> bool {
@@ -983,8 +1093,10 @@ pub async fn admin_list(
                 "description": m.description,
                 "enabled_models": m.enabled_models,
                 "billing_mode": m.billing_mode, "per_call_cents": m.per_call_cents,
+                "per_call_micro_usd": m.per_call_micro_usd,
                 "model_names": m.model_names,
                 "model_prices": m.model_prices,
+                "model_billing": m.model_billing,
                 "protocol": m.protocol,
             })
         })
@@ -1333,6 +1445,7 @@ pub struct ModelReq {
     pub sort: Option<i32>,
     pub billing_mode: Option<String>,
     pub per_call_cents: Option<i64>,
+    pub per_call_micro_usd: Option<i64>,
 }
 
 /// POST /api/admin/models — create a provider connection (admin). model_id is
@@ -1454,10 +1567,12 @@ pub struct UpdateReq {
     pub enabled_models: Option<Vec<String>>,
     pub billing_mode: Option<String>,
     pub per_call_cents: Option<i64>,
+    pub per_call_micro_usd: Option<i64>,
     /// { raw_model_id → friendly display name }. Replaces the whole map when present.
     pub model_names: Option<serde_json::Value>,
     /// { raw_model_id → {"in", "out"} } per-model price overrides. Replaces the whole map.
     pub model_prices: Option<serde_json::Value>,
+    pub model_billing: Option<serde_json::Value>,
     /// "anthropic" | "openai" — upstream wire protocol for this connection.
     pub protocol: Option<String>,
 }
@@ -1511,6 +1626,50 @@ pub async fn admin_update(
         _ => m.billing_mode, // unspecified → keep existing
     };
     let per_call_cents = req.per_call_cents.unwrap_or(m.per_call_cents).max(0);
+    let per_call_micro_usd = req
+        .per_call_micro_usd
+        .unwrap_or(m.per_call_micro_usd)
+        .max(0);
+    let model_billing = req
+        .model_billing
+        .filter(|v| v.is_object())
+        .unwrap_or(m.model_billing);
+    // 次数模式 with a zero fee bills exactly nothing, silently. But a zero CONNECTION fee is
+    // perfectly valid when every model carries its own price, which is how per-model pricing
+    // is meant to be used — so check the RESOLVED outcome per model, not the connection field
+    // in isolation. Reject only models that would actually end up charging nothing:
+    // per-call with no fee anywhere, and not 免费 (免费 is floored at billing time, so it is
+    // capped by the points pool rather than unlimited).
+    if billing_mode == "per_call" && per_call_cents == 0 && per_call_micro_usd == 0 {
+        let unpriced: Vec<String> = enabled
+            .iter()
+            .filter(|mid| {
+                let ov = model_billing.get(mid.as_str());
+                let mode = ov
+                    .and_then(|v| v.get("mode"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| s == "rate" || s == "per_call" || s == "free")
+                    .unwrap_or_else(|| billing_mode.clone());
+                if mode == "free" || mode == "rate" {
+                    return false; // points-capped, or billed by tokens — both fine
+                }
+                let fee = ov
+                    .and_then(|v| v.get("per_call_micro_usd"))
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| ov.and_then(|v| v.get("per_call_cents")).and_then(|v| v.as_i64()))
+                    .unwrap_or(0);
+                fee <= 0
+            })
+            .cloned()
+            .collect();
+        if !unpriced.is_empty() {
+            return Err(AppError::bad(format!(
+                "次数模式下这些模型没有价格，调用将不计费：{}。请给它们单独填「次费$」，或设置渠道级「每次调用收费」。",
+                unpriced.join("、")
+            )));
+        }
+    }
     // model_names / model_prices: replace the whole map when the client sends one; keep existing otherwise.
     let model_names = req
         .model_names
@@ -1525,7 +1684,7 @@ pub async fn admin_update(
         Some("anthropic") => "anthropic".to_string(),
         _ => m.protocol, // unspecified → keep existing
     };
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -1545,6 +1704,8 @@ pub async fn admin_update(
         .bind(&model_prices)
         .bind(&protocol)
         .bind(id)
+        .bind(&model_billing)
+        .bind(per_call_micro_usd)
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -1617,20 +1778,40 @@ pub async fn chat(
 
     // pre-check: need a positive balance when the model isn't free. per_call mode
     // (with per_call_cents > 0) also requires balance even if rate/io-price are 0.
-    let not_free = model.rate > 0.0
-        || model.input_price > 0.0
-        || model.output_price > 0.0
-        || (model.billing_mode == "per_call" && model.per_call_cents > 0);
-    if not_free {
-        let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_one(&state.db)
-            .await?;
-        if bal <= 0 {
+    // Which pool pays decides which balance to gate on. A free-flagged model must NOT be
+    // blocked by an empty wallet — that is the whole point — but it must still be blocked by
+    // an empty points pool, or "free" would silently become unlimited.
+    let _pre_mid = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| model.model_id.clone().unwrap_or_default());
+    let (_pre_mode, _pre_percall, pre_free) = effective_billing(&model, &_pre_mid);
+    if pre_free {
+        if free_points_balance(&state, uid).await <= 0 {
             return Err(AppError {
                 status: axum::http::StatusCode::PAYMENT_REQUIRED,
-                msg: "额度不足，请充值".into(),
+                msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
             });
+        }
+    } else {
+        let not_free = model.rate > 0.0
+            || model.input_price > 0.0
+            || model.output_price > 0.0
+            || (model.billing_mode == "per_call" && model.per_call_cents > 0);
+        if not_free {
+            let bal: i64 = sqlx::query_scalar("SELECT credits_cents FROM users WHERE id = $1")
+                .bind(uid)
+                .fetch_one(&state.db)
+                .await?;
+            if bal <= 0 {
+                return Err(AppError {
+                    status: axum::http::StatusCode::PAYMENT_REQUIRED,
+                    msg: "额度不足，请充值".into(),
+                });
+            }
         }
     }
 
@@ -1688,9 +1869,10 @@ pub async fn chat(
     if !usage_reported {
         tracing::warn!(model = %chosen, "provider omitted authoritative usage; rate billing is zero");
     }
+    let (eff_mode, eff_percall, free_pool, free_micro) = effective_billing_micro(&model, &chosen);
     let cost = resolve_cost(
-        &model.billing_mode,
-        model.per_call_cents,
+        &eff_mode,
+        eff_percall,
         usage_val.filter(|_| usage_reported),
         &chosen,
         model.rate,
@@ -1707,7 +1889,11 @@ pub async fn chat(
         !usage_reported,
     );
     tokens.request_id = request_id;
-    bill(&state, uid, model.id, cost, false, &tokens).await;
+    // Same step classification as the main chat path — otherwise this handler's rows land in
+    // model_usage with NULL mode/tool_turn and the routing report silently under-counts.
+    tokens.mode = step_mode(&headers);
+    tokens.tool_turn = step_is_tool_turn(&body);
+    bill(&state, uid, model.id, cost, false, &tokens, free_pool, free_micro).await;
     Ok(Json(data))
 }
 
@@ -1743,10 +1929,11 @@ pub async fn user_usage(
         String,
         bool,
         chrono::DateTime<chrono::Utc>,
+        i64,
     );
     let rows: Vec<UsageRow> =
         sqlx::query_as(
-            "SELECT cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, created_at \
+            "SELECT cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, created_at, free_milli_points_spent \
              FROM model_usage WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200",
         )
         .bind(uid)
@@ -1764,6 +1951,9 @@ pub async fn user_usage(
                 "cache_creation_tokens": if reported { Some(r.4) } else { None },
                 "model": r.5,
                 "estimated": r.6,
+                // 点 spent from the daily free pool. 0 for paid calls, so the client can
+                // render "40 点" rows without a second endpoint.
+                "free_points_spent": r.8 as f64 / MILLI as f64,
                 "usage_reported": reported,
                 "time": r.7,
             })
@@ -2710,20 +2900,26 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
-/// Deterministic cache key for a chat request: hashes the full request body (model
-/// + messages + params). serde_json serializes Map keys sorted, so it's stable.
+/// Deterministic cache key for a chat request. serde_json serializes Map keys sorted, so
+/// the same request always produces the same key.
 ///
-/// 128-bit (two seeded hashes) so a collision — which would serve a WRONG cached
-/// response — is negligible.
-fn gw_cache_key(body: &serde_json::Value) -> String {
-    use std::hash::{Hash, Hasher};
-    let bytes = serde_json::to_vec(body).unwrap_or_default();
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h1);
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    0x9e37_79b9_7f4a_7c15u64.hash(&mut h2);
-    bytes.hash(&mut h2);
-    format!("gwc:{:016x}{:016x}", h1.finish(), h2.finish())
+/// Scoped PER USER and hashed with SHA-256. Both matter:
+///
+/// * The key used to be global, so an entry stored by one account could be served to a
+///   different one. Scoping to the caller means a collision can only hit your own history.
+/// * `DefaultHasher` is a hash-table primitive, not a digest: not collision resistant,
+///   `DefaultHasher::new()` is specified to use fixed zero keys (so anyone can reproduce it
+///   offline and grind for a colliding body), and Rust reserves the right to change the
+///   algorithm between releases. The old "128-bit" claim did not hold either — the second
+///   hash fed a constant plus the SAME bytes to the SAME keyed function, so it is
+///   correlated with the first, not independent.
+fn gw_cache_key(uid: uuid::Uuid, body: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(uid.as_bytes());
+    h.update(b"\x00"); // domain separator so the uid cannot run into the body
+    h.update(serde_json::to_vec(body).unwrap_or_default());
+    format!("gwc:{:x}", h.finalize())
 }
 
 fn response_cache_safe(bytes: &[u8]) -> bool {
@@ -2989,6 +3185,103 @@ struct BillTokens {
     model_name: String,
     estimated: bool,
     request_id: Option<String>,
+    // ---- step-type instrumentation (for model-routing analysis) ----
+    // We can already see WHAT was spent; these say WHAT KIND OF WORK bought it, so the
+    // share of expensive calls that were mechanical tool dispatch becomes measurable
+    // instead of guessed. All optional: nothing downstream depends on them.
+    /// Which IDE surface asked (agent / chat / explorer / plan / reviewer), from x-ide-mode.
+    mode: Option<String>,
+    /// True when this continues an agent loop — the last input message was a tool result
+    /// rather than a human turn. These are the calls that repeat many times per task.
+    tool_turn: Option<bool>,
+    /// First tool the model called back; None when it answered in prose. A call whose
+    /// entire output is one tool dispatch is the prime routing candidate.
+    emitted_tool: Option<String>,
+}
+
+// ---- step-type classification (pure, no extra model call) ------------------
+//
+// Routing decisions need to know what KIND of work a call did. All three signals are
+// already in the request/response we handle, so this costs a couple of string scans and
+// never touches the network.
+
+/// Which IDE surface issued the call. Same header prompts::assemble_into keys off.
+fn step_mode(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-ide-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s.len() <= 32)
+}
+
+/// Is this a continuation of an agent loop rather than a fresh human turn?
+/// True when the last input message is a tool result — these are the calls that repeat
+/// many times per task and therefore dominate cost.
+/// Is this request a continuation after tool execution (rather than a fresh user turn)?
+///
+/// Checking only the LAST message was wrong and recorded `false` on every request in
+/// production — 1440 NULL / 0 true out of 1545 rows. The IDE deliberately appends ephemeral
+/// `user` nudges AFTER the tool results (the "last message gets the most attention" trick),
+/// so a tool turn's final message is almost always `user`, never `tool`.
+///
+/// Scan back instead, and stop at the first assistant message that made no tool calls — that
+/// is the boundary of the current tool cycle. Anything tool-shaped inside it means this is a
+/// tool turn. Handles both wire shapes: OpenAI `role:"tool"`, and Anthropic tool results,
+/// which arrive as a `user` message whose content array carries a `tool_result` block.
+fn step_is_tool_turn(body: &serde_json::Value) -> Option<bool> {
+    let msgs = body.get("messages")?.as_array()?;
+    for m in msgs.iter().rev().take(12) {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "tool" || role == "function" {
+            return Some(true);
+        }
+        // Anthropic shape: user message containing a tool_result content block.
+        if role == "user" {
+            if let Some(parts) = m.get("content").and_then(|v| v.as_array()) {
+                if parts.iter().any(|p| {
+                    p.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+                }) {
+                    return Some(true);
+                }
+            }
+        }
+        // An assistant turn that called tools keeps us inside the cycle; one that did not
+        // ends it — anything older belongs to a previous exchange.
+        if role == "assistant" {
+            let called = m.get("tool_calls").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+            if !called {
+                return Some(false);
+            }
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// The first tool the model called back, or None when it answered in prose.
+/// Scans the accumulated OpenAI-shape response; bounded and allocation-light.
+fn step_emitted_tool(text: &str) -> Option<String> {
+    // Matches both the streaming delta shape and the non-streaming message shape:
+    //   "function":{"name":"read_file"     /    "function": { "name": "read_file"
+    let key = "\"function\"";
+    let mut from = 0usize;
+    while let Some(f) = text[from..].find(key) {
+        let start = from + f + key.len();
+        let window = &text[start..text.len().min(start + 160)];
+        if let Some(n) = window.find("\"name\"") {
+            let rest = &window[n + 6..];
+            if let Some(q1) = rest.find('"') {
+                if let Some(q2) = rest[q1 + 1..].find('"') {
+                    let name = &rest[q1 + 1..q1 + 1 + q2];
+                    if !name.is_empty() && name.len() <= 64 {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        from = start;
+    }
+    None
 }
 
 /// Extract BillTokens from a provider usage JSON (OpenAI or Anthropic shape).
@@ -3030,6 +3323,11 @@ fn extract_bill_tokens(
         model_name: model_name.to_string(),
         estimated,
         request_id: None,
+        // Filled by the caller, which is the only place that can see the request headers
+        // and the model's reply. Left None here so usage extraction stays a pure function.
+        mode: None,
+        tool_turn: None,
+        emitted_tool: None,
     }
 }
 
@@ -3106,6 +3404,135 @@ fn split_fused_charge(
 
 /// Deduct cost from the user's quota/credits and log the model_usage row with token detail.
 /// Module-scope so chat_completions, responses_proxy, and image_generations all share it.
+/// Write one model_usage row. Extracted so the free-points path records identical history to
+/// the quota/wallet path — free is a payment source, not a reason to lose usage data.
+async fn record_usage_row(
+    state: &AppState,
+    uid: uuid::Uuid,
+    conn_id: uuid::Uuid,
+    cost_cents: i64,
+    free_milli_points_spent: i64,
+    tokens: &BillTokens,
+) {
+    if let Err(error) = sqlx::query(
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+    )
+    .bind(uid)
+    .bind(conn_id)
+    .bind(cost_cents)
+    .bind(tokens.prompt)
+    .bind(tokens.completion)
+    .bind(tokens.cached)
+    .bind(tokens.cache_creation)
+    .bind(&tokens.model_name)
+    .bind(tokens.estimated)
+    .bind(&tokens.request_id)
+    .bind(tokens.mode.as_deref())
+    .bind(tokens.tool_turn)
+    .bind(tokens.emitted_tool.as_deref())
+    .bind(free_milli_points_spent)
+    .execute(&state.db)
+    .await
+    {
+        tracing::error!(%error, "failed to insert free-pool usage row");
+    }
+}
+
+/// Daily free allowance in 点. The operator prices in 点: ¥0.5 = 10 点, so 1 点 = ¥0.05 and
+/// the ¥2 daily allowance is exactly 40 点.
+pub const FREE_POINTS_DAILY: i64 = 40;
+
+/// The pool is STORED in milli-点 (1 点 = 1000). Whole 点 could not express a small per-call
+/// fee: the deduction rounded up, so any non-zero cost cost a full 点 and a 40-点 allowance
+/// was always exactly 40 calls regardless of price. Integers throughout — no floats in the
+/// money path — just three more decimal places.
+pub const MILLI: i64 = 1_000;
+pub const FREE_MILLI_POINTS_DAILY: i64 = FREE_POINTS_DAILY * MILLI;
+
+/// Micro-USD per raw cent (1 cent = 10 000 micro-USD). Per-model fees are stored in micro-USD
+/// so a $0.003 fee survives; whole cents floored it to zero and the model became free.
+pub const MICRO_USD_PER_CENT: i64 = 10_000;
+
+/// Micro-USD that one milli-点 buys. 1 点 = RAW_CENTS_PER_POINT cents, so
+/// 1 milli-点 = 5 cents × 10 000 / 1000 = 50 micro-USD.
+pub const MICRO_USD_PER_MILLI_POINT: i64 = RAW_CENTS_PER_POINT * MICRO_USD_PER_CENT / MILLI;
+
+/// Milli-点 owed for a call costing `micro_usd` of real provider spend. Rounds UP at
+/// milli-点 resolution, so a priced call always costs something (never free by rounding),
+/// but a $0.003 call costs 60 milli-点 (0.06 点) rather than a whole one.
+pub fn milli_points_for_micro_usd(micro_usd: i64) -> i64 {
+    if micro_usd <= 0 {
+        return 0;
+    }
+    (micro_usd + MICRO_USD_PER_MILLI_POINT - 1) / MICRO_USD_PER_MILLI_POINT
+}
+
+/// Raw provider cents that one 点 buys.
+///
+/// DERIVATION (the one assumption in this file, single-sourced so it is changed in one place):
+///   • the client's credit denomination is exact — 663 raw cents = $1.00 of visible credit
+///   • at ≈¥7.2 per $1.00 of visible credit, 1 点 (¥0.05) ≈ $0.00694 ≈ 4.6 raw cents
+/// Rounded UP to 5, which makes each point buy slightly more than its strict value — the
+/// error therefore favours the user, never silently overcharges them. If the platform's
+/// ¥-per-credit-dollar changes, this is the only number to touch.
+pub const RAW_CENTS_PER_POINT: i64 = 5;
+
+/// Points owed for a call that cost `raw_cents` of real provider spend. Rounds UP so a
+/// sub-point call still costs 1 点 — otherwise a cheap-enough free model would be unlimited.
+pub fn points_for_raw_cents(raw_cents: i64) -> i64 {
+    if raw_cents <= 0 {
+        return 0;
+    }
+    (raw_cents + RAW_CENTS_PER_POINT - 1) / RAW_CENTS_PER_POINT
+}
+
+/// Read the caller's free-points balance, granting today's allowance first if the stored
+/// date is not today. Lazy grant instead of a cron sweep: no scheduler to fail, users who
+/// never call cost nothing, and "resets to zero daily" is automatic — yesterday's remainder
+/// is overwritten, never carried.
+async fn free_points_balance(state: &AppState, uid: uuid::Uuid) -> i64 {
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+        "UPDATE users SET \
+           free_points = CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
+                              THEN $2 ELSE free_points END, \
+           free_points_date = CURRENT_DATE \
+         WHERE id = $1 RETURNING free_points",
+    )
+    .bind(uid)
+    .bind(FREE_MILLI_POINTS_DAILY)
+    .fetch_optional(&state.db)
+    .await;
+    row.ok().flatten().map(|(n,)| n).unwrap_or(0)
+}
+
+/// Spend from the daily free pool. Returns what was actually deducted — the pool floors at
+/// zero rather than going negative, so a request that outruns the remaining points is
+/// partially charged and the rest is simply free. The pre-gate below refuses the call before
+/// it reaches here when the pool is already empty, so this is the tail case only.
+/// Spend from the daily pool, in milli-点. `micro_usd` is the call's real provider cost at
+/// micro-USD resolution — either the per-model flat fee, or token cost converted up from
+/// cents — so per-call and volume billing both land in the same conversion.
+async fn spend_free_points(state: &AppState, uid: uuid::Uuid, micro_usd: i64) -> i64 {
+    let points = milli_points_for_micro_usd(micro_usd);
+    if points <= 0 {
+        return 0;
+    }
+    let _ = free_points_balance(state, uid).await; // ensure today's grant exists first
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+        "UPDATE users SET free_points = GREATEST(0, free_points - $2) \
+         WHERE id = $1 RETURNING free_points",
+    )
+    .bind(uid)
+    .bind(points)
+    .fetch_optional(&state.db)
+    .await;
+    match row.ok().flatten() {
+        Some(_) => points,
+        None => 0,
+    }
+}
+
 async fn bill(
     state: &AppState,
     uid: uuid::Uuid,
@@ -3113,6 +3540,8 @@ async fn bill(
     cost: i64,
     use_quota: bool,
     tokens: &BillTokens,
+    free_pool: bool,
+    free_micro_usd: i64,
 ) {
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
@@ -3122,6 +3551,41 @@ async fn bill(
         }
     };
     let requested_cost = cost.max(0);
+    // Free models bill against the daily points pool, never quota or wallet. Done here rather
+    // than at each call site so no biller can forget it: every path that charges a free model
+    // lands in this one branch, and the model_usage row below is still written (so usage
+    // history and the routing report stay complete — free is a payment source, not a
+    // shadow-billing hole).
+    if free_pool {
+        // Prefer the model's own micro-USD fee (per-call billing, which may be sub-cent);
+        // otherwise convert the token-billed cost up from whole cents. Volume billing and
+        // per-call billing therefore both convert to 点 through one path.
+        let micro = if free_micro_usd > 0 {
+            free_micro_usd
+        } else {
+            requested_cost.max(0) * MICRO_USD_PER_CENT
+        };
+        // FLOOR: a 免费 model must always consume something, even when no fee is configured.
+        // Without this, "free + no fee" spent 0 点 — so the model was not merely free, it was
+        // UNCAPPED: the daily allowance never moved and there was nothing to run out of,
+        // which defeats the entire pool. One milli-点 (0.001 点) is negligible to a real user
+        // and still guarantees the cap eventually binds.
+        let points = spend_free_points(state, uid, micro).await.max(1);
+        // Deduct the floor when the fee itself produced nothing.
+        if micro <= 0 {
+            let _ = sqlx::query(
+                "UPDATE users SET free_points = GREATEST(0, free_points - 1) WHERE id = $1",
+            )
+            .bind(uid)
+            .execute(&state.db)
+            .await;
+        }
+        // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
+        // free_points_spent carries what the user actually paid, in 点.
+        record_usage_row(state, uid, conn_id, requested_cost, points, tokens).await;
+        let _ = tx.rollback().await;
+        return;
+    }
     let charge = if requested_cost == 0 {
         FusedCharge::default()
     } else {
@@ -3174,8 +3638,8 @@ async fn bill(
         }
     }
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -3187,6 +3651,9 @@ async fn bill(
     .bind(&tokens.model_name)
     .bind(tokens.estimated)
     .bind(&tokens.request_id)
+    .bind(tokens.mode.as_deref())
+    .bind(tokens.tool_turn)
+    .bind(tokens.emitted_tool.as_deref())
     .execute(&mut *tx)
     .await
     {
@@ -3298,10 +3765,12 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         };
         return Some(json!({"type":"enabled","budget_tokens":budget}));
     }
-    if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
-        // 4.x+/Fable/Mythos 一律用显式预算：聚合上游（zyz 等）对 {"type":"adaptive"}
-        // 静默忽略——请求 200 但一个 thinking_delta 都不回，IDE 的思考卡永远是空的；
-        // 换成 enabled+budget_tokens 后实测同一路线能正常回思考流。
+    // 4.6 及更早（不含上面已处理的 3.5/3.7）：仍接受显式预算。
+    // 历史背景：早期聚合上游（zyz 等）对 {"type":"adaptive"} 静默忽略——请求 200 但一个
+    // thinking_delta 都不回，IDE 的思考卡永远是空的；换成 enabled+budget_tokens 后同一
+    // 路线能正常回思考流。那个兜底当时是对的，但它被套用到了**所有** claude 模型上。
+    if m.contains("claude-4-6") || m.contains("claude-opus-4-6") || m.contains("claude-sonnet-4-6")
+    {
         let budget = match eff {
             "low" => 4096,
             "high" => 24000,
@@ -3309,6 +3778,21 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
             _ => 12000,
         };
         return Some(json!({"type":"enabled","budget_tokens":budget}));
+    }
+    if m.contains("claude") || m.contains("fable") || m.contains("mythos") {
+        // Sonnet 5 / Opus 5 / Opus 4.8 / 4.7 / Fable 5 / Mythos 5 REMOVED the explicit-budget
+        // form: `{"type":"enabled","budget_tokens":N}` is rejected with a hard 400
+        //   "thinking.type.enabled is not supported for this model.
+        //    use thinking.type.adaptive and output_config.effort"
+        // The old zyz workaround above was therefore sending a request that can never
+        // succeed on the current upstream (polly.modelbridge.cc → real Claude API), and the
+        // 400 was being reclassified as a retryable 502 (see `upstream_failure_status`), so
+        // the IDE re-sent the same impossible request every ~2s — measured in production on
+        // 2026-08-01, 29 rejections in six hours, each with attempted_sends=1: the gateway
+        // gave up correctly, the CLIENT was the retry loop, and the user just saw a frozen
+        // editor. Depth is expressed with output_config.effort instead (set by the caller);
+        // adaptive lets the model choose how much to think per turn.
+        return Some(json!({"type":"adaptive"}));
     }
     None
 }
@@ -4275,7 +4759,22 @@ pub async fn chat_completions(
         && q_window > 0
         && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
     let use_quota = quota_ok;
-    if !quota_ok && credits <= 0 {
+    // Free-flagged models are paid from the daily 点 pool, so the quota/credits gate below
+    // does not apply to them — and crucially, passing that gate must NOT let a user keep
+    // calling a free model on an empty pool. Without this the allowance was decorative: any
+    // member with quota could use free models forever at 0 点.
+    //
+    // Checked across every candidate route, since one model can be served by more than one
+    // connection; if ANY route that could serve this request bills from the pool, the pool is
+    // what must have room.
+    let free_here = candidates.iter().any(|c| effective_billing(c, &model_id).2);
+    if free_here && free_points_balance(&state, uid).await <= 0 {
+        return Err(AppError {
+            status: StatusCode::PAYMENT_REQUIRED,
+            msg: "今日免费额度已用完，明天 0 点重置（或改用付费模型）".into(),
+        });
+    }
+    if !free_here && !quota_ok && credits <= 0 {
         let msg = if plan_active && q_total <= 0 {
             "总额度已用完"
         } else if plan_active && q_window <= 0 {
@@ -4377,7 +4876,7 @@ pub async fn chat_completions(
     // for EVERY model regardless of whether the upstream caches. Best-effort: any
     // Redis hiccup or miss just falls through to a normal upstream call. The quota
     // gate already ran above, so a hit still requires access — it just costs nothing.
-    let ckey = gw_cache_key(&body);
+    let ckey = gw_cache_key(uid, &body);
     {
         let mut rconn = state.redis.clone();
         let hit: Option<Vec<u8>> = redis::cmd("GET")
@@ -4398,6 +4897,8 @@ pub async fn chat_completions(
                     request_id: request_id.clone(),
                     ..Default::default()
                 },
+                false,
+                0,
             )
             .await; // record a 0-cost cache hit
             let ct = if streaming {
@@ -4499,17 +5000,7 @@ pub async fn chat_completions(
     }
     // 深思考只放宽响应头之后的首个有效 token / stream idle 窗口。响应头代表线路健康，
     // 在它出现前，普通与深思请求共用同一个短 transport deadline。
-    let deep_thinking = body
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .map(|e| e.eq_ignore_ascii_case("max") || e.eq_ignore_ascii_case("xhigh"))
-        .unwrap_or(false)
-        || body
-            .get("thinking")
-            .and_then(|t| t.get("budget_tokens"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            > 0;
+    let deep_thinking = request_is_deep_thinking(&body);
     let agentic_request = headers
         .get("x-ide-mode")
         .and_then(|value| value.to_str().ok())
@@ -4749,6 +5240,25 @@ pub async fn chat_completions(
                             || err_low.contains("no available")
                             || err_low.contains("没有可用");
                         let transient = matches!(err_status, 502 | 503 | 504 | 429);
+                        // A 400 that names the REQUEST as the problem is deterministic:
+                        // the same body will be rejected by every remaining candidate, so
+                        // failing over just multiplies one bad request by the route count
+                        // while the user watches a spinner. Give up immediately and let the
+                        // real upstream message reach them. (401/403 still fail over — those
+                        // are per-route credentials, and another route may well be fine.)
+                        if err_status == 400
+                            && (err_low.contains("invalid_request_error")
+                                || err_low.contains("is not supported for this model")
+                                || err_low.contains("extra inputs are not permitted")
+                                || err_low.contains("unexpected keyword"))
+                        {
+                            tracing::warn!(
+                                model = %model_id,
+                                excerpt = %safe_upstream_error_excerpt(&err_low),
+                                "upstream rejected the request body; not failing over"
+                            );
+                            break 'routes;
+                        }
                         if persistent || !transient {
                             break;
                         }
@@ -4858,9 +5368,10 @@ pub async fn chat_completions(
         let admin_out = conn.output_price;
         let cache_read_price = conn.cache_read_price;
         let cache_create_price = conn.cache_create_price;
-        let bmode = conn.billing_mode.clone();
-        let percall = conn.per_call_cents;
+        // Per-model override wins over the connection default; `free_pool` routes the charge
+        // to the daily points pool instead of quota/wallet.
         let req_model = model_id.clone();
+        let (bmode, percall, free_pool, free_micro) = effective_billing_micro(&conn, &model_id);
         let request_id_task = request_id.clone();
         // 思考钳位探测：只对"开了思考的 Anthropic 原生请求"检测丢块签名。
         let thinking_clip_probe = anthropic
@@ -4871,6 +5382,9 @@ pub async fn chat_completions(
                     .is_some_and(|e| !e.is_empty() && e != "off"));
         let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
         let ckey_task = ckey.clone();
+        // Step-type signals must be read here: `body` is moved into the pump task below.
+        let step_mode_task = step_mode(&headers);
+        let step_tool_turn_task = step_is_tool_turn(&body);
         // Absorb short provider bursts without making the billing/cache pump stop reading the
         // upstream while Hyper or nginx drains a handful of tiny SSE frames.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(256);
@@ -5125,6 +5639,11 @@ pub async fn chat_completions(
                 !usage_reported,
             );
             tokens.request_id = request_id_task;
+            tokens.mode = step_mode_task;
+            tokens.tool_turn = step_tool_turn_task;
+            // What did the model actually DO? A reply that is nothing but one tool dispatch
+            // is the clearest routing candidate; prose replies are where reasoning happens.
+            tokens.emitted_tool = step_emitted_tool(&String::from_utf8_lossy(&acc));
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
             // 中转丢块的坏流（只有思考）绝不缓存：客户端的快速重试请求体逐字节相同，
             // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
@@ -5138,7 +5657,7 @@ pub async fn chat_completions(
                     .query_async(&mut rconn)
                     .await;
             }
-            bill(&st, uid, cid, cost, use_quota, &tokens).await;
+            bill(&st, uid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
         });
         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -5199,6 +5718,8 @@ pub async fn chat_completions(
                     .await;
             }
         }
+        let mut free_pool = false;
+        let mut free_micro = 0i64;
         let (cost, tokens) = if is_image_gen_model(&model_id) {
             let per = if conn.per_call_cents > 0 {
                 conn.per_call_cents
@@ -5220,9 +5741,12 @@ pub async fn chat_completions(
                 tracing::warn!(model = %model_id, "provider omitted authoritative usage; rate billing is zero");
             }
             let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(&conn, &model_id);
+            free_pool = eff_free;
+            free_micro = eff_micro;
             let cost = resolve_cost(
-                &conn.billing_mode,
-                conn.per_call_cents,
+                &eff_mode,
+                eff_percall,
                 usage_val.filter(|_| usage_reported),
                 &model_id,
                 conn.rate,
@@ -5239,9 +5763,12 @@ pub async fn chat_completions(
                 !usage_reported,
             );
             tokens.request_id = request_id.clone();
+            tokens.mode = step_mode(&headers);
+            tokens.tool_turn = step_is_tool_turn(&body);
+            tokens.emitted_tool = step_emitted_tool(&serde_json::to_string(&data).unwrap_or_default());
             (cost, tokens)
         };
-        bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
+        bill(&state, uid, conn.id, cost, use_quota, &tokens, free_pool, free_micro).await;
         let mut resp = Json(data).into_response();
         if let Some((tok, covered)) = compression_prefix.as_ref() {
             if let Ok(v) = axum::http::HeaderValue::from_str(tok) {
@@ -5359,6 +5886,10 @@ pub async fn responses_proxy(
         });
     }
 
+    // Same per-user concurrency ceiling chat_completions uses. Without it these two
+    // billed paths had no cap at all, so the bounded-overdraft guarantee that
+    // InFlightGuard exists to provide simply did not hold here.
+    let _inflight_guard = InFlightGuard::acquire(&state, uid).await?;
     // Always ensure image_generation tool is present for image models.
     let is_image_model = model_id.to_lowercase().contains("gpt-image")
         || model_id.to_lowercase().contains("dall-e")
@@ -5502,15 +6033,20 @@ pub async fn responses_proxy(
                     request_id: request_id.clone(),
                     ..Default::default()
                 },
+                false,
+                0,
             )
             .await;
         } else {
             let usage = data.get("usage");
             let usage_reported = usage_is_authoritative(usage);
             let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(&conn, &model_id);
+            let free_pool = eff_free;
+            let free_micro = eff_micro;
             let cost = resolve_cost(
-                &conn.billing_mode,
-                conn.per_call_cents,
+                &eff_mode,
+                eff_percall,
                 usage.filter(|_| usage_reported),
                 &model_id,
                 conn.rate,
@@ -5524,7 +6060,7 @@ pub async fn responses_proxy(
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
             tokens.request_id = request_id.clone();
-            bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
+            bill(&state, uid, conn.id, cost, use_quota, &tokens, free_pool, free_micro).await;
         }
     }
 
@@ -5631,6 +6167,10 @@ pub async fn image_generations(
     }
 
     // Proxy to upstream /images/generations with retry for transient failures.
+    // Same per-user concurrency ceiling chat_completions uses. Without it these two
+    // billed paths had no cap at all, so the bounded-overdraft guarantee that
+    // InFlightGuard exists to provide simply did not hold here.
+    let _inflight_guard = InFlightGuard::acquire(&state, uid).await?;
     let url = format!("{}/images/generations", api_base(&conn.base_url));
     let resp = {
         let mut success = None;
@@ -5764,6 +6304,8 @@ pub async fn image_generations(
                     request_id: request_id.clone(),
                     ..Default::default()
                 },
+                false,
+                0,
             )
             .await;
         }
@@ -5966,6 +6508,33 @@ mod billing_tests {
             upstream_failure_status(502, "bad gateway"),
             StatusCode::BAD_GATEWAY
         );
+
+        // Regression (2026-08-01 outage): a permanent request rejection must NOT be
+        // dressed up as a transient 502. It used to fall through `_ => BAD_GATEWAY`,
+        // so the IDE's retry loop re-sent the same rejected body until the route died
+        // and the editor hung. These three statuses mean "the body is wrong" — the
+        // client must see that and stop, not retry.
+        assert_eq!(
+            upstream_failure_status(
+                400,
+                "\"thinking.type.enabled\" is not supported for this model."
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            upstream_failure_status(413, "request entity too large"),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            upstream_failure_status(422, "unprocessable"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // ...but a 400 whose text is an access/billing failure keeps its 424 mapping,
+        // so the "switch account / top up" path in the IDE still triggers.
+        assert_eq!(
+            upstream_failure_status(400, "insufficient_balance"),
+            StatusCode::FAILED_DEPENDENCY
+        );
         assert_eq!(
             upstream_failure_status(503, "service unavailable"),
             StatusCode::SERVICE_UNAVAILABLE
@@ -5977,6 +6546,230 @@ mod billing_tests {
     }
 
     // per_call mode bills the flat fee, ignoring token usage entirely.
+    #[test]
+    /// A `models` row is a CONNECTION holding many enabled_models, so billing_mode /
+    /// per_call_cents alone could only switch a WHOLE channel — "make this one model per-call"
+    /// was impossible, which is exactly what the operator hit. model_billing overrides per id.
+    #[test]
+    fn model_billing_overrides_the_connection_default() {
+        // mode override: connection is rate, one model is per_call
+        let billing = json!({ "gpt-5.5": { "mode": "per_call", "per_call_cents": 7 } });
+        let ov = billing.get("gpt-5.5");
+        let mode = ov
+            .and_then(|v| v.get("mode"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s == "rate" || s == "per_call" || s == "free")
+            .unwrap_or_else(|| "rate".to_string());
+        assert_eq!(mode, "per_call", "per-model override must beat the channel default");
+        // an unlisted model keeps the connection default
+        assert!(billing.get("claude-opus-5").is_none());
+        // a junk mode is rejected, not silently honored
+        let junk = json!({ "m": { "mode": "PER-CALL" } });
+        let jm = junk
+            .get("m")
+            .and_then(|v| v.get("mode"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s == "rate" || s == "per_call" || s == "free");
+        assert!(jm.is_none(), "unknown mode must fall back, never be trusted");
+    }
+
+    /// "free" is a payment TARGET, not a price: the cost is still computed the normal way and
+    /// still recorded in model_usage — it is merely deducted from the daily points pool. If
+    /// free silently meant zero-cost, usage history and the routing report would go blind.
+    #[test]
+    fn free_mode_still_costs_and_maps_to_a_real_cost_mode() {
+        // free + a configured per-call fee bills that flat fee (against points)
+        assert_eq!(
+            resolve_cost("per_call", 3, None, "free-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            3,
+        );
+        // free with no fee falls through to token billing, which with zero prices is 0 —
+        // legitimately free, and the points pool is simply untouched.
+        assert_eq!(
+            resolve_cost("rate", 0, None, "free-model", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            0,
+        );
+    }
+
+    /// The operator prices in 点: ¥0.5 = 10 点 → 1 点 = ¥0.05 → the ¥2 daily allowance is
+    /// exactly 40 点. Pin the arithmetic so a future edit cannot quietly desync the two.
+    #[test]
+    fn daily_allowance_is_two_yuan_worth_of_points() {
+        assert_eq!(super::FREE_POINTS_DAILY, 40);
+        // ¥0.5 buys 10 点, so the daily grant is ¥2.00 exactly.
+        let yuan_per_point = 0.5_f64 / 10.0;
+        assert!((super::FREE_POINTS_DAILY as f64 * yuan_per_point - 2.0).abs() < 1e-9);
+    }
+
+    /// Regression: the free gate must exist on the MAIN chat path, not only the legacy
+    /// handler. It was added to `chat` first, and `chat_completions` — the endpoint the IDE
+    /// actually calls — kept passing free requests through on quota alone, so the allowance
+    /// was decorative: a member with quota could use free models forever at 0 点.
+    #[test]
+    fn free_gate_guards_the_main_chat_path() {
+        // Read at RUNTIME, not include_str!: embedding the very file being compiled makes
+        // cargo's change detection lag by a build, so the assertion can pass against stale
+        // bytes — which it did, hiding a removed gate for one run.
+        // Read at RUNTIME (include_str! of the file being compiled lags a build), and search
+        // ONLY the non-test half — the first cut counted this test's own assertion literals,
+        // so it matched itself and could never fail. Both mutations sailed through it.
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        // Cut at the TEST MODULE, not the first `#[cfg(test)]` — there is a cfg(test) helper
+        // far earlier in this file, and truncating there hid the very gate being asserted.
+        let src = &full[..full.find("mod billing_tests").unwrap_or(full.len())];
+        let n = src.matches("今日免费额度已用完").count();
+        assert!(n >= 2, "the free-pool gate must guard both chat handlers, found {n}");
+        assert!(
+            src.contains("candidates.iter().any(|c| effective_billing(c, &model_id).2)"),
+            "the main path must decide freeness across every candidate route",
+        );
+    }
+
+    /// The operator could not enter a $0.003 per-call fee: whole cents floored it to 0 (the
+    /// "minimum value" they hit), and whole 点 then rounded every call up to 1 点, so a 40-点
+    /// allowance was always exactly 40 calls whatever the price. Both floors are gone.
+    /// The CONNECTION-level fee had the same whole-cent floor as the per-model one: entering
+    /// 0.0055 computed round(0.55) = 1 cent and the form redisplayed "0.010", which reads as
+    /// the value reverting. Both levels must now carry micro-USD.
+    /// A 免费 model with no fee used to spend 0 点 — so it was not "free within a daily cap",
+    /// it was UNCAPPED: the allowance never moved and nothing could run out. And 次数模式 with
+    /// a zero fee billed nothing at all while the admin form reported success. Both silent
+    /// zeros are now closed: one at runtime (floor), one at save time (refusal).
+    /// Regression: the classifier recorded `false` on EVERY production request (1440 NULL /
+    /// 0 true of 1545 rows) because it read only the last message, and the IDE appends
+    /// ephemeral user nudges after tool results. Routing data was therefore blind.
+    #[test]
+    fn tool_turns_are_detected_behind_trailing_nudges() {
+        use super::step_is_tool_turn as t;
+
+        // OpenAI shape with a trailing nudge — the real production case that recorded false.
+        let with_nudge = json!({"messages":[
+            {"role":"user","content":"do it"},
+            {"role":"assistant","tool_calls":[{"id":"c1"}]},
+            {"role":"tool","tool_call_id":"c1","content":"file bytes"},
+            {"role":"user","content":"[行动门禁] keep going"}
+        ]});
+        assert_eq!(t(&with_nudge), Some(true), "a trailing nudge must not hide the tool result");
+
+        // Anthropic shape: tool_result inside a user message's content array.
+        let anthropic = json!({"messages":[
+            {"role":"user","content":"do it"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"c1"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"x"}]}
+        ]});
+        assert_eq!(t(&anthropic), Some(true), "Anthropic tool_result blocks count too");
+
+        // A genuine fresh user turn is NOT a tool turn.
+        let fresh = json!({"messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"now do something"}
+        ]});
+        assert_eq!(t(&fresh), Some(false));
+
+        // A prose-only assistant reply ends the cycle — older tool calls belong to a
+        // previous exchange and must not leak into this turn's classification.
+        let previous_cycle = json!({"messages":[
+            {"role":"assistant","tool_calls":[{"id":"old"}]},
+            {"role":"tool","tool_call_id":"old","content":"x"},
+            {"role":"assistant","content":"done, here is the answer"},
+            {"role":"user","content":"thanks, next task"}
+        ]});
+        assert_eq!(t(&previous_cycle), Some(false));
+    }
+
+    #[test]
+    fn zero_fee_cannot_silently_mean_unlimited() {
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let src = &full[..full.find("mod billing_tests").unwrap_or(full.len())];
+
+        // runtime floor on the free path
+        assert!(
+            src.contains("spend_free_points(state, uid, micro).await.max(1)"),
+            "a free-flagged call must always consume at least one milli-点",
+        );
+        // Save-time refusal for per-call with no fee — but resolved PER MODEL, not on the
+        // connection field alone. A zero connection fee is legitimate when every model
+        // carries its own price; the first cut rejected that and blocked a correct setup.
+        assert!(
+            src.contains(r#"billing_mode == "per_call" && per_call_cents == 0 && per_call_micro_usd == 0"#),
+            "saving 次数模式 with no price anywhere must be refused",
+        );
+        assert!(
+            src.contains("let unpriced: Vec<String> = enabled"),
+            "the refusal must inspect each enabled model's resolved price, not just the channel field",
+        );
+        assert!(
+            src.contains(r#"if mode == "free" || mode == "rate""#),
+            "免费 (points-capped) and 倍率 (token-billed) models must not be flagged unpriced",
+        );
+        // the floor is the SMALLEST possible spend — it must not overcharge a priced call
+        assert_eq!(super::milli_points_for_micro_usd(1), 1);
+        assert!(super::milli_points_for_micro_usd(55_000) > 1, "a real fee still costs its real amount");
+    }
+
+    #[test]
+    fn connection_fee_keeps_sub_cent_precision() {
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let src = &full[..full.find("mod billing_tests").unwrap_or(full.len())];
+        assert!(src.contains("pub per_call_micro_usd: i64"), "connection carries a micro fee");
+        assert!(
+            src.contains("model.per_call_micro_usd > 0"),
+            "the free path must prefer the connection's micro fee over rounded cents",
+        );
+        // $0.0055 = 5500 micro-USD → 110 milli-点, i.e. 0.11 点 — NOT rounded to a whole cent
+        // and NOT rounded up to a whole 点.
+        assert_eq!(super::milli_points_for_micro_usd(5_500), 110);
+        // the old lossy path would have produced 1 cent = 10 000 micro = 200 milli-点
+        assert_ne!(super::milli_points_for_micro_usd(5_500), 200);
+    }
+
+    #[test]
+    fn sub_cent_fees_survive_and_convert_proportionally() {
+        use super::{milli_points_for_micro_usd as mp, MICRO_USD_PER_CENT, MICRO_USD_PER_MILLI_POINT};
+
+        // $0.003 = 3000 micro-USD. It must NOT round to zero…
+        let three_tenths_of_a_cent = 3_000;
+        assert!(three_tenths_of_a_cent > 0);
+        // …and must cost a real, sub-点 amount: 3000 / 50 = 60 milli-点 = 0.06 点.
+        assert_eq!(MICRO_USD_PER_MILLI_POINT, 50);
+        assert_eq!(mp(three_tenths_of_a_cent), 60);
+
+        // A 40-点 daily pool therefore buys ~666 such calls, not 40.
+        assert_eq!(super::FREE_MILLI_POINTS_DAILY / mp(three_tenths_of_a_cent), 666);
+
+        // Volume billing converts through the same path: whole-cent token cost scaled up.
+        assert_eq!(mp(1 * MICRO_USD_PER_CENT), 200, "1 cent = 0.2 点");
+        assert_eq!(mp(super::RAW_CENTS_PER_POINT * MICRO_USD_PER_CENT), super::MILLI, "5 cents = 1 点");
+
+        // Still never free by rounding: any positive cost costs at least one milli-点.
+        assert_eq!(mp(1), 1);
+        assert_eq!(mp(0), 0);
+        assert_eq!(mp(-9), 0);
+    }
+
+    #[test]
+    fn points_round_up_so_cheap_calls_are_never_free() {
+        use super::points_for_raw_cents as pts;
+        assert_eq!(pts(0), 0, "a genuinely zero-cost call spends nothing");
+        assert_eq!(pts(-5), 0, "negative cost cannot refund points");
+        // Anything that costs real money costs at least one 点 — otherwise a sub-point model
+        // would be unlimited and the daily cap would mean nothing.
+        assert_eq!(pts(1), 1);
+        assert_eq!(pts(super::RAW_CENTS_PER_POINT), 1);
+        assert_eq!(pts(super::RAW_CENTS_PER_POINT + 1), 2);
+        // The whole daily pool corresponds to a bounded amount of real spend.
+        assert_eq!(
+            pts(super::RAW_CENTS_PER_POINT * super::FREE_POINTS_DAILY),
+            super::FREE_POINTS_DAILY,
+        );
+    }
+
     #[test]
     fn per_call_mode_flat_fee() {
         let usage = json!({"prompt_tokens": 999999, "completion_tokens": 50000});
@@ -6425,19 +7218,17 @@ mod billing_tests {
 
     #[test]
     fn oai_to_anthropic_enables_thinking_and_drops_temp() {
-        // Opus 4.x + reasoning_effort → explicit-budget thinking on; temperature/top_p dropped;
+        // Opus 4.8 + reasoning_effort → adaptive thinking on; temperature/top_p dropped;
         // max_tokens gets headroom; output_config.effort must NOT be sent (it collapses the
-        // upstream thinking stream into a one-line summary).
+        // upstream thinking stream into a one-line summary, and adaptive defaults fine
+        // without it).
         let body = json!({
             "model": "claude-opus-4-8", "max_tokens": 4096, "temperature": 0.7, "top_p": 0.9,
             "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "hi"}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(
-            a["thinking"],
-            json!({"type":"enabled","budget_tokens":24000})
-        );
+        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         assert!(
             a.get("output_config").is_none(),
             "output_config.effort must be omitted or upstream returns summarized thinking"
@@ -6452,13 +7243,13 @@ mod billing_tests {
             "top_p must be dropped when thinking is on"
         );
 
-        // Fable → enabled+budget too.
+        // Fable 5 → adaptive too (it rejects budget_tokens like the rest of the 5 family).
         assert_eq!(
             oai_to_anthropic(
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
             )
             .unwrap()["thinking"],
-            json!({"type":"enabled","budget_tokens":12000})
+            json!({"type":"adaptive"})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking.
@@ -6475,8 +7266,9 @@ mod billing_tests {
 
     #[test]
     fn thinking_normalized_per_model() {
-        // Opus 4.8 with reasoning_effort: gateway normalizes to enabled+budget mapped from
-        // the effort dial (aggregator upstreams silently ignore "adaptive").
+        // Opus 4.8 with reasoning_effort: gateway normalizes to adaptive. The client may
+        // still send the legacy enabled+budget_tokens shape; the gateway must rewrite it,
+        // because forwarding it verbatim is a 400 on every model from 4.7 onward.
         let a = oai_to_anthropic(&json!({
             "model": "claude-opus-4-8",
             "reasoning_effort": "max",
@@ -6484,14 +7276,11 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert_eq!(
-            a["thinking"],
-            json!({"type":"enabled","budget_tokens":32000})
-        );
+        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
         assert!(a.get("output_config").is_none()); // effort knob dropped to keep raw thinking
 
-        // Sonnet 5: enabled+budget too (high → 24000)
+        // Sonnet 5: adaptive as well — enabled+budget_tokens is rejected outright.
         let s5 = oai_to_anthropic(&json!({
             "model": "claude-sonnet-5",
             "reasoning_effort": "high",
@@ -6499,10 +7288,7 @@ mod billing_tests {
             "messages": []
         }))
         .unwrap();
-        assert_eq!(
-            s5["thinking"],
-            json!({"type":"enabled","budget_tokens":24000})
-        );
+        assert_eq!(s5["thinking"], json!({"type":"adaptive"}));
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
         let b = oai_to_anthropic(&json!({
@@ -6530,18 +7316,29 @@ mod billing_tests {
 
     #[test]
     fn anthropic_thinking_gate_by_model() {
-        // effort present → on for capable Claude; mapped to enabled + explicit budget.
+        // Modern Claude (4.7+/5/Fable/Mythos) REMOVED the explicit-budget form: sending
+        // {"type":"enabled","budget_tokens":N} is a hard 400 —
+        //   "thinking.type.enabled is not supported for this model.
+        //    use thinking.type.adaptive and output_config.effort"
+        // This is not a preference; it is the upstream contract, observed in production
+        // (gateway logs, 2026-08-01, claude-sonnet-5 → 400 on every attempt).
         assert_eq!(
             anthropic_thinking("claude-opus-4-8", Some("medium")),
-            Some(json!({"type":"enabled","budget_tokens":12000}))
+            Some(json!({"type":"adaptive"}))
         );
         assert_eq!(
-            anthropic_thinking("claude-sonnet-4-6", Some("high")),
-            Some(json!({"type":"enabled","budget_tokens":24000}))
+            anthropic_thinking("claude-sonnet-5", Some("high")),
+            Some(json!({"type":"adaptive"}))
         );
         assert_eq!(
             anthropic_thinking("claude-fable-5", Some("low")),
-            Some(json!({"type":"enabled","budget_tokens":4096}))
+            Some(json!({"type":"adaptive"}))
+        );
+        // 4.6 still accepts the explicit budget (deprecated but functional there) — it is
+        // the one branch the old aggregator workaround is still valid for.
+        assert_eq!(
+            anthropic_thinking("claude-sonnet-4-6", Some("high")),
+            Some(json!({"type":"enabled","budget_tokens":24000}))
         );
         assert_eq!(
             anthropic_thinking("claude-haiku-4-5-20251001", Some("high")),
@@ -7659,6 +8456,35 @@ mod upstream_timeout_tests {
     }
 
     /// Thinking effort must never widen a broken transport's response-header window.
+    #[test]
+    /// Regression (2026-08-01): the deep-thinking budget must recognise EVERY wire shape
+    /// that turns thinking on. It used to key off `budget_tokens > 0` alone, so when the
+    /// gateway switched modern Claude to `{"type":"adaptive"}` — which has no budget field —
+    /// thinking requests silently fell back to the standard 7s header / 180s idle budget and
+    /// died as 504s. The bug was invisible: nothing errored, the deadline was just wrong.
+    #[test]
+    fn adaptive_thinking_still_counts_as_deep_thinking() {
+        // The shape modern Claude requires — no budget_tokens anywhere.
+        assert!(request_is_deep_thinking(
+            &json!({"thinking": {"type": "adaptive"}})
+        ));
+        // Legacy explicit-budget shape (3.7 / 4.6) must keep working.
+        assert!(request_is_deep_thinking(
+            &json!({"thinking": {"type": "enabled", "budget_tokens": 12000}})
+        ));
+        // Deepest OpenAI-shaped dials.
+        assert!(request_is_deep_thinking(&json!({"reasoning_effort": "max"})));
+        assert!(request_is_deep_thinking(&json!({"reasoning_effort": "xhigh"})));
+
+        // ...and a request with no thinking at all must NOT get the deep budget, or every
+        // ordinary chat inherits a 600s idle window and a hung route stops looking hung.
+        assert!(!request_is_deep_thinking(&json!({"messages": []})));
+        assert!(!request_is_deep_thinking(&json!({"reasoning_effort": "low"})));
+        assert!(!request_is_deep_thinking(
+            &json!({"thinking": {"type": "disabled"}})
+        ));
+    }
+
     #[test]
     fn deep_thinking_uses_the_same_transport_budget() {
         assert_eq!(route_budget_for(true), route_budget_for(false));
@@ -9201,5 +10027,88 @@ async fn bill_compression_call(
     // 零余额的用户扣成负数 —— 他被自己套餐包含的功能扣出了债。压缩省下来的输入
     // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
     // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
-    bill(state, uid, conn.id, cost, true, &tokens).await;
+    bill(state, uid, conn.id, cost, true, &tokens, false, 0).await;
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::gw_cache_key;
+    use serde_json::json;
+
+    fn body() -> serde_json::Value {
+        json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": "hi" }] })
+    }
+
+    #[test]
+    fn same_user_same_body_hits() {
+        let u = uuid::Uuid::nil();
+        assert_eq!(gw_cache_key(u, &body()), gw_cache_key(u, &body()));
+    }
+
+    #[test]
+    fn different_users_never_share_an_entry() {
+        // The key used to be global, so one account's completion could be served to
+        // another. Scoping to the caller is what makes that impossible.
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        assert_ne!(gw_cache_key(a, &body()), gw_cache_key(b, &body()));
+    }
+
+    #[test]
+    fn different_body_different_key() {
+        let u = uuid::Uuid::nil();
+        let mut other = body();
+        other["messages"][0]["content"] = json!("bye");
+        assert_ne!(gw_cache_key(u, &body()), gw_cache_key(u, &other));
+    }
+}
+
+#[cfg(test)]
+mod step_kind_tests {
+    use super::{step_emitted_tool, step_is_tool_turn, step_mode};
+    use axum::http::HeaderMap;
+    use serde_json::json;
+
+    #[test]
+    fn mode_comes_from_the_ide_header() {
+        let mut h = HeaderMap::new();
+        h.insert("x-ide-mode", "Agent".parse().unwrap());
+        assert_eq!(step_mode(&h).as_deref(), Some("agent"));
+        assert_eq!(step_mode(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn tool_turn_detects_agent_loop_continuations() {
+        // last message is a tool result => this is a loop continuation, not a human turn
+        let cont = json!({"messages":[{"role":"user","content":"hi"},{"role":"tool","content":"{}"}]});
+        assert_eq!(step_is_tool_turn(&cont), Some(true));
+        let fresh = json!({"messages":[{"role":"user","content":"hi"}]});
+        assert_eq!(step_is_tool_turn(&fresh), Some(false));
+        assert_eq!(step_is_tool_turn(&json!({})), None);
+    }
+
+    #[test]
+    fn emitted_tool_reads_streaming_and_nonstreaming_shapes() {
+        let streaming = r#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"read_file","arguments":""}}]}}]}"#;
+        assert_eq!(step_emitted_tool(streaming).as_deref(), Some("read_file"));
+        let non_streaming = r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"run_cmd"}}]}}]}"#;
+        assert_eq!(step_emitted_tool(non_streaming).as_deref(), Some("run_cmd"));
+    }
+
+    #[test]
+    fn prose_replies_have_no_emitted_tool() {
+        let prose = r#"data: {"choices":[{"delta":{"content":"这里是一段普通回答，没有工具调用。"}}]}"#;
+        assert_eq!(step_emitted_tool(prose), None);
+        assert_eq!(step_emitted_tool(""), None);
+    }
+
+    #[test]
+    fn classifier_never_panics_on_hostile_input() {
+        // runs over untrusted upstream text; must be total, not merely usually-correct
+        for s in ["\"function\"", "\"function\"{\"name\":", "\"function\"{\"name\":\"", "{}", "\"function\"{\"name\":\"\"}"] {
+            let _ = step_emitted_tool(s);
+        }
+        let long = format!("\"function\"{{\"name\":\"{}\"}}", "x".repeat(500));
+        assert_eq!(step_emitted_tool(&long), None, "over-long names are rejected");
+    }
 }

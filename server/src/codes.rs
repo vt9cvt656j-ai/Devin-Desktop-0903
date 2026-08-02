@@ -152,14 +152,14 @@ pub async fn admin_delete(
 
 // ---------- apply a grant to a user (shared by redeem + admin grant) ----------
 /// Per-plan quota spec: (total_cents, window_cap_cents, weekly_cap_cents, duration_days).
-/// Amounts are USD cents; weekly 0 = unlimited.
+/// Amounts are USD cents; window_cap 0 = window disabled, weekly cap is primary (P0 quota fix).
 pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
     match plan {
-        "trial" => Some((5_000, 5_000, 0, 1)), // $50 total, $50/5.5h, 1 day, ¥8.8
-        "basic" => Some((33_000, 3_000, 0, 30)), // $330 total, $30/5.5h, 30 days, ¥88
-        "pro" => Some((65_000, 6_000, 0, 30)), // $650 total, $60/5.5h, 30 days, ¥188
-        "power" => Some((180_000, 15_000, 0, 30)), // $1800 total, $150/5.5h, 30 days, ¥488
-        "ultra" => Some((500_000, 30_000, 0, 30)), // $5000 total, $300/5.5h, 30 days
+        "trial" => Some((5_000, 0, 500, 1)), // $50 total, $5/week cap, 1 day, ¥8.8
+        "basic" => Some((33_000, 0, 5_000, 30)), // $330 total, $50/week cap, 30 days, ¥88
+        "pro" => Some((65_000, 0, 10_000, 30)), // $650 total, $100/week cap, 30 days, ¥188
+        "power" => Some((180_000, 0, 30_000, 30)), // $1800 total, $300/week cap, 30 days, ¥488
+        "ultra" => Some((500_000, 0, 80_000, 30)), // $5000 total, $800/week cap, 30 days
         _ => None,
     }
 }

@@ -210,8 +210,22 @@ pub async fn ui_click(
     action: String,
     value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    if !matches!(action.as_str(), "press" | "set_value" | "focus") {
-        return Err("action must be press, set_value, or focus".into());
+    if !matches!(
+        action.as_str(),
+        "press"
+            | "set_value"
+            | "focus"
+            | "increment"
+            | "decrement"
+            | "show_menu"
+            | "confirm"
+            | "cancel"
+            | "pick"
+    ) {
+        return Err(
+            "action must be press, set_value, focus, increment, decrement, show_menu, confirm, cancel, or pick"
+                .into(),
+        );
     }
     if action == "set_value" && value.is_none() {
         return Err("set_value requires value".into());
@@ -539,6 +553,15 @@ const AX_ACTION_JS: &str = r##"(function(){
     __SIGNATURE_HELPER__
     var CTX = __CONTEXT__;
     var REF = CTX.reference; var ACT = CTX.action; var VAL = CTX.value;
+    // Perform a named AX action (AXIncrement/AXShowMenu/AXPick/…) by scanning the
+    // element's action list — this is how you drive steppers, popups, disclosure
+    // rows and dialogs that don't respond to a plain AXPress.
+    var axPerform = function(elm, axName){
+      try { var acts = elm.actions();
+        for (var ai=0; ai<acts.length; ai++){ var an=''; try{an=acts[ai].name();}catch(e){} if(an===axName){ acts[ai].perform(); return true; } }
+      } catch(e){}
+      return false;
+    };
     var se = Application('System Events');
     var procs = se.applicationProcesses.whose({ frontmost: true });
     if (!procs.length) return JSON.stringify({ok:false, err:'no frontmost app'});
@@ -592,10 +615,21 @@ const AX_ACTION_JS: &str = r##"(function(){
     } else if (ACT === 'focus') {
       var f=false; try { el.focused = true; f=true; } catch(e) {}
       return JSON.stringify({ok:f, action:'focus', role:role, name:String(name).slice(0,60)});
-    } else {
-      try { el.click(); } catch(e) { return JSON.stringify({ok:false, err:'AXPress failed: '+e, role:role, name:String(name).slice(0,60)}); }
+    } else if (ACT === 'press') {
+      var pressed=false;
+      try { el.click(); pressed=true; } catch(e) {}
+      // Rows, disclosure triangles and popup buttons often expose AXOpen/AXPick
+      // instead of AXPress — fall through those before giving up.
+      if(!pressed) pressed = axPerform(el,'AXPress')||axPerform(el,'AXOpen')||axPerform(el,'AXPick');
+      if(!pressed) return JSON.stringify({ok:false, err:'element does not respond to press/open/pick', role:role, name:String(name).slice(0,60)});
       var nv2=''; try { var vv=el.value(); if(typeof vv==='string') nv2=vv; } catch(e) {}
       return JSON.stringify({ok:true, action:'press', role:role, name:String(name).slice(0,60), value:String(nv2).slice(0,140)});
+    } else {
+      var axName = ({increment:'AXIncrement',decrement:'AXDecrement',show_menu:'AXShowMenu',confirm:'AXConfirm',cancel:'AXCancel',pick:'AXPick'})[ACT];
+      if(!axName) return JSON.stringify({ok:false, err:'unsupported action: '+String(ACT)});
+      if(!axPerform(el,axName)) return JSON.stringify({ok:false, err:'element does not support '+axName+' ('+ACT+')', role:role, name:String(name).slice(0,60)});
+      var nv3=''; try { var vv3=el.value(); if(vv3!=null) nv3=String(vv3); } catch(e) {}
+      return JSON.stringify({ok:true, action:ACT, role:role, name:String(name).slice(0,60), value:String(nv3).slice(0,140)});
     }
   } catch(e) { return JSON.stringify({ok:false, err:String(e)}); }
 })()"##;
@@ -608,7 +642,8 @@ fn build_ax_action_script(
     expected_target: &AccessibilityTarget,
 ) -> Result<String, String> {
     let act = match action {
-        "set_value" | "focus" | "press" => action,
+        "set_value" | "focus" | "press" | "increment" | "decrement" | "show_menu" | "confirm"
+        | "cancel" | "pick" => action,
         _ => return Err("unsupported accessibility action".to_string()),
     };
     let context = serde_json::json!({
@@ -1032,6 +1067,40 @@ return JSON.stringify({operated:operated,changed:changed});
         for operation in ["el.value = VAL", "el.focused = true", "el.click()"] {
             assert!(gate < script.find(operation).expect("AX operation should exist"));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn action_script_supports_extended_ax_actions() {
+        let target = AccessibilityTarget {
+            pid: 7,
+            name: "App".to_string(),
+        };
+        let binding = AxRefBinding {
+            raw_ref: 3,
+            signature: AxElementSignature::from(&element(3)),
+        };
+        // Every extended action must be accepted by the builder and map to a real AX verb.
+        for (action, ax_verb) in [
+            ("increment", "AXIncrement"),
+            ("decrement", "AXDecrement"),
+            ("show_menu", "AXShowMenu"),
+            ("confirm", "AXConfirm"),
+            ("cancel", "AXCancel"),
+            ("pick", "AXPick"),
+        ] {
+            let script = build_ax_action_script(&binding, action, None, &target)
+                .unwrap_or_else(|_| panic!("action {action} should build a script"));
+            assert!(
+                script.contains(ax_verb),
+                "{action} must map to {ax_verb} in the action script"
+            );
+            // The named-action executor and its signature gate must both be present.
+            assert!(script.contains("var axPerform = function"));
+            assert!(script.contains("axSignatureChanges(CTX.signature,candidate.signature)"));
+        }
+        // Unknown actions are still rejected before ever reaching osascript.
+        assert!(build_ax_action_script(&binding, "nuke", None, &target).is_err());
     }
 
     /// 自己实现 FNV-1a 而不是用 `DefaultHasher`：后者的输出不保证跨 Rust 版本稳定，

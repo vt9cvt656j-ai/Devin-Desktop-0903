@@ -1,0 +1,86 @@
+#!/bin/bash
+# Pre-commit hook to prevent committing sensitive information
+# Install with: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+echo "🔍 Scanning staged files for sensitive information..."
+
+# Get list of staged files
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo -e "${GREEN}✅ No files staged. Skipping security check.${NC}"
+    exit 0
+fi
+
+FOUND_SECRETS=0
+
+for FILE in $STAGED_FILES; do
+    # Skip if file is being deleted
+    if git diff --cached --diff-filter=D --name-only | grep -q "^${FILE}$"; then
+        continue
+    fi
+    
+    # Check for common secret patterns
+    if grep -iE "(password|passwd|pwd)\s*[=:]\s*['\"]?[^'\"]+['\"]?" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ Password detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    if grep -iE "(api[_-]?key|apikey)\s*[=:]\s*['\"]?[a-zA-Z0-9]{16,}['\"]?" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ API Key detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    if grep -iE "(secret|token)\s*[=:]\s*['\"]?[a-zA-Z0-9]{20,}['\"]?" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ Secret/Token detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    # Check for .env file commits
+    if [[ "$FILE" == *".env"* ]] && [[ "$FILE" != *".env.example"* ]]; then
+        echo -e "${RED}❌ Environment file detected: $FILE (except .env.example)${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    # Check for AWS credentials pattern
+    if grep -E "AKIA[0-9A-Z]{16}" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ AWS Access Key ID detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    # Check for GitHub tokens
+    if grep -E "gh[pousr]_[a-zA-Z0-9_]{36,}" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ GitHub Token detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    # Check for Stripe secret keys
+    if grep -E "sk_live_[a-zA-Z0-9]{24,}" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ Stripe Live Secret Key detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+    
+    # Check for JWT secrets
+    if grep -iE "jwt[_-]?secret\s*[=:]\s*['\"]?[a-zA-Z0-9]{32,}['\"]?" "$FILE" 2>/dev/null; then
+        echo -e "${RED}❌ JWT Secret detected in: $FILE${NC}"
+        FOUND_SECRETS=1
+    fi
+done
+
+if [ $FOUND_SECRETS -eq 1 ]; then
+    echo -e "\n${RED}⛔️ Commit blocked! Please remove sensitive information before committing.${NC}"
+    echo -e "\n💡 Tips:"
+    echo -e "  - Use environment variables or Docker secrets for sensitive data"
+    echo -e "  - Add .env files to .gitignore"
+    echo -e "  - Use .env.example as a template for documenting required variables"
+    echo -e "  - Run 'git reset HEAD <file>' to unstage changes"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ Security check passed.${NC}"
+exit 0

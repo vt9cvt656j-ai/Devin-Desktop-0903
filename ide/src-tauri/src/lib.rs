@@ -7,6 +7,7 @@ mod auth;
 mod automation;
 mod browser;
 mod capture;
+mod conversation_store;
 mod db;
 mod debug;
 mod extensions;
@@ -26,6 +27,8 @@ mod process_util;
 mod proxy;
 mod public_data;
 mod qr;
+#[macro_use]
+mod safelog;
 mod shop_catalog;
 mod sysctl;
 mod tasks;
@@ -67,7 +70,7 @@ fn cleanup_stale(
 
 /// 多窗口时跳过 cleanup_stale 的说明位（保持函数体简单，便于将来换成真正的日志）。
 fn tracing_ignore_multiwindow() {
-    eprintln!("[cleanup_stale] 检测到多个窗口，跳过进程回收以免杀掉其它窗口正在用的会话");
+    elog!("[cleanup_stale] 检测到多个窗口，跳过进程回收以免杀掉其它窗口正在用的会话");
 }
 
 /// Entry point shared by the binary and (potentially) mobile targets.
@@ -100,6 +103,21 @@ fn install_panic_logger() {
                 .open(dir.join("crash.log"))
             {
                 let _ = f.write_all(msg.as_bytes());
+            }
+            // macOS 标准日志位置再落一份，方便用户直接在 Console.app 里找到尸检记录。
+            #[cfg(target_os = "macos")]
+            {
+                let logs = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_default(),
+                )
+                .join("Library/Logs");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(logs.join("michael-ide-panic.log"))
+                {
+                    let _ = f.write_all(msg.as_bytes());
+                }
             }
         }
         prev(info);
@@ -178,6 +196,13 @@ pub fn run() {
             files::search_in_project,
             files::replace_in_file,
             files::replace_in_project,
+            conversation_store::conversation_snapshot_save,
+            conversation_store::conversation_snapshot_load,
+            conversation_store::conversation_transcript_append,
+            conversation_store::conversation_transcript_load,
+            conversation_store::conversation_transcript_window,
+            conversation_store::conversation_transcript_content_slice,
+            conversation_store::conversation_transcript_truncate,
             git::git_status,
             git::git_worktree_add,
             git::git_worktree_list,

@@ -2443,6 +2443,32 @@ fn looks_like_ui_task(q: &str) -> bool {
         "media asset",
         "image asset",
         "video background",
+        // Software/Desktop UI related
+        "desktop app",
+        "desktop application",
+        "software",
+        "software ui",
+        "app interface",
+        "client interface",
+        "gui",
+        "electron",
+        "tauri",
+        "gtk",
+        "qt",
+        "wxwidgets",
+        "swing",
+        "javafx",
+        "wpf",
+        "windows forms",
+        "macos app",
+        "ios app",
+        "android app",
+        "mobile app",
+        "native app",
+        "cli tool",
+        "command line tool",
+        "tui",
+        "terminal ui",
     ];
     // CJK terms (matched against the raw query)
     const CJK_KW: &[&str] = &[
@@ -2504,6 +2530,43 @@ fn looks_like_ui_task(q: &str) -> bool {
         "交互动效",
         "内容密度",
         "信息架构",
+        // 应用/桌面 UI 相关
+        "应用界面",
+        "应用 UI",
+        "软件界面",
+        "软件 UI",
+        "桌面应用",
+        "桌面程序",
+        "客户端界面",
+        "客户端 UI",
+        "GUI",
+        "图形界面",
+        "Electron",
+        "Tauri",
+        "GTK",
+        "Qt",
+        "QT",
+        "PyQt",
+        "Swing",
+        "JavaFX",
+        "WPF",
+        "移动应用",
+        "手机 APP",
+        "App 界面",
+        "移动端界面",
+        // 通用改界面表述
+        "改界面",
+        "调界面",
+        "重新设计界面",
+        "界面美化",
+        "界面优化",
+        "界面调整",
+        "后台界面",
+        "管理后台",
+        "控制面板",
+        "配置页面",
+        "设置页面",
+        "仪表板",
     ];
     let contextual_component = q.contains("组件")
         && [
@@ -6291,4 +6354,5 @@ mod tests {
             );
         }
     }
+
 }

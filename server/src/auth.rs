@@ -22,6 +22,9 @@ pub struct User {
     pub plan: String,
     pub plan_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub credits_cents: i64,
+    /// Daily free allowance, in 点. ¥0.5 = 10 点, so the ¥2 grant is 40 点.
+    #[serde(default)]
+    pub free_points: i64,
     pub quota_total_cents: i64,
     pub quota_window_cap_cents: i64,
     pub quota_window_cents: i64,
@@ -125,6 +128,78 @@ pub fn claims_from_jwt(cfg: &Config, token: &str) -> Option<Claims> {
     )
     .ok()
     .map(|data| data.claims)
+}
+
+// ---- password-login brute-force guard --------------------------------------
+// The emailed-code path is carefully budgeted (per-code attempts + an hourly ceiling that
+// resends cannot reset). Password login had no budget at all — only bcrypt's cost factor,
+// which slows an attacker but never stops one, and fail2ban on this host is configured for
+// SSH, not for HTTP 401s from the backend.
+
+/// Failed passwords tolerated per account per hour before login is paused.
+const LOGIN_FAIL_PER_EMAIL: i64 = 10;
+/// Failed passwords tolerated per source IP per hour — stops one host spraying many accounts.
+const LOGIN_FAIL_PER_IP: i64 = 50;
+const LOGIN_FAIL_WINDOW_SECS: i64 = 3600;
+
+/// A throwaway hash so "no such account" spends the same CPU as a wrong password.
+static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    bcrypt::hash("michael-timing-equalizer", bcrypt::DEFAULT_COST).unwrap_or_default()
+});
+
+/// Client IP as nginx sees it (`X-Real-IP`, else the first `X-Forwarded-For` hop).
+fn client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Reject outright when either budget is spent; otherwise hand back the two counter keys.
+async fn login_guard(state: &AppState, email: &str, ip: &str) -> ApiResult<(String, String)> {
+    let mut conn = state.redis.clone();
+    let ekey = format!("login_fail:{}", normalize_email(email));
+    let ikey = format!("login_fail_ip:{ip}");
+    let e_fails: Option<i64> = redis::cmd("GET").arg(&ekey).query_async(&mut conn).await?;
+    let i_fails: Option<i64> = redis::cmd("GET").arg(&ikey).query_async(&mut conn).await?;
+    if e_fails.unwrap_or(0) >= LOGIN_FAIL_PER_EMAIL || i_fails.unwrap_or(0) >= LOGIN_FAIL_PER_IP {
+        return Err(AppError::bad(
+            "登录失败次数过多，请稍后再试，或改用邮箱验证码登录",
+        ));
+    }
+    Ok((ekey, ikey))
+}
+
+async fn login_fail(state: &AppState, ekey: &str, ikey: &str) {
+    let mut conn = state.redis.clone();
+    for k in [ekey, ikey] {
+        let _: Result<i64, _> = redis::cmd("INCR").arg(k).query_async(&mut conn).await;
+        // EXPIRE on every increment (idempotent): setting it only on the first failure
+        // risks a crash in between leaving a TTL-less key that locks the account out forever
+        // — the same reasoning as take_code() above.
+        let _: Result<(), _> = redis::cmd("EXPIRE")
+            .arg(k)
+            .arg(LOGIN_FAIL_WINDOW_SECS)
+            .query_async(&mut conn)
+            .await;
+    }
+}
+
+async fn login_ok(state: &AppState, ekey: &str, ikey: &str) {
+    let mut conn = state.redis.clone();
+    let _: Result<(), _> = redis::cmd("DEL")
+        .arg(ekey)
+        .arg(ikey)
+        .query_async(&mut conn)
+        .await;
 }
 
 /// Lightweight email format check ("合规").
@@ -407,22 +482,29 @@ pub async fn register(
     if req.password.len() < 6 {
         return Err(AppError::bad("密码至少 6 位"));
     }
-    if !take_code(&state, &req.email, &req.code).await? {
-        return Err(AppError::bad("验证码错误或已过期"));
-    }
+    // Duplicate check BEFORE consuming the code. take_code() deletes the code on success,
+    // so the old order burned the code of anyone who retried a registration that had
+    // already gone through — they then had to wait out the 30s resend cooldown.
     if find_user(&state, &req.email).await?.is_some() {
         return Err(AppError::bad("该邮箱已注册，请直接登录"));
+    }
+    if !take_code(&state, &req.email, &req.code).await? {
+        return Err(AppError::bad("验证码错误或已过期"));
     }
     let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)?;
     // Store the canonical form so the UNIQUE index actually enforces one account per
     // mailbox from here on.
+    // ON CONFLICT: two concurrent registrations for the same address both clear the check
+    // above; without this the loser hits the UNIQUE index and surfaces as a raw 500.
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *",
+        "INSERT INTO users (email, password_hash) VALUES ($1, $2) \
+         ON CONFLICT (email) DO NOTHING RETURNING *",
     )
     .bind(normalize_email(&req.email))
     .bind(&hash)
-    .fetch_one(&state.db)
-    .await?;
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad("该邮箱已注册，请直接登录"))?;
     let token = issue_token(&state.cfg, &user)?;
     crate::realtime::record_event(
         &state,
@@ -436,17 +518,31 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if req.email.trim().is_empty() || req.password.is_empty() {
         return Err(AppError::bad("账号或密码不能为空"));
     }
-    let user = find_user(&state, req.email.trim())
-        .await?
-        .ok_or_else(|| AppError::bad("账号不存在"))?;
+    let ip = client_ip(&headers);
+    let (ekey, ikey) = login_guard(&state, &req.email, &ip).await?;
+    // One message for "no such account" and "wrong password", and the same bcrypt cost on
+    // both paths. Splitting them — and skipping bcrypt entirely when the account did not
+    // exist — made both the response text AND the response time an enumeration oracle,
+    // on an endpoint that had no rate limit at all.
+    let user = match find_user(&state, req.email.trim()).await? {
+        Some(u) => u,
+        None => {
+            let _ = bcrypt::verify(&req.password, &DUMMY_HASH);
+            login_fail(&state, &ekey, &ikey).await;
+            return Err(AppError::unauthorized("账号或密码错误"));
+        }
+    };
     if !bcrypt::verify(&req.password, &user.password_hash)? {
-        return Err(AppError::unauthorized("密码错误"));
+        login_fail(&state, &ekey, &ikey).await;
+        return Err(AppError::unauthorized("账号或密码错误"));
     }
+    login_ok(&state, &ekey, &ikey).await;
     sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1")
         .bind(user.id)
         .execute(&state.db)
@@ -520,8 +616,36 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
     } else {
         None
     };
+    // Daily free-points grant, applied lazily on read: if the stored date is not today the
+    // pool is overwritten with today's allowance, so yesterday's remainder is never carried.
+    // Doing it here means the profile popup is always the freshest view of the pool.
+    let free_points: i64 = sqlx::query_scalar(
+        "UPDATE users SET \
+           free_points = CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
+                              THEN $2 ELSE free_points END, \
+           free_points_date = CURRENT_DATE \
+         WHERE id = $1 RETURNING free_points",
+    )
+    .bind(id)
+    .bind(crate::models::FREE_MILLI_POINTS_DAILY)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
     let mut body = serde_json::to_value(&user).unwrap_or_else(|_| json!({}));
     if let Some(obj) = body.as_object_mut() {
+        // Stored in milli-点; exposed as fractional 点 so the client renders "39.94 点"
+        // rather than a whole number that hides every sub-point call.
+        obj.insert(
+            "free_points".into(),
+            json!(free_points as f64 / crate::models::MILLI as f64),
+        );
+        obj.insert(
+            "free_points_daily".into(),
+            json!(crate::models::FREE_POINTS_DAILY),
+        );
         obj.insert(
             "michael_compression".into(),
             match tier {

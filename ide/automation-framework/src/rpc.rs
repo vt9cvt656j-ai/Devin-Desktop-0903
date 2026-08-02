@@ -203,7 +203,7 @@ impl RpcServer {
             #[cfg(feature = "system")]
             "mouse.double_click" => {
                 let button = params.get("button").and_then(|v| v.as_str());
-                agent.mouse_double_click()?;
+                agent.mouse_double_click(button)?;
                 Ok(serde_json::json!({"status": "ok"}))
             }
             
@@ -233,7 +233,7 @@ impl RpcServer {
                 let delta_y = params.get("delta_y")
                     .and_then(|v| v.as_i64())
                     .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'delta_y' parameter")))? as i32;
-                agent.mouse_scroll(delta_y)?;
+                agent.mouse_scroll(delta_x, delta_y)?;
                 Ok(serde_json::json!({"status": "ok"}))
             }
             

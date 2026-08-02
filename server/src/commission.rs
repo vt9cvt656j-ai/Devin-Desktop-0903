@@ -176,6 +176,24 @@ pub async fn admin_create_commission(
         return Err(AppError::bad("佣金金额不能大于成交金额"));
     }
 
+    // One payable commission per order. `idx_commissions_order` is a plain index, not a
+    // unique one, so nothing stopped a double-submitted form (or two admins working the
+    // same backlog) from creating two rows for the same order and paying the referrer
+    // twice. Rejected rows are ignored so a mistake can be corrected and re-entered.
+    if let Some(order_id) = req.order_id {
+        let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM commissions WHERE order_id = $1 AND status <> 'rejected' LIMIT 1",
+        )
+        .bind(order_id)
+        .fetch_optional(&state.db)
+        .await?;
+        if existing.is_some() {
+            return Err(AppError::bad(
+                "该订单已有佣金记录（如需重开，请先把原记录标记为 rejected）",
+            ));
+        }
+    }
+
     let referrer_user_id = user_id_by_email(&state, &referrer_email).await?;
     let customer_user_id = user_id_by_email(&state, &customer_email).await?;
     let source = req
@@ -242,7 +260,7 @@ pub async fn admin_update_commission_status(
         "UPDATE commissions \
          SET status = $2, \
              note = CASE WHEN $3::text = '' THEN note ELSE $3 END, \
-             settled_at = CASE WHEN $2 = 'settled' THEN now() ELSE NULL END, \
+             settled_at = CASE WHEN $2 = 'settled' THEN COALESCE(settled_at, now()) ELSE NULL END, \
              updated_at = now() \
          WHERE id = $1 \
          RETURNING *",

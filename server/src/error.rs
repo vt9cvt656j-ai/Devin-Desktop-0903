@@ -46,7 +46,20 @@ impl IntoResponse for AppError {
         } else if self.status.is_server_error() {
             tracing::error!("{}", self.msg);
         }
-        (self.status, Json(json!({ "error": self.msg }))).into_response()
+        // Only 500 is redacted. The `into_internal!` impls below fill 500 messages with
+        // raw `sqlx`/`redis` error text — table names, column names, constraint names,
+        // SQL fragments — which was being returned verbatim to whoever made the request,
+        // including unauthenticated callers on /api/auth/*. That belongs in the log.
+        //
+        // Scoped to 500 deliberately, NOT to is_server_error(): 502/503/504 carry the
+        // hand-written upstream messages ("换个模型或稍后再试") that are meant for the user,
+        // and blanking those would be a real UX regression.
+        let body = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            "服务器内部错误，请稍后重试".to_string()
+        } else {
+            self.msg
+        };
+        (self.status, Json(json!({ "error": body }))).into_response()
     }
 }
 

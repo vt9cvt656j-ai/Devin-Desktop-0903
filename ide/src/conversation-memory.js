@@ -268,6 +268,14 @@ export class ConversationMemory {
     this.summaries = [];
     this.milestones = [];
     this.fileEvidence = [];
+    // The prompt-facing memory below is intentionally compacted. Keep a separate
+    // append-only transcript for durable chat recovery so saving tokens can never
+    // discard what the user or agent actually said.
+    this.transcript = [];
+    // `transcript` may be only the in-process tail after a restart. Its first
+    // item still has a stable, absolute journal sequence so a new append can
+    // never overwrite the beginning of a long SQLite transcript.
+    this.transcriptOffset = 0;
     // Archival memory (MemGPT/Letta-style): compacted-away turns keep a bounded
     // text-only record here, searchable via searchArchive() / the recall tool,
     // so compression no longer means permanent loss of early details.
@@ -276,6 +284,7 @@ export class ConversationMemory {
     // newer correction records supersede older beliefs during retrieval.
     this.corrections = [];
     this._onMessagesRemoved = null;
+    this._onTranscriptMutation = null;
     this._externalCompression = false;
     this._recentChars = 0;
   }
@@ -288,13 +297,26 @@ export class ConversationMemory {
     this._onMessagesRemoved = typeof handler === 'function' ? handler : null;
   }
 
+  setTranscriptMutationHandler(handler) {
+    this._onTranscriptMutation = typeof handler === 'function' ? handler : null;
+  }
+
+  _notifyTranscriptMutation(mutation) {
+    if (!this._onTranscriptMutation) return;
+    try { this._onTranscriptMutation(mutation); } catch {}
+  }
+
   _notifyMessagesRemoved(messages) {
     if (!messages?.length || !this._onMessagesRemoved) return;
     try { this._onMessagesRemoved(messages); } catch {}
   }
 
   push(msg) {
+    const sequence = this.transcriptOffset + this.transcript.length;
     this.totalTurns++;
+    this.transcript.push(msg);
+    this.totalTurns = Math.max(this.totalTurns, sequence + 1);
+    this._notifyTranscriptMutation({ kind: 'append', sequence, message: msg });
     this.recent.push(msg);
     this._recentChars += ConversationMemory._messageChars(msg);
     // Adaptive compression: by count (long chats of short turns) OR by token
@@ -305,6 +327,94 @@ export class ConversationMemory {
         || (this.recent.length >= SUMMARY_BATCH + 6 && this.estimateRecentTokens() > 48000))) {
       this._compressOldestBatch();
     }
+  }
+
+  // Display/recovery deliberately reads this durable record, whereas assemble()
+  // remains the bounded, prompt-facing view. Falling back to `recent` keeps
+  // snapshots created by older app versions readable.
+  transcriptEntries() {
+    return this.transcript.length || this.transcriptOffset > 0 ? this.transcript : this.recent;
+  }
+
+  transcriptLength() {
+    return this.transcriptOffset + this.transcriptEntries().length;
+  }
+
+  transcriptSlice(from = 0, to = this.transcriptLength()) {
+    const entries = this.transcriptEntries();
+    const length = this.transcriptLength();
+    const start = Math.max(0, Math.min(length, Math.trunc(Number(from) || 0)));
+    const end = Math.max(start, Math.min(length, Math.trunc(Number(to) || 0)));
+    const localStart = Math.max(0, start - this.transcriptOffset);
+    const localEnd = Math.max(localStart, Math.min(entries.length, end - this.transcriptOffset));
+    return entries.slice(localStart, localEnd);
+  }
+
+  // SQLite restores the compact prompt projection first, then supplies the exact
+  // transcript only when this tab is opened. Hydration must not emit a journal
+  // mutation: these records already exist durably and re-appending would create
+  // duplicate work on every restart.
+  replaceTranscript(messages) {
+    this.transcript = Array.isArray(messages) ? messages.slice() : [];
+    this.transcriptOffset = 0;
+    this.totalTurns = this.transcript.length;
+    if (!this.recent.length && this.transcript.length) {
+      this.recent = this.transcript.slice(-RECENT_WINDOW);
+      this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    }
+    return this.transcript.length;
+  }
+
+  // Editing/resending a historical user turn invalidates every later turn. Keep
+  // the exact retained transcript, then rebuild the compact prompt projection
+  // so stale summaries or archive entries cannot steer the next model call.
+  truncateTranscript(index) {
+    const cut = Math.max(0, Math.min(this.transcriptLength(), Math.trunc(Number(index) || 0)));
+    const localCut = Math.max(0, Math.min(this.transcript.length, cut - this.transcriptOffset));
+    const removed = this.transcript.slice(localCut);
+    if (cut <= this.transcriptOffset) {
+      this.transcript = [];
+      this.transcriptOffset = cut;
+    } else {
+      this.transcript = this.transcript.slice(0, localCut);
+    }
+    this.totalTurns = cut;
+    this.recent = this.transcript.slice();
+    this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    this.summaries = [];
+    this.archive = [];
+    this.milestones = this.milestones.filter((item) => Number(item?.turn) <= this.totalTurns);
+    this.fileEvidence = [];
+    this.corrections = this.corrections.filter((item) => {
+      const sourceTurns = Array.isArray(item?.sourceTurns) ? item.sourceTurns : [];
+      return sourceTurns.every((turn) => Number(turn) <= this.totalTurns);
+    });
+    while (this.recent.length > RECENT_WINDOW) this._compressOldestBatch();
+    this._notifyMessagesRemoved(removed);
+    this._notifyTranscriptMutation({ kind: 'truncate', length: cut });
+    return removed;
+  }
+
+  // The durable journal is authoritative after startup. Keep only a bounded
+  // prompt projection in memory, but advance the absolute append sequence to
+  // its real length before accepting another user turn.
+  setExternalTranscriptLength(length) {
+    const total = Math.max(0, Math.trunc(Number(length) || 0));
+    if (!this.transcript.length) this.transcriptOffset = total;
+    this.totalTurns = Math.max(total, this.transcriptOffset + this.transcript.length);
+    return this.totalTurns;
+  }
+
+  // Used after a historical edit. These messages are deliberately not inserted
+  // into `transcript`: they already exist in SQLite and must not be re-appended.
+  replacePromptTail(messages, totalTurns = this.totalTurns) {
+    this.recent = Array.isArray(messages) ? messages.slice(-RECENT_WINDOW) : [];
+    this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
+    this.summaries = [];
+    this.archive = [];
+    this.fileEvidence = [];
+    this.totalTurns = Math.max(0, Math.trunc(Number(totalTurns) || 0));
+    return this.recent.length;
   }
 
   markMilestone(event) {
@@ -685,6 +795,15 @@ export class ConversationMemory {
         : 'system';
       const text = clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
       if (text) lines.push(`[${role}] ${text}`);
+      // 思考结论优先保留：助手消息尾部的〔推理摘要〕段被上面的 520 字截断裁掉时，
+      // 补一条独立结论行（≤400 字），跨压缩边界仍能"接着想"而不是重新推导
+      //（与 main.js 的 _thinkLedger 同一条治理线）。
+      if (role === 'assistant' && typeof msg?.content === 'string') {
+        const reasoningAt = msg.content.indexOf('〔推理摘要〕');
+        if (reasoningAt >= 0 && !text.includes('〔推理摘要〕')) {
+          lines.push(`[assistant·推理结论] ${clean(msg.content.slice(reasoningAt), 400)}`);
+        }
+      }
       const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
       if (attachments.length) {
         const kinds = attachments.map((a) => a?.kind || "media").slice(0, 4).join(", ");
@@ -712,7 +831,30 @@ export class ConversationMemory {
       ? Math.max(0, Math.trunc(options.recentLimit))
       : this.recent.length;
     const recent = limit === 0 ? [] : limit < this.recent.length ? this.recent.slice(-limit) : this.recent;
-    return { totalTurns: this.totalTurns, recent: serializeMessagesForPersistence(recent, effectiveBudget, { textBudget: options?.textBudget }), summaries: this.summaries, milestones: this.milestones, fileEvidence: this.fileEvidence, archive: this.archive, corrections: this.corrections };
+    const transcriptLimit = Number.isFinite(options?.transcriptLimit)
+      ? Math.max(0, Math.trunc(options.transcriptLimit))
+      : this.transcript.length;
+    const transcript = transcriptLimit === 0
+      ? []
+      : transcriptLimit < this.transcript.length
+        ? this.transcript.slice(-transcriptLimit)
+        : this.transcript;
+    const serializedTranscriptOffset = this.transcriptOffset + Math.max(0, this.transcript.length - transcript.length);
+    return {
+      totalTurns: this.totalTurns,
+      recent: serializeMessagesForPersistence(recent, effectiveBudget, { textBudget: options?.textBudget }),
+      // This is deliberately independent from `recent` and `archive`: those two
+      // serve bounded model context and retrieval, while transcript is the exact
+      // local record used to restore a conversation after a restart.
+      transcript: serializeMessagesForPersistence(transcript, effectiveBudget, { textBudget: options?.textBudget }),
+      transcriptOffset: serializedTranscriptOffset || undefined,
+      transcriptCheckpoint: options?.externalizeTranscript ? this.transcriptLength() : undefined,
+      summaries: this.summaries,
+      milestones: this.milestones,
+      fileEvidence: this.fileEvidence,
+      archive: this.archive,
+      corrections: this.corrections,
+    };
   }
 
   static fromJSON(obj) {
@@ -720,6 +862,17 @@ export class ConversationMemory {
     if (obj) {
       mem.totalTurns = obj.totalTurns || 0;
       mem.recent = Array.isArray(obj.recent) ? obj.recent : [];
+      mem.transcript = Array.isArray(obj.transcript) ? obj.transcript : [];
+      const checkpoint = Number.isFinite(obj.transcriptCheckpoint)
+        ? Math.max(0, Math.trunc(obj.transcriptCheckpoint)) : null;
+      mem.transcriptOffset = Number.isFinite(obj.transcriptOffset)
+        ? Math.max(0, Math.trunc(obj.transcriptOffset)) : 0;
+      // SQLite checkpoints externalize the entire exact transcript. Do not
+      // synthesize one from `recent`: that would give old messages sequence 0
+      // and let the next append overwrite stored history.
+      if (checkpoint !== null && mem.transcript.length === 0) {
+        mem.transcriptOffset = checkpoint;
+      }
       mem._recentChars = mem.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
       mem.summaries = obj.summaries || [];
       mem.milestones = obj.milestones || [];
@@ -729,6 +882,26 @@ export class ConversationMemory {
           .filter((e) => e && typeof e.text === 'string' && e.text)
           .map((e) => ({ turn: Math.max(0, Number(e.turn) || 0), role: String(e.role || 'assistant'), text: String(e.text).slice(0, ARCHIVE_ENTRY_MAX) }))
         : [];
+      // Older session.json files only had compacted recent/archive memories.
+      // Recover the best available display history once, then all future saves
+      // persist the canonical transcript without another lossy conversion.
+      if (!mem.transcript.length && checkpoint === null) {
+        const legacyArchive = mem.archive.map((entry) => ({
+          role: entry.role,
+          content: entry.text,
+        }));
+        mem.transcript = legacyArchive.concat(mem.recent);
+      }
+      if (checkpoint !== null && mem.transcript.length && checkpoint <= mem.transcriptOffset + mem.transcript.length) {
+        const localCheckpoint = Math.max(0, Math.min(mem.transcript.length, checkpoint - mem.transcriptOffset));
+        const tail = mem.transcript.slice(localCheckpoint);
+        if (tail.length) {
+          mem.recent.push(...tail);
+          for (const message of tail) mem._recentChars += ConversationMemory._messageChars(message);
+          while (mem.recent.length > RECENT_WINDOW) mem._compressOldestBatch();
+        }
+      }
+      mem.totalTurns = Math.max(mem.totalTurns, mem.transcriptOffset + mem.transcript.length, mem.recent.length);
       mem.corrections = Array.isArray(obj.corrections)
         ? obj.corrections.slice(-MAX_CORRECTIONS).map((item) => ({
           id: cleanCorrectionText(item?.id, 160),

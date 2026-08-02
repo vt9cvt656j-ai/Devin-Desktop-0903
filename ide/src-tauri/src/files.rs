@@ -34,6 +34,11 @@ const IGNORED_DIRS: &[&str] = &[
     "vendor",
     "__pycache__",
     "coverage",
+    // Additional universally-vendored / generated trees so search returns signal,
+    // not noise (dot-dirs like .next/.gradle/.venv are already skipped separately).
+    "bower_components",
+    "Pods",
+    "venv",
 ];
 
 /// Workspace roots that have been opened by the user via the native folder
@@ -311,7 +316,10 @@ fn is_within_allowed_root(path: &Path, roots: &[PathBuf]) -> bool {
 /// Verify `target` is inside an allowed workspace root.  Resolves symlinks and
 /// normalises components so that `../../etc/passwd` tricks are caught even when
 /// intermediate directories exist.
-fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
+/// Require that a target path is inside one of the registered workspace roots, or (for
+/// read-only operations) under the user's home directory. Write/delete/rename operations
+/// must stay strictly within workspace to prevent writing ~/.ssh/id_rsa, etc.
+pub fn require_inside_workspace(target: &str, is_write_op: bool) -> Result<PathBuf, String> {
     let target_path = Path::new(target);
     let raw_target = target.to_string();
 
@@ -368,11 +376,15 @@ fn require_inside_workspace(target: &str) -> Result<PathBuf, String> {
         return Ok(resolved);
     }
 
-    // Always allow paths under HOME regardless of what roots are registered.
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if let Ok(home_canonical) = std::fs::canonicalize(&home) {
-            if resolved.starts_with(home_canonical) {
-                return Ok(resolved);
+    // For read-only operations, allow paths under HOME (useful for reading logs,
+    // config files, etc.). For write/delete/rename operations, block HOME paths
+    // to prevent writing ~/.ssh/id_rsa, ~/.bashrc, etc., which could bypass workspace.
+    if !is_write_op {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            if let Ok(home_canonical) = std::fs::canonicalize(&home) {
+                if resolved.starts_with(home_canonical) {
+                    return Ok(resolved);
+                }
             }
         }
     }
@@ -400,7 +412,7 @@ pub struct DirEntry {
 /// Dotfiles are hidden by default to keep the tree tidy.
 #[tauri::command]
 pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    require_inside_workspace(&path)?;
+    require_inside_workspace(&path, false)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -421,13 +433,50 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+/// Translate a raw IO error into a friendly, actionable message instead of
+/// leaking `os error N` straight to the UI (see PATH_RESOLUTION_DIAGNOSIS.md).
+fn friendly_read_error(path: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "文件不存在：{}（请先用 list_dir/find_files 确认真实路径，注意不要臆造子目录或把文件名翻译成英文）",
+            path
+        ),
+        std::io::ErrorKind::PermissionDenied => format!("没有读取权限：{}", path),
+        std::io::ErrorKind::IsADirectory => {
+            format!("{} 是目录不是文件，请用 read_dir 查看其内容", path)
+        }
+        std::io::ErrorKind::NotADirectory => format!(
+            "路径中间有一段不是目录：{}（可能把某个文件当成了目录）",
+            path
+        ),
+        kind => format!("读取失败：{}（{}）", path, kind),
+    }
+}
+
+fn friendly_write_error(op: &str, path: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{}失败：路径不存在：{}（请先用 list_dir 确认父目录存在）",
+            op, path
+        ),
+        std::io::ErrorKind::PermissionDenied => format!("{}失败：没有写入权限：{}", op, path),
+        std::io::ErrorKind::AlreadyExists => format!("{}失败：目标已存在：{}", op, path),
+        std::io::ErrorKind::IsADirectory => format!("{}失败：{} 是目录", op, path),
+        std::io::ErrorKind::NotADirectory => format!(
+            "{}失败：路径中间有一段不是目录：{}",
+            op, path
+        ),
+        std::io::ErrorKind::DirectoryNotEmpty => format!("{}失败：目录不为空：{}", op, path),
+        kind => format!("{}失败：{}（{}）", op, path, kind),
+    }
+}
+
 /// Read a UTF-8 text file. Rejects directories, oversized and binary files so
 /// the editor never tries to render garbage.
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
-    let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let resolved = require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!(
             "'{}' is a directory, not a file. Use read_dir to list its contents.",
@@ -437,7 +486,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > MAX_FILE {
         return Err("file is too large to open in the editor (> 5 MB)".into());
     }
-    let bytes = std::fs::read(&resolved).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let bytes = std::fs::read(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot open a binary file in the editor".into());
     }
@@ -463,9 +512,8 @@ pub fn read_log_tail(
     } else {
         path
     };
-    let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let resolved = require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a log file.", path));
     }
@@ -493,12 +541,12 @@ pub fn read_log_tail(
     let file_len = meta.len();
     let start = file_len.saturating_sub(byte_limit);
     let mut file =
-        std::fs::File::open(&resolved).map_err(|e| format!("cannot open '{}': {}", path, e))?;
+        std::fs::File::open(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::with_capacity((file_len - start).min(byte_limit) as usize);
     file.read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read '{}': {}", path, e))?;
+        .map_err(|e| friendly_read_error(&path, &e))?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
         return Err("cannot read log tail: file appears to be binary".into());
     }
@@ -553,8 +601,8 @@ fn data_url_mime(path: &Path) -> &'static str {
 
 #[tauri::command]
 pub fn read_file_data_url(path: String) -> Result<String, String> {
-    require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a file.", path));
     }
@@ -564,7 +612,7 @@ pub fn read_file_data_url(path: String) -> Result<String, String> {
             meta.len()
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let bytes = std::fs::read(&path).map_err(|e| friendly_read_error(&path, &e))?;
     let mime = data_url_mime(std::path::Path::new(&path));
     Ok(format!(
         "data:{};base64,{}",
@@ -675,12 +723,12 @@ fn file_name(path: &Path) -> String {
 }
 
 fn read_prefix(path: &Path, len: usize) -> Result<Vec<u8>, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot open '{}': {e}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| friendly_read_error(&path.display().to_string(), &e))?;
     let mut bytes = vec![0u8; len];
     let n = file
         .read(&mut bytes)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+        .map_err(|e| friendly_read_error(&path.display().to_string(), &e))?;
     bytes.truncate(n);
     Ok(bytes)
 }
@@ -1176,9 +1224,8 @@ fn detect_kind_and_mime(ext: &str, bytes: &[u8], traineddata: bool) -> (String, 
 
 #[tauri::command]
 pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspection, String> {
-    let resolved = require_inside_workspace(&path)?;
-    let meta =
-        std::fs::metadata(&resolved).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    let resolved = require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&resolved).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory, not a file.", path));
     }
@@ -1277,8 +1324,8 @@ pub fn inspect_file(path: String, max_bytes: Option<u64>) -> Result<FileInspecti
 /// `pdf-extract` (pure Rust). The agent's read_file routes here automatically by extension.
 #[tauri::command]
 pub fn read_document(path: String) -> Result<String, String> {
-    require_inside_workspace(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat '{}': {}", path, e))?;
+    require_inside_workspace(&path, false)?;
+    let meta = std::fs::metadata(&path).map_err(|e| friendly_read_error(&path, &e))?;
     if meta.is_dir() {
         return Err(format!("'{}' is a directory", path));
     }
@@ -1387,7 +1434,7 @@ fn strip_xml(xml: &str) -> String {
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    let resolved = require_inside_workspace(&path)?;
+    let resolved = require_inside_workspace(&path, true)?;
     atomic_write_text(&resolved, &content)
 }
 
@@ -1403,7 +1450,7 @@ pub fn write_text_file_if_unchanged(
     content: String,
 ) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    let resolved = require_inside_workspace(&path)?;
+    let resolved = require_inside_workspace(&path, true)?;
     match expected_content {
         Some(expected) => {
             if !resolved.exists() {
@@ -1426,7 +1473,7 @@ pub fn write_text_file_if_unchanged(
 #[tauri::command]
 pub fn delete_text_file_if_unchanged(path: String, expected_content: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    let resolved = require_inside_workspace(&path)?;
+    let resolved = require_inside_workspace(&path, true)?;
     let meta = std::fs::symlink_metadata(&resolved).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("[CONFLICT] path is no longer the expected text file".into());
@@ -1463,7 +1510,7 @@ pub fn home_dir() -> Option<String> {
 #[tauri::command]
 pub fn create_file(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    let resolved = require_inside_workspace(&path)?;
+    let resolved = require_inside_workspace(&path, true)?;
     atomic_create_text(&resolved, "")
 }
 
@@ -1471,28 +1518,28 @@ pub fn create_file(path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn create_dir(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&path)?;
+    require_inside_workspace(&path, true)?;
     let p = Path::new(&path);
     if p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
-    std::fs::create_dir_all(p).map_err(|e| e.to_string())
+    std::fs::create_dir_all(p).map_err(|e| friendly_write_error("创建目录", &path, &e))
 }
 
 /// Rename or move a file/folder. Errors if the destination already exists.
 #[tauri::command]
 pub fn rename_path(from: String, to: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&from)?;
-    require_inside_workspace(&to)?;
+    require_inside_workspace(&from, true)?;
+    require_inside_workspace(&to, true)?;
     let to_p = Path::new(&to);
     if to_p.exists() {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = to_p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
     }
-    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+    std::fs::rename(&from, &to).map_err(|e| friendly_write_error("重命名", &from, &e))
 }
 
 fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -1516,8 +1563,8 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
 #[tauri::command]
 pub fn copy_path(from: String, to: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&from)?;
-    let to_path = require_inside_workspace(&to)?;
+    require_inside_workspace(&from, false)?;
+    let to_path = require_inside_workspace(&to, true)?;
     let from_p = Path::new(&from);
     if !from_p.exists() {
         return Err("source does not exist".into());
@@ -1526,15 +1573,15 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
         return Err("a file or folder with that name already exists".into());
     }
     if let Some(parent) = to_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
     }
-    let meta = std::fs::symlink_metadata(from_p).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(from_p).map_err(|e| friendly_write_error("读取源文件", &from, &e))?;
     if meta.is_dir() {
-        copy_dir_recursive(from_p, &to_path).map_err(|e| e.to_string())
+        copy_dir_recursive(from_p, &to_path).map_err(|e| friendly_write_error("复制目录", &from, &e))
     } else {
         std::fs::copy(from_p, &to_path)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| friendly_write_error("复制文件", &from, &e))
     }
 }
 
@@ -1542,13 +1589,13 @@ pub fn copy_path(from: String, to: String) -> Result<(), String> {
 #[tauri::command]
 pub fn delete_path(path: String) -> Result<(), String> {
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
-    require_inside_workspace(&path)?;
+    require_inside_workspace(&path, true)?;
     let p = Path::new(&path);
-    let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
+    let meta = std::fs::symlink_metadata(p).map_err(|e| friendly_write_error("删除", &path, &e))?;
     if meta.is_dir() {
-        std::fs::remove_dir_all(p).map_err(|e| e.to_string())
+        std::fs::remove_dir_all(p).map_err(|e| friendly_write_error("删除目录", &path, &e))
     } else {
-        std::fs::remove_file(p).map_err(|e| e.to_string())
+        std::fs::remove_file(p).map_err(|e| friendly_write_error("删除文件", &path, &e))
     }
 }
 
@@ -1634,7 +1681,7 @@ fn search_project_scope(
     // Keep the search confined to a registered workspace root and validate the
     // resolved scope before traversal. `read_dir` on a file and `os.walk` on a
     // missing path previously looked exactly like a legitimate no-match result.
-    let root_path = require_inside_workspace(root)?;
+    let root_path = require_inside_workspace(root, false)?;
     let root_meta = std::fs::symlink_metadata(&root_path).map_err(|error| {
         format!(
             "[INVALID_SEARCH_SCOPE] cannot inspect search scope '{}': {error}",
@@ -1770,7 +1817,15 @@ fn search_project_scope(
         ));
     }
 
-    results.sort_by(|a, b| a.rel.cmp(&b.rel));
+    // Rank most-relevant files first: more matches = more likely what the caller
+    // wants, alphabetical rel path as a stable tiebreaker. (Was pure alphabetical,
+    // which buried a 30-hit file below an incidental 1-hit one.)
+    results.sort_by(|a, b| {
+        b.matches
+            .len()
+            .cmp(&a.matches.len())
+            .then_with(|| a.rel.cmp(&b.rel))
+    });
     Ok(ProjectSearch {
         files: results,
         scanned_files,
@@ -1844,7 +1899,7 @@ pub fn replace_in_file(
     let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
     // Same workspace boundary every other mutating fs command enforces — without
     // it this is an arbitrary-file-write primitive.
-    let resolved = require_inside_workspace(&file_path)?;
+    let resolved = require_inside_workspace(&file_path, true)?;
     let file_path = resolved.to_string_lossy().to_string();
     let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
@@ -1907,7 +1962,7 @@ pub fn replace_in_project(
     }
     // Confine the whole sweep to the workspace (each write is also guarded by
     // replace_in_file, but this stops us from even scanning arbitrary trees).
-    let root_path = require_inside_workspace(&root)?;
+    let root_path = require_inside_workspace(&root, true)?;
     let mut files_changed = 0usize;
     let mut replacements = 0usize;
     let mut stack: Vec<PathBuf> = vec![root_path];
@@ -2414,5 +2469,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn project_search_ranks_files_by_match_count() {
+        let root = temp_file("search-ranking");
+        std::fs::create_dir(&root).unwrap();
+        // `low.txt` sorts first alphabetically but has one hit; `zzz.txt` sorts
+        // last yet has three. Ranking by match count must surface zzz.txt first.
+        std::fs::write(root.join("low.txt"), "needle here\nnothing\n").unwrap();
+        std::fs::write(root.join("zzz.txt"), "needle\nneedle\nneedle\n").unwrap();
+
+        let ranked =
+            search_project_scope(&root.to_string_lossy(), "needle", false, None).unwrap();
+        assert_eq!(ranked.files.len(), 2);
+        assert_eq!(
+            ranked.files[0].rel, "zzz.txt",
+            "the file with more matches must rank first, not the alphabetical one"
+        );
+        assert_eq!(ranked.files[0].matches.len(), 3);
+        assert_eq!(ranked.files[1].rel, "low.txt");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_search_skips_expanded_vendored_dirs() {
+        let root = temp_file("search-ignore-expanded");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("app.js"), "token\n").unwrap();
+        for noise in ["bower_components", "Pods", "venv"] {
+            let d = root.join(noise);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::write(d.join("dep.js"), "token\n").unwrap();
+        }
+        let out = search_project_scope(&root.to_string_lossy(), "token", false, None).unwrap();
+        assert_eq!(
+            out.files.len(),
+            1,
+            "vendored dirs must be skipped so only app.js matches"
+        );
+        assert_eq!(out.files[0].rel, "app.js");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

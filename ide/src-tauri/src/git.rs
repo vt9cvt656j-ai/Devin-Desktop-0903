@@ -673,9 +673,12 @@ pub fn git_checkout(root: String, branch: String, create: bool) -> Result<(), St
         return Err("Branch name is empty.".into());
     }
     if create {
-        run_git_checked(&root, &["checkout", "-b", branch]).map(|_| ())
+        run_git_checked(&root, &["checkout", "-b", branch, "--"]).map(|_| ())
     } else {
-        run_git_checked(&root, &["checkout", branch]).map(|_| ())
+        // Trailing `--` marks the end of revisions so a branch whose name also
+        // matches a file in the tree resolves to the branch (git errors on the
+        // ambiguous `git checkout <name>` form otherwise).
+        run_git_checked(&root, &["checkout", branch, "--"]).map(|_| ())
     }
 }
 

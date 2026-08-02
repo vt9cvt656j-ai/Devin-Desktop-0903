@@ -3,3 +3,10 @@
 context-eval-results/
 *.env
 !.env.example
+
+# Stale working copies — git history already has these states.
+*.bak
+*.bak.*
+*.bak-*
+*.pre-*
+*.predeploy-bak

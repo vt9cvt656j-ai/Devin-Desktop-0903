@@ -94,13 +94,19 @@ impl Agent {
     }
     
     #[cfg(feature = "system")]
-    pub fn mouse_double_click(&mut self) -> Result<()> {
+    pub fn mouse_double_click(&mut self, button: Option<&str>) -> Result<()> {
         self.system_init()?;
         let mut sys = self.system.as_ref()
             .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
             .lock()
             .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
-        sys.double_click(MouseButton::Left)
+        let btn = match button.unwrap_or("left") {
+            "left" => MouseButton::Left,
+            "right" => MouseButton::Right,
+            "middle" => MouseButton::Middle,
+            _ => MouseButton::Left,
+        };
+        sys.double_click(btn)
     }
     
     #[cfg(feature = "system")]
@@ -113,14 +119,16 @@ impl Agent {
         sys.drag(from_x, from_y, to_x, to_y)
     }
     
+    /// 滚动。参数与 `SystemAutomation::scroll` 一致：(delta_x, delta_y)。
+    /// 此前只收一个 `amount` 且误传成了水平分量——调用方以为在垂直滚动，实际页面纹丝不动。
     #[cfg(feature = "system")]
-    pub fn mouse_scroll(&mut self, amount: i32) -> Result<()> {
+    pub fn mouse_scroll(&mut self, delta_x: i32, delta_y: i32) -> Result<()> {
         self.system_init()?;
         let mut sys = self.system.as_ref()
             .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
             .lock()
             .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
-        sys.scroll(amount, 0)
+        sys.scroll(delta_x, delta_y)
     }
     
     #[cfg(feature = "system")]
@@ -212,7 +220,25 @@ impl Agent {
     }
     
     // ==================== 浏览器自动化 ====================
-    
+
+    /// 取浏览器锁：未启动 / Mutex 中毒都返回错误而不是 panic——否则一次中毒
+    /// 会连带杀死整个常驻的 automation-server。
+    #[cfg(feature = "browser")]
+    fn browser_lock(&self) -> Result<std::sync::MutexGuard<'_, BrowserAutomation>> {
+        self.browser
+            .as_ref()
+            .ok_or_else(|| Error::Browser("浏览器未启动".to_string()))?
+            .lock()
+            .map_err(|e| Error::Browser(format!("Mutex 中毒: {}", e)))
+    }
+
+    #[cfg(feature = "browser")]
+    fn rt(&self) -> Result<&tokio::runtime::Runtime> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("Runtime not initialized")))
+    }
+
     #[cfg(feature = "browser")]
     pub fn browser_start(&mut self, headless: bool) -> Result<()> {
         if self.browser.is_some() {
@@ -237,66 +263,45 @@ impl Agent {
     
     #[cfg(feature = "browser")]
     pub fn browser_goto(&self, url: &str) -> Result<()> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.navigate(url))
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.navigate(url))
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_click(&self, selector: &str) -> Result<()> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.click_element(selector))
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.click_element(selector))
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_type(&self, selector: &str, text: &str) -> Result<()> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.type_text(selector, text))
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.type_text(selector, text))
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_wait(&self, selector: &str, timeout_ms: u64) -> Result<()> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.wait_for_element(selector, timeout_ms))
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.wait_for_element(selector, timeout_ms))
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_eval(&self, script: &str) -> Result<serde_json::Value> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.execute_script(script))
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.execute_script(script))
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_screenshot(&self, path: Option<&str>) -> Result<()> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.screenshot(path))?;
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.screenshot(path))?;
         Ok(())
     }
     
     #[cfg(feature = "browser")]
     pub fn browser_content(&self) -> Result<String> {
-        let browser = self.browser.as_ref()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("Browser not started")))?;
-        let mut browser = browser.lock().unwrap();
-        let runtime = self.runtime.as_ref().unwrap();
-        runtime.block_on(browser.get_content())
+        let mut browser = self.browser_lock()?;
+        self.rt()?.block_on(browser.get_content())
     }
     
     #[cfg(feature = "browser")]

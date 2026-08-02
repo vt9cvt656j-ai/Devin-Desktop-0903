@@ -1,0 +1,13 @@
+-- One-time repair: re-arm today's free-points grant.
+--
+-- 20260803 dropped free_points_cents and added free_points DEFAULT 0, but left
+-- free_points_date untouched. Anyone whose /api/me had already run that day therefore had
+-- free_points_date = today with free_points = 0, and the lazy grant
+--   CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE THEN <grant> ELSE free_points END
+-- read that as "already granted today" and kept the balance at zero. The allowance could
+-- never appear for those users — the balance reset and the date marker have to move together.
+--
+-- Clearing the date makes the next read grant normally. Safe to run repeatedly: it only
+-- re-arms a grant that resets daily anyway, and users whose date is already NULL are
+-- unaffected.
+UPDATE users SET free_points_date = NULL WHERE free_points = 0;

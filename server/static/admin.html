@@ -335,6 +335,9 @@ const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "michael_admin_token";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let ws = null, statsTimer = null, ideReleaseTimer = null, me = null, usersCache = [];
+// Set when the server rejects the feed handshake, so the 3s auto-reconnect stops.
+// An explicit connectWs() (login / boot) clears it and tries again.
+let wsAuthDenied = false;
 let adminSkillsUsers = [];
 let adminSkillPromptCache = new Map();
 let ideReleaseState = null;
@@ -1281,7 +1284,7 @@ function renderModels(){
           计费 <select id="mdBillMode" style="min-width:96px" title="倍率=按Token计费；次数=每次调用固定收费"><option value="rate">倍率(按Token)</option><option value="per_call">次数(每次固定)</option></select>
           <span id="mdRateWrap">倍率 <input id="mdRate" type="number" value="1" step="0.1" min="0" style="min-width:64px" title="计费倍率：最终扣费 = 真实Token成本 × 此值。如 3 = 按官方成本的 3 倍收费">
           自定义官方价 入<input id="mdInPrice" type="number" value="0" step="0.01" min="0" style="min-width:58px" title="可选：每100万输入token美元。仅当模型不在内置官方目录时才需填；留 0 用内置官方价"> 出<input id="mdOutPrice" type="number" value="0" step="0.01" min="0" style="min-width:58px" title="可选：每100万输出token美元。留 0 用内置官方价"> 缓存读<input id="mdCacheRead" type="number" value="0" step="0.01" min="0" style="min-width:58px" title="可选：每100万「缓存读取」token价。留 0 = 用 0.1×输入价"> 缓存建<input id="mdCacheCreate" type="number" value="0" step="0.01" min="0" style="min-width:58px" title="可选：每100万「缓存创建/写入」token价。留 0 = 用 1.25×输入价"></span>
-          <span id="mdPerCallWrap" style="display:none">每次调用收费($) <input id="mdPerCall" type="number" value="0.2" step="0.001" min="0" style="min-width:72px" title="次数模式：每成功调用一次扣这么多钱。缓存命中不扣"></span>
+          <span id="mdPerCallWrap" style="display:none">每次调用收费($) <input id="mdPerCall" type="number" value="0.2" step="0.000001" min="0" style="min-width:72px" title="次数模式：每成功调用一次扣这么多钱。缓存命中不扣"></span>
           描述 <input id="mdDesc" placeholder="如 擅长复杂推理/编程（IDE 选模型时悬停显示）" style="min-width:260px">
           <button class="btn b" id="mdAdd">添加</button>
         </div>
@@ -1630,7 +1633,9 @@ async function addModel(){
     cache_read_price:parseFloat($("mdCacheRead").value)||0, cache_create_price:parseFloat($("mdCacheCreate").value)||0,
     description:$("mdDesc").value.trim(),
     billing_mode:billMode,
-    per_call_cents:Math.round((parseFloat($("mdPerCall").value)||0)*100),
+    per_call_micro_usd:Math.round((parseFloat($("mdPerCall").value)||0)*1000000),
+    // kept in sync for the paid path, which still settles in whole cents
+    per_call_cents:Math.max(0,Math.round((parseFloat($("mdPerCall").value)||0)*100)),
   };
   if(!body.label||!body.base_url){ toast("名称/baseUrl 必填"); return; }
   try{ await api("/api/admin/models",{method:"POST",body:JSON.stringify(body)}); toast("已添加，去点编辑勾选模型"); ["mdLabel","mdKey","mdDesc"].forEach(id=>$(id).value=""); loadModels(); }
@@ -1647,7 +1652,31 @@ async function loadModels(){
     const rows=modelsCache.map(m=>{
       const en=(m.enabled_models&&m.enabled_models.length)?`${m.enabled_models.length} 个开放`:'<span class="t">未选择(默认1个)</span>';
       const bill=m.billing_mode==="per_call"
-        ? `<span title="次数模式：每次调用固定收费" style="color:#8430ce;font-weight:600">次数 ${usd(m.per_call_cents)}/次</span>`
+        ? (()=>{
+            // Read the MICRO fee first: usd(per_call_cents) shows "$0.00" for any sub-cent
+            // price, so a correctly-saved $0.0035 looked like it had not saved at all.
+            const micro=Number(m.per_call_micro_usd)||0;
+            const dollars=micro>0?micro/1000000:(Number(m.per_call_cents)||0)/100;
+            // Trim to the precision the number actually has, so $0.20 stays "$0.20" and
+            // $0.0035 does not round away.
+            const txt=dollars>0?("$"+dollars.toFixed(dollars<0.01?4:2)):"$0.00";
+            // Resolve PER MODEL, exactly as the server does. A zero channel fee is fine when
+            // the models carry their own prices — warning on the channel field alone flagged
+            // correctly-configured channels, which is the same mistake the save-time check
+            // made before it was taught to look at model_billing.
+            const bl=m.model_billing||{};
+            const unpriced=(m.enabled_models||[]).filter(id=>{
+              const ov=bl[id]||{};
+              const mode=["rate","per_call","free"].includes(ov.mode)?ov.mode:m.billing_mode;
+              if(mode==="free"||mode==="rate") return false;   // points-capped, or token-billed
+              const fee=Number(ov.per_call_micro_usd)||Number(ov.per_call_cents)||0;
+              return fee<=0 && dollars<=0;
+            });
+            const warn=unpriced.length
+              ? ` <span title="次数模式但这些模型没有价格，每次调用都不计费：${unpriced.join("、")}" style="color:#c5221f">⚠ ${unpriced.length} 个模型未计费</span>`
+              : "";
+            return `<span title="次数模式：每次调用固定收费" style="color:#8430ce;font-weight:600">次数 ${txt}/次</span>${warn}`;
+          })()
         : `<span title="计费 = 真实Token × 官方价 × 倍率">×${m.rate}<span class="t"> 倍率</span>${(m.input_price>0||m.output_price>0)?`<span class="t"> · 自定$${m.input_price}/$${m.output_price}</span>`:""}</span>`;
       return `<tr><td><div style="display:flex;align-items:center">${brandBadge(m.provider)}<span class="email">${esc(m.label)}</span></div></td><td>${en}</td><td class="t" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(m.base_url)}</td><td class="codeval">${esc(m.api_key_masked||"")}</td><td class="codeval">${bill}</td><td><div class="acts"><button class="btn sm b" data-editmd="${m.id}">编辑</button><button class="btn sm danger" data-delmd="${m.id}">删除</button></div></td></tr>`;
     }).join("");
@@ -1683,6 +1712,8 @@ function openModelEdit(m){
   const names=Object.assign({}, m.model_names||{});
   // Per-model price overrides: { raw_id → {in, out} } ($/1M tokens). Edited inline per row.
   const prices=Object.assign({}, m.model_prices||{});
+  // Per-model billing override: { id → {mode, per_call_cents} }. Empty mode = follow channel.
+  const bl=Object.assign({}, m.model_billing||{});
   const ov=document.createElement("div");
   ov.style.cssText="position:fixed;inset:0;background:rgba(32,33,36,.5);display:grid;place-items:center;z-index:60;padding:24px";
   ov.innerHTML=`<div style="background:#fff;border-radius:14px;width:760px;max-width:100%;max-height:88vh;overflow:auto;box-shadow:var(--shadow2)">
@@ -1710,7 +1741,7 @@ function openModelEdit(m){
         </div>
         <div id="mePerCallWrap" style="margin-top:11px;${m.billing_mode==="per_call"?"":"display:none"}">
           <label style="font-size:12px;color:var(--dim)">每次调用收费（$）</label>
-          <input id="mePerCall" type="number" step="0.001" min="0" value="${((m.per_call_cents||0)/100).toFixed(3)}" title="次数模式下，每成功调用一次扣这么多钱。缓存命中不扣，调用失败不扣" style="max-width:140px">
+          <input id="mePerCall" type="number" step="0.000001" min="0" value="${m.per_call_micro_usd?(m.per_call_micro_usd/1000000):((m.per_call_cents||0)/100)}" title="次数模式下，每成功调用一次扣这么多钱。缓存命中不扣，调用失败不扣" style="max-width:140px">
           <span class="t" style="margin-left:8px">如 0.2 = 每次调用扣 ¢20（$0.20）</span>
         </div>
       </div>
@@ -1758,6 +1789,13 @@ function openModelEdit(m){
       <input type="text" class="me-name" data-id="${esc(id)}" value="${esc(names[id]||"")}" placeholder="显示名" title="IDE 里显示的名字（留空=原始 id）" style="flex:0 0 100px;font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:6px">
       <input type="number" step="0.01" min="0" class="me-pin" data-id="${esc(id)}" value="${pr.in?pr.in:""}" placeholder="${d?('默认'+d.in):'入价'}" title="该模型 输入 价 $/100万token（留空=用内置官方价${d?(' $'+d.in):''}）" style="flex:0 0 80px;font-size:12px;padding:4px 6px;border:1px solid var(--line);border-radius:6px">
       <input type="number" step="0.01" min="0" class="me-pout" data-id="${esc(id)}" value="${pr.out?pr.out:""}" placeholder="${d?('默认'+d.out):'出价'}" title="该模型 输出 价 $/100万token（留空=用内置官方价${d?(' $'+d.out):''}）" style="flex:0 0 80px;font-size:12px;padding:4px 6px;border:1px solid var(--line);border-radius:6px">
+      <select class="me-bmode" data-id="${esc(id)}" title="该模型单独的计费方式。跟随渠道=用上面的渠道设置；按次=这一个模型固定收费；免费=从用户每日免费积分里扣（不动钱包/套餐）" style="flex:0 0 96px;font-size:12px;padding:4px 6px;border:1px solid var(--line);border-radius:6px">
+        <option value="" ${!(bl[id]&&bl[id].mode)?"selected":""}>跟随渠道</option>
+        <option value="per_call" ${bl[id]&&bl[id].mode==="per_call"?"selected":""}>按次</option>
+        <option value="rate" ${bl[id]&&bl[id].mode==="rate"?"selected":""}>按Token</option>
+        <option value="free" ${bl[id]&&bl[id].mode==="free"?"selected":""}>免费</option>
+      </select>
+      <input type="number" step="0.000001" min="0" class="me-bfee" data-id="${esc(id)}" value="${bl[id]&&bl[id].per_call_micro_usd?(bl[id].per_call_micro_usd/1000000):(bl[id]&&bl[id].per_call_cents?(bl[id].per_call_cents/100):"")}" placeholder="次费$" title="按次/免费模式下每次调用的费用（美元），可低至 0.000001。免费模式下按此金额折算成点数，从用户每日免费额度扣" style="flex:0 0 70px;font-size:12px;padding:4px 6px;border:1px solid var(--line);border-radius:6px">
     </div>`;}).join("");
   }
   // start by showing already-enabled ids (so save works even without fetching)
@@ -1802,10 +1840,12 @@ function openModelEdit(m){
       enabled_models:[...enabled],
       billing_mode:mode,
       protocol:ov.querySelector("#meProtocol").value,
-      per_call_cents:Math.round((parseFloat(ov.querySelector("#mePerCall").value)||0)*100),
+      per_call_micro_usd:Math.round((parseFloat(ov.querySelector("#mePerCall").value)||0)*1000000),
+      per_call_cents:Math.max(0,Math.round((parseFloat(ov.querySelector("#mePerCall").value)||0)*100)),
       // Only keep name / price overrides for models that are actually enabled.
       model_names:Object.fromEntries(Object.entries(names).filter(([id])=>enabled.has(id))),
       model_prices:Object.fromEntries(Object.entries(prices).filter(([id])=>enabled.has(id))),
+      model_billing:(()=>{const out={};ov.querySelectorAll(".me-bmode").forEach(sel=>{const id=sel.dataset.id;if(!enabled.has(id))return;const mode=sel.value;const feeEl=ov.querySelector(`.me-bfee[data-id="${CSS.escape(id)}"]`);const micro=Math.round((parseFloat(feeEl&&feeEl.value)||0)*1000000);if(!mode&&!micro)return;const e={};if(mode)e.mode=mode;if(micro>0){e.per_call_micro_usd=micro;e.per_call_cents=Math.max(1,Math.round(micro/10000));}out[id]=e;});return out;})(),
     };
     const k=ov.querySelector("#meKey").value.trim(); if(k) body.api_key=k;
     try{ await api(`/api/admin/models/${m.id}`,{method:"POST",body:JSON.stringify(body)}); toast(`已保存，开放 ${enabled.size} 个模型`); close(); loadModels(); }
@@ -1998,6 +2038,7 @@ async function publishIdeRelease(requestedTag){
 
 /* ---------- websocket (global) ---------- */
 function connectWs(){
+  wsAuthDenied=false;   // explicit connect → give it another chance
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
   // The feed is admin-only. A browser can't set an Authorization header on a
@@ -2006,8 +2047,10 @@ function connectWs(){
   ws.onopen=()=>{ try{ ws.send(JSON.stringify({type:"auth",token})); }catch{} };
   ws.onmessage=(ev)=>{
     let e; try{e=JSON.parse(ev.data);}catch{return;}
-    if(e.type==="auth_ok") return;
-    if(e.type==="auth_error"){ toast(e.error||"实时事件流鉴权失败"); return; }
+    if(e.type==="auth_ok"){ wsAuthDenied=false; return; }
+    // Rejected — either never an admin, or the role changed under a live socket.
+    // Stop reconnecting: retrying every 3s would just loop the same toast forever.
+    if(e.type==="auth_error"){ wsAuthDenied=true; toast(e.error||"实时事件流鉴权失败"); return; }
     addEvent(e); refreshStats();
     if(e.kind==="register") refreshDashUsers();
     // Live-patch the user table when ANY user is modified (grant / set_credits /
@@ -2020,7 +2063,7 @@ function connectWs(){
     if(e.kind==="user_deleted"&&activeTab==="users") loadUsers();
     if(e.kind&&e.kind.startsWith("ide_release_")&&activeTab==="releases") loadIdeReleases(false);
   };
-  ws.onclose=()=>{ if(token) setTimeout(connectWs,3000); };
+  ws.onclose=()=>{ if(token && !wsAuthDenied) setTimeout(connectWs,3000); };
 }
 
 /* ---------- boot ---------- */

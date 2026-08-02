@@ -68,6 +68,11 @@ const SKILLS = [
 ];
 const SKILL_IDS = SKILLS.map((s) => s.id);
 
+// Export avgMastery for external access (runtime policy lookup)
+export function getAvgMastery() {
+  try { load(); return avgMastery(); } catch { return 0.5; }
+}
+
 // --- Bayesian Knowledge Tracing ------------------------------------------------
 // Classic 4-parameter BKT: a latent "mastered?" probability updated by each
 // observation. Interpretable and cheap — deep/LSTM knowledge tracing is overkill
@@ -671,4 +676,43 @@ export function renderPanel(body, ctx = {}) {
   } catch (e) {
     body.innerHTML = `<div style="padding:20px;color:var(--text-dim,#888)">「成长」面板渲染失败：${(e && e.message) || e}</div>`;
   }
+}
+
+// ===== ADAPTIVE RUNTIME POLICY =====
+// 根据 avgMastery 输出工具加载策略
+
+export function getRuntimePolicy(growthState = null) {
+    const g = growthState || state || {};
+    const avgP = typeof g.avgMastery === 'function' ? g.avgMastery() : 
+                  (g.avg_mastery ?? 0.5); // fallback to medium
+    
+    // 三档策略：新手/进阶/专家
+    if (avgP > 0.7) {
+        // 专家模式：开放更多工具窗口
+        return {
+            initialToolCount: 20,
+            criticMaxTools: 15,
+            catalogDensity: 'minimal', // 减少冗余描述节省空间
+            enableProfessionalTools: true,
+            allowAutoLoadAdvanced: true
+        };
+    } else if (avgP > 0.45) {
+        // 进阶模式：适度扩展
+        return {
+            initialToolCount: 14,
+            criticMaxTools: 12,
+            catalogDensity: 'balanced',
+            enableProfessionalTools: true,
+            allowAutoLoadAdvanced: false
+        };
+    } else {
+        // 新手模式：保守
+        return {
+            initialToolCount: 11,
+            criticMaxTools: 10,
+            catalogDensity: 'rich', // 新手需要更详细的提示
+            enableProfessionalTools: false,
+            allowAutoLoadAdvanced: false
+        };
+    }
 }
