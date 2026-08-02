@@ -32082,8 +32082,19 @@ function _toolExecutionSucceeded(call, result) {
   return true;
 }
 function _looksLikeVerificationCommand(command) {
-  const raw = String(command || "").trim();
+  // Redirects are presentation, not semantics. `2>&1` is the most common way to capture
+  // build output — the agent emits it by default — and rejecting the whole command on a
+  // bare `>` meant `npx vite build 2>&1` was not a verification command. That cost twice:
+  // the plan gate BLOCKED the agent from running its own build ("先列计划 · 未执行" on a
+  // pure diagnostic), and a passing build earned no verification credit, so the finish
+  // gate kept demanding proof the agent had already produced. Strip noise, then classify.
+  let raw = _stripHarmlessRedirects(String(command || "")).trim();
   if (!raw || /[\r\n;|<>`]|\$\(/.test(raw)) return false;
+  // A leading `cd <dir>` is navigation, not an effect. Real agents write
+  // `cd <project> && npm run build`; requiring EVERY segment to be a checker rejected it.
+  const _segs = raw.split(/\s*&&\s*/).map((x) => x.trim()).filter(Boolean);
+  while (_segs.length > 1 && /^cd\s+(?:"[^"]*"|'[^']*'|[\w./~@:+-]+)$/i.test(_segs[0])) _segs.shift();
+  if (!_segs.length) return false;
   const safeArgs = String.raw`(?:\s+[\w./:=,@%+~-]+)*`;
   const checks = [
     new RegExp(String.raw`^(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:test|build|lint|check|typecheck|type-check)\b${safeArgs}$`, "i"),
@@ -32096,8 +32107,16 @@ function _looksLikeVerificationCommand(command) {
     new RegExp(String.raw`^python\d*\s+-m\s+(?:compileall|py_compile)\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^(?:mvn|gradle\w*|\./gradlew)\s+(?:test|check|build)\b${safeArgs}$`, "i"),
     new RegExp(String.raw`^dotnet\s+(?:test|build)\b${safeArgs}$`, "i"),
+    // The runners real projects actually invoke, directly or via npx/dlx. Without these,
+    // `npx vite build` — the canonical Vite verification — matched nothing at all.
+    new RegExp(String.raw`^(?:(?:npx(?:\s+-y|\s+--no-install)?|pnpm\s+dlx|yarn\s+dlx|bunx)\s+)?(?:vite|next|nuxt|astro|webpack|rollup|esbuild|parcel|tsup|turbo)\s+(?:build|check|lint|typecheck)\b${safeArgs}$`, "i"),
+    // Test runners. `open`/`ui`/`watch` are interactive sessions, not one-shot checks.
+    new RegExp(String.raw`^(?:(?:npx(?:\s+-y|\s+--no-install)?|pnpm\s+dlx|yarn\s+dlx|bunx)\s+)?(?:vitest|jest|mocha|ava|playwright|cypress)(?!\s+(?:open|ui|watch)\b)${safeArgs}$`, "i"),
+    new RegExp(String.raw`^(?:(?:npx(?:\s+-y|\s+--no-install)?|pnpm\s+dlx|yarn\s+dlx|bunx)\s+)?(?:eslint|oxlint|biome|stylelint)\b${safeArgs}$`, "i"),
+    new RegExp(String.raw`^(?:(?:npx(?:\s+-y|\s+--no-install)?|pnpm\s+dlx|yarn\s+dlx|bunx)\s+)?prettier\b(?=.*(?:^|\s)--(?:check|list-different)(?:\s|$))${safeArgs}$`, "i"),
+    new RegExp(String.raw`^(?:flutter|xcodebuild)\s+(?:build|test|analyze)\b${safeArgs}$`, "i"),
   ];
-  const segments = raw.split(/\s*&&\s*/).map((segment) => segment.trim()).filter(Boolean);
+  const segments = _segs; // cd-prefixes already dropped above
   // A final `echo` is only terminal presentation; it does not change the check's
   // semantics. Treat it as part of the same deterministic verification pipeline
   // so an agent-visible "all passed" marker cannot re-arm the runtime-review gate.
