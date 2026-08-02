@@ -184,6 +184,76 @@ static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant
 // 30 分钟"思考钳位"，期间 budget_tokens 压到实测安全值；健康线路不受影响，到期自动解除。
 const THINKING_CLIP_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const THINKING_CLIP_SAFE_BUDGET: i64 = 6000;
+/// Learned header latency per upstream route, so the first-attempt cutover is measured
+/// against how THIS route actually behaves instead of one global guess.
+///
+/// The fixed 4s first-attempt wait taxes every request on a reliably-slow route: the
+/// route needs ~2s, we wait 4s, cut over, and pay again. Meanwhile a genuinely healthy
+/// route that occasionally takes 5s gets killed for no reason. Both are the same bug —
+/// a constant standing in for a measurement.
+///
+/// Stores an exponentially-weighted mean of SUCCESSFUL header latencies plus a count of
+/// consecutive stalls. Bounded: one small entry per route id, no growth with traffic.
+#[derive(Clone, Copy, Debug)]
+struct RouteHeaderStats {
+    /// EWMA of successful header latency, milliseconds.
+    mean_ms: f64,
+    /// Successful observations folded in so far (saturating).
+    samples: u32,
+    /// Consecutive first-attempt stalls; resets on any success.
+    stall_streak: u32,
+}
+
+static ROUTE_HEADER_STATS: LazyLock<Mutex<HashMap<uuid::Uuid, RouteHeaderStats>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fold a successful header latency into the route's memory.
+fn record_header_success(route: uuid::Uuid, header_ms: u128) {
+    let Ok(mut map) = ROUTE_HEADER_STATS.lock() else { return };
+    let entry = map.entry(route).or_insert(RouteHeaderStats {
+        mean_ms: header_ms as f64,
+        samples: 0,
+        stall_streak: 0,
+    });
+    // 0.3 weight: adapts within a handful of requests when a provider degrades, without
+    // letting one outlier swing the cutover.
+    entry.mean_ms = entry.mean_ms * 0.7 + (header_ms as f64) * 0.3;
+    entry.samples = entry.samples.saturating_add(1);
+    entry.stall_streak = 0;
+}
+
+/// Record that this route stalled before sending headers.
+fn record_header_stall(route: uuid::Uuid) {
+    let Ok(mut map) = ROUTE_HEADER_STATS.lock() else { return };
+    let entry = map.entry(route).or_insert(RouteHeaderStats {
+        mean_ms: 0.0,
+        samples: 0,
+        stall_streak: 0,
+    });
+    entry.stall_streak = entry.stall_streak.saturating_add(1);
+}
+
+/// How long to wait for headers on the FIRST attempt of a route that still has retries.
+///
+/// Unknown routes keep the previous fixed behaviour. Once a route has a real baseline,
+/// wait a multiple of its own mean — slow-but-honest providers stop being killed, and
+/// routes that habitually hang get cut over well before the old flat 4s.
+fn adaptive_first_attempt_wait(route: uuid::Uuid, fallback: Duration) -> Duration {
+    const MIN_WAIT: Duration = Duration::from_millis(900);
+    const MAX_WAIT: Duration = Duration::from_secs(9);
+    let Ok(map) = ROUTE_HEADER_STATS.lock() else { return fallback };
+    let Some(stats) = map.get(&route) else { return fallback };
+    // Need a few observations before trusting the mean.
+    if stats.samples < 3 {
+        return fallback;
+    }
+    // A route that just stalled repeatedly gets a shorter leash, so the cutover to a
+    // fresh connection — which is what actually works on these relays — happens sooner.
+    let multiplier = if stats.stall_streak >= 2 { 1.5 } else { 2.5 };
+    let target_ms = (stats.mean_ms * multiplier).round().max(0.0) as u64;
+    Duration::from_millis(target_ms).clamp(MIN_WAIT, MAX_WAIT)
+}
+
 static THINKING_CLIP_ROUTES: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The i18n pack cache is bounded because each entry holds a full ~630KB response
@@ -5140,7 +5210,11 @@ pub async fn chat_completions(
                 // response body/stream that follows is untouched. That is the piece
                 // reqwest's own `.timeout()` cannot express for a streaming response.
                 let header_wait = if attempt == 0 && candidate_max_attempts > 1 {
-                    remaining.min(max_header_wait).min(FIRST_ATTEMPT_HEADER_WAIT)
+                    // Measured, not guessed: a route with a known baseline is judged
+                    // against itself; an unknown one keeps FIRST_ATTEMPT_HEADER_WAIT.
+                    let adaptive =
+                        adaptive_first_attempt_wait(candidate.id, FIRST_ATTEMPT_HEADER_WAIT);
+                    remaining.min(max_header_wait).min(adaptive)
                 } else {
                     remaining.min(max_header_wait)
                 };
@@ -5149,15 +5223,20 @@ pub async fn chat_completions(
                     Ok(result) => {
                         let header_ms = send_started.elapsed().as_millis();
                         match &result {
-                            Ok(response) => tracing::info!(
-                                model = %model_id,
-                                route_id = %candidate.id,
-                                attempt = attempt + 1,
-                                fresh_connection = attempt > 0,
-                                upstream_status = response.status().as_u16(),
-                                upstream_header_ms = header_ms,
-                                "upstream response headers received"
-                            ),
+                            Ok(response) => {
+                                // Feed the route's own baseline so the next first-attempt
+                                // cutover is judged against measured behaviour.
+                                record_header_success(candidate.id, header_ms);
+                                tracing::info!(
+                                    model = %model_id,
+                                    route_id = %candidate.id,
+                                    attempt = attempt + 1,
+                                    fresh_connection = attempt > 0,
+                                    upstream_status = response.status().as_u16(),
+                                    upstream_header_ms = header_ms,
+                                    "upstream response headers received"
+                                )
+                            }
                             Err(error) => tracing::warn!(
                                 model = %model_id,
                                 route_id = %candidate.id,
@@ -5178,11 +5257,12 @@ pub async fn chat_completions(
                             "upstream sent no response headers within {}s",
                             header_wait.as_secs()
                         );
+                        record_header_stall(candidate.id);
                         tracing::warn!(
                             model = %model_id,
                             url = %candidate_url,
                             attempt = attempt + 1,
-                            waited_secs = header_wait.as_secs(),
+                            waited_ms = header_wait.as_millis(),
                             "upstream stalled before response headers"
                         );
                         route_failed_transient = true;
@@ -10121,5 +10201,106 @@ mod step_kind_tests {
         }
         let long = format!("\"function\"{{\"name\":\"{}\"}}", "x".repeat(500));
         assert_eq!(step_emitted_tool(&long), None, "over-long names are rejected");
+    }
+}
+
+#[cfg(test)]
+mod adaptive_header_wait_tests {
+    use super::*;
+
+    fn fresh_route() -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        if let Ok(mut m) = ROUTE_HEADER_STATS.lock() {
+            m.remove(&id);
+        }
+        id
+    }
+
+    /// An unknown route must behave exactly as before — no measurement, no opinion.
+    #[test]
+    fn unknown_route_keeps_the_fixed_fallback() {
+        let id = fresh_route();
+        assert_eq!(
+            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT),
+            FIRST_ATTEMPT_HEADER_WAIT
+        );
+        // Two samples is still not a baseline worth trusting.
+        record_header_success(id, 300);
+        record_header_success(id, 300);
+        assert_eq!(
+            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT),
+            FIRST_ATTEMPT_HEADER_WAIT
+        );
+    }
+
+    /// A fast route gets a TIGHT leash — the old flat 4s was pure tax on these.
+    #[test]
+    fn fast_route_cuts_over_far_sooner_than_the_flat_wait() {
+        let id = fresh_route();
+        for _ in 0..6 {
+            record_header_success(id, 200);
+        }
+        let wait = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        assert!(
+            wait < FIRST_ATTEMPT_HEADER_WAIT,
+            "a 200ms route must not be given 4s: got {wait:?}"
+        );
+        // …but never so tight that ordinary jitter kills it.
+        assert!(wait >= Duration::from_millis(900), "floor must hold: {wait:?}");
+    }
+
+    /// A slow-but-HONEST route must stop being killed at 4s — this is the regression
+    /// that made the gateway abandon working upstreams and pay the cost twice.
+    #[test]
+    fn slow_but_healthy_route_is_given_more_than_the_flat_wait() {
+        let id = fresh_route();
+        for _ in 0..6 {
+            record_header_success(id, 3_000);
+        }
+        let wait = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        assert!(
+            wait > FIRST_ATTEMPT_HEADER_WAIT,
+            "a consistently-3s route needs room to answer: got {wait:?}"
+        );
+        assert!(wait <= Duration::from_secs(9), "ceiling must hold: {wait:?}");
+    }
+
+    /// Consecutive stalls shorten the leash: on these relays a FRESH CONNECTION is what
+    /// actually works, so reaching it sooner is the whole point.
+    #[test]
+    fn repeated_stalls_shorten_the_leash_and_success_restores_it() {
+        let id = fresh_route();
+        for _ in 0..6 {
+            record_header_success(id, 2_000);
+        }
+        let calm = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        record_header_stall(id);
+        record_header_stall(id);
+        let stalling = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        assert!(
+            stalling < calm,
+            "a habitual staller must cut over sooner: {stalling:?} !< {calm:?}"
+        );
+        // One success clears the streak — a transient blip must not permanently bias it.
+        record_header_success(id, 2_000);
+        assert!(
+            adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT) > stalling,
+            "the shorter leash must relax once the route answers again"
+        );
+    }
+
+    /// The EWMA has to actually track a provider that degrades, within a few requests.
+    #[test]
+    fn baseline_follows_a_degrading_provider() {
+        let id = fresh_route();
+        for _ in 0..6 {
+            record_header_success(id, 200);
+        }
+        let before = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        for _ in 0..6 {
+            record_header_success(id, 4_000);
+        }
+        let after = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
+        assert!(after > before, "the baseline must follow reality: {after:?} !> {before:?}");
     }
 }
