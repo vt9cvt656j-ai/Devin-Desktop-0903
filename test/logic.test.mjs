@@ -17444,3 +17444,53 @@ test("review: bare npm/yarn init is a mutation but not a code obligation", () =>
     "init WITH an initializer is npm create — a real scaffold");
   assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest app" }, ok), true);
 });
+
+// ---------------------------------------------------------------------------
+// "The directory exists but the IDE insists the workspace is empty."
+//
+// Two independent ways the empty-root registration went stale:
+//   1. The startup probe is fire-and-forget. A directory created while its readDir was
+//      in flight landed FIRST, then the stale empty snapshot overwrote reality — after
+//      which every read into the workspace was short-circuited with
+//      [SKIPPED_EMPTY_WORKSPACE] against a workspace the model had just populated.
+//   2. mkdir on an existing directory returned "已存在" without clearing the flag, so a
+//      directory created by a shell command / earlier turn never lifted the verdict.
+// ---------------------------------------------------------------------------
+test("empty-root probe: a mutation during the probe invalidates its snapshot", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _emptyProbeTick = run\._fsMutTick \|\| 0;/,
+    "the probe must capture the mutation tick before awaiting");
+  assert.match(loop, /if \(run\._didMutate \|\| \(run\._fsMutTick \|\| 0\) !== _emptyProbeTick\) return;/,
+    "a stale snapshot must be dropped, not applied");
+  // The guard has to sit BEFORE the marking call, or it guards nothing.
+  const probeIdx = loop.indexOf("_emptyProbeTick = run._fsMutTick");
+  const guardIdx = loop.indexOf("!== _emptyProbeTick) return;");
+  const markIdx = loop.indexOf("_markRunRootEmpty(run, root, root, entries)");
+  assert.ok(probeIdx >= 0 && probeIdx < guardIdx && guardIdx < markIdx,
+    "capture → guard → mark, in that order");
+});
+
+test("mkdir on an existing directory still clears the empty-root registration", () => {
+  const start = SRC.indexOf('} else if (call.type === "mkdir")');
+  assert.ok(start > 0, "the mkdir branch must exist");
+  const branch = SRC.slice(start, start + 2000);
+  const existsIdx = branch.indexOf("if (alreadyExists)");
+  const clearIdx = branch.indexOf("_clearRunEmptyRoot(run, fp)");
+  const returnIdx = branch.indexOf("无需重复创建");
+  assert.ok(existsIdx >= 0 && clearIdx > existsIdx && clearIdx < returnIdx,
+    "the already-exists branch must clear the flag before returning");
+  // …and the create path must keep doing so too.
+  assert.equal((branch.match(/_clearRunEmptyRoot\(run, fp\)/g) || []).length, 2,
+    "both the already-exists and the freshly-created paths clear it");
+});
+
+test("the file-not-found toast carries no agent coaching", () => {
+  const rust = readFileSync(join(HERE, "../src-tauri/src/files.rs"), "utf8");
+  const notFound = rust.slice(rust.indexOf("ErrorKind::NotFound =>"), rust.indexOf("PermissionDenied"));
+  assert.match(notFound, /文件不存在：\{\}/, "it must still name the missing path");
+  assert.doesNotMatch(notFound, /list_dir|find_files|臆造/,
+    "model instructions must not ride in a user-facing toast — the model gets pathGuidance instead");
+  // The model's channel keeps the guidance.
+  assert.match(SRC, /pathGuidance = "[^"]*list_dir \/ find_files[^"]*"/,
+    "the tool-result channel must still coach the model");
+});

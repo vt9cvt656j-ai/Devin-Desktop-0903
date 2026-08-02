@@ -36525,8 +36525,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 旧项目残影让它乱探已删除的文件）。运行一启动就后台探一次根目录，空的立刻登记；
   // 首个工具执行前必然就位（模型首轮以秒计），写入/脚手架会 _clearRunEmptyRoot 自动解除。
   if (isAgent && root && backend?.readDir) {
+    // The listing below is a SNAPSHOT taken before the first tool runs. It is fire-and-
+    // forget, so a directory the model creates while it is in flight lands first and the
+    // stale "empty" verdict overwrites reality — after which the model is told
+    // "工作区根目录已确认为空" about a workspace it just populated, and every read there
+    // is short-circuited. Only trust the snapshot if nothing mutated while we waited.
+    const _emptyProbeTick = run._fsMutTick || 0;
     backend.readDir(root)
       .then((entries) => {
+        if (run._didMutate || (run._fsMutTick || 0) !== _emptyProbeTick) return;
         if (Array.isArray(entries)) {
           _markRunRootEmpty(run, root, root, entries);
           // 空目录起步事实：供下方“空项目行动门禁”判定。_emptyWorkspaceRoots 写入后会被
@@ -43780,6 +43787,11 @@ async function _executeToolStepInner(step, call, root, run) {
         let alreadyExists = false;
         try { await backend.readDir(fp); alreadyExists = true; } catch {}
         if (alreadyExists) {
+          // "Already there" is still proof the workspace is not empty. Skipping the clear
+          // here left the empty-root registration standing after a directory had been
+          // created (by a shell command, an earlier turn, or a retried mkdir), so the run
+          // kept insisting the workspace was empty and short-circuited reads into it.
+          _clearRunEmptyRoot(run, fp);
           res.className = "atc-result atc-result--ok"; res.textContent = "目录已存在";
           return { type: "mkdir", path: p, mutated: false, content: `目录 ${p} 已存在，无需重复创建。` };
         }

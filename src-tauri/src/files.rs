@@ -437,10 +437,11 @@ pub fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 /// leaking `os error N` straight to the UI (see PATH_RESOLUTION_DIAGNOSIS.md).
 fn friendly_read_error(path: &str, e: &std::io::Error) -> String {
     match e.kind() {
-        std::io::ErrorKind::NotFound => format!(
-            "文件不存在：{}（请先用 list_dir/find_files 确认真实路径，注意不要臆造子目录或把文件名翻译成英文）",
-            path
-        ),
+        // Human-facing only. This string is rendered as a UI toast, so it must not carry
+        // agent coaching ("先用 list_dir/find_files 确认真实路径…"): the user is not the one
+        // guessing paths, and the toast covered the terminal to say so. The model gets that
+        // guidance on its own channel — the tool result — from `pathGuidance` in main.js.
+        std::io::ErrorKind::NotFound => format!("文件不存在：{}", path),
         std::io::ErrorKind::PermissionDenied => format!("没有读取权限：{}", path),
         std::io::ErrorKind::IsADirectory => {
             format!("{} 是目录不是文件，请用 read_dir 查看其内容", path)
