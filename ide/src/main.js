@@ -37108,8 +37108,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // ② ideSemanticProfile —— 不刷新的话服务端 prompt graph 整个 run 都按 answer 模式注入，
       // 设计/数据库纪律块全丢；③ 运行义务并入，效果门才知道要 build/test/push。
       // 其余门（研究/UI 审计/计划/效果契约）执行时现读 run.engineering，落地即自愈。
-      // 只在还没写过任何文件时补射，避免中途换规则。
-      if (iter > 0 && !didMutate && run.engineering?.intentSource === "none") {
+      //
+      // 补射窗口原本是「还没写过任何文件」，用意是避免中途换规则。但实测这个窗口太窄：
+      // 判定走的是同一条慢中转（实测首包 1.8-7s、还会 4s 无响应挂起），8s race 经常输，
+      // 于是 intentSource=none → design 旗标缺失 → 服务端整轮不注入 michael-design；等裁决
+      // 落地时模型往往已经写下第一个文件，补射被 didMutate 永久关死 —— 表现就是「Michael
+      // design 又丢了」。设计知识对整个 UI 构建自始至终有效，晚补远好过不补，所以放宽到
+      // 「尚未产生实质实现量」（_implOps 小）为止，而不是第一次落盘就锁死。
+      const _lateBackfillOpen = !didMutate || _implOps <= 3;
+      if (iter > 0 && _lateBackfillOpen && run.engineering?.intentSource === "none") {
         const _lateProfile = _engineeringProfileWithAiIntent(task, session);
         if (_lateProfile && _lateProfile.intentSource !== "none") {
           run.engineering = _lateProfile;

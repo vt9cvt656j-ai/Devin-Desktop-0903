@@ -17688,3 +17688,41 @@ test("a non-mutating run exits on the first quiet turn", () => {
     assert.ok(gate.includes(clause), `the quiet-exit must still gate on ${clause}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Michael Design must survive a slow intent classifier.
+//
+// Causal chain behind "did you lose the Michael design again":
+//   1. the intent classifier races an 8s timeout (main.js:17269) on the SAME upstream
+//      measured at 1.8-7s with 4s header stalls;
+//   2. losing that race resolves the profile to {}, so _ideSemanticProfile emits no
+//      `design` flag;
+//   3. the gateway gates ALL michael-design injection on semantic("design")
+//      (server/src/prompts.rs), so nothing is injected for the whole run;
+//   4. the late-verdict backfill exists — but was gated `!didMutate`, so the model's
+//      first written file closed it permanently.
+// Design knowledge is relevant for the entire UI build, so late is far better than never.
+// ---------------------------------------------------------------------------
+test("late intent backfill survives the first write", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _lateBackfillOpen = !didMutate \|\| _implOps <= 3;/,
+    "the backfill window must not be closed by the first file written");
+  assert.match(loop, /if \(iter > 0 && _lateBackfillOpen && run\.engineering\?\.intentSource === "none"\)/);
+  assert.doesNotMatch(loop, /if \(iter > 0 && !didMutate && run\.engineering\?\.intentSource === "none"\)/,
+    "the old narrow window is what lost michael-design on a slow classifier");
+  // It must still refresh the header the gateway gates design injection on.
+  const region = loop.slice(loop.indexOf("_lateBackfillOpen"), loop.indexOf("_lateBackfillOpen") + 900);
+  assert.match(region, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
+    "the refreshed profile must reach the gateway or the design modules stay off");
+  // Still bounded: it only fires while the verdict was genuinely missing.
+  assert.match(region, /intentSource !== "none"/, "only a real late verdict may overwrite the profile");
+});
+
+test("an empty profile emits no design flag — the failure mode this guards", () => {
+  const header = load("_ideSemanticProfile");
+  const empty = header({});
+  assert.ok(!/(^|,)design(,|$)/.test(empty.replace("2.5:", "")),
+    "a timed-out classifier must not silently claim design knowledge was requested");
+  const ui = header({ uiProject: true, ui: true, workspaceAction: "modify" });
+  assert.match(ui, /design/, "a real UI profile does request design knowledge");
+});
