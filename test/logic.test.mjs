@@ -5729,7 +5729,14 @@ test("dynamic time and bulky file context stay out of the cached system prefix",
   assert.match(SRC, /\(_adaptiveMemory \? _adaptiveMemory \+ "\\n\\n" : ""\) \+/,
     "adaptive preference memory rides the per-turn dynamic preamble instead");
   assert.match(SRC, /const _timeBlock = _currentDateBlock\(\);[\s\S]{0,140}const _dynPreamble =\s*\n\s*\(_timeBlock \? _timeBlock \+ "\\n\\n" : ""\) \+/);
-  assert.match(SRC, /const _childContext = _currentDateBlock\(\) \+ `\\n\\n--- 项目上下文 ---\\n` \+ \(await _gatherAgentContext\("", root\)\)/);
+  // The child context still rides OUTSIDE the cached prefix (that is this test's concern),
+  // but retrieval is now ranked by the child's own task: an empty query silently disabled
+  // repo-map term ranking, BM25 refs (`!query` early-return) and the whole enrichment
+  // branch (empty profile never `applies`) for every sub-agent.
+  assert.match(SRC, /const _childQuery = \[description, prompt\]\.filter\(Boolean\)\.join\("\\n"\)\.slice\(0, 2000\);/);
+  assert.match(SRC, /const _childContext = _currentDateBlock\(\) \+ `\\n\\n--- 项目上下文 ---\\n` \+ \(await _gatherAgentContext\(_childQuery, root\)\)/);
+  assert.doesNotMatch(SRC, /_gatherAgentContext\("", root\)/,
+    "a sub-agent must not retrieve project context with an empty query");
   assert.doesNotMatch(SRC, /\+ _currentDateBlock\(\) \+ `\\n\\n--- 项目上下文 ---\\n`/);
 
   const snippet = load("_contextSnippet");
@@ -9722,6 +9729,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
   const mutates = load("_toolMutatesWorkspace", {
     _WORKSPACE_MUTATING_TYPES: workspaceTypes,
     _looksLikeWorkspaceMutationCommand: commandMutates,
+    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
     _mcpMutationHint: mcpHint,
   });
   const failureMatch = load("_toolFailureMatch");
@@ -11720,7 +11728,15 @@ test("plain-text assistant questions are a hard agent wait boundary", () => {
   const criticGate = loop.indexOf("if (_needCritic && run.mode === \"agent\"");
   assert.ok(boundary >= 0 && boundary < pendingGate && boundary < toolFirstGate && boundary < criticGate,
     "the question boundary must run before every automatic continuation gate");
-  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,220}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
+  // The boundary is still hard — but it may spend ONE bounded verify nudge first when the
+  // run mutated code with zero green evidence, so a closing question ("需要我再补测试吗？")
+  // is not a side door around the pre-delivery verification gate. The nudge shares
+  // codeVerifyNudges with the finish gate, so a second question is always honored.
+  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,1400}awaitingUserReply = true;[\s\S]{0,220}_clearNudges\(\);[\s\S]{0,80}break;/);
+  assert.match(loop, /if \(_agentTurnMustWaitForUser\(turn\)\) \{[\s\S]{0,900}codeVerifyNudges < 1[\s\S]{0,300}_pushNudge\("codeVerify", _CODE_VERIFY_NUDGE/,
+    "the question branch must demand verification before honoring the question");
+  assert.match(loop, /_qVerified = _verifiedAtImplOps >= _implOps[\s\S]{0,220}_evidenceCertifies\(e, _implOps\)/,
+    "the question branch must use the same certification rule as the finish gate");
   assert.match(loop, /if \(!awaitingUserReply && !finalErr && !run\._incompleteReason\)/,
     "post-loop honest accounting must not execute while waiting for the user");
   assert.doesNotMatch(loop, /_pushNudge\("askUser"/,
@@ -17184,4 +17200,134 @@ test("verify gate: stale evidence still loses to a newer edit", () => {
     _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 1, ok: true }], 5),
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Shell-written code carries the same verification obligation as tool-written code.
+//
+// _mutatedFiles is populated only by the structured write/edit tools, and _mutatedCode
+// derived solely from it — so `sed -i` on a .ts file, a heredoc, or `npm create vite`
+// (a whole project) bumped _implOps while leaving _mutatedCode false, and
+// _codeDeliveredUnverified could never fire for exactly the runs that write the most code.
+// ---------------------------------------------------------------------------
+test("_commandWroteCode: scaffolds and code-file rewrites create a verification obligation", () => {
+  const wroteCode = load("_commandWroteCode", {
+    _toolExecutionSucceeded: (_c, r) => (r && r.code) === 0,
+    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
+    _looksLikeShellFileRewrite: load("_looksLikeShellFileRewrite", {
+      _stripHarmlessRedirects: load("_stripHarmlessRedirects"),
+    }),
+    _CODE_FILE_RE: /\.(?:js|jsx|ts|tsx|mjs|cjs|py|rs|go)$/i,
+  });
+  const ok = { code: 0 }, red = { code: 1 };
+  // Scaffolds: a whole project landed.
+  assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest my-app" }, ok), true);
+  assert.equal(wroteCode({ type: "cmd", command: "cargo new server" }, ok), true);
+  // Shell rewrites of code files.
+  assert.equal(wroteCode({ type: "cmd", command: "sed -i '' 's/a/b/' src/main.ts" }, ok), true);
+  assert.equal(wroteCode({ type: "termtask", command: "cat > src/app.py <<EOF" }, ok), true);
+  // Rewrites of NON-code files carry no code obligation.
+  assert.equal(wroteCode({ type: "cmd", command: "echo hi > notes.txt" }, ok), false);
+  // Failed commands wrote nothing worth verifying.
+  assert.equal(wroteCode({ type: "cmd", command: "cargo new server" }, red), false);
+  // Non-shell tools are not this predicate's business.
+  assert.equal(wroteCode({ type: "write", path: "src/a.ts", content: "x" }, ok), false);
+  // Plain non-writing commands.
+  assert.equal(wroteCode({ type: "cmd", command: "ls -la" }, ok), false);
+});
+
+test("_toolMutatesWorkspace: scaffold commands now count as workspace mutations", () => {
+  const mutates = load("_toolMutatesWorkspace", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
+    _looksLikeWorkspaceMutationCommand: () => false, // isolate: scaffold must be sufficient alone
+    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
+    _mcpMutationHint: () => false,
+  });
+  assert.equal(mutates({ type: "cmd", command: "npm create vite@latest app" }, {}), true,
+    "a scaffold lands a whole project; didMutate=false made every verification gate inert");
+  assert.equal(mutates({ type: "termtask", command: "dotnet new webapi" }, {}), true);
+  assert.equal(mutates({ type: "cmd", command: "npm run dev" }, {}), false);
+});
+
+test("agent loop: shell-written code feeds _mutatedCode and the index stays alive", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_commandWroteCode\(it\.call, it\.rawResult\)/,
+    "the mutation handler must record shell-written code");
+  assert.match(loop, /run\._codeWrittenByCommand === true/,
+    "_mutatedCode must consider code written by shell commands");
+  // Index liveness: agent writes refresh the symbol index like human saves do,
+  // and BM25 invalidation schedules a rebuild instead of blinding retrieval for the session.
+  assert.match(extractFn("_executeToolStepInner"), /refreshSymbolIndexFor\(fp\)/);
+  assert.match(extractFn("handleFsChanges"), /buildBM25Index\(_bm25Index\.root\)/,
+    "invalidating the BM25 index must schedule its rebuild");
+});
+
+// ---------------------------------------------------------------------------
+// Sub-agents get a tool-discovery escape hatch, filtered by their own sandbox.
+//
+// A child's toolset was frozen at dispatch for its whole 12–18-turn life; guessing a
+// tool name — the moment it signals which capability it needs — earned a static
+// [BLOCKED] and a burned turn. search_tools now answers that signal: same-sandbox tools
+// are admitted into the child's payload, out-of-sandbox hits are named so the child's
+// report can route the need to the parent. MCP stays out-of-sandbox by design (workers
+// are scope-bounded; MCP mutations cannot be scope-checked), so it lands in `outside`.
+// ---------------------------------------------------------------------------
+test("_subAgentAdmitTools: admits same-capability tools, names out-of-sandbox ones", () => {
+  const mkSchema = (n) => ({ type: "function", function: { name: n, parameters: {} } });
+  const registry = new Map([
+    ["semantic_search", mkSchema("semantic_search")],
+    ["run_terminal", mkSchema("run_terminal")],
+    ["mcp__db__query", mkSchema("mcp__db__query")],
+  ]);
+  const admit = load("_subAgentAdmitTools", {
+    _searchToolsExactQuery: () => false,
+    _searchToolsLookup: () => [],
+    _searchToolsFuzzyMatch: (_q, reg) =>
+      [...reg.values()].map((schema) => ({ schema, alreadyLoaded: false })),
+  });
+  const typeOf = { semantic_search: "semsearch", run_terminal: "termtask", mcp__db__query: "mcp" };
+  const res = admit("search code semantically", {
+    registry,
+    loaded: new Set(),
+    execTypes: ["read", "semsearch"],           // a read-only child
+    mapCall: (n) => ({ type: typeOf[n] || "" }),
+  });
+  assert.deepEqual(res.admitted.map((s) => s.function.name), ["semantic_search"]);
+  assert.deepEqual(res.outside.sort(), ["mcp__db__query", "run_terminal"]);
+});
+
+test("_subAgentAdmitTools: fails closed on matcher errors and unmappable names", () => {
+  const admit = load("_subAgentAdmitTools", {
+    _searchToolsExactQuery: () => { throw new Error("registry exploded"); },
+    _searchToolsLookup: () => [],
+    _searchToolsFuzzyMatch: () => [],
+  });
+  const res = admit("anything", { registry: new Map(), loaded: new Set(), execTypes: ["read"], mapCall: () => ({}) });
+  assert.deepEqual(res, { admitted: [], outside: [] }, "a matcher error must yield empty, not throw");
+
+  const admit2 = load("_subAgentAdmitTools", {
+    _searchToolsExactQuery: () => false,
+    _searchToolsLookup: () => [],
+    _searchToolsFuzzyMatch: () => [
+      { schema: { type: "function", function: { name: "mystery_tool", parameters: {} } }, alreadyLoaded: false },
+    ],
+  });
+  const res2 = admit2("q", { registry: new Map(), loaded: new Set(), execTypes: ["read"], mapCall: () => { throw new Error("no mapping"); } });
+  assert.deepEqual(res2.admitted, [], "unmappable tools must not be admitted");
+  assert.deepEqual(res2.outside, ["mystery_tool"], "…but must still be reported");
+});
+
+test("sub-agent loop: search_tools is answered before the allowlist, via the payload window", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /_SEARCH_TOOLS_SCHEMA,\s*\n\s*\];/,
+    "children must be offered the discovery entry point");
+  const searchIdx = sub.indexOf('call.type === "search_tools"');
+  const allowIdx = sub.indexOf("!_execTypes.includes(call.type)");
+  assert.ok(searchIdx >= 0 && allowIdx > searchIdx,
+    "discovery must be handled before the allowlist rejection");
+  // Admission goes through the same capped window as the main loop — a raw
+  // toolSchemas.push would bypass the byte/count limits (and is banned globally by the
+  // payload-window test above). The window splices the SAME array the next turn reads.
+  assert.match(sub, /_applyToolPayloadWindow\(toolSchemas, _found\.admitted, _childCoreNames\)/);
+  assert.doesNotMatch(sub, /toolSchemas\.push/);
 });
