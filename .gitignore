@@ -37,3 +37,7 @@ yarn-error.log*
 # Local Claude settings backups — these mirror settings.local.json and can contain
 # API tokens (a Figma token was found in one). Ignored for the same reason as the original.
 .claude/settings.local.json.bak-*
+
+# Python bytecode — build junk, never source
+__pycache__/
+*.pyc
