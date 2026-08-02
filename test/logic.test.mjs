@@ -14820,10 +14820,19 @@ test("#53-2 并发预算共享：嵌套走同一个 _sess._subAgentsActive 上�
   // 嵌套派发复用 _runSubAgent 入口且 run: execRun（session 浅拷贝共享）→ 同一会话计数器
   assert.match(sub, /const _nestReport = await _runSubAgent\(\{ config, [^\n]*run: execRun/,
     "嵌套必须递归复用 _runSubAgent（才能吃到同一套计数/排队/超时机制）");
-  assert.match(sub, /const willStart = \+\+_sess\._subAgentsActive;/);
-  assert.match(sub, /if \(willStart > MAX_SUBAGENTS_PARALLEL\)/);
+  // 真信号量：超额必须真的等待槽位释放，而不是"等一个 tick 然后照常启动"。
+  // 旧写法 `if (willStart > MAX) await setImmediate` 从不真正限流——九个 worker 会同时起，
+  // 而描述里的 2 又在劝退模型分工，两头都不讨好。
+  assert.match(sub, /while \(\(_sess\._subAgentsActive \|\| 0\) >= MAX_SUBAGENTS_PARALLEL\)/,
+    "必须是真正的等待门，不是一次 tick 让步");
+  assert.match(sub, /_subAgentSlotWaiters \|\|= \[\]\)\.push\(resolve\)/, "超额者必须真的挂进队列");
+  assert.match(sub, /if \(typeof _waiter === "function"\) _waiter\(\);/,
+    "退出时必须真的唤醒一个排队者——不唤醒就是死锁");
+  assert.match(sub, /_subAgentSlotWaiters\?\.shift\?\.\(\)/,
+    "每次只放行一个，全量唤醒等于没有上限");
+  assert.doesNotMatch(sub, /setImmediate/, "旧的假信号量不得复活");
   // 全函数只有一处递增一处递减——嵌套没有第二套计数器，预算不因层级翻倍
-  assert.equal((sub.match(/\+\+_sess\._subAgentsActive/g) || []).length, 1, "只允许一处递增");
+  assert.equal((sub.match(/_sess\._subAgentsActive\+\+/g) || []).length, 1, "只允许一处递增");
   assert.equal((sub.match(/_sess\._subAgentsActive--/g) || []).length, 1, "只允许一处递减（finally 里）");
   assert.doesNotMatch(sub, /MAX_SUBAGENTS_PARALLEL \* /, "上限不得按层级乘倍放大");
 });
@@ -14837,7 +14846,7 @@ test("#53-3 只读继承 + scope 收敛：嵌套强制只读，scope 必须是�
   assert.match(sub, /const _within = \(x, y\) => x === y \|\| x\.startsWith\(y \+ "\/"\);/);
   assert.match(sub, /嵌套 worker 的 scope（/, "越界必须有明确拒绝文案");
   // 拒绝必须发生在并发计数器与超时器启动之前——被拒的嵌套不得泄漏计数/定时器
-  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("++_sess._subAgentsActive"), "scope 拒绝在计数器之前");
+  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("_sess._subAgentsActive++"), "scope 拒绝在计数器之前");
   assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("const timeoutId = setTimeout"), "scope 拒绝在超时器之前");
   // 行为复算：同一 within 谓词下的子集判定（含 CRLF 注入样本——归一后不得误判为子集）
   const within = (x, y) => x === y || x.startsWith(y + "/");
