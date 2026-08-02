@@ -17660,3 +17660,31 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
   assert.match(loop, /退出码 \$\{_buildFail\.exitCode\}/);
   assert.match(loop, /_buildFail\.stderr \|\| _buildFail\.stdout/);
 });
+
+// ---------------------------------------------------------------------------
+// A complete text answer ends the run — it does not get re-asked.
+//
+// Reported: asking the assistant a plain question produced the SAME capability answer
+// twice, with a pointless list_dir on an empty folder between them. Cause, entirely in
+// the loop: a text-only turn (stop_reason == "end_turn") did not end a non-mutating run,
+// because _quietExitAt was 2 and any tool call resets quietTurns to 0. So answer(1) →
+// forced extra turn → model makes a token tool call → counter resets → answer again.
+//
+// Claude Code stops on the first end_turn. Every obligation the extra turn was standing
+// in for is already an explicit clause of the same exit condition.
+// ---------------------------------------------------------------------------
+test("a non-mutating run exits on the first quiet turn", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _quietExitAt = didMutate \? 4 : 1;/,
+    "one complete answer must end a run that touched nothing");
+  assert.doesNotMatch(loop, /const _quietExitAt = didMutate \? 4 : 2;/,
+    "requiring two quiet turns is what produced the duplicated answer");
+  // The counter still resets on real action — that is correct, and is precisely why a
+  // threshold above 1 could be re-armed forever by token tool calls.
+  assert.match(loop, /quietTurns = 0; \/\/ real action → reset the consecutive-quiet counter/);
+  // The obligations are still enforced, so lowering the threshold loses no safety.
+  const gate = loop.slice(loop.indexOf("if (quietTurns >= _quietExitAt"), loop.indexOf("if (quietTurns >= _quietExitAt") + 420);
+  for (const clause of ["!pending", "_missingResearch.length", "_missingRequiredEffect", "_codeDeliveredUnverified"]) {
+    assert.ok(gate.includes(clause), `the quiet-exit must still gate on ${clause}`);
+  }
+});

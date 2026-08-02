@@ -37665,7 +37665,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             && _semanticReviewAtImplOps >= _implOps);
         // 纯问答 run（本轮没改过任何文件）安静 2 轮即收——4 轮是给“被催收尾的改动型 run”
         // 留的；信息型问题多陪 2 轮只会多两张换个说法的复读卡（实测“一直重复讲话”）。
-        const _quietExitAt = didMutate ? 4 : 2;
+        // A complete text answer with no tool calls IS the end of the run — that is
+        // `stop_reason == "end_turn"`, and Claude Code stops on it immediately.
+        //
+        // This used to require TWO consecutive quiet turns even for a run that never
+        // touched the workspace, and any tool call resets the counter (37547). So a plain
+        // question went: answer (quiet=1, not enough) → loop forces another turn → the
+        // model, pressured to act, makes a pointless call (list_dir on an empty folder)
+        // → counter back to 0 → it answers AGAIN. That is the duplicated-answer bug, and
+        // the pointless tool call in the middle of it.
+        //
+        // Nothing is lost by exiting on the first one: every obligation this was standing
+        // in for — pending plan steps, research evidence, required effects, unverified
+        // code — is already an explicit clause of the same condition below, and a run that
+        // mutated files still gets the longer leash.
+        const _quietExitAt = didMutate ? 4 : 1;
         // 静默收尾也要过证据/义务门：补救 nudge 还有额度就不早退（放行给下方门禁催办）；
         // 额度耗尽仍缺的项以未完成状态入账——诚实记账，不无声放行“假成功”。
         // （这条写入腿曾在“验证改为 AI 自主判断”重构中被连带误删：标签映射与渲染腿都在，
