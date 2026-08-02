@@ -31879,7 +31879,7 @@ function _blockedToolRecoveryInstruction(content, call = null, result = null) {
     old_string_missing: () => mk("old_string_missing", "PRECISE_EDIT_STRING",
       `不要换搜索乱试或整文件覆盖。下一步用报错给出的最接近真实片段，或重新 ${readStep}，从当前内容逐字符复制 old_string（不要带行号，空白/缩进/标点一致），再用 edit_file / multi_edit 精准重试。`),
     retry_complete_write_existing: () => mk("retry_complete_write_existing", "RETRY_COMPLETE_WRITE",
-      `上一条失败的是完整 write_file。新版 IDE 会先读当前磁盘内容生成 diff，再用 CAS + Undo 覆盖写入；下一步直接重新调用 write_file，带上同一个精确 path 和完整非空 content。只有 edit_file / multi_edit 才需要先 read_file。`),
+      `上一条失败的是完整 write_file。文件已存在时，write_file 与 edit_file / multi_edit 一样需要**当前版本**的读取证据——整文件覆盖同样会丢掉你没读过的内容。下一步先 ${readStep} 完整读取当前版本，再重新调用 write_file，带上同一个精确 path 和完整非空 content。`),
     read_before_edit_missing_ranges: () => mk("read_before_edit_missing_ranges", "READ_MISSING_RANGES",
       `下一步不要再 edit_file / multi_edit。先补齐当前版本缺失范围：${missingRanges[1].trim()}。最稳妥是按工具提示用 ${readStep} 带 offset=1、limit=总行数完整读取当前文件；拿到完整读取结果后，再基于同一版本做 edit_file / multi_edit。`),
     read_before_edit: () => mk("read_before_edit", "READ_CURRENT_FILE",
@@ -41240,6 +41240,33 @@ function _reindentReplacement(newStr, indent) {
     .join("\n");
 }
 
+/**
+ * May this mutation of an EXISTING file proceed without current-version read evidence?
+ *
+ * Exactly two bypasses are legitimate, and neither is "the model sent a whole file":
+ *
+ *   - redacted write-back — the model DID read the current version, just a masked copy.
+ *     Its placeholders are restored by _restoreRedactedPlaceholders, which returns null and
+ *     refuses the write if restoration is not exact.
+ *   - precise local edit — an exact, unique oldString anchor located in the current disk
+ *     content is itself evidence the model is operating on the real bytes.
+ *
+ * A complete whole-file write is NOT a bypass. Undo-ability is not correctness: content
+ * composed from the model's prior silently drops whatever the file already held. Callers
+ * apply this only when the file exists; creating a new file needs no prior read.
+ */
+function _writeGateBypass(call, { redactedRead = false, preciseLocalEdit = false } = {}) {
+  if (!call || typeof call !== "object") return false;
+  if (call.type === "write") {
+    return (
+      redactedRead &&
+      typeof call.content === "string" &&
+      /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(call.content)
+    );
+  }
+  return call.type === "edit" && !!preciseLocalEdit;
+}
+
 function _localEditHasPreciseAnchors(currentContent, call) {
   const content0 = String(currentContent ?? "");
   if (!call || typeof call !== "object") return false;
@@ -42121,26 +42148,29 @@ async function _executeToolStepInner(step, call, root, run) {
       const hasCurrentRead = !existed || !run || _runHasCurrentRead(run, root, old, call.path, fp);
       const preciseLocalEdit = existed && call.type === "edit" && _localEditHasPreciseAnchors(old, call);
       const redactedRead = existed && _runReadWasRedacted(run, root, old, call.path, fp);
-      // write_file is a whole-file terminal state. If the model provided complete,
-      // non-empty content, the IDE can safely show a full diff, CAS-write the current
-      // disk snapshot, and keep Undo — no need to dead-end with "先读取已有文件".
-      // Local edit/multi_edit still require current read evidence or precise anchors.
-      // 
-      // P0 fix for gate competition on redacted reads:
-      // When `redactedRead=true` AND the write content contains REDACTED placeholders,
-      // it means the model is writing back based on the masked copy, which will be
-      // restored via _restoreRedactedPlaceholders before landing on disk. The model
-      // has already "read" the masked version, so bypassing the "first-read" gate here
-      // is safe — restoration integrity and consistency are guaranteed by the restore
-      // layer (which returns null on failure and refuses dangerous writes). Must use
-      // the same exact placeholder pattern as in _restoreRedactedPlaceholders.
-      const completeWholeWrite = call.type === "write" && typeof call.content === "string" && !!call.content.trim()
-        && (!redactedRead || /\[?REDACTED(?:_[A-Z_]+)?\]?/i.test(newContent));
-      if (existed && run && !hasCurrentRead && !completeWholeWrite && !(call.type === "edit" && preciseLocalEdit)) {
+      // A whole-file write to an EXISTING file is still a blind overwrite. It used to be
+      // exempt from the read gate on the theory that complete content is a "terminal state"
+      // the IDE can diff and undo — but undo-ability is not correctness: content written
+      // from the model's prior, without reading the current version, silently drops whatever
+      // the file already contained. That exemption was the single widest hole in the gate,
+      // and the recovery text for a blocked edit used to steer the model straight into it
+      // (see R.retry_complete_write_existing), so a blocked edit_file became a blind
+      // write_file. New files are unaffected: the gate only applies when `existed`.
+      //
+      // The one genuinely safe bypass is the redacted write-back: the model read a MASKED
+      // copy, so it does hold current-version evidence, and its placeholders are restored by
+      // _restoreRedactedPlaceholders (which returns null and refuses the write on failure).
+      // That case keeps its exemption; nothing else does.
+      //
+      // Reads `call.content`, not `newContent`: `newContent` is not declared until below,
+      // and because `!redactedRead` is false in exactly the branch that mattered, the OR did
+      // not short-circuit — it evaluated a let-binding inside its temporal dead zone and threw
+      // ReferenceError. The two are identical here anyway (`newContent = call.content`).
+      if (existed && run && !hasCurrentRead && !_writeGateBypass(call, { redactedRead, preciseLocalEdit })) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 先读取已有文件";
         const coverageHint = _readBeforeEditCoverageHint(run, root, old, call.path, call.path, fp);
-        return { type: call.type, path: call.path, content: `[BLOCKED] ${call.path} 已存在，但本次运行没有完整读取它的**当前版本**（可能从未读过，也可能在读取后被用户或另一个任务改过）。IDE 已阻止盲改/旧版本覆盖。${coverageHint}` };
+        return { type: call.type, path: call.path, content: `[BLOCKED] ${call.path} 已存在，但本次运行没有完整读取它的**当前版本**（可能从未读过，也可能在读取后被用户或另一个任务改过）。IDE 已阻止盲改/旧版本覆盖。先 read_file 读当前版本，再重试本次写入。${coverageHint}` };
       }
       let _redactNote = "";
       let newContent = call.content;

@@ -17061,3 +17061,63 @@ test("the per-delta segment parse is marked, memoised and throttled", () => {
   assert.match(SRC, /segs = renderStream\._segs;/,
     "between parses the last segment list must be reused, not recomputed");
 });
+
+// ---------------------------------------------------------------------------
+// Read-before-write gate: a whole-file write is not a bypass.
+//
+// write_file to an existing file used to be exempt from the read gate whenever the
+// content was a non-empty string ("completeWholeWrite"), on the theory that a full
+// diff plus Undo made it safe. Undo-ability is not correctness — content written from
+// the model's prior drops whatever it never read. Worse, the recovery text for a
+// blocked edit_file told the model that "only edit_file / multi_edit need read_file",
+// so the gate actively routed blind rewrites through write_file.
+// ---------------------------------------------------------------------------
+test("_writeGateBypass: whole-file write to an existing file is NOT a bypass", () => {
+  const gate = load("_writeGateBypass");
+  // The exact shape the old completeWholeWrite disjunct waved through.
+  assert.equal(
+    gate({ type: "write", content: "export const x = 1;\n" }, { redactedRead: false }),
+    false,
+    "a complete, non-empty whole-file write must still require read evidence",
+  );
+  assert.equal(gate({ type: "write", content: "   " }, {}), false);
+  assert.equal(gate({ type: "write", content: "" }, {}), false);
+});
+
+test("_writeGateBypass: redacted write-back keeps its exemption", () => {
+  const gate = load("_writeGateBypass");
+  // The model read a MASKED current version, so it does hold current-version evidence.
+  assert.equal(
+    gate({ type: "write", content: "key = [REDACTED_API_KEY]\n" }, { redactedRead: true }),
+    true,
+  );
+  assert.equal(gate({ type: "write", content: "key = REDACTED\n" }, { redactedRead: true }), true);
+  // Redacted read, but the write carries no placeholder → not a write-back, no exemption.
+  assert.equal(
+    gate({ type: "write", content: "key = hunter2\n" }, { redactedRead: true }),
+    false,
+    "a redacted read does not license writing content with no placeholders",
+  );
+  // Placeholder present but nothing was redacted → the flag is what licenses this.
+  assert.equal(
+    gate({ type: "write", content: "key = [REDACTED]\n" }, { redactedRead: false }),
+    false,
+  );
+});
+
+test("_writeGateBypass: precise local edit anchors remain a bypass", () => {
+  const gate = load("_writeGateBypass");
+  assert.equal(gate({ type: "edit" }, { preciseLocalEdit: true }), true);
+  assert.equal(gate({ type: "edit" }, { preciseLocalEdit: false }), false);
+  // multi_edit has never had an escape and must not gain one here.
+  assert.equal(gate({ type: "multiedit" }, { preciseLocalEdit: true }), false);
+});
+
+test("_writeGateBypass: tolerates malformed calls without throwing", () => {
+  const gate = load("_writeGateBypass");
+  assert.equal(gate(null), false);
+  assert.equal(gate(undefined), false);
+  assert.equal(gate("write"), false);
+  assert.equal(gate({ type: "write" }), false, "missing content is not a bypass");
+  assert.equal(gate({ type: "write", content: 42 }, { redactedRead: true }), false);
+});
