@@ -9749,6 +9749,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
     }),
   });
   const needsSemanticReview = load("_runtimeNeedsSemanticReview", {
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand"),
     _executionEvidenceFromTool: executionEvidence,
   });
   const sqlWithoutLeadingTrivia = load("_sqlWithoutLeadingTrivia");
@@ -17280,6 +17281,7 @@ test("_subAgentAdmitTools: admits same-capability tools, names out-of-sandbox on
     ["mcp__db__query", mkSchema("mcp__db__query")],
   ]);
   const admit = load("_subAgentAdmitTools", {
+    _STRICT_MUTATING_TOOL_NAMES: new Set(["deploy_site", "git_commit", "git_push", "run_cmd"]),
     _searchToolsExactQuery: () => false,
     _searchToolsLookup: () => [],
     _searchToolsFuzzyMatch: (_q, reg) =>
@@ -17298,6 +17300,7 @@ test("_subAgentAdmitTools: admits same-capability tools, names out-of-sandbox on
 
 test("_subAgentAdmitTools: fails closed on matcher errors and unmappable names", () => {
   const admit = load("_subAgentAdmitTools", {
+    _STRICT_MUTATING_TOOL_NAMES: new Set(["deploy_site"]),
     _searchToolsExactQuery: () => { throw new Error("registry exploded"); },
     _searchToolsLookup: () => [],
     _searchToolsFuzzyMatch: () => [],
@@ -17306,6 +17309,7 @@ test("_subAgentAdmitTools: fails closed on matcher errors and unmappable names",
   assert.deepEqual(res, { admitted: [], outside: [] }, "a matcher error must yield empty, not throw");
 
   const admit2 = load("_subAgentAdmitTools", {
+    _STRICT_MUTATING_TOOL_NAMES: new Set(["deploy_site"]),
     _searchToolsExactQuery: () => false,
     _searchToolsLookup: () => [],
     _searchToolsFuzzyMatch: () => [
@@ -17330,4 +17334,113 @@ test("sub-agent loop: search_tools is answered before the allowlist, via the pay
   // payload-window test above). The window splices the SAME array the next turn reads.
   assert.match(sub, /_applyToolPayloadWindow\(toolSchemas, _found\.admitted, _childCoreNames\)/);
   assert.doesNotMatch(sub, /toolSchemas\.push/);
+});
+
+// ---------------------------------------------------------------------------
+// Fixes from the adversarial review of the gate work (2026-08-02).
+// Each of these was a CONFIRMED defect in the first version of the gates.
+// ---------------------------------------------------------------------------
+test("review: strict-mutating tools are never admitted into a child by type", () => {
+  // deploy_site maps to type "cmd" — which every child has — but publishes the
+  // workspace to a public domain. Type alone must not admit it.
+  const mkSchema = (n) => ({ type: "function", function: { name: n, parameters: {} } });
+  const admit = load("_subAgentAdmitTools", {
+    _STRICT_MUTATING_TOOL_NAMES: new Set(["deploy_site", "git_commit", "git_push"]),
+    _searchToolsExactQuery: () => false,
+    _searchToolsLookup: () => [],
+    _searchToolsFuzzyMatch: (_q, reg) =>
+      [...reg.values()].map((schema) => ({ schema, alreadyLoaded: false })),
+  });
+  const registry = new Map([
+    ["deploy_site", mkSchema("deploy_site")],
+    ["git_commit", mkSchema("git_commit")],
+    ["mcp__db__query", mkSchema("mcp__db__query")],
+  ]);
+  const typeOf = { deploy_site: "cmd", git_commit: "git", mcp__db__query: "mcp" };
+  const res = admit("deploy my site", {
+    registry, loaded: new Set(),
+    execTypes: ["read", "cmd", "git"],          // worker sandbox: type-level would admit all but mcp
+    mapCall: (n) => ({ type: typeOf[n] || "" }),
+  });
+  assert.deepEqual(res.admitted, [], "no strict-mutating tool may enter via discovery");
+  assert.deepEqual(res.outside.sort(), ["deploy_site", "git_commit", "mcp__db__query"],
+    "…but each must be named so the report can route it to the parent");
+});
+
+test("review: evidence with a non-zero exitCode never certifies, even when ok=true", () => {
+  // read_terminal on an exited terminal SUCCEEDS as a read (ok=true) while carrying the
+  // real command and exitCode:1 — looking at a failure must not mint green evidence.
+  const certifies = load("_evidenceCertifies", {
+    _looksLikeVerificationCommand: (c) => /\bnpm\b.*\bbuild\b/.test(c),
+    _runtimeCommandKinds: () => [],
+  });
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 1 }, 3), false);
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 0 }, 3), true);
+  // null/undefined exitCode (still running, no code reported) keeps its old meaning.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: null }, 3), true);
+});
+
+test("review: a RED verification command does not arm the semantic-review gate", () => {
+  // The success-gated stamp un-exempted red checks from semantic review, routing honest
+  // wrap-ups into the paid critic loop. The exemption follows the command CLASS.
+  const needs = load("_runtimeNeedsSemanticReview", {
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand"),
+    _executionEvidenceFromTool: () => ({ command: "npm run build", exitCode: 1 }),
+  });
+  assert.equal(needs({ type: "cmd", command: "npm run build" }, { code: 1 }), false,
+    "a red build needs FIXING (codeVerify gate), never semantic review");
+  assert.equal(needs({ type: "cmd", command: "python app.py" }, { code: 0 }), true,
+    "application runs still require semantic postcondition review");
+});
+
+test("review: files whose read coverage is mechanically impossible bypass the write gate", () => {
+  const impossible = load("_readCoverageImpossible", { _READ_SLICE_CHAR_CAP: 55000 });
+  const gate = load("_writeGateBypass");
+  const giant = "x".repeat(60001);                       // one line > the 55k slice cap
+  assert.equal(impossible(giant), true);
+  assert.equal(impossible("short\n".repeat(1000)), false);
+  assert.equal(impossible(`head\n${giant}\ntail`), true, "any single over-cap line suffices");
+  assert.equal(
+    gate({ type: "write", content: "minified" }, { coverageImpossible: true }), true,
+    "the gate must not demand evidence the reader cannot produce");
+  assert.equal(
+    gate({ type: "write", content: "minified" }, { coverageImpossible: false }), false);
+});
+
+test("review: eager writes evaluate the read gate at the in-flight turn", () => {
+  const hasRead = load("_runHasCurrentRead", {
+    _normRel: (p) => p,
+    _contentSignature: () => "sig",
+  });
+  const run = {
+    _toolBatch: 2,
+    ctx: { filesRead: new Set(["a.ts"]) },
+    _readCoverage: new Map([["a.ts", { signature: "sig", completedBatch: 2 }]]),
+  };
+  // Batch path: a read completed THIS batch does not authorize (same-turn write).
+  assert.equal(hasRead(run, "", "content", "a.ts"), false);
+  // Eager path: the bias reflects that execution belongs to turn N+1.
+  run._eagerTurnBias = 1;
+  assert.equal(hasRead(run, "", "content", "a.ts"), true,
+    "a file read in the immediately preceding turn must authorize its eager rewrite");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /run\._eagerTurnBias = 1;/, "the eager hook must set the bias");
+  assert.match(loop, /run\._eagerTurnBias = 0;\s*\n\s*run\._toolBatch = \(run\._toolBatch \|\| 0\) \+ 1;/,
+    "the real increment must clear it");
+});
+
+test("review: bare npm/yarn init is a mutation but not a code obligation", () => {
+  const wroteCode = load("_commandWroteCode", {
+    _toolExecutionSucceeded: () => true,
+    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
+    _looksLikeShellFileRewrite: () => false,
+    _CODE_FILE_RE: /\.(?:ts|js)$/i,
+  });
+  const ok = { code: 0 };
+  assert.equal(wroteCode({ type: "cmd", command: "npm init -y" }, ok), false,
+    "writes only package.json — no build obligation");
+  assert.equal(wroteCode({ type: "cmd", command: "yarn init --yes" }, ok), false);
+  assert.equal(wroteCode({ type: "cmd", command: "npm init vite@latest my-app" }, ok), true,
+    "init WITH an initializer is npm create — a real scaffold");
+  assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest app" }, ok), true);
 });
