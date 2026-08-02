@@ -17738,3 +17738,35 @@ test("an empty profile emits no design flag — the failure mode this guards", (
   const ui = header({ uiProject: true, ui: true, workspaceAction: "modify" });
   assert.match(ui, /design/, "a real UI profile does request design knowledge");
 });
+
+// ---------------------------------------------------------------------------
+// A question closed with a sign-off is still a question.
+//
+// Reported: the assistant ended with "…想继续完善它，还是想做点别的新东西？随时说 👋"
+// and the run did NOT wait — it thought again, listed the directory and batch-read five
+// files. Two independent misses in _looksLikeUserQuestion:
+//   1. the mark had to be the FINAL character, so any sign-off after ？ disqualified it;
+//   2. no A-or-B choice shape, so a direct "X, 还是 Y？" matched no intent phrase at all.
+// ---------------------------------------------------------------------------
+test("_looksLikeUserQuestion: sign-offs and choice questions still pause the run", () => {
+  const q = load("_looksLikeUserQuestion");
+  // The exact reported closer.
+  assert.equal(q("你现在桌面上有 Mr.day One 官网这个项目，想继续完善它，还是想做点别的新东西？随时说 👋"), true);
+  assert.equal(q("需要我先跑一遍构建吗？随时说"), true, "a trailing sign-off must not disqualify");
+  assert.equal(q("Which one do you want? let me know 😊"), true);
+  assert.equal(q("用 Tailwind 还是原生 CSS？"), true, "A-or-B is a choice question by shape");
+  assert.equal(q("要不要我继续？"), true);
+});
+
+test("_looksLikeUserQuestion: statements and rhetoric still do NOT pause the run", () => {
+  const q = load("_looksLikeUserQuestion");
+  // A new sentence after the mark means the model answered itself and is proceeding.
+  assert.equal(q("要不要我继续？我这就去把构建跑完，然后把错误一条条修掉。"), false);
+  assert.equal(q("Is that right? No, do X instead."), false);
+  // 还是 inside a STATEMENT is not a question.
+  assert.equal(q("这个项目用了 React 还是 Vue 我已经确认过了。"), false);
+  assert.equal(q("这不是很明显吗？"), false, "rhetorical");
+  assert.equal(q("我已经改好了。"), false);
+  assert.equal(q("> 要不要继续？"), false, "quoted");
+  assert.equal(q("# 要不要继续？"), false, "heading");
+});
