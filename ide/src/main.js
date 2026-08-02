@@ -23043,6 +23043,12 @@ function _skillDiscoveryBases(projectRoot, home) {
  * still drops (the gateway would otherwise receive two competing base prompts) and so the
  * split is visible at the call site instead of implied.
  */
+// Parallel worker budget. Workers run as a parallel segment in the batch scheduler and
+// their scopes are proven disjoint before dispatch, so this bounds upstream concurrency
+// (rate limits, context), not write safety. 2 was low enough that a nine-component build
+// ran as one serial worker; 4 keeps a real bound while letting a decomposed task fan out.
+const _MAX_SUBAGENTS_PARALLEL = 4;
+
 function _l0MessagesWithSkills(messages, skillsBlock, clientBlocks = "") {
   const source = Array.isArray(messages) ? messages : [];
   const out = source[0] && source[0].role === "system" ? source.slice(1) : source.slice();
@@ -34171,17 +34177,30 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
   }, _subTimeoutMs);
   
-  // === Concurrent subagent limit: max 2 parallel, queue the rest ===
-  // Reuse session's subagent counter for isolation
-  let _subAgentCount = (_sess && _sess._subAgentsActive) || 0;
-  const MAX_SUBAGENTS_PARALLEL = 2;
-  if (!_sess) _sess._subAgentsActive = 0;
-  const willStart = ++_sess._subAgentsActive;
-  if (willStart > MAX_SUBAGENTS_PARALLEL) {
-    // Queue by waiting a tick (non-blocking yield to UI)
-    await new Promise((resolve) => setImmediate(resolve));
+  // === Concurrent subagent limit ===
+  // This was a semaphore in name only: it incremented the counter, and when over the
+  // limit awaited a SINGLE macrotask tick and then started anyway. So the "max 2" never
+  // held — nine workers in one batch all ran at once — while the number 2 in the tool
+  // description discouraged the model from ever fanning out that far. Worst of both:
+  // no real bound, and a stated bound that suppressed parallelism.
+  //
+  // Now a real gate. The cap is higher because the batch scheduler already runs workers
+  // as a parallel segment and their scopes are proven disjoint before dispatch, so the
+  // limiting factor is upstream rate/context, not write safety.
+  if (!_sess._subAgentsActive) _sess._subAgentsActive = 0;
+  const MAX_SUBAGENTS_PARALLEL = _MAX_SUBAGENTS_PARALLEL;
+  while ((_sess._subAgentsActive || 0) >= MAX_SUBAGENTS_PARALLEL) {
+    if (!_live()) return "[interrupted]";
+    // Wait for a running sibling to release a slot. _subAgentSlotWaiters is drained in
+    // the finally that decrements the counter, so this cannot deadlock on a crashed
+    // child; the run-level timeout above remains the outer backstop.
+    await new Promise((resolve) => {
+      (_sess._subAgentSlotWaiters ||= []).push(resolve);
+      setTimeout(resolve, 15000); // belt-and-braces: never wedge on a lost release
+    });
   }
-  
+  _sess._subAgentsActive++;
+
   // === run 字段安全初始化审计：子智能体路径补齐新机制字段的默认值 ===
   // Run 对象可能从主循环继承，但子智能体的独立执行环境需要这些字段的安全默认值
   if (run && !run._dupReadN) run._dupReadN = new Map();
@@ -34540,6 +34559,10 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     // === Cleanup: cancel timeout & decrement counter ===
     clearTimeout(timeoutId);
     if (_sess && _sess._subAgentsActive) _sess._subAgentsActive--;
+    // Release one queued sibling. Draining a single waiter per exit keeps the gate at
+    // exactly MAX; draining all of them would let the whole queue through at once.
+    const _waiter = _sess?._subAgentSlotWaiters?.shift?.();
+    if (typeof _waiter === "function") _waiter();
   }
 
   // 0-step floor: keep the attempt visible and settled. Hiding the card made a
