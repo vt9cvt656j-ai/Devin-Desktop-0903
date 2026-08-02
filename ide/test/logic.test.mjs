@@ -9803,8 +9803,9 @@ test("typed runtime and external evidence stays separate from workspace mutation
   assert.equal(commandMutates("git status"), false);
   assert.equal(commandMutates("printf changed > src/app.js"), true);
   assert.equal(commandMutates("npm install zod"), true);
-  assert.equal(mutates({ type: "cmd", command: "npm test" }, {}), false);
-  assert.equal(mutates({ type: "termtask", command: "npx prettier --write src/app.js" }, {}), true);
+  assert.equal(mutates({ type: "cmd", command: "npm test", purpose: "verify" }, {}), false);
+  // Fact-based now: the watcher delta is what says a command mutated.
+  assert.equal(mutates({ type: "termtask", command: "npx prettier --write src/app.js" }, { _fsDelta: true }), true);
   assert.equal(mutates({ type: "git", op: "branch", branch: "feature" }, {}), true);
   assert.equal(mutates({ type: "git", op: "pull" }, {}), true);
   assert.deepEqual(runtimeKinds("npm run build"), ["build"]);
@@ -13449,8 +13450,9 @@ test("项目入口退出 0 保留原始证据并进入语义验收，不直接�
   assert.equal(execLike("python x.py; rm -rf /"), false, "shell 元字符直接拒绝");
   assert.doesNotMatch(SRC, /_looksLikeVerificationCommand\(it\.call\.command\) \|\| _looksLikeProjectExecutionCommand\(it\.call\.command\)/,
     "任意项目入口退出 0 不能直接记成验证通过");
-  assert.match(SRC, /t === "cmd" && _looksLikeVerificationCommand\(it\.call\.command\)/,
-    "只有确定性 check\/test\/build 命令可直接记验证学分");
+  assert.match(SRC, /\(t === "cmd" \|\| t === "termtask"\) && it\.call\.purpose === "verify"/,
+    "只有模型显式声明 verify 的命令可直接记验证学分——不再按命令文本猜");
+
   const semanticGate = extractFn("_runtimeNeedsSemanticReview");
   assert.match(semanticGate, /_executionEvidenceFromTool\(call, result, ""\)/);
   assert.doesNotMatch(semanticGate, /_runtimeCommandKinds|RegExp|\.test\(/,
@@ -17182,36 +17184,24 @@ const _verifyEvidenceAccepts = (evidence, implOps = 1) => {
   return evidence.some((e) => certifies(e, implOps));
 };
 
-test("verify gate: a FAILING build does not count as verification", () => {
-  const failing = [{ command: "npm run build", implementationVersion: 2, ok: false }];
-  assert.equal(_verifyEvidenceAccepts(failing, 2), false);
-  // Even with the explicit stamp present, a red exit must lose.
-  const stampedButRed = [
-    { command: "npm run build", implementationVersion: 2, ok: false, verification: true },
-  ];
-  assert.equal(_verifyEvidenceAccepts(stampedButRed, 2), false,
-    "ok===false must be checked before the verification stamp");
-});
-
-test("verify gate: a GREEN build still counts", () => {
-  assert.equal(
-    _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 2, ok: true }], 2),
-    true,
-  );
-  assert.equal(
-    _verifyEvidenceAccepts(
-      [{ command: "cargo test", implementationVersion: 2, ok: true, verification: true }], 2),
-    true,
-  );
-});
-
-test("verify gate: evidence without `ok` is not retroactively voided", () => {
-  // Records predating the ok stamp carry undefined; they must keep their old meaning
-  // rather than silently invalidating a run's accumulated evidence.
-  assert.equal(
-    _verifyEvidenceAccepts([{ command: "npm run build", implementationVersion: 2 }], 2),
-    true,
-  );
+test("verify gate: certification requires a declaration or the IDE's own stamp", () => {
+  const certifies = load("_evidenceCertifies");
+  // The IDE stamps `verification` when a DECLARED verification exited 0.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 2, ok: true, verification: true }, 2), true);
+  // A record carrying the model's declaration certifies directly.
+  assert.equal(certifies({ command: "python check.py", implementationVersion: 2, ok: true, purpose: "verify" }, 2), true);
+  // Undeclared and unstamped certifies NOTHING — silence is not evidence. This is the
+  // deliberate break from the old text floor, which guessed from the command string.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 2, ok: true }, 2), false);
+  // Red never certifies, however it is declared or stamped.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 2, ok: false, verification: true }, 2), false);
+  assert.equal(certifies({ command: "python check.py", implementationVersion: 2, ok: true, exitCode: 1, purpose: "verify" }, 2), false);
+  // No text classifier may be consulted here any more.
+  assert.doesNotMatch(extractFn("_evidenceCertifies"), /_looksLikeVerificationCommand|_runtimeCommandKinds/,
+    "certification must not read command text");
+  // The IDE only sets that stamp for a DECLARED verification that exited 0.
+  assert.match(SRC, /if \(\(call\.type === "cmd" \|\| call\.type === "termtask"\)\s*\n\s*&& call\.purpose === "verify"\s*\n\s*&& _toolExecutionSucceeded\(call, result\)\) \{/,
+    "the verification stamp requires the declaration plus a green exit");
 });
 
 test("verify gate: stale evidence still loses to a newer edit", () => {
@@ -17230,43 +17220,43 @@ test("verify gate: stale evidence still loses to a newer edit", () => {
 // (a whole project) bumped _implOps while leaving _mutatedCode false, and
 // _codeDeliveredUnverified could never fire for exactly the runs that write the most code.
 // ---------------------------------------------------------------------------
-test("_commandWroteCode: scaffolds and code-file rewrites create a verification obligation", () => {
+test("_commandWroteCode: answers from watcher-observed paths, not command text", () => {
   const wroteCode = load("_commandWroteCode", {
     _toolExecutionSucceeded: (_c, r) => (r && r.code) === 0,
-    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
-    _looksLikeShellFileRewrite: load("_looksLikeShellFileRewrite", {
-      _stripHarmlessRedirects: load("_stripHarmlessRedirects"),
-    }),
-    _CODE_FILE_RE: /\.(?:js|jsx|ts|tsx|mjs|cjs|py|rs|go)$/i,
+    _CODE_FILE_RE: /\.(?:js|jsx|ts|tsx|py|rs|go)$/i,
   });
-  const ok = { code: 0 }, red = { code: 1 };
-  // Scaffolds: a whole project landed.
-  assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest my-app" }, ok), true);
-  assert.equal(wroteCode({ type: "cmd", command: "cargo new server" }, ok), true);
-  // Shell rewrites of code files.
-  assert.equal(wroteCode({ type: "cmd", command: "sed -i '' 's/a/b/' src/main.ts" }, ok), true);
-  assert.equal(wroteCode({ type: "termtask", command: "cat > src/app.py <<EOF" }, ok), true);
-  // Rewrites of NON-code files carry no code obligation.
-  assert.equal(wroteCode({ type: "cmd", command: "echo hi > notes.txt" }, ok), false);
-  // Failed commands wrote nothing worth verifying.
-  assert.equal(wroteCode({ type: "cmd", command: "cargo new server" }, red), false);
-  // Non-shell tools are not this predicate's business.
-  assert.equal(wroteCode({ type: "write", path: "src/a.ts", content: "x" }, ok), false);
-  // Plain non-writing commands.
-  assert.equal(wroteCode({ type: "cmd", command: "ls -la" }, ok), false);
+  const ok = { code: 0 };
+  // A generator whose NAME says nothing — invisible to any classifier, visible in fact.
+  assert.equal(wroteCode({ type: "cmd", command: "python gen.py", purpose: "mutate" },
+    { ...ok, _fsPaths: ["src/App.tsx"] }), true);
+  // Same command, only non-code output → no code obligation.
+  assert.equal(wroteCode({ type: "cmd", command: "python gen.py", purpose: "mutate" },
+    { ...ok, _fsPaths: ["out/report.txt"] }), false);
+  // Even undeclared, observed code writes count.
+  assert.equal(wroteCode({ type: "cmd", command: "make all" }, { ...ok, _fsPaths: ["src/x.rs"] }), true);
+  // A declared scaffold with no watcher report still counts (the watcher may miss a
+  // burst); declaration is the fallback, never the overrule.
+  assert.equal(wroteCode({ type: "cmd", command: "npm create vite", purpose: "scaffold" }, ok), true);
+  assert.equal(wroteCode({ type: "cmd", command: "ls", purpose: "explore" }, ok), false);
+  assert.equal(wroteCode({ type: "cmd", command: "npm create vite", purpose: "scaffold" }, { code: 1 }), false,
+    "a failed command wrote nothing worth verifying");
+  assert.doesNotMatch(extractFn("_commandWroteCode"), /_looksLikeScaffoldCommand|_looksLikeShellFileRewrite/);
 });
 
-test("_toolMutatesWorkspace: scaffold commands now count as workspace mutations", () => {
+test("_toolMutatesWorkspace: an observed fs delta outranks any declaration", () => {
   const mutates = load("_toolMutatesWorkspace", {
     _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
-    _looksLikeWorkspaceMutationCommand: () => false, // isolate: scaffold must be sufficient alone
-    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
     _mcpMutationHint: () => false,
   });
-  assert.equal(mutates({ type: "cmd", command: "npm create vite@latest app" }, {}), true,
-    "a scaffold lands a whole project; didMutate=false made every verification gate inert");
-  assert.equal(mutates({ type: "termtask", command: "dotnet new webapi" }, {}), true);
-  assert.equal(mutates({ type: "cmd", command: "npm run dev" }, {}), false);
+  // Fact wins even when the model declared the command read-only.
+  assert.equal(mutates({ type: "cmd", command: "./tool.sh", purpose: "explore" }, { _fsDelta: true }), true,
+    "the watcher cannot be talked out of by a wrong declaration");
+  // Declaration covers what the watcher missed.
+  assert.equal(mutates({ type: "cmd", command: "./tool.sh", purpose: "mutate" }, { _fsDelta: false }), true);
+  // Neither → not a mutation.
+  assert.equal(mutates({ type: "cmd", command: "ls -la", purpose: "explore" }, { _fsDelta: false }), false);
+  assert.equal(mutates({ type: "termtask", command: "npm run dev", purpose: "run" }, {}), false);
+  assert.doesNotMatch(extractFn("_toolMutatesWorkspace"), /_looksLikeWorkspaceMutationCommand|_looksLikeScaffoldCommand/);
 });
 
 test("agent loop: shell-written code feeds _mutatedCode and the index stays alive", () => {
@@ -17389,27 +17379,23 @@ test("review: strict-mutating tools are never admitted into a child by type", ()
 test("review: evidence with a non-zero exitCode never certifies, even when ok=true", () => {
   // read_terminal on an exited terminal SUCCEEDS as a read (ok=true) while carrying the
   // real command and exitCode:1 — looking at a failure must not mint green evidence.
-  const certifies = load("_evidenceCertifies", {
-    _looksLikeVerificationCommand: (c) => /\bnpm\b.*\bbuild\b/.test(c),
-    _runtimeCommandKinds: () => [],
-  });
-  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 1 }, 3), false);
-  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 0 }, 3), true);
+  const certifies = load("_evidenceCertifies");
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 1, purpose: "verify" }, 3), false);
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 0, purpose: "verify" }, 3), true);
   // null/undefined exitCode (still running, no code reported) keeps its old meaning.
-  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: null }, 3), true);
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: null, purpose: "verify" }, 3), true);
 });
 
-test("review: a RED verification command does not arm the semantic-review gate", () => {
-  // The success-gated stamp un-exempted red checks from semantic review, routing honest
-  // wrap-ups into the paid critic loop. The exemption follows the command CLASS.
+test("review: a declared verification never arms the semantic-review gate", () => {
+  // Red or green, a declared verification has an exit-status contract: fix it, never
+  // "have a paid critic interpret the output". Application runs still need review.
   const needs = load("_runtimeNeedsSemanticReview", {
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _executionEvidenceFromTool: () => ({ command: "npm run build", exitCode: 1 }),
   });
-  assert.equal(needs({ type: "cmd", command: "npm run build" }, { code: 1 }), false,
-    "a red build needs FIXING (codeVerify gate), never semantic review");
-  assert.equal(needs({ type: "cmd", command: "python app.py" }, { code: 0 }), true,
+  assert.equal(needs({ type: "cmd", command: "npm run build", purpose: "verify" }, { code: 1 }), false);
+  assert.equal(needs({ type: "cmd", command: "python app.py", purpose: "run" }, { code: 0 }), true,
     "application runs still require semantic postcondition review");
+  assert.doesNotMatch(extractFn("_runtimeNeedsSemanticReview"), /_looksLikeVerificationCommand/);
 });
 
 test("review: files whose read coverage is mechanically impossible bypass the write gate", () => {
@@ -17448,81 +17434,20 @@ test("review: eager writes evaluate the read gate at the in-flight turn", () => 
     "the real increment must clear it");
 });
 
-test("review: bare npm/yarn init is a mutation but not a code obligation", () => {
+test("review: install-type commands mutate but carry no code obligation by themselves", () => {
   const wroteCode = load("_commandWroteCode", {
     _toolExecutionSucceeded: () => true,
-    _looksLikeScaffoldCommand: load("_looksLikeScaffoldCommand"),
-    _looksLikeShellFileRewrite: () => false,
     _CODE_FILE_RE: /\.(?:ts|js)$/i,
   });
-  const ok = { code: 0 };
-  assert.equal(wroteCode({ type: "cmd", command: "npm init -y" }, ok), false,
-    "writes only package.json — no build obligation");
-  assert.equal(wroteCode({ type: "cmd", command: "yarn init --yes" }, ok), false);
-  assert.equal(wroteCode({ type: "cmd", command: "npm init vite@latest my-app" }, ok), true,
-    "init WITH an initializer is npm create — a real scaffold");
-  assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest app" }, ok), true);
+  // `npm init -y` writes package.json only: a mutation, not code. With no observed code
+  // path and no scaffold declaration, no build obligation is armed.
+  assert.equal(wroteCode({ type: "cmd", command: "npm init -y", purpose: "install" },
+    { code: 0, _fsPaths: ["package.json"] }), false);
+  // A real scaffold that lands code does arm it.
+  assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest app", purpose: "scaffold" },
+    { code: 0, _fsPaths: ["src/main.ts"] }), true);
 });
 
-// ---------------------------------------------------------------------------
-// "The directory exists but the IDE insists the workspace is empty."
-//
-// Two independent ways the empty-root registration went stale:
-//   1. The startup probe is fire-and-forget. A directory created while its readDir was
-//      in flight landed FIRST, then the stale empty snapshot overwrote reality — after
-//      which every read into the workspace was short-circuited with
-//      [SKIPPED_EMPTY_WORKSPACE] against a workspace the model had just populated.
-//   2. mkdir on an existing directory returned "已存在" without clearing the flag, so a
-//      directory created by a shell command / earlier turn never lifted the verdict.
-// ---------------------------------------------------------------------------
-test("empty-root probe: a mutation during the probe invalidates its snapshot", () => {
-  const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /const _emptyProbeTick = run\._fsMutTick \|\| 0;/,
-    "the probe must capture the mutation tick before awaiting");
-  assert.match(loop, /if \(run\._didMutate \|\| \(run\._fsMutTick \|\| 0\) !== _emptyProbeTick\) return;/,
-    "a stale snapshot must be dropped, not applied");
-  // The guard has to sit BEFORE the marking call, or it guards nothing.
-  const probeIdx = loop.indexOf("_emptyProbeTick = run._fsMutTick");
-  const guardIdx = loop.indexOf("!== _emptyProbeTick) return;");
-  const markIdx = loop.indexOf("_markRunRootEmpty(run, root, root, entries)");
-  assert.ok(probeIdx >= 0 && probeIdx < guardIdx && guardIdx < markIdx,
-    "capture → guard → mark, in that order");
-});
-
-test("mkdir on an existing directory still clears the empty-root registration", () => {
-  const start = SRC.indexOf('} else if (call.type === "mkdir")');
-  assert.ok(start > 0, "the mkdir branch must exist");
-  const branch = SRC.slice(start, start + 2000);
-  const existsIdx = branch.indexOf("if (alreadyExists)");
-  const clearIdx = branch.indexOf("_clearRunEmptyRoot(run, fp)");
-  const returnIdx = branch.indexOf("无需重复创建");
-  assert.ok(existsIdx >= 0 && clearIdx > existsIdx && clearIdx < returnIdx,
-    "the already-exists branch must clear the flag before returning");
-  // …and the create path must keep doing so too.
-  assert.equal((branch.match(/_clearRunEmptyRoot\(run, fp\)/g) || []).length, 2,
-    "both the already-exists and the freshly-created paths clear it");
-});
-
-test("the file-not-found toast carries no agent coaching", () => {
-  const rust = readFileSync(join(HERE, "../src-tauri/src/files.rs"), "utf8");
-  const notFound = rust.slice(rust.indexOf("ErrorKind::NotFound =>"), rust.indexOf("PermissionDenied"));
-  assert.match(notFound, /文件不存在：\{\}/, "it must still name the missing path");
-  assert.doesNotMatch(notFound, /list_dir|find_files|臆造/,
-    "model instructions must not ride in a user-facing toast — the model gets pathGuidance instead");
-  // The model's channel keeps the guidance.
-  assert.match(SRC, /pathGuidance = "[^"]*list_dir \/ find_files[^"]*"/,
-    "the tool-result channel must still coach the model");
-});
-
-// ---------------------------------------------------------------------------
-// Per-model tuning must actually REACH the model.
-//
-// messages[0] holds `sysPrompt + _modelStyleTuning(model) + skillsBlock + …`, and the L0
-// path drops messages[0] because the gateway assembles its own base prompt. It re-added
-// only skillsBlock — so every byte of per-model tuning, including the write→read and
-// don't-invent-paths discipline in _AGENT_RECOVERY_TUNING, was rebuilt every turn and
-// thrown away for every gateway-routed model. "Tuning the model" was a no-op.
-// ---------------------------------------------------------------------------
 test("L0 strip keeps client-side tuning while still dropping the bundled prompt", () => {
   const preserve = load("_l0MessagesWithSkills");
   const out = preserve([
@@ -17654,42 +17579,28 @@ test("run_cmd purpose is validated structurally and rides the call", () => {
   assert.match(SRC, /purpose: \{ type: "string", enum: \["explore", "verify", "install", "mutate", "scaffold", "run"\]/);
 });
 
-test("declared verify certifies on green; declared non-verify is never regex-promoted", () => {
-  const certifies = load("_evidenceCertifies", {
-    _looksLikeVerificationCommand: (c) => /build/.test(c),
-    _runtimeCommandKinds: () => [],
-  });
-  // A verification the regex could never recognise (custom script) now certifies.
+test("declared verify certifies on green; nothing else does", () => {
+  const certifies = load("_evidenceCertifies");
+  // A verification no regex could recognise now certifies.
   assert.equal(certifies({ command: "python check_invariants.py", purpose: "verify", implementationVersion: 1, ok: true }, 1), true);
-  // A command declared as `run` must not be reinterpreted as verification because its
-  // TEXT happens to contain "build".
+  // Declared as something else → not verification, regardless of its text.
   assert.equal(certifies({ command: "node build_report.js", purpose: "run", implementationVersion: 1, ok: true }, 1), false);
-  // No declaration → the floor still works.
-  assert.equal(certifies({ command: "npm run build", implementationVersion: 1, ok: true }, 1), true);
-  // Declared verify still cannot certify a red exit.
+  // Undeclared → not verification either. The floor is gone by design.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 1, ok: true }, 1), false);
   assert.equal(certifies({ command: "python check.py", purpose: "verify", implementationVersion: 1, ok: true, exitCode: 1 }, 1), false);
 });
 
-test("declared mutate/scaffold arms accounting the classifiers cannot see", () => {
+test("declared mutate/scaffold arms accounting no classifier could see", () => {
   const mutates = load("_toolMutatesWorkspace", {
     _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
-    _looksLikeWorkspaceMutationCommand: () => false,
-    _looksLikeScaffoldCommand: () => false,
     _mcpMutationHint: () => false,
   });
-  // Invisible to every classifier; visible via declaration.
+  // A generator invisible to any text rule, visible by declaration.
   assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "mutate" }, {}), true);
-  assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "explore" }, {}), false,
-    "declared explore with no classifier signal stays read-only");
-  // Mis-declaration cannot SUPPRESS the classifier: explore + classifier-mutating → mutated.
-  const mutates2 = load("_toolMutatesWorkspace", {
-    _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
-    _looksLikeWorkspaceMutationCommand: () => true,
-    _looksLikeScaffoldCommand: () => false,
-    _mcpMutationHint: () => false,
-  });
-  assert.equal(mutates2({ type: "cmd", command: "sed -i x f.ts", purpose: "explore" }, {}), true,
-    "declaration adds signal, never subtracts");
+  assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "explore" }, {}), false);
+  // …and the observed fact overrules a wrong declaration in the safe direction.
+  assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "explore" }, { _fsDelta: true }), true,
+    "declaration adds signal, the watcher fact cannot be suppressed by it");
 });
 
 test("the checkpoint route runs with phase-scoped deadlines", () => {
