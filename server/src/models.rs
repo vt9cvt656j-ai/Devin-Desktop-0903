@@ -8578,11 +8578,21 @@ mod audit_regression_tests {
         assert_eq!(body["stream_options"]["foo"], json!("bar"));
     }
 
+    /// I18N_PACK_CACHE is one process-global, and the test harness runs tests on
+    /// parallel threads — so the flood test below can evict another test's entry
+    /// between its put and its get. That was a real 1-in-~75 flake (caught twice in a
+    /// 150-run hunt): `round_trips_a_fresh_entry` observed None for a key it had just
+    /// inserted, because `is_bounded` was mid-flood on another thread. Every test that
+    /// touches the cache takes this lock; `into_inner` on poison keeps one failing
+    /// test from cascading into the others.
+    static I18N_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The pack cache holds ~630KB per entry and its key is a hash of the request, so
     /// a caller varying one character misses every time. Unbounded, that OOMs the
     /// gateway before the upstream bill even becomes the bigger problem.
     #[test]
     fn i18n_pack_cache_is_bounded() {
+        let _serial = I18N_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for i in 0..(I18N_PACK_CACHE_MAX_ENTRIES * 3) {
             i18n_pack_cache_put(format!("k{i}"), json!({ "n": i }));
         }
@@ -8595,6 +8605,7 @@ mod audit_regression_tests {
 
     #[test]
     fn i18n_pack_cache_round_trips_a_fresh_entry() {
+        let _serial = I18N_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         i18n_pack_cache_put("fresh-key".into(), json!({ "ok": true }));
         assert_eq!(
             i18n_pack_cache_get("fresh-key"),
