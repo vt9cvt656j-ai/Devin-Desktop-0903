@@ -17612,3 +17612,51 @@ test("the checkpoint route runs with phase-scoped deadlines", () => {
   assert.match(SRC, /Math\.max\(1000, deadlineMs \| 0\)/,
     "…and actually use it for the abort timer");
 });
+
+// ---------------------------------------------------------------------------
+// A red build keeps the loop fixing — it does not finish on a broken tree.
+//
+// The screenshot bug: `tsc -b` exited nonzero (13 TS errors), the LSP never mirrored
+// those errors, so the diagnostic-driven loop called the tree clean and finished. The
+// build's exit code is the ground truth (Warp: terminal is where verification happens;
+// Cursor: read stderr, fix, re-run; Claude Code: a failing build is information the model
+// iterates on). _freshBuildFailure surfaces it from the evidence the loop already holds.
+// ---------------------------------------------------------------------------
+test("_freshBuildFailure finds a declared verification that exited nonzero at this edit count", () => {
+  const fresh = load("_freshBuildFailure");
+  const run = { _executionEvidence: [
+    { purpose: "verify", command: "npm run build", exitCode: 0, implementationVersion: 2 }, // green, older
+    { purpose: "run", command: "node app.js", exitCode: 1, implementationVersion: 3 },      // failed but not a verify
+    { purpose: "verify", command: "tsc -b", exitCode: 2, implementationVersion: 3 },        // the real red build
+  ] };
+  const hit = fresh(run, 3);
+  assert.ok(hit && hit.command === "tsc -b", "the newest failed verification at this edit count");
+  assert.equal(hit.exitCode, 2);
+  // A green build at the current edit count → nothing to block on.
+  assert.equal(fresh({ _executionEvidence: [
+    { purpose: "verify", command: "tsc -b", exitCode: 0, implementationVersion: 3 },
+  ] }, 3), null);
+  // A failure that PREDATES the latest edit is stale — the code changed since.
+  assert.equal(fresh({ _executionEvidence: [
+    { purpose: "verify", command: "tsc -b", exitCode: 2, implementationVersion: 1 },
+  ] }, 5), null);
+  // A non-verify command that failed is not a build failure (it's reviewed elsewhere).
+  assert.equal(fresh({ _executionEvidence: [
+    { purpose: "run", command: "node crawler.js", exitCode: 1, implementationVersion: 3 },
+  ] }, 3), null);
+  assert.equal(fresh({}, 1), null);
+});
+
+test("the agent loop keeps fixing a red build, bounded, then finishes honestly", () => {
+  const loop = extractFn("_runAgenticLoop");
+  // The build-failure signal drives a nudge + continue (keep fixing), like _diagnosticBlock.
+  assert.match(loop, /const _buildFail = _freshBuildFailure\(run, _implOps\);/);
+  assert.match(loop, /if \(buildFixAttempts < 6\) \{[\s\S]{0,400}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
+    "a fresh red build must feed stderr back and continue, not finish");
+  // Bounded: past the budget it records an honest incomplete instead of thrashing.
+  assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "build_failing"/,
+    "an unfixable build must converge to an honest incomplete");
+  // The nudge carries the real exit code and stderr — facts, not a keyword guess.
+  assert.match(loop, /退出码 \$\{_buildFail\.exitCode\}/);
+  assert.match(loop, /_buildFail\.stderr \|\| _buildFail\.stdout/);
+});
