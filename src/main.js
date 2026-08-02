@@ -20302,8 +20302,21 @@ function _looksLikeUserQuestion(text) {
   if (!lines.length || lines.every((line) => /^>/.test(line))) return false;
   const lastLine = lines[lines.length - 1].replace(/[*_`]+$/g, "").trim();
   if (/^(?:[“‘\"']).*(?:[”’\"'])$/.test(lastLine)) return false;
-  if (!/[？?](?:[)）\]】》」』\"'”’]*)\s*$/.test(lastLine)) return false;
+  // The mark does not have to be the FINAL character. Models close with a sign-off —
+  // "…还是想做点别的新东西？随时说 👋", "…which one? let me know 😊" — and requiring the
+  // line to END with ？ classified those as not-a-question. The run then refused to wait
+  // for the user and went off reading files instead of stopping. A short trailing tail is
+  // allowed, as long as it opens no new sentence (no further terminator inside it), which
+  // still rejects "Is that right? No, do X instead."
+  if (!/[？?](?:[)）\]】》」』\"'”’]*)\s*(?:[^？?。.!！\n]{0,20})?\s*$/.test(lastLine)) return false;
   if (/(?:难道|岂不是|不就是|这不是|怎么可能|何必|何尝|谁会|isn['’]t it|aren['’]t (?:we|you)|why would|who would|how could)/i.test(lastBlock)) return false;
+  // A-or-B choice questions are STRUCTURAL, not vocabulary: "…继续完善它，还是…新东西？"
+  // asks the user to pick, and no phrase from the list below appears in it. Missing this
+  // shape meant the run treated a direct choice as prose and kept working instead of
+  // waiting. The disjunction must sit in the questioning sentence itself, so it is tested
+  // against the last LINE rather than the whole block.
+  if (/(?:还是|或者)[^\n]{0,40}[？?]/.test(lastLine)) return true;
+  if (/\bor\b[^\n]{0,40}\?/i.test(lastLine)) return true;
   return /(?:要不要|需不需要|需要我|要我|是否(?:需要|继续|要)|请(?:选择|确认|告诉我)|哪个|哪种|哪条|你(?:想|希望|倾向|选择|选|要)|选哪|怎么选|继续吗|可以吗|行吗|should i|do you (?:want|prefer|need)|which (?:one|option|way)|would you like|please (?:choose|confirm|tell me))/i.test(lastBlock);
 }
 
