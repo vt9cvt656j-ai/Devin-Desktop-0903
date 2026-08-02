@@ -21348,7 +21348,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         requestConfig.ideRegion = _ideRegionCode();
         delete requestConfig.ideTools;
         providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock,
-          _agentLightTurn ? "" : _modelStyleTuning(config.model));
+          _agentLightTurn ? "" : (_modelStyleTuning(config.model) + _authContextBlock()));
       }
       const _mcTierPlain = requestConfig.customModelId ? null : _compressionTier();
       if (_mcTierPlain && !requestConfig.customModelId) {
@@ -33178,12 +33178,18 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _turnConfig.ideMode = ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
-        // Per-model tuning is client-side and must survive the bundled-prompt drop.
-        // Unconditional here: _agentModelTurn is only reached from the agent loop and
-        // sub-agents, i.e. always a full agent turn (sendPrompt owns the light-turn path
-        // and passes its own value at the other call site).
+        // Per-model tuning AND the authorization framing are client-side and must survive
+        // the bundled-prompt drop. _authContextBlock is what tells the model that reverse
+        // engineering, packet capture, scraping, and pen-testing / CTF on the user's OWN or
+        // AUTHORIZED systems are ordinary engineering — do it, don't lecture, don't ask if
+        // it's legal. It was being composed into the dropped fullPrompt and never sent, so
+        // gateway-routed models never saw it and over-refused exactly this legitimate work
+        // (the reason this IDE's users — pentesters, CTF, reverse-eng — kept hitting walls).
+        // The genuine line it still carries: no attacking unauthorized third parties, no
+        // mass credential theft. Unconditional here: _agentModelTurn is always a full agent
+        // turn (sendPrompt owns the light-turn path and passes its own value).
         _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock,
-          _modelStyleTuning(_turnConfig.model));
+          _modelStyleTuning(_turnConfig.model) + _authContextBlock());
       }
       // `_turnConfig` survives the outer retry loop. Always clear the previous attempt's handle
       // before rebuilding; otherwise a 409 recovery invalidates the Map but still resends the stale
