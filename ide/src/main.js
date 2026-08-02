@@ -38253,18 +38253,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           });
           if (_auValidation.advice) it._auAdvice = `\n\n〔提示·不拦截〕${_auValidation.advice}`;
         }
-        // 计划门：复杂工程任务在第一次落盘/副作用调用前，必须先用 update_plan 给出任务计划，
-        // 让用户在聊天里看到分步计划卡。只拦真正的 mutate/副作用调用（读取、诊断、验证、
-        // 依赖恢复照常放行），最多拦 2 次防死循环，之后放行不再纠缠。
+        // 计划提示（不拦截）：复杂工程任务首次落盘时若还没有计划，随本次结果附一条提示，
+        // 工具照常执行。原来是硬拦（"先列计划 · 未执行"），和已撤的 ask_user 硬禁、取证
+        // 拦截同一个病：拦截式打回白烧一轮，还把正确的行动（先跑构建看现状、先写第一个
+        // 文件）当错误惩罚——计划靠上下文引导，不靠拒绝工作来强迫。同 planGateNudges 预算。
         if (run && _runNeedsPlanGateNow(run, call) && planGateNudges < 2) {
           planGateNudges++;
-          const r = { type: call.type, path: call.path || "", content: call.type === "worker"
-            ? "[BLOCKED] 派 worker 前必须先用 update_plan 列出**工程全貌计划**：模块划分、每个角色（frontend/backend/database/test…）负责哪块、模块间接口契约、每块的验证点。这是编排的第一步——想清全貌再拆分，列完计划重新派发。"
-            : "[BLOCKED] 这是从零/完整交付级的大工程，动手前先用 update_plan 列出全貌路线图（模块/文件/顺序/验证点），让用户看到你要做什么。列完计划后重新执行这次被拦下的调用。" };
-          it.rawResult = r;
-          it._skipped = true;
-          _settleToolStep(step, r, "先列计划 · 未执行");
-          return _toolResultToString(call, r);
+          it._planAdvice = call.type === "worker"
+            ? "\n\n〔提示·不拦截〕这是复杂工程编排：建议先用 update_plan 列出全貌（模块划分、各角色负责哪块、接口契约、验证点），用户能在聊天里看到路线图，并行分工也更稳。"
+            : "\n\n〔提示·不拦截〕这是完整交付级的工程：建议尽快用 update_plan 列出路线图（模块/文件/顺序/验证点），让用户看到你要做什么。";
         }
         // 取证告知（不拦截）：工程语义要求外部参考的任务，首次写入时若还没取证，
         // 当场装载研究工具 schema + 强提醒一次，但写入**照常执行**——拦截式打回白烧
@@ -38516,6 +38513,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (run && run._planQualityNote) { _resultMsg += run._planQualityNote; run._planQualityNote = ""; }
         // ask_user 首轮软建议（仅非空工作区）：随用户回答一并带回，提醒后续能自查的信息自查。
         if (it._auAdvice) { _resultMsg += it._auAdvice; it._auAdvice = ""; }
+        // 计划提示与 ask_user 软建议同通道：附在真实工具结果后，不替代结果。
+        if (it._planAdvice) { _resultMsg += it._planAdvice; it._planAdvice = ""; }
         return _resultMsg;
       };
 
@@ -38621,15 +38620,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           return message;
         }
         const isWorker = it.tc.name === "run_worker";
-        const planIssue = isWorker && _runNeedsPlanGateNow(run, { type: "write" }) && planGateNudges < 2 ? "尚未创建任务计划" : "";
-        if (planIssue) {
+        // 同上：worker 派发前没计划 → 附提示不拦截。拦截让"先派一个 worker 探路"这类
+        // 合理动作白烧一轮；worker 本身有 scope 硬边界兜底，计划不是安全前提。
+        if (isWorker && _runNeedsPlanGateNow(run, { type: "write" }) && planGateNudges < 2) {
           planGateNudges++;
-          const message = `[BLOCKED] 这是复杂工程任务，启动写入型 worker 前需要任务计划：${planIssue}。先调用 update_plan 列出具体文件/步骤/验证点，再重新启动 worker。`;
-          it.rawResult = { type: "worker", path: it.call.description || "worker", content: message };
-          it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
-          body.appendChild(it.step);
-          _settleToolStep(it.step, it.rawResult, "先列计划 · 未执行");
-          return message;
+          it._planAdvice = "\n\n〔提示·不拦截〕启动写入型 worker 前建议先 update_plan 列出具体文件/步骤/验证点——用户能看到路线图，后续 worker 分工也以它为契约。";
         }
         const uiReadinessIssue = isWorker
           ? _uiImplementationReadinessNudge(run, planSteps, { type: "worker", scope: it.call.scope || [] })
