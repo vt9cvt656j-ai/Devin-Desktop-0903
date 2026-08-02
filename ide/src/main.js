@@ -25922,7 +25922,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "edit_file", description: "对已有文件做精确替换：把 old_string 替换成 new_string。", parameters: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string", description: "要被替换的原文，需与文件内容逐字符一致" }, new_string: { type: "string", description: "替换后的新内容" }, replace_all: { type: "boolean", description: "为 true 时替换所有匹配；默认只替换唯一的一处" } }, required: ["path", "old_string", "new_string"] } } },
       { type: "function", function: { name: "multi_edit", description: "对同一个文件做多处精确替换：edits 是一组 {old_string, new_string, replace_all?}，按顺序原子应用（任一处定位失败则整体不写入、报错）。", parameters: { type: "object", properties: { path: { type: "string" }, edits: { type: "array", description: "有序的替换列表", items: { type: "object", properties: { old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } }, required: ["old_string", "new_string"] } } }, required: ["path", "edits"] } } },
       { type: "function", function: { name: "write_file", description: "新建文件或整文件重写。仅用于新建或彻底重写；改局部请用 edit_file。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "本轮已确认的精确文件路径；相对路径固定基于本次任务的工作区根" }, content: { type: "string", minLength: 1, description: "要写入的完整非空 UTF-8 文件内容，不能省略或用占位内容" } }, required: ["path", "content"], additionalProperties: false } } },
-      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条会结束的短命令并返回退出码/输出（装依赖、跑测试、构建、git 等）。不要用它前台启动 dev server/watch/监听/REPL 这类持续任务；持续任务必须用 run_in_terminal，随后 read_logs/read_terminal 看日志，必要时 background_monitor 等端口/URL/文件 ready。", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_cmd", description: "在工作区里运行一条会结束的短命令并返回退出码/输出（装依赖、跑测试、构建、git 等）。不要用它前台启动 dev server/watch/监听/REPL 这类持续任务；持续任务必须用 run_in_terminal，随后 read_logs/read_terminal 看日志，必要时 background_monitor 等端口/URL/文件 ready。", parameters: { type: "object", properties: { command: { type: "string" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "这条命令的目的：explore=只读探查；verify=构建/测试/类型检查/lint 等一次性校验（退出码即结论）；install=装依赖；mutate=会修改工作区文件；scaffold=生成项目骨架；run=运行应用/脚本看行为。如实声明——verify+退出 0 记为验证证据，mutate/scaffold 会重新武装验证义务。" } }, required: ["command"] } } },
       { type: "function", function: { name: "deploy_site", description: "**一键把做好的网站部署上线**——自动 npm run build + 上传服务器 + **自动分配一个 HTTPS 二级域名 `名字.michaelide.xyz`**（泛解析 + 泛域名证书早已配好，用户完全无需手动配 DNS / 去域名控制台加 A 记录），返回可直接访问分享的网址（形如 https://my-portfolio.michaelide.xyz/）。**用户说「绑定/解析个二级域名、自定义域名、上线分享」时就直接用这个工具——二级域名是全自动的，别再反问用户域名是什么、也别让他去域名后台手动加记录。** 做完官网想让用户真能打开分享时用（idea→设计→建站→上线 闭环最后一步）。", parameters: { type: "object", properties: { name: { type: "string", description: "站点名（短 slug，做 URL 路径，如 mrday / my-portfolio）" } }, required: ["name"] } } },
       { type: "function", function: { name: "delete_path", description: "删除工作区内的一个文件或目录（递归）。【何时用】清理废弃文件、重构移除旧模块时。【vs 替代】改名/移动用 move_path。【注意】务必确认路径存在且确实该删；不可逆操作。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要删除的文件或目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "move_path", description: "移动或重命名工作区内的文件/目录（from → to）。【何时用】重构改名、调整目录结构时。【vs 替代】保留原件用 copy_path。【注意】目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", minLength: 1, description: "源路径" }, to: { type: "string", minLength: 1, description: "目标路径" } }, required: ["from", "to"] } } },
@@ -27132,7 +27132,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "edit_file": return { type: "edit", path: args.path || "", oldString: args.old_string || "", newString: args.new_string || "", replaceAll: !!args.replace_all };
     case "multi_edit": return { type: "multiedit", path: args.path || "", edits: Array.isArray(args.edits) ? args.edits : [] };
     case "write_file": return { type: "write", path: args.path || "", content: args.content || "", contentProvided: Object.prototype.hasOwnProperty.call(args, "content") };
-    case "run_cmd": return { type: "cmd", command: args.command || "" };
+    case "run_cmd": {
+      const _purpose = ["explore", "verify", "install", "mutate", "scaffold", "run"].includes(args.purpose) ? args.purpose : "";
+      return { type: "cmd", command: args.command || "", purpose: _purpose };
+    }
     case "deploy_site": {
       // 安全部署：构建 → 打包 → 带用户 JWT POST 到网关 /api/deploy（账号绑定 + 白名单 + 限大小 +
       // 防路径穿越安全解压 + 按账号隔离 + 纯静态无执行）。绝不给用户 SSH/root——多租户安全的关键。
@@ -32224,6 +32227,7 @@ function _commandWroteCode(call, result) {
   // Bare `npm/pnpm/yarn/bun init` (flags only, no initializer) writes package.json and
   // nothing else — a workspace mutation, but not CODE, so it must not arm the build/test
   // obligation. `npm init <initializer>` is `npm create` and scaffolds for real.
+  if (call.purpose === "scaffold") return true;
   if (_looksLikeScaffoldCommand(cmd)) {
     return !/^(?:npm|pnpm|yarn|bun)\s+init\s*(?:-{1,2}[\w-]+(?:[=\s]\S*)?\s*)*$/i.test(cmd);
   }
@@ -32249,6 +32253,11 @@ function _toolMutatesWorkspace(call, result) {
   // for plan-step advancement, so a scaffolded project had didMutate=false and _implOps=0
   // — every verification gate inert on exactly the runs that create the most code.
   if (call.type === "cmd" || call.type === "termtask") {
+    // Declared intent ADDS signal (a `python generate.py` that writes files is invisible
+    // to every classifier); it never subtracts — a declared "explore" that the classifier
+    // recognises as mutating still counts, so mis-declaration cannot suppress the
+    // verification-obligation re-arm.
+    if (call.purpose === "mutate" || call.purpose === "scaffold" || call.purpose === "install") return true;
     return _looksLikeWorkspaceMutationCommand(call.command) || _looksLikeScaffoldCommand(call.command);
   }
   // MCP names are only approval hints. A remote GitHub `create_or_update_file`
@@ -36278,7 +36287,7 @@ function _isWeakModel(modelId) {
 // 注册表（含 MCP 已发现工具），根据任务含义和新证据选择下一阶段需要的能力；本地代码
 // 只把返回名称精确映射回真实 schema，再放进有界窗口。没有模型响应时不猜、不用关键词
 // 代替语义，只保留 search_tools 让主模型自行扩展。
-async function _semanticToolOrchestrator({ config, task, profile, phase, progress, evidence, toolRegistry, loadedTools = [], toolHistory = [], toolHistoryTurnIndex = 0 }) {
+async function _semanticToolOrchestrator({ config, task, profile, phase, progress, evidence, toolRegistry, loadedTools = [], toolHistory = [], toolHistoryTurnIndex = 0, deadlineMs = 20000 }) {
   // JSON stringify cache for profile and loadedTools (avoid re-serializing unchanged data)
   let _profileCache = null;
   let _profileStrCache = "";
@@ -36334,7 +36343,10 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
   const plannerModel = config.model;
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const to = ctrl ? setTimeout(() => ctrl.abort(), 20000) : null;
+    // Phase-scoped: the initial route must fit inside its caller's 3s race instead of
+    // losing it and then burning quota in the background; batch-checkpoint routes must
+    // never stall the loop for the worst-case planner.
+    const to = ctrl ? setTimeout(() => ctrl.abort(), Math.max(1000, deadlineMs | 0)) : null;
     const res = await fetch(_chatCompletionsUrl(config.baseUrl), {
       method: "POST",
       headers: {
@@ -36851,6 +36863,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 注入结构化工具历史摘要（事实记账，判断权留给模型）
       toolHistory: run._toolLedger?.entries || [],
       toolHistoryTurnIndex: run._toolLedger?.turnIndex || 0,
+      // initial must land inside its caller's 3s race; checkpoint/recovery routes are
+      // latency-sensitive (they used to be able to stall a tool batch ~20s); steering
+      // is the user actively waiting.
+      deadlineMs: phase === "initial" ? 2800 : phase === "after_tools" ? 12000 : 8000,
     });
     if (!decision) return null;
     // 工具规划思考链可视化已关闭：不再渲染独立的🧠工具规划卡片，消除冗余思考和 UI 噪音。
@@ -38472,7 +38488,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // It used to key on the command's shape alone, so `npm run build` exiting non-zero
         // was recorded as verification — a failing build certified the code it just proved
         // broken, which is the most direct way for the loop to deliver code that does not run.
-        if (call.type === "cmd" && _looksLikeVerificationCommand(call.command)
+        // Declaration-first (Claude Code style): the model states the command's purpose
+        // structurally in the tool call; the harness verifies through the exit code. The
+        // regex classifier remains ONLY as a floor for models that omit the field — it is
+        // no longer the judge for models that declare.
+        if (call.type === "cmd"
+            && (call.purpose === "verify" || (!call.purpose && _looksLikeVerificationCommand(call.command)))
             && _toolExecutionSucceeded(call, result)) {
           call.verification = true;
           if (result && typeof result === "object") result.verification = true;
@@ -38488,6 +38509,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (run && executionEvidence) {
           run._executionEvidence.push({
             ...executionEvidence,
+            purpose: call.purpose || "",
             implementationVersion: _implOps,
             // Exit status travels with the evidence: the finish gate matches on command
             // shape, so it cannot tell a green build from a red one without this.
@@ -39294,7 +39316,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           exitCode: it?.rawResult?.exitCode ?? it?.rawResult?.code ?? null,
           running: it?.rawResult?.running === true,
         })));
-        await _routeAgentTools("after_tools", routingEvidence);
+        // Off the serial path: this checkpoint used to be awaited every batch, so a slow
+        // planner stalled the whole loop for up to its full deadline. The route mutates
+        // toolSchemas in place through the payload window, so whatever it admits is
+        // simply present for the NEXT model turn; the model's own search_tools remains
+        // the synchronous escape hatch when it knows what it is missing.
+        void _routeAgentTools("after_tools", routingEvidence).catch(() => {});
       }
 
       // Investigate-before-edit: edited existing code without reading/searching anything
@@ -41566,6 +41593,12 @@ function _evidenceCertifies(e, implOps) {
   // its previous meaning.
   if (typeof e.exitCode === "number" && e.exitCode !== 0) return false;
   if (e.verification === true) return true;
+  // Declaration-first: a command the model declared as verification certifies on green;
+  // one it declared as something ELSE (run/mutate/install/explore) must not be
+  // reinterpreted as verification by pattern-matching its text. The regex floor applies
+  // only when no declaration exists.
+  if (e.purpose === "verify") return true;
+  if (e.purpose) return false;
   if (_looksLikeVerificationCommand(cmd)) return true;
   return _runtimeCommandKinds(cmd, false).some((k) =>
     ["build", "test", "run", "package"].includes(k));

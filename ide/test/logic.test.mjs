@@ -8608,8 +8608,13 @@ test("tool hints stay capability-neutral while the semantic orchestrator control
     "the first agent turn must not wait for an extra routing-model request");
   assert.match(loop, /await _routeAgentTools\("steering", "", _steerSemanticText\)/,
     "mid-run user intent changes must reroute tools immediately");
-  assert.match(loop, /await _routeAgentTools\("after_tools", routingEvidence\)/,
-    "every novel tool-result batch must create another semantic routing checkpoint");
+  // The checkpoint still fires per novel batch, but OFF the serial path: awaiting it let
+  // a slow planner stall every tool batch for up to its full deadline. It mutates
+  // toolSchemas in place, so admissions are simply present for the next turn.
+  assert.match(loop, /void _routeAgentTools\("after_tools", routingEvidence\)\.catch\(\(\) => \{\}\)/,
+    "every novel tool-result batch must still create a checkpoint — asynchronously");
+  assert.doesNotMatch(loop, /await _routeAgentTools\("after_tools"/,
+    "the checkpoint must never block the loop");
   assert.doesNotMatch(loop, /_routeAgentTools\(\s*"mcp_discovered"/,
     "background MCP discovery must not add a planner round trip or mutate the first tool payload");
   assert.match(loop, /_routeAgentTools\(\s*"unknown_tool"/,
@@ -17626,4 +17631,73 @@ test("stale write-preview re-bases instead of blocking; CAS still guards the wri
   // Guard 2: the write itself is still compare-and-swap against freshly-read disk.
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
     "a genuinely concurrent change must still fail at the CAS write");
+});
+
+// ---------------------------------------------------------------------------
+// Declaration-first command semantics (the anti-keyword architecture).
+//
+// The model states each command's purpose STRUCTURALLY in the tool call (an enum arg —
+// structured output, not text sniffing); the harness verifies through exit codes. The
+// regex classifiers survive only as a compatibility floor for models that omit the
+// field, and can never overrule an explicit declaration.
+// ---------------------------------------------------------------------------
+test("run_cmd purpose is validated structurally and rides the call", () => {
+  // The mapper has broad deps; extract just its run_cmd case and execute it.
+  const m = SRC.match(/case "run_cmd": \{\s*([\s\S]*?return \{ type: "cmd"[^\n]*)/);
+  assert.ok(m, "the run_cmd mapper case must exist");
+  const caseFn = new Function("args", m[1].replace(/^\s*const _purpose/, "const _purpose"));
+  assert.equal(caseFn({ command: "npx vite build", purpose: "verify" }).purpose, "verify");
+  assert.equal(caseFn({ command: "ls" }).purpose, "", "absent declaration → empty, floor applies");
+  assert.equal(caseFn({ command: "ls", purpose: "hack the gibson" }).purpose, "",
+    "an invalid enum value is dropped, not trusted");
+  // And the schema offers the field so models can actually declare.
+  assert.match(SRC, /purpose: \{ type: "string", enum: \["explore", "verify", "install", "mutate", "scaffold", "run"\]/);
+});
+
+test("declared verify certifies on green; declared non-verify is never regex-promoted", () => {
+  const certifies = load("_evidenceCertifies", {
+    _looksLikeVerificationCommand: (c) => /build/.test(c),
+    _runtimeCommandKinds: () => [],
+  });
+  // A verification the regex could never recognise (custom script) now certifies.
+  assert.equal(certifies({ command: "python check_invariants.py", purpose: "verify", implementationVersion: 1, ok: true }, 1), true);
+  // A command declared as `run` must not be reinterpreted as verification because its
+  // TEXT happens to contain "build".
+  assert.equal(certifies({ command: "node build_report.js", purpose: "run", implementationVersion: 1, ok: true }, 1), false);
+  // No declaration → the floor still works.
+  assert.equal(certifies({ command: "npm run build", implementationVersion: 1, ok: true }, 1), true);
+  // Declared verify still cannot certify a red exit.
+  assert.equal(certifies({ command: "python check.py", purpose: "verify", implementationVersion: 1, ok: true, exitCode: 1 }, 1), false);
+});
+
+test("declared mutate/scaffold arms accounting the classifiers cannot see", () => {
+  const mutates = load("_toolMutatesWorkspace", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
+    _looksLikeWorkspaceMutationCommand: () => false,
+    _looksLikeScaffoldCommand: () => false,
+    _mcpMutationHint: () => false,
+  });
+  // Invisible to every classifier; visible via declaration.
+  assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "mutate" }, {}), true);
+  assert.equal(mutates({ type: "cmd", command: "python generate_project.py", purpose: "explore" }, {}), false,
+    "declared explore with no classifier signal stays read-only");
+  // Mis-declaration cannot SUPPRESS the classifier: explore + classifier-mutating → mutated.
+  const mutates2 = load("_toolMutatesWorkspace", {
+    _WORKSPACE_MUTATING_TYPES: new Set(["write"]),
+    _looksLikeWorkspaceMutationCommand: () => true,
+    _looksLikeScaffoldCommand: () => false,
+    _mcpMutationHint: () => false,
+  });
+  assert.equal(mutates2({ type: "cmd", command: "sed -i x f.ts", purpose: "explore" }, {}), true,
+    "declaration adds signal, never subtracts");
+});
+
+test("the checkpoint route runs with phase-scoped deadlines", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /deadlineMs: phase === "initial" \? 2800 : phase === "after_tools" \? 12000 : 8000/,
+    "the initial route must fit inside its caller's 3s race");
+  assert.match(SRC, /deadlineMs = 20000/,
+    "the orchestrator must take the deadline as a parameter");
+  assert.match(SRC, /Math\.max\(1000, deadlineMs \| 0\)/,
+    "…and actually use it for the abort timer");
 });
