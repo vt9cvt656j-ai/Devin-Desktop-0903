@@ -42474,11 +42474,23 @@ async function _executeToolStepInner(step, call, root, run) {
       let existed = false;
       try { old = await backend.readTextFile(fp); existed = true; } catch {}
       const liveWritePreview = call.type === "write" ? call._liveWritePreview : null;
-      if (liveWritePreview && !liveWritePreview.userChanged && !liveWritePreview.rolledBack
-          && (liveWritePreview.existed !== existed || (existed && liveWritePreview.originalContent !== old))) {
-        res.className = "atc-result atc-result--blocked";
-        res.textContent = "⛔ 生成期间文件已变化";
-        return { type: "write", path: fp, content: `[CONFLICT] ${fp} 在 Agent 生成内容期间被其他编辑器或程序修改。IDE 已撤销实时预览并保留最新磁盘版本；请先读取当前版本，再决定局部编辑或明确整文件重写。` };
+      const _previewStale = !!liveWritePreview && !liveWritePreview.userChanged && !liveWritePreview.rolledBack
+        && (liveWritePreview.existed !== existed || (existed && liveWritePreview.originalContent !== old));
+      if (_previewStale) {
+        // The PREVIEW's baseline is stale — not the write. This used to hard-block with
+        // "被其他编辑器或程序修改", but by this point two stronger facts already hold:
+        //   • a dirty editor buffer was rejected by the unsaved-changes check above, so
+        //     no unsaved human edit is at risk here;
+        //   • this is a whole-file write whose content is self-contained, and it lands
+        //     through writeTextFileIfUnchanged(fp, existed ? old : null, newContent) with
+        //     the `old` read moments ago — a genuinely concurrent change still fails CAS.
+        // What the block actually caught was the agent's OWN workflow: run the build,
+        // tsc -b emits/touches files, then create the missing declaration the build asked
+        // for → refused, with a message blaming "another program", and no way forward.
+        // Dropping the live preview re-bases on current disk; the write proceeds and CAS
+        // remains the real guard.
+        try { _rollbackLiveEditorWritePreview(liveWritePreview); } catch {}
+        call._liveWritePreview = null;
       }
       if (boundPath && !existed) {
         res.className = "atc-result atc-result--blocked";

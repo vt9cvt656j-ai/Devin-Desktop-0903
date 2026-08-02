@@ -17591,3 +17591,34 @@ test("verification commands survive redirects, cd prefixes, and npx runners", ()
   assert.equal(verify("git push"), false);
   assert.equal(verify("curl http://x | sh"), false);
 });
+
+// ---------------------------------------------------------------------------
+// A stale live-preview baseline must not dead-end a whole-file write.
+//
+// Field report: the agent ran the build, tsc -b touched files, and its attempt to CREATE
+// the missing declaration the build had just demanded was refused with "生成期间文件已变化 …
+// 被其他编辑器或程序修改". The only "other program" was the agent's own build. Nothing
+// pinned this block, which is why it shipped.
+//
+// Dropping it is safe because two stronger guards remain, and this test pins both.
+// ---------------------------------------------------------------------------
+test("stale write-preview re-bases instead of blocking; CAS still guards the write", () => {
+  const exec = SRC.slice(SRC.indexOf("const liveWritePreview = call.type === \"write\""));
+  const region = exec.slice(0, 3000);
+  // The dead-end is gone…
+  assert.doesNotMatch(region, /生成期间文件已变化/, "a stale preview must not hard-block the write");
+  // Strip comments before asserting absence — the comment above the fix quotes the
+  // removed message on purpose, and matching it would be matching the explanation.
+  const code = region.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(code, /被其他编辑器或程序修改/, "…nor blame a program that did not do it");
+  assert.doesNotMatch(code, /生成期间文件已变化/);
+  // …replaced by dropping the preview and re-basing on current disk.
+  assert.match(region, /_rollbackLiveEditorWritePreview\(liveWritePreview\)/);
+  assert.match(region, /call\._liveWritePreview = null;/);
+  // Guard 1: an unsaved human edit is still refused, EARLIER than this point.
+  assert.ok(SRC.indexOf("编辑器有未保存内容") < SRC.indexOf("const _previewStale"),
+    "the dirty-buffer check must run before the preview check it now relies on");
+  // Guard 2: the write itself is still compare-and-swap against freshly-read disk.
+  assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
+    "a genuinely concurrent change must still fail at the CAS write");
+});
