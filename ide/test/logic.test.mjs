@@ -17444,3 +17444,109 @@ test("review: bare npm/yarn init is a mutation but not a code obligation", () =>
     "init WITH an initializer is npm create — a real scaffold");
   assert.equal(wroteCode({ type: "cmd", command: "npm create vite@latest app" }, ok), true);
 });
+
+// ---------------------------------------------------------------------------
+// "The directory exists but the IDE insists the workspace is empty."
+//
+// Two independent ways the empty-root registration went stale:
+//   1. The startup probe is fire-and-forget. A directory created while its readDir was
+//      in flight landed FIRST, then the stale empty snapshot overwrote reality — after
+//      which every read into the workspace was short-circuited with
+//      [SKIPPED_EMPTY_WORKSPACE] against a workspace the model had just populated.
+//   2. mkdir on an existing directory returned "已存在" without clearing the flag, so a
+//      directory created by a shell command / earlier turn never lifted the verdict.
+// ---------------------------------------------------------------------------
+test("empty-root probe: a mutation during the probe invalidates its snapshot", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const _emptyProbeTick = run\._fsMutTick \|\| 0;/,
+    "the probe must capture the mutation tick before awaiting");
+  assert.match(loop, /if \(run\._didMutate \|\| \(run\._fsMutTick \|\| 0\) !== _emptyProbeTick\) return;/,
+    "a stale snapshot must be dropped, not applied");
+  // The guard has to sit BEFORE the marking call, or it guards nothing.
+  const probeIdx = loop.indexOf("_emptyProbeTick = run._fsMutTick");
+  const guardIdx = loop.indexOf("!== _emptyProbeTick) return;");
+  const markIdx = loop.indexOf("_markRunRootEmpty(run, root, root, entries)");
+  assert.ok(probeIdx >= 0 && probeIdx < guardIdx && guardIdx < markIdx,
+    "capture → guard → mark, in that order");
+});
+
+test("mkdir on an existing directory still clears the empty-root registration", () => {
+  const start = SRC.indexOf('} else if (call.type === "mkdir")');
+  assert.ok(start > 0, "the mkdir branch must exist");
+  const branch = SRC.slice(start, start + 2000);
+  const existsIdx = branch.indexOf("if (alreadyExists)");
+  const clearIdx = branch.indexOf("_clearRunEmptyRoot(run, fp)");
+  const returnIdx = branch.indexOf("无需重复创建");
+  assert.ok(existsIdx >= 0 && clearIdx > existsIdx && clearIdx < returnIdx,
+    "the already-exists branch must clear the flag before returning");
+  // …and the create path must keep doing so too.
+  assert.equal((branch.match(/_clearRunEmptyRoot\(run, fp\)/g) || []).length, 2,
+    "both the already-exists and the freshly-created paths clear it");
+});
+
+test("the file-not-found toast carries no agent coaching", () => {
+  const rust = readFileSync(join(HERE, "../src-tauri/src/files.rs"), "utf8");
+  const notFound = rust.slice(rust.indexOf("ErrorKind::NotFound =>"), rust.indexOf("PermissionDenied"));
+  assert.match(notFound, /文件不存在：\{\}/, "it must still name the missing path");
+  assert.doesNotMatch(notFound, /list_dir|find_files|臆造/,
+    "model instructions must not ride in a user-facing toast — the model gets pathGuidance instead");
+  // The model's channel keeps the guidance.
+  assert.match(SRC, /pathGuidance = "[^"]*list_dir \/ find_files[^"]*"/,
+    "the tool-result channel must still coach the model");
+});
+
+// ---------------------------------------------------------------------------
+// Per-model tuning must actually REACH the model.
+//
+// messages[0] holds `sysPrompt + _modelStyleTuning(model) + skillsBlock + …`, and the L0
+// path drops messages[0] because the gateway assembles its own base prompt. It re-added
+// only skillsBlock — so every byte of per-model tuning, including the write→read and
+// don't-invent-paths discipline in _AGENT_RECOVERY_TUNING, was rebuilt every turn and
+// thrown away for every gateway-routed model. "Tuning the model" was a no-op.
+// ---------------------------------------------------------------------------
+test("L0 strip keeps client-side tuning while still dropping the bundled prompt", () => {
+  const preserve = load("_l0MessagesWithSkills");
+  const out = preserve([
+    { role: "system", content: "private bundled prompt" },
+    { role: "user", content: "build it" },
+  ], "SKILLS", "PER-MODEL TUNING");
+  assert.equal(out[0].role, "system");
+  assert.match(out[0].content, /PER-MODEL TUNING/, "tuning must survive the strip");
+  assert.match(out[0].content, /SKILLS/, "skills must still survive");
+  assert.ok(!out.some((m) => m.content.includes("private bundled prompt")),
+    "the locally-composed base prompt must still drop — the gateway sends its own");
+  assert.equal(out[1].content, "build it");
+  // Tuning alone, with no skills, still yields a system message.
+  const tuningOnly = preserve([{ role: "system", content: "bundled" }, { role: "user", content: "x" }], "", "TUNING");
+  assert.match(tuningOnly[0].content, /TUNING/);
+  // Neither → no empty system message injected.
+  const neither = preserve([{ role: "system", content: "bundled" }, { role: "user", content: "x" }], "", "");
+  assert.equal(neither.length, 1);
+  assert.equal(neither[0].role, "user");
+});
+
+test("both L0 call sites pass the per-model tuning", () => {
+  assert.match(SRC, /_l0MessagesWithSkills\(providerMessages, skillsBlock,\s*\n\s*_modelStyleTuning\(_turnConfig\.model\)\)/,
+    "the agent path must pass tuning");
+  assert.match(SRC, /_l0MessagesWithSkills\(messages, _agentLightTurn \? "" : skillsBlock,\s*\n\s*_agentLightTurn \? "" : _modelStyleTuning\(config\.model\)\)/,
+    "the plain-chat path must pass tuning except on a light turn");
+  assert.doesNotMatch(SRC, /_l0MessagesWithSkills\([^)]*\);(?![\s\S]{0,200}_modelStyleTuning)/,
+    "no call site may drop tuning silently");
+});
+
+test("failure caches do not outlive the fact that produced them", () => {
+  // A path that now exists must leave the negative cache, or the 2-strike gate refuses
+  // reads of a file the agent itself just wrote.
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /if \(run\?\._failedPathAttempts\) \{[\s\S]{0,200}_failedPathAttempts\.delete/,
+    "a successful mutation must clear that path's miss count");
+  assert.match(loop, /\[mutationPath, actualPath, it\.call\?\.path\]/,
+    "clear under every key the miss could have been recorded with");
+  // The 3-strike tool memory is module-level; it must reset per run, or three invented
+  // paths permanently brick read_file for the whole app session.
+  assert.match(loop, /_toolFailureCounts\.clear\(\);/,
+    "each run starts with a clean failure ledger");
+  const clearIdx = loop.indexOf("_toolFailureCounts.clear()");
+  const loopIdx = loop.indexOf("for (let iter = 0");
+  assert.ok(clearIdx >= 0 && clearIdx < loopIdx, "the reset must happen before the loop starts");
+});

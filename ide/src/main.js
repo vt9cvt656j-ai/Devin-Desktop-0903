@@ -21317,7 +21317,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         requestConfig.ideUtcOffsetMinutes = turnTime.utcOffsetMinutes;
         requestConfig.ideRegion = _ideRegionCode();
         delete requestConfig.ideTools;
-        providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock);
+        providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock,
+          _agentLightTurn ? "" : _modelStyleTuning(config.model));
       }
       const _mcTierPlain = requestConfig.customModelId ? null : _compressionTier();
       if (_mcTierPlain && !requestConfig.customModelId) {
@@ -23028,11 +23029,26 @@ function _skillDiscoveryBases(projectRoot, home) {
 // L0 removes the bundled local system prompt and asks the gateway to restore it. User-authored
 // skill instructions are dynamic and unknown to the gateway, so preserve them as a separate
 // system message instead of accidentally stripping them with the private static prompt.
-function _l0MessagesWithSkills(messages, skillsBlock) {
+/**
+ * Drop the locally-composed system prompt (the gateway assembles its own) while KEEPING
+ * the client-side blocks that the gateway cannot produce.
+ *
+ * messages[0] is `sysPrompt + _modelStyleTuning(model) + skillsBlock + …`, and this
+ * function used to discard the whole thing and re-add only skillsBlock. That silently
+ * deleted every byte of per-model tuning on every turn, for every gateway-routed model —
+ * including _AGENT_RECOVERY_TUNING, which carries the write→read and don't-invent-paths
+ * discipline. "Tune the model" was a no-op: the text was rebuilt each turn and thrown away.
+ *
+ * `clientBlocks` is that surviving portion, passed in explicitly so the bundled prompt
+ * still drops (the gateway would otherwise receive two competing base prompts) and so the
+ * split is visible at the call site instead of implied.
+ */
+function _l0MessagesWithSkills(messages, skillsBlock, clientBlocks = "") {
   const source = Array.isArray(messages) ? messages : [];
   const out = source[0] && source[0].role === "system" ? source.slice(1) : source.slice();
-  const skillText = String(skillsBlock || "").trim();
-  if (skillText) out.unshift({ role: "system", content: skillText });
+  const head = [String(clientBlocks || "").trim(), String(skillsBlock || "").trim()]
+    .filter(Boolean).join("\n\n");
+  if (head) out.unshift({ role: "system", content: head });
   return out;
 }
 // Count badge on the Skills sidebar button so active skills are visible even when the panel is closed.
@@ -33073,7 +33089,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _turnConfig.ideMode = ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
-        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock);
+        // Per-model tuning is client-side and must survive the bundled-prompt drop.
+        // Unconditional here: _agentModelTurn is only reached from the agent loop and
+        // sub-agents, i.e. always a full agent turn (sendPrompt owns the light-turn path
+        // and passes its own value at the other call site).
+        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock,
+          _modelStyleTuning(_turnConfig.model));
       }
       // `_turnConfig` survives the outer retry loop. Always clear the previous attempt's handle
       // before rebuilding; otherwise a 409 recovery invalidates the Map but still resends the stale
@@ -36525,8 +36546,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // 旧项目残影让它乱探已删除的文件）。运行一启动就后台探一次根目录，空的立刻登记；
   // 首个工具执行前必然就位（模型首轮以秒计），写入/脚手架会 _clearRunEmptyRoot 自动解除。
   if (isAgent && root && backend?.readDir) {
+    // The listing below is a SNAPSHOT taken before the first tool runs. It is fire-and-
+    // forget, so a directory the model creates while it is in flight lands first and the
+    // stale "empty" verdict overwrites reality — after which the model is told
+    // "工作区根目录已确认为空" about a workspace it just populated, and every read there
+    // is short-circuited. Only trust the snapshot if nothing mutated while we waited.
+    const _emptyProbeTick = run._fsMutTick || 0;
     backend.readDir(root)
       .then((entries) => {
+        if (run._didMutate || (run._fsMutTick || 0) !== _emptyProbeTick) return;
         if (Array.isArray(entries)) {
           _markRunRootEmpty(run, root, root, entries);
           // 空目录起步事实：供下方“空项目行动门禁”判定。_emptyWorkspaceRoots 写入后会被
@@ -36553,6 +36581,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   _clearAgentReadCache(); // fresh file reads each run (read cache is shared; perf only)
+  // _toolFailureCounts is MODULE-level and had no reset anywhere: three failed read_file
+  // calls (trivial for a weak model inventing paths) permanently hard-blocked read_file
+  // for the rest of the APP session — every later run inherited the strikes, including
+  // runs in a different workspace. Failure history is evidence about one run, not the app.
+  _toolFailureCounts.clear();
 
   let finalErr = null;
   let summaryText = "";
@@ -39050,6 +39083,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
             _pad.modified.set(actualPath.split("/").pop(), _desc);
+            // A path that now EXISTS must leave the negative cache. The 2-strike gate at
+            // the top of _executeToolStepInner refuses reads of a path that missed twice —
+            // with "你已搜索过 N 次且不存在" — and only a successful list_dir cleared it. So
+            // read(x) → miss → miss → write(x) → read(x) was refused for a file the agent
+            // had just created, which is exactly the "it misidentifies things" symptom.
+            if (run?._failedPathAttempts) {
+              for (const key of [mutationPath, actualPath, it.call?.path]) {
+                if (key) run._failedPathAttempts.delete(String(key).trim());
+              }
+            }
             // Item 1: write 成功后清除同路径的 read_file 失败 toast（新文件先 read 再 write 场景）
             if (run?._readFailSteps?.has(mutationPath)) {
               try { run._readFailSteps.get(mutationPath)?.remove?.(); } catch {}
@@ -43780,6 +43823,11 @@ async function _executeToolStepInner(step, call, root, run) {
         let alreadyExists = false;
         try { await backend.readDir(fp); alreadyExists = true; } catch {}
         if (alreadyExists) {
+          // "Already there" is still proof the workspace is not empty. Skipping the clear
+          // here left the empty-root registration standing after a directory had been
+          // created (by a shell command, an earlier turn, or a retried mkdir), so the run
+          // kept insisting the workspace was empty and short-circuited reads into it.
+          _clearRunEmptyRoot(run, fp);
           res.className = "atc-result atc-result--ok"; res.textContent = "目录已存在";
           return { type: "mkdir", path: p, mutated: false, content: `目录 ${p} 已存在，无需重复创建。` };
         }
