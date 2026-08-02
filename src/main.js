@@ -37913,8 +37913,50 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             }
           }
         }
-        // A — 验证已改为 AI 自主判断：主循环不再强制代跑验证命令（_detectVerifyCmd/_runApprovedVerification），
-        // 该不该验证、何时收尾由 AI 在正常工具调用中自行决定。
+        // A — 自动验证：改了源码却没有验证证据时，IDE 自己把项目的真实检查命令跑掉，
+        // 不是回头催用户/催模型。命令来自 _detectVerifyCmd（按项目栈探测 + 存在性过滤，
+        // 探不到就什么都不做），退出码即结论：绿了直接记学分并清掉诊断，红了把真实
+        // stderr 交给上面的红构建循环去修。有界（verifyRuns < 3）防止在修不好的项目上空转。
+        if (didMutate && !_verifyExhausted && verifyRuns < 3 && _live()
+            && _verifiedAtImplOps < _implOps
+            && !(Array.isArray(run._executionEvidence)
+                 && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)))) {
+          let _autoCmd = null;
+          try { _autoCmd = await _detectVerifyCmd(root, run.stack); } catch { _autoCmd = null; }
+          if (_autoCmd) {
+            verifyRuns++;
+            let _autoRes = null;
+            try { _autoRes = await _runApprovedVerification(root, _autoCmd, run); }
+            catch (e) { _autoRes = { code: 1, stderr: String(e?.message || e) }; }
+            const _autoCall = { type: "cmd", command: _autoCmd, purpose: "verify" };
+            const _autoEv = _executionEvidenceFromTool(_autoCall, _autoRes || {}, root);
+            if (run && _autoEv) {
+              run._executionEvidence.push({
+                ..._autoEv,
+                purpose: "verify",
+                implementationVersion: _implOps,
+                ok: _toolExecutionSucceeded(_autoCall, _autoRes || {}),
+              });
+              if (run._executionEvidence.length > 12) run._executionEvidence.shift();
+            }
+            // 退出 127 = 命令不存在，不是代码坏了。这正是当初拆掉强制验证的原因：
+            // 机器上没装 ruff/pytest，门禁却把 127 写成「验证失败」，还据此结束了本可
+            // 继续修的一轮。存在性过滤已在 _detectVerifyCmd 里治本，这里再兜一层：
+            // 验证器跑不起来就当本项目没有自动验证器，绝不记成失败、绝不驱动修复循环。
+            const _code = Number(_autoRes?.code ?? _autoRes?.exitCode);
+            if (_code === 127) {
+              if (run && Array.isArray(run._executionEvidence)) run._executionEvidence.pop();
+              _verifyExhausted = true;
+              continue;
+            }
+            if (_toolExecutionSucceeded(_autoCall, _autoRes || {})) {
+              didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
+              run._diagnosticBlock = "";
+            }
+            continue; // let the red-build loop below see a real failure and drive the fix
+          }
+          _verifyExhausted = true; // no detectable checker in this project — stop trying
+        }
         if (run._diagnosticBlock && _live()) {
           // LSP 诊断过期机制：防止陈旧诊断永久卡死收尾。
           const _isStale = quietTurns >= _LSP_DIAGNOSTIC_EXPIRY_QUIET_TURNS;
