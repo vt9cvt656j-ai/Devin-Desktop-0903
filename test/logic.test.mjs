@@ -17481,13 +17481,24 @@ test("L0 strip keeps client-side tuning while still dropping the bundled prompt"
   assert.equal(neither[0].role, "user");
 });
 
-test("both L0 call sites pass the per-model tuning", () => {
-  assert.match(SRC, /_l0MessagesWithSkills\(providerMessages, skillsBlock,\s*\n\s*_modelStyleTuning\(_turnConfig\.model\)\)/,
-    "the agent path must pass tuning");
-  assert.match(SRC, /_l0MessagesWithSkills\(messages, _agentLightTurn \? "" : skillsBlock,\s*\n\s*_agentLightTurn \? "" : _modelStyleTuning\(config\.model\)\)/,
-    "the plain-chat path must pass tuning except on a light turn");
-  assert.doesNotMatch(SRC, /_l0MessagesWithSkills\([^)]*\);(?![\s\S]{0,200}_modelStyleTuning)/,
+test("both L0 call sites deliver per-model tuning AND the authorization framing", () => {
+  // Both are composed into the dropped fullPrompt, so both must be re-added or gateway
+  // models never see them. _authContextBlock is the block that stops the model over-
+  // refusing legitimate security work (pentest/CTF/reverse) — losing it is why those
+  // users hit walls.
+  assert.match(SRC, /_l0MessagesWithSkills\(providerMessages, skillsBlock,\s*\n\s*_modelStyleTuning\(_turnConfig\.model\) \+ _authContextBlock\(\)\)/,
+    "the agent path must pass tuning + auth framing");
+  assert.match(SRC, /_l0MessagesWithSkills\(messages, _agentLightTurn \? "" : skillsBlock,\s*\n\s*_agentLightTurn \? "" : \(_modelStyleTuning\(config\.model\) \+ _authContextBlock\(\)\)\)/,
+    "the plain-chat path must pass tuning + auth framing except on a light turn");
+  assert.doesNotMatch(SRC, /_l0MessagesWithSkills\([^)]*\);(?![\s\S]{0,240}_modelStyleTuning)/,
     "no call site may drop tuning silently");
+  // The framing (original vetted wording) authorizes legitimate work and keeps the line.
+  const auth = extractFn("_authContextBlock");
+  for (const term of ["渗透", "CTF", "逆向"]) {
+    assert.ok(auth.includes(term), `auth framing must name ${term} as legitimate dev work`);
+  }
+  assert.match(auth, /别拒答|别说教/, "must instruct the model not to refuse or lecture");
+  assert.match(auth, /攻击未授权的第三方|盗他人凭据/, "must keep the genuine harm line");
 });
 
 test("failure caches do not outlive the fact that produced them", () => {
