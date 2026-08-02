@@ -8455,6 +8455,15 @@ function handleFsChanges(paths) {
   try {
     if (_bm25Index.root && paths.some((p) => p === _bm25Index.root || p.startsWith(_bm25Index.root + "/"))) {
       _bm25Index.built = false;
+      // Invalidation without a rebuild was a one-way door: the agent-context builder asks
+      // with waitForIndex=false, which returns "" on an unbuilt index — so the FIRST agent
+      // write of a session permanently blinded BM25 code retrieval for the rest of it.
+      // Debounced so a burst of writes schedules one rebuild; buildBM25Index additionally
+      // self-guards (`building`) and yields the main thread in slices.
+      clearTimeout(handleFsChanges._bm25RebuildTimer);
+      handleFsChanges._bm25RebuildTimer = setTimeout(() => {
+        try { void buildBM25Index(_bm25Index.root); } catch {}
+      }, 2000);
     }
   } catch {}
   // Clean open models follow disk changes; dirty models keep the user's buffer and
@@ -20286,6 +20295,10 @@ function _agentTurnMustWaitForUser(turn) {
     && _looksLikeUserQuestion(turn.text);
 }
 
+// Shared by the pre-delivery gate and the closing-question gate (moved verbatim from the
+// former's inline literal so both doors demand the same thing).
+const _CODE_VERIFY_NUDGE = "你改了源码但这一轮没有任何验证证据（没跑构建/类型检查/测试/运行，也没读诊断）。交付前必须先实际验证：能编译的项目跑构建或类型检查，有相关测试就跑测试，起服务的就启动并核对，至少用 get_diagnostics 或读构建输出确认无报错——按真实退出状态和输出判断，别只凭“看起来对”就说完成。发现问题先修掉再验证一次。";
+
 // Strip markdown emphasis WITHOUT touching `code spans`. A blanket /\*+/g turned the
 // suggestion `sqlite3 db "SELECT * FROM price_history;"` into `SELECT FROM price_history;`
 // — a broken query, silently, in the text that gets sent back on click. Inside backticks an
@@ -26100,6 +26113,48 @@ const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) =>
 // 外部来源契约：优惠/薅羊毛/返利/比价加载 smzdm_search；二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。
 const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search；live_markets（参考汇率/加密资产报价）按需加载。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
+
+/**
+ * Sub-agent tool discovery, capability-filtered by the child's own sandbox.
+ *
+ * A child's toolset used to be frozen at dispatch for its entire 12–18-turn life; when it
+ * guessed a tool name — the exact moment it signals which capability it needs — the loop
+ * threw that signal away with a static [BLOCKED] and burned the turn. This searches the
+ * registry with the same local matchers the main loop uses (exact, then fuzzy; no
+ * orchestrator round-trip — a child's discovery must stay cheap and offline) and splits
+ * hits into:
+ *
+ *   admitted — mapped type is inside the child's execTypes: safe to add to its payload.
+ *   outside  — real capability, wrong sandbox (e.g. write tools for a read-only child,
+ *              MCP for any child): named back to the model so its REPORT can ask the
+ *              parent, instead of the child silently lacking it.
+ *
+ * Fails closed: unmappable names count as outside, any matcher error returns empty.
+ */
+function _subAgentAdmitTools(query, { registry, loaded, execTypes, mapCall, max = 6 }) {
+  const out = { admitted: [], outside: [] };
+  let hits = [];
+  try {
+    const exact = _searchToolsExactQuery(query, registry);
+    hits = exact
+      ? _searchToolsLookup(query, registry, loaded)
+      : _searchToolsFuzzyMatch(query, registry, loaded)
+          .filter((h) => !h.alreadyLoaded).map((h) => h.schema);
+  } catch { return out; }
+  for (const schema of hits) {
+    const name = schema?.function?.name;
+    if (!name || loaded.has(name)) continue;
+    let type = "";
+    try { type = (mapCall(name, {}) || {}).type || ""; } catch { type = ""; }
+    if (type && execTypes.includes(type)) {
+      if (out.admitted.length < max) out.admitted.push(schema);
+    } else {
+      out.outside.push(name);
+    }
+  }
+  out.outside = out.outside.slice(0, 8);
+  return out;
+}
 // 全量注册表 { name → schema }。
 function _buildToolRegistry(includeWrite, mcpTools = []) {
   const reg = new Map();
@@ -32096,6 +32151,30 @@ function _looksLikeScaffoldCommand(command) {
   if (!raw) return false;
   return /^(?:(?:npm|pnpm|yarn|bun)\s+(?:create|init)\b|(?:npx|bunx|pnpm\s+dlx|yarn\s+dlx)\s+(?:-y\s+|--yes\s+|--no-install\s+)*(?:create-[\w@./-]+|degit\b|nuxi\b|shadcn(?:-vue)?\b)|cargo\s+(?:new|init)\b|django-admin\s+startproject\b|rails\s+new\b|flutter\s+create\b|dotnet\s+new\b|vue\s+create\b|ng\s+(?:new|generate|g)\b|composer\s+create-project\b)/i.test(raw);
 }
+/**
+ * Did this successful shell command WRITE CODE — as opposed to merely mutating the
+ * workspace (npm install, mkdir, chmod)?
+ *
+ * Exists because the verification obligation used to key exclusively on _mutatedFiles,
+ * which is populated only by the structured write/edit tools. Code that arrived via
+ * `sed -i`, a heredoc, a redirect, or a scaffold (`npm create`, `cargo new`) bumped
+ * _implOps — revoking any prior verification credit — while leaving _mutatedCode false,
+ * so _codeDeliveredUnverified could never fire for it: the loop could sed a .ts file
+ * and finish without ever being asked to build. Shell-written code now carries the same
+ * obligation as tool-written code.
+ *
+ * Only SUCCESSFUL commands qualify: a failed scaffold wrote nothing worth verifying.
+ */
+function _commandWroteCode(call, result) {
+  if (!call || (call.type !== "cmd" && call.type !== "termtask")) return false;
+  if (!_toolExecutionSucceeded(call, result)) return false;
+  const cmd = String(call.command || "");
+  if (!cmd) return false;
+  if (_looksLikeScaffoldCommand(cmd)) return true;
+  if (!_looksLikeShellFileRewrite(cmd)) return false;
+  // The rewrite targeted a code file if any token in the command is a code-file path.
+  return cmd.split(/[\s"'=:;|&<>()]+/).some((tok) => _CODE_FILE_RE.test(tok));
+}
 function _mcpMutationHint(call, requireWorkspacePath = false) {
   if (!call || call.type !== "mcp" || call.mcpReadOnly) return false;
   const args = call.args && typeof call.args === "object" ? call.args : {};
@@ -32110,7 +32189,12 @@ function _mcpMutationHint(call, requireWorkspacePath = false) {
 function _toolMutatesWorkspace(call, result) {
   if (!call) return false;
   if (_WORKSPACE_MUTATING_TYPES.has(call.type)) return true;
-  if (call.type === "cmd" || call.type === "termtask") return _looksLikeWorkspaceMutationCommand(call.command);
+  // Scaffolds count: `npm create vite` lands a whole project. They were only recognised
+  // for plan-step advancement, so a scaffolded project had didMutate=false and _implOps=0
+  // — every verification gate inert on exactly the runs that create the most code.
+  if (call.type === "cmd" || call.type === "termtask") {
+    return _looksLikeWorkspaceMutationCommand(call.command) || _looksLikeScaffoldCommand(call.command);
+  }
   // MCP names are only approval hints. A remote GitHub `create_or_update_file`
   // also has a path, but it did not mutate this local workspace.
   if (call.type === "mcp") return result?.workspaceMutated === true;
@@ -34121,7 +34205,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const sysPrompt = (write
     ? _WORKER_SYSTEM + `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`
     : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _activeSkillsBlock());
-  const _childContext = _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext("", root));
+  // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
+  // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
+  // ranking (biggest files, almost never the worker's scope), _buildRetrievedCodeContext
+  // returned "" on its `!query` first line so BM25 refs were structurally unreachable for
+  // every child, and _agentContextForQuery skipped its whole enrichment branch because an
+  // empty profile never `applies`. The worker — the thing actually writing code — got
+  // strictly less architectural context than the parent. Same failure/caching behaviour:
+  // the base context cache is query-independent, only the ranking layer reads this.
+  const _childQuery = [description, prompt].filter(Boolean).join("\n").slice(0, 2000);
+  const _childContext = _currentDateBlock() + `\n\n--- 项目上下文 ---\n` + (await _gatherAgentContext(_childQuery, root));
   // Context IN: prepend the shared run-context digest so this child stands on what the main
   // agent already learned/did (真·上下文协议) instead of re-investigating from zero.
   // P0.1：先把主 run 已读文件的内容摘要装进 ctx.fileSnippets（每文件 ≤1500 字、总量 ≤8K），
@@ -34198,7 +34291,15 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   if (_canNest) for (const t of ["run_subagent", "run_worker", "await_subagent"]) if (!_allow.includes(t)) _allow.push(t);
   // Build the full schema then filter by name — so a tool gated behind if(includeWrite) at build
   // time (e.g. browser) is still visible to a read-only child that's allowed it.
-  const toolSchemas = _buildAgentToolSchemas(true).filter((t) => _allow.includes(t.function.name));
+  // _SEARCH_TOOLS_SCHEMA is the discovery escape hatch (see _subAgentAdmitTools): children
+  // can pull additional same-capability schemas into their window instead of dead-ending
+  // on [BLOCKED]. Admission goes through _applyToolPayloadWindow like the main loop's, so
+  // the payload caps hold; the child's initial toolset is its core (never evicted).
+  const toolSchemas = [
+    ..._buildAgentToolSchemas(true).filter((t) => _allow.includes(t.function.name)),
+    _SEARCH_TOOLS_SCHEMA,
+  ];
+  const _childCoreNames = new Set(toolSchemas.map((t) => t?.function?.name).filter(Boolean));
   const _execTypes = write
     ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
     : [..._READ_TYPES, "cmd"]; // P0.2: 允许只读模式执行 cmd
@@ -34243,6 +34344,39 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       for (const tc of turn.toolCalls) {
         const call = _mapToolCall(tc.name, tc.parsedArgs, run?.mcpToolMap);
         if (call && tc._liveWritePreview) call._liveWritePreview = tc._liveWritePreview;
+        // Discovery before the allowlist: a search_tools call is the child SIGNALLING a
+        // missing capability — answer it instead of [BLOCKED]-ing it. Same-sandbox tools
+        // are admitted into toolSchemas in place (the array rides into every later
+        // _agentModelTurn by reference); out-of-sandbox hits are named so the child's
+        // report can ask the parent. Failure degrades to a plain message; never throws.
+        if (call && call.type === "search_tools") {
+          toolCount++;
+          let _stContent = "";
+          let _stStep = null;
+          try { _stStep = _createToolStep(call); vp.appendChild(_stStep); } catch {}
+          try {
+            const _loaded = new Set(toolSchemas.map((t) => t.function && t.function.name));
+            const _registry = run?._toolRegistry || _buildToolRegistry(true, run?.mcpToolCache || []);
+            const _found = _subAgentAdmitTools(call.query, {
+              registry: _registry, loaded: _loaded, execTypes: _execTypes,
+              mapCall: (n, a) => _mapToolCall(n, a, run?.mcpToolMap),
+            });
+            // Same admission path as the main loop: the window's byte/count caps apply,
+            // and the child's initial toolset (core) is protected from eviction.
+            const _stWindow = _applyToolPayloadWindow(toolSchemas, _found.admitted, _childCoreNames);
+            const _stAdmitted = _found.admitted
+              .map((s) => s?.function?.name)
+              .filter((n) => n && _stWindow.admitted.includes(n));
+            if (_stAdmitted.length) _stContent += `已加载工具：${_stAdmitted.join("、")}。下一步直接调用。`;
+            if (_found.outside.length) _stContent += `${_stContent ? "\n" : ""}以下工具超出子任务沙箱，不能在这里执行；如确实需要，在最终报告里请父智能体处理：${_found.outside.join("、")}`;
+            if (!_stContent) _stContent = "没有匹配的工具。用现有工具完成，或在最终报告里说明缺少的能力。";
+          } catch (e) {
+            _stContent = `[ERROR] 工具搜索失败: ${String(e?.message || e)}`;
+          }
+          try { if (_stStep) _settleToolStep(_stStep, { type: "search_tools", path: "", content: _stContent }); } catch {}
+          messages.push({ role: "tool", tool_call_id: tc.id, content: _stContent });
+          continue;
+        }
         // Tool allowlist: read-only sub-agents may ONLY read/search; workers also get
         // write/edit/multiedit (scope-enforced in _executeToolStep). Nested dispatch is
         // depth-gated（#53）: 深度 <2 的子体可再派一层（上方 _canNest 放行），深度 ≥2 的
@@ -37248,7 +37382,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // A visible question is a hard turn boundary. The assistant message is already rendered,
       // accumulated, and in the transcript; without a NEW user message there is no authority to
       // infer an answer, run another model turn, execute a tool, or pass any finish gate.
+      //
+      // …but it must not be a SIDE DOOR around the pre-delivery verification gate. This break
+      // runs before the finish gates, and the fallback accounting leg is skipped when
+      // awaitingUserReply — so "登录已实现，需要我再补测试吗？" used to ship unverified code with
+      // no _incompleteReason. If the run mutated code and holds zero green evidence, spend ONE
+      // verify nudge first (same budget as the finish gate's: if codeVerifyNudges was already
+      // used, or the model asks again after verifying, the question is honored immediately).
       if (_agentTurnMustWaitForUser(turn)) {
+        const _qMutatedCode = didMutate && ([..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)))
+          || run._codeWrittenByCommand === true);
+        const _qVerified = _verifiedAtImplOps >= _implOps
+          || (Array.isArray(run._executionEvidence)
+              && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
+        if (isAgent && run.mode === "agent" && _qMutatedCode && !_qVerified
+            && codeVerifyNudges < 1 && _live()) {
+          codeVerifyNudges++;
+          _pushNudge("codeVerify", _CODE_VERIFY_NUDGE + "验证完成后再向用户提问。");
+          continue;
+        }
         awaitingUserReply = true;
         _clearNudges();
         break;
@@ -37319,7 +37471,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 交付前自验证门：改了源码却整轮零验证证据（没跑构建/类型检查/测试/运行，
         // 也没跑诊断）= “交付即报错”的直接根因。这里只管“完全没验证过”；有正式运行时
         // 义务（_missingRequiredEffect）或已有诊断阻断（_diagnosticBlock）时交给那两道门，不重复催。
-        const _mutatedCode = didMutate && [..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)));
+        const _mutatedCode = didMutate && ([..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)))
+          || run._codeWrittenByCommand === true);
         // Freshness, not existence. This used to read `verificationPassed || didVerify ||
         // _verifiedAtImplOps >= 0` — three credentials that are monotonic for the life of the
         // run, so one `npm test` after edit #1 certified edits #2-#12 as well, including the
@@ -37523,7 +37676,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // 靠“没验证证据就不放行收尾”的硬事实门。get_diagnostics/构建/测试/运行任一都算。
         if (_codeDeliveredUnverified && codeVerifyNudges < 3 && _live()) {
           codeVerifyNudges++;
-          _pushNudge("codeVerify", "你改了源码但这一轮没有任何验证证据（没跑构建/类型检查/测试/运行，也没读诊断）。交付前必须先实际验证：能编译的项目跑构建或类型检查，有相关测试就跑测试，起服务的就启动并核对，至少用 get_diagnostics 或读构建输出确认无报错——按真实退出状态和输出判断，别只凭“看起来对”就说完成。发现问题先修掉再验证一次。");
+          _pushNudge("codeVerify", _CODE_VERIFY_NUDGE);
           continue;
         }
         const reconciliation = _takeRequirementsReconciliation(run, {
@@ -38847,6 +39000,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
                 _uiVerifyPhase = "idle";
               }
             }
+          }
+          // Shell-written code carries the same verification obligation as tool-written
+          // code (see _commandWroteCode). Sticky for the run: _implOps bumps on every
+          // subsequent mutation, so the obligation is re-armed exactly like file writes.
+          if ((t === "cmd" || t === "termtask") && _commandWroteCode(it.call, it.rawResult)) {
+            run._codeWrittenByCommand = true;
           }
           if (mutationPath && t !== "cmd" && t !== "termtask") {
             const actualPath = _normRel(mutationPath, root);
@@ -42372,6 +42531,11 @@ async function _executeToolStepInner(step, call, root, run) {
         _bindRunFilePath(run, root, call.path, fp);
         _recordRunKnownContent(run, root, newContent, call.path, fp);
         _refreshTreeFor(fp); // show the new/changed file in the explorer right away
+        // Mirror of the human save path (saveActive): without this, every file the agent
+        // creates is invisible to find_symbol and _buildRepoMap for the rest of the
+        // session, and every symbol it renames stays indexed under the old name — the
+        // agent's own first write starts blinding its later architectural context.
+        try { void refreshSymbolIndexFor(fp); } catch {}
       } catch (e1) {
         writeErr = String(e1?.message || e1);
       }
@@ -42558,6 +42722,7 @@ async function _executeToolStepInner(step, call, root, run) {
         _bindRunFilePath(run, root, call.path, fp);
         _recordRunKnownContent(run, root, newContent, call.path, fp);
         _refreshTreeFor(fp);
+        try { void refreshSymbolIndexFor(fp); } catch {} // same as the write path above
       } catch (e) { writeErr = String(e?.message || e); }
       if (writeErr) {
         step.classList.add("agent-tool-step--rejected");
@@ -43040,6 +43205,9 @@ async function _executeToolStepInner(step, call, root, run) {
         _invalidateRead(p); _agentReadCache.delete(fp);
         _resetReadProgress(run, fp, p); // gone → don't report it as "已读"
         _refreshTreeFor(fp);
+        // Drop-first then failed re-read → entries removed. Without this, find_symbol
+        // keeps steering the model to symbols in a file that no longer exists.
+        try { void refreshSymbolIndexFor(fp); } catch {}
         res.className = "atc-result atc-result--ok"; res.textContent = "已删除";
         return { type: "delete", path: p, content: `已删除 ${p}` };
       } catch (e) {
