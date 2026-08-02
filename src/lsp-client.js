@@ -699,8 +699,12 @@ export function createLspManager(options) {
     clients.set(langId, client);
     try {
       await client.start(custom);
+      // No success toast. A language server starting is routine background plumbing the user
+      // did not ask for and cannot act on, and it fires again for every language a project
+      // touches. The status bar already shows which servers are live ("LSP: python, shell"),
+      // which is the same information without interrupting. Failures below still toast —
+      // those the user can act on.
       onStatus?.();
-      showToast(`Language server started: ${langId}`);
       return client;
     } catch (e) {
       clients.delete(langId);

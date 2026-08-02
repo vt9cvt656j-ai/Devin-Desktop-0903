@@ -1,0 +1,1989 @@
+diff --git a/server/.gitignore b/server/.gitignore
+index 593e9e9..24b0b8d 100644
+--- a/server/.gitignore
++++ b/server/.gitignore
+@@ -2,3 +2,10 @@
+ .env
+ *.env
+ !.env.example
++
++# Stale working copies — git history already has every one of these states.
++*.bak
++*.bak.*
++*.bak-*
++*.pre-*
++*.predeploy-bak
+diff --git a/server/Cargo.lock b/server/Cargo.lock
+index 31d6f99..4fc19bc 100644
+--- a/server/Cargo.lock
++++ b/server/Cargo.lock
+@@ -2,6 +2,12 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
+ [[package]]
+ name = "aho-corasick"
+ version = "1.1.4"
+@@ -94,6 +100,7 @@ dependencies = [
+  "matchit",
+  "memchr",
+  "mime",
++ "multer",
+  "percent-encoding",
+  "pin-project-lite",
+  "rustversion",
+@@ -328,6 +335,15 @@ version = "2.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+ 
++[[package]]
++name = "crc32fast"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
++dependencies = [
++ "cfg-if",
++]
++
+ [[package]]
+ name = "crossbeam-queue"
+ version = "0.3.12"
+@@ -430,6 +446,15 @@ version = "0.2.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+ 
++[[package]]
++name = "encoding_rs"
++version = "0.8.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
++dependencies = [
++ "cfg-if",
++]
++
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+@@ -474,12 +499,32 @@ version = "2.4.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+ 
++[[package]]
++name = "filetime"
++version = "0.2.29"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
++dependencies = [
++ "cfg-if",
++ "libc",
++]
++
+ [[package]]
+ name = "find-msvc-tools"
+ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+ 
++[[package]]
++name = "flate2"
++version = "1.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
++dependencies = [
++ "crc32fast",
++ "miniz_oxide",
++]
++
+ [[package]]
+ name = "flume"
+ version = "0.11.1"
+@@ -1098,6 +1143,12 @@ dependencies = [
+  "vcpkg",
+ ]
+ 
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
+ [[package]]
+ name = "litemap"
+ version = "0.8.2"
+@@ -1165,6 +1216,7 @@ dependencies = [
+  "bcrypt",
+  "chrono",
+  "dotenvy",
++ "flate2",
+  "futures-util",
+  "jsonwebtoken",
+  "lettre",
+@@ -1173,7 +1225,9 @@ dependencies = [
+  "reqwest",
+  "serde",
+  "serde_json",
++ "sha2",
+  "sqlx",
++ "tar",
+  "tokio",
+  "tower 0.4.13",
+  "tower-http 0.5.2",
+@@ -1188,6 +1242,26 @@ version = "0.3.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+ 
++[[package]]
++name = "mime_guess"
++version = "2.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
++dependencies = [
++ "mime",
++ "unicase",
++]
++
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++ "simd-adler32",
++]
++
+ [[package]]
+ name = "mio"
+ version = "1.2.1"
+@@ -1199,6 +1273,23 @@ dependencies = [
+  "windows-sys 0.61.2",
+ ]
+ 
++[[package]]
++name = "multer"
++version = "3.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
++dependencies = [
++ "bytes",
++ "encoding_rs",
++ "futures-util",
++ "http",
++ "httparse",
++ "memchr",
++ "mime",
++ "spin",
++ "version_check",
++]
++
+ [[package]]
+ name = "nom"
+ version = "8.0.0"
+@@ -1631,6 +1722,7 @@ dependencies = [
+  "hyper-util",
+  "js-sys",
+  "log",
++ "mime_guess",
+  "percent-encoding",
+  "pin-project-lite",
+  "quinn",
+@@ -1694,6 +1786,19 @@ version = "2.1.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+ 
++[[package]]
++name = "rustix"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "rustls"
+ version = "0.23.41"
+@@ -1877,6 +1982,12 @@ dependencies = [
+  "rand_core 0.6.4",
+ ]
+ 
++[[package]]
++name = "simd-adler32"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
++
+ [[package]]
+ name = "simple_asn1"
+ version = "0.6.4"
+@@ -2195,6 +2306,17 @@ dependencies = [
+  "syn",
+ ]
+ 
++[[package]]
++name = "tar"
++version = "0.4.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
++dependencies = [
++ "filetime",
++ "libc",
++ "xattr",
++]
++
+ [[package]]
+ name = "thiserror"
+ version = "1.0.69"
+@@ -2539,6 +2661,12 @@ version = "1.20.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+ 
++[[package]]
++name = "unicase"
++version = "2.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
++
+ [[package]]
+ name = "unicode-bidi"
+ version = "0.3.18"
+@@ -2991,6 +3119,16 @@ version = "0.6.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+ 
++[[package]]
++name = "xattr"
++version = "1.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
++dependencies = [
++ "libc",
++ "rustix",
++]
++
+ [[package]]
+ name = "yoke"
+ version = "0.8.3"
+diff --git a/server/Cargo.toml b/server/Cargo.toml
+index a190f11..25ed0be 100644
+--- a/server/Cargo.toml
++++ b/server/Cargo.toml
+@@ -29,6 +29,7 @@ tracing = "0.1"
+ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ dotenvy = "0.15"
+ anyhow = "1"
++sha2 = "0.10"   # keyed-by-user gateway cache key (DefaultHasher is not collision resistant)
+ reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+ 
+ [profile.release]
+diff --git a/server/src/agent_trace.rs b/server/src/agent_trace.rs
+index 157aa59..73b29fb 100644
+--- a/server/src/agent_trace.rs
++++ b/server/src/agent_trace.rs
+@@ -1,5 +1,7 @@
+ use crate::auth::Claims;
+-use crate::error::{ApiResult, AppError};
++use crate::error::ApiResult;
++use crate::AppState;
++use axum::extract::State;
+ use axum::Json;
+ use serde::Serialize;
+ use std::collections::VecDeque;
+@@ -78,10 +80,11 @@ pub fn record_agent_trace(input: AgentTraceInput) {
+ /// GET /api/agent-traces — admin only. This was unauthenticated: prompt-assembly
+ /// metadata (modes, injected block names, payload sizes) was readable by anyone on
+ /// the open internet.
+-pub async fn list_agent_traces(claims: Claims) -> ApiResult<Json<Vec<AgentTrace>>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++pub async fn list_agent_traces(
++    State(state): State<AppState>,
++    claims: Claims,
++) -> ApiResult<Json<Vec<AgentTrace>>> {
++    crate::auth::require_admin(&state, &claims).await?;
+     let guard = traces()
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+diff --git a/server/src/auth.rs b/server/src/auth.rs
+index cb63b7d..16d141c 100644
+--- a/server/src/auth.rs
++++ b/server/src/auth.rs
+@@ -88,6 +88,103 @@ pub fn user_from_jwt(cfg: &Config, token: &str) -> Option<uuid::Uuid> {
+     uuid::Uuid::parse_str(&data.claims.sub).ok()
+ }
+ 
++// ---- live account/role checks ----------------------------------------------
++// A JWT here lives for 30 days and there is no revocation list, so the token proves
++// only what was true at login. Every authorization decision therefore re-reads the
++// user row: otherwise a demoted admin keeps admin power, and a deleted account keeps
++// working, until the token happens to expire.
++
++/// Resolve the caller's user id and assert the account still exists.
++pub async fn require_user(state: &AppState, claims: &Claims) -> ApiResult<uuid::Uuid> {
++    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
++    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE id = $1")
++        .bind(uid)
++        .fetch_optional(&state.db)
++        .await?
++        .ok_or_else(|| AppError::unauthorized("账号已注销，请重新登录"))
++}
++
++/// Assert the caller is CURRENTLY an admin, from `users.role` rather than `claims.role`.
++pub async fn require_admin(state: &AppState, claims: &Claims) -> ApiResult<uuid::Uuid> {
++    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
++    let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
++        .bind(uid)
++        .fetch_optional(&state.db)
++        .await?;
++    match role.as_deref() {
++        Some("admin") => Ok(uid),
++        Some(_) => Err(AppError::forbidden("需要管理员权限")),
++        None => Err(AppError::unauthorized("账号已注销，请重新登录")),
++    }
++}
++
++// ---- password-login brute-force guard --------------------------------------
++// The emailed-code path is already budgeted (per-code + hourly). Password login had no
++// budget at all — only bcrypt's cost factor, which slows an attacker but never stops one.
++
++/// Failed passwords tolerated per account per hour before the account is paused.
++const LOGIN_FAIL_PER_EMAIL: i64 = 10;
++/// Failed passwords tolerated per source IP per hour — stops one host spraying many accounts.
++const LOGIN_FAIL_PER_IP: i64 = 50;
++const LOGIN_FAIL_WINDOW_SECS: i64 = 3600;
++
++/// A throwaway hash used to spend the same CPU on "no such account" as on a wrong
++/// password, so response latency doesn't reveal which accounts exist.
++static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
++    bcrypt::hash("michael-timing-equalizer", bcrypt::DEFAULT_COST).unwrap_or_default()
++});
++
++/// Client IP as nginx sees it (`X-Real-IP`, else the first `X-Forwarded-For` hop).
++fn client_ip(headers: &axum::http::HeaderMap) -> String {
++    headers
++        .get("x-real-ip")
++        .and_then(|v| v.to_str().ok())
++        .or_else(|| {
++            headers
++                .get("x-forwarded-for")
++                .and_then(|v| v.to_str().ok())
++                .and_then(|s| s.split(',').next())
++        })
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .unwrap_or_else(|| "unknown".to_string())
++}
++
++/// Reject the attempt outright when either budget is spent; otherwise hand back the two
++/// counter keys so the caller can record the outcome.
++async fn login_guard(state: &AppState, email: &str, ip: &str) -> ApiResult<(String, String)> {
++    let mut conn = state.redis.clone();
++    let ekey = format!("login_fail:{}", email.trim().to_lowercase());
++    let ikey = format!("login_fail_ip:{ip}");
++    let e_fails: Option<i64> = redis::cmd("GET").arg(&ekey).query_async(&mut conn).await?;
++    let i_fails: Option<i64> = redis::cmd("GET").arg(&ikey).query_async(&mut conn).await?;
++    if e_fails.unwrap_or(0) >= LOGIN_FAIL_PER_EMAIL || i_fails.unwrap_or(0) >= LOGIN_FAIL_PER_IP {
++        return Err(AppError::bad(
++            "登录失败次数过多，请稍后再试，或改用邮箱验证码登录",
++        ));
++    }
++    Ok((ekey, ikey))
++}
++
++async fn login_fail(state: &AppState, ekey: &str, ikey: &str) {
++    let mut conn = state.redis.clone();
++    for k in [ekey, ikey] {
++        let _: Result<i64, _> = redis::cmd("INCR").arg(k).query_async(&mut conn).await;
++        // EXPIRE on every increment (idempotent): setting it only on the first failure
++        // risks a crash in between leaving a TTL-less key that locks the account out forever.
++        let _: Result<(), _> = redis::cmd("EXPIRE")
++            .arg(k)
++            .arg(LOGIN_FAIL_WINDOW_SECS)
++            .query_async(&mut conn)
++            .await;
++    }
++}
++
++async fn login_ok(state: &AppState, ekey: &str, ikey: &str) {
++    let mut conn = state.redis.clone();
++    let _: Result<(), _> = redis::cmd("DEL").arg(ekey).arg(ikey).query_async(&mut conn).await;
++}
++
+ /// Lightweight email format check ("合规").
+ pub fn valid_email(e: &str) -> bool {
+     let e = e.trim();
+@@ -261,33 +358,57 @@ pub async fn register(State(state): State<AppState>, Json(req): Json<RegisterReq
+     if req.password.len() < 6 {
+         return Err(AppError::bad("密码至少 6 位"));
+     }
+-    if !take_code(&state, &req.email, &req.code).await? {
+-        return Err(AppError::bad("验证码错误或已过期"));
+-    }
++    // Check "already registered" BEFORE consuming the code. take_code() deletes the code
++    // on success, so doing this the other way round burned the code of anyone who retried
++    // a registration that had already gone through.
+     if find_user(&state, &req.email).await?.is_some() {
+         return Err(AppError::bad("该邮箱已注册，请直接登录"));
+     }
++    if !take_code(&state, &req.email, &req.code).await? {
++        return Err(AppError::bad("验证码错误或已过期"));
++    }
+     let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)?;
++    // ON CONFLICT: two concurrent registrations for the same address both clear the check
++    // above; without this the loser hits the UNIQUE constraint and surfaces as a raw 500.
+     let user = sqlx::query_as::<_, User>(
+-        "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *",
++        "INSERT INTO users (email, password_hash) VALUES ($1, $2) \
++         ON CONFLICT (email) DO NOTHING RETURNING *",
+     )
+     .bind(&req.email)
+     .bind(&hash)
+-    .fetch_one(&state.db)
+-    .await?;
++    .fetch_optional(&state.db)
++    .await?
++    .ok_or_else(|| AppError::bad("该邮箱已注册，请直接登录"))?;
+     let token = issue_token(&state.cfg, &user)?;
+     crate::realtime::record_event(&state, Some(user.id), "register", json!({ "email": user.email })).await;
+     Ok(Json(json!({ "token": token, "user": user })))
+ }
+ 
+-pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> ApiResult<Json<serde_json::Value>> {
++pub async fn login(
++    State(state): State<AppState>,
++    headers: axum::http::HeaderMap,
++    Json(req): Json<LoginReq>,
++) -> ApiResult<Json<serde_json::Value>> {
+     if req.email.trim().is_empty() || req.password.is_empty() {
+         return Err(AppError::bad("账号或密码不能为空"));
+     }
+-    let user = find_user(&state, req.email.trim()).await?.ok_or_else(|| AppError::bad("账号不存在"))?;
++    let ip = client_ip(&headers);
++    let (ekey, ikey) = login_guard(&state, &req.email, &ip).await?;
++    // One message for both "no such account" and "wrong password", and the same bcrypt
++    // cost on both paths: splitting them turned this endpoint into an enumeration oracle.
++    let user = match find_user(&state, req.email.trim()).await? {
++        Some(u) => u,
++        None => {
++            let _ = bcrypt::verify(&req.password, &DUMMY_HASH);
++            login_fail(&state, &ekey, &ikey).await;
++            return Err(AppError::unauthorized("账号或密码错误"));
++        }
++    };
+     if !bcrypt::verify(&req.password, &user.password_hash)? {
+-        return Err(AppError::unauthorized("密码错误"));
++        login_fail(&state, &ekey, &ikey).await;
++        return Err(AppError::unauthorized("账号或密码错误"));
+     }
++    login_ok(&state, &ekey, &ikey).await;
+     sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1").bind(user.id).execute(&state.db).await?;
+     let token = issue_token(&state.cfg, &user)?;
+     crate::realtime::record_event(&state, Some(user.id), "login", json!({ "email": user.email })).await;
+@@ -328,9 +449,7 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
+ }
+ 
+ pub async fn admin_users(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<User>>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++    require_admin(&state, &claims).await?;
+     let users = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at DESC LIMIT 500")
+         .fetch_all(&state.db)
+         .await?;
+@@ -347,13 +466,11 @@ pub async fn set_user_role(
+     Path(id): Path<uuid::Uuid>,
+     Json(req): Json<SetRoleReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++    let me = require_admin(&state, &claims).await?;
+     if req.role != "admin" && req.role != "user" {
+         return Err(AppError::bad("角色只能是 admin 或 user"));
+     }
+-    if claims.sub == id.to_string() {
++    if me == id {
+         return Err(AppError::bad("不能修改自己的角色"));
+     }
+     let res = sqlx::query("UPDATE users SET role = $1, updated_at = now() WHERE id = $2")
+@@ -374,10 +491,8 @@ pub async fn delete_user(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
+-    if claims.sub == id.to_string() {
++    let me = require_admin(&state, &claims).await?;
++    if me == id {
+         return Err(AppError::bad("不能删除自己"));
+     }
+     let res = sqlx::query("DELETE FROM users WHERE id = $1")
+diff --git a/server/src/codes.rs b/server/src/codes.rs
+index 1611ecf..7081785 100644
+--- a/server/src/codes.rs
++++ b/server/src/codes.rs
+@@ -26,11 +26,8 @@ pub struct Code {
+     pub created_at: chrono::DateTime<chrono::Utc>,
+ }
+ 
+-fn admin_only(claims: &Claims) -> ApiResult<()> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
+-    Ok(())
++async fn admin_only(state: &AppState, claims: &Claims) -> ApiResult<()> {
++    crate::auth::require_admin(state, claims).await.map(|_| ())
+ }
+ 
+ /// A readable random code like `AB3K-9F2M-7QX4-WPED`.
+@@ -65,7 +62,7 @@ pub async fn admin_generate(
+     claims: Claims,
+     Json(req): Json<GenReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let count = req.count.clamp(1, 500);
+     match req.kind.as_str() {
+         "plan" => {
+@@ -121,7 +118,7 @@ pub async fn admin_generate(
+ 
+ // ---------- admin: list ----------
+ pub async fn admin_list(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<Code>>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, Code>("SELECT * FROM activation_codes ORDER BY created_at DESC LIMIT 1000")
+         .fetch_all(&state.db)
+         .await?;
+@@ -134,7 +131,7 @@ pub async fn admin_delete(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let res = sqlx::query("DELETE FROM activation_codes WHERE id = $1")
+         .bind(id)
+         .execute(&state.db)
+@@ -282,7 +279,7 @@ pub async fn admin_grant(
+     Path(id): Path<uuid::Uuid>,
+     Json(req): Json<GrantReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let mut tx = state.db.begin().await?;
+     match req.kind.as_str() {
+         "plan" => {
+@@ -321,7 +318,7 @@ pub async fn admin_set_credits(
+     Path(id): Path<uuid::Uuid>,
+     Json(req): Json<SetCreditsReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     if req.credits_cents < 0 {
+         return Err(AppError::bad("额度不能为负数"));
+     }
+@@ -357,7 +354,7 @@ pub async fn admin_set_plan(
+     Path(id): Path<uuid::Uuid>,
+     Json(req): Json<SetPlanReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let plan = req.plan.trim();
+     if plan != "none" && !PLANS.contains(&plan) {
+         return Err(AppError::bad("套餐无效（合法值: trial / basic / pro / power / ultra / none）"));
+@@ -419,7 +416,7 @@ pub async fn admin_cancel_plan(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     sqlx::query(
+         "UPDATE users SET plan = 'none', plan_expires_at = NULL, \
+          quota_total_cents = 0, quota_window_cents = 0, quota_window_cap_cents = 0, \
+diff --git a/server/src/deploy.rs b/server/src/deploy.rs
+index 7c60aff..2e3a59a 100644
+--- a/server/src/deploy.rs
++++ b/server/src/deploy.rs
+@@ -137,17 +137,39 @@ fn chmod_readable(dir: &std::path::Path) -> std::io::Result<()> {
+ /// 给「账号+站点」分配稳定的二级域名，并用软链把 `_hosts/<sub>` 指向站点目录，于是
+ /// nginx（server_name `*.<域名>`）就能按域名直接服务它。返回完整站点 URL；若没配置
+ /// `DEPLOY_SITE_DOMAIN`（= 没开二级域名托管）返回 None，调用方回退到 `/s/` 路径。
+-fn assign_subdomain(account: &str, name: &str, target: &std::path::Path) -> Option<String> {
+-    use std::os::unix::fs::PermissionsExt;
+-    let domain = std::env::var("DEPLOY_SITE_DOMAIN").ok().filter(|s| !s.is_empty())?;
+-    // 子域名标签：小写、只留 [a-z0-9-]、两端去 '-'（与 nginx 的 server_name 正则一致）
++/// Names that must never be handed to a user: they read as ours. Without this any
++/// account could deploy a site called "admin" and own https://admin.<domain>/ — served
++/// from our domain, under our wildcard certificate, which is a ready-made phishing page.
++const RESERVED_SUBDOMAINS: &[&str] = &[
++    "www", "api", "admin", "app", "mail", "smtp", "imap", "pop", "ns1", "ns2", "mx",
++    "login", "signin", "auth", "account", "accounts", "gateway", "cdn", "static",
++    "assets", "code", "dev", "staging", "test", "beta", "support", "help", "docs",
++    "status", "billing", "pay", "payment", "checkout", "secure", "vpn", "git",
++];
++
++/// 子域名标签：小写、只留 [a-z0-9-]、两端去 '-'（与 nginx 的 server_name 正则一致）。
++/// None = 这个名字不能作为子域名（保留字或过短），调用方回退到 /s/ 路径。
++fn subdomain_label(name: &str) -> Option<String> {
+     let base: String = name
+         .to_lowercase()
+         .chars()
+         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+         .collect();
+     let base = base.trim_matches('-');
+-    let base = if base.is_empty() { "site" } else { base };
++    // An unnamed / unusable name used to fall back to the literal "site", which meant the
++    // first person to deploy without a name claimed site.<domain> for everyone else.
++    // No usable label → no subdomain; the caller serves it under /s/ instead.
++    if base.is_empty() || RESERVED_SUBDOMAINS.contains(&base) || base.len() < 4 {
++        return None;
++    }
++    Some(base.to_string())
++}
++
++fn assign_subdomain(account: &str, name: &str, target: &std::path::Path) -> Option<String> {
++    use std::os::unix::fs::PermissionsExt;
++    let domain = std::env::var("DEPLOY_SITE_DOMAIN").ok().filter(|s| !s.is_empty())?;
++    let base = subdomain_label(name)?;
++    let base = base.as_str();
+     let hosts = PathBuf::from(SITES_ROOT).join("_hosts");
+     let _ = std::fs::create_dir_all(&hosts);
+     let _ = std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o755)); // nginx 可遍历
+@@ -173,10 +195,14 @@ fn assign_subdomain(account: &str, name: &str, target: &std::path::Path) -> Opti
+ 
+ /// `POST /api/deploy?name=<slug>` —— body 是 gzip'd tar 的静态站产物。
+ pub async fn deploy_site(
++    axum::extract::State(state): axum::extract::State<crate::AppState>,
+     claims: Claims,
+     Query(p): Query<DeployParams>,
+     body: Bytes,
+ ) -> ApiResult<Json<serde_json::Value>> {
++    // 0) 账号仍然存在吗？This handler never touched the users table, so a DELETED account
++    //    kept publishing sites until its 30-day token expired.
++    crate::auth::require_user(&state, &claims).await?;
+     // 1) 部署授权：已登录账号自动开通「临时白名单」，不必再找管理员手动加
+     //    （admin / 永久名单 / 黑名单封禁的逻辑都在 access() 里）
+     let grant_expires = match access(&claims) {
+@@ -215,6 +241,18 @@ pub async fn deploy_site(
+     let entries = ar
+         .entries()
+         .map_err(|e| AppError::forbidden(format!("不是有效的 tar.gz: {e}")))?;
++    // Uncompressed budget. The check above bounds only the COMPRESSED body, and gzip
++    // reaches ~1000:1 on repetitive input — so a 30MB upload could expand to ~30GB. The
++    // file-count guard below never caught it because a bomb is a SINGLE huge entry, and it
++    // was only tested after unpack() had already written the whole thing. Postgres, Redis
++    // and nginx share this filesystem, so filling it takes down the whole platform.
++    let max_total: u64 = std::env::var("DEPLOY_MAX_UNPACKED_MB")
++        .ok()
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(200)
++        * 1024
++        * 1024;
++    let mut written: u64 = 0;
+     let mut count = 0usize;
+     for entry in entries {
+         let mut e = entry.map_err(|e| AppError::forbidden(format!("tar 读取错: {e}")))?;
+@@ -248,10 +286,32 @@ pub async fn deploy_site(
+         if let Some(parent) = dest.parent() {
+             let _ = std::fs::create_dir_all(parent);
+         }
+-        e.unpack(&dest)
++        // Copy through a limited reader rather than unpack()-ing whatever the tar header
++        // claims: the header is attacker-controlled, the actual byte count is not.
++        let remaining = max_total.saturating_sub(written);
++        if remaining == 0 {
++            let _ = std::fs::remove_dir_all(&target);
++            return Err(AppError::forbidden(
++                "解压后体积超限——精简项目后再传，或联系管理员提额。",
++            ));
++        }
++        let mut out = std::fs::File::create(&dest)
++            .map_err(|e| AppError::internal(format!("建文件失败: {e}")))?;
++        // remaining + 1 so an entry that lands exactly on the cap is still over-budget.
++        written += std::io::copy(&mut std::io::Read::take(&mut e, remaining + 1), &mut out)
+             .map_err(|e| AppError::internal(format!("解压失败: {e}")))?;
++        // Check here, not just at the top of the loop: a bomb is typically ONE huge entry,
++        // and if it is also the last entry the loop would end and report success.
++        if written > max_total {
++            drop(out);
++            let _ = std::fs::remove_dir_all(&target);
++            return Err(AppError::forbidden(
++                "解压后体积超限——精简项目后再传，或联系管理员提额。",
++            ));
++        }
+         count += 1;
+         if count > 5000 {
++            let _ = std::fs::remove_dir_all(&target); // don't leave a half-extracted tree
+             return Err(AppError::forbidden("文件数过多（>5000）——精简项目后再传。"));
+         }
+     }
+@@ -283,3 +343,37 @@ pub async fn deploy_site(
+         "grant_note": grant_expires.map(|_| "已自动为你开通临时部署权限（每次部署自动续期）"),
+     })))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn reserved_subdomains_are_refused() {
++        // These would otherwise be served from our own domain under our wildcard cert.
++        for name in ["admin", "www", "API", "Login", "billing", "checkout"] {
++            assert_eq!(subdomain_label(name), None, "{name} must not be claimable");
++        }
++    }
++
++    #[test]
++    fn short_labels_are_refused() {
++        for name in ["a", "ab", "abc", "!!", ""] {
++            assert_eq!(subdomain_label(name), None, "{name:?} is too short to claim");
++        }
++    }
++
++    #[test]
++    fn ordinary_names_still_work_and_are_normalised() {
++        assert_eq!(subdomain_label("MyShop").as_deref(), Some("myshop"));
++        assert_eq!(subdomain_label("my_cool_site").as_deref(), Some("my-cool-site"));
++        assert_eq!(subdomain_label("--hello--").as_deref(), Some("hello"));
++    }
++
++    #[test]
++    fn slug_blocks_path_injection() {
++        assert_eq!(slug("../../etc"), "etc");
++        assert_eq!(slug("a/b/c"), "abc");
++        assert_eq!(slug(&"x".repeat(80)).len(), 40);
++    }
++}
+diff --git a/server/src/email.rs b/server/src/email.rs
+index 9fb93e0..569c0f0 100644
+--- a/server/src/email.rs
++++ b/server/src/email.rs
+@@ -8,11 +8,8 @@ use crate::config::Config;
+ use crate::error::{ApiResult, AppError};
+ use crate::AppState;
+ 
+-fn admin_only(claims: &Claims) -> ApiResult<()> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
+-    Ok(())
++async fn admin_only(state: &AppState, claims: &Claims) -> ApiResult<()> {
++    crate::auth::require_admin(state, claims).await.map(|_| ())
+ }
+ 
+ /// Send a single email via the Brevo transactional HTTP API (over HTTPS/443, so
+@@ -67,7 +64,7 @@ pub struct NotifyReq {
+ 
+ /// POST /api/admin/notify — send a notification to all users / a plan tier / one address.
+ pub async fn notify(State(state): State<AppState>, claims: Claims, Json(req): Json<NotifyReq>) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     if req.subject.trim().is_empty() || req.body.trim().is_empty() {
+         return Err(AppError::bad("主题和内容不能为空"));
+     }
+@@ -137,7 +134,7 @@ pub struct EmailLog {
+ 
+ /// GET /api/admin/email-logs — recent outbound mail (admin only).
+ pub async fn logs(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<EmailLog>>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, EmailLog>("SELECT * FROM email_logs ORDER BY id DESC LIMIT 300")
+         .fetch_all(&state.db)
+         .await?;
+diff --git a/server/src/error.rs b/server/src/error.rs
+index b20153f..687e78c 100644
+--- a/server/src/error.rs
++++ b/server/src/error.rs
+@@ -26,10 +26,21 @@ impl AppError {
+ 
+ impl IntoResponse for AppError {
+     fn into_response(self) -> Response {
+-        if self.status.is_server_error() {
++        // Only 500 is genericized. The `From` impls below fill 500 messages with
++        // `sqlx`/`redis` error strings carrying table names, constraint names and SQL
++        // fragments — that belongs in the log, not in a body any anonymous caller reads.
++        // 4xx and 502 are left verbatim on purpose: those messages (quota exhausted,
++        // friendly_upstream's "换个模型或稍后再试") are written FOR the user.
++        let body = if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+             tracing::error!("{}", self.msg);
+-        }
+-        (self.status, Json(json!({ "error": self.msg }))).into_response()
++            "服务器内部错误，请稍后重试".to_string()
++        } else {
++            if self.status.is_server_error() {
++                tracing::error!("{}", self.msg);
++            }
++            self.msg
++        };
++        (self.status, Json(json!({ "error": body }))).into_response()
+     }
+ }
+ 
+diff --git a/server/src/game.rs b/server/src/game.rs
+index 3640f22..27e2018 100644
+--- a/server/src/game.rs
++++ b/server/src/game.rs
+@@ -18,6 +18,40 @@ static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(||
+         .unwrap_or_else(|_| reqwest::Client::new())
+ });
+ 
++/// Every generator below spends either real money on a third-party key (Tripo /
++/// HuggingFace / ElevenLabs / Replicate / Freesound) or real CPU on this box — local
++/// MusicGen costs roughly 4 seconds of CPU per second of audio, up to 30s of audio.
++/// They used to check only that the caller was *some* logged-in account: no plan, no
++/// quota, no credits, and no billing anywhere in this module. A free account could
++/// therefore drain the shared keys and pin the container, which serves all paid chat
++/// traffic too.
++///
++/// `gate` applies the same access rule as chat and charges a flat per-asset fee. The fee
++/// is taken UP FRONT rather than on success: these are best-effort pipelines with several
++/// fallback paths and many early returns, and a pre-charge is the version that cannot be
++/// bypassed by making the expensive call fail. Fees are small and overridable per endpoint.
++async fn gate(
++    state: &AppState,
++    headers: &HeaderMap,
++    env_key: &str,
++    default_cents: i64,
++    label: &str,
++) -> Result<(), AppError> {
++    let uid = crate::models::auth_any_user(state, headers).await?;
++    let (use_quota, _hold) = crate::models::require_quota(state, uid).await?;
++    let cents: i64 = std::env::var(env_key)
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(default_cents)
++        .max(0);
++    crate::models::bill_flat(state, uid, use_quota, cents, label).await;
++    Ok(())
++}
++
++/// Local MusicGen is CPU-bound and unbounded concurrency here starves every other request
++/// in the process. Two at a time; the rest queue.
++static MUSICGEN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
++
+ fn hf_key() -> String { std::env::var("HF_API_KEY").unwrap_or_default() }
+ fn elevenlabs_key() -> String { std::env::var("ELEVENLABS_API_KEY").unwrap_or_default() }
+ fn freesound_key() -> String { std::env::var("FREESOUND_API_KEY").unwrap_or_default() }
+@@ -328,7 +362,7 @@ pub async fn generate_3d(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_3D_CENTS", 20, "game:3d").await?;
+     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+     if prompt.is_empty() { return Err(AppError::bad("缺少 prompt")); }
+     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+@@ -389,6 +423,11 @@ pub async fn generate_3d(
+ // on the container CPU. The default engine for music & (fallback) SFX.
+ async fn local_musicgen(prompt: &str, duration: f64) -> Result<Vec<u8>, AppError> {
+     let dur = duration.clamp(2.0, 30.0);
++    // Hold a slot for the whole subprocess lifetime; released when `_slot` drops.
++    let _slot = MUSICGEN_SLOTS
++        .acquire()
++        .await
++        .map_err(|_| AppError::internal("音乐生成队列不可用"))?;
+     let out = format!("/tmp/mus_{}.mp3", uuid::Uuid::new_v4());
+     tracing::info!("[generate_music] local MusicGen: ~{dur:.0}s, prompt_len={}", prompt.len());
+     let child = tokio::process::Command::new("python3")
+@@ -432,7 +471,7 @@ pub async fn generate_sound(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_SOUND_CENTS", 3, "game:sound").await?;
+     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+     if prompt.is_empty() { return Err(AppError::bad("缺少 prompt")); }
+     let duration = body.get("duration").and_then(|v| v.as_f64()).unwrap_or(5.0);
+@@ -471,7 +510,7 @@ pub async fn generate_music(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_MUSIC_CENTS", 5, "game:music").await?;
+     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+     if prompt.is_empty() { return Err(AppError::bad("缺少 prompt")); }
+     let duration = body.get("duration").and_then(|v| v.as_f64()).unwrap_or(30.0).min(30.0);
+@@ -501,7 +540,7 @@ pub async fn generate_voice(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_VOICE_CENTS", 2, "game:voice").await?;
+     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+     if text.is_empty() { return Err(AppError::bad("缺少 text")); }
+     let voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("default");
+@@ -556,7 +595,7 @@ pub async fn auto_rig(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_RIG_CENTS", 10, "game:rig").await?;
+     // Tripo rigging needs an existing task_id from a previous 3D generation
+     let original_task_id = body.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+     if original_task_id.is_empty() {
+@@ -584,7 +623,7 @@ pub async fn generate_motion(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_MOTION_CENTS", 10, "game:motion").await?;
+     let original_task_id = body.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+     if original_task_id.is_empty() {
+         return Err(AppError::bad(
+@@ -613,7 +652,7 @@ pub async fn generate_texture(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Response, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_TEXTURE_CENTS", 10, "game:texture").await?;
+     let prompt = body.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+     if prompt.is_empty() { return Err(AppError::bad("缺少 prompt")); }
+     let full_prompt = format!("seamless tileable texture, {prompt}, game asset, PBR material");
+@@ -630,7 +669,7 @@ pub async fn search_assets(
+     headers: HeaderMap,
+     Json(body): Json<serde_json::Value>,
+ ) -> Result<Json<serde_json::Value>, AppError> {
+-    crate::models::auth_any_user(&state, &headers).await?;
++    gate(&state, &headers, "GAME_SEARCH_CENTS", 1, "game:search").await?;
+     let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
+     if query.is_empty() { return Err(AppError::bad("缺少 query")); }
+     let asset_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("all");
+diff --git a/server/src/models.rs b/server/src/models.rs
+index e951cdb..6c992df 100644
+--- a/server/src/models.rs
++++ b/server/src/models.rs
+@@ -59,11 +59,8 @@ where
+     })
+ }
+ 
+-fn admin_only(claims: &Claims) -> ApiResult<()> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
+-    Ok(())
++async fn admin_only(state: &AppState, claims: &Claims) -> ApiResult<()> {
++    crate::auth::require_admin(state, claims).await.map(|_| ())
+ }
+ 
+ /// Normalize an OpenAI-compatible base URL: ensure it ends with a `/v1` segment
+@@ -221,7 +218,7 @@ pub async fn admin_list(
+     State(state): State<AppState>,
+     claims: Claims,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, Model>("SELECT * FROM models ORDER BY sort, created_at")
+         .fetch_all(&state.db)
+         .await?;
+@@ -271,7 +268,7 @@ pub async fn admin_create(
+     claims: Claims,
+     Json(req): Json<ModelReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     if req.label.trim().is_empty() || req.base_url.trim().is_empty() {
+         return Err(AppError::bad("名称 / baseUrl 不能为空"));
+     }
+@@ -308,7 +305,7 @@ pub async fn admin_delete(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let res = sqlx::query("DELETE FROM models WHERE id = $1")
+         .bind(id)
+         .execute(&state.db)
+@@ -326,7 +323,7 @@ pub async fn admin_available(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+         .bind(id)
+         .fetch_optional(&state.db)
+@@ -349,9 +346,10 @@ pub async fn admin_available(
+     let status = resp.status();
+     let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+     if !status.is_success() {
++        tracing::warn!("upstream {} listing models: {}", status.as_u16(), data);
+         return Err(AppError {
+             status: axum::http::StatusCode::BAD_GATEWAY,
+-            msg: format!("供应商错误 {}: {}", status.as_u16(), data),
++            msg: format!("供应商错误 {}（详情见服务端日志）", status.as_u16()),
+         });
+     }
+     let ids: Vec<String> = data
+@@ -398,7 +396,7 @@ pub async fn admin_update(
+     Path(id): Path<uuid::Uuid>,
+     Json(req): Json<UpdateReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let m = sqlx::query_as::<_, Model>("SELECT * FROM models WHERE id = $1")
+         .bind(id)
+         .fetch_optional(&state.db)
+@@ -599,9 +597,12 @@ pub async fn chat(
+         .await
+         .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+     if !status.is_success() {
++        // Log the provider's full body; return only the status. The raw body can carry
++        // upstream account state and internal endpoints.
++        tracing::warn!("upstream {} on legacy chat: {}", status.as_u16(), data);
+         return Err(AppError {
+             status: axum::http::StatusCode::BAD_GATEWAY,
+-            msg: format!("模型供应商错误 {}: {}", status.as_u16(), data),
++            msg: format!("模型供应商错误 {}，请换个模型或稍后再试", status.as_u16()),
+         });
+     }
+ 
+@@ -635,7 +636,7 @@ pub async fn chat(
+         model_out,
+     );
+     let tokens = extract_bill_tokens(Some(&effective_usage), &chosen, is_est);
+-    bill(&state, uid, model.id, cost, false, &tokens).await;
++    bill(&state, uid, Some(model.id), cost, false, &tokens).await;
+     Ok(Json(data))
+ }
+ 
+@@ -645,7 +646,7 @@ pub async fn admin_usage(
+     State(state): State<AppState>,
+     claims: Claims,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM model_usage")
+         .fetch_one(&state.db)
+         .await?;
+@@ -738,7 +739,7 @@ pub async fn admin_create_apikey(
+     claims: Claims,
+     Json(req): Json<ApiKeyReq>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let uid = match req
+         .email
+         .as_deref()
+@@ -769,7 +770,7 @@ pub async fn admin_list_apikeys(
+     State(state): State<AppState>,
+     claims: Claims,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, ApiKeyRow>(
+         "SELECT k.id, k.label, k.api_key, u.email, k.created_at, k.last_used_at \
+          FROM api_keys k LEFT JOIN users u ON u.id = k.user_id ORDER BY k.created_at DESC LIMIT 200",
+@@ -789,7 +790,7 @@ pub async fn admin_delete_apikey(
+     claims: Claims,
+     Path(id): Path<uuid::Uuid>,
+ ) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let res = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+         .bind(id)
+         .execute(&state.db)
+@@ -1286,19 +1287,26 @@ fn strip_cache_control(body: &mut serde_json::Value) {
+     }
+ }
+ 
+-/// Deterministic cache key for a chat request: hashes the full request body (model
+-/// + messages + params). serde_json serializes Map keys sorted, so it's stable.
+-/// 128-bit (two seeded hashes) so a collision — which would serve a WRONG cached
+-/// response — is negligible.
+-fn gw_cache_key(body: &serde_json::Value) -> String {
+-    use std::hash::{Hash, Hasher};
+-    let bytes = serde_json::to_vec(body).unwrap_or_default();
+-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+-    bytes.hash(&mut h1);
+-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+-    0x9e37_79b9_7f4a_7c15u64.hash(&mut h2);
+-    bytes.hash(&mut h2);
+-    format!("gwc:{:016x}{:016x}", h1.finish(), h2.finish())
++/// Deterministic cache key for a chat request. serde_json serializes Map keys sorted, so
++/// the same request always produces the same key.
++///
++/// Scoped PER USER, and hashed with SHA-256. Both matter:
++///
++/// * The key used to be global, so an entry stored by one account could be served to
++///   another. Scoping to the caller means a collision can only ever hit your own history.
++/// * It used to use `DefaultHasher`, which is a hash-table primitive: not collision
++///   resistant, and `DefaultHasher::new()` is specified to use fixed zero keys, so anyone
++///   could reproduce it offline and grind for a body colliding with a known request. (The
++///   old comment claimed 128 bits, but the second hash fed a constant plus the *same*
++///   bytes to the *same* keyed function, which is correlated with the first, not
++///   independent.) Rust also reserves the right to change that algorithm between releases.
++fn gw_cache_key(uid: uuid::Uuid, body: &serde_json::Value) -> String {
++    use sha2::{Digest, Sha256};
++    let mut h = Sha256::new();
++    h.update(uid.as_bytes());
++    h.update(b"\x00"); // domain separator: uid can't run into the body
++    h.update(serde_json::to_vec(body).unwrap_or_default());
++    format!("gwc:{:x}", h.finalize())
+ }
+ 
+ /// POST /v1/chat/completions — OpenAI-compatible gateway. Auth via a Michael API
+@@ -1421,7 +1429,7 @@ pub async fn knowledge_domains(
+ 
+ /// Per-call token detail for the model_usage audit trail.
+ #[derive(Clone, Default)]
+-struct BillTokens {
++pub(crate) struct BillTokens {
+     prompt: i64,
+     completion: i64,
+     cached: i64,
+@@ -1477,12 +1485,166 @@ fn estimated_usage(input_tok: i64, output_tok: i64) -> serde_json::Value {
+     json!({ "prompt_tokens": input_tok, "completion_tokens": output_tok, "total_tokens": input_tok + output_tok })
+ }
+ 
++// ---- access gate + concurrency reservation ---------------------------------
++
++/// Cents held while a call is in flight.
++///
++/// The balance in Postgres only moves when a call FINISHES, so a burst of concurrent
++/// requests all read the same balance and all pass the gate: a user with 10¢ could run
++/// 50 parallel calls and still pay 10¢. The IDE's own multi-agent fan-out makes that a
++/// routine pattern, not a contrived one. So calls that are still running are counted, in
++/// Redis (shared across workers), against the balance.
++///
++/// A flat hold is deliberate — it bounds concurrency in proportion to the balance without
++/// having to predict a call's cost, and it is released in full when the call settles, so
++/// the user is only ever charged the real `compute_cost` amount.
++const INFLIGHT_HOLD_CENTS: i64 = 25;
++/// A hold cannot outlive this, so a killed process can never strand one.
++const INFLIGHT_TTL_SECS: i64 = 900;
++
++fn inflight_key(uid: uuid::Uuid) -> String {
++    format!("inflight:{uid}")
++}
++
++async fn inflight_now(state: &AppState, uid: uuid::Uuid) -> i64 {
++    let mut conn = state.redis.clone();
++    let v: Result<Option<i64>, _> = redis::cmd("GET")
++        .arg(inflight_key(uid))
++        .query_async(&mut conn)
++        .await;
++    v.ok().flatten().unwrap_or(0).max(0)
++}
++
++/// RAII reservation. Released in `Drop`, so every early return, `?` and panic path gives
++/// it back; `Drop` cannot be async, hence the spawn.
++pub(crate) struct InflightHold {
++    state: AppState,
++    uid: uuid::Uuid,
++    cents: i64,
++}
++
++impl InflightHold {
++    async fn acquire(state: &AppState, uid: uuid::Uuid, cents: i64) -> Self {
++        let mut conn = state.redis.clone();
++        let key = inflight_key(uid);
++        let _: Result<i64, _> = redis::cmd("INCRBY")
++            .arg(&key)
++            .arg(cents)
++            .query_async(&mut conn)
++            .await;
++        // EXPIRE on every acquire (idempotent) so the key always carries a TTL.
++        let _: Result<(), _> = redis::cmd("EXPIRE")
++            .arg(&key)
++            .arg(INFLIGHT_TTL_SECS)
++            .query_async(&mut conn)
++            .await;
++        Self { state: state.clone(), uid, cents }
++    }
++}
++
++impl Drop for InflightHold {
++    fn drop(&mut self) {
++        let (st, uid, cents) = (self.state.clone(), self.uid, self.cents);
++        // try_current() rather than tokio::spawn: Drop can run while the runtime is
++        // shutting down, where spawn panics. Failing to release is harmless there — the
++        // key carries INFLIGHT_TTL_SECS and expires on its own.
++        let Ok(handle) = tokio::runtime::Handle::try_current() else {
++            return;
++        };
++        handle.spawn(async move {
++            let mut conn = st.redis.clone();
++            let key = inflight_key(uid);
++            let left: Result<i64, _> = redis::cmd("DECRBY")
++                .arg(&key)
++                .arg(cents)
++                .query_async(&mut conn)
++                .await;
++            if matches!(left, Ok(n) if n <= 0) {
++                let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
++            }
++        });
++    }
++}
++
++/// Refill the 5h30m window and reset the weekly counter when either is due.
++async fn refill_quota(state: &AppState, uid: uuid::Uuid) -> Result<(), AppError> {
++    sqlx::query(
++        "UPDATE users SET \
++         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
++         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
++         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
++         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
++         WHERE id = $1",
++    )
++    .bind(uid)
++    .execute(&state.db)
++    .await?;
++    Ok(())
++}
++
++/// THE access gate for every metered endpoint: refill what is due, then check the caller
++/// can pay — membership quota first, pay-as-you-go credits second.
++///
++/// Returns `(use_quota, hold)`. Keep `hold` alive for the whole upstream call; dropping it
++/// releases the reservation. Was duplicated in three handlers and absent from four more.
++pub(crate) async fn require_quota(
++    state: &AppState,
++    uid: uuid::Uuid,
++) -> Result<(bool, InflightHold), AppError> {
++    refill_quota(state, uid).await?;
++    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
++        String,
++        Option<chrono::DateTime<chrono::Utc>>,
++        i64,
++        i64,
++        i64,
++        i64,
++        i64,
++    ) = sqlx::query_as(
++        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
++         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
++    )
++    .bind(uid)
++    .fetch_one(&state.db)
++    .await?;
++    let inflight = inflight_now(state, uid).await;
++    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
++    // Every pool is compared against balance-minus-in-flight, not the raw balance.
++    let quota_ok = plan_active
++        && q_total > inflight
++        && q_window > inflight
++        && (q_weekly_cap == 0 || q_week_used + inflight < q_weekly_cap);
++    if !quota_ok && credits <= inflight {
++        // Distinguish "you are out of money" from "you have money but too many calls are
++        // already running" — otherwise a burst looks like a billing bug to the user.
++        let contended = inflight > 0
++            && (credits > 0 || (plan_active && q_total > 0 && q_window > 0));
++        let msg = if contended {
++            "并发请求过多，请等前面的请求返回后再试"
++        } else if plan_active && q_total <= 0 {
++            "总额度已用完"
++        } else if plan_active && q_window <= 0 {
++            "本时段额度已用完，请等待刷新（每 5.5 小时）"
++        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
++            "本周额度已用完"
++        } else {
++            "请先开通会员或充值额度"
++        };
++        return Err(AppError {
++            status: StatusCode::PAYMENT_REQUIRED,
++            msg: msg.into(),
++        });
++    }
++    let hold = InflightHold::acquire(state, uid, INFLIGHT_HOLD_CENTS).await;
++    Ok((quota_ok, hold))
++}
++
+ /// Deduct cost from the user's quota/credits and log the model_usage row with token detail.
+ /// Module-scope so chat_completions, responses_proxy, and image_generations all share it.
+-async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64, use_quota: bool, tokens: &BillTokens) {
++pub(crate) async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: Option<uuid::Uuid>, cost: i64, use_quota: bool, tokens: &BillTokens) {
+     if cost > 0 {
+-        if use_quota {
+-            let _ = sqlx::query(
++        let res = if use_quota {
++            sqlx::query(
+                 "UPDATE users SET quota_total_cents = GREATEST(quota_total_cents - $1, 0), \
+                  quota_window_cents = GREATEST(quota_window_cents - $1, 0), \
+                  quota_week_used_cents = quota_week_used_cents + $1 WHERE id = $2",
+@@ -1490,18 +1652,24 @@ async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64,
+             .bind(cost)
+             .bind(uid)
+             .execute(&state.db)
+-            .await;
++            .await
+         } else {
+-            let _ = sqlx::query(
++            sqlx::query(
+                 "UPDATE users SET credits_cents = GREATEST(credits_cents - $1, 0) WHERE id = $2",
+             )
+             .bind(cost)
+             .bind(uid)
+             .execute(&state.db)
+-            .await;
++            .await
++        };
++        // This used to be `let _ =`. For streaming calls bill() runs in a detached task
++        // AFTER the response was sent, so nothing upstream can observe a failure — a lost
++        // write meant silently uncharged usage with no trace anywhere.
++        if let Err(e) = res {
++            tracing::error!(user = %uid, cost, "billing write FAILED, usage not charged: {e}");
+         }
+     }
+-    let _ = sqlx::query(
++    let logged = sqlx::query(
+         "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, model_name, estimated) \
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+     )
+@@ -1515,6 +1683,29 @@ async fn bill(state: &AppState, uid: uuid::Uuid, conn_id: uuid::Uuid, cost: i64,
+     .bind(tokens.estimated)
+     .execute(&state.db)
+     .await;
++    if let Err(e) = logged {
++        tracing::error!(user = %uid, cost, "model_usage insert FAILED: {e}");
++    }
++}
++
++/// Charge a flat fee for an asset that isn't a token-billed model call (3D mesh, sound,
++/// music, voice, transcription) and record it in model_usage with a NULL connection.
++pub(crate) async fn bill_flat(
++    state: &AppState,
++    uid: uuid::Uuid,
++    use_quota: bool,
++    cents: i64,
++    label: &str,
++) {
++    bill(
++        state,
++        uid,
++        None,
++        cents.max(0),
++        use_quota,
++        &BillTokens { model_name: label.to_string(), estimated: true, ..Default::default() },
++    )
++    .await;
+ }
+ 
+ // ============ Anthropic protocol bridge (OpenAI ⇄ Anthropic Messages API) ============
+@@ -2105,14 +2296,24 @@ pub async fn audio_transcriptions(
+         .map(|s| s.trim().to_string())
+         .filter(|s| !s.is_empty())
+         .ok_or_else(|| AppError::unauthorized("缺少 API Key"))?;
+-    let _uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
++    // This was `let _uid` — the caller was identified and then thrown away, so the
++    // endpoint ran with no quota check and no billing at all: any account could burn the
++    // shared Groq key on 25MB uploads indefinitely. The underscore also silenced the
++    // unused-variable warning that would have flagged it.
++    let uid: uuid::Uuid = match sqlx::query_scalar::<_, uuid::Uuid>(
+         "SELECT user_id FROM api_keys WHERE api_key = $1",
+     )
+     .bind(&token)
+     .fetch_optional(&state.db)
+     .await?
+     {
+-        Some(u) => u,
++        Some(u) => {
++            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE api_key = $1")
++                .bind(&token)
++                .execute(&state.db)
++                .await;
++            u
++        }
+         None => crate::auth::user_from_jwt(&state.cfg, &token)
+             .ok_or_else(|| AppError::unauthorized("登录已失效或密钥无效"))?,
+     };
+@@ -2121,6 +2322,8 @@ pub async fn audio_transcriptions(
+         return Err(AppError::bad("转写服务未配置"));
+     }
+ 
++    let (use_quota, _hold) = require_quota(&state, uid).await?;
++
+     // ---- read the multipart form: file (required) + optional language ----
+     let mut file_bytes: Option<Vec<u8>> = None;
+     let mut file_name = "speech.m4a".to_string();
+@@ -2198,6 +2401,30 @@ pub async fn audio_transcriptions(
+         .await
+         .map_err(|e| AppError::bad(format!("转写上游读取失败: {e}")))?;
+ 
++    // Meter it. Whisper is priced per audio-minute upstream and we never learn the
++    // duration, so charge a flat fee per successful transcription — enough to make the
++    // call appear in model_usage and count against quota. Tune with TRANSCRIBE_CALL_CENTS.
++    if status.is_success() {
++        let cents: i64 = std::env::var("TRANSCRIBE_CALL_CENTS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(1)
++            .max(0);
++        bill(
++            &state,
++            uid,
++            None, // not tied to a model connection
++            cents,
++            use_quota,
++            &BillTokens {
++                model_name: state.cfg.transcribe_model.clone(),
++                estimated: true,
++                ..Default::default()
++            },
++        )
++        .await;
++    }
++
+     Ok(Response::builder()
+         .status(status)
+         .header(axum::http::header::CONTENT_TYPE, ctype)
+@@ -2263,46 +2490,9 @@ pub async fn chat_completions(
+         .find(|m| allowed_ids(m).contains(&model_id))
+         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+ 
+-    // Refill the 5h30m window + reset the weekly counter when due.
+-    sqlx::query(
+-        "UPDATE users SET \
+-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+-         WHERE id = $1",
+-    )
+-    .bind(uid)
+-    .execute(&state.db)
+-    .await?;
+-
+-    // Access gate: active-membership quota (window/total/weekly) OR pay-as-you-go credits.
+-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (String, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64, i64, i64) =
+-        sqlx::query_as("SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1")
+-            .bind(uid)
+-            .fetch_one(&state.db)
+-            .await?;
+-    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
+-    let quota_ok = plan_active
+-        && q_total > 0
+-        && q_window > 0
+-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+-    let use_quota = quota_ok;
+-    if !quota_ok && credits <= 0 {
+-        let msg = if plan_active && q_total <= 0 {
+-            "总额度已用完"
+-        } else if plan_active && q_window <= 0 {
+-            "本时段额度已用完，请等待刷新（每 5.5 小时）"
+-        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
+-            "本周额度已用完"
+-        } else {
+-            "请先开通会员或充值额度"
+-        };
+-        return Err(AppError {
+-            status: StatusCode::PAYMENT_REQUIRED,
+-            msg: msg.into(),
+-        });
+-    }
++    // Access gate: membership quota or credits, with an in-flight reservation so a
++    // burst of concurrent calls can't all pass on the same stale balance.
++    let (use_quota, hold) = require_quota(&state, uid).await?;
+ 
+     let streaming = body
+         .get("stream")
+@@ -2324,7 +2514,7 @@ pub async fn chat_completions(
+     // for EVERY model regardless of whether the upstream caches. Best-effort: any
+     // Redis hiccup or miss just falls through to a normal upstream call. The quota
+     // gate already ran above, so a hit still requires access — it just costs nothing.
+-    let ckey = gw_cache_key(&body);
++    let ckey = gw_cache_key(uid, &body);
+     {
+         let mut rconn = state.redis.clone();
+         let hit: Option<Vec<u8>> = redis::cmd("GET")
+@@ -2334,7 +2524,7 @@ pub async fn chat_completions(
+             .ok()
+             .flatten();
+         if let Some(bytes) = hit {
+-            bill(&state, uid, conn.id, 0, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await; // record a 0-cost cache hit
++            bill(&state, uid, Some(conn.id), 0, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await; // record a 0-cost cache hit
+             let ct = if streaming {
+                 "text/event-stream"
+             } else {
+@@ -2644,7 +2834,10 @@ pub async fn chat_completions(
+                     .query_async(&mut rconn)
+                     .await;
+             }
+-            bill(&st, uid, cid, cost, use_quota, &tokens).await;
++            bill(&st, uid, Some(cid), cost, use_quota, &tokens).await;
++            // Release the in-flight reservation only now — the response was handed to the
++            // client long before this task finished streaming and billing.
++            drop(hold);
+         });
+         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+             rx.recv().await.map(|item| (item, rx))
+@@ -2662,9 +2855,10 @@ pub async fn chat_completions(
+             .await
+             .unwrap_or_else(|_| json!({ "error": "上游返回非 JSON" }));
+         if !status.is_success() {
++            tracing::warn!("upstream {} on chat_completions: {}", status.as_u16(), raw);
+             return Err(AppError {
+                 status: StatusCode::BAD_GATEWAY,
+-                msg: format!("模型供应商错误 {}: {}", status.as_u16(), raw),
++                msg: format!("模型供应商错误 {}，请换个模型或稍后再试", status.as_u16()),
+             });
+         }
+         // Anthropic native response → OpenAI shape for the IDE (usage kept in a form compute_cost bills).
+@@ -2730,7 +2924,7 @@ pub async fn chat_completions(
+             );
+             (cost, extract_bill_tokens(Some(&effective_usage), &model_id, is_est))
+         };
+-        bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
++        bill(&state, uid, Some(conn.id), cost, use_quota, &tokens).await;
+         Ok(Json(data).into_response())
+     }
+ }
+@@ -2790,46 +2984,9 @@ pub async fn responses_proxy(
+         .find(|m| allowed_ids(m).contains(&model_id))
+         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+ 
+-    // Same quota refill + check as image_generations.
+-    sqlx::query(
+-        "UPDATE users SET \
+-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+-         WHERE id = $1",
+-    )
+-    .bind(uid)
+-    .execute(&state.db)
+-    .await?;
+-
+-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+-        String,
+-        Option<chrono::DateTime<chrono::Utc>>,
+-        i64,
+-        i64,
+-        i64,
+-        i64,
+-        i64,
+-    ) = sqlx::query_as(
+-        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+-         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
+-    )
+-    .bind(uid)
+-    .fetch_one(&state.db)
+-    .await?;
+-    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
+-    let quota_ok = plan_active
+-        && q_total > 0
+-        && q_window > 0
+-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+-    let use_quota = quota_ok;
+-    if !quota_ok && credits <= 0 {
+-        return Err(AppError {
+-            status: StatusCode::PAYMENT_REQUIRED,
+-            msg: "请先开通会员或充值额度".into(),
+-        });
+-    }
++    // Access gate: membership quota or credits, with an in-flight reservation so a
++    // burst of concurrent calls can't all pass on the same stale balance.
++    let (use_quota, _hold) = require_quota(&state, uid).await?;
+ 
+     // Always ensure image_generation tool is present for image models.
+     let is_image_model = model_id.to_lowercase().contains("gpt-image")
+@@ -2961,7 +3118,7 @@ pub async fn responses_proxy(
+             } else {
+                 (30.0 * n_images * conn.rate).round().min(5000.0) as i64
+             };
+-            bill(&state, uid, conn.id, cost, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await;
++            bill(&state, uid, Some(conn.id), cost, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await;
+         } else {
+             let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+             let cost = resolve_cost(
+@@ -2978,7 +3135,7 @@ pub async fn responses_proxy(
+                 model_out,
+             );
+             let tokens = extract_bill_tokens(data.get("usage"), &model_id, false);
+-            bill(&state, uid, conn.id, cost, use_quota, &tokens).await;
++            bill(&state, uid, Some(conn.id), cost, use_quota, &tokens).await;
+         }
+     }
+ 
+@@ -3033,55 +3190,9 @@ pub async fn image_generations(
+         .find(|m| allowed_ids(m).contains(&model_id))
+         .ok_or_else(|| AppError::bad(format!("模型 {model_id} 不可用")))?;
+ 
+-    // Quota refill + check (same as chat_completions).
+-    sqlx::query(
+-        "UPDATE users SET \
+-         quota_window_cents = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN LEAST(quota_window_cap_cents, quota_total_cents) ELSE quota_window_cents END, \
+-         quota_window_reset_at = CASE WHEN (quota_window_reset_at IS NULL OR quota_window_reset_at <= now()) AND quota_total_cents > 0 THEN now() + interval '5 hours 30 minutes' ELSE quota_window_reset_at END, \
+-         quota_week_used_cents = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN 0 ELSE quota_week_used_cents END, \
+-         quota_week_reset_at = CASE WHEN quota_week_reset_at IS NULL OR quota_week_reset_at <= now() THEN now() + interval '7 days' ELSE quota_week_reset_at END \
+-         WHERE id = $1",
+-    )
+-    .bind(uid)
+-    .execute(&state.db)
+-    .await?;
+-
+-    let (plan, plan_exp, q_total, q_window, q_weekly_cap, q_week_used, credits): (
+-        String,
+-        Option<chrono::DateTime<chrono::Utc>>,
+-        i64,
+-        i64,
+-        i64,
+-        i64,
+-        i64,
+-    ) = sqlx::query_as(
+-        "SELECT plan, plan_expires_at, quota_total_cents, quota_window_cents, \
+-         quota_weekly_cap_cents, quota_week_used_cents, credits_cents FROM users WHERE id = $1",
+-    )
+-    .bind(uid)
+-    .fetch_one(&state.db)
+-    .await?;
+-    let plan_active = plan != "none" && plan_exp.map_or(true, |e| e > chrono::Utc::now());
+-    let quota_ok = plan_active
+-        && q_total > 0
+-        && q_window > 0
+-        && (q_weekly_cap == 0 || q_week_used < q_weekly_cap);
+-    let use_quota = quota_ok;
+-    if !quota_ok && credits <= 0 {
+-        let msg = if plan_active && q_total <= 0 {
+-            "总额度已用完"
+-        } else if plan_active && q_window <= 0 {
+-            "本时段额度已用完，请等待刷新（每 5.5 小时）"
+-        } else if plan_active && q_weekly_cap > 0 && q_week_used >= q_weekly_cap {
+-            "本周额度已用完"
+-        } else {
+-            "请先开通会员或充值额度"
+-        };
+-        return Err(AppError {
+-            status: StatusCode::PAYMENT_REQUIRED,
+-            msg: msg.into(),
+-        });
+-    }
++    // Access gate: membership quota or credits, with an in-flight reservation so a
++    // burst of concurrent calls can't all pass on the same stale balance.
++    let (use_quota, _hold) = require_quota(&state, uid).await?;
+ 
+     // Proxy to upstream /images/generations with retry for transient failures.
+     let url = format!("{}/images/generations", api_base(&conn.base_url));
+@@ -3205,7 +3316,7 @@ pub async fn image_generations(
+             (30.0 * n_images * conn.rate).round().min(5000.0) as i64
+         };
+         if cost > 0 {
+-            bill(&state, uid, conn.id, cost, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await;
++            bill(&state, uid, Some(conn.id), cost, use_quota, &BillTokens { model_name: model_id.clone(), ..Default::default() }).await;
+         }
+     }
+ 
+@@ -4076,3 +4187,36 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
+         assert!(cost > 0, "estimated usage should produce nonzero cost, got {}", cost);
+     }
+ }
++
++#[cfg(test)]
++mod cache_key_tests {
++    use super::gw_cache_key;
++    use serde_json::json;
++
++    fn body() -> serde_json::Value {
++        json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": "hi" }] })
++    }
++
++    #[test]
++    fn same_user_same_body_hits() {
++        let u = uuid::Uuid::nil();
++        assert_eq!(gw_cache_key(u, &body()), gw_cache_key(u, &body()));
++    }
++
++    #[test]
++    fn different_users_never_share_an_entry() {
++        // The key used to be global, so one account's completion could be served to
++        // another. Scoping to the caller is what makes that impossible.
++        let a = uuid::Uuid::from_u128(1);
++        let b = uuid::Uuid::from_u128(2);
++        assert_ne!(gw_cache_key(a, &body()), gw_cache_key(b, &body()));
++    }
++
++    #[test]
++    fn different_body_different_key() {
++        let u = uuid::Uuid::nil();
++        let mut other = body();
++        other["messages"][0]["content"] = json!("bye");
++        assert_ne!(gw_cache_key(u, &body()), gw_cache_key(u, &other));
++    }
++}
+diff --git a/server/src/pay.rs b/server/src/pay.rs
+index 3ab76fa..4639ffe 100644
+--- a/server/src/pay.rs
++++ b/server/src/pay.rs
+@@ -7,11 +7,8 @@ use crate::auth::Claims;
+ use crate::error::{ApiResult, AppError};
+ use crate::AppState;
+ 
+-fn admin_only(claims: &Claims) -> ApiResult<()> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
+-    Ok(())
++async fn admin_only(state: &AppState, claims: &Claims) -> ApiResult<()> {
++    crate::auth::require_admin(state, claims).await.map(|_| ())
+ }
+ 
+ // ---------------- prices (products) ----------------
+@@ -71,7 +68,7 @@ pub async fn list_prices_public(State(state): State<AppState>) -> ApiResult<Json
+ 
+ /// GET /api/admin/prices — all products (admin).
+ pub async fn admin_list_prices(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<Price>>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, Price>("SELECT * FROM prices ORDER BY sort, created_at")
+         .fetch_all(&state.db)
+         .await?;
+@@ -80,7 +77,7 @@ pub async fn admin_list_prices(State(state): State<AppState>, claims: Claims) ->
+ 
+ /// POST /api/admin/prices — create a product (admin).
+ pub async fn admin_create_price(State(state): State<AppState>, claims: Claims, Json(req): Json<PriceReq>) -> ApiResult<Json<Price>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     if req.label.trim().is_empty() {
+         return Err(AppError::bad("请填写名称"));
+     }
+@@ -106,7 +103,7 @@ pub async fn admin_create_price(State(state): State<AppState>, claims: Claims, J
+ 
+ /// DELETE /api/admin/prices/:id (admin).
+ pub async fn admin_delete_price(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let res = sqlx::query("DELETE FROM prices WHERE id = $1").bind(id).execute(&state.db).await?;
+     if res.rows_affected() == 0 {
+         return Err(AppError::bad("商品不存在"));
+@@ -168,7 +165,7 @@ pub async fn create_order(State(state): State<AppState>, claims: Claims, Json(re
+ 
+ /// GET /api/admin/orders — all orders (admin).
+ pub async fn admin_list_orders(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<Vec<Order>>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, Order>("SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000")
+         .fetch_all(&state.db)
+         .await?;
+@@ -177,7 +174,7 @@ pub async fn admin_list_orders(State(state): State<AppState>, claims: Claims) ->
+ 
+ /// POST /api/admin/orders/:id/confirm — mark a pending order paid and grant it (admin).
+ pub async fn admin_confirm_order(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let mut tx = state.db.begin().await?;
+     let order = sqlx::query_as::<_, Order>("SELECT * FROM orders WHERE id = $1 FOR UPDATE")
+         .bind(id)
+@@ -204,7 +201,7 @@ pub async fn admin_confirm_order(State(state): State<AppState>, claims: Claims,
+ 
+ /// POST /api/admin/orders/:id/cancel (admin).
+ pub async fn admin_cancel_order(State(state): State<AppState>, claims: Claims, Path(id): Path<uuid::Uuid>) -> ApiResult<Json<serde_json::Value>> {
+-    admin_only(&claims)?;
++    admin_only(&state, &claims).await?;
+     let res = sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = $1 AND status = 'pending'")
+         .bind(id)
+         .execute(&state.db)
+diff --git a/server/src/realtime.rs b/server/src/realtime.rs
+index 1547036..3dec940 100644
+--- a/server/src/realtime.rs
++++ b/server/src/realtime.rs
+@@ -1,6 +1,5 @@
+ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+-use axum::extract::State;
+-use axum::response::IntoResponse;
++use axum::extract::{Query, State};
+ use axum::Json;
+ use futures_util::StreamExt;
+ use serde_json::json;
+@@ -9,7 +8,13 @@ use crate::error::{ApiResult, AppError};
+ use crate::AppState;
+ 
+ const FEED_CHANNEL: &str = "events:feed";
+-const ONLINE_KEY: &str = "online:count";
++/// Presence is one short-lived key PER CONNECTION, refreshed while the socket is open.
++/// The previous single INCR/DECR counter drifted upward forever — a container restart or
++/// a panic skipped the decrement, and the key had no TTL to heal it, so "online" only
++/// ever grew. Per-connection keys expire on their own when a process dies.
++const PRESENCE_PREFIX: &str = "ws:online:";
++const PRESENCE_TTL_SECS: i64 = 45;
++const PRESENCE_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+ 
+ /// Persist an event and publish it to the live feed. Best-effort: a telemetry
+ /// failure must never break the request that triggered it.
+@@ -38,32 +43,102 @@ pub async fn record_event(state: &AppState, user_id: Option<uuid::Uuid>, kind: &
+     }
+ }
+ 
+-async fn bump_online(state: &AppState, delta: i64) {
++async fn touch_presence(state: &AppState, key: &str) {
+     let mut conn = state.redis.clone();
+-    let _: Result<i64, _> = redis::cmd("INCRBY").arg(ONLINE_KEY).arg(delta).query_async(&mut conn).await;
++    let _: Result<(), _> = redis::cmd("SET")
++        .arg(key)
++        .arg(1)
++        .arg("EX")
++        .arg(PRESENCE_TTL_SECS)
++        .query_async(&mut conn)
++        .await;
+ }
+ 
+-/// GET /ws — upgrade to a WebSocket that streams the live event feed (fanned out
+-/// across all backend instances via Redis pub/sub) and tracks online presence.
+-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+-    ws.on_upgrade(move |socket| handle_socket(socket, state))
++async fn drop_presence(state: &AppState, key: &str) {
++    let mut conn = state.redis.clone();
++    let _: Result<(), _> = redis::cmd("DEL").arg(key).query_async(&mut conn).await;
++}
++
++/// Count live presence keys. SCAN rather than KEYS so a large keyspace never blocks Redis.
++async fn online_count(state: &AppState) -> i64 {
++    let mut conn = state.redis.clone();
++    let pattern = format!("{PRESENCE_PREFIX}*");
++    let mut cursor: u64 = 0;
++    let mut n: i64 = 0;
++    loop {
++        let res: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
++            .arg(cursor)
++            .arg("MATCH")
++            .arg(&pattern)
++            .arg("COUNT")
++            .arg(500)
++            .query_async(&mut conn)
++            .await;
++        match res {
++            Ok((next, keys)) => {
++                n += keys.len() as i64;
++                cursor = next;
++                if cursor == 0 {
++                    break;
++                }
++            }
++            Err(_) => break,
++        }
++    }
++    n
++}
++
++#[derive(serde::Deserialize)]
++pub struct WsAuth {
++    pub token: Option<String>,
++}
++
++/// GET /ws?token=<jwt> — live event feed, ADMIN ONLY.
++///
++/// This upgraded for anyone who asked, while the two REST endpoints on the same feed
++/// (`recent_events` / `stats`) required admin. Everything published to the channel — the
++/// email of every user who registers or logs in, order amounts, plan changes, admin
++/// addresses — was therefore readable by any anonymous client on the internet.
++///
++/// The token arrives as a query parameter because browsers cannot set headers on a
++/// WebSocket handshake; it is the same login JWT the dashboard already holds.
++pub async fn ws_handler(
++    ws: WebSocketUpgrade,
++    Query(q): Query<WsAuth>,
++    State(state): State<AppState>,
++) -> Result<axum::response::Response, AppError> {
++    let token = q.token.unwrap_or_default();
++    let uid = crate::auth::user_from_jwt(&state.cfg, &token)
++        .ok_or_else(|| AppError::unauthorized("需要登录"))?;
++    // Live role, not the one baked into the token — see auth::require_admin.
++    let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
++        .bind(uid)
++        .fetch_optional(&state.db)
++        .await?;
++    if role.as_deref() != Some("admin") {
++        return Err(AppError::forbidden("需要管理员权限"));
++    }
++    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
+ }
+ 
+ async fn handle_socket(mut socket: WebSocket, state: AppState) {
+-    bump_online(&state, 1).await;
+-    let result = stream_feed(&mut socket, &state).await;
++    let key = format!("{}{}", PRESENCE_PREFIX, uuid::Uuid::new_v4());
++    touch_presence(&state, &key).await;
++    let result = stream_feed(&mut socket, &state, &key).await;
+     if let Err(e) = result {
+         tracing::debug!("ws closed: {}", e.msg);
+     }
+-    bump_online(&state, -1).await;
++    drop_presence(&state, &key).await;
+ }
+ 
+-async fn stream_feed(socket: &mut WebSocket, state: &AppState) -> ApiResult<()> {
++async fn stream_feed(socket: &mut WebSocket, state: &AppState, presence_key: &str) -> ApiResult<()> {
+     let mut pubsub = state.redis_client.get_async_pubsub().await?;
+     pubsub.subscribe(FEED_CHANNEL).await?;
+     let mut messages = pubsub.on_message();
++    let mut refresh = tokio::time::interval(PRESENCE_REFRESH);
+     loop {
+         tokio::select! {
++            _ = refresh.tick() => { touch_presence(state, presence_key).await; }
+             maybe = messages.next() => {
+                 match maybe {
+                     Some(msg) => {
+@@ -100,9 +175,7 @@ pub struct Event {
+ /// GET /api/admin/events — recent activity for the dashboard's initial load
+ /// (the live tail then arrives over /ws). Admin only.
+ pub async fn recent_events(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<Vec<Event>>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++    crate::auth::require_admin(&state, &claims).await?;
+     let rows = sqlx::query_as::<_, Event>(
+         "SELECT id, user_id, kind, data, created_at FROM events ORDER BY id DESC LIMIT 50",
+     )
+@@ -113,18 +186,14 @@ pub async fn recent_events(State(state): State<AppState>, claims: crate::auth::C
+ 
+ /// GET /api/admin/stats — headline numbers for the dashboard (admin only).
+ pub async fn stats(State(state): State<AppState>, claims: crate::auth::Claims) -> ApiResult<Json<serde_json::Value>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++    crate::auth::require_admin(&state, &claims).await?;
+     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&state.db).await?;
+     let today: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE created_at >= date_trunc('day', now())")
+         .fetch_one(&state.db)
+         .await?;
+-    let mut conn = state.redis.clone();
+-    let online: Option<i64> = redis::cmd("GET").arg(ONLINE_KEY).query_async(&mut conn).await?;
+     Ok(Json(json!({
+         "total_users": total,
+         "today_users": today,
+-        "online": online.unwrap_or(0).max(0),
++        "online": online_count(&state).await,
+     })))
+ }
+diff --git a/server/src/skills.rs b/server/src/skills.rs
+index 1d9570e..f67c6f3 100644
+--- a/server/src/skills.rs
++++ b/server/src/skills.rs
+@@ -53,9 +53,7 @@ pub async fn admin_list_skills(
+     State(state): State<AppState>,
+     claims: Claims,
+ ) -> ApiResult<Json<Value>> {
+-    if claims.role != "admin" {
+-        return Err(AppError::forbidden("需要管理员权限"));
+-    }
++    crate::auth::require_admin(&state, &claims).await?;
+     let rows: Vec<(String, Value, String)> = sqlx::query_as(
+         "SELECT u.email, s.skills, s.updated_at::text \
+          FROM user_skills s JOIN users u ON u.id = s.user_id \
+diff --git a/server/static/admin.html b/server/static/admin.html
+index aa3de0b..bf3f908 100644
+--- a/server/static/admin.html
++++ b/server/static/admin.html
+@@ -1055,7 +1055,9 @@ function openModelEdit(m){
+ /* ---------- websocket (global) ---------- */
+ function connectWs(){
+   const proto=location.protocol==="https:"?"wss":"ws";
+-  ws=new WebSocket(`${proto}://${location.host}/ws`);
++  if(!token) return;  // feed is admin-only now; no token → nothing to subscribe to
++  // Token goes in the query string because browsers can't set headers on a WS handshake.
++  ws=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+   ws.onmessage=(ev)=>{
+     let e; try{e=JSON.parse(ev.data);}catch{return;}
+     addEvent(e); refreshStats();

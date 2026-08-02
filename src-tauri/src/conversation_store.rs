@@ -1231,11 +1231,22 @@ async fn hydrate_snapshot(pool: &SqlitePool, snapshot: &mut Value) -> Result<(),
                 .or_insert_with(|| Value::Array(Vec::new()));
         }
         externalize_transcript_metadata(&mut session, &lengths)?;
-        let key = if row.get::<i64, _>("is_closed") != 0 {
-            "closedSessions"
-        } else {
-            "sessions"
-        };
+        // A row missing from the snapshot is restored as CLOSED, never as an open tab.
+        //
+        // This registry is a durability backstop: it exists so a conversation is never lost,
+        // not so it is reopened. Which sessions are OPEN is the snapshot's call, and this row
+        // is by definition absent from it. Resurrecting into "sessions" made absence mean
+        // "the snapshot must be incomplete" when it usually means "the user closed this".
+        //
+        // `is_closed` cannot be trusted to tell those apart. Nothing ever deletes from this
+        // table, and the flag is only set when a save happens to carry the session inside
+        // `closedSessions` — and that array is produced by a *budgeted* serializer that drops
+        // entries under quota pressure. So a closed session that got trimmed from one save
+        // keeps is_closed = 0 forever and came back as an open tab on every single launch.
+        //
+        // Restoring it closed keeps the conversation fully recoverable from history while
+        // never reopening a tab the user deliberately shut.
+        let key = "closedSessions";
         object
             .get_mut(key)
             .and_then(Value::as_array_mut)
@@ -1682,6 +1693,52 @@ mod tests {
             }
         }
         assert_eq!(assembled, content);
+    }
+
+    /// A session the user CLOSED must not come back as an open tab.
+    ///
+    /// Nothing ever deletes from `conversation_sessions`, and `is_closed` only flips to 1 when
+    /// a save happens to carry that session inside `closedSessions` — an array built by a
+    /// budgeted serializer that drops entries under quota pressure. So a closed session whose
+    /// row still reads `is_closed = 0` is the NORMAL case, not an edge case, and hydration used
+    /// to push exactly those rows back into `"sessions"` on every single launch.
+    #[tokio::test]
+    async fn hydration_never_reopens_a_session_the_snapshot_left_out() {
+        let pool = test_pool().await;
+        for id in ["kept_open", "user_closed_it"] {
+            sqlx::query("INSERT INTO conversation_sessions (session_id, session_json, is_closed, updated_at) VALUES (?, ?, 0, 1)")
+                .bind(id)
+                .bind(format!(r#"{{"id":"{id}","memory":{{}}}}"#))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // The frontend still lists one session as open; the other it dropped, because the user
+        // closed it. Both rows say is_closed = 0.
+        let mut snapshot = json!({
+            "sessions": [{"id": "kept_open", "memory": {}}],
+            "closedSessions": [],
+            "activeIdx": 0,
+        });
+        hydrate_snapshot(&pool, &mut snapshot).await.unwrap();
+
+        let open: Vec<&str> = snapshot["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(open, ["kept_open"], "hydration must not add tabs the snapshot omitted");
+
+        // ...but the conversation itself is preserved, just closed — never silently dropped.
+        let closed: Vec<&str> = snapshot["closedSessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(closed, ["user_closed_it"], "the omitted session must survive as closed");
     }
 
     #[tokio::test]

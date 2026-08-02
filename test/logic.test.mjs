@@ -9,6 +9,7 @@
 // Run:  node --test   (from ide/, or `npm test`)
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -5349,6 +5350,8 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
     ["kimi-k2.6-off", "off"],
     ["grok-4.5", "medium"],
     ["claude-sonnet-5", "high"],
+    ["claude-opus-4-6", "high"],
+    ["claude-3-7-sonnet", "high"],
     ["gemini-3.5-flash", "minimal"],
     ["MiniMax-M2.7", "high"],
   ]);
@@ -5360,9 +5363,27 @@ test("thinking depth is based on real per-model capabilities instead of fixed fa
   assert.deepEqual(apply({ model: "kimi-k2.6" }).thinking, { type: "enabled" });
   assert.deepEqual(apply({ model: "kimi-k2.6-off" }).thinking, { type: "disabled" });
   assert.equal(apply({ model: "grok-4.5" }).reasoningEffort, "medium");
+
+  // Modern Claude (4.7+/5/Fable) is ADAPTIVE: these models reject
+  // {"type":"enabled","budget_tokens":N} with a hard 400 — observed in production, 29 times in
+  // six hours, and it froze the IDE. The client therefore sends reasoning_effort ONLY; the
+  // gateway rebuilds the correct adaptive block, and aggregator routes that forward the body
+  // verbatim never carry the poison shape. This test previously asserted budget_tokens:24000
+  // for sonnet-5 — codifying the exact bug, same as the gateway tests that were rewritten to
+  // defend the 400.
   const claude = apply({ model: "claude-sonnet-5" });
-  assert.equal(claude.thinkingBudget, 24000);
-  assert.deepEqual(claude.thinking, { type: "enabled", budget_tokens: 24000 });
+  assert.equal(claude.reasoningEffort, "high");
+  assert.equal(claude.thinkingBudget, undefined, "adaptive family must NOT send a budget");
+  assert.equal(claude.thinking, undefined, "adaptive family must NOT send a thinking block");
+
+  // Claude 4.6 still uses the explicit budget — that family accepts it.
+  const c46 = apply({ model: "claude-opus-4-6" });
+  assert.equal(c46.thinkingBudget, 24000);
+  assert.deepEqual(c46.thinking, { type: "enabled", budget_tokens: 24000 });
+
+  // Claude 3.7 keeps its own (smaller) budget table, matching the gateway's mapping.
+  const c37 = apply({ model: "claude-3-7-sonnet" });
+  assert.equal(c37.thinkingBudget, 12000);
   assert.deepEqual(apply({ model: "gemini-3.5-flash" }).thinkingConfig, { thinkingLevel: "minimal" });
   const minimax = apply({ model: "MiniMax-M2.7" });
   assert.equal(minimax.reasoningEffort, undefined);
@@ -5417,8 +5438,10 @@ test("model card shows backend input output pricing as model price", () => {
   assert.match(html, /Model price/);
   assert.match(html, /Input[\s\S]*\$0\.25[\s\S]*Output[\s\S]*\$1/);
   assert.doesNotMatch(html, /官方参考价/);
-  assert.match(html, /Source: backend connection settings/);
-  assert.match(html, /Rate \/ multiplier: 1\.8/);
+  // 2026-08: the source line and the rate multiplier are backend bookkeeping the user never
+  // chose and cannot act on — removed from the card at the user's request. Pin the removal.
+  assert.doesNotMatch(html, /Source:/, "price-source row must stay removed");
+  assert.doesNotMatch(html, /Rate \/ multiplier/, "rate row must stay removed");
   assert.match(SERVER_MODELS, /"input_price": input_price/);
   assert.match(SERVER_MODELS, /"output_price": output_price/);
   assert.match(SERVER_MODELS, /"price_source": price_source/);
@@ -6506,20 +6529,22 @@ test("压缩档位注入预算适度伸缩，封顶 2 倍守住计费", () => {
   // 档位的主体价值是历史容量（网关压缩留住长历史）；每轮重发的通用底料按 8x 灰
   // 曾把单次发送注入烧到 40K-64K token（用户痛点"扣费太快"）。封顶 2x：比 200K
   // 时代更宽的定位信息 + 模型按需 read_file/search 取深内容，不降智不烧钱。
-  const five = load("_contextBudgetScale", {
-    _michaelUser: { michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } },
+  const mk = (user, eff) => load("_contextBudgetScale", {
+    _michaelUser: user,
+    loadConfig: () => ({ model: "m" }),
+    // the scale now follows the user's CHOSEN window, injected here as the effective limit
+    _effectiveContextLimit: () => eff,
   });
-  assert.equal(five(), 2, "5M 档位注入预算封顶 2 倍，不随窗口线性烧钱");
-  const two = load("_contextBudgetScale", {
-    _michaelUser: { michael_compression: { tier: "2m", max_input_tokens: 2_000_000 } },
-  });
-  assert.equal(two(), 2, "2M 同样封顶 2 倍");
-  const one = load("_contextBudgetScale", {
-    _michaelUser: { michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } },
-  });
-  assert.equal(one(), 2, "1M 档位同样 2 倍封顶");
-  const none = load("_contextBudgetScale", { _michaelUser: null });
-  assert.equal(none(), 1, "无档位（未登录/无套餐）保持旧预算不变");
+  assert.equal(mk({ michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } }, 5_000_000)(), 2,
+    "5M 档位注入预算封顶 2 倍，不随窗口线性烧钱");
+  assert.equal(mk({ michael_compression: { tier: "2m", max_input_tokens: 2_000_000 } }, 2_000_000)(), 2,
+    "2M 同样封顶 2 倍");
+  assert.equal(mk({ michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } }, 1_000_000)(), 2,
+    "1M 档位同样 2 倍封顶");
+  assert.equal(mk(null, 200_000)(), 1, "无档位（未登录/无套餐）保持旧预算不变");
+  // 用户主动把窗口缩回 200k：注入预算必须跟着回到 1x，而不是按会员档位继续 2x 塞满
+  assert.equal(mk({ michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } }, 200_000)(), 1,
+    "选了原生 200k 就按 200k 预算，档位不越权");
 
   // 注入层仍统一读取倍率，各自带硬顶，大档位不致无上限灌入。
   assert.match(SRC, /maxTokens = Math\.round\(\(profile\.substantial \|\| profile\.debugProject \|\| profile\.uiProject \? 8000 : 5000\) \* _ctxScale\)/);
@@ -13014,9 +13039,21 @@ test("background monitors retire with their run instead of billing a new one", (
   // _bmFinish 会 _queueFollowup + _drainFollowups —— 也就是**自动开一整轮新的计费 agent
   // run**。而轮询自续、没有存活判据：Stop 杀不掉、关标签页还在跑、用户开了新一轮之后它
   // 超时照样再塞一轮进去，跨轮复活且无次数上限。
-  assert.match(SRC, /const _bmGen = session\?\._runGen \|\| 0;/,
+  // The session handle MUST come from `run`. This block lives in _executeToolStepInner
+  // (step, call, root, run) — there is no `session` binding in scope, so the original
+  // `const _bmSess = session;` threw ReferenceError on its very first line and the whole
+  // retirement guard this test exists to protect never ran even once.
+  assert.match(SRC, /const _bmSess = \(run && run\.session\) \|\| null;/,
+    "监视器要从 run 拿会话；裸 session 不在作用域内，会 ReferenceError");
+  assert.doesNotMatch(SRC, /const _bmSess = session;/,
+    "不能再用作用域外的裸 session");
+  assert.match(SRC, /const _bmGen = _bmSess\?\._runGen \|\| 0;/,
     "监视器要绑定发起它的那一轮的代际");
-  assert.match(SRC, /const _bmRetired = \(\) => \(_bmSess\?\._runGen \|\| 0\) !== _bmGen \|\| !!_bmSess\?\._disposed;/);
+  // Missing session also counts as retired: without one we cannot tell which run a
+  // follow-up belongs to, and queueing one blind starts a billed agent turn.
+  assert.match(SRC, /const _bmRetired = \(\) => !_bmSess \|\| \(_bmSess\._runGen \|\| 0\) !== _bmGen \|\| !!_bmSess\._disposed;/);
+  assert.doesNotMatch(SRC, /_queueFollowup\(session, followupText\);/,
+    "排后续轮次也要用捕获到的那个会话");
   // 两处都要判：finish 决定要不要再排一轮，poll 决定要不要继续烧 CPU。
   assert.match(SRC, /if \(_bmIv\) clearTimeout\(_bmIv\);\s*\n\s*\/\/[^\n]*\n\s*if \(_bmRetired\(\)\) return;/,
     "_bmFinish 必须在排新 run 之前退场");
@@ -14063,7 +14100,8 @@ test("方案D：布尔思考开关模型诚实两态——能力表驱动，不�
   // 真档位模型（Claude/GPT/Gemini）保持现状，不被误伤
   const claude = profileFor("claude-sonnet-5");
   assert.ok(!claude.booleanToggle);
-  assert.deepEqual(claude.levels, ["off", "low", "medium", "high", "max"]);
+  // Sonnet 5 is adaptive: no `low` (identical to medium on the wire), no budget dial.
+  assert.deepEqual(claude.levels, ["off", "medium", "high", "max"]);
   const gpt = profileFor("gpt-5.6");
   assert.ok(!gpt.booleanToggle && gpt.levels.includes("medium"));
   const gemini = profileFor("gemini-3-pro");
@@ -16434,4 +16472,592 @@ test("流式参数解析：不以 } 结尾时不尝试 parse", () => {
     return true;
   }
   assert.equal(mayAttempt(entry, Date.now()), false);
+});
+
+// A suggestion chip's text is sent verbatim back to the agent when clicked, so corrupting it
+// corrupts the next instruction. The old blanket /\*+/g strip ate the asterisk in
+// `SELECT * FROM price_history;`, turning a valid query into a broken one on screen and in
+// the reply. Emphasis is markup only OUTSIDE code spans.
+test("_detectChoiceOptions keeps asterisks inside code spans", () => {
+  const _stripEmphasisOutsideCode = load("_stripEmphasisOutsideCode");
+  const detect = load("_detectChoiceOptions", { _stripEmphasisOutsideCode });
+
+  const answer = [
+    "你可以自己试试",
+    "",
+    "1. **改个价格提醒**: 去 `config.yaml` 把目标价调高，然后 `--once` 跑一次",
+    '2. **看历史数据**: 跑几次后用 `sqlite3 price_history.db "SELECT * FROM price_history;"` 看看存了什么',
+    "",
+    "需要我帮你调试抓价格的部分吗？",
+  ].join("\n");
+
+  const opts = detect(answer);
+  assert.ok(opts, "two numbered suggestions plus a question cue should parse as choices");
+  assert.equal(opts.length, 2);
+
+  // The bold markers are markup and must go...
+  assert.ok(!opts[0].text.includes("**"), "markdown bold should be stripped");
+  assert.ok(opts[0].text.startsWith("改个价格提醒"));
+
+  // ...but the asterisk inside the backticked query is CONTENT and must survive, both in the
+  // visible label and in the text sent back on click.
+  assert.ok(opts[1].text.includes("SELECT * FROM price_history;"), `lost the asterisk: ${opts[1].text}`);
+  assert.ok(opts[1].send.includes("SELECT * FROM price_history;"), `send payload corrupted: ${opts[1].send}`);
+});
+
+test("_stripEmphasisOutsideCode only strips outside backticks", () => {
+  const strip = load("_stripEmphasisOutsideCode");
+  assert.equal(strip("**bold** and `a * b`"), "bold and `a * b`");
+  assert.equal(strip("no code, **bold**"), "no code, bold");
+  assert.equal(strip("`* leading`"), "`* leading`");
+  assert.equal(strip(""), "");
+});
+
+// ---- hot-exit buffer recovery must never revert a file that disk has moved past ----
+//
+// The recovery path re-applies unsaved editor buffers saved on beforeunload. It used to do so
+// unconditionally, which turned "restore my unflushed edits" into "revert the file" whenever
+// anything had written the path in between (a save that did land, git checkout, another
+// window, the agent). Autosave then pushed the reverted buffer to disk, so it was real data
+// loss, not just a stale view.
+test("_bufferBaseStamp fingerprints disk content deterministically", () => {
+  const stamp = load("_bufferBaseStamp");
+  assert.equal(stamp("hello"), stamp("hello"), "same content must produce the same stamp");
+  assert.notEqual(stamp("hello"), stamp("hello "), "trailing whitespace must change the stamp");
+  assert.notEqual(stamp("hello"), stamp("olleh"), "reordering must change the stamp");
+  assert.notEqual(stamp(""), stamp("a"));
+  assert.equal(stamp(null), null, "a file with no known disk baseline has no stamp");
+  assert.equal(stamp(undefined), null);
+  assert.match(stamp("abc"), /^3:[0-9a-z]+$/, "stamp carries the length so a hash tie still differs on size");
+});
+
+test("hot-exit recovery gates on the disk baseline before re-applying a buffer", () => {
+  const src = extractFn("restoreSession");
+
+  // The captured baseline must be compared against the CURRENT disk content, and a mismatch
+  // must skip the entry rather than fall through to the write.
+  assert.match(src, /u\.base !== _bufferBaseStamp\(f\.diskContent\)/,
+    "restore must compare the stored baseline against freshly-read disk content");
+  const gate = src.indexOf("staleSkipped++");
+  const write = src.indexOf("_setModelValueProgrammatically(f.model, u.content)");
+  assert.ok(gate > -1 && write > -1, "both the staleness gate and the apply must exist");
+  assert.ok(gate < write, "the staleness gate must run BEFORE the buffer is applied");
+
+  // Recovery must not look like user typing; the raw setValue scheduled an autosave of the
+  // very content we are unsure about.
+  assert.ok(!/\bf\.model\.setValue\(u\.content\)/.test(src),
+    "recovery must not use raw setValue — it bypasses _programmaticModelUpdates and triggers autosave");
+
+  // Capture side must actually record the baseline, or the gate above is inert.
+  const capture = extractFn("_flushDirtyBuffersSync");
+  assert.match(capture, /base: _bufferBaseStamp\(f\.diskContent\)/,
+    "the beforeunload capture must stamp each buffer with its disk baseline");
+});
+
+// ---- no undeclared identifiers anywhere in client code ----
+//
+// This class of bug bit four separate times, always the same way: a `const` declared inside a
+// `for`/`try`/`if` block and then read after that block closed. It is invisible to review and
+// to the type-free runtime until the line executes, at which point WebKit throws
+// "Can't find variable: X" — which the agent executor catches and renders as a red badge,
+// silently killing every statement after it.
+//
+// Real instances found in production code:
+//   * `fp`                  — killed the read_file failure handler, which disabled the entire
+//                             progressive anti-guessing gate (the model could guess paths forever)
+//   * `_top`                — killed the workspace preheat listing, whose whole purpose is to
+//                             stop the model guessing filenames
+//   * `_steerSemanticText`  — killed mid-run steering after the message was already queued
+//   * `session`             — killed the background-task monitor at its first line
+//   * `chatSessions`        — silently disabled the "view task" button (swallowed by try/catch)
+//
+// Scope analysis catches all of them statically, so this asserts there are none left.
+test("client modules have no undeclared identifiers", async () => {
+  const { analyze } = createRequire(import.meta.url)("eslint-scope");
+
+  // Genuine runtime globals. Anything NOT here that fails to resolve is a bug.
+  const GLOBALS = new Set([
+    // ECMAScript
+    "Array","ArrayBuffer","Boolean","DataView","Date","Error","Float32Array","Infinity","Int16Array",
+    "Intl","JSON","Map","Math","NaN","Number","Object","Promise","Proxy","RangeError","RegExp","Set",
+    "String","Symbol","Uint32Array","Uint8Array","WeakMap","WeakSet","globalThis","isNaN","parseFloat",
+    "parseInt","structuredClone","undefined","decodeURIComponent","encodeURIComponent",
+    // DOM / browser
+    "AbortController","AbortSignal","Blob","BroadcastChannel","CSS","CustomEvent","Event","FileReader",
+    "FormData","Image","MutationObserver","Node","Notification","PerformanceObserver","ResizeObserver",
+    "TextDecoder","TextEncoder","URL","URLSearchParams","alert","cancelAnimationFrame","clearInterval",
+    "clearTimeout","confirm","console","crypto","document","fetch","localStorage","location","navigator",
+    "performance","queueMicrotask","requestAnimationFrame","requestIdleCallback","self","setInterval",
+    "setTimeout","window","setImmediate",
+    // Feature-detected on purpose, always behind `typeof x !== "undefined"`
+    "module","session",
+  ]);
+
+  const FILES = ["src/main.js","src/tool-guides.js","src/markdown.js","src/conversation-memory.js","src/growth.js","src/i18n.js"];
+  const offenders = [];
+  for (const file of FILES) {
+    const code = readFileSync(join(HERE, "..", file), "utf8");
+    const ast = acorn.parse(code, { ecmaVersion: "latest", sourceType: "module", ranges: true, locations: true });
+    const scope = analyze(ast, { ecmaVersion: 2024, sourceType: "module" });
+    for (const ref of scope.globalScope.through) {
+      const name = ref.identifier.name;
+      if (GLOBALS.has(name)) continue;
+      offenders.push(`${file}:${ref.identifier.loc.start.line}  ${name}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `undeclared identifier(s) — these throw ReferenceError the moment the line runs:\n  ${offenders.join("\n  ")}`);
+});
+
+// The `typeof`-guarded names above are only safe BECAUSE of the guard. If someone drops the
+// guard, the allowlist would hide a real ReferenceError, so pin the guard itself.
+test("typeof-guarded globals keep their guards", () => {
+  const code = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  for (const [name, expected] of [["session", 3], ["module", 1]]) {
+    const guards = code.match(new RegExp(`typeof\\s+${name}\\s*!==?\\s*["']undefined["']`, "g")) || [];
+    assert.ok(guards.length >= expected,
+      `${name} is allowlisted as a feature-detected global but only ${guards.length} typeof guard(s) remain (expected >= ${expected})`);
+  }
+});
+
+// ---- one 「接下来」 block per turn ----
+//
+// An answer that offers options used to render its own panel under a 👉 banner, stacked above
+// a second panel of run-state suggestions under its own heading. Two lists, two headings, both
+// answering "what next". They now merge into a single block, and the banner is gone.
+test("offered choices and run-state suggestions merge into one 接下来 block", () => {
+  const mkEl = (tag) => {
+    const el = {
+      tagName: tag, className: "", dataset: {}, children: [], textContent: "", innerHTML: "",
+      classList: {
+        _s: new Set(),
+        add(c) { this._s.add(c); }, contains(c) { return el.className.split(/\s+/).includes(c) || this._s.has(c); },
+      },
+      appendChild(c) { el.children.push(c); return c; },
+      remove() {},
+      addEventListener() {},
+      querySelector() { return mkEl("span"); },
+      querySelectorAll(sel) {
+        const want = sel.replace(".", "");
+        return el.children.filter((c) => String(c.className).split(/\s+/).includes(want));
+      },
+      get lastElementChild() { return el.children[el.children.length - 1] || null; },
+    };
+    return el;
+  };
+  const container = mkEl("div");
+  const sess = { container };
+  const deps = {
+    document: { createElement: mkEl },
+    _NS_SPARK: "<svg/>", _NS_ARROW: "<svg/>", _NEXT_STEPS_MAX: 4,
+    sendPrompt() {}, _currentSession: () => null, _chatFollow() {},
+  };
+  const render = load("_renderSuggestionChips", deps);
+
+  // Turn renders offered choices first...
+  render(sess, [{ label: "1、爬个电商网站", send: "我选 1" }, { label: "2、批量爬多页", send: "我选 2" }], "接下来 ›");
+  assert.equal(container.children.length, 1, "first call creates the block");
+  const block = container.children[0];
+  assert.equal(block.className, "next-steps");
+  assert.equal(block.querySelectorAll(".next-steps__chip").length, 2);
+
+  // ...then run-state suggestions merge into the SAME block rather than adding a second one.
+  render(sess, [{ label: "继续完成剩余部分", send: "继续" }], "接下来 ›");
+  assert.equal(container.children.length, 1, "second call must NOT create a second panel");
+  assert.equal(block.querySelectorAll(".next-steps__chip").length, 3, "chips accumulate in one block");
+
+  // Exactly one heading, added only by the call that created the block.
+  assert.equal(block.querySelectorAll(".next-steps__label").length, 1, "one heading, not two");
+
+  // The shared cap holds across both sources.
+  render(sess, [{ label: "a", send: "a" }, { label: "b", send: "b" }, { label: "c", send: "c" }], "接下来 ›");
+  assert.equal(block.querySelectorAll(".next-steps__chip").length, 4, "total capped at _NEXT_STEPS_MAX");
+});
+
+test("the 👉 click-to-reply banner is gone", () => {
+  assert.ok(!SRC.includes("点一个直接回复"), "the 👉 banner text must not be reintroduced");
+  assert.ok(!/className = "ai-choices"/.test(SRC), "the separate choice panel must not come back");
+  assert.match(extractFn("_maybeRenderChoices"), /_renderSuggestionChips\(/,
+    "offered choices must render through the 接下来 renderer");
+});
+
+// ---- custom models: one endpoint, many model names ----
+//
+// A relay endpoint typically exposes a dozen models behind one base URL + key. Entering them
+// one at a time meant retyping the URL and key for each. The name field now splits on , and ;
+// — including the full-width ，； a Chinese IME actually produces, which is what this field
+// gets typed with in practice.
+test("custom-model name field splits on ASCII and full-width separators", () => {
+  const SAVE = extractFn("showCustomModelsDialog");
+
+  // The parse must handle both ASCII and full-width separators, and dedupe.
+  const split = (v) => [...new Set(v.split(/[,;，；]/).map((x) => x.trim()).filter(Boolean))];
+  assert.deepEqual(split("gpt-4o-mini"), ["gpt-4o-mini"]);
+  assert.deepEqual(split("a,b;c"), ["a", "b", "c"]);
+  assert.deepEqual(split("a，b；c"), ["a", "b", "c"], "full-width , and ; must split too");
+  assert.deepEqual(split(" a , , b "), ["a", "b"], "blank segments dropped");
+  assert.deepEqual(split("a,a,b"), ["a", "b"], "duplicates collapsed");
+  assert.deepEqual(split(",;，；"), [], "separators only => nothing to add");
+
+  // And the shipped code must actually use that split, not the old single-value read.
+  assert.match(SAVE, /inName\.value\.split\(\/\[,;，；\]\/\)/,
+    "the save handler must split the name field");
+  assert.ok(!/const name = inName\.value\.trim\(\);/.test(SAVE),
+    "the old single-name read must be gone");
+
+  // Editing with several names keeps the edited row and appends the rest, rather than
+  // silently discarding the extras.
+  assert.match(SAVE, /name: names\[0\]/, "edited row takes the first name");
+  assert.match(SAVE, /names\.slice\(1\)/, "remaining names are appended when editing");
+
+  // The 64-entry cap still holds, and over-cap input is reported instead of vanishing.
+  assert.match(SAVE, /items\.length >= 64/, "cap must still be enforced");
+  assert.match(SAVE, /未添加/, "dropped-over-cap entries must be surfaced to the user");
+});
+
+test("custom-model dialog has no empty-state placeholder", () => {
+  assert.ok(!SRC.includes("还没有自定义模型"),
+    "the redundant empty-state copy must not come back");
+  assert.match(extractFn("showCustomModelsDialog"), /if \(!items\.length\) return;/,
+    "an empty list should render nothing at all");
+});
+
+// ---- the follow-up reply must survive the turn ----
+//
+// _agentFollowUp answers a file read. The file bodies it reasons over are sent in an ephemeral
+// context message that is deliberately NOT persisted (a single read can be ~55k chars), so its
+// reply is the only durable trace of what the file actually contained.
+//
+// It used to push that reply onto `sess.memory.assemble()`, which returns a freshly-built array
+// (conversation-memory.js assembledSlice: `const result = []; … return result;`). The push
+// mutated a temporary and vanished. The next turn therefore saw "[TOOL:read_file] <path>" with
+// no content and no conclusion — so the model read the same file again, and again.
+//
+// This only fires for models that emit tool syntax as TEXT; models using native tool_calls take
+// a different path that persists its own summary. That asymmetry is why context appeared to
+// work on one model and not another.
+test("_agentFollowUp persists its reply to real session memory, not a throwaway copy", () => {
+  const fn = extractFn("_agentFollowUp");
+
+  assert.match(fn, /sess\?\.memory\?\.push\(\{ role: "assistant", content: acc \}\)/,
+    "the reply must be pushed onto the session's real memory");
+  // Strip // comments first: the fix's own comment quotes the old broken call, and a naive
+  // negative match would hit the prose describing the bug rather than the bug.
+  const code = fn.replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(!/_hist\.push\(/.test(code),
+    "pushing onto the assemble() copy is a no-op — it must not come back");
+
+  // _hist itself is still legitimate: it is the read-only snapshot spread into the request.
+  assert.match(fn, /\.\.\._hist,/, "_hist is still the request-building snapshot");
+
+  // assemble() really does hand back a new array — the premise the bug rested on.
+  const mem = readFileSync(join(HERE, "../src/conversation-memory.js"), "utf8");
+  const slice = mem.slice(mem.indexOf("assembledSlice(from"), mem.indexOf("assembledSlice(from") + 1400);
+  assert.match(slice, /const result = \[\]/, "assembledSlice builds a fresh array");
+  assert.match(slice, /return result;/, "…and returns it, so callers cannot mutate memory through it");
+});
+
+// ---- folding a read must also invalidate its duplicate-read stubs ----
+//
+// When the transcript passes the soft budget, Tier 2 compresses old tool results and marks
+// read messages contextAvailable:false. But the "authorized" / "hard_blocked" dedup stubs are
+// only ~80-130 chars, so the `c.length > cap + 80` (480) test never matches them — they
+// survive untouched, still carrying whole-file coverage evidence.
+//
+// _syncRunReadCoverageFromMessages credits those stubs as real coverage. So once the 55k
+// content message is folded, the stub alone re-registers full coverage, and the next read_file
+// is answered with the stub's own text — "完整原文就在上文…不需要重读" — for bytes that are
+// gone. The model declines to re-read and reasons about nothing. This is keyed to the selected
+// model's context window, so it triggers earlier on smaller models.
+test("Tier-2 fold invalidates duplicate-read stubs for the same file", () => {
+  const fn = extractFn("_trimMessagesIfHuge");
+
+  assert.match(fn, /_foldedSigs/, "the fold must record which file signatures it folded");
+  assert.match(fn, /meta\.resultKind !== "content"/,
+    "stubs (authorized / hard_blocked) must be targeted, not just content messages");
+  assert.match(fn, /_foldedSigs\.has\(meta\.signature\)/,
+    "only stubs whose underlying content was folded may be invalidated");
+
+  // Ordering: signatures must be collected before the stub sweep can use them.
+  const collect = fn.indexOf("_foldedSigs.add(meta.signature)");
+  const sweep = fn.indexOf("_foldedSigs.has(meta.signature)");
+  assert.ok(collect > -1 && sweep > -1 && collect < sweep,
+    "signatures are collected during the fold, then applied to stubs afterwards");
+
+  // The coverage resync must still treat stubs as coverage-bearing — that is WHY they have to
+  // be invalidated here rather than filtered there (filtering there reintroduces the
+  // read/write-gate deadlock the surrounding comments guard against).
+  assert.match(SRC, /resultKind === "hard_blocked" \|\| meta\?\.resultKind === "authorized"/,
+    "stubs still count as coverage in the resync; the fix belongs at fold time");
+});
+
+// ---- context-window selector: honest clamping and membership gating ----
+//
+// The model card renders native + all three michael-compression tiers as buttons. A stored
+// choice may NARROW the window (a cost dial) but must never budget past what native-or-
+// membership actually delivers — a fictional window dies upstream as context-length 400s.
+test("context-window choice clamps to what is actually deliverable", () => {
+  const mkEff = (store, user, compress) => load("_effectiveContextLimit", {
+    _modelContextLimit: () => 200_000,
+    _michaelUser: user,
+    _gatewayHandlesCompression: () => compress,
+    _ctxChoiceFor: () => store,
+  });
+  const tier5m = { michael_compression: { tier: "5m", max_input_tokens: 5_000_000 } };
+
+  assert.equal(mkEff(0, tier5m, true)("m"), 5_000_000, "no choice → membership default");
+  assert.equal(mkEff(2_000_000, tier5m, true)("m"), 2_000_000, "choice narrows within membership");
+  assert.equal(mkEff(200_000, tier5m, true)("m"), 200_000, "native is always selectable");
+  assert.equal(mkEff(5_000_000, null, true)("m"), 200_000,
+    "membership gone → stored 5M silently falls back to native, never a fictional window");
+  assert.equal(mkEff(2_000_000, tier5m, false)("m"), 200_000,
+    "gateway compression off → tiers are not deliverable, clamp to native");
+
+  const mkOpts = (user, compress) => load("_ctxChoiceOptions", {
+    _modelContextLimit: () => 200_000,
+    _michaelUser: user,
+    _gatewayHandlesCompression: () => compress,
+    _tokenShort: (n) => n >= 1_000_000 ? (n / 1_000_000) + "m" : (n / 1000) + "k",
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+  });
+  const opts1m = mkOpts({ michael_compression: { tier: "1m", max_input_tokens: 1_000_000 } }, true)("m");
+  assert.equal(opts1m.length, 4, "native + ALL three tiers are displayed regardless of membership");
+  assert.equal(opts1m[0].native, true);
+  assert.equal(opts1m[1].locked, false, "1M tier selectable on a 1M membership");
+  assert.equal(opts1m[2].locked, true, "2M tier locked above membership");
+  assert.equal(opts1m[3].locked, true, "5M tier locked above membership");
+  assert.match(opts1m[2].lockHint, /2M/, "locked tier explains what unlocks it");
+});
+
+// ---- free allowance is denominated in 点, not dollars ----
+//
+// The operator prices in 点: ¥0.5 = 10 点, so 1 点 = ¥0.05 and the ¥2 daily allowance is
+// exactly 40 点. The first cut stored raw provider cents and rendered them through the
+// credit-dollar denominator (663 raw cents = $1.00), which showed a ¥2 allowance as "$3.02" —
+// a real number in the wrong currency. Points are the unit; render them as such.
+test("free allowance renders in 点 and never through the dollar denominator", () => {
+  const fn = load("_freePointsMetric");
+  const seen = [];
+  const metric = (label, value, pct, sub) => { seen.push({ label, value, pct, sub }); return "ROW"; };
+  const usd = () => { throw new Error("free points must NOT go through the usd() denominator"); };
+
+  const out = fn(metric, usd, { free_points: 40, free_points_daily: 40 });
+  assert.equal(out, "ROW");
+  assert.equal(seen[0].label, "免费额度");
+  assert.equal(seen[0].value, "40 点", "a full pool reads cleanly, no trailing zeros");
+  assert.equal(seen[0].pct, 100);
+  assert.match(seen[0].sub, /40 点/);
+  assert.match(seen[0].sub, /¥2\.00/, "¥0.5 = 10 点 ⇒ 40 点 is ¥2.00");
+
+  // partially spent
+  seen.length = 0;
+  fn(metric, usd, { free_points: 10, free_points_daily: 40 });
+  assert.equal(seen[0].value, "10 点");
+  assert.equal(seen[0].pct, 25);
+
+  // Sub-点 balances must render, or a cheap model would appear to cost nothing all day.
+  seen.length = 0;
+  fn(metric, usd, { free_points: 39.94, free_points_daily: 40 });
+  assert.equal(seen[0].value, "39.94 点", "fractional balances are visible");
+
+  // exhausted → tells the user paid models still work
+  seen.length = 0;
+  fn(metric, usd, { free_points: 0, free_points_daily: 40 });
+  assert.equal(seen[0].value, "0 点");
+  assert.match(seen[0].sub, /付费模型不受影响/);
+
+  // absent field (older gateway) → render nothing rather than a misleading zero
+  assert.equal(fn(metric, usd, {}), "");
+  assert.equal(fn(metric, usd, { free_points: null }), "");
+});
+
+// ---- verification credit must decay with the artifact it certified ----
+//
+// The pre-delivery gate asked "has anything ever been verified this run?" using three
+// credentials that are monotonic for the life of the run. So `npm test` after edit #1
+// certified edits #2..#12 too — including the one that broke the build — and the run still
+// reported success with "验证：已通过真实命令/检查。" attached. That is the modal shape of a
+// hard task (verify early, keep refactoring), which made it a ceiling rather than an edge case.
+//
+// The fix consults the edit-count stamp already written onto every evidence record
+// (`implementationVersion`) and expires the credential in the mutation handlers, alongside the
+// sibling credentials that were ALREADY being reset there.
+test("verification credit expires when files change under it", () => {
+  const loop = extractFn("_runAgenticLoop");
+
+  // freshness, not existence
+  assert.match(loop, /_hasVerifyEvidence = _verifiedAtImplOps >= _implOps/,
+    "the gate must compare against the current edit count, not >= 0");
+  assert.ok(!/_hasVerifyEvidence = verificationPassed \|\| didVerify \|\| _verifiedAtImplOps >= 0/.test(loop),
+    "the monotonic form must not come back");
+
+  // the stamp that was written and never read is now read
+  assert.match(loop, /Number\(e && e\.implementationVersion\) < _implOps/,
+    "stale evidence records must be rejected by their edit stamp");
+  assert.match(loop, /implementationVersion: _implOps/, "…and still written when evidence is recorded");
+
+  // both mutation handlers expire it, matching their sibling resets
+  assert.equal((loop.match(/_verifiedAtImplOps = -1;/g) || []).length, 2,
+    "both the file-mutation and worker-mutation handlers must expire verification credit");
+  assert.equal((loop.match(/verificationPassed = false;/g) || []).length, 2,
+    "…and clear the boolean alongside it");
+
+  // didVerify must NOT be cleared: it means "a check was attempted", not "state is proven"
+  assert.ok(!/didVerify = false;/.test(loop),
+    "didVerify tracks attempts, not proof — clearing it would re-trigger verifier-unavailable cards");
+
+  // the stale comment claiming the gate was removed must be gone
+  assert.ok(!/验证门已拆/.test(loop), "the comment justifying the sticky credential is no longer true");
+});
+
+// ---- R2: the plan must be visible to the reasoner, not just the UI ----
+test("the scratchpad renders the whole plan, not a completed-tally", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /任务计划 \$\{_doneN\}\/\$\{_ps\.length\}/,
+    "the pad must show progress over the full plan");
+  assert.match(loop, /status === "in_progress" \? "\[→\]"/, "in-progress steps must be marked");
+  assert.ok(!/_pad\.done/.test(loop),
+    "the completed-only tally is retired — it hid which step was current");
+  assert.match(loop, /run\._planSteps.*filter\(\(x\) => x && x\.status !== "cancelled"\)/,
+    "sourced from the live plan, and cancelled steps excluded");
+});
+
+// ---- R3: folding source through an error-log extractor destroys what an edit needs ----
+test("folded reads keep a line-anchored skeleton", () => {
+  // extractFn only pulls functions; _SKEL_RE is a const regex, so read it from source.
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const reSrc = src.match(/const _SKEL_RE = (\/.*\/);/)[1];
+  const fn = new Function("_SKEL_RE", extractFn("_codeSkeleton") + "\n;return _codeSkeleton;")(eval(reSrc));
+
+  const body = ["import x from 'y';", "export function a() {", "  const inner = 1;", "class B {}"].join("\n");
+  const out = fn(body, 800, 500);
+  assert.match(out, /^501: export function a\(\) \{$/m, "line anchors must be TRUE file lines");
+  assert.match(out, /^503: class B \{\}$/m);
+  assert.ok(!/inner/.test(out), "bodies are dropped; only definitions are kept");
+  assert.equal(fn("", 800, 1), "", "empty body yields no skeleton");
+
+  const loop = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  assert.match(loop, /skeleton: _codeSkeleton\(_safeBody, 800, shownFrom\)/,
+    "computed where _safeBody and shownFrom are correct — NOT from the prefixed message body");
+  assert.match(loop, /行号真实——用 read_file offset\/limit/,
+    "the fold must tell the model a ranged re-read is enough");
+});
+
+// ---- R5: the critic must judge the product, not only the process ----
+test("the wrap-up critic receives the actual diff", () => {
+  const critic = extractFn("_wrapUpCritic");
+  assert.match(critic, /changeDigest = ""/, "critic accepts a change digest");
+  assert.match(critic, /本轮实际改动（真实 diff）/, "…and renders it in the user block");
+  assert.match(critic, /先读【本轮实际改动】里的真实 diff/,
+    "…and is instructed to judge the change itself, not just whether commands ran");
+  assert.match(critic, /即使命令全绿/, "green commands must not by themselves mean done");
+
+  const hunk = new Function(extractFn("_changedHunk") + "\n;return _changedHunk;")();
+  assert.equal(hunk("same", "same"), "", "identical content produces no hunk");
+  const d = hunk("a\nb\nc", "a\nB\nc");
+  assert.match(d, /^- b$/m); assert.match(d, /^\+ B$/m);
+  assert.match(d, /^@@ /m, "hunks carry a position header");
+  // bounded: a huge change must not blow the critic's budget
+  const big = hunk("x\n".repeat(500), "y\n".repeat(500), 3, 40);
+  assert.ok(big.split("\n").length <= 41, "hunks are capped");
+});
+
+// ---- R4: reasoning depth must track live difficulty, and the meter must not lie ----
+test("reasoning depth is re-derived each iteration from live run state", () => {
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /failStreak = lastTurnHadFailure \? failStreak \+ 1 : 0;/,
+    "consecutive failures are tracked, not just the last turn");
+  assert.match(loop, /const _cx = isComplexTask \|\| failStreak >= 2 \|\| quietTurns >= 2/,
+    "difficulty discovered at runtime must raise depth");
+  assert.match(loop, /_applyThinkingToConfig\(_rawConfig, \{ agentTurn: true, isComplexTask: _cx \}\)/,
+    "re-derived from _rawConfig — mutating config in place would leave stale family keys");
+  // the meter was written once, pre-loop, from the un-demoted config
+  assert.match(loop, /_activeThinkEffort = config\.thinkingEffort/,
+    "the meter must be written inside the loop so it reports what is actually on the wire");
+});
+
+// ---- two built-but-never-connected reasoning features ----
+//
+// `_diagnosticBlock` had only `= ""` assignments, so the BLOCKING_NEW_DIAGNOSTICS gate — with
+// its staleness expiry and `continue` — was unreachable. `_prevVerifyErrs`/`_noProgressVerify`
+// (declared "re-verify after new edits; stop once errors stop dropping") were never written,
+// leaving `hadDiagnostics` permanently false in the run summary.
+//
+// The convergence bound matters more now that verification credit expires on every edit:
+// without it, "verify again" could thrash on a project whose errors are not improving.
+test("the diagnostic block and auto-verify convergence loop are actually wired", () => {
+  const loop = extractFn("_runAgenticLoop");
+
+  // the block is now populated from real markers, not just cleared
+  assert.match(loop, /run\._diagnosticBlock = formatDiagnosticsForAgent\(_errMarkers, root/,
+    "the blocking gate must receive real diagnostics");
+  assert.ok(/getProblemMarkers\(\)\.filter\(\(m\) => m\.severity === SEV\.Error\)/.test(loop),
+    "errors (not warnings) drive the gate");
+
+  // convergence: progress resets, stagnation counts, two rounds stop pushing
+  assert.match(loop, /_noProgressVerify\+\+/, "stagnation must be counted");
+  assert.match(loop, /_noProgressVerify = 0; \/\/ errors are dropping/, "progress must reset the counter");
+  assert.match(loop, /_noProgressVerify < 2/, "…and two stalled rounds must stop the blocking");
+  assert.match(loop, /_prevVerifyErrs = _errNow;/, "the error count must be carried forward");
+
+  // a clean tree must clear the block, or a fixed error would keep blocking forever
+  assert.match(loop, /_errNow === 0/, "zero errors clears the block");
+
+  // the summary field that was permanently false now has a source
+  assert.match(loop, /hadDiagnostics: !!_prevVerifyErrs/, "run summary reads the tracked count");
+});
+
+// ---- michael-design must trigger on real UI work, not just website-shaped surfaces ----
+//
+// MICHAEL_DESIGN_TRIGGER_DIAGNOSIS.md: the design knowledge only loaded when deliverySurface
+// was ui_component/website/web_app/desktop. A full-stack job reports `mixed`, so "build the
+// front-end for this client" silently ran WITHOUT the design system — which is exactly when
+// it is needed. Widening by surface alone would over-trigger on backend-heavy `mixed` work, so
+// the verdict's own roleNeeds decides: a pure backend task never lists frontend/design.
+test("design knowledge triggers on mixed-surface work that needs frontend or design", () => {
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const m = src.match(/const uiSurface = \[[\s\S]*?\n\s*\|\| \(\(deliverySurface === "mixed"[\s\S]*?\)\);/);
+  assert.ok(m, "the widened uiSurface predicate must exist");
+  const fn = new Function("deliverySurface", "engineering",
+    "const _roles = Array.isArray(engineering?.roleNeeds) ? engineering.roleNeeds : [];\n"
+    + m[0] + "\nreturn uiSurface;");
+
+  // classic UI surfaces still trigger
+  for (const s of ["ui_component", "website", "web_app", "desktop"]) {
+    assert.equal(fn(s, {}), true, `${s} must trigger`);
+  }
+  // full-stack work that includes front-end now triggers
+  assert.equal(fn("mixed", { roleNeeds: ["backend", "frontend"] }), true,
+    "a mixed task needing frontend is UI work");
+  assert.equal(fn("mixed", { roleNeeds: ["design"] }), true);
+  // …but backend-only mixed work does NOT — this is the over-trigger the diagnosis warned about
+  assert.equal(fn("mixed", { roleNeeds: ["backend", "database"] }), false,
+    "backend-heavy mixed work must not pull in the design system");
+  assert.equal(fn("backend", { roleNeeds: ["frontend"] }), false,
+    "an explicit backend surface stays out regardless of roles");
+  assert.equal(fn("mixed", {}), false, "no roles → no false trigger");
+});
+
+// ---- the streaming freeze on long replies ----
+//
+// Forensics, not guesswork: /tmp/michael-ide-perf.log recorded stalls of 7.1s, 7.7s, 7.3s,
+// 11.3s and one of 149s, every one reporting "no phase markers inside the freeze window".
+// Every instrumented phase (renderMarkdownStream, _cleanAgentText, highlightCode,
+// persistChatHistory) was therefore innocent — the hot code was simply unmarked.
+//
+// _parseStreamSegments re-split and regex-scanned the WHOLE accumulated reply, and the
+// streaming renderer called it on every delta: cost grows with length². It carried no perf
+// marker, which is exactly why the sentinel was blind to it.
+test("the per-delta segment parse is marked, memoised and throttled", () => {
+  const fn = extractFn("_parseStreamSegments");
+  assert.match(fn, /_perfPhase\(`_parseStreamSegments len=/,
+    "must be instrumented, or the sentinel stays blind to it");
+  assert.match(fn, /if \(text === _parseStreamSegments\._in\) return _parseStreamSegments\._out;/,
+    "identical input must not be re-parsed");
+  assert.match(fn, /_parseStreamSegments\._out = segs;/, "…and the result must be cached");
+
+  assert.match(SRC, /const _due = !renderStream\._at \|\| \(_nowMs - renderStream\._at\) >= 150;/,
+    "the per-delta call must be throttled — the memo always misses on a growing accumulator");
+  assert.match(SRC, /segs = renderStream\._segs;/,
+    "between parses the last segment list must be reused, not recomputed");
 });
