@@ -37327,16 +37327,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // rule (`_verifiedAtImplOps >= _implOps`); the code compared against 0.
         // `implementationVersion` is stamped onto every evidence record and was read nowhere.
         const _hasVerifyEvidence = _verifiedAtImplOps >= _implOps
-          || (Array.isArray(run._executionEvidence) && run._executionEvidence.some((e) => {
-            // Evidence taken before the current edit count certifies a file that has since
-            // changed — that is precisely the stale credit this gate exists to catch.
-            if (Number(e && e.implementationVersion) < _implOps) return false;
-            const cmd = String((e && e.command) || "");
-            if (!cmd) return false;
-            if (e.verification === true) return true;
-            if (_looksLikeVerificationCommand(cmd)) return true;
-            return _runtimeCommandKinds(cmd, false).some((k) => ["build", "test", "run", "package"].includes(k));
-          }));
+          || (Array.isArray(run._executionEvidence)
+              && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
         const _codeDeliveredUnverified = run.mode === "agent" && _mutatedCode && !_hasVerifyEvidence
           && !run._diagnosticBlock && !_missingRequiredEffect;
         const _missingResearch = _missingResearchEvidence(run.engineering, _researchEvidence);
@@ -38212,7 +38204,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // This is a deterministic command contract, not a task-intent or output-text
         // classifier. Carry it as evidence metadata so a green build/test does not
         // get reinterpreted as an arbitrary application run at the finish gate.
-        if (call.type === "cmd" && _looksLikeVerificationCommand(call.command)) {
+        //
+        // "Green" is the operative word: the stamp requires the command to have SUCCEEDED.
+        // It used to key on the command's shape alone, so `npm run build` exiting non-zero
+        // was recorded as verification — a failing build certified the code it just proved
+        // broken, which is the most direct way for the loop to deliver code that does not run.
+        if (call.type === "cmd" && _looksLikeVerificationCommand(call.command)
+            && _toolExecutionSucceeded(call, result)) {
           call.verification = true;
           if (result && typeof result === "object") result.verification = true;
         }
@@ -38225,7 +38223,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         }
         const executionEvidence = _executionEvidenceFromTool(call, result, root);
         if (run && executionEvidence) {
-          run._executionEvidence.push({ ...executionEvidence, implementationVersion: _implOps });
+          run._executionEvidence.push({
+            ...executionEvidence,
+            implementationVersion: _implOps,
+            // Exit status travels with the evidence: the finish gate matches on command
+            // shape, so it cannot tell a green build from a red one without this.
+            ok: _toolExecutionSucceeded(call, result),
+          });
           if (run._executionEvidence.length > 12) run._executionEvidence.shift();
           if (_runtimeNeedsSemanticReview(call, result)) {
             _semanticRuntimeAtImplOps = _implOps;
@@ -41255,6 +41259,33 @@ function _reindentReplacement(newStr, indent) {
  * composed from the model's prior silently drops whatever the file already held. Callers
  * apply this only when the file exists; creating a new file needs no prior read.
  */
+/**
+ * Does this execution-evidence record certify the code as it stands at `implOps` edits?
+ *
+ * Two independent ways to fail:
+ *
+ *   - STALE. Evidence taken before the current edit count certifies a file that has since
+ *     changed. That is the credit this gate exists to revoke.
+ *   - RED. A command that failed is not verification, it is the opposite. Every positive
+ *     test below matches on command SHAPE, so without the exit-status check a
+ *     `npm run build` that exited non-zero certified the code it had just proven broken —
+ *     the most direct route to delivering code that does not run.
+ *
+ * `ok` is stamped at settle time from _toolExecutionSucceeded. Records predating that
+ * stamp carry `undefined` and keep their previous meaning, so introducing this check
+ * cannot retroactively void a run's accumulated evidence.
+ */
+function _evidenceCertifies(e, implOps) {
+  if (Number(e && e.implementationVersion) < implOps) return false;
+  const cmd = String((e && e.command) || "");
+  if (!cmd) return false;
+  if (e.ok === false) return false;
+  if (e.verification === true) return true;
+  if (_looksLikeVerificationCommand(cmd)) return true;
+  return _runtimeCommandKinds(cmd, false).some((k) =>
+    ["build", "test", "run", "package"].includes(k));
+}
+
 function _writeGateBypass(call, { redactedRead = false, preciseLocalEdit = false } = {}) {
   if (!call || typeof call !== "object") return false;
   if (call.type === "write") {
