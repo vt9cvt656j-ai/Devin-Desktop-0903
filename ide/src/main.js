@@ -26146,7 +26146,17 @@ function _subAgentAdmitTools(query, { registry, loaded, execTypes, mapCall, max 
     if (!name || loaded.has(name)) continue;
     let type = "";
     try { type = (mapCall(name, {}) || {}).type || ""; } catch { type = ""; }
-    if (type && execTypes.includes(type)) {
+    // Type alone is not authority. Two admitted-by-type escapes were real:
+    //   deploy_site maps to type "cmd" — which every child has — but it publishes the
+    //   workspace to a public HTTPS domain; a scope-bounded worker must never gain that
+    //   from a discovery query.
+    //   git_commit/git_push map to type "git" (read-listed for the op-gated read four),
+    //   so admission wasted a turn on a schema the dispatcher's op gate then [BLOCKED],
+    //   without ever telling the child to route the need to the parent.
+    // Every strict-mutating tool a child is entitled to is already in its INITIAL
+    // allowlist; one that is not loaded is by definition outside this sandbox.
+    const _strict = _STRICT_MUTATING_TOOL_NAMES.has(name) || name.startsWith("mcp__");
+    if (!_strict && type && execTypes.includes(type)) {
       if (out.admitted.length < max) out.admitted.push(schema);
     } else {
       out.outside.push(name);
@@ -32170,7 +32180,12 @@ function _commandWroteCode(call, result) {
   if (!_toolExecutionSucceeded(call, result)) return false;
   const cmd = String(call.command || "");
   if (!cmd) return false;
-  if (_looksLikeScaffoldCommand(cmd)) return true;
+  // Bare `npm/pnpm/yarn/bun init` (flags only, no initializer) writes package.json and
+  // nothing else — a workspace mutation, but not CODE, so it must not arm the build/test
+  // obligation. `npm init <initializer>` is `npm create` and scaffolds for real.
+  if (_looksLikeScaffoldCommand(cmd)) {
+    return !/^(?:npm|pnpm|yarn|bun)\s+init\s*(?:-{1,2}[\w-]+(?:[=\s]\S*)?\s*)*$/i.test(cmd);
+  }
   if (!_looksLikeShellFileRewrite(cmd)) return false;
   // The rewrite targeted a code file if any token in the command is a code-file path.
   return cmd.split(/[\s"'=:;|&<>()]+/).some((tok) => _CODE_FILE_RE.test(tok));
@@ -32613,6 +32628,15 @@ function _runtimeNeedsSemanticReview(call, result) {
   // semantic review" gate: that used to produce the contradictory UI state
   // "automatic verification passed" + "runtime result not verified".
   if (call?.verification === true || result?.verification === true) return false;
+  // A deterministic check that FAILED is still deterministic. The stamp above became
+  // success-gated (a red build must not CERTIFY code), which un-exempted red checks
+  // from this gate — routing "npm test went red, wrap up honestly" into the paid
+  // semantic-critic loop and labelling the run semantic_runtime_review_missing. The
+  // exemption's rationale is the command CLASS's exit-status contract, not its
+  // outcome: a red build needs fixing (the codeVerify gate demands exactly that),
+  // never semantic review. Command shape is the right test here for the same reason
+  // it is the wrong test for granting verification credit.
+  if (call?.type === "cmd" && _looksLikeVerificationCommand(call.command)) return false;
   // Do not classify application success from command names or output words. If a
   // terminal tool produced observable execution state, the reviewer must inspect
   // that state in the context of the user's requested outcome.
@@ -33681,7 +33705,8 @@ function _refreshDuplicateReadAuthorization(run, root, signature, total, content
   // already visible to the model BEFORE this tool batch. If the same assistant
   // response did read_file + edit_file together, the model has not seen that read
   // result yet, so read-before-edit must still block it.
-  const priorModelTurn = !run._toolBatch || !state.completedBatch || state.completedBatch < run._toolBatch;
+  const _authBatch = (run._toolBatch || 0) + (run._eagerTurnBias || 0); // eager = in-flight turn (see _runHasCurrentRead)
+  const priorModelTurn = !_authBatch || !state.completedBatch || state.completedBatch < _authBatch;
   if (!priorModelTurn) return false;
   const keys = [...new Set(paths.map((path) => _normRel(path, root)).filter(Boolean))];
   for (const key of keys) {
@@ -33865,14 +33890,17 @@ function _runHasCurrentRead(run, root, currentContent, ...paths) {
   const reads = run?.ctx?.filesRead;
   if (!reads) return false;
   const signature = _contentSignature(currentContent);
+  // Eager (mid-stream) executions belong to the still-open turn; the bias makes the
+  // "prior turn" comparison see them at N+1 before the loop's real increment lands.
+  const _gateBatch = (run._toolBatch || 0) + (run._eagerTurnBias || 0);
   return paths.some((path) => {
     const key = _normRel(path, root);
     if (!key) return false;
     const state = coverage?.get?.(key);
-    const readFromPriorModelTurn = !run._toolBatch || !state?.completedBatch || state.completedBatch < run._toolBatch;
+    const readFromPriorModelTurn = !_gateBatch || !state?.completedBatch || state.completedBatch < _gateBatch;
     if (reads.has(key) && state?.signature === signature && readFromPriorModelTurn) return true;
     const known = run?._knownCurrentContent?.get?.(key);
-    const knownFromPriorModelTurn = !run._toolBatch || !known?.completedBatch || known.completedBatch < run._toolBatch;
+    const knownFromPriorModelTurn = !_gateBatch || !known?.completedBatch || known.completedBatch < _gateBatch;
     return known?.signature === signature && knownFromPriorModelTurn;
   });
 }
@@ -37258,6 +37286,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (_runNeedsPlanGateNow(run, call) && planGateNudges < 2) return;
         if (_uiImplementationReadinessNudge(run, planSteps, call)) return;
         entry._eagerDone = true;
+        // An eager write belongs to the IN-FLIGHT model turn, but run._toolBatch is not
+        // incremented until the turn returns — so the read-gate's "read must be from a
+        // prior turn" comparison saw completedBatch N < N and spuriously blocked
+        // whole-file writes of files the model had just read. The bias makes gate
+        // evaluation see the truth (this execution is turn N+1); it is cleared at the
+        // real increment so the batch path's same-turn semantics stay intact.
+        run._eagerTurnBias = 1;
         entry._eagerPromise = (async () => {
           const step = _createToolStep(call);
           body.appendChild(step);
@@ -37872,6 +37907,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         const _eagerEntry = tc._streamEntry && tc._streamEntry._eagerDone ? tc._streamEntry : null;
         return { tc, call, step: null, _unknown: !mapped, _eagerEntry };
       });
+      // The real increment supersedes the eager bias (see run._eagerTurnBias at the
+      // eager hook): clearing it here restores same-turn semantics for the batch path.
+      run._eagerTurnBias = 0;
       run._toolBatch = (run._toolBatch || 0) + 1;
 
       // 工具不丢失（自愈加载）：模型若直接按名调用真实但当前未加载的工具，照常执行，
@@ -41439,15 +41477,47 @@ function _evidenceCertifies(e, implOps) {
   const cmd = String((e && e.command) || "");
   if (!cmd) return false;
   if (e.ok === false) return false;
+  // `ok` measures the WRAPPER tool's success, not the command's. read_terminal on an
+  // exited terminal succeeds as a read (its prose "状态：已退出" carries no failure
+  // marker) while the record it mints carries the real command and exitCode:1 — so an
+  // agent that ran a build in a terminal and then LOOKED AT the failure was minting
+  // green evidence at the current edit count. The record's own exit status is the
+  // ground truth when present; null/undefined (still running, no code reported) keeps
+  // its previous meaning.
+  if (typeof e.exitCode === "number" && e.exitCode !== 0) return false;
   if (e.verification === true) return true;
   if (_looksLikeVerificationCommand(cmd)) return true;
   return _runtimeCommandKinds(cmd, false).some((k) =>
     ["build", "test", "run", "package"].includes(k));
 }
 
-function _writeGateBypass(call, { redactedRead = false, preciseLocalEdit = false } = {}) {
+// One shared cap: the read tool cuts slices at this many chars (whole lines only), so a
+// single line longer than this can never be delivered in full by any read.
+const _READ_SLICE_CHAR_CAP = 55000;
+
+/**
+ * Read coverage for this content is MECHANICALLY impossible: it contains a line longer
+ * than the read slice cap, and the reader only counts whole lines — so no sequence of
+ * read_file calls can ever register complete coverage (minified bundles, data URIs).
+ * The gate must not demand evidence the harness cannot produce; for these files the
+ * whole-file write keeps the old CAS+Undo protection instead of a permanent dead end.
+ */
+function _readCoverageImpossible(content) {
+  if (typeof content !== "string" || !content) return false;
+  let lineStart = 0;
+  for (;;) {
+    const nl = content.indexOf("\n", lineStart);
+    const end = nl === -1 ? content.length : nl;
+    if (end - lineStart > _READ_SLICE_CHAR_CAP) return true;
+    if (nl === -1) return false;
+    lineStart = nl + 1;
+  }
+}
+
+function _writeGateBypass(call, { redactedRead = false, preciseLocalEdit = false, coverageImpossible = false } = {}) {
   if (!call || typeof call !== "object") return false;
   if (call.type === "write") {
+    if (coverageImpossible && typeof call.content === "string" && !!call.content.trim()) return true;
     return (
       redactedRead &&
       typeof call.content === "string" &&
@@ -42112,7 +42182,7 @@ async function _executeToolStepInner(step, call, root, run) {
       const shownFrom = start + 1;
       let shownTo = Math.min(start + slice.length, total);
       let body = slice.join("\n");
-      const CHAR_CAP = 55000; // 读全大多数源文件（~1500-1800 行）；只有真·超大文件才截断分页
+      const CHAR_CAP = _READ_SLICE_CHAR_CAP; // 读全大多数源文件（~1500-1800 行）；只有真·超大文件才截断分页
       let charCapped = false;
       let coverageTo = shownTo;
       if (body.length > CHAR_CAP) {
@@ -42356,7 +42426,8 @@ async function _executeToolStepInner(step, call, root, run) {
       // and because `!redactedRead` is false in exactly the branch that mattered, the OR did
       // not short-circuit — it evaluated a let-binding inside its temporal dead zone and threw
       // ReferenceError. The two are identical here anyway (`newContent = call.content`).
-      if (existed && run && !hasCurrentRead && !_writeGateBypass(call, { redactedRead, preciseLocalEdit })) {
+      if (existed && run && !hasCurrentRead
+          && !_writeGateBypass(call, { redactedRead, preciseLocalEdit, coverageImpossible: _readCoverageImpossible(old) })) {
         res.className = "atc-result atc-result--blocked";
         res.textContent = "⛔ 先读取已有文件";
         const coverageHint = _readBeforeEditCoverageHint(run, root, old, call.path, call.path, fp);
