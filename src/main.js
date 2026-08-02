@@ -32747,6 +32747,23 @@ function _executionEvidenceFromTool(call, result, root) {
   };
 }
 
+// The build's exit code is the ground truth for "does it work" (Warp: the terminal is
+// where verification happens; Cursor: the agent loop reads stderr and re-runs; Claude
+// Code: a failing build is information the model iterates on, not a gate). Returns the
+// newest verification the model DECLARED and that FAILED at the current edit count, so a
+// red build the LSP never mirrored (tsc -b project refs, a Makefile, a custom checker)
+// still forces another fix pass instead of a "clean" finish on a broken tree.
+function _freshBuildFailure(run, implOps) {
+  const ev = run && Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
+  for (let i = ev.length - 1; i >= 0; i--) {
+    const e = ev[i];
+    if (!e || e.purpose !== "verify") continue;
+    if (Number(e.implementationVersion) < implOps) continue; // stale: predates the latest edit
+    if (typeof e.exitCode === "number" && e.exitCode !== 0) return e;
+  }
+  return null;
+}
+
 function _executionEvidenceReviewBlock(records) {
   const list = Array.isArray(records) ? records.slice(-5) : [];
   if (!list.length) return "";
@@ -36708,6 +36725,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   // editing existing code; bounded investigate-first / plan-first nudges; and how many
   // times we've AUTO-RUN the project's verify check (so it CONVERGES to green).
   let didInvestigate = false, didEdit = false, investigateNudged = false, planNudged = false, verifyRuns = 0;
+  let buildFixAttempts = 0; // bounded red-build → fix → rerun loop (Cursor caps at 8; we allow 6)
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
@@ -37885,6 +37903,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _pushNudge("diagBlocking", `[BLOCKING_NEW_DIAGNOSTICS] 新增诊断仍未解除。先修复下面这些错误并重新运行真实构建/测试；只有退出码 0 才能推翻可能过期的 LSP 结果。在此之前不要继续无关功能、不要收尾：\n\n${run._diagnosticBlock}`);
             continue;
           }
+        }
+        // Red-build → fix → rerun (Cursor's Agent Loop, Warp's terminal verification): the
+        // model DECLARED a verification and it exited nonzero at the current edit count.
+        // Feed the real stderr back and keep fixing — do NOT finish on a broken build,
+        // which is the "开发服务器在跑但页面不可见 / 13 个 TS 错误" symptom. Bounded so an
+        // unfixable build converges to an honest incomplete instead of thrashing forever.
+        const _buildFail = _freshBuildFailure(run, _implOps);
+        if (_buildFail && _live()) {
+          if (buildFixAttempts < 6) {
+            buildFixAttempts++;
+            const _tail = String(_buildFail.stderr || _buildFail.stdout || "").slice(-2400);
+            _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实（退出码即结论）。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
+            continue;
+          }
+          // Budget spent: stop nudging, record the truth so the finish is honest.
+          run._incompleteReason = run._incompleteReason || "build_failing";
         }
         const _needsUiDeliveryAudit = run.engineering.fullWebsite && run.engineering.uiProject && didMutate
           && _uiDeliveryAuditedAtImplOps < _implOps && uiDeliveryAuditRuns < 3;
