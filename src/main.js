@@ -8444,8 +8444,25 @@ function _invalidateSessionEvidenceForPaths(paths) {
     }
   }
 }
+// Observed-fact ledger for command mutation accounting. The watcher is the ground truth
+// for "did the workspace change?" — strictly better than reading intent out of a command
+// string, and it sees what no classifier can (a script, a Makefile target, a generator).
+let _fsWatchTick = 0;
+let _fsWatchRecent = [];
+function _fsWatchSnapshot() { return { tick: _fsWatchTick, len: _fsWatchRecent.length }; }
+function _fsWatchDeltaSince(snap) {
+  if (!snap) return { changed: false, paths: [] };
+  if (_fsWatchTick === snap.tick) return { changed: false, paths: [] };
+  return { changed: true, paths: _fsWatchRecent.slice(Math.max(0, snap.len)) };
+}
+
 function handleFsChanges(paths) {
   paths = (paths || []).map(_coherentFilePath);
+  if (paths.length) {
+    _fsWatchTick++;
+    _fsWatchRecent.push(...paths);
+    if (_fsWatchRecent.length > 400) _fsWatchRecent = _fsWatchRecent.slice(-400);
+  }
   const dependencyCacheChanged = paths.some(_isDependencyCachePath);
   _invalidateSessionEvidenceForPaths(paths);
   // A file actually changed (agent write / user edit / external) → the agent context is now stale, so
@@ -25934,7 +25951,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "create_dir", description: "新建一个目录（含缺失的父目录）。【何时用】确实需要创建空目录时。【vs 替代】write_file 写文件时父目录会自动创建，所以一般不需要手动建。【何时不用】如果接下来要往目录里写文件，直接 write_file 即可，不必先 create_dir。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要创建的目录路径" } }, required: ["path"] } } },
       { type: "function", function: { name: "copy_path", description: "复制文件或目录（递归）到新位置（from → to）。【何时用】按模板搭脚手架、备份文件时。【vs 替代】改名/移动用 move_path。【注意】目标已存在会报错。", parameters: { type: "object", properties: { from: { type: "string", minLength: 1, description: "源路径" }, to: { type: "string", minLength: 1, description: "目标路径" } }, required: ["from", "to"] } } },
       { type: "function", function: { name: "format_file", description: "用语言服务（LSP / 内置 TS）格式化整个文件；结果按可撤销的方式写入并显示 diff。【何时用】改完代码想统一格式风格时。【vs 替代】局部格式调整直接 edit_file。【注意】仅支持有 LSP 的语言（TS/JS 等）。", parameters: { type: "object", properties: { path: { type: "string", minLength: 1, description: "要格式化的文件" } }, required: ["path"] } } },
-      { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程、监听服务等）。启动后不要猜：用 read_logs/read_terminal 读取日志/URL/退出状态；要等 ready 就再用 background_monitor(check_type:\"port\"/\"url\"/\"file\"/\"command\") 挂后台自动轮询。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" } }, required: ["command"] } } },
+      { type: "function", function: { name: "run_in_terminal", description: "在 IDE 的真实终端 tab 里启动一个**长时间运行 / 持续**的命令（dev server、watch、后台守护进程、监听服务等）。启动后不要猜：用 read_logs/read_terminal 读取日志/URL/退出状态；要等 ready 就再用 background_monitor(check_type:\"port\"/\"url\"/\"file\"/\"command\") 挂后台自动轮询。", parameters: { type: "object", properties: { command: { type: "string", description: "要持续运行的命令，如 npm run dev" }, name: { type: "string", description: "可选，这个任务/终端的简短名字" }, purpose: { type: "string", enum: ["explore", "verify", "install", "mutate", "scaffold", "run"], description: "这条命令的目的：verify=构建/测试/类型检查/lint（退出码即结论）；run=启动应用/服务看行为；mutate/scaffold=会改工作区文件；install=装依赖；explore=只读探查。如实声明——verify+退出 0 记为验证证据。" } }, required: ["command"] } } },
       { type: "function", function: { name: "system", description: "**系统级控制：在各种软件之间瞬间跳转、直接走菜单——比截图找图标再点快得多（控制慢就用它）**。", parameters: { type: "object", properties: { action: { type: "string", enum: ["open", "menu", "menu_items", "apps", "windows", "focus", "frontmost"], description: "要执行的系统操作" }, name: { type: "string", description: "open/windows/focus 用：App 名（和「应用程序」或菜单栏显示的完全一致）" }, background: { type: "boolean", description: "open 用(可选)：true = 后台启动、不抢焦点、不打断用户（macOS 生效）" }, path: { type: "array", description: "menu/menu_items 用：菜单路径数组，如 [\"文件\",\"新建\"] / [\"File\",\"New\"] / [\"格式\",\"字体\",\"加粗\"]。", items: { type: "string" } }, title: { type: "string", description: "focus 用(可选)：要提到最前的窗口标题（含即可，不传则第一个窗口）" }, app: { type: "string", description: "menu/menu_items 用(可选)：目标 App 名；不传=当前前台 App" } }, required: ["action"] } } },
       { type: "function", function: { name: "browser", description: "**有头/可见且 sticky 复用的交互式浏览器自动化**：登录、多步表单、点击、上传、验证码前后、E2E/UI 行为验证用它。默认流程：navigate(fresh=true) → check → nodes → batch 连续点击/输入/等待 → assert/check 验证；复杂页面优先 batch，它会用真实 pointer/mouse 事件、hover、drag/slide/swipe、wheel、遮挡检测、React/Vue 原生 value setter、动作后 DOM/URL settle，不要慢吞吞每步截图。只有最终视觉验收或肉眼排版问题才 screenshot。抓真实接口先 capture_start(mode:\"isolated_browser\") 再 browser navigate(fresh:true)。**⚠️读源码/文件一律 read_file，抓纯数据优先 http_request/脚本，不要用浏览器一页页抄。**", parameters: { type: "object", properties: { action: { type: "string", enum: ["navigate", "viewport", "click", "type", "autofill", "fill", "press", "scroll", "wait", "eval", "screenshot", "design", "network", "inspect", "nodes", "assert", "check", "batch", "upload", "cookies", "storage", "close"], description: "要执行的浏览器动作。连续/复杂操作优先用 batch；表单登录优先 autofill；screenshot 只用于最终视觉验收/排版肉眼检查。测手机端用 viewport 切换视口（width/height/mobile），不要给 screenshot 传宽高。" }, url: { type: "string", description: "navigate 用：要打开的网址。省略时若有 dev server 在跑会自动用其 URL" }, width: { type: "integer", description: "viewport 用：视口宽 px（如桌面 1440、手机 390）" }, height: { type: "integer", description: "viewport 用：视口高 px（如桌面 900、手机 844）" }, mobile: { type: "boolean", description: "viewport 用：true=移动端模拟（触摸/UA/DPR）" }, device_scale_factor: { type: "number", description: "viewport 用：设备像素比，手机常用 2-3" }, fresh: { type: "boolean", description: "navigate 用：true=隔离语义；同任务同源会自动保留并复用当前浏览器，不会动不动关窗口。" }, mode: { type: "string", enum: ["headed", "isolated"], description: "可选语义提示：headed=有头交互（默认）；isolated=请配合 fresh=true 做隔离会话。真正无头静态渲染请用 screenshot。" }, force: { type: "boolean", description: "close 用：只有 force:true 才真正关闭浏览器；默认 close 只是释放占用并保持 sticky 复用。" }, paths: { type: "array", description: "upload 用：要上传的本地文件绝对路径（可多个）；单个也可用 path", items: { type: "string" } }, fields: { type: "object", description: "autofill/fill 用：语义字段表，如 {\"email\":\"a@b.com\",\"password\":\"secret\",\"username\":\"michael\"}，会按 label/placeholder/name/autocomplete 匹配并返回 invalid/missing。" }, submit: { type: "boolean", description: "autofill 用：填完后是否尝试提交表单" }, submitText: { type: "string", description: "autofill 提交按钮文字，如 登录/保存/Continue" }, steps: { type: "array", description: "batch 用：连续执行步骤数组，每项 {op,node/index/selector/target/role,text/value/option,key,amount,dx,dy,x,y,toX,toY,percent,duration,checked,ms}。op 支持 click/tap、hover、type/fill/input、select/choose、toggle/check/uncheck、drag、slide(滑块，percent/value)、swipe、wheel、press、scroll、wait。先 nodes 拿 node 编号最稳；也可 target:\"保存\" 按可访问名称/文字语义定位。batch 会一次执行多步、检测遮挡、等待变化并返回失败原因。只有 navigate/upload 这类换页/文件操作才拆开。", items: { type: "object" } }, node: { type: "integer", description: "click/type 用(首选)：nodes 清单里的节点号 i" }, index: { type: "integer", description: "click/type 用：截图元素列表里的编号(红色数字)" }, selector: { type: "string", description: "click/type/wait 用(备选)：CSS 选择器；支持 :has-text()/text= 的解析。" }, target: { type: "string", description: "click/type/wait 用(语义备选)：目标可见文字、aria-label、placeholder、label、name，例如 保存、Email、搜索。" }, role: { type: "string", description: "click/type/wait 用(语义备选)：目标角色提示，如 button/textbox/link/tab/slider/switch/checkbox。" }, text: { type: "string", description: "type 用：要输入的文本；click/wait 可作为目标文字；assert 用：要查找的文本(确认它出现/可见)" }, key: { type: "string", description: "press 用：按键名，如 Enter" }, amount: { type: "integer", description: "scroll/wheel 用：滚动像素，正=下 负=上(如 600 / -600)" }, ms: { type: "integer", description: "wait 用：等待毫秒(不传 selector/target 时用，默认 1500)" }, script: { type: "string", description: "eval 用：要执行的 JavaScript" } }, required: ["action"] } } },
       { type: "function", function: { name: "git_stash", description: "把当前工作区改动暂存进 stash 堆栈并清空工作区（git stash push）。", parameters: { type: "object", properties: {} } } },
@@ -27358,7 +27375,10 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "create_dir": { const _p = String(args.path || "").trim(); if (!_p) return { type: "mkdir", _error: "path 不能为空" }; return { type: "mkdir", path: _p }; }
     case "copy_path": { const _f = String(args.from || "").trim(); const _t = String(args.to || "").trim(); if (!_f) return { type: "copy", _error: "from 不能为空" }; if (!_t) return { type: "copy", _error: "to 不能为空" }; return { type: "copy", path: _f, to: _t }; }
     case "format_file": { const _p = String(args.path || "").trim(); if (!_p) return { type: "format", _error: "path 不能为空" }; return { type: "format", path: _p }; }
-    case "run_in_terminal": return { type: "termtask", command: args.command || "", name: args.name || "" };
+    case "run_in_terminal": {
+      const _p = ["explore", "verify", "install", "mutate", "scaffold", "run"].includes(args.purpose) ? args.purpose : "";
+      return { type: "termtask", command: args.command || "", name: args.name || "", purpose: _p };
+    }
     case "browser": {
       // Prefer the element ref (Set-of-Mark index) → a precise [data-mref] selector,
       // so the agent acts by number instead of guessing CSS. Falls back to selector.
@@ -27676,7 +27696,7 @@ function _planEvidenceKindsForTool(call, result) {
     // 只有真正铺出项目代码的脚手架命令才算 implement 证据。
     if (_looksLikeScaffoldCommand(command)) kinds.add("implement");
     else if (_isDependencyRestoreCommand(command) || _looksLikeWorkspaceMutationCommand(command) || runtimeKinds.includes("install")) kinds.add("execute");
-    if (_looksLikeVerificationCommand(command) || runtimeKinds.some((kind) => ["build", "test", "package"].includes(kind))) kinds.add("verify");
+    if (call?.purpose === "verify" || runtimeKinds.some((kind) => ["build", "test", "package"].includes(kind))) kinds.add("verify");
     if (runtimeKinds.includes("run")) kinds.add("execute");
     if (!kinds.size) kinds.add("execute");
   }
@@ -32227,13 +32247,14 @@ function _commandWroteCode(call, result) {
   // Bare `npm/pnpm/yarn/bun init` (flags only, no initializer) writes package.json and
   // nothing else — a workspace mutation, but not CODE, so it must not arm the build/test
   // obligation. `npm init <initializer>` is `npm create` and scaffolds for real.
-  if (call.purpose === "scaffold") return true;
-  if (_looksLikeScaffoldCommand(cmd)) {
-    return !/^(?:npm|pnpm|yarn|bun)\s+init\s*(?:-{1,2}[\w-]+(?:[=\s]\S*)?\s*)*$/i.test(cmd);
+  // Declared as producing code, or observed to have written a code file. The watcher
+  // reports the actual paths, so "did this write code?" is answered by what landed on
+  // disk rather than by reading intent out of the command string.
+  if (call.purpose === "scaffold" || call.purpose === "mutate") {
+    const touched = Array.isArray(result?._fsPaths) ? result._fsPaths : null;
+    return touched ? touched.some((f) => _CODE_FILE_RE.test(String(f))) : call.purpose === "scaffold";
   }
-  if (!_looksLikeShellFileRewrite(cmd)) return false;
-  // The rewrite targeted a code file if any token in the command is a code-file path.
-  return cmd.split(/[\s"'=:;|&<>()]+/).some((tok) => _CODE_FILE_RE.test(tok));
+  return Array.isArray(result?._fsPaths) && result._fsPaths.some((f) => _CODE_FILE_RE.test(String(f)));
 }
 function _mcpMutationHint(call, requireWorkspacePath = false) {
   if (!call || call.type !== "mcp" || call.mcpReadOnly) return false;
@@ -32253,12 +32274,14 @@ function _toolMutatesWorkspace(call, result) {
   // for plan-step advancement, so a scaffolded project had didMutate=false and _implOps=0
   // — every verification gate inert on exactly the runs that create the most code.
   if (call.type === "cmd" || call.type === "termtask") {
-    // Declared intent ADDS signal (a `python generate.py` that writes files is invisible
-    // to every classifier); it never subtracts — a declared "explore" that the classifier
-    // recognises as mutating still counts, so mis-declaration cannot suppress the
-    // verification-obligation re-arm.
-    if (call.purpose === "mutate" || call.purpose === "scaffold" || call.purpose === "install") return true;
-    return _looksLikeWorkspaceMutationCommand(call.command) || _looksLikeScaffoldCommand(call.command);
+    // Declaration OR observed fact — no command-text guessing. `_fsDelta` is stamped by
+    // the executor from the file watcher: it is TRUE when the workspace actually changed
+    // while this command ran. That is strictly better evidence than any classifier could
+    // be, and it catches the cases text never could (`python generate.py`, a Makefile
+    // target, a script whose name says nothing). A declaration that under-reports is
+    // corrected by the fact; the fact cannot be talked out of by a wrong declaration.
+    if (result && result._fsDelta === true) return true;
+    return call.purpose === "mutate" || call.purpose === "scaffold" || call.purpose === "install";
   }
   // MCP names are only approval hints. A remote GitHub `create_or_update_file`
   // also has a path, but it did not mutate this local workspace.
@@ -32686,7 +32709,9 @@ function _runtimeNeedsSemanticReview(call, result) {
   // outcome: a red build needs fixing (the codeVerify gate demands exactly that),
   // never semantic review. Command shape is the right test here for the same reason
   // it is the wrong test for granting verification credit.
-  if (call?.type === "cmd" && _looksLikeVerificationCommand(call.command)) return false;
+  // A declared verification has an exit-status contract: red means fix it (the codeVerify
+  // gate demands exactly that), never "have a critic interpret the output".
+  if (call?.purpose === "verify") return false;
   // Do not classify application success from command names or output words. If a
   // terminal tool produced observable execution state, the reviewer must inspect
   // that state in the context of the user's requested outcome.
@@ -38488,12 +38513,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         // It used to key on the command's shape alone, so `npm run build` exiting non-zero
         // was recorded as verification — a failing build certified the code it just proved
         // broken, which is the most direct way for the loop to deliver code that does not run.
-        // Declaration-first (Claude Code style): the model states the command's purpose
-        // structurally in the tool call; the harness verifies through the exit code. The
-        // regex classifier remains ONLY as a floor for models that omit the field — it is
-        // no longer the judge for models that declare.
-        if (call.type === "cmd"
-            && (call.purpose === "verify" || (!call.purpose && _looksLikeVerificationCommand(call.command)))
+        // Declaration + fact, nothing else. The model states the command's purpose
+        // structurally; the harness verifies through the exit code. No text classifier
+        // participates: a keyword floor could only ever guess, and its guesses were both
+        // false-negative (npx vite build) and false-positive (node build_report.js).
+        if ((call.type === "cmd" || call.type === "termtask")
+            && call.purpose === "verify"
             && _toolExecutionSucceeded(call, result)) {
           call.verification = true;
           if (result && typeof result === "object") result.verification = true;
@@ -39224,11 +39249,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           if (!_evidenceSeen.has(evidenceKey)) { _evidenceSeen.add(evidenceKey); _novelEvidenceCount++; }
         }
         if ((t === "edit" || t === "multiedit") && _ok) didEdit = true;
-        // Model-initiated deterministic verification: only an explicit check/test/
-        // build contract gets direct credit. Project execution is reviewed from raw
-        // structured evidence and never promoted solely because it exited with 0.
+        // Model-initiated deterministic verification: the model DECLARES the command a
+        // verification and the exit code confirms it. Command text is never consulted —
+        // it produced credit for `node build_report.js` and denied it to `npx vite build`.
         if (didMutate && _ok
-            && t === "cmd" && _looksLikeVerificationCommand(it.call.command)) {
+            && (t === "cmd" || t === "termtask") && it.call.purpose === "verify") {
           didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
           run._diagnosticBlock = "";
         }
@@ -41592,16 +41617,12 @@ function _evidenceCertifies(e, implOps) {
   // ground truth when present; null/undefined (still running, no code reported) keeps
   // its previous meaning.
   if (typeof e.exitCode === "number" && e.exitCode !== 0) return false;
+  // Two ways to certify, both grounded: the IDE's own structural stamp (set when a
+  // declared verification exited 0), or the model's declaration on the record itself.
+  // An undeclared command certifies nothing — silence is not evidence, and guessing
+  // from command text is what produced both false credit and false denial.
   if (e.verification === true) return true;
-  // Declaration-first: a command the model declared as verification certifies on green;
-  // one it declared as something ELSE (run/mutate/install/explore) must not be
-  // reinterpreted as verification by pattern-matching its text. The regex floor applies
-  // only when no declaration exists.
-  if (e.purpose === "verify") return true;
-  if (e.purpose) return false;
-  if (_looksLikeVerificationCommand(cmd)) return true;
-  return _runtimeCommandKinds(cmd, false).some((k) =>
-    ["build", "test", "run", "package"].includes(k));
+  return e.purpose === "verify";
 }
 
 // One shared cap: the read tool cuts slices at this many chars (whole lines only), so a
@@ -45868,6 +45889,9 @@ ${bodyPreview}`)}</pre>`;
         `</div>`;
 
       const _cmdStartedAt = Date.now(); // 长耗时安装/下载附注的耗时事实（含自动重试）
+      // Baseline for the observed-mutation fact: anything the watcher reports after this
+      // point and before the result is read is attributable to this command.
+      call._fsWatchSnap = _fsWatchSnapshot();
       const result = await _agentRunInTerminal(root, call.command, step);
       let commandDiagnostics = null;
 
@@ -45948,7 +45972,11 @@ ${bodyPreview}`)}</pre>`;
       if (result.code === 0 && /\b(install|add|sync|ci)\b|pipx?\d?(\.\d+)?\s+install|uv\s+(pip\s+)?(install|sync)|cargo\s+install|brew\s+install/i.test(call.command)) {
         try { _binProbeCache.clear(); } catch {}
       }
-      const _workspaceChangedByCommand = result.code === 0 && _looksLikeWorkspaceMutationCommand(call.command);
+      // Observed, not guessed. The watcher is debounced, so give it a beat to land before
+      // reading the delta; a miss degrades to the declaration, never to a wrong verdict.
+      await new Promise((r) => setTimeout(r, 120));
+      const _fsSeen = _fsWatchDeltaSince(call._fsWatchSnap);
+      const _workspaceChangedByCommand = result.code === 0 && _fsSeen.changed;
       if (_workspaceChangedByCommand) _clearRunEmptyRoot(run, root || rootPath);
       if (_dependencyGraphChanged || _workspaceChangedByCommand) {
         try {
@@ -45970,6 +45998,8 @@ ${bodyPreview}`)}</pre>`;
         path: call.command,
         command: call.command,
         cwd: root || "",
+        _fsDelta: _fsSeen.changed,
+        _fsPaths: _fsSeen.paths,
         code: result.code,
         exitCode: result.code,
         running: false,
