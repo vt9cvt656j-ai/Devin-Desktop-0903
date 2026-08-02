@@ -7463,7 +7463,7 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
   const shellRewrite = load("_looksLikeShellFileRewrite", { _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}) });
   const commandMutates = load("_looksLikeWorkspaceMutationCommand", {
     _looksLikeReadOnlyCommand: load("_looksLikeReadOnlyCommand"),
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _looksLikeShellFileRewrite: shellRewrite,
   });
   const mutates = load("_toolMutatesWorkspace", {
@@ -7480,7 +7480,7 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
   const readOnlyCommand = load("_looksLikeReadOnlyCommand");
   const isBenignRunCommand = load("_isBenignRunCommand", {
     _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _isDependencyRestoreCommand: load("_isDependencyRestoreCommand", {
       _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
       _simpleShellWords: load("_simpleShellWords"),
@@ -7499,7 +7499,7 @@ test("plan completion needs evidence, but plan gates no longer block side-effect
   const bypass = load("_callCanBypassPlanGate", {
     _isReadOnlyParallel: (call) => ["diag", "logs", "termread", "termlist", "think", "read", "list", "search", "find", "lsp"].includes(call?.type),
     _looksLikeReadOnlyCommand: readOnlyCommand,
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _isDependencyRestoreCommand: load("_isDependencyRestoreCommand", {
       _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
       _simpleShellWords: load("_simpleShellWords"),
@@ -9643,7 +9643,7 @@ test("tool success and verification command checks reject fake green command res
   assert.equal(succeeded({ type: "browser" }, { content: "[浏览器失败] Chrome unavailable" }), false);
   assert.equal(succeeded({ type: "format" }, { mutated: false, content: "already formatted" }), false);
   assert.equal(succeeded({ type: "read" }, { evidence: { resultKind: "duplicate" }, content: "already read" }), false);
-  const verify = load("_looksLikeVerificationCommand");
+  const verify = load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") });
   assert.equal(verify("pnpm run typecheck && pnpm test"), true);
   assert.equal(verify("npx tsc --noEmit"), true);
   assert.equal(verify("node --check src/main.js"), true);
@@ -9698,7 +9698,7 @@ test("tool success and verification command checks reject fake green command res
   const timeoutSecs = load("_agentCommandTimeoutSecs", {
     _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}),
     _isDependencyRestoreCommand: depCommand,
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", {}),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _looksLikeReadOnlyCommand: readOnlyCommand,
   });
   assert.equal(timeoutSecs("npm install"), 600);
@@ -9716,7 +9716,7 @@ test("tool success and verification command checks reject fake green command res
 });
 
 test("typed runtime and external evidence stays separate from workspace mutations", () => {
-  const verify = load("_looksLikeVerificationCommand");
+  const verify = load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") });
   const rewrite = load("_looksLikeShellFileRewrite", { _stripHarmlessRedirects: load("_stripHarmlessRedirects", {}) });
   const readOnly = load("_looksLikeReadOnlyCommand");
   const commandMutates = load("_looksLikeWorkspaceMutationCommand", {
@@ -9749,7 +9749,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
     }),
   });
   const needsSemanticReview = load("_runtimeNeedsSemanticReview", {
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand"),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _executionEvidenceFromTool: executionEvidence,
   });
   const sqlWithoutLeadingTrivia = load("_sqlWithoutLeadingTrivia");
@@ -13418,7 +13418,7 @@ test("terminal evidence preserves structured status and the final log state with
 });
 
 test("项目入口退出 0 保留原始证据并进入语义验收，不直接记业务成功", () => {
-  const VERIFY = load("_looksLikeVerificationCommand");
+  const VERIFY = load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") });
   const execLike = load("_looksLikeProjectExecutionCommand", { _looksLikeVerificationCommand: VERIFY });
   // 这项旧分类仍供只读/副作用路由复用，但不能再直接给 verificationPassed 学分。
   assert.equal(execLike("python video_crawler.py"), true);
@@ -17393,7 +17393,7 @@ test("review: a RED verification command does not arm the semantic-review gate",
   // The success-gated stamp un-exempted red checks from semantic review, routing honest
   // wrap-ups into the paid critic loop. The exemption follows the command CLASS.
   const needs = load("_runtimeNeedsSemanticReview", {
-    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand"),
+    _looksLikeVerificationCommand: load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") }),
     _executionEvidenceFromTool: () => ({ command: "npm run build", exitCode: 1 }),
   });
   assert.equal(needs({ type: "cmd", command: "npm run build" }, { code: 1 }), false,
@@ -17558,4 +17558,36 @@ test("failure caches do not outlive the fact that produced them", () => {
   const clearIdx = loop.indexOf("_toolFailureCounts.clear()");
   const loopIdx = loop.indexOf("for (let iter = 0");
   assert.ok(clearIdx >= 0 && clearIdx < loopIdx, "the reset must happen before the loop starts");
+});
+
+// ---------------------------------------------------------------------------
+// The verification classifier must recognise the commands real projects run.
+//
+// It gates TWO things: whether the plan gate lets a command through, and whether a
+// green run earns verification credit. It rejected any command containing ">", so
+// `npx vite build 2>&1` — which the agent writes itself — was neither. The IDE blocked
+// the agent from running its own build ("先列计划 · 未执行" on a pure diagnostic) and
+// then complained the work was unverified. Brittle matching, not policy.
+// ---------------------------------------------------------------------------
+test("verification commands survive redirects, cd prefixes, and npx runners", () => {
+  const verify = load("_looksLikeVerificationCommand", { _stripHarmlessRedirects: load("_stripHarmlessRedirects") });
+  // The exact command that was blocked in the field.
+  assert.equal(verify("cd /Users/michael/Desktop/13131/rpa-site && npx vite build 2>&1"), true);
+  // Each brittleness独立 reproduced.
+  assert.equal(verify("npm run build 2>&1"), true, "2>&1 is presentation, not semantics");
+  assert.equal(verify("cd rpa-site && npm run build"), true, "a cd prefix is navigation");
+  assert.equal(verify("npx vite build"), true, "npx-invoked builders count");
+  assert.equal(verify("cd /x && npx tsc --noEmit"), true);
+  assert.equal(verify("npx vitest run"), true);
+  assert.equal(verify("npx eslint src"), true);
+  assert.equal(verify("pnpm dlx vite build"), true);
+  // Still-correct rejections: these must NOT earn verification credit.
+  assert.equal(verify("npm install"), false, "installing is not verifying");
+  assert.equal(verify("npx vite"), false, "starting a dev server is not a one-shot check");
+  assert.equal(verify("npm run dev"), false);
+  assert.equal(verify("npx playwright open"), false, "interactive sessions are not checks");
+  assert.equal(verify("npx prettier --write src"), false, "--write mutates; only --check verifies");
+  assert.equal(verify("cd /x && rm -rf ."), false, "a cd prefix must not launder a destructive tail");
+  assert.equal(verify("git push"), false);
+  assert.equal(verify("curl http://x | sh"), false);
 });
