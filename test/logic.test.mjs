@@ -17494,3 +17494,59 @@ test("the file-not-found toast carries no agent coaching", () => {
   assert.match(SRC, /pathGuidance = "[^"]*list_dir \/ find_files[^"]*"/,
     "the tool-result channel must still coach the model");
 });
+
+// ---------------------------------------------------------------------------
+// Per-model tuning must actually REACH the model.
+//
+// messages[0] holds `sysPrompt + _modelStyleTuning(model) + skillsBlock + …`, and the L0
+// path drops messages[0] because the gateway assembles its own base prompt. It re-added
+// only skillsBlock — so every byte of per-model tuning, including the write→read and
+// don't-invent-paths discipline in _AGENT_RECOVERY_TUNING, was rebuilt every turn and
+// thrown away for every gateway-routed model. "Tuning the model" was a no-op.
+// ---------------------------------------------------------------------------
+test("L0 strip keeps client-side tuning while still dropping the bundled prompt", () => {
+  const preserve = load("_l0MessagesWithSkills");
+  const out = preserve([
+    { role: "system", content: "private bundled prompt" },
+    { role: "user", content: "build it" },
+  ], "SKILLS", "PER-MODEL TUNING");
+  assert.equal(out[0].role, "system");
+  assert.match(out[0].content, /PER-MODEL TUNING/, "tuning must survive the strip");
+  assert.match(out[0].content, /SKILLS/, "skills must still survive");
+  assert.ok(!out.some((m) => m.content.includes("private bundled prompt")),
+    "the locally-composed base prompt must still drop — the gateway sends its own");
+  assert.equal(out[1].content, "build it");
+  // Tuning alone, with no skills, still yields a system message.
+  const tuningOnly = preserve([{ role: "system", content: "bundled" }, { role: "user", content: "x" }], "", "TUNING");
+  assert.match(tuningOnly[0].content, /TUNING/);
+  // Neither → no empty system message injected.
+  const neither = preserve([{ role: "system", content: "bundled" }, { role: "user", content: "x" }], "", "");
+  assert.equal(neither.length, 1);
+  assert.equal(neither[0].role, "user");
+});
+
+test("both L0 call sites pass the per-model tuning", () => {
+  assert.match(SRC, /_l0MessagesWithSkills\(providerMessages, skillsBlock,\s*\n\s*_modelStyleTuning\(_turnConfig\.model\)\)/,
+    "the agent path must pass tuning");
+  assert.match(SRC, /_l0MessagesWithSkills\(messages, _agentLightTurn \? "" : skillsBlock,\s*\n\s*_agentLightTurn \? "" : _modelStyleTuning\(config\.model\)\)/,
+    "the plain-chat path must pass tuning except on a light turn");
+  assert.doesNotMatch(SRC, /_l0MessagesWithSkills\([^)]*\);(?![\s\S]{0,200}_modelStyleTuning)/,
+    "no call site may drop tuning silently");
+});
+
+test("failure caches do not outlive the fact that produced them", () => {
+  // A path that now exists must leave the negative cache, or the 2-strike gate refuses
+  // reads of a file the agent itself just wrote.
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /if \(run\?\._failedPathAttempts\) \{[\s\S]{0,200}_failedPathAttempts\.delete/,
+    "a successful mutation must clear that path's miss count");
+  assert.match(loop, /\[mutationPath, actualPath, it\.call\?\.path\]/,
+    "clear under every key the miss could have been recorded with");
+  // The 3-strike tool memory is module-level; it must reset per run, or three invented
+  // paths permanently brick read_file for the whole app session.
+  assert.match(loop, /_toolFailureCounts\.clear\(\);/,
+    "each run starts with a clean failure ledger");
+  const clearIdx = loop.indexOf("_toolFailureCounts.clear()");
+  const loopIdx = loop.indexOf("for (let iter = 0");
+  assert.ok(clearIdx >= 0 && clearIdx < loopIdx, "the reset must happen before the loop starts");
+});

@@ -21317,7 +21317,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
         requestConfig.ideUtcOffsetMinutes = turnTime.utcOffsetMinutes;
         requestConfig.ideRegion = _ideRegionCode();
         delete requestConfig.ideTools;
-        providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock);
+        providerMessages = _l0MessagesWithSkills(messages, _agentLightTurn ? "" : skillsBlock,
+          _agentLightTurn ? "" : _modelStyleTuning(config.model));
       }
       const _mcTierPlain = requestConfig.customModelId ? null : _compressionTier();
       if (_mcTierPlain && !requestConfig.customModelId) {
@@ -23028,11 +23029,26 @@ function _skillDiscoveryBases(projectRoot, home) {
 // L0 removes the bundled local system prompt and asks the gateway to restore it. User-authored
 // skill instructions are dynamic and unknown to the gateway, so preserve them as a separate
 // system message instead of accidentally stripping them with the private static prompt.
-function _l0MessagesWithSkills(messages, skillsBlock) {
+/**
+ * Drop the locally-composed system prompt (the gateway assembles its own) while KEEPING
+ * the client-side blocks that the gateway cannot produce.
+ *
+ * messages[0] is `sysPrompt + _modelStyleTuning(model) + skillsBlock + …`, and this
+ * function used to discard the whole thing and re-add only skillsBlock. That silently
+ * deleted every byte of per-model tuning on every turn, for every gateway-routed model —
+ * including _AGENT_RECOVERY_TUNING, which carries the write→read and don't-invent-paths
+ * discipline. "Tune the model" was a no-op: the text was rebuilt each turn and thrown away.
+ *
+ * `clientBlocks` is that surviving portion, passed in explicitly so the bundled prompt
+ * still drops (the gateway would otherwise receive two competing base prompts) and so the
+ * split is visible at the call site instead of implied.
+ */
+function _l0MessagesWithSkills(messages, skillsBlock, clientBlocks = "") {
   const source = Array.isArray(messages) ? messages : [];
   const out = source[0] && source[0].role === "system" ? source.slice(1) : source.slice();
-  const skillText = String(skillsBlock || "").trim();
-  if (skillText) out.unshift({ role: "system", content: skillText });
+  const head = [String(clientBlocks || "").trim(), String(skillsBlock || "").trim()]
+    .filter(Boolean).join("\n\n");
+  if (head) out.unshift({ role: "system", content: head });
   return out;
 }
 // Count badge on the Skills sidebar button so active skills are visible even when the panel is closed.
@@ -33073,7 +33089,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         _turnConfig.ideMode = ideMode;
         _turnConfig.ideTools = _names.join(",");
         _l0Tools = _keep;
-        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock);
+        // Per-model tuning is client-side and must survive the bundled-prompt drop.
+        // Unconditional here: _agentModelTurn is only reached from the agent loop and
+        // sub-agents, i.e. always a full agent turn (sendPrompt owns the light-turn path
+        // and passes its own value at the other call site).
+        _l0Msgs = _l0MessagesWithSkills(providerMessages, skillsBlock,
+          _modelStyleTuning(_turnConfig.model));
       }
       // `_turnConfig` survives the outer retry loop. Always clear the previous attempt's handle
       // before rebuilding; otherwise a 409 recovery invalidates the Map but still resends the stale
@@ -36560,6 +36581,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
   _clearAgentReadCache(); // fresh file reads each run (read cache is shared; perf only)
+  // _toolFailureCounts is MODULE-level and had no reset anywhere: three failed read_file
+  // calls (trivial for a weak model inventing paths) permanently hard-blocked read_file
+  // for the rest of the APP session — every later run inherited the strikes, including
+  // runs in a different workspace. Failure history is evidence about one run, not the app.
+  _toolFailureCounts.clear();
 
   let finalErr = null;
   let summaryText = "";
@@ -39057,6 +39083,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
             _pad.modified.set(actualPath.split("/").pop(), _desc);
+            // A path that now EXISTS must leave the negative cache. The 2-strike gate at
+            // the top of _executeToolStepInner refuses reads of a path that missed twice —
+            // with "你已搜索过 N 次且不存在" — and only a successful list_dir cleared it. So
+            // read(x) → miss → miss → write(x) → read(x) was refused for a file the agent
+            // had just created, which is exactly the "it misidentifies things" symptom.
+            if (run?._failedPathAttempts) {
+              for (const key of [mutationPath, actualPath, it.call?.path]) {
+                if (key) run._failedPathAttempts.delete(String(key).trim());
+              }
+            }
             // Item 1: write 成功后清除同路径的 read_file 失败 toast（新文件先 read 再 write 场景）
             if (run?._readFailSteps?.has(mutationPath)) {
               try { run._readFailSteps.get(mutationPath)?.remove?.(); } catch {}
