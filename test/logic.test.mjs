@@ -11656,9 +11656,14 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.match(SRC, /workerMutated = false/);
   assert.match(SRC, /onMutation: \(path\) => \{\s*workerMutated = true;/);
   assert.match(SRC, /it\._workerMutationPaths\.push\(path\)/);
-  // 复杂工程任务里，写入型 worker 启动前需要先有任务计划（有界：最多拦 2 次）。
-  assert.match(SRC, /const planIssue = isWorker && _runNeedsPlanGateNow\(run, \{ type: "write" \}\) && planGateNudges < 2/);
-  assert.match(SRC, /先列计划 · 未执行/);
+  // 计划门已从硬拦改为提示：拦截式打回白烧一轮，还把"先探路再计划"的合理顺序当错误
+  // 惩罚。工具照常执行，提示随结果附带（同 ask_user 软建议通道），预算不变（≤2 次）。
+  assert.match(SRC, /if \(isWorker && _runNeedsPlanGateNow\(run, \{ type: "write" \}\) && planGateNudges < 2\)/);
+  assert.match(SRC, /it\._planAdvice = /);
+  assert.match(SRC, /if \(it\._planAdvice\) \{ _resultMsg \+= it\._planAdvice; it\._planAdvice = ""; \}/,
+    "提示必须真的送达模型——附在真实工具结果之后");
+  const _srcCode = SRC.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+  assert.doesNotMatch(_srcCode, /先列计划 · 未执行/, "计划门不得再以拒绝执行的形式存在");
   // 问方向（ask_user）和列计划本身是控制面动作，绝不能被计划门拦下——
   // 方向没定就被逼着先出计划，正是用户骂过的"不让我选"。
   assert.match(extractFn("_callCanBypassPlanGate"), /call\.type === "askuser" \|\| call\.type === "plan"/);
