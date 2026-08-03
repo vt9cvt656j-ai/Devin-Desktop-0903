@@ -17911,3 +17911,52 @@ test("shell mutations are captured into the run checkpoint, bounded, never gated
   assert.match(SRC, /_CMD_SNAPSHOT_MAX_FILES = 200/);
   assert.match(SRC, /_CMD_SNAPSHOT_MAX_BYTES = 2 \* 1024 \* 1024/);
 });
+
+// ---------------------------------------------------------------------------
+// Role tool matrix: specialists get role-appropriate tools, not just prompt text.
+//
+// Before, every sub-agent role got the identical toolset — only _AGENT_ROLE_BLOCKS (the
+// system prompt) differed. So a `design` worker couldn't open a browser to check its UI
+// and a `database` worker couldn't query a db. This wires the declared role to the tools
+// that role actually needs. Side-effect tools go ONLY to write workers (a read-only child
+// keeps read+web), and every name/type is a real registered tool.
+// ---------------------------------------------------------------------------
+test("_roleCapabilities: write workers get role-matched tools, read-only get none", () => {
+  const caps = load("_roleCapabilities", {
+    _ROLE_CAPABILITIES: {
+      frontend: { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
+      design:   { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
+      backend:  { tools: ["db_query", "http_request"],  types: ["db", "http"] },
+      database: { tools: ["db_query"],                  types: ["db"] },
+      devops:   { tools: ["docker_compose_up"],         types: ["docker_compose_up"] },
+      security: { tools: ["http_request"],              types: ["http"] },
+      test:     { tools: ["browser"],                   types: ["browser"] },
+    },
+  });
+  assert.deepEqual(caps("database", true), { tools: ["db_query"], types: ["db"] });
+  assert.deepEqual(caps("design", true).tools, ["browser", "generate_image"]);
+  assert.deepEqual(caps("backend", true).types, ["db", "http"]);
+  // Read-only child: no side-effect tools, whatever the role.
+  assert.deepEqual(caps("design", false), { tools: [], types: [] });
+  assert.deepEqual(caps("database", false), { tools: [], types: [] });
+  // Unknown role → nothing extra (base set covers it).
+  assert.deepEqual(caps("nonesuch", true), { tools: [], types: [] });
+  // Every role's tool count equals its type count — a name with no admitted type would be
+  // dead (dispatcher rejects it), so they must stay in lockstep.
+  for (const role of ["frontend", "design", "backend", "database", "devops", "security", "test"]) {
+    const c = caps(role, true);
+    assert.equal(c.tools.length, c.types.length, `${role}: tools and types must be paired`);
+  }
+});
+
+test("the role matrix is wired into BOTH _allow and _execTypes from one source", () => {
+  const sub = extractFn("_runSubAgent");
+  assert.match(sub, /const _roleCaps = _roleCapabilities\(role, write\);/);
+  // name side and type side both consume the SAME _roleCaps — or a tool is visible but
+  // not executable (or vice-versa).
+  assert.match(sub, /for \(const t of _roleCaps\.tools\) if \(!_allow\.includes\(t\)\) _allow\.push\(t\)/);
+  assert.match(sub, /for \(const t of _roleCaps\.types\) if \(!_execTypes\.includes\(t\)\) _execTypes\.push\(t\)/);
+  // The matrix names must be tools the builder actually produces (verified) — guard the
+  // stale "no role tool matrix" comment can't creep back as the live behavior.
+  assert.doesNotMatch(sub, /不搞角色工具矩阵/);
+});
