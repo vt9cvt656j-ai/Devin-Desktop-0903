@@ -1891,7 +1891,7 @@ fn design_knowledge_block(
         "--- michael-design 设计蓝本（421 条成品级 UI 知识按需检索）---\n\
          {scope_instruction}\n\
          产品名是生造词时先从功能描述推断品类，用品类词检索，绝不拿生造名当 query。配色只采用同品类来源并折算为 Tailwind 族+档与 semantic role；跨品类命中只能借结构、组件和动效。具体组件、媒体、数据、动效、工程与验证要求由本轮已加载的独立模块负责，本块不重复。\n\
-         【蓝本是 Tailwind v3 时代写的，照抄会建出错的项目】下面的蓝本里大量出现 `tailwind.config.js/ts`、`theme.extend`、`@tailwind base/components/utilities`、`postcss.config.js`、`autoprefixer`、`tailwindcss-animate`、`content: [...]` —— 这些都是 v3 写法，本栈是 Tailwind v4 CSS-first，**一个都不要建、不要装**。照下面这样翻译再用：`@tailwind base/components/utilities` 三行 → 一行 `@import \"tailwindcss\";`；`theme.extend.colors/fontFamily/borderRadius` → CSS 入口的 `@theme inline` 里的 `--color-*` / `--font-*` / `--radius-*`（嵌套色名拍平成 `--color-a-b`）；`darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`；`content` globs 和 postcss 链 → 不需要，v4 自动处理。蓝本里的**视觉判断**（布局、密度、配色关系、动效编排、文案气质）照用，**构建配置**一律按上面翻译。\n\n{}\n\n{}",
+         注意——蓝本是 Tailwind v3 时代写的，照抄会建出错的项目：下面的蓝本里大量出现 `tailwind.config.js/ts`、`theme.extend`、`@tailwind base/components/utilities`、`postcss.config.js`、`autoprefixer`、`tailwindcss-animate`、`content: [...]` —— 这些都是 v3 写法，本栈是 Tailwind v4 CSS-first，**一个都不要建、不要装**。照下面这样翻译再用：`@tailwind base/components/utilities` 三行 → 一行 `@import \"tailwindcss\";`；`theme.extend.colors/fontFamily/borderRadius` → CSS 入口的 `@theme inline` 里的 `--color-*` / `--font-*` / `--radius-*`（嵌套色名拍平成 `--color-a-b`）；`darkMode: [\"class\"]` → `@custom-variant dark (&:is(.dark *));`；`content` globs 和 postcss 链 → 不需要，v4 自动处理。蓝本里的**视觉判断**（布局、密度、配色关系、动效编排、文案气质）照用，**构建配置**一律按上面翻译。\n\n{}\n\n{}",
         design_color_direction_block(color_direction),
         sections.join("\n\n———\n\n")
     ))
