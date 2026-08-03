@@ -34262,6 +34262,34 @@ function _agentRoleBlock(role) {
   return (_AGENT_ROLE_BLOCKS[key] ? "\n\n" + _AGENT_ROLE_BLOCKS[key] : "");
 }
 
+// Role → the specialist capabilities that role genuinely needs beyond the shared read
+// set — the actual "flexible use of multiple roles" tool matrix, not just prompt text.
+// Before this, every role got the identical toolset and only the SYSTEM PROMPT differed:
+// a `design` worker and a `database` worker were handed the same tools, so "design" could
+// not open a browser to check its UI and "database" could not query a db. The model
+// DECLARES the role in run_worker/run_subagent; the harness gives it the matching tools.
+//
+// Every name below is produced by _buildAgentToolSchemas(true) and every type is a real
+// mapper type — both verified — because a tool NAME must survive the _allow filter AND its
+// TYPE must be in the child's _execTypes or the dispatcher rejects it. Side-effect tools
+// (browser can eval/upload, db/http reach outside the workspace) go ONLY to write workers;
+// a read-only child stays on the read+web set, preserving the deliberate read-only browser
+// exclusion. Unknown roles get nothing extra (the base set already covers general work).
+const _ROLE_CAPABILITIES = {
+  frontend: { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
+  design:   { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
+  backend:  { tools: ["db_query", "http_request"],  types: ["db", "http"] },
+  database: { tools: ["db_query"],                  types: ["db"] },
+  devops:   { tools: ["docker_compose_up"],         types: ["docker_compose_up"] },
+  security: { tools: ["http_request"],              types: ["http"] },
+  test:     { tools: ["browser"],                   types: ["browser"] },
+};
+function _roleCapabilities(role, write) {
+  if (!write) return { tools: [], types: [] }; // read-only child: read+web only, no side-effect tools
+  const spec = _ROLE_CAPABILITIES[String(role || "").trim().toLowerCase()];
+  return spec ? { tools: [...spec.tools], types: [...spec.types] } : { tools: [], types: [] };
+}
+
 const _WORKER_SYSTEM = _P("worker_system", `你是能改文件的 worker 子智能体。只能修改指定 scope 内的文件、其余只读，不删移、不再派 worker。先读 scope 内真实文件和必要调用方，再实现交代的那块；写完整能跑的代码、补齐 import、风格随项目。**如果 list_dir 已经确认工作区根目录为空 / 新项目，就停止本地 read/search/find_files/semantic_search，不要猜 package.json、vite.config、src 等旧项目路径；按用户目标和 scope 直接创建需要的文件，或如实回报“空项目事实”。**可以运行会结束的短验证命令（test/build/lint/typecheck/diagnostics），不要启动 dev server/watch/监听/REPL 这类持续任务，也不要用 shell 重定向/sed/tee/cp/mv/rm/脚本 API 绕过文件工具改文件。交付必须包含：改了哪些文件、关键证据/原因、运行过的验证命令和退出码、未验证/风险。用中文。`);
 
 // The baked task for research_project — a thorough, structured codebase-mapping brief the
@@ -34551,11 +34579,16 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _allow = write
     ? [..._READ_TOOLS, "write_file", "edit_file", "multi_edit", "run_cmd", "format_file", "create_dir"]
     : [..._READ_TOOLS, "run_cmd"]; // P0.2: 子智能体可运行纯探索命令
-  // P1.5(#51): research/security 角色确保网络工具在场（当前默认已含，此处是幂等兜底，
-  // 防止未来白名单收紧时把这两个角色的核心工具挤掉）。只做"确保在场"，不搞角色工具矩阵。
+  // research/security always keep the network tools (idempotent — the read set already
+  // has them; this survives a future allowlist tightening).
   if (["research", "security"].includes(String(role || "").toLowerCase())) {
     for (const t of ["web_search", "web_fetch"]) if (!_allow.includes(t)) _allow.push(t);
   }
+  // Role tool matrix: give a specialist WRITE worker the tools its role actually needs
+  // (see _roleCapabilities). The paired _execTypes admission is applied where _execTypes is
+  // built below, keyed on the same matrix, so the name and its type are always in sync.
+  const _roleCaps = _roleCapabilities(role, write);
+  for (const t of _roleCaps.tools) if (!_allow.includes(t)) _allow.push(t);
   // 嵌套派发硬边界①②（#53）：深度 <2 的子体可再派一层——run_subagent/run_worker/await_subagent
   // 进白名单；嵌套启动仍走 _runSubAgent 里同一个 _sess._subAgentsActive 计数与
   // MAX_SUBAGENTS_PARALLEL(2) 排队逻辑，并发预算全会话共享、不因层级翻倍。
@@ -34576,6 +34609,10 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   const _execTypes = write
     ? [..._READ_TYPES, "write", "edit", "multiedit", "cmd", "format", "mkdir"]
     : [..._READ_TYPES, "cmd"]; // P0.2: 允许只读模式执行 cmd
+  // Role tool matrix, execution side: admit the same role tools' TYPES that _allow admitted
+  // by name (from the identical _roleCaps), so a specialist's tool is both visible AND
+  // executable. Per-op safety gates (db mutation, http external-effect) still apply downstream.
+  for (const t of _roleCaps.types) if (!_execTypes.includes(t)) _execTypes.push(t);
   // #53：与 _allow 同步——深度 <2 放行派发三类型；深度 ≥2 不进列表，执行层门禁二次兜底
   if (_canNest) for (const t of ["subagent", "worker", "awaitsubagent"]) if (!_execTypes.includes(t)) _execTypes.push(t);
   // Worker run context: inherit session + checkpoint (so edits are in the parent's
