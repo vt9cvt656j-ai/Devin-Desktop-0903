@@ -4095,10 +4095,30 @@ fn oai_to_anthropic_with_cache(
     out.insert("max_tokens".into(), json!(max_tokens));
     if let Some(t) = &thinking {
         out.insert("thinking".into(), t.clone());
-        // 不发 output_config.effort：实测聚合上游（zyz）一旦收到 effort 就把思考流
-        // 换成一句 "Compatibility reasoning summary." 摘要，完整原始思考全部丢失；
-        // 只发 thinking.budget_tokens 时上游按原文回思考流。思考深度已由
-        // budget_tokens + max_tokens 下限（见上）控制，effort 不再需要。
+        // 深度旋钮：两个家族用两套，不能混。
+        //
+        // 旧家族（3.7 / 4.6，thinking.type=enabled）：**不发** output_config.effort。实测聚合
+        // 上游（zyz）一旦收到 effort 就把思考流换成一句 "Compatibility reasoning summary."，
+        // 完整思考全丢；只发 budget_tokens 时上游按原文回思考流。深度由 budget_tokens 控制。
+        //
+        // 新家族（4.7/4.8/5/Sonnet 5/Fable/Mythos，thinking.type=adaptive）：**必须发**
+        // output_config.effort。这一家族直接拒绝 budget_tokens（400 的原文就是
+        // "use thinking.type.adaptive and output_config.effort"），所以上面那条「不发 effort」
+        // 一旦套到它身上，深度旋钮就一个都不剩了——adaptive 没有任何深度信号，模型每轮
+        // 都只想一点点。用户看到的「思考没有实质内容」就是这么来的：不是没要思考，
+        // 是要了思考却没告诉它想多深。
+        if t.get("type").and_then(|v| v.as_str()) == Some("adaptive") {
+            if let Some(e) = effort.filter(|e| !e.is_empty() && *e != "off") {
+                let eff = match e {
+                    "xhigh" => "xhigh",
+                    "max" => "max",
+                    "low" => "low",
+                    "high" => "high",
+                    _ => "medium",
+                };
+                out.insert("output_config".into(), json!({ "effort": eff }));
+            }
+        }
     }
     // Native Anthropic requests do not forward OpenAI sampling knobs. New Claude
     // models reject temperature/top_p even when thinking is off, while omitting
@@ -7393,9 +7413,13 @@ mod billing_tests {
         });
         let a = oai_to_anthropic(&body).unwrap();
         assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
-        assert!(
-            a.get("output_config").is_none(),
-            "output_config.effort must be omitted or upstream returns summarized thinking"
+        // The adaptive family REJECTS budget_tokens, so effort is its only depth control —
+        // omitting it left the model with no depth signal at all, which is exactly what
+        // "the thinking has no substance" looked like. The old "never send effort" rule still
+        // holds for the enabled/budget family and is asserted separately below.
+        assert_eq!(
+            a["output_config"], json!({"effort":"high"}),
+            "adaptive thinking must carry output_config.effort or it has no depth knob"
         );
         assert_eq!(a["max_tokens"], json!(40000)); // high effort gets extra thinking headroom
         assert!(
@@ -7442,7 +7466,10 @@ mod billing_tests {
         .unwrap();
         assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
-        assert!(a.get("output_config").is_none()); // effort knob dropped to keep raw thinking
+        // 4.8 is the adaptive family: the client's legacy enabled+budget shape is normalized to
+        // adaptive above, so effort must ride along as the depth knob. (The "never send effort"
+        // rule applies only to models that genuinely stay on enabled+budget, i.e. 3.7 / 4.6.)
+        assert_eq!(a["output_config"], json!({"effort":"max"}), "normalized adaptive keeps its depth knob");
 
         // Sonnet 5: adaptive as well — enabled+budget_tokens is rejected outright.
         let s5 = oai_to_anthropic(&json!({
