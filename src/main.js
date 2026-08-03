@@ -1635,9 +1635,12 @@ setInterval(() => {
       vp.innerHTML = `<div style="padding:6px 10px;color:var(--atc-dim,#636c76);font-size:11px;cursor:pointer" onclick="this.parentElement.innerHTML=this.parentElement._gcOriginal;this.parentElement._gcStub=false">… 内容已折叠以释放内存（${Math.round(len/1024)}KB）——点击展开</div>`;
       freed++;
     }
-    document.querySelectorAll(".terminal-panel__instance[hidden] canvas").forEach((c) => {
-      try { const ctx = c.getContext("2d"); if (ctx) ctx.clearRect(0, 0, c.width, c.height); c.width = 1; c.height = 1; freed++; } catch {}
-    });
+    // REMOVED: shrinking hidden terminal canvases to 1x1. Verified in a real WKWebView — it
+    // frees ~5MiB per hidden terminal and permanently blanks it, because xterm's renderer keeps
+    // its own dimensions and never repaints at the new size when the tab is shown again. A
+    // background terminal you switch back to was simply empty. If the GPU memory is genuinely
+    // worth reclaiming, this codebase already has the supported route: each tab stores its
+    // `webgl` addon and closeTermTab() disposes it — dispose on hide, loadAddon on show.
     if (freed) console.log(`[MemGC] freed ${freed} heavy elements (nodes was ${nodes})`);
   } catch {}
 }, 30000);
@@ -13806,7 +13809,14 @@ const _RENDER_LIMIT = 56;
 const _RENDER_PAGE = 32;
 const _RENDER_SYNC_LIMIT = 30; // 恢复时只同步渲染最近这么多条，其余窗口 idle 补渲
 const _RENDER_SLICE_BUDGET_MS = 50; // 历史渲染每片最多占用主线程 50ms
+// Last bytes written to the localStorage mirror, so an unchanged conversation never pays
+// for the write again. Held as one string — the same one localStorage already holds.
+let _lastLocalMirror = null;
+let _lastLocalMirrorLen = -1;
 const _HISTORY_CACHE_LIMIT = 384;
+// Hard byte ceiling for the per-session history cache. 24MB is generous for text paging
+// and small enough that a few pasted screenshots cannot silently pin hundreds of MB.
+const _HISTORY_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const _LARGE_TRANSCRIPT_PAGE_BYTES = 64 * 1024;
 const _SNAPSHOT_MAX_CHARS = 360_000;
 const _SNAPSHOT_MAX_MESSAGES = 64;
@@ -13824,11 +13834,32 @@ function _cacheTranscriptMessage(session, sequence, message) {
   // user pages around nearby history.
   session._historyCache.delete(sequence);
   session._historyCache.set(sequence, message);
-  while (session._historyCache.size > _HISTORY_CACHE_LIMIT) {
+  session._historyBytes = (Number(session._historyBytes) || 0) + _historyEntryBytes(message);
+  // Evict on EITHER bound. The count cap alone let 384 entries hold hundreds of MB when the
+  // messages carried base64 attachments; the byte cap is the one that actually protects the heap.
+  while (session._historyCache.size > _HISTORY_CACHE_LIMIT
+         || (session._historyBytes > _HISTORY_CACHE_MAX_BYTES && session._historyCache.size > 1)) {
     const oldest = session._historyCache.keys().next().value;
     if (oldest === undefined) break;
+    const evicted = session._historyCache.get(oldest);
     session._historyCache.delete(oldest);
+    session._historyBytes = Math.max(0, (Number(session._historyBytes) || 0) - _historyEntryBytes(evicted));
   }
+}
+// Approximate retained size of one cached transcript entry. Attachments dominate by orders of
+// magnitude (a single pasted screenshot as a base64 dataUrl is megabytes), so they are measured
+// directly and the rest is charged a flat estimate rather than walked.
+function _historyEntryBytes(message) {
+  if (!message || typeof message !== "object") return 0;
+  let bytes = 512;
+  const content = message.content;
+  if (typeof content === "string") bytes += content.length;
+  const atts = Array.isArray(message.attachments) ? message.attachments : [];
+  for (const a of atts) {
+    if (typeof a?.dataUrl === "string") bytes += a.dataUrl.length;
+    if (typeof a?.text === "string") bytes += a.text.length;
+  }
+  return bytes;
 }
 function _cachedTranscriptMessage(session, sequence) {
   const cache = session?._historyCache;
@@ -14789,8 +14820,15 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
   // Tauri 不可用时的兑底，流结束后下次非流式保存会补上。
   if (!lightweightOnly) {
     const localJson = `{"sessions":[${mirrorParts.join(",")}],"closedSessions":[${closedParts.join(",")}],"activeIdx":${Number.isFinite(activeIdxSnapshot) ? activeIdxSnapshot : 0}}`;
-    try { _perfPhase(`localStorage:setItem len=${localJson.length}`); } catch {}
-    try { localStorage.setItem(CHAT_STORE_KEY, localJson); } catch {}
+    // Content-addressed: a settled conversation re-serialises to the exact same bytes, so the
+    // write is skipped entirely. Cheap identity check (length + value) against the last write.
+    if (localJson.length !== _lastLocalMirrorLen || localJson !== _lastLocalMirror) {
+      try { _perfPhase(`localStorage:setItem len=${localJson.length}`); } catch {}
+      try {
+        localStorage.setItem(CHAT_STORE_KEY, localJson);
+        _lastLocalMirror = localJson; _lastLocalMirrorLen = localJson.length;
+      } catch {}
+    }
   }
 
   // The hot path is an append-only, per-session transcript journal. Awaiting it
@@ -57289,7 +57327,12 @@ async function saveSession() {
   } catch (e) {
     console.warn("[session] save failed:", e);
   }
-  await saveChatHistory();
+  // Deliberately NOT awaiting saveChatHistory() here. This function persists tabs and view
+  // state; the transcript is a different concern with a different trigger (chat mutations).
+  // Coupling them meant every explorer file click and every tab switch scheduled a full
+  // serialise-and-write of the whole conversation ~1.1s later — landing exactly as the user
+  // started scrolling. /tmp/michael-ide-perf.log: localStorage:setItem precedes more of the
+  // >=300ms frame gaps than any other phase, marker age ~0.
 }
 
 // Persist the session eagerly (debounced) whenever the workspace or active file

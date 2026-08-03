@@ -11174,6 +11174,32 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
+test("空闲期卡死：点文件不再拖着整段对话过 JSON，重复镜像不再重写", () => {
+  // 实证来自 /tmp/michael-ide-perf.log：120 次 2-60s 的真实卡顿里，紧邻的相位标记
+  // 最常见的就是 localStorage:setItem，且标记年龄≈0（其他标记都带 @-Nms 说明已过期无关）。
+  const save = extractFn("saveSession");
+  assert.doesNotMatch(stripJsComments(save), /await saveChatHistory\(\)/,
+    "保存标签页/视图状态不得顺带序列化整段对话——那正是点文件后约 1.1s 的那次卡顿");
+  // 镜像必须内容寻址：对话没变时同一份字节不该反复写
+  assert.match(SRC, /localJson\.length !== _lastLocalMirrorLen \|\| localJson !== _lastLocalMirror/,
+    "内容未变时必须跳过 setItem");
+
+  // 历史缓存必须按字节封顶——按条数封顶时 384 条可以装几百 MB 的 base64 图片，
+  // 这正是 STALL 记录里「dom 只有 4348，热点却在未标记代码或 GC」的形态。
+  const bytes = load("_historyEntryBytes");
+  assert.ok(bytes({ content: "hi" }) > 0);
+  const big = bytes({ content: "", attachments: [{ dataUrl: "d".repeat(5_000_000) }] });
+  assert.ok(big > 4_000_000, "附件的 base64 必须被计入字节数，否则字节上限形同虚设");
+  assert.match(SRC, /_HISTORY_CACHE_MAX_BYTES/, "必须存在字节上限");
+  const cacheFn = extractFn("_cacheTranscriptMessage");
+  assert.match(cacheFn, /session\._historyBytes > _HISTORY_CACHE_MAX_BYTES/,
+    "淘汰条件必须同时看字节，不只看条数");
+
+  // MemGC 不得再把后台终端画布压成 1x1——实测会让切回去的终端永久空白
+  assert.doesNotMatch(SRC, /terminal-panel__instance\[hidden\] canvas/,
+    "压缩隐藏终端画布会永久弄坏终端，必须删除");
+});
+
 test("IDE 必须自己先跑验证，而不是催模型/催用户", () => {
   // 用户的原话：「你写了代码却不自己跑测试？要用户手动测？」根因是顺序：
   // IDE 自带的验证块（注释里明写「不是回头催用户/催模型」）被放在 codeVerify 提醒
