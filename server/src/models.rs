@@ -2438,10 +2438,22 @@ fn official_context(model_id: &str) -> Option<i64> {
         return Some(400_000);
     }
     if m.contains("gemini") {
+        // 1.5 Pro 是 2M，其余 Gemini 1M。这条必须排在通用 gemini 之前。
+        // （客户端的兜底表一直是 2M，服务端是 1M —— 两张表各说各话，而服务端这个数
+        //  用来规划 michael-compression、客户端那个用来做请求预算，分歧=静默 413 或白扔窗口。）
+        if m.contains("1.5") && m.contains("pro") {
+            return Some(2_000_000);
+        }
         return Some(1_000_000);
     }
-    if m.contains("grok") {
+    if m.contains("grok") || m.contains("xai") {
+        // xai/ 前缀但不含 grok 的型号此前落到 None→128k，客户端却按 256k 预算。
         return Some(256_000);
+    }
+    if m.contains("minimax") {
+        // official_price 有这些型号（在卖），official_context 却没有 —— 于是下发 null，
+        // 客户端只能猜。有价必须有窗口。
+        return Some(1_000_000);
     }
     if m.contains("kimi") || m.contains("moonshot") || m.contains("k2") {
         return Some(256_000);
