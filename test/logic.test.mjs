@@ -11180,10 +11180,15 @@ test("上下文窗口：真实值来自网关，两张兜底表不得各说各�
   // 但它必须和服务端逐值一致——服务端的数用来规划 michael-compression，客户端的用来做
   // 请求预算，分歧就是静默 413 或白扔窗口。历史上真的分歧过（gemini-1.5-pro 2M vs 1M）。
   const RS = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
-  const table = RS.slice(RS.indexOf("fn official_context"), RS.indexOf("fn official_context") + 1800);
+  const table = RS.slice(RS.indexOf("fn official_context"), RS.indexOf("fn official_context") + 3200);
   const client = load("_fallbackModelContextLimit");
   const pairs = [
-    ["claude-opus-4-7", 200_000], ["gpt-5.5", 400_000], ["gemini-2.0-flash", 1_000_000],
+    // Anthropic Models API (max_input_tokens) is the authority. Opus 4.6/4.7/4.8/5,
+    // Sonnet 4.6/5 and Fable 5 are 1M by default; Sonnet 4.5 and Haiku 4.5 are 200K.
+    ["claude-opus-4-7", 1_000_000], ["claude-opus-4-8", 1_000_000], ["claude-opus-5", 1_000_000],
+    ["claude-sonnet-5", 1_000_000], ["claude-sonnet-4-6", 1_000_000], ["claude-fable-5", 1_000_000],
+    ["claude-sonnet-4-5-20250929", 200_000], ["claude-haiku-4-5", 200_000],
+    ["gpt-5.5", 400_000], ["gemini-2.0-flash", 1_000_000],
     ["gemini-1.5-pro", 2_000_000], ["grok-3", 256_000], ["kimi-k2", 256_000],
     ["deepseek-v3", 128_000], ["glm-4", 128_000], ["minimax-m2", 1_000_000],
   ];
@@ -11195,6 +11200,11 @@ test("上下文窗口：真实值来自网关，两张兜底表不得各说各�
     assert.ok(table.includes(`"${fam}"`), `服务端 official_context 必须覆盖 ${fam}`);
   }
   assert.match(table, /1\.5.*pro[\s\S]{0,120}2_000_000/, "gemini-1.5-pro 服务端必须是 2M，与客户端一致");
+  // 服务端也必须逐型号，不能再一刀切 200K —— 那会把 Opus/Sonnet 新家族 4/5 的窗口白扔
+  assert.match(table, /opus-4-6[\s\S]{0,400}1_000_000/,
+    "服务端必须给 Opus 4.6/4.7/4.8/5、Sonnet 4.6/5、Fable 5 记 1M，不能一刀切 200K");
+  assert.doesNotMatch(table, /contains\("claude"\) \{\s*\n\s*\/\/[^\n]*\n\s*return Some\(200_000\)/,
+    "不得恢复成 claude 一律 200K");
 });
 
 test("上下文选择存的是意图而不是数字，原生窗口修正后不会把用户钉死", () => {
