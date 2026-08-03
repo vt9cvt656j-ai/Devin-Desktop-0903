@@ -36733,6 +36733,35 @@ function _requiredPlanIssue(run, steps, call = null) {
   return _planQualityIssue(steps, _runRequiresPlan(run), _planEffectForRun(run), run?.engineering || null);
 }
 
+// Apply a late AI intent verdict to a run, if one has landed since the run started.
+//
+// The intent classifier (_aiIntentProfile — a genuine LLM assessment, not keywords) races
+// an 8s timeout on the first turn; when it loses (a slow upstream), the run starts with a
+// stale profile and its late verdict lands in session._intentState a few seconds later.
+// This re-reads that, and if a real "ai" verdict is now available, adopts it: refreshes the
+// gateway semantic profile (so Michael Design and the other graph modules inject), re-arms
+// the effect obligations, and prefetches the design brief. Shared by the in-loop backfill
+// and the greenfield pre-first-turn wait so both stay in lockstep. Returns whether applied.
+async function _applyLateIntentIfLanded(run, config, task, session, body, isLive, messages) {
+  if (!run || run.engineering?.intentSource === "ai") return false;
+  const late = _engineeringProfileWithAiIntent(task, session);
+  if (!late || late.intentSource !== "ai") return false;
+  run.engineering = late;
+  config.ideSemanticProfile = _ideSemanticProfile(run.engineering);
+  run._cancelledEffectKinds = run._cancelledEffectKinds instanceof Set ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
+  run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
+  run._addedExternalObligations = run._addedExternalObligations instanceof Set ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
+  for (const kind of run.engineering.runtimeObligations || []) { run._addedRuntimeObligations.add(kind); run._cancelledEffectKinds.delete(`runtime:${kind}`); }
+  for (const kind of run.engineering.externalObligations || []) { run._addedExternalObligations.add(kind); run._cancelledEffectKinds.delete(`external:${kind}`); }
+  if (late.designKnowledgeRequired && !run._michaelDesignEvidence && !run._michaelDesignPreflight) {
+    try {
+      const pre = await _runMichaelDesignPreflight({ run, body, isLive });
+      if (pre.required && pre.brief && Array.isArray(messages)) messages.push({ role: "user", content: pre.brief });
+    } catch {}
+  }
+  return true;
+}
+
 async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mode, task, skillsBlock = "", billingTasks = [] }) {
   _clearPlanChip(); // drop any stale plan chip from a previous task before this run starts
   // session/root 先解析：意图画像要读本会话刚确认的语义帧，必须拿到真 session。
@@ -37287,6 +37316,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // 落地时模型往往已经写下第一个文件，补射被 didMutate 永久关死 —— 表现就是「Michael
       // design 又丢了」。设计知识对整个 UI 构建自始至终有效，晚补远好过不补，所以放宽到
       // 「尚未产生实质实现量」（_implOps 小）为止，而不是第一次落盘就锁死。
+      // Greenfield build: the design decision must be in context BEFORE the first UI file
+      // is written, or the initial build goes out with no Michael Design and the later
+      // backfill only fixes subsequent edits. On an EMPTY workspace (a fact) there is nothing
+      // to read or do until intent is known, so on the very first turn wait briefly for the
+      // AI verdict to land rather than building the UI blind on a lost race. Bounded to ~6s;
+      // if the verdict never lands (upstream dead) it proceeds — never hangs the run.
+      if (iter === 0 && isAgent && run._emptyRootAtStart && run.engineering?.intentSource !== "ai" && _live()) {
+        const _intentWaitUntil = Date.now() + 6000;
+        while (Date.now() < _intentWaitUntil && _live() && run.engineering?.intentSource !== "ai") {
+          if (await _applyLateIntentIfLanded(run, config, task, session, body, _live, messages)) break;
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
       const _lateBackfillOpen = !didMutate || _implOps <= 3;
       // Re-fire whenever the run is NOT standing on a real classifier verdict — that is
       // "none" (race lost, no prior state) AND "session-inherited" (race lost, but a prior
@@ -37296,30 +37338,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // "session-inherited" not "none", and design injection never fires. Only a genuine
       // "ai" verdict is trusted enough to skip the backfill.
       if (iter > 0 && _lateBackfillOpen && run.engineering?.intentSource !== "ai") {
-        const _lateProfile = _engineeringProfileWithAiIntent(task, session);
-        if (_lateProfile && _lateProfile.intentSource === "ai") {
-          run.engineering = _lateProfile;
-          config.ideSemanticProfile = _ideSemanticProfile(run.engineering);
-          // 与 steer 路径同款懒初始化：这些 Set 可能尚未建立。
-          run._cancelledEffectKinds = run._cancelledEffectKinds instanceof Set
-            ? run._cancelledEffectKinds : new Set(run._cancelledEffectKinds || []);
-          run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set
-            ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
-          run._addedExternalObligations = run._addedExternalObligations instanceof Set
-            ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
-          for (const kind of run.engineering.runtimeObligations || []) {
-            run._addedRuntimeObligations.add(kind);
-            run._cancelledEffectKinds.delete(`runtime:${kind}`);
-          }
-          for (const kind of run.engineering.externalObligations || []) {
-            run._addedExternalObligations.add(kind);
-            run._cancelledEffectKinds.delete(`external:${kind}`);
-          }
-          if (_lateProfile.designKnowledgeRequired && !run._michaelDesignEvidence && !run._michaelDesignPreflight) {
-            const _latePre = await _runMichaelDesignPreflight({ run, body, isLive: _live });
-            if (_latePre.required && _latePre.brief) messages.push({ role: "user", content: _latePre.brief });
-          }
-        }
+        await _applyLateIntentIfLanded(run, config, task, session, body, _live, messages);
       }
       // === Reasoning depth is a per-iteration function of live state, not a one-shot verdict ===
       // isComplexTask was decided once from an AI verdict racing an 8s timeout; a late verdict
