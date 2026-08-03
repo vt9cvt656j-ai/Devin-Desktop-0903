@@ -19764,6 +19764,28 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null) 
       ? `\n根目录顶层实况（以此为准）：${_top.join("、")}`
       : "\n🚫 现场已替你实探：当前工作区是**空目录**，没有任何文件。不要发任何 read_file / list_dir / search / find_files（结果必然为空，IDE 会直接拦截）；第一步就按用户需求规划并 write_file/脚手架开建。";
   } catch {}
+  // Cold cache used to return ONLY this "warming up" line + the top-level file list — no
+  // README, no tree, no source. So the first question after opening a project ("这个项目
+  // 是干嘛的") reached the model with nothing but the incidentally-open file, and it
+  // answered "基于已读取的 Cargo.toml" because that was literally all it had. A human would
+  // open the README first. Build the real digest now, bounded: a small project's README +
+  // tree + key manifests read in well under this budget; only a genuinely slow build falls
+  // back to the thin snapshot. Not empty-workspace (nothing to build) — that path returned
+  // above.
+  if (!_topEmpty) {
+    try {
+      const _full = await Promise.race([
+        _gatherAgentContext(query || "", root),
+        new Promise((r) => setTimeout(() => r(""), 4500)),
+      ]);
+      if (_full && String(_full).trim().length > 200) {
+        return _full
+          + (stackHint ? `\n${stackHint}` : "")
+          + _memoryBlocks(root, query || "", { isEmpty: false })
+          + _projectJournalBlock(root);
+      }
+    } catch {}
+  }
   return `⚠️ 当前工作区根目录（后台上下文仍在预热）: ${root}`
     + _topLine
     + (stackHint ? `\n${stackHint}` : "")

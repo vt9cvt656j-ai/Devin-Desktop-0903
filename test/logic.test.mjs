@@ -17819,3 +17819,28 @@ test("the light-turn call site passes the observable workspace fact", () => {
   assert.match(SRC, /workspaceOpen: !!String\(_earlyRoot \|\| rootPath \|\| \(workspaceRoots && workspaceRoots\[0\]\) \|\| ""\)\.trim\(\)/,
     "eligibility must be computed from the real open folder, not the profile");
 });
+
+// ---------------------------------------------------------------------------
+// The first question after opening a project must get the project, not one file.
+//
+// Reported: "我项目是干嘛用的？" answered "基于已读取的 Cargo.toml" — it described the
+// whole project from the one open manifest, never opening README/src. Cause: on a cold
+// cache, _agentContextSnapshotForTurn returned only a "预热中" line + the top-level file
+// list. The README, tree and key files were all still "warming up", so the model received
+// nothing but the incidentally-open file. It now builds the real digest (bounded) before
+// falling back to the thin snapshot.
+// ---------------------------------------------------------------------------
+test("cold context snapshot builds the real digest before the warming-up fallback", () => {
+  const fn = extractFn("_agentContextSnapshotForTurn");
+  // It must attempt the full gather, bounded by a race, on a non-empty cold workspace.
+  assert.match(fn, /await Promise\.race\(\[\s*_gatherAgentContext\(query \|\| "", root\),/,
+    "a cold miss must build README+tree+key-files, not just announce warming-up");
+  assert.match(fn, /setTimeout\(\(\) => r\(""\), 4500\)/, "the build must be bounded so it cannot hang");
+  // The real digest must be RETURNED before the thin fallback, not after it.
+  const buildIdx = fn.indexOf("_gatherAgentContext(query");
+  const fallbackIdx = fn.indexOf("后台上下文仍在预热");
+  assert.ok(buildIdx >= 0 && buildIdx < fallbackIdx,
+    "the build attempt must precede the warming-up fallback");
+  // Empty workspace still short-circuits — there is nothing to build.
+  assert.match(fn, /if \(!_topEmpty\) \{/, "an empty workspace must not attempt a digest build");
+});
