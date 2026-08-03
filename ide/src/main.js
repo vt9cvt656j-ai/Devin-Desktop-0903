@@ -8375,11 +8375,11 @@ function _maybeOnboardProject(path) {
     if (!sess || !sess.container) return;
     if (sess.memory && sess.memory.recent.length > 1) return; // don't interrupt an ongoing chat
     _renderSuggestionChips(sess, [
-      { label: "🔎 深挖这个项目", send: "用 research_project 深挖整个项目，给我一份上手地图：技术栈、目录结构、核心模块职责、数据/控制流、代码约定、常见改动入口。" },
-      { label: "它是做什么的", send: "这个项目是做什么的？核心功能、目标用户、整体架构，简明讲一下。" },
-      { label: "怎么跑起来", send: "这个项目怎么安装依赖、怎么启动？看 README/package.json 等，给我可直接执行的步骤。" },
-      { label: "帮我加个功能", send: "我想给这个项目加个新功能。先帮我研究相关代码、找到合适的改动入口，再给方案。" },
-    ], `📁 已打开 ${basename(path)} · 上手引导：`);
+      { label: "🔎 " + t("assistant.chip.projectResearch"), send: t("assistant.prompt.projectResearch") },
+      { label: t("assistant.chip.whatIsProject"), send: t("assistant.prompt.whatIsProject") },
+      { label: t("assistant.chip.howToRun"), send: t("assistant.prompt.howToRunProject") },
+      { label: t("assistant.chip.addFeature"), send: t("assistant.prompt.addFeature") },
+    ], t("assistant.onboardHeader", { name: basename(path) }));
   } catch {}
 }
 
@@ -11590,7 +11590,12 @@ function _fallbackModelContextLimit(id = "") {
   if (!s) return 128_000;
   if (/gemini.*1\.5.*pro/.test(s)) return 2_000_000;
   if (/gemini/.test(s)) return 1_000_000;
-  if (/claude|sonnet|opus|haiku/.test(s)) return 200_000;
+  if (/claude|sonnet|opus|haiku|fable/.test(s)) {
+    // Per model, not a blanket 200K — Opus 4.6/4.7/4.8/5, Sonnet 4.6/5 and Fable 5 ship 1M by
+    // DEFAULT. Must stay value-for-value identical to official_context in server/src/models.rs.
+    if (/opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos-5/.test(s)) return 1_000_000;
+    return 200_000; // Sonnet 4.5 / Haiku 4.5 / Opus 4.1 and earlier (Sonnet 4.5's 1M needs the beta header)
+  }
   if (/minimax/.test(s)) return 1_000_000;
   if (/grok|xai/.test(s)) return 256_000;
   if (/kimi|moonshot|k2/.test(s)) return 256_000;

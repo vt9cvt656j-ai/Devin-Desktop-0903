@@ -2429,8 +2429,20 @@ fn cost_from_usage(u: &serde_json::Value, rate: f64) -> Option<i64> {
 /// Keep in sync with provider docs; unknown models fall back client-side.
 fn official_context(model_id: &str) -> Option<i64> {
     let m = model_id.to_lowercase();
-    if m.contains("claude") {
-        // Claude 4.x/5 家族统一 200K（长上下文 beta 不按默认下发）。
+    if m.contains("claude") || m.contains("sonnet") || m.contains("opus") || m.contains("haiku") || m.contains("fable") {
+        // 逐型号，不是一刀切 200K。原来那句注释「Claude 4.x/5 家族统一 200K（长上下文 beta
+        // 不按默认下发）」在 1M 还需要 beta 头的年代是对的，现在不是了：Opus 4.6/4.7/4.8/5、
+        // Sonnet 4.6/5、Fable 5 的**默认**上下文就是 1M（Opus 4.8 还明确是标准价、无长上下文溢价）。
+        // 一刀切 200K 等于把用户 4/5 的窗口白扔掉，而且卡片上显示的就是这个数。
+        // 权威来源：Anthropic Models API 的 max_input_tokens（GET /v1/models/{id}）。
+        if m.contains("opus-4-6") || m.contains("opus-4-7") || m.contains("opus-4-8")
+            || m.contains("opus-5") || m.contains("sonnet-4-6") || m.contains("sonnet-5")
+            || m.contains("fable-5") || m.contains("mythos-5")
+        {
+            return Some(1_000_000);
+        }
+        // Sonnet 4.5 / Haiku 4.5 / Opus 4.1 及更早：默认 200K
+        // （Sonnet 4.5 的 1M 要 context-1m beta 头，网关默认不下发，所以按 200K 记账才准确）。
         return Some(200_000);
     }
     if m.contains("gpt-5") || m.contains("codex") {
