@@ -15083,17 +15083,23 @@ const EVIDENCE_GRADING_HINT = load("_evidenceGradingHint");
 test("#71-C 证据分级：仅读文档且下项目结论 → 触发软提示", () => {
   const hint = EVIDENCE_GRADING_HINT(["逆向分析报告.md"], "这个项目采用 Rust + Tauri 架构实现桌面 IDE。");
   assert.match(hint, /证据分级/);
-  assert.match(hint, /源码 > 配置 > 文档 > 笔记/);
+  assert.match(hint, /源码 > 配置 > 文档\/清单/);
   // README + 多份 md 仍是纯文档证据 → 照样触发
   assert.ok(EVIDENCE_GRADING_HINT(["README.md", "docs/架构.md", "notes.txt"], "该项目的技术栈是 Vue3。"));
+  // 依赖清单只描述依赖、不是实现：只读 Cargo.toml/package.json 就下项目/实现结论 → 触发核实
+  assert.ok(EVIDENCE_GRADING_HINT(["README.md", "package.json"], "项目的框架是 Express。"),
+    "只读清单+文档不算见过实现");
+  assert.ok(EVIDENCE_GRADING_HINT(["Cargo.toml"], "该项目基于 Tauri 构建。"),
+    "只读 Cargo.toml 就下实现结论 → 必须核实源码");
 });
 
 test("#71-C 证据分级：读过真实源码 → 解除，不触发", () => {
-  // 读了源码：即便同时读了 md、草稿仍在下项目结论 → 有权威证据，解除
+  // 读了源码：即便同时读了 md/清单、草稿仍在下项目结论 → 有权威证据，解除
   assert.equal(EVIDENCE_GRADING_HINT(["逆向分析报告.md", "src/main.js"], "这个项目用 React 实现。"), "");
-  // 读了配置（package.json/Cargo.toml）也算权威证据 → 解除
-  assert.equal(EVIDENCE_GRADING_HINT(["README.md", "package.json"], "项目的框架是 Express。"), "");
-  assert.equal(EVIDENCE_GRADING_HINT(["docs/x.md", "Cargo.toml"], "该项目基于 Tauri 构建。"), "");
+  // 读了源码 + 清单 → 见过实现，解除（清单本身不算，但源码算）
+  assert.equal(EVIDENCE_GRADING_HINT(["package.json", "src/index.ts"], "项目的框架是 Express。"), "");
+  // 读了真配置（非清单，如 tsconfig/yaml）→ 仍视为权威证据，解除
+  assert.equal(EVIDENCE_GRADING_HINT(["docs/x.md", "tsconfig.json"], "该项目基于 Tauri 构建。"), "");
   // 各类源码扩展名都视为已核实源码
   for (const src of ["a.ts", "b.py", "c.rs", "d.go", "e.java", "f.vue"]) {
     assert.equal(EVIDENCE_GRADING_HINT(["readme.md", src], "这个项目怎么实现的：见源码。"), "", `${src} 应视为源码`);
