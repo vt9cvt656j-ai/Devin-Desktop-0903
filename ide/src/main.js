@@ -13504,13 +13504,26 @@ async function _flushTranscriptJournal() {
 // assistant 消息落账——最坏只丢最后 ~2 秒的输出。
 const _STREAM_DRAFT_KEY = "michael-stream-draft-v1";
 function _streamDraftSave(session, text, reasoning) {
-  if (_isSecondaryWindow || !session?.id || !String(text || "").trim()) return;
+  // NOTE the ordering here — it is the whole point. `text` is the rope built by `acc += delta`,
+  // so `.trim()` cannot run on it lazily: it forces a full String::Flatten, an O(n) memcpy of
+  // the ENTIRE answer so far into a fresh string. This guard used to sit four lines above the
+  // 2s throttle below, so every single streamed token paid that copy — O(n²) time AND O(n²)
+  // transient allocation on both hot paths (agent + plain chat). Measured on a 500KB reply:
+  // 556ms of pure memcpy plain, 1687ms with a run prefix, and ~6-17GB of garbage churned
+  // through the allocator. That sustained multi-GB/s allocation is the GC-thrash-then-OOM
+  // profile behind "lags or crashes whenever there is too much content".
+  // Truthiness on a rope is O(1); the flatten now happens at most once per 2s, below.
+  if (_isSecondaryWindow || !session?.id || !text) return;
   // 退出同步 flush 的数据源：节流窗口内被丢掉的尾部也常驻内存（字符串引用，零拷贝），
   // pagehide/关窗/更新重启时由 _streamDraftFlushSync 一次性全量补写。
   session._streamDraftLatest = { text: String(text || ""), reasoning: String(reasoning || "") };
   const now = Date.now();
   // 节流戳挂在 session 上：多标签页并发流式时，模块级全局戳会让两个会话互相卡对方的节流。
   if (now - (Number(session._draftSaveAt) || 0) < 2000) return;
+  // Blank check moved below the throttle: this is the flatten, and it must not be per-token.
+  // A whitespace-only stash above is harmless — both consumers (_streamDraftFlushSync and the
+  // restore path) re-validate with .trim() before using it.
+  if (!String(text).trim()) return;
   session._draftSaveAt = now;
   const draft = {
     sessionId: session.id,
@@ -14296,7 +14309,15 @@ function _disposeChatSession(session) {
 
 function _archiveChatSession(session) {
   if (!session || !_sessionHasRecoverableMemory(session)) return null;
-  const archived = _chatSessionDataForStorage(session, undefined, true);
+  // The only call site that passes includeHtml=true, and it passed no options — so a closed tab
+  // kept a full, TEXT-UNBUDGETED copy of memory.recent + memory.transcript in memory for the
+  // process lifetime, x80 tabs. Media (1.5MB) and HTML (360k) were already bounded; text was
+  // the one unbounded dimension. Use the same budget shape the on-disk mirror already uses.
+  // Deliberately NOT setting recentLimit/transcriptLimit: those desynchronize transcriptOffset
+  // from _transcriptLoaded on restore.
+  const archived = _chatSessionDataForStorage(session, undefined, true, {
+    textBudget: { remaining: CHAT_LOCAL_TEXT_BUDGET, perValue: CHAT_LOCAL_TEXT_PER_VALUE },
+  });
   archived.closedAt = Date.now();
   if (!_sessionHasRecoverableMemory(archived)) return null;
   _closedChatSessions = (Array.isArray(_closedChatSessions) ? _closedChatSessions : [])
@@ -21769,6 +21790,15 @@ async function _agentRunInTerminal(root, command, stepEl) {
   if (stepEl) {
     stepEl.classList.remove("agent-term-card--running");
     stepEl.classList.add(result.code === 0 ? "agent-term-card--ok" : "agent-term-card--err");
+    // Terminal cards used to escape the fold-away mechanism completely: _createToolStep makes
+    // an `.agent-tool-step` with an `.atc-result` badge, then the cmd executor REPLACES the
+    // whole className and innerHTML with `.agent-term-card`. _settleToolStep then finds no
+    // `.atc-result`, bails early, and so never marks the card settled nor folds anything —
+    // meaning every command card in a run stayed expanded at full height, forever. That is
+    // exactly the "code cards at the top should auto-collapse" complaint. Mark it settled at
+    // its real completion point and run the same fold pass every other card gets.
+    if (stepEl.dataset) stepEl.dataset.toolSettled = "1";
+    try { _collapseSettledToolSteps(stepEl); } catch {}
   }
 
   return result;
@@ -41121,11 +41151,14 @@ function _collapseSettledToolSteps(step) {
   const scope = step?.parentElement;
   if (!scope?.children || scope.classList?.contains("atc-viewport") || scope.closest?.(".agent-activity-log")) return;
   const settled = Array.from(scope.children).filter((node) =>
-    node.classList?.contains("agent-tool-step")
+    // Terminal cards are `.agent-term-card` (the cmd executor rewrites the className), so
+    // matching only `.agent-tool-step` silently excluded every shell command from folding.
+    (node.classList?.contains("agent-tool-step") || node.classList?.contains("agent-term-card"))
     && node.dataset?.toolSettled === "1"
     && !node.classList.contains("agent-tool-step--askuser")
   );
   let log = scope.querySelector(":scope > .agent-activity-log");
+  let moved = 0;
   if (settled.length > _TOOL_ACTIVITY_VISIBLE) {
     if (!log) {
       log = document.createElement("details");
@@ -41135,10 +41168,22 @@ function _collapseSettledToolSteps(step) {
     }
     const overflow = settled.slice(0, settled.length - _TOOL_ACTIVITY_VISIBLE);
     const body = log.querySelector(".agent-activity-log__body");
-    for (const card of overflow) body?.appendChild(card);
+    for (const card of overflow) {
+      // Fold it shut on the way in. Diff/preview cards are force-opened by their executors and
+      // nothing ever closed them, so expanding the Activity log dumped every historical diff at
+      // full height in one frame. Collapsed, each is one row until the user asks for it.
+      card.classList.remove("is-open");
+      body?.appendChild(card);
+      moved++;
+    }
   }
   if (log) {
-    const count = log.querySelectorAll(".agent-tool-step[data-tool-settled='1']").length;
+    // O(1). This used to be log.querySelectorAll(...).length on every settle — a full walk of
+    // the activity log's ENTIRE subtree, which only ever grows, and whose folded cards can hold
+    // thousands of nodes each (JSON dumps, images, diffs). That made the fold pass itself
+    // O(n²) across a long run. Cards are only ever added to the log here, so just count them.
+    const count = (Number(log.dataset.settledCount) || 0) + moved;
+    log.dataset.settledCount = String(count);
     log.querySelector("summary").textContent = `Activity (${count} steps)`;
   }
 }

@@ -114,6 +114,14 @@ function extractFn(name) {
   }
   throw new Error(`unbalanced braces extracting ${name}`);
 }
+// Strip comments so a "this code must not appear" assertion cannot be satisfied — or defeated —
+// by prose. extractFn returns comments verbatim, and the comments explaining a perf fix routinely
+// quote the very code the fix removed.
+function stripJsComments(source) {
+  return String(source)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
 // Build the real function with its module-level deps injected as parameters.
 function load(name, deps = {}) {
   const keys = Object.keys(deps);
@@ -12831,6 +12839,15 @@ test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚
     assert.match(box.textContent, /Para one stays\./);
     assert.match(box.textContent, /Final body\./);
     assert.match(box.textContent, /const x = 1;/, "终渲染代码块内容完整");
+
+    // 4) 终渲染必须切断流式状态。__mdStream 强引用每个已 settle 块的顶层节点
+    //    （textContent="" 只是把它们摘下来，引用还在）加一份全量正文；不清掉的话，
+    //    留在时间线里的每条消息都永久多留一份自己 —— webview OOM 的经典形态。
+    assert.equal(box.__mdStream, null,
+      "终渲染后必须清掉 __mdStream，否则每条流式消息永久泄漏一份 DOM + 正文副本");
+    // 清掉之后仍可继续流式（重新建状态），不是把容器打死。
+    renderMarkdownStream(box, "Restarted stream.\n\n", o);
+    assert.match(box.textContent, /Restarted stream\./, "清状态后必须还能重新流式渲染");
   } finally {
     if (prevDoc === undefined) delete globalThis.document;
     else globalThis.document = prevDoc;
@@ -14008,6 +14025,63 @@ test("计划假完成门禁：install/mkdir 只算 execute 证据，implement �
   // 两处调用点都显式排除 update_plan
   assert.ok((SRC.match(/it\.tc\.name !== "update_plan"/g) || []).length >= 2,
     "自动推进必须排除 update_plan，手动标记仍由模型说了算");
+});
+
+test("草稿保存不得在节流之上展平累计正文（长内容卡死/崩溃的根因）", () => {
+  const src = extractFn("_streamDraftSave");
+  const throttleAt = src.indexOf("< 2000) return;");
+  assert.ok(throttleAt > 0, "2s 节流早退必须存在");
+  // 关键不变量：节流早退之上不得出现任何会展平 rope 的操作。text 是 `acc += delta`
+  // 累积出来的 rope，.trim() 无法惰性执行，会强制整段 memcpy；放在节流之上等于每个
+  // token 复制一次全文 —— O(n²) 时间 + O(n²) 瞬时分配。实测 500KB 回复（含 200KB
+  // run 前缀）3805ms → 37ms，落盘次数不变。
+  // 只看真实代码：extractFn 连注释一起返回，而本函数的注释里就写着 .trim()。
+  const abovethrottle = stripJsComments(src.slice(0, throttleAt));
+  assert.doesNotMatch(abovethrottle, /\.trim\(\)/,
+    "节流之上出现 .trim() 会让每个 token 展平一次全文——这正是长内容卡死的根因");
+  assert.doesNotMatch(abovethrottle, /\.slice\(0,|JSON\.stringify/,
+    "节流之上也不得做任何全量拷贝/序列化");
+  // 展平只允许发生在节流之后
+  assert.ok(src.indexOf("String(text).trim()") > throttleAt,
+    "空白判定必须落在节流之后，最多 2s 一次");
+
+  // 行为不变：空白内容依然不会被落盘
+  const KEY = "k";
+  const m = new Map();
+  const ls = { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) };
+  const save = load("_streamDraftSave", { _isSecondaryWindow: false, _STREAM_DRAFT_KEY: KEY, localStorage: ls, inTauri: false });
+  save({ id: "s" }, "   \n  ", "");
+  assert.equal(ls.getItem(KEY), null, "纯空白内容不得落盘（行为必须与修复前一致）");
+  save({ id: "s2" }, "真实内容", "");
+  assert.equal(JSON.parse(ls.getItem(KEY)).text, "真实内容", "真实内容照常落盘");
+});
+
+test("终端卡与工具卡一样会自动折叠，且折叠计数是 O(1)", () => {
+  const collapse = extractFn("_collapseSettledToolSteps");
+  // 终端卡的类名被 cmd 执行器整个改写成 .agent-term-card，只匹配 .agent-tool-step
+  // 会把每条 shell 命令排除在折叠之外 —— 命令卡因此永远全高堆在聊天里。
+  assert.match(collapse, /contains\("agent-tool-step"\) \|\| node\.classList\?\.contains\("agent-term-card"\)/,
+    "折叠必须同时认识工具卡和终端卡");
+  // 折进活动日志时顺手收起：diff/预览卡被执行器强制展开且从无人关闭，
+  // 展开活动日志会一次性铺开所有历史 diff。
+  assert.match(collapse, /card\.classList\.remove\("is-open"\);/,
+    "折进活动日志的卡片必须同时收起，否则展开日志会一次性铺开全部历史 diff");
+  // 计数不得再遍历不断增长的日志子树
+  assert.doesNotMatch(stripJsComments(collapse), /log\.querySelectorAll/,
+    "计数遍历整棵活动日志子树会让折叠本身变成 O(n²)");
+  assert.match(collapse, /Number\(log\.dataset\.settledCount\) \|\| 0\) \+ moved/,
+    "计数必须是 O(1) 累加");
+
+  // 终端命令结束时必须真的进入折叠流程（否则上面的支持是死代码）
+  const term = extractFn("_agentRunInTerminal");
+  assert.match(term, /stepEl\.dataset\.toolSettled = "1";/,
+    "命令结束必须标记已结算——_settleToolStep 因为找不到 .atc-result 会提前 return");
+  assert.match(term, /_collapseSettledToolSteps\(stepEl\)/, "命令结束必须触发折叠");
+
+  // 终端卡也要有视口外容器化（此前只有 .agent-tool-step/.think-card 有）
+  const CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  assert.match(CSS, /\.agent-term-card \{ content-visibility: auto;/,
+    "终端卡必须有 content-visibility，否则视口外仍付全额布局绘制成本");
 });
 
 test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步写全量草稿", () => {
