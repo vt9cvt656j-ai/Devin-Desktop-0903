@@ -4737,6 +4737,10 @@ body.zen-mode .editor {
    关键：估值必须接近中位数，避免首滚抖动和锚定跳跃。 */
 .msg { content-visibility: auto; contain-intrinsic-size: auto 420px; }
 .agent-tool-step, .think-card { content-visibility: auto; contain-intrinsic-size: auto 300px; }
+/* 终端卡此前完全没有容器化：cmd 执行器把 .agent-tool-step 类名整个换成 .agent-term-card，
+   于是一整轮里每张命令卡都在视口外仍付全额布局/绘制成本。估高比工具卡大——命令输出 pre
+   最多渲染 5000 字符，常远高于 300px；auto 前缀会在首次渲染后记住真实高度，避免回滚跳动。 */
+.agent-term-card { content-visibility: auto; contain-intrinsic-size: auto 420px; }
 /* 流式中的消息仍保持 content-visibility: auto（视口内本就正常渲染），但把估高提到 800px：
    流式高度持续增长，估值偏小会在用户上滑时与滚动锚定打架、滚动条跳动 */
 .msg.is-streaming, .chat-session-container.is-streaming > .msg { content-visibility: auto; contain-intrinsic-size: auto 800px; }

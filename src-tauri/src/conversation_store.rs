@@ -1199,8 +1199,11 @@ async fn hydrate_snapshot(pool: &SqlitePool, snapshot: &mut Value) -> Result<(),
             }
         }
     }
+    // DESC: this backfill is a recovery backstop, and if it must be capped (it must — see
+    // BACKFILL_APPEND_CAP below) the rows worth keeping are the most recently touched ones.
+    // Ascending order meant a cap would have preserved the oldest conversations in the table.
     let rows = sqlx::query(
-        "SELECT session_id, session_json, is_closed FROM conversation_sessions ORDER BY updated_at",
+        "SELECT session_id, session_json, is_closed FROM conversation_sessions ORDER BY updated_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -1214,7 +1217,20 @@ async fn hydrate_snapshot(pool: &SqlitePool, snapshot: &mut Value) -> Result<(),
     object
         .entry("closedSessions")
         .or_insert_with(|| Value::Array(Vec::new()));
+    // Nothing ever deletes from `conversation_sessions` (see the note below), so this backfill
+    // was unbounded: every conversation ever created was decoded, re-serialized, sent across
+    // IPC and re-parsed by the webview on EVERY launch — while the frontend keeps only the
+    // newest 80 recoverable closed sessions (src/main.js `_closedChatSessions ... .slice(0, 80)`)
+    // and throws the rest away. Bound the APPENDS rather than the SELECT: a LIMIT on the query
+    // would be spent on rows that are already in the snapshot and get skipped below.
+    // The cap is well above the webview's 80 because it filters these again on arrival
+    // (_sessionHasRecoverableMemory), so a tight 80 here could starve it.
+    const BACKFILL_APPEND_CAP: usize = 200;
+    let mut appended = 0usize;
     for row in rows {
+        if appended >= BACKFILL_APPEND_CAP {
+            break;
+        }
         let id: String = row.get("session_id");
         if present.contains(&id) {
             continue;
@@ -1252,6 +1268,7 @@ async fn hydrate_snapshot(pool: &SqlitePool, snapshot: &mut Value) -> Result<(),
             .and_then(Value::as_array_mut)
             .expect("session arrays are initialized")
             .push(session);
+        appended += 1;
     }
     Ok(())
 }

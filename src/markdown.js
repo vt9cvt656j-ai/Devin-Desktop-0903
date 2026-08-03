@@ -710,6 +710,13 @@ function flashCopied(btn, label) {
  * @param {{ highlighter?: (code:string, lang:string)=>Promise<string>, streaming?: boolean, showCaret?: boolean }} [opts]
  */
 export function renderMarkdownInto(container, text, opts = {}) {
+  // A full render supersedes any incremental stream state on this container, so drop it.
+  // Without this, __mdStream survives on the finalized element for the life of the chat tab,
+  // and it holds strong references to st.chunks[i].nodes — every top-level node the streamed
+  // render produced (code cards, images, tables) — which textContent="" merely DETACHES,
+  // plus a second full copy of the source text in st.src and the last fence body. Every
+  // streamed reply therefore leaked roughly a duplicate of itself. Classic webview OOM.
+  container.__mdStream = null;
   container.textContent = "";
   const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
   container.appendChild(parseBlocks(lines, opts));
