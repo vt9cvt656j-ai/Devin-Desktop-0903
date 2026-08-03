@@ -8928,6 +8928,8 @@ test("slow community references cannot erase stable local engineering context", 
     _promiseOrFallbackWithin: within,
     _idleRun: (callback) => scheduled.push(callback),
     _bm25Index: { root: "", built: false },
+    _symbolIndexRoot: "/repo",
+    _symbolIndexBuilt: true,
     _estimateTokens: (text) => text.length / 4,
     _memoryBlocks: () => "",
     _projectJournalBlock: () => "",
@@ -10875,7 +10877,11 @@ test("precise local edit anchors can safely bypass whole-file read gate", () => 
   assert.equal(precise(content, { type: "edit", oldString: "  color: red;", newString: "  color: green;" }), true);
   assert.equal(precise(content, { type: "edit", oldString: "  color:", newString: "  background:", replaceAll: false }), false);
   assert.equal(precise(content, { type: "edit", oldString: "  missing: true;", newString: "" }), false);
-  assert.equal(precise(content, { type: "edit", oldString: "  color:", newString: "  background:", replaceAll: true }), true);
+  // replace_all does NOT relax the uniqueness requirement. Uniqueness is the entire basis for
+  // this bypass ("an exact, unique anchor is itself evidence the model is on the real bytes");
+  // a 2-hit anchor is evidence of nothing, and granting the bypass here let an unread file be
+  // rewritten at every occurrence. This assertion previously pinned that hole open.
+  assert.equal(precise(content, { type: "edit", oldString: "  color:", newString: "  background:", replaceAll: true }), false);
   assert.equal(precise(content, {
     type: "multiedit",
     edits: [
@@ -11110,6 +11116,82 @@ test("adjacent run_worker calls execute as a parallel segment, still barriered f
   assert.equal(maxWorkers, 3, "同轮相邻的 worker 必须真并行（此前被当硬屏障串行跑）");
   assert.ok(events.indexOf("read1") < events.indexOf("worker2"), "读段先于 worker 段");
   assert.ok(events.indexOf("worker4") < events.indexOf("read5"), "worker 段完成后才轮到后续读");
+});
+
+test("_runHasOrientationFacts counts only what the run actually observed", () => {
+  const oriented = load("_runHasOrientationFacts", {
+    _ORIENTING_TOOLS: new Set(["list_dir", "find_files", "read_file", "find_symbol", "semantic_search", "grep_search"]),
+  });
+  // no bookkeeping → never invent a block
+  assert.equal(oriented(null), true);
+  assert.equal(oriented({}), false, "a run that has done nothing is not oriented");
+  // a real read counts
+  assert.equal(oriented({ ctx: { filesRead: new Set(["src/a.ts"]) } }), true);
+  assert.equal(oriented({ ctx: { filesRead: new Set() } }), false, "an empty read set is not orientation");
+  // a successful orientation tool counts; a failed one does not
+  assert.equal(oriented({ _toolLedger: { entries: [{ tool: "list_dir", ok: true }] } }), true);
+  assert.equal(oriented({ _toolLedger: { entries: [{ tool: "list_dir", ok: false }] } }), false,
+    "a FAILED list_dir observed nothing");
+  // acting is not observing — a prior command or write is not orientation
+  assert.equal(oriented({ _toolLedger: { entries: [{ tool: "run_cmd", ok: true }, { tool: "write_file", ok: true }] } }), false,
+    "running commands and writing files is not looking at the workspace");
+});
+
+test("a destructive shell command with zero observed facts is handed back once, not executed", () => {
+  // The gate must key on the run's OBSERVED facts, never on prose about the command.
+  assert.match(SRC, /commandRisk === "danger" \|\| _looksLikeShellFileRewrite\(call\.command\)/,
+    "trigger is the existing destructive-command permission floor, not a new matcher");
+  assert.match(SRC, /!run\._emptyRootAtStart && !run\._cmdGroundingDeferred && !_runHasOrientationFacts\(run\)/,
+    "must be once-per-run, skipped on an empty workspace, and released by real orientation");
+  assert.match(SRC, /\[NOT_RUN·先确认作用域\]/, "the command must NOT run; the model is told to look first");
+  // It must be a self-directed deferral, never a user-facing confirmation prompt.
+  assert.doesNotMatch(SRC, /_cmdGroundingDeferred[\s\S]{0,400}confirm\(/,
+    "this is the agent looking before it leaps, not a permission dialog");
+});
+
+test("a mutating command reports which files it actually touched, not just how many", () => {
+  assert.match(SRC, /_plan\.slice\(0, 20\)\.map\(\(s\) => `\$\{_normRel\(s\.path, root \|\| rootPath\)\}/,
+    "the already-computed before/after diff must be enumerated for the model");
+  assert.match(SRC, /本次命令实际改动 \$\{_plan\.length\} 个文件：/);
+  assert.doesNotMatch(SRC, /本次命令改动了 \$\{_plan\.length\} 个文件；/,
+    "the bare count discarded an observed fact the harness already held");
+});
+
+test("project-level answers require source, not just a dependency manifest", () => {
+  const auth = extractFn("_authContextBlock");
+  assert.match(auth, /只是对项目的\*\*描述\*\*，不是实现本身/,
+    "the manifest-is-not-implementation rule must exist at GENERATION time, not only in post-hoc grading");
+  assert.doesNotMatch(auth, /读 README\/Cargo\.toml\/源码，用具体内容/,
+    "the old wording named a manifest as a sufficient source and caused the observed bug");
+});
+
+test("an unbuilt index is declared as unavailable, never rendered as an empty project", async () => {
+  const contextFor = (mapRoot, mapBuilt, bm) => load("_agentContextForQuery", {
+    _buildRepoMap: () => "",
+    _contextBudgetScale: () => 1,
+    _engineeringProfileWithAiIntent: () => ({ applies: false, ui: false, needsReferences: false }),
+    _projectStacks: new Map([["/repo", { lang: "Rust" }]]),
+    _buildRetrievedCodeContext: async () => "",
+    _buildEngineeringReferenceContext: async () => "",
+    _engineeringReferenceCachedBlock: () => "",
+    _promiseOrFallbackWithin: load("_promiseOrFallbackWithin"),
+    _idleRun: () => {},
+    _bm25Index: bm,
+    _symbolIndexRoot: mapRoot,
+    _symbolIndexBuilt: mapBuilt,
+    _estimateTokens: (text) => text.length / 4,
+    _memoryBlocks: () => "",
+    _projectJournalBlock: () => "",
+  });
+
+  const cold = await contextFor(null, false, { root: "", built: false })("BASE", "q", "/repo", 5);
+  assert.match(cold, /符号地图本轮不可用/, "an unbuilt symbol map must be declared, not silently omitted");
+  assert.match(cold, /代码检索\(BM25\)索引本轮不可用/);
+  assert.match(cold, /索引缺失 ≠ 项目里没有这些东西/,
+    "the model must be told absence is not evidence of absence — this is the whole point");
+
+  const warm = await contextFor("/repo", true, { root: "/repo", built: true })("BASE", "q", "/repo", 5);
+  assert.doesNotMatch(warm, /工程索引状态/, "a fully built index adds no noise");
 });
 
 test("_scopesOverlap: whole-workspace sentinel collides with any scope; disjoint dirs don't", () => {
@@ -17224,7 +17306,9 @@ test("_writeGateBypass: precise local edit anchors remain a bypass", () => {
   const gate = load("_writeGateBypass");
   assert.equal(gate({ type: "edit" }, { preciseLocalEdit: true }), true);
   assert.equal(gate({ type: "edit" }, { preciseLocalEdit: false }), false);
-  // multi_edit has never had an escape and must not gain one here.
+  // multi_edit gets no bypass THROUGH THIS FUNCTION. Note it is not un-bypassable overall: the
+  // multiedit branch checks _localEditHasPreciseAnchors inline at its own gate site. Both paths
+  // now require a unique anchor per edit, so neither can stand in for reading an unread file.
   assert.equal(gate({ type: "multiedit" }, { preciseLocalEdit: true }), false);
 });
 
