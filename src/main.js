@@ -27414,7 +27414,11 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "zhuanzhuan_search": return { type: "zhuanzhuan_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "current_time": return { type: "current_time" };
     case "game_scaffold": return { type: "game_scaffold", engine: String(args.engine || "phaser"), name: String(args.name || "my-game") };
-    case "web_scaffold": return { type: "web_scaffold", name: String(args.name || "my-site"), framework: String(args.framework || "vue"), style: String(args.style || ""), tokens_css: String(args.tokens_css || "") };
+    // Default react, NOT vue. Every design prompt tells the model to build Michael Design
+    // (React 19 + TS + Tailwind v4 + shadcn); a model that followed that and then called
+    // web_scaffold without arguments silently got a Vue project. Declaration and execution
+    // must agree, and the shipped site is React.
+    case "web_scaffold": return { type: "web_scaffold", name: String(args.name || "my-site"), framework: String(args.framework || "react"), style: String(args.style || ""), tokens_css: String(args.tokens_css || "") };
     case "generate_3d": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_3d", _error: "prompt 不能为空" }; return { type: "generate_3d", prompt: _p, name: String(args.name || "model").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "model", style: String(args.style || "realistic") }; }
     case "generate_sound": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_sound", _error: "prompt 不能为空" }; const _dur = Number.isFinite(+args.duration) ? Math.max(0.5, Math.min(+args.duration, 300)) : undefined; return { type: "generate_sound", prompt: _p, name: String(args.name || "sound").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "sound", duration: _dur }; }
     case "generate_music": { const _p = String(args.prompt || "").trim(); if (!_p) return { type: "generate_music", _error: "prompt 不能为空" }; const _dur = Number.isFinite(+args.duration) ? Math.max(1, Math.min(+args.duration, 600)) : undefined; return { type: "generate_music", prompt: _p, name: String(args.name || "bgm").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 64) || "bgm", duration: _dur }; }
@@ -34276,6 +34280,25 @@ function _scopesOverlap(a, b) {
 // 专业角色纪律块：多角色拆分并行的核心——每个子智能体/worker 按角色带上自己领域的
 // 打法与红线，而不是一套通用工人提示干所有领域的活（通用工人 = 每个领域都平庸）。
 // 块要精炼：只写该领域"怎么干才专业 + 最容易翻车的红线"，通用纪律仍由基座承担。
+// ── Michael Design：唯一权威技术栈 ────────────────────────────────────────────
+// 事实来源是 owner 真正上线的站点（package "michael-ide-site"），不是任何文档或习惯。
+// 此前全仓库有 20+ 处各说各话：有的把 Vue 排在 React 前面、有的整个漏掉 TypeScript、
+// 几乎全部没写 Tailwind 大版本——模型于是按最先看到的那条走，产出的项目和 owner 手里
+// 真正在跑的那套对不上。这里定义一次，所有地方引用同一份。
+//
+// 真实站点核对过的关键事实：项目里【没有】tailwind.config.js / postcss.config.js，
+// 也【没有】postcss / autoprefixer 依赖——Tailwind v4 走 CSS-first。按 v3 习惯脚手架
+// 出来的项目结构完全不同，shadcn 组件的令牌也接不上。
+const _MD_STACK_RULE =
+  "Michael Design 技术栈（唯一标准，不用问、不要换）：Vite 7 + React 19 + TypeScript 5.9 + Tailwind v4 + shadcn/ui。"
+  + "shadcn 的底座要一起装齐，缺一个组件就跑不起来：@radix-ui/react-*（按实际用到的 primitive 装）、class-variance-authority、clsx、tailwind-merge，"
+  + "并在 src/lib/utils.ts 里定义 cn() = twMerge(clsx(...))；图标用 lucide-react。"
+  + "Tailwind v4 是 CSS-first 接线：装 tailwindcss + @tailwindcss/vite，vite.config.ts 里加 tailwindcss() 插件和 @ 别名，tsconfig 配 @/* paths，"
+  + "CSS 入口写 @import \"tailwindcss\"; 与 @theme inline 注册令牌。"
+  + "【绝对不要】新建 tailwind.config.js/ts 或 postcss.config.js，也不要装 postcss、autoprefixer、tailwindcss-animate——那些是 Tailwind v3 的做法，本栈一个都没有；"
+  + "知识库蓝图里若出现 tailwind.config 或 theme.extend，一律翻译成 v4 的 @theme inline 写法，不要照抄建文件。"
+  + "目录约定：shadcn 原件放 src/components/ui/，业务区块放 src/components/sections/。"
+  + "用户没点名框架就用这套，不要用 Vue / Next / Nuxt / SvelteKit，也不要退化成单个 index.html；用户明确点名别的框架才例外，已有项目按其现状走、不强行迁移。";
 const _AGENT_ROLE_BLOCKS = {
   architect: `# 你的角色：架构师（专注边界、契约与演进路径）
 - 先读现有入口、依赖方向、数据流和部署事实，再给边界判断；不凭目录名臆测架构。
@@ -34288,7 +34311,8 @@ const _AGENT_ROLE_BLOCKS = {
   frontend: `# 你的角色：前端工程师（专注 UI/交互/样式）
 - 设计一律服从系统提示里的「michael-design 设计体系」块；没注入就先 knowledge_search(domain="michael-design") 取品类蓝本再动手。
 - 配色只用 Tailwind 族+档或语义 token（bg-primary 等），业务代码禁裸 hex；未明确要求暗色时根背景浅色中性档。
-- 组件用 shadcn/ui 官方 primitive 组合，不造平行轮子；图标 Lucide/SVG 禁 emoji；状态做全（hover/focus-visible/active/disabled/loading/空/错误）。
+- ${_MD_STACK_RULE}
+- 组件用 shadcn/ui 官方 primitive 组合，不造平行轮子；图标 lucide-react 禁 emoji；状态做全（hover/focus-visible/active/disabled/loading/空/错误）。
 - 动效按知识库分层编排（标志性滚动叙事/分区入场/微交互/移动端降级 + reduced-motion），禁全页统一 fade-up。
 - 响应式必须真做：移动端单列/重排，不溢出不破版。`,
   backend: `# 你的角色：后端工程师（专注 API/服务/业务逻辑）
@@ -34373,7 +34397,7 @@ function _RESEARCH_PROMPT(focus) {
 // live browser design-extraction during implementation).
 function _DESIGN_RESEARCH_PROMPT(goal) {
   const g = String(goal || "").trim();
-  return _P("design_research_prompt", `研究并规划「{{GOAL}}」的设计方向 + 完整 UI 架构，给主智能体一份可直接实现的「设计 + 架构蓝图」。先 list_dir / read 现有项目，读取 README/package.json/product wiki/docs/src/data/assets/public/screenshots 等真实内容源，定产品事实、品牌、技术栈、可用数据、真实图片/截图/设计稿；**如果 list_dir 已确认工作区根目录为空 / 新项目，就立即停止本地 read/search/find_files，不要猜 package.json、vite.config、src 等旧项目路径；直接把用户描述当产品事实来源，必要时继续做外部设计/包/GitHub 调研。**用户随消息附上的截图/图片/视频要当目标视觉或缺陷证据，按图中真实布局、文字、裁切、溢出、间距和素材内容规划，不要套行业模板。缺设计参考时首选 web_fetch styles.refero.design 的 style 页（或 web_search "site:styles.refero.design 品类"）拿一线产品的完整色板/字阶/用途描述当真实依据，其次 web_search 一流产品或官方文档，并标注哪些是事实、哪些是参考。规划页面 / 区块结构 / 真实文案来源、真实素材使用方案（缺素材才 generate_image/picsum 且标明占位）、shadcn/ui + Radix primitives 组件映射（Button/Card/Dialog/Tabs/Accordion/Progress 等按需选，不要裸造控件）、Tailwind palette/theme.extend/CSS variables 设计 tokens(配色含 hex / 字阶 / 间距 / 圆角 / 阴影)、布局与响应式、关键状态、动效、无障碍。技术取向一律上现代框架(Vue3+Vite 或 React+Vite+TS / Next·Nuxt / SvelteKit + Tailwind)，静态站 / 落地页 / 单页 / 简单 demo 也一律用脚手架。最后输出随问题动态组织的蓝图。`).replace(/\{\{GOAL\}\}/g, g || "这个网站 / 界面");
+  return _P("design_research_prompt", `研究并规划「{{GOAL}}」的设计方向 + 完整 UI 架构，给主智能体一份可直接实现的「设计 + 架构蓝图」。先 list_dir / read 现有项目，读取 README/package.json/product wiki/docs/src/data/assets/public/screenshots 等真实内容源，定产品事实、品牌、技术栈、可用数据、真实图片/截图/设计稿；**如果 list_dir 已确认工作区根目录为空 / 新项目，就立即停止本地 read/search/find_files，不要猜 package.json、vite.config、src 等旧项目路径；直接把用户描述当产品事实来源，必要时继续做外部设计/包/GitHub 调研。**用户随消息附上的截图/图片/视频要当目标视觉或缺陷证据，按图中真实布局、文字、裁切、溢出、间距和素材内容规划，不要套行业模板。缺设计参考时首选 web_fetch styles.refero.design 的 style 页（或 web_search "site:styles.refero.design 品类"）拿一线产品的完整色板/字阶/用途描述当真实依据，其次 web_search 一流产品或官方文档，并标注哪些是事实、哪些是参考。规划页面 / 区块结构 / 真实文案来源、真实素材使用方案（缺素材才 generate_image/picsum 且标明占位）、shadcn/ui + Radix primitives 组件映射（Button/Card/Dialog/Tabs/Accordion/Progress 等按需选，不要裸造控件）、Tailwind palette/theme.extend/CSS variables 设计 tokens(配色含 hex / 字阶 / 间距 / 圆角 / 阴影)、布局与响应式、关键状态、动效、无障碍。技术取向固定为 Michael Design 那套：Vite + React 19 + TypeScript + Tailwind v4(@tailwindcss/vite，CSS-first，不建 tailwind.config) + shadcn/ui(Radix + CVA + clsx + tailwind-merge 的 cn() + lucide-react)；静态站 / 落地页 / 单页 / 简单 demo 也一律用这套脚手架，不要换 Vue/Next/Nuxt/SvelteKit。最后输出随问题动态组织的蓝图。`).replace(/\{\{GOAL\}\}/g, g || "这个网站 / 界面");
 }
 
 // generate_wiki（DeepWiki 式）：把代码库/产品自动摸透成一份结构化「产品 Wiki」Markdown 落盘复用，
@@ -35653,7 +35677,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (p.ui || p.uiProject) {
     lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用户直接给出的链接、文案、名称、业务对象和限制就是第一事实来源，先逐条保留并在计划中落到对应区块，不能用默认品类猜测覆盖它。任何网站/UI 项目在第一次视觉实现前都必须取得 michael-design 三轨证据，把命中的结构、组件体系、素材 URL、动效参数和视觉令牌落进实现。用项目现有组件优先，shadcn/ui + Radix 只承担 Button/Dialog/Tabs/Accordion 等交互 primitive，不把每个区块都套 Card；Tailwind palette/theme token 统一配色，并建立中性族+主强调族+可选辅助族的全页契约，任何 section 不得突然硬编码陌生色相。卡片按真实数量选择 2/3/4 列、跨列和末行平衡；图标先理解对象/动作/状态，再映射 Bot/Mail/Shield/Chart 等具体语义，禁止 Sparkles/Wand 万能代替。构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
     if (p.designKnowledgeRequired) lines.push("michael-design 主编排律：IDE 首轮前固定完成三条主题检索，不能压成一条泛 query：① 业务信息架构、视觉样式、字阶/间距/圆角/阴影、shadcn/Radix 组件变体、Tailwind 配色和响应式网格；② 标志性滚动/状态动效、移动端参数与 prefers-reduced-motion；③ 真实媒体、头像、语义图标和卡片 surface。优先直接采用已注入证据，只有覆盖缺口才追加 knowledge_search；每条命中都记录来源 section、采用项、弃用项和实际落点，并形成“section → primitive/variant → Tailwind token/class → 页面落点”的映射。动效从知识库选彼此兼容的一组，禁止只写 fade-up 或把所有特效硬堆到一页。");
-    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：默认 React/Vite + Tailwind + shadcn/ui/Radix，并按 section/component/data 拆分；禁止退化成单个通用 index.html。只有用户明确要求原生 HTML，或已有技术栈与 React 不兼容时才例外；已有项目不得为满足本条强制迁移。");
+    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：" + _MD_STACK_RULE + "并按 section/component/data 拆分；禁止退化成单个通用 index.html。只有用户明确要求原生 HTML，或已有技术栈与 React 不兼容时才例外；已有项目不得为满足本条强制迁移。");
     if (p.fullWebsite) lines.push("完整网站决策律：先按业务品类推导栏目与用户旅程，区块由真实旅程决定、逐块写满具体文案，禁止默认 Hero/Features/Pricing/CTA/Footer 套路，也禁止按固定区块数配额凑数；真实图片、视频或 GIF 必须成为内容的一部分。编码前明确数据库选择：不需要、本地持久化或服务端数据库，写出理由；需要账户、跨设备数据、后台管理、订单/预约/评论等持久业务时不能只做静态假界面，不需要时也不要为了显得复杂硬加数据库。");
     if (p.fullWebsite) lines.push("网站内容取证律：视觉实现前必须取得并记录一条真实内容证据，优先级为：工作区 README/产品文档/素材与既有文案 → 已知品牌的官方主站用 web_fetch 读正文 → generate_wiki 从当前代码提取真实功能 → 同品类公开资料只用于结构与事实核对。没有可验证产品事实时，先写 PRODUCT_BRIEF.md，明确“原创内容/假设/待确认”，再以这些边界写文案；不把搜索标题、竞品措辞或通用 AI 口号伪装成产品事实。");
     if (p.motionDesignRequired) lines.push("响应式动效律：至少规划微交互、分区入场、滚动叙事/状态转场三层节奏；高级方案必须写清知识库来源、目标区块、时间线/滚动进度、参数和移动端降级，不能把一个孤立 useScroll 或 clip-path 当全站高级动效。桌面与移动分别调整距离、节奏、并发和触发方式，并实现 prefers-reduced-motion/useReducedMotion。");
@@ -35844,7 +35868,7 @@ function _uiDesignCraftBlock(text, profile = null, opts = {}) {
   const referenceRule = _uiDesignReferenceRule(p);
   const transactionalRule = _uiDesignTransactionalRule(p);
   const greenfieldRule = p.fromZeroUiProject
-    ? "\n- 从零网站技术栈硬约束：默认 React/Vite + Tailwind + shadcn/ui/Radix，按 section/component/data 拆分并真正使用 Button/Dialog/Tabs 等 primitive、variant 和语义 Tailwind 类；禁止再次只生成一个通用 index.html。用户明确要求原生 HTML 或已有项目技术栈不兼容时才例外，已有项目不得强制迁移。"
+    ? "\n- 从零网站技术栈硬约束：" + _MD_STACK_RULE + "按 section/component/data 拆分并真正使用 Button/Dialog/Tabs 等 primitive、variant 和语义 Tailwind 类；禁止再次只生成一个通用 index.html。用户明确要求原生 HTML 或已有项目技术栈不兼容时才例外，已有项目不得强制迁移。"
     : "";
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
 - 所有网站/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据：信息架构/视觉样式/组件体系/Tailwind token，动效/响应式，媒体/头像/语义图标；仅覆盖有缺口时追加检索。每项实施计划必须写成“来源 section → shadcn/Radix primitive 与 variant → Tailwind semantic token/class → 页面落点”，不能只说“参考知识库”。
@@ -39313,7 +39337,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       if (run.mode === "agent") {
         const _allContent = toolMsgs.map(m => m.content || "").join("\n");
         if (/用户选择了设计方向/.test(_allContent)) {
-          _pushNudge("design", "✅ 设计方向选完了。**现在开始写代码**：①直接按布局骨架→区块→交互→响应式实现 ②用 React/Vue + Tailwind 写组件化代码 ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证");
+          _pushNudge("design", "✅ 设计方向选完了。**现在开始写代码**：①直接按布局骨架→区块→交互→响应式实现 ②用 React + TypeScript + Tailwind v4 + shadcn/ui 写组件化代码（cn()/CVA/lucide-react，别建 tailwind.config） ③遇到组件有多种方案 → 用 **preview_choices** 让用户选 ④写完用 browser 验证");
         }
       }
 

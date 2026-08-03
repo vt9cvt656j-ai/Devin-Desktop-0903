@@ -46,7 +46,8 @@ pub async fn web_scaffold(
         "material" | "material3" | "m3" | "google" | "谷歌"
     );
     let is_tdesign = matches!(preset.as_str(), "tdesign" | "tencent" | "腾讯");
-    // Vue is the default per the house style; react is accepted but currently
+    // React is the default: the house style (the shipped "michael-ide-site") is
+    // React 19 + TS + Tailwind v4 + shadcn. Vue is accepted but is NOT the default;
     // shares the Vite+Tailwind+token base with a React entry. Material rides its
     // best-supported stack (React + MUI); TDesign rides Vue (tdesign-vue-next).
     let is_react = if is_material {
@@ -146,7 +147,7 @@ pub async fn web_scaffold(
             "src/main.jsx",
             "src/App.jsx",
         ]);
-        note = "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 风格 OKLCH 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。".to_string();
+        note = "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。".to_string();
     } else {
         put(&dir, "package.json", &pkg_json(&proj, false)).await?;
         put(&dir, "vite.config.js", VITE_CONFIG_VUE).await?;
@@ -164,7 +165,7 @@ pub async fn web_scaffold(
             "src/App.vue",
             "src/components/SiteHeader.vue",
         ]);
-        note = "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 风格 OKLCH 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。".to_string();
+        note = "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。".to_string();
     }
 
     let mut note = note;
