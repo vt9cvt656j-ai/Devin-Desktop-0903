@@ -17970,3 +17970,39 @@ test("the role matrix is wired into BOTH _allow and _execTypes from one source",
   // stale "no role tool matrix" comment can't creep back as the live behavior.
   assert.doesNotMatch(sub, /不搞角色工具矩阵/);
 });
+
+// ---------------------------------------------------------------------------
+// Automatic prompt optimization: the classifier restates a vague message.
+//
+// The user wanted terse/ambiguous input ("做个网站", "修一下") understood, not guessed at.
+// The intent classifier already makes one AI call per turn; it now also emits
+// semantic.restatedTask — a clarified, complete, first-person restatement — which is
+// injected ALONGSIDE the raw user text (never replacing it). One field through the existing
+// pipeline: zero extra latency, no keyword logic, no UI.
+// ---------------------------------------------------------------------------
+test("restatedTask flows through classifier schema, normalizer, and render", () => {
+  // Schema advertises it, so the model fills it.
+  assert.match(SRC, /"ambiguities":\[\],"restatedTask":""/, "the classifier output schema must request it");
+  // Normalizer carries it, inheriting on a short continuation like the other fields.
+  assert.match(SRC, /restatedTask: _aiIntentText\(rawSemantic\.restatedTask \|\| \(followsPrior \? prior\.restatedTask : ""\), 600\)/,
+    "the normalizer must accept and inherit restatedTask");
+  // Render injects it, and the comment fixes the invariant that it augments, not replaces.
+  const render = extractFn("_agentIntentExecutionBlock");
+  assert.match(render, /semantic\.restatedTask/, "the execution block must render the restatement");
+  assert.match(render, /以用户原话为准/, "it must defer to the user's raw words as ground truth");
+});
+
+test("_agentIntentExecutionBlock leads with the restatement but keeps raw text authoritative", () => {
+  const block = load("_agentIntentExecutionBlock", {
+    _AI_INTENT_DIMENSIONS: [],
+  });
+  const out = block({
+    intentSource: "ai",
+    intentSemantic: { continuation: "new", goal: "构建产品官网", restatedTask: "帮我用 React+Vite 从零做一个产品官网，包含首屏、功能区和 CTA" },
+  });
+  assert.match(out, /读懂的诉求/, "a terse message gets a clarified restatement in context");
+  assert.match(out, /React\+Vite 从零做一个产品官网/);
+  // No restatement → no line (a clear message needs no rescue).
+  const plain = block({ intentSource: "ai", intentSemantic: { continuation: "new", goal: "x" } });
+  assert.doesNotMatch(plain, /读懂的诉求/);
+});
