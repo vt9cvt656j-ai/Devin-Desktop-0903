@@ -8101,8 +8101,11 @@ test("michael-design prefetch starts only from a resolved structured design prof
   const preflight = extractFn("_runMichaelDesignPreflight");
   assert.match(preflight, /!profile\.designKnowledgeRequired/);
   assert.doesNotMatch(preflight, /_engineeringTaskProfile|keyword|关键词/);
-  assert.match(SRC, /_lateProfile\.intentSource === "ai"/);
-  assert.match(SRC, /_lateProfile\.designKnowledgeRequired && !run\._michaelDesignEvidence/);
+  // The late-verdict apply logic now lives in _applyLateIntentIfLanded (shared by the
+  // in-loop backfill and the greenfield pre-first-turn wait).
+  const applyLate = extractFn("_applyLateIntentIfLanded");
+  assert.match(applyLate, /late\.intentSource !== "ai"/, "only a real (ai) verdict is adopted");
+  assert.match(applyLate, /late\.designKnowledgeRequired && !run\._michaelDesignEvidence/);
   assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
 });
 
@@ -17742,12 +17745,19 @@ test("late intent backfill survives the first write", () => {
     "the narrow ===none gate missed the session-inherited case");
   assert.doesNotMatch(loop, /if \(iter > 0 && !didMutate && run\.engineering\?\.intentSource === "none"\)/,
     "the old narrow window is what lost michael-design on a slow classifier");
-  // It must still refresh the header the gateway gates design injection on.
-  const region = loop.slice(loop.indexOf("_lateBackfillOpen"), loop.indexOf("_lateBackfillOpen") + 1600);
-  assert.match(region, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
+  // The backfill now delegates to the shared helper, which refreshes the gateway profile.
+  assert.match(loop, /await _applyLateIntentIfLanded\(run, config, task, session, body, _live, messages\)/,
+    "the backfill must delegate to the shared late-intent apply");
+  const applyLate = extractFn("_applyLateIntentIfLanded");
+  assert.match(applyLate, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
     "the refreshed profile must reach the gateway or the design modules stay off");
-  // Still bounded: it only fires while the verdict was genuinely missing.
-  assert.match(region, /intentSource === "ai"/, "only a real (ai) late verdict may overwrite the profile");
+  assert.match(applyLate, /late\.intentSource !== "ai"/, "only a real (ai) late verdict may overwrite the profile");
+  // Greenfield: the design decision must land BEFORE the first UI write — a bounded wait
+  // on the first turn of an empty-workspace build, using the same helper.
+  assert.match(loop, /iter === 0 && isAgent && run\._emptyRootAtStart && run\.engineering\?\.intentSource !== "ai"/,
+    "an empty-workspace build must wait for the verdict before building the UI blind");
+  assert.match(loop, /Date\.now\(\) < _intentWaitUntil[\s\S]{0,180}_applyLateIntentIfLanded/,
+    "the greenfield wait must be bounded and use the shared apply");
 });
 
 test("an empty profile emits no design flag — the failure mode this guards", () => {
