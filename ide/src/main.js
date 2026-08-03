@@ -25967,7 +25967,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       type: "function",
       function: {
         name: "update_plan",
-        description: "创建或更新复杂任务计划；简单一步修改不要套流程，读诊断/看日志/看终端/恢复已声明依赖/跑验证命令也不要先建计划。所有项目默认工程级：计划一旦用于项目/代码库/服务/数据库/Agent 基座，就必须覆盖项目地图/模块边界、变更半径/调用方影响、验证矩阵/CI式检查；生产级还要覆盖发布回滚和可观测性边界。业务功能必须覆盖业务域/角色/状态机/业务规则、业务漏洞/越权/滥用/幂等并发、功能完整性/验收清单；数据库任务要覆盖数据库选型、事务/索引/迁移/连接池边界；容器任务要覆盖 Docker/Compose/K8s、环境变量、端口、volume、网络、healthcheck 和日志；网站交付要覆盖路由/404/SEO/表单/内容/性能/无障碍/真实浏览器验收。计划步数按任务真实复杂度自然拆分，不设固定下限或上限：两步讲清就两步，九步才清楚就九步。复杂工程写入计划要像老手执行清单：覆盖调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写口号或关键词堆砌。Bug/调试修复必须像老手查案：先复现或读取真实报错/日志/截图/诊断/exit code，把症状、触发条件和期望行为写清；沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链；列出可证伪根因假设，优先用最小证据排除；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。动态数据/URL/接口/抓包/爬虫/第三方页面任务必须列真实证据采集步骤：打开真实页面或真实接口、捕获网络响应/DOM/文件样本、验证链接/字段可访问，再写解析和落库逻辑；不得先猜 URL 规则。只读找 bug 通常直接读证据，只有确实需要多阶段协作或多文件写入时才上计划。UI/官网/落地页/从零前端项目要覆盖真实内容源取证、页面信息架构/区块文案、shadcn/ui + Radix primitives 语义组件映射、Tailwind palette/theme.extend/CSS variables 设计令牌、组件与布局实现、响应式/交互/无障碍状态、真实浏览器桌面+手机验证；按需要合并或拆分步骤。需要持续进程/交互等待/后台监听时必须写清策略：run_in_terminal 启动真实终端、read_logs/read_terminal 看日志/URL/退出状态、background_monitor 按 port/url/file/command/capture 自动轮询并恢复继续；不要让 run_cmd 前台硬等。复杂只读调查覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
+        description: "创建或更新复杂任务计划；简单一步修改不要套流程，读诊断/看日志/看终端/恢复已声明依赖/跑验证命令也不要先建计划。所有项目默认工程级：计划一旦用于项目/代码库/服务/数据库/Agent 基座，就必须覆盖项目地图/模块边界、变更半径/调用方影响、验证矩阵/CI式检查；生产级还要覆盖发布回滚和可观测性边界。业务功能必须覆盖业务域/角色/状态机/业务规则、业务漏洞/越权/滥用/幂等并发、功能完整性/验收清单；数据库任务要覆盖数据库选型、事务/索引/迁移/连接池边界；容器任务要覆盖 Docker/Compose/K8s、环境变量、端口、volume、网络、healthcheck 和日志；网站交付要覆盖路由/404/SEO/表单/内容/性能/无障碍/真实浏览器验收。计划步数按任务真实复杂度自然拆分，不设固定下限或上限：两步讲清就两步，九步才清楚就九步。复杂工程写入计划要像老手执行清单：覆盖调查现状、接口/数据契约与边界、实现改动、失败/空值/兼容处理、真实命令验证、交付验收；每步注明关键文件/目录/命令/输出标准，别写口号或关键词堆砌。Bug/调试修复必须像老手查案：先复现或读取真实报错/日志/截图/诊断/exit code，把症状、触发条件和期望行为写清；沿入口、状态、数据流、调用链、异步时序、边界值和调用方契约建立因果链；列出可证伪根因假设，优先用最小证据排除；做最小补丁并同步调用方/契约；补失败/空值/竞态边界；重跑同一失败路径或聚焦回归测试并记录退出码。动态数据/URL/接口/抓包/爬虫/第三方页面任务必须列真实证据采集步骤：打开真实页面或真实接口、捕获网络响应/DOM/文件样本、验证链接/字段可访问，再写解析和落库逻辑；不得先猜 URL 规则。只读找 bug 通常直接读证据，只有确实需要多阶段协作或多文件写入时才上计划。UI/官网/落地页/从零前端项目要覆盖真实内容源取证、页面信息架构/区块文案、shadcn/ui + Radix primitives 语义组件映射、Tailwind 语义令牌（v4：CSS 入口 @theme inline 注册 --color-*/--font-*/--radius-*，不是 v3 的 theme.extend） 设计令牌、组件与布局实现、响应式/交互/无障碍状态、真实浏览器桌面+手机验证；按需要合并或拆分步骤。需要持续进程/交互等待/后台监听时必须写清策略：run_in_terminal 启动真实终端、read_logs/read_terminal 看日志/URL/退出状态、background_monitor 按 port/url/file/command/capture 自动轮询并恢复继续；不要让 run_cmd 前台硬等。复杂只读调查覆盖取证、交叉核验、结论边界/不确定性。拿到真实证据后才标 completed，用户取消的步骤保持 cancelled。",
         parameters: {
           type: "object",
           properties: {
@@ -34397,7 +34397,7 @@ function _RESEARCH_PROMPT(focus) {
 // live browser design-extraction during implementation).
 function _DESIGN_RESEARCH_PROMPT(goal) {
   const g = String(goal || "").trim();
-  return _P("design_research_prompt", `研究并规划「{{GOAL}}」的设计方向 + 完整 UI 架构，给主智能体一份可直接实现的「设计 + 架构蓝图」。先 list_dir / read 现有项目，读取 README/package.json/product wiki/docs/src/data/assets/public/screenshots 等真实内容源，定产品事实、品牌、技术栈、可用数据、真实图片/截图/设计稿；**如果 list_dir 已确认工作区根目录为空 / 新项目，就立即停止本地 read/search/find_files，不要猜 package.json、vite.config、src 等旧项目路径；直接把用户描述当产品事实来源，必要时继续做外部设计/包/GitHub 调研。**用户随消息附上的截图/图片/视频要当目标视觉或缺陷证据，按图中真实布局、文字、裁切、溢出、间距和素材内容规划，不要套行业模板。缺设计参考时首选 web_fetch styles.refero.design 的 style 页（或 web_search "site:styles.refero.design 品类"）拿一线产品的完整色板/字阶/用途描述当真实依据，其次 web_search 一流产品或官方文档，并标注哪些是事实、哪些是参考。规划页面 / 区块结构 / 真实文案来源、真实素材使用方案（缺素材才 generate_image/picsum 且标明占位）、shadcn/ui + Radix primitives 组件映射（Button/Card/Dialog/Tabs/Accordion/Progress 等按需选，不要裸造控件）、Tailwind palette/theme.extend/CSS variables 设计 tokens(配色含 hex / 字阶 / 间距 / 圆角 / 阴影)、布局与响应式、关键状态、动效、无障碍。技术取向固定为 Michael Design 那套：Vite + React 19 + TypeScript + Tailwind v4(@tailwindcss/vite，CSS-first，不建 tailwind.config) + shadcn/ui(Radix + CVA + clsx + tailwind-merge 的 cn() + lucide-react)；静态站 / 落地页 / 单页 / 简单 demo 也一律用这套脚手架，不要换 Vue/Next/Nuxt/SvelteKit。最后输出随问题动态组织的蓝图。`).replace(/\{\{GOAL\}\}/g, g || "这个网站 / 界面");
+  return _P("design_research_prompt", `研究并规划「{{GOAL}}」的设计方向 + 完整 UI 架构，给主智能体一份可直接实现的「设计 + 架构蓝图」。先 list_dir / read 现有项目，读取 README/package.json/product wiki/docs/src/data/assets/public/screenshots 等真实内容源，定产品事实、品牌、技术栈、可用数据、真实图片/截图/设计稿；**如果 list_dir 已确认工作区根目录为空 / 新项目，就立即停止本地 read/search/find_files，不要猜 package.json、vite.config、src 等旧项目路径；直接把用户描述当产品事实来源，必要时继续做外部设计/包/GitHub 调研。**用户随消息附上的截图/图片/视频要当目标视觉或缺陷证据，按图中真实布局、文字、裁切、溢出、间距和素材内容规划，不要套行业模板。缺设计参考时首选 web_fetch styles.refero.design 的 style 页（或 web_search "site:styles.refero.design 品类"）拿一线产品的完整色板/字阶/用途描述当真实依据，其次 web_search 一流产品或官方文档，并标注哪些是事实、哪些是参考。规划页面 / 区块结构 / 真实文案来源、真实素材使用方案（缺素材才 generate_image/picsum 且标明占位）、shadcn/ui + Radix primitives 组件映射（Button/Card/Dialog/Tabs/Accordion/Progress 等按需选，不要裸造控件）、Tailwind 语义令牌（v4：CSS 入口 @theme inline 注册 --color-*/--font-*/--radius-*，不是 v3 的 theme.extend） 设计 tokens(配色含 hex / 字阶 / 间距 / 圆角 / 阴影)、布局与响应式、关键状态、动效、无障碍。技术取向固定为 Michael Design 那套：Vite + React 19 + TypeScript + Tailwind v4(@tailwindcss/vite，CSS-first，不建 tailwind.config) + shadcn/ui(Radix + CVA + clsx + tailwind-merge 的 cn() + lucide-react)；静态站 / 落地页 / 单页 / 简单 demo 也一律用这套脚手架，不要换 Vue/Next/Nuxt/SvelteKit。最后输出随问题动态组织的蓝图。`).replace(/\{\{GOAL\}\}/g, g || "这个网站 / 界面");
 }
 
 // generate_wiki（DeepWiki 式）：把代码库/产品自动摸透成一份结构化「产品 Wiki」Markdown 落盘复用，
@@ -35677,7 +35677,10 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (p.ui || p.uiProject) {
     lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用户直接给出的链接、文案、名称、业务对象和限制就是第一事实来源，先逐条保留并在计划中落到对应区块，不能用默认品类猜测覆盖它。任何网站/UI 项目在第一次视觉实现前都必须取得 michael-design 三轨证据，把命中的结构、组件体系、素材 URL、动效参数和视觉令牌落进实现。用项目现有组件优先，shadcn/ui + Radix 只承担 Button/Dialog/Tabs/Accordion 等交互 primitive，不把每个区块都套 Card；Tailwind palette/theme token 统一配色，并建立中性族+主强调族+可选辅助族的全页契约，任何 section 不得突然硬编码陌生色相。卡片按真实数量选择 2/3/4 列、跨列和末行平衡；图标先理解对象/动作/状态，再映射 Bot/Mail/Shield/Chart 等具体语义，禁止 Sparkles/Wand 万能代替。构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
     if (p.designKnowledgeRequired) lines.push("michael-design 主编排律：IDE 首轮前固定完成三条主题检索，不能压成一条泛 query：① 业务信息架构、视觉样式、字阶/间距/圆角/阴影、shadcn/Radix 组件变体、Tailwind 配色和响应式网格；② 标志性滚动/状态动效、移动端参数与 prefers-reduced-motion；③ 真实媒体、头像、语义图标和卡片 surface。优先直接采用已注入证据，只有覆盖缺口才追加 knowledge_search；每条命中都记录来源 section、采用项、弃用项和实际落点，并形成“section → primitive/variant → Tailwind token/class → 页面落点”的映射。动效从知识库选彼此兼容的一组，禁止只写 fade-up 或把所有特效硬堆到一页。");
-    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：" + _MD_STACK_RULE + "并按 section/component/data 拆分；禁止退化成单个通用 index.html。用户明确要求原生 HTML 时才例外。已有项目一律按上面的「何时不用这套」处理：保留原栈、只搬令牌与组件语义，绝不迁移。");
+    // Every UI turn, not just greenfield. The rule itself branches on greenfield vs
+    // existing, and the turn AFTER the agent creates the first file is exactly when it
+    // used to disappear — i.e. precisely when it was being disobeyed.
+    lines.push((p.fromZeroUiProject ? "从零网站技术栈律：" : "技术栈律：") + _MD_STACK_RULE + "并按 section/component/data 拆分；禁止退化成单个通用 index.html。用户明确要求原生 HTML 时才例外。已有项目一律按上面的「何时不用这套」处理：保留原栈、只搬令牌与组件语义，绝不迁移。");
     if (p.fullWebsite) lines.push("完整网站决策律：先按业务品类推导栏目与用户旅程，区块由真实旅程决定、逐块写满具体文案，禁止默认 Hero/Features/Pricing/CTA/Footer 套路，也禁止按固定区块数配额凑数；真实图片、视频或 GIF 必须成为内容的一部分。编码前明确数据库选择：不需要、本地持久化或服务端数据库，写出理由；需要账户、跨设备数据、后台管理、订单/预约/评论等持久业务时不能只做静态假界面，不需要时也不要为了显得复杂硬加数据库。");
     if (p.fullWebsite) lines.push("网站内容取证律：视觉实现前必须取得并记录一条真实内容证据，优先级为：工作区 README/产品文档/素材与既有文案 → 已知品牌的官方主站用 web_fetch 读正文 → generate_wiki 从当前代码提取真实功能 → 同品类公开资料只用于结构与事实核对。没有可验证产品事实时，先写 PRODUCT_BRIEF.md，明确“原创内容/假设/待确认”，再以这些边界写文案；不把搜索标题、竞品措辞或通用 AI 口号伪装成产品事实。");
     if (p.motionDesignRequired) lines.push("响应式动效律：至少规划微交互、分区入场、滚动叙事/状态转场三层节奏；高级方案必须写清知识库来源、目标区块、时间线/滚动进度、参数和移动端降级，不能把一个孤立 useScroll 或 clip-path 当全站高级动效。桌面与移动分别调整距离、节奏、并发和触发方式，并实现 prefers-reduced-motion/useReducedMotion。");
@@ -35861,9 +35864,14 @@ function _uiDesignCraftBlock(text, profile = null, opts = {}) {
   // michael-design 各层（design_system/components/content/motion，走缓存 0.1 倍价）高度
   // 重叠。L0 开启且语义旗标头已送达（服务端必然装配设计层）时只留锚点与客户端
   // 独有细则；裁决缺席或第三方直连（没人注入）时仍全量兑底——零回退：宁重复不缺席。
+  // The stack rule is NOT one of the michael-design design layers — it is a client-side fact
+  // about the owner's own repo — so it must survive the token slimming. A few hundred tokens
+  // against a ~4K block; trading it away is how a UI turn ends up with no stack instruction at
+  // all when the server layers are stale, undeployed, or simply not loaded this turn.
+  const stackRule = (p.ui || p.uiProject) ? "\n- 技术栈硬约束：" + _MD_STACK_RULE : "";
   if (opts.serverDesignLayersActive) {
     return "\n\n【设计执行】严格按系统提示词中 michael-design 各层（信息架构/配色/组件/布局/动效/媒体/验收）执行，那是本项目设计纪律的唯一完整版本；本地不再重复。**兜底：若系统提示词里并未出现这些设计层（网关注入缺失），必须先成功调用 `knowledge_search(domain=\"michael-design\")` 取设计证据再写，绝不凭记忆糊 UI。**"
-      + _uiDesignReferenceRule(p) + _uiDesignTransactionalRule(p);
+      + stackRule + _uiDesignReferenceRule(p) + _uiDesignTransactionalRule(p);
   }
   const referenceRule = _uiDesignReferenceRule(p);
   const transactionalRule = _uiDesignTransactionalRule(p);
@@ -42276,7 +42284,7 @@ async function _searchKnowledgeBase(call) {
       type: "knowledge",
       path: call.query,
       knowledge: { hitCount: hits.length, domains },
-      content: `📚 专业知识库「${call.query}」${call.domain ? ` [${call.domain}]` : ""} 检索到 ${hits.length} 段最佳实践，**照这个来做**：${domains.includes("michael-design") ? "\n（配色约束：命中正文里的 Hex/OKLCH 是参考定义值，采用前必须折算成最接近的 Tailwind 族+档；计划/叙述/业务代码禁裸 hex；跨品类命中只借结构/动效不借配色；未明确要求暗色时根背景浅色中性档。）" : ""}\n\n${body}`,
+      content: `📚 专业知识库「${call.query}」${call.domain ? ` [${call.domain}]` : ""} 检索到 ${hits.length} 段最佳实践：**视觉判断（布局/密度/配色关系/动效/文案气质）照这个来做**${domains.includes("michael-design") ? "\n（**构建配置不要照抄**：下面的正文是 Tailwind v3 时期写的，出现 tailwind.config.js/ts、theme.extend、@tailwind base/components/utilities、postcss.config.js、autoprefixer、tailwindcss-animate、content:[...] 一律**不要建也不要装**。本项目是 Tailwind v4 CSS-first，按这样翻译：三行 @tailwind 指令 → 一行 `@import \"tailwindcss\";`；theme.extend 的 colors/fontFamily/borderRadius → CSS 入口 `@theme inline` 里的 --color-* / --font-* / --radius-*（嵌套色名拍平成 --color-a-b）；darkMode:[\"class\"] → `@custom-variant dark (&:is(.dark *));`；content globs 和 postcss 链 → v4 不需要。）\n（配色约束：命中正文里的 Hex/OKLCH 是参考定义值，采用前必须折算成最接近的 Tailwind 族+档；计划/叙述/业务代码禁裸 hex；跨品类命中只借结构/动效不借配色；未明确要求暗色时根背景浅色中性档。）" : ""}\n\n${body}`,
     };
   } catch (error) {
     const message = String(error?.name === "AbortError" ? "请求超时" : (error?.message || error)).slice(0, 200);
