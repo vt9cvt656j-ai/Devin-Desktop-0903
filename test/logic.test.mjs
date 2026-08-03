@@ -11174,6 +11174,40 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
+test("IDE 必须自己先跑验证，而不是催模型/催用户", () => {
+  // 用户的原话：「你写了代码却不自己跑测试？要用户手动测？」根因是顺序：
+  // IDE 自带的验证块（注释里明写「不是回头催用户/催模型」）被放在 codeVerify 提醒
+  // 之后，而那个提醒 continue，于是 IDE 先催三轮才第一次自己跑 tsc。
+  const loop = SRC.slice(SRC.indexOf("// A — 自动验证"), SRC.indexOf("// A — 自动验证") + 200);
+  assert.ok(loop, "自动验证块必须存在");
+  const autoAt = SRC.indexOf("// A — 自动验证");
+  // 注意：有两处「交付前自验证门」注释（一处是静默收尾门），要锚在真正的 nudge 上
+  const nudgeAt = SRC.indexOf("if (_codeDeliveredUnverified && codeVerifyNudges < 3");
+  assert.ok(autoAt > 0 && nudgeAt > 0, "两个块都必须存在");
+  assert.ok(autoAt < nudgeAt,
+    "IDE 自己跑检查必须排在催模型之前——顺序反了就等于「写完不自测」");
+
+  // 守门条件不得再依赖模型自报的 purpose:"verify"（run_cmd("ls", purpose:"verify") 曾能顶掉真检查）
+  const block = SRC.slice(autoAt, nudgeAt);
+  assert.doesNotMatch(block, /_evidenceCertifies\(e, _implOps\)/,
+    "自动验证的守门不得依赖模型自报的 purpose——那是可以随口编的");
+  assert.match(block, /!_runtimeEffects\.has\("build"\) && !_runtimeEffects\.has\("test"\)/,
+    "必须以真实跑过并退出 0 的运行事实为准");
+
+  // 红构建时必须把真实编译错误交给模型，而不是空的错误体
+  const rav = extractFn("_runApprovedVerification");
+  assert.match(rav, /stderr: result\.stderr \?\? result\.report \?\? ""/,
+    "IDE 自跑验证失败时必须把编译输出放进 stderr——修复循环读的是 stderr");
+
+  // 没验证就交付，必须在结果卡里如实告诉用户
+  // 静默收尾不得在 IDE 自己的验证器还有额度时就放行
+  assert.match(SRC, /codeVerifyNudges >= 3 && \(_verifyExhausted \|\| verifyRuns >= 3\)/,
+    "未验证交付要收尾，必须先确认 IDE 自己的检查已经跑过或跑不动");
+  const label = extractFn("_agentIncompleteLabel");
+  assert.match(label, /code_delivered_unverified:/,
+    "未验证交付必须有用户可见的说明，不能只是静默完成");
+});
+
 test("技术栈规则必须真的送达模型——每个 UI 轮次，包括网关设计层在场时", () => {
   // 上一版的教训：规则写好了却送不到。_uiDesignCraftBlock 在网关设计层在场时会提前
   // return 省 token，而承载栈规则的 greenfieldRule 在 return 之后才拼装；同时另一个

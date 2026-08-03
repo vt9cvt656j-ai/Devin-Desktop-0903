@@ -27916,6 +27916,9 @@ function _agentIncompleteLabel(reason, hitCap = false) {
   const labels = {
     required_mutation_missing: "用户要求的真实副作用还没全部发生",
     semantic_runtime_review_missing: "真实运行结果尚未完成语义核验，不能确认用户目标已经实现",
+    // Without this entry a run that wrote code and never compiled it rendered an outcome card
+    // listing the files with no warning at all — the user had no way to know it was unchecked.
+    code_delivered_unverified: "代码已写入但**没有通过编译/测试验证**（本项目没探测到可用的检查命令，或检查没跑成功）——请先跑一次构建/测试再当作可用",
     // 步数延展/硬顶已拆除：flailing/stalled/extension_limit/ceiling 标签随之删除，
     // 仅剩 token 预算钳位一种 cap 来源（用户自设，收尾文案走 fallback）。
   };
@@ -38023,7 +38026,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         if (quietTurns >= _quietExitAt && !pending
           && (!_missingResearch.length || researchNudges >= 2)
           && (!_missingRequiredEffect || effectNudges >= 2)
-          && (!_codeDeliveredUnverified || codeVerifyNudges >= 3)) {
+          // Not nudge-count alone: the IDE must have actually TRIED to verify. Otherwise a
+          // run closes unverified while its own detected check command was never run.
+          && (!_codeDeliveredUnverified
+              || (codeVerifyNudges >= 3 && (_verifyExhausted || verifyRuns >= 3)))) {
           if (Array.isArray(session._steerQueue) && session._steerQueue.length && _live()) continue;
           if (_missingRequiredEffect && !run._incompleteReason) run._incompleteReason = `required_effect_missing:${_missingEffects.join(",")}`;
           if (_missingResearch.length && !run._incompleteReason) run._incompleteReason = `research_evidence_missing:${_missingResearch.join(",")}`;
@@ -38190,6 +38196,56 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           _pushNudge("effect", `这项请求要求产生真实结果，但仍缺：${targetInstruction}。逐项使用对应工具完成并检查真实退出状态/持续进程/远端返回；编辑文件、echo 文本或其他类别的成功不能替代这些义务。若确实无法执行，收尾必须明确未完成项，不能只说“已经好了”。`);
           continue;
         }
+        // 顺序即语义：IDE 先自己跑真实检查命令，跑不动才轮到催模型。此前这一整块在
+        // 下面的 codeVerify 提醒之后，而那个提醒 `continue`，于是 IDE 会先催模型三轮
+        // 才第一次自己跑 tsc——用户看到的就是「写完代码不自测，让我手动测」。
+        // A — 自动验证：改了源码却没有验证证据时，IDE 自己把项目的真实检查命令跑掉，
+        // 不是回头催用户/催模型。命令来自 _detectVerifyCmd（按项目栈探测 + 存在性过滤，
+        // 探不到就什么都不做），退出码即结论：绿了直接记学分并清掉诊断，红了把真实
+        // stderr 交给上面的红构建循环去修。有界（verifyRuns < 3）防止在修不好的项目上空转。
+        if (didMutate && !_verifyExhausted && verifyRuns < 3 && _live()
+            && _verifiedAtImplOps < _implOps
+            // Deliberately NOT _evidenceCertifies here: that is satisfied by the model's own
+            // purpose:"verify" declaration, so `run_cmd("ls", purpose:"verify")` used to skip
+            // the IDE's real check entirely. _runtimeEffects is recorded from what actually
+            // ran and exited zero, which the model cannot fabricate.
+            && !_runtimeEffects.has("build") && !_runtimeEffects.has("test")) {
+          let _autoCmd = null;
+          try { _autoCmd = await _detectVerifyCmd(root, run.stack); } catch { _autoCmd = null; }
+          if (_autoCmd) {
+            verifyRuns++;
+            let _autoRes = null;
+            try { _autoRes = await _runApprovedVerification(root, _autoCmd, run); }
+            catch (e) { _autoRes = { code: 1, stderr: String(e?.message || e) }; }
+            const _autoCall = { type: "cmd", command: _autoCmd, purpose: "verify" };
+            const _autoEv = _executionEvidenceFromTool(_autoCall, _autoRes || {}, root);
+            if (run && _autoEv) {
+              run._executionEvidence.push({
+                ..._autoEv,
+                purpose: "verify",
+                implementationVersion: _implOps,
+                ok: _toolExecutionSucceeded(_autoCall, _autoRes || {}),
+              });
+              if (run._executionEvidence.length > 12) run._executionEvidence.shift();
+            }
+            // 退出 127 = 命令不存在，不是代码坏了。这正是当初拆掉强制验证的原因：
+            // 机器上没装 ruff/pytest，门禁却把 127 写成「验证失败」，还据此结束了本可
+            // 继续修的一轮。存在性过滤已在 _detectVerifyCmd 里治本，这里再兜一层：
+            // 验证器跑不起来就当本项目没有自动验证器，绝不记成失败、绝不驱动修复循环。
+            const _code = Number(_autoRes?.code ?? _autoRes?.exitCode);
+            if (_code === 127) {
+              if (run && Array.isArray(run._executionEvidence)) run._executionEvidence.pop();
+              _verifyExhausted = true;
+              continue;
+            }
+            if (_toolExecutionSucceeded(_autoCall, _autoRes || {})) {
+              didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
+              run._diagnosticBlock = "";
+            }
+            continue; // let the red-build loop below see a real failure and drive the fix
+          }
+          _verifyExhausted = true; // no detectable checker in this project — stop trying
+        }
         // 交付前自验证门：改了源码却零验证证据 → 要求先实际运行验证再收尾（最多 3 轮，
         // 之后如实记未完成）。这是“交付即报错/跑不起来”的机制层根治：不靠提示词唠叨，
         // 靠“没验证证据就不放行收尾”的硬事实门。get_diagnostics/构建/测试/运行任一都算。
@@ -38241,50 +38297,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
               run._diagnosticBlock = ""; // clean tree — nothing to block on
             }
           }
-        }
-        // A — 自动验证：改了源码却没有验证证据时，IDE 自己把项目的真实检查命令跑掉，
-        // 不是回头催用户/催模型。命令来自 _detectVerifyCmd（按项目栈探测 + 存在性过滤，
-        // 探不到就什么都不做），退出码即结论：绿了直接记学分并清掉诊断，红了把真实
-        // stderr 交给上面的红构建循环去修。有界（verifyRuns < 3）防止在修不好的项目上空转。
-        if (didMutate && !_verifyExhausted && verifyRuns < 3 && _live()
-            && _verifiedAtImplOps < _implOps
-            && !(Array.isArray(run._executionEvidence)
-                 && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)))) {
-          let _autoCmd = null;
-          try { _autoCmd = await _detectVerifyCmd(root, run.stack); } catch { _autoCmd = null; }
-          if (_autoCmd) {
-            verifyRuns++;
-            let _autoRes = null;
-            try { _autoRes = await _runApprovedVerification(root, _autoCmd, run); }
-            catch (e) { _autoRes = { code: 1, stderr: String(e?.message || e) }; }
-            const _autoCall = { type: "cmd", command: _autoCmd, purpose: "verify" };
-            const _autoEv = _executionEvidenceFromTool(_autoCall, _autoRes || {}, root);
-            if (run && _autoEv) {
-              run._executionEvidence.push({
-                ..._autoEv,
-                purpose: "verify",
-                implementationVersion: _implOps,
-                ok: _toolExecutionSucceeded(_autoCall, _autoRes || {}),
-              });
-              if (run._executionEvidence.length > 12) run._executionEvidence.shift();
-            }
-            // 退出 127 = 命令不存在，不是代码坏了。这正是当初拆掉强制验证的原因：
-            // 机器上没装 ruff/pytest，门禁却把 127 写成「验证失败」，还据此结束了本可
-            // 继续修的一轮。存在性过滤已在 _detectVerifyCmd 里治本，这里再兜一层：
-            // 验证器跑不起来就当本项目没有自动验证器，绝不记成失败、绝不驱动修复循环。
-            const _code = Number(_autoRes?.code ?? _autoRes?.exitCode);
-            if (_code === 127) {
-              if (run && Array.isArray(run._executionEvidence)) run._executionEvidence.pop();
-              _verifyExhausted = true;
-              continue;
-            }
-            if (_toolExecutionSucceeded(_autoCall, _autoRes || {})) {
-              didVerify = true; verificationPassed = true; _verifiedAtImplOps = _implOps;
-              run._diagnosticBlock = "";
-            }
-            continue; // let the red-build loop below see a real failure and drive the fix
-          }
-          _verifyExhausted = true; // no detectable checker in this project — stop trying
         }
         if (run._diagnosticBlock && _live()) {
           // LSP 诊断过期机制：防止陈旧诊断永久卡死收尾。
@@ -51016,7 +51028,11 @@ async function _interleavedTest(root, testCmd) {
 async function _runApprovedVerification(root, command, run) {
   const call = { type: "cmd", command: String(command || "") };
   const result = await _interleavedTest(root, call.command);
-  return { ...result, verification: true };
+  // stderr, not just report: the red-build fix loop reads e.stderr. Returning the compiler
+  // output only under `report` meant every IDE-run failure reached the model as an empty
+  // error body — "the build failed, here are the errors:" followed by nothing. The green
+  // path is unchanged (report is "" on success, so stderr stays "").
+  return { ...result, stderr: result.stderr ?? result.report ?? "", verification: true };
 }
 
 // Run a task non-interactively, capture its output, parse it through the
