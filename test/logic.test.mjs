@@ -17850,3 +17850,64 @@ test("cold context snapshot builds the real digest before the warming-up fallbac
   // Empty workspace still short-circuits — there is nothing to build.
   assert.match(fn, /if \(!_topEmpty\) \{/, "an empty workspace must not attempt a digest build");
 });
+
+// ---------------------------------------------------------------------------
+// Capture-before-mutate: a shell command's file changes become reversible.
+//
+// Reported: the agent ran `cd config && for f in *.json; do mv "$f" "${f%.json}.enc"`,
+// renamed config files the program needs, then hand-authored a reverse mv to recover. The
+// write/edit/move TOOLS are checkpointed into the run's revert-all; a run_cmd was not — the
+// exact gap Cursor/Aider document. _cmdUndoPlan is the pure diff core that turns a
+// before/after scope snapshot + the watcher's observed paths into exact restore steps. No
+// gate, no UI — the command runs identically; only the mistake gets cheaper.
+// ---------------------------------------------------------------------------
+test("_cmdUndoPlan reverses the reported bulk rename exactly", () => {
+  const plan = load("_cmdUndoPlan");
+  const pre = new Map([["/w/config/a.json", "X"], ["/w/config/b.json", "Y"]]);
+  const post = new Map([["/w/config/a.enc", "X"], ["/w/config/b.enc", "Y"]]);
+  const changed = ["/w/config/a.json", "/w/config/a.enc", "/w/config/b.json", "/w/config/b.enc"];
+  const steps = plan(pre, changed, post);
+  const by = Object.fromEntries(steps.map((s) => [s.path, s]));
+  // Recreate the .json originals from their captured content…
+  assert.equal(by["/w/config/a.json"].op, "restore");
+  assert.equal(by["/w/config/a.json"].existedBefore, true);
+  assert.equal(by["/w/config/a.json"].contentBefore, "X");
+  assert.equal(by["/w/config/a.json"].contentAfter, null);
+  // …and remove the .enc files the rename created (content-matched, never a blind delete).
+  assert.equal(by["/w/config/a.enc"].op, "delete");
+  assert.equal(by["/w/config/a.enc"].existedBefore, false);
+  assert.equal(by["/w/config/a.enc"].contentAfter, "X");
+});
+
+test("_cmdUndoPlan handles delete, overwrite, and refuses the un-snapshotted", () => {
+  const plan = load("_cmdUndoPlan");
+  // rm f → recreate from pre-content
+  assert.deepEqual(plan(new Map([["/w/f", "keep"]]), ["/w/f"], new Map()),
+    [{ path: "/w/f", existedBefore: true, contentBefore: "keep", contentAfter: null, op: "restore" }]);
+  // overwrite in place → rewrite the old content back
+  assert.equal(plan(new Map([["/w/f", "old"]]), ["/w/f"], new Map([["/w/f", "new"]]))[0].op, "rewrite");
+  // unchanged content → no step (the command touched it but it is identical)
+  assert.equal(plan(new Map([["/w/f", "s"]]), ["/w/f"], new Map([["/w/f", "s"]])).length, 0);
+  // a path in NEITHER snapshot (outside captured scope) is never reversed — can't guess.
+  assert.equal(plan(new Map(), ["/w/outside"], new Map()).length, 0);
+  // no observed changes → empty plan, so a stale watcher can never fabricate an undo.
+  assert.equal(plan(new Map([["/w/f", "x"]]), [], new Map([["/w/f", "y"]])).length, 0);
+  // duplicate paths are de-duped.
+  assert.equal(plan(new Map([["/w/f", "a"]]), ["/w/f", "/w/f"], new Map()).length, 1);
+});
+
+test("shell mutations are captured into the run checkpoint, bounded, never gated", () => {
+  const branch = SRC.slice(SRC.indexOf('const _cmdMayMutate = call.purpose === "mutate"'));
+  const region = branch.slice(0, 2500);
+  // Keyed on DECLARATION or the existing risk class — not a new keyword gate.
+  assert.match(region, /call\.purpose === "mutate" \|\| _commandRiskKind\(call\.command\) === "workspace-write"/);
+  // Pre-snapshot before the command, post-diff after, registered into the SAME checkpoint.
+  assert.match(SRC, /_preCmdSnap = await _snapshotCmdScope\(root \|\| rootPath\)/);
+  assert.match(SRC, /_cmdUndoPlan\(_preCmdSnap\.files, _fsSeen\.paths, _postSnap\.files\)/);
+  assert.match(SRC, /_checkpointRecord\(_cp, s\.path, s\.existedBefore, s\.contentBefore\)/);
+  // Never blocks execution; a too-large scope degrades to an observed-fact note.
+  assert.match(SRC, /_preCmdSnap\.truncated[\s\S]{0,400}未快照·作用域大/);
+  // The bound exists so ordinary work stays cheap and node_modules is never read.
+  assert.match(SRC, /_CMD_SNAPSHOT_MAX_FILES = 200/);
+  assert.match(SRC, /_CMD_SNAPSHOT_MAX_BYTES = 2 \* 1024 \* 1024/);
+});
