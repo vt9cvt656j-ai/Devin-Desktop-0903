@@ -33750,9 +33750,16 @@ function _evidenceGradingHint(readPaths, draftText) {
   const DOC_EXT = new Set(["md", "markdown", "mdx", "txt", "rst", "adoc", "org"]);
   const SOURCE_EXT = new Set(["ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "java", "kt", "kts", "rb", "php", "c", "cc", "cpp", "h", "hpp", "cs", "swift", "scala", "m", "mm", "vue", "svelte", "sh", "bash", "zsh", "sql"]);
   const CONFIG_EXT = new Set(["json", "toml", "yaml", "yml", "lock", "gradle", "xml", "ini", "cfg", "conf", "env", "properties"]);
+  // A dependency manifest DESCRIBES the project — it is not the implementation. Reading
+  // Cargo.toml/package.json and then concluding "the project is built with / does X" is
+  // exactly trusting a description instead of the real files. So a manifest counts as a
+  // description (like a doc), NOT as authoritative source/config — reading only manifests
+  // must still push the agent to open actual source before a project/implementation claim.
+  const MANIFEST = new Set(["package.json", "cargo.toml", "go.mod", "go.sum", "pyproject.toml", "requirements.txt", "gemfile", "gemfile.lock", "pom.xml", "build.gradle", "composer.json", "pubspec.yaml", "pipfile"]);
   let sawDoc = false, sawSource = false, sawConfig = false;
   for (const p of paths) {
     const ext = _ext(p), base = _base(p);
+    if (MANIFEST.has(base)) { sawDoc = true; continue; } // a manifest is a description of deps
     if (SOURCE_EXT.has(ext)) { sawSource = true; continue; }
     if (CONFIG_EXT.has(ext) || base === "dockerfile" || base === "makefile") { sawConfig = true; continue; }
     if (DOC_EXT.has(ext) || base === "readme" || base === "license" || base === "changelog" || base === "authors") { sawDoc = true; continue; }
@@ -33768,7 +33775,7 @@ function _evidenceGradingHint(readPaths, draftText) {
   if (!draft.trim()) return "";
   const CONCLUSION = /(这个?项目|本项目|该项目|整个项目|项目的?(是|用|采用|基于|使用|架构|实现|技术栈|框架|结构|功能)|技术栈|架构(设计|上|是|采用|基于)|采用了|基于.{0,8}(框架|构建|开发|实现)|the project|tech stack|built (with|on|using)|implemented (in|with|using)|architecture)/i;
   if (!CONCLUSION.test(draft)) return "";
-  return "⚠️ 证据分级：本轮仅读了文档（.md 可能过期或是随手记），未核对真实源码。下\u201c项目/实现\u201d类结论前请先读相关源文件（read_file/find_symbol/semantic_search）核实；暂将此结论视为低置信、待核验。源码 > 配置 > 文档 > 笔记。";
+  return "⚠️ 证据分级：本轮只读了文档/清单（.md 可能过期；package.json·Cargo.toml 这类清单只描述依赖，不是实现本身），没核对真实源码。下\u201c项目/实现\u201d类结论前先读相关源文件（read_file/find_symbol/semantic_search）核实；暂将此结论视为低置信、待核验。源码 > 配置 > 文档/清单。";
 }
 // === ANTI-HALLUCINATION Protocol-C 变体：结论前须先摸清项目结构 ===
 // 痛点：AI 被问"这个项目是干嘛的"，只读了 3 个文件就敢输出完整项目总结，没先 list_dir 摸清真实结构。
