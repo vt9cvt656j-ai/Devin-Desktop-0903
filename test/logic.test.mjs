@@ -7429,7 +7429,7 @@ test("structured semantic profiles drive planning without lexical classification
   assert.match(SRC, /复杂工程写入计划要像老手执行清单/);
   assert.match(SRC, /UI\/官网\/落地页\/从零前端项目要覆盖/);
   assert.match(SRC, /shadcn\/ui \+ Radix primitives/);
-  assert.match(SRC, /Tailwind palette\/theme\.extend\/CSS variables/);
+  assert.match(SRC, /Tailwind 语义令牌（v4：CSS 入口 @theme inline/);
   assert.match(SRC, /真实内容源/);
   assert.match(SRC, /Bug\/调试修复必须像老手查案/);
   assert.match(SRC, /同一失败路径或聚焦回归测试/);
@@ -11158,7 +11158,7 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
   assert.ok(!rule.includes("sonner"), "sonner 是真实站点里的死依赖（零 import），不得写进标准栈");
 
   // 各处必须引用同一份，不再各说各话
-  for (const site of ["从零网站技术栈律：\" + _MD_STACK_RULE", "从零网站技术栈硬约束：\" + _MD_STACK_RULE",
+  for (const site of ["从零网站技术栈律：\" : \"技术栈律：\") + _MD_STACK_RULE", "从零网站技术栈硬约束：\" + _MD_STACK_RULE",
                       "- ${_MD_STACK_RULE}"]) {
     assert.ok(SRC.includes(site.replace('\\"', '"')) || SRC.includes(site),
       `声明点必须引用权威常量而不是自己复述一遍：${site}`);
@@ -11172,6 +11172,65 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
   // 声明与执行必须一致：web_scaffold 默认框架
   assert.match(SRC, /framework: String\(args\.framework \|\| "react"\)/,
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
+});
+
+test("技术栈规则必须真的送达模型——每个 UI 轮次，包括网关设计层在场时", () => {
+  // 上一版的教训：规则写好了却送不到。_uiDesignCraftBlock 在网关设计层在场时会提前
+  // return 省 token，而承载栈规则的 greenfieldRule 在 return 之后才拼装；同时另一个
+  // 承载点只在 greenfield 时触发，于是 agent 建完第一个文件之后就再也收不到。
+  // 这个测试不看源码文本，直接跑真实函数看输出里有没有栈规则。
+  const STACK = "[[MD_STACK_SENTINEL]]";
+  const craft = load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: STACK,
+    _uiDesignReferenceRule: () => "",
+    _uiDesignTransactionalRule: () => "",
+    _uiStructuralSignal: () => "",
+  });
+  const mkFrame = (profile) => load("_agentDecisionFrameBlock", {
+    _MD_STACK_RULE: STACK,
+    _engineeringProfileWithAiIntent: () => profile,
+    _agentBugEvidenceLadderBlock: () => "",
+    _agentIntentExecutionBlock: () => "",
+    _uiStructuralSignal: () => "",
+  });
+
+  // ① 网关设计层在场（默认安装的常态）——省 token 也不能把栈规则省掉
+  const lean = craft("做个官网", { ui: true, uiProject: true, fromZeroUiProject: true },
+    { serverDesignLayersActive: true });
+  assert.ok(lean.includes(STACK), "精简分支必须仍然带栈规则——这正是上一版丢失的地方");
+
+  // ② 完整分支同样带
+  const full = craft("做个官网", { ui: true, uiProject: true, fromZeroUiProject: true },
+    { serverDesignLayersActive: false });
+  assert.ok(full.includes(STACK), "完整分支必须带栈规则");
+
+  // ③ 决策框架：greenfield 与「已有项目」都要带——agent 写完第一个文件后就不再是
+  //    greenfield，而那正是它开始违反规则的时刻
+  const green = mkFrame({ ui: true, uiProject: true, fromZeroUiProject: true })("做个官网");
+  assert.ok(green.includes(STACK), "greenfield 轮必须带栈规则");
+  const existing = mkFrame({ ui: true, uiProject: true, fromZeroUiProject: false })("继续完善这个官网");
+  assert.ok(existing.includes(STACK),
+    "已有项目的 UI 轮同样必须带栈规则——否则第二轮起就没人管它用什么栈了");
+
+  // ④ 非 UI 轮不应该被塞进来
+  const backend = craft("修后端接口", { ui: false, uiProject: false }, { serverDesignLayersActive: true });
+  assert.ok(!backend.includes(STACK), "非 UI 轮不注入栈规则");
+});
+
+test("知识库检索结果必须把 v3 蓝本翻译成 v4，而不是让模型照抄", () => {
+  // 真正的成因：模型自己调 knowledge_search，IDE 把 3 段 Tailwind v3 蓝本原样回灌，
+  // 还写着「照这个来做」。三份可复制粘贴的 tailwind.config.js 例子会压过提示词里
+  // 一句禁令——模型于是建了 postcss.config.js + tailwind.config.js。
+  const i = SRC.indexOf("📚 专业知识库");
+  assert.ok(i > 0, "知识库结果格式化位置必须存在");
+  const block = SRC.slice(i, i + 1400);
+  assert.match(block, /构建配置不要照抄/, "必须明确告诉模型构建配置不能照抄");
+  assert.match(block, /@theme inline/, "必须给出 v4 的等价写法");
+  assert.ok(block.includes("tailwind.config") && block.includes("postcss"),
+    "必须点名 v3 里会出现、但本栈禁止的那些文件");
+  // 「照这个来做」只能适用于视觉判断，不能笼统适用于全部内容
+  assert.match(block, /视觉判断（[^）]*）照这个来做/,
+    "「照这个来做」必须限定在视觉判断上，构建配置另有规矩");
 });
 
 test("别的栈只搬令牌，绝不把项目迁成 React", () => {
