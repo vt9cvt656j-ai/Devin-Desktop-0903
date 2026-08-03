@@ -988,7 +988,7 @@ function mockBackend() {
       id: "michael.eslint",
       name: "ESLint",
       version: "4.2.1",
-      description: "Integrates ESLint into Michael IDE. Highlights problems in your code and offers quick-fix actions.",
+      description: "Integrates ESLint into Mr.day One. Highlights problems in your code and offers quick-fix actions.",
       author: "Microsoft",
       download_url: "https://example.com/eslint.zip",
       tags: ["linter", "javascript", "typescript"],
@@ -1381,7 +1381,7 @@ function mockBackend() {
       return `${hash} ${msg}`;
     },
     gitPush: async (_root) => "Everything up-to-date (preview mock).",
-    gitClone: async () => { throw new Error("Git clone requires the native Michael IDE app."); },
+    gitClone: async () => { throw new Error("Git clone requires the native Mr.day One app."); },
     gitBranches: async (_root) => ({ current: GIT_BRANCH, branches: [...GIT_BRANCHES] }),
     gitCheckout: async (_root, branch, create) => {
       const name = (branch || "").trim();
@@ -1414,7 +1414,7 @@ function mockBackend() {
     gitStash: async () => {
       if (!GIT_CHANGES.length && !GIT_STASHES.length) return "No local changes to stash.";
       const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-      GIT_STASHES.unshift(`stash@{0}: On main: Michael IDE stash (${ts})`);
+      GIT_STASHES.unshift(`stash@{0}: On main: Mr.day One stash (${ts})`);
       return GIT_STASHES[0];
     },
     gitStashList: async () =>
@@ -1553,7 +1553,7 @@ function mockBackend() {
       mockTerms.set(id, { onEvent, line: "", cwd });
       const send = (s) => onEvent({ kind: "data", data: s });
       setTimeout(() => {
-        send("Michael IDE terminal \x1b[2m(preview mock)\x1b[0m\r\n");
+        send("Mr.day One terminal \x1b[2m(preview mock)\x1b[0m\r\n");
         send("\x1b[2mSimulated shell — the native app runs your real shell via a PTY. Type 'help'.\x1b[0m\r\n\r\n");
         send(mockPrompt(cwd));
       }, 20);
@@ -3874,7 +3874,7 @@ function activate(path) {
   saveBtn.disabled = !f.dirty;
   if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf || f.isInspection);
   const projectLabel = rootPath ? basename(rootPath) : "";
-  $("windowTitle") && _setWindowTitle(f.name + (projectLabel ? " — " + projectLabel : "") + " — Michael IDE");
+  $("windowTitle") && _setWindowTitle(f.name + (projectLabel ? " — " + projectLabel : "") + " — Mr.day One");
   if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
     renderBreakpointDecorations();
@@ -7242,7 +7242,7 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
       hideMarkdownPreview();
       saveBtn.disabled = true;
       if (runBtn) runBtn.disabled = true;
-      const idleTitle = rootPath ? basename(rootPath) + " — Michael IDE" : "Michael IDE";
+      const idleTitle = rootPath ? basename(rootPath) + " — Mr.day One" : "Mr.day One";
       _setWindowTitle(idleTitle);
       refreshGutter();
     }
@@ -8269,8 +8269,8 @@ function setActiveWorkspaceRoot(path) {
   const titleFile = activePath ? openFiles.get(activePath)?.name : "";
   const project = path ? basename(path) : "";
   _setWindowTitle(project
-    ? (titleFile ? titleFile + " — " : "") + project + " — Michael IDE"
-    : "Michael IDE");
+    ? (titleFile ? titleFile + " — " : "") + project + " — Mr.day One"
+    : "Mr.day One");
 }
 
 async function renderWorkspaceRoots() {
@@ -11548,7 +11548,10 @@ function _modelContextRows(m) {
     const active = !activeMarked && o.value === eff && !(o.locked);
     if (active) activeMarked = true;
     const cls = "mic-think-btn" + (active ? " is-active" : "") + (o.locked ? " mic-ctx-btn--locked" : "");
-    const tip = o.locked ? o.lockHint : (o.native ? `${_tokenExact(o.value)} tokens（模型原生窗口）` : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
+    const tip = o.locked ? o.lockHint
+      : (o.native
+          ? `${_tokenExact(o.value)} tokens（模型原生窗口）${o.beta ? `\n需上游 beta：${o.beta}（账号档位不够时上游会拒绝）` : ""}`
+          : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
     return { kind: o.kind || (o.native ? "native" : "modified"),
       html: `<button type="button" class="${cls}" data-ctx="${o.value}" data-ctx-kind="${o.kind || (o.native ? "native" : "modified")}"${o.locked ? ' data-locked="1"' : ""} title="${_escAttr(tip)}">${_escHtml(o.label)}</button>` };
   });
@@ -11628,11 +11631,18 @@ async function loadBackendModels() {
       const label = it.group || it.provider || "Models";
       const pricing = _catalogModelPricing(it);
       const contextLimit = _catalogModelContextLimit(it);
+      // Every native window this model offers, not just the default. Beta-gated entries carry
+      // the header the gateway must send; the client displays them but never invents one.
+      const contextWindows = Array.isArray(it.context_windows)
+        ? it.context_windows
+            .map((w) => ({ tokens: Math.round(Number(w?.tokens) || 0), beta: w?.beta || null }))
+            .filter((w) => w.tokens > 0)
+        : [];
       (byGroup[label] ||= []).push({
         id: it.model_id, name: it.name || it.model_id, brand: it.provider, meta: "",
         // pricing + blurb for the hover info card (input/output = USD per 1M tokens)
         inPrice: pricing.inPrice, outPrice: pricing.outPrice, flatPrice: pricing.flatPrice, rate: pricing.rate,
-        contextLimit,
+        contextLimit, contextWindows,
         priceSource: it.price_source || it.priceSource || "",
         desc: it.description || "", group: label,
       });
@@ -11963,7 +11973,16 @@ function _ctxChoiceOptions(modelId) {
   const native = _modelContextLimit(modelId);
   const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
   const compress = _gatewayHandlesCompression() && tierMax > 0;
-  const opts = [{ value: native, label: _tokenShort(native), locked: false, native: true, kind: "native" }];
+  // Show EVERY native window the model genuinely offers, not just the default. One entry for
+  // most models; two for Sonnet 4/4.5 (200K default + 1M behind the context-1m beta) and for
+  // Gemini 1.5 Pro (1M/2M). Falls back to the single resolved value when the gateway sent no
+  // list — an older gateway, or a third-party direct connection with no catalogue at all.
+  const listed = (_modelCatalogEntry(modelId)?.contextWindows || []).filter((w) => w.tokens > 0);
+  const natives = listed.length ? listed : [{ tokens: native, beta: null }];
+  const opts = natives.map((w) => ({
+    value: w.tokens, label: _tokenShort(w.tokens), locked: false, native: true, kind: "native",
+    beta: w.beta || null,
+  }));
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
   for (const [name, tokens] of _MC_TIER_OPTIONS) {
@@ -14288,7 +14307,7 @@ async function _openNewWindow() {
     const label = "win-" + Date.now().toString(36);
     const w = new WebviewWindow(label, {
       url: "index.html?w=sub",
-      title: "Michael IDE",
+      title: "Mr.day One",
       width: 1180, height: 760, minWidth: 880, minHeight: 560,
       resizable: true, titleBarStyle: "Overlay", hiddenTitle: true,
     });
@@ -22767,7 +22786,7 @@ async function _approveWorkspaceExecConfig(kind, path, text, details) {
   const decision = await _toolApprovalDialog({
     title: `这个仓库自带 ${kind} 配置，要运行它吗？`,
     detail: `${path}\n\n将要启动：\n${listed}${more}\n\n`
-      + `⚠️ 这些命令来自你打开的这个仓库，不是 Michael IDE 自带的。\n`
+      + `⚠️ 这些命令来自你打开的这个仓库，不是 Mr.day One 自带的。\n`
       + `如果这个仓库不是你自己写的、或者你不认识上面的命令，请选择拒绝。\n`
       + `（配置内容一旦改变会重新询问）`,
   });
@@ -45457,7 +45476,7 @@ ${bodyPreview}`)}</pre>`;
       const _bmRetired = () => !_bmSess || (_bmSess._runGen || 0) !== _bmGen || !!_bmSess._disposed;
       const _bmNotify = (title) => {
         try {
-          if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Michael IDE", { body: title });
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Mr.day One", { body: title });
         } catch {}
       };
       const _bmFinish = (dotClass, statusText, followupText) => {
@@ -50856,7 +50875,7 @@ async function _startDevServer(dir, port, fileName = "") {
     "s = socketserver.TCPServer(('', PORT), RH)",
     `FILE = '${fileName}'`,
     `path_suffix = '/' + FILE if FILE else ''`,
-    `print('\\n  \\033[1;32m✦ Michael IDE Dev Server\\033[0m\\n')`,
+    `print('\\n  \\033[1;32m✦ Mr.day One Dev Server\\033[0m\\n')`,
     `print(f'  ➜  Local:   \\033[36mhttp://localhost:{PORT}{path_suffix}\\033[0m')`,
     `print(f'  ➜  Network: \\033[36mhttp://{ip}:{PORT}{path_suffix}\\033[0m')`,
     `print(f'\\n  Serving:  {os.getcwd()}')`,
@@ -52628,9 +52647,9 @@ function showAboutDialog() {
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
       <div class="about-dialog__hero">
-        <img class="about-dialog__logo" src="${_escAttr(appIconSrc())}" alt="Michael IDE" />
+        <img class="about-dialog__logo" src="${_escAttr(appIconSrc())}" alt="Mr.day One" />
         <div class="about-dialog__heading">
-          <h2 id="aboutDialogTitle">Michael IDE</h2>
+          <h2 id="aboutDialogTitle">Mr.day One</h2>
           <p>${_escHtml(t("about.subtitle"))}</p>
         </div>
       </div>
@@ -53023,7 +53042,7 @@ _updateLoginUI();
 
 // login flow
 const loginLogoEl = $("loginLogo");
-if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" data-app-icon="true" src="${appIconSrc()}" alt="Michael IDE" style="width:52px;height:52px;border-radius:13px" />`;
+if (loginLogoEl) loginLogoEl.innerHTML = `<img class="assistant-logo" data-app-icon="true" src="${appIconSrc()}" alt="Mr.day One" style="width:52px;height:52px;border-radius:13px" />`;
 // Login / signup flow:
 //   step 1 — enter email → validate format → check DB for an existing account
 //   existing account → enter password → 登录                 (auth_login)
@@ -53572,7 +53591,7 @@ async function _voiceStart(btn) {
     // Permission denied / no system授权框 — point at System Settings (mic string needs a rebuild to prompt).
     _confirmDialog(
       "麦克风没授权",
-      "语音输入需要麦克风权限，但系统没弹出授权框。\n请在「系统设置 › 隐私与安全性 › 麦克风」里给 Michael IDE 打开开关。\n（首次系统授权框需要重新构建 App 后才会自动弹出。）",
+      "语音输入需要麦克风权限，但系统没弹出授权框。\n请在「系统设置 › 隐私与安全性 › 麦克风」里给 Mr.day One 打开开关。\n（首次系统授权框需要重新构建 App 后才会自动弹出。）",
       "打开系统设置", false
     ).then((ok) => {
       if (!ok) return;
@@ -54345,7 +54364,7 @@ async function _openRemoteSshPanel(value, remoteRoot = "", password = "") {
   });
 
   try {
-    term.write(`\x1b[36mMichael IDE SSH\x1b[0m 连接目标：${target}\r\n`);
+    term.write(`\x1b[36mMr.day One SSH\x1b[0m 连接目标：${target}\r\n`);
     const pty = await backend.termOpen(
       { cwd: rootPath || undefined, cols: term.cols, rows: term.rows },
       (ev) => {
@@ -55724,7 +55743,7 @@ async function showNewProjectDialog() {
       </div>
       <div class="new-project-titleblock">
         <h2 id="newProjectTitle">新建项目</h2>
-        <p>选择一个真实模板，Michael IDE 会在终端里创建并安装依赖。</p>
+        <p>选择一个真实模板，Mr.day One 会在终端里创建并安装依赖。</p>
       </div>
       <button class="new-project-close" type="button" aria-label="关闭">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -58361,7 +58380,7 @@ async function checkWorkspaceTrust(path) {
   const decision = await _toolApprovalDialog({
     title: "信任这个文件夹的作者吗？",
     detail: `${path}\n\n`
-      + `信任后，Michael IDE 会使用这个仓库自带的开发工具（例如 node_modules 里的\n`
+      + `信任后，Mr.day One 会使用这个仓库自带的开发工具（例如 node_modules 里的\n`
       + `语言服务器版本），并允许它的 .michael/hooks.json 运行。\n\n`
       + `不信任也能正常打开、阅读和编辑代码，你自己敲的命令照常执行——\n`
       + `只是不会去运行这个仓库提供的程序。\n\n`

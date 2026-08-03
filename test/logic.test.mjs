@@ -11205,6 +11205,10 @@ test("上下文窗口：真实值来自网关，两张兜底表不得各说各�
     "服务端必须给 Opus 4.6/4.7/4.8/5、Sonnet 4.6/5、Fable 5 记 1M，不能一刀切 200K");
   assert.doesNotMatch(table, /contains\("claude"\) \{\s*\n\s*\/\/[^\n]*\n\s*return Some\(200_000\)/,
     "不得恢复成 claude 一律 200K");
+  // 标量必须从列表推导。两者一旦各写各的，就会重演「卡片显示一个数、记账用另一个数」
+  // 那次分歧——那正是这轮修的东西。
+  assert.match(RS, /fn official_context\(model_id: &str\) -> Option<i64> \{\s*\n\s*official_contexts\(model_id\)\.first\(\)/,
+    "official_context 必须取 official_contexts 的第一项，不能自己再写一份");
 });
 
 test("上下文选择存的是意图而不是数字，原生窗口修正后不会把用户钉死", () => {
@@ -17410,8 +17414,11 @@ test("context-window choice clamps to what is actually deliverable", () => {
   assert.equal(mkEff(2_000_000, tier5m, false)("m"), 200_000,
     "gateway compression off → tiers are not deliverable, clamp to native");
 
-  const mkOpts = (user, compress) => load("_ctxChoiceOptions", {
+  const mkOpts = (user, compress, windows = null) => load("_ctxChoiceOptions", {
     _modelContextLimit: () => 200_000,
+    // No catalogue entry -> falls back to the single resolved native (the third-party-direct
+    // path). Pass `windows` to exercise a model that genuinely has more than one.
+    _modelCatalogEntry: () => (windows ? { contextWindows: windows } : null),
     _michaelUser: user,
     _gatewayHandlesCompression: () => compress,
     _tokenShort: (n) => n >= 1_000_000 ? (n / 1_000_000) + "m" : (n / 1000) + "k",
@@ -17424,6 +17431,19 @@ test("context-window choice clamps to what is actually deliverable", () => {
   assert.equal(opts1m[2].locked, true, "2M tier locked above membership");
   assert.equal(opts1m[3].locked, true, "5M tier locked above membership");
   assert.match(opts1m[2].lockHint, /2M/, "locked tier explains what unlocks it");
+
+  // 多个原生窗口要全部显示，而不是只留默认那个。Sonnet 4/4.5 真的有两个（200K 默认 +
+  // 1M 走 context-1m beta），Gemini 1.5 Pro 有 1M/2M —— 只显示第一个等于把模型真实
+  // 具备的能力藏起来。
+  const multi = mkOpts({ michael_compression: { max_input_tokens: 1_000_000 } }, true,
+    [{ tokens: 200_000, beta: null }, { tokens: 1_000_000, beta: "context-1m-2025-08-07" }])("claude-sonnet-4-5");
+  const nativeOpts = multi.filter((o) => o.native);
+  assert.equal(nativeOpts.length, 2, "两个原生窗口都要出现在原生分组里");
+  assert.equal(nativeOpts[0].value, 200_000);
+  assert.equal(nativeOpts[1].value, 1_000_000);
+  assert.equal(nativeOpts[1].beta, "context-1m-2025-08-07",
+    "需要 beta 头的原生档必须带上这个要求——否则就是个会 413 的按钮");
+  assert.equal(nativeOpts[0].beta, null, "默认档不需要 beta");
 });
 
 // ---- free allowance is denominated in 点, not dollars ----
