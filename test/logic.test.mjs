@@ -11174,6 +11174,46 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
+test("上下文窗口：真实值来自网关，两张兜底表不得各说各话", () => {
+  // 真实来源是网关 /api/models 的 context_window（server/src/models.rs official_context），
+  // 客户端 _catalogModelContextLimit 优先读它。客户端那张正则表只服务第三方直连，
+  // 但它必须和服务端逐值一致——服务端的数用来规划 michael-compression，客户端的用来做
+  // 请求预算，分歧就是静默 413 或白扔窗口。历史上真的分歧过（gemini-1.5-pro 2M vs 1M）。
+  const RS = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
+  const table = RS.slice(RS.indexOf("fn official_context"), RS.indexOf("fn official_context") + 1800);
+  const client = load("_fallbackModelContextLimit");
+  const pairs = [
+    ["claude-opus-4-7", 200_000], ["gpt-5.5", 400_000], ["gemini-2.0-flash", 1_000_000],
+    ["gemini-1.5-pro", 2_000_000], ["grok-3", 256_000], ["kimi-k2", 256_000],
+    ["deepseek-v3", 128_000], ["glm-4", 128_000], ["minimax-m2", 1_000_000],
+  ];
+  for (const [id, expect] of pairs) {
+    assert.equal(client(id), expect, `客户端兜底表 ${id} 应为 ${expect}`);
+  }
+  // 服务端表必须覆盖同样这些族（有价就必须有窗口）
+  for (const fam of ["claude", "gpt-5", "gemini", "grok", "kimi", "deepseek", "glm", "minimax", "xai"]) {
+    assert.ok(table.includes(`"${fam}"`), `服务端 official_context 必须覆盖 ${fam}`);
+  }
+  assert.match(table, /1\.5.*pro[\s\S]{0,120}2_000_000/, "gemini-1.5-pro 服务端必须是 2M，与客户端一致");
+});
+
+test("上下文选择存的是意图而不是数字，原生窗口修正后不会把用户钉死", () => {
+  // 旧版存的是按钮上的 token 数。原生值一旦被修正，选过「原生」的用户永远钉在旧数字上，
+  // 而且卡片一个高亮按钮都不会有（判定是 o.value === eff）。
+  const mig = extractFn("_migrateCtxChoiceV1");
+  assert.match(mig, /n === _modelContextLimit\(id\)/,
+    "迁移必须拿该模型当前的原生值比对，而不是用 1M/2M/5M 硬清单——Gemini 的原生就是 1M，" +
+    "按清单判会把选了原生的 Gemini 用户误判成选了档位");
+  const setter = extractFn("_setCtxChoice");
+  assert.match(setter, /kind === "native"/, "必须能存下「跟随原生」这个意图");
+  const getter = extractFn("_ctxChoiceFor");
+  assert.match(getter, /rec\.kind === "native"/, "读取时原生要重新解析成当前真实值");
+  // 渲染分两组，且按钮要带上自己属于哪一组
+  const rows = extractFn("_modelContextRows");
+  assert.match(rows, /原生上下文/); assert.match(rows, /修改上下文/);
+  assert.match(rows, /data-ctx-kind=/, "按钮必须标明所属分组，点击才能存对意图");
+});
+
 test("空闲期卡死：点文件不再拖着整段对话过 JSON，重复镜像不再重写", () => {
   // 实证来自 /tmp/michael-ide-perf.log：120 次 2-60s 的真实卡顿里，紧邻的相位标记
   // 最常见的就是 localStorage:setItem，且标记年龄≈0（其他标记都带 @-Nms 说明已过期无关）。

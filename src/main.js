@@ -11549,11 +11549,18 @@ function _modelContextRows(m) {
     if (active) activeMarked = true;
     const cls = "mic-think-btn" + (active ? " is-active" : "") + (o.locked ? " mic-ctx-btn--locked" : "");
     const tip = o.locked ? o.lockHint : (o.native ? `${_tokenExact(o.value)} tokens（模型原生窗口）` : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
-    return `<button type="button" class="${cls}" data-ctx="${o.value}"${o.locked ? ' data-locked="1"' : ""} title="${_escAttr(tip)}">${_escHtml(o.label)}</button>`;
-  }).join("");
+    return { kind: o.kind || (o.native ? "native" : "modified"),
+      html: `<button type="button" class="${cls}" data-ctx="${o.value}" data-ctx-kind="${o.kind || (o.native ? "native" : "modified")}"${o.locked ? ' data-locked="1"' : ""} title="${_escAttr(tip)}">${_escHtml(o.label)}</button>` };
+  });
   const hint = `当前生效：${_tokenShort(eff)}（${_tokenExact(eff)} tokens）`;
-  return '<div class="mic-plabel">上下文窗口</div>' +
-    `<div class="mic-think-row">${btns}</div>` +
+  const nativeBtns = btns.filter((b) => b.kind === "native").map((b) => b.html).join("");
+  const modBtns = btns.filter((b) => b.kind !== "native").map((b) => b.html).join("");
+  return '<div class="mic-plabel">原生上下文</div>' +
+    `<div class="mic-think-row">${nativeBtns}</div>` +
+    (modBtns
+      ? '<div class="mic-plabel mic-plabel--sub">修改上下文</div>'
+        + `<div class="mic-think-row">${modBtns}</div>`
+      : "") +
     `<div class="mic-think-hint">${_escHtml(hint)}</div>`;
 }
 
@@ -11569,12 +11576,22 @@ function _modelCatalogEntry(id = "") {
   return null;
 }
 
+// LAST RESORT ONLY. The real number comes from the gateway: /api/models emits
+// "context_window" (server/src/models.rs official_context) and _catalogModelContextLimit reads
+// it first. This table exists solely for third-party direct connections, where there is no
+// gateway catalogue to ask.
+//
+// It MUST agree with official_context value-for-value. It did not: gemini-1.5-pro was 2M here
+// and 1M there, xai-without-grok 256k here and 128k there. The server's number plans
+// michael-compression while this one budgets the request, so a disagreement is a silent 413 or
+// a quarter of the window thrown away. A test now pins the two tables together.
 function _fallbackModelContextLimit(id = "") {
   const s = String(id || "").toLowerCase();
   if (!s) return 128_000;
   if (/gemini.*1\.5.*pro/.test(s)) return 2_000_000;
   if (/gemini/.test(s)) return 1_000_000;
   if (/claude|sonnet|opus|haiku/.test(s)) return 200_000;
+  if (/minimax/.test(s)) return 1_000_000;
   if (/grok|xai/.test(s)) return 256_000;
   if (/kimi|moonshot|k2/.test(s)) return 256_000;
   if (/deepseek/.test(s)) return 128_000;
@@ -11888,18 +11905,51 @@ function _gatewayHandlesCompression() {
 // actually deliverable right now (native, or a tier the CURRENT membership grants) — so a
 // membership downgrade silently falls back instead of budgeting against a window the gateway
 // will no longer honor.
-const _CTX_CHOICE_KEY = "michael-ide.ctx-choice.v1";
-function _ctxChoiceFor(modelId) {
+const _CTX_CHOICE_KEY = "michael-ide.ctx-choice.v2";
+const _CTX_CHOICE_KEY_V1 = "michael-ide.ctx-choice.v1";
+// v1 stored the raw token count the button carried, which silently breaks the moment a native
+// window is corrected: the choice stays pinned to the stale number and the card shows no active
+// button at all (the active test is `o.value === eff`). v2 stores the user's INTENT —
+// {kind:"native"} follows the model wherever its real window lands; {kind:"modified",tokens}
+// pins a michael-compression tier. Reading still yields a plain number, so every consumer is
+// unchanged.
+function _migrateCtxChoiceV1() {
   try {
-    const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
-    return Math.max(0, Math.round(Number(map[String(modelId || "")]) || 0));
-  } catch { return 0; }
+    const raw = localStorage.getItem(_CTX_CHOICE_KEY_V1);
+    if (!raw || localStorage.getItem(_CTX_CHOICE_KEY)) return;
+    const old = JSON.parse(raw) || {};
+    const out = {};
+    for (const [id, value] of Object.entries(old)) {
+      const n = Math.round(Number(value) || 0);
+      if (!(n > 0)) continue;
+      // Disambiguate by comparing against THIS model's native window, not against the tier list.
+      // A bare "is it 1M/2M/5M?" test misreads every Gemini pick, because Gemini's native window
+      // IS 1M (and gemini-1.5-pro's is 2M) — those users chose 原生, not a tier.
+      out[id] = (n === _modelContextLimit(id)) ? { kind: "native" } : { kind: "modified", tokens: n };
+    }
+    localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(out));
+    localStorage.removeItem(_CTX_CHOICE_KEY_V1);
+  } catch {}
 }
-function _setCtxChoice(modelId, tokens) {
+function _ctxChoiceRecord(modelId) {
   try {
     const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
-    if (tokens > 0) map[String(modelId || "")] = Math.round(tokens);
-    else delete map[String(modelId || "")];
+    return map[String(modelId || "")] || null;
+  } catch { return null; }
+}
+function _ctxChoiceFor(modelId) {
+  const rec = _ctxChoiceRecord(modelId);
+  if (!rec) return 0;
+  if (rec.kind === "native") return Math.max(0, Math.round(_modelContextLimit(modelId) || 0));
+  return Math.max(0, Math.round(Number(rec.tokens) || 0));
+}
+function _setCtxChoice(modelId, tokens, kind = "modified") {
+  try {
+    const map = JSON.parse(localStorage.getItem(_CTX_CHOICE_KEY) || "{}") || {};
+    const key = String(modelId || "");
+    if (kind === "native") map[key] = { kind: "native" };
+    else if (tokens > 0) map[key] = { kind: "modified", tokens: Math.round(tokens) };
+    else delete map[key];
     localStorage.setItem(_CTX_CHOICE_KEY, JSON.stringify(map));
   } catch {}
 }
@@ -11908,13 +11958,13 @@ function _ctxChoiceOptions(modelId) {
   const native = _modelContextLimit(modelId);
   const tierMax = Number(_michaelUser?.michael_compression?.max_input_tokens) || 0;
   const compress = _gatewayHandlesCompression() && tierMax > 0;
-  const opts = [{ value: native, label: `原生 ${_tokenShort(native)}`, locked: false, native: true }];
+  const opts = [{ value: native, label: _tokenShort(native), locked: false, native: true, kind: "native" }];
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
   for (const [name, tokens] of _MC_TIER_OPTIONS) {
     const locked = !(compress && tokens <= tierMax);
     opts.push({
-      value: tokens, label: name, locked, tier: name,
+      value: tokens, label: name, locked, tier: name, kind: "modified",
       lockHint: locked
         ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
         : `michael-compression ${name} 档`,
@@ -13032,7 +13082,7 @@ function showModelInfoCard(m, anchorEl) {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         if (btn.getAttribute("data-locked")) { showToast(btn.getAttribute("title") || "该档位需更高会员"); return; }
-        _setCtxChoice(m.id, Number(btn.getAttribute("data-ctx")) || 0);
+        _setCtxChoice(m.id, Number(btn.getAttribute("data-ctx")) || 0, btn.getAttribute("data-ctx-kind") || "modified");
         showModelInfoCard(m, anchorEl); // re-render: active button + 生效 hint update
       });
     }
