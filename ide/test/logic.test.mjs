@@ -6498,6 +6498,7 @@ test("planning gates consume structured semantic fields and do not infer intent 
 
 test("设计工艺块 token 瘦身：服务端设计层在场时只留锚点，缺席时全量兑底", () => {
   const block = load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
   });
@@ -6806,6 +6807,7 @@ test("a novice's vague sentence flows through the real chain into professional d
   assert.equal(merged.requiresPlan, true, "模糊的小项目请求也要走完整工程路径");
 
   const frame = load("_agentDecisionFrameBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _engineeringProfileWithAiIntent: () => merged,
     _agentBugEvidenceLadderBlock: () => "",
     _agentIntentExecutionBlock: load("_agentIntentExecutionBlock"),
@@ -6832,6 +6834,7 @@ test("automation-era laws: install cleanup desktop gates fire only on AI intent"
   assert.match(SRC, /"envSetup", "cleanupTask", "desktopAutomation",/,
     "三个自动化意图维度必须在 AI 判定清单里");
   const frame = load("_agentDecisionFrameBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _engineeringProfileWithAiIntent: () => ({}),
     _agentBugEvidenceLadderBlock: () => "",
   });
@@ -7823,7 +7826,7 @@ test("Agent mode requires workspace tools from semantic scope fields", () => {
 });
 
 test("Agent decision frame gives task-specific old-hand operating rules", () => {
-  const frame = load("_agentDecisionFrameBlock");
+  const frame = load("_agentDecisionFrameBlock", { _MD_STACK_RULE: "[[MD_STACK]]" });
   const complex = frame("修复 UI 卡死 bug，设计数据库 schema 和索引，启动 dev server，抓包看真实接口，然后用浏览器验证", {
     requiresPlan: true,
     substantial: true,
@@ -7922,6 +7925,7 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
 
 test("UI design craft guidance is injected only for front-end work", () => {
   const craft = load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
     _uiStructuralSignal: () => false,
@@ -7929,6 +7933,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.equal(craft("修复后端接口", { ui: false }), "");
   // 触发链去单点：分类器漏判 UI，但结构事实（在场的是前端源文件）→ 注入 michael-design 可达性提醒
   const reach = load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
     _uiStructuralSignal: () => true,
@@ -7937,6 +7942,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(reach, /knowledge_search/);
   // 分类器判定不在（intentSource=none，超时/失败）→ 也让 michael-design 可达（此时对是否 UI 无判据）
   const blind = load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
     _uiStructuralSignal: () => false,
@@ -7944,6 +7950,7 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(blind, /UI 可达性提醒/);
   // 分类器明确判为非 UI（有裁决、无结构信号）→ 不提醒，尊重裁决
   assert.equal(load("_uiDesignCraftBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _uiDesignReferenceRule: load("_uiDesignReferenceRule"),
     _uiDesignTransactionalRule: load("_uiDesignTransactionalRule"),
     _uiStructuralSignal: () => false,
@@ -7979,7 +7986,11 @@ test("UI design craft guidance is injected only for front-end work", () => {
   assert.match(marketplace, /交易产品硬约束/);
   assert.match(marketplace, /禁止用 localStorage、假 JSON 或“无后端”替代/);
   const greenfield = craft("创建社区论坛", { ui: true, uiProject: true, fromZeroUiProject: true });
-  assert.match(greenfield, /默认 React\/Vite \+ Tailwind \+ shadcn\/ui\/Radix/);
+  // 这条断言原本钉的是旧的、不完整的栈描述（"默认 React/Vite + Tailwind + shadcn/ui/Radix"），
+  // 它漏了 TypeScript、Tailwind 大版本和 shadcn 底座，和 owner 真正上线的站点对不上。
+  // 现在只钉“必须引用唯一权威定义”，栈内容由 _MD_STACK_RULE 的专项测试负责。
+  assert.match(greenfield, /从零网站技术栈硬约束：\[\[MD_STACK\]\]/,
+    "greenfield 规则必须引用权威栈常量，而不是自己复述一份会过时的描述");
   assert.match(greenfield, /禁止再次只生成一个通用 index\.html/);
   assert.match(SRC, /const _uiDesignCraft = \(effectiveMode === "agent" && !_agentLightTurn\)\s*\? _uiDesignCraftBlock\(text, _uiTurnEngineering, \{ serverDesignLayersActive: _l0On\(config\) && !!config\.ideSemanticProfile \}\)/,
     "Agent send path must add the UI craft block to front-end turns");
@@ -8599,6 +8610,7 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
   assert.match(text, /针对性复验/);
 
   const frame = load("_agentDecisionFrameBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _engineeringProfileWithAiIntent: () => ({ bug: true, debugProject: true, backendApi: true, database: true }),
     _agentBugEvidenceLadderBlock: ladder,
   });
@@ -11124,6 +11136,42 @@ test("adjacent run_worker calls execute as a parallel segment, still barriered f
   assert.equal(maxWorkers, 3, "同轮相邻的 worker 必须真并行（此前被当硬屏障串行跑）");
   assert.ok(events.indexOf("read1") < events.indexOf("worker2"), "读段先于 worker 段");
   assert.ok(events.indexOf("worker4") < events.indexOf("read5"), "worker 段完成后才轮到后续读");
+});
+
+test("Michael Design 技术栈只有一个权威定义，且和真实上线站点一致", () => {
+  // 事实来源是 owner 真正上线的站点（package "michael-ide-site"）：
+  // Vite 7 + React 19 + TS 5.9 + Tailwind v4(@tailwindcss/vite, CSS-first) + shadcn/ui
+  // (Radix + CVA + clsx + tailwind-merge 的 cn() + lucide-react)，且项目里没有
+  // tailwind.config.* / postcss.config.js / postcss / autoprefixer。
+  const rule = SRC.slice(SRC.indexOf("const _MD_STACK_RULE"), SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
+  assert.ok(rule, "必须有唯一权威的 _MD_STACK_RULE");
+  for (const must of ["React 19", "TypeScript", "Tailwind v4", "shadcn/ui",
+                      "@tailwindcss/vite", "class-variance-authority", "tailwind-merge",
+                      "clsx", "lucide-react", "@radix-ui/react-", "cn()"]) {
+    assert.ok(rule.includes(must), `权威栈缺少真实站点确实在用的：${must}`);
+  }
+  // 最关键的否定规则：真实站点里根本没有这些文件/依赖，建了就是另一套项目
+  assert.match(rule, /不要】新建 tailwind\.config/, "必须明确禁止建 tailwind.config（v3 做法）");
+  assert.ok(rule.includes("postcss") && rule.includes("autoprefixer"),
+    "必须明确不要装 postcss/autoprefixer——真实站点一个都没有");
+  // sonner 在 package.json 里但 src/ 零引用，属于死依赖，不得写进房屋标准
+  assert.ok(!rule.includes("sonner"), "sonner 是真实站点里的死依赖（零 import），不得写进标准栈");
+
+  // 各处必须引用同一份，不再各说各话
+  for (const site of ["从零网站技术栈律：\" + _MD_STACK_RULE", "从零网站技术栈硬约束：\" + _MD_STACK_RULE",
+                      "- ${_MD_STACK_RULE}"]) {
+    assert.ok(SRC.includes(site.replace('\\"', '"')) || SRC.includes(site),
+      `声明点必须引用权威常量而不是自己复述一遍：${site}`);
+  }
+  // Vue 不得再作为等价默认出现在实现指令里
+  assert.doesNotMatch(SRC, /用 React\/Vue \+ Tailwind 写组件化代码/,
+    "选完设计方向后的实现提示不得把 Vue 当作等价选项");
+  assert.doesNotMatch(SRC, /技术取向一律上现代框架\(Vue3\+Vite/,
+    "设计调研提示不得把 Vue3 排在 React 前面");
+
+  // 声明与执行必须一致：web_scaffold 默认框架
+  assert.match(SRC, /framework: String\(args\.framework \|\| "react"\)/,
+    "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
 test("_runHasOrientationFacts counts only what the run actually observed", () => {
@@ -13760,6 +13808,7 @@ test("收尾验收契约开局告知，与收尾门禁同源而非突袭", () =>
     "契约的研究证据项必须直接读门禁同源的 needsOfficialResearch");
   // 行为验证：有义务 → 契约列出；纯问答无 applies → 不注入契约块。
   const frame = load("_agentDecisionFrameBlock", {
+    _MD_STACK_RULE: "[[MD_STACK]]",
     _engineeringProfileWithAiIntent: (t) => ({}),
     _agentIntentExecutionBlock: () => "",
     _agentBugEvidenceLadderBlock: () => "",
