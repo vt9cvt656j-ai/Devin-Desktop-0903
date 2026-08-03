@@ -29301,6 +29301,81 @@ function _refreshTreeFor(absPath) {
 const _runCheckpoint = new Map(); // legacy fallback when a call has no per-run context
 // Snapshot a file before its first change THIS run, into the run's own checkpoint
 // map (`cp`) —— 每个 run 的快照互相独立，并行 tab 不串状态。
+// Reversal plan for a shell command's file changes, from a before/after snapshot of the
+// affected scope plus the watcher's observed changed-paths. Pure and total over its three
+// inputs — no I/O, no module deps — so the tricky part (turning "these paths changed" into
+// exact restore steps) is fully testable in isolation. This is the capture-before-mutate
+// pattern Claude Code / Cursor / Aider all use for reversibility; the codebase already
+// applies it to the write/edit/move TOOLS but never to a run_cmd, which is why the bulk
+// `mv config/*.json *.enc` in the report had nothing to undo and the model had to
+// hand-author a reverse command.
+//
+// preFiles / postFiles: Map<absPath, content> of the scope before/after the command.
+// changedPaths: the watcher's observed _fsPaths (already normalized absolute).
+// Returns [{ path, existedBefore, contentBefore, contentAfter, op }], skipping any path
+// present in neither snapshot (outside the captured scope — cannot be reversed safely).
+function _cmdUndoPlan(preFiles, changedPaths, postFiles) {
+  const pre = preFiles instanceof Map ? preFiles : new Map();
+  const post = postFiles instanceof Map ? postFiles : new Map();
+  const seen = new Set();
+  const plan = [];
+  for (const raw of Array.isArray(changedPaths) ? changedPaths : []) {
+    const path = String(raw || "");
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    const inPre = pre.has(path), inPost = post.has(path);
+    if (!inPre && !inPost) continue; // outside captured scope → not safely reversible
+    if (inPre && !inPost) {
+      // deleted or renamed away → recreate it from the pre-content
+      plan.push({ path, existedBefore: true, contentBefore: pre.get(path), contentAfter: null, op: "restore" });
+    } else if (!inPre && inPost) {
+      // created or renamed to → delete it (content-matched, never a blind rm)
+      plan.push({ path, existedBefore: false, contentBefore: "", contentAfter: post.get(path), op: "delete" });
+    } else if (pre.get(path) !== post.get(path)) {
+      // overwritten in place → rewrite the pre-content back
+      plan.push({ path, existedBefore: true, contentBefore: pre.get(path), contentAfter: post.get(path), op: "rewrite" });
+    }
+  }
+  return plan;
+}
+
+// Bounded content snapshot of a directory subtree, for capture-before-mutate. Reads each
+// text file into a Map<absPath, content>, skipping the heavy build/vendor dirs the context
+// walk already skips. Aborts to { truncated: true } the instant it exceeds the file-count
+// or byte budget, or hits a file it cannot read as text (binary) — the bound is what keeps
+// this cheap on ordinary work and keeps a node_modules-sized tree from ever being read.
+// A truncated result means "scope too large to make reversible" → the caller degrades to
+// an observed-fact note, never a block.
+const _CMD_SNAPSHOT_MAX_FILES = 200;
+const _CMD_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
+async function _snapshotCmdScope(root) {
+  const base = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
+  if (!base || !backend?.readDir || !backend?.readTextFile) return null;
+  const files = new Map();
+  let bytes = 0, truncated = false;
+  const walk = async (dir, depth) => {
+    if (truncated || depth > 6) return;
+    let entries;
+    try { entries = await backend.readDir(dir); } catch { return; }
+    if (!Array.isArray(entries)) return;
+    for (const e of entries) {
+      if (truncated) return;
+      const name = _agentDirEntryName(e);
+      if (!name || _AGENT_CONTEXT_SKIP_DIRS.has(name) || name.startsWith(".")) continue;
+      const full = _normalizeFsPath(e?.path || (dir + "/" + name)).replace(/\/+$/, "");
+      if (_agentDirEntryIsDir(e)) { await walk(full, depth + 1); continue; }
+      if (files.size >= _CMD_SNAPSHOT_MAX_FILES) { truncated = true; return; }
+      let content;
+      try { content = await backend.readTextFile(full); } catch { truncated = true; return; } // binary/unreadable
+      bytes += (content || "").length;
+      if (bytes > _CMD_SNAPSHOT_MAX_BYTES) { truncated = true; return; }
+      files.set(full, content || "");
+    }
+  };
+  try { await walk(base, 0); } catch { return null; }
+  return { files, truncated };
+}
+
 function _checkpointRecord(cp, absPath, existed, content) {
   cp = cp || _runCheckpoint;
   if (!absPath || cp.has(absPath)) return;
@@ -46053,6 +46128,17 @@ ${bodyPreview}`)}</pre>`;
         `</div>`;
 
       const _cmdStartedAt = Date.now(); // 长耗时安装/下载附注的耗时事实（含自动重试）
+      // Capture-before-mutate: a command the model DECLARED as mutating (or that the risk
+      // classifier already calls a workspace-write) gets its scope snapshotted first, so a
+      // bulk mv/rm becomes reversible like a tool edit instead of something the model must
+      // hand-author a reverse command for. Never gates execution; a too-large scope
+      // degrades to an observed-fact note (below). Local root only — the native watcher is
+      // blind on remote, so a snapshot there would be unreliable.
+      let _preCmdSnap = null;
+      const _cmdMayMutate = call.purpose === "mutate" || _commandRiskKind(call.command) === "workspace-write";
+      if (_cmdMayMutate && !(typeof _remote !== "undefined" && _remote?.active)) {
+        try { _preCmdSnap = await _snapshotCmdScope(root || rootPath); } catch { _preCmdSnap = null; }
+      }
       // Baseline for the observed-mutation fact: anything the watcher reports after this
       // point and before the result is read is attributable to this command.
       call._fsWatchSnap = _fsWatchSnapshot();
@@ -46142,6 +46228,27 @@ ${bodyPreview}`)}</pre>`;
       const _fsSeen = _fsWatchDeltaSince(call._fsWatchSnap);
       const _workspaceChangedByCommand = result.code === 0 && _fsSeen.changed;
       if (_workspaceChangedByCommand) _clearRunEmptyRoot(run, root || rootPath);
+      // Register the reversal into the same run checkpoint the write/edit tools use, so a
+      // mutating command's changes are recoverable and visible to the run-end review that
+      // is otherwise blind to shell mutations. Post-snapshot the same scope, diff via the
+      // pure _cmdUndoPlan, and record each affected path with its before/after content.
+      if (_workspaceChangedByCommand && _preCmdSnap && !_preCmdSnap.truncated) {
+        try {
+          const _postSnap = await _snapshotCmdScope(root || rootPath);
+          if (_postSnap) {
+            const _plan = _cmdUndoPlan(_preCmdSnap.files, _fsSeen.paths, _postSnap.files);
+            for (const s of _plan) {
+              _checkpointRecord(_cp, s.path, s.existedBefore, s.contentBefore);
+              _checkpointMarkCurrent(_cp, s.path, s.contentAfter);
+            }
+            if (_plan.length) _content += `\n\n[可还原] 本次命令改动了 ${_plan.length} 个文件；IDE 已快照改动前内容，若改错了可精确还原（改名/删除也在内）。`;
+          }
+        } catch {}
+      } else if (_workspaceChangedByCommand && _preCmdSnap && _preCmdSnap.truncated) {
+        // Reversibility unavailable because the scope was too large to snapshot cheaply.
+        // State it as a fact where it is true, so next time the model checks scope first.
+        _content += "\n\n[未快照·作用域大] 这条改动命令的工作目录文件很多，IDE 没做改动前快照——删除/重命名这类不可逆操作，先用 read/ls 确认作用域再执行，避免改错难以还原。";
+      }
       if (_dependencyGraphChanged || _workspaceChangedByCommand) {
         try {
           await refreshProjectCaches(root || rootPath, _dependencyGraphChanged ? "依赖/脚手架命令完成" : "命令写入完成");
