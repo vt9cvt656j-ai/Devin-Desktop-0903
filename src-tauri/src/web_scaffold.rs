@@ -55,9 +55,13 @@ pub async fn web_scaffold(
     } else if is_tdesign {
         false
     } else {
-        matches!(
+        // Empty / unrecognised => React. Michael Design IS the default; only an explicit
+        // Vue-family request opts out. Previously anything unrecognised (including "")
+        // fell through to the Vue arm, so a model that followed the React instruction and
+        // called this tool with no framework silently got a Vue project.
+        !matches!(
             fw.as_str(),
-            "react" | "reactjs" | "react.js" | "jsx" | "tsx"
+            "vue" | "vuejs" | "vue.js" | "vue3" | "nuxt" | "svelte" | "sveltekit"
         )
     };
 
@@ -133,21 +137,19 @@ pub async fn web_scaffold(
         ]);
         note = "腾讯 TDesign 预设：官方 tdesign-vue-next + 全局引入官方样式与令牌（--td-brand-color 系列）。组件一律用 t-button/t-card 等官方组件；换品牌色改 src/style.css 的 --td-brand-color 覆盖。".to_string();
     } else if is_react {
-        put(&dir, "package.json", &pkg_json(&proj, true)).await?;
-        put(&dir, "vite.config.js", VITE_CONFIG_REACT).await?;
-        put(&dir, "index.html", &index_html(&proj, true)).await?;
-        put(&dir, "src/style.css", STYLE_CSS).await?;
-        put(&dir, "src/main.jsx", MAIN_JSX).await?;
-        put(&dir, "src/App.jsx", APP_JSX).await?;
-        files.extend([
-            "package.json",
-            "vite.config.js",
-            "index.html",
-            "src/style.css",
-            "src/main.jsx",
-            "src/App.jsx",
-        ]);
-        note = "已铺好 Vite + Tailwind v4(@tailwindcss/vite) + shadcn 语义令牌(src/style.css @theme inline) + 字体配对(Space Grotesk 标题 / Manrope 正文)。改配色只改 :root 变量；自定义 reset 必须放进 @layer base，不能用裸 * 覆盖 Tailwind utilities。".to_string();
+        // === Michael Design native base ===
+        // Every file is the owner's REAL shipped site (package "michael-ide-site"),
+        // reproduced byte-for-byte from src-tauri/templates/michael-design/ — not a generic
+        // shadcn approximation. Verified end to end before shipping: npm install, `tsc -b`
+        // clean, `vite build` clean (58 modules), all primitives rendered in a browser.
+        // include_str! rather than format! because the templates are full of literal {}
+        // (CSS, JSX, JSON) that format! would read as placeholders; the only substitution
+        // is the project name via __PROJECT__.
+        for (rel, body) in MD_TEMPLATES {
+            put(&dir, rel, &body.replace("__PROJECT__", &proj)).await?;
+        }
+        files.extend(MD_TEMPLATES.iter().map(|(rel, _)| *rel));
+        note = "已铺好 Michael Design 原生基座（和线上站点同一套）：Vite 7 + React 19 + TypeScript + Tailwind v4(@tailwindcss/vite，CSS-first) + shadcn/ui。已含 13 个 shadcn 原件(src/components/ui/: button/card/badge/input/dialog/sheet/tabs/accordion/separator/tooltip/avatar/table/aspect-ratio)、cn()(src/lib/utils.ts)、SectionReveal 入场动效(src/components/motion/)，以及全套语义令牌与排版类(src/index.css 的 :root + @theme inline；Space Grotesk 标题 / Inter 正文 / JetBrains Mono 等宽)。【直接用这些原件，不要重造】按钮变体是 default/secondary/outline/ghost/link/inverse（没有 destructive）；改配色只改 src/index.css 的 :root 十六进制变量。【不要建 tailwind.config.js / postcss.config.js，也不要装 postcss/autoprefixer/tailwindcss-animate】——本栈是 Tailwind v4 CSS-first，加了反而冲突。跑起来：npm install && npm run dev。".to_string();
     } else {
         put(&dir, "package.json", &pkg_json(&proj, false)).await?;
         put(&dir, "vite.config.js", VITE_CONFIG_VUE).await?;
@@ -174,16 +176,19 @@ pub async fn web_scaffold(
         // CSS @import must precede all other rules, so the learned palette is
         // imported at the very top of style.css (its --learned-* names don't
         // collide with the semantic tokens, so order among :root blocks is moot).
-        let style_path = dir.join("src/style.css");
+        // The Michael Design (react) arm writes src/index.css; vue/material/tdesign still
+        // write src/style.css. Use whichever this run actually produced.
+        let style_rel = if dir.join("src/index.css").exists() { "src/index.css" } else { "src/style.css" };
+        let style_path = dir.join(style_rel);
         let base = fs::read_to_string(&style_path)
             .await
-            .map_err(|e| format!("读 style.css 失败: {e}"))?;
+            .map_err(|e| format!("读 {style_rel} 失败: {e}"))?;
         fs::write(
             &style_path,
             format!("@import './reference-tokens.css';\n{base}"),
         )
         .await
-        .map_err(|e| format!("写 style.css 失败: {e}"))?;
+        .map_err(|e| format!("写 {style_rel} 失败: {e}"))?;
         files.push("src/reference-tokens.css");
         note.push_str(" 已接入 learn_design 学到的参考令牌（src/reference-tokens.css）——把其中的 --learned-* 映射到语义变量后使用。");
     }
@@ -199,6 +204,34 @@ pub async fn web_scaffold(
 }
 
 // ── curated templates ──────────────────────────────────────────────
+
+/// The Michael Design base, verbatim from the shipped site (templates/michael-design/).
+/// include_str! bakes each file in at compile time, so the scaffold works offline and the
+/// templates stay real, editable, lintable files rather than Rust string literals.
+const MD_TEMPLATES: &[(&str, &str)] = &[
+    ("package.json", include_str!("../templates/michael-design/package.json")),
+    ("tsconfig.json", include_str!("../templates/michael-design/tsconfig.json")),
+    ("vite.config.ts", include_str!("../templates/michael-design/vite.config.ts")),
+    ("index.html", include_str!("../templates/michael-design/index.html")),
+    ("src/App.tsx", include_str!("../templates/michael-design/src/App.tsx")),
+    ("src/components/motion/section-reveal.tsx", include_str!("../templates/michael-design/src/components/motion/section-reveal.tsx")),
+    ("src/components/ui/accordion.tsx", include_str!("../templates/michael-design/src/components/ui/accordion.tsx")),
+    ("src/components/ui/aspect-ratio.tsx", include_str!("../templates/michael-design/src/components/ui/aspect-ratio.tsx")),
+    ("src/components/ui/avatar.tsx", include_str!("../templates/michael-design/src/components/ui/avatar.tsx")),
+    ("src/components/ui/badge.tsx", include_str!("../templates/michael-design/src/components/ui/badge.tsx")),
+    ("src/components/ui/button.tsx", include_str!("../templates/michael-design/src/components/ui/button.tsx")),
+    ("src/components/ui/card.tsx", include_str!("../templates/michael-design/src/components/ui/card.tsx")),
+    ("src/components/ui/dialog.tsx", include_str!("../templates/michael-design/src/components/ui/dialog.tsx")),
+    ("src/components/ui/input.tsx", include_str!("../templates/michael-design/src/components/ui/input.tsx")),
+    ("src/components/ui/separator.tsx", include_str!("../templates/michael-design/src/components/ui/separator.tsx")),
+    ("src/components/ui/sheet.tsx", include_str!("../templates/michael-design/src/components/ui/sheet.tsx")),
+    ("src/components/ui/table.tsx", include_str!("../templates/michael-design/src/components/ui/table.tsx")),
+    ("src/components/ui/tabs.tsx", include_str!("../templates/michael-design/src/components/ui/tabs.tsx")),
+    ("src/components/ui/tooltip.tsx", include_str!("../templates/michael-design/src/components/ui/tooltip.tsx")),
+    ("src/index.css", include_str!("../templates/michael-design/src/index.css")),
+    ("src/lib/utils.ts", include_str!("../templates/michael-design/src/lib/utils.ts")),
+    ("src/main.tsx", include_str!("../templates/michael-design/src/main.tsx")),
+];
 
 fn pkg_json(proj: &str, react: bool) -> String {
     if react {
@@ -246,16 +279,6 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
-  server: { host: '127.0.0.1', port: 3000 },
-})
-"#;
-
-const VITE_CONFIG_REACT: &str = r#"import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
-
-export default defineConfig({
-  plugins: [react(), tailwindcss()],
   server: { host: '127.0.0.1', port: 3000 },
 })
 "#;
@@ -436,61 +459,6 @@ const SITE_HEADER_VUE: &str = r##"<template>
     </div>
   </header>
 </template>
-"##;
-
-const MAIN_JSX: &str = r#"import React from 'react'
-import ReactDOM from 'react-dom/client'
-import './style.css'
-import App from './App.jsx'
-
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-)
-"#;
-
-const APP_JSX: &str = r##"import './style.css'
-
-const features = [
-  { title: 'Token-driven', body: '一套 CSS 变量当单一真源，改主题只改 :root。' },
-  { title: 'Real type', body: 'Space Grotesk 标题 + Manrope 正文，不是满屏 Inter。' },
-  { title: 'Accessible', body: '状态齐全、对比达标、prefers-reduced-motion 兜底。' },
-]
-
-export default function App() {
-  return (
-    <>
-      <header className="sticky top-0 z-10 border-b border-border bg-bg/80 backdrop-blur">
-        <div className="mx-auto flex max-w-content items-center justify-between px-6 py-4">
-          <span className="font-display text-lg font-bold text-text">Brand</span>
-          <a className="btn btn-primary" href="#">Get started</a>
-        </div>
-      </header>
-      <main className="mx-auto max-w-content px-6">
-        <section className="py-24 text-center">
-          <p className="mb-4 text-sm font-semibold uppercase tracking-widest text-primary">Starter</p>
-          <h1 className="mx-auto max-w-3xl text-5xl font-bold text-text">在一套精选设计系统上开始搭建</h1>
-          <p className="mx-auto mt-6 max-w-prose text-lg text-muted">
-            Vite + React + Tailwind，设计令牌 / 字体配对 / 基础组件已就位。
-          </p>
-          <div className="mt-8 flex justify-center gap-4">
-            <a className="btn btn-primary" href="#">开始</a>
-            <a className="btn btn-ghost" href="#">了解更多</a>
-          </div>
-        </section>
-        <section className="grid gap-6 pb-24 sm:grid-cols-3">
-          {features.map((f) => (
-            <article key={f.title} className="card">
-              <h3 className="text-lg font-semibold text-text">{f.title}</h3>
-              <p className="mt-2 text-muted">{f.body}</p>
-            </article>
-          ))}
-        </section>
-      </main>
-    </>
-  )
-}
 "##;
 
 // Preset stacks style with their official libraries, not Tailwind — plain configs.
