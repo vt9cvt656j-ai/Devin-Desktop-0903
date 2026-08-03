@@ -8101,7 +8101,7 @@ test("michael-design prefetch starts only from a resolved structured design prof
   const preflight = extractFn("_runMichaelDesignPreflight");
   assert.match(preflight, /!profile\.designKnowledgeRequired/);
   assert.doesNotMatch(preflight, /_engineeringTaskProfile|keyword|关键词/);
-  assert.match(SRC, /_lateProfile\.intentSource !== "none"/);
+  assert.match(SRC, /_lateProfile\.intentSource === "ai"/);
   assert.match(SRC, /_lateProfile\.designKnowledgeRequired && !run\._michaelDesignEvidence/);
   assert.doesNotMatch(SRC, /function _engineeringTaskProfile\(/);
 });
@@ -17730,15 +17730,18 @@ test("late intent backfill survives the first write", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _lateBackfillOpen = !didMutate \|\| _implOps <= 3;/,
     "the backfill window must not be closed by the first file written");
-  assert.match(loop, /if \(iter > 0 && _lateBackfillOpen && run\.engineering\?\.intentSource === "none"\)/);
+  assert.match(loop, /if \(iter > 0 && _lateBackfillOpen && run\.engineering\?\.intentSource !== "ai"\)/,
+    "backfill must re-fire for session-inherited too, not just none — that was the residual design loss");
+  assert.doesNotMatch(loop, /_lateBackfillOpen && run\.engineering\?\.intentSource === "none"\)/,
+    "the narrow ===none gate missed the session-inherited case");
   assert.doesNotMatch(loop, /if \(iter > 0 && !didMutate && run\.engineering\?\.intentSource === "none"\)/,
     "the old narrow window is what lost michael-design on a slow classifier");
   // It must still refresh the header the gateway gates design injection on.
-  const region = loop.slice(loop.indexOf("_lateBackfillOpen"), loop.indexOf("_lateBackfillOpen") + 900);
+  const region = loop.slice(loop.indexOf("_lateBackfillOpen"), loop.indexOf("_lateBackfillOpen") + 1600);
   assert.match(region, /config\.ideSemanticProfile = _ideSemanticProfile\(run\.engineering\)/,
     "the refreshed profile must reach the gateway or the design modules stay off");
   // Still bounded: it only fires while the verdict was genuinely missing.
-  assert.match(region, /intentSource !== "none"/, "only a real late verdict may overwrite the profile");
+  assert.match(region, /intentSource === "ai"/, "only a real (ai) late verdict may overwrite the profile");
 });
 
 test("an empty profile emits no design flag — the failure mode this guards", () => {
@@ -17780,4 +17783,39 @@ test("_looksLikeUserQuestion: statements and rhetoric still do NOT pause the run
   assert.equal(q("我已经改好了。"), false);
   assert.equal(q("> 要不要继续？"), false, "quoted");
   assert.equal(q("# 要不要继续？"), false, "heading");
+});
+
+// ---------------------------------------------------------------------------
+// A light turn (no tools, no project context) is unsafe with a workspace open.
+//
+// Reported: "这个项目是干嘛的？" in an open Rust project returned a greeting
+// ("准备就绪，工作区已加载（Rust 项目）"), ~1k input tokens — it read nothing. The
+// classifier had tagged projectState="none" over a real project, so the light-turn gate
+// let it through. The gate now keys on the OBSERVABLE fact that a folder is open, which a
+// classifier guess cannot override.
+// ---------------------------------------------------------------------------
+test("light turn is refused whenever a workspace folder is open", () => {
+  const light = load("_shouldUseLightweightAgentTurn", { _knownWorkspaceRoots: () => [] });
+  // A profile the classifier would pass as a context-free answer turn.
+  const answerProfile = {
+    intentSource: "ai",
+    intentSemantic: { action: "answer", continuation: "new" },
+    projectState: "none", deliverySurface: "answer", changeScope: "none",
+    architectureMode: "none", dataStrategy: "not_applicable", researchMode: "none",
+    designMode: "none", workspaceAction: "none", captureMode: "none",
+    browserGoal: "none", orchestrationMode: "solo",
+    runtimeObligations: [], externalObligations: [],
+  };
+  // No workspace open → the fast path is still allowed (its whole reason to exist).
+  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: false }), true);
+  // A folder IS open → never light, regardless of the classifier saying projectState:none.
+  assert.equal(light("agent", answerProfile, {}, { workspaceOpen: true }), false,
+    "a project question must not be answered from zero context");
+  // The fact overrides the guess: same 'none' profile, workspace open → full turn.
+  assert.equal(light("agent", { ...answerProfile, projectState: "none" }, {}, { workspaceOpen: true }), false);
+});
+
+test("the light-turn call site passes the observable workspace fact", () => {
+  assert.match(SRC, /workspaceOpen: !!String\(_earlyRoot \|\| rootPath \|\| \(workspaceRoots && workspaceRoots\[0\]\) \|\| ""\)\.trim\(\)/,
+    "eligibility must be computed from the real open folder, not the profile");
 });

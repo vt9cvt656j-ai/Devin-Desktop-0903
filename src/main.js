@@ -20666,7 +20666,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null) {
       effectiveMode,
       _turnEngineeringResolved,
       sess,
-      { hasAttachments: attachments.length > 0 },
+      {
+        hasAttachments: attachments.length > 0,
+        // The observable fact, not the classifier's guess: is a real folder open?
+        workspaceOpen: !!String(_earlyRoot || rootPath || (workspaceRoots && workspaceRoots[0]) || "").trim(),
+      },
     );
   } catch {}
 
@@ -22328,6 +22332,13 @@ function _agentMustUseWorkspaceTools(engineering, root = "", active = "") {
 function _shouldUseLightweightAgentTurn(mode, profile, session = null, options = {}) {
   if (mode !== "agent" || !profile || profile.intentSource !== "ai") return false;
   if (options.hasAttachments === true || session?.streaming || session?._runIsLoop) return false;
+  // A light turn carries ZERO project context (no tools, no file digest), so it can only
+  // ever be safe when there is no project to be ignorant of. When a workspace folder is
+  // actually open, "这个项目是干嘛的 / how do I run this / what does X do" all need the
+  // real files — and answering them from nothing produced the greeting the user saw
+  // ("准备就绪，工作区已加载"). This keys on the OBSERVABLE fact that a folder is open,
+  // not on the classifier's projectState guess, which said "none" over a real Rust project.
+  if (options.workspaceOpen === true) return false;
   const semanticDecision = profile.intentSemantic;
   if (!semanticDecision || semanticDecision.action !== "answer" || semanticDecision.continuation !== "new") return false;
   if (profile.projectState !== "none"
@@ -37135,9 +37146,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
       // design 又丢了」。设计知识对整个 UI 构建自始至终有效，晚补远好过不补，所以放宽到
       // 「尚未产生实质实现量」（_implOps 小）为止，而不是第一次落盘就锁死。
       const _lateBackfillOpen = !didMutate || _implOps <= 3;
-      if (iter > 0 && _lateBackfillOpen && run.engineering?.intentSource === "none") {
+      // Re-fire whenever the run is NOT standing on a real classifier verdict — that is
+      // "none" (race lost, no prior state) AND "session-inherited" (race lost, but a prior
+      // turn's profile got carried in). The latter was the residual Michael Design loss:
+      // ask "这个项目是干嘛的" (non-UI), then "帮我做个网站" whose classifier verdict is
+      // late — the UI turn inherits the previous non-UI profile, intentSource becomes
+      // "session-inherited" not "none", and design injection never fires. Only a genuine
+      // "ai" verdict is trusted enough to skip the backfill.
+      if (iter > 0 && _lateBackfillOpen && run.engineering?.intentSource !== "ai") {
         const _lateProfile = _engineeringProfileWithAiIntent(task, session);
-        if (_lateProfile && _lateProfile.intentSource !== "none") {
+        if (_lateProfile && _lateProfile.intentSource === "ai") {
           run.engineering = _lateProfile;
           config.ideSemanticProfile = _ideSemanticProfile(run.engineering);
           // 与 steer 路径同款懒初始化：这些 Set 可能尚未建立。
