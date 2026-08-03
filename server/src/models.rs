@@ -1821,6 +1821,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 // 每模型真实上下文窗口（tokens）：客户端上下文表和棘轮压缩阈值都靠它，
                 // 不下发就只能靠客户端猜（GPT-5 曾被猜成 128K，白扔 3/4 窗口）。
                 "context_window": official_context(&mid),
+                // Full native list so the client can show every window a model really offers,
+                // instead of collapsing a genuine choice down to the default.
+                "context_windows": official_contexts(&mid)
+                    .into_iter()
+                    .map(|(tokens, beta)| serde_json::json!({ "tokens": tokens, "beta": beta }))
+                    .collect::<Vec<_>>(),
             }));
         }
     }
@@ -2427,58 +2433,68 @@ fn cost_from_usage(u: &serde_json::Value, rate: f64) -> Option<i64> {
 /// usage and triggers ratchet compression against this number, so a wrong guess either
 /// wastes most of the window (guessing 128K for a 400K model) or blows the request.
 /// Keep in sync with provider docs; unknown models fall back client-side.
-fn official_context(model_id: &str) -> Option<i64> {
+/// Every native context window a model genuinely offers, ascending, with the upstream beta
+/// header each one requires (None = available by default).
+///
+/// A list rather than a single number because some models really do offer more than one native
+/// window, and collapsing that to one hid a real capability: Sonnet 4/4.5 ship 200K by default
+/// and 1M behind `context-1m`, and Gemini 1.5 Pro offers 1M and 2M. This is NOT the same axis as
+/// michael-compression's 1M/2M/5M tiers — those are windows this gateway manufactures on top of
+/// whatever the model natively has.
+///
+/// Anything listed with Some(beta) MUST have that header actually sent upstream (see the
+/// anthropic-beta wiring at the request builder), or the option is a 413 with extra steps.
+fn official_contexts(model_id: &str) -> Vec<(i64, Option<&'static str>)> {
     let m = model_id.to_lowercase();
     if m.contains("claude") || m.contains("sonnet") || m.contains("opus") || m.contains("haiku") || m.contains("fable") {
-        // 逐型号，不是一刀切 200K。原来那句注释「Claude 4.x/5 家族统一 200K（长上下文 beta
-        // 不按默认下发）」在 1M 还需要 beta 头的年代是对的，现在不是了：Opus 4.6/4.7/4.8/5、
-        // Sonnet 4.6/5、Fable 5 的**默认**上下文就是 1M（Opus 4.8 还明确是标准价、无长上下文溢价）。
-        // 一刀切 200K 等于把用户 4/5 的窗口白扔掉，而且卡片上显示的就是这个数。
-        // 权威来源：Anthropic Models API 的 max_input_tokens（GET /v1/models/{id}）。
         if m.contains("opus-4-6") || m.contains("opus-4-7") || m.contains("opus-4-8")
             || m.contains("opus-5") || m.contains("sonnet-4-6") || m.contains("sonnet-5")
             || m.contains("fable-5") || m.contains("mythos-5")
         {
-            return Some(1_000_000);
+            // 1M is both default and maximum on these — one native window, not a choice.
+            return vec![(1_000_000, None)];
         }
-        // Sonnet 4.5 / Haiku 4.5 / Opus 4.1 及更早：默认 200K
-        // （Sonnet 4.5 的 1M 要 context-1m beta 头，网关默认不下发，所以按 200K 记账才准确）。
-        return Some(200_000);
+        if m.contains("sonnet-4") {
+            // Sonnet 4 / 4.5: 200K default, 1M behind the beta header (Anthropic requires a
+            // sufficient usage tier for it; upstream may still refuse, which surfaces as a
+            // normal upstream error rather than a silent truncation).
+            return vec![(200_000, None), (1_000_000, Some("context-1m-2025-08-07"))];
+        }
+        return vec![(200_000, None)];
     }
     if m.contains("gpt-5") || m.contains("codex") {
-        // GPT-5 系（含 codex 变体）官方 400K 输入上下文。
-        return Some(400_000);
+        return vec![(400_000, None)];
     }
     if m.contains("gemini") {
-        // 1.5 Pro 是 2M，其余 Gemini 1M。这条必须排在通用 gemini 之前。
-        // （客户端的兜底表一直是 2M，服务端是 1M —— 两张表各说各话，而服务端这个数
-        //  用来规划 michael-compression、客户端那个用来做请求预算，分歧=静默 413 或白扔窗口。）
         if m.contains("1.5") && m.contains("pro") {
-            return Some(2_000_000);
+            return vec![(1_000_000, None), (2_000_000, None)];
         }
-        return Some(1_000_000);
+        return vec![(1_000_000, None)];
     }
     if m.contains("grok") || m.contains("xai") {
-        // xai/ 前缀但不含 grok 的型号此前落到 None→128k，客户端却按 256k 预算。
-        return Some(256_000);
+        return vec![(256_000, None)];
     }
     if m.contains("minimax") {
-        // official_price 有这些型号（在卖），official_context 却没有 —— 于是下发 null，
-        // 客户端只能猜。有价必须有窗口。
-        return Some(1_000_000);
+        return vec![(1_000_000, None)];
     }
     if m.contains("kimi") || m.contains("moonshot") || m.contains("k2") {
-        return Some(256_000);
+        return vec![(256_000, None)];
     }
     if m.contains("deepseek") {
-        return Some(128_000);
+        return vec![(128_000, None)];
     }
     if m.contains("glm") || m.contains("qwen") {
-        return Some(128_000);
+        return vec![(128_000, None)];
     }
-    None
+    vec![]
 }
 
+/// The DEFAULT native window — the first entry of official_contexts. Kept as the single number
+/// that budgeting and michael-compression plan against, so adding a beta-gated larger option
+/// never silently inflates anyone's budget.
+fn official_context(model_id: &str) -> Option<i64> {
+    official_contexts(model_id).first().map(|(tokens, _)| *tokens)
+}
 fn official_price(model_id: &str) -> Option<(f64, f64)> {
     let m = model_id.to_lowercase();
     // ---- Anthropic Claude (official list price) ----
