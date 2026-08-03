@@ -1,5 +1,5 @@
 # michael-design 脚手架层：只在从零 UI 项目需要时加载
 
 - 先检查现有 package.json、构建配置、样式入口、组件目录和主题 token。已有项目沿用当前框架与设计系统，本模块不能成为换栈或重建脚手架的理由。
-- 只有项目尚无前端栈且用户未点名框架时，使用 React + Vite + TypeScript + Tailwind v4 + shadcn/ui；用户点名 Vue 时用 shadcn-vue，点名其他框架则迁移同一语义令牌体系，不混框架。
+- 只有项目尚无前端栈且用户未点名框架时，使用 React + Vite + TypeScript + Tailwind v4 + shadcn/ui；用户点名 Vue 时用 shadcn-vue；点名其他框架、或项目本来就跑在别的栈上（含 Django/Flask/Jinja、Rails、PHP 等服务端渲染）时，**保留它原来的栈**，只把同一套语义令牌和组件语义搬过去，不混框架，也不要把项目改写成 React 或另起一个 React 前端。
 - Tailwind v4 接线：安装 `tailwindcss` 与 `@tailwindcss/vite`；Vite 加 `tailwindcss()` 和 `@` alias；tsconfig 配 `@/*` paths；CSS 入口使用 `@import "tailwindcss";` 与 `@custom-variant dark (&:is(.dark *));`；`cn()` 使用 `twMerge(clsx(...))`。只 `shadcn add` 页面真实用到的组件。

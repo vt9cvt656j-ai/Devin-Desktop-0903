@@ -34298,7 +34298,7 @@ const _MD_STACK_RULE =
   + "【绝对不要】新建 tailwind.config.js/ts 或 postcss.config.js，也不要装 postcss、autoprefixer、tailwindcss-animate——那些是 Tailwind v3 的做法，本栈一个都没有；"
   + "知识库蓝图里若出现 tailwind.config 或 theme.extend，一律翻译成 v4 的 @theme inline 写法，不要照抄建文件。"
   + "目录约定：shadcn 原件放 src/components/ui/，业务区块放 src/components/sections/。"
-  + "用户没点名框架就用这套，不要用 Vue / Next / Nuxt / SvelteKit，也不要退化成单个 index.html；用户明确点名别的框架才例外，已有项目按其现状走、不强行迁移。";
+  + "用户没点名框架就用这套，不要用 Vue / Next / Nuxt / SvelteKit，也不要退化成单个 index.html。【何时不用这套】只有两种：① 用户明确点名了别的框架；② 项目本来就跑在别的栈上（Vue/Svelte，或 Django/Flask/Jinja、Rails、PHP 这类服务端渲染）。这两种情况下**保留人家原来的栈**：不要改写成 React，不要在旁边另起一个 React 前端，不要为了「对齐 Michael Design」去动它的技术栈。要做的只是把**语义令牌**（background/foreground/card/muted/primary/secondary/accent/border/ring/radius 这套命名）和**组件语义**（variant/size/状态/图标语义/字阶）照搬到它自己的写法里：Vue 用 shadcn-vue，Svelte 用 shadcn-svelte，服务端模板就在它自己的 CSS 里用同名令牌、在模板里用同名 variant class。【不需要转换就别转换】已经是这套栈的项目，直接写功能，不要做任何迁移动作。";
 const _AGENT_ROLE_BLOCKS = {
   architect: `# 你的角色：架构师（专注边界、契约与演进路径）
 - 先读现有入口、依赖方向、数据流和部署事实，再给边界判断；不凭目录名臆测架构。
@@ -35677,7 +35677,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (p.ui || p.uiProject) {
     lines.push("UI/前端律：先读 README/package/src/data/assets/public/screenshots 等真实内容源；用户直接给出的链接、文案、名称、业务对象和限制就是第一事实来源，先逐条保留并在计划中落到对应区块，不能用默认品类猜测覆盖它。任何网站/UI 项目在第一次视觉实现前都必须取得 michael-design 三轨证据，把命中的结构、组件体系、素材 URL、动效参数和视觉令牌落进实现。用项目现有组件优先，shadcn/ui + Radix 只承担 Button/Dialog/Tabs/Accordion 等交互 primitive，不把每个区块都套 Card；Tailwind palette/theme token 统一配色，并建立中性族+主强调族+可选辅助族的全页契约，任何 section 不得突然硬编码陌生色相。卡片按真实数量选择 2/3/4 列、跨列和末行平衡；图标先理解对象/动作/状态，再映射 Bot/Mail/Shield/Chart 等具体语义，禁止 Sparkles/Wand 万能代替。构建后用真实浏览器桌面+手机视口验证布局、console/network 和关键交互。");
     if (p.designKnowledgeRequired) lines.push("michael-design 主编排律：IDE 首轮前固定完成三条主题检索，不能压成一条泛 query：① 业务信息架构、视觉样式、字阶/间距/圆角/阴影、shadcn/Radix 组件变体、Tailwind 配色和响应式网格；② 标志性滚动/状态动效、移动端参数与 prefers-reduced-motion；③ 真实媒体、头像、语义图标和卡片 surface。优先直接采用已注入证据，只有覆盖缺口才追加 knowledge_search；每条命中都记录来源 section、采用项、弃用项和实际落点，并形成“section → primitive/variant → Tailwind token/class → 页面落点”的映射。动效从知识库选彼此兼容的一组，禁止只写 fade-up 或把所有特效硬堆到一页。");
-    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：" + _MD_STACK_RULE + "并按 section/component/data 拆分；禁止退化成单个通用 index.html。只有用户明确要求原生 HTML，或已有技术栈与 React 不兼容时才例外；已有项目不得为满足本条强制迁移。");
+    if (p.fromZeroUiProject) lines.push("从零网站技术栈律：" + _MD_STACK_RULE + "并按 section/component/data 拆分；禁止退化成单个通用 index.html。用户明确要求原生 HTML 时才例外。已有项目一律按上面的「何时不用这套」处理：保留原栈、只搬令牌与组件语义，绝不迁移。");
     if (p.fullWebsite) lines.push("完整网站决策律：先按业务品类推导栏目与用户旅程，区块由真实旅程决定、逐块写满具体文案，禁止默认 Hero/Features/Pricing/CTA/Footer 套路，也禁止按固定区块数配额凑数；真实图片、视频或 GIF 必须成为内容的一部分。编码前明确数据库选择：不需要、本地持久化或服务端数据库，写出理由；需要账户、跨设备数据、后台管理、订单/预约/评论等持久业务时不能只做静态假界面，不需要时也不要为了显得复杂硬加数据库。");
     if (p.fullWebsite) lines.push("网站内容取证律：视觉实现前必须取得并记录一条真实内容证据，优先级为：工作区 README/产品文档/素材与既有文案 → 已知品牌的官方主站用 web_fetch 读正文 → generate_wiki 从当前代码提取真实功能 → 同品类公开资料只用于结构与事实核对。没有可验证产品事实时，先写 PRODUCT_BRIEF.md，明确“原创内容/假设/待确认”，再以这些边界写文案；不把搜索标题、竞品措辞或通用 AI 口号伪装成产品事实。");
     if (p.motionDesignRequired) lines.push("响应式动效律：至少规划微交互、分区入场、滚动叙事/状态转场三层节奏；高级方案必须写清知识库来源、目标区块、时间线/滚动进度、参数和移动端降级，不能把一个孤立 useScroll 或 clip-path 当全站高级动效。桌面与移动分别调整距离、节奏、并发和触发方式，并实现 prefers-reduced-motion/useReducedMotion。");
@@ -35868,7 +35868,7 @@ function _uiDesignCraftBlock(text, profile = null, opts = {}) {
   const referenceRule = _uiDesignReferenceRule(p);
   const transactionalRule = _uiDesignTransactionalRule(p);
   const greenfieldRule = p.fromZeroUiProject
-    ? "\n- 从零网站技术栈硬约束：" + _MD_STACK_RULE + "按 section/component/data 拆分并真正使用 Button/Dialog/Tabs 等 primitive、variant 和语义 Tailwind 类；禁止再次只生成一个通用 index.html。用户明确要求原生 HTML 或已有项目技术栈不兼容时才例外，已有项目不得强制迁移。"
+    ? "\n- 从零网站技术栈硬约束：" + _MD_STACK_RULE + "按 section/component/data 拆分并真正使用 Button/Dialog/Tabs 等 primitive、variant 和语义 Tailwind 类；禁止再次只生成一个通用 index.html。用户明确要求原生 HTML 时才例外。已有项目一律按上面的「何时不用这套」处理：保留原栈、只搬令牌与组件语义，绝不迁移。"
     : "";
   return `\n\n🎨 **前端设计工艺要求（UI/网页任务必须执行，不要复述）**
 - 所有网站/UI 项目都必须先使用本轮 IDE 已预取的 michael-design 三轨证据：信息架构/视觉样式/组件体系/Tailwind token，动效/响应式，媒体/头像/语义图标；仅覆盖有缺口时追加检索。每项实施计划必须写成“来源 section → shadcn/Radix primitive 与 variant → Tailwind semantic token/class → 页面落点”，不能只说“参考知识库”。

@@ -7,7 +7,7 @@
 // => these tests exercise the ACTUAL shipped code, not hand-copied duplicates that drift.
 //
 // Run:  node --test   (from ide/, or `npm test`)
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { basename, dirname, join } from "node:path";
@@ -11172,6 +11172,60 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
   // 声明与执行必须一致：web_scaffold 默认框架
   assert.match(SRC, /framework: String\(args\.framework \|\| "react"\)/,
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
+});
+
+test("别的栈只搬令牌，绝不把项目迁成 React", () => {
+  const rule = SRC.slice(SRC.indexOf("const _MD_STACK_RULE"), SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
+  // 三个分支：没点名 -> 原生直接建；已有别的栈 -> 保留原栈只搬语义；不需要转换就别转换
+  assert.match(rule, /保留人家原来的栈/, "已有别的栈必须保留，不得改写");
+  assert.match(rule, /不要改写成 React/, "必须明确禁止迁移到 React");
+  assert.match(rule, /不要在旁边另起一个 React 前端/, "也不得绕道另起 React 前端");
+  assert.ok(rule.includes("Django") && rule.includes("Flask"),
+    "必须点名服务端渲染栈——Python 项目正是 owner 举的例子");
+  assert.match(rule, /shadcn-vue/, "Vue 项目要用 shadcn-vue 而不是 React 版");
+  assert.match(rule, /不需要转换就别转换/, "已经是本栈的项目不得做任何迁移动作");
+
+  // 反向断言：那条把「和 React 不兼容」当唯一免转理由的escape clause必须消失。
+  // 它读起来是「只要能上 React 就该转」，Django 恰恰能上 React —— 正好授权了被禁止的迁移。
+  assert.doesNotMatch(SRC, /已有技术栈与 React 不兼容时才例外/,
+    "这条反向条款会授权 Python→React 迁移，必须删除而不是软化");
+  assert.doesNotMatch(SRC, /已有项目技术栈不兼容时才例外/, "同上，_uiDesignCraftBlock 那份也要删");
+});
+
+test("web_scaffold 铺的就是真实 Michael Design 基座", () => {
+  const RS = readFileSync(join(HERE, "../src-tauri/src/web_scaffold.rs"), "utf8");
+  // 空/未知框架必须落到 React——此前落到 Vue 分支，模型照着 React 提示却拿到 Vue 项目
+  assert.match(RS, /!matches!\(\s*fw\.as_str\(\),\s*"vue"/,
+    "只有明确点名 Vue 系才走 Vue；空值/未知一律 React");
+  assert.match(RS, /const MD_TEMPLATES: &\[\(&str, &str\)\] = &\[/, "模板表必须存在");
+  assert.match(RS, /include_str!\("\.\.\/templates\/michael-design\//, "模板用 include_str! 编进二进制");
+  // 旧的 JS 模板必须真的删掉，否则会和真实基座并存漂移
+  for (const dead of ["const MAIN_JSX:", "const APP_JSX:", "const VITE_CONFIG_REACT:"]) {
+    assert.ok(!RS.includes(dead), `被取代的旧 React 模板必须删除：${dead}`);
+  }
+  // 真实模板必须齐全且能编译（已在浏览器里验证过渲染）
+  const T = join(HERE, "../src-tauri/templates/michael-design");
+  for (const f of ["package.json", "tsconfig.json", "vite.config.ts", "src/index.css",
+                   "src/lib/utils.ts", "src/components/ui/button.tsx", "src/components/motion/section-reveal.tsx"]) {
+    assert.ok(existsSync(join(T, f)), `缺模板文件：${f}`);
+  }
+  const pkg = JSON.parse(readFileSync(join(T, "package.json"), "utf8"));
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  for (const d of ["react", "typescript", "tailwindcss", "@tailwindcss/vite",
+                   "class-variance-authority", "clsx", "tailwind-merge", "lucide-react"]) {
+    assert.ok(deps[d], `模板 package.json 缺少 ${d}`);
+  }
+  assert.ok(!deps.sonner, "sonner 在真实站点零引用，不得进模板");
+  assert.ok(!deps.gsap, "gsap 只服务一个滚动叙事区块，不属于基座");
+  assert.ok(!deps.postcss && !deps.autoprefixer, "Tailwind v4 CSS-first：不得带 postcss/autoprefixer");
+  assert.ok(!existsSync(join(T, "tailwind.config.js")) && !existsSync(join(T, "postcss.config.js")),
+    "模板里不得出现 v3 配置文件");
+  // 令牌必须是真站点那套（十六进制 zinc + @theme inline），不是通用 shadcn oklch
+  const css = readFileSync(join(T, "src/index.css"), "utf8");
+  assert.match(css, /@import "tailwindcss";/, "CSS 入口必须是 v4 写法");
+  assert.match(css, /@theme inline/, "令牌必须通过 @theme inline 注册");
+  assert.match(css, /--radius:\s*0\.75rem/, "圆角标量必须和真实站点一致");
+  assert.doesNotMatch(css, /oklch\(/, "真实站点用十六进制 zinc，不是 oklch");
 });
 
 test("_runHasOrientationFacts counts only what the run actually observed", () => {
