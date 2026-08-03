@@ -16626,7 +16626,7 @@ const _TRUTHFULNESS_FALLBACK = `\n\n真实性优先：先用知识和推理回�
 // This compact contract is what is sent on every fallback turn. Detailed domain
 // constraints stay with their tool schemas and verification code instead of making
 // ordinary conversation slow or bureaucratic.
-const _HUMAN_EVIDENCE_FALLBACK = `\n\n像在和人一起解决问题一样说话：先给结论或当前进展，再给必要的依据；不要复述内部规则、工具流水账或固定模板。稳定事实可直接推理；会变化、影响决策或用户明确要求实时的信息，按需使用真实项目、终端、网页、官方接口或可靠来源核实。工具被调用不等于目标成功，修改、运行、部署和外部操作都要看实际结果、退出码、响应或界面状态。没有证据就说未知，不编造链接、数据、文件内容、接口或完成状态。不要用 mock、演示数据、占位结果或“看起来能用”的实现替代用户要求的真实交付。`;
+const _HUMAN_EVIDENCE_FALLBACK = `\n\n像在和人一起解决问题一样说话：先给结论或当前进展，再给必要的依据；不要复述内部规则、工具流水账或固定模板。稳定事实可直接推理；会变化、影响决策或用户明确要求实时的信息，按需使用真实项目、终端、网页、官方接口或可靠来源核实。工具被调用不等于目标成功，修改、运行、部署和外部操作都要看实际结果、退出码、响应或界面状态。没有证据就说未知，不编造链接、数据、文件内容、接口或完成状态。不要用 mock、演示数据、占位结果或“看起来能用”的实现替代用户要求的真实交付。用户是新手还是老手都不改变交付标准——代码是你写的，别因为觉得“对方是初学者/从零开始”就擅自砍成最小可用原型(MVP)或阉割版；按用户真正要的那个完整、能真实使用的东西来做，只有用户明确说“先来个最简版/demo/占位”时才降规格。`;
 const _AI_MODE_PROMPTS = {
   agent: `你是 Michael IDE 的协作式编码 AI，用中文自然直接地交流。先理解人真正想要的结果：明确要求修改、实现、运行、提交或部署时，使用真实工具完成并验证；只是提问、讨论或让你评估时，只读调查和回答，不擅自制造副作用。已知目标直接读取，未知位置才定位；改已有文件前先读当前原文。改 package.json/锁文件/依赖版本前先用 package_search/官方 registry 核对 latest、版本历史、engines、peerDependencies，不能凭记忆猜版本。多文件、跨模块或外部操作可用 update_plan 给出完整而简洁的路线，状态只随真实证据推进。选择工具看任务语义、当前证据和工具结果，不依赖关键词或正则路由；需要当前资料时再联网，优先一手来源和真实响应。
 
@@ -34176,12 +34176,19 @@ function _recordRunKnownContent(run, root, content, ...paths) {
   const signature = _contentSignature(value);
   return _recordRunKnownSignature(run, root, signature, total, run._toolBatch || 0, ...paths);
 }
+// A worker dispatched with no declared scope gets this sentinel: it may write anywhere in
+// the workspace, but the dispatcher runs it EXCLUSIVELY (serialized) so a lone writer can't
+// race a sibling. Not a real path — never produced by _normRel — so it can't collide with
+// a genuine scope entry.
+const WORKER_SCOPE_ALL = "*";
 // Is `target` inside one of the worker's scope entries (a file == entry, or under a
 // dir entry)? Absolute paths that escape root, or "..", are never in scope.
 function _pathInScope(target, scopeRel, root) {
   if (!scopeRel || !scopeRel.length) return false;
   const t = _normRel(target, root);
   if (!t || t.startsWith("..") || t.startsWith("/")) return false;
+  // Whole-workspace worker: any in-root, non-escaping path is writable.
+  if (scopeRel.includes(WORKER_SCOPE_ALL)) return true;
   return scopeRel.some((s) => { const e = s.replace(/\/+$/, ""); return t === e || t.startsWith(e + "/"); });
 }
 function _mutationPathIssue(requested, resolved, root, run, allowReadBinding = true) {
@@ -34205,6 +34212,8 @@ function _mutationPathIssue(requested, resolved, root, run, allowReadBinding = t
 }
 // Do two scopes share any file? (entry equal, or one nested under the other.)
 function _scopesOverlap(a, b) {
+  // A whole-workspace scope overlaps everything — that's what forces its worker to serialize.
+  if (a.includes(WORKER_SCOPE_ALL) || b.includes(WORKER_SCOPE_ALL)) return true;
   const within = (x, y) => x === y || x.startsWith(y + "/") || y.startsWith(x + "/");
   return a.some((x) => b.some((y) => within(x.replace(/\/+$/, ""), y.replace(/\/+$/, ""))));
 }
@@ -34447,13 +34456,17 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // Worker mode: declared scope → root-relative; the worker may only modify files
   // inside it. Disjoint scopes across concurrent workers = no write conflict.
   const scopeRel = write ? (Array.isArray(scope) ? scope : [scope]).map((s) => _normRel(s, root)).filter(Boolean) : [];
+  // Model omitted scope (or scoped to the workspace root, which normalizes away). That's a
+  // recoverable slip, not a dead end: grant the whole workspace and run exclusively (below).
+  if (write && !scopeRel.length) scopeRel.push(WORKER_SCOPE_ALL);
+  const _scopeIsWholeWs = write && scopeRel.includes(WORKER_SCOPE_ALL);
   const card = document.createElement("div");
   card.className = "agent-tool-step agent-tool-step--subagent is-open";
   card.innerHTML =
     `<div class="agent-tool-row">` +
     `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
     `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a2 2 0 011 3.732V6h3.25A2.75 2.75 0 0115 8.75v3.5A2.75 2.75 0 0112.25 15h-8.5A2.75 2.75 0 011 12.25v-3.5A2.75 2.75 0 013.75 6H7V4.732A2 2 0 018 1zM5.5 9.5a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg></div>` +
-    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${write ? "worker" : "子智能体"}</span><span class="atc-path">${_escHtml(description)}${write && scopeRel.length ? " · scope: " + _escHtml(scopeRel.join(", ")) : ""}</span></div></div>` +
+    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${write ? "worker" : "子智能体"}</span><span class="atc-path">${_escHtml(description)}${write && scopeRel.length ? " · scope: " + _escHtml(_scopeIsWholeWs ? "整个工作区(独占串行)" : scopeRel.join(", ")) : ""}</span></div></div>` +
     `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
     `<div class="atc-viewport"></div>`;
   card.querySelector(".agent-tool-row").addEventListener("click", () => card.classList.toggle("is-open"));
@@ -34496,20 +34509,39 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       res.className = "atc-result atc-result--blocked"; res.textContent = "⛔ 只读模式"; card.classList.remove("is-open");
       return "[BLOCKED] 当前是只读模式（Explorer / Plan / Reviewer），不能用 run_worker 改文件。需要改代码请切到 Agent 模式。";
     }
-    if (!scopeRel.length) {
-      res.className = "atc-result atc-result--err"; res.textContent = "缺少 scope"; card.classList.remove("is-open");
-      return "[ERROR] run_worker 需要非空 scope（本 worker 可改的文件 / 目录，相对工作区根）。";
-    }
+    // Scope is a permission boundary, so it's enforced structurally — but an empty or
+    // overlapping scope is a recoverable slip, not a dead end that burns a reseller round-trip.
+    // Recovery is serialization: a whole-workspace worker (or one that overlaps a running
+    // sibling) WAITS for the conflicting worker to finish, then runs — never concurrently,
+    // so no write race regardless of which files it touches. Only two workers the model
+    // declared with EXPLICIT scopes that overlap stay a hard error (a real modelling mistake
+    // worth surfacing so it splits them). The claim is atomic: no await between the
+    // no-conflict check and the push, so two siblings can't both register the same paths.
     run._activeWorkerScopes = run._activeWorkerScopes || [];
-    if (run._activeWorkerScopes.some((s) => _scopesOverlap(s, scopeRel))) {
-      res.className = "atc-result atc-result--err"; res.textContent = "scope 重叠"; card.classList.remove("is-open");
-      return `[ERROR] 这个 worker 的 scope（${scopeRel.join(", ")}）与另一个正在运行的 worker 重叠。并行 worker 的 scope 必须**互不重叠**——把这块拆成不相交的文件 / 目录，或改为串行（等上一个 worker 结束再派）。`;
+    for (;;) {
+      if (!_live()) {
+        res.className = "atc-result atc-result--err"; res.textContent = "已中断"; card.classList.remove("is-open");
+        return "[interrupted]"; // finally frees the slot; scope not yet registered, nothing to unwind
+      }
+      const conflict = run._activeWorkerScopes.find((s) => _scopesOverlap(s, scopeRel));
+      if (!conflict) { run._activeWorkerScopes.push(scopeRel); break; }
+      if (!_scopeIsWholeWs && !conflict.includes(WORKER_SCOPE_ALL)) {
+        res.className = "atc-result atc-result--err"; res.textContent = "scope 重叠"; card.classList.remove("is-open");
+        return `[ERROR] 这个 worker 的 scope（${scopeRel.join(", ")}）与另一个正在运行的 worker 重叠。并行 worker 的 scope 必须**互不重叠**——把这块拆成不相交的文件 / 目录，或改为串行（等上一个 worker 结束再派）。`;
+      }
+      // Whole-workspace worker on either side → serialize: wait for a sibling to release,
+      // then re-check. _workerScopeWaiters is drained in the finally that unregisters scope.
+      res.textContent = "排队中";
+      await new Promise((resolve) => { (run._workerScopeWaiters ||= []).push(resolve); setTimeout(resolve, 15000); });
+      res.innerHTML = '<span class="atc-spin"></span>';
     }
-    run._activeWorkerScopes.push(scopeRel);
   }
 
+  const _scopeGuidance = _scopeIsWholeWs
+    ? `\n\n# 你的可改范围(scope)\n本次没有细分 scope：你可以改整个工作区，但你是**独占串行**运行（同一时刻只有你在写文件）。请只改这块子任务真正需要的文件，别越界重写别人的部分。`
+    : `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`;
   const sysPrompt = (write
-    ? _WORKER_SYSTEM + `\n\n# 你的可改范围(scope)\n你**只能修改**下面这些路径内的文件（相对工作区根），其余文件只读：\n${scopeRel.map((s) => "- " + s).join("\n")}`
+    ? _WORKER_SYSTEM + _scopeGuidance
     : _SUBAGENT_SYSTEM) + _agentRoleBlock(role) + (run?.skillsBlock ?? _activeSkillsBlock());
   // Retrieval is ranked by the CHILD'S OWN TASK, not an empty string. The empty query
   // silently disabled three paths at once: _buildRepoMap degraded to pure symbol-count
@@ -34802,6 +34834,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     if (write && run._activeWorkerScopes) {
       const idx = run._activeWorkerScopes.indexOf(scopeRel);
       if (idx >= 0) run._activeWorkerScopes.splice(idx, 1);
+      // Wake every worker queued behind this scope so they re-check overlap; only one will
+      // win the atomic claim, the rest re-queue. Draining all avoids a lost-wakeup stall.
+      (run._workerScopeWaiters || []).splice(0).forEach((r) => { try { r(); } catch {} });
     }
     // === Cleanup: cancel timeout & decrement counter ===
     clearTimeout(timeoutId);

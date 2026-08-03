@@ -11112,6 +11112,57 @@ test("adjacent run_worker calls execute as a parallel segment, still barriered f
   assert.ok(events.indexOf("worker4") < events.indexOf("read5"), "worker 段完成后才轮到后续读");
 });
 
+test("_scopesOverlap: whole-workspace sentinel collides with any scope; disjoint dirs don't", () => {
+  const overlap = load("_scopesOverlap", { WORKER_SCOPE_ALL: "*" });
+  // disjoint explicit scopes → parallel-safe, must NOT report overlap
+  assert.equal(overlap(["packages/frontend"], ["packages/backend"]), false);
+  assert.equal(overlap(["src/api"], ["src/ui"]), false);
+  // nested paths overlap
+  assert.equal(overlap(["src"], ["src/api"]), true);
+  // the sentinel overlaps everything on either side → this is what forces serialization
+  assert.equal(overlap(["*"], ["packages/frontend"]), true);
+  assert.equal(overlap(["packages/backend"], ["*"]), true);
+  assert.equal(overlap(["*"], ["*"]), true);
+});
+
+test("_pathInScope: whole-workspace sentinel admits any in-root path but still blocks escapes", () => {
+  const stubNorm = (p) => String(p).replace(/^\.\//, "").replace(/\/+$/, "");
+  const inScope = load("_pathInScope", { _normRel: stubNorm, WORKER_SCOPE_ALL: "*" });
+  const root = "/ws";
+  // sentinel: any normal in-root path is writable (that's the whole point of the fallback)
+  assert.equal(inScope("packages/frontend/App.tsx", ["*"], root), true);
+  assert.equal(inScope("anything/deep/here.ts", ["*"], root), true);
+  // …but escapes are refused even for a whole-workspace worker
+  assert.equal(inScope("../outside.ts", ["*"], root), false);
+  assert.equal(inScope("/etc/passwd", ["*"], root), false);
+  // empty scope is never in-scope; explicit scope is still gated exactly
+  assert.equal(inScope("a.ts", [], root), false);
+  assert.equal(inScope("src/api/x.ts", ["src/api"], root), true);
+  assert.equal(inScope("src/ui/x.ts", ["src/api"], root), false);
+});
+
+test("worker with no scope recovers to a serialized whole-workspace run, not a hard error", () => {
+  const src = extractFn("_runSubAgent");
+  // empty / root-collapsed scope → sentinel, instead of the old dead-end "缺少 scope"
+  assert.match(src, /if \(write && !scopeRel\.length\) scopeRel\.push\(WORKER_SCOPE_ALL\)/,
+    "empty scope must fall back to the whole-workspace sentinel");
+  assert.doesNotMatch(src, /缺少 scope/, "the terminal missing-scope error must be gone");
+  // conflicting / whole-workspace workers queue and serialize rather than failing
+  assert.match(src, /_workerScopeWaiters/, "conflicting workers must queue, not fail");
+  assert.match(src, /run\._workerScopeWaiters \|\| \[\]\)\.splice\(0\)\.forEach/,
+    "the finally must wake queued siblings so they re-check overlap");
+  // the claim must be atomic: push immediately follows the no-conflict check, no await between
+  assert.match(src, /if \(!conflict\) \{ run\._activeWorkerScopes\.push\(scopeRel\); break; \}/,
+    "the scope claim must be atomic (no await between check and push)");
+  // two EXPLICIT overlapping scopes are still surfaced as a real modelling error
+  assert.match(src, /scope 重叠/, "explicit overlapping scopes still error to teach a disjoint split");
+});
+
+test("delivery standard forbids self-downgrading a real deliverable to an MVP (beginner ≠ smaller build)", () => {
+  assert.match(SRC, /用户是新手还是老手都不改变交付标准/, "user skill level must not change the delivery bar");
+  assert.match(SRC, /擅自砍成最小可用原型\(MVP\)/, "must explicitly forbid auto-downgrading a real build to an MVP");
+});
+
 test("an edit merged into item zero never gets its own card or staging work", () => {
   const isMerged = load("_isMergedToolItem");
   assert.equal(isMerged({ merged: 0 }), true, "index zero is a valid merge target");
