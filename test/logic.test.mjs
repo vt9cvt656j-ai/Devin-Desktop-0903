@@ -12798,7 +12798,21 @@ test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     setAttribute(n, v) { this.attributes.set(n, String(v)); }
     getAttribute(n) { return this.attributes.get(n) ?? null; }
-    addEventListener() {}
+    // Real classList backed by className — code cards fold via classes, so a stub without
+    // this silently makes every fold assertion untestable (or throws).
+    get classList() {
+      const own = this;
+      const set = () => new Set(String(own.className || "").split(/\s+/).filter(Boolean));
+      const put = (s) => { own.className = [...s].join(" "); };
+      return {
+        add: (...cs) => { const s = set(); cs.forEach((c) => s.add(c)); put(s); },
+        remove: (...cs) => { const s = set(); cs.forEach((c) => s.delete(c)); put(s); },
+        contains: (c) => set().has(c),
+        toggle: (c) => { const s = set(); if (s.has(c)) { s.delete(c); put(s); return false; } s.add(c); put(s); return true; },
+      };
+    }
+    addEventListener(type, fn) { (this._ev ||= {})[type] = fn; }
+    _fire(type) { this._ev?.[type]?.({ stopPropagation() {} }); }
     querySelector() { return null; }
     set textContent(v) { this._text = String(v ?? ""); this.childNodes = []; }
     get textContent() { return this._text + this.childNodes.map((c) => c.textContent || "").join(""); }
@@ -12848,6 +12862,39 @@ test("流式Markdown增量渲染：settle 前缀不重建，divergence 只回滚
     // 清掉之后仍可继续流式（重新建状态），不是把容器打死。
     renderMarkdownStream(box, "Restarted stream.\n\n", o);
     assert.match(box.textContent, /Restarted stream\./, "清状态后必须还能重新流式渲染");
+
+    // 5) 长代码卡就地折叠：完成的长代码块收成一行标题，正文 display:none 不参与布局。
+    const longCode = Array.from({ length: 40 }, (_, i) => `const line${i} = ${i};`).join("\n");
+    const findCard = (root) => {
+      if (root.className && String(root.className).includes("code-card") && !String(root.className).includes("__")) return root;
+      for (const kid of root.childNodes) { const hit = findCard(kid); if (hit) return hit; }
+      return null;
+    };
+    const long = new _N("div");
+    renderMarkdownInto(long, "见下：\n\n```js\n" + longCode + "\n```\n", {});
+    const longCard = findCard(long);
+    assert.ok(longCard, "长代码块必须渲染成 code-card");
+    assert.ok(longCard.classList.contains("is-foldable"), "超过阈值的代码卡必须可折叠");
+    assert.ok(longCard.classList.contains("is-folded"), "完成的长代码卡默认折叠");
+    assert.match(longCard.textContent, /40 行/, "折叠态必须显示行数，用户才知道里面有多少");
+    assert.match(longCard.textContent, /const line0 = 0;/, "正文仍在 DOM 里（靠 CSS 收起），展开无需重渲染");
+    longCard.childNodes[0]._fire("click"); // childNodes[0] 是 .code-card__head
+    assert.equal(longCard.classList.contains("is-folded"), false, "点标题必须展开");
+
+    // 短代码块不折叠，也不该多出折叠装饰
+    const short = new _N("div");
+    renderMarkdownInto(short, "```js\nconst a = 1;\n```\n", {});
+    const shortCard = findCard(short);
+    assert.equal(shortCard.classList.contains("is-foldable"), false, "短代码块不应折叠");
+    assert.doesNotMatch(shortCard.textContent, /行/, "短代码块不该显示行数装饰");
+
+    // 流式途中的代码卡绝不能折叠——正在写的代码必须看得见
+    const live = new _N("div");
+    renderMarkdownStream(live, "```js\n" + longCode, { streaming: true, showCaret: false });
+    const liveCard = findCard(live);
+    assert.ok(liveCard, "流式途中也有 code-card");
+    assert.equal(liveCard.classList.contains("is-folded"), false,
+      "正在流式写入的代码卡不得自动折叠，否则用户看不到代码在生成");
   } finally {
     if (prevDoc === undefined) delete globalThis.document;
     else globalThis.document = prevDoc;
@@ -14056,32 +14103,44 @@ test("草稿保存不得在节流之上展平累计正文（长内容卡死/崩�
   assert.equal(JSON.parse(ls.getItem(KEY)).text, "真实内容", "真实内容照常落盘");
 });
 
-test("终端卡与工具卡一样会自动折叠，且折叠计数是 O(1)", () => {
+test("旧工具卡就地折叠，不再被搬进 Activity 抽屉", () => {
   const collapse = extractFn("_collapseSettledToolSteps");
-  // 终端卡的类名被 cmd 执行器整个改写成 .agent-term-card，只匹配 .agent-tool-step
-  // 会把每条 shell 命令排除在折叠之外 —— 命令卡因此永远全高堆在聊天里。
-  assert.match(collapse, /contains\("agent-tool-step"\) \|\| node\.classList\?\.contains\("agent-term-card"\)/,
-    "折叠必须同时认识工具卡和终端卡");
-  // 折进活动日志时顺手收起：diff/预览卡被执行器强制展开且从无人关闭，
-  // 展开活动日志会一次性铺开所有历史 diff。
-  assert.match(collapse, /card\.classList\.remove\("is-open"\);/,
-    "折进活动日志的卡片必须同时收起，否则展开日志会一次性铺开全部历史 diff");
-  // 计数不得再遍历不断增长的日志子树
-  assert.doesNotMatch(stripJsComments(collapse), /log\.querySelectorAll/,
-    "计数遍历整棵活动日志子树会让折叠本身变成 O(n²)");
-  assert.match(collapse, /Number\(log\.dataset\.settledCount\) \|\| 0\) \+ moved/,
-    "计数必须是 O(1) 累加");
-
-  // 终端命令结束时必须真的进入折叠流程（否则上面的支持是死代码）
-  const term = extractFn("_agentRunInTerminal");
-  assert.match(term, /stepEl\.dataset\.toolSettled = "1";/,
-    "命令结束必须标记已结算——_settleToolStep 因为找不到 .atc-result 会提前 return");
-  assert.match(term, /_collapseSettledToolSteps\(stepEl\)/, "命令结束必须触发折叠");
-
-  // 终端卡也要有视口外容器化（此前只有 .agent-tool-step/.think-card 有）
+  const code = stripJsComments(collapse);
+  // 「Activity (N steps)」抽屉整体删除：折叠就该是就地收起正文，而不是把卡片搬去
+  // 第二个容器让用户再翻一遍。
+  assert.doesNotMatch(code, /agent-activity-log/, "Activity 抽屉必须彻底删除，不留搬运逻辑");
+  assert.doesNotMatch(code, /appendChild|insertBefore/, "折叠不得再移动任何卡片（就地折叠）");
+  assert.doesNotMatch(code, /querySelectorAll/, "不得再遍历不断增长的子树计数");
   const CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  assert.doesNotMatch(CSS, /^\.agent-activity-log \{/m, "抽屉的样式也必须删掉");
+
+  // 终端卡的类名被 cmd 执行器整个改写成 .agent-term-card，只认 .agent-tool-step
+  // 会把每条 shell 命令排除在外。
+  assert.match(code, /contains\("agent-tool-step"\) \|\| node\.classList\?\.contains\("agent-term-card"\)/,
+    "折叠必须同时认识工具卡和终端卡");
+  // 只折一次：用户特意展开来读的卡片不能被后续 settle 再次关上
+  assert.match(code, /dataset\.autoFolded === "1"\) continue;/, "已折叠过的卡片不得反复关闭");
   assert.match(CSS, /\.agent-term-card \{ content-visibility: auto;/,
     "终端卡必须有 content-visibility，否则视口外仍付全额布局绘制成本");
+
+  // 行为：最新 3 张保持展开，更早的就地收起且不挪位置
+  const mk = (open) => {
+    let cls = "agent-tool-step" + (open ? " is-open" : "");
+    return {
+      dataset: { toolSettled: "1" }, className: cls,
+      classList: { contains: (c) => cls.split(" ").includes(c), remove: (c) => { cls = cls.split(" ").filter((x) => x !== c).join(" "); } },
+      get _cls() { return cls; },
+    };
+  };
+  const cards = [mk(true), mk(true), mk(true), mk(true), mk(true)];
+  const scope = { children: cards, classList: { contains: () => false } };
+  const fold = load("_collapseSettledToolSteps", { _TOOL_ACTIVITY_VISIBLE: 3 });
+  fold({ parentElement: scope });
+  assert.equal(cards[0]._cls.includes("is-open"), false, "最早的卡片必须折叠");
+  assert.equal(cards[1]._cls.includes("is-open"), false, "次早的卡片必须折叠");
+  assert.equal(cards[2]._cls.includes("is-open"), true, "最新 3 张保持展开");
+  assert.equal(cards[4]._cls.includes("is-open"), true, "当前卡片当然保持展开");
+  assert.equal(cards.length, 5, "卡片不得被移出原位置");
 });
 
 test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步写全量草稿", () => {

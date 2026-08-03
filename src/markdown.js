@@ -630,17 +630,37 @@ function dedent(line, cols) {
 }
 
 // ---- code card ----
+// A code block longer than this folds to just its header once it is complete. Long code is
+// what makes a transcript unscrollable: three 300-line blocks push everything else off the
+// page. Folded, each is one row that says what it is and how big — click to open.
+const CODE_CARD_FOLD_LINES = 16;
 function codeCard(code, lang, filename, ctx) {
   const card = el("div", "code-card");
   card.dataset.lang = monacoLang(lang);
 
   const head = el("div", "code-card__head");
   const label = el("span", "code-card__lang");
+  const lineCount = String(code ?? "").replace(/\n$/, "").split("\n").length;
+  const foldable = lineCount > CODE_CARD_FOLD_LINES;
+  if (foldable) label.appendChild(el("span", "code-card__chev"));
   label.appendChild(langIcon(lang));
   const labelText = el("span");
   labelText.textContent = filename || langLabel(lang);
   label.appendChild(labelText);
+  if (foldable) {
+    const meta = el("span", "code-card__meta");
+    meta.textContent = `${lineCount} 行`;
+    label.appendChild(meta);
+  }
   head.appendChild(label);
+  if (foldable) {
+    card.classList.add("is-foldable");
+    // Auto-fold only a COMPLETE block. While the model is still writing the code you must be
+    // able to watch it arrive, so a card built during streaming starts open; the final render
+    // (streaming:false) rebuilds it folded. Restored history renders folded for the same reason.
+    if (!ctx || !ctx.streaming) card.classList.add("is-folded");
+    head.addEventListener("click", () => card.classList.toggle("is-folded"));
+  }
 
   const copy = el("button", "code-card__copy");
   copy.type = "button";
@@ -648,7 +668,8 @@ function codeCard(code, lang, filename, ctx) {
   const copyText = el("span");
   copyText.textContent = "";
   copy.appendChild(copyText);
-  copy.addEventListener("click", () => {
+  copy.addEventListener("click", (event) => {
+    event?.stopPropagation?.(); // the head toggles the fold; copying must not also collapse it
     const write = navigator.clipboard?.writeText
       ? navigator.clipboard.writeText(code)
       : Promise.reject();

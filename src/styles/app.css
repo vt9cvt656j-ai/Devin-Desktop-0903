@@ -4711,26 +4711,8 @@ body.zen-mode .editor {
    Borders use --line-strong, NOT --border: --border is defined nowhere in this stylesheet,
    so `var(--border, …)` silently pinned a light-grey hairline that stayed light on dark. */
 .agent-tool-step { overflow: hidden; }
-.agent-activity-log {
-  margin: 6px 0;
-  border: 1px solid var(--line-strong, rgba(128, 128, 128, .28));
-  border-radius: 6px;
-  background: var(--panel, transparent);
-  color: var(--text-dim, #6b7280);
-}
-.agent-activity-log > summary {
-  padding: 6px 10px;
-  font-size: 12px;
-  line-height: 1.2;
-  cursor: pointer;
-  user-select: none;
-}
-.agent-activity-log__body {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 0 6px 6px;
-}
+/* 「Activity (N steps)」抽屉已删除：它把旧卡片搬进另一个容器，等于把内容藏到第二个地方
+   让用户再去翻，而不是就地收起。工具卡现在和代码卡一样原地折叠——卡片不挪窝，只收起正文。 */
 /* 长对话性能（跑着跑着就卡的根因）：视口外的消息行/工具卡用 content-visibility: auto
    完全跳过布局与绘制——DOM 再长每帧也只为可见部分付渲染成本。contain-intrinsic-size
    记住/预估高度，滚动条稳定、锚点不跳；流式尾部消息在视口内，渲染不受影响。
@@ -5166,6 +5148,45 @@ body.zen-mode .editor {
   padding: 0 6px 0 12px;
   background: var(--panel-2);
   border-bottom: 1px solid var(--line);
+}
+/* 长代码块折叠：完成后的代码卡收成一行标题，点标题展开。长代码是聊天变得没法滚动的
+   主因——三个 300 行的块就能把其他内容全顶出屏幕。折叠后 body 不参与布局与绘制。 */
+.code-card.is-foldable .code-card__head { cursor: pointer; user-select: none; }
+.code-card.is-folded .code-card__body { display: none; }
+/* 折叠态整张卡就只剩这一条 head，所以卡片自身背景看不见（也会被后面的 .dark .code-card
+   盖掉），不再重复设置；只需要去掉 head 的下边框，避免和卡片圆角边框叠成双线。
+   这条 (0,3,0) 高于深色主题的 (0,2,0)，两种主题都生效。 */
+.code-card.is-folded .code-card__head { border-bottom-color: transparent; }
+.code-card__meta {
+  flex: none;
+  margin-left: 2px;
+  padding-left: 8px;
+  border-left: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  opacity: .8;
+}
+.code-card__chev {
+  position: relative;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  margin-right: 1px;
+  transform: rotate(45deg);          /* 展开时朝下 */
+  transition: transform .15s ease;
+}
+.code-card.is-folded .code-card__chev { transform: rotate(-45deg); } /* 折叠时朝右 */
+.code-card__chev::before {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: 1px;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  opacity: .75;
 }
 .code-card__lang {
   display: inline-flex;

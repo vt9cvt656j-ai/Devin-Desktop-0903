@@ -41146,45 +41146,31 @@ function _settleToolStep(step, result, label = "") {
   return true;
 }
 
-const _TOOL_ACTIVITY_VISIBLE = 6;
+// How many of the newest settled tool cards stay expanded. Older ones fold IN PLACE.
+const _TOOL_ACTIVITY_VISIBLE = 3;
+// Fold older settled tool cards the same way a code card folds: the card keeps its position
+// and its header, and only its body collapses. One click reopens it.
+//
+// This previously RELOCATED older cards into a `<details class="agent-activity-log">` drawer.
+// That was the wrong model — it did not fold anything, it moved the content to a second place
+// the user had to go find, and it left every card inside expanded. Drawer deleted.
 function _collapseSettledToolSteps(step) {
   const scope = step?.parentElement;
-  if (!scope?.children || scope.classList?.contains("atc-viewport") || scope.closest?.(".agent-activity-log")) return;
+  if (!scope?.children || scope.classList?.contains("atc-viewport")) return;
   const settled = Array.from(scope.children).filter((node) =>
     // Terminal cards are `.agent-term-card` (the cmd executor rewrites the className), so
-    // matching only `.agent-tool-step` silently excluded every shell command from folding.
+    // matching only `.agent-tool-step` silently excluded every shell command.
     (node.classList?.contains("agent-tool-step") || node.classList?.contains("agent-term-card"))
     && node.dataset?.toolSettled === "1"
     && !node.classList.contains("agent-tool-step--askuser")
   );
-  let log = scope.querySelector(":scope > .agent-activity-log");
-  let moved = 0;
-  if (settled.length > _TOOL_ACTIVITY_VISIBLE) {
-    if (!log) {
-      log = document.createElement("details");
-      log.className = "agent-activity-log";
-      log.innerHTML = '<summary></summary><div class="agent-activity-log__body"></div>';
-      scope.insertBefore(log, settled[0]);
-    }
-    const overflow = settled.slice(0, settled.length - _TOOL_ACTIVITY_VISIBLE);
-    const body = log.querySelector(".agent-activity-log__body");
-    for (const card of overflow) {
-      // Fold it shut on the way in. Diff/preview cards are force-opened by their executors and
-      // nothing ever closed them, so expanding the Activity log dumped every historical diff at
-      // full height in one frame. Collapsed, each is one row until the user asks for it.
-      card.classList.remove("is-open");
-      body?.appendChild(card);
-      moved++;
-    }
-  }
-  if (log) {
-    // O(1). This used to be log.querySelectorAll(...).length on every settle — a full walk of
-    // the activity log's ENTIRE subtree, which only ever grows, and whose folded cards can hold
-    // thousands of nodes each (JSON dumps, images, diffs). That made the fold pass itself
-    // O(n²) across a long run. Cards are only ever added to the log here, so just count them.
-    const count = (Number(log.dataset.settledCount) || 0) + moved;
-    log.dataset.settledCount = String(count);
-    log.querySelector("summary").textContent = `Activity (${count} steps)`;
+  const older = settled.slice(0, Math.max(0, settled.length - _TOOL_ACTIVITY_VISIBLE));
+  for (const card of older) {
+    // Fold each card at most once, ever. Re-folding on every subsequent settle would slam shut
+    // a card the user had deliberately reopened to read.
+    if (!card.dataset || card.dataset.autoFolded === "1") continue;
+    card.dataset.autoFolded = "1";
+    card.classList.remove("is-open");
   }
 }
 
