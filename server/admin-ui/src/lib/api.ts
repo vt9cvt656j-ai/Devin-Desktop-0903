@@ -51,12 +51,14 @@ export const api = {
   del: <T,>(p: string) => request<T>(p, { method: "DELETE" }),
 };
 
-export async function login(email: string, password: string) {
-  // The field is `email` — auth.rs LoginReq { email, password }. Sending `account` (which is what
-  // the old console LABELS the box) gets a 422 "missing field `email`" and no login at all.
+export async function login(identity: string, password: string) {
+  // The WIRE field is still `email` — auth.rs LoginReq { email, password } — but the server now
+  // resolves it as an email OR a username (find_user tries email first, then username). Keep
+  // sending `email`; renaming the key would 422. Sending `account`, which is what the old console
+  // labels the box, is exactly the bug that made login impossible earlier.
   const r = await api.post<{ token: string; user?: { role?: string; email?: string } }>(
     "/api/auth/login",
-    { email, password },
+    { email: identity, password },
   );
   if (!r?.token) throw new ApiError(500, "登录响应缺少 token");
   auth.set(r.token);

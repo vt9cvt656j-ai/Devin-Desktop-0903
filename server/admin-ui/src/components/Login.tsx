@@ -43,10 +43,10 @@ export function Login({ onDone }: { onDone: () => void }) {
         </div>
         <div className="rounded-xl border border-border bg-card p-6 shadow-sm">
           <div className="mb-4">
-            <Label htmlFor="email">邮箱</Label>
+            <Label htmlFor="identity">账号</Label>
             <Input
-              id="email" type="email" value={email} autoFocus autoComplete="username"
-              onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
+              id="identity" type="text" value={email} autoFocus autoComplete="username"
+              onChange={(e) => setEmail(e.target.value)} placeholder="用户名或邮箱"
             />
           </div>
           <div className="mb-5">

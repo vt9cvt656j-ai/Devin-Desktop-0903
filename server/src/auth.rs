@@ -363,11 +363,16 @@ pub fn normalize_email(email: &str) -> String {
 /// normalized string keeps mixed-case rows created before normalization loginable.
 /// `LIMIT 1` (oldest first) because such rows may already collide pairwise, and a
 /// bare `fetch_optional` would error out instead of resolving to the original account.
-async fn find_user(state: &AppState, email: &str) -> ApiResult<Option<User>> {
+async fn find_user(state: &AppState, identity: &str) -> ApiResult<Option<User>> {
+    // Matches on `email`, which in this deployment is really an IDENTITY column — the admin
+    // account's stored email is literally "fendoushaonian", not an address. A username therefore
+    // already works and no username column is needed; what blocked login was a `type="email"` on
+    // the client input, which the browser rejected before the request was ever sent. Deliberately
+    // ONE query: an email-or-username OR would let a username shadow someone else's real address.
     Ok(sqlx::query_as::<_, User>(
         "SELECT * FROM users WHERE lower(email) = $1 ORDER BY created_at LIMIT 1",
     )
-    .bind(normalize_email(email))
+    .bind(normalize_email(identity))
     .fetch_optional(&state.db)
     .await?)
 }
@@ -755,3 +760,4 @@ mod privilege_source_tests {
         );
     }
 }
+
