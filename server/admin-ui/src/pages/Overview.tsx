@@ -269,9 +269,12 @@ export function Overview() {
         </SectionReveal>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <SectionReveal as="section" delay={200}>
-          <div className="rounded-xl border border-border bg-card">
+      {/* Equal heights. The feed decided the row height and the orders panel was left short and
+          floating — items-stretch plus h-full on both cards makes them match, and the feed's own
+          list scrolls inside a fixed body rather than growing the card. */}
+      <div className="grid items-stretch gap-6 lg:grid-cols-2">
+        <SectionReveal as="section" delay={200} className="flex">
+          <div className="flex w-full flex-col rounded-xl border border-border bg-card">
             <header className="flex items-center justify-between border-b border-border px-5 py-3">
               <h2 className="text-sm font-semibold">待确认订单</h2>
               {pending.length > 0 && <Badge variant="outline">{pending.length}</Badge>}
@@ -279,7 +282,7 @@ export function Overview() {
             {!orders ? (
               <TableSkeleton rows={4} columns={["46%", "18%"]} label="待确认订单读取中" />
             ) : (
-              <div className="divide-y divide-border">
+              <div className="flex flex-1 flex-col divide-y divide-border">
                 {pending.slice(0, 6).map((o) => (
                   <div key={o.id} className="flex items-baseline justify-between gap-4 px-5 py-3 text-sm">
                     <span className="min-w-0 truncate" title={o.email || o.id}>
@@ -296,15 +299,15 @@ export function Overview() {
           </div>
         </SectionReveal>
 
-        <SectionReveal as="section" delay={210}>
-          <div className="rounded-xl border border-border bg-card">
+        <SectionReveal as="section" delay={210} className="flex">
+          <div className="flex w-full flex-col rounded-xl border border-border bg-card">
             <header className="border-b border-border px-5 py-3">
               <h2 className="text-sm font-semibold">实时动态</h2>
             </header>
             {!events ? (
               <TableSkeleton rows={4} columns={["52%", "14%"]} label="实时动态读取中" />
             ) : (
-              <div className="divide-y divide-border">
+              <div className="max-h-80 flex-1 divide-y divide-border overflow-y-auto">
                 {events.slice(0, 6).map((ev, i) => {
                   const who = subject(ev);
                   return (
