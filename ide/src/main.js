@@ -11552,8 +11552,8 @@ function _modelContextRows(m) {
     const active = !activeMarked && o.value === eff && !(o.locked);
     if (active) activeMarked = true;
     const cls = "mic-think-btn" + (active ? " is-active" : "")
-      + (o.locked || o.redundant ? " mic-ctx-btn--locked" : "");
-    const tip = (o.locked || o.redundant) ? o.lockHint
+      + (o.locked ? " mic-ctx-btn--locked" : "");
+    const tip = o.locked ? o.lockHint
       : (o.native
           ? `${_tokenExact(o.value)} tokens（模型原生窗口）${o.beta ? `\n需上游 beta：${o.beta}（账号档位不够时上游会拒绝）` : ""}`
           : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
@@ -11991,19 +11991,16 @@ function _ctxChoiceOptions(modelId) {
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
   for (const [name, tokens] of _MC_TIER_OPTIONS) {
-    // A tier at or below the model's own window buys nothing — on a 1M-native model the 1M tier
-    // is the window the user already has for free. Showing it as a purchasable upgrade is selling
-    // a no-op, so mark it plainly instead. (It is still shown, not hidden: it exists, it is just
-    // redundant here, and silently disappearing options is more confusing than labelling them.)
-    const redundant = tokens <= native;
+    // Tiers stack ON TOP of the model's own window: the 1M tier means "+1M", so on a 1M-native
+    // model it delivers 2M. That is why no tier is redundant any more — an absolute ceiling
+    // decayed to nothing as models grew, an additive one is worth the same forever.
+    const total = native + tokens;
     const locked = !(compress && tokens <= tierMax);
     opts.push({
-      value: tokens, label: name, locked, tier: name, kind: "modified", redundant,
-      lockHint: redundant
-        ? `${name} 不大于本模型原生窗口（${_tokenShort(native)}），选它不会多给上下文`
-        : locked
-          ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
-          : `michael-compression ${name} 档`,
+      value: total, label: name, locked, tier: name, kind: "modified",
+      lockHint: locked
+        ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
+        : `michael-compression ${name} 档：原生 ${_tokenShort(native)} + 本档 ${name} = 实际 ${_tokenShort(total)}`,
     });
   }
   return opts;

@@ -51,12 +51,25 @@ pub enum Tier {
 
 impl Tier {
     /// 该档位接受的原始输入 token 上限。
+    /// How much history this tier ADDS on top of whatever the model natively holds.
+    ///
+    /// Deliberately additive rather than absolute. As an absolute ceiling these numbers decayed
+    /// into nothing as models grew: when every Claude model moved to a 1M native window, the M1
+    /// tier's 1M ceiling bought exactly zero extra tokens and the subscriber was strictly worse
+    /// off than a free user. Additive keeps every tier worth the same thing forever — "+1M" is
+    /// still +1M on a 200K model and on a 2M model — and no existing subscriber can ever receive
+    /// less than before, since native + tier >= max(native, tier) for all values.
     pub fn max_input_tokens(self) -> usize {
         match self {
             Tier::M1 => 1_000_000,
             Tier::M2 => 2_000_000,
             Tier::M5 => 5_000_000,
         }
+    }
+
+    /// Total history this subscriber may accumulate on a model with the given native window.
+    pub fn capacity_for_native(self, native: usize) -> usize {
+        native.saturating_add(self.max_input_tokens())
     }
 
     /// 档位的对外标识，用于请求头 / 计费记录 / 日志。
@@ -211,9 +224,13 @@ pub fn segment_tokens_for(tier: Tier, native_window: usize) -> usize {
 }
 
 /// 与 `segment_tokens_for` 相同，但调用方已经扣除了固定 system/tool schema 开销。
+/// Sized against the TIER's added amount, deliberately not native+tier. Segment size is the
+/// content-hash boundary for every cached summary, so moving it re-summarises every live
+/// conversation from scratch. The native portion shifts capacity by at most a few percent, which
+/// is not worth invalidating every user's cache for.
 pub fn segment_tokens_for_budget(tier: Tier, budget: usize, retrieval_reserve: usize) -> usize {
     let summary_budget = budget
-        .saturating_sub(VERBATIM_TAIL_TOKENS)
+        .saturating_sub(verbatim_tail_for_budget(budget))
         .saturating_sub(retrieval_reserve);
     let summary_slots = (summary_budget / SEGMENT_SUMMARY_BUDGET_TOKENS).max(1);
     let needed = tier.max_input_tokens().div_ceil(summary_slots);
@@ -1818,25 +1835,29 @@ mod window_scaling_tests {
 mod entitlement_tests {
     use super::*;
 
-    /// Paying for context must never buy a SMALLER ceiling than not paying. On a 1M-native model
-    /// the M1 cap equalled native, so a subscriber hit a hard 413 at exactly the point a free
-    /// user was still fine — the tier was a downgrade.
+    /// Two properties, both asserted against the REAL function (an earlier version of this test
+    /// re-derived the formula inline and happily passed with the bug restored):
+    ///   1. a subscriber is never capped below the model's own window, and
+    ///   2. every tier adds its advertised amount no matter how large the model grows.
+    /// Property 2 is what an absolute ceiling could not hold: when models reached 1M native, the
+    /// 1M tier bought zero extra tokens and the subscriber was worse off than a free user.
     #[test]
-    fn tier_cap_is_never_below_the_models_own_window() {
-        for (tier, native) in [
-            (Tier::M1, 1_000_000usize),   // the broken case: cap == native
-            (Tier::M1, 2_000_000),        // native beyond the tier entirely
-            (Tier::M2, 1_000_000),
-            (Tier::M5, 1_000_000),
-            (Tier::M1, 200_000),          // small native: tier is a genuine upgrade
-        ] {
-            let effective = tier.max_input_tokens().max(native);
-            assert!(effective >= native,
-                "{:?} on a {native}-token model must not cap below native", tier);
-            assert!(effective >= tier.max_input_tokens(),
-                "{:?} must still deliver at least what it advertises", tier);
+    fn tier_capacity_is_additive_and_never_below_native() {
+        for native in [128_000usize, 200_000, 400_000, 1_000_000, 2_000_000, 5_000_000] {
+            for tier in [Tier::M1, Tier::M2, Tier::M5] {
+                let cap = tier.capacity_for_native(native);
+                assert!(cap > native,
+                    "{tier:?} on a {native}-token model must add real room, got {cap}");
+                assert_eq!(cap - native, tier.max_input_tokens(),
+                    "{tier:?} must add exactly what it advertises on every model size");
+                assert!(cap >= tier.max_input_tokens(),
+                    "{tier:?} must still deliver at least its headline number");
+            }
         }
-        assert_eq!(Tier::M1.max_input_tokens().max(1_000_000), 1_000_000);
-        assert_eq!(Tier::M5.max_input_tokens().max(1_000_000), 5_000_000);
+        // The exact case that was broken: M1 on a 1M-native model.
+        assert_eq!(Tier::M1.capacity_for_native(1_000_000), 2_000_000);
+        assert_eq!(Tier::M5.capacity_for_native(1_000_000), 6_000_000);
+        // And the case that must not regress: a small window still gets the full headline.
+        assert_eq!(Tier::M1.capacity_for_native(200_000), 1_200_000);
     }
 }

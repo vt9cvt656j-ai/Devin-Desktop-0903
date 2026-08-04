@@ -9790,7 +9790,7 @@ async fn apply_michael_compression(
     // MORE room, never less: on a 1M-native model the M1 cap (1M) equalled native, so a paying
     // subscriber hit a hard 413 at exactly the point a free user was still fine. Paying for
     // context must never buy a smaller ceiling than not paying.
-    let effective_cap = tier.max_input_tokens().max(native);
+    let effective_cap = tier.capacity_for_native(native);
     if total_raw > effective_cap {
         return Err(AppError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
