@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
-import { Search, RefreshCw } from "lucide-react";
+import { Toolbar } from "@/components/Toolbar";
 import { Stat } from "@/components/Stat";
 import { TableSkeleton } from "@/components/TableSkeleton";
 import { SectionReveal } from "@/components/motion/section-reveal";
@@ -209,24 +209,15 @@ export function Customers() {
       </SectionReveal>
 
       <SectionReveal as="section" delay={140} className="space-y-4">
-      {/* One bar, one height. These were three controls at two different heights floating on a
-          bare background with the count stranded at the far edge — the eye had nothing to group
-          them by. Now they share a surface, a border and a 44px row; the search grows, the filter
-          is fixed-width, and the count sits inside the bar it describes. */}
-      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-2">
-        <div className="relative min-w-0 flex-1">
-          <Search aria-hidden className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            className="h-11 w-full border-transparent bg-transparent pl-9 focus-visible:border-ring"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索邮箱 / 角色 / 套餐 / ID…"
-            aria-label="搜索客户"
-          />
-        </div>
-        <Separator orientation="vertical" className="hidden h-6 sm:block" />
+      <Toolbar
+        query={q}
+        onQuery={setQ}
+        placeholder="搜索邮箱 / 角色 / 套餐 / ID…"
+        count={list.length === users.length ? `${users.length} 位` : `${list.length} / ${users.length}`}
+        onRefresh={() => load().catch(() => {})}
+      >
         <Select
-          className="h-11 w-44 border-transparent bg-transparent focus-visible:border-ring"
+          className="w-44"
           value={planFilter}
           onChange={(e) => setPlanFilter(e.target.value)}
           aria-label="筛选客户"
@@ -239,17 +230,7 @@ export function Customers() {
             <option key={p} value={p}>套餐：{p}</option>
           ))}
         </Select>
-        <span className="px-2 text-sm tabular-nums text-muted-foreground" aria-live="polite">
-          {list.length === users.length ? `${users.length} 位` : `${list.length} / ${users.length}`}
-        </span>
-        <Button
-          variant="outline" className="h-11 w-11 shrink-0 p-0"
-          onClick={() => load().catch(() => {})}
-          aria-label="刷新" title="刷新"
-        >
-          <RefreshCw className="size-4" />
-        </Button>
-      </div>
+      </Toolbar>
 
       <div className="overflow-hidden rounded-xl border border-border bg-card">
         {loading && !users.length ? (
