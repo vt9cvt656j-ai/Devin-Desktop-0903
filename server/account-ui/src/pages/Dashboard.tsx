@@ -24,13 +24,24 @@ import {
 } from "@/lib/format";
 import { DICTS, type Lang } from "@/lib/i18n";
 
-const RELEASES = "https://github.com/fendoushaonian/Devin-Desktop/releases/latest";
+/*
+ * The release repo is private, so github.com/.../releases/latest 404s for every signed-in
+ * user who clicks Download here. The marketing site's download section reads the gateway's
+ * public update feed and shows either a real installer link or an honest "not published
+ * yet" — either beats a 404.
+ */
+const RELEASES = "https://www.michaelide.xyz/#download";
 
 export type Tab = "overview" | "usage" | "settings" | "integrations";
 
+/**
+ * Centred, not left-aligned. These sit in a row of three: ragged left-aligned blocks of
+ * different lengths read as misaligned rather than as a set. Centring is applied here so
+ * the Overview row and the Usage row cannot drift apart.
+ */
 function Stat({ label, value, sub }: { label: string; value: React.ReactNode; sub?: string }) {
   return (
-    <Card className="bg-muted p-6">
+    <Card className="items-center bg-muted p-6 text-center">
       <p className="text-xs text-muted-foreground">{label}</p>
       <div className="mt-1.5 text-[22px] font-semibold tracking-tight tabular-nums">{value}</div>
       {sub ? <div className="mt-1.5 text-xs text-muted-foreground">{sub}</div> : null}
@@ -362,12 +373,20 @@ export function Dashboard({ me, tab, lang }: { me: Me; tab: Tab; lang: Lang }) {
             </>
           ) : (
             <>
-              <p className="mb-4 text-3xl font-semibold tracking-tight tabular-nums">
-                {Math.round(pct)}% {t.used}{" "}
-                <span className="text-[15px] font-medium text-muted-foreground">
-                  {usd(spent)} {t.ofQuota} {usd(cap)}
-                </span>
-              </p>
+              {/* The amount spent used to sit here as "$0.00 of $45.25", which restated the
+                  percentage beside it — two ways of saying nothing was used. Only the
+                  headline keeps the reading; the allowance moves to the right, where it
+                  labels the far end of the bar it belongs to. */}
+              {/* flex-wrap so a long pair ("100% 已使用" + "$120.66 每时段") drops onto a
+                  second line on a phone instead of crushing the headline. */}
+              <div className="mb-4 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+                <p className="text-3xl font-semibold tracking-tight tabular-nums">
+                  {Math.round(pct)}% {t.used}
+                </p>
+                <p className="shrink-0 text-[15px] font-medium tabular-nums text-muted-foreground">
+                  {usd(cap)} {t.perWindow}
+                </p>
+              </div>
               <div className="h-1 overflow-hidden rounded-full bg-accent">
                 <div className="h-full rounded-full bg-foreground transition-all" style={{ width: `${pct}%` }} />
               </div>
@@ -378,8 +397,8 @@ export function Dashboard({ me, tab, lang }: { me: Me; tab: Tab; lang: Lang }) {
           )}
         </Card>
 
-        <Card className="bg-muted p-6">
-          <div className="mb-2.5 flex items-baseline gap-2.5">
+        <Card className="items-center bg-muted p-6 text-center">
+          <div className="mb-2.5 flex items-baseline justify-center gap-2.5">
             <span className="text-lg font-semibold">{planLabel(me.plan)}</span>
           </div>
           <p className="mb-5 text-[13.5px] leading-relaxed text-muted-foreground">
