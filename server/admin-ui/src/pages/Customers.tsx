@@ -14,9 +14,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Truncate } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { cents, num, when } from "@/lib/format";
 
 /**
@@ -386,6 +386,7 @@ function CustomerDialog({
   user: User; isSelf: boolean; reload: () => Promise<void>; onClose: () => void;
 }) {
   const [topUp, setTopUp] = useState("");
+  const [balanceMode, setBalanceMode] = useState<"add" | "set">("add");
   const [balance, setBalance] = useState(creditInput(user.credits_cents));
   const [plan, setPlan] = useState(user.plan || "none");
   const [expiry, setExpiry] = useState(toLocalInput(user.plan_expires_at));
@@ -555,76 +556,111 @@ function CustomerDialog({
           different jobs — money, membership, the account itself — so they are three tabs.
           Nothing about the logic changed; only what you have to scroll past to reach it. */}
       <Tabs defaultValue="credit" className="mt-2">
-        <TabsList>
-          <TabsTrigger value="credit">额度</TabsTrigger>
-          <TabsTrigger value="plan">套餐</TabsTrigger>
-          <TabsTrigger value="account">账号</TabsTrigger>
+        <TabsList className="w-full">
+          <TabsTrigger value="credit" className="flex-1">额度</TabsTrigger>
+          <TabsTrigger value="plan" className="flex-1">套餐</TabsTrigger>
+          <TabsTrigger value="account" className="flex-1">账号</TabsTrigger>
         </TabsList>
 
         <TabsContent value="credit" className="space-y-6 pt-4">
+        {/* One balance field, two verbs. These were two full sections — heading, hint, label,
+            input, buttons, twice — for the same underlying number, which is why the dialog felt
+            padded out. The mode switch makes the DIFFERENCE the visible thing (加 vs 设为), which
+            is the part that actually matters and the part that was easiest to get wrong.
+            Both handlers and both guards are unchanged. */}
         <section>
-          <h3 className="text-sm font-semibold">充值：在现有余额上增加</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            客户付款后用这个。填多少就加多少，不需要先算出新的总额。要扣减就填负数。
-          </p>
-          <div className="mt-3 flex flex-wrap items-end gap-2">
-            <div className="w-40">
-              <Label htmlFor="topup">增加（$）</Label>
-              <Input
-                id="topup" type="number" step="0.01" value={topUp}
-                onChange={(e) => setTopUp(e.target.value)} placeholder="20.00"
-              />
-            </div>
-            <div className="flex gap-2 pb-0.5">
-              {["10", "20", "50"].map((v) => (
-                <Button key={v} type="button" variant="ghost" size="sm" onClick={() => setTopUp(v)}>+${v}</Button>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold">余额</h3>
+            <div
+              role="radiogroup" aria-label="余额操作方式"
+              className="inline-flex h-9 items-center rounded-full border border-border bg-card p-1"
+            >
+              {([["add", "充值 · 加"], ["set", "改写 · 设为"]] as const).map(([m, t]) => (
+                <button
+                  key={m} type="button" role="radio" aria-checked={balanceMode === m}
+                  onClick={() => setBalanceMode(m)}
+                  className={cn(
+                    "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+                    balanceMode === m
+                      ? "bg-foreground text-background"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {t}
+                </button>
               ))}
             </div>
-            <Button size="sm" disabled={busy !== "" || topUpValue === 0 || topUpOverdraft} onClick={grantCredits}>
-              {busy === "grant" ? "充值中…" : "充值"}
-            </Button>
           </div>
-          {topUpValue !== 0 && (
+
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            {balanceMode === "add"
+              ? "客户付款后用这个。填多少加多少，不必先算总额；扣减填负数。"
+              : "对账修正才用。这是覆盖不是增加，不能为负，没改动时不可提交。"}
+          </p>
+
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <div className="w-40">
+              <Label htmlFor="balance-field">
+                {balanceMode === "add" ? "增加（$）" : "余额（$）"}
+              </Label>
+              {balanceMode === "add" ? (
+                <Input
+                  id="balance-field" type="number" step="0.01" value={topUp}
+                  onChange={(e) => setTopUp(e.target.value)} placeholder="20.00"
+                />
+              ) : (
+                <Input
+                  id="balance-field" type="number" step="0.01" min="0" value={balance}
+                  onChange={(e) => setBalance(e.target.value)}
+                />
+              )}
+            </div>
+
+            {balanceMode === "add" && (
+              <div className="flex gap-1 pb-0.5">
+                {["10", "20", "50"].map((v) => (
+                  <Button key={v} type="button" variant="ghost" size="sm" onClick={() => setTopUp(v)}>
+                    +${v}
+                  </Button>
+                ))}
+              </div>
+            )}
+
+            {balanceMode === "add" ? (
+              <Button
+                size="sm"
+                disabled={busy !== "" || topUpValue === 0 || topUpOverdraft}
+                onClick={grantCredits}
+              >
+                {busy === "grant" ? "充值中…" : "充值"}
+              </Button>
+            ) : (
+              <Button
+                variant="outline" size="sm"
+                disabled={busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) || balanceValue < 0}
+                onClick={setAbsoluteBalance}
+              >
+                {busy === "credits" ? "保存中…" : "改写余额"}
+              </Button>
+            )}
+
+            <span className="pb-2.5 text-xs tabular-nums text-muted-foreground">
+              当前 {cents(creditCents(user.credits_cents))}
+            </span>
+          </div>
+
+          {balanceMode === "add" && topUpValue !== 0 && (
             <p
-              className={
-                topUpOverdraft
-                  ? "mt-2 text-xs text-destructive tabular-nums"
-                  : "mt-2 text-xs text-muted-foreground tabular-nums"
-              }
+              className={cn(
+                "mt-2 text-xs tabular-nums",
+                topUpOverdraft ? "text-destructive" : "text-muted-foreground",
+              )}
             >
               {topUpOverdraft
                 ? `扣减后余额会变成负数（${cents(creditCents(topUpResultRaw))}），请改小扣减额`
                 : `充值后余额 ${cents(creditCents(topUpResultRaw))}`}
             </p>
           )}
-        </section>
-
-          <Separator />
-
-        <section>
-          <h3 className="text-sm font-semibold">改写余额：直接设成这个数</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            对账修正才用。这是覆盖，不是增加；不能为负数。没改动输入框时不可提交。
-          </p>
-          <div className="mt-3 flex flex-wrap items-end gap-2">
-            <div className="w-40">
-              <Label htmlFor="balance">余额（$）</Label>
-              <Input
-                id="balance" type="number" step="0.01" min="0" value={balance}
-                onChange={(e) => setBalance(e.target.value)}
-              />
-            </div>
-            <Button
-              variant="outline" size="sm"
-              disabled={busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) || balanceValue < 0}
-              onClick={setAbsoluteBalance}
-            >
-              {busy === "credits" ? "保存中…" : "改写余额"}
-            </Button>
-            <span className="pb-2.5 text-xs text-muted-foreground tabular-nums">
-              当前 {cents(creditCents(user.credits_cents))}
-            </span>
-          </div>
         </section>
         </TabsContent>
 
