@@ -1,0 +1,1 @@
+import{Fc as e,Ic as t}from"./vendor-a8bn3H4I.js";t();export{e as getCurrentWebview};

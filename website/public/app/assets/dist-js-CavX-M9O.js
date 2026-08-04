@@ -1,0 +1,1 @@
+import{_c as e,vc as t}from"./vendor-a8bn3H4I.js";e();export{t as relaunch};
