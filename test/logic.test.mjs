@@ -13333,8 +13333,22 @@ test("gateway compression makes the local LLM compaction stand down", () => {
     "请求必须带上档位头，网关才知道要不要压");
 
   // 同一份 transcript 不能在网关前缀生效后继续被本地机械改写，否则 covered 立即错位。
-  assert.match(SRC, /function _trimMessagesIfHuge\([\s\S]{0,260}if \(_gatewayHandlesCompression\(\)\) return;/,
-    "网关接管时 Agent transcript 的本地裁剪必须停下");
+  // 网关接管时，棘轮式本地裁剪必须停下（否则 covered 立即错位）。唯一例外是超大图片的
+  // 兜底剥离——没有它，选了 1M/2M/5M 档就等于关掉了客户端唯一的请求体上限，整个 app 会
+  // 卡死在序列化一份无上限的 transcript 上。这个例外一旦真的动了 transcript，必须同时
+  // 作废前缀，不变量才成立。
+  {
+    const trim = extractFn("_trimMessagesIfHuge");
+    const open = trim.indexOf("if (_gatewayHandlesCompression()) {");
+    assert.ok(open > 0, "网关分支必须存在");
+    // 分支体 = 从 { 到同缩进的收尾 }，即第一处 "\n  }" 
+    const body = trim.slice(open, trim.indexOf("\n  }", open) + 4);
+    assert.doesNotMatch(body, /RATCHET|overSoft|overHard/,
+      "网关接管时不得再跑棘轮式裁剪");
+    assert.match(body, /_mcPrefixInvalidate/,
+      "兜底剥离改了 transcript，就必须作废前缀，否则 covered 会错位");
+    assert.match(body, /return;/, "兜底之后仍然要提前返回，不能继续走本地裁剪");
+  }
   assert.match(SRC, /function _compactHistoryIfNeeded\([\s\S]{0,300}if \(_gatewayHandlesCompression\(\)\) return;/,
     "跨轮历史也不能再被 16K 本地阈值提前改写");
   assert.match(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,420}_gatewayHandlesCompression\(\) && tierMax \? Math\.max\(native, tierMax\) : native/,
