@@ -5,11 +5,18 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 /*
- * 下载区：两个平台都真实存在 —— CI 的 ide-package 矩阵产出
- * macOS Apple Silicon DMG 与 Windows x64 EXE/MSI。文案只说构建出来的东西：
- * 没有 Intel Mac 构建，就不写 Intel。
+ * 下载地址来自网关，不是 GitHub。
+ *
+ * 发行仓库是私有的，github.com/.../releases/latest 对访客一律 404 —— 这里以前直接写死
+ * 那个链接，等于每个点"下载"的人都被送进一个 404。网关本来就为此准备了公开代下载路由
+ * （update.rs：带 token 取私有仓库资产，并把清单里的地址改写成
+ * /api/ide/update/download/<tag>/<file>），所以站点读同一份清单就够了。
+ *
+ * 没有已发布版本时清单返回 204。那时不摆死链接：明说桌面版还没放出来，把人引到注册。
+ * 运营在控制台发布 release 之后，这里下一次加载自动变成真实下载，站点不用再改。
  */
-const RELEASES = "https://github.com/fendoushaonian/Devin-Desktop/releases/latest";
+const UPDATE_FEED = "https://code.mrday.one/api/ide/update";
+const SIGN_UP = "https://code.mrday.one/gate";
 
 /** lucide has no Windows glyph; this is the four-pane mark. */
 function WindowsMark({ className }: { className?: string }) {
@@ -22,6 +29,14 @@ function WindowsMark({ className }: { className?: string }) {
 
 type OS = "mac" | "windows";
 
+/** Tauri's updater target keys — how the manifest names each build. */
+const TARGET: Record<OS, string> = { mac: "darwin-aarch64", windows: "windows-x86_64" };
+
+type Release =
+  | { state: "checking" }
+  | { state: "ready"; version: string; urls: Partial<Record<OS, string>> }
+  | { state: "none" };
+
 /** Best guess at the visitor's platform; both downloads stay reachable either way. */
 function useDetectedOS(): OS {
   const [os, setOs] = useState<OS>("mac");
@@ -33,6 +48,41 @@ function useDetectedOS(): OS {
     if (/win/i.test(ua)) setOs("windows");
   }, []);
   return os;
+}
+
+function useRelease(): Release {
+  const [release, setRelease] = useState<Release>({ state: "checking" });
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await fetch(UPDATE_FEED, { cache: "no-store" });
+        // 204 means the gateway is healthy and simply has no published release.
+        if (res.status !== 200) throw new Error(String(res.status));
+        const manifest = (await res.json()) as {
+          version?: string;
+          platforms?: Record<string, { url?: string }>;
+        };
+        const urls: Partial<Record<OS, string>> = {};
+        for (const os of ["mac", "windows"] as OS[]) {
+          const url = manifest.platforms?.[TARGET[os]]?.url;
+          if (url) urls[os] = url;
+        }
+        if (!alive) return;
+        setRelease(
+          Object.keys(urls).length
+            ? { state: "ready", version: manifest.version ?? "", urls }
+            : { state: "none" },
+        );
+      } catch {
+        if (alive) setRelease({ state: "none" });
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return release;
 }
 
 type IconType = React.ComponentType<{ className?: string }>;
@@ -61,39 +111,79 @@ export function DownloadButtons({
   className?: string;
 }) {
   const detected = useDetectedOS();
+  const release = useRelease();
   const other: OS = detected === "mac" ? "windows" : "mac";
   const Primary = PLATFORMS[detected].icon;
   const Secondary = PLATFORMS[other].icon;
+  const muted = variant === "onDark" ? "text-primary-foreground/60" : "text-muted-foreground";
+
+  // Nothing published: say so, and offer what does work today rather than a dead button.
+  if (release.state === "none") {
+    return (
+      <div className={cn("flex flex-col items-center gap-3", className)}>
+        <Button size={size} variant={variant === "onDark" ? "inverse" : "default"} asChild>
+          <a href={SIGN_UP}>Create an account</a>
+        </Button>
+        <p className={cn("max-w-md text-center text-xs leading-relaxed", muted)}>
+          The macOS and Windows builds are not published yet. Create an account now — the editor
+          runs in your browser, and the download appears here the moment it ships.
+        </p>
+      </div>
+    );
+  }
+
+  const checking = release.state === "checking";
+  const href = (os: OS) => (release.state === "ready" ? release.urls[os] : undefined);
+  const live = (os: OS) => !checking && !!href(os);
 
   return (
     <div className={cn("flex flex-col items-center gap-3", className)}>
       <div className="flex flex-col items-center gap-3 sm:flex-row">
-        <Button size={size} variant={variant === "onDark" ? "inverse" : "default"} asChild>
-          <a href={RELEASES} target="_blank" rel="noreferrer">
-            <Primary /> {PLATFORMS[detected].label}
-          </a>
+        <Button
+          size={size}
+          variant={variant === "onDark" ? "inverse" : "default"}
+          disabled={!live(detected)}
+          asChild={live(detected)}
+        >
+          {live(detected) ? (
+            <a href={href(detected)}>
+              <Primary /> {PLATFORMS[detected].label}
+            </a>
+          ) : (
+            <span>
+              <Primary /> {PLATFORMS[detected].label}
+            </span>
+          )}
         </Button>
         <Button
           size={size}
           variant="outline"
+          disabled={!live(other)}
+          asChild={live(other)}
           className={cn(
             variant === "onDark" &&
               "border-primary-foreground/25 bg-transparent text-primary-foreground hover:bg-primary-foreground/10",
           )}
-          asChild
         >
-          <a href={RELEASES} target="_blank" rel="noreferrer">
-            <Secondary /> {PLATFORMS[other].label}
-          </a>
+          {live(other) ? (
+            <a href={href(other)}>
+              <Secondary /> {PLATFORMS[other].label}
+            </a>
+          ) : (
+            <span>
+              <Secondary /> {PLATFORMS[other].label}
+            </span>
+          )}
         </Button>
       </div>
 
-      <p
-        className={cn(
-          "text-xs",
-          variant === "onDark" ? "text-primary-foreground/60" : "text-muted-foreground",
-        )}
-      >
+      <p className={cn("text-xs", muted)}>
+        {release.state === "ready" && release.version ? (
+          <>
+            Version {release.version}
+            <span className="mx-1.5 opacity-50">·</span>
+          </>
+        ) : null}
         {PLATFORMS[detected].requirement}
         <span className="mx-1.5 opacity-50">·</span>
         {PLATFORMS[other].requirement}

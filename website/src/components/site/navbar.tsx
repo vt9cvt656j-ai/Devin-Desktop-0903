@@ -11,7 +11,9 @@ const links = [
   { href: "#features", label: "Product" },
   { href: "#architecture", label: "How it works" },
   { href: "#extensions", label: "Extensibility" },
-  { href: "#customers", label: "Customers" },
+  // "Customers" promised customer quotes; the section is an attributed code review and
+  // an open invitation, because there are no sourced customer quotes yet.
+  { href: "#customers", label: "Reviews" },
 ];
 
 export function Navbar() {
