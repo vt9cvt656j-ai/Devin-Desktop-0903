@@ -21,7 +21,7 @@ import {
   probeDesktop,
   signOut,
   type Catalog,
-  type DesktopSession,
+  type DesktopProbe,
   type Me,
   type Usage,
 } from "@/lib/api";
@@ -451,7 +451,8 @@ export function Dashboard({
 }) {
   const t = DICTS[lang];
   const [usage, setUsage] = useState<Usage | null>(null);
-  const [desktop, setDesktop] = useState<DesktopSession | null | undefined>(undefined);
+  const [desktop, setDesktop] = useState<DesktopProbe | undefined>(undefined);
+  const [checkingDesktop, setCheckingDesktop] = useState(false);
   const [modelCount, setModelCount] = useState<number | null>(null);
 
   useEffect(() => {
@@ -460,6 +461,16 @@ export function Dashboard({
     void api.models().then((m) => setModelCount(Array.isArray(m) ? m.length : null)).catch(() => undefined);
     void probeDesktop().then(setDesktop);
   }, []);
+
+  /** Runs inside the click, which is the only context Chrome will prompt from. */
+  async function recheckDesktop() {
+    setCheckingDesktop(true);
+    try {
+      setDesktop(await probeDesktop());
+    } finally {
+      setCheckingDesktop(false);
+    }
+  }
 
   const cap = me.quota_window_cap_cents ?? 0;
   const left = me.quota_window_cents ?? 0;
@@ -543,28 +554,49 @@ export function Dashboard({
         <Card className="bg-muted p-6">
           <div className="mb-2.5 flex items-baseline gap-2.5">
             <span className="text-lg font-semibold">{t.desktopApp}</span>
-            {desktop === undefined ? null : desktop === null ? (
-              <Badge variant="outline">{t.notDetected}</Badge>
-            ) : desktop.signedIn ? (
-              <Badge variant="success">{t.connected}</Badge>
+            {desktop === undefined ? null : desktop.state === "connected" ? (
+              desktop.session.signedIn ? (
+                <Badge variant="success">{t.connected}</Badge>
+              ) : (
+                <Badge variant="outline">{t.signedOut}</Badge>
+              )
+            ) : desktop.state === "needs-permission" ? (
+              <Badge variant="outline">{t.desktopNeedsPermission}</Badge>
+            ) : desktop.state === "permission-blocked" ? (
+              <Badge variant="outline">{t.desktopPermissionBlocked}</Badge>
             ) : (
-              <Badge variant="outline">{t.signedOut}</Badge>
+              <Badge variant="outline">{t.notDetected}</Badge>
             )}
           </div>
           <p className="mb-4 text-[13.5px] leading-relaxed text-muted-foreground">
             {desktop === undefined
               ? t.loading
-              : desktop === null
-                ? t.desktopMissing
-                : desktop.signedIn
-                  ? `${t.desktopConnected} ${desktop.email} (${t.desktopVersion} ${desktop.version}). ${t.desktopReuse}`
-                  : t.desktopSignedOut}
+              : desktop.state === "connected"
+                ? desktop.session.signedIn
+                  ? `${t.desktopConnected} ${desktop.session.email} (${t.desktopVersion} ${desktop.session.version}). ${t.desktopReuse}`
+                  : t.desktopSignedOut
+                : desktop.state === "needs-permission"
+                  ? t.desktopPermissionAsk
+                  : desktop.state === "permission-blocked"
+                    ? t.desktopPermissionBlockedHelp
+                    : t.desktopMissing}
           </p>
-          <Button variant="outline" asChild className="w-fit">
-            <a href={RELEASES} target="_blank" rel="noreferrer">
-              {t.download}
-            </a>
-          </Button>
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Chrome raises the local-network prompt only off a real click, so this
+                button exists to be that click. Offered whenever we are not already
+                connected — after a block it is also how you re-test once the setting
+                has been changed back. */}
+            {desktop !== undefined && desktop.state !== "connected" ? (
+              <Button className="w-fit" disabled={checkingDesktop} onClick={() => void recheckDesktop()}>
+                {checkingDesktop ? t.desktopChecking : t.desktopConnectButton}
+              </Button>
+            ) : null}
+            <Button variant="outline" asChild className="w-fit">
+              <a href={RELEASES} target="_blank" rel="noreferrer">
+                {t.download}
+              </a>
+            </Button>
+          </div>
         </Card>
 
         <h2 className="mb-3 mt-8 text-sm font-semibold">{t.apiHeading}</h2>

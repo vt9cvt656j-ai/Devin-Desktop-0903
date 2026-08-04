@@ -100,6 +100,14 @@ const EN = {
   desktopReuse: "The sign-in page will offer to reuse this session instead of asking for your password.",
   desktopSignedOut: "The app is running here but nobody is signed in, so it cannot pass a session to the browser.",
   desktopMissing: "The app is not running on this machine, or is running without the browser connection.",
+  desktopNeedsPermission: "Needs permission",
+  desktopPermissionAsk:
+    "Your browser has not been given permission to reach apps on this computer, so this page cannot tell whether Mr.day One is running. Chrome only asks when you click.",
+  desktopConnectButton: "Check for the app",
+  desktopChecking: "Checking…",
+  desktopPermissionBlocked: "Blocked by the browser",
+  desktopPermissionBlockedHelp:
+    "Local network access is blocked for this site. Turn it back on in Chrome: click the icon to the left of the address bar, then allow local network access, and check again.",
   download: "Download the app",
   apiHeading: "API",
   baseUrl: "Base URL",
@@ -247,6 +255,14 @@ const ZH: Dict = {
   desktopReuse: "登录页会直接复用这个会话，无需再次输入密码。",
   desktopSignedOut: "桌面端正在本机运行，但没有登录账号，无法把会话交给浏览器。",
   desktopMissing: "桌面端未在本机运行，或未开启浏览器连接。",
+  desktopNeedsPermission: "需要授权",
+  desktopPermissionAsk:
+    "浏览器还没有获得访问本机应用的权限，因此这个页面无法判断 Mr.day One 是否在运行。Chrome 只在你点击时才会询问。",
+  desktopConnectButton: "检测桌面端",
+  desktopChecking: "检测中…",
+  desktopPermissionBlocked: "已被浏览器阻止",
+  desktopPermissionBlockedHelp:
+    "本站的本地网络访问已被阻止。在 Chrome 中重新开启：点击地址栏左侧的图标，允许本地网络访问，然后再次检测。",
   download: "下载桌面端",
   apiHeading: "API",
   baseUrl: "接口地址",

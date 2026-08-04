@@ -150,7 +150,56 @@ const HANDOFF_PORTS = [47821, 47822, 47823];
 
 export type DesktopSession = { app: string; version: string; signedIn: boolean; email: string | null };
 
-export async function probeDesktop(index = 0): Promise<DesktopSession | null> {
+/**
+ * Why a reachable, correctly-answering app can still look absent.
+ *
+ * Chrome 150 replaced Private Network Access — where a loopback server opted in by
+ * answering the preflight with `Access-Control-Allow-Private-Network: true` — with a
+ * *permission* the person has to grant. The desktop app still sends that header and it
+ * is no longer enough on its own: until the permission is granted, the fetch fails with
+ * a bare "Failed to fetch", indistinguishable from the app not running.
+ *
+ * Chrome only shows the prompt off a user gesture, so a probe on page load can never
+ * obtain it — it just fails, silently, forever. Hence the distinct states: the page has
+ * to be able to say "your browser is holding this back, click here" instead of the flat
+ * "not running" it used to claim while the app was running perfectly.
+ */
+export type DesktopProbe =
+  | { state: "connected"; session: DesktopSession }
+  | { state: "not-running" }
+  /** Reachable in principle; Chrome needs a click to raise the permission prompt. */
+  | { state: "needs-permission" }
+  /** The person said no, or a policy did. Only site settings can undo it. */
+  | { state: "permission-blocked" };
+
+/** null when the browser has no such permission — then the old rules still apply. */
+async function localNetworkPermission(): Promise<PermissionState | null> {
+  try {
+    const status = await navigator.permissions.query({
+      name: "local-network-access" as PermissionName,
+    });
+    return status.state;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One probe pass. Call it from a click to let Chrome raise the permission prompt; call
+ * it on load to report the current state without one.
+ */
+export async function probeDesktop(): Promise<DesktopProbe> {
+  const session = await reachDesktop();
+  if (session) return { state: "connected", session };
+
+  // Unreachable. Distinguish "no app" from "browser will not let us ask it".
+  const permission = await localNetworkPermission();
+  if (permission === "denied") return { state: "permission-blocked" };
+  if (permission === "prompt") return { state: "needs-permission" };
+  return { state: "not-running" };
+}
+
+async function reachDesktop(index = 0): Promise<DesktopSession | null> {
   if (index >= HANDOFF_PORTS.length) return null;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 700);
@@ -166,7 +215,7 @@ export async function probeDesktop(index = 0): Promise<DesktopSession | null> {
     if (json.app !== "mrday-one") throw new Error("not ours");
     return json;
   } catch {
-    return probeDesktop(index + 1);
+    return reachDesktop(index + 1);
   } finally {
     clearTimeout(timer);
   }
