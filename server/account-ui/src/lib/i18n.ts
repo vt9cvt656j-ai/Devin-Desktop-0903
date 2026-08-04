@@ -31,6 +31,9 @@ const EN = {
   resets: "Resets",
   recentActivity: "Recent activity",
   noRequests: "No requests yet.",
+  /** {days} is the plan's billing period, e.g. "every 30 days". */
+  everyDays: "every {days} days",
+  planGranted: "Granted, not purchased",
   when: "When",
   model: "Model",
   tokensIn: "In",
@@ -164,6 +167,8 @@ const ZH: Dict = {
   resets: "重置于",
   recentActivity: "最近调用",
   noRequests: "还没有调用记录。",
+  everyDays: "每 {days} 天",
+  planGranted: "由运营方发放，非购买",
   when: "时间",
   model: "模型",
   tokensIn: "输入",

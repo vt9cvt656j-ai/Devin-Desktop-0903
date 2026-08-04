@@ -35,25 +35,33 @@ export default function App() {
     try {
       const [profile, cat] = await Promise.all([
         api.me(),
-        onBilling ? api.catalog() : Promise.resolve(null),
+        // The overview needs it too, to price the plan the account is on. Failing to
+        // load the catalogue must not take the dashboard down with it — it is extra
+        // detail on one card there, whereas /billing genuinely cannot render without it.
+        api.catalog().catch(() => null),
       ]);
       setCreditDivisor(profile.raw_cents_per_credit_usd);
       setMe(profile);
       if (cat) {
         setCreditDivisor(cat.raw_cents_per_credit_usd);
         setCatalog(cat);
-        let saved: string | null = null;
-        try {
-          saved = localStorage.getItem(CURRENCY_KEY);
-        } catch {
-          /* storage may be blocked */
-        }
-        if (saved === "cny" || saved === "usd") {
-          setCurrency(saved);
-          setAutoCurrency(false);
-        } else {
-          setCurrency(cat.currency === "cny" ? "cny" : "usd");
-          setAutoCurrency(true);
+        // Currency still gets decided on the billing page alone. It also selects the
+        // interface language, so adopting the geo-inferred default here would swing a
+        // CN visitor's whole dashboard into Chinese without them asking for it.
+        if (onBilling) {
+          let saved: string | null = null;
+          try {
+            saved = localStorage.getItem(CURRENCY_KEY);
+          } catch {
+            /* storage may be blocked */
+          }
+          if (saved === "cny" || saved === "usd") {
+            setCurrency(saved);
+            setAutoCurrency(false);
+          } else {
+            setCurrency(cat.currency === "cny" ? "cny" : "usd");
+            setAutoCurrency(true);
+          }
         }
       }
     } catch {
@@ -88,6 +96,28 @@ export default function App() {
       /* a rejected write only means the choice is not remembered */
     }
   }
+
+  /*
+   * Which currency to price the plan in — a different question from which language to
+   * render, even though `currency` state answers both on the billing page.
+   *
+   * Money should read the way the account actually transacts: a buyer charged in yuan
+   * wants to see ¥488, not a dollar figure they never paid. Language should not be
+   * dragged along with it — deriving `lang` from this would swing the whole dashboard
+   * into Chinese for anyone billed in CNY, which is not what "show me the price I paid"
+   * asked for. So this reads the buyer's saved choice, falls back to the country the
+   * gateway inferred, and stops there.
+   */
+  const priceCurrency: Currency = (() => {
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem(CURRENCY_KEY);
+    } catch {
+      /* storage may be blocked; the inferred default still applies */
+    }
+    if (saved === "cny" || saved === "usd") return saved;
+    return catalog?.currency === "cny" ? "cny" : "usd";
+  })();
 
   if (failed) {
     return <div className="p-16 text-center text-muted-foreground">{t.loadFailed}</div>;
@@ -141,7 +171,7 @@ export default function App() {
           onRedeemed={() => void load()}
         />
       ) : (
-        <Dashboard me={me} tab={tab} lang={lang} />
+        <Dashboard me={me} tab={tab} lang={lang} catalog={catalog} currency={priceCurrency} />
       )}
     </Shell>
   );

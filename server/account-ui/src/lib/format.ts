@@ -44,11 +44,19 @@ export function priceAlt(item: CatalogItem, currency: Currency, quantity = 1): s
     : `$${trimZeros(((item.amount_usd_cents * quantity) / 100).toFixed(2))}`;
 }
 
+/*
+ * Both formatters name the locale outright. Passing `undefined` means "whatever locale
+ * the browser is set to", which is not the same thing as English: on a machine set to
+ * Chinese it rendered 2026年9月30日 inside an otherwise fully English console. The
+ * interface language decides the date format, not the operating system.
+ */
+const localeFor = (lang: Lang) => (lang === "zh" ? "zh-CN" : "en-US");
+
 export function formatDate(value: string | null | undefined, lang: Lang): string {
   if (!value) return "—";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString(lang === "zh" ? "zh-CN" : undefined, {
+  return d.toLocaleDateString(localeFor(lang), {
     year: "numeric",
     month: "long",
     day: "numeric",
@@ -59,7 +67,7 @@ export function formatDateTime(value: string | null | undefined, lang: Lang): st
   if (!value) return "—";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString(lang === "zh" ? "zh-CN" : undefined, {
+  return d.toLocaleString(localeFor(lang), {
     dateStyle: "medium",
     timeStyle: "short",
   });

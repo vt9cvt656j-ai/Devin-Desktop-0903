@@ -13,16 +13,25 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { api, probeDesktop, signOut, type DesktopSession, type Me, type Usage } from "@/lib/api";
+import {
+  api,
+  probeDesktop,
+  signOut,
+  type Catalog,
+  type DesktopSession,
+  type Me,
+  type Usage,
+} from "@/lib/api";
 import {
   formatDate,
   formatDateTime,
   planIsActive,
   planLabel,
+  price,
   timeUntil,
   usd,
 } from "@/lib/format";
-import { DICTS, type Lang } from "@/lib/i18n";
+import { DICTS, type Currency, type Lang } from "@/lib/i18n";
 
 /*
  * The release repo is private, so github.com/.../releases/latest 404s for every signed-in
@@ -234,7 +243,20 @@ function UsageTable({
   );
 }
 
-export function Dashboard({ me, tab, lang }: { me: Me; tab: Tab; lang: Lang }) {
+export function Dashboard({
+  me,
+  tab,
+  lang,
+  catalog,
+  currency,
+}: {
+  me: Me;
+  tab: Tab;
+  lang: Lang;
+  /** null when the catalogue could not be loaded; the plan card just omits the price. */
+  catalog: Catalog | null;
+  currency: Currency;
+}) {
   const t = DICTS[lang];
   const [usage, setUsage] = useState<Usage | null>(null);
   const [desktop, setDesktop] = useState<DesktopSession | null | undefined>(undefined);
@@ -253,6 +275,11 @@ export function Dashboard({ me, tab, lang }: { me: Me; tab: Tab; lang: Lang }) {
   const pct = cap > 0 ? Math.max(0, Math.min(100, (spent / cap) * 100)) : null;
   const refill = timeUntil(me.quota_window_reset_at);
   const active = planIsActive(me.plan, me.plan_expires_at);
+  // One catalogue row per plan, so this is unambiguous. Free accounts match nothing.
+  const planPrice =
+    active && me.plan
+      ? (catalog?.items.find((i) => i.kind === "plan" && i.plan === me.plan) ?? null)
+      : null;
 
   if (tab === "usage") {
     return (
@@ -401,6 +428,19 @@ export function Dashboard({ me, tab, lang }: { me: Me; tab: Tab; lang: Lang }) {
           <div className="mb-2.5 flex items-baseline justify-center gap-2.5">
             <span className="text-lg font-semibold">{planLabel(me.plan)}</span>
           </div>
+          {/* What this plan costs, in the currency this console is showing. It is the
+              catalogue price, not a receipt: an account can also be put on a plan by an
+              operator grant or a redemption code, and those leave no order to quote. */}
+          {planPrice ? (
+            <p className="mb-1.5 text-2xl font-semibold tracking-tight tabular-nums">
+              {price(planPrice, currency)}
+              {planPrice.duration_days ? (
+                <span className="ml-1.5 text-[13.5px] font-medium text-muted-foreground">
+                  {fill(t.everyDays, { days: planPrice.duration_days })}
+                </span>
+              ) : null}
+            </p>
+          ) : null}
           <p className="mb-5 text-[13.5px] leading-relaxed text-muted-foreground">
             {active && me.plan_expires_at
               ? `${t.until} ${formatDate(me.plan_expires_at, lang)}`
