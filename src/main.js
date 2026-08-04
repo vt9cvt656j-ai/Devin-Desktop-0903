@@ -651,8 +651,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       const covered = Number(coveredStr || "0") || 0;
       if (prefix && typeof prefix === "string") {
         const trimmedPrefix = prefix.trim();
-        if (trimmedPrefix.length >= 16 && trimmedPrefix.length <= 200
-            && /^[a-f0-9]+$/i.test(trimmedPrefix) && covered > 0) {
+        // Must match the token the gateway actually issues: "mcp_" + hex. The old bare-hex
+        // pattern rejected every real token, so the client never stored a prefix, re-uploaded the
+        // entire transcript every turn, and hit the 3.5MB body cap — which made the 2M and 5M
+        // tiers physically unreachable from the app no matter what the user paid for. The correct
+        // pattern already existed 100 lines below in _mcPrefixLoadAll; this copy was stale.
+        if (/^mcp_[a-f0-9]{16,80}$/i.test(trimmedPrefix) && covered > 0) {
           // 覆盖条数缺失或解析失败时按 0 处理：宁可这一轮整份重传，也不能凭一个错的
           // 条数去裁历史 —— 裁错了模型收到的是错位的上下文，而且不会有任何报错。
           onEvent({ kind: "compressionPrefix", token: trimmedPrefix, covered });
@@ -11547,8 +11551,9 @@ function _modelContextRows(m) {
   const btns = opts.map((o) => {
     const active = !activeMarked && o.value === eff && !(o.locked);
     if (active) activeMarked = true;
-    const cls = "mic-think-btn" + (active ? " is-active" : "") + (o.locked ? " mic-ctx-btn--locked" : "");
-    const tip = o.locked ? o.lockHint
+    const cls = "mic-think-btn" + (active ? " is-active" : "")
+      + (o.locked || o.redundant ? " mic-ctx-btn--locked" : "");
+    const tip = (o.locked || o.redundant) ? o.lockHint
       : (o.native
           ? `${_tokenExact(o.value)} tokens（模型原生窗口）${o.beta ? `\n需上游 beta：${o.beta}（账号档位不够时上游会拒绝）` : ""}`
           : `${o.lockHint} · ${_tokenExact(o.value)} tokens`);
@@ -11986,12 +11991,19 @@ function _ctxChoiceOptions(modelId) {
   // Every tier is DISPLAYED regardless of membership; only those the membership grants are
   // selectable. Locked tiers say what would unlock them instead of silently hiding.
   for (const [name, tokens] of _MC_TIER_OPTIONS) {
+    // A tier at or below the model's own window buys nothing — on a 1M-native model the 1M tier
+    // is the window the user already has for free. Showing it as a purchasable upgrade is selling
+    // a no-op, so mark it plainly instead. (It is still shown, not hidden: it exists, it is just
+    // redundant here, and silently disappearing options is more confusing than labelling them.)
+    const redundant = tokens <= native;
     const locked = !(compress && tokens <= tierMax);
     opts.push({
-      value: tokens, label: name, locked, tier: name, kind: "modified",
-      lockHint: locked
-        ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
-        : `michael-compression ${name} 档`,
+      value: tokens, label: name, locked, tier: name, kind: "modified", redundant,
+      lockHint: redundant
+        ? `${name} 不大于本模型原生窗口（${_tokenShort(native)}），选它不会多给上下文`
+        : locked
+          ? (tierMax > 0 ? `需 ${name} 及以上会员档位（当前 ${_tokenShort(tierMax)}）` : "需开通 michael-compression 会员")
+          : `michael-compression ${name} 档`,
     });
   }
   return opts;
@@ -20452,7 +20464,7 @@ function _runStateNextActionSuggestions(sess) {
 async function _maybeSuggestNext(sess, messages, config) {
   try {
     if (!sess || !inTauri) return;
-    _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), "接下来 ›");
+    _renderSuggestionChips(sess, _runStateNextActionSuggestions(sess), t("chat.nextSteps"));
   } catch {}
 }
 
@@ -20564,7 +20576,7 @@ function _maybeRenderChoices(sess, src) {
     _renderSuggestionChips(
       sess,
       opts.map((o) => ({ label: o.label + (o.text ? "、" + o.text : ""), send: o.send })),
-      "接下来 ›",
+      t("chat.nextSteps"),
     );
     const block = sess.container.lastElementChild;
     if (block && block.classList && block.classList.contains("next-steps")) block.dataset.choices = "1";
@@ -27388,9 +27400,9 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
             .map((a) => ({ role: String(a?.role || "research"), focus: String(a?.focus || a?.task || a?.prompt || "").trim() }))
             .filter((a) => a.focus)
             .slice(0, 5);
-          return { type: "spawnmulti", path: `并发×${_agents.length}`, task: String(args.task || ""), agents: _agents, collaboration: args.collaboration === "independent" ? "independent" : "shared_store" };
+          return { type: "spawnmulti", path: t("subagent.concurrent", { count: _agents.length }), task: String(args.task || ""), agents: _agents, collaboration: args.collaboration === "independent" ? "independent" : "shared_store" };
         }
-    case "research_project": return { type: "subagent", path: "深挖代码库", description: (args.focus && String(args.focus).trim()) ? "深挖·" + String(args.focus).trim().slice(0, 8) : "深挖代码库", prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || ""), wait: !!args.wait };
+    case "research_project": return { type: "subagent", path: t("subagent.researchProject"), description: (args.focus && String(args.focus).trim()) ? t("subagent.researchFocus", { focus: String(args.focus).trim().slice(0, 12) }) : t("subagent.researchProject"), prompt: _RESEARCH_PROMPT(args.focus || args.area || args.target || ""), wait: !!args.wait };
     case "design_research": return { type: "subagent", path: "设计调研", description: "设计+UI架构调研", prompt: _DESIGN_RESEARCH_PROMPT(args.goal || args.focus || args.target || args.description || ""), wait: !!args.wait };
     case "learn_design": return { type: "learndesign", path: String(args.url || ""), url: String(args.url || ""), name: String(args.name || "") };
     case "generate_wiki": return { type: "subagent", path: "生成产品Wiki", description: "产品Wiki", prompt: _WIKI_PROMPT(args.focus || ""), _wiki: true, wikiDest: String(args.dest || "PRODUCT_WIKI.md") };
@@ -28156,7 +28168,7 @@ function _planRowHtml(s, i) {
   const isDone = s.status === "completed", isCancel = s.status === "cancelled";
   const actionable = !isDone && !isCancel;
   const cls = "agent-plan__row" + (isDone ? " agent-plan__row--done" : isCancel ? " agent-plan__row--cancelled" : " agent-plan__row--actionable");
-  const tag = isCancel ? `<span class="agent-plan__tag">点击恢复 ↩</span>` : (actionable ? `<span class="agent-plan__cancelhint">点击取消 ✕</span>` : "");
+  const tag = isCancel ? `<span class="agent-plan__tag">${_escHtml(t("plan.restoreHint"))}</span>` : (actionable ? `<span class="agent-plan__cancelhint">${_escHtml(t("plan.cancelHint"))}</span>` : "");
   const rowCls = cls + (isCancel ? " agent-plan__row--restorable" : "");
   return `<li class="${rowCls}" data-idx="${i}">${_planStepIcon(s.status)}<span class="agent-plan__txt">${_escHtml(s.content)}</span>${tag}</li>`;
 }
@@ -28331,12 +28343,12 @@ function _renderPlan(container, steps, existingEl, run) {
     // the user sees after the actual wrap-up text.
     container.appendChild(el);
   }
-  const badge = `${done}/${total} 完成` + (canc ? ` · ${canc} 已取消` : "");
+  const badge = t("plan.badgeDone", { done, total }) + (canc ? t("plan.badgeCancelled", { count: canc }) : "");
   const view = _planVisibleWindow(run, steps);
   el.innerHTML =
     `<div class="agent-plan__head">` +
       `<span class="ic">${_PLAN_ICON}</span>` +
-      `<span>任务计划</span><span class="agent-plan__badge">${badge}</span>` +
+      `<span>${_escHtml(t("plan.title"))}</span><span class="agent-plan__badge">${_escHtml(badge)}</span>` +
     `</div>` +
     `<ul class="agent-plan__list">` +
     view.rows.map((s, i) => _planRowHtml(s, view.start + i)).join("") +
@@ -34660,7 +34672,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     `<div class="agent-tool-row">` +
     `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
     `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a2 2 0 011 3.732V6h3.25A2.75 2.75 0 0115 8.75v3.5A2.75 2.75 0 0112.25 15h-8.5A2.75 2.75 0 011 12.25v-3.5A2.75 2.75 0 013.75 6H7V4.732A2 2 0 018 1zM5.5 9.5a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg></div>` +
-    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${write ? "worker" : "子智能体"}</span><span class="atc-path">${_escHtml(description)}${write && scopeRel.length ? " · scope: " + _escHtml(_scopeIsWholeWs ? "整个工作区(独占串行)" : scopeRel.join(", ")) : ""}</span></div></div>` +
+    `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">${write ? t("subagent.worker") : t("subagent.label")}</span><span class="atc-path">${_escHtml(description)}${write && scopeRel.length ? " · scope: " + _escHtml(_scopeIsWholeWs ? "整个工作区(独占串行)" : scopeRel.join(", ")) : ""}</span></div></div>` +
     `<span class="atc-result"><span class="atc-spin"></span></span></div>` +
     `<div class="atc-viewport"></div>`;
   card.querySelector(".agent-tool-row").addEventListener("click", () => card.classList.toggle("is-open"));
@@ -34725,7 +34737,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       }
       // Whole-workspace worker on either side → serialize: wait for a sibling to release,
       // then re-check. _workerScopeWaiters is drained in the finally that unregisters scope.
-      res.textContent = "排队中";
+      res.textContent = t("subagent.queued");
       await new Promise((resolve) => { (run._workerScopeWaiters ||= []).push(resolve); setTimeout(resolve, 15000); });
       res.innerHTML = '<span class="atc-spin"></span>';
     }
@@ -35046,7 +35058,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // distinguish an empty child run from a missing card.
   if (toolCount === 0) {
     res.className = "atc-result atc-result--err";
-    res.textContent = "0 步 · 未执行";
+    res.textContent = t("subagent.noSteps");
     card.classList.remove("is-open");
     _chatFollow();
     return write
@@ -35063,7 +35075,11 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
       : `\n\n【系统核对·非 worker 自述】该 worker 全程未写盘任何文件——若简报声称已完成改动即为虚报，不要采信；这块改为自己实现或重派。`);
   }
   res.className = "atc-result atc-result--ok";
-  res.textContent = `${toolCount} 步${write ? (_writesDone.length ? "（worker）" : "（worker·未写盘）") : "调研"}`;
+  // 单复数：中文无变化，英文 1 步不能写成 "1 steps"
+  const _stepKey = (base) => (toolCount === 1 ? base + "One" : base);
+  res.textContent = write
+      ? t(_stepKey(_writesDone.length ? "subagent.workerSteps" : "subagent.workerStepsNoWrite"), { count: toolCount })
+      : t(_stepKey("subagent.researchSteps"), { count: toolCount });
   card.classList.remove("is-open");
   _chatFollow();
   // Context OUT: fold this child's report into the shared findings so it integrates into the
@@ -39213,7 +39229,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
             _smJobs.push(jobId);
           }
           const message = `[已并发派发 ${_smJobs.length} 个子智能体] ${_smJobs.map((id) => `job#${id}`).join("、")}（协同模式：${_smShared ? "shared_store 发现互相广播" : "independent 完全隔离"}）。它们在后台并行工作，你继续推进当前任务的其他步骤；结果就绪后自动送达，也可用 await_subagent(job="all") 汇合。`;
-          it.rawResult = { type: "spawnmulti", path: it.call.path || `并发×${_smJobs.length}`, content: message };
+          it.rawResult = { type: "spawnmulti", path: it.call.path || t("subagent.concurrent", { count: _smJobs.length }), content: message };
           return message;
         }
         const isWorker = it.tc.name === "run_worker";
@@ -39245,7 +39261,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
           it.rawResult = { type: "subagent", path: it.call.description || "", content: dispatchIssue };
           it.step = _createToolStep({ ...it.call, _toolName: it.tc.name });
           body.appendChild(it.step);
-          _settleToolStep(it.step, it.rawResult, "单点任务 · 未派发");
+          _settleToolStep(it.step, it.rawResult, t("subagent.singleTaskNotDispatched"));
           return dispatchIssue;
         }
         // 并行派发事实账本（供拆分门与收尾自省记账读取）：只记 worker/子智能体真派发，被拦截的不算。
@@ -39411,9 +39427,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
         for (let j = 0; j < items.length; j++) {
           if (!toolMsgs[j]) {
             toolMsgs[j] = { role: "tool", tool_call_id: items[j].tc.id, content: "[interrupted]" };
-            _settleToolStep(items[j].step, { content: "[interrupted]" }, "已停止");
+            _settleToolStep(items[j].step, { content: "[interrupted]" }, t("tool.stopped"));
           }
-          if (items[j]._readGroup) _settleReadBatchGroup(items[j]._readGroup, "已停止");
+          if (items[j]._readGroup) _settleReadBatchGroup(items[j]._readGroup, t("tool.stopped"));
         }
         for (const m of toolMsgs) messages.push(m);
         break;
@@ -40099,7 +40115,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     try {
       body.querySelectorAll?.(".agent-tool-step").forEach((step) => {
         if (step.querySelector?.(".atc-spin")) {
-          _settleToolStep(step, { content: finalErr ? `[ERROR] ${finalErr}` : "[interrupted]" }, finalErr ? "失败" : "已停止");
+          _settleToolStep(step, { content: finalErr ? `[ERROR] ${finalErr}` : "[interrupted]" }, finalErr ? t("tool.failed") : t("tool.stopped"));
         }
       });
     } catch {}
@@ -41132,6 +41148,13 @@ function _toolStepActionLabel(call) {
     generate_music: "音乐", generate_voice: "语音", auto_rig: "骨骼绑定", generate_motion: "动画",
     generate_texture: "纹理", search_game_assets: "资源搜索", download_asset: "下载资源", unknown: "未知工具",
   };
+  // i18n first: `tool.action.<type>` carries the translated verb. The literal map above
+  // stays as the fallback for any type that has no translation yet.
+  if (call?.type) {
+    const key = `tool.action.${call.type}`;
+    const translated = t(key);
+    if (translated !== key) return translated;
+  }
   if (labels[call?.type]) return labels[call.type];
   const raw = String(call?._toolName || call?.mcpName || call?.type || "工具").trim();
   return raw ? raw.replace(/_/g, " ") : "工具";
@@ -42906,7 +42929,7 @@ async function _executeToolStepInner(step, call, root, run) {
       const sizeLabel = txt.length > 1024 ? `${(txt.length / 1024).toFixed(1)} KB` : `${txt.length} chars`;
       res.className = "atc-result atc-result--info";
       const rangeLabel = (start > 0 || shownTo < total) ? ` (${shownFrom}-${shownTo}/${total})` : "";
-      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg><span class="atc-result__t">${total} 行 · ${sizeLabel}${rangeLabel}</span>`;
+      res.innerHTML = `<svg viewBox="0 0 12 12" width="11" height="11" fill="currentColor"><path d="M6 0a6 6 0 110 12A6 6 0 016 0zm.75 3a.75.75 0 10-1.5 0 .75.75 0 001.5 0zM5.25 5a.75.75 0 000 1.5h.25V8.5h-.5a.75.75 0 000 1.5h2a.75.75 0 000-1.5H6.5V5.75A.75.75 0 005.75 5h-.5z"/></svg><span class="atc-result__t">${t("tool.readLines", { count: total })} · ${sizeLabel}${rangeLabel}</span>`;
       // Render the file content with syntax highlighting (same engine as the
       // code cards) instead of a plain-text dump — much easier to read.
       const _disp = body.slice(0, 4000);
@@ -43327,7 +43350,7 @@ async function _executeToolStepInner(step, call, root, run) {
       growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
       res.className = "atc-result atc-result--ok";
-      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">撤销</button>`;
+      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">${_escHtml(t("tool.undo"))}</button>`;
       row.addEventListener("dblclick", () => openFile(fp, String(call.path || "").split("/").pop()));
       _ipcBroadcast("file_changed", { path: fp });
 
@@ -43509,7 +43532,7 @@ async function _executeToolStepInner(step, call, root, run) {
       growth.predictGate(vp, { lines: added });   // "你先猜": blur the diff until the user guesses (challenge mode)
       step.classList.add("agent-tool-step--accepted");
       res.className = "atc-result atc-result--ok";
-      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span><button class="atc-undo-btn" type="button">撤销</button>`;
+      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span> <span class="d">-${removed}</span></span><button class="atc-undo-btn" type="button">${_escHtml(t("tool.undo"))}</button>`;
       row.addEventListener("dblclick", () => openFile(fp, String(call.path || "").split("/").pop()));
       _ipcBroadcast("file_changed", { path: fp });
       showToast(`Updated ${String(call.path || "").split("/").pop()} (${edits.length} edits)`);
@@ -44593,7 +44616,7 @@ async function _executeToolStepInner(step, call, root, run) {
       }
       step.classList.add("agent-tool-step--accepted");
       res.className = "atc-result atc-result--ok";
-      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">撤销</button>`;
+      res.innerHTML = `<svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5l2.8 2.8L11 4"/></svg> <span class="atc-diffstat"><span class="a">+${added}</span>${removed ? ` <span class="d">-${removed}</span>` : ""}</span><button class="atc-undo-btn" type="button">${_escHtml(t("tool.undo"))}</button>`;
       _ipcBroadcast("file_changed", { path: fp });
       showToast(`Formatted ${rel.split("/").pop()}`);
       const undoBtn = res.querySelector(".atc-undo-btn");
@@ -45967,7 +45990,7 @@ ${bodyPreview}`)}</pre>`;
         const _tag = j.status === "done" ? "完成" : (j.status === "timeout" ? "超时 (部分结果)" : (j.status === "cancelled" ? "已取消" : "失败"));
         _parts.push(`[job#${j.id} ${_tag}·${j.desc}] ${_clipPreservingErrors(String(j.result || "（无产出）").replace(/\s+/g, " "), Math.min(1200, _budget))}`);
       }
-      res.className = "atc-result atc-result--ok"; res.textContent = `${_targets.length} 个作业落定`;
+      res.className = "atc-result atc-result--ok"; res.textContent = t("subagent.jobsSettled", { count: _targets.length });
       const _factHead = _idleWait ? "[事实] 派发后未做任何其他工作就开始等待 = 同步阻塞，异步失去意义。下次：单个聚焦调研直接自己读；派了后台作业就先推进其他步骤，结果会自动送达。\n" : "";
       return { type: "awaitsubagent", path: _want, content: (_factHead + _parts.join("\n")).slice(0, 3200) };
 
