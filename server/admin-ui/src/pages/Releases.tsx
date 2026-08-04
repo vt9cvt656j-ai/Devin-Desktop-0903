@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,8 +23,10 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Truncate,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import { useRowFlash } from "@/lib/flash";
 import { num, when } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -155,6 +162,9 @@ export function Releases() {
   const [tag, setTag] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState<Release | null>(null);
+  // 发布成功后那一行亮一下。这一屏 15 秒轮询一次，"草稿"变"已发布"这个变化很容易被
+  // 当成又一次轮询刷新，行内闪一下才说明这是刚才那一下点出来的。
+  const { fire, toneOf } = useRowFlash();
   const alive = useRef(true);
 
   const load = useCallback(async () => {
@@ -239,8 +249,10 @@ export function Releases() {
           : `${wanted} 已发布，客户端下一次检查更新就能收到`,
       });
       await load();
+      if (wanted) fire(wanted, "ok");
     } catch (e) {
       setFlash({ ok: false, text: e instanceof Error ? e.message : "发布失败" });
+      if (wanted) fire(wanted, "error");
     } finally {
       if (alive.current) {
         setBusy(false);
@@ -250,27 +262,24 @@ export function Releases() {
   }
 
   return (
-    <div>
-      <h1 className="font-display text-2xl font-semibold tracking-tight">版本发布</h1>
-      <p className="type-measure mt-1 text-muted-foreground">
-        触发签名构建，确认草稿带齐更新清单后再发布。发布即上线，撤不回来。
-      </p>
+    <div className="space-y-6">
+      <PageHeader
+        title="版本发布"
+        description="触发签名构建，确认草稿带齐更新清单后再发布。发布即上线，撤不回来。"
+      />
 
-      {err && (
-        <p role="alert" className="mt-4 text-sm text-destructive">
-          {err}
-        </p>
-      )}
+      <ErrorState message={err} onRetry={() => load()} />
       {flash && (
         <p
           role={flash.ok ? "status" : "alert"}
-          className={cn("mt-4 text-sm", flash.ok ? "text-success" : "text-destructive")}
+          className={cn("text-sm", flash.ok ? "text-success" : "text-destructive")}
         >
           {flash.text}
         </p>
       )}
 
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 入场错峰：标题 0，往下每段 +70ms，第五段起封顶（Math.min(i,4)*70）。 */}
+      <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat
           label="线上版本"
           value={live?.tag_name || "—"}
@@ -307,9 +316,9 @@ export function Releases() {
                     : "等第一个版本发布"
           }
         />
-      </div>
+      </SectionReveal>
 
-      <section className="mt-8 rounded-xl border border-border bg-card">
+      <SectionReveal as="section" delay={140} className="rounded-xl border border-border bg-card">
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
           <div className="min-w-0">
             <h2 className="text-sm font-semibold">发布流水线</h2>
@@ -377,22 +386,22 @@ export function Releases() {
             </>
           )}
         </div>
-      </section>
+      </SectionReveal>
 
-      <section className="mt-6 rounded-xl border border-border bg-card">
+      <SectionReveal as="section" delay={210} className="rounded-xl border border-border bg-card">
         <header className="flex items-center justify-between border-b border-border px-5 py-3">
           <h2 className="text-sm font-semibold">Release</h2>
           {drafts.length > 0 && <Badge variant="outline">{drafts.length} 个草稿</Badge>}
         </header>
         {releases.length ? (
-          <Table>
+          <Table className="min-w-[58rem]">
             <TableHeader>
               <TableRow>
-                <TableHead>版本</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>更新包</TableHead>
-                <TableHead>时间</TableHead>
-                <TableHead className="text-right">操作</TableHead>
+                <TableHead className="w-52">版本</TableHead>
+                <TableHead className="w-40">状态</TableHead>
+                <TableHead className="w-[26rem]">更新包</TableHead>
+                <TableHead className="w-28">时间</TableHead>
+                <TableHead className="w-32 text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -400,13 +409,13 @@ export function Releases() {
                 const u = updater(r);
                 const url = githubUrl(r.html_url);
                 return (
-                  <TableRow key={r.id ?? r.tag_name ?? i}>
-                    <TableCell>
-                      <div className="font-medium tabular-nums">{r.tag_name || r.name || "未命名"}</div>
+                  <TableRow key={r.id ?? r.tag_name ?? i} data-flash={toneOf(r.tag_name || "")}>
+                    <TableCell className="max-w-52">
+                      <Truncate className="font-medium tabular-nums">
+                        {r.tag_name || r.name || "未命名"}
+                      </Truncate>
                       {r.name && r.name !== r.tag_name && (
-                        <div className="mt-0.5 max-w-64 truncate text-xs text-muted-foreground">
-                          {r.name}
-                        </div>
+                        <Truncate className="mt-0.5 text-xs text-muted-foreground">{r.name}</Truncate>
                       )}
                     </TableCell>
                     <TableCell>
@@ -430,14 +439,14 @@ export function Releases() {
                         )}
                         {u.signatures > 0 && <Badge variant="outline">{u.signatures} 个签名</Badge>}
                       </div>
-                      <div
-                        className="mt-1.5 max-w-72 truncate text-xs text-muted-foreground"
+                      <Truncate
+                        className="mt-1.5 max-w-[24rem] text-xs text-muted-foreground"
                         title={assetTitle(u.assets)}
                       >
                         {u.assets.length
                           ? `${u.assets.length} 个文件：${u.assets.map((a) => a.name || "?").join("、")}`
                           : "尚无构建文件"}
-                      </div>
+                      </Truncate>
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-muted-foreground">
                       {when(r.published_at || r.created_at)}
@@ -465,26 +474,29 @@ export function Releases() {
               })}
             </TableBody>
           </Table>
+        ) : !status ? (
+          <TableSkeleton rows={3} columns={["16%", "12%", "34%", "10%"]} label="Release 读取中" />
         ) : (
-          <p className="px-5 py-8 text-center text-sm text-muted-foreground">
-            {status ? "还没有 Release" : "读取中…"}
-          </p>
+          <EmptyState
+            title="还没有 Release"
+            hint="在上面填一个已经推到仓库的 vX.Y.Z tag，构建完成后草稿会出现在这里。"
+          />
         )}
-      </section>
+      </SectionReveal>
 
-      <section className="mt-6 rounded-xl border border-border bg-card">
+      <SectionReveal as="section" delay={280} className="rounded-xl border border-border bg-card">
         <header className="flex items-center justify-between border-b border-border px-5 py-3">
           <h2 className="text-sm font-semibold">构建记录</h2>
           {running.length > 0 && <Badge variant="outline">{running.length} 个进行中</Badge>}
         </header>
         {runs.length ? (
-          <Table className="min-w-[34rem]">
+          <Table className="min-w-[40rem]">
             <TableHeader>
               <TableRow>
-                <TableHead>构建</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>触发</TableHead>
-                <TableHead className="text-right">日志</TableHead>
+                <TableHead className="w-[24rem]">构建</TableHead>
+                <TableHead className="w-32">状态</TableHead>
+                <TableHead className="w-28">触发</TableHead>
+                <TableHead className="w-24 text-right">日志</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -492,11 +504,11 @@ export function Releases() {
                 const url = githubUrl(run.html_url);
                 return (
                   <TableRow key={run.id ?? i}>
-                    <TableCell>
-                      <div className="max-w-64 truncate font-medium">
+                    <TableCell className="max-w-[24rem]">
+                      <Truncate className="font-medium">
                         {run.head_branch || run.display_title || run.name || `#${run.id ?? "—"}`}
-                      </div>
-                      <div className="mt-0.5 text-xs text-muted-foreground">
+                      </Truncate>
+                      <div className="mt-0.5 whitespace-nowrap text-xs text-muted-foreground">
                         #{run.id ?? "—"} · 第 {run.run_attempt || 1} 次
                         {run.head_sha ? ` · ${String(run.head_sha).slice(0, 7)}` : ""}
                       </div>
@@ -521,12 +533,12 @@ export function Releases() {
               })}
             </TableBody>
           </Table>
+        ) : !status ? (
+          <TableSkeleton rows={3} columns={["30%", "10%", "10%"]} label="构建记录读取中" />
         ) : (
-          <p className="px-5 py-8 text-center text-sm text-muted-foreground">
-            {status ? "还没有构建记录" : "读取中…"}
-          </p>
+          <EmptyState title="还没有构建记录" hint="触发一次构建后，GitHub Actions 的运行会出现在这里。" />
         )}
-      </section>
+      </SectionReveal>
 
       <Dialog
         open={!!confirming}

@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +24,7 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Truncate,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
@@ -218,10 +224,6 @@ function Field({
       {hint && <p className="mt-1.5 text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
-}
-
-function Empty({ children }: { children: ReactNode }) {
-  return <p className="px-5 py-8 text-center text-sm text-muted-foreground">{children}</p>;
 }
 
 export function Pricing() {
@@ -887,7 +889,7 @@ export function Pricing() {
                       />
                     </>
                   ) : (
-                    <Empty>选好渠道和模型，结果会自动算出来。</Empty>
+                    <EmptyState compact title="选好渠道和模型" hint="参数填齐之后结果会自动算出来。" />
                   )}
                 </div>
               </Panel>
@@ -915,7 +917,7 @@ export function Pricing() {
                       />
                     </>
                   ) : (
-                    <Empty>还没有可用的建议。</Empty>
+                    <EmptyState compact title="还没有可用的建议" hint="先在左边选好渠道和模型。" />
                   )}
                 </div>
               </Panel>
@@ -955,7 +957,7 @@ export function Pricing() {
                       />
                     </>
                   ) : (
-                    <Empty>选好渠道和模型，结果会自动算出来。</Empty>
+                    <EmptyState compact title="选好渠道和模型" hint="参数填齐之后结果会自动算出来。" />
                   )}
                 </div>
               </Panel>
@@ -996,7 +998,7 @@ export function Pricing() {
                       />
                     </>
                   ) : (
-                    <Empty>选好渠道和模型，结果会自动算出来。</Empty>
+                    <EmptyState compact title="选好渠道和模型" hint="参数填齐之后结果会自动算出来。" />
                   )}
                 </div>
               </Panel>
@@ -1008,19 +1010,17 @@ export function Pricing() {
   );
 
   return (
-    <div>
-      <h1 className="font-display text-2xl font-semibold tracking-tight">定价试算</h1>
-      <p className="type-measure mt-1 text-muted-foreground">
-        改倍率、定套餐价之前先在这里算一遍。用的是服务端真正的计费规则，算完不会改动任何模型或用户的扣费。
-      </p>
+    <div className="space-y-6">
+      <PageHeader
+        title="定价试算"
+        description="改倍率、定套餐价之前先在这里算一遍。用的是服务端真正的计费规则，算完不会改动任何模型或用户的扣费。"
+      />
 
-      {loadErr && (
-        <p role="alert" className="mt-4 text-sm text-destructive">
-          {loadErr}
-        </p>
-      )}
+      <ErrorState message={loadErr} />
 
-      <Tabs value={mode} onValueChange={(v) => setMode(v as Mode)} className="mt-6 gap-6">
+      {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
+      <SectionReveal as="section" delay={70}>
+      <Tabs value={mode} onValueChange={(v) => setMode(v as Mode)} className="gap-6">
         <TabsList>
           <TabsTrigger value="quota">套餐额度</TabsTrigger>
           <TabsTrigger value="token">Token 用量</TabsTrigger>
@@ -1033,8 +1033,9 @@ export function Pricing() {
           {lab}
         </TabsContent>
       </Tabs>
+      </SectionReveal>
 
-      <section className="mt-8 rounded-xl border border-border bg-card">
+      <SectionReveal as="section" delay={140} className="rounded-xl border border-border bg-card">
         <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
           <h2 className="text-sm font-semibold">渠道汇率</h2>
           <span className="text-xs text-muted-foreground">只用于上面的试算</span>
@@ -1087,23 +1088,29 @@ export function Pricing() {
 
         <div className="border-t border-border">
           {channels.length ? (
-            <Table>
+            <Table className="min-w-[52rem]">
               <TableHeader>
                 <TableRow>
-                  <TableHead>渠道</TableHead>
-                  <TableHead>渠道汇率</TableHead>
-                  <TableHead>备注</TableHead>
-                  <TableHead>更新</TableHead>
-                  <TableHead className="text-right">操作</TableHead>
+                  <TableHead className="w-[16rem]">渠道</TableHead>
+                  <TableHead numeric className="w-56">渠道汇率</TableHead>
+                  <TableHead className="w-[20rem]">备注</TableHead>
+                  <TableHead className="w-28">更新</TableHead>
+                  <TableHead className="w-32 text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {channels.map((c) => (
                   <TableRow key={c.id}>
-                    <TableCell className="font-medium">{c.name}</TableCell>
-                    <TableCell className="tabular-nums">{fx(c.usd_per_cny)}</TableCell>
-                    <TableCell className="text-muted-foreground">{c.note || "—"}</TableCell>
-                    <TableCell className="text-muted-foreground">{when(c.updated_at || c.created_at)}</TableCell>
+                    <TableCell className="max-w-[16rem] font-medium">
+                      <Truncate>{c.name}</Truncate>
+                    </TableCell>
+                    <TableCell numeric>{fx(c.usd_per_cny)}</TableCell>
+                    <TableCell className="max-w-[20rem] text-muted-foreground">
+                      <Truncate>{c.note || "—"}</Truncate>
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-muted-foreground">
+                      {when(c.updated_at || c.created_at)}
+                    </TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
                         <Button size="sm" variant="outline" onClick={() => openEdit(c)}>
@@ -1123,15 +1130,24 @@ export function Pricing() {
                 ))}
               </TableBody>
             </Table>
+          ) : ratesLoaded ? (
+            <EmptyState
+              title="还没有渠道汇率"
+              hint="汇率表示 1 元人民币能换多少渠道原始美元，先建一个再试算。"
+            />
+          ) : loadErr ? (
+            // 「还没有」只能对真的加载成功过的列表说。加载失败时说"还没有渠道汇率"，
+            // 操作员会照着建一条重复的。
+            <ErrorState
+              variant="block"
+              message="渠道汇率没有加载出来"
+              hint="先解决上面的报错再操作，别在这里重复创建。"
+            />
           ) : (
-            <Empty>
-              {ratesLoaded
-                ? "还没有渠道汇率。汇率表示 1 元人民币能换多少渠道原始美元，先建一个再试算。"
-                : "渠道汇率没有加载出来，先解决上面的报错再操作，别在这里重复创建。"}
-            </Empty>
+            <TableSkeleton rows={3} columns={["18%", "26%", "24%", "10%"]} label="渠道汇率读取中" />
           )}
         </div>
-      </section>
+      </SectionReveal>
 
       <Dialog open={!!editing} onOpenChange={(open) => !open && setEditing(null)}>
         <DialogContent className="max-w-md">

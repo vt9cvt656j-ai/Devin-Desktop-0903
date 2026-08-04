@@ -9,7 +9,7 @@ import { login } from "@/lib/api";
  * and pasted the same SVG again in the sidebar. Replaced with the wordmark.
  */
 export function Login({ onDone }: { onDone: () => void }) {
-  const [account, setAccount] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -19,7 +19,7 @@ export function Login({ onDone }: { onDone: () => void }) {
     setErr("");
     setBusy(true);
     try {
-      await login(account.trim(), password);
+      await login(email.trim(), password);
       onDone();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "登录失败");
@@ -39,10 +39,10 @@ export function Login({ onDone }: { onDone: () => void }) {
         </div>
         <div className="rounded-xl border border-border bg-card p-6 shadow-sm">
           <div className="mb-4">
-            <Label htmlFor="account">账号</Label>
+            <Label htmlFor="email">邮箱</Label>
             <Input
-              id="account" value={account} autoFocus autoComplete="username"
-              onChange={(e) => setAccount(e.target.value)} placeholder="邮箱或用户名"
+              id="email" type="email" value={email} autoFocus autoComplete="username"
+              onChange={(e) => setEmail(e.target.value)} placeholder="邮箱"
             />
           </div>
           <div className="mb-5">
@@ -55,7 +55,7 @@ export function Login({ onDone }: { onDone: () => void }) {
           {err && (
             <p role="alert" className="mb-4 text-sm text-destructive">{err}</p>
           )}
-          <Button type="submit" className="w-full" disabled={busy || !account || !password}>
+          <Button type="submit" className="w-full" disabled={busy || !email || !password}>
             {busy ? "登录中…" : "登录"}
           </Button>
         </div>

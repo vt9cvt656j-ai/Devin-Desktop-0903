@@ -1,6 +1,11 @@
 import { Fragment, useEffect, useState } from "react";
 import { ChevronDown, Plus, RefreshCw } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -21,8 +26,10 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Truncate,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import { useRowFlash } from "@/lib/flash";
 import { cents, num } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -208,6 +215,9 @@ export function Routing() {
   // null = closed, { conn: null } = 新建, { conn } = 编辑.
   const [dialog, setDialog] = useState<{ conn: Conn | null } | null>(null);
   const [confirmDel, setConfirmDel] = useState<Conn | null>(null);
+  // 停用/启用是行内的写操作，反馈也留在行内：成功就这一行亮一下（240ms），
+  // 失败亮成 destructive —— 一条线路撤出轮转是件大事，不该只靠按钮文字从"停用"变成"启用"来暗示。
+  const { fire, toneOf } = useRowFlash();
   // Delete failures have to land INSIDE the modal — a page-level error behind the overlay
   // reads as "nothing happened" on the one action that cannot be undone.
   const [delErr, setDelErr] = useState("");
@@ -242,7 +252,9 @@ export function Routing() {
       // this row never loaded.
       await api.post(`/api/admin/models/${c.id}`, { active });
       await load();
+      fire(c.id, "ok");
     } catch (e) {
+      fire(c.id, "error");
       const msg = e instanceof Error ? e.message : "操作失败";
       // admin_update runs its per-call price check on every update (models.rs:1713), so the
       // rescue action fails with a PRICING error on exactly the connections that need rescuing.
@@ -274,23 +286,24 @@ export function Routing() {
   const exposed = live.reduce((a, c) => a + allowedIds(c).length, 0);
 
   return (
-    <div>
-      <h1 className="font-display text-2xl font-semibold tracking-tight">模型线路</h1>
-      <p className="type-measure mt-1 text-muted-foreground">
-        供应商连接和每个模型的价格。线路出问题就停用它——密钥、开放的模型和定价都留着，随时能再开。
-      </p>
+    <div className="space-y-6">
+      <PageHeader
+        title="模型线路"
+        description="供应商连接和每个模型的价格。线路出问题就停用它——密钥、开放的模型和定价都留着，随时能再开。"
+      />
 
-      {err && <p role="alert" className="mt-4 text-sm text-destructive">{err}</p>}
+      <ErrorState message={err} />
 
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
+      <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="在转线路" value={num(live.length)} hint={`共 ${conns.length} 条连接`} />
         <Stat label="开放模型" value={num(exposed)} hint="IDE 里能选到的" />
         <Stat label="累计调用" value={num(usage.calls)} />
         {/* cost_cents 是「按倍率结算后从用户扣掉的钱」(models.rs:2715)，不是渠道成本。 */}
         <Stat label="累计计费" value={cents(usage.spent_cents)} hint="已含倍率" />
-      </div>
+      </SectionReveal>
 
-      <section className="mt-8 rounded-xl border border-border bg-card">
+      <SectionReveal as="section" delay={140} className="rounded-xl border border-border bg-card">
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3">
           <h2 className="text-sm font-semibold">供应商连接</h2>
           <div className="flex items-center gap-2">
@@ -303,24 +316,37 @@ export function Routing() {
           </div>
         </header>
 
-        {loading && <p className="px-5 py-10 text-center text-sm text-muted-foreground">加载中…</p>}
+        {loading && (
+          <TableSkeleton
+            rows={4}
+            columns={["22%", "8%", "10%", "20%", "12%"]}
+            label="供应商连接读取中"
+          />
+        )}
 
         {!loading && !conns.length && (
-          <p className="px-5 py-10 text-center text-sm text-muted-foreground">
-            还没有连接。新建一条，再进「编辑」勾选要开放的模型。
-          </p>
+          <EmptyState
+            title="还没有连接"
+            hint="先建一条，保存后再进「编辑」拉取并勾选要开放给 IDE 的模型。"
+            action={
+              <Button size="sm" onClick={() => setDialog({ conn: null })}>
+                <Plus /> 新建连接
+              </Button>
+            }
+          />
         )}
 
         {!loading && conns.length > 0 && (
-          <Table>
+          /* 六列写死宽度：base_url 和 model id 都能长到把别的列挤没，密钥列是等宽掩码。 */
+          <Table className="min-w-[72rem]">
             <TableHeader>
               <TableRow>
-                <TableHead>连接</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>开放模型</TableHead>
-                <TableHead>计费</TableHead>
-                <TableHead>密钥</TableHead>
-                <TableHead className="text-right">操作</TableHead>
+                <TableHead className="w-[20rem]">连接</TableHead>
+                <TableHead className="w-28">状态</TableHead>
+                <TableHead className="w-32">开放模型</TableHead>
+                <TableHead className="w-[18rem]">计费</TableHead>
+                <TableHead className="w-40">密钥</TableHead>
+                <TableHead className="w-[15rem] text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -331,12 +357,15 @@ export function Routing() {
                 const open = expanded === c.id;
                 return (
                   <Fragment key={c.id}>
-                    <TableRow className={cn(!isOn(c) && "opacity-60")}>
-                      <TableCell>
-                        <div className="font-medium">{c.label || "未命名"}</div>
-                        <div className="truncate text-xs text-muted-foreground" title={c.base_url}>
+                    <TableRow data-flash={toneOf(c.id)} className={cn(!isOn(c) && "opacity-60")}>
+                      <TableCell className="max-w-[20rem]">
+                        <Truncate className="font-medium">{c.label || "未命名"}</Truncate>
+                        <Truncate
+                          className="text-xs text-muted-foreground"
+                          title={`${c.provider || "other"} · ${c.base_url || "—"}`}
+                        >
                           {c.provider || "other"} · {c.base_url || "—"}
-                        </div>
+                        </Truncate>
                       </TableCell>
                       <TableCell>
                         {isOn(c) ? (
@@ -384,8 +413,8 @@ export function Routing() {
                           </div>
                         )}
                       </TableCell>
-                      <TableCell className="font-mono text-xs text-muted-foreground">
-                        {c.has_key === false ? "未配置" : c.api_key_masked || "—"}
+                      <TableCell className="max-w-40 font-mono text-xs text-muted-foreground">
+                        <Truncate>{c.has_key === false ? "未配置" : c.api_key_masked || "—"}</Truncate>
                       </TableCell>
                       <TableCell>
                         <div className="flex justify-end gap-2">
@@ -455,7 +484,7 @@ export function Routing() {
             </TableBody>
           </Table>
         )}
-      </section>
+      </SectionReveal>
 
       {dialog && (
         <ConnectionDialog

@@ -51,19 +51,22 @@ export const api = {
   del: <T,>(p: string) => request<T>(p, { method: "DELETE" }),
 };
 
-export async function login(account: string, password: string) {
-  const r = await api.post<{ token: string; user?: { role?: string } }>("/api/auth/login", {
-    account,
-    password,
-  });
+export async function login(email: string, password: string) {
+  // The field is `email` — auth.rs LoginReq { email, password }. Sending `account` (which is what
+  // the old console LABELS the box) gets a 422 "missing field `email`" and no login at all.
+  const r = await api.post<{ token: string; user?: { role?: string; email?: string } }>(
+    "/api/auth/login",
+    { email, password },
+  );
   if (!r?.token) throw new ApiError(500, "登录响应缺少 token");
   auth.set(r.token);
-  // The old console checked the role client-side after login (admin.html:391). Keep that check —
-  // it is what stops a paying customer from loading the operator shell.
-  const me = await api.get<{ role?: string }>("/api/me");
-  if (me?.role !== "admin") {
+  // The role is already on the login response (auth.rs returns { token, user }), so trust it
+  // rather than paying a second round-trip. Keep the client-side check itself — it is what stops
+  // a paying customer from loading the operator shell.
+  const role = r.user?.role;
+  if (role !== "admin") {
     auth.clear();
     throw new ApiError(403, "该账号不是管理员");
   }
-  return me;
+  return r.user ?? {};
 }

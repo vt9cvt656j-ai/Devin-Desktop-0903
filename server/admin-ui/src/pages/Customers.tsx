@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -8,7 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Truncate } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { cents, num, when } from "@/lib/format";
 
@@ -185,15 +190,13 @@ export function Customers() {
   const editing = editingId ? users.find((u) => u.id === editingId) : undefined;
 
   return (
-    <div>
-      <h1 className="font-display text-2xl font-semibold tracking-tight">客户</h1>
-      <p className="type-measure mt-1 text-muted-foreground">
-        谁现在还能用、谁付了钱、谁该退订。改动立即生效。
-      </p>
+    <div className="space-y-6">
+      <PageHeader title="客户" description="谁现在还能用、谁付了钱、谁该退订。改动立即生效。" />
 
-      {err && <p role="alert" className="mt-4 text-sm text-destructive">{err}</p>}
+      <ErrorState message={err} onRetry={() => load().catch(() => {})} />
 
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
+      <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="客户总数" value={num(users.length)} hint="最多显示最近 500 位" />
         <Stat label="有效会员" value={num(members)} />
         <Stat
@@ -202,9 +205,10 @@ export function Customers() {
           hint={drained ? "这些人现在发不出请求" : "没有人被卡住"}
         />
         <Stat label="7 天内登录" value={num(recent)} />
-      </div>
+      </SectionReveal>
 
-      <div className="mt-8 flex flex-wrap items-center gap-3">
+      <SectionReveal as="section" delay={140} className="space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
         <Input
           className="h-11 max-w-sm flex-1"
           value={q}
@@ -234,16 +238,29 @@ export function Customers() {
         </span>
       </div>
 
-      <div className="mt-4 overflow-hidden rounded-xl border border-border bg-card">
-        <Table className="min-w-[58rem]">
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        {loading && !users.length ? (
+          <TableSkeleton
+            rows={6}
+            columns={["22%", "7%", "9%", "17%", "9%", "9%"]}
+            label="客户列表读取中"
+          />
+        ) : (
+          <>
+        {/*
+          列宽写死，不让浏览器按内容分配：邮箱长度从 8 到 80 都有，交给 auto layout 的结果是
+          每翻一页列宽都在动。68rem 是七列都放得下的下限，比它窄就横向滚动 —— 挤成竖排的
+          「已/用/完」不是密度，是不能用。
+        */}
+        <Table className="min-w-[68rem]">
           <TableHeader>
             <TableRow>
-              <TableHead>账号</TableHead>
-              <TableHead>角色</TableHead>
-              <TableHead>套餐</TableHead>
-              <TableHead>本时段用量</TableHead>
-              <TableHead className="text-right">余额</TableHead>
-              <TableHead>最近登录</TableHead>
+              <TableHead className="w-[22rem]">账号</TableHead>
+              <TableHead className="w-28">角色</TableHead>
+              <TableHead className="w-32">套餐</TableHead>
+              <TableHead className="w-48">本时段用量</TableHead>
+              <TableHead numeric className="w-28">余额</TableHead>
+              <TableHead className="w-32">最近登录</TableHead>
               <TableHead className="w-24 text-right" />
             </TableRow>
           </TableHeader>
@@ -253,9 +270,11 @@ export function Customers() {
               const active = isActive(u);
               return (
                 <TableRow key={u.id}>
-                  <TableCell className="max-w-[16rem]">
-                    <div className="truncate font-medium">{u.email}</div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">注册 {when(u.created_at)}</div>
+                  <TableCell className="max-w-[22rem]">
+                    <Truncate className="font-medium">{u.email}</Truncate>
+                    <div className="mt-0.5 whitespace-nowrap text-xs text-muted-foreground">
+                      注册 {when(u.created_at)}
+                    </div>
                   </TableCell>
                   <TableCell>
                     {u.role === "admin" ? <Badge>管理员</Badge> : <Badge variant="outline">用户</Badge>}
@@ -282,8 +301,8 @@ export function Customers() {
                     {!w ? (
                       <span className="text-muted-foreground">—</span>
                     ) : (
-                      <div className="w-40">
-                        <div className="flex items-center gap-1.5 text-xs tabular-nums">
+                      <div className="w-44">
+                        <div className="flex items-center gap-1.5 whitespace-nowrap text-xs tabular-nums">
                           <span className="font-medium">{cents(w.used)}</span>
                           <span className="text-muted-foreground">/ {cents(w.cap)}</span>
                           {w.left <= 0 && (
@@ -298,8 +317,8 @@ export function Customers() {
                       </div>
                     )}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums">{cents(creditCents(u.credits_cents))}</TableCell>
-                  <TableCell className="text-muted-foreground">
+                  <TableCell numeric>{cents(creditCents(u.credits_cents))}</TableCell>
+                  <TableCell className="whitespace-nowrap text-muted-foreground">
                     {u.last_login_at ? when(u.last_login_at) : "从未登录"}
                   </TableCell>
                   <TableCell className="text-right">
@@ -311,11 +330,33 @@ export function Customers() {
           </TableBody>
         </Table>
         {!list.length && (
-          <p className="px-5 py-12 text-center text-sm text-muted-foreground">
-            {loading ? "加载中…" : users.length ? "没有匹配的客户" : "暂无客户"}
-          </p>
+          <EmptyState
+            title={users.length ? "没有匹配的客户" : "暂无客户"}
+            hint={
+              users.length
+                ? "关键词匹配邮箱 / 角色 / 套餐 / ID，筛选和它是「且」的关系。"
+                : "有人注册后会出现在这里。"
+            }
+            action={
+              users.length ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setQ("");
+                    setPlanFilter("");
+                  }}
+                >
+                  清空筛选
+                </Button>
+              ) : undefined
+            }
+          />
+        )}
+          </>
         )}
       </div>
+      </SectionReveal>
 
       <Dialog open={!!editing} onOpenChange={(o) => { if (!o) setEditingId(null); }}>
         {editing && (
@@ -489,10 +530,10 @@ function CustomerDialog({
         />
         <Fact
           label="本周"
-          value={weeklyCap > 0 ? `${cents(user.quota_week_used_cents)} / ${cents(weeklyCap)}` : cents(user.quota_week_used_cents)}
+          value={weeklyCap > 0 ? `${cents(creditCents(user.quota_week_used_cents))} / ${cents(weeklyCap)}` : cents(creditCents(user.quota_week_used_cents))}
           hint={weeklyCap > 0 ? undefined : "无周上限"}
         />
-        <Fact label="总额度余量" value={cents(user.quota_total_cents)} />
+        <Fact label="总额度余量" value={cents(creditCents(user.quota_total_cents))} />
         <Fact
           label="钱包余额"
           value={cents(creditCents(user.credits_cents))}

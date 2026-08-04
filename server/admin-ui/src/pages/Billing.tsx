@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/ErrorState";
+import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
+import { TableSkeleton } from "@/components/TableSkeleton";
+import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,10 +24,12 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Truncate,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
+import { useRowFlash } from "@/lib/flash";
 import { cents, num, when } from "@/lib/format";
 
 /**
@@ -117,10 +124,6 @@ function Field({ id, label, children }: { id: string; label: string; children: R
   );
 }
 
-function Empty({ text }: { text: string }) {
-  return <p className="px-5 py-10 text-center text-sm text-muted-foreground">{text}</p>;
-}
-
 /** What a plan / credits grant actually gives — shared by products, orders and codes. */
 function content(g: Grant) {
   if (g.kind === "plan") {
@@ -151,6 +154,12 @@ export function Billing() {
   const [err, setErr] = useState("");
   const [ok, setOk] = useState("");
   const [busy, setBusy] = useState(false);
+  // "还没读到"和"读到了，是空的"是两句话。分不开的话，第一次 render 会对着一张空表说
+  // 「暂无订单」，操作员就以为今天没人下单。
+  const [loaded, setLoaded] = useState(false);
+  // 行级反馈：确认/取消之后，那一行自己亮一下（240ms，index.css 的 [data-flash]）。
+  // 表格随后会重排（待确认永远置顶），亮的是这一行本身，不是它当时的位置。
+  const { fire, toneOf } = useRowFlash();
   // busy 的 ref 影子：轮询的 setInterval 闭包读不到最新的 state。
   const busyRef = useRef(false);
   const mark = (v: boolean) => {
@@ -206,6 +215,7 @@ export function Billing() {
     setOrders(r.orders);
     setCodes(r.codes);
     setLoadErr(r.failed[0] || "");
+    setLoaded(true);
   }, [load]);
 
   useEffect(() => {
@@ -220,6 +230,7 @@ export function Billing() {
       setOrders(r.orders);
       setCodes(r.codes);
       setLoadErr(r.failed[0] || "");
+      setLoaded(true);
     };
     tick();
     const t = setInterval(tick, 30_000);
@@ -324,9 +335,10 @@ export function Billing() {
       desc: `确认已收到 ${o.email || o.id} 的 ${cents(o.amount_cents)}？确认后立即发放，且无法撤销。`,
       label: "确认收款并发放",
       act: async () => {
-        await mutate("已确认收款并发放", () =>
+        const done = await mutate("已确认收款并发放", () =>
           api.post<{ ok?: boolean }>(`/api/admin/orders/${o.id}/confirm`),
         );
+        fire(o.id, done ? "ok" : "error");
       },
     });
 
@@ -337,7 +349,10 @@ export function Billing() {
       label: "取消订单",
       danger: true,
       act: async () => {
-        await mutate("已取消订单", () => api.post<{ ok?: boolean }>(`/api/admin/orders/${o.id}/cancel`));
+        const done = await mutate("已取消订单", () =>
+          api.post<{ ok?: boolean }>(`/api/admin/orders/${o.id}/cancel`),
+        );
+        fire(o.id, done ? "ok" : "error");
       },
     });
 
@@ -371,20 +386,21 @@ export function Billing() {
   const dangerBtn = "text-destructive border-destructive/40 hover:bg-destructive/10";
 
   return (
-    <div>
-      <h1 className="font-display text-2xl font-semibold tracking-tight">收款</h1>
-      <p className="type-measure mt-1 text-muted-foreground">
-        商品、订单和兑换码。确认一笔订单会立刻给对应账号发放套餐或额度。
-      </p>
+    <div className="space-y-6">
+      <PageHeader
+        title="收款"
+        description="商品、订单和兑换码。确认一笔订单会立刻给对应账号发放套餐或额度。"
+      />
 
-      {shownErr && (
-        <p role="alert" className="mt-4 text-sm text-destructive">
-          {shownErr}
+      <ErrorState message={shownErr} />
+      {!shownErr && ok && (
+        <p role="status" className="text-sm text-success">
+          {ok}
         </p>
       )}
-      {!shownErr && ok && <p className="mt-4 text-sm text-success">{ok}</p>}
 
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
+      <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="已收款" value={cents(revenue)} hint={`${paid.length} 笔已支付`} />
         <Stat
           label="待确认订单"
@@ -397,9 +413,9 @@ export function Billing() {
           hint={onSale.length === prices.length ? undefined : `共 ${prices.length} 个`}
         />
         <Stat label="未使用兑换码" value={num(unused.length)} hint={`共 ${codes.length} 个`} />
-      </div>
+      </SectionReveal>
 
-      <Tabs defaultValue="orders" className="mt-8">
+      <Tabs defaultValue="orders">
         <TabsList>
           <TabsTrigger value="orders">
             订单
@@ -429,30 +445,50 @@ export function Billing() {
               </div>
             }
           >
-            {shownOrders.length === 0 ? (
-              <Empty text={orders.length ? "没有符合筛选的订单" : "暂无订单"} />
+            {!loaded ? (
+              <TableSkeleton
+                rows={5}
+                columns={["24%", "18%", "10%", "10%", "10%"]}
+                label="订单读取中"
+              />
+            ) : shownOrders.length === 0 ? (
+              <EmptyState
+                title={orders.length ? "没有符合筛选的订单" : "暂无订单"}
+                hint={
+                  orders.length
+                    ? "把状态筛选调回「全部状态」就能看到其余订单。"
+                    : "客户在 IDE 里下单后，订单会出现在这里等你确认收款。"
+                }
+              />
             ) : (
-              <Table>
+              /* 六列写死宽度：买家是邮箱（可长到 80 字符），金额是右对齐等宽，操作列两个按钮不能换行。 */
+              <Table className="min-w-[62rem]">
                 <TableHeader>
                   <TableRow>
-                    <TableHead>买家</TableHead>
-                    <TableHead>内容</TableHead>
-                    <TableHead>金额</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>下单</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
+                    <TableHead className="w-[20rem]">买家</TableHead>
+                    <TableHead className="w-56">内容</TableHead>
+                    <TableHead numeric className="w-28">金额</TableHead>
+                    <TableHead className="w-28">状态</TableHead>
+                    <TableHead className="w-28">下单</TableHead>
+                    <TableHead className="w-44 text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {shownOrders.map((o) => (
-                    <TableRow key={o.id} className={o.status === "pending" ? "bg-muted/40" : undefined}>
-                      <TableCell className="max-w-[16rem] truncate font-medium">
-                        {o.email || o.id}
+                    <TableRow
+                      key={o.id}
+                      data-flash={toneOf(o.id)}
+                      className={o.status === "pending" ? "bg-muted/40" : undefined}
+                    >
+                      <TableCell className="max-w-[20rem]">
+                        <Truncate className="font-medium">{o.email || o.id}</Truncate>
                       </TableCell>
                       <TableCell>{content(o)}</TableCell>
-                      <TableCell className="tabular-nums">{cents(o.amount_cents)}</TableCell>
+                      <TableCell numeric>{cents(o.amount_cents)}</TableCell>
                       <TableCell>{orderStatus(o.status)}</TableCell>
-                      <TableCell className="text-muted-foreground">{when(o.created_at)}</TableCell>
+                      <TableCell className="whitespace-nowrap text-muted-foreground">
+                        {when(o.created_at)}
+                      </TableCell>
                       <TableCell className="text-right">
                         {o.status === "pending" ? (
                           <div className="flex justify-end gap-2">
@@ -557,33 +593,37 @@ export function Billing() {
           </Panel>
 
           <Panel title={`商品 · ${prices.length}`}>
-            {prices.length === 0 ? (
-              <Empty text="还没有商品，先在上面添加一个" />
+            {!loaded ? (
+              <TableSkeleton rows={3} columns={["26%", "10%", "20%", "10%"]} label="商品读取中" />
+            ) : prices.length === 0 ? (
+              <EmptyState title="还没有商品" hint="在上面那张表单里添加一个，IDE 的购买页就会出现它。" />
             ) : (
-              <Table>
+              <Table className="min-w-[52rem]">
                 <TableHeader>
                   <TableRow>
-                    <TableHead>名称</TableHead>
-                    <TableHead>类型</TableHead>
-                    <TableHead>内容</TableHead>
-                    <TableHead>售价</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
+                    <TableHead className="w-[18rem]">名称</TableHead>
+                    <TableHead className="w-24">类型</TableHead>
+                    <TableHead className="w-56">内容</TableHead>
+                    <TableHead numeric className="w-28">售价</TableHead>
+                    <TableHead className="w-28 text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {prices.map((p) => (
                     <TableRow key={p.id}>
-                      <TableCell className="font-medium">
-                        <span className="inline-flex items-center gap-2">
-                          {p.label || "—"}
-                          {p.active === false && <Badge variant="secondary">已下架</Badge>}
+                      <TableCell className="max-w-[18rem] font-medium">
+                        <span className="flex items-center gap-2">
+                          <Truncate>{p.label || "—"}</Truncate>
+                          {p.active === false && (
+                            <Badge variant="secondary" className="shrink-0">已下架</Badge>
+                          )}
                         </span>
                       </TableCell>
                       <TableCell className="text-muted-foreground">
                         {p.kind === "plan" ? "套餐" : "额度"}
                       </TableCell>
                       <TableCell>{content(p)}</TableCell>
-                      <TableCell className="tabular-nums">{cents(p.amount_cents)}</TableCell>
+                      <TableCell numeric>{cents(p.amount_cents)}</TableCell>
                       <TableCell className="text-right">
                         <Button
                           size="sm"
@@ -718,25 +758,40 @@ export function Billing() {
               </div>
             }
           >
-            {shownCodes.length === 0 ? (
-              <Empty text={codes.length ? "没有符合筛选的兑换码" : "暂无兑换码"} />
+            {!loaded ? (
+              <TableSkeleton
+                rows={5}
+                columns={["16%", "18%", "8%", "14%", "14%", "8%"]}
+                label="兑换码读取中"
+              />
+            ) : shownCodes.length === 0 ? (
+              <EmptyState
+                title={codes.length ? "没有符合筛选的兑换码" : "暂无兑换码"}
+                hint={
+                  codes.length
+                    ? "把状态筛选调回「全部状态」就能看到其余的码。"
+                    : "在上面生成一批，生成之后只显示这一次。"
+                }
+              />
             ) : (
-              <Table>
+              <Table className="min-w-[68rem]">
                 <TableHeader>
                   <TableRow>
-                    <TableHead>兑换码</TableHead>
-                    <TableHead>内容</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>使用者</TableHead>
-                    <TableHead>备注</TableHead>
-                    <TableHead>创建</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
+                    <TableHead className="w-[13rem]">兑换码</TableHead>
+                    <TableHead className="w-52">内容</TableHead>
+                    <TableHead className="w-24">状态</TableHead>
+                    <TableHead className="w-40">使用者</TableHead>
+                    <TableHead className="w-[14rem]">备注</TableHead>
+                    <TableHead className="w-24">创建</TableHead>
+                    <TableHead className="w-24 text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {shownCodes.map((c) => (
                     <TableRow key={c.id}>
-                      <TableCell className="font-mono">{c.code || "—"}</TableCell>
+                      <TableCell className="max-w-[13rem] font-mono">
+                        <Truncate>{c.code || "—"}</Truncate>
+                      </TableCell>
                       <TableCell>{content(c)}</TableCell>
                       <TableCell>
                         {c.status === "unused" ? (
@@ -745,13 +800,17 @@ export function Billing() {
                           <Badge variant="secondary">已使用</Badge>
                         )}
                       </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {c.used_by_email || (c.used_by ? `${String(c.used_by).slice(0, 8)}…` : "—")}
+                      <TableCell className="max-w-[10rem] text-muted-foreground">
+                        <Truncate>
+                          {c.used_by_email || (c.used_by ? `${String(c.used_by).slice(0, 8)}…` : "—")}
+                        </Truncate>
                       </TableCell>
-                      <TableCell className="max-w-[12rem] truncate text-muted-foreground">
-                        {c.note || "—"}
+                      <TableCell className="max-w-[14rem] text-muted-foreground">
+                        <Truncate>{c.note || "—"}</Truncate>
                       </TableCell>
-                      <TableCell className="text-muted-foreground">{when(c.created_at)}</TableCell>
+                      <TableCell className="whitespace-nowrap text-muted-foreground">
+                        {when(c.created_at)}
+                      </TableCell>
                       <TableCell className="text-right">
                         <Button
                           size="sm"
