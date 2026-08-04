@@ -575,7 +575,7 @@ function CustomerDialog({
               role="radiogroup" aria-label="余额操作方式"
               className="inline-flex h-9 items-center rounded-full border border-border bg-card p-1"
             >
-              {([["add", "充值 · 加"], ["set", "改写 · 设为"]] as const).map(([m, t]) => (
+              {([["add", "增加余额"], ["set", "调整余额"]] as const).map(([m, t]) => (
                 <button
                   key={m} type="button" role="radio" aria-checked={balanceMode === m}
                   onClick={() => setBalanceMode(m)}
@@ -592,13 +592,13 @@ function CustomerDialog({
             </div>
           </div>
 
-          <p className="mt-1.5 text-xs text-muted-foreground">
+          <p className="mt-1.5 text-center text-xs text-muted-foreground">
             {balanceMode === "add"
               ? "客户付款后用这个。填多少加多少，不必先算总额；扣减填负数。"
               : "对账修正才用。这是覆盖不是增加，不能为负，没改动时不可提交。"}
           </p>
 
-          <div className="mt-3 flex flex-wrap items-end gap-2">
+          <div className="mt-3 flex flex-wrap items-end justify-center gap-2">
             <div className="w-40">
               <Label htmlFor="balance-field">
                 {balanceMode === "add" ? "增加（$）" : "余额（$）"}
@@ -652,7 +652,7 @@ function CustomerDialog({
           {balanceMode === "add" && topUpValue !== 0 && (
             <p
               className={cn(
-                "mt-2 text-xs tabular-nums",
+                "mt-2 text-center text-xs tabular-nums",
                 topUpOverdraft ? "text-destructive" : "text-muted-foreground",
               )}
             >
