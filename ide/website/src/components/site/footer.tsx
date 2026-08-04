@@ -1,5 +1,11 @@
 import { Separator } from "@/components/ui/separator";
 
+/*
+ * Every link here used to point at github.com/fendoushaonian/Devin-Desktop. That
+ * repository is private, so all five returned 404 to visitors — a footer where nothing
+ * works reads as an abandoned product. They are gone until the repo is public; what is
+ * left is only destinations that actually resolve today.
+ */
 const columns = [
   {
     heading: "Product",
@@ -7,22 +13,15 @@ const columns = [
       { label: "Overview", href: "#features" },
       { label: "How it works", href: "#architecture" },
       { label: "Extensibility", href: "#extensions" },
-      { label: "Customers", href: "#customers" },
+      { label: "Reviews", href: "#customers" },
     ],
   },
   {
-    heading: "Resources",
+    heading: "Get started",
     links: [
-      { label: "Writing an extension", href: "https://github.com/fendoushaonian/Devin-Desktop" },
-      { label: "GitHub", href: "https://github.com/fendoushaonian/Devin-Desktop" },
-      { label: "Releases", href: "https://github.com/fendoushaonian/Devin-Desktop/releases" },
-    ],
-  },
-  {
-    heading: "Company",
-    links: [
-      { label: "Devin Desktop", href: "https://github.com/fendoushaonian/Devin-Desktop" },
-      { label: "License", href: "https://github.com/fendoushaonian/Devin-Desktop" },
+      { label: "Download", href: "#download" },
+      { label: "Sign in", href: "https://code.mrday.one/gate" },
+      { label: "Create an account", href: "https://code.mrday.one/gate" },
     ],
   },
 ];
@@ -42,7 +41,7 @@ export function Footer() {
               own work.
             </p>
           </div>
-          <div className="grid grid-cols-2 gap-10 sm:grid-cols-3">
+          <div className="grid grid-cols-2 gap-10">
             {columns.map((column) => (
               <div key={column.heading}>
                 <p className="type-eyebrow mb-4">{column.heading}</p>

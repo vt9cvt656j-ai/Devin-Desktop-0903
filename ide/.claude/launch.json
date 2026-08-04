@@ -4,8 +4,38 @@
     {
       "name": "ide-web",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5174", "--strictPort"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "port": 5174
+    },
+    {
+      "name": "website",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "website",
+        "--",
+        "--port=5283",
+        "--strictPort=false"
+      ],
+      "port": 5283
+    },
+    {
+      "name": "account-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "../server/account-ui",
+        "--",
+        "--base=/"
+      ],
+      "port": 5274
     }
   ]
 }

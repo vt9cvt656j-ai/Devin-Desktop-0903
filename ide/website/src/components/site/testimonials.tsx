@@ -1,5 +1,5 @@
 import type { PointerEvent } from "react";
-import { ArrowUpRight, Github, Linkedin, MessageSquarePlus } from "lucide-react";
+import { Github, Linkedin, MessageSquarePlus } from "lucide-react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -103,7 +103,13 @@ const PROOF = [
   ["8", "languages in the interface"],
 ];
 
-const REPO = "https://github.com/fendoushaonian/Devin-Desktop";
+/*
+ * The two buttons here used to point at the GitHub repo and its discussions board. The
+ * repo is private, so both returned 404 — an invitation to talk to us that led nowhere.
+ * Until there is a public place to post, the invitation stands on its own text and the
+ * button goes somewhere that works.
+ */
+const SIGN_UP = "https://code.mrday.one/gate";
 
 /** Shown until the first real quote lands — an invitation, not invented praise. */
 function CollectingState() {
@@ -121,13 +127,8 @@ function CollectingState() {
           </p>
           <div className="mt-6 flex flex-wrap gap-3">
             <Button asChild>
-              <a href={`${REPO}/discussions`} target="_blank" rel="noreferrer">
-                <MessageSquarePlus /> Share how you use it
-              </a>
-            </Button>
-            <Button variant="outline" asChild>
-              <a href={REPO} target="_blank" rel="noreferrer">
-                <Github /> See the source <ArrowUpRight />
+              <a href={SIGN_UP}>
+                <MessageSquarePlus /> Try it and tell us
               </a>
             </Button>
           </div>
