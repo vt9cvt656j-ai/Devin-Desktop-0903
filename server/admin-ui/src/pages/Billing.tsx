@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
 import { useRowFlash } from "@/lib/flash";
 import { cents, num, when } from "@/lib/format";
@@ -103,17 +104,6 @@ const toCents = (v: string) => Math.round((parseFloat(v) || 0) * 100);
 const toCredits = (v: string) => Math.round((parseFloat(v) || 0) * CREDIT_RAW_PER_USD);
 const reason = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
-function Panel({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="rounded-xl border border-border bg-card">
-      <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        {action}
-      </header>
-      {children}
-    </section>
-  );
-}
 
 function Field({ id, label, children }: { id: string; label: string; children: ReactNode }) {
   return (
@@ -429,7 +419,7 @@ export function Billing() {
         <TabsContent value="orders">
           <Panel
             title={`订单 · ${orders.length}`}
-            action={
+            aside={
               <div className="w-36">
                 <Select
                   aria-label="订单状态筛选"
@@ -743,7 +733,7 @@ export function Billing() {
 
           <Panel
             title={`兑换码 · ${codes.length}，未使用 ${unused.length}`}
-            action={
+            aside={
               <div className="w-36">
                 <Select
                   aria-label="兑换码状态筛选"

@@ -27,6 +27,7 @@ import {
   Truncate,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
 import { cents, num, when } from "@/lib/format";
 
@@ -166,7 +167,14 @@ const mul = (v: number | null | undefined, max = 2) =>
   v == null || !Number.isFinite(v) ? "—" : `×${dec(v, max)}`;
 const pct = (v: number | null | undefined) =>
   v == null || !Number.isFinite(v) ? "—" : `${dec(v, 2)}%`;
-const fx = (v: number | null | undefined) => `1 CNY = ${dec(v, 8)} USD`;
+// NOT an exchange rate — a relay PURCHASE rate: how many dollars of upstream credit ¥1 buys.
+// The schema says so in words ("usd_per_cny means: 1 CNY buys this many raw channel USD") and the
+// arithmetic (cost_cny = usd / rate) is correct for that reading. Only the wording was inherited
+// from FX, and it was actively harmful: the field used to prefill "6.63", the CNY-per-USD FX
+// number, which an operator would reasonably type — understating channel cost about 48x with no
+// error and a plausible-looking result. new-api models these as two separate options for exactly
+// this reason: Price (CNY per $1 of credit) and USDExchangeRate (display only).
+const buyRate = (v: number | null | undefined) => `¥1 买 ${dec(v, 4)} 美元额度`;
 
 const PRICE_SOURCE: Record<string, string> = {
   model_override: "单模型自定义价",
@@ -187,17 +195,6 @@ const positive = (s: string) => {
 };
 const msg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
-function Panel({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="rounded-xl border border-border bg-card">
-      <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        {aside}
-      </header>
-      {children}
-    </section>
-  );
-}
 
 function Row({ label, value, hint }: { label: string; value: ReactNode; hint?: ReactNode }) {
   return (
@@ -234,13 +231,15 @@ export function Pricing() {
   const [optionKey, setOptionKey] = useState("");
   const [loadErr, setLoadErr] = useState("");
   // "The list is empty" and "the list never arrived" look identical on screen unless these are
-  // tracked. Telling an operator 还没有渠道汇率 after a failed GET invites a duplicate channel.
+  // tracked. Telling an operator 还没有渠道购买价 after a failed GET invites a duplicate channel.
   const [ratesLoaded, setRatesLoaded] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
 
   // 套餐额度 inputs
-  const [quotaUsd, setQuotaUsd] = useState("1000");
-  const [quotaSales, setQuotaSales] = useState("288");
+  // Defaults mirror a REAL plan (power) so the page does not open on a fabricated loss.
+  // The old $1000-sold-for-¥288 pairing matches nothing in plan_spec and rendered -187.76%.
+  const [quotaUsd, setQuotaUsd] = useState("271");
+  const [quotaSales, setQuotaSales] = useState("488");
   const [targetMargin, setTargetMargin] = useState("20");
   // Token 用量 inputs
   const [calls, setCalls] = useState("1");
@@ -256,7 +255,7 @@ export function Pricing() {
   const [calcErr, setCalcErr] = useState("");
   const seq = useRef(0);
 
-  // 渠道汇率 form + dialogs. The inline form and the two dialogs get their own error slots —
+  // 渠道购买价 form + dialogs. The inline form and the two dialogs get their own error slots —
   // one shared string leaks a failed 创建 into the delete-confirm dialog and vice versa.
   const [crName, setCrName] = useState("");
   const [crRate, setCrRate] = useState("");
@@ -294,7 +293,7 @@ export function Pricing() {
         setChannels(Array.isArray(v) ? v : v?.items || []);
         setRatesLoaded(true);
       } else {
-        failed.push(msg(rates.reason, "渠道汇率加载失败"));
+        failed.push(msg(rates.reason, "渠道购买价加载失败"));
       }
       if (models.status === "fulfilled") {
         const v = models.value;
@@ -470,7 +469,7 @@ export function Pricing() {
       return;
     }
     if (!Number.isFinite(rate) || rate <= 0) {
-      setFormErr("渠道汇率必须是有效的正数");
+      setFormErr("渠道购买价必须是有效的正数");
       return;
     }
     setCrBusy(true);
@@ -523,7 +522,7 @@ export function Pricing() {
       return;
     }
     if (!Number.isFinite(rate) || rate <= 0) {
-      setDialogErr("渠道汇率必须是有效的正数");
+      setDialogErr("渠道购买价必须是有效的正数");
       return;
     }
     setCrBusy(true);
@@ -698,11 +697,11 @@ export function Pricing() {
                   onChange={(e) => setChannelId(e.target.value)}
                 >
                   {!channels.length && (
-                    <option value="">{ratesLoaded ? "还没有渠道汇率" : "渠道汇率没加载出来"}</option>
+                    <option value="">{ratesLoaded ? "还没有渠道购买价" : "渠道购买价没加载出来"}</option>
                   )}
                   {channels.map((c) => (
                     <option key={c.id} value={c.id}>
-                      {c.name} · {fx(c.usd_per_cny)}
+                      {c.name} · {buyRate(c.usd_per_cny)}
                     </option>
                   ))}
                 </Select>
@@ -879,7 +878,7 @@ export function Pricing() {
                       <Row
                         label="换成人民币成本"
                         value={cny(quota.channel_cost_cny)}
-                        hint={`÷ 渠道汇率 ${fx(quota.channel.usd_per_cny)}`}
+                        hint={`÷ 渠道购买价 ${buyRate(quota.channel.usd_per_cny)}`}
                       />
                       <Row label="销售收入" value={cny(quota.sales_cny)} />
                       <Row
@@ -979,7 +978,7 @@ export function Pricing() {
                       <Row
                         label="人民币成本"
                         value={cny(token.channel_cost_cny)}
-                        hint={fx(token.channel.usd_per_cny)}
+                        hint={buyRate(token.channel.usd_per_cny)}
                       />
                       <Row
                         label="服务端钱包扣费"
@@ -1037,7 +1036,7 @@ export function Pricing() {
 
       <SectionReveal as="section" delay={140} className="rounded-xl border border-border bg-card">
         <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-3">
-          <h2 className="text-sm font-semibold">渠道汇率</h2>
+          <h2 className="text-sm font-semibold">渠道购买价</h2>
           <span className="text-xs text-muted-foreground">只用于上面的试算</span>
         </header>
 
@@ -1059,7 +1058,7 @@ export function Pricing() {
               type="number"
               min="0"
               step="0.000001"
-              placeholder="6.63"
+              placeholder="0.139"
               value={crRate}
               onChange={(e) => setCrRate(e.target.value)}
             />
@@ -1092,7 +1091,7 @@ export function Pricing() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-[16rem]">渠道</TableHead>
-                  <TableHead numeric className="w-56">渠道汇率</TableHead>
+                  <TableHead numeric className="w-56">渠道购买价</TableHead>
                   <TableHead className="w-[20rem]">备注</TableHead>
                   <TableHead className="w-28">更新</TableHead>
                   <TableHead className="w-32 text-right">操作</TableHead>
@@ -1104,7 +1103,7 @@ export function Pricing() {
                     <TableCell className="max-w-[16rem] font-medium">
                       <Truncate>{c.name}</Truncate>
                     </TableCell>
-                    <TableCell numeric>{fx(c.usd_per_cny)}</TableCell>
+                    <TableCell numeric>{buyRate(c.usd_per_cny)}</TableCell>
                     <TableCell className="max-w-[20rem] text-muted-foreground">
                       <Truncate>{c.note || "—"}</Truncate>
                     </TableCell>
@@ -1132,19 +1131,19 @@ export function Pricing() {
             </Table>
           ) : ratesLoaded ? (
             <EmptyState
-              title="还没有渠道汇率"
+              title="还没有渠道购买价"
               hint="汇率表示 1 元人民币能换多少渠道原始美元，先建一个再试算。"
             />
           ) : loadErr ? (
-            // 「还没有」只能对真的加载成功过的列表说。加载失败时说"还没有渠道汇率"，
+            // 「还没有」只能对真的加载成功过的列表说。加载失败时说"还没有渠道购买价"，
             // 操作员会照着建一条重复的。
             <ErrorState
               variant="block"
-              message="渠道汇率没有加载出来"
+              message="渠道购买价没有加载出来"
               hint="先解决上面的报错再操作，别在这里重复创建。"
             />
           ) : (
-            <TableSkeleton rows={3} columns={["18%", "26%", "24%", "10%"]} label="渠道汇率读取中" />
+            <TableSkeleton rows={3} columns={["18%", "26%", "24%", "10%"]} label="渠道购买价读取中" />
           )}
         </div>
       </SectionReveal>
@@ -1152,7 +1151,7 @@ export function Pricing() {
       <Dialog open={!!editing} onOpenChange={(open) => !open && setEditing(null)}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>编辑渠道汇率</DialogTitle>
+            <DialogTitle>编辑渠道购买价</DialogTitle>
             <DialogDescription>改完之后，上面的试算会用新汇率重算一遍。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -1205,7 +1204,7 @@ export function Pricing() {
       <Dialog open={!!removing} onOpenChange={(open) => !open && setRemoving(null)}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>删除渠道汇率</DialogTitle>
+            <DialogTitle>删除渠道购买价</DialogTitle>
             <DialogDescription>
               删除「{removing?.name}」只影响试算，不会改动任何模型价格或用户扣费。
             </DialogDescription>
