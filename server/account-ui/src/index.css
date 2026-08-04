@@ -1,0 +1,345 @@
+@import "tailwindcss";
+@import "./fonts.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  语义 token 层 —— 唯一允许出现 hex 的地方。
+  配色来源：michael-design / enterprise-standard #sections/curated-palette-library
+  + 本轮运行时锁定方向 design-judgment #Category Palette Harmony（route: neutral-brand，
+  "Monochrome is a complete design"）。
+  每个值都已折算成最接近的 Tailwind 族+档，业务组件只消费语义类。
+
+  这里没有 warning / amber：一个后台只需要"正常 / 成功 / 出事了"三种语气，
+  第四种颜色只会让前三种更难分辨。需要"注意"的地方用 outline + muted-foreground。
+*/
+:root {
+  --background: #fafafa; /* zinc-50  — 根画布 */
+  --foreground: #09090b; /* zinc-950 — 主文字 */
+  --card: #ffffff; /* white    — 卡片/浮层表面 */
+  --card-foreground: #09090b; /* zinc-950 */
+  --popover: #ffffff; /* white */
+  --popover-foreground: #09090b; /* zinc-950 */
+  --primary: #18181b; /* zinc-900 — 主 CTA / 强调块 */
+  --primary-foreground: #fafafa; /* zinc-50 */
+  --secondary: #f4f4f5; /* zinc-100 — 次级按钮底 */
+  --secondary-foreground: #18181b; /* zinc-900 */
+  --muted: #f4f4f5; /* zinc-100 — 交替 section 底 */
+  --muted-foreground: #52525b; /* zinc-600 — 辅助文字，对 zinc-50 达 AA */
+  --accent: #e4e4e7; /* zinc-200 — hover 面 */
+  --accent-foreground: #18181b; /* zinc-900 */
+  --border: #e4e4e7; /* zinc-200 */
+  --input: #d4d4d8; /* zinc-300 */
+  --ring: #18181b; /* zinc-900 — 焦点环 */
+  --success: #059669; /* emerald-600 — 真实成功态专用 */
+  --success-foreground: #ffffff; /* white */
+  --destructive: #dc2626; /* red-600 — 真实错误态专用 */
+  --destructive-foreground: #ffffff; /* white */
+  --code-surface: #18181b; /* zinc-900 — 代码/编辑器拟真面 */
+  --code-foreground: #e4e4e7; /* zinc-200 */
+  --radius: 0.75rem;
+  --ease-reveal: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-code-surface: var(--code-surface);
+  --color-code-foreground: var(--code-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 12px);
+
+  --font-display: "Space Grotesk", "PingFang SC", "Noto Sans SC", sans-serif;
+  --font-sans: "Inter", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --animate-marquee: marquee 30s linear infinite;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+
+  /*
+    密度：这是一个装真数据的后台，不是空表格的排版稿。金额、次数、倍率、时间戳全部
+    等宽对齐，列宽才不会随着数字长度跳动（"$9.90" 和 "$12,345,678.90" 在同一列里）。
+  */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* 排版层级契约：全站复用这三个类，避免每个 section 自造字号 */
+@layer components {
+  .type-eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--color-muted-foreground);
+  }
+
+  .type-metric {
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+
+  .type-measure {
+    max-width: 42rem;
+  }
+}
+
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* ==========================================================================
+   动效层。整个后台只认这三条规则：
+
+   1. 参数集中在这里，组件只切 data-* 属性 —— 沿用展示站 SectionReveal 的
+      [data-reveal] 契约，没有引入任何动画库（framer-motion 之类为了做淡入
+      而背一个运行时依赖，展示站自己都没这么干）。
+   2. 这是一个人一天用八小时的操作台，不是落地页：入场 200ms 封顶、退场 130ms，
+      没有一个动画超过 250ms。同一份契约在展示站是 700ms / 24px，这里被压短了 ——
+      位移和时长本来就写在 CSS 里，正是为了能按场景重调。
+   3. prefers-reduced-motion 一律降级：要么只剩透明度，要么直接不动。
+   ========================================================================== */
+
+/* 可复用分区入场：SectionReveal 只切换 data-reveal，参数集中在这里 */
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(10px);
+  transition:
+    opacity 0.2s var(--ease-reveal),
+    transform 0.2s var(--ease-reveal);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+
+/*
+  移动端缩短位移：10px → 6px。必须排在 [data-reveal="visible"] 之前 ——
+  [data-reveal] 和 [data-reveal="visible"] 特异度完全相同（都是一个属性选择器 0,1,0），
+  谁在后面谁赢。展示站那份把这个 media query 写在 visible 规则后面，结果是窄屏下
+  分区淡入之后永远停在偏移位上（transform 再也回不到 0），旁边没有入场动画的元素
+  就和它差着几个像素对不齐。这里换了顺序。
+*/
+@media (max-width: 767px) {
+  [data-reveal] {
+    transform: translateY(6px);
+  }
+}
+
+[data-reveal="visible"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/*
+  Radix 浮层动效。dialog.tsx / sheet.tsx 里本来就写着
+  data-[state=open]:animate-in / data-[state=closed]:animate-out，
+  但这个项目没装 tailwindcss-animate —— Tailwind v4 不认识这两个类，一个字节都不会生成，
+  于是弹窗一直是硬切上屏的。这里用 v4 原生的 @utility 把这套类补齐（不加依赖），
+  语义和 tailwindcss-animate 一致，时长按操作台的口径重设。
+
+  位移/缩放走 transform，居中走 Tailwind v4 的 translate 属性（-translate-x-1/2 编译成
+  `translate:`，不是 `transform:`），两者互不覆盖，所以弹窗不会在动画期间弹到左上角。
+*/
+@utility animate-in {
+  animation-name: ui-enter;
+  animation-duration: 200ms;
+  animation-timing-function: var(--ease-reveal);
+  animation-fill-mode: both;
+}
+
+@utility animate-out {
+  animation-name: ui-exit;
+  animation-duration: 130ms;
+  animation-timing-function: var(--ease-exit);
+  animation-fill-mode: both;
+}
+
+@utility fade-in-0 {
+  --ui-enter-opacity: 0;
+}
+
+@utility fade-out-0 {
+  --ui-exit-opacity: 0;
+}
+
+@utility zoom-in-98 {
+  --ui-enter-scale: 0.98;
+}
+
+@utility zoom-out-98 {
+  --ui-exit-scale: 0.98;
+}
+
+@utility slide-in-from-bottom-1 {
+  --ui-enter-y: 0.25rem;
+}
+
+@utility slide-out-to-bottom-1 {
+  --ui-exit-y: 0.25rem;
+}
+
+@utility slide-in-from-right-4 {
+  --ui-enter-x: 1rem;
+}
+
+@utility slide-out-to-right-4 {
+  --ui-exit-x: 1rem;
+}
+
+@keyframes ui-enter {
+  from {
+    opacity: var(--ui-enter-opacity, 1);
+    transform: translate3d(var(--ui-enter-x, 0), var(--ui-enter-y, 0), 0)
+      scale(var(--ui-enter-scale, 1));
+  }
+}
+
+@keyframes ui-exit {
+  to {
+    opacity: var(--ui-exit-opacity, 1);
+    transform: translate3d(var(--ui-exit-x, 0), var(--ui-exit-y, 0), 0)
+      scale(var(--ui-exit-scale, 1));
+  }
+}
+
+/*
+  数字只在"真的变了"的时候动一下。Stat 用 key 重挂一次值节点并挂上 data-bump，
+  30 秒轮询回来数字没变就什么都不发生 —— 一个每半分钟自己抖一下的仪表盘会训练人无视它。
+  没有 fill-mode：动画结束后不能把 opacity / transform 钉死在动画值上。
+*/
+@keyframes stat-bump {
+  from {
+    opacity: 0.45;
+    transform: translateY(-3px);
+  }
+}
+
+[data-bump="on"] {
+  animation: stat-bump 200ms var(--ease-reveal);
+}
+
+/*
+  行级反馈：一行保存成功，就是这一行亮一下，不是屏幕角上弹个 toast 再自己消失。
+  同样不带 fill-mode —— 带了会把 background-color 钉死，这一行的 hover 从此失效。
+*/
+@keyframes row-flash-ok {
+  from {
+    background-color: color-mix(in oklab, var(--color-success) 16%, transparent);
+  }
+}
+
+@keyframes row-flash-error {
+  from {
+    background-color: color-mix(in oklab, var(--color-destructive) 14%, transparent);
+  }
+}
+
+[data-flash="ok"] {
+  animation: row-flash-ok 240ms ease-out;
+}
+
+[data-flash="error"] {
+  animation: row-flash-error 240ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  [data-reveal] {
+    transform: none;
+    transition-duration: 150ms;
+    transition-property: opacity;
+  }
+
+  /* 位移类的一律取消；颜色闪一下不是位移，留着，它是"这一行存上了"唯一的证据。 */
+  [data-bump="on"] {
+    animation: none;
+  }
+
+  .animate-pulse {
+    animation: none;
+  }
+
+  /*
+    Radix 靠 animationend 才卸载节点，所以这里不能写 animation: none —— 那样弹窗关不掉。
+    压到近乎瞬时即可，事件照常触发。用 data-slot 选中，因为类名带着
+    data-[state=…] 变体前缀，.animate-in 这种裸选择器根本选不中。
+  */
+  [data-slot="dialog-overlay"],
+  [data-slot="dialog-content"],
+  [data-slot="sheet-overlay"],
+  [data-slot="sheet-content"] {
+    animation-duration: 1ms !important;
+  }
+
+  .marquee-track {
+    animation: none !important;
+  }
+}
