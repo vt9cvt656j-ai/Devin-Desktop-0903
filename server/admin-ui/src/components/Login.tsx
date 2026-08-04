@@ -31,9 +31,13 @@ export function Login({ onDone }: { onDone: () => void }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-6">
       <form onSubmit={submit} className="w-full max-w-sm">
-        <div className="mb-8 text-center">
+        <div className="mb-8 flex flex-col items-center text-center">
+          <img
+            src="/console/logo.png" alt="Mr. Day One" width={56} height={56}
+            className="mb-3 size-14 rounded-xl"
+          />
           <div className="font-display text-2xl font-bold tracking-tight text-foreground">
-            Michael
+            Mr. Day One
           </div>
           <p className="type-eyebrow mt-2">管理后台</p>
         </div>
@@ -42,7 +46,7 @@ export function Login({ onDone }: { onDone: () => void }) {
             <Label htmlFor="email">邮箱</Label>
             <Input
               id="email" type="email" value={email} autoFocus autoComplete="username"
-              onChange={(e) => setEmail(e.target.value)} placeholder="邮箱"
+              onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
             />
           </div>
           <div className="mb-5">

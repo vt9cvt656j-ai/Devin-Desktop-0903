@@ -28,8 +28,9 @@ export function Shell({
   return (
     <div className="flex min-h-screen bg-background">
       <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-card">
-        <div className="flex h-16 items-center px-5 font-display text-lg font-bold tracking-tight">
-          Michael
+        <div className="flex h-16 items-center gap-2.5 px-5">
+          <img src="/console/logo.png" alt="" width={24} height={24} className="size-6 rounded-md" />
+          <span className="font-display text-base font-bold tracking-tight">Mr. Day One</span>
         </div>
         <nav className="flex-1 space-y-0.5 px-3">
           {NAV.map(({ key, label, icon: Icon }) => (
