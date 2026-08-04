@@ -153,6 +153,36 @@ pub const SEGMENT_SUMMARY_BUDGET_TOKENS: usize = 640;
 ///
 /// 模型对「刚刚发生了什么」最敏感，把近期对话压掉会直接伤害续写质量，所以这部分永不压缩。
 pub const VERBATIM_TAIL_TOKENS: usize = 32_000;
+/// How much recent conversation stays VERBATIM, scaled to the window we actually have.
+///
+/// The flat 32_000 above was written when every Claude model reported a 200K native window
+/// (usable budget ~148K), where keeping 32K verbatim is ~22% of the budget. Native is now 1M on
+/// most of the catalogue (budget ~748K) and the constant did not move, so a paying subscriber
+/// was handed 32K of real conversation out of a 748K window — 4%, with the rest replaced by
+/// summary. Scale with the budget and keep the old value as the floor, so 200K-native models
+/// behave exactly as before.
+/// When to pre-warm: cut old segments and issue a prefix BEFORE the window actually overflows,
+/// so a growing conversation never cold-starts on the turn it crosses the line.
+///
+/// Must stay a share of the REAL budget. This was previously clamped by a flat 400_000, written
+/// when every Claude model reported a 200K native window (budget ~148K) where the clamp never
+/// bound. Once native became 1M (budget ~748K) that same constant fired at 53% of budget, so
+/// history that fit verbatim was summarised anyway and a paying subscriber ended up with less
+/// real context than a free user.
+pub fn prefix_trigger_for(budget: usize, verbatim_tail: usize, segment_tokens: usize) -> usize {
+    ((budget * 2) / 3).max(verbatim_tail + segment_tokens)
+}
+
+pub fn verbatim_tail_for_budget(budget: usize) -> usize {
+    // Deliberately unchanged at or below a 200K-native window. Moving the tail moves every
+    // segment boundary, which changes every content-hash cache key and forces every live
+    // conversation to re-summarise from zero. Small windows were never the problem, so they pay
+    // nothing for this fix.
+    if budget <= 200_000 {
+        return VERBATIM_TAIL_TOKENS;
+    }
+    (budget / 4).max(VERBATIM_TAIL_TOKENS)
+}
 
 /// 规划时给原生窗口留的余量：模型还要写输出，且我们的 token 估算是近似值。
 pub const WINDOW_SAFETY: f64 = 0.75;
@@ -1734,5 +1764,52 @@ mod tests {
             Some(Tier::M5),
             "套餐有效时 5M 与余额无关 —— 它是套餐内含的能力"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_scaling_tests {
+    use super::*;
+
+    /// A paying subscriber must never receive LESS real conversation than a free user on the
+    /// same model. That inverted on 2026-08-03 when official_context went 200K -> 1M for most
+    /// Claude models: the flat 32K verbatim tail and the flat 400K pre-warm trigger were both
+    /// written for a 200K window and neither moved, so compression fired at 53% of budget and
+    /// handed the model ~44K where ~400K would have fit untouched.
+    #[test]
+    fn verbatim_tail_scales_with_the_window_and_never_shrinks() {
+        // 200K-native model: budget ~148K — must behave exactly as before the change.
+        assert_eq!(verbatim_tail_for_budget(147_952), VERBATIM_TAIL_TOKENS,
+            "small windows keep the original 32K floor");
+        // 1M-native model: budget ~748K — 32K would be 4% of the window.
+        let big = verbatim_tail_for_budget(747_952);
+        assert_eq!(big, 186_988);
+        assert!(big > VERBATIM_TAIL_TOKENS * 5,
+            "a 5x bigger window must keep proportionally more real conversation, not the same 32K");
+        // Monotonic: a bigger window never keeps less.
+        let mut prev = 0;
+        for b in [50_000, 147_952, 400_000, 747_952, 2_000_000] {
+            let t = verbatim_tail_for_budget(b);
+            assert!(t >= prev, "verbatim tail must never shrink as the budget grows");
+            assert!(t <= b, "the tail can never exceed the budget it lives in");
+            prev = t;
+        }
+    }
+
+    /// The pre-warm trigger must stay a share of the REAL budget. A fixed ceiling silently
+    /// becomes "compress long before you need to" the moment the window grows.
+    #[test]
+    fn prewarm_trigger_is_a_share_of_budget_not_a_fixed_ceiling() {
+        for budget in [147_952usize, 747_952] {
+            let seg = SEGMENT_TOKENS;
+            let tail = verbatim_tail_for_budget(budget);
+            let trigger = prefix_trigger_for(budget, tail, seg);
+            assert!(trigger <= budget,
+                "budget {budget}: trigger {trigger} must not exceed the budget itself");
+            assert!(trigger * 100 / budget >= 60,
+                "budget {budget}: trigger {trigger} fires at {}% of budget — pre-warming that \
+                 early throws away context that would have fit",
+                trigger * 100 / budget);
+        }
     }
 }

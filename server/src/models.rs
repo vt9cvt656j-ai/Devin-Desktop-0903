@@ -9745,21 +9745,22 @@ async fn apply_michael_compression(
     let carried_budget = mc::actual_summary_tokens(&carried.summaries);
     let remaining_budget = budget.saturating_sub(carried_budget);
     let segment_tokens = mc::segment_tokens_for_budget(tier, budget, retrieval_reserve);
-    let mut plan = mc::plan_to_budget(
-        &msgs,
-        remaining_budget,
-        mc::VERBATIM_TAIL_TOKENS,
-        segment_tokens,
-    );
+    let verbatim_tail = mc::verbatim_tail_for_budget(budget);
+    let mut plan = mc::plan_to_budget(&msgs, remaining_budget, verbatim_tail, segment_tokens);
 
     // 提前切出旧段：即使原文暂时还塞得进窗口，也要在请求体逼近 3.5MB 前完成预热并签发
     // 前缀。普通增长型会话因此不会在跨过原生窗口的那一轮突然冷启动。
-    let prefix_trigger = ((budget * 2) / 3)
-        .min(COMPRESSION_PREFIX_TRIGGER_MAX_TOKENS)
-        .max(mc::VERBATIM_TAIL_TOKENS + segment_tokens);
+    // The .min(400_000) clamp is gone. It was written when every Claude model reported a 200K
+    // native window, where 2/3 of budget is ~99K and the 400K cap never bound. Native is now 1M
+    // on most models (budget ~748K), so the same constant fired at 53% of budget: history that
+    // fit verbatim was summarised anyway, and the model received ~44K where 400K was available.
+    // A paying subscriber was strictly worse off than a free user. Pre-warm still happens before
+    // the window overflows — that is its whole point — just at a share of the real budget rather
+    // than at a number that only made sense for a 200K window.
+    let prefix_trigger = mc::prefix_trigger_for(budget, verbatim_tail, segment_tokens);
     if carried.summaries.is_empty() && plan.compress.is_empty() && plan.raw_tokens >= prefix_trigger
     {
-        plan = mc::plan_for_prefix(&msgs, mc::VERBATIM_TAIL_TOKENS, segment_tokens);
+        plan = mc::plan_for_prefix(&msgs, verbatim_tail, segment_tokens);
     }
 
     // 压缩器目前只读文本。一旦把含图片/音频的整条原消息换成文本摘要，下一轮前缀续传
