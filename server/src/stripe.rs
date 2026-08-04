@@ -396,16 +396,35 @@ pub async fn webhook(
         return Err(AppError::bad("事件缺少 id"));
     }
 
-    // Idempotency gate. INSERT wins or it doesn't; a duplicate delivery returns 200
-    // without granting anything a second time, which is what Stripe wants to hear.
-    let claimed = sqlx::query("INSERT INTO stripe_events (id, type) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING")
-        .bind(event_id)
-        .bind(event_type)
-        .execute(&state.db)
-        .await?;
+    // Idempotency gate — and the grant it guards — in ONE transaction.
+    //
+    // This used to claim the event on its own connection, commit, and only then fulfil.
+    // That combination loses paid orders in silence: if fulfilment then failed for any
+    // transient reason (deadlock, pool timeout, a dropped connection), the handler
+    // returned 500, Stripe retried, and the retry found the id already present and
+    // answered `200 duplicate` — so Stripe stopped retrying and the grant never
+    // happened. The customer was charged and received nothing, and both systems
+    // reported success. Nothing else would have caught it: there is no reconciliation
+    // job, and `invoice.paid` never fires for a one-off purchase.
+    //
+    // Sharing one transaction makes the claim conditional on the grant. A failure rolls
+    // BOTH back, so Stripe's next delivery genuinely re-runs the work. The "give up"
+    // paths below (unknown product, unusable user id) deliberately return Ok and let the
+    // claim commit — retrying those cannot change the outcome, so they must not loop.
+    let mut tx = state.db.begin().await?;
+    let claimed =
+        sqlx::query("INSERT INTO stripe_events (id, type) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING")
+            .bind(event_id)
+            .bind(event_type)
+            .execute(&mut *tx)
+            .await?;
     if claimed.rows_affected() == 0 {
         return Ok(Json(json!({ "ok": true, "duplicate": true })));
     }
+
+    // Anything user-visible is recorded AFTER the commit — an event announced from
+    // inside a transaction that later rolls back is a lie told to the admin console.
+    let mut post_commit: Vec<(uuid::Uuid, &'static str, serde_json::Value)> = Vec::new();
 
     match event_type {
         // Covers both one-off payments and the first period of a subscription.
@@ -418,26 +437,123 @@ pub async fn webhook(
                 .and_then(|v| v.as_str())
                 .map(|s| s == "paid" || s == "no_payment_required")
                 .unwrap_or(false);
-            if !paid {
-                return Ok(Json(json!({ "ok": true, "skipped": "payment_status" })));
+            if paid {
+                if let Some((uid, label, quantity)) = fulfil_session(&mut tx, &obj).await? {
+                    post_commit.push((
+                        uid,
+                        "order_paid",
+                        json!({ "via": "stripe", "product": label, "quantity": quantity }),
+                    ));
+                }
             }
-            fulfil_session(&state, &obj).await?;
         }
         // Renewals. The first invoice of a subscription arrives here too, but the
         // session already granted it and `stripe_events` keeps that from doubling up
         // only per-event — so renewals are matched on the subscription id instead.
         "invoice.paid" => {
             let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
-            fulfil_renewal(&state, &obj).await?;
+            fulfil_renewal(&mut tx, &obj).await?;
+        }
+        // The subscription is over — cancelled, or dunning finally gave up. Until this
+        // was handled, cancelling in Stripe never reached this database at all: the row
+        // kept its plan and its quota, so a cancelled subscriber went on being served
+        // forever. This is the event that actually ends a paid relationship.
+        "customer.subscription.deleted" => {
+            let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
+            if let Some(uid) = end_subscription(&mut tx, &obj).await? {
+                post_commit.push((uid, "user_updated", json!({ "by": "stripe", "action": "subscription_deleted" })));
+            }
+        }
+        // Mid-life changes. Only the terminal statuses act: `cancel_at_period_end` is
+        // NOT one of them — that subscriber has paid through the end of the period and
+        // keeps everything until `deleted` arrives. Revoking here would be taking away
+        // time they already bought.
+        "customer.subscription.updated" => {
+            let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
+            let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or_default();
+            if is_terminal_subscription_status(status) {
+                if let Some(uid) = end_subscription(&mut tx, &obj).await? {
+                    post_commit.push((uid, "user_updated", json!({ "by": "stripe", "action": "subscription_ended", "status": status })));
+                }
+            }
+        }
+        // A renewal charge failed. Deliberately does NOT revoke: Stripe retries on its
+        // own schedule for days, and cutting a paying customer off on the first failed
+        // attempt would be wrong. Record it so it is visible, and let the terminal
+        // events above do the revoking if it never recovers.
+        "invoice.payment_failed" => {
+            let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
+            if let Some(sub) = obj.get("subscription").and_then(|v| v.as_str()) {
+                if let Some(uid) = user_for_subscription(&mut tx, sub).await? {
+                    post_commit.push((uid, "payment_failed", json!({ "via": "stripe", "subscription": sub })));
+                }
+            }
         }
         _ => {}
+    }
+
+    tx.commit().await?;
+
+    for (uid, kind, payload) in post_commit {
+        crate::realtime::record_event(&state, Some(uid), kind, payload).await;
     }
 
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Grant what the purchased row says, in one transaction with the order flip.
-async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiResult<()> {
+/// Statuses from which a subscription never comes back, so entitlement should end.
+///
+/// `past_due` is absent on purpose: Stripe is still retrying the card, and the
+/// subscriber has not lost anything yet. `trialing` and `active` are obviously alive.
+/// `paused` is absent too — it resumes.
+fn is_terminal_subscription_status(status: &str) -> bool {
+    matches!(status, "canceled" | "unpaid" | "incomplete_expired")
+}
+
+/// Which account a Stripe subscription belongs to, via the order that created it.
+async fn user_for_subscription(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sub: &str,
+) -> ApiResult<Option<uuid::Uuid>> {
+    let found: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM orders \
+         WHERE stripe_subscription_id = $1 AND user_id IS NOT NULL \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(sub)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(found.map(|(uid,)| uid))
+}
+
+/// End a subscription: the plan and every quota column go back to nothing, through the
+/// same `codes::clear_plan` an operator cancel uses.
+async fn end_subscription(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    subscription: &serde_json::Value,
+) -> ApiResult<Option<uuid::Uuid>> {
+    let Some(sub) = subscription.get("id").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Some(uid) = user_for_subscription(tx, sub).await? else {
+        tracing::warn!("Stripe cancellation for unknown subscription {sub}");
+        return Ok(None);
+    };
+    crate::codes::clear_plan(tx, uid).await?;
+    Ok(Some(uid))
+}
+
+/// Grant what the purchased row says, in the caller's transaction — the same one that
+/// claimed the event — so the grant and the claim commit or fail together.
+///
+/// `Ok(None)` means "nothing to announce, and do not retry": the payload named a product
+/// or a user we cannot resolve, and a redelivery would reach the identical conclusion.
+/// Real failures propagate with `?` and take the event claim down with them.
+/// On success returns (user, product label, quantity) for the caller to record post-commit.
+async fn fulfil_session(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session: &serde_json::Value,
+) -> ApiResult<Option<(uuid::Uuid, String, i64)>> {
     let session_id = session.get("id").and_then(|v| v.as_str()).unwrap_or_default();
     let uid_str = session
         .get("client_reference_id")
@@ -446,7 +562,7 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
         .unwrap_or_default();
     let Ok(uid) = uuid::Uuid::parse_str(uid_str) else {
         tracing::warn!("Stripe session {session_id} has no usable user id");
-        return Ok(());
+        return Ok(None);
     };
     let lookup_key = session
         .pointer("/metadata/lookup_key")
@@ -458,20 +574,17 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let mut tx = state.db.begin().await?;
-
     let row = sqlx::query_as::<_, CatalogRow>(
         "SELECT id, label, kind, plan, duration_days, credits_cents, amount_cents, \
          amount_usd_cents, stripe_price_id, lookup_key, recurring, once_per_account, \
          unit_credits_cents, blurb FROM prices WHERE lookup_key = $1",
     )
     .bind(&lookup_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
         tracing::warn!("Stripe session {session_id} references unknown product {lookup_key}");
-        tx.commit().await?;
-        return Ok(());
+        return Ok(None);
     };
 
     // What the buyer asked for at create time. If they raised it on Stripe's own page
@@ -484,7 +597,7 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
         .unwrap_or(1)
         .max(1);
 
-    grant(&mut tx, uid, &row, quantity).await?;
+    grant(tx, uid, &row, quantity).await?;
 
     // Flip the pending order, or record one if the buyer reached Stripe some other way.
     let updated = sqlx::query(
@@ -493,7 +606,7 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
     )
     .bind(session_id)
     .bind(&subscription)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {
         let _ = sqlx::query(
@@ -513,7 +626,7 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
         .bind(session_id)
         .bind(&subscription)
         .bind(quantity as i32)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await;
     }
 
@@ -521,26 +634,21 @@ async fn fulfil_session(state: &AppState, session: &serde_json::Value) -> ApiRes
         let _ = sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
             .bind(cust)
             .bind(uid)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await;
     }
 
-    tx.commit().await?;
-    crate::realtime::record_event(
-        state,
-        Some(uid),
-        "order_paid",
-        json!({ "via": "stripe", "product": row.label, "quantity": quantity }),
-    )
-    .await;
-    Ok(())
+    Ok(Some((uid, row.label.clone(), quantity)))
 }
 
 /// A subscription renewed. Extend the plan by another period.
 ///
 /// The first invoice of a subscription is skipped: the Checkout session already granted
 /// that period, and granting again here would hand out two months for one payment.
-async fn fulfil_renewal(state: &AppState, invoice: &serde_json::Value) -> ApiResult<()> {
+async fn fulfil_renewal(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    invoice: &serde_json::Value,
+) -> ApiResult<()> {
     let reason = invoice
         .get("billing_reason")
         .and_then(|v| v.as_str())
@@ -559,24 +667,23 @@ async fn fulfil_renewal(state: &AppState, invoice: &serde_json::Value) -> ApiRes
          ORDER BY created_at LIMIT 1",
     )
     .bind(sub)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some((uid, price_id)) = found else {
         tracing::warn!("Stripe renewal for unknown subscription {sub}");
         return Ok(());
     };
 
-    let mut tx = state.db.begin().await?;
     let row = sqlx::query_as::<_, CatalogRow>(
         "SELECT id, label, kind, plan, duration_days, credits_cents, amount_cents, \
          amount_usd_cents, stripe_price_id, lookup_key, recurring, once_per_account, \
          unit_credits_cents, blurb FROM prices WHERE id = $1",
     )
     .bind(price_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = row {
-        grant(&mut tx, uid, &row, 1).await?;
+        grant(tx, uid, &row, 1).await?;
         let _ = sqlx::query(
             "INSERT INTO orders (user_id, email, price_id, kind, plan, duration_days, \
              credits_cents, amount_cents, method, status, stripe_subscription_id, paid_at) \
@@ -590,10 +697,9 @@ async fn fulfil_renewal(state: &AppState, invoice: &serde_json::Value) -> ApiRes
         .bind(row.credits_cents)
         .bind(row.amount_cents)
         .bind(sub)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -627,6 +733,81 @@ async fn grant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claim on `stripe_events` must never commit independently of the grant.
+    ///
+    /// This is a source-level assertion because the failure it guards needs a database
+    /// that fails halfway, which this suite has no way to stage. The bug it pins was
+    /// real: the INSERT ran on `state.db` (its own auto-committed connection) and the
+    /// fulfilment opened a separate transaction afterwards. A transient failure between
+    /// them left the event claimed and nothing granted, and because the retry then saw
+    /// the id already present and answered `200 duplicate`, Stripe stopped retrying — a
+    /// paid customer, no entitlement, and success reported on both sides.
+    ///
+    /// Written against the source rather than behaviour so that reintroducing the shape
+    /// fails, not just reintroducing the symptom.
+    #[test]
+    fn the_event_claim_shares_the_grants_transaction() {
+        let src = include_str!("stripe.rs");
+        let claim = src
+            .split_once("INSERT INTO stripe_events")
+            .expect("the idempotency INSERT should still exist")
+            .1;
+        // The executor is named a few lines below the SQL, after the binds.
+        let executor = claim
+            .split_once(".execute(")
+            .expect("the INSERT should be executed")
+            .1;
+        let executor: String = executor.chars().take(40).collect();
+        assert!(
+            executor.contains("tx"),
+            "the stripe_events claim must run inside the fulfilment transaction, \
+             but it executes against `{}` — committing the claim on its own connection \
+             silently drops paid orders when fulfilment then fails",
+            executor.trim()
+        );
+        assert!(
+            !executor.contains("state.db"),
+            "the stripe_events claim must not run on the pool directly: {}",
+            executor.trim()
+        );
+    }
+
+    /// Only genuinely dead subscriptions revoke. `past_due` means Stripe is still
+    /// retrying the card — cutting that customer off would be taking away a period
+    /// they may yet pay for.
+    #[test]
+    fn only_terminal_statuses_end_a_subscription() {
+        for dead in ["canceled", "unpaid", "incomplete_expired"] {
+            assert!(is_terminal_subscription_status(dead), "{dead} should revoke");
+        }
+        for alive in ["active", "trialing", "past_due", "paused", "incomplete", ""] {
+            assert!(
+                !is_terminal_subscription_status(alive),
+                "{alive} must NOT revoke — the subscriber has not lost the period they paid for"
+            );
+        }
+    }
+
+    /// Every event the fulfilment logic depends on must actually be handled. Adding a
+    /// branch is cheap; noticing months later that cancellations were never wired up is
+    /// not — that gap let a cancelled subscriber keep their plan indefinitely.
+    #[test]
+    fn the_lifecycle_events_are_all_handled() {
+        let src = include_str!("stripe.rs");
+        for event in [
+            "checkout.session.completed",
+            "invoice.paid",
+            "customer.subscription.deleted",
+            "customer.subscription.updated",
+            "invoice.payment_failed",
+        ] {
+            assert!(
+                src.contains(&format!("\"{event}\" =>")),
+                "no match arm for {event}"
+            );
+        }
+    }
 
     /// A real Stripe header, signed with a known secret, must verify — and every way of
     /// tampering with it must not.

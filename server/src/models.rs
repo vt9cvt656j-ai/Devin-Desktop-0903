@@ -1197,7 +1197,12 @@ pub struct QuotaEstimateReq {
     pub target_margin_percent: f64,
 }
 
-const USER_QUOTA_RAW_USD_PER_VISIBLE_USD: f64 = 6.63;
+/// 面值分母：卖出的 $1.00 额度对应多少上游真实成本美元（原先硬编码的 6.63）。
+/// 现在唯一定义在 app_settings 表里，见 `settings.rs`——管理台改一次，服务端测算、
+/// 两个管理页和 IDE 客户端同时跟着变，不会各说各话。
+fn user_quota_raw_usd_per_visible_usd() -> f64 {
+    crate::settings::raw_usd_per_visible_usd()
+}
 const MAX_ESTIMATE_TOKENS_PER_CALL: i64 = 10_000_000_000;
 const MAX_ESTIMATE_CALLS: i64 = 1_000_000;
 const MAX_ESTIMATE_MONEY: f64 = 1_000_000_000.0;
@@ -1227,7 +1232,7 @@ fn project_quota_package(
     multiplier: f64,
     target_margin_percent: f64,
 ) -> QuotaPackageProjection {
-    let quota_raw_usd = visible_quota_usd * USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+    let quota_raw_usd = visible_quota_usd * user_quota_raw_usd_per_visible_usd();
     let provider_usd_capacity = quota_raw_usd / multiplier;
     let channel_cost_cny = provider_usd_capacity / usd_per_cny;
     let profit_cny = sales_cny - channel_cost_cny;
@@ -1237,7 +1242,7 @@ fn project_quota_package(
     let target_multiplier = break_even_multiplier / target_cost_ratio;
     let target_sales_cny = channel_cost_cny / target_cost_ratio;
     let safe_visible_quota_usd = sales_cny * usd_per_cny * target_cost_ratio * multiplier
-        / USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+        / user_quota_raw_usd_per_visible_usd();
     QuotaPackageProjection {
         quota_raw_usd,
         provider_usd_capacity,
@@ -1368,7 +1373,7 @@ pub async fn admin_model_estimate(
     let provider_usd_total = provider_usd_per_call * calls;
     let channel_cost_cny = provider_usd_total / usd_per_cny;
     let billed_raw_usd = billed_cents_per_call as f64 / 100.0 * calls;
-    let visible_quota_usd = billed_raw_usd / USER_QUOTA_RAW_USD_PER_VISIBLE_USD;
+    let visible_quota_usd = billed_raw_usd / user_quota_raw_usd_per_visible_usd();
     let profit_cny = req.sales_cny.map(|sales| sales - channel_cost_cny);
     let margin_percent = req.sales_cny.and_then(|sales| {
         if sales > 0.0 {
@@ -1402,7 +1407,7 @@ pub async fn admin_model_estimate(
         "billed_cents_per_call": billed_cents_per_call,
         "billed_raw_usd": billed_raw_usd,
         "visible_quota_usd": visible_quota_usd,
-        "quota_raw_usd_per_visible_usd": USER_QUOTA_RAW_USD_PER_VISIBLE_USD,
+        "quota_raw_usd_per_visible_usd": user_quota_raw_usd_per_visible_usd(),
         "sales_cny": req.sales_cny,
         "profit_cny": profit_cny,
         "margin_percent": margin_percent,
@@ -1480,7 +1485,7 @@ pub async fn admin_quota_estimate(
         "model": { "id": model_id, "name": display_name_for(&model.model_names, model_id) },
         "visible_quota_usd": req.visible_quota_usd,
         "quota_raw_usd": projection.quota_raw_usd,
-        "quota_raw_usd_per_visible_usd": USER_QUOTA_RAW_USD_PER_VISIBLE_USD,
+        "quota_raw_usd_per_visible_usd": user_quota_raw_usd_per_visible_usd(),
         "provider_usd_capacity": projection.provider_usd_capacity,
         "channel_cost_cny": projection.channel_cost_cny,
         "sales_cny": req.sales_cny,
@@ -1533,9 +1538,16 @@ pub async fn admin_create(
         Some("per_call") => "per_call",
         _ => "rate",
     };
+    // per_call_micro_usd 必须一起写进去。这一列是 20260806_conn_per_call_micro 后加的：
+    // ModelReq 加了字段、admin_update 也读了，唯独这条 INSERT 漏掉，于是新建连接时填的
+    // 每次调用费被**静默丢弃**，落库永远是 0（clippy 报的 "field is never read" 就是它）。
+    //
+    // 单独看不会立刻漏账：新建的连接 enabled_models 是空的，还serve不了流量，而后续
+    // 启用模型要走 admin_update，那条路上有零费率闸门。但运营填了价、保存成功、价没了，
+    // 下一次编辑还得重填一遍——而且一旦没注意到，闸门看到的就是 0。
     let id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, input_price, output_price, description, sort, billing_mode, per_call_cents, cache_read_price, cache_create_price) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
+        "INSERT INTO models (label, provider, base_url, model_id, api_key, rate, input_price, output_price, description, sort, billing_mode, per_call_cents, cache_read_price, cache_create_price, per_call_micro_usd) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id",
     )
     .bind(req.label.trim())
     .bind(req.provider.unwrap_or_default())
@@ -1551,6 +1563,7 @@ pub async fn admin_create(
     .bind(req.per_call_cents.unwrap_or(0).max(0))
     .bind(req.cache_read_price.unwrap_or(0.0).max(0.0))
     .bind(req.cache_create_price.unwrap_or(0.0).max(0.0))
+    .bind(req.per_call_micro_usd.unwrap_or(0).max(0))
     .fetch_one(&state.db)
     .await?;
     Ok(Json(json!({ "ok": true, "id": id })))
@@ -3558,14 +3571,23 @@ async fn record_usage_row(
 
 /// Daily free allowance in 点. The operator prices in 点: ¥0.5 = 10 点, so 1 点 = ¥0.05 and
 /// the ¥2 daily allowance is exactly 40 点.
-pub const FREE_POINTS_DAILY: i64 = 40;
+///
+/// 从常量改成读设置（`app_settings.free_points_daily`，默认仍是 40）。改动只影响
+/// **下一次日切之后**的发放：池子是按 用户 × 自然日 存下来的，SQL 的 CASE 只在
+/// `free_points_date` 不是今天时才覆写，所以今天已经领过的用户不受影响。
+pub fn free_points_daily() -> i64 {
+    crate::settings::free_points_daily()
+}
 
 /// The pool is STORED in milli-点 (1 点 = 1000). Whole 点 could not express a small per-call
 /// fee: the deduction rounded up, so any non-zero cost cost a full 点 and a 40-点 allowance
 /// was always exactly 40 calls regardless of price. Integers throughout — no floats in the
 /// money path — just three more decimal places.
 pub const MILLI: i64 = 1_000;
-pub const FREE_MILLI_POINTS_DAILY: i64 = FREE_POINTS_DAILY * MILLI;
+
+pub fn free_milli_points_daily() -> i64 {
+    crate::settings::free_milli_points_daily()
+}
 
 /// Micro-USD per raw cent (1 cent = 10 000 micro-USD). Per-model fees are stored in micro-USD
 /// so a $0.003 fee survives; whole cents floored it to zero and the model became free.
@@ -3617,35 +3639,54 @@ async fn free_points_balance(state: &AppState, uid: uuid::Uuid) -> i64 {
          WHERE id = $1 RETURNING free_points",
     )
     .bind(uid)
-    .bind(FREE_MILLI_POINTS_DAILY)
+    .bind(free_milli_points_daily())
     .fetch_optional(&state.db)
     .await;
     row.ok().flatten().map(|(n,)| n).unwrap_or(0)
 }
 
-/// Spend from the daily free pool. Returns what was actually deducted — the pool floors at
-/// zero rather than going negative, so a request that outruns the remaining points is
-/// partially charged and the rest is simply free. The pre-gate below refuses the call before
-/// it reaches here when the pool is already empty, so this is the tail case only.
 /// Spend from the daily pool, in milli-点. `micro_usd` is the call's real provider cost at
 /// micro-USD resolution — either the per-model flat fee, or token cost converted up from
 /// cents — so per-call and volume billing both land in the same conversion.
+///
+/// Returns what was **actually** deducted. That used to be a lie: the doc claimed it, but
+/// the code returned the full requested `points` even when the pool floored at zero, so a
+/// user with 2 点 left who made a 50 点 call had 50 recorded against them in
+/// `model_usage.free_points_spent`. Usage history over-reported what people spent, and the
+/// daily pool looked exhausted faster than it was.
+///
+/// Now one statement instead of two. The old version reset the daily grant in
+/// `free_points_balance` and then decremented in a second round trip; between them another
+/// request could read a balance that no longer existed by the time it spent. Folding the
+/// reset into the same statement — behind `FOR UPDATE`, so concurrent spends on one row
+/// serialise — makes the read and the write a single atomic step, halves the round trips on
+/// a hot path, and lets `LEAST` report the true deduction.
 async fn spend_free_points(state: &AppState, uid: uuid::Uuid, micro_usd: i64) -> i64 {
     let points = milli_points_for_micro_usd(micro_usd);
     if points <= 0 {
         return 0;
     }
-    let _ = free_points_balance(state, uid).await; // ensure today's grant exists first
     let row: Result<Option<(i64,)>, _> = sqlx::query_as(
-        "UPDATE users SET free_points = GREATEST(0, free_points - $2) \
-         WHERE id = $1 RETURNING free_points",
+        "WITH cur AS ( \
+             SELECT id, \
+                    CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
+                         THEN $3 ELSE free_points END AS avail \
+             FROM users WHERE id = $1 FOR UPDATE \
+         ) \
+         UPDATE users u \
+            SET free_points = GREATEST(0, cur.avail - $2), \
+                free_points_date = CURRENT_DATE \
+           FROM cur \
+          WHERE u.id = cur.id \
+         RETURNING LEAST(cur.avail, $2)",
     )
     .bind(uid)
     .bind(points)
+    .bind(free_milli_points_daily())
     .fetch_optional(&state.db)
     .await;
     match row.ok().flatten() {
-        Some(_) => points,
+        Some((spent,)) => spent.max(0),
         None => 0,
     }
 }
@@ -6780,10 +6821,10 @@ mod billing_tests {
     /// exactly 40 点. Pin the arithmetic so a future edit cannot quietly desync the two.
     #[test]
     fn daily_allowance_is_two_yuan_worth_of_points() {
-        assert_eq!(super::FREE_POINTS_DAILY, 40);
+        assert_eq!(super::free_points_daily(), 40);
         // ¥0.5 buys 10 点, so the daily grant is ¥2.00 exactly.
         let yuan_per_point = 0.5_f64 / 10.0;
-        assert!((super::FREE_POINTS_DAILY as f64 * yuan_per_point - 2.0).abs() < 1e-9);
+        assert!((super::free_points_daily() as f64 * yuan_per_point - 2.0).abs() < 1e-9);
     }
 
     /// Regression: the free gate must exist on the MAIN chat path, not only the legacy
@@ -6895,6 +6936,52 @@ mod billing_tests {
         assert!(super::milli_points_for_micro_usd(55_000) > 1, "a real fee still costs its real amount");
     }
 
+    /// 新建连接的 INSERT 必须覆盖 `ModelReq` 能设置的每一个计价字段。
+    ///
+    /// `per_call_micro_usd` 曾经就漏在这里：列是 20260806 迁移加的，结构体加了字段、
+    /// admin_update 也读了，唯独 admin_create 的 INSERT 没写，于是运营新建连接时填的
+    /// 每次调用费保存后变成 0，而且没有任何报错 —— 只有 clippy 的
+    /// "field is never read" 提过一句。
+    ///
+    /// 逐字段比对而不是只钉那一个名字：下一次再加计价列时，漏的会是新那个。
+    #[test]
+    fn admin_create_persists_every_pricing_field() {
+        let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        // ModelReq 的字段表
+        let req = full
+            .split("pub struct ModelReq {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("ModelReq struct");
+        let fields: Vec<&str> = req
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split(':').next())
+            .map(|s| s.trim())
+            .collect();
+        // admin_create 的 INSERT 列表
+        let insert = full
+            .split("INSERT INTO models (")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("admin_create INSERT");
+
+        // api_key/label/base_url 等一定在；这里关心的是计价与展示字段有没有落库。
+        // provider/model_id 用了不同的绑定名，排除掉避免误报。
+        let exempt = ["provider", "model_id"];
+        for f in fields {
+            if exempt.contains(&f) {
+                continue;
+            }
+            assert!(
+                insert.contains(f),
+                "ModelReq 有字段 `{f}`，但 admin_create 的 INSERT 没有这一列 —— \
+                 运营在新建界面填的这个值会被静默丢弃（per_call_micro_usd 就是这么漏的）",
+            );
+        }
+    }
+
     #[test]
     fn connection_fee_keeps_sub_cent_precision() {
         let full = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
@@ -6924,7 +7011,7 @@ mod billing_tests {
         assert_eq!(mp(three_tenths_of_a_cent), 60);
 
         // A 40-点 daily pool therefore buys ~666 such calls, not 40.
-        assert_eq!(super::FREE_MILLI_POINTS_DAILY / mp(three_tenths_of_a_cent), 666);
+        assert_eq!(super::free_milli_points_daily() / mp(three_tenths_of_a_cent), 666);
 
         // Volume billing converts through the same path: whole-cent token cost scaled up.
         assert_eq!(mp(1 * MICRO_USD_PER_CENT), 200, "1 cent = 0.2 点");
@@ -6948,8 +7035,8 @@ mod billing_tests {
         assert_eq!(pts(super::RAW_CENTS_PER_POINT + 1), 2);
         // The whole daily pool corresponds to a bounded amount of real spend.
         assert_eq!(
-            pts(super::RAW_CENTS_PER_POINT * super::FREE_POINTS_DAILY),
-            super::FREE_POINTS_DAILY,
+            pts(super::RAW_CENTS_PER_POINT * super::free_points_daily()),
+            super::free_points_daily(),
         );
     }
 

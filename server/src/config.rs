@@ -36,14 +36,14 @@ pub struct Config {
     pub ide_release_github_workflow: String,
 
     /// OAuth apps for linking code hosts. Registered by the operator under their own
-    /// GitHub / Gitee account, because the app belongs to that identity and the secret
-    /// is theirs. Empty means the provider is simply not offered — same shape as Stripe:
-    /// the feature ships and stays switched off until credentials exist, rather than
-    /// half-appearing and failing at the point someone clicks it.
+    /// GitHub / GitLab account, because the app belongs to that identity and the secret
+    /// is theirs. Empty only removes the one-click OAuth button — linking by personal
+    /// access token needs nothing registered and is always available, so the card never
+    /// ends up with a dead button.
     pub github_client_id: String,
     pub github_client_secret: String,
-    pub gitee_client_id: String,
-    pub gitee_client_secret: String,
+    pub gitlab_client_id: String,
+    pub gitlab_client_secret: String,
 }
 
 /// JWT 密钥是整套鉴权的根：拿到它就能签一张 `role: "admin"` 的令牌，而 Claims 提取器
@@ -127,8 +127,8 @@ impl Config {
             // button that lands the person on a provider error page.
             github_client_id: std::env::var("GITHUB_CLIENT_ID").unwrap_or_default(),
             github_client_secret: std::env::var("GITHUB_CLIENT_SECRET").unwrap_or_default(),
-            gitee_client_id: std::env::var("GITEE_CLIENT_ID").unwrap_or_default(),
-            gitee_client_secret: std::env::var("GITEE_CLIENT_SECRET").unwrap_or_default(),
+            gitlab_client_id: std::env::var("GITLAB_CLIENT_ID").unwrap_or_default(),
+            gitlab_client_secret: std::env::var("GITLAB_CLIENT_SECRET").unwrap_or_default(),
         })
     }
 

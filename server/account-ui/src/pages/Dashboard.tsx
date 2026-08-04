@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Camera, ChevronLeft, ChevronRight, GitBranch, Github } from "lucide-react";
+import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { BRAND_MARKS } from "@/components/BrandMarks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -272,6 +273,9 @@ function CodeHosts({ lang }: { lang: Lang }) {
   const [rows, setRows] = useState<Integration[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
+  /** Which card is currently showing its token box, and what has been typed into it. */
+  const [tokenFor, setTokenFor] = useState<string | null>(null);
+  const [token, setToken] = useState("");
 
   const load = () => {
     void api
@@ -310,6 +314,26 @@ function CodeHosts({ lang }: { lang: Lang }) {
     }
   }
 
+  async function saveToken(provider: string) {
+    const value = token.trim();
+    if (!value) return;
+    setBusy(provider);
+    setNote(null);
+    try {
+      const res = await api.integrationConnectToken(provider, value);
+      setTokenFor(null);
+      // Cleared rather than left in state: there is no reason to keep a live token in
+      // memory once it has been handed over.
+      setToken("");
+      setNote({ text: `${t.integrationConnected} (${res.account_login})`, ok: true });
+      load();
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : t.integrationError, ok: false });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function disconnect(provider: string) {
     setBusy(provider);
     setNote(null);
@@ -339,40 +363,104 @@ function CodeHosts({ lang }: { lang: Lang }) {
         </p>
       ) : null}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {(rows ?? []).map((row) => (
-          <Card key={row.provider} className="bg-muted p-6">
-            <div className="mb-2.5 flex items-center gap-2.5">
-              {row.provider === "github" ? <Github className="size-5" /> : <GitBranch className="size-5" />}
-              <span className="text-lg font-semibold">{row.label}</span>
-              {row.connected ? <Badge variant="success">{t.connected}</Badge> : null}
-            </div>
-            <p className="mb-4 min-h-[2.5rem] text-[13.5px] leading-relaxed text-muted-foreground">
-              {!row.configured
-                ? t.notConfigured
-                : row.connected
+        {(rows ?? []).map((row) => {
+          const Mark = BRAND_MARKS[row.provider];
+          const open = tokenFor === row.provider;
+          return (
+            <Card key={row.provider} className="items-center bg-muted p-6 text-center">
+              <div className="mb-2.5 flex items-center justify-center gap-2.5">
+                {Mark ? <Mark className="size-5" /> : null}
+                <span className="text-lg font-semibold">{row.label}</span>
+                {row.connected ? <Badge variant="success">{t.connected}</Badge> : null}
+              </div>
+              <p className="mb-4 min-h-[2.5rem] text-[13.5px] leading-relaxed text-muted-foreground">
+                {row.connected
                   ? `${t.connectedAs} ${row.account_login || row.account_name || "—"}`
                   : `@${row.provider}:`}
-            </p>
-            {row.connected ? (
-              <Button
-                variant="outline"
-                className="w-fit"
-                disabled={busy === row.provider}
-                onClick={() => void disconnect(row.provider)}
-              >
-                {t.disconnect}
-              </Button>
-            ) : (
-              <Button
-                className="w-fit"
-                disabled={!row.configured || busy === row.provider}
-                onClick={() => void connect(row.provider)}
-              >
-                {busy === row.provider ? t.connecting : t.connect}
-              </Button>
-            )}
-          </Card>
-        ))}
+              </p>
+
+              {row.connected ? (
+                <Button
+                  variant="outline"
+                  disabled={busy === row.provider}
+                  onClick={() => void disconnect(row.provider)}
+                >
+                  {t.disconnect}
+                </Button>
+              ) : open ? (
+                // Paste path. Type=password so a token does not sit in plain sight on a
+                // shared screen; the browser is told not to remember it either.
+                <div className="flex w-full max-w-xs flex-col items-center gap-2.5">
+                  <Input
+                    autoFocus
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder={t.tokenPlaceholder}
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void saveToken(row.provider);
+                    }}
+                  />
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t.tokenScopes} <code className="font-medium">{row.token_hint}</code>
+                    {" · "}
+                    <a
+                      className="underline underline-offset-2"
+                      href={row.token_url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {t.tokenCreate}
+                    </a>
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      disabled={!token.trim() || busy === row.provider}
+                      onClick={() => void saveToken(row.provider)}
+                    >
+                      {busy === row.provider ? t.connecting : t.connect}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      disabled={busy === row.provider}
+                      onClick={() => {
+                        setTokenFor(null);
+                        setToken("");
+                      }}
+                    >
+                      {t.cancel}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  {/* Only when an OAuth app exists. Its absence no longer disables the
+                      card — the token route below always works. */}
+                  {row.oauth_configured ? (
+                    <Button
+                      disabled={busy === row.provider}
+                      onClick={() => void connect(row.provider)}
+                    >
+                      {busy === row.provider ? t.connecting : t.connect}
+                    </Button>
+                  ) : null}
+                  <Button
+                    variant={row.oauth_configured ? "outline" : "default"}
+                    onClick={() => {
+                      setNote(null);
+                      setToken("");
+                      setTokenFor(row.provider);
+                    }}
+                  >
+                    {row.oauth_configured ? t.useToken : t.connect}
+                  </Button>
+                </div>
+              )}
+            </Card>
+          );
+        })}
       </div>
     </>
   );

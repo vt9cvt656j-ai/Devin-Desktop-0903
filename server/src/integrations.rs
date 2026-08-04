@@ -1,5 +1,5 @@
-//! Linking a GitHub or Gitee account, so the IDE can offer someone's own repositories
-//! behind `@github:` and `@gitee:`.
+//! Linking a GitHub or GitLab account, so the IDE can offer someone's own repositories
+//! behind `@github:` and `@gitlab:`.
 //!
 //! Three things decide the shape of this module.
 //!
@@ -17,9 +17,14 @@
 //! token, and it is checked for provider mismatch as well as signature.
 //!
 //! **Credentials belong to the operator.** The OAuth app is registered under their
-//! GitHub/Gitee identity, so this ships with no defaults and reports `configured: false`
-//! until the environment carries an id and secret. A provider that is not configured is
-//! not offered — better than a button that leads to a provider error page.
+//! GitHub/GitLab identity, so OAuth ships with no defaults and reports
+//! `oauth_configured: false` until the environment carries an id and secret.
+//!
+//! **But a provider without OAuth still connects.** Requiring the operator to register
+//! an OAuth app before anyone can link anything makes the button dead on a fresh
+//! deployment. A personal access token needs nothing registered — the person creates one
+//! in their own account settings and pastes it — so that path is always open, and the
+//! OAuth button appears alongside it once credentials exist.
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -42,14 +47,14 @@ const UA: &str = "MrDayOne-Gateway";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     GitHub,
-    Gitee,
+    GitLab,
 }
 
 impl Provider {
     fn parse(raw: &str) -> Option<Self> {
         match raw {
             "github" => Some(Self::GitHub),
-            "gitee" => Some(Self::Gitee),
+            "gitlab" => Some(Self::GitLab),
             _ => None,
         }
     }
@@ -57,14 +62,14 @@ impl Provider {
     fn key(self) -> &'static str {
         match self {
             Self::GitHub => "github",
-            Self::Gitee => "gitee",
+            Self::GitLab => "gitlab",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::GitHub => "GitHub",
-            Self::Gitee => "Gitee",
+            Self::GitLab => "GitLab",
         }
     }
 
@@ -74,9 +79,9 @@ impl Provider {
                 state.cfg.github_client_id.clone(),
                 state.cfg.github_client_secret.clone(),
             ),
-            Self::Gitee => (
-                state.cfg.gitee_client_id.clone(),
-                state.cfg.gitee_client_secret.clone(),
+            Self::GitLab => (
+                state.cfg.gitlab_client_id.clone(),
+                state.cfg.gitlab_client_secret.clone(),
             ),
         }
     }
@@ -85,25 +90,43 @@ impl Provider {
     ///
     /// GitHub's `repo` is coarse — it is the only scope that can see private
     /// repositories, and it grants write with it. `read:user` is separate so the page
-    /// can say who is connected. Gitee splits them properly.
+    /// can say who is connected. GitLab splits read from write properly, so it gets
+    /// read-only scopes.
     fn scope(self) -> &'static str {
         match self {
             Self::GitHub => "repo read:user",
-            Self::Gitee => "projects user_info",
+            Self::GitLab => "read_api read_user read_repository",
+        }
+    }
+
+    /// Where the person goes to create a personal access token by hand.
+    fn token_create_url(self) -> &'static str {
+        match self {
+            Self::GitHub => "https://github.com/settings/tokens/new?scopes=repo&description=Mr.day%20One",
+            Self::GitLab => "https://gitlab.com/-/user_settings/personal_access_tokens",
+        }
+    }
+
+    /// Which boxes to tick on that page. Getting this wrong is the most likely reason a
+    /// pasted token is refused, so the page says it rather than leaving it to be guessed.
+    fn token_hint(self) -> &'static str {
+        match self {
+            Self::GitHub => "repo",
+            Self::GitLab => "read_api, read_repository",
         }
     }
 
     fn authorize_url(self) -> &'static str {
         match self {
             Self::GitHub => "https://github.com/login/oauth/authorize",
-            Self::Gitee => "https://gitee.com/oauth/authorize",
+            Self::GitLab => "https://gitlab.com/oauth/authorize",
         }
     }
 
     fn token_url(self) -> &'static str {
         match self {
             Self::GitHub => "https://github.com/login/oauth/access_token",
-            Self::Gitee => "https://gitee.com/oauth/token",
+            Self::GitLab => "https://gitlab.com/oauth/token",
         }
     }
 }
@@ -168,7 +191,7 @@ pub async fn list(
     .fetch_all(&state.db)
     .await?;
 
-    let providers: Vec<serde_json::Value> = [Provider::GitHub, Provider::Gitee]
+    let providers: Vec<serde_json::Value> = [Provider::GitHub, Provider::GitLab]
         .iter()
         .map(|p| {
             let (id, secret) = p.credentials(&state);
@@ -177,7 +200,11 @@ pub async fn list(
             json!({
                 "provider": p.key(),
                 "label": p.label(),
-                "configured": configured,
+                // Whether the OAuth *button* can be offered. Token linking never depends
+                // on it, so the card is never dead.
+                "oauth_configured": configured,
+                "token_url": p.token_create_url(),
+                "token_hint": p.token_hint(),
                 "connected": linked.is_some(),
                 "account_login": linked.map(|r| r.account_login.clone()),
                 "account_name": linked.map(|r| r.account_name.clone()),
@@ -290,7 +317,7 @@ async fn finish(
         &Validation::default(),
     )?;
     // A valid signature for *a* flow is not a valid signature for *this* one: without
-    // this check a state minted for GitHub would complete a Gitee link.
+    // this check a state minted for GitHub would complete a GitLab link.
     if data.claims.provider != provider.key() {
         anyhow::bail!("state provider mismatch");
     }
@@ -317,12 +344,11 @@ async fn finish(
                 .json()
                 .await?
         }
-        Provider::Gitee => {
-            // Gitee takes these as query parameters, not a form body.
+        Provider::GitLab => {
             state
                 .update_http
                 .post(provider.token_url())
-                .query(&[
+                .form(&[
                     ("grant_type", "authorization_code"),
                     ("code", code),
                     ("client_id", client_id.as_str()),
@@ -400,7 +426,7 @@ async fn fetch_account(
 ) -> anyhow::Result<Account> {
     let url = match provider {
         Provider::GitHub => "https://api.github.com/user",
-        Provider::Gitee => "https://gitee.com/api/v5/user",
+        Provider::GitLab => "https://gitlab.com/api/v4/user",
     };
     let body: serde_json::Value = state
         .update_http
@@ -412,8 +438,10 @@ async fn fetch_account(
         .json()
         .await?;
     Ok(Account {
+        // GitHub calls the handle `login`; GitLab calls it `username`.
         login: body
             .get("login")
+            .or_else(|| body.get("username"))
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_owned(),
@@ -428,6 +456,80 @@ async fn fetch_account(
             .unwrap_or_default()
             .to_owned(),
     })
+}
+
+// ── POST /api/integrations/:provider/token ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct TokenReq {
+    pub token: String,
+}
+
+/// Link by personal access token instead of OAuth.
+///
+/// This is what makes the button work on a deployment where no OAuth app has been
+/// registered — which is every deployment until the operator registers one. The person
+/// creates a token in their own account settings and pastes it; nothing has to exist on
+/// our side first.
+///
+/// The token is verified before it is stored, by spending it on the provider's "who am
+/// I" endpoint. A typo, a token for the wrong host, or one whose scopes are too narrow
+/// fails here with a message, rather than being saved and then failing later at the
+/// point someone types `@github:` and gets an empty list.
+pub async fn connect_token(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(provider): Path<String>,
+    Json(req): Json<TokenReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let provider = provider_or_400(&provider)?;
+    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+
+    let token = req.token.trim().to_owned();
+    if token.is_empty() {
+        return Err(AppError::bad("请填写访问令牌"));
+    }
+    // Length only — the formats are not stable enough to pattern-match, and the real
+    // check is the API call below.
+    if token.len() > 512 {
+        return Err(AppError::bad("这不像是一个访问令牌"));
+    }
+
+    let who = fetch_account(&state, provider, &token)
+        .await
+        .map_err(|_| AppError::bad(format!("{} 拒绝了这个令牌，请检查是否填错或权限不足", provider.label())))?;
+    if who.login.is_empty() {
+        return Err(AppError::bad(format!(
+            "{} 没有认出这个令牌对应的账号",
+            provider.label()
+        )));
+    }
+
+    sqlx::query(
+        "INSERT INTO connected_accounts \
+           (user_id, provider, account_login, account_name, avatar_url, access_token, \
+            refresh_token, token_expires_at, scopes, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,NULL,NULL,'pat', now()) \
+         ON CONFLICT (user_id, provider) DO UPDATE SET \
+           account_login = EXCLUDED.account_login, \
+           account_name  = EXCLUDED.account_name, \
+           avatar_url    = EXCLUDED.avatar_url, \
+           access_token  = EXCLUDED.access_token, \
+           refresh_token = NULL, \
+           token_expires_at = NULL, \
+           scopes        = 'pat', \
+           updated_at    = now()",
+    )
+    .bind(uid)
+    .bind(provider.key())
+    .bind(&who.login)
+    .bind(&who.name)
+    .bind(&who.avatar)
+    .bind(&token)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "ok": true, "account_login": who.login })))
 }
 
 // ── DELETE /api/integrations/:provider ───────────────────────────────────────────────
@@ -452,14 +554,14 @@ pub async fn disconnect(
         "ok": true,
         "revoke_at_provider": match provider {
             Provider::GitHub => "https://github.com/settings/applications",
-            Provider::Gitee => "https://gitee.com/oauth/applications",
+            Provider::GitLab => "https://gitlab.com/-/user_settings/applications",
         }
     })))
 }
 
 // ── GET /api/integrations/:provider/repos ────────────────────────────────────────────
 
-/// What `@github:` and `@gitee:` offer. Proxied rather than letting the IDE hold the
+/// What `@github:` and `@gitlab:` offer. Proxied rather than letting the IDE hold the
 /// token: the token stays on this server, and the IDE gets a list of names.
 pub async fn repos(
     State(state): State<AppState>,
@@ -480,7 +582,7 @@ pub async fn repos(
 
     let url = match provider {
         Provider::GitHub => "https://api.github.com/user/repos?per_page=100&sort=updated",
-        Provider::Gitee => "https://gitee.com/api/v5/user/repos?per_page=100&sort=updated",
+        Provider::GitLab => "https://gitlab.com/api/v4/projects?membership=true&per_page=100&order_by=updated_at",
     };
     let body: serde_json::Value = state
         .update_http
@@ -502,18 +604,35 @@ pub async fn repos(
         )));
     };
 
+    // The two APIs describe the same thing with different words, and the editor should
+    // not have to care which host a repository came from.
+    let str_of = |r: &serde_json::Value, keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| r.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_owned()
+    };
     let repos: Vec<serde_json::Value> = list
         .iter()
         .map(|r| {
+            // Computed outside the macro: json! takes expressions, not blocks.
+            let branch = {
+                let b = str_of(r, &["default_branch"]);
+                if b.is_empty() { "main".to_owned() } else { b }
+            };
+            // GitHub has a boolean; GitLab has visibility public/internal/private.
+            let private = r.get("private").and_then(|v| v.as_bool()).unwrap_or_else(|| {
+                r.get("visibility").and_then(|v| v.as_str()).unwrap_or("private") != "public"
+            });
             json!({
-                "full_name": r.get("full_name").and_then(|v| v.as_str()).unwrap_or_default(),
-                "name": r.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
-                "private": r.get("private").and_then(|v| v.as_bool()).unwrap_or(false),
-                "default_branch": r.get("default_branch").and_then(|v| v.as_str()).unwrap_or("main"),
-                "description": r.get("description").and_then(|v| v.as_str()).unwrap_or_default(),
-                "clone_url": r.get("clone_url").and_then(|v| v.as_str()).unwrap_or_default(),
-                "html_url": r.get("html_url").and_then(|v| v.as_str()).unwrap_or_default(),
-                "updated_at": r.get("updated_at").and_then(|v| v.as_str()).unwrap_or_default(),
+                "full_name": str_of(r, &["full_name", "path_with_namespace"]),
+                "name": str_of(r, &["name"]),
+                "private": private,
+                "default_branch": branch,
+                "description": str_of(r, &["description"]),
+                "clone_url": str_of(r, &["clone_url", "http_url_to_repo"]),
+                "html_url": str_of(r, &["html_url", "web_url"]),
+                "updated_at": str_of(r, &["updated_at", "last_activity_at"]),
             })
         })
         .collect();
@@ -528,11 +647,11 @@ mod tests {
     #[test]
     fn only_the_two_known_providers_are_accepted() {
         assert_eq!(Provider::parse("github"), Some(Provider::GitHub));
-        assert_eq!(Provider::parse("gitee"), Some(Provider::Gitee));
+        assert_eq!(Provider::parse("gitlab"), Some(Provider::GitLab));
         // Path segments come straight off the URL; anything else must not reach a
         // credential lookup or a database write.
         assert_eq!(Provider::parse("GitHub"), None);
-        assert_eq!(Provider::parse("gitlab"), None);
+        assert_eq!(Provider::parse("gitee"), None);
         assert_eq!(Provider::parse("../github"), None);
         assert_eq!(Provider::parse(""), None);
     }
@@ -542,8 +661,8 @@ mod tests {
         // A widening here is a real escalation across every linked account, so it should
         // have to break a test to happen.
         assert_eq!(Provider::GitHub.scope(), "repo read:user");
-        assert_eq!(Provider::Gitee.scope(), "projects user_info");
-        for p in [Provider::GitHub, Provider::Gitee] {
+        assert_eq!(Provider::GitLab.scope(), "read_api read_user read_repository");
+        for p in [Provider::GitHub, Provider::GitLab] {
             assert!(
                 !p.scope().contains("delete") && !p.scope().contains("admin"),
                 "{} must not ask for destructive scopes",

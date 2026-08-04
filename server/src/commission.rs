@@ -227,7 +227,17 @@ pub async fn admin_create_commission(
     .bind(commission_cents)
     .bind(&note)
     .fetch_one(&state.db)
-    .await?;
+    .await
+    // The SELECT above is the friendly path; `idx_commissions_order_payable` is the one
+    // that actually holds under concurrency. Reaching here means two requests raced past
+    // that check — a double-clicked form, most likely — so report the same thing the
+    // check would have, not a 500 that reads like the server broke.
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => AppError::bad(
+            "该订单已有佣金记录（如需重开，请先把原记录标记为 rejected）",
+        ),
+        _ => AppError::from(e),
+    })?;
 
     crate::realtime::record_event(
         &state,

@@ -164,28 +164,21 @@ pub async fn admin_delete(
 /// Moving to a weekly-primary scheme is a real design change, not a retuning: it needs
 /// `quota_ok` and the four refill sites to treat a 0 cap as "unlimited window" first.
 /// See `plan_spec_window_cap_is_never_zero` below.
+///
+/// 额度值原先写死在这里的 match 分支里，改一次要重新编译部署；现在唯一定义在
+/// `plan_quotas` 表（见 `settings.rs`），种子值与原分支逐字相同。单位不变：真实计费分
+/// （trial 的 5_000 = 上游 $50 成本，客户端按面值分母折算后显示）。
+///
+/// 编辑套餐**不会**改写已订阅用户：额度在兑换时由 `apply_plan` 写进 users 表，
+/// 之后没有任何地方重新推导。唯一的例外是 `admin_set_plan` 的 `reset_quotas`。
 pub(crate) fn plan_spec(plan: &str) -> Option<(i64, i64, i64, i32)> {
-    match plan {
-        "trial" => Some((5_000, 5_000, 0, 1)), // $50 total, $50/5.5h, 1 day, ¥8.8
-        "basic" => Some((33_000, 3_000, 0, 30)), // $330 total, $30/5.5h, 30 days, ¥88
-        "pro" => Some((65_000, 6_000, 0, 30)), // $650 total, $60/5.5h, 30 days, ¥188
-        "power" => Some((180_000, 15_000, 0, 30)), // $1800 total, $150/5.5h, 30 days, ¥488
-        "ultra" => Some((500_000, 30_000, 0, 30)), // $5000 total, $300/5.5h, 30 days
-        _ => None,
-    }
+    crate::settings::plan_spec(plan)
 }
 
 /// Ordering of the built-in plans, so a grant never silently downgrades a user who
 /// still holds a better plan. Unknown/absent plans rank 0.
 pub(crate) fn plan_rank(plan: &str) -> i32 {
-    match plan {
-        "trial" => 1,
-        "basic" => 2,
-        "pro" => 3,
-        "power" => 4,
-        "ultra" => 5,
-        _ => 0,
-    }
+    crate::settings::plan_rank(plan)
 }
 
 pub(crate) async fn apply_plan(
@@ -510,21 +503,38 @@ pub async fn admin_set_plan(
 }
 
 // ---------- admin: CANCEL a user's membership ----------
-pub async fn admin_cancel_plan(
-    State(state): State<AppState>,
-    claims: Claims,
-    Path(id): Path<uuid::Uuid>,
-) -> ApiResult<Json<serde_json::Value>> {
-    admin_only(&claims)?;
+/// Strip a plan back to nothing, in a caller-supplied transaction.
+///
+/// One definition, deliberately. There are now two ways a plan ends — an operator
+/// cancelling it in the console, and Stripe reporting the subscription gone — and if
+/// they each carried their own UPDATE they would drift the moment a quota column is
+/// added. The Stripe path must also be able to run inside the webhook's transaction,
+/// which is why this takes a `Transaction` rather than the pool.
+pub async fn clear_plan(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    uid: uuid::Uuid,
+) -> ApiResult<()> {
     sqlx::query(
         "UPDATE users SET plan = 'none', plan_expires_at = NULL, \
          quota_total_cents = 0, quota_window_cents = 0, quota_window_cap_cents = 0, \
          quota_weekly_cap_cents = 0, quota_week_used_cents = 0, \
          updated_at = now() WHERE id = $1",
     )
-    .bind(id)
-    .execute(&state.db)
+    .bind(uid)
+    .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+pub async fn admin_cancel_plan(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let mut tx = state.db.begin().await?;
+    clear_plan(&mut tx, id).await?;
+    tx.commit().await?;
     let summary = user_summary(&state, id).await?;
     crate::realtime::record_event(
         &state,

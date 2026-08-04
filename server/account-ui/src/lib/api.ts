@@ -131,6 +131,12 @@ export const api = {
   /** Returns the provider's authorize URL; the caller navigates to it. */
   integrationStart: (provider: string) =>
     request<{ url: string }>(`/api/integrations/${provider}/start`),
+  /** Verified against the provider before it is stored, so a bad paste fails here. */
+  integrationConnectToken: (provider: string, token: string) =>
+    request<{ ok: boolean; account_login: string }>(`/api/integrations/${provider}/token`, {
+      method: "POST",
+      body: { token },
+    }),
   integrationDisconnect: (provider: string) =>
     request<{ ok: boolean; revoke_at_provider: string }>(`/api/integrations/${provider}`, {
       method: "DELETE",
@@ -159,8 +165,16 @@ const HANDOFF_PORTS = [47821, 47822, 47823];
 export type Integration = {
   provider: string;
   label: string;
-  /** False when this server has no OAuth credentials for it — then it is not offered. */
-  configured: boolean;
+  /**
+   * Whether the one-click OAuth button can be offered. Linking by pasted token needs
+   * nothing registered on the server, so it stays available either way — this only
+   * decides whether there is a second, faster route.
+   */
+  oauth_configured: boolean;
+  /** Where the person creates a personal access token by hand. */
+  token_url: string;
+  /** Which scopes to tick there — the usual reason a pasted token gets refused. */
+  token_hint: string;
   connected: boolean;
   account_login: string | null;
   account_name: string | null;

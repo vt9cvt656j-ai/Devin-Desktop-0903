@@ -30,9 +30,9 @@
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
     io::{Read, Write},
 };
 
@@ -327,18 +327,53 @@ pub fn segment_messages(msgs: &[Msg], segment_tokens: usize) -> Vec<Segment> {
     out
 }
 
+/// 小写十六进制。摘要键要进 Redis 和 Postgres，必须是纯 ASCII 的稳定字符串。
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// 一个段的缓存键。
 ///
 /// 键里必须包含**压缩器模型**和**目标长度**：换了压缩模型或改了摘要长度，旧摘要就不再
 /// 是这次请求想要的东西，必须重算而不是复用。
+///
+/// # 为什么是 SHA-256，而不是 DefaultHasher
+///
+/// 这个函数的输出会被**写进 Postgres**（`michael_context_archives.archive_key`）并保存
+/// 90 天。`DefaultHasher` 有两个性质让它不能承担这个角色：
+///
+///   1. **标准库明说它的算法不保证跨 Rust 版本稳定。** 一次例行的 `rustup update` 重编，
+///      同样的内容就可能算出不同的键 —— 所有已归档的历史当场变成孤儿，而且不会报任何错，
+///      只会表现成"用户的长对话突然想不起前面说过什么"。把一个显式声明不稳定的哈希当
+///      持久化主键用，是在赌工具链永远不升级。
+///   2. **它不抗碰撞。** 键里没有 user_id（内容寻址是故意的：两个人的同一段内容本就该
+///      共用一份摘要，省一次 LLM 调用）。抗碰撞因此是唯一挡在跨账号之间的东西 ——
+///      能构造出碰撞，就能拿自己的一段内容去读到别人那段内容的摘要。SipHash 在密钥已知
+///      （`DefaultHasher::new()` 固定用 0,0）时并不提供这个保证。
+///
+/// Cargo.toml 里 sha2 那一行的注释写着"DefaultHasher is not collision resistant"——
+/// 网关缓存键当时已经换过来了，这两个键漏掉了。
+///
+/// 版本号从 v1 提到 v2，所以新旧键不可能互相误认。已有的 prefix 记录里存的是 v1 键，
+/// 读取走的是记录里存下来的字符串，因此**在途的对话不受影响**；只有重新分段时才会按 v2
+/// 重算，代价是那一段重新摘要一次，不会丢数据。
 pub fn segment_cache_key(text: &str, compressor_model: &str, summary_tokens: usize) -> String {
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    let payload = (text, compressor_model, summary_tokens);
-    payload.hash(&mut h1);
-    0x9e37_79b9_7f4a_7c15u64.hash(&mut h2);
-    payload.hash(&mut h2);
-    format!("mc:v1:{:016x}{:016x}", h1.finish(), h2.finish())
+    let mut h = Sha256::new();
+    h.update(b"mc-seg-v2\0");
+    h.update(text.as_bytes());
+    h.update(b"\0");
+    h.update(compressor_model.as_bytes());
+    h.update(b"\0");
+    // `as u64`, not `usize::to_le_bytes()`: usize is 8 bytes here and 4 on a 32-bit
+    // target, so the raw usize would make the key depend on the build architecture —
+    // the same "stable key that quietly isn't" problem this function exists to avoid.
+    h.update((summary_tokens as u64).to_le_bytes());
+    format!("mc:v2:{}", hex_lower(&h.finalize()))
 }
 
 /// 把一个段的消息拼成送去压缩的文本。
@@ -398,14 +433,15 @@ impl SegmentSearchIndex {
 
 /// 无损归档必须按完整 JSON 内容寻址；摘要键只看可计数文本，两个 JSON 对象可能有相同
 /// 文本却带不同 tool_call_id，不能让其中一个覆盖另一个。
+/// SHA-256 for the same two reasons as `segment_cache_key` — and more urgently, because
+/// THIS key is the archive's primary key in Postgres. A key that shifts under a compiler
+/// upgrade orphans the lossless history these rows exist to preserve.
 pub fn raw_segment_cache_key(messages: &[Value]) -> String {
     let bytes = serde_json::to_vec(messages).unwrap_or_default();
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h1);
-    0xd6e8_feb8_6659_fd93u64.hash(&mut h2);
-    bytes.hash(&mut h2);
-    format!("mc:raw:v1:{:016x}{:016x}", h1.finish(), h2.finish())
+    let mut h = Sha256::new();
+    h.update(b"mc-raw-v2\0");
+    h.update(&bytes);
+    format!("mc:raw:v2:{}", hex_lower(&h.finalize()))
 }
 
 pub fn raw_segment_search_key(raw_key: &str) -> String {
@@ -1406,7 +1442,39 @@ mod tests {
         assert_ne!(a, segment_cache_key("别的内容", "haiku", 600));
         assert_ne!(a, segment_cache_key("同样的内容", "sonnet", 600));
         assert_ne!(a, segment_cache_key("同样的内容", "haiku", 900));
-        assert!(a.starts_with("mc:v1:"));
+        assert!(a.starts_with("mc:v2:"));
+    }
+
+    /// 这两个键会被写进 Postgres 当主键存 90 天，所以它们必须是**跨编译稳定**的。
+    ///
+    /// 常量是**独立算出来的**，不是把代码的输出抄回来的 —— 抄回来的话这条断言只能证明
+    /// "代码等于代码"。期望值来自 shell：
+    ///
+    /// ```text
+    /// printf 'mc-seg-v2\x00hello\x00haiku\x00\x58\x02\x00\x00\x00\x00\x00\x00' \
+    ///   | shasum -a 256
+    /// ```
+    ///
+    /// （0x0258 = 600，小端 u64。）只要有人把哈希换回 DefaultHasher（标准库明说算法不保证
+    /// 跨版本稳定）、改了拼接顺序或分隔符、或把 `as u64` 改回裸 usize，这里立刻红。没有
+    /// 这条断言，同样的改动只会在某次 `rustup update` 之后表现为"所有人的长对话丢了前半
+    /// 段"，而且一声不响。
+    #[test]
+    fn archive_keys_are_stable_across_builds() {
+        assert_eq!(
+            segment_cache_key("hello", "haiku", 600),
+            "mc:v2:c30fb4e5e96afee9cb56b8ae153ffc07ae7a63e906fbbd6d1c88bffb261dc88d"
+        );
+    }
+
+    /// 段键与归档键的命名空间不能重叠：一个存摘要，一个存无损原文，互相覆盖就是数据损坏。
+    #[test]
+    fn summary_and_archive_keys_never_collide() {
+        let seg = segment_cache_key("同样的内容", "haiku", 600);
+        let raw = raw_segment_cache_key(&[serde_json::json!("同样的内容")]);
+        assert_ne!(seg, raw);
+        assert!(seg.starts_with("mc:v2:"), "{seg}");
+        assert!(raw.starts_with("mc:raw:v2:"), "{raw}");
     }
 
     #[test]

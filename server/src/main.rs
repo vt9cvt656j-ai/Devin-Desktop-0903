@@ -116,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::delete(integrations::disconnect),
         )
         .route("/api/integrations/:provider/repos", get(integrations::repos))
+        // Linking by pasted token: the path that works before any OAuth app exists.
+        .route(
+            "/api/integrations/:provider/token",
+            post(integrations::connect_token),
+        )
         // Body limit covers the inline avatar data URL, which the browser has already
         // resized; the handler caps it far lower still.
         .route(
