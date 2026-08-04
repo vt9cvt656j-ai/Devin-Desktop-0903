@@ -1,0 +1,1 @@
+import{Cc as e,Dc as t,Ec as n,Oc as r,Tc as i,wc as a}from"./vendor-a8bn3H4I.js";i();export{e as ask,a as confirm,n as message,t as open,r as save};
