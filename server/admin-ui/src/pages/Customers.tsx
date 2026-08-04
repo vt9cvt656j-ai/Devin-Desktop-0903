@@ -13,6 +13,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, Truncate } from "@/components/ui/table";
 import { api } from "@/lib/api";
@@ -507,7 +508,7 @@ function CustomerDialog({
   const balanceDirty = balance !== creditInput(user.credits_cents);
 
   return (
-    <DialogContent className="max-w-2xl">
+    <DialogContent className="flex max-h-[85vh] max-w-2xl flex-col overflow-y-auto">
       <DialogHeader>
         <DialogTitle className="truncate">{user.email}</DialogTitle>
         <DialogDescription>
@@ -516,7 +517,7 @@ function CustomerDialog({
         </DialogDescription>
       </DialogHeader>
 
-      <div className="grid grid-cols-2 gap-4 rounded-xl border border-border bg-secondary/40 p-4 sm:grid-cols-3">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border bg-secondary/40 p-4 sm:grid-cols-4">
         <Fact
           label="本时段"
           value={w ? `${cents(w.used)} / ${cents(w.cap)}` : "—"}
@@ -550,249 +551,262 @@ function CustomerDialog({
         <p role="alert" className={msg.ok ? "text-sm text-success" : "text-sm text-destructive"}>{msg.text}</p>
       )}
 
-      <section>
-        <h3 className="text-sm font-semibold">充值：在现有余额上增加</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          客户付款后用这个。填多少就加多少，不需要先算出新的总额。要扣减就填负数。
-        </p>
-        <div className="mt-3 flex flex-wrap items-end gap-2">
-          <div className="w-40">
-            <Label htmlFor="topup">增加（$）</Label>
-            <Input
-              id="topup" type="number" step="0.01" value={topUp}
-              onChange={(e) => setTopUp(e.target.value)} placeholder="20.00"
-            />
-          </div>
-          <div className="flex gap-2 pb-0.5">
-            {["10", "20", "50"].map((v) => (
-              <Button key={v} type="button" variant="ghost" size="sm" onClick={() => setTopUp(v)}>+${v}</Button>
-            ))}
-          </div>
-          <Button size="sm" disabled={busy !== "" || topUpValue === 0 || topUpOverdraft} onClick={grantCredits}>
-            {busy === "grant" ? "充值中…" : "充值"}
-          </Button>
-        </div>
-        {topUpValue !== 0 && (
-          <p
-            className={
-              topUpOverdraft
-                ? "mt-2 text-xs text-destructive tabular-nums"
-                : "mt-2 text-xs text-muted-foreground tabular-nums"
-            }
-          >
-            {topUpOverdraft
-              ? `扣减后余额会变成负数（${cents(creditCents(topUpResultRaw))}），请改小扣减额`
-              : `充值后余额 ${cents(creditCents(topUpResultRaw))}`}
+      {/* Four stacked sections in one long scroll made this dialog a wall. They are three
+          different jobs — money, membership, the account itself — so they are three tabs.
+          Nothing about the logic changed; only what you have to scroll past to reach it. */}
+      <Tabs defaultValue="credit" className="mt-2">
+        <TabsList>
+          <TabsTrigger value="credit">额度</TabsTrigger>
+          <TabsTrigger value="plan">套餐</TabsTrigger>
+          <TabsTrigger value="account">账号</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="credit" className="space-y-6 pt-4">
+        <section>
+          <h3 className="text-sm font-semibold">充值：在现有余额上增加</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            客户付款后用这个。填多少就加多少，不需要先算出新的总额。要扣减就填负数。
           </p>
-        )}
-      </section>
-
-      <Separator />
-
-      <section>
-        <h3 className="text-sm font-semibold">改写余额：直接设成这个数</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          对账修正才用。这是覆盖，不是增加；不能为负数。没改动输入框时不可提交。
-        </p>
-        <div className="mt-3 flex flex-wrap items-end gap-2">
-          <div className="w-40">
-            <Label htmlFor="balance">余额（$）</Label>
-            <Input
-              id="balance" type="number" step="0.01" min="0" value={balance}
-              onChange={(e) => setBalance(e.target.value)}
-            />
-          </div>
-          <Button
-            variant="outline" size="sm"
-            disabled={busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) || balanceValue < 0}
-            onClick={setAbsoluteBalance}
-          >
-            {busy === "credits" ? "保存中…" : "改写余额"}
-          </Button>
-          <span className="pb-2.5 text-xs text-muted-foreground tabular-nums">
-            当前 {cents(creditCents(user.credits_cents))}
-          </span>
-        </div>
-      </section>
-
-      <Separator />
-
-      <section>
-        <h3 className="text-sm font-semibold">套餐</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          上面一行是「改成」，下面一行是「再加」。选 none 保存等同退订，会要求二次确认。
-        </p>
-
-        <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,10rem)_minmax(0,1fr)_auto] sm:items-end">
-          <div>
-            <Label htmlFor="plan">改成</Label>
-            <Select
-              id="plan"
-              value={plan}
-              onChange={(e) => {
-                setPlan(e.target.value);
-                if (confirming === "unsubscribe") setConfirming(null);
-              }}
-            >
-              <option value="none">none（退订）</option>
-              {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </Select>
-          </div>
-          <div>
-            <Label htmlFor="expiry">到期时间</Label>
-            <Input
-              id="expiry" type="datetime-local" value={expiry}
-              onChange={(e) => setExpiry(e.target.value)} disabled={plan === "none"}
-            />
-          </div>
-          {/*
-            plan="none" 走的是和 cancel-plan 完全相同的一条 SQL（codes.rs:456-467 vs 519-525）：
-            套餐、到期、时段/周/总额度一起清零。既然「取消会员」要二次确认，这条路不能一点就炸。
-          */}
-          <Button
-            size="sm"
-            disabled={busy !== "" || confirming === "unsubscribe"}
-            onClick={() => {
-              if (plan === "none") { setMsg(null); setConfirming("unsubscribe"); return; }
-              savePlan();
-            }}
-          >
-            {busy === "plan" ? "保存中…" : plan === "none" ? "退订…" : "保存套餐"}
-          </Button>
-        </div>
-
-        {confirming === "unsubscribe" && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
-            <span className="text-sm text-muted-foreground">
-              保存 none 会立即清空「{user.email}」的套餐和全部额度（时段 / 周 / 总额度），与「取消会员」等效。
-            </span>
-            <Button
-              variant="outline" size="sm" disabled={busy !== ""}
-              className="border-destructive/40 text-destructive hover:bg-destructive/10"
-              onClick={savePlan}
-            >
-              {busy === "plan" ? "处理中…" : "确认退订"}
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <div className="w-40">
+              <Label htmlFor="topup">增加（$）</Label>
+              <Input
+                id="topup" type="number" step="0.01" value={topUp}
+                onChange={(e) => setTopUp(e.target.value)} placeholder="20.00"
+              />
+            </div>
+            <div className="flex gap-2 pb-0.5">
+              {["10", "20", "50"].map((v) => (
+                <Button key={v} type="button" variant="ghost" size="sm" onClick={() => setTopUp(v)}>+${v}</Button>
+              ))}
+            </div>
+            <Button size="sm" disabled={busy !== "" || topUpValue === 0 || topUpOverdraft} onClick={grantCredits}>
+              {busy === "grant" ? "充值中…" : "充值"}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>返回</Button>
           </div>
-        )}
-
-        <label className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
-          <Checkbox
-            checked={resetQuotas} disabled={plan === "none"}
-            onChange={(e) => setResetQuotas(e.target.checked)}
-          />
-          按新套餐重置时段 / 周 / 总额度（留空则只换标签，额度保持不动）
-        </label>
-        {expiry === "" && plan !== "none" && (
-          <p className="mt-2 text-xs text-muted-foreground">到期时间留空 = 永不过期。</p>
-        )}
-
-        <div className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,10rem)_minmax(0,8rem)_auto] sm:items-end">
-          <div>
-            <Label htmlFor="extend">再加</Label>
-            <Select id="extend" value={extendPlan} onChange={(e) => setExtendPlan(e.target.value)}>
-              {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </Select>
-          </div>
-          <div>
-            <Label htmlFor="days">时长（天）</Label>
-            <Input
-              id="days" type="number" min="1" value={extendDays}
-              onChange={(e) => setExtendDays(e.target.value)}
-            />
-          </div>
-          <Button variant="outline" size="sm" disabled={busy !== "" || extendValue <= 0} onClick={grantPlan}>
-            {busy === "extend" ? "开通中…" : "叠加开通"}
-          </Button>
-        </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          叠加走的是和激活码同一条路：到期时间在现有基础上顺延，总额度累加，时段上限取两者较大值，
-          不会把人降级。上面两个输入框会跟着刷新成叠加后的结果。
-        </p>
-      </section>
-
-      <Separator />
-
-      <section>
-        <h3 className="text-sm font-semibold">权限与账号</h3>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Button
-            variant="outline" size="sm" disabled={busy !== "" || isSelf}
-            onClick={() =>
-              act(
-                "role",
-                () => api.post<WriteResp>(`/api/admin/users/${user.id}/role`, {
-                  role: user.role === "admin" ? "user" : "admin",
-                }),
-                user.role === "admin" ? "已取消管理员" : "已设为管理员",
-              )
-            }
-          >
-            {busy === "role" ? "处理中…" : user.role === "admin" ? "取消管理员" : "设为管理员"}
-          </Button>
-
-          {confirming === "cancel" ? (
-            <>
-              <span className="text-sm text-muted-foreground">退订会立即清零套餐和全部额度。</span>
-              <Button
-                variant="outline" size="sm" disabled={busy !== ""}
-                className="border-destructive/40 text-destructive hover:bg-destructive/10"
-                onClick={cancelPlan}
-              >
-                {busy === "cancel" ? "处理中…" : "确认取消会员"}
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>返回</Button>
-            </>
-          ) : (
-            isActive(user) && (
-              <Button
-                variant="outline" size="sm" disabled={busy !== ""}
-                className="border-destructive/40 text-destructive hover:bg-destructive/10"
-                onClick={() => { setMsg(null); setConfirming("cancel"); }}
-              >
-                取消会员
-              </Button>
-            )
+          {topUpValue !== 0 && (
+            <p
+              className={
+                topUpOverdraft
+                  ? "mt-2 text-xs text-destructive tabular-nums"
+                  : "mt-2 text-xs text-muted-foreground tabular-nums"
+              }
+            >
+              {topUpOverdraft
+                ? `扣减后余额会变成负数（${cents(creditCents(topUpResultRaw))}），请改小扣减额`
+                : `充值后余额 ${cents(creditCents(topUpResultRaw))}`}
+            </p>
           )}
+        </section>
 
-          {confirming === "delete" ? (
-            <>
-              <span className="text-sm text-muted-foreground">删除「{user.email}」后不可恢复。</span>
-              <Button
-                variant="outline" size="sm" disabled={busy !== ""}
-                className="border-destructive/40 text-destructive hover:bg-destructive/10"
-                onClick={async () => {
-                  setBusy("delete");
-                  setMsg(null);
-                  try {
-                    await api.del<{ ok?: boolean }>(`/api/admin/users/${user.id}`);
-                    await reload();
-                    onClose();
-                  } catch (e) {
-                    setMsg({ text: e instanceof Error ? e.message : "删除失败", ok: false });
-                    setBusy("");
-                  }
+          <Separator />
+
+        <section>
+          <h3 className="text-sm font-semibold">改写余额：直接设成这个数</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            对账修正才用。这是覆盖，不是增加；不能为负数。没改动输入框时不可提交。
+          </p>
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <div className="w-40">
+              <Label htmlFor="balance">余额（$）</Label>
+              <Input
+                id="balance" type="number" step="0.01" min="0" value={balance}
+                onChange={(e) => setBalance(e.target.value)}
+              />
+            </div>
+            <Button
+              variant="outline" size="sm"
+              disabled={busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) || balanceValue < 0}
+              onClick={setAbsoluteBalance}
+            >
+              {busy === "credits" ? "保存中…" : "改写余额"}
+            </Button>
+            <span className="pb-2.5 text-xs text-muted-foreground tabular-nums">
+              当前 {cents(creditCents(user.credits_cents))}
+            </span>
+          </div>
+        </section>
+        </TabsContent>
+
+        <TabsContent value="plan" className="pt-4">
+        <section>
+          <h3 className="text-sm font-semibold">套餐</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            上面一行是「改成」，下面一行是「再加」。选 none 保存等同退订，会要求二次确认。
+          </p>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,10rem)_minmax(0,1fr)_auto] sm:items-end">
+            <div>
+              <Label htmlFor="plan">改成</Label>
+              <Select
+                id="plan"
+                value={plan}
+                onChange={(e) => {
+                  setPlan(e.target.value);
+                  if (confirming === "unsubscribe") setConfirming(null);
                 }}
               >
-                {busy === "delete" ? "删除中…" : "确认删除"}
+                <option value="none">none（退订）</option>
+                {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="expiry">到期时间</Label>
+              <Input
+                id="expiry" type="datetime-local" value={expiry}
+                onChange={(e) => setExpiry(e.target.value)} disabled={plan === "none"}
+              />
+            </div>
+            {/*
+              plan="none" 走的是和 cancel-plan 完全相同的一条 SQL（codes.rs:456-467 vs 519-525）：
+              套餐、到期、时段/周/总额度一起清零。既然「取消会员」要二次确认，这条路不能一点就炸。
+            */}
+            <Button
+              size="sm"
+              disabled={busy !== "" || confirming === "unsubscribe"}
+              onClick={() => {
+                if (plan === "none") { setMsg(null); setConfirming("unsubscribe"); return; }
+                savePlan();
+              }}
+            >
+              {busy === "plan" ? "保存中…" : plan === "none" ? "退订…" : "保存套餐"}
+            </Button>
+          </div>
+
+          {confirming === "unsubscribe" && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+              <span className="text-sm text-muted-foreground">
+                保存 none 会立即清空「{user.email}」的套餐和全部额度（时段 / 周 / 总额度），与「取消会员」等效。
+              </span>
+              <Button
+                variant="outline" size="sm" disabled={busy !== ""}
+                className="border-destructive/40 text-destructive hover:bg-destructive/10"
+                onClick={savePlan}
+              >
+                {busy === "plan" ? "处理中…" : "确认退订"}
               </Button>
               <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>返回</Button>
-            </>
-          ) : (
+            </div>
+          )}
+
+          <label className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
+            <Checkbox
+              checked={resetQuotas} disabled={plan === "none"}
+              onChange={(e) => setResetQuotas(e.target.checked)}
+            />
+            按新套餐重置时段 / 周 / 总额度（留空则只换标签，额度保持不动）
+          </label>
+          {expiry === "" && plan !== "none" && (
+            <p className="mt-2 text-xs text-muted-foreground">到期时间留空 = 永不过期。</p>
+          )}
+
+          <div className="mt-5 grid gap-3 sm:grid-cols-[minmax(0,10rem)_minmax(0,8rem)_auto] sm:items-end">
+            <div>
+              <Label htmlFor="extend">再加</Label>
+              <Select id="extend" value={extendPlan} onChange={(e) => setExtendPlan(e.target.value)}>
+                {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
+              </Select>
+            </div>
+            <div>
+              <Label htmlFor="days">时长（天）</Label>
+              <Input
+                id="days" type="number" min="1" value={extendDays}
+                onChange={(e) => setExtendDays(e.target.value)}
+              />
+            </div>
+            <Button variant="outline" size="sm" disabled={busy !== "" || extendValue <= 0} onClick={grantPlan}>
+              {busy === "extend" ? "开通中…" : "叠加开通"}
+            </Button>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            叠加走的是和激活码同一条路：到期时间在现有基础上顺延，总额度累加，时段上限取两者较大值，
+            不会把人降级。上面两个输入框会跟着刷新成叠加后的结果。
+          </p>
+        </section>
+        </TabsContent>
+
+        <TabsContent value="account" className="pt-4">
+        <section>
+          <h3 className="text-sm font-semibold">权限与账号</h3>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button
               variant="outline" size="sm" disabled={busy !== "" || isSelf}
-              className="border-destructive/40 text-destructive hover:bg-destructive/10"
-              onClick={() => { setMsg(null); setConfirming("delete"); }}
+              onClick={() =>
+                act(
+                  "role",
+                  () => api.post<WriteResp>(`/api/admin/users/${user.id}/role`, {
+                    role: user.role === "admin" ? "user" : "admin",
+                  }),
+                  user.role === "admin" ? "已取消管理员" : "已设为管理员",
+                )
+              }
             >
-              删除用户
+              {busy === "role" ? "处理中…" : user.role === "admin" ? "取消管理员" : "设为管理员"}
             </Button>
+
+            {confirming === "cancel" ? (
+              <>
+                <span className="text-sm text-muted-foreground">退订会立即清零套餐和全部额度。</span>
+                <Button
+                  variant="outline" size="sm" disabled={busy !== ""}
+                  className="border-destructive/40 text-destructive hover:bg-destructive/10"
+                  onClick={cancelPlan}
+                >
+                  {busy === "cancel" ? "处理中…" : "确认取消会员"}
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>返回</Button>
+              </>
+            ) : (
+              isActive(user) && (
+                <Button
+                  variant="outline" size="sm" disabled={busy !== ""}
+                  className="border-destructive/40 text-destructive hover:bg-destructive/10"
+                  onClick={() => { setMsg(null); setConfirming("cancel"); }}
+                >
+                  取消会员
+                </Button>
+              )
+            )}
+
+            {confirming === "delete" ? (
+              <>
+                <span className="text-sm text-muted-foreground">删除「{user.email}」后不可恢复。</span>
+                <Button
+                  variant="outline" size="sm" disabled={busy !== ""}
+                  className="border-destructive/40 text-destructive hover:bg-destructive/10"
+                  onClick={async () => {
+                    setBusy("delete");
+                    setMsg(null);
+                    try {
+                      await api.del<{ ok?: boolean }>(`/api/admin/users/${user.id}`);
+                      await reload();
+                      onClose();
+                    } catch (e) {
+                      setMsg({ text: e instanceof Error ? e.message : "删除失败", ok: false });
+                      setBusy("");
+                    }
+                  }}
+                >
+                  {busy === "delete" ? "删除中…" : "确认删除"}
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setConfirming(null)}>返回</Button>
+              </>
+            ) : (
+              <Button
+                variant="outline" size="sm" disabled={busy !== "" || isSelf}
+                className="border-destructive/40 text-destructive hover:bg-destructive/10"
+                onClick={() => { setMsg(null); setConfirming("delete"); }}
+              >
+                删除用户
+              </Button>
+            )}
+          </div>
+          {isSelf && (
+            <p className="mt-2 text-xs text-muted-foreground">不能改自己的角色，也不能删自己的号。</p>
           )}
-        </div>
-        {isSelf && (
-          <p className="mt-2 text-xs text-muted-foreground">不能改自己的角色，也不能删自己的号。</p>
-        )}
-      </section>
+        </section>
+        </TabsContent>
+      </Tabs>
     </DialogContent>
   );
 }
