@@ -3911,7 +3911,16 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         // the card never appears. Nothing downstream is broken; it is correctly dropping empty
         // strings. Raw chain-of-thought is never returned on this family regardless; summarized
         // is the only visible form there is.
-        return Some(json!({"type":"adaptive","display":"summarized"}));
+        // NO display field. I added display:"summarized" believing it was required to make
+        // thinking visible on this family — measured against the real upstream, it does the
+        // OPPOSITE. Four probes to changhuai.ai with the same question:
+        //     adaptive + summarized + effort -> thinking 0 chars
+        //     adaptive + summarized          -> thinking 0 chars
+        //     adaptive (bare)                -> thinking 131 chars
+        // The reseller answers "summarized" by returning no thinking at all. Bare adaptive is
+        // what works, and is what this line was before I touched it. Do not re-add display
+        // without re-running that probe against the live route.
+        return Some(json!({"type":"adaptive"}));
     }
     None
 }
@@ -4109,11 +4118,15 @@ fn oai_to_anthropic_with_cache(
         // 是要了思考却没告诉它想多深。
         if t.get("type").and_then(|v| v.as_str()) == Some("adaptive") {
             if let Some(e) = effort.filter(|e| !e.is_empty() && *e != "off") {
+                // Cap at "high". The max_tokens floor above already documents the contract:
+                // both "high" and "max" send effort="high", and "max" is made deeper by MORE
+                // ROOM (64k vs 40k), not by a bigger effort word. Passing "xhigh"/"max" through
+                // literally is not safe here — this route is a reseller, not Anthropic direct,
+                // and an effort value it does not accept comes back as an empty completion
+                // rather than a clean 400.
                 let eff = match e {
-                    "xhigh" => "xhigh",
-                    "max" => "max",
                     "low" => "low",
-                    "high" => "high",
+                    "high" | "xhigh" | "max" => "high",
                     _ => "medium",
                 };
                 out.insert("output_config".into(), json!({ "effort": eff }));
@@ -7384,13 +7397,14 @@ mod billing_tests {
     /// 4.6 showed thinking and 4.7 did not: the two families take different branches whose
     /// `display` defaults differ, and `display` was never set anywhere in the stack.
     #[test]
-    fn adaptive_thinking_must_ask_for_summarized_display() {
+    fn adaptive_thinking_must_not_send_display() {
         for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
             let t = anthropic_thinking(model, Some("high")).expect("thinking must be requested");
             assert_eq!(t["type"], "adaptive", "{model} must use adaptive");
-            assert_eq!(
-                t["display"], "summarized",
-                "{model}: without display=summarized the thinking streams back empty"
+            assert!(
+                t.get("display").is_none(),
+                "{model}: display must NOT be sent — measured against the live upstream, \
+                 display=summarized returns ZERO thinking while bare adaptive returns it"
             );
         }
         // 4.6 takes the older explicit-budget branch, whose display default is already
@@ -7412,7 +7426,7 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let a = oai_to_anthropic(&body).unwrap();
-        assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         // The adaptive family REJECTS budget_tokens, so effort is its only depth control —
         // omitting it left the model with no depth signal at all, which is exactly what
         // "the thinking has no substance" looked like. The old "never send effort" rule still
@@ -7437,7 +7451,7 @@ mod billing_tests {
                 &json!({"model":"claude-fable-5","reasoning_effort":"medium","messages":[]})
             )
             .unwrap()["thinking"],
-            json!({"type":"adaptive","display":"summarized"})
+            json!({"type":"adaptive"})
         );
 
         // No reasoning_effort (user chose "off" → IDE drops the field) → NO thinking.
@@ -7464,12 +7478,12 @@ mod billing_tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert_eq!(a["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert_eq!(a["thinking"], json!({"type":"adaptive"}));
         assert!(a["max_tokens"].as_i64().unwrap() >= 32000);
         // 4.8 is the adaptive family: the client's legacy enabled+budget shape is normalized to
         // adaptive above, so effort must ride along as the depth knob. (The "never send effort"
         // rule applies only to models that genuinely stay on enabled+budget, i.e. 3.7 / 4.6.)
-        assert_eq!(a["output_config"], json!({"effort":"max"}), "normalized adaptive keeps its depth knob");
+        assert_eq!(a["output_config"], json!({"effort":"high"}), "max maps to high; depth comes from max_tokens headroom");
 
         // Sonnet 5: adaptive as well — enabled+budget_tokens is rejected outright.
         let s5 = oai_to_anthropic(&json!({
@@ -7479,7 +7493,7 @@ mod billing_tests {
             "messages": []
         }))
         .unwrap();
-        assert_eq!(s5["thinking"], json!({"type":"adaptive","display":"summarized"}));
+        assert_eq!(s5["thinking"], json!({"type":"adaptive"}));
 
         // Claude 3.7: explicit budget is correct (gateway generates it, not client).
         let b = oai_to_anthropic(&json!({
@@ -7515,15 +7529,15 @@ mod billing_tests {
         // (gateway logs, 2026-08-01, claude-sonnet-5 → 400 on every attempt).
         assert_eq!(
             anthropic_thinking("claude-opus-4-8", Some("medium")),
-            Some(json!({"type":"adaptive","display":"summarized"}))
+            Some(json!({"type":"adaptive"}))
         );
         assert_eq!(
             anthropic_thinking("claude-sonnet-5", Some("high")),
-            Some(json!({"type":"adaptive","display":"summarized"}))
+            Some(json!({"type":"adaptive"}))
         );
         assert_eq!(
             anthropic_thinking("claude-fable-5", Some("low")),
-            Some(json!({"type":"adaptive","display":"summarized"}))
+            Some(json!({"type":"adaptive"}))
         );
         // 4.6 still accepts the explicit budget (deprecated but functional there) — it is
         // the one branch the old aggregator workaround is still valid for.
