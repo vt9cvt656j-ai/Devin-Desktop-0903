@@ -30747,7 +30747,33 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   try { _perfPhase("trimMessages"); } catch {}
   // michael-compression 依赖逐字稳定的前缀。网关开启时，本地不再改写同一份 Agent
   // transcript；请求体和模型窗口由 mc_prefix + 服务端分段负责。
-  if (_gatewayHandlesCompression()) return;
+  //
+  // BUT the image payload guard still has to run. This early return used to skip the whole
+  // function, so selecting a 1M/2M/5M tier silently removed the only client-side ceiling on
+  // request size — nothing trimmed, nothing capped, and the app froze serialising an unbounded
+  // transcript. (A comment further up this file claimed "PAYLOAD_CAP 照常生效" with a tier
+  // active; it did not.) Only oversized IMAGES are stripped, oldest first, so text history stays
+  // byte-stable for the prefix in the normal case; if it does fire it has changed the transcript,
+  // so the prefix is invalidated with it.
+  if (_gatewayHandlesCompression()) {
+    let bytes = 0;
+    for (const m of messages) bytes += _msgSize(m);
+    if (bytes > 10_000_000) {
+      let stripped = false;
+      for (let i = 0; i < messages.length && bytes > 10_000_000; i++) {
+        const m = messages[i];
+        if (m.role === "user" && Array.isArray(m.content) && m.content.some((p) => p && p.type === "image_url")) {
+          const before = _msgSize(m);
+          const txt = m.content.filter((p) => p && p.type === "text").map((p) => p.text).join("\n");
+          messages[i] = { ...m, content: (txt || "(截图)") + "\n（这张截图过大，已从本次请求中移除以避免超限；需要时请重新粘贴）" };
+          bytes -= before - _msgSize(messages[i]);
+          stripped = true;
+        }
+      }
+      if (stripped) { try { _mcPrefixInvalidate(); } catch {} }
+    }
+    return;
+  }
   // 同上：裁剪掉消息之后，前缀覆盖的条数不再对应真实历史。
   try { _mcPrefixInvalidate(); } catch {}
   // ── RATCHET compression（棘轮式，只进不摆）──────────────────────────────────
