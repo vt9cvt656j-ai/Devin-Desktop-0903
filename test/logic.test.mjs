@@ -11179,34 +11179,31 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
-test("付费档位不得低于模型原生窗口，也不得把 no-op 当升级卖", () => {
-  const opts = load("_ctxChoiceOptions", {
-    _modelContextLimit: () => 1_000_000,          // 1M 原生（Opus 4.7/5、Sonnet 5、Fable）
+test("档位是叠加在原生之上的，任何模型上都不会变成 no-op", () => {
+  const mk = (native) => load("_ctxChoiceOptions", {
+    _modelContextLimit: () => native,
     _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
     _gatewayHandlesCompression: () => true,
     _tokenShort: (n) => String(n),
     _modelCatalogEntry: () => null,
     _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
-  })("claude-opus-4-7");
-  const tiers = opts.filter((o) => o.kind === "modified");
-  const m1 = tiers.find((t) => t.tier === "1M");
-  const m5 = tiers.find((t) => t.tier === "5M");
-  // 1M 档在 1M 原生模型上一个 token 都不多给——不能显示成可购买的升级
-  assert.equal(m1.redundant, true, "不大于原生窗口的档位必须标成买了也没用");
-  assert.match(m1.lockHint, /不会多给上下文/, "提示必须说清它不会多给上下文");
-  // 真正更大的档位不受影响
-  assert.equal(m5.redundant, false, "5M 在 1M 原生上是真升级，不能被误标");
-  // 原生窗口小的模型上，1M 仍然是真升级
-  const small = load("_ctxChoiceOptions", {
-    _modelContextLimit: () => 200_000,
-    _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
-    _gatewayHandlesCompression: () => true,
-    _tokenShort: (n) => String(n),
-    _modelCatalogEntry: () => null,
-    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
-  })("claude-sonnet-4-5");
-  assert.equal(small.find((t) => t.tier === "1M").redundant, false,
-    "200K 原生上 1M 是真升级");
+  })("m");
+  // 1M 原生：1M 档 = 原生 + 1M = 2M。绝对值语义下这里是 1M，等于白买。
+  const big = mk(1_000_000).filter((o) => o.kind === "modified");
+  assert.equal(big.find((t) => t.tier === "1M").value, 2_000_000, "1M 档在 1M 原生上必须给到 2M");
+  assert.equal(big.find((t) => t.tier === "5M").value, 6_000_000);
+  // 200K 原生：同一档位仍然是 +1M
+  const small = mk(200_000).filter((o) => o.kind === "modified");
+  assert.equal(small.find((t) => t.tier === "1M").value, 1_200_000, "小窗口上 1M 档也是 +1M");
+  // 每个档位在任何原生窗口下都必须严格大于原生——不存在“买了不多给”的档位
+  for (const native of [128_000, 200_000, 400_000, 1_000_000, 2_000_000]) {
+    for (const t of mk(native).filter((o) => o.kind === "modified")) {
+      assert.ok(t.value > native,
+        `原生 ${native} 上 ${t.tier} 档必须严格更大，否则就是把 no-op 当升级卖`);
+    }
+  }
+  // 提示里要把加法讲清楚
+  assert.match(big.find((t) => t.tier === "2M").lockHint, /原生 .* \+ 本档 2M = 实际 3000000/);
 });
 
 test("前缀续传的校验必须认得网关真正签发的 token", () => {
