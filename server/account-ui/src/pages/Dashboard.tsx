@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -161,28 +161,46 @@ function ProfileCard({
   return (
     <Card className="bg-muted p-6">
       <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
-        <div className="flex shrink-0 flex-col items-center gap-2.5">
-          <Avatar className="size-20">
-            {avatar ? <AvatarImage src={avatar} alt="" /> : null}
-            <AvatarFallback className="bg-primary text-xl font-semibold text-primary-foreground">
-              {initial}
-            </AvatarFallback>
-          </Avatar>
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={busy}
-              onClick={() => fileRef.current?.click()}
-            >
+        {/*
+          * The picture is the control. A separate "Change" button beside it left two
+          * buttons sitting at different heights against a column of inputs, and made
+          * the obvious target — the picture itself — inert. Clicking it opens the file
+          * dialog; hovering (or tabbing to it) says so.
+          */}
+        <div className="flex shrink-0 flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={busy}
+            aria-label={t.changePicture}
+            className="group relative size-20 rounded-full outline-none ring-offset-background transition-opacity focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-60"
+          >
+            <Avatar className="size-20">
+              {avatar ? <AvatarImage src={avatar} alt="" /> : null}
+              <AvatarFallback className="bg-primary text-xl font-semibold text-primary-foreground">
+                {initial}
+              </AvatarFallback>
+            </Avatar>
+            {/* Fixed black-and-white, not theme tokens. The fallback avatar is already
+                `bg-primary` — near black — so a `foreground/60` scrim over it was black
+                on black and the label all but vanished. This has to stay legible over a
+                dark fallback, a light photo and a dark one alike. */}
+            <span className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1 rounded-full bg-black/70 text-[10px] font-semibold uppercase tracking-wider text-white opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-visible:opacity-100">
+              <Camera className="size-4" />
               {t.changePicture}
+            </span>
+          </button>
+          {avatar ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs text-muted-foreground"
+              disabled={busy}
+              onClick={() => void remove()}
+            >
+              {t.removePicture}
             </Button>
-            {avatar ? (
-              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void remove()}>
-                {t.removePicture}
-              </Button>
-            ) : null}
-          </div>
+          ) : null}
           <input
             ref={fileRef}
             type="file"

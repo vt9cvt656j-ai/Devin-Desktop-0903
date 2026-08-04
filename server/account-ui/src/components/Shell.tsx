@@ -49,7 +49,19 @@ export function Shell({
 
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
-      <aside className="flex w-full flex-none flex-col gap-1.5 border-b border-border p-3.5 md:w-[264px] md:border-b-0 md:border-r">
+      {/*
+       * Pinned on desktop: `sticky top-0` + `h-screen` makes the column exactly one
+       * viewport tall and holds it there while the page scrolls.
+       *
+       * Without those two the aside is simply the left half of a flex row, so it grows
+       * to the height of whatever is beside it. The account block then sits at the
+       * bottom of a 2000px *page* rather than the bottom of the *screen* — invisible
+       * until you scroll, and sliding away as you do. `mt-auto` was already asking for
+       * the bottom; it just had no fixed bottom to be pushed to.
+       *
+       * Stacked above the content on mobile, where a pinned column would eat the screen.
+       */}
+      <aside className="flex w-full flex-none flex-col gap-1.5 border-b border-border p-3.5 md:sticky md:top-0 md:h-screen md:w-[264px] md:border-b-0 md:border-r">
         <a
           href="/app/"
           className="mb-3 flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
@@ -58,7 +70,9 @@ export function Shell({
           {t.openEditor}
         </a>
 
-        <nav className="flex flex-col gap-0.5">
+        {/* Takes the slack so the account block below is pushed to the bottom edge, and
+            scrolls on its own if the entries ever outgrow a short window. */}
+        <nav className="flex flex-col gap-0.5 md:min-h-0 md:flex-1 md:overflow-y-auto">
           {NAV.map((item, i) => {
             if ("separator" in item) return <div key={`sep-${i}`} className="h-3.5" />;
             const Icon = item.icon;
@@ -80,7 +94,7 @@ export function Shell({
           })}
         </nav>
 
-        <div className="mt-auto flex flex-col gap-2.5 pt-3">
+        <div className="mt-auto flex flex-none flex-col gap-2.5 border-t border-border/60 pt-3">
           {footer}
           <div className="flex items-center gap-2.5 px-1 py-1.5">
             <Avatar className="size-8">
