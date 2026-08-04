@@ -2895,10 +2895,15 @@ test("runtime tool schemas reject missing required parameters for native and tex
 });
 
 test("tool cards always have a label and skipped paths settle their spinner", () => {
-  const label = load("_toolStepActionLabel");
+  // 未翻译的类型（t 原样返回 key）必须回落到字面量表，标签不能空。
+  const label = load("_toolStepActionLabel", { t: (key) => key });
   for (const type of ["read", "search_tools", "vizcompare", "db", "capture_replay", "unknown", "future_tool_type"]) {
     assert.ok(label({ type, _toolName: type === "future_tool_type" ? "future_real_tool" : "" }).trim(), `${type} needs a visible label`);
   }
+  // 有翻译时以 i18n 为准，字面量表只是兜底。
+  const translated = load("_toolStepActionLabel", { t: (key) => key === "tool.action.read" ? "Read" : key });
+  assert.equal(translated({ type: "read" }), "Read");
+  assert.equal(translated({ type: "write" }), "写入");
 
   let textContent = "";
   const classes = new Set();
@@ -11174,6 +11179,47 @@ test("Michael Design 技术栈只有一个权威定义，且和真实上线站�
     "web_scaffold 默认必须是 react——默认 vue 会让模型照着 React 提示却拿到 Vue 项目");
 });
 
+test("付费档位不得低于模型原生窗口，也不得把 no-op 当升级卖", () => {
+  const opts = load("_ctxChoiceOptions", {
+    _modelContextLimit: () => 1_000_000,          // 1M 原生（Opus 4.7/5、Sonnet 5、Fable）
+    _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
+    _gatewayHandlesCompression: () => true,
+    _tokenShort: (n) => String(n),
+    _modelCatalogEntry: () => null,
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+  })("claude-opus-4-7");
+  const tiers = opts.filter((o) => o.kind === "modified");
+  const m1 = tiers.find((t) => t.tier === "1M");
+  const m5 = tiers.find((t) => t.tier === "5M");
+  // 1M 档在 1M 原生模型上一个 token 都不多给——不能显示成可购买的升级
+  assert.equal(m1.redundant, true, "不大于原生窗口的档位必须标成买了也没用");
+  assert.match(m1.lockHint, /不会多给上下文/, "提示必须说清它不会多给上下文");
+  // 真正更大的档位不受影响
+  assert.equal(m5.redundant, false, "5M 在 1M 原生上是真升级，不能被误标");
+  // 原生窗口小的模型上，1M 仍然是真升级
+  const small = load("_ctxChoiceOptions", {
+    _modelContextLimit: () => 200_000,
+    _michaelUser: { michael_compression: { max_input_tokens: 5_000_000 } },
+    _gatewayHandlesCompression: () => true,
+    _tokenShort: (n) => String(n),
+    _modelCatalogEntry: () => null,
+    _MC_TIER_OPTIONS: [["1M", 1_000_000], ["2M", 2_000_000], ["5M", 5_000_000]],
+  })("claude-sonnet-4-5");
+  assert.equal(small.find((t) => t.tier === "1M").redundant, false,
+    "200K 原生上 1M 是真升级");
+});
+
+test("前缀续传的校验必须认得网关真正签发的 token", () => {
+  // 旧的纯 hex 正则拒绝了每一个真实 token（真实格式是 mcp_+hex），于是客户端从不保存前缀、
+  // 每轮重传整份历史、撞上 3.5MB 上限——2M/5M 档位在桌面端物理上无法达到。
+  const realToken = "mcp_" + "a1b2c3d4e5f60718".repeat(2);
+  assert.ok(/^mcp_[a-f0-9]{16,80}$/i.test(realToken), "真实 token 必须通过");
+  assert.ok(!/^[a-f0-9]+$/i.test(realToken), "旧正则确实会拒绝真实 token（这就是当初的 bug）");
+  const gate = SRC.slice(SRC.indexOf("x-michael-compression-covered"), SRC.indexOf("x-michael-compression-covered") + 1200);
+  assert.match(gate, /\^mcp_\[a-f0-9\]\{16,80\}\$/, "校验点必须用真实 token 的格式");
+  assert.doesNotMatch(gate, /\/\^\[a-f0-9\]\+\$\/i\.test\(trimmedPrefix\)/, "旧的纯 hex 正则必须消失");
+});
+
 test("上下文窗口：真实值来自网关，两张兜底表不得各说各话", () => {
   // 真实来源是网关 /api/models 的 context_window（server/src/models.rs official_context），
   // 客户端 _catalogModelContextLimit 优先读它。客户端那张正则表只服务第三方直连，
@@ -12094,7 +12140,10 @@ test("substantial worker tasks process parent plans first and count only real wr
   assert.match(extractFn("_callCanBypassPlanGate"), /call\.type === "askuser" \|\| call\.type === "plan"/);
   assert.doesNotMatch(SRC, /run\._planQualityNudged = true;/);
   const subagentSrc = SRC.slice(SRC.indexOf("async function _runSubAgent"), SRC.indexOf("function _verificationCommandsForStack"));
-  assert.match(subagentSrc, /0 步 · 未执行/);
+  // 空跑的子智能体仍要留下可见结论；文案已进 i18n（zh 值不变，en 才是新增的）。
+  assert.match(subagentSrc, /res\.textContent = t\("subagent\.noSteps"\)/);
+  assert.match(I18N, /"subagent\.noSteps": "0 步 · 未执行"/);
+  assert.match(I18N, /"subagent\.noSteps": "0 steps · did not run"/);
   assert.doesNotMatch(subagentSrc, /toolCount === 0[\s\S]{0,120}card\.remove\(/);
   assert.match(subagentSrc, /rejectedStep = _createToolStep\(rejectedCall\)/,
     "unknown and disallowed child tools must remain visible");
@@ -14978,27 +15027,27 @@ test("P2.1-await_subagent：等待作业落定取回结果；无作业/无运行
   assert.ok(end > bodyStart, "分支必须紧邻 openapi_parser 之前");
   const body = SRC.slice(bodyStart, end);
   const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: load("_hasErrorLine") });
-  const exec = new Function("call", "run", "res", "_clipPreservingErrors", `return (async () => { ${body} })();`);
+  const exec = new Function("call", "run", "res", "_clipPreservingErrors", "t", `return (async () => { ${body} })();`);
   const res = {};
   // 1) 无台账 → 无作业提示
-  const r1 = await exec({ type: "awaitsubagent", job: "all" }, {}, res, clip);
+  const r1 = await exec({ type: "awaitsubagent", job: "all" }, {}, res, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r1.content, /\[无子智能体作业\]/);
   // 2) 等待运行中作业：promise 落定后取回结果并标 consumed
   const job = { id: 1, desc: "调研A", status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null };
   job.promise = new Promise((resolve) => setTimeout(() => { job.status = "done"; job.result = "深度报告内容"; resolve(job.result); }, 10));
   const run = { _subAgentJobs: new Map([[1, job]]) };
-  const r2 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip);
+  const r2 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r2.content, /\[job#1 完成·调研A\] 深度报告内容/);
   assert.equal(job.consumed, true, "取回后标 consumed，自动交付不再重复送");
   // 3) 无运行中作业 → 台账现状摘要
-  const r3 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip);
+  const r3 = await exec({ type: "awaitsubagent", job: "all" }, run, res, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r3.content, /\[作业台账现状\]/);
   assert.match(r3.content, /job#1·调研A·done·已消化/);
   // 4) 指定作业号：已落定的直接取回；不存在的报未找到
   job.consumed = false;
-  const r4 = await exec({ type: "awaitsubagent", job: "1" }, run, res, clip);
+  const r4 = await exec({ type: "awaitsubagent", job: "1" }, run, res, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r4.content, /\[job#1 完成·调研A\]/);
-  const r5 = await exec({ type: "awaitsubagent", job: "9" }, run, res, clip);
+  const r5 = await exec({ type: "awaitsubagent", job: "9" }, run, res, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r5.content, /未找到 job#9/);
   // 5) 等待受剩余 5min 总超时保护（Promise.race 外层护栏）
   assert.match(body, /5 \* 60 \* 1000/);
@@ -15053,7 +15102,7 @@ test("#49-1 傻等事实检测：派发后零其他工具就 await → 结果前
   const end = SRC.indexOf('} else if (call.type === "openapi_parser")', start);
   const body = SRC.slice(bodyStart, end);
   const clip = load("_clipPreservingErrors", { _headTailModelText: load("_headTailModelText"), _hasErrorLine: load("_hasErrorLine") });
-  const exec = new Function("call", "run", "res", "_clipPreservingErrors", `return (async () => { ${body} })();`);
+  const exec = new Function("call", "run", "res", "_clipPreservingErrors", "t", `return (async () => { ${body} })();`);
   const mkJob = () => {
     const j = { id: 1, desc: "调研A", status: "running", startedAt: Date.now(), result: "", consumed: false, promise: null, dispatchLedgerLen: 1 };
     j.promise = new Promise((resolve) => setTimeout(() => { j.status = "done"; j.result = "报告"; resolve(j.result); }, 10));
@@ -15062,7 +15111,7 @@ test("#49-1 傻等事实检测：派发后零其他工具就 await → 结果前
   // 1) 派发以来账本新增只有 run_subagent/await_subagent 自身 → 傻等，结果开头附事实（不拦截等待）
   const idle = mkJob();
   const runIdle = { _subAgentJobs: new Map([[1, idle]]), _toolLedger: { entries: [{ tool: "read_file" }, { tool: "run_subagent" }, { tool: "await_subagent" }], turnIndex: 0 } };
-  const r1 = await exec({ type: "awaitsubagent", job: "all" }, runIdle, {}, clip);
+  const r1 = await exec({ type: "awaitsubagent", job: "all" }, runIdle, {}, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.match(r1.content, /^\[事实\] 派发后未做任何其他工作就开始等待 = 同步阻塞/);
   assert.match(r1.content, /单个聚焦调研直接自己读；派了后台作业就先推进其他步骤/);
   assert.match(r1.content, /\[job#1 完成·调研A\] 报告/, "事实只前置，等待照常执行取回结果");
@@ -15070,11 +15119,11 @@ test("#49-1 傻等事实检测：派发后零其他工具就 await → 结果前
   // 2) 派发后干过别的活（read_file）→ 不触发
   const busy = mkJob();
   const runBusy = { _subAgentJobs: new Map([[1, busy]]), _toolLedger: { entries: [{ tool: "run_subagent" }, { tool: "read_file" }], turnIndex: 0 } };
-  const r2 = await exec({ type: "awaitsubagent", job: "all" }, runBusy, {}, clip);
+  const r2 = await exec({ type: "awaitsubagent", job: "all" }, runBusy, {}, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.doesNotMatch(r2.content, /\[事实\]/, "派发后干过活不得误报");
   // 3) 无 dispatchLedgerLen 的存量作业（#45 旧结构）不误报；无 _toolLedger 的 run 安全穿过
   const legacy = mkJob(); delete legacy.dispatchLedgerLen;
-  const r3 = await exec({ type: "awaitsubagent", job: "all" }, { _subAgentJobs: new Map([[1, legacy]]) }, {}, clip);
+  const r3 = await exec({ type: "awaitsubagent", job: "all" }, { _subAgentJobs: new Map([[1, legacy]]) }, {}, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.doesNotMatch(r3.content, /\[事实\]/, "存量作业/无账本不误报");
   // 4) 派发路径必须落盘傻等检测锚点；#45 作业结构钉死字段不回退
   const loopSrc = SRC.slice(SRC.indexOf("const runSubagentItem = async (it)"), SRC.indexOf("const executeScheduledItem"));
@@ -15554,7 +15603,9 @@ test("#56-2 单点派发前置判断：一次性事实提示不硬拦，与 #49 
   const spawnAt = SRC.indexOf('const _asyncSpawnNames = new Set(["run_subagent"');
   assert.ok(gateAt > 0 && ledgerAt > 0 && spawnAt > 0);
   assert.ok(gateAt < ledgerAt && ledgerAt < spawnAt, "前置判断必须在 _parallelDispatches 记账与异步派发之前");
-  assert.match(SRC, /_settleToolStep\(it\.step, it\.rawResult, "单点任务 · 未派发"\)/);
+  // 文案已进 i18n（zh 值不变，en 为新增）
+  assert.match(SRC, /_settleToolStep\(it\.step, it\.rawResult, t\("subagent\.singleTaskNotDispatched"\)\)/);
+  assert.match(I18N, /"subagent\.singleTaskNotDispatched": "单点任务 · 未派发"/);
   // #49 傻等事后兜底原样保留（事前提示 + 事后兜底各一次，不重复轰炸）
   assert.match(SRC, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\)/);
   assert.match(SRC, /⚠️ 不要立即 await/);

@@ -1813,3 +1813,30 @@ mod window_scaling_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod entitlement_tests {
+    use super::*;
+
+    /// Paying for context must never buy a SMALLER ceiling than not paying. On a 1M-native model
+    /// the M1 cap equalled native, so a subscriber hit a hard 413 at exactly the point a free
+    /// user was still fine — the tier was a downgrade.
+    #[test]
+    fn tier_cap_is_never_below_the_models_own_window() {
+        for (tier, native) in [
+            (Tier::M1, 1_000_000usize),   // the broken case: cap == native
+            (Tier::M1, 2_000_000),        // native beyond the tier entirely
+            (Tier::M2, 1_000_000),
+            (Tier::M5, 1_000_000),
+            (Tier::M1, 200_000),          // small native: tier is a genuine upgrade
+        ] {
+            let effective = tier.max_input_tokens().max(native);
+            assert!(effective >= native,
+                "{:?} on a {native}-token model must not cap below native", tier);
+            assert!(effective >= tier.max_input_tokens(),
+                "{:?} must still deliver at least what it advertises", tier);
+        }
+        assert_eq!(Tier::M1.max_input_tokens().max(1_000_000), 1_000_000);
+        assert_eq!(Tier::M5.max_input_tokens().max(1_000_000), 5_000_000);
+    }
+}

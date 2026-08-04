@@ -9786,13 +9786,18 @@ async fn apply_michael_compression(
     }
 
     let total_raw = carried.raw_tokens + plan.raw_tokens;
-    if total_raw > tier.max_input_tokens() {
+    // The cap is the tier OR the model's own window, whichever is larger. A tier is a promise of
+    // MORE room, never less: on a 1M-native model the M1 cap (1M) equalled native, so a paying
+    // subscriber hit a hard 413 at exactly the point a free user was still fine. Paying for
+    // context must never buy a smaller ceiling than not paying.
+    let effective_cap = tier.max_input_tokens().max(native);
+    if total_raw > effective_cap {
         return Err(AppError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             msg: format!(
                 "michael-compression: {} 档最多接受 {} token，当前累计约 {} token",
                 tier.as_str(),
-                tier.max_input_tokens(),
+                effective_cap,
                 total_raw
             ),
         });
@@ -10004,8 +10009,25 @@ async fn apply_michael_compression(
         },
     )
     .await?;
+    // Retrieval is a NICE-TO-HAVE and it is measured AFTER JSON escaping inflates it (observed up
+    // to ~1.8x the budget it was selected against). If it no longer fits, drop it and send the
+    // message. Dropping costs some recalled detail; failing costs the user the message entirely —
+    // and because selection is deterministic, the retry fails identically forever, so the request
+    // was wedged in "warming" permanently. Not trimmed, because the text is escaped JSON and
+    // cutting it mid-string would hand the model malformed context.
+    let retrieved = if base_projected.saturating_add(retrieved.tokens) > budget {
+        tracing::warn!(
+            base_projected, retrieval_tokens = retrieved.tokens, budget,
+            "michael-compression: retrieval overshot the budget after escaping; sending without it"
+        );
+        RetrievedCompressionHistory { text: None, tokens: 0, segment_count: 0, excerpt_count: 0 }
+    } else {
+        retrieved
+    };
     let projected = base_projected.saturating_add(retrieved.tokens);
     if projected > budget {
+        // Only the mandatory part alone still overflows — retrieval cannot rescue that, and it
+        // is genuinely a warming condition rather than an accounting artifact.
         return Err(AppError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             msg: "michael-compression warming: 精确历史回注仍在重新规划窗口".into(),
