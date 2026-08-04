@@ -19,6 +19,14 @@ pub struct User {
     #[serde(skip)]
     pub password_hash: String,
     pub role: String,
+    /// US order: given name first, family name second. Empty when never set.
+    /// `avatar` is deliberately NOT a field here — this struct is also what
+    /// `/api/admin/users` returns for up to 500 rows, and an inline image on each
+    /// would turn that response into megabytes. `me` fetches it separately.
+    #[serde(default)]
+    pub first_name: String,
+    #[serde(default)]
+    pub last_name: String,
     pub plan: String,
     pub plan_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub credits_cents: i64,
@@ -632,7 +640,7 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
          WHERE id = $1 RETURNING free_points",
     )
     .bind(id)
-    .bind(crate::models::FREE_MILLI_POINTS_DAILY)
+    .bind(crate::models::free_milli_points_daily())
     .fetch_optional(&state.db)
     .await
     .ok()
@@ -649,8 +657,24 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
         );
         obj.insert(
             "free_points_daily".into(),
-            json!(crate::models::FREE_POINTS_DAILY),
+            json!(crate::models::free_points_daily()),
         );
+        // 面值分母随资料一起下发。客户端与两个管理页原先各自硬编码 663，其中三处还在
+        // 写路径上（管理员输入的美元由前端乘 663 变成存库的真实分），改一处不改其余就会
+        // "发出去多少"和"显示多少"对不上。现在只有服务端有这个数。
+        obj.insert(
+            "raw_cents_per_credit_usd".into(),
+            json!(crate::settings::raw_cents_per_credit_usd()),
+        );
+        // Fetched on its own rather than as a `User` field: see the note on the struct.
+        let avatar: Option<String> = sqlx::query_scalar("SELECT avatar FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        obj.insert("avatar".into(), json!(avatar));
         obj.insert(
             "michael_compression".into(),
             match tier {
@@ -660,6 +684,109 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
         );
     }
     Ok(Json(body))
+}
+
+/// Longest name half accepted. Generous for a legal name, short enough that the column
+/// can never be used as free storage.
+const NAME_MAX_CHARS: usize = 64;
+/// Longest `data:` URL accepted, in characters. The browser resizes to a 256px square
+/// before upload (~30 KB), so this is roughly seven times what an honest client sends —
+/// enough headroom for an odd encoder, far short of letting the column hold a file.
+const AVATAR_MAX_CHARS: usize = 300_000;
+
+/// Names are free text, but not *anything*: control characters would let a display name
+/// break out of the line it is rendered on, and leading or trailing space is invisible
+/// yet compares unequal.
+fn clean_name(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad("姓名不能包含控制字符"));
+    }
+    if trimmed.chars().count() > NAME_MAX_CHARS {
+        return Err(AppError::bad(format!("姓名最长 {NAME_MAX_CHARS} 个字符")));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Only these three encodings, and only as a self-contained `data:` URL. An `http(s)`
+/// URL would turn every profile render into a request to a third party chosen by the
+/// account holder — an SSRF-shaped hole on the server and a tracking pixel on the client.
+fn clean_avatar(raw: &str) -> Result<Option<String>, AppError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None); // an explicit clear
+    }
+    if value.len() > AVATAR_MAX_CHARS {
+        return Err(AppError::bad("头像过大，请换一张图片"));
+    }
+    const ALLOWED: [&str; 3] = [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+    ];
+    let Some(prefix) = ALLOWED.iter().find(|p| value.starts_with(**p)) else {
+        return Err(AppError::bad("头像格式不支持"));
+    };
+    // Reject anything that is not actually base64 after the comma, so the column cannot
+    // be loaded with a payload that only *looks* like an image to this check.
+    let payload = &value[prefix.len()..];
+    if payload.is_empty()
+        || !payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return Err(AppError::bad("头像数据无效"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+#[derive(Deserialize)]
+pub struct ProfileReq {
+    /// Absent leaves the stored value alone; present replaces it. That distinction is
+    /// what lets the picture be saved without resending the names and vice versa.
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    /// A `data:` URL, or "" to remove the current picture.
+    pub avatar: Option<String>,
+}
+
+/// `POST /api/me/profile` — the account holder edits their own display name and picture.
+///
+/// Scoped to the caller's own row by the token: there is no id in the path and none is
+/// accepted from the body, so this endpoint cannot be aimed at another account.
+pub async fn update_profile(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<ProfileReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
+
+    let first = req.first_name.as_deref().map(clean_name).transpose()?;
+    let last = req.last_name.as_deref().map(clean_name).transpose()?;
+    // Flattened deliberately: "not sent" and "sent an explicit clear" both collapse to
+    // None here, and the boolean bound to $4 below is what tells them apart.
+    let avatar: Option<String> = req.avatar.as_deref().map(clean_avatar).transpose()?.flatten();
+
+    // COALESCE keeps the stored value when the client sent no opinion. The avatar needs
+    // the extra flag because "sent nothing" and "sent an explicit clear" both arrive as
+    // a SQL NULL and mean opposite things.
+    sqlx::query(
+        "UPDATE users SET \
+           first_name = COALESCE($2, first_name), \
+           last_name  = COALESCE($3, last_name), \
+           avatar     = CASE WHEN $4 THEN $5 ELSE avatar END, \
+           updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(first.as_deref())
+    .bind(last.as_deref())
+    .bind(req.avatar.is_some())
+    .bind(avatar.as_deref())
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn admin_users(

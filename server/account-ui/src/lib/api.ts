@@ -10,6 +10,11 @@ export type Me = {
   id: string;
   email: string;
   role: string;
+  /** US order — given name, then family name. "" when never set. */
+  first_name: string;
+  last_name: string;
+  /** A `data:` URL the account holder uploaded, or null. */
+  avatar: string | null;
   plan: string;
   plan_expires_at: string | null;
   credits_cents: number;
@@ -116,6 +121,12 @@ export const api = {
       method: "POST",
       body: quantity ? { lookup_key, quantity } : { lookup_key },
     }),
+  /**
+   * Partial update: only the keys present are written, so the picture can be changed
+   * without resending the names. `avatar: ""` clears it; omitting it leaves it alone.
+   */
+  updateProfile: (body: { first_name?: string; last_name?: string; avatar?: string }) =>
+    request<{ ok: boolean }>("/api/me/profile", { method: "POST", body }),
   redeem: (code: string) => request<unknown>("/api/redeem", { method: "POST", body: { code } }),
   models: () => request<unknown[]>("/api/models"),
 };

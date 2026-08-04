@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
   Table,
@@ -32,6 +35,8 @@ import {
   usd,
 } from "@/lib/format";
 import { DICTS, type Currency, type Lang } from "@/lib/i18n";
+import { ACCEPTED, AvatarError, fileToAvatarDataUrl } from "@/lib/avatar";
+import { cn } from "@/lib/utils";
 
 /*
  * The release repo is private, so github.com/.../releases/latest 404s for every signed-in
@@ -67,6 +72,172 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
       </div>
       <Separator className="last:hidden" />
     </>
+  );
+}
+
+/**
+ * Name and picture, edited in place.
+ *
+ * The picture saves the moment one is chosen rather than waiting for the button: a
+ * preview that is not yet stored is a trap, because the obvious next move after seeing
+ * your face appear is to navigate away. The name fields do wait for Save — text is
+ * edited character by character and saving each keystroke would be absurd.
+ */
+function ProfileCard({
+  me,
+  lang,
+  onSaved,
+}: {
+  me: Me;
+  lang: Lang;
+  onSaved: () => void;
+}) {
+  const t = DICTS[lang];
+  const [first, setFirst] = useState(me.first_name ?? "");
+  const [last, setLast] = useState(me.last_name ?? "");
+  const [avatar, setAvatar] = useState<string | null>(me.avatar ?? null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  const dirty = first !== (me.first_name ?? "") || last !== (me.last_name ?? "");
+
+  async function pick(file: File | undefined) {
+    if (!file) return;
+    setNote(null);
+    try {
+      const dataUrl = await fileToAvatarDataUrl(file);
+      setBusy(true);
+      await api.updateProfile({ avatar: dataUrl });
+      setAvatar(dataUrl);
+      setNote({ text: t.profileSaved, ok: true });
+      onSaved();
+    } catch (e) {
+      const kind = e instanceof AvatarError ? e.message : "";
+      setNote({
+        text: kind === "too-large" ? t.pictureTooLarge : t.pictureUnreadable,
+        ok: false,
+      });
+    } finally {
+      setBusy(false);
+      // Let the same file be chosen again after a failure.
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    setNote(null);
+    try {
+      await api.updateProfile({ avatar: "" });
+      setAvatar(null);
+      setNote({ text: t.profileSaved, ok: true });
+      onSaved();
+    } catch {
+      setNote({ text: t.pictureUnreadable, ok: false });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function save() {
+    setBusy(true);
+    setNote(null);
+    try {
+      await api.updateProfile({ first_name: first.trim(), last_name: last.trim() });
+      setFirst(first.trim());
+      setLast(last.trim());
+      setNote({ text: t.profileSaved, ok: true });
+      onSaved();
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : "…", ok: false });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const initial = (first || me.email || "?").charAt(0).toUpperCase();
+
+  return (
+    <Card className="bg-muted p-6">
+      <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
+        <div className="flex shrink-0 flex-col items-center gap-2.5">
+          <Avatar className="size-20">
+            {avatar ? <AvatarImage src={avatar} alt="" /> : null}
+            <AvatarFallback className="bg-primary text-xl font-semibold text-primary-foreground">
+              {initial}
+            </AvatarFallback>
+          </Avatar>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => fileRef.current?.click()}
+            >
+              {t.changePicture}
+            </Button>
+            {avatar ? (
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void remove()}>
+                {t.removePicture}
+              </Button>
+            ) : null}
+          </div>
+          <input
+            ref={fileRef}
+            type="file"
+            accept={ACCEPTED}
+            className="hidden"
+            onChange={(e) => void pick(e.target.files?.[0])}
+          />
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <p className="mb-4 text-[13.5px] leading-relaxed text-muted-foreground">
+            {t.profileNote} {t.pictureHint}
+          </p>
+          {/* US order: given name first. */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <Label htmlFor="first-name" className="mb-1.5 text-xs text-muted-foreground">
+                {t.firstName}
+              </Label>
+              <Input
+                id="first-name"
+                value={first}
+                autoComplete="given-name"
+                maxLength={64}
+                onChange={(e) => setFirst(e.target.value)}
+              />
+            </div>
+            <div>
+              <Label htmlFor="last-name" className="mb-1.5 text-xs text-muted-foreground">
+                {t.lastName}
+              </Label>
+              <Input
+                id="last-name"
+                value={last}
+                autoComplete="family-name"
+                maxLength={64}
+                onChange={(e) => setLast(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="mt-4 flex items-center gap-3">
+            <Button disabled={busy || !dirty} onClick={() => void save()}>
+              {busy ? t.saving : t.saveProfile}
+            </Button>
+            {note ? (
+              <span
+                className={cn("text-[13px]", note.ok ? "text-success" : "text-destructive")}
+              >
+                {note.text}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -249,6 +420,7 @@ export function Dashboard({
   lang,
   catalog,
   currency,
+  onProfileSaved,
 }: {
   me: Me;
   tab: Tab;
@@ -256,6 +428,8 @@ export function Dashboard({
   /** null when the catalogue could not be loaded; the plan card just omits the price. */
   catalog: Catalog | null;
   currency: Currency;
+  /** Re-reads the profile so the sidebar picks up a new name or picture immediately. */
+  onProfileSaved: () => void;
 }) {
   const t = DICTS[lang];
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -306,6 +480,9 @@ export function Dashboard({
       <div className="max-w-[1080px]">
         <h1 className="text-xl font-semibold tracking-tight">{t.settings}</h1>
         <p className="mb-6 mt-0.5 text-[13.5px] text-muted-foreground">{t.settingsLede}</p>
+
+        <h2 className="mb-3 text-sm font-semibold">{t.profile}</h2>
+        <ProfileCard me={me} lang={lang} onSaved={onProfileSaved} />
 
         <h2 className="mb-3 text-sm font-semibold">{t.account}</h2>
         <Card className="bg-muted px-6 py-1">

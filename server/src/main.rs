@@ -5,6 +5,7 @@ mod codes;
 mod commission;
 mod compression;
 mod config;
+mod console_session;
 mod deploy;
 mod email;
 mod error;
@@ -16,12 +17,14 @@ mod procedural_3d;
 mod prompts;
 mod realtime;
 mod repo_sync;
+mod settings;
 mod skills;
+mod stripe;
 mod update;
 
 use std::sync::Arc;
 
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
@@ -57,6 +60,18 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&db).await?;
     tracing::info!("postgres connected, migrations applied");
 
+    // 运营参数进内存。必须在建路由之前——面值分母在展示路径上是除数，套餐额度在发放
+    // 路径上使用，两者都不能等到第一个请求才有值。读不到会沿用与改造前一致的默认值。
+    settings::load(&db).await;
+    {
+        let s = settings::current();
+        tracing::info!(
+            raw_cents_per_credit_usd = s.raw_cents_per_credit_usd,
+            free_points_daily = s.free_points_daily,
+            "运营参数已装载"
+        );
+    }
+
     let redis_client = redis::Client::open(cfg.redis_url.clone())?;
     let redis = redis::aio::ConnectionManager::new(redis_client.clone()).await?;
     tracing::info!("redis connected");
@@ -75,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = Router::new()
-        .route("/", get(admin_page))
+        .route("/", get(root_redirect))
         .route("/register", get(register_page))
         .route("/api/logo.png", get(logo_png))
         .route("/health", get(|| async { "ok" }))
@@ -86,6 +101,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify-code", post(auth::verify_code))
         .route("/api/me", get(auth::me))
+        // Body limit covers the inline avatar data URL, which the browser has already
+        // resized; the handler caps it far lower still.
+        .route(
+            "/api/me/profile",
+            post(auth::update_profile).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             "/api/skills",
             get(skills::get_skills).put(skills::put_skills),
@@ -122,6 +143,10 @@ async fn main() -> anyhow::Result<()> {
             get(pay::admin_list_prices).post(pay::admin_create_price),
         )
         .route("/api/admin/prices/:id", delete(pay::admin_delete_price))
+        .route("/api/billing/catalog", get(stripe::catalog))
+        .route("/api/billing/checkout", post(stripe::checkout))
+        // Unauthenticated by design: Stripe proves itself with the signature.
+        .route("/api/webhooks/stripe", post(stripe::webhook))
         .route("/api/orders", post(pay::create_order))
         .route("/api/admin/orders", get(pay::admin_list_orders))
         .route(
@@ -151,6 +176,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/channel-rates/:id",
             post(channel_rates::admin_update).delete(channel_rates::admin_delete),
+        )
+        .route(
+            "/api/admin/settings",
+            get(settings::admin_get).post(settings::admin_put),
+        )
+        // 管理后台门禁：nginx 的 auth_request 打 /api/admin/authz，
+        // 登录页拿到管理员 Bearer 后调 /api/admin/session 换 HttpOnly cookie。
+        .route("/api/admin/authz", get(console_session::authz))
+        .route("/api/admin/session", post(console_session::create_session))
+        .route(
+            "/api/admin/session/logout",
+            post(console_session::destroy_session),
         )
         .route("/api/models", get(models::list_for_client))
         .route("/api/ide-key", get(models::ide_key))
@@ -270,14 +307,15 @@ async fn main() -> anyhow::Result<()> {
 /// The admin dashboard SPA, baked into the binary (no separate build/deploy).
 /// `no-store` so browsers always fetch the latest panel after a redeploy — the
 /// HTML is baked into the binary, so a new deploy always means new markup.
-async fn admin_page() -> impl axum::response::IntoResponse {
-    (
-        [(
-            axum::http::header::CACHE_CONTROL,
-            "no-store, must-revalidate",
-        )],
-        Html(include_str!("../static/admin.html")),
-    )
+/// 旧版管理后台（static/admin.html，2091 行）已经整个删掉了。
+///
+/// 它是第二套能改余额、发兑换码、改套餐的界面，和新控制台各写各的：面值分母 663 在它
+/// 里面又是一份独立的硬编码副本，而且它此前对**任何匿名访客**公开，等于把整张运营接口
+/// 地图挂在网上。留着它意味着每加一个防护都要在两处各做一遍，而漏掉的那一处就是入口。
+///
+/// 根路径改成跳转到新控制台。真正的鉴权在 /console/ 的门禁上，这里只是个指路牌。
+async fn root_redirect() -> axum::response::Response {
+    axum::response::Redirect::temporary("/console/").into_response()
 }
 
 /// Public user registration page (email + verification code).

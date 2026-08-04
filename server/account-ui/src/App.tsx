@@ -134,6 +134,9 @@ export default function App() {
       lang={lang}
       active={active}
       email={me.email}
+      // US order, and tolerant of only one half being filled in.
+      name={[me.first_name, me.last_name].filter(Boolean).join(" ").trim()}
+      avatar={me.avatar}
       planLabel={planText}
       footer={
         onBilling ? (
@@ -171,7 +174,14 @@ export default function App() {
           onRedeemed={() => void load()}
         />
       ) : (
-        <Dashboard me={me} tab={tab} lang={lang} catalog={catalog} currency={priceCurrency} />
+        <Dashboard
+          me={me}
+          tab={tab}
+          lang={lang}
+          catalog={catalog}
+          currency={priceCurrency}
+          onProfileSaved={() => void load()}
+        />
       )}
     </Shell>
   );

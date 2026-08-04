@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { ChevronLeft, CreditCard, Home, LineChart, Settings, Workflow } from "lucide-react";
 
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { DICTS, type Lang } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -26,12 +26,25 @@ type ShellProps = {
   /** Path + hash of the active entry, e.g. "/dashboard#usage" or "/billing". */
   active: string;
   email?: string;
+  /** Already joined for display, US order. Empty when the account has set no name. */
+  name?: string;
+  /** `data:` URL, or undefined for the lettered fallback. */
+  avatar?: string | null;
   planLabel?: string;
   footer?: ReactNode;
   children: ReactNode;
 };
 
-export function Shell({ lang, active, email, planLabel, footer, children }: ShellProps) {
+export function Shell({
+  lang,
+  active,
+  email,
+  name,
+  avatar,
+  planLabel,
+  footer,
+  children,
+}: ShellProps) {
   const t = DICTS[lang];
 
   return (
@@ -71,13 +84,19 @@ export function Shell({ lang, active, email, planLabel, footer, children }: Shel
           {footer}
           <div className="flex items-center gap-2.5 px-1 py-1.5">
             <Avatar className="size-8">
+              {avatar ? <AvatarImage src={avatar} alt="" /> : null}
               <AvatarFallback className="bg-primary text-xs font-semibold text-primary-foreground">
-                {(email ?? "?").charAt(0).toUpperCase()}
+                {(name || email || "?").charAt(0).toUpperCase()}
               </AvatarFallback>
             </Avatar>
+            {/* Name on top once there is one, with the email demoted beneath it — the
+                email is still the thing that identifies the account, so it never
+                disappears entirely. */}
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[13px] font-medium">{email ?? "—"}</div>
-              <div className="text-[11.5px] text-muted-foreground">{planLabel}</div>
+              <div className="truncate text-[13px] font-medium">{name || email || "—"}</div>
+              <div className="truncate text-[11.5px] text-muted-foreground">
+                {name ? email : planLabel}
+              </div>
             </div>
           </div>
         </div>
