@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
+import { Camera, ChevronLeft, ChevronRight, GitBranch, Github } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +22,7 @@ import {
   signOut,
   type Catalog,
   type DesktopProbe,
+  type Integration,
   type Me,
   type Usage,
 } from "@/lib/api";
@@ -256,6 +257,124 @@ function ProfileCard({
         </div>
       </div>
     </Card>
+  );
+}
+
+/**
+ * Linked code hosts.
+ *
+ * Providers the server has no credentials for are shown greyed out rather than hidden —
+ * "GitHub, not available yet" tells you where you stand; a missing row reads as a
+ * product that never had the feature.
+ */
+function CodeHosts({ lang }: { lang: Lang }) {
+  const t = DICTS[lang];
+  const [rows, setRows] = useState<Integration[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
+
+  const load = () => {
+    void api
+      .integrations()
+      .then((r) => setRows(r.providers))
+      .catch(() => setRows([]));
+  };
+  useEffect(load, []);
+
+  // The OAuth callback lands back here with ?integration=… — report it, then take it out
+  // of the URL so a refresh does not replay a stale message.
+  useEffect(() => {
+    const outcome = new URLSearchParams(location.search).get("integration");
+    if (!outcome) return;
+    setNote(
+      outcome === "cancelled"
+        ? { text: t.integrationCancelled, ok: false }
+        : outcome === "error"
+          ? { text: t.integrationError, ok: false }
+          : { text: t.integrationConnected, ok: true },
+    );
+    const url = new URL(location.href);
+    url.searchParams.delete("integration");
+    history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [t]);
+
+  async function connect(provider: string) {
+    setBusy(provider);
+    setNote(null);
+    try {
+      const { url } = await api.integrationStart(provider);
+      location.href = url;
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : t.integrationError, ok: false });
+      setBusy(null);
+    }
+  }
+
+  async function disconnect(provider: string) {
+    setBusy(provider);
+    setNote(null);
+    try {
+      const res = await api.integrationDisconnect(provider);
+      setNote({ text: `${t.disconnectedNote} ${res.revoke_at_provider}`, ok: true });
+      load();
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : t.integrationError, ok: false });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <>
+      <h2 className="mb-1 mt-8 text-sm font-semibold">{t.codeHosts}</h2>
+      <p className="mb-3 text-[13.5px] text-muted-foreground">{t.codeHostsLede}</p>
+      {note ? (
+        <p
+          className={cn(
+            "mb-3 break-all text-[13px]",
+            note.ok ? "text-success" : "text-destructive",
+          )}
+        >
+          {note.text}
+        </p>
+      ) : null}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        {(rows ?? []).map((row) => (
+          <Card key={row.provider} className="bg-muted p-6">
+            <div className="mb-2.5 flex items-center gap-2.5">
+              {row.provider === "github" ? <Github className="size-5" /> : <GitBranch className="size-5" />}
+              <span className="text-lg font-semibold">{row.label}</span>
+              {row.connected ? <Badge variant="success">{t.connected}</Badge> : null}
+            </div>
+            <p className="mb-4 min-h-[2.5rem] text-[13.5px] leading-relaxed text-muted-foreground">
+              {!row.configured
+                ? t.notConfigured
+                : row.connected
+                  ? `${t.connectedAs} ${row.account_login || row.account_name || "—"}`
+                  : `@${row.provider}:`}
+            </p>
+            {row.connected ? (
+              <Button
+                variant="outline"
+                className="w-fit"
+                disabled={busy === row.provider}
+                onClick={() => void disconnect(row.provider)}
+              >
+                {t.disconnect}
+              </Button>
+            ) : (
+              <Button
+                className="w-fit"
+                disabled={!row.configured || busy === row.provider}
+                onClick={() => void connect(row.provider)}
+              >
+                {busy === row.provider ? t.connecting : t.connect}
+              </Button>
+            )}
+          </Card>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -598,6 +717,8 @@ export function Dashboard({
             </Button>
           </div>
         </Card>
+
+        <CodeHosts lang={lang} />
 
         <h2 className="mb-3 mt-8 text-sm font-semibold">{t.apiHeading}</h2>
         <Card className="bg-muted px-6 py-1">

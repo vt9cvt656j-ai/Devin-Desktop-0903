@@ -10,6 +10,7 @@ mod deploy;
 mod email;
 mod error;
 mod game;
+mod integrations;
 mod knowledge;
 mod models;
 mod pay;
@@ -101,6 +102,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify-code", post(auth::verify_code))
         .route("/api/me", get(auth::me))
+        // Linked code hosts. `/callback` is the only one without a Bearer token — the
+        // provider redirects the browser to it, and the signed `state` is what ties the
+        // request to an account (see integrations.rs).
+        .route("/api/integrations", get(integrations::list))
+        .route("/api/integrations/:provider/start", get(integrations::start))
+        .route(
+            "/api/integrations/:provider/callback",
+            get(integrations::callback),
+        )
+        .route(
+            "/api/integrations/:provider",
+            axum::routing::delete(integrations::disconnect),
+        )
+        .route("/api/integrations/:provider/repos", get(integrations::repos))
         // Body limit covers the inline avatar data URL, which the browser has already
         // resized; the handler caps it far lower still.
         .route(

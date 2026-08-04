@@ -127,6 +127,14 @@ export const api = {
    */
   updateProfile: (body: { first_name?: string; last_name?: string; avatar?: string }) =>
     request<{ ok: boolean }>("/api/me/profile", { method: "POST", body }),
+  integrations: () => request<{ providers: Integration[] }>("/api/integrations"),
+  /** Returns the provider's authorize URL; the caller navigates to it. */
+  integrationStart: (provider: string) =>
+    request<{ url: string }>(`/api/integrations/${provider}/start`),
+  integrationDisconnect: (provider: string) =>
+    request<{ ok: boolean; revoke_at_provider: string }>(`/api/integrations/${provider}`, {
+      method: "DELETE",
+    }),
   redeem: (code: string) => request<unknown>("/api/redeem", { method: "POST", body: { code } }),
   models: () => request<unknown[]>("/api/models"),
 };
@@ -147,6 +155,18 @@ export function signOut(): void {
  * network stack and cannot be caught away, so the common case should make one request.
  */
 const HANDOFF_PORTS = [47821, 47822, 47823];
+
+export type Integration = {
+  provider: string;
+  label: string;
+  /** False when this server has no OAuth credentials for it — then it is not offered. */
+  configured: boolean;
+  connected: boolean;
+  account_login: string | null;
+  account_name: string | null;
+  avatar_url: string | null;
+  connected_at: string | null;
+};
 
 export type DesktopSession = { app: string; version: string; signedIn: boolean; email: string | null };
 

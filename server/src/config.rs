@@ -34,6 +34,47 @@ pub struct Config {
     pub ide_release_github_token: String,
     pub ide_release_github_repo: String,
     pub ide_release_github_workflow: String,
+
+    /// OAuth apps for linking code hosts. Registered by the operator under their own
+    /// GitHub / Gitee account, because the app belongs to that identity and the secret
+    /// is theirs. Empty means the provider is simply not offered — same shape as Stripe:
+    /// the feature ships and stays switched off until credentials exist, rather than
+    /// half-appearing and failing at the point someone clicks it.
+    pub github_client_id: String,
+    pub github_client_secret: String,
+    pub gitee_client_id: String,
+    pub gitee_client_secret: String,
+}
+
+/// JWT 密钥是整套鉴权的根：拿到它就能签一张 `role: "admin"` 的令牌，而 Claims 提取器
+/// 只会去数据库确认这个用户还在、role 是什么 —— 签名一旦能伪造，后面所有检查都白搭。
+///
+/// `.env.example` 里带着一个占位串，只要有一次部署忘了替换，这台机器就是敞开的。
+/// 与其在运行时无声地敞着，不如让进程根本起不来。
+fn jwt_secret() -> anyhow::Result<String> {
+    const PLACEHOLDERS: [&str; 4] = [
+        "change-me",
+        "changeme",
+        "your-secret-here",
+        "replace-with-a-long-random-string",
+    ];
+    let v = req("JWT_SECRET")?;
+    let t = v.trim();
+    if t.len() < 32 {
+        anyhow::bail!(
+            "JWT_SECRET 太短（{} 字节）。它能签发管理员令牌，至少要 32 字节的随机串。\n\
+             生成一个：openssl rand -hex 32",
+            t.len()
+        );
+    }
+    let lower = t.to_ascii_lowercase();
+    if PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
+        anyhow::bail!(
+            "JWT_SECRET 还是 .env.example 里的占位值。任何人都能用它伪造管理员令牌。\n\
+             换成一个真随机串：openssl rand -hex 32"
+        );
+    }
+    Ok(v)
 }
 
 impl Config {
@@ -41,7 +82,7 @@ impl Config {
         Ok(Self {
             database_url: req("DATABASE_URL")?,
             redis_url: opt("REDIS_URL", "redis://127.0.0.1:6379"),
-            jwt_secret: req("JWT_SECRET")?,
+            jwt_secret: jwt_secret()?,
             bind_addr: opt("BIND_ADDR", "0.0.0.0:8080"),
             db_max_connections: opt("DB_MAX_CONNECTIONS", "20").parse().unwrap_or(20),
             // 显式写 1/true 才开。缺省缺失都按关处理（fail-closed）。
@@ -82,6 +123,12 @@ impl Config {
                 "IDE_RELEASE_GITHUB_WORKFLOW",
                 "ide-package.yml",
             ),
+            // No defaults on purpose: a placeholder client id would produce a working
+            // button that lands the person on a provider error page.
+            github_client_id: std::env::var("GITHUB_CLIENT_ID").unwrap_or_default(),
+            github_client_secret: std::env::var("GITHUB_CLIENT_SECRET").unwrap_or_default(),
+            gitee_client_id: std::env::var("GITEE_CLIENT_ID").unwrap_or_default(),
+            gitee_client_secret: std::env::var("GITEE_CLIENT_SECRET").unwrap_or_default(),
         })
     }
 
