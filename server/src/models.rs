@@ -1710,7 +1710,14 @@ pub async fn admin_update(
     // in isolation. Reject only models that would actually end up charging nothing:
     // per-call with no fee anywhere, and not 免费 (免费 is floored at billing time, so it is
     // capped by the points pool rather than unlimited).
-    if billing_mode == "per_call" && per_call_cents == 0 && per_call_micro_usd == 0 {
+    // ...but only for a route that will actually SERVE traffic. This guard used to run on every
+    // update, including a bare {"active": false}, so a per-call connection with unpriced models
+    // could not be disabled — the operator was told to go price the models first, at the exact
+    // moment the route was misbehaving and needed to come out of rotation. A disabled route bills
+    // nothing, so unpriced models on it cannot cause an unbilled call; the guard has nothing to
+    // protect. Deleting it was the only remaining escape, and that destroys the api key, the
+    // enabled-model set, display names and every per-model price with it.
+    if active && billing_mode == "per_call" && per_call_cents == 0 && per_call_micro_usd == 0 {
         let unpriced: Vec<String> = enabled
             .iter()
             .filter(|mid| {
@@ -10450,5 +10457,26 @@ mod adaptive_header_wait_tests {
         }
         let after = adaptive_first_attempt_wait(id, FIRST_ATTEMPT_HEADER_WAIT);
         assert!(after > before, "the baseline must follow reality: {after:?} !> {before:?}");
+    }
+}
+
+#[cfg(test)]
+mod route_disable_tests {
+    /// A broken per-call route with unpriced models MUST still be disableable. The zero-fee guard
+    /// exists to stop unbilled traffic; a route with active=false serves no traffic, so applying
+    /// the guard there only traps the operator — whose sole remaining escape was DELETE, which
+    /// destroys the api key, enabled-model set, display names and per-model prices.
+    #[test]
+    fn zero_fee_guard_is_scoped_to_routes_that_still_serve() {
+        let src = include_str!("models.rs");
+        let i = src
+            .find("if active && billing_mode == \"per_call\"")
+            .expect("the zero-fee guard must be gated on `active` — disabling must never be blocked");
+        // and the gate must sit on the guard itself, not somewhere incidental
+        let window = &src[i..i + 200];
+        assert!(
+            window.contains("per_call_cents == 0") && window.contains("per_call_micro_usd == 0"),
+            "the `active &&` gate must be on the zero-fee guard, not on an unrelated condition"
+        );
     }
 }
