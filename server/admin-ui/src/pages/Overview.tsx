@@ -2,6 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
+import { Donut } from "@/components/viz/Donut";
+import { Meter } from "@/components/viz/Meter";
+import { TrendArea } from "@/components/viz/TrendArea";
 import { Stat } from "@/components/Stat";
 import { TableSkeleton } from "@/components/TableSkeleton";
 import { SectionReveal } from "@/components/motion/section-reveal";
@@ -29,6 +32,14 @@ import { cents, num, when } from "@/lib/format";
  * GET /api/admin/orders 和 /api/admin/events 都是裸数组（pay.rs admin_list_orders →
  * Json<Vec<Order>>，realtime.rs recent_events → Json<Vec<Event>>），不是 { items } 信封。
  */
+
+type User = {
+  plan?: string;
+  plan_expires_at?: string | null;
+  created_at?: string;
+  quota_window_cents?: number;
+  quota_window_cap_cents?: number;
+};
 
 type Stats = { total_users?: number; today_users?: number; online?: number };
 
@@ -78,19 +89,24 @@ export function Overview() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [events, setEvents] = useState<Event[] | null>(null);
+  const [users, setUsers] = useState<User[] | null>(null);
   const [err, setErr] = useState("");
 
   const load = useCallback(async (signal?: { alive: boolean }) => {
     try {
-      const [s, o, e] = await Promise.all([
+      const [s, o, e, u] = await Promise.all([
         api.get<Stats>("/api/admin/stats"),
         api.get<Order[]>("/api/admin/orders"),
         api.get<Event[]>("/api/admin/events"),
+        // Plan mix, the signup trend and quota pressure all come from this one list, so the
+        // dashboard stops being three counters and starts answering "what shape is the business".
+        api.get<User[]>("/api/admin/users").catch(() => [] as User[]),
       ]);
       if (signal && !signal.alive) return;
       setStats(s || {});
       setOrders(Array.isArray(o) ? o : []);
       setEvents(Array.isArray(e) ? e : []);
+      setUsers(Array.isArray(u) ? u : []);
       setErr("");
     } catch (e) {
       if (signal && !signal.alive) return;
@@ -116,6 +132,58 @@ export function Overview() {
   // that never clears and disagrees with Billing, which filters correctly.
   const pending = loadedOrders.filter((o) => o.status === "pending");
   const revenue = paid.reduce((a, o) => a + (o.amount_cents || 0), 0);
+
+  const loadedUsers = users ?? [];
+  const active = (u: User) =>
+    !!u.plan && u.plan !== "none" &&
+    (!u.plan_expires_at || new Date(u.plan_expires_at).getTime() > Date.now());
+
+  // Plan mix. Ordered tiers, so the ring uses a SEQUENTIAL ramp — see Donut for why this design
+  // system cannot use a categorical one.
+  const PLAN_ORDER = ["ultra", "power", "pro", "basic", "trial"];
+  const planMix = (() => {
+    const by = new Map<string, number>();
+    for (const u of loadedUsers) {
+      if (!active(u)) continue;
+      const k = String(u.plan);
+      by.set(k, (by.get(k) || 0) + 1);
+    }
+    const slices = PLAN_ORDER.filter((k) => by.get(k)).map((k) => ({ label: k, value: by.get(k)! }));
+    const none = loadedUsers.length - slices.reduce((a, x) => a + x.value, 0);
+    if (none > 0) slices.push({ label: "无会员", value: none });
+    return slices;
+  })();
+
+  // Signups per day over the last 14 days, from created_at. Dates are bucketed on the LOCAL day
+  // so the chart matches what the operator sees elsewhere in the console.
+  const signups = (() => {
+    const days: { t: string; v: number }[] = [];
+    const key = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
+    const bucket = new Map<string, number>();
+    for (const u of loadedUsers) {
+      if (!u.created_at) continue;
+      const d = new Date(u.created_at);
+      if (Number.isNaN(d.getTime())) continue;
+      if (Date.now() - d.getTime() > 14 * 86_400_000) continue;
+      bucket.set(key(d), (bucket.get(key(d)) || 0) + 1);
+    }
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86_400_000);
+      days.push({ t: key(d), v: bucket.get(key(d)) || 0 });
+    }
+    return days;
+  })();
+
+  // Fleet quota pressure: how much of the granted window is actually spent. A ratio, so a METER.
+  const quota = loadedUsers.reduce(
+    (a, u) => {
+      const cap = u.quota_window_cap_cents || 0;
+      if (cap <= 0) return a;
+      const left = Math.max(0, Math.min(cap, u.quota_window_cents ?? cap));
+      return { cap: a.cap + cap, used: a.used + (cap - left) };
+    },
+    { cap: 0, used: 0 },
+  );
 
   return (
     <div className="space-y-8">
@@ -147,8 +215,62 @@ export function Overview() {
         <Stat label="今日新增" value={stats ? num(stats.today_users) : "—"} />
       </SectionReveal>
 
+      {/* Two things the old dashboard could not answer: what SHAPE the customer base is, and
+          whether signups are moving. Both come from the users list already being fetched. */}
+      <div className="mb-6 grid gap-6 lg:grid-cols-2">
+        <SectionReveal as="section" delay={120}>
+          <div className="h-full rounded-xl border border-border bg-card">
+            <header className="border-b border-border px-5 py-3">
+              <h2 className="text-sm font-semibold">套餐构成</h2>
+            </header>
+            <div className="p-5">
+              {!users ? (
+                <div className="h-36 animate-pulse rounded-lg bg-secondary motion-reduce:animate-none" />
+              ) : planMix.length ? (
+                <Donut
+                  slices={planMix}
+                  centerValue={num(loadedUsers.length)}
+                  centerLabel="总客户"
+                />
+              ) : (
+                <EmptyState compact title="还没有客户" hint="有人注册后会出现在这里。" />
+              )}
+            </div>
+          </div>
+        </SectionReveal>
+
+        <SectionReveal as="section" delay={160}>
+          <div className="h-full rounded-xl border border-border bg-card">
+            <header className="flex items-baseline justify-between border-b border-border px-5 py-3">
+              <h2 className="text-sm font-semibold">近 14 天注册</h2>
+              <span className="text-sm tabular-nums text-muted-foreground">
+                共 {num(signups.reduce((a, d) => a + d.v, 0))} 位
+              </span>
+            </header>
+            <div className="p-5">
+              {!users ? (
+                <div className="h-28 animate-pulse rounded-lg bg-secondary motion-reduce:animate-none" />
+              ) : (
+                <TrendArea points={signups} label="近 14 天每日注册数" />
+              )}
+              {quota.cap > 0 && (
+                <div className="mt-5 border-t border-border pt-4">
+                  <div className="mb-1.5 flex items-baseline justify-between">
+                    <span className="type-eyebrow">全站时段额度已用</span>
+                    <span className="text-sm tabular-nums">
+                      {Math.round((quota.used / quota.cap) * 100)}%
+                    </span>
+                  </div>
+                  <Meter used={quota.used} cap={quota.cap} />
+                </div>
+              )}
+            </div>
+          </div>
+        </SectionReveal>
+      </div>
+
       <div className="grid gap-6 lg:grid-cols-2">
-        <SectionReveal as="section" delay={140}>
+        <SectionReveal as="section" delay={200}>
           <div className="rounded-xl border border-border bg-card">
             <header className="flex items-center justify-between border-b border-border px-5 py-3">
               <h2 className="text-sm font-semibold">待确认订单</h2>
