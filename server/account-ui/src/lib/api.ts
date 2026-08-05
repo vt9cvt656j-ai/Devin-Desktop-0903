@@ -200,7 +200,14 @@ export type DesktopSession = { app: string; version: string; signedIn: boolean; 
  */
 export type DesktopProbe =
   | { state: "connected"; session: DesktopSession }
-  | { state: "not-running" }
+  /**
+   * Could not reach it. Deliberately NOT called "not running" any more: a refused
+   * connection and a browser-blocked one are the same `TypeError: Failed to fetch`, so
+   * claiming the app is absent was a guess the page kept getting wrong while the app was
+   * running perfectly. `permission` and `error` carry what was actually observed so the
+   * card can show it instead of inventing a cause.
+   */
+  | { state: "unreachable"; permission: string; error: string }
   /** Reachable in principle; Chrome needs a click to raise the permission prompt. */
   | { state: "needs-permission" }
   /** The person said no, or a policy did. Only site settings can undo it. */
@@ -223,18 +230,30 @@ async function localNetworkPermission(): Promise<PermissionState | null> {
  * it on load to report the current state without one.
  */
 export async function probeDesktop(): Promise<DesktopProbe> {
-  const session = await reachDesktop();
-  if (session) return { state: "connected", session };
+  const attempt = await reachDesktop();
+  if (attempt.session) return { state: "connected", session: attempt.session };
 
-  // Unreachable. Distinguish "no app" from "browser will not let us ask it".
   const permission = await localNetworkPermission();
   if (permission === "denied") return { state: "permission-blocked" };
   if (permission === "prompt") return { state: "needs-permission" };
-  return { state: "not-running" };
+
+  // Permission is "granted", or the browser has no such permission at all — and it still
+  // could not be reached. There is no way from here to tell a stopped app from a browser
+  // that is blocking for some other reason, so the page reports what was seen rather
+  // than picking one and stating it as fact.
+  return {
+    state: "unreachable",
+    permission: permission ?? "unsupported",
+    error: attempt.error,
+  };
 }
 
-async function reachDesktop(index = 0): Promise<DesktopSession | null> {
-  if (index >= HANDOFF_PORTS.length) return null;
+/** Carries the last failure back up, so the card can show it instead of a guess. */
+async function reachDesktop(
+  index = 0,
+  lastError = "no attempt made",
+): Promise<{ session: DesktopSession | null; error: string }> {
+  if (index >= HANDOFF_PORTS.length) return { session: null, error: lastError };
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 700);
   try {
@@ -244,12 +263,13 @@ async function reachDesktop(index = 0): Promise<DesktopSession | null> {
       cache: "no-store",
       signal: ctl.signal,
     });
-    if (!res.ok) throw new Error("bad status");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = (await res.json()) as DesktopSession;
-    if (json.app !== "mrday-one") throw new Error("not ours");
-    return json;
-  } catch {
-    return reachDesktop(index + 1);
+    if (json.app !== "mrday-one") throw new Error("something else is on that port");
+    return { session: json, error: "" };
+  } catch (e) {
+    const why = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    return reachDesktop(index + 1, `port ${HANDOFF_PORTS[index]} — ${why}`);
   } finally {
     clearTimeout(timer);
   }

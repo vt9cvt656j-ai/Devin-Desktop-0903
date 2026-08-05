@@ -796,8 +796,17 @@ export function Dashboard({
                   ? t.desktopPermissionAsk
                   : desktop.state === "permission-blocked"
                     ? t.desktopPermissionBlockedHelp
-                    : t.desktopMissing}
+                    : t.desktopUnreachable}
           </p>
+          {/* The observed facts, verbatim. Without these the page was asserting a cause
+              it could not know, and "the app is not running" was flatly wrong while the
+              app was running, listening, and answering the preflight correctly. */}
+          {desktop !== undefined && desktop.state === "unreachable" ? (
+            <p className="mb-4 font-mono text-[11.5px] leading-relaxed text-muted-foreground">
+              {t.desktopDetail}: local-network-access = {desktop.permission}
+              {desktop.error ? ` · ${desktop.error}` : null}
+            </p>
+          ) : null}
           <div className="flex flex-wrap items-center gap-2.5">
             {/* Chrome raises the local-network prompt only off a real click, so this
                 button exists to be that click. Offered whenever we are not already
