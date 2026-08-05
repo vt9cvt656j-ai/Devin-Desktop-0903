@@ -19385,7 +19385,7 @@ async function _buildEngineeringReferenceContext(text, root, stack, profile = _e
     backend.invoke("developer_community_search", { query, sources: [source], maxPerSource: 1 }));
   if (profile.ui) {
     jobs.push(backend.invoke("codrops_search", { query, maxResults: 2 }));
-    jobs.push(backend.invoke("codepen_search", { query, maxResults: 2 }));
+    jobs.push(backend.invoke({ query, maxResults: 2 }));
   }
   let settled = [];
   try {
@@ -26414,17 +26414,12 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "list_dir", description: "列出某个目录下的文件和子目录。", parameters: { type: "object", properties: { path: { type: "string", description: "目录路径（相对工作区根或绝对路径）" }, depth: { type: "integer", description: "递归深度，默认 1（只列当前层），0 = 无限递归到底" } }, required: ["path"] } } },
     { type: "function", function: { name: "search", description: "位置未知时在文件或目录中定位文本；命中后读取目标文件确认完整上下文。目标文件已知时直接 read_file，不要先 search。默认 literal；只有明确需要模式匹配才用 regex。", parameters: { type: "object", properties: { query: { type: "string", description: "要搜索的文本或正则表达式" }, path: { type: "string", description: "可选，限定单个文件或子目录（如 src/auth.ts 或 src/）" }, mode: { type: "string", enum: ["literal", "regex"], description: "匹配模式，默认 literal" }, case_sensitive: { type: "boolean", description: "是否区分大小写，默认 false" } }, required: ["query"] } } },
     { type: "function", function: { name: "find_files", description: "按文件名或 glob 模式查找文件，如 *.rs、main.js、src/**/*.ts，或直接给文件名子串。", parameters: { type: "object", properties: { pattern: { type: "string", description: "文件名或 glob 模式" } }, required: ["pattern"] } } },
-    { type: "function", function: { name: "web_search", description: "⚠️ **最后手段**——只在以下专用工具都不适用时才用 web_search。**必须优先用专用工具**：查周边/附近→local_discovery；查店铺官网商品/菜单/价格/库存公开结构化数据→shop_catalog；查天气/空气→live_environment；查航班→live_flights；查汇率/币价/加密资产→live_markets；查交通/堵车→road_environment；查快递→track_shipment；查技术问题/报错→stackoverflow_search；查npm/pip包→package_search；查GitHub仓库/release/issues→github_search；查最新论文/SOTA/学术→academic_search/arxiv_search/openalex_search/crossref_search；查医学/药物/临床试验→pubmed_search/pubchem_search/clinical_trials_search；查百科概念→wiki_search；查漏洞→cve_search；查游戏价格/平台→steam_search；查优惠/二手→smzdm_search/xianyu_search/zhuanzhuan_search；查开发者社区/论坛真实踩坑→developer_community_search。以上场景**绝不准优先用 web_search**。web_search 仅用于：找不到对应专用工具的通用互联网信息检索。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
+    { type: "function", function: { name: "web_search", description: "⚠️ **最后手段**——只在以下专用工具都不适用时才用 web_search。**必须优先用专用工具**：查周边/附近→local_discovery；查天气/空气→live_environment；查技术问题/报错→stackoverflow_search；查npm/pip包→package_search；查GitHub仓库/release/issues→github_search；查最新论文/SOTA/学术→arxiv_search/openalex_search/crossref_search；查医学/药物/临床试验→pubmed_search/pubchem_search/clinical_trials_search；查百科概念→wiki_search；查漏洞→cve_search；查游戏价格/平台→steam_search；查开发者社区/论坛真实踩坑→developer_community_search。以上场景**绝不准优先用 web_search**。web_search 仅用于：找不到对应专用工具的通用互联网信息检索。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词（可用英文更准）" } }, required: ["query"] } } },
     { type: "function", function: { name: "web_fetch", description: "抓取一个公网网页并返回正文文本，用于读 web_search 找到的页面、在线文档、API 参考、报错信息等。", parameters: { type: "object", properties: { url: { type: "string", description: "完整的 http/https URL" } }, required: ["url"] } } },
     { type: "function", function: { name: "local_discovery", description: "查询公开地理数据中的周边候选。桌面后端接入 Nominatim 与 ArcGIS 地理编码、OpenStreetMap Overpass POI、Open-Meteo 和 Wikipedia GeoSearch；返回 OSM 收录候选、Haversine 直线距离、OSM opening_hours 原文、weather.observed_at 时点的区域天气估算和逐来源本次请求状态。source_statuses 的 success 只表示端点本次返回，不表示数据新鲜、完整、准确或商家已核实；retrieved_at 只是本次取回时间，不是 POI 更新时间。没有实时活动场次/票务、评分、价格、路线时长或实时营业数据时保持未知。near=current 必须有用户授权得到的坐标，绝不从时区/IP 猜位置。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "想找什么，如 local breakfast、川菜、museum、family activity venue" }, near: { type: "string", minLength: 1, description: "城市、地址或商圈；当前位置可传 current（IDE 会尝试请求一次定位权限）" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "已获用户授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "已获用户授权的经度；与 latitude 一起传" }, radius_m: { type: "integer", minimum: 100, maximum: 20000, description: "搜索半径米，默认 3000" }, limit: { type: "integer", minimum: 1, maximum: 30, description: "最多返回地点数，默认 12" }, language: { type: "string", description: "Wikipedia/地理编码语言，如 zh、en、ja" } }, required: ["query"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
     { type: "function", function: { name: "live_environment", description: "查询无需 API 密钥的结构化环境与灾害数据。weather/air_quality/marine 来自 Open-Meteo 的带时间模型估算，earthquakes 来自 USGS，natural_hazards 来自 NASA EONET。逐来源返回 success/empty/failed、data_as_of 和 retrieved_at；不得把模型估算叫现场传感器实测，也不得把空结果解释成没有风险。地点类 kind 需要已授权坐标。", parameters: { type: "object", properties: { kind: { type: "string", enum: ["weather", "air_quality", "marine", "earthquakes", "natural_hazards"] }, latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 20000, description: "earthquakes 可选半径" }, window: { type: "string", enum: ["hour", "day", "week", "month"], description: "earthquakes 时间窗" }, minimum_magnitude: { type: "number", minimum: -1, maximum: 10 }, category: { type: "string", description: "EONET 类别 id，如 wildfires" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["kind"], anyOf: [{ properties: { kind: { enum: ["weather", "air_quality", "marine"] } }, required: ["latitude", "longitude"] }, { properties: { kind: { enum: ["earthquakes", "natural_hazards"] } } }] } } },
-    { type: "function", function: { name: "live_markets", description: "查询无需 API 密钥的结构化市场数据。exchange_rate 使用 Frankfurter/央行每日参考汇率，不是盘中可成交价；crypto 并行保留 Coinbase 与 Kraken 的交易所报价，不静默平均冲突。返回逐来源状态和时间边界。", parameters: { type: "object", properties: { kind: { type: "string", enum: ["exchange_rate", "crypto"] }, base: { type: "string", description: "基础货币或资产，如 USD/BTC" }, quote: { type: "string", description: "计价货币，如 CNY/USD" } }, required: ["kind", "base", "quote"] } } },
     { type: "function", function: { name: "performance_profile", description: "分析前端页面的性能指标并生成报告。通过浏览器自动化注入 Performance API 获取时序数据，配合截图验证页面状态。适合定位加载慢、渲染卡顿等问题。【何时用】页面卡顿/加载慢先跑它拿真实时序数据定位瓶颈，别读代码猜「可能是渲染」。", parameters: { type: "object", properties: { url: { type: "string", description: "目标页面 URL（必须是 http://localhost 或 http://127.0.0.1 开头）" }, metrics: { type: "string", enum: ["cpu", "memory", "both"], description: "监控类型：cpu=CPU 使用率，memory=内存占用，both=两者都监控", default: "both" }, timeoutSeconds: { type: "number", description: "超时秒数，默认 30", default: 30 } }, required: ["url"] } } },
     { type: "function", function: { name: "openapi_parser", description: "从 Swagger/OpenAPI JSON 规范中提取可用端点清单。支持本地文件路径 (./开头) 或公网 URL，输出格式可选端点列表/schema/json/curl 示例。", parameters: { type: "object", properties: { url: { type: "string", description: "OpenAPI JSON 规范的文件路径或 URL（本地用./开头，公网用https/http）" }, outputFormat: { type: "string", enum: ["list", "schema", "client"], description: "输出格式:list=每行一个端点, schema=完整 JSON 转义文本，client=curl 示例模板", default: "list" } }, required: ["url"] } } },
-    { type: "function", function: { name: "live_flights", description: "查询 OpenSky Network 匿名公开的飞机状态向量，不需要 API 密钥。返回 feed time、position time、last contact、位置、高度和速度；覆盖取决于接收站且匿名端点限流，不能冒充完整航班表、售票状态或安全结论。需要已授权或用户明确提供的中心坐标。", parameters: { type: "object", properties: { latitude: { type: "number", minimum: -90, maximum: 90 }, longitude: { type: "number", minimum: -180, maximum: 180 }, radius_km: { type: "integer", minimum: 1, maximum: 500 }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["latitude", "longitude"] } } },
-    { type: "function", function: { name: "road_environment", description: "按用户明确提供或系统授权取得的坐标查询无需 API 密钥的真实道路环境公开源；查当前位置时传 near=current，IDE 会弹出一次系统定位权限。vehicle_counts 返回温尼伯固定站时段计数，或挪威官方延迟约 2–3 小时的小时计数与覆盖率；traffic_flow 返回纽约/芝加哥道路速度原始值，或芬兰 TMS 带时间窗的 kpl/h 车流率与均速；road_incidents 返回奥斯汀、卡尔加里、DriveBC、Fintraffic V2、TfL、芝加哥或 Caltrans QuickMap CHP 道路事件/报告。overview 查询当地适用类别。逐来源返回 success/delayed/empty/stale/no_coverage/failed；delayed 必须连同 data_as_of 和 data_as_of_kind 表述，不能冒充当前状态。空、过期或无覆盖绝不等于周围没有车或事故；站点计数不是此刻周围车辆总数，多个站点不得相加，kpl/h 也不是原始车辆数。California CHP 记录只表示 current public feed membership；data_as_of_kind=http_last_modified 只是 HTTP representation 的 Last-Modified 新鲜度代理，不是 feed 生成或事件更新时间，也不同于首次上报本地时间 event_time_local；不证明记录完整、已验证或仍在处置/活跃，也不覆盖 local-police-only 或未上报事故。不得输出 dispatch notes、车牌、电话号码、医疗或人物细节。", parameters: { type: "object", properties: { kind: { type: "string", enum: ["overview", "vehicle_counts", "traffic_flow", "road_incidents"] }, near: { type: "string", enum: ["current"], description: "查询系统当前位置时传 current；会请求一次定位权限" }, latitude: { type: "number", minimum: -90, maximum: 90, description: "用户明确提供或已授权的纬度；与 longitude 一起传" }, longitude: { type: "number", minimum: -180, maximum: 180, description: "用户明确提供或已授权的经度；与 latitude 一起传" }, radius_km: { type: "integer", minimum: 1, maximum: 100, description: "直线半径公里，默认 10" }, lookback_hours: { type: "integer", minimum: 1, maximum: 720, description: "仅 Austin 动态记录和 Chicago 警察报告的回看小时数，默认 24；其他来源是各自当前 feed" }, limit: { type: "integer", minimum: 1, maximum: 50, description: "每个适用来源最多返回的记录数，默认 20；overview 可能包含多个来源" } }, required: ["kind"], anyOf: [{ required: ["near"] }, { required: ["latitude", "longitude"] }] } } },
-    { type: "function", function: { name: "track_shipment", description: "免密快递真实性入口。主流快递正式机器 API 都需要账号凭据；本工具只识别少数不歧义单号或使用用户提供的 carrier，返回承运商官方查询页并掩码单号，不抓网页、不绕验证码、不编造轨迹、位置、状态或 ETA。它不会声称已查询到实时物流。", parameters: { type: "object", properties: { tracking_number: { type: "string", minLength: 6, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$", description: "用户主动提供的快递单号；结果只回显掩码" }, carrier: { type: "string", description: "承运商 id，如 ups/usps/fedex/dhl/sf/china_post/yto/zto/sto/yunda/jd；号码歧义时必须提供" } }, required: ["tracking_number"] } } },
-    { type: "function", function: { name: "shop_catalog", description: "读取店铺官网/商品页公开商品、菜单、价格、库存字段的结构化入口。优先尝试 Shopify 公共 /products.json，再解析页面 schema.org JSON-LD Product/Offer；不登录、不绕验证码/反爬、不抓私有接口、不编造价格/库存/币种。没有官网 URL 时返回需要官网，不把搜索摘要当价格。每条结果带 source_url、retrieved_at、source_statuses 和 limitations。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "用户原始问题或店铺名/商品名。若里面有官网 URL，后端会提取；没有 URL 时不会瞎编价格。" }, url: { type: "string", description: "店铺官网或商品页 URL；已从 local_discovery/web_search 找到官网时必须传这个。" }, limit: { type: "integer", minimum: 1, maximum: 50, description: "最多返回商品/变体数，默认 12" } }, required: ["query"] } } },
     { type: "function", function: { name: "read_screen", description: "读取前台原生应用实际暴露的可访问性元素（role、名称、值、是否可用和屏幕坐标）。结果为空时必须如实报告权限不足或该应用未暴露元素。ocr=true 是 macOS 屏幕文字识别兜底；OCR ref 不是可操作的 AX 节点。", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "仅当前台应用没有可访问性树时设 true；可能需要屏幕录制权限" } }, required: [] } } },
     { type: "function", function: { name: "ui_click", description: "对 read_screen 返回的真实可访问性 ref 执行动作：press（点按/打开：按钮、链接、菜单项、复选框、列表行）、set_value（写文本框/设滑块值）、focus（聚焦）、increment/decrement（步进器/滑块/日期字段加减）、show_menu（打开弹出菜单/上下文菜单）、pick（下拉/组合框选项）、confirm/cancel（提交或取消对话框/文本框）。仅 macOS AX 节点直接操作可用；界面变化后先重新 read_screen，OCR ref 不可传入。", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "read_screen 返回的 AX 元素 ref" }, action: { type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick"] }, value: { type: "string", description: "action=set_value 时必填" } }, required: ["ref", "action"] } } },
     {
@@ -26516,8 +26511,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "git_stash_pop", description: "从 stash 堆栈取回并应用最近(或指定 index)的暂存改动（git stash pop）。", parameters: { type: "object", properties: { index: { type: "integer", description: "要弹出的 stash 序号(0 为最新)；省略取最新" } } } } },
       { type: "function", function: { name: "stop_terminal", description: "停止 / 关闭一个由 run_in_terminal 启动的任务终端（结束它的进程）。【何时用】后台任务不再需要、或端口冲突需要杀掉旧进程时。【vs 替代】只是看输出用 read_terminal。", parameters: { type: "object", properties: { name: { type: "string", description: "要停止的终端 / 任务名；省略则停最近一个" } } } } },
       { type: "function", function: { name: "http_request", description: "调用任意 HTTP API——这是你用各种**网上工具 / 在线服务**的关键能力。公网 API 不要凭感觉拼 /api、/v1、appapi 路径；先用官方文档/页面源码/抓包/用户给的精确 URL 取证，localhost/dev server/已取证 URL 可直接请求。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST、PUT、DELETE；不传默认 GET" }, url: { type: "string", description: "完整 http/https URL，可为 http://127.0.0.1:端口/path" }, headers: { type: "object", description: "可选，请求头键值对，如 {\"Authorization\":\"Bearer xxx\",\"Content-Type…", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体（POST/PUT 等用；要发 JSON 就传 JSON 字符串）" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 30，最大 120" } }, required: ["url"] } } },
-      { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读 deep_search 返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST；不传默认 GET" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["url"] } } },
-      { type: "function", function: { name: "academic_search", description: "**搜索学术论文**（Semantic Scholar，覆盖 arXiv / PubMed / ACL 等）。返回标题、作者、年份、引用量、摘要、链接。用于查最新研究、算法、AI/ML 论文。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 'transformer attention mechanism' 或 'large language model agent'" }, max_results: { type: "integer", description: "返回数量，默认 8，最大 20" } }, required: ["query"] } } },
+      { type: "function", function: { name: "tor_request", description: "**通过 Tor 网络发 HTTP 请求——访问深网/暗网 .onion 站点**（也可匿名访问普通 URL）。用于读  返回的 .onion 链接、访问被审查/隐藏的资源、匿名抓取。**Tor 会自动启动**（没跑就自愈拉起，首次冷启动约 10-30s；只有完全没装 tor 才需 brew install tor）。深网内容就靠这个读。", parameters: { type: "object", properties: { method: { type: "string", description: "HTTP 方法，如 GET、POST；不传默认 GET" }, url: { type: "string", description: "完整 URL，支持 .onion 地址（如 http://xxx.onion/path）和普通 http/https" }, headers: { type: "object", description: "可选，请求头键值对", additionalProperties: { type: "string" } }, body: { type: "string", description: "可选，请求体" }, timeout_secs: { type: "integer", description: "可选，超时秒数，默认 60（Tor 较慢），最大 300" } }, required: ["url"] } } },
       { type: "function", function: { name: "package_search", description: "**搜索软件包/库 + 查版本兼容**——查 npm、crates.io、PyPI、HuggingFace、pub.dev(Flutter)、Conda、CocoaPods(iOS)、Hex(Elixir) 的包信息。npm 传精确包名时会附带 registry 元数据：dist-tags.latest、最近版本、engines、peerDependencies、dependencies、deprecated。改 package.json、选版本、处理 peer 依赖冲突前必须先用它核实，别凭记忆猜版本。", parameters: { type: "object", properties: { query: { type: "string", description: "包名或搜索词；查 npm 版本/兼容性时传精确包名，如 'axios' / '@vitejs/plugin-react' / 'tsx'" }, ecosystem: { type: "string", description: "生态：npm(默认) / pypi / crates / huggingface / dart / conda / cocoapods / hex。pypi 仅支持精确包名" }, max_results: { type: "integer", description: "返回数量，默认 8" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_search", description: "通过 GitHub API 搜索仓库、代码或 issue，并返回本次响应里的元数据和链接。created_date、updated_date 与 pushed_at 各有不同语义，都不证明最新 release、质量或持续维护；关键实现仍需读源码并在当前项目验证。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，支持 GitHub 语法如 'language:rust stars:>1000' 或 'org:facebook react'" }, search_type: { type: "string", description: "搜索类型：repositories（默认）/ code / issues" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_repo", description: "直接读取指定 GitHub 仓库的真实内容：overview/readme/tree/file/releases/issues/pulls。用于看开源项目结构、README、源码文件、版本发布和真实 issue，而不是只拿搜索结果标题。", parameters: { type: "object", properties: { owner: { type: "string", description: "仓库 owner/org，例如 vercel" }, repo: { type: "string", description: "仓库名，例如 next.js" }, action: { type: "string", enum: ["overview", "readme", "tree", "file", "releases", "issues", "pulls"], description: "要读取的内容，默认 overview" }, path: { type: "string", description: "tree/file 用：仓库内路径，如 packages/next/src/server" }, branch: { type: "string", description: "可选分支/tag/SHA；不填用默认分支" }, max_results: { type: "integer", description: "tree/releases/issues/pulls 返回数量，默认 20，最大 100" } }, required: ["owner", "repo"] } } },
@@ -26530,8 +26524,8 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "hackernews_search", description: "**搜索 Hacker News**——技术社区讨论、行业动态、开发者真实经验。找社区观点/争议/经验分享用。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, sort: { type: "string", description: "排序：relevance（默认）/ date（最新优先）" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "developer_community_search", description: "并行搜索当前注册的代码平台、问答站、技术社区和官方语言论坛。逐来源返回 success、empty、rate-limited、failed 或 timeout；empty 只表示适配器完成但没有可用命中，不证明站点没有相关内容；timeout 表示该来源超过独立硬时限，不能当作 empty 或 success。结果保留各来源的相关性或上游顺序，不保证按日期排序；published_date、created_date、updated_date、last_activity_date 与 retrieved_at 不得互相代替，缺失保持 unknown。all 只指当前适配器清单。【何时用】技术选型/踩坑经验/方案对比要真实开发者证据时首选——比泛泛 web_search 更聚焦。", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, description: "搜索主题或报错关键词" }, scope: { type: "string", enum: ["all", "code", "forums", "chinese", "articles"], description: "来源分组，默认 all（指当前支持的来源，不是互联网全部社区）" }, sources: { type: "array", items: { type: "string" }, description: "可选，明确指定来源；如 github、stackoverflow、reddit、v2ex、juejin、gitlab、gitee，以及官方论坛 rust_users、python_discussions、swift_forums、kotlin_discussions" }, max_per_source: { type: "integer", minimum: 1, maximum: 5, description: "每个来源最多返回几项，默认 3" } }, required: ["query"] } } },
       { type: "function", function: { name: "dockerhub_search", description: "**搜索 Docker Hub 镜像**——找容器镜像、官方/社区镜像、部署方案。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 'nginx' / 'postgres' / 'node'" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "pubmed_search", description: "**搜索 PubMed 生物医学文献**——3500万+篇论文，查医学/生物/药学/基因组学研究。比 academic_search 更精准的生物医学专用库。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，支持 PubMed 高级语法如 'cancer AND immunotherapy' 或 MeSH 术语" }, max_results: { type: "integer", description: "返回数量，默认 8" } }, required: ["query"] } } },
-      { type: "function", function: { name: "arxiv_search", description: "**直搜 arXiv 预印本**——物理/数学/CS/生物/金融最新论文，含完整摘要和PDF直链。比 academic_search 更快拿到最新未发表研究。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, category: { type: "string", description: "可选，限定分类如 cs.AI / cs.LG / math.CO / physics.hep-th / q-bio" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
+      { type: "function", function: { name: "pubmed_search", description: "**搜索 PubMed 生物医学文献**——3500万+篇论文，查医学/生物/药学/基因组学研究。比  更精准的生物医学专用库。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，支持 PubMed 高级语法如 'cancer AND immunotherapy' 或 MeSH 术语" }, max_results: { type: "integer", description: "返回数量，默认 8" } }, required: ["query"] } } },
+      { type: "function", function: { name: "arxiv_search", description: "**直搜 arXiv 预印本**——物理/数学/CS/生物/金融最新论文，含完整摘要和PDF直链。比  更快拿到最新未发表研究。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, category: { type: "string", description: "可选，限定分类如 cs.AI / cs.LG / math.CO / physics.hep-th / q-bio" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "crossref_search", description: "**CrossRef 学术元数据**——1.3亿+学术作品的 DOI、引用数、期刊、作者。查某篇论文被引多少次、找某期刊的文章。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词或 DOI" }, search_type: { type: "string", description: "搜索类型：works（默认，论文）/ journals / funders" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "openalex_search", description: "**OpenAlex 开放学术图谱**——2.5亿+学术作品、作者、机构、主题。找某领域热门论文、查作者发表记录、看机构产出。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, entity_type: { type: "string", description: "实体类型：works（默认）/ authors / institutions / topics / sources" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "pubchem_search", description: "**PubChem 化学数据库**——1亿+化合物，查分子式、分子量、结构、药物化学性质。", parameters: { type: "object", properties: { query: { type: "string", description: "化合物名称，如 'aspirin' / 'caffeine' / 'glucose'" }, search_type: { type: "string", description: "搜索类型：compound（默认）" } }, required: ["query"] } } },
@@ -26547,35 +26541,22 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
       { type: "function", function: { name: "cdnjs_search", description: "**cdnjs 前端库搜索**——在 cdnjs CDN 上找 JS/CSS 库，返回 CDN 链接+版本号。", parameters: { type: "object", properties: { query: { type: "string", description: "库名，如 'react' / 'lodash' / 'animate.css'" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "bundlephobia_search", description: "**Bundlephobia 包体积分析**——查 npm 包的 minified/gzip 大小、依赖数、是否可 tree-shake。", parameters: { type: "object", properties: { package: { type: "string", description: "npm 包名，如 'lodash' / 'react-dom' / 'date-fns'" } }, required: ["package"] } } },
       { type: "function", function: { name: "devto_search", description: "通过公开网页搜索查找 DEV Community 文章并返回原文链接；这不是 DEV 官方 API，搜索端点不可用时会明确说明。", parameters: { type: "object", properties: { query: { type: "string", description: "文章主题或技术关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "reddit_search", description: "**Reddit 搜索**——搜索 Reddit 帖子/讨论，可指定 subreddit。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, subreddit: { type: "string", description: "可选，限定 subreddit，如 'programming' / 'gamedev' / 'webdev'" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "steam_search", description: "**Steam 游戏搜索**——搜索 Steam 游戏，返回价格/平台/链接。", parameters: { type: "object", properties: { query: { type: "string", description: "游戏名" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "iconify_search", description: "**图标搜索**——跨 200+ 图标集搜索（Material/Heroicons/Tabler/FontAwesome...），返回 SVG 链接。", parameters: { type: "object", properties: { query: { type: "string", description: "图标名/关键词，如 'arrow' / 'home' / 'settings'" }, max_results: { type: "integer", description: "返回数量，默认 20" } }, required: ["query"] } } },
-      { type: "function", function: { name: "color_search", description: "**配色方案搜索**——按关键词找设计配色方案（ColourLovers），返回 HEX 色值组合。", parameters: { type: "object", properties: { query: { type: "string", description: "风格关键词，如 'ocean' / 'sunset' / 'cyberpunk' / 'pastel'" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "lobsters_search", description: "通过公开网页搜索查找 Lobsters 技术讨论并返回原帖链接；这不是 Lobsters 官方 API，搜索端点不可用时会明确说明。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "juejin_search", description: "搜索掘金公开技术文章，适合查中文教程和开发实践；文章质量需结合原文与其他来源判断。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词（中英文）" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "codrops_search", description: "**Codrops 创意前端搜索**——Tympanus/Codrops 创意 CSS/JS 实验和教程：页面转场/交互动效/创意布局/WebGL 特效/菜单效果。学习前沿前端视觉效果的最佳来源。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 page transition / scroll animation / menu effect" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "smashingmag_search", description: "**Smashing Magazine 搜索**——Web 设计/UX/CSS/响应式/无障碍领域最权威的深度文章。学习设计模式、排版、配色、组件最佳实践。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 responsive layout / typography / design system" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "css_tricks_search", description: "**CSS-Tricks 搜索**——CSS 技巧/Flexbox/Grid/动画/前端技术教程，实战代码丰富。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 flexbox / grid layout / custom properties" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "codepen_search", description: "通过公共网页搜索定位 codepen.io/pen 页面并附站内入口；不是 CodePen 官方 API，不保证完整代码、可运行性、发布日期或覆盖全部作品。空结果也不证明站内没有匹配。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 modal animation / card hover / navbar responsive" }, max_results: { type: "integer", description: "返回数量，默认 12" } }, required: ["query"] } } },
-      { type: "function", function: { name: "dribbble_search", description: "通过公共网页搜索定位 dribbble.com/shots 页面并附站内入口；不是 Dribbble 官方 API，不保证结果质量、发布日期或覆盖全部作品，只能作为待核验的视觉候选。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 dashboard design / landing page / mobile app ui" }, max_results: { type: "integer", description: "返回数量，默认 12" } }, required: ["query"] } } },
       { type: "function", function: { name: "awwwards_search", description: "**Awwwards 搜索**——全球获奖网站设计，搜索行业标杆级的布局/交互/视觉设计。了解当前最顶级的网页设计趋势和实现。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索词，如 portfolio / e-commerce / agency / minimal" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "v2ex_search", description: "**V2EX 搜索**——中文程序员社区，搜索真实开发者的经验/踩坑/工具推荐/技术讨论。碰到具体技术问题时看看国内开发者怎么解决的。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "segmentfault_search", description: "**思否 (SegmentFault) 搜索**——中文 StackOverflow，搜索编程问答和技术文章。碰 bug 或找最佳实践时搜这里看中文开发者的解法。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词或报错信息" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_discussions_search", description: "通过公开网页搜索查找 GitHub Discussions 原帖，适合定位项目设计和架构讨论；这不是 GitHub GraphQL API。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "producthunt_search", description: "通过公开网页搜索查找 Product Hunt 产品页并返回原链接；这不是 Product Hunt 官方 API，结果不代表产品质量或当前热度。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 code editor / API testing / design tool" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "freecodecamp_search", description: "查询 freeCodeCamp 当前公开 Algolia 文章索引，返回索引暴露的标题、作者、标签和链接；覆盖与日期以本次响应为准，文章示例不是当前项目已验证的最佳实践。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 react hooks / python flask / docker kubernetes" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "github_trending", description: "读取 GitHub Trending 当前 weekly 页面列出的项目，可按明确语言路径筛选；它不是关键词搜索、全 GitHub 排名、质量或长期维护状态证明。", parameters: { type: "object", properties: { query: { type: "string", description: "编程语言筛选（如 python / rust / typescript），留空或 all 看全部语言" }, max_results: { type: "integer", description: "返回数量，默认 15" } }, required: ["query"] } } },
       { type: "function", function: { name: "infoq_search", description: "解析 InfoQ 当前公开搜索页中的文章和新闻链接；这些是媒体内容候选，不代表方案适合当前项目，也不能替代原始文档、源码和版本验证。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 microservices / kubernetes / AI agent" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "hackernoon_search", description: "通过公开网页搜索查找 HackerNoon 页面并返回文章链接；这不是 HackerNoon 官方 API，搜索端点不可用时会明确说明。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "codeberg_search", description: "通过 Codeberg API 搜索公开仓库，适合补充 GitHub/GitLab 之外的自由软件和开源项目来源。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 privacy / decentralized / matrix" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "bestofjs_search", description: "查询 Best of JS 当前公开项目数据集，按名称、描述和标签过滤并返回其 star、标签与仓库链接；收录和 star 不代表全生态排名、质量、维护状态或兼容性。", parameters: { type: "object", properties: { query: { type: "string", description: "搜索关键词，如 state management / testing / bundler / react" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "sourcegraph_search", description: "通过 Sourcegraph 当前索引搜索公开代码。支持语言和仓库过滤；覆盖范围取决于实时索引，不代表所有公开仓库。", parameters: { type: "object", properties: { query: { type: "string", description: "代码搜索语法，如 useEffect cleanup lang:typescript / oauth2 middleware lang:go / type:repo ai framework" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "deep_search", description: "**深层情报搜索——挖普通搜索找不到、被藏起来的内容**。多层并行且结果自动深读正文：① 明网 DuckDuckGo ② **定向 dork**（自动加 site:pastebin/ghostbin/rentry/gist + filetype:log/sql/env/json——专挖泄露的配置/dump/paste）③ 暗网四引擎（DDG-onion / Ahmia / Torch / Haystak，需本机 tor 运行）④ 传域名/URL 时额外跑：**crt.sh 证书透明挖隐藏子域名/内部主机**、**Wayback 存档挖已从网上删除的历史页面**（快照仍可读）。适合：安全情报/泄露检测/找被删内容/隐藏子域名/非主流资源/被审查内容/圈内灰色渠道/普通搜索翻不到的技术资料。查某个网站的隐藏面就直接传域名。", parameters: { type: "object", properties: { query: { type: "string", description: "关键词，或一个域名/URL（传域名会额外挖子域名+已删除的存档页）" }, max_results: { type: "integer", description: "返回数量，默认 24" } }, required: ["query"] } } },
-      { type: "function", function: { name: "smzdm_search", description: "什么值得买/SMZDM 公开网页搜索。用于查当前商品优惠、好价、券、线报和真实讨论；不是官方 API，结果是公开索引候选，价格/库存/活动有效性必须继续核验。用户问薅羊毛、哪里便宜、优惠、返利、值不值时优先用。", parameters: { type: "object", properties: { query: { type: "string", description: "商品名或关键词，如「iPhone 16 优惠」「显示器 好价」「奶粉 券」" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "xianyu_search", description: "闲鱼/Goofish 二手公开网页搜索。用于查二手挂牌、成色描述、价格区间和捡漏线索；不是官方 API，不证明成交价或仍在售。用户问二手、闲鱼、捡漏、行情时和 zhuanzhuan_search 交叉比价。", parameters: { type: "object", properties: { query: { type: "string", description: "二手商品关键词，如「二手 iPhone 13」「95新 3080 显卡」" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
-      { type: "function", function: { name: "zhuanzhuan_search", description: "转转二手公开网页搜索。用于查二手挂牌、回收/验机相关行情和价格区间；不是官方 API，不证明成交价或仍在售。查二手行情时和 xianyu_search 一起用。", parameters: { type: "object", properties: { query: { type: "string", description: "二手商品关键词" }, max_results: { type: "integer", description: "返回数量，默认 10" } }, required: ["query"] } } },
       { type: "function", function: { name: "download_file", description: "从一个 http/https URL 下载文件保存到工作区内（图片 / 字体 / 数据集 / 二进制等）。", parameters: { type: "object", properties: { url: { type: "string", description: "要下载的 http/https URL" }, dest: { type: "string", description: "保存到的路径，相对工作区根，如 assets/logo.png" } }, required: ["url", "dest"] } } },
-      { type: "function", function: { name: "realtime_news_feed", description: "获取技术社区的最新讨论和文章 (Hacker News、Reddit、Dev.to)——适合了解某技术的当前动态、版本发布、社区风向。默认并发三源聚合，支持指定来源；失败源自动标注但不会阻塞其他源。返回格式：[来源] 标题 | 分数/评论数 | 时间 | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "关注主题，如 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "reddit", "devto", "all"], description: "数据来源：hn(仅 Hacker News)、reddit(仅 Reddit)、devto(仅 DEV Community)、all(默认全部并发)", default: "all" }, maxResults: { type: "integer", description: "每源最大结果数，默认 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
+      { type: "function", function: { name: "realtime_news_feed", description: "获取技术社区的最新讨论和文章 (Hacker News、Dev.to)——适合了解某技术的当前动态、版本发布、社区风向。默认并发三源聚合，支持指定来源；失败源自动标注但不会阻塞其他源。返回格式：[来源] 标题 | 分数/评论数 | 时间 | URL", parameters: { type: "object", properties: { topic: { type: "string", description: "关注主题，如 'Rust 1.80' / 'Kubernetes new features'", minLength: 1 }, sources: { type: "string", enum: ["hn", "reddit", "devto", "all"], description: "数据来源：hn(仅 Hacker News)、reddit(仅 Reddit)、devto(仅 DEV Community)、all(默认全部并发)", default: "all" }, maxResults: { type: "integer", description: "每源最大结果数，默认 10", minimum: 1, maximum: 25, default: 10 } }, required: ["topic"] } } },
       { type: "function", function: { name: "capture_start", description: "**启动抓包（mitmproxy，小黄鸟/HttpCanary 类能力）**。先选模式：mode:\"isolated_browser\"=默认推荐，无痕/隔离抓自动化浏览器，不改系统代理；mode:\"system\"=抓任意 App/全系统流量，会改 macOS 系统代理；mode:\"background\"=后台只监听/手动代理，常配 background_monitor(check_type:\"capture\")。启动后用 capture_flows 找真实请求，再用 capture_replay/http_request 重放。", parameters: { type: "object", properties: { port: { type: "integer", description: "代理端口，默认 8080" }, mode: { type: "string", enum: ["auto", "isolated_browser", "system", "background"], description: "auto=IDE 按任务判断；isolated_browser=不改系统代理，browser(fresh=true) 自动走代理；system=改系统代理抓任意 App；background=只启动代理监听，自己/monitor 等流量" }, system_proxy: { type: "boolean", description: "兼容旧参数：true 等同 mode=system；false 等同 mode=isolated_browser/background。不传时按 mode/任务自动判断" } }, required: [] } } },
       { type: "function", function: { name: "automation", description: "桌面自动化 RPC：真实鼠标键盘、CDP 浏览器和录制回放。按状态机用：先确认 URL/窗口/节点/登录态等前置状态，再执行动作，再用 browser.content / browser.eval / screenshot / recorder 结果等验证后置状态；发起点击或输入不等于成功。首次先调 system.init。坐标点击必须先 mouse.move{x,y} 再 mouse.click{button}；不存在 desktop.click/desktop.type。selector 失效要重新读取页面/节点，导航慢要 wait 后核 URL/DOM，登录/验证码/系统权限阻塞时说明具体阻塞并用后台监控接续。method 可选：system.init / mouse.move / mouse.click / mouse.double_click / mouse.drag / mouse.scroll{delta_y} / keyboard.type / keyboard.press / keyboard.combo / browser.start / browser.goto / browser.click / browser.type / browser.wait / browser.eval / browser.screenshot / browser.content / browser.close / recorder.save / recorder.replay / recorder.list / window.list / window.activate{title} / window.minimize{title} / screen.info / clipboard.get / clipboard.set{text} / keyboard.paste{text}。操作其他应用前先 window.list 找到目标窗口并 window.activate 带到前台；坐标乘 screen.info 的 scale_factor；长文本用 keyboard.paste 剪贴板粘贴而非逐键。", parameters: { type: "object", properties: { method: { type: "string", description: "要调用的真实 RPC 方法名，如 browser.goto / mouse.move / recorder.replay" }, params: { type: "object", description: "该方法的参数对象；以方法描述为准" } }, required: ["method"] } } },
       { type: "function", function: { name: "capture_flows", description: "**读取已抓到的 HTTP/HTTPS 请求**（结构化：方法/URL/主机/路径/状态/耗时/请求头/请求体/响应头/响应体）。比看截图可靠，是反接口的第一步。用 filter 关键词筛（匹配 host/路径/URL/方法/状态/类型），limit 限条数（默认 30，最新在前）。", parameters: { type: "object", properties: { filter: { type: "string", description: "可选，关键词筛选（模糊匹配 host/路径/URL/方法/状态/content-type）" }, limit: { type: "integer", description: "可选，返回最新的多少条，默认 30" }, include_body: { type: "boolean", description: "可选，是否含请求/响应体（默认 true；只看列表设 false 省 token）" } }, required: [] } } },
@@ -26649,7 +26630,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]);
+    const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment"]);
     return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
   }
   return _applyCloudToolDescs(tools);
@@ -26664,8 +26645,23 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
 // ============================================================================
 // 仅「重 / 专用」簇延迟加载；未列出的工具全留在核心集——保守，漏判也有 search_tools 兜底。
 // Tool bundles: deferred tool groups. NO regex triggers — the MODEL decides what it
-// needs via search_tools or direct-by-name calls (auto-healed at line ~14678).
+// needs via search_tools（主循环与子智能体两条路径都会真的注入 toolSchemas）。
 // Regex-based preloading was removed per user directive: "交给模型判断，不要老拿正则".
+// 这两个常量**不是死代码，不要删**（2026-08-05 删过一次，被测试挡了回来）。
+//
+// `_selectInitialTools` 的函数体确实一次都不引用它们 —— 这正是重点。多条测试
+//（"external source tools stay real but load on demand"、"reference-site UI tasks
+// keep learning and fetch schemas lazy" 等）会注入这些 bundle、传进像"做一个官网"
+// 这种**本来会命中正则的**任务文本，然后断言首轮工具集恒等于
+// ["read_file", "search_tools"]。它们锁的是「按正则预加载工具簇」这条路已被移除
+//（用户原话："交给模型判断，不要老拿正则"）。
+//
+// 也就是说：这份分组表 + 它未被引用这一事实，合起来才是那条契约的锚点。删掉表，
+// 测试就再也无法表达"即使给了分组和触发词，也不许预加载"。
+//
+// 真正的按需加载走 search_tools：主循环（精确名 → 模糊匹配 → 语义编排器 →
+// _applyToolPayloadWindow）和子智能体（_subAgentAdmitTools → 同一个 payload window）
+// 都会把工具真的注入 toolSchemas，数组按引用带进后续每一轮。
 const _TOOL_BUNDLES = {
   design:  { tools: ["design_research", "learn_design", "design_board", "preview_choices", "visual_explain", "generate_image", "browser", "screenshot", "visual_compare", "figma"] },
   desktop: { tools: ["automation", "system", "decode_qr"] },
@@ -26680,30 +26676,23 @@ const _TOOL_BUNDLES = {
   demo:    { tools: ["start_demo", "stop_demo"] },
   // Defer the sub-agent spawn tools so they're NOT in the default payload — an eager model
   // can't casually fire one (the "误触/0 步调研 花架势" noise). They stay fully reachable via
-  // search_tools or a deliberate by-name call (auto-loaded), which is a real intent signal.
+  // search_tools or a deliberate by-name call, which is a real intent signal.
   subagent: { tools: ["run_subagent", "run_worker", "research_project", "generate_wiki", "await_subagent", "spawn_multiple_agents"] },
   // External retrieval is deliberately absent from the first-turn payload. Project
   // evidence, memory, built-in knowledge_search, and model reasoning should answer
   // first; public web/community tools load only for a concrete current-fact gap.
-  // Direct-by-name/search_tools keeps the full capability available without making
-  // network lookup the reflex action.
   resources: { tools: [
     "developer_community_search",
-    "academic_search", "package_search", "github_search", "github_repo",
+    "package_search", "github_search", "github_repo",
     "gitlab_repo", "gitee_repo", "codeberg_repo", "cve_search", "wiki_search",
     "stackoverflow_search", "hackernews_search", "dockerhub_search", "pubmed_search",
     "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
     "clinical_trials_search", "gitlab_search", "gitee_search", "maven_search",
     "packagist_search", "rubygems_search", "nuget_search", "homebrew_search",
-    "mdn_search", "cdnjs_search", "bundlephobia_search", "devto_search", "reddit_search",
-    "steam_search", "iconify_search", "color_search", "lobsters_search", "juejin_search",
-    "codrops_search", "smashingmag_search", "css_tricks_search", "codepen_search",
-    "dribbble_search", "awwwards_search", "v2ex_search", "segmentfault_search",
-    "github_discussions_search", "producthunt_search", "freecodecamp_search",
-    "github_trending", "infoq_search", "hackernoon_search", "codeberg_search",
-    "bestofjs_search", "sourcegraph_search", "deep_search", "smzdm_search",
-    "xianyu_search", "zhuanzhuan_search",
-  ] },
+    "mdn_search", "cdnjs_search", "bundlephobia_search", "devto_search", "steam_search", "iconify_search", "juejin_search",
+    "codrops_search", "smashingmag_search", "css_tricks_search", "awwwards_search", "v2ex_search", "segmentfault_search",
+    "github_discussions_search", "github_trending", "infoq_search", "codeberg_search",
+    "sourcegraph_search", ] },
 };
 const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) => b.tools));
 // Keep the always-loaded Tool Search schema short. The semantic router has the
@@ -26711,8 +26700,7 @@ const _DEFERRED_TOOL_NAMES = new Set(Object.values(_TOOL_BUNDLES).flatMap((b) =>
 // capability. The old domain manual was repeated on every model turn.
 // 兼容旧提示契约：帮用户装软件/装环境/配工具链：run_cmd 配 package_search/homebrew_search。
 // 具体仓库读取契约：要读具体代码仓库的 README/目录/源码/release/issue/PR/MR；GitHub 用 github_repo，GitLab 用 gitlab_repo，Gitee 用 gitee_repo，Codeberg 用 codeberg_repo。
-// 外部来源契约：优惠/薅羊毛/返利/比价加载 smzdm_search；二手/闲鱼/转转/捡漏同时加载 xianyu_search 和 zhuanzhuan_search。
-const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 academic_search、arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search、academic_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search；live_markets（参考汇率/加密资产报价）按需加载。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。`;
+const _SEARCH_TOOLS_DESCRIPTION = `按需查找和加载当前支持的工具（工程、终端、浏览器、数据库、Git、LSP、桌面、MCP 与外部来源都在注册表中）。自然语言请求由语义编排器依据完整目录、任务阶段和真实证据选择，不做关键词或正则路由；已知精确工具名也可直接查询。先用项目证据、记忆和 knowledge_search，只有存在明确的当前事实缺口才加载公网来源。当前时间只表示本轮请求时间，不能替代来源的 published_date、updated_at、version、observed_at、rate_date 或 retrieved_at。最新论文/SOTA/前沿研究加载 arxiv_search、openalex_search、crossref_search；医学/药物/临床优先加载 pubmed_search、clinical_trials_search、pubchem_search；新技术/新版本/API 兼容性先查官方文档、包注册表、GitHub/GitLab/Gitee/Codeberg release/issues 和开发者社区；developer_community_search 用于真实开发者社区证据；游戏价格/平台加载 steam_search。拿到社区、仓库、论坛或专业数据库结果后必须提炼共识、分歧、适用版本/时间、对当前问题的影响和验证动作，不能只罗列链接。`;
 const _SEARCH_TOOLS_SCHEMA = { type: "function", function: { name: "search_tools", description: _SEARCH_TOOLS_DESCRIPTION, parameters: { type: "object", properties: { query: { type: "string", description: "要查找的能力或要完成的工作" } }, required: ["query"] } } };
 
 /**
@@ -26775,6 +26763,9 @@ function _buildToolRegistry(includeWrite, mcpTools = []) {
 // Initial tool payload: the ten-tool Agent nucleus (nine ordinary engineering tools plus
 // search_tools). Everything else is schema-lazy: long-running terminals, browser, databases,
 // Git, external sources and MCP are admitted only when the evolving task actually needs them.
+// `taskText` 故意保留、且故意不使用 —— 删它之前先读上面 _TOOL_BUNDLES 的注释。
+// 多条测试靠"传进一个会命中正则的任务文本，结果仍恒为核心集"来锁住
+//「不按正则预加载」这条契约；形参没了，测试就没法表达这件事。
 function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = includeWrite ? "agent" : "explorer") {
   const all = _buildAgentToolSchemas(includeWrite, mcpTools);
   const mcpNames = new Set((Array.isArray(mcpTools) ? mcpTools : [])
@@ -26955,11 +26946,10 @@ const _KNOWN_TOOLS = new Set([
   "gh_pr_create", "gh_pr_view", "gh_pr_checks", "gh_actions_log", "gh_pr_review_comments", "gh_pr_reply",
   "read_terminal", "read_logs", "list_terminals", "stop_terminal", "run_in_terminal", "start_demo", "stop_demo",
   "http_request", "download_file", "generate_image", "design_board", "db_query", "screenshot",
-  "local_discovery", "live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog", "read_screen", "ui_click",
+  "local_discovery", "live_environment", "read_screen", "ui_click",
   "lsp_symbols", "lsp_definition", "lsp_references", "browser",
   "preview_choices", "visual_explain", "design_research", "learn_design",
-  "background_monitor", "developer_community_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
-  "performance_profile", "openapi_parser", "generate_test_cases", "docker_compose_up", "realtime_news_feed",
+  "background_monitor", "developer_community_search", "performance_profile", "openapi_parser", "generate_test_cases", "docker_compose_up", "realtime_news_feed",
   "spawn_multiple_agents",
   "await_subagent",
 ]);
@@ -27057,16 +27047,8 @@ const _TOOL_ALIASES = {
   runinterminal: "run_in_terminal", run_background: "run_in_terminal",
   webfetch: "web_fetch", fetch: "web_fetch", fetch_url: "web_fetch", curl: "web_fetch", http_get: "web_fetch", get_url: "web_fetch", read_url: "web_fetch", open_url: "web_fetch", visit: "web_fetch",
   websearch: "web_search", search_web: "web_search", google: "web_search", searchweb: "web_search", internet_search: "web_search", web_query: "web_search",
-  smzdm: "smzdm_search", smzdmsearch: "smzdm_search", deal_search: "smzdm_search", coupon_search: "smzdm_search", cashback_search: "smzdm_search",
-  xianyu: "xianyu_search", goofish: "xianyu_search", xianyusearch: "xianyu_search", secondhand_search: "xianyu_search",
-  zhuanzhuan: "zhuanzhuan_search", zhuanzhuansearch: "zhuanzhuan_search",
   localdiscovery: "local_discovery", nearby: "local_discovery", nearby_search: "local_discovery", places: "local_discovery", place_search: "local_discovery",
   liveenvironment: "live_environment", environment_data: "live_environment", weather_data: "live_environment", air_quality: "live_environment", earthquake_data: "live_environment", hazard_data: "live_environment",
-  livemarkets: "live_markets", market_data: "live_markets", exchange_rate: "live_markets", crypto_price: "live_markets",
-  liveflights: "live_flights", flight_data: "live_flights", aircraft_data: "live_flights",
-  roadenvironment: "road_environment",
-  trackshipment: "track_shipment", shipment_tracking: "track_shipment", parcel_tracking: "track_shipment", track_package: "track_shipment",
-  shopcatalog: "shop_catalog", store_catalog: "shop_catalog", storecatalog: "shop_catalog", product_catalog: "shop_catalog", productcatalog: "shop_catalog", product_price: "shop_catalog", productprice: "shop_catalog", shop_products: "shop_catalog", shopproducts: "shop_catalog", menu_prices: "shop_catalog", menuprices: "shop_catalog",
   readscreen: "read_screen", inspect_screen: "read_screen", accessibility_tree: "read_screen",
   uiclick: "ui_click", ax_click: "ui_click", accessibility_click: "ui_click",
   runsubagent: "run_subagent", subagent: "run_subagent",
@@ -27231,19 +27213,15 @@ function _applyToolArgDefaults(name, args, context = "") {
     return picked.length > 260 ? picked.slice(0, 260) : picked;
   };
   const queryDefaultTools = new Set([
-    "search_tools", "search", "web_search", "knowledge_search", "local_discovery", "shop_catalog",
-    "academic_search", "package_search", "github_search", "cve_search", "wiki_search",
+    "search_tools", "search", "web_search", "knowledge_search", "local_discovery", 
+    "package_search", "github_search", "cve_search", "wiki_search",
     "stackoverflow_search", "hackernews_search", "developer_community_search", "dockerhub_search",
     "pubmed_search", "arxiv_search", "crossref_search", "openalex_search", "pubchem_search",
     "clinical_trials_search", "gitlab_search", "gitee_search", "maven_search", "packagist_search",
     "rubygems_search", "nuget_search", "homebrew_search", "mdn_search", "cdnjs_search",
-    "devto_search", "reddit_search", "steam_search", "iconify_search", "color_search",
-    "lobsters_search", "juejin_search", "codrops_search", "smashingmag_search",
-    "css_tricks_search", "codepen_search", "dribbble_search", "awwwards_search", "v2ex_search",
-    "segmentfault_search", "github_discussions_search", "producthunt_search", "freecodecamp_search",
-    "github_trending", "infoq_search", "hackernoon_search", "codeberg_search", "bestofjs_search",
-    "sourcegraph_search", "deep_search", "smzdm_search", "xianyu_search", "zhuanzhuan_search",
-  ]);
+    "devto_search", "steam_search", "iconify_search", "juejin_search", "codrops_search", "smashingmag_search",
+    "css_tricks_search", "awwwards_search", "v2ex_search",
+    "segmentfault_search", "github_discussions_search", "github_trending", "infoq_search", "codeberg_search", "sourcegraph_search", ]);
   if (!a.query && queryDefaultTools.has(canonical)) {
     const q = contextQuery();
     if (q) a.query = q;
@@ -27794,16 +27772,11 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       return { type: "localdiscovery", path: args.near || "", query: String(args.query || ""), near: args.near ? String(args.near) : "", latitude, longitude, radiusM: radius === null ? null : Math.max(100, Math.min(radius, 20000)), limit: limit === null ? null : Math.max(1, Math.min(limit, 30)), language: args.language ? String(args.language) : _preferredLanguageCode() };
     }
     case "live_environment": return { type: "liveenvironment", path: String(args.kind || "environment"), kind: String(args.kind || ""), latitude: _finiteNumberArg(args.latitude), longitude: _finiteNumberArg(args.longitude), radiusKm: _finiteNumberArg(args.radius_km), window: args.window ? String(args.window) : "", minimumMagnitude: _finiteNumberArg(args.minimum_magnitude), category: args.category ? String(args.category) : "", limit: _finiteNumberArg(args.limit) };
-    case "live_markets": return { type: "livemarkets", path: `${String(args.base || "").toUpperCase()}/${String(args.quote || "").toUpperCase()}`, kind: String(args.kind || ""), base: String(args.base || ""), quote: String(args.quote || "") };
-    case "live_flights": return { type: "liveflights", path: "OpenSky", latitude: _finiteNumberArg(args.latitude), longitude: _finiteNumberArg(args.longitude), radiusKm: _finiteNumberArg(args.radius_km), limit: _finiteNumberArg(args.limit) };
-    case "road_environment": return { type: "roadenvironment", path: String(args.kind || "overview"), kind: String(args.kind || ""), near: args.near ? String(args.near) : "", latitude: _finiteNumberArg(args.latitude), longitude: _finiteNumberArg(args.longitude), radiusKm: _finiteNumberArg(args.radius_km), lookbackHours: _finiteNumberArg(args.lookback_hours), limit: _finiteNumberArg(args.limit) };
     case "performance_profile": return { type: "performance_profile", url: args.url || "", metrics: args.metrics || "both", timeoutSeconds: Number.isFinite(+args.timeoutSeconds) ? +args.timeoutSeconds : 30 };
     case "openapi_parser": return { type: "openapi_parser", url: args.url || "", outputFormat: args.outputFormat || "list" };
     case "generate_test_cases": return { type: "generate_test_cases", path: args.path || "", framework: args.framework || "auto" };
     case "docker_compose_up": return { type: "docker_compose_up", path: args.path || "docker-compose.yml", services: Array.isArray(args.services) ? args.services.map((s) => String(s)) : [], detach: args.detach !== false };
     case "realtime_news_feed": return { type: "realtime_news_feed", topic: String(args.topic || ""), sources: args.sources || "all", maxResults: Number.isFinite(+args.maxResults) ? Math.max(1, Math.min(25, +args.maxResults)) : 10 };
-    case "track_shipment": return { type: "trackshipment", path: "官方核验", trackingNumber: String(args.tracking_number || ""), carrier: args.carrier ? String(args.carrier) : "" };
-    case "shop_catalog": return { type: "shopcatalog", path: String(args.url || args.query || "商品价格"), query: String(args.query || args.url || ""), url: args.url ? String(args.url) : "", limit: _finiteNumberArg(args.limit) };
     case "gh_pr_create": return { type: "gh", op: "pr_create", title: args.title || "", body: args.body || "", base: args.base || "", draft: !!args.draft };
     case "gh_pr_view": return { type: "gh", op: "pr_view", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
     case "gh_pr_checks": return { type: "gh", op: "pr_checks", number: Number.isFinite(+args.number) ? Math.floor(+args.number) : null };
@@ -27836,7 +27809,6 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       return { type: "tor", method: (args.method || "GET").toUpperCase(), url: args.url || "", headers: _h, body: (args.body != null ? String(args.body) : undefined), timeout: args.timeout_secs || args.timeoutSecs || args.timeout };
     }
     case "figma": return { type: "figma", action: String(args.action || "design"), url: String(args.url || args.file || args.link || ""), node: (args.node != null ? String(args.node) : (args.node_id != null ? String(args.node_id) : (args.nodeId != null ? String(args.nodeId) : ""))), depth: Number.isFinite(+args.depth) ? +args.depth : undefined, name: args.name ? String(args.name) : undefined };
-    case "academic_search": return { type: "academic_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "package_search": return { type: "package_search", query: String(args.query || ""), ecosystem: String(args.ecosystem || "npm"), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_search": return { type: "github_search", query: String(args.query || ""), search_type: String(args.search_type || "repositories"), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_repo": return { type: "github_repo", owner: String(args.owner || ""), repo: String(args.repo || ""), action: args.action ? String(args.action) : undefined, path: args.path ? String(args.path) : undefined, branch: args.branch ? String(args.branch) : undefined, max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
@@ -27866,33 +27838,20 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "cdnjs_search": return { type: "cdnjs_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "bundlephobia_search": return { type: "bundlephobia_search", package: String(args.package || args.query || "") };
     case "devto_search": return { type: "devto_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "reddit_search": return { type: "reddit_search", query: String(args.query || ""), subreddit: args.subreddit ? String(args.subreddit) : undefined, max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "steam_search": return { type: "steam_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "iconify_search": return { type: "iconify_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "color_search": return { type: "color_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "lobsters_search": return { type: "lobsters_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "juejin_search": return { type: "juejin_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "codrops_search": return { type: "codrops_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "smashingmag_search": return { type: "smashingmag_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "css_tricks_search": return { type: "css_tricks_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "codepen_search": return { type: "codepen_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "dribbble_search": return { type: "dribbble_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "awwwards_search": return { type: "awwwards_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "v2ex_search": return { type: "v2ex_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "segmentfault_search": return { type: "segmentfault_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_discussions_search": return { type: "github_discussions_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "producthunt_search": return { type: "producthunt_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "freecodecamp_search": return { type: "freecodecamp_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "github_trending": return { type: "github_trending", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "infoq_search": return { type: "infoq_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "hackernoon_search": return { type: "hackernoon_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "codeberg_search": return { type: "codeberg_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "bestofjs_search": return { type: "bestofjs_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "sourcegraph_search": return { type: "sourcegraph_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "deep_search": return { type: "deep_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "smzdm_search": return { type: "smzdm_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "xianyu_search": return { type: "xianyu_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
-    case "zhuanzhuan_search": return { type: "zhuanzhuan_search", query: String(args.query || ""), max_results: Number.isFinite(+args.max_results) ? +args.max_results : undefined };
     case "current_time": return { type: "current_time" };
     case "game_scaffold": return { type: "game_scaffold", engine: String(args.engine || "phaser"), name: String(args.name || "my-game") };
     // Default react, NOT vue. Every design prompt tells the model to build Michael Design
@@ -28329,10 +28288,8 @@ const _OFFICIAL_RESEARCH_EVIDENCE_TOOLS = new Set([
 ]);
 const _COMMUNITY_RESEARCH_EVIDENCE_TOOLS = new Set([
   "developer_community_search", "stackoverflow_search", "github_discussions_search",
-  "hackernews_search", "reddit_search", "lobsters_search", "devto_search",
-  "juejin_search", "v2ex_search", "segmentfault_search", "producthunt_search",
-  "freecodecamp_search", "infoq_search", "hackernoon_search",
-  "rust_users_search", "python_discussions_search", "swift_forums_search",
+  "hackernews_search", "devto_search",
+  "juejin_search", "v2ex_search", "segmentfault_search", "infoq_search", "rust_users_search", "python_discussions_search", "swift_forums_search",
   "kotlin_discussions_search",
 ]);
 const _OFFICIAL_RESEARCH_HOSTS = new Set([
@@ -28831,16 +28788,14 @@ const _AR_URL_RE = /https?:\/\/[^\s)\]"'<>`,]+/g;
 const _AR_SKIP_RE = /duckduckgo\.com|bing\.com\/search|google\.com\/search|\/search\?|\.(?:jpg|jpeg|png|gif|svg|webp|mp4|webm|mov|m4v|ogv|zip|pdf|exe|dmg)(?:[?#]|$)/i;
 // Specialized searches whose VALUE is in the linked page body (repo README, forum
 // thread, article) — auto-deep-read these. Metadata searches (package_search,
-// cve_search, color_search…) already return the answer, so we skip them (no point
+// cve_search, …) already return the answer, so we skip them (no point
 // fetching an npm page for a version number, and it'd just add latency).
 const _DEEP_READ_SEARCHES = new Set([
   "developer_community_search", "github_search", "gitee_search", "gitlab_search", "codeberg_search", "sourcegraph_search",
-  "v2ex_search", "reddit_search", "hackernews_search", "lobsters_search", "segmentfault_search",
+  "v2ex_search", "hackernews_search", "segmentfault_search",
   "juejin_search", "github_discussions_search", "stackoverflow_search", "devto_search",
-  "freecodecamp_search", "infoq_search", "hackernoon_search", "smashingmag_search",
-  "css_tricks_search", "codrops_search", "codepen_search", "producthunt_search", "deep_search",
-  "smzdm_search", "xianyu_search", "zhuanzhuan_search",
-]);
+  "infoq_search", "smashingmag_search",
+  "css_tricks_search", "codrops_search", ]);
 async function _autoDeepRead(text, maxPages = 3, perChars = 3200) {
   const _none = { text: "", count: 0 };
   if (!text || typeof text !== "string") return _none;
@@ -32511,21 +32466,19 @@ const _CACHEABLE_TOOL_TYPES = new Set([
   "ghprview", "ghprchecks", "ghprreviewcomments", "ghactionslog",
   "currenttime", "readscreen",
   // P1 重构：所有 deferred 搜索工具纳入 5 分钟结果缓存
-  "academic_search", "package_search", "github_search", "github_repo",
+  "package_search", "github_search", "github_repo",
   "gitlab_repo", "gitee_repo", "codeberg_repo", "cve_search", "wiki_search",
   "stackoverflow_search", "hackernews_search", "developer_community_search",
   "dockerhub_search", "pubmed_search", "arxiv_search", "crossref_search",
   "openalex_search", "pubchem_search", "clinical_trials_search", "gitlab_search",
   "gitee_search", "maven_search", "packagist_search", "rubygems_search",
   "nuget_search", "homebrew_search", "mdn_search", "cdnjs_search",
-  "bundlephobia_search", "devto_search", "reddit_search", "smzdm_search",
-  "xianyu_search", "zhuanzhuan_search", "steam_search", "iconify_search",
-  "color_search", "lobsters_search", "juejin_search", "codrops_search",
-  "smashingmag_search", "css_tricks_search", "codepen_search", "dribbble_search",
-  "awwwards_search", "v2ex_search", "segmentfault_search", "github_discussions_search",
-  "producthunt_search", "freecodecamp_search", "github_trending", "infoq_search",
-  "hackernoon_search", "codeberg_search", "bestofjs_search", "sourcegraph_search",
-  "deep_search", "realtime_news_feed",
+  "bundlephobia_search", "devto_search", "steam_search", "iconify_search",
+  "juejin_search", "codrops_search",
+  "smashingmag_search", "css_tricks_search", "awwwards_search", "v2ex_search", "segmentfault_search", "github_discussions_search",
+  "github_trending", "infoq_search",
+  "codeberg_search", "sourcegraph_search",
+  "realtime_news_feed",
 ]);
 const _TOOL_CACHE_TTL = 5 * 60 * 1000;
 function _toolCacheKey(call) {
@@ -32595,8 +32548,7 @@ const _toolCategoryMap = {
   // 这几个此前一个都不在表里，于是所有 git / gh / lsp / cmd 调用都落到 "other" ——
   // 恰好是这张表最想区分出来的那几类。
   git: "git", gh: "git", lsp: "lsp", cmd: "execution", console: "execution",
-  knowledge: "search", semsearch: "search", deep_search: "search",
-  db: "db", diag: "lsp", subagent: "orchestration", worktree: "orchestration",
+  knowledge: "search", semsearch: "search", db: "db", diag: "lsp", subagent: "orchestration", worktree: "orchestration",
   uiclick: "desktop", localdiscovery: "search", automation: "desktop",
 };
 
@@ -32619,7 +32571,7 @@ function _toolCategoryOf(toolName, callType) {
   if (byName) return byName;
   const byType = _toolCategoryMap[_normToolKey(callType)];
   if (byType) return byType;
-  // 长尾：`*_search` 这一类有上百个（arxiv_search、dribbble_search、cve_search…），
+  // 长尾：`*_search` 这一类有上百个（arxiv_search、cve_search…），
   // 逐个列出来只会再烂掉一次。按后缀归类，新增一个搜索源不用回来改这里。
   const k = _normToolKey(toolName) || _normToolKey(callType);
   if (/search$/.test(k)) return "search";
@@ -35240,7 +35192,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // P1.4(#51): 纳入 git 只读四件套（blame/log 是"查代码历史/为什么这样写"的核心证据工具）。
   // git 工具全部映射为单一 type "git"（op 区分读写），type 级门禁分不出 git_commit/git_push，
   // 所以 _READ_TYPES 放行 "git" 的同时必须用 _GIT_READ_OPS 做 op 级二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "web_fetch", "web_search", "screenshot", "road_environment", "shop_catalog", "git_status", "git_diff", "git_log", "git_blame"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame"];
   const _READ_TYPES = ["read", "list", "search", "find", "semsearch", "findsymbol", "lsp", "diag", "knowledge", "web", "websearch", "screenshot", "roadenvironment", "shopcatalog", "git"];
   const _GIT_READ_OPS = ["status", "diff", "log", "blame"];
   // P0.2: 只读 subagent 额外授予 run_cmd 权限，但仅限纯探索类命令（ls/cat/grep 等）
@@ -41636,7 +41588,7 @@ function _createToolStep(call) {
     : (call.path || call.command || (call.type === "unknown" ? call._toolName : ""))) ?? "");
   const fileName = pathDisplay.split("/").pop();
   const dirPath = pathDisplay.includes("/") ? pathDisplay.split("/").slice(0, -1).join("/") : "";
-  const _kLabels = { academic_search: "学术搜索", package_search: "包搜索", github_search: "GitHub", github_repo: "GitHub 仓库读取", gitlab_repo: "GitLab 仓库读取", gitee_repo: "Gitee 仓库读取", codeberg_repo: "Codeberg 仓库读取", cve_search: "CVE", wiki_search: "维基百科", stackoverflow_search: "StackOverflow", hackernews_search: "HackerNews", dockerhub_search: "DockerHub", pubmed_search: "PubMed", arxiv_search: "arXiv", crossref_search: "CrossRef", openalex_search: "OpenAlex", pubchem_search: "PubChem", clinical_trials_search: "临床试验", gitlab_search: "GitLab", gitee_search: "Gitee", maven_search: "Maven", packagist_search: "Packagist", rubygems_search: "RubyGems", nuget_search: "NuGet", homebrew_search: "Homebrew", mdn_search: "MDN", cdnjs_search: "cdnjs", bundlephobia_search: "Bundlephobia", devto_search: "Dev.to", reddit_search: "Reddit", steam_search: "Steam", iconify_search: "Icons", color_search: "Colors", lobsters_search: "Lobsters", juejin_search: "掘金", codrops_search: "Codrops", smashingmag_search: "SmashingMag", css_tricks_search: "CSS-Tricks", codepen_search: "CodePen", dribbble_search: "Dribbble", awwwards_search: "Awwwards", v2ex_search: "V2EX", segmentfault_search: "思否", github_discussions_search: "Discussions", producthunt_search: "ProductHunt", freecodecamp_search: "FreeCodeCamp", github_trending: "Trending", infoq_search: "InfoQ", hackernoon_search: "HackerNoon", codeberg_search: "Codeberg", bestofjs_search: "Best of JS", sourcegraph_search: "Sourcegraph", deep_search: "深层搜索", smzdm_search: "什么值得买", xianyu_search: "闲鱼", zhuanzhuan_search: "转转" };
+  const _kLabels = { package_search: "包搜索", github_search: "GitHub", github_repo: "GitHub 仓库读取", gitlab_repo: "GitLab 仓库读取", gitee_repo: "Gitee 仓库读取", codeberg_repo: "Codeberg 仓库读取", cve_search: "CVE", wiki_search: "维基百科", stackoverflow_search: "StackOverflow", hackernews_search: "HackerNews", dockerhub_search: "DockerHub", pubmed_search: "PubMed", arxiv_search: "arXiv", crossref_search: "CrossRef", openalex_search: "OpenAlex", pubchem_search: "PubChem", clinical_trials_search: "临床试验", gitlab_search: "GitLab", gitee_search: "Gitee", maven_search: "Maven", packagist_search: "Packagist", rubygems_search: "RubyGems", nuget_search: "NuGet", homebrew_search: "Homebrew", mdn_search: "MDN", cdnjs_search: "cdnjs", bundlephobia_search: "Bundlephobia", devto_search: "Dev.to", steam_search: "Steam", iconify_search: "Icons", juejin_search: "掘金", codrops_search: "Codrops", smashingmag_search: "SmashingMag", css_tricks_search: "CSS-Tricks", awwwards_search: "Awwwards", v2ex_search: "V2EX", segmentfault_search: "思否", github_discussions_search: "Discussions", github_trending: "Trending", infoq_search: "InfoQ", codeberg_search: "Codeberg", sourcegraph_search: "Sourcegraph", };
   const actionLabel = _isKSearch ? (_kLabels[call.type] || _toolStepActionLabel(call)) : _toolStepActionLabel(call);
   const typeIcons = {
     write: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9 1.5H4.25A1.75 1.75 0 002.5 3.25v9.5c0 .966.784 1.75 1.75 1.75h7.5a1.75 1.75 0 001.75-1.75V6L9 1.5zm.25 1.31L12.19 5.5H9.75a.5.5 0 01-.5-.5V2.81zM7.25 7.75a.75.75 0 011.5 0V9h1.25a.75.75 0 010 1.5H8.75v1.25a.75.75 0 01-1.5 0V10.5H6a.75.75 0 010-1.5h1.25V7.75z"/></svg>`,
@@ -41669,7 +41621,6 @@ function _createToolStep(call) {
     computer: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v7.5C0 12.216.784 13 1.75 13h4.5l-.5 1.5H4.25a.75.75 0 000 1.5h7.5a.75.75 0 000-1.5h-1.5L9.75 13h4.5A1.75 1.75 0 0016 11.25v-7.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v6.5a.25.25 0 01-.25.25H1.75a.25.25 0 01-.25-.25v-6.5z"/></svg>`,
     askuser: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zM6.05 5.18c.3-.74.99-1.18 1.95-1.18 1.2 0 2.1.78 2.1 1.86 0 .77-.4 1.27-1.06 1.7-.6.38-.79.62-.79 1.04v.27a.5.5 0 01-.5.5h-.5a.5.5 0 01-.5-.5v-.36c0-.78.36-1.27 1.06-1.72.55-.36.74-.58.74-.97 0-.43-.34-.74-.85-.74-.45 0-.77.22-.94.62a.6.6 0 01-.77.32l-.3-.12a.55.55 0 01-.3-.72zM8 12.25a.9.9 0 110-1.8.9.9 0 010 1.8z"/></svg>`,
     current_time: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 100 16A8 8 0 008 0zm0 1.5a6.5 6.5 0 110 13 6.5 6.5 0 010-13z"/><path d="M8.75 4a.75.75 0 00-1.5 0v4.2c0 .26.13.5.35.63l2.6 1.56a.75.75 0 10.77-1.28L8.75 7.7V4z"/></svg>`,
-    deep_search: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5 1a5.5 5.5 0 014.38 8.82l3.65 3.65a.75.75 0 11-1.06 1.06l-3.65-3.65A5.5 5.5 0 116.5 1zm0 1.5a4 4 0 100 8 4 4 0 000-8z"/><circle cx="6.5" cy="5.5" r="2.4" fill="none" stroke="currentColor" stroke-width=".9" opacity=".5"/><circle cx="6.5" cy="5.5" r="1" /></svg>`,
     _ksearch: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1.75C3 .784 3.784 0 4.75 0h6.5c.966 0 1.75.784 1.75 1.75v12.5A1.75 1.75 0 0111.25 16h-6.5A1.75 1.75 0 013 14.25V1.75zm1.75-.25a.25.25 0 00-.25.25v12.5c0 .138.112.25.25.25h6.5a.25.25 0 00.25-.25V1.75a.25.25 0 00-.25-.25h-6.5z"/><path d="M6 4h4M6 6.5h4M6 9h2.5" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" opacity=".55"/></svg>`,
     genimage: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 2A1.75 1.75 0 000 3.75v8.5C0 13.216.784 14 1.75 14h12.5A1.75 1.75 0 0016 12.25v-8.5A1.75 1.75 0 0014.25 2H1.75zM1.5 3.75a.25.25 0 01.25-.25h12.5a.25.25 0 01.25.25v5.69l-3.22-3.22a.75.75 0 00-1.06 0L6.44 9.94 4.78 8.28a.75.75 0 00-1.06 0L1.5 10.5V3.75zM5 6.5a1 1 0 11-2 0 1 1 0 012 0z"/></svg>`,
     db: `<svg viewBox="0 0 16 16" fill="currentColor"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2v-9"/><path d="M2.5 7c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/><path d="M2.5 10.5c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2" fill="none" stroke="currentColor" stroke-width=".6" opacity=".3"/></svg>`,
@@ -45721,9 +45672,9 @@ ${bodyPreview}`)}</pre>`;
         return { type: "figma", path: call.url || "", content: `[FIGMA] 处理出错：${msg}` };
       }
 
-    } else if (call.type === "academic_search" || call.type === "package_search" || call.type === "github_search" || call.type === "github_repo" || call.type === "gitlab_repo" || call.type === "gitee_repo" || call.type === "codeberg_repo" || call.type === "cve_search" || call.type === "wiki_search" || call.type === "stackoverflow_search" || call.type === "hackernews_search" || call.type === "developer_community_search" || call.type === "dockerhub_search" || call.type === "pubmed_search" || call.type === "arxiv_search" || call.type === "crossref_search" || call.type === "openalex_search" || call.type === "pubchem_search" || call.type === "clinical_trials_search" || call.type === "gitlab_search" || call.type === "gitee_search" || call.type === "maven_search" || call.type === "packagist_search" || call.type === "rubygems_search" || call.type === "nuget_search" || call.type === "homebrew_search" || call.type === "mdn_search" || call.type === "cdnjs_search" || call.type === "bundlephobia_search" || call.type === "devto_search" || call.type === "reddit_search" || call.type === "smzdm_search" || call.type === "xianyu_search" || call.type === "zhuanzhuan_search" || call.type === "steam_search" || call.type === "iconify_search" || call.type === "color_search" || call.type === "lobsters_search" || call.type === "juejin_search" || call.type === "codrops_search" || call.type === "smashingmag_search" || call.type === "css_tricks_search" || call.type === "codepen_search" || call.type === "dribbble_search" || call.type === "awwwards_search" || call.type === "v2ex_search" || call.type === "segmentfault_search" || call.type === "github_discussions_search" || call.type === "producthunt_search" || call.type === "freecodecamp_search" || call.type === "github_trending" || call.type === "infoq_search" || call.type === "hackernoon_search" || call.type === "codeberg_search" || call.type === "bestofjs_search" || call.type === "sourcegraph_search" || call.type === "deep_search") {
+    } else if (call.type === "package_search" || call.type === "github_search" || call.type === "github_repo" || call.type === "gitlab_repo" || call.type === "gitee_repo" || call.type === "codeberg_repo" || call.type === "cve_search" || call.type === "wiki_search" || call.type === "stackoverflow_search" || call.type === "hackernews_search" || call.type === "developer_community_search" || call.type === "dockerhub_search" || call.type === "pubmed_search" || call.type === "arxiv_search" || call.type === "crossref_search" || call.type === "openalex_search" || call.type === "pubchem_search" || call.type === "clinical_trials_search" || call.type === "gitlab_search" || call.type === "gitee_search" || call.type === "maven_search" || call.type === "packagist_search" || call.type === "rubygems_search" || call.type === "nuget_search" || call.type === "homebrew_search" || call.type === "mdn_search" || call.type === "cdnjs_search" || call.type === "bundlephobia_search" || call.type === "devto_search" || call.type === "steam_search" || call.type === "iconify_search" || call.type === "juejin_search" || call.type === "codrops_search" || call.type === "smashingmag_search" || call.type === "css_tricks_search" || call.type === "awwwards_search" || call.type === "v2ex_search" || call.type === "segmentfault_search" || call.type === "github_discussions_search" || call.type === "github_trending" || call.type === "infoq_search" || call.type === "codeberg_search" || call.type === "sourcegraph_search") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: call.type, path: "", content: "[不可用] 知识库搜索只能在桌面 App 里用。" }; }
-      const _labels = { academic_search: "学术搜索", package_search: "包搜索", github_search: "GitHub", github_repo: "GitHub 仓库读取", gitlab_repo: "GitLab 仓库读取", gitee_repo: "Gitee 仓库读取", codeberg_repo: "Codeberg 仓库读取", cve_search: "CVE", wiki_search: "维基百科", stackoverflow_search: "StackOverflow", hackernews_search: "HackerNews", developer_community_search: "开发者社区聚合搜索", dockerhub_search: "DockerHub", pubmed_search: "PubMed", arxiv_search: "arXiv", crossref_search: "CrossRef", openalex_search: "OpenAlex", pubchem_search: "PubChem", clinical_trials_search: "临床试验", gitlab_search: "GitLab", gitee_search: "Gitee", maven_search: "Maven", packagist_search: "Packagist", rubygems_search: "RubyGems", nuget_search: "NuGet", homebrew_search: "Homebrew", mdn_search: "MDN", cdnjs_search: "cdnjs", bundlephobia_search: "Bundlephobia", devto_search: "Dev.to", reddit_search: "Reddit", smzdm_search: "什么值得买", xianyu_search: "闲鱼", zhuanzhuan_search: "转转", steam_search: "Steam", iconify_search: "Icons", color_search: "Colors", lobsters_search: "Lobsters", juejin_search: "掘金", codrops_search: "Codrops", smashingmag_search: "SmashingMag", css_tricks_search: "CSS-Tricks", codepen_search: "CodePen", dribbble_search: "Dribbble", awwwards_search: "Awwwards", v2ex_search: "V2EX", segmentfault_search: "思否", github_discussions_search: "GitHub Discussions", producthunt_search: "ProductHunt", freecodecamp_search: "FreeCodeCamp", github_trending: "GitHub Trending", infoq_search: "InfoQ", hackernoon_search: "HackerNoon", codeberg_search: "Codeberg", bestofjs_search: "Best of JS", sourcegraph_search: "Sourcegraph", deep_search: "深层搜索" };
+      const _labels = { package_search: "包搜索", github_search: "GitHub", github_repo: "GitHub 仓库读取", gitlab_repo: "GitLab 仓库读取", gitee_repo: "Gitee 仓库读取", codeberg_repo: "Codeberg 仓库读取", cve_search: "CVE", wiki_search: "维基百科", stackoverflow_search: "StackOverflow", hackernews_search: "HackerNews", developer_community_search: "开发者社区聚合搜索", dockerhub_search: "DockerHub", pubmed_search: "PubMed", arxiv_search: "arXiv", crossref_search: "CrossRef", openalex_search: "OpenAlex", pubchem_search: "PubChem", clinical_trials_search: "临床试验", gitlab_search: "GitLab", gitee_search: "Gitee", maven_search: "Maven", packagist_search: "Packagist", rubygems_search: "RubyGems", nuget_search: "NuGet", homebrew_search: "Homebrew", mdn_search: "MDN", cdnjs_search: "cdnjs", bundlephobia_search: "Bundlephobia", devto_search: "Dev.to", steam_search: "Steam", iconify_search: "Icons", juejin_search: "掘金", codrops_search: "Codrops", smashingmag_search: "SmashingMag", css_tricks_search: "CSS-Tricks", awwwards_search: "Awwwards", v2ex_search: "V2EX", segmentfault_search: "思否", github_discussions_search: "GitHub Discussions", github_trending: "GitHub Trending", infoq_search: "InfoQ", codeberg_search: "Codeberg", sourcegraph_search: "Sourcegraph", };
       try {
         const _args = _tauriSearchInvokeArgs(call);
         const r = await backend.invoke(call.type, _args);
@@ -45743,7 +45694,21 @@ ${bodyPreview}`)}</pre>`;
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = `${_labels[call.type] || call.type} 失败`;
-        return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}。检查查询参数、网络连接或稍后重试。` };
+        // 这 57 个源里有一批是**直接抓公开网站的 HTML**，而不少站点已经封了爬虫。
+// 实测（2026-08-05，完整搜索 URL）：producthunt / codepen / colourlovers /
+// freecodecamp / reddit 返回 403，dribbble / smzdm 返回 202 + 空体（反爬挑战），
+// 闲鱼返回 11KB 的 JS 壳页（抓不到商品）。
+//
+// 这类失败**重试永远不会好**。而这里原来一律回一句"检查查询参数、网络连接或
+// 稍后重试"，于是模型换个词再搜、再搜——把一次注定失败的抓取变成一串失败，
+// 用户看到的就是"这破工具动不动就报错"。真因（对方封了爬虫）一个字都没传达。
+//
+// 按状态码分因：能判定是封锁的就明说"换别的源"，只有真正像网络抖动的才建议重试。
+const _blocked = /\b(403|401|429|202)\b/.test(msg) || /forbidden|blocked|captcha|cloudflare|访问被拒/i.test(msg);
+const _hint = _blocked
+  ? "该站点拒绝了程序化访问（反爬 / 需登录），重试无用——换其他信息源，或改用 web_search / browser 打开页面读取。"
+  : "可能是网络或查询参数问题，可换个查询词重试一次；再失败就换其他信息源。";
+return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}。${_hint}` };
       }
 
     } else if (call.type === "automation") {
@@ -47399,18 +47364,11 @@ ${bodyPreview}`)}</pre>`;
         }
       };
       
-      const _fetchReddit = async () => {
-        const query = encodeURIComponent(topic);
-        const url = `https://www.reddit.com/search.json?q=${query}&sort=new&limit=${maxResults}`;
-        const r = await backend.invoke("http_request", { method: "GET", url, headers: { "User-Agent": "Mozilla/5.0 (compatible; Michael-IDE-realtime_news_feed)" }, body: null, timeoutSecs: 30 });
-        if (!r || !r.ok) return { error: `HTTP ${r?.status}: ${r?.status_text || "failed"}` };
-        try {
-          const json = JSON.parse(r.body || "{}");
-          return json.data || {};
-        } catch (e) {
-          return { error: `JSON parse: ${String(e.message || e).slice(0,60)}` };
-        }
-      };
+        // Reddit 源已移除（2026-08-05）：reddit.com/search.json 实测 403（Michael-IDE/1.0、
+        // Reddit 要求的 platform:app:version 格式、浏览器 UA 三种都试过），pushshift 镜像
+        // 已停服。原来它靠 failedSources 优雅降级，不会带坏另外两源 —— 但每次调用都固定
+        // 浪费一个注定 403 的往返，并在结果里留一行"[Reddit] 源失败"的噪音。
+        // HN(hn.algolia.com) 和 Dev.to(dev.to/api/articles) 两源实测正常，保留。
       
       const _fetchDevTo = async () => {
         const tag = encodeURIComponent(topic.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0,30));
@@ -47434,22 +47392,6 @@ ${bodyPreview}`)}</pre>`;
         else { results += hnRes + "\n\n"; }
       }
       
-      if (sources === "all" || sources === "reddit") {
-        const redditRaw = await _fetchReddit();
-        if (redditRaw.error) { failedSources.push(`Reddit(${redditRaw.error})`); }
-        else {
-          const redditPosts = (redditRaw.children || []).filter(p => p.kind === "submission");
-          if (redditPosts.length > 0) {
-            results += redditPosts.slice(0, maxResults).map(p => {
-              const d = p.data;
-              // 公网字段转义：title/permalink 均来自 Reddit API，不可信
-              return `Reddit: ${_escHtml(String(d.title || ""))} | 👍${d.ups || 0} | ${new Date(d.created_at * 1000).toLocaleString()} | https://www.reddit.com${_escHtml(String(d.permalink || ""))}\n`;
-            }).join("\n");
-          } else {
-            results += `[Reddit] 暂无结果或源失败：${redditRaw.error || "空响应"}\n`;
-          }
-        }
-      }
       
       if (sources === "all" || sources === "devto") {
         const devtoRes = await _fetchDevTo();
