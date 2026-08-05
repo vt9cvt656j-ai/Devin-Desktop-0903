@@ -77,10 +77,20 @@
       });
       var j = await r.json().catch(function () { return {}; });
       if (!r.ok || !j.token) { setMsg(j.error || "邮箱或密码错误", "err"); btn.disabled = false; return; }
-      // The gate cookie nginx checks. Not HttpOnly by necessity (set from JS), but Secure +
-      // SameSite=Strict + short-lived; it only gates static-asset delivery, real API calls
-      // still carry the Bearer token and are authorized server-side per request.
-      document.cookie = "mide_token=" + encodeURIComponent(j.token) + "; Path=/; Secure; SameSite=Strict; Max-Age=" + (7 * 24 * 3600);
+      // The gate cookie nginx checks. Not HttpOnly by necessity (set from JS), but Secure
+      // + short-lived; it only gates static-asset delivery, real API calls still carry the
+      // Bearer token and are authorized server-side per request.
+      //
+      // Lax, not Strict. Strict withholds the cookie on EVERY cross-site navigation —
+      // including the one where Stripe returns the buyer to /billing after paying. The
+      // gate then saw no cookie, decided nobody was signed in, and bounced them to the
+      // login page: from the buyer's side, paying logged them out and the payment appeared
+      // to vanish.
+      //
+      // Lax still withholds it from cross-site subresources and cross-site POSTs, which is
+      // where CSRF lives. It only adds it back on top-level GET navigation — exactly the
+      // return-from-checkout case, and nothing that can be triggered silently.
+      document.cookie = "mide_token=" + encodeURIComponent(j.token) + "; Path=/; Secure; SameSite=Lax; Max-Age=" + (7 * 24 * 3600);
       try { localStorage.setItem("michael_token", j.token); } catch (e) {}
       setMsg("登录成功，进入中…", "ok");
       location.replace(nextTarget());
