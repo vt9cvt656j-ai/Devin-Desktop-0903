@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
 import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import JavaScriptObfuscator from "javascript-obfuscator";
 import { stripToolIp } from "./build/strip-tool-ip.mjs";
 
@@ -160,10 +163,26 @@ function dynamicImportGuard() {
 
 export default defineConfig({
   clearScreen: false,
+  // The app's own version, so the desktop heartbeat can tell the gateway which build is
+  // running. Read from package.json at build time rather than hardcoded, because a
+  // second place to bump is a place that gets forgotten.
+  define: {
+    __APP_VERSION__: JSON.stringify(
+      JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version,
+    ),
+  },
   plugins: [
     // enforce:"pre" → tool-IP strip runs before bundling.
     stripToolIpPlugin(),
-    // enforce:"post" renderChunk → obfuscate the final emitted app chunks.
+    // React islands: shadcn components mounted into the existing vanilla shell.
+    // Only touches .jsx/.tsx — src/main.js has no JSX, so the 59k-line shell is not
+    // transformed and its 907 source-text test assertions keep matching.
+    react(),
+    // Tailwind v4. Preflight is deliberately NOT imported (see src/ui/tailwind.css):
+    // its reset would restyle every element in 14,111 lines of existing CSS.
+    tailwindcss(),
+    // writeBundle → obfuscate the final emitted app chunks.
+    // React/Radix land in `vendor` (see manualChunks), which this never touches.
     obfuscateAppChunks(),
     // generateBundle → assert dynamic imports survived (runs after obfuscation).
     dynamicImportGuard(),
