@@ -228,10 +228,19 @@ export function Billing({ catalog, me, lang, currency, onRedeemed }: Props) {
                           <strong className="font-semibold tabular-nums">{usd(p.included_cents)}</strong>{" "}
                           <span className="text-muted-foreground">{t.includedEachMonth}</span>
                         </Feature>,
-                        <Feature key="win">
-                          <strong className="font-semibold tabular-nums">{usd(p.window_cap_cents)}</strong>{" "}
-                          <span className="text-muted-foreground">{t.per55}</span>
-                        </Feature>,
+                        // Only when there is a cap. A plan with none rendered
+                        // "$0.00 per 5½-hour window", which reads as a plan that gives
+                        // you nothing — the opposite of what an absent cap means.
+                        ...(p.window_cap_cents
+                          ? [
+                              <Feature key="win">
+                                <strong className="font-semibold tabular-nums">
+                                  {usd(p.window_cap_cents)}
+                                </strong>{" "}
+                                <span className="text-muted-foreground">{t.per55}</span>
+                              </Feature>,
+                            ]
+                          : []),
                         <Feature key="wk">
                           <span className="text-muted-foreground">
                             {p.weekly_cap_cents ? `${usd(p.weekly_cap_cents)} ${t.weeklyCapSuffix}` : t.noWeeklyCap}
