@@ -82,6 +82,8 @@ struct CatalogRow {
 /// What Stripe says a price actually is. Fetched by lookup key, never typed by hand.
 #[derive(Clone, Debug, Default)]
 pub struct LivePrice {
+    /// Stripe's own id for the price this lookup key currently points at.
+    pub id: String,
     /// Minor units in the price's own currency (fen for cny, cents for usd).
     pub cny_minor: Option<i64>,
     pub usd_minor: Option<i64>,
@@ -151,6 +153,7 @@ async fn live_prices(state: &AppState) -> HashMap<String, LivePrice> {
         out.insert(
             lookup.to_owned(),
             LivePrice {
+                id: p.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
                 cny_minor: opt("cny").or(if base_ccy == "cny" { base_amount } else { None }),
                 usd_minor: opt("usd").or(if base_ccy == "usd" { base_amount } else { None }),
                 recurring: p.get("recurring").map(|v| !v.is_null()).unwrap_or(false),
@@ -289,9 +292,17 @@ pub async fn checkout(
     .await?
     .ok_or_else(|| AppError::bad("商品不存在或已下架"))?;
 
-    let price_id = row
-        .stripe_price_id
-        .clone()
+    // Resolved by lookup key, not from the stored column. A Stripe price is immutable:
+    // changing an amount means creating a NEW price and moving the lookup key onto it.
+    // Reading the id from the key means that move is all it takes — no row to update, and
+    // no window where the database points at the old price while Stripe has the new one.
+    // The stored column stays as the fallback for when Stripe cannot be reached.
+    let live = live_prices(&state).await;
+    let live_entry = live.get(&req.lookup_key);
+    let price_id = live_entry
+        .map(|p| p.id.clone())
+        .filter(|id| !id.is_empty())
+        .or_else(|| row.stripe_price_id.clone())
         .ok_or_else(|| AppError::bad("该商品未绑定 Stripe 价格"))?;
 
     // Quantity only applies where the row prices per unit; everything else is one.
@@ -319,11 +330,7 @@ pub async fn checkout(
     // ("You must provide at least one recurring price in subscription mode"), which is a
     // Subscribe button that silently does nothing. Stripe is the only thing that
     // actually knows, so it is the thing that decides.
-    let recurring = live_prices(&state)
-        .await
-        .get(&req.lookup_key)
-        .map(|p| p.recurring)
-        .unwrap_or(row.recurring);
+    let recurring = live_entry.map(|p| p.recurring).unwrap_or(row.recurring);
     let mode = if recurring { "subscription" } else { "payment" };
     let base = public_base();
 
