@@ -33,6 +33,9 @@ pub struct Receipt<'a> {
     pub duration: Option<&'a str>,
     pub order_id: &'a str,
     pub console_url: &'a str,
+    /// Absolute and anonymously fetchable — an email carries no session, and a logo
+    /// behind a login renders as a broken image.
+    pub logo_url: &'a str,
 }
 
 /// A row in the details table. `strong` is for the figures worth scanning to.
@@ -67,34 +70,40 @@ pub fn purchase_html(r: &Receipt) -> String {
 
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border:1px solid {LINE};border-radius:12px;">
 
-  <tr><td style="padding:32px 32px 0 32px;">
+  <tr><td align="center" style="padding:36px 32px 0 32px;text-align:center;">
+    <!-- Most clients block remote images by default, so the wordmark below is real text.
+         The logo is a bonus, never the only thing carrying the brand. -->
+    <img src="{logo}" width="44" height="44" alt="" style="display:block;margin:0 auto 12px auto;border:0;border-radius:10px;">
     <div style="font-size:15px;font-weight:600;color:{INK};letter-spacing:-0.01em;">Mr.day One</div>
   </td></tr>
 
-  <tr><td style="padding:24px 32px 0 32px;">
-    <div style="font-size:22px;font-weight:600;color:{INK};letter-spacing:-0.02em;">购买成功</div>
-    <div style="margin-top:8px;font-size:14px;line-height:1.6;color:{MUTED};">
+  <tr><td align="center" style="padding:28px 32px 0 32px;text-align:center;">
+    <div style="font-size:24px;font-weight:600;color:{INK};letter-spacing:-0.02em;line-height:1.3;">购买成功</div>
+    <div style="margin-top:10px;font-size:14px;line-height:1.6;color:{MUTED};">
       额度已经发放到你的账号，可以直接开始使用。
     </div>
   </td></tr>
 
-  <tr><td style="padding:24px 32px 0 32px;">
+  <tr><td style="padding:28px 32px 0 32px;">
+    <!-- The one block that stays left/right aligned: figures are scanned down a column,
+         and centring them would break that. -->
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
       {rows}
     </table>
   </td></tr>
 
-  <tr><td style="padding:24px 32px 0 32px;">
-    <!-- Bulletproof-ish button: a padded anchor, since Outlook ignores button elements. -->
-    <a href="{console}" style="display:inline-block;background:{INK};color:#ffffff;text-decoration:none;font-size:14px;font-weight:500;padding:12px 20px;border-radius:8px;">
+  <tr><td align="center" style="padding:28px 32px 0 32px;text-align:center;">
+    <!-- A padded anchor, not a <button>: Outlook does not render button elements. -->
+    <a href="{console}" style="display:inline-block;background:{INK};color:#ffffff;text-decoration:none;font-size:14px;font-weight:500;padding:13px 24px;border-radius:8px;">
       查看我的账号
     </a>
   </td></tr>
 
-  <tr><td style="padding:24px 32px 32px 32px;">
-    <div style="border-top:1px solid {LINE};padding-top:16px;font-size:12px;line-height:1.7;color:{MUTED};">
-      付款由 <strong style="color:{INK};font-weight:600;">Stripe</strong> 处理，银行卡信息不会经过 Mr.day One 的服务器。<br>
-      如需发票或有任何疑问，直接回复这封邮件即可。
+  <tr><td align="center" style="padding:28px 32px 32px 32px;text-align:center;">
+    <div style="border-top:1px solid {LINE};padding-top:20px;font-size:12px;line-height:1.8;color:{MUTED};">
+      付款由 <strong style="color:{INK};font-weight:600;">Stripe</strong> 处理<br>
+      银行卡信息不会经过 Mr.day One 的服务器<br>
+      <span style="display:inline-block;margin-top:8px;">如需发票或有任何疑问，直接回复这封邮件即可</span>
     </div>
   </td></tr>
 
@@ -116,6 +125,7 @@ pub fn purchase_html(r: &Receipt) -> String {
             format!("{}{}", row("获得", r.granted, true), duration_row)
         ),
         console = esc(r.console_url),
+        logo = esc(r.logo_url),
         order = esc(r.order_id),
     )
 }
@@ -132,6 +142,7 @@ mod tests {
             duration: Some("30 天"),
             order_id: "ord_123",
             console_url: "https://code.mrday.one/billing",
+            logo_url: "https://code.mrday.one/api/logo.png",
         })
     }
 
@@ -161,6 +172,7 @@ mod tests {
             duration: None,
             order_id: "o",
             console_url: "https://code.mrday.one/billing",
+            logo_url: "https://code.mrday.one/api/logo.png",
         });
         assert!(!html.contains("<script>"), "product label was not escaped");
         assert!(html.contains("&lt;script&gt;"));
@@ -175,6 +187,7 @@ mod tests {
             duration: None,
             order_id: "o",
             console_url: "https://code.mrday.one/billing",
+            logo_url: "https://code.mrday.one/api/logo.png",
         });
         assert!(!html.contains("有效期"), "credits never expire — do not imply they do");
     }

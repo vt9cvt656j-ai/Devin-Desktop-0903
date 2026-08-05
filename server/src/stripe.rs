@@ -576,6 +576,31 @@ pub async fn webhook(
                 }
             }
         }
+        // Fallback for an endpoint that was never subscribed to
+        // checkout.session.completed. That is the only event carrying who bought what, so
+        // without it the money lands and nothing is granted — which is exactly what
+        // happened here: charge.succeeded and payment_intent.succeeded arrived, the
+        // session event did not, and the buyer got nothing.
+        //
+        // Stripe can map a payment intent back to its session, so the missing event can be
+        // reconstructed. Double-granting is prevented by the session claim inside
+        // fulfil_session, not by hoping only one of the two events is subscribed.
+        "payment_intent.succeeded" => {
+            let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
+            let pi = obj.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+            if !pi.is_empty() {
+                if let Some(session) = session_for_payment_intent(&state, &pi).await {
+                    if let Some((uid, label, quantity)) = fulfil_session(&mut tx, &session).await? {
+                        tracing::info!("fulfilled {pi} via payment_intent fallback");
+                        post_commit.push((
+                            uid,
+                            "order_paid",
+                            json!({ "via": "stripe", "product": label, "quantity": quantity }),
+                        ));
+                    }
+                }
+            }
+        }
         // Renewals. The first invoice of a subscription arrives here too, but the
         // session already granted it and `stripe_events` keeps that from doubling up
         // only per-event — so renewals are matched on the subscription id instead.
@@ -679,6 +704,37 @@ async fn end_subscription(
 /// or a user we cannot resolve, and a redelivery would reach the identical conclusion.
 /// Real failures propagate with `?` and take the event claim down with them.
 /// On success returns (user, product label, quantity) for the caller to record post-commit.
+/// Find the Checkout Session a payment intent belongs to.
+///
+/// Used only by the fallback path above. Returns None on any failure — a fallback that
+/// cannot reach Stripe simply does not fire, and the primary event (or Stripe's retry)
+/// remains the path that matters.
+async fn session_for_payment_intent(
+    state: &AppState,
+    payment_intent: &str,
+) -> Option<serde_json::Value> {
+    let key = secret_key()?;
+    let body: serde_json::Value = state
+        .update_http
+        .get(format!("{STRIPE_API}/checkout/sessions"))
+        .bearer_auth(&key)
+        .query(&[("payment_intent", payment_intent), ("limit", "1")])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let session = body.get("data")?.as_array()?.first()?.clone();
+    // Only fulfil once the money is actually there, same rule as the primary path.
+    let paid = session
+        .get("payment_status")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "paid" || s == "no_payment_required")
+        .unwrap_or(false);
+    paid.then_some(session)
+}
+
 async fn fulfil_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: &serde_json::Value,
@@ -726,10 +782,14 @@ async fn fulfil_session(
         .unwrap_or(1)
         .max(1);
 
-    grant(tx, uid, &row, quantity).await?;
-
-    // Flip the pending order, or record one if the buyer reached Stripe some other way.
-    let updated = sqlx::query(
+    // Claim the SESSION before granting anything.
+    //
+    // `stripe_events` dedupes by event id, which is not the same thing: one payment can
+    // arrive as two different events — checkout.session.completed and, on endpoints
+    // subscribed to it, payment_intent.succeeded. Two ids, two passes through here, and
+    // with grant() first that is two grants for one payment. Ordering the claim first
+    // makes the session itself the unit of "already done".
+    let claimed = sqlx::query(
         "UPDATE orders SET status = 'paid', paid_at = now(), stripe_subscription_id = $2 \
          WHERE stripe_session_id = $1 AND status <> 'paid'",
     )
@@ -737,8 +797,13 @@ async fn fulfil_session(
     .bind(&subscription)
     .execute(&mut **tx)
     .await?;
-    if updated.rows_affected() == 0 {
-        let _ = sqlx::query(
+
+    if claimed.rows_affected() == 0 {
+        // Nothing pending to flip. Either the buyer never went through our checkout (no
+        // row at all), or this session was already fulfilled. The insert decides which:
+        // the unique index on stripe_session_id makes it atomic, so a conflict means
+        // somebody else got there first and we must not grant again.
+        let inserted = sqlx::query(
             "INSERT INTO orders (user_id, email, price_id, kind, plan, duration_days, \
              credits_cents, amount_cents, method, status, stripe_session_id, \
              stripe_subscription_id, quantity, paid_at) \
@@ -756,8 +821,14 @@ async fn fulfil_session(
         .bind(&subscription)
         .bind(quantity as i32)
         .execute(&mut **tx)
-        .await;
+        .await?;
+        if inserted.rows_affected() == 0 {
+            tracing::info!("Stripe session {session_id} already fulfilled; skipping");
+            return Ok(None);
+        }
     }
+
+    grant(tx, uid, &row, quantity).await?;
 
     if let Some(cust) = session.get("customer").and_then(|v| v.as_str()) {
         let _ = sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
