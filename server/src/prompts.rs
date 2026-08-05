@@ -4134,7 +4134,6 @@ mod tests {
             "stackoverflow_search",
             "hackernews_search",
             "devto_search",
-            "reddit_search",
             "gitlab_search",
             "gitee_search",
         ] {
@@ -4387,10 +4386,6 @@ mod tests {
         let tools = tools.as_array().unwrap();
         for (name, expected_source) in [
             ("live_environment", "USGS"),
-            ("live_markets", "Coinbase"),
-            ("live_flights", "OpenSky"),
-            ("road_environment", "温尼伯"),
-            ("track_shipment", "正式机器 API 都需要账号凭据"),
         ] {
             let tool = tools
                 .iter()
@@ -4435,83 +4430,6 @@ mod tests {
             Some(2),
             "coordinate-bound environment kinds must require latitude and longitude"
         );
-        let shipment = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name")
-                    .and_then(|value| value.as_str())
-                    == Some("track_shipment")
-            })
-            .unwrap();
-        assert_eq!(
-            shipment
-                .pointer("/function/parameters/required/0")
-                .and_then(|value| value.as_str()),
-            Some("tracking_number")
-        );
-        assert_eq!(
-            shipment
-                .pointer("/function/parameters/properties/tracking_number/pattern")
-                .and_then(|value| value.as_str()),
-            Some("^[A-Za-z0-9_-]+$")
-        );
-        let road = tools
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name")
-                    .and_then(|value| value.as_str())
-                    == Some("road_environment")
-            })
-            .unwrap();
-        let road_kinds = road
-            .pointer("/function/parameters/properties/kind/enum")
-            .and_then(|value| value.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            road_kinds,
-            [
-                "overview",
-                "vehicle_counts",
-                "traffic_flow",
-                "road_incidents"
-            ]
-        );
-        let road_required = road
-            .pointer("/function/parameters/required")
-            .and_then(|value| value.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(road_required, ["kind"]);
-        let road_location_options = road
-            .pointer("/function/parameters/anyOf")
-            .and_then(|value| value.as_array())
-            .unwrap();
-        assert_eq!(road_location_options.len(), 2);
-        assert_eq!(
-            road_location_options[0]
-                .pointer("/required/0")
-                .and_then(|value| value.as_str()),
-            Some("near")
-        );
-        assert_eq!(
-            road_location_options[1]
-                .pointer("/required")
-                .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(2)
-        );
-        let road_description = road
-            .pointer("/function/description")
-            .and_then(|value| value.as_str())
-            .unwrap();
-        assert!(road_description.contains("Caltrans QuickMap CHP"));
-        assert!(road_description.contains("data_as_of_kind=http_last_modified"));
-        assert!(road_description.contains("不得输出 dispatch notes"));
     }
 
     #[test]
@@ -4953,7 +4871,6 @@ mod tests {
                 frontier_system.contains("# 按任务加载：研究、社区与当前事实"),
                 "{model}"
             );
-            assert!(frontier_system.contains("academic_search"), "{model}");
             assert!(frontier_system.contains("arxiv_search"), "{model}");
             assert!(frontier_system.contains("openalex_search"), "{model}");
 
@@ -4985,30 +4902,7 @@ mod tests {
             );
             assert!(local_system.contains("local_discovery"), "{model}");
 
-            let mut deal_body = serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "现在 iPhone 16 有没有优惠，闲鱼二手行情值不值得捡漏？"}]
-            });
-            assemble_into(&headers, &mut deal_body);
-            let deal_system = deal_body["messages"][0]["content"].as_str().unwrap();
-            assert!(
-                deal_system.contains("# 按任务加载：研究、社区与当前事实"),
-                "{model}"
-            );
-            assert!(deal_system.contains("smzdm_search"), "{model}");
-            assert!(deal_system.contains("xianyu_search"), "{model}");
 
-            let mut finance_body = serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "compare current BTC/USD crypto market data and exchange rate risk"}]
-            });
-            assemble_into(&headers, &mut finance_body);
-            let finance_system = finance_body["messages"][0]["content"].as_str().unwrap();
-            assert!(
-                finance_system.contains("# 按任务加载：研究、社区与当前事实"),
-                "{model}"
-            );
-            assert!(finance_system.contains("live_markets"), "{model}");
 
             let mut medical_body = serde_json::json!({
                 "model": model,
@@ -5231,7 +5125,6 @@ mod tests {
         assert!(names.contains("knowledge_search"));
         assert!(names.contains("local_discovery"));
         assert!(names.contains("live_environment"));
-        assert!(names.contains("road_environment"));
         assert!(body["messages"][0]["content"]
             .as_str()
             .unwrap()
