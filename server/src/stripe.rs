@@ -357,10 +357,28 @@ pub async fn checkout(
         .update_http
         .post(format!("{STRIPE_API}/checkout/sessions"))
         .bearer_auth(&key)
-        // Retrying a failed create must not open two sessions for the same intent.
+        // Retrying a failed create must not open two sessions for the same intent — but
+        // the key has to move whenever the request does, and it must not outlive the
+        // attempt it belongs to. The old key was (user, product, quantity) and broke both
+        // ways:
+        //
+        //   * Stripe remembers a key for 24h and rejects it outright if the parameters
+        //     differ. Fixing this product's mode from subscription to payment therefore
+        //     locked the buyer out for a day with an idempotency_error, not a price
+        //     error — the Subscribe button simply kept failing.
+        //   * Buying the same product twice inside 24h replayed the FIRST session instead
+        //     of opening a new one, handing the buyer a checkout they had already used.
+        //
+        // So: everything that shapes the request goes in, plus a 5-minute bucket. A
+        // network retry seconds later still collapses onto one session; a genuine second
+        // purchase gets a genuine second session.
         .header(
             "Idempotency-Key",
-            format!("co_{uid}_{}_{quantity}", req.lookup_key),
+            format!(
+                "co_{uid}_{}_{quantity}_{mode}_{}",
+                req.lookup_key,
+                chrono::Utc::now().timestamp() / 300
+            ),
         )
         .form(&form)
         .send()
