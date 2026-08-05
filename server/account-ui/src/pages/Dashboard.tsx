@@ -435,27 +435,37 @@ function CodeHosts({ lang }: { lang: Lang }) {
                   </div>
                 </div>
               ) : (
-                <div className="flex flex-wrap items-center justify-center gap-2">
-                  {/* Only when an OAuth app exists. Its absence no longer disables the
-                      card — the token route below always works. */}
-                  {row.oauth_configured ? (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    {/* Only when an OAuth app exists. Its absence no longer disables the
+                        card — the token route below always works. */}
+                    {row.oauth_configured ? (
+                      <Button
+                        disabled={busy === row.provider}
+                        onClick={() => void connect(row.provider)}
+                      >
+                        {busy === row.provider ? t.connecting : t.connect}
+                      </Button>
+                    ) : null}
+                    {/* Named for what it does. Labelled plain "Connect" it promised a
+                        jump to GitHub's sign-in page and instead opened a paste box,
+                        which reads as a broken button rather than a different route. */}
                     <Button
-                      disabled={busy === row.provider}
-                      onClick={() => void connect(row.provider)}
+                      variant={row.oauth_configured ? "outline" : "default"}
+                      onClick={() => {
+                        setNote(null);
+                        setToken("");
+                        setTokenFor(row.provider);
+                      }}
                     >
-                      {busy === row.provider ? t.connecting : t.connect}
+                      {row.oauth_configured ? t.useToken : t.connectWithToken}
                     </Button>
+                  </div>
+                  {!row.oauth_configured ? (
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      {t.oauthUnavailable}
+                    </p>
                   ) : null}
-                  <Button
-                    variant={row.oauth_configured ? "outline" : "default"}
-                    onClick={() => {
-                      setNote(null);
-                      setToken("");
-                      setTokenFor(row.provider);
-                    }}
-                  >
-                    {row.oauth_configured ? t.useToken : t.connect}
-                  </Button>
                 </div>
               )}
             </Card>

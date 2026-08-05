@@ -108,6 +108,9 @@ const EN = {
   disconnect: "Disconnect",
   connectedAs: "Connected as",
   useToken: "Use a token",
+  connectWithToken: "Connect with a token",
+  /** Says why there is no one-click sign-in, so the button is not read as broken. */
+  oauthUnavailable: "One-click sign-in needs an OAuth app registered on the server.",
   cancel: "Cancel",
   tokenPlaceholder: "Paste a personal access token",
   tokenScopes: "Needs scope:",
@@ -278,6 +281,8 @@ const ZH: Dict = {
   disconnect: "断开",
   connectedAs: "已连接",
   useToken: "使用令牌",
+  connectWithToken: "用令牌连接",
+  oauthUnavailable: "一键登录需要服务器上先注册 OAuth 应用。",
   cancel: "取消",
   tokenPlaceholder: "粘贴个人访问令牌",
   tokenScopes: "需要权限：",
