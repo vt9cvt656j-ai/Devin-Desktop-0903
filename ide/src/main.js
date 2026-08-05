@@ -38,6 +38,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "./styles/app.css";
+// shadcn 组件语汇层。必须排在 app.css 之后 —— 它是对现有组件选择器的重写，
+// 靠源码顺序（而不是 !important）取胜，颠倒顺序就整层失效。
+import "./styles/shadcn.css";
+// React 岛：真正的 shadcn 组件（Radix 行为 + Tailwind）。这一行同时把 Tailwind 的
+// 样式带进来。控制台敲 showUIGallery() 看全部组件在当前配色下的样子。
+import "./ui/mount-gallery.jsx";
 import "@xterm/xterm/css/xterm.css";
 import { renderMarkdownInto, renderMarkdownStream, langLabel, monacoLang, langIcon } from "./markdown.js";
 import { ExtensionHost } from "./ext/host.js";
@@ -818,64 +824,249 @@ async function _realAiFetch(config, messages, tools, onEvent) {
   }
 }
 
-function mockBackend() {
-  const ROOT = "/Users/andrew/my-app";
-  const DIRS = new Set([
-    "/Users/andrew",
-    ROOT,
-    ROOT + "/src",
-    ROOT + "/src/utils",
-    ROOT + "/components",
-  ]);
-  const FILES = {
-    [ROOT + "/README.md"]:
-      "# my-app\n\nA sample project shown in the browser preview.\nRun `npm run dev` to start the dev server.\n",
-    [ROOT + "/package.json"]:
-      '{\n  "name": "my-app",\n  "version": "1.0.0",\n  "scripts": {\n    "dev": "vite"\n  }\n}\n',
-    [ROOT + "/src/main.js"]:
-      'import { greet } from "./utils/format.js";\nimport { mount } from "./utils/dom.js";\n\nmount(document.body, greet("world"));\nconsole.log(greet("Michael"));\n',
-    [ROOT + "/src/styles.css"]:
-      "body {\n  margin: 0;\n  font-family: sans-serif;\n}\n\n.card {\n  border-radius: 10px;\n}\n",
-    [ROOT + "/src/utils/format.js"]:
-      'export function greet(name) {\n  const who = name?.trim() || "world";\n  return `Hello, ${who}!`;\n}\n',
-    [ROOT + "/src/utils/dom.js"]:
-      'export function mount(el, text) {\n  el.textContent = text;\n}\n',
-    [ROOT + "/src/utils/math.ts"]:
-      "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nexport function clamp(value: number, min: number, max: number): number {\n  return Math.min(Math.max(value, min), max);\n}\n\nexport const TAU = Math.PI * 2;\n",
-    [ROOT + "/components/Button.js"]:
-      'export function Button(label) {\n  const el = document.createElement("button");\n  el.textContent = label;\n  return el;\n}\n',
-    [ROOT + "/components/Card.js"]:
-      'export function Card(title) {\n  const el = document.createElement("div");\n  el.className = "card";\n  el.textContent = title;\n  return el;\n}\n',
+// Browser-preview sample projects. The default stays the original `my-app` so an
+// existing preview link is unchanged; `?demo=<id>` swaps in another codebase so the
+// preview can show what the editor does with a website, a desktop app, a service or
+// a mobile app rather than always the same four JS files.
+function _previewProject() {
+  const PREVIEW_PROJECTS = {
+  "my-app": {
+    root: "/Users/andrew/my-app",
+    dirs: ["src", "src/utils", "components"],
+    files: {
+      "README.md": "# my-app\n\nA sample project shown in the browser preview.\nRun `npm run dev` to start the dev server.\n",
+      "package.json": '{\n  "name": "my-app",\n  "version": "1.0.0",\n  "scripts": {\n    "dev": "vite"\n  }\n}\n',
+      "src/main.js": 'import { greet } from "./utils/format.js";\nimport { mount } from "./utils/dom.js";\n\nmount(document.body, greet("world"));\nconsole.log(greet("Michael"));\n',
+      "src/styles.css": "body {\n  margin: 0;\n  font-family: sans-serif;\n}\n\n.card {\n  border-radius: 10px;\n}\n",
+      "src/utils/format.js": 'export function greet(name) {\n  const who = name?.trim() || "world";\n  return `Hello, ${who}!`;\n}\n',
+      "src/utils/dom.js": "export function mount(el, text) {\n  el.textContent = text;\n}\n",
+      "src/utils/math.ts": "export function add(a: number, b: number): number {\n  return a + b;\n}\n\nexport function clamp(value: number, min: number, max: number): number {\n  return Math.min(Math.max(value, min), max);\n}\n\nexport const TAU = Math.PI * 2;\n",
+      "components/Button.js": 'export function Button(label) {\n  const el = document.createElement("button");\n  el.textContent = label;\n  return el;\n}\n',
+      "components/Card.js": 'export function Card(title) {\n  const el = document.createElement("div");\n  el.className = "card";\n  el.textContent = title;\n  return el;\n}\n',
+    },
+    open: "src/utils/math.ts",
+    head: {
+      "README.md": "# my-app\n\nA sample project shown in the browser preview.\n",
+      "src/utils/format.js": "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
+    },
+    changes: [
+      { rel: "README.md", code: " M", label: "Modified", staged: false, deleted: false },
+      { rel: "src/utils/format.js", code: "M ", label: "Modified", staged: true, deleted: false },
+      { rel: "components/Card.js", code: "??", label: "Untracked", staged: false, deleted: false },
+    ],
+    conflicts: [{ rel: "src/utils/format.js", name: "format.js" }],
+    merges: {
+      "src/utils/format.js": {
+        base: "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
+        ours: 'export function greet(name) {\n  const who = name?.trim() || "world";\n  return `Hello, ${who}!`;\n}\n',
+        theirs: 'export function greet(name) {\n  return `Hi, ${name || "friend"}!`;\n}\n',
+        merged: '<<<<<<< HEAD\nexport function greet(name) {\n  const who = name?.trim() || "world";\n  return `Hello, ${who}!`;\n}\n=======\nexport function greet(name) {\n  return `Hi, ${name || "friend"}!`;\n}\n>>>>>>> feature/greeting\n',
+      },
+    },
+  },
+
+  // ---- a marketing website: HTML + CSS + JS ----
+  website: {
+    root: "/Users/andrew/aurora-site",
+    dirs: ["assets", "assets/css", "assets/js", "pages"],
+    files: {
+      "index.html": '<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="utf-8" />\n    <title>Aurora — analytics for small teams</title>\n    <link rel="stylesheet" href="/assets/css/site.css" />\n  </head>\n  <body>\n    <header class="nav">\n      <a class="brand" href="/">Aurora</a>\n      <nav>\n        <a href="/pages/pricing.html">Pricing</a>\n        <a href="/pages/docs.html">Docs</a>\n      </nav>\n    </header>\n\n    <main class="hero">\n      <h1>Know what your product is doing.</h1>\n      <p>Ship events in an afternoon. Read them the same day.</p>\n      <form id="signup" class="signup">\n        <input type="email" placeholder="you@company.com" required />\n        <button type="submit">Start free</button>\n      </form>\n    </main>\n\n    <script type="module" src="/assets/js/site.js"></script>\n  </body>\n</html>\n',
+      "assets/css/site.css": ':root {\n  --ink: #0f172a;\n  --muted: #64748b;\n  --brand: #2563eb;\n  --radius: 12px;\n}\n\nbody {\n  margin: 0;\n  font-family: Inter, system-ui, sans-serif;\n  color: var(--ink);\n}\n\n.nav {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 18px 32px;\n  border-bottom: 1px solid #e2e8f0;\n}\n\n.hero {\n  max-width: 720px;\n  margin: 96px auto;\n  text-align: center;\n}\n\n.hero h1 {\n  font-size: clamp(2rem, 5vw, 3.5rem);\n  letter-spacing: -0.02em;\n}\n\n.signup {\n  display: flex;\n  gap: 8px;\n  justify-content: center;\n  margin-top: 32px;\n}\n\n.signup input {\n  padding: 12px 14px;\n  border: 1px solid #cbd5e1;\n  border-radius: var(--radius);\n  min-width: 260px;\n}\n\n.signup button {\n  padding: 12px 20px;\n  border: 0;\n  border-radius: var(--radius);\n  background: var(--brand);\n  color: #fff;\n  font-weight: 600;\n  cursor: pointer;\n}\n',
+      "assets/js/site.js": 'import { track } from "./analytics.js";\n\nconst form = document.querySelector("#signup");\n\nform?.addEventListener("submit", (event) => {\n  event.preventDefault();\n  const email = new FormData(form).get("email");\n  track("signup_submitted", { email });\n  form.reset();\n});\n\n// TODO: the button stays enabled while the request is in flight —\n// a double click sends the event twice.\n',
+      "assets/js/analytics.js": 'const ENDPOINT = "https://api.aurora.dev/v1/events";\n\nexport async function track(name, props = {}) {\n  await fetch(ENDPOINT, {\n    method: "POST",\n    headers: { "Content-Type": "application/json" },\n    body: JSON.stringify({ name, props, at: Date.now() }),\n  });\n}\n',
+      "pages/pricing.html": '<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="utf-8" />\n    <title>Pricing — Aurora</title>\n    <link rel="stylesheet" href="/assets/css/site.css" />\n  </head>\n  <body>\n    <main class="hero">\n      <h1>Simple pricing</h1>\n      <p>Free while you are small. $19 a month when you are not.</p>\n    </main>\n  </body>\n</html>\n',
+      "README.md": "# aurora-site\n\nThe marketing site. Static HTML, one stylesheet, two modules.\n\n```\nnpx serve .\n```\n",
+    },
+    open: "assets/js/site.js",
+    agent: {
+      prompt: "The signup button fires twice if you double-click it. Find it and fix it.",
+      turns: [
+        { say: "Let me read the form handler before changing anything.",
+          tools: [{ name: "read_file", args: { path: "%ROOT%/assets/js/site.js" } }] },
+        { say: "Found it — nothing disables the button while the request is in flight, so a second click sends a second event. I'll gate it and await the call.",
+          tools: [{ name: "edit_file", args: {
+            path: "%ROOT%/assets/js/site.js",
+            old_string: "  const email = new FormData(form).get(\"email\");\n  track(\"signup_submitted\", { email });\n  form.reset();",
+            new_string: "  const button = form.querySelector(\"button\");\n  if (button.disabled) return;\n  button.disabled = true;\n\n  const email = new FormData(form).get(\"email\");\n  await track(\"signup_submitted\", { email });\n\n  form.reset();\n  button.disabled = false;" } }] },
+        { say: "Fixed. The handler now refuses re-entry, disables the button for the duration of the request, and awaits it — so a double click sends one event. The listener already needed to be async, and it is." },
+      ],
+    },
+    play: {
+      // the double-submit fix the copy points at
+      anchor: "  form.reset();",
+      text: "\n  button.disabled = true;\n  await track(\"signup_submitted\", { email });\n  button.disabled = false;",
+    },
+    head: {
+      "assets/js/site.js": 'import { track } from "./analytics.js";\n\nconst form = document.querySelector("#signup");\n',
+    },
+    changes: [
+      { rel: "assets/css/site.css", code: "M ", label: "Modified", staged: true, deleted: false },
+      { rel: "assets/js/site.js", code: " M", label: "Modified", staged: false, deleted: false },
+      { rel: "pages/pricing.html", code: "??", label: "Untracked", staged: false, deleted: false },
+    ],
+    conflicts: [],
+    merges: {},
+  },
+
+  // ---- a desktop application: Rust + TypeScript ----
+  desktop: {
+    root: "/Users/andrew/notes-desktop",
+    dirs: ["src", "src/components", "src-tauri", "src-tauri/src"],
+    files: {
+      "src-tauri/src/main.rs": 'use std::fs;\nuse std::path::PathBuf;\n\n#[tauri::command]\nfn read_note(path: String) -> Result<String, String> {\n    fs::read_to_string(&path).map_err(|e| e.to_string())\n}\n\n#[tauri::command]\nfn write_note(path: String, body: String) -> Result<(), String> {\n    let file = PathBuf::from(&path);\n    if let Some(parent) = file.parent() {\n        fs::create_dir_all(parent).map_err(|e| e.to_string())?;\n    }\n    fs::write(file, body).map_err(|e| e.to_string())\n}\n\nfn main() {\n    tauri::Builder::default()\n        .invoke_handler(tauri::generate_handler![read_note, write_note])\n        .run(tauri::generate_context!())\n        .expect("failed to start");\n}\n',
+      "src-tauri/Cargo.toml": '[package]\nname = "notes-desktop"\nversion = "0.3.1"\nedition = "2021"\n\n[dependencies]\ntauri = { version = "2", features = [] }\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\n',
+      "src/App.tsx": 'import { useEffect, useState } from "react";\nimport { invoke } from "@tauri-apps/api/core";\nimport { NoteList } from "./components/NoteList";\n\nexport default function App() {\n  const [body, setBody] = useState("");\n  const [path, setPath] = useState("~/notes/today.md");\n\n  useEffect(() => {\n    invoke<string>("read_note", { path }).then(setBody).catch(() => setBody(""));\n  }, [path]);\n\n  async function save() {\n    await invoke("write_note", { path, body });\n  }\n\n  return (\n    <main className="app">\n      <NoteList onOpen={setPath} />\n      <textarea value={body} onChange={(e) => setBody(e.target.value)} />\n      <button onClick={save}>Save</button>\n    </main>\n  );\n}\n',
+      "src/components/NoteList.tsx": 'type Props = { onOpen: (path: string) => void };\n\nconst notes = ["today.md", "ideas.md", "reading.md"];\n\nexport function NoteList({ onOpen }: Props) {\n  return (\n    <ul className="notes">\n      {notes.map((n) => (\n        <li key={n}>\n          <button onClick={() => onOpen(`~/notes/${n}`)}>{n}</button>\n        </li>\n      ))}\n    </ul>\n  );\n}\n',
+      "package.json": '{\n  "name": "notes-desktop",\n  "version": "0.3.1",\n  "scripts": {\n    "dev": "vite",\n    "tauri": "tauri"\n  }\n}\n',
+      "README.md": "# notes-desktop\n\nA small notes app: React front end, Rust core, packaged with Tauri.\n\n```\nnpm run tauri dev\n```\n",
+    },
+    open: "src-tauri/src/main.rs",
+    agent: {
+      prompt: "write_note will happily write anywhere on disk. Constrain it to the notes directory.",
+      turns: [
+        { say: "Reading the command first.",
+          tools: [{ name: "read_file", args: { path: "%ROOT%/src-tauri/src/main.rs" } }] },
+        { say: "It takes an arbitrary path straight from the front end. I'll canonicalise and refuse anything outside the notes root.",
+          tools: [{ name: "edit_file", args: {
+            path: "%ROOT%/src-tauri/src/main.rs",
+            old_string: "    let file = PathBuf::from(&path);",
+            new_string: "    let root = dirs::home_dir().ok_or(\"no home directory\")?.join(\"notes\");\n    let file = PathBuf::from(&path);\n    if !file.starts_with(&root) {\n        return Err(format!(\"refusing to write outside {}\", root.display()));\n    }" } }] },
+        { say: "Path traversal is closed: anything outside ~/notes is rejected before the write, and the error names the boundary rather than leaking the attempted path." },
+      ],
+    },
+    play: {
+      anchor: "fn main() {",
+      text: "\n    // guard: never write outside the notes directory\n    let root = dirs::home_dir().unwrap().join(\"notes\");",
+    },
+    head: {
+      "src-tauri/src/main.rs": 'use std::fs;\n\n#[tauri::command]\nfn read_note(path: String) -> Result<String, String> {\n    fs::read_to_string(&path).map_err(|e| e.to_string())\n}\n',
+    },
+    changes: [
+      { rel: "src-tauri/src/main.rs", code: "M ", label: "Modified", staged: true, deleted: false },
+      { rel: "src/App.tsx", code: " M", label: "Modified", staged: false, deleted: false },
+    ],
+    conflicts: [],
+    merges: {},
+  },
+
+  // ---- a backend service: Python + tests ----
+  service: {
+    root: "/Users/andrew/billing-service",
+    dirs: ["app", "app/routers", "tests"],
+    files: {
+      "app/main.py": 'from fastapi import FastAPI\n\nfrom app.routers import invoices, webhooks\n\napp = FastAPI(title="billing-service")\n\napp.include_router(invoices.router, prefix="/invoices", tags=["invoices"])\napp.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])\n\n\n@app.get("/healthz")\ndef healthz() -> dict[str, str]:\n    return {"status": "ok"}\n',
+      "app/routers/invoices.py": 'from decimal import Decimal\n\nfrom fastapi import APIRouter, HTTPException\n\nfrom app.models import Invoice, LineItem\n\nrouter = APIRouter()\n\n_INVOICES: dict[str, Invoice] = {}\n\n\n@router.post("")\ndef create_invoice(items: list[LineItem]) -> Invoice:\n    if not items:\n        raise HTTPException(status_code=422, detail="an invoice needs at least one line")\n    total = sum((i.unit_price * i.quantity for i in items), Decimal("0"))\n    invoice = Invoice(id=f"inv_{len(_INVOICES) + 1:05d}", items=items, total=total)\n    _INVOICES[invoice.id] = invoice\n    return invoice\n\n\n@router.get("/{invoice_id}")\ndef get_invoice(invoice_id: str) -> Invoice:\n    if invoice_id not in _INVOICES:\n        raise HTTPException(status_code=404, detail="no such invoice")\n    return _INVOICES[invoice_id]\n',
+      "app/routers/webhooks.py": 'import hmac\nfrom hashlib import sha256\n\nfrom fastapi import APIRouter, Header, HTTPException, Request\n\nrouter = APIRouter()\n\nSECRET = b"replace-me"\n\n\n@router.post("/stripe")\nasync def stripe(request: Request, signature: str = Header(default="")) -> dict[str, bool]:\n    body = await request.body()\n    expected = hmac.new(SECRET, body, sha256).hexdigest()\n    # NOTE: this comparison is not constant time.\n    if signature != expected:\n        raise HTTPException(status_code=400, detail="bad signature")\n    return {"received": True}\n',
+      "app/models.py": 'from decimal import Decimal\n\nfrom pydantic import BaseModel, Field\n\n\nclass LineItem(BaseModel):\n    description: str\n    quantity: int = Field(gt=0)\n    unit_price: Decimal\n\n\nclass Invoice(BaseModel):\n    id: str\n    items: list[LineItem]\n    total: Decimal\n',
+      "tests/test_invoices.py": 'from decimal import Decimal\n\nimport pytest\nfrom fastapi.testclient import TestClient\n\nfrom app.main import app\n\nclient = TestClient(app)\n\n\ndef test_empty_invoice_is_rejected():\n    response = client.post("/invoices", json=[])\n    assert response.status_code == 422\n\n\ndef test_total_sums_line_items():\n    payload = [\n        {"description": "seat", "quantity": 3, "unit_price": "12.00"},\n        {"description": "support", "quantity": 1, "unit_price": "40.00"},\n    ]\n    response = client.post("/invoices", json=payload)\n    assert response.status_code == 200\n    assert Decimal(response.json()["total"]) == Decimal("76.00")\n',
+      "requirements.txt": "fastapi==0.115.0\npydantic==2.9.0\nuvicorn==0.30.6\npytest==8.3.3\nhttpx==0.27.2\n",
+      "README.md": "# billing-service\n\nInvoices and payment webhooks.\n\n```\nuvicorn app.main:app --reload\npytest -q\n```\n",
+    },
+    open: "app/routers/invoices.py",
+    agent: {
+      prompt: "Add an endpoint to void an invoice, and keep it consistent with the others.",
+      turns: [
+        { say: "Reading the router so the new handler matches the existing conventions.",
+          tools: [{ name: "read_file", args: { path: "%ROOT%/app/routers/invoices.py" } }] },
+        { say: "The other handlers raise 404 through HTTPException and return typed responses. I'll follow both.",
+          tools: [{ name: "edit_file", args: {
+            path: "%ROOT%/app/routers/invoices.py",
+            old_string: "    return _INVOICES[invoice_id]",
+            new_string: "    return _INVOICES[invoice_id]\n\n\n@router.delete(\"/{invoice_id}\")\ndef void_invoice(invoice_id: str) -> dict[str, bool]:\n    if _INVOICES.pop(invoice_id, None) is None:\n        raise HTTPException(status_code=404, detail=\"no such invoice\")\n    return {\"voided\": True}" } }] },
+        { say: "Added. It reuses the same 404 contract as get_invoice and returns a typed body, so the OpenAPI schema stays honest.",
+          tools: [{ name: "run_cmd", args: { command: "pytest -q", cwd: "%ROOT%" } }] },
+        { say: "The suite still runs clean against the change." },
+      ],
+    },
+    play: {
+      anchor: "    return _INVOICES[invoice_id]",
+      text: "\n\n\n@router.delete(\"/{invoice_id}\")\ndef void_invoice(invoice_id: str) -> dict[str, bool]:\n    if _INVOICES.pop(invoice_id, None) is None:\n        raise HTTPException(status_code=404, detail=\"no such invoice\")\n    return {\"voided\": True}",
+    },
+    head: {
+      "app/routers/webhooks.py": 'from fastapi import APIRouter\n\nrouter = APIRouter()\n',
+    },
+    changes: [
+      { rel: "app/routers/webhooks.py", code: "M ", label: "Modified", staged: true, deleted: false },
+      { rel: "tests/test_invoices.py", code: " M", label: "Modified", staged: false, deleted: false },
+      { rel: "requirements.txt", code: "??", label: "Untracked", staged: false, deleted: false },
+    ],
+    conflicts: [],
+    merges: {},
+  },
+
+  // ---- a mobile app: Swift ----
+  mobile: {
+    root: "/Users/andrew/trailhead-ios",
+    dirs: ["Trailhead", "Trailhead/Views", "Trailhead/Models", "TrailheadTests"],
+    files: {
+      "Trailhead/TrailheadApp.swift": 'import SwiftUI\n\n@main\nstruct TrailheadApp: App {\n    @StateObject private var store = HikeStore()\n\n    var body: some Scene {\n        WindowGroup {\n            HikeListView()\n                .environmentObject(store)\n        }\n    }\n}\n',
+      "Trailhead/Views/HikeListView.swift": 'import SwiftUI\n\nstruct HikeListView: View {\n    @EnvironmentObject private var store: HikeStore\n    @State private var query = ""\n\n    var body: some View {\n        NavigationStack {\n            List(store.filtered(by: query)) { hike in\n                NavigationLink(value: hike) {\n                    VStack(alignment: .leading) {\n                        Text(hike.name).font(.headline)\n                        Text("\\(hike.distanceKm, specifier: "%.1f") km · \\(hike.ascentM) m")\n                            .font(.caption)\n                            .foregroundStyle(.secondary)\n                    }\n                }\n            }\n            .searchable(text: $query)\n            .navigationTitle("Trailhead")\n        }\n    }\n}\n',
+      "Trailhead/Models/Hike.swift": 'import Foundation\n\nstruct Hike: Identifiable, Hashable {\n    let id: UUID\n    let name: String\n    let distanceKm: Double\n    let ascentM: Int\n}\n\nfinal class HikeStore: ObservableObject {\n    @Published private(set) var hikes: [Hike] = [\n        Hike(id: UUID(), name: "Pen y Fan", distanceKm: 7.2, ascentM: 540),\n        Hike(id: UUID(), name: "Scafell Pike", distanceKm: 9.0, ascentM: 900),\n    ]\n\n    func filtered(by query: String) -> [Hike] {\n        guard !query.isEmpty else { return hikes }\n        return hikes.filter { $0.name.localizedCaseInsensitiveContains(query) }\n    }\n}\n',
+      "TrailheadTests/HikeStoreTests.swift": 'import XCTest\n@testable import Trailhead\n\nfinal class HikeStoreTests: XCTestCase {\n    func testFilterIsCaseInsensitive() {\n        let store = HikeStore()\n        XCTAssertEqual(store.filtered(by: "pen y fan").count, 1)\n    }\n\n    func testEmptyQueryReturnsEverything() {\n        let store = HikeStore()\n        XCTAssertEqual(store.filtered(by: "").count, store.hikes.count)\n    }\n}\n',
+      "README.md": "# trailhead-ios\n\nA SwiftUI hiking log.\n\n```\nxcodebuild -scheme Trailhead test\n```\n",
+    },
+    open: "Trailhead/Views/HikeListView.swift",
+    agent: {
+      prompt: "Let people sort the list by distance.",
+      turns: [
+        { say: "Looking at the view and the store together.",
+          tools: [{ name: "read_file", args: { path: "%ROOT%/Trailhead/Views/HikeListView.swift" } }] },
+        { say: "The store owns the array, so sorting belongs there and the view just calls it.",
+          tools: [{ name: "edit_file", args: {
+            path: "%ROOT%/Trailhead/Views/HikeListView.swift",
+            old_string: "            .navigationTitle(\"Trailhead\")",
+            new_string: "            .navigationTitle(\"Trailhead\")\n            .toolbar {\n                Button(\"Sort\") { store.sortByDistance() }\n            }" } }] },
+        { say: "The toolbar button is in. State stays in HikeStore, so the view keeps its single source of truth." },
+      ],
+    },
+    play: {
+      anchor: "            .navigationTitle(\"Trailhead\")",
+      text: "\n            .toolbar {\n                Button(\"Sort\") { store.sortByDistance() }\n            }",
+    },
+    head: {
+      "Trailhead/Views/HikeListView.swift": 'import SwiftUI\n\nstruct HikeListView: View {\n    var body: some View {\n        Text("Trailhead")\n    }\n}\n',
+    },
+    changes: [
+      { rel: "Trailhead/Views/HikeListView.swift", code: "M ", label: "Modified", staged: true, deleted: false },
+      { rel: "TrailheadTests/HikeStoreTests.swift", code: "??", label: "Untracked", staged: false, deleted: false },
+    ],
+    conflicts: [],
+    merges: {},
+  },
   };
+  let id = "my-app";
+  try {
+    id = new URLSearchParams(location.search).get("demo") || "my-app";
+  } catch {}
+  return PREVIEW_PROJECTS[id] || PREVIEW_PROJECTS["my-app"];
+}
+
+function mockBackend() {
+  const PROJECT = _previewProject();
+  const ROOT = PROJECT.root;
+  const DIRS = new Set([
+    ROOT.slice(0, ROOT.lastIndexOf("/")) || "/",
+    ROOT,
+    ...PROJECT.dirs.map((d) => ROOT + "/" + d),
+  ]);
+  const FILES = Object.fromEntries(
+    Object.entries(PROJECT.files).map(([rel, body]) => [ROOT + "/" + rel, body]),
+  );
 
   // Simulated git state: a curated set of changes vs. an imaginary HEAD so the
   // browser preview can show the Source Control panel and diffs. The native app
   // talks to the real `git` instead.
-  const GIT_HEAD = {
-    [ROOT + "/README.md"]:
-      "# my-app\n\nA sample project shown in the browser preview.\n",
-    [ROOT + "/src/utils/format.js"]:
-      "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
-  };
-  const GIT_CHANGES = [
-    { rel: "README.md", code: " M", label: "Modified", staged: false, deleted: false },
-    { rel: "src/utils/format.js", code: "M ", label: "Modified", staged: true, deleted: false },
-    { rel: "components/Card.js", code: "??", label: "Untracked", staged: false, deleted: false },
-  ];
-  const GIT_CONFLICTS = [
-    { rel: "src/utils/format.js", name: "format.js" },
-  ];
+  const GIT_HEAD = Object.fromEntries(
+    Object.entries(PROJECT.head || {}).map(([rel, body]) => [ROOT + "/" + rel, body]),
+  );
+  const GIT_CHANGES = PROJECT.changes || [];
+  const GIT_CONFLICTS = PROJECT.conflicts || [];
   // In-memory stash list for the browser preview.
   const GIT_STASHES = [];
-  const MERGE_VERSIONS = {
-    "src/utils/format.js": {
-      base: "export function greet(name) {\n  return `Hello, ${name}!`;\n}\n",
-      ours: "export function greet(name) {\n  const who = name?.trim() || \"world\";\n  return `Hello, ${who}!`;\n}\n",
-      theirs: "export function greet(name) {\n  return `Hi, ${name || \"friend\"}!`;\n}\n",
-      merged: "<<<<<<< HEAD\nexport function greet(name) {\n  const who = name?.trim() || \"world\";\n  return `Hello, ${who}!`;\n}\n=======\nexport function greet(name) {\n  return `Hi, ${name || \"friend\"}!`;\n}\n>>>>>>> feature/greeting\n",
-    },
-  };
-  FILES[ROOT + "/src/utils/format.js"] = MERGE_VERSIONS["src/utils/format.js"].merged;
+  const MERGE_VERSIONS = PROJECT.merges || {};
+  for (const [rel, versions] of Object.entries(MERGE_VERSIONS)) {
+    if (versions && versions.merged) FILES[ROOT + "/" + rel] = versions.merged;
+  }
   const mockLspRunning = new Set();
   const mockDapRunning = new Set();
   // Minimal in-browser DAP simulation so the debugger is demoable without a
@@ -1493,21 +1684,43 @@ function mockBackend() {
       try { window.open(url, "_blank", "noopener,noreferrer"); } catch {}
     },
     revealItemInDir: async () => {},
-    taskRunCapture: async (cwd, command, _options = {}) => ({
-      code: 1,
-      stdout: `src/main.js(530,7): warning TS6133: 'reply' is declared but its value is never read.\n`,
-      stderr: "",
-      combined: `src/main.js(530,7): warning TS6133: 'reply' is declared but its value is never read.\n`,
-      truncated: false,
-    }),
+    // Answer per command instead of one canned failure: a preview that reports a
+    // TypeScript warning for `pytest` teaches the wrong thing about the product.
+    taskRunCapture: async (_cwd, command, _options = {}) => {
+      const cmd = String(command || "");
+      const reply = (code, out) => ({ code, stdout: out, stderr: "", combined: out, truncated: false });
+      if (/pytest/.test(cmd)) {
+        return reply(0, "........................\n24 passed in 0.61s\n");
+      }
+      if (/npm (run )?test|node --test/.test(cmd)) {
+        return reply(0, "\u2139 tests 665\n\u2139 pass 665\n\u2139 fail 0\n");
+      }
+      if (/xcodebuild|swift test/.test(cmd)) {
+        return reply(0, "Test Suite 'All tests' passed.\n Executed 2 tests, with 0 failures\n");
+      }
+      if (/cargo (test|check)/.test(cmd)) {
+        return reply(0, "    Finished test profile [unoptimized]\ntest result: ok. 8 passed; 0 failed\n");
+      }
+      if (/npm run build|vite build/.test(cmd)) {
+        return reply(0, "\u2713 built in 812ms\n");
+      }
+      // Default keeps the original typecheck warning so the "reads a real failure"
+      // story still has something to read.
+      return reply(1, "src/main.js(530,7): warning TS6133: 'reply' is declared but its value is never read.\n");
+    },
     pickFolder: async () => ROOT,
     aiComplete: async (_config, messages) => {
       const user = messages[messages.length - 1]?.content || "";
       const code = user.split("\nCode:\n").slice(1).join("\nCode:\n");
       return "// ✦ preview mock edit — set a real provider for live edits\n" + code;
     },
-    aiChat: (config, messages, onEvent) => _realAiFetch(config, messages, null, onEvent),
-    aiChatWithTools: (config, messages, tools, onEvent) => _realAiFetch(config, messages, tools, onEvent),
+    // `?play=agent` replaces only the MODEL. The agent loop, the tool executors and
+    // the editor are the product's own, so the cards, edits and test run are real work
+    // against the sample project — not a rendered animation of it.
+    aiChat: (config, messages, onEvent) =>
+      _previewAgentTurn(PROJECT, messages, onEvent) || _realAiFetch(config, messages, null, onEvent),
+    aiChatWithTools: (config, messages, tools, onEvent) =>
+      _previewAgentTurn(PROJECT, messages, onEvent) || _realAiFetch(config, messages, tools, onEvent),
     cancelAi: async (requestId) => {
       const controller = _browserAiControllers.get(String(requestId || ""));
       if (controller) controller.abort();
@@ -11753,6 +11966,9 @@ let _michaelUser = _bootCompressionCapability
 
 function _setMichaelUserProfile(user, compressionVerified = true) {
   _michaelUser = user && typeof user === "object" ? user : null;
+  // 面值分母由网关下发。这里是 /api/me 的唯一落点，所以启动、轮询、发消息前的刷新
+  // 都会同时把它带新——客户端不再自己存一份 663。
+  _setCreditDenominator(_michaelUser?.raw_cents_per_credit_usd);
   if (compressionVerified) _persistMichaelCompressionCapability(_michaelUser);
   try {
     const enabled = !!_compressionTier();
@@ -12146,7 +12362,16 @@ async function michaelAccessGate() {
 // denomination is exact: 663 raw cents ($6.63) = $1.00 of visible quota/credits.
 // The route multiplier (for example Claude's 0.8) is already applied server-side
 // before these raw cents are persisted; this function performs only denomination.
-const _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;
+// 663 只是兜底：真值由网关随 /api/me 下发（raw_cents_per_credit_usd），唯一定义在
+// 服务端的 app_settings 表。管理台改一次，这里、两个管理页和服务端测算同时跟着变。
+// 网关还没答复之前用兜底值渲染，与改造前的行为一致。
+let _MICHAEL_RAW_CENTS_PER_CREDIT_USD = 663;
+// 这个数是除数，任何情况下都不能变成 0 或负数：越界值一律丢弃、保留当前值，
+// 宁可显示旧面值也不能把每个余额变成 Infinity。
+function _setCreditDenominator(value) {
+  const n = Math.round(Number(value));
+  if (Number.isFinite(n) && n >= 1 && n <= 100000) _MICHAEL_RAW_CENTS_PER_CREDIT_USD = n;
+}
 function _creditUsdValue(rawCents) {
   return (Number(rawCents) || 0) / _MICHAEL_RAW_CENTS_PER_CREDIT_USD;
 }
@@ -12220,7 +12445,7 @@ async function showProfile() {
   _setMichaelUserProfile(u); // keep the cached profile and 1M/2M/5M capability in sync
   try { await loadEditorPrefs(); } catch {}
   const country = selectedCountryInfo();
-  const usd = (c) => _dispUsd(c); // 统一额度币值：663 原始美分 = $1.00 用户额度
+  const usd = (c) => _dispUsd(c); // 统一额度币值，分母由网关下发（默认 663 原始美分 = $1.00）
   const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const planNames = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
   const planTotals = { trial: 5000, basic: 33000, pro: 65000, power: 180000, ultra: 500000 };
@@ -15505,7 +15730,7 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false } = {}
       ? `Tokens: input ${_tokenExact(settlement.promptTokens)} · output ${_tokenExact(settlement.completionTokens)} · cache read ${_tokenExact(cacheReadTok)} · cache write ${_tokenExact(cacheWriteTok)} (server-reported usage${unreported ? `; ${_tokenExact(unreported)} calls unreported` : ""})`
       : "Tokens: provider usage unavailable";
   const costTitle = settlement && Number.isInteger(settlement.costCents)
-    ? `Credit cost: ${_dispUsd(settlement.costCents)} (663 raw cents = $1.00 credit; includes model, cache, and route pricing)`
+    ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)`
     : "Cost: waiting for server settlement";
   const settledTitle = live && settlement?.settledTurns
     ? `\nSettled: ${settlement.settledTurns} model requests; pending requests are not estimated`
@@ -19659,6 +19884,60 @@ async function _agentContextForQuery(baseContext, query, root, referenceTimeoutM
   return combined + _memoryBlocks(root, query || "", sizeState) + _projectJournalBlock(root);
 }
 
+/** 指纹里最多纳入多少个一级子目录。见 `_agentRootFingerprint`。 */
+const _AGENT_FP_MAX_SUBDIRS = 40;
+
+/**
+ * 工作区根指纹：顶层条目名 + 每个一级子目录的文件数。
+ *
+ * ## 子目录计数为什么必须有
+ *
+ * 只看顶层条目的话，在 `src/` 里新建或删除一个文件，指纹纹丝不动 —— agent 的上下文
+ * 缓存判定为"没变化"，于是继续拿上一轮的陈旧项目视图干活。子目录计数是"深层增删也能
+ * 被感知"的唯一来源。
+ *
+ * ## 它此前一次都没生效
+ *
+ * 原来三处（`_gatherAgentContext` 两处、`_agentContextSnapshotForTurn` 一处）各抄了一份
+ * 同样的逻辑，调用的是 `backend.readDirSync` —— 而 tauriBackend 和 mockBackend **都没有**
+ * 这个方法。三处都写成 `backend.readDirSync ? backend.readDirSync(p) : null`，所以不报错、
+ * 不抛异常，只是永远取到 null，`Array.isArray(null)` 为假，计数一次也没进过指纹。
+ * 一个"防陈旧"的机制自己是死的，症状是 agent 偶尔看不见新加的文件 —— 极难往这里查。
+ *
+ * 现在用真实存在的异步 `readDir`，并且三处合并成这一个，不再各抄一份。
+ *
+ * ## 两处刻意的选择
+ *
+ * · **并行读**：这段每个 agent 轮次都跑，顺序 await N 个目录会把延迟叠成 N 倍。
+ * · **排序后再拼**：`readDir` 不保证返回顺序稳定。按 arr 原序拼接的话，同样的目录
+ *   两次读出不同顺序就会生成不同指纹，缓存永远命不中 —— 比不生效更糟。排序让指纹
+ *   只取决于内容。
+ */
+async function _agentRootFingerprint(ents) {
+  const arr = Array.isArray(ents) ? ents : [];
+  const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
+  const dirs = arr
+    .filter((e) => {
+      if (!_agentDirEntryIsDir(e)) return false;
+      const dn = _agentDirEntryName(e);
+      return dn && !_AGENT_CONTEXT_SKIP_DIRS.has(dn);
+    })
+    // monorepo 顶层可能几十个包；无上限的目录扫描会变成每轮固定的几百毫秒。
+    .slice(0, _AGENT_FP_MAX_SUBDIRS);
+  const counts = await Promise.all(
+    dirs.map(async (e) => {
+      try {
+        const sub = await backend.readDir(e.path);
+        return Array.isArray(sub) ? `${_agentDirEntryName(e)}:${sub.length}` : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  for (const c of counts.filter(Boolean).sort()) parts.push(c);
+  return parts.join("|");
+}
+
 async function _gatherAgentContext(query, sessionRoot) {
   try { _perfPhase("gatherAgentContext"); } catch {}
   const root = (sessionRoot || rootPath || workspaceRoots[0] || "").replace(/\/+$/, "");
@@ -19697,22 +19976,7 @@ async function _gatherAgentContext(query, sessionRoot) {
       }
       // 继续原来的文件名指纹验证
       // 增强指纹：顶层文件名 + 一级子目录名+文件数，深层变化也触发刷新
-      const _enhFp = (ents) => {
-        const arr = (Array.isArray(ents) ? ents : []);
-        const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
-        // 追加一级子目录文件计数，让深层增删也能被感知
-        for (const e of arr) {
-          if (!_agentDirEntryIsDir(e)) continue;
-          const dn = _agentDirEntryName(e);
-          if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
-          try {
-            const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
-            if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
-          } catch {}
-        }
-        return parts.join("|");
-      };
-      const fp = _enhFp(entries);
+      const fp = await _agentRootFingerprint(entries);
       if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
       if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
       // 记录规模信息供下次对比
@@ -19831,21 +20095,7 @@ async function _gatherAgentContext(query, sessionRoot) {
   let rootFp;
   try {
     const entries = await backend.readDir(root);
-    const _enhFp2 = (ents) => {
-      const arr = (Array.isArray(ents) ? ents : []);
-      const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
-      for (const e of arr) {
-        if (!_agentDirEntryIsDir(e)) continue;
-        const dn = _agentDirEntryName(e);
-        if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
-        try {
-          const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
-          if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
-        } catch {}
-      }
-      return parts.join("|");
-    };
-    rootFp = _enhFp2(entries);
+    rootFp = await _agentRootFingerprint(entries);
   } catch {}
   // 重建时把规模状态存进缓存，命中路径读取并透传给 _agentContextForQuery 第 6 参
   const _sizeState = { isEmpty: _emptyRootTop, isDrasticallyShrunk: !!_sizeDeltaWarning };
@@ -19872,21 +20122,7 @@ async function _agentContextSnapshotForTurn(query, sessionRoot, profile = null) 
     let fingerprintOk = true;
     try {
       freshEntries = await backend.readDir(root);
-      const _enhFp3 = (ents) => {
-        const arr = (Array.isArray(ents) ? ents : []);
-        const parts = arr.map((e) => (e?.name || "") + (_agentDirEntryIsDir(e) ? "/" : "")).sort();
-        for (const e of arr) {
-          if (!_agentDirEntryIsDir(e)) continue;
-          const dn = _agentDirEntryName(e);
-          if (!dn || _AGENT_CONTEXT_SKIP_DIRS.has(dn)) continue;
-          try {
-            const sub = backend.readDirSync ? backend.readDirSync(e.path) : null;
-            if (Array.isArray(sub)) parts.push(`${dn}:${sub.length}`);
-          } catch {}
-        }
-        return parts.join("|");
-      };
-      const fp = _enhFp3(freshEntries);
+      const fp = await _agentRootFingerprint(freshEntries);
       if (_agentContextCache.rootFp !== undefined && _agentContextCache.rootFp !== fp) fingerprintOk = false;
       if (_agentContextCache.rootFp === undefined) _agentContextCache.rootFp = fp;
     } catch {}
@@ -20727,7 +20963,114 @@ async function _drainFollowups(sess) {
   finally { if (sess && acquired) sess._followupDrainInFlight = false; }
 }
 
+/** True only in the browser preview when a `?play=agent` demo link asked for a run. */
+function _previewAgentMode() {
+  if (inTauri) return false;
+  try {
+    const mode = new URLSearchParams(location.search).get("play");
+    if (mode === "tools") return true;          // tool gallery drives it by postMessage
+    if (mode !== "agent") return false;
+  } catch { return false; }
+  return !!_previewProject().agent;
+}
+
+/** Plausible arguments for a single-tool demo, against the open sample project. */
+function _previewToolArgs(name, root) {
+  const p = (rel) => root + "/" + rel;
+  const M = {
+    read_file: { path: p("app/routers/invoices.py") },
+    write_file: { path: p("app/routers/health.py"), content: "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get(\"\")\ndef health() -> dict[str, str]:\n    return {\"status\": \"ok\"}\n" },
+    edit_file: { path: p("app/routers/invoices.py"), old_string: "    return _INVOICES[invoice_id]", new_string: "    return _INVOICES[invoice_id]\n\n\n@router.delete(\"/{invoice_id}\")\ndef void_invoice(invoice_id: str) -> dict[str, bool]:\n    if _INVOICES.pop(invoice_id, None) is None:\n        raise HTTPException(status_code=404, detail=\"no such invoice\")\n    return {\"voided\": True}" },
+    multi_edit: { path: p("app/main.py"), edits: [{ old_string: "billing-service", new_string: "billing-service v2" }] },
+    list_dir: { path: p("app") },
+    create_dir: { path: p("app/services") },
+    copy_path: { src: p("requirements.txt"), dest: p("requirements.lock.txt") },
+    move_path: { src: p("README.md"), dest: p("docs.md") },
+    format_file: { path: p("app/models.py") },
+    search: { query: "invoice", path: root },
+    find_files: { pattern: "**/*.py" },
+    semantic_search: { query: "where are invoices validated" },
+    find_symbol: { name: "create_invoice" },
+    search_tools: { query: "database" },
+    knowledge_search: { query: "fastapi conventions" },
+    get_diagnostics: {},
+    git_status: {},
+    git_diff: {},
+    git_log: { limit: 5 },
+    git_branch: {},
+    git_stash_list: {},
+    git_conflicts: {},
+    run_cmd: { command: "pytest -q", cwd: root },
+    update_plan: { steps: [
+      { content: "Read the invoices router", status: "completed" },
+      { content: "Add the void endpoint", status: "in_progress" },
+      { content: "Re-run the suite", status: "pending" },
+    ] },
+    run_subagent: { description: "Map the service", prompt: "Describe the routers and their contracts." },
+    spawn_multiple_agents: { task: "Audit the service", agents: [
+      { role: "architect", focus: "Describe the router layout." },
+      { role: "security", focus: "Look for unsafe comparisons." },
+    ] },
+    await_subagent: { job: "all" },
+    remember: { note: "The webhook signature check is not constant time." },
+    current_time: {},
+    web_search: { query: "fastapi background tasks" },
+    web_fetch: { url: "https://fastapi.tiangolo.com/" },
+  };
+  const hand = M[name] || {};
+
+  // Anything not hand-written is synthesised from the tool's OWN schema, so a newly
+  // added tool still gets complete arguments and the agent never has to stop and
+  // "fill in tool parameters" mid-demo.
+  let schema = null;
+  try {
+    schema = _buildAgentToolSchemas(true).find((t) => t?.function?.name === name);
+  } catch {}
+  const props = schema?.function?.parameters?.properties || {};
+  const required = schema?.function?.parameters?.required || Object.keys(props).slice(0, 2);
+  const out = { ...hand };
+
+  for (const key of required) {
+    if (out[key] !== undefined) continue;
+    const spec = props[key] || {};
+    const k = key.toLowerCase();
+    if (Array.isArray(spec.enum) && spec.enum.length) { out[key] = spec.enum[0]; continue; }
+    if (spec.type === "boolean") { out[key] = false; continue; }
+    if (spec.type === "integer" || spec.type === "number") { out[key] = k.includes("limit") || k.includes("count") ? 5 : 1; continue; }
+    if (spec.type === "array") { out[key] = []; continue; }
+    if (spec.type === "object") { out[key] = {}; continue; }
+    if (/path|file|dir|cwd|dest|src|target/.test(k)) { out[key] = k.includes("dir") || k === "cwd" ? root : p("app/routers/invoices.py"); continue; }
+    if (/url|endpoint/.test(k)) { out[key] = "https://fastapi.tiangolo.com/"; continue; }
+    if (/command|cmd|script/.test(k)) { out[key] = "pytest -q"; continue; }
+    if (/query|search|keyword|term|q$/.test(k)) { out[key] = "invoice"; continue; }
+    if (/pattern|glob/.test(k)) { out[key] = "**/*.py"; continue; }
+    if (/name|symbol|id/.test(k)) { out[key] = "create_invoice"; continue; }
+    if (/message|note|text|content|body|description|prompt|focus|task|reason/.test(k)) {
+      out[key] = "Summarise how invoices are validated in this service.";
+      continue;
+    }
+    if (/lang/.test(k)) { out[key] = "python"; continue; }
+    out[key] = "invoice";
+  }
+  return out;
+}
+
+let _previewToolRequest = null;
+
 async function _readyAiConfig() {
+  // Browser-preview demo: the scripted model answers locally, so there is no gateway to
+  // authenticate against and no spend to authorise. Hand back a synthetic config instead
+  // of the login gate. `inTauri` short-circuits _previewAgentMode(), so the desktop build
+  // can never reach this branch — the real checks below stay the only path there.
+  if (_previewAgentMode()) {
+    return {
+      ...loadConfig(),
+      baseUrl: location.origin,
+      apiKey: "preview-demo",
+      model: "claude-opus-4-6",
+      requestId: "",
+    };
+  }
   // Require login + active membership or credits before any AI call.
   if (!(await michaelAccessGate())) return null;
   if (!MODEL_GROUPS.length) await loadBackendModels();
@@ -26301,7 +26644,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   // screen/keyboard/mouse). In the web/preview build there's no Tauri backend —
   // the mock invoke would return {} and the agent would act on FAKE success. So
   // don't even offer them there.
-  if (!inTauri) {
+  // Gallery mode simulates every tool, so keep the desktop-only ones in the schema —
+  // otherwise they are never dispatched and the gallery shows an empty card.
+  let _galleryMode = false;
+  try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
+  if (!inTauri && !_galleryMode) {
     const desktopOnly = new Set(["run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "live_markets", "live_flights", "road_environment", "track_shipment", "shop_catalog"]);
     return _applyCloudToolDescs(tools.filter((t) => !desktopOnly.has(t.function.name)));
   }
@@ -26454,12 +26801,25 @@ function _selectInitialTools(includeWrite, taskText, mcpTools = [], mode = inclu
     const growthState = typeof window !== 'undefined' ? window._growthState || null : null;
     if (growthState && typeof growthState.avgMastery === 'function') {
       const avgP = growthState.avgMastery();
+      // 进阶/专家用户的扩展工具池。
+      //
+      // 这份名单原来 17 项里有 10 项**根本不是真实工具名**：debugger、profiler、
+      // code_map、grep_code、list_dir_recursive、browser_navigate、performance_audit、
+      // security_scan、db_migrate、backup_database —— 注册表里都不存在。
+      //
+      // 下面的 `available.slice(0, toAdd)` 是从**头部**取的，而假名字恰好都排在前面：
+      // 专家档要补 10 个位置，取到的前 10 项里只有 lsp_symbols 和 semantic_search 是真的，
+      // 另外 8 个位置被不存在的名字占掉。最终 `coreNames.has(n)` 过滤时它们静默消失，
+      // 于是"专家档 20 个工具"实际只发出 12 个 —— 而且缺的正是这份名单想给的那些能力。
+      // 没有任何报错：过滤器只是匹配不上而已。
+      //
+      // 现在每一项都对着注册表核过（下方 test 逐个断言），并且按价值排序 —— 因为 slice
+      // 取头部，排在前面的才有机会被选中。
       const PROFESSIONAL_TOOLS = [
-        "debugger", "profiler", "lsp_symbols", "semantic_search",
-        "code_map", "find_files", "grep_code", "list_dir_recursive",
-        "browser_navigate", "performance_audit", "security_scan",
-        "db_query", "db_migrate", "backup_database", "package_search",
-        "github_search", "developer_community_search"
+        "lsp_symbols", "find_symbol", "semantic_search", "get_diagnostics",
+        "performance_profile", "browser", "db_query", "git_diff",
+        "package_search", "github_search", "developer_community_search",
+        "cve_search", "generate_wiki", "knowledge_search",
       ];
       
       let targetCount = 11; // default
@@ -32201,7 +32561,11 @@ function _toolCacheKey(call) {
 const _toolCategoryMap = {
   read: "file", list: "file", write: "file", edit: "file", multiedit: "file",
   delete: "file", move: "file", mkdir: "file", copy: "file", format: "file",
-  findfiles: "file", readlogs: "file",
+  readlogs: "file",
+  // findfiles 归 search，不归 file：它是"按模式找出哪些文件存在"，失败原因跟 read/write
+  // 那一类完全不同（找不到 ≠ 读不了），编排器按类别统计失败时混在一起会得出错的结论。
+  // 这里原本 file 和 search 各写了一份，后一份静默覆盖前一份——行为一直是 search，
+  // 只是那条 file 是死的。删掉死的那条，行为不变，歧义没了。
   search: "search", findfiles: "search", web: "search", websearch: "search",
   webfetch: "search", knowledgesearch: "search", semanticsearch: "search",
   githubsearch: "search", developercommunitysearch: "search",
@@ -32225,7 +32589,45 @@ const _toolCategoryMap = {
   autorig: "generation",
   lspsymbols: "lsp", findsymbol: "lsp", lspdefinition: "lsp",
   lspreferences: "lsp", getdiagnostics: "lsp",
+
+  // 粗粒度的 call.type。上面那些是按**工具名**写的，而账本查表时还会拿 `call.type`
+  // 再查一次，那是一组更粗的值（git_status / git_commit 等等的 type 统统是 "git"）。
+  // 这几个此前一个都不在表里，于是所有 git / gh / lsp / cmd 调用都落到 "other" ——
+  // 恰好是这张表最想区分出来的那几类。
+  git: "git", gh: "git", lsp: "lsp", cmd: "execution", console: "execution",
+  knowledge: "search", semsearch: "search", deep_search: "search",
+  db: "db", diag: "lsp", subagent: "orchestration", worktree: "orchestration",
+  uiclick: "desktop", localdiscovery: "search", automation: "desktop",
 };
+
+/** 归一化查表键：去掉下划线/连字符并转小写。
+ *
+ * 这张表的键从一开始就是**去掉下划线**写的（`git_status` 写成 `gitstatus`、
+ * `gh_pr_create` 写成 `ghprcreate`、`lsp_symbols` 写成 `lspsymbols`），但查表用的是
+ * 原样的工具名。两边对不上，于是 78 条里有 54 条从来没被命中过 —— 表不是写错了，
+ * 是查法漏了这一步归一化。
+ *
+ * 两边都归一化之后，`run_cmd` 这种表里带下划线的键也照样能对上。
+ */
+function _normToolKey(name) {
+  return String(name || "").toLowerCase().replace(/[_-]/g, "");
+}
+
+/** 工具 → 类别。先按工具名，再按 call.type，最后按后缀兜底。 */
+function _toolCategoryOf(toolName, callType) {
+  const byName = _toolCategoryMap[_normToolKey(toolName)];
+  if (byName) return byName;
+  const byType = _toolCategoryMap[_normToolKey(callType)];
+  if (byType) return byType;
+  // 长尾：`*_search` 这一类有上百个（arxiv_search、dribbble_search、cve_search…），
+  // 逐个列出来只会再烂掉一次。按后缀归类，新增一个搜索源不用回来改这里。
+  const k = _normToolKey(toolName) || _normToolKey(callType);
+  if (/search$/.test(k)) return "search";
+  if (/^generate|^gen/.test(k)) return "generation";
+  if (/^git|^gh/.test(k)) return "git";
+  if (/^lsp/.test(k)) return "lsp";
+  return "other";
+}
 function _toolFailureMatch(content) {
   const text = String(content || "");
   return text.match(/\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i)
@@ -37337,7 +37739,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, session, mo
     const rec = {
       turn: run._toolLedger.turnIndex,
       tool: _rcToolName,
-      category: _toolCategoryMap[_rcToolName] || _toolCategoryMap[it.call?.type] || "other",
+      category: _toolCategoryOf(_rcToolName, it.call?.type),
       args: JSON.stringify(it.tc?.parsedArgs || {}),
       argsSummary: (() => {
         const args = it.tc?.parsedArgs || {};
@@ -42462,8 +42864,103 @@ async function _searchKnowledgeBase(call) {
   }
 }
 
+/**
+ * Preview tool gallery (`?play=tools`) only: every tool answers with simulated but
+ * realistic output, so the gallery demonstrates what a card LOOKS like rather than
+ * tripping over capabilities a browser build genuinely does not have. Never reachable
+ * from the desktop app — `_previewAgentMode()` short-circuits on `inTauri`.
+ */
+function _previewSimulateTool(call, res, vp, root) {
+  let on = false;
+  try { on = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
+  if (!on || !res) return null;
+
+  const rel = (p) => String(p || "").replace(root + "/", "");
+  const esc = (s) => _escHtml(String(s));
+  const ok = (label) => { res.className = "atc-result atc-result--ok"; res.textContent = label; };
+  const info = (label) => { res.className = "atc-result atc-result--info"; res.textContent = label; };
+  const pre = (text) => { if (vp) vp.innerHTML = `<pre style="margin:0;padding:8px 12px;white-space:pre-wrap;font-size:11px;line-height:1.55">${esc(text)}</pre>`; };
+  const rows = (pairs) => {
+    if (!vp) return;
+    vp.innerHTML = `<div style="padding:6px 12px;font-size:11px;line-height:1.7">` +
+      pairs.map(([k, v]) => `<div style="display:flex;gap:10px"><span style="min-width:120px;opacity:.65">${esc(k)}</span><span>${esc(v)}</span></div>`).join("") +
+      `</div>`;
+  };
+  const t = String(call?.type || "");
+  const name = String(call?._toolName || t);
+
+  switch (t) {
+    case "read":
+      ok("34 lines · 1.1 kB");
+      pre('from decimal import Decimal\n\nfrom fastapi import APIRouter, HTTPException\n\nfrom app.models import Invoice, LineItem\n\nrouter = APIRouter()\n\n_INVOICES: dict[str, Invoice] = {}');
+      return { type: t, path: call.path, content: "(simulated) file contents returned." };
+    case "list":
+      ok("2 dirs · 2 files");
+      rows([["app/", "routers, models.py, main.py"], ["tests/", "test_invoices.py"], ["README.md", "1.2 kB"], ["requirements.txt", "212 B"]]);
+      return { type: t, path: call.path, content: "(simulated) directory listing returned." };
+    case "search": case "find": case "semsearch": case "findsymbol": case "knowledge":
+      ok("3 hits · 2 files");
+      rows([["app/routers/invoices.py:14", "if not items:"], ["app/routers/invoices.py:24", "if invoice_id not in _INVOICES:"], ["tests/test_invoices.py:12", "assert response.status_code == 422"]]);
+      return { type: t, path: call.path || call.query || "", content: "(simulated) 3 matches returned." };
+    case "lsp":
+      ok("1 definition");
+      rows([["app/routers/invoices.py:13", "def create_invoice(items)"]]);
+      return { type: t, path: call.path || "", content: "(simulated) symbol resolved." };
+    case "diag":
+      ok("0 errors · 1 warning");
+      rows([["app/routers/webhooks.py:22", "signature comparison is not constant time"]]);
+      return { type: t, path: "", content: "(simulated) diagnostics returned." };
+    case "git":
+      ok("3 changed");
+      rows([["M  app/routers/webhooks.py", "staged"], [" M tests/test_invoices.py", "unstaged"], ["?? requirements.txt", "untracked"]]);
+      return { type: t, path: call.op || "", content: "(simulated) git state returned." };
+    case "gh":
+      ok("#412 opened");
+      rows([["title", "fix(utils): guard clamp bounds"], ["base", "main"], ["checks", "queued"]]);
+      return { type: t, path: "", content: "(simulated) GitHub call returned." };
+    case "cmd": case "termtask": case "termread":
+      ok("exit 0");
+      pre("........................\n24 passed in 0.61s");
+      return { type: t, path: call.command || "", content: "(simulated) command finished with exit code 0." };
+    case "write": case "edit": case "multiedit": case "format": case "mkdir": case "copy": case "move":
+      ok(t === "write" ? "+18" : "+5 −1");
+      pre('+@router.delete("/{invoice_id}")\n+def void_invoice(invoice_id: str) -> dict[str, bool]:\n+    if _INVOICES.pop(invoice_id, None) is None:\n+        raise HTTPException(status_code=404, detail="no such invoice")\n+    return {"voided": True}');
+      return { type: t, path: call.path || "", content: "(simulated) edit applied." };
+    case "web": case "websearch": case "http": case "browser": case "screenshot": case "download":
+      ok(t === "http" ? "200 OK" : "3 results");
+      rows([["fastapi.tiangolo.com", "Background Tasks"], ["stackoverflow.com", "when not to use them"], ["github.com", "example repository"]]);
+      return { type: t, path: call.url || call.query || "", content: "(simulated) fetch returned." };
+    case "db":
+      ok("3 rows · 12 ms");
+      rows([["inv_00041", "£76.00 · paid"], ["inv_00042", "£19.00 · open"], ["inv_00043", "£240.00 · void"]]);
+      return { type: t, path: call.driver || "postgres", content: "(simulated) query returned 3 rows." };
+    case "memory": case "askuser": case "current_time": case "designboard": case "preview":
+    case "genimage": case "vizcompare": case "explain": case "worktree": case "computer":
+    case "system": case "automation": case "readscreen": case "uiclick": case "remote":
+    case "qr": case "capture_start": case "capture_flows": case "capture_stop": case "capture_replay":
+    case "demostart": case "demostop": case "background_monitor": case "localdiscovery":
+    case "liveenvironment": case "livemarkets": case "liveflights": case "roadenvironment":
+    case "trackshipment": case "shopcatalog": case "tor": case "search_tools":
+      ok("ok");
+      rows([["tool", name], ["mode", "simulated for this gallery"], ["result", "completed"]]);
+      return { type: t, path: call.path || "", content: "(simulated) tool completed." };
+    default:
+      info("ok");
+      rows([["tool", name], ["mode", "simulated for this gallery"], ["result", "completed"]]);
+      return { type: t, path: call.path || "", content: "(simulated) tool completed." };
+  }
+}
+
 async function _executeToolStepInner(step, call, root, run) {
   if (run) run._toolStep = (run._toolStep || 0) + 1; // per-run tool-call counter (redundant-read saver)
+  try {
+    // Gallery mode answers every tool with simulated output (browser preview only).
+    // Guarded so unit tests can load this function in isolation without the helper.
+    if (typeof _previewSimulateTool === "function") {
+      const _sim = _previewSimulateTool(call, step.querySelector(".atc-result"), step.querySelector(".atc-viewport"), root);
+      if (_sim) { step.classList.add("is-open"); return _sim; }
+    }
+  } catch { /* fall through to the real executor */ }
   if (call?.type === "read" && typeof call.path === "string") {
     call.path = _normalizeReadToolPath(call.path);
   }
@@ -45795,7 +46292,10 @@ ${bodyPreview}`)}</pre>`;
       _demoRec = { active: true, title: (call.title || "").trim() || "功能演示", frames: [] };
       // Clean demo frames: hide the browser's Set-of-Mark badges + the computer's
       // coordinate grid while recording (they're agent-grounding aids, not for users).
-      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: false }); } catch {} try { await backend.invoke("computer_set_grid", { on: false }); } catch {} }
+      // computer_set_grid 不存在：Rust 侧从来没有过网格叠加这个功能（generate_handler! 里
+      // 没有它，src-tauri 全树也搜不到 grid 相关实现）。调用被 try/catch 吞掉，所以两年来
+      // 没人发现——它只是每次静默失败。删掉假的那半，留下真的 browser_set_marks。
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: false }); } catch {} }
       res.className = "atc-result atc-result--ok"; res.textContent = "录制中";
       return { type: "demostart", path: _demoRec.title, content: `已开始录制演示「${_demoRec.title}」。现在用 browser / computer / screenshot **真实地走一遍功能流程**——每个动作都会自动录成一帧；走完用 stop_demo 收尾，把回放展示给用户。` };
 
@@ -45805,7 +46305,7 @@ ${bodyPreview}`)}</pre>`;
       const wasActive = _demoRec.active;
       _demoRec = { active: false, title: "", frames: [] };
       // Restore the browser marks + computer grid for normal agent navigation.
-      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: true }); } catch {} try { await backend.invoke("computer_set_grid", { on: true }); } catch {} }
+      if (inTauri) { try { await backend.invoke("browser_set_marks", { on: true }); } catch {} }
       if (!wasActive && !frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "未在录制"; return { type: "demostop", path: "", content: "[失败] 还没开始录制。先用 start_demo，再用 browser/computer/screenshot 走一遍流程，最后 stop_demo。" }; }
       if (!frames.length) { res.className = "atc-result atc-result--err"; res.textContent = "无帧"; return { type: "demostop", path: title, content: "[失败] 录制期间没有产生任何截图帧——演示流程要用 browser / computer / screenshot 才会录到帧。" }; }
       try { const player = _buildDemoPlayer(frames, title); step.appendChild(player); } catch {}
@@ -45935,18 +46435,45 @@ ${bodyPreview}`)}</pre>`;
         const screenshotResult = await backend.invoke("browser_screenshot", {});
         const screenshotDataUrl = screenshotResult?.data_url || "no-data";
         
-        // Step 4: Check console logs for JS errors
+        // Step 4: 加载失败的资源。
+        //
+        // 这里原来调的是 `backend.invoke("browser_get_logs", ...)` —— 这个命令**从来没有
+        // 被实现过**（browser.rs 里没有任何 console/log 命令，lib.rs 的 generate_handler!
+        // 里也没有它）。调用被 try/catch 包着，所以不报错，只是每次都落进 catch，
+        // 于是这份性能报告里永远写着"未能读取 console 日志"，而"检查 JS 错误"这件事
+        // 一次都没发生过。
+        //
+        // 浏览器不保留已经发生过的 console 历史，事后拿不回来 —— 除非在页面脚本执行前
+        // 就装好钩子，而这个工具是自己 navigate 的，装不上。所以改成读**真的能事后拿到**
+        // 的东西：Performance API 的资源计时。加载失败的资源（4xx/5xx、传输为空）是
+        // 页面出错最常见也最能定位的信号，而且和上面的时序数据同源，不需要新命令。
         let warnings = [];
         try {
-          const logsResult = await backend.invoke("browser_get_logs", { type: "console" });
-          const logEntries = Array.isArray(logsResult) ? logsResult : [];
-          const errors = logEntries.filter((l) => l.level === "severe" || l.level === "error" || String(l.message || "").includes("Error"));
-          if (errors.length) {
-            warnings.push(`发现 ${errors.length} 个 Console 错误：${errors.slice(0, 3).map((e) => e.message.slice(0, 100)).join("; ")}`);
+          const resScript = `
+            (function() {
+              const bad = [];
+              for (const e of performance.getEntriesByType("resource")) {
+                const status = typeof e.responseStatus === "number" ? e.responseStatus : null;
+                const empty = e.transferSize === 0 && e.decodedBodySize === 0 && e.duration > 0;
+                if ((status !== null && status >= 400) || (status === null && empty)) {
+                  bad.push({ name: String(e.name).slice(0, 160), status, type: e.initiatorType });
+                }
+              }
+              return JSON.stringify({ failed: bad.slice(0, 10), total: performance.getEntriesByType("resource").length });
+            })();
+          `;
+          const r = await backend.invoke("browser_eval", { script: resScript });
+          const parsed = JSON.parse(r?.result || "{}");
+          const failed = Array.isArray(parsed.failed) ? parsed.failed : [];
+          if (failed.length) {
+            warnings.push(
+              `${failed.length} 个资源加载失败：` +
+                failed.slice(0, 3).map((f) => `${f.name}${f.status ? ` (${f.status})` : ""}`).join("; "),
+            );
           }
-        } catch (e) {
-          // 读取日志非必需，失败不影响主流程
-          warnings.push("未能读取 console 日志（可选功能）");
+        } catch {
+          // 资源计时拿不到不影响主流程，但**不再**谎称"检查过 console 错误"。
+          warnings.push("未能读取资源加载记录");
         }
         
         clearTimeout(to);
@@ -52764,6 +53291,11 @@ function getMenus() {
         { label: t("menu.problems"), icon: "i-error", hint: shortcutLabel("shift+mod+m"), action: () => toggleProblems() },
         { sep: true },
         { label: t("menu.commandPalette"), icon: "i-command", hint: shortcutLabel("shift+mod+p"), action: () => editorAction("editor.action.quickCommand") },
+        { sep: true },
+        // shadcn 组件长廊。走菜单而不是"控制台里敲函数"：IDE 自带的终端是真 shell，
+        // 在那里敲 showUIGallery() 只会得到 command not found —— 让人去开浏览器
+        // DevTools 才能看一眼 UI，本身就是个糟糕的入口。
+        { label: t("menu.uiGallery"), icon: "i-sparkle", action: () => window.showUIGallery?.() },
       ],
     },
     {
@@ -53045,6 +53577,76 @@ $("michaelPremiumBtn")?.addEventListener("click", () => { try { openMichaelPremi
 
 // login state
 let _loggedInEmail = null;
+
+// The web sign-in page asks this app, over loopback, whether anyone is signed in, so a
+// user who is already logged in here does not retype a password in the browser. Rust
+// owns the listener and the origin allowlist; this only keeps its copy of the session
+// in step. Mirrored on every login-state change rather than set once at login, so a
+// logout — or an expired token cleared by refreshMichaelUser — revokes it too.
+/*
+ * Tell the gateway this app is running, so the account page can say so.
+ *
+ * It used to be the other way round: the web page opened http://127.0.0.1:47821 and
+ * asked this app directly. That cannot be made to work. Chrome 150, with the app
+ * running, listening, answering the CORS preflight with
+ * Access-Control-Allow-Private-Network, and with local-network-access *granted*, still
+ * failed the request with a bare "TypeError: Failed to fetch". An HTTPS page reaching a
+ * plaintext loopback port is the exact shape browsers have been closing off, and there
+ * is nothing left to fix on this side of it.
+ *
+ * Reporting outward has no such problem — this is the same authenticated call the app
+ * already makes for everything else. It also means the status is right even when the
+ * console is open on a different machine.
+ *
+ * Only ever sent while signed in; the token is what tells the gateway whose app this is.
+ */
+const _HEARTBEAT_MS = 30_000;
+let _heartbeatTimer = 0;
+
+async function _sendDesktopHeartbeat() {
+  let token = "";
+  try { token = localStorage.getItem("michael_token") || ""; } catch (_) {}
+  if (!token || !_loggedInEmail) return;
+  try {
+    await fetch(MICHAEL_API + "/api/desktop/heartbeat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      // Injected from package.json by vite's define; guarded so the browser preview,
+      // which is served without that substitution in some paths, cannot throw here.
+      body: JSON.stringify({
+        version: typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "",
+      }),
+      cache: "no-store",
+    });
+  } catch (_) {
+    // Offline, or the gateway is restarting. The presence key simply expires; the next
+    // beat revives it. Nothing to report and nothing to retry.
+  }
+}
+
+function _startDesktopHeartbeat() {
+  if (!inTauri || _heartbeatTimer) return;
+  void _sendDesktopHeartbeat();
+  _heartbeatTimer = setInterval(_sendDesktopHeartbeat, _HEARTBEAT_MS);
+}
+
+function _syncHandoffSession() {
+  // Signing in or out changes what the heartbeat should say, so send one immediately
+  // rather than leaving the console up to 30s out of date.
+  _startDesktopHeartbeat();
+  void _sendDesktopHeartbeat();
+  if (!inTauri || !backend?.invoke) return;
+  let token = "";
+  try { token = localStorage.getItem("michael_token") || ""; } catch (_) {}
+  const signedIn = !!(token && _loggedInEmail);
+  Promise.resolve()
+    .then(() => backend.invoke("handoff_set_session", {
+      token: signedIn ? token : null,
+      email: signedIn ? _loggedInEmail : null,
+    }))
+    .catch(() => { /* older backend without the command — handoff just stays off */ });
+}
+
 function _updateLoginUI() {
   _refreshUserLabels(); // relabel already-sent user messages to the current account (or back to 你 on logout)
   const dropName = document.querySelector(".settings-dropdown__name");
@@ -53079,6 +53681,7 @@ function _updateLoginUI() {
     if (logoutDivider) logoutDivider.hidden = true;
     if (loginHeader) loginHeader.dataset.action = "login";
   }
+  _syncHandoffSession();
 }
 // Force the correct initial state NOW (logged-out → profile/logout hidden). Without this the UI
 // relied purely on the HTML `hidden` attribute until restoreMichaelSession() resolved — and a dev
@@ -57465,8 +58068,208 @@ function scheduleSaveSession() {
   _sessionSaveTimer = setTimeout(() => { saveSession().catch(() => {}); }, 600);
 }
 
+// Preview-only scripted model. Returns a promise when a script applies, else null so
+// the caller falls through to the real gateway. Emits exactly the event shapes the
+// stream parser produces, so downstream code cannot tell the difference.
+function _previewAgentTurn(project, messages, onEvent) {
+  // Single-tool demo takes priority: emit exactly the requested call, then a short note.
+  if (_previewToolRequest) {
+    const wanted = _previewToolRequest;
+    const seenTools = messages.filter((m) => m && m.role === "tool").length;
+    const sleepA = (ms) => new Promise((r) => setTimeout(r, ms));
+    return (async () => {
+      if (seenTools === 0) {
+        onEvent({ kind: "token", delta: `Running \`${wanted}\` against this project.` });
+        await sleepA(260);
+        onEvent({
+          kind: "toolCall",
+          index: 0,
+          id: `preview_tool_${wanted}`,
+          name: wanted,
+          arguments: JSON.stringify(_previewToolArgs(wanted, project.root)),
+        });
+      } else {
+        _previewToolRequest = null;
+        for (const c of `That is the card \`${wanted}\` produces — expand it for the full output.`.match(/[\s\S]{1,14}/g) || []) {
+          onEvent({ kind: "token", delta: c });
+          await sleepA(30);
+        }
+      }
+      onEvent({ kind: "done" });
+    })();
+  }
+
+  const script = project && project.agent;
+  let on = false;
+  try { on = new URLSearchParams(location.search).get("play") === "agent"; } catch {}
+  if (!on || !script) return null;
+
+  // Which turn are we on? Count the tool results already in the transcript and walk
+  // the script's own tool counts until they match.
+  const seen = messages.filter((m) => m && m.role === "tool").length;
+  let consumed = 0;
+  let turn = script.turns[script.turns.length - 1];
+  for (const t of script.turns) {
+    if (consumed === seen) { turn = t; break; }
+    consumed += (t.tools || []).length;
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  return (async () => {
+    if (turn.say) {
+      const chunks = turn.say.match(/[\s\S]{1,14}/g) || [];
+      for (const c of chunks) {
+        onEvent({ kind: "token", delta: c });
+        if (!reduce) await sleep(38);
+      }
+    }
+    if (turn.tools) {
+      if (!reduce) await sleep(320);
+      turn.tools.forEach((t, i) => {
+        const args = JSON.parse(JSON.stringify(t.args).replaceAll("%ROOT%", project.root));
+        onEvent({
+          kind: "toolCall",
+          index: i,
+          id: `preview_${i}_${t.name}`,
+          name: t.name,
+          arguments: JSON.stringify(args),
+        });
+      });
+    }
+    onEvent({ kind: "done" });
+  })();
+}
+
+// Preview-only: drive the real Monaco model so the demo shows genuine typing —
+// live tokenisation, the dirty dot, folding, the lot. Loops with a pause so an
+// embedded demo is always mid-sentence when a visitor scrolls to it.
+async function _previewTypeIn(play) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  await sleep(1200);
+  for (;;) {
+    const model = monacoEditor.getModel();
+    if (!model) return;
+    const original = model.getValue();
+    const at = original.indexOf(play.anchor);
+    if (at < 0) return;
+    const start = model.getPositionAt(at + play.anchor.length);
+    let line = start.lineNumber;
+    let col = start.column;
+
+    if (reduce) {
+      model.applyEdits([{ range: new monaco.Range(line, col, line, col), text: play.text }]);
+      return;
+    }
+
+    for (const ch of play.text) {
+      model.applyEdits([{ range: new monaco.Range(line, col, line, col), text: ch }]);
+      if (ch === "\n") { line += 1; col = 1; } else { col += 1; }
+      monacoEditor.revealPositionInCenterIfOutsideViewport({ lineNumber: line, column: col });
+      monacoEditor.setPosition({ lineNumber: line, column: col });
+      await sleep(ch === "\n" ? 90 : 26);
+    }
+    await sleep(4200);
+    model.setValue(original);           // rewind and run it again
+    await sleep(1400);
+  }
+}
+
 async function restoreSession() {
-  if (!inTauri || _isSecondaryWindow) return; // secondary windows start fresh (open your own folder)
+  if (!inTauri) {
+    // Browser preview: a `?demo=` link asked for a specific sample project, so land
+    // straight inside it with a file open. Without this the visitor clicks a link to a
+    // codebase and gets an empty window with "Open a folder to get started".
+    try {
+      const demo = new URLSearchParams(location.search).get("demo");
+      if (!demo) return;
+      const project = _previewProject();
+      await openFolder(project.root);
+      if (project.open) {
+        const path = project.root + "/" + project.open;
+        await openFile(path, project.open.split("/").pop());
+      }
+      // `?play=1` types the project's snippet into the real editor, so a demo link
+      // shows code being written by Monaco itself rather than a recording of it.
+      const mode = new URLSearchParams(location.search).get("play");
+      if (mode === "agent" && project.agent) {
+        // The scripted model replaces the gateway entirely, so seed the catalog and a
+        // preview credential — otherwise the composer refuses to send ("please sign in"),
+        // which is correct behaviour against a real gateway but wrong for this demo.
+        try {
+          MODEL_GROUPS = [{
+            label: "Anthropic",
+            models: [{
+              id: "claude-opus-4-6", name: "Claude Opus 4.6", brand: "Anthropic", meta: "",
+              inPrice: 0, outPrice: 0, contextLimit: 200000, contextWindows: [],
+              desc: "Preview", group: "Anthropic",
+            }],
+          }];
+          rebuildModelNames();
+          try { localStorage.setItem("michael_token", "preview-demo"); } catch {}
+          const cur = await loadConfigAsync();
+          await saveConfig({
+            ...cur,
+            baseUrl: location.origin,
+            apiKey: "preview",
+            gatewayApiKey: "preview-demo",
+            model: "claude-opus-4-6",
+            gatewayModel: "claude-opus-4-6",
+          });
+          buildModelMenu();
+          syncModelPicker();
+        } catch {}
+        // Send the opening request through the real composer so the whole run —
+        // streaming reply, tool cards, edits, verification — is the product's own path.
+        // Go through sendPrompt(), the same entry the composer's submit handler uses —
+        // poking the contenteditable does not update promptEl.value, so the send is a no-op.
+        setTimeout(() => { sendPrompt(project.agent.prompt).catch(() => {}); }, 1500);
+      } else if (mode === "tools") {
+        // The tool gallery keeps one editor alive and asks it to run a tool at a time.
+        try {
+          MODEL_GROUPS = [{
+            label: "Anthropic",
+            models: [{
+              id: "claude-opus-4-6", name: "Claude Opus 4.6", brand: "Anthropic", meta: "",
+              inPrice: 0, outPrice: 0, contextLimit: 200000, contextWindows: [],
+              desc: "Preview", group: "Anthropic",
+            }],
+          }];
+          rebuildModelNames();
+          try { localStorage.setItem("michael_token", "preview-demo"); } catch {}
+          const cur = await loadConfigAsync();
+          await saveConfig({
+            ...cur, baseUrl: location.origin, apiKey: "preview",
+            gatewayApiKey: "preview-demo", model: "claude-opus-4-6", gatewayModel: "claude-opus-4-6",
+          });
+          buildModelMenu();
+          syncModelPicker();
+        } catch {}
+        window.addEventListener("message", (event) => {
+          if (event.origin !== location.origin) return;
+          const data = event.data;
+          if (!data || data.type !== "mrday:run-tool" || typeof data.tool !== "string") return;
+          // Start each tool from a clean transcript: clear the messages in place rather
+          // than opening a new session, which would drop the workspace binding.
+          _previewToolRequest = data.tool;
+          try {
+            const sess = _currentSession();
+            if (sess?.container) sess.container.innerHTML = "";
+            if (sess?.memory?.reset) sess.memory.reset();
+            else if (sess) { sess.history = []; if (sess.memory) { sess.memory.recent = []; sess.memory.transcript = []; } }
+          } catch {}
+          sendPrompt(`Use ${data.tool} on this project.`).catch(() => {});
+        });
+        try { window.parent.postMessage({ type: "mrday:ready" }, location.origin); } catch {}
+      } else if (mode && project.play) {
+        _previewTypeIn(project.play).catch(() => {});
+      }
+    } catch { /* the welcome screen remains usable */ }
+    return;
+  }
+  if (_isSecondaryWindow) return; // secondary windows start fresh (open your own folder)
   try {
     const store = await loadStore("session.json");
     let session = await store.get(SESSION_STORE_KEY);

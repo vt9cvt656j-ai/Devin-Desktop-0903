@@ -789,9 +789,14 @@ export function Dashboard({
             {desktop === undefined
               ? t.loading
               : desktop.state === "connected"
-                ? desktop.session.signedIn
-                  ? `${t.desktopConnected} ${desktop.session.email} (${t.desktopVersion} ${desktop.session.version}). ${t.desktopReuse}`
-                  : t.desktopSignedOut
+                ? desktop.session.viaServer
+                  // Reported by the gateway: it knows an app is signed in to this
+                  // account, not which machine it is on, so the wording does not claim
+                  // "here".
+                  ? `${t.desktopOnline} ${desktop.session.secondsAgo ?? 0} ${t.desktopSecondsAgo}${desktop.session.version ? ` (${t.desktopVersion} ${desktop.session.version})` : ""}`
+                  : desktop.session.signedIn
+                    ? `${t.desktopConnected} ${desktop.session.email} (${t.desktopVersion} ${desktop.session.version}). ${t.desktopReuse}`
+                    : t.desktopSignedOut
                 : desktop.state === "needs-permission"
                   ? t.desktopPermissionAsk
                   : desktop.state === "permission-blocked"

@@ -7,6 +7,7 @@ mod compression;
 mod config;
 mod console_session;
 mod deploy;
+mod desktop;
 mod email;
 mod error;
 mod game;
@@ -102,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify-code", post(auth::verify_code))
         .route("/api/me", get(auth::me))
+        // 只读门禁：nginx 的 auth_request 打这里，而不是 /api/me。
+        // /api/me 每次跑两条 UPDATE，而 auth_request 是每个静态资源都触发一次。
+        .route("/api/authz", get(auth::authz))
+        // Desktop presence, reported by the app rather than probed over loopback: a
+        // browser cannot reliably reach 127.0.0.1 from an HTTPS page (see desktop.rs).
+        .route("/api/desktop/heartbeat", post(desktop::heartbeat))
+        .route("/api/desktop/status", get(desktop::status))
         // Linked code hosts. `/callback` is the only one without a Bearer token — the
         // provider redirects the browser to it, and the signed `state` is what ties the
         // request to an account (see integrations.rs).

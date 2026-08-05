@@ -5010,10 +5010,22 @@ pub async fn chat_completions(
     // 写进 Redis，客户端从不回发，于是 Redis 只写不读，而客户端每轮都得上传完整历史
     // —— 2m/5m 两档在物理上根本达不到。
     let mut compression_prefix: Option<(String, usize)> = None;
-    // 总开关默认关闭（MICHAEL_COMPRESSION_ENABLED）。发布前审查在这条链路上确认了多处
-    // 会破坏线上请求的缺陷，最严重的是 compression_write_back 把每条消息重写成
-    // {role, content} —— tool_calls / tool_call_id 全部丢失，而 agent 模式发的正是
-    // 这些，上游会直接拒收。开关打开前必须先修完；关着时 body 一个字节都不动。
+    // 总开关 MICHAEL_COMPRESSION_ENABLED，config.rs 里 fail-closed（缺省=关）。
+    // 线上 **当前是开的**（容器里 MICHAEL_COMPRESSION_ENABLED=1）。
+    //
+    // 这里原先写着"发布前审查发现多处会破坏线上请求的缺陷，最严重的是
+    // compression_write_back 把每条消息重写成 {role, content}，tool_calls /
+    // tool_call_id 全部丢失，agent 模式会被上游直接拒收；开关打开前必须先修完"。
+    //
+    // 那个缺陷**已经修了**：write_back 现在对钉住段和逐字尾部都是 `.clone()` 原始
+    // 消息对象，只有注入的摘要是新造的 system 消息，所以结构字段一个不丢。
+    // `write_back_preserves_tool_call_structure` 用带 tool_calls + tool_call_id 的
+    // agent 形状把这条不变量钉死了。
+    //
+    // 注释没跟着改，就成了最坏的一种：它告诉读代码的人"线上这个功能是不安全的、
+    // 不该开"，而它其实已经开着并且是好的。谁照着这段注释去把开关关掉，等于无声地
+    // 砍掉 1M/2M/5M 三档上下文。所以这里改成陈述现状，而不是留一句过期的警告。
+    // 关着时 body 一个字节都不动这一点不变。
     if state.cfg.compression_enabled {
         let requested_tier = compression_tier_from(&headers, &body);
         if let Some(requested) = requested_tier {

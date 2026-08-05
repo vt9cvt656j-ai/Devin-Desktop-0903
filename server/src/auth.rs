@@ -1,6 +1,8 @@
 use axum::async_trait;
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -596,6 +598,34 @@ pub async fn verify_code(
     Ok(Json(json!({ "token": token, "user": user })))
 }
 
+/// `GET /api/authz` —— nginx `auth_request` 的目标。204 = 已登录，401 = 没登录。
+///
+/// ## 为什么必须和 /api/me 分开
+///
+/// `/_app_authz` 原来打的是 `/api/me`，而 `/api/me` 每次要跑 **两条 UPDATE + 一条
+/// SELECT \***（配额窗口刷新、每日免费点发放、整行读取）。nginx 的 auth_request 是
+/// **每个受门禁的请求**都触发一次 —— 包括 `/app/` 和 `/account/` 下的每一个 JS、CSS、
+/// 字体文件。打开一次网页版 IDE 有几十个静态资源，就是几十次 auth 子请求、上百次
+/// 对同一行 users 的写。
+///
+/// 线上实测（2026-08-05）：users 表 120 行，累计 **362,059 次 UPDATE**，而
+/// model_usage 只有 78,086 行 —— 也就是说绝大多数写入根本不来自计费，来自这个门禁。
+/// HOT update 让它没有膨胀（dead tuple 只有 26），但每条 UPDATE 都要拿行锁，同一个
+/// 用户的并发请求因此串行化，日志里那条 `time to acquire exceeded slow threshold
+/// aquired_after_secs=2.29` 就是连接卡在行锁上。
+///
+/// 这个问题 console_session.rs 早就写明白了（"/api/me … 还会跑两条 UPDATE，不适合
+/// 每个请求都触发一次"），并且为 `/console/` 单独做了只读的 `/api/admin/authz`。
+/// 这里只是把同一套做法补给 `/app/` 和 `/account/`。
+///
+/// 本函数**一次写都没有**：`Claims` 提取器已经按主键读过一次 users 校验身份和 role，
+/// 到这里只需要回一个状态码。配额刷新和每日发放仍然在 `/api/me` 里做 —— 那才是真正
+/// 要展示余额的地方，而且它由用户打开资料页触发，不是每个静态资源都触发。
+pub async fn authz(_claims: Claims) -> Response {
+    // 能走到这里说明 Claims 提取器已经验过令牌、且用户还在库里（删号立刻失效）。
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json<serde_json::Value>> {
     let id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
     // Apply the 5h30m window refill + weekly reset so the profile shows current quota.
@@ -888,3 +918,51 @@ mod privilege_source_tests {
     }
 }
 
+
+#[cfg(test)]
+mod authz_gate_tests {
+    /// 门禁端点必须是**只读**的。
+    ///
+    /// nginx 的 `auth_request` 对每个受保护请求触发一次 —— 包括 `/app/` 和 `/account/`
+    /// 下的每个静态资源。它原来打的是 `/api/me`，而 `/api/me` 每次跑两条 UPDATE
+    /// （配额窗口刷新 + 每日免费点发放）。线上 users 表 120 行累计 362,059 次 UPDATE，
+    /// 远超 model_usage 的 78,086 行 —— 写入的主体不是计费，是这道门禁。
+    ///
+    /// 这条测试盯住两件事：`authz` 自己不能写，且 nginx 不能再指回 /api/me。
+    #[test]
+    fn authz_endpoint_performs_no_writes() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/auth.rs"))
+            .expect("read auth.rs");
+        let start = src.find("pub async fn authz(").expect("authz 必须存在");
+        let end = src[start..].find("\npub async fn me(").expect("me 紧随其后") + start;
+        let body = &src[start..end];
+        for write in ["UPDATE ", "INSERT ", "DELETE ", "sqlx::query"] {
+            assert!(
+                !body.contains(write),
+                "authz 里出现了 `{write}` —— 它每个静态资源都会跑一次，必须保持零写入",
+            );
+        }
+    }
+
+    #[test]
+    fn nginx_app_gate_points_at_the_readonly_endpoint() {
+        let conf = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/nginx/michael-backend.conf"
+        ))
+        .expect("read nginx conf");
+        let start = conf.find("location = /_app_authz").expect("门禁 location 必须在");
+        // 按**字符**截取，不按字节：这个文件里有中文注释，`&conf[a..a+400]` 一旦落在
+        // 多字节字符中间就会 panic（第一版就是这么挂的，而配置本身是对的）。
+        let block: String = conf[start..].chars().take(400).collect();
+        let block = block.as_str();
+        assert!(
+            block.contains("/api/authz"),
+            "/_app_authz 必须打只读的 /api/authz",
+        );
+        assert!(
+            !block.contains("proxy_pass http://127.0.0.1:8080/api/me"),
+            "/_app_authz 不能再打 /api/me —— 那会让每个静态资源触发两条 UPDATE",
+        );
+    }
+}

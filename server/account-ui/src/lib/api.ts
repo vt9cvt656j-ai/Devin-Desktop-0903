@@ -182,7 +182,16 @@ export type Integration = {
   connected_at: string | null;
 };
 
-export type DesktopSession = { app: string; version: string; signedIn: boolean; email: string | null };
+export type DesktopSession = {
+  app: string;
+  version: string;
+  signedIn: boolean;
+  email: string | null;
+  /** True when the gateway answered, rather than the app over localhost. */
+  viaServer?: boolean;
+  /** How stale the gateway's last heartbeat is, in seconds. */
+  secondsAgo?: number;
+};
 
 /**
  * Why a reachable, correctly-answering app can still look absent.
@@ -229,7 +238,37 @@ async function localNetworkPermission(): Promise<PermissionState | null> {
  * One probe pass. Call it from a click to let Chrome raise the permission prompt; call
  * it on load to report the current state without one.
  */
+export type DesktopStatus = {
+  online: boolean;
+  version: string | null;
+  seconds_ago: number | null;
+  interval_secs: number;
+};
+
 export async function probeDesktop(): Promise<DesktopProbe> {
+  // Ask the gateway first. The app reports in on a timer, so this needs no loopback, no
+  // browser permission, and works with the console open on another machine. The
+  // localhost probe below is kept only because, when it does work, it proves the app is
+  // on *this* computer — a stronger claim than the server can make.
+  try {
+    const s = await request<DesktopStatus>("/api/desktop/status");
+    if (s.online) {
+      return {
+        state: "connected",
+        session: {
+          app: "mrday-one",
+          version: s.version ?? "",
+          signedIn: true,
+          email: null,
+          viaServer: true,
+          secondsAgo: s.seconds_ago ?? 0,
+        },
+      };
+    }
+  } catch {
+    // Older gateway without the endpoint, or offline. Fall through to the local probe.
+  }
+
   const attempt = await reachDesktop();
   if (attempt.session) return { state: "connected", session: attempt.session };
 
