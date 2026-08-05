@@ -215,10 +215,14 @@ export function Billing({ catalog, me, lang, currency, onRedeemed }: Props) {
                 badge={mine ? t.current : undefined}
                 highlighted={mine}
                 priceMain={price(p, currency)}
-                priceUnit={p.recurring ? t.perMonth : t.perDay}
+                // How long it lasts, not how it is billed. `recurring` says whether
+                // Stripe charges again; a one-off payment can still buy 30 days, and
+                // reading it as "day pass" labelled such a plan /天 with "24 hours"
+                // beside a 30-day grant.
+                priceUnit={p.duration_days === 1 ? t.perDay : t.perMonth}
                 priceAltText={priceAlt(p, currency)}
                 features={
-                  p.recurring
+                  p.duration_days !== 1
                     ? [
                         <Feature key="inc">
                           <strong className="font-semibold tabular-nums">{usd(p.included_cents)}</strong>{" "}
@@ -242,9 +246,15 @@ export function Billing({ catalog, me, lang, currency, onRedeemed }: Props) {
                           <strong className="font-semibold tabular-nums">{usd(p.included_cents)}</strong>{" "}
                           <span className="text-muted-foreground">{t.fullDayQuota}</span>
                         </Feature>,
-                        <Feature key="once">
-                          <span className="text-muted-foreground">{t.onePerAccount}</span>
-                        </Feature>,
+                        // Only where it is true — this used to be printed on every
+                        // non-subscription product regardless.
+                        ...(p.once_per_account
+                          ? [
+                              <Feature key="once">
+                                <span className="text-muted-foreground">{t.onePerAccount}</span>
+                              </Feature>,
+                            ]
+                          : []),
                       ]
                 }
                 action={
