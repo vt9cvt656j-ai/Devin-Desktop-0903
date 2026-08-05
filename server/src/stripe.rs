@@ -15,6 +15,10 @@
 //! and credit grants are all read server-side from the matching row, so a tampered
 //! request can at worst buy a different listed product at its real price.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+use std::time::{Duration, Instant};
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -75,6 +79,91 @@ struct CatalogRow {
     blurb: String,
 }
 
+/// What Stripe says a price actually is. Fetched by lookup key, never typed by hand.
+#[derive(Clone, Debug, Default)]
+pub struct LivePrice {
+    /// Minor units in the price's own currency (fen for cny, cents for usd).
+    pub cny_minor: Option<i64>,
+    pub usd_minor: Option<i64>,
+    /// Stripe's `recurring` is null on a one-time price. This decides the checkout mode,
+    /// and getting it wrong is a hard 400 from Stripe, not a cosmetic slip.
+    pub recurring: bool,
+}
+
+static PRICE_CACHE: LazyLock<RwLock<Option<(Instant, HashMap<String, LivePrice>)>>> =
+    LazyLock::new(|| RwLock::new(None));
+/// Long enough that the billing page is not making an API call per view; short enough
+/// that editing a price in Stripe shows up without a deploy.
+const PRICE_CACHE_TTL: Duration = Duration::from_secs(120);
+
+/// Read every price this catalogue references straight from Stripe.
+///
+/// The amounts and the one-time/recurring flag used to be typed into the `prices` table
+/// by hand, which meant two sources of truth for the same fact. They drift, and both ways
+/// of drifting are bad: a wrong amount advertises a price you do not charge, and a wrong
+/// `recurring` flag makes Stripe reject the checkout outright with "You must provide at
+/// least one recurring price in subscription mode" — which is exactly how the test plan
+/// broke. Asking Stripe removes the second copy.
+///
+/// Returns an empty map on any failure. Every caller falls back to the stored columns, so
+/// Stripe being unreachable degrades the page to its previous behaviour rather than
+/// emptying the shop.
+async fn live_prices(state: &AppState) -> HashMap<String, LivePrice> {
+    if let Some((at, cached)) = PRICE_CACHE.read().ok().and_then(|g| g.clone()) {
+        if at.elapsed() < PRICE_CACHE_TTL {
+            return cached;
+        }
+    }
+    let Some(key) = secret_key() else {
+        return HashMap::new();
+    };
+
+    // `currency_options` carries the per-currency amounts of a multi-currency price and
+    // is not returned unless expanded.
+    let res = state
+        .update_http
+        .get(format!("{STRIPE_API}/prices"))
+        .bearer_auth(&key)
+        .query(&[
+            ("limit", "100"),
+            ("active", "true"),
+            ("expand[]", "data.currency_options"),
+        ])
+        .send()
+        .await;
+    let Ok(res) = res else { return HashMap::new() };
+    let body: serde_json::Value = res.json().await.unwrap_or_else(|_| json!({}));
+    let Some(list) = body.get("data").and_then(|v| v.as_array()) else {
+        return HashMap::new();
+    };
+
+    let mut out: HashMap<String, LivePrice> = HashMap::new();
+    for p in list {
+        let Some(lookup) = p.get("lookup_key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let base_ccy = p.get("currency").and_then(|v| v.as_str()).unwrap_or("");
+        let base_amount = p.get("unit_amount").and_then(|v| v.as_i64());
+        let opt = |c: &str| {
+            p.pointer(&format!("/currency_options/{c}/unit_amount"))
+                .and_then(|v| v.as_i64())
+        };
+        out.insert(
+            lookup.to_owned(),
+            LivePrice {
+                cny_minor: opt("cny").or(if base_ccy == "cny" { base_amount } else { None }),
+                usd_minor: opt("usd").or(if base_ccy == "usd" { base_amount } else { None }),
+                recurring: p.get("recurring").map(|v| !v.is_null()).unwrap_or(false),
+            },
+        );
+    }
+
+    if let Ok(mut g) = PRICE_CACHE.write() {
+        *g = Some((Instant::now(), out.clone()));
+    }
+    out
+}
+
 /// Which currency to show first, from where the request came from.
 ///
 /// Cloudflare sits in front of this origin and stamps `CF-IPCountry` on every request,
@@ -125,10 +214,15 @@ pub async fn catalog(
     .await
     .unwrap_or_default();
 
+    // Stripe is the authority on price and on one-time-vs-subscription; the columns are
+    // only a fallback for when it cannot be reached.
+    let live = live_prices(&state).await;
+
     let items: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let key = r.lookup_key.clone().unwrap_or_default();
+            let lp = live.get(&key);
             // What a plan actually grants, from the same table apply_plan uses — so a
             // card can say "$49.77 included" instead of only quoting a price, and can
             // never drift from what the purchase really delivers.
@@ -143,9 +237,9 @@ pub async fn catalog(
                 "weekly_cap_cents": spec.map(|s| s.2),
                 "duration_days": r.duration_days,
                 "credits_cents": r.credits_cents,
-                "amount_cents": r.amount_cents,
-                "amount_usd_cents": r.amount_usd_cents,
-                "recurring": r.recurring,
+                "amount_cents": lp.and_then(|p| p.cny_minor).unwrap_or(r.amount_cents),
+                "amount_usd_cents": lp.and_then(|p| p.usd_minor).or(r.amount_usd_cents),
+                "recurring": lp.map(|p| p.recurring).unwrap_or(r.recurring),
                 "once_per_account": r.once_per_account,
                 "unit_credits_cents": r.unit_credits_cents,
                 "blurb": r.blurb,
@@ -220,7 +314,17 @@ pub async fn checkout(
         }
     }
 
-    let mode = if row.recurring { "subscription" } else { "payment" };
+    // Ask Stripe what this price is rather than trusting the stored flag. A row that
+    // says "recurring" over a one-time price makes Stripe reject the session outright
+    // ("You must provide at least one recurring price in subscription mode"), which is a
+    // Subscribe button that silently does nothing. Stripe is the only thing that
+    // actually knows, so it is the thing that decides.
+    let recurring = live_prices(&state)
+        .await
+        .get(&req.lookup_key)
+        .map(|p| p.recurring)
+        .unwrap_or(row.recurring);
+    let mode = if recurring { "subscription" } else { "payment" };
     let base = public_base();
 
     // Form-encoded: Stripe's API does not take JSON.
